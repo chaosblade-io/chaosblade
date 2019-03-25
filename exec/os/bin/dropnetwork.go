@@ -33,7 +33,9 @@ func main() {
 func startDropNet(servicePort, invokePort string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
-	handleDropAllPort(invokePort, servicePort, channel, ctx)
+	if invokePort == "" && servicePort == "" {
+		printErrAndExit("must specify port flag")
+	}
 	handleDropSpecifyPort(invokePort, servicePort, channel, ctx)
 }
 
@@ -47,7 +49,7 @@ func handleDropSpecifyPort(invokePort string, servicePort string, channel *exec.
 			printErrAndExit(response.Err)
 		}
 		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A INPUT -p tcp --dport %s -j DROP`, servicePort))
+			fmt.Sprintf(`-A INPUT -p udp --dport %s -j DROP`, servicePort))
 		if !response.Success {
 			stopDropNet(servicePort, invokePort)
 			printErrAndExit(response.Err)
@@ -61,7 +63,7 @@ func handleDropSpecifyPort(invokePort string, servicePort string, channel *exec.
 			printErrAndExit(response.Err)
 		}
 		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A OUTPUT -p tcp --dport %s -j DROP`, servicePort))
+			fmt.Sprintf(`-A OUTPUT -p udp --dport %s -j DROP`, servicePort))
 		if !response.Success {
 			stopDropNet(servicePort, invokePort)
 			printErrAndExit(response.Err)
@@ -70,50 +72,15 @@ func handleDropSpecifyPort(invokePort string, servicePort string, channel *exec.
 	printOutputAndExit(response.Result.(string))
 }
 
-func handleDropAllPort(invokePort string, servicePort string, channel *exec.LocalChannel, ctx context.Context) {
-	if invokePort == "" && servicePort == "" {
-		response := channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A INPUT -p tcp --dport 22 -j ACCEPT`))
-		if !response.Success {
-			stopDropNet(servicePort, invokePort)
-			printErrAndExit(response.Err)
-		}
-		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A INPUT -p udp --dport 22 -j ACCEPT`))
-		if !response.Success {
-			stopDropNet(servicePort, invokePort)
-			printErrAndExit(response.Err)
-		}
-		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-P INPUT DROP`))
-		if !response.Success {
-			stopDropNet(servicePort, invokePort)
-			printErrAndExit(response.Err)
-		}
-		response = channel.Run(ctx, "iptables", fmt.Sprintf(`-P OUTPUT DROP`))
-		if !response.Success {
-			stopDropNet(servicePort, invokePort)
-			printErrAndExit(response.Err)
-		}
-		printOutputAndExit(response.Result.(string))
-	}
-}
-
 func stopDropNet(servicePort, invokePort string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
-	if invokePort == "" && servicePort == "" {
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p tcp -m multiport --dports 22 -j ACCEPT`))
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p udp -m multiport --dports 22 -j ACCEPT`))
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-P INPUT ACCEPT`))
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-P OUTPUT ACCEPT`))
-	}
 	if servicePort != "" {
 		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p tcp --dport %s -j DROP`, servicePort))
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p tcp --dport %s -j DROP`, servicePort))
+		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p udp --dport %s -j DROP`, servicePort))
 	}
 	if invokePort != "" {
 		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p tcp --dport %s -j DROP`, servicePort))
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p tcp --dport %s -j DROP`, servicePort))
+		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p udp --dport %s -j DROP`, servicePort))
 	}
 }

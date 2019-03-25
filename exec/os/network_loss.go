@@ -33,6 +33,11 @@ func (*LossActionSpec) Matchers() []exec.ExpFlagSpec {
 			Name: "service-port",
 			Desc: "Port for external service",
 		},
+		&exec.ExpFlag{
+			Name:     "device",
+			Desc:     "Network device",
+			Required: true,
+		},
 	}
 }
 

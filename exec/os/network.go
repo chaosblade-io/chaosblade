@@ -31,12 +31,7 @@ func (*NetworkCommandSpec) Actions() []exec.ExpActionCommandSpec {
 }
 
 func (*NetworkCommandSpec) Flags() []exec.ExpFlagSpec {
-	return []exec.ExpFlagSpec{
-		&exec.ExpFlag{
-			Name: "device",
-			Desc: "Network device",
-		},
-	}
+	return []exec.ExpFlagSpec{}
 }
 
 func (*NetworkCommandSpec) PreExecutor() exec.PreExecutor {

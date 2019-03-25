@@ -37,6 +37,11 @@ func (*DelayActionSpec) Matchers() []exec.ExpFlagSpec {
 			Name: "invoke-port",
 			Desc: "Port for invoke",
 		},
+		&exec.ExpFlag{
+			Name:     "device",
+			Desc:     "Network device",
+			Required: true,
+		},
 	}
 }
 
