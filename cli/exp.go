@@ -268,7 +268,7 @@ func (ec *expCommand) registerActionCommand(actionParentCmdName string, spec exe
 func (command *actionCommand) runActionCommand(actionParentCmdName string, cmd *cobra.Command, args []string, spec exec.ExpActionCommandSpec) error {
 	expModel := createExpModel(actionParentCmdName, spec.Name(), cmd)
 	// update status
-	model, err := command.recordExpModel(cmd.CommandPath(), expModel.GetFlags(), "Created", "")
+	model, err := command.recordExpModel(cmd.CommandPath(), expModel.GetFlags())
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.DatabaseError], err.Error())
 	}
@@ -278,11 +278,11 @@ func (command *actionCommand) runActionCommand(actionParentCmdName string, cmd *
 	response := executor.Exec(model.Uid, ctx_, expModel)
 	if !response.Success {
 		// update status
-		checkError(db.UpdateExperimentModelByUid(model.Uid, "Error", response.Err))
+		checkError(GetDS().UpdateExperimentModelByUid(model.Uid, "Error", response.Err))
 		return response
 	}
 	// update status
-	checkError(db.UpdateExperimentModelByUid(model.Uid, "Success", response.Err))
+	checkError(GetDS().UpdateExperimentModelByUid(model.Uid, "Success", response.Err))
 	response.Result = model.Uid
 	cmd.Println(response.Print())
 	return nil

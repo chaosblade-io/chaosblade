@@ -18,6 +18,32 @@ type PreparationRecord struct {
 	UpdateTime  string
 }
 
+type PreparationSource interface {
+	// CheckAndInitPreTable
+	CheckAndInitPreTable()
+
+	// InitPreparationTable when first executed
+	InitPreparationTable() error
+
+	// PreparationTableExists return true if preparation exists, otherwise return false or error if execute sql exception
+	PreparationTableExists() (bool, error)
+
+	// InsertPreparationRecord
+	InsertPreparationRecord(record *PreparationRecord) error
+
+	// QueryPreparationByUid
+	QueryPreparationByUid(uid string) (*PreparationRecord, error)
+
+	// QueryRunningPreByTypeAndProcess
+	QueryRunningPreByTypeAndProcess(programType string, process string) (*PreparationRecord, error)
+
+	// ListPreparationRecords
+	ListPreparationRecords() ([]*PreparationRecord, error)
+
+	// UpdatePreparationRecordByUid
+	UpdatePreparationRecordByUid(uid, status, errMsg string) error
+}
+
 const preparationTableDDL = `CREATE TABLE IF NOT EXISTS preparation (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	uid VARCHAR(32) UNIQUE,
@@ -41,20 +67,20 @@ var insertPreDML = `INSERT INTO
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `
 
-func (s *Source) checkAndInitPreTable() {
-	exists, err := s.preparationTableExists()
+func (s *Source) CheckAndInitPreTable() {
+	exists, err := s.PreparationTableExists()
 	if err != nil {
 		logrus.Fatalf(err.Error())
 	}
 	if !exists {
-		err = s.initPreparationTable()
+		err = s.InitPreparationTable()
 		if err != nil {
 			logrus.Fatalf(err.Error())
 		}
 	}
 }
 
-func (s *Source) initPreparationTable() error {
+func (s *Source) InitPreparationTable() error {
 	_, err := s.DB.Exec(preparationTableDDL)
 	if err != nil {
 		return fmt.Errorf("create preparation table err, %s", err)
@@ -65,7 +91,7 @@ func (s *Source) initPreparationTable() error {
 	return nil
 }
 
-func (s *Source) preparationTableExists() (bool, error) {
+func (s *Source) PreparationTableExists() (bool, error) {
 	stmt, err := s.DB.Prepare(tableExistsDQL)
 	if err != nil {
 		return false, fmt.Errorf("select preparation table exists err when invoke db prepare, %s", err)

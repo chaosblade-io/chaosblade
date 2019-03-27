@@ -31,7 +31,7 @@ func (dc *DestroyCommand) Init() {
 // runDestroy
 func (dc *DestroyCommand) runDestroy(cmd *cobra.Command, args []string) error {
 	uid := args[0]
-	model, err := db.QueryExperimentModelByUid(uid)
+	model, err := GetDS().QueryExperimentModelByUid(uid)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.DatabaseError], err.Error())
 	}
@@ -87,7 +87,7 @@ func (dc *DestroyCommand) runDestroy(cmd *cobra.Command, args []string) error {
 		return response
 	}
 	// return result
-	checkError(db.UpdateExperimentModelByUid(uid, "Destroyed", ""))
+	checkError(GetDS().UpdateExperimentModelByUid(uid, "Destroyed", ""))
 	result := fmt.Sprintf("command: %s %s %s", model.Command, model.SubCommand, model.Flag)
 	cmd.Println(transport.ReturnSuccess(result).Print())
 	return nil

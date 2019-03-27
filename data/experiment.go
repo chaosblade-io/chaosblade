@@ -18,6 +18,32 @@ type ExperimentModel struct {
 	UpdateTime string
 }
 
+type ExperimentSource interface {
+	// CheckAndInitExperimentTable, if experiment table not exists, then init it
+	CheckAndInitExperimentTable()
+
+	// ExperimentTableExists return true if experiment exists
+	ExperimentTableExists() (bool, error)
+
+	// InitExperimentTable for first executed
+	InitExperimentTable() error
+
+	// InsertExperimentModel for creating chaos experiment
+	InsertExperimentModel(model *ExperimentModel) error
+
+	// UpdateExperimentModelByUid
+	UpdateExperimentModelByUid(uid, status, errMsg string) error
+
+	// QueryExperimentModelByUid
+	QueryExperimentModelByUid(uid string) (*ExperimentModel, error)
+
+	// ListExperimentModels
+	ListExperimentModels() ([]*ExperimentModel, error)
+
+	// QueryExperimentModelsByCommand
+	QueryExperimentModelsByCommand(target string) ([]*ExperimentModel, error)
+}
+
 const expTableDDL = `CREATE TABLE IF NOT EXISTS experiment (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	uid VARCHAR(32) UNIQUE,
@@ -41,20 +67,20 @@ var insertExpDML = `INSERT INTO
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `
 
-func (s *Source) checkAndInitExperimentTable() {
-	exists, err := s.experimentTableExists()
+func (s *Source) CheckAndInitExperimentTable() {
+	exists, err := s.ExperimentTableExists()
 	if err != nil {
 		logrus.Fatalf(err.Error())
 	}
 	if !exists {
-		err = s.initExperimentTable()
+		err = s.InitExperimentTable()
 		if err != nil {
 			logrus.Fatalf(err.Error())
 		}
 	}
 }
 
-func (s *Source) experimentTableExists() (bool, error) {
+func (s *Source) ExperimentTableExists() (bool, error) {
 	stmt, err := s.DB.Prepare(tableExistsDQL)
 	if err != nil {
 		return false, fmt.Errorf("select experiment table exists err when invoke db prepare, %s", err)
@@ -73,7 +99,7 @@ func (s *Source) experimentTableExists() (bool, error) {
 	return c != 0, nil
 }
 
-func (s *Source) initExperimentTable() error {
+func (s *Source) InitExperimentTable() error {
 	_, err := s.DB.Exec(expTableDDL)
 	if err != nil {
 		return fmt.Errorf("create experiment table err, %s", err)

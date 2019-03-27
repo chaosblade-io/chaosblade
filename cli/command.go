@@ -22,9 +22,6 @@ type Command interface {
 	Name() string
 }
 
-// database source
-var db = data.GetSource()
-
 // baseCommand
 type baseCommand struct {
 	command *cobra.Command
@@ -42,8 +39,23 @@ func (bc *baseCommand) Name() string {
 	return bc.command.Name()
 }
 
+var ds data.SourceI
+
+// GetDS returns dataSource
+func GetDS() data.SourceI {
+	if ds == nil {
+		ds = data.GetSource()
+	}
+	return ds
+}
+
+// SetDS for test
+func SetDS(source data.SourceI) {
+	ds = source
+}
+
 // recordExpModel
-func (bc *baseCommand) recordExpModel(commandPath, flag, status, error string) (*data.ExperimentModel, error) {
+func (bc *baseCommand) recordExpModel(commandPath, flag string) (*data.ExperimentModel, error) {
 	time := time.Now().Format(time.RFC3339Nano)
 	uid, err := bc.generateUid()
 	if err != nil {
@@ -58,12 +70,12 @@ func (bc *baseCommand) recordExpModel(commandPath, flag, status, error string) (
 		Command:    command,
 		SubCommand: subCommand,
 		Flag:       flag,
-		Status:     status,
-		Error:      error,
+		Status:     "Created",
+		Error:      "",
 		CreateTime: time,
 		UpdateTime: time,
 	}
-	err = db.InsertExperimentModel(commandModel)
+	err = GetDS().InsertExperimentModel(commandModel)
 	if err != nil {
 		return nil, err
 	}
@@ -84,7 +96,7 @@ func (bc *baseCommand) generateUid() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	model, err := db.QueryExperimentModelByUid(uid)
+	model, err := GetDS().QueryExperimentModelByUid(uid)
 	if err != nil {
 		return "", err
 	}

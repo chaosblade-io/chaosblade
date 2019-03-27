@@ -38,7 +38,7 @@ func (pc *PrepareJvmCommand) prepareExample() string {
 }
 
 func (pc *PrepareJvmCommand) prepareJvm() error {
-	record, err := db.QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName)
+	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.DatabaseError],
 			fmt.Sprintf("query attach java process record err, %s", err.Error()))
@@ -49,14 +49,14 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 			return transport.ReturnFail(transport.Code[transport.ServerError],
 				fmt.Sprintf("get sandbox port err, %s", err.Error()))
 		}
-		record, err = insertPrepareRecord(PrepareJvmType, pc.processName, port)
+		record, err = pc.insertPrepareRecord(PrepareJvmType, pc.processName, port)
 		if err != nil {
 			return transport.ReturnFail(transport.Code[transport.DatabaseError],
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))
 		}
 	}
 	response := jvm.Attach(pc.processName, record.Port)
-	return handlePrepareResponse(record.Uid, pc.command, response)
+	return pc.handlePrepareResponse(record.Uid, pc.command, response)
 }
 
 // getSandboxPort by process name. If this process does not exist, an unbound port will be selected

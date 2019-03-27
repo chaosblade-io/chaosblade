@@ -29,7 +29,7 @@ func (rc *RevokeCommand) Init() {
 
 func (rc *RevokeCommand) runRevoke(args []string) error {
 	uid := args[0]
-	record, err := db.QueryPreparationByUid(uid)
+	record, err := GetDS().QueryPreparationByUid(uid)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.DatabaseError],
 			fmt.Sprintf("query record err, %s", err.Error()))
@@ -51,10 +51,10 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 			fmt.Sprintf("not support the %s type", record.ProgramType))
 	}
 	if !response.Success {
-		checkError(db.UpdatePreparationRecordByUid(uid, "Running", fmt.Sprintf("revoke failed. %s", response.Err)))
+		checkError(GetDS().UpdatePreparationRecordByUid(uid, "Running", fmt.Sprintf("revoke failed. %s", response.Err)))
 		return response
 	}
-	checkError(db.UpdatePreparationRecordByUid(uid, "Revoked", ""))
+	checkError(GetDS().UpdatePreparationRecordByUid(uid, "Revoked", ""))
 	rc.command.Println(response.Print())
 	return nil
 }

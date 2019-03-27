@@ -45,25 +45,25 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 	switch sc.commandType {
 	case "create", "destroy", "c", "d":
 		if uid != "" {
-			result, err = db.QueryExperimentModelByUid(uid)
+			result, err = GetDS().QueryExperimentModelByUid(uid)
 		} else if sc.target != "" {
-			result, err = db.QueryExperimentModelsByCommand(sc.target)
+			result, err = GetDS().QueryExperimentModelsByCommand(sc.target)
 		} else {
-			result, err = db.ListExperimentModels()
+			result, err = GetDS().ListExperimentModels()
 		}
 	case "prepare", "revoke", "p", "r":
 		if uid != "" {
-			result, err = db.QueryPreparationByUid(uid)
+			result, err = GetDS().QueryPreparationByUid(uid)
 		} else {
-			result, err = db.ListPreparationRecords()
+			result, err = GetDS().ListPreparationRecords()
 		}
 	default:
 		if uid == "" {
 			return transport.ReturnFail(transport.Code[transport.IllegalCommand], "must specify the right type or uid")
 		}
-		result, err = db.QueryExperimentModelByUid(uid)
-		if result == nil || err != nil {
-			result, err = db.QueryPreparationByUid(uid)
+		result, err = GetDS().QueryExperimentModelByUid(uid)
+		if util.IsNil(result) || err != nil {
+			result, err = GetDS().QueryPreparationByUid(uid)
 		}
 	}
 	if err != nil {

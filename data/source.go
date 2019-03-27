@@ -11,19 +11,25 @@ import (
 
 const dataFile = "chaosblade.dat"
 
+type SourceI interface {
+	ExperimentSource
+	PreparationSource
+}
+
 type Source struct {
 	DB *sql.DB
 }
 
-var source *Source
+var source SourceI
 var once = sync.Once{}
 
-func GetSource() *Source {
+func GetSource() SourceI {
 	once.Do(func() {
-		source = &Source{
+		src := &Source{
 			DB: getConnection(),
 		}
-		source.init()
+		src.init()
+		source = src
 	})
 	return source
 }
@@ -35,8 +41,8 @@ const tableExistsDQL = `SELECT count(*) AS c
 `
 
 func (s *Source) init() {
-	s.checkAndInitExperimentTable()
-	s.checkAndInitPreTable()
+	s.CheckAndInitExperimentTable()
+	s.CheckAndInitPreTable()
 }
 
 func getConnection() *sql.DB {

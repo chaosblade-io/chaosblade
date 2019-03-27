@@ -41,7 +41,7 @@ func (pc *PrepareCommand) prepareExample() string {
 }
 
 // insertPrepareRecord
-func insertPrepareRecord(prepareType string, flags ...string) (*data.PreparationRecord, error) {
+func (pc *PrepareJvmCommand) insertPrepareRecord(prepareType string, flags ...string) (*data.PreparationRecord, error) {
 	uid, err := util.GenerateUid()
 	if err != nil {
 		return nil, err
@@ -58,19 +58,19 @@ func insertPrepareRecord(prepareType string, flags ...string) (*data.Preparation
 	if len(flags) > 1 {
 		record.Port = flags[1]
 	}
-	err = db.InsertPreparationRecord(record)
+	err = GetDS().InsertPreparationRecord(record)
 	if err != nil {
 		return nil, err
 	}
 	return record, nil
 }
 
-func handlePrepareResponse(uid string, cmd *cobra.Command, response *transport.Response) error {
+func (pc *PrepareJvmCommand) handlePrepareResponse(uid string, cmd *cobra.Command, response *transport.Response) error {
 	if !response.Success {
-		db.UpdatePreparationRecordByUid(uid, "Error", response.Err)
+		GetDS().UpdatePreparationRecordByUid(uid, "Error", response.Err)
 		return response
 	}
-	err := db.UpdatePreparationRecordByUid(uid, "Running", "")
+	err := GetDS().UpdatePreparationRecordByUid(uid, "Running", "")
 	if err != nil {
 		logrus.Warningf("update preparation record error: %s", err.Error())
 	}
