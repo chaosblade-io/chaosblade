@@ -33,10 +33,6 @@ func (*DeleteActionCommandSpec) Matchers() []exec.ExpFlagSpec {
 			Name: "pod",
 			Desc: "pod name",
 		},
-		&exec.ExpFlag{
-			Name: "container",
-			Desc: "container id",
-		},
 	}
 }
 
