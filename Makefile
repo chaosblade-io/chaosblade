@@ -39,7 +39,7 @@ BLADE_JAVA_TOOLS_JAR_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_TOOLS_JAR_NAME
 BLADE_JAVA_TOOLS_JAR_DOWNLOAD_URL=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/release/$(BLADE_JAVA_TOOLS_JAR_NAME)
 
 ifeq ($(GOOS), linux)
-	GO_FLAGS=-ldflags="-linkmode external -extldflags -static -X main.version=$(BLADE_VERSION) -X 'main.buildTime=`date`'"
+	GO_FLAGS=-ldflags="-linkmode external -extldflags -static -X main.ver=$(BLADE_VERSION) -X main.env=oss -X 'main.buildTime=`date`'"
 endif
 
 # build chaosblade package and image

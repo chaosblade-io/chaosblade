@@ -35,7 +35,11 @@ func (*DelayActionSpec) Matchers() []exec.ExpFlagSpec {
 		},
 		&exec.ExpFlag{
 			Name: "invoke-port",
-			Desc: "Port for invoke",
+			Desc: "Port for invoking",
+		},
+		&exec.ExpFlag{
+			Name: "exclude-port",
+			Desc: "Exclude one local port, for example 22 port. This flag is invalid when --service-port or invoke-port is specified",
 		},
 		&exec.ExpFlag{
 			Name:     "device",
@@ -85,22 +89,26 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	}
 	servicePort := model.ActionFlags["service-port"]
 	invokePort := model.ActionFlags["invoke-port"]
+	excludePort := model.ActionFlags["exclude-port"]
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return de.stop(device, ctx)
 	} else {
-		return de.start(servicePort, invokePort, time, offset, device, ctx)
+		return de.start(servicePort, invokePort, excludePort, time, offset, device, ctx)
 	}
 }
 
 var delayNetworkBin = "chaos_delaynetwork"
 
-func (de *NetworkDelayExecutor) start(servicePort, invokePort, time, offset, device string, ctx context.Context) *transport.Response {
+func (de *NetworkDelayExecutor) start(servicePort, invokePort, excludePort, time, offset, device string, ctx context.Context) *transport.Response {
 	args := fmt.Sprintf("--start --device %s --time %s --offset %s", device, time, offset)
 	if servicePort != "" {
 		args = fmt.Sprintf("%s --service-port %s", args, servicePort)
 	}
 	if invokePort != "" {
 		args = fmt.Sprintf("%s --invoke-port %s", args, invokePort)
+	}
+	if excludePort != "" {
+		args = fmt.Sprintf("%s --exclude-port %s", args, excludePort)
 	}
 	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), delayNetworkBin), args)
 }

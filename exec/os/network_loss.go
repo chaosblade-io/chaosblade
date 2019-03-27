@@ -34,6 +34,14 @@ func (*LossActionSpec) Matchers() []exec.ExpFlagSpec {
 			Desc: "Port for external service",
 		},
 		&exec.ExpFlag{
+			Name: "invoke-port",
+			Desc: "Port for invoking",
+		},
+		&exec.ExpFlag{
+			Name: "exclude-port",
+			Desc: "Exclude one local port, for example 22 port. This flag is invalid when --service-port or invoke-port is specified",
+		},
+		&exec.ExpFlag{
 			Name:     "device",
 			Desc:     "Network device",
 			Required: true,
@@ -80,14 +88,22 @@ func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *exe
 		return nle.stop(dev, ctx)
 	} else {
 		servicePort := model.ActionFlags["service-port"]
-		return nle.start(dev, servicePort, percent, ctx)
+		invokePort := model.ActionFlags["invoke-port"]
+		excludePort := model.ActionFlags["exclude-port"]
+		return nle.start(dev, servicePort, invokePort, excludePort, percent, ctx)
 	}
 }
 
-func (nle *NetworkLossExecutor) start(device, servicePort, percent string, ctx context.Context) *transport.Response {
+func (nle *NetworkLossExecutor) start(device, servicePort, invokePort, excludePort, percent string, ctx context.Context) *transport.Response {
 	args := fmt.Sprintf("--start --device %s --percent %s", device, percent)
 	if servicePort != "" {
 		args = fmt.Sprintf("%s --service-port %s", args, servicePort)
+	}
+	if invokePort != "" {
+		args = fmt.Sprintf("%s --invoke-port %s", args, invokePort)
+	}
+	if excludePort != "" {
+		args = fmt.Sprintf("%s --exclude-port %s", args, excludePort)
 	}
 	return nle.channel.Run(ctx, path.Join(nle.channel.GetScriptPath(), lossNetworkBin), args)
 }

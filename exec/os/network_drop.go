@@ -35,7 +35,7 @@ func (*DropActionSpec) Matchers() []exec.ExpFlagSpec {
 		},
 		&exec.ExpFlag{
 			Name: "invoke-port",
-			Desc: "Port for invoke",
+			Desc: "Port for invoking",
 		},
 	}
 }
