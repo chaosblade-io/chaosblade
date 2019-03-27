@@ -20,8 +20,8 @@ type StatusCommand struct {
 func (sc *StatusCommand) Init() {
 	sc.command = &cobra.Command{
 		Use:     "status",
-		Short:   "Get command or experiment status",
-		Long:    "Get command or experiment status",
+		Short:   "Query preparation stage or experiment status",
+		Long:    "Query preparation stage or experiment status",
 		Aliases: []string{"s"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return sc.runStatus(cmd, args)

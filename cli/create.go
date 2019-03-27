@@ -12,8 +12,8 @@ type CreateCommand struct {
 func (cc *CreateCommand) Init() {
 	cc.command = &cobra.Command{
 		Use:     "create",
-		Short:   "Create a chaos experiment",
-		Long:    "Create a chaos experiment",
+		Short:   "Create a chaos engineering experiment",
+		Long:    "Create a chaos engineering experiment",
 		Aliases: []string{"c"},
 		Example: createExample(),
 	}

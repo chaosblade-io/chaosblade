@@ -17,8 +17,8 @@ func (rc *RevokeCommand) Init() {
 	rc.command = &cobra.Command{
 		Use:     "revoke [PREPARE UID]",
 		Aliases: []string{"r"},
-		Short:   "Revoke deploy",
-		Long:    "Revoke deploy",
+		Short:   "Undo chaos engineering experiment preparation",
+		Long:    "Undo chaos engineering experiment preparation",
 		Args:    cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return rc.runRevoke(args)
@@ -60,5 +60,5 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 }
 
 func revokeExample() string {
-	return `blade revoke <UID>`
+	return `blade revoke cc015e9bd9c68406`
 }

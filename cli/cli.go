@@ -14,8 +14,8 @@ func NewCli() *Cli {
 	cli := &Cli{
 		rootCmd: &cobra.Command{
 			Use:   "blade",
-			Short: "An easy to use, powerful chaos toolkit",
-			Long:  "An easy to use, powerful chaos toolkit.",
+			Short: "An easy to use and powerful chaos toolkit",
+			Long:  "An easy to use and powerful chaos engineering experiment toolkit",
 		},
 	}
 	cli.setFlags()

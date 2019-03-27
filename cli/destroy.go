@@ -18,7 +18,7 @@ func (dc *DestroyCommand) Init() {
 	dc.command = &cobra.Command{
 		Use:     "destroy UID",
 		Short:   "Destroy a chaos experiment",
-		Long:    "Destroy a chaos experiment by experiment uid, you can run status command to list",
+		Long:    "Destroy a chaos experiment by experiment uid which you can run status command to query",
 		Args:    cobra.MinimumNArgs(1),
 		Aliases: []string{"d"},
 		Example: destroyExample(),
