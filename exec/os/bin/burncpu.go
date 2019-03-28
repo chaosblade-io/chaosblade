@@ -1,24 +1,37 @@
 package main
 
 import (
-	"runtime"
-	"path"
-	"github.com/chaosblade-io/chaosblade/util"
-	"fmt"
-	"time"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"strings"
-	"flag"
 	"context"
+	"flag"
+	"fmt"
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/util"
+	"os"
+	"path"
+	"runtime"
+	"strings"
+	"time"
 )
 
-var burnCpuStart, burnCpuStop, burnCpuNohup bool
+var (
+	burnCpuStart, burnCpuStop, burnCpuNohup bool
+	burnTimeout                             uint
+)
 
 func main() {
 	flag.BoolVar(&burnCpuStart, "start", false, "burn cpu")
+	flag.UintVar(&burnTimeout, "timeout", 0, "execute timeout")
 	flag.BoolVar(&burnCpuStop, "stop", false, "stop burn cpu")
 	flag.BoolVar(&burnCpuNohup, "nohup", false, "nohup to run burn cpu")
 	flag.Parse()
+
+	if burnTimeout > 0 {
+		fmt.Fprint(os.Stderr, fmt.Sprintf("cpu fullload test will stopped in %d seconds\n", burnTimeout))
+		go func() {
+			time.Sleep(time.Duration(burnTimeout) * time.Second)
+			stopBurnCpu()
+		}()
+	}
 
 	if burnCpuStart {
 		startBurnCpu()
@@ -50,6 +63,10 @@ const burnCpuBin = "chaos_burncpu"
 // startBurnCpu by invoke burnCpuBin with --nohup flag
 func startBurnCpu() {
 	args := fmt.Sprintf(`%s --nohup > /dev/null 2>&1 &`, path.Join(util.GetProgramPath(), burnCpuBin))
+	if burnTimeout > 0 {
+		args = fmt.Sprintf(`%s --nohup --timeout %d > /dev/null 2>&1 &`,
+			path.Join(util.GetProgramPath(), burnCpuBin), burnTimeout)
+	}
 	ctx := context.Background()
 	response := exec.NewLocalChannel().Run(ctx, "nohup", args)
 	if !response.Success {
@@ -62,7 +79,6 @@ func startBurnCpu() {
 	if pids == nil || len(pids) == 0 {
 		printErrAndExit(fmt.Sprintf("%s pid not found", burnCpuBin))
 	}
-	printOutputAndExit(strings.Join(pids, " "))
 }
 
 // stopBurnCpu
