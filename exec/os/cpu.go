@@ -5,7 +5,12 @@ import (
 	"fmt"
 	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/transport"
+	. "github.com/chaosblade-io/chaosblade/util"
+	"log"
+	. "os/exec"
 	"path"
+	"runtime"
+	"strconv"
 )
 
 type CpuCommandModelSpec struct {
@@ -38,6 +43,11 @@ func (cms *CpuCommandModelSpec) Flags() []exec.ExpFlagSpec {
 		&exec.ExpFlag{
 			Name:     "timeout",
 			Desc:     "execute timeout",
+			Required: false,
+		},
+		&exec.ExpFlag{
+			Name:     "numcpu",
+			Desc:     "number of cpus",
 			Required: false,
 		},
 	}
@@ -100,9 +110,21 @@ func (ce *cpuExecutor) SetChannel(channel exec.Channel) {
 }
 
 func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *transport.Response {
-	timeout := model.ActionFlags["timeout"]
-	if timeout == "" {
-		timeout = "0"
+	// set benchmark timeout
+	if timeout, err := strconv.ParseUint(model.ActionFlags["timeout"], 10, 64); err == nil && timeout > 0 {
+		script := path.Join(GetProgramPath(), bladeBin)
+		args := fmt.Sprintf("nohup /bin/sh -c 'sleep %d; %s destroy %s' > /dev/null 2>&1 &",
+			timeout, script, uid)
+		cmd := CommandContext(context.Background(), "/bin/sh", "-c", args)
+		if err := cmd.Run(); err != nil {
+			log.Fatal(err.Error())
+		}
+	}
+
+	// number of cpu cores
+	numcpu, err := strconv.ParseUint(model.ActionFlags["numcpus"], 10, 64)
+	if err != nil || numcpu <= 0 || int(numcpu) > runtime.NumCPU() {
+		numcpu = uint64(runtime.NumCPU())
 	}
 
 	if ce.channel == nil {
@@ -111,15 +133,16 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMode
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return ce.stop(ctx)
 	} else {
-		return ce.start(ctx, timeout)
+		return ce.start(ctx, int(numcpu))
 	}
 }
 
 const burnCpuBin = "chaos_burncpu"
+const bladeBin = "blade"
 
-func (ce *cpuExecutor) start(ctx context.Context, timeout string) *transport.Response {
+func (ce *cpuExecutor) start(ctx context.Context, numcpu int) *transport.Response {
 	return ce.channel.Run(ctx, path.Join(ce.channel.GetScriptPath(), burnCpuBin),
-		fmt.Sprintf("--start --timeout %s", timeout))
+		fmt.Sprintf("--start --numcpu %d", numcpu))
 }
 
 func (ce *cpuExecutor) stop(ctx context.Context) *transport.Response {
