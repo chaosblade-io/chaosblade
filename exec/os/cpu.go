@@ -115,9 +115,9 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMode
 		script := path.Join(GetProgramPath(), bladeBin)
 		args := fmt.Sprintf("nohup /bin/sh -c 'sleep %d; %s destroy %s' > /dev/null 2>&1 &",
 			timeout, script, uid)
-		cmd := CommandContext(context.Background(), "/bin/sh", "-c", args)
+		cmd := CommandContext(context.TODO(), "/bin/sh", "-c", args)
 		if err := cmd.Run(); err != nil {
-			log.Fatal(err.Error())
+			log.Fatal(err)
 		}
 	}
 
