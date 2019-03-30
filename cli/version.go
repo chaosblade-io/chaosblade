@@ -24,6 +24,7 @@ func (vc *VersionCommand) Init() {
 		Aliases: []string{"v"},
 		Run: func(cmd *cobra.Command, args []string) {
 			cmd.Printf("version: %s\n", ver)
+			cmd.Printf("env: %s\n", env)
 			cmd.Printf("build-time: %s\n", buildTime)
 			return
 		},
