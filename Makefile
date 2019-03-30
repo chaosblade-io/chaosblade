@@ -5,7 +5,7 @@ BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
 
 GO_ENV=CGO_ENABLED=1
-GO_FLAGS=-ldflags="-X main.ver=$(BLADE_VERSION) -X main.env=oss -X 'main.buildTime=`date`'"
+GO_FLAGS=-ldflags="-X main.ver=$(BLADE_VERSION) -X 'main.env=`uname -mo`' -X 'main.buildTime=`date`'"
 GO=env $(GO_ENV) go
 
 BUILD_TARGET=target
@@ -39,7 +39,7 @@ BLADE_JAVA_TOOLS_JAR_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_TOOLS_JAR_NAME
 BLADE_JAVA_TOOLS_JAR_DOWNLOAD_URL=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/release/$(BLADE_JAVA_TOOLS_JAR_NAME)
 
 ifeq ($(GOOS), linux)
-	GO_FLAGS=-ldflags="-linkmode external -extldflags -static -X main.ver=$(BLADE_VERSION) -X main.env=oss -X 'main.buildTime=`date`'"
+	GO_FLAGS=-ldflags="-linkmode external -extldflags -static -X main.ver=$(BLADE_VERSION) -X 'main.env=`uname -mo`' -X 'main.buildTime=`date`'"
 endif
 
 # build chaosblade package and image
