@@ -3,6 +3,7 @@
 BLADE_VERSION=0.0.1
 BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
+BLADE_SRC_ROOT=`pwd`
 
 GO_ENV=CGO_ENABLED=1
 GO_FLAGS=-ldflags="-X main.ver=$(BLADE_VERSION) -X 'main.env=`uname -mo`' -X 'main.buildTime=`date`'"
@@ -135,6 +136,12 @@ build_image: build_linux
 		$(BUILD_IMAGE_PATH)
 
 	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
+
+# build docker image with multi-stage builds
+docker_image: clean
+	docker build -f ./Dockerfile \
+		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
+		-t chaosblade:$(BLADE_VERSION) $(BLADE_SRC_ROOT)
 
 # clean all build result
 clean:
