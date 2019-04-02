@@ -8,15 +8,15 @@ import (
 	"github.com/chaosblade-io/chaosblade/transport"
 )
 
-var delayNetDevice, delayNetTime, delayNetOffset, delayServicePort, delayInvokePort, delayExcludePort string
+var delayNetDevice, delayNetTime, delayNetOffset, delayLocalPort, delayRemotePort, delayExcludePort string
 var delayNetStart, delayNetStop bool
 
 func main() {
 	flag.StringVar(&delayNetDevice, "device", "", "network device")
 	flag.StringVar(&delayNetTime, "time", "", "delay time")
 	flag.StringVar(&delayNetOffset, "offset", "", "delay offset")
-	flag.StringVar(&delayServicePort, "service-port", "", "service port")
-	flag.StringVar(&delayInvokePort, "invoke-port", "", "invoke port")
+	flag.StringVar(&delayLocalPort, "local-port", "", "local port")
+	flag.StringVar(&delayRemotePort, "remote-port", "", "remote port")
 	flag.StringVar(&delayExcludePort, "exclude-port", "", "exclude port")
 	flag.BoolVar(&delayNetStart, "start", false, "start delay")
 	flag.BoolVar(&delayNetStop, "stop", false, "stop delay")
@@ -27,7 +27,7 @@ func main() {
 	}
 
 	if delayNetStart {
-		startDelayNet(delayNetDevice, delayNetTime, delayNetOffset, delayServicePort, delayInvokePort, delayExcludePort)
+		startDelayNet(delayNetDevice, delayNetTime, delayNetOffset, delayLocalPort, delayRemotePort, delayExcludePort)
 	} else if delayNetStop {
 		stopDelayNet(delayNetDevice)
 	} else {
@@ -35,11 +35,11 @@ func main() {
 	}
 }
 
-func startDelayNet(device, time, offset, servicePort, invokePort, excludePort string) {
+func startDelayNet(device, time, offset, localPort, remotePort, excludePort string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
-	// assert servicePort and invokePort
-	if servicePort == "" && invokePort == "" && excludePort == "" {
+	// assert localPort and remotePort
+	if localPort == "" && remotePort == "" && excludePort == "" {
 		response := channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s root netem delay %sms %sms`, device, time, offset))
 		if !response.Success {
 			printErrAndExit(response.Err)
@@ -48,30 +48,30 @@ func startDelayNet(device, time, offset, servicePort, invokePort, excludePort st
 		return
 	}
 	response := addQdiscForDelay(channel, ctx, device, time, offset)
-	if servicePort == "" && invokePort == "" && excludePort != "" {
+	if localPort == "" && remotePort == "" && excludePort != "" {
 		response = addExcludePortFilterForDelay(excludePort, device, response, channel, ctx)
 		printOutputAndExit(response.Result.(string))
 		return
 	}
-	response = addServiceOrInvokePortForDelay(servicePort, response, channel, ctx, device, invokePort)
+	response = addLocalOrRemotePortForDelay(localPort, response, channel, ctx, device, remotePort)
 	printOutputAndExit(response.Result.(string))
 }
 
-// addServiceOrInvokePortForDelay
-func addServiceOrInvokePortForDelay(servicePort string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context, device string, invokePort string) *transport.Response {
-	// service port 0
-	if servicePort != "" {
+// addLocalOrRemotePortForDelay
+func addLocalOrRemotePortForDelay(localPort string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context, device string, remotePort string) *transport.Response {
+	// local port 0
+	if localPort != "" {
 		response = channel.Run(ctx, "tc",
-			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport eq %s)" flowid 1:4`, device, servicePort))
+			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport eq %s)" flowid 1:4`, device, localPort))
 		if !response.Success {
 			stopDelayNet(device)
 			printErrAndExit(response.Err)
 		}
 	}
-	// invoke port 2
-	if invokePort != "" {
+	// remote port 2
+	if remotePort != "" {
 		response = channel.Run(ctx, "tc",
-			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 2 layer transport eq %s)" flowid 1:4`, device, invokePort))
+			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 2 layer transport eq %s)" flowid 1:4`, device, remotePort))
 		if !response.Success {
 			stopDelayNet(device)
 			printErrAndExit(response.Err)
