@@ -3,14 +3,12 @@ package os
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"github.com/chaosblade-io/chaosblade/transport"
-	. "github.com/chaosblade-io/chaosblade/util"
-	"log"
-	. "os/exec"
 	"path"
 	"runtime"
 	"strconv"
+
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/transport"
 )
 
 type CpuCommandModelSpec struct {
@@ -40,11 +38,6 @@ func (*CpuCommandModelSpec) Actions() []exec.ExpActionCommandSpec {
 
 func (cms *CpuCommandModelSpec) Flags() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
-		&exec.ExpFlag{
-			Name:     "timeout",
-			Desc:     "execute timeout",
-			Required: false,
-		},
 		&exec.ExpFlag{
 			Name:     "numcpu",
 			Desc:     "number of cpus",
@@ -110,17 +103,6 @@ func (ce *cpuExecutor) SetChannel(channel exec.Channel) {
 }
 
 func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *transport.Response {
-	// set benchmark timeout
-	if timeout, err := strconv.ParseUint(model.ActionFlags["timeout"], 10, 64); err == nil && timeout > 0 {
-		script := path.Join(GetProgramPath(), bladeBin)
-		args := fmt.Sprintf("nohup /bin/sh -c 'sleep %d; %s destroy %s' > /dev/null 2>&1 &",
-			timeout, script, uid)
-		cmd := CommandContext(context.TODO(), "/bin/sh", "-c", args)
-		if err := cmd.Run(); err != nil {
-			log.Fatal(err)
-		}
-	}
-
 	// number of cpu cores
 	numcpu, err := strconv.ParseUint(model.ActionFlags["numcpus"], 10, 64)
 	if err != nil || numcpu <= 0 || int(numcpu) > runtime.NumCPU() {
