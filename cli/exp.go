@@ -1,21 +1,23 @@
 package main
 
 import (
-	"github.com/spf13/cobra"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"fmt"
-	"strconv"
-	"github.com/sirupsen/logrus"
-	"sync"
-	"github.com/chaosblade-io/chaosblade/exec/jvm"
-	"path"
-	"github.com/chaosblade-io/chaosblade/util"
-	"github.com/chaosblade-io/chaosblade/exec/os"
-	"github.com/chaosblade-io/chaosblade/exec/docker"
-	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
 	"context"
-	"github.com/spf13/pflag"
+	"fmt"
+	osexec "os/exec"
+	"path"
+	"strconv"
+	"sync"
+
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/docker"
+	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
+	"github.com/chaosblade-io/chaosblade/exec/os"
 	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // ExpActionFlags is used to receive experiment action flags
@@ -49,6 +51,8 @@ type modelCommand struct {
 type actionCommand struct {
 	baseCommand
 	*ExpActionFlags
+	uid      string
+	expModel *exec.ExpModel
 }
 
 // modelCommands cache model commands
@@ -246,7 +250,7 @@ func (ec *expCommand) registerActionCommand(actionParentCmdName string, spec exe
 		&ExpActionFlags{
 			ActionFlags:  make(map[string]func() string, 0),
 			MatcherFlags: make(map[string]func() string, 0),
-		},
+		}, "", nil,
 	}
 	command.command = &cobra.Command{
 		Use:     spec.Name(),
@@ -256,11 +260,38 @@ func (ec *expCommand) registerActionCommand(actionParentCmdName string, spec exe
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return command.runActionCommand(actionParentCmdName, cmd, args, spec)
 		},
+		PostRunE: func(cmd *cobra.Command, args []string) error {
+			const bladeBin = "blade"
+
+			if command.expModel != nil {
+				if timeout, err := strconv.ParseUint(command.expModel.ActionFlags["timeout"], 10, 64); err == nil && timeout > 0 && command.uid != "" {
+					script := path.Join(util.GetProgramPath(), bladeBin)
+					args := fmt.Sprintf("nohup /bin/sh -c 'sleep %d; %s destroy %s' > /dev/null 2>&1 &",
+						timeout, script, command.uid)
+					cmd := osexec.CommandContext(context.TODO(), "/bin/sh", "-c", args)
+					return cmd.Run()
+				} else {
+					return err
+				}
+			}
+
+			return nil
+		},
 	}
-	// set action flags
-	ec.bindFlags(command.ActionFlags, command.command, spec.Flags())
+
+	// set action flags, always add timeout param
+	// @TODO `timeout` param does not list in cobra params
+	flags := append(spec.Flags(),
+		&exec.ExpFlag{
+			Name:     "timeout",
+			Desc:     "set timeout for experiment",
+			Required: false,
+		},
+	)
+	ec.bindFlags(command.ActionFlags, command.command, flags)
 	// set matcher flags
 	ec.bindFlags(command.MatcherFlags, command.command, spec.Matchers())
+
 	return command
 }
 
@@ -272,10 +303,16 @@ func (command *actionCommand) runActionCommand(actionParentCmdName string, cmd *
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.DatabaseError], err.Error())
 	}
+
 	// execute experiment
 	executor := spec.Executor(channel_)
 	executor.SetChannel(channel_)
 	response := executor.Exec(model.Uid, ctx_, expModel)
+
+	// pass the uid, expModel to actionCommand
+	command.expModel = expModel
+	command.uid = model.Uid
+
 	if !response.Success {
 		// update status
 		checkError(GetDS().UpdateExperimentModelByUid(model.Uid, "Error", response.Err))
@@ -307,6 +344,7 @@ func (ec *expCommand) bindFlags(commandFlags map[string]func() string, cmd *cobr
 		if flag.FlagNoArgs() {
 			var key bool
 			cmd.PersistentFlags().BoolVar(&key, flagName, false, flagDesc)
+			// @TODO dont convert EVERYTHING into string
 			commandFlags[flagName] = func() string {
 				return strconv.FormatBool(key)
 			}
