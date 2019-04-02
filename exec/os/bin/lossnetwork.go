@@ -8,14 +8,14 @@ import (
 	"github.com/chaosblade-io/chaosblade/transport"
 )
 
-var lossNetDevice, lossNetPercent, lossNetServicePort, lossNetInvokePort, lossNetExcludePort string
+var lossNetDevice, lossNetPercent, lossNetLocalPort, lossNetRemotePort, lossNetExcludePort string
 var lossNetStart, lossNetStop bool
 
 func main() {
 	flag.StringVar(&lossNetDevice, "device", "", "network device")
 	flag.StringVar(&lossNetPercent, "percent", "", "loss percent")
-	flag.StringVar(&lossNetServicePort, "service-port", "", "service port")
-	flag.StringVar(&lossNetInvokePort, "invoke-port", "", "invoke port")
+	flag.StringVar(&lossNetLocalPort, "local-port", "", "local port")
+	flag.StringVar(&lossNetRemotePort, "remote-port", "", "remote port")
 	flag.StringVar(&lossNetExcludePort, "exclude-port", "", "exclude port")
 	flag.BoolVar(&lossNetStart, "start", false, "start loss network")
 	flag.BoolVar(&lossNetStop, "stop", false, "stop loss network")
@@ -25,7 +25,7 @@ func main() {
 		printErrAndExit("must add --start or --stop flag")
 	}
 	if lossNetStart {
-		startLossNet(lossNetDevice, lossNetPercent, lossNetServicePort, lossNetInvokePort, lossNetExcludePort)
+		startLossNet(lossNetDevice, lossNetPercent, lossNetLocalPort, lossNetRemotePort, lossNetExcludePort)
 	} else if lossNetStop {
 		stopLossNet(lossNetDevice)
 	} else {
@@ -33,13 +33,13 @@ func main() {
 	}
 }
 
-func startLossNet(device, percent, servicePort, invokePort, excludePort string) {
+func startLossNet(device, percent, localPort, remotePort, excludePort string) {
 	// invoke stop
 	stopLossNet(device)
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 
-	if servicePort == "" && invokePort == "" && excludePort == "" {
+	if localPort == "" && remotePort == "" && excludePort == "" {
 		response := channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s root netem loss %s%%`, device, percent))
 		if !response.Success {
 			printErrAndExit(response.Err)
@@ -48,28 +48,28 @@ func startLossNet(device, percent, servicePort, invokePort, excludePort string) 
 		return
 	}
 	response := addQdiscForLoss(channel, ctx, device, percent)
-	if servicePort == "" && invokePort == "" && excludePort != "" {
+	if localPort == "" && remotePort == "" && excludePort != "" {
 		response = addExcludePortFilterForLoss(excludePort, device, response, channel, ctx)
 		printOutputAndExit(response.Result.(string))
 		return
 	}
-	response = addServiceOrInvokePortFilterForLoss(servicePort, response, channel, ctx, device, invokePort)
+	response = addLocalOrRemotePortFilterForLoss(localPort, response, channel, ctx, device, remotePort)
 	printOutputAndExit(response.Result.(string))
 }
 
-// addServiceOrInvokePortFilterForLoss
-func addServiceOrInvokePortFilterForLoss(servicePort string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context, device string, invokePort string) *transport.Response {
-	if servicePort != "" {
+// addLocalOrRemotePortFilterForLoss
+func addLocalOrRemotePortFilterForLoss(localPort string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context, device string, remotePort string) *transport.Response {
+	if localPort != "" {
 		response = channel.Run(ctx, "tc",
-			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport eq %s)" flowid 1:4`, device, servicePort))
+			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport eq %s)" flowid 1:4`, device, localPort))
 		if !response.Success {
 			stopLossNet(device)
 			printErrAndExit(response.Err)
 		}
 	}
-	if invokePort != "" {
+	if remotePort != "" {
 		response = channel.Run(ctx, "tc",
-			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 2 layer transport eq %s)" flowid 1:4`, device, invokePort))
+			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 2 layer transport eq %s)" flowid 1:4`, device, remotePort))
 		if !response.Success {
 			stopLossNet(device)
 			printErrAndExit(response.Err)

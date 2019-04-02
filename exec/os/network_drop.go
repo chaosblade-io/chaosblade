@@ -30,12 +30,12 @@ func (*DropActionSpec) LongDesc() string {
 func (*DropActionSpec) Matchers() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
 		&exec.ExpFlag{
-			Name: "service-port",
-			Desc: "Port for external service",
+			Name: "local-port",
+			Desc: "Port for local service",
 		},
 		&exec.ExpFlag{
-			Name: "invoke-port",
-			Desc: "Port for invoking",
+			Name: "remote-port",
+			Desc: "Port for remote service",
 		},
 	}
 }
@@ -58,33 +58,33 @@ func (ne *NetworkDropExecutor) Exec(suid string, ctx context.Context, model *exe
 	if ne.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
-	servicePort := model.ActionFlags["service-port"]
-	invokePort := model.ActionFlags["invoke-port"]
+	localPort := model.ActionFlags["local-port"]
+	remotePort := model.ActionFlags["remote-port"]
 	if _, ok := exec.IsDestroy(ctx); ok {
-		return ne.stop(servicePort, invokePort, ctx)
+		return ne.stop(localPort, remotePort, ctx)
 	} else {
-		return ne.start(servicePort, invokePort, ctx)
+		return ne.start(localPort, remotePort, ctx)
 	}
 }
 
-func (ne *NetworkDropExecutor) start(servicePort, invokePort string, ctx context.Context) *transport.Response {
+func (ne *NetworkDropExecutor) start(localPort, remotePort string, ctx context.Context) *transport.Response {
 	args := "--start"
-	if servicePort != "" {
-		args = fmt.Sprintf("%s --service-port %s", args, servicePort)
+	if localPort != "" {
+		args = fmt.Sprintf("%s --local-port %s", args, localPort)
 	}
-	if invokePort != "" {
-		args = fmt.Sprintf("%s --invoke-port %s", args, invokePort)
+	if remotePort != "" {
+		args = fmt.Sprintf("%s --remote-port %s", args, remotePort)
 	}
 	return ne.channel.Run(ctx, path.Join(ne.channel.GetScriptPath(), dropNetworkBin), args)
 }
 
-func (ne *NetworkDropExecutor) stop(servicePort, invokePort string, ctx context.Context) *transport.Response {
+func (ne *NetworkDropExecutor) stop(localPort, remotePort string, ctx context.Context) *transport.Response {
 	args := "--stop"
-	if servicePort != "" {
-		args = fmt.Sprintf("%s --service-port %s", args, servicePort)
+	if localPort != "" {
+		args = fmt.Sprintf("%s --local-port %s", args, localPort)
 	}
-	if invokePort != "" {
-		args = fmt.Sprintf("%s --invoke-port %s", args, invokePort)
+	if remotePort != "" {
+		args = fmt.Sprintf("%s --remote-port %s", args, remotePort)
 	}
 	return ne.channel.Run(ctx, path.Join(ne.channel.GetScriptPath(), dropNetworkBin), args)
 }
