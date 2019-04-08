@@ -1,0 +1,51 @@
+package main
+
+import (
+	"github.com/spf13/cobra"
+	"net"
+	"fmt"
+	"github.com/chaosblade-io/chaosblade/transport"
+	"strings"
+)
+
+type QueryNetworkCommand struct {
+	baseCommand
+}
+
+func (qnc *QueryNetworkCommand) Init() {
+	qnc.command = &cobra.Command{
+		Use:     "network device",
+		Aliases: []string{"net"},
+		Short:   "Query network information",
+		Long:    "Query network information for chaos experiments of network",
+		Args:    cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return qnc.queryNetworkInfo(cmd, args[0])
+		},
+		Example: qnc.queryNetworkExample(),
+	}
+}
+
+func (qnc *QueryNetworkCommand) queryNetworkExample() string {
+	return `blade query network device`
+}
+
+func (qnc *QueryNetworkCommand) queryNetworkInfo(command *cobra.Command, arg string) error {
+	switch arg {
+	case DeviceArg:
+		interfaces, err := net.Interfaces()
+		if err != nil {
+			return err
+		}
+		names := make([]string, 0)
+		for _, i := range interfaces {
+			if strings.Contains(i.Flags.String(), "up") {
+				names = append(names, i.Name)
+			}
+		}
+		command.Println(transport.ReturnSuccess(names))
+	default:
+		return fmt.Errorf("the %s argument not found", arg)
+	}
+	return nil
+}

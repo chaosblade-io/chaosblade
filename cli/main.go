@@ -34,6 +34,12 @@ func main() {
 	// add status command
 	baseCmd.AddCommand(&StatusCommand{exp: expCommand})
 
+	// add query command
+	queryCommand := &QueryCommand{}
+	baseCmd.AddCommand(queryCommand)
+	queryCommand.AddCommand(&QueryDiskCommand{})
+	queryCommand.AddCommand(&QueryNetworkCommand{})
+
 	if err := cli.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
 		os.Exit(1)
