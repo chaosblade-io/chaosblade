@@ -13,6 +13,8 @@ type QueryDiskCommand struct {
 	baseCommand
 }
 
+const MountPointArg = "mount-point"
+
 func (qdc *QueryDiskCommand) Init() {
 	qdc.command = &cobra.Command{
 		Use:   "disk device",
@@ -27,12 +29,12 @@ func (qdc *QueryDiskCommand) Init() {
 }
 
 func (qdc *QueryDiskCommand) queryDiskExample() string {
-	return `blade query disk device`
+	return `blade query disk mount-point`
 }
 
 func (qdc *QueryDiskCommand) queryDiskInfo(command *cobra.Command, arg string) error {
 	switch arg {
-	case DeviceArg:
+	case MountPointArg:
 		response := exec.NewLocalChannel().Run(context.TODO(), "df",
 			fmt.Sprintf(`-h | grep -v 'Mounted on' | awk '{print $NF}' | tr '\n' ' '`))
 		if !response.Success {

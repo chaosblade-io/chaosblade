@@ -6,8 +6,6 @@ import (
 	"fmt"
 )
 
-const DeviceArg = "device"
-
 // QueryCommand defines query command
 type QueryCommand struct {
 	baseCommand
@@ -18,8 +16,8 @@ func (qc *QueryCommand) Init() {
 	qc.command = &cobra.Command{
 		Use:     "query TARGET TYPE",
 		Aliases: []string{"q"},
-		Short:   "Query information for chaos experiments",
-		Long:    "Query information for chaos experiments",
+		Short:   "Query the parameter values required for chaos experiments",
+		Long:    "Query the parameter values required for chaos experiments",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return transport.ReturnFail(transport.Code[transport.IllegalCommand],
 				fmt.Sprintf("less TARGE to query"))

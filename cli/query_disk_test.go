@@ -38,7 +38,7 @@ func testQueryDiskDevice(t *testing.T, command *cobra.Command, qdc *QueryDiskCom
 	buffer := &bytes.Buffer{}
 	command.SetOutput(buffer)
 
-	arg := "device"
+	arg := "mount-point"
 	err := qdc.queryDiskInfo(command, arg)
 	if err != nil {
 		t.Errorf("unexpected result: %s, expected no error", err)

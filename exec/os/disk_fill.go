@@ -55,7 +55,7 @@ func (fae *FillActionExecutor) Exec(uid string, ctx context.Context, model *exec
 	if fae.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
-	device := model.ActionFlags["mount-on"]
+	device := model.ActionFlags["mount-point"]
 	if device == "" {
 		device = "/"
 	}
