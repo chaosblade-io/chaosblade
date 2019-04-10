@@ -114,7 +114,7 @@ func burnRead(device, size, count string) {
 	}
 }
 
-// get fileSystem by mount-on
+// get fileSystem by mount point
 func getFileSystem(mountOn string) (string, error) {
 	response := exec.NewLocalChannel().Run(context.Background(), "mount", fmt.Sprintf(` | grep "on %s " | awk '{print $1}'`, mountOn))
 	if response.Success {

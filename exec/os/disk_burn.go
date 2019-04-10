@@ -68,7 +68,7 @@ func (be *BurnIOExecutor) Exec(uid string, ctx context.Context, model *exec.ExpM
 	if be.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
-	mountOn := model.ActionFlags["mount-on"]
+	mountOn := model.ActionFlags["mount-point"]
 	if mountOn == "" {
 		mountOn = "/"
 	}

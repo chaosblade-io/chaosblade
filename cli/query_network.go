@@ -12,6 +12,8 @@ type QueryNetworkCommand struct {
 	baseCommand
 }
 
+const DeviceArg = "device"
+
 func (qnc *QueryNetworkCommand) Init() {
 	qnc.command = &cobra.Command{
 		Use:     "network device",
