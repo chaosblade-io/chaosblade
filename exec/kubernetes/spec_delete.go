@@ -73,6 +73,10 @@ func (e *deleteExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMo
 	namespace := model.ActionFlags["namespace"]
 	podName := model.ActionFlags["pod"]
 	containerId := model.ActionFlags["container"]
+	// if invoke destroy, return success directly
+	if _, ok := exec.IsDestroy(ctx); ok {
+		return transport.ReturnSuccess(uid)
+	}
 	if containerId != "" {
 		return e.deleteContainer(containerId, podName, namespace, kubeconfig)
 	}
