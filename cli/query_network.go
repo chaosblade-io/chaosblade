@@ -12,11 +12,11 @@ type QueryNetworkCommand struct {
 	baseCommand
 }
 
-const DeviceArg = "device"
+const InterfaceArg = "interface"
 
 func (qnc *QueryNetworkCommand) Init() {
 	qnc.command = &cobra.Command{
-		Use:     "network device",
+		Use:     "network interface",
 		Aliases: []string{"net"},
 		Short:   "Query network information",
 		Long:    "Query network information for chaos experiments of network",
@@ -29,12 +29,12 @@ func (qnc *QueryNetworkCommand) Init() {
 }
 
 func (qnc *QueryNetworkCommand) queryNetworkExample() string {
-	return `blade query network device`
+	return `blade query network interface`
 }
 
 func (qnc *QueryNetworkCommand) queryNetworkInfo(command *cobra.Command, arg string) error {
 	switch arg {
-	case DeviceArg:
+	case InterfaceArg:
 		interfaces, err := net.Interfaces()
 		if err != nil {
 			return err

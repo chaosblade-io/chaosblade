@@ -37,7 +37,7 @@ func testQueryNetworkDevice(t *testing.T, command *cobra.Command, qnc *QueryNetw
 	buffer := &bytes.Buffer{}
 	command.SetOutput(buffer)
 
-	arg := "device"
+	arg := "interface"
 	err := qnc.queryNetworkInfo(command, arg)
 	if err != nil {
 		t.Errorf("unexpected result: %s, expected no error", err)
