@@ -15,7 +15,7 @@ func TestQueryNetworkCommand_queryNetworkInfo(t *testing.T) {
 	}
 	qnc := &QueryNetworkCommand{
 	}
-	testQueryNetworkDevice(t, command, qnc)
+	testQueryNetworkInterface(t, command, qnc)
 
 	testQueryNetworkUnknownArg(t, command, qnc)
 }
@@ -33,7 +33,7 @@ func testQueryNetworkUnknownArg(t *testing.T, command *cobra.Command, qnc *Query
 	}
 }
 
-func testQueryNetworkDevice(t *testing.T, command *cobra.Command, qnc *QueryNetworkCommand) {
+func testQueryNetworkInterface(t *testing.T, command *cobra.Command, qnc *QueryNetworkCommand) {
 	buffer := &bytes.Buffer{}
 	command.SetOutput(buffer)
 

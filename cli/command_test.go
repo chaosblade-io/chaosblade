@@ -23,20 +23,20 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 		expect expect
 	}{
 		{
-			input{"blade create docker network delay", "--time 3000 --device eth0"},
+			input{"blade create docker network delay", "--time 3000 --interface eth0"},
 			expect{&data.ExperimentModel{
 				Command:    "docker",
 				SubCommand: "network delay",
-				Flag:       "--time 3000 --device eth0",
+				Flag:       "--time 3000 --interface eth0",
 				Status:     "Created",
 			}, false},
 		},
 		{
-			input{"blade create network delay", "--time 3000 --device eth0"},
+			input{"blade create network delay", "--time 3000 --interface eth0"},
 			expect{&data.ExperimentModel{
 				Command:    "network",
 				SubCommand: "delay",
-				Flag:       "--time 3000 --device eth0",
+				Flag:       "--time 3000 --interface eth0",
 				Status:     "Created",
 			}, false},
 		},

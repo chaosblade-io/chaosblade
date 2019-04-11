@@ -18,7 +18,7 @@ func (*NetworkCommandSpec) LongDesc() string {
 }
 
 func (*NetworkCommandSpec) Example() string {
-	return "network delay --device eth0 --time 3000"
+	return "network delay --interface eth0 --time 3000"
 }
 
 func (*NetworkCommandSpec) Actions() []exec.ExpActionCommandSpec {

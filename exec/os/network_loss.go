@@ -42,8 +42,8 @@ func (*LossActionSpec) Matchers() []exec.ExpFlagSpec {
 			Desc: "Exclude one local port, for example 22 port. This flag is invalid when --local-port or --remote-port is specified",
 		},
 		&exec.ExpFlag{
-			Name:     "device",
-			Desc:     "Network device",
+			Name:     "interface",
+			Desc:     "Network interface, for example, eth0",
 			Required: true,
 		},
 	}
@@ -74,11 +74,11 @@ func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *exe
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
 	var dev = ""
-	if device, ok := model.ActionFlags["device"]; ok {
-		if device == "" {
-			return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less device parameter")
+	if netInterface, ok := model.ActionFlags["interface"]; ok {
+		if netInterface == "" {
+			return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less interface flag")
 		}
-		dev = device
+		dev = netInterface
 	}
 	percent := model.ActionFlags["percent"]
 	if percent == "" {
@@ -94,8 +94,8 @@ func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *exe
 	}
 }
 
-func (nle *NetworkLossExecutor) start(device, localPort, remotePort, excludePort, percent string, ctx context.Context) *transport.Response {
-	args := fmt.Sprintf("--start --device %s --percent %s", device, percent)
+func (nle *NetworkLossExecutor) start(netInterface, localPort, remotePort, excludePort, percent string, ctx context.Context) *transport.Response {
+	args := fmt.Sprintf("--start --interface %s --percent %s", netInterface, percent)
 	if localPort != "" {
 		args = fmt.Sprintf("%s --local-port %s", args, localPort)
 	}
@@ -108,9 +108,9 @@ func (nle *NetworkLossExecutor) start(device, localPort, remotePort, excludePort
 	return nle.channel.Run(ctx, path.Join(nle.channel.GetScriptPath(), lossNetworkBin), args)
 }
 
-func (nle *NetworkLossExecutor) stop(device string, ctx context.Context) *transport.Response {
+func (nle *NetworkLossExecutor) stop(netInterface string, ctx context.Context) *transport.Response {
 	return nle.channel.Run(ctx, path.Join(nle.channel.GetScriptPath(), lossNetworkBin),
-		fmt.Sprintf("--stop --device %s", device))
+		fmt.Sprintf("--stop --interface %s", netInterface))
 }
 
 func (nle *NetworkLossExecutor) SetChannel(channel exec.Channel) {

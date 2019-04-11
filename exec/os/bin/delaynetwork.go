@@ -8,11 +8,11 @@ import (
 	"github.com/chaosblade-io/chaosblade/transport"
 )
 
-var delayNetDevice, delayNetTime, delayNetOffset, delayLocalPort, delayRemotePort, delayExcludePort string
+var delayNetInterface, delayNetTime, delayNetOffset, delayLocalPort, delayRemotePort, delayExcludePort string
 var delayNetStart, delayNetStop bool
 
 func main() {
-	flag.StringVar(&delayNetDevice, "device", "", "network device")
+	flag.StringVar(&delayNetInterface, "interface", "", "network interface")
 	flag.StringVar(&delayNetTime, "time", "", "delay time")
 	flag.StringVar(&delayNetOffset, "offset", "", "delay offset")
 	flag.StringVar(&delayLocalPort, "local-port", "", "local port")
@@ -22,58 +22,58 @@ func main() {
 	flag.BoolVar(&delayNetStop, "stop", false, "stop delay")
 	flag.Parse()
 
-	if delayNetDevice == "" {
-		printErrAndExit("less device arg")
+	if delayNetInterface == "" {
+		printErrAndExit("less --interface flag")
 	}
 
 	if delayNetStart {
-		startDelayNet(delayNetDevice, delayNetTime, delayNetOffset, delayLocalPort, delayRemotePort, delayExcludePort)
+		startDelayNet(delayNetInterface, delayNetTime, delayNetOffset, delayLocalPort, delayRemotePort, delayExcludePort)
 	} else if delayNetStop {
-		stopDelayNet(delayNetDevice)
+		stopDelayNet(delayNetInterface)
 	} else {
 		printErrAndExit("less --start or --stop flag")
 	}
 }
 
-func startDelayNet(device, time, offset, localPort, remotePort, excludePort string) {
+func startDelayNet(netInterface, time, offset, localPort, remotePort, excludePort string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	// assert localPort and remotePort
 	if localPort == "" && remotePort == "" && excludePort == "" {
-		response := channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s root netem delay %sms %sms`, device, time, offset))
+		response := channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s root netem delay %sms %sms`, netInterface, time, offset))
 		if !response.Success {
 			printErrAndExit(response.Err)
 		}
 		printOutputAndExit(response.Result.(string))
 		return
 	}
-	response := addQdiscForDelay(channel, ctx, device, time, offset)
+	response := addQdiscForDelay(channel, ctx, netInterface, time, offset)
 	if localPort == "" && remotePort == "" && excludePort != "" {
-		response = addExcludePortFilterForDelay(excludePort, device, response, channel, ctx)
+		response = addExcludePortFilterForDelay(excludePort, netInterface, response, channel, ctx)
 		printOutputAndExit(response.Result.(string))
 		return
 	}
-	response = addLocalOrRemotePortForDelay(localPort, response, channel, ctx, device, remotePort)
+	response = addLocalOrRemotePortForDelay(localPort, response, channel, ctx, netInterface, remotePort)
 	printOutputAndExit(response.Result.(string))
 }
 
 // addLocalOrRemotePortForDelay
-func addLocalOrRemotePortForDelay(localPort string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context, device string, remotePort string) *transport.Response {
+func addLocalOrRemotePortForDelay(localPort string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context, netInterface string, remotePort string) *transport.Response {
 	// local port 0
 	if localPort != "" {
 		response = channel.Run(ctx, "tc",
-			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport eq %s)" flowid 1:4`, device, localPort))
+			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport eq %s)" flowid 1:4`, netInterface, localPort))
 		if !response.Success {
-			stopDelayNet(device)
+			stopDelayNet(netInterface)
 			printErrAndExit(response.Err)
 		}
 	}
 	// remote port 2
 	if remotePort != "" {
 		response = channel.Run(ctx, "tc",
-			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 2 layer transport eq %s)" flowid 1:4`, device, remotePort))
+			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 2 layer transport eq %s)" flowid 1:4`, netInterface, remotePort))
 		if !response.Success {
-			stopDelayNet(device)
+			stopDelayNet(netInterface)
 			printErrAndExit(response.Err)
 		}
 	}
@@ -81,46 +81,46 @@ func addLocalOrRemotePortForDelay(localPort string, response *transport.Response
 }
 
 // addExcludePortFilterForDelay
-func addExcludePortFilterForDelay(excludePort string, device string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context) *transport.Response {
+func addExcludePortFilterForDelay(excludePort string, netInterface string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context) *transport.Response {
 	response = channel.Run(ctx, "tc",
 		fmt.Sprintf(
 			`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport gt 0) and cmp(u16 at 0 layer transport lt %s)" flowid 1:4`,
-			device, excludePort))
+			netInterface, excludePort))
 	if !response.Success {
-		stopDelayNet(device)
+		stopDelayNet(netInterface)
 		printErrAndExit(response.Err)
 	}
 	response = channel.Run(ctx, "tc",
 		fmt.Sprintf(
 			`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport gt %s) and cmp(u16 at 0 layer transport lt 65535)" flowid 1:4`,
-			device, excludePort))
+			netInterface, excludePort))
 	if !response.Success {
-		stopDelayNet(device)
+		stopDelayNet(netInterface)
 		printErrAndExit(response.Err)
 	}
 	return response
 }
 
 // addQdiscForDelay
-func addQdiscForDelay(channel *exec.LocalChannel, ctx context.Context, device string, time string, offset string) *transport.Response {
+func addQdiscForDelay(channel *exec.LocalChannel, ctx context.Context, netInterface string, time string, offset string) *transport.Response {
 	// add tc filter for delay specify port
-	response := channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s root handle 1: prio bands 4`, device))
+	response := channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s root handle 1: prio bands 4`, netInterface))
 	if !response.Success {
 		printErrAndExit(response.Err)
 	}
 	response = channel.Run(ctx, "tc",
-		fmt.Sprintf(`qdisc add dev %s parent 1:4 handle 40: netem delay %sms %sms`, device, time, offset))
+		fmt.Sprintf(`qdisc add dev %s parent 1:4 handle 40: netem delay %sms %sms`, netInterface, time, offset))
 	if !response.Success {
-		stopDelayNet(device)
+		stopDelayNet(netInterface)
 		printErrAndExit(response.Err)
 	}
 	return response
 }
 
 // stopDelayNet, no need to add os.Exit
-func stopDelayNet(device string) {
+func stopDelayNet(netInterface string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
-	channel.Run(ctx, "tc", fmt.Sprintf(`filter del dev %s parent 1: prio 4 basic`, device))
-	channel.Run(ctx, "tc", fmt.Sprintf(`qdisc del dev %s root`, device))
+	channel.Run(ctx, "tc", fmt.Sprintf(`filter del dev %s parent 1: prio 4 basic`, netInterface))
+	channel.Run(ctx, "tc", fmt.Sprintf(`qdisc del dev %s root`, netInterface))
 }
