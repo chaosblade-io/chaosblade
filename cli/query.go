@@ -27,5 +27,5 @@ func (qc *QueryCommand) Init() {
 }
 
 func (qc *QueryCommand) queryExample() string {
-	return `query network device`
+	return `query network interface`
 }

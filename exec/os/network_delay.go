@@ -42,8 +42,8 @@ func (*DelayActionSpec) Matchers() []exec.ExpFlagSpec {
 			Desc: "Exclude one local port, for example 22 port. This flag is invalid when --local-port or --remote-port is specified",
 		},
 		&exec.ExpFlag{
-			Name:     "device",
-			Desc:     "Network device",
+			Name:     "interface",
+			Desc:     "Network interface, for example, eth0",
 			Required: true,
 		},
 	}
@@ -75,9 +75,9 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	if de.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
-	device := model.ActionFlags["device"]
-	if device == "" {
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less device parameter")
+	netInterface := model.ActionFlags["interface"]
+	if netInterface == "" {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less interface parameter")
 	}
 	time := model.ActionFlags["time"]
 	if time == "" {
@@ -91,16 +91,16 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	remotePort := model.ActionFlags["remote-port"]
 	excludePort := model.ActionFlags["exclude-port"]
 	if _, ok := exec.IsDestroy(ctx); ok {
-		return de.stop(device, ctx)
+		return de.stop(netInterface, ctx)
 	} else {
-		return de.start(localPort, remotePort, excludePort, time, offset, device, ctx)
+		return de.start(localPort, remotePort, excludePort, time, offset, netInterface, ctx)
 	}
 }
 
 var delayNetworkBin = "chaos_delaynetwork"
 
-func (de *NetworkDelayExecutor) start(localPort, remotePort, excludePort, time, offset, device string, ctx context.Context) *transport.Response {
-	args := fmt.Sprintf("--start --device %s --time %s --offset %s", device, time, offset)
+func (de *NetworkDelayExecutor) start(localPort, remotePort, excludePort, time, offset, netInterface string, ctx context.Context) *transport.Response {
+	args := fmt.Sprintf("--start --interface %s --time %s --offset %s", netInterface, time, offset)
 	if localPort != "" {
 		args = fmt.Sprintf("%s --local-port %s", args, localPort)
 	}
@@ -113,9 +113,9 @@ func (de *NetworkDelayExecutor) start(localPort, remotePort, excludePort, time, 
 	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), delayNetworkBin), args)
 }
 
-func (de *NetworkDelayExecutor) stop(device string, ctx context.Context) *transport.Response {
+func (de *NetworkDelayExecutor) stop(netInterface string, ctx context.Context) *transport.Response {
 	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), delayNetworkBin),
-		fmt.Sprintf("--stop --device %s", device))
+		fmt.Sprintf("--stop --interface %s", netInterface))
 }
 
 func (de *NetworkDelayExecutor) SetChannel(channel exec.Channel) {
