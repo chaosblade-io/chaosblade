@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"path"
+	"github.com/chaosblade-io/chaosblade/util"
 )
 
 type FillActionSpec struct {
@@ -55,29 +56,33 @@ func (fae *FillActionExecutor) Exec(uid string, ctx context.Context, model *exec
 	if fae.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
-	device := model.ActionFlags["mount-point"]
-	if device == "" {
-		device = "/"
+	mountPoint := model.ActionFlags["mount-point"]
+	if mountPoint == "" {
+		mountPoint = "/"
+	}
+	if !util.IsExist(mountPoint) {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+			fmt.Sprintf("the %s mount point is not exist", mountPoint))
 	}
 	size := model.ActionFlags["size"]
 	if size == "" {
 		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less size arg")
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
-		return fae.stop(device, size, ctx)
+		return fae.stop(mountPoint, size, ctx)
 	} else {
-		return fae.start(device, size, ctx)
+		return fae.start(mountPoint, size, ctx)
 	}
 }
 
-func (fae *FillActionExecutor) start(device, size string, ctx context.Context) *transport.Response {
+func (fae *FillActionExecutor) start(mountPoint, size string, ctx context.Context) *transport.Response {
 	return fae.channel.Run(ctx, path.Join(fae.channel.GetScriptPath(), fillDiskBin),
-		fmt.Sprintf("--device %s --size %s --start", device, size))
+		fmt.Sprintf("--mount-point %s --size %s --start", mountPoint, size))
 }
 
-func (fae *FillActionExecutor) stop(device, size string, ctx context.Context) *transport.Response {
+func (fae *FillActionExecutor) stop(mountPoint, size string, ctx context.Context) *transport.Response {
 	return fae.channel.Run(ctx, path.Join(fae.channel.GetScriptPath(), fillDiskBin),
-		fmt.Sprintf("--device %s --stop", device))
+		fmt.Sprintf("--mount-point %s --stop", mountPoint))
 }
 
 func (fae *FillActionExecutor) SetChannel(channel exec.Channel) {
