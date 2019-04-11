@@ -6,6 +6,7 @@ import (
 	"context"
 	"path"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade/util"
 )
 
 type BurnActionSpec struct {
@@ -68,13 +69,17 @@ func (be *BurnIOExecutor) Exec(uid string, ctx context.Context, model *exec.ExpM
 	if be.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
-	mountOn := model.ActionFlags["mount-point"]
-	if mountOn == "" {
-		mountOn = "/"
+	mountPoint := model.ActionFlags["mount-point"]
+	if mountPoint == "" {
+		mountPoint = "/"
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return be.stop(ctx)
 	} else {
+		if !util.IsExist(mountPoint) {
+			return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+				fmt.Sprintf("the %s mount point is not exist", mountPoint))
+		}
 		readExists := model.ActionFlags["read"] == "true"
 		writeExists := model.ActionFlags["write"] == "true"
 		if !readExists && !writeExists {
@@ -88,13 +93,13 @@ func (be *BurnIOExecutor) Exec(uid string, ctx context.Context, model *exec.ExpM
 		if size == "" {
 			size = "1"
 		}
-		return be.start(readExists, writeExists, count, size, mountOn, ctx)
+		return be.start(readExists, writeExists, count, size, mountPoint, ctx)
 	}
 }
 
-func (be *BurnIOExecutor) start(read, write bool, count, size, device string, ctx context.Context) *transport.Response {
+func (be *BurnIOExecutor) start(read, write bool, count, size, mountPoint string, ctx context.Context) *transport.Response {
 	return be.channel.Run(ctx, path.Join(be.channel.GetScriptPath(), burnIOBin),
-		fmt.Sprintf("--read=%t --write=%t --count %s --size %s --device %s --start", read, write, count, size, device))
+		fmt.Sprintf("--read=%t --write=%t --count %s --size %s --mount-point %s --start", read, write, count, size, mountPoint))
 }
 
 func (be *BurnIOExecutor) stop(ctx context.Context) *transport.Response {

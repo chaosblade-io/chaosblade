@@ -34,7 +34,7 @@ func (*DiskCommandSpec) Flags() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
 		&exec.ExpFlag{
 			Name: "mount-point",
-			Desc: "the disk device mounted point",
+			Desc: "the disk mount point",
 		},
 	}
 }
