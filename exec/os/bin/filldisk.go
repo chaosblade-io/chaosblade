@@ -37,20 +37,11 @@ func main() {
 func startFill(mountPoint, size string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
-	response := channel.Run(ctx, "df", fmt.Sprintf(`-h %s | grep -v 'Mounted on' | awk '{print $NF}'`, mountPoint))
-	if !response.Success {
-		printErrAndExit(response.Err)
+	if mountPoint == "" {
+		printErrAndExit("mount-point flag is empty")
 	}
-	path := strings.TrimSpace(response.Result.(string))
-	if len(path) == 0 {
-		printErrAndExit("cannot find disk mount point")
-	}
-	if path[len(path)-1:] != "/" {
-		path = path + "/"
-	}
-	// "if" arg in dd command is file system value, but "of" arg value is related to mount point
-	dataFile := fmt.Sprintf("%s%s", path, fillDataFile)
-	response = channel.Run(ctx, "dd", fmt.Sprintf(`if=/dev/zero of=%s bs=1b count=1 iflag=fullblock`, dataFile))
+	dataFile := fmt.Sprintf("%s%s", mountPoint, fillDataFile)
+	response := channel.Run(ctx, "dd", fmt.Sprintf(`if=/dev/zero of=%s bs=1b count=1 iflag=fullblock`, dataFile))
 	if !response.Success {
 		stopFill(mountPoint)
 		printErrAndExit(response.Err)

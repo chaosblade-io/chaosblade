@@ -36,12 +36,24 @@ func (qdc *QueryDiskCommand) queryDiskInfo(command *cobra.Command, arg string) e
 	switch arg {
 	case MountPointArg:
 		response := exec.NewLocalChannel().Run(context.TODO(), "df",
-			fmt.Sprintf(`-h | grep -v 'Mounted on' | awk '{print $NF}' | tr '\n' ' '`))
+			fmt.Sprintf(`-h | awk 'NR!=1 {print $1","$NF}' | tr '\n' ' '`))
 		if !response.Success {
 			return response
 		}
 		disks := response.Result.(string)
-		command.Println(transport.ReturnSuccess(strings.Fields(disks)))
+		fields := strings.Fields(disks)
+		var result = make([]string, 0)
+		for _, disk := range fields {
+			// TODO Check the file system prefix, but should check the file system type
+			if strings.HasPrefix(disk, "/") {
+				arr := strings.Split(disk, ",")
+				if len(arr) < 2 {
+					continue
+				}
+				result = append(result, arr[1])
+			}
+		}
+		command.Println(transport.ReturnSuccess(result))
 	default:
 		return fmt.Errorf("the %s argument not found", arg)
 	}
