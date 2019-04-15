@@ -57,13 +57,13 @@ func handleDropSpecifyPort(remotePort string, localPort string, channel *exec.Lo
 	}
 	if remotePort != "" {
 		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A OUTPUT -p tcp --dport %s -j DROP`, localPort))
+			fmt.Sprintf(`-A OUTPUT -p tcp --dport %s -j DROP`, remotePort))
 		if !response.Success {
 			stopDropNet(localPort, remotePort)
 			printErrAndExit(response.Err)
 		}
 		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A OUTPUT -p udp --dport %s -j DROP`, localPort))
+			fmt.Sprintf(`-A OUTPUT -p udp --dport %s -j DROP`, remotePort))
 		if !response.Success {
 			stopDropNet(localPort, remotePort)
 			printErrAndExit(response.Err)
@@ -80,7 +80,7 @@ func stopDropNet(localPort, remotePort string) {
 		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p udp --dport %s -j DROP`, localPort))
 	}
 	if remotePort != "" {
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p tcp --dport %s -j DROP`, localPort))
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p udp --dport %s -j DROP`, localPort))
+		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p tcp --dport %s -j DROP`, remotePort))
+		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p udp --dport %s -j DROP`, remotePort))
 	}
 }

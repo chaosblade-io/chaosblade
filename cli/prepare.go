@@ -66,6 +66,7 @@ func (pc *PrepareJvmCommand) insertPrepareRecord(prepareType string, flags ...st
 }
 
 func (pc *PrepareJvmCommand) handlePrepareResponse(uid string, cmd *cobra.Command, response *transport.Response) error {
+	response.Result = uid
 	if !response.Success {
 		GetDS().UpdatePreparationRecordByUid(uid, "Error", response.Err)
 		return response
