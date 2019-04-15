@@ -11,11 +11,15 @@ import (
 	"github.com/chaosblade-io/chaosblade/util"
 )
 
-var burnIODevice, burnIOSize, burnIOCount string
+var burnIOMountPoint, burnIOFileSystem, burnIOSize, burnIOCount string
 var burnIORead, burnIOWrite, burnIOStart, burnIOStop, burnIONohup bool
 
 func main() {
-	flag.StringVar(&burnIODevice, "device", "", "disk device")
+	// Filesystem      Size  Used Avail Use% Mounted on
+	///dev/vda1        40G  9.5G   28G  26% /
+	//  mount-point value is /, file-system value is /dev/vda1
+	flag.StringVar(&burnIOMountPoint, "mount-point", "", "mount point of disk")
+	flag.StringVar(&burnIOFileSystem, "file-system", "", "file system of disk")
 	flag.StringVar(&burnIOSize, "size", "", "block size")
 	flag.StringVar(&burnIOCount, "count", "", "block count")
 	flag.BoolVar(&burnIOWrite, "write", false, "write io")
@@ -27,16 +31,16 @@ func main() {
 	flag.Parse()
 
 	if burnIOStart {
-		device, err := getFileSystem(burnIODevice)
-		if err != nil || device == "" {
-			printErrAndExit(fmt.Sprintf("cannot find mount device, %s", burnIODevice))
+		fileSystem, err := getFileSystem(burnIOMountPoint)
+		if err != nil || fileSystem == "" {
+			printErrAndExit(fmt.Sprintf("cannot find mount point, %s", burnIOMountPoint))
 		}
-		startBurnIO(device, burnIOSize, burnIOCount, burnIORead, burnIOWrite)
+		startBurnIO(fileSystem, burnIOSize, burnIOCount, burnIORead, burnIOWrite)
 	} else if burnIOStop {
 		stopBurnIO()
 	} else if burnIONohup {
 		if burnIORead {
-			go burnRead(burnIODevice, burnIOSize, burnIOCount)
+			go burnRead(burnIOFileSystem, burnIOSize, burnIOCount)
 		}
 		if burnIOWrite {
 			go burnWrite(burnIOSize, burnIOCount)
@@ -52,12 +56,12 @@ var logFile = "/tmp/chaos_burnio.log"
 var burnIOBin = "chaos_burnio"
 
 // start burn io
-func startBurnIO(device, size, count string, read, write bool) {
+func startBurnIO(fileSystem, size, count string, read, write bool) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	response := channel.Run(ctx, "nohup",
-		fmt.Sprintf(`%s --device %s --size %s --count %s --read=%t --write=%t --nohup=true > %s 2>&1 &`,
-			path.Join(util.GetProgramPath(), burnIOBin), device, size, count, read, write, logFile))
+		fmt.Sprintf(`%s --file-system %s --size %s --count %s --read=%t --write=%t --nohup=true > %s 2>&1 &`,
+			path.Join(util.GetProgramPath(), burnIOBin), fileSystem, size, count, read, write, logFile))
 	if !response.Success {
 		stopBurnIO()
 		printErrAndExit(response.Err)
@@ -104,9 +108,10 @@ func burnWrite(size, count string) {
 }
 
 // read burn
-func burnRead(device, size, count string) {
+func burnRead(fileSystem, size, count string) {
 	for {
-		args := fmt.Sprintf(`if=%s of=/dev/null bs=%sM count=%s iflag=dsync,direct,fullblock`, device, size, count)
+		// "if" arg in dd command is file system value, but "of" arg value is related to mount point
+		args := fmt.Sprintf(`if=%s of=/dev/null bs=%sM count=%s iflag=dsync,direct,fullblock`, fileSystem, size, count)
 		response := exec.NewLocalChannel().Run(context.Background(), "dd", args)
 		if !response.Success {
 			printAndExitWithErrPrefix(response.Err)
@@ -114,9 +119,9 @@ func burnRead(device, size, count string) {
 	}
 }
 
-// get fileSystem by mount-on
-func getFileSystem(mountOn string) (string, error) {
-	response := exec.NewLocalChannel().Run(context.Background(), "mount", fmt.Sprintf(` | grep "on %s " | awk '{print $1}'`, mountOn))
+// get fileSystem by mount point
+func getFileSystem(mountPoint string) (string, error) {
+	response := exec.NewLocalChannel().Run(context.Background(), "mount", fmt.Sprintf(` | grep "on %s " | awk '{print $1}'`, mountPoint))
 	if response.Success {
 		fileSystem := response.Result.(string)
 		return strings.TrimSpace(fileSystem), nil

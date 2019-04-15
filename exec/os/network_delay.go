@@ -30,20 +30,20 @@ func (*DelayActionSpec) LongDesc() string {
 func (*DelayActionSpec) Matchers() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
 		&exec.ExpFlag{
-			Name: "service-port",
-			Desc: "Port for external service",
+			Name: "local-port",
+			Desc: "Port for local service",
 		},
 		&exec.ExpFlag{
-			Name: "invoke-port",
-			Desc: "Port for invoking",
+			Name: "remote-port",
+			Desc: "Port for remote service",
 		},
 		&exec.ExpFlag{
 			Name: "exclude-port",
-			Desc: "Exclude one local port, for example 22 port. This flag is invalid when --service-port or invoke-port is specified",
+			Desc: "Exclude one local port, for example 22 port. This flag is invalid when --local-port or --remote-port is specified",
 		},
 		&exec.ExpFlag{
-			Name:     "device",
-			Desc:     "Network device",
+			Name:     "interface",
+			Desc:     "Network interface, for example, eth0",
 			Required: true,
 		},
 	}
@@ -75,9 +75,9 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	if de.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
-	device := model.ActionFlags["device"]
-	if device == "" {
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less device parameter")
+	netInterface := model.ActionFlags["interface"]
+	if netInterface == "" {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less interface parameter")
 	}
 	time := model.ActionFlags["time"]
 	if time == "" {
@@ -87,25 +87,25 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	if offset == "" {
 		offset = "10"
 	}
-	servicePort := model.ActionFlags["service-port"]
-	invokePort := model.ActionFlags["invoke-port"]
+	localPort := model.ActionFlags["local-port"]
+	remotePort := model.ActionFlags["remote-port"]
 	excludePort := model.ActionFlags["exclude-port"]
 	if _, ok := exec.IsDestroy(ctx); ok {
-		return de.stop(device, ctx)
+		return de.stop(netInterface, ctx)
 	} else {
-		return de.start(servicePort, invokePort, excludePort, time, offset, device, ctx)
+		return de.start(localPort, remotePort, excludePort, time, offset, netInterface, ctx)
 	}
 }
 
 var delayNetworkBin = "chaos_delaynetwork"
 
-func (de *NetworkDelayExecutor) start(servicePort, invokePort, excludePort, time, offset, device string, ctx context.Context) *transport.Response {
-	args := fmt.Sprintf("--start --device %s --time %s --offset %s", device, time, offset)
-	if servicePort != "" {
-		args = fmt.Sprintf("%s --service-port %s", args, servicePort)
+func (de *NetworkDelayExecutor) start(localPort, remotePort, excludePort, time, offset, netInterface string, ctx context.Context) *transport.Response {
+	args := fmt.Sprintf("--start --interface %s --time %s --offset %s", netInterface, time, offset)
+	if localPort != "" {
+		args = fmt.Sprintf("%s --local-port %s", args, localPort)
 	}
-	if invokePort != "" {
-		args = fmt.Sprintf("%s --invoke-port %s", args, invokePort)
+	if remotePort != "" {
+		args = fmt.Sprintf("%s --remote-port %s", args, remotePort)
 	}
 	if excludePort != "" {
 		args = fmt.Sprintf("%s --exclude-port %s", args, excludePort)
@@ -113,9 +113,9 @@ func (de *NetworkDelayExecutor) start(servicePort, invokePort, excludePort, time
 	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), delayNetworkBin), args)
 }
 
-func (de *NetworkDelayExecutor) stop(device string, ctx context.Context) *transport.Response {
+func (de *NetworkDelayExecutor) stop(netInterface string, ctx context.Context) *transport.Response {
 	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), delayNetworkBin),
-		fmt.Sprintf("--stop --device %s", device))
+		fmt.Sprintf("--stop --interface %s", netInterface))
 }
 
 func (de *NetworkDelayExecutor) SetChannel(channel exec.Channel) {

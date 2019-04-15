@@ -20,7 +20,7 @@ func (*DiskCommandSpec) LongDesc() string {
 }
 
 func (*DiskCommandSpec) Example() string {
-	return "disk fill --mount-on / --size 1000"
+	return "disk fill --mount-point / --size 1000"
 }
 
 func (*DiskCommandSpec) Actions() []exec.ExpActionCommandSpec {
@@ -33,8 +33,8 @@ func (*DiskCommandSpec) Actions() []exec.ExpActionCommandSpec {
 func (*DiskCommandSpec) Flags() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
 		&exec.ExpFlag{
-			Name: "mount-on",
-			Desc: "the disk device mounted",
+			Name: "mount-point",
+			Desc: "the disk mount point",
 		},
 	}
 }

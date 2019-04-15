@@ -10,7 +10,9 @@ go-sqlite3
 
 sqlite3 driver conforming to the built-in database/sql interface
 
-Supported Golang version: See .travis.yml
+Supported Golang version:
+- 1.9.x
+- 1.10.x
 
 [This package follows the official Golang Release Policy.](https://golang.org/doc/devel/release.html#policy)
 
@@ -280,7 +282,7 @@ To compile this package on Windows OS you must have the `gcc` compiler installed
 3) Open a terminal for the TDM-GCC toolchain, can be found in the Windows Start menu.
 4) Navigate to your project folder and run the `go build ...` command for this package.
 
-For example the TDM-GCC Toolchain can be found [here](https://sourceforge.net/projects/tdm-gcc/).
+For example the TDM-GCC Toolchain can be found [here](ttps://sourceforge.net/projects/tdm-gcc/).
 
 ## Errors
 
@@ -483,7 +485,7 @@ For an example see [shaxbee/go-spatialite](https://github.com/shaxbee/go-spatial
 
 - Error: `database is locked`
 
-    When you get a database is locked. Please use the following options.
+    When you get an database is locked. Please use the following options.
 
     Add to DSN: `cache=shared`
 
@@ -495,7 +497,7 @@ For an example see [shaxbee/go-spatialite](https://github.com/shaxbee/go-spatial
     Second please set the database connections of the SQL package to 1.
     
     ```go
-    db.SetMaxOpenConns(1)
+    db.SetMaxOpenConn(1)
     ```
 
     More information see [#209](https://github.com/mattn/go-sqlite3/issues/209)

@@ -47,3 +47,6 @@ target
 
 # Website
 site-build
+
+!/vendor/*
+go.sum

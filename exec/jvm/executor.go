@@ -65,6 +65,10 @@ func (e *Executor) createUrl(port, suid string, model *exec.ExpModel) string {
 		if v == "" || v == "false" {
 			continue
 		}
+		// filter timeout because of the java agent implementation by all matchers
+		if k == "timeout" {
+			continue
+		}
 		url = fmt.Sprintf("%s&%s=%s", url, k, v)
 	}
 	return url

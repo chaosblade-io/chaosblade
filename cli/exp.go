@@ -262,25 +262,25 @@ func (ec *expCommand) registerActionCommand(actionParentCmdName string, spec exe
 		},
 		PostRunE: func(cmd *cobra.Command, args []string) error {
 			const bladeBin = "blade"
-
 			if command.expModel != nil {
-				if timeout, err := strconv.ParseUint(command.expModel.ActionFlags["timeout"], 10, 64); err == nil && timeout > 0 && command.uid != "" {
+				tt := command.expModel.ActionFlags["timeout"]
+				if tt == "" {
+					return nil
+				}
+				// the err checked in RunE function
+				if timeout, _ := strconv.ParseUint(tt, 10, 64); timeout > 0 && command.uid != "" {
 					script := path.Join(util.GetProgramPath(), bladeBin)
 					args := fmt.Sprintf("nohup /bin/sh -c 'sleep %d; %s destroy %s' > /dev/null 2>&1 &",
 						timeout, script, command.uid)
 					cmd := osexec.CommandContext(context.TODO(), "/bin/sh", "-c", args)
 					return cmd.Run()
-				} else {
-					return err
 				}
 			}
-
 			return nil
 		},
 	}
 
 	// set action flags, always add timeout param
-	// @TODO `timeout` param does not list in cobra params
 	flags := append(spec.Flags(),
 		&exec.ExpFlag{
 			Name:     "timeout",
@@ -298,6 +298,16 @@ func (ec *expCommand) registerActionCommand(actionParentCmdName string, spec exe
 // runActionCommand
 func (command *actionCommand) runActionCommand(actionParentCmdName string, cmd *cobra.Command, args []string, spec exec.ExpActionCommandSpec) error {
 	expModel := createExpModel(actionParentCmdName, spec.Name(), cmd)
+
+	// check timeout flag
+	tt := expModel.ActionFlags["timeout"]
+	if tt != "" {
+		_, err := strconv.ParseUint(tt, 10, 64)
+		if err != nil {
+			return err
+		}
+	}
+
 	// update status
 	model, err := command.recordExpModel(cmd.CommandPath(), expModel.GetFlags())
 	if err != nil {
@@ -344,7 +354,6 @@ func (ec *expCommand) bindFlags(commandFlags map[string]func() string, cmd *cobr
 		if flag.FlagNoArgs() {
 			var key bool
 			cmd.PersistentFlags().BoolVar(&key, flagName, false, flagDesc)
-			// @TODO dont convert EVERYTHING into string
 			commandFlags[flagName] = func() string {
 				return strconv.FormatBool(key)
 			}

@@ -19,19 +19,19 @@ func Test_convertCommandModel(t *testing.T) {
 		expect expect
 	}{
 		{
-			input{"network delay", "docker", "--time 3000 --device eth0"},
+			input{"network delay", "docker", "--time 3000 --interface eth0"},
 			expect{&exec.ExpModel{
 				Target:      "docker",
 				ActionName:  "network delay",
-				ActionFlags: map[string]string{"time": "3000", "device": "eth0"},
+				ActionFlags: map[string]string{"time": "3000", "interface": "eth0"},
 			}},
 		},
 		{
-			input{"delay", "network", "--time 3000 --device eth0"},
+			input{"delay", "network", "--time 3000 --interface eth0"},
 			expect{&exec.ExpModel{
 				Target:      "network",
 				ActionName:  "delay",
-				ActionFlags: map[string]string{"time": "3000", "device": "eth0"},
+				ActionFlags: map[string]string{"time": "3000", "interface": "eth0"},
 			}},
 		},
 	}

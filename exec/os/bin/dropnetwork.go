@@ -8,12 +8,12 @@ import (
 	"context"
 )
 
-var dropServicePort, dropInvokePort string
+var dropLocalPort, dropRemotePort string
 var dropNetStart, dropNetStop bool
 
 func main() {
-	flag.StringVar(&dropServicePort, "service-port", "", "service port")
-	flag.StringVar(&dropInvokePort, "invoke-port", "", "invoke port")
+	flag.StringVar(&dropLocalPort, "local-port", "", "local port")
+	flag.StringVar(&dropRemotePort, "remote-port", "", "remote port")
 	flag.BoolVar(&dropNetStart, "start", false, "start drop")
 	flag.BoolVar(&dropNetStop, "stop", false, "stop drop")
 	flag.Parse()
@@ -22,65 +22,65 @@ func main() {
 		printErrAndExit("must add --start or --stop flag")
 	}
 	if dropNetStart {
-		startDropNet(dropServicePort, dropInvokePort)
+		startDropNet(dropLocalPort, dropRemotePort)
 	} else if dropNetStop {
-		stopDropNet(dropServicePort, dropInvokePort)
+		stopDropNet(dropLocalPort, dropRemotePort)
 	} else {
 		printErrAndExit("less --start or --stop flag")
 	}
 }
 
-func startDropNet(servicePort, invokePort string) {
+func startDropNet(localPort, remotePort string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
-	if invokePort == "" && servicePort == "" {
+	if remotePort == "" && localPort == "" {
 		printErrAndExit("must specify port flag")
 	}
-	handleDropSpecifyPort(invokePort, servicePort, channel, ctx)
+	handleDropSpecifyPort(remotePort, localPort, channel, ctx)
 }
 
-func handleDropSpecifyPort(invokePort string, servicePort string, channel *exec.LocalChannel, ctx context.Context) {
+func handleDropSpecifyPort(remotePort string, localPort string, channel *exec.LocalChannel, ctx context.Context) {
 	var response *transport.Response
-	if servicePort != "" {
+	if localPort != "" {
 		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A INPUT -p tcp --dport %s -j DROP`, servicePort))
+			fmt.Sprintf(`-A INPUT -p tcp --dport %s -j DROP`, localPort))
 		if !response.Success {
-			stopDropNet(servicePort, invokePort)
+			stopDropNet(localPort, remotePort)
 			printErrAndExit(response.Err)
 		}
 		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A INPUT -p udp --dport %s -j DROP`, servicePort))
+			fmt.Sprintf(`-A INPUT -p udp --dport %s -j DROP`, localPort))
 		if !response.Success {
-			stopDropNet(servicePort, invokePort)
+			stopDropNet(localPort, remotePort)
 			printErrAndExit(response.Err)
 		}
 	}
-	if invokePort != "" {
+	if remotePort != "" {
 		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A OUTPUT -p tcp --dport %s -j DROP`, servicePort))
+			fmt.Sprintf(`-A OUTPUT -p tcp --dport %s -j DROP`, remotePort))
 		if !response.Success {
-			stopDropNet(servicePort, invokePort)
+			stopDropNet(localPort, remotePort)
 			printErrAndExit(response.Err)
 		}
 		response = channel.Run(ctx, "iptables",
-			fmt.Sprintf(`-A OUTPUT -p udp --dport %s -j DROP`, servicePort))
+			fmt.Sprintf(`-A OUTPUT -p udp --dport %s -j DROP`, remotePort))
 		if !response.Success {
-			stopDropNet(servicePort, invokePort)
+			stopDropNet(localPort, remotePort)
 			printErrAndExit(response.Err)
 		}
 	}
 	printOutputAndExit(response.Result.(string))
 }
 
-func stopDropNet(servicePort, invokePort string) {
+func stopDropNet(localPort, remotePort string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
-	if servicePort != "" {
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p tcp --dport %s -j DROP`, servicePort))
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p udp --dport %s -j DROP`, servicePort))
+	if localPort != "" {
+		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p tcp --dport %s -j DROP`, localPort))
+		channel.Run(ctx, "iptables", fmt.Sprintf(`-D INPUT -p udp --dport %s -j DROP`, localPort))
 	}
-	if invokePort != "" {
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p tcp --dport %s -j DROP`, servicePort))
-		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p udp --dport %s -j DROP`, servicePort))
+	if remotePort != "" {
+		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p tcp --dport %s -j DROP`, remotePort))
+		channel.Run(ctx, "iptables", fmt.Sprintf(`-D OUTPUT -p udp --dport %s -j DROP`, remotePort))
 	}
 }
