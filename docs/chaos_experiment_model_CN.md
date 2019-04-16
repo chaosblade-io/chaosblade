@@ -54,7 +54,7 @@ blade create dubbo delay --time 3000 --consumer --service com.example.HelloServi
 
 为了有个更加直观的认识，我们先通过一下的模型结构图来大致看一下模型之间的关系。核心接口模型是：ExpModelCommandSpec，由它引申出来的是ExpActionCommandSpec和ExpFlagSpec这两个接口。其中，ExpModelCommandSpec已有的具体实现有：cpu、network、disk等；ExpActionCommandSpec则是如cpu下的fullload之类的；ExpFlagSpec是各类自定义参数，比如--timeout。更加详细的模型定义说明请见后续小节。
 
-![](http://mdpic.cenyol.com/2019-04-16-模型简图V0.0.1.png)
+![模型简图](https://user-images.githubusercontent.com/3992234/56200214-ecfb3300-6070-11e9-9c33-a318eb305bd9.png)
 
 
 ## chaosblade 模型定义
@@ -196,3 +196,6 @@ func (*DelayActionSpec) Executor(channel exec.Channel) exec.Executor {
 * try-catch 块异常
 
 
+# 文档贡献者
+[@xcaspar](https://github.com/xcaspar)  
+[@Cenyol](https://github.com/Cenyol)
