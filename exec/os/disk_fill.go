@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path"
 	"github.com/chaosblade-io/chaosblade/util"
+	"strconv"
 )
 
 type FillActionSpec struct {
@@ -32,7 +33,7 @@ func (*FillActionSpec) Flags() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
 		&exec.ExpFlag{
 			Name:     "size",
-			Desc:     "fill size, MB",
+			Desc:     "fill size, unit is MB",
 			Required: true,
 		},
 	}
@@ -67,6 +68,10 @@ func (fae *FillActionExecutor) Exec(uid string, ctx context.Context, model *exec
 	size := model.ActionFlags["size"]
 	if size == "" {
 		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less size arg")
+	}
+	_, err := strconv.Atoi(size)
+	if err != nil {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "size must be positive integer")
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return fae.stop(mountPoint, size, ctx)
