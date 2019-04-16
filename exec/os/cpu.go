@@ -104,8 +104,11 @@ func (ce *cpuExecutor) SetChannel(channel exec.Channel) {
 
 func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *transport.Response {
 	// number of cpu cores
-	numcpu, err := strconv.ParseUint(model.ActionFlags["numcpus"], 10, 64)
-	if err != nil || numcpu <= 0 || int(numcpu) > runtime.NumCPU() {
+	numcpu, err := strconv.ParseUint(model.ActionFlags["numcpu"], 10, 64)
+	if err != nil {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "--numcpu value must be a positive integer")
+	}
+	if numcpu <= 0 || int(numcpu) > runtime.NumCPU() {
 		numcpu = uint64(runtime.NumCPU())
 	}
 
@@ -120,7 +123,6 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMode
 }
 
 const burnCpuBin = "chaos_burncpu"
-const bladeBin = "blade"
 
 func (ce *cpuExecutor) start(ctx context.Context, numcpu int) *transport.Response {
 	return ce.channel.Run(ctx, path.Join(ce.channel.GetScriptPath(), burnCpuBin),
