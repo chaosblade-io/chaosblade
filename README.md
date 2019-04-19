@@ -75,6 +75,10 @@ clean compilation:
 make clean
 ```
 
+## Contributing
+We welcome every contribution, even if it is just a punctuation. See details of [CONTRIBUTING](CONTRIBUTING.md)
+
+
 ## Component Architecture 
 ![component.png](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/doc/image/component.png)
 
