@@ -10,8 +10,8 @@ RUN apt-get update && apt-get install unzip
 
 # # The image is used to build chaosblade for musl
 RUN wget http://www.musl-libc.org/releases/musl-${MUSL_VERSION}.tar.gz \
-    && tar -zxvf musl-1.1.21.tar.gz \
-    && rm musl-1.1.21.tar.gz \
+    && tar -zxvf musl-${MUSL_VERSION}.tar.gz \
+    && rm musl-${MUSL_VERSION}.tar.gz \
     && cd musl* \
     && ./configure \
     && make \
