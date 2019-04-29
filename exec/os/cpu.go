@@ -104,14 +104,19 @@ func (ce *cpuExecutor) SetChannel(channel exec.Channel) {
 
 func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *transport.Response {
 	// number of cpu cores
-	numcpu, err := strconv.ParseUint(model.ActionFlags["numcpu"], 10, 64)
-	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "--numcpu value must be a positive integer")
+	numcpuStr := model.ActionFlags["numcpu"]
+	var numcpu uint64
+	var err error
+	if numcpuStr != "" {
+		numcpu, err = strconv.ParseUint(numcpuStr, 10, 64)
+		if err != nil {
+			return transport.ReturnFail(transport.Code[transport.IllegalParameters], "--numcpu value must be a positive integer")
+		}
+
 	}
 	if numcpu <= 0 || int(numcpu) > runtime.NumCPU() {
 		numcpu = uint64(runtime.NumCPU())
 	}
-
 	if ce.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
