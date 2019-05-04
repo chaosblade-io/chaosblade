@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 type DeleteActionCommandSpec struct {
@@ -31,7 +32,11 @@ func (*DeleteActionCommandSpec) Matchers() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
 		&exec.ExpFlag{
 			Name: "pod",
-			Desc: "pod name",
+			Desc: "Pod name",
+		},
+		&exec.ExpFlag{
+			Name: "pods",
+			Desc: "Multiple pod names separated by commas",
 		},
 	}
 }
@@ -72,6 +77,7 @@ func (e *deleteExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMo
 	kubeconfig := model.ActionFlags["kubeconfig"]
 	namespace := model.ActionFlags["namespace"]
 	podName := model.ActionFlags["pod"]
+	podNames := model.ActionFlags["pods"]
 	containerId := model.ActionFlags["container"]
 	// if invoke destroy, return success directly
 	if _, ok := exec.IsDestroy(ctx); ok {
@@ -80,12 +86,30 @@ func (e *deleteExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMo
 	if containerId != "" {
 		return e.deleteContainer(containerId, podName, namespace, kubeconfig)
 	}
-	if podName != "" {
+	if podNames == "" {
+		podNames = podName
+	} else if podName != "" {
+		podNames = fmt.Sprintf("%s,%s", podNames, podName)
+	}
+	if podNames != "" {
 		force, err := strconv.ParseBool(model.ActionFlags["force"])
 		if err != nil {
 			force = false
 		}
-		return e.deletePod(podName, namespace, kubeconfig, force)
+		deletedPods := make([]string, 0)
+		pods := strings.Split(podNames, ",")
+		for _, pod := range pods {
+			response := e.deletePod(strings.TrimSpace(pod), namespace, kubeconfig, force)
+			if response.Success {
+				deletedPods = append(deletedPods, pod)
+			} else {
+				if len(deletedPods) > 0 {
+					response.Err = fmt.Sprintf("%s, has deleted pods: %v", response.Err, deletedPods)
+				}
+				return response
+			}
+		}
+		return transport.ReturnSuccess("success")
 	}
 	return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less --pod or --container")
 }
