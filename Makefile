@@ -1,6 +1,7 @@
 .PHONY: build clean
 
-BLADE_VERSION=0.0.2
+BLADE_VERSION=0.0.3
+
 BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
 BLADE_SRC_ROOT=`pwd`

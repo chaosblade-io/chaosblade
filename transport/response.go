@@ -42,6 +42,8 @@ const (
 	DestroyNotSupported     = "DestroyNotSupported"
 	PreHandleError          = "PreHandleError"
 	SandboxInvokeError      = "SandboxInvokeError"
+	CommandNotFound         = "CommandNotFound"
+	StatusError             = "StatusError"
 )
 
 type CodeType struct {
@@ -61,6 +63,8 @@ var Code = map[string]CodeType{
 	ServerError:             {500, "server error"},
 	HandlerClosed:           {501, "handler closed"},
 	PreHandleError:          {502, "pre handle error"},
+	CommandNotFound:         {503, "command not found"},
+	StatusError:             {504, "status error"},
 	Timeout:                 {510, "timeout"},
 	Uninitialized:           {511, "uninitialized"},
 	EncodeError:             {512, "encode error"},

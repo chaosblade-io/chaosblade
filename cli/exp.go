@@ -102,11 +102,13 @@ func (ec *expCommand) registerOsExpCommands() []*modelCommand {
 	process := ec.registerExpCommand(&os.ProcessCommandModelSpec{})
 	network := ec.registerExpCommand(&os.NetworkCommandSpec{})
 	disk := ec.registerExpCommand(&os.DiskCommandSpec{})
+	script := ec.registerExpCommand(&os.ScriptCommandModelSpec{})
 	return []*modelCommand{
 		cpu,
 		process,
 		network,
 		disk,
+		script,
 	}
 }
 
