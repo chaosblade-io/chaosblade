@@ -9,6 +9,12 @@ import (
 
 	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/transport"
+	"strings"
+)
+
+const (
+	CpuCountFlag = "cpu-count"
+	CpuListFlag  = "cpu-list"
 )
 
 type CpuCommandModelSpec struct {
@@ -39,8 +45,13 @@ func (*CpuCommandModelSpec) Actions() []exec.ExpActionCommandSpec {
 func (cms *CpuCommandModelSpec) Flags() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
 		&exec.ExpFlag{
-			Name:     "numcpu",
-			Desc:     "number of cpus",
+			Name:     CpuCountFlag,
+			Desc:     "Cpu count",
+			Required: false,
+		},
+		&exec.ExpFlag{
+			Name:     CpuListFlag,
+			Desc:     "CPUs in which to allow burning (0-3 or 1,3)",
 			Required: false,
 		},
 	}
@@ -103,37 +114,94 @@ func (ce *cpuExecutor) SetChannel(channel exec.Channel) {
 }
 
 func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *transport.Response {
-	// number of cpu cores
-	numcpuStr := model.ActionFlags["numcpu"]
-	var numcpu uint64
-	var err error
-	if numcpuStr != "" {
-		numcpu, err = strconv.ParseUint(numcpuStr, 10, 64)
-		if err != nil {
-			return transport.ReturnFail(transport.Code[transport.IllegalParameters], "--numcpu value must be a positive integer")
-		}
-
-	}
-	if numcpu <= 0 || int(numcpu) > runtime.NumCPU() {
-		numcpu = uint64(runtime.NumCPU())
-	}
 	if ce.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return ce.stop(ctx)
 	} else {
-		return ce.start(ctx, int(numcpu))
+		var cpuCount int
+		var cpuList string
+
+		cpuListStr := model.ActionFlags[CpuListFlag]
+		if cpuListStr != "" {
+			if !exec.IsCommandAvailable(TasksetCommand) {
+				return transport.ReturnFail(transport.Code[transport.EnvironmentError],
+					fmt.Sprintf("%s command not exist", TasksetCommand))
+			}
+			cores, err := parseCpuList(cpuListStr)
+			if err != nil {
+				return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+					fmt.Sprintf("parse %s flag err, %v", CpuListFlag, err))
+			}
+			cpuList = strings.Join(cores, ",")
+		} else {
+			// if cpu-list value is not empty, then the cpu-count flag is invalid
+			var err error
+			cpuCountStr := model.ActionFlags[CpuCountFlag]
+			if cpuCountStr != "" {
+				cpuCount, err = strconv.Atoi(cpuCountStr)
+				if err != nil {
+					return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+						fmt.Sprintf("--%s value must be a positive integer", CpuCountFlag))
+				}
+			}
+			if cpuCount <= 0 || int(cpuCount) > runtime.NumCPU() {
+				cpuCount = runtime.NumCPU()
+			}
+		}
+		return ce.start(ctx, cpuList, cpuCount)
 	}
 }
 
 const burnCpuBin = "chaos_burncpu"
 
-func (ce *cpuExecutor) start(ctx context.Context, numcpu int) *transport.Response {
-	return ce.channel.Run(ctx, path.Join(ce.channel.GetScriptPath(), burnCpuBin),
-		fmt.Sprintf("--start --numcpu %d", numcpu))
+// start burn cpu
+func (ce *cpuExecutor) start(ctx context.Context, cpuList string, cpuCount int) *transport.Response {
+	args := fmt.Sprintf("--%s --%s %d", StartFlag, CpuCountFlag, cpuCount)
+	if cpuList != "" {
+		args = fmt.Sprintf("%s --%s %s", args, CpuListFlag, cpuList)
+	}
+	return ce.channel.Run(ctx, path.Join(ce.channel.GetScriptPath(), burnCpuBin), args)
 }
 
+// stop burn cpu
 func (ce *cpuExecutor) stop(ctx context.Context) *transport.Response {
-	return ce.channel.Run(ctx, path.Join(ce.channel.GetScriptPath(), burnCpuBin), "--stop")
+	return ce.channel.Run(ctx, path.Join(ce.channel.GetScriptPath(), burnCpuBin), fmt.Sprintf("--%s", StopFlag))
+}
+
+// parseCpuList returns the cpu core count. 0,2-3
+func parseCpuList(cpuListValue string) ([]string, error) {
+	cores := make([]string, 0)
+	commaParts := strings.Split(cpuListValue, ",")
+	for _, part := range commaParts {
+		value := strings.TrimSpace(part)
+		if value == "" {
+			continue
+		}
+		if !strings.Contains(value, "-") {
+			_, err := strconv.Atoi(value)
+			if err != nil {
+				return cores, fmt.Errorf("%s value is illegal, %v", value, err)
+			}
+			cores = append(cores, value)
+			continue
+		}
+		coreRange := strings.Split(value, "-")
+		if len(coreRange) != 2 {
+			return cores, fmt.Errorf("%s value is illegal", value)
+		}
+		startIndex, err := strconv.Atoi(strings.TrimSpace(coreRange[0]))
+		if err != nil {
+			return cores, fmt.Errorf("start in %s value is illegal", value)
+		}
+		endIndex, err := strconv.Atoi(strings.TrimSpace(coreRange[1]))
+		if err != nil {
+			return cores, fmt.Errorf("end in %s value is illegal", value)
+		}
+		for i := startIndex; i <= endIndex; i++ {
+			cores = append(cores, strconv.Itoa(i))
+		}
+	}
+	return cores, nil
 }
