@@ -45,7 +45,8 @@ func execScript(ctx context.Context, script, args string) *transport.Response {
 
 // GetPidsByProcessCmdName
 func GetPidsByProcessCmdName(processName string, ctx context.Context) ([]string, error) {
-	response := channel.Run(ctx, "pgrep", fmt.Sprintf(`-l %s | grep -v -w blade | grep -v -w chaos_killprocess | awk '{print $1}' | tr '\n' ' '`, processName))
+	response := channel.Run(ctx, "pgrep",
+		fmt.Sprintf(`-l %s | grep -v -w blade | grep -v -w chaos_killprocess | awk '{print $1}' | tr '\n' ' '`, processName))
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
 	}
@@ -64,11 +65,12 @@ func GetPidsByProcessName(processName string, ctx context.Context) ([]string, er
 	if otherProcess != nil {
 		processString := otherProcess.(string)
 		if processString != "" {
-			otherGrepInfo = fmt.Sprintf("| grep %s", processString)
+			otherGrepInfo = fmt.Sprintf(`| grep "%s"`, processString)
 		}
 	}
-	response := channel.Run(ctx, "ps", fmt.Sprintf(`%s | grep %s %s | grep -v -w grep | grep -v -w blade | grep -v -w chaos_killprocess | awk '{print $2}' | tr '\n' ' '`,
-		psArgs, processName, otherGrepInfo))
+	response := channel.Run(ctx, "ps",
+		fmt.Sprintf(`%s | grep %s %s | grep -v -w grep | grep -v -w blade | grep -v -w chaos_killprocess | awk '{print $2}' | tr '\n' ' '`,
+			psArgs, processName, otherGrepInfo))
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
 	}
@@ -90,4 +92,10 @@ func GetPsArgs(ctx context.Context) string {
 		psArgs = "-o user,pid,ppid,args"
 	}
 	return psArgs
+}
+
+// IsCommandAvailable return true if the command exists
+func IsCommandAvailable(commandName string) bool {
+	response := execScript(context.TODO(), "command", fmt.Sprintf("-v %s", commandName))
+	return response.Success
 }
