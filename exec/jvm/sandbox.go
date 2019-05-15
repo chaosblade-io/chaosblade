@@ -91,7 +91,7 @@ func attach(pid, port string, ctx context.Context) *transport.Response {
 		sandboxHome, token, "127.0.0.1", port, DefaultNamespace)
 	javaArgs := fmt.Sprintf(`%s -jar %s/sandbox-core.jar %s "%s/sandbox-agent.jar" "%s"`,
 		jvmOpts, sandboxLibPath, pid, sandboxLibPath, sandboxAttachArgs)
-	response = channel.Run(ctx, "java", javaArgs)
+	response = channel.Run(ctx, path.Join(javaHome, "bin/java"), javaArgs)
 	if !response.Success {
 		return response
 	}
