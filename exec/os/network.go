@@ -18,7 +18,9 @@ func (*NetworkCommandSpec) LongDesc() string {
 }
 
 func (*NetworkCommandSpec) Example() string {
-	return "network delay --interface eth0 --time 3000"
+	return `network delay --interface eth0 --time 3000
+
+# You can execute "blade query network interface" command to query the interfaces`
 }
 
 func (*NetworkCommandSpec) Actions() []exec.ExpActionCommandSpec {

@@ -33,7 +33,7 @@ func Attach(processName string, port string) *transport.Response {
 	}
 	pid := pids[0]
 	// refresh
-	response := refresh(pid, port, ctx)
+	response := attach(pid, port, ctx)
 	if !response.Success {
 		return response
 	}
@@ -67,20 +67,7 @@ func active(port string) *transport.Response {
 	return transport.ReturnSuccess("success")
 }
 
-// execute bash bin/sandbox.sh -p $pid -P $2 -R 2>&1
-func refresh(pid, port string, ctx context.Context) *transport.Response {
-	response := attach(pid, port, ctx)
-	if !response.Success {
-		return response
-	}
-	url := getSandboxUrl(port, "sandbox-module-mgr/reset", "")
-	_, err := util.Curl(url)
-	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
-	}
-	return transport.ReturnSuccess("refresh success")
-}
-
+// attach java agent to application process
 func attach(pid, port string, ctx context.Context) *transport.Response {
 	javaHome := os.Getenv("JAVA_HOME")
 	if javaHome == "" {
@@ -104,7 +91,7 @@ func attach(pid, port string, ctx context.Context) *transport.Response {
 		sandboxHome, token, "127.0.0.1", port, DefaultNamespace)
 	javaArgs := fmt.Sprintf(`%s -jar %s/sandbox-core.jar %s "%s/sandbox-agent.jar" "%s"`,
 		jvmOpts, sandboxLibPath, pid, sandboxLibPath, sandboxAttachArgs)
-	response = channel.Run(ctx, "java", javaArgs)
+	response = channel.Run(ctx, path.Join(javaHome, "bin/java"), javaArgs)
 	if !response.Success {
 		return response
 	}

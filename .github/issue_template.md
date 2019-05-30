@@ -25,4 +25,3 @@ Type: *bug report* or *feature request*
 
 ### Anything else we need to know?
 
-

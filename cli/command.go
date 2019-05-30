@@ -1,13 +1,15 @@
 package main
 
 import (
-	"github.com/spf13/cobra"
+	"fmt"
+	"strings"
+	"time"
+
 	"github.com/chaosblade-io/chaosblade/data"
 	"github.com/chaosblade-io/chaosblade/util"
-	"time"
-	"strings"
-	"fmt"
+
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 // Command is cli command interface

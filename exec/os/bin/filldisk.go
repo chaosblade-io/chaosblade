@@ -40,7 +40,7 @@ func startFill(mountPoint, size string) {
 	if mountPoint == "" {
 		printErrAndExit("mount-point flag is empty")
 	}
-	dataFile := fmt.Sprintf("%s%s", mountPoint, fillDataFile)
+	dataFile := path.Join(mountPoint, fillDataFile)
 	response := channel.Run(ctx, "dd", fmt.Sprintf(`if=/dev/zero of=%s bs=1b count=1 iflag=fullblock`, dataFile))
 	if !response.Success {
 		stopFill(mountPoint)

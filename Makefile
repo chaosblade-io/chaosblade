@@ -1,6 +1,7 @@
 .PHONY: build clean
 
-BLADE_VERSION=0.0.1
+BLADE_VERSION=0.0.3
+
 BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
 BLADE_SRC_ROOT=`pwd`
@@ -26,7 +27,7 @@ JVM_SANDBOX_NAME=sandbox-$(JVM_SANDBOX_VERSION)-bin.zip
 JVM_SANDBOX_OSS_URL=https://ompc.oss-cn-hangzhou.aliyuncs.com/jvm-sandbox/release/$(JVM_SANDBOX_NAME)
 JVM_SANDBOX_DEST_PATH=$(BUILD_TARGET_CACHE)/$(JVM_SANDBOX_NAME)
 # used to execute jvm chaos
-BLADE_JAVA_AGENT_VERSION=0.0.1
+BLADE_JAVA_AGENT_VERSION=0.0.3
 BLADE_JAVA_AGENT_NAME=chaosblade-java-agent-$(BLADE_JAVA_AGENT_VERSION).jar
 BLADE_JAVA_AGENT_DOWNLOAD_URL=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/release/$(BLADE_JAVA_AGENT_NAME)
 BLADE_JAVA_AGENT_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_AGENT_NAME)

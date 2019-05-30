@@ -75,6 +75,17 @@ clean compilation:
 make clean
 ```
 
+## Contributing
+We welcome every contribution, even if it is just a punctuation. See details of [CONTRIBUTING](CONTRIBUTING.md)
+
+## Bugs and Feedback
+For bug report, questions and discussions please submit [GitHub Issues](https://github.com/chaosblade-io/chaosblade/issues).
+
+Contact us: chaosblade.io.01@gmail.com
+
+Gitter room: [chaosblade community](https://gitter.im/chaosblade-io/community)
+
+
 ## Component Architecture 
 ![component.png](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/doc/image/component.png)
 

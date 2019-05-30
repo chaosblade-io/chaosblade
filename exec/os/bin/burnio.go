@@ -114,7 +114,7 @@ func burnRead(fileSystem, size, count string) {
 		args := fmt.Sprintf(`if=%s of=/dev/null bs=%sM count=%s iflag=dsync,direct,fullblock`, fileSystem, size, count)
 		response := exec.NewLocalChannel().Run(context.Background(), "dd", args)
 		if !response.Success {
-			printAndExitWithErrPrefix(response.Err)
+			printAndExitWithErrPrefix(fmt.Sprintf("The file system named %s is not supported or %s", fileSystem, response.Err))
 		}
 	}
 }
