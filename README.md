@@ -87,7 +87,7 @@ Gitter room: [chaosblade community](https://gitter.im/chaosblade-io/community)
 
 
 ## Component Architecture 
-![component.png](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/doc/image/component.png)
+![component.png](https://user-images.githubusercontent.com/3992234/58927455-2f8fe080-8781-11e9-9a5e-4e251b1e50f9.png)
 
 * Cli contains create, destroy, status, prepare, revoke, version commands
 * Relevant chaos experiment data is stored locally using SQLite (under the chaosblade directory)
