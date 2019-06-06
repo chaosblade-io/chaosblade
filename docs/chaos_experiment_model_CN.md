@@ -43,7 +43,7 @@ Toolkit.
 ```
 blade create dubbo delay --time 3000 --consumer --service com.example.HelloService --version 1.0.0
 ```
-* `dubbo`: 模型中的 target，对 dubbo 实施实验。
+* `dubbo`: 模型中的 target，对 dubbo 实施实验。
 * `delay`: 模型中的 action，执行延迟演练场景。
 * `--time`: 模型中 action 参数，指延迟时间。
 * `--consumer`、`--service`、`--version`：模型中的 matchers，实验规则匹配器。
