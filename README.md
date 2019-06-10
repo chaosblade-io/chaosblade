@@ -8,7 +8,7 @@ Chaosblade is an experimental tool that follows the principles of Chaos Engineer
 
 Chaosblade is Alibaba's internal MonkeyKing open source project. It is based on Alibaba's nearly ten years of fault testing and practice, combining the best ideas and practices of the Group's businesses.
 
-Chaosblade can be compiled and run directly, and the cli command prompt makes it easier to perform chaos engineering experiments. Currently supported experimental areas include os, java, docker and kubernetes, for example, filling disk, killing process, network delay, Dubbo, MySQL, Servlet and custom class methods of Java application class delay or exception, kill container, kill Pod and so on. You can execute `blade create -h` command to view
+Chaosblade can be compiled and run directly, and the cli command prompt makes it easier to perform chaos engineering experiments. Currently supported experimental areas include os, java, docker and kubernetes, for example, filling disk, killing the process, network delay, Dubbo, MySQL, Servlet and custom class methods of Java application class delay or exception, kill container, kill Pod and so on. You can execute `blade create -h` command to view
 
 
 ## CLI Command
@@ -47,12 +47,12 @@ go get github.com/chaosblade-io/chaosblade
 ```
 This project was downloaded to the `GOPATH/src/github.com/chaosblade-io/chaosblade` directory. You can execute `go env` command to view the `GOPATH` value. 
 
-Go to the the project root directory(`GOPATH/src/github.com/chaosblade-io/chaosblade`) and execute compile:
+Go to the project root directory(`GOPATH/src/github.com/chaosblade-io/chaosblade`) and execute compile:
 ```bash
 make
 ```
 
-If you compile the linux package on the mac operating system, you can do:
+If you compile the Linux package on the Mac operating system, you can do:
 ```bash
 make build_linux
 ```
@@ -76,7 +76,7 @@ make clean
 ```
 
 ## Contributing
-We welcome every contribution, even if it is just a punctuation. See details of [CONTRIBUTING](CONTRIBUTING.md)
+We welcome every contribution, even if it is just punctuation. See details of [CONTRIBUTING](CONTRIBUTING.md)
 
 ## Bugs and Feedback
 For bug report, questions and discussions please submit [GitHub Issues](https://github.com/chaosblade-io/chaosblade/issues).
