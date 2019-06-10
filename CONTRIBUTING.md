@@ -5,9 +5,8 @@ Welcome to ChaosBlade world, here is a list of contributing guide for you. If yo
 
 
 ## What can you do 
-Every action to make project better is encouraged. On GitHub, every improvement for the project could be via a PR 
-(short 
-for pull request).
+Every action to make the project better is encouraged. On GitHub, every improvement for the project could be via a PR 
+(short for pull request).
 
 * If you find a typo, try to fix it!
 * If you find a bug, try to fix it!
@@ -20,7 +19,7 @@ for pull request).
 * If you find document incorrect, just do it and fix that!
 * ...
 
-Actually it is impossible to list them completely. Just remember one principle:
+Actually, it is impossible to list them completely. Just remember one principle:
 
 **WE ARE LOOKING FORWARD TO ANY PR FROM YOU.**
 
@@ -32,12 +31,12 @@ Before you contribute, you need to register a Github ID. Prepare the following e
 * git
 
 ### Workflow
-We use the `master` branch as the development branch, which indicates that this is a unstable branch.
+We use the `master` branch as the development branch, which indicates that this is an unstable branch.
 
-Here are the workflow for contributors:
+Here is the workflow for contributors:
 
 1. Fork to your own
-2. Clone fork to local repository
+2. Clone fork to the local repository
 3. Create a new branch and work on it
 4. Keep your branch in sync
 5. Commit your changes (make sure your commit message concise)
@@ -54,12 +53,12 @@ Before merging a PR, squash any fix review feedback, typo, merged, and rebased s
 The final commit message should be clear and concise.
 
 ### Compile
-Go to the the project root directory which you cloned and execute compile:
+Go to the project root directory which you cloned and execute compile:
 ```bash
 make
 ```
 
-If you compile the linux package on the mac operating system, you can do:
+If you compile the Linux package on the Mac operating system, you can do:
 ```bash
 make build_linux
 ```
@@ -72,7 +71,7 @@ make build_image
 Compilation process:
 * Create the compilation result folder target and chaosblade version directory in the project root directory, and the compiled file is placed in the target/chaosblade-[version] directory.
 * Download the third-party package [jvm-sandbox](https://github.com/alibaba/jvm-sandbox/releases) required by Java Application Chaos Experiment to the cache folder (target/cache)
-* Download chaosblade java agent and tools.jar (for attaching jvm), jar package for implementing Java chaos experiments to cache folder (target/cache)
+* Download chaosblade java agent and tools.jar (for attaching JVM, jar package for implementing Java chaos experiments to cache folder (target/cache)
 * Unzip the JVM-SANDBOX package to the target/chaosblade-[version]/lib directory; copy the chaosblade java agent jar to the JVM-SANDBOX module directory (target/chaosblade-[version]/lib/sandbox/module)
 * Compile the blade (cli command tool) to the target/chaosblade-[version] directory, and other programs needed to implement the chaos experiment will be compiled into the target/chaosblade-[version]/bin directory.
 * Compile is complete, you can enter the target/chaosblade-[version] directory, you can use the blade toolkit.
@@ -88,13 +87,13 @@ See details of [CODE STYLE](./docs/code_styles.md)
 ### Commit Rules
 #### Commit Message
 
-Commit message could help reviewers better understand what is the purpose of submitted PR. It could help accelerate the code review procedure as well. We encourage contributors to use **EXPLICIT** commit message rather than ambiguous message. In general, we advocate the following commit message type:
+Commit message could help reviewers better understand what is the purpose of submitted PR. It could help accelerate the code review procedure as well. We encourage contributors to use **EXPLICIT** commit message rather than an ambiguous message. In general, we advocate the following commit message type:
 
 * feat: A new feature
 * fix: A bug fix
 * docs: Documentation only changes
 * style: Changes that do not affect the meaning of the code (white-space, formatting, missing semi-colons, etc)
-* refactor: A code change that neither fixes a bug nor adds a feature
+* refactor: A code change that neither fixes a bug or adds a feature
 * perf: A code change that improves performance
 * test: Adding missing or correcting existing tests
 * chore: Changes to the build process or auxiliary tools and libraries such as documentation generation
@@ -109,12 +108,12 @@ If you get lost, please see [How to Write a Git Commit Message](http://chris.bea
 
 #### Commit Content
 
-Commit content represents all content changes included in one commit. We had better include things in one single commit which could support reviewer's complete review without any other commits' help. In another word, contents in one single commit can pass the CI to avoid code mess. In brief, there are two minor rules for us to keep in mind:
+Commit content represents all content changes included in one commit. We had better include things in one single commit which could support the reviewer's complete review without any other commits' help. In other word, contents in one single commit can pass the CI to avoid code mess. In brief, there are two minor rules for us to keep in mind:
 
 * avoid very large change in a commit;
 * complete and reviewable for each commit.
 
-No matter commit message, or commit content, we do take more emphasis on code review.
+No matter commit message or commit content, we do take more emphasis on code review.
 
 
 ### Pull Request
@@ -150,7 +149,7 @@ You can also search the ID: `23177705` in dingding(钉钉) app to join the Chaos
 
 ## Others
 ### Code of Conduct
-*"In the interest of fostering an open and welcoming environment, we as contributors and maintainers pledge to making 
+*"In the interest of fostering an open and welcoming environment, we as contributors and maintainers pledge to make 
 participation in our project and our community a harassment-free experience for everyone, regardless of age, body 
 size, disability, ethnicity, sex characteristics, gender identity and expression, level of experience, education, 
 socio-economic status, nationality, personal appearance, race, religion, or sexual identity and orientation..."*
