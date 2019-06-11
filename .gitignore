@@ -49,4 +49,3 @@ target
 site-build
 
 !/vendor/*
-go.sum

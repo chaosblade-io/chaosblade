@@ -1,5 +1,17 @@
 .PHONY: build clean
 
+ifneq ("$(wildcard /go)", "")
+    GOPATH=/go
+endif
+
+ifneq ("$(wildcard /usr/local/go)", "")
+	GOROOT=/usr/local/go
+endif
+
+ifneq ("$(wildcard /usr/lib/go)", "")
+	GOROOT=/usr/lib/go
+endif
+
 BLADE_VERSION=0.0.3
 
 BLADE_BIN=blade
@@ -8,7 +20,7 @@ BLADE_SRC_ROOT=`pwd`
 
 GO_ENV=CGO_ENABLED=1
 GO_FLAGS=-ldflags="-X main.ver=$(BLADE_VERSION) -X 'main.env=`uname -mv`' -X 'main.buildTime=`date`'"
-GO=env $(GO_ENV) go
+GO=env $(GO_ENV) $(GOROOT)/bin/go
 
 BUILD_TARGET=target
 BUILD_TARGET_DIR_NAME=chaosblade-$(BLADE_VERSION)
@@ -17,7 +29,6 @@ BUILD_TARGET_BIN=$(BUILD_TARGET_PKG_DIR)/bin
 BUILD_TARGET_LIB=$(BUILD_TARGET_PKG_DIR)/lib
 BUILD_TARGET_TAR_NAME=$(BUILD_TARGET_DIR_NAME).tar.gz
 BUILD_TARGET_PKG_FILE_PATH=$(BUILD_TARGET)/$(BUILD_TARGET_TAR_NAME)
-BUILD_IMAGE_PATH=build/image/blade
 # cache downloaded file
 BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
@@ -119,24 +130,24 @@ ifneq ($(BUILD_TARGET_CACHE), $(wildcard $(BUILD_TARGET_CACHE)))
 endif
 
 # build chaosblade linux version by docker image
-build_linux:
-	docker build -f build/image/musl/Dockerfile -t chaosblade-build-musl:latest build/image/musl
-	docker run --rm \
-		-v $(shell echo -n ${GOPATH}):/go \
-		-w /go/src/github.com/chaosblade-io/chaosblade \
-		chaosblade-build-musl:latest
-
+# build_linux:
+# 	docker build -f build/image/musl/Dockerfile -t chaosblade-build-musl:latest build/image/musl
+# 	docker run --rm \
+# 		-v $(shell echo -n ${GOPATH}):/go \
+# 		-w /go/src/github.com/chaosblade-io/chaosblade \
+# 		chaosblade-build-musl:latest
+#
 # build chaosblade image for chaos
-build_image: build_linux
-	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
-
-	cp -R $(BUILD_TARGET_PKG_DIR) $(BUILD_IMAGE_PATH)
-	docker build -f $(BUILD_IMAGE_PATH)/Dockerfile \
-		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
-		-t chaosblade-agent:$(BLADE_VERSION) \
-		$(BUILD_IMAGE_PATH)
-
-	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
+# build_image: build_linux
+# 	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
+#
+# 	cp -R $(BUILD_TARGET_PKG_DIR) $(BUILD_IMAGE_PATH)
+# 	docker build -f $(BUILD_IMAGE_PATH)/Dockerfile \
+# 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
+# 		-t chaosblade-agent:$(BLADE_VERSION) \
+# 		$(BUILD_IMAGE_PATH)
+#
+# 	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 
 # build docker image with multi-stage builds
 docker_image: clean
@@ -146,6 +157,5 @@ docker_image: clean
 
 # clean all build result
 clean:
-	go clean ./...
+	$(GO) clean ./...
 	rm -rf $(BUILD_TARGET)
-	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
