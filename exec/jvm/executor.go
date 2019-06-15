@@ -1,14 +1,15 @@
 package jvm
 
 import (
-	"github.com/chaosblade-io/chaosblade/transport"
 	"context"
-	"fmt"
-	"strings"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"github.com/chaosblade-io/chaosblade/data"
 	"encoding/json"
+	"fmt"
+	"github.com/chaosblade-io/chaosblade/data"
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/chaosblade-io/chaosblade/util"
+	neturl "net/url"
+	"strings"
 )
 
 const DefaultUri = "sandbox/default/module/http/chaosblade"
@@ -69,7 +70,7 @@ func (e *Executor) createUrl(port, suid string, model *exec.ExpModel) string {
 		if k == "timeout" {
 			continue
 		}
-		url = fmt.Sprintf("%s&%s=%s", url, k, v)
+		url = fmt.Sprintf("%s&%s=%s", url, k, neturl.QueryEscape(v))
 	}
 	return url
 }
