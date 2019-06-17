@@ -86,7 +86,7 @@ func GetUserHome() string {
 }
 
 // Curl url
-func Curl(url string) (string, error) {
+func Curl(url string) (string, error, int) {
 	trans := http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return net.DialTimeout(network, addr, 10*time.Second)
@@ -97,12 +97,12 @@ func Curl(url string) (string, error) {
 	}
 	resp, err := client.Get(url)
 	if err != nil {
-		return "", err
+		return "", err, 0
 	}
 	defer resp.Body.Close()
 	bytes, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return "", err
+		return "", err, resp.StatusCode
 	}
-	return string(bytes), nil
+	return string(bytes), nil, resp.StatusCode
 }
