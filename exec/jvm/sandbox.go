@@ -50,19 +50,27 @@ func Attach(processName string, port string) *transport.Response {
 // curl -s http://localhost:$2/sandbox/default/module/http/chaosblade/status 2>&1
 func check(port string) *transport.Response {
 	url := getSandboxUrl(port, "chaosblade/status", "")
-	result, err := util.Curl(url)
+	result, err, code := util.Curl(url)
+	if code == 200 {
+		return transport.ReturnSuccess(result)
+	}
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
 	}
-	return transport.ReturnSuccess(result)
+	return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+		fmt.Sprintf("response code is %d, result: %s", code, result))
 }
 
 // active chaosblade bin/sandbox.sh -p $pid -P $2 -a chaosblade 2>&1
 func active(port string) *transport.Response {
 	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids=chaosblade")
-	_, err := util.Curl(url)
+	result, err, code := util.Curl(url)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+	}
+	if code != 200 {
+		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+			fmt.Sprintf("active module response code: %d, result: %s", code, result))
 	}
 	return transport.ReturnSuccess("success")
 }
@@ -112,9 +120,13 @@ func Detach(port string) *transport.Response {
 // sudo -u $user -H bash bin/sandbox.sh -p $pid -S 2>&1
 func shutdown(port string) *transport.Response {
 	url := getSandboxUrl(port, "sandbox-control/shutdown", "")
-	_, err := util.Curl(url)
+	result, err, code := util.Curl(url)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+	}
+	if code != 200 {
+		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+			fmt.Sprintf("shutdown module response code: %d, result: %s", code, result))
 	}
 	return transport.ReturnSuccess("success")
 }

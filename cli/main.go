@@ -39,6 +39,7 @@ func main() {
 	baseCmd.AddCommand(queryCommand)
 	queryCommand.AddCommand(&QueryDiskCommand{})
 	queryCommand.AddCommand(&QueryNetworkCommand{})
+	queryCommand.AddCommand(&QueryJvmCommand{})
 
 	if err := cli.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err.Error())
