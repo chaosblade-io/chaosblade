@@ -1,14 +1,14 @@
 package jvm
 
 import (
-	"github.com/chaosblade-io/chaosblade/exec"
 	"context"
-	"github.com/chaosblade-io/chaosblade/util"
-	"github.com/chaosblade-io/chaosblade/transport"
 	"fmt"
-	"strings"
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade/util"
 	"os"
 	"path"
+	"strings"
 	"time"
 )
 
@@ -17,7 +17,7 @@ var channel = exec.NewLocalChannel()
 
 const DefaultNamespace = "default"
 
-func Attach(processName string, port string) *transport.Response {
+func Attach(processName string, port string, javaHome string) *transport.Response {
 	// get process pid
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, exec.ProcessKey, "java")
@@ -33,7 +33,7 @@ func Attach(processName string, port string) *transport.Response {
 	}
 	pid := pids[0]
 	// refresh
-	response := attach(pid, port, ctx)
+	response := attach(pid, port, ctx, javaHome)
 	if !response.Success {
 		return response
 	}
@@ -68,8 +68,11 @@ func active(port string) *transport.Response {
 }
 
 // attach java agent to application process
-func attach(pid, port string, ctx context.Context) *transport.Response {
-	javaHome := os.Getenv("JAVA_HOME")
+func attach(pid, port string, ctx context.Context, javaHome string) *transport.Response {
+
+	if javaHome == "" {
+		javaHome = os.Getenv("JAVA_HOME")
+	}
 	if javaHome == "" {
 		return transport.ReturnFail(transport.Code[transport.EnvironmentError], "JAVA_HOME env not found")
 	}
