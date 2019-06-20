@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+  
 	"github.com/chaosblade-io/chaosblade/data"
 	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/transport"
@@ -13,7 +14,6 @@ import (
 )
 
 const DefaultUri = "sandbox/default/module/http/chaosblade"
-const Sandbox404 = "Error 404 Not Found"
 
 // Executor for jvm experiment
 type Executor struct {
@@ -38,7 +38,7 @@ func (e *Executor) SetChannel(channel exec.Channel) {
 
 func (e *Executor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *transport.Response {
 	var url_ string
-	port, err := e.getPortFromDB(model)
+	port, err := e.getPortFromDB(model.ActionFlags["process"])
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "cannot get port from local")
 	}
@@ -47,11 +47,11 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *
 	} else {
 		url_ = e.createUrl(port, uid, model)
 	}
-	result, err := util.Curl(url_)
+	result, err, code := util.Curl(url_)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
 	}
-	if strings.Contains(result, Sandbox404) {
+	if code == 404 {
 		return transport.ReturnFail(transport.Code[transport.JavaAgentCmdError], "please invoke attach command first")
 	}
 	var resp transport.Response
@@ -81,16 +81,66 @@ func (e *Executor) destroyUrl(port, uid string) string {
 	return url
 }
 
+func (e *Executor) QueryStatus(uid string) *transport.Response {
+	experimentModel, err := db.QueryExperimentModelByUid(uid)
+	if err != nil {
+		return transport.ReturnFail(transport.Code[transport.DatabaseError],
+			fmt.Sprintf("query experiment error, %s", err.Error()))
+	}
+	if experimentModel == nil {
+		return transport.ReturnFail(transport.Code[transport.DataNotFound], "the experiment record not found")
+	}
+	// get process flag
+	process := getProcessFlagFromExpRecord(experimentModel)
+	port, err := e.getPortFromDB(process)
+	if err != nil {
+		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+	}
+	url := e.statusUrl(port, uid)
+	result, err, code := util.Curl(url)
+	if err != nil {
+		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+	}
+	if code == 404 {
+		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], "the command not support")
+	}
+	if code != 200 {
+		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], result)
+	}
+	var resp transport.Response
+	json.Unmarshal([]byte(result), &resp)
+	return &resp
+}
+
+func (e *Executor) statusUrl(port, uid string) string {
+	return fmt.Sprintf("http://%s:%s/%s/status?suid=%s", "127.0.0.1", port, e.Uri, uid)
+}
+
 var db = data.GetSource()
 
-func (e *Executor) getPortFromDB(model *exec.ExpModel) (string, error) {
-	processName := model.ActionFlags["process"]
-	record, err := db.QueryRunningPreByTypeAndProcess("jvm", processName)
+func (e *Executor) getPortFromDB(process string) (string, error) {
+	record, err := db.QueryRunningPreByTypeAndProcess("jvm", process)
 	if err != nil {
 		return "", err
 	}
 	if record == nil {
-		return "", fmt.Errorf("port not found for %s process, please execute prepare command firstly", processName)
+		return "", fmt.Errorf("port not found for %s process, please execute prepare command firstly", process)
 	}
 	return record.Port, nil
+}
+
+func getProcessFlagFromExpRecord(model *data.ExperimentModel) string {
+	flagValue := model.Flag
+	fields := strings.Fields(flagValue)
+	for idx, value := range fields {
+		if strings.HasPrefix(value, "--process") || strings.HasPrefix(value, "-process") {
+			// contains process flag, predicate equal symbol next
+			eqlIdx := strings.Index(value, "=")
+			if eqlIdx > 0 {
+				return value[eqlIdx+1:]
+			}
+			return fields[idx+1]
+		}
+	}
+	return ""
 }
