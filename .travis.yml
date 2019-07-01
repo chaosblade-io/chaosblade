@@ -1,0 +1,33 @@
+sudo: required
+
+cache:
+    directories:
+    # We cache the SDK so we don't have to download it again on subsequent builds.
+        - $HOME/google-cloud-sdk
+
+services: 
+    - docker
+
+env:
+    global:
+    # Do not prompt for user input when using any SDK methods.
+        - CLOUDSDK_CORE_DISABLE_PROMPTS=1 
+
+language: go
+
+go:
+    - 1.12.x
+
+before_install:
+    - go get -u github.com/chaosblade-io/chaosblade || true
+    - if [ ! -d $HOME/google-cloud-sdk/bin ]; then
+        rm -rf $HOME/google-cloud-sdk;
+        curl https://sdk.cloud.google.com | bash > /dev/null;
+      fi
+    - source $HOME/google-cloud-sdk/path.bash.inc
+    - gcloud components install kubectl
+    - gcloud version
+
+script:
+    - make
+    - go test -v  ./...
