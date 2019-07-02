@@ -7,6 +7,7 @@ import (
 )
 
 func TestChannel_GetBladePodByContainer(t *testing.T) {
+	t.Skip("Skip TestChannel_GetBladePodByContainer of channel_test.go in travis CI")
 	channel := &Channel{
 		channel: exec.NewLocalChannel(),
 	}
