@@ -1,11 +1,13 @@
 package main
 
 import (
-	"fmt"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"flag"
-	"github.com/chaosblade-io/chaosblade/exec"
 	"context"
+	"flag"
+	"fmt"
+
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/os/bin"
+	"github.com/chaosblade-io/chaosblade/transport"
 )
 
 var dropLocalPort, dropRemotePort string
@@ -19,14 +21,14 @@ func main() {
 	flag.Parse()
 
 	if dropNetStart == dropNetStop {
-		printErrAndExit("must add --start or --stop flag")
+		bin.PrintErrAndExit("must add --start or --stop flag")
 	}
 	if dropNetStart {
 		startDropNet(dropLocalPort, dropRemotePort)
 	} else if dropNetStop {
 		stopDropNet(dropLocalPort, dropRemotePort)
 	} else {
-		printErrAndExit("less --start or --stop flag")
+		bin.PrintErrAndExit("less --start or --stop flag")
 	}
 }
 
@@ -34,7 +36,7 @@ func startDropNet(localPort, remotePort string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	if remotePort == "" && localPort == "" {
-		printErrAndExit("must specify port flag")
+		bin.PrintErrAndExit("must specify port flag")
 	}
 	handleDropSpecifyPort(remotePort, localPort, channel, ctx)
 }
@@ -46,13 +48,13 @@ func handleDropSpecifyPort(remotePort string, localPort string, channel *exec.Lo
 			fmt.Sprintf(`-A INPUT -p tcp --dport %s -j DROP`, localPort))
 		if !response.Success {
 			stopDropNet(localPort, remotePort)
-			printErrAndExit(response.Err)
+			bin.PrintErrAndExit(response.Err)
 		}
 		response = channel.Run(ctx, "iptables",
 			fmt.Sprintf(`-A INPUT -p udp --dport %s -j DROP`, localPort))
 		if !response.Success {
 			stopDropNet(localPort, remotePort)
-			printErrAndExit(response.Err)
+			bin.PrintErrAndExit(response.Err)
 		}
 	}
 	if remotePort != "" {
@@ -60,16 +62,16 @@ func handleDropSpecifyPort(remotePort string, localPort string, channel *exec.Lo
 			fmt.Sprintf(`-A OUTPUT -p tcp --dport %s -j DROP`, remotePort))
 		if !response.Success {
 			stopDropNet(localPort, remotePort)
-			printErrAndExit(response.Err)
+			bin.PrintErrAndExit(response.Err)
 		}
 		response = channel.Run(ctx, "iptables",
 			fmt.Sprintf(`-A OUTPUT -p udp --dport %s -j DROP`, remotePort))
 		if !response.Success {
 			stopDropNet(localPort, remotePort)
-			printErrAndExit(response.Err)
+			bin.PrintErrAndExit(response.Err)
 		}
 	}
-	printOutputAndExit(response.Result.(string))
+	bin.PrintOutputAndExit(response.Result.(string))
 }
 
 func stopDropNet(localPort, remotePort string) {

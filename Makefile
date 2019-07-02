@@ -57,31 +57,31 @@ build_cli:
 build_osbin: build_burncpu build_burnio build_killprocess build_changedns build_delaynetwork build_dropnetwork build_lossnetwork build_filldisk
 
 # build burn-cpu chaos tools
-build_burncpu: exec/os/bin/burncpu.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burncpu $< exec/os/bin/common.go
+build_burncpu: exec/os/bin/burncpu/burncpu.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burncpu $<
 
 # build burn-io chaos tools
-build_burnio: exec/os/bin/burnio.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burnio $< exec/os/bin/common.go
+build_burnio: exec/os/bin/burnio/burnio.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burnio $<
 
 # build kill-process chaos tools
-build_killprocess: exec/os/bin/killprocess.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_killprocess $< exec/os/bin/common.go
+build_killprocess: exec/os/bin/killprocess/killprocess.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_killprocess $<
 
-build_changedns: exec/os/bin/changedns.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_changedns $< exec/os/bin/common.go
+build_changedns: exec/os/bin/changedns/changedns.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_changedns $<
 
-build_delaynetwork: exec/os/bin/delaynetwork.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_delaynetwork $< exec/os/bin/common.go
+build_delaynetwork: exec/os/bin/delaynetwork/delaynetwork.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_delaynetwork $<
 
-build_dropnetwork: exec/os/bin/dropnetwork.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_dropnetwork $< exec/os/bin/common.go
+build_dropnetwork: exec/os/bin/dropnetwork/dropnetwork.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_dropnetwork $<
 
-build_lossnetwork: exec/os/bin/lossnetwork.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_lossnetwork $< exec/os/bin/common.go
+build_lossnetwork: exec/os/bin/lossnetwork/lossnetwork.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_lossnetwork $<
 
-build_filldisk: exec/os/bin/filldisk.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_filldisk $< exec/os/bin/common.go
+build_filldisk: exec/os/bin/filldisk/filldisk.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_filldisk $<
 
 # create dir or download necessary file
 pre_build:mkdir_build_target download_sandbox download_blade_java_agent

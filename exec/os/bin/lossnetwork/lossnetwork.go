@@ -1,10 +1,12 @@
 package main
 
 import (
-	"fmt"
-	"flag"
-	"github.com/chaosblade-io/chaosblade/exec"
 	"context"
+	"flag"
+	"fmt"
+
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/os/bin"
 	"github.com/chaosblade-io/chaosblade/transport"
 )
 
@@ -22,14 +24,14 @@ func main() {
 	flag.Parse()
 
 	if lossNetStart == lossNetStop {
-		printErrAndExit("must add --start or --stop flag")
+		bin.PrintErrAndExit("must add --start or --stop flag")
 	}
 	if lossNetStart {
 		startLossNet(lossNetInterface, lossNetPercent, lossNetLocalPort, lossNetRemotePort, lossNetExcludePort)
 	} else if lossNetStop {
 		stopLossNet(lossNetInterface)
 	} else {
-		printErrAndExit("less --start or --stop flag")
+		bin.PrintErrAndExit("less --start or --stop flag")
 	}
 }
 
@@ -42,19 +44,19 @@ func startLossNet(netInterface, percent, localPort, remotePort, excludePort stri
 	if localPort == "" && remotePort == "" && excludePort == "" {
 		response := channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s root netem loss %s%%`, netInterface, percent))
 		if !response.Success {
-			printErrAndExit(response.Err)
+			bin.PrintErrAndExit(response.Err)
 		}
-		printOutputAndExit(response.Result.(string))
+		bin.PrintOutputAndExit(response.Result.(string))
 		return
 	}
 	response := addQdiscForLoss(channel, ctx, netInterface, percent)
 	if localPort == "" && remotePort == "" && excludePort != "" {
 		response = addExcludePortFilterForLoss(excludePort, netInterface, response, channel, ctx)
-		printOutputAndExit(response.Result.(string))
+		bin.PrintOutputAndExit(response.Result.(string))
 		return
 	}
 	response = addLocalOrRemotePortFilterForLoss(localPort, response, channel, ctx, netInterface, remotePort)
-	printOutputAndExit(response.Result.(string))
+	bin.PrintOutputAndExit(response.Result.(string))
 }
 
 // addLocalOrRemotePortFilterForLoss
@@ -64,7 +66,7 @@ func addLocalOrRemotePortFilterForLoss(localPort string, response *transport.Res
 			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport eq %s)" flowid 1:4`, netInterface, localPort))
 		if !response.Success {
 			stopLossNet(netInterface)
-			printErrAndExit(response.Err)
+			bin.PrintErrAndExit(response.Err)
 		}
 	}
 	if remotePort != "" {
@@ -72,7 +74,7 @@ func addLocalOrRemotePortFilterForLoss(localPort string, response *transport.Res
 			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 2 layer transport eq %s)" flowid 1:4`, netInterface, remotePort))
 		if !response.Success {
 			stopLossNet(netInterface)
-			printErrAndExit(response.Err)
+			bin.PrintErrAndExit(response.Err)
 		}
 	}
 	return response
@@ -86,7 +88,7 @@ func addExcludePortFilterForLoss(excludePort string, netInterface string, respon
 			netInterface, excludePort))
 	if !response.Success {
 		stopLossNet(netInterface)
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
 	response = channel.Run(ctx, "tc",
 		fmt.Sprintf(
@@ -94,7 +96,7 @@ func addExcludePortFilterForLoss(excludePort string, netInterface string, respon
 			netInterface, excludePort))
 	if !response.Success {
 		stopLossNet(netInterface)
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
 	return response
 }
@@ -106,13 +108,13 @@ func addQdiscForLoss(channel *exec.LocalChannel, ctx context.Context, netInterfa
 	if !response.Success {
 		// invoke stop
 		stopLossNet(netInterface)
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
 	response = channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s parent 1:4 handle 40: netem loss %s%%`, netInterface, percent))
 	if !response.Success {
 		// invoke stop
 		stopLossNet(netInterface)
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
 	return response
 }
