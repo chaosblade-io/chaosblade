@@ -1,18 +1,19 @@
 package main
 
 import (
-	"github.com/spf13/cobra"
-	"path"
-	"github.com/chaosblade-io/chaosblade/util"
 	"fmt"
-	"net"
-	"strconv"
-	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/spf13/cobra"
+	"net"
+	"path"
+	"strconv"
 )
 
 type PrepareJvmCommand struct {
 	baseCommand
+	javaHome    string
 	processName string
 	// sandboxHome is jvm-sandbox home, default value is CHAOSBLADE_HOME/lib
 	sandboxHome string
@@ -28,6 +29,7 @@ func (pc *PrepareJvmCommand) Init() {
 		},
 		Example: pc.prepareExample(),
 	}
+	pc.command.Flags().StringVarP(&pc.javaHome, "javaHome", "j", "", "the java jdk home path")
 	pc.command.Flags().StringVarP(&pc.processName, "process", "p", "", "the java application process name (required)")
 	pc.command.MarkFlagRequired("process")
 	pc.sandboxHome = path.Join(util.GetLibHome(), "sandbox")
@@ -55,7 +57,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))
 		}
 	}
-	response := jvm.Attach(pc.processName, record.Port)
+	response := jvm.Attach(pc.processName, record.Port, pc.javaHome)
 	return pc.handlePrepareResponse(record.Uid, pc.command, response)
 }
 

@@ -1,14 +1,14 @@
 package jvm
 
 import (
-	"github.com/chaosblade-io/chaosblade/exec"
 	"context"
-	"github.com/chaosblade-io/chaosblade/util"
-	"github.com/chaosblade-io/chaosblade/transport"
 	"fmt"
-	"strings"
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade/util"
 	"os"
 	"path"
+	"strings"
 	"time"
 )
 
@@ -17,7 +17,7 @@ var channel = exec.NewLocalChannel()
 
 const DefaultNamespace = "default"
 
-func Attach(processName string, port string) *transport.Response {
+func Attach(processName string, port string, javaHome string) *transport.Response {
 	// get process pid
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, exec.ProcessKey, "java")
@@ -33,7 +33,7 @@ func Attach(processName string, port string) *transport.Response {
 	}
 	pid := pids[0]
 	// refresh
-	response := attach(pid, port, ctx)
+	response := attach(pid, port, ctx, javaHome)
 	if !response.Success {
 		return response
 	}
@@ -50,26 +50,36 @@ func Attach(processName string, port string) *transport.Response {
 // curl -s http://localhost:$2/sandbox/default/module/http/chaosblade/status 2>&1
 func check(port string) *transport.Response {
 	url := getSandboxUrl(port, "chaosblade/status", "")
-	result, err := util.Curl(url)
+	result, err, code := util.Curl(url)
+	if code == 200 {
+		return transport.ReturnSuccess(result)
+	}
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
 	}
-	return transport.ReturnSuccess(result)
+	return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+		fmt.Sprintf("response code is %d, result: %s", code, result))
 }
 
 // active chaosblade bin/sandbox.sh -p $pid -P $2 -a chaosblade 2>&1
 func active(port string) *transport.Response {
 	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids=chaosblade")
-	_, err := util.Curl(url)
+	result, err, code := util.Curl(url)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+	}
+	if code != 200 {
+		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+			fmt.Sprintf("active module response code: %d, result: %s", code, result))
 	}
 	return transport.ReturnSuccess("success")
 }
 
 // attach java agent to application process
-func attach(pid, port string, ctx context.Context) *transport.Response {
-	javaHome := os.Getenv("JAVA_HOME")
+func attach(pid, port string, ctx context.Context, javaHome string) *transport.Response {
+	if javaHome == "" {
+		javaHome = os.Getenv("JAVA_HOME")
+	}
 	if javaHome == "" {
 		return transport.ReturnFail(transport.Code[transport.EnvironmentError], "JAVA_HOME env not found")
 	}
@@ -112,9 +122,13 @@ func Detach(port string) *transport.Response {
 // sudo -u $user -H bash bin/sandbox.sh -p $pid -S 2>&1
 func shutdown(port string) *transport.Response {
 	url := getSandboxUrl(port, "sandbox-control/shutdown", "")
-	_, err := util.Curl(url)
+	result, err, code := util.Curl(url)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+	}
+	if code != 200 {
+		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+			fmt.Sprintf("shutdown module response code: %d, result: %s", code, result))
 	}
 	return transport.ReturnSuccess("success")
 }

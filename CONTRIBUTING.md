@@ -71,7 +71,7 @@ make build_image
 Compilation process:
 * Create the compilation result folder target and chaosblade version directory in the project root directory, and the compiled file is placed in the target/chaosblade-[version] directory.
 * Download the third-party package [jvm-sandbox](https://github.com/alibaba/jvm-sandbox/releases) required by Java Application Chaos Experiment to the cache folder (target/cache)
-* Download chaosblade java agent and tools.jar (for attaching JVM, jar package for implementing Java chaos experiments to cache folder (target/cache)
+* Download chaosblade java agent and tools.jar (for attaching JVM, jar package for implementing Java chaos experiments) to cache folder (target/cache)
 * Unzip the JVM-SANDBOX package to the target/chaosblade-[version]/lib directory; copy the chaosblade java agent jar to the JVM-SANDBOX module directory (target/chaosblade-[version]/lib/sandbox/module)
 * Compile the blade (cli command tool) to the target/chaosblade-[version] directory, and other programs needed to implement the chaos experiment will be compiled into the target/chaosblade-[version]/bin directory.
 * Compile is complete, you can enter the target/chaosblade-[version] directory, you can use the blade toolkit.
