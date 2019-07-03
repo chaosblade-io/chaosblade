@@ -1,10 +1,12 @@
 package main
 
 import (
-	"fmt"
-	"flag"
-	"github.com/chaosblade-io/chaosblade/exec"
 	"context"
+	"flag"
+	"fmt"
+
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/os/bin"
 )
 
 var dnsDomain, dnsIp string
@@ -18,14 +20,14 @@ func main() {
 	flag.Parse()
 
 	if dnsDomain == "" || dnsIp == "" {
-		printErrAndExit("less --domain or --ip flag")
+		bin.PrintErrAndExit("less --domain or --ip flag")
 	}
 	if changeDnsStart {
 		startChangeDns(dnsDomain, dnsIp)
 	} else if changeDnsStop {
 		recoverDns(dnsDomain, dnsIp)
 	} else {
-		printErrAndExit("less --start or --stop flag")
+		bin.PrintErrAndExit("less --start or --stop flag")
 	}
 }
 
@@ -39,13 +41,13 @@ func startChangeDns(domain, ip string) {
 	dnsPair := createDnsPair(domain, ip)
 	response := channel.Run(ctx, "grep", fmt.Sprintf(`-q "%s" %s`, dnsPair, hosts))
 	if response.Success {
-		printErrAndExit(fmt.Sprintf("%s has been exist", dnsPair))
+		bin.PrintErrAndExit(fmt.Sprintf("%s has been exist", dnsPair))
 	}
 	response = channel.Run(ctx, "echo", fmt.Sprintf(`"%s" >> %s`, dnsPair, hosts))
 	if !response.Success {
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
-	printOutputAndExit(response.Result.(string))
+	bin.PrintOutputAndExit(response.Result.(string))
 }
 
 // recoverDns
@@ -55,12 +57,12 @@ func recoverDns(domain, ip string) {
 	dnsPair := createDnsPair(domain, ip)
 	response := channel.Run(ctx, "grep", fmt.Sprintf(`-q "%s" %s`, dnsPair, hosts))
 	if !response.Success {
-		printOutputAndExit("nothing to do")
+		bin.PrintOutputAndExit("nothing to do")
 	}
 	response = channel.Run(ctx, "cat", fmt.Sprintf(`%s | grep -v "%s" > %s && cat %s > %s`,
 		hosts, dnsPair, tmpHosts, tmpHosts, hosts))
 	if !response.Success {
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
 	channel.Run(ctx, "rm", fmt.Sprintf(`-rf %s`, tmpHosts))
 }

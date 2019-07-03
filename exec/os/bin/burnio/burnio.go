@@ -1,13 +1,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"context"
+	"path"
 	"strings"
 	"time"
-	"path"
+
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/os/bin"
 	"github.com/chaosblade-io/chaosblade/util"
 )
 
@@ -33,7 +35,7 @@ func main() {
 	if burnIOStart {
 		fileSystem, err := getFileSystem(burnIOMountPoint)
 		if err != nil || fileSystem == "" {
-			printErrAndExit(fmt.Sprintf("cannot find mount point, %s", burnIOMountPoint))
+			bin.PrintErrAndExit(fmt.Sprintf("cannot find mount point, %s", burnIOMountPoint))
 		}
 		startBurnIO(fileSystem, burnIOSize, burnIOCount, burnIORead, burnIOWrite)
 	} else if burnIOStop {
@@ -47,7 +49,7 @@ func main() {
 		}
 		select {}
 	} else {
-		printErrAndExit("less --start or --stop flag")
+		bin.PrintErrAndExit("less --start or --stop flag")
 	}
 }
 
@@ -64,19 +66,19 @@ func startBurnIO(fileSystem, size, count string, read, write bool) {
 			path.Join(util.GetProgramPath(), burnIOBin), fileSystem, size, count, read, write, logFile))
 	if !response.Success {
 		stopBurnIO()
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
 	// check
 	time.Sleep(time.Second)
-	response = channel.Run(ctx, "grep", fmt.Sprintf("%s %s", ErrPrefix, logFile))
+	response = channel.Run(ctx, "grep", fmt.Sprintf("%s %s", bin.ErrPrefix, logFile))
 	if response.Success {
 		errMsg := strings.TrimSpace(response.Result.(string))
 		if errMsg != "" {
 			stopBurnIO()
-			printErrAndExit(errMsg)
+			bin.PrintErrAndExit(errMsg)
 		}
 	}
-	printOutputAndExit("success")
+	bin.PrintOutputAndExit("success")
 }
 
 var taskName = []string{"if=/dev/zero", "of=/dev/null"}
@@ -102,7 +104,7 @@ func burnWrite(size, count string) {
 		response := exec.NewLocalChannel().Run(context.Background(), "dd", args)
 		exec.NewLocalChannel().Run(context.Background(), "rm", fmt.Sprintf(`-rf %s`, tmpDataFile))
 		if !response.Success {
-			printAndExitWithErrPrefix(response.Err)
+			bin.PrintAndExitWithErrPrefix(response.Err)
 		}
 	}
 }
@@ -114,7 +116,7 @@ func burnRead(fileSystem, size, count string) {
 		args := fmt.Sprintf(`if=%s of=/dev/null bs=%sM count=%s iflag=dsync,direct,fullblock`, fileSystem, size, count)
 		response := exec.NewLocalChannel().Run(context.Background(), "dd", args)
 		if !response.Success {
-			printAndExitWithErrPrefix(fmt.Sprintf("The file system named %s is not supported or %s", fileSystem, response.Err))
+			bin.PrintAndExitWithErrPrefix(fmt.Sprintf("The file system named %s is not supported or %s", fileSystem, response.Err))
 		}
 	}
 }

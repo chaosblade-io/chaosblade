@@ -1,13 +1,15 @@
 package main
 
 import (
-	"fmt"
-	"strings"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"flag"
 	"context"
-	"github.com/chaosblade-io/chaosblade/util"
+	"flag"
+	"fmt"
 	"path"
+	"strings"
+
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/os/bin"
+	"github.com/chaosblade-io/chaosblade/util"
 )
 
 var fillDataFile = "chaos_filldisk.log.dat"
@@ -23,14 +25,14 @@ func main() {
 	flag.Parse()
 
 	if fillDiskStart == fillDiskStop {
-		printErrAndExit("must specify start or stop operation")
+		bin.PrintErrAndExit("must specify start or stop operation")
 	}
 	if fillDiskStart {
 		startFill(fillDiskMountPoint, fillDiskSize)
 	} else if fillDiskStop {
 		stopFill(fillDiskMountPoint)
 	} else {
-		printErrAndExit("less --start or --stop flag")
+		bin.PrintErrAndExit("less --start or --stop flag")
 	}
 }
 
@@ -38,21 +40,21 @@ func startFill(mountPoint, size string) {
 	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	if mountPoint == "" {
-		printErrAndExit("mount-point flag is empty")
+		bin.PrintErrAndExit("mount-point flag is empty")
 	}
 	dataFile := path.Join(mountPoint, fillDataFile)
 	response := channel.Run(ctx, "dd", fmt.Sprintf(`if=/dev/zero of=%s bs=1b count=1 iflag=fullblock`, dataFile))
 	if !response.Success {
 		stopFill(mountPoint)
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
 	response = channel.Run(ctx, "nohup",
 		fmt.Sprintf(`dd if=/dev/zero of=%s bs=1M count=%s iflag=fullblock >/dev/null 2>&1 &`, dataFile, size))
 	if !response.Success {
 		stopFill(mountPoint)
-		printErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
-	printOutputAndExit(response.Result.(string))
+	bin.PrintOutputAndExit(response.Result.(string))
 }
 
 func stopFill(mountPoint string) {
@@ -67,7 +69,7 @@ func stopFill(mountPoint string) {
 	if util.IsExist(fileName) {
 		response := channel.Run(ctx, "rm", fmt.Sprintf(`-rf %s`, fileName))
 		if !response.Success {
-			printErrAndExit(response.Err)
+			bin.PrintErrAndExit(response.Err)
 		}
 	}
 }
