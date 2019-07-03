@@ -14,7 +14,7 @@ go:
     - 1.12.x
 
 before_script:
-    - mkdir -p src/github.com/chaosblade-io/chaosblade
+    - mkdir -p $GOPATH/src/github.com/chaosblade-io/chaosblade
     - cp -r $TRAVIS_BUILD_DIR/. $GOPATH/src/github.com/chaosblade-io/chaosblade
     - cd $GOPATH/src/github.com/chaosblade-io
     #- curl -Lo kubectl https://storage.googleapis.com/kubernetes-release/release/v1.15.0/bin/linux/amd64/kubectl && chmod +x kubectl && sudo mv kubectl /usr/local/bin/
