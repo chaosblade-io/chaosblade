@@ -21,9 +21,10 @@ before_script:
     - JSONPATH='{range .items[*]}{@.metadata.name}:{range @.status.conditions[*]}{@.type}={@.status};{end}{end}'; until kubectl get nodes -o jsonpath="$JSONPATH" 2>&1 | grep -q "Ready=True"; do sleep 1; done
     - mkdir -p $GOPATH/src/github.com/chaosblade-io/chaosblade
     - cp -r $TRAVIS_BUILD_DIR/. $GOPATH/src/github.com/chaosblade-io/chaosblade
-    - cd $GOPATH/src/github.com/chaosblade-io
+    - cd $GOPATH/src/github.com/chaosblade-io/chaosblade
     
 script:
+    - pwd
     - kubectl cluster-info
     - go test -v ./... -count=1
     - ls
