@@ -26,4 +26,5 @@ before_script:
 script:
     - kubectl cluster-info
     - go test -v ./... -count=1
+    - ls
     - make
