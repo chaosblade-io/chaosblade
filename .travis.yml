@@ -14,9 +14,9 @@ go:
     - 1.12.x
 
 before_script:
-    pwd
-    cd $GOPATH
-    ls
+    -pwd
+    -cd $GOPATH
+    -ls
     - echo $GOPATH
     - cd $GOPATH
     - mkdir -p src/github.com/chaosblade-io/
