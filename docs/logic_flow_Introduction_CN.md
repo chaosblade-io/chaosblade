@@ -24,7 +24,7 @@ blade create help
 blade create cpu help
 ```
 
-在你输入blade之后不知所措的时候，一路help下去会有惊喜不断，感觉大神提供的彩蛋。
+在你输入blade之后不知所措的时候，一路help下去会有惊喜不断，感谢大神提供的彩蛋。
 
 ### 各类create子命令
 
