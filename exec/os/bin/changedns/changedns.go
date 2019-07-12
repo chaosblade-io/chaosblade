@@ -19,9 +19,13 @@ func main() {
 	flag.BoolVar(&changeDnsStop, "stop", false, "recover dns")
 	flag.Parse()
 
+	if !changeDnsStart && !changeDnsStop {
+		bin.PrintErrAndExit("must add --start or --stop flag")
+	}
 	if dnsDomain == "" || dnsIp == "" {
 		bin.PrintErrAndExit("less --domain or --ip flag")
 	}
+	
 	if changeDnsStart {
 		startChangeDns(dnsDomain, dnsIp)
 	} else if changeDnsStop {

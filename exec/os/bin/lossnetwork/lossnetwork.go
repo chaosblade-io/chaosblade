@@ -23,9 +23,10 @@ func main() {
 	flag.BoolVar(&lossNetStop, "stop", false, "stop loss network")
 	flag.Parse()
 
-	if lossNetStart == lossNetStop {
+	if !lossNetStart && !lossNetStop {
 		bin.PrintErrAndExit("must add --start or --stop flag")
 	}
+	
 	if lossNetStart {
 		startLossNet(lossNetInterface, lossNetPercent, lossNetLocalPort, lossNetRemotePort, lossNetExcludePort)
 	} else if lossNetStop {

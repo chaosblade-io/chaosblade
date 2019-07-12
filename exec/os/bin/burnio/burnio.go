@@ -29,9 +29,12 @@ func main() {
 	flag.BoolVar(&burnIOStart, "start", false, "start burn io")
 	flag.BoolVar(&burnIOStop, "stop", false, "stop burn io")
 	flag.BoolVar(&burnIONohup, "nohup", false, "start by nohup")
-
 	flag.Parse()
 
+	if !burnIOStart && !burnIOStop {
+		bin.PrintErrAndExit("must add --start or --stop flag")
+	}
+	
 	if burnIOStart {
 		fileSystem, err := getFileSystem(burnIOMountPoint)
 		if err != nil || fileSystem == "" {

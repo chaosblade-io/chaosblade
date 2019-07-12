@@ -75,26 +75,26 @@ func (be *BurnIOExecutor) Exec(uid string, ctx context.Context, model *exec.ExpM
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return be.stop(ctx)
-	} else {
-		if !util.IsExist(mountPoint) {
-			return transport.ReturnFail(transport.Code[transport.IllegalParameters],
-				fmt.Sprintf("the %s mount point is not exist", mountPoint))
-		}
-		readExists := model.ActionFlags["read"] == "true"
-		writeExists := model.ActionFlags["write"] == "true"
-		if !readExists && !writeExists {
-			return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less --read or --write flag")
-		}
-		count := model.ActionFlags["count"]
-		if count == "" {
-			count = "1024"
-		}
-		size := model.ActionFlags["size"]
-		if size == "" {
-			size = "1"
-		}
-		return be.start(readExists, writeExists, count, size, mountPoint, ctx)
+	} 
+
+	if !util.IsExist(mountPoint) {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+			fmt.Sprintf("the %s mount point is not exist", mountPoint))
 	}
+	readExists := model.ActionFlags["read"] == "true"
+	writeExists := model.ActionFlags["write"] == "true"
+	if !readExists && !writeExists {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less --read or --write flag")
+	}
+	count := model.ActionFlags["count"]
+	if count == "" {
+		count = "1024"
+	}
+	size := model.ActionFlags["size"]
+	if size == "" {
+		size = "1"
+	}
+	return be.start(readExists, writeExists, count, size, mountPoint, ctx)
 }
 
 func (be *BurnIOExecutor) start(read, write bool, count, size, mountPoint string, ctx context.Context) *transport.Response {

@@ -92,9 +92,8 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	excludePort := model.ActionFlags["exclude-port"]
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return de.stop(netInterface, ctx)
-	} else {
-		return de.start(localPort, remotePort, excludePort, time, offset, netInterface, ctx)
 	}
+	return de.start(localPort, remotePort, excludePort, time, offset, netInterface, ctx)
 }
 
 var delayNetworkBin = "chaos_delaynetwork"

@@ -68,10 +68,8 @@ func (ns *NetworkDnsExecutor) Exec(uid string, ctx context.Context, model *exec.
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return ns.stop(ctx, domain, ip)
-	} else {
-		return ns.start(ctx, domain, ip)
 	}
-	return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less dns matcher")
+	return ns.start(ctx, domain, ip)
 }
 
 func (ns *NetworkDnsExecutor) start(ctx context.Context, domain, ip string) *transport.Response {

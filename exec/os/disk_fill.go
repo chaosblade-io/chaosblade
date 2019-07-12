@@ -32,8 +32,8 @@ func (*FillActionSpec) LongDesc() string {
 func (*FillActionSpec) Flags() []exec.ExpFlagSpec {
 	return []exec.ExpFlagSpec{
 		&exec.ExpFlag{
-			Name:     "size",
-			Desc:     "fill size, unit is MB",
+			Name:     "count",
+			Desc:     "fill disk block count, unit is MB",
 			Required: true,
 		},
 	}
@@ -65,19 +65,18 @@ func (fae *FillActionExecutor) Exec(uid string, ctx context.Context, model *exec
 		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
 			fmt.Sprintf("the %s mount point is not exist", mountPoint))
 	}
-	size := model.ActionFlags["size"]
-	if size == "" {
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less size arg")
+	count := model.ActionFlags["count"]
+	if count == "" {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "less count arg")
 	}
-	_, err := strconv.Atoi(size)
+	_, err := strconv.Atoi(count)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "size must be positive integer")
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "count must be positive integer")
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
-		return fae.stop(mountPoint, size, ctx)
-	} else {
-		return fae.start(mountPoint, size, ctx)
+		return fae.stop(mountPoint, count, ctx)
 	}
+	return fae.start(mountPoint, count, ctx)
 }
 
 func (fae *FillActionExecutor) start(mountPoint, size string, ctx context.Context) *transport.Response {

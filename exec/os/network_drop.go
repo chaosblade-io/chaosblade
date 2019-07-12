@@ -62,9 +62,8 @@ func (ne *NetworkDropExecutor) Exec(suid string, ctx context.Context, model *exe
 	remotePort := model.ActionFlags["remote-port"]
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return ne.stop(localPort, remotePort, ctx)
-	} else {
-		return ne.start(localPort, remotePort, ctx)
 	}
+	return ne.start(localPort, remotePort, ctx)
 }
 
 func (ne *NetworkDropExecutor) start(localPort, remotePort string, ctx context.Context) *transport.Response {

@@ -20,9 +20,10 @@ func main() {
 	flag.BoolVar(&dropNetStop, "stop", false, "stop drop")
 	flag.Parse()
 
-	if dropNetStart == dropNetStop {
+	if !dropNetStart && !dropNetStop {
 		bin.PrintErrAndExit("must add --start or --stop flag")
 	}
+	
 	if dropNetStart {
 		startDropNet(dropLocalPort, dropRemotePort)
 	} else if dropNetStop {

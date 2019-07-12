@@ -24,6 +24,9 @@ func main() {
 	flag.BoolVar(&delayNetStop, "stop", false, "stop delay")
 	flag.Parse()
 
+	if !delayNetStart && !delayNetStop {
+		bin.PrintErrAndExit("must add --start or --stop flag")
+	}
 	if delayNetInterface == "" {
 		bin.PrintErrAndExit("less --interface flag")
 	}
