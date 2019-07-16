@@ -15,7 +15,7 @@ var channel = &LocalChannel{}
 type LocalChannel struct {
 }
 
-func NewLocalChannel() *LocalChannel {
+func NewLocalChannel() Channel {
 	return channel
 }
 

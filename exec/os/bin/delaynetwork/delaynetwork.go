@@ -37,8 +37,8 @@ func main() {
 	}
 }
 
+var channel = exec.NewLocalChannel()
 func startDelayNet(netInterface, time, offset, localPort, remotePort, excludePort string) {
-	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	// assert localPort and remotePort
 	if localPort == "" && remotePort == "" && excludePort == "" {
@@ -59,14 +59,15 @@ func startDelayNet(netInterface, time, offset, localPort, remotePort, excludePor
 	bin.PrintOutputAndExit(response.Result.(string))
 }
 
+var stopDelayNetFunc = stopDelayNet
 // addLocalOrRemotePortForDelay
-func addLocalOrRemotePortForDelay(localPort string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context, netInterface string, remotePort string) *transport.Response {
+func addLocalOrRemotePortForDelay(localPort string, response *transport.Response, channel exec.Channel, ctx context.Context, netInterface string, remotePort string) *transport.Response {
 	// local port 0
 	if localPort != "" {
 		response = channel.Run(ctx, "tc",
 			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport eq %s)" flowid 1:4`, netInterface, localPort))
 		if !response.Success {
-			stopDelayNet(netInterface)
+			stopDelayNetFunc(netInterface)
 			bin.PrintErrAndExit(response.Err)
 		}
 	}
@@ -75,7 +76,7 @@ func addLocalOrRemotePortForDelay(localPort string, response *transport.Response
 		response = channel.Run(ctx, "tc",
 			fmt.Sprintf(`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 2 layer transport eq %s)" flowid 1:4`, netInterface, remotePort))
 		if !response.Success {
-			stopDelayNet(netInterface)
+			stopDelayNetFunc(netInterface)
 			bin.PrintErrAndExit(response.Err)
 		}
 	}
@@ -83,45 +84,48 @@ func addLocalOrRemotePortForDelay(localPort string, response *transport.Response
 }
 
 // addExcludePortFilterForDelay
-func addExcludePortFilterForDelay(excludePort string, netInterface string, response *transport.Response, channel *exec.LocalChannel, ctx context.Context) *transport.Response {
+func addExcludePortFilterForDelay(excludePort string, netInterface string, response *transport.Response, channel exec.Channel, ctx context.Context) *transport.Response {
 	response = channel.Run(ctx, "tc",
 		fmt.Sprintf(
 			`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport gt 0) and cmp(u16 at 0 layer transport lt %s)" flowid 1:4`,
 			netInterface, excludePort))
 	if !response.Success {
-		stopDelayNet(netInterface)
+		stopDelayNetFunc(netInterface)
 		bin.PrintErrAndExit(response.Err)
+		return response
 	}
 	response = channel.Run(ctx, "tc",
 		fmt.Sprintf(
 			`filter add dev %s parent 1: protocol ip prio 4 basic match "cmp(u16 at 0 layer transport gt %s) and cmp(u16 at 0 layer transport lt 65535)" flowid 1:4`,
 			netInterface, excludePort))
 	if !response.Success {
-		stopDelayNet(netInterface)
+		stopDelayNetFunc(netInterface)
 		bin.PrintErrAndExit(response.Err)
+		return response
 	}
 	return response
 }
 
 // addQdiscForDelay
-func addQdiscForDelay(channel *exec.LocalChannel, ctx context.Context, netInterface string, time string, offset string) *transport.Response {
+func addQdiscForDelay(channel exec.Channel, ctx context.Context, netInterface string, time string, offset string) *transport.Response {
 	// add tc filter for delay specify port
 	response := channel.Run(ctx, "tc", fmt.Sprintf(`qdisc add dev %s root handle 1: prio bands 4`, netInterface))
 	if !response.Success {
 		bin.PrintErrAndExit(response.Err)
+		return response
 	}
 	response = channel.Run(ctx, "tc",
 		fmt.Sprintf(`qdisc add dev %s parent 1:4 handle 40: netem delay %sms %sms`, netInterface, time, offset))
 	if !response.Success {
 		stopDelayNet(netInterface)
 		bin.PrintErrAndExit(response.Err)
+		return response
 	}
 	return response
 }
 
 // stopDelayNet, no need to add os.Exit
 func stopDelayNet(netInterface string) {
-	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	channel.Run(ctx, "tc", fmt.Sprintf(`filter del dev %s parent 1: prio 4 basic`, netInterface))
 	channel.Run(ctx, "tc", fmt.Sprintf(`qdisc del dev %s root`, netInterface))
