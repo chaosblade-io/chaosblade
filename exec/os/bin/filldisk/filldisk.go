@@ -36,8 +36,9 @@ func main() {
 	}
 }
 
+var channel = exec.NewLocalChannel()
+
 func startFill(mountPoint, size string) {
-	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	if mountPoint == "" {
 		bin.PrintErrAndExit("mount-point flag is empty")
@@ -58,7 +59,6 @@ func startFill(mountPoint, size string) {
 }
 
 func stopFill(mountPoint string) {
-	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	pids, _ := exec.GetPidsByProcessName(fillDataFile, ctx)
 
