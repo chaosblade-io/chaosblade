@@ -38,6 +38,10 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		return transport.ReturnFail(transport.Code[transport.DataNotFound],
 			fmt.Sprintf("the uid record not found"))
 	}
+	if record.Status == "Revoked" {
+		rc.command.Println(transport.ReturnSuccess("success").Print())
+		return nil
+	}
 	var response *transport.Response
 	var channel = exec.NewLocalChannel()
 	switch record.ProgramType {
