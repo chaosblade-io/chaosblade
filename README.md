@@ -1,7 +1,9 @@
 ![logo](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/doc/image/chaosblade-logo.png)  
 
 # Chaosblade: An Easy to Use and Powerful Chaos Engineering Toolkit
-
+[![Build Status](https://travis-ci.org/chaosblade-io/chaosblade.svg?branch=master)](https://travis-ci.org/chaosblade-io/chaosblade)
+[![codecov](https://codecov.io/gh/chaosblade-io/chaosblade/branch/master/graph/badge.svg)](https://codecov.io/gh/chaosblade-io/chaosblade)
+![license](https://img.shields.io/github/license/chaosblade-io/chaosblade.svg)
 ## Introduction
 
 Chaosblade is an experimental tool that follows the principles of Chaos Engineering and is used to simulate common fault scenarios, helping to improve the recoverability of faulty systems and the fault tolerance of faults.
