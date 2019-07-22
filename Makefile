@@ -150,7 +150,7 @@ docker_image: clean
 
 # test
 test:
-	go test ./... -count=1
+	go test -race -coverprofile=coverage.txt -covermode=atomic ./...
 # clean all build result
 clean:
 	go clean ./...
