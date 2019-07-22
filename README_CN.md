@@ -1,7 +1,9 @@
 ![logo](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/doc/image/chaosblade-logo.png)  
 
 # Chaosblade: 一个简单易用且功能强大的混沌实验实施工具
-
+[![Build Status](https://travis-ci.org/chaosblade-io/chaosblade.svg?branch=master)](https://travis-ci.org/chaosblade-io/chaosblade)
+[![codecov](https://codecov.io/gh/chaosblade-io/chaosblade/branch/master/graph/badge.svg)](https://codecov.io/gh/chaosblade-io/chaosblade)
+![license](https://img.shields.io/github/license/chaosblade-io/chaosblade.svg)
 ## 项目简介
 Chaosblade 是遵循混沌工程（Chaos Engineering）原理的实验工具，用于模拟常见的故障场景，帮助提升分布式系统的可恢复性和对故障的容错性。
 
