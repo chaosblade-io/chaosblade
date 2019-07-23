@@ -69,17 +69,16 @@ func (sde *ScriptDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return sde.stop(ctx, scriptFile)
-	} else {
-		functionName := model.ActionFlags["function-name"]
-		if functionName == "" {
-			return transport.ReturnFail(transport.Code[transport.IllegalParameters], "must specify --function-name flag")
-		}
-		time := model.ActionFlags["time"]
-		if time == "" {
-			return transport.ReturnFail(transport.Code[transport.IllegalParameters], "must specify --time flag")
-		}
-		return sde.start(ctx, scriptFile, functionName, time)
 	}
+	functionName := model.ActionFlags["function-name"]
+	if functionName == "" {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "must specify --function-name flag")
+	}
+	time := model.ActionFlags["time"]
+	if time == "" {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "must specify --time flag")
+	}
+	return sde.start(ctx, scriptFile, functionName, time)
 }
 
 func (sde *ScriptDelayExecutor) start(ctx context.Context, scriptFile, functionName, time string) *transport.Response {
