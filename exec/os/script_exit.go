@@ -73,15 +73,14 @@ func (see *ScriptExitExecutor) Exec(uid string, ctx context.Context, model *exec
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return see.stop(ctx, scriptFile)
-	} else {
-		functionName := model.ActionFlags["function-name"]
-		if functionName == "" {
-			return transport.ReturnFail(transport.Code[transport.IllegalParameters], "must specify --function-name flag")
-		}
-		exitMessage := model.ActionFlags["exit-message"]
-		exitCode := model.ActionFlags["exit-code"]
-		return see.start(ctx, scriptFile, functionName, exitMessage, exitCode)
 	}
+	functionName := model.ActionFlags["function-name"]
+	if functionName == "" {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], "must specify --function-name flag")
+	}
+	exitMessage := model.ActionFlags["exit-message"]
+	exitCode := model.ActionFlags["exit-code"]
+	return see.start(ctx, scriptFile, functionName, exitMessage, exitCode)
 }
 
 func (see *ScriptExitExecutor) start(ctx context.Context, scriptFile, functionName, exitMessage, exitCode string) *transport.Response {

@@ -86,12 +86,11 @@ func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *exe
 	}
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return nle.stop(dev, ctx)
-	} else {
-		localPort := model.ActionFlags["local-port"]
-		remotePort := model.ActionFlags["remote-port"]
-		excludePort := model.ActionFlags["exclude-port"]
-		return nle.start(dev, localPort, remotePort, excludePort, percent, ctx)
 	}
+	localPort := model.ActionFlags["local-port"]
+	remotePort := model.ActionFlags["remote-port"]
+	excludePort := model.ActionFlags["exclude-port"]
+	return nle.start(dev, localPort, remotePort, excludePort, percent, ctx)
 }
 
 func (nle *NetworkLossExecutor) start(netInterface, localPort, remotePort, excludePort, percent string, ctx context.Context) *transport.Response {
