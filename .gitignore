@@ -44,6 +44,7 @@ tags
 /hack/lib/**
 /chaosblade.dat
 target
+coverage.txt
 
 # Website
 site-build
