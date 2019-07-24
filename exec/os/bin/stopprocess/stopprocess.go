@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/os/bin"
 )
 
 var stopProcessName string
@@ -22,7 +23,7 @@ func main() {
 	flag.Parse()
 
 	if startFakeDeath == stopFakeDeath {
-		PrintErrAndExit("must add --start or --stop flag")
+		bin.PrintErrAndExit("must add --start or --stop flag")
 	}
 
 	if startFakeDeath {
@@ -30,7 +31,7 @@ func main() {
 	} else if stopFakeDeath {
 		doRecoverProcess(stopProcessName, stopProcessInCmd)
 	} else {
-		PrintErrAndExit("less --start or --stop flag")
+		bin.PrintErrAndExit("less --start or --stop flag")
 	}
 }
 
@@ -41,26 +42,26 @@ func doStopProcess(process, processCmd string) {
 	if process != "" {
 		pids, err = exec.GetPidsByProcessName(process, ctx)
 		if err != nil {
-			PrintErrAndExit(err.Error())
+			bin.PrintErrAndExit(err.Error())
 		}
 		stopProcessName = process
 	} else if processCmd != "" {
 		pids, err = exec.GetPidsByProcessCmdName(processCmd, ctx)
 		if err != nil {
-			PrintErrAndExit(err.Error())
+			bin.PrintErrAndExit(err.Error())
 		}
 		stopProcessName = processCmd
 	}
 
 	if pids == nil || len(pids) == 0 {
-		PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
+		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
 	}
 	args := fmt.Sprintf("-19 %s", strings.Join(pids, " "))
 	response := exec.NewLocalChannel().Run(ctx, "kill", args)
 	if !response.Success {
-		PrintErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
-	PrintOutputAndExit(response.Result.(string))
+	bin.PrintOutputAndExit(response.Result.(string))
 }
 
 func doRecoverProcess(process, processCmd string) {
@@ -70,23 +71,23 @@ func doRecoverProcess(process, processCmd string) {
 	if process != "" {
 		pids, err = exec.GetPidsByProcessName(process, ctx)
 		if err != nil {
-			PrintErrAndExit(err.Error())
+			bin.PrintErrAndExit(err.Error())
 		}
 		stopProcessName = process
 	} else if processCmd != "" {
 		pids, err = exec.GetPidsByProcessCmdName(processCmd, ctx)
 		if err != nil {
-			PrintErrAndExit(err.Error())
+			bin.PrintErrAndExit(err.Error())
 		}
 		stopProcessName = processCmd
 	}
 
 	if pids == nil || len(pids) == 0 {
-		PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
+		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
 	}
 	response := exec.NewLocalChannel().Run(ctx, "kill", fmt.Sprintf("-18 %s", strings.Join(pids, " ")))
 	if !response.Success {
-		PrintErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
-	PrintOutputAndExit(response.Result.(string))
+	bin.PrintOutputAndExit(response.Result.(string))
 }

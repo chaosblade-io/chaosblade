@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/os/bin"
 )
 
 var killProcessName string
@@ -28,23 +29,23 @@ func killProcess(process, processCmd string) {
 	if process != "" {
 		pids, err = exec.GetPidsByProcessName(process, ctx)
 		if err != nil {
-			PrintErrAndExit(err.Error())
+			bin.PrintErrAndExit(err.Error())
 		}
 		killProcessName = process
 	} else if processCmd != "" {
 		pids, err = exec.GetPidsByProcessCmdName(processCmd, ctx)
 		if err != nil {
-			PrintErrAndExit(err.Error())
+			bin.PrintErrAndExit(err.Error())
 		}
 		killProcessName = processCmd
 	}
 
 	if pids == nil || len(pids) == 0 {
-		PrintErrAndExit(fmt.Sprintf("%s process not found", killProcessName))
+		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", killProcessName))
 	}
 	response := exec.NewLocalChannel().Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
 	if !response.Success {
-		PrintErrAndExit(response.Err)
+		bin.PrintErrAndExit(response.Err)
 	}
-	PrintOutputAndExit(response.Result.(string))
+	bin.PrintOutputAndExit(response.Result.(string))
 }
