@@ -42,9 +42,11 @@ func main() {
 	if burnCpuStart {
 		startBurnCpu()
 	} else if burnCpuStop {
-		stopBurnCpu()
+		stopBurnCpuFunc()
 	} else if burnCpuNohup {
 		burnCpu()
+	} else {
+		bin.PrintErrAndExit("less --start or --stop flag")
 	}
 }
 
@@ -63,6 +65,16 @@ func burnCpu() {
 	select {} // wait forever
 }
 
+var channel = exec.NewLocalChannel()
+
+var stopBurnCpuFunc = stopBurnCpu
+
+var runBurnCpuFunc = runBurnCpu
+
+var bindBurnCpuFunc = bindBurnCpu
+
+var checkBurnCpuFunc = checkBurnCpu
+
 // startBurnCpu by invoke burnCpuBin with --nohup flag
 func startBurnCpu() {
 	ctx := context.Background()
@@ -70,13 +82,13 @@ func startBurnCpu() {
 		cpuCount = 1
 		cores := strings.Split(cpuList, os.CommaDelimiter)
 		for _, core := range cores {
-			pid := runBurnCpu(ctx, cpuCount, true, core)
-			bindBurnCpu(ctx, core, pid)
+			pid := runBurnCpuFunc(ctx, cpuCount, true, core)
+			bindBurnCpuFunc(ctx, core, pid)
 		}
 	} else {
-		runBurnCpu(ctx, cpuCount, false, "")
+		runBurnCpuFunc(ctx, cpuCount, false, "")
 	}
-	checkBurnCpu(ctx)
+	checkBurnCpuFunc(ctx)
 }
 
 // runBurnCpu
@@ -88,9 +100,9 @@ func runBurnCpu(ctx context.Context, cpuCount int, pidNeeded bool, processor str
 		args = fmt.Sprintf("%s --%s %s", args, cpuProcessorFlag, processor)
 	}
 	args = fmt.Sprintf(`%s > /dev/null 2>&1 &`, args)
-	response := exec.NewLocalChannel().Run(ctx, os.NohupCommand, args)
+	response := channel.Run(ctx, os.NohupCommand, args)
 	if !response.Success {
-		stopBurnCpu()
+		stopBurnCpuFunc()
 		bin.PrintErrAndExit(response.Err)
 	}
 	if pidNeeded {
@@ -98,14 +110,14 @@ func runBurnCpu(ctx context.Context, cpuCount int, pidNeeded bool, processor str
 		newCtx := context.WithValue(context.Background(), exec.ProcessKey, fmt.Sprintf("%s %s", cpuProcessorFlag, processor))
 		pids, err := exec.GetPidsByProcessName(os.BurnCpuCommand, newCtx)
 		if err != nil {
-			stopBurnCpu()
+			stopBurnCpuFunc()
 			bin.PrintErrAndExit(fmt.Sprintf("bind cpu core failed, cannot get the burning program pid, %v", err))
 		}
 		if len(pids) > 0 {
 			// return the first one
 			pid, err := strconv.Atoi(pids[0])
 			if err != nil {
-				stopBurnCpu()
+				stopBurnCpuFunc()
 				bin.PrintErrAndExit(fmt.Sprintf("bind cpu core failed, get pid failed, pids: %v, err: %v", pids, err))
 			}
 			return pid
@@ -116,9 +128,9 @@ func runBurnCpu(ctx context.Context, cpuCount int, pidNeeded bool, processor str
 
 // bindBurnCpu by taskset command
 func bindBurnCpu(ctx context.Context, core string, pid int) {
-	response := exec.NewLocalChannel().Run(ctx, os.TasksetCommand, fmt.Sprintf("-cp %s %d", core, pid))
+	response := channel.Run(ctx, os.TasksetCommand, fmt.Sprintf("-cp %s %d", core, pid))
 	if !response.Success {
-		stopBurnCpu()
+		stopBurnCpuFunc()
 		bin.PrintErrAndExit(response.Err)
 	}
 }
@@ -142,5 +154,5 @@ func stopBurnCpu() {
 	if pids == nil || len(pids) == 0 {
 		return
 	}
-	exec.NewLocalChannel().Run(ctx, os.KillCommand, fmt.Sprintf(`-9 %s`, strings.Join(pids, " ")))
+	channel.Run(ctx, os.KillCommand, fmt.Sprintf(`-9 %s`, strings.Join(pids, " ")))
 }

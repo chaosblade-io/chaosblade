@@ -148,6 +148,9 @@ docker_image: clean
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
 		-t chaosblade:$(BLADE_VERSION) $(BLADE_SRC_ROOT)
 
+# test
+test:
+	go test -race -coverprofile=coverage.txt -covermode=atomic ./...
 # clean all build result
 clean:
 	go clean ./...

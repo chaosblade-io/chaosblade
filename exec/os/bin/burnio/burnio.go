@@ -57,16 +57,20 @@ var tmpDataFile = "/tmp/chaos_burnio.log.dat"
 var logFile = "/tmp/chaos_burnio.log"
 var burnIOBin = "chaos_burnio"
 
+var channel = exec.NewLocalChannel()
+
+var stopBurnIOFunc = stopBurnIO
+
 // start burn io
 func startBurnIO(fileSystem, size, count string, read, write bool) {
-	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	response := channel.Run(ctx, "nohup",
 		fmt.Sprintf(`%s --file-system %s --size %s --count %s --read=%t --write=%t --nohup=true > %s 2>&1 &`,
 			path.Join(util.GetProgramPath(), burnIOBin), fileSystem, size, count, read, write, logFile))
 	if !response.Success {
-		stopBurnIO()
+		stopBurnIOFunc()
 		bin.PrintErrAndExit(response.Err)
+		return
 	}
 	// check
 	time.Sleep(time.Second)
@@ -74,8 +78,9 @@ func startBurnIO(fileSystem, size, count string, read, write bool) {
 	if response.Success {
 		errMsg := strings.TrimSpace(response.Result.(string))
 		if errMsg != "" {
-			stopBurnIO()
+			stopBurnIOFunc()
 			bin.PrintErrAndExit(errMsg)
+			return
 		}
 	}
 	bin.PrintOutputAndExit("success")
@@ -85,7 +90,6 @@ var taskName = []string{"if=/dev/zero", "of=/dev/null"}
 
 // stop burn io,  no need to add os.Exit
 func stopBurnIO() {
-	channel := exec.NewLocalChannel()
 	ctx := context.Background()
 	for _, name := range taskName {
 		pids, _ := exec.GetPidsByProcessName(name, ctx)
@@ -101,10 +105,11 @@ func stopBurnIO() {
 func burnWrite(size, count string) {
 	for {
 		args := fmt.Sprintf(`if=/dev/zero of=%s bs=%sM count=%s oflag=dsync`, tmpDataFile, size, count)
-		response := exec.NewLocalChannel().Run(context.Background(), "dd", args)
-		exec.NewLocalChannel().Run(context.Background(), "rm", fmt.Sprintf(`-rf %s`, tmpDataFile))
+		response := channel.Run(context.Background(), "dd", args)
+		channel.Run(context.Background(), "rm", fmt.Sprintf(`-rf %s`, tmpDataFile))
 		if !response.Success {
 			bin.PrintAndExitWithErrPrefix(response.Err)
+			return
 		}
 	}
 }
@@ -114,7 +119,7 @@ func burnRead(fileSystem, size, count string) {
 	for {
 		// "if" arg in dd command is file system value, but "of" arg value is related to mount point
 		args := fmt.Sprintf(`if=%s of=/dev/null bs=%sM count=%s iflag=dsync,direct,fullblock`, fileSystem, size, count)
-		response := exec.NewLocalChannel().Run(context.Background(), "dd", args)
+		response := channel.Run(context.Background(), "dd", args)
 		if !response.Success {
 			bin.PrintAndExitWithErrPrefix(fmt.Sprintf("The file system named %s is not supported or %s", fileSystem, response.Err))
 		}
@@ -123,7 +128,7 @@ func burnRead(fileSystem, size, count string) {
 
 // get fileSystem by mount point
 func getFileSystem(mountPoint string) (string, error) {
-	response := exec.NewLocalChannel().Run(context.Background(), "mount", fmt.Sprintf(` | grep "on %s " | awk '{print $1}'`, mountPoint))
+	response := channel.Run(context.Background(), "mount", fmt.Sprintf(` | grep "on %s " | awk '{print $1}'`, mountPoint))
 	if response.Success {
 		fileSystem := response.Result.(string)
 		return strings.TrimSpace(fileSystem), nil
