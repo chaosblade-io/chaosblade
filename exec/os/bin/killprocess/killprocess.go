@@ -41,13 +41,11 @@ func killProcess(process, processCmd string) {
 	}
 
 	if pids == nil || len(pids) == 0 {
-		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", processName))
-		return
+		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", killProcessName))
 	}
 	response := exec.NewLocalChannel().Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
 	if !response.Success {
 		bin.PrintErrAndExit(response.Err)
-		return
 	}
 	bin.PrintOutputAndExit(response.Result.(string))
 }

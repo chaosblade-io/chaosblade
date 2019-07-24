@@ -2,12 +2,12 @@ package exec
 
 import (
 	"context"
-	"time"
-	"strings"
 	"fmt"
 	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/chaosblade-io/chaosblade/util"
 	"os/exec"
+	"strings"
+	"time"
 )
 
 var channel = &LocalChannel{}
@@ -46,7 +46,7 @@ func execScript(ctx context.Context, script, args string) *transport.Response {
 // GetPidsByProcessCmdName
 func GetPidsByProcessCmdName(processName string, ctx context.Context) ([]string, error) {
 	response := channel.Run(ctx, "pgrep",
-		fmt.Sprintf(`-l %s | grep -v -w blade | grep -v -w chaos_killprocess | awk '{print $1}' | tr '\n' ' '`, processName))
+		fmt.Sprintf(`-l %s | grep -v -w blade | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $1}' | tr '\n' ' '`, processName))
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
 	}
@@ -69,7 +69,7 @@ func GetPidsByProcessName(processName string, ctx context.Context) ([]string, er
 		}
 	}
 	response := channel.Run(ctx, "ps",
-		fmt.Sprintf(`%s | grep %s %s | grep -v -w grep | grep -v -w blade | grep -v -w chaos_killprocess | awk '{print $2}' | tr '\n' ' '`,
+		fmt.Sprintf(`%s | grep %s %s | grep -v -w grep | grep -v -w blade | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $2}' | tr '\n' ' '`,
 			psArgs, processName, otherGrepInfo))
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
