@@ -13,7 +13,7 @@ type StopProcessActionCommandSpec struct {
 }
 
 func (*StopProcessActionCommandSpec) Name() string {
-	return "fakedeath"
+	return "stop"
 }
 
 func (*StopProcessActionCommandSpec) Aliases() []string {
@@ -54,7 +54,7 @@ type StopProcessExecutor struct {
 }
 
 func (spe *StopProcessExecutor) Name() string {
-	return "fakedeath"
+	return "stop"
 }
 
 var stopProcessBin = "chaos_stopprocess"
