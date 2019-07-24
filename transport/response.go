@@ -44,6 +44,7 @@ const (
 	SandboxInvokeError      = "SandboxInvokeError"
 	CommandNotFound         = "CommandNotFound"
 	StatusError             = "StatusError"
+	UnexpectedCommandError  = "UnexpectedCommandError"
 )
 
 type CodeType struct {
@@ -90,6 +91,7 @@ var Code = map[string]CodeType{
 	K8sInvokeError:          {800, "invoke k8s server api error"},
 	DockerInvokeError:       {801, "invoke docker command error"},
 	SandboxInvokeError:      {802, "invoke sandbox error"},
+	UnexpectedCommandError:  {901, "unexpected command error"},
 }
 
 type Response struct {
