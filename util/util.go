@@ -106,3 +106,59 @@ func Curl(url string) (string, error, int) {
 	}
 	return string(bytes), nil, resp.StatusCode
 }
+
+// CheckPortInUse returns true if the port is in use, otherwise returns false.
+func CheckPortInUse(port string) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", port), time.Second)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	if conn != nil {
+		return true
+	}
+	return false
+}
+
+func GetUnusedPort() (int, error) {
+	addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	listener, err := net.ListenTCP("tcp", addr)
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port, nil
+}
+
+// GetLogFile
+func GetLogFile() (string, error) {
+	logsPath := path.Join(GetProgramPath(), "logs")
+	logFile := path.Join(logsPath, "chaosblade.log")
+	if IsExist(logFile) {
+		return logFile, nil
+	}
+	// mk dir
+	err := os.MkdirAll(logsPath, os.ModePerm)
+	if err != nil {
+		return "", err
+	}
+	// create file
+	file, err := os.OpenFile(logFile, os.O_RDONLY|os.O_CREATE, 0666)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	return logFile, nil
+}
+
+// GetNohupOutput
+func GetNohupOutput() string {
+	logFile, err := GetLogFile()
+	if err == nil {
+		return logFile
+	}
+	return "/dev/null"
+}

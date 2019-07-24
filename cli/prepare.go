@@ -11,8 +11,9 @@ import (
 )
 
 const (
-	PrepareJvmType = "jvm"
-	PrepareK8sType = "k8s"
+	PrepareJvmType   = "jvm"
+	PrepareK8sType   = "k8s"
+	PrepareCPlusType = "cplus"
 )
 
 // PrepareCommand defines attach command
@@ -41,7 +42,7 @@ func (pc *PrepareCommand) prepareExample() string {
 }
 
 // insertPrepareRecord
-func (pc *PrepareJvmCommand) insertPrepareRecord(prepareType string, flags ...string) (*data.PreparationRecord, error) {
+func insertPrepareRecord(prepareType string, flags ...string) (*data.PreparationRecord, error) {
 	uid, err := util.GenerateUid()
 	if err != nil {
 		return nil, err
@@ -65,7 +66,7 @@ func (pc *PrepareJvmCommand) insertPrepareRecord(prepareType string, flags ...st
 	return record, nil
 }
 
-func (pc *PrepareJvmCommand) handlePrepareResponse(uid string, cmd *cobra.Command, response *transport.Response) error {
+func handlePrepareResponse(uid string, cmd *cobra.Command, response *transport.Response) error {
 	response.Result = uid
 	if !response.Success {
 		GetDS().UpdatePreparationRecordByUid(uid, "Error", response.Err)

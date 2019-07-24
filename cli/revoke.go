@@ -7,6 +7,7 @@ import (
 	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/chaosblade-io/chaosblade/exec/cplus"
 	"strings"
 )
 
@@ -48,6 +49,8 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 	switch record.ProgramType {
 	case PrepareJvmType:
 		response = jvm.Detach(record.Port)
+	case PrepareCPlusType:
+		response = cplus.Revoke(record.Port)
 	case PrepareK8sType:
 		args := fmt.Sprintf("delete ns chaosblade")
 		response = channel.Run(context.Background(), "kubectl", args)

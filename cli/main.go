@@ -17,6 +17,8 @@ func main() {
 	prepareCommand := &PrepareCommand{}
 	baseCmd.AddCommand(prepareCommand)
 	prepareCommand.AddCommand(&PrepareJvmCommand{})
+	prepareCommand.AddCommand(&PrepareCPlusCommand{})
+
 	// add revoke command
 	baseCmd.AddCommand(&RevokeCommand{})
 

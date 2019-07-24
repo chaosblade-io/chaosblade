@@ -18,6 +18,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"github.com/chaosblade-io/chaosblade/exec/cplus"
 )
 
 // ExpActionFlags is used to receive experiment action flags
@@ -80,6 +81,8 @@ func (ec *expCommand) init() {
 	osExpCommands := ec.registerOsExpCommands()
 	// register jvm framework commands
 	ec.registerJvmExpCommands()
+	// register cplus
+	ec.registerCplusExpCommands()
 	// register docker command
 	ec.registerDockerExpCommands(osExpCommands)
 	// register k8s command
@@ -126,6 +129,22 @@ func (ec *expCommand) registerJvmExpCommands() []*modelCommand {
 		jvmCommands = append(jvmCommands, command)
 	}
 	return jvmCommands
+}
+
+// registerCplusExpCommands
+func (ec *expCommand) registerCplusExpCommands() []*modelCommand {
+	file := path.Join(util.GetBinPath(), "cplus-chaosblade.spec.yaml")
+	models, err := exec.ParseSpecsToModel(file, cplus.NewExecutor())
+	if err != nil {
+		return nil
+	}
+	cplusCommands := make([]*modelCommand, 0)
+	for idx := range models.Models {
+		model := &models.Models[idx]
+		command := ec.registerExpCommand(model)
+		cplusCommands = append(cplusCommands, command)
+	}
+	return cplusCommands
 }
 
 // registerDockerExpCommands
