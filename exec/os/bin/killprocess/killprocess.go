@@ -7,19 +7,18 @@ import (
 	"strings"
 
 	"github.com/chaosblade-io/chaosblade/exec"
-	"github.com/chaosblade-io/chaosblade/exec/os/bin"
 )
 
-var processName string
-var processInCmd string
+var killProcessName string
+var killProcessInCmd string
 
 func main() {
-	flag.StringVar(&processName, "process", "", "process name")
-	flag.StringVar(&processInCmd, "process-cmd", "", "process in command")
+	flag.StringVar(&killProcessName, "process", "", "process name")
+	flag.StringVar(&killProcessInCmd, "process-cmd", "", "process in command")
 
 	flag.Parse()
 
-	killProcess(processName, processInCmd)
+	killProcess(killProcessName, killProcessInCmd)
 }
 
 func killProcess(process, processCmd string) {
@@ -29,23 +28,23 @@ func killProcess(process, processCmd string) {
 	if process != "" {
 		pids, err = exec.GetPidsByProcessName(process, ctx)
 		if err != nil {
-			bin.PrintErrAndExit(err.Error())
+			printErrAndExit(err.Error())
 		}
-		processName = process
+		killProcessName = process
 	} else if processCmd != "" {
 		pids, err = exec.GetPidsByProcessCmdName(processCmd, ctx)
 		if err != nil {
-			bin.PrintErrAndExit(err.Error())
+			printErrAndExit(err.Error())
 		}
-		processName = processCmd
+		killProcessName = processCmd
 	}
 
 	if pids == nil || len(pids) == 0 {
-		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", processName))
+		printErrAndExit(fmt.Sprintf("%s process not found", killProcessName))
 	}
 	response := exec.NewLocalChannel().Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
 	if !response.Success {
-		bin.PrintErrAndExit(response.Err)
+		printErrAndExit(response.Err)
 	}
-	bin.PrintOutputAndExit(response.Result.(string))
+	printOutputAndExit(response.Result.(string))
 }
