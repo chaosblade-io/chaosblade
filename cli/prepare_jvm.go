@@ -6,7 +6,6 @@ import (
 	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/chaosblade-io/chaosblade/util"
 	"github.com/spf13/cobra"
-	"net"
 	"path"
 	"strconv"
 	"strings"
@@ -63,7 +62,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 					fmt.Sprintf("get sandbox port err, %s", err.Error()))
 			}
 		}
-		record, err = pc.insertPrepareRecord(PrepareJvmType, pc.processName, port)
+		record, err = insertPrepareRecord(PrepareJvmType, pc.processName, port)
 		if err != nil {
 			return transport.ReturnFail(transport.Code[transport.DatabaseError],
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))
@@ -84,27 +83,14 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 				response.Err, port)
 		}
 	}
-	return pc.handlePrepareResponse(record.Uid, pc.command, response)
+	return handlePrepareResponse(record.Uid, pc.command, response)
 }
 
 // getSandboxPort by process name. If this process does not exist, an unbound port will be selected
 func getAndCacheSandboxPort() (string, error) {
-	port, err := getUnusedPort()
+	port, err := util.GetUnusedPort()
 	if err != nil {
 		return "", err
 	}
 	return strconv.Itoa(port), nil
-}
-
-func getUnusedPort() (int, error) {
-	addr, err := net.ResolveTCPAddr("tcp", "localhost:0")
-	if err != nil {
-		return 0, err
-	}
-	listener, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return 0, err
-	}
-	defer listener.Close()
-	return listener.Addr().(*net.TCPAddr).Port, nil
 }

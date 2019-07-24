@@ -33,9 +33,8 @@ func TestPrepareJvmCommand_insertPrepareRecord(t *testing.T) {
 			},
 		},
 	}
-	jvmCommand := &PrepareJvmCommand{}
 	for _, tt := range tests {
-		got, err := jvmCommand.insertPrepareRecord(tt.input.prepareType, tt.input.flags...)
+		got, err := insertPrepareRecord(tt.input.prepareType, tt.input.flags...)
 		if (err != nil) != tt.expect.err {
 			t.Errorf("unexpected result: %t, expected: %t", err != nil, tt.expect.err)
 		}
