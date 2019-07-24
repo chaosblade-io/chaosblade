@@ -28,23 +28,23 @@ func killProcess(process, processCmd string) {
 	if process != "" {
 		pids, err = exec.GetPidsByProcessName(process, ctx)
 		if err != nil {
-			printErrAndExit(err.Error())
+			PrintErrAndExit(err.Error())
 		}
 		killProcessName = process
 	} else if processCmd != "" {
 		pids, err = exec.GetPidsByProcessCmdName(processCmd, ctx)
 		if err != nil {
-			printErrAndExit(err.Error())
+			PrintErrAndExit(err.Error())
 		}
 		killProcessName = processCmd
 	}
 
 	if pids == nil || len(pids) == 0 {
-		printErrAndExit(fmt.Sprintf("%s process not found", killProcessName))
+		PrintErrAndExit(fmt.Sprintf("%s process not found", killProcessName))
 	}
 	response := exec.NewLocalChannel().Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
 	if !response.Success {
-		printErrAndExit(response.Err)
+		PrintErrAndExit(response.Err)
 	}
-	printOutputAndExit(response.Result.(string))
+	PrintOutputAndExit(response.Result.(string))
 }

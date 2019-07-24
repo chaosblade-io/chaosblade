@@ -22,7 +22,7 @@ func main() {
 	flag.Parse()
 
 	if startFakeDeath == stopFakeDeath {
-		printErrAndExit("must add --start or --stop flag")
+		PrintErrAndExit("must add --start or --stop flag")
 	}
 
 	if startFakeDeath {
@@ -30,7 +30,7 @@ func main() {
 	} else if stopFakeDeath {
 		doRecoverProcess(stopProcessName, stopProcessInCmd)
 	} else {
-		printErrAndExit("less --start or --stop flag")
+		PrintErrAndExit("less --start or --stop flag")
 	}
 }
 
@@ -41,26 +41,26 @@ func doStopProcess(process, processCmd string) {
 	if process != "" {
 		pids, err = exec.GetPidsByProcessName(process, ctx)
 		if err != nil {
-			printErrAndExit(err.Error())
+			PrintErrAndExit(err.Error())
 		}
 		stopProcessName = process
 	} else if processCmd != "" {
 		pids, err = exec.GetPidsByProcessCmdName(processCmd, ctx)
 		if err != nil {
-			printErrAndExit(err.Error())
+			PrintErrAndExit(err.Error())
 		}
 		stopProcessName = processCmd
 	}
 
 	if pids == nil || len(pids) == 0 {
-		printErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
+		PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
 	}
 	args := fmt.Sprintf("-19 %s", strings.Join(pids, " "))
 	response := exec.NewLocalChannel().Run(ctx, "kill", args)
 	if !response.Success {
-		printErrAndExit(response.Err)
+		PrintErrAndExit(response.Err)
 	}
-	printOutputAndExit(response.Result.(string))
+	PrintOutputAndExit(response.Result.(string))
 }
 
 func doRecoverProcess(process, processCmd string) {
@@ -70,23 +70,23 @@ func doRecoverProcess(process, processCmd string) {
 	if process != "" {
 		pids, err = exec.GetPidsByProcessName(process, ctx)
 		if err != nil {
-			printErrAndExit(err.Error())
+			PrintErrAndExit(err.Error())
 		}
 		stopProcessName = process
 	} else if processCmd != "" {
 		pids, err = exec.GetPidsByProcessCmdName(processCmd, ctx)
 		if err != nil {
-			printErrAndExit(err.Error())
+			PrintErrAndExit(err.Error())
 		}
 		stopProcessName = processCmd
 	}
 
 	if pids == nil || len(pids) == 0 {
-		printErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
+		PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
 	}
 	response := exec.NewLocalChannel().Run(ctx, "kill", fmt.Sprintf("-18 %s", strings.Join(pids, " ")))
 	if !response.Success {
-		printErrAndExit(response.Err)
+		PrintErrAndExit(response.Err)
 	}
-	printOutputAndExit(response.Result.(string))
+	PrintOutputAndExit(response.Result.(string))
 }
