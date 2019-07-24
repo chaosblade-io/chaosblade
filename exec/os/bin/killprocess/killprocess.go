@@ -10,16 +10,16 @@ import (
 	"github.com/chaosblade-io/chaosblade/exec/os/bin"
 )
 
-var processName string
-var processInCmd string
+var killProcessName string
+var killProcessInCmd string
 
 func main() {
-	flag.StringVar(&processName, "process", "", "process name")
-	flag.StringVar(&processInCmd, "process-cmd", "", "process in command")
+	flag.StringVar(&killProcessName, "process", "", "process name")
+	flag.StringVar(&killProcessInCmd, "process-cmd", "", "process in command")
 
 	flag.Parse()
 
-	killProcess(processName, processInCmd)
+	killProcess(killProcessName, killProcessInCmd)
 }
 
 func killProcess(process, processCmd string) {
@@ -31,13 +31,13 @@ func killProcess(process, processCmd string) {
 		if err != nil {
 			bin.PrintErrAndExit(err.Error())
 		}
-		processName = process
+		killProcessName = process
 	} else if processCmd != "" {
 		pids, err = exec.GetPidsByProcessCmdName(processCmd, ctx)
 		if err != nil {
 			bin.PrintErrAndExit(err.Error())
 		}
-		processName = processCmd
+		killProcessName = processCmd
 	}
 
 	if pids == nil || len(pids) == 0 {
