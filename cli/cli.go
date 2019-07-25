@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/spf13/cobra"
+	"os"
 )
 
 type Cli struct {
@@ -18,6 +19,7 @@ func NewCli() *Cli {
 			Long:  "An easy to use and powerful chaos engineering experiment toolkit",
 		},
 	}
+	cli.rootCmd.SetOutput(os.Stdout)
 	cli.setFlags()
 	return cli
 }
