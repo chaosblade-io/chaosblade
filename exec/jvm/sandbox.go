@@ -17,6 +17,8 @@ var channel = exec.NewLocalChannel()
 
 const DefaultNamespace = "default"
 
+var sandboxTokenFile = path.Join(util.GetUserHome(), ".sandbox.token")
+
 func Attach(processName string, port string, javaHome string) *transport.Response {
 	// get process pid
 	ctx := context.Background()
@@ -105,9 +107,9 @@ func attach(pid, port string, ctx context.Context, javaHome string) *transport.R
 	if !response.Success {
 		return response
 	}
-	tokenFile := path.Join(util.GetUserHome(), ".sandbox.token")
 	response = channel.Run(ctx, "grep", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
-		token, tokenFile, DefaultNamespace))
+		token, sandboxTokenFile, DefaultNamespace))
+	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
 			fmt.Sprintf("attach JVM %s failed, loss response; %s", pid, response.Err))
@@ -117,6 +119,46 @@ func attach(pid, port string, ctx context.Context, javaHome string) *transport.R
 
 func Detach(port string) *transport.Response {
 	return shutdown(port)
+}
+
+// CheckPortFromSandboxToken will read last line and curl the port for testing connectivity
+func CheckPortFromSandboxToken() (port string, err error) {
+	port, err = getPortFromSandboxToken()
+	if err != nil {
+		return port, err
+	}
+	versionUrl := getSandboxUrl(port, "sandbox-info/version", "")
+	_, err, _ = util.Curl(versionUrl)
+	if err != nil {
+		return "", err
+	}
+	return port, nil
+}
+
+func getPortFromSandboxToken() (port string, err error) {
+	file, err := os.Open(sandboxTokenFile)
+	if err != nil {
+		return "", err
+	}
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return "", err
+	}
+	if fileInfo.Size() == 0 {
+		return "", fmt.Errorf("sandbox token file is empty")
+	}
+	buf := make([]byte, 8)
+	n, err := file.ReadAt(buf, fileInfo.Size()-int64(len(buf)))
+	if err != nil {
+		return "", err
+	}
+	for idx, c := range buf {
+		// ;
+		if c == 59 {
+			return strings.TrimSpace(string(buf[idx+1 : n])), nil
+		}
+	}
+	return "", fmt.Errorf("not found port from sandbox token file")
 }
 
 // sudo -u $user -H bash bin/sandbox.sh -p $pid -S 2>&1

@@ -7,6 +7,7 @@ import (
 	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"strings"
 )
 
 type RevokeCommand struct {
@@ -54,11 +55,17 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
 			fmt.Sprintf("not support the %s type", record.ProgramType))
 	}
-	if !response.Success {
-		checkError(GetDS().UpdatePreparationRecordByUid(uid, "Running", fmt.Sprintf("revoke failed. %s", response.Err)))
+	if response.Success {
+		checkError(GetDS().UpdatePreparationRecordByUid(uid, "Revoked", ""))
+	} else if strings.Contains(response.Err, "connection refused") {
+		// sandbox has been detached, reset response value
+		response = transport.ReturnSuccess("success")
+		checkError(GetDS().UpdatePreparationRecordByUid(uid, "Revoked", ""))
+	} else {
+		// other failed reason
+		checkError(GetDS().UpdatePreparationRecordByUid(uid, record.Status, fmt.Sprintf("revoke failed. %s", response.Err)))
 		return response
 	}
-	checkError(GetDS().UpdatePreparationRecordByUid(uid, "Revoked", ""))
 	rc.command.Println(response.Print())
 	return nil
 }

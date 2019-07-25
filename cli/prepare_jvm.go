@@ -9,6 +9,7 @@ import (
 	"net"
 	"path"
 	"strconv"
+	"strings"
 )
 
 type PrepareJvmCommand struct {
@@ -17,6 +18,7 @@ type PrepareJvmCommand struct {
 	processName string
 	// sandboxHome is jvm-sandbox home, default value is CHAOSBLADE_HOME/lib
 	sandboxHome string
+	port        int
 }
 
 func (pc *PrepareJvmCommand) Init() {
@@ -31,6 +33,7 @@ func (pc *PrepareJvmCommand) Init() {
 	}
 	pc.command.Flags().StringVarP(&pc.javaHome, "javaHome", "j", "", "the java jdk home path")
 	pc.command.Flags().StringVarP(&pc.processName, "process", "p", "", "the java application process name (required)")
+	pc.command.Flags().IntVarP(&pc.port, "port", "P", 0, "the port used for agent server")
 	pc.command.MarkFlagRequired("process")
 	pc.sandboxHome = path.Join(util.GetLibHome(), "sandbox")
 }
@@ -39,25 +42,48 @@ func (pc *PrepareJvmCommand) prepareExample() string {
 	return `prepare jvm --process tomcat`
 }
 
+// prepareJvm means attaching java agent
 func (pc *PrepareJvmCommand) prepareJvm() error {
+	// query record from sqlite by process name
 	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.DatabaseError],
 			fmt.Sprintf("query attach java process record err, %s", err.Error()))
 	}
 	if record == nil || record.Status != "Running" {
-		port, err := getAndCacheSandboxPort()
-		if err != nil {
-			return transport.ReturnFail(transport.Code[transport.ServerError],
-				fmt.Sprintf("get sandbox port err, %s", err.Error()))
+		var port string
+		if pc.port != 0 {
+			// get port from flag value user passed
+			port = strconv.Itoa(pc.port)
+		} else {
+			// get port from local port
+			port, err = getAndCacheSandboxPort()
+			if err != nil {
+				return transport.ReturnFail(transport.Code[transport.ServerError],
+					fmt.Sprintf("get sandbox port err, %s", err.Error()))
+			}
 		}
 		record, err = pc.insertPrepareRecord(PrepareJvmType, pc.processName, port)
 		if err != nil {
 			return transport.ReturnFail(transport.Code[transport.DatabaseError],
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))
 		}
+	} else {
+		if pc.port != 0 && strconv.Itoa(pc.port) != record.Port {
+			return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+				fmt.Sprintf("the process has been executed prepare command, if you wan't re-prepare, "+
+					"please append or modify the --port %s argument in prepare command for retry", record.Port))
+		}
 	}
 	response := jvm.Attach(pc.processName, record.Port, pc.javaHome)
+	if !response.Success {
+		// if attach failed, search port from ~/.sandbox.token
+		port, err := jvm.CheckPortFromSandboxToken()
+		if err == nil && strings.Contains(response.Err, "connection refused") {
+			response.Err = fmt.Sprintf("%s, append or modify the --port %s argument in prepare command for retry",
+				response.Err, port)
+		}
+	}
 	return pc.handlePrepareResponse(record.Uid, pc.command, response)
 }
 
