@@ -44,6 +44,17 @@ func startFill(mountPoint, size string) {
 		bin.PrintErrAndExit("mount-point flag is empty")
 	}
 	dataFile := path.Join(mountPoint, fillDataFile)
+
+	// Some normal filesystems (ext4, xfs, btrfs and ocfs2) tack quick works
+	if exec.IsCommandAvailable("fallocate") {
+		response := channel.Run(ctx, "fallocate", fmt.Sprintf(`-l %sM %s`, size, dataFile))
+		if !response.Success {
+			stopFill(mountPoint)
+			bin.PrintErrAndExit(response.Err)
+		}
+		bin.PrintOutputAndExit(response.Result.(string))
+	}
+
 	response := channel.Run(ctx, "dd", fmt.Sprintf(`if=/dev/zero of=%s bs=1b count=1 iflag=fullblock`, dataFile))
 	if !response.Success {
 		stopFill(mountPoint)
