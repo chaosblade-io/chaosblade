@@ -21,7 +21,7 @@ func TestPrepareJvmCommand_insertPrepareRecord(t *testing.T) {
 	}{
 		{
 			input{
-				PrepareJvmType, []string{"project.name", "8703"},
+				PrepareJvmType, []string{"project.name", "8703", ""},
 			},
 			expect{
 				&data.PreparationRecord{
@@ -34,7 +34,7 @@ func TestPrepareJvmCommand_insertPrepareRecord(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		got, err := insertPrepareRecord(tt.input.prepareType, tt.input.flags...)
+		got, err := insertPrepareRecord(tt.input.prepareType, tt.input.flags[0], tt.input.flags[1], tt.input.flags[2])
 		if (err != nil) != tt.expect.err {
 			t.Errorf("unexpected result: %t, expected: %t", err != nil, tt.expect.err)
 		}

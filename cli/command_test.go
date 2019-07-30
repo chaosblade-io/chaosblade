@@ -160,7 +160,8 @@ func (*MockSource) QueryPreparationByUid(uid string) (*data.PreparationRecord, e
 	return &data.PreparationRecord{}, nil
 }
 
-func (*MockSource) QueryRunningPreByTypeAndProcess(programType string, process string) (*data.PreparationRecord, error) {
+func (*MockSource) QueryRunningPreByTypeAndProcess(programType string, processName string,
+	processId string) (*data.PreparationRecord, error) {
 	return &data.PreparationRecord{}, nil
 }
 

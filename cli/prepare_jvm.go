@@ -18,6 +18,7 @@ type PrepareJvmCommand struct {
 	// sandboxHome is jvm-sandbox home, default value is CHAOSBLADE_HOME/lib
 	sandboxHome string
 	port        int
+	processId   string
 }
 
 func (pc *PrepareJvmCommand) Init() {
@@ -33,7 +34,7 @@ func (pc *PrepareJvmCommand) Init() {
 	pc.command.Flags().StringVarP(&pc.javaHome, "javaHome", "j", "", "the java jdk home path")
 	pc.command.Flags().StringVarP(&pc.processName, "process", "p", "", "the java application process name (required)")
 	pc.command.Flags().IntVarP(&pc.port, "port", "P", 0, "the port used for agent server")
-	pc.command.MarkFlagRequired("process")
+	pc.command.Flags().StringVarP(&pc.processId, "pid", "", "", "the target java process id")
 	pc.sandboxHome = path.Join(util.GetLibHome(), "sandbox")
 }
 
@@ -43,13 +44,21 @@ func (pc *PrepareJvmCommand) prepareExample() string {
 
 // prepareJvm means attaching java agent
 func (pc *PrepareJvmCommand) prepareJvm() error {
-	// query record from sqlite by process name
-	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName)
+	if pc.processName == "" && pc.processId == "" {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+			fmt.Sprintf("less --process or --pid flags"))
+	}
+	pid, response := jvm.CheckFlagValues(pc.processName, pc.processId)
+	if !response.Success {
+		return response
+	}
+	pc.processId = pid
+	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName, pc.processId)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.DatabaseError],
 			fmt.Sprintf("query attach java process record err, %s", err.Error()))
 	}
-	if record == nil || record.Status != "Running" {
+	if record == nil {
 		var port string
 		if pc.port != 0 {
 			// get port from flag value user passed
@@ -62,7 +71,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 					fmt.Sprintf("get sandbox port err, %s", err.Error()))
 			}
 		}
-		record, err = insertPrepareRecord(PrepareJvmType, pc.processName, port)
+		record, err = insertPrepareRecord(PrepareJvmType, pc.processName, port, pc.processId)
 		if err != nil {
 			return transport.ReturnFail(transport.Code[transport.DatabaseError],
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))
@@ -74,7 +83,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 					"please append or modify the --port %s argument in prepare command for retry", record.Port))
 		}
 	}
-	response := jvm.Attach(pc.processName, record.Port, pc.javaHome)
+	response = jvm.Attach(record.Port, pc.javaHome, pc.processId)
 	if !response.Success {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err := jvm.CheckPortFromSandboxToken()

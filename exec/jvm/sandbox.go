@@ -19,23 +19,9 @@ const DefaultNamespace = "default"
 
 var sandboxTokenFile = path.Join(util.GetUserHome(), ".sandbox.token")
 
-func Attach(processName string, port string, javaHome string) *transport.Response {
-	// get process pid
-	ctx := context.Background()
-	ctx = context.WithValue(ctx, exec.ProcessKey, "java")
-	pids, err := exec.GetPidsByProcessName(processName, ctx)
-	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.GetProcessError], err.Error())
-	}
-	if pids == nil || len(pids) == 0 {
-		return transport.ReturnFail(transport.Code[transport.GetProcessError], "process not found")
-	}
-	if len(pids) != 1 {
-		return transport.ReturnFail(transport.Code[transport.GetProcessError], "too many process")
-	}
-	pid := pids[0]
+func Attach(port string, javaHome string, pid string) *transport.Response {
 	// refresh
-	response := attach(pid, port, ctx, javaHome)
+	response := attach(pid, port, context.TODO(), javaHome)
 	if !response.Success {
 		return response
 	}

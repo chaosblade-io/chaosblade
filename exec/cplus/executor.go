@@ -77,7 +77,7 @@ var db = data.GetSource()
 
 func (e *Executor) getPortFromDB(model *exec.ExpModel) (string, error) {
 	port := model.ActionFlags["port"]
-	record, err := db.QueryRunningPreByTypeAndProcess("cplus", port)
+	record, err := db.QueryRunningPreByTypeAndProcess("cplus", port, "")
 	if err != nil {
 		return "", err
 	}

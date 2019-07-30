@@ -12,6 +12,7 @@ type PreparationRecord struct {
 	ProgramType string
 	Process     string
 	Port        string
+	Pid         string
 	Status      string
 	Error       string
 	CreateTime  string
@@ -35,7 +36,7 @@ type PreparationSource interface {
 	QueryPreparationByUid(uid string) (*PreparationRecord, error)
 
 	// QueryRunningPreByTypeAndProcess
-	QueryRunningPreByTypeAndProcess(programType string, process string) (*PreparationRecord, error)
+	QueryRunningPreByTypeAndProcess(programType string, processName, processId string) (*PreparationRecord, error)
 
 	// ListPreparationRecords
 	ListPreparationRecords() ([]*PreparationRecord, error)
@@ -44,6 +45,13 @@ type PreparationSource interface {
 	UpdatePreparationRecordByUid(uid, status, errMsg string) error
 }
 
+// UserVersion PRAGMA [database.]user_version
+const UserVersion = 1
+
+// addPidColumn sql
+const addPidColumn = `ALTER TABLE preparation ADD COLUMN pid VARCHAR DEFAULT ""`
+
+// preparationTableDDL
 const preparationTableDDL = `CREATE TABLE IF NOT EXISTS preparation (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	uid VARCHAR(32) UNIQUE,
@@ -53,7 +61,8 @@ const preparationTableDDL = `CREATE TABLE IF NOT EXISTS preparation (
 	status     VARCHAR,
     error 	   VARCHAR,
 	create_time VARCHAR,
-	update_time VARCHAR
+	update_time VARCHAR,
+	pid 	   VARCHAR
 )`
 
 var preIndexDDL = []string{
@@ -63,20 +72,42 @@ var preIndexDDL = []string{
 }
 
 var insertPreDML = `INSERT INTO
-	preparation (uid, program_type, process, port, status, error, create_time, update_time)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	preparation (uid, program_type, process, port, status, error, create_time, update_time, pid)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `
 
 func (s *Source) CheckAndInitPreTable() {
+	// check user_version
+	version, err := s.GetUserVersion()
+	if err != nil {
+		logrus.Fatalln(err.Error())
+	}
+	// return directly if equal the current UserVersion
+	if version == UserVersion {
+		return
+	}
+	// check the table exists or not
 	exists, err := s.PreparationTableExists()
 	if err != nil {
-		logrus.Fatalf(err.Error())
+		logrus.Fatalln(err.Error())
 	}
-	if !exists {
+	if exists {
+		// execute alter sql if exists
+		err := s.AlterPreparationTable(addPidColumn)
+		if err != nil {
+			logrus.Fatalln(err.Error())
+		}
+	} else {
+		// execute create table
 		err = s.InitPreparationTable()
 		if err != nil {
-			logrus.Fatalf(err.Error())
+			logrus.Fatalln(err.Error())
 		}
+	}
+	// update userVersion to new
+	err = s.UpdateUserVersion(UserVersion)
+	if err != nil {
+		logrus.Fatalln(err.Error())
 	}
 }
 
@@ -87,6 +118,14 @@ func (s *Source) InitPreparationTable() error {
 	}
 	for _, sql := range preIndexDDL {
 		s.DB.Exec(sql)
+	}
+	return nil
+}
+
+func (s *Source) AlterPreparationTable(alterSql string) error {
+	_, err := s.DB.Exec(alterSql)
+	if err != nil {
+		return fmt.Errorf("execute %s sql err, %s", alterSql, err)
 	}
 	return nil
 }
@@ -125,6 +164,7 @@ func (s *Source) InsertPreparationRecord(record *PreparationRecord) error {
 		record.Error,
 		record.CreateTime,
 		record.UpdateTime,
+		record.Pid,
 	)
 	if err != nil {
 		return err
@@ -153,10 +193,11 @@ func (s *Source) QueryPreparationByUid(uid string) (*PreparationRecord, error) {
 	return records[0], nil
 }
 
-func (s *Source) QueryRunningPreByTypeAndProcess(programType string, process string) (*PreparationRecord, error) {
-	query := `SELECT * FROM preparation WHERE program_type = ? and process = ? and status = "Running"`
-	if process == "" {
-		query = `SELECT * FROM preparation WHERE program_type = ? and status = "Running"`
+// QueryRunningPreByTypeAndProcess returns the first record matching the process id or process name
+func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName, processId string) (*PreparationRecord, error) {
+	var query = `SELECT * FROM preparation WHERE program_type = ? and status = "Running"`
+	if processId != "" || processName != "" {
+		query = fmt.Sprintf(`%s and (pid = ? OR process = ?)`, query)
 	}
 	stmt, err := s.DB.Prepare(query)
 	if err != nil {
@@ -164,10 +205,10 @@ func (s *Source) QueryRunningPreByTypeAndProcess(programType string, process str
 	}
 	defer stmt.Close()
 	var rows *sql.Rows
-	if process == "" {
-		rows, err = stmt.Query(programType)
+	if processId != "" || processName != "" {
+		rows, err = stmt.Query(programType, processId, processName)
 	} else {
-		rows, err = stmt.Query(programType, process)
+		rows, err = stmt.Query(programType)
 	}
 	if err != nil {
 		return nil, err
@@ -198,8 +239,8 @@ func getPreparationRecordFrom(rows *sql.Rows) ([]*PreparationRecord, error) {
 	records := make([]*PreparationRecord, 0)
 	for rows.Next() {
 		var id int
-		var uid, t, p, port, status, error, createTime, updateTime string
-		err := rows.Scan(&id, &uid, &t, &p, &port, &status, &error, &createTime, &updateTime)
+		var uid, t, p, port, status, error, createTime, updateTime, pid string
+		err := rows.Scan(&id, &uid, &t, &p, &port, &status, &error, &createTime, &updateTime, &pid)
 		if err != nil {
 			return nil, err
 		}
@@ -208,6 +249,7 @@ func getPreparationRecordFrom(rows *sql.Rows) ([]*PreparationRecord, error) {
 			ProgramType: t,
 			Process:     p,
 			Port:        port,
+			Pid:         pid,
 			Status:      status,
 			Error:       error,
 			CreateTime:  createTime,
