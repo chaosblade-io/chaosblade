@@ -42,7 +42,7 @@ func (pc *PrepareCommand) prepareExample() string {
 }
 
 // insertPrepareRecord
-func insertPrepareRecord(prepareType string, flags ...string) (*data.PreparationRecord, error) {
+func insertPrepareRecord(prepareType string, processName, port, processId string) (*data.PreparationRecord, error) {
 	uid, err := util.GenerateUid()
 	if err != nil {
 		return nil, err
@@ -50,14 +50,13 @@ func insertPrepareRecord(prepareType string, flags ...string) (*data.Preparation
 	record := &data.PreparationRecord{
 		Uid:         uid,
 		ProgramType: prepareType,
-		Process:     flags[0],
+		Process:     processName,
+		Port:        port,
+		Pid:         processId,
 		Status:      "Created",
 		Error:       "",
 		CreateTime:  time.Now().Format(time.RFC3339Nano),
 		UpdateTime:  time.Now().Format(time.RFC3339Nano),
-	}
-	if len(flags) > 1 {
-		record.Port = flags[1]
 	}
 	err = GetDS().InsertPreparationRecord(record)
 	if err != nil {

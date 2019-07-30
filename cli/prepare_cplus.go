@@ -40,13 +40,13 @@ func (pc *PrepareCPlusCommand) prepareExample() string {
 
 func (pc *PrepareCPlusCommand) prepareCPlus() error {
 	portStr := strconv.Itoa(pc.port)
-	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareCPlusType, portStr)
+	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareCPlusType, portStr, "")
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.DatabaseError],
 			fmt.Sprintf("query cplus agent server port record err, %s", err.Error()))
 	}
 	if record == nil || record.Status != "Running" {
-		record, err = insertPrepareRecord(PrepareCPlusType, portStr, portStr)
+		record, err = insertPrepareRecord(PrepareCPlusType, portStr, portStr, "")
 		if err != nil {
 			return transport.ReturnFail(transport.Code[transport.DatabaseError],
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))

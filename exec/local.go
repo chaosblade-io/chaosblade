@@ -59,7 +59,7 @@ const ProcessKey = "process"
 
 // GetPidsByProcessName
 func GetPidsByProcessName(processName string, ctx context.Context) ([]string, error) {
-	psArgs := GetPsArgs(ctx)
+	psArgs := GetPsArgs()
 	otherProcess := ctx.Value(ProcessKey)
 	otherGrepInfo := ""
 	if otherProcess != nil {
@@ -78,24 +78,46 @@ func GetPidsByProcessName(processName string, ctx context.Context) ([]string, er
 	return strings.Fields(strings.TrimSpace(pidString)), nil
 }
 
-// GetPsArgs
-func GetPsArgs(ctx context.Context) string {
+// GetPsArgs for querying the process info
+func GetPsArgs() string {
+	var psArgs = "-ef"
+	if isAlpinePlatform() {
+		psArgs = "-o user,pid,ppid,args"
+	}
+	return psArgs
+}
+
+// isAlpinePlatform returns true if the os version is alpine.
+// If the /etc/os-release file doesn't exist, the function returns false.
+func isAlpinePlatform() bool {
 	var osVer = ""
 	if util.IsExist("/etc/os-release") {
-		response := channel.Run(ctx, "awk", "-F '=' '{if ($1 == \"ID\") {print $2;exit 0}}' /etc/os-release")
+		response := channel.Run(context.TODO(), "awk", "-F '=' '{if ($1 == \"ID\") {print $2;exit 0}}' /etc/os-release")
 		if response.Success {
 			osVer = response.Result.(string)
 		}
 	}
-	var psArgs = "-ef"
-	if strings.TrimSpace(osVer) == "alpine" {
-		psArgs = "-o user,pid,ppid,args"
-	}
-	return psArgs
+	return strings.TrimSpace(osVer) == "alpine"
 }
 
 // IsCommandAvailable return true if the command exists
 func IsCommandAvailable(commandName string) bool {
 	response := execScript(context.TODO(), "command", fmt.Sprintf("-v %s", commandName))
 	return response.Success
+}
+
+//ProcessExists returns true if the pid exists, otherwise return false.
+func ProcessExists(pid string) (bool, error) {
+	if isAlpinePlatform() {
+		response := channel.Run(context.TODO(), "ps", fmt.Sprintf("-o pid | grep %s", pid))
+		if !response.Success {
+			return false, fmt.Errorf(response.Err)
+		}
+		if strings.TrimSpace(response.Result.(string)) == "" {
+			return false, nil
+		}
+		return true, nil
+	}
+	response := channel.Run(context.TODO(), "ps", fmt.Sprintf("-p %s", pid))
+	return response.Success, nil
 }
