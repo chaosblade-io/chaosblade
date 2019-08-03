@@ -39,7 +39,9 @@ func main() {
 	if burnCpuStart {
 		startBurnCpu()
 	} else if burnCpuStop {
-		stopBurnCpuFunc()
+		if success, errs :=stopBurnCpuFunc();!success {
+			bin.PrintErrAndExit(errs)
+		}
 	} else if burnCpuNohup {
 		burnCpu()
 	} else {
@@ -146,12 +148,16 @@ func checkBurnCpu(ctx context.Context) {
 }
 
 // stopBurnCpu
-func stopBurnCpu() {
+func stopBurnCpu() (success bool,errs string){
 	// add grep nohup
 	ctx := context.WithValue(context.Background(), exec.ProcessKey, "nohup")
 	pids, _ := exec.GetPidsByProcessName(burnCpuBin, ctx)
 	if pids == nil || len(pids) == 0 {
-		return
+		return true,errs
 	}
-	channel.Run(ctx, "kill", fmt.Sprintf(`-9 %s`, strings.Join(pids, " ")))
+	response:=channel.Run(ctx, "kill", fmt.Sprintf(`-9 %s`, strings.Join(pids, " ")))
+	if !response.Success{
+		return false,response.Err
+	}
+	return true,errs
 }

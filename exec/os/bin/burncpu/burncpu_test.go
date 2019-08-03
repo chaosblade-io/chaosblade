@@ -53,8 +53,9 @@ func Test_runBurnCpu_failed(t *testing.T) {
 		exitCode = code
 	}
 	var invokeTime int
-	stopBurnCpuFunc = func() {
+	stopBurnCpuFunc = func()(bool,string) {
 		invokeTime++
+		return true, ""
 	}
 
 	channel = &exec.MockLocalChannel{
@@ -86,7 +87,7 @@ func Test_bindBurnCpu(t *testing.T) {
 	bin.ExitFunc = func(code int) {
 		exitCode = code
 	}
-	stopBurnCpuFunc = func() {}
+	stopBurnCpuFunc = func()(bool,string) { return true, ""}
 
 	channel = &exec.MockLocalChannel{
 		Response:        transport.ReturnFail(transport.Code[transport.CommandNotFound], "taskset command not found"),
