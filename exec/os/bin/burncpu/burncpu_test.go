@@ -14,19 +14,22 @@ import (
 
 func Test_startBurnCpu(t *testing.T) {
 	type args struct {
-		cpuList 		string
-		cpuCount       	int
+		cpuList    string
+		cpuCount   int
+		cpuPercent int
 	}
 	tests := []struct {
 		name string
 		args args
 	}{
-		{"test1", args{"1,2,3,5", 0}},
-		{"test2", args{"", 3}},
+		{"test1", args{"1,2,3,5", 0, 50}},
+		{"test2", args{"", 3, 50}},
 	}
-	runBurnCpuFunc = func(ctx context.Context, cpuCount int, pidNeeded bool, processor string) int {return 25233}
-	bindBurnCpuFunc = func(ctx context.Context, core string, pid int){}
-	checkBurnCpuFunc = func(ctx context.Context){}
+	runBurnCpuFunc = func(ctx context.Context, cpuCount int, cpuPercent int, pidNeeded bool, processor string) int {
+		return 25233
+	}
+	bindBurnCpuFunc = func(ctx context.Context, core string, pid int) {}
+	checkBurnCpuFunc = func(ctx context.Context) {}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cpuList = tt.args.cpuList
@@ -37,15 +40,17 @@ func Test_startBurnCpu(t *testing.T) {
 }
 func Test_runBurnCpu_failed(t *testing.T) {
 	type args struct {
-		cpuCount  int
-		pidNeeded bool
-		processor string
+		cpuCount   int
+		cpuPercent int
+		pidNeeded  bool
+		processor  string
 	}
 	burnBin := path.Join(util.GetProgramPath(), "chaos_burncpu")
 	as := &args{
-		cpuCount:  2,
-		pidNeeded: false,
-		processor: "",
+		cpuCount:   2,
+		cpuPercent: 50,
+		pidNeeded:  false,
+		processor:  "",
 	}
 
 	var exitCode int
@@ -53,18 +58,18 @@ func Test_runBurnCpu_failed(t *testing.T) {
 		exitCode = code
 	}
 	var invokeTime int
-	stopBurnCpuFunc = func()(bool,string) {
+	stopBurnCpuFunc = func() (bool, string) {
 		invokeTime++
 		return true, ""
 	}
 
 	channel = &exec.MockLocalChannel{
 		Response:        transport.ReturnFail(transport.Code[transport.CommandNotFound], "nohup command not found"),
-		ExpectedCommand: fmt.Sprintf(`nohup %s --nohup --cpu-count 2 > /dev/null 2>&1 &`, burnBin),
+		ExpectedCommand: fmt.Sprintf(`nohup %s --nohup --cpu-count 2 --cpu-percent 50 > /dev/null 2>&1 &`, burnBin),
 		T:               t,
 	}
 
-	runBurnCpu(context.Background(), as.cpuCount, as.pidNeeded, as.processor)
+	runBurnCpu(context.Background(), as.cpuCount, as.cpuPercent, as.pidNeeded, as.processor)
 	if exitCode != 1 {
 		t.Errorf("unexpected result %d, expected result: %d", exitCode, 1)
 	}
@@ -75,19 +80,19 @@ func Test_runBurnCpu_failed(t *testing.T) {
 
 func Test_bindBurnCpu(t *testing.T) {
 	type args struct {
-		core 	string
-		pid 	int
+		core string
+		pid  int
 	}
 	as := &args{
-		core:	"0",
-		pid:	25233,
+		core: "0",
+		pid:  25233,
 	}
 
 	var exitCode int
 	bin.ExitFunc = func(code int) {
 		exitCode = code
 	}
-	stopBurnCpuFunc = func()(bool,string) { return true, ""}
+	stopBurnCpuFunc = func() (bool, string) { return true, "" }
 
 	channel = &exec.MockLocalChannel{
 		Response:        transport.ReturnFail(transport.Code[transport.CommandNotFound], "taskset command not found"),

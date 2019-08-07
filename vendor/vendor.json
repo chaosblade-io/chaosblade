@@ -3,10 +3,74 @@
 	"ignore": "test",
 	"package": [
 		{
+			"checksumSHA1": "QC55lHNOv1+UAL2xtIHw17MJ8J8=",
+			"origin": "github.com/shirou/gopsutil/vendor/github.com/StackExchange/wmi",
+			"path": "github.com/StackExchange/wmi",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
+		},
+		{
+			"checksumSHA1": "vTmc/uvCPpTs51Rl9bVomPZMZIM=",
+			"origin": "github.com/shirou/gopsutil/vendor/github.com/go-ole/go-ole",
+			"path": "github.com/go-ole/go-ole",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
+		},
+		{
+			"checksumSHA1": "PArleDBtadu2qO4hJwHR8a3IOTA=",
+			"origin": "github.com/shirou/gopsutil/vendor/github.com/go-ole/go-ole/oleutil",
+			"path": "github.com/go-ole/go-ole/oleutil",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
+		},
+		{
+			"checksumSHA1": "40vJyUB4ezQSn/NSadsKEOrudMc=",
+			"path": "github.com/inconshreveable/mousetrap",
+			"revision": "76626ae9c91c4f2a10f34cad8ce83ea42c93bb75",
+			"revisionTime": "2014-10-17T20:07:13Z"
+		},
+		{
 			"checksumSHA1": "8zEXCBTpyOvsoOEPmLe8tTZvkXI=",
 			"path": "github.com/mattn/go-sqlite3",
 			"revision": "ad30583d8387ce8118f8605eaeb3b4f7b4ae0ee1",
 			"revisionTime": "2019-02-17T17:40:29Z"
+		},
+		{
+			"checksumSHA1": "GE+ZKBrF6erMVBnWSwx4icWPsZg=",
+			"path": "github.com/shirou/gopsutil/cpu",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
+		},
+		{
+			"checksumSHA1": "+iFA/hHmdWehBFBa3uAetswSoug=",
+			"path": "github.com/shirou/gopsutil/internal/common",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
+		},
+		{
+			"checksumSHA1": "Vk/BsSvr/O9VM7T5EnEgwEb1eGk=",
+			"path": "github.com/shirou/gopsutil/mem",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
+		},
+		{
+			"checksumSHA1": "ll/ZalNpZsgoZ/KkxQCqNcf4588=",
+			"path": "github.com/shirou/gopsutil/net",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
+		},
+		{
+			"checksumSHA1": "JgJVd1eBTRDzHCdwjPA9xC1FB1M=",
+			"path": "github.com/shirou/gopsutil/process",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
+		},
+		{
+			"checksumSHA1": "Nve7SpDmjsv6+rhkXAkfg/UQx94=",
+			"origin": "github.com/shirou/gopsutil/vendor/github.com/shirou/w32",
+			"path": "github.com/shirou/w32",
+			"revision": "d80c43f9c984a48783daf22f4bd9278006ae483a",
+			"revisionTime": "2019-07-31T13:47:26Z"
 		},
 		{
 			"checksumSHA1": "xTmkE7bYrgO9gXGRDPIba8A5M/U=",

@@ -7,9 +7,10 @@ import (
 	"runtime"
 	"strconv"
 
+	"strings"
+
 	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/transport"
-	"strings"
 )
 
 type CpuCommandModelSpec struct {
@@ -49,6 +50,11 @@ func (cms *CpuCommandModelSpec) Flags() []exec.ExpFlagSpec {
 			Desc:     "CPUs in which to allow burning (0-3 or 1,3)",
 			Required: false,
 		},
+		&exec.ExpFlag{
+			Name:     "cpu-percent",
+			Desc:     "percent of burn CPU (0-100)",
+			Required: false,
+		},
 	}
 }
 
@@ -71,7 +77,7 @@ func (*fullLoadActionCommand) Name() string {
 }
 
 func (*fullLoadActionCommand) Aliases() []string {
-	return []string{"fl"}
+	return []string{"fl", "load"}
 }
 
 func (*fullLoadActionCommand) ShortDesc() string {
@@ -117,6 +123,23 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMode
 	}
 	var cpuCount int
 	var cpuList string
+	var cpuPercent int
+
+	cpuPercentStr := model.ActionFlags["cpu-percent"]
+	if cpuPercentStr != "" {
+		var err error
+		cpuPercent, err = strconv.Atoi(cpuPercentStr)
+		if err != nil {
+			return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+				"--cpu-percent value must be a positive integer")
+		}
+		if cpuPercent > 100 || cpuPercent < 0 {
+			return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+				"--cpu-percent value must be a prositive integer and not bigger than 100")
+		}
+	} else {
+		cpuPercent = 100
+	}
 
 	cpuListStr := model.ActionFlags["cpu-list"]
 	if cpuListStr != "" {
@@ -145,14 +168,14 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMode
 			cpuCount = runtime.NumCPU()
 		}
 	}
-	return ce.start(ctx, cpuList, cpuCount)
+	return ce.start(ctx, cpuList, cpuCount, cpuPercent)
 }
 
 const burnCpuBin = "chaos_burncpu"
 
 // start burn cpu
-func (ce *cpuExecutor) start(ctx context.Context, cpuList string, cpuCount int) *transport.Response {
-	args := fmt.Sprintf("--start --cpu-count %d", cpuCount)
+func (ce *cpuExecutor) start(ctx context.Context, cpuList string, cpuCount int, cpuPercent int) *transport.Response {
+	args := fmt.Sprintf("--start --cpu-count %d --cpu-percent %d", cpuCount, cpuPercent)
 	if cpuList != "" {
 		args = fmt.Sprintf("%s --cpu-list %s", args, cpuList)
 	}
