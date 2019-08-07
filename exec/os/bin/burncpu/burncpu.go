@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"path"
 	"runtime"
 	"strings"
@@ -14,11 +15,13 @@ import (
 	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/exec/os/bin"
 	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/process"
 )
 
 var (
 	burnCpuStart, burnCpuStop, burnCpuNohup bool
-	cpuCount                                int
+	cpuCount, cpuPercent                    int
 	cpuList                                 string
 	cpuProcessor                            string
 )
@@ -29,6 +32,7 @@ func main() {
 	flag.StringVar(&cpuList, "cpu-list", "", "CPUs in which to allow burning (1,3)")
 	flag.BoolVar(&burnCpuNohup, "nohup", false, "nohup to run burn cpu")
 	flag.IntVar(&cpuCount, "cpu-count", runtime.NumCPU(), "number of cpus")
+	flag.IntVar(&cpuPercent, "cpu-percent", 100, "percent of burn-cpu")
 	flag.StringVar(&cpuProcessor, "cpu-processor", "0", "only used for identifying process of cpu burn")
 	flag.Parse()
 
@@ -39,7 +43,7 @@ func main() {
 	if burnCpuStart {
 		startBurnCpu()
 	} else if burnCpuStop {
-		if success, errs :=stopBurnCpuFunc();!success {
+		if success, errs := stopBurnCpuFunc(); !success {
 			bin.PrintErrAndExit(errs)
 		}
 	} else if burnCpuNohup {
@@ -50,18 +54,53 @@ func main() {
 }
 
 func burnCpu() {
+
 	runtime.GOMAXPROCS(cpuCount)
 
+	totalCpuPercent, _ := cpu.Percent(time.Second, false)
+	curProcess, _ := process.NewProcess(int32(os.Getpid()))
+	curCpuPercent, _ := curProcess.CPUPercent()
+	otherCpuPercent := (100.0 - (totalCpuPercent[0] - curCpuPercent)) / 100.0
+	go func() {
+		t := time.NewTicker(3 * time.Second)
+		for {
+			select {
+			case <-t.C:
+				totalCpuPercent, _ = cpu.Percent(time.Second, false)
+				curCpuPercent, _ = curProcess.CPUPercent()
+				otherCpuPercent = (100.0 - (totalCpuPercent[0] - curCpuPercent)) / 100.0
+			}
+		}
+	}()
 	for i := 0; i < cpuCount; i++ {
 		go func() {
-			for {
-				for i := 0; i < 2147483647; i++ {
+			busy := int64(0)
+			idle := int64(0)
+			all := int64(10000000)
+			dx := 0.0
+			ds := time.Duration(0)
+			for i := 0; ; i = (i + 1) % 1000 {
+				startTime := time.Now().UnixNano()
+				if i == 0 {
+					dx = (float64(cpuPercent) - totalCpuPercent[0]) / otherCpuPercent
+					busy = busy + int64(dx*100000)
+					if busy < 0 {
+						busy = 0
+					}
+					idle = all - busy
+					if idle < 0 {
+						idle = 0
+					}
+					ds, _ = time.ParseDuration(strconv.FormatInt(idle, 10) + "ns")
 				}
+				for time.Now().UnixNano()-startTime < busy {
+				}
+				time.Sleep(ds)
 				runtime.Gosched()
 			}
 		}()
 	}
-	select {} // wait forever
+	select {}
 }
 
 var burnCpuBin = "chaos_burncpu"
@@ -83,19 +122,19 @@ func startBurnCpu() {
 		cpuCount = 1
 		cores := strings.Split(cpuList, ",")
 		for _, core := range cores {
-			pid := runBurnCpuFunc(ctx, cpuCount, true, core)
+			pid := runBurnCpuFunc(ctx, cpuCount, cpuPercent, true, core)
 			bindBurnCpuFunc(ctx, core, pid)
 		}
 	} else {
-		runBurnCpuFunc(ctx, cpuCount, false, "")
+		runBurnCpuFunc(ctx, cpuCount, cpuPercent, false, "")
 	}
 	checkBurnCpuFunc(ctx)
 }
 
 // runBurnCpu
-func runBurnCpu(ctx context.Context, cpuCount int, pidNeeded bool, processor string) int {
-	args := fmt.Sprintf(`%s --nohup --cpu-count %d`,
-		path.Join(util.GetProgramPath(), burnCpuBin), cpuCount)
+func runBurnCpu(ctx context.Context, cpuCount int, cpuPercent int, pidNeeded bool, processor string) int {
+	args := fmt.Sprintf(`%s --nohup --cpu-count %d --cpu-percent %d`,
+		path.Join(util.GetProgramPath(), burnCpuBin), cpuCount, cpuPercent)
 
 	if pidNeeded {
 		args = fmt.Sprintf("%s --cpu-processor %s", args, processor)
@@ -148,16 +187,16 @@ func checkBurnCpu(ctx context.Context) {
 }
 
 // stopBurnCpu
-func stopBurnCpu() (success bool,errs string){
+func stopBurnCpu() (success bool, errs string) {
 	// add grep nohup
 	ctx := context.WithValue(context.Background(), exec.ProcessKey, "nohup")
 	pids, _ := exec.GetPidsByProcessName(burnCpuBin, ctx)
 	if pids == nil || len(pids) == 0 {
-		return true,errs
+		return true, errs
 	}
-	response:=channel.Run(ctx, "kill", fmt.Sprintf(`-9 %s`, strings.Join(pids, " ")))
-	if !response.Success{
-		return false,response.Err
+	response := channel.Run(ctx, "kill", fmt.Sprintf(`-9 %s`, strings.Join(pids, " ")))
+	if !response.Success {
+		return false, response.Err
 	}
-	return true,errs
+	return true, errs
 }
