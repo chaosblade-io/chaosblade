@@ -10,6 +10,8 @@ GO_ENV=CGO_ENABLED=1
 GO_FLAGS=-ldflags="-X main.ver=$(BLADE_VERSION) -X 'main.env=`uname -mv`' -X 'main.buildTime=`date`'"
 GO=env $(GO_ENV) go
 
+UNAME := $(shell uname)
+
 BUILD_TARGET=target
 BUILD_TARGET_DIR_NAME=chaosblade-$(BLADE_VERSION)
 BUILD_TARGET_PKG_DIR=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)
@@ -75,8 +77,12 @@ build_cli:
 build_osbin: build_burncpu build_burnmem build_burnio build_killprocess build_stopprocess build_changedns build_delaynetwork build_dropnetwork build_lossnetwork build_filldisk
 
 # build burn-cpu chaos tools
-build_burncpu: exec/os/bin/burncpu/burncpu.go
+build_burncpu: exec/os/bin/burncpu/forlinux/burncpu.go exec/os/bin/burncpu/burncpu.go
+ifeq ($(UNAME), Linux)
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burncpu $<
+else
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burncpu exec/os/bin/burncpu/burncpu.go
+endif
 
 # build burn-mem chaos tools
 build_burnmem: exec/os/bin/burnmem/burnmem.go
