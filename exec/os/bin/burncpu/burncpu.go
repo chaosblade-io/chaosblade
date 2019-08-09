@@ -57,17 +57,42 @@ func burnCpu() {
 
 	runtime.GOMAXPROCS(cpuCount)
 
-	totalCpuPercent, _ := cpu.Percent(time.Second, false)
-	curProcess, _ := process.NewProcess(int32(os.Getpid()))
-	curCpuPercent, _ := curProcess.CPUPercent()
+	var totalCpuPercent []float64
+	var curProcess *process.Process
+	var curCpuPercent float64
+	var err error
+
+	totalCpuPercent, err = cpu.Percent(time.Second, false)
+	if err != nil {
+		bin.PrintErrAndExit(err.Error())
+	}
+
+	curProcess, err = process.NewProcess(int32(os.Getpid()))
+	if err != nil {
+		bin.PrintErrAndExit(err.Error())
+	}
+
+	curCpuPercent, err = curProcess.CPUPercent()
+	if err != nil {
+		bin.PrintErrAndExit(err.Error())
+	}
+
 	otherCpuPercent := (100.0 - (totalCpuPercent[0] - curCpuPercent)) / 100.0
 	go func() {
 		t := time.NewTicker(3 * time.Second)
 		for {
 			select {
 			case <-t.C:
-				totalCpuPercent, _ = cpu.Percent(time.Second, false)
-				curCpuPercent, _ = curProcess.CPUPercent()
+				totalCpuPercent, err = cpu.Percent(time.Second, false)
+				if err != nil {
+					bin.PrintErrAndExit(err.Error())
+				}
+
+				curCpuPercent, err = curProcess.CPUPercent()
+				if err != nil {
+					bin.PrintErrAndExit(err.Error())
+				}
+
 				otherCpuPercent = (100.0 - (totalCpuPercent[0] - curCpuPercent)) / 100.0
 			}
 		}

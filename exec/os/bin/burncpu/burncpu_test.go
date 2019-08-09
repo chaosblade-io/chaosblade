@@ -34,6 +34,7 @@ func Test_startBurnCpu(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cpuList = tt.args.cpuList
 			cpuCount = tt.args.cpuCount
+			cpuPercent = tt.args.cpuPercent
 			startBurnCpu()
 		})
 	}
