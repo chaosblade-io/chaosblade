@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/cplus"
 	"github.com/chaosblade-io/chaosblade/exec/docker"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
 	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
@@ -18,7 +19,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"github.com/chaosblade-io/chaosblade/exec/cplus"
 )
 
 // ExpActionFlags is used to receive experiment action flags
@@ -102,12 +102,14 @@ var ctx_ = context.Background()
 func (ec *expCommand) registerOsExpCommands() []*modelCommand {
 	// register cpu
 	cpu := ec.registerExpCommand(&os.CpuCommandModelSpec{})
+	mem := ec.registerExpCommand(&os.MemCommandModelSpec{})
 	process := ec.registerExpCommand(&os.ProcessCommandModelSpec{})
 	network := ec.registerExpCommand(&os.NetworkCommandSpec{})
 	disk := ec.registerExpCommand(&os.DiskCommandSpec{})
 	script := ec.registerExpCommand(&os.ScriptCommandModelSpec{})
 	return []*modelCommand{
 		cpu,
+		mem,
 		process,
 		network,
 		disk,

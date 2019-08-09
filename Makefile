@@ -72,11 +72,15 @@ build_cli:
 	# build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
 
-build_osbin: build_burncpu build_burnio build_killprocess build_stopprocess build_changedns build_delaynetwork build_dropnetwork build_lossnetwork build_filldisk
+build_osbin: build_burncpu build_burnmem build_burnio build_killprocess build_stopprocess build_changedns build_delaynetwork build_dropnetwork build_lossnetwork build_filldisk
 
 # build burn-cpu chaos tools
 build_burncpu: exec/os/bin/burncpu/burncpu.go
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burncpu $<
+
+# build burn-mem chaos tools
+build_burnmem: exec/os/bin/burnmem/burnmem.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burnmem $<
 
 # build burn-io chaos tools
 build_burnio: exec/os/bin/burnio/burnio.go
