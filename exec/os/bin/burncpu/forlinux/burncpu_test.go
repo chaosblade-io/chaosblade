@@ -31,7 +31,7 @@ func Test_startBurnCpu(t *testing.T) {
 	}
 	bindBurnCpuFunc = func(ctx context.Context, core string, pid int) {}
 	checkBurnCpuFunc = func(ctx context.Context) {}
-	cgroupNewFunc = func(int, int) cgroups.Cgroup { return new(exec.CgroupMock) }
+	cgroupNewFunc = func(int, int) cgroups.Cgroup { return new(CgroupMock) }
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cpuList = tt.args.cpuList
