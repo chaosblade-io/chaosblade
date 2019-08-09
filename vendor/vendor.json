@@ -10,6 +10,24 @@
 			"revisionTime": "2019-07-31T13:47:26Z"
 		},
 		{
+			"checksumSHA1": "1Q2PgYs9vhxY0SOzGg8/ttDSRtk=",
+			"path": "github.com/containerd/cgroups",
+			"revision": "c4b9ac5c7601384c965b9646fc515884e091ebb9",
+			"revisionTime": "2019-07-17T03:03:53Z"
+		},
+		{
+			"checksumSHA1": "WF6GR2/MTAreZskxw9rvh+HCQc4=",
+			"path": "github.com/coreos/go-systemd/dbus",
+			"revision": "fd7a80b32e1fc73e890fde45604ed5009dc817a3",
+			"revisionTime": "2019-07-19T11:48:52Z"
+		},
+		{
+			"checksumSHA1": "uJpTEqskmHWciK0+gjsnpRHXq7k=",
+			"path": "github.com/docker/go-units",
+			"revision": "519db1ee28dcc9fd2474ae59fca29a810482bfb1",
+			"revisionTime": "2019-04-23T14:49:23Z"
+		},
+		{
 			"checksumSHA1": "vTmc/uvCPpTs51Rl9bVomPZMZIM=",
 			"origin": "github.com/shirou/gopsutil/vendor/github.com/go-ole/go-ole",
 			"path": "github.com/go-ole/go-ole",
@@ -24,16 +42,58 @@
 			"revisionTime": "2019-07-31T13:47:26Z"
 		},
 		{
+			"checksumSHA1": "qwK75TRXmR/k8CiegYaeqaCDek4=",
+			"path": "github.com/godbus/dbus",
+			"revision": "4481cbc300e2df0c0b3cecc18b6c16c6c0bb885d",
+			"revisionTime": "2019-07-26T02:52:47Z"
+		},
+		{
+			"checksumSHA1": "rasgUuf7DVFShc3hKeh9wjWBWO0=",
+			"path": "github.com/gogo/protobuf/gogoproto",
+			"revision": "28a6bbf47e48e0b2220b2a244750b660c83d4942",
+			"revisionTime": "2019-07-30T20:11:29Z"
+		},
+		{
+			"checksumSHA1": "TtsnwmGQV6sPwWg6nt3b7XbdxoA=",
+			"path": "github.com/gogo/protobuf/proto",
+			"revision": "28a6bbf47e48e0b2220b2a244750b660c83d4942",
+			"revisionTime": "2019-07-30T20:11:29Z"
+		},
+		{
+			"checksumSHA1": "uA3fNRcrMhh6Y8ugPuoyEK72nvk=",
+			"path": "github.com/gogo/protobuf/protoc-gen-gogo/descriptor",
+			"revision": "28a6bbf47e48e0b2220b2a244750b660c83d4942",
+			"revisionTime": "2019-07-30T20:11:29Z"
+		},
+		{
 			"checksumSHA1": "40vJyUB4ezQSn/NSadsKEOrudMc=",
 			"path": "github.com/inconshreveable/mousetrap",
 			"revision": "76626ae9c91c4f2a10f34cad8ce83ea42c93bb75",
 			"revisionTime": "2014-10-17T20:07:13Z"
 		},
 		{
+			"path": "github.com/konsorten/go-windows-terminal-sequences",
+			"revision": ""
+		},
+		{
 			"checksumSHA1": "8zEXCBTpyOvsoOEPmLe8tTZvkXI=",
 			"path": "github.com/mattn/go-sqlite3",
 			"revision": "ad30583d8387ce8118f8605eaeb3b4f7b4ae0ee1",
 			"revisionTime": "2019-02-17T17:40:29Z"
+		},
+		{
+			"checksumSHA1": "LocsyJEtNVlpow4fvR+UZGxxRD8=",
+			"path": "github.com/opencontainers/runtime-spec/specs-go",
+			"revision": "c9a5f6194441d1dcaf8b0651841f6cace6a8fd46",
+			"revisionTime": "2019-07-16T19:26:40Z",
+			"version": "master",
+			"versionExact": "master"
+		},
+		{
+			"checksumSHA1": "I7hloldMJZTqUx6hbVDp5nk9fZQ=",
+			"path": "github.com/pkg/errors",
+			"revision": "27936f6d90f9c8e1145f11ed52ffffbfdb9e0af7",
+			"revisionTime": "2019-02-27T00:00:51Z"
 		},
 		{
 			"checksumSHA1": "GE+ZKBrF6erMVBnWSwx4icWPsZg=",
