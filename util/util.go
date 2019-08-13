@@ -5,7 +5,6 @@ import (
 	"math/rand"
 	"encoding/hex"
 	"time"
-	"path/filepath"
 	"os"
 	"log"
 	"reflect"
@@ -14,6 +13,8 @@ import (
 	"net/http"
 	"io/ioutil"
 	"context"
+	"os/exec"
+	"path/filepath"
 )
 
 var proPath string
@@ -25,12 +26,15 @@ func GetProgramPath() string {
 	if proPath != "" {
 		return proPath
 	}
-	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	dir, err := exec.LookPath(os.Args[0])
 	if err != nil {
 		log.Fatal("can get the process path")
 	}
-	proPath = dir
-	return dir
+	if p, err := os.Readlink(dir); err == nil {
+		dir = p
+	}
+	proPath = filepath.Dir(dir)
+	return proPath
 }
 
 // GetBinPath
