@@ -33,7 +33,10 @@ func GetProgramPath() string {
 	if p, err := os.Readlink(dir); err == nil {
 		dir = p
 	}
-	proPath = filepath.Dir(dir)
+	proPath, err = filepath.Abs(filepath.Dir(dir))
+	if err != nil {
+		log.Fatal("can get the full process path")
+	}
 	return proPath
 }
 
