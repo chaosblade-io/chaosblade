@@ -55,7 +55,7 @@ func doStopProcess(process, processCmd string) {
 	if pids == nil || len(pids) == 0 {
 		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
 	}
-	args := fmt.Sprintf("-STOP %s", strings.Join(pids, " "))
+	args := fmt.Sprintf("-STOP %s ", strings.Join(pids, " "))
 	response := exec.NewLocalChannel().Run(ctx, "kill", args)
 	if !response.Success {
 		bin.PrintErrAndExit(response.Err)
