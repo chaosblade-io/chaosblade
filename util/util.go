@@ -77,10 +77,19 @@ func IsNil(i interface{}) bool {
 	return false
 }
 
-//IsExist return true if file exists
+//IsExist returns true if file exists
 func IsExist(fileName string) bool {
 	_, err := os.Stat(fileName)
 	return err == nil || os.IsExist(err)
+}
+
+// IsDir returns true if the path is directory
+func IsDir(path string) bool {
+	fileInfo, err := os.Stat(path)
+	if err != nil || fileInfo == nil {
+		return false
+	}
+	return fileInfo.IsDir()
 }
 
 //GetUserHome return user home.
