@@ -55,7 +55,7 @@ func doStopProcess(process, processCmd string) {
 	if pids == nil || len(pids) == 0 {
 		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
 	}
-	args := fmt.Sprintf("-19 %s", strings.Join(pids, " "))
+	args := fmt.Sprintf("-STOP %s", strings.Join(pids, " "))
 	response := exec.NewLocalChannel().Run(ctx, "kill", args)
 	if !response.Success {
 		bin.PrintErrAndExit(response.Err)
@@ -84,7 +84,7 @@ func doRecoverProcess(process, processCmd string) {
 	if pids == nil || len(pids) == 0 {
 		bin.PrintErrAndExit(fmt.Sprintf("%s process not found", stopProcessName))
 	}
-	response := exec.NewLocalChannel().Run(ctx, "kill", fmt.Sprintf("-18 %s", strings.Join(pids, " ")))
+	response := exec.NewLocalChannel().Run(ctx, "kill", fmt.Sprintf("-CONT %s", strings.Join(pids, " ")))
 	if !response.Success {
 		bin.PrintErrAndExit(response.Err)
 	}
