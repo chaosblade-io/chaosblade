@@ -10,6 +10,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"os"
 )
 
 // Command is cli command interface
@@ -110,15 +111,22 @@ func (bc *baseCommand) generateUid() (string, error) {
 
 // initLog initializes logrus config
 func (bc *baseCommand) initLog() {
-	if bc.debug {
-		logrus.SetLevel(logrus.DebugLevel)
-		logrus.Infoln("open client debug model")
-	}
 	formatter := &logrus.TextFormatter{
 		FullTimestamp:   true,
 		TimestampFormat: time.RFC3339Nano,
 	}
 	logrus.SetFormatter(formatter)
+	logFile, err := util.GetLogFile()
+	if err == nil {
+		f, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE, 0755)
+		if err == nil {
+			logrus.SetOutput(util.NewFileWriterWithoutErr(f))
+		}
+	}
+	if bc.debug {
+		logrus.SetLevel(logrus.DebugLevel)
+		logrus.Infoln("open client debug model")
+	}
 }
 
 //AddCommand is add child command to the parent command

@@ -52,6 +52,10 @@ func (*BurnActionSpec) Flags() []exec.ExpFlagSpec {
 			Name: "size",
 			Desc: "Block size, MB, default is 1MB",
 		},
+		&exec.ExpFlag{
+			Name: "mount-point",
+			Desc: "The disk mount point",
+		},
 	}
 }
 

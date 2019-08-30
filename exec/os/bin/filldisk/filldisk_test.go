@@ -10,12 +10,12 @@ import (
 
 func Test_startFill_startSuccessful(t *testing.T) {
 	type args struct {
-		mountPoint string
-		size       string
+		path string
+		size string
 	}
 	as := &args{
-		mountPoint: "/dev",
-		size:       "10",
+		path: "/dev",
+		size: "10",
 	}
 
 	var exitCode int
@@ -29,7 +29,7 @@ func Test_startFill_startSuccessful(t *testing.T) {
 		T:        t,
 	}
 
-	startFill(as.mountPoint, as.size)
+	startFill(as.path, as.size)
 	if exitCode != 0 {
 		t.Errorf("unexpected result %d, expected result: %d", exitCode, 1)
 	}
@@ -46,8 +46,8 @@ func Test_stopFill(t *testing.T) {
 		mountPoint string
 	}
 	tests := []struct {
-		name    string
-		args    args
+		name string
+		args args
 	}{
 		{"stop", args{"/dev"}},
 	}
