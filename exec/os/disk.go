@@ -20,7 +20,7 @@ func (*DiskCommandSpec) LongDesc() string {
 }
 
 func (*DiskCommandSpec) Example() string {
-	return `disk fill --mount-point / --size 1000
+	return `disk fill --path /home --size 1000
 
 # You can execute "blade query disk mount-point" command to query the mount points`
 }
@@ -33,12 +33,7 @@ func (*DiskCommandSpec) Actions() []exec.ExpActionCommandSpec {
 }
 
 func (*DiskCommandSpec) Flags() []exec.ExpFlagSpec {
-	return []exec.ExpFlagSpec{
-		&exec.ExpFlag{
-			Name: "mount-point",
-			Desc: "the disk mount point",
-		},
-	}
+	return []exec.ExpFlagSpec{}
 }
 
 func (*DiskCommandSpec) PreExecutor() exec.PreExecutor {

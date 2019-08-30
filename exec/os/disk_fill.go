@@ -22,11 +22,11 @@ func (*FillActionSpec) Aliases() []string {
 }
 
 func (*FillActionSpec) ShortDesc() string {
-	return "Fill the specified directory path or mount point"
+	return "Fill the specified directory path"
 }
 
 func (*FillActionSpec) LongDesc() string {
-	return "Fill the specified directory path or mount point. If the path is not directory or does not exist, an error message will be returned. Only one can be selected in --path and --mount-point"
+	return "Fill the specified directory path. If the path is not directory or does not exist, an error message will be returned."
 }
 
 func (*FillActionSpec) Flags() []exec.ExpFlagSpec {
@@ -36,16 +36,16 @@ func (*FillActionSpec) Flags() []exec.ExpFlagSpec {
 			Desc:     "Disk fill size, unit is MB. The value is a positive integer without unit, for example, --size 1024",
 			Required: true,
 		},
-		&exec.ExpFlag{
-			Name: "path",
-			Desc: "The path of directory where the disk is populated",
-		},
-		// Mount-point flag in parent cannot be deleted because it needs to be adapted to the old version
 	}
 }
 
 func (*FillActionSpec) Matchers() []exec.ExpFlagSpec {
-	return []exec.ExpFlagSpec{}
+	return []exec.ExpFlagSpec{
+		&exec.ExpFlag{
+			Name: "path",
+			Desc: "The path of directory where the disk is populated, default value is /",
+		},
+	}
 }
 
 type FillActionExecutor struct {
@@ -62,19 +62,10 @@ func (fae *FillActionExecutor) Exec(uid string, ctx context.Context, model *exec
 	if fae.channel == nil {
 		return transport.ReturnFail(transport.Code[transport.ServerError], "channel is nil")
 	}
-	mountPoint := model.ActionFlags["mount-point"]
+	directory := "/"
 	path := model.ActionFlags["path"]
-	if mountPoint == "" && path == "" {
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
-			"must use --path or --mount-point to specify the directory")
-	}
-	if mountPoint != "" && path != "" {
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
-			"only one can be select in --path and --mount-point")
-	}
-	directory := path
-	if directory == "" {
-		directory = mountPoint
+	if path != "" {
+		directory = path
 	}
 	if !util.IsDir(directory) {
 		return transport.ReturnFail(transport.Code[transport.IllegalParameters],

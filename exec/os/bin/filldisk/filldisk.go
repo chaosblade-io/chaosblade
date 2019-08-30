@@ -16,9 +16,11 @@ var fillDataFile = "chaos_filldisk.log.dat"
 var fillDiskSize, fillDiskDirectory string
 var fillDiskStart, fillDiskStop bool
 
+const diskFillErrorMessage = "No space left on device"
+
 func main() {
 	flag.StringVar(&fillDiskDirectory, "directory", "", "the directory where the disk is populated")
-	flag.StringVar(&fillDiskSize, "size", "", "fill size")
+	flag.StringVar(&fillDiskSize, "size", "", "fill size, unit is M")
 	flag.BoolVar(&fillDiskStart, "start", false, "start fill or not")
 	flag.BoolVar(&fillDiskStop, "stop", false, "stop fill or not")
 
@@ -47,14 +49,25 @@ func startFill(directory, size string) {
 
 	// Some normal filesystems (ext4, xfs, btrfs and ocfs2) tack quick works
 	if exec.IsCommandAvailable("fallocate") {
-		response := channel.Run(ctx, "fallocate", fmt.Sprintf(`-l %sM %s`, size, dataFile))
-		if !response.Success {
-			stopFill(directory)
-			bin.PrintErrAndExit(response.Err)
-		}
+		fillDiskByFallocate(ctx, size, dataFile)
+	}
+	// If execute fallocate command failed, use dd command to retry.
+	fillDiskByDD(ctx, dataFile, directory, size)
+}
+
+func fillDiskByFallocate(ctx context.Context, size string, dataFile string) {
+	response := channel.Run(ctx, "fallocate", fmt.Sprintf(`-l %sM %s`, size, dataFile))
+	if response.Success {
 		bin.PrintOutputAndExit(response.Result.(string))
 	}
+	// Need to judge that the disk is full or not. If the disk is full, return success
+	if strings.Contains(response.Err, diskFillErrorMessage) {
+		bin.PrintOutputAndExit(fmt.Sprintf("success because of %s", diskFillErrorMessage))
+	}
+}
 
+func fillDiskByDD(ctx context.Context, dataFile string, directory string, size string) {
+	// Because of filling disk slowly using dd, so execute dd with 1b size first to test the command.
 	response := channel.Run(ctx, "dd", fmt.Sprintf(`if=/dev/zero of=%s bs=1b count=1 iflag=fullblock`, dataFile))
 	if !response.Success {
 		stopFill(directory)
@@ -69,10 +82,10 @@ func startFill(directory, size string) {
 	bin.PrintOutputAndExit(response.Result.(string))
 }
 
+// stopFill contains kill the filldisk process and delete the temp file actions
 func stopFill(directory string) {
 	ctx := context.Background()
 	pids, _ := exec.GetPidsByProcessName(fillDataFile, ctx)
-
 	if pids != nil || len(pids) >= 0 {
 		channel.Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
 	}
