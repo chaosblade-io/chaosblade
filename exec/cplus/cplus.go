@@ -101,7 +101,7 @@ func startProxy(port, scriptLocation, javaBin string) *transport.Response {
 		javaBin,
 		cplusJarPath,
 		port, scriptLocation,
-		util.GetNohupOutput())
+		util.GetNohupOutput(util.Blade))
 	return exec.NewLocalChannel().Run(context.Background(), "nohup", args)
 }
 

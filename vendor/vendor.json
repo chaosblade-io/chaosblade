@@ -169,6 +169,12 @@
 			"revisionTime": "2019-02-15T13:44:14Z"
 		},
 		{
+			"checksumSHA1": "TM3Neoy1xRAKyZYMGzKc41sDFW4=",
+			"path": "gopkg.in/natefinch/lumberjack.v2",
+			"revision": "a96e63847dc3c67d17befa69c303767e2f84e54f",
+			"revisionTime": "2017-05-31T16:03:50Z"
+		},
+		{
 			"checksumSHA1": "QqDq2x8XOU7IoOR98Cx1eiV5QY8=",
 			"path": "gopkg.in/yaml.v2",
 			"revision": "51d6538a90f86fe93ac480b35f37b2be17fef232",

@@ -11,6 +11,7 @@ import (
 
 	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade/util"
 )
 
 type CpuCommandModelSpec struct {
@@ -147,7 +148,7 @@ func (ce *cpuExecutor) Exec(uid string, ctx context.Context, model *exec.ExpMode
 			return transport.ReturnFail(transport.Code[transport.EnvironmentError],
 				"taskset command not exist")
 		}
-		cores, err := parseCpuList(cpuListStr)
+		cores, err := util.ParseIntegerListToStringSlice(cpuListStr)
 		if err != nil {
 			return transport.ReturnFail(transport.Code[transport.IllegalParameters],
 				fmt.Sprintf("parse %s flag err, %v", "cpu-list", err))
@@ -185,40 +186,4 @@ func (ce *cpuExecutor) start(ctx context.Context, cpuList string, cpuCount int, 
 // stop burn cpu
 func (ce *cpuExecutor) stop(ctx context.Context) *transport.Response {
 	return ce.channel.Run(ctx, path.Join(ce.channel.GetScriptPath(), burnCpuBin), "--stop")
-}
-
-// parseCpuList returns the cpu core count. 0,2-3
-func parseCpuList(cpuListValue string) ([]string, error) {
-	cores := make([]string, 0)
-	commaParts := strings.Split(cpuListValue, ",")
-	for _, part := range commaParts {
-		value := strings.TrimSpace(part)
-		if value == "" {
-			continue
-		}
-		if !strings.Contains(value, "-") {
-			_, err := strconv.Atoi(value)
-			if err != nil {
-				return cores, fmt.Errorf("%s value is illegal, %v", value, err)
-			}
-			cores = append(cores, value)
-			continue
-		}
-		coreRange := strings.Split(value, "-")
-		if len(coreRange) != 2 {
-			return cores, fmt.Errorf("%s value is illegal", value)
-		}
-		startIndex, err := strconv.Atoi(strings.TrimSpace(coreRange[0]))
-		if err != nil {
-			return cores, fmt.Errorf("start in %s value is illegal", value)
-		}
-		endIndex, err := strconv.Atoi(strings.TrimSpace(coreRange[1]))
-		if err != nil {
-			return cores, fmt.Errorf("end in %s value is illegal", value)
-		}
-		for i := startIndex; i <= endIndex; i++ {
-			cores = append(cores, strconv.Itoa(i))
-		}
-	}
-	return cores, nil
 }

@@ -3,11 +3,11 @@ package main
 import (
 	"github.com/spf13/cobra"
 	"os"
+	"github.com/chaosblade-io/chaosblade/util"
 )
 
 type Cli struct {
 	rootCmd *cobra.Command
-	Debug   bool
 }
 
 //NewCli returns the cli instance used to register and execute command
@@ -27,7 +27,7 @@ func NewCli() *Cli {
 // setFlags defines flags for root command
 func (cli *Cli) setFlags() {
 	flags := cli.rootCmd.PersistentFlags()
-	flags.BoolVarP(&cli.Debug, "debug", "d", false, "Set client to DEBUG mode")
+	flags.BoolVarP(&util.Debug, "debug", "d", false, "Set client to DEBUG mode")
 }
 
 //Run command

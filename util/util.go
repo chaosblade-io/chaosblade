@@ -149,32 +149,8 @@ func GetUnusedPort() (int, error) {
 	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
-// GetLogFile
-func GetLogFile() (string, error) {
-	logsPath := path.Join(GetProgramPath(), "logs")
-	logFile := path.Join(logsPath, "chaosblade.log")
-	if IsExist(logFile) {
-		return logFile, nil
-	}
-	// mk dir
-	err := os.MkdirAll(logsPath, os.ModePerm)
-	if err != nil {
-		return "", err
-	}
-	// create file
-	file, err := os.OpenFile(logFile, os.O_RDONLY|os.O_CREATE, 0666)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	return logFile, nil
-}
-
-// GetNohupOutput
-func GetNohupOutput() string {
-	logFile, err := GetLogFile()
-	if err == nil {
-		return logFile
-	}
-	return "/dev/null"
+// GetProgramParentPath returns the parent directory end with /
+func GetProgramParentPath() string {
+	dir, _ := path.Split(GetProgramPath())
+	return dir
 }
