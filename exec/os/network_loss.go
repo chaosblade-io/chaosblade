@@ -28,25 +28,7 @@ func (*LossActionSpec) LongDesc() string {
 }
 
 func (*LossActionSpec) Matchers() []exec.ExpFlagSpec {
-	return []exec.ExpFlagSpec{
-		&exec.ExpFlag{
-			Name: "local-port",
-			Desc: "Port for local service",
-		},
-		&exec.ExpFlag{
-			Name: "remote-port",
-			Desc: "Port for remote service",
-		},
-		&exec.ExpFlag{
-			Name: "exclude-port",
-			Desc: "Exclude one local port, for example 22 port. This flag is invalid when --local-port or --remote-port is specified",
-		},
-		&exec.ExpFlag{
-			Name:     "interface",
-			Desc:     "Network interface, for example, eth0",
-			Required: true,
-		},
-	}
+	return commFlags
 }
 
 func (*LossActionSpec) Flags() []exec.ExpFlagSpec {
@@ -66,8 +48,6 @@ type NetworkLossExecutor struct {
 func (*NetworkLossExecutor) Name() string {
 	return "loss"
 }
-
-var lossNetworkBin = "chaos_lossnetwork"
 
 func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *transport.Response {
 	if nle.channel == nil {
@@ -95,20 +75,15 @@ func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *exe
 
 func (nle *NetworkLossExecutor) start(netInterface, localPort, remotePort, excludePort, percent string, ctx context.Context) *transport.Response {
 	args := fmt.Sprintf("--start --interface %s --percent %s", netInterface, percent)
-	if localPort != "" {
-		args = fmt.Sprintf("%s --local-port %s", args, localPort)
+	args, err := getCommArgs(localPort, remotePort, excludePort, args)
+	if err != nil {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], err.Error())
 	}
-	if remotePort != "" {
-		args = fmt.Sprintf("%s --remote-port %s", args, remotePort)
-	}
-	if excludePort != "" {
-		args = fmt.Sprintf("%s --exclude-port %s", args, excludePort)
-	}
-	return nle.channel.Run(ctx, path.Join(nle.channel.GetScriptPath(), lossNetworkBin), args)
+	return nle.channel.Run(ctx, path.Join(nle.channel.GetScriptPath(), dlNetworkBin), args)
 }
 
 func (nle *NetworkLossExecutor) stop(netInterface string, ctx context.Context) *transport.Response {
-	return nle.channel.Run(ctx, path.Join(nle.channel.GetScriptPath(), lossNetworkBin),
+	return nle.channel.Run(ctx, path.Join(nle.channel.GetScriptPath(), dlNetworkBin),
 		fmt.Sprintf("--stop --interface %s", netInterface))
 }
 

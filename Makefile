@@ -74,7 +74,7 @@ build_cli:
 	# build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
 
-build_osbin: build_burncpu build_burnmem build_burnio build_killprocess build_stopprocess build_changedns build_delaynetwork build_dropnetwork build_lossnetwork build_filldisk
+build_osbin: build_burncpu build_burnmem build_burnio build_killprocess build_stopprocess build_changedns build_dlnetwork build_dropnetwork build_filldisk
 
 # build burn-cpu chaos tools
 build_burncpu: exec/os/bin/burncpu/forlinux/burncpu.go exec/os/bin/burncpu/burncpu.go
@@ -103,14 +103,11 @@ build_stopprocess: exec/os/bin/stopprocess/stopprocess.go
 build_changedns: exec/os/bin/changedns/changedns.go
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_changedns $<
 
-build_delaynetwork: exec/os/bin/delaynetwork/delaynetwork.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_delaynetwork $<
+build_dlnetwork: exec/os/bin/delaylossnetwork/delaylossnetwork.go
+	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_dlnetwork $<
 
 build_dropnetwork: exec/os/bin/dropnetwork/dropnetwork.go
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_dropnetwork $<
-
-build_lossnetwork: exec/os/bin/lossnetwork/lossnetwork.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_lossnetwork $<
 
 build_filldisk: exec/os/bin/filldisk/filldisk.go
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_filldisk $<

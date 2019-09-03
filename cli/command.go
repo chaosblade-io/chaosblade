@@ -8,9 +8,7 @@ import (
 	"github.com/chaosblade-io/chaosblade/data"
 	"github.com/chaosblade-io/chaosblade/util"
 
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"os"
 )
 
 // Command is cli command interface
@@ -28,7 +26,6 @@ type Command interface {
 // baseCommand
 type baseCommand struct {
 	command *cobra.Command
-	debug   bool
 }
 
 func (bc *baseCommand) Init() {
@@ -109,32 +106,12 @@ func (bc *baseCommand) generateUid() (string, error) {
 	return bc.generateUid()
 }
 
-// initLog initializes logrus config
-func (bc *baseCommand) initLog() {
-	formatter := &logrus.TextFormatter{
-		FullTimestamp:   true,
-		TimestampFormat: time.RFC3339Nano,
-	}
-	logrus.SetFormatter(formatter)
-	logFile, err := util.GetLogFile()
-	if err == nil {
-		f, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE, 0755)
-		if err == nil {
-			logrus.SetOutput(util.NewFileWriterWithoutErr(f))
-		}
-	}
-	if bc.debug {
-		logrus.SetLevel(logrus.DebugLevel)
-		logrus.Infoln("open client debug model")
-	}
-}
-
 //AddCommand is add child command to the parent command
 func (bc *baseCommand) AddCommand(child Command) {
 	child.Init()
 	childCmd := child.CobraCmd()
 	childCmd.PreRun = func(cmd *cobra.Command, args []string) {
-		bc.initLog()
+		util.InitLog(util.Blade)
 	}
 	childCmd.SilenceUsage = true
 	childCmd.DisableFlagsInUseLine = true

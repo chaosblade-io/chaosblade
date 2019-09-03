@@ -6,6 +6,7 @@ import (
 	"context"
 	"path"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade/util"
 )
 
 type DelayActionSpec struct {
@@ -28,25 +29,7 @@ func (*DelayActionSpec) LongDesc() string {
 }
 
 func (*DelayActionSpec) Matchers() []exec.ExpFlagSpec {
-	return []exec.ExpFlagSpec{
-		&exec.ExpFlag{
-			Name: "local-port",
-			Desc: "Port for local service",
-		},
-		&exec.ExpFlag{
-			Name: "remote-port",
-			Desc: "Port for remote service",
-		},
-		&exec.ExpFlag{
-			Name: "exclude-port",
-			Desc: "Exclude one local port, for example 22 port. This flag is invalid when --local-port or --remote-port is specified",
-		},
-		&exec.ExpFlag{
-			Name:     "interface",
-			Desc:     "Network interface, for example, eth0",
-			Required: true,
-		},
-	}
+	return commFlags
 }
 
 func (*DelayActionSpec) Flags() []exec.ExpFlagSpec {
@@ -97,25 +80,18 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	}
 }
 
-var delayNetworkBin = "chaos_delaynetwork"
-
 func (de *NetworkDelayExecutor) start(localPort, remotePort, excludePort, time, offset, netInterface string, ctx context.Context) *transport.Response {
-	args := fmt.Sprintf("--start --interface %s --time %s --offset %s", netInterface, time, offset)
-	if localPort != "" {
-		args = fmt.Sprintf("%s --local-port %s", args, localPort)
+	args := fmt.Sprintf("--start --interface %s --time %s --offset %s --debug=%t", netInterface, time, offset, util.Debug)
+	args, err := getCommArgs(localPort, remotePort, excludePort, args)
+	if err != nil {
+		return transport.ReturnFail(transport.Code[transport.IllegalParameters], err.Error())
 	}
-	if remotePort != "" {
-		args = fmt.Sprintf("%s --remote-port %s", args, remotePort)
-	}
-	if excludePort != "" {
-		args = fmt.Sprintf("%s --exclude-port %s", args, excludePort)
-	}
-	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), delayNetworkBin), args)
+	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), dlNetworkBin), args)
 }
 
 func (de *NetworkDelayExecutor) stop(netInterface string, ctx context.Context) *transport.Response {
-	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), delayNetworkBin),
-		fmt.Sprintf("--stop --interface %s", netInterface))
+	return de.channel.Run(ctx, path.Join(de.channel.GetScriptPath(), dlNetworkBin),
+		fmt.Sprintf("--stop --interface %s --debug=%t", netInterface, util.Debug))
 }
 
 func (de *NetworkDelayExecutor) SetChannel(channel exec.Channel) {

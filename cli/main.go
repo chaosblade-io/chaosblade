@@ -9,7 +9,6 @@ func main() {
 	cli := NewCli()
 	baseCmd := &baseCommand{
 		command: cli.rootCmd,
-		debug:   cli.Debug,
 	}
 	// add version command
 	baseCmd.AddCommand(&VersionCommand{})
