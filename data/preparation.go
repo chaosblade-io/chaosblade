@@ -43,6 +43,12 @@ type PreparationSource interface {
 
 	// UpdatePreparationRecordByUid
 	UpdatePreparationRecordByUid(uid, status, errMsg string) error
+
+	// UpdatePreparationPortByUid
+	UpdatePreparationPortByUid(uid, port string) error
+
+	// UpdatePreparationPidByUid
+	UpdatePreparationPidByUid(uid, pid string) error
 }
 
 // UserVersion PRAGMA [database.]user_version
@@ -270,6 +276,38 @@ func (s *Source) UpdatePreparationRecordByUid(uid, status, errMsg string) error 
 	}
 	defer stmt.Close()
 	_, err = stmt.Exec(status, errMsg, time.Now().Format(time.RFC3339Nano), uid)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Source) UpdatePreparationPortByUid(uid, port string) error {
+	stmt, err := s.DB.Prepare(`UPDATE preparation
+	SET port = ?, update_time = ?
+	WHERE uid = ?
+`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	_, err = stmt.Exec(port, time.Now().Format(time.RFC3339Nano), uid)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Source) UpdatePreparationPidByUid(uid, pid string) error {
+	stmt, err := s.DB.Prepare(`UPDATE preparation
+	SET pid = ?, update_time = ?
+	WHERE uid = ?
+`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	_, err = stmt.Exec(pid, time.Now().Format(time.RFC3339Nano), uid)
 	if err != nil {
 		return err
 	}

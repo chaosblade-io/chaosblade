@@ -9,6 +9,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"github.com/sirupsen/logrus"
 )
 
 type PrepareJvmCommand struct {
@@ -83,14 +84,25 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 					"please append or modify the --port %s argument in prepare command for retry", record.Port))
 		}
 	}
-	response = jvm.Attach(record.Port, pc.javaHome, pc.processId)
-	if !response.Success {
+	response, username := jvm.Attach(record.Port, pc.javaHome, pc.processId)
+	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
-		port, err := jvm.CheckPortFromSandboxToken()
-		if err == nil && strings.Contains(response.Err, "connection refused") {
-			response.Err = fmt.Sprintf("%s, append or modify the --port %s argument in prepare command for retry",
-				response.Err, port)
+		port, err := jvm.CheckPortFromSandboxToken(username)
+		if err == nil {
+			logrus.Infof("use %s port to retry", port)
+			response, username = jvm.Attach(port, pc.javaHome, pc.processId)
+			if response.Success {
+				// update port
+				err := updatePreparationPort(record.Uid, port)
+				if err != nil {
+					logrus.Warningf("update preparation port failed, %v", err)
+				}
+			}
 		}
+	}
+	if record.Pid != pc.processId {
+		// update pid
+		updatePreparationPid(record.Uid, pc.processId)
 	}
 	return handlePrepareResponse(record.Uid, pc.command, response)
 }

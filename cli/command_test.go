@@ -172,3 +172,11 @@ func (*MockSource) ListPreparationRecords() ([]*data.PreparationRecord, error) {
 func (*MockSource) UpdatePreparationRecordByUid(uid, status, errMsg string) error {
 	return nil
 }
+
+func (*MockSource) UpdatePreparationPortByUid(uid, port string) error {
+	return nil
+}
+
+func (*MockSource) UpdatePreparationPidByUid(uid, pid string) error {
+	return nil
+}
