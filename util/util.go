@@ -15,6 +15,7 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"fmt"
 )
 
 var proPath string
@@ -99,6 +100,15 @@ func GetUserHome() string {
 		return user.HomeDir
 	}
 	return "/root"
+}
+
+// GetSpecifyingUserHome
+func GetSpecifyingUserHome(username string) string {
+	usr, err := user.Lookup(username)
+	if err == nil {
+		return usr.HomeDir
+	}
+	return fmt.Sprintf("/home/%s", username)
 }
 
 // Curl url

@@ -10,6 +10,7 @@ import (
 	"path"
 	"strings"
 	"time"
+	"strconv"
 )
 
 // attach sandbox to java process
@@ -17,22 +18,20 @@ var channel = exec.NewLocalChannel()
 
 const DefaultNamespace = "default"
 
-var sandboxTokenFile = path.Join(util.GetUserHome(), ".sandbox.token")
-
-func Attach(port string, javaHome string, pid string) *transport.Response {
+func Attach(port string, javaHome string, pid string) (*transport.Response, string) {
 	// refresh
-	response := attach(pid, port, context.TODO(), javaHome)
+	response, username := attach(pid, port, context.TODO(), javaHome)
 	if !response.Success {
-		return response
+		return response, username
 	}
 	time.Sleep(5 * time.Second)
 	// active
 	response = active(port)
 	if !response.Success {
-		return response
+		return response, username
 	}
 	// check
-	return check(port)
+	return check(port), username
 }
 
 // curl -s http://localhost:$2/sandbox/default/module/http/chaosblade/status 2>&1
@@ -64,12 +63,24 @@ func active(port string) *transport.Response {
 }
 
 // attach java agent to application process
-func attach(pid, port string, ctx context.Context, javaHome string) *transport.Response {
+func attach(pid, port string, ctx context.Context, javaHome string) (*transport.Response, string) {
 	if javaHome == "" {
 		javaHome = os.Getenv("JAVA_HOME")
 	}
 	if javaHome == "" {
-		return transport.ReturnFail(transport.Code[transport.EnvironmentError], "JAVA_HOME env not found")
+		psArgs := exec.GetPsArgs()
+		response := channel.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}' | sed 's/\/bin\/java//g'`,
+			psArgs, pid))
+		if response.Success {
+			javaHome = strings.TrimSpace(response.Result.(string))
+		}
+	}
+	if javaHome == "" {
+		return transport.ReturnFail(transport.Code[transport.EnvironmentError], "JAVA_HOME env not found"), ""
+	}
+	user, err := exec.GetPidUser(pid)
+	if err != nil {
+		return transport.ReturnFail(transport.Code[transport.GetProcessError], err.Error()), user
 	}
 	toolsJar := path.Join(util.GetBinPath(), "tools.jar")
 	originalJar := path.Join(javaHome, "lib/tools.jar")
@@ -79,7 +90,7 @@ func attach(pid, port string, ctx context.Context, javaHome string) *transport.R
 	// create sandbox token
 	response := channel.Run(ctx, "date", "| head | cksum | sed 's/ //g'")
 	if !response.Success {
-		return response
+		return response, user
 	}
 	token := strings.TrimSpace(response.Result.(string))
 	jvmOpts := fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s", toolsJar)
@@ -89,18 +100,19 @@ func attach(pid, port string, ctx context.Context, javaHome string) *transport.R
 		sandboxHome, token, "127.0.0.1", port, DefaultNamespace)
 	javaArgs := fmt.Sprintf(`%s -jar %s/sandbox-core.jar %s "%s/sandbox-agent.jar" "%s"`,
 		jvmOpts, sandboxLibPath, pid, sandboxLibPath, sandboxAttachArgs)
-	response = channel.Run(ctx, path.Join(javaHome, "bin/java"), javaArgs)
+	javaBin := path.Join(javaHome, "bin/java")
+	response = channel.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", user, javaBin, javaArgs))
 	if !response.Success {
-		return response
+		return response, user
 	}
 	response = channel.Run(ctx, "grep", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
-		token, sandboxTokenFile, DefaultNamespace))
+		token, getSandboxTokenFile(user), DefaultNamespace))
 	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
 		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
-			fmt.Sprintf("attach JVM %s failed, loss response; %s", pid, response.Err))
+			fmt.Sprintf("attach JVM %s failed, loss response; %s", pid, response.Err)), user
 	}
-	return response
+	return response, user
 }
 
 func Detach(port string) *transport.Response {
@@ -108,8 +120,8 @@ func Detach(port string) *transport.Response {
 }
 
 // CheckPortFromSandboxToken will read last line and curl the port for testing connectivity
-func CheckPortFromSandboxToken() (port string, err error) {
-	port, err = getPortFromSandboxToken()
+func CheckPortFromSandboxToken(username string) (port string, err error) {
+	port, err = getPortFromSandboxToken(username)
 	if err != nil {
 		return port, err
 	}
@@ -121,30 +133,25 @@ func CheckPortFromSandboxToken() (port string, err error) {
 	return port, nil
 }
 
-func getPortFromSandboxToken() (port string, err error) {
-	file, err := os.Open(sandboxTokenFile)
+func getPortFromSandboxToken(username string) (port string, err error) {
+	response := channel.Run(context.TODO(), "grep",
+		fmt.Sprintf(`%s %s | tail -1 | awk -F ";" '{print $4}'`,
+			DefaultNamespace, getSandboxTokenFile(username)))
+	if !response.Success {
+		return "", fmt.Errorf(response.Err)
+	}
+	if response.Result == nil {
+		return "", fmt.Errorf("get empty from sandbox token file")
+	}
+	port = strings.TrimSpace(response.Result.(string))
+	if port == "" {
+		return "", fmt.Errorf("read empty from sandbox token file")
+	}
+	_, err = strconv.Atoi(port)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("can not find port from sandbox token file, %v", err)
 	}
-	fileInfo, err := file.Stat()
-	if err != nil {
-		return "", err
-	}
-	if fileInfo.Size() == 0 {
-		return "", fmt.Errorf("sandbox token file is empty")
-	}
-	buf := make([]byte, 8)
-	n, err := file.ReadAt(buf, fileInfo.Size()-int64(len(buf)))
-	if err != nil {
-		return "", err
-	}
-	for idx, c := range buf {
-		// ;
-		if c == 59 {
-			return strings.TrimSpace(string(buf[idx+1 : n])), nil
-		}
-	}
-	return "", fmt.Errorf("not found port from sandbox token file")
+	return port, nil
 }
 
 // sudo -u $user -H bash bin/sandbox.sh -p $pid -S 2>&1
@@ -165,4 +172,9 @@ func getSandboxUrl(port, uri, param string) string {
 	// "sandbox-module-mgr/reset"
 	return fmt.Sprintf("http://127.0.0.1:%s/sandbox/%s/module/http/%s?1=1%s",
 		port, DefaultNamespace, uri, param)
+}
+
+func getSandboxTokenFile(username string) string {
+	userHome := util.GetSpecifyingUserHome(username)
+	return path.Join(userHome, ".sandbox.token")
 }

@@ -79,3 +79,11 @@ func handlePrepareResponse(uid string, cmd *cobra.Command, response *transport.R
 	cmd.Println(response.Print())
 	return nil
 }
+
+func updatePreparationPort(uid, port string) error {
+	return GetDS().UpdatePreparationPortByUid(uid, port)
+}
+
+func updatePreparationPid(uid, pid string) error  {
+	return GetDS().UpdatePreparationPidByUid(uid, pid)
+}

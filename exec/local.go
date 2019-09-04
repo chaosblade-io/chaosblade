@@ -74,13 +74,16 @@ func GetPidsByProcessName(processName string, ctx context.Context) ([]string, er
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
 	}
-	pidString := response.Result.(string)
-	return strings.Fields(strings.TrimSpace(pidString)), nil
+	pidString := strings.TrimSpace(response.Result.(string))
+	if pidString == "" {
+		return make([]string, 0), nil
+	}
+	return strings.Fields(pidString), nil
 }
 
 // GetPsArgs for querying the process info
 func GetPsArgs() string {
-	var psArgs = "-ef"
+	var psArgs = "-eo user,pid,ppid,args"
 	if isAlpinePlatform() {
 		psArgs = "-o user,pid,ppid,args"
 	}
@@ -120,4 +123,23 @@ func ProcessExists(pid string) (bool, error) {
 	}
 	response := channel.Run(context.TODO(), "ps", fmt.Sprintf("-p %s", pid))
 	return response.Success, nil
+}
+
+// GetPidUser
+func GetPidUser(pid string) (string, error) {
+	var response *transport.Response
+	if isAlpinePlatform() {
+		response = channel.Run(context.TODO(), "ps", fmt.Sprintf("-o user,pid | grep %s", pid))
+
+	} else {
+		response = channel.Run(context.TODO(), "ps", fmt.Sprintf("-o user,pid -p %s | grep %s", pid, pid))
+	}
+	if !response.Success {
+		return "", fmt.Errorf(response.Err)
+	}
+	result := strings.TrimSpace(response.Result.(string))
+	if result == "" {
+		return "", fmt.Errorf("process user not found by pid")
+	}
+	return strings.Fields(result)[0], nil
 }
