@@ -32,9 +32,9 @@ func Test_startDelayNet(t *testing.T) {
 		exitCode = code
 	}
 	channel = &exec.MockLocalChannel{
-		Response:        transport.ReturnSuccess("success"),
-		ExpectedCommand: fmt.Sprintf(`tc qdisc add dev eth0 root netem delay 3000ms 10ms`),
-		T:               t,
+		Response:         transport.ReturnSuccess("success"),
+		ExpectedCommands: []string{fmt.Sprintf(`tc qdisc add dev eth0 root netem delay 3000ms 10ms`)},
+		T:                t,
 	}
 	startNet(as.netInterface, as.classRule, as.localPort, as.remotePort, as.excludePort)
 	if exitCode != 0 {
@@ -44,12 +44,12 @@ func Test_startDelayNet(t *testing.T) {
 
 func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 	type input struct {
-		localPort       string
-		remotePort      string
-		netInterface    string
-		response        *transport.Response
-		expectedCommand string
-		classRule       string
+		localPort        string
+		remotePort       string
+		netInterface     string
+		response         *transport.Response
+		expectedCommands []string
+		classRule        string
 	}
 	type expect struct {
 		exitCode   int
@@ -61,15 +61,25 @@ func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 		expect expect
 	}{
 		{input{"80", "", "eth0", transport.ReturnSuccess("success"),
-			`tc filter add dev eth0 parent 1: protocol ip prio 4 protocol ip u32 match ip sport 80 0xffff flowid 1:4`,
+			[]string{
+				`tc qdisc add dev eth0 parent 1:4 handle 40: netem delay 3000ms 10ms`,
+				`tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip sport 80 0xffff flowid 1:4`,
+			},
 			"netem delay 3000ms 10ms"},
 			expect{0, 0}},
 		{input{"", "80", "eth0", transport.ReturnSuccess("success"),
-			`tc filter add dev eth0 parent 1: protocol ip prio 4 protocol ip u32 match ip dport 80 0xffff flowid 1:4`,
+			[]string{
+				`tc qdisc add dev eth0 parent 1:4 handle 40: netem delay 3000ms 10ms`,
+				`tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip dport 80 0xffff flowid 1:4`,
+			},
 			"netem delay 3000ms 10ms"},
 			expect{0, 0}},
 		{input{"80", "", "eth0", transport.ReturnFail(transport.Code[transport.CommandNotFound], "tc command not found"),
-			`tc filter add dev eth0 parent 1: protocol ip prio 4 protocol ip u32 match ip sport 80 0xffff flowid 1:4`,
+			[]string{
+				`tc qdisc add dev eth0 parent 1:4 handle 40: netem delay 3000ms 10ms`,
+				`tc filter del dev eth0 parent 1: prio 4`,
+				`tc qdisc del dev eth0 root`,
+			},
 			"netem delay 3000ms 10ms"},
 			expect{1, 1}},
 	}
@@ -78,16 +88,12 @@ func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 	bin.ExitFunc = func(code int) {
 		exitCode = code
 	}
-	var invokeTime int
-	stopDLNetFunc = func(netInterface string) {
-		invokeTime++
-	}
+
 	for _, tt := range tests {
-		invokeTime = 0
 		channel = &exec.MockLocalChannel{
-			Response:        tt.input.response,
-			ExpectedCommand: tt.input.expectedCommand,
-			T:               t,
+			Response:         tt.input.response,
+			ExpectedCommands: tt.input.expectedCommands,
+			T:                t,
 		}
 		// ctx context.Context, channel exec.Channel,
 		//	netInterface, classRule, localPort, remotePort string
@@ -95,19 +101,16 @@ func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 		if exitCode != tt.expect.exitCode {
 			t.Errorf("unexpected result: %d, expected result: %d", exitCode, tt.expect.exitCode)
 		}
-		if invokeTime != tt.expect.invokeTime {
-			t.Errorf("unexpected invoke time %d, expected result: %d", invokeTime, tt.expect.invokeTime)
-		}
 	}
 }
 
 func Test_addExcludePortFilterForDelay(t *testing.T) {
 	type input struct {
-		excludePort     string
-		netInterface    string
-		response        *transport.Response
-		expectedCommand string
-		classRule       string
+		excludePort      string
+		netInterface     string
+		response         *transport.Response
+		expectedCommands []string
+		classRule        string
 	}
 	type expect struct {
 		exitCode   int
@@ -119,12 +122,12 @@ func Test_addExcludePortFilterForDelay(t *testing.T) {
 		expect expect
 	}{
 		{input{"80", "eth0", transport.ReturnFail(transport.Code[transport.CommandNotFound], "tc command not found"),
-			`tc qdisc add dev eth0 parent 1:1 netem delay 3000ms 10ms && \
+			[]string{`tc qdisc add dev eth0 parent 1:1 netem delay 3000ms 10ms && \
 			tc qdisc add dev eth0 parent 1:2 netem delay 3000ms 10ms && \
 			tc qdisc add dev eth0 parent 1:3 netem delay 3000ms 10ms && \
 			tc qdisc add dev eth0 parent 1:4 handle 40: pfifo_fast && \
 			tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip sport 80 0xffff flowid 1:4 && \
-			tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip dport 80 0xffff flowid 1:4`,
+			tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip dport 80 0xffff flowid 1:4`},
 			"netem delay 3000ms 10ms"},
 			expect{1, 1}},
 	}
@@ -140,9 +143,9 @@ func Test_addExcludePortFilterForDelay(t *testing.T) {
 	for _, tt := range tests {
 		invokeTime = 0
 		channel = &exec.MockLocalChannel{
-			Response:        tt.input.response,
-			ExpectedCommand: tt.input.expectedCommand,
-			T:               t,
+			Response:         tt.input.response,
+			ExpectedCommands: tt.input.expectedCommands,
+			T:                t,
 		}
 		addExcludePortFilterForDL(context.Background(), channel, tt.input.netInterface, tt.input.classRule, tt.input.excludePort)
 		if exitCode != tt.expect.exitCode {
@@ -171,9 +174,9 @@ func Test_addQdiscForDelay(t *testing.T) {
 		exitCode = code
 	}
 	channel = &exec.MockLocalChannel{
-		Response:        transport.ReturnFail(transport.Code[transport.CommandNotFound], "tc command not found"),
-		ExpectedCommand: fmt.Sprintf(`tc qdisc add dev eth0 root handle 1: prio bands 4`),
-		T:               t,
+		Response:         transport.ReturnFail(transport.Code[transport.CommandNotFound], "tc command not found"),
+		ExpectedCommands: []string{fmt.Sprintf(`tc qdisc add dev eth0 root handle 1: prio bands 4`)},
+		T:                t,
 	}
 
 	addQdiscForDL(channel, context.Background(), as.netInterface)

@@ -64,9 +64,9 @@ func Test_runBurnCpu_failed(t *testing.T) {
 	}
 
 	channel = &exec.MockLocalChannel{
-		Response:        transport.ReturnFail(transport.Code[transport.CommandNotFound], "nohup command not found"),
-		ExpectedCommand: fmt.Sprintf(`nohup %s --nohup --cpu-count 2 > /dev/null 2>&1 &`, burnBin),
-		T:               t,
+		Response:         transport.ReturnFail(transport.Code[transport.CommandNotFound], "nohup command not found"),
+		ExpectedCommands: []string{fmt.Sprintf(`nohup %s --nohup --cpu-count 2 > /dev/null 2>&1 &`, burnBin)},
+		T:                t,
 	}
 
 	runBurnCpu(context.Background(), as.cpuCount, as.pidNeeded, as.processor)
@@ -95,9 +95,9 @@ func Test_bindBurnCpu(t *testing.T) {
 	stopBurnCpuFunc = func() (bool, string) { return true, "" }
 
 	channel = &exec.MockLocalChannel{
-		Response:        transport.ReturnFail(transport.Code[transport.CommandNotFound], "taskset command not found"),
-		ExpectedCommand: fmt.Sprintf(`taskset -cp 0 25233`),
-		T:               t,
+		Response:         transport.ReturnFail(transport.Code[transport.CommandNotFound], "taskset command not found"),
+		ExpectedCommands: []string{fmt.Sprintf(`taskset -cp 0 25233`)},
+		T:                t,
 	}
 
 	bindBurnCpu(context.Background(), as.core, as.pid)

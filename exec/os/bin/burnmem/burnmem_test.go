@@ -29,9 +29,9 @@ func Test_startBurnMem(t *testing.T) {
 
 	flPath := path.Join(util.GetProgramPath(), dirName)
 	channel = &exec.MockLocalChannel{
-		Response:        transport.ReturnSuccess("success"),
-		ExpectedCommand: fmt.Sprintf("mount -t tmpfs tmpfs %s -o size=", flPath) + "100%",
-		T:               t,
+		Response:         transport.ReturnSuccess("success"),
+		ExpectedCommands: []string{fmt.Sprintf("mount -t tmpfs tmpfs %s -o size=", flPath) + "100%"},
+		T:                t,
 	}
 
 	startBurnMem()
@@ -56,9 +56,9 @@ func Test_runBurnMem_failed(t *testing.T) {
 	}
 
 	channel = &exec.MockLocalChannel{
-		Response:        transport.ReturnFail(transport.Code[transport.CommandNotFound], "nohup command not found"),
-		ExpectedCommand: fmt.Sprintf(`nohup %s --nohup --mem-percent 50 > /dev/null 2>&1 &`, burnBin),
-		T:               t,
+		Response:         transport.ReturnFail(transport.Code[transport.CommandNotFound], "nohup command not found"),
+		ExpectedCommands: []string{fmt.Sprintf(`nohup %s --nohup --mem-percent 50 > /dev/null 2>&1 &`, burnBin)},
+		T:                t,
 	}
 
 	stopBurnMemFunc = func() (bool, string) {
