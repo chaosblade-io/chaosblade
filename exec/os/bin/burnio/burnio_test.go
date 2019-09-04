@@ -38,9 +38,9 @@ func Test_startBurnIO_startFailed(t *testing.T) {
 		invokeTime++
 	}
 	channel = &exec.MockLocalChannel{
-		Response:        transport.ReturnFail(transport.Code[transport.CommandNotFound], "nohup command not found"),
-		ExpectedCommand: fmt.Sprintf(`nohup %s --file-system /dev/disk1s1 --size 1024 --count 1024 --read=true --write=true --nohup=true > /tmp/chaos_burnio.log 2>&1 &`, burnBin),
-		T:               t,
+		Response:         transport.ReturnFail(transport.Code[transport.CommandNotFound], "nohup command not found"),
+		ExpectedCommands: []string{fmt.Sprintf(`nohup %s --file-system /dev/disk1s1 --size 1024 --count 1024 --read=true --write=true --nohup=true > /tmp/chaos_burnio.log 2>&1 &`, burnBin)},
+		T:                t,
 	}
 
 	startBurnIO(as.fileSystem, as.size, as.count, as.read, as.write)

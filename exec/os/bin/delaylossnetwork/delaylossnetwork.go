@@ -82,6 +82,7 @@ func addLocalOrRemotePortForDL(ctx context.Context, channel exec.Channel,
 	if !response.Success {
 		stopNet(netInterface)
 		bin.PrintErrAndExit(response.Err)
+		return response
 	}
 	// local port 0
 	if localPort != "" {
