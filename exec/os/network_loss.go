@@ -70,12 +70,14 @@ func (nle *NetworkLossExecutor) Exec(uid string, ctx context.Context, model *exe
 	localPort := model.ActionFlags["local-port"]
 	remotePort := model.ActionFlags["remote-port"]
 	excludePort := model.ActionFlags["exclude-port"]
-	return nle.start(dev, localPort, remotePort, excludePort, percent, ctx)
+	destIp := model.ActionFlags["destination-ip"]
+	return nle.start(dev, localPort, remotePort, excludePort, destIp, percent, ctx)
 }
 
-func (nle *NetworkLossExecutor) start(netInterface, localPort, remotePort, excludePort, percent string, ctx context.Context) *transport.Response {
+func (nle *NetworkLossExecutor) start(netInterface, localPort, remotePort, excludePort, destIp, percent string,
+	ctx context.Context) *transport.Response {
 	args := fmt.Sprintf("--start --interface %s --percent %s", netInterface, percent)
-	args, err := getCommArgs(localPort, remotePort, excludePort, args)
+	args, err := getCommArgs(localPort, remotePort, excludePort, destIp, args)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.IllegalParameters], err.Error())
 	}
