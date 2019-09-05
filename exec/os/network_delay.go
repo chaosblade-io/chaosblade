@@ -73,16 +73,18 @@ func (de *NetworkDelayExecutor) Exec(uid string, ctx context.Context, model *exe
 	localPort := model.ActionFlags["local-port"]
 	remotePort := model.ActionFlags["remote-port"]
 	excludePort := model.ActionFlags["exclude-port"]
+	destIp := model.ActionFlags["destination-ip"]
 	if _, ok := exec.IsDestroy(ctx); ok {
 		return de.stop(netInterface, ctx)
 	} else {
-		return de.start(localPort, remotePort, excludePort, time, offset, netInterface, ctx)
+		return de.start(localPort, remotePort, excludePort, destIp, time, offset, netInterface, ctx)
 	}
 }
 
-func (de *NetworkDelayExecutor) start(localPort, remotePort, excludePort, time, offset, netInterface string, ctx context.Context) *transport.Response {
+func (de *NetworkDelayExecutor) start(localPort, remotePort, excludePort, destIp, time, offset, netInterface string,
+	ctx context.Context) *transport.Response {
 	args := fmt.Sprintf("--start --interface %s --time %s --offset %s --debug=%t", netInterface, time, offset, util.Debug)
-	args, err := getCommArgs(localPort, remotePort, excludePort, args)
+	args, err := getCommArgs(localPort, remotePort, excludePort, destIp, args)
 	if err != nil {
 		return transport.ReturnFail(transport.Code[transport.IllegalParameters], err.Error())
 	}

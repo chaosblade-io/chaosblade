@@ -17,6 +17,7 @@ func Test_startDelayNet(t *testing.T) {
 		localPort    string
 		remotePort   string
 		excludePort  string
+		destIp       string
 	}
 
 	as := &args{
@@ -36,7 +37,7 @@ func Test_startDelayNet(t *testing.T) {
 		ExpectedCommands: []string{fmt.Sprintf(`tc qdisc add dev eth0 root netem delay 3000ms 10ms`)},
 		T:                t,
 	}
-	startNet(as.netInterface, as.classRule, as.localPort, as.remotePort, as.excludePort)
+	startNet(as.netInterface, as.classRule, as.localPort, as.remotePort, as.excludePort, as.destIp)
 	if exitCode != 0 {
 		t.Errorf("unexpected result: %d, expected result: %d", exitCode, 1)
 	}
@@ -50,6 +51,7 @@ func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 		response         *transport.Response
 		expectedCommands []string
 		classRule        string
+		ipRule           string
 	}
 	type expect struct {
 		exitCode   int
@@ -63,16 +65,16 @@ func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 		{input{"80", "", "eth0", transport.ReturnSuccess("success"),
 			[]string{
 				`tc qdisc add dev eth0 parent 1:4 handle 40: netem delay 3000ms 10ms`,
-				`tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip sport 80 0xffff flowid 1:4`,
+				`tc filter add dev eth0 parent 1: prio 4 protocol ip u32  match ip sport 80 0xffff flowid 1:4`,
 			},
-			"netem delay 3000ms 10ms"},
+			"netem delay 3000ms 10ms", ""},
 			expect{0, 0}},
 		{input{"", "80", "eth0", transport.ReturnSuccess("success"),
 			[]string{
 				`tc qdisc add dev eth0 parent 1:4 handle 40: netem delay 3000ms 10ms`,
 				`tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip dport 80 0xffff flowid 1:4`,
 			},
-			"netem delay 3000ms 10ms"},
+			"netem delay 3000ms 10ms", ""},
 			expect{0, 0}},
 		{input{"80", "", "eth0", transport.ReturnFail(transport.Code[transport.CommandNotFound], "tc command not found"),
 			[]string{
@@ -80,7 +82,7 @@ func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 				`tc filter del dev eth0 parent 1: prio 4`,
 				`tc qdisc del dev eth0 root`,
 			},
-			"netem delay 3000ms 10ms"},
+			"netem delay 3000ms 10ms", ""},
 			expect{1, 1}},
 	}
 
@@ -97,7 +99,7 @@ func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 		}
 		// ctx context.Context, channel exec.Channel,
 		//	netInterface, classRule, localPort, remotePort string
-		addLocalOrRemotePortForDL(context.Background(), channel, tt.input.netInterface, tt.input.classRule, tt.input.localPort, tt.input.remotePort)
+		addLocalOrRemotePortForDL(context.Background(), channel, tt.input.netInterface, tt.input.classRule, tt.input.localPort, tt.input.remotePort, tt.input.ipRule)
 		if exitCode != tt.expect.exitCode {
 			t.Errorf("unexpected result: %d, expected result: %d", exitCode, tt.expect.exitCode)
 		}
@@ -111,6 +113,7 @@ func Test_addExcludePortFilterForDelay(t *testing.T) {
 		response         *transport.Response
 		expectedCommands []string
 		classRule        string
+		ipRule           string
 	}
 	type expect struct {
 		exitCode   int
@@ -126,9 +129,9 @@ func Test_addExcludePortFilterForDelay(t *testing.T) {
 			tc qdisc add dev eth0 parent 1:2 netem delay 3000ms 10ms && \
 			tc qdisc add dev eth0 parent 1:3 netem delay 3000ms 10ms && \
 			tc qdisc add dev eth0 parent 1:4 handle 40: pfifo_fast && \
-			tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip sport 80 0xffff flowid 1:4 && \
-			tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip dport 80 0xffff flowid 1:4`},
-			"netem delay 3000ms 10ms"},
+			tc filter add dev eth0 parent 1: prio 4 protocol ip u32  match ip sport 80 0xffff flowid 1:4 && \
+			tc filter add dev eth0 parent 1: prio 4 protocol ip u32  match ip dport 80 0xffff flowid 1:4`},
+			"netem delay 3000ms 10ms", ""},
 			expect{1, 1}},
 	}
 
@@ -147,7 +150,7 @@ func Test_addExcludePortFilterForDelay(t *testing.T) {
 			ExpectedCommands: tt.input.expectedCommands,
 			T:                t,
 		}
-		addExcludePortFilterForDL(context.Background(), channel, tt.input.netInterface, tt.input.classRule, tt.input.excludePort)
+		addExcludePortFilterForDL(context.Background(), channel, tt.input.netInterface, tt.input.classRule, tt.input.excludePort, tt.input.ipRule)
 		if exitCode != tt.expect.exitCode {
 			t.Errorf("unexpected result: %d, expected result: %d", exitCode, tt.expect.exitCode)
 		}
