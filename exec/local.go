@@ -34,6 +34,7 @@ func execScript(ctx context.Context, script, args string) *transport.Response {
 	if ctx == context.Background() {
 		ctx = newCtx
 	}
+	script = strings.Replace(script, " ", `\ `, -1)
 	logrus.Debugf("script: %s %s", script, args)
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", script+" "+args)
 	output, err := cmd.CombinedOutput()
