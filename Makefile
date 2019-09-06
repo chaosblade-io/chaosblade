@@ -150,9 +150,10 @@ endif
 	wget "$(BLADE_JAVA_AGENT_SPEC_DOWNLOAD_URL)" -O $(BLADE_JAVA_AGENT_SPEC_DEST_PATH)
 
 download_cplus_agent:
+ifneq ($(BLADE_CPLUS_ZIP_DEST_PATH), $(wildcard $(BLADE_CPLUS_ZIP_DEST_PATH)))
 	wget "$(BLADE_CPLUS_ZIP_DOWNLOAD_URL)" -O $(BLADE_CPLUS_ZIP_DEST_PATH)
+endif
 	wget "$(BLADE_CPLUS_AGENT_SPEC_DOWNLOAD_URL)" -O $(BLADE_CPLUS_AGENT_SPEC_DEST_PATH)
-
 
 # create cache dir
 mkdir_build_target:

@@ -104,13 +104,16 @@ func convertCommandModel(action, target, rules string) *exec.ExpModel {
 	if len(flags) < 2 {
 		return model
 	}
-	for i := 0; i < len(flags); i += 2 {
+	length := len(flags)
+	for i := 0; i < length; i += 2 {
 		// delete --
 		key := flags[i]
 		if strings.HasPrefix(key, "--") {
 			key = key[2:]
 		}
-		model.ActionFlags[key] = flags[i+1]
+		if i+1 < length {
+			model.ActionFlags[key] = flags[i+1]
+		}
 	}
 	return model
 }
