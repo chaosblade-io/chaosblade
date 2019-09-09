@@ -307,7 +307,7 @@ func (ec *expCommand) registerActionCommand(actionParentCmdName string, spec exe
 	flags := append(spec.Flags(),
 		&exec.ExpFlag{
 			Name:     "timeout",
-			Desc:     "set timeout for experiment",
+			Desc:     "set timeout for experiment in seconds",
 			Required: false,
 		},
 	)
