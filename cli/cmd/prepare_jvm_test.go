@@ -1,8 +1,9 @@
-package main
+package cmd
 
 import (
-	"testing"
 	"bytes"
+	"testing"
+
 	"github.com/spf13/cobra"
 )
 

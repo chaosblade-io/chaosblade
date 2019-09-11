@@ -1,8 +1,8 @@
-package main
+package cmd
 
 import (
-	"testing"
 	"bytes"
+	"testing"
 )
 
 func TestCli_Run(t *testing.T) {

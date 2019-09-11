@@ -1,12 +1,13 @@
-package main
+package cmd
 
 import (
-	"github.com/spf13/cobra"
 	"encoding/json"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"golang.org/x/crypto/ssh/terminal"
 	"os"
+
+	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/spf13/cobra"
+	"golang.org/x/crypto/ssh/terminal"
 )
 
 type StatusCommand struct {

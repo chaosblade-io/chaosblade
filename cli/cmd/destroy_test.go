@@ -1,10 +1,11 @@
-package main
+package cmd
 
 import (
 	"testing"
 
-	"github.com/chaosblade-io/chaosblade/exec"
 	"reflect"
+
+	"github.com/chaosblade-io/chaosblade/exec"
 )
 
 func Test_convertCommandModel(t *testing.T) {

@@ -1,45 +1,43 @@
-package main
+package cmd
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"reflect"
 	"testing"
 
-	"github.com/spf13/cobra"
-	"bytes"
-	"fmt"
 	"github.com/chaosblade-io/chaosblade/transport"
-	"encoding/json"
-	"reflect"
+	"github.com/spf13/cobra"
 )
 
-func TestQueryDiskCommand_queryDiskInfo(t *testing.T) {
-	command := &cobra.Command{
-	}
-	qdc := &QueryDiskCommand{
-	}
-	testQueryDiskDevice(t, command, qdc)
+func TestQueryNetworkCommand_queryNetworkInfo(t *testing.T) {
+	command := &cobra.Command{}
+	qnc := &QueryNetworkCommand{}
+	testQueryNetworkInterface(t, command, qnc)
 
-	testQueryDiskUnknownArg(t, command, qdc)
+	testQueryNetworkUnknownArg(t, command, qnc)
 }
 
-func testQueryDiskUnknownArg(t *testing.T, command *cobra.Command, qdc *QueryDiskCommand) {
+func testQueryNetworkUnknownArg(t *testing.T, command *cobra.Command, qnc *QueryNetworkCommand) {
 	buffer := &bytes.Buffer{}
 	command.SetOutput(buffer)
 
 	arg := "unknown"
 	expectedErr := fmt.Errorf("the %s argument not found", arg)
 
-	err := qdc.queryDiskInfo(command, arg)
+	err := qnc.queryNetworkInfo(command, arg)
 	if err.Error() != expectedErr.Error() {
 		t.Errorf("unexpected result: %s, expected: %s", err, expectedErr)
 	}
 }
 
-func testQueryDiskDevice(t *testing.T, command *cobra.Command, qdc *QueryDiskCommand) {
+func testQueryNetworkInterface(t *testing.T, command *cobra.Command, qnc *QueryNetworkCommand) {
 	buffer := &bytes.Buffer{}
 	command.SetOutput(buffer)
 
-	arg := "mount-point"
-	err := qdc.queryDiskInfo(command, arg)
+	arg := "interface"
+	err := qnc.queryNetworkInfo(command, arg)
 	if err != nil {
 		t.Errorf("unexpected result: %s, expected no error", err)
 	}

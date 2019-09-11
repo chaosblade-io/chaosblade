@@ -1,9 +1,10 @@
-package main
+package cmd
 
 import (
-	"github.com/spf13/cobra"
 	"os"
+
 	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/spf13/cobra"
 )
 
 type Cli struct {

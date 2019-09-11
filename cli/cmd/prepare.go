@@ -1,13 +1,14 @@
-package main
+package cmd
 
 import (
-	"github.com/spf13/cobra"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"github.com/sirupsen/logrus"
-	"github.com/chaosblade-io/chaosblade/util"
-	"github.com/chaosblade-io/chaosblade/data"
 	"time"
+
+	"github.com/chaosblade-io/chaosblade/data"
+	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 const (
@@ -84,6 +85,6 @@ func updatePreparationPort(uid, port string) error {
 	return GetDS().UpdatePreparationPortByUid(uid, port)
 }
 
-func updatePreparationPid(uid, pid string) error  {
+func updatePreparationPid(uid, pid string) error {
 	return GetDS().UpdatePreparationPidByUid(uid, pid)
 }

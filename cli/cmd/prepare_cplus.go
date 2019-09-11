@@ -1,12 +1,13 @@
-package main
+package cmd
 
 import (
-	"github.com/spf13/cobra"
-	"strconv"
 	"fmt"
+	"strconv"
 
-	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/spf13/cobra"
+
 	"github.com/chaosblade-io/chaosblade/exec/cplus"
+	"github.com/chaosblade-io/chaosblade/transport"
 )
 
 type PrepareCPlusCommand struct {
