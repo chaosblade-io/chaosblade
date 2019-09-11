@@ -1,11 +1,12 @@
-package main
+package cmd
 
 import (
-	"github.com/spf13/cobra"
-	"net"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade/transport"
+	"net"
 	"strings"
+
+	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/spf13/cobra"
 )
 
 type QueryNetworkCommand struct {

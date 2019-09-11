@@ -1,9 +1,10 @@
-package main
+package cmd
 
 import (
-	"github.com/spf13/cobra"
-	"github.com/chaosblade-io/chaosblade/transport"
 	"fmt"
+
+	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/spf13/cobra"
 )
 
 // QueryCommand defines query command

@@ -1,15 +1,16 @@
-package main
+package cmd
 
 import (
 	"fmt"
-	"github.com/chaosblade-io/chaosblade/exec/jvm"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"github.com/chaosblade-io/chaosblade/util"
-	"github.com/spf13/cobra"
 	"path"
 	"strconv"
 	"strings"
+
+	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade/util"
 	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 type PrepareJvmCommand struct {

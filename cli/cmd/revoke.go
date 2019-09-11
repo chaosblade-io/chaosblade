@@ -1,14 +1,15 @@
-package main
+package cmd
 
 import (
-	"fmt"
 	"context"
-	"github.com/spf13/cobra"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"github.com/chaosblade-io/chaosblade/exec/jvm"
-	"github.com/chaosblade-io/chaosblade/exec/cplus"
+	"fmt"
 	"strings"
+
+	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/exec/cplus"
+	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/spf13/cobra"
 )
 
 type RevokeCommand struct {

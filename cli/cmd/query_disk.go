@@ -1,12 +1,13 @@
-package main
+package cmd
 
 import (
-	"github.com/spf13/cobra"
-	"fmt"
-	"github.com/chaosblade-io/chaosblade/exec"
 	"context"
+	"fmt"
 	"strings"
+
+	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/spf13/cobra"
 )
 
 type QueryDiskCommand struct {
