@@ -1,6 +1,11 @@
 package cmd
 
-func CmdInit() *baseCommand {
+import "github.com/chaosblade-io/chaosblade/version"
+
+func CmdInit(ver, env, buildTime string) *baseCommand {
+	//version init
+	version.InitVersion(ver, env, buildTime)
+
 	cli := NewCli()
 	baseCmd := &baseCommand{
 		command: cli.rootCmd,
