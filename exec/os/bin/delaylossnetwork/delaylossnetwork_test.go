@@ -72,7 +72,7 @@ func Test_addLocalOrRemotePortForDelay(t *testing.T) {
 		{input{"", "80", "eth0", transport.ReturnSuccess("success"),
 			[]string{
 				`tc qdisc add dev eth0 parent 1:4 handle 40: netem delay 3000ms 10ms`,
-				`tc filter add dev eth0 parent 1: prio 4 protocol ip u32 match ip dport 80 0xffff flowid 1:4`,
+				`tc filter add dev eth0 parent 1: prio 4 protocol ip u32  match ip dport 80 0xffff flowid 1:4`,
 			},
 			"netem delay 3000ms 10ms", ""},
 			expect{0, 0}},

@@ -146,13 +146,14 @@ func addLocalOrRemotePortForDL(ctx context.Context, channel exec.Channel,
 	if remotePort != "" {
 		ports := strings.Split(remotePort, delimiter)
 		args := fmt.Sprintf(
-			`filter add dev %s parent 1: prio 4 protocol ip u32 match ip dport %s 0xffff flowid 1:4`, netInterface, ports[0])
+			`filter add dev %s parent 1: prio 4 protocol ip u32 %s match ip dport %s 0xffff flowid 1:4`,
+			netInterface, ipRule, ports[0])
 		if len(ports) > 1 {
 			for i := 1; i < len(ports); i++ {
 				args = fmt.Sprintf(
 					`%s && \
-					tc filter add dev %s parent 1: prio 4 protocol ip u32 match ip dport %s 0xffff flowid 1:4`,
-					args, netInterface, ports[i])
+					tc filter add dev %s parent 1: prio 4 protocol ip u32 %s match ip dport %s 0xffff flowid 1:4`,
+					args, netInterface, ipRule, ports[i])
 			}
 		}
 		response = channel.Run(ctx, "tc", args)
