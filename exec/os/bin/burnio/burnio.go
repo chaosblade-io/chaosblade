@@ -13,17 +13,14 @@ import (
 	"github.com/chaosblade-io/chaosblade/util"
 )
 
-var burnIOMountPoint, burnIOFileSystem, burnIOSize, burnIOCount string
+const count = 100
+
+var burnIODirectory, burnIOSize string
 var burnIORead, burnIOWrite, burnIOStart, burnIOStop, burnIONohup bool
 
 func main() {
-	// Filesystem      Size  Used Avail Use% Mounted on
-	///dev/vda1        40G  9.5G   28G  26% /
-	//  mount-point value is /, file-system value is /dev/vda1
-	flag.StringVar(&burnIOMountPoint, "mount-point", "", "mount point of disk")
-	flag.StringVar(&burnIOFileSystem, "file-system", "", "file system of disk")
+	flag.StringVar(&burnIODirectory, "directory", "", "the directory where the disk is burning")
 	flag.StringVar(&burnIOSize, "size", "", "block size")
-	flag.StringVar(&burnIOCount, "count", "", "block count")
 	flag.BoolVar(&burnIOWrite, "write", false, "write io")
 	flag.BoolVar(&burnIORead, "read", false, "read io")
 	flag.BoolVar(&burnIOStart, "start", false, "start burn io")
@@ -33,19 +30,15 @@ func main() {
 	flag.Parse()
 
 	if burnIOStart {
-		fileSystem, err := getFileSystem(burnIOMountPoint)
-		if err != nil || fileSystem == "" {
-			bin.PrintErrAndExit(fmt.Sprintf("cannot find mount point, %s", burnIOMountPoint))
-		}
-		startBurnIO(fileSystem, burnIOSize, burnIOCount, burnIORead, burnIOWrite)
+		startBurnIO(burnIODirectory, burnIOSize, burnIORead, burnIOWrite)
 	} else if burnIOStop {
-		stopBurnIO()
+		stopBurnIO(burnIODirectory, burnIORead, burnIOWrite)
 	} else if burnIONohup {
 		if burnIORead {
-			go burnRead(burnIOFileSystem, burnIOSize, burnIOCount)
+			go burnRead(burnIODirectory, burnIOSize)
 		}
 		if burnIOWrite {
-			go burnWrite(burnIOSize, burnIOCount)
+			go burnWrite(burnIODirectory, burnIOSize)
 		}
 		select {}
 	} else {
@@ -53,22 +46,23 @@ func main() {
 	}
 }
 
-var tmpDataFile = "/tmp/chaos_burnio.log.dat"
-var logFile = "/tmp/chaos_burnio.log"
+var readFile = "chaos_burnio.read"
+var writeFile = "chaos_burnio.write"
 var burnIOBin = "chaos_burnio"
+var logFile = util.GetNohupOutput(util.Bin, "chaos_burnio.log")
 
 var channel = exec.NewLocalChannel()
 
 var stopBurnIOFunc = stopBurnIO
 
 // start burn io
-func startBurnIO(fileSystem, size, count string, read, write bool) {
+func startBurnIO(directory, size string, read, write bool) {
 	ctx := context.Background()
 	response := channel.Run(ctx, "nohup",
-		fmt.Sprintf(`%s --file-system %s --size %s --count %s --read=%t --write=%t --nohup=true > %s 2>&1 &`,
-			path.Join(util.GetProgramPath(), burnIOBin), fileSystem, size, count, read, write, logFile))
+		fmt.Sprintf(`%s --directory %s --size %s --read=%t --write=%t --nohup=true > %s 2>&1 &`,
+			path.Join(util.GetProgramPath(), burnIOBin), directory, size, read, write, logFile))
 	if !response.Success {
-		stopBurnIOFunc()
+		stopBurnIOFunc(directory, read, write)
 		bin.PrintErrAndExit(response.Err)
 		return
 	}
@@ -78,7 +72,7 @@ func startBurnIO(fileSystem, size, count string, read, write bool) {
 	if response.Success {
 		errMsg := strings.TrimSpace(response.Result.(string))
 		if errMsg != "" {
-			stopBurnIOFunc()
+			stopBurnIOFunc(directory, read, write)
 			bin.PrintErrAndExit(errMsg)
 			return
 		}
@@ -86,27 +80,44 @@ func startBurnIO(fileSystem, size, count string, read, write bool) {
 	bin.PrintOutputAndExit("success")
 }
 
-var taskName = []string{"if=/dev/zero", "of=/dev/null"}
-
 // stop burn io,  no need to add os.Exit
-func stopBurnIO() {
+func stopBurnIO(directory string, read, write bool) {
 	ctx := context.Background()
-	for _, name := range taskName {
-		pids, _ := exec.GetPidsByProcessName(name, ctx)
-		if pids == nil || len(pids) == 0 {
-			continue
+	if read {
+		// dd process
+		pids, _ := exec.GetPidsByProcessName(readFile, ctx)
+		if pids != nil && len(pids) > 0 {
+			channel.Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
 		}
-		channel.Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
+		// chaos_burnio process
+		ctxWithKey := context.WithValue(ctx, exec.ProcessKey, burnIOBin)
+		pids, _ = exec.GetPidsByProcessName("--read=true", ctxWithKey)
+		if pids != nil && len(pids) > 0 {
+			channel.Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
+		}
+		channel.Run(ctx, "rm", fmt.Sprintf("-rf %s*", path.Join(directory, readFile)))
 	}
-	channel.Run(ctx, "rm", fmt.Sprintf("-rf %s*", logFile))
+	if write {
+		// dd process
+		pids, _ := exec.GetPidsByProcessName(writeFile, ctx)
+		if pids != nil && len(pids) > 0 {
+			channel.Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
+		}
+		ctxWithKey := context.WithValue(ctx, exec.ProcessKey, burnIOBin)
+		pids, _ = exec.GetPidsByProcessName("--write=true", ctxWithKey)
+		if pids != nil && len(pids) > 0 {
+			channel.Run(ctx, "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
+		}
+		channel.Run(ctx, "rm", fmt.Sprintf("-rf %s*", path.Join(directory, writeFile)))
+	}
 }
 
 // write burn
-func burnWrite(size, count string) {
+func burnWrite(directory, size string) {
+	tmpFileForWrite := path.Join(directory, writeFile)
 	for {
-		args := fmt.Sprintf(`if=/dev/zero of=%s bs=%sM count=%s oflag=dsync`, tmpDataFile, size, count)
+		args := fmt.Sprintf(`if=/dev/zero of=%s bs=%sM count=%d oflag=dsync`, tmpFileForWrite, size, count)
 		response := channel.Run(context.Background(), "dd", args)
-		channel.Run(context.Background(), "rm", fmt.Sprintf(`-rf %s`, tmpDataFile))
 		if !response.Success {
 			bin.PrintAndExitWithErrPrefix(response.Err)
 			return
@@ -115,23 +126,22 @@ func burnWrite(size, count string) {
 }
 
 // read burn
-func burnRead(fileSystem, size, count string) {
+func burnRead(directory, size string) {
+	// create a 1g file under the directory
+	tmpFileForRead := path.Join(directory, readFile)
+	createArgs := fmt.Sprintf("if=/dev/zero of=%s bs=%dM count=%d oflag=dsync", tmpFileForRead, 6, count)
+	response := channel.Run(context.Background(), "dd", createArgs)
+	if !response.Success {
+		bin.PrintAndExitWithErrPrefix(
+			fmt.Sprintf("using dd command to create a temp file under %s directory for reading error, %s",
+				directory, response.Err))
+	}
 	for {
-		// "if" arg in dd command is file system value, but "of" arg value is related to mount point
-		args := fmt.Sprintf(`if=%s of=/dev/null bs=%sM count=%s iflag=dsync,direct,fullblock`, fileSystem, size, count)
-		response := channel.Run(context.Background(), "dd", args)
+		args := fmt.Sprintf(`if=%s of=/dev/null bs=%sM count=%d iflag=dsync,direct,fullblock`, tmpFileForRead, size, count)
+		response = channel.Run(context.Background(), "dd", args)
 		if !response.Success {
-			bin.PrintAndExitWithErrPrefix(fmt.Sprintf("The file system named %s is not supported or %s", fileSystem, response.Err))
+			bin.PrintAndExitWithErrPrefix(fmt.Sprintf("using dd command to burn read io error, %s", response.Err))
+			return
 		}
 	}
-}
-
-// get fileSystem by mount point
-func getFileSystem(mountPoint string) (string, error) {
-	response := channel.Run(context.Background(), "mount", fmt.Sprintf(` | grep "on %s " | awk '{print $1}'`, mountPoint))
-	if response.Success {
-		fileSystem := response.Result.(string)
-		return strings.TrimSpace(fileSystem), nil
-	}
-	return "", fmt.Errorf(response.Err)
 }
