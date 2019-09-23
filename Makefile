@@ -78,12 +78,8 @@ build_cli:
 build_osbin: build_burncpu build_burnmem build_burnio build_killprocess build_stopprocess build_changedns build_dlnetwork build_dropnetwork build_filldisk
 
 # build burn-cpu chaos tools
-build_burncpu: exec/os/bin/burncpu/forlinux/burncpu.go exec/os/bin/burncpu/burncpu.go
-ifeq ($(UNAME), Linux)
+build_burncpu: exec/os/bin/burncpu/burncpu.go
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burncpu $<
-else
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burncpu exec/os/bin/burncpu/burncpu.go
-endif
 
 # build burn-mem chaos tools
 build_burnmem: exec/os/bin/burnmem/burnmem.go
