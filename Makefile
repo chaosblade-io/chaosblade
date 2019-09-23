@@ -7,7 +7,8 @@ BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
 BLADE_SRC_ROOT=`pwd`
 
 GO_ENV=CGO_ENABLED=1
-GO_FLAGS=-ldflags="-X main.ver=$(BLADE_VERSION) -X 'main.env=`uname -mv`' -X 'main.buildTime=`date`'"
+VERSION_PKG=github.com/chaosblade-io/chaosblade/version
+GO_FLAGS=-ldflags="-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`'"
 GO=env $(GO_ENV) go
 
 UNAME := $(shell uname)
@@ -61,7 +62,7 @@ BLADE_CPLUS_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/cplus-chaosblade.spec.yam
 BLADE_CPLUS_AGENT_SPEC_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_CPLUS_AGENT_SPEC)
 
 ifeq ($(GOOS), linux)
-	GO_FLAGS=-ldflags="-linkmode external -extldflags -static -X main.ver=$(BLADE_VERSION) -X 'main.env=`uname -mv`' -X 'main.buildTime=`date`'"
+	GO_FLAGS=-ldflags="-linkmode external -extldflags -static -X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`'"
 endif
 
 # build chaosblade package and image
