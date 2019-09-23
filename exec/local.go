@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"github.com/sirupsen/logrus"
+	"os"
+	"strconv"
 )
 
 var channel = &LocalChannel{}
@@ -46,21 +48,28 @@ func execScript(ctx context.Context, script, args string) *transport.Response {
 	return transport.ReturnSuccess(result)
 }
 
-// GetPidsByProcessCmdName
+// GetPidsByProcessCmdName returns the matched process other than the current process
 func GetPidsByProcessCmdName(processName string, ctx context.Context) ([]string, error) {
 	response := channel.Run(ctx, "pgrep",
-		fmt.Sprintf(`-l %s | grep -v -w blade | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $1}' | tr '\n' ' '`, processName))
+		fmt.Sprintf(`-l %s | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $1}' | tr '\n' ' '`, processName))
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
 	}
 	pidString := response.Result.(string)
-	return strings.Fields(strings.TrimSpace(pidString)), nil
+	pids := strings.Fields(strings.TrimSpace(pidString))
+	currPid := strconv.Itoa(os.Getpid())
+	for idx, pid := range pids {
+		if pid == currPid {
+			return util.Remove(pids, idx), nil
+		}
+	}
+	return pids, nil
 }
 
 // grep ${key}
 const ProcessKey = "process"
 
-// GetPidsByProcessName
+// GetPidsByProcessName returns the matched process other than the current process
 func GetPidsByProcessName(processName string, ctx context.Context) ([]string, error) {
 	psArgs := GetPsArgs()
 	otherProcess := ctx.Value(ProcessKey)
@@ -72,7 +81,7 @@ func GetPidsByProcessName(processName string, ctx context.Context) ([]string, er
 		}
 	}
 	response := channel.Run(ctx, "ps",
-		fmt.Sprintf(`%s | grep %s %s | grep -v -w grep | grep -v -w blade | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $2}' | tr '\n' ' '`,
+		fmt.Sprintf(`%s | grep "%s" %s | grep -v -w grep | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $2}' | tr '\n' ' '`,
 			psArgs, processName, otherGrepInfo))
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
@@ -81,7 +90,14 @@ func GetPidsByProcessName(processName string, ctx context.Context) ([]string, er
 	if pidString == "" {
 		return make([]string, 0), nil
 	}
-	return strings.Fields(pidString), nil
+	pids := strings.Fields(pidString)
+	currPid := strconv.Itoa(os.Getpid())
+	for idx, pid := range pids {
+		if pid == currPid {
+			return util.Remove(pids, idx), nil
+		}
+	}
+	return pids, nil
 }
 
 // GetPsArgs for querying the process info

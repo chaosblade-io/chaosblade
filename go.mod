@@ -3,6 +3,7 @@ module github.com/chaosblade-io/chaosblade
 go 1.13
 
 require (
+	github.com/BurntSushi/toml v0.3.1 // indirect
 	github.com/containerd/cgroups v0.0.0-20190717030353-c4b9ac5c7601
 	github.com/coreos/go-systemd v0.0.0-20190719114852-fd7a80b32e1f
 	github.com/docker/go-units v0.4.0
