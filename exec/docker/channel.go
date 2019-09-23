@@ -30,7 +30,7 @@ type Channel struct {
 func NewDockerChannel(channel exec.Channel) *Channel {
 	return &Channel{
 		localChannel: channel,
-		image:        fmt.Sprintf("%s:%s", repository, version.Version.Ver),
+		image:        fmt.Sprintf("%s:%s", repository, version.Ver),
 	}
 }
 
