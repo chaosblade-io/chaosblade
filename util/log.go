@@ -15,6 +15,8 @@ const (
 	Bin   = 2
 )
 
+const BladeLog = "chaosblade.log"
+
 var Debug bool
 
 func AddDebugFlag() {
@@ -47,8 +49,7 @@ func InitLog(programType int) {
 	}
 }
 
-// GetLogFile
-func GetLogFile(programType int) (string, error) {
+func GetLogPath(programType int) (string, error) {
 	var binDir string
 	switch programType {
 	case Blade:
@@ -59,25 +60,34 @@ func GetLogFile(programType int) (string, error) {
 		binDir = GetProgramPath()
 	}
 	logsPath := path.Join(binDir, "logs")
-	logFile := path.Join(logsPath, "chaosblade.log")
-	if IsExist(logFile) {
-		return logFile, nil
+	if IsExist(logsPath) {
+		return logsPath, nil
 	}
 	// mk dir
 	err := os.MkdirAll(logsPath, os.ModePerm)
 	if err != nil {
 		return "", err
 	}
+	return logsPath, nil
+}
+
+// GetLogFile
+func GetLogFile(programType int) (string, error) {
+	logPath, err := GetLogPath(programType)
+	if err != nil {
+		return "", err
+	}
+	logFile := path.Join(logPath, BladeLog)
 	return logFile, nil
 }
 
 // GetNohupOutput
-func GetNohupOutput(programType int) string {
-	logFile, err := GetLogFile(programType)
-	if err == nil {
-		return logFile
+func GetNohupOutput(programType int, logFileName string) string {
+	logPath, err := GetLogPath(programType)
+	if err != nil {
+		return "/dev/null"
 	}
-	return "/dev/null"
+	return path.Join(logPath, logFileName)
 }
 
 // fileWriterWithoutErr write func does not return err under any conditions

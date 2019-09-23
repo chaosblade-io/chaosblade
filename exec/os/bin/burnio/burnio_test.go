@@ -13,20 +13,18 @@ import (
 
 func Test_startBurnIO_startFailed(t *testing.T) {
 	type args struct {
-		fileSystem string
-		size       string
-		count      string
-		read       bool
-		write      bool
+		directory string
+		size      string
+		read      bool
+		write     bool
 	}
 
 	burnBin := path.Join(util.GetProgramPath(), "chaos_burnio")
 	as := &args{
-		fileSystem: "/dev/disk1s1",
-		size:       "1024",
-		count:      "1024",
-		read:       true,
-		write:      true,
+		directory: "/home/admin",
+		size:      "1024",
+		read:      true,
+		write:     true,
 	}
 
 	var exitCode int
@@ -34,16 +32,16 @@ func Test_startBurnIO_startFailed(t *testing.T) {
 		exitCode = code
 	}
 	var invokeTime int
-	stopBurnIOFunc = func() {
+	stopBurnIOFunc = func(directory string, read, write bool) {
 		invokeTime++
 	}
 	channel = &exec.MockLocalChannel{
 		Response:         transport.ReturnFail(transport.Code[transport.CommandNotFound], "nohup command not found"),
-		ExpectedCommands: []string{fmt.Sprintf(`nohup %s --file-system /dev/disk1s1 --size 1024 --count 1024 --read=true --write=true --nohup=true > /tmp/chaos_burnio.log 2>&1 &`, burnBin)},
+		ExpectedCommands: []string{fmt.Sprintf(`nohup %s --directory /home/admin --size 1024 --read=true --write=true --nohup=true > %s 2>&1 &`, burnBin, logFile)},
 		T:                t,
 	}
 
-	startBurnIO(as.fileSystem, as.size, as.count, as.read, as.write)
+	startBurnIO(as.directory, as.size, as.read, as.write)
 	if exitCode != 1 {
 		t.Errorf("unexpected result: %d, expected result: %d", exitCode, 1)
 	}
@@ -54,39 +52,22 @@ func Test_startBurnIO_startFailed(t *testing.T) {
 
 func Test_stopBurnIO(t *testing.T) {
 	tests := []struct {
-		name string
+		name      string
+		directory string
+		read      bool
+		write     bool
 	}{
-		{"stop"},
+		{
+			name:      "stop",
+			directory: "/home/admin",
+			read:      true,
+			write:     true,
+		},
 	}
 	channel = exec.NewLocalChannel()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stopBurnIO()
-		})
-	}
-}
-
-func Test_getFileSystem(t *testing.T) {
-	type args struct {
-		mountPoint string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		wantErr bool
-	}{
-		{"test1", args{"/"}, false},
-		{"test2", args{"/dev"}, false},
-		{"test2", args{"devs"}, false},
-	}
-	channel = exec.NewLocalChannel()
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := getFileSystem(tt.args.mountPoint)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("getFileSystem() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
+			stopBurnIO(tt.directory, tt.read, tt.write)
 		})
 	}
 }
