@@ -37,5 +37,11 @@ func CmdInit() *baseCommand {
 	queryCommand.AddCommand(&QueryNetworkCommand{})
 	queryCommand.AddCommand(&QueryJvmCommand{})
 
+	// add server command
+	serverCommand := &ServerCommand{}
+	baseCmd.AddCommand(serverCommand)
+	serverCommand.AddCommand(&StartServerCommand{})
+	serverCommand.AddCommand(&StopServerCommand{})
+
 	return baseCmd
 }
