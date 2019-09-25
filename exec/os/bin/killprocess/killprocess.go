@@ -25,7 +25,7 @@ func main() {
 func killProcess(process, processCmd string) {
 	var pids []string
 	var err error
-	var ctx = context.Background()
+	var ctx = context.WithValue(context.Background(), exec.ExcludeProcessKey, "blade")
 	if process != "" {
 		pids, err = exec.GetPidsByProcessName(process, ctx)
 		if err != nil {

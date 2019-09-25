@@ -50,8 +50,17 @@ func execScript(ctx context.Context, script, args string) *transport.Response {
 
 // GetPidsByProcessCmdName returns the matched process other than the current process
 func GetPidsByProcessCmdName(processName string, ctx context.Context) ([]string, error) {
+	excludeProcess := ctx.Value(ExcludeProcessKey)
+	excludeGrepInfo := ""
+	if excludeProcess != nil {
+		excludeProcessString := excludeProcess.(string)
+		if excludeProcessString != "" {
+			excludeGrepInfo = fmt.Sprintf(`| grep -v -w %s`, excludeProcessString)
+		}
+	}
 	response := channel.Run(ctx, "pgrep",
-		fmt.Sprintf(`-l %s | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $1}' | tr '\n' ' '`, processName))
+		fmt.Sprintf(`-l %s %s | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $1}' | tr '\n' ' '`,
+			processName, excludeGrepInfo))
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
 	}
@@ -68,6 +77,7 @@ func GetPidsByProcessCmdName(processName string, ctx context.Context) ([]string,
 
 // grep ${key}
 const ProcessKey = "process"
+const ExcludeProcessKey = "excludeProcess"
 
 // GetPidsByProcessName returns the matched process other than the current process
 func GetPidsByProcessName(processName string, ctx context.Context) ([]string, error) {
@@ -80,9 +90,17 @@ func GetPidsByProcessName(processName string, ctx context.Context) ([]string, er
 			otherGrepInfo = fmt.Sprintf(`| grep "%s"`, processString)
 		}
 	}
+	excludeProcess := ctx.Value(ExcludeProcessKey)
+	excludeGrepInfo := ""
+	if excludeProcess != nil {
+		excludeProcessString := excludeProcess.(string)
+		if excludeProcessString != "" {
+			excludeGrepInfo = fmt.Sprintf(`| grep -v -w %s`, excludeProcessString)
+		}
+	}
 	response := channel.Run(ctx, "ps",
-		fmt.Sprintf(`%s | grep "%s" %s | grep -v -w grep | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $2}' | tr '\n' ' '`,
-			psArgs, processName, otherGrepInfo))
+		fmt.Sprintf(`%s | grep "%s" %s %s | grep -v -w grep | grep -v -w chaos_killprocess | grep -v -w chaos_stopprocess | awk '{print $2}' | tr '\n' ' '`,
+			psArgs, processName, otherGrepInfo, excludeGrepInfo))
 	if !response.Success {
 		return nil, fmt.Errorf(response.Err)
 	}
