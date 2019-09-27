@@ -10,6 +10,8 @@ import (
 	"github.com/chaosblade-io/chaosblade/transport"
 	"strings"
 	"github.com/chaosblade-io/chaosblade/util"
+	"strconv"
+	"github.com/sirupsen/logrus"
 )
 
 var dlNetInterface, dlLocalPort, dlRemotePort, dlExcludePort string
@@ -55,6 +57,11 @@ func main() {
 var channel = exec.NewLocalChannel()
 
 func startNet(netInterface, classRule, localPort, remotePort, excludePort, destIp string) {
+	// check device txqueuelen size, if the size is zero, then set the value to 1000
+	response := preHandleTxqueue(netInterface)
+	if !response.Success {
+		bin.PrintErrAndExit(response.Err)
+	}
 	ctx := context.Background()
 	// assert localPort and remotePort
 	if localPort == "" && remotePort == "" && excludePort == "" && destIp == "" {
@@ -65,7 +72,7 @@ func startNet(netInterface, classRule, localPort, remotePort, excludePort, destI
 		bin.PrintOutputAndExit(response.Result.(string))
 		return
 	}
-	response := addQdiscForDL(channel, ctx, netInterface)
+	response = addQdiscForDL(channel, ctx, netInterface)
 	// only ip
 	if localPort == "" && remotePort == "" && excludePort == "" {
 		response = addIpFilterForDL(ctx, channel, netInterface, classRule, destIp)
@@ -82,6 +89,34 @@ func startNet(netInterface, classRule, localPort, remotePort, excludePort, destI
 	// local port or remote port
 	response = addLocalOrRemotePortForDL(ctx, channel, netInterface, classRule, localPort, remotePort, ipRule)
 	bin.PrintOutputAndExit(response.Result.(string))
+}
+
+func preHandleTxqueue(netInterface string) *transport.Response {
+	txFile := fmt.Sprintf("/sys/class/net/%s/tx_queue_len", netInterface)
+	isExist := util.IsExist(txFile)
+	if isExist {
+		// check the value
+		response := channel.Run(context.TODO(), "head", fmt.Sprintf("-1 %s", txFile))
+		if response.Success {
+			txlen := strings.TrimSpace(response.Result.(string))
+			len, err := strconv.Atoi(txlen)
+			if err != nil {
+				logrus.Warningf("parse %s file err, %v", txFile, err)
+			} else {
+				if len > 0 {
+					return response
+				} else {
+					logrus.Infof("the tx_queue_len value for %s is %s", netInterface, txlen)
+				}
+			}
+		}
+	}
+	// set to 1000 directly
+	response := channel.Run(context.TODO(), "ifconfig", fmt.Sprintf("%s txqueuelen 1000", netInterface))
+	if !response.Success {
+		logrus.Warningf("set txqueuelen for %s err, %s", netInterface, response.Err)
+	}
+	return response
 }
 
 func getIpRule(destIp string) string {
