@@ -33,9 +33,11 @@ func Test_startDelayNet(t *testing.T) {
 		exitCode = code
 	}
 	channel = &exec.MockLocalChannel{
-		Response:         transport.ReturnSuccess("success"),
-		ExpectedCommands: []string{fmt.Sprintf(`tc qdisc add dev eth0 root netem delay 3000ms 10ms`)},
-		T:                t,
+		Response: transport.ReturnSuccess("success"),
+		ExpectedCommands: []string{
+			`ifconfig eth0 txqueuelen 1000`,
+			fmt.Sprintf(`tc qdisc add dev eth0 root netem delay 3000ms 10ms`)},
+		T: t,
 	}
 	startNet(as.netInterface, as.classRule, as.localPort, as.remotePort, as.excludePort, as.destIp)
 	if exitCode != 0 {
