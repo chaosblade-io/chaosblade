@@ -3,12 +3,13 @@ package docker
 import (
 	"context"
 	"fmt"
+	"path"
 	"strings"
 	"time"
-	"github.com/chaosblade-io/chaosblade/transport"
+
 	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/chaosblade-io/chaosblade/version"
-	"path"
 )
 
 const (
@@ -22,6 +23,8 @@ const (
 const bladeHome = "/usr/local/chaosblade"
 const repository = "registry.cn-hangzhou.aliyuncs.com/chaosblade/chaosblade-agent"
 
+var NewDockerChannelFunc = NewDockerChannel
+
 type Channel struct {
 	localChannel exec.Channel
 	image        string
@@ -32,6 +35,11 @@ func NewDockerChannel(channel exec.Channel) *Channel {
 		localChannel: channel,
 		image:        fmt.Sprintf("%s:%s", repository, version.Ver),
 	}
+}
+
+func (c *Channel) Set(channel exec.Channel, image string) {
+	c.localChannel = channel
+	c.image = image
 }
 
 func (c *Channel) Run(ctx context.Context, script, args string) *transport.Response {

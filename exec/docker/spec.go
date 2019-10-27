@@ -1,9 +1,10 @@
 package docker
 
 import (
-	"github.com/chaosblade-io/chaosblade/exec"
 	"context"
 	"fmt"
+
+	"github.com/chaosblade-io/chaosblade/exec"
 )
 
 const (
@@ -60,7 +61,7 @@ type PreExecutor struct {
 
 func NewPreExecutor(channel exec.Channel) *PreExecutor {
 	return &PreExecutor{
-		DockerChannel: NewDockerChannel(channel),
+		DockerChannel: NewDockerChannelFunc(channel),
 	}
 }
 
