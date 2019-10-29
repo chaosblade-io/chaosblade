@@ -97,7 +97,7 @@ func Test_bindBurnCpu(t *testing.T) {
 
 	channel = &exec.MockLocalChannel{
 		Response:         transport.ReturnFail(transport.Code[transport.CommandNotFound], "taskset command not found"),
-		ExpectedCommands: []string{fmt.Sprintf(`taskset -cp 0 25233`)},
+		ExpectedCommands: []string{fmt.Sprintf(`taskset -a -cp 0 25233`)},
 		T:                t,
 	}
 
