@@ -136,7 +136,7 @@ var stopBurnCpuFunc = stopBurnCpu
 
 var runBurnCpuFunc = runBurnCpu
 
-var bindBurnCpuFunc = bindBurnCpu
+var bindBurnCpuFunc = bindBurnCpuByTaskset
 
 var checkBurnCpuFunc = checkBurnCpu
 
@@ -192,8 +192,8 @@ func runBurnCpu(ctx context.Context, cpuCount int, cpuPercent int, pidNeeded boo
 }
 
 // bindBurnCpu by taskset command
-func bindBurnCpu(ctx context.Context, core string, pid int) {
-	response := channel.Run(ctx, "taskset", fmt.Sprintf("-cp %s %d", core, pid))
+func bindBurnCpuByTaskset(ctx context.Context, core string, pid int) {
+	response := channel.Run(ctx, "taskset", fmt.Sprintf("-a -cp %s %d", core, pid))
 	if !response.Success {
 		stopBurnCpuFunc()
 		bin.PrintErrAndExit(response.Err)

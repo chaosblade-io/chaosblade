@@ -29,7 +29,7 @@ func Test_startBurnCpu(t *testing.T) {
 	runBurnCpuFunc = func(ctx context.Context, cpuCount int, pidNeeded bool, processor string) int {
 		return 25233
 	}
-	bindBurnCpuFunc = func(ctx context.Context, core string, pid int) {}
+	bindBurnCpuFunc = func(cgctrl cgroups.Cgroup, cpulist string) {}
 	checkBurnCpuFunc = func(ctx context.Context) {}
 	cgroupNewFunc = func(int, int) cgroups.Cgroup { return new(CgroupMock) }
 	for _, tt := range tests {
@@ -96,11 +96,11 @@ func Test_bindBurnCpu(t *testing.T) {
 
 	channel = &exec.MockLocalChannel{
 		Response:         transport.ReturnFail(transport.Code[transport.CommandNotFound], "taskset command not found"),
-		ExpectedCommands: []string{fmt.Sprintf(`taskset -cp 0 25233`)},
+		ExpectedCommands: []string{fmt.Sprintf(`taskset -a -cp 0 25233`)},
 		T:                t,
 	}
 
-	bindBurnCpu(context.Background(), as.core, as.pid)
+	bindBurnCpuByTaskset(context.Background(), as.core, as.pid)
 	if exitCode != 1 {
 		t.Errorf("unexpected result %d, expected result: %d", exitCode, 1)
 	}

@@ -101,7 +101,7 @@ func Test_bindBurnCpu(t *testing.T) {
 		T:                t,
 	}
 
-	bindBurnCpu(context.Background(), as.core, as.pid)
+	bindBurnCpuByTaskset(context.Background(), as.core, as.pid)
 	if exitCode != 1 {
 		t.Errorf("unexpected result %d, expected result: %d", exitCode, 1)
 	}
