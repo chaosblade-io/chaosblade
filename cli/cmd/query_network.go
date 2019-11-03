@@ -5,7 +5,7 @@ import (
 	"net"
 	"strings"
 
-	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
 )
 
@@ -46,7 +46,7 @@ func (qnc *QueryNetworkCommand) queryNetworkInfo(command *cobra.Command, arg str
 				names = append(names, i.Name)
 			}
 		}
-		command.Println(transport.ReturnSuccess(names))
+		command.Println(spec.ReturnSuccess(names))
 	default:
 		return fmt.Errorf("the %s argument not found", arg)
 	}

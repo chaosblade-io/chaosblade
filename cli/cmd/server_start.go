@@ -2,16 +2,16 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
-	"github.com/chaosblade-io/chaosblade/exec"
 	"context"
-	"github.com/chaosblade-io/chaosblade/transport"
 	"github.com/sirupsen/logrus"
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"path"
 	"fmt"
 	"time"
 	"net/http"
 	"os"
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 )
 
 const startServerKey = "blade server start --nohup"
@@ -39,12 +39,12 @@ func (ssc *StartServerCommand) Init() {
 
 func (ssc *StartServerCommand) run(cmd *cobra.Command, args []string) error {
 	// check if the process named `blade server --start` exists or not
-	pids, err := exec.GetPidsByProcessName(startServerKey, context.TODO())
+	pids, err := channel.GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.ServerError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}
 	if len(pids) > 0 {
-		return transport.ReturnFail(transport.Code[transport.DuplicateError], "the chaosblade has been started. If you want to stop it, you can execute blade server stop command")
+		return spec.ReturnFail(spec.Code[spec.DuplicateError], "the chaosblade has been started. If you want to stop it, you can execute blade server stop command")
 	}
 	if ssc.nohup {
 		ssc.start0()
@@ -60,32 +60,32 @@ func (ssc *StartServerCommand) run(cmd *cobra.Command, args []string) error {
 // start used nohup command and check the process
 func (ssc *StartServerCommand) start() error {
 	// use nohup to invoke blade server start command
-	channel := exec.NewLocalChannel()
+	cl := channel.NewLocalChannel()
 	bladeBin := path.Join(util.GetProgramPath(), "blade")
-	response := channel.Run(context.TODO(), "nohup", fmt.Sprintf("%s server start --nohup --port %s > /dev/null 2>&1 &", bladeBin, ssc.port))
+	response := cl.Run(context.TODO(), "nohup", fmt.Sprintf("%s server start --nohup --port %s > /dev/null 2>&1 &", bladeBin, ssc.port))
 	if !response.Success {
 		return response
 	}
 	time.Sleep(time.Second)
 	// check process
-	pids, err := exec.GetPidsByProcessName(startServerKey, context.TODO())
+	pids, err := channel.GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.ServerError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}
 	if len(pids) == 0 {
 		// read logs
 		logFile, err := util.GetLogFile(util.Blade)
 		if err != nil {
-			return transport.ReturnFail(transport.Code[transport.ServerError], "start blade server failed and can't get log file")
+			return spec.ReturnFail(spec.Code[spec.ServerError], "start blade server failed and can't get log file")
 		}
 		if !util.IsExist(logFile) {
-			return transport.ReturnFail(transport.Code[transport.ServerError], "start blade server failed and log file does not exist")
+			return spec.ReturnFail(spec.Code[spec.ServerError], "start blade server failed and log file does not exist")
 		}
-		response := channel.Run(context.TODO(), "tail", fmt.Sprintf("-1 %s", logFile))
+		response := cl.Run(context.TODO(), "tail", fmt.Sprintf("-1 %s", logFile))
 		if !response.Success {
-			return transport.ReturnFail(transport.Code[transport.ServerError], "start blade server failed and can't read log file")
+			return spec.ReturnFail(spec.Code[spec.ServerError], "start blade server failed and can't read log file")
 		}
-		return transport.ReturnFail(transport.Code[transport.ServerError], response.Result.(string))
+		return spec.ReturnFail(spec.Code[spec.ServerError], response.Result.(string))
 	}
 	logrus.Infof("start blade server success, listen on %s", ssc.port)
 	return nil
@@ -109,18 +109,18 @@ func Register(requestPath string) {
 		err := request.ParseForm()
 		if err != nil {
 			fmt.Fprintf(writer,
-				transport.ReturnFail(transport.Code[transport.IllegalParameters], err.Error()).Print())
+				spec.ReturnFail(spec.Code[spec.IllegalParameters], err.Error()).Print())
 			return
 		}
 
 		cmds := request.Form["cmd"]
 		if len(cmds) != 1 {
 			fmt.Fprintf(writer,
-				transport.ReturnFail(transport.Code[transport.IllegalParameters], "illegal cmd parameter").Print())
+				spec.ReturnFail(spec.Code[spec.IllegalParameters], "illegal cmd parameter").Print())
 			return
 		}
 		ctx := context.WithValue(context.Background(), "mode", "server")
-		response := exec.NewLocalChannel().Run(ctx, path.Join(util.GetProgramPath(), "blade"), cmds[0])
+		response := channel.NewLocalChannel().Run(ctx, path.Join(util.GetProgramPath(), "blade"), cmds[0])
 		if response.Success {
 			fmt.Fprintf(writer, response.Result.(string))
 		} else {

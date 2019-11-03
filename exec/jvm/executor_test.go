@@ -1,13 +1,13 @@
 package jvm
 
 import (
-	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"testing"
 )
 
 func TestExecutor_createUrl(t *testing.T) {
 	jvm := NewExecutor()
-	enhanceModel := &exec.ExpModel{}
+	enhanceModel := &spec.ExpModel{}
 	enhanceModel.Target = "jvm"
 	enhanceModel.ActionName = "return"
 	enhanceModel.ActionFlags = make(map[string]string)

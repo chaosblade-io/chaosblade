@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/chaosblade-io/chaosblade/data"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -31,7 +31,7 @@ func (pc *PrepareCommand) Init() {
 		Short:   "Prepare to experiment",
 		Long:    "Prepare to experiment, for example, attach agent to java process or deploy agent to kubernetes cluster.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return transport.ReturnFail(transport.Code[transport.IllegalCommand],
+			return spec.ReturnFail(spec.Code[spec.IllegalCommand],
 				fmt.Sprintf("less command type to prepare"))
 		},
 		Example: pc.prepareExample(),
@@ -66,7 +66,7 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 	return record, nil
 }
 
-func handlePrepareResponse(uid string, cmd *cobra.Command, response *transport.Response) error {
+func handlePrepareResponse(uid string, cmd *cobra.Command, response *spec.Response) error {
 	response.Result = uid
 	if !response.Success {
 		GetDS().UpdatePreparationRecordByUid(uid, "Error", response.Err)

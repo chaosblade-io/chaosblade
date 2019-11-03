@@ -6,9 +6,10 @@ import (
 	"time"
 
 	"github.com/chaosblade-io/chaosblade/data"
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 
 	"github.com/spf13/cobra"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 // Command is cli command interface
@@ -55,21 +56,28 @@ func SetDS(source data.SourceI) {
 }
 
 // recordExpModel
-func (bc *baseCommand) recordExpModel(commandPath, flag string) (*data.ExperimentModel, error) {
-	time := time.Now().Format(time.RFC3339Nano)
-	uid, err := bc.generateUid()
-	if err != nil {
-		return nil, err
+func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpModel) (commandModel *data.ExperimentModel, err error) {
+	uid := expModel.ActionFlags[UidFlag]
+	if uid == "" {
+		uid, err = bc.generateUid()
+		if err != nil {
+			return nil, err
+		}
 	}
+
+	flagsInline := spec.ConvertExpMatchersToString(expModel, func() map[string]spec.Empty {
+		return make(map[string]spec.Empty)
+	})
+	time := time.Now().Format(time.RFC3339Nano)
 	command, subCommand, err := parseCommandPath(commandPath)
 	if err != nil {
 		return nil, err
 	}
-	commandModel := &data.ExperimentModel{
+	commandModel = &data.ExperimentModel{
 		Uid:        uid,
 		Command:    command,
 		SubCommand: subCommand,
-		Flag:       flag,
+		Flag:       flagsInline,
 		Status:     "Created",
 		Error:      "",
 		CreateTime: time,

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/chaosblade-io/chaosblade/exec"
-	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 )
 
 type QueryDiskCommand struct {
@@ -36,7 +36,7 @@ func (qdc *QueryDiskCommand) queryDiskExample() string {
 func (qdc *QueryDiskCommand) queryDiskInfo(command *cobra.Command, arg string) error {
 	switch arg {
 	case MountPointArg:
-		response := exec.NewLocalChannel().Run(context.TODO(), "df",
+		response := channel.NewLocalChannel().Run(context.TODO(), "df",
 			fmt.Sprintf(`-h | awk 'NR!=1 {print $1","$NF}' | tr '\n' ' '`))
 		if !response.Success {
 			return response
@@ -54,7 +54,7 @@ func (qdc *QueryDiskCommand) queryDiskInfo(command *cobra.Command, arg string) e
 				result = append(result, arr[1])
 			}
 		}
-		command.Println(transport.ReturnSuccess(result))
+		command.Println(spec.ReturnSuccess(result))
 	default:
 		return fmt.Errorf("the %s argument not found", arg)
 	}

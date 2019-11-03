@@ -3,9 +3,9 @@ package jvm
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"os"
 	"path"
 	"strings"
@@ -14,11 +14,11 @@ import (
 )
 
 // attach sandbox to java process
-var channel = exec.NewLocalChannel()
+var channel = specchannel.NewLocalChannel()
 
 const DefaultNamespace = "default"
 
-func Attach(port string, javaHome string, pid string) (*transport.Response, string) {
+func Attach(port string, javaHome string, pid string) (*spec.Response, string) {
 	// refresh
 	response, username := attach(pid, port, context.TODO(), javaHome)
 	if !response.Success {
@@ -35,40 +35,40 @@ func Attach(port string, javaHome string, pid string) (*transport.Response, stri
 }
 
 // curl -s http://localhost:$2/sandbox/default/module/http/chaosblade/status 2>&1
-func check(port string) *transport.Response {
+func check(port string) *spec.Response {
 	url := getSandboxUrl(port, "chaosblade/status", "")
 	result, err, code := util.Curl(url)
 	if code == 200 {
-		return transport.ReturnSuccess(result)
+		return spec.ReturnSuccess(result)
 	}
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
-	return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+	return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
 		fmt.Sprintf("response code is %d, result: %s", code, result))
 }
 
 // active chaosblade bin/sandbox.sh -p $pid -P $2 -a chaosblade 2>&1
-func active(port string) *transport.Response {
+func active(port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids=chaosblade")
 	result, err, code := util.Curl(url)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
 	if code != 200 {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
 			fmt.Sprintf("active module response code: %d, result: %s", code, result))
 	}
-	return transport.ReturnSuccess("success")
+	return spec.ReturnSuccess("success")
 }
 
 // attach java agent to application process
-func attach(pid, port string, ctx context.Context, javaHome string) (*transport.Response, string) {
+func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
 	if javaHome == "" {
 		javaHome = os.Getenv("JAVA_HOME")
 	}
 	if javaHome == "" {
-		psArgs := exec.GetPsArgs()
+		psArgs := specchannel.GetPsArgs()
 		response := channel.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}' | sed 's/\/bin\/java//g'`,
 			psArgs, pid))
 		if response.Success {
@@ -76,11 +76,11 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*transport.
 		}
 	}
 	if javaHome == "" {
-		return transport.ReturnFail(transport.Code[transport.EnvironmentError], "JAVA_HOME env not found"), ""
+		return spec.ReturnFail(spec.Code[spec.EnvironmentError], "JAVA_HOME env not found"), ""
 	}
-	user, err := exec.GetPidUser(pid)
+	user, err := specchannel.GetPidUser(pid)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.GetProcessError], err.Error()), user
+		return spec.ReturnFail(spec.Code[spec.GetProcessError], err.Error()), user
 	}
 	toolsJar := path.Join(util.GetBinPath(), "tools.jar")
 	originalJar := path.Join(javaHome, "lib/tools.jar")
@@ -109,13 +109,13 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*transport.
 		token, getSandboxTokenFile(user), DefaultNamespace))
 	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
 			fmt.Sprintf("attach JVM %s failed, loss response; %s", pid, response.Err)), user
 	}
 	return response, user
 }
 
-func Detach(port string) *transport.Response {
+func Detach(port string) *spec.Response {
 	return shutdown(port)
 }
 
@@ -155,17 +155,17 @@ func getPortFromSandboxToken(username string) (port string, err error) {
 }
 
 // sudo -u $user -H bash bin/sandbox.sh -p $pid -S 2>&1
-func shutdown(port string) *transport.Response {
+func shutdown(port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-control/shutdown", "")
 	result, err, code := util.Curl(url)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
 	if code != 200 {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError],
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
 			fmt.Sprintf("shutdown module response code: %d, result: %s", code, result))
 	}
-	return transport.ReturnSuccess("success")
+	return spec.ReturnSuccess("success")
 }
 
 func getSandboxUrl(port, uri, param string) string {

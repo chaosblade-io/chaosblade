@@ -5,7 +5,7 @@ import (
 
 	"reflect"
 
-	"github.com/chaosblade-io/chaosblade/exec"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 func Test_convertCommandModel(t *testing.T) {
@@ -13,7 +13,7 @@ func Test_convertCommandModel(t *testing.T) {
 		action, target, rules string
 	}
 	type expect struct {
-		*exec.ExpModel
+		*spec.ExpModel
 	}
 	tests := []struct {
 		input  input
@@ -21,7 +21,7 @@ func Test_convertCommandModel(t *testing.T) {
 	}{
 		{
 			input{"network delay", "docker", "--time 3000 --interface eth0"},
-			expect{&exec.ExpModel{
+			expect{&spec.ExpModel{
 				Target:      "docker",
 				ActionName:  "network delay",
 				ActionFlags: map[string]string{"time": "3000", "interface": "eth0"},
@@ -29,7 +29,7 @@ func Test_convertCommandModel(t *testing.T) {
 		},
 		{
 			input{"delay", "network", "--time 3000 --interface eth0"},
-			expect{&exec.ExpModel{
+			expect{&spec.ExpModel{
 				Target:      "network",
 				ActionName:  "delay",
 				ActionFlags: map[string]string{"time": "3000", "interface": "eth0"},

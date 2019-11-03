@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"os"
 
-	"github.com/chaosblade-io/chaosblade/transport"
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -60,7 +60,7 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 		}
 	default:
 		if uid == "" {
-			return transport.ReturnFail(transport.Code[transport.IllegalCommand], "must specify the right type or uid")
+			return spec.ReturnFail(spec.Code[spec.IllegalCommand], "must specify the right type or uid")
 		}
 		result, err = GetDS().QueryExperimentModelByUid(uid)
 		if util.IsNil(result) || err != nil {
@@ -68,12 +68,12 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 		}
 	}
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.DatabaseError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.DatabaseError], err.Error())
 	}
 	if util.IsNil(result) {
-		return transport.Return(transport.Code[transport.DataNotFound])
+		return spec.Return(spec.Code[spec.DataNotFound])
 	}
-	response := transport.ReturnSuccess(result)
+	response := spec.ReturnSuccess(result)
 
 	if terminal.IsTerminal(int(os.Stdout.Fd())) {
 		bytes, err := json.MarshalIndent(response, "", "\t")

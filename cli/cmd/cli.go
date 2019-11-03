@@ -3,7 +3,7 @@ package cmd
 import (
 	"os"
 
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
 )
 

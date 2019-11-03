@@ -2,7 +2,7 @@ package data
 
 import (
 	"database/sql"
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"path"
 	"github.com/sirupsen/logrus"
 	"sync"

@@ -6,11 +6,11 @@ import (
 	"fmt"
 
 	"github.com/chaosblade-io/chaosblade/data"
-	"github.com/chaosblade-io/chaosblade/exec"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	neturl "net/url"
 	"strings"
+	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
 )
 
 const DefaultUri = "sandbox/default/module/http/chaosblade"
@@ -18,13 +18,13 @@ const DefaultUri = "sandbox/default/module/http/chaosblade"
 // Executor for jvm experiment
 type Executor struct {
 	Uri     string
-	channel exec.Channel
+	channel spec.Channel
 }
 
 func NewExecutor() *Executor {
 	return &Executor{
 		Uri:     DefaultUri,
-		channel: exec.NewLocalChannel(),
+		channel: specchannel.NewLocalChannel(),
 	}
 }
 
@@ -32,34 +32,34 @@ func (e *Executor) Name() string {
 	return "jvm"
 }
 
-func (e *Executor) SetChannel(channel exec.Channel) {
+func (e *Executor) SetChannel(channel spec.Channel) {
 	e.channel = channel
 }
 
-func (e *Executor) Exec(uid string, ctx context.Context, model *exec.ExpModel) *transport.Response {
+func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
 	var url_ string
 	port, err := e.getPortFromDB(model.ActionFlags["process"], "")
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.ServerError], "cannot get port from local, please execute prepare command first")
+		return spec.ReturnFail(spec.Code[spec.ServerError], "cannot get port from local, please execute prepare command first")
 	}
-	if _, ok := exec.IsDestroy(ctx); ok {
+	if _, ok := spec.IsDestroy(ctx); ok {
 		url_ = e.destroyUrl(port, uid)
 	} else {
 		url_ = e.createUrl(port, uid, model)
 	}
 	result, err, code := util.Curl(url_)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
 	if code == 404 {
-		return transport.ReturnFail(transport.Code[transport.JavaAgentCmdError], "please execute prepare command first")
+		return spec.ReturnFail(spec.Code[spec.JavaAgentCmdError], "please execute prepare command first")
 	}
-	var resp transport.Response
+	var resp spec.Response
 	json.Unmarshal([]byte(result), &resp)
 	return &resp
 }
 
-func (e *Executor) createUrl(port, suid string, model *exec.ExpModel) string {
+func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) string {
 	url := fmt.Sprintf("http://%s:%s/%s/create?target=%s&suid=%s&action=%s",
 		"127.0.0.1", port, e.Uri, model.Target, suid, model.ActionName)
 	for k, v := range model.ActionFlags {
@@ -81,33 +81,33 @@ func (e *Executor) destroyUrl(port, uid string) string {
 	return url
 }
 
-func (e *Executor) QueryStatus(uid string) *transport.Response {
+func (e *Executor) QueryStatus(uid string) *spec.Response {
 	experimentModel, err := db.QueryExperimentModelByUid(uid)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.DatabaseError],
+		return spec.ReturnFail(spec.Code[spec.DatabaseError],
 			fmt.Sprintf("query experiment error, %s", err.Error()))
 	}
 	if experimentModel == nil {
-		return transport.ReturnFail(transport.Code[transport.DataNotFound], "the experiment record not found")
+		return spec.ReturnFail(spec.Code[spec.DataNotFound], "the experiment record not found")
 	}
 	// get process flag
 	process := getProcessFlagFromExpRecord(experimentModel)
 	port, err := e.getPortFromDB(process, "")
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
 	url := e.statusUrl(port, uid)
 	result, err, code := util.Curl(url)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
 	if code == 404 {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], "the command not support")
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], "the command not support")
 	}
 	if code != 200 {
-		return transport.ReturnFail(transport.Code[transport.SandboxInvokeError], result)
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], result)
 	}
-	var resp transport.Response
+	var resp spec.Response
 	json.Unmarshal([]byte(result), &resp)
 	return &resp
 }
@@ -158,37 +158,37 @@ func getProcessFlagFromExpRecord(model *data.ExperimentModel) string {
 // 2. Process is empty, pid is not empty, then determine if the pid process exists
 // 3. Process is not empty, pid is empty, then it is judged whether the process exists, there is no error, and the process id is assigned to pid.
 // 4. Process and pid are both empty, then an error is returned.
-func CheckFlagValues(processName, processId string) (string, *transport.Response) {
+func CheckFlagValues(processName, processId string) (string, *spec.Response) {
 	if processName == "" {
-		exists, err := exec.ProcessExists(processId)
+		exists, err := specchannel.ProcessExists(processId)
 		if err != nil {
-			return processId, transport.ReturnFail(transport.Code[transport.GetProcessError],
+			return processId, spec.ReturnFail(spec.Code[spec.GetProcessError],
 				fmt.Sprintf("the %s process id doesn't exist, %s", processId, err.Error()))
 		}
 		if !exists {
-			return processId, transport.ReturnFail(transport.Code[transport.IllegalParameters],
+			return processId, spec.ReturnFail(spec.Code[spec.IllegalParameters],
 				fmt.Sprintf("the %s process id doesn't exist.", processId))
 		}
 	}
 	if processName != "" {
-		ctx := context.WithValue(context.Background(), exec.ProcessKey, "java")
-		pids, err := exec.GetPidsByProcessName(processName, ctx)
+		ctx := context.WithValue(context.Background(), specchannel.ProcessKey, "java")
+		pids, err := specchannel.GetPidsByProcessName(processName, ctx)
 		if err != nil {
-			return processId, transport.ReturnFail(transport.Code[transport.GetProcessError], err.Error())
+			return processId, spec.ReturnFail(spec.Code[spec.GetProcessError], err.Error())
 		}
 		if pids == nil || len(pids) == 0 {
-			return processId, transport.ReturnFail(transport.Code[transport.GetProcessError], "process not found")
+			return processId, spec.ReturnFail(spec.Code[spec.GetProcessError], "process not found")
 		}
 		if len(pids) == 1 {
 			if processId == "" {
 				processId = pids[0]
 			} else if processId != pids[0] {
-				return processId, transport.ReturnFail(transport.Code[transport.IllegalParameters],
+				return processId, spec.ReturnFail(spec.Code[spec.IllegalParameters],
 					fmt.Sprintf("get process id by process name is %s, not equal the value of pid flag", pids[0]))
 			}
 		} else {
 			if processId == "" {
-				return processId, transport.ReturnFail(transport.Code[transport.GetProcessError], "too many process")
+				return processId, spec.ReturnFail(spec.Code[spec.GetProcessError], "too many process")
 			} else {
 				var contains bool
 				for _, p := range pids {
@@ -198,11 +198,11 @@ func CheckFlagValues(processName, processId string) (string, *transport.Response
 					}
 				}
 				if !contains {
-					return processId, transport.ReturnFail(transport.Code[transport.IllegalParameters],
+					return processId, spec.ReturnFail(spec.Code[spec.IllegalParameters],
 						"the process ids got by process name does not contain the pid value")
 				}
 			}
 		}
 	}
-	return processId, transport.ReturnSuccess("success")
+	return processId, spec.ReturnSuccess("success")
 }

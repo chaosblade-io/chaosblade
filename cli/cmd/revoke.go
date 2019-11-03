@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/chaosblade-io/chaosblade/exec"
 	"github.com/chaosblade-io/chaosblade/exec/cplus"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
-	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 )
 
 type RevokeCommand struct {
@@ -34,19 +34,19 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 	uid := args[0]
 	record, err := GetDS().QueryPreparationByUid(uid)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.DatabaseError],
+		return spec.ReturnFail(spec.Code[spec.DatabaseError],
 			fmt.Sprintf("query record err, %s", err.Error()))
 	}
 	if record == nil {
-		return transport.ReturnFail(transport.Code[transport.DataNotFound],
+		return spec.ReturnFail(spec.Code[spec.DataNotFound],
 			fmt.Sprintf("the uid record not found"))
 	}
 	if record.Status == "Revoked" {
-		rc.command.Println(transport.ReturnSuccess("success").Print())
+		rc.command.Println(spec.ReturnSuccess("success").Print())
 		return nil
 	}
-	var response *transport.Response
-	var channel = exec.NewLocalChannel()
+	var response *spec.Response
+	var channel = channel.NewLocalChannel()
 	switch record.ProgramType {
 	case PrepareJvmType:
 		response = jvm.Detach(record.Port)
@@ -56,14 +56,14 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		args := fmt.Sprintf("delete ns chaosblade")
 		response = channel.Run(context.Background(), "kubectl", args)
 	default:
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+		return spec.ReturnFail(spec.Code[spec.IllegalParameters],
 			fmt.Sprintf("not support the %s type", record.ProgramType))
 	}
 	if response.Success {
 		checkError(GetDS().UpdatePreparationRecordByUid(uid, "Revoked", ""))
 	} else if strings.Contains(response.Err, "connection refused") {
 		// sandbox has been detached, reset response value
-		response = transport.ReturnSuccess("success")
+		response = spec.ReturnSuccess("success")
 		checkError(GetDS().UpdatePreparationRecordByUid(uid, "Revoked", ""))
 	} else {
 		// other failed reason
