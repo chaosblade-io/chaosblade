@@ -164,12 +164,14 @@ func runBurnCpu(ctx context.Context, cpuCount int, cpuPercent int, pidNeeded boo
 	if pidNeeded {
 		args = fmt.Sprintf("%s --cpu-processor %s", args, processor)
 	}
+
 	args = fmt.Sprintf(`%s > /dev/null 2>&1 &`, args)
 	response := channel.Run(ctx, "nohup", args)
 	if !response.Success {
 		stopBurnCpuFunc()
 		bin.PrintErrAndExit(response.Err)
 	}
+
 	if pidNeeded {
 		// parse pid
 		newCtx := context.WithValue(context.Background(), exec.ProcessKey, fmt.Sprintf("cpu-processor %s", processor))
