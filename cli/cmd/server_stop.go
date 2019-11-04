@@ -3,11 +3,11 @@ package cmd
 import (
 	"github.com/spf13/cobra"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade/exec"
 	"strings"
 	"context"
-	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/sirupsen/logrus"
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 )
 
 type StopServerCommand struct {
@@ -27,16 +27,16 @@ func (ssc *StopServerCommand) Init() {
 }
 
 func (ssc *StopServerCommand) run(cmd *cobra.Command, args []string) error {
-	pids, err := exec.GetPidsByProcessName(startServerKey, context.TODO())
+	pids, err := channel.GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.ServerError], err.Error())
+		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}
 	if pids == nil || len(pids) == 0 {
 		logrus.Infof("the blade server process not found, so return success for stop operation")
-		cmd.Printf(transport.ReturnSuccess("success").Print())
+		cmd.Printf(spec.ReturnSuccess("success").Print())
 		return nil
 	}
-	response := exec.NewLocalChannel().Run(context.TODO(), "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
+	response := channel.NewLocalChannel().Run(context.TODO(), "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
 	if !response.Success {
 		return response
 	}

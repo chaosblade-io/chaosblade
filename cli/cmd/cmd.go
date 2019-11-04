@@ -36,6 +36,7 @@ func CmdInit() *baseCommand {
 	queryCommand.AddCommand(&QueryDiskCommand{})
 	queryCommand.AddCommand(&QueryNetworkCommand{})
 	queryCommand.AddCommand(&QueryJvmCommand{})
+	queryCommand.AddCommand(&QueryK8sCommand{})
 
 	// add server command
 	serverCommand := &ServerCommand{}

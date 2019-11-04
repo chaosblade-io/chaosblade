@@ -1,11 +1,32 @@
 package kubernetes
 
 import (
-	"github.com/chaosblade-io/chaosblade/exec"
-	"context"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 type CommandModelSpec struct {
+	spec.BaseExpModelCommandSpec
+}
+
+var KubeConfigFlag = &spec.ExpFlag{
+	Name: "kubeconfig",
+	Desc: "kubeconfig file",
+}
+
+var WaitingTimeFlag = &spec.ExpFlag{
+	Name: "waiting-time",
+	Desc: "Waiting time for invoking, default value is 20s",
+}
+
+func NewCommandModelSpec() spec.ExpModelCommandSpec {
+	return &CommandModelSpec{
+		spec.BaseExpModelCommandSpec{
+			ExpActions: []spec.ExpActionCommandSpec{},
+			ExpFlags: []spec.ExpFlagSpec{
+				KubeConfigFlag, WaitingTimeFlag,
+			},
+		},
+	}
 }
 
 func (*CommandModelSpec) Name() string {
@@ -21,64 +42,5 @@ func (*CommandModelSpec) LongDesc() string {
 }
 
 func (*CommandModelSpec) Example() string {
-	return "k8s delete --pod <podname> --namespace default"
-}
-
-func (*CommandModelSpec) Actions() []exec.ExpActionCommandSpec {
-	return []exec.ExpActionCommandSpec{
-		&DeleteActionCommandSpec{},
-	}
-}
-
-func (cms *CommandModelSpec) Flags() []exec.ExpFlagSpec {
-	return []exec.ExpFlagSpec{
-		&exec.ExpFlag{
-			Name: "kubeconfig",
-			Desc: "kubeconfig file",
-		},
-		&exec.ExpFlag{
-			Name: "namespace",
-			Desc: "namespace",
-		},
-		&exec.ExpFlag{
-			Name: "deployment",
-			Desc: "deployment name",
-		},
-	}
-}
-
-type PreExecutor struct {
-	k8sChannel *Channel
-}
-
-func (cms *CommandModelSpec) PreExecutor() exec.PreExecutor {
-	return &PreExecutor{
-		k8sChannel: &Channel{
-			exec.NewLocalChannel(),
-		},
-	}
-}
-
-// PreExec
-func (pe *PreExecutor) PreExec(cmdName, parentCmdName string, flags map[string]string) func(ctx context.Context) (exec.Channel, context.Context, error) {
-	// handle k8s redirect action
-	switch cmdName {
-	case "delete":
-		return func(ctx context.Context) (exec.Channel, context.Context, error) {
-			return pe.k8sChannel, ctx, nil
-		}
-	}
-	kubeconfig := flags["kubeconfig"]
-	namespace := flags["namespace"]
-	podName := flags["pod"]
-	deployment := flags["deployment"]
-
-	return func(ctx context.Context) (exec.Channel, context.Context, error) {
-		ctx = context.WithValue(ctx, "podName", podName)
-		ctx = context.WithValue(ctx, "namespace", namespace)
-		ctx = context.WithValue(ctx, "kubeconfig", kubeconfig)
-		ctx = context.WithValue(ctx, "deployment", deployment)
-
-		return pe.k8sChannel, ctx, nil
-	}
+	return "k8s node-cpu load --cpu-percent 50 --selector app=demo --coverage—count 1 --kube-config config"
 }

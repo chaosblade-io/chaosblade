@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
-	"github.com/chaosblade-io/chaosblade/transport"
-	"github.com/chaosblade-io/chaosblade/util"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -47,7 +47,7 @@ func (pc *PrepareJvmCommand) prepareExample() string {
 // prepareJvm means attaching java agent
 func (pc *PrepareJvmCommand) prepareJvm() error {
 	if pc.processName == "" && pc.processId == "" {
-		return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+		return spec.ReturnFail(spec.Code[spec.IllegalParameters],
 			fmt.Sprintf("less --process or --pid flags"))
 	}
 	pid, response := jvm.CheckFlagValues(pc.processName, pc.processId)
@@ -57,7 +57,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 	pc.processId = pid
 	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName, pc.processId)
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.DatabaseError],
+		return spec.ReturnFail(spec.Code[spec.DatabaseError],
 			fmt.Sprintf("query attach java process record err, %s", err.Error()))
 	}
 	if record == nil {
@@ -69,18 +69,18 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 			// get port from local port
 			port, err = getAndCacheSandboxPort()
 			if err != nil {
-				return transport.ReturnFail(transport.Code[transport.ServerError],
+				return spec.ReturnFail(spec.Code[spec.ServerError],
 					fmt.Sprintf("get sandbox port err, %s", err.Error()))
 			}
 		}
 		record, err = insertPrepareRecord(PrepareJvmType, pc.processName, port, pc.processId)
 		if err != nil {
-			return transport.ReturnFail(transport.Code[transport.DatabaseError],
+			return spec.ReturnFail(spec.Code[spec.DatabaseError],
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))
 		}
 	} else {
 		if pc.port != 0 && strconv.Itoa(pc.port) != record.Port {
-			return transport.ReturnFail(transport.Code[transport.IllegalParameters],
+			return spec.ReturnFail(spec.Code[spec.IllegalParameters],
 				fmt.Sprintf("the process has been executed prepare command, if you wan't re-prepare, "+
 					"please append or modify the --port %s argument in prepare command for retry", record.Port))
 		}

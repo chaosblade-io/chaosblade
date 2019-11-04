@@ -3,7 +3,7 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
 )
 
@@ -20,7 +20,7 @@ func (qc *QueryCommand) Init() {
 		Short:   "Query the parameter values required for chaos experiments",
 		Long:    "Query the parameter values required for chaos experiments",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return transport.ReturnFail(transport.Code[transport.IllegalCommand],
+			return spec.ReturnFail(spec.Code[spec.IllegalCommand],
 				fmt.Sprintf("less TARGE to query"))
 		},
 		Example: qc.queryExample(),

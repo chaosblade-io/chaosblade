@@ -7,7 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade/exec/cplus"
-	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 type PrepareCPlusCommand struct {
@@ -43,13 +43,13 @@ func (pc *PrepareCPlusCommand) prepareCPlus() error {
 	portStr := strconv.Itoa(pc.port)
 	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareCPlusType, portStr, "")
 	if err != nil {
-		return transport.ReturnFail(transport.Code[transport.DatabaseError],
+		return spec.ReturnFail(spec.Code[spec.DatabaseError],
 			fmt.Sprintf("query cplus agent server port record err, %s", err.Error()))
 	}
 	if record == nil || record.Status != "Running" {
 		record, err = insertPrepareRecord(PrepareCPlusType, portStr, portStr, "")
 		if err != nil {
-			return transport.ReturnFail(transport.Code[transport.DatabaseError],
+			return spec.ReturnFail(spec.Code[spec.DatabaseError],
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))
 		}
 	}

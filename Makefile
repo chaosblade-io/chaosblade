@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-BLADE_VERSION=0.3.0
+export BLADE_VERSION=0.4.0
 
 BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
@@ -16,6 +16,7 @@ UNAME := $(shell uname)
 BUILD_TARGET=target
 BUILD_TARGET_DIR_NAME=chaosblade-$(BLADE_VERSION)
 BUILD_TARGET_PKG_DIR=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)
+BUILD_TARGET_PKG_NAME=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION).tar.gz
 BUILD_TARGET_BIN=$(BUILD_TARGET_PKG_DIR)/bin
 BUILD_TARGET_LIB=$(BUILD_TARGET_PKG_DIR)/lib
 BUILD_TARGET_TAR_NAME=$(BUILD_TARGET_DIR_NAME).tar.gz
@@ -40,7 +41,7 @@ BLADE_JAVA_AGENT_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_AGENT_NAME)
 BLADE_JAVA_AGENT_SPEC=jvm.spec.yaml
 BLADE_JAVA_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/jvm.spec.yaml
 BLADE_JAVA_AGENT_SPEC_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_JAVA_AGENT_SPEC)
-# used to java agent attach
+# used to java agent attachp
 BLADE_JAVA_TOOLS_JAR_NAME=tools.jar
 BLADE_JAVA_TOOLS_JAR_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_TOOLS_JAR_NAME)
 BLADE_JAVA_TOOLS_JAR_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_JAVA_TOOLS_JAR_NAME)
@@ -61,12 +62,16 @@ BLADE_CPLUS_AGENT_SPEC=cplus-chaosblade.spec.yaml
 BLADE_CPLUS_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/cplus-chaosblade.spec.yaml
 BLADE_CPLUS_AGENT_SPEC_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_CPLUS_AGENT_SPEC)
 
+# docker yaml
+DOCKER_YAML_FILE_NAME=chaosblade-docker-spec-$(BLADE_VERSION).yaml
+DOCKER_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(DOCKER_YAML_FILE_NAME)
+
 ifeq ($(GOOS), linux)
 	GO_FLAGS=-ldflags="-linkmode external -extldflags -static -X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`'"
 endif
 
 # build chaosblade package and image
-build: pre_build build_osbin build_cli
+build: pre_build build_cli
 	# tar package
 	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
 
@@ -74,40 +79,6 @@ build: pre_build build_osbin build_cli
 build_cli:
 	# build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
-
-build_osbin: build_burncpu build_burnmem build_burnio build_killprocess build_stopprocess build_changedns build_dlnetwork build_dropnetwork build_filldisk
-
-# build burn-cpu chaos tools
-build_burncpu: exec/os/bin/burncpu/burncpu.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burncpu $<
-
-# build burn-mem chaos tools
-build_burnmem: exec/os/bin/burnmem/burnmem.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burnmem $<
-
-# build burn-io chaos tools
-build_burnio: exec/os/bin/burnio/burnio.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_burnio $<
-
-# build kill-process chaos tools
-build_killprocess: exec/os/bin/killprocess/killprocess.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_killprocess $<
-
-# build stop-process chaos tools
-build_stopprocess: exec/os/bin/stopprocess/stopprocess.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_stopprocess $<
-
-build_changedns: exec/os/bin/changedns/changedns.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_changedns $<
-
-build_dlnetwork: exec/os/bin/delaylossnetwork/delaylossnetwork.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_dlnetwork $<
-
-build_dropnetwork: exec/os/bin/dropnetwork/dropnetwork.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_dropnetwork $<
-
-build_filldisk: exec/os/bin/filldisk/filldisk.go
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_BIN)/chaos_filldisk $<
 
 # create dir or download necessary file
 pre_build:mkdir_build_target download_sandbox download_blade_java_agent download_cplus_agent
@@ -166,14 +137,15 @@ build_linux:
 		-w /go/src/github.com/chaosblade-io/chaosblade \
 		chaosblade-build-musl:latest
 
-# build chaosblade image for chaos
-build_image: build_linux
-	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
+# build chaosblade image for chaos TODO
+build_image:
+#	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 
-	cp -R $(BUILD_TARGET_PKG_DIR) $(BUILD_IMAGE_PATH)
+	cp -R $(BUILD_TARGET_PKG_NAME) $(BUILD_IMAGE_PATH)
+	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_IMAGE_PATH)
 	docker build -f $(BUILD_IMAGE_PATH)/Dockerfile \
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
-		-t chaosblade-agent:$(BLADE_VERSION) \
+		-t chaosblade-tool:$(BLADE_VERSION) \
 		$(BUILD_IMAGE_PATH)
 
 	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)

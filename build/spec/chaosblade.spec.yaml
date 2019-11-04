@@ -1,0 +1,2422 @@
+version: v1
+kind: plugin
+items:
+- target: cpu
+  shortDesc: Cpu experiment
+  longDesc: Cpu experiment, for example full load
+  example: cpu fullload
+  actions:
+  - action: fullload
+    aliases: [fl, load]
+    shortDesc: cpu load
+    longDesc: cpu load
+    flags:
+    - name: cpu-count
+      desc: Cpu count
+      noArgs: false
+      required: false
+    - name: cpu-list
+      desc: CPUs in which to allow burning (0-3 or 1,3)
+      noArgs: false
+      required: false
+    - name: cpu-percent
+      desc: percent of burn CPU (0-100)
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: host
+- target: mem
+  shortDesc: Mem experiment
+  longDesc: Mem experiment, for example load
+  example: mem load
+  actions:
+  - action: load
+    shortDesc: mem load
+    longDesc: mem load
+    flags:
+    - name: mem-percent
+      desc: percent of burn Memory (0-100)
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: host
+- target: process
+  shortDesc: Process experiment
+  longDesc: Process experiment, for example, kill process
+  example: process kill --process tomcat
+  actions:
+  - action: kill
+    aliases: [k]
+    shortDesc: Kill process
+    longDesc: Kill process by process id or process name
+    matchers:
+    - name: process
+      desc: Process name
+      noArgs: false
+      required: false
+    - name: process-cmd
+      desc: Process name in command
+      noArgs: false
+      required: false
+    flags:
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: stop
+    aliases: [f]
+    shortDesc: process fake death
+    longDesc: process fake death by process id or process name
+    matchers:
+    - name: process
+      desc: Process name
+      noArgs: false
+      required: false
+    - name: process-cmd
+      desc: Process name in command
+      noArgs: false
+      required: false
+    flags:
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: host
+- target: network
+  shortDesc: Network experiment
+  longDesc: Network experiment
+  example: |-
+    network delay --interface eth0 --time 3000
+
+    # You can execute "blade query network interface" command to query the interfaces
+  actions:
+  - action: delay
+    shortDesc: Delay experiment
+    longDesc: Delay experiment
+    matchers:
+    - name: local-port
+      desc: 'Ports for local service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: 'Ports for remote service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: exclude-port
+      desc: 'Exclude local ports. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 22,8000. This flag
+        is invalid when --local-port or --remote-port is specified'
+      noArgs: false
+      required: false
+    - name: destination-ip
+      desc: destination ip. Support for using mask to specify the ip range, for example,
+        192.168.1.0/24. You can also use 192.168.1.1 or 192.168.1.1/32 to specify
+        it.
+      noArgs: false
+      required: false
+    - name: interface
+      desc: Network interface, for example, eth0
+      noArgs: false
+      required: true
+    flags:
+    - name: time
+      desc: Delay time, ms
+      noArgs: false
+      required: true
+    - name: offset
+      desc: Delay offset time, ms
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: drop
+    shortDesc: Drop experiment
+    longDesc: Drop network data
+    matchers:
+    - name: local-port
+      desc: Port for local service
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: Port for remote service
+      noArgs: false
+      required: false
+    flags:
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: dns
+    shortDesc: Dns experiment
+    longDesc: Dns experiment
+    flags:
+    - name: domain
+      desc: Domain name
+      noArgs: false
+      required: true
+    - name: ip
+      desc: Domain ip
+      noArgs: false
+      required: true
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: loss
+    shortDesc: Loss network package
+    longDesc: Loss network package
+    matchers:
+    - name: local-port
+      desc: 'Ports for local service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: 'Ports for remote service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: exclude-port
+      desc: 'Exclude local ports. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 22,8000. This flag
+        is invalid when --local-port or --remote-port is specified'
+      noArgs: false
+      required: false
+    - name: destination-ip
+      desc: destination ip. Support for using mask to specify the ip range, for example,
+        192.168.1.0/24. You can also use 192.168.1.1 or 192.168.1.1/32 to specify
+        it.
+      noArgs: false
+      required: false
+    - name: interface
+      desc: Network interface, for example, eth0
+      noArgs: false
+      required: true
+    flags:
+    - name: percent
+      desc: loss percent, [0, 100]
+      noArgs: false
+      required: true
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: host
+- target: disk
+  shortDesc: Disk experiment
+  longDesc: Disk experiment contains fill disk or burn io
+  example: |-
+    disk fill --path /home --size 1000
+
+    # You can execute "blade query disk mount-point" command to query the mount points
+  actions:
+  - action: fill
+    shortDesc: Fill the specified directory path
+    longDesc: Fill the specified directory path. If the path is not directory or does
+      not exist, an error message will be returned.
+    matchers:
+    - name: path
+      desc: The path of directory where the disk is populated, default value is /
+      noArgs: false
+      required: false
+    flags:
+    - name: size
+      desc: Disk fill size, unit is MB. The value is a positive integer without unit,
+        for example, --size 1024
+      noArgs: false
+      required: true
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: burn
+    shortDesc: Increase disk read and write io load
+    longDesc: Increase disk read and write io load
+    matchers:
+    - name: read
+      desc: Burn io by read, it will create a 600M for reading and delete it when
+        destroy it
+      noArgs: true
+      required: false
+    - name: write
+      desc: Burn io by write, it will create a file by value of the size flag, for
+        example the size default value is 10, then it will create a 10M*100=1000M
+        file for writing, and delete it when destroy
+      noArgs: true
+      required: false
+    flags:
+    - name: size
+      desc: Block size, MB, default is 10
+      noArgs: false
+      required: false
+    - name: path
+      desc: The path of directory where the disk is burning, default value is /
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: host
+- target: script
+  shortDesc: Script chaos experiment
+  longDesc: Script chaos experiment
+  example: |-
+    blade create script delay --time 2000 --file xxx.sh --function-name start
+
+    blade create script exit --file xxx.sh --function-name offline --exit-message "error" --exit-code 2
+  actions:
+  - action: delay
+    shortDesc: Script executed delay
+    longDesc: Sleep in script
+    flags:
+    - name: time
+      desc: sleep time, unit is millisecond
+      noArgs: false
+      required: true
+    - name: file
+      desc: Script file full path
+      noArgs: false
+      required: true
+    - name: function-name
+      desc: function name in shell
+      noArgs: false
+      required: true
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: exit
+    shortDesc: Exit script
+    longDesc: Exit script with specify message and code
+    flags:
+    - name: exit-code
+      desc: Exit code
+      noArgs: false
+      required: false
+    - name: exit-message
+      desc: Exit message
+      noArgs: false
+      required: false
+    - name: file
+      desc: Script file full path
+      noArgs: false
+      required: true
+    - name: function-name
+      desc: function name in shell
+      noArgs: false
+      required: true
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: host
+- target: http
+  shortDesc: http experiment
+  longDesc: http experiment for testing service delay and exception.
+  example: http delay --rest --time 1000 --uri http://127.0.0.1:8801/getName
+  actions:
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: httpclient4
+      desc: To tag httpclient4 experiment.
+      noArgs: true
+      required: false
+    - name: rest
+      desc: To tag restTemplate experiment.
+      noArgs: true
+      required: false
+    - name: httpclient3
+      desc: To tag httpclient3 experiment.
+      noArgs: true
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: uri
+      desc: url
+      noArgs: false
+      required: true
+    flags:
+    - name: time
+      desc: delay time
+      noArgs: false
+      required: true
+    - name: offset
+      desc: delay offset for the time
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwCustomException
+    aliases: [tce]
+    shortDesc: throw custom exception
+    longDesc: Throw custom exception with --exception option
+    matchers:
+    - name: httpclient4
+      desc: To tag httpclient4 experiment.
+      noArgs: true
+      required: false
+    - name: rest
+      desc: To tag restTemplate experiment.
+      noArgs: true
+      required: false
+    - name: httpclient3
+      desc: To tag httpclient3 experiment.
+      noArgs: true
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: uri
+      desc: url
+      noArgs: false
+      required: true
+    flags:
+    - name: exception
+      desc: Exception class inherit java.lang.Exception
+      noArgs: false
+      required: true
+    - name: exception-message
+      desc: Specify exception message for exception experiment, default value is chaosblade-mock-exception
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: jedis
+  shortDesc: jedis experiment
+  longDesc: jedis experiment contains delay and exception by command and so on.
+  example: 'jedis  --cmd hset --key test_key '
+  actions:
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: cmd
+      desc: The cmd type, for example, set, hget,zadd and so on.
+      noArgs: false
+      required: false
+    - name: key
+      desc: The key which command used
+      noArgs: false
+      required: false
+    flags:
+    - name: time
+      desc: delay time
+      noArgs: false
+      required: true
+    - name: offset
+      desc: delay offset for the time
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwCustomException
+    aliases: [tce]
+    shortDesc: throw custom exception
+    longDesc: Throw custom exception with --exception option
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: cmd
+      desc: The cmd type, for example, set, hget,zadd and so on.
+      noArgs: false
+      required: false
+    - name: key
+      desc: The key which command used
+      noArgs: false
+      required: false
+    flags:
+    - name: exception
+      desc: Exception class inherit java.lang.Exception
+      noArgs: false
+      required: true
+    - name: exception-message
+      desc: Specify exception message for exception experiment, default value is chaosblade-mock-exception
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: servlet
+  shortDesc: java servlet experiment
+  longDesc: Java servlet experiment, support path, query string, servlet path and
+    request method matcher
+  example: servlet --pathinfo hello --method post
+  actions:
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: servletpath
+      desc: The part of this request's URL that calls the servlet
+      noArgs: false
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: method
+      desc: The name of the HTTP method with which this request was made, for example,
+        GET, POST, or PUT.
+      noArgs: false
+      required: false
+    - name: querystring
+      desc: The query string that is contained in the request URL after the path.
+      noArgs: false
+      required: false
+    - name: requestpath
+      desc: equal RequestUri without ContextPath
+      noArgs: false
+      required: false
+    - name: pathinfo
+      desc: The extra path information follows the servlet path but precedes the query
+        string and start with a / character
+      noArgs: false
+      required: false
+    flags:
+    - name: time
+      desc: delay time
+      noArgs: false
+      required: true
+    - name: offset
+      desc: delay offset for the time
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwCustomException
+    aliases: [tce]
+    shortDesc: throw custom exception
+    longDesc: Throw custom exception with --exception option
+    matchers:
+    - name: servletpath
+      desc: The part of this request's URL that calls the servlet
+      noArgs: false
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: method
+      desc: The name of the HTTP method with which this request was made, for example,
+        GET, POST, or PUT.
+      noArgs: false
+      required: false
+    - name: querystring
+      desc: The query string that is contained in the request URL after the path.
+      noArgs: false
+      required: false
+    - name: requestpath
+      desc: equal RequestUri without ContextPath
+      noArgs: false
+      required: false
+    - name: pathinfo
+      desc: The extra path information follows the servlet path but precedes the query
+        string and start with a / character
+      noArgs: false
+      required: false
+    flags:
+    - name: exception
+      desc: Exception class inherit java.lang.Exception
+      noArgs: false
+      required: true
+    - name: exception-message
+      desc: Specify exception message for exception experiment, default value is chaosblade-mock-exception
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: psql
+  shortDesc: Postgrelsql experiment
+  longDesc: Postgrelsql experiment contains delay and exception by table name and
+    so on.
+  example: psql --sqltype select --port 5432
+  actions:
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: sqltype
+      desc: The sql type, for example, select, update and so on.
+      noArgs: false
+      required: false
+    - name: database
+      desc: The database name which used
+      noArgs: false
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: port
+      desc: The database port which used
+      noArgs: false
+      required: false
+    - name: host
+      desc: The database host
+      noArgs: false
+      required: false
+    - name: table
+      desc: The first table name in sql.
+      noArgs: false
+      required: false
+    flags:
+    - name: time
+      desc: delay time
+      noArgs: false
+      required: true
+    - name: offset
+      desc: delay offset for the time
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwCustomException
+    aliases: [tce]
+    shortDesc: throw custom exception
+    longDesc: Throw custom exception with --exception option
+    matchers:
+    - name: sqltype
+      desc: The sql type, for example, select, update and so on.
+      noArgs: false
+      required: false
+    - name: database
+      desc: The database name which used
+      noArgs: false
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: port
+      desc: The database port which used
+      noArgs: false
+      required: false
+    - name: host
+      desc: The database host
+      noArgs: false
+      required: false
+    - name: table
+      desc: The first table name in sql.
+      noArgs: false
+      required: false
+    flags:
+    - name: exception
+      desc: Exception class inherit java.lang.Exception
+      noArgs: false
+      required: true
+    - name: exception-message
+      desc: Specify exception message for exception experiment, default value is chaosblade-mock-exception
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: jvm
+  shortDesc: method
+  longDesc: method
+  example: method
+  actions:
+  - action: CodeCacheFilling
+    aliases: [ccf]
+    shortDesc: Fill up code cache.
+    longDesc: Filling code cache until JIT compiler turn off.
+    flags:
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: classname
+      desc: The class name with package
+      noArgs: false
+      required: true
+    - name: methodname
+      desc: The method name
+      noArgs: false
+      required: true
+    flags:
+    - name: time
+      desc: delay time
+      noArgs: false
+      required: true
+    - name: offset
+      desc: delay offset for the time
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwCustomException
+    aliases: [tce]
+    shortDesc: throw custom exception
+    longDesc: Throw custom exception with --exception option
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: classname
+      desc: The class name with package
+      noArgs: false
+      required: true
+    - name: methodname
+      desc: The method name
+      noArgs: false
+      required: true
+    flags:
+    - name: exception
+      desc: Exception class inherit java.lang.Exception
+      noArgs: false
+      required: true
+    - name: exception-message
+      desc: Specify exception message for exception experiment, default value is chaosblade-mock-exception
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: cpufullload
+    aliases: [cfl]
+    shortDesc: Process occupied cpu full load
+    longDesc: Process occupied cpu full load
+    flags:
+    - name: cpu-count
+      desc: Binding cpu core count
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwDeclaredException
+    aliases: [tde]
+    shortDesc: Throw the first declared exception of method
+    longDesc: Throw the first declared exception of method
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: classname
+      desc: The class name with package
+      noArgs: false
+      required: true
+    - name: methodname
+      desc: The method name
+      noArgs: false
+      required: true
+    flags:
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: return
+    shortDesc: Return the specify value
+    longDesc: Return the specify value
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: classname
+      desc: The class name with package
+      noArgs: false
+      required: true
+    - name: methodname
+      desc: The method name
+      noArgs: false
+      required: true
+    flags:
+    - name: value
+      desc: Value returned, only support primitive type value. If you want return
+        null, set --value null
+      noArgs: false
+      required: true
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: script
+    shortDesc: Dynamically execute custom scripts
+    longDesc: Dynamically execute custom scripts
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: classname
+      desc: The class name with package
+      noArgs: false
+      required: true
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: methodname
+      desc: The method name
+      noArgs: false
+      required: true
+    flags:
+    - name: script-file
+      desc: The Script file full path
+      noArgs: false
+      required: false
+    - name: script-type
+      desc: The script file type, java or groovy, default value is java
+      noArgs: false
+      required: false
+    - name: script-content
+      desc: The script contents
+      noArgs: false
+      required: false
+    - name: script-name
+      desc: The script name for label, unnecessary
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: OutOfMemoryError
+    aliases: [oom, outofmemoryerror]
+    shortDesc: JVM out of memory
+    longDesc: JVM out of memory
+    flags:
+    - name: area
+      desc: Jvm memory area you want  to cause OutOfMemoryError,the options:[HEAP,
+        NOHEAP, OFFHEAP]
+      noArgs: false
+      required: true
+    - name: wild-mode
+      desc: Decide oom happen mode in wild-mode or not,default is false,if true,will
+        quickly generate oom error,and the memory  will not release until stop,if
+        false,the oom error will not generate at once,and if oom happens frequently,the  memory
+        will release each once
+      noArgs: false
+      required: false
+    - name: interval
+      desc: Time between to oom error,the time unit is millis,default is 500 ms,only
+        used when wilde-mode not true
+      noArgs: false
+      required: false
+    - name: block
+      desc: Each block size when fill memory,only used for Heap OffHeap Area,Unit:MB
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: druid
+  shortDesc: Druid experiment
+  longDesc: Druid experiment, for example, druid connection pool full
+  example: druid connectionpoolfull
+  actions:
+  - action: connectionpoolfull
+    aliases: [cpf]
+    shortDesc: Connection pool full
+    longDesc: Connection pool full
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    flags:
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: mysql
+  shortDesc: mysql experiment
+  longDesc: Mysql experiment contains delay and exception by table name and so on.
+  example: mysql --sqltype select --port 3306
+  actions:
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: sqltype
+      desc: The sql type, for example, select, update and so on.
+      noArgs: false
+      required: false
+    - name: database
+      desc: The database name which used
+      noArgs: false
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: port
+      desc: The database port which used
+      noArgs: false
+      required: false
+    - name: host
+      desc: The database host
+      noArgs: false
+      required: false
+    - name: table
+      desc: The first table name in sql.
+      noArgs: false
+      required: false
+    flags:
+    - name: time
+      desc: delay time
+      noArgs: false
+      required: true
+    - name: offset
+      desc: delay offset for the time
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwCustomException
+    aliases: [tce]
+    shortDesc: throw custom exception
+    longDesc: Throw custom exception with --exception option
+    matchers:
+    - name: sqltype
+      desc: The sql type, for example, select, update and so on.
+      noArgs: false
+      required: false
+    - name: database
+      desc: The database name which used
+      noArgs: false
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: port
+      desc: The database port which used
+      noArgs: false
+      required: false
+    - name: host
+      desc: The database host
+      noArgs: false
+      required: false
+    - name: table
+      desc: The first table name in sql.
+      noArgs: false
+      required: false
+    flags:
+    - name: exception
+      desc: Exception class inherit java.lang.Exception
+      noArgs: false
+      required: true
+    - name: exception-message
+      desc: Specify exception message for exception experiment, default value is chaosblade-mock-exception
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: dubbo
+  shortDesc: dubbo experiment
+  longDesc: Dubbo experiment for testing service delay and exception.
+  example: dubbo delay --time 3000 --consumer --service com.example.service.HelloService
+  actions:
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: appname
+      desc: The consumer or provider application name
+      noArgs: false
+      required: false
+    - name: provider
+      desc: To tag provider experiment
+      noArgs: true
+      required: false
+    - name: service
+      desc: The service interface
+      noArgs: false
+      required: false
+    - name: version
+      desc: the service version
+      noArgs: false
+      required: false
+    - name: consumer
+      desc: To tag consumer role experiment.
+      noArgs: true
+      required: false
+    - name: methodname
+      desc: The method name
+      noArgs: false
+      required: false
+    - name: group
+      desc: The service group
+      noArgs: false
+      required: false
+    flags:
+    - name: time
+      desc: delay time
+      noArgs: false
+      required: true
+    - name: offset
+      desc: delay offset for the time
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwCustomException
+    aliases: [tce]
+    shortDesc: throw custom exception
+    longDesc: Throw custom exception with --exception option
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: appname
+      desc: The consumer or provider application name
+      noArgs: false
+      required: false
+    - name: provider
+      desc: To tag provider experiment
+      noArgs: true
+      required: false
+    - name: service
+      desc: The service interface
+      noArgs: false
+      required: false
+    - name: version
+      desc: the service version
+      noArgs: false
+      required: false
+    - name: consumer
+      desc: To tag consumer role experiment.
+      noArgs: true
+      required: false
+    - name: methodname
+      desc: The method name
+      noArgs: false
+      required: false
+    - name: group
+      desc: The service group
+      noArgs: false
+      required: false
+    flags:
+    - name: exception
+      desc: Exception class inherit java.lang.Exception
+      noArgs: false
+      required: true
+    - name: exception-message
+      desc: Specify exception message for exception experiment, default value is chaosblade-mock-exception
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: threadpoolfull
+    aliases: [tpf]
+    shortDesc: Thread pool full
+    longDesc: Thread pool full
+    matchers:
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: provider
+      desc: To tag provider experiment
+      noArgs: true
+      required: false
+    flags:
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: rocketmq
+  shortDesc: Rocketmq experiment,can make message send or pull delay and exception
+  longDesc: Rocketmq experiment,can make message send or pull delay and exception,default
+    if you not set [producerGroup,consumerGroup],will effect both send and pull message,if
+    you only set producerGroup for specific group,will only effect on sendMessage,if
+    you only set consumerGroup,will only effect pullMessage for specific group
+  example: ""
+  actions:
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: producerGroup
+      desc: Message producer group
+      noArgs: false
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: topic
+      desc: Message topic
+      noArgs: false
+      required: true
+    - name: consumerGroup
+      desc: Message consumer group
+      noArgs: false
+      required: false
+    flags:
+    - name: time
+      desc: delay time
+      noArgs: false
+      required: true
+    - name: offset
+      desc: delay offset for the time
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  - action: throwCustomException
+    aliases: [tce]
+    shortDesc: throw custom exception
+    longDesc: Throw custom exception with --exception option
+    matchers:
+    - name: producerGroup
+      desc: Message producer group
+      noArgs: false
+      required: false
+    - name: effect-count
+      desc: The count of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: effect-percent
+      desc: The percent of chaos experiment in effect
+      noArgs: false
+      required: false
+    - name: topic
+      desc: Message topic
+      noArgs: false
+      required: true
+    - name: consumerGroup
+      desc: Message consumer group
+      noArgs: false
+      required: false
+    flags:
+    - name: exception
+      desc: Exception class inherit java.lang.Exception
+      noArgs: false
+      required: true
+    - name: exception-message
+      desc: Specify exception message for exception experiment, default value is chaosblade-mock-exception
+      noArgs: false
+      required: false
+    - name: process
+      desc: Application process name
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id
+      noArgs: false
+      required: false
+  scope: host
+  prepare:
+    type: jvm
+    flags:
+    - name: process
+      desc: Java application process
+      noArgs: false
+      required: false
+    - name: javaHome
+      desc: Java home path
+      noArgs: false
+      required: false
+    - name: pid
+      desc: The process id of java application
+      noArgs: false
+      required: false
+    required: true
+- target: process
+  shortDesc: Process experiment
+  longDesc: Process experiment, for example, kill process
+  example: process kill --process tomcat
+  actions:
+  - action: kill
+    aliases: [k]
+    shortDesc: Kill process
+    longDesc: Kill process by process id or process name
+    matchers:
+    - name: process
+      desc: Process name
+      noArgs: false
+      required: false
+    - name: process-cmd
+      desc: Process name in command
+      noArgs: false
+      required: false
+    flags:
+    - name: container-id
+      desc: Container id
+      noArgs: false
+      required: true
+    - name: image-repo
+      desc: Image repository
+      noArgs: false
+      required: false
+    - name: docker-endpoint
+      desc: Docker socket endpoint
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: stop
+    aliases: [f]
+    shortDesc: process fake death
+    longDesc: process fake death by process id or process name
+    matchers:
+    - name: process
+      desc: Process name
+      noArgs: false
+      required: false
+    - name: process-cmd
+      desc: Process name in command
+      noArgs: false
+      required: false
+    flags:
+    - name: container-id
+      desc: Container id
+      noArgs: false
+      required: true
+    - name: image-repo
+      desc: Image repository
+      noArgs: false
+      required: false
+    - name: docker-endpoint
+      desc: Docker socket endpoint
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: docker
+- target: network
+  shortDesc: Network experiment
+  longDesc: Network experiment
+  example: |-
+    network delay --interface eth0 --time 3000
+
+    # You can execute "blade query network interface" command to query the interfaces
+  actions:
+  - action: delay
+    shortDesc: Delay experiment
+    longDesc: Delay experiment
+    matchers:
+    - name: local-port
+      desc: 'Ports for local service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: 'Ports for remote service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: exclude-port
+      desc: 'Exclude local ports. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 22,8000. This flag
+        is invalid when --local-port or --remote-port is specified'
+      noArgs: false
+      required: false
+    - name: destination-ip
+      desc: destination ip. Support for using mask to specify the ip range, for example,
+        192.168.1.0/24. You can also use 192.168.1.1 or 192.168.1.1/32 to specify
+        it.
+      noArgs: false
+      required: false
+    - name: interface
+      desc: Network interface, for example, eth0
+      noArgs: false
+      required: true
+    flags:
+    - name: time
+      desc: Delay time, ms
+      noArgs: false
+      required: true
+    - name: offset
+      desc: Delay offset time, ms
+      noArgs: false
+      required: false
+    - name: container-id
+      desc: Container id
+      noArgs: false
+      required: true
+    - name: image-repo
+      desc: Image repository
+      noArgs: false
+      required: false
+    - name: docker-endpoint
+      desc: Docker socket endpoint
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: drop
+    shortDesc: Drop experiment
+    longDesc: Drop network data
+    matchers:
+    - name: local-port
+      desc: Port for local service
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: Port for remote service
+      noArgs: false
+      required: false
+    flags:
+    - name: container-id
+      desc: Container id
+      noArgs: false
+      required: true
+    - name: image-repo
+      desc: Image repository
+      noArgs: false
+      required: false
+    - name: docker-endpoint
+      desc: Docker socket endpoint
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: dns
+    shortDesc: Dns experiment
+    longDesc: Dns experiment
+    flags:
+    - name: domain
+      desc: Domain name
+      noArgs: false
+      required: true
+    - name: ip
+      desc: Domain ip
+      noArgs: false
+      required: true
+    - name: container-id
+      desc: Container id
+      noArgs: false
+      required: true
+    - name: image-repo
+      desc: Image repository
+      noArgs: false
+      required: false
+    - name: docker-endpoint
+      desc: Docker socket endpoint
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: loss
+    shortDesc: Loss network package
+    longDesc: Loss network package
+    matchers:
+    - name: local-port
+      desc: 'Ports for local service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: 'Ports for remote service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: exclude-port
+      desc: 'Exclude local ports. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 22,8000. This flag
+        is invalid when --local-port or --remote-port is specified'
+      noArgs: false
+      required: false
+    - name: destination-ip
+      desc: destination ip. Support for using mask to specify the ip range, for example,
+        192.168.1.0/24. You can also use 192.168.1.1 or 192.168.1.1/32 to specify
+        it.
+      noArgs: false
+      required: false
+    - name: interface
+      desc: Network interface, for example, eth0
+      noArgs: false
+      required: true
+    flags:
+    - name: percent
+      desc: loss percent, [0, 100]
+      noArgs: false
+      required: true
+    - name: container-id
+      desc: Container id
+      noArgs: false
+      required: true
+    - name: image-repo
+      desc: Image repository
+      noArgs: false
+      required: false
+    - name: docker-endpoint
+      desc: Docker socket endpoint
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: docker
+- target: cpu
+  shortDesc: Cpu experiment
+  longDesc: Cpu experiment, for example full load
+  example: cpu fullload
+  actions:
+  - action: fullload
+    aliases: [fl, load]
+    shortDesc: cpu load
+    longDesc: cpu load
+    flags:
+    - name: cpu-count
+      desc: Cpu count
+      noArgs: false
+      required: false
+    - name: cpu-list
+      desc: CPUs in which to allow burning (0-3 or 1,3)
+      noArgs: false
+      required: false
+    - name: cpu-percent
+      desc: percent of burn CPU (0-100)
+      noArgs: false
+      required: false
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: node
+- target: network
+  shortDesc: Network experiment
+  longDesc: Network experiment
+  example: |-
+    network delay --interface eth0 --time 3000
+
+    # You can execute "blade query network interface" command to query the interfaces
+  actions:
+  - action: delay
+    shortDesc: Delay experiment
+    longDesc: Delay experiment
+    matchers:
+    - name: local-port
+      desc: 'Ports for local service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: 'Ports for remote service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: exclude-port
+      desc: 'Exclude local ports. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 22,8000. This flag
+        is invalid when --local-port or --remote-port is specified'
+      noArgs: false
+      required: false
+    - name: destination-ip
+      desc: destination ip. Support for using mask to specify the ip range, for example,
+        192.168.1.0/24. You can also use 192.168.1.1 or 192.168.1.1/32 to specify
+        it.
+      noArgs: false
+      required: false
+    - name: interface
+      desc: Network interface, for example, eth0
+      noArgs: false
+      required: true
+    flags:
+    - name: time
+      desc: Delay time, ms
+      noArgs: false
+      required: true
+    - name: offset
+      desc: Delay offset time, ms
+      noArgs: false
+      required: false
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: drop
+    shortDesc: Drop experiment
+    longDesc: Drop network data
+    matchers:
+    - name: local-port
+      desc: Port for local service
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: Port for remote service
+      noArgs: false
+      required: false
+    flags:
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: dns
+    shortDesc: Dns experiment
+    longDesc: Dns experiment
+    flags:
+    - name: domain
+      desc: Domain name
+      noArgs: false
+      required: true
+    - name: ip
+      desc: Domain ip
+      noArgs: false
+      required: true
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: loss
+    shortDesc: Loss network package
+    longDesc: Loss network package
+    matchers:
+    - name: local-port
+      desc: 'Ports for local service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: 'Ports for remote service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: exclude-port
+      desc: 'Exclude local ports. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 22,8000. This flag
+        is invalid when --local-port or --remote-port is specified'
+      noArgs: false
+      required: false
+    - name: destination-ip
+      desc: destination ip. Support for using mask to specify the ip range, for example,
+        192.168.1.0/24. You can also use 192.168.1.1 or 192.168.1.1/32 to specify
+        it.
+      noArgs: false
+      required: false
+    - name: interface
+      desc: Network interface, for example, eth0
+      noArgs: false
+      required: true
+    flags:
+    - name: percent
+      desc: loss percent, [0, 100]
+      noArgs: false
+      required: true
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: node
+- target: process
+  shortDesc: Process experiment
+  longDesc: Process experiment, for example, kill process
+  example: process kill --process tomcat
+  actions:
+  - action: kill
+    aliases: [k]
+    shortDesc: Kill process
+    longDesc: Kill process by process id or process name
+    matchers:
+    - name: process
+      desc: Process name
+      noArgs: false
+      required: false
+    - name: process-cmd
+      desc: Process name in command
+      noArgs: false
+      required: false
+    flags:
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: stop
+    aliases: [f]
+    shortDesc: process fake death
+    longDesc: process fake death by process id or process name
+    matchers:
+    - name: process
+      desc: Process name
+      noArgs: false
+      required: false
+    - name: process-cmd
+      desc: Process name in command
+      noArgs: false
+      required: false
+    flags:
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: node
+- target: pod
+  shortDesc: Pod experiments
+  longDesc: Pod experiments
+  example: ""
+  actions:
+  - action: delete
+    shortDesc: Delete pods
+    longDesc: Delete pods
+    flags:
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: namespaces
+      desc: Namespaces, such as default
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: evict-group
+      desc: Group key from labels
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: pod
+- target: network
+  shortDesc: Network experiment
+  longDesc: Network experiment
+  example: |-
+    network delay --interface eth0 --time 3000
+
+    # You can execute "blade query network interface" command to query the interfaces
+  actions:
+  - action: delay
+    shortDesc: Delay experiment
+    longDesc: Delay experiment
+    matchers:
+    - name: local-port
+      desc: 'Ports for local service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: 'Ports for remote service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: exclude-port
+      desc: 'Exclude local ports. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 22,8000. This flag
+        is invalid when --local-port or --remote-port is specified'
+      noArgs: false
+      required: false
+    - name: destination-ip
+      desc: destination ip. Support for using mask to specify the ip range, for example,
+        192.168.1.0/24. You can also use 192.168.1.1 or 192.168.1.1/32 to specify
+        it.
+      noArgs: false
+      required: false
+    - name: interface
+      desc: Network interface, for example, eth0
+      noArgs: false
+      required: true
+    flags:
+    - name: time
+      desc: Delay time, ms
+      noArgs: false
+      required: true
+    - name: offset
+      desc: Delay offset time, ms
+      noArgs: false
+      required: false
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: namespaces
+      desc: Namespaces, such as default
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: evict-group
+      desc: Group key from labels
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: drop
+    shortDesc: Drop experiment
+    longDesc: Drop network data
+    matchers:
+    - name: local-port
+      desc: Port for local service
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: Port for remote service
+      noArgs: false
+      required: false
+    flags:
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: namespaces
+      desc: Namespaces, such as default
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: evict-group
+      desc: Group key from labels
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: dns
+    shortDesc: Dns experiment
+    longDesc: Dns experiment
+    flags:
+    - name: domain
+      desc: Domain name
+      noArgs: false
+      required: true
+    - name: ip
+      desc: Domain ip
+      noArgs: false
+      required: true
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: namespaces
+      desc: Namespaces, such as default
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: evict-group
+      desc: Group key from labels
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  - action: loss
+    shortDesc: Loss network package
+    longDesc: Loss network package
+    matchers:
+    - name: local-port
+      desc: 'Ports for local service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: remote-port
+      desc: 'Ports for remote service. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 80,8000-8080'
+      noArgs: false
+      required: false
+    - name: exclude-port
+      desc: 'Exclude local ports. Support for configuring multiple ports, separated
+        by commas or connector representing ranges, for example: 22,8000. This flag
+        is invalid when --local-port or --remote-port is specified'
+      noArgs: false
+      required: false
+    - name: destination-ip
+      desc: destination ip. Support for using mask to specify the ip range, for example,
+        192.168.1.0/24. You can also use 192.168.1.1 or 192.168.1.1/32 to specify
+        it.
+      noArgs: false
+      required: false
+    - name: interface
+      desc: Network interface, for example, eth0
+      noArgs: false
+      required: true
+    flags:
+    - name: percent
+      desc: loss percent, [0, 100]
+      noArgs: false
+      required: true
+    - name: evict-count
+      desc: Affected count
+      noArgs: false
+      required: false
+    - name: evict-percent
+      desc: Affected percent, integer value without %
+      noArgs: false
+      required: false
+    - name: names
+      desc: Resource names, such as pod name
+      noArgs: false
+      required: false
+    - name: namespaces
+      desc: Namespaces, such as default
+      noArgs: false
+      required: false
+    - name: labels
+      desc: Label selector, such app=demo,name=consumer
+      noArgs: false
+      required: false
+    - name: evict-group
+      desc: Group key from labels
+      noArgs: false
+      required: false
+    - name: timeout
+      desc: set timeout for experiment
+      noArgs: false
+      required: false
+  scope: pod
+- target: cplus
+  shortDesc: c++ experiment
+  longDesc: c++ experiment for testing program delay, variable changed and method
+    return.
+  example: cplus delay --delayDuration 5 --breakLine tcp_server.cpp:39 --fileLocateAndName
+    /home/admin/socketServer/main --forkMode child --processName main --delayDuration
+    5 --initParams 9527 --libLoad /home/lib
+  actions:
+  - action: delay
+    shortDesc: delay time
+    longDesc: delay time...
+    matchers:
+    - name: breakLine
+      desc: Injection line in source code
+      noArgs: false
+      required: true
+    - name: fileLocateAndName
+      desc: Startup file location and name
+      noArgs: false
+      required: true
+    - name: initParams
+      desc: Initialization parameters for program startup (such as port number)
+      noArgs: false
+      required: true
+    - name: forkMode
+      desc: Fault injection into child or parent processes (sub process:child ; main
+        process:parent)
+      noArgs: false
+      required: true
+    - name: processName
+      desc: Application process name
+      noArgs: false
+      required: true
+    - name: libLoad
+      desc: If the class library needs to be loaded when the program starts, input
+        the class library address
+      noArgs: false
+      required: false
+    flags:
+    - name: delayDuration
+      desc: delay time
+      noArgs: false
+      required: true
+  - action: modify
+    shortDesc: Modify value of the variable
+    longDesc: Modify value of the variable in source code when program running
+    matchers:
+    - name: breakLine
+      desc: Injection line in source code
+      noArgs: false
+      required: true
+    - name: fileLocateAndName
+      desc: Startup file location and name
+      noArgs: false
+      required: true
+    - name: initParams
+      desc: Initialization parameters for program startup (such as port number)
+      noArgs: false
+      required: true
+    - name: forkMode
+      desc: Fault injection into child or parent processes (sub process:child ; main
+        process:parent)
+      noArgs: false
+      required: true
+    - name: processName
+      desc: Application process name
+      noArgs: false
+      required: true
+    - name: libLoad
+      desc: If the class library needs to be loaded when the program starts, input
+        the class library address
+      noArgs: false
+      required: false
+    flags:
+    - name: varaibleName
+      desc: The name of the modified variable
+      noArgs: false
+      required: true
+    - name: varaibleValue
+      desc: The value of the modified variable
+      noArgs: false
+      required: true
+  - action: return
+    shortDesc: Return the specify value
+    longDesc: Return the specify value
+    matchers:
+    - name: breakLine
+      desc: Injection line in source code
+      noArgs: false
+      required: true
+    - name: fileLocateAndName
+      desc: Startup file location and name
+      noArgs: false
+      required: true
+    - name: initParams
+      desc: Initialization parameters for program startup (such as port number)
+      noArgs: false
+      required: true
+    - name: forkMode
+      desc: Fault injection into child or parent processes (sub process:child ; main
+        process:parent)
+      noArgs: false
+      required: true
+    - name: processName
+      desc: Application process name
+      noArgs: false
+      required: true
+    - name: libLoad
+      desc: If the class library needs to be loaded when the program starts, input
+        the class library address
+      noArgs: false
+      required: false
+    flags:
+    - name: returnValue
+      desc: Value returned. If you want return null, set --value null
+      noArgs: false
+      required: true
+  scope: ""
+  prepare:
+    type: cplus
+    flags:
+    - name: port
+      desc: server's port to be opened
+      noArgs: false
+      required: true
+    - name: script-location
+      desc: injection script location
+      noArgs: false
+      required: true
+    - name: wait-time
+      desc: wait time for check status
+      noArgs: false
+      required: true
+    required: true

@@ -7,7 +7,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/chaosblade-io/chaosblade/transport"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
 )
 
@@ -42,7 +42,7 @@ func testQueryNetworkInterface(t *testing.T, command *cobra.Command, qnc *QueryN
 		t.Errorf("unexpected result: %s, expected no error", err)
 	}
 	// check print value
-	var response transport.Response
+	var response spec.Response
 	err = json.Unmarshal(buffer.Bytes(), &response)
 	if err != nil {
 		t.Errorf("unexpected result: %s, expected no error", err)
