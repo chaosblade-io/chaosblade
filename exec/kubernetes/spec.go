@@ -42,5 +42,5 @@ func (*CommandModelSpec) LongDesc() string {
 }
 
 func (*CommandModelSpec) Example() string {
-	return "k8s node-cpu load --cpu-percent 50 --selector app=demo --coverage—count 1 --kube-config config"
+	return "blade create k8s node-cpu fullload --names cn-hangzhou.192.168.0.205 --cpu-percent 80 --kubeconfig ~/.kube/config"
 }

@@ -84,5 +84,5 @@ func (dc *DestroyCommand) runDestroy(cmd *cobra.Command, args []string) error {
 }
 
 func destroyExample() string {
-	return `destroy 47cc0744f1bb`
+	return `blade destroy 47cc0744f1bb`
 }

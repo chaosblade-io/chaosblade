@@ -37,7 +37,7 @@ func Test_convertCommandModel(t *testing.T) {
 		},
 	}
 	for _, tt := range tests {
-		got := convertCommandModel(tt.input.action, tt.input.target, tt.input.rules)
+		got := spec.ConvertCommandsToExpModel(tt.input.action, tt.input.target, tt.input.rules)
 		if got.Target != tt.expect.Target {
 			t.Errorf("unexpected result: %v, expected: %v", got.Target, tt.expect.Target)
 		}

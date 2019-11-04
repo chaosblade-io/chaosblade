@@ -26,5 +26,5 @@ func (cc *CreateCommand) Init() {
 }
 
 func createExample() string {
-	return `create dubbo delay --time 3000 --offset 100 --service com.example.Service --consumer`
+	return `blade create cpu load --cpu-percent 60`
 }

@@ -88,6 +88,10 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 }
 
 func statusExample() string {
-	return `status cc015e9bd9c68406
-status --type create`
+	return `# Query by UID
+blade status cc015e9bd9c68406
+# Query chaos experiments
+blade status --type create
+# Query preparations
+blade status --type prepare`
 }
