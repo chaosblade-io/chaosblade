@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-
-	"github.com/chaosblade-io/chaosblade/data"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	neturl "net/url"
 	"strings"
+
 	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
+
+	"github.com/chaosblade-io/chaosblade/data"
 )
 
 const DefaultUri = "sandbox/default/module/http/chaosblade"

@@ -1,13 +1,14 @@
 package cmd
 
 import (
-	"github.com/spf13/cobra"
+	"context"
 	"fmt"
 	"strings"
-	"context"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/sirupsen/logrus"
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/spf13/cobra"
 )
 
 type StopServerCommand struct {

@@ -1,8 +1,9 @@
 package jvm
 
 import (
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"testing"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 func TestExecutor_createUrl(t *testing.T) {

@@ -1,12 +1,11 @@
 package cmd
 
 import (
-	"testing"
-
 	"bytes"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"testing"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"

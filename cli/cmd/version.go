@@ -1,8 +1,9 @@
 package cmd
 
 import (
-	"github.com/chaosblade-io/chaosblade/version"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade/version"
 )
 
 type VersionCommand struct {

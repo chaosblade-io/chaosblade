@@ -3,24 +3,25 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os/exec"
 	"path"
 	"strconv"
 	"sync"
 
-	specutil "github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/chaosblade-io/chaosblade/exec/cplus"
-	"github.com/chaosblade-io/chaosblade/exec/docker"
-	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	specutil "github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
-	"os/exec"
-	"github.com/chaosblade-io/chaosblade/version"
-	"github.com/chaosblade-io/chaosblade/exec/os"
+
+	"github.com/chaosblade-io/chaosblade/exec/cplus"
+	"github.com/chaosblade-io/chaosblade/exec/docker"
+	"github.com/chaosblade-io/chaosblade/exec/jvm"
 	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
+	"github.com/chaosblade-io/chaosblade/exec/os"
+	"github.com/chaosblade-io/chaosblade/version"
 )
 
 // ExpActionFlags is used to receive experiment action flags

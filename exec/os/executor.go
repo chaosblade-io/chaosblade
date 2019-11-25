@@ -1,11 +1,12 @@
 package os
 
 import (
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade-exec-os/exec/model"
 	"context"
 	"fmt"
+
+	"github.com/chaosblade-io/chaosblade-exec-os/exec/model"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 type Executor struct {

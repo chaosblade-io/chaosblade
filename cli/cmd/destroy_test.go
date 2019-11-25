@@ -1,9 +1,8 @@
 package cmd
 
 import (
-	"testing"
-
 	"reflect"
+	"testing"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )

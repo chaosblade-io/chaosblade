@@ -1,9 +1,10 @@
 package cmd
 
 import (
-	"github.com/spf13/cobra"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"fmt"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/spf13/cobra"
 )
 
 type ServerCommand struct {

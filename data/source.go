@@ -2,12 +2,13 @@ package data
 
 import (
 	"database/sql"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"path"
-	"github.com/sirupsen/logrus"
-	"sync"
-	_ "github.com/mattn/go-sqlite3"
 	"fmt"
+	"path"
+	"sync"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/sirupsen/logrus"
 )
 
 const dataFile = "chaosblade.dat"

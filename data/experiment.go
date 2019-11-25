@@ -1,9 +1,10 @@
 package data
 
 import (
-	"time"
 	"database/sql"
 	"fmt"
+	"time"
+
 	"github.com/sirupsen/logrus"
 )
 

@@ -1,12 +1,13 @@
 package main
 
 import (
-	"github.com/sirupsen/logrus"
+	"fmt"
 	os2 "os"
 	"path"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"fmt"
+	"github.com/sirupsen/logrus"
 )
 
 var version = "0.4.0"

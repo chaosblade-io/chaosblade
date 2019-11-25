@@ -3,8 +3,9 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/chaosblade-io/chaosblade/exec/jvm"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade/exec/jvm"
 )
 
 type QueryJvmCommand struct {

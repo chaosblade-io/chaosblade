@@ -2,9 +2,10 @@ package data
 
 import (
 	"database/sql"
-	"time"
-	"github.com/sirupsen/logrus"
 	"fmt"
+	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 type PreparationRecord struct {

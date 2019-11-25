@@ -5,11 +5,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chaosblade-io/chaosblade/data"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 
-	"github.com/spf13/cobra"
+	"github.com/chaosblade-io/chaosblade/data"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/spf13/cobra"
 )
 
 // Command is cli command interface

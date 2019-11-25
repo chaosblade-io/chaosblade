@@ -3,14 +3,15 @@ package jvm
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
-	"strconv"
+
+	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 // attach sandbox to java process

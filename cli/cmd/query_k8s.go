@@ -1,9 +1,11 @@
 package cmd
 
 import (
-	"github.com/spf13/cobra"
-	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
 	"fmt"
+
+	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
 )
 
 type QueryK8sCommand struct {

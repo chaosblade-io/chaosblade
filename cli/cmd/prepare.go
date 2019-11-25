@@ -4,11 +4,12 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/chaosblade-io/chaosblade/data"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade/data"
 )
 
 const (

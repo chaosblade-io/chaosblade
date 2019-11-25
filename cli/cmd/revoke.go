@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/chaosblade-io/chaosblade/exec/cplus"
-	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+
+	"github.com/chaosblade-io/chaosblade/exec/cplus"
+	"github.com/chaosblade-io/chaosblade/exec/jvm"
 )
 
 type RevokeCommand struct {
