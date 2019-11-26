@@ -19,7 +19,7 @@ func Test_convertCommandModel(t *testing.T) {
 		expect expect
 	}{
 		{
-			input{"network delay", "docker", "--time 3000 --interface eth0"},
+			input{"network delay", "docker", "--time=3000 --interface=eth0"},
 			expect{&spec.ExpModel{
 				Target:      "docker",
 				ActionName:  "network delay",
@@ -27,7 +27,7 @@ func Test_convertCommandModel(t *testing.T) {
 			}},
 		},
 		{
-			input{"delay", "network", "--time 3000 --interface eth0"},
+			input{"delay", "network", "--time=3000 --interface=eth0"},
 			expect{&spec.ExpModel{
 				Target:      "network",
 				ActionName:  "delay",
@@ -38,13 +38,13 @@ func Test_convertCommandModel(t *testing.T) {
 	for _, tt := range tests {
 		got := spec.ConvertCommandsToExpModel(tt.input.action, tt.input.target, tt.input.rules)
 		if got.Target != tt.expect.Target {
-			t.Errorf("unexpected result: %v, expected: %v", got.Target, tt.expect.Target)
+			t.Errorf("unexpected target result: %v, expected: %v", got.Target, tt.expect.Target)
 		}
 		if got.ActionName != tt.expect.ActionName {
-			t.Errorf("unexpected result: %v, expected: %v", got.ActionName, tt.expect.ActionName)
+			t.Errorf("unexpected action result: %v, expected: %v", got.ActionName, tt.expect.ActionName)
 		}
 		if !reflect.DeepEqual(got.ActionFlags, tt.expect.ActionFlags) {
-			t.Errorf("unexpected result: %v, expected: %v", got.ActionFlags, tt.expect.ActionFlags)
+			t.Errorf("unexpected flag result: %v, expected: %v", got.ActionFlags, tt.expect.ActionFlags)
 		}
 	}
 }

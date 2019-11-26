@@ -2,11 +2,11 @@ sudo: required
 
 dist: xenial
 
-services: 
+services:
     - docker
 
 env:
-    - CHANGE_MINIKUBE_NONE_USER=true
+    - CHANGE_MINIKUBE_NONE_USER=true GO111MODULE=on
 
 language: go
 
@@ -21,12 +21,12 @@ before_script:
     #- minikube update-context
     #- JSONPATH='{range .items[*]}{@.metadata.name}:{range @.status.conditions[*]}{@.type}={@.status};{end}{end}'; until kubectl get nodes -o jsonpath="$JSONPATH" 2>&1 | grep -q "Ready=True"; do sleep 1; done
     # a tip of using forked package import in Golang
-    - if [ ! -d $GOPATH/src/github.com/chaosblade-io/chaosblade ]; then 
-        mkdir -p $GOPATH/src/github.com/chaosblade-io/chaosblade; 
-        cp -r $TRAVIS_BUILD_DIR/. $GOPATH/src/github.com/chaosblade-io/chaosblade; 
-        cd $GOPATH/src/github.com/chaosblade-io/chaosblade; 
+    - if [ ! -d $GOPATH/src/github.com/chaosblade-io/chaosblade ]; then
+        mkdir -p $GOPATH/src/github.com/chaosblade-io/chaosblade;
+        cp -r $TRAVIS_BUILD_DIR/. $GOPATH/src/github.com/chaosblade-io/chaosblade;
+        cd $GOPATH/src/github.com/chaosblade-io/chaosblade;
       fi
-    
+
 script:
     #- kubectl cluster-info
     - go test -race -coverprofile=coverage.txt -covermode=atomic ./...

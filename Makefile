@@ -7,9 +7,10 @@ BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
 BLADE_SRC_ROOT=`pwd`
 
 GO_ENV=CGO_ENABLED=1
+GO_MODULE=GO111MODULE=on
 VERSION_PKG=github.com/chaosblade-io/chaosblade/version
 GO_FLAGS=-ldflags="-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`'"
-GO=env $(GO_ENV) go
+GO=env $(GO_ENV) $(GO_MODULE) go
 
 UNAME := $(shell uname)
 
@@ -24,9 +25,21 @@ BUILD_TARGET_PKG_FILE_PATH=$(BUILD_TARGET)/$(BUILD_TARGET_TAR_NAME)
 BUILD_IMAGE_PATH=build/image/blade
 # cache downloaded file
 BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
+
+# chaosblade-exec-os
+BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
+BLADE_EXEC_OS_BRANCH=master
+
+# chaosblade-exec-docker
+BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
+BLADE_EXEC_DOCKER_BRANCH=master
+
+# chaosblade-exec-kubernetes
+BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
+BLADE_OPERATOR_BRANCH=master
+
 # oss url
 BLADE_OSS_URL=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/release
-
 # used to transform java class
 JVM_SANDBOX_VERSION=1.2.0
 JVM_SANDBOX_NAME=sandbox-$(JVM_SANDBOX_VERSION)-bin.zip
@@ -38,8 +51,8 @@ BLADE_JAVA_AGENT_NAME=chaosblade-java-agent-$(BLADE_JAVA_AGENT_VERSION).jar
 BLADE_JAVA_AGENT_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_JAVA_AGENT_NAME)
 BLADE_JAVA_AGENT_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_AGENT_NAME)
 # used to invoke by chaosblade
-BLADE_JAVA_AGENT_SPEC=jvm.spec.yaml
-BLADE_JAVA_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/jvm.spec.yaml
+BLADE_JAVA_AGENT_SPEC=chaosblade-jvm-spec-$(BLADE_VERSION).yaml
+BLADE_JAVA_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_AGENT_SPEC)
 BLADE_JAVA_AGENT_SPEC_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_JAVA_AGENT_SPEC)
 # used to java agent attachp
 BLADE_JAVA_TOOLS_JAR_NAME=tools.jar
@@ -71,7 +84,7 @@ ifeq ($(GOOS), linux)
 endif
 
 # build chaosblade package and image
-build: pre_build build_cli
+build: pre_build build_cli build_os build_docker build_kubernetes
 	# tar package
 	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
 
@@ -79,6 +92,34 @@ build: pre_build build_cli
 build_cli:
 	# build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
+
+# build os
+build_os:
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
+	git clone -b $(BLADE_EXEC_OS_BRANCH) $(BLADE_EXEC_OS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-os
+else
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
+endif
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
+	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
+
+build_docker:
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-docker, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-docker))
+	git clone -b $(BLADE_EXEC_DOCKER_BRANCH) $(BLADE_EXEC_DOCKER_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-docker
+else
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-docker pull origin $(BLADE_EXEC_DOCKER_BRANCH)
+endif
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-docker
+	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-docker/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
+
+build_kubernetes:
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-operator, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-operator))
+	git clone -b $(BLADE_OPERATOR_BRANCH) $(BLADE_OPERATOR_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-operator
+else
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-operator pull origin $(BLADE_OPERATOR_BRANCH)
+endif
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-operator
+	cp $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 
 # create dir or download necessary file
 pre_build:mkdir_build_target download_sandbox download_blade_java_agent download_cplus_agent
@@ -137,17 +178,15 @@ build_linux:
 		-w /go/src/github.com/chaosblade-io/chaosblade \
 		chaosblade-build-musl:latest
 
-# build chaosblade image for chaos TODO
+# build chaosblade image for chaos
 build_image:
-#	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
-
+	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 	cp -R $(BUILD_TARGET_PKG_NAME) $(BUILD_IMAGE_PATH)
 	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_IMAGE_PATH)
 	docker build -f $(BUILD_IMAGE_PATH)/Dockerfile \
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
 		-t chaosblade-tool:$(BLADE_VERSION) \
 		$(BUILD_IMAGE_PATH)
-
 	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 
 # build docker image with multi-stage builds
@@ -158,9 +197,9 @@ docker_image: clean
 
 # test
 test:
-	go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+	$(GO) test -race -coverprofile=coverage.txt -covermode=atomic ./...
 # clean all build result
 clean:
-	go clean ./...
+	$(GO) clean ./...
 	rm -rf $(BUILD_TARGET)
 	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)

@@ -3,19 +3,20 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
 )
 
 type DestroyCommand struct {
 	baseCommand
-	exp *expCommand
+	*baseExpCommandService
 }
 
 func (dc *DestroyCommand) Init() {
-
 	dc.command = &cobra.Command{
 		Use:     "destroy UID",
 		Short:   "Destroy a chaos experiment",
@@ -27,6 +28,7 @@ func (dc *DestroyCommand) Init() {
 			return dc.runDestroy(cmd, args)
 		},
 	}
+	dc.baseExpCommandService = newBaseExpCommandService(dc)
 }
 
 // runDestroy
@@ -58,7 +60,7 @@ func (dc *DestroyCommand) runDestroy(cmd *cobra.Command, args []string) error {
 			actionTargetCommand = ""
 		}
 	}
-	executor := dc.exp.getExecutor(firstCommand, actionTargetCommand, actionCommand)
+	executor := dc.GetExecutor(firstCommand, actionTargetCommand, actionCommand)
 	if executor == nil {
 		return spec.ReturnFail(spec.Code[spec.ServerError],
 			fmt.Sprintf("can't find executor for %s, %s", model.Command, model.SubCommand))
@@ -80,6 +82,52 @@ func (dc *DestroyCommand) runDestroy(cmd *cobra.Command, args []string) error {
 	checkError(GetDS().UpdateExperimentModelByUid(uid, "Destroyed", ""))
 	result := fmt.Sprintf("command: %s %s %s", model.Command, model.SubCommand, model.Flag)
 	cmd.Println(spec.ReturnSuccess(result).Print())
+	return nil
+}
+
+func (dc *DestroyCommand) bindFlagsFunction() func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
+	return func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
+		// set action flags
+		for _, flag := range specFlags {
+			flagName := flag.FlagName()
+			flagDesc := flag.FlagDesc()
+			if !flag.FlagRequiredWhenDestroyed() {
+				continue
+			}
+			flagDesc = fmt.Sprintf("%s (required)", flagDesc)
+			if flag.FlagNoArgs() {
+				var key bool
+				cmd.PersistentFlags().BoolVar(&key, flagName, false, flagDesc)
+				commandFlags[flagName] = func() string {
+					return strconv.FormatBool(key)
+				}
+			} else {
+				var key string
+				cmd.PersistentFlags().StringVar(&key, flagName, "", flagDesc)
+				commandFlags[flagName] = func() string {
+					return key
+				}
+			}
+			cmd.MarkPersistentFlagRequired(flagName)
+		}
+	}
+}
+
+func (dc *DestroyCommand) actionRunEFunc(target, scope string, actionCommand *actionCommand, actionCommandSpec spec.ExpActionCommandSpec) func(cmd *cobra.Command, args []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
+		// execute experiment
+		executor := actionCommandSpec.Executor()
+		executor.SetChannel(channel.NewLocalChannel())
+		// set destroy flag
+		ctx := spec.SetDestroyFlag(context.Background(), spec.UnknownUid)
+		// execute
+		response := executor.Exec(spec.UnknownUid, ctx, expModel)
+		return response
+	}
+}
+
+func (dc *DestroyCommand) actionPostRunEFunc(actionCommand *actionCommand) func(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
