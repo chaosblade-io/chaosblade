@@ -20,15 +20,12 @@ func CmdInit() *baseCommand {
 	createCommand := &CreateCommand{}
 	baseCmd.AddCommand(createCommand)
 
-	// add exp command
-	expCommand := NewExpCommand()
-	expCommand.AddCommandTo(createCommand)
-
 	// add destroy command
-	baseCmd.AddCommand(&DestroyCommand{exp: expCommand})
+	destroyCommand := &DestroyCommand{}
+	baseCmd.AddCommand(destroyCommand)
 
 	// add status command
-	baseCmd.AddCommand(&StatusCommand{exp: expCommand})
+	baseCmd.AddCommand(&StatusCommand{})
 
 	// add query command
 	queryCommand := &QueryCommand{}

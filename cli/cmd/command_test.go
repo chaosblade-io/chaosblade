@@ -3,6 +3,8 @@ package cmd
 import (
 	"testing"
 
+	"github.com/spf13/cobra"
+
 	"github.com/chaosblade-io/chaosblade/data"
 )
 
@@ -12,37 +14,49 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 	bc := &baseCommand{}
 
 	type input struct {
-		commandPath, flag string
+		commandPath string
+		command     *cobra.Command
+		target      string
+		scope       string
+		action      string
 	}
 	type expect struct {
 		model *data.ExperimentModel
 		err   bool
 	}
+	delayCommand := &cobra.Command{Use: "delay"}
+	var time, inf string
+	delayCommand.PersistentFlags().StringVar(&time, "time", "3000", "")
+	delayCommand.PersistentFlags().StringVar(&inf, "interface", "eth0", "")
+	delayCommand.PersistentFlags().SortFlags = true
+	delayCommand.ParseFlags([]string{})
+
 	tests := []struct {
 		input  input
 		expect expect
 	}{
 		{
-			input{"blade create docker network delay", "--time 3000 --interface eth0"},
+			input{"blade create docker network delay", delayCommand, "docker", "docker", "delay"},
 			expect{&data.ExperimentModel{
 				Command:    "docker",
 				SubCommand: "network delay",
-				Flag:       "--time 3000 --interface eth0",
+				Flag:       " --interface=eth0 --time=3000",
 				Status:     "Created",
 			}, false},
 		},
 		{
-			input{"blade create network delay", "--time 3000 --interface eth0"},
+			input{"blade create network delay", delayCommand, "network", "", "delay"},
 			expect{&data.ExperimentModel{
 				Command:    "network",
 				SubCommand: "delay",
-				Flag:       "--time 3000 --interface eth0",
+				Flag:       " --interface=eth0 --time=3000",
 				Status:     "Created",
 			}, false},
 		},
 	}
 	for _, tt := range tests {
-		got, err := bc.recordExpModel(tt.input.commandPath, tt.input.flag)
+		got, err := bc.recordExpModel(tt.input.commandPath,
+			createExpModel(tt.input.target, tt.input.scope, tt.input.action, tt.input.command))
 		if (err != nil) != tt.expect.err {
 			t.Errorf("unexpected result: %t, expected: %t", err != nil, tt.expect.err)
 		}
@@ -53,16 +67,16 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 
 func validateExperimentModel(result *data.ExperimentModel, expect *data.ExperimentModel, t *testing.T) {
 	if result.Command != expect.Command {
-		t.Errorf("unexpected result: %v, expected: %v", result.Command, expect.Command)
+		t.Errorf("unexpected command result: %v, expected: %v", result.Command, expect.Command)
 	}
 	if result.SubCommand != expect.SubCommand {
-		t.Errorf("unexpected result: %v, expected: %v", result.SubCommand, expect.SubCommand)
+		t.Errorf("unexpected subcommand result: %v, expected: %v", result.SubCommand, expect.SubCommand)
 	}
 	if result.Flag != expect.Flag {
-		t.Errorf("unexpected result: %v, expected: %v", result.Flag, expect.Flag)
+		t.Errorf("unexpected flag result: %v, expected: %v", result.Flag, expect.Flag)
 	}
 	if result.Status != expect.Status {
-		t.Errorf("unexpected result: %v, expected: %v", result.Status, expect.Status)
+		t.Errorf("unexpected status result: %v, expected: %v", result.Status, expect.Status)
 	}
 }
 

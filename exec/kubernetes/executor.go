@@ -107,6 +107,11 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 	var completed bool
 	var operation string
 	if suid, ok := spec.IsDestroy(ctx); ok {
+		if suid == spec.UnknownUid {
+			errMsg := "does not support destroy k8s experiments without uid"
+			return spec.ReturnFailWitResult(spec.Code[spec.IllegalCommand], errMsg,
+				CreateConfirmFailedStatusResult(suid, errMsg))
+		}
 		operation = QueryDestroy
 		response, completed = e.destroy(client, suid, config)
 	} else {

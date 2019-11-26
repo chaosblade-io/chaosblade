@@ -12,7 +12,6 @@ import (
 
 type StatusCommand struct {
 	baseCommand
-	exp         *expCommand
 	commandType string
 	target      string
 	uid         string

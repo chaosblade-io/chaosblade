@@ -43,10 +43,14 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.ServerError], "cannot get port from local, please execute prepare command first")
 	}
-	if _, ok := spec.IsDestroy(ctx); ok {
-		url_ = e.destroyUrl(port, uid)
+	if suid, ok := spec.IsDestroy(ctx); ok {
+		if suid == spec.UnknownUid {
+			url_ = e.sandboxUrl(port, e.getDestroyRequestPathWithoutUid(model.Target, model.ActionName))
+		} else {
+			url_ = e.sandboxUrl(port, e.getDestroyRequestPathWithUid(uid))
+		}
 	} else {
-		url_ = e.createUrl(port, uid, model)
+		url_ = e.sandboxUrl(port, e.getCreateRequestPath(uid, model))
 	}
 	result, err, code := util.Curl(url_)
 	if err != nil {
@@ -60,9 +64,12 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	return &resp
 }
 
-func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) string {
-	url := fmt.Sprintf("http://%s:%s/%s/create?target=%s&suid=%s&action=%s",
-		"127.0.0.1", port, e.Uri, model.Target, suid, model.ActionName)
+func (e *Executor) sandboxUrl(port, requestPath string) string {
+	return fmt.Sprintf("http://%s:%s/%s/%s", "127.0.0.1", port, e.Uri, requestPath)
+}
+
+func (e *Executor) getCreateRequestPath(suid string, model *spec.ExpModel) string {
+	url := fmt.Sprintf("create?target=%s&suid=%s&action=%s", model.Target, suid, model.ActionName)
 	for k, v := range model.ActionFlags {
 		if v == "" || v == "false" {
 			continue
@@ -76,10 +83,16 @@ func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) string {
 	return url
 }
 
-func (e *Executor) destroyUrl(port, uid string) string {
-	url := fmt.Sprintf("http://%s:%s/%s/destroy?suid=%s",
-		"127.0.0.1", port, e.Uri, uid)
-	return url
+func (e *Executor) getDestroyRequestPathWithUid(uid string) string {
+	return fmt.Sprintf("destroy?suid=%s", uid)
+}
+
+func (e *Executor) getDestroyRequestPathWithoutUid(target string, action string) string {
+	return fmt.Sprintf("destroy?target=%s&action=%s", target, action)
+}
+
+func (e *Executor) getStatusRequestPath(uid string) string {
+	return fmt.Sprintf("status?suid=%s", uid)
 }
 
 func (e *Executor) QueryStatus(uid string) *spec.Response {
@@ -97,7 +110,7 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
-	url := e.statusUrl(port, uid)
+	url := e.sandboxUrl(port, e.getStatusRequestPath(uid))
 	result, err, code := util.Curl(url)
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
@@ -111,10 +124,6 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 	var resp spec.Response
 	json.Unmarshal([]byte(result), &resp)
 	return &resp
-}
-
-func (e *Executor) statusUrl(port, uid string) string {
-	return fmt.Sprintf("http://%s:%s/%s/status?suid=%s", "127.0.0.1", port, e.Uri, uid)
 }
 
 var db = data.GetSource()
