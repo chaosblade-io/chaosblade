@@ -30,7 +30,6 @@ before_script:
 script:
     #- kubectl cluster-info
     - go test -race -coverprofile=coverage.txt -covermode=atomic ./...
-    - make
 
 after_success:
   - bash <(curl -s https://codecov.io/bash)
