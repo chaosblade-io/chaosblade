@@ -19,6 +19,7 @@ const startServerKey = "blade server start --nohup"
 
 type StartServerCommand struct {
 	baseCommand
+	ip    string
 	port  string
 	nohup bool
 }
@@ -34,6 +35,7 @@ func (ssc *StartServerCommand) Init() {
 		},
 		Example: startServerExample(),
 	}
+	ssc.command.Flags().StringVarP(&ssc.ip, "ip", "i", "", "service ip address, default value is *")
 	ssc.command.Flags().StringVarP(&ssc.port, "port", "p", "9526", "service port")
 	ssc.command.Flags().BoolVarP(&ssc.nohup, "nohup", "n", false, "used by internal")
 }
@@ -54,7 +56,7 @@ func (ssc *StartServerCommand) run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	cmd.Printf("success, listening on %s", ssc.port)
+	cmd.Println(fmt.Sprintf("success, listening on %s:%s", ssc.ip, ssc.port))
 	return nil
 }
 
@@ -63,7 +65,11 @@ func (ssc *StartServerCommand) start() error {
 	// use nohup to invoke blade server start command
 	cl := channel.NewLocalChannel()
 	bladeBin := path.Join(util.GetProgramPath(), "blade")
-	response := cl.Run(context.TODO(), "nohup", fmt.Sprintf("%s server start --nohup --port %s > /dev/null 2>&1 &", bladeBin, ssc.port))
+	args := fmt.Sprintf("%s server start --nohup --port %s", bladeBin, ssc.port)
+	if ssc.ip != "" {
+		args = fmt.Sprintf("%s --ip %s", args, ssc.ip)
+	}
+	response := cl.Run(context.TODO(), "nohup", fmt.Sprintf("%s > /dev/null 2>&1 &", args))
 	if !response.Success {
 		return response
 	}
@@ -88,14 +94,14 @@ func (ssc *StartServerCommand) start() error {
 		}
 		return spec.ReturnFail(spec.Code[spec.ServerError], response.Result.(string))
 	}
-	logrus.Infof("start blade server success, listen on %s", ssc.port)
+	logrus.Infof("start blade server success, listen on %s:%s", ssc.ip, ssc.port)
 	return nil
 }
 
 // start0 starts web service
 func (ssc *StartServerCommand) start0() {
 	go func() {
-		err := http.ListenAndServe(":"+ssc.port, nil)
+		err := http.ListenAndServe(ssc.ip+":"+ssc.port, nil)
 		if err != nil {
 			logrus.Errorf("start blade server error, %v", err)
 			os.Exit(1)
