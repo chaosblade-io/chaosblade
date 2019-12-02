@@ -9,6 +9,7 @@ require (
 	github.com/chaosblade-io/chaosblade-spec-go v0.0.2-0.20191128032435-a99b601f1c34
 	github.com/googleapis/gnostic v0.3.1 // indirect
 	github.com/mattn/go-sqlite3 v1.10.1-0.20190217174029-ad30583d8387
+	github.com/shirou/gopsutil v2.19.9+incompatible
 	github.com/sirupsen/logrus v1.4.2
 	github.com/spf13/cobra v0.0.4-0.20190109003409-7547e83b2d85
 	github.com/spf13/pflag v1.0.4-0.20181223182923-24fa6976df40

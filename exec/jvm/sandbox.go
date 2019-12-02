@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	osuser "os/user"
 	"path"
 	"strconv"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	"github.com/shirou/gopsutil/process"
+	"github.com/sirupsen/logrus"
 )
 
 // attach sandbox to java process
@@ -65,35 +68,47 @@ func active(port string) *spec.Response {
 
 // attach java agent to application process
 func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
-	if javaHome == "" {
-		javaHome = os.Getenv("JAVA_HOME")
-	}
-	if javaHome == "" {
-		psArgs := specchannel.GetPsArgs()
-		response := channel.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}' | sed 's/\/bin\/java//g'`,
-			psArgs, pid))
-		if response.Success {
-			javaHome = strings.TrimSpace(response.Result.(string))
-		}
-	}
-	if javaHome == "" {
-		return spec.ReturnFail(spec.Code[spec.EnvironmentError], "JAVA_HOME env not found"), ""
-	}
-	user, err := specchannel.GetPidUser(pid)
+	username, err := getUsername(pid)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.GetProcessError], err.Error()), user
+		return spec.ReturnFail(spec.Code[spec.StatusError],
+			fmt.Sprintf("get username failed by %s pid, %v", pid, err)), ""
 	}
-	toolsJar := path.Join(util.GetBinPath(), "tools.jar")
-	originalJar := path.Join(javaHome, "lib/tools.jar")
-	if util.IsExist(originalJar) {
-		toolsJar = originalJar
+	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, ctx, pid)
+	toolsJar := getToolJar(javaHome)
+	token, err := getSandboxToken(ctx)
+	if err != nil {
+		return spec.ReturnFail(spec.Code[spec.ServerError],
+			fmt.Sprintf("create sandbox token failed, %v", err)), username
 	}
-	// create sandbox token
-	response := channel.Run(ctx, "date", "| head | cksum | sed 's/ //g'")
+	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid)
+	currUser, err := osuser.Current()
+	if err != nil {
+		logrus.Warnf("get current user info failed, %v", err)
+	}
+	var response *spec.Response
+	if currUser != nil && (currUser.Username == username) {
+		response = channel.Run(ctx, javaBin, javaArgs)
+	} else {
+		if currUser != nil {
+			logrus.Debugf("current user name is %s, not equal %s, so use sudo command to execute",
+				currUser.Username, username)
+		}
+		response = channel.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", username, javaBin, javaArgs))
+	}
 	if !response.Success {
-		return response, user
+		return response, username
 	}
-	token := strings.TrimSpace(response.Result.(string))
+	response = channel.Run(ctx, "grep", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
+		token, getSandboxTokenFile(username), DefaultNamespace))
+	// if attach successfully, the sandbox-agent.jar will write token to local file
+	if !response.Success {
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+			fmt.Sprintf("attach JVM %s failed, loss response; %s", pid, response.Err)), username
+	}
+	return response, username
+}
+
+func getAttachJvmOpts(toolsJar string, token string, port string, pid string) string {
 	jvmOpts := fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s", toolsJar)
 	sandboxHome := path.Join(util.GetLibHome(), "sandbox")
 	sandboxLibPath := path.Join(sandboxHome, "lib")
@@ -101,19 +116,58 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 		sandboxHome, token, "127.0.0.1", port, DefaultNamespace)
 	javaArgs := fmt.Sprintf(`%s -jar %s/sandbox-core.jar %s "%s/sandbox-agent.jar" "%s"`,
 		jvmOpts, sandboxLibPath, pid, sandboxLibPath, sandboxAttachArgs)
-	javaBin := path.Join(javaHome, "bin/java")
-	response = channel.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", user, javaBin, javaArgs))
+	return javaArgs
+}
+
+func getSandboxToken(ctx context.Context) (string, error) {
+	// create sandbox token
+	response := channel.Run(ctx, "date", "| head | cksum | sed 's/ //g'")
 	if !response.Success {
-		return response, user
+		return "", fmt.Errorf(response.Err)
 	}
-	response = channel.Run(ctx, "grep", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
-		token, getSandboxTokenFile(user), DefaultNamespace))
-	// if attach successfully, the sandbox-agent.jar will write token to local file
-	if !response.Success {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
-			fmt.Sprintf("attach JVM %s failed, loss response; %s", pid, response.Err)), user
+	token := strings.TrimSpace(response.Result.(string))
+	return token, nil
+}
+
+func getToolJar(javaHome string) string {
+	toolsJar := path.Join(util.GetBinPath(), "tools.jar")
+	originalJar := path.Join(javaHome, "lib/tools.jar")
+	if util.IsExist(originalJar) {
+		toolsJar = originalJar
 	}
-	return response, user
+	return toolsJar
+}
+
+func getUsername(pid string) (string, error) {
+	p, err := strconv.Atoi(pid)
+	if err != nil {
+		return "", err
+	}
+	javaProcess, err := process.NewProcess(int32(p))
+	if err != nil {
+		return "", err
+	}
+	return javaProcess.Username()
+}
+
+func getJavaBinAndJavaHome(javaHome string, ctx context.Context, pid string) (string, string) {
+	javaBin := "java"
+	if javaHome == "" {
+		javaHome = os.Getenv("JAVA_HOME")
+		javaBin = path.Join(javaHome, "bin/java")
+	}
+	if javaHome == "" {
+		psArgs := specchannel.GetPsArgs()
+		response := channel.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}'`,
+			psArgs, pid))
+		if response.Success {
+			javaBin = strings.TrimSpace(response.Result.(string))
+		}
+		if strings.HasPrefix(javaBin, "/bin/java") {
+			javaHome = javaBin[:len(javaBin)-9]
+		}
+	}
+	return javaBin, javaHome
 }
 
 func Detach(port string) *spec.Response {
