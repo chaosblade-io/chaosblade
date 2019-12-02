@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -72,12 +73,37 @@ func validateExperimentModel(result *data.ExperimentModel, expect *data.Experime
 	if result.SubCommand != expect.SubCommand {
 		t.Errorf("unexpected subcommand result: %v, expected: %v", result.SubCommand, expect.SubCommand)
 	}
-	if result.Flag != expect.Flag {
+	if !compareFlags(result.Flag, expect.Flag) {
 		t.Errorf("unexpected flag result: %v, expected: %v", result.Flag, expect.Flag)
 	}
 	if result.Status != expect.Status {
 		t.Errorf("unexpected status result: %v, expected: %v", result.Status, expect.Status)
 	}
+}
+
+func compareFlags(actual, expect string) bool {
+	actualFlags := covertFlagToMap(actual)
+	expectFlags := covertFlagToMap(expect)
+
+	if len(actualFlags) != len(expectFlags) {
+		return false
+	}
+	for key := range actualFlags {
+		if _, ok := expectFlags[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func covertFlagToMap(flagStr string) map[string]string {
+	flags := strings.Split(flagStr, " ")
+	result := make(map[string]string, 0)
+	for _, flag := range flags {
+		f := strings.TrimSpace(flag)
+		result[f] = ""
+	}
+	return result
 }
 
 func Test_parseCommandPath(t *testing.T) {
