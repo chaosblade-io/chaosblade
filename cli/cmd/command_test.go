@@ -201,10 +201,6 @@ func (*MockSource) QueryRunningPreByTypeAndProcess(programType string, processNa
 	return &data.PreparationRecord{}, nil
 }
 
-func (*MockSource) ListPreparationRecords() ([]*data.PreparationRecord, error) {
-	return make([]*data.PreparationRecord, 0), nil
-}
-
 func (*MockSource) UpdatePreparationRecordByUid(uid, status, errMsg string) error {
 	return nil
 }
@@ -215,4 +211,8 @@ func (*MockSource) UpdatePreparationPortByUid(uid, port string) error {
 
 func (*MockSource) UpdatePreparationPidByUid(uid, pid string) error {
 	return nil
+}
+
+func (*MockSource) QueryPreparationRecords(target, status, limit string, asc bool) ([]*data.PreparationRecord, error) {
+	return make([]*data.PreparationRecord, 0), nil
 }

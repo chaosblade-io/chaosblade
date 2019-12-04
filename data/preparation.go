@@ -49,6 +49,7 @@ type PreparationSource interface {
 	// UpdatePreparationPidByUid
 	UpdatePreparationPidByUid(uid, pid string) error
 
+	// QueryPreparationRecords
 	QueryPreparationRecords(target, status, limit string, asc bool) ([]*PreparationRecord, error)
 }
 
