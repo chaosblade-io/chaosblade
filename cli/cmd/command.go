@@ -79,7 +79,7 @@ func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpMode
 		Command:    command,
 		SubCommand: subCommand,
 		Flag:       flagsInline,
-		Status:     "Created",
+		Status:     Created,
 		Error:      "",
 		CreateTime: time,
 		UpdateTime: time,

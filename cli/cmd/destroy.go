@@ -41,7 +41,7 @@ func (dc *DestroyCommand) runDestroy(cmd *cobra.Command, args []string) error {
 	if model == nil {
 		return spec.Return(spec.Code[spec.DataNotFound])
 	}
-	if model.Status == "Destroyed" {
+	if model.Status == Destroyed {
 		result := fmt.Sprintf("command: %s %s %s, destroy time: %s",
 			model.Command, model.SubCommand, model.Flag, model.UpdateTime)
 		cmd.Println(spec.ReturnSuccess(result).Print())
@@ -79,7 +79,7 @@ func (dc *DestroyCommand) runDestroy(cmd *cobra.Command, args []string) error {
 		return response
 	}
 	// return result
-	checkError(GetDS().UpdateExperimentModelByUid(uid, "Destroyed", ""))
+	checkError(GetDS().UpdateExperimentModelByUid(uid, Destroyed, ""))
 	result := fmt.Sprintf("command: %s %s %s", model.Command, model.SubCommand, model.Flag)
 	cmd.Println(spec.ReturnSuccess(result).Print())
 	return nil

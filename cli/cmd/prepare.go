@@ -55,7 +55,7 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 		Process:     processName,
 		Port:        port,
 		Pid:         processId,
-		Status:      "Created",
+		Status:      Created,
 		Error:       "",
 		CreateTime:  time.Now().Format(time.RFC3339Nano),
 		UpdateTime:  time.Now().Format(time.RFC3339Nano),
@@ -70,10 +70,10 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 func handlePrepareResponse(uid string, cmd *cobra.Command, response *spec.Response) error {
 	response.Result = uid
 	if !response.Success {
-		GetDS().UpdatePreparationRecordByUid(uid, "Error", response.Err)
+		GetDS().UpdatePreparationRecordByUid(uid, Error, response.Err)
 		return response
 	}
-	err := GetDS().UpdatePreparationRecordByUid(uid, "Running", "")
+	err := GetDS().UpdatePreparationRecordByUid(uid, Running, "")
 	if err != nil {
 		logrus.Warningf("update preparation record error: %s", err.Error())
 	}

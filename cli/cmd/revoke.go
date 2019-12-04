@@ -42,7 +42,7 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		return spec.ReturnFail(spec.Code[spec.DataNotFound],
 			fmt.Sprintf("the uid record not found"))
 	}
-	if record.Status == "Revoked" {
+	if record.Status == Revoked {
 		rc.command.Println(spec.ReturnSuccess("success").Print())
 		return nil
 	}
@@ -61,11 +61,11 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 			fmt.Sprintf("not support the %s type", record.ProgramType))
 	}
 	if response.Success {
-		checkError(GetDS().UpdatePreparationRecordByUid(uid, "Revoked", ""))
+		checkError(GetDS().UpdatePreparationRecordByUid(uid, Revoked, ""))
 	} else if strings.Contains(response.Err, "connection refused") {
 		// sandbox has been detached, reset response value
 		response = spec.ReturnSuccess("success")
-		checkError(GetDS().UpdatePreparationRecordByUid(uid, "Revoked", ""))
+		checkError(GetDS().UpdatePreparationRecordByUid(uid, Revoked, ""))
 	} else {
 		// other failed reason
 		checkError(GetDS().UpdatePreparationRecordByUid(uid, record.Status, fmt.Sprintf("revoke failed. %s", response.Err)))

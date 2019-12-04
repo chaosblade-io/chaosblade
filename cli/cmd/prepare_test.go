@@ -28,7 +28,7 @@ func TestPrepareJvmCommand_insertPrepareRecord(t *testing.T) {
 					ProgramType: PrepareJvmType,
 					Process:     "project.name",
 					Port:        "8703",
-					Status:      "Created",
+					Status:      Created,
 				}, false,
 			},
 		},

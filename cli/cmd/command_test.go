@@ -42,7 +42,7 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 				Command:    "docker",
 				SubCommand: "network delay",
 				Flag:       " --interface=eth0 --time=3000",
-				Status:     "Created",
+				Status:     Created,
 			}, false},
 		},
 		{
@@ -51,7 +51,7 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 				Command:    "network",
 				SubCommand: "delay",
 				Flag:       " --interface=eth0 --time=3000",
-				Status:     "Created",
+				Status:     Created,
 			}, false},
 		},
 	}
@@ -173,11 +173,7 @@ func (*MockSource) QueryExperimentModelByUid(uid string) (*data.ExperimentModel,
 	return nil, nil
 }
 
-func (*MockSource) ListExperimentModels() ([]*data.ExperimentModel, error) {
-	return make([]*data.ExperimentModel, 0), nil
-}
-
-func (*MockSource) QueryExperimentModelsByCommand(target string) ([]*data.ExperimentModel, error) {
+func (*MockSource) QueryExperimentModels(target, status, limit string, asc bool) ([]*data.ExperimentModel, error) {
 	return make([]*data.ExperimentModel, 0), nil
 }
 

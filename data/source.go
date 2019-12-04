@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path"
 	"sync"
+	"unicode"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	_ "github.com/mattn/go-sqlite3"
@@ -79,4 +80,8 @@ func (s *Source) GetUserVersion() (int, error) {
 func (s *Source) UpdateUserVersion(version int) error {
 	_, err := s.DB.Exec(fmt.Sprintf("PRAGMA user_version=%d", version))
 	return err
+}
+
+func UpperFirst(str string) string {
+	return string(unicode.ToUpper(rune(str[0]))) + str[1:]
 }

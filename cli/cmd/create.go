@@ -96,11 +96,11 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 
 		if !response.Success {
 			// update status
-			checkError(GetDS().UpdateExperimentModelByUid(model.Uid, "Error", response.Err))
+			checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, response.Err))
 			return response
 		}
 		// update status
-		checkError(GetDS().UpdateExperimentModelByUid(model.Uid, "Success", response.Err))
+		checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
 		response.Result = model.Uid
 		cmd.Println(response.Print())
 		return nil
