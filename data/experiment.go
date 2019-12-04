@@ -3,6 +3,7 @@ package data
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -38,11 +39,8 @@ type ExperimentSource interface {
 	// QueryExperimentModelByUid
 	QueryExperimentModelByUid(uid string) (*ExperimentModel, error)
 
-	// ListExperimentModels
-	ListExperimentModels() ([]*ExperimentModel, error)
-
-	// QueryExperimentModelsByCommand
-	QueryExperimentModelsByCommand(target string) ([]*ExperimentModel, error)
+	// QueryExperimentModels
+	QueryExperimentModels(target, status, limit string, asc bool) ([]*ExperimentModel, error)
 }
 
 const expTableDDL = `CREATE TABLE IF NOT EXISTS experiment (
@@ -169,27 +167,43 @@ func (s *Source) QueryExperimentModelByUid(uid string) (*ExperimentModel, error)
 	return models[0], nil
 }
 
-func (s *Source) ListExperimentModels() ([]*ExperimentModel, error) {
-	stmt, err := s.DB.Prepare(`SELECT * FROM experiment`)
+func (s *Source) QueryExperimentModels(target, status, limit string, asc bool) ([]*ExperimentModel, error) {
+	sql := `SELECT * FROM experiment where 1=1`
+	parameters := make([]interface{}, 0)
+	if target != "" {
+		sql = fmt.Sprintf(`%s and command = ?`, sql)
+		parameters = append(parameters, target)
+	}
+	if status != "" {
+		sql = fmt.Sprintf(`%s and status = ?`, sql)
+		parameters = append(parameters, UpperFirst(status))
+	}
+	if asc {
+		sql = fmt.Sprintf(`%s order by id asc`, sql)
+	} else {
+		sql = fmt.Sprintf(`%s order by id desc`, sql)
+	}
+	if limit != "" {
+		values := strings.Split(limit, ",")
+		offset := "0"
+		count := "0"
+		if len(values) > 1 {
+			offset = values[0]
+			count = values[1]
+		} else {
+			count = values[0]
+		}
+		sql = fmt.Sprintf(`%s limit ?,?`, sql)
+		parameters = append(parameters, offset, count)
+	}
+	stmt, err := s.DB.Prepare(sql)
 	if err != nil {
 		return nil, err
 	}
+	logrus.Infoln(sql)
+	logrus.Infof("%v", parameters)
 	defer stmt.Close()
-	rows, err := stmt.Query()
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return getExperimentModelsFrom(rows)
-}
-
-func (s *Source) QueryExperimentModelsByCommand(target string) ([]*ExperimentModel, error) {
-	stmt, err := s.DB.Prepare(`SELECT * FROM experiment where command = ?`)
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(target)
+	rows, err := stmt.Query(parameters...)
 	if err != nil {
 		return nil, err
 	}

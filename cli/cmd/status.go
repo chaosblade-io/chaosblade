@@ -10,11 +10,23 @@ import (
 	"golang.org/x/crypto/ssh/terminal"
 )
 
+const (
+	Created   = "Created"
+	Success   = "Success"
+	Running   = "Running"
+	Error     = "Error"
+	Destroyed = "Destroyed"
+	Revoked   = "Revoked"
+)
+
 type StatusCommand struct {
 	baseCommand
 	commandType string
 	target      string
 	uid         string
+	limit       string
+	status      string
+	asc         bool
 }
 
 func (sc *StatusCommand) Init() {
@@ -30,7 +42,10 @@ func (sc *StatusCommand) Init() {
 	}
 	sc.command.Flags().StringVar(&sc.commandType, "type", "", "command type, attach|create|destroy|detach")
 	sc.command.Flags().StringVar(&sc.target, "target", "", "experiment target, for example: dubbo")
+	sc.command.Flags().StringVar(&sc.limit, "limit", "", "limit the count of experiments, support OFFSET clause, for example, limit 4,3 returns only 3 items starting from the 5 position item")
+	sc.command.Flags().StringVar(&sc.status, "status", "", "experiment status. create type supports Created|Success|Error|Destroyed status. prepare type supports Created|Running|Error|Revoked status")
 	sc.command.Flags().StringVar(&sc.uid, "uid", "", "prepare or experiment uid")
+	sc.command.Flags().BoolVar(&sc.asc, "asc", false, "order by CreateTime, default value is false that means order by CreateTime desc")
 
 }
 func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error {
@@ -46,16 +61,14 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 	case "create", "destroy", "c", "d":
 		if uid != "" {
 			result, err = GetDS().QueryExperimentModelByUid(uid)
-		} else if sc.target != "" {
-			result, err = GetDS().QueryExperimentModelsByCommand(sc.target)
 		} else {
-			result, err = GetDS().ListExperimentModels()
+			result, err = GetDS().QueryExperimentModels(sc.target, sc.status, sc.limit, sc.asc)
 		}
 	case "prepare", "revoke", "p", "r":
 		if uid != "" {
 			result, err = GetDS().QueryPreparationByUid(uid)
 		} else {
-			result, err = GetDS().ListPreparationRecords()
+			result, err = GetDS().QueryPreparationRecords(sc.target, sc.status, sc.limit, sc.asc)
 		}
 	default:
 		if uid == "" {

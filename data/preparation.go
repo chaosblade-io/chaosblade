@@ -3,6 +3,7 @@ package data
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -39,9 +40,6 @@ type PreparationSource interface {
 	// QueryRunningPreByTypeAndProcess
 	QueryRunningPreByTypeAndProcess(programType string, processName, processId string) (*PreparationRecord, error)
 
-	// ListPreparationRecords
-	ListPreparationRecords() ([]*PreparationRecord, error)
-
 	// UpdatePreparationRecordByUid
 	UpdatePreparationRecordByUid(uid, status, errMsg string) error
 
@@ -50,6 +48,8 @@ type PreparationSource interface {
 
 	// UpdatePreparationPidByUid
 	UpdatePreparationPidByUid(uid, pid string) error
+
+	QueryPreparationRecords(target, status, limit string, asc bool) ([]*PreparationRecord, error)
 }
 
 // UserVersion PRAGMA [database.]user_version
@@ -231,17 +231,6 @@ func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName
 	return records[0], nil
 }
 
-func (s *Source) ListPreparationRecords() ([]*PreparationRecord, error) {
-	stmt, err := s.DB.Prepare(`SELECT * FROM preparation`)
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query()
-	defer rows.Close()
-	return getPreparationRecordFrom(rows)
-}
-
 func getPreparationRecordFrom(rows *sql.Rows) ([]*PreparationRecord, error) {
 	records := make([]*PreparationRecord, 0)
 	for rows.Next() {
@@ -313,4 +302,46 @@ func (s *Source) UpdatePreparationPidByUid(uid, pid string) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Source) QueryPreparationRecords(target, status, limit string, asc bool) ([]*PreparationRecord, error) {
+	sql := `SELECT * FROM preparation where 1=1`
+	parameters := make([]interface{}, 0)
+	if target != "" {
+		sql = fmt.Sprintf(`%s and program_type = ?`, sql)
+		parameters = append(parameters, target)
+	}
+	if status != "" {
+		sql = fmt.Sprintf(`%s and status = ?`, sql)
+		parameters = append(parameters, UpperFirst(status))
+	}
+	if asc {
+		sql = fmt.Sprintf(`%s order by id asc`, sql)
+	} else {
+		sql = fmt.Sprintf(`%s order by id desc`, sql)
+	}
+	if limit != "" {
+		values := strings.Split(limit, ",")
+		offset := "0"
+		count := "0"
+		if len(values) > 1 {
+			offset = values[0]
+			count = values[1]
+		} else {
+			count = values[0]
+		}
+		sql = fmt.Sprintf(`%s limit ?,?`, sql)
+		parameters = append(parameters, offset, count)
+	}
+	stmt, err := s.DB.Prepare(sql)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+	rows, err := stmt.Query(parameters...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return getPreparationRecordFrom(rows)
 }

@@ -47,7 +47,7 @@ func (pc *PrepareCPlusCommand) prepareCPlus() error {
 		return spec.ReturnFail(spec.Code[spec.DatabaseError],
 			fmt.Sprintf("query cplus agent server port record err, %s", err.Error()))
 	}
-	if record == nil || record.Status != "Running" {
+	if record == nil || record.Status != Running {
 		record, err = insertPrepareRecord(PrepareCPlusType, portStr, portStr, "")
 		if err != nil {
 			return spec.ReturnFail(spec.Code[spec.DatabaseError],
