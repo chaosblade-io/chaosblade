@@ -200,8 +200,6 @@ func (s *Source) QueryExperimentModels(target, status, limit string, asc bool) (
 	if err != nil {
 		return nil, err
 	}
-	logrus.Infoln(sql)
-	logrus.Infof("%v", parameters)
 	defer stmt.Close()
 	rows, err := stmt.Query(parameters...)
 	if err != nil {
