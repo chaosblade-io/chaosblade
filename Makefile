@@ -46,7 +46,7 @@ JVM_SANDBOX_NAME=sandbox-$(JVM_SANDBOX_VERSION)-bin.zip
 JVM_SANDBOX_OSS_URL=https://ompc.oss-cn-hangzhou.aliyuncs.com/jvm-sandbox/release/$(JVM_SANDBOX_NAME)
 JVM_SANDBOX_DEST_PATH=$(BUILD_TARGET_CACHE)/$(JVM_SANDBOX_NAME)
 # used to execute jvm chaos
-BLADE_JAVA_AGENT_VERSION=0.3.0
+BLADE_JAVA_AGENT_VERSION=0.4.0
 BLADE_JAVA_AGENT_NAME=chaosblade-java-agent-$(BLADE_JAVA_AGENT_VERSION).jar
 BLADE_JAVA_AGENT_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_JAVA_AGENT_NAME)
 BLADE_JAVA_AGENT_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_AGENT_NAME)
@@ -71,8 +71,8 @@ BLADE_CPLUS_AGENT_NAME=chaosblade-exec-cplus-$(BLADE_CPLUS_ZIP_VERSION).jar
 BLADE_CPLUS_AGENT_DEST_NAME=chaosblade-exec-cplus.jar
 
 # cplus spec is used to invoke by chaosblade
-BLADE_CPLUS_AGENT_SPEC=cplus-chaosblade.spec.yaml
-BLADE_CPLUS_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/cplus-chaosblade.spec.yaml
+BLADE_CPLUS_AGENT_SPEC=chaosblade-cplus-spec.yaml
+BLADE_CPLUS_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/chaosblade-cplus-spec.yaml
 BLADE_CPLUS_AGENT_SPEC_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_CPLUS_AGENT_SPEC)
 
 # docker yaml
@@ -139,7 +139,7 @@ pre_build:mkdir_build_target download_sandbox download_blade_java_agent download
 	mv $(BUILD_TARGET_LIB)/$(BLADE_CPLUS_DIR_NAME)/$(BLADE_CPLUS_AGENT_NAME) $(BUILD_TARGET_LIB)/$(BLADE_CPLUS_DIR_NAME)/$(BLADE_CPLUS_AGENT_DEST_NAME)
 	# rename chaosblade-exec-cplus to cplus
 	mv $(BUILD_TARGET_LIB)/$(BLADE_CPLUS_DIR_NAME) $(BUILD_TARGET_LIB)/$(BLADE_CPLUS_LIB_DIR_NAME)
-	# cp cplus-chaosblade.spec.yaml to bin
+	# cp chaosblade-cplus-spec.yaml  to bin
 	mv $(BLADE_CPLUS_AGENT_SPEC_DEST_PATH) $(BUILD_TARGET_BIN)
 
 # download sandbox for java chaos experiment

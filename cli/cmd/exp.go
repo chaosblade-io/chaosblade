@@ -141,7 +141,7 @@ func (ec *baseExpCommandService) registerJvmExpCommands() []*modelCommand {
 
 // registerCplusExpCommands
 func (ec *baseExpCommandService) registerCplusExpCommands() []*modelCommand {
-	file := path.Join(util.GetBinPath(), fmt.Sprintf("chaosblade-cplus-spec-%s.yaml", version.Ver))
+	file := path.Join(util.GetBinPath(), "chaosblade-cplus-spec.yaml")
 	models, err := util.ParseSpecsToModel(file, cplus.NewExecutor())
 	if err != nil {
 		return nil

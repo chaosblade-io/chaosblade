@@ -18,7 +18,7 @@ var osSpecFile = path.Join(filePath, fmt.Sprintf("chaosblade-os-spec-%s.yaml", v
 var k8sSpecFile = path.Join(filePath, fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version))
 var dockerSpecFile = path.Join(filePath, fmt.Sprintf("chaosblade-docker-spec-%s.yaml", version))
 var nodeSpecFile = path.Join(filePath, "nodejs-chaosblade.spec.yaml")
-var cplusSpecFile = path.Join(filePath, "cplus-chaosblade.spec.yaml")
+var cplusSpecFile = path.Join(filePath, "chaosblade-cplus-spec.yaml ")
 var chaosSpecFile = path.Join(targetPath, "chaosblade.spec.yaml")
 
 func main() {
