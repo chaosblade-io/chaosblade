@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"encoding/json"
-	"errors"
 	"os"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -50,17 +49,6 @@ func (sc *StatusCommand) Init() {
 
 }
 func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error {
-	retries := "1"
-	seconds := 2
-	url := "https://chaosblade.io"
-	simpleError := errors.New("a simple error")
-	log.Error(simpleError, "test_err", "url", url)
-	log.V(4).Info("got a retry-after response when requesting url", "attempt", retries, "after seconds", seconds, "url", url)
-	log.V(0).Info("test info")
-	log.V(-1).Info("test warn")
-	log.V(1).Info("test debug")
-	log.Info("test")
-
 	var uid = ""
 	if len(args) > 0 {
 		uid = args[0]
