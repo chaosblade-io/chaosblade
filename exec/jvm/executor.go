@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
+
 	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
@@ -21,6 +23,8 @@ type Executor struct {
 	Uri     string
 	channel spec.Channel
 }
+
+var log = logf.Log.WithName("jvm")
 
 func NewExecutor() *Executor {
 	return &Executor{

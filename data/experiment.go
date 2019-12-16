@@ -3,10 +3,11 @@ package data
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
-	"github.com/sirupsen/logrus"
+	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 )
 
 type ExperimentModel struct {
@@ -61,20 +62,26 @@ var expIndexDDL = []string{
 	`CREATE INDEX exp_status_idx ON experiment (status)`,
 }
 
-var insertExpDML = `INSERT INTO 
+var insertExpDML = `INSERT INTO
 	experiment (uid, command, sub_command, flag, status, error, create_time, update_time)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `
 
+var log = logf.Log.WithName("data")
+
 func (s *Source) CheckAndInitExperimentTable() {
 	exists, err := s.ExperimentTableExists()
 	if err != nil {
-		logrus.Fatalf(err.Error())
+		//logrus.Fatalf(err.Error())
+		log.Error(err, "ExperimentTableExists err")
+		os.Exit(1)
 	}
 	if !exists {
 		err = s.InitExperimentTable()
 		if err != nil {
-			logrus.Fatalf(err.Error())
+			//logrus.Fatalf(err.Error())
+			log.Error(err, "InitExperimentTable err")
+			os.Exit(1)
 		}
 	}
 }

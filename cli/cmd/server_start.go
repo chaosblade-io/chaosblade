@@ -11,7 +11,6 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -94,7 +93,8 @@ func (ssc *StartServerCommand) start() error {
 		}
 		return spec.ReturnFail(spec.Code[spec.ServerError], response.Result.(string))
 	}
-	logrus.Infof("start blade server success, listen on %s:%s", ssc.ip, ssc.port)
+	//logrus.Infof("start blade server success, listen on %s:%s", ssc.ip, ssc.port)
+	log.Info("start blade server success", "ip", ssc.ip, ssc.port)
 	return nil
 }
 
@@ -103,7 +103,8 @@ func (ssc *StartServerCommand) start0() {
 	go func() {
 		err := http.ListenAndServe(ssc.ip+":"+ssc.port, nil)
 		if err != nil {
-			logrus.Errorf("start blade server error, %v", err)
+			//logrus.Errorf("start blade server error, %v", err)
+			log.Error(err, "start blade server error")
 			os.Exit(1)
 		}
 	}()

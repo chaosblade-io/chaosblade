@@ -7,7 +7,6 @@ import (
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -33,7 +32,8 @@ func (ssc *StopServerCommand) run(cmd *cobra.Command, args []string) error {
 		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}
 	if pids == nil || len(pids) == 0 {
-		logrus.Infof("the blade server process not found, so return success for stop operation")
+		//logrus.Infof("the blade server process not found, so return success for stop operation")
+		log.Info("the blade server process not found, so return success for stop operation")
 		cmd.Printf(spec.ReturnSuccess("success").Print())
 		return nil
 	}

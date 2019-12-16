@@ -3,13 +3,13 @@ package data
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"path"
 	"sync"
 	"unicode"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/sirupsen/logrus"
 )
 
 const dataFile = "chaosblade.dat"
@@ -38,7 +38,7 @@ func GetSource() SourceI {
 }
 
 const tableExistsDQL = `SELECT count(*) AS c
-	FROM sqlite_master 
+	FROM sqlite_master
 	WHERE type = "table"
 	AND name = ?
 `
@@ -51,7 +51,9 @@ func (s *Source) init() {
 func getConnection() *sql.DB {
 	database, err := sql.Open("sqlite3", path.Join(util.GetProgramPath(), dataFile))
 	if err != nil {
-		logrus.Fatalf("open data file err, %s", err.Error())
+		//logrus.Fatalf("open data file err, %s", err.Error())
+		log.Error(err, "open data file err")
+		os.Exit(1)
 	}
 	return database
 }
