@@ -8,7 +8,6 @@ import (
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
@@ -91,13 +90,15 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err := jvm.CheckPortFromSandboxToken(username)
 		if err == nil {
-			logrus.Infof("use %s port to retry", port)
+			//logrus.Infof("use %s port to retry", port)
+			log.Info("use port to retry", "port", port)
 			response, username = jvm.Attach(port, pc.javaHome, pc.processId)
 			if response.Success {
 				// update port
 				err := updatePreparationPort(record.Uid, port)
 				if err != nil {
-					logrus.Warningf("update preparation port failed, %v", err)
+					//logrus.Warningf("update preparation port failed, %v", err)
+					log.V(-1).Info("update preparation port failed", "err_msg", err.Error())
 				}
 			}
 		}

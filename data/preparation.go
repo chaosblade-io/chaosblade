@@ -3,10 +3,9 @@ package data
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 type PreparationRecord struct {
@@ -88,7 +87,9 @@ func (s *Source) CheckAndInitPreTable() {
 	// check user_version
 	version, err := s.GetUserVersion()
 	if err != nil {
-		logrus.Fatalln(err.Error())
+		//logrus.Fatalln(err.Error())
+		log.Error(err, "GetUserVersion err")
+		os.Exit(1)
 	}
 	// return directly if equal the current UserVersion
 	if version == UserVersion {
@@ -97,25 +98,33 @@ func (s *Source) CheckAndInitPreTable() {
 	// check the table exists or not
 	exists, err := s.PreparationTableExists()
 	if err != nil {
-		logrus.Fatalln(err.Error())
+		//logrus.Fatalln(err.Error())
+		log.Error(err, "PreparationTableExists err")
+		os.Exit(1)
 	}
 	if exists {
 		// execute alter sql if exists
 		err := s.AlterPreparationTable(addPidColumn)
 		if err != nil {
-			logrus.Fatalln(err.Error())
+			//logrus.Fatalln(err.Error())
+			log.Error(err, "AlterPreparationTable err", "addPidColumn", addPidColumn)
+			os.Exit(1)
 		}
 	} else {
 		// execute create table
 		err = s.InitPreparationTable()
 		if err != nil {
-			logrus.Fatalln(err.Error())
+			//logrus.Fatalln(err.Error())
+			log.Error(err, "InitPreparationTable err")
+			os.Exit(1)
 		}
 	}
 	// update userVersion to new
 	err = s.UpdateUserVersion(UserVersion)
 	if err != nil {
-		logrus.Fatalln(err.Error())
+		//logrus.Fatalln(err.Error())
+		log.Error(err, "UpdateUserVersion err", "UserVersion", UserVersion)
+		os.Exit(1)
 	}
 }
 

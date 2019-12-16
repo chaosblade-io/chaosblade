@@ -14,7 +14,6 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/shirou/gopsutil/process"
-	"github.com/sirupsen/logrus"
 )
 
 // attach sandbox to java process
@@ -83,15 +82,19 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid)
 	currUser, err := osuser.Current()
 	if err != nil {
-		logrus.Warnf("get current user info failed, %v", err)
+		//logrus.Warnf("get current user info failed, %v", err)
+		log.V(-1).Info("get current user info failed", "err_msg", err.Error())
 	}
 	var response *spec.Response
 	if currUser != nil && (currUser.Username == username) {
 		response = channel.Run(ctx, javaBin, javaArgs)
 	} else {
 		if currUser != nil {
-			logrus.Debugf("current user name is %s, not equal %s, so use sudo command to execute",
-				currUser.Username, username)
+			//logrus.Debugf("current user name is %s, not equal %s, so use sudo command to execute",
+			//	currUser.Username, username)
+			//1=DEBUG
+			log.V(1).Info("current user name is not equal username, so use sudo command to execute",
+				"current_username", currUser.Username, "username", username)
 		}
 		response = channel.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", username, javaBin, javaArgs))
 	}

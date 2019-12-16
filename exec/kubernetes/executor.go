@@ -6,7 +6,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -161,7 +160,8 @@ func (*Executor) destroy(client rest.Interface, uid string, config string) (*spe
 }
 
 func (e *Executor) create(client rest.Interface, kubeconfig string, uid string, expModel *spec.ExpModel) (*spec.Response, bool) {
-	logrus.Infof("create uid: %s, target: %s, scope: %s, action: %s", uid, expModel.Target, expModel.Scope, expModel.ActionName)
+	//logrus.Infof("create uid: %s, target: %s, scope: %s, action: %s", uid, expModel.Target, expModel.Scope, expModel.ActionName)
+	log.Info("create", "uid", uid, "target", expModel.Target, "scope", expModel.Scope, "action", expModel.ActionName)
 	chaosBladeObj := convertExpModelToChaosBladeObject(uid, expModel)
 	var err error
 	resource, err := create(client, &chaosBladeObj)
@@ -185,7 +185,8 @@ func (e *Executor) checkCreateStatus(uid string, store cache.Store, client rest.
 	} else {
 		chaosblade = item.(*v1alpha1.ChaosBlade)
 	}
-	logrus.Debugf("chaosblade: %+v", chaosblade)
+	//logrus.Debugf("chaosblade: %+v", chaosblade)
+	log.V(1).Info("chaosblade", "chaosblade", chaosblade)
 	if chaosblade.Status.Phase == v1alpha1.ClusterPhaseRunning {
 		return spec.ReturnSuccess(CreateStatusResult(uid, true, "", chaosblade.Status.ExpStatuses))
 	}
