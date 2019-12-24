@@ -53,22 +53,30 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		}
 		result, err, code = util.Curl(url_)
 	} else {
-		url_, body, err := e.createUrl(port, uid, model)
+		var body []byte
+		url_, body, err = e.createUrl(port, uid, model)
 		if err != nil {
 			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 		}
 		result, err, code = util.PostCurl(url_, body)
 	}
-
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
 	if code == 404 {
 		return spec.ReturnFail(spec.Code[spec.JavaAgentCmdError], "please execute prepare command first")
 	}
-	var resp spec.Response
-	json.Unmarshal([]byte(result), &resp)
-	return &resp
+	if code == 200 {
+		var resp spec.Response
+		err := json.Unmarshal([]byte(result), &resp)
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+				fmt.Sprintf("unmarshal create command result %s err, %v", result, err))
+		}
+		return &resp
+	}
+	return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+		fmt.Sprintf("response code is %d, result: %s", code, result))
 }
 
 func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) (string, []byte, error) {
@@ -137,10 +145,15 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], "the command not support")
 	}
 	if code != 200 {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], result)
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+			fmt.Sprintf("query response code is %d, result: %s", code, result))
 	}
 	var resp spec.Response
-	json.Unmarshal([]byte(result), &resp)
+	err = json.Unmarshal([]byte(result), &resp)
+	if err != nil {
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+			fmt.Sprintf("unmarshal query command result %s err, %v", result, err))
+	}
 	return &resp
 }
 

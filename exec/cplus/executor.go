@@ -44,13 +44,21 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	} else {
 		url = e.createUrl(port, uid, model)
 	}
-	result, err, _ := util.Curl(url)
+	result, err, code := util.Curl(url)
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError], err.Error())
 	}
-	var resp spec.Response
-	json.Unmarshal([]byte(result), &resp)
-	return &resp
+	if code == 200 {
+		var resp spec.Response
+		err := json.Unmarshal([]byte(result), &resp)
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError],
+				fmt.Sprintf("unmarshal create command result %s err, %v", result, err))
+		}
+		return &resp
+	}
+	return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError],
+		fmt.Sprintf("response code is %d, result: %s", code, result))
 }
 
 func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) string {
