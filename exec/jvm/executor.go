@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	neturl "net/url"
 	"strings"
 
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
@@ -12,6 +11,7 @@ import (
 	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	"github.com/sirupsen/logrus"
 
 	"github.com/chaosblade-io/chaosblade/data"
 )
@@ -47,33 +47,49 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.ServerError], "cannot get port from local, please execute prepare command first")
 	}
+	var result string
+	var code int
 	if suid, ok := spec.IsDestroy(ctx); ok {
 		if suid == spec.UnknownUid {
 			url_ = e.sandboxUrl(port, e.getDestroyRequestPathWithoutUid(model.Target, model.ActionName))
 		} else {
 			url_ = e.sandboxUrl(port, e.getDestroyRequestPathWithUid(uid))
 		}
+		result, err, code = util.Curl(url_)
 	} else {
-		url_ = e.sandboxUrl(port, e.getCreateRequestPath(uid, model))
+		var body []byte
+		url_, body, err = e.createUrl(port, uid, model)
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+		}
+		result, err, code = util.PostCurl(url_, body)
 	}
-	result, err, code := util.Curl(url_)
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
 	if code == 404 {
 		return spec.ReturnFail(spec.Code[spec.JavaAgentCmdError], "please execute prepare command first")
 	}
-	var resp spec.Response
-	json.Unmarshal([]byte(result), &resp)
-	return &resp
+	if code == 200 {
+		var resp spec.Response
+		err := json.Unmarshal([]byte(result), &resp)
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+				fmt.Sprintf("unmarshal create command result %s err, %v", result, err))
+		}
+		return &resp
+	}
+	return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+		fmt.Sprintf("response code is %d, result: %s", code, result))
 }
 
-func (e *Executor) sandboxUrl(port, requestPath string) string {
-	return fmt.Sprintf("http://%s:%s/%s/%s", "127.0.0.1", port, e.Uri, requestPath)
-}
+func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) (string, []byte, error) {
+	url := e.sandboxUrl(port, "create")
+	bodyMap := make(map[string]string, 0)
+	bodyMap["target"] = model.Target
+	bodyMap["suid"] = suid
+	bodyMap["action"] = model.ActionName
 
-func (e *Executor) getCreateRequestPath(suid string, model *spec.ExpModel) string {
-	url := fmt.Sprintf("create?target=%s&suid=%s&action=%s", model.Target, suid, model.ActionName)
 	for k, v := range model.ActionFlags {
 		if v == "" || v == "false" {
 			continue
@@ -82,9 +98,19 @@ func (e *Executor) getCreateRequestPath(suid string, model *spec.ExpModel) strin
 		if k == "timeout" {
 			continue
 		}
-		url = fmt.Sprintf("%s&%s=%s", url, k, neturl.QueryEscape(v))
+		bodyMap[k] = v
 	}
-	return url
+	// encode
+	bytes, err := json.Marshal(bodyMap)
+	if err != nil {
+		logrus.Warningf("Marshal request body to json error. %v", err)
+		return "", nil, err
+	}
+	return url, bytes, nil
+}
+
+func (e *Executor) sandboxUrl(port, requestPath string) string {
+	return fmt.Sprintf("http://%s:%s/%s/%s", "127.0.0.1", port, e.Uri, requestPath)
 }
 
 func (e *Executor) getDestroyRequestPathWithUid(uid string) string {
@@ -123,10 +149,15 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], "the command not support")
 	}
 	if code != 200 {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], result)
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+			fmt.Sprintf("query response code is %d, result: %s", code, result))
 	}
 	var resp spec.Response
-	json.Unmarshal([]byte(result), &resp)
+	err = json.Unmarshal([]byte(result), &resp)
+	if err != nil {
+		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
+			fmt.Sprintf("unmarshal query command result %s err, %v", result, err))
+	}
 	return &resp
 }
 

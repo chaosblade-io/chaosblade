@@ -32,11 +32,11 @@ BLADE_EXEC_OS_BRANCH=v0.4.0
 
 # chaosblade-exec-docker
 BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
-BLADE_EXEC_DOCKER_BRANCH=v0.4.0
+BLADE_EXEC_DOCKER_BRANCH=v0.4.1
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=v0.4.0
+BLADE_OPERATOR_BRANCH=master
 
 # oss url
 BLADE_OSS_URL=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/release
