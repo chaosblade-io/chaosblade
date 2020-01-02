@@ -2,6 +2,13 @@
 
 export BLADE_VERSION=0.4.0
 
+ALLOWGITVERSION=1.8.5
+GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
+
+ifneq ($(strip $(firstword $(sort $(GITVERSION), $(ALLOWGITVERSION)))),$(ALLOWGITVERSION))
+	ALERTMSG="please update git to >= $(ALLOWGITVERSION)"
+endif
+
 BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
 BLADE_SRC_ROOT=`pwd`
@@ -123,6 +130,9 @@ endif
 
 # create dir or download necessary file
 pre_build:mkdir_build_target download_sandbox download_blade_java_agent download_cplus_agent
+	ifdef ALERTMSG
+		$(error $(ALERTMSG))
+	endif
 	rm -rf $(BUILD_TARGET_PKG_DIR) $(BUILD_TARGET_PKG_FILE_PATH)
 	mkdir -p $(BUILD_TARGET_BIN) $(BUILD_TARGET_LIB)
 	# unzip jvm-sandbox
