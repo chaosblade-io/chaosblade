@@ -105,6 +105,9 @@ build_os:
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
 	git clone -b $(BLADE_EXEC_OS_BRANCH) $(BLADE_EXEC_OS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-os
 else
+	ifdef ALERTMSG
+		$(error $(ALERTMSG))
+	endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
 endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
@@ -130,9 +133,6 @@ endif
 
 # create dir or download necessary file
 pre_build:mkdir_build_target download_sandbox download_blade_java_agent download_cplus_agent
-	ifdef ALERTMSG
-		$(error $(ALERTMSG))
-	endif
 	rm -rf $(BUILD_TARGET_PKG_DIR) $(BUILD_TARGET_PKG_FILE_PATH)
 	mkdir -p $(BUILD_TARGET_BIN) $(BUILD_TARGET_LIB)
 	# unzip jvm-sandbox
