@@ -2,6 +2,13 @@
 
 export BLADE_VERSION=0.4.0
 
+ALLOWGITVERSION=1.8.5
+GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
+
+ifneq ($(strip $(firstword $(sort $(GITVERSION), $(ALLOWGITVERSION)))),$(ALLOWGITVERSION))
+	ALERTMSG="please update git to >= $(ALLOWGITVERSION)"
+endif
+
 BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
 BLADE_SRC_ROOT=`pwd`
@@ -98,6 +105,9 @@ build_os:
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
 	git clone -b $(BLADE_EXEC_OS_BRANCH) $(BLADE_EXEC_OS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-os
 else
+	ifdef ALERTMSG
+		$(error $(ALERTMSG))
+	endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
 endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
