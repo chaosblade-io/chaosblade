@@ -12,6 +12,7 @@ Chaosblade is Alibaba's internal MonkeyKing open source project. It is based on 
 
 Chaosblade can be compiled and run directly, and the cli command prompt makes it easier to perform chaos engineering experiments. Currently supported experimental areas include os, java, docker and kubernetes, for example, filling disk, killing the process, network delay, Dubbo, MySQL, Servlet and custom class methods of Java application class delay or exception, kill container, kill Pod and so on. You can execute `blade create -h` command to view
 
+中文使用文档：https://chaosblade-io.gitbook.io/chaosblade-help-zh-cn/
 
 ## CLI Command
 
