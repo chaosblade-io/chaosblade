@@ -35,11 +35,11 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=v0.4.0
+BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-docker
 BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
-BLADE_EXEC_DOCKER_BRANCH=v0.4.1
+BLADE_EXEC_DOCKER_BRANCH=master
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
@@ -105,9 +105,9 @@ build_os:
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
 	git clone -b $(BLADE_EXEC_OS_BRANCH) $(BLADE_EXEC_OS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-os
 else
-	ifdef ALERTMSG
-		$(error $(ALERTMSG))
-	endif
+ifdef ALERTMSG
+	$(error $(ALERTMSG))
+endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
 endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os

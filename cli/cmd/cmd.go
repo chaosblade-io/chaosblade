@@ -1,8 +1,8 @@
 package cmd
 
-import logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
-
-var log = logf.Log.WithName("cmd")
+//import logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
+//
+//var log = logf.Log.WithName("cmd")
 
 func CmdInit() *baseCommand {
 	cli := NewCli()

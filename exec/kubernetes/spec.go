@@ -2,7 +2,6 @@ package kubernetes
 
 import (
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 )
 
 type CommandModelSpec struct {
@@ -19,7 +18,7 @@ var WaitingTimeFlag = &spec.ExpFlag{
 	Desc: "Waiting time for invoking, default value is 20s",
 }
 
-var log = logf.Log.WithName("Kubernetes")
+//var log = logf.Log.WithName("Kubernetes")
 
 func NewCommandModelSpec() spec.ExpModelCommandSpec {
 	return &CommandModelSpec{

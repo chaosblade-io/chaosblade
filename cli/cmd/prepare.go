@@ -6,6 +6,7 @@ import (
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade/data"
@@ -74,8 +75,8 @@ func handlePrepareResponse(uid string, cmd *cobra.Command, response *spec.Respon
 	}
 	err := GetDS().UpdatePreparationRecordByUid(uid, Running, "")
 	if err != nil {
-		//logrus.Warningf("update preparation record error: %s", err.Error())
-		log.V(-1).Info("update preparation record error", "err_msg", err.Error())
+		logrus.Warningf("update preparation record error: %s", err.Error())
+		//log.V(-1).Info("update preparation record error", "err_msg", err.Error())
 	}
 	response.Result = uid
 	cmd.Println(response.Print())

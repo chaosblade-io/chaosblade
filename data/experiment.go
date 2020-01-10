@@ -3,11 +3,10 @@ package data
 import (
 	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
+	"github.com/sirupsen/logrus"
 )
 
 type ExperimentModel struct {
@@ -67,21 +66,19 @@ var insertExpDML = `INSERT INTO
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `
 
-var log = logf.Log.WithName("data")
-
 func (s *Source) CheckAndInitExperimentTable() {
 	exists, err := s.ExperimentTableExists()
 	if err != nil {
-		//logrus.Fatalf(err.Error())
-		log.Error(err, "ExperimentTableExists err")
-		os.Exit(1)
+		logrus.Fatalf(err.Error())
+		//log.Error(err, "ExperimentTableExists err")
+		//os.Exit(1)
 	}
 	if !exists {
 		err = s.InitExperimentTable()
 		if err != nil {
-			//logrus.Fatalf(err.Error())
-			log.Error(err, "InitExperimentTable err")
-			os.Exit(1)
+			logrus.Fatalf(err.Error())
+			//log.Error(err, "InitExperimentTable err")
+			//os.Exit(1)
 		}
 	}
 }

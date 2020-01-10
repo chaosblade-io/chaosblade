@@ -6,16 +6,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chaosblade-io/chaosblade-operator/pkg/apis/chaosblade/v1alpha1"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-
-	"github.com/chaosblade-io/chaosblade-operator/pkg/apis/chaosblade/v1alpha1"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 const ResourceName = "chaosblades"
@@ -160,8 +160,8 @@ func (*Executor) destroy(client rest.Interface, uid string, config string) (*spe
 }
 
 func (e *Executor) create(client rest.Interface, kubeconfig string, uid string, expModel *spec.ExpModel) (*spec.Response, bool) {
-	//logrus.Infof("create uid: %s, target: %s, scope: %s, action: %s", uid, expModel.Target, expModel.Scope, expModel.ActionName)
-	log.Info("create", "uid", uid, "target", expModel.Target, "scope", expModel.Scope, "action", expModel.ActionName)
+	logrus.Infof("create uid: %s, target: %s, scope: %s, action: %s", uid, expModel.Target, expModel.Scope, expModel.ActionName)
+	//log.Info("create", "uid", uid, "target", expModel.Target, "scope", expModel.Scope, "action", expModel.ActionName)
 	chaosBladeObj := convertExpModelToChaosBladeObject(uid, expModel)
 	var err error
 	resource, err := create(client, &chaosBladeObj)
@@ -185,8 +185,8 @@ func (e *Executor) checkCreateStatus(uid string, store cache.Store, client rest.
 	} else {
 		chaosblade = item.(*v1alpha1.ChaosBlade)
 	}
-	//logrus.Debugf("chaosblade: %+v", chaosblade)
-	log.V(1).Info("chaosblade", "chaosblade", chaosblade)
+	logrus.Debugf("chaosblade: %+v", chaosblade)
+	//log.V(1).Info("chaosblade", "chaosblade", chaosblade)
 	if chaosblade.Status.Phase == v1alpha1.ClusterPhaseRunning {
 		return spec.ReturnSuccess(CreateStatusResult(uid, true, "", chaosblade.Status.ExpStatuses))
 	}
