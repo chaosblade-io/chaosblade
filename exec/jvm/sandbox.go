@@ -155,23 +155,25 @@ func getUsername(pid string) (string, error) {
 }
 
 func getJavaBinAndJavaHome(javaHome string, ctx context.Context, pid string) (string, string) {
-	javaBin := "java"
-	if javaHome == "" {
-		javaHome = os.Getenv("JAVA_HOME")
-		javaBin = path.Join(javaHome, "bin/java")
-	}
-	if javaHome == "" {
-		psArgs := specchannel.GetPsArgs()
-		response := channel.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}'`,
-			psArgs, pid))
-		if response.Success {
-			javaBin = strings.TrimSpace(response.Result.(string))
-		}
-		if strings.HasPrefix(javaBin, "/bin/java") {
-			javaHome = javaBin[:len(javaBin)-9]
-		}
-	}
-	return javaBin, javaHome
+        javaBin := "java"
+        if javaHome != "" {
+           javaBin = path.Join(javaHome, "bin/java")
+           return javaBin, javaHome
+        }
+        if javaHome = os.Getenv("JAVA_HOME"); javaHome != "" {
+           javaBin = path.Join(javaHome, "bin/java")
+           return javaBin, javaHome
+        }
+        psArgs := specchannel.GetPsArgs()
+        response := channel.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}'`,
+                psArgs, pid))
+        if response.Success {
+                javaBin = strings.TrimSpace(response.Result.(string))
+        }
+        if strings.HasPrefix(javaBin, "/bin/java") {
+                javaHome = javaBin[:len(javaBin)-9]
+        }
+        return javaBin, javaHome
 }
 
 func Detach(port string) *spec.Response {
