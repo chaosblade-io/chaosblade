@@ -215,6 +215,9 @@ func CheckFlagValues(processName, processId string) (string, *spec.Response) {
 	}
 	if processName != "" {
 		ctx := context.WithValue(context.Background(), specchannel.ProcessKey, "java")
+                // set pecchannel.ExcludeProcessKey as "blade" to exclude pid of the blade command we run when querying the target application by processName
+                // If ExcludeProcessKey is not set, multiple pids might be returned (the blade command pid might be one of the pids.)
+                ctx = context.WithValue(ctx, specchannel.ExcludeProcessKey, "blade")
 		pids, err := specchannel.GetPidsByProcessName(processName, ctx)
 		if err != nil {
 			return processId, spec.ReturnFail(spec.Code[spec.GetProcessError], err.Error())
