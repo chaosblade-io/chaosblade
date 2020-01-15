@@ -60,6 +60,7 @@ func CmdInit() *baseCommand {
 	baseCmd.AddCommand(serverCommand)
 	serverCommand.AddCommand(&StartServerCommand{})
 	serverCommand.AddCommand(&StopServerCommand{})
+	serverCommand.AddCommand(&StatusServerCommand{})
 
 	return baseCmd
 }
