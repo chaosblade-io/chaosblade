@@ -22,6 +22,7 @@ GO=env $(GO_ENV) $(GO_MODULE) go
 UNAME := $(shell uname)
 
 BUILD_TARGET=target
+BUILD_TARGET_FOR_JAVA_CPLUS=build-target
 BUILD_TARGET_DIR_NAME=chaosblade-$(BLADE_VERSION)
 BUILD_TARGET_PKG_DIR=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)
 BUILD_TARGET_PKG_NAME=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION).tar.gz
@@ -45,42 +46,13 @@ BLADE_EXEC_DOCKER_BRANCH=master
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
 BLADE_OPERATOR_BRANCH=master
 
-# oss url
-BLADE_OSS_URL=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/release
-# used to transform java class
-JVM_SANDBOX_VERSION=1.2.0
-JVM_SANDBOX_NAME=sandbox-$(JVM_SANDBOX_VERSION)-bin.zip
-JVM_SANDBOX_OSS_URL=https://ompc.oss-cn-hangzhou.aliyuncs.com/jvm-sandbox/release/$(JVM_SANDBOX_NAME)
-JVM_SANDBOX_DEST_PATH=$(BUILD_TARGET_CACHE)/$(JVM_SANDBOX_NAME)
-# used to execute jvm chaos
-BLADE_JAVA_AGENT_VERSION=0.4.0
-BLADE_JAVA_AGENT_NAME=chaosblade-java-agent-$(BLADE_JAVA_AGENT_VERSION).jar
-BLADE_JAVA_AGENT_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_JAVA_AGENT_NAME)
-BLADE_JAVA_AGENT_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_AGENT_NAME)
-# used to invoke by chaosblade
-BLADE_JAVA_AGENT_SPEC=chaosblade-jvm-spec-$(BLADE_VERSION).yaml
-BLADE_JAVA_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_AGENT_SPEC)
-BLADE_JAVA_AGENT_SPEC_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_JAVA_AGENT_SPEC)
-# used to java agent attachp
-BLADE_JAVA_TOOLS_JAR_NAME=tools.jar
-BLADE_JAVA_TOOLS_JAR_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_JAVA_TOOLS_JAR_NAME)
-BLADE_JAVA_TOOLS_JAR_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_JAVA_TOOLS_JAR_NAME)
-# cplus zip contains jar and scripts
-BLADE_CPLUS_ZIP_VERSION=0.0.1
-BLADE_CPLUS_LIB_DIR_NAME=cplus
-BLADE_CPLUS_DIR_NAME=chaosblade-exec-cplus-$(BLADE_CPLUS_ZIP_VERSION)
-BLADE_CPLUS_ZIP_NAME=$(BLADE_CPLUS_DIR_NAME).zip
-BLADE_CPLUS_ZIP_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_CPLUS_ZIP_NAME)
-BLADE_CPLUS_ZIP_DEST_PATH=$(BUILD_TARGET_CACHE)/$(BLADE_CPLUS_ZIP_NAME)
-# cplus jar
-BLADE_CPLUS_AGENT_NAME=chaosblade-exec-cplus-$(BLADE_CPLUS_ZIP_VERSION).jar
-# important!! the name is related to the blade program
-BLADE_CPLUS_AGENT_DEST_NAME=chaosblade-exec-cplus.jar
+# chaosblade-exec-jvm
+BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
+BLADE_EXEC_JVM_BRANCH=master
 
-# cplus spec is used to invoke by chaosblade
-BLADE_CPLUS_AGENT_SPEC=chaosblade-cplus-spec.yaml
-BLADE_CPLUS_AGENT_SPEC_DEST_PATH=$(BUILD_TARGET_CACHE)/chaosblade-cplus-spec.yaml
-BLADE_CPLUS_AGENT_SPEC_DOWNLOAD_URL=$(BLADE_OSS_URL)/$(BLADE_CPLUS_AGENT_SPEC)
+# chaosblade-exec-cplus
+BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
+BLADE_EXEC_CPLUS_BRANCH=master
 
 # docker yaml
 DOCKER_YAML_FILE_NAME=chaosblade-docker-spec-$(BLADE_VERSION).yaml
@@ -91,9 +63,24 @@ ifeq ($(GOOS), linux)
 endif
 
 # build chaosblade package and image
-build: pre_build build_cli build_os build_docker build_kubernetes
+build: pre_build build_cli build_os build_docker build_kubernetes build_java build_cplus
 	# tar package
 	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
+
+# alias
+cli: build_cli
+os: build_os
+os_darwin: build_darwin
+docker: build_docker
+kubernetes: build_kubernetes
+java: build_java
+cplus: build_cplus
+
+# for example: make build_with cli os_darwin
+build_with: pre_build
+
+# for example: make build_with cli os
+build_with_linux: pre_build
 
 # build chaosblade cli: blade
 build_cli:
@@ -111,6 +98,18 @@ endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
 endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
+	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
+
+build_os_darwin:
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
+	git clone -b $(BLADE_EXEC_OS_BRANCH) $(BLADE_EXEC_OS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-os
+else
+ifdef ALERTMSG
+	$(error $(ALERTMSG))
+endif
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
+endif
+	make build_darwin -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 
 build_docker:
@@ -131,54 +130,45 @@ endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-operator
 	cp $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 
+build_java:
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-jvm, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm))
+	git clone -b $(BLADE_EXEC_JVM_BRANCH) $(BLADE_EXEC_JVM_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm
+else
+ifdef ALERTMSG
+	$(error $(ALERTMSG))
+endif
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm pull origin $(BLADE_EXEC_JVM_BRANCH)
+endif
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm
+	cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm/$(BUILD_TARGET_FOR_JAVA_CPLUS)/$(BUILD_TARGET_DIR_NAME)/* $(BUILD_TARGET_PKG_DIR)
+
+build_cplus:
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-cplus, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus))
+	git clone -b $(BLADE_EXEC_CPLUS_BRANCH) $(BLADE_EXEC_CPLUS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus
+else
+ifdef ALERTMSG
+	$(error $(ALERTMSG))
+endif
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus pull origin $(BLADE_EXEC_CPLUS_BRANCH)
+endif
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus
+	cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus/$(BUILD_TARGET_FOR_JAVA_CPLUS)/$(BUILD_TARGET_DIR_NAME)/* $(BUILD_TARGET_PKG_DIR)
+
 # create dir or download necessary file
-pre_build:mkdir_build_target download_sandbox download_blade_java_agent download_cplus_agent
+pre_build:mkdir_build_target
 	rm -rf $(BUILD_TARGET_PKG_DIR) $(BUILD_TARGET_PKG_FILE_PATH)
 	mkdir -p $(BUILD_TARGET_BIN) $(BUILD_TARGET_LIB)
-	# unzip jvm-sandbox
-	unzip $(JVM_SANDBOX_DEST_PATH) -d $(BUILD_TARGET_LIB)
-	# cp chaosblade-java-agent
-	cp $(BLADE_JAVA_AGENT_DEST_PATH) $(BUILD_TARGET_LIB)/sandbox/module/
-	# cp jvm.spec.yaml to bin
-	cp $(BLADE_JAVA_AGENT_SPEC_DEST_PATH) $(BUILD_TARGET_BIN)
-	# cp tools.jar to bin
-	cp $(BLADE_JAVA_TOOLS_JAR_DEST_PATH) $(BUILD_TARGET_BIN)
-	# unzip chaosblade-exec-cplus
-	unzip $(BLADE_CPLUS_ZIP_DEST_PATH) -d $(BUILD_TARGET_LIB)
-	# rename chaosblade-exec-cplus-VERSION.jar to chaosblade-exec-cplus.jar
-	mv $(BUILD_TARGET_LIB)/$(BLADE_CPLUS_DIR_NAME)/$(BLADE_CPLUS_AGENT_NAME) $(BUILD_TARGET_LIB)/$(BLADE_CPLUS_DIR_NAME)/$(BLADE_CPLUS_AGENT_DEST_NAME)
-	# rename chaosblade-exec-cplus to cplus
-	mv $(BUILD_TARGET_LIB)/$(BLADE_CPLUS_DIR_NAME) $(BUILD_TARGET_LIB)/$(BLADE_CPLUS_LIB_DIR_NAME)
-	# cp chaosblade-cplus-spec.yaml  to bin
-	mv $(BLADE_CPLUS_AGENT_SPEC_DEST_PATH) $(BUILD_TARGET_BIN)
-
-# download sandbox for java chaos experiment
-download_sandbox:
-ifneq ($(JVM_SANDBOX_DEST_PATH), $(wildcard $(JVM_SANDBOX_DEST_PATH)))
-	wget "$(JVM_SANDBOX_OSS_URL)" -O $(JVM_SANDBOX_DEST_PATH)
-endif
-
-# download java agent and spec config file
-download_blade_java_agent:
-ifneq ($(BLADE_JAVA_AGENT_DEST_PATH), $(wildcard $(BLADE_JAVA_AGENT_DEST_PATH)))
-	wget "$(BLADE_JAVA_AGENT_DOWNLOAD_URL)" -O $(BLADE_JAVA_AGENT_DEST_PATH)
-endif
-ifneq ($(BLADE_JAVA_TOOLS_JAR_DEST_PATH), $(wildcard $(BLADE_JAVA_TOOLS_JAR_DEST_PATH)))
-	wget "$(BLADE_JAVA_TOOLS_JAR_DOWNLOAD_URL)" -O $(BLADE_JAVA_TOOLS_JAR_DEST_PATH)
-endif
-	wget "$(BLADE_JAVA_AGENT_SPEC_DOWNLOAD_URL)" -O $(BLADE_JAVA_AGENT_SPEC_DEST_PATH)
-
-download_cplus_agent:
-ifneq ($(BLADE_CPLUS_ZIP_DEST_PATH), $(wildcard $(BLADE_CPLUS_ZIP_DEST_PATH)))
-	wget "$(BLADE_CPLUS_ZIP_DOWNLOAD_URL)" -O $(BLADE_CPLUS_ZIP_DEST_PATH)
-endif
-	wget "$(BLADE_CPLUS_AGENT_SPEC_DOWNLOAD_URL)" -O $(BLADE_CPLUS_AGENT_SPEC_DEST_PATH)
 
 # create cache dir
 mkdir_build_target:
 ifneq ($(BUILD_TARGET_CACHE), $(wildcard $(BUILD_TARGET_CACHE)))
 	mkdir -p $(BUILD_TARGET_CACHE)
 endif
+
+# build dawrin version on mac system
+build_darwin: pre_build build_cli build_os_darwin build_docker build_kubernetes build_java build_cplus
+	# tar package
+	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
 
 # build chaosblade linux version by docker image
 build_linux:
