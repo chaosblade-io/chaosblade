@@ -22,7 +22,7 @@ RUN apt-get update \
 
 ENV CC /usr/local/musl/bin/musl-gcc
 ENV GOOS linux
-ENV mvn /usr/local/apache-maven-3.6.3/bin
 ENV java /usr/bin/java
+ENV PATH /usr/local/apache-maven-3.6.3/bin:$PATH
 
 ENTRYPOINT [ "make" ]

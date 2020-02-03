@@ -70,7 +70,7 @@ build: pre_build build_cli build_os build_docker build_kubernetes build_java bui
 # alias
 cli: build_cli
 os: build_os
-os_darwin: build_darwin
+os_darwin: build_os_darwin
 docker: build_docker
 kubernetes: build_kubernetes
 java: build_java
@@ -79,8 +79,8 @@ cplus: build_cplus
 # for example: make build_with cli os_darwin
 build_with: pre_build
 
-# for example: make build_with cli os
-build_with_linux: pre_build
+# for example: make build_with_linux cli os
+build_with_linux: pre_build build_linux_with_arg
 
 # build chaosblade cli: blade
 build_cli:
@@ -177,6 +177,13 @@ build_linux:
 		-v $(shell echo -n ${GOPATH}):/go \
 		-w /go/src/github.com/chaosblade-io/chaosblade \
 		chaosblade-build-musl:latest
+
+build_linux_with_arg:
+	docker build -f build/image/musl/Dockerfile -t chaosblade-build-musl:latest build/image/musl
+	docker run --rm \
+		-v $(shell echo -n ${GOPATH}):/go \
+		-w /go/src/github.com/chaosblade-io/chaosblade \
+		chaosblade-build-musl:latest build_with $$ARGS
 
 # build chaosblade image for chaos
 build_image:
