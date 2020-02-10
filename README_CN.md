@@ -78,6 +78,8 @@ make build_linux
 make build_with cli os
 # 如果是 mac 系统，执行
 make build_with cli os_darwin
+# 如果是 mac 系统，想选择性的编译 linux 版本的 cli，os，则执行：
+ARGS="cli os" make build_with_linux
 ```
 
 ## 缺陷&建议

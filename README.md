@@ -77,6 +77,8 @@ You can also compile selectively, for example, you only need to compile cli and 
 make build_with cli os
 # If it is a mac system, run
 make build_with cli os_darwin
+# If you want to compile linux system version selectively, execute:
+ARGS="cli os" make build_with_linux
 ```
 
 ## Bugs and Feedback
