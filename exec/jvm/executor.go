@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"strings"
 
-	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/sirupsen/logrus"
@@ -43,7 +43,7 @@ type Executor struct {
 func NewExecutor() *Executor {
 	return &Executor{
 		Uri:     DefaultUri,
-		channel: specchannel.NewLocalChannel(),
+		channel: channel.NewLocalChannel(),
 	}
 }
 
@@ -218,8 +218,9 @@ func getProcessFlagFromExpRecord(model *data.ExperimentModel) string {
 // 3. Process is not empty, pid is empty, then it is judged whether the process exists, there is no error, and the process id is assigned to pid.
 // 4. Process and pid are both empty, then an error is returned.
 func CheckFlagValues(processName, processId string) (string, *spec.Response) {
+	cl := channel.NewLocalChannel()
 	if processName == "" {
-		exists, err := specchannel.ProcessExists(processId)
+		exists, err := cl.ProcessExists(processId)
 		if err != nil {
 			return processId, spec.ReturnFail(spec.Code[spec.GetProcessError],
 				fmt.Sprintf("the %s process id doesn't exist, %s", processId, err.Error()))
@@ -230,11 +231,11 @@ func CheckFlagValues(processName, processId string) (string, *spec.Response) {
 		}
 	}
 	if processName != "" {
-		ctx := context.WithValue(context.Background(), specchannel.ProcessKey, "java")
-                // set pecchannel.ExcludeProcessKey as "blade" to exclude pid of the blade command we run when querying the target application by processName
-                // If ExcludeProcessKey is not set, multiple pids might be returned (the blade command pid might be one of the pids.)
-                ctx = context.WithValue(ctx, specchannel.ExcludeProcessKey, "blade")
-		pids, err := specchannel.GetPidsByProcessName(processName, ctx)
+		ctx := context.WithValue(context.Background(), channel.ProcessKey, "java")
+		// set pecchannel.ExcludeProcessKey as "blade" to exclude pid of the blade command we run when querying the target application by processName
+		// If ExcludeProcessKey is not set, multiple pids might be returned (the blade command pid might be one of the pids.)
+		ctx = context.WithValue(ctx, channel.ExcludeProcessKey, "blade")
+		pids, err := cl.GetPidsByProcessName(processName, ctx)
 		if err != nil {
 			return processId, spec.ReturnFail(spec.Code[spec.GetProcessError], err.Error())
 		}

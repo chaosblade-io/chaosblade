@@ -105,7 +105,7 @@ func preCheck(port, scriptLocation string) *spec.Response {
 
 func processExists(port string) bool {
 	ctx := context.WithValue(context.Background(), channel.ProcessKey, port)
-	pids, _ := channel.GetPidsByProcessName(ApplicationName, ctx)
+	pids, _ := channel.NewLocalChannel().GetPidsByProcessName(ApplicationName, ctx)
 	if pids != nil && len(pids) > 0 {
 		return true
 	}

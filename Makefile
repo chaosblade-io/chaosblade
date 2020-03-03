@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=0.5.0
+export BLADE_VERSION=0.6.0
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -36,19 +36,19 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=v0.5.0
+BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-docker
 BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
-BLADE_EXEC_DOCKER_BRANCH=v0.5.0
+BLADE_EXEC_DOCKER_BRANCH=master
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=v0.5.0
+BLADE_OPERATOR_BRANCH=master
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=v0.5.0
+BLADE_EXEC_JVM_BRANCH=master
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git

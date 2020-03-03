@@ -58,7 +58,7 @@ func (ssc *StartServerCommand) Init() {
 
 func (ssc *StartServerCommand) run(cmd *cobra.Command, args []string) error {
 	// check if the process named `blade server --start` exists or not
-	pids, err := channel.GetPidsByProcessName(startServerKey, context.TODO())
+	pids, err := channel.NewLocalChannel().GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}
@@ -91,7 +91,7 @@ func (ssc *StartServerCommand) start() error {
 	}
 	time.Sleep(time.Second)
 	// check process
-	pids, err := channel.GetPidsByProcessName(startServerKey, context.TODO())
+	pids, err := channel.NewLocalChannel().GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}

@@ -29,7 +29,7 @@ func (ssc *StatusServerCommand) Init() {
 
 func (ssc *StatusServerCommand) run(cmd *cobra.Command, args []string) error {
 	// check if the process named `blade server --start` exists or not
-	pids, err := channel.GetPidsByProcessName(startServerKey, context.TODO())
+	pids, err := channel.NewLocalChannel().GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}

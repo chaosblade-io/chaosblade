@@ -54,6 +54,10 @@ github.com/chaosblade-io/chaosblade-exec-os v0.4.1-0.20200131100637-6f11682eeada
 github.com/chaosblade-io/chaosblade-exec-os v0.4.1-0.20200131100637-6f11682eeada/go.mod h1:y1+wo+0IAjyHW6574WdT1Vwh2Jqe9pfdFNCZL14oVPE=
 github.com/chaosblade-io/chaosblade-exec-os v0.5.0 h1:aliw7vn+Au3dFuhz430/DGhZ4hjeGxDFOvw2UFmTuaI=
 github.com/chaosblade-io/chaosblade-exec-os v0.5.0/go.mod h1:0iAqL2POuj4fBp5JLI3ug/tWEpWEL7LSsuff3aQ3rZA=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200219082755-93386e891b08 h1:3d51bNATpWE0cKZqhRNnSK+e+0l5KDNvcczt6hkDnWw=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200219082755-93386e891b08/go.mod h1:0iAqL2POuj4fBp5JLI3ug/tWEpWEL7LSsuff3aQ3rZA=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200303021642-a0b0a31d5a93 h1:4Yjy8Rvd8Qt3WmUApM7CUDEU7N1KLodYQRZQ9AGUI2U=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200303021642-a0b0a31d5a93/go.mod h1:JNAmMFc5RiMP7L1SwDse9QUaFuIkWwcD5UXeOMul754=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646 h1:RBFYLyw63VEg6zuze32clu4wRelss04GvPURqmEZYAg=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646/go.mod h1:FE9gkAN0FmpANjoPl37hKcNHD103f0TKKN8Eq41KoLw=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20200110075310-a6443f3732ca h1:7kQ3CpXWRgxZnG2Y1YeKPpqqAgWc88UJmLni+YC8yJI=
@@ -69,6 +73,8 @@ github.com/chaosblade-io/chaosblade-spec-go v0.4.1-0.20200110072855-4f767ce4e582
 github.com/chaosblade-io/chaosblade-spec-go v0.4.1-0.20200110072855-4f767ce4e582/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
 github.com/chaosblade-io/chaosblade-spec-go v0.5.0 h1:IcacKph5X7rgAA0d8d4Myh0ko3blXWKBg4jWnA4mH+E=
 github.com/chaosblade-io/chaosblade-spec-go v0.5.0/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
+github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200303014535-956c50c757eb h1:rAeJAuxWeKF6rOVmch7QTNno7FkN8cWhoC+MRZ6qE9I=
+github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200303014535-956c50c757eb/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
 github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
 github.com/containerd/cgroups v0.0.0-20191011165608-5fbad35c2a7e/go.mod h1:OApqhQ4XNSNC13gXIwDjhOQxjWa/NxkwZXJ1EvqT0ko=
 github.com/coreos/bbolt v1.3.0/go.mod h1:iRUV2dpdMOn7Bo10OQBFzIJO9kkE559Wcmn+qkEiiKk=

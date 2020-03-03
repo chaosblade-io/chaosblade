@@ -44,7 +44,7 @@ func (ssc *StopServerCommand) Init() {
 }
 
 func (ssc *StopServerCommand) run(cmd *cobra.Command, args []string) error {
-	pids, err := channel.GetPidsByProcessName(startServerKey, context.TODO())
+	pids, err := channel.NewLocalChannel().GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}

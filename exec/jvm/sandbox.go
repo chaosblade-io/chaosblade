@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	specchannel "github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/shirou/gopsutil/process"
@@ -34,7 +34,7 @@ import (
 )
 
 // attach sandbox to java process
-var channel = specchannel.NewLocalChannel()
+var cl = channel.NewLocalChannel()
 
 const DefaultNamespace = "default"
 
@@ -104,7 +104,7 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 	}
 	var response *spec.Response
 	if currUser != nil && (currUser.Username == username) {
-		response = channel.Run(ctx, javaBin, javaArgs)
+		response = cl.Run(ctx, javaBin, javaArgs)
 	} else {
 		if currUser != nil {
 			logrus.Debugf("current user name is %s, not equal %s, so use sudo command to execute",
@@ -113,12 +113,12 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 			//log.V(1).Info("current user name is not equal username, so use sudo command to execute",
 			//	"current_username", currUser.Username, "username", username)
 		}
-		response = channel.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", username, javaBin, javaArgs))
+		response = cl.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", username, javaBin, javaArgs))
 	}
 	if !response.Success {
 		return response, username
 	}
-	response = channel.Run(ctx, "grep", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
+	response = cl.Run(ctx, "grep", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
 		token, getSandboxTokenFile(username), DefaultNamespace))
 	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
@@ -141,7 +141,7 @@ func getAttachJvmOpts(toolsJar string, token string, port string, pid string) st
 
 func getSandboxToken(ctx context.Context) (string, error) {
 	// create sandbox token
-	response := channel.Run(ctx, "date", "| head | cksum | sed 's/ //g'")
+	response := cl.Run(ctx, "date", "| head | cksum | sed 's/ //g'")
 	if !response.Success {
 		return "", fmt.Errorf(response.Err)
 	}
@@ -171,25 +171,25 @@ func getUsername(pid string) (string, error) {
 }
 
 func getJavaBinAndJavaHome(javaHome string, ctx context.Context, pid string) (string, string) {
-        javaBin := "java"
-        if javaHome != "" {
-           javaBin = path.Join(javaHome, "bin/java")
-           return javaBin, javaHome
-        }
-        if javaHome = os.Getenv("JAVA_HOME"); javaHome != "" {
-           javaBin = path.Join(javaHome, "bin/java")
-           return javaBin, javaHome
-        }
-        psArgs := specchannel.GetPsArgs()
-        response := channel.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}'`,
-                psArgs, pid))
-        if response.Success {
-                javaBin = strings.TrimSpace(response.Result.(string))
-        }
-        if strings.HasPrefix(javaBin, "/bin/java") {
-                javaHome = javaBin[:len(javaBin)-9]
-        }
-        return javaBin, javaHome
+	javaBin := "java"
+	if javaHome != "" {
+		javaBin = path.Join(javaHome, "bin/java")
+		return javaBin, javaHome
+	}
+	if javaHome = os.Getenv("JAVA_HOME"); javaHome != "" {
+		javaBin = path.Join(javaHome, "bin/java")
+		return javaBin, javaHome
+	}
+	psArgs := cl.GetPsArgs()
+	response := cl.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}'`,
+		psArgs, pid))
+	if response.Success {
+		javaBin = strings.TrimSpace(response.Result.(string))
+	}
+	if strings.HasPrefix(javaBin, "/bin/java") {
+		javaHome = javaBin[:len(javaBin)-9]
+	}
+	return javaBin, javaHome
 }
 
 func Detach(port string) *spec.Response {
@@ -211,7 +211,7 @@ func CheckPortFromSandboxToken(username string) (port string, err error) {
 }
 
 func getPortFromSandboxToken(username string) (port string, err error) {
-	response := channel.Run(context.TODO(), "grep",
+	response := cl.Run(context.TODO(), "grep",
 		fmt.Sprintf(`%s %s | tail -1 | awk -F ";" '{print $4}'`,
 			DefaultNamespace, getSandboxTokenFile(username)))
 	if !response.Success {
