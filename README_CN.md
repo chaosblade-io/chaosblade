@@ -47,7 +47,7 @@ chaosblade 支持 CLI 和 HTTP 两种调用方式，支持的命令如下：
 操作步骤如下：
 下载镜像：
 ```bash
-docker pull docker pull chaosbladeio/chaosblade-demo
+docker pull chaosbladeio/chaosblade-demo
 ```
 
 启动镜像：
