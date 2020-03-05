@@ -48,7 +48,7 @@ Download the chaosblade demo image and experience the use of the blade toolkit
 
 Download image command：
 ```shell script
-docker pull docker pull chaosbladeio/chaosblade-demo
+docker pull chaosbladeio/chaosblade-demo
 ```
 Run the demo container：
 ```shell script
