@@ -107,10 +107,10 @@ func (dc *DestroyCommand) bindFlagsFunction() func(commandFlags map[string]func(
 		for _, flag := range specFlags {
 			flagName := flag.FlagName()
 			flagDesc := flag.FlagDesc()
-			if !flag.FlagRequiredWhenDestroyed() {
-				continue
+			if flag.FlagRequiredWhenDestroyed() {
+				cmd.MarkPersistentFlagRequired(flagName)
+				flagDesc = fmt.Sprintf("%s (required)", flagDesc)
 			}
-			flagDesc = fmt.Sprintf("%s (required)", flagDesc)
 			if flag.FlagNoArgs() {
 				var key bool
 				cmd.PersistentFlags().BoolVar(&key, flagName, false, flagDesc)
@@ -124,7 +124,6 @@ func (dc *DestroyCommand) bindFlagsFunction() func(commandFlags map[string]func(
 					return key
 				}
 			}
-			cmd.MarkPersistentFlagRequired(flagName)
 		}
 	}
 }
@@ -139,7 +138,11 @@ func (dc *DestroyCommand) actionRunEFunc(target, scope string, actionCommand *ac
 		ctx := spec.SetDestroyFlag(context.Background(), spec.UnknownUid)
 		// execute
 		response := executor.Exec(spec.UnknownUid, ctx, expModel)
-		return response
+		if !response.Success {
+			return response
+		}
+		cmd.Println(response.Print())
+		return nil
 	}
 }
 
