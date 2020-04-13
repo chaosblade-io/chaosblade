@@ -75,6 +75,8 @@ github.com/chaosblade-io/chaosblade-spec-go v0.5.0 h1:IcacKph5X7rgAA0d8d4Myh0ko3
 github.com/chaosblade-io/chaosblade-spec-go v0.5.0/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
 github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200303014535-956c50c757eb h1:rAeJAuxWeKF6rOVmch7QTNno7FkN8cWhoC+MRZ6qE9I=
 github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200303014535-956c50c757eb/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
+github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200413030726-04d0b230c5bc h1:uMYmBiJGlUJ+felgA8Ii0BHs6WRY+wKfBH5IPnH1hs4=
+github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200413030726-04d0b230c5bc/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
 github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
 github.com/containerd/cgroups v0.0.0-20191011165608-5fbad35c2a7e/go.mod h1:OApqhQ4XNSNC13gXIwDjhOQxjWa/NxkwZXJ1EvqT0ko=
 github.com/coreos/bbolt v1.3.0/go.mod h1:iRUV2dpdMOn7Bo10OQBFzIJO9kkE559Wcmn+qkEiiKk=
