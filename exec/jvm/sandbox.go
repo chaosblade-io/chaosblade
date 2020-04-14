@@ -91,6 +91,7 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 	}
 	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, ctx, pid)
 	toolsJar := getToolJar(javaHome)
+	logrus.Debugf("javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
 	token, err := getSandboxToken(ctx)
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.ServerError],
@@ -154,6 +155,8 @@ func getToolJar(javaHome string) string {
 	originalJar := path.Join(javaHome, "lib/tools.jar")
 	if util.IsExist(originalJar) {
 		toolsJar = originalJar
+	} else {
+		logrus.Warningf("using chaosblade default tools.jar, %s", toolsJar)
 	}
 	return toolsJar
 }
@@ -176,7 +179,7 @@ func getJavaBinAndJavaHome(javaHome string, ctx context.Context, pid string) (st
 		javaBin = path.Join(javaHome, "bin/java")
 		return javaBin, javaHome
 	}
-	if javaHome = os.Getenv("JAVA_HOME"); javaHome != "" {
+	if javaHome = strings.TrimSpace(os.Getenv("JAVA_HOME")); javaHome != "" {
 		javaBin = path.Join(javaHome, "bin/java")
 		return javaBin, javaHome
 	}
@@ -186,7 +189,7 @@ func getJavaBinAndJavaHome(javaHome string, ctx context.Context, pid string) (st
 	if response.Success {
 		javaBin = strings.TrimSpace(response.Result.(string))
 	}
-	if strings.HasPrefix(javaBin, "/bin/java") {
+	if strings.HasSuffix(javaBin, "/bin/java") {
 		javaHome = javaBin[:len(javaBin)-9]
 	}
 	return javaBin, javaHome
