@@ -28,7 +28,9 @@ github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578/go.mod h1:uGdko
 github.com/Shopify/sarama v1.19.0/go.mod h1:FVkBWblsNy7DGZRfXLU0O9RCGt5g3g3yEuWXgklEdEo=
 github.com/Shopify/toxiproxy v2.1.4+incompatible/go.mod h1:OXgGpZ6Cli1/URJOF1DMxUHB2q5Ap20/P/eIdh4G0pI=
 github.com/StackExchange/wmi v0.0.0-20190523213315-cbe66965904d/go.mod h1:3eOhrUMpNV+6aFIbp5/iudMxNCF27Vw2OZgy4xEx0Fg=
+github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc h1:cAKDfWh5VpdgMhJosfJnn5/FoN2SRZ4p7fJNX58YPaU=
 github.com/alecthomas/template v0.0.0-20160405071501-a0175ee3bccc/go.mod h1:LOuyumcjzFXgccqObfd/Ljyb9UuFJ6TxHnclSeseNhc=
+github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf h1:qet1QNfXsQxTZqLG4oE62mJzwPIB8+Tee4RNCL9ulrY=
 github.com/alecthomas/units v0.0.0-20151022065526-2efee857e7cf/go.mod h1:ybxpYRFXyAe+OPACYpWeL0wqObRcbAqCMya13uyzqw0=
 github.com/anmitsu/go-shlex v0.0.0-20161002113705-648efa622239/go.mod h1:2FmKhYUyUczH0OGQWaF5ceTx0UBShxjsH6f8oGKYe2c=
 github.com/apache/thrift v0.12.0/go.mod h1:cp2SuWMxlEZw2r+iP2GNCdIi4C1qmUzdZFSVb+bacwQ=
@@ -58,6 +60,10 @@ github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200219082755-93386e891b08
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200219082755-93386e891b08/go.mod h1:0iAqL2POuj4fBp5JLI3ug/tWEpWEL7LSsuff3aQ3rZA=
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200303021642-a0b0a31d5a93 h1:4Yjy8Rvd8Qt3WmUApM7CUDEU7N1KLodYQRZQ9AGUI2U=
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200303021642-a0b0a31d5a93/go.mod h1:JNAmMFc5RiMP7L1SwDse9QUaFuIkWwcD5UXeOMul754=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200413080041-c11c03be57d9 h1:6iKAxlfdL7uvcFHciKxeT/vNeIFHdQHF0a+17Zzbq9Q=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200413080041-c11c03be57d9/go.mod h1:JNAmMFc5RiMP7L1SwDse9QUaFuIkWwcD5UXeOMul754=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200413115705-def054cb9b0d h1:QXhn/fUmSc/UFIW1U0gmq4x3IF+xF6R8MKY9Py45kVE=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200413115705-def054cb9b0d/go.mod h1:JNAmMFc5RiMP7L1SwDse9QUaFuIkWwcD5UXeOMul754=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646 h1:RBFYLyw63VEg6zuze32clu4wRelss04GvPURqmEZYAg=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646/go.mod h1:FE9gkAN0FmpANjoPl37hKcNHD103f0TKKN8Eq41KoLw=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20200110075310-a6443f3732ca h1:7kQ3CpXWRgxZnG2Y1YeKPpqqAgWc88UJmLni+YC8yJI=
@@ -77,6 +83,8 @@ github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200303014535-956c50c757eb
 github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200303014535-956c50c757eb/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
 github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200413030726-04d0b230c5bc h1:uMYmBiJGlUJ+felgA8Ii0BHs6WRY+wKfBH5IPnH1hs4=
 github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200413030726-04d0b230c5bc/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
+github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200413053019-c6149ff993b4 h1:vIn/uqBty/+xv7Tei5cdjrpfuXpNTO6l37zNl3lPPuw=
+github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200413053019-c6149ff993b4/go.mod h1:pNTL6HH4/ei+dshXnqxoNBUJ6jkDL+/7VYrobFVEyeQ=
 github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
 github.com/containerd/cgroups v0.0.0-20191011165608-5fbad35c2a7e/go.mod h1:OApqhQ4XNSNC13gXIwDjhOQxjWa/NxkwZXJ1EvqT0ko=
 github.com/coreos/bbolt v1.3.0/go.mod h1:iRUV2dpdMOn7Bo10OQBFzIJO9kkE559Wcmn+qkEiiKk=
@@ -325,6 +333,7 @@ github.com/prometheus/client_model v0.0.0-20190129233127-fd36f4220a90/go.mod h1:
 github.com/prometheus/common v0.0.0-20180801064454-c7de2306084e/go.mod h1:daVV7qP5qjZbuso7PdcryaAu0sAZbrN9i7WWcTMWvro=
 github.com/prometheus/common v0.0.0-20181126121408-4724e9255275/go.mod h1:daVV7qP5qjZbuso7PdcryaAu0sAZbrN9i7WWcTMWvro=
 github.com/prometheus/common v0.0.0-20190104105734-b1c43a6df3ae/go.mod h1:TNfzLD0ON7rHzMJeJkieUDPYmFC7Snx/y86RQel1bk4=
+github.com/prometheus/common v0.2.0 h1:kUZDBDTdBVBYBj5Tmh2NZLlF60mfjA27rM34b+cVwNU=
 github.com/prometheus/common v0.2.0/go.mod h1:TNfzLD0ON7rHzMJeJkieUDPYmFC7Snx/y86RQel1bk4=
 github.com/prometheus/procfs v0.0.0-20180725123919-05ee40e3a273/go.mod h1:c3At6R/oaqEKCNdg8wHV1ftS6bRYblBhIjjI8uT2IGk=
 github.com/prometheus/procfs v0.0.0-20181005140218-185b4288413d/go.mod h1:c3At6R/oaqEKCNdg8wHV1ftS6bRYblBhIjjI8uT2IGk=
@@ -521,6 +530,7 @@ google.golang.org/grpc v1.16.0/go.mod h1:0JHn/cJsOMiMfNA9+DeHDlAU7KAAB5GDlYFpa9M
 google.golang.org/grpc v1.17.0/go.mod h1:6QZJwpn2B+Zp71q/5VxRsJ6NXXVCE5NRUHRo+f3cWCs=
 google.golang.org/grpc v1.19.0/go.mod h1:mqu4LbDTu4XGKhr4mRzUsmM4RtVoemTSY81AxZiDr8c=
 google.golang.org/grpc v1.19.1/go.mod h1:mqu4LbDTu4XGKhr4mRzUsmM4RtVoemTSY81AxZiDr8c=
+gopkg.in/alecthomas/kingpin.v2 v2.2.6 h1:jMFz6MfLP0/4fUyZle81rXUoxOBFi19VUFKVDOQfozc=
 gopkg.in/alecthomas/kingpin.v2 v2.2.6/go.mod h1:FMv+mEhP44yOT+4EoQTLFTRgOQ1FBLkstjWtayDeSgw=
 gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
 gopkg.in/check.v1 v1.0.0-20180628173108-788fd7840127/go.mod h1:Co6ibVJAznAaIkqp8huTwlJQCZ016jof/cbN4VW5Yz0=
