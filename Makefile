@@ -16,7 +16,10 @@ BLADE_SRC_ROOT=`pwd`
 GO_ENV=CGO_ENABLED=1
 GO_MODULE=GO111MODULE=on
 VERSION_PKG=github.com/chaosblade-io/chaosblade/version
-GO_FLAGS=-ldflags="-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`'"
+# Specify chaosblade version in docker experiments
+DOCKER_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-docker/version
+GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
+GO_FLAGS=-ldflags="$(GO_X_FLAGS)"
 GO=env $(GO_ENV) $(GO_MODULE) go
 
 UNAME := $(shell uname)
@@ -59,7 +62,7 @@ DOCKER_YAML_FILE_NAME=chaosblade-docker-spec-$(BLADE_VERSION).yaml
 DOCKER_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(DOCKER_YAML_FILE_NAME)
 
 ifeq ($(GOOS), linux)
-	GO_FLAGS=-ldflags="-linkmode external -extldflags -static -X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`'"
+	GO_FLAGS=-ldflags="-linkmode external -extldflags -static $(GO_X_FLAGS)"
 endif
 
 # build chaosblade package and image
