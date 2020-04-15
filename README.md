@@ -2,7 +2,7 @@
 
 # Chaosblade: An Easy to Use and Powerful Chaos Engineering Toolkit
 [![Build Status](https://travis-ci.org/chaosblade-io/chaosblade.svg?branch=master)](https://travis-ci.org/chaosblade-io/chaosblade)
-[![codecov](https://codecov.io/gh/chaosblade-io/chaosblade/branch/master/graph/badge.svg)](https://codecov.io/gh/chaosblade-io/chaosblade)
+[![Financial Contributors on Open Collective](https://opencollective.com/chaosblade/all/badge.svg?label=financial+contributors)](https://opencollective.com/chaosblade) [![codecov](https://codecov.io/gh/chaosblade-io/chaosblade/branch/master/graph/badge.svg)](https://codecov.io/gh/chaosblade-io/chaosblade)
 ![license](https://img.shields.io/github/license/chaosblade-io/chaosblade.svg)
 
 中文版 [README](README_CN.md)
@@ -101,6 +101,36 @@ The original intention of our open source project is to lower the threshold for 
 
 ## Ecosystem
 ![ecosystem](https://user-images.githubusercontent.com/3992234/72410783-429d7100-37a4-11ea-8314-540560f8a54f.png)
+
+## Contributors
+
+### Code Contributors
+
+This project exists thanks to all the people who contribute. [[Contribute](CONTRIBUTING.md)].
+<a href="https://github.com/chaosblade-io/chaosblade/graphs/contributors"><img src="https://opencollective.com/chaosblade/contributors.svg?width=890&button=false" /></a>
+
+### Financial Contributors
+
+Become a financial contributor and help us sustain our community. [[Contribute](https://opencollective.com/chaosblade/contribute)]
+
+#### Individuals
+
+<a href="https://opencollective.com/chaosblade"><img src="https://opencollective.com/chaosblade/individuals.svg?width=890"></a>
+
+#### Organizations
+
+Support this project with your organization. Your logo will show up here with a link to your website. [[Contribute](https://opencollective.com/chaosblade/contribute)]
+
+<a href="https://opencollective.com/chaosblade/organization/0/website"><img src="https://opencollective.com/chaosblade/organization/0/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/1/website"><img src="https://opencollective.com/chaosblade/organization/1/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/2/website"><img src="https://opencollective.com/chaosblade/organization/2/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/3/website"><img src="https://opencollective.com/chaosblade/organization/3/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/4/website"><img src="https://opencollective.com/chaosblade/organization/4/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/5/website"><img src="https://opencollective.com/chaosblade/organization/5/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/6/website"><img src="https://opencollective.com/chaosblade/organization/6/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/7/website"><img src="https://opencollective.com/chaosblade/organization/7/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/8/website"><img src="https://opencollective.com/chaosblade/organization/8/avatar.svg"></a>
+<a href="https://opencollective.com/chaosblade/organization/9/website"><img src="https://opencollective.com/chaosblade/organization/9/avatar.svg"></a>
 
 ## License
 Chaosblade is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.
