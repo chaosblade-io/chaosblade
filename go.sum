@@ -50,6 +50,7 @@ github.com/chaosblade-io/chaosblade-exec-docker v0.5.0 h1:M2Vu7wrc0WFbtvAKV7VVgV
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.0/go.mod h1:BdnVXOe3AJJm5Q8dOj1uO5rmavD5+E/sOKj+bcu+Bjw=
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200415083603-6d69441151dc h1:N9laL9Gr5TUasDRQEuDN2zWAUA/qt2P96ficj8LL9Ck=
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200415083603-6d69441151dc/go.mod h1:r8uJ9dUyuNARD/DMuYOREbav/57KiGxTezIe5EnHYCI=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200415111551-078ae08fddee/go.mod h1:r8uJ9dUyuNARD/DMuYOREbav/57KiGxTezIe5EnHYCI=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.0 h1:yNUGhBFD3dA2+BulDCXL8fAyZvmiOp+HVOczvhVke1c=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.0/go.mod h1:os4QqiAHjuzurJFH6JdMayqjMsNhUWD9LL8nlb0TEJk=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.1-0.20200110074748-6dcc3e972904 h1:FZ/5pgI3c3e0U2zF7nljRdVYEh7qsZq9QNsbE7GrjeY=

@@ -3,7 +3,7 @@ module github.com/chaosblade-io/chaosblade
 go 1.13
 
 require (
-	github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200415083603-6d69441151dc
+	github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200415111551-078ae08fddee
 	github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200414120247-a06d8ee8462f
 	github.com/chaosblade-io/chaosblade-operator v0.5.0
 	github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200413053019-c6149ff993b4
