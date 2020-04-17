@@ -24,6 +24,7 @@ import (
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -44,6 +45,8 @@ func (dc *DestroyCommand) Init() {
 			return dc.runDestroy(cmd, args)
 		},
 	}
+	flags := dc.command.PersistentFlags()
+	flags.StringVar(&uid, UidFlag, "", "Set Uid for the experiment, adapt to docker")
 	dc.baseExpCommandService = newBaseExpCommandService(dc)
 }
 
@@ -96,8 +99,7 @@ func (dc *DestroyCommand) runDestroy(cmd *cobra.Command, args []string) error {
 	}
 	// return result
 	checkError(GetDS().UpdateExperimentModelByUid(uid, Destroyed, ""))
-	result := fmt.Sprintf("command: %s %s %s", model.Command, model.SubCommand, model.Flag)
-	cmd.Println(spec.ReturnSuccess(result).Print())
+	cmd.Println(spec.ReturnSuccess(expModel).Print())
 	return nil
 }
 
@@ -128,9 +130,21 @@ func (dc *DestroyCommand) bindFlagsFunction() func(commandFlags map[string]func(
 	}
 }
 
-func (dc *DestroyCommand) actionRunEFunc(target, scope string, actionCommand *actionCommand, actionCommandSpec spec.ExpActionCommandSpec) func(cmd *cobra.Command, args []string) error {
+func (dc *DestroyCommand) actionRunEFunc(target, scope string, _ *actionCommand, actionCommandSpec spec.ExpActionCommandSpec) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
+		// If uid exists, use uid first. If the record cannot be found, then continue to destroy using matchers
+		if uid := expModel.ActionFlags["uid"]; uid != "" {
+			err := dc.runDestroy(cmd, []string{uid})
+			if err == nil {
+				return nil
+			}
+			resp, ok := err.(*spec.Response)
+			if ok && resp.Code != spec.Code[spec.DataNotFound].Code {
+				return resp
+			}
+			logrus.Warningf("%s uid not found, so using matchers to continue to destroy", uid)
+		}
 		// execute experiment
 		executor := actionCommandSpec.Executor()
 		executor.SetChannel(channel.NewLocalChannel())
@@ -141,7 +155,25 @@ func (dc *DestroyCommand) actionRunEFunc(target, scope string, actionCommand *ac
 		if !response.Success {
 			return response
 		}
-		cmd.Println(response.Print())
+
+		command := expModel.Target
+		subCommand := expModel.ActionName
+		if expModel.Scope != "" && expModel.Scope != "host" {
+			command = expModel.Scope
+			subCommand = fmt.Sprintf("%s %s", expModel.Target, expModel.ActionName)
+		}
+		// update status by finding related records
+		logrus.Infof("destroy by model: %+v, command: %s, subCommand: %s", expModel, command, subCommand)
+		experimentModels, err := GetDS().QueryExperimentModelsByCommand(command, subCommand, expModel.ActionFlags)
+		if err != nil {
+			logrus.Warningf("destroy success but query records failed, %v", err)
+		} else {
+			for _, record := range experimentModels {
+				checkError(GetDS().UpdateExperimentModelByUid(record.Uid, Destroyed, ""))
+			}
+		}
+
+		cmd.Println(spec.ReturnSuccess(expModel).Print())
 		return nil
 	}
 }

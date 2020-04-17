@@ -51,6 +51,9 @@ github.com/chaosblade-io/chaosblade-exec-docker v0.5.0/go.mod h1:BdnVXOe3AJJm5Q8
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200415083603-6d69441151dc h1:N9laL9Gr5TUasDRQEuDN2zWAUA/qt2P96ficj8LL9Ck=
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200415083603-6d69441151dc/go.mod h1:r8uJ9dUyuNARD/DMuYOREbav/57KiGxTezIe5EnHYCI=
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200415111551-078ae08fddee/go.mod h1:r8uJ9dUyuNARD/DMuYOREbav/57KiGxTezIe5EnHYCI=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200417015215-9570469b2ee9 h1:SnV7f9RvKrGMQJP8CmL049FlEV2YJ8QCi7sIUzLZFOk=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200417015215-9570469b2ee9/go.mod h1:r8uJ9dUyuNARD/DMuYOREbav/57KiGxTezIe5EnHYCI=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200420053331-524a764ee2e1/go.mod h1:r8uJ9dUyuNARD/DMuYOREbav/57KiGxTezIe5EnHYCI=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.0 h1:yNUGhBFD3dA2+BulDCXL8fAyZvmiOp+HVOczvhVke1c=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.0/go.mod h1:os4QqiAHjuzurJFH6JdMayqjMsNhUWD9LL8nlb0TEJk=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.1-0.20200110074748-6dcc3e972904 h1:FZ/5pgI3c3e0U2zF7nljRdVYEh7qsZq9QNsbE7GrjeY=
@@ -71,6 +74,8 @@ github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200414113734-e7bfdfdeadb4
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200414113734-e7bfdfdeadb4/go.mod h1:kwsrd0Bx+gxDduZ81c4EEPLvX8Fq18mS8IO6My0w7i4=
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200414120247-a06d8ee8462f h1:fouxyVYoykpAXWKfglsPmviJJSArbLCMzxW6ItQuDkQ=
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200414120247-a06d8ee8462f/go.mod h1:kwsrd0Bx+gxDduZ81c4EEPLvX8Fq18mS8IO6My0w7i4=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200415114502-7d3f7b8d57cf h1:tI8saQvh756nAPyGtpphBu/NL1l0LK4gD9iEf0ltn00=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200415114502-7d3f7b8d57cf/go.mod h1:kwsrd0Bx+gxDduZ81c4EEPLvX8Fq18mS8IO6My0w7i4=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646 h1:RBFYLyw63VEg6zuze32clu4wRelss04GvPURqmEZYAg=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646/go.mod h1:FE9gkAN0FmpANjoPl37hKcNHD103f0TKKN8Eq41KoLw=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20200110075310-a6443f3732ca h1:7kQ3CpXWRgxZnG2Y1YeKPpqqAgWc88UJmLni+YC8yJI=
@@ -79,6 +84,9 @@ github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20200203091953-e633762449d
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20200203091953-e633762449d8/go.mod h1:gR9xIUGXXd0e4Witx4Zgga+LnovD7WDzUhN3pptaLAU=
 github.com/chaosblade-io/chaosblade-operator v0.5.0 h1:9EIJwVUNOzJlQjtlIBMDmAu7eK83r5lozfdW/W/XIgk=
 github.com/chaosblade-io/chaosblade-operator v0.5.0/go.mod h1:3KP+68a/l/pM57Od3pl9iwVbyEx+7tHB736WvOPr2gk=
+github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200417092441-0e5a98b23726 h1:jEeYP9yTgriYdl5pxm1q6pZx0SaqmDsGyG/6TD80sdg=
+github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200417092441-0e5a98b23726/go.mod h1:dLwcN3ZHzN6Pecvft1/cCIapsEELqYE6B1D+q85dfEc=
+github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200420053347-b3c734a482c3/go.mod h1:dLwcN3ZHzN6Pecvft1/cCIapsEELqYE6B1D+q85dfEc=
 github.com/chaosblade-io/chaosblade-spec-go v0.4.0/go.mod h1:ybcCsIX1wZtPrH0IsI28yDNJ+AVPeDMUZlgw1HE++Ds=
 github.com/chaosblade-io/chaosblade-spec-go v0.4.1-0.20191225105920-8d7c5f186698 h1:vO6v4Ku7WdMZvgQAhyBUM10i+nn7NNoO1rOQ5ORaGCg=
 github.com/chaosblade-io/chaosblade-spec-go v0.4.1-0.20191225105920-8d7c5f186698/go.mod h1:/U5pOQIrBm82Xo8HB9mPjZHHira4dFiJzCB1UNkyPyk=
@@ -136,6 +144,7 @@ github.com/emicklei/go-restful v2.8.1+incompatible/go.mod h1:otzb+WCGbkyDHkqmQmT
 github.com/emicklei/go-restful v2.9.3+incompatible h1:2OwhVdhtzYUp5P5wuGsVDPagKSRd9JK72sJCHVCXh5g=
 github.com/emicklei/go-restful v2.9.3+incompatible/go.mod h1:otzb+WCGbkyDHkqmQmT5YD2WR4BBwUdeQoFo8l/7tVs=
 github.com/emicklei/go-restful-swagger12 v0.0.0-20170926063155-7524189396c6/go.mod h1:qr0VowGBT4CS4Q8vFF8BSeKz34PuqKGxs/L0IAQA9DQ=
+github.com/ethercflow/hookfs v0.3.0/go.mod h1:c4t7EbwfiU+xsSjeZrlup9p5boB/PT3HD9sTq57K/4M=
 github.com/evanphx/json-patch v3.0.0+incompatible/go.mod h1:50XU6AFN0ol/bzJsmQLiYLvXMP4fmwYFNcr97nuDLSk=
 github.com/evanphx/json-patch v4.0.0+incompatible/go.mod h1:50XU6AFN0ol/bzJsmQLiYLvXMP4fmwYFNcr97nuDLSk=
 github.com/evanphx/json-patch v4.1.0+incompatible/go.mod h1:50XU6AFN0ol/bzJsmQLiYLvXMP4fmwYFNcr97nuDLSk=
@@ -238,6 +247,8 @@ github.com/grpc-ecosystem/grpc-gateway v1.6.2/go.mod h1:RSKVYQBd5MCa4OVpNdGskqpg
 github.com/grpc-ecosystem/grpc-gateway v1.6.3/go.mod h1:RSKVYQBd5MCa4OVpNdGskqpgL2+G+NZTnrVHpWWfpdw=
 github.com/grpc-ecosystem/grpc-gateway v1.8.5/go.mod h1:vNeuVxBJEsws4ogUvrchl83t/GYV9WGTSLVdBhOQFDY=
 github.com/grpc-ecosystem/grpc-health-probe v0.2.0/go.mod h1:4GVx/bTCtZaSzhjbGueDY5YgBdsmKeVx+LErv/n0L6s=
+github.com/hanwen/go-fuse v0.0.0-20190111173210-425e8d5301f6/go.mod h1:unqXarDXqzAk0rt98O2tVndEPIpUgLD9+rwFisZH3Ok=
+github.com/hanwen/go-fuse v1.0.0/go.mod h1:unqXarDXqzAk0rt98O2tVndEPIpUgLD9+rwFisZH3Ok=
 github.com/hashicorp/golang-lru v0.0.0-20160207214719-a0d98a5f2880/go.mod h1:/m3WP610KZHVQ1SGc6re/UDhFvYD7pJ4Ao+sR/qLZy8=
 github.com/hashicorp/golang-lru v0.5.0/go.mod h1:/m3WP610KZHVQ1SGc6re/UDhFvYD7pJ4Ao+sR/qLZy8=
 github.com/hashicorp/golang-lru v0.5.1 h1:0hERBMJE1eitiLkihrMvRVBYAkpHzc/J3QdDN+dAcgU=
@@ -364,6 +375,7 @@ github.com/shirou/w32 v0.0.0-20160930032740-bb4de0191aa4/go.mod h1:qsXQc7+bwAM3Q
 github.com/shurcooL/sanitized_anchor_name v1.0.0/go.mod h1:1NzhyTcUVG4SuEtjjoZeVRXNmyL/1OwPU0+IJeTBvfc=
 github.com/sirupsen/logrus v1.1.1/go.mod h1:zrgwTnHtNr00buQ1vSptGe8m1f/BbgsPukg8qsT7A+A=
 github.com/sirupsen/logrus v1.2.0/go.mod h1:LxeOpSwHxABJmUn/MG1IvRgCAasNZTLOkJPxbbu5VWo=
+github.com/sirupsen/logrus v1.3.0/go.mod h1:LxeOpSwHxABJmUn/MG1IvRgCAasNZTLOkJPxbbu5VWo=
 github.com/sirupsen/logrus v1.4.1/go.mod h1:ni0Sbl8bgC9z8RoU9G6nDWqqs/fq4eDPysMBDgk/93Q=
 github.com/sirupsen/logrus v1.4.2 h1:SPIRibHv4MatM3XXNO2BJeFLZwZ2LvZgfQ5+UNI2im4=
 github.com/sirupsen/logrus v1.4.2/go.mod h1:tLMulIdttU9McNUspp0xgXVQah82FyeX6MwdIuYE2rE=

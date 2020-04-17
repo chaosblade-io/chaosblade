@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/sirupsen/logrus"
 )
 
@@ -56,7 +57,11 @@ type ExperimentSource interface {
 	QueryExperimentModelByUid(uid string) (*ExperimentModel, error)
 
 	// QueryExperimentModels
-	QueryExperimentModels(target, status, limit string, asc bool) ([]*ExperimentModel, error)
+	QueryExperimentModels(target, action, status, limit string, asc bool) ([]*ExperimentModel, error)
+
+	// QueryExperimentModelsByCommand
+	// flags value contains necessary parameters generally
+	QueryExperimentModelsByCommand(command, subCommand string, flags map[string]string) ([]*ExperimentModel, error)
 }
 
 const expTableDDL = `CREATE TABLE IF NOT EXISTS experiment (
@@ -187,12 +192,16 @@ func (s *Source) QueryExperimentModelByUid(uid string) (*ExperimentModel, error)
 	return models[0], nil
 }
 
-func (s *Source) QueryExperimentModels(target, status, limit string, asc bool) ([]*ExperimentModel, error) {
+func (s *Source) QueryExperimentModels(target, action, status, limit string, asc bool) ([]*ExperimentModel, error) {
 	sql := `SELECT * FROM experiment where 1=1`
 	parameters := make([]interface{}, 0)
 	if target != "" {
 		sql = fmt.Sprintf(`%s and command = ?`, sql)
 		parameters = append(parameters, target)
+	}
+	if action != "" {
+		sql = fmt.Sprintf(`%s and sub_command = ?`, sql)
+		parameters = append(parameters, action)
 	}
 	if status != "" {
 		sql = fmt.Sprintf(`%s and status = ?`, sql)
@@ -227,6 +236,35 @@ func (s *Source) QueryExperimentModels(target, status, limit string, asc bool) (
 	}
 	defer rows.Close()
 	return getExperimentModelsFrom(rows)
+}
+
+func (s *Source) QueryExperimentModelsByCommand(command, subCommand string, flags map[string]string) ([]*ExperimentModel, error) {
+	models := make([]*ExperimentModel, 0)
+	experimentModels, err := s.QueryExperimentModels(command, subCommand, "", "", true)
+	if err != nil {
+		return models, err
+	}
+	if flags == nil || len(flags) == 0 {
+		return experimentModels, nil
+	}
+	for _, experimentModel := range experimentModels {
+		recordModel := spec.ConvertCommandsToExpModel(subCommand, command, experimentModel.Flag)
+		recordFlags := recordModel.ActionFlags
+		isMatched := true
+		for k, v := range flags {
+			if v == "" {
+				continue
+			}
+			if recordFlags[k] != v {
+				isMatched = false
+				break
+			}
+		}
+		if isMatched {
+			models = append(models, experimentModel)
+		}
+	}
+	return models, nil
 }
 
 func getExperimentModelsFrom(rows *sql.Rows) ([]*ExperimentModel, error) {

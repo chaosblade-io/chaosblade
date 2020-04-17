@@ -78,7 +78,7 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 		if uid != "" {
 			result, err = GetDS().QueryExperimentModelByUid(uid)
 		} else {
-			result, err = GetDS().QueryExperimentModels(sc.target, sc.status, sc.limit, sc.asc)
+			result, err = GetDS().QueryExperimentModels(sc.target, "", sc.status, sc.limit, sc.asc)
 		}
 	case "prepare", "revoke", "p", "r":
 		if uid != "" {
