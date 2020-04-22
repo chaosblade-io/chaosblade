@@ -198,6 +198,10 @@ items:
         it.
       noArgs: false
       required: false
+    - name: exclude-ip
+      desc: exclude ip
+      noArgs: false
+      required: false
     - name: interface
       desc: Network interface, for example, eth0
       noArgs: false
