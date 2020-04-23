@@ -101,7 +101,6 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 	currUser, err := osuser.Current()
 	if err != nil {
 		logrus.Warnf("get current user info failed, %v", err)
-		//log.V(-1).Info("get current user info failed", "err_msg", err.Error())
 	}
 	var response *spec.Response
 	if currUser != nil && (currUser.Username == username) {
@@ -110,9 +109,6 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 		if currUser != nil {
 			logrus.Debugf("current user name is %s, not equal %s, so use sudo command to execute",
 				currUser.Username, username)
-			//1=DEBUG
-			//log.V(1).Info("current user name is not equal username, so use sudo command to execute",
-			//	"current_username", currUser.Username, "username", username)
 		}
 		response = cl.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", username, javaBin, javaArgs))
 	}

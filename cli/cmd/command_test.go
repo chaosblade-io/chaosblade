@@ -236,3 +236,7 @@ func (*MockSource) QueryPreparationRecords(target, status, limit string, asc boo
 func (*MockSource) QueryExperimentModelsByCommand(command, subCommand string, flags map[string]string) ([]*data.ExperimentModel, error) {
 	return make([]*data.ExperimentModel, 0), nil
 }
+
+func (*MockSource) DeleteExperimentModelByUid(uid string) error {
+	return nil
+}

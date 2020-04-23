@@ -6,7 +6,7 @@ require (
 	github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200420053331-524a764ee2e1
 	github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200415114502-7d3f7b8d57cf
 	github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200420053347-b3c734a482c3
-	github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200413053019-c6149ff993b4
+	github.com/chaosblade-io/chaosblade-spec-go v0.5.1-0.20200423014225-aa78604fa1f2
 	github.com/mattn/go-sqlite3 v1.10.1-0.20190217174029-ad30583d8387
 	github.com/prometheus/common v0.2.0
 	github.com/shirou/gopsutil v2.19.9+incompatible
@@ -16,6 +16,7 @@ require (
 	golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550
 	k8s.io/apimachinery v0.17.0
 	k8s.io/client-go v11.0.0+incompatible
+	sigs.k8s.io/controller-runtime v0.1.12
 )
 
 // Pinned to kubernetes-1.13.11

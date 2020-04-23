@@ -28,10 +28,12 @@ import (
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const ResourceName = "chaosblades"
@@ -56,8 +58,10 @@ func (*Executor) Name() string {
 func (e *Executor) SetChannel(channel spec.Channel) {
 }
 
+var cli client.Client
+
 func QueryStatus(operation, uid, kubeconfig string) (*spec.Response, bool) {
-	client, err := newClient(kubeconfig)
+	client, err := getClient(kubeconfig)
 	if err != nil {
 		return spec.ReturnFailWitResult(spec.Code[spec.K8sInvokeError], err.Error(),
 			CreateConfirmFailedStatusResult(uid, err.Error())), true
@@ -112,7 +116,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 			config = ""
 		}
 	}
-	client, err := newClient(config)
+	client, err := getClient(config)
 	if err != nil {
 		return spec.ReturnFailWitResult(spec.Code[spec.K8sInvokeError], err.Error(),
 			CreateConfirmFailedStatusResult(uid, err.Error()))
@@ -165,8 +169,8 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 	return response
 }
 
-func (*Executor) destroy(client rest.Interface, uid string, config string) (*spec.Response, bool) {
-	err := delete(client, uid, &metav1.DeleteOptions{})
+func (*Executor) destroy(cli client.Client, uid string, config string) (*spec.Response, bool) {
+	err := delete(cli, uid)
 	if err != nil {
 		return spec.ReturnFailWitResult(spec.Code[spec.K8sInvokeError], err.Error(),
 			CreateStatusResult(uid, false, err.Error(), nil)), true
@@ -175,12 +179,12 @@ func (*Executor) destroy(client rest.Interface, uid string, config string) (*spe
 	return QueryStatus(QueryDestroy, uid, config)
 }
 
-func (e *Executor) create(client rest.Interface, kubeconfig string, uid string, expModel *spec.ExpModel) (*spec.Response, bool) {
+func (e *Executor) create(cli client.Client, kubeconfig string, uid string, expModel *spec.ExpModel) (*spec.Response, bool) {
 	logrus.Infof("create uid: %s, target: %s, scope: %s, action: %s", uid, expModel.Target, expModel.Scope, expModel.ActionName)
 	//log.Info("create", "uid", uid, "target", expModel.Target, "scope", expModel.Scope, "action", expModel.ActionName)
 	chaosBladeObj := convertExpModelToChaosBladeObject(uid, expModel)
 	var err error
-	resource, err := create(client, &chaosBladeObj)
+	resource, err := create(cli, &chaosBladeObj)
 	if err != nil {
 		return spec.ReturnFailWitResult(spec.Code[spec.K8sInvokeError],
 			fmt.Sprintf("create err, %v", err),
@@ -192,12 +196,12 @@ func (e *Executor) create(client rest.Interface, kubeconfig string, uid string, 
 	return QueryStatus(QueryCreate, uid, kubeconfig)
 }
 
-func (e *Executor) checkCreateStatus(uid string, store cache.Store, client rest.Interface,
+func (e *Executor) checkCreateStatus(uid string, store cache.Store, cli client.Client,
 	resource *v1alpha1.ChaosBlade) *spec.Response {
 	var chaosblade *v1alpha1.ChaosBlade
 	item, _, err := store.GetByKey(resource.Name)
 	if err != nil || item == nil {
-		chaosblade, err = get(client, resource.Name)
+		chaosblade, err = get(cli, resource.Name)
 	} else {
 		chaosblade = item.(*v1alpha1.ChaosBlade)
 	}
@@ -308,40 +312,41 @@ func convertFlagsToResourceFlags(flags map[string]string) []v1alpha1.FlagSpec {
 	return flagSpecs
 }
 
-func get(client rest.Interface, name string) (result *v1alpha1.ChaosBlade, err error) {
+func get(cli client.Client, name string) (result *v1alpha1.ChaosBlade, err error) {
 	result = &v1alpha1.ChaosBlade{}
-	err = client.Get().
-		Resource(ResourceName).
-		Name(name).
-		Do().
-		Into(result)
+	err = cli.Get(context.TODO(), types.NamespacedName{Name: name}, result)
 	return
 }
 
-func create(client rest.Interface, chaosblade *v1alpha1.ChaosBlade) (result *v1alpha1.ChaosBlade, err error) {
-	result = &v1alpha1.ChaosBlade{}
-	err = client.Post().
-		Resource(ResourceName).
-		Body(chaosblade).
-		Do().
-		Into(result)
-	return
+func create(cli client.Client, chaosblade *v1alpha1.ChaosBlade) (result *v1alpha1.ChaosBlade, err error) {
+	err = cli.Create(context.TODO(), chaosblade)
+	if err != nil {
+		return nil, err
+	}
+	return get(cli, chaosblade.Name)
 }
 
-func delete(client rest.Interface, name string, options *metav1.DeleteOptions) error {
-	return client.Delete().
-		Resource(ResourceName).
-		Name(name).
-		Body(options).
-		Do().
-		Error()
+func delete(cli client.Client, name string) error {
+	objectMeta := metav1.ObjectMeta{Name: name}
+	return cli.Delete(context.TODO(), &v1alpha1.ChaosBlade{ObjectMeta: objectMeta})
 }
 
-type ChaosBladeV1Alpha1Client struct {
-	restClient rest.Interface
+func update(cli client.Client, chaosblade *v1alpha1.ChaosBlade) error {
+	return cli.Update(context.TODO(), chaosblade)
 }
 
-func newClient(kubeConfig string) (rest.Interface, error) {
+func getClient(kubeconfig string) (client.Client, error) {
+	if cli == nil {
+		c, err := newClient(kubeconfig)
+		if err != nil {
+			return nil, err
+		}
+		cli = c
+	}
+	return cli, nil
+}
+
+func newClient(kubeConfig string) (client.Client, error) {
 	var clusterConfig *rest.Config
 	var err error
 	if kubeConfig == "" {
@@ -365,13 +370,11 @@ func newClient(kubeConfig string) (rest.Interface, error) {
 	clusterConfig.APIPath = "/apis"
 	clusterConfig.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: scheme.Codecs}
 	clusterConfig.UserAgent = rest.DefaultKubernetesUserAgent()
-
-	client, err := rest.RESTClientFor(clusterConfig)
+	scheme, err := v1alpha1.SchemeBuilder.Build()
 	if err != nil {
 		return nil, err
 	}
-	bladeV1Alpha1Client := &ChaosBladeV1Alpha1Client{restClient: client}
-	return bladeV1Alpha1Client.restClient, nil
+	return client.New(clusterConfig, client.Options{Scheme: scheme})
 }
 
 func completed(operation string, statusResult StatusResult) bool {
@@ -380,4 +383,25 @@ func completed(operation string, statusResult StatusResult) bool {
 	}
 	statuses := statusResult.Statuses
 	return statuses != nil && len(statuses) > 0
+}
+
+func GetChaosBladeByName(name, kubeconfig string) (result *v1alpha1.ChaosBlade, err error) {
+	client, err := getClient(kubeconfig)
+	if err != nil {
+		return nil, err
+	}
+	return get(client, name)
+}
+
+func RemoveFinalizer(name, kubeconfig string) error {
+	cli, err := getClient(kubeconfig)
+	if err != nil {
+		return err
+	}
+	chaosblade, err := get(cli, name)
+	if err != nil {
+		return err
+	}
+	chaosblade.Finalizers = []string{}
+	return update(cli, chaosblade)
 }

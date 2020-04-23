@@ -62,6 +62,9 @@ type ExperimentSource interface {
 	// QueryExperimentModelsByCommand
 	// flags value contains necessary parameters generally
 	QueryExperimentModelsByCommand(command, subCommand string, flags map[string]string) ([]*ExperimentModel, error)
+
+	// DeleteExperimentModelByUid
+	DeleteExperimentModelByUid(uid string) error
 }
 
 const expTableDDL = `CREATE TABLE IF NOT EXISTS experiment (
@@ -289,4 +292,16 @@ func getExperimentModelsFrom(rows *sql.Rows) ([]*ExperimentModel, error) {
 		models = append(models, model)
 	}
 	return models, nil
+}
+
+func (s *Source) DeleteExperimentModelByUid(uid string) error {
+	stmt, err := s.DB.Prepare(`DELETE FROM experiment WHERE uid = ?`)
+	if err != nil {
+		return err
+	}
+	_, err = stmt.Exec(uid)
+	if err != nil {
+		return err
+	}
+	return nil
 }
