@@ -1,4 +1,4 @@
-FROM golang:1.14.0 AS builder
+FROM golang:1.14.2 AS builder
 LABEL maintainer="Changjun Xiao, Ming Cheng"
 
 ARG BLADE_VERSION=0.0.1
@@ -35,7 +35,7 @@ RUN make clean && \
   mv -f ${BLADE_BUILD_PATH}/target/chaosblade-${BLADE_VERSION} /usr/local/chaosblade
 
 # Stage2
-FROM alpine:3.10.4
+FROM alpine:3.10.5
 
 # @from https://mirrors.ustc.edu.cn/help/alpine.html
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
