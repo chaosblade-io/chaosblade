@@ -76,7 +76,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		if err != nil {
 			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 		}
-		result, err, code = util.PostCurl(url_, body)
+		result, err, code = util.PostCurl(url_, body, "")
 	}
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())

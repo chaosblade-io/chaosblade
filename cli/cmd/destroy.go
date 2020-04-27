@@ -138,7 +138,7 @@ func (dc *DestroyCommand) destroyAndRemoveExperimentByUidAndForceFlag(
 // destroyExperimentByUid destroys experiments with local records, including k8s experiments.
 func (dc *DestroyCommand) destroyExperimentByUid(model *data.ExperimentModel, uid string) (*spec.Response, error) {
 	if model == nil {
-		return nil, spec.Return(spec.Code[spec.DataNotFound])
+		return nil, spec.Return(spec.Code[spec.DataNotFound], false)
 	}
 	if model.Status == Destroyed {
 		result := fmt.Sprintf("command: %s %s %s, destroy time: %s",

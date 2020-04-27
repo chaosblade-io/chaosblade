@@ -99,7 +99,7 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 		return spec.ReturnFail(spec.Code[spec.DatabaseError], err.Error())
 	}
 	if util.IsNil(result) {
-		return spec.Return(spec.Code[spec.DataNotFound])
+		return spec.Return(spec.Code[spec.DataNotFound], false)
 	}
 	response := spec.ReturnSuccess(result)
 
