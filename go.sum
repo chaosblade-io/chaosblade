@@ -55,6 +55,11 @@ github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200417015215-9570469b
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200417015215-9570469b2ee9/go.mod h1:r8uJ9dUyuNARD/DMuYOREbav/57KiGxTezIe5EnHYCI=
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200420053331-524a764ee2e1 h1:It/fEM7n3U6Ef4kwxeGQlaC+Prv0uf4ky9xeZNXdqIc=
 github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200420053331-524a764ee2e1/go.mod h1:r8uJ9dUyuNARD/DMuYOREbav/57KiGxTezIe5EnHYCI=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200427074239-509ea92096f1/go.mod h1:xocO0MzuNuDoahWu991c/RSwusH9McE1sLAiA4rdm7A=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200427112110-7235bcf2057c h1:ciuz5EnC+5sLsHnqKUboFkehFd3RIupWXFczpOVxiJI=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200427112110-7235bcf2057c/go.mod h1:GqZ1x3Enbxobjhgf3mHA0/rLQi/k9o/QbaNdIGOTwBA=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200427181253-0f01189464d7 h1:arQewIlqNlWixe4UUHLRWJx6n4iDOQYphEQwnWqSLqg=
+github.com/chaosblade-io/chaosblade-exec-docker v0.5.1-0.20200427181253-0f01189464d7/go.mod h1:N12vh+PcPYqXqW8ZiLNzXBBz4Z7nh5hHSm88aeYalhg=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.0 h1:yNUGhBFD3dA2+BulDCXL8fAyZvmiOp+HVOczvhVke1c=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.0/go.mod h1:os4QqiAHjuzurJFH6JdMayqjMsNhUWD9LL8nlb0TEJk=
 github.com/chaosblade-io/chaosblade-exec-os v0.4.1-0.20200110074748-6dcc3e972904 h1:FZ/5pgI3c3e0U2zF7nljRdVYEh7qsZq9QNsbE7GrjeY=
@@ -79,6 +84,11 @@ github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200415114502-7d3f7b8d57cf
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200415114502-7d3f7b8d57cf/go.mod h1:kwsrd0Bx+gxDduZ81c4EEPLvX8Fq18mS8IO6My0w7i4=
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200427070718-1dac8677bcab h1:CF6YeW4iprtxxib+p8R+1u7eHB18KzFuwIdkbFCVHzg=
 github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200427070718-1dac8677bcab/go.mod h1:Cti07ZTH9GPGKBUxFz1Ast5BulhJTUFsswLwkoJB9FI=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200427111520-92bba858bd9a/go.mod h1:Cti07ZTH9GPGKBUxFz1Ast5BulhJTUFsswLwkoJB9FI=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200427173354-2cc554c3eccc h1:tQSR/XL4ewRWrCQc0NOExlQ74NS9PAS/rgqzi76xkI8=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200427173354-2cc554c3eccc/go.mod h1:Cti07ZTH9GPGKBUxFz1Ast5BulhJTUFsswLwkoJB9FI=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200427181027-059c92d02189 h1:2tWg41yFctCJo3stvXgBr9kr1v/3sQDLaCQQ3nwu89I=
+github.com/chaosblade-io/chaosblade-exec-os v0.5.1-0.20200427181027-059c92d02189/go.mod h1:Cti07ZTH9GPGKBUxFz1Ast5BulhJTUFsswLwkoJB9FI=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646 h1:RBFYLyw63VEg6zuze32clu4wRelss04GvPURqmEZYAg=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646/go.mod h1:FE9gkAN0FmpANjoPl37hKcNHD103f0TKKN8Eq41KoLw=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20200110075310-a6443f3732ca h1:7kQ3CpXWRgxZnG2Y1YeKPpqqAgWc88UJmLni+YC8yJI=
@@ -93,6 +103,10 @@ github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200420053347-b3c734a482c
 github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200420053347-b3c734a482c3/go.mod h1:dLwcN3ZHzN6Pecvft1/cCIapsEELqYE6B1D+q85dfEc=
 github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200424055402-f02946ef750d h1:/690Wt6NFFuSSX6/hCFDSIOD2et7Hv8x+eeYGdo+KOI=
 github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200424055402-f02946ef750d/go.mod h1:F7fJTJSufmfFw/tpXZGIMXB/mvI+BYnqHU05iwTjYd0=
+github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200427074600-738d097bac44 h1:UP0E3IRaz99TTQelPrU5RbjA10EzdCXihCbkqKgQHYA=
+github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200427074600-738d097bac44/go.mod h1:47sasTcvtM0xTV75o8hgxHVGsHVleOs/ekuw9uFiXro=
+github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200428050021-e3c4ee289585 h1:fzY6JjaUw3L1fpjmoDMwGtI7SCIEGutJb+NqC/A3b6o=
+github.com/chaosblade-io/chaosblade-operator v0.5.1-0.20200428050021-e3c4ee289585/go.mod h1:AXyZKpbrvtzRInIzKojh+DDk4C1nsIQih3lpgqS39bo=
 github.com/chaosblade-io/chaosblade-spec-go v0.4.0/go.mod h1:ybcCsIX1wZtPrH0IsI28yDNJ+AVPeDMUZlgw1HE++Ds=
 github.com/chaosblade-io/chaosblade-spec-go v0.4.1-0.20191225105920-8d7c5f186698 h1:vO6v4Ku7WdMZvgQAhyBUM10i+nn7NNoO1rOQ5ORaGCg=
 github.com/chaosblade-io/chaosblade-spec-go v0.4.1-0.20191225105920-8d7c5f186698/go.mod h1:/U5pOQIrBm82Xo8HB9mPjZHHira4dFiJzCB1UNkyPyk=
