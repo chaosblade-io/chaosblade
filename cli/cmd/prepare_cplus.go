@@ -29,10 +29,8 @@ import (
 
 type PrepareCPlusCommand struct {
 	baseCommand
-	port           int
-	scriptLocation string
-	waitTime       int
-	javaHome       string
+	port int
+	ip   string
 }
 
 func (pc *PrepareCPlusCommand) Init() {
@@ -46,14 +44,12 @@ func (pc *PrepareCPlusCommand) Init() {
 		Example: pc.prepareExample(),
 	}
 	pc.command.Flags().IntVarP(&pc.port, "port", "p", 8703, "the server port of cplus proxy")
-	pc.command.Flags().StringVarP(&pc.scriptLocation, "script-location", "l", "", "the script files directory")
-	pc.command.Flags().IntVarP(&pc.waitTime, "wait-time", "w", 6, "waiting time of preparation phase, unit is second")
-	pc.command.Flags().StringVarP(&pc.javaHome, "javaHome", "j", "", "the java jdk home path")
+	pc.command.Flags().StringVarP(&pc.ip, "ip", "i", "", "the server ip")
 	pc.command.MarkFlagRequired("port")
 }
 
 func (pc *PrepareCPlusCommand) prepareExample() string {
-	return `prepare cplus --port 8703 --wait-time 10`
+	return `prepare cplus --port 8703`
 }
 
 func (pc *PrepareCPlusCommand) prepareCPlus() error {
@@ -70,6 +66,6 @@ func (pc *PrepareCPlusCommand) prepareCPlus() error {
 				fmt.Sprintf("insert prepare record err, %s", err.Error()))
 		}
 	}
-	response := cplus.Prepare(portStr, pc.scriptLocation, pc.waitTime, pc.javaHome)
+	response := cplus.Prepare(portStr, pc.ip)
 	return handlePrepareResponse(record.Uid, pc.command, response)
 }

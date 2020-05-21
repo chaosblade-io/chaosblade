@@ -18,10 +18,9 @@ package cplus
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
@@ -29,70 +28,40 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
-const ApplicationName = "chaosblade-exec-cplus.jar"
+const ApplicationName = "chaosblade-exec-cplus"
 const RemoveAction = "remove"
 
-var cplusJarPath = path.Join(util.GetLibHome(), "cplus", ApplicationName)
+var cplusBinPath = path.Join(util.GetLibHome(), "cplus", ApplicationName)
 var scriptDefaultPath = path.Join(util.GetLibHome(), "cplus", "script")
 
 // 启动 spring boot application，需要校验程序是否已启动
-func Prepare(port, scriptLocation string, waitTime int, javaHome string) *spec.Response {
-	if scriptLocation == "" {
-		scriptLocation = scriptDefaultPath + "/"
-	}
-	response := preCheck(port, scriptLocation)
+func Prepare(port, ip string) *spec.Response {
+
+	response := preCheck(port)
 	if !response.Success {
 		return response
 	}
-	javaBin, err := getJavaBin(javaHome)
-	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.FileNotFound], err.Error())
-	}
-	response = startProxy(port, scriptLocation, javaBin)
+	response = startProxy(port, ip)
 	if !response.Success {
 		return response
 	}
-	// wait seconds
-	time.Sleep(time.Duration(waitTime) * time.Second)
 	return postCheck(port)
 }
 
-// getJavaBin returns the java bin path
-func getJavaBin(javaHome string) (string, error) {
-	if javaHome == "" {
-		// check java bin
-		response := channel.NewLocalChannel().Run(context.Background(), "java", "-version")
-		if response.Success {
-			return "java", nil
-		}
-		// get java home
-		javaHome = os.Getenv("JAVA_HOME")
-		if javaHome == "" {
-			return "", fmt.Errorf("JAVA_HOME not found")
-		}
-	}
-	javaBin := path.Join(javaHome, "bin", "java")
-	response := channel.NewLocalChannel().Run(context.Background(), javaBin, "-version")
-	if !response.Success {
-		return "", fmt.Errorf(response.Err)
-	}
-	return javaBin, nil
-}
-
-func preCheck(port, scriptLocation string) *spec.Response {
+func preCheck(port string) *spec.Response {
 	// check spring boot application
 	if processExists(port) {
-		return spec.ReturnFail(spec.Code[spec.DuplicateError], "the server proxy has been started")
+		return spec.ReturnSuccess("the server proxy has been started")
 	}
 	// check chaosblade-exec-cplus.jar file exists or not
-	if !util.IsExist(cplusJarPath) {
+	if !util.IsExist(cplusBinPath) {
 		return spec.ReturnFail(spec.Code[spec.FileNotFound],
 			fmt.Sprintf("the %s proxy jar file not found in %s dir", ApplicationName, util.GetLibHome()))
 	}
 	// check script file
-	if !util.IsExist(scriptLocation) {
+	if !util.IsExist(scriptDefaultPath) {
 		return spec.ReturnFail(spec.Code[spec.FileNotFound],
-			fmt.Sprintf("the %s script file dir not found", scriptLocation))
+			fmt.Sprintf("the %s script file dir not found", scriptDefaultPath))
 	}
 	// check the port has been used or not
 	portInUse := util.CheckPortInUse(port)
@@ -112,14 +81,12 @@ func processExists(port string) bool {
 	return false
 }
 
-// startProxy invokes `nohup java -jar chaosblade-exec-cplus-1.0-SNAPSHOT1.jar --server.port=8703 --script.location=xxx &`
-func startProxy(port, scriptLocation, javaBin string) *spec.Response {
-	args := fmt.Sprintf("%s -jar %s --server.port=%s --script.location=%s >> %s 2>&1 &",
-		javaBin,
-		cplusJarPath,
-		port, scriptLocation,
-		util.GetNohupOutput(util.Blade, util.BladeLog))
-	return channel.NewLocalChannel().Run(context.Background(), "nohup", args)
+func startProxy(port, ip string) *spec.Response {
+	args := fmt.Sprintf("--port %s", port)
+	if ip != "" {
+		args = fmt.Sprintf("%s --ip %s", args, ip)
+	}
+	return channel.NewLocalChannel().Run(context.Background(), cplusBinPath, args)
 }
 
 func postCheck(port string) *spec.Response {
@@ -127,9 +94,7 @@ func postCheck(port string) *spec.Response {
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError], err.Error())
 	}
-	var resp spec.Response
-	json.Unmarshal([]byte(result), &resp)
-	return &resp
+	return spec.ReturnSuccess(result)
 }
 
 // 停止 spring boot application
@@ -142,7 +107,18 @@ func Revoke(port string) *spec.Response {
 	// Get http://127.0.0.1:xxx/remove: EOF, doesn't to check the result
 	util.Curl(getProxyServiceUrl(port, RemoveAction))
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(time.Second)
+	ctx := context.WithValue(context.Background(), channel.ExcludeProcessKey, "blade")
+	pids, err := channel.NewLocalChannel().GetPidsByProcessName(ApplicationName, ctx)
+	if err != nil {
+		return spec.ReturnFail(spec.Code[spec.ServerError], fmt.Sprintf("query process failed, %v", err))
+	}
+	if len(pids) > 0 {
+		response := channel.NewLocalChannel().Run(context.Background(), "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
+		if !response.Success {
+			return response
+		}
+	}
 	// revoke failed if the check operation returns success
 	response := postCheck(port)
 	if response.Success {
