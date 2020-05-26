@@ -99,11 +99,13 @@ func (dc *DestroyCommand) destroyAndRemoveK8sExperimentWithoutRecordByForceFlag(
 			fmt.Sprintf("the %s has been destroyed, but forcibly remove resource failed, %v", uid, removeResourceErr))
 	}
 	response = err.(*spec.Response)
-	if removeResourceErr == nil {
+	if dc.forceRemove && removeResourceErr == nil {
 		response.Err = fmt.Sprintf("forcibly remove %s resource success, but destroy the experiment failed, %s", uid, response.Err)
 		return response
 	}
-	response.Err = fmt.Sprintf("destroy and forcibly remove the %s experiment failed, %s, %v", uid, response.Err, removeResourceErr)
+	if dc.forceRemove {
+		response.Err = fmt.Sprintf("destroy and forcibly remove the %s experiment failed, %s, %v", uid, response.Err, removeResourceErr)
+	}
 	return response
 }
 
@@ -126,12 +128,14 @@ func (dc *DestroyCommand) destroyAndRemoveExperimentByUidAndForceFlag(
 				uid, removeRecordErr, removeResourceErr))
 	}
 	response = err.(*spec.Response)
-	if removeRecordErr == nil && removeResourceErr == nil {
+	if dc.forceRemove && removeRecordErr == nil && removeResourceErr == nil {
 		response.Err = fmt.Sprintf("forcibly remove %s resource success, but destroy the experiment failed, %s", uid, response.Err)
 		return response
 	}
-	response.Err = fmt.Sprintf("destroy and forcibly remove the %s experiment failed, %s, %v|%v",
-		uid, response.Err, removeRecordErr, removeResourceErr)
+	if dc.forceRemove {
+		response.Err = fmt.Sprintf("destroy and forcibly remove the %s experiment failed, %s, %v|%v",
+			uid, response.Err, removeRecordErr, removeResourceErr)
+	}
 	return response
 }
 
