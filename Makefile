@@ -186,8 +186,9 @@ build_linux_with_arg:
 	docker build -f build/image/musl/Dockerfile -t chaosblade-build-musl:latest build/image/musl
 	docker run --rm \
 		-v $(shell echo -n ${GOPATH}):/go \
-		-w /go/src/github.com/chaosblade-io/chaosblade \
+		-w /opt/chaosblade \
 		-v ~/.m2/repository:/root/.m2/repository \
+		-v $(shell pwd):/opt/chaosblade \
 		chaosblade-build-musl:latest build_with $$ARGS
 
 # build chaosblade image for chaos
