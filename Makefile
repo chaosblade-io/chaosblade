@@ -11,7 +11,7 @@ endif
 
 BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
-BLADE_SRC_ROOT=`pwd`
+BLADE_SRC_ROOT=$(pwd)
 
 GO_ENV=CGO_ENABLED=1
 GO_MODULE=GO111MODULE=on
@@ -66,7 +66,7 @@ ifeq ($(GOOS), linux)
 endif
 
 # build chaosblade package and image
-build: pre_build build_cli build_os build_docker build_kubernetes build_java build_cplus
+build: pre_build build_cli build_os build_docker build_kubernetes build_cplus
 	# tar package
 	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
 

@@ -1,4 +1,4 @@
-FROM golang:1.12.1
+FROM golang:1.13.1
 LABEL maintainer="Changjun Xiao"
 
 # # The image is used to build chaosblade for musl
@@ -18,7 +18,7 @@ RUN wget http://mirrors.tuna.tsinghua.edu.cn/apache/maven/maven-3/3.6.3/binaries
     && mv apache-maven-3.6.3 /usr/local/apache-maven-3.6.3
 
 RUN apt-get update \
-    && apt-get install -y unzip openjdk-8-jdk
+    && apt-get install -y unzip openjdk-11-jdk
 
 ENV CC /usr/local/musl/bin/musl-gcc
 ENV GOOS linux
