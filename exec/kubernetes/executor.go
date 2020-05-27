@@ -368,7 +368,7 @@ func newClient(kubeConfig string) (client.Client, error) {
 	}
 	clusterConfig.ContentConfig.GroupVersion = &v1alpha1.SchemeGroupVersion
 	clusterConfig.APIPath = "/apis"
-	clusterConfig.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: scheme.Codecs}
+	clusterConfig.NegotiatedSerializer = serializer.WithoutConversionCodecFactory{CodecFactory: scheme.Codecs}
 	clusterConfig.UserAgent = rest.DefaultKubernetesUserAgent()
 	scheme, err := v1alpha1.SchemeBuilder.Build()
 	if err != nil {
