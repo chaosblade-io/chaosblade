@@ -1,6 +1,9 @@
 FROM golang:1.13.1
 LABEL maintainer="Changjun Xiao"
 
+RUN sed -i 's/deb.debian.org/mirrors.163.com/g' /etc/apt/sources.list \
+    && sed -i 's/security.debian.org/mirrors.163.com/g' /etc/apt/sources.list
+
 # # The image is used to build chaosblade for musl
 RUN wget http://www.musl-libc.org/releases/musl-1.1.21.tar.gz \
     && tar -zxvf musl-1.1.21.tar.gz \

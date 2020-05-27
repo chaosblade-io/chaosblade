@@ -11,7 +11,7 @@ env:
 language: go
 
 go:
-    - 1.12.x
+    - 1.14.3
 
 before_script:
     # install kubectl and minikube
