@@ -86,9 +86,10 @@ For bug report, questions and discussions please submit [GitHub Issues](https://
 
 You can also contact us via:
 * Dingding group (recommended for chinese): 23177705
-* Gitter room: [chaosblade community] (https://gitter.im/chaosblade-io/community)
+* Slack group: [chaosblade-io](https://join.slack.com/t/chaosblade-io/shared_invite/zt-f0d3r3f4-TDK13Wr3QRUrAhems28p1w)
+* Gitter room: [chaosblade community](https://gitter.im/chaosblade-io/community)
 * Email: chaosblade.io.01@gmail.com
-* Twitter: [chaosblade.io] (https://twitter.com/ChaosbladeI)
+* Twitter: [chaosblade.io](https://twitter.com/ChaosbladeI)
 
 ## Contributing
 We welcome every contribution, even if it is just punctuation. See details of [CONTRIBUTING](CONTRIBUTING.md)
@@ -108,29 +109,6 @@ The original intention of our open source project is to lower the threshold for 
 
 This project exists thanks to all the people who contribute. [[Contribute](CONTRIBUTING.md)].
 <a href="https://github.com/chaosblade-io/chaosblade/graphs/contributors"><img src="https://opencollective.com/chaosblade/contributors.svg?width=890&button=false" /></a>
-
-### Financial Contributors
-
-Become a financial contributor and help us sustain our community. [[Contribute](https://opencollective.com/chaosblade/contribute)]
-
-#### Individuals
-
-<a href="https://opencollective.com/chaosblade"><img src="https://opencollective.com/chaosblade/individuals.svg?width=890"></a>
-
-#### Organizations
-
-Support this project with your organization. Your logo will show up here with a link to your website. [[Contribute](https://opencollective.com/chaosblade/contribute)]
-
-<a href="https://opencollective.com/chaosblade/organization/0/website"><img src="https://opencollective.com/chaosblade/organization/0/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/1/website"><img src="https://opencollective.com/chaosblade/organization/1/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/2/website"><img src="https://opencollective.com/chaosblade/organization/2/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/3/website"><img src="https://opencollective.com/chaosblade/organization/3/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/4/website"><img src="https://opencollective.com/chaosblade/organization/4/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/5/website"><img src="https://opencollective.com/chaosblade/organization/5/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/6/website"><img src="https://opencollective.com/chaosblade/organization/6/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/7/website"><img src="https://opencollective.com/chaosblade/organization/7/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/8/website"><img src="https://opencollective.com/chaosblade/organization/8/avatar.svg"></a>
-<a href="https://opencollective.com/chaosblade/organization/9/website"><img src="https://opencollective.com/chaosblade/organization/9/avatar.svg"></a>
 
 ## License
 Chaosblade is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.
