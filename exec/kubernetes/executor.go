@@ -315,6 +315,10 @@ func convertFlagsToResourceFlags(flags map[string]string) []v1alpha1.FlagSpec {
 func get(cli client.Client, name string) (result *v1alpha1.ChaosBlade, err error) {
 	result = &v1alpha1.ChaosBlade{}
 	err = cli.Get(context.TODO(), types.NamespacedName{Name: name}, result)
+	result.TypeMeta = metav1.TypeMeta{
+		APIVersion: "chaosblade.io/v1alpha1",
+		Kind:       "ChaosBlade",
+	}
 	return
 }
 
@@ -328,7 +332,13 @@ func create(cli client.Client, chaosblade *v1alpha1.ChaosBlade) (result *v1alpha
 
 func delete(cli client.Client, name string) error {
 	objectMeta := metav1.ObjectMeta{Name: name}
-	return cli.Delete(context.TODO(), &v1alpha1.ChaosBlade{ObjectMeta: objectMeta})
+	return cli.Delete(context.TODO(), &v1alpha1.ChaosBlade{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "chaosblade.io/v1alpha1",
+			Kind:       "ChaosBlade",
+		},
+		ObjectMeta: objectMeta,
+	})
 }
 
 func update(cli client.Client, chaosblade *v1alpha1.ChaosBlade) error {
