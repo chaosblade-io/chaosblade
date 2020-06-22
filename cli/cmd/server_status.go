@@ -2,11 +2,11 @@ package cmd
 
 import (
 	"context"
-	"fmt"
-	"strings"
+	"strconv"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/shirou/gopsutil/process"
 	"github.com/spf13/cobra"
 )
 
@@ -38,15 +38,24 @@ func (ssc *StatusServerCommand) run(cmd *cobra.Command, args []string) error {
 			"status": "up",
 			"port":   "",
 		}
-		response := channel.NewLocalChannel().Run(context.TODO(), "ps", fmt.Sprintf("-p %s | grep port", strings.Join(pids, " ")))
-		fmtStrs := strings.Split(strings.Replace(fmt.Sprintf("%v", response.Result), "\n", "", -1), " ")
-		for i, p := range fmtStrs {
-			if p == "--port" {
-				data["port"] = fmtStrs[i+1]
+		pid, err := strconv.Atoi(pids[0])
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+		}
+		process, err := process.NewProcess(int32(pid))
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+		}
+		cmdlineSlice, err := process.CmdlineSlice()
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+		}
+		for idx, cmd := range cmdlineSlice {
+			if cmd == "--port" {
+				data["port"] = cmdlineSlice[idx+1]
 			}
 		}
-		response = spec.ReturnSuccess(data)
-		ssc.command.Println(response.Print())
+		ssc.command.Println(spec.ReturnSuccess(data).Print())
 	} else {
 		return spec.ReturnFail(spec.Code[spec.ServerError], "down")
 	}

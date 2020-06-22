@@ -18,36 +18,22 @@ package jvm
 
 import (
 	"context"
+	"fmt"
 	"os"
-	"strings"
 	"testing"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/prometheus/common/log"
 )
 
 func Test_getJavaBinAndJavaHome(t *testing.T) {
-	javaProcessCommand := "/opt/java/bin/java"
-	cl = &channel.MockLocalChannel{
-		RunFunc: func(ctx context.Context, script, args string) *spec.Response {
-			if strings.Contains(args, "-1") {
-				return spec.ReturnFail(spec.Code[spec.GetProcessError], "process not found")
-			}
-			return spec.ReturnSuccess(javaProcessCommand)
-		},
-		GetPsArgsFunc: func() string {
-			return ""
-		},
-	}
 	err := os.Unsetenv("JAVA_HOME")
 	if err != nil {
 		t.Logf("remove JAVA_HOME env failed, %v", err)
 	}
 	type args struct {
-		javaHome string
-		ctx      context.Context
-		pid      string
+		javaHome       string
+		ctx            context.Context
+		getJavaCmdLine func(pid string) (commandSlice []string, err error)
 	}
 	tests := []struct {
 		name             string
@@ -56,27 +42,33 @@ func Test_getJavaBinAndJavaHome(t *testing.T) {
 		expectedJavaHome string
 	}{
 		{
-			name:             "javaHome flag value is empty, JAVA_HOME doesn't exist, java process exists",
-			args:             args{"", context.TODO(), "1"},
+			name: "javaHome flag value is empty, JAVA_HOME doesn't exist, java process exists",
+			args: args{"", context.TODO(), func(pid string) (commandSlice []string, err error) {
+				return []string{"/opt/java/bin/java", "-jar", "xxx.jar"}, nil
+			}},
 			expectedJavaBin:  "/opt/java/bin/java",
 			expectedJavaHome: "/opt/java",
 		},
 		{
-			name:             "javaHome flag value is empty, JAVA_HOME doesn't exist, java process doesn't exist",
-			args:             args{"", context.TODO(), "-1"},
+			name: "javaHome flag value is empty, JAVA_HOME doesn't exist, java process doesn't exist",
+			args: args{"", context.TODO(), func(pid string) (commandSlice []string, err error) {
+				return nil, fmt.Errorf("process not found")
+			}},
 			expectedJavaBin:  "java",
 			expectedJavaHome: "",
 		},
 		{
-			name:             "javaHome flag exists, JAVA_HOME doesn't exist, java process exists",
-			args:             args{"/home/admin/java", context.TODO(), "1"},
+			name: "javaHome flag exists, JAVA_HOME doesn't exist, java process exists",
+			args: args{"/home/admin/java", context.TODO(), func(pid string) (commandSlice []string, err error) {
+				return []string{"/opt/java/bin/java", "-jar", "xxx.jar"}, nil
+			}},
 			expectedJavaBin:  "/home/admin/java/bin/java",
 			expectedJavaHome: "/home/admin/java",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			javaBin, javaHome := getJavaBinAndJavaHome(tt.args.javaHome, tt.args.ctx, tt.args.pid)
+			javaBin, javaHome := getJavaBinAndJavaHome(tt.args.javaHome, "", tt.args.getJavaCmdLine)
 			if javaBin != tt.expectedJavaBin {
 				t.Errorf("getJavaBinAndJavaHome() javaBin = %v, expectedJavaBin %v", javaBin, tt.expectedJavaBin)
 			}
@@ -98,21 +90,25 @@ func Test_getJavaBinAndJavaHome(t *testing.T) {
 		expectedJavaHome string
 	}{
 		{
-			name:             "javaHome flag value is empty, JAVA_HOME exists, java process exists",
-			args:             args{"", context.TODO(), "1"},
+			name: "javaHome flag value is empty, JAVA_HOME exists, java process exists",
+			args: args{"", context.TODO(), func(pid string) (commandSlice []string, err error) {
+				return []string{"/opt/java/bin/java", "-jar", "xxx.jar"}, nil
+			}},
 			expectedJavaBin:  "/opt/chaos/java/bin/java",
 			expectedJavaHome: "/opt/chaos/java",
 		},
 		{
-			name:             "javaHome flag exits, JAVA_HOME exists, java process exists",
-			args:             args{"/home/admin/java", context.TODO(), "1"},
+			name: "javaHome flag exits, JAVA_HOME exists, java process exists",
+			args: args{"/home/admin/java", context.TODO(), func(pid string) (commandSlice []string, err error) {
+				return []string{"/opt/java/bin/java", "-jar", "xxx.jar"}, nil
+			}},
 			expectedJavaBin:  "/home/admin/java/bin/java",
 			expectedJavaHome: "/home/admin/java",
 		},
 	}
 	for _, tt := range testsWithJavaHome {
 		t.Run(tt.name, func(t *testing.T) {
-			javaBin, javaHome := getJavaBinAndJavaHome(tt.args.javaHome, tt.args.ctx, tt.args.pid)
+			javaBin, javaHome := getJavaBinAndJavaHome(tt.args.javaHome, "", tt.args.getJavaCmdLine)
 			if javaBin != tt.expectedJavaBin {
 				t.Errorf("getJavaBinAndJavaHome() javaBin = %v, expectedJavaBin %v", javaBin, tt.expectedJavaBin)
 			}

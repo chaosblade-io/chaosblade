@@ -89,7 +89,7 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 		return spec.ReturnFail(spec.Code[spec.StatusError],
 			fmt.Sprintf("get username failed by %s pid, %v", pid, err)), ""
 	}
-	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, ctx, pid)
+	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, pid, getJavaCommandLine)
 	toolsJar := getToolJar(javaHome)
 	logrus.Debugf("javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
 	token, err := getSandboxToken(ctx)
@@ -169,7 +169,8 @@ func getUsername(pid string) (string, error) {
 	return javaProcess.Username()
 }
 
-func getJavaBinAndJavaHome(javaHome string, ctx context.Context, pid string) (string, string) {
+func getJavaBinAndJavaHome(javaHome string, pid string,
+	getJavaCommandLineFunc func(pid string) (commandSlice []string, err error)) (string, string) {
 	javaBin := "java"
 	if javaHome != "" {
 		javaBin = path.Join(javaHome, "bin/java")
@@ -179,16 +180,35 @@ func getJavaBinAndJavaHome(javaHome string, ctx context.Context, pid string) (st
 		javaBin = path.Join(javaHome, "bin/java")
 		return javaBin, javaHome
 	}
-	psArgs := cl.GetPsArgs()
-	response := cl.Run(ctx, "ps", fmt.Sprintf(`%s | grep -w %s | grep java | grep -v grep | awk '{print $4}'`,
-		psArgs, pid))
-	if response.Success {
-		javaBin = strings.TrimSpace(response.Result.(string))
+	cmdlineSlice, err := getJavaCommandLineFunc(pid)
+	if err != nil {
+		logrus.WithField("pid", pid).WithError(err).Warningln("get command slice err")
+		return javaBin, javaHome
 	}
+	if len(cmdlineSlice) == 0 {
+		logrus.WithField("pid", pid).Warningln("command line is empty")
+		return javaBin, javaHome
+	}
+	javaBin = strings.TrimSpace(cmdlineSlice[0])
 	if strings.HasSuffix(javaBin, "/bin/java") {
 		javaHome = javaBin[:len(javaBin)-9]
 	}
 	return javaBin, javaHome
+}
+
+func getJavaCommandLine(pid string) (commandSlice []string, err error) {
+	// get commands
+	processId, err := strconv.Atoi(pid)
+	if err != nil {
+		logrus.Warningf("convert string value of pid err, %v", err)
+		return nil, err
+	}
+	processObj, err := process.NewProcess(int32(processId))
+	if err != nil {
+		logrus.WithField("pid", processId).WithError(err).Warningln("new process by processId err")
+		return nil, err
+	}
+	return processObj.CmdlineSlice()
 }
 
 func Detach(port string) *spec.Response {
