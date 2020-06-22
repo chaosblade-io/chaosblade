@@ -57,7 +57,7 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 			expect{&data.ExperimentModel{
 				Command:    "docker",
 				SubCommand: "network delay",
-				Flag:       " --interface=eth0 --time=3000",
+				Flag:       " --interface='eth0' --time='3000'",
 				Status:     Created,
 			}, false},
 		},
@@ -66,7 +66,7 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 			expect{&data.ExperimentModel{
 				Command:    "network",
 				SubCommand: "delay",
-				Flag:       " --interface=eth0 --time=3000",
+				Flag:       " --interface='eth0' --time='3000'",
 				Status:     Created,
 			}, false},
 		},
