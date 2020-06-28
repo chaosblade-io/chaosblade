@@ -21,8 +21,8 @@ import (
 	"fmt"
 	"os/exec"
 	"path"
-	"regexp"
 	"strconv"
+	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -37,9 +37,6 @@ type CreateCommand struct {
 }
 
 const UidFlag = "uid"
-
-//SecondsInMinute is Number of Seconds in Minute
-const SecondsInMinute uint64 = 60
 
 var uid string
 
@@ -93,15 +90,20 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 		// check timeout flag
 		tt := expModel.ActionFlags["timeout"]
 		if tt != "" {
-			_, err := strconv.ParseUint(tt, 10, 64)
-			if err != nil {
-				// regexTest is compiled to test the input for timeInterval format [like 2m33s, 1h3m2s or 43s].
-				regexTest, _ := regexp.Compile("^(\\d+h)?(\\d+m)?(\\d+s)?$")
-				if regexTest.MatchString(tt) {
 
-				} else {
-					return err
+			//errNumber checks whether timout flag is parsable as Number
+			_, errNumber := strconv.ParseUint(tt, 10, 64)
+
+			//errNumber checks whether timout flag is parsable as Time
+			_, errTimeDuartion := time.ParseDuration(tt)
+
+			//error handling
+			if errNumber != nil && errTimeDuartion != nil {
+				if errTimeDuartion != nil {
+					return errTimeDuartion
 				}
+				return errNumber
+
 			}
 		}
 
@@ -133,42 +135,6 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 	}
 }
 
-// getTimeInSeconds converts string to uint64 [3m => 180, 34s => 34].
-func getTimeInSeconds(timeInterval string) uint64 {
-	length := len(timeInterval)
-	var count uint64 = 0
-	if numericValue, err := strconv.ParseUint(timeInterval[:length-1], 10, 64); err == nil {
-		switch timeInterval[length-1] {
-		case 104: //ASCII value of "h".
-			count += numericValue * (SecondsInMinute * SecondsInMinute)
-
-		case 109: //ASCII value of "m".
-			count += numericValue * SecondsInMinute
-
-		case 115: //ASCII value of "s".
-			count += numericValue
-		}
-	}
-	return count
-}
-
-// timeInStringsToSeconds converts string to unit4 [like  1h34m23s=>5663, 2h34s=>7234 , 34m=>2040(similar)].
-func timeInStringToSeconds(time string) uint64 {
-	// regexGroups the key time intervals to substrings.
-	regexGroups, _ := regexp.Compile("([\\d]+[h,m,s])")
-
-	var seconds uint64 = 0
-
-	// values stores the substrings as an array.
-	values := regexGroups.FindAllString(time, -1)
-
-	for i := 0; i < len(values); i++ {
-		seconds += getTimeInSeconds(values[i])
-	}
-
-	return seconds
-}
-
 func (cc *CreateCommand) actionPostRunEFunc(actionCommand *actionCommand) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		const bladeBin = "blade"
@@ -178,13 +144,15 @@ func (cc *CreateCommand) actionPostRunEFunc(actionCommand *actionCommand) func(c
 				return nil
 			}
 
+			//err possible if timeout used as timeDuration.
 			timeout, err := strconv.ParseUint(tt, 10, 64)
 
-			//err possible if timeout used as timeInterval.
 			if err != nil {
-				timeout = timeInStringToSeconds(tt)
+				// the err checked in RunE function
+				timeDuartion, _ := time.ParseDuration(tt)
+				timeout = uint64(timeDuartion.Seconds())
 			}
-			// the err checked in RunE function
+
 			if timeout > 0 && actionCommand.uid != "" {
 				script := path.Join(util.GetProgramPath(), bladeBin)
 				args := fmt.Sprintf("nohup /bin/sh -c 'sleep %d; %s destroy %s' > /dev/null 2>&1 &",
