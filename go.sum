@@ -197,6 +197,8 @@ github.com/chaosblade-io/chaosblade-exec-os v0.6.0 h1:Qd+9/g9nXtQDFReK4jCf+TtKvc
 github.com/chaosblade-io/chaosblade-exec-os v0.6.0/go.mod h1:VeR9OFFdeg0BXkEta0DDQ90J/vC5zOiUAOOmajodizM=
 github.com/chaosblade-io/chaosblade-exec-os v0.6.1-0.20200622032255-04a928cebde5 h1:iNI4rzYzTbBO9FH+E8PL2bGFnaKV6OplCYDXzT2dZXA=
 github.com/chaosblade-io/chaosblade-exec-os v0.6.1-0.20200622032255-04a928cebde5/go.mod h1:BCfKuNG8njL69KUgNE57E0LWhsx6izLZ69wQGcH29iQ=
+github.com/chaosblade-io/chaosblade-exec-os v0.6.1-0.20200628031823-4b2ab0083bdd h1:AAyK2OxYDFZO1IN3g+qHndKiYn3XZhPaIh2eKg75vzI=
+github.com/chaosblade-io/chaosblade-exec-os v0.6.1-0.20200628031823-4b2ab0083bdd/go.mod h1:BCfKuNG8njL69KUgNE57E0LWhsx6izLZ69wQGcH29iQ=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646 h1:RBFYLyw63VEg6zuze32clu4wRelss04GvPURqmEZYAg=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20191216080032-f02da7845646/go.mod h1:FE9gkAN0FmpANjoPl37hKcNHD103f0TKKN8Eq41KoLw=
 github.com/chaosblade-io/chaosblade-operator v0.4.1-0.20200110075310-a6443f3732ca h1:7kQ3CpXWRgxZnG2Y1YeKPpqqAgWc88UJmLni+YC8yJI=
@@ -242,6 +244,8 @@ github.com/chaosblade-io/chaosblade-spec-go v0.6.0 h1:PtNvXQ1NTtKS4lQb1y07ZmBJKd
 github.com/chaosblade-io/chaosblade-spec-go v0.6.0/go.mod h1:mBn6I5u/E5liN2zimyhxOBL5wSNPt2biZ7mIpJBjoJ4=
 github.com/chaosblade-io/chaosblade-spec-go v0.6.1-0.20200622031335-2871f4f895ff h1:PERy9yp1JcNLHr+Y5WaXu9z10v+m3tlqo3rL6sNqb4g=
 github.com/chaosblade-io/chaosblade-spec-go v0.6.1-0.20200622031335-2871f4f895ff/go.mod h1:xUF+8r54FphQjBR8fVPnweVqzu7EitE15UsnZ57O5gk=
+github.com/chaosblade-io/chaosblade-spec-go v0.6.1-0.20200628025133-fa9dc1fa51a6 h1:nijr287GpeysRa7i0coZbUiHSYy/3CM3L6A4wH0ZQ+4=
+github.com/chaosblade-io/chaosblade-spec-go v0.6.1-0.20200628025133-fa9dc1fa51a6/go.mod h1:xUF+8r54FphQjBR8fVPnweVqzu7EitE15UsnZ57O5gk=
 github.com/circonus-labs/circonus-gometrics v2.3.1+incompatible/go.mod h1:nmEj6Dob7S7YxXgwXpfOuvO54S+tGdZdw9fuRZt25Ag=
 github.com/circonus-labs/circonusllhist v0.1.3/go.mod h1:kMXHVDlOchFAehlya5ePtbp5jckzBHf4XRpQvBOLI+I=
 github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
