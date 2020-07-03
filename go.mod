@@ -4,7 +4,7 @@ go 1.13
 
 require (
 	github.com/chaosblade-io/chaosblade-exec-docker v0.6.0
-	github.com/chaosblade-io/chaosblade-exec-os v0.6.1-0.20200628031823-4b2ab0083bdd
+	github.com/chaosblade-io/chaosblade-exec-os v0.6.1-0.20200703070815-1cc9206637b7
 	github.com/chaosblade-io/chaosblade-operator v0.6.0
 	github.com/chaosblade-io/chaosblade-spec-go v0.6.1-0.20200628025133-fa9dc1fa51a6
 	github.com/gregjones/httpcache v0.0.0-20190611155906-901d90724c79 // indirect
