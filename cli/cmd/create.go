@@ -89,20 +89,16 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 
 		// check timeout flag
 		tt := expModel.ActionFlags["timeout"]
+
 		if tt != "" {
 
 			//errNumber checks whether timout flag is parsable as Number
-			_, errNumber := strconv.ParseUint(tt, 10, 64)
+			if _, errNumber := strconv.ParseUint(tt, 10, 64); errNumber != nil {
 
-			//errNumber checks whether timout flag is parsable as Time
-			_, errTimeDuartion := time.ParseDuration(tt)
-
-			//error handling
-			if errNumber != nil && errTimeDuartion != nil {
-				if errTimeDuartion != nil {
-					return errTimeDuartion
+				//err checks whether timout flag is parsable as Time
+				if _, err := time.ParseDuration(tt); err != nil {
+					return err
 				}
-				return errNumber
 
 			}
 		}
