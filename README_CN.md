@@ -58,7 +58,7 @@ docker run -it --privileged chaosbladeio/chaosblade-demo
 进入镜像之后，可阅读 README.txt 文件实施混沌实验，Enjoy it。
 
 ## 面向云原生
-[chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator) 项目是针对云原生平台所实现的混沌实验注入工具，遵循混沌实验模型规范化实验场景，把实验定义为 Kubernetes CRD 资源，将实验模型映射为 Kubernetes 资源属性，很友好的将混沌实验模型与 Kubernetes 声明式设计结合在一起，依靠混沌实验模型便捷开发场景的同时，又可以很好的结合 Kubernetes 设计理念，通过 kubectl 或者编写代码直接调用 Kubernetes API 来创建、更新、删除混沌实验，而且资源状态可以非常清晰的表示实验的执行状态，标准化实现 Kubernetes 故障注入。除了使用上述方式执行实验外，还可以使用 chaosblade cli 方式非常方便的执行 kubernetes 实验场景，查询实验状态等。具体请阅读：[云原生下的混沌工程实践](CLOUDNATIVE.md)
+[chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator) 项目是针对云原生平台所实现的混沌实验注入工具，遵循混沌实验模型规范化实验场景，把实验定义为 Kubernetes CRD 资源，将实验模型映射为 Kubernetes 资源属性，很友好地将混沌实验模型与 Kubernetes 声明式设计结合在一起，在依靠混沌实验模型便捷开发场景的同时，又可以很好的结合 Kubernetes 设计理念，通过 kubectl 或者编写代码直接调用 Kubernetes API 来创建、更新、删除混沌实验，而且资源状态可以非常清晰地表示实验的执行状态，标准化实现 Kubernetes 故障注入。除了使用上述方式执行实验外，还可以使用 chaosblade cli 方式非常方便的执行 kubernetes 实验场景，查询实验状态等。具体请阅读：[云原生下的混沌工程实践](CLOUDNATIVE.md)
 
 ## 编译
 此项目采用 golang 语言编写，所以需要先安装最新的 golang 版本，最低支持的版本是 1.11。Clone 工程后进入项目目录执行以下命令进行编译：
@@ -109,7 +109,7 @@ ARGS="cli os" make build_with_linux
 * NodeJS 应用混沌实验场景
 * 故障演练控制台
 * 完善 ChaosBlade 各项目的开发文档
-* 完善 chaosblade 工具的英文文档
+* 完善 ChaosBlade 工具的英文文档
 
 ## License
-Chaosblade 遵循 Apache 2.0 许可证，详细内容请阅读 [LICENSE](LICENSE)
+ChaosBlade 遵循 Apache 2.0 许可证，详细内容请阅读 [LICENSE](LICENSE)
