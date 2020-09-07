@@ -15,9 +15,9 @@ BLADE_SRC_ROOT=$(shell pwd)
 
 GO_ENV=CGO_ENABLED=1
 GO_MODULE=GO111MODULE=on
-VERSION_PKG=github.com/chaosblade-io/chaosblade/version
+VERSION_PKG=github.com/dhlhust/chaosblade/version
 # Specify chaosblade version in docker experiments
-DOCKER_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-docker/version
+DOCKER_BLADE_VERSION=github.com/dhlhust/chaosblade-exec-docker/version
 GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
 GO_FLAGS=-ldflags="$(GO_X_FLAGS)"
 GO=env $(GO_ENV) $(GO_MODULE) go
@@ -38,23 +38,23 @@ BUILD_IMAGE_PATH=build/image/blade
 BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
-BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
+BLADE_EXEC_OS_PROJECT=https://github.com/dhlhust/chaosblade-exec-os.git
 BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-docker
-BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
+BLADE_EXEC_DOCKER_PROJECT=https://github.com/dhlhust/chaosblade-exec-docker.git
 BLADE_EXEC_DOCKER_BRANCH=master
 
 # chaosblade-exec-kubernetes
-BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
+BLADE_OPERATOR_PROJECT=https://github.com/dhlhust/chaosblade-operator.git
 BLADE_OPERATOR_BRANCH=master
 
 # chaosblade-exec-jvm
-BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
+BLADE_EXEC_JVM_PROJECT=https://github.com/dhlhust/chaosblade-exec-jvm.git
 BLADE_EXEC_JVM_BRANCH=master
 
 # chaosblade-exec-cplus
-BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
+BLADE_EXEC_CPLUS_PROJECT=https://github.com/dhlhust/chaosblade-exec-cplus.git
 BLADE_EXEC_CPLUS_BRANCH=master
 
 # docker yaml
@@ -178,7 +178,7 @@ build_linux:
 	docker build -f build/image/musl/Dockerfile -t chaosblade-build-musl:latest build/image/musl
 	docker run --rm \
 		-v $(shell echo -n ${GOPATH}):/go \
-		-w /go/src/github.com/chaosblade-io/chaosblade \
+		-w /go/src/github.com/dhlhust/chaosblade \
 		-v ~/.m2/repository:/root/.m2/repository \
 		chaosblade-build-musl:latest
 
