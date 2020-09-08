@@ -21,8 +21,8 @@ require (
 )
 
 replace (
-	github.com/chaosblade-io/chaosblade-exec-docker => /root/chaosblade-io/chaosblade-exec-docker
-	github.com/chaosblade-io/chaosblade-exec-os => /root/chaosblade-io/chaosblade-exec-os
-	github.com/chaosblade-io/chaosblade-operator => /root/chaosblade-io/chaosblade-operator
-	github.com/chaosblade-io/chaosblade-spec-go => /root/chaosblade-io/chaosblade-spec-go
+	github.com/chaosblade-io/chaosblade-exec-docker => github.com/dhlhust/chaosblade-io/chaosblade-exec-docker
+	github.com/chaosblade-io/chaosblade-exec-os => github.com/dhlhust/chaosblade-exec-os
+	github.com/chaosblade-io/chaosblade-operator => github.com/dhlhust/chaosblade-operator
+	github.com/chaosblade-io/chaosblade-spec-go => github.com/dhlhust/chaosblade-spec-go
 )
