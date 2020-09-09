@@ -22,7 +22,7 @@ require (
 
 replace (
 	github.com/chaosblade-io/chaosblade-exec-docker => github.com/dhlhust/chaosblade-exec-docker v0.6.0
-	github.com/chaosblade-io/chaosblade-exec-os => github.com/dhlhust/chaosblade-exec-os v0.6.0
+	github.com/chaosblade-io/chaosblade-exec-os => github.com/dhlhust/chaosblade-exec-os v0.6.2
 	github.com/chaosblade-io/chaosblade-operator => github.com/dhlhust/chaosblade-operator v0.6.0
 	github.com/chaosblade-io/chaosblade-spec-go => github.com/dhlhust/chaosblade-spec-go v0.6.0
 )
