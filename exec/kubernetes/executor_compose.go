@@ -14,46 +14,42 @@
  * limitations under the License.
  */
 
-package os
+package kubernetes
 
 import (
 	"context"
-	"fmt"
 	"github.com/chaosblade-io/chaosblade-exec-os/exec"
-	"github.com/chaosblade-io/chaosblade-exec-os/exec/model"
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
-type Executor struct {
-	executors map[string]spec.Executor
+type ComposeExecutor interface {
+	spec.Executor
+}
+
+type ComposeExecutorForK8s struct {
+	clientExecutors spec.Executor
 	sshExecutor spec.Executor
 }
 
-func NewExecutor() spec.Executor {
-	return &Executor{
-		executors: model.GetAllOsExecutors(),
-		sshExecutor: model.GetSHHExecutor(),
+func NewComposeExecutor() ComposeExecutor {
+	return &ComposeExecutorForK8s{
+		clientExecutors: NewExecutor(),
+		sshExecutor: exec.NewSSHExecutor(),
 	}
 }
 
-func (*Executor) Name() string {
+func (*ComposeExecutorForK8s) Name() string {
 	return "os"
 }
 
-func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
+func (e *ComposeExecutorForK8s) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
 	if model.ActionFlags[exec.ChannelFlag.Name] == e.sshExecutor.Name() {
 		return e.sshExecutor.Exec(uid, ctx, model)
+	} else {
+		return e.clientExecutors.Exec(uid, ctx, model)
 	}
-
-	key := model.Target + model.ActionName
-	executor := e.executors[key]
-	if executor == nil {
-		return spec.ReturnFail(spec.Code[spec.HandlerNotFound], fmt.Sprintf("the os executor not found, %s", key))
-	}
-	executor.SetChannel(channel.NewLocalChannel())
-	return executor.Exec(uid, ctx, model)
 }
 
-func (*Executor) SetChannel(channel spec.Channel) {
+func (*ComposeExecutorForK8s) SetChannel(channel spec.Channel) {
+
 }

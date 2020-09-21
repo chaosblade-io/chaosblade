@@ -18,7 +18,9 @@ GO_MODULE=GO111MODULE=on
 VERSION_PKG=github.com/chaosblade-io/chaosblade/version
 # Specify chaosblade version in docker experiments
 DOCKER_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-docker/version
-GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
+OS_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-os/version
+
+GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
 GO_FLAGS=-ldflags="$(GO_X_FLAGS)"
 GO=env $(GO_ENV) $(GO_MODULE) go
 
