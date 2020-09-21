@@ -42,8 +42,7 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 		err   bool
 	}
 	delayCommand := &cobra.Command{Use: "delay"}
-	var time, inf string
-	delayCommand.PersistentFlags().StringVar(&time, "time", "3000", "")
+	var inf string
 	delayCommand.PersistentFlags().StringVar(&inf, "interface", "eth0", "")
 	delayCommand.PersistentFlags().SortFlags = true
 	delayCommand.ParseFlags([]string{})
@@ -57,7 +56,7 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 			expect{&data.ExperimentModel{
 				Command:    "docker",
 				SubCommand: "network delay",
-				Flag:       " --interface='eth0' --time='3000'",
+				Flag:       " --interface=eth0",
 				Status:     Created,
 			}, false},
 		},
@@ -66,7 +65,7 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 			expect{&data.ExperimentModel{
 				Command:    "network",
 				SubCommand: "delay",
-				Flag:       " --interface='eth0' --time='3000'",
+				Flag:       " --interface=eth0",
 				Status:     Created,
 			}, false},
 		},
