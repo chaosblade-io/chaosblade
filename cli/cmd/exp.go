@@ -226,7 +226,6 @@ func (ec *baseExpCommandService) registerExpCommand(commandSpec spec.ExpModelCom
 		Use:     cmdName,
 		Short:   commandSpec.ShortDesc(),
 		Long:    commandSpec.LongDesc(),
-		Example: commandSpec.Example(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return spec.ReturnFail(spec.Code[spec.IllegalParameters], "less action command")
 		},
@@ -277,6 +276,7 @@ func (ec *baseExpCommandService) registerActionCommand(target, scope string, act
 		Aliases:  actionCommandSpec.Aliases(),
 		Short:    actionCommandSpec.ShortDesc(),
 		Long:     actionCommandSpec.LongDesc(),
+		Example:  actionCommandSpec.Example(),
 		RunE:     ec.actionRunEFunc(target, scope, command, actionCommandSpec),
 		PostRunE: ec.actionPostRunEFunc(command),
 	}
