@@ -196,7 +196,7 @@ func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
 func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 	// 读取 k8s 下的场景并注册
 	file := path.Join(util.GetBinPath(), fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version.Ver))
-	models, err := specutil.ParseSpecsToModel(file, kubernetes.NewExecutor())
+	models, err := specutil.ParseSpecsToModel(file, kubernetes.NewComposeExecutor())
 	if err != nil {
 		return nil
 	}
