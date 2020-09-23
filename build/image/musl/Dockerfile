@@ -21,7 +21,12 @@ RUN wget http://mirrors.tuna.tsinghua.edu.cn/apache/maven/maven-3/3.6.3/binaries
     && mv apache-maven-3.6.3 /usr/local/apache-maven-3.6.3
 
 RUN apt-get update \
-    && apt-get install -y unzip openjdk-11-jdk
+    && apt-get install -y unzip openjdk-11-jdk xz-utils
+
+RUN wget https://github.com/upx/upx/releases/download/v3.96/upx-3.96-amd64_linux.tar.xz \
+    && tar -xvf upx-3.96-amd64_linux.tar.xz \
+    && mv upx-3.96-amd64_linux/upx /usr/local/bin \
+    && rm -rf upx*
 
 ENV CC /usr/local/musl/bin/musl-gcc
 ENV GOOS linux
