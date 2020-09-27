@@ -91,7 +91,11 @@ build_with_linux: pre_build build_linux_with_arg
 build_cli:
 	# build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
+ifneq ($(shell command -v upx),)
 	upx -1 $(BUILD_TARGET_PKG_DIR)/blade
+else
+	$(warning "The compiled file may be too large because you haven't installed UPX")
+endif
 
 # build os
 build_os:
