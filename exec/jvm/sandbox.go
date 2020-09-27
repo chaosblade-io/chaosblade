@@ -147,7 +147,7 @@ func getSandboxToken(ctx context.Context) (string, error) {
 }
 
 func getToolJar(javaHome string) string {
-	toolsJar := path.Join(util.GetBinPath(), "tools.jar")
+	toolsJar := path.Join(util.GetLibHome(), "sandbox", "tools.jar")
 	originalJar := path.Join(javaHome, "lib/tools.jar")
 	if util.IsExist(originalJar) {
 		toolsJar = originalJar

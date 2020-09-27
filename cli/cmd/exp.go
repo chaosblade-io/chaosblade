@@ -125,7 +125,7 @@ func (ec *baseExpCommandService) registerSubCommands() {
 
 // registerOsExpCommands
 func (ec *baseExpCommandService) registerOsExpCommands() []*modelCommand {
-	file := path.Join(util.GetBinPath(), fmt.Sprintf("chaosblade-os-spec-%s.yaml", version.Ver))
+	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-os-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, os.NewExecutor())
 	if err != nil {
 		return nil
@@ -141,7 +141,7 @@ func (ec *baseExpCommandService) registerOsExpCommands() []*modelCommand {
 
 // registerJvmExpCommands
 func (ec *baseExpCommandService) registerJvmExpCommands() []*modelCommand {
-	file := path.Join(util.GetBinPath(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
+	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
 	models, err := util.ParseSpecsToModel(file, jvm.NewExecutor())
 	if err != nil {
 		return nil
@@ -157,7 +157,7 @@ func (ec *baseExpCommandService) registerJvmExpCommands() []*modelCommand {
 
 // registerCplusExpCommands
 func (ec *baseExpCommandService) registerCplusExpCommands() []*modelCommand {
-	file := path.Join(util.GetBinPath(), "chaosblade-cplus-spec.yaml")
+	file := path.Join(util.GetYamlHome(), "chaosblade-cplus-spec.yaml")
 	models, err := util.ParseSpecsToModel(file, cplus.NewExecutor())
 	if err != nil {
 		return nil
@@ -173,7 +173,7 @@ func (ec *baseExpCommandService) registerCplusExpCommands() []*modelCommand {
 
 // registerDockerExpCommands
 func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
-	file := path.Join(util.GetBinPath(), fmt.Sprintf("chaosblade-docker-spec-%s.yaml", version.Ver))
+	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-docker-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, docker.NewExecutor())
 	if err != nil {
 		return nil
@@ -195,7 +195,7 @@ func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
 
 func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 	// 读取 k8s 下的场景并注册
-	file := path.Join(util.GetBinPath(), fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version.Ver))
+	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, kubernetes.NewComposeExecutor())
 	if err != nil {
 		return nil
@@ -223,9 +223,9 @@ func (ec *baseExpCommandService) registerExpCommand(commandSpec spec.ExpModelCom
 		cmdName = fmt.Sprintf("%s-%s", commandSpec.Scope(), commandSpec.Name())
 	}
 	cmd := &cobra.Command{
-		Use:     cmdName,
-		Short:   commandSpec.ShortDesc(),
-		Long:    commandSpec.LongDesc(),
+		Use:   cmdName,
+		Short: commandSpec.ShortDesc(),
+		Long:  commandSpec.LongDesc(),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return spec.ReturnFail(spec.Code[spec.IllegalParameters], "less action command")
 		},
@@ -282,6 +282,7 @@ func (ec *baseExpCommandService) registerActionCommand(target, scope string, act
 	}
 
 	flags := addTimeoutFlag(actionCommandSpec.Flags())
+	flags = addOverrideFlag(flags)
 	ec.bindFlagsFunc(command.ActionFlags, command.command, flags)
 	// set matcher flags
 	ec.bindFlagsFunc(command.MatcherFlags, command.command, actionCommandSpec.Matchers())
@@ -302,6 +303,28 @@ func addTimeoutFlag(flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
 			&spec.ExpFlag{
 				Name:     "timeout",
 				Desc:     "set timeout for experiment in seconds",
+				Required: false,
+			},
+		)
+	}
+	return flags
+}
+
+func addOverrideFlag(flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
+	contains := false
+	for _, flag := range flags {
+		if flag.FlagName() == "override" {
+			contains = true
+			break
+		}
+	}
+	if !contains {
+		// set action flags, always add timeout param
+		flags = append(flags,
+			&spec.ExpFlag{
+				Name:     "override",
+				Desc:     "only for java now, uninstall java agent",
+				NoArgs:   true,
 				Required: false,
 			},
 		)

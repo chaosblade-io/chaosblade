@@ -1,9 +1,6 @@
 FROM golang:1.13.1
 LABEL maintainer="Changjun Xiao"
 
-RUN sed -i 's/deb.debian.org/mirrors.163.com/g' /etc/apt/sources.list \
-    && sed -i 's/security.debian.org/mirrors.163.com/g' /etc/apt/sources.list
-
 # # The image is used to build chaosblade for musl
 RUN wget http://www.musl-libc.org/releases/musl-1.1.21.tar.gz \
     && tar -zxvf musl-1.1.21.tar.gz \
@@ -14,23 +11,7 @@ RUN wget http://www.musl-libc.org/releases/musl-1.1.21.tar.gz \
     && make install \
     && rm -rf musl*
 
-# install maven for java project compiled
-RUN wget http://mirrors.tuna.tsinghua.edu.cn/apache/maven/maven-3/3.6.3/binaries/apache-maven-3.6.3-bin.tar.gz \
-    && tar -zxvf apache-maven-3.6.3-bin.tar.gz \
-    && rm apache-maven-3.6.3-bin.tar.gz \
-    && mv apache-maven-3.6.3 /usr/local/apache-maven-3.6.3
-
-RUN apt-get update \
-    && apt-get install -y unzip openjdk-11-jdk xz-utils
-
-RUN wget https://github.com/upx/upx/releases/download/v3.96/upx-3.96-amd64_linux.tar.xz \
-    && tar -xvf upx-3.96-amd64_linux.tar.xz \
-    && mv upx-3.96-amd64_linux/upx /usr/local/bin \
-    && rm -rf upx*
-
 ENV CC /usr/local/musl/bin/musl-gcc
 ENV GOOS linux
-ENV java /usr/bin/java
-ENV PATH /usr/local/apache-maven-3.6.3/bin:$PATH
 
 ENTRYPOINT [ "make" ]

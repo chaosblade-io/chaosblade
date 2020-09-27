@@ -20,7 +20,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -57,13 +59,33 @@ func (e *Executor) SetChannel(channel spec.Channel) {
 
 func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
 	var url_ string
-	port, err := e.getPortFromDB(model.ActionFlags["process"], "")
-	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.ServerError], "cannot get port from local, please execute prepare command first")
+	processName := model.ActionFlags["process"]
+	processId := model.ActionFlags["pid"]
+	override := model.ActionFlags["override"] == "true"
+	suid, isDestroy := spec.IsDestroy(ctx)
+	record, err := e.getRecordFromDB(processName, processId)
+	if override && !isDestroy {
+		// Uninstall java agent
+		response := Revoke(record, processName, processId)
+		if !response.Success {
+			return response
+		}
+	}
+	var port string
+	if !isDestroy && (record == nil || err != nil || override) {
+		response, newPort := Prepare(processName, processId)
+		if !response.Success {
+			return response
+		}
+		port = newPort
+	} else if record != nil {
+		port = record.Port
+	} else {
+		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}
 	var result string
 	var code int
-	if suid, ok := spec.IsDestroy(ctx); ok {
+	if isDestroy {
 		if suid == spec.UnknownUid {
 			url_ = e.sandboxUrl(port, e.getDestroyRequestPathWithoutUid(model.Target, model.ActionName))
 		} else {
@@ -82,7 +104,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
 	if code == 404 {
-		return spec.ReturnFail(spec.Code[spec.JavaAgentCmdError], "please execute prepare command first")
+		return spec.ReturnFail(spec.Code[spec.JavaAgentCmdError], "please restart application to inject fault")
 	}
 	if code == 200 {
 		var resp spec.Response
@@ -150,10 +172,11 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 	}
 	// get process flag
 	process := getProcessFlagFromExpRecord(experimentModel)
-	port, err := e.getPortFromDB(process, "")
+	record, err := e.getRecordFromDB(process, "")
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
+	port := record.Port
 	url := e.sandboxUrl(port, e.getStatusRequestPath(uid))
 	result, err, code := util.Curl(url)
 	if err != nil {
@@ -177,22 +200,22 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 
 var db = data.GetSource()
 
-func (e *Executor) getPortFromDB(processName, processId string) (string, error) {
+func (e *Executor) getRecordFromDB(processName, processId string) (*data.PreparationRecord, error) {
 	if processName != "" || processId != "" {
 		pid, response := CheckFlagValues(processName, processId)
 		if !response.Success {
-			return "", fmt.Errorf(response.Err)
+			return nil, fmt.Errorf(response.Err)
 		}
 		processId = pid
 	}
 	record, err := db.QueryRunningPreByTypeAndProcess("jvm", processName, processId)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if record == nil {
-		return "", fmt.Errorf("port not found for %s process, please execute prepare command firstly", processName)
+		return nil, fmt.Errorf("port not found for %s process, please execute prepare command firstly", processName)
 	}
-	return record.Port, nil
+	return record, nil
 }
 
 func getProcessFlagFromExpRecord(model *data.ExperimentModel) string {
@@ -268,4 +291,128 @@ func CheckFlagValues(processName, processId string) (string, *spec.Response) {
 		}
 	}
 	return processId, spec.ReturnSuccess("success")
+}
+
+func Prepare(processName, processId string) (response *spec.Response, port string) {
+	processId, response = CheckFlagValues(processName, processId)
+	if !response.Success {
+		return
+	}
+	record, err := db.QueryRunningPreByTypeAndProcess("jvm", processName, processId)
+	if record == nil || err != nil || record.Uid == "" {
+		// get port from local port
+		port, err = getAndCacheSandboxPort()
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.ServerError],
+				fmt.Sprintf("get sandbox port err, %s", err.Error())), port
+		}
+		record, err = insertPrepareRecord("jvm", processName, port, processId)
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.DatabaseError],
+				fmt.Sprintf("insert prepare record err, %s", err.Error())), port
+		}
+	}
+	var username string
+	port = record.Port
+	response, username = Attach(port, "", processId)
+	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
+		// if attach failed, search port from ~/.sandbox.token
+		port, err = CheckPortFromSandboxToken(username)
+		if err == nil {
+			logrus.Infof("use %s port to retry", port)
+			response, username = Attach(port, "", processId)
+			if response.Success {
+				// update port
+				err := db.UpdatePreparationPortByUid(record.Uid, port)
+				if err != nil {
+					logrus.Warningf("update preparation port failed, %v", err)
+				}
+			}
+		}
+	}
+	if record.Pid != processId {
+		// update pid
+		db.UpdatePreparationPortByUid(record.Uid, processId)
+	}
+	handlePrepareResponse(record.Uid, response)
+	return response, port
+}
+
+// Revoke 卸载 Java agent
+func Revoke(record *data.PreparationRecord, processName, processId string) *spec.Response {
+	var port string
+	if record == nil {
+		processId, response := CheckFlagValues(processName, processId)
+		if !response.Success {
+			return response
+		}
+		username, err := getUsername(processId)
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.StatusError],
+				fmt.Sprintf("get username failed by %s pid, %v", username, err))
+		}
+		// get port from sandbox.token
+		port, err = getPortFromSandboxToken(username)
+		if err != nil {
+			return spec.ReturnSuccess("no record")
+		}
+	} else {
+		if record.Status == "Revoked" {
+			return spec.ReturnSuccess("success")
+		}
+		port = record.Port
+	}
+	if response := Detach(port); !response.Success {
+		logrus.WithFields(logrus.Fields{
+			"processName": processName,
+			"processId":   processId,
+		}).Warningln(response.Print())
+	}
+	// TODO 默认成功，不影响后续执行
+	return spec.ReturnSuccess("success")
+}
+
+// getSandboxPort by process name. If this process does not exist, an unbound port will be selected
+func getAndCacheSandboxPort() (string, error) {
+	port, err := util.GetUnusedPort()
+	if err != nil {
+		return "", err
+	}
+	return strconv.Itoa(port), nil
+}
+
+// insertPrepareRecord
+func insertPrepareRecord(prepareType string, processName, port, processId string) (*data.PreparationRecord, error) {
+	uid, err := util.GenerateUid()
+	if err != nil {
+		return nil, err
+	}
+	record := &data.PreparationRecord{
+		Uid:         uid,
+		ProgramType: prepareType,
+		Process:     processName,
+		Port:        port,
+		Pid:         processId,
+		Status:      "Created",
+		Error:       "",
+		CreateTime:  time.Now().Format(time.RFC3339Nano),
+		UpdateTime:  time.Now().Format(time.RFC3339Nano),
+	}
+	err = db.InsertPreparationRecord(record)
+	if err != nil {
+		return nil, err
+	}
+	return record, nil
+}
+
+func handlePrepareResponse(uid string, response *spec.Response) {
+	response.Result = uid
+	if !response.Success {
+		db.UpdatePreparationRecordByUid(uid, "Error", response.Err)
+		return
+	}
+	err := db.UpdatePreparationRecordByUid(uid, "Running", "")
+	if err != nil {
+		logrus.Warningf("update preparation record error: %s", err.Error())
+	}
 }

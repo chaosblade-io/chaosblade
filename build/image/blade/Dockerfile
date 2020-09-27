@@ -13,7 +13,6 @@ ENV CHAOSBLADE_HOME /opt/chaosblade
 WORKDIR ${CHAOSBLADE_HOME}
 
 COPY chaosblade-${BLADE_VERSION} ${CHAOSBLADE_HOME}
-COPY chaosblade-${BLADE_VERSION}.tar.gz /opt
 
 ENV PATH ${CHAOSBLADE_HOME}:${PATH}
 CMD ["sh", "-c", "tail -f /dev/null"]
