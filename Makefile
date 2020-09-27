@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=0.6.0
+export BLADE_VERSION=0.7.0
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -33,6 +33,7 @@ BUILD_TARGET_PKG_DIR=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)
 BUILD_TARGET_PKG_NAME=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION).tar.gz
 BUILD_TARGET_BIN=$(BUILD_TARGET_PKG_DIR)/bin
 BUILD_TARGET_LIB=$(BUILD_TARGET_PKG_DIR)/lib
+BUILD_TARGET_YAML=$(BUILD_TARGET_PKG_DIR)/yaml
 BUILD_TARGET_TAR_NAME=$(BUILD_TARGET_DIR_NAME).tar.gz
 BUILD_TARGET_PKG_FILE_PATH=$(BUILD_TARGET)/$(BUILD_TARGET_TAR_NAME)
 BUILD_IMAGE_PATH=build/image/blade
@@ -162,7 +163,7 @@ endif
 # create dir or download necessary file
 pre_build:mkdir_build_target
 	rm -rf $(BUILD_TARGET_PKG_DIR) $(BUILD_TARGET_PKG_FILE_PATH)
-	mkdir -p $(BUILD_TARGET_BIN) $(BUILD_TARGET_LIB)
+	mkdir -p $(BUILD_TARGET_BIN) $(BUILD_TARGET_LIB) $(BUILD_TARGET_YAML)
 
 # create cache dir
 mkdir_build_target:
@@ -209,6 +210,9 @@ docker_image: clean
 	docker build -f ./Dockerfile \
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
 		-t chaosblade:$(BLADE_VERSION) $(BLADE_SRC_ROOT)
+
+upx:
+	upx -1 $(BUILD_TARGET_PKG_DIR)/blade $(BUILD_TARGET_PKG_DIR)/bin/*
 
 # test
 test:
