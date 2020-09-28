@@ -92,11 +92,6 @@ build_with_linux: pre_build build_linux_with_arg
 build_cli:
 	# build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
-ifneq ($(shell command -v upx),)
-	upx -1 $(BUILD_TARGET_PKG_DIR)/blade
-else
-	$(warning "The compiled file may be too large because you haven't installed UPX")
-endif
 
 # build os
 build_os:
@@ -195,9 +190,9 @@ build_linux_with_arg:
 	docker build -f build/image/musl/Dockerfile -t chaosblade-build-musl:latest build/image/musl
 	docker run --rm \
 		-v $(shell echo -n ${GOPATH}):/go \
-		-w /opt/chaosblade \
+		-w /go/src/github.com/chaosblade-io/chaosblade \
 		-v ~/.m2/repository:/root/.m2/repository \
-		-v $(shell pwd):/opt/chaosblade \
+		-v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
 		chaosblade-build-musl:latest build_with $$ARGS
 
 # build chaosblade image for chaos
@@ -217,8 +212,18 @@ docker_image: clean
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
 		-t chaosblade:$(BLADE_VERSION) $(BLADE_SRC_ROOT)
 
+build_upx_image:
+	docker build --rm \
+ 		-f build/image/upx/Dockerfile \
+ 		-t chaosbladeio/upx:3.96 build/image/upx
+
 upx:
-	upx -1 $(BUILD_TARGET_PKG_DIR)/blade $(BUILD_TARGET_PKG_DIR)/bin/*
+	docker run --rm \
+		-w $(shell pwd)/$(BUILD_TARGET_PKG_DIR) \
+		-v $(shell pwd)/$(BUILD_TARGET_PKG_DIR):$(shell pwd)/$(BUILD_TARGET_PKG_DIR) \
+ 		chaosbladeio/upx:3.96 \
+		--best \
+		blade $(shell pwd)/$(BUILD_TARGET_PKG_DIR)/bin/*
 
 # test
 test:
