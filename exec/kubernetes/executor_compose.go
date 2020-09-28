@@ -18,6 +18,8 @@ package kubernetes
 
 import (
 	"context"
+	"strings"
+
 	"github.com/chaosblade-io/chaosblade-exec-os/exec"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
@@ -28,13 +30,13 @@ type ComposeExecutor interface {
 
 type ComposeExecutorForK8s struct {
 	clientExecutors spec.Executor
-	sshExecutor spec.Executor
+	sshExecutor     spec.Executor
 }
 
 func NewComposeExecutor() ComposeExecutor {
 	return &ComposeExecutorForK8s{
 		clientExecutors: NewExecutor(),
-		sshExecutor: exec.NewSSHExecutor(),
+		sshExecutor:     exec.NewSSHExecutor(),
 	}
 }
 
@@ -43,7 +45,7 @@ func (*ComposeExecutorForK8s) Name() string {
 }
 
 func (e *ComposeExecutorForK8s) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
-	if model.ActionFlags[exec.ChannelFlag.Name] == e.sshExecutor.Name() {
+	if strings.ToLower(model.ActionFlags[exec.ChannelFlag.Name]) == e.sshExecutor.Name() {
 		return e.sshExecutor.Exec(uid, ctx, model)
 	} else {
 		return e.clientExecutors.Exec(uid, ctx, model)
