@@ -51,7 +51,7 @@ func (pc *PrepareJvmCommand) Init() {
 		},
 		Example: pc.prepareExample(),
 	}
-	//chaosbaldeJarPath  第三方jar包扫描路径
+	//chaosbaldeJarPath  the extrenal jar path 
 	pc.command.Flags().StringVarP(&pc.javaHome, "javaHome", "j", "", "the java jdk home path")
 	pc.command.Flags().StringVarP(&pc.chaosbaldeJarPath, "chaosbaldeJarPath", "jarPath", "", "the java jdk home path")
 	pc.command.Flags().StringVarP(&pc.processName, "process", "p", "", "the java application process name (required)")

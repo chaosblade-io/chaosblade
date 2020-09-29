@@ -98,7 +98,7 @@ func attach(pid, port string, ctx context.Context, javaHome string, chaosbaldeJa
 		return spec.ReturnFail(spec.Code[spec.ServerError],
 			fmt.Sprintf("create sandbox token failed, %v", err)), username
 	}
-	//挂载Agent的时候将第三方工具类传入
+	//Pass in the third-party tools when mounting the Agent
 	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid, chaosbaldeJarPath)
 	currUser, err := osuser.Current()
 	if err != nil {
@@ -128,7 +128,7 @@ func attach(pid, port string, ctx context.Context, javaHome string, chaosbaldeJa
 }
 
 func getAttachJvmOpts(toolsJar string, token string, port string, pid string, chaosbaldeJarPath string) string {
-	//-Xbootclasspath/a在系统class加载后加载
+	//-Xbootclasspath/a
 	var jvmOpts string
 	if chaosbaldeJarPath != "" {
 		jvmOpts = fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s:%s", toolsJar, chaosbaldeJarPath)
