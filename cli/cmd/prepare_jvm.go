@@ -53,7 +53,7 @@ func (pc *PrepareJvmCommand) Init() {
 	}
 	//chaosbaldeJarPath  the extrenal jar path
 	pc.command.Flags().StringVarP(&pc.javaHome, "javaHome", "j", "", "the java jdk home path")
-	pc.command.Flags().StringVarP(&pc.chaosbladeJarPath, "chaosbladeJarPath", "jarPath", "", "the java jdk home path")
+	pc.command.Flags().StringVarP(&pc.chaosbladeJarPath, "chaosbladeJarPath", "jp", "", "the java jdk home path")
 	pc.command.Flags().StringVarP(&pc.processName, "process", "p", "", "the java application process name (required)")
 	pc.command.Flags().IntVarP(&pc.port, "port", "P", 0, "the port used for agent server")
 	pc.command.Flags().StringVarP(&pc.processId, "pid", "", "", "the target java process id")
