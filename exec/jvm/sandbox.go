@@ -129,7 +129,7 @@ func attach(pid, port string, ctx context.Context, javaHome string, chaosbaldeJa
 
 func getAttachJvmOpts(toolsJar string, token string, port string, pid string, chaosbladeJarPath string) string {
 	//-Xbootclasspath/a
-	var jvmOpts = fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s:", toolsJar)
+	var jvmOpts = fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s", toolsJar)
 	if chaosbladeJarPath != "" {
 		jvmOpts = fmt.Sprintf("%s:%s", jvmOpts, chaosbladeJarPath)
 		logrus.Infof("chaosblade jvmOpts:%s", jvmOpts)
