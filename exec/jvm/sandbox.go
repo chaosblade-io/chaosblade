@@ -127,14 +127,12 @@ func attach(pid, port string, ctx context.Context, javaHome string, chaosbaldeJa
 	return response, username
 }
 
-func getAttachJvmOpts(toolsJar string, token string, port string, pid string, chaosbaldeJarPath string) string {
+func getAttachJvmOpts(toolsJar string, token string, port string, pid string, chaosbladeJarPath string) string {
 	//-Xbootclasspath/a
-	var jvmOpts string
-	if chaosbaldeJarPath != "" {
-		jvmOpts = fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s:%s", toolsJar, chaosbaldeJarPath)
-		logrus.Printf("chaosblade jvmOpts:%s", jvmOpts)
-	} else {
-		jvmOpts = fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s:", toolsJar)
+	var jvmOpts = fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s:", toolsJar)
+	if chaosbladeJarPath != "" {
+		jvmOpts = fmt.Sprintf("%s:%s", jvmOpts, chaosbladeJarPath)
+		logrus.Infof("chaosblade jvmOpts:%s", jvmOpts)
 	}
 	sandboxHome := path.Join(util.GetLibHome(), "sandbox")
 	sandboxLibPath := path.Join(sandboxHome, "lib")
