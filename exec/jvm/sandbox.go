@@ -38,9 +38,9 @@ var cl = channel.NewLocalChannel()
 
 const DefaultNamespace = "default"
 
-func Attach(port string, javaHome string, pid string) (*spec.Response, string) {
+func Attach(port string, javaHome string, pid string, chaosbaldeJarPath string) (*spec.Response, string) {
 	// refresh
-	response, username := attach(pid, port, context.TODO(), javaHome)
+	response, username := attach(pid, port, context.TODO(), javaHome, chaosbaldeJarPath)
 	if !response.Success {
 		return response, username
 	}
@@ -83,13 +83,14 @@ func active(port string) *spec.Response {
 }
 
 // attach java agent to application process
-func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
+func attach(pid, port string, ctx context.Context, javaHome string, chaosbaldeJarPath string) (*spec.Response, string) {
 	username, err := getUsername(pid)
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.StatusError],
 			fmt.Sprintf("get username failed by %s pid, %v", pid, err)), ""
 	}
 	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, pid, getJavaCommandLine)
+
 	toolsJar := getToolJar(javaHome)
 	logrus.Debugf("javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
 	token, err := getSandboxToken(ctx)
@@ -97,7 +98,8 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 		return spec.ReturnFail(spec.Code[spec.ServerError],
 			fmt.Sprintf("create sandbox token failed, %v", err)), username
 	}
-	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid)
+	//挂载Agent的时候将第三方工具类传入
+	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid, chaosbaldeJarPath)
 	currUser, err := osuser.Current()
 	if err != nil {
 		logrus.Warnf("get current user info failed, %v", err)
@@ -125,8 +127,15 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 	return response, username
 }
 
-func getAttachJvmOpts(toolsJar string, token string, port string, pid string) string {
-	jvmOpts := fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s", toolsJar)
+func getAttachJvmOpts(toolsJar string, token string, port string, pid string, chaosbaldeJarPath string) string {
+	//-Xbootclasspath/a在系统class加载后加载
+	var jvmOpts string
+	if chaosbaldeJarPath != "" {
+		jvmOpts = fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s:%s", toolsJar, chaosbaldeJarPath)
+		logrus.Printf("chaosblade jvmOpts:%s", jvmOpts)
+	} else {
+		jvmOpts = fmt.Sprintf("-Xms128M -Xmx128M -Xnoclassgc -ea -Xbootclasspath/a:%s:", toolsJar)
+	}
 	sandboxHome := path.Join(util.GetLibHome(), "sandbox")
 	sandboxLibPath := path.Join(sandboxHome, "lib")
 	sandboxAttachArgs := fmt.Sprintf("home=%s;token=%s;server.ip=%s;server.port=%s;namespace=%s",

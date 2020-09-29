@@ -35,9 +35,10 @@ type PrepareJvmCommand struct {
 	javaHome    string
 	processName string
 	// sandboxHome is jvm-sandbox home, default value is CHAOSBLADE_HOME/lib
-	sandboxHome string
-	port        int
-	processId   string
+	sandboxHome       string
+	port              int
+	processId         string
+	chaosbaldeJarPath string
 }
 
 func (pc *PrepareJvmCommand) Init() {
@@ -50,7 +51,9 @@ func (pc *PrepareJvmCommand) Init() {
 		},
 		Example: pc.prepareExample(),
 	}
+	//chaosbaldeJarPath  第三方jar包扫描路径
 	pc.command.Flags().StringVarP(&pc.javaHome, "javaHome", "j", "", "the java jdk home path")
+	pc.command.Flags().StringVarP(&pc.chaosbaldeJarPath, "chaosbaldeJarPath", "jarPath", "", "the java jdk home path")
 	pc.command.Flags().StringVarP(&pc.processName, "process", "p", "", "the java application process name (required)")
 	pc.command.Flags().IntVarP(&pc.port, "port", "P", 0, "the port used for agent server")
 	pc.command.Flags().StringVarP(&pc.processId, "pid", "", "", "the target java process id")
@@ -102,14 +105,14 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 					"please append or modify the --port %s argument in prepare command for retry", record.Port))
 		}
 	}
-	response, username := jvm.Attach(record.Port, pc.javaHome, pc.processId)
+	response, username := jvm.Attach(record.Port, pc.javaHome, pc.processId,pc.chaosbaldeJarPath)
 	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err := jvm.CheckPortFromSandboxToken(username)
 		if err == nil {
 			logrus.Infof("use %s port to retry", port)
 			//log.Info("use port to retry", "port", port)
-			response, username = jvm.Attach(port, pc.javaHome, pc.processId)
+			response, username = jvm.Attach(port, pc.javaHome, pc.processId,pc.chaosbaldeJarPath)
 			if response.Success {
 				// update port
 				err := updatePreparationPort(record.Uid, port)
