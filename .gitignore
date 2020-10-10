@@ -46,6 +46,7 @@ tags
 target
 coverage.txt
 vendor
+build/spec/*.yaml
 
 # Website
 site-build
