@@ -83,6 +83,19 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 	return record, nil
 }
 
+func handlePrepareResponseWithoutExit(uid string, cmd *cobra.Command, response *spec.Response) error {
+	response.Result = uid
+	if !response.Success {
+		GetDS().UpdatePreparationRecordByUid(uid, Error, response.Err)
+		return response
+	}
+	err := GetDS().UpdatePreparationRecordByUid(uid, Running, "")
+	if err != nil {
+		logrus.Warningf("update preparation record error: %s", err.Error())
+	}
+	return nil
+}
+
 func handlePrepareResponse(uid string, cmd *cobra.Command, response *spec.Response) error {
 	response.Result = uid
 	if !response.Success {

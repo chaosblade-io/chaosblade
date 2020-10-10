@@ -56,7 +56,7 @@ func (sc *StatusCommand) Init() {
 		},
 		Example: statusExample(),
 	}
-	sc.command.Flags().StringVar(&sc.commandType, "type", "", "command type, attach|create|destroy|detach")
+	sc.command.Flags().StringVar(&sc.commandType, "type", "", "command type, prepare|create|destroy|revoke")
 	sc.command.Flags().StringVar(&sc.target, "target", "", "experiment target, for example: dubbo")
 	sc.command.Flags().StringVar(&sc.limit, "limit", "", "limit the count of experiments, support OFFSET clause, for example, limit 4,3 returns only 3 items starting from the 5 position item")
 	sc.command.Flags().StringVar(&sc.status, "status", "", "experiment status. create type supports Created|Success|Error|Destroyed status. prepare type supports Created|Running|Error|Revoked status")

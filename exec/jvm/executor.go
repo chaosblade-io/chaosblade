@@ -243,6 +243,9 @@ func getProcessFlagFromExpRecord(model *data.ExperimentModel) string {
 func CheckFlagValues(processName, processId string) (string, *spec.Response) {
 	cl := channel.NewLocalChannel()
 	if processName == "" {
+		if processId == "" {
+			return "", spec.ReturnFail(spec.Code[spec.GetProcessError], fmt.Sprintf("cant get the process id"))
+		}
 		exists, err := cl.ProcessExists(processId)
 		if err != nil {
 			return processId, spec.ReturnFail(spec.Code[spec.GetProcessError],
