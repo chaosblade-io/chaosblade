@@ -37,7 +37,7 @@ chaosblade supports CLI and HTTP invocation methods. The supported commands are 
 * **create**: alias is c, create a chaos engineering experiment. The command is `blade create [TARGET] [ACTION] [FLAGS]`. For example, if you implement a Dubbo consumer call xxx.xxx.Service interface delay 3s, the command executed is `blade create dubbo delay --consumer --time 3000 --Service xxx.xxx.Service`, if the injection is successful, return the experimental uid for status query and destroy the experiment.
 * **destroy**: alias is d, destroy a chaos engineering experiment, such as destroying the Dubbo delay experiment mentioned above, the command is `blade destroy UID`
 * **status**: alias s, query preparation stage or experiment status, the command is `blade status UID` or `blade status --type create`
-* **server**: start the web server, expose the HTTP service, and call chaosblade through HTTP requests. For example, execute on the target machine xxxx: `blade server start -p 9526` to perform a CPU full load experiment:` curl "http://xxxx:9526/chaosblade?Cmd=create%20cpu%20fullload" `
+* **server**: start the web server, expose the HTTP service, and call chaosblade through HTTP requests. For example, execute on the target machine xxxx: `blade server start -p 9526` to perform a CPU full load experiment:` curl "http://xxxx:9526/chaosblade?cmd=create%20cpu%20fullload" `
 
 Use the `blade help [COMMAND]` or `blade [COMMAND] -h` command to view help
 
