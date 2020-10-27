@@ -150,6 +150,10 @@ func (cc *CreateCommand) actionPostRunEFunc(actionCommand *actionCommand) func(c
 			}
 
 			if timeout > 0 && actionCommand.uid != "" {
+				// fix https://github.com/chaosblade-io/chaosblade-operator/issues/34
+				if actionCommand.expModel.Scope == "container" || actionCommand.expModel.Scope == "pod" {
+					timeout = timeout + 60
+				}
 				script := path.Join(util.GetProgramPath(), bladeBin)
 				args := fmt.Sprintf("nohup /bin/sh -c 'sleep %d; %s destroy %s' > /dev/null 2>&1 &",
 					timeout, script, actionCommand.uid)
