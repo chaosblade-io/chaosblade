@@ -64,25 +64,56 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	override := model.ActionFlags["override"] == "true"
 	suid, isDestroy := spec.IsDestroy(ctx)
 	record, err := e.getRecordFromDB(processName, processId)
-	if override && !isDestroy {
-		// Uninstall java agent
-		response := Revoke(record, processName, processId)
-		if !response.Success {
-			return response
+	if record == nil || err != nil {
+		logrus.Warn(fmt.Sprintf("select record fail, uid: %s, err: %v", uid, err))
+		if processName == "" && processId == "" {
+			return spec.ReturnFail(spec.Code[spec.IllegalParameters],
+				fmt.Sprintf("less --process or --pid flags or can't found record, uid: %s", uid))
 		}
 	}
+
 	var port string
-	if !isDestroy && (record == nil || err != nil || override) {
-		response, newPort := Prepare(processName, processId)
-		if !response.Success {
-			return response
-		}
-		port = newPort
-	} else if record != nil {
+	if record != nil {
 		port = record.Port
-	} else {
-		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
 	}
+
+	if isDestroy {
+		if port == "" {
+			processId, response := CheckFlagValues(processName, processId)
+			if !response.Success {
+				return response
+			}
+			username, err := getUsername(processId)
+			if err != nil {
+				return spec.ReturnFail(spec.Code[spec.StatusError],
+					fmt.Sprintf("get username failed by %s pid, %v", username, err))
+			}
+			// get port from sandbox.token
+			port, err = getPortFromSandboxToken(username)
+			if err != nil {
+				return spec.ReturnSuccess(fmt.Sprintf("no record, %v", err))
+			}
+		}
+	} else {
+		if override {
+			// Uninstall java agent
+			logrus.Info("Uninstall java agent")
+			response := Revoke(record, processName, processId)
+			if !response.Success {
+				return response
+			}
+		}
+		// Install java agent
+		if port == "" || override {
+			logrus.Info("Install java agent")
+			response, newPort := Prepare(processName, processId)
+			if !response.Success {
+				return response
+			}
+			port = newPort
+		}
+	}
+
 	var result string
 	var code int
 	if isDestroy {
@@ -176,6 +207,9 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 	if err != nil {
 		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
 	}
+	if record == nil {
+		return spec.ReturnFail(spec.Code[spec.DatabaseError], fmt.Sprintf("record not found, uid: %s", uid))
+	}
 	port := record.Port
 	url := e.sandboxUrl(port, e.getStatusRequestPath(uid))
 	result, err, code := util.Curl(url)
@@ -211,9 +245,6 @@ func (e *Executor) getRecordFromDB(processName, processId string) (*data.Prepara
 	record, err := db.QueryRunningPreByTypeAndProcess("jvm", processName, processId)
 	if err != nil {
 		return nil, err
-	}
-	if record == nil {
-		return nil, fmt.Errorf("port not found for %s process, please execute prepare command firstly", processName)
 	}
 	return record, nil
 }
