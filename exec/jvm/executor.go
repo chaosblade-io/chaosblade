@@ -111,6 +111,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 				return response
 			}
 			port = newPort
+			delete(model.ActionFlags,"override")
 		}
 	}
 
