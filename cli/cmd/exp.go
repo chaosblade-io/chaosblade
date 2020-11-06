@@ -250,8 +250,11 @@ func (ec *baseExpCommandService) registerExpCommand(commandSpec spec.ExpModelCom
 		actionCommand := ec.registerActionCommand(commandSpec.Name(), commandSpec.Scope(), action)
 		command.Actions[action.Name()] = actionCommand.ExpActionFlags
 		command.AddCommand(actionCommand)
+
 		executor := action.Executor()
-		executor.SetChannel(channel.NewLocalChannel())
+		if executor != nil {
+			executor.SetChannel(channel.NewLocalChannel())
+		}
 		ec.executors[createExecutorKey(parentTargetCmd, cmdName, action.Name())] = executor
 	}
 

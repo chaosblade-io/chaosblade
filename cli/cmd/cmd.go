@@ -62,5 +62,11 @@ func CmdInit() *baseCommand {
 	serverCommand.AddCommand(&StopServerCommand{})
 	serverCommand.AddCommand(&StatusServerCommand{})
 
+	// add deteck command
+	deteckCommand := &DeteckCommand{}
+	baseCmd.AddCommand(deteckCommand)
+	deteckCommand.AddCommand(&DeteckJavaCommand{})
+	deteckCommand.AddCommand(&DeteckOsCommand{})
+
 	return baseCmd
 }
