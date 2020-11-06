@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=0.7.0
+export BLADE_VERSION=0.8.0
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -227,7 +227,7 @@ build_linux_with_arg:
 		-w /go/src/github.com/chaosblade-io/chaosblade \
 		-v ~/.m2/repository:/root/.m2/repository \
 		-v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
-		chaosbladeio/chaosblade-build-musl:$(BLADE_VERSION) build_with $$ARGS
+		chaosbladeio/chaosblade-build-musl:latest build_with $$ARGS
 
 ## Select scenario build linux arm version by docker image
 build_linux_arm_with_arg:
@@ -237,7 +237,7 @@ build_linux_arm_with_arg:
 		-w /go/src/github.com/chaosblade-io/chaosblade \
 		-v ~/.m2/repository:/root/.m2/repository \
 		-v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
-		chaosbladeio/chaosblade-build-arm:$(BLADE_VERSION) build_with $$ARGS
+		chaosbladeio/chaosblade-build-arm:latest build_with $$ARGS
 
 # create cache dir
 mkdir_build_target:
