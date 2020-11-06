@@ -30,18 +30,18 @@ type DeteckCommand struct {
 
 func (dc *DeteckCommand) Init() {
 	dc.command = &cobra.Command{
-		Use:     "deteck",
+		Use:     "check",
 		Aliases: []string{"k"},
-		Short:   "Deteck the environment",
-		Long:    "Deteck the environment is ok for chaosblade or not",
+		Short:   "Check the environment for chaosblade",
+		Long:    "Check the environment for chaosblade",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return spec.ReturnFail(spec.Code[spec.IllegalCommand],
-				fmt.Sprintf("less TARGE to deteck"))
+				fmt.Sprintf("less TARGE to check"))
 		},
 		Example: dc.detectExample(),
 	}
 }
 
 func (dc *DeteckCommand) detectExample() string {
-	return "deteck os"
+	return "check os"
 }

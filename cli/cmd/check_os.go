@@ -32,7 +32,7 @@ var allCmd []string
 var BladeBinPath string
 
 const (
-	BladeBin  = "/blade"
+	BladeBin  = "blade"
 	OsCommand = "create"
 )
 
@@ -53,27 +53,27 @@ func (doc *DeteckOsCommand) Name() string {
 func (doc *DeteckOsCommand) Init() {
 	doc.command = &cobra.Command{
 		Use:   "os",
-		Short: "Deteck the environment of os",
-		Long:  "Deteck the environment of os is ok for chaosblade or not",
+		Short: "Check the environment of os for chaosblade",
+		Long:  "Check the environment of os for chaosblade",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return doc.deteckOsAll()
 		},
 		Example: doc.detectExample(),
 	}
-	BladeBinPath = util.GetProgramPath() + BladeBin
+	BladeBinPath = util.GetProgramPath() + "/" + BladeBin
 	doc.baseExpCommandService = newBaseExpDeteckCommandService(doc)
 }
 
 func (doc *DeteckOsCommand) detectExample() string {
-	return "deteck os"
+	return "check os"
 }
 
-// deteck all os action
+// check all os action
 func (doc *DeteckOsCommand) deteckOsAll() error {
 	// 1. build all cmd
 	err := doc.buildAllOsCmd()
 	if err != nil {
-		fmt.Printf("deteck os failed! err: %s \n", err.Error())
+		fmt.Printf("check os failed! err: %s \n", err.Error())
 	}
 
 	// 2. one by one exec cmd
@@ -175,7 +175,7 @@ func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *
 			}
 
 			if flag.FlagRequired() && value == "" {
-				fmt.Print("deteck failed! err: less required parameter \n")
+				fmt.Print("check failed! err: less required parameter \n")
 				return nil
 			}
 
@@ -188,9 +188,9 @@ func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *
 		// 3. exec cmd
 		response := channel.NewLocalChannel().Run(context.Background(), BladeBinPath, cmdStr)
 		if response.Success {
-			fmt.Print("deteck success! \n")
+			fmt.Print("check success! \n")
 		} else {
-			fmt.Printf("deteck failed! err: %s \n", response.Err)
+			fmt.Printf("check failed! err: %s \n", response.Err)
 		}
 
 		return nil

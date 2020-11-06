@@ -54,8 +54,8 @@ func (djc *DeteckJavaCommand) Name() string {
 func (djc *DeteckJavaCommand) Init() {
 	djc.command = &cobra.Command{
 		Use:   "java",
-		Short: "Deteck the environment of java",
-		Long:  "Deteck the environment of java is ok for chaosblade or not",
+		Short: "Check the environment of java for chaosblade",
+		Long:  "Check the environment of java for chaosblade",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return djc.deteckJavaRunE()
 		},
@@ -66,7 +66,7 @@ func (djc *DeteckJavaCommand) Init() {
 }
 
 func (djc *DeteckJavaCommand) detectExample() string {
-	return "deteck os"
+	return "check os"
 }
 
 func (djc *DeteckJavaCommand) deteckJavaRunE() error {
@@ -86,7 +86,7 @@ func (djc *DeteckJavaCommand) deteckJavaRunE() error {
 			if err != nil {
 				fmt.Printf(err.Error() + "\n")
 			} else {
-				fmt.Print("deteck jdk version success! \n")
+				fmt.Print("check jdk version success! \n")
 			}
 		case "tools":
 			err := djc.deteckTools()
@@ -94,7 +94,7 @@ func (djc *DeteckJavaCommand) deteckJavaRunE() error {
 				fmt.Printf(err.Error() + "\n")
 				return err
 			} else {
-				fmt.Printf("deteck tools.jar success! \n")
+				fmt.Printf("check tools.jar success! \n")
 			}
 		default:
 			return spec.ReturnFail(spec.Code[spec.IllegalParameters], fmt.Sprintf("object parameter is wrong, object : %s", object))
@@ -104,9 +104,9 @@ func (djc *DeteckJavaCommand) deteckJavaRunE() error {
 	return nil
 }
 
-// deteck jdk
+// check jdk
 func (djc *DeteckJavaCommand) deteckJdk() error {
-	// 1. deteck jdk by javaHome
+	// 1. check jdk by javaHome
 	if javaHome != "" {
 		jdkVersion, err := djc.getJdkVersionFromJdkHome()
 		if err != nil {
@@ -114,12 +114,12 @@ func (djc *DeteckJavaCommand) deteckJdk() error {
 		}
 
 		if ok, err := djc.deteckJdkVersion(jdkVersion); !ok {
-			return errors.New("deteck jdk version failed. err: " + err.Error())
+			return errors.New("check jdk version failed. err: " + err.Error())
 		}
 		return nil
 	}
 
-	// 2. deteck jdk by $JAVA_HOME
+	// 2. check jdk by $JAVA_HOME
 	var jdkVersion string
 	response := channel.NewLocalChannel().Run(context.Background(), "", cmdJavaHome)
 	if response.Success {
@@ -127,35 +127,35 @@ func (djc *DeteckJavaCommand) deteckJdk() error {
 		javaHome = strings.Trim(javaResult, "\n")
 		jdkVersion, err := djc.getJdkVersionFromJdkHome()
 		if err != nil {
-			return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", err.Error()))
+			return errors.New(fmt.Sprintf("check java jdk version failed! err: %s", err.Error()))
 		}
 
 		ok, err := djc.deteckJdkVersion(jdkVersion)
 		if !ok || err != nil {
-			return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", err.Error()))
+			return errors.New(fmt.Sprintf("check java jdk version failed! err: %s", err.Error()))
 		}
 		return nil
 	}
 
-	// 3. deteck jdk by `java -version`
+	// 3. check jdk by `java -version`
 	response = channel.NewLocalChannel().Run(context.Background(), "", cmdJavaVersion)
 	if !response.Success {
-		return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", response.Err))
+		return errors.New(fmt.Sprintf("check java jdk version failed! err: %s", response.Err))
 	}
 	javaResult := response.Result.(string)
 
 	jdkVersion, err := djc.getJdkVersionFromJavaVer(string(javaResult))
 	if err != nil {
-		return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", err.Error()))
+		return errors.New(fmt.Sprintf("check java jdk version failed! err: %s", err.Error()))
 	}
 	ok, err := djc.deteckJdkVersion(jdkVersion)
 	if !ok || err != nil {
-		return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", err.Error()))
+		return errors.New(fmt.Sprintf("check java jdk version failed! err: %s", err.Error()))
 	}
 	return nil
 }
 
-// deteck java tools
+// check java tools
 func (djc *DeteckJavaCommand) deteckTools() error {
 	// 1. get java tools.jar path
 	var javaToolsPrePath string
@@ -164,19 +164,19 @@ func (djc *DeteckJavaCommand) deteckTools() error {
 	} else {
 		response := channel.NewLocalChannel().Run(context.Background(), "", cmdJavaHome)
 		if !response.Success {
-			return errors.New("deteck java tools.jar failed, JAVAHOME is nil")
+			return errors.New("check java tools.jar failed, JAVAHOME is nil")
 		}
 		javaToolsPrePath = response.Result.(string)
 	}
 
-	// deteck the path of tools.jar is exists or not
+	// check the path of tools.jar is exists or not
 	if util.IsExist(javaToolsPrePath + javaToolsSubPath) {
 		return nil
 	}
-	return errors.New("deteck java tools.jar failed, tools.jar not exist")
+	return errors.New("check java tools.jar failed, tools.jar not exist")
 }
 
-// deteck jdk version. if current jdk version less than 1.6, return false, else return true
+// check jdk version. if current jdk version less than 1.6, return false, else return true
 func (djc *DeteckJavaCommand) deteckJdkVersion(currentVersion string) (bool, error) {
 	// 1. split jdk version, eg: 1.8.0_151
 	currentVersions := strings.Split(currentVersion, ".")
@@ -185,7 +185,7 @@ func (djc *DeteckJavaCommand) deteckJdkVersion(currentVersion string) (bool, err
 		return false, errors.New("jdk version error, jdk version: " + currentVersion)
 	}
 
-	// 2. deteck current jdk
+	// 2. check current jdk
 	currFirst, _ := strconv.Atoi(currentVersions[0])
 	currSecond, _ := strconv.Atoi(currentVersions[1])
 	minFirst, _ := strconv.Atoi(minVersions[0])

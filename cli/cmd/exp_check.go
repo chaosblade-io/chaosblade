@@ -48,7 +48,7 @@ func (ec *baseExpCommandService) registerSubCommandsForDeteck() {
 
 func (ec *baseExpCommandService) registerDetectExpCommands() []*modelCommand {
 	var err error
-	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-deteck-spec-%s.yaml", version.Ver))
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-check-spec-%s.yaml", version.Ver))
 	AllDeteckModels, err = specutil.ParseSpecsToModel(file, nil)
 	if err != nil {
 		return nil
