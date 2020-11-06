@@ -30,7 +30,7 @@ import (
 var allCmd []string
 
 const (
-	BladeBin  = "/Users/caimingxia/chaosblade-0.7.0/blade" //"/opt/chaosblade/blade"
+	BladeBin  = "/opt/chaosblade/blade"
 	OsCommand = "create"
 )
 
@@ -71,23 +71,22 @@ func (doc *DeteckOsCommand) deteckOsAll() error {
 	// 1. build all cmd
 	err := doc.buildAllOsCmd()
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.IllegalParameters], err.Error())
+		fmt.Printf("deteck os failed! err: %s \n", err.Error())
 	}
 
 	// 2. one by one exec cmd
-	var result []string
 	ch := channel.NewLocalChannel()
 	for _, cmd := range allCmd {
 		response := ch.Run(context.Background(), BladeBin, cmd)
 		if response.Success {
-			result = append(result, fmt.Sprintf("%s, success ;", cmd))
+			fmt.Printf("%s, success! \n", cmd)
 			continue
 		}
 
-		result = append(result, fmt.Sprintf("%s, failed ! err: %s ;", cmd, response.Err))
+		fmt.Printf("%s, failed! err: %s", cmd, response.Err)
 	}
 
-	return spec.ReturnSuccess(result)
+	return nil
 }
 
 // build all os cmd
@@ -136,7 +135,6 @@ func (doc *DeteckOsCommand) buildAllOsCmd() error {
 // bind flags
 func (doc *DeteckOsCommand) bindFlagsFunction() func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
 	return func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
-		//return
 		//set action flags
 		for _, flag := range specFlags {
 			flagName := flag.FlagName()
@@ -174,7 +172,8 @@ func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *
 			}
 
 			if flag.FlagRequired() && value == "" {
-				return spec.ReturnFail(spec.Code[spec.IllegalParameters], "less required parameter")
+				fmt.Print("deteck failed! err: less required parameter \n")
+				return nil
 			}
 
 			if value == "" {
@@ -184,8 +183,14 @@ func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *
 		}
 
 		// 3. exec cmd
-		return channel.NewLocalChannel().Run(context.Background(), BladeBin, cmdStr)
+		response := channel.NewLocalChannel().Run(context.Background(), BladeBin, cmdStr)
+		if response.Success {
+			fmt.Print("deteck success! \n")
+		} else {
+			fmt.Printf("deteck failed! err: %s \n", response.Err)
+		}
 
+		return nil
 	}
 }
 

@@ -75,7 +75,6 @@ func (djc *DeteckJavaCommand) deteckJavaRunE() error {
 		return spec.ReturnFail(spec.Code[spec.IllegalParameters], "less object parameter")
 	}
 
-	var result []string
 	for _, object := range objects {
 		object = strings.TrimSpace(object)
 		if object == "" {
@@ -85,20 +84,24 @@ func (djc *DeteckJavaCommand) deteckJavaRunE() error {
 		case "jdk":
 			err := djc.deteckJdk()
 			if err != nil {
-				result = append(result)
+				fmt.Printf(err.Error() + "\n")
+			} else {
+				fmt.Print("deteck jdk version success! \n")
 			}
 		case "tools":
 			err := djc.deteckTools()
 			if err != nil {
+				fmt.Printf(err.Error() + "\n")
 				return err
+			} else {
+				fmt.Printf("deteck tools.jar success! \n")
 			}
 		default:
 			return spec.ReturnFail(spec.Code[spec.IllegalParameters], fmt.Sprintf("object parameter is wrong, object : %s", object))
 		}
 
 	}
-
-	return spec.ReturnSuccess("success")
+	return nil
 }
 
 // deteck jdk
@@ -111,7 +114,7 @@ func (djc *DeteckJavaCommand) deteckJdk() error {
 		}
 
 		if ok, err := djc.deteckJdkVersion(jdkVersion); !ok {
-			return errors.New("deteck jdk failed. err: " + err.Error())
+			return errors.New("deteck jdk version failed. err: " + err.Error())
 		}
 		return nil
 	}
@@ -124,12 +127,12 @@ func (djc *DeteckJavaCommand) deteckJdk() error {
 		javaHome = strings.Trim(javaResult, "\n")
 		jdkVersion, err := djc.getJdkVersionFromJdkHome()
 		if err != nil {
-			return errors.New(fmt.Sprintf("deteck java jdk failed! err: %s", err.Error()))
+			return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", err.Error()))
 		}
 
 		ok, err := djc.deteckJdkVersion(jdkVersion)
 		if !ok || err != nil {
-			return errors.New(fmt.Sprintf("deteck java jdk failed! err: %s", err.Error()))
+			return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", err.Error()))
 		}
 		return nil
 	}
@@ -137,17 +140,17 @@ func (djc *DeteckJavaCommand) deteckJdk() error {
 	// 3. deteck jdk by `java -version`
 	response = channel.NewLocalChannel().Run(context.Background(), "", cmdJavaVersion)
 	if !response.Success {
-		return errors.New(fmt.Sprintf("deteck java jdk failed! err: %s", response.Err))
+		return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", response.Err))
 	}
 	javaResult := response.Result.(string)
 
 	jdkVersion, err := djc.getJdkVersionFromJavaVer(string(javaResult))
 	if err != nil {
-		return errors.New(fmt.Sprintf("deteck java jdk failed! err: %s", err.Error()))
+		return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", err.Error()))
 	}
 	ok, err := djc.deteckJdkVersion(jdkVersion)
 	if !ok || err != nil {
-		return spec.ReturnFail(spec.Code[spec.ExecCommandError], fmt.Sprintf("deteck java jdk failed! err: %s", err.Error()))
+		return errors.New(fmt.Sprintf("deteck java jdk version failed! err: %s", err.Error()))
 	}
 	return nil
 }
@@ -161,7 +164,7 @@ func (djc *DeteckJavaCommand) deteckTools() error {
 	} else {
 		response := channel.NewLocalChannel().Run(context.Background(), "", cmdJavaHome)
 		if !response.Success {
-			return spec.ReturnFail(spec.Code[spec.ExecCommandError], "deteck java tools failed, JAVAHOME is nil")
+			return errors.New("deteck java tools.jar failed, JAVAHOME is nil")
 		}
 		javaToolsPrePath = response.Result.(string)
 	}
@@ -170,7 +173,7 @@ func (djc *DeteckJavaCommand) deteckTools() error {
 	if util.IsExist(javaToolsPrePath + javaToolsSubPath) {
 		return nil
 	}
-	return spec.ReturnFail(spec.Code[spec.ExecCommandError], "deteck java tools failed, tools.jar not exist")
+	return errors.New("deteck java tools.jar failed, tools.jar not exist")
 }
 
 // deteck jdk version. if current jdk version less than 1.6, return false, else return true
