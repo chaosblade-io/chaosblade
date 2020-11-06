@@ -24,13 +24,15 @@ import (
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
 )
 
 var allCmd []string
+var BladeBinPath string
 
 const (
-	BladeBin  = "/opt/chaosblade/blade"
+	BladeBin  = "/blade"
 	OsCommand = "create"
 )
 
@@ -58,7 +60,7 @@ func (doc *DeteckOsCommand) Init() {
 		},
 		Example: doc.detectExample(),
 	}
-
+	BladeBinPath = util.GetProgramPath() + BladeBin
 	doc.baseExpCommandService = newBaseExpDeteckCommandService(doc)
 }
 
@@ -77,7 +79,7 @@ func (doc *DeteckOsCommand) deteckOsAll() error {
 	// 2. one by one exec cmd
 	ch := channel.NewLocalChannel()
 	for _, cmd := range allCmd {
-		response := ch.Run(context.Background(), BladeBin, cmd)
+		response := ch.Run(context.Background(), BladeBinPath, cmd)
 		if response.Success {
 			fmt.Printf("%s, success! \n", cmd)
 			continue
@@ -105,7 +107,8 @@ func (doc *DeteckOsCommand) buildAllOsCmd() error {
 				}
 
 				if flag.FlagDefault() == "" {
-					return errors.New("less required parameter" + flag.FlagName())
+					return errors.New("less required parameter, model: " + model.ExpName +
+						" action: " + actionName + " parameter: " + flag.FlagName())
 				}
 
 				cmd += fmt.Sprintf(" --%s %s", flag.FlagName(), flag.FlagDefault())
@@ -183,7 +186,7 @@ func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *
 		}
 
 		// 3. exec cmd
-		response := channel.NewLocalChannel().Run(context.Background(), BladeBin, cmdStr)
+		response := channel.NewLocalChannel().Run(context.Background(), BladeBinPath, cmdStr)
 		if response.Success {
 			fmt.Print("deteck success! \n")
 		} else {
