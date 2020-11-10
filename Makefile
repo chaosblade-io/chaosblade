@@ -37,6 +37,7 @@ BUILD_TARGET_YAML=$(BUILD_TARGET_PKG_DIR)/yaml
 BUILD_TARGET_TAR_NAME=$(BUILD_TARGET_DIR_NAME).tar.gz
 BUILD_TARGET_PKG_FILE_PATH=$(BUILD_TARGET)/$(BUILD_TARGET_TAR_NAME)
 BUILD_IMAGE_PATH=build/image/blade
+BUILD_ARM_IMAGE_PATH=build/image/blade_arm
 # cache downloaded file
 BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
@@ -187,6 +188,16 @@ build_image: ## Build chaosblade-tool image
 		-t chaosblade-tool:$(BLADE_VERSION) \
 		$(BUILD_IMAGE_PATH)
 	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
+
+build_image_arm: ## Build chaosblade-tool-arm image
+	rm -rf $(BUILD_ARM_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
+	cp -R $(BUILD_TARGET_PKG_NAME) $(BUILD_ARM_IMAGE_PATH)
+	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_ARM_IMAGE_PATH)
+	docker build -f $(BUILD_ARM_IMAGE_PATH)/Dockerfile \
+		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
+		-t chaosblade-tool-arm:$(BLADE_VERSION) \
+		$(BUILD_ARM_IMAGE_PATH)
+	rm -rf $(BUILD_ARM_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 
 # build docker image with multi-stage builds
 docker_image: clean ## Build chaosblade image
