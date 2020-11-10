@@ -84,17 +84,17 @@ func (djc *DeteckJavaCommand) deteckJavaRunE() error {
 		case "jdk":
 			err := djc.deteckJdk()
 			if err != nil {
-				fmt.Printf(err.Error() + "\n")
+				fmt.Printf("[failed] %s \n", err.Error())
 			} else {
-				fmt.Print("check jdk version success! \n")
+				fmt.Print("[success] check jdk version success! \n")
 			}
 		case "tools":
 			err := djc.deteckTools()
 			if err != nil {
-				fmt.Printf(err.Error() + "\n")
+				fmt.Printf("[failed] %s \n", err.Error())
 				return err
 			} else {
-				fmt.Printf("check tools.jar success! \n")
+				fmt.Printf("[success] check tools.jar success! \n")
 			}
 		default:
 			return spec.ReturnFail(spec.Code[spec.IllegalParameters], fmt.Sprintf("object parameter is wrong, object : %s", object))

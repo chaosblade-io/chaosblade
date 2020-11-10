@@ -17,6 +17,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -24,16 +25,16 @@ import (
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
 )
 
 var allCmd []string
+var AllCmd map[string][]string
 var BladeBinPath string
 
 const (
-	BladeBin  = "blade"
-	OsCommand = "create"
+	BladeBin        = "blade"
+	OperatorCommand = "operator"
 )
 
 type DeteckOsCommand struct {
@@ -60,7 +61,10 @@ func (doc *DeteckOsCommand) Init() {
 		},
 		Example: doc.detectExample(),
 	}
-	BladeBinPath = util.GetProgramPath() + "/" + BladeBin
+	//BladeBinPath = path.Join(util.GetProgramPath(), BladeBin)
+	// todo : delete
+	BladeBinPath = "/Users/caimingxia/chaosblade-0.7.0/blade"
+	AllCmd = make(map[string][]string, 0)
 	doc.baseExpCommandService = newBaseExpDeteckCommandService(doc)
 }
 
@@ -73,66 +77,162 @@ func (doc *DeteckOsCommand) deteckOsAll() error {
 	// 1. build all cmd
 	err := doc.buildAllOsCmd()
 	if err != nil {
-		fmt.Printf("check os failed! err: %s \n", err.Error())
+		fmt.Printf("[failed] check os failed! err: %s \n", err.Error())
 	}
 
 	// 2. one by one exec cmd
-	ch := channel.NewLocalChannel()
-	for _, cmd := range allCmd {
-		response := ch.Run(context.Background(), BladeBinPath, cmd)
-		if response.Success {
-			fmt.Printf("%s, success! \n", cmd)
-			continue
+	for program, cmds := range AllCmd {
+		switch program {
+		case OperatorCommand:
+			doc.execOperatorCmd(cmds)
+		default:
+			doc.execBladeCmd(cmds)
 		}
-
-		fmt.Printf("%s, failed! err: %s", cmd, response.Err)
 	}
-
 	return nil
 }
 
+func (doc *DeteckOsCommand) execBladeCmd(allCmd []string) {
+	ch := channel.NewLocalChannel()
+	for _, cmd := range allCmd {
+		//2.1 create os cmd
+		response := ch.Run(context.Background(), BladeBinPath, cmd)
+		if !response.Success {
+			fmt.Printf("[failed] %s, failed! create err: %s", cmd, response.Err)
+			continue
+		}
+		var res spec.Response
+		err := json.Unmarshal([]byte(response.Result.(string)), &res)
+		if err != nil {
+			fmt.Printf("[failed] %s, failed! create err: %s", cmd, response.Result)
+			continue
+		}
+
+		// 2.2 destroy os cmd
+		response = ch.Run(context.Background(), BladeBinPath, fmt.Sprintf("destroy %s", res.Result.(string)))
+		if !response.Success {
+			fmt.Printf("[failed] %s, failed! destroy err: %s \n", err.Error())
+			continue
+		}
+		err = json.Unmarshal([]byte(response.Result.(string)), &res)
+		if err != nil || !res.Success {
+			fmt.Printf("[failed] %s, failed! destroy err: %s", cmd, response.Result)
+			continue
+		}
+		fmt.Printf("[success] %s, success! \n", cmd)
+	}
+}
+
+func (doc *DeteckOsCommand) execOperatorCmd(allCmd []string) {
+	ch := channel.NewLocalChannel()
+	if len(allCmd) == 0 {
+		return
+	}
+
+	for _, cmd := range allCmd {
+		response := ch.Run(context.Background(), "", cmd)
+		if !response.Success {
+			fmt.Printf("[failed] %s, failed! command not found \n", cmd[len("man "):])
+			continue
+		}
+
+		fmt.Printf("[success] %s, success! \n", cmd[len("man "):])
+	}
+}
+
 // build all os cmd
+
 func (doc *DeteckOsCommand) buildAllOsCmd() error {
 	models := AllDeteckModels.Models
 	for _, model := range models {
 		expName := model.ExpName
 		for _, action := range model.Actions() {
+			programs := action.Programs()
 			actionName := action.Name()
-			cmd := fmt.Sprintf("%s %s %s", OsCommand, expName, actionName)
-
-			// build base cmd by required flag
-			for _, flag := range action.Flags() {
-				if !flag.FlagRequired() {
-					continue
-				}
-
-				if flag.FlagDefault() == "" {
-					return errors.New("less required parameter, model: " + model.ExpName +
-						" action: " + actionName + " parameter: " + flag.FlagName())
-				}
-
-				cmd += fmt.Sprintf(" --%s %s", flag.FlagName(), flag.FlagDefault())
-				allCmd = append(allCmd, cmd)
+			if len(programs) != 1 {
+				return errors.New("build all commadn by yaml file failed! action programs wrong, model: " + model.ExpName +
+					" action: " + actionName)
 			}
 
-			// add other flag
-			baseCmd := cmd
-			for _, flag := range action.Flags() {
-				if flag.FlagRequired() {
-					continue
-				}
+			cmd := ""
+			switch programs[0] {
+			case OperatorCommand:
+				cmd = fmt.Sprintf("%s %s", expName, actionName)
+			default:
+				cmd = fmt.Sprintf("%s %s %s", programs[0], expName, actionName)
+			}
 
-				if flag.FlagDefault() == "" {
-					continue
-				}
+			// merge matchers and flags
+			flags := doc.mergeMatchesAndFlags(action.Matchers(), action.Flags())
 
-				cmd += fmt.Sprintf(" --%s %s", flag.FlagName(), flag.FlagDefault())
-				allCmd = append(allCmd, cmd)
-				cmd = baseCmd
+			// build cmd by flags and matchers
+			cmdArr, err := doc.buildCmdByMatchersAndFlags(flags, expName, actionName, cmd)
+			if err != nil {
+				return err
+			}
+			onePrograms, ok := AllCmd[programs[0]]
+			if ok {
+				AllCmd[programs[0]] = append(onePrograms, cmdArr...)
+			} else {
+				AllCmd[programs[0]] = cmdArr
+
 			}
 		}
 	}
 	return nil
+}
+
+// merge matchers and flags
+func (doc *DeteckOsCommand) mergeMatchesAndFlags(matches, flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
+
+	mergeResult := make([]spec.ExpFlagSpec, 0)
+	for _, flag := range flags {
+		mergeResult = append(mergeResult, flag)
+	}
+	for _, matcher := range matches {
+		mergeResult = append(mergeResult, matcher)
+	}
+	return mergeResult
+}
+
+func (doc *DeteckOsCommand) buildCmdByMatchersAndFlags(flags []spec.ExpFlagSpec, expName, actionName, cmd string) ([]string, error) {
+	var cmdArr []string
+	if len(flags) == 0 {
+		cmdArr = append(cmdArr, cmd)
+		return cmdArr, nil
+	}
+	// build base cmd by required flag
+	for _, flag := range flags {
+		if !flag.FlagRequired() {
+			continue
+		}
+
+		if flag.FlagDefault() == "" {
+			return nil, errors.New("build all commadn by yaml file failed! less required parameter, model: " + expName +
+				" action: " + actionName + " parameter: " + flag.FlagName())
+		}
+
+		cmd += fmt.Sprintf(" --%s %s", flag.FlagName(), flag.FlagDefault())
+		cmdArr = append(cmdArr, cmd)
+	}
+
+	// add other flag
+	baseCmd := cmd
+	for _, flag := range flags {
+		if flag.FlagRequired() {
+			continue
+		}
+
+		if flag.FlagDefault() == "" {
+			continue
+		}
+
+		cmd += fmt.Sprintf(" --%s %s", flag.FlagName(), flag.FlagDefault())
+		cmdArr = append(cmdArr, cmd)
+		cmd = baseCmd
+	}
+
+	return cmdArr, nil
 }
 
 // bind flags
@@ -167,15 +267,24 @@ func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *
 		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
 
 		// 2. build cmd
-		cmdStr := OsCommand + " " + expModel.Target + " " + expModel.ActionName
-		for _, flag := range actionCommandSpec.Flags() {
+		programs := actionCommandSpec.Programs()
+		if len(programs) != 1 {
+			fmt.Print("[failed] check failed! err: action program is wrong! \n")
+			return nil
+		}
+
+		cmdStr := ""
+		// 2.1 merge matchers and flags
+		flags := doc.mergeMatchesAndFlags(actionCommandSpec.Matchers(), actionCommandSpec.Flags())
+		// 2.2 build cmd by flags
+		for _, flag := range flags {
 			value, ok := expModel.ActionFlags[flag.FlagName()]
 			if !ok || value == "" {
 				value = flag.FlagDefault()
 			}
 
 			if flag.FlagRequired() && value == "" {
-				fmt.Print("check failed! err: less required parameter \n")
+				fmt.Print("[failed] check failed! err: less required parameter! \n")
 				return nil
 			}
 
@@ -186,11 +295,24 @@ func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *
 		}
 
 		// 3. exec cmd
-		response := channel.NewLocalChannel().Run(context.Background(), BladeBinPath, cmdStr)
-		if response.Success {
-			fmt.Print("check success! \n")
-		} else {
-			fmt.Printf("check failed! err: %s \n", response.Err)
+		var response *spec.Response
+		switch programs[0] {
+		case OperatorCommand:
+			cmdStr = fmt.Sprintf("%s %s %s", expModel.Target, expModel.ActionName, cmdStr)
+			response = channel.NewLocalChannel().Run(context.Background(), "", cmdStr)
+			if response.Success {
+				fmt.Print("[success] check success! \n")
+			} else {
+				fmt.Printf("[failed] check failed! %s, command not found \n", cmdStr[len("man "):])
+			}
+		default:
+			cmdStr = fmt.Sprintf("%s %s %s %s", programs[0], expModel.Target, expModel.ActionName, cmdStr)
+			response = channel.NewLocalChannel().Run(context.Background(), BladeBinPath, cmdStr)
+			if response.Success {
+				fmt.Print("[success] check success! \n")
+			} else {
+				fmt.Printf("[failed] check failed! err: %s \n", response.Err)
+			}
 		}
 
 		return nil

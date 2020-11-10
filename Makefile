@@ -64,6 +64,11 @@ BLADE_EXEC_CPLUS_BRANCH=master
 DOCKER_YAML_FILE_NAME=chaosblade-docker-spec-$(BLADE_VERSION).yaml
 DOCKER_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(DOCKER_YAML_FILE_NAME)
 
+# check yaml
+CHECK_YAML_FILE_NAME=chaosblade-check-spec-$(BLADE_VERSION).yaml
+CHECK_YANL_FILE_OSS=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/$(BLADE_VERSION)/$(CHECK_YAML_FILE_NAME)
+CHECK_YAML_FILE_PATH=$(BUILD_TARGET_YAML)/$(CHECK_YAML_FILE_NAME)
+
 ifeq ($(GOOS), linux)
 	GO_FLAGS=-ldflags="-linkmode external -extldflags -static $(GO_X_FLAGS) -s -w"
 endif
@@ -76,7 +81,7 @@ help:
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>...\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m  %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Build
-build: pre_build cli os docker kubernetes cplus java upx package  ## Build all scenarios
+build: pre_build cli os docker kubernetes cplus java upx package check_yaml  ## Build all scenarios
 
 # for example: make build_with cli os_darwin
 build_with: pre_build ## Select scenario build, for example `make build_with cli os docker kubernetes java cplus`
@@ -88,12 +93,12 @@ build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario buil
 
 # build chaosblade linux version by docker image
 build_linux:  ## Build linux version of all scenarios by docker image
-	make build_with_linux ARGS="cli os docker kubernetes java cplus" upx package
+	make build_with_linux ARGS="cli os docker kubernetes java cplus check_yaml" upx package
 
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
-	make build_with_linux_arm ARGS="cli os docker kubernetes java cplus" upx package
+	make build_with_linux_arm ARGS="cli os docker kubernetes java cplus check_yaml" upx package
 
-build_darwin: pre_build cli os_darwin docker kubernetes java cplus upx package ## Build all scenarios darwin version
+build_darwin: pre_build cli os_darwin docker kubernetes java cplus upx package check_yaml ## Build all scenarios darwin version
 
 ##@ Build sub
 
@@ -219,6 +224,9 @@ clean: ## Clean
 
 package: ## Generate the tar packages
 	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
+
+check_yaml:
+	wget "$(CHECK_YANL_FILE_OSS)" -O $(CHECK_YAML_FILE_PATH)
 
 ## Select scenario build linux version by docker image
 build_linux_with_arg:
