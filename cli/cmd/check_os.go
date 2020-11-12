@@ -116,6 +116,7 @@ func (doc *CheckOsCommand) deteckOsAll() error {
 	return nil
 }
 func (doc *CheckOsCommand) outPutTheResult(output [][]string) {
+	fmt.Printf("------------summary----------")
 	table := tablewriter.NewWriter(os.Stdout)
 	table.SetHeader([]string{"experiment", "command", "result", "info"})
 	table.SetRowLine(true)
@@ -183,8 +184,8 @@ func (doc *CheckOsCommand) execOperatorCmd(checkExecCmd *CheckExecCmd) {
 			continue
 		}
 
-		fmt.Printf("[success] %s, success! `%s` command exist \n", cmdArr[1], operatorCmd)
-		execResult.info = fmt.Sprintf("`%s` command exist", operatorCmd)
+		fmt.Printf("[success] %s, success! `%s` command exists \n", cmdArr[1], operatorCmd)
+		execResult.info = fmt.Sprintf("`%s` command exists", operatorCmd)
 		execResult.result = "success"
 	}
 }
@@ -383,9 +384,9 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 				}
 			}
 			if failedCmd != "" {
-				fmt.Printf("[failed] %s, failed! `%s` command not found \n", checkStr, failedCmd)
+				fmt.Printf("[failed] %s, failed! `%s` command not install \n", checkStr, failedCmd)
 			} else {
-				fmt.Printf("[success] %s, success! `%s` command exist \n", checkStr, successCmd)
+				fmt.Printf("[success] %s, success! `%s` command exists \n", checkStr, successCmd)
 			}
 		default:
 			cmdStr = fmt.Sprintf("%s %s %s %s", programs[0], expModel.Target, expModel.ActionName, cmdStr)

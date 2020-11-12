@@ -172,7 +172,7 @@ func (djc *DeteckJavaCommand) deteckTools() error {
 	if util.IsExist(javaToolsPrePath + javaToolsSubPath) {
 		return nil
 	}
-	return errors.New("check java tools.jar failed, file: $JAVA_HOME/lib/tools.jar not exist")
+	return errors.New("check java tools.jar failed, file: $JAVA_HOME/lib/tools.jar not exists")
 }
 
 // check jdk version. if current jdk version less than 1.6, return false, else return true
