@@ -66,7 +66,7 @@ func CmdInit() *baseCommand {
 	deteckCommand := &DeteckCommand{}
 	baseCmd.AddCommand(deteckCommand)
 	deteckCommand.AddCommand(&DeteckJavaCommand{})
-	deteckCommand.AddCommand(&DeteckOsCommand{})
+	deteckCommand.AddCommand(&CheckOsCommand{})
 
 	return baseCmd
 }

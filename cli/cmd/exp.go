@@ -219,7 +219,7 @@ func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 // registerExpCommand
 func (ec *baseExpCommandService) registerExpCommand(commandSpec spec.ExpModelCommandSpec, parentTargetCmd string) *modelCommand {
 	cmdName := commandSpec.Name()
-	if commandSpec.Scope() != "" && commandSpec.Scope() != "host" && commandSpec.Scope() != "docker" {
+	if commandSpec.Scope() != "" && commandSpec.Scope() != "host" && commandSpec.Scope() != "docker" && commandSpec.Scope() != OperatorCommand {
 		cmdName = fmt.Sprintf("%s-%s", commandSpec.Scope(), commandSpec.Name())
 	}
 	cmd := &cobra.Command{

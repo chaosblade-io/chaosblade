@@ -20,38 +20,55 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	"github.com/olekukonko/tablewriter"
 	"github.com/spf13/cobra"
 )
 
 var allCmd []string
-var AllCmd map[string][]string
 var BladeBinPath string
+var AllCheckExecCmds []CheckExecCmd
 
 const (
 	BladeBin        = "blade"
 	OperatorCommand = "operator"
 )
 
-type DeteckOsCommand struct {
+type CheckOsCommand struct {
 	command *cobra.Command
 	*baseExpCommandService
 	sw *sync.WaitGroup
 }
+type ExecResult struct {
+	cmd    string
+	result string
+	info   string
+}
 
-func (doc *DeteckOsCommand) CobraCmd() *cobra.Command {
+type CheckExecCmd struct {
+	ExpName    string
+	ActionName string
+	Scope      string
+	ExecResult []*ExecResult
+}
+
+func (doc *CheckOsCommand) CobraCmd() *cobra.Command {
 	return doc.command
 }
 
-func (doc *DeteckOsCommand) Name() string {
+func (doc *CheckOsCommand) Name() string {
 	return ""
 }
 
-func (doc *DeteckOsCommand) Init() {
+func (doc *CheckOsCommand) Init() {
 	doc.command = &cobra.Command{
 		Use:   "os",
 		Short: "Check the environment of os for chaosblade",
@@ -61,19 +78,16 @@ func (doc *DeteckOsCommand) Init() {
 		},
 		Example: doc.detectExample(),
 	}
-	//BladeBinPath = path.Join(util.GetProgramPath(), BladeBin)
-	// todo : delete
-	BladeBinPath = "/Users/caimingxia/chaosblade-0.7.0/blade"
-	AllCmd = make(map[string][]string, 0)
+	BladeBinPath = path.Join(util.GetProgramPath(), BladeBin)
 	doc.baseExpCommandService = newBaseExpDeteckCommandService(doc)
 }
 
-func (doc *DeteckOsCommand) detectExample() string {
+func (doc *CheckOsCommand) detectExample() string {
 	return "check os"
 }
 
 // check all os action
-func (doc *DeteckOsCommand) deteckOsAll() error {
+func (doc *CheckOsCommand) deteckOsAll() error {
 	// 1. build all cmd
 	err := doc.buildAllOsCmd()
 	if err != nil {
@@ -81,109 +95,163 @@ func (doc *DeteckOsCommand) deteckOsAll() error {
 	}
 
 	// 2. one by one exec cmd
-	for program, cmds := range AllCmd {
-		switch program {
+	for _, allCheckExecCmd := range AllCheckExecCmds {
+		switch allCheckExecCmd.Scope {
 		case OperatorCommand:
-			doc.execOperatorCmd(cmds)
+			doc.execOperatorCmd(&allCheckExecCmd)
 		default:
-			doc.execBladeCmd(cmds)
+			doc.execBladeCmd(&allCheckExecCmd)
 		}
 	}
+
+	// 3. output the result
+	var output [][]string
+	for _, checkExecCmd := range AllCheckExecCmds {
+		for _, execResult := range checkExecCmd.ExecResult {
+			oneOutput := []string{checkExecCmd.ExpName, checkExecCmd.ActionName, execResult.result, execResult.info}
+			output = append(output, oneOutput)
+		}
+	}
+	doc.outPutTheResult(output)
 	return nil
 }
+func (doc *CheckOsCommand) outPutTheResult(output [][]string) {
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"experiment", "command", "result", "info"})
+	table.SetRowLine(true)
+	table.AppendBulk(output)
+	table.SetAutoMergeCellsByColumnIndex([]int{0})
+	table.Render()
+}
 
-func (doc *DeteckOsCommand) execBladeCmd(allCmd []string) {
+func (doc *CheckOsCommand) execBladeCmd(checkExecCmd *CheckExecCmd) {
 	ch := channel.NewLocalChannel()
-	for _, cmd := range allCmd {
+	for _, execResult := range checkExecCmd.ExecResult {
 		//2.1 create os cmd
-		response := ch.Run(context.Background(), BladeBinPath, cmd)
+		response := ch.Run(context.Background(), BladeBinPath, execResult.cmd)
+		var res spec.Response
 		if !response.Success {
-			fmt.Printf("[failed] %s, failed! create err: %s", cmd, response.Err)
+			execResult.result = "failed"
+			execResult.info = fmt.Sprintf("%s, exec failed! create err: %s", execResult.cmd, response.Err)
+			fmt.Printf("[failed] %s, exec failed! create err: %s", execResult.cmd, response.Err)
 			continue
 		}
-		var res spec.Response
 		err := json.Unmarshal([]byte(response.Result.(string)), &res)
 		if err != nil {
-			fmt.Printf("[failed] %s, failed! create err: %s", cmd, response.Result)
+			execResult.result = "failed"
+			execResult.info = fmt.Sprintf("%s, exec failed! create err: %s", execResult.cmd, response.Result)
+			fmt.Printf("[failed] %s, exec failed! create err: %s", execResult.cmd, response.Result)
 			continue
 		}
 
 		// 2.2 destroy os cmd
 		response = ch.Run(context.Background(), BladeBinPath, fmt.Sprintf("destroy %s", res.Result.(string)))
 		if !response.Success {
-			fmt.Printf("[failed] %s, failed! destroy err: %s \n", err.Error())
+			execResult.result = "failed"
+			execResult.info = fmt.Sprintf("%s, exec failed! destroy err: %s", response.Err)
+			fmt.Printf("[failed] %s, exec failed! destroy err: %s \n", response.Err)
 			continue
 		}
-		err = json.Unmarshal([]byte(response.Result.(string)), &res)
-		if err != nil || !res.Success {
-			fmt.Printf("[failed] %s, failed! destroy err: %s", cmd, response.Result)
-			continue
-		}
-		fmt.Printf("[success] %s, success! \n", cmd)
+
+		execResult.result = "success"
+		execResult.info = fmt.Sprintf("%s, exec success!", execResult.cmd)
+		fmt.Printf("[success] %s, success! \n", execResult.cmd)
 	}
 }
 
-func (doc *DeteckOsCommand) execOperatorCmd(allCmd []string) {
+func (doc *CheckOsCommand) execOperatorCmd(checkExecCmd *CheckExecCmd) {
 	ch := channel.NewLocalChannel()
-	if len(allCmd) == 0 {
+	if len(checkExecCmd.ExecResult) == 0 {
 		return
 	}
 
-	for _, cmd := range allCmd {
-		response := ch.Run(context.Background(), "", cmd)
+	for _, execResult := range checkExecCmd.ExecResult {
+		cmdArr := strings.Split(execResult.cmd, "|")
+		operatorCmd := cmdArr[0][len("man "):]
+
+		if len(cmdArr) != 2 {
+			fmt.Printf("[failed] %s, failed! error: yaml faile is wrong \n", execResult.cmd)
+			execResult.info = fmt.Sprintf("yaml faile is wrong")
+			execResult.result = "failed"
+			continue
+		}
+		response := ch.Run(context.Background(), "", cmdArr[0])
 		if !response.Success {
-			fmt.Printf("[failed] %s, failed! command not found \n", cmd[len("man "):])
+			fmt.Printf("[failed] %s, failed! error: `%s` command not install \n", cmdArr[1], operatorCmd)
+			execResult.info = fmt.Sprintf("`%s` command not install", operatorCmd)
+			execResult.result = "failed"
 			continue
 		}
 
-		fmt.Printf("[success] %s, success! \n", cmd[len("man "):])
+		fmt.Printf("[success] %s, success! `%s` command exist \n", cmdArr[1], operatorCmd)
+		execResult.info = fmt.Sprintf("`%s` command exist", operatorCmd)
+		execResult.result = "success"
 	}
 }
 
 // build all os cmd
-
-func (doc *DeteckOsCommand) buildAllOsCmd() error {
+func (doc *CheckOsCommand) buildAllOsCmd() error {
 	models := AllDeteckModels.Models
 	for _, model := range models {
 		expName := model.ExpName
+		scope := model.ExpScope
 		for _, action := range model.Actions() {
-			programs := action.Programs()
 			actionName := action.Name()
-			if len(programs) != 1 {
-				return errors.New("build all commadn by yaml file failed! action programs wrong, model: " + model.ExpName +
-					" action: " + actionName)
-			}
-
-			cmd := ""
-			switch programs[0] {
-			case OperatorCommand:
-				cmd = fmt.Sprintf("%s %s", expName, actionName)
-			default:
-				cmd = fmt.Sprintf("%s %s %s", programs[0], expName, actionName)
-			}
 
 			// merge matchers and flags
 			flags := doc.mergeMatchesAndFlags(action.Matchers(), action.Flags())
 
-			// build cmd by flags and matchers
-			cmdArr, err := doc.buildCmdByMatchersAndFlags(flags, expName, actionName, cmd)
-			if err != nil {
-				return err
+			var execResult []*ExecResult
+			var err error
+			switch scope {
+			case OperatorCommand:
+				execResult = doc.buildOperatorCmd(action.Programs(), expName, actionName)
+			default:
+				execResult, err = doc.buildBladeCmd(action.Programs(), flags, expName, actionName)
+				if err != nil {
+					return err
+				}
 			}
-			onePrograms, ok := AllCmd[programs[0]]
-			if ok {
-				AllCmd[programs[0]] = append(onePrograms, cmdArr...)
-			} else {
-				AllCmd[programs[0]] = cmdArr
 
-			}
+			AllCheckExecCmds = append(AllCheckExecCmds, CheckExecCmd{
+				ExpName:    expName,
+				ActionName: actionName,
+				Scope:      scope,
+				ExecResult: execResult,
+			})
 		}
 	}
 	return nil
 }
 
+func (doc *CheckOsCommand) buildOperatorCmd(programs []string, expName, actionName string) []*ExecResult {
+	var execResult []*ExecResult
+	for _, program := range programs {
+		execResult = append(execResult, &ExecResult{
+			cmd: fmt.Sprintf("%s|%s %s", program, expName, actionName),
+		})
+	}
+	return execResult
+}
+
+func (doc *CheckOsCommand) buildBladeCmd(programs []string, flags []spec.ExpFlagSpec, expName, actionName string) ([]*ExecResult, error) {
+	var execResults []*ExecResult
+	for _, program := range programs {
+		bladeCmd := fmt.Sprintf("%s %s %s", program, expName, actionName)
+
+		// build cmd by flags and matchers
+		execResult, err := doc.buildCmdByMatchersAndFlags(flags, expName, actionName, bladeCmd)
+		if err != nil {
+			return nil, err
+		}
+
+		execResults = append(execResults, execResult...)
+	}
+	return execResults, nil
+}
+
 // merge matchers and flags
-func (doc *DeteckOsCommand) mergeMatchesAndFlags(matches, flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
+func (doc *CheckOsCommand) mergeMatchesAndFlags(matches, flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
 
 	mergeResult := make([]spec.ExpFlagSpec, 0)
 	for _, flag := range flags {
@@ -195,11 +263,13 @@ func (doc *DeteckOsCommand) mergeMatchesAndFlags(matches, flags []spec.ExpFlagSp
 	return mergeResult
 }
 
-func (doc *DeteckOsCommand) buildCmdByMatchersAndFlags(flags []spec.ExpFlagSpec, expName, actionName, cmd string) ([]string, error) {
-	var cmdArr []string
+func (doc *CheckOsCommand) buildCmdByMatchersAndFlags(flags []spec.ExpFlagSpec, expName, actionName, cmd string) ([]*ExecResult, error) {
+	var execResult []*ExecResult
 	if len(flags) == 0 {
-		cmdArr = append(cmdArr, cmd)
-		return cmdArr, nil
+		execResult = append(execResult, &ExecResult{
+			cmd: cmd,
+		})
+		return execResult, nil
 	}
 	// build base cmd by required flag
 	for _, flag := range flags {
@@ -213,7 +283,7 @@ func (doc *DeteckOsCommand) buildCmdByMatchersAndFlags(flags []spec.ExpFlagSpec,
 		}
 
 		cmd += fmt.Sprintf(" --%s %s", flag.FlagName(), flag.FlagDefault())
-		cmdArr = append(cmdArr, cmd)
+		execResult = append(execResult, &ExecResult{cmd: cmd})
 	}
 
 	// add other flag
@@ -228,15 +298,15 @@ func (doc *DeteckOsCommand) buildCmdByMatchersAndFlags(flags []spec.ExpFlagSpec,
 		}
 
 		cmd += fmt.Sprintf(" --%s %s", flag.FlagName(), flag.FlagDefault())
-		cmdArr = append(cmdArr, cmd)
+		execResult = append(execResult, &ExecResult{cmd: cmd})
 		cmd = baseCmd
 	}
 
-	return cmdArr, nil
+	return execResult, nil
 }
 
 // bind flags
-func (doc *DeteckOsCommand) bindFlagsFunction() func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
+func (doc *CheckOsCommand) bindFlagsFunction() func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
 	return func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
 		//set action flags
 		for _, flag := range specFlags {
@@ -261,31 +331,26 @@ func (doc *DeteckOsCommand) bindFlagsFunction() func(commandFlags map[string]fun
 }
 
 // RunE
-func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *actionCommand, actionCommandSpec spec.ExpActionCommandSpec) func(cmd *cobra.Command, args []string) error {
+func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *actionCommand, actionCommandSpec spec.ExpActionCommandSpec) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		// 1. build expModel
 		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
 
 		// 2. build cmd
 		programs := actionCommandSpec.Programs()
-		if len(programs) != 1 {
-			fmt.Print("[failed] check failed! err: action program is wrong! \n")
-			return nil
-		}
-
-		cmdStr := ""
 		// 2.1 merge matchers and flags
+		cmdStr := ""
 		flags := doc.mergeMatchesAndFlags(actionCommandSpec.Matchers(), actionCommandSpec.Flags())
+
 		// 2.2 build cmd by flags
 		for _, flag := range flags {
+			// runEFun donot use default
 			value, ok := expModel.ActionFlags[flag.FlagName()]
-			if !ok || value == "" {
-				value = flag.FlagDefault()
-			}
-
-			if flag.FlagRequired() && value == "" {
-				fmt.Print("[failed] check failed! err: less required parameter! \n")
-				return nil
+			if flag.FlagRequired() {
+				if !ok || value == "" {
+					fmt.Print("[failed] check failed! err: less required parameter! \n")
+					return nil
+				}
 			}
 
 			if value == "" {
@@ -296,30 +361,43 @@ func (doc *DeteckOsCommand) actionRunEFunc(target, scope string, actionCommand *
 
 		// 3. exec cmd
 		var response *spec.Response
-		switch programs[0] {
+		switch scope {
 		case OperatorCommand:
-			cmdStr = fmt.Sprintf("%s %s %s", expModel.Target, expModel.ActionName, cmdStr)
-			response = channel.NewLocalChannel().Run(context.Background(), "", cmdStr)
-			if response.Success {
-				fmt.Print("[success] check success! \n")
+			failedCmd := ""
+			successCmd := ""
+			checkStr := fmt.Sprintf("%s %s", target, expModel.ActionName)
+			for _, program := range programs {
+				response = channel.NewLocalChannel().Run(context.Background(), "", program)
+				if response.Success {
+					if successCmd == "" {
+						successCmd = program[len("man "):]
+					} else {
+						successCmd += "|" + program[len("man "):]
+					}
+				} else {
+					if failedCmd == "" {
+						failedCmd = program[len("man "):]
+					} else {
+						failedCmd += "|" + program[len("man "):]
+					}
+				}
+			}
+			if failedCmd != "" {
+				fmt.Printf("[failed] %s, failed! `%s` command not found \n", checkStr, failedCmd)
 			} else {
-				fmt.Printf("[failed] check failed! %s, command not found \n", cmdStr[len("man "):])
+				fmt.Printf("[success] %s, success! `%s` command exist \n", checkStr, successCmd)
 			}
 		default:
 			cmdStr = fmt.Sprintf("%s %s %s %s", programs[0], expModel.Target, expModel.ActionName, cmdStr)
-			response = channel.NewLocalChannel().Run(context.Background(), BladeBinPath, cmdStr)
-			if response.Success {
-				fmt.Print("[success] check success! \n")
-			} else {
-				fmt.Printf("[failed] check failed! err: %s \n", response.Err)
-			}
-		}
+			checkExecCmd := CheckExecCmd{ExpName: target, ActionName: actionCommandSpec.Name(), Scope: scope, ExecResult: []*ExecResult{&ExecResult{cmd: cmdStr}}}
 
+			doc.execBladeCmd(&checkExecCmd)
+		}
 		return nil
 	}
 }
 
-func (doc *DeteckOsCommand) actionPostRunEFunc(actionCommand *actionCommand) func(cmd *cobra.Command, args []string) error {
+func (doc *CheckOsCommand) actionPostRunEFunc(actionCommand *actionCommand) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		return nil
 	}

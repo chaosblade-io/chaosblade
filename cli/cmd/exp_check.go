@@ -16,8 +16,13 @@
 package cmd
 
 import (
+	"fmt"
+	"path"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	specutil "github.com/chaosblade-io/chaosblade-spec-go/util"
+
+	"github.com/chaosblade-io/chaosblade/version"
 )
 
 var AllDeteckModels *spec.Models
@@ -43,8 +48,7 @@ func (ec *baseExpCommandService) registerSubCommandsForDeteck() {
 
 func (ec *baseExpCommandService) registerCheckExpCommands() []*modelCommand {
 	var err error
-	//file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-check-spec-%s.yaml", version.Ver))
-	file := "/Users/caimingxia/go/chaosblade-open/target/chaosblade-0.8.0/yaml/chaosblade-check-spec-0.8.0.yaml"
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-check-spec-%s.yaml", version.Ver))
 	AllDeteckModels, err = specutil.ParseSpecsToModel(file, nil)
 	if err != nil {
 		return nil

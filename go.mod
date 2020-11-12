@@ -8,6 +8,7 @@ require (
 	github.com/chaosblade-io/chaosblade-operator v0.8.0
 	github.com/chaosblade-io/chaosblade-spec-go v0.8.0
 	github.com/mattn/go-sqlite3 v1.10.1-0.20190217174029-ad30583d8387
+	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
 	github.com/prometheus/common v0.9.1
 	github.com/shirou/gopsutil v2.20.5+incompatible
 	github.com/sirupsen/logrus v1.5.0

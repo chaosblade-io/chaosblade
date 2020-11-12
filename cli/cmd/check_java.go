@@ -92,12 +92,11 @@ func (djc *DeteckJavaCommand) deteckJavaRunE() error {
 			err := djc.deteckTools()
 			if err != nil {
 				fmt.Printf("[failed] %s \n", err.Error())
-				return err
 			} else {
 				fmt.Printf("[success] check tools.jar success! \n")
 			}
 		default:
-			return spec.ReturnFail(spec.Code[spec.IllegalParameters], fmt.Sprintf("object parameter is wrong, object : %s", object))
+			fmt.Printf("[failed] object parameter is wrong, object : %s", object)
 		}
 
 	}
@@ -164,7 +163,7 @@ func (djc *DeteckJavaCommand) deteckTools() error {
 	} else {
 		response := channel.NewLocalChannel().Run(context.Background(), "", cmdJavaHome)
 		if !response.Success {
-			return errors.New("check java tools.jar failed, JAVAHOME is nil")
+			return errors.New("check java tools.jar failed, $JAVA_HOME is nil")
 		}
 		javaToolsPrePath = response.Result.(string)
 	}
@@ -173,7 +172,7 @@ func (djc *DeteckJavaCommand) deteckTools() error {
 	if util.IsExist(javaToolsPrePath + javaToolsSubPath) {
 		return nil
 	}
-	return errors.New("check java tools.jar failed, tools.jar not exist")
+	return errors.New("check java tools.jar failed, file: $JAVA_HOME/lib/tools.jar not exist")
 }
 
 // check jdk version. if current jdk version less than 1.6, return false, else return true
@@ -182,7 +181,7 @@ func (djc *DeteckJavaCommand) deteckJdkVersion(currentVersion string) (bool, err
 	currentVersions := strings.Split(currentVersion, ".")
 	minVersions := strings.Split(minJdkVersion, ".")
 	if len(currentVersions) < 2 {
-		return false, errors.New("jdk version error, jdk version: " + currentVersion)
+		return false, errors.New("jdk version error, current jdk version: " + currentVersion)
 	}
 
 	// 2. check current jdk
@@ -194,7 +193,7 @@ func (djc *DeteckJavaCommand) deteckJdkVersion(currentVersion string) (bool, err
 		return ok, nil
 	}
 
-	return false, errors.New("jdk version less than 1.6")
+	return false, errors.New("jdk version less than 1.6, current jdk version: " + currentVersion)
 }
 
 // get jdk version from $JAVA_HOME eg: /Library/Java/JavaVirtualMachines/jdk1.8.0_151.jdk/Contents/Home
@@ -220,10 +219,6 @@ func (djc *DeteckJavaCommand) getJdkVersionFromJdkHome() (string, error) {
 			continue
 		}
 
-		//subIndex := strings.Index(javaHomeOne, ".jdk")
-		//if subIndex == -1 {
-		//	continue
-		//}
 		javaVersion := javaHomeOne[len("jdk"):]
 		if javaVersion != "" {
 			return javaVersion, nil
