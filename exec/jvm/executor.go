@@ -64,13 +64,6 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	override := model.ActionFlags["override"] == "true"
 	suid, isDestroy := spec.IsDestroy(ctx)
 	record, err := e.getRecordFromDB(processName, processId)
-	if record == nil || err != nil {
-		logrus.Warn(fmt.Sprintf("select record fail, uid: %s, err: %v", uid, err))
-		if processName == "" && processId == "" {
-			return spec.ReturnFail(spec.Code[spec.IllegalParameters],
-				fmt.Sprintf("less --process or --pid flags or can't found record, uid: %s", uid))
-		}
-	}
 
 	var port string
 	if record != nil {
@@ -79,6 +72,16 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 
 	if isDestroy {
 		if port == "" {
+			if suid == spec.UnknownUid {
+				if processName == "" && processId == "" {
+					return spec.ReturnFail(spec.Code[spec.IllegalParameters],
+						fmt.Sprintf(" can't found record, you need to add flag --process or --pid flags, uid: %s", uid))
+				}
+			}
+
+			if processName == "" && processId == "" {
+				return spec.ReturnSuccess(fmt.Sprintf("no prepare record, uid: %s", suid))
+			}
 			processId, response := CheckFlagValues(processName, processId)
 			if !response.Success {
 				return response
@@ -95,6 +98,13 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 			}
 		}
 	} else {
+		if port == "" || err != nil {
+			logrus.Warn(fmt.Sprintf("select record fail, uid: %s, err: %v", uid, err))
+			if processName == "" && processId == "" {
+				return spec.ReturnFail(spec.Code[spec.IllegalParameters],
+					fmt.Sprintf(" can't found record, you need to add flag --process or --pid flags, uid: %s", uid))
+			}
+		}
 		if override {
 			// Uninstall java agent
 			logrus.Info("Uninstall java agent")
@@ -367,7 +377,7 @@ func Prepare(processName, processId string) (response *spec.Response, port strin
 	}
 	if record.Pid != processId {
 		// update pid
-		db.UpdatePreparationPortByUid(record.Uid, processId)
+		db.UpdatePreparationPidByUid(record.Uid, processId)
 	}
 	handlePrepareResponse(record.Uid, response)
 	return response, port
