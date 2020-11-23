@@ -74,12 +74,12 @@ func (doc *CheckOsCommand) Init() {
 		Short: "Check the environment of os for chaosblade",
 		Long:  "Check the environment of os for chaosblade",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return doc.deteckOsAll()
+			return doc.checkOsAll()
 		},
 		Example: doc.detectExample(),
 	}
 	BladeBinPath = path.Join(util.GetProgramPath(), BladeBin)
-	doc.baseExpCommandService = newBaseExpDeteckCommandService(doc)
+	doc.baseExpCommandService = newBaseExpCheckCommandService(doc)
 }
 
 func (doc *CheckOsCommand) detectExample() string {
@@ -87,7 +87,7 @@ func (doc *CheckOsCommand) detectExample() string {
 }
 
 // check all os action
-func (doc *CheckOsCommand) deteckOsAll() error {
+func (doc *CheckOsCommand) checkOsAll() error {
 	// 1. build all cmd
 	err := doc.buildAllOsCmd()
 	if err != nil {
@@ -192,7 +192,7 @@ func (doc *CheckOsCommand) execOperatorCmd(checkExecCmd *CheckExecCmd) {
 
 // build all os cmd
 func (doc *CheckOsCommand) buildAllOsCmd() error {
-	models := AllDeteckModels.Models
+	models := AllCheckModels.Models
 	for _, model := range models {
 		expName := model.ExpName
 		scope := model.ExpScope

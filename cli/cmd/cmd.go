@@ -63,10 +63,10 @@ func CmdInit() *baseCommand {
 	serverCommand.AddCommand(&StatusServerCommand{})
 
 	// add check command
-	deteckCommand := &DeteckCommand{}
-	baseCmd.AddCommand(deteckCommand)
-	deteckCommand.AddCommand(&DeteckJavaCommand{})
-	deteckCommand.AddCommand(&CheckOsCommand{})
+	checkCommand := &CheckCommand{}
+	baseCmd.AddCommand(checkCommand)
+	checkCommand.AddCommand(&CheckJavaCommand{})
+	checkCommand.AddCommand(&CheckOsCommand{})
 
 	return baseCmd
 }

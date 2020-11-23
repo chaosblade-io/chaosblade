@@ -23,12 +23,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
-type DeteckCommand struct {
+type CheckCommand struct {
 	baseCommand
 	*baseExpCommandService
 }
 
-func (dc *DeteckCommand) Init() {
+func (dc *CheckCommand) Init() {
 	dc.command = &cobra.Command{
 		Use:     "check",
 		Aliases: []string{"k"},
@@ -42,6 +42,6 @@ func (dc *DeteckCommand) Init() {
 	}
 }
 
-func (dc *DeteckCommand) detectExample() string {
+func (dc *CheckCommand) detectExample() string {
 	return "check os"
 }
