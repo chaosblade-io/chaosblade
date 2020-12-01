@@ -168,7 +168,7 @@ func (doc *CheckOsCommand) execOperatorCmd(checkExecCmd *CheckExecCmd) {
 
 	for _, execResult := range checkExecCmd.ExecResult {
 		cmdArr := strings.Split(execResult.cmd, "|")
-		operatorCmd := cmdArr[0][len("man "):]
+		operatorCmd := strings.TrimSpace(cmdArr[0])
 
 		if len(cmdArr) != 2 {
 			fmt.Printf("[failed] %s, failed! error: yaml faile is wrong \n", execResult.cmd)
@@ -176,8 +176,7 @@ func (doc *CheckOsCommand) execOperatorCmd(checkExecCmd *CheckExecCmd) {
 			execResult.result = "failed"
 			continue
 		}
-		response := ch.Run(context.Background(), "", cmdArr[0])
-		if !response.Success {
+		if !ch.IsCommandAvailable(operatorCmd) {
 			fmt.Printf("[failed] %s, failed! error: `%s` command not install \n", cmdArr[1], operatorCmd)
 			execResult.info = fmt.Sprintf("`%s` command not install", operatorCmd)
 			execResult.result = "failed"
@@ -361,25 +360,23 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 		}
 
 		// 3. exec cmd
-		var response *spec.Response
 		switch scope {
 		case OperatorCommand:
 			failedCmd := ""
 			successCmd := ""
 			checkStr := fmt.Sprintf("%s %s", target, expModel.ActionName)
 			for _, program := range programs {
-				response = channel.NewLocalChannel().Run(context.Background(), "", program)
-				if response.Success {
+				if channel.NewLocalChannel().IsCommandAvailable(program) {
 					if successCmd == "" {
-						successCmd = program[len("man "):]
+						successCmd = program
 					} else {
-						successCmd += "|" + program[len("man "):]
+						successCmd += "|" + program
 					}
 				} else {
 					if failedCmd == "" {
-						failedCmd = program[len("man "):]
+						failedCmd = program
 					} else {
-						failedCmd += "|" + program[len("man "):]
+						failedCmd += "|" + program
 					}
 				}
 			}
