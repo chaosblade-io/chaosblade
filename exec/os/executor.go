@@ -23,16 +23,17 @@ import (
 	"github.com/chaosblade-io/chaosblade-exec-os/exec/model"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 type Executor struct {
-	executors map[string]spec.Executor
+	executors   map[string]spec.Executor
 	sshExecutor spec.Executor
 }
 
 func NewExecutor() spec.Executor {
 	return &Executor{
-		executors: model.GetAllOsExecutors(),
+		executors:   model.GetAllOsExecutors(),
 		sshExecutor: model.GetSHHExecutor(),
 	}
 }
@@ -49,7 +50,9 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	key := model.Target + model.ActionName
 	executor := e.executors[key]
 	if executor == nil {
-		return spec.ReturnFail(spec.Code[spec.HandlerNotFound], fmt.Sprintf("the os executor not found, %s", key))
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.OsExecutorNotFound].ErrInfo, key))
+		return spec.ResponseFailWaitResult(spec.OsExecutorNotFound, fmt.Sprintf(spec.ResponseErr[spec.OsExecutorNotFound].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.OsExecutorNotFound].ErrInfo, key))
 	}
 	executor.SetChannel(channel.NewLocalChannel())
 	return executor.Exec(uid, ctx, model)

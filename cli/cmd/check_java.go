@@ -71,7 +71,7 @@ func (djc *CheckJavaCommand) detectExample() string {
 
 func (djc *CheckJavaCommand) checkJavaRunE() error {
 	objects := strings.Split(djc.object, ",")
-	if len(objects) == 0 {
+	if len(objects) == 0 || djc.object == "" {
 		return spec.ReturnFail(spec.Code[spec.IllegalParameters], "less object parameter")
 	}
 

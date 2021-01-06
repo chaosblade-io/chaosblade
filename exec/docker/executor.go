@@ -23,6 +23,7 @@ import (
 	"github.com/chaosblade-io/chaosblade-exec-docker/exec"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 type Executor struct {
@@ -43,7 +44,9 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	key := exec.GetExecutorKey(model.Target, model.ActionName)
 	executor := e.executors[key]
 	if executor == nil {
-		return spec.ReturnFail(spec.Code[spec.HandlerNotFound], fmt.Sprintf("the docker executor not found, %s", key))
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DockerExecNotFound].ErrInfo, key))
+		return spec.ResponseFailWaitResult(spec.DockerExecNotFound, fmt.Sprintf(spec.ResponseErr[spec.DockerExecNotFound].Err, key),
+			fmt.Sprintf(spec.ResponseErr[spec.DockerExecNotFound].ErrInfo, key))
 	}
 	executor.SetChannel(channel.NewLocalChannel())
 	return executor.Exec(uid, ctx, model)

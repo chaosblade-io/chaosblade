@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -56,16 +57,18 @@ func (pc *PrepareCPlusCommand) prepareCPlus() error {
 	portStr := strconv.Itoa(pc.port)
 	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareCPlusType, portStr, "")
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.DatabaseError],
-			fmt.Sprintf("query cplus agent server port record err, %s", err.Error()))
+		util.Errorf("", util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "query running by type and process", err.Error()))
+		return spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, ""),
+			fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "query running by type and process", err.Error()))
 	}
 	if record == nil || record.Status != Running {
 		record, err = insertPrepareRecord(PrepareCPlusType, portStr, portStr, "")
 		if err != nil {
-			return spec.ReturnFail(spec.Code[spec.DatabaseError],
-				fmt.Sprintf("insert prepare record err, %s", err.Error()))
+			util.Errorf("", util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, ""))
+			return spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].Err, ""),
+				fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "insert prepare recode", err.Error()))
 		}
 	}
-	response := cplus.Prepare(portStr, pc.ip)
+	response := cplus.Prepare(record.Uid, portStr, pc.ip)
 	return handlePrepareResponse(record.Uid, pc.command, response)
 }

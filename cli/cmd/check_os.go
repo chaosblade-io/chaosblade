@@ -100,7 +100,7 @@ func (doc *CheckOsCommand) checkOsAll() error {
 		case OperatorCommand:
 			doc.execOperatorCmd(&allCheckExecCmd)
 		default:
-			doc.execBladeCmd(&allCheckExecCmd)
+			doc.execBladeCmd(&allCheckExecCmd, true)
 		}
 	}
 
@@ -125,39 +125,53 @@ func (doc *CheckOsCommand) outPutTheResult(output [][]string) {
 	table.Render()
 }
 
-func (doc *CheckOsCommand) execBladeCmd(checkExecCmd *CheckExecCmd) {
+func (doc *CheckOsCommand) execBladeCmd(checkExecCmd *CheckExecCmd, osAll bool) *spec.Response {
 	ch := channel.NewLocalChannel()
+	var response *spec.Response
 	for _, execResult := range checkExecCmd.ExecResult {
-		//2.1 create os cmd
-		response := ch.Run(context.Background(), BladeBinPath, execResult.cmd)
+		//1.1 create os cmd
+		response = ch.Run(context.Background(), BladeBinPath, execResult.cmd)
 		var res spec.Response
 		if !response.Success {
 			execResult.result = "failed"
 			execResult.info = fmt.Sprintf("%s, exec failed! create err: %s", execResult.cmd, response.Err)
-			fmt.Printf("[failed] %s, exec failed! create err: %s", execResult.cmd, response.Err)
+			response.Err = fmt.Sprintf("[failed] %s, exec failed! create err: %s", execResult.cmd, response.Err)
+			if osAll {
+				fmt.Printf("[failed] %s, exec failed! create err: %s \n", execResult.cmd, response.Err)
+			}
 			continue
 		}
 		err := json.Unmarshal([]byte(response.Result.(string)), &res)
 		if err != nil {
 			execResult.result = "failed"
 			execResult.info = fmt.Sprintf("%s, exec failed! create err: %s", execResult.cmd, response.Result)
-			fmt.Printf("[failed] %s, exec failed! create err: %s", execResult.cmd, response.Result)
+			response.Err = fmt.Sprintf("[failed] %s, exec failed! create err: %s", execResult.cmd, response.Result)
+			if osAll {
+				fmt.Printf("[failed] %s, exec failed! create err: %s \n", execResult.cmd, response.Result)
+			}
 			continue
 		}
 
-		// 2.2 destroy os cmd
+		// 1.2 destroy os cmd
 		response = ch.Run(context.Background(), BladeBinPath, fmt.Sprintf("destroy %s", res.Result.(string)))
 		if !response.Success {
 			execResult.result = "failed"
 			execResult.info = fmt.Sprintf("%s, exec failed! destroy err: %s", response.Err)
-			fmt.Printf("[failed] %s, exec failed! destroy err: %s \n", response.Err)
+			response.Err = fmt.Sprintf("[failed] %s, exec failed! destroy err: %s", response.Err)
+			if osAll {
+				fmt.Printf("[failed] %s, exec failed! destroy err: %s \n", response.Err)
+			}
 			continue
 		}
 
 		execResult.result = "success"
 		execResult.info = fmt.Sprintf("%s, exec success!", execResult.cmd)
-		fmt.Printf("[success] %s, success! \n", execResult.cmd)
+		response.Result = fmt.Sprintf("[success] %s, success!", execResult.cmd)
+		if osAll {
+			fmt.Printf("[success] %s, success! \n", execResult.cmd)
+		}
 	}
+	return response
 }
 
 func (doc *CheckOsCommand) execOperatorCmd(checkExecCmd *CheckExecCmd) {
@@ -335,6 +349,7 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 	return func(cmd *cobra.Command, args []string) error {
 		// 1. build expModel
 		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
+		var response spec.Response
 
 		// 2. build cmd
 		programs := actionCommandSpec.Programs()
@@ -348,7 +363,10 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 			value, ok := expModel.ActionFlags[flag.FlagName()]
 			if flag.FlagRequired() {
 				if !ok || value == "" {
-					fmt.Print("[failed] check failed! err: less required parameter! \n")
+					response.Code = spec.ParameterLess
+					response.Success = false
+					response.Err = fmt.Sprintf("[failed] check failed! err: less required parameter!")
+					cmd.Println(response.Print())
 					return nil
 				}
 			}
@@ -381,17 +399,21 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 				}
 			}
 			if failedCmd != "" {
-				fmt.Printf("[failed] %s, failed! `%s` command not install \n", checkStr, failedCmd)
+				response.Code = spec.CommandLess
+				response.Success = false
+				response.Err = fmt.Sprintf("[failed] %s, failed! `%s` command not install", checkStr, failedCmd)
 			} else {
-				fmt.Printf("[success] %s, success! `%s` command exists \n", checkStr, successCmd)
+				response.Success = true
+				response.Result = fmt.Sprintf("[success] %s, success! `%s` command exists", checkStr, successCmd)
 			}
+
 		default:
 			cmdStr = fmt.Sprintf("%s %s %s %s", programs[0], expModel.Target, expModel.ActionName, cmdStr)
 			checkExecCmd := CheckExecCmd{ExpName: target, ActionName: actionCommandSpec.Name(), Scope: scope, ExecResult: []*ExecResult{&ExecResult{cmd: cmdStr}}}
 
-			doc.execBladeCmd(&checkExecCmd)
+			response = *doc.execBladeCmd(&checkExecCmd, false)
 		}
-		return nil
+		return &response
 	}
 }
 

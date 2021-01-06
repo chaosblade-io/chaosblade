@@ -66,9 +66,9 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 	var channel = channel.NewLocalChannel()
 	switch record.ProgramType {
 	case PrepareJvmType:
-		response = jvm.Detach(record.Port)
+		response = jvm.Detach(uid, record.Port)
 	case PrepareCPlusType:
-		response = cplus.Revoke(record.Port)
+		response = cplus.Revoke(uid, record.Port)
 	case PrepareK8sType:
 		args := fmt.Sprintf("delete ns chaosblade")
 		response = channel.Run(context.Background(), "kubectl", args)
