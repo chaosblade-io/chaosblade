@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=0.8.0
+export BLADE_VERSION=1.9.0
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -176,7 +176,6 @@ else
 ifdef ALERTMSG
 	$(error $(ALERTMSG))
 endif
-	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus pull origin $(BLADE_EXEC_CPLUS_BRANCH)
 endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus
 	cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus/$(BUILD_TARGET_FOR_JAVA_CPLUS)/$(BUILD_TARGET_DIR_NAME)/* $(BUILD_TARGET_PKG_DIR)

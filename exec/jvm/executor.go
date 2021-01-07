@@ -303,9 +303,9 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 		}
 		exists, err := cl.ProcessExists(processId)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessJudgeExistFailed].ErrInfo+" ,err: %s", processId, err.Error()))
+			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessJudgeExistFailed].ErrInfo, processId, err.Error()))
 			return "", spec.ResponseFailWaitResult(spec.ProcessJudgeExistFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessJudgeExistFailed].Err, uid),
-				fmt.Sprintf(spec.ResponseErr[spec.ProcessJudgeExistFailed].ErrInfo, processId))
+				fmt.Sprintf(spec.ResponseErr[spec.ProcessJudgeExistFailed].ErrInfo, processId, err.Error()))
 		}
 		if !exists {
 			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProName].ErrInfo, "pid", processId))
@@ -339,9 +339,9 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 			}
 		} else {
 			if processId == "" {
-				util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessExistTooMany].ErrInfo, processName))
-				return "", spec.ResponseFailWaitResult(spec.ProcessExistTooMany, fmt.Sprintf(spec.ResponseErr[spec.ProcessExistTooMany].Err, uid),
-					fmt.Sprintf(spec.ResponseErr[spec.ProcessExistTooMany].ErrInfo, processName))
+				util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].ErrInfo, processName, processId))
+				return "", spec.ResponseFailWaitResult(spec.ParameterInvalidProIdNotByName, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].Err, processName, processId),
+					fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].ErrInfo, processName, processId))
 			} else {
 				var contains bool
 				for _, p := range pids {
