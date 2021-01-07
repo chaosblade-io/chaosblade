@@ -6,7 +6,7 @@ Please try to use English to describe your issue, or at least provide a snippet 
 
 ## Issue Description
 
-Type: *bug report* or *feature request*
+Type: *bug report* , *feature request* or *question*
 
 ### Describe what happened (or what feature you want)
 

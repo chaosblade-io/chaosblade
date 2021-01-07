@@ -62,11 +62,6 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	processName := model.ActionFlags["process"]
 	processId := model.ActionFlags["pid"]
 	override := model.ActionFlags["override"] == "true"
-	if processName == "" && processId == "" {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
-		return spec.ResponseFailWaitResult(spec.ParameterLess, fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].Err, "process&pid"),
-			fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process|pid"))
-	}
 
 	// 2. get record from db by processname|processId
 	suid, isDestroy := spec.IsDestroy(ctx)
@@ -86,6 +81,17 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	// 3. exec command
 	if isDestroy {
 		if port == "" {
+			if suid == spec.UnknownUid {
+				if processName == "" && processId == "" {
+					util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
+					return spec.ResponseFailWaitResult(spec.ParameterLess, fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].Err, "process&pid"),
+						fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
+				}
+			}
+
+			if processName == "" && processId == "" {
+				return spec.ReturnSuccess(fmt.Sprintf("no prepare record, uid: %s", suid))
+			}
 			processId, response := CheckFlagValues(uid, processName, processId)
 			if !response.Success {
 				return response
@@ -103,6 +109,14 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 			}
 		}
 	} else {
+		if port == "" || err != nil {
+			logrus.Warn(fmt.Sprintf("select record fail, uid: %s, err: %v", uid, err))
+			if processName == "" && processId == "" {
+				util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
+				return spec.ResponseFailWaitResult(spec.ParameterLess, fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].Err, "process&pid"),
+					fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
+			}
+		}
 		if override {
 			// Uninstall java agent
 			logrus.Info("Uninstall java agent")
@@ -402,7 +416,7 @@ func Prepare(uid, processName, processId string) (response *spec.Response, port 
 	}
 	if record.Pid != processId {
 		// update pid
-		db.UpdatePreparationPortByUid(record.Uid, processId)
+		db.UpdatePreparationPidByUid(record.Uid, processId)
 	}
 	handlePrepareResponse(record.Uid, response)
 	return response, port
