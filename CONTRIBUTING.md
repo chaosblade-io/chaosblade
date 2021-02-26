@@ -43,7 +43,7 @@ Here is the workflow for contributors:
 6. Push your commits to your forked repository
 7. Create a pull request
 
-Please follow [the pull request template](./.github/PULL_REQUEST_TEMPLATE.md).
+Please follow [Creating a pull request](https://docs.github.com/en/github/collaborating-with-issues-and-pull-requests/creating-a-pull-request).
 Please make sure the PR has a corresponding issue.
 
 After creating a PR, one or more reviewers will be assigned to the pull request.
