@@ -65,9 +65,10 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	suid, isDestroy := spec.IsDestroy(ctx)
 	record, err := e.getRecordFromDB(processName, processId)
 
-	var port string
+	var port, pid string
 	if record != nil {
 		port = record.Port
+		pid = record.Pid
 	}
 
 	if isDestroy {
@@ -113,6 +114,13 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 				return response
 			}
 		}
+
+		// jvm restart case
+		if exists, _ := cl.ProcessExists(pid); !exists && port != "" {
+			logrus.Infof("pid %s not exists", pid)
+			port = ""
+		}
+
 		// Install java agent
 		if port == "" || override {
 			logrus.Info("Install java agent")

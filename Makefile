@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=0.9.0
+export BLADE_VERSION=0.10.0
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
