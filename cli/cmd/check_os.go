@@ -156,10 +156,10 @@ func (doc *CheckOsCommand) execBladeCmd(checkExecCmd *CheckExecCmd, osAll bool) 
 		response = ch.Run(context.Background(), BladeBinPath, fmt.Sprintf("destroy %s", res.Result.(string)))
 		if !response.Success {
 			execResult.result = "failed"
-			execResult.info = fmt.Sprintf("%s, exec failed! destroy err: %s", response.Err)
-			response.Err = fmt.Sprintf("[failed] %s, exec failed! destroy err: %s", response.Err)
+			execResult.info = fmt.Sprintf("%s, exec failed! destroy err: %s",execResult.cmd, response.Err)
+			response.Err = fmt.Sprintf("[failed] %s, exec failed! destroy err: %s",execResult.cmd, response.Err)
 			if osAll {
-				fmt.Printf("[failed] %s, exec failed! destroy err: %s \n", response.Err)
+				fmt.Printf("[failed] %s, exec failed! destroy err: %s \n",execResult.cmd, response.Err)
 			}
 			continue
 		}
