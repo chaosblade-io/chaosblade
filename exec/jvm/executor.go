@@ -73,9 +73,10 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 			fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo,
 				fmt.Sprintf("where by processName:%s or pid%s", processName, processId), err.Error()))
 	}
-	var port string
+	var port, pid string
 	if record != nil {
 		port = record.Port
+		pid = record.Pid
 	}
 
 	// 3. exec command
@@ -125,6 +126,13 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 				return response
 			}
 		}
+
+		// jvm restart case
+		if exists, _ := cl.ProcessExists(pid); !exists && port != "" {
+			logrus.Infof("pid %s not exists", pid)
+			port = ""
+		}
+
 		// Install java agent
 		if port == "" || override {
 			logrus.Info("Install java agent")

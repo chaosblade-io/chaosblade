@@ -97,9 +97,6 @@ We welcome every contribution, even if it is just punctuation. See details of [C
 ## Business Registration
 The original intention of our open source project is to lower the threshold for chaos engineering to be implemented in enterprises, so we highly value the use of the project in enterprises. Welcome everyone here [ISSUE](https://github.com/chaosblade-io/chaosblade/issues/32). After registration, you will be invited to join the corporate mail group to discuss the problems encountered by Chaos Engineering in the landing of the company and share the landing experience.
 
-## Experiments Landscape
-![experiments landscape](https://user-images.githubusercontent.com/3992234/72340872-eb47c400-3703-11ea-830f-062e117c2e95.png)
-
 ## Ecosystem
 ![ecosystem](https://user-images.githubusercontent.com/3992234/72410783-429d7100-37a4-11ea-8314-540560f8a54f.png)
 
