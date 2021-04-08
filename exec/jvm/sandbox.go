@@ -38,64 +38,72 @@ var cl = channel.NewLocalChannel()
 
 const DefaultNamespace = "default"
 
-func Attach(port string, javaHome string, pid string) (*spec.Response, string) {
+func Attach(uid, port, javaHome, pid string) (*spec.Response, string) {
 	// refresh
-	response, username := attach(pid, port, context.TODO(), javaHome)
+	response, username := attach(uid, pid, port, context.TODO(), javaHome)
 	if !response.Success {
 		return response, username
 	}
 	time.Sleep(5 * time.Second)
 	// active
-	response = active(port)
+	response = active(uid, port)
 	if !response.Success {
 		return response, username
 	}
 	// check
-	return check(port), username
+	return check(uid, port), username
 }
 
 // curl -s http://localhost:$2/sandbox/default/module/http/chaosblade/status 2>&1
-func check(port string) *spec.Response {
+func check(uid, port string) *spec.Response {
 	url := getSandboxUrl(port, "chaosblade/status", "")
 	result, err, code := util.Curl(url)
 	if code == 200 {
 		return spec.ReturnSuccess(result)
 	}
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
 	}
-	return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
-		fmt.Sprintf("response code is %d, result: %s", code, result))
+	util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo+" ,code: %d", url, result, code))
+	return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+		fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
 }
 
 // active chaosblade bin/sandbox.sh -p $pid -P $2 -a chaosblade 2>&1
-func active(port string) *spec.Response {
+func active(uid, port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids=chaosblade")
 	result, err, code := util.Curl(url)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
 	}
 	if code != 200 {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
-			fmt.Sprintf("active module response code: %d, result: %s", code, result))
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo+" ,code: %d", url, result, code))
+		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
 	}
 	return spec.ReturnSuccess("success")
 }
 
 // attach java agent to application process
-func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
+func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
 	username, err := getUsername(pid)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.StatusError],
-			fmt.Sprintf("get username failed by %s pid, %v", pid, err)), ""
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].ErrInfo, pid, err.Error()))
+		return spec.ResponseFailWaitResult(spec.ProcessGetUsernameFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].ErrInfo, pid, err.Error())), ""
 	}
 	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, pid, getJavaCommandLine)
 	toolsJar := getToolJar(javaHome)
 	logrus.Debugf("javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
 	token, err := getSandboxToken(ctx)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.ServerError],
-			fmt.Sprintf("create sandbox token failed, %v", err)), username
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.SandboxCreateTokenFailed].ErrInfo, err.Error()))
+		return spec.ResponseFailWaitResult(spec.SandboxCreateTokenFailed, fmt.Sprintf(spec.ResponseErr[spec.SandboxCreateTokenFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.SandboxCreateTokenFailed].ErrInfo, err.Error())), username
 	}
 	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid)
 	currUser, err := osuser.Current()
@@ -115,12 +123,14 @@ func attach(pid, port string, ctx context.Context, javaHome string) (*spec.Respo
 	if !response.Success {
 		return response, username
 	}
-	response = cl.Run(ctx, "grep", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
+	osCmd := fmt.Sprintf("grep %s", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
 		token, getSandboxTokenFile(username), DefaultNamespace))
+	response = cl.Run(ctx, "", osCmd)
 	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
-			fmt.Sprintf("attach JVM %s failed, loss response; %s", pid, response.Err)), username
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.OsCmdExecFailed].ErrInfo, osCmd, response.Err))
+		return spec.ResponseFailWaitResult(spec.OsCmdExecFailed, fmt.Sprintf(spec.ResponseErr[spec.OsCmdExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.OsCmdExecFailed].ErrInfo, osCmd, response.Err)), username
 	}
 	return response, username
 }
@@ -211,8 +221,8 @@ func getJavaCommandLine(pid string) (commandSlice []string, err error) {
 	return processObj.CmdlineSlice()
 }
 
-func Detach(port string) *spec.Response {
-	return shutdown(port)
+func Detach(uid, port string) *spec.Response {
+	return shutdown(uid, port)
 }
 
 // CheckPortFromSandboxToken will read last line and curl the port for testing connectivity
@@ -251,15 +261,18 @@ func getPortFromSandboxToken(username string) (port string, err error) {
 }
 
 // sudo -u $user -H bash bin/sandbox.sh -p $pid -S 2>&1
-func shutdown(port string) *spec.Response {
+func shutdown(uid, port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-control/shutdown", "")
 	result, err, code := util.Curl(url)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError], err.Error())
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
 	}
 	if code != 200 {
-		return spec.ReturnFail(spec.Code[spec.SandboxInvokeError],
-			fmt.Sprintf("shutdown module response code: %d, result: %s", code, result))
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo+" ,code: %d", url, result, code))
+		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
 	}
 	return spec.ReturnSuccess("success")
 }

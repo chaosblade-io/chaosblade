@@ -85,7 +85,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 		return spec.ReturnFail(spec.Code[spec.IllegalParameters],
 			fmt.Sprintf("less --process or --pid flags"))
 	}
-	pid, response := jvm.CheckFlagValues(pc.processName, pc.processId)
+	pid, response := jvm.CheckFlagValues(pc.uid, pc.processName, pc.processId)
 	if !response.Success {
 		return response
 	}
@@ -146,13 +146,13 @@ func (pc *PrepareJvmCommand) reportAttachedResult(response *spec.Response) {
 
 // attachAgent
 func (pc *PrepareJvmCommand) attachAgent() *spec.Response {
-	response, username := jvm.Attach(strconv.Itoa(pc.port), pc.javaHome, pc.processId)
+	response, username := jvm.Attach(pc.uid, strconv.Itoa(pc.port), pc.javaHome, pc.processId)
 	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err := jvm.CheckPortFromSandboxToken(username)
 		if err == nil {
 			logrus.Infof("use %s port to retry", port)
-			response, username = jvm.Attach(port, pc.javaHome, pc.processId)
+			response, username = jvm.Attach(pc.uid, port, pc.javaHome, pc.processId)
 			if response.Success {
 				// update port
 				err := updatePreparationPort(pc.uid, port)
