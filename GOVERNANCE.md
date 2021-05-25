@@ -17,7 +17,7 @@ They normally take the following responsibilities:
 
 - Classify GitHub issues and perform pull request reviews for other maintainers and the community.
 
-- During GitHub issue classification, apply all applicable [labels](https://github.com/openyurtio/openyurt/labels)
+- During GitHub issue classification, apply all applicable [labels](https://github.com/chaosblade-io/chaosblade/labels)
   to each new issue. Labels are extremely useful for follow-up of future issues. Which labels to apply
   is somewhat subjective so just use your best judgment.
 
@@ -53,7 +53,7 @@ process is a simple majority in which each maintainer receives one vote.
 
 Decisions are made based on consensus between maintainers.
 Proposals and ideas can either be submitted for agreement via a github issue or PR,
-or by sending an email to `openyurt@googlegroups.com`.
+or by sending an email to `chaosblade.io.01@gmail.com`.
 
 In general, we prefer that technical issues and maintainer membership are amicably worked out between the persons involved.
 If a dispute cannot be decided independently, get a third-party maintainer (e.g. a mutual contact with some background
