@@ -17,29 +17,31 @@
 package cmd
 
 import (
+	"fmt"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
 )
 
-// QueryCommand defines query command
-type QueryCommand struct {
+type CheckCommand struct {
 	baseCommand
+	*baseExpCommandService
 }
 
-// Init attach command operators includes create instance and bind flags
-func (qc *QueryCommand) Init() {
-	qc.command = &cobra.Command{
-		Use:     "query TARGET TYPE",
-		Aliases: []string{"q"},
-		Short:   "Query the parameter values required for chaos experiments",
-		Long:    "Query the parameter values required for chaos experiments",
+func (dc *CheckCommand) Init() {
+	dc.command = &cobra.Command{
+		Use:     "check",
+		Aliases: []string{"k"},
+		Short:   "Check the environment for chaosblade",
+		Long:    "Check the environment for chaosblade",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spec.ResponseFailWaitResult(spec.CommandLess, spec.ResponseErr[spec.CommandLess].Err, spec.ResponseErr[spec.CommandLess].ErrInfo)
+			return spec.ReturnFail(spec.Code[spec.IllegalCommand],
+				fmt.Sprintf("less TARGE to check"))
 		},
-		Example: qc.queryExample(),
+		Example: dc.detectExample(),
 	}
 }
 
-func (qc *QueryCommand) queryExample() string {
-	return `query network interface`
+func (dc *CheckCommand) detectExample() string {
+	return "check os"
 }

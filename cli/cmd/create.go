@@ -18,7 +18,11 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade/data"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
 	"os/exec"
 	"path"
 	"strconv"
@@ -34,9 +38,17 @@ import (
 type CreateCommand struct {
 	baseCommand
 	*baseExpCommandService
+	async bool // Whether to create asynchronously, default is false
+	// Actively report the create result.
+	// The installation result report is triggered only when the async value is true and the value is not empty.
+	endpoint string
+	nohup    bool //used to internal async create, no need to config
 }
 
 const UidFlag = "uid"
+const AsyncFlag = "async"
+const EndpointFlag = "endpoint"
+const NohupFlag = "nohup"
 
 var uid string
 
@@ -50,6 +62,9 @@ func (cc *CreateCommand) Init() {
 	}
 	flags := cc.command.PersistentFlags()
 	flags.StringVar(&uid, UidFlag, "", "Set Uid for the experiment, adapt to docker")
+	flags.BoolVarP(&cc.async, AsyncFlag, "a", false, "whether to create asynchronously, default is false")
+	flags.StringVarP(&cc.endpoint, EndpointFlag, "e", "", "the create result reporting address. It takes effect only when the async value is true and the value is not empty")
+	flags.BoolVarP(&cc.nohup, NohupFlag, "n", false, "used to internal async create, no need to config")
 
 	cc.baseExpCommandService = newBaseExpCommandService(cc)
 }
@@ -102,32 +117,98 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 
 			}
 		}
-
-		// update status
-		model, err := actionCommand.recordExpModel(cmd.CommandPath(), expModel)
-		if err != nil {
-			return spec.ReturnFail(spec.Code[spec.DatabaseError], err.Error())
-		}
-
-		// execute experiment
-		executor := actionCommandSpec.Executor()
-		executor.SetChannel(channel.NewLocalChannel())
-		response := executor.Exec(model.Uid, context.Background(), expModel)
-
-		// pass the uid, expModel to actionCommand
-		actionCommand.expModel = expModel
-		actionCommand.uid = model.Uid
-
-		if !response.Success {
+		nohup := expModel.ActionFlags[NohupFlag] == "true"
+		var model *data.ExperimentModel
+		var err error
+		if nohup {
+			uid := expModel.ActionFlags[UidFlag]
+			if uid == "" {
+				logrus.Infof("can not execute nohup, uid is null")
+				return spec.ReturnFail(spec.Code[spec.ExecCommandError], "can not execute nohup, uid is null")
+			} else {
+				model, err = GetDS().QueryExperimentModelByUid(uid)
+				delete(expModel.ActionFlags, NohupFlag)
+			}
+		} else {
 			// update status
-			checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, response.Err))
-			return response
+			model, err = actionCommand.recordExpModel(cmd.CommandPath(), expModel)
 		}
-		// update status
-		checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
-		response.Result = model.Uid
-		cmd.Println(response.Print())
-		return nil
+		if err != nil {
+			return spec.ReturnFail(spec.Code[spec.ExecCommandError], err.Error())
+		}
+		// is async ?
+		async := expModel.ActionFlags[AsyncFlag] == "true"
+		endpoint := expModel.ActionFlags[EndpointFlag]
+
+		if async {
+			var args string
+			if scope == "host" {
+				args = fmt.Sprintf("create %s %s --uid %s --nohup=true", target, actionCommand.Name(), model.Uid)
+			} else {
+				args = fmt.Sprintf("create %s %s %s --uid %s --nohup=true", scope, target, actionCommand.Name(), model.Uid)
+			}
+			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
+				if flag.Value.String() == "false" {
+					return
+				}
+				if flag.Name == AsyncFlag || flag.Name == UidFlag {
+					return
+				}
+				args = fmt.Sprintf("%s --%s=%s ", args, flag.Name, flag.Value)
+			})
+			args = fmt.Sprintf("%s %s %s", path.Join(util.GetProgramPath(), "blade"), args, "> /dev/null 2>&1 &")
+			response := channel.NewLocalChannel().Run(context.Background(), "nohup", args)
+			if response.Success {
+				logrus.Infof("async create success, uid: %s", model.Uid)
+				cmd.Println(spec.ReturnSuccess(model.Uid).Print())
+			} else {
+				logrus.Warningf("async create fail, err: %s, uid: %s", response.Err, model.Uid)
+				cmd.Println(spec.ReturnFail(spec.Code[spec.ExecCommandError], response.Err).Print())
+			}
+			return nil
+		} else {
+			// execute experiment
+			executor := actionCommandSpec.Executor()
+			executor.SetChannel(channel.NewLocalChannel())
+			response := executor.Exec(model.Uid, context.Background(), expModel)
+
+			// pass the uid, expModel to actionCommand
+			actionCommand.expModel = expModel
+			actionCommand.uid = model.Uid
+
+			if !response.Success {
+				// update status
+				checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, response.Err))
+				endpointCallBack(endpoint, model.Uid, response)
+				return response
+			}
+			// update status
+			checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
+			response.Result = model.Uid
+			cmd.Println(response.Print())
+			endpointCallBack(endpoint, model.Uid, response)
+			return nil
+		}
+	}
+}
+
+func endpointCallBack(endpoint, uid string, response *spec.Response) {
+	if endpoint != "" {
+		logrus.Infof("report response: %s to endpoint: %s", response.Print(), endpoint)
+		experimentModel, _ := GetDS().QueryExperimentModelByUid(uid)
+		body, err := json.Marshal(experimentModel)
+		if err != nil {
+			logrus.Warningf("create post body %s failed, %v", response.Print(), err)
+		} else {
+			result, err, code := util.PostCurl(endpoint, body, "application/json")
+			if err != nil {
+				logrus.Warningf("report result %s failed, %v", response.Print(), err)
+			} else if code != 200 {
+				logrus.Warningf("response code is %d, result %s", code, result)
+			} else {
+				logrus.Infof("report result success, result %s", result)
+			}
+		}
 	}
 }
 
@@ -136,10 +217,10 @@ func (cc *CreateCommand) actionPostRunEFunc(actionCommand *actionCommand) func(c
 		const bladeBin = "blade"
 		if actionCommand.expModel != nil {
 			tt := actionCommand.expModel.ActionFlags["timeout"]
-			if tt == "" {
+			async := actionCommand.expModel.ActionFlags[AsyncFlag] == "true"
+			if tt == "" || async {
 				return nil
 			}
-
 			//err possible if timeout used as timeDuration.
 			timeout, err := strconv.ParseUint(tt, 10, 64)
 

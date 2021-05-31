@@ -51,10 +51,11 @@ func (e *Executor) SetChannel(channel spec.Channel) {
 
 func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
 	var url string
-	port, err := e.getPortFromDB(model)
-	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.ServerError], "cannot get port from local")
+	port, resp := e.getPortFromDB(uid, model)
+	if resp != nil {
+		return resp
 	}
+
 	if _, ok := spec.IsDestroy(ctx); ok {
 		url = e.destroyUrl(port, uid)
 	} else {
@@ -62,19 +63,23 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	}
 	result, err, code := util.Curl(url)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError], err.Error())
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
 	}
 	if code == 200 {
 		var resp spec.Response
 		err := json.Unmarshal([]byte(result), &resp)
 		if err != nil {
-			return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError],
-				fmt.Sprintf("unmarshal create command result %s err, %v", result, err))
+			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].ErrInfo, result, err.Error()))
+			return spec.ResponseFailWaitResult(spec.ResultUnmarshalFailed, spec.ResponseErr[spec.ResultUnmarshalFailed].Err,
+				fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].ErrInfo, result, err.Error()))
 		}
 		return &resp
 	}
-	return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError],
-		fmt.Sprintf("response code is %d, result: %s", code, result))
+	util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
+	return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+		fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
 }
 
 func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) string {
@@ -101,14 +106,18 @@ func (e *Executor) destroyUrl(port, uid string) string {
 
 var db = data.GetSource()
 
-func (e *Executor) getPortFromDB(model *spec.ExpModel) (string, error) {
+func (e *Executor) getPortFromDB(uid string, model *spec.ExpModel) (string, *spec.Response) {
 	port := model.ActionFlags["port"]
 	record, err := db.QueryRunningPreByTypeAndProcess("cplus", port, "")
 	if err != nil {
-		return "", err
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, err.Error()))
+		return "", spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, fmt.Sprintf("where cplus and %s from prepare", port), err.Error()))
 	}
 	if record == nil {
-		return "", fmt.Errorf("%s port not found, please execute prepare command firstly", port)
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidCplusPort].ErrInfo, port))
+		return "", spec.ResponseFailWaitResult(spec.ParameterInvalidCplusPort, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidCplusPort].Err, port),
+			fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidCplusPort].ErrInfo, port))
 	}
 	return record.Port, nil
 }

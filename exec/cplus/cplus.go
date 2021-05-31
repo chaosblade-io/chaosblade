@@ -35,39 +35,42 @@ var cplusBinPath = path.Join(util.GetLibHome(), "cplus", ApplicationName)
 var scriptDefaultPath = path.Join(util.GetLibHome(), "cplus", "script")
 
 // 启动 spring boot application，需要校验程序是否已启动
-func Prepare(port, ip string) *spec.Response {
+func Prepare(uid, port, ip string) *spec.Response {
 
-	response := preCheck(port)
+	response := preCheck(uid, port)
 	if !response.Success {
 		return response
 	}
-	response = startProxy(port, ip)
+	response = startProxy(uid, port, ip)
 	if !response.Success {
 		return response
 	}
-	return postCheck(port)
+	return postCheck(uid, port)
 }
 
-func preCheck(port string) *spec.Response {
+func preCheck(uid, port string) *spec.Response {
 	// check spring boot application
 	if processExists(port) {
 		return spec.ReturnSuccess("the server proxy has been started")
 	}
 	// check chaosblade-exec-cplus.jar file exists or not
 	if !util.IsExist(cplusBinPath) {
-		return spec.ReturnFail(spec.Code[spec.FileNotFound],
-			fmt.Sprintf("the %s proxy jar file not found in %s dir", ApplicationName, util.GetLibHome()))
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].ErrInfo, cplusBinPath))
+		return spec.ResponseFailWaitResult(spec.ChaosbladeFileNotFound, fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].Err, cplusBinPath),
+			fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].ErrInfo, cplusBinPath))
 	}
 	// check script file
 	if !util.IsExist(scriptDefaultPath) {
-		return spec.ReturnFail(spec.Code[spec.FileNotFound],
-			fmt.Sprintf("the %s script file dir not found", scriptDefaultPath))
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].ErrInfo, scriptDefaultPath))
+		return spec.ResponseFailWaitResult(spec.ChaosbladeFileNotFound, fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].Err, scriptDefaultPath),
+			fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].ErrInfo, scriptDefaultPath))
 	}
 	// check the port has been used or not
 	portInUse := util.CheckPortInUse(port)
 	if portInUse {
-		return spec.ReturnFail(spec.Code[spec.IllegalParameters],
-			fmt.Sprintf("the %s port is in use", port))
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalid].ErrInfo+" ,%s is in use", "port", port))
+		return spec.ResponseFailWaitResult(spec.ParameterInvalid, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalid].Err, "port"),
+			fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalid].ErrInfo, "port"))
 	}
 	return spec.ReturnSuccess("success")
 }
@@ -81,7 +84,7 @@ func processExists(port string) bool {
 	return false
 }
 
-func startProxy(port, ip string) *spec.Response {
+func startProxy(uid, port, ip string) *spec.Response {
 	args := fmt.Sprintf("--port %s", port)
 	if ip != "" {
 		args = fmt.Sprintf("%s --ip %s", args, ip)
@@ -89,16 +92,19 @@ func startProxy(port, ip string) *spec.Response {
 	return channel.NewLocalChannel().Run(context.Background(), cplusBinPath, args)
 }
 
-func postCheck(port string) *spec.Response {
-	result, err, _ := util.Curl(getProxyServiceUrl(port, "status"))
+func postCheck(uid, port string) *spec.Response {
+	url := getProxyServiceUrl(port, "status")
+	result, err, _ := util.Curl(url)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError], err.Error())
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
 	}
 	return spec.ReturnSuccess(result)
 }
 
 // 停止 spring boot application
-func Revoke(port string) *spec.Response {
+func Revoke(uid, port string) *spec.Response {
 	// check process
 	if !processExists(port) {
 		return spec.ReturnSuccess("process not exists")
@@ -111,7 +117,9 @@ func Revoke(port string) *spec.Response {
 	ctx := context.WithValue(context.Background(), channel.ExcludeProcessKey, "blade")
 	pids, err := channel.NewLocalChannel().GetPidsByProcessName(ApplicationName, ctx)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.ServerError], fmt.Sprintf("query process failed, %v", err))
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].ErrInfo, ApplicationName, err.Error()))
+		return spec.ResponseFailWaitResult(spec.ProcessIdByNameFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].ErrInfo, ApplicationName, err.Error()))
 	}
 	if len(pids) > 0 {
 		response := channel.NewLocalChannel().Run(context.Background(), "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
@@ -120,9 +128,11 @@ func Revoke(port string) *spec.Response {
 		}
 	}
 	// revoke failed if the check operation returns success
-	response := postCheck(port)
+	response := postCheck(uid, port)
 	if response.Success {
-		return spec.ReturnFail(spec.Code[spec.CplusProxyCmdError], "the process exists")
+		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, getProxyServiceUrl(port, RemoveAction), "process still exists"))
+		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
+			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, getProxyServiceUrl(port, RemoveAction), "process still exists"))
 	}
 	return spec.ReturnSuccess("success")
 }

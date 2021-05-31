@@ -62,5 +62,11 @@ func CmdInit() *baseCommand {
 	serverCommand.AddCommand(&StopServerCommand{})
 	serverCommand.AddCommand(&StatusServerCommand{})
 
+	// add check command
+	checkCommand := &CheckCommand{}
+	baseCmd.AddCommand(checkCommand)
+	checkCommand.AddCommand(&CheckJavaCommand{})
+	checkCommand.AddCommand(&CheckOsCommand{})
+
 	return baseCmd
 }
