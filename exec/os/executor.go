@@ -19,43 +19,53 @@ package os
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-exec-os/exec"
-	"github.com/chaosblade-io/chaosblade-exec-os/exec/model"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	"path"
 )
 
 type Executor struct {
-	executors   map[string]spec.Executor
-	sshExecutor spec.Executor
 }
 
 func NewExecutor() spec.Executor {
-	return &Executor{
-		executors:   model.GetAllOsExecutors(),
-		sshExecutor: model.GetSHHExecutor(),
-	}
+	return &Executor{}
 }
 
 func (*Executor) Name() string {
 	return "os"
 }
 
+var c = channel.NewLocalChannel()
+
+const (
+	OS_BIN  = "chaos_os"
+	CREATE  = "create"
+	DESTROY = "destroy"
+)
+
 func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
-	if model.ActionFlags[exec.ChannelFlag.Name] == e.sshExecutor.Name() {
-		return e.sshExecutor.Exec(uid, ctx, model)
+	var args string
+	var flags string
+	for k, v := range model.ActionFlags {
+		if v == "" {
+			continue
+		}
+		flags = fmt.Sprintf("%s %s=%s", flags, k, v)
 	}
 
-	key := model.Target + model.ActionName
-	executor := e.executors[key]
-	if executor == nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.OsExecutorNotFound].ErrInfo, key))
-		return spec.ResponseFailWaitResult(spec.OsExecutorNotFound, fmt.Sprintf(spec.ResponseErr[spec.OsExecutorNotFound].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.OsExecutorNotFound].ErrInfo, key))
+	if _, ok := spec.IsDestroy(ctx); ok {
+		args = fmt.Sprintf("%s %s %s%s uid=%s", DESTROY, model.Target, model.ActionName, flags, uid)
+	} else {
+		args = fmt.Sprintf("%s %s %s%s uid=%s", CREATE, model.Target, model.ActionName, flags, uid)
 	}
-	executor.SetChannel(channel.NewLocalChannel())
-	return executor.Exec(uid, ctx, model)
+
+	response := c.Run(ctx, path.Join(util.GetBinPath(), OS_BIN), args)
+	if response.Success {
+		return spec.Decode(response.Result.(string), response)
+	} else {
+		return response
+	}
 }
 
 func (*Executor) SetChannel(channel spec.Channel) {
