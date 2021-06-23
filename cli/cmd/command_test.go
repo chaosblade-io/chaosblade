@@ -188,7 +188,7 @@ func (*MockSource) QueryExperimentModelByUid(uid string) (*data.ExperimentModel,
 	return nil, nil
 }
 
-func (*MockSource) QueryExperimentModels(target, action, status, limit string, asc bool) ([]*data.ExperimentModel, error) {
+func (*MockSource) QueryExperimentModels(target, action, flag, status, limit string, asc bool) ([]*data.ExperimentModel, error) {
 	return make([]*data.ExperimentModel, 0), nil
 }
 
@@ -228,7 +228,7 @@ func (*MockSource) UpdatePreparationPidByUid(uid, pid string) error {
 	return nil
 }
 
-func (*MockSource) QueryPreparationRecords(target, status, limit string, asc bool) ([]*data.PreparationRecord, error) {
+func (*MockSource) QueryPreparationRecords(target, status, action, flag, limit string, asc bool) ([]*data.PreparationRecord, error) {
 	return make([]*data.PreparationRecord, 0), nil
 }
 
