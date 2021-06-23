@@ -66,7 +66,7 @@ type PreparationSource interface {
 	UpdatePreparationPidByUid(uid, pid string) error
 
 	// QueryPreparationRecords
-	QueryPreparationRecords(target, status, limit string, asc bool) ([]*PreparationRecord, error)
+	QueryPreparationRecords(target, status, action, flag, limit string, asc bool) ([]*PreparationRecord, error)
 }
 
 // UserVersion PRAGMA [database.]user_version
@@ -331,7 +331,7 @@ func (s *Source) UpdatePreparationPidByUid(uid, pid string) error {
 	return nil
 }
 
-func (s *Source) QueryPreparationRecords(target, status, limit string, asc bool) ([]*PreparationRecord, error) {
+func (s *Source) QueryPreparationRecords(target, status, action, flag, limit string, asc bool) ([]*PreparationRecord, error) {
 	sql := `SELECT * FROM preparation where 1=1`
 	parameters := make([]interface{}, 0)
 	if target != "" {
@@ -341,6 +341,14 @@ func (s *Source) QueryPreparationRecords(target, status, limit string, asc bool)
 	if status != "" {
 		sql = fmt.Sprintf(`%s and status = ?`, sql)
 		parameters = append(parameters, UpperFirst(status))
+	}
+	if action != "" {
+		sql = fmt.Sprintf(`%s and sub_command = ?`, sql)
+		parameters = append(parameters, action)
+	}
+	if flag != "" {
+		sql = fmt.Sprintf(`%s and flag like ?`, sql)
+		parameters = append(parameters, "%"+flag+"%")
 	}
 	if asc {
 		sql = fmt.Sprintf(`%s order by id asc`, sql)

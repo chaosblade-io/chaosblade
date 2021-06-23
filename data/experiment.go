@@ -57,7 +57,7 @@ type ExperimentSource interface {
 	QueryExperimentModelByUid(uid string) (*ExperimentModel, error)
 
 	// QueryExperimentModels
-	QueryExperimentModels(target, action, status, limit string, asc bool) ([]*ExperimentModel, error)
+	QueryExperimentModels(target, action, flag, status, limit string, asc bool) ([]*ExperimentModel, error)
 
 	// QueryExperimentModelsByCommand
 	// flags value contains necessary parameters generally
@@ -195,7 +195,7 @@ func (s *Source) QueryExperimentModelByUid(uid string) (*ExperimentModel, error)
 	return models[0], nil
 }
 
-func (s *Source) QueryExperimentModels(target, action, status, limit string, asc bool) ([]*ExperimentModel, error) {
+func (s *Source) QueryExperimentModels(target, action, flag, status, limit string, asc bool) ([]*ExperimentModel, error) {
 	sql := `SELECT * FROM experiment where 1=1`
 	parameters := make([]interface{}, 0)
 	if target != "" {
@@ -205,6 +205,10 @@ func (s *Source) QueryExperimentModels(target, action, status, limit string, asc
 	if action != "" {
 		sql = fmt.Sprintf(`%s and sub_command = ?`, sql)
 		parameters = append(parameters, action)
+	}
+	if flag != "" {
+		sql = fmt.Sprintf(`%s and flag like ?`, sql)
+		parameters = append(parameters, "%"+flag+"%")
 	}
 	if status != "" {
 		sql = fmt.Sprintf(`%s and status = ?`, sql)
@@ -243,7 +247,7 @@ func (s *Source) QueryExperimentModels(target, action, status, limit string, asc
 
 func (s *Source) QueryExperimentModelsByCommand(command, subCommand string, flags map[string]string) ([]*ExperimentModel, error) {
 	models := make([]*ExperimentModel, 0)
-	experimentModels, err := s.QueryExperimentModels(command, subCommand, "", "", true)
+	experimentModels, err := s.QueryExperimentModels(command, subCommand, "", "", "", true)
 	if err != nil {
 		return models, err
 	}

@@ -39,6 +39,8 @@ type StatusCommand struct {
 	baseCommand
 	commandType string
 	target      string
+	action      string
+	flag        string
 	uid         string
 	limit       string
 	status      string
@@ -58,6 +60,8 @@ func (sc *StatusCommand) Init() {
 	}
 	sc.command.Flags().StringVar(&sc.commandType, "type", "", "command type, prepare|create|destroy|revoke")
 	sc.command.Flags().StringVar(&sc.target, "target", "", "experiment target, for example: dubbo")
+	sc.command.Flags().StringVar(&sc.action, "action", "", "sub command, for example:fullload")
+	sc.command.Flags().StringVar(&sc.flag, "flag-filter", "", "flag can do fuzzy search")
 	sc.command.Flags().StringVar(&sc.limit, "limit", "", "limit the count of experiments, support OFFSET clause, for example, limit 4,3 returns only 3 items starting from the 5 position item")
 	sc.command.Flags().StringVar(&sc.status, "status", "", "experiment status. create type supports Created|Success|Error|Destroyed status. prepare type supports Created|Running|Error|Revoked status")
 	sc.command.Flags().StringVar(&sc.uid, "uid", "", "prepare or experiment uid")
@@ -78,13 +82,13 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 		if uid != "" {
 			result, err = GetDS().QueryExperimentModelByUid(uid)
 		} else {
-			result, err = GetDS().QueryExperimentModels(sc.target, "", sc.status, sc.limit, sc.asc)
+			result, err = GetDS().QueryExperimentModels(sc.target, sc.action, sc.flag, sc.status, sc.limit, sc.asc)
 		}
 	case "prepare", "revoke", "p", "r":
 		if uid != "" {
 			result, err = GetDS().QueryPreparationByUid(uid)
 		} else {
-			result, err = GetDS().QueryPreparationRecords(sc.target, sc.status, sc.limit, sc.asc)
+			result, err = GetDS().QueryPreparationRecords(sc.target, sc.status, sc.action, sc.flag, sc.limit, sc.asc)
 		}
 	default:
 		if uid == "" {
