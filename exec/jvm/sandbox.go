@@ -36,7 +36,7 @@ import (
 // attach sandbox to java process
 var cl = channel.NewLocalChannel()
 
-const DefaultNamespace = "default"
+const DefaultNamespace = "chaosblade"
 
 func Attach(uid, port, javaHome, pid string) (*spec.Response, string) {
 	// refresh
