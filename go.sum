@@ -135,6 +135,7 @@ github.com/chaosblade-io/chaosblade-exec-os v1.2.0 h1:GPv6JC/jh7NosY8cIUBF1P3chO
 github.com/chaosblade-io/chaosblade-exec-os v1.2.0/go.mod h1:NPmsiENi1L3l+wKvLDib/s395YkAXaEqwrVIWZUomDM=
 github.com/chaosblade-io/chaosblade-operator v1.2.0 h1:FdnPA/1dYxY36GeqEJb9rTo86F4jANw30b2SDaEBj6c=
 github.com/chaosblade-io/chaosblade-operator v1.2.0/go.mod h1:WUUCxvx+PR9Yu1kuI+j6wyurcolcoT2iCLsqqvM3oIA=
+github.com/chaosblade-io/chaosblade-operator v1.3.0-dev h1:GLzsygO/aIdyOyRvw6Rvw+YL000PRLmio6uddVz042w=
 github.com/chaosblade-io/chaosblade-operator v1.3.0-dev/go.mod h1:LoAaSdtyx1HIaUlUbIh7GW4ze5v86pLT0Embh6d40HA=
 github.com/chaosblade-io/chaosblade-spec-go v1.0.1-0.20210531022335-b8bb425f7cb9/go.mod h1:xUF+8r54FphQjBR8fVPnweVqzu7EitE15UsnZ57O5gk=
 github.com/chaosblade-io/chaosblade-spec-go v1.2.0 h1:f1AAqUqrWMPPOYu6JacpUQCVlxe6oFKMhfe0ZMivRQI=

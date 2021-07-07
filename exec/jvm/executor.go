@@ -61,7 +61,8 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	// 1. check parameters
 	processName := model.ActionFlags["process"]
 	processId := model.ActionFlags["pid"]
-	override := model.ActionFlags["override"] == "true"
+	// refresh flag is used to reload java agent
+	refresh := model.ActionFlags["refresh"] == "true"
 
 	// 2. get record from db by processname|processId
 	suid, isDestroy := spec.IsDestroy(ctx)
@@ -118,7 +119,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 					fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
 			}
 		}
-		if override {
+		if refresh {
 			// Uninstall java agent
 			logrus.Info("Uninstall java agent")
 			response := Revoke(uid, record, processName, processId)
@@ -134,14 +135,13 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		}
 
 		// Install java agent
-		if port == "" || override {
+		if port == "" || refresh {
 			logrus.Info("Install java agent")
 			response, newPort := Prepare(uid, processName, processId)
 			if !response.Success {
 				return response
 			}
 			port = newPort
-			delete(model.ActionFlags, "override")
 		}
 	}
 
