@@ -285,7 +285,6 @@ func (ec *baseExpCommandService) registerActionCommand(target, scope string, act
 	}
 
 	flags := addTimeoutFlag(actionCommandSpec.Flags())
-	flags = addOverrideFlag(flags)
 	ec.bindFlagsFunc(command.ActionFlags, command.command, flags)
 	// set matcher flags
 	ec.bindFlagsFunc(command.MatcherFlags, command.command, actionCommandSpec.Matchers())
@@ -306,28 +305,6 @@ func addTimeoutFlag(flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
 			&spec.ExpFlag{
 				Name:     "timeout",
 				Desc:     "set timeout for experiment in seconds",
-				Required: false,
-			},
-		)
-	}
-	return flags
-}
-
-func addOverrideFlag(flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
-	contains := false
-	for _, flag := range flags {
-		if flag.FlagName() == "override" {
-			contains = true
-			break
-		}
-	}
-	if !contains {
-		// set action flags, always add timeout param
-		flags = append(flags,
-			&spec.ExpFlag{
-				Name:     "override",
-				Desc:     "only for java now, uninstall java agent",
-				NoArgs:   true,
 				Required: false,
 			},
 		)
