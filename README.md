@@ -4,6 +4,7 @@
 [![Build Status](https://travis-ci.org/chaosblade-io/chaosblade.svg?branch=master)](https://travis-ci.org/chaosblade-io/chaosblade)
 [![Financial Contributors on Open Collective](https://opencollective.com/chaosblade/all/badge.svg?label=financial+contributors)](https://opencollective.com/chaosblade) [![codecov](https://codecov.io/gh/chaosblade-io/chaosblade/branch/master/graph/badge.svg)](https://codecov.io/gh/chaosblade-io/chaosblade)
 ![license](https://img.shields.io/github/license/chaosblade-io/chaosblade.svg)
+[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/5032/badge)](https://bestpractices.coreinfrastructure.org/projects/5032)
 
 中文版 [README](README_CN.md)
 ## Introduction
