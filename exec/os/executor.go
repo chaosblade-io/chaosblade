@@ -19,6 +19,7 @@ package os
 import (
 	"context"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-exec-os/exec"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
@@ -45,6 +46,12 @@ const (
 )
 
 func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
+
+	if model.ActionFlags[exec.ChannelFlag.Name] == "ssh" {
+		sshExecutor:= &exec.SSHExecutor{}
+		return sshExecutor.Exec(uid, ctx, model)
+	}
+
 	var args string
 	var flags string
 	for k, v := range model.ActionFlags {
