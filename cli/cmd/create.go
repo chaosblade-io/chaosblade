@@ -20,13 +20,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade/data"
-	"github.com/sirupsen/logrus"
-	"github.com/spf13/pflag"
 	"os/exec"
 	"path"
 	"strconv"
 	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/pflag"
+
+	"github.com/chaosblade-io/chaosblade/data"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -119,22 +121,25 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 		}
 		nohup := expModel.ActionFlags[NohupFlag] == "true"
 		var model *data.ExperimentModel
+		var resp *spec.Response
 		var err error
 		if nohup {
 			uid := expModel.ActionFlags[UidFlag]
 			if uid == "" {
 				logrus.Infof("can not execute nohup, uid is null")
-				return spec.ReturnFail(spec.Code[spec.ExecCommandError], "can not execute nohup, uid is null")
+				return spec.ResponseFailWithFlags(spec.ParameterLess, UidFlag)
 			} else {
 				model, err = GetDS().QueryExperimentModelByUid(uid)
-				delete(expModel.ActionFlags, NohupFlag)
+				if err == nil {
+					delete(expModel.ActionFlags, NohupFlag)
+				}
 			}
 		} else {
 			// update status
-			model, err = actionCommand.recordExpModel(cmd.CommandPath(), expModel)
+			model, resp = actionCommand.recordExpModel(cmd.CommandPath(), expModel)
 		}
-		if err != nil {
-			return spec.ReturnFail(spec.Code[spec.ExecCommandError], err.Error())
+		if !resp.Success {
+			return resp
 		}
 		// is async ?
 		async := expModel.ActionFlags[AsyncFlag] == "true"
@@ -163,7 +168,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 				cmd.Println(spec.ReturnSuccess(model.Uid).Print())
 			} else {
 				logrus.Warningf("async create fail, err: %s, uid: %s", response.Err, model.Uid)
-				cmd.Println(spec.ReturnFail(spec.Code[spec.ExecCommandError], response.Err).Print())
+				cmd.Println(spec.ResponseFailWithFlags(spec.OsCmdExecFailed, "nohup", response.Err).Print())
 			}
 			return nil
 		} else {

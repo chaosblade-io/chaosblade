@@ -21,8 +21,6 @@ import (
 	"fmt"
 	"os"
 	"testing"
-
-	"github.com/prometheus/common/log"
 )
 
 func Test_getJavaBinAndJavaHome(t *testing.T) {
@@ -81,7 +79,7 @@ func Test_getJavaBinAndJavaHome(t *testing.T) {
 	// set JAVA_HOME
 	err = os.Setenv("JAVA_HOME", "/opt/chaos/java")
 	if err != nil {
-		log.Errorf("set JAVA_HOME env failed, %v", err)
+		t.Errorf("set JAVA_HOME env failed, %v", err)
 	}
 	testsWithJavaHome := []struct {
 		name             string

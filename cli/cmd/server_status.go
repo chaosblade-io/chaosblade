@@ -31,7 +31,7 @@ func (ssc *StatusServerCommand) run(cmd *cobra.Command, args []string) error {
 	// check if the process named `blade server --start` exists or not
 	pids, err := channel.NewLocalChannel().GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey, err)
 	}
 	if len(pids) != 0 {
 		data := map[string]string{
@@ -40,15 +40,15 @@ func (ssc *StatusServerCommand) run(cmd *cobra.Command, args []string) error {
 		}
 		pid, err := strconv.Atoi(pids[0])
 		if err != nil {
-			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+			return spec.ResponseFailWithFlags(spec.ParameterIllegal, "pid", pids[0], err)
 		}
 		process, err := process.NewProcess(int32(pid))
 		if err != nil {
-			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+			return spec.ResponseFailWithFlags(spec.ParameterIllegal, "pid", pids[0], err)
 		}
 		cmdlineSlice, err := process.CmdlineSlice()
 		if err != nil {
-			return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+			return spec.ResponseFailWithFlags(spec.ParameterIllegal, "pid", pids[0], err)
 		}
 		for idx, cmd := range cmdlineSlice {
 			if cmd == "--port" {
@@ -57,7 +57,7 @@ func (ssc *StatusServerCommand) run(cmd *cobra.Command, args []string) error {
 		}
 		ssc.command.Println(spec.ReturnSuccess(data).Print())
 	} else {
-		return spec.ReturnFail(spec.Code[spec.ServerError], "down")
+		return spec.ResponseFailWithFlags(spec.ChaosbladeServiceStoped)
 	}
 	return nil
 }

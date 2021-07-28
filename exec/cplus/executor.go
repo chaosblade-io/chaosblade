@@ -63,23 +63,20 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	}
 	result, err, code := util.Curl(url)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code == 200 {
 		var resp spec.Response
 		err := json.Unmarshal([]byte(result), &resp)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].ErrInfo, result, err.Error()))
-			return spec.ResponseFailWaitResult(spec.ResultUnmarshalFailed, spec.ResponseErr[spec.ResultUnmarshalFailed].Err,
-				fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].ErrInfo, result, err.Error()))
+			util.Errorf(uid, util.GetRunFuncName(), spec.ResultUnmarshalFailed.Sprintf(result, err))
+			return spec.ResponseFailWithFlags(spec.ResultUnmarshalFailed, result, err)
 		}
 		return &resp
 	}
-	util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
-	return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-		fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
+	util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+	return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 }
 
 func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) string {
@@ -110,14 +107,12 @@ func (e *Executor) getPortFromDB(uid string, model *spec.ExpModel) (string, *spe
 	port := model.ActionFlags["port"]
 	record, err := db.QueryRunningPreByTypeAndProcess("cplus", port, "")
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, err.Error()))
-		return "", spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, fmt.Sprintf("where cplus and %s from prepare", port), err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
+		return "", spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidCplusPort].ErrInfo, port))
-		return "", spec.ResponseFailWaitResult(spec.ParameterInvalidCplusPort, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidCplusPort].Err, port),
-			fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidCplusPort].ErrInfo, port))
+		util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidCplusPort.Sprintf(port))
+		return "", spec.ResponseFailWithFlags(spec.ParameterInvalidCplusPort, port)
 	}
 	return record.Port, nil
 }

@@ -227,7 +227,7 @@ func (ec *baseExpCommandService) registerExpCommand(commandSpec spec.ExpModelCom
 		Short: commandSpec.ShortDesc(),
 		Long:  commandSpec.LongDesc(),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spec.ReturnFail(spec.Code[spec.IllegalParameters], "less action command")
+			return spec.ResponseFailWithFlags(spec.CommandIllegal, "less action command")
 		},
 	}
 	// create the experiment command

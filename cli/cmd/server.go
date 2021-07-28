@@ -17,8 +17,6 @@
 package cmd
 
 import (
-	"fmt"
-
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
 )
@@ -34,8 +32,7 @@ func (sc *ServerCommand) Init() {
 		Long:    "Server mode starts, exposes web services. Under the mode, you can send http request to trigger experiments",
 		Aliases: []string{"srv"},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spec.ReturnFail(spec.Code[spec.IllegalCommand],
-				fmt.Sprintf("less start or stop command"))
+			return spec.ResponseFailWithFlags(spec.CommandIllegal, "less start or stop command")
 		},
 		Example: serverExample(),
 	}

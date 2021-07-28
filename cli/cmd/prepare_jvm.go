@@ -82,8 +82,7 @@ func (pc *PrepareJvmCommand) prepareExample() string {
 // prepareJvm means attaching java agent
 func (pc *PrepareJvmCommand) prepareJvm() error {
 	if pc.processName == "" && pc.processId == "" {
-		return spec.ReturnFail(spec.Code[spec.IllegalParameters],
-			fmt.Sprintf("less --process or --pid flags"))
+		return spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 	}
 	pid, response := jvm.CheckFlagValues(pc.uid, pc.processName, pc.processId)
 	if !response.Success {
@@ -92,8 +91,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 	pc.processId = pid
 	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName, pc.processId)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.DatabaseError],
-			fmt.Sprintf("query attach java process record err, %s", err.Error()))
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if !pc.nohup {
 		record, err = pc.ManualPreparation(record, err)
@@ -175,18 +173,16 @@ func (pc *PrepareJvmCommand) ManualPreparation(record *data.PreparationRecord, e
 			// get port from local port
 			port, err = getAndCacheSandboxPort()
 			if err != nil {
-				return nil, spec.ReturnFail(spec.Code[spec.ServerError],
-					fmt.Sprintf("get sandbox port err, %s", err.Error()))
+				return nil, spec.ResponseFailWithFlags(spec.SandboxGetPortFailed, err)
 			}
 		}
 		record, err = insertPrepareRecord(PrepareJvmType, pc.processName, port, pc.processId)
 		if err != nil {
-			return nil, spec.ReturnFail(spec.Code[spec.DatabaseError],
-				fmt.Sprintf("insert prepare record err, %s", err.Error()))
+			return nil, spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err)
 		}
 	} else {
 		if pc.port != 0 && strconv.Itoa(pc.port) != record.Port {
-			return nil, spec.ReturnFail(spec.Code[spec.IllegalParameters],
+			return nil, spec.ResponseFailWithFlags(spec.SandboxGetPortFailed,
 				fmt.Sprintf("the process has been executed prepare command, if you wan't re-prepare, "+
 					"please append or modify the --port %s argument in prepare command for retry", record.Port))
 		}
