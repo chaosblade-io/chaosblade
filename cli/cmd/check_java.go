@@ -72,7 +72,7 @@ func (djc *CheckJavaCommand) detectExample() string {
 func (djc *CheckJavaCommand) checkJavaRunE() error {
 	objects := strings.Split(djc.object, ",")
 	if len(objects) == 0 || djc.object == "" {
-		return spec.ReturnFail(spec.Code[spec.IllegalParameters], "less object parameter")
+		return spec.ResponseFailWithFlags(spec.CommandIllegal, "less object parameter")
 	}
 
 	for _, object := range objects {

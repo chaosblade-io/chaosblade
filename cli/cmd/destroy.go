@@ -78,10 +78,9 @@ func (dc *DestroyCommand) runDestroyWithUid(cmd *cobra.Command, args []string) e
 			return dc.destroyAndRemoveK8sExperimentWithoutRecordByForceFlag(cmd, uid)
 		}
 		if err != nil {
-			return spec.ReturnFail(spec.Code[spec.DatabaseError], err.Error())
+			return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 		}
-		return spec.ReturnFail(spec.Code[spec.DataNotFound],
-			fmt.Sprintf("the %s experiment not found, if it's k8s experiment, please add --target k8s --kubeconfig KUBECONFIG to retry", uid))
+		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	return dc.destroyAndRemoveExperimentByUidAndForceFlag(cmd, err, model, uid, isK8sTarget)
 }
@@ -95,7 +94,7 @@ func (dc *DestroyCommand) destroyAndRemoveK8sExperimentWithoutRecordByForceFlag(
 		return nil
 	}
 	if err == nil && removeResourceErr != nil {
-		return spec.ReturnFail(spec.Code[spec.RemoveRecordError],
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "remove",
 			fmt.Sprintf("the %s has been destroyed, but forcibly remove resource failed, %v", uid, removeResourceErr))
 	}
 	response = err.(*spec.Response)
@@ -123,7 +122,7 @@ func (dc *DestroyCommand) destroyAndRemoveExperimentByUidAndForceFlag(
 			cmd.Println(response.Print())
 			return nil
 		}
-		return spec.ReturnFail(spec.Code[spec.RemoveRecordError],
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "remove",
 			fmt.Sprintf("the %s has been destroyed, but forcibly remove resource failed, %v|%v",
 				uid, removeRecordErr, removeResourceErr))
 	}
@@ -142,7 +141,7 @@ func (dc *DestroyCommand) destroyAndRemoveExperimentByUidAndForceFlag(
 // destroyExperimentByUid destroys experiments with local records, including k8s experiments.
 func (dc *DestroyCommand) destroyExperimentByUid(model *data.ExperimentModel, uid string) (*spec.Response, error) {
 	if model == nil {
-		return nil, spec.Return(spec.Code[spec.DataNotFound], false)
+		return nil, spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	if model.Status == Destroyed {
 		result := fmt.Sprintf("command: %s %s %s, destroy time: %s",
@@ -151,7 +150,7 @@ func (dc *DestroyCommand) destroyExperimentByUid(model *data.ExperimentModel, ui
 	}
 	executor, expModel, err := dc.getExecutorAndExpModelByRecord(model)
 	if err != nil {
-		return nil, spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+		return nil, spec.ResponseFailWithFlags(spec.HandlerExecNotFound, err.Error())
 	}
 	if err = dc.destroyExperiment(uid, executor, expModel); err != nil {
 		return nil, err
@@ -162,19 +161,19 @@ func (dc *DestroyCommand) destroyExperimentByUid(model *data.ExperimentModel, ui
 //destroyK8sExperimentWithoutRecord deletes chaosblade resources by name in the cluster.
 func (dc *DestroyCommand) destroyK8sExperimentWithoutRecord(uid string) (*spec.Response, error) {
 	if uid == "" || dc.kubeconfig == "" {
-		return nil, spec.ReturnFail(spec.Code[spec.IllegalParameters],
-			"illegal arguments, usage: blade destroy UID --target k8s --kubeconfig KUBECONFIG")
+		return nil, spec.ResponseFailWithFlags(spec.ParameterLess,
+			"usage: blade destroy UID --target k8s --kubeconfig KUBECONFIG")
 	}
 	exp, err := kubernetes.GetChaosBladeByName(uid, dc.kubeconfig)
 	if err != nil {
-		return nil, spec.ReturnFail(spec.Code[spec.K8sInvokeError], err.Error())
+		return nil, spec.ResponseFailWithFlags(spec.K8sExecFailed, "GetChaosBlade", err)
 	}
 	if exp.Status.Phase == v1alpha1.ClusterPhaseDestroyed {
 		return spec.ReturnSuccess(exp), nil
 	}
 	executor, expModel, err := dc.getExecutorAndExpModelByChaosBladeResource(exp)
 	if err != nil {
-		return nil, spec.ReturnFail(spec.Code[spec.IllegalParameters], err.Error())
+		return nil, spec.ResponseFailWithFlags(spec.HandlerExecNotFound, err.Error())
 	}
 	if err := dc.destroyExperiment(uid, executor, expModel); err != nil {
 		return nil, err
@@ -310,7 +309,7 @@ func (dc *DestroyCommand) actionRunEFunc(target, scope string, _ *actionCommand,
 				return nil
 			}
 			resp, ok := err.(*spec.Response)
-			if ok && resp.Code != spec.Code[spec.DataNotFound].Code {
+			if ok && resp.Code != spec.DataNotFound.Code {
 				return resp
 			}
 			logrus.Warningf("%s uid not found, so using matchers to continue to destroy", uid)

@@ -34,7 +34,7 @@ func (qc *QueryCommand) Init() {
 		Short:   "Query the parameter values required for chaos experiments",
 		Long:    "Query the parameter values required for chaos experiments",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spec.ResponseFailWaitResult(spec.CommandLess, spec.ResponseErr[spec.CommandLess].Err, spec.ResponseErr[spec.CommandLess].ErrInfo)
+			return spec.ResponseFailWithFlags(spec.CommandIllegal, "less target type")
 		},
 		Example: qc.queryExample(),
 	}

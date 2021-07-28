@@ -46,7 +46,7 @@ func (ssc *StopServerCommand) Init() {
 func (ssc *StopServerCommand) run(cmd *cobra.Command, args []string) error {
 	pids, err := channel.NewLocalChannel().GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.ServerError], err.Error())
+		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey, err)
 	}
 	if pids == nil || len(pids) == 0 {
 		logrus.Infof("the blade server process not found, so return success for stop operation")

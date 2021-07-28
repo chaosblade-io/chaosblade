@@ -62,13 +62,11 @@ func check(uid, port string) *spec.Response {
 		return spec.ReturnSuccess(result)
 	}
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
-	util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo+" ,code: %d", url, result, code))
-	return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-		fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
+	util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+	return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 }
 
 // active chaosblade bin/sandbox.sh -p $pid -P $2 -a chaosblade 2>&1
@@ -76,14 +74,12 @@ func active(uid, port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids=chaosblade")
 	result, err, code := util.Curl(url)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code != 200 {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo+" ,code: %d", url, result, code))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	return spec.ReturnSuccess("success")
 }
@@ -92,18 +88,16 @@ func active(uid, port string) *spec.Response {
 func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
 	username, err := getUsername(pid)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].ErrInfo, pid, err.Error()))
-		return spec.ResponseFailWaitResult(spec.ProcessGetUsernameFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].ErrInfo, pid, err.Error())), ""
+		util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(pid, err))
+		return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, pid, err), ""
 	}
 	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, pid, getJavaCommandLine)
 	toolsJar := getToolJar(javaHome)
 	logrus.Debugf("javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
 	token, err := getSandboxToken(ctx)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.SandboxCreateTokenFailed].ErrInfo, err.Error()))
-		return spec.ResponseFailWaitResult(spec.SandboxCreateTokenFailed, fmt.Sprintf(spec.ResponseErr[spec.SandboxCreateTokenFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.SandboxCreateTokenFailed].ErrInfo, err.Error())), username
+		util.Errorf(uid, util.GetRunFuncName(), spec.SandboxCreateTokenFailed.Sprintf(err))
+		return spec.ResponseFailWithFlags(spec.SandboxCreateTokenFailed, err), username
 	}
 	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid)
 	currUser, err := osuser.Current()
@@ -128,9 +122,8 @@ func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.
 	response = cl.Run(ctx, "", osCmd)
 	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.OsCmdExecFailed].ErrInfo, osCmd, response.Err))
-		return spec.ResponseFailWaitResult(spec.OsCmdExecFailed, fmt.Sprintf(spec.ResponseErr[spec.OsCmdExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.OsCmdExecFailed].ErrInfo, osCmd, response.Err)), username
+		util.Errorf(uid, util.GetRunFuncName(), spec.OsCmdExecFailed.Sprintf(osCmd, response.Err))
+		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, osCmd, response.Err), username
 	}
 	return response, username
 }
@@ -265,14 +258,12 @@ func shutdown(uid, port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-control/shutdown", "")
 	result, err, code := util.Curl(url)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code != 200 {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo+" ,code: %d", url, result, code))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	return spec.ReturnSuccess("success")
 }

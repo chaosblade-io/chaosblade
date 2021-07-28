@@ -51,12 +51,10 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 	uid := args[0]
 	record, err := GetDS().QueryPreparationByUid(uid)
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.DatabaseError],
-			fmt.Sprintf("query record err, %s", err.Error()))
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil {
-		return spec.ReturnFail(spec.Code[spec.DataNotFound],
-			fmt.Sprintf("the uid record not found"))
+		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	if record.Status == Revoked {
 		rc.command.Println(spec.ReturnSuccess("success").Print())
@@ -73,8 +71,7 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		args := fmt.Sprintf("delete ns chaosblade")
 		response = channel.Run(context.Background(), "kubectl", args)
 	default:
-		return spec.ReturnFail(spec.Code[spec.IllegalParameters],
-			fmt.Sprintf("not support the %s type", record.ProgramType))
+		return spec.ResponseFailWithFlags(spec.ParameterIllegal, "type", record.ProgramType, "not support the type")
 	}
 	if response.Success {
 		checkError(GetDS().UpdatePreparationRecordByUid(uid, Revoked, ""))

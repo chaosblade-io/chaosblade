@@ -92,7 +92,7 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 		}
 	default:
 		if uid == "" {
-			return spec.ReturnFail(spec.Code[spec.IllegalCommand], "must specify the right type or uid")
+			return spec.ResponseFailWithFlags(spec.ParameterLess, "type|uid", "must specify the right type or uid")
 		}
 		result, err = GetDS().QueryExperimentModelByUid(uid)
 		if util.IsNil(result) || err != nil {
@@ -100,10 +100,10 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 		}
 	}
 	if err != nil {
-		return spec.ReturnFail(spec.Code[spec.DatabaseError], err.Error())
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if util.IsNil(result) {
-		return spec.Return(spec.Code[spec.DataNotFound], false)
+		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	response := spec.ReturnSuccess(result)
 

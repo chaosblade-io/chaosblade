@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -48,8 +47,7 @@ func (pc *PrepareCommand) Init() {
 		Short:   "Prepare to experiment",
 		Long:    "Prepare to experiment, for example, attach agent to java process or deploy agent to kubernetes cluster.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spec.ReturnFail(spec.Code[spec.IllegalCommand],
-				fmt.Sprintf("less command type to prepare"))
+			return spec.ResponseFailWithFlags(spec.CommandIllegal, "less command type to prepare")
 		},
 		Example: pc.prepareExample(),
 	}
