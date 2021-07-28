@@ -17,8 +17,6 @@
 package cmd
 
 import (
-	"fmt"
-
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
 )
@@ -35,8 +33,7 @@ func (dc *CheckCommand) Init() {
 		Short:   "Check the environment for chaosblade",
 		Long:    "Check the environment for chaosblade",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return spec.ReturnFail(spec.Code[spec.IllegalCommand],
-				fmt.Sprintf("less TARGE to check"))
+			return spec.ResponseFailWithFlags(spec.CommandIllegal, "less target command")
 		},
 		Example: dc.detectExample(),
 	}

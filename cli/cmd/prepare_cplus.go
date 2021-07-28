@@ -17,7 +17,6 @@
 package cmd
 
 import (
-	"fmt"
 	"strconv"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
@@ -57,16 +56,14 @@ func (pc *PrepareCPlusCommand) prepareCPlus() error {
 	portStr := strconv.Itoa(pc.port)
 	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareCPlusType, portStr, "")
 	if err != nil {
-		util.Errorf("", util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "query running by type and process", err.Error()))
-		return spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, ""),
-			fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "query running by type and process", err.Error()))
+		util.Errorf("", util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil || record.Status != Running {
 		record, err = insertPrepareRecord(PrepareCPlusType, portStr, portStr, "")
 		if err != nil {
-			util.Errorf("", util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, ""))
-			return spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].Err, ""),
-				fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "insert prepare recode", err.Error()))
+			util.Errorf("", util.GetRunFuncName(), spec.DatabaseError.Sprintf("insert", err))
+			return spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err)
 		}
 	}
 	response := cplus.Prepare(record.Uid, portStr, pc.ip)

@@ -63,27 +63,25 @@ var cli client.Client
 func QueryStatus(operation, uid, kubeconfig string) (*spec.Response, bool) {
 	client, err := getClient(kubeconfig)
 	if err != nil {
-		errMsg := fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].ErrInfo, "getClient", err.Error())
+		errMsg := spec.K8sExecFailed.Sprintf("getClient", err)
 		util.Errorf(uid, util.GetRunFuncName(), errMsg)
-		return spec.ResponseFailWaitResult(spec.K8sExecFailed, fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].Err, uid),
-			CreateConfirmFailedStatusResult(uid, errMsg)), true
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg),
+			"getClient", err), true
 	}
 	chaosblade, err := get(client, uid)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") && QueryDestroy == operation {
 			return spec.ReturnSuccess(CreateConfirmDestroyedStatusResult(uid)), true
 		}
-		errMsg := fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].ErrInfo, "getClient", err.Error())
+		errMsg := spec.K8sExecFailed.Sprintf("getClient", err)
 		util.Errorf(uid, util.GetRunFuncName(), errMsg)
-		return spec.ResponseFailWaitResult(spec.K8sExecFailed, fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].Err, uid),
-			CreateConfirmFailedStatusResult(uid, errMsg)), true
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "getClient", err), true
 	}
 
 	if chaosblade == nil && operation != QueryDestroy {
 		errMsg := "the experiment not found"
 		util.Errorf(uid, util.GetRunFuncName(), errMsg)
-		return spec.ResponseFailWaitResult(spec.K8sExecFailed, fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].Err, uid),
-			CreateConfirmFailedStatusResult(uid, errMsg)), true
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "get", errMsg), true
 	}
 
 	if chaosblade.Status.Phase == v1alpha1.ClusterPhaseRunning {
@@ -91,33 +89,35 @@ func QueryStatus(operation, uid, kubeconfig string) (*spec.Response, bool) {
 			statusResult := CreateStatusResult(uid, true, "", chaosblade.Status.ExpStatuses)
 			return spec.ReturnSuccess(statusResult), completed(operation, statusResult)
 		}
-		errMsg := fmt.Sprintf(spec.ResponseErr[spec.UnexpectedStatus].ErrInfo, "destroyed", chaosblade.Status.Phase)
+		errMsg := spec.UnexpectedStatus.Sprintf("destroyed", chaosblade.Status.Phase)
 		statusResult := CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses)
 		util.Errorf(uid, util.GetRunFuncName(), errMsg)
-		return spec.ResponseFailWaitResult(spec.UnexpectedStatus, errMsg, statusResult), completed(operation, statusResult)
+		return spec.ResponseFailWithFlags(spec.UnexpectedStatus, statusResult, "running", chaosblade.Status.Phase),
+			completed(operation, statusResult)
 	}
 	if chaosblade.Status.Phase == v1alpha1.ClusterPhaseDestroyed {
 		if operation == QueryCreate {
-			errMsg := fmt.Sprintf(spec.ResponseErr[spec.UnexpectedStatus].ErrInfo, "running", chaosblade.Status.Phase)
+			errMsg := spec.UnexpectedStatus.Sprintf("running", chaosblade.Status.Phase)
 			statusResult := CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses)
 			util.Errorf(uid, util.GetRunFuncName(), errMsg)
-			return spec.ResponseFailWaitResult(spec.UnexpectedStatus, errMsg, statusResult), completed(operation, statusResult)
+			return spec.ResponseFailWithFlags(spec.UnexpectedStatus, statusResult, "running", chaosblade.Status.Phase),
+				completed(operation, statusResult)
 		}
 		statusResult := CreateStatusResult(uid, true, "", chaosblade.Status.ExpStatuses)
 		return spec.ReturnSuccess(statusResult), completed(operation, statusResult)
 	}
 
-	errMsg := fmt.Sprintf(spec.ResponseErr[spec.UnexpectedStatus].ErrInfo, operation, chaosblade.Status.Phase)
-	statusResult := CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses)
+	statusResult := CreateStatusResult(uid, false, spec.UnexpectedStatus.Sprintf(operation, chaosblade.Status.Phase),
+		chaosblade.Status.ExpStatuses)
 	util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf("chaosblade result: %v", chaosblade.Status.ExpStatuses))
-
 	if len(statusResult.Statuses) > 0 {
 		statuses := statusResult.Statuses
 		if statuses[0].Code > 0 {
-			return spec.ResponseFailWaitResult(statuses[0].Code, statusResult.Error, statusResult), completed(operation, statusResult)
+			return spec.ResponseFail(statuses[0].Code, statusResult.Error, statusResult), completed(operation, statusResult)
 		}
 	}
-	return spec.ResponseFailWaitResult(spec.K8sExecFailed, errMsg, statusResult), completed(operation, statusResult)
+	return spec.ResponseFailWithFlags(spec.UnexpectedStatus, statusResult, operation, chaosblade.Status.Phase),
+		completed(operation, statusResult)
 }
 
 func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel) *spec.Response {
@@ -129,19 +129,18 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 	}
 	client, err := getClient(config)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].ErrInfo, "getClient", err.Error()))
-		return spec.ResponseFailWaitResult(spec.K8sExecFailed, fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].Err, uid),
-			CreateConfirmFailedStatusResult(uid, fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].ErrInfo, "getClient", err.Error())))
+		util.Errorf(uid, util.GetRunFuncName(), spec.K8sExecFailed.Sprintf("getClient", err))
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, "getClient", err)
 	}
-
 	var response *spec.Response
 	var completed bool
 	var operation string
 	if suid, ok := spec.IsDestroy(ctx); ok {
 		if suid == spec.UnknownUid {
-			errMsg := fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalid].ErrInfo, "suid")
-			util.Errorf(uid, util.GetRunFuncName(), errMsg+fmt.Sprintf(", `%s` does not support destroy k8s experiments without uid", suid))
-			return spec.ResponseFailWaitResult(spec.ParameterInvalid, errMsg, CreateConfirmFailedStatusResult(uid, errMsg))
+			util.Errorf(uid, util.GetRunFuncName(),
+				spec.ParameterInvalid.Sprintf("suid", spec.UnknownUid, "not support destroy k8s experiments without uid"))
+			return spec.ResponseFailWithFlags(spec.ParameterInvalid, "suid", spec.UnknownUid,
+				"not support destroy k8s experiments without uid")
 		}
 		operation = QueryDestroy
 		response, completed = e.destroy(client, suid, config)
@@ -184,9 +183,9 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 func (*Executor) destroy(cli client.Client, uid string, config string) (*spec.Response, bool) {
 	err := delete(cli, uid)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].ErrInfo, "delete", err.Error()))
-		return spec.ResponseFailWaitResult(spec.K8sExecFailed, fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].Err, uid),
-			CreateStatusResult(uid, false, fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].ErrInfo, "delete", err.Error()), nil)), true
+		errMsg := spec.K8sExecFailed.Sprintf("delete", err)
+		util.Errorf(uid, util.GetRunFuncName(), errMsg)
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "delete", err), true
 	}
 	// 查询资源
 	return QueryStatus(QueryDestroy, uid, config)
@@ -199,10 +198,9 @@ func (e *Executor) create(cli client.Client, kubeconfig string, uid string, expM
 	var err error
 	resource, err := create(cli, &chaosBladeObj)
 	if err != nil {
-		errMsg := fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].ErrInfo, "create", err.Error())
+		errMsg := spec.K8sExecFailed.Sprintf("create", err)
 		util.Errorf(uid, util.GetRunFuncName(), errMsg)
-		return spec.ResponseFailWaitResult(spec.K8sExecFailed, fmt.Sprintf(spec.ResponseErr[spec.K8sExecFailed].Err, uid),
-			CreateConfirmFailedStatusResult(uid, errMsg)), true
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "create", err), true
 	}
 	if resource.Status.Phase == v1alpha1.ClusterPhaseRunning {
 		return spec.ReturnSuccess(CreateStatusResult(uid, true, "", resource.Status.ExpStatuses)), true
@@ -224,10 +222,10 @@ func (e *Executor) checkCreateStatus(uid string, store cache.Store, cli client.C
 	if chaosblade.Status.Phase == v1alpha1.ClusterPhaseRunning {
 		return spec.ReturnSuccess(CreateStatusResult(uid, true, "", chaosblade.Status.ExpStatuses))
 	}
-
-	errMsg := fmt.Sprintf(spec.ResponseErr[spec.UnexpectedStatus].ErrInfo, "Running", chaosblade.Status.Phase)
+	errMsg := spec.UnexpectedStatus.Sprintf("running", chaosblade.Status.Phase)
 	util.Errorf(uid, util.GetRunFuncName(), errMsg)
-	return spec.ResponseFailWaitResult(spec.UnexpectedStatus, errMsg, CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses))
+	return spec.ResponseFailWithFlags(spec.UnexpectedStatus, CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses),
+		"running", chaosblade.Status.Phase)
 }
 
 type StatusResult struct {

@@ -55,22 +55,19 @@ func preCheck(uid, port string) *spec.Response {
 	}
 	// check chaosblade-exec-cplus.jar file exists or not
 	if !util.IsExist(cplusBinPath) {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].ErrInfo, cplusBinPath))
-		return spec.ResponseFailWaitResult(spec.ChaosbladeFileNotFound, fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].Err, cplusBinPath),
-			fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].ErrInfo, cplusBinPath))
+		util.Errorf(uid, util.GetRunFuncName(), spec.ChaosbladeFileNotFound.Sprintf(cplusBinPath))
+		return spec.ResponseFailWithFlags(spec.ChaosbladeFileNotFound, cplusBinPath)
 	}
 	// check script file
 	if !util.IsExist(scriptDefaultPath) {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].ErrInfo, scriptDefaultPath))
-		return spec.ResponseFailWaitResult(spec.ChaosbladeFileNotFound, fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].Err, scriptDefaultPath),
-			fmt.Sprintf(spec.ResponseErr[spec.ChaosbladeFileNotFound].ErrInfo, scriptDefaultPath))
+		util.Errorf(uid, util.GetRunFuncName(), spec.ChaosbladeFileNotFound.Sprintf(scriptDefaultPath))
+		return spec.ResponseFailWithFlags(spec.ChaosbladeFileNotFound, scriptDefaultPath)
 	}
 	// check the port has been used or not
 	portInUse := util.CheckPortInUse(port)
 	if portInUse {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalid].ErrInfo+" ,%s is in use", "port", port))
-		return spec.ResponseFailWaitResult(spec.ParameterInvalid, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalid].Err, "port"),
-			fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalid].ErrInfo, "port"))
+		util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalid.Sprintf("port", port, "the port has been used"))
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, port, "the port has been used")
 	}
 	return spec.ReturnSuccess("success")
 }
@@ -96,9 +93,8 @@ func postCheck(uid, port string) *spec.Response {
 	url := getProxyServiceUrl(port, "status")
 	result, err, _ := util.Curl(url)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	return spec.ReturnSuccess(result)
 }
@@ -109,17 +105,14 @@ func Revoke(uid, port string) *spec.Response {
 	if !processExists(port) {
 		return spec.ReturnSuccess("process not exists")
 	}
-
 	// Get http://127.0.0.1:xxx/remove: EOF, doesn't to check the result
 	util.Curl(getProxyServiceUrl(port, RemoveAction))
-
 	time.Sleep(time.Second)
 	ctx := context.WithValue(context.Background(), channel.ExcludeProcessKey, "blade")
 	pids, err := channel.NewLocalChannel().GetPidsByProcessName(ApplicationName, ctx)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].ErrInfo, ApplicationName, err.Error()))
-		return spec.ResponseFailWaitResult(spec.ProcessIdByNameFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].ErrInfo, ApplicationName, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.ProcessIdByNameFailed.Sprintf(ApplicationName, err))
+		return spec.ResponseFailWithFlags(spec.ProcessIdByNameFailed, ApplicationName, err)
 	}
 	if len(pids) > 0 {
 		response := channel.NewLocalChannel().Run(context.Background(), "kill", fmt.Sprintf("-9 %s", strings.Join(pids, " ")))
@@ -130,9 +123,7 @@ func Revoke(uid, port string) *spec.Response {
 	// revoke failed if the check operation returns success
 	response := postCheck(uid, port)
 	if response.Success {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, getProxyServiceUrl(port, RemoveAction), "process still exists"))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, getProxyServiceUrl(port, RemoveAction), "process still exists"))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(getProxyServiceUrl(port, RemoveAction), "process exists"))
 	}
 	return spec.ReturnSuccess("success")
 }

@@ -68,11 +68,10 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	suid, isDestroy := spec.IsDestroy(ctx)
 	record, err := e.getRecordFromDB(uid, processName, processId)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo,
+		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("get",
 			fmt.Sprintf("where by processName:%s or pid%s", processName, processId), err.Error()))
-		return spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo,
-				fmt.Sprintf("where by processName:%s or pid%s", processName, processId), err.Error()))
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "get",
+			fmt.Sprintf("where by processName:%s or pid%s", processName, processId), err.Error())
 	}
 	var port, pid string
 	if record != nil {
@@ -85,12 +84,10 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		if port == "" {
 			if suid == spec.UnknownUid {
 				if processName == "" && processId == "" {
-					util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
-					return spec.ResponseFailWaitResult(spec.ParameterLess, fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].Err, "process&pid"),
-						fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
+					util.Errorf(uid, util.GetRunFuncName(), spec.ParameterLess.Sprintf("process|pid"))
+					return spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 				}
 			}
-
 			if processName == "" && processId == "" {
 				return spec.ReturnSuccess(fmt.Sprintf("no prepare record, uid: %s", suid))
 			}
@@ -100,9 +97,8 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 			}
 			username, err := getUsername(processId)
 			if err != nil {
-				util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].ErrInfo, processId, err.Error()))
-				return spec.ResponseFailWaitResult(spec.ProcessGetUsernameFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].Err, uid),
-					fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].ErrInfo, processId, err.Error()))
+				util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(processId, err))
+				return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, processId, err)
 			}
 			// get port from sandbox.token
 			port, err = getPortFromSandboxToken(username)
@@ -114,9 +110,8 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		if port == "" || err != nil {
 			logrus.Warn(fmt.Sprintf("select record fail, uid: %s, err: %v", uid, err))
 			if processName == "" && processId == "" {
-				util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
-				return spec.ResponseFailWaitResult(spec.ParameterLess, fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].Err, "process&pid"),
-					fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process&pid"))
+				util.Errorf(uid, util.GetRunFuncName(), spec.ParameterLess.Sprintf("process|pid"))
+				return spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 			}
 		}
 		if refresh {
@@ -164,24 +159,20 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		result, err, code = util.PostCurl(url, body, "")
 	}
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code == 200 {
 		var resp spec.Response
 		err := json.Unmarshal([]byte(result), &resp)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].ErrInfo, result, err.Error()))
-			return spec.ResponseFailWaitResult(spec.ResultUnmarshalFailed, fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].Err),
-				fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].ErrInfo, result, err.Error()))
+			util.Errorf(uid, util.GetRunFuncName(), spec.ResultUnmarshalFailed.Sprintf(result, err))
+			return spec.ResponseFailWithFlags(spec.ResultUnmarshalFailed, result, err)
 		}
 		return &resp
 	}
-
-	util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo+" ,code: %d", url, result, code))
-	return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-		fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
+	util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+	return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 }
 
 func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) (string, []byte, *spec.Response) {
@@ -204,9 +195,8 @@ func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) (string, [
 	// encode
 	bytes, err := json.Marshal(bodyMap)
 	if err != nil {
-		util.Warnf(suid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ResultMarshalFailed].ErrInfo, bodyMap, err.Error()))
-		return "", nil, spec.ResponseFailWaitResult(spec.ResultMarshalFailed, spec.ResponseErr[spec.ResultMarshalFailed].Err,
-			fmt.Sprintf(spec.ResponseErr[spec.ResultMarshalFailed].ErrInfo, bodyMap, err.Error()))
+		util.Warnf(suid, util.GetRunFuncName(), spec.ResultMarshalFailed.Sprintf(bodyMap, err))
+		return "", nil, spec.ResponseFailWithFlags(spec.ResultMarshalFailed, bodyMap, err)
 	}
 	return url, bytes, nil
 }
@@ -230,48 +220,40 @@ func (e *Executor) getStatusRequestPath(uid string) string {
 func (e *Executor) QueryStatus(uid string) *spec.Response {
 	experimentModel, err := db.QueryExperimentModelByUid(uid)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "where query model by uid", err.Error()))
-		return spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "where query model by uid", err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if experimentModel == nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidDbQuery].ErrInfo, "uid"))
-		return spec.ResponseFailWaitResult(spec.ParameterInvalidDbQuery, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidDbQuery].Err, "uid"),
-			fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidDbQuery].Err, "uid"))
+		util.Errorf(uid, util.GetRunFuncName(), spec.DataNotFound.Sprintf(uid))
+		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	// get process flag
 	process := getProcessFlagFromExpRecord(experimentModel)
 	record, err := e.getRecordFromDB(uid, process, "")
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "where query model by uid", err.Error()))
-		return spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "where query recode by uid", err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
+		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidDbQuery].ErrInfo, "uid"))
-		return spec.ResponseFailWaitResult(spec.ParameterInvalidDbQuery, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidDbQuery].Err, "uid"),
-			fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidDbQuery].ErrInfo, "uid"))
+		util.Errorf(uid, util.GetRunFuncName(), spec.DataNotFound.Sprintf(uid))
+		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	port := record.Port
 	url := e.sandboxUrl(port, e.getStatusRequestPath(uid))
 	result, err, code := util.Curl(url)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
-
 	if code != 200 {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
-		return spec.ResponseFailWaitResult(spec.HttpExecFailed, fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].Err, uid),
-			fmt.Sprintf(spec.ResponseErr[spec.HttpExecFailed].ErrInfo, url, result))
+		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	var resp spec.Response
 	err = json.Unmarshal([]byte(result), &resp)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].ErrInfo, result, err.Error()))
-		return spec.ResponseFailWaitResult(spec.ResultUnmarshalFailed, fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].Err),
-			fmt.Sprintf(spec.ResponseErr[spec.ResultUnmarshalFailed].ErrInfo, result, err.Error()))
+		util.Errorf(uid, util.GetRunFuncName(), spec.ResultUnmarshalFailed.Sprintf(result, err))
+		return spec.ResponseFailWithFlags(spec.ResultUnmarshalFailed, result, err)
 	}
 	return &resp
 }
@@ -319,20 +301,17 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 	cl := channel.NewLocalChannel()
 	if processName == "" {
 		if processId == "" {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process|pid"))
-			return "", spec.ResponseFailWaitResult(spec.ParameterLess, fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].Err, "process|pid"),
-				fmt.Sprintf(spec.ResponseErr[spec.ParameterLess].ErrInfo, "process|pid"))
+			util.Errorf(uid, util.GetRunFuncName(), spec.ParameterLess.Sprintf("process|pid"))
+			return "", spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 		}
 		exists, err := cl.ProcessExists(processId)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessJudgeExistFailed].ErrInfo, processId, err.Error()))
-			return "", spec.ResponseFailWaitResult(spec.ProcessJudgeExistFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessJudgeExistFailed].Err, uid),
-				fmt.Sprintf(spec.ResponseErr[spec.ProcessJudgeExistFailed].ErrInfo, processId, err.Error()))
+			util.Errorf(uid, util.GetRunFuncName(), spec.ProcessJudgeExistFailed.Sprintf(processId, err))
+			return "", spec.ResponseFailWithFlags(spec.ProcessJudgeExistFailed, processId, err)
 		}
 		if !exists {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProName].ErrInfo, "pid", processId))
-			return "", spec.ResponseFailWaitResult(spec.ParameterInvalidProName, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProName].Err, "pid", processId),
-				fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProName].ErrInfo, "pid", processId))
+			util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProName.Sprintf("pid", processId))
+			return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProName, "pid", processId)
 		}
 	}
 	if processName != "" {
@@ -342,28 +321,24 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 		ctx = context.WithValue(ctx, channel.ExcludeProcessKey, "blade")
 		pids, err := cl.GetPidsByProcessName(processName, ctx)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].ErrInfo, processName, err.Error()))
-			return "", spec.ResponseFailWaitResult(spec.ProcessIdByNameFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].Err, uid),
-				fmt.Sprintf(spec.ResponseErr[spec.ProcessIdByNameFailed].ErrInfo, processName, err.Error()))
+			util.Errorf(uid, util.GetRunFuncName(), spec.ProcessIdByNameFailed.Sprintf(processName, err))
+			return "", spec.ResponseFailWithFlags(spec.ProcessIdByNameFailed, processName, err)
 		}
 		if pids == nil || len(pids) == 0 {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProName].ErrInfo, "process", processName))
-			return "", spec.ResponseFailWaitResult(spec.ParameterInvalidProName, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProName].Err, "process", processName),
-				fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProName].ErrInfo, "process", processName))
+			util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProName.Sprintf("process", processName))
+			return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProName, "process", processName)
 		}
 		if len(pids) == 1 {
 			if processId == "" {
 				processId = pids[0]
 			} else if processId != pids[0] {
-				util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].ErrInfo, processName, processId))
-				return "", spec.ResponseFailWaitResult(spec.ParameterInvalidProIdNotByName, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].Err, processName, processId),
-					fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].ErrInfo, processName, processId))
+				util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
+				return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProIdNotByName, processName, processId)
 			}
 		} else {
 			if processId == "" {
-				util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].ErrInfo, processName, processId))
-				return "", spec.ResponseFailWaitResult(spec.ParameterInvalidProIdNotByName, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].Err, processName, processId),
-					fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].ErrInfo, processName, processId))
+				util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
+				return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProIdNotByName, processName, processId)
 			} else {
 				var contains bool
 				for _, p := range pids {
@@ -373,9 +348,8 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 					}
 				}
 				if !contains {
-					util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].ErrInfo, processName, processId))
-					return "", spec.ResponseFailWaitResult(spec.ParameterInvalidProIdNotByName, fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].Err, processName, processId),
-						fmt.Sprintf(spec.ResponseErr[spec.ParameterInvalidProIdNotByName].ErrInfo, processName, processId))
+					util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
+					return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProIdNotByName, processName, processId)
 				}
 			}
 		}
@@ -393,15 +367,13 @@ func Prepare(uid, processName, processId string) (response *spec.Response, port 
 		// get port from local port
 		port, err = getAndCacheSandboxPort()
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.SandboxGetPortFailed].ErrInfo, err.Error()))
-			return spec.ResponseFailWaitResult(spec.SandboxGetPortFailed, fmt.Sprintf(spec.ResponseErr[spec.SandboxGetPortFailed].ErrInfo, uid),
-				fmt.Sprintf(spec.ResponseErr[spec.SandboxGetPortFailed].ErrInfo, err.Error())), port
+			util.Errorf(uid, util.GetRunFuncName(), spec.SandboxGetPortFailed.Sprintf(err))
+			return spec.ResponseFailWithFlags(spec.SandboxGetPortFailed, err), port
 		}
 		record, err = insertPrepareRecord("jvm", processName, port, processId)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, err.Error()))
-			return spec.ResponseFailWaitResult(spec.DbQueryFailed, fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].Err, uid),
-				fmt.Sprintf(spec.ResponseErr[spec.DbQueryFailed].ErrInfo, "insert prepare recode", err.Error())), port
+			util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("insert", err))
+			return spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err), port
 		}
 	}
 	var username string
@@ -440,9 +412,8 @@ func Revoke(uid string, record *data.PreparationRecord, processName, processId s
 		}
 		username, err := getUsername(processId)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].ErrInfo, processId, err.Error()))
-			return spec.ResponseFailWaitResult(spec.ProcessGetUsernameFailed, fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].Err, uid),
-				fmt.Sprintf(spec.ResponseErr[spec.ProcessGetUsernameFailed].ErrInfo, processId, err.Error()))
+			util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(processId, err))
+			return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, processId, err)
 		}
 		// get port from sandbox.token
 		port, err = getPortFromSandboxToken(username)

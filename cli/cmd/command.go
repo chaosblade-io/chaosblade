@@ -73,12 +73,14 @@ func SetDS(source data.SourceI) {
 }
 
 // recordExpModel
-func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpModel) (commandModel *data.ExperimentModel, err error) {
+func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpModel) (commandModel *data.ExperimentModel,
+	response *spec.Response) {
 	uid := expModel.ActionFlags[UidFlag]
+	var err error
 	if uid == "" {
 		uid, err = bc.generateUid()
 		if err != nil {
-			return nil, err
+			return nil, spec.ResponseFailWithFlags(spec.GenerateUidFailed, err)
 		}
 	}
 
@@ -88,7 +90,7 @@ func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpMode
 	time := time.Now().Format(time.RFC3339Nano)
 	command, subCommand, err := parseCommandPath(commandPath)
 	if err != nil {
-		return nil, err
+		return nil, spec.ResponseFailWithFlags(spec.CommandIllegal, err)
 	}
 	commandModel = &data.ExperimentModel{
 		Uid:        uid,
@@ -102,9 +104,9 @@ func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpMode
 	}
 	err = GetDS().InsertExperimentModel(commandModel)
 	if err != nil {
-		return nil, err
+		return nil, spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err)
 	}
-	return commandModel, nil
+	return commandModel, spec.Success()
 }
 
 func parseCommandPath(commandPath string) (string, string, error) {
