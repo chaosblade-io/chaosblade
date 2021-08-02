@@ -63,6 +63,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	processId := model.ActionFlags["pid"]
 	// refresh flag is used to reload java agent
 	refresh := model.ActionFlags["refresh"] == "true"
+	javaHome := model.ActionFlags["javaHome"]
 
 	// 2. get record from db by processname|processId
 	suid, isDestroy := spec.IsDestroy(ctx)
@@ -132,7 +133,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		// Install java agent
 		if port == "" || refresh {
 			logrus.Info("Install java agent")
-			response, newPort := Prepare(uid, processName, processId)
+			response, newPort := Prepare(uid, processName, processId, javaHome)
 			if !response.Success {
 				return response
 			}
@@ -357,7 +358,7 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 	return processId, spec.ReturnSuccess("success")
 }
 
-func Prepare(uid, processName, processId string) (response *spec.Response, port string) {
+func Prepare(uid, processName, processId, javaHome string) (response *spec.Response, port string) {
 	processId, response = CheckFlagValues(uid, processName, processId)
 	if !response.Success {
 		return
@@ -378,7 +379,7 @@ func Prepare(uid, processName, processId string) (response *spec.Response, port 
 	}
 	var username string
 	port = record.Port
-	response, username = Attach(uid, port, "", processId)
+	response, username = Attach(uid, port, javaHome, processId)
 	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err = CheckPortFromSandboxToken(username)
