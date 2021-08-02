@@ -93,7 +93,7 @@ func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.
 	}
 	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, pid, getJavaCommandLine)
 	toolsJar := getToolJar(javaHome)
-	logrus.Debugf("javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
+	logrus.Infof("javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
 	token, err := getSandboxToken(ctx)
 	if err != nil {
 		util.Errorf(uid, util.GetRunFuncName(), spec.SandboxCreateTokenFailed.Sprintf(err))
@@ -109,7 +109,7 @@ func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.
 		response = cl.Run(ctx, javaBin, javaArgs)
 	} else {
 		if currUser != nil {
-			logrus.Debugf("current user name is %s, not equal %s, so use sudo command to execute",
+			logrus.Infof("current user name is %s, not equal %s, so use sudo command to execute",
 				currUser.Username, username)
 		}
 		response = cl.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", username, javaBin, javaArgs))
