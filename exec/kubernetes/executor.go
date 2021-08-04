@@ -92,7 +92,7 @@ func QueryStatus(operation, uid, kubeconfig string) (*spec.Response, bool) {
 		errMsg := spec.UnexpectedStatus.Sprintf("destroyed", chaosblade.Status.Phase)
 		statusResult := CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses)
 		util.Errorf(uid, util.GetRunFuncName(), errMsg)
-		return spec.ResponseFailWithFlags(spec.UnexpectedStatus, statusResult, "running", chaosblade.Status.Phase),
+		return spec.ResponseFailWithResult(spec.UnexpectedStatus, statusResult, "running", chaosblade.Status.Phase),
 			completed(operation, statusResult)
 	}
 	if chaosblade.Status.Phase == v1alpha1.ClusterPhaseDestroyed {
@@ -100,7 +100,7 @@ func QueryStatus(operation, uid, kubeconfig string) (*spec.Response, bool) {
 			errMsg := spec.UnexpectedStatus.Sprintf("running", chaosblade.Status.Phase)
 			statusResult := CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses)
 			util.Errorf(uid, util.GetRunFuncName(), errMsg)
-			return spec.ResponseFailWithFlags(spec.UnexpectedStatus, statusResult, "running", chaosblade.Status.Phase),
+			return spec.ResponseFailWithResult(spec.UnexpectedStatus, statusResult, "running", chaosblade.Status.Phase),
 				completed(operation, statusResult)
 		}
 		statusResult := CreateStatusResult(uid, true, "", chaosblade.Status.ExpStatuses)
@@ -116,7 +116,7 @@ func QueryStatus(operation, uid, kubeconfig string) (*spec.Response, bool) {
 			return spec.ResponseFail(statuses[0].Code, statusResult.Error, statusResult), completed(operation, statusResult)
 		}
 	}
-	return spec.ResponseFailWithFlags(spec.UnexpectedStatus, statusResult, operation, chaosblade.Status.Phase),
+	return spec.ResponseFailWithResult(spec.UnexpectedStatus, statusResult, operation, chaosblade.Status.Phase),
 		completed(operation, statusResult)
 }
 
@@ -185,7 +185,7 @@ func (*Executor) destroy(cli client.Client, uid string, config string) (*spec.Re
 	if err != nil {
 		errMsg := spec.K8sExecFailed.Sprintf("delete", err)
 		util.Errorf(uid, util.GetRunFuncName(), errMsg)
-		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "delete", err), true
+		return spec.ResponseFailWithResult(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "delete", err), true
 	}
 	// 查询资源
 	return QueryStatus(QueryDestroy, uid, config)
@@ -200,7 +200,7 @@ func (e *Executor) create(cli client.Client, kubeconfig string, uid string, expM
 	if err != nil {
 		errMsg := spec.K8sExecFailed.Sprintf("create", err)
 		util.Errorf(uid, util.GetRunFuncName(), errMsg)
-		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "create", err), true
+		return spec.ResponseFailWithResult(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "create", err), true
 	}
 	if resource.Status.Phase == v1alpha1.ClusterPhaseRunning {
 		return spec.ReturnSuccess(CreateStatusResult(uid, true, "", resource.Status.ExpStatuses)), true
@@ -224,7 +224,7 @@ func (e *Executor) checkCreateStatus(uid string, store cache.Store, cli client.C
 	}
 	errMsg := spec.UnexpectedStatus.Sprintf("running", chaosblade.Status.Phase)
 	util.Errorf(uid, util.GetRunFuncName(), errMsg)
-	return spec.ResponseFailWithFlags(spec.UnexpectedStatus, CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses),
+	return spec.ResponseFailWithResult(spec.UnexpectedStatus, CreateStatusResult(uid, false, errMsg, chaosblade.Status.ExpStatuses),
 		"running", chaosblade.Status.Phase)
 }
 

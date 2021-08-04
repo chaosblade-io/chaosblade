@@ -43,19 +43,19 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=1.3.0-dev
+BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-docker
 BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
-BLADE_EXEC_DOCKER_BRANCH=1.3.0-dev
+BLADE_EXEC_DOCKER_BRANCH=master
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=1.3.0-dev
+BLADE_OPERATOR_BRANCH=master
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=v1.3.0-dev
+BLADE_EXEC_JVM_BRANCH=master
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
