@@ -403,6 +403,7 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 				response.Success = false
 				response.Err = fmt.Sprintf("[failed] %s, failed! `%s` command not install", checkStr, failedCmd)
 			} else {
+				response.Code = spec.OK.Code
 				response.Success = true
 				response.Result = fmt.Sprintf("[success] %s, success! `%s` command exists", checkStr, successCmd)
 			}
