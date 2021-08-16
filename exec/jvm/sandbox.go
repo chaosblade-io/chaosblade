@@ -104,16 +104,21 @@ func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.
 	if err != nil {
 		logrus.Warnf("get current user info failed, %v", err)
 	}
-	var response *spec.Response
+	var command string
 	if currUser != nil && (currUser.Username == username) {
-		response = cl.Run(ctx, javaBin, javaArgs)
+		command = fmt.Sprintf("%s %s", javaBin, javaArgs)
 	} else {
 		if currUser != nil {
 			logrus.Infof("current user name is %s, not equal %s, so use sudo command to execute",
 				currUser.Username, username)
 		}
-		response = cl.Run(ctx, "sudo", fmt.Sprintf("-u %s %s %s", username, javaBin, javaArgs))
+		command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
 	}
+	javaToolOptions := os.Getenv("JAVA_TOOL_OPTIONS")
+	if javaToolOptions != "" {
+		command = fmt.Sprintf("export JAVA_TOOL_OPTIONS='' && %s", command)
+	}
+	response := cl.Run(ctx, "", command)
 	if !response.Success {
 		return response, username
 	}
