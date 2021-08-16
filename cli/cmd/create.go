@@ -103,20 +103,15 @@ func (cc *CreateCommand) bindFlagsFunction() func(commandFlags map[string]func()
 func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *actionCommand, actionCommandSpec spec.ExpActionCommandSpec) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
-
 		// check timeout flag
 		tt := expModel.ActionFlags["timeout"]
-
 		if tt != "" {
-
 			//errNumber checks whether timout flag is parsable as Number
 			if _, errNumber := strconv.ParseUint(tt, 10, 64); errNumber != nil {
-
 				//err checks whether timout flag is parsable as Time
 				if _, err := time.ParseDuration(tt); err != nil {
 					return err
 				}
-
 			}
 		}
 		nohup := expModel.ActionFlags[NohupFlag] == "true"
@@ -149,8 +144,10 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			var args string
 			if scope == "host" {
 				args = fmt.Sprintf("create %s %s --uid %s --nohup=true", target, actionCommand.Name(), model.Uid)
-			} else {
+			} else if scope == "docker" {
 				args = fmt.Sprintf("create %s %s %s --uid %s --nohup=true", scope, target, actionCommand.Name(), model.Uid)
+			} else {
+				args = fmt.Sprintf("create k8s %s-%s %s --uid %s --nohup=true", scope, target, actionCommand.Name(), model.Uid)
 			}
 			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
 				if flag.Value.String() == "false" {
