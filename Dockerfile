@@ -35,7 +35,7 @@ RUN make clean && \
   mv -f ${BLADE_BUILD_PATH}/target/chaosblade-${BLADE_VERSION} /usr/local/chaosblade
 
 # Stage2
-FROM alpine:3.10.4
+FROM alpine:latest
 
 # @from https://mirrors.ustc.edu.cn/help/alpine.html
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
