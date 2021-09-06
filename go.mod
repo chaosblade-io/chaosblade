@@ -3,10 +3,10 @@ module github.com/chaosblade-io/chaosblade
 go 1.13
 
 require (
-	github.com/chaosblade-io/chaosblade-exec-docker v1.3.0
-	github.com/chaosblade-io/chaosblade-exec-os v1.3.0
-	github.com/chaosblade-io/chaosblade-operator v1.3.0
-	github.com/chaosblade-io/chaosblade-spec-go v1.3.0
+	github.com/chaosblade-io/chaosblade-exec-docker v1.3.1-0.20210906073714-7bd7d7367d76
+	github.com/chaosblade-io/chaosblade-exec-os v1.3.1-0.20210906070659-0b8e3c15c25b
+	github.com/chaosblade-io/chaosblade-operator v1.3.1-0.20210906074054-831b748528b9
+	github.com/chaosblade-io/chaosblade-spec-go v1.3.1-0.20210906070321-ae22844733f2
 	github.com/mattn/go-sqlite3 v1.10.1-0.20190217174029-ad30583d8387
 	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
 	github.com/shirou/gopsutil v3.21.6+incompatible
