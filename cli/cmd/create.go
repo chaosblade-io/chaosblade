@@ -133,7 +133,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			// update status
 			model, resp = actionCommand.recordExpModel(cmd.CommandPath(), expModel)
 		}
-		if !resp.Success {
+		if resp != nil && !resp.Success {
 			return resp
 		}
 		// is async ?
@@ -173,7 +173,13 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			executor := actionCommandSpec.Executor()
 			executor.SetChannel(channel.NewLocalChannel())
 			response := executor.Exec(model.Uid, context.Background(), expModel)
-
+			response.Result = model.Uid
+			if response.Code == spec.ReturnOKDirectly.Code {
+				// return directly
+				response.Code = spec.OK.Code
+				cmd.Println(response.Print())
+				endpointCallBack(endpoint, model.Uid, response)
+			}
 			// pass the uid, expModel to actionCommand
 			actionCommand.expModel = expModel
 			actionCommand.uid = model.Uid
