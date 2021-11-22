@@ -29,6 +29,7 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/chaosblade-io/chaosblade/exec/cplus"
+	"github.com/chaosblade-io/chaosblade/exec/cri"
 	"github.com/chaosblade-io/chaosblade/exec/docker"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
 	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
@@ -119,6 +120,8 @@ func (ec *baseExpCommandService) registerSubCommands() {
 	ec.registerCplusExpCommands()
 	// register docker command
 	ec.registerDockerExpCommands()
+	// register cri command
+	ec.registerCriExpCommands()
 	// register k8s command
 	ec.registerK8sExpCommands()
 }
@@ -216,10 +219,32 @@ func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 	return modelCommands
 }
 
+// registerCriExpCommands
+func (ec *baseExpCommandService) registerCriExpCommands() []*modelCommand {
+	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version.Ver))
+	models, err := specutil.ParseSpecsToModel(file, cri.NewExecutor())
+	if err != nil {
+		return nil
+	}
+	criSpec := cri.NewCommandModelSpec()
+	modelCommands := make([]*modelCommand, 0)
+	for idx := range models.Models {
+		model := &models.Models[idx]
+		command := ec.registerExpCommand(model, criSpec.Name())
+		modelCommands = append(modelCommands, command)
+	}
+	criCmd := ec.registerExpCommand(criSpec, "")
+	cobraCmd := criCmd.CobraCmd()
+	for _, child := range modelCommands {
+		copyAndAddCommand(cobraCmd, child.command)
+	}
+	return modelCommands
+}
+
 // registerExpCommand
 func (ec *baseExpCommandService) registerExpCommand(commandSpec spec.ExpModelCommandSpec, parentTargetCmd string) *modelCommand {
 	cmdName := commandSpec.Name()
-	if commandSpec.Scope() != "" && commandSpec.Scope() != "host" && commandSpec.Scope() != "docker" && commandSpec.Scope() != OperatorCommand {
+	if commandSpec.Scope() != "" && commandSpec.Scope() != "host" && commandSpec.Scope() != "docker" && commandSpec.Scope() != "cri" && commandSpec.Scope() != OperatorCommand {
 		cmdName = fmt.Sprintf("%s-%s", commandSpec.Scope(), commandSpec.Name())
 	}
 	cmd := &cobra.Command{
@@ -365,4 +390,5 @@ func copyAndAddCommand(parent, child *cobra.Command) {
 	for _, command := range commands {
 		copyAndAddCommand(newChild, command)
 	}
+
 }
