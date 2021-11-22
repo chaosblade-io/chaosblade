@@ -1,4 +1,4 @@
-![logo](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/doc/image/chaosblade-logo.png)  
+![logo](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/doc/image/chaosblade-logo.png)
 
 # ChaosBlade: 一个简单易用且功能强大的混沌实验实施工具
 [![Build Status](https://travis-ci.org/chaosblade-io/chaosblade.svg?branch=master)](https://travis-ci.org/chaosblade-io/chaosblade)
@@ -23,6 +23,7 @@ ChaosBlade 不仅使用简单，而且支持丰富的实验场景，场景包括
 * [chaosblade-spec-go](https://github.com/chaosblade-io/chaosblade-spec-go): 混沌实验模型 Golang 语言定义，便于使用 Golang 语言实现的场景都基于此规范便捷实现。
 * [chaosblade-exec-os](https://github.com/chaosblade-io/chaosblade-exec-os): 基础资源实验场景实现。
 * [chaosblade-exec-docker](https://github.com/chaosblade-io/chaosblade-exec-docker): Docker 容器实验场景实现，通过调用 Docker API 标准化实现。
+* [chaosblade-exec-cri](https://github.com/chaosblade-io/chaosblade-exec-cri): 容器实验场景实现，通过调用 CRI 标准化实现。
 * [chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator): Kubernetes 平台实验场景实现，将混沌实验通过 Kubernetes 标准的 CRD 方式定义，很方便的使用 Kubernetes 资源操作的方式来创建、更新、删除实验场景，包括使用 kubectl、client-go 等方式执行，而且还可以使用上述的 chaosblade cli 工具执行。
 * [chaosblade-exec-jvm](https://github.com/chaosblade-io/chaosblade-exec-jvm): Java 应用实验场景实现，使用 Java Agent 技术动态挂载，无需任何接入，零成本使用，而且支持卸载，完全回收 Agent 创建的各种资源。
 * [chaosblade-exec-cplus](https://github.com/chaosblade-io/chaosblade-exec-cplus): C++ 应用实验场景实现，使用 GDB 技术实现方法、代码行级别的实验场景注入。
@@ -37,12 +38,12 @@ chaosblade 支持 CLI 和 HTTP 两种调用方式，支持的命令如下：
 * destroy：简写是 d，销毁之前的混沌实验，比如销毁上面提到的 Dubbo 延迟实验，命令是 `blade destroy UID`
 * status：简写 s，查询准备阶段或者实验的状态，命令是 `blade status UID` 或者 `blade status --type create`
 * server：启动 web server，暴露 HTTP 服务，可以通过 HTTP 请求来调用 chaosblade。例如在目标机器xxxx上执行：`blade server start -p 9526`，执行 CPU 满载实验：`curl "http:/xxxx:9526/chaosblade?cmd=create%20cpu%20fullload"`
- 
+
 以上命令帮助均可使用 `blade help [COMMAND]` 或者 `blade [COMMAND] -h` 查看，也可查看[新手指南](https://github.com/chaosblade-io/chaosblade/wiki/%E6%96%B0%E6%89%8B%E6%8C%87%E5%8D%97)，或者上述中文使用文档，快速上手使用。
 
 ## 快速体验
-如果想不下载 chaosblade 工具包，快速体验 chaosblade，可以拉取 docker 镜像并运行，在容器内体验。  
-![demo.gif](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/release/chaosblade-demo-0.0.1.gif)  
+如果想不下载 chaosblade 工具包，快速体验 chaosblade，可以拉取 docker 镜像并运行，在容器内体验。
+![demo.gif](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/release/chaosblade-demo-0.0.1.gif)
 
 操作步骤如下：
 下载镜像：
@@ -83,7 +84,7 @@ ARGS="cli os" make build_with_linux
 ```
 
 ## 缺陷&建议
-欢迎提交缺陷、问题、建议和新功能，所有项目（包含其他子项目）的问题都可以提交到[Github Issues](https://github.com/chaosblade-io/chaosblade/issues) 
+欢迎提交缺陷、问题、建议和新功能，所有项目（包含其他子项目）的问题都可以提交到[Github Issues](https://github.com/chaosblade-io/chaosblade/issues)
 
 你也可以通过以下方式联系我们：
 * 钉钉群（推荐）：23177705

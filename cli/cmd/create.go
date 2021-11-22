@@ -63,7 +63,7 @@ func (cc *CreateCommand) Init() {
 		Example: createExample(),
 	}
 	flags := cc.command.PersistentFlags()
-	flags.StringVar(&uid, UidFlag, "", "Set Uid for the experiment, adapt to docker")
+	flags.StringVar(&uid, UidFlag, "", "Set Uid for the experiment, adapt to docker and cri")
 	flags.BoolVarP(&cc.async, AsyncFlag, "a", false, "whether to create asynchronously, default is false")
 	flags.StringVarP(&cc.endpoint, EndpointFlag, "e", "", "the create result reporting address. It takes effect only when the async value is true and the value is not empty")
 	flags.BoolVarP(&cc.nohup, NohupFlag, "n", false, "used to internal async create, no need to config")
@@ -144,7 +144,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			var args string
 			if scope == "host" {
 				args = fmt.Sprintf("create %s %s --uid %s --nohup=true", target, actionCommand.Name(), model.Uid)
-			} else if scope == "docker" {
+			} else if scope == "docker" || scope == "cri" {
 				args = fmt.Sprintf("create %s %s %s --uid %s --nohup=true", scope, target, actionCommand.Name(), model.Uid)
 			} else {
 				args = fmt.Sprintf("create k8s %s-%s %s --uid %s --nohup=true", scope, target, actionCommand.Name(), model.Uid)

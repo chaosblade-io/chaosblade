@@ -49,6 +49,10 @@ BLADE_EXEC_OS_BRANCH=v1.3.0
 BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
 BLADE_EXEC_DOCKER_BRANCH=v1.3.0
 
+# chaosblade-exec-cri
+BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
+BLADE_EXEC_CRI_BRANCH=v1.3.0
+
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
 BLADE_OPERATOR_BRANCH=v1.3.0
@@ -64,6 +68,10 @@ BLADE_EXEC_CPLUS_BRANCH=master
 # docker yaml
 DOCKER_YAML_FILE_NAME=chaosblade-docker-spec-$(BLADE_VERSION).yaml
 DOCKER_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(DOCKER_YAML_FILE_NAME)
+
+# cri yaml
+CRI_YAML_FILE_NAME=chaosblade-cri-spec-$(BLADE_VERSION).yaml
+CRI_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(CRI_YAML_FILE_NAME)
 
 # check yaml
 CHECK_YAML_FILE_NAME=chaosblade-check-spec-$(BLADE_VERSION).yaml
@@ -82,24 +90,24 @@ help:
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>...\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m  %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Build
-build: pre_build cli os docker cplus java kubernetes upx package check_yaml  ## Build all scenarios
+build: pre_build cli os docker cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
 
 # for example: make build_with cli os_darwin
-build_with: pre_build ## Select scenario build, for example `make build_with cli os docker kubernetes java cplus`
+build_with: pre_build ## Select scenario build, for example `make build_with cli os docker cri kubernetes java cplus`
 
 # for example: make build_with_linux cli os
-build_with_linux: pre_build build_linux_with_arg ## Select scenario build linux version by docker image, for example `make build_with_linux ARGS="cli os"`
+build_with_linux: pre_build build_linux_with_arg ## Select scenario build linux version by docker cri image, for example `make build_with_linux ARGS="cli os"`
 
-build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario build linux version by docker image, for example `make build_with_linux_arm ARGS="cli os"`
+build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario build linux version by docker cri image, for example `make build_with_linux_arm ARGS="cli os"`
 
 # build chaosblade linux version by docker image
 build_linux:  ## Build linux version of all scenarios by docker image
-	make build_with_linux ARGS="cli os docker kubernetes java cplus check_yaml" upx package
+	make build_with_linux ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
 
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
-	make build_with_linux_arm ARGS="cli os docker kubernetes java cplus check_yaml" upx package
+	make build_with_linux_arm ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
 
-build_darwin: pre_build cli os_darwin docker cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
+build_darwin: pre_build cli os_darwin docker cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
 ##@ Build sub
 
@@ -157,6 +165,16 @@ endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-operator
 	cp $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
+
+cri: ## Build cri experimental scenarios.
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-cri, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-cri))
+	git clone -b $(BLADE_EXEC_CRI_BRANCH) $(BLADE_EXEC_CRI_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-cri
+else
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri pull origin $(BLADE_EXEC_CRI_BRANCH)
+endif
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri
+	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-cri/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
+
 
 java: ## Build java experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-jvm, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm))
