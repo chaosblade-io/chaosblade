@@ -350,5 +350,10 @@ func (dc *DestroyCommand) actionPostRunEFunc(actionCommand *actionCommand) func(
 }
 
 func destroyExample() string {
-	return `blade destroy 47cc0744f1bb`
+	return `
+# Destroy experiment
+blade destroy 47cc0744f1bb
+
+# Force delete kubernetes experiment
+blade destroy 47cc0744f1bb --target k8s --kubeconfig ~/.kube/config --force-remove`
 }
