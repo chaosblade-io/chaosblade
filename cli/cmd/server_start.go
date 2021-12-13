@@ -97,7 +97,13 @@ func (ssc *StartServerCommand) start() error {
 	}
 	if len(pids) == 0 {
 		// read logs
-		logFile, err := util.GetLogFile(util.Blade)
+		var logFile string
+		var err error
+		if ssc.command.Flag("log-path").Value.String() != "" {
+			logFile, err = util.GetLogFile(util.Custom)
+		} else {
+			logFile, err = util.GetLogFile(util.Blade)
+		}
 		if err != nil {
 			return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
 				"start blade server failed and can't get log file")

@@ -55,6 +55,7 @@ func (cli *Cli) setFlags() {
 	flags.StringVar(&data.Password, "db-pwd", "", "If remote db server like mysql used for db-type, set the password for db connection (default \"\")")
 	flags.IntVar(&data.Timeout, "db-timeout", 60, "If remote db server like mysql used for db-type, set the timeout for db connection")
 	flags.StringVar(&data.DatPath, "dat-path", util.GetProgramPath(), "If default or local db like sqlite3 used for db-type, set the directory path to save chaosblade.dat file")
+	flags.StringVar(&util.LogPath, "log-path", util.GetProgramPath(), "Use log-path to set custom path for saving chaosblade logs")
 }
 
 //Run command
