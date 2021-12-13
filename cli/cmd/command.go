@@ -84,7 +84,17 @@ func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpMode
 		}
 	}
 
-	flagsInline := spec.ConvertExpMatchersToString(expModel, func() map[string]spec.Empty {
+	// filter db flags, not to record in experiment values
+	toRecordExpModel := expModel
+	delete(toRecordExpModel.ActionFlags, "db-type")
+	delete(toRecordExpModel.ActionFlags, "db-host")
+	delete(toRecordExpModel.ActionFlags, "db-port")
+	delete(toRecordExpModel.ActionFlags, "db-name")
+	delete(toRecordExpModel.ActionFlags, "db-user")
+	delete(toRecordExpModel.ActionFlags, "db-pwd")
+	delete(toRecordExpModel.ActionFlags, "db-timeout")
+	delete(toRecordExpModel.ActionFlags, "dat-path")
+	flagsInline := spec.ConvertExpMatchersToString(toRecordExpModel, func() map[string]spec.Empty {
 		return make(map[string]spec.Empty)
 	})
 	time := time.Now().Format(time.RFC3339Nano)

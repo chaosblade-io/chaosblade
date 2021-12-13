@@ -68,15 +68,15 @@ type ExperimentSource interface {
 }
 
 const expTableDDL = `CREATE TABLE IF NOT EXISTS experiment (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	id INTEGER PRIMARY KEY %s,
 	uid VARCHAR(32) UNIQUE,
-	command VARCHAR NOT NULL,
-	sub_command VARCHAR,
-	flag VARCHAR,
-	status VARCHAR,
-	error VARCHAR,
-	create_time VARCHAR,
-	update_time VARCHAR
+	command VARCHAR(16) NOT NULL,
+	sub_command VARCHAR(16),
+	flag VARCHAR(256),
+	status VARCHAR(16),
+	error VARCHAR(512),
+	create_time VARCHAR(32),
+	update_time VARCHAR(32)
 )`
 
 var expIndexDDL = []string{
@@ -108,9 +108,9 @@ func (s *Source) CheckAndInitExperimentTable() {
 }
 
 func (s *Source) ExperimentTableExists() (bool, error) {
-	stmt, err := s.DB.Prepare(tableExistsDQL)
+	stmt, err := s.getStmtPreparation()
 	if err != nil {
-		return false, fmt.Errorf("select experiment table exists err when invoke db prepare, %s", err)
+		return false, err
 	}
 	defer stmt.Close()
 	rows, err := stmt.Query("experiment")
@@ -127,7 +127,16 @@ func (s *Source) ExperimentTableExists() (bool, error) {
 }
 
 func (s *Source) InitExperimentTable() error {
-	_, err := s.DB.Exec(expTableDDL)
+	var err error
+	// auto increment keywords in mysql is different from in sqlite3
+	switch Type {
+	case "mysql":
+		_, err = s.DB.Exec(fmt.Sprintf(expTableDDL, "AUTO_INCREMENT"))
+		break
+	default:
+		_, err = s.DB.Exec(fmt.Sprintf(expTableDDL, "AUTOINCREMENT"))
+		break
+	}
 	if err != nil {
 		return fmt.Errorf("create experiment table err, %s", err)
 	}

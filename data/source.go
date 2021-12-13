@@ -19,16 +19,27 @@ package data
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"path"
 	"sync"
 	"unicode"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sirupsen/logrus"
 )
 
 const dataFile = "chaosblade.dat"
+var (
+	Type string
+	Host string
+	Port int
+	Database string
+	Username string
+	Password string
+	Timeout int
+	DatPath string
+)
 
 type SourceI interface {
 	ExperimentSource
@@ -53,11 +64,30 @@ func GetSource() SourceI {
 	return source
 }
 
-const tableExistsDQL = `SELECT count(*) AS c
-	FROM sqlite_master
-	WHERE type = "table"
-	AND name = ?
-`
+func (s *Source) getStmtPreparation() (*sql.Stmt, error) {
+	var stmt *sql.Stmt
+	var err error
+	switch Type {
+	case "mysql":
+		stmt, err = s.DB.Prepare(fmt.Sprintf(
+			`SELECT count(*) AS c
+				FROM information_schema.tables
+				WHERE TABLE_SCHEMA = "%s" AND TABLE_NAME = ?`, Database),
+		)
+		break
+	default:
+		stmt, err = s.DB.Prepare(fmt.Sprintf(
+			`SELECT count(*) AS c
+				FROM sqlite_master
+				WHERE type = "table" AND name = ?`),
+		)
+		break
+	}
+	if err != nil {
+		return nil, fmt.Errorf("select experiment table exists err when invoke db prepare, %s", err)
+	}
+	return stmt, nil
+}
 
 func (s *Source) init() {
 	s.CheckAndInitExperimentTable()
@@ -65,12 +95,29 @@ func (s *Source) init() {
 }
 
 func getConnection() *sql.DB {
-	database, err := sql.Open("sqlite3", path.Join(util.GetProgramPath(), dataFile))
+	var database *sql.DB
+	var err error
+	switch Type {
+	case "mysql":
+		database, err = sql.Open("mysql",
+			fmt.Sprintf("%v:%s@tcp(%s:%d)/%v?charset=utf8&parseTime=true&interpolateParams=true&timeout=%ds&readTimeout=%ds&writeTimeout=%ds",
+			Username, Password, Host, Port, Database, Timeout, Timeout, Timeout))
+		break
+	default:
+		if _, err := os.Stat(DatPath); err != nil {
+			fmt.Printf("stat dat-path failed: %s", err)
+			os.Exit(-1)
+		}
+		database, err = sql.Open("sqlite3", path.Join(DatPath, dataFile))
+		break
+	}
 	if err != nil {
 		logrus.Fatalf("open data file err, %s", err.Error())
 		//log.Error(err, "open data file err")
 		//os.Exit(1)
 	}
+	database.SetMaxOpenConns(20)
+	database.SetMaxIdleConns(2)
 	return database
 }
 
@@ -82,7 +129,16 @@ func (s *Source) Close() {
 
 // GetUserVersion returns the user_version value
 func (s *Source) GetUserVersion() (int, error) {
-	userVerRows, err := s.DB.Query("PRAGMA user_version")
+	var userVerRows *sql.Rows
+	var err error
+	switch Type {
+	case "mysql":
+		userVerRows, err = s.DB.Query("SELECT @user_version")
+		break
+	default:
+		userVerRows, err = s.DB.Query("PRAGMA user_version")
+		break
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -96,7 +152,15 @@ func (s *Source) GetUserVersion() (int, error) {
 
 // UpdateUserVersion to the latest
 func (s *Source) UpdateUserVersion(version int) error {
-	_, err := s.DB.Exec(fmt.Sprintf("PRAGMA user_version=%d", version))
+	var err error
+	switch Type {
+	case "mysql":
+		_, err = s.DB.Exec(fmt.Sprintf("SET @user_version=%d", version))
+		break
+	default:
+		_, err = s.DB.Exec(fmt.Sprintf("PRAGMA user_version=%d", version))
+		break
+	}
 	return err
 }
 

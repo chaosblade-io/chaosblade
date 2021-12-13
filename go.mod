@@ -8,6 +8,7 @@ require (
 	github.com/chaosblade-io/chaosblade-exec-os v1.4.0
 	github.com/chaosblade-io/chaosblade-operator v1.4.0
 	github.com/chaosblade-io/chaosblade-spec-go v1.4.0
+	github.com/go-sql-driver/mysql v1.6.0 // indirect
 	github.com/mattn/go-sqlite3 v1.10.1-0.20190217174029-ad30583d8387
 	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
 	github.com/shirou/gopsutil v3.21.6+incompatible

@@ -73,20 +73,20 @@ type PreparationSource interface {
 const UserVersion = 1
 
 // addPidColumn sql
-const addPidColumn = `ALTER TABLE preparation ADD COLUMN pid VARCHAR DEFAULT ""`
+const addPidColumn = `ALTER TABLE preparation ADD COLUMN pid VARCHAR(8) DEFAULT ""`
 
 // preparationTableDDL
 const preparationTableDDL = `CREATE TABLE IF NOT EXISTS preparation (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	id INTEGER PRIMARY KEY %s,
 	uid VARCHAR(32) UNIQUE,
-	program_type       VARCHAR NOT NULL,
-	process    VARCHAR,
-	port       VARCHAR,
-	status     VARCHAR,
-    error 	   VARCHAR,
-	create_time VARCHAR,
-	update_time VARCHAR,
-	pid 	   VARCHAR
+	program_type VARCHAR(32) NOT NULL,
+	process    VARCHAR(32),
+	port       VARCHAR(8),
+	status     VARCHAR(16),
+    error 	   VARCHAR(512),
+	create_time VARCHAR(32),
+	update_time VARCHAR(32),
+	pid 	   VARCHAR(8)
 )`
 
 var preIndexDDL = []string{
@@ -119,7 +119,8 @@ func (s *Source) CheckAndInitPreTable() {
 		//log.Error(err, "PreparationTableExists err")
 		//os.Exit(1)
 	}
-	if exists {
+	//新增支持 mysql 类型 db 的 feature 时表结构已经有了 pid 字段，再 ADD COLUMN 一次会报错
+	if exists && strings.EqualFold(Type, "sqlite3") {
 		// execute alter sql if exists
 		err := s.AlterPreparationTable(addPidColumn)
 		if err != nil {
@@ -146,7 +147,16 @@ func (s *Source) CheckAndInitPreTable() {
 }
 
 func (s *Source) InitPreparationTable() error {
-	_, err := s.DB.Exec(preparationTableDDL)
+	var err error
+	// auto increment keywords in mysql is different from in sqlite3
+	switch Type {
+	case "mysql":
+		_, err = s.DB.Exec(fmt.Sprintf(preparationTableDDL, "AUTO_INCREMENT"))
+		break
+	default:
+		_, err = s.DB.Exec(fmt.Sprintf(preparationTableDDL, "AUTOINCREMENT"))
+		break
+	}
 	if err != nil {
 		return fmt.Errorf("create preparation table err, %s", err)
 	}
@@ -165,7 +175,10 @@ func (s *Source) AlterPreparationTable(alterSql string) error {
 }
 
 func (s *Source) PreparationTableExists() (bool, error) {
-	stmt, err := s.DB.Prepare(tableExistsDQL)
+	stmt, err := s.getStmtPreparation()
+	if err != nil {
+		return false, err
+	}
 	if err != nil {
 		return false, fmt.Errorf("select preparation table exists err when invoke db prepare, %s", err)
 	}
