@@ -148,7 +148,11 @@ func (bc *baseCommand) AddCommand(child Command) {
 	child.Init()
 	childCmd := child.CobraCmd()
 	childCmd.PreRun = func(cmd *cobra.Command, args []string) {
-		util.InitLog(util.Blade)
+		if cmd.Flag("log-path").Value.String() != "" {
+			util.InitLog(util.Custom)
+		} else {
+			util.InitLog(util.Blade)
+		}
 	}
 	childCmd.SilenceUsage = true
 	childCmd.DisableFlagsInUseLine = true
