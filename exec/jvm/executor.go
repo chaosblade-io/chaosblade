@@ -219,7 +219,7 @@ func (e *Executor) getStatusRequestPath(uid string) string {
 }
 
 func (e *Executor) QueryStatus(uid string) *spec.Response {
-	experimentModel, err := db.QueryExperimentModelByUid(uid)
+	experimentModel, err := GetDS().QueryExperimentModelByUid(uid)
 	if err != nil {
 		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
@@ -259,7 +259,19 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 	return &resp
 }
 
-var db = data.GetSource()
+//取消直接调用 data.GetSource() 的方式，会导致 GetSource() 在运行 cobra.Command 之前执行而无法获取到 flag 参数。由于不能和 cmd package
+//循环依赖所以没法使用 cmd.GetDS()，且没有该工程中没有公共的 util，所以每个用到 data source 的地方都需要重复一遍 GetDS()，所以更好的方式
+//应该是把 data package 的部分放到 spec-go 里面去，并在 spec-go 里面提供 util.GetDS() 来使用
+//var db = data.GetSource()
+var ds data.SourceI
+
+// GetDS returns dataSource
+func GetDS() data.SourceI {
+	if ds == nil {
+		ds = data.GetSource()
+	}
+	return ds
+}
 
 func (e *Executor) getRecordFromDB(uid, processName, processId string) (*data.PreparationRecord, error) {
 	if processName != "" || processId != "" {
@@ -269,7 +281,7 @@ func (e *Executor) getRecordFromDB(uid, processName, processId string) (*data.Pr
 		}
 		processId = pid
 	}
-	record, err := db.QueryRunningPreByTypeAndProcess("jvm", processName, processId)
+	record, err := GetDS().QueryRunningPreByTypeAndProcess("jvm", processName, processId)
 	if err != nil {
 		return nil, err
 	}
@@ -363,7 +375,7 @@ func Prepare(uid, processName, processId, javaHome string) (response *spec.Respo
 	if !response.Success {
 		return
 	}
-	record, err := db.QueryRunningPreByTypeAndProcess("jvm", processName, processId)
+	record, err := GetDS().QueryRunningPreByTypeAndProcess("jvm", processName, processId)
 	if record == nil || err != nil || record.Uid == "" {
 		// get port from local port
 		port, err = getAndCacheSandboxPort()
@@ -388,7 +400,7 @@ func Prepare(uid, processName, processId, javaHome string) (response *spec.Respo
 			response, username = Attach(uid, port, "", processId)
 			if response.Success {
 				// update port
-				err := db.UpdatePreparationPortByUid(record.Uid, port)
+				err := GetDS().UpdatePreparationPortByUid(record.Uid, port)
 				if err != nil {
 					logrus.Warningf("update preparation port failed, %v", err)
 				}
@@ -397,7 +409,7 @@ func Prepare(uid, processName, processId, javaHome string) (response *spec.Respo
 	}
 	if record.Pid != processId {
 		// update pid
-		db.UpdatePreparationPidByUid(record.Uid, processId)
+		GetDS().UpdatePreparationPidByUid(record.Uid, processId)
 	}
 	handlePrepareResponse(record.Uid, response)
 	return response, port
@@ -463,7 +475,7 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 		CreateTime:  time.Now().Format(time.RFC3339Nano),
 		UpdateTime:  time.Now().Format(time.RFC3339Nano),
 	}
-	err = db.InsertPreparationRecord(record)
+	err = GetDS().InsertPreparationRecord(record)
 	if err != nil {
 		return nil, err
 	}
@@ -473,10 +485,10 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 func handlePrepareResponse(uid string, response *spec.Response) {
 	response.Result = uid
 	if !response.Success {
-		db.UpdatePreparationRecordByUid(uid, "Error", response.Err)
+		GetDS().UpdatePreparationRecordByUid(uid, "Error", response.Err)
 		return
 	}
-	err := db.UpdatePreparationRecordByUid(uid, "Running", "")
+	err := GetDS().UpdatePreparationRecordByUid(uid, "Running", "")
 	if err != nil {
 		logrus.Warningf("update preparation record error: %s", err.Error())
 	}
