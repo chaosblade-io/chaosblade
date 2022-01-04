@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=1.4.0
+export BLADE_VERSION=1.5.0
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -218,7 +218,7 @@ build_image_arm: ## Build chaosblade-tool-arm image
 	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_ARM_IMAGE_PATH)
 	docker build -f $(BUILD_ARM_IMAGE_PATH)/Dockerfile \
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
-		-t chaosblade-tool-arm:$(BLADE_VERSION) \
+		-t chaosblade-tool-arm64:$(BLADE_VERSION) \
 		$(BUILD_ARM_IMAGE_PATH)
 	rm -rf $(BUILD_ARM_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 

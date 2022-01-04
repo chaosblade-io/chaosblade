@@ -47,6 +47,8 @@ target
 coverage.txt
 vendor
 build/spec/*.yaml
+*.gz
+*.tar
 
 # Website
 site-build
