@@ -105,16 +105,17 @@ func getConnection() *sql.DB {
 		break
 	default:
 		if _, err := os.Stat(DatPath); err != nil {
-			fmt.Printf("stat dat-path failed: %s", err)
+			logrus.Errorf("stat dat-path failed: %s", err.Error())
+			fmt.Println(err.Error())
 			os.Exit(-1)
 		}
 		database, err = sql.Open("sqlite3", path.Join(DatPath, dataFile))
 		break
 	}
 	if err != nil {
-		logrus.Fatalf("open data file err, %s", err.Error())
-		//log.Error(err, "open data file err")
-		//os.Exit(1)
+		logrus.Errorf("open database err, %s", err.Error())
+		fmt.Println(err.Error())
+		os.Exit(-1)
 	}
 	database.SetMaxOpenConns(20)
 	database.SetMaxIdleConns(2)
