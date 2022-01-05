@@ -94,6 +94,7 @@ func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpMode
 	delete(toRecordExpModel.ActionFlags, "db-pwd")
 	delete(toRecordExpModel.ActionFlags, "db-timeout")
 	delete(toRecordExpModel.ActionFlags, "dat-path")
+	delete(toRecordExpModel.ActionFlags, "log-path")
 	flagsInline := spec.ConvertExpMatchersToString(toRecordExpModel, func() map[string]spec.Empty {
 		return make(map[string]spec.Empty)
 	})
