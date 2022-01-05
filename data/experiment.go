@@ -19,6 +19,7 @@ package data
 import (
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -93,16 +94,16 @@ var insertExpDML = `INSERT INTO
 func (s *Source) CheckAndInitExperimentTable() {
 	exists, err := s.ExperimentTableExists()
 	if err != nil {
-		logrus.Fatalf(err.Error())
-		//log.Error(err, "ExperimentTableExists err")
-		//os.Exit(1)
+		logrus.Errorf("ExperimentTableExists err, %s", err.Error())
+		fmt.Println(err.Error())
+		os.Exit(-1)
 	}
 	if !exists {
 		err = s.InitExperimentTable()
 		if err != nil {
-			logrus.Fatalf(err.Error())
-			//log.Error(err, "InitExperimentTable err")
-			//os.Exit(1)
+			logrus.Errorf("InitExperimentTable err, %s", err.Error())
+			fmt.Println(err.Error())
+			os.Exit(-1)
 		}
 	}
 }
