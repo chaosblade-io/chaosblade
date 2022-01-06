@@ -83,6 +83,11 @@ make build_with cli os_darwin
 ARGS="cli os" make build_with_linux
 ```
 
+Arch Linux 安装 [chaosblade-bin](https://aur.archlinux.org/packages/chaosblade-bin/)
+```bash
+yay -S chaosblade-bin
+```
+
 ## 缺陷&建议
 欢迎提交缺陷、问题、建议和新功能，所有项目（包含其他子项目）的问题都可以提交到[Github Issues](https://github.com/chaosblade-io/chaosblade/issues)
 
