@@ -1,4 +1,4 @@
-FROM golang:1.16.6
+FROM golang:1.16.13
 LABEL maintainer="Changjun Xiao"
 
 # # The image is used to build chaosblade for musl
