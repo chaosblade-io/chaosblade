@@ -63,7 +63,7 @@ func (cc *CreateCommand) Init() {
 		Example: createExample(),
 	}
 	flags := cc.command.PersistentFlags()
-	flags.StringVar(&uid, UidFlag, "", "Set Uid for the experiment, adapt to docker")
+	flags.StringVar(&uid, UidFlag, "", "Set Uid for the experiment, adapt to docker and cri")
 	flags.BoolVarP(&cc.async, AsyncFlag, "a", false, "whether to create asynchronously, default is false")
 	flags.StringVarP(&cc.endpoint, EndpointFlag, "e", "", "the create result reporting address. It takes effect only when the async value is true and the value is not empty")
 	flags.BoolVarP(&cc.nohup, NohupFlag, "n", false, "used to internal async create, no need to config")
@@ -103,20 +103,15 @@ func (cc *CreateCommand) bindFlagsFunction() func(commandFlags map[string]func()
 func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *actionCommand, actionCommandSpec spec.ExpActionCommandSpec) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
-
 		// check timeout flag
 		tt := expModel.ActionFlags["timeout"]
-
 		if tt != "" {
-
 			//errNumber checks whether timout flag is parsable as Number
 			if _, errNumber := strconv.ParseUint(tt, 10, 64); errNumber != nil {
-
 				//err checks whether timout flag is parsable as Time
 				if _, err := time.ParseDuration(tt); err != nil {
 					return err
 				}
-
 			}
 		}
 		nohup := expModel.ActionFlags[NohupFlag] == "true"
@@ -138,7 +133,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			// update status
 			model, resp = actionCommand.recordExpModel(cmd.CommandPath(), expModel)
 		}
-		if !resp.Success {
+		if resp != nil && !resp.Success {
 			return resp
 		}
 		// is async ?
@@ -149,8 +144,10 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			var args string
 			if scope == "host" {
 				args = fmt.Sprintf("create %s %s --uid %s --nohup=true", target, actionCommand.Name(), model.Uid)
-			} else {
+			} else if scope == "docker" || scope == "cri" {
 				args = fmt.Sprintf("create %s %s %s --uid %s --nohup=true", scope, target, actionCommand.Name(), model.Uid)
+			} else {
+				args = fmt.Sprintf("create k8s %s-%s %s --uid %s --nohup=true", scope, target, actionCommand.Name(), model.Uid)
 			}
 			cmd.Flags().VisitAll(func(flag *pflag.Flag) {
 				if flag.Value.String() == "false" {
@@ -176,7 +173,13 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			executor := actionCommandSpec.Executor()
 			executor.SetChannel(channel.NewLocalChannel())
 			response := executor.Exec(model.Uid, context.Background(), expModel)
-
+			response.Result = model.Uid
+			if response.Code == spec.ReturnOKDirectly.Code {
+				// return directly
+				response.Code = spec.OK.Code
+				cmd.Println(response.Print())
+				endpointCallBack(endpoint, model.Uid, response)
+			}
 			// pass the uid, expModel to actionCommand
 			actionCommand.expModel = expModel
 			actionCommand.uid = model.Uid

@@ -180,6 +180,7 @@ func (s *Source) QueryExperimentModelByUid(uid string) (*ExperimentModel, error)
 	if err != nil {
 		return nil, err
 	}
+	defer stmt.Close()
 	rows, err := stmt.Query(uid)
 	if err != nil {
 		return nil, err
@@ -303,6 +304,7 @@ func (s *Source) DeleteExperimentModelByUid(uid string) error {
 	if err != nil {
 		return err
 	}
+	defer stmt.Close()
 	_, err = stmt.Exec(uid)
 	if err != nil {
 		return err
