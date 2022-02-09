@@ -230,8 +230,12 @@ func (s *Source) QueryPreparationByUid(uid string) (*PreparationRecord, error) {
 // QueryRunningPreByTypeAndProcess returns the first record matching the process id or process name
 func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName, processId string) (*PreparationRecord, error) {
 	var query = `SELECT * FROM preparation WHERE program_type = ? and status = "Running"`
-	if processId != "" || processName != "" {
-		query = fmt.Sprintf(`%s and (pid = ? OR process = ?)`, query)
+	if processId != "" && processName != "" {
+		query = fmt.Sprintf(`%s and pid = ? and process = ?`, query)
+	} else if processId != "" {
+		query = fmt.Sprintf(`%s and pid = ?`, query)
+	} else if processName != "" {
+		query = fmt.Sprintf(`%s and process = ?`, query)
 	}
 	stmt, err := s.DB.Prepare(query)
 	if err != nil {
@@ -239,8 +243,12 @@ func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName
 	}
 	defer stmt.Close()
 	var rows *sql.Rows
-	if processId != "" || processName != "" {
+	if processId != "" && processName != "" {
 		rows, err = stmt.Query(programType, processId, processName)
+	} else if processId != "" {
+		rows, err = stmt.Query(programType, processId)
+	} else if processName != "" {
+		rows, err = stmt.Query(programType, processName)
 	} else {
 		rows, err = stmt.Query(programType)
 	}
