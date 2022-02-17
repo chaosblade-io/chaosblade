@@ -57,21 +57,6 @@ func (bc *baseCommand) Name() string {
 	return bc.command.Name()
 }
 
-var ds data.SourceI
-
-// GetDS returns dataSource
-func GetDS() data.SourceI {
-	if ds == nil {
-		ds = data.GetSource()
-	}
-	return ds
-}
-
-// SetDS for test
-func SetDS(source data.SourceI) {
-	ds = source
-}
-
 // recordExpModel
 func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpModel) (commandModel *data.ExperimentModel,
 	response *spec.Response) {
@@ -113,7 +98,7 @@ func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpMode
 		CreateTime: time,
 		UpdateTime: time,
 	}
-	err = GetDS().InsertExperimentModel(commandModel)
+	err = data.GetSource().InsertExperimentModel(commandModel)
 	if err != nil {
 		return nil, spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err)
 	}
@@ -134,7 +119,7 @@ func (bc *baseCommand) generateUid() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	model, err := GetDS().QueryExperimentModelByUid(uid)
+	model, err := data.GetSource().QueryExperimentModelByUid(uid)
 	if err != nil {
 		return "", err
 	}

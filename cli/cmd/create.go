@@ -124,7 +124,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 				logrus.Infof("can not execute nohup, uid is null")
 				return spec.ResponseFailWithFlags(spec.ParameterLess, UidFlag)
 			} else {
-				model, err = GetDS().QueryExperimentModelByUid(uid)
+				model, err = data.GetSource().QueryExperimentModelByUid(uid)
 				if err == nil {
 					delete(expModel.ActionFlags, NohupFlag)
 				}
@@ -186,12 +186,12 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 
 			if !response.Success {
 				// update status
-				checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, response.Err))
+				checkError(data.GetSource().UpdateExperimentModelByUid(model.Uid, Error, response.Err))
 				endpointCallBack(endpoint, model.Uid, response)
 				return response
 			}
 			// update status
-			checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
+			checkError(data.GetSource().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
 			response.Result = model.Uid
 			cmd.Println(response.Print())
 			endpointCallBack(endpoint, model.Uid, response)
@@ -203,7 +203,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 func endpointCallBack(endpoint, uid string, response *spec.Response) {
 	if endpoint != "" {
 		logrus.Infof("report response: %s to endpoint: %s", response.Print(), endpoint)
-		experimentModel, _ := GetDS().QueryExperimentModelByUid(uid)
+		experimentModel, _ := data.GetSource().QueryExperimentModelByUid(uid)
 		body, err := json.Marshal(experimentModel)
 		if err != nil {
 			logrus.Warningf("create post body %s failed, %v", response.Print(), err)

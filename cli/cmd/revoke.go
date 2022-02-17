@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade/data"
 	"strings"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
@@ -49,7 +50,7 @@ func (rc *RevokeCommand) Init() {
 
 func (rc *RevokeCommand) runRevoke(args []string) error {
 	uid := args[0]
-	record, err := GetDS().QueryPreparationByUid(uid)
+	record, err := data.GetSource().QueryPreparationByUid(uid)
 	if err != nil {
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
@@ -74,14 +75,14 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		return spec.ResponseFailWithFlags(spec.ParameterIllegal, "type", record.ProgramType, "not support the type")
 	}
 	if response.Success {
-		checkError(GetDS().UpdatePreparationRecordByUid(uid, Revoked, ""))
+		checkError(data.GetSource().UpdatePreparationRecordByUid(uid, Revoked, ""))
 	} else if strings.Contains(response.Err, "connection refused") {
 		// sandbox has been detached, reset response value
 		response = spec.ReturnSuccess("success")
-		checkError(GetDS().UpdatePreparationRecordByUid(uid, Revoked, ""))
+		checkError(data.GetSource().UpdatePreparationRecordByUid(uid, Revoked, ""))
 	} else {
 		// other failed reason
-		checkError(GetDS().UpdatePreparationRecordByUid(uid, record.Status, fmt.Sprintf("revoke failed. %s", response.Err)))
+		checkError(data.GetSource().UpdatePreparationRecordByUid(uid, record.Status, fmt.Sprintf("revoke failed. %s", response.Err)))
 		return response
 	}
 	rc.command.Println(response.Print())

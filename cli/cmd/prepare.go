@@ -74,7 +74,7 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 		CreateTime:  time.Now().Format(time.RFC3339Nano),
 		UpdateTime:  time.Now().Format(time.RFC3339Nano),
 	}
-	err = GetDS().InsertPreparationRecord(record)
+	err = data.GetSource().InsertPreparationRecord(record)
 	if err != nil {
 		return nil, err
 	}
@@ -84,10 +84,10 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 func handlePrepareResponseWithoutExit(uid string, cmd *cobra.Command, response *spec.Response) error {
 	response.Result = uid
 	if !response.Success {
-		GetDS().UpdatePreparationRecordByUid(uid, Error, response.Err)
+		data.GetSource().UpdatePreparationRecordByUid(uid, Error, response.Err)
 		return response
 	}
-	err := GetDS().UpdatePreparationRecordByUid(uid, Running, "")
+	err := data.GetSource().UpdatePreparationRecordByUid(uid, Running, "")
 	if err != nil {
 		logrus.Warningf("update preparation record error: %s", err.Error())
 	}
@@ -97,10 +97,10 @@ func handlePrepareResponseWithoutExit(uid string, cmd *cobra.Command, response *
 func handlePrepareResponse(uid string, cmd *cobra.Command, response *spec.Response) error {
 	response.Result = uid
 	if !response.Success {
-		GetDS().UpdatePreparationRecordByUid(uid, Error, response.Err)
+		data.GetSource().UpdatePreparationRecordByUid(uid, Error, response.Err)
 		return response
 	}
-	err := GetDS().UpdatePreparationRecordByUid(uid, Running, "")
+	err := data.GetSource().UpdatePreparationRecordByUid(uid, Running, "")
 	if err != nil {
 		logrus.Warningf("update preparation record error: %s", err.Error())
 		//log.V(-1).Info("update preparation record error", "err_msg", err.Error())
@@ -111,9 +111,9 @@ func handlePrepareResponse(uid string, cmd *cobra.Command, response *spec.Respon
 }
 
 func updatePreparationPort(uid, port string) error {
-	return GetDS().UpdatePreparationPortByUid(uid, port)
+	return data.GetSource().UpdatePreparationPortByUid(uid, port)
 }
 
 func updatePreparationPid(uid, pid string) error {
-	return GetDS().UpdatePreparationPidByUid(uid, pid)
+	return data.GetSource().UpdatePreparationPidByUid(uid, pid)
 }

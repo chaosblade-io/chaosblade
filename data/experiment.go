@@ -19,12 +19,11 @@ package data
 import (
 	"database/sql"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/sirupsen/logrus"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/sirupsen/logrus"
 )
 
 type ExperimentModel struct {
@@ -109,14 +108,17 @@ func (s *Source) CheckAndInitExperimentTable() {
 }
 
 func (s *Source) ExperimentTableExists() (bool, error) {
-	stmt, err := s.getStmtPreparation()
+	rows, err := s.queryTableSchema("experiment")
 	if err != nil {
-		return false, err
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query("experiment")
-	if err != nil {
-		return false, fmt.Errorf("select experiment table exists or not err, %s", err)
+		stmt, err := s.getStmtPreparation()
+		if err != nil {
+			return false, err
+		}
+		defer stmt.Close()
+		rows, err = stmt.Query("experiment")
+		if err != nil {
+			return false, fmt.Errorf("select experiment table exists err, %s", err)
+		}
 	}
 	defer rows.Close()
 	var c int
@@ -148,12 +150,7 @@ func (s *Source) InitExperimentTable() error {
 }
 
 func (s *Source) InsertExperimentModel(model *ExperimentModel) error {
-	stmt, err := s.DB.Prepare(insertExpDML)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	_, err = stmt.Exec(
+	_, err := s.DB.Exec(insertExpDML,
 		model.Uid,
 		model.Command,
 		model.SubCommand,
@@ -164,36 +161,57 @@ func (s *Source) InsertExperimentModel(model *ExperimentModel) error {
 		model.UpdateTime,
 	)
 	if err != nil {
-		return err
+		stmt, err := s.DB.Prepare(insertExpDML)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(
+			model.Uid,
+			model.Command,
+			model.SubCommand,
+			model.Flag,
+			model.Status,
+			model.Error,
+			model.CreateTime,
+			model.UpdateTime,
+		)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (s *Source) UpdateExperimentModelByUid(uid, status, errMsg string) error {
-	stmt, err := s.DB.Prepare(`UPDATE experiment
-	SET status = ?, error = ?, update_time = ?
-	WHERE uid = ?
-`)
+	_, err := s.DB.Exec(`UPDATE experiment SET status = ?, error = ?, update_time = ? WHERE uid = ?`,
+		status, errMsg, time.Now().Format(time.RFC3339Nano), uid)
 	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	_, err = stmt.Exec(status, errMsg, time.Now().Format(time.RFC3339Nano), uid)
-	if err != nil {
-		return err
+		stmt, err := s.DB.Prepare(`UPDATE experiment SET status = ?, error = ?, update_time = ? WHERE uid = ?`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(status, errMsg, time.Now().Format(time.RFC3339Nano), uid)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (s *Source) QueryExperimentModelByUid(uid string) (*ExperimentModel, error) {
-	stmt, err := s.DB.Prepare(`SELECT * FROM experiment WHERE uid = ?`)
+	rows, err := s.DB.Query(`SELECT * FROM experiment WHERE uid = ?`, uid)
 	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(uid)
-	if err != nil {
-		return nil, err
+		stmt, err := s.DB.Prepare(`SELECT * FROM experiment WHERE uid = ?`)
+		if err != nil {
+			return nil, err
+		}
+		defer stmt.Close()
+		rows, err = stmt.Query(uid)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	models, err := getExperimentModelsFrom(rows)
@@ -243,14 +261,17 @@ func (s *Source) QueryExperimentModels(target, action, flag, status, limit strin
 		sql = fmt.Sprintf(`%s limit ?,?`, sql)
 		parameters = append(parameters, offset, count)
 	}
-	stmt, err := s.DB.Prepare(sql)
+	rows, err := s.DB.Query(sql, parameters...)
 	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(parameters...)
-	if err != nil {
-		return nil, err
+		stmt, err := s.DB.Prepare(sql)
+		if err != nil {
+			return nil, err
+		}
+		defer stmt.Close()
+		rows, err = stmt.Query(parameters...)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	return getExperimentModelsFrom(rows)
@@ -310,14 +331,17 @@ func getExperimentModelsFrom(rows *sql.Rows) ([]*ExperimentModel, error) {
 }
 
 func (s *Source) DeleteExperimentModelByUid(uid string) error {
-	stmt, err := s.DB.Prepare(`DELETE FROM experiment WHERE uid = ?`)
+	_, err := s.DB.Exec(`DELETE FROM experiment WHERE uid = ?`, uid)
 	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	_, err = stmt.Exec(uid)
-	if err != nil {
-		return err
+		stmt, err := s.DB.Prepare(`DELETE FROM experiment WHERE uid = ?`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(uid)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

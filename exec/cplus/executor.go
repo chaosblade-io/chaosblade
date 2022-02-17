@@ -101,23 +101,9 @@ func (e *Executor) destroyUrl(port, uid string) string {
 	return url
 }
 
-//取消直接调用 data.GetSource() 的方式，会导致 GetSource() 在运行 cobra.Command 之前执行而无法获取到 flag 参数。由于不能和 cmd package
-//循环依赖所以没法使用 cmd.GetDS()，且没有该工程中没有公共的 util，所以每个用到 data source 的地方都需要重复一遍 GetDS()，所以更好的方式
-//应该是把 data package 的部分放到 spec-go 里面去，并在 spec-go 里面提供 util.GetDS() 来使用
-//var db = data.GetSource()
-var ds data.SourceI
-
-// GetDS returns dataSource
-func GetDS() data.SourceI {
-	if ds == nil {
-		ds = data.GetSource()
-	}
-	return ds
-}
-
 func (e *Executor) getPortFromDB(uid string, model *spec.ExpModel) (string, *spec.Response) {
 	port := model.ActionFlags["port"]
-	record, err := GetDS().QueryRunningPreByTypeAndProcess("cplus", port, "")
+	record, err := data.GetSource().QueryRunningPreByTypeAndProcess("cplus", port, "")
 	if err != nil {
 		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
 		return "", spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)

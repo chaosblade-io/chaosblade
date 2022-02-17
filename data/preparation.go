@@ -175,17 +175,20 @@ func (s *Source) AlterPreparationTable(alterSql string) error {
 }
 
 func (s *Source) PreparationTableExists() (bool, error) {
-	stmt, err := s.getStmtPreparation()
+	rows, err := s.queryTableSchema("preparation")
 	if err != nil {
-		return false, err
-	}
-	if err != nil {
-		return false, fmt.Errorf("select preparation table exists err when invoke db prepare, %s", err)
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query("preparation")
-	if err != nil {
-		return false, fmt.Errorf("select preparation table exists or not err, %s", err)
+		stmt, err := s.getStmtPreparation()
+		if err != nil {
+			return false, err
+		}
+		if err != nil {
+			return false, fmt.Errorf("select preparation table exists err when invoke db prepare, %s", err)
+		}
+		defer stmt.Close()
+		rows, err = stmt.Query("preparation")
+		if err != nil {
+			return false, fmt.Errorf("select preparation table exists or not err, %s", err)
+		}
 	}
 	defer rows.Close()
 	var c int
@@ -197,12 +200,7 @@ func (s *Source) PreparationTableExists() (bool, error) {
 }
 
 func (s *Source) InsertPreparationRecord(record *PreparationRecord) error {
-	stmt, err := s.DB.Prepare(insertPreDML)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	_, err = stmt.Exec(
+	_, err := s.DB.Exec(insertPreDML,
 		record.Uid,
 		record.ProgramType,
 		record.Process,
@@ -214,20 +212,41 @@ func (s *Source) InsertPreparationRecord(record *PreparationRecord) error {
 		record.Pid,
 	)
 	if err != nil {
-		return err
+		stmt, err := s.DB.Prepare(insertPreDML)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(
+			record.Uid,
+			record.ProgramType,
+			record.Process,
+			record.Port,
+			record.Status,
+			record.Error,
+			record.CreateTime,
+			record.UpdateTime,
+			record.Pid,
+		)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (s *Source) QueryPreparationByUid(uid string) (*PreparationRecord, error) {
-	stmt, err := s.DB.Prepare(`SELECT * FROM preparation WHERE uid = ?`)
+	rows, err := s.DB.Query(`SELECT * FROM preparation WHERE uid = ?`, uid)
 	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(uid)
-	if err != nil {
-		return nil, err
+		stmt, err := s.DB.Prepare(`SELECT * FROM preparation WHERE uid = ?`)
+		if err != nil {
+			return nil, err
+		}
+		defer stmt.Close()
+		rows, err = stmt.Query(uid)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	records, err := getPreparationRecordFrom(rows)
@@ -243,22 +262,28 @@ func (s *Source) QueryPreparationByUid(uid string) (*PreparationRecord, error) {
 // QueryRunningPreByTypeAndProcess returns the first record matching the process id or process name
 func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName, processId string) (*PreparationRecord, error) {
 	var query = `SELECT * FROM preparation WHERE program_type = ? and status = "Running"`
+	var rows *sql.Rows
+	var err error
 	if processId != "" || processName != "" {
 		query = fmt.Sprintf(`%s and (pid = ? OR process = ?)`, query)
-	}
-	stmt, err := s.DB.Prepare(query)
-	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	var rows *sql.Rows
-	if processId != "" || processName != "" {
-		rows, err = stmt.Query(programType, processId, processName)
+		rows, err = s.DB.Query(query, programType, processId, processName)
 	} else {
-		rows, err = stmt.Query(programType)
+		rows, err = s.DB.Query(query, programType)
 	}
 	if err != nil {
-		return nil, err
+		stmt, err := s.DB.Prepare(query)
+		if err != nil {
+			return nil, err
+		}
+		defer stmt.Close()
+		if processId != "" || processName != "" {
+			rows, err = stmt.Query(programType, processId, processName)
+		} else {
+			rows, err = stmt.Query(programType)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	records, err := getPreparationRecordFrom(rows)
@@ -297,15 +322,16 @@ func getPreparationRecordFrom(rows *sql.Rows) ([]*PreparationRecord, error) {
 }
 
 func (s *Source) UpdatePreparationRecordByUid(uid, status, errMsg string) error {
-	stmt, err := s.DB.Prepare(`UPDATE preparation
-	SET status = ?, error = ?, update_time = ?
-	WHERE uid = ?
-`)
+	_, err := s.DB.Exec(`UPDATE preparation SET status = ?, error = ?, update_time = ? WHERE uid = ?`,
+		status, errMsg, time.Now().Format(time.RFC3339Nano), uid)
 	if err != nil {
-		return err
+		stmt, err := s.DB.Prepare(`UPDATE preparation SET status = ?, error = ?, update_time = ? WHERE uid = ?`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(status, errMsg, time.Now().Format(time.RFC3339Nano), uid)
 	}
-	defer stmt.Close()
-	_, err = stmt.Exec(status, errMsg, time.Now().Format(time.RFC3339Nano), uid)
 	if err != nil {
 		return err
 	}
@@ -313,33 +339,35 @@ func (s *Source) UpdatePreparationRecordByUid(uid, status, errMsg string) error 
 }
 
 func (s *Source) UpdatePreparationPortByUid(uid, port string) error {
-	stmt, err := s.DB.Prepare(`UPDATE preparation
-	SET port = ?, update_time = ?
-	WHERE uid = ?
-`)
+	_, err := s.DB.Exec(`UPDATE preparation SET port = ?, update_time = ? WHERE uid = ?`,
+		port, time.Now().Format(time.RFC3339Nano), uid)
 	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	_, err = stmt.Exec(port, time.Now().Format(time.RFC3339Nano), uid)
-	if err != nil {
-		return err
+		stmt, err := s.DB.Prepare(`UPDATE preparation SET port = ?, update_time = ? WHERE uid = ?`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(port, time.Now().Format(time.RFC3339Nano), uid)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
 func (s *Source) UpdatePreparationPidByUid(uid, pid string) error {
-	stmt, err := s.DB.Prepare(`UPDATE preparation
-	SET pid = ?, update_time = ?
-	WHERE uid = ?
-`)
+	_, err := s.DB.Exec(`UPDATE preparation SET pid = ?, update_time = ? WHERE uid = ?`,
+		pid, time.Now().Format(time.RFC3339Nano), uid)
 	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-	_, err = stmt.Exec(pid, time.Now().Format(time.RFC3339Nano), uid)
-	if err != nil {
-		return err
+		stmt, err := s.DB.Prepare(`UPDATE preparation SET pid = ?, update_time = ? WHERE uid = ?`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		_, err = stmt.Exec(pid, time.Now().Format(time.RFC3339Nano), uid)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -381,14 +409,17 @@ func (s *Source) QueryPreparationRecords(target, status, action, flag, limit str
 		sql = fmt.Sprintf(`%s limit ?,?`, sql)
 		parameters = append(parameters, offset, count)
 	}
-	stmt, err := s.DB.Prepare(sql)
+	rows, err := s.DB.Query(sql, parameters...)
 	if err != nil {
-		return nil, err
-	}
-	defer stmt.Close()
-	rows, err := stmt.Query(parameters...)
-	if err != nil {
-		return nil, err
+		stmt, err := s.DB.Prepare(sql)
+		if err != nil {
+			return nil, err
+		}
+		defer stmt.Close()
+		rows, err = stmt.Query(parameters...)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	return getPreparationRecordFrom(rows)

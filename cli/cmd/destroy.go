@@ -70,7 +70,7 @@ func (dc *DestroyCommand) Init() {
 func (dc *DestroyCommand) runDestroyWithUid(cmd *cobra.Command, args []string) error {
 	uid := args[0]
 	logrus.Infof("destroy by %s uid, force-remove: %t, target: %s", uid, dc.forceRemove, dc.expTarget)
-	model, err := GetDS().QueryExperimentModelByUid(uid)
+	model, err := data.GetSource().QueryExperimentModelByUid(uid)
 	lowerExpTarget := strings.ToLower(dc.expTarget)
 	isK8sTarget := lowerExpTarget == "kubernetes" || lowerExpTarget == "k8s"
 	if err != nil || model == nil {
@@ -192,7 +192,7 @@ func (dc *DestroyCommand) checkAndForceRemoveForK8sExp(name, kubeconfig string) 
 // checkAndForceRemoveForExpRecord deletes experiment record by uid if force-remove is true
 func (dc *DestroyCommand) checkAndForceRemoveForExpRecord(uid string) error {
 	if dc.forceRemove {
-		return GetDS().DeleteExperimentModelByUid(uid)
+		return data.GetSource().DeleteExperimentModelByUid(uid)
 	}
 	return nil
 }
@@ -206,7 +206,7 @@ func (dc *DestroyCommand) destroyExperiment(uid string, executor spec.Executor, 
 		return response
 	}
 	// return result
-	checkError(GetDS().UpdateExperimentModelByUid(uid, Destroyed, ""))
+	checkError(data.GetSource().UpdateExperimentModelByUid(uid, Destroyed, ""))
 	return nil
 }
 
@@ -332,12 +332,12 @@ func (dc *DestroyCommand) actionRunEFunc(target, scope string, _ *actionCommand,
 		}
 		// update status by finding related records
 		logrus.Infof("destroy by model: %+v, command: %s, subCommand: %s", expModel, command, subCommand)
-		experimentModels, err := GetDS().QueryExperimentModelsByCommand(command, subCommand, expModel.ActionFlags)
+		experimentModels, err := data.GetSource().QueryExperimentModelsByCommand(command, subCommand, expModel.ActionFlags)
 		if err != nil {
 			logrus.Warningf("destroy success but query records failed, %v", err)
 		} else {
 			for _, record := range experimentModels {
-				checkError(GetDS().UpdateExperimentModelByUid(record.Uid, Destroyed, ""))
+				checkError(data.GetSource().UpdateExperimentModelByUid(record.Uid, Destroyed, ""))
 			}
 		}
 		cmd.Println(spec.ReturnSuccess(expModel).Print())

@@ -89,7 +89,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 		return response
 	}
 	pc.processId = pid
-	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName, pc.processId)
+	record, err := data.GetSource().QueryRunningPreByTypeAndProcess(PrepareJvmType, pc.processName, pc.processId)
 	if err != nil {
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
@@ -244,7 +244,7 @@ func (pc *PrepareJvmCommand) invokeAttaching(port string, uid string) {
 }
 */
 func createPostBody(uid string) ([]byte, error) {
-	preparationRecord, err := GetDS().QueryPreparationByUid(uid)
+	preparationRecord, err := data.GetSource().QueryPreparationByUid(uid)
 	if err != nil {
 		return nil, err
 	}

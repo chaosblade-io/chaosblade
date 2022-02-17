@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"github.com/chaosblade-io/chaosblade/data"
 	"os"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -80,23 +81,23 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 	switch sc.commandType {
 	case "create", "destroy", "c", "d":
 		if uid != "" {
-			result, err = GetDS().QueryExperimentModelByUid(uid)
+			result, err = data.GetSource().QueryExperimentModelByUid(uid)
 		} else {
-			result, err = GetDS().QueryExperimentModels(sc.target, sc.action, sc.flag, sc.status, sc.limit, sc.asc)
+			result, err = data.GetSource().QueryExperimentModels(sc.target, sc.action, sc.flag, sc.status, sc.limit, sc.asc)
 		}
 	case "prepare", "revoke", "p", "r":
 		if uid != "" {
-			result, err = GetDS().QueryPreparationByUid(uid)
+			result, err = data.GetSource().QueryPreparationByUid(uid)
 		} else {
-			result, err = GetDS().QueryPreparationRecords(sc.target, sc.status, sc.action, sc.flag, sc.limit, sc.asc)
+			result, err = data.GetSource().QueryPreparationRecords(sc.target, sc.status, sc.action, sc.flag, sc.limit, sc.asc)
 		}
 	default:
 		if uid == "" {
 			return spec.ResponseFailWithFlags(spec.ParameterLess, "type|uid", "must specify the right type or uid")
 		}
-		result, err = GetDS().QueryExperimentModelByUid(uid)
+		result, err = data.GetSource().QueryExperimentModelByUid(uid)
 		if util.IsNil(result) || err != nil {
-			result, err = GetDS().QueryPreparationByUid(uid)
+			result, err = data.GetSource().QueryPreparationByUid(uid)
 		}
 	}
 	if err != nil {

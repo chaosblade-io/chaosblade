@@ -17,6 +17,7 @@
 package cmd
 
 import (
+	"github.com/chaosblade-io/chaosblade/data"
 	"strconv"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
@@ -54,7 +55,7 @@ func (pc *PrepareCPlusCommand) prepareExample() string {
 
 func (pc *PrepareCPlusCommand) prepareCPlus() error {
 	portStr := strconv.Itoa(pc.port)
-	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareCPlusType, portStr, "")
+	record, err := data.GetSource().QueryRunningPreByTypeAndProcess(PrepareCPlusType, portStr, "")
 	if err != nil {
 		util.Errorf("", util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)

@@ -44,6 +44,7 @@ var (
 type SourceI interface {
 	ExperimentSource
 	PreparationSource
+	Close()
 }
 
 type Source struct {
@@ -89,9 +90,36 @@ func (s *Source) getStmtPreparation() (*sql.Stmt, error) {
 	return stmt, nil
 }
 
+func (s *Source) queryTableSchema(tableName string) (*sql.Rows, error) {
+	var rows *sql.Rows
+	var err error
+	switch Type {
+	case "mysql":
+		rows, err = s.DB.Query(`SELECT count(*) AS c
+				FROM information_schema.tables
+				WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?`, Database, tableName)
+		break
+	default:
+		rows, err = s.DB.Query(`SELECT count(*) AS c
+				FROM sqlite_master
+				WHERE type = "table" AND name = ?`, tableName)
+		break
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query %s table exists err when invoke db prepare, %s", tableName, err)
+	}
+	return rows, nil
+}
+
 func (s *Source) init() {
 	s.CheckAndInitExperimentTable()
 	s.CheckAndInitPreTable()
+}
+
+func (s *Source) Close() {
+	if s.DB != nil {
+		s.DB.Close()
+	}
 }
 
 func getConnection() *sql.DB {
@@ -120,12 +148,6 @@ func getConnection() *sql.DB {
 	database.SetMaxOpenConns(20)
 	database.SetMaxIdleConns(2)
 	return database
-}
-
-func (s *Source) Close() {
-	if s.DB != nil {
-		s.DB.Close()
-	}
 }
 
 // GetUserVersion returns the user_version value
