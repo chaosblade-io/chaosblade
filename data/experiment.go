@@ -72,7 +72,7 @@ const expTableDDL = `CREATE TABLE IF NOT EXISTS experiment (
 	uid VARCHAR(32) UNIQUE,
 	command VARCHAR(16) NOT NULL,
 	sub_command VARCHAR(16),
-	flag VARCHAR(256),
+	flag VARCHAR(512),
 	status VARCHAR(16),
 	error VARCHAR(512),
 	create_time VARCHAR(32),
