@@ -103,6 +103,7 @@ func (cc *CreateCommand) bindFlagsFunction() func(commandFlags map[string]func()
 func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *actionCommand, actionCommandSpec spec.ExpActionCommandSpec) func(cmd *cobra.Command, args []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		expModel := createExpModel(target, scope, actionCommandSpec.Name(), cmd)
+		expModel.ActionProcessHang = actionCommandSpec.ProcessHang()
 		// check timeout flag
 		tt := expModel.ActionFlags["timeout"]
 		if tt != "" {
