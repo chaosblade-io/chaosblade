@@ -84,8 +84,8 @@ const preparationTableDDL = `CREATE TABLE IF NOT EXISTS preparation (
 	port       VARCHAR(8),
 	status     VARCHAR(16),
     error 	   VARCHAR(512),
-	create_time VARCHAR(32),
-	update_time VARCHAR(32),
+	create_time VARCHAR(64),
+	update_time VARCHAR(64),
 	pid 	   VARCHAR(8)
 )`
 

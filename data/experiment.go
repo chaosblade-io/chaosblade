@@ -75,8 +75,8 @@ const expTableDDL = `CREATE TABLE IF NOT EXISTS experiment (
 	flag VARCHAR(512),
 	status VARCHAR(16),
 	error VARCHAR(512),
-	create_time VARCHAR(32),
-	update_time VARCHAR(32)
+	create_time VARCHAR(64),
+	update_time VARCHAR(64)
 )`
 
 var expIndexDDL = []string{
