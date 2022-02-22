@@ -17,13 +17,16 @@
 package os
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/chaosblade-io/chaosblade-exec-os/exec"
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
+	os_exec "os/exec"
 	"path"
+	"strings"
+	"syscall"
 )
 
 type Executor struct {
@@ -37,18 +40,10 @@ func (*Executor) Name() string {
 	return "os"
 }
 
-var c = channel.NewLocalChannel()
-
-const (
-	OS_BIN  = "chaos_os"
-	CREATE  = "create"
-	DESTROY = "destroy"
-)
-
 func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
 
 	if model.ActionFlags[exec.ChannelFlag.Name] == "ssh" {
-		sshExecutor:= &exec.SSHExecutor{}
+		sshExecutor := &exec.SSHExecutor{}
 		return sshExecutor.Exec(uid, ctx, model)
 	}
 
@@ -58,20 +53,42 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		if v == "" {
 			continue
 		}
-		flags = fmt.Sprintf("%s %s=%s", flags, k, v)
+		flags = fmt.Sprintf("%s --%s=%s", flags, k, v)
 	}
 
-	if _, ok := spec.IsDestroy(ctx); ok {
-		args = fmt.Sprintf("%s %s %s%s uid=%s", DESTROY, model.Target, model.ActionName, flags, uid)
-	} else {
-		args = fmt.Sprintf("%s %s %s%s uid=%s", CREATE, model.Target, model.ActionName, flags, uid)
-	}
+	_, isDestroy := spec.IsDestroy(ctx)
 
-	response := c.Run(ctx, path.Join(util.GetBinPath(), OS_BIN), args)
-	if response.Success {
-		return spec.Decode(response.Result.(string), response)
+	if isDestroy {
+		args = fmt.Sprintf("%s %s %s%s uid=%s", spec.Destroy, model.Target, model.ActionName, flags, uid)
 	} else {
-		return response
+		args = fmt.Sprintf("%s %s %s%s uid=%s", spec.Create, model.Target, model.ActionName, flags, uid)
+	}
+	chaosOsBin := path.Join(util.GetProgramPath(), "bin", spec.ChaosOsBin)
+	argsArray := strings.Split(args, " ")
+	command := os_exec.CommandContext(ctx, chaosOsBin, argsArray...)
+
+	if model.ActionProcessHang && !isDestroy {
+		if err := command.Start(); err != nil {
+			sprintf := fmt.Sprintf("create experiment command start failed, %v", err)
+			return spec.ReturnFail(spec.OsCmdExecFailed, sprintf)
+		}
+		command.SysProcAttr = &syscall.SysProcAttr{}
+		return spec.ReturnSuccess(uid)
+	} else {
+		buf := new(bytes.Buffer)
+		command.Stdout = buf
+		command.Stderr = buf
+
+		if err := command.Start(); err != nil {
+			sprintf := fmt.Sprintf("create experiment command start failed, %v", err)
+			return spec.ReturnFail(spec.OsCmdExecFailed, sprintf)
+		}
+
+		if err := command.Wait(); err != nil {
+			sprintf := fmt.Sprintf("create experiment command wait failed, %v", err)
+			return spec.ReturnFail(spec.OsCmdExecFailed, sprintf)
+		}
+		return spec.Decode(buf.String(), nil)
 	}
 }
 
