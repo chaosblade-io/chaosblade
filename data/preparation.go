@@ -264,8 +264,12 @@ func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName
 	var query = `SELECT * FROM preparation WHERE program_type = ? and status = "Running"`
 	var rows *sql.Rows
 	var err error
-	if processId != "" || processName != "" {
-		query = fmt.Sprintf(`%s and (pid = ? OR process = ?)`, query)
+	if processId != "" && processName != "" {
+		query = fmt.Sprintf(`%s and pid = ? and process = ?`, query)
+	} else if processId != "" {
+		query = fmt.Sprintf(`%s and pid = ?`, query)
+	} else if processName != "" {
+		query = fmt.Sprintf(`%s and process = ?`, query)
 		rows, err = s.DB.Query(query, programType, processId, processName)
 	} else {
 		rows, err = s.DB.Query(query, programType)
@@ -276,8 +280,12 @@ func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName
 			return nil, err
 		}
 		defer stmt.Close()
-		if processId != "" || processName != "" {
+		if processId != "" && processName != "" {
 			rows, err = stmt.Query(programType, processId, processName)
+		} else if processId != "" {
+			rows, err = stmt.Query(programType, processId)
+		} else if processName != "" {
+			rows, err = stmt.Query(programType, processName)
 		} else {
 			rows, err = stmt.Query(programType)
 		}
