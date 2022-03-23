@@ -37,6 +37,12 @@ int main(int argc, char *argv[]) {
     int option_index = 0;
     char *string = "st:mpuni";
 
+    int ipcns = 0;
+    int utsns = 0;
+    int netns = 0;
+    int pidns = 0;
+    int mntns = 0;
+
     while((opt =getopt(argc, argv, string))!= -1) {
         switch (opt) {
             case 's':
@@ -46,24 +52,23 @@ int main(int argc, char *argv[]) {
                 target = optarg;
                 break;
             case 'm':
-                enter_namespace(target, "mnt");
+                mntns = 1;
                 break;
             case 'p':
-                enter_namespace(target, "pid");
+                pidns = 1;
                 break;
             case 'u':
-                enter_namespace(target, "uts");
+                utsns = 1;
                 break;
             case 'n':
-                enter_namespace(target, "net");
+                netns = 1;
                 break;
             case 'i':
-                enter_namespace(target, "ipc");
+                ipcns = 1;
                 break;
             default:
                 break;
         }
-
     }
 
     int i,j=0;
@@ -86,6 +91,26 @@ int main(int argc, char *argv[]) {
         pause();
         char *nc = "nsexec";
         prctl(PR_SET_NAME, nc);
+    }
+
+    if(ipcns) {
+        enter_namespace(target, "ipc");
+    }
+
+    if(utsns) {
+        enter_namespace(target, "uts");
+    }
+
+    if(netns) {
+        enter_namespace(target, "net");
+    }
+
+    if(pidns) {
+        enter_namespace(target, "pid");
+    }
+
+    if(mntns) {
+        enter_namespace(target, "mnt");
     }
 
     pid_t pid;

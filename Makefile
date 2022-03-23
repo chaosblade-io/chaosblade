@@ -93,7 +93,7 @@ help:
 ##@ Build
 build: pre_build cli os docker cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
 
-# for example: make build_with cli os_darwin
+# for example: make build_with cli
 build_with: pre_build ## Select scenario build, for example `make build_with cli os docker cri kubernetes java cplus`
 
 # for example: make build_with_linux cli os
@@ -108,7 +108,7 @@ build_linux:  ## Build linux version of all scenarios by docker image
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
 	make build_with_linux_arm ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
 
-build_darwin: pre_build cli os_darwin docker cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
+build_darwin: pre_build cli docker cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
 ##@ Build sub
 
@@ -133,19 +133,6 @@ endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
 endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
-	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
-	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
-
-os_darwin: ## Build basic resource experimental scenarios for darwin.
-ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
-	git clone -b $(BLADE_EXEC_OS_BRANCH) $(BLADE_EXEC_OS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-os
-else
-ifdef ALERTMSG
-	$(error $(ALERTMSG))
-endif
-	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
-endif
-	make build_darwin -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
 
