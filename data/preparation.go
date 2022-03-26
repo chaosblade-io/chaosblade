@@ -266,10 +266,10 @@ func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName
 	var err error
 	if processId != "" && processName != "" {
 		query = fmt.Sprintf(`%s and pid = ? and process = ?`, query)
-		rows, err = s.DB.Query(programType, processId, processName)
+		rows, err = s.DB.Query(query, programType, processId, processName)
 	} else if processId != "" {
 		query = fmt.Sprintf(`%s and pid = ?`, query)
-		rows, err = s.DB.Query(programType, processId)
+		rows, err = s.DB.Query(query, programType, processId)
 	} else if processName != "" {
 		query = fmt.Sprintf(`%s and process = ?`, query)
 		rows, err = s.DB.Query(query, programType, processName)
