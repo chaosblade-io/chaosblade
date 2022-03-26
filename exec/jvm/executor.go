@@ -34,6 +34,20 @@ import (
 
 const DefaultUri = "sandbox/" + DefaultNamespace + "/module/http/chaosblade"
 
+var ProcessUserPasswordFlag = &spec.ExpFlag{
+	Name:     "process-user-password",
+	Desc:     "Set target process user's password for process or jvm experiment's 'sudo -S -u' executing",
+	NoArgs:   false,
+	Required: false,
+}
+
+var PasswordClearFlag = &spec.ExpFlag{
+	Name:     "password-clear",
+	Desc:     "Indicate the password value is clear(not encrypted), default is false means that password value is encrypted",
+	NoArgs:   true,
+	Required: false,
+}
+
 // Executor for jvm experiment
 type Executor struct {
 	Uri     string
@@ -133,7 +147,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		// Install java agent
 		if port == "" || refresh {
 			logrus.Info("Install java agent")
-			response, newPort := Prepare(uid, processName, processId, javaHome)
+			response, newPort := Prepare(uid, processName, processId, javaHome, ctx)
 			if !response.Success {
 				return response
 			}
@@ -358,7 +372,7 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 	return processId, spec.ReturnSuccess("success")
 }
 
-func Prepare(uid, processName, processId, javaHome string) (response *spec.Response, port string) {
+func Prepare(uid, processName, processId, javaHome string, ctx context.Context) (response *spec.Response, port string) {
 	processId, response = CheckFlagValues(uid, processName, processId)
 	if !response.Success {
 		return
@@ -379,13 +393,13 @@ func Prepare(uid, processName, processId, javaHome string) (response *spec.Respo
 	}
 	var username string
 	port = record.Port
-	response, username = Attach(uid, port, javaHome, processId)
+	response, username = Attach(uid, processId, port, javaHome, ctx)
 	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err = CheckPortFromSandboxToken(username)
 		if err == nil {
 			logrus.Infof("use %s port to retry", port)
-			response, username = Attach(uid, port, "", processId)
+			response, username = Attach(uid, processId, "", javaHome, ctx)
 			if response.Success {
 				// update port
 				err := db.UpdatePreparationPortByUid(record.Uid, port)

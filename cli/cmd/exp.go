@@ -28,6 +28,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
+	osModel "github.com/chaosblade-io/chaosblade-exec-os/exec/model"
 	"github.com/chaosblade-io/chaosblade/exec/cplus"
 	"github.com/chaosblade-io/chaosblade/exec/cri"
 	"github.com/chaosblade-io/chaosblade/exec/docker"
@@ -145,13 +146,23 @@ func (ec *baseExpCommandService) registerOsExpCommands() []*modelCommand {
 // registerJvmExpCommands
 func (ec *baseExpCommandService) registerJvmExpCommands() []*modelCommand {
 	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
-	models, err := util.ParseSpecsToModel(file, jvm.NewExecutor())
+	models, err := util.ParseSpecsToModel(file, jvm.NewComposeExecutor())
 	if err != nil {
 		return nil
 	}
 	jvmCommands := make([]*modelCommand, 0)
 	for idx := range models.Models {
 		model := &models.Models[idx]
+		// add ssh flags for jvm action, use ssh channel by exec.NewSSHExecutor()
+		spec.AddFlagsToModelSpec(osModel.GetSSHExpFlags, model)
+		// add password flags
+		spec.AddFlagsToModelSpec(func() []spec.ExpFlagSpec {
+			flags := []spec.ExpFlagSpec{
+				jvm.ProcessUserPasswordFlag,
+				jvm.PasswordClearFlag,
+			}
+			return flags
+		}, model)
 		command := ec.registerExpCommand(model, "")
 		jvmCommands = append(jvmCommands, command)
 	}

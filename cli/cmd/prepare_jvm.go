@@ -43,6 +43,10 @@ type PrepareJvmCommand struct {
 	sandboxHome string
 	port        int
 	processId   string
+	// Set target process user's password for process or jvm experiment's 'sudo -S -u' executing
+	processUserPasswordFlag string
+	// Indicate the password value is clear(not encrypted), default is false, it means the password value is encrypted
+	passwordClearFlag bool
 	// Whether to attach asynchronously, default is false
 	async bool
 	// Used to internal asynchronous attach, no need to config
@@ -66,6 +70,8 @@ func (pc *PrepareJvmCommand) Init() {
 	}
 	pc.command.Flags().StringVarP(&pc.javaHome, "javaHome", "j", "", "the java jdk home path")
 	pc.command.Flags().StringVarP(&pc.processName, "process", "p", "", "the java application process name (required)")
+	pc.command.Flags().StringVar(&pc.processUserPasswordFlag, "process-user-password", "", "Set target process user's password for process or jvm experiment's 'sudo -S -u' executing")
+	pc.command.Flags().BoolVar(&pc.passwordClearFlag, "password-clear", false, "Indicate the password value is clear(not encrypted), default is false, it means the password value is encrypted")
 	pc.command.Flags().IntVarP(&pc.port, "port", "P", 0, "the port used for agent server")
 	pc.command.Flags().StringVarP(&pc.processId, "pid", "", "", "the target java process id")
 	pc.command.Flags().BoolVarP(&pc.async, "async", "a", false, "whether to attach asynchronously, default is false")
@@ -144,13 +150,16 @@ func (pc *PrepareJvmCommand) reportAttachedResult(response *spec.Response) {
 
 // attachAgent
 func (pc *PrepareJvmCommand) attachAgent() *spec.Response {
-	response, username := jvm.Attach(pc.uid, strconv.Itoa(pc.port), pc.javaHome, pc.processId)
+	ctx := context.TODO()
+	context.WithValue(ctx, jvm.UserPasswordKey, pc.processUserPasswordFlag)
+	context.WithValue(ctx, jvm.PasswordClearKey, pc.passwordClearFlag)
+	response, username := jvm.Attach(pc.uid, pc.processId, strconv.Itoa(pc.port), pc.javaHome, ctx)
 	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err := jvm.CheckPortFromSandboxToken(username)
 		if err == nil {
 			logrus.Infof("use %s port to retry", port)
-			response, username = jvm.Attach(pc.uid, port, pc.javaHome, pc.processId)
+			response, username = jvm.Attach(pc.uid, pc.processId, port, pc.javaHome, ctx)
 			if response.Success {
 				// update port
 				err := updatePreparationPort(pc.uid, port)

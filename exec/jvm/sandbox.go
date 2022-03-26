@@ -18,6 +18,7 @@ package jvm
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	osuser "os/user"
@@ -37,10 +38,12 @@ import (
 var cl = channel.NewLocalChannel()
 
 const DefaultNamespace = "chaosblade"
+const UserPasswordKey = "user-password"
+const PasswordClearKey = "password-clear"
 
-func Attach(uid, port, javaHome, pid string) (*spec.Response, string) {
+func Attach(uid, pid, port, javaHome string, ctx context.Context) (*spec.Response, string) {
 	// refresh
-	response, username := attach(uid, pid, port, context.TODO(), javaHome)
+	response, username := attach(uid, pid, port, ctx, javaHome)
 	if !response.Success {
 		return response, username
 	}
@@ -86,6 +89,27 @@ func active(uid, port string) *spec.Response {
 
 // attach java agent to application process
 func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
+	password := ctx.Value(UserPasswordKey)
+	if password != "" {
+		if ctx.Value(PasswordClearKey) != "true" {
+			/* password is encoded by '==' suffix and two times base64, like shell commands as follow:
+			➜ password=123456
+			➜ echo $password"==" | base64 | base64
+			TVRJek5EVTJQVDBLCg==
+			➜ chaosblade echo ${$(echo TVRJek5EVTJQVDBLCg== | base64 --decode | base64 --decode)/==}
+			123456
+			*/
+			decodedBytes, err := base64.StdEncoding.DecodeString(password.(string))
+			if err == nil {
+				if decodedBytes, err = base64.StdEncoding.DecodeString(string(decodedBytes)); err == nil {
+					password = strings.TrimSuffix(string(decodedBytes), "==")
+				}
+			}
+			if err != nil {
+				util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(pid, err))
+			}
+		}
+	}
 	username, err := getUsername(pid)
 	if err != nil {
 		util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(pid, err))
@@ -112,7 +136,12 @@ func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.
 			logrus.Infof("current user name is %s, not equal %s, so use sudo command to execute",
 				currUser.Username, username)
 		}
-		command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
+		// If password exists, use stdin(-S) to set password for sudo
+		if password != "" {
+			command = fmt.Sprintf("echo %s | sudo -S -u %s %s %s", password, username, javaBin, javaArgs)
+		} else {
+			command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
+		}
 	}
 	javaToolOptions := os.Getenv("JAVA_TOOL_OPTIONS")
 	if javaToolOptions != "" {
