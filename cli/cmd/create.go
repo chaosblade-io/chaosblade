@@ -80,6 +80,7 @@ func (cc *CreateCommand) bindFlagsFunction() func(commandFlags map[string]func()
 			flagDesc := flag.FlagDesc()
 			if flag.FlagRequired() {
 				flagDesc = fmt.Sprintf("%s (required)", flagDesc)
+				cmd.MarkPersistentFlagRequired(flagName)
 			}
 			if flag.FlagNoArgs() {
 				var key bool
@@ -89,13 +90,10 @@ func (cc *CreateCommand) bindFlagsFunction() func(commandFlags map[string]func()
 				}
 			} else {
 				var key string
-				cmd.PersistentFlags().StringVar(&key, flagName, "", flagDesc)
+				cmd.PersistentFlags().StringVar(&key, flagName, flag.FlagDefault(), flagDesc)
 				commandFlags[flagName] = func() string {
 					return key
 				}
-			}
-			if flag.FlagRequired() {
-				cmd.MarkPersistentFlagRequired(flagName)
 			}
 		}
 	}
