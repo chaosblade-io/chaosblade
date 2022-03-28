@@ -146,7 +146,7 @@ func getAttachJvmOpts(toolsJar string, token string, port string, pid string) st
 
 func getSandboxToken(ctx context.Context) (string, error) {
 	// create sandbox token
-	response := cl.Run(ctx, "date", "| head | cksum | sed 's/ //g'")
+	response := cl.Run(ctx, "", "date | head | cksum | sed 's/ //g'")
 	if !response.Success {
 		return "", fmt.Errorf(response.Err)
 	}
@@ -182,7 +182,11 @@ func getJavaBinAndJavaHome(javaHome string, pid string,
 	javaBin := "java"
 	if javaHome != "" {
 		javaBin = path.Join(javaHome, "bin/java")
-		return javaBin, javaHome
+		if util.IsExist(javaBin) {
+			return javaBin, javaHome
+		} else {
+			logrus.WithField("pid", pid).Warningln("initial javaHome or javaBin not exists")
+		}
 	}
 	if javaHome = strings.TrimSpace(os.Getenv("JAVA_HOME")); javaHome != "" {
 		javaBin = path.Join(javaHome, "bin/java")
@@ -198,8 +202,69 @@ func getJavaBinAndJavaHome(javaHome string, pid string,
 		return javaBin, javaHome
 	}
 	javaBin = strings.TrimSpace(cmdlineSlice[0])
+	// If the process use java command to start, then use 'whereis java' to check whole path
+	if javaBin == "java" {
+		// if shell terminal to exec doesn't have enough env variables, java command will not be found,
+		// like default local channel use /bin/sh, so source valid env files
+		sourceEnvCommand := `
+source /etc/profile
+if [ -f "/etc/zshrc" ]; then
+  source /etc/zshrc
+fi
+if [ -f "/etc/bashrc" ]; then
+  source /etc/bashrc
+fi
+if [ -f ~/.profile ]; then
+  source ~/.profile
+fi
+if [ -f ~/.zsh_profile ]; then
+  source ~/.zsh_profile
+fi
+if [ -f ~/.zshrc ]; then
+  source ~/.zshrc
+fi
+if [ -f ~/.bash_profile ]; then
+  source ~/.bash_profile
+fi
+if [ -f ~/.bashrc ]; then
+  source ~/.bashrc
+fi
+`
+		response := cl.Run(context.Background(), "", sourceEnvCommand + "whereis java")
+		if response.Success && response.Result != nil {
+			javaResult := response.Result.(string)
+			if strings.Contains(javaResult, ":") {
+				javaResult = strings.TrimSpace(strings.Split(javaResult, ":")[1])
+			}
+			if strings.HasPrefix(javaResult, "/") {
+				javaResult = strings.TrimSpace(javaResult)
+				javaBin = strings.Trim(strings.Split(javaResult, " ")[0], "\n")
+			} else {
+				logrus.WithField("pid", pid).Warningln("whereis java: " + response.ToString())
+			}
+		} else {
+			logrus.WithField("pid", pid).Warningln("check \"whereis java\" failed: " + response.ToString())
+			response := cl.Run(context.Background(), "", sourceEnvCommand + "echo $PATH")
+			if response.Success && response.Result != nil {
+				pathItem := strings.Split(response.Result.(string), ":")
+				for _, item := range pathItem {
+					if strings.Contains(item, "java") {
+						javaBin = path.Join(item, "java")
+						break
+					}
+				}
+			} else {
+				logrus.WithField("pid", pid).Warningln("try get java path by \"echo $PATH\" failed: " + response.ToString())
+			}
+		}
+	}
 	if strings.HasSuffix(javaBin, "/bin/java") {
 		javaHome = javaBin[:len(javaBin)-9]
+	} else {
+		lastDir := path.Dir(javaBin)
+		if util.IsDir(path.Join(path.Dir(javaBin), "jre")) {
+			javaHome = lastDir
+		}
 	}
 	return javaBin, javaHome
 }
