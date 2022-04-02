@@ -49,6 +49,7 @@ func (rc *RevokeCommand) Init() {
 
 func (rc *RevokeCommand) runRevoke(args []string) error {
 	uid := args[0]
+	ctx := context.WithValue(context.Background(), spec.Uid, uid)
 	record, err := GetDS().QueryPreparationByUid(uid)
 	if err != nil {
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
@@ -64,12 +65,12 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 	var channel = channel.NewLocalChannel()
 	switch record.ProgramType {
 	case PrepareJvmType:
-		response = jvm.Detach(uid, record.Port)
+		response = jvm.Detach(ctx, record.Port)
 	case PrepareCPlusType:
-		response = cplus.Revoke(uid, record.Port)
+		response = cplus.Revoke(ctx, record.Port)
 	case PrepareK8sType:
 		args := fmt.Sprintf("delete ns chaosblade")
-		response = channel.Run(context.Background(), "kubectl", args)
+		response = channel.Run(ctx, "kubectl", args)
 	default:
 		return spec.ResponseFailWithFlags(spec.ParameterIllegal, "type", record.ProgramType, "not support the type")
 	}

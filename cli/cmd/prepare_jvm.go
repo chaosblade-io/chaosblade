@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"path"
 	"strconv"
 	"strings"
@@ -28,7 +29,6 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade/data"
@@ -60,7 +60,8 @@ func (pc *PrepareJvmCommand) Init() {
 		Short: "Attach a type agent to the jvm process",
 		Long:  "Attach a type agent to the jvm process for java framework experiment.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return pc.prepareJvm()
+			ctx := context.WithValue(context.Background(), spec.Uid, pc.uid)
+			return pc.prepareJvm(ctx)
 		},
 		Example: pc.prepareExample(),
 	}
@@ -80,11 +81,11 @@ func (pc *PrepareJvmCommand) prepareExample() string {
 }
 
 // prepareJvm means attaching java agent
-func (pc *PrepareJvmCommand) prepareJvm() error {
+func (pc *PrepareJvmCommand) prepareJvm(ctx context.Context) error {
 	if pc.processName == "" && pc.processId == "" {
 		return spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 	}
-	pid, response := jvm.CheckFlagValues(pc.uid, pc.processName, pc.processId)
+	pid, response := jvm.CheckFlagValues(ctx, pc.processName, pc.processId)
 	if !response.Success {
 		return response
 	}
@@ -94,7 +95,7 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if !pc.nohup {
-		record, err = pc.ManualPreparation(record, err)
+		record, err = pc.ManualPreparation(ctx, record, err)
 		if err != nil {
 			return err
 		}
@@ -108,15 +109,15 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 	if pc.port == 0 && record != nil {
 		pc.port, _ = strconv.Atoi(record.Port)
 	}
-	response = pc.attachAgent()
+	response = pc.attachAgent(ctx)
 	if record != nil && record.Pid != pc.processId {
 		// update pid
 		updatePreparationPid(pc.uid, pc.processId)
 	}
 
-	preErr := handlePrepareResponseWithoutExit(pc.uid, pc.command, response)
+	preErr := handlePrepareResponseWithoutExit(ctx, pc.uid, pc.command, response)
 	if pc.async && pc.endpoint != "" {
-		pc.reportAttachedResult(response)
+		pc.reportAttachedResult(ctx, response)
 	}
 	if preErr == nil {
 		pc.command.Println(response.Print())
@@ -125,37 +126,37 @@ func (pc *PrepareJvmCommand) prepareJvm() error {
 	return preErr
 }
 
-func (pc *PrepareJvmCommand) reportAttachedResult(response *spec.Response) {
-	logrus.Infof("report response: %s to endpoint: %s", response.Print(), pc.endpoint)
-	body, err := createPostBody(pc.uid)
+func (pc *PrepareJvmCommand) reportAttachedResult(ctx context.Context, response *spec.Response) {
+	log.Infof(ctx, "report response: %s to endpoint: %s", response.Print(), pc.endpoint)
+	body, err := createPostBody(ctx)
 	if err != nil {
-		logrus.Warningf("create java install post body %s failed, %v", response.Print(), err)
+		log.Warnf(ctx, "create java install post body %s failed, %v", response.Print(), err)
 	} else {
 		result, err, code := util.PostCurl(pc.endpoint, body, "application/json")
 		if err != nil {
-			logrus.Warningf("report java install result %s failed, %v", response.Print(), err)
+			log.Warnf(ctx, "report java install result %s failed, %v", response.Print(), err)
 		} else if code != 200 {
-			logrus.Warningf("response code is %d, result %s", code, result)
+			log.Warnf(ctx, "response code is %d, result %s", code, result)
 		} else {
-			logrus.Infof("report java install result success, result %s", result)
+			log.Infof(ctx, "report java install result success, result %s", result)
 		}
 	}
 }
 
 // attachAgent
-func (pc *PrepareJvmCommand) attachAgent() *spec.Response {
-	response, username := jvm.Attach(pc.uid, strconv.Itoa(pc.port), pc.javaHome, pc.processId)
+func (pc *PrepareJvmCommand) attachAgent(ctx context.Context) *spec.Response {
+	response, username := jvm.Attach(ctx, strconv.Itoa(pc.port), pc.javaHome, pc.processId)
 	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
-		port, err := jvm.CheckPortFromSandboxToken(username)
+		port, err := jvm.CheckPortFromSandboxToken(ctx, username)
 		if err == nil {
-			logrus.Infof("use %s port to retry", port)
-			response, username = jvm.Attach(pc.uid, port, pc.javaHome, pc.processId)
+			log.Infof(ctx, "use %s port to retry", port)
+			response, username = jvm.Attach(ctx, port, pc.javaHome, pc.processId)
 			if response.Success {
 				// update port
 				err := updatePreparationPort(pc.uid, port)
 				if err != nil {
-					logrus.Warningf("update preparation port failed, %v", err)
+					log.Warnf(ctx, "update preparation port failed, %v", err)
 				}
 			}
 		}
@@ -163,7 +164,7 @@ func (pc *PrepareJvmCommand) attachAgent() *spec.Response {
 	return response
 }
 
-func (pc *PrepareJvmCommand) ManualPreparation(record *data.PreparationRecord, err error) (*data.PreparationRecord, error) {
+func (pc *PrepareJvmCommand) ManualPreparation(ctx context.Context, record *data.PreparationRecord, err error) (*data.PreparationRecord, error) {
 	if record == nil || record.Status != "Running" {
 		var port string
 		if pc.port != 0 {
@@ -189,7 +190,7 @@ func (pc *PrepareJvmCommand) ManualPreparation(record *data.PreparationRecord, e
 	}
 
 	if pc.async {
-		go pc.invokeAttaching(record.Port, record.Uid)
+		go pc.invokeAttaching(ctx, record.Port, record.Uid)
 		time.Sleep(time.Second)
 		pc.command.Println(spec.ReturnSuccess(record.Uid).Print())
 		// return record nil value to break flow
@@ -198,7 +199,7 @@ func (pc *PrepareJvmCommand) ManualPreparation(record *data.PreparationRecord, e
 	return record, nil
 }
 
-func (pc *PrepareJvmCommand) invokeAttaching(port string, uid string) {
+func (pc *PrepareJvmCommand) invokeAttaching(ctx context.Context, port string, uid string) {
 	args := fmt.Sprintf("prepare jvm --uid %s --nohup", uid)
 	if port != "" {
 		args = fmt.Sprintf("%s --port %s", args, port)
@@ -220,9 +221,9 @@ func (pc *PrepareJvmCommand) invokeAttaching(port string, uid string) {
 	}
 	response := channel.NewLocalChannel().Run(context.Background(), path.Join(util.GetProgramPath(), "blade"), args)
 	if response.Success {
-		logrus.Infof("attach java agent success, uid: %s", uid)
+		log.Infof(ctx, "attach java agent success, uid: %s", uid)
 	} else {
-		logrus.Warningf("attach java agent failed, err: %s, uid: %s", response.Err, uid)
+		log.Warnf(ctx, "attach java agent failed, err: %s, uid: %s", response.Err, uid)
 	}
 }
 
@@ -243,7 +244,7 @@ func (pc *PrepareJvmCommand) invokeAttaching(port string, uid string) {
   "type":"JAVA_AGENT_PREPARE"
 }
 */
-func createPostBody(uid string) ([]byte, error) {
+func createPostBody(ctx context.Context) ([]byte, error) {
 	preparationRecord, err := GetDS().QueryPreparationByUid(uid)
 	if err != nil {
 		return nil, err
@@ -255,10 +256,10 @@ func createPostBody(uid string) ([]byte, error) {
 	// encode
 	bytes, err := json.Marshal(bodyMap)
 	if err != nil {
-		logrus.Warningf("Marshal request body to json error. %v", err)
+		log.Warnf(ctx, "Marshal request body to json error. %v", err)
 		return nil, err
 	}
-	logrus.Infof("body: %s", string(bytes))
+	log.Infof(ctx, "body: %s", string(bytes))
 	return bytes, nil
 }
 

@@ -19,11 +19,11 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strings"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -49,7 +49,7 @@ func (ssc *StopServerCommand) run(cmd *cobra.Command, args []string) error {
 		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey, err)
 	}
 	if pids == nil || len(pids) == 0 {
-		logrus.Infof("the blade server process not found, so return success for stop operation")
+		log.Infof(context.Background(), "the blade server process not found, so return success for stop operation")
 		//log.Info("the blade server process not found, so return success for stop operation")
 		cmd.Println(spec.ReturnSuccess("success").Print())
 		return nil

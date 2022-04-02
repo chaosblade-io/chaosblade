@@ -17,12 +17,12 @@
 package data
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strings"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 type PreparationRecord struct {
@@ -103,8 +103,9 @@ var insertPreDML = `INSERT INTO
 func (s *Source) CheckAndInitPreTable() {
 	// check user_version
 	version, err := s.GetUserVersion()
+	ctx := context.Background()
 	if err != nil {
-		logrus.Fatalln(err.Error())
+		log.Fatalf(ctx, err.Error())
 		//log.Error(err, "GetUserVersion err")
 		//os.Exit(1)
 	}
@@ -115,7 +116,7 @@ func (s *Source) CheckAndInitPreTable() {
 	// check the table exists or not
 	exists, err := s.PreparationTableExists()
 	if err != nil {
-		logrus.Fatalln(err.Error())
+		log.Fatalf(ctx, err.Error())
 		//log.Error(err, "PreparationTableExists err")
 		//os.Exit(1)
 	}
@@ -123,7 +124,7 @@ func (s *Source) CheckAndInitPreTable() {
 		// execute alter sql if exists
 		err := s.AlterPreparationTable(addPidColumn)
 		if err != nil {
-			logrus.Fatalln(err.Error())
+			log.Fatalf(ctx, err.Error())
 			//log.Error(err, "AlterPreparationTable err", "addPidColumn", addPidColumn)
 			//os.Exit(1)
 		}
@@ -131,7 +132,7 @@ func (s *Source) CheckAndInitPreTable() {
 		// execute create table
 		err = s.InitPreparationTable()
 		if err != nil {
-			logrus.Fatalln(err.Error())
+			log.Fatalf(ctx, err.Error())
 			//log.Error(err, "InitPreparationTable err")
 			//os.Exit(1)
 		}
@@ -139,7 +140,7 @@ func (s *Source) CheckAndInitPreTable() {
 	// update userVersion to new
 	err = s.UpdateUserVersion(UserVersion)
 	if err != nil {
-		logrus.Fatalln(err.Error())
+		log.Fatalf(ctx, err.Error())
 		//log.Error(err, "UpdateUserVersion err", "UserVersion", UserVersion)
 		//os.Exit(1)
 	}

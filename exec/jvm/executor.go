@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strconv"
 	"strings"
 	"time"
@@ -27,7 +28,6 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
 
 	"github.com/chaosblade-io/chaosblade/data"
 )
@@ -67,9 +67,9 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 
 	// 2. get record from db by processname|processId
 	suid, isDestroy := spec.IsDestroy(ctx)
-	record, err := e.getRecordFromDB(uid, processName, processId)
+	record, err := e.getRecordFromDB(ctx, processName, processId)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("get",
+		log.Errorf(ctx, spec.DatabaseError.Sprintf("get",
 			fmt.Sprintf("where by processName:%s or pid%s", processName, processId), err.Error()))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "get",
 			fmt.Sprintf("where by processName:%s or pid%s", processName, processId), err.Error())
@@ -85,20 +85,20 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		if port == "" {
 			if suid == spec.UnknownUid {
 				if processName == "" && processId == "" {
-					util.Errorf(uid, util.GetRunFuncName(), spec.ParameterLess.Sprintf("process|pid"))
+					log.Errorf(ctx, spec.ParameterLess.Sprintf("process|pid"))
 					return spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 				}
 			}
 			if processName == "" && processId == "" {
 				return spec.ReturnSuccess(fmt.Sprintf("no prepare record, uid: %s", suid))
 			}
-			processId, response := CheckFlagValues(uid, processName, processId)
+			processId, response := CheckFlagValues(ctx, processName, processId)
 			if !response.Success {
 				return response
 			}
 			username, err := getUsername(processId)
 			if err != nil {
-				util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(processId, err))
+				log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(processId, err))
 				return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, processId, err)
 			}
 			// get port from sandbox.token
@@ -109,16 +109,16 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		}
 	} else {
 		if port == "" || err != nil {
-			logrus.Warn(fmt.Sprintf("select record fail, uid: %s, err: %v", uid, err))
+			log.Warnf(ctx, "select record fail, uid: %s, err: %v", uid, err)
 			if processName == "" && processId == "" {
-				util.Errorf(uid, util.GetRunFuncName(), spec.ParameterLess.Sprintf("process|pid"))
+				log.Errorf(ctx, spec.ParameterLess.Sprintf("process|pid"))
 				return spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 			}
 		}
 		if refresh {
 			// Uninstall java agent
-			logrus.Info("Uninstall java agent")
-			response := Revoke(uid, record, processName, processId)
+			log.Infof(ctx, "Uninstall java agent")
+			response := Revoke(ctx, record, processName, processId)
 			if !response.Success {
 				return response
 			}
@@ -126,14 +126,14 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 
 		// jvm restart case
 		if exists, _ := cl.ProcessExists(pid); !exists && port != "" {
-			logrus.Infof("pid %s not exists", pid)
+			log.Infof(ctx, "pid %s not exists", pid)
 			port = ""
 		}
 
 		// Install java agent
 		if port == "" || refresh {
-			logrus.Info("Install java agent")
-			response, newPort := Prepare(uid, processName, processId, javaHome)
+			log.Infof(ctx, "Install java agent")
+			response, newPort := Prepare(ctx, processName, processId, javaHome)
 			if !response.Success {
 				return response
 			}
@@ -150,37 +150,37 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		} else {
 			url = e.sandboxUrl(port, e.getDestroyRequestPathWithUid(uid))
 		}
-		result, err, code = util.Curl(url)
+		result, err, code = util.Curl(ctx, url)
 	} else {
 		var body []byte
-		url, body, resp := e.createUrl(port, uid, model)
+		url, body, resp := e.createUrl(ctx, port, model)
 		if err != nil {
 			return resp
 		}
 		result, err, code = util.PostCurl(url, body, "")
 	}
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code == 200 {
 		var resp spec.Response
 		err := json.Unmarshal([]byte(result), &resp)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), spec.ResultUnmarshalFailed.Sprintf(result, err))
+			log.Errorf(ctx, spec.ResultUnmarshalFailed.Sprintf(result, err))
 			return spec.ResponseFailWithFlags(spec.ResultUnmarshalFailed, result, err)
 		}
 		return &resp
 	}
-	util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+	log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
 	return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 }
 
-func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) (string, []byte, *spec.Response) {
+func (e *Executor) createUrl(ctx context.Context, port string, model *spec.ExpModel) (string, []byte, *spec.Response) {
 	url := e.sandboxUrl(port, "create")
 	bodyMap := make(map[string]string, 0)
 	bodyMap["target"] = model.Target
-	bodyMap["suid"] = suid
+	bodyMap["suid"] = ctx.Value(spec.Uid).(string)
 	bodyMap["action"] = model.ActionName
 
 	for k, v := range model.ActionFlags {
@@ -196,7 +196,7 @@ func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) (string, [
 	// encode
 	bytes, err := json.Marshal(bodyMap)
 	if err != nil {
-		util.Warnf(suid, util.GetRunFuncName(), spec.ResultMarshalFailed.Sprintf(bodyMap, err))
+		log.Warnf(ctx, spec.ResultMarshalFailed.Sprintf(bodyMap, err))
 		return "", nil, spec.ResponseFailWithFlags(spec.ResultMarshalFailed, bodyMap, err)
 	}
 	return url, bytes, nil
@@ -218,42 +218,43 @@ func (e *Executor) getStatusRequestPath(uid string) string {
 	return fmt.Sprintf("status?suid=%s", uid)
 }
 
-func (e *Executor) QueryStatus(uid string) *spec.Response {
+func (e *Executor) QueryStatus(ctx context.Context) *spec.Response {
+	uid := ctx.Value(spec.Uid).(string)
 	experimentModel, err := db.QueryExperimentModelByUid(uid)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
+		log.Errorf(ctx, spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if experimentModel == nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.DataNotFound.Sprintf(uid))
+		log.Errorf(ctx, spec.DataNotFound.Sprintf(uid))
 		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	// get process flag
 	process := getProcessFlagFromExpRecord(experimentModel)
-	record, err := e.getRecordFromDB(uid, process, "")
+	record, err := e.getRecordFromDB(ctx, process, "")
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
+		log.Errorf(ctx, spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.DataNotFound.Sprintf(uid))
+		log.Errorf(ctx, spec.DataNotFound.Sprintf(uid))
 		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	port := record.Port
 	url := e.sandboxUrl(port, e.getStatusRequestPath(uid))
-	result, err, code := util.Curl(url)
+	result, err, code := util.Curl(ctx, url)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code != 200 {
-		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	var resp spec.Response
 	err = json.Unmarshal([]byte(result), &resp)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.ResultUnmarshalFailed.Sprintf(result, err))
+		log.Errorf(ctx, spec.ResultUnmarshalFailed.Sprintf(result, err))
 		return spec.ResponseFailWithFlags(spec.ResultUnmarshalFailed, result, err)
 	}
 	return &resp
@@ -261,9 +262,9 @@ func (e *Executor) QueryStatus(uid string) *spec.Response {
 
 var db = data.GetSource()
 
-func (e *Executor) getRecordFromDB(uid, processName, processId string) (*data.PreparationRecord, error) {
+func (e *Executor) getRecordFromDB(ctx context.Context, processName, processId string) (*data.PreparationRecord, error) {
 	if processName != "" || processId != "" {
-		pid, response := CheckFlagValues(uid, processName, processId)
+		pid, response := CheckFlagValues(ctx, processName, processId)
 		if !response.Success {
 			return nil, fmt.Errorf(response.Err)
 		}
@@ -298,20 +299,20 @@ func getProcessFlagFromExpRecord(model *data.ExperimentModel) string {
 // 2. Process is empty, pid is not empty, then determine if the pid process exists
 // 3. Process is not empty, pid is empty, then it is judged whether the process exists, there is no error, and the process id is assigned to pid.
 // 4. Process and pid are both empty, then an error is returned.
-func CheckFlagValues(uid, processName, processId string) (string, *spec.Response) {
+func CheckFlagValues(ctx context.Context, processName, processId string) (string, *spec.Response) {
 	cl := channel.NewLocalChannel()
 	if processName == "" {
 		if processId == "" {
-			util.Errorf(uid, util.GetRunFuncName(), spec.ParameterLess.Sprintf("process|pid"))
+			log.Errorf(ctx, spec.ParameterLess.Sprintf("process|pid"))
 			return "", spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 		}
 		exists, err := cl.ProcessExists(processId)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), spec.ProcessJudgeExistFailed.Sprintf(processId, err))
+			log.Errorf(ctx, spec.ProcessJudgeExistFailed.Sprintf(processId, err))
 			return "", spec.ResponseFailWithFlags(spec.ProcessJudgeExistFailed, processId, err)
 		}
 		if !exists {
-			util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProName.Sprintf("pid", processId))
+			log.Errorf(ctx, spec.ParameterInvalidProName.Sprintf("pid", processId))
 			return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProName, "pid", processId)
 		}
 	}
@@ -322,23 +323,23 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 		ctx = context.WithValue(ctx, channel.ExcludeProcessKey, "blade")
 		pids, err := cl.GetPidsByProcessName(processName, ctx)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), spec.ProcessIdByNameFailed.Sprintf(processName, err))
+			log.Errorf(ctx, spec.ProcessIdByNameFailed.Sprintf(processName, err))
 			return "", spec.ResponseFailWithFlags(spec.ProcessIdByNameFailed, processName, err)
 		}
 		if pids == nil || len(pids) == 0 {
-			util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProName.Sprintf("process", processName))
+			log.Errorf(ctx, spec.ParameterInvalidProName.Sprintf("process", processName))
 			return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProName, "process", processName)
 		}
 		if len(pids) == 1 {
 			if processId == "" {
 				processId = pids[0]
 			} else if processId != pids[0] {
-				util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
+				log.Errorf(ctx, spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
 				return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProIdNotByName, processName, processId)
 			}
 		} else {
 			if processId == "" {
-				util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidTooManyProcess.Sprintf(processName))
+				log.Errorf(ctx, spec.ParameterInvalidTooManyProcess.Sprintf(processName))
 				return "", spec.ResponseFailWithFlags(spec.ParameterInvalidTooManyProcess, processName)
 			} else {
 				var contains bool
@@ -349,7 +350,7 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 					}
 				}
 				if !contains {
-					util.Errorf(uid, util.GetRunFuncName(), spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
+					log.Errorf(ctx, spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
 					return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProIdNotByName, processName, processId)
 				}
 			}
@@ -358,8 +359,8 @@ func CheckFlagValues(uid, processName, processId string) (string, *spec.Response
 	return processId, spec.ReturnSuccess("success")
 }
 
-func Prepare(uid, processName, processId, javaHome string) (response *spec.Response, port string) {
-	processId, response = CheckFlagValues(uid, processName, processId)
+func Prepare(ctx context.Context, processName, processId, javaHome string) (response *spec.Response, port string) {
+	processId, response = CheckFlagValues(ctx, processName, processId)
 	if !response.Success {
 		return
 	}
@@ -368,29 +369,29 @@ func Prepare(uid, processName, processId, javaHome string) (response *spec.Respo
 		// get port from local port
 		port, err = getAndCacheSandboxPort()
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), spec.SandboxGetPortFailed.Sprintf(err))
+			log.Errorf(ctx, spec.SandboxGetPortFailed.Sprintf(err))
 			return spec.ResponseFailWithFlags(spec.SandboxGetPortFailed, err), port
 		}
 		record, err = insertPrepareRecord("jvm", processName, port, processId)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), spec.DatabaseError.Sprintf("insert", err))
+			log.Errorf(ctx, spec.DatabaseError.Sprintf("insert", err))
 			return spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err), port
 		}
 	}
 	var username string
 	port = record.Port
-	response, username = Attach(uid, port, javaHome, processId)
+	response, username = Attach(ctx, port, javaHome, processId)
 	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
-		port, err = CheckPortFromSandboxToken(username)
+		port, err = CheckPortFromSandboxToken(ctx, username)
 		if err == nil {
-			logrus.Infof("use %s port to retry", port)
-			response, username = Attach(uid, port, "", processId)
+			log.Infof(ctx, "use %s port to retry", port)
+			response, username = Attach(ctx, port, "", processId)
 			if response.Success {
 				// update port
 				err := db.UpdatePreparationPortByUid(record.Uid, port)
 				if err != nil {
-					logrus.Warningf("update preparation port failed, %v", err)
+					log.Warnf(ctx, "update preparation port failed, %v", err)
 				}
 			}
 		}
@@ -399,21 +400,21 @@ func Prepare(uid, processName, processId, javaHome string) (response *spec.Respo
 		// update pid
 		db.UpdatePreparationPidByUid(record.Uid, processId)
 	}
-	handlePrepareResponse(record.Uid, response)
+	handlePrepareResponse(ctx, record.Uid, response)
 	return response, port
 }
 
 // Revoke 卸载 Java agent
-func Revoke(uid string, record *data.PreparationRecord, processName, processId string) *spec.Response {
+func Revoke(ctx context.Context, record *data.PreparationRecord, processName, processId string) *spec.Response {
 	var port string
 	if record == nil {
-		processId, response := CheckFlagValues(uid, processName, processId)
+		processId, response := CheckFlagValues(ctx, processName, processId)
 		if !response.Success {
 			return response
 		}
 		username, err := getUsername(processId)
 		if err != nil {
-			util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(processId, err))
+			log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(processId, err))
 			return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, processId, err)
 		}
 		// get port from sandbox.token
@@ -427,11 +428,8 @@ func Revoke(uid string, record *data.PreparationRecord, processName, processId s
 		}
 		port = record.Port
 	}
-	if response := Detach(uid, port); !response.Success {
-		logrus.WithFields(logrus.Fields{
-			"processName": processName,
-			"processId":   processId,
-		}).Warningln(response.Print())
+	if response := Detach(ctx, port); !response.Success {
+		log.Warnf(ctx, "processName: %s, processId: %s , %s", processName, processId, response.Print())
 	}
 	// TODO 默认成功，不影响后续执行
 	return spec.ReturnSuccess("success")
@@ -470,7 +468,7 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 	return record, nil
 }
 
-func handlePrepareResponse(uid string, response *spec.Response) {
+func handlePrepareResponse(ctx context.Context, uid string, response *spec.Response) {
 	response.Result = uid
 	if !response.Success {
 		db.UpdatePreparationRecordByUid(uid, "Error", response.Err)
@@ -478,6 +476,6 @@ func handlePrepareResponse(uid string, response *spec.Response) {
 	}
 	err := db.UpdatePreparationRecordByUid(uid, "Running", "")
 	if err != nil {
-		logrus.Warningf("update preparation record error: %s", err.Error())
+		log.Warnf(ctx, "update preparation record error: %s", err.Error())
 	}
 }
