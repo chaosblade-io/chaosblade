@@ -17,11 +17,12 @@
 package cmd
 
 import (
+	"context"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade/data"
@@ -81,7 +82,7 @@ func insertPrepareRecord(prepareType string, processName, port, processId string
 	return record, nil
 }
 
-func handlePrepareResponseWithoutExit(uid string, cmd *cobra.Command, response *spec.Response) error {
+func handlePrepareResponseWithoutExit(ctx context.Context, uid string, cmd *cobra.Command, response *spec.Response) error {
 	response.Result = uid
 	if !response.Success {
 		GetDS().UpdatePreparationRecordByUid(uid, Error, response.Err)
@@ -89,12 +90,13 @@ func handlePrepareResponseWithoutExit(uid string, cmd *cobra.Command, response *
 	}
 	err := GetDS().UpdatePreparationRecordByUid(uid, Running, "")
 	if err != nil {
-		logrus.Warningf("update preparation record error: %s", err.Error())
+		log.Warnf(ctx, "update preparation record error: %s", err.Error())
 	}
 	return nil
 }
 
-func handlePrepareResponse(uid string, cmd *cobra.Command, response *spec.Response) error {
+func handlePrepareResponse(ctx context.Context, cmd *cobra.Command, response *spec.Response) error {
+	uid = ctx.Value(spec.Uid).(string)
 	response.Result = uid
 	if !response.Success {
 		GetDS().UpdatePreparationRecordByUid(uid, Error, response.Err)
@@ -102,7 +104,7 @@ func handlePrepareResponse(uid string, cmd *cobra.Command, response *spec.Respon
 	}
 	err := GetDS().UpdatePreparationRecordByUid(uid, Running, "")
 	if err != nil {
-		logrus.Warningf("update preparation record error: %s", err.Error())
+		log.Warnf(ctx, "update preparation record error: %s", err.Error())
 		//log.V(-1).Info("update preparation record error", "err_msg", err.Error())
 	}
 	response.Result = uid

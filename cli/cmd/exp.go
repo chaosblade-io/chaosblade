@@ -17,14 +17,15 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"path"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	specutil "github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
@@ -340,7 +341,7 @@ func addTimeoutFlag(flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
 // checkError for db operation
 func checkError(err error) {
 	if err != nil {
-		logrus.Warningf(err.Error())
+		log.Warnf(context.Background(), err.Error())
 		//log.V(-1).Info(err.Error())
 	}
 }

@@ -20,12 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"os/exec"
 	"path"
 	"strconv"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/pflag"
 
 	"github.com/chaosblade-io/chaosblade/data"
@@ -119,12 +119,16 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 		var model *data.ExperimentModel
 		var resp *spec.Response
 		var err error
+		ctx := context.Background()
+
 		if nohup {
 			uid := expModel.ActionFlags[UidFlag]
 			if uid == "" {
-				logrus.Infof("can not execute nohup, uid is null")
+				ctx := context.Background()
+				log.Infof(ctx, "can not execute nohup, uid is null")
 				return spec.ResponseFailWithFlags(spec.ParameterLess, UidFlag)
 			} else {
+				ctx = context.WithValue(context.Background(), spec.Uid, uid)
 				model, err = GetDS().QueryExperimentModelByUid(uid)
 				if err == nil {
 					delete(expModel.ActionFlags, NohupFlag)
@@ -162,10 +166,10 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			args = fmt.Sprintf("%s %s %s", path.Join(util.GetProgramPath(), "blade"), args, "> /dev/null 2>&1 &")
 			response := channel.NewLocalChannel().Run(context.Background(), "nohup", args)
 			if response.Success {
-				logrus.Infof("async create success, uid: %s", model.Uid)
+				log.Infof(ctx, "async create success, uid: %s", model.Uid)
 				cmd.Println(spec.ReturnSuccess(model.Uid).Print())
 			} else {
-				logrus.Warningf("async create fail, err: %s, uid: %s", response.Err, model.Uid)
+				log.Warnf(ctx, "async create fail, err: %s, uid: %s", response.Err, model.Uid)
 				cmd.Println(spec.ResponseFailWithFlags(spec.OsCmdExecFailed, "nohup", response.Err).Print())
 			}
 			return nil
@@ -173,13 +177,14 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			// execute experiment
 			executor := actionCommandSpec.Executor()
 			executor.SetChannel(channel.NewLocalChannel())
-			response := executor.Exec(model.Uid, context.Background(), expModel)
+			ctx := context.WithValue(context.Background(), spec.Uid, model.Uid)
+			response := executor.Exec(model.Uid, ctx, expModel)
 			response.Result = model.Uid
 			if response.Code == spec.ReturnOKDirectly.Code {
 				// return directly
 				response.Code = spec.OK.Code
 				cmd.Println(response.Print())
-				endpointCallBack(endpoint, model.Uid, response)
+				endpointCallBack(ctx, endpoint, model.Uid, response)
 			}
 			// pass the uid, expModel to actionCommand
 			actionCommand.expModel = expModel
@@ -188,34 +193,34 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			if !response.Success {
 				// update status
 				checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, response.Err))
-				endpointCallBack(endpoint, model.Uid, response)
+				endpointCallBack(ctx, endpoint, model.Uid, response)
 				return response
 			}
 			// update status
 			checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
 			response.Result = model.Uid
 			cmd.Println(response.Print())
-			endpointCallBack(endpoint, model.Uid, response)
+			endpointCallBack(ctx, endpoint, model.Uid, response)
 			return nil
 		}
 	}
 }
 
-func endpointCallBack(endpoint, uid string, response *spec.Response) {
+func endpointCallBack(ctx context.Context, endpoint, uid string, response *spec.Response) {
 	if endpoint != "" {
-		logrus.Infof("report response: %s to endpoint: %s", response.Print(), endpoint)
+		log.Infof(ctx, "report response: %s to endpoint: %s", response.Print(), endpoint)
 		experimentModel, _ := GetDS().QueryExperimentModelByUid(uid)
 		body, err := json.Marshal(experimentModel)
 		if err != nil {
-			logrus.Warningf("create post body %s failed, %v", response.Print(), err)
+			log.Warnf(ctx, "create post body %s failed, %v", response.Print(), err)
 		} else {
 			result, err, code := util.PostCurl(endpoint, body, "application/json")
 			if err != nil {
-				logrus.Warningf("report result %s failed, %v", response.Print(), err)
+				log.Warnf(ctx, "report result %s failed, %v", response.Print(), err)
 			} else if code != 200 {
-				logrus.Warningf("response code is %d, result %s", code, result)
+				log.Warnf(ctx, "response code is %d, result %s", code, result)
 			} else {
-				logrus.Infof("report result success, result %s", result)
+				log.Infof(ctx, "report result success, result %s", result)
 			}
 		}
 	}

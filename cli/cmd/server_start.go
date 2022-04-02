@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"net/http"
 	"os"
 	"path"
@@ -27,7 +28,6 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
@@ -85,7 +85,8 @@ func (ssc *StartServerCommand) start() error {
 	if ssc.ip != "" {
 		args = fmt.Sprintf("%s --ip %s", args, ssc.ip)
 	}
-	response := cl.Run(context.TODO(), "nohup", fmt.Sprintf("%s > /dev/null 2>&1 &", args))
+	ctx := context.Background()
+	response := cl.Run(ctx, "nohup", fmt.Sprintf("%s > /dev/null 2>&1 &", args))
 	if !response.Success {
 		return response
 	}
@@ -113,7 +114,7 @@ func (ssc *StartServerCommand) start() error {
 		}
 		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey, response.Err)
 	}
-	logrus.Infof("start blade server success, listen on %s:%s", ssc.ip, ssc.port)
+	log.Infof(ctx, "start blade server success, listen on %s:%s", ssc.ip, ssc.port)
 	return nil
 }
 
@@ -122,7 +123,7 @@ func (ssc *StartServerCommand) start0() {
 	go func() {
 		err := http.ListenAndServe(ssc.ip+":"+ssc.port, nil)
 		if err != nil {
-			logrus.Errorf("start blade server error, %v", err)
+			log.Errorf(context.Background(),"start blade server error, %v", err)
 			//log.Error(err, "start blade server error")
 			os.Exit(1)
 		}
@@ -145,7 +146,7 @@ func Register(requestPath string) {
 		}
 		ctx := context.WithValue(context.Background(), "mode", "server")
 		response := channel.NewLocalChannel().Run(ctx, path.Join(util.GetProgramPath(), "blade"), cmds[0])
-		logrus.Debugf("Server response: %v", response)
+		log.Debugf(ctx, "Server response: %v", response)
 		fmt.Fprintf(writer, response.Print())
 	})
 }

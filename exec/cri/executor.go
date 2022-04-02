@@ -18,11 +18,11 @@ package cri
 
 import (
 	"context"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 
 	"github.com/chaosblade-io/chaosblade-exec-cri/exec"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 type Executor struct {
@@ -43,7 +43,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	key := exec.GetExecutorKey(model.Target, model.ActionName)
 	executor := e.executors[key]
 	if executor == nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.CriExecNotFound.Sprintf(key))
+		log.Errorf(ctx, spec.CriExecNotFound.Sprintf(key))
 		return spec.ResponseFailWithFlags(spec.CriExecNotFound, key)
 	}
 	executor.SetChannel(channel.NewLocalChannel())

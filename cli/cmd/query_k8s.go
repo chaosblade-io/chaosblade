@@ -17,7 +17,9 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 
 	"github.com/spf13/cobra"
 
@@ -49,7 +51,8 @@ func (q *QueryK8sCommand) queryK8sExample() string {
 
 // queryK8sExpStatus by uid
 func (q *QueryK8sCommand) queryK8sExpStatus(command *cobra.Command, cmd, uid string) error {
-	response, _ := kubernetes.QueryStatus(cmd, uid, q.kubeconfig)
+	ctx := context.WithValue(context.Background(), spec.Uid, uid)
+	response, _ := kubernetes.QueryStatus(ctx, cmd, q.kubeconfig)
 	if response.Success {
 		command.Println(response.Print())
 	} else {

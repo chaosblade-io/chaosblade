@@ -17,6 +17,8 @@
 package cmd
 
 import (
+	"context"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strconv"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
@@ -53,19 +55,21 @@ func (pc *PrepareCPlusCommand) prepareExample() string {
 }
 
 func (pc *PrepareCPlusCommand) prepareCPlus() error {
+	ctx := context.Background()
 	portStr := strconv.Itoa(pc.port)
 	record, err := GetDS().QueryRunningPreByTypeAndProcess(PrepareCPlusType, portStr, "")
 	if err != nil {
-		util.Errorf("", util.GetRunFuncName(), spec.DatabaseError.Sprintf("query", err))
+		log.Errorf(ctx, spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil || record.Status != Running {
 		record, err = insertPrepareRecord(PrepareCPlusType, portStr, portStr, "")
 		if err != nil {
-			util.Errorf("", util.GetRunFuncName(), spec.DatabaseError.Sprintf("insert", err))
+			log.Errorf(ctx, util.GetRunFuncName(), spec.DatabaseError.Sprintf("insert", err))
 			return spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err)
 		}
 	}
-	response := cplus.Prepare(record.Uid, portStr, pc.ip)
-	return handlePrepareResponse(record.Uid, pc.command, response)
+	ctx = context.WithValue(ctx, spec.Uid, record.Uid)
+	response := cplus.Prepare(ctx, portStr, pc.ip)
+	return handlePrepareResponse(ctx, pc.command, response)
 }

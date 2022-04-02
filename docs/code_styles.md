@@ -171,7 +171,7 @@ return retryLoad()
 
 ### RULE007 - Lowercase log and error
 
-No matter log or error, first letter of the message must be lower-case. So, `logrus.Debugf("failed to add list: %v", err)` is encouraged. And `logrus.Debugf("Failed to add list: %v", err)` is not perferred.
+No matter log or error, first letter of the message must be lower-case. So, `log.Debugf("failed to add list: %v", err)` is encouraged. And `log.Debugf("Failed to add list: %v", err)` is not perferred.
 
 ### RULE008 - Nested errors
 

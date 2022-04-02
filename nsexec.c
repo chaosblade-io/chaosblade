@@ -12,6 +12,8 @@
 #include <sys/wait.h>
 #include <sys/prctl.h>
 
+extern char** environ;
+
 void enter_namespace(char* target, char* type)
 {
     char namespace_path[1024];
