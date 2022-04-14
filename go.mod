@@ -3,9 +3,9 @@ module github.com/chaosblade-io/chaosblade
 go 1.13
 
 require (
-	github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220329020941-416d4cde682b
-	github.com/chaosblade-io/chaosblade-exec-os v1.5.1-0.20220403082616-dec506a55be7
-	github.com/chaosblade-io/chaosblade-operator v1.5.1-0.20220329021209-8f9e1e9b6287
+	github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220414062646-d65e7db648f7
+	github.com/chaosblade-io/chaosblade-exec-os v1.5.1-0.20220414062130-f930629babd8
+	github.com/chaosblade-io/chaosblade-operator v1.5.1-0.20220414062903-5eaea8ce82f3
 	github.com/chaosblade-io/chaosblade-spec-go v1.5.1-0.20220403044331-978f0910eaf3
 	github.com/mattn/go-sqlite3 v1.10.1-0.20190217174029-ad30583d8387
 	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
@@ -19,8 +19,3 @@ require (
 )
 
 replace k8s.io/client-go => k8s.io/client-go v0.20.6
-
-replace (
-	github.com/chaosblade-io/chaosblade-exec-os => /Users/xf.yefei/Projects/github/chaosblade/chaosblade-exec-os
-	github.com/chaosblade-io/chaosblade-spec-go => /Users/xf.yefei/Projects/github/chaosblade/chaosblade-spec-go
-)
