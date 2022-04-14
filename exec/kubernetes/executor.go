@@ -159,7 +159,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 	}
 	duration = d
 	if duration > time.Second {
-		ctx, cancel := context.WithTimeout(context.Background(), duration)
+		ctx, cancel := context.WithTimeout(ctx, duration)
 		defer cancel()
 		ticker := time.NewTicker(time.Second)
 	TickerLoop:

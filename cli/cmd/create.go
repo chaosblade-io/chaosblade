@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"github.com/shirou/gopsutil/process"
 	"os/exec"
 	"path"
 	"strconv"
@@ -179,7 +180,6 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 			executor.SetChannel(channel.NewLocalChannel())
 			ctx := context.WithValue(context.Background(), spec.Uid, model.Uid)
 			response := executor.Exec(model.Uid, ctx, expModel)
-			response.Result = model.Uid
 			if response.Code == spec.ReturnOKDirectly.Code {
 				// return directly
 				response.Code = spec.OK.Code
@@ -196,8 +196,23 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 				endpointCallBack(ctx, endpoint, model.Uid, response)
 				return response
 			}
-			// update status
-			checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
+			if expModel.ActionProcessHang {
+				// todo -> need to find a better way to query the status
+				time.Sleep(time.Millisecond * 100)
+				log.Debugf(ctx, "result: %v", response.Result)
+				_, err := process.NewProcess(int32(response.Result.(int)))
+				if err != nil {
+					errMsg := fmt.Sprintf("chaos_os process not found, please check chaosblade log, err: %s", err.Error())
+					checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, errMsg))
+					response.Err = errMsg
+				} else {
+					// update status
+					checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
+				}
+			} else {
+				// update status
+				checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
+			}
 			response.Result = model.Uid
 			cmd.Println(response.Print())
 			endpointCallBack(ctx, endpoint, model.Uid, response)

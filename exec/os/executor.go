@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/chaosblade-io/chaosblade-exec-os/exec"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	os_exec "os/exec"
@@ -50,7 +51,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	var args string
 	var flags string
 	for k, v := range model.ActionFlags {
-		if v == "" {
+		if v == "" ||  k == "timeout" {
 			continue
 		}
 		flags = fmt.Sprintf("%s --%s=%s", flags, k, v)
@@ -66,6 +67,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	chaosOsBin := path.Join(util.GetProgramPath(), "bin", spec.ChaosOsBin)
 	argsArray := strings.Split(args, " ")
 	command := os_exec.CommandContext(ctx, chaosOsBin, argsArray...)
+	log.Debugf(ctx, "run command, %s %s", chaosOsBin, args)
 
 	if model.ActionProcessHang && !isDestroy {
 		if err := command.Start(); err != nil {
@@ -73,21 +75,25 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 			return spec.ReturnFail(spec.OsCmdExecFailed, sprintf)
 		}
 		command.SysProcAttr = &syscall.SysProcAttr{}
-		return spec.ReturnSuccess(uid)
+		return spec.ReturnSuccess(command.Process.Pid)
 	} else {
 		buf := new(bytes.Buffer)
 		command.Stdout = buf
 		command.Stderr = buf
-
 		if err := command.Start(); err != nil {
 			sprintf := fmt.Sprintf("create experiment command start failed, %v", err)
 			return spec.ReturnFail(spec.OsCmdExecFailed, sprintf)
 		}
 
 		if err := command.Wait(); err != nil {
-			sprintf := fmt.Sprintf("create experiment command wait failed, %v", err)
+			sprintf := fmt.Sprintf("create experiment command wait failed, %s", err.Error())
+			log.Debugf(ctx, "command result: %s, err: %s", buf.String(), err.Error())
+			if buf.Len() > 0  {
+				return spec.ReturnFail(spec.OsCmdExecFailed, buf.String())
+			}
 			return spec.ReturnFail(spec.OsCmdExecFailed, sprintf)
 		}
+		log.Debugf(ctx, "command result: %s", buf.String())
 		return spec.Decode(buf.String(), nil)
 	}
 }
