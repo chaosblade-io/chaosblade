@@ -75,7 +75,7 @@ CRI_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(CRI_YAML_FILE_NAME)
 
 # check yaml
 CHECK_YAML_FILE_NAME=chaosblade-check-spec-$(BLADE_VERSION).yaml
-CHECK_YANL_FILE_OSS=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/$(BLADE_VERSION)/$(CHECK_YAML_FILE_NAME)
+CHECK_YAML_FILE_OSS=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/$(BLADE_VERSION)/$(CHECK_YAML_FILE_NAME)
 CHECK_YAML_FILE_PATH=$(BUILD_TARGET_YAML)/$(CHECK_YAML_FILE_NAME)
 
 ifeq ($(GOOS), linux)
@@ -255,7 +255,7 @@ package: ## Generate the tar packages
 	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
 
 check_yaml:
-	wget "$(CHECK_YANL_FILE_OSS)" -O $(CHECK_YAML_FILE_PATH)
+	wget "$(CHECK_YAML_FILE_OSS)" -O $(CHECK_YAML_FILE_PATH)
 
 ## Select scenario build linux version by docker image
 build_linux_with_arg:
