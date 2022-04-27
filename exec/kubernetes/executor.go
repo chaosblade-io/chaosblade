@@ -116,8 +116,7 @@ func QueryStatus(operation, uid, kubeconfig string) (*spec.Response, bool) {
 			return spec.ResponseFail(statuses[0].Code, statusResult.Error, statusResult), completed(operation, statusResult)
 		}
 	}
-	return spec.ResponseFailWithResult(spec.UnexpectedStatus, statusResult, operation, chaosblade.Status.Phase),
-		completed(operation, statusResult)
+	return spec.ResponseFail(spec.UnexpectedStatus.Code, statusResult.Error, statusResult), completed(operation, statusResult)
 }
 
 func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel) *spec.Response {
