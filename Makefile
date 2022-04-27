@@ -91,7 +91,7 @@ help:
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>...\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m  %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Build
-build: pre_build cli os docker cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
+build: pre_build cli nsexec os cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
 
 # for example: make build_with cli
 build_with: pre_build ## Select scenario build, for example `make build_with cli os docker cri kubernetes java cplus`
@@ -108,7 +108,7 @@ build_linux:  ## Build linux version of all scenarios by docker image
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
 	make build_with_linux_arm ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
 
-build_darwin: pre_build cli docker cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
+build_darwin: pre_build cli os cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
 ##@ Build sub
 
@@ -121,6 +121,8 @@ pre_build: mkdir_build_target ## Mkdir build target
 .PHONY:cli
 cli: ## Build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
+
+nsexec: ## Build nsexec
 	/usr/local/musl/bin/musl-gcc -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
 
 os: ## Build basic resource experimental scenarios.
