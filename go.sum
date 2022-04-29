@@ -164,17 +164,12 @@ github.com/cespare/xxhash/v2 v2.1.0/go.mod h1:dgIUBU3pDso/gPgZ1osOZ0iQf77oPR28Tj
 github.com/cespare/xxhash/v2 v2.1.1 h1:6MnRN8NT7+YBpUIWxHtefFZOKTAPgGjpQSxqLNn0+qY=
 github.com/cespare/xxhash/v2 v2.1.1/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/chai2010/gettext-go v0.0.0-20160711120539-c6fed771bfd5/go.mod h1:/iP1qXHoty45bqomnu2LM+VVyAEdWN+vtSHGlQgyxbw=
-github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220414062646-d65e7db648f7/go.mod h1:kNBBoGpqErDNhF+SDGs8VCbg11sqe9FggfHQNjopco4=
-github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220426025737-30c292fe50f2 h1:lXilvxpaUXTvHRLXCN544A8J3lOA793g3254YRA6yzs=
-github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220426025737-30c292fe50f2/go.mod h1:ntY1QmFauHvQ6jIuAeJXjDoaNxuQxi6lmzodBsScZbc=
-github.com/chaosblade-io/chaosblade-exec-os v1.5.1-0.20220414062130-f930629babd8/go.mod h1:3XPEZl5qwaUOEL+pwuhiel9rMkXuxfKGjge1qL+FZrQ=
+github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220429064319-1baacd4efc7e h1:ZF05b4HKrg3vKe6b0QI9UxtebZ3M8ZS3fNW/A7/z598=
+github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220429064319-1baacd4efc7e/go.mod h1:ntY1QmFauHvQ6jIuAeJXjDoaNxuQxi6lmzodBsScZbc=
 github.com/chaosblade-io/chaosblade-exec-os v1.5.1-0.20220426025253-6d1640d20ae4 h1:L1S4syQy85xfC+Yb7S88DIkdYrRyJV1Rqq5GfBYwbKg=
 github.com/chaosblade-io/chaosblade-exec-os v1.5.1-0.20220426025253-6d1640d20ae4/go.mod h1:UNDuSGNygBqqGVxUMhCL56BwK/up53bz8qKVOdEEyFE=
-github.com/chaosblade-io/chaosblade-operator v1.5.1-0.20220414062903-5eaea8ce82f3 h1:mpFMEjjyV8/fG4oa87ac7irBYr7BQVYwW8TYfNe8gfI=
-github.com/chaosblade-io/chaosblade-operator v1.5.1-0.20220414062903-5eaea8ce82f3/go.mod h1:5y9PNF4v6m0j5jjZDIksxxDwpIX+xRkrlUhcZn2R3G0=
-github.com/chaosblade-io/chaosblade-operator v1.5.1-0.20220426064640-09bb2d6b05f7 h1:q511BtUgyPBZBlzilciFOyU8i4ygj5l2oxXdkziQbmE=
-github.com/chaosblade-io/chaosblade-operator v1.5.1-0.20220426064640-09bb2d6b05f7/go.mod h1:b5jwEuuADJDsgs6tb/MsvDcsGzVi95nQcsGzVvYTgvI=
-github.com/chaosblade-io/chaosblade-spec-go v1.5.1-0.20220403044331-978f0910eaf3/go.mod h1:977aR5J4BBfLtFkYZkbHv1i7NJYN1X0x85xO3b8YLpc=
+github.com/chaosblade-io/chaosblade-operator v1.5.1-0.20220429080716-d91b82573cbc h1:flvATfoh6jsf8vViEyIJkwmhJHfgJV6OzUdbY/Gm9e4=
+github.com/chaosblade-io/chaosblade-operator v1.5.1-0.20220429080716-d91b82573cbc/go.mod h1:oEXBsPLe6eYQV3/cctw9u2Skye7erXOx+OVJshtgR/0=
 github.com/chaosblade-io/chaosblade-spec-go v1.5.1-0.20220423030509-6d8dbd90b300 h1:zHZkTkuMHbeSOZ/vXYgo+0p/qFfLaXQdwKyAFh75hyA=
 github.com/chaosblade-io/chaosblade-spec-go v1.5.1-0.20220423030509-6d8dbd90b300/go.mod h1:977aR5J4BBfLtFkYZkbHv1i7NJYN1X0x85xO3b8YLpc=
 github.com/checkpoint-restore/go-criu/v4 v4.1.0/go.mod h1:xUQBLp4RLc5zJtWY++yjOoMoB5lihDt7fai+75m+rGw=
@@ -371,6 +366,7 @@ github.com/docker/go-units v0.3.3/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDD
 github.com/docker/go-units v0.4.0 h1:3uh0PgVws3nIA0Q+MwDC8yjEPf9zjRfZZWXZYDct3Tw=
 github.com/docker/go-units v0.4.0/go.mod h1:fgPhTUdO+D/Jk86RDLlptpiXQzgHJF7gydDDbaIK4Dk=
 github.com/docker/libtrust v0.0.0-20150114040149-fa567046d9b1/go.mod h1:cyGadeNEkKy96OOhEzfZl+yxihPEzKnqJwvfuSUqbZE=
+github.com/docker/spdystream v0.0.0-20160310174837-449fdfce4d96 h1:cenwrSVm+Z7QLSV/BsnenAOcDXdX4cMv4wP0B/5QbPg=
 github.com/docker/spdystream v0.0.0-20160310174837-449fdfce4d96/go.mod h1:Qh8CwZgvJUkLughtfhJv5dyTYa91l1fOUCrgjqmcifM=
 github.com/docopt/docopt-go v0.0.0-20180111231733-ee0de3bc6815/go.mod h1:WwZ+bS3ebgob9U8Nd0kOddGdZWjyMGR8Wziv+TBNwSE=
 github.com/dustin/go-humanize v0.0.0-20171111073723-bb3d318650d4/go.mod h1:HtrtbFcZ19U5GC7JDqmcUSB87Iq5E25KnS6fMYU6eOk=
@@ -385,6 +381,7 @@ github.com/elastic/go-sysinfo v1.1.1/go.mod h1:i1ZYdU10oLNfRzq4vq62BEwD2fH8KaWh6
 github.com/elastic/go-windows v1.0.0/go.mod h1:TsU0Nrp7/y3+VwE82FoZF8gC/XFg/Elz6CcloAxnPgU=
 github.com/elastic/go-windows v1.0.1/go.mod h1:FoVvqWSun28vaDQPbj2Elfc0JahhPB7WQEGa3c814Ss=
 github.com/elazarl/goproxy v0.0.0-20170405201442-c4fc26588b6e/go.mod h1:/Zj4wYkgs4iZTTu3o/KG3Itv/qCCa8VVMlb3i9OVuzc=
+github.com/elazarl/goproxy v0.0.0-20180725130230-947c36da3153 h1:yUdfgN0XgIJw7foRItutHYUIhlcKzcSf5vDpdhQAKTc=
 github.com/elazarl/goproxy v0.0.0-20180725130230-947c36da3153/go.mod h1:/Zj4wYkgs4iZTTu3o/KG3Itv/qCCa8VVMlb3i9OVuzc=
 github.com/emicklei/go-restful v0.0.0-20170410110728-ff4f55a20633/go.mod h1:otzb+WCGbkyDHkqmQmT5YD2WR4BBwUdeQoFo8l/7tVs=
 github.com/emicklei/go-restful v2.9.5+incompatible h1:spTtZBk5DYEvbxMVutUuTyh1Ao2r4iyvLdACqsl/Ljk=

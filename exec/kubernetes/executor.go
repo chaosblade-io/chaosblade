@@ -144,6 +144,9 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 		operation = QueryDestroy
 		response, completed = e.destroy(ctx, client, config)
 	} else {
+		if expModel.ActionProcessHang {
+			expModel.ActionFlags["cgroup-root"] = "/host-sys/fs/cgroup"
+		}
 		operation = QueryCreate
 		response, completed = e.create(ctx, client, config, uid, expModel)
 	}
