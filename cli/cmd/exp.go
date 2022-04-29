@@ -200,6 +200,7 @@ func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
 	for idx := range models.Models {
 		model := &models.Models[idx]
 		model.ExpScope = "docker"
+		spec.AddFlagsToModelSpec(exec.GetExecInContainerFlags, model)
 		command := ec.registerExpCommand(model, dockerSpec.Name())
 		modelCommands = append(modelCommands, command)
 	}

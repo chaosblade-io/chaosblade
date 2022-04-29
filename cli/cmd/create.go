@@ -196,27 +196,24 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 				endpointCallBack(ctx, endpoint, model.Uid, response)
 				return response
 			}
-			if expModel.ActionProcessHang {
+
+			if expModel.ActionProcessHang && scope != "pod" && scope != "container" {
 				// todo -> need to find a better way to query the status
 				time.Sleep(time.Millisecond * 100)
 				log.Debugf(ctx, "result: %v", response.Result)
-				if !response.Success {
-					checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, response.Err))
+				if response.Result == nil {
+					errMsg := fmt.Sprintf("chaos_os process not found, please check chaosblade log")
+					checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, errMsg))
+					response.Err = errMsg
 				} else {
-					if response.Result == nil {
-						errMsg := fmt.Sprintf("chaos_os process not found, please check chaosblade log")
+					_, err := process.NewProcess(int32(response.Result.(int)))
+					if err != nil {
+						errMsg := fmt.Sprintf("chaos_os process not found, please check chaosblade log, err: %s", err.Error())
 						checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, errMsg))
 						response.Err = errMsg
 					} else {
-						_, err := process.NewProcess(int32(response.Result.(int)))
-						if err != nil {
-							errMsg := fmt.Sprintf("chaos_os process not found, please check chaosblade log, err: %s", err.Error())
-							checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, errMsg))
-							response.Err = errMsg
-						} else {
-							// update status
-							checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
-						}
+						// update status
+						checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Success, response.Err))
 					}
 				}
 			} else {
