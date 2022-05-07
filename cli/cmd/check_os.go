@@ -292,7 +292,7 @@ func (doc *CheckOsCommand) buildCmdByMatchersAndFlags(flags []spec.ExpFlagSpec, 
 		}
 
 		if flag.FlagDefault() == "" {
-			return nil, errors.New("build all commadn by yaml file failed! less required parameter, model: " + expName +
+			return nil, errors.New("build all command by yaml file failed! less required parameter, model: " + expName +
 				" action: " + actionName + " parameter: " + flag.FlagName())
 		}
 
