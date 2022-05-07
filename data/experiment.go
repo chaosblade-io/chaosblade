@@ -121,10 +121,10 @@ func (s *Source) ExperimentTableExists() (bool, error) {
 	}
 	defer rows.Close()
 	var c int
-	for rows.Next() {
+	if rows.Next() {
 		rows.Scan(&c)
-		break
 	}
+
 	return c != 0, nil
 }
 
