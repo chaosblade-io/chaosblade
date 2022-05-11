@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"os"
 	osuser "os/user"
 	"path"
@@ -31,67 +32,68 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/shirou/gopsutil/process"
-	"github.com/sirupsen/logrus"
 )
 
 // attach sandbox to java process
 var cl = channel.NewLocalChannel()
 
 const DefaultNamespace = "chaosblade"
-const UserPasswordKey = "user-password"
-const PasswordClearKey = "password-clear"
 
-func Attach(uid, pid, port, javaHome string, ctx context.Context) (*spec.Response, string) {
+//func Attach(uid, pid, port, javaHome string, ctx context.Context) (*spec.Response, string) {
+//	// refresh
+//	response, username := attach(uid, pid, port, ctx, javaHome)
+func Attach(ctx context.Context, port, javaHome, pid string) (*spec.Response, string) {
 	// refresh
-	response, username := attach(uid, pid, port, ctx, javaHome)
+	response, username := attach(ctx, pid, port, javaHome)
 	if !response.Success {
 		return response, username
 	}
 	time.Sleep(5 * time.Second)
 	// active
-	response = active(uid, port)
+	response = active(ctx, port)
 	if !response.Success {
 		return response, username
 	}
 	// check
-	return check(uid, port), username
+	return check(ctx, port), username
 }
 
 // curl -s http://localhost:$2/sandbox/default/module/http/chaosblade/status 2>&1
-func check(uid, port string) *spec.Response {
+func check(ctx context.Context, port string) *spec.Response {
 	url := getSandboxUrl(port, "chaosblade/status", "")
-	result, err, code := util.Curl(url)
+	result, err, code := util.Curl(ctx, url)
 	if code == 200 {
 		return spec.ReturnSuccess(result)
 	}
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
-	util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+	log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
 	return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 }
 
 // active chaosblade bin/sandbox.sh -p $pid -P $2 -a chaosblade 2>&1
-func active(uid, port string) *spec.Response {
+func active(ctx context.Context, port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids=chaosblade")
-	result, err, code := util.Curl(url)
+	result, err, code := util.Curl(ctx, url)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code != 200 {
-		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	return spec.ReturnSuccess("success")
 }
 
 // attach java agent to application process
-func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
-	password := ctx.Value(UserPasswordKey)
-	if password != "" {
-		if ctx.Value(PasswordClearKey) != "true" {
+func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Response, string) {
+	password := ctx.Value(ProcessUserPasswordFlag.Name)
+	if password != nil && password != "" {
+		if ctx.Value(PasswordClearFlag.Name) != "true" {
+			log.Debugf(ctx, "password is encoded")
 			/* password is encoded by '==' suffix and two times base64, like shell commands as follow:
 			➜ password=123456
 			➜ echo $password"==" | base64 | base64
@@ -106,43 +108,50 @@ func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.
 				}
 			}
 			if err != nil {
-				util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(pid, err))
+				log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(pid, err))
 			}
+		} else {
+			log.Debugf(ctx, "password is clear!!!")
 		}
 	}
 	username, err := getUsername(pid)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.ProcessGetUsernameFailed.Sprintf(pid, err))
+		log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(pid, err))
 		return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, pid, err), ""
 	}
-	javaBin, javaHome := getJavaBinAndJavaHome(javaHome, pid, getJavaCommandLine)
-	toolsJar := getToolJar(javaHome)
-	logrus.Infof("javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
+	javaBin, javaHome := getJavaBinAndJavaHome(ctx, javaHome, pid, getJavaCommandLine)
+	toolsJar := getToolJar(ctx, javaHome)
+	log.Infof(ctx, "javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
 	token, err := getSandboxToken(ctx)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.SandboxCreateTokenFailed.Sprintf(err))
+		log.Errorf(ctx, spec.SandboxCreateTokenFailed.Sprintf(err))
 		return spec.ResponseFailWithFlags(spec.SandboxCreateTokenFailed, err), username
 	}
 	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid)
 	currUser, err := osuser.Current()
 	if err != nil {
-		logrus.Warnf("get current user info failed, %v", err)
+		log.Warnf(ctx, "get current user info failed, %v", err)
 	}
 	var command string
+	commandPrefix := ""
 	if currUser != nil && (currUser.Username == username) {
 		command = fmt.Sprintf("%s %s", javaBin, javaArgs)
 	} else {
 		if currUser != nil {
-			logrus.Infof("current user name is %s, not equal %s, so use sudo command to execute",
+			log.Infof(ctx, "current user name is %s, not equal %s, so use sudo command to execute",
 				currUser.Username, username)
 		}
 		// If password exists, use stdin(-S) to set password for sudo
-		if password != "" {
+		if password != nil && password != "" {
+			commandPrefix = fmt.Sprintf("echo %s | sudo -S -u %s", password, username)
 			command = fmt.Sprintf("echo %s | sudo -S -u %s %s %s", password, username, javaBin, javaArgs)
 		} else {
+			commandPrefix = fmt.Sprintf("sudo -u %s", username)
 			command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
 		}
 	}
+	// 这里其实是有问题的，因为获取环境是跟 shell 有关系的，而且 export 是 bash 的命令，如果到 /bin/sh 下面去执行会找不到命令，
+	// 但因为基本上获取不到这个环境变量信息，所以也不会执行到
 	javaToolOptions := os.Getenv("JAVA_TOOL_OPTIONS")
 	if javaToolOptions != "" {
 		command = fmt.Sprintf("export JAVA_TOOL_OPTIONS='' && %s", command)
@@ -151,12 +160,12 @@ func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.
 	if !response.Success {
 		return response, username
 	}
-	osCmd := fmt.Sprintf("grep %s", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
-		token, getSandboxTokenFile(username), DefaultNamespace))
+	osCmd := fmt.Sprintf(`%s grep %s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
+		commandPrefix, token, getSandboxTokenFile(username), DefaultNamespace)
 	response = cl.Run(ctx, "", osCmd)
 	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
-		util.Errorf(uid, util.GetRunFuncName(), spec.OsCmdExecFailed.Sprintf(osCmd, response.Err))
+		log.Errorf(ctx, spec.OsCmdExecFailed.Sprintf(osCmd, response.Err))
 		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, osCmd, response.Err), username
 	}
 	return response, username
@@ -175,7 +184,7 @@ func getAttachJvmOpts(toolsJar string, token string, port string, pid string) st
 
 func getSandboxToken(ctx context.Context) (string, error) {
 	// create sandbox token
-	response := cl.Run(ctx, "date", "| head | cksum | sed 's/ //g'")
+	response := cl.Run(ctx, "", "date | head | cksum | sed 's/ //g'")
 	if !response.Success {
 		return "", fmt.Errorf(response.Err)
 	}
@@ -183,13 +192,13 @@ func getSandboxToken(ctx context.Context) (string, error) {
 	return token, nil
 }
 
-func getToolJar(javaHome string) string {
+func getToolJar(ctx context.Context, javaHome string) string {
 	toolsJar := path.Join(util.GetLibHome(), "sandbox", "tools.jar")
 	originalJar := path.Join(javaHome, "lib/tools.jar")
 	if util.IsExist(originalJar) {
 		toolsJar = originalJar
 	} else {
-		logrus.Warningf("using chaosblade default tools.jar, %s", toolsJar)
+		log.Warnf(ctx, "using chaosblade default tools.jar, %s", toolsJar)
 	}
 	return toolsJar
 }
@@ -206,60 +215,125 @@ func getUsername(pid string) (string, error) {
 	return javaProcess.Username()
 }
 
-func getJavaBinAndJavaHome(javaHome string, pid string,
-	getJavaCommandLineFunc func(pid string) (commandSlice []string, err error)) (string, string) {
+func getJavaBinAndJavaHome(ctx context.Context, javaHome string, pid string,
+	getJavaCommandLineFunc func(ctx context.Context, pid string) (commandSlice []string, err error)) (string, string) {
 	javaBin := "java"
 	if javaHome != "" {
 		javaBin = path.Join(javaHome, "bin/java")
-		return javaBin, javaHome
+		if util.IsExist(javaBin) {
+			return javaBin, javaHome
+		} else {
+			log.Warnf(ctx, pid, "initial javaHome or javaBin not exists")
+		}
 	}
 	if javaHome = strings.TrimSpace(os.Getenv("JAVA_HOME")); javaHome != "" {
 		javaBin = path.Join(javaHome, "bin/java")
 		return javaBin, javaHome
 	}
-	cmdlineSlice, err := getJavaCommandLineFunc(pid)
+	cmdlineSlice, err := getJavaCommandLineFunc(ctx, pid)
 	if err != nil {
-		logrus.WithField("pid", pid).WithError(err).Warningln("get command slice err")
+		log.Warnf(ctx, "get command slice err, pid: %s, err: %v", pid, err)
 		return javaBin, javaHome
 	}
 	if len(cmdlineSlice) == 0 {
-		logrus.WithField("pid", pid).Warningln("command line is empty")
+		log.Warnf(ctx, "command line is empty, pid: %s", pid)
 		return javaBin, javaHome
 	}
 	javaBin = strings.TrimSpace(cmdlineSlice[0])
+	// If the process use java command to start, then use 'whereis java' to check whole path
+	if javaBin == "java" {
+		// if shell terminal to exec doesn't have enough env variables, java command will not be found,
+		// like default local channel use /bin/sh, so source valid env files
+		sourceEnvCommand := `
+source /etc/profile
+if [ -f "/etc/zshrc" ]; then
+  source /etc/zshrc
+fi
+if [ -f "/etc/bashrc" ]; then
+  source /etc/bashrc
+fi
+if [ -f ~/.profile ]; then
+  source ~/.profile
+fi
+if [ -f ~/.zsh_profile ]; then
+  source ~/.zsh_profile
+fi
+if [ -f ~/.zshrc ]; then
+  source ~/.zshrc
+fi
+if [ -f ~/.bash_profile ]; then
+  source ~/.bash_profile
+fi
+if [ -f ~/.bashrc ]; then
+  source ~/.bashrc
+fi
+`
+		response := cl.Run(context.Background(), "", sourceEnvCommand + "whereis java")
+		if response.Success && response.Result != nil {
+			javaResult := response.Result.(string)
+			if strings.Contains(javaResult, ":") {
+				javaResult = strings.TrimSpace(strings.Split(javaResult, ":")[1])
+			}
+			if strings.HasPrefix(javaResult, "/") {
+				javaResult = strings.TrimSpace(javaResult)
+				javaBin = strings.Trim(strings.Split(javaResult, " ")[0], "\n")
+			} else {
+				log.Warnf(ctx, pid, "whereis java: " + response.ToString())
+			}
+		} else {
+			log.Warnf(ctx, pid, "check \"whereis java\" failed: " + response.ToString())
+			response := cl.Run(context.Background(), "", sourceEnvCommand + "echo $PATH")
+			if response.Success && response.Result != nil {
+				pathItem := strings.Split(response.Result.(string), ":")
+				for _, item := range pathItem {
+					if strings.Contains(item, "java") {
+						javaBin = path.Join(item, "java")
+						break
+					}
+				}
+			} else {
+				log.Warnf(ctx, pid, "try get java path by \"echo $PATH\" failed: " + response.ToString())
+			}
+		}
+	}
 	if strings.HasSuffix(javaBin, "/bin/java") {
 		javaHome = javaBin[:len(javaBin)-9]
+	} else {
+		lastDir := path.Dir(javaBin)
+		if util.IsDir(path.Join(path.Dir(javaBin), "jre")) {
+			javaHome = lastDir
+		}
 	}
 	return javaBin, javaHome
 }
 
-func getJavaCommandLine(pid string) (commandSlice []string, err error) {
+func getJavaCommandLine(ctx context.Context, pid string) (commandSlice []string, err error) {
 	// get commands
 	processId, err := strconv.Atoi(pid)
 	if err != nil {
-		logrus.Warningf("convert string value of pid err, %v", err)
+		log.Warnf(ctx, "convert string value of pid err, %v", err)
 		return nil, err
 	}
 	processObj, err := process.NewProcess(int32(processId))
 	if err != nil {
-		logrus.WithField("pid", processId).WithError(err).Warningln("new process by processId err")
+		log.Warnf(ctx, "new process by processId err: %v, pid: %s", pid)
 		return nil, err
 	}
 	return processObj.CmdlineSlice()
 }
 
-func Detach(uid, port string) *spec.Response {
-	return shutdown(uid, port)
+func Detach(ctx context.Context, port string) *spec.Response {
+	return shutdown(ctx, port)
 }
 
 // CheckPortFromSandboxToken will read last line and curl the port for testing connectivity
-func CheckPortFromSandboxToken(username string) (port string, err error) {
+func CheckPortFromSandboxToken(ctx context.Context, username string) (port string, err error) {
 	port, err = getPortFromSandboxToken(username)
 	if err != nil {
 		return port, err
 	}
 	versionUrl := getSandboxUrl(port, "sandbox-info/version", "")
-	_, err, _ = util.Curl(versionUrl)
+	_, err, _ = util.Curl(ctx, versionUrl)
 	if err != nil {
 		return "", err
 	}
@@ -288,15 +362,15 @@ func getPortFromSandboxToken(username string) (port string, err error) {
 }
 
 // sudo -u $user -H bash bin/sandbox.sh -p $pid -S 2>&1
-func shutdown(uid, port string) *spec.Response {
+func shutdown(ctx context.Context, port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-control/shutdown", "")
-	result, err, code := util.Curl(url)
+	result, err, code := util.Curl(ctx, url)
 	if err != nil {
-		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code != 200 {
-		util.Errorf(uid, util.GetRunFuncName(), spec.HttpExecFailed.Sprintf(url, result))
+		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	return spec.ReturnSuccess("success")
