@@ -17,13 +17,14 @@
 package data
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strings"
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/sirupsen/logrus"
 )
 
 type ExperimentModel struct {
@@ -92,15 +93,16 @@ var insertExpDML = `INSERT INTO
 
 func (s *Source) CheckAndInitExperimentTable() {
 	exists, err := s.ExperimentTableExists()
+	ctx := context.Background()
 	if err != nil {
-		logrus.Fatalf(err.Error())
+		log.Fatalf(ctx, err.Error())
 		//log.Error(err, "ExperimentTableExists err")
 		//os.Exit(1)
 	}
 	if !exists {
 		err = s.InitExperimentTable()
 		if err != nil {
-			logrus.Fatalf(err.Error())
+			log.Fatalf(ctx, err.Error())
 			//log.Error(err, "InitExperimentTable err")
 			//os.Exit(1)
 		}

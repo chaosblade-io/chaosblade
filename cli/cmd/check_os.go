@@ -190,7 +190,7 @@ func (doc *CheckOsCommand) execOperatorCmd(checkExecCmd *CheckExecCmd) {
 			execResult.result = "failed"
 			continue
 		}
-		if !ch.IsCommandAvailable(operatorCmd) {
+		if !ch.IsCommandAvailable(context.TODO(), operatorCmd) {
 			fmt.Printf("[failed] %s, failed! error: `%s` command not install \n", cmdArr[1], operatorCmd)
 			execResult.info = fmt.Sprintf("`%s` command not install", operatorCmd)
 			execResult.result = "failed"
@@ -292,7 +292,7 @@ func (doc *CheckOsCommand) buildCmdByMatchersAndFlags(flags []spec.ExpFlagSpec, 
 		}
 
 		if flag.FlagDefault() == "" {
-			return nil, errors.New("build all commadn by yaml file failed! less required parameter, model: " + expName +
+			return nil, errors.New("build all command by yaml file failed! less required parameter, model: " + expName +
 				" action: " + actionName + " parameter: " + flag.FlagName())
 		}
 
@@ -384,7 +384,7 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 			successCmd := ""
 			checkStr := fmt.Sprintf("%s %s", target, expModel.ActionName)
 			for _, program := range programs {
-				if channel.NewLocalChannel().IsCommandAvailable(program) {
+				if channel.NewLocalChannel().IsCommandAvailable(context.TODO(), program) {
 					if successCmd == "" {
 						successCmd = program
 					} else {

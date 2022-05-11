@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=1.5.0
+export BLADE_VERSION=1.6.0
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -31,8 +31,9 @@ BUILD_TARGET_FOR_JAVA_CPLUS=build-target
 BUILD_TARGET_DIR_NAME=chaosblade-$(BLADE_VERSION)
 BUILD_TARGET_PKG_DIR=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)
 BUILD_TARGET_PKG_NAME=$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION).tar.gz
-BUILD_TARGET_BIN=$(BUILD_TARGET_PKG_DIR)/bin
+
 BUILD_TARGET_LIB=$(BUILD_TARGET_PKG_DIR)/lib
+BUILD_TARGET_BIN=$(BUILD_TARGET_PKG_DIR)/bin
 BUILD_TARGET_YAML=$(BUILD_TARGET_PKG_DIR)/yaml
 BUILD_TARGET_TAR_NAME=$(BUILD_TARGET_DIR_NAME).tar.gz
 BUILD_TARGET_PKG_FILE_PATH=$(BUILD_TARGET)/$(BUILD_TARGET_TAR_NAME)
@@ -43,7 +44,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=v1.5.0
+BLADE_EXEC_OS_BRANCH=1.6.0-dev
 
 # chaosblade-exec-docker
 BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
@@ -51,15 +52,15 @@ BLADE_EXEC_DOCKER_BRANCH=v1.5.0
 
 # chaosblade-exec-cri
 BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
-BLADE_EXEC_CRI_BRANCH=v1.5.0
+BLADE_EXEC_CRI_BRANCH=1.6.0-dev
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=v1.5.0
+BLADE_OPERATOR_BRANCH=1.6.0-dev
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=v1.5.0
+BLADE_EXEC_JVM_BRANCH=1.6.0-dev
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
@@ -90,9 +91,9 @@ help:
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>...\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m  %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Build
-build: pre_build cli os docker cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
+build: pre_build cli nsexec os cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
 
-# for example: make build_with cli os_darwin
+# for example: make build_with cli
 build_with: pre_build ## Select scenario build, for example `make build_with cli os docker cri kubernetes java cplus`
 
 # for example: make build_with_linux cli os
@@ -107,7 +108,7 @@ build_linux:  ## Build linux version of all scenarios by docker image
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
 	make build_with_linux_arm ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
 
-build_darwin: pre_build cli os_darwin docker cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
+build_darwin: pre_build cli os cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
 ##@ Build sub
 
@@ -121,6 +122,9 @@ pre_build: mkdir_build_target ## Mkdir build target
 cli: ## Build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
 
+nsexec: ## Build nsexec
+	/usr/local/musl/bin/musl-gcc -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
+
 os: ## Build basic resource experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
 	git clone -b $(BLADE_EXEC_OS_BRANCH) $(BLADE_EXEC_OS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-os
@@ -131,19 +135,6 @@ endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
 endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
-	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
-	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
-
-os_darwin: ## Build basic resource experimental scenarios for darwin.
-ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
-	git clone -b $(BLADE_EXEC_OS_BRANCH) $(BLADE_EXEC_OS_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-os
-else
-ifdef ALERTMSG
-	$(error $(ALERTMSG))
-endif
-	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
-endif
-	make build_darwin -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
 

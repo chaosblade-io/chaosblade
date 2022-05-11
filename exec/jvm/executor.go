@@ -237,7 +237,7 @@ func (e *Executor) getStatusRequestPath(uid string) string {
 
 func (e *Executor) QueryStatus(ctx context.Context) *spec.Response {
 	uid := ctx.Value(spec.Uid).(string)
-	experimentModel, err := data.GetSource().QueryExperimentModelByUid(uid)
+	experimentModel, err := db.QueryExperimentModelByUid(uid)
 	if err != nil {
 		log.Errorf(ctx, spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
@@ -277,6 +277,7 @@ func (e *Executor) QueryStatus(ctx context.Context) *spec.Response {
 	return &resp
 }
 
+var db = data.GetSource()
 func (e *Executor) getRecordFromDB(ctx context.Context, processName, processId string) (*data.PreparationRecord, error) {
 	if processName != "" || processId != "" {
 		pid, response := CheckFlagValues(ctx, processName, processId)

@@ -151,8 +151,6 @@ func (pc *PrepareJvmCommand) reportAttachedResult(ctx context.Context, response 
 
 // attachAgent
 func (pc *PrepareJvmCommand) attachAgent(ctx context.Context) *spec.Response {
-	ctx = context.WithValue(context.TODO(), jvm.ProcessUserPasswordFlag, pc.processUserPasswordFlag)
-	ctx = context.WithValue(ctx, jvm.PasswordClearFlag, pc.passwordClearFlag)
 	response, username := jvm.Attach(ctx, strconv.Itoa(pc.port), pc.javaHome, pc.processId)
 	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
@@ -253,7 +251,7 @@ func (pc *PrepareJvmCommand) invokeAttaching(ctx context.Context, port string, u
 }
 */
 func createPostBody(ctx context.Context) ([]byte, error) {
-	preparationRecord, err := data.GetSource().QueryPreparationByUid(uid)
+	preparationRecord, err := GetDS().QueryPreparationByUid(uid)
 	if err != nil {
 		return nil, err
 	}

@@ -39,9 +39,6 @@ var cl = channel.NewLocalChannel()
 
 const DefaultNamespace = "chaosblade"
 
-//func Attach(uid, pid, port, javaHome string, ctx context.Context) (*spec.Response, string) {
-//	// refresh
-//	response, username := attach(uid, pid, port, ctx, javaHome)
 func Attach(ctx context.Context, port, javaHome, pid string) (*spec.Response, string) {
 	// refresh
 	response, username := attach(ctx, pid, port, javaHome)
@@ -90,30 +87,6 @@ func active(ctx context.Context, port string) *spec.Response {
 
 // attach java agent to application process
 func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Response, string) {
-	password := ctx.Value(ProcessUserPasswordFlag.Name)
-	if password != nil && password != "" {
-		if ctx.Value(PasswordClearFlag.Name) != "true" {
-			log.Debugf(ctx, "password is encoded")
-			/* password is encoded by '==' suffix and two times base64, like shell commands as follow:
-			➜ password=123456
-			➜ echo $password"==" | base64 | base64
-			TVRJek5EVTJQVDBLCg==
-			➜ chaosblade echo ${$(echo TVRJek5EVTJQVDBLCg== | base64 --decode | base64 --decode)/==}
-			123456
-			*/
-			decodedBytes, err := base64.StdEncoding.DecodeString(password.(string))
-			if err == nil {
-				if decodedBytes, err = base64.StdEncoding.DecodeString(string(decodedBytes)); err == nil {
-					password = strings.TrimSuffix(string(decodedBytes), "==")
-				}
-			}
-			if err != nil {
-				log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(pid, err))
-			}
-		} else {
-			log.Debugf(ctx, "password is clear!!!")
-		}
-	}
 	username, err := getUsername(pid)
 	if err != nil {
 		log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(pid, err))
@@ -141,14 +114,8 @@ func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Respo
 			log.Infof(ctx, "current user name is %s, not equal %s, so use sudo command to execute",
 				currUser.Username, username)
 		}
-		// If password exists, use stdin(-S) to set password for sudo
-		if password != nil && password != "" {
-			commandPrefix = fmt.Sprintf("echo %s | sudo -S -u %s", password, username)
-			command = fmt.Sprintf("echo %s | sudo -S -u %s %s %s", password, username, javaBin, javaArgs)
-		} else {
-			commandPrefix = fmt.Sprintf("sudo -u %s", username)
-			command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
-		}
+		commandPrefix = fmt.Sprintf("sudo -u %s", username)
+		command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
 	}
 	// 这里其实是有问题的，因为获取环境是跟 shell 有关系的，而且 export 是 bash 的命令，如果到 /bin/sh 下面去执行会找不到命令，
 	// 但因为基本上获取不到这个环境变量信息，所以也不会执行到

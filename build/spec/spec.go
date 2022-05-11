@@ -24,7 +24,6 @@ import (
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/sirupsen/logrus"
 )
 
 var version = "0.7.1"
@@ -55,7 +54,7 @@ func main() {
 
 	file, err := os.OpenFile(chaosSpecFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0755)
 	if err != nil {
-		logrus.Fatalf("open %s file err, %s", chaosSpecFile, err.Error())
+		log.Fatalf("open %s file err, %s", chaosSpecFile, err.Error())
 	}
 	defer file.Close()
 	util.MarshalModelSpec(models, file)
@@ -64,14 +63,14 @@ func main() {
 func getOsModels(osSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(osSpecFile, nil)
 	if err != nil {
-		logrus.Fatalf("parse os spec failed, %s", err)
+		log.Fatalf("parse os spec failed, %s", err)
 	}
 	return models
 }
 func getJvmModels(jvmSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(jvmSpecFile, nil)
 	if err != nil {
-		logrus.Fatalf("parse java spec failed, %s", err)
+		log.Fatalf("parse java spec failed, %s", err)
 	}
 	return models
 }
@@ -79,7 +78,7 @@ func getJvmModels(jvmSpecFile string) *spec.Models {
 func getCplusModels(cplusSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(cplusSpecFile, nil)
 	if err != nil {
-		logrus.Fatalf("parse cplus spec failed, %s", err)
+		log.Fatalf("parse cplus spec failed, %s", err)
 	}
 	return models
 }
@@ -87,7 +86,7 @@ func getCplusModels(cplusSpecFile string) *spec.Models {
 func getDockerModels(dockerSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(dockerSpecFile, nil)
 	if err != nil {
-		logrus.Fatalf("parse docker spec failed, %s", err)
+		log.Fatalf("parse docker spec failed, %s", err)
 	}
 	return models
 }
@@ -95,7 +94,7 @@ func getDockerModels(dockerSpecFile string) *spec.Models {
 func getCriModels(criSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(criSpecFile, nil)
 	if err != nil {
-		logrus.Fatalf("parse cri spec failed, %s", err)
+		log.Fatalf("parse cri spec failed, %s", err)
 	}
 	return models
 }
@@ -103,7 +102,7 @@ func getCriModels(criSpecFile string) *spec.Models {
 func getKubernetesModels(k8sSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(k8sSpecFile, nil)
 	if err != nil {
-		logrus.Fatalf("parse kubernetes spec failed, %s", err)
+		log.Fatalf("parse kubernetes spec failed, %s", err)
 	}
 	return models
 }
