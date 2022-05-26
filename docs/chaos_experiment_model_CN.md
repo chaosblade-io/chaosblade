@@ -43,7 +43,7 @@ Toolkit.
 ```
 blade create dubbo delay --time 3000 --consumer --service com.example.HelloService --version 1.0.0
 ```
-* `dubbo`: 模型中的 target，对 dubbo 实施实验。
+* `dubbo`: 模型中的 target，对 dubbo 实施实验。
 * `delay`: 模型中的 action，执行延迟演练场景。
 * `--time`: 模型中 action 参数，指延迟时间。
 * `--consumer`、`--service`、`--version`：模型中的 matchers，实验规则匹配器。
@@ -56,7 +56,6 @@ blade create dubbo delay --time 3000 --consumer --service com.example.HelloServi
 
 ![模型简图](https://user-images.githubusercontent.com/3992234/56200214-ecfb3300-6070-11e9-9c33-a318eb305bd9.png)
 
-
 ## chaosblade 模型定义
 ```go
 type ExpModelCommandSpec interface {
@@ -66,11 +65,10 @@ type ExpModelCommandSpec interface {
 	// 支持的场景列表
 	Actions() []ExpActionCommandSpec
 
-	// ... 略
+	// ...
 }
 ```
 **注：** 一个组件混沌实验模型的定义，包含组件名称和所支持的实验场景列表。
-
 ```go
 type ExpActionCommandSpec interface {
 	// 演练场景名称
@@ -85,28 +83,26 @@ type ExpActionCommandSpec interface {
 	// Action 执行器
 	Executor(channel Channel) Executor
 
-        // ... 略
+    // ...
 }
 ```
 **注：** 一个实验场景 action 的定义，包含场景名称，场景所需参数和一些实验规则匹配器
-
 ```go
 type ExpFlagSpec interface {
-        // 参数名
+    // 参数名
 	FlagName() string
 
-        // 参数描述
+    // 参数描述
 	FlagDesc() string
 
-        // 是否需要参数值
+    // 是否需要参数值
 	FlagNoArgs() bool
 
-        // 是否是必要参数
+    // 是否是必要参数
 	FlagRequired() bool
 }
 ```
 **注：** 实验匹配器定义。
-
 
 ## chaosblade 模型具体实现
 拿 network 组件举例，network 作为混沌实验组件，目前包含网络延迟、网络屏蔽、网络丢包、DNS 篡改演练场景，则依据模型规范，具体实现为：
@@ -180,10 +176,8 @@ func (*DelayActionSpec) Executor(channel exec.Channel) exec.Executor {
 ```
 * `DelayActionSpec` 包含 2 个场景参数和 4 个规则匹配器。
 
-
 # 总结
 通过以上事例，可以看出此模型简单、易实现，并且可以覆盖目前已知的实验场景。后续可以对此模型进行完善，成为一个混沌实验标准。
-
 
 # 附录 A
 

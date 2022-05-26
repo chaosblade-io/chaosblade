@@ -1,4 +1,4 @@
-欢迎关注 chaosblade 项目，这篇文章将带你快速掌握 chaosblade 工具的使用
+欢迎关注 chaosblade 项目！这篇文章将带你快速掌握 chaosblade 工具的使用。
 
 # 下载 chaosblade
 
@@ -11,19 +11,16 @@
 进入解压后的文件夹，可以看到以下内容：
 ```
 ├── bin
-│   ├── chaos_burncpu
-│   ├── chaos_burnio
-│   ├── chaos_changedns
-│   ├── chaos_delaynetwork
-│   ├── chaos_dropnetwork
-│   ├── chaos_filldisk
-│   ├── chaos_killprocess
-│   ├── chaos_lossnetwork
-│   ├── jvm.spec.yaml
-│   └── tools.jar
+│   ├── chaos_fuse
+│   ├── chaos_os
+│   ├── nsexec
+│   └── strace
 ├── blade
 └── lib
-    └── sandbox
+│    ├── cplus
+│    └── sandbox
+├── logs
+└── yaml
 ```
 
 其中 blade 是可执行文件，即 chaosblade 工具的 cli，混沌实验执行的工具。执行 `./blade help` 可以查看支持命令有哪些：
@@ -59,7 +56,7 @@ Use "blade [command] --help" for more information about a command.
 {"code":200,"success":true,"result":"7c1f7afc281482c8"}
 ```
 
-通过 `top` 命令查看 CPU 使用率
+通过 `top` 命令查看 CPU 使用率：
 ```
 CPU usage: 93.79% user, 6.20% sys, 0.0% idle
 ```
@@ -69,7 +66,7 @@ CPU usage: 93.79% user, 6.20% sys, 0.0% idle
 ./blade destroy 7c1f7afc281482c8 
 ```
 
-返回以下结果，表示停止实验成功
+返回以下结果，表示停止实验成功:
 ```
 {"code":200,"success":true,"result":"command: cpu fullload --debug false --help false"}
 ``` 
@@ -135,7 +132,7 @@ Global Flags:
 ```
 ./blade create dubbo delay --time 3000 --service com.alibaba.demo.HelloService --methodname hello --consumer --process dubbo.consumer
 ```
-返回以下结果，表示执行成功；访问 `http://localhost:8080/hello?msg=world` 验证是否延迟 3 秒
+返回以下结果，表示执行成功；访问 `http://localhost:8080/hello?msg=world` 验证是否延迟 3 秒。
 ```
 {"code":200,"success":true,"result":"ec695fee1e458fc6"}
 ```
@@ -180,7 +177,7 @@ Global Flags:
 ```
 ./blade create dubbo throwCustomException --exception java.lang.Exception --service com.alibaba.demo.HelloService --methodname hello --consumer --process dubbo.consumer
 ```
-返回以下结果，访问 `http://localhost:8080/hello?msg=world` 验证是否异常
+返回以下结果，表示实验执行成功；访问 `http://localhost:8080/hello?msg=world` 验证是否异常
 ```
 {"code":200,"success":true,"result":"09dd96f4c062df69"}
 ```
@@ -211,7 +208,6 @@ Global Flags:
                 }
         ]
 }
-
 ```
 
 # FAQ
@@ -222,4 +218,4 @@ chaosblade 每次发布，相关的 changelog 和新版的包都会同步到 REL
 暂无支持计划，不过欢迎大家提相关支持的 issue，社区会根据大家的需求来决定是否支持。
 
 ### 执行 blade 命令报错： exec format error 或 cannot execute binary file 
-是由于 chaosblade 包和运行的平台不兼容造成的，请提 [ISSUE](https://github.com/chaosblade-io/chaosblade/issues)来告知我们，issue 中标注下载的 chaosblade 包版本和操作系统版本信息。
+这个问题是由于 chaosblade 包和运行的平台不兼容造成的，请提 [ISSUE](https://github.com/chaosblade-io/chaosblade/issues)来告知我们您遇到的问题，issue 中标注下载的 chaosblade 包版本和操作系统版本信息。
