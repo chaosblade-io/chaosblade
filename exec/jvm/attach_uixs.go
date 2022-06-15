@@ -31,6 +31,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// attach java agent to application process
 func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.Response, string) {
 	username, err := getUsername(pid)
 	if err != nil {
@@ -58,7 +59,7 @@ func attach(uid, pid, port string, ctx context.Context, javaHome string) (*spec.
 			logrus.Infof("current user name is %s, not equal %s, so use sudo command to execute",
 				currUser.Username, username)
 		}
-		command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
+		command = fmt.Sprintf("su - %s -c '%s %s'", username, javaBin, javaArgs)
 	}
 	// TODO for xiniao, solve the JAVA_TOOL_OPTIONS env
 	javaToolOptions := os.Getenv("JAVA_TOOL_OPTIONS")

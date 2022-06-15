@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"github.com/chaosblade-io/chaosblade/exec/windows"
 	"path"
 
 	"github.com/chaosblade-io/chaosblade-exec-cri/exec"
@@ -133,6 +134,8 @@ func (ec *baseExpCommandService) registerSubCommands() {
 	ec.registerCriExpCommands()
 	// register k8s command
 	ec.registerK8sExpCommands()
+	// registerWindowsExpCommands
+	ec.registerWindowsExpCommands()
 }
 
 // registerOsExpCommands
@@ -333,10 +336,32 @@ func (ec *baseExpCommandService) registerCriExpCommands() []*modelCommand {
 	return modelCommands
 }
 
+// register windows exp commands
+func (ec *baseExpCommandService) registerWindowsExpCommands() []*modelCommand {
+	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-windows-spec-%s.yaml", version.Ver))
+	models, err := specutil.ParseSpecsToModel(file, windows.NewWindowsExecutor())
+	if err != nil {
+		return nil
+	}
+	windowsSpec := windows.NewCommandModelSpec()
+	modelCommands := make([]*modelCommand, 0)
+	for idx := range models.Models {
+		model := &models.Models[idx]
+		command := ec.registerExpCommand(model, windowsSpec.Name())
+		modelCommands = append(modelCommands, command)
+	}
+	windowsCmd := ec.registerExpCommand(windowsSpec, "")
+	cobraCmd := windowsCmd.CobraCmd()
+	for _, child := range modelCommands {
+		copyAndAddCommand(cobraCmd, child.command)
+	}
+	return modelCommands
+}
+
 // registerExpCommand
 func (ec *baseExpCommandService) registerExpCommand(commandSpec spec.ExpModelCommandSpec, parentTargetCmd string) *modelCommand {
 	cmdName := commandSpec.Name()
-	if commandSpec.Scope() != "" && commandSpec.Scope() != "host" && commandSpec.Scope() != "docker" && commandSpec.Scope() != "cri" && commandSpec.Scope() != OperatorCommand {
+	if commandSpec.Scope() != "" && commandSpec.Scope() != "host" && commandSpec.Scope() != "docker" && commandSpec.Scope() != "cri" && commandSpec.Scope() != "windows" && commandSpec.Scope() != OperatorCommand {
 		cmdName = fmt.Sprintf("%s-%s", commandSpec.Scope(), commandSpec.Name())
 	}
 	cmd := &cobra.Command{
