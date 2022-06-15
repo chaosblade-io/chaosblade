@@ -277,16 +277,37 @@ func CheckPortFromSandboxToken(ctx context.Context, username string) (port strin
 }
 
 func getPortFromSandboxToken(username string) (port string, err error) {
-	response := cl.Run(context.TODO(), "grep",
-		fmt.Sprintf(`%s %s | tail -1 | awk -F ";" '{print $4}'`,
-			DefaultNamespace, getSandboxTokenFile(username)))
-	if !response.Success {
-		return "", fmt.Errorf(response.Err)
+	if runtime.GOOS == "windows" {
+		bytes, err := ioutil.ReadFile(getSandboxTokenFile(username))
+		if err != nil {
+			return "", fmt.Errorf(err.Error())
+		}
+
+		sandboxTokenContent := string(bytes)
+		if sandboxTokenContent == "" {
+			return "", fmt.Errorf("get empty from sandbox token file")
+		}
+
+		split := strings.Split(strings.TrimSpace(sandboxTokenContent), "\n")
+		row := strings.TrimSpace(split[len(split)-1])
+		rows := strings.Split(row, ";")
+
+		port = strings.TrimSpace(rows[len(rows)-1])
+
+	} else {
+		response := cl.Run(context.TODO(), "grep",
+			fmt.Sprintf(`%s %s | tail -1 | awk -F ";" '{print $4}'`,
+				DefaultNamespace, getSandboxTokenFile(username)))
+		if !response.Success {
+			return "", fmt.Errorf(response.Err)
+		}
+		if response.Result == nil {
+			return "", fmt.Errorf("get empty from sandbox token file")
+		}
+		port = strings.TrimSpace(response.Result.(string))
+
 	}
-	if response.Result == nil {
-		return "", fmt.Errorf("get empty from sandbox token file")
-	}
-	port = strings.TrimSpace(response.Result.(string))
+
 	if port == "" {
 		return "", fmt.Errorf("read empty from sandbox token file")
 	}
@@ -321,4 +342,27 @@ func getSandboxUrl(port, uri, param string) string {
 func getSandboxTokenFile(username string) string {
 	userHome := util.GetSpecifyingUserHome(username)
 	return path.Join(userHome, ".sandbox.token")
+}
+
+type Charset string
+
+const (
+	UTF8    = Charset("UTF-8")
+	GB18030 = Charset("GB18030")
+)
+
+func ConvertByte2String(byte []byte, charset Charset) string {
+
+	var str string
+	switch charset {
+	case GB18030:
+		decodeBytes, _ := simplifiedchinese.GB18030.NewDecoder().Bytes(byte)
+		str = string(decodeBytes)
+	case UTF8:
+		fallthrough
+	default:
+		str = string(byte)
+	}
+
+	return str
 }
