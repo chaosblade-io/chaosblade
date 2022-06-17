@@ -98,7 +98,7 @@ yay -S chaosblade-bin
 * Twitter: chaosblade.io
 
 ## 参与贡献
-我们非常欢迎每个 Issue 和 PR，即使一个标点符号，如何参加贡献请阅读 [CONTRIBUTING](CONTRIBUTING.md) 文档，或者通过上述的方式联系我们。
+我们非常欢迎每个 Issue 和 PR，即使一个标点符号，如何参加贡献请阅读 [CONTRIBUTING](CONTRIBUTING.md) 文档，或者通过上述的方式联系我们。具体社区参与同学的晋升者阶梯，参见： ([晋升者阶梯](https://github.com/chaosblade-io/community/blob/main/Contributor_Ladder_CN.md))
 
 ## 企业登记
 我们开源此项目的初衷是降低混沌工程在企业中落地的门槛，所以非常看重该项目在企业的使用情况，欢迎大家在此 [ISSUE](https://github.com/chaosblade-io/chaosblade/issues/32) 中登记，登记后会被邀请加入企业邮件组，探讨混沌工程在企业落地中遇到的问题和分享落地经验。
