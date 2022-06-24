@@ -44,7 +44,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=1.6.0-dev
+BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-docker
 BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
@@ -52,15 +52,15 @@ BLADE_EXEC_DOCKER_BRANCH=v1.5.0
 
 # chaosblade-exec-cri
 BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
-BLADE_EXEC_CRI_BRANCH=1.6.0-dev
+BLADE_EXEC_CRI_BRANCH=main
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=1.6.0-dev
+BLADE_OPERATOR_BRANCH=master
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=1.6.0-dev
+BLADE_EXEC_JVM_BRANCH=master
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
@@ -122,8 +122,8 @@ pre_build: mkdir_build_target ## Mkdir build target
 cli: ## Build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
 
-nsexec: ## Build nsexec
-	musl-gcc -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
+nsexec: ## Build nsexecgo
+	/usr/local/musl/bin/musl-gcc -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
 
 os: ## Build basic resource experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
