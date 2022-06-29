@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=1.6.0
+export BLADE_VERSION=1.6.1
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -18,9 +18,12 @@ GO_MODULE=GO111MODULE=on
 VERSION_PKG=github.com/chaosblade-io/chaosblade/version
 # Specify chaosblade version in docker experiments
 DOCKER_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-docker/version
+CRI_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-cri/version
 OS_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-os/version
+JVM_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-jvm/version
+K8S_BLADE_VERSION=github.com/chaosblade-io/cchaosblade-operator/version
 
-GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
+GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${CRI_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${JVM_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${K8S_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
 GO_FLAGS=-ldflags="$(GO_X_FLAGS) -s -w"
 GO=env $(GO_ENV) $(GO_MODULE) go
 
@@ -103,10 +106,10 @@ build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario buil
 
 # build chaosblade linux version by docker image
 build_linux:  ## Build linux version of all scenarios by docker image
-	make build_with_linux ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
+	make build_with_linux ARGS="cli os docker cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
-	make build_with_linux_arm ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
+	make build_with_linux_arm ARGS="cli os docker cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_darwin: pre_build cli os cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
