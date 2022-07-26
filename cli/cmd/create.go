@@ -195,7 +195,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 				return response
 			}
 
-			if expModel.ActionProcessHang && scope != "pod" && scope != "container" {
+			if expModel.ActionProcessHang && scope != "pod" && scope != "container" && expModel.ActionFlags["channel"] != "ssh" {
 				// todo -> need to find a better way to query the status
 				time.Sleep(time.Millisecond * 100)
 				log.Debugf(ctx, "result: %v", response.Result)
