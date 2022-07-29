@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=1.6.0
+export BLADE_VERSION=1.6.1
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -18,9 +18,12 @@ GO_MODULE=GO111MODULE=on
 VERSION_PKG=github.com/chaosblade-io/chaosblade/version
 # Specify chaosblade version in docker experiments
 DOCKER_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-docker/version
+CRI_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-cri/version
 OS_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-os/version
+JVM_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-jvm/version
+K8S_BLADE_VERSION=github.com/chaosblade-io/cchaosblade-operator/version
 
-GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
+GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${CRI_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${JVM_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${K8S_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
 GO_FLAGS=-ldflags="$(GO_X_FLAGS) -s -w"
 GO=env $(GO_ENV) $(GO_MODULE) go
 
@@ -44,7 +47,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=1.6.0-dev
+BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-docker
 BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
@@ -52,15 +55,15 @@ BLADE_EXEC_DOCKER_BRANCH=v1.5.0
 
 # chaosblade-exec-cri
 BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
-BLADE_EXEC_CRI_BRANCH=1.6.0-dev
+BLADE_EXEC_CRI_BRANCH=main
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=1.6.0-dev
+BLADE_OPERATOR_BRANCH=master
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=1.6.0-dev
+BLADE_EXEC_JVM_BRANCH=master
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
@@ -103,10 +106,10 @@ build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario buil
 
 # build chaosblade linux version by docker image
 build_linux:  ## Build linux version of all scenarios by docker image
-	make build_with_linux ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
+	make build_with_linux ARGS="cli os docker cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
-	make build_with_linux_arm ARGS="cli os docker cri kubernetes java cplus check_yaml" upx package
+	make build_with_linux_arm ARGS="cli os docker cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_darwin: pre_build cli os cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
@@ -122,8 +125,8 @@ pre_build: mkdir_build_target ## Mkdir build target
 cli: ## Build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
 
-nsexec: ## Build nsexec
-	musl-gcc -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
+nsexec: ## Build nsexecgo
+	/usr/local/musl/bin/musl-gcc -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
 
 os: ## Build basic resource experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))

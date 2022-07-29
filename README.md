@@ -99,7 +99,7 @@ You can also contact us via:
 * Twitter: [chaosblade.io](https://twitter.com/ChaosbladeI)
 
 ## Contributing
-We welcome every contribution, even if it is just punctuation. See details of [CONTRIBUTING](CONTRIBUTING.md)
+We welcome every contribution, even if it is just punctuation. See details of [CONTRIBUTING](CONTRIBUTING.md). For the promotion ladder of specific community participation students, see： ([Contributor Ladder](https://github.com/chaosblade-io/community/blob/main/Contributor_Ladder.md))
 
 ## Business Registration
 The original intention of our open source project is to lower the threshold for chaos engineering to be implemented in enterprises, so we highly value the use of the project in enterprises. Welcome everyone here [ISSUE](https://github.com/chaosblade-io/chaosblade/issues/32). After registration, you will be invited to join the corporate mail group to discuss the problems encountered by Chaos Engineering in the landing of the company and share the landing experience.
