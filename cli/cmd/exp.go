@@ -213,7 +213,7 @@ func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
 	return modelCommands
 }
 
-func getResourceFlags() []spec.ExpFlagSpec {
+func GetResourceFlags() []spec.ExpFlagSpec {
 	coverageFlags := model.GetResourceCoverageFlags()
 	commonFlags := model.GetResourceCommonFlags()
 	containerFlags := model.GetContainerFlags()
@@ -244,7 +244,7 @@ func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 	for idx := range models.Models {
 		model := &models.Models[idx]
 		model.ExpScope = "container"
-		spec.AddFlagsToModelSpec(getResourceFlags, model)
+		spec.AddFlagsToModelSpec(GetResourceFlags, model)
 		command := ec.registerExpCommand(model, k8sSpec.Name())
 		modelCommands = append(modelCommands, command)
 	}

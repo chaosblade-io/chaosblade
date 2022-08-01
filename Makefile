@@ -21,7 +21,7 @@ DOCKER_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-docker/version
 CRI_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-cri/version
 OS_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-os/version
 JVM_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-jvm/version
-K8S_BLADE_VERSION=github.com/chaosblade-io/cchaosblade-operator/version
+K8S_BLADE_VERSION=github.com/chaosblade-io/chaosblade-operator/version
 
 GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${CRI_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${JVM_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${K8S_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
 GO_FLAGS=-ldflags="$(GO_X_FLAGS) -s -w"

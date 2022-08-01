@@ -41,7 +41,7 @@ func NewComposeExecutor() ComposeExecutor {
 }
 
 func (*ComposeExecutorForK8s) Name() string {
-	return "os"
+	return "k8s"
 }
 
 func (e *ComposeExecutorForK8s) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {

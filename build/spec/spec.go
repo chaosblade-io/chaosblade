@@ -22,11 +22,14 @@ import (
 	"os"
 	"path"
 
+	"github.com/chaosblade-io/chaosblade-exec-cri/exec"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
+
+	"github.com/chaosblade-io/chaosblade/cli/cmd"
 )
 
-var version = "0.7.1"
+var version = "1.6.1"
 
 func main() {
 
@@ -38,7 +41,6 @@ func main() {
 	jvmSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version))
 	osSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-os-spec-%s.yaml", version))
 	k8sSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version))
-	dockerSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-docker-spec-%s.yaml", version))
 	criSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version))
 	cplusSpecFile := path.Join(filePath, "chaosblade-cplus-spec.yaml")
 	chaosSpecFile := path.Join(targetPath, "chaosblade.spec.yaml")
@@ -46,11 +48,10 @@ func main() {
 	osModels := getOsModels(osSpecFile)
 	jvmModels := getJvmModels(jvmSpecFile)
 	cplusModels := getCplusModels(cplusSpecFile)
-	dockerModels := getDockerModels(dockerSpecFile)
-	criModels := getCriModels(criSpecFile)
-	k8sModels := getKubernetesModels(k8sSpecFile)
+	criModels := getCriModels(criSpecFile, jvmSpecFile)
+	k8sModels := getKubernetesModels(k8sSpecFile, jvmSpecFile)
 
-	models := mergeModels(osModels, jvmModels, dockerModels, cplusModels, criModels, k8sModels)
+	models := mergeModels(osModels, jvmModels, cplusModels, criModels, k8sModels)
 
 	file, err := os.OpenFile(chaosSpecFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0755)
 	if err != nil {
@@ -83,28 +84,53 @@ func getCplusModels(cplusSpecFile string) *spec.Models {
 	return models
 }
 
-func getDockerModels(dockerSpecFile string) *spec.Models {
-	models, err := util.ParseSpecsToModel(dockerSpecFile, nil)
-	if err != nil {
-		log.Fatalf("parse docker spec failed, %s", err)
-	}
-	return models
-}
-
-func getCriModels(criSpecFile string) *spec.Models {
-	models, err := util.ParseSpecsToModel(criSpecFile, nil)
+func getCriModels(criSpecFile, jvmSpecFile string) *spec.Models {
+	criModels, err := util.ParseSpecsToModel(criSpecFile, nil)
 	if err != nil {
 		log.Fatalf("parse cri spec failed, %s", err)
 	}
-	return models
+
+	jvmModels := getJvmModels(jvmSpecFile)
+	for idx := range jvmModels.Models {
+		model := &jvmModels.Models[idx]
+		model.ExpScope = "cri"
+		spec.AddFlagsToModelSpec(exec.GetExecInContainerFlags, model)
+		addFlagToActionSpec(model)
+		criModels.Models = append(criModels.Models, *model)
+	}
+
+	return criModels
 }
 
-func getKubernetesModels(k8sSpecFile string) *spec.Models {
+func getKubernetesModels(k8sSpecFile, jvmSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(k8sSpecFile, nil)
 	if err != nil {
 		log.Fatalf("parse kubernetes spec failed, %s", err)
 	}
+
+	jvmModels := getJvmModels(jvmSpecFile)
+	for idx := range jvmModels.Models {
+		model := &jvmModels.Models[idx]
+
+		model.ExpScope = "container"
+		spec.AddFlagsToModelSpec(cmd.GetResourceFlags, model)
+		addFlagToActionSpec(model)
+		models.Models = append(models.Models, *model)
+	}
 	return models
+}
+
+func addFlagToActionSpec(model *spec.ExpCommandModel) {
+	for idx := range model.ExpActions {
+		action := &model.ExpActions[idx]
+		flags := model.ExpFlags
+		if flags == nil {
+			flags = make([]spec.ExpFlag, 0)
+		}
+		action.ActionFlags = append(action.ActionFlags, flags...)
+		//model.ExpActions[idx] = *action
+	}
+	model.SetFlags(nil)
 }
 
 func convertSpecToModels(modelSpec spec.ExpModelCommandSpec, prepare spec.ExpPrepareModel) *spec.Models {
