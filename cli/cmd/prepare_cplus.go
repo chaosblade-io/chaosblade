@@ -63,7 +63,7 @@ func (pc *PrepareCPlusCommand) prepareCPlus() error {
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil || record.Status != Running {
-		record, err = insertPrepareRecord(PrepareCPlusType, portStr, portStr, "")
+		record, err = insertPrepareRecord(PrepareCPlusType, pc.Name(), portStr, "")
 		if err != nil {
 			log.Errorf(ctx, util.GetRunFuncName(), spec.DatabaseError.Sprintf("insert", err))
 			return spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err)
