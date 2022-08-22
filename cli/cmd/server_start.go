@@ -18,8 +18,11 @@ package cmd
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"io/ioutil"
 	"net/http"
 	"os"
 	"path"
@@ -35,16 +38,20 @@ const startServerKey = "blade server start --nohup"
 
 type StartServerCommand struct {
 	baseCommand
-	ip    string
-	port  string
-	nohup bool
+	ip       string
+	port     string
+	nohup    bool
+	mtls     bool
+	cafile   string
+	certfile string
+	keyfile  string
 }
 
 func (ssc *StartServerCommand) Init() {
 	ssc.command = &cobra.Command{
 		Use:     "start",
 		Short:   "Start server mode, exposes web services",
-		Long:    "Start server mode, exposes web services. Under the mode, you can send http request to trigger experiments",
+		Long:    "Start server mode, exposes web services. Under the mode, you can send http or https request to trigger experiments",
 		Aliases: []string{"s"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return ssc.run(cmd, args)
@@ -54,9 +61,30 @@ func (ssc *StartServerCommand) Init() {
 	ssc.command.Flags().StringVarP(&ssc.ip, "ip", "i", "", "service ip address, default value is *")
 	ssc.command.Flags().StringVarP(&ssc.port, "port", "p", "9526", "service port")
 	ssc.command.Flags().BoolVarP(&ssc.nohup, "nohup", "n", false, "used by internal")
+	ssc.command.Flags().BoolVarP(&ssc.mtls, "mtls", "", false, "use mtls authentication, default value is false")
+	ssc.command.Flags().StringVarP(&ssc.cafile, "ca-file", "", "", "TLS CA file")
+	ssc.command.Flags().StringVarP(&ssc.certfile, "cert-file", "", "", "server TLS cert file")
+	ssc.command.Flags().StringVarP(&ssc.keyfile, "key-file", "", "", "server TLS key file")
 }
 
 func (ssc *StartServerCommand) run(cmd *cobra.Command, args []string) error {
+	// check if the mtls parameters are correct
+	if ssc.mtls && ssc.cafile == "" || ssc.certfile == "" || ssc.keyfile == "" {
+		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
+			"start blade server failed, mtls needs ca, cert and key file")
+	}
+	if !util.IsExist(ssc.cafile) {
+		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
+			"start blade server failed, ca file does not exist")
+	}
+	if !util.IsExist(ssc.certfile) {
+		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
+			"start blade server failed, cert file does not exist")
+	}
+	if !util.IsExist(ssc.keyfile) {
+		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
+			"start blade server failed, key file does not exist")
+	}
 	// check if the process named `blade server --start` exists or not
 	pids, err := channel.NewLocalChannel().GetPidsByProcessName(startServerKey, context.TODO())
 	if err != nil {
@@ -84,6 +112,9 @@ func (ssc *StartServerCommand) start() error {
 	args := fmt.Sprintf("%s server start --nohup --port %s", bladeBin, ssc.port)
 	if ssc.ip != "" {
 		args = fmt.Sprintf("%s --ip %s", args, ssc.ip)
+	}
+	if ssc.mtls {
+		args = fmt.Sprintf("%s --mtls --ca-file %s --cert-file %s --key-file %s", args, ssc.cafile, ssc.certfile, ssc.keyfile)
 	}
 	ctx := context.Background()
 	response := cl.Run(ctx, "nohup", fmt.Sprintf("%s > /dev/null 2>&1 &", args))
@@ -120,14 +151,36 @@ func (ssc *StartServerCommand) start() error {
 
 // start0 starts web service
 func (ssc *StartServerCommand) start0() {
-	go func() {
-		err := http.ListenAndServe(ssc.ip+":"+ssc.port, nil)
-		if err != nil {
-			log.Errorf(context.Background(),"start blade server error, %v", err)
-			//log.Error(err, "start blade server error")
-			os.Exit(1)
-		}
-	}()
+	if ssc.mtls {
+		go func() {
+			pool := x509.NewCertPool()
+			caCrt, _ := ioutil.ReadFile(ssc.cafile)
+			pool.AppendCertsFromPEM(caCrt)
+			s := &http.Server{
+				Addr:    ssc.ip + ":" + ssc.port,
+				Handler: nil,
+				TLSConfig: &tls.Config{
+					ClientCAs:  pool,
+					ClientAuth: tls.RequireAndVerifyClientCert,
+				},
+			}
+			err := s.ListenAndServeTLS(ssc.certfile, ssc.keyfile)
+			if err != nil {
+				log.Errorf(context.Background(), "start blade server error, %v", err)
+				//log.Error(err, "start blade server error")
+				os.Exit(1)
+			}
+		}()
+	} else {
+		go func() {
+			err := http.ListenAndServe(ssc.ip+":"+ssc.port, nil)
+			if err != nil {
+				log.Errorf(context.Background(), "start blade server error, %v", err)
+				//log.Error(err, "start blade server error")
+				os.Exit(1)
+			}
+		}()
+	}
 	Register("/chaosblade")
 	util.Hold()
 }
