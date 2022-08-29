@@ -69,21 +69,23 @@ func (ssc *StartServerCommand) Init() {
 
 func (ssc *StartServerCommand) run(cmd *cobra.Command, args []string) error {
 	// check if the mtls parameters are correct
-	if ssc.mtls && ssc.cafile == "" || ssc.certfile == "" || ssc.keyfile == "" {
-		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
-			"start blade server failed, mtls needs ca, cert and key file")
-	}
-	if !util.IsExist(ssc.cafile) {
-		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
-			"start blade server failed, ca file does not exist")
-	}
-	if !util.IsExist(ssc.certfile) {
-		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
-			"start blade server failed, cert file does not exist")
-	}
-	if !util.IsExist(ssc.keyfile) {
-		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
-			"start blade server failed, key file does not exist")
+	if ssc.mtls {
+		if ssc.cafile == "" || ssc.certfile == "" || ssc.keyfile == "" {
+			return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
+				"start blade server failed, mtls needs ca, cert and key file")
+		}
+		if !util.IsExist(ssc.cafile) {
+			return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
+				"start blade server failed, ca file does not exist")
+		}
+		if !util.IsExist(ssc.certfile) {
+			return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
+				"start blade server failed, cert file does not exist")
+		}
+		if !util.IsExist(ssc.keyfile) {
+			return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey,
+				"start blade server failed, key file does not exist")
+		}
 	}
 	// check if the process named `blade server --start` exists or not
 	pids, err := channel.NewLocalChannel().GetPidsByProcessName(startServerKey, context.TODO())
