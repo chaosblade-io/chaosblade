@@ -93,7 +93,7 @@ help:
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>...\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m  %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Build
-build: pre_build cli nsexec os middleware cri cplus java kubernetes upx package check_yaml
+build: pre_build cli nsexec os middleware cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
 
 # for example: make build_with cli
 build_with: pre_build ## Select scenario build, for example `make build_with cli os docker cri kubernetes java cplus`
