@@ -3,7 +3,7 @@ module github.com/chaosblade-io/chaosblade
 go 1.13
 
 require (
-	github.com/chaosblade-io/chaosblade-exec-cri v1.6.1-0.20220624081117-892e8ba08983
+	github.com/chaosblade-io/chaosblade-exec-cri v1.6.1-0.20220817062756-064b7b4cab4d
 	github.com/chaosblade-io/chaosblade-exec-os v1.6.1-0.20220624033144-ee86ca0c3a31
 	github.com/chaosblade-io/chaosblade-operator v1.6.1-0.20220624033356-cdb8ba30adfd
 	github.com/chaosblade-io/chaosblade-spec-go v1.6.0

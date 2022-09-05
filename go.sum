@@ -168,6 +168,8 @@ github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220429064319-1baacd4efc7
 github.com/chaosblade-io/chaosblade-exec-cri v1.5.1-0.20220429064319-1baacd4efc7e/go.mod h1:ntY1QmFauHvQ6jIuAeJXjDoaNxuQxi6lmzodBsScZbc=
 github.com/chaosblade-io/chaosblade-exec-cri v1.6.1-0.20220624081117-892e8ba08983 h1:cdztcdV7ZGbQ6Jkm3Ek6hUB7HqKYK8U6B28ZUxamwck=
 github.com/chaosblade-io/chaosblade-exec-cri v1.6.1-0.20220624081117-892e8ba08983/go.mod h1:ntY1QmFauHvQ6jIuAeJXjDoaNxuQxi6lmzodBsScZbc=
+github.com/chaosblade-io/chaosblade-exec-cri v1.6.1-0.20220817062756-064b7b4cab4d h1:yTTQOm3kzfhy7i5DMBqkqyaBSYTX5nXztLcWt5BkF60=
+github.com/chaosblade-io/chaosblade-exec-cri v1.6.1-0.20220817062756-064b7b4cab4d/go.mod h1:ntY1QmFauHvQ6jIuAeJXjDoaNxuQxi6lmzodBsScZbc=
 github.com/chaosblade-io/chaosblade-exec-os v1.5.1-0.20220426025253-6d1640d20ae4 h1:L1S4syQy85xfC+Yb7S88DIkdYrRyJV1Rqq5GfBYwbKg=
 github.com/chaosblade-io/chaosblade-exec-os v1.5.1-0.20220426025253-6d1640d20ae4/go.mod h1:UNDuSGNygBqqGVxUMhCL56BwK/up53bz8qKVOdEEyFE=
 github.com/chaosblade-io/chaosblade-exec-os v1.6.1-0.20220624033144-ee86ca0c3a31 h1:QCCKsDQJEikN+MhNXbLjz4hBmR1Ldvphz5Hy548YGiI=
