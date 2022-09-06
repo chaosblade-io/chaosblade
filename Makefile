@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=1.6.1
+export BLADE_VERSION=1.7.0
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -17,13 +17,12 @@ GO_ENV=CGO_ENABLED=1
 GO_MODULE=GO111MODULE=on
 VERSION_PKG=github.com/chaosblade-io/chaosblade/version
 # Specify chaosblade version in docker experiments
-DOCKER_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-docker/version
 CRI_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-cri/version
 OS_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-os/version
 JVM_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-jvm/version
 K8S_BLADE_VERSION=github.com/chaosblade-io/chaosblade-operator/version
 
-GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${DOCKER_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${CRI_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${JVM_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${K8S_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
+GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${CRI_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${JVM_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${K8S_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
 GO_FLAGS=-ldflags="$(GO_X_FLAGS) -s -w"
 GO=env $(GO_ENV) $(GO_MODULE) go
 
@@ -49,10 +48,6 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
 BLADE_EXEC_OS_BRANCH=master
 
-# chaosblade-exec-docker
-BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
-BLADE_EXEC_DOCKER_BRANCH=v1.5.0
-
 # chaosblade-exec-cri
 BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
 BLADE_EXEC_CRI_BRANCH=main
@@ -69,17 +64,13 @@ BLADE_EXEC_JVM_BRANCH=master
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
 BLADE_EXEC_CPLUS_BRANCH=master
 
-# docker yaml
-DOCKER_YAML_FILE_NAME=chaosblade-docker-spec-$(BLADE_VERSION).yaml
-DOCKER_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(DOCKER_YAML_FILE_NAME)
-
 # cri yaml
 CRI_YAML_FILE_NAME=chaosblade-cri-spec-$(BLADE_VERSION).yaml
 CRI_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(CRI_YAML_FILE_NAME)
 
 # check yaml
 CHECK_YAML_FILE_NAME=chaosblade-check-spec-$(BLADE_VERSION).yaml
-CHECK_YANL_FILE_OSS=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/$(BLADE_VERSION)/$(CHECK_YAML_FILE_NAME)
+CHECK_YANL_FILE_OSS=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/chaosblade-check-spec.yaml
 CHECK_YAML_FILE_PATH=$(BUILD_TARGET_YAML)/$(CHECK_YAML_FILE_NAME)
 
 ifeq ($(GOOS), linux)
@@ -106,10 +97,10 @@ build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario buil
 
 # build chaosblade linux version by docker image
 build_linux:  ## Build linux version of all scenarios by docker image
-	make build_with_linux ARGS="cli os docker cri nsexec kubernetes java cplus check_yaml" upx package
+	make build_with_linux ARGS="cli os cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
-	make build_with_linux_arm ARGS="cli os docker cri nsexec kubernetes java cplus check_yaml" upx package
+	make build_with_linux_arm ARGS="cli os cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_darwin: pre_build cli os cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
@@ -140,15 +131,6 @@ endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
-
-docker: ## Build docker experimental scenarios.
-ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-docker, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-docker))
-	git clone -b $(BLADE_EXEC_DOCKER_BRANCH) $(BLADE_EXEC_DOCKER_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-docker
-else
-	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-docker pull origin $(BLADE_EXEC_DOCKER_BRANCH)
-endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-docker
-	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-docker/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
 
 kubernetes: ## Build kubernetes experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-operator, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-operator))
