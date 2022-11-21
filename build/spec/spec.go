@@ -40,18 +40,20 @@ func main() {
 	targetPath := os.Args[2]
 	jvmSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version))
 	osSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-os-spec-%s.yaml", version))
+	cloudSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cloud-spec-%s.yaml", version))
 	k8sSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version))
 	criSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version))
 	cplusSpecFile := path.Join(filePath, "chaosblade-cplus-spec.yaml")
 	chaosSpecFile := path.Join(targetPath, "chaosblade.spec.yaml")
 
 	osModels := getOsModels(osSpecFile)
+	cloudModels := getCloudModels(cloudSpecFile)
 	jvmModels := getJvmModels(jvmSpecFile)
 	cplusModels := getCplusModels(cplusSpecFile)
 	criModels := getCriModels(criSpecFile, jvmSpecFile)
 	k8sModels := getKubernetesModels(k8sSpecFile, jvmSpecFile)
 
-	models := mergeModels(osModels, jvmModels, cplusModels, criModels, k8sModels)
+	models := mergeModels(osModels, cloudModels, jvmModels, cplusModels, criModels, k8sModels)
 
 	file, err := os.OpenFile(chaosSpecFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0755)
 	if err != nil {
@@ -68,6 +70,15 @@ func getOsModels(osSpecFile string) *spec.Models {
 	}
 	return models
 }
+
+func getCloudModels(cloudSpecFile string) *spec.Models {
+	models, err := util.ParseSpecsToModel(cloudSpecFile, nil)
+	if err != nil {
+		log.Fatalf("parse cloud spec failed, %s", err)
+	}
+	return models
+}
+
 func getJvmModels(jvmSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(jvmSpecFile, nil)
 	if err != nil {
