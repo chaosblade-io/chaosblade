@@ -52,10 +52,6 @@ BLADE_EXEC_OS_BRANCH=master
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
 BLADE_EXEC_MIDDLEWARE_BRANCH=main
 
-# chaosblade-exec-docker
-BLADE_EXEC_DOCKER_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-docker.git
-BLADE_EXEC_DOCKER_BRANCH=v1.5.0
-
 # chaosblade-exec-cri
 BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
 BLADE_EXEC_CRI_BRANCH=main
@@ -105,10 +101,10 @@ build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario buil
 
 # build chaosblade linux version by docker image
 build_linux:  ## Build linux version of all scenarios by docker image
-	make build_with_linux ARGS="cli os middleware docker cri nsexec kubernetes java cplus check_yaml" upx package
+	make build_with_linux ARGS="cli os middleware cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
-	make build_with_linux_arm ARGS="cli os middleware docker cri nsexec kubernetes java cplus check_yaml" upx package
+	make build_with_linux_arm ARGS="cli os middleware cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_darwin: pre_build cli os middleware cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
@@ -152,15 +148,6 @@ endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
-
-docker: ## Build docker experimental scenarios.
-ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-docker, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-docker))
-	git clone -b $(BLADE_EXEC_DOCKER_BRANCH) $(BLADE_EXEC_DOCKER_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-docker
-else
-	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-docker pull origin $(BLADE_EXEC_DOCKER_BRANCH)
-endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-docker
-	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-docker/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
 
 kubernetes: ## Build kubernetes experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-operator, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-operator))
