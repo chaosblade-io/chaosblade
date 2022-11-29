@@ -36,7 +36,7 @@ func NewExecutor() spec.Executor {
 }
 
 func (*Executor) Name() string {
-	return "os"
+	return "cloud"
 }
 
 func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
