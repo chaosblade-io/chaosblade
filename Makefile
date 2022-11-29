@@ -48,9 +48,15 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
 BLADE_EXEC_OS_BRANCH=master
 
+
+# chaosblade-exec-middleware
+BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
+BLADE_EXEC_MIDDLEWARE_BRANCH=main
+
 # chaosblade-exec-cloud
 BLADE_EXEC_CLOUD_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cloud.git
 BLADE_EXEC_CLOUD_BRANCH=main
+
 
 # chaosblade-exec-cri
 BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
@@ -89,8 +95,8 @@ help:
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>...\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m  %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
 ##@ Build
-build: pre_build cli nsexec os cloud cri cplus java kubernetes package check_yaml  ## Build all scenarios
-#build: pre_build cli nsexec os cloud cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
+build: pre_build cli nsexec os cloud middleware cri cplus java kubernetes package check_yaml  ## Build all scenarios
+#build: pre_build cli nsexec os cloud middleware cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
 
 # for example: make build_with cli
 build_with: pre_build ## Select scenario build, for example `make build_with cli os cloud docker cri kubernetes java cplus`
@@ -102,12 +108,12 @@ build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario buil
 
 # build chaosblade linux version by docker image
 build_linux:  ## Build linux version of all scenarios by docker image
-	make build_with_linux ARGS="cli os cloud cri nsexec kubernetes java cplus check_yaml" upx package
+	make build_with_linux ARGS="cli os cloud middleware cri nsexec kubernetes java cplus check_yaml" upx package
 
 build_linux_arm:  ## Build linux arm version of all scenarios by docker image
-	make build_with_linux_arm ARGS="cli os cloud cri nsexec kubernetes java cplus check_yaml" upx package
+	make build_with_linux_arm ARGS="cli os cloud middleware cri nsexec kubernetes java cplus check_yaml" upx package
 
-build_darwin: pre_build cli os cloud cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
+build_darwin: pre_build cli os cloud middleware cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
 
 ##@ Build sub
 
@@ -137,6 +143,19 @@ endif
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
 
+middleware: ## Build middleware experimental scenarios.
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-middleware, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware))
+	git clone -b $(BLADE_EXEC_MIDDLEWARE_BRANCH) $(BLADE_EXEC_MIDDLEWARE_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware
+else
+ifdef ALERTMSG
+	$(error $(ALERTMSG))
+endif
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware pull origin $(BLADE_EXEC_MIDDLEWARE_BRANCH)
+endif
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware
+	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
+	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
+
 cloud: ## Build cloud experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-cloud, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud))
 	git clone -b $(BLADE_EXEC_CLOUD_BRANCH) $(BLADE_EXEC_CLOUD_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud
@@ -149,6 +168,7 @@ endif
 	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
+
 
 kubernetes: ## Build kubernetes experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-operator, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-operator))

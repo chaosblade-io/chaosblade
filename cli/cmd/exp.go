@@ -22,6 +22,7 @@ import (
 	"github.com/chaosblade-io/chaosblade-exec-cri/exec"
 	"github.com/chaosblade-io/chaosblade-operator/exec/model"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"github.com/chaosblade-io/chaosblade/exec/middleware"
 	"github.com/chaosblade-io/chaosblade/exec/cloud"
 	"path"
 
@@ -118,6 +119,8 @@ func (ec *baseExpCommandService) GetExecutor(target, actionTarget, action string
 func (ec *baseExpCommandService) registerSubCommands() {
 	// register os type command
 	ec.registerOsExpCommands()
+	// register middleware command
+	ec.registerMiddlewareExpCommands()
 	// register cloud type command
 	ec.registerCloudExpCommands()
 	// register jvm framework commands
@@ -148,6 +151,22 @@ func (ec *baseExpCommandService) registerOsExpCommands() []*modelCommand {
 	return osCommands
 }
 
+
+// registerMiddlewareExpCommands
+func (ec *baseExpCommandService) registerMiddlewareExpCommands() []*modelCommand {
+	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-middleware-spec-%s.yaml", version.Ver))
+	models, err := specutil.ParseSpecsToModel(file, middleware.NewExecutor())
+	if err != nil {
+		return nil
+	}
+	middlewareCommands := make([]*modelCommand, 0)
+	for idx := range models.Models {
+		model := &models.Models[idx]
+		command := ec.registerExpCommand(model, "")
+		middlewareCommands = append(middlewareCommands, command)
+	}
+	return middlewareCommands
+}
 // registerCloudExpCommands
 func (ec *baseExpCommandService) registerCloudExpCommands() []*modelCommand {
 	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-cloud-spec-%s.yaml", version.Ver))
@@ -162,6 +181,7 @@ func (ec *baseExpCommandService) registerCloudExpCommands() []*modelCommand {
 		cloudCommands = append(cloudCommands, command)
 	}
 	return cloudCommands
+
 }
 
 // registerJvmExpCommands
