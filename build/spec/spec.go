@@ -29,7 +29,7 @@ import (
 	"github.com/chaosblade-io/chaosblade/cli/cmd"
 )
 
-var version = "1.7.0"
+var version = "1.7.1"
 
 func main() {
 

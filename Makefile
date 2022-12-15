@@ -1,6 +1,6 @@
 .PHONY: build clean
 
-export BLADE_VERSION=1.7.0
+export BLADE_VERSION=1.7.1
 
 ALLOWGITVERSION=1.8.5
 GITVERSION:=$(shell git --version | grep ^git | sed 's/^.* //g')
@@ -48,7 +48,6 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
 BLADE_EXEC_OS_BRANCH=master
 
-
 # chaosblade-exec-middleware
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
 BLADE_EXEC_MIDDLEWARE_BRANCH=main
@@ -56,7 +55,6 @@ BLADE_EXEC_MIDDLEWARE_BRANCH=main
 # chaosblade-exec-cloud
 BLADE_EXEC_CLOUD_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cloud.git
 BLADE_EXEC_CLOUD_BRANCH=main
-
 
 # chaosblade-exec-cri
 BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
@@ -222,7 +220,7 @@ build_image: ## Build chaosblade-tool image
 	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_IMAGE_PATH)
 	docker build -f $(BUILD_IMAGE_PATH)/Dockerfile \
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
-		-t chaosblade-tool:$(BLADE_VERSION) \
+		-t chaosbladeio/chaosblade-tool:$(BLADE_VERSION) \
 		$(BUILD_IMAGE_PATH)
 	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 
@@ -232,7 +230,7 @@ build_image_arm: ## Build chaosblade-tool-arm image
 	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_ARM_IMAGE_PATH)
 	docker build -f $(BUILD_ARM_IMAGE_PATH)/Dockerfile \
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
-		-t chaosblade-tool-arm64:$(BLADE_VERSION) \
+		-t chaosbladeio/chaosblade-tool-arm64:$(BLADE_VERSION) \
 		$(BUILD_ARM_IMAGE_PATH)
 	rm -rf $(BUILD_ARM_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 
@@ -277,7 +275,7 @@ build_linux_with_arg:
 		-v $(shell echo -n ${GOPATH}):/go \
 		-w /go/src/github.com/chaosblade-io/chaosblade \
 		-v ~/.m2/repository:/root/.m2/repository \
-		-v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
+        -v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
 		chaosbladeio/chaosblade-build-musl:latest build_with $$ARGS
 
 ## Select scenario build linux arm version by docker image
