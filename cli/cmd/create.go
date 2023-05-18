@@ -140,6 +140,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 		if resp != nil && !resp.Success {
 			return resp
 		}
+		model.Uid = resp.Result.(string)
 		// is async ?
 		async := expModel.ActionFlags[AsyncFlag] == "true"
 		endpoint := expModel.ActionFlags[EndpointFlag]
