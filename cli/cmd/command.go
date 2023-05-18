@@ -106,7 +106,7 @@ func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpMode
 	if err != nil {
 		return nil, spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err)
 	}
-	return commandModel, spec.Success()
+	return commandModel, spec.ReturnSuccess(uid)
 }
 
 func parseCommandPath(commandPath string) (string, string, error) {
