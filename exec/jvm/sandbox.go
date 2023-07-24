@@ -19,7 +19,6 @@ package jvm
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"os"
 	osuser "os/user"
 	"path"
@@ -28,6 +27,7 @@ import (
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/shirou/gopsutil/process"
@@ -213,7 +213,7 @@ func getJavaCommandLine(ctx context.Context, pid string) (commandSlice []string,
 	}
 	processObj, err := process.NewProcess(int32(processId))
 	if err != nil {
-		log.Warnf(ctx, "new process by processId err: %v, pid: %s", pid)
+		log.Warnf(ctx, "new process by processId err, pid %s, err: %v", pid, err)
 		return nil, err
 	}
 	return processObj.CmdlineSlice()
