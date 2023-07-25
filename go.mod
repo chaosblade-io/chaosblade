@@ -3,12 +3,12 @@ module github.com/chaosblade-io/chaosblade
 go 1.20
 
 require (
-	github.com/chaosblade-io/chaosblade-exec-cloud v1.7.2
-	github.com/chaosblade-io/chaosblade-exec-cri v1.7.2
-	github.com/chaosblade-io/chaosblade-exec-middleware v1.7.2
-	github.com/chaosblade-io/chaosblade-exec-os v1.7.2
-	github.com/chaosblade-io/chaosblade-operator v1.7.2
-	github.com/chaosblade-io/chaosblade-spec-go v1.7.2
+	github.com/chaosblade-io/chaosblade-exec-cloud v1.7.3
+	github.com/chaosblade-io/chaosblade-exec-cri v1.7.3
+	github.com/chaosblade-io/chaosblade-exec-middleware v1.7.3
+	github.com/chaosblade-io/chaosblade-exec-os v1.7.3
+	github.com/chaosblade-io/chaosblade-operator v1.7.3
+	github.com/chaosblade-io/chaosblade-spec-go v1.7.3
 	github.com/mattn/go-sqlite3 v1.10.1-0.20190217174029-ad30583d8387
 	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
 	github.com/shirou/gopsutil v3.21.8-0.20210816101416-f86a04298073+incompatible
@@ -51,13 +51,12 @@ require (
 	github.com/go-openapi/jsonreference v0.19.3 // indirect
 	github.com/go-openapi/spec v0.19.4 // indirect
 	github.com/go-openapi/swag v0.19.5 // indirect
-	github.com/go-sql-driver/mysql v1.6.0 // indirect
 	github.com/godbus/dbus/v5 v5.0.4 // indirect
 	github.com/gogo/googleapis v1.4.0 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
-	github.com/google/go-cmp v0.5.5 // indirect
+	github.com/google/go-cmp v0.5.6 // indirect
 	github.com/google/gofuzz v1.1.0 // indirect
 	github.com/google/uuid v1.2.0 // indirect
 	github.com/googleapis/gnostic v0.4.1 // indirect
