@@ -228,7 +228,8 @@ build_image_arm: ## Build chaosblade-tool-arm image
 	rm -rf $(BUILD_ARM_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
 	cp -R $(BUILD_TARGET_PKG_NAME) $(BUILD_ARM_IMAGE_PATH)
 	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_ARM_IMAGE_PATH)
-	docker build -f $(BUILD_ARM_IMAGE_PATH)/Dockerfile \
+	docker buildx build -f $(BUILD_ARM_IMAGE_PATH)/Dockerfile \
+                --platform=linux/arm64 \
 		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
 		-t chaosbladeio/chaosblade-tool-arm64:$(BLADE_VERSION) \
 		$(BUILD_ARM_IMAGE_PATH)
