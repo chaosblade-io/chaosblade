@@ -123,7 +123,7 @@ func (ssc *StartServerCommand) start0() {
 	go func() {
 		err := http.ListenAndServe(ssc.ip+":"+ssc.port, nil)
 		if err != nil {
-			log.Errorf(context.Background(),"start blade server error, %v", err)
+			log.Errorf(context.Background(), "start blade server error, %v", err)
 			//log.Error(err, "start blade server error")
 			os.Exit(1)
 		}
@@ -134,20 +134,7 @@ func (ssc *StartServerCommand) start0() {
 
 func Register(requestPath string) {
 	http.HandleFunc(requestPath, func(writer http.ResponseWriter, request *http.Request) {
-		err := request.ParseForm()
-		if err != nil {
-			fmt.Fprintf(writer, spec.ReturnFail(spec.ParameterRequestFailed, err.Error()).Print())
-			return
-		}
-		cmds := request.Form["cmd"]
-		if len(cmds) != 1 {
-			fmt.Fprintf(writer, spec.ResponseFailWithFlags(spec.ParameterLess, "cmd").Print())
-			return
-		}
-		ctx := context.WithValue(context.Background(), "mode", "server")
-		response := channel.NewLocalChannel().Run(ctx, path.Join(util.GetProgramPath(), "blade"), cmds[0])
-		log.Debugf(ctx, "Server response: %v", response)
-		fmt.Fprintf(writer, response.Print())
+		fmt.Fprintf(writer, spec.ReturnFail(spec.CommandIllegal, "Server mode is disabled").Print())
 	})
 }
 
