@@ -55,12 +55,7 @@ func CmdInit() *baseCommand {
 	queryCommand.AddCommand(&QueryJvmCommand{})
 	queryCommand.AddCommand(&QueryK8sCommand{})
 
-	// add server command
-	serverCommand := &ServerCommand{}
-	baseCmd.AddCommand(serverCommand)
-	serverCommand.AddCommand(&StartServerCommand{})
-	serverCommand.AddCommand(&StopServerCommand{})
-	serverCommand.AddCommand(&StatusServerCommand{})
+	// UPDATE 2023-12-30 Disable server command mode.
 
 	// add check command
 	checkCommand := &CheckCommand{}
