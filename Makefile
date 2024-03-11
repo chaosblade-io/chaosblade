@@ -85,6 +85,8 @@ ifeq ($(GOOS), linux)
 	GO_FLAGS=-ldflags="-linkmode external -extldflags -static $(GO_X_FLAGS) -s -w"
 endif
 
+CC:=/usr/local/musl/bin/musl-gcc
+
 help:
 	@echo ''
 	@echo 'You can compile each project of ChaosBlade on Mac or Linux platform,'
@@ -126,7 +128,7 @@ cli: ## Build blade cli
 	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
 
 nsexec: ## Build nsexecgo
-	/usr/local/musl/bin/musl-gcc -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
+	$(CC) -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
 
 os: ## Build basic resource experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
