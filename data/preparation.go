@@ -20,9 +20,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strings"
 	"time"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 )
 
 type PreparationRecord struct {
@@ -91,7 +92,7 @@ const preparationTableDDL = `CREATE TABLE IF NOT EXISTS preparation (
 
 var preIndexDDL = []string{
 	`CREATE INDEX pre_uid_uidx ON preparation (uid)`,
-	`CREATE INDEX pre_status_idx ON preparation (uid)`,
+	`CREATE INDEX pre_status_idx ON preparation (status)`,
 	`CREATE INDEX pre_type_process_idx ON preparation (program_type, process)`,
 }
 
