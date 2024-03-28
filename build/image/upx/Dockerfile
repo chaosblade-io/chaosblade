@@ -1,4 +1,4 @@
-FROM alpine:3.8 as builder
+FROM alpine:3.19 as builder
 LABEL maintainer="tiny-x"
 
 # install upx
