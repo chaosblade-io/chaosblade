@@ -201,7 +201,7 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 				time.Sleep(time.Millisecond * 100)
 				log.Debugf(ctx, "result: %v", response.Result)
 				if response.Result == nil {
-					errMsg := fmt.Sprintf("chaos_os process not found, please check chaosblade log")
+					errMsg := "chaos_os process not found, please check chaosblade log"
 					checkError(GetDS().UpdateExperimentModelByUid(model.Uid, Error, errMsg))
 					response.Err = errMsg
 				} else {

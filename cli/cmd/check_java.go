@@ -143,7 +143,7 @@ func (djc *CheckJavaCommand) checkJdk() error {
 	}
 	javaResult := response.Result.(string)
 
-	jdkVersion, err := djc.getJdkVersionFromJavaVer(string(javaResult))
+	jdkVersion, err := djc.getJdkVersionFromJavaVer(javaResult)
 	if err != nil {
 		return errors.New(fmt.Sprintf("check java jdk version failed! err: %s", err.Error()))
 	}
@@ -229,8 +229,9 @@ func (djc *CheckJavaCommand) getJdkVersionFromJdkHome() (string, error) {
 }
 
 // get jdk version from `java version` eg: java version "1.8.0_261"
-//										   Java(TM) SE Runtime Environment (build 1.8.0_261-b12)
-//										   Java HotSpot(TM) 64-Bit Server VM (build 25.261-b12, mixed mode)
+//
+//	Java(TM) SE Runtime Environment (build 1.8.0_261-b12)
+//	Java HotSpot(TM) 64-Bit Server VM (build 25.261-b12, mixed mode)
 func (djc *CheckJavaCommand) getJdkVersionFromJavaVer(jdkVer string) (string, error) {
 	// 1. check `java version`
 	if jdkVer == "" {

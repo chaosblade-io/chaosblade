@@ -69,7 +69,7 @@ func (sc *StatusCommand) Init() {
 
 }
 func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error {
-	var uid = ""
+	var uid string
 	if len(args) > 0 {
 		uid = args[0]
 	} else {

@@ -48,7 +48,7 @@ func (ssc *StopServerCommand) run(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, startServerKey, err)
 	}
-	if pids == nil || len(pids) == 0 {
+	if len(pids) == 0 {
 		log.Infof(context.Background(), "the blade server process not found, so return success for stop operation")
 		//log.Info("the blade server process not found, so return success for stop operation")
 		cmd.Println(spec.ReturnSuccess("success").Print())
