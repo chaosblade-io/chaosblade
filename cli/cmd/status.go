@@ -23,7 +23,7 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 const (
@@ -107,7 +107,7 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 	}
 	response := spec.ReturnSuccess(result)
 
-	if terminal.IsTerminal(int(os.Stdout.Fd())) {
+	if term.IsTerminal(int(os.Stdout.Fd())) {
 		bytes, err := json.MarshalIndent(response, "", "\t")
 		if err != nil {
 			return response

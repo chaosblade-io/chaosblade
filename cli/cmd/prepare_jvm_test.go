@@ -26,7 +26,7 @@ import (
 func TestPrepareJvmCommand_Run(t *testing.T) {
 	jvmCommand := &PrepareJvmCommand{}
 	jvmCommand.Init()
-	jvmCommand.command.SetOutput(&bytes.Buffer{})
+	jvmCommand.command.SetOut(&bytes.Buffer{})
 	jvmCommand.command.RunE = func(cmd *cobra.Command, args []string) error {
 		return nil
 	}
