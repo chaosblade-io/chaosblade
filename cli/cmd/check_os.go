@@ -266,14 +266,10 @@ func (doc *CheckOsCommand) buildBladeCmd(programs []string, flags []spec.ExpFlag
 
 // merge matchers and flags
 func (doc *CheckOsCommand) mergeMatchesAndFlags(matches, flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
-
 	mergeResult := make([]spec.ExpFlagSpec, 0)
-	for _, flag := range flags {
-		mergeResult = append(mergeResult, flag)
-	}
-	for _, matcher := range matches {
-		mergeResult = append(mergeResult, matcher)
-	}
+	mergeResult = append(mergeResult, flags...)
+	mergeResult = append(mergeResult, matches...)
+
 	return mergeResult
 }
 
