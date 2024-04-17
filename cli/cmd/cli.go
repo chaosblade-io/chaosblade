@@ -27,7 +27,7 @@ type Cli struct {
 	rootCmd *cobra.Command
 }
 
-//NewCli returns the cli instance used to register and execute command
+// NewCli returns the cli instance used to register and execute command
 func NewCli() *Cli {
 	cli := &Cli{
 		rootCmd: &cobra.Command{
@@ -36,7 +36,7 @@ func NewCli() *Cli {
 			Long:  "An easy to use and powerful chaos engineering experiment toolkit",
 		},
 	}
-	cli.rootCmd.SetOutput(os.Stdout)
+	cli.rootCmd.SetOut(os.Stdout)
 	cli.setFlags()
 	return cli
 }
@@ -48,7 +48,7 @@ func (cli *Cli) setFlags() {
 	//flags.StringVarP(&util.LogLevel, "log-level", "l", "info", "level of logging wanted. 1=DEBUG, 0=INFO, -1=WARN, A higher verbosity level means a log message is less important.")
 }
 
-//Run command
+// Run command
 func (cli *Cli) Run() error {
 	return cli.rootCmd.Execute()
 }
