@@ -143,7 +143,7 @@ func (djc *CheckJavaCommand) checkJdk() error {
 	}
 	javaResult := response.Result.(string)
 
-	jdkVersion, err := djc.getJdkVersionFromJavaVer(string(javaResult))
+	jdkVersion, err := djc.getJdkVersionFromJavaVer(javaResult)
 	if err != nil {
 		return fmt.Errorf("check java jdk version failed! err: %s", err.Error())
 	}
