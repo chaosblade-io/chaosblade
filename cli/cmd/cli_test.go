@@ -23,7 +23,7 @@ import (
 
 func TestCli_Run(t *testing.T) {
 	cli := NewCli()
-	cli.rootCmd.SetOutput(&bytes.Buffer{})
+	cli.rootCmd.SetOut(&bytes.Buffer{})
 
 	err := cli.Run()
 	if err != nil {

@@ -37,7 +37,7 @@ func TestQueryDiskCommand_queryDiskInfo(t *testing.T) {
 
 func testQueryDiskUnknownArg(t *testing.T, command *cobra.Command, qdc *QueryDiskCommand) {
 	buffer := &bytes.Buffer{}
-	command.SetOutput(buffer)
+	command.SetOut(buffer)
 
 	arg := "unknown"
 	expectedErr := fmt.Errorf("the %s argument not found", arg)
@@ -50,7 +50,7 @@ func testQueryDiskUnknownArg(t *testing.T, command *cobra.Command, qdc *QueryDis
 
 func testQueryDiskDevice(t *testing.T, command *cobra.Command, qdc *QueryDiskCommand) {
 	buffer := &bytes.Buffer{}
-	command.SetOutput(buffer)
+	command.SetOut(buffer)
 
 	arg := "mount-point"
 	err := qdc.queryDiskInfo(command, arg)

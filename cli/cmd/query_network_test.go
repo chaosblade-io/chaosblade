@@ -37,7 +37,7 @@ func TestQueryNetworkCommand_queryNetworkInfo(t *testing.T) {
 
 func testQueryNetworkUnknownArg(t *testing.T, command *cobra.Command, qnc *QueryNetworkCommand) {
 	buffer := &bytes.Buffer{}
-	command.SetOutput(buffer)
+	command.SetOut(buffer)
 
 	arg := "unknown"
 	expectedErr := fmt.Errorf("the %s argument not found", arg)
@@ -50,7 +50,7 @@ func testQueryNetworkUnknownArg(t *testing.T, command *cobra.Command, qnc *Query
 
 func testQueryNetworkInterface(t *testing.T, command *cobra.Command, qnc *QueryNetworkCommand) {
 	buffer := &bytes.Buffer{}
-	command.SetOutput(buffer)
+	command.SetOut(buffer)
 
 	arg := "interface"
 	err := qnc.queryNetworkInfo(command, arg)
