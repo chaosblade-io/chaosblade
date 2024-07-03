@@ -279,7 +279,7 @@ build_linux_with_arg:
 		-w /go/src/github.com/chaosblade-io/chaosblade \
 		-v ~/.m2/repository:/root/.m2/repository \
         -v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
-		ghcr.io/chaosblade-io/chaosblade-build-musl:latest build_with $$ARGS
+		chaosbladeio/chaosblade-build-musl:latest build_with $$ARGS
 
 ## Select scenario build linux arm version by docker image
 build_linux_arm_with_arg:

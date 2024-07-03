@@ -20,10 +20,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -378,15 +379,15 @@ func Prepare(ctx context.Context, processName, processId, javaHome string) (resp
 			return spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err), port
 		}
 	}
-	var username string
+	var username, userid string
 	port = record.Port
-	response, username = Attach(ctx, port, javaHome, processId)
-	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
+	response, username, userid = Attach(ctx, port, javaHome, processId)
+	if !response.Success && (username != "" || userid != "") && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err = CheckPortFromSandboxToken(ctx, username)
 		if err == nil {
 			log.Infof(ctx, "use %s port to retry", port)
-			response, username = Attach(ctx, port, "", processId)
+			response, username, userid = Attach(ctx, port, "", processId)
 			if response.Success {
 				// update port
 				err := db.UpdatePreparationPortByUid(record.Uid, port)
