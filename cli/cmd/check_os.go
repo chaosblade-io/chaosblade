@@ -186,7 +186,7 @@ func (doc *CheckOsCommand) execOperatorCmd(checkExecCmd *CheckExecCmd) {
 
 		if len(cmdArr) != 2 {
 			fmt.Printf("[failed] %s, failed! error: yaml faile is wrong \n", execResult.cmd)
-			execResult.info = fmt.Sprintf("yaml faile is wrong")
+			execResult.info = "yaml faile is wrong"
 			execResult.result = "failed"
 			continue
 		}
@@ -266,14 +266,10 @@ func (doc *CheckOsCommand) buildBladeCmd(programs []string, flags []spec.ExpFlag
 
 // merge matchers and flags
 func (doc *CheckOsCommand) mergeMatchesAndFlags(matches, flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
-
 	mergeResult := make([]spec.ExpFlagSpec, 0)
-	for _, flag := range flags {
-		mergeResult = append(mergeResult, flag)
-	}
-	for _, matcher := range matches {
-		mergeResult = append(mergeResult, matcher)
-	}
+	mergeResult = append(mergeResult, flags...)
+	mergeResult = append(mergeResult, matches...)
+
 	return mergeResult
 }
 
@@ -365,7 +361,7 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 				if !ok || value == "" {
 					response.Code = spec.ParameterLess.Code
 					response.Success = false
-					response.Err = fmt.Sprintf("[failed] check failed! err: less required parameter!")
+					response.Err = "[failed] check failed! err: less required parameter!"
 					cmd.Println(response.Print())
 					return nil
 				}

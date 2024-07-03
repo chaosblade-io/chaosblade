@@ -19,16 +19,16 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"path"
+
 	"github.com/chaosblade-io/chaosblade-exec-cri/exec"
 	"github.com/chaosblade-io/chaosblade-operator/exec/model"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
-	"github.com/chaosblade-io/chaosblade/exec/middleware"
 	"github.com/chaosblade-io/chaosblade/exec/cloud"
-	"path"
+	"github.com/chaosblade-io/chaosblade/exec/middleware"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	specutil "github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -137,7 +137,7 @@ func (ec *baseExpCommandService) registerSubCommands() {
 
 // registerOsExpCommands
 func (ec *baseExpCommandService) registerOsExpCommands() []*modelCommand {
-	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-os-spec-%s.yaml", version.Ver))
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-os-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, os.NewExecutor())
 	if err != nil {
 		return nil
@@ -151,10 +151,9 @@ func (ec *baseExpCommandService) registerOsExpCommands() []*modelCommand {
 	return osCommands
 }
 
-
 // registerMiddlewareExpCommands
 func (ec *baseExpCommandService) registerMiddlewareExpCommands() []*modelCommand {
-	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-middleware-spec-%s.yaml", version.Ver))
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-middleware-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, middleware.NewExecutor())
 	if err != nil {
 		return nil
@@ -167,9 +166,10 @@ func (ec *baseExpCommandService) registerMiddlewareExpCommands() []*modelCommand
 	}
 	return middlewareCommands
 }
+
 // registerCloudExpCommands
 func (ec *baseExpCommandService) registerCloudExpCommands() []*modelCommand {
-	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-cloud-spec-%s.yaml", version.Ver))
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-cloud-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, cloud.NewExecutor())
 	if err != nil {
 		return nil
@@ -186,8 +186,8 @@ func (ec *baseExpCommandService) registerCloudExpCommands() []*modelCommand {
 
 // registerJvmExpCommands
 func (ec *baseExpCommandService) registerJvmExpCommands() []*modelCommand {
-	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
-	models, err := util.ParseSpecsToModel(file, jvm.NewExecutor())
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
+	models, err := specutil.ParseSpecsToModel(file, jvm.NewExecutor())
 	if err != nil {
 		return nil
 	}
@@ -202,8 +202,8 @@ func (ec *baseExpCommandService) registerJvmExpCommands() []*modelCommand {
 
 // registerCplusExpCommands
 func (ec *baseExpCommandService) registerCplusExpCommands() []*modelCommand {
-	file := path.Join(util.GetYamlHome(), "chaosblade-cplus-spec.yaml")
-	models, err := util.ParseSpecsToModel(file, cplus.NewExecutor())
+	file := path.Join(specutil.GetYamlHome(), "chaosblade-cplus-spec.yaml")
+	models, err := specutil.ParseSpecsToModel(file, cplus.NewExecutor())
 	if err != nil {
 		return nil
 	}
@@ -218,7 +218,7 @@ func (ec *baseExpCommandService) registerCplusExpCommands() []*modelCommand {
 
 // registerDockerExpCommands
 func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
-	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-docker-spec-%s.yaml", version.Ver))
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-docker-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, docker.NewExecutor())
 	if err != nil {
 		return nil
@@ -231,8 +231,8 @@ func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
 		modelCommands = append(modelCommands, command)
 	}
 
-	file = path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
-	models, err = util.ParseSpecsToModel(file, docker.NewExecutor())
+	file = path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
+	models, err = specutil.ParseSpecsToModel(file, docker.NewExecutor())
 	if err != nil {
 		return nil
 	}
@@ -262,7 +262,7 @@ func GetResourceFlags() []spec.ExpFlagSpec {
 
 func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 	// 读取 k8s 下的场景并注册
-	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version.Ver))
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, kubernetes.NewComposeExecutor())
 	if err != nil {
 		return nil
@@ -275,8 +275,8 @@ func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 		modelCommands = append(modelCommands, command)
 	}
 
-	file = path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
-	models, err = util.ParseSpecsToModel(file, kubernetes.NewExecutor())
+	file = path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
+	models, err = specutil.ParseSpecsToModel(file, kubernetes.NewExecutor())
 	if err != nil {
 		return nil
 	}
@@ -299,7 +299,7 @@ func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 
 // registerCriExpCommands
 func (ec *baseExpCommandService) registerCriExpCommands() []*modelCommand {
-	file := path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version.Ver))
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, cri.NewExecutor())
 	if err != nil {
 		return nil
@@ -312,8 +312,8 @@ func (ec *baseExpCommandService) registerCriExpCommands() []*modelCommand {
 		modelCommands = append(modelCommands, command)
 	}
 
-	file = path.Join(util.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
-	models, err = util.ParseSpecsToModel(file, cri.NewExecutor())
+	file = path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
+	models, err = specutil.ParseSpecsToModel(file, cri.NewExecutor())
 	if err != nil {
 		return nil
 	}
