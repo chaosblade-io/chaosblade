@@ -5,7 +5,7 @@ ARG BLADE_VERSION=0.0.1
 ARG MUSL_VERSION=1.2.0
 
 # Using 163 mirror for Debian Strech
-RUN sed -i 's/deb.debian.org/mirrors.163.com/g' /etc/apt/sources.list
+RUN sed -i 's/deb.debian.org/mirrors.163.com/g' /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && apt-get install unzip
 
 # # The image is used to build chaosblade for musl
