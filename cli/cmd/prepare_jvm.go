@@ -20,11 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"path"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -145,13 +146,13 @@ func (pc *PrepareJvmCommand) reportAttachedResult(ctx context.Context, response 
 
 // attachAgent
 func (pc *PrepareJvmCommand) attachAgent(ctx context.Context) *spec.Response {
-	response, username := jvm.Attach(ctx, strconv.Itoa(pc.port), pc.javaHome, pc.processId)
-	if !response.Success && username != "" && strings.Contains(response.Err, "connection refused") {
+	response, username, userid := jvm.Attach(ctx, strconv.Itoa(pc.port), pc.javaHome, pc.processId)
+	if !response.Success && (username != "" || userid != "") && strings.Contains(response.Err, "connection refused") {
 		// if attach failed, search port from ~/.sandbox.token
 		port, err := jvm.CheckPortFromSandboxToken(ctx, username)
 		if err == nil {
 			log.Infof(ctx, "use %s port to retry", port)
-			response, username = jvm.Attach(ctx, port, pc.javaHome, pc.processId)
+			response, username, userid = jvm.Attach(ctx, port, pc.javaHome, pc.processId)
 			if response.Success {
 				// update port
 				err := updatePreparationPort(pc.uid, port)
@@ -228,21 +229,21 @@ func (pc *PrepareJvmCommand) invokeAttaching(ctx context.Context, port string, u
 }
 
 /*
-{
-  "data":{   #PreparestatusBean
-    "createTime":"",
-    "error":"",
-    "pid":"",
-    "port":"",
-    "process":"sss",
-    "running":false,
-    "status":"",
-    "type":"",
-    "uid":"",
-    "updateTime":""
-  },
-  "type":"JAVA_AGENT_PREPARE"
-}
+	{
+	  "data":{   #PreparestatusBean
+	    "createTime":"",
+	    "error":"",
+	    "pid":"",
+	    "port":"",
+	    "process":"sss",
+	    "running":false,
+	    "status":"",
+	    "type":"",
+	    "uid":"",
+	    "updateTime":""
+	  },
+	  "type":"JAVA_AGENT_PREPARE"
+	}
 */
 func createPostBody(ctx context.Context) ([]byte, error) {
 	preparationRecord, err := GetDS().QueryPreparationByUid(uid)

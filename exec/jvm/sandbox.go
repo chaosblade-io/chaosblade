@@ -22,6 +22,7 @@ import (
 	"os"
 	osuser "os/user"
 	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -38,20 +39,20 @@ var cl = channel.NewLocalChannel()
 
 const DefaultNamespace = "chaosblade"
 
-func Attach(ctx context.Context, port, javaHome, pid string) (*spec.Response, string) {
+func Attach(ctx context.Context, port, javaHome, pid string) (*spec.Response, string, string) {
 	// refresh
-	response, username := attach(ctx, pid, port, javaHome)
+	response, username, userid := attach(ctx, pid, port, javaHome)
 	if !response.Success {
-		return response, username
+		return response, username, userid
 	}
 	time.Sleep(5 * time.Second)
 	// active
 	response = active(ctx, port)
 	if !response.Success {
-		return response, username
+		return response, username, userid
 	}
 	// check
-	return check(ctx, port), username
+	return check(ctx, port), username, userid
 }
 
 // curl -s http://localhost:$2/sandbox/default/module/http/chaosblade/status 2>&1
@@ -85,34 +86,54 @@ func active(ctx context.Context, port string) *spec.Response {
 }
 
 // attach java agent to application process
-func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Response, string) {
+func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Response, string, string) {
 	username, err := getUsername(pid)
+	userid := ""
 	if err != nil {
-		log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(pid, err))
-		return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, pid, err), ""
+		userid, err = getUserid(ctx, pid)
+		if err != nil {
+			log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(pid, err))
+			return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, pid, err), "", ""
+		}
 	}
 	javaBin, javaHome := getJavaBinAndJavaHome(ctx, javaHome, pid, getJavaCommandLine)
 	toolsJar := getToolJar(ctx, javaHome)
-	log.Infof(ctx, "javaBin: %s, javaHome: %s, toolsJar: %s", javaBin, javaHome, toolsJar)
+	log.Infof(ctx, "javaBin: %s, javaHome: %s, toolsJar: %s, username: %s, userid: %s", javaBin, javaHome, toolsJar, username, userid)
 	token, err := getSandboxToken(ctx)
 	if err != nil {
 		log.Errorf(ctx, spec.SandboxCreateTokenFailed.Sprintf(err))
-		return spec.ResponseFailWithFlags(spec.SandboxCreateTokenFailed, err), username
+		return spec.ResponseFailWithFlags(spec.SandboxCreateTokenFailed, err), username, userid
 	}
 	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid)
 	currUser, err := osuser.Current()
 	if err != nil {
-		log.Warnf(ctx, "get current user info failed, %v", err)
+		log.Warnf(ctx, "get current user info failed, curr user: %v, %v", currUser, err)
+		if strings.Contains(err.Error(), "unknown userid") {
+			reg, e := regexp.Compile(`\d+`)
+			if e == nil {
+				uid := reg.FindString(err.Error())
+				currUser = &osuser.User{
+					Uid: uid,
+				}
+			}
+		}
+
 	}
+
 	var command string
-	if currUser != nil && (currUser.Username == username) {
+	if currUser != nil && (currUser.Username == username || currUser.Uid == userid) {
 		command = fmt.Sprintf("%s %s", javaBin, javaArgs)
 	} else {
 		if currUser != nil {
-			log.Infof(ctx, "current user name is %s, not equal %s, so use sudo command to execute",
-				currUser.Username, username)
+			log.Infof(ctx, "current user name is %s, not equal %s|%s, so use sudo command to execute",
+				currUser.Username, username, userid)
 		}
-		command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
+		if username != "" {
+			command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
+		} else if userid != "" {
+			command = fmt.Sprintf("su - #%s -c '%s %s'", userid, javaBin, javaArgs)
+		}
+
 	}
 	javaToolOptions := os.Getenv("JAVA_TOOL_OPTIONS")
 	if javaToolOptions != "" {
@@ -120,7 +141,7 @@ func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Respo
 	}
 	response := cl.Run(ctx, "", command)
 	if !response.Success {
-		return response, username
+		return response, username, userid
 	}
 	osCmd := fmt.Sprintf("grep %s", fmt.Sprintf(`%s %s | grep %s | tail -1 | awk -F ";" '{print $3";"$4}'`,
 		token, getSandboxTokenFile(username), DefaultNamespace))
@@ -128,9 +149,9 @@ func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Respo
 	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
 		log.Errorf(ctx, spec.OsCmdExecFailed.Sprintf(osCmd, response.Err))
-		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, osCmd, response.Err), username
+		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, osCmd, response.Err), username, userid
 	}
-	return response, username
+	return response, username, userid
 }
 
 func getAttachJvmOpts(toolsJar string, token string, port string, pid string) string {
@@ -175,6 +196,24 @@ func getUsername(pid string) (string, error) {
 		return "", err
 	}
 	return javaProcess.Username()
+}
+
+func getUserid(ctx context.Context, pid string) (string, error) {
+	p, err := strconv.Atoi(pid)
+	if err != nil {
+		return "", err
+	}
+	javaProcess, err := process.NewProcess(int32(p))
+	if err != nil {
+		return "", err
+	}
+
+	userIds, err := javaProcess.Uids()
+	if err == nil && cap(userIds) > 0 {
+		userid := strconv.Itoa(int(userIds[0]))
+		return userid, err
+	}
+	return "", err
 }
 
 func getJavaBinAndJavaHome(ctx context.Context, javaHome string, pid string,
