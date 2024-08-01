@@ -64,6 +64,24 @@ Decision making process should be transparent to adhere to the principles of Cha
 
 The ChaosBlade [Code of Conduct](CODE_OF_CONDUCT.md) is aligned with the CNCF Code of Conduct.
 
+## Release process
+Eligibility to be a release manager:
+
+- MUST be an active Maintainer
+- MUST have the GPG fingerprint listed in the maintainer list
+Release steps:
+
+- Open an issue to propose making a new release. The proposal should be public, with an exception for vulnerability fixes. If this is the first time for you to take a role of release management, you SHOULD make a beta (or alpha, RC) release as an exercise before releasing GA.
+- Make sure that all the merged PRs are associated with the correct Milestone.
+- Run git tag --sign vX.Y.Z-beta.W .
+- Run git push UPSTREAM vX.Y.Z-beta.W .
+- Wait for the Release action on GitHub Actions to complete. A draft release will appear in https://github.com/chaosblade-io/chaosblade/releases .
+- Add release notes in the draft release, to explain the changes and show appreciation to the contributors. Make sure to fulfill the Release manager: [ADD YOUR NAME HERE] (@[ADD YOUR GITHUB ID HERE]) line with your name. e.g., Release manager: MandssS (@MandssS) .
+- Click the Set as a pre-release checkbox if this release is a beta (or alpha, RC).
+- Click the Publish release button.
+- Close the Milestone.
+
+
 ## Credits
 
 Some contents in this documents have been borrowed from [BFE](https://github.com/bfenetworks/bfe/blob/develop/GOVERNANCE.md) and [CoreDNS](https://github.com/coredns/coredns/blob/master/GOVERNANCE.md) projects.
