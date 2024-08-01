@@ -69,6 +69,7 @@ Eligibility to be a release manager:
 
 - MUST be an active Maintainer
 - MUST have the GPG fingerprint listed in the maintainer list
+
 Release steps:
 
 - Open an issue to propose making a new release. The proposal should be public, with an exception for vulnerability fixes. If this is the first time for you to take a role of release management, you SHOULD make a beta (or alpha, RC) release as an exercise before releasing GA.
