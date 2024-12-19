@@ -92,7 +92,7 @@ func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error 
 		}
 	default:
 		if uid == "" {
-			return spec.ResponseFailWithFlags(spec.ParameterLess, "type|uid", "must specify the right type or uid")
+			return spec.ResponseFailWithFlags(spec.ParameterLess, "type|uid, must specify the right type or uid")
 		}
 		result, err = GetDS().QueryExperimentModelByUid(uid)
 		if util.IsNil(result) || err != nil {

@@ -105,8 +105,8 @@ github.com/cespare/xxhash/v2 v2.1.2 h1:YRXhKfTDauu4ajMg1TPgFO5jnlC2HCbmLXMcTG5cb
 github.com/cespare/xxhash/v2 v2.1.2/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XLFGgcrjCOs=
 github.com/chaosblade-io/chaosblade-exec-cloud v1.7.4 h1:TTB7XfXK4XWpBYm8hembkVpF/pGNeUnN1Q7e59q6WRM=
 github.com/chaosblade-io/chaosblade-exec-cloud v1.7.4/go.mod h1:XjnydGKczljWwvUZqSZk78gzQBvScOi86MXWWIG4EqU=
-github.com/chaosblade-io/chaosblade-exec-cri v1.7.4 h1:PauMhZn5gTs6tdoy0jLKPE4v/k0mqHvHNEgVLLAWaUo=
-github.com/chaosblade-io/chaosblade-exec-cri v1.7.4/go.mod h1:C7PIJL56BytrugMlr3Oz0WPMV1XsADhs+WPUntPLbtg=
+github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20241218081809-c09b5ea1461a h1:vg8O/cTK0Vkms3J8Yn9CEnIjbcZgwOrPNTl0FxSYOiU=
+github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20241218081809-c09b5ea1461a/go.mod h1:3D+OvTREOSNTNx+FvSADvW7eQ2kSlyewnRI4UUempTg=
 github.com/chaosblade-io/chaosblade-exec-middleware v1.7.4 h1:JLTqvWoNJpRFWG/G5HJL7sH1F6eM5sTBq9CqiYyGVes=
 github.com/chaosblade-io/chaosblade-exec-middleware v1.7.4/go.mod h1:F/L+nb5qaNWvUodyg5aMetIoSQXunO9z0/8nT+VIT48=
 github.com/chaosblade-io/chaosblade-exec-os v1.7.4 h1:31oPl7sAxUVyZ50bKYMiC9aSLeeSB1p6Qr2m8Qhu7U4=
@@ -124,6 +124,7 @@ github.com/cilium/ebpf v0.0.0-20200110133405-4032b1d8aae3/go.mod h1:MA5e5Lr8slmE
 github.com/cilium/ebpf v0.0.0-20200702112145-1c8d4c9ef775/go.mod h1:7cR51M8ViRLIdUjrmSXlK9pkrsDlLHbO8jiB8X8JnOc=
 github.com/cilium/ebpf v0.2.0/go.mod h1:To2CFviqOWL/M0gIMsvSMlqe7em/l1ALkX1PyjrX2Qs=
 github.com/cilium/ebpf v0.4.0/go.mod h1:4tRaxcgiL706VnOzHOdBlY8IEAIdxINsQBcU4xJJXRs=
+github.com/cilium/ebpf v0.6.2 h1:iHsfF/t4aW4heW2YKfeHrVPGdtYTL4C4KocpM8KTSnI=
 github.com/cilium/ebpf v0.6.2/go.mod h1:4tRaxcgiL706VnOzHOdBlY8IEAIdxINsQBcU4xJJXRs=
 github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
 github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGXZJjfX53e64911xZQV5JYwmTeXPW+k8Sc=
@@ -294,6 +295,7 @@ github.com/evanphx/json-patch v4.9.0+incompatible h1:kLcOMZeuLAJvL2BPWLMIj5oaZQo
 github.com/evanphx/json-patch v4.9.0+incompatible/go.mod h1:50XU6AFN0ol/bzJsmQLiYLvXMP4fmwYFNcr97nuDLSk=
 github.com/fatih/color v1.7.0/go.mod h1:Zm6kSWBoL9eyXnKyktHP6abPY2pDugNf5KwzbycvMj4=
 github.com/form3tech-oss/jwt-go v3.2.2+incompatible/go.mod h1:pbq4aXjuKjdthFRnoDwaVPLA+WlJuPGy+QneDUgJi2k=
+github.com/frankban/quicktest v1.11.3 h1:8sXhOn0uLys67V8EsXLc6eszDs8VXWxL3iRvebPhedY=
 github.com/frankban/quicktest v1.11.3/go.mod h1:wRf/ReqHper53s+kmmSZizM8NamnL3IM0I9ntUbOk+k=
 github.com/fsnotify/fsnotify v1.4.7/go.mod h1:jwhsz4b93w/PPRr/qN1Yymfu8t87LnFCMoQvtojpjFo=
 github.com/fsnotify/fsnotify v1.4.9 h1:hsms1Qyu0jgnwNXIxa+/V/PDsU6CfLf6CNO8H7IWoS4=
