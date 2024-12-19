@@ -18,8 +18,10 @@ package kubernetes
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"k8s.io/klog/v2"
 	"strings"
 	"time"
 
@@ -43,6 +45,13 @@ const (
 	DefaultWaitingTime = "20s"
 )
 
+func init() {
+	// disable printing of client-go logs
+	klog.InitFlags(nil)
+	flag.Set("v", "0")
+	flag.Parse()
+}
+
 type Executor struct {
 }
 
@@ -64,7 +73,7 @@ func QueryStatus(ctx context.Context, operation, kubeconfig string) (*spec.Respo
 	client, err := getClient(kubeconfig)
 	if err != nil {
 		log.Errorf(ctx, spec.K8sExecFailed.Sprintf("getClient", err))
-		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, spec.K8sExecFailed.Sprintf("getClient", err)),
+		return spec.ResponseFailWithResult(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, spec.K8sExecFailed.Sprintf("getClient", err)),
 			"getClient", err), true
 	}
 	chaosblade, err := get(client, uid)
@@ -74,13 +83,13 @@ func QueryStatus(ctx context.Context, operation, kubeconfig string) (*spec.Respo
 		}
 		errMsg := spec.K8sExecFailed.Sprintf("getClient", err)
 		log.Errorf(ctx, errMsg)
-		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "getClient", err), true
+		return spec.ResponseFailWithResult(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "getClient", err), true
 	}
 
 	if chaosblade == nil && operation != QueryDestroy {
 		errMsg := "the experiment not found"
 		log.Errorf(ctx, errMsg)
-		return spec.ResponseFailWithFlags(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "get", errMsg), true
+		return spec.ResponseFailWithResult(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "get", errMsg), true
 	}
 
 	if chaosblade.Status.Phase == v1alpha1.ClusterPhaseRunning {
