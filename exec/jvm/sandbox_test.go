@@ -66,7 +66,9 @@ func Test_getJavaBinAndJavaHome(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			javaBin, javaHome := getJavaBinAndJavaHome(tt.args.javaHome, "", tt.args.getJavaCmdLine)
+			javaBin, javaHome := getJavaBinAndJavaHome(tt.args.ctx, tt.args.javaHome, "", func(ctx context.Context, pid string) ([]string, error) {
+				return tt.args.getJavaCmdLine(pid)
+			})
 			if javaBin != tt.expectedJavaBin {
 				t.Errorf("getJavaBinAndJavaHome() javaBin = %v, expectedJavaBin %v", javaBin, tt.expectedJavaBin)
 			}
@@ -106,7 +108,9 @@ func Test_getJavaBinAndJavaHome(t *testing.T) {
 	}
 	for _, tt := range testsWithJavaHome {
 		t.Run(tt.name, func(t *testing.T) {
-			javaBin, javaHome := getJavaBinAndJavaHome(tt.args.javaHome, "", tt.args.getJavaCmdLine)
+			javaBin, javaHome := getJavaBinAndJavaHome(tt.args.ctx, tt.args.javaHome, "", func(ctx context.Context, pid string) ([]string, error) {
+				return tt.args.getJavaCmdLine(pid)
+			})
 			if javaBin != tt.expectedJavaBin {
 				t.Errorf("getJavaBinAndJavaHome() javaBin = %v, expectedJavaBin %v", javaBin, tt.expectedJavaBin)
 			}
