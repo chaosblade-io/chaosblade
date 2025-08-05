@@ -1,4 +1,4 @@
-.PHONY: build clean
+.PHONY: build build_all
 
 export BLADE_VERSION=1.7.4
 
@@ -13,8 +13,23 @@ BLADE_BIN=blade
 BLADE_EXPORT=chaosblade-$(BLADE_VERSION).tgz
 BLADE_SRC_ROOT=$(shell pwd)
 
+#----------------------------------------------------------------------------------
+# 多平台支持配置
+CURRENT_OS := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+CURRENT_ARCH := $(shell uname -m | sed 's/aarch64/arm64/;s/armv7l/arm/;s/armv6l/arm/;s/x86_64/amd64/')
+
+# Check if current os contains "MINGW" or "MSYS" to determine if it is Windows
+ifeq ($(findstring mingw,$(CURRENT_OS)),mingw)
+   CURRENT_OS := windows
+endif
+
+ifeq ($(findstring msys,$(CURRENT_OS)),msys)
+   CURRENT_OS := windows
+endif
+
 GO_ENV=CGO_ENABLED=1
 GO_MODULE=GO111MODULE=on
+GO=go
 VERSION_PKG=github.com/chaosblade-io/chaosblade/version
 # Specify chaosblade version in docker experiments
 CRI_BLADE_VERSION=github.com/chaosblade-io/chaosblade-exec-cri/version
@@ -24,7 +39,10 @@ K8S_BLADE_VERSION=github.com/chaosblade-io/chaosblade-operator/version
 
 GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${CRI_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${JVM_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${K8S_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
 GO_FLAGS=-ldflags="$(GO_X_FLAGS) -s -w"
-GO=env $(GO_ENV) $(GO_MODULE) go
+
+# 不同平台的构建参数
+BUILD_CMD = env CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) $(GO_MODULE) go build -ldflags="$(GO_X_FLAGS) -s -w" -o $(3) ./cli
+BUILD_CMD_STATIC = env CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) $(GO_MODULE) go build -ldflags="-linkmode external -extldflags -static $(GO_X_FLAGS) -s -w" -o $(3) ./cli
 
 UNAME := $(shell uname)
 
@@ -81,54 +99,170 @@ CHECK_YAML_FILE_NAME=chaosblade-check-spec-$(BLADE_VERSION).yaml
 CHECK_YANL_FILE_OSS=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/chaosblade-check-spec.yaml
 CHECK_YAML_FILE_PATH=$(BUILD_TARGET_YAML)/$(CHECK_YAML_FILE_NAME)
 
-ifeq ($(GOOS), linux)
-	GO_FLAGS=-ldflags="-linkmode external -extldflags -static $(GO_X_FLAGS) -s -w"
-endif
-
 CC:=/usr/local/musl/bin/musl-gcc
 
 help:
 	@echo ''
-	@echo 'You can compile each project of ChaosBlade on Mac or Linux platform,'
-	@echo 'You can use docker to compile cross-platform,compile the package running on Linux platform.'
-	@echo 'For details refer to https://github.com/chaosblade-io/chaosblade/wiki/ChaosBlade-Projects-Compilation'
-	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>...\033[0m\n"} /^[a-zA-Z0-9_-]+:.*?##/ { printf "  \033[36m%-20s\033[0m  %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
+	@echo 'ChaosBlade is a powerful and versatile chaos engineering platform.'
+	@echo 'You can compile each project of ChaosBlade on Mac, Linux or Windows platform.'
+	@echo ''
+	@echo 'Usage:'
+	@echo '  make <target>'
+	@echo ''
+	@echo 'Main targets:'
+	@printf '  \033[36m%-20s\033[0m  %s\n' "build" "Build for current platform (backward compatibility)"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "build_all" "Build for current platform with all dependencies"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "darwin_amd64" "Build for Darwin/macOS AMD64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "darwin_arm64" "Build for Darwin/macOS ARM64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "linux_amd64" "Build for Linux AMD64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "linux_arm64" "Build for Linux ARM64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "windows_amd64" "Build for Windows AMD64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "clean" "Clean build artifacts"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "test" "Run tests"
+	@echo ''
+	@echo 'Examples:'
+	@echo '  make build                                  # Build cli for current platform'
+	@echo '  make linux_amd64 MODULES=cli                # Build cli for linux_amd64'
+	@echo '  make linux_amd64 MODULES=cli,os,java        # Build cli, os, java for linux_amd64'
+	@echo '  make linux_amd64 MODULES=all                # Build all components for linux_amd64'
+	@echo '  make build_all                              # Build all components for current platform'
+	@echo ''
+	@echo 'Component list:'
+	@echo '  cli, os, cloud, middleware, cri, cplus, java, kubernetes, nsexec, check_yaml'
+	@echo '  Use "all" to build all components'
+	@echo ''
+	@echo 'For more details, visit https://github.com/chaosblade-io/chaosblade'
 
 ##@ Build
-build: pre_build cli nsexec os cloud middleware cri cplus java kubernetes package check_yaml  ## Build all scenarios
-#build: pre_build cli nsexec os cloud middleware cri cplus java kubernetes upx package check_yaml  ## Build all scenarios
 
-# for example: make build_with cli
-build_with: pre_build ## Select scenario build, for example `make build_with cli os cloud docker cri kubernetes java cplus`
+# 通用构建目标，支持指定平台和组件
+# 用法示例:
+#   make build                            # 当前平台构建 cli
+#   make darwin_amd64 MODULES=cli         # 构建 darwin_amd64 平台的 cli
+#   make darwin_amd64 MODULES=cli,os,java # 构建 darwin_amd64 平台的 cli, os, java
+#   make build_all                        # 构建当前平台的所有组件
+build: pre_build cli
 
-# for example: make build_with_linux cli os
-build_with_linux: pre_build build_linux_with_arg ## Select scenario build linux version by docker cri image, for example `make build_with_linux ARGS="cli os"`
+build_all: pre_build cli nsexec os cloud middleware cri cplus java kubernetes package check_yaml  ## Build all components for current platform
+	@echo "Build all components for current platform completed"
 
-build_with_linux_arm: pre_build build_linux_arm_with_arg ## Select scenario build linux version by docker cri image, for example `make build_with_linux_arm ARGS="cli os"`
-
-# build chaosblade linux version by docker image
-build_linux:  ## Build linux version of all scenarios by docker image
-	make build_with_linux ARGS="cli os cloud middleware cri nsexec kubernetes java cplus check_yaml" upx package
-
-build_linux_arm:  ## Build linux arm version of all scenarios by docker image
-	make build_with_linux_arm ARGS="cli os cloud middleware cri nsexec kubernetes java cplus check_yaml" upx package
-
-build_darwin: pre_build cli os cloud middleware cri cplus java kubernetes upx package check_yaml ## Build all scenarios darwin version
-
-##@ Build sub
-
-# create dir or download necessary file
-pre_build: mkdir_build_target ## Mkdir build target
+pre_build: ## Prepare build environment
 	rm -rf $(BUILD_TARGET_PKG_DIR) $(BUILD_TARGET_PKG_FILE_PATH)
 	mkdir -p $(BUILD_TARGET_BIN) $(BUILD_TARGET_LIB) $(BUILD_TARGET_YAML)
+
+#----------------------------------------------------------------------------------
+# 多平台构建目标
+.PHONY: darwin_amd64 linux_amd64 windows_amd64 darwin_arm64 linux_arm64
+
+# 默认平台变量
+GOOS ?= $(CURRENT_OS)
+GOARCH ?= $(CURRENT_ARCH)
+
+# 通用构建目标，支持指定平台和组件
+# 用法: make [platform] MODULES=[components]
+# 示例: make linux_amd64 MODULES=cli,os,java
+darwin_amd64 linux_amd64 windows_amd64 darwin_arm64 linux_arm64:
+	@$(MAKE) pre_build
+	@MODULES_VAL="$(MODULES)"; \
+	if [ -n "$$MODULES_VAL" ]; then \
+		$(MAKE) _build_platform GOOS=$(word 1,$(subst _, ,$@)) GOARCH=$(word 2,$(subst _, ,$@)) COMPONENTS="$$MODULES_VAL"; \
+	else \
+		$(MAKE) _build_platform GOOS=$(word 1,$(subst _, ,$@)) GOARCH=$(word 2,$(subst _, ,$@)) COMPONENTS=""; \
+	fi
+
+# 防止 make 将逗号分隔的组件当作单独的目标
+%:
+	@:
+
+# 通用平台构建函数
+.PHONY: _build_platform
+_build_platform:
+	@echo "Building for $(GOOS)/$(GOARCH)"
+	@mkdir -p $(BUILD_TARGET_PKG_DIR)
+	@if [ -n "$(COMPONENTS)" ]; then \
+		if [ "$(COMPONENTS)" = "all" ]; then \
+			components="cli os cloud middleware cri cplus java kubernetes nsexec check_yaml"; \
+		else \
+			components=`echo "$(COMPONENTS)" | tr ',' ' '`; \
+		fi; \
+		for component in $$components; do \
+			case "$$component" in \
+				"cli") $(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"os") $(MAKE) os GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"cloud") $(MAKE) cloud GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"middleware") $(MAKE) middleware GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"cri") $(MAKE) cri GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"cplus") $(MAKE) cplus GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"java") $(MAKE) java GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"kubernetes") $(MAKE) kubernetes GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"nsexec") $(MAKE) nsexec GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"check_yaml") $(MAKE) check_yaml; ;; \
+				*) echo "Unknown component: $$component"; ;; \
+			esac; \
+		done; \
+	else \
+		$(MAKE) cli GOOS=$(GOOS) GOARCH=$(GOARCH); \
+	fi
+	@$(MAKE) _package_$(GOOS)_$(GOARCH)
+
+#----------------------------------------------------------------------------------
+# 各平台打包
+.PHONY: _package_darwin_amd64 _package_linux_amd64 _package_windows_amd64 _package_darwin_arm64 _package_linux_arm64
+
+_package_darwin_amd64:
+	@echo "Packaging for darwin amd64..."
+	@tar zcvf $(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)-darwin-amd64.tar.gz -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
+
+_package_linux_amd64:
+	@echo "Packaging for linux amd64..."
+	@tar zcvf $(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)-linux-amd64.tar.gz -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
+
+_package_windows_amd64:
+	@echo "Packaging for windows amd64..."
+	@mv $(BUILD_TARGET_PKG_DIR)/blade-windows-amd64.exe $(BUILD_TARGET_PKG_DIR)/blade.exe
+	@tar zcvf $(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)-windows-amd64.tar.gz -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
+
+_package_darwin_arm64:
+	@echo "Packaging for darwin arm64..."
+	@tar zcvf $(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)-darwin-arm64.tar.gz -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
+
+_package_linux_arm64:
+	@echo "Packaging for linux arm64..."
+	@tar zcvf $(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)-linux-arm64.tar.gz -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
 
 # build chaosblade cli: blade
 .PHONY:cli
 cli: ## Build blade cli
-	$(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli
+	@if [ -n "$(GOOS)" ] && [ -n "$(GOARCH)" ]; then \
+		if [ "$(GOOS)_$(GOARCH)" = "linux_amd64" ] || [ "$(GOOS)_$(GOARCH)" = "linux_arm64" ]; then \
+			if [ "$(CURRENT_OS)" = "linux" ]; then \
+				$(call BUILD_CMD_STATIC,$(GOOS),$(GOARCH),$(BUILD_TARGET_PKG_DIR)/blade); \
+			else \
+				$(call BUILD_CMD,$(GOOS),$(GOARCH),$(BUILD_TARGET_PKG_DIR)/blade); \
+			fi; \
+		else \
+			$(call BUILD_CMD,$(GOOS),$(GOARCH),$(BUILD_TARGET_PKG_DIR)/blade); \
+		fi; \
+	else \
+		$(GO_ENV) $(GO) build $(GO_FLAGS) -o $(BUILD_TARGET_PKG_DIR)/blade ./cli; \
+	fi
 
 nsexec: ## Build nsexecgo
-	$(CC) -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec
+ifeq ($(GOOS),linux)
+	@if [ -f "/usr/local/musl/bin/musl-gcc" ]; then \
+		$(CC) -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec; \
+	else \
+		echo "Warning: musl-gcc not found, skipping nsexec build"; \
+	fi
+else ifeq ($(CURRENT_OS),linux)
+	@if [ -f "/usr/local/musl/bin/musl-gcc" ]; then \
+		$(CC) -static nsexec.c -o $(BUILD_TARGET_PKG_DIR)/bin/nsexec; \
+	else \
+		echo "Warning: musl-gcc not found, skipping nsexec build"; \
+	fi
+else
+	@echo "Skipping nsexec build on $(CURRENT_OS) for $(GOOS) target - Linux only"
+endif
 
 os: ## Build basic resource experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-os, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-os))
@@ -139,7 +273,11 @@ ifdef ALERTMSG
 endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os pull origin $(BLADE_EXEC_OS_BRANCH)
 endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os
+	@if [ -z "$(GOOS)" ]; then \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os; \
+	else \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-os build PLATFORM=$(GOOS)_$(GOARCH); \
+	fi
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-os/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
 
@@ -152,7 +290,11 @@ ifdef ALERTMSG
 endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware pull origin $(BLADE_EXEC_MIDDLEWARE_BRANCH)
 endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware
+	@if [ -z "$(GOOS)" ]; then \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware; \
+	else \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware GOOS=$(GOOS) GOARCH=$(GOARCH); \
+	fi
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
 
@@ -165,10 +307,13 @@ ifdef ALERTMSG
 endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud pull origin $(BLADE_EXEC_CLOUD_BRANCH)
 endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud
+	@if [ -z "$(GOOS)" ]; then \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud; \
+	else \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud GOOS=$(GOOS) GOARCH=$(GOARCH); \
+	fi
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-cloud/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
-
 
 kubernetes: ## Build kubernetes experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-operator, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-operator))
@@ -176,7 +321,11 @@ ifneq ($(BUILD_TARGET_CACHE)/chaosblade-operator, $(wildcard $(BUILD_TARGET_CACH
 else
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-operator pull origin $(BLADE_OPERATOR_BRANCH)
 endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-operator
+	@if [ -z "$(GOOS)" ]; then \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator; \
+	else \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator GOOS=$(GOOS) GOARCH=$(GOARCH); \
+	fi
 	cp $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET_BIN)/* $(BUILD_TARGET_BIN)
 	cp $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
 
@@ -186,9 +335,12 @@ ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-cri, $(wildcard $(BUILD_TARGET_CACH
 else
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri pull origin $(BLADE_EXEC_CRI_BRANCH)
 endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri
+	@if [ -z "$(GOOS)" ]; then \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri; \
+	else \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri GOOS=$(GOOS) GOARCH=$(GOARCH); \
+	fi
 	cp $(BUILD_TARGET_CACHE)/chaosblade-exec-cri/$(BUILD_TARGET_YAML)/* $(BUILD_TARGET_YAML)
-
 
 java: ## Build java experimental scenarios.
 ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-jvm, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm))
@@ -199,7 +351,11 @@ ifdef ALERTMSG
 endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm pull origin $(BLADE_EXEC_JVM_BRANCH)
 endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm
+	@if [ -z "$(GOOS)" ]; then \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm; \
+	else \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm GOOS=$(GOOS) GOARCH=$(GOARCH); \
+	fi
 	cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm/$(BUILD_TARGET_FOR_JAVA_CPLUS)/$(BUILD_TARGET_DIR_NAME)/* $(BUILD_TARGET_PKG_DIR)
 
 cplus: ## Build c/c++ experimental scenarios.
@@ -211,51 +367,12 @@ ifdef ALERTMSG
 endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus pull origin $(BLADE_EXEC_CPLUS_BRANCH)
 endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus
+	@if [ -z "$(GOOS)" ]; then \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus; \
+	else \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus GOOS=$(GOOS) GOARCH=$(GOARCH); \
+	fi
 	cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus/$(BUILD_TARGET_FOR_JAVA_CPLUS)/$(BUILD_TARGET_DIR_NAME)/* $(BUILD_TARGET_PKG_DIR)
-
-##@ Build image
-# build chaosblade image for chaos
-build_image: ## Build chaosblade-tool image
-	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
-	cp -R $(BUILD_TARGET_PKG_NAME) $(BUILD_IMAGE_PATH)
-	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_IMAGE_PATH)
-	docker build -f $(BUILD_IMAGE_PATH)/Dockerfile \
-		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
-		-t ghcr.io/chaosblade-io/chaosblade-tool:$(BLADE_VERSION) \
-		$(BUILD_IMAGE_PATH)
-	rm -rf $(BUILD_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
-
-build_image_arm: ## Build chaosblade-tool-arm image
-	rm -rf $(BUILD_ARM_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
-	cp -R $(BUILD_TARGET_PKG_NAME) $(BUILD_ARM_IMAGE_PATH)
-	tar zxvf $(BUILD_TARGET_PKG_NAME) -C $(BUILD_ARM_IMAGE_PATH)
-	docker buildx build -f $(BUILD_ARM_IMAGE_PATH)/Dockerfile \
-                --platform=linux/arm64 \
-		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
-		-t ghcr.io/chaosblade-io/chaosblade-tool-arm64:$(BLADE_VERSION) \
-		$(BUILD_ARM_IMAGE_PATH)
-	rm -rf $(BUILD_ARM_IMAGE_PATH)/$(BUILD_TARGET_DIR_NAME)
-
-# build docker image with multi-stage builds
-docker_image: clean ## Build chaosblade image
-	docker build -f ./Dockerfile \
-		--build-arg BLADE_VERSION=$(BLADE_VERSION) \
-		-t chaosblade:$(BLADE_VERSION) $(BLADE_SRC_ROOT)
-
-build_upx_image:
-	docker build --rm \
- 		-f build/image/upx/Dockerfile \
- 		-t chaosblade-upx:3.96 build/image/upx
-
-##@ Other
-upx: ## Upx compression by docker image
-	docker run --rm \
-    		-w $(shell pwd)/$(BUILD_TARGET_PKG_DIR) \
-    		-v $(shell pwd)/$(BUILD_TARGET_PKG_DIR):$(shell pwd)/$(BUILD_TARGET_PKG_DIR) \
-     		ghcr.io/chaosblade-io/chaosblade-upx:3.96 \
-    		--best \
-    		blade $(shell pwd)/$(BUILD_TARGET_PKG_DIR)/bin/*
 
 test: ## Test
 	$(GO) test -race -coverprofile=coverage.txt -covermode=atomic ./...
@@ -270,29 +387,10 @@ package: ## Generate the tar packages
 	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) $(BUILD_TARGET_DIR_NAME)
 
 check_yaml:
-	wget "$(CHECK_YANL_FILE_OSS)" -O $(CHECK_YAML_FILE_PATH)
-
-## Select scenario build linux version by docker image
-build_linux_with_arg:
-	docker run --rm \
-		-v $(shell echo -n ${GOPATH}):/go \
-		-w /go/src/github.com/chaosblade-io/chaosblade \
-		-v ~/.m2/repository:/root/.m2/repository \
-        -v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
-		ghcr.io/chaosblade-io/chaosblade-build-musl:latest build_with $$ARGS
-
-## Select scenario build linux arm version by docker image
-build_linux_arm_with_arg:
-	docker run --rm --privileged multiarch/qemu-user-static:register --reset
-	docker run --rm \
-		-v $(shell echo -n ${GOPATH}):/go \
-		-w /go/src/github.com/chaosblade-io/chaosblade \
-		-v ~/.m2/repository:/root/.m2/repository \
-		-v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
-		ghcr.io/chaosblade-io/chaosblade-build-arm:latest build_with $$ARGS
-
-# create cache dir
-mkdir_build_target:
-ifneq ($(BUILD_TARGET_CACHE), $(wildcard $(BUILD_TARGET_CACHE)))
-	mkdir -p $(BUILD_TARGET_CACHE)
-endif
+	@if command -v wget >/dev/null 2>&1; then \
+		wget "$(CHECK_YANL_FILE_OSS)" -O $(CHECK_YAML_FILE_PATH); \
+	elif command -v curl >/dev/null 2>&1; then \
+		curl -sSL "$(CHECK_YANL_FILE_OSS)" -o $(CHECK_YAML_FILE_PATH); \
+	else \
+		echo "Warning: Neither wget nor curl found, skipping check_yaml"; \
+	fi
