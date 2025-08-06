@@ -1,0 +1,72 @@
+run:
+  timeout: 5m
+  skip-dirs:
+    - target
+    - vendor
+
+linters-settings:
+  gocyclo:
+    min-complexity: 15
+  
+  govet:
+    check-shadowing: true
+    
+  golint:
+    min-confidence: 0
+    
+  gofmt:
+    simplify: true
+    
+  misspell:
+    locale: US
+    
+  lll:
+    line-length: 120
+
+linters:
+  enable:
+    - bodyclose
+    - deadcode
+    - depguard
+    - dogsled
+    - dupl
+    - errcheck
+    - exportloopref
+    - exhaustive
+    - funlen
+    - gochecknoinits
+    - goconst
+    - gocritic
+    - gocyclo
+    - gofmt
+    - goimports
+    - golint
+    - gomnd
+    - goprintffuncname
+    - gosec
+    - gosimple
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - noctx
+    - nolintlint
+    - rowserrcheck
+    - staticcheck
+    - structcheck
+    - stylecheck
+    - typecheck
+    - unconvert
+    - unparam
+    - unused
+    - varcheck
+    - whitespace
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gomnd
+        - funlen
+        - goconst

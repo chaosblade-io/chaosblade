@@ -1,0 +1,245 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ master, main, develop ]
+
+env:
+  GO_VERSION: '1.20'
+
+jobs:
+  # 代码质量检查和测试
+  test:
+    name: Test on Linux AMD64
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Run vet
+      run: go vet ./...
+
+    - name: Run tests
+      run: make test
+
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.txt
+        flags: unittests
+        name: codecov-umbrella
+
+  # 多平台CLI编译
+  build-multi-platform:
+    name: Build CLI - ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    needs: test
+    
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            target: linux_amd64
+          - os: linux
+            arch: arm64
+            target: linux_arm64
+          - os: darwin
+            arch: amd64
+            target: darwin_amd64
+          - os: darwin
+            arch: arm64
+            target: darwin_arm64
+          - os: windows
+            arch: amd64
+            target: windows_amd64
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Install musl-gcc for static linking (Linux only)
+      if: matrix.os == 'linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools
+        
+    - name: Build CLI for ${{ matrix.target }}
+      run: make ${{ matrix.target }} MODULES=cli
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: chaosblade-cli-${{ matrix.target }}
+        path: target/chaosblade-*-${{ matrix.target }}.tar.gz
+        retention-days: 30
+
+  # Linux AMD64 完整构建（包含所有组件）
+  build-full-linux-amd64:
+    name: Full Build - Linux AMD64
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y musl-tools gcc-multilib
+
+    - name: Build full package for Linux AMD64
+      run: make linux_amd64 MODULES=all
+
+    - name: Upload full build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: chaosblade-full-linux-amd64
+        path: target/chaosblade-*-linux-amd64.tar.gz
+        retention-days: 30
+
+  # 集成测试（仅在Linux AMD64上运行）
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: build-full-linux-amd64
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Download full build artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: chaosblade-full-linux-amd64
+        path: ./
+
+    - name: Extract and test binary
+      run: |
+        tar -xzf chaosblade-*-linux-amd64.tar.gz
+        cd chaosblade-*/
+        ./blade version
+        ./blade help
+
+    - name: Run basic functionality test
+      run: |
+        cd chaosblade-*/
+        # 测试基本命令功能
+        ./blade query disk
+        ./blade query network
+        # 更多集成测试可以在这里添加
+
+# 发布工作流（仅在标签推送时触发）
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build-multi-platform, build-full-linux-amd64, integration-test]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: ChaosBlade ${{ github.ref_name }}
+        draft: false
+        prerelease: false
+        body: |
+          ## ChaosBlade ${{ github.ref_name }}
+          
+          ### Downloads
+          Choose the appropriate package for your platform:
+          
+          - **Linux AMD64**: For 64-bit Linux systems
+          - **Linux ARM64**: For ARM64 Linux systems  
+          - **Darwin AMD64**: For Intel-based macOS
+          - **Darwin ARM64**: For Apple Silicon macOS
+          - **Windows AMD64**: For 64-bit Windows systems
+          
+          ### Changes
+          See [CHANGELOG](CHANGELOG.md) for detailed changes.
+
+    - name: Upload Release Assets
+      run: |
+        # Upload CLI builds for all platforms
+        for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64; do
+          if [ -f "chaosblade-cli-${platform}/chaosblade-"*"-${platform}.tar.gz" ]; then
+            gh release upload ${{ github.ref_name }} "chaosblade-cli-${platform}/chaosblade-"*"-${platform}.tar.gz" --clobber
+          fi
+        done
+        
+        # Upload full Linux AMD64 build
+        if [ -f "chaosblade-full-linux-amd64/chaosblade-"*"-linux-amd64.tar.gz" ]; then
+          gh release upload ${{ github.ref_name }} "chaosblade-full-linux-amd64/chaosblade-"*"-linux-amd64.tar.gz" --clobber
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
