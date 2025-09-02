@@ -16,8 +16,5 @@
 
 package version
 
-var (
-	Ver       = "unknown"
-	Env       = "unknown"
-	BuildTime = "unknown"
-)
+// 版本信息由 scripts/version.sh 自动生成在 version_info.go 中
+// 请勿在此文件中手动添加版本变量
