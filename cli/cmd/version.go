@@ -30,12 +30,24 @@ func (vc *VersionCommand) Init() {
 	vc.command = &cobra.Command{
 		Use:     "version",
 		Short:   "Print version info",
-		Long:    "Print version info",
+		Long:    "Print detailed version information including Git details",
 		Aliases: []string{"v"},
 		Run: func(cmd *cobra.Command, args []string) {
-			cmd.Printf("version: %s\n", version.Ver)
-			cmd.Printf("env: %s\n", version.Env)
-			cmd.Printf("build-time: %s\n", version.BuildTime)
+			cmd.Printf("ChaosBlade Version Information:\n")
+			cmd.Printf("==============================\n")
+			cmd.Printf("Version:     %s\n", version.Ver)
+			cmd.Printf("Git Tag:     %s\n", version.GitTag)
+			cmd.Printf("Git Commit:  %s\n", version.GitCommit)
+			cmd.Printf("Git Branch:  %s\n", version.GitBranch)
+			cmd.Printf("Build Time:  %s\n", version.BuildTime)
+
+			if version.IsRelease() {
+				cmd.Printf("Release:     Yes (Production)\n")
+			} else {
+				cmd.Printf("Release:     No (Development)\n")
+			}
+
+			cmd.Printf("==============================\n")
 			return
 		},
 	}
