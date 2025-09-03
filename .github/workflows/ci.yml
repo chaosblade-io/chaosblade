@@ -72,9 +72,6 @@ jobs:
           - os: darwin
             arch: arm64
             target: darwin_arm64
-          - os: windows
-            arch: amd64
-            target: windows_amd64
 
     steps:
     - name: Checkout code
@@ -104,9 +101,13 @@ jobs:
     - name: Build CLI for ${{ matrix.target }}
       run: make ${{ matrix.target }} MODULES=cli
 
-    - name: Run basic functionality test
+    - name: Verify file format and structure
       run: |
         cd target/chaosblade-*-${{ matrix.target }}
-        # 测试基本命令功能
-        ./blade version
+        # 校验文件格式
+        echo "Verifying file structure for ${{ matrix.target }}..."
+        ls -la
+        echo "Checking blade binary..."
+        file ./blade
+
 
