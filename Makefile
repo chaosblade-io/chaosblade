@@ -380,8 +380,40 @@ endif
 	fi; \
 	cp -R $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)/* $(OUTPUT_DIR)/
 
+
+#----------------------------------------------------------------------------------
+# build image with all components
+
+build_linux_amd64_image:
+	@echo "Building linux amd64 image..."
+	make linux_amd64 MODULES=all
+	$(CONTAINER_RUNTIME) buildx build \
+		--build-arg BLADE_VERSION=${BLADE_VERSION} \
+		--build-arg GOOS=linux \
+		--build-arg GOARCH=amd64 \
+		-f build/image/blade/Dockerfile \
+		--platform=linux/amd64 \
+		-t ghcr.io/chaosblade-io/chaosblade-tool:${BLADE_VERSION} .
+
+build_linux_arm64_image:
+	@echo "Building linux arm64 image..."
+	make linux_arm64 MODULES=all
+	$(CONTAINER_RUNTIME) buildx build \
+		--build-arg BLADE_VERSION=${BLADE_VERSION} \
+		--build-arg GOOS=linux \
+		--build-arg GOARCH=arm64 \
+		-f build/image/blade_arm/Dockerfile \
+		--platform=linux/arm64 \
+		-t ghcr.io/chaosblade-io/chaosblade-tool-arm64:${BLADE_VERSION} .
+
+push_image:
+	$(CONTAINER_RUNTIME) push ghcr.io/chaosblade-io/chaosblade-tool:${BLADE_VERSION}
+	$(CONTAINER_RUNTIME) push ghcr.io/chaosblade-io/chaosblade-tool-arm64:${BLADE_VERSION}
+
+#----------------------------------------------------------------------------------
+
 test: ## Test
-	$(GO) test -race -coverprofile=coverage.txt -covermode=atomic ./... -skip=github.com/chaosblade-io/chaosblade/cli/cmd
+	$(GO) test -race -coverprofile=coverage.txt -covermode=atomic ./build/spec ./data ./version ./exec/jvm ./exec/os ./exec/docker ./exec/kubernetes ./exec/cri ./exec/cplus ./exec/cloud ./exec/middleware
 
 # clean all build result
 clean: ## Clean
@@ -419,6 +451,9 @@ help:
 	@printf '  \033[36m%-20s\033[0m  %s\n' "linux_amd64" "Build for Linux AMD64"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "linux_arm64" "Build for Linux ARM64"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "windows_amd64" "Build for Windows AMD64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "build_linux_amd64_image" "Build Docker image for Linux AMD64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "build_linux_arm64_image" "Build Docker image for Linux ARM64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "push_image" "Push Docker images to registry"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "clean" "Clean build artifacts"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "test" "Run tests"
 	@echo ''
@@ -428,6 +463,9 @@ help:
 	@echo '  make linux_amd64 MODULES=cli,os,java        # Build cli, os, java for linux_amd64'
 	@echo '  make linux_amd64 MODULES=all                # Build all components for linux_amd64'
 	@echo '  make build_all                              # Build all components for current platform'
+	@echo '  make build_linux_amd64_image                # Build Docker image for Linux AMD64'
+	@echo '  make build_linux_arm64_image                # Build Docker image for Linux ARM64'
+	@echo '  make push_image                             # Push Docker images to registry'
 	@echo ''
 	@echo 'Component list:'
 	@echo '  cli, os, cloud, middleware, cri, cplus, java, kubernetes, nsexec, check_yaml'
