@@ -1,17 +1,23 @@
 .PHONY: build build_all
 
-# 版本信息管理
-# 支持从Git Tag自动获取版本号
-GIT_TAG := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "")
-ifeq ($(GIT_TAG),)
-    # 如果没有Git Tag，使用默认版本或环境变量
-    BLADE_VERSION ?= 1.7.4
+# Version information management
+# Priority: use environment variable BLADE_VERSION, otherwise auto-get version from Git Tag
+ifneq ($(BLADE_VERSION),)
+    # If environment variable BLADE_VERSION is set, use it directly
+    # BLADE_VERSION is already defined in environment variables
 else
-    # 从Git Tag提取版本号（移除v前缀）
-    BLADE_VERSION := $(shell echo $(GIT_TAG) | sed 's/^v//')
+    # If environment variable BLADE_VERSION is not set, try to get from Git Tag
+    GIT_TAG := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "")
+    ifeq ($(GIT_TAG),)
+        # If no Git Tag exists, use default version
+        BLADE_VERSION := 1.7.4
+    else
+        # Extract version number from Git Tag (remove v prefix)
+        BLADE_VERSION := $(shell echo $(GIT_TAG) | sed 's/^v//')
+    endif
 endif
 
-# 导出版本号供其他脚本使用
+# Export version number for use by other scripts
 export BLADE_VERSION
 
 ALLOWGITVERSION=1.8.5
@@ -38,22 +44,22 @@ K8S_BLADE_VERSION=github.com/chaosblade-io/chaosblade-operator/version
 GO_X_FLAGS=-X ${VERSION_PKG}.Ver=$(BLADE_VERSION) -X '${VERSION_PKG}.Env=`uname -mv`' -X '${VERSION_PKG}.BuildTime=`date`' -X ${CRI_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${OS_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${JVM_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION) -X ${K8S_BLADE_VERSION}.BladeVersion=$(BLADE_VERSION)
 GO_FLAGS=-ldflags="$(GO_X_FLAGS) -s -w"
 
-# 不同平台的构建参数
+# Build parameters for different platforms
 BUILD_CMD = env CGO_ENABLED=0 GOOS=$(1) GOARCH=$(2) $(GO_MODULE) go build -ldflags="$(GO_X_FLAGS) -s -w" -o $(3) ./cli
 
 UNAME := $(shell uname)
-# 默认平台变量
+# Default platform variables
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
-# 平台特定的目录和包名称
+# Platform-specific directory and package names
 get_platform_dir_name = chaosblade-$(BLADE_VERSION)-$(1)_$(2)
 get_platform_pkg_name = $(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)-$(1)_$(2).tar.gz
 
-# 通用构建目录函数
+# Common build directory function
 get_build_output_dir = $(BUILD_TARGET)/$(call get_platform_dir_name,$(GOOS),$(GOARCH))
 
-# 使用函数统一管理平台相关的路径变量
+# Use functions to uniformly manage platform-related path variables
 BUILD_TARGET_LIB=$(call get_build_output_dir)/lib
 BUILD_TARGET_BIN=$(call get_build_output_dir)/bin
 BUILD_TARGET_YAML=$(call get_build_output_dir)/yaml
@@ -92,6 +98,10 @@ BLADE_EXEC_JVM_BRANCH=master
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
 BLADE_EXEC_CPLUS_BRANCH=master
 
+# chaosblade-spec-go
+BLADE_SPEC_GO_PROJECT=https://github.com/chaosblade-io/chaosblade-spec-go.git
+BLADE_SPEC_GO_BRANCH=master
+
 # cri yaml
 CRI_YAML_FILE_NAME=chaosblade-cri-spec-$(BLADE_VERSION).yaml
 CRI_YAML_FILE_PATH=$(BUILD_TARGET_BIN)/$(CRI_YAML_FILE_NAME)
@@ -128,15 +138,15 @@ endif
 
 ##@ Build
 
-# 通用构建目标，支持指定平台和组件
-# 用法示例:
-#   make build                            # 当前平台构建 cli
-#   make darwin_amd64 MODULES=cli         # 构建 darwin_amd64 平台的 cli
-#   make darwin_amd64 MODULES=cli,os,java # 构建 darwin_amd64 平台的 cli, os, java
-#   make build_all                        # 构建当前平台的所有组件
+# Common build target supporting specified platform and components
+# Usage examples:
+#   make build                            # Build cli for current platform
+#   make darwin_amd64 MODULES=cli         # Build cli for darwin_amd64 platform
+#   make darwin_amd64 MODULES=cli,os,java # Build cli, os, java for darwin_amd64 platform
+#   make build_all                        # Build all components for current platform
 build: pre_build cli
 
-# 生成版本信息
+# Generate version information
 generate_version: ## Generate version information from Git
 	@echo "Generating version information..."
 	@echo "Git Tag: $(GIT_TAG)"
@@ -144,10 +154,16 @@ generate_version: ## Generate version information from Git
 	@chmod +x scripts/version.sh
 	@./scripts/version.sh
 
+# Sync go.mod dependency versions
+sync_go_mod: ## Sync go.mod dependencies with Makefile branch configuration
+	@echo "Syncing go.mod dependencies with Makefile branch configuration..."
+	@chmod +x scripts/sync_go_mod.sh
+	@./scripts/sync_go_mod.sh
+
 build_all: pre_build cli nsexec os cloud middleware java cplus cri kubernetes package check_yaml  ## Build all components for current platform
 	@echo "Build all components for current platform completed"
 
-pre_build: generate_version ## Prepare build environment
+pre_build: generate_version sync_go_mod ## Prepare build environment
 	@if [ -n "$(GOOS)" ] && [ -n "$(GOARCH)" ]; then \
 		rm -rf $(BUILD_TARGET)/$(call get_platform_dir_name,$(GOOS),$(GOARCH)) $(call get_platform_pkg_name,$(GOOS),$(GOARCH)); \
 		mkdir -p $(BUILD_TARGET)/$(call get_platform_dir_name,$(GOOS),$(GOARCH))/bin $(BUILD_TARGET)/$(call get_platform_dir_name,$(GOOS),$(GOARCH))/lib $(BUILD_TARGET)/$(call get_platform_dir_name,$(GOOS),$(GOARCH))/yaml; \
@@ -157,12 +173,12 @@ pre_build: generate_version ## Prepare build environment
 	fi
 
 #----------------------------------------------------------------------------------
-# 多平台构建目标
+# Multi-platform build targets
 .PHONY: darwin_amd64 linux_amd64 windows_amd64 darwin_arm64 linux_arm64
 
-# 通用构建目标，支持指定平台和组件
-# 用法: make [platform] MODULES=[components]
-# 示例: make linux_amd64 MODULES=cli,os,java
+# Common build target supporting specified platform and components
+# Usage: make [platform] MODULES=[components]
+# Example: make linux_amd64 MODULES=cli,os,java
 darwin_amd64 linux_amd64 windows_amd64 darwin_arm64 linux_arm64:
 	@$(eval GOOS := $(word 1,$(subst _, ,$@)))
 	@$(eval GOARCH := $(word 2,$(subst _, ,$@)))
@@ -174,11 +190,11 @@ darwin_amd64 linux_amd64 windows_amd64 darwin_arm64 linux_arm64:
 		$(MAKE) _build_platform GOOS=$(GOOS) GOARCH=$(GOARCH) COMPONENTS=""; \
 	fi
 
-# 防止 make 将逗号分隔的组件当作单独的目标
+# Prevent make from treating comma-separated components as separate targets
 %:
 	@:
 
-# 通用平台构建函数
+# Common platform build function
 .PHONY: _build_platform
 _build_platform:
 	@echo "Building for $(GOOS)/$(GOARCH)"
@@ -212,30 +228,30 @@ _build_platform:
 	@$(MAKE) _package_$(GOOS)_$(GOARCH) PLATFORM_DIR_NAME=$(PLATFORM_DIR_NAME)
 
 #----------------------------------------------------------------------------------
-# 各平台打包
+# Platform-specific packaging
 .PHONY: _package_darwin_amd64 _package_linux_amd64 _package_windows_amd64 _package_darwin_arm64 _package_linux_arm64
 
 _package_darwin_amd64:
 	@echo "Packaging for darwin amd64..."
-	@tar zcvf $(call get_platform_pkg_name,darwin,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
+	@tar --no-xattrs -zcvf $(call get_platform_pkg_name,darwin,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 
 _package_linux_amd64:
 	@echo "Packaging for linux amd64..."
-	@tar zcvf $(call get_platform_pkg_name,linux,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
+	@COPYFILE_DISABLE=1 tar --no-xattrs -zcvf $(call get_platform_pkg_name,linux,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 
 _package_windows_amd64:
 	@echo "Packaging for windows amd64..."
 	@$(eval OUTPUT_DIR := $(BUILD_TARGET)/$(PLATFORM_DIR_NAME))
 	@if [ -f "$(OUTPUT_DIR)/blade-windows-amd64.exe" ]; then mv $(OUTPUT_DIR)/blade-windows-amd64.exe $(OUTPUT_DIR)/blade.exe; fi
-	@tar zcvf $(call get_platform_pkg_name,windows,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
+	@COPYFILE_DISABLE=1 tar --no-xattrs -zcvf $(call get_platform_pkg_name,windows,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 
 _package_darwin_arm64:
 	@echo "Packaging for darwin arm64..."
-	@tar zcvf $(call get_platform_pkg_name,darwin,arm64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
+	@tar --no-xattrs -zcvf $(call get_platform_pkg_name,darwin,arm64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 
 _package_linux_arm64:
 	@echo "Packaging for linux arm64..."
-	@tar zcvf $(call get_platform_pkg_name,linux,arm64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
+	@COPYFILE_DISABLE=1 tar --no-xattrs -zcvf $(call get_platform_pkg_name,linux,arm64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 	
 #----------------------------------------------------------------------------------
 
@@ -422,7 +438,7 @@ clean: ## Clean
 	rm -rf $(BUILD_IMAGE_PATH)/chaosblade-$(BLADE_VERSION)-$(GOOS)_$(GOARCH)
 
 package: ## Generate the tar packages
-	tar zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) chaosblade-$(BLADE_VERSION)-$(GOOS)_$(GOARCH)
+	tar --no-xattrs -zcvf $(BUILD_TARGET_PKG_FILE_PATH) -C $(BUILD_TARGET) chaosblade-$(BLADE_VERSION)-$(GOOS)_$(GOARCH)
 
 check_yaml:
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir)) \
@@ -451,6 +467,7 @@ help:
 	@printf '  \033[36m%-20s\033[0m  %s\n' "linux_amd64" "Build for Linux AMD64"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "linux_arm64" "Build for Linux ARM64"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "windows_amd64" "Build for Windows AMD64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "sync_go_mod" "Sync go.mod dependencies with Makefile branch config"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "build_linux_amd64_image" "Build Docker image for Linux AMD64"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "build_linux_arm64_image" "Build Docker image for Linux ARM64"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "push_image" "Push Docker images to registry"
@@ -463,6 +480,7 @@ help:
 	@echo '  make linux_amd64 MODULES=cli,os,java        # Build cli, os, java for linux_amd64'
 	@echo '  make linux_amd64 MODULES=all                # Build all components for linux_amd64'
 	@echo '  make build_all                              # Build all components for current platform'
+	@echo '  make sync_go_mod                            # Sync go.mod with Makefile branch config'
 	@echo '  make build_linux_amd64_image                # Build Docker image for Linux AMD64'
 	@echo '  make build_linux_arm64_image                # Build Docker image for Linux ARM64'
 	@echo '  make push_image                             # Push Docker images to registry'

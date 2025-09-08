@@ -3,12 +3,12 @@ module github.com/chaosblade-io/chaosblade
 go 1.20
 
 require (
-	github.com/chaosblade-io/chaosblade-exec-cloud v1.7.4
-	github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20241218081809-c09b5ea1461a
-	github.com/chaosblade-io/chaosblade-exec-middleware v1.7.4
-	github.com/chaosblade-io/chaosblade-exec-os v1.7.4
-	github.com/chaosblade-io/chaosblade-operator v1.7.4
-	github.com/chaosblade-io/chaosblade-spec-go v1.7.4
+	github.com/chaosblade-io/chaosblade-exec-cloud v1.7.5-0.20250902042623-6caabb19d8c5
+	github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20250902113721-9015d7eee9c2
+	github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5-0.20250902072204-62593a75f3bc
+	github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250905063806-b2d815847b22
+	github.com/chaosblade-io/chaosblade-operator v1.7.5-0.20250903092252-3fc18cd4e775
+	github.com/chaosblade-io/chaosblade-spec-go v1.7.5-0.20250902032330-12bd479355fe
 	github.com/glebarez/sqlite v1.11.0
 	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
 	github.com/shirou/gopsutil v3.21.11+incompatible
@@ -92,8 +92,8 @@ require (
 	github.com/prometheus/procfs v0.6.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sirupsen/logrus v1.8.1 // indirect
-	github.com/tklauser/go-sysconf v0.3.9 // indirect
-	github.com/tklauser/numcpus v0.3.0 // indirect
+	github.com/tklauser/go-sysconf v0.3.12 // indirect
+	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opencensus.io v0.22.3 // indirect
 	go.uber.org/automaxprocs v1.3.0 // indirect
@@ -101,7 +101,7 @@ require (
 	golang.org/x/net v0.1.0 // indirect
 	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d // indirect
 	golang.org/x/sync v0.0.0-20220722155255-886fb9371eb4 // indirect
-	golang.org/x/sys v0.7.0 // indirect
+	golang.org/x/sys v0.20.0 // indirect
 	golang.org/x/text v0.4.0 // indirect
 	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac // indirect
 	gomodules.xyz/jsonpatch/v2 v2.0.1 // indirect
