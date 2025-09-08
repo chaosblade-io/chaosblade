@@ -72,7 +72,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=master
+BLADE_EXEC_OS_BRANCH=bugfix-1134
 
 # chaosblade-exec-middleware
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
@@ -160,7 +160,7 @@ sync_go_mod: ## Sync go.mod dependencies with Makefile branch configuration
 	@chmod +x scripts/sync_go_mod.sh
 	@./scripts/sync_go_mod.sh
 
-build_all: pre_build cli nsexec os cloud middleware java cplus cri kubernetes package check_yaml  ## Build all components for current platform
+build_all: pre_build cli nsexec os cloud middleware java cplus cri kubernetes upx package check_yaml  ## Build all components for current platform
 	@echo "Build all components for current platform completed"
 
 pre_build: generate_version sync_go_mod ## Prepare build environment
@@ -203,7 +203,7 @@ _build_platform:
 	@mkdir -p $(OUTPUT_DIR)/bin $(OUTPUT_DIR)/lib $(OUTPUT_DIR)/yaml
 	@if [ -n "$(COMPONENTS)" ]; then \
 		if [ "$(COMPONENTS)" = "all" ]; then \
-			components="cli os cloud middleware java cplus cri kubernetes nsexec check_yaml"; \
+			components="cli os cloud middleware java cplus cri kubernetes nsexec upx check_yaml"; \
 		else \
 			components=`echo "$(COMPONENTS)" | tr ',' ' '`; \
 		fi; \
@@ -218,6 +218,7 @@ _build_platform:
 				"cri") $(MAKE) cri GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"kubernetes") $(MAKE) kubernetes GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"nsexec") $(MAKE) nsexec GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"upx") $(MAKE) upx GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"check_yaml") $(MAKE) check_yaml; ;; \
 				*) echo "Unknown component: $$component"; ;; \
 			esac; \
@@ -228,29 +229,64 @@ _build_platform:
 	@$(MAKE) _package_$(GOOS)_$(GOARCH) PLATFORM_DIR_NAME=$(PLATFORM_DIR_NAME)
 
 #----------------------------------------------------------------------------------
+# UPX compression for binary files
+.PHONY: upx
+
+upx: ## Compress binary files using UPX for maximum compression
+	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
+	@echo "Compressing binary files with UPX in $(OUTPUT_DIR)..."
+	@if command -v upx >/dev/null 2>&1; then \
+		if [ "$(GOOS)" = "linux" ] || [ "$(GOOS)" = "windows" ]; then \
+			echo "UPX found, compressing binaries for $(GOOS)..."; \
+			find $(OUTPUT_DIR) -type f \( -name "blade" -o -name "blade.exe" -o -name "chaos_*" -o -name "nsexec" -o -name "*.exe" \) | while read file; do \
+				if [ -x "$$file" ]; then \
+					echo "Compressing: $$file"; \
+					upx --best --lzma "$$file" || echo "Warning: Failed to compress $$file"; \
+				fi; \
+			done; \
+			echo "UPX compression completed"; \
+		else \
+			echo "UPX compression skipped for $(GOOS) - not supported by UPX"; \
+			echo "UPX currently supports: Linux, Windows"; \
+		fi; \
+	else \
+		echo "Warning: UPX not found, skipping compression"; \
+		echo "To install UPX:"; \
+		echo "  - macOS: brew install upx"; \
+		echo "  - Ubuntu/Debian: apt-get install upx-ucl"; \
+		echo "  - CentOS/RHEL: yum install upx"; \
+		echo "  - Or download from: https://upx.github.io/"; \
+	fi
+
+#----------------------------------------------------------------------------------
 # Platform-specific packaging
 .PHONY: _package_darwin_amd64 _package_linux_amd64 _package_windows_amd64 _package_darwin_arm64 _package_linux_arm64
 
 _package_darwin_amd64:
 	@echo "Packaging for darwin amd64..."
+	@$(MAKE) upx GOOS=darwin GOARCH=amd64
 	@tar --no-xattrs -zcvf $(call get_platform_pkg_name,darwin,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 
 _package_linux_amd64:
 	@echo "Packaging for linux amd64..."
+	@$(MAKE) upx GOOS=linux GOARCH=amd64
 	@COPYFILE_DISABLE=1 tar --no-xattrs -zcvf $(call get_platform_pkg_name,linux,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 
 _package_windows_amd64:
 	@echo "Packaging for windows amd64..."
+	@$(MAKE) upx GOOS=windows GOARCH=amd64
 	@$(eval OUTPUT_DIR := $(BUILD_TARGET)/$(PLATFORM_DIR_NAME))
 	@if [ -f "$(OUTPUT_DIR)/blade-windows-amd64.exe" ]; then mv $(OUTPUT_DIR)/blade-windows-amd64.exe $(OUTPUT_DIR)/blade.exe; fi
 	@COPYFILE_DISABLE=1 tar --no-xattrs -zcvf $(call get_platform_pkg_name,windows,amd64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 
 _package_darwin_arm64:
 	@echo "Packaging for darwin arm64..."
+	@$(MAKE) upx GOOS=darwin GOARCH=arm64
 	@tar --no-xattrs -zcvf $(call get_platform_pkg_name,darwin,arm64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 
 _package_linux_arm64:
 	@echo "Packaging for linux arm64..."
+	@$(MAKE) upx GOOS=linux GOARCH=arm64
 	@COPYFILE_DISABLE=1 tar --no-xattrs -zcvf $(call get_platform_pkg_name,linux,arm64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
 	
 #----------------------------------------------------------------------------------
@@ -486,7 +522,7 @@ help:
 	@echo '  make push_image                             # Push Docker images to registry'
 	@echo ''
 	@echo 'Component list:'
-	@echo '  cli, os, cloud, middleware, cri, cplus, java, kubernetes, nsexec, check_yaml'
+	@echo '  cli, os, cloud, middleware, cri, cplus, java, kubernetes, nsexec, upx, check_yaml'
 	@echo '  Use "all" to build all components'
 	@echo ''
 	@echo 'For more details, visit https://github.com/chaosblade-io/chaosblade'
