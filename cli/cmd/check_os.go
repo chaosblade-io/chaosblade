@@ -17,7 +17,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -131,7 +130,6 @@ func (doc *CheckOsCommand) execBladeCmd(checkExecCmd *CheckExecCmd, osAll bool) 
 	for _, execResult := range checkExecCmd.ExecResult {
 		//1.1 create os cmd
 		response = ch.Run(context.Background(), BladeBinPath, execResult.cmd)
-		var res spec.Response
 		if !response.Success {
 			execResult.result = "failed"
 			execResult.info = fmt.Sprintf("%s, exec failed! create err: %s", execResult.cmd, response.Err)
@@ -141,19 +139,8 @@ func (doc *CheckOsCommand) execBladeCmd(checkExecCmd *CheckExecCmd, osAll bool) 
 			}
 			continue
 		}
-		err := json.Unmarshal([]byte(response.Result.(string)), &res)
-		if err != nil {
-			execResult.result = "failed"
-			execResult.info = fmt.Sprintf("%s, exec failed! create err: %s", execResult.cmd, response.Result)
-			response.Err = fmt.Sprintf("[failed] %s, exec failed! create err: %s", execResult.cmd, response.Result)
-			if osAll {
-				fmt.Printf("[failed] %s, exec failed! create err: %s \n", execResult.cmd, response.Result)
-			}
-			continue
-		}
-
 		// 1.2 destroy os cmd
-		response = ch.Run(context.Background(), BladeBinPath, fmt.Sprintf("destroy %s", res.Result.(string)))
+		response = ch.Run(context.Background(), BladeBinPath, fmt.Sprintf("destroy %s", response.Result.(string)))
 		if !response.Success {
 			execResult.result = "failed"
 			execResult.info = fmt.Sprintf("%s, exec failed! destroy err: %s", execResult.cmd, response.Err)
