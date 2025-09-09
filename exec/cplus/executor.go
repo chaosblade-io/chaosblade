@@ -20,8 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	neturl "net/url"
+	"strings"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -81,8 +83,13 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 }
 
 func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) string {
-	url := fmt.Sprintf("http://%s:%s/create?target=%s&suid=%s&action=%s",
+	baseUrl := fmt.Sprintf("http://%s:%s/create?target=%s&suid=%s&action=%s",
 		"127.0.0.1", port, model.Target, suid, model.ActionName)
+
+	// 使用 strings.Builder 来安全地构建URL，避免格式化字符串问题
+	var urlBuilder strings.Builder
+	urlBuilder.WriteString(baseUrl)
+
 	for k, v := range model.ActionFlags {
 		if v == "" || v == "false" {
 			continue
@@ -91,9 +98,13 @@ func (e *Executor) createUrl(port, suid string, model *spec.ExpModel) string {
 		if k == "timeout" {
 			continue
 		}
-		url = fmt.Sprintf("%s&%s=%s", url, k, neturl.QueryEscape(v))
+		// 安全地添加参数，避免格式化字符串问题
+		urlBuilder.WriteString("&")
+		urlBuilder.WriteString(k)
+		urlBuilder.WriteString("=")
+		urlBuilder.WriteString(neturl.QueryEscape(v))
 	}
-	return url
+	return urlBuilder.String()
 }
 
 func (e *Executor) destroyUrl(port, uid string) string {
