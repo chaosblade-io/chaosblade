@@ -12,13 +12,13 @@ var (
 	GitTag = "v1.7.4"
 	
 	// GitCommit Git提交哈希
-	GitCommit = "b1a1c89"
+	GitCommit = "6456629"
 	
 	// GitBranch Git分支
-	GitBranch = "dev-1.7.5"
+	GitBranch = "bugfix-cplus-spec-yaml"
 	
 	// BuildTime 构建时间
-	BuildTime = "2025-09-09 01:49:35 UTC"
+	BuildTime = "2025-09-09 02:35:22 UTC"
 	
 	// BuildTimeParsed 解析后的构建时间
 	BuildTimeParsed, _ = time.Parse("2006-01-02 15:04:05 UTC", BuildTime)
