@@ -1,4 +1,4 @@
-FROM golang:1.20.13
+FROM golang:1.25.1
 LABEL maintainer="Changjun Xiao"
 
 # # The image is used to build chaosblade for musl
@@ -11,18 +11,21 @@ RUN wget http://www.musl-libc.org/releases/musl-1.1.21.tar.gz \
     && make install \
     && rm -rf musl*
 
+    # 提取 maven 版本号
+ARG MAVEN_VERSION=3.9.11
 # install maven for java project compiled
-RUN wget http://mirrors.tuna.tsinghua.edu.cn/apache/maven/maven-3/3.6.3/binaries/apache-maven-3.6.3-bin.tar.gz \
-    && tar -zxvf apache-maven-3.6.3-bin.tar.gz \
-    && rm apache-maven-3.6.3-bin.tar.gz \
-    && mv apache-maven-3.6.3 /usr/local/apache-maven-3.6.3
+RUN wget http://mirrors.tuna.tsinghua.edu.cn/apache/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz \
+    && tar -zxvf apache-maven-${MAVEN_VERSION}-bin.tar.gz \
+    && rm apache-maven-${MAVEN_VERSION}-bin.tar.gz \
+    && mv apache-maven-${MAVEN_VERSION} /usr/local/apache-maven-${MAVEN_VERSION}
 
 RUN apt-get update \
-    && apt-get install -y unzip openjdk-11-jdk
+    && apt-get install -y unzip openjdk-11-jdk \
+    && apt-get install upx-ucl
 
 ENV CC /usr/local/musl/bin/musl-gcc
 ENV GOOS linux
 ENV java /usr/bin/java
-ENV PATH /usr/local/apache-maven-3.6.3/bin:$PATH
+ENV PATH /usr/local/apache-maven-${MAVEN_VERSION}/bin:$PATH
 
 ENTRYPOINT [ "make" ]
