@@ -43,7 +43,7 @@ func main() {
 	cloudSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cloud-spec-%s.yaml", version))
 	k8sSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version))
 	criSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version))
-	cplusSpecFile := path.Join(filePath, "chaosblade-cplus-spec.yaml")
+	cplusSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cplus-spec-%s.yaml", version))
 	chaosSpecFile := path.Join(targetPath, "chaosblade.spec.yaml")
 
 	osModels := getOsModels(osSpecFile)

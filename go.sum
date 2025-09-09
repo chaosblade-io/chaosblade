@@ -109,8 +109,8 @@ github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20250902113721-9015d7eee9c
 github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20250902113721-9015d7eee9c2/go.mod h1:3D+OvTREOSNTNx+FvSADvW7eQ2kSlyewnRI4UUempTg=
 github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5-0.20250902072204-62593a75f3bc h1:cxwxQEYpd9IEJwVMu3TNP960sSyjupliKVH4Mpvn9GQ=
 github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5-0.20250902072204-62593a75f3bc/go.mod h1:8UV8I1E4gCY+VaF7gfJGBgccJk1wBxJEsfh6tkBn5ik=
-github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250909014542-5475bee1980e h1:Rff5rpqS27iF7SZYXjHDzC30Yqxfw/X+ouDcJpDz0Yk=
-github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250909014542-5475bee1980e/go.mod h1:4VQnlFJSlUkFYV70JGn+FNwdFlsjqIJtooAutFLDG3A=
+github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250905063806-b2d815847b22 h1:ee9HL/l3e/eTZXYD6jqdFZJ2g2epZY74+t4UioUlAhI=
+github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250905063806-b2d815847b22/go.mod h1:4VQnlFJSlUkFYV70JGn+FNwdFlsjqIJtooAutFLDG3A=
 github.com/chaosblade-io/chaosblade-operator v1.7.5-0.20250903092252-3fc18cd4e775 h1:Ls+WBaifE42Oyj5RILmPk+rV1oMv0yIn7bdfs0fcoos=
 github.com/chaosblade-io/chaosblade-operator v1.7.5-0.20250903092252-3fc18cd4e775/go.mod h1:Q8+54939ZNQHUqvGzSQjADXG6fZtxZ3ispervm/CNvU=
 github.com/chaosblade-io/chaosblade-spec-go v1.7.5-0.20250902032330-12bd479355fe h1:s/7VysOMs15XzdwOrDoDiBGB4WGCj7bl6mXs8bwPDAM=
