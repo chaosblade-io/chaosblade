@@ -72,7 +72,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=bugfix-1134
+BLADE_EXEC_OS_BRANCH=feature-time-travel
 
 # chaosblade-exec-middleware
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
@@ -461,6 +461,38 @@ build_linux_arm64_image:
 push_image:
 	$(CONTAINER_RUNTIME) push ghcr.io/chaosblade-io/chaosblade-tool:${BLADE_VERSION}
 	$(CONTAINER_RUNTIME) push ghcr.io/chaosblade-io/chaosblade-tool-arm64:${BLADE_VERSION}
+
+#----------------------------------------------------------------------------------
+
+
+#----------------------------------------------------------------------------------
+# Keep using mirrors to achieve cross-platform compilation and solve the problem of generating yaml files according to the target platform
+## Select scenario build linux version by docker image
+# ghcr.io/chaosblade-io/chaosblade-build-musl image is built by build/image/musl/Dockerfile
+cross_build_linux_amd64_by_container:
+	$(CONTAINER_RUNTIME) run --rm \
+		-v $(shell echo "$${GOPATH:-$$HOME/go}"):/go \
+		-w /go/src/github.com/chaosblade-io/chaosblade \
+		-v ~/.m2/repository:/root/.m2/repository \
+        -v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
+		-e MODULES=$(MODULES) \
+		-e BLADE_VERSION=$(BLADE_VERSION) \
+		ghcr.io/chaosblade-io/chaosblade-build-musl:latest linux_amd64
+
+
+## Select scenario build linux arm version by docker image
+#  ghcr.io/chaosblade-io/chaosblade-build-arm image is built by build/image/arm/Dockerfile
+cross_build_linux_arm64_by_container:
+	$(CONTAINER_RUNTIME) run --rm --privileged multiarch/qemu-user-static:register --reset
+	$(CONTAINER_RUNTIME) run --rm \
+		-v $(shell echo "$${GOPATH:-$$HOME/go}"):/go \
+		-w /go/src/github.com/chaosblade-io/chaosblade \
+		-v ~/.m2/repository:/root/.m2/repository \
+		-v $(shell pwd):/go/src/github.com/chaosblade-io/chaosblade \
+		-e MODULES=$(MODULES) \
+		-e BLADE_VERSION=$(BLADE_VERSION) \
+		ghcr.io/chaosblade-io/chaosblade-build-arm:latest linux_arm64
+
 
 #----------------------------------------------------------------------------------
 
