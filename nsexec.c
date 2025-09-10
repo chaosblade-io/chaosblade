@@ -234,20 +234,7 @@ int main(int argc, char *argv[]) {
             }
         }
         if(WIFEXITED(status)){
-            // 正确传递子进程的退出状态码
-            int exit_code = WEXITSTATUS(status);
-            if(exit_code != 0) {
-                // 如果子进程非正常退出，输出错误信息
-                fprintf(stderr, "Child process exited with code %d\n", exit_code);
-            }
-            exit(exit_code);
-        } else if(WIFSIGNALED(status)){
-            int signal_num = WTERMSIG(status);
-            fprintf(stderr, "Child process terminated by signal %d\n", signal_num);
-            exit(128 + signal_num);
-        } else {
-            fprintf(stderr, "Child process terminated abnormally\n");
-            exit(1);
+            exit(WEXITSTATUS(status));
         }
     }
     return 0;

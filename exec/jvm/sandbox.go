@@ -39,6 +39,12 @@ var cl = channel.NewLocalChannel()
 
 const DefaultNamespace = "chaosblade"
 
+// checkSudoAvailable 检查sudo命令是否可用
+func checkSudoAvailable(ctx context.Context) bool {
+	response := cl.Run(ctx, "", "which sudo")
+	return response.Success
+}
+
 func Attach(ctx context.Context, port, javaHome, pid string) (*spec.Response, string, string) {
 	// refresh
 	response, username, userid := attach(ctx, pid, port, javaHome)
@@ -129,7 +135,12 @@ func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Respo
 				currUser.Username, username, userid)
 		}
 		if username != "" {
-			command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
+			if checkSudoAvailable(ctx) {
+				command = fmt.Sprintf("sudo -u %s %s %s", username, javaBin, javaArgs)
+			} else {
+				log.Infof(ctx, "sudo command not available, using su command instead")
+				command = fmt.Sprintf("su - %s -c '%s %s'", username, javaBin, javaArgs)
+			}
 		} else if userid != "" {
 			command = fmt.Sprintf("su - #%s -c '%s %s'", userid, javaBin, javaArgs)
 		}
