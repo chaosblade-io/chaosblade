@@ -233,15 +233,14 @@ func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
 
 	file = path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
 	models, err = specutil.ParseSpecsToModel(file, docker.NewExecutor())
-	if err != nil {
-		return nil
-	}
-	for idx := range models.Models {
-		model := &models.Models[idx]
-		model.ExpScope = "docker"
-		spec.AddFlagsToModelSpec(exec.GetExecInContainerFlags, model)
-		command := ec.registerExpCommand(model, dockerSpec.Name())
-		modelCommands = append(modelCommands, command)
+	if err == nil {
+		for idx := range models.Models {
+			model := &models.Models[idx]
+			model.ExpScope = "docker"
+			spec.AddFlagsToModelSpec(exec.GetExecInContainerFlags, model)
+			command := ec.registerExpCommand(model, dockerSpec.Name())
+			modelCommands = append(modelCommands, command)
+		}
 	}
 
 	dockerCmd := ec.registerExpCommand(dockerSpec, "")
@@ -277,17 +276,15 @@ func (ec *baseExpCommandService) registerK8sExpCommands() []*modelCommand {
 
 	file = path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
 	models, err = specutil.ParseSpecsToModel(file, kubernetes.NewExecutor())
-	if err != nil {
-		return nil
+	if err == nil {
+		for idx := range models.Models {
+			model := &models.Models[idx]
+			model.ExpScope = "container"
+			spec.AddFlagsToModelSpec(GetResourceFlags, model)
+			command := ec.registerExpCommand(model, k8sSpec.Name())
+			modelCommands = append(modelCommands, command)
+		}
 	}
-	for idx := range models.Models {
-		model := &models.Models[idx]
-		model.ExpScope = "container"
-		spec.AddFlagsToModelSpec(GetResourceFlags, model)
-		command := ec.registerExpCommand(model, k8sSpec.Name())
-		modelCommands = append(modelCommands, command)
-	}
-
 	k8sCmd := ec.registerExpCommand(k8sSpec, "")
 	cobraCmd := k8sCmd.CobraCmd()
 
@@ -314,17 +311,15 @@ func (ec *baseExpCommandService) registerCriExpCommands() []*modelCommand {
 
 	file = path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
 	models, err = specutil.ParseSpecsToModel(file, cri.NewExecutor())
-	if err != nil {
-		return nil
+	if err == nil {
+		for idx := range models.Models {
+			model := &models.Models[idx]
+			model.ExpScope = "cri"
+			spec.AddFlagsToModelSpec(exec.GetExecInContainerFlags, model)
+			command := ec.registerExpCommand(model, criSpec.Name())
+			modelCommands = append(modelCommands, command)
+		}
 	}
-	for idx := range models.Models {
-		model := &models.Models[idx]
-		model.ExpScope = "cri"
-		spec.AddFlagsToModelSpec(exec.GetExecInContainerFlags, model)
-		command := ec.registerExpCommand(model, criSpec.Name())
-		modelCommands = append(modelCommands, command)
-	}
-
 	criCmd := ec.registerExpCommand(criSpec, "")
 	cobraCmd := criCmd.CobraCmd()
 	for _, child := range modelCommands {

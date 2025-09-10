@@ -20,8 +20,7 @@ RUN wget http://mirrors.tuna.tsinghua.edu.cn/apache/maven/maven-3/${MAVEN_VERSIO
     && mv apache-maven-${MAVEN_VERSION} /usr/local/apache-maven-${MAVEN_VERSION}
 
 RUN apt-get update \
-    && apt-get install -y unzip openjdk-11-jdk \
-    && apt-get install upx-ucl
+    && apt-get install -y unzip  upx-ucl openjdk-21-jdk
 
 ENV CC /usr/local/musl/bin/musl-gcc
 ENV GOOS linux

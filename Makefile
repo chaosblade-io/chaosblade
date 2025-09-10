@@ -414,7 +414,7 @@ endif
 	@if [ -z "$(GOOS)" ]; then \
 		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri; \
 	else \
-		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri $(GOOS)_$(GOARCH) JVM_SPEC_PATH=$$(cd $(OUTPUT_DIR)/yaml && pwd); \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri $(GOOS)_$(GOARCH); \
 	fi
 	@cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-cri/target/$(call get_platform_dir_name,$(GOOS),$(GOARCH))/* $(OUTPUT_DIR)/
 
@@ -426,9 +426,9 @@ else
 endif
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
 	@if [ "$(GOOS)_$(GOARCH)" == "linux_amd64" ] || [ "$(GOOS)_$(GOARCH)" == "linux_arm64" ]; then \
-		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator $(GOOS)_$(GOARCH) JVM_SPEC_PATH=$$(cd $(OUTPUT_DIR)/yaml && pwd); \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator $(GOOS)_$(GOARCH); \
 	else \
-		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator only_yaml JVM_SPEC_PATH=$$(cd $(OUTPUT_DIR)/yaml && pwd); \
+		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator only_yaml; \
 	fi; \
 	cp -R $(BUILD_TARGET_CACHE)/chaosblade-operator/$(BUILD_TARGET)/chaosblade-$(BLADE_VERSION)/* $(OUTPUT_DIR)/
 
