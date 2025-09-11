@@ -1,0 +1,404 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 1.8.0)'
+        required: true
+        type: string
+      draft:
+        description: 'Create as draft release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  GO_VERSION: '1.20'
+  REGISTRY: 'ghcr.io'
+  IMAGE_NAME: 'chaosblade-io/chaosblade'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # 多平台构建任务
+  build-multi-platform:
+    name: Build - ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            target: linux_amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            target: linux_arm64
+            runner: ubuntu-latest
+          - os: darwin
+            arch: amd64
+            target: darwin_amd64
+            runner: macos-latest
+          - os: darwin
+            arch: arm64
+            target: darwin_arm64
+            runner: macos-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      package-path: ${{ steps.package.outputs.package-path }}
+      package-name: ${{ steps.package.outputs.package-name }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+        restore-keys: |
+          ${{ runner.os }}-maven-
+      continue-on-error: true
+
+    - name: Get version information
+      id: version
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          VERSION="${{ github.event.inputs.version }}"
+          TAG="v$VERSION"
+        else
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        echo "Version: $VERSION, Tag: $TAG"
+
+    - name: Set environment variables
+      run: |
+        echo "BLADE_VERSION=${{ steps.version.outputs.version }}" >> $GITHUB_ENV
+        echo "BUILD_TARGET=${{ matrix.target }}" >> $GITHUB_ENV
+
+    - name: Install dependencies
+      run: |
+        if [[ "${{ matrix.os }}" == "linux" ]]; then
+          sudo apt-get update
+          sudo apt-get install -y musl-tools upx-ucl
+        elif [[ "${{ matrix.os }}" == "darwin" ]]; then
+          if ! command -v upx &> /dev/null; then
+            brew install upx
+          else
+            echo "UPX already installed"
+          fi
+        fi
+
+    - name: Build all components
+      run: |
+        echo "Building ChaosBlade for ${{ matrix.target }} with all modules..."
+        make ${{ matrix.target }} MODULES=all
+        echo "Build completed successfully for ${{ matrix.target }}"
+      
+    - name: Verify build output
+      run: |
+        echo "Verifying build output for ${{ matrix.target }}..."
+        if [[ -d "target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}" ]]; then
+          echo "✅ Build directory exists"
+          echo "Directory contents:"
+          ls -la "target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}/"
+          
+          # 检查关键文件
+          if [[ -f "target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}/blade" ]]; then
+            echo "✅ blade binary exists"
+            file "target/chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}/blade"
+          else
+            echo "❌ blade binary not found"
+            exit 1
+          fi
+        else
+          echo "❌ Build directory not found"
+          exit 1
+        fi
+
+    - name: Generate package
+      id: package
+      run: |
+        PACKAGE_NAME="chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}.tar.gz"
+        PACKAGE_PATH="target/$PACKAGE_NAME"
+        
+        # 检查 tar.gz 文件是否已生成
+        if [[ -f "$PACKAGE_PATH" ]]; then
+          echo "✅ Package already exists: $PACKAGE_PATH"
+        else
+          echo "❌ Package not found: $PACKAGE_PATH"
+          echo "Available files in target/:"
+          ls -la target/
+          exit 1
+        fi
+        
+        echo "package-name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+        echo "package-path=$PACKAGE_PATH" >> $GITHUB_OUTPUT
+        
+        # 显示包信息
+        echo "Package information:"
+        ls -lh "$PACKAGE_PATH"
+        file "$PACKAGE_PATH"
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: chaosblade-${{ matrix.target }}-${{ steps.version.outputs.version }}
+        path: ${{ steps.package.outputs.package-path }}
+        retention-days: 30
+
+  # Docker 镜像构建任务
+  build-images:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [build-multi-platform]
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ secrets.GHCR_USER }}
+        password: ${{ secrets.GHCR_PASSWORD }}
+        
+    - name: Debug permissions
+      run: |
+        echo "GitHub Actor: ${{ github.actor }}"
+        echo "Repository: ${{ github.repository }}"
+        echo "Registry: ${{ env.REGISTRY }}"
+        echo "Image Name: ${{ env.IMAGE_NAME }}"
+        echo "Version: ${{ needs.build-multi-platform.outputs.version }}"
+        echo "Full image name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-tool:${{ needs.build-multi-platform.outputs.version }}"
+
+    - name: Download Linux AMD64 artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: chaosblade-linux_amd64-${{ needs.build-multi-platform.outputs.version }}
+        path: artifacts/linux_amd64
+
+    - name: Download Linux ARM64 artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: chaosblade-linux_arm64-${{ needs.build-multi-platform.outputs.version }}
+        path: artifacts/linux_arm64
+
+    - name: Prepare artifacts for image build
+      run: |
+        # 创建目标目录结构
+        mkdir -p target/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64
+        mkdir -p target/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64
+        
+        # 解压 Linux AMD64 包
+        tar -xzf artifacts/linux_amd64/*.tar.gz -C target/
+        
+        # 解压 Linux ARM64 包
+        tar -xzf artifacts/linux_arm64/*.tar.gz -C target/
+        
+        # 显示目录结构
+        echo "Linux AMD64 contents:"
+        ls -la target/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64/
+        echo "Linux ARM64 contents:"
+        ls -la target/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64/
+        
+        # 显示版本信息和标签策略
+        echo "Version: ${{ needs.build-multi-platform.outputs.version }}"
+        if [[ "${{ needs.build-multi-platform.outputs.version }}" == *"dev"* ]]; then
+          echo "🔧 Development version detected - will NOT tag as 'latest'"
+        else
+          echo "🚀 Release version detected - will tag as 'latest'"
+        fi
+
+    - name: Build and push Linux AMD64 image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: build/image/blade/Dockerfile
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-tool:${{ needs.build-multi-platform.outputs.version }}
+          ${{ !contains(needs.build-multi-platform.outputs.version, 'dev') && format('{0}/{1}-tool:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
+        build-args: |
+          BLADE_VERSION=${{ needs.build-multi-platform.outputs.version }}
+          GOOS=linux
+          GOARCH=amd64
+        platforms: linux/amd64
+
+    - name: Build and push Linux ARM64 image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: build/image/blade_arm/Dockerfile
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-tool-arm64:${{ needs.build-multi-platform.outputs.version }}
+          ${{ !contains(needs.build-multi-platform.outputs.version, 'dev') && format('{0}/{1}-tool-arm64:latest', env.REGISTRY, env.IMAGE_NAME) || '' }}
+        build-args: |
+          BLADE_VERSION=${{ needs.build-multi-platform.outputs.version }}
+          GOOS=linux
+          GOARCH=arm64
+        platforms: linux/arm64
+
+  # 创建 GitHub Release
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-multi-platform, build-images]
+    if: github.event_name == 'push' || github.event.inputs.version
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts/
+
+    - name: Prepare release assets
+      run: |
+        # 创建发布目录
+        mkdir -p release-assets
+        
+        # 复制所有平台的包
+        for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+          artifact_dir="artifacts/chaosblade-$platform-${{ needs.build-multi-platform.outputs.version }}"
+          if [[ -d "$artifact_dir" ]]; then
+            cp "$artifact_dir"/*.tar.gz "release-assets/"
+            echo "✅ Copied $platform package"
+          else
+            echo "❌ Missing $platform package"
+          fi
+        done
+        
+        # 显示发布资产
+        echo "Release assets:"
+        ls -la release-assets/
+        
+        # 生成校验和
+        cd release-assets
+        sha256sum *.tar.gz > checksums.txt
+        echo "Generated checksums:"
+        cat checksums.txt
+
+    - name: Generate release notes
+      run: |
+        cat > release-assets/RELEASE_NOTES.md << 'EOF'
+        ## ChaosBlade ${{ needs.build-multi-platform.outputs.version }}
+
+        ### �� What's New
+        This release includes various improvements and bug fixes.
+
+        ### 📦 Downloads
+        Choose the appropriate package for your platform:
+
+        **Full Package (All Components):**
+        - **Linux AMD64**: `chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64.tar.gz` - For 64-bit Linux systems
+        - **Linux ARM64**: `chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64.tar.gz` - For ARM64 Linux systems  
+        - **Darwin AMD64**: `chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_amd64.tar.gz` - For Intel-based macOS
+        - **Darwin ARM64**: `chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_arm64.tar.gz` - For Apple Silicon macOS
+
+        **Docker Images:**
+        - **Linux AMD64**: `ghcr.io/chaosblade-io/chaosblade-tool:${{ needs.build-multi-platform.outputs.version }}`
+        - **Linux ARM64**: `ghcr.io/chaosblade-io/chaosblade-tool-arm64:${{ needs.build-multi-platform.outputs.version }}`
+
+        ### 🔧 Installation
+
+        **From Package:**
+        ```bash
+        # Extract and install
+        tar -xzf chaosblade-${{ needs.build-multi-platform.outputs.version }}-[platform].tar.gz
+        cd chaosblade-${{ needs.build-multi-platform.outputs.version }}-[platform]
+        sudo cp blade /usr/local/bin/
+
+        # Verify installation
+        blade version
+        ```
+
+        **From Docker:**
+        ```bash
+        # Linux AMD64
+        docker run -it --rm ghcr.io/chaosblade-io/chaosblade-tool:${{ needs.build-multi-platform.outputs.version }}
+
+        # Linux ARM64
+        docker run -it --rm ghcr.io/chaosblade-io/chaosblade-tool-arm64:${{ needs.build-multi-platform.outputs.version }}
+        ```
+
+        ### 📋 Components Included
+        - **CLI**: Command-line interface
+        - **OS**: Operating system experimental scenarios
+        - **Cloud**: Cloud platform experimental scenarios
+        - **Middleware**: Middleware experimental scenarios
+        - **JVM**: Java Virtual Machine experimental scenarios
+        - **CRI**: Container Runtime Interface experimental scenarios
+        - **Kubernetes**: Kubernetes experimental scenarios
+        - **C++**: C/C++ experimental scenarios
+
+        ### 🐛 Bug Reports
+        If you encounter any issues, please report them on [GitHub Issues](https://github.com/chaosblade-io/chaosblade/issues).
+        EOF
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: ChaosBlade ${{ needs.build-multi-platform.outputs.version }}
+        body_path: release-assets/RELEASE_NOTES.md
+        draft: ${{ github.event.inputs.draft == 'true' }}
+        prerelease: false
+        files: |
+          release-assets/*.tar.gz
+          release-assets/checksums.txt
+        tag_name: ${{ needs.build-multi-platform.outputs.tag }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+  # 清理任务
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [build-multi-platform, build-images, create-release]
+    if: always()
+    
+    steps:
+    - name: Clean up artifacts
+      run: |
+        echo "Cleaning up build artifacts..."
+        # 这里可以添加清理逻辑，比如删除临时文件等
+        echo "Cleanup completed"
+        
