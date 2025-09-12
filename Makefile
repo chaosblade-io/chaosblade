@@ -72,7 +72,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=dev-1.7.5
+BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-middleware
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
@@ -88,11 +88,11 @@ BLADE_EXEC_CRI_BRANCH=main
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=1.7.5-dev
+BLADE_OPERATOR_BRANCH=master
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=dev-1.7.5
+BLADE_EXEC_JVM_BRANCH=master
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
@@ -118,8 +118,9 @@ $(if $(and $(filter amd64,$(GOARCH)),$(wildcard /usr/local/musl/bin/musl-gcc)),/
 $(if $(and $(filter amd64,$(GOARCH)),$(shell command -v x86_64-linux-musl-gcc 2>/dev/null)),x86_64-linux-musl-gcc,\
 $(if $(and $(filter arm64,$(GOARCH)),$(shell command -v aarch64-linux-musl-gcc 2>/dev/null)),aarch64-linux-musl-gcc,\
 $(if $(and $(filter amd64,$(GOARCH)),$(shell command -v gcc 2>/dev/null)),gcc,\
+$(if $(and $(filter arm64,$(GOARCH)),$(shell command -v gcc 2>/dev/null)),gcc,\
 $(if $(and $(filter arm64,$(GOARCH)),$(shell command -v aarch64-linux-gnu-gcc 2>/dev/null)),aarch64-linux-gnu-gcc,\
-container)))))))
+container))))))))
 endef
 CC_FOR_NSEXEC := $(call detect_cc)
 
@@ -160,7 +161,7 @@ sync_go_mod: ## Sync go.mod dependencies with Makefile branch configuration
 	@chmod +x scripts/sync_go_mod.sh
 	@./scripts/sync_go_mod.sh
 
-build_all: pre_build cli nsexec os cloud middleware java cplus cri kubernetes upx package check_yaml  ## Build all components for current platform
+build_all: pre_build nsexec os cloud middleware java cplus cri kubernetes cli upx package check_yaml  ## Build all components for current platform
 	@echo "Build all components for current platform completed"
 
 pre_build: generate_version sync_go_mod ## Prepare build environment
@@ -203,7 +204,7 @@ _build_platform:
 	@mkdir -p $(OUTPUT_DIR)/bin $(OUTPUT_DIR)/lib $(OUTPUT_DIR)/yaml
 	@if [ -n "$(COMPONENTS)" ]; then \
 		if [ "$(COMPONENTS)" = "all" ]; then \
-			components="cli os cloud middleware java cplus cri kubernetes nsexec upx check_yaml"; \
+			components="os cloud middleware java cri kubernetes cli nsexec upx check_yaml"; \
 		else \
 			components=`echo "$(COMPONENTS)" | tr ',' ' '`; \
 		fi; \
@@ -438,7 +439,11 @@ endif
 
 build_linux_amd64_image:
 	@echo "Building linux amd64 image..."
-	make linux_amd64 MODULES=all
+	@if [ -n "$(MODULES)" ]; then \
+		make linux_amd64 MODULES=$(MODULES); \
+	else \
+		make linux_amd64 MODULES=all; \
+	fi
 	$(CONTAINER_RUNTIME) buildx build \
 		--build-arg BLADE_VERSION=${BLADE_VERSION} \
 		--build-arg GOOS=linux \
@@ -449,7 +454,11 @@ build_linux_amd64_image:
 
 build_linux_arm64_image:
 	@echo "Building linux arm64 image..."
-	make linux_arm64 MODULES=all
+	@if [ -n "$(MODULES)" ]; then \
+		make linux_arm64 MODULES=$(MODULES); \
+	else \
+		make linux_arm64 MODULES=all; \
+	fi
 	$(CONTAINER_RUNTIME) buildx build \
 		--build-arg BLADE_VERSION=${BLADE_VERSION} \
 		--build-arg GOOS=linux \
@@ -536,8 +545,8 @@ help:
 	@printf '  \033[36m%-20s\033[0m  %s\n' "linux_arm64" "Build for Linux ARM64"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "windows_amd64" "Build for Windows AMD64"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "sync_go_mod" "Sync go.mod dependencies with Makefile branch config"
-	@printf '  \033[36m%-20s\033[0m  %s\n' "build_linux_amd64_image" "Build Docker image for Linux AMD64"
-	@printf '  \033[36m%-20s\033[0m  %s\n' "build_linux_arm64_image" "Build Docker image for Linux ARM64"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "build_linux_amd64_image" "Build Docker image for Linux AMD64 (supports MODULES)"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "build_linux_arm64_image" "Build Docker image for Linux ARM64 (supports MODULES)"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "push_image" "Push Docker images to registry"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "clean" "Clean build artifacts"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "test" "Run tests"
@@ -550,6 +559,7 @@ help:
 	@echo '  make build_all                              # Build all components for current platform'
 	@echo '  make sync_go_mod                            # Sync go.mod with Makefile branch config'
 	@echo '  make build_linux_amd64_image                # Build Docker image for Linux AMD64'
+	@echo '  make build_linux_amd64_image MODULES=middleware  # Build Docker image with only middleware'
 	@echo '  make build_linux_arm64_image                # Build Docker image for Linux ARM64'
 	@echo '  make push_image                             # Push Docker images to registry'
 	@echo ''
