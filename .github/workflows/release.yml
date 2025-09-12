@@ -21,8 +21,12 @@ env:
   REGISTRY: 'ghcr.io'
   IMAGE_NAME: 'chaosblade-io/chaosblade'
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
-  # 多平台构建任务
+  # 多平台构建任务 - 在对应原生平台编译
   build-multi-platform:
     name: Build - ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
@@ -38,6 +42,7 @@ jobs:
             arch: arm64
             target: linux_arm64
             runner: ubuntu-latest
+            use_docker: true
           - os: darwin
             arch: amd64
             target: darwin_amd64
@@ -65,7 +70,7 @@ jobs:
         go-version: ${{ env.GO_VERSION }}
 
     - name: Cache Go modules
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cache/go-build
@@ -75,7 +80,7 @@ jobs:
           ${{ runner.os }}-go-
 
     - name: Cache Maven dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.m2/repository
         key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
@@ -101,6 +106,12 @@ jobs:
       run: |
         echo "BLADE_VERSION=${{ steps.version.outputs.version }}" >> $GITHUB_ENV
         echo "BUILD_TARGET=${{ matrix.target }}" >> $GITHUB_ENV
+        # 不设置 GOOS 和 GOARCH，让 Go 使用当前运行环境的原生架构
+        echo "Using native platform: $(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m)"
+
+    - name: Set up Docker Buildx (for ARM64)
+      if: matrix.use_docker == true
+      uses: docker/setup-buildx-action@v3
 
     - name: Install dependencies
       run: |
@@ -118,7 +129,42 @@ jobs:
     - name: Build all components
       run: |
         echo "Building ChaosBlade for ${{ matrix.target }} with all modules..."
-        make ${{ matrix.target }} MODULES=all
+        echo "Current platform: $(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m)"
+        echo "Target platform: ${{ matrix.target }}"
+        
+        # 对于 ARM64 Linux，使用 Docker 容器进行原生编译
+        if [[ "${{ matrix.target }}" == "linux_arm64" && "${{ matrix.use_docker }}" == "true" ]]; then
+          echo "Using Docker for ARM64 Linux native compilation..."
+          
+          # 设置 Docker Buildx 以支持多平台构建
+          podman run --rm --privileged multiarch/qemu-user-static --reset -p yes
+          
+          # 使用 ARM64 Ubuntu 容器进行原生编译
+          podman run --rm \
+            -v $(pwd):/workspace \
+            -w /workspace \
+            -e BLADE_VERSION=${{ steps.version.outputs.version }} \
+            -e MODULES=all \
+            --platform linux/arm64 \
+            ubuntu:22.04 \
+            bash -c "
+              apt-get update && \
+              apt-get install -y git make gcc musl-tools upx-ucl && \
+              make ${{ matrix.target }} MODULES=all
+            "
+        else
+          # 验证当前运行环境是否与目标平台匹配
+          CURRENT_PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m)
+          if [[ "$CURRENT_PLATFORM" != "${{ matrix.target }}" ]]; then
+            echo "❌ Platform mismatch! Current: $CURRENT_PLATFORM, Target: ${{ matrix.target }}"
+            echo "This workflow should run on the native platform for ${{ matrix.target }}"
+            exit 1
+          fi
+          
+          # 使用原生平台构建，不进行交叉编译
+          make ${{ matrix.target }} MODULES=all
+        fi
+        
         echo "Build completed successfully for ${{ matrix.target }}"
       
     - name: Verify build output
@@ -167,9 +213,9 @@ jobs:
         file "$PACKAGE_PATH"
 
     - name: Upload build artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
-        name: chaosblade-${{ matrix.target }}-${{ steps.version.outputs.version }}
+        name: chaosblade-${{ steps.version.outputs.version }}-${{ matrix.target }}
         path: ${{ steps.package.outputs.package-path }}
         retention-days: 30
 
@@ -190,19 +236,28 @@ jobs:
       uses: docker/login-action@v3
       with:
         registry: ${{ env.REGISTRY }}
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+        username: ${{ secrets.GHCR_USER }}
+        password: ${{ secrets.GHCR_PASSWORD }}
+        
+    - name: Debug permissions
+      run: |
+        echo "GitHub Actor: ${{ github.actor }}"
+        echo "Repository: ${{ github.repository }}"
+        echo "Registry: ${{ env.REGISTRY }}"
+        echo "Image Name: ${{ env.IMAGE_NAME }}"
+        echo "Version: ${{ needs.build-multi-platform.outputs.version }}"
+        echo "Full image name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-tool:${{ needs.build-multi-platform.outputs.version }}"
 
     - name: Download Linux AMD64 artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
-        name: chaosblade-linux_amd64-${{ needs.build-multi-platform.outputs.version }}
+        name: chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64
         path: artifacts/linux_amd64
 
     - name: Download Linux ARM64 artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
-        name: chaosblade-linux_arm64-${{ needs.build-multi-platform.outputs.version }}
+        name: chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64
         path: artifacts/linux_arm64
 
     - name: Prepare artifacts for image build
@@ -275,7 +330,7 @@ jobs:
         fetch-depth: 0
 
     - name: Download all artifacts
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4
       with:
         path: artifacts/
 
@@ -323,8 +378,12 @@ jobs:
         - **Darwin ARM64**: `chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_arm64.tar.gz` - For Apple Silicon macOS
 
         **Docker Images:**
-        - **Linux AMD64**: `ghcr.io/chaosblade-io/chaosblade-tool:${{ needs.build-multi-platform.outputs.version }}`
-        - **Linux ARM64**: `ghcr.io/chaosblade-io/chaosblade-tool-arm64:${{ needs.build-multi-platform.outputs.version }}`
+        - **Linux AMD64**: 
+            `ghcr.io/chaosblade-io/chaosblade-tool:${{ needs.build-multi-platform.outputs.version }}`
+            `ghcr.io/chaosblade-io/chaosblade-operator:${{ needs.build-multi-platform.outputs.version }}`
+        - **Linux ARM64**: 
+            `ghcr.io/chaosblade-io/chaosblade-tool-arm64:${{ needs.build-multi-platform.outputs.version }}`
+            `ghcr.io/chaosblade-io/chaosblade-operator-arm64:${{ needs.build-multi-platform.outputs.version }}`
 
         ### 🔧 Installation
 
@@ -333,42 +392,34 @@ jobs:
         # Extract and install
         tar -xzf chaosblade-${{ needs.build-multi-platform.outputs.version }}-[platform].tar.gz
         cd chaosblade-${{ needs.build-multi-platform.outputs.version }}-[platform]
-        sudo cp blade /usr/local/bin/
 
         # Verify installation
         blade version
         ```
 
-        **From Docker:**
-        ```bash
-        # Linux AMD64
-        docker run -it --rm ghcr.io/chaosblade-io/chaosblade-tool:${{ needs.build-multi-platform.outputs.version }}
-
-        # Linux ARM64
-        docker run -it --rm ghcr.io/chaosblade-io/chaosblade-tool-arm64:${{ needs.build-multi-platform.outputs.version }}
+        ### For Kubernetes
+        #### Install
         ```
-
-        ### 📋 Components Included
-        - **CLI**: Command-line interface
-        - **OS**: Operating system experimental scenarios
-        - **Cloud**: Cloud platform experimental scenarios
-        - **Middleware**: Middleware experimental scenarios
-        - **JVM**: Java Virtual Machine experimental scenarios
-        - **CRI**: Container Runtime Interface experimental scenarios
-        - **Kubernetes**: Kubernetes experimental scenarios
-        - **C++**: C/C++ experimental scenarios
-
-        ### 🐛 Bug Reports
-        If you encounter any issues, please report them on [GitHub Issues](https://github.com/chaosblade-io/chaosblade/issues).
-        EOF
+        helm repo add chaosblade-io https://chaosblade-io.github.io/charts
+        helm install chaosblade chaosblade-io/chaosblade-operator --namespace chaosblade
+        ```
+        Default image repository is `ghcr.io/chaosblade-io/chaosblade-tool` and  `ghcr.io/chaosblade-io/chaosblade-operator`, you can append `--set blade.repository` or `--set operator.repository` flag to change the image repository. For examples:
+        ```
+        helm install chaosblade-operator chaosblade-io/chaosblade-operator --namespace chaosblade --set blade.repository=chaosbladeio/chaosblade-tool,operator.repository=chaosbladeio/chaosblade-operator 
+        ```
+        #### Uninstall
+        ```
+        helm uninstall chaosblade-operator --namespace chaosblade
+        ```
 
     - name: Create GitHub Release
       uses: softprops/action-gh-release@v1
       with:
-        name: ChaosBlade ${{ needs.build-multi-platform.outputs.version }}
+        name: v${{ needs.build-multi-platform.outputs.version }}
         body_path: release-assets/RELEASE_NOTES.md
         draft: ${{ github.event.inputs.draft == 'true' }}
         prerelease: false
+        generate_release_notes: true
         files: |
           release-assets/*.tar.gz
           release-assets/checksums.txt
