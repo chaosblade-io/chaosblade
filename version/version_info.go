@@ -16,7 +16,6 @@ var (
 
 	// GitBranch Git分支
 	GitBranch = "1.7.5-dev"
-	GitBranch = "1.7.5-dev"
 
 	// BuildTime 构建时间
 	BuildTime = "2025-09-12 12:18:55 UTC"
