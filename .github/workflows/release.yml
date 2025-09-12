@@ -309,7 +309,7 @@ jobs:
         
         # 复制所有平台的包
         for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
-          artifact_dir="artifacts/chaosblade-$platform-${{ needs.build-multi-platform.outputs.version }}"
+          artifact_dir="artifacts/chaosblade-${{ needs.build-multi-platform.outputs.version }}-$platform"
           if [[ -d "$artifact_dir" ]]; then
             cp "$artifact_dir"/*.tar.gz "release-assets/"
             echo "✅ Copied $platform package"
