@@ -18,6 +18,7 @@ on:
 
 env:
   GO_VERSION: '1.20'
+  JAVA_VERSION: '11'
   REGISTRY: 'ghcr.io'
   IMAGE_NAME: 'chaosblade-io/chaosblade'
 
@@ -69,6 +70,12 @@ jobs:
       with:
         go-version: ${{ env.GO_VERSION }}
 
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        java-version: ${{ env.JAVA_VERSION }}
+        distribution: 'temurin'
+
     - name: Cache Go modules
       uses: actions/cache@v4
       with:
@@ -108,6 +115,8 @@ jobs:
         echo "BUILD_TARGET=${{ matrix.target }}" >> $GITHUB_ENV
         # 不设置 GOOS 和 GOARCH，让 Go 使用当前运行环境的原生架构
         echo "Using native platform: $(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m)"
+        # 设置 Maven 选项以支持 Lombok 与 Java 的兼容性
+        echo "MAVEN_OPTS=--add-opens jdk.compiler/com.sun.tools.javac.processing=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.comp=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.main=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.parser=ALL-UNNAMED --add-opens jdk.compiler/com.sun.tools.javac.jvm=ALL-UNNAMED" >> $GITHUB_ENV
 
     - name: Set up Docker Buildx (for ARM64)
       if: matrix.use_docker == true
@@ -328,13 +337,48 @@ jobs:
         echo "Generated checksums:"
         cat checksums.txt
 
+    - name: Setup OSSUTIL environment
+      uses: yizhoumo/setup-ossutil@v1.1.3
+      env:
+        BINARY_TAG: ${{ needs.build-multi-platform.outputs.version }}
+      with:
+        endpoint: ${{ secrets.OSS_ENDPOINT }}
+        access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+        access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+        ossutil-version: '1.7.14'
+
+    - name: Upload packages to OSS
+      env:
+        BINARY_TAG: ${{ needs.build-multi-platform.outputs.version }}
+      run: |
+        echo "Uploading ChaosBlade packages to OSS..."
+        
+        # 上传所有平台的包
+        for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+          package_file="release-assets/chaosblade-${BINARY_TAG}-${platform}.tar.gz"
+          if [[ -f "$package_file" ]]; then
+            echo "Uploading $platform package..."
+            ossutil cp -f "$package_file" "oss://chaosblade/agent/github/${BINARY_TAG}/chaosblade-${BINARY_TAG}-${platform}.tar.gz"
+            echo "✅ $platform package uploaded successfully"
+          else
+            echo "❌ $platform package not found: $package_file"
+          fi
+        done
+        
+        # 上传校验和文件
+        if [[ -f "release-assets/checksums.txt" ]]; then
+          echo "Uploading checksums file..."
+          ossutil cp -f "release-assets/checksums.txt" "oss://chaosblade/agent/github/${BINARY_TAG}/checksums.txt"
+          echo "✅ Checksums file uploaded successfully"
+        else
+          echo "❌ Checksums file not found"
+        fi
+        
+        echo "All packages uploaded to OSS successfully"
+
     - name: Generate release notes
       run: |
         cat > release-assets/RELEASE_NOTES.md << 'EOF'
-        ## ChaosBlade ${{ needs.build-multi-platform.outputs.version }}
-
-        ### �� What's New
-        This release includes various improvements and bug fixes.
 
         ### 📦 Downloads
         Choose the appropriate package for your platform:
@@ -352,6 +396,16 @@ jobs:
         - **Linux ARM64**: 
             `ghcr.io/chaosblade-io/chaosblade-tool-arm64:${{ needs.build-multi-platform.outputs.version }}`
             `ghcr.io/chaosblade-io/chaosblade-operator-arm64:${{ needs.build-multi-platform.outputs.version }}`
+
+        ### 🌐 OSS Download Links
+        Alternative download links from Alibaba Cloud OSS:
+
+        **Full Package (All Components):**
+        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64.tar.gz)
+        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64.tar.gz)
+        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_amd64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_amd64.tar.gz)
+        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_arm64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_arm64.tar.gz)
+        - [checksums.txt](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/checksums.txt) - SHA256 checksums
 
         ### 🔧 Installation
 
@@ -384,8 +438,8 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         name: v${{ needs.build-multi-platform.outputs.version }}
-        body_path: release-assets/RELEASE_NOTES.md
         draft: ${{ github.event.inputs.draft == 'true' }}
+        body_path: release-assets/RELEASE_NOTES.md
         prerelease: false
         generate_release_notes: true
         files: |
