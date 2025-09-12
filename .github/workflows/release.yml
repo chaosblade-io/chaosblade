@@ -41,7 +41,7 @@ jobs:
           - os: linux
             arch: arm64
             target: linux_arm64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
             use_docker: true
           - os: darwin
             arch: amd64
@@ -131,40 +131,8 @@ jobs:
         echo "Building ChaosBlade for ${{ matrix.target }} with all modules..."
         echo "Current platform: $(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m)"
         echo "Target platform: ${{ matrix.target }}"
-        
-        # 对于 ARM64 Linux，使用 Docker 容器进行原生编译
-        if [[ "${{ matrix.target }}" == "linux_arm64" && "${{ matrix.use_docker }}" == "true" ]]; then
-          echo "Using Docker for ARM64 Linux native compilation..."
-          
-          # 设置 Docker Buildx 以支持多平台构建
-          podman run --rm --privileged multiarch/qemu-user-static --reset -p yes
-          
-          # 使用 ARM64 Ubuntu 容器进行原生编译
-          podman run --rm \
-            -v $(pwd):/workspace \
-            -w /workspace \
-            -e BLADE_VERSION=${{ steps.version.outputs.version }} \
-            -e MODULES=all \
-            --platform linux/arm64 \
-            ubuntu:22.04 \
-            bash -c "
-              apt-get update && \
-              apt-get install -y git make gcc musl-tools upx-ucl && \
-              make ${{ matrix.target }} MODULES=all
-            "
-        else
-          # 验证当前运行环境是否与目标平台匹配
-          CURRENT_PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m)
-          if [[ "$CURRENT_PLATFORM" != "${{ matrix.target }}" ]]; then
-            echo "❌ Platform mismatch! Current: $CURRENT_PLATFORM, Target: ${{ matrix.target }}"
-            echo "This workflow should run on the native platform for ${{ matrix.target }}"
-            exit 1
-          fi
-          
-          # 使用原生平台构建，不进行交叉编译
-          make ${{ matrix.target }} MODULES=all
-        fi
-        
+        echo "Building for target platform: ${{ matrix.target }}"
+        make ${{ matrix.target }} MODULES=all
         echo "Build completed successfully for ${{ matrix.target }}"
       
     - name: Verify build output
