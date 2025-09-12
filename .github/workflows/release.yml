@@ -22,7 +22,7 @@ env:
   IMAGE_NAME: 'chaosblade-io/chaosblade'
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
