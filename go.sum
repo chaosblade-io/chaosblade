@@ -109,10 +109,10 @@ github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20250912110237-af663e58450
 github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20250912110237-af663e584508/go.mod h1:fMgaT9oHMkIvnwz6jQ9vKIAltUVNKGGepIKJQWVUSN0=
 github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5-0.20250912110204-2c87c33b8334 h1:x8hCtmwt3J1GHz5RcwJgZvoDcqr/f6GhmLzbUuxSWnY=
 github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5-0.20250912110204-2c87c33b8334/go.mod h1:8UV8I1E4gCY+VaF7gfJGBgccJk1wBxJEsfh6tkBn5ik=
-github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250912090135-37584d0a5138 h1:7pxRrNutnFXD4xT6yLcAneWmvuQA382+cZ2vGKDM8nw=
-github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250912090135-37584d0a5138/go.mod h1:4VQnlFJSlUkFYV70JGn+FNwdFlsjqIJtooAutFLDG3A=
-github.com/chaosblade-io/chaosblade-operator v1.7.5-0.20250912113519-207b67aee739 h1:Hy9Pwp2Qd/vbviufTAG7mt9kSi/p5rVA+KpzRx7a4Fc=
-github.com/chaosblade-io/chaosblade-operator v1.7.5-0.20250912113519-207b67aee739/go.mod h1:Y38ANS9m8BIbST6JZfFpUdVGcY0hIlgdArOM0999wEs=
+github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250909073259-5e5d82beaec4 h1:doHfb7OfXCIbrkEFcwF52WbzN0qc7bKDtAW0J+8pmSY=
+github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250909073259-5e5d82beaec4/go.mod h1:4VQnlFJSlUkFYV70JGn+FNwdFlsjqIJtooAutFLDG3A=
+github.com/chaosblade-io/chaosblade-operator v1.7.5-0.20250911040940-7e9b6c880a7a h1:IzhGs78KHLk/sthgi61c1pLgclPImEphCzUpITc2cpw=
+github.com/chaosblade-io/chaosblade-operator v1.7.5-0.20250911040940-7e9b6c880a7a/go.mod h1:Y38ANS9m8BIbST6JZfFpUdVGcY0hIlgdArOM0999wEs=
 github.com/chaosblade-io/chaosblade-spec-go v1.7.5 h1:wt+N/Kzxc9kyyKnacEfSLEPUT6dzH+TLonq/tlN1pic=
 github.com/chaosblade-io/chaosblade-spec-go v1.7.5/go.mod h1:QrsUvbhnSmI7SjsKKdNM+F8MnkEE9iIZg2xV425nKsY=
 github.com/checkpoint-restore/go-criu/v4 v4.1.0/go.mod h1:xUQBLp4RLc5zJtWY++yjOoMoB5lihDt7fai+75m+rGw=

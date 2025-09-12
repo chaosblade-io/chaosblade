@@ -153,15 +153,22 @@ jobs:
               make ${{ matrix.target }} MODULES=all
             "
         else
-          # 验证当前运行环境是否与目标平台匹配
+          # 对于 macOS 平台，允许交叉编译
           CURRENT_PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m)
           if [[ "$CURRENT_PLATFORM" != "${{ matrix.target }}" ]]; then
-            echo "❌ Platform mismatch! Current: $CURRENT_PLATFORM, Target: ${{ matrix.target }}"
-            echo "This workflow should run on the native platform for ${{ matrix.target }}"
-            exit 1
+            if [[ "${{ matrix.os }}" == "darwin" ]]; then
+              echo "🔄 Cross-compiling from $CURRENT_PLATFORM to ${{ matrix.target }}"
+              echo "This is supported for macOS platforms"
+            else
+              echo "❌ Platform mismatch! Current: $CURRENT_PLATFORM, Target: ${{ matrix.target }}"
+              echo "This workflow should run on the native platform for ${{ matrix.target }}"
+              exit 1
+            fi
+          else
+            echo "✅ Building on native platform: $CURRENT_PLATFORM"
           fi
           
-          # 使用原生平台构建，不进行交叉编译
+          # 使用 Makefile 进行构建，支持交叉编译
           make ${{ matrix.target }} MODULES=all
         fi
         
