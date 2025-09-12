@@ -426,7 +426,7 @@ else
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-operator pull origin $(BLADE_OPERATOR_BRANCH)
 endif
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
-	@if [ "$(GOOS)_$(GOARCH)" == "linux_amd64" ] || [ "$(GOOS)_$(GOARCH)" == "linux_arm64" ]; then \
+	@if [ "$(GOOS)_$(GOARCH)" = "linux_amd64" ] || [ "$(GOOS)_$(GOARCH)" = "linux_arm64" ]; then \
 		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator $(GOOS)_$(GOARCH); \
 	else \
 		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator only_yaml; \
