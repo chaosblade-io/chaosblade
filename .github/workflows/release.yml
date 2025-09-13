@@ -401,11 +401,11 @@ jobs:
         Alternative download links from Alibaba Cloud OSS:
 
         **Full Package (All Components):**
-        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64.tar.gz)
-        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64.tar.gz)
-        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_amd64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_amd64.tar.gz)
-        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_arm64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_arm64.tar.gz)
-        - [checksums.txt](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/v${{ needs.build-multi-platform.outputs.version }}/checksums.txt) - SHA256 checksums
+        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_amd64.tar.gz)
+        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-linux_arm64.tar.gz)
+        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_amd64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_amd64.tar.gz)
+        - [chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_arm64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/${{ needs.build-multi-platform.outputs.version }}/chaosblade-${{ needs.build-multi-platform.outputs.version }}-darwin_arm64.tar.gz)
+        - [checksums.txt](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/${{ needs.build-multi-platform.outputs.version }}/checksums.txt) - SHA256 checksums
 
         ### 🔧 Installation
 
