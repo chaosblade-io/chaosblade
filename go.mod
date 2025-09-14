@@ -4,10 +4,10 @@ go 1.20
 
 require (
 	github.com/chaosblade-io/chaosblade-exec-cloud v1.7.5
-	github.com/chaosblade-io/chaosblade-exec-cri v1.7.5-0.20250912110237-af663e584508
-	github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5-0.20250912121602-439655522328
-	github.com/chaosblade-io/chaosblade-exec-os v1.7.5-0.20250912090135-37584d0a5138
-	github.com/chaosblade-io/chaosblade-operator v1.7.5-0.20250912231650-23db444713a6
+	github.com/chaosblade-io/chaosblade-exec-cri v1.7.5
+	github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5
+	github.com/chaosblade-io/chaosblade-exec-os v1.7.5
+	github.com/chaosblade-io/chaosblade-operator v1.7.5
 	github.com/chaosblade-io/chaosblade-spec-go v1.7.5
 	github.com/glebarez/sqlite v1.11.0
 	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3

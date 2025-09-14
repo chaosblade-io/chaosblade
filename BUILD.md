@@ -58,6 +58,40 @@ make linux_amd64 MODULES=cli,os,java
 make linux_amd64 MODULES=all
 ```
 
+#### 3. Individual Component Build
+```bash
+# Build individual components for current platform
+make cli          # Build CLI tool only
+make os           # Build OS experiment scenarios
+make cloud        # Build cloud experiment scenarios
+make middleware   # Build middleware experiment scenarios
+make java         # Build Java experiment scenarios
+make cplus        # Build C/C++ experiment scenarios
+make cri          # Build CRI experiment scenarios
+make kubernetes   # Build Kubernetes experiment scenarios
+make nsexec       # Build nsexec (Linux only)
+make upx          # Compress binaries with UPX
+make check_yaml   # Download check specification YAML files
+```
+
+#### 4. Build Preparation and Utilities
+```bash
+# Generate version information from Git
+make generate_version
+
+# Sync go.mod dependencies with Makefile branch configuration
+make sync_go_mod
+
+# Prepare build environment (clean and create directories)
+make pre_build
+
+# Package build artifacts
+make package
+
+# Clean all build artifacts
+make clean
+```
+
 ### Component List
 
 | Component | Description | Notes |
@@ -128,6 +162,10 @@ make build_linux_amd64_image
 
 # Build Linux ARM64 image
 make build_linux_arm64_image
+
+# Build with specific modules
+make build_linux_amd64_image MODULES=cli,os
+make build_linux_arm64_image MODULES=all
 ```
 
 ### Image Push
@@ -136,19 +174,34 @@ make build_linux_arm64_image
 make push_image
 ```
 
+### Container Runtime Configuration
+The build system automatically detects available container runtimes:
+- **Docker** (default)
+- **Podman** (if Docker is not available)
+
+You can manually specify the container runtime:
+```bash
+# Use Docker explicitly
+make nsexec CONTAINER_RUNTIME=docker
+
+# Use Podman explicitly
+make nsexec CONTAINER_RUNTIME=podman
+```
+
 ## Cross-Platform Compilation
 
 ### nsexec Cross-Platform Compilation
 The nsexec component supports cross-compilation from macOS to Linux:
 
 #### Automatic Compiler Detection
-The system automatically detects available cross-compilation toolchains:
-- `musl-gcc`
-- `/usr/local/musl/bin/musl-gcc`
-- `x86_64-linux-musl-gcc`
-- `aarch64-linux-musl-gcc`
-- `gcc`
-- `aarch64-linux-gnu-gcc`
+The system automatically detects available cross-compilation toolchains in this order:
+1. `musl-gcc` (for amd64)
+2. `/usr/local/musl/bin/musl-gcc` (for amd64)
+3. `x86_64-linux-musl-gcc` (for amd64)
+4. `aarch64-linux-musl-gcc` (for arm64)
+5. `gcc` (fallback for both architectures)
+6. `aarch64-linux-gnu-gcc` (for arm64)
+7. `container` (if no suitable compiler found)
 
 #### Containerized Compilation
 If no suitable cross-compilation toolchain is available, containers can be used for compilation:
@@ -160,19 +213,55 @@ make nsexec CONTAINER_RUNTIME=docker
 make nsexec CONTAINER_RUNTIME=podman
 ```
 
+### Cross-Platform Build with Containers
+```bash
+# Build Linux AMD64 using musl container
+make cross_build_linux_amd64_by_container
+
+# Build Linux ARM64 using ARM container
+make cross_build_linux_arm64_by_container
+```
+
+### UPX Binary Compression
+The build system supports UPX compression for smaller binary sizes:
+```bash
+# Compress binaries with UPX (Linux and Windows only)
+make upx
+
+# UPX is automatically applied during packaging for supported platforms
+```
+
+**Supported platforms for UPX:**
+- Linux (amd64, arm64)
+- Windows (amd64)
+
+**Installation:**
+- macOS: `brew install upx`
+- Ubuntu/Debian: `apt-get install upx-ucl`
+- CentOS/RHEL: `yum install upx`
+
 ## Build Configuration
 
 ### Environment Variables
-- `GOOS`: Target operating system
-- `GOARCH`: Target architecture
-- `BLADE_VERSION`: Version number
-- `CONTAINER_RUNTIME`: Container runtime (docker/podman)
-- `MODULES`: List of components to build
+- `GOOS`: Target operating system (linux, darwin, windows)
+- `GOARCH`: Target architecture (amd64, arm64)
+- `BLADE_VERSION`: Version number (auto-detected from Git tags or set manually)
+- `CONTAINER_RUNTIME`: Container runtime (docker/podman, auto-detected)
+- `MODULES`: Comma-separated list of components to build
+- `GOPATH`: Go workspace path (for containerized builds)
 
 ### Build Flags
-- `CGO_ENABLED=0`: Disable CGO
+- `CGO_ENABLED=0`: Disable CGO for static linking
 - `GO111MODULE=on`: Enable Go modules
-- Static linking flags: `-ldflags="-s -w"`
+- Static linking flags: `-ldflags="-s -w"` (strip debug info and symbols)
+- Version injection: `-X` flags for embedding version information
+
+### Version Information Injection
+The build process automatically injects version information into binaries:
+- Version number from Git tags or environment
+- Build environment (`uname -mv`)
+- Build timestamp
+- Component-specific version information
 
 ## Build Artifacts
 
@@ -188,6 +277,14 @@ target/
 ### File Naming
 - Executable files: `blade` (Linux/macOS) or `blade.exe` (Windows)
 - Compressed packages: `chaosblade-{version}-{platform}_{arch}.tar.gz`
+- YAML specification files: `chaosblade-{component}-spec-{version}.yaml`
+- Check specification: `chaosblade-check-spec-{version}.yaml`
+
+### Build Cache
+The build system uses a cache directory to store downloaded dependencies:
+- Cache location: `target/cache/`
+- Cached components: All external repositories (os, cloud, middleware, etc.)
+- Cache management: Automatic clone/update of cached repositories
 
 ## Common Command Examples
 
@@ -224,6 +321,38 @@ make linux_amd64 MODULES=all
 make build_linux_amd64_image
 make build_linux_arm64_image
 make push_image
+
+# Build images with specific modules
+make build_linux_amd64_image MODULES=cli,os
+make build_linux_arm64_image MODULES=all
+```
+
+### Cross-Platform Build
+```bash
+# Build Linux versions using containers
+make cross_build_linux_amd64_by_container
+make cross_build_linux_arm64_by_container
+```
+
+### Utility Commands
+```bash
+# Generate version information
+make generate_version
+
+# Sync dependencies
+make sync_go_mod
+
+# Compress binaries
+make upx
+
+# Download check specifications
+make check_yaml
+
+# Run tests
+make test
+
+# Clean build artifacts
+make clean
 ```
 
 ## Troubleshooting
@@ -262,6 +391,49 @@ podman info
 
 # Manually specify container runtime
 make nsexec CONTAINER_RUNTIME=docker
+```
+
+#### 4. UPX Compression Issues
+```bash
+# Check if UPX is installed
+which upx
+
+# Install UPX on different platforms
+# macOS
+brew install upx
+
+# Ubuntu/Debian
+sudo apt-get install upx-ucl
+
+# CentOS/RHEL
+sudo yum install upx
+```
+
+#### 5. Cross-Compilation Issues
+```bash
+# Check available cross-compilers
+which musl-gcc
+which aarch64-linux-gnu-gcc
+
+# Install cross-compilation tools
+# Ubuntu/Debian
+sudo apt-get install musl-tools gcc-aarch64-linux-gnu
+
+# macOS
+brew install FiloSottile/musl-cross/musl-cross
+```
+
+#### 6. Git Version Issues
+```bash
+# Check Git version
+git --version
+
+# Update Git if needed
+# Ubuntu/Debian
+sudo apt-get update && sudo apt-get install git
+
+# macOS
+brew install git
 ```
 
 ### Clean Build Artifacts
