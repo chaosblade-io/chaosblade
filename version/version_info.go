@@ -12,12 +12,14 @@ var (
 	GitTag = "v1.7.4"
 	
 	// GitCommit Git提交哈希
+
 	GitCommit = "917f240"
 	
 	// GitBranch Git分支
-	GitBranch = "1.7.5-dev"
+	GitBranch = "master"
 	
 	// BuildTime 构建时间
+
 	BuildTime = "2025-09-12 23:39:35 UTC"
 	
 	// BuildTimeParsed 解析后的构建时间
