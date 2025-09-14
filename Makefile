@@ -72,7 +72,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=dev-1.7.5
+BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-middleware
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
@@ -88,11 +88,11 @@ BLADE_EXEC_CRI_BRANCH=main
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=1.7.5-dev
+BLADE_OPERATOR_BRANCH=master
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=dev-1.7.5
+BLADE_EXEC_JVM_BRANCH=master
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
@@ -426,7 +426,7 @@ else
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-operator pull origin $(BLADE_OPERATOR_BRANCH)
 endif
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
-	@if [ "$(GOOS)_$(GOARCH)" == "linux_amd64" ] || [ "$(GOOS)_$(GOARCH)" == "linux_arm64" ]; then \
+	@if [ "$(GOOS)_$(GOARCH)" = "linux_amd64" ] || [ "$(GOOS)_$(GOARCH)" = "linux_arm64" ]; then \
 		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator $(GOOS)_$(GOARCH); \
 	else \
 		make -C $(BUILD_TARGET_CACHE)/chaosblade-operator only_yaml; \
