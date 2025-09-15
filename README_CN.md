@@ -62,31 +62,7 @@ docker run -it --privileged chaosbladeio/chaosblade-demo
 [chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator) 项目是针对云原生平台所实现的混沌实验注入工具，遵循混沌实验模型规范化实验场景，把实验定义为 Kubernetes CRD 资源，将实验模型映射为 Kubernetes 资源属性，很友好地将混沌实验模型与 Kubernetes 声明式设计结合在一起，在依靠混沌实验模型便捷开发场景的同时，又可以很好的结合 Kubernetes 设计理念，通过 kubectl 或者编写代码直接调用 Kubernetes API 来创建、更新、删除混沌实验，而且资源状态可以非常清晰地表示实验的执行状态，标准化实现 Kubernetes 故障注入。除了使用上述方式执行实验外，还可以使用 chaosblade cli 方式非常方便的执行 kubernetes 实验场景，查询实验状态等。具体请阅读：[云原生下的混沌工程实践](CLOUDNATIVE.md)
 
 ## 编译
-此项目采用 golang 语言编写，所以需要先安装最新的 golang 版本，最低支持的版本是 1.11。Clone 工程后进入项目目录执行以下命令进行编译：
-```shell script
-make
-```
-如果在 mac 系统上，编译当前系统的版本，请执行：
-```shell script
-make build_darwin
-```
-如果想在 mac 系统上，编译 linux 系统版本，请执行：
-```shell script
-make build_linux
-```
-也可以选择性编译，比如只需要编译 cli、os 场景，则执行：
-```shell script
-make build_with cli os
-# 如果是 mac 系统，执行
-make build_with cli os_darwin
-# 如果是 mac 系统，想选择性的编译 linux 版本的 cli，os，则执行：
-ARGS="cli os" make build_with_linux
-```
-
-Arch Linux 安装 [chaosblade-bin](https://aur.archlinux.org/packages/chaosblade-bin/)
-```bash
-yay -S chaosblade-bin
-```
+详见 [BUILD_ZH.md](BUILD_ZH.md)
 
 ## 缺陷&建议
 欢迎提交缺陷、问题、建议和新功能，所有项目（包含其他子项目）的问题都可以提交到[Github Issues](https://github.com/chaosblade-io/chaosblade/issues)

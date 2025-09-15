@@ -62,31 +62,7 @@ After entering the container, you can read the README.txt file to implement the 
 [chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator) The project is a chaos experiment injection tool for cloud-native platforms. It follows the chaos experiment model to standardize the experimental scenario and defines the experiment as Kubernetes CRD Resources, mapping experimental models to Kubernetes resource attributes, and very friendly combination of chaotic experimental models with Kubernetes declarative design. While relying on chaotic experimental models to conveniently develop scenarios, it can also well integrate Kubernetes design concepts, through kubectl or Write code to directly call the Kubernetes API to create, update, and delete chaotic experiments, and the resource status can clearly indicate the execution status of the experiment, and standardize Kubernetes fault injection. In addition to using the above methods to perform experiments, you can also use the chaosblade cli method to execute kubernetes experimental scenarios and query the experimental status very conveniently. For details, please read the chinese document: [Chaos Engineering Practice under Cloud Native](CLOUDNATIVE.md)
 
 ## Compile
-This project is written in golang, so you need to install the latest golang version first. The minimum supported version is 1.11. After the Clone project, enter the project directory and execute the following command to compile:
-```shell script
-make
-```
-If on a mac system, compile the current system version, execute:
-```shell script
-make build_darwin
-```
-If you want to compile linux system version on mac system, execute:
-```shell script
-make build_linux
-```
-You can also compile selectively, for example, you only need to compile cli and os scenes, then execute:
-```shell script
-make build_with cli os
-# If it is a mac system, run
-make build_with cli os_darwin
-# If you want to compile linux system version selectively, execute:
-ARGS="cli os" make build_with_linux
-```
-
-Arch Linux install [chaosblade-bin](https://aur.archlinux.org/packages/chaosblade-bin/)
-```bash
-yay -S chaosblade-bin
-```
+See [BUILD.md](BUILD.md) for the details.
 
 ## Bugs and Feedback
 For bug report, questions and discussions please submit [GitHub Issues](https://github.com/chaosblade-io/chaosblade/issues).
