@@ -20,10 +20,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
-	"k8s.io/klog/v2"
 	"strings"
 	"time"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"k8s.io/klog/v2"
 
 	"github.com/chaosblade-io/chaosblade-operator/pkg/apis/chaosblade/v1alpha1"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -68,9 +69,9 @@ func (e *Executor) SetChannel(channel spec.Channel) {
 
 var cli client.Client
 
-func QueryStatus(ctx context.Context, operation, kubeconfig string) (*spec.Response, bool) {
+func QueryStatus(ctx context.Context, operation, kubeconfig, proxyURL, token string) (*spec.Response, bool) {
 	uid := ctx.Value(spec.Uid).(string)
-	client, err := getClient(kubeconfig)
+	client, err := getClient(kubeconfig, proxyURL, token)
 	if err != nil {
 		log.Errorf(ctx, spec.K8sExecFailed.Sprintf("getClient", err))
 		return spec.ResponseFailWithResult(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, spec.K8sExecFailed.Sprintf("getClient", err)),
@@ -134,7 +135,9 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 			config = ""
 		}
 	}
-	client, err := getClient(config)
+	proxyURL := expModel.ActionFlags[KubectlProxyFlag.Name]
+	token := expModel.ActionFlags[TokenFlag.Name]
+	client, err := getClient(config, proxyURL, token)
 	if err != nil {
 		log.Errorf(ctx, spec.K8sExecFailed.Sprintf("getClient", err))
 		return spec.ResponseFailWithFlags(spec.K8sExecFailed, "getClient", err)
@@ -150,13 +153,13 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 				"not support destroy k8s experiments without uid")
 		}
 		operation = QueryDestroy
-		response, completed = e.destroy(ctx, client, config)
+		response, completed = e.destroy(ctx, client, config, proxyURL, token)
 	} else {
 		if expModel.ActionProcessHang {
 			expModel.ActionFlags["cgroup-root"] = "/host-sys/fs/cgroup"
 		}
 		operation = QueryCreate
-		response, completed = e.create(ctx, client, config, uid, expModel)
+		response, completed = e.create(ctx, client, config, proxyURL, token, uid, expModel)
 	}
 
 	var duration time.Duration
@@ -180,7 +183,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 				ticker.Stop()
 				break TickerLoop
 			default:
-				response, completed = QueryStatus(ctx, operation, config)
+				response, completed = QueryStatus(ctx, operation, config, proxyURL, token)
 				if completed {
 					return response
 				}
@@ -190,7 +193,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 	return response
 }
 
-func (*Executor) destroy(ctx context.Context, cli client.Client, config string) (*spec.Response, bool) {
+func (*Executor) destroy(ctx context.Context, cli client.Client, config, proxyURL, token string) (*spec.Response, bool) {
 	err := delete(ctx, cli)
 	if err != nil {
 		errMsg := spec.K8sExecFailed.Sprintf("delete", err)
@@ -199,10 +202,10 @@ func (*Executor) destroy(ctx context.Context, cli client.Client, config string) 
 		return spec.ResponseFailWithResult(spec.K8sExecFailed, CreateConfirmFailedStatusResult(uid, errMsg), "delete", err), true
 	}
 	// 查询资源
-	return QueryStatus(ctx, QueryDestroy, config)
+	return QueryStatus(ctx, QueryDestroy, config, proxyURL, token)
 }
 
-func (e *Executor) create(ctx context.Context, cli client.Client, kubeconfig string, uid string, expModel *spec.ExpModel) (*spec.Response, bool) {
+func (e *Executor) create(ctx context.Context, cli client.Client, kubeconfig, proxyURL, token, uid string, expModel *spec.ExpModel) (*spec.Response, bool) {
 	log.Infof(ctx, "create uid: %s, target: %s, scope: %s, action: %s", uid, expModel.Target, expModel.Scope, expModel.ActionName)
 	//log.Info("create", "uid", uid, "target", expModel.Target, "scope", expModel.Scope, "action", expModel.ActionName)
 	chaosBladeObj := convertExpModelToChaosBladeObject(uid, expModel)
@@ -216,7 +219,7 @@ func (e *Executor) create(ctx context.Context, cli client.Client, kubeconfig str
 	if resource.Status.Phase == v1alpha1.ClusterPhaseRunning {
 		return spec.ReturnSuccess(CreateStatusResult(uid, true, "", resource.Status.ExpStatuses)), true
 	}
-	response, flag := QueryStatus(ctx, QueryCreate, kubeconfig)
+	response, flag := QueryStatus(ctx, QueryCreate, kubeconfig, proxyURL, token)
 	return response, flag
 }
 
@@ -328,7 +331,7 @@ func convertExpModelToChaosBladeObject(uid string, expModel *spec.ExpModel) v1al
 func convertFlagsToResourceFlags(flags map[string]string) []v1alpha1.FlagSpec {
 	flagSpecs := make([]v1alpha1.FlagSpec, 0)
 	for name, values := range flags {
-		if name == KubeConfigFlag.Name || name == WaitingTimeFlag.Name {
+		if name == KubeConfigFlag.Name || name == WaitingTimeFlag.Name || name == KubectlProxyFlag.Name || name == TokenFlag.Name {
 			continue
 		}
 		valueArr := strings.Split(values, ",")
@@ -374,9 +377,9 @@ func update(cli client.Client, chaosblade *v1alpha1.ChaosBlade) error {
 	return cli.Update(context.TODO(), chaosblade)
 }
 
-func getClient(kubeconfig string) (client.Client, error) {
+func getClient(kubeconfig, proxyURL, token string) (client.Client, error) {
 	if cli == nil {
-		c, err := newClient(kubeconfig)
+		c, err := newClient(kubeconfig, proxyURL, token)
 		if err != nil {
 			return nil, err
 		}
@@ -385,10 +388,57 @@ func getClient(kubeconfig string) (client.Client, error) {
 	return cli, nil
 }
 
-func newClient(kubeConfig string) (client.Client, error) {
+func newClient(kubeConfig, proxyURL, token string) (client.Client, error) {
 	var clusterConfig *rest.Config
 	var err error
-	if kubeConfig == "" {
+
+	if proxyURL != "" {
+		if token != "" {
+			clusterConfig = &rest.Config{
+				Host:        proxyURL,
+				BearerToken: token,
+				TLSClientConfig: rest.TLSClientConfig{
+					Insecure: true,
+				},
+			}
+		} else if kubeConfig != "" {
+			clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+				&clientcmd.ClientConfigLoadingRules{
+					ExplicitPath: kubeConfig,
+				},
+				&clientcmd.ConfigOverrides{},
+			)
+			baseConfig, err := clientConfig.ClientConfig()
+			if err != nil {
+				return nil, err
+			}
+			clusterConfig = baseConfig
+			clusterConfig.Host = proxyURL
+			clusterConfig.TLSClientConfig = rest.TLSClientConfig{
+				Insecure: true,
+			}
+		} else {
+			clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+				&clientcmd.ClientConfigLoadingRules{},
+				&clientcmd.ConfigOverrides{},
+			)
+			baseConfig, err := clientConfig.ClientConfig()
+			if err != nil {
+				clusterConfig = &rest.Config{
+					Host: proxyURL,
+					TLSClientConfig: rest.TLSClientConfig{
+						Insecure: true,
+					},
+				}
+			} else {
+				clusterConfig = baseConfig
+				clusterConfig.Host = proxyURL
+				clusterConfig.TLSClientConfig = rest.TLSClientConfig{
+					Insecure: true,
+				}
+			}
+		}
+	} else if kubeConfig == "" {
 		clusterConfig, err = rest.InClusterConfig()
 		if err != nil {
 			return nil, err
@@ -424,16 +474,16 @@ func completed(operation string, statusResult StatusResult) bool {
 	return statuses != nil && len(statuses) > 0
 }
 
-func GetChaosBladeByName(name, kubeconfig string) (result *v1alpha1.ChaosBlade, err error) {
-	client, err := getClient(kubeconfig)
+func GetChaosBladeByName(name, kubeconfig, proxyURL, token string) (result *v1alpha1.ChaosBlade, err error) {
+	client, err := getClient(kubeconfig, proxyURL, token)
 	if err != nil {
 		return nil, err
 	}
 	return get(client, name)
 }
 
-func RemoveFinalizer(name, kubeconfig string) error {
-	cli, err := getClient(kubeconfig)
+func RemoveFinalizer(name, kubeconfig, proxyURL, token string) error {
+	cli, err := getClient(kubeconfig, proxyURL, token)
 	if err != nil {
 		return err
 	}

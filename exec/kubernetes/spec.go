@@ -34,6 +34,16 @@ var WaitingTimeFlag = &spec.ExpFlag{
 	Desc: "Waiting time for invoking, default value is 20s",
 }
 
+var KubectlProxyFlag = &spec.ExpFlag{
+	Name: "kubectl-proxy",
+	Desc: "Kubectl proxy URL for accessing Kubernetes API, e.g., http://localhost:8001",
+}
+
+var TokenFlag = &spec.ExpFlag{
+	Name: "token",
+	Desc: "Bearer token for Kubernetes API authentication",
+}
+
 //var log = logf.Log.WithName("Kubernetes")
 
 func NewCommandModelSpec() spec.ExpModelCommandSpec {
@@ -41,7 +51,7 @@ func NewCommandModelSpec() spec.ExpModelCommandSpec {
 		spec.BaseExpModelCommandSpec{
 			ExpActions: []spec.ExpActionCommandSpec{},
 			ExpFlags: []spec.ExpFlagSpec{
-				KubeConfigFlag, WaitingTimeFlag,
+				KubeConfigFlag, WaitingTimeFlag, KubectlProxyFlag, TokenFlag,
 			},
 		},
 	}
@@ -60,5 +70,9 @@ func (*CommandModelSpec) LongDesc() string {
 }
 
 func (*CommandModelSpec) Example() string {
-	return "blade create k8s node-cpu fullload --names cn-hangzhou.192.168.0.205 --cpu-percent 80 --kubeconfig ~/.kube/config"
+	return `blade create k8s node-cpu fullload --names cn-hangzhou.192.168.0.205 --cpu-percent 80 --kubeconfig ~/.kube/config
+
+# 使用 kubectl proxy 和 token 认证
+# 首先启动 kubectl proxy: kubectl proxy --port=8080
+blade create k8s node-cpu fullload --names cn-hangzhou.192.168.0.205 --cpu-percent 80 --kubectl-proxy http://localhost:8080 --token your-token-here`
 }
