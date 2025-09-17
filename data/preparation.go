@@ -122,12 +122,19 @@ func (s *Source) CheckAndInitPreTable() {
 		//os.Exit(1)
 	}
 	if exists {
-		// execute alter sql if exists
-		err := s.AlterPreparationTable(addPidColumn)
+		// check if pid column exists before adding it
+		pidColumnExists, err := s.ColumnExists("preparation", "pid")
 		if err != nil {
 			log.Fatalf(ctx, err.Error())
-			//log.Error(err, "AlterPreparationTable err", "addPidColumn", addPidColumn)
-			//os.Exit(1)
+		}
+		if !pidColumnExists {
+			// execute alter sql if column doesn't exist
+			err := s.AlterPreparationTable(addPidColumn)
+			if err != nil {
+				log.Fatalf(ctx, err.Error())
+				//log.Error(err, "AlterPreparationTable err", "addPidColumn", addPidColumn)
+				//os.Exit(1)
+			}
 		}
 	} else {
 		// execute create table

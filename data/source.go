@@ -105,3 +105,29 @@ func (s *Source) UpdateUserVersion(version int) error {
 func UpperFirst(str string) string {
 	return string(unicode.ToUpper(rune(str[0]))) + str[1:]
 }
+
+// ColumnExists checks if a column exists in the specified table
+func (s *Source) ColumnExists(tableName, columnName string) (bool, error) {
+	query := `SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`
+	stmt, err := s.DB.Prepare(query)
+	if err != nil {
+		return false, fmt.Errorf("prepare column exists query err, %s", err)
+	}
+	defer stmt.Close()
+
+	rows, err := stmt.Query(tableName, columnName)
+	if err != nil {
+		return false, fmt.Errorf("query column exists err, %s", err)
+	}
+	defer rows.Close()
+
+	var count int
+	if rows.Next() {
+		err = rows.Scan(&count)
+		if err != nil {
+			return false, fmt.Errorf("scan column count err, %s", err)
+		}
+	}
+
+	return count > 0, nil
+}
