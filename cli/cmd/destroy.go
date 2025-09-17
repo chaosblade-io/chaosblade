@@ -19,9 +19,10 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strconv"
 	"strings"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 
 	"github.com/chaosblade-io/chaosblade-operator/pkg/apis/chaosblade/v1alpha1"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
@@ -36,6 +37,8 @@ const (
 	ForceRemoveFlag = "force-remove"
 	ExpTargetFlag   = "target"
 	KubeconfigFlag  = "kubeconfig"
+	ProxyURLFlag    = "kubectl-proxy"
+	TokenFlag       = "token"
 )
 
 type DestroyCommand struct {
@@ -43,6 +46,7 @@ type DestroyCommand struct {
 	*baseExpCommandService
 	forceRemove           bool
 	expTarget, kubeconfig string
+	proxyURL, token       string
 }
 
 func (dc *DestroyCommand) Init() {
@@ -62,6 +66,8 @@ func (dc *DestroyCommand) Init() {
 	flags.StringVar(&dc.expTarget, ExpTargetFlag, "", "Specify experiment target, such as --target k8s. Used to destroy creating k8s experiments without using blade command")
 	flags.BoolVar(&dc.forceRemove, ForceRemoveFlag, false, "Force remove chaosblade resource or record even if destroy experiment failed")
 	flags.StringVar(&dc.kubeconfig, KubeconfigFlag, "", "The config file of kubernetes cluster. Used to destroy creating k8s experiments without using blade command")
+	flags.StringVar(&dc.proxyURL, ProxyURLFlag, "", "Kubectl proxy URL for accessing Kubernetes API, e.g., http://localhost:8001")
+	flags.StringVar(&dc.token, TokenFlag, "", "Bearer token for Kubernetes API authentication")
 	dc.baseExpCommandService = newBaseExpCommandService(dc)
 }
 
@@ -88,7 +94,7 @@ func (dc *DestroyCommand) runDestroyWithUid(ctx context.Context, cmd *cobra.Comm
 // destroyAndRemoveK8sExperimentWithoutRecordByForceFlag deletes and forcibly removes the chaosblade resources in the cluster by the forceRemoveFlag.
 func (dc *DestroyCommand) destroyAndRemoveK8sExperimentWithoutRecordByForceFlag(cmd *cobra.Command, uid string) error {
 	response, err := dc.destroyK8sExperimentWithoutRecord(uid)
-	removeResourceErr := dc.checkAndForceRemoveForK8sExp(uid, dc.kubeconfig)
+	removeResourceErr := dc.checkAndForceRemoveForK8sExp(uid, dc.kubeconfig, dc.proxyURL)
 	if err == nil && removeResourceErr == nil {
 		cmd.Println(response.Print())
 		return nil
@@ -115,7 +121,7 @@ func (dc *DestroyCommand) destroyAndRemoveExperimentByUidAndForceFlag(
 	removeRecordErr := dc.checkAndForceRemoveForExpRecord(uid)
 	var removeResourceErr error
 	if isK8sTarget {
-		removeResourceErr = dc.checkAndForceRemoveForK8sExp(uid, dc.kubeconfig)
+		removeResourceErr = dc.checkAndForceRemoveForK8sExp(uid, dc.kubeconfig, dc.proxyURL)
 	}
 	if err == nil {
 		if removeRecordErr == nil && removeResourceErr == nil {
@@ -158,13 +164,13 @@ func (dc *DestroyCommand) destroyExperimentByUid(model *data.ExperimentModel, ui
 	return spec.ReturnSuccess(expModel), nil
 }
 
-//destroyK8sExperimentWithoutRecord deletes chaosblade resources by name in the cluster.
+// destroyK8sExperimentWithoutRecord deletes chaosblade resources by name in the cluster.
 func (dc *DestroyCommand) destroyK8sExperimentWithoutRecord(uid string) (*spec.Response, error) {
 	if uid == "" || dc.kubeconfig == "" {
 		return nil, spec.ResponseFailWithFlags(spec.ParameterLess,
 			"usage: blade destroy UID --target k8s --kubeconfig KUBECONFIG")
 	}
-	exp, err := kubernetes.GetChaosBladeByName(uid, dc.kubeconfig)
+	exp, err := kubernetes.GetChaosBladeByName(uid, dc.kubeconfig, dc.proxyURL, dc.token)
 	if err != nil {
 		return nil, spec.ResponseFailWithFlags(spec.K8sExecFailed, "GetChaosBlade", err)
 	}
@@ -182,9 +188,9 @@ func (dc *DestroyCommand) destroyK8sExperimentWithoutRecord(uid string) (*spec.R
 }
 
 // checkAndForceRemoveForK8sExp deletes chaosblade resource by resource name if force-remove is true
-func (dc *DestroyCommand) checkAndForceRemoveForK8sExp(name, kubeconfig string) error {
+func (dc *DestroyCommand) checkAndForceRemoveForK8sExp(name, kubeconfig, proxyURL string) error {
 	if dc.forceRemove {
-		return kubernetes.RemoveFinalizer(name, kubeconfig)
+		return kubernetes.RemoveFinalizer(name, kubeconfig, proxyURL, dc.token)
 	}
 	return nil
 }

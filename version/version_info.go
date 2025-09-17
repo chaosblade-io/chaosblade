@@ -7,19 +7,19 @@ import "time"
 var (
 	// Ver 版本号
 	Ver = "1.7.5"
-
+	
 	// GitTag Git标签
 	GitTag = "v1.7.5"
-
+	
 	// GitCommit Git提交哈希
-	GitCommit = "145fdfd"
-
+	GitCommit = "6d290d7"
+	
 	// GitBranch Git分支
-	GitBranch = "master"
-
+	GitBranch = "feature-1184"
+	
 	// BuildTime 构建时间
-	BuildTime = "2025-09-14 10:38:58 UTC"
-
+	BuildTime = "2025-09-16 11:54:43 UTC"
+	
 	// BuildTimeParsed 解析后的构建时间
 	BuildTimeParsed, _ = time.Parse("2006-01-02 15:04:05 UTC", BuildTime)
 )
@@ -27,7 +27,7 @@ var (
 // GetVersionInfo 获取完整的版本信息
 func GetVersionInfo() map[string]string {
 	return map[string]string{
-		"version":   Ver,
+		"version":    Ver,
 		"gitTag":    GitTag,
 		"gitCommit": GitCommit,
 		"gitBranch": GitBranch,

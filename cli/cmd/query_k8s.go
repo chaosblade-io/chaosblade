@@ -19,6 +19,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 
 	"github.com/spf13/cobra"
@@ -29,6 +30,8 @@ import (
 type QueryK8sCommand struct {
 	baseCommand
 	kubeconfig string
+	proxyURL   string
+	token      string
 }
 
 func (q *QueryK8sCommand) Init() {
@@ -43,16 +46,21 @@ func (q *QueryK8sCommand) Init() {
 		Example: q.queryK8sExample(),
 	}
 	q.command.Flags().StringVarP(&q.kubeconfig, "kubeconfig", "k", "", "the kubeconfig path")
+	q.command.Flags().StringVar(&q.proxyURL, "kubectl-proxy", "", "Kubectl proxy URL for accessing Kubernetes API, e.g., http://localhost:8001")
+	q.command.Flags().StringVar(&q.token, "token", "", "Bearer token for Kubernetes API authentication")
 }
 
 func (q *QueryK8sCommand) queryK8sExample() string {
-	return `blade query k8s create 29c3f9dab4abbc79`
+	return `blade query k8s create 29c3f9dab4abbc79
+
+# 使用 kubectl proxy 查询状态
+blade query k8s create 29c3f9dab4abbc79 --kubectl-proxy http://localhost:8001`
 }
 
 // queryK8sExpStatus by uid
 func (q *QueryK8sCommand) queryK8sExpStatus(command *cobra.Command, cmd, uid string) error {
 	ctx := context.WithValue(context.Background(), spec.Uid, uid)
-	response, _ := kubernetes.QueryStatus(ctx, cmd, q.kubeconfig)
+	response, _ := kubernetes.QueryStatus(ctx, cmd, q.kubeconfig, q.proxyURL, q.token)
 	if response.Success {
 		command.Println(response.Print())
 	} else {
