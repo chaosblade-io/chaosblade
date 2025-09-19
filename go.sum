@@ -111,8 +111,8 @@ github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5 h1://NZAvAyV0zQg5Zi/R
 github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5/go.mod h1:x8HEXMux6qrtfF3c/WyX7OnNrMkN3GFr/S9kjHVpg2M=
 github.com/chaosblade-io/chaosblade-exec-os v1.7.5 h1:86QqPdi22QguAExxO3obJrK6ERgqktMAZNekSIid7rw=
 github.com/chaosblade-io/chaosblade-exec-os v1.7.5/go.mod h1:KNr5x3ayQL6JxEheYzt45kJvfYn8k8PyphtBZYT6+o8=
-github.com/chaosblade-io/chaosblade-operator v1.7.5 h1:hGzy/aebExb7pRYBaXhDQ2Jh2Vv8vB0mul1JzQ8YnhI=
-github.com/chaosblade-io/chaosblade-operator v1.7.5/go.mod h1:e03EZtZPG0xjLGdAXzdbCRDyqDGYUC+VftAVnxCxZ0k=
+github.com/chaosblade-io/chaosblade-operator v1.7.6-0.20250918100041-80377c5f1d0f h1:U/xO90ESvgrpf3WLkzEMK876d2mAFuSs4/5HUA7lFgA=
+github.com/chaosblade-io/chaosblade-operator v1.7.6-0.20250918100041-80377c5f1d0f/go.mod h1:e03EZtZPG0xjLGdAXzdbCRDyqDGYUC+VftAVnxCxZ0k=
 github.com/chaosblade-io/chaosblade-spec-go v1.7.5 h1:wt+N/Kzxc9kyyKnacEfSLEPUT6dzH+TLonq/tlN1pic=
 github.com/chaosblade-io/chaosblade-spec-go v1.7.5/go.mod h1:QrsUvbhnSmI7SjsKKdNM+F8MnkEE9iIZg2xV425nKsY=
 github.com/checkpoint-restore/go-criu/v4 v4.1.0/go.mod h1:xUQBLp4RLc5zJtWY++yjOoMoB5lihDt7fai+75m+rGw=
