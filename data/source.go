@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"path"
 	"sync"
 	"unicode"
@@ -66,8 +67,48 @@ func (s *Source) init() {
 	s.CheckAndInitPreTable()
 }
 
+// GetDataFilePath gets the data file path.
+// Prioritizes reading from the CHAOSBLADE_DATAFILE_PATH environment variable.
+// If CHAOSBLADE_DATAFILE_PATH is a directory, it is used as the directory for dataFile.
+// If CHAOSBLADE_DATAFILE_PATH is a file, it is used as the file for dataFile.
+// If CHAOSBLADE_DATAFILE_PATH is not specified, the original logic is used.
+func GetDataFilePath() string {
+	envPath := os.Getenv("CHAOSBLADE_DATAFILE_PATH")
+	if envPath == "" {
+		return path.Join(util.GetProgramPath(), dataFile)
+	}
+
+	fileInfo, err := os.Stat(envPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if path.Ext(envPath) != "" {
+				parentDir := path.Dir(envPath)
+				if mkdirErr := os.MkdirAll(parentDir, 0755); mkdirErr != nil {
+					log.Warnf(context.Background(), "failed to create parent directory %s, using default path: %s", parentDir, mkdirErr.Error())
+					return path.Join(util.GetProgramPath(), dataFile)
+				}
+				return envPath
+			} else {
+				if mkdirErr := os.MkdirAll(envPath, 0755); mkdirErr != nil {
+					log.Warnf(context.Background(), "failed to create directory %s, using default path: %s", envPath, mkdirErr.Error())
+					return path.Join(util.GetProgramPath(), dataFile)
+				}
+				return path.Join(envPath, dataFile)
+			}
+		}
+		log.Warnf(context.Background(), "failed to stat path %s, using default path: %s", envPath, err.Error())
+		return path.Join(util.GetProgramPath(), dataFile)
+	}
+
+	if fileInfo.IsDir() {
+		return path.Join(envPath, dataFile)
+	} else {
+		return envPath
+	}
+}
+
 func getConnection() *sql.DB {
-	database, err := sql.Open("sqlite", path.Join(util.GetProgramPath(), dataFile))
+	database, err := sql.Open("sqlite", GetDataFilePath())
 	if err != nil {
 		log.Fatalf(context.Background(), "open data file err, %s", err.Error())
 		//log.Error(err, "open data file err")
