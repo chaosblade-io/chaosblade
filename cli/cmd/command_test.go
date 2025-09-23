@@ -73,7 +73,7 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 	for _, tt := range tests {
 		got, err := bc.recordExpModel(tt.input.commandPath,
 			createExpModel(tt.input.target, tt.input.scope, tt.input.action, tt.input.command))
-		if (err != nil) != tt.expect.err {
+		if !err.Success != tt.expect.err {
 			t.Errorf("unexpected result: %t, expected: %t", err != nil, tt.expect.err)
 		}
 		validateExperimentModel(got, tt.expect.model, t)
