@@ -19,17 +19,16 @@ package jvm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
-
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-
 	"github.com/chaosblade-io/chaosblade/data"
 )
 
@@ -70,7 +69,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 	suid, isDestroy := spec.IsDestroy(ctx)
 	record, err := e.getRecordFromDB(ctx, processName, processId)
 	if err != nil {
-		log.Errorf(ctx, spec.DatabaseError.Sprintf("get",
+		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("get",
 			fmt.Sprintf("where by processName:%s or pid%s", processName, processId), err.Error()))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "get",
 			fmt.Sprintf("where by processName:%s or pid%s", processName, processId), err.Error())
@@ -86,7 +85,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		if port == "" {
 			if suid == spec.UnknownUid {
 				if processName == "" && processId == "" {
-					log.Errorf(ctx, spec.ParameterLess.Sprintf("process|pid"))
+					log.Errorf(ctx, "%s", spec.ParameterLess.Sprintf("process|pid"))
 					return spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 				}
 			}
@@ -99,7 +98,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 			}
 			username, err := getUsername(processId)
 			if err != nil {
-				log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(processId, err))
+				log.Errorf(ctx, "%s", spec.ProcessGetUsernameFailed.Sprintf(processId, err))
 				return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, processId, err)
 			}
 			// get port from sandbox.token
@@ -112,7 +111,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		if port == "" || err != nil {
 			log.Warnf(ctx, "select record fail, uid: %s, err: %v", uid, err)
 			if processName == "" && processId == "" {
-				log.Errorf(ctx, spec.ParameterLess.Sprintf("process|pid"))
+				log.Errorf(ctx, "%s", spec.ParameterLess.Sprintf("process|pid"))
 				return spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 			}
 		}
@@ -161,19 +160,19 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 		result, err, code = util.PostCurl(url, body, "")
 	}
 	if err != nil {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code == 200 {
 		var resp spec.Response
 		err := json.Unmarshal([]byte(result), &resp)
 		if err != nil {
-			log.Errorf(ctx, spec.ResultUnmarshalFailed.Sprintf(result, err))
+			log.Errorf(ctx, "%s", spec.ResultUnmarshalFailed.Sprintf(result, err))
 			return spec.ResponseFailWithFlags(spec.ResultUnmarshalFailed, result, err)
 		}
 		return &resp
 	}
-	log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
+	log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, result))
 	return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 }
 
@@ -197,7 +196,7 @@ func (e *Executor) createUrl(ctx context.Context, port string, model *spec.ExpMo
 	// encode
 	bytes, err := json.Marshal(bodyMap)
 	if err != nil {
-		log.Warnf(ctx, spec.ResultMarshalFailed.Sprintf(bodyMap, err))
+		log.Warnf(ctx, "%s", spec.ResultMarshalFailed.Sprintf(bodyMap, err))
 		return "", nil, spec.ResponseFailWithFlags(spec.ResultMarshalFailed, bodyMap, err)
 	}
 	return url, bytes, nil
@@ -223,39 +222,39 @@ func (e *Executor) QueryStatus(ctx context.Context) *spec.Response {
 	uid := ctx.Value(spec.Uid).(string)
 	experimentModel, err := db.QueryExperimentModelByUid(uid)
 	if err != nil {
-		log.Errorf(ctx, spec.DatabaseError.Sprintf("query", err))
+		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if experimentModel == nil {
-		log.Errorf(ctx, spec.DataNotFound.Sprintf(uid))
+		log.Errorf(ctx, "%s", spec.DataNotFound.Sprintf(uid))
 		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	// get process flag
 	process := getProcessFlagFromExpRecord(experimentModel)
 	record, err := e.getRecordFromDB(ctx, process, "")
 	if err != nil {
-		log.Errorf(ctx, spec.DatabaseError.Sprintf("query", err))
+		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil {
-		log.Errorf(ctx, spec.DataNotFound.Sprintf(uid))
+		log.Errorf(ctx, "%s", spec.DataNotFound.Sprintf(uid))
 		return spec.ResponseFailWithFlags(spec.DataNotFound, uid)
 	}
 	port := record.Port
 	url := e.sandboxUrl(port, e.getStatusRequestPath(uid))
 	result, err, code := util.Curl(ctx, url)
 	if err != nil {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code != 200 {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, result))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	var resp spec.Response
 	err = json.Unmarshal([]byte(result), &resp)
 	if err != nil {
-		log.Errorf(ctx, spec.ResultUnmarshalFailed.Sprintf(result, err))
+		log.Errorf(ctx, "%s", spec.ResultUnmarshalFailed.Sprintf(result, err))
 		return spec.ResponseFailWithFlags(spec.ResultUnmarshalFailed, result, err)
 	}
 	return &resp
@@ -267,7 +266,7 @@ func (e *Executor) getRecordFromDB(ctx context.Context, processName, processId s
 	if processName != "" || processId != "" {
 		pid, response := CheckFlagValues(ctx, processName, processId)
 		if !response.Success {
-			return nil, fmt.Errorf(response.Err)
+			return nil, errors.New(response.Err)
 		}
 		processId = pid
 	}
@@ -304,16 +303,16 @@ func CheckFlagValues(ctx context.Context, processName, processId string) (string
 	cl := channel.NewLocalChannel()
 	if processName == "" {
 		if processId == "" {
-			log.Errorf(ctx, spec.ParameterLess.Sprintf("process|pid"))
+			log.Errorf(ctx, "%s", spec.ParameterLess.Sprintf("process|pid"))
 			return "", spec.ResponseFailWithFlags(spec.ParameterLess, "process|pid")
 		}
 		exists, err := cl.ProcessExists(processId)
 		if err != nil {
-			log.Errorf(ctx, spec.ProcessJudgeExistFailed.Sprintf(processId, err))
+			log.Errorf(ctx, "%s", spec.ProcessJudgeExistFailed.Sprintf(processId, err))
 			return "", spec.ResponseFailWithFlags(spec.ProcessJudgeExistFailed, processId, err)
 		}
 		if !exists {
-			log.Errorf(ctx, spec.ParameterInvalidProName.Sprintf("pid", processId))
+			log.Errorf(ctx, "%s", spec.ParameterInvalidProName.Sprintf("pid", processId))
 			return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProName, "pid", processId)
 		}
 	}
@@ -324,23 +323,23 @@ func CheckFlagValues(ctx context.Context, processName, processId string) (string
 		ctx = context.WithValue(ctx, channel.ExcludeProcessKey, "blade")
 		pids, err := cl.GetPidsByProcessName(processName, ctx)
 		if err != nil {
-			log.Errorf(ctx, spec.ProcessIdByNameFailed.Sprintf(processName, err))
+			log.Errorf(ctx, "%s", spec.ProcessIdByNameFailed.Sprintf(processName, err))
 			return "", spec.ResponseFailWithFlags(spec.ProcessIdByNameFailed, processName, err)
 		}
 		if pids == nil || len(pids) == 0 {
-			log.Errorf(ctx, spec.ParameterInvalidProName.Sprintf("process", processName))
+			log.Errorf(ctx, "%s", spec.ParameterInvalidProName.Sprintf("process", processName))
 			return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProName, "process", processName)
 		}
 		if len(pids) == 1 {
 			if processId == "" {
 				processId = pids[0]
 			} else if processId != pids[0] {
-				log.Errorf(ctx, spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
+				log.Errorf(ctx, "%s", spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
 				return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProIdNotByName, processName, processId)
 			}
 		} else {
 			if processId == "" {
-				log.Errorf(ctx, spec.ParameterInvalidTooManyProcess.Sprintf(processName))
+				log.Errorf(ctx, "%s", spec.ParameterInvalidTooManyProcess.Sprintf(processName))
 				return "", spec.ResponseFailWithFlags(spec.ParameterInvalidTooManyProcess, processName)
 			} else {
 				var contains bool
@@ -351,7 +350,7 @@ func CheckFlagValues(ctx context.Context, processName, processId string) (string
 					}
 				}
 				if !contains {
-					log.Errorf(ctx, spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
+					log.Errorf(ctx, "%s", spec.ParameterInvalidProIdNotByName.Sprintf(processName, processId))
 					return "", spec.ResponseFailWithFlags(spec.ParameterInvalidProIdNotByName, processName, processId)
 				}
 			}
@@ -370,12 +369,12 @@ func Prepare(ctx context.Context, processName, processId, javaHome string) (resp
 		// get port from local port
 		port, err = getAndCacheSandboxPort()
 		if err != nil {
-			log.Errorf(ctx, spec.SandboxGetPortFailed.Sprintf(err))
+			log.Errorf(ctx, "%s", spec.SandboxGetPortFailed.Sprintf(err))
 			return spec.ResponseFailWithFlags(spec.SandboxGetPortFailed, err), port
 		}
 		record, err = insertPrepareRecord("jvm", processName, port, processId)
 		if err != nil {
-			log.Errorf(ctx, spec.DatabaseError.Sprintf("insert", err))
+			log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("insert", err))
 			return spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err), port
 		}
 	}
@@ -415,7 +414,7 @@ func Revoke(ctx context.Context, record *data.PreparationRecord, processName, pr
 		}
 		username, err := getUsername(processId)
 		if err != nil {
-			log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(processId, err))
+			log.Errorf(ctx, "%s", spec.ProcessGetUsernameFailed.Sprintf(processId, err))
 			return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, processId, err)
 		}
 		// get port from sandbox.token

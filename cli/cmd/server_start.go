@@ -19,13 +19,13 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"net/http"
 	"os"
 	"path"
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
@@ -134,7 +134,7 @@ func (ssc *StartServerCommand) start0() {
 
 func Register(requestPath string) {
 	http.HandleFunc(requestPath, func(writer http.ResponseWriter, request *http.Request) {
-		fmt.Fprintf(writer, spec.ReturnFail(spec.CommandIllegal, "Server mode is disabled").Print())
+		fmt.Fprint(writer, spec.ReturnFail(spec.CommandIllegal, "Server mode is disabled").Print())
 	})
 }
 

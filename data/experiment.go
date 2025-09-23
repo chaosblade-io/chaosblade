@@ -20,10 +20,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strings"
 	"time"
 
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
@@ -95,14 +95,14 @@ func (s *Source) CheckAndInitExperimentTable() {
 	exists, err := s.ExperimentTableExists()
 	ctx := context.Background()
 	if err != nil {
-		log.Fatalf(ctx, err.Error())
+		log.Fatalf(ctx, "%s", err.Error())
 		//log.Error(err, "ExperimentTableExists err")
 		//os.Exit(1)
 	}
 	if !exists {
 		err = s.InitExperimentTable()
 		if err != nil {
-			log.Fatalf(ctx, err.Error())
+			log.Fatalf(ctx, "%s", err.Error())
 			//log.Error(err, "InitExperimentTable err")
 			//os.Exit(1)
 		}

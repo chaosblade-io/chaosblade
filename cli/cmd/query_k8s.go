@@ -18,13 +18,11 @@ package cmd
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-
-	"github.com/spf13/cobra"
-
 	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
+	"github.com/spf13/cobra"
 )
 
 type QueryK8sCommand struct {
@@ -64,7 +62,7 @@ func (q *QueryK8sCommand) queryK8sExpStatus(command *cobra.Command, cmd, uid str
 	if response.Success {
 		command.Println(response.Print())
 	} else {
-		return fmt.Errorf(response.Error())
+		return errors.New(response.Error())
 	}
 	return nil
 }

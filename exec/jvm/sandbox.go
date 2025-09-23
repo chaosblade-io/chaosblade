@@ -18,6 +18,7 @@ package jvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	osuser "os/user"
@@ -69,10 +70,10 @@ func check(ctx context.Context, port string) *spec.Response {
 		return spec.ReturnSuccess(result)
 	}
 	if err != nil {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
-	log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
+	log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, result))
 	return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 }
 
@@ -81,11 +82,11 @@ func active(ctx context.Context, port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids=chaosblade")
 	result, err, code := util.Curl(ctx, url)
 	if err != nil {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code != 200 {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, result))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	return spec.ReturnSuccess("success")
@@ -98,7 +99,7 @@ func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Respo
 	if err != nil {
 		userid, err = getUserid(ctx, pid)
 		if err != nil {
-			log.Errorf(ctx, spec.ProcessGetUsernameFailed.Sprintf(pid, err))
+			log.Errorf(ctx, "%s", spec.ProcessGetUsernameFailed.Sprintf(pid, err))
 			return spec.ResponseFailWithFlags(spec.ProcessGetUsernameFailed, pid, err), "", ""
 		}
 	}
@@ -107,7 +108,7 @@ func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Respo
 	log.Infof(ctx, "javaBin: %s, javaHome: %s, toolsJar: %s, username: %s, userid: %s", javaBin, javaHome, toolsJar, username, userid)
 	token, err := getSandboxToken(ctx)
 	if err != nil {
-		log.Errorf(ctx, spec.SandboxCreateTokenFailed.Sprintf(err))
+		log.Errorf(ctx, "%s", spec.SandboxCreateTokenFailed.Sprintf(err))
 		return spec.ResponseFailWithFlags(spec.SandboxCreateTokenFailed, err), username, userid
 	}
 	javaArgs := getAttachJvmOpts(toolsJar, token, port, pid)
@@ -159,7 +160,7 @@ func attach(ctx context.Context, pid, port string, javaHome string) (*spec.Respo
 	response = cl.Run(ctx, "", osCmd)
 	// if attach successfully, the sandbox-agent.jar will write token to local file
 	if !response.Success {
-		log.Errorf(ctx, spec.OsCmdExecFailed.Sprintf(osCmd, response.Err))
+		log.Errorf(ctx, "%s", spec.OsCmdExecFailed.Sprintf(osCmd, response.Err))
 		return spec.ResponseFailWithFlags(spec.OsCmdExecFailed, osCmd, response.Err), username, userid
 	}
 	return response, username, userid
@@ -180,7 +181,7 @@ func getSandboxToken(ctx context.Context) (string, error) {
 	// create sandbox token
 	response := cl.Run(ctx, "date", "| head | cksum | sed 's/ //g'")
 	if !response.Success {
-		return "", fmt.Errorf(response.Err)
+		return "", errors.New(response.Err)
 	}
 	token := strings.TrimSpace(response.Result.(string))
 	return token, nil
@@ -292,7 +293,7 @@ func getPortFromSandboxToken(username string) (port string, err error) {
 		fmt.Sprintf(`%s %s | tail -1 | awk -F ";" '{print $4}'`,
 			DefaultNamespace, getSandboxTokenFile(username)))
 	if !response.Success {
-		return "", fmt.Errorf(response.Err)
+		return "", errors.New(response.Err)
 	}
 	if response.Result == nil {
 		return "", fmt.Errorf("get empty from sandbox token file")
@@ -313,11 +314,11 @@ func shutdown(ctx context.Context, port string) *spec.Response {
 	url := getSandboxUrl(port, "sandbox-control/shutdown", "")
 	result, err, code := util.Curl(ctx, url)
 	if err != nil {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	if code != 200 {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, result))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, result))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
 	return spec.ReturnSuccess("success")
