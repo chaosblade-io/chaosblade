@@ -1,6 +1,6 @@
 module github.com/chaosblade-io/chaosblade
 
-go 1.20
+go 1.25
 
 require (
 	github.com/chaosblade-io/chaosblade-exec-cloud v1.7.5
