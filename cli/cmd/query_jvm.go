@@ -18,12 +18,11 @@ package cmd
 
 import (
 	"context"
-	"fmt"
+	"errors"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-
-	"github.com/spf13/cobra"
-
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/spf13/cobra"
 )
 
 type QueryJvmCommand struct {
@@ -37,7 +36,7 @@ func (qjc *QueryJvmCommand) Init() {
 		Long:  "Query hit counts of the specify experiment",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx := context.WithValue(context.Background(), spec.Uid,  args[0])
+			ctx := context.WithValue(context.Background(), spec.Uid, args[0])
 			return qjc.queryJvmExpStatus(ctx, cmd)
 		},
 		Example: qjc.queryJvmExample(),
@@ -54,7 +53,7 @@ func (qjc *QueryJvmCommand) queryJvmExpStatus(ctx context.Context, command *cobr
 	if response.Success {
 		command.Println(response.Print())
 	} else {
-		return fmt.Errorf(response.Error())
+		return errors.New(response.Error())
 	}
 	return nil
 }

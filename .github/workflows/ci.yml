@@ -7,56 +7,56 @@ on:
     branches: [ master, main ]
 
 env:
-  GO_VERSION: '1.20'
+  GO_VERSION: '1.25'
 
 jobs:
   test:
     name: Test on Linux AMD64
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: ${{ env.GO_VERSION }}
-        
-    - name: Cache Go modules
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
-    - name: Verify dependencies
-      run: go mod verify
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
-    - name: Run vet
-      run: go vet ./...
+      - name: Verify dependencies
+        run: go mod verify
 
-    - name: Run tests
-      run: make test
+      - name: Run vet
+        run: go vet ./...
 
-    - name: Upload coverage reports
-      uses: codecov/codecov-action@v3
-      with:
-        file: ./coverage.txt
-        flags: unittests
-        name: codecov-umbrella
+      - name: Run tests
+        run: make test
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.txt
+          flags: unittests
+          name: codecov-umbrella
 
   # 多平台CLI编译
   build-multi-platform:
     name: Build CLI - ${{ matrix.os }}-${{ matrix.arch }}
     runs-on: ubuntu-latest
     needs: test
-    
+
     strategy:
       matrix:
         include:
@@ -74,40 +74,40 @@ jobs:
             target: darwin_arm64
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: ${{ env.GO_VERSION }}
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
-    - name: Cache Go modules
-      uses: actions/cache@v3
-      with:
-        path: |
-          ~/.cache/go-build
-          ~/go/pkg/mod
-        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go-
+      - name: Cache Go modules
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
 
-    - name: Install musl-gcc for static linking (Linux only)
-      if: matrix.os == 'linux'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y musl-tools
-        
-    - name: Build CLI for ${{ matrix.target }}
-      run: make ${{ matrix.target }} MODULES=cli
+      - name: Install musl-gcc for static linking (Linux only)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
-    - name: Verify file format and structure
-      run: |
-        cd target/chaosblade-*-${{ matrix.target }}
-        # 校验文件格式
-        echo "Verifying file structure for ${{ matrix.target }}..."
-        ls -la
-        echo "Checking blade binary..."
-        file ./blade
+      - name: Build CLI for ${{ matrix.target }}
+        run: make ${{ matrix.target }} MODULES=cli
+
+      - name: Verify file format and structure
+        run: |
+          cd target/chaosblade-*-${{ matrix.target }}
+          # 校验文件格式
+          echo "Verifying file structure for ${{ matrix.target }}..."
+          ls -la
+          echo "Checking blade binary..."
+          file ./blade
 
 

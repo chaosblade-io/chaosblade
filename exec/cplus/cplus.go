@@ -19,12 +19,12 @@ package cplus
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
@@ -56,18 +56,18 @@ func preCheck(ctx context.Context, port string) *spec.Response {
 	}
 	// check chaosblade-exec-cplus.jar file exists or not
 	if !util.IsExist(cplusBinPath) {
-		log.Errorf(ctx, spec.ChaosbladeFileNotFound.Sprintf(cplusBinPath))
+		log.Errorf(ctx, "%s", spec.ChaosbladeFileNotFound.Sprintf(cplusBinPath))
 		return spec.ResponseFailWithFlags(spec.ChaosbladeFileNotFound, cplusBinPath)
 	}
 	// check script file
 	if !util.IsExist(scriptDefaultPath) {
-		log.Errorf(ctx, spec.ChaosbladeFileNotFound.Sprintf(scriptDefaultPath))
+		log.Errorf(ctx, "%s", spec.ChaosbladeFileNotFound.Sprintf(scriptDefaultPath))
 		return spec.ResponseFailWithFlags(spec.ChaosbladeFileNotFound, scriptDefaultPath)
 	}
 	// check the port has been used or not
 	portInUse := util.CheckPortInUse(port)
 	if portInUse {
-		log.Errorf(ctx, spec.ParameterInvalid.Sprintf("port", port, "the port has been used"))
+		log.Errorf(ctx, "%s", spec.ParameterInvalid.Sprintf("port", port, "the port has been used"))
 		return spec.ResponseFailWithFlags(spec.ParameterInvalid, port, "the port has been used")
 	}
 	return spec.ReturnSuccess("success")
@@ -94,7 +94,7 @@ func postCheck(ctx context.Context, port string) *spec.Response {
 	url := getProxyServiceUrl(port, "status")
 	result, err, _ := util.Curl(ctx, url)
 	if err != nil {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(url, err))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
 	}
 	return spec.ReturnSuccess(result)
@@ -112,7 +112,7 @@ func Revoke(ctx context.Context, port string) *spec.Response {
 	ctx = context.WithValue(ctx, channel.ExcludeProcessKey, "blade")
 	pids, err := channel.NewLocalChannel().GetPidsByProcessName(ApplicationName, ctx)
 	if err != nil {
-		log.Errorf(ctx, spec.ProcessIdByNameFailed.Sprintf(ApplicationName, err))
+		log.Errorf(ctx, "%s", spec.ProcessIdByNameFailed.Sprintf(ApplicationName, err))
 		return spec.ResponseFailWithFlags(spec.ProcessIdByNameFailed, ApplicationName, err)
 	}
 	if len(pids) > 0 {
@@ -124,7 +124,7 @@ func Revoke(ctx context.Context, port string) *spec.Response {
 	// revoke failed if the check operation returns success
 	response := postCheck(ctx, port)
 	if response.Success {
-		log.Errorf(ctx, spec.HttpExecFailed.Sprintf(getProxyServiceUrl(port, RemoveAction), "process exists"))
+		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(getProxyServiceUrl(port, RemoveAction), "process exists"))
 	}
 	return spec.ReturnSuccess("success")
 }

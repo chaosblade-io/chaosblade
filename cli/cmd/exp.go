@@ -23,23 +23,21 @@ import (
 
 	"github.com/chaosblade-io/chaosblade-exec-cri/exec"
 	"github.com/chaosblade-io/chaosblade-operator/exec/model"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
-	"github.com/chaosblade-io/chaosblade/exec/cloud"
-	"github.com/chaosblade-io/chaosblade/exec/middleware"
-
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	specutil "github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
-
+	"github.com/chaosblade-io/chaosblade/exec/cloud"
 	"github.com/chaosblade-io/chaosblade/exec/cplus"
 	"github.com/chaosblade-io/chaosblade/exec/cri"
 	"github.com/chaosblade-io/chaosblade/exec/docker"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
 	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
+	"github.com/chaosblade-io/chaosblade/exec/middleware"
 	"github.com/chaosblade-io/chaosblade/exec/os"
 	"github.com/chaosblade-io/chaosblade/version"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // ExpActionFlags is used to receive experiment action flags
@@ -427,7 +425,7 @@ func addTimeoutFlag(flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
 // checkError for db operation
 func checkError(err error) {
 	if err != nil {
-		log.Warnf(context.Background(), err.Error())
+		log.Warnf(context.Background(), "%s", err.Error())
 		//log.V(-1).Info(err.Error())
 	}
 }
