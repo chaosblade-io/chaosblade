@@ -35,6 +35,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
+      - name: Run code style and import order verification
+        run: make verify
+
       - name: Verify dependencies
         run: go mod verify
 
