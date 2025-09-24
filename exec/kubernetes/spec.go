@@ -44,8 +44,7 @@ var TokenFlag = &spec.ExpFlag{
 	Desc: "Bearer token for Kubernetes API authentication",
 }
 
-//var log = logf.Log.WithName("Kubernetes")
-
+// var log = logf.Log.WithName("Kubernetes")
 func NewCommandModelSpec() spec.ExpModelCommandSpec {
 	return &CommandModelSpec{
 		spec.BaseExpModelCommandSpec{

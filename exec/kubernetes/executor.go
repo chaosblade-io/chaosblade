@@ -23,10 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chaosblade-io/chaosblade-operator/pkg/apis/chaosblade/v1alpha1"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
@@ -36,6 +32,11 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/chaosblade-io/chaosblade-operator/pkg/apis/chaosblade/v1alpha1"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 const (
@@ -52,8 +53,7 @@ func init() {
 	flag.Parse()
 }
 
-type Executor struct {
-}
+type Executor struct{}
 
 func NewExecutor() spec.Executor {
 	return &Executor{}
@@ -206,7 +206,7 @@ func (*Executor) destroy(ctx context.Context, cli client.Client, config, proxyUR
 
 func (e *Executor) create(ctx context.Context, cli client.Client, kubeconfig, proxyURL, token, uid string, expModel *spec.ExpModel) (*spec.Response, bool) {
 	log.Infof(ctx, "create uid: %s, target: %s, scope: %s, action: %s", uid, expModel.Target, expModel.Scope, expModel.ActionName)
-	//log.Info("create", "uid", uid, "target", expModel.Target, "scope", expModel.Scope, "action", expModel.ActionName)
+	// log.Info("create", "uid", uid, "target", expModel.Target, "scope", expModel.Scope, "action", expModel.ActionName)
 	chaosBladeObj := convertExpModelToChaosBladeObject(uid, expModel)
 	var err error
 	resource, err := create(cli, &chaosBladeObj)
@@ -223,7 +223,8 @@ func (e *Executor) create(ctx context.Context, cli client.Client, kubeconfig, pr
 }
 
 func (e *Executor) checkCreateStatus(ctx context.Context, uid string, store cache.Store, cli client.Client,
-	resource *v1alpha1.ChaosBlade) *spec.Response {
+	resource *v1alpha1.ChaosBlade,
+) *spec.Response {
 	var chaosblade *v1alpha1.ChaosBlade
 	item, _, err := store.GetByKey(resource.Name)
 	if err != nil || item == nil {
@@ -349,7 +350,7 @@ func get(cli client.Client, name string) (result *v1alpha1.ChaosBlade, err error
 		APIVersion: "chaosblade.io/v1alpha1",
 		Kind:       "ChaosBlade",
 	}
-	return
+	return result, err
 }
 
 func create(cli client.Client, chaosblade *v1alpha1.ChaosBlade) (result *v1alpha1.ChaosBlade, err error) {

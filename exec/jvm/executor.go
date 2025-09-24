@@ -29,6 +29,7 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
+
 	"github.com/chaosblade-io/chaosblade/data"
 )
 
@@ -40,8 +41,7 @@ type Executor struct {
 	channel spec.Channel
 }
 
-//var log = logf.Log.WithName("jvm")
-
+// var log = logf.Log.WithName("jvm")
 func NewExecutor() *Executor {
 	return &Executor{
 		Uri:     DefaultUri,
@@ -362,7 +362,7 @@ func CheckFlagValues(ctx context.Context, processName, processId string) (string
 func Prepare(ctx context.Context, processName, processId, javaHome string) (response *spec.Response, port string) {
 	processId, response = CheckFlagValues(ctx, processName, processId)
 	if !response.Success {
-		return
+		return response, port
 	}
 	record, err := db.QueryRunningPreByTypeAndProcess("jvm", processName, processId)
 	if record == nil || err != nil || record.Uid == "" {

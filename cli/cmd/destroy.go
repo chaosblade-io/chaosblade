@@ -22,12 +22,12 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade-operator/pkg/apis/chaosblade/v1alpha1"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade/data"
 	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
@@ -116,7 +116,8 @@ func (dc *DestroyCommand) destroyAndRemoveK8sExperimentWithoutRecordByForceFlag(
 
 // destroyAndRemoveExperimentByUidAndForceFlag destroys and forcibly deletes experiments with local records, including k8s experiments.
 func (dc *DestroyCommand) destroyAndRemoveExperimentByUidAndForceFlag(
-	cmd *cobra.Command, err error, model *data.ExperimentModel, uid string, isK8sTarget bool) error {
+	cmd *cobra.Command, err error, model *data.ExperimentModel, uid string, isK8sTarget bool,
+) error {
 	response, err := dc.destroyExperimentByUid(model, uid)
 	removeRecordErr := dc.checkAndForceRemoveForExpRecord(uid)
 	var removeResourceErr error
@@ -218,8 +219,9 @@ func (dc *DestroyCommand) destroyExperiment(uid string, executor spec.Executor, 
 }
 
 func (dc *DestroyCommand) getExecutorAndExpModelByRecord(model *data.ExperimentModel) (
-	executor spec.Executor, expModel *spec.ExpModel, err error) {
-	var firstCommand = model.Command
+	executor spec.Executor, expModel *spec.ExpModel, err error,
+) {
+	firstCommand := model.Command
 	var actionCommand, actionTargetCommand string
 	subCommands := strings.Split(model.SubCommand, " ")
 	subLength := len(subCommands)
@@ -235,29 +237,30 @@ func (dc *DestroyCommand) getExecutorAndExpModelByRecord(model *data.ExperimentM
 	executor = dc.GetExecutor(firstCommand, actionTargetCommand, actionCommand)
 	if executor == nil {
 		err = fmt.Errorf("can't find executor for %s, %s", model.Command, model.SubCommand)
-		return
+		return executor, expModel, err
 	}
 	if actionTargetCommand == "" {
 		actionTargetCommand = firstCommand
 	}
 	// covert commandModel to expModel
 	expModel = spec.ConvertCommandsToExpModel(actionCommand, actionTargetCommand, model.Flag)
-	return
+	return executor, expModel, err
 }
 
 func (dc *DestroyCommand) getExecutorAndExpModelByChaosBladeResource(chaosBlade *v1alpha1.ChaosBlade) (
-	executor spec.Executor, expModel *spec.ExpModel, err error) {
+	executor spec.Executor, expModel *spec.ExpModel, err error,
+) {
 	for _, experiment := range chaosBlade.Spec.Experiments {
 		actionTarget := fmt.Sprintf("%s-%s", experiment.Scope, experiment.Target)
 		executor = dc.GetExecutor("k8s", actionTarget, experiment.Action)
 		if executor == nil {
 			err = fmt.Errorf("can't find executor for k8s %s, %s", actionTarget, experiment.Action)
-			return
+			return executor, expModel, err
 		}
 		expModel = convertCBExperimentToExpModel(experiment, actionTarget)
 		break
 	}
-	return
+	return executor, expModel, err
 }
 
 func convertCBExperimentToExpModel(experiment v1alpha1.ExperimentSpec, actionTarget string) *spec.ExpModel {

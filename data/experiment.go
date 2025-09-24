@@ -96,15 +96,15 @@ func (s *Source) CheckAndInitExperimentTable() {
 	ctx := context.Background()
 	if err != nil {
 		log.Fatalf(ctx, "%s", err.Error())
-		//log.Error(err, "ExperimentTableExists err")
-		//os.Exit(1)
+		// log.Error(err, "ExperimentTableExists err")
+		// os.Exit(1)
 	}
 	if !exists {
 		err = s.InitExperimentTable()
 		if err != nil {
 			log.Fatalf(ctx, "%s", err.Error())
-			//log.Error(err, "InitExperimentTable err")
-			//os.Exit(1)
+			// log.Error(err, "InitExperimentTable err")
+			// os.Exit(1)
 		}
 	}
 }

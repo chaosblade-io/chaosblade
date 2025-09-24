@@ -21,8 +21,9 @@ import (
 	"net"
 	"strings"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 type QueryNetworkCommand struct {

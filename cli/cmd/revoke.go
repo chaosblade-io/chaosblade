@@ -21,9 +21,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/spf13/cobra"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade/exec/cplus"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
@@ -62,7 +63,7 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		return nil
 	}
 	var response *spec.Response
-	var channel = channel.NewLocalChannel()
+	channel := channel.NewLocalChannel()
 	switch record.ProgramType {
 	case PrepareJvmType:
 		response = jvm.Detach(ctx, record.Port)

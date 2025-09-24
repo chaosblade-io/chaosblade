@@ -78,7 +78,6 @@ func Test_baseCommand_recordExpModel(t *testing.T) {
 		}
 		validateExperimentModel(got, tt.expect.model, t)
 	}
-
 }
 
 func validateExperimentModel(result *data.ExperimentModel, expect *data.ExperimentModel, t *testing.T) {
@@ -161,8 +160,7 @@ func Test_parseCommandPath(t *testing.T) {
 	}
 }
 
-type MockSource struct {
-}
+type MockSource struct{}
 
 func (*MockSource) CheckAndInitExperimentTable() {
 }
@@ -212,7 +210,8 @@ func (*MockSource) QueryPreparationByUid(uid string) (*data.PreparationRecord, e
 }
 
 func (*MockSource) QueryRunningPreByTypeAndProcess(programType string, processName string,
-	processId string) (*data.PreparationRecord, error) {
+	processId string,
+) (*data.PreparationRecord, error) {
 	return &data.PreparationRecord{}, nil
 }
 

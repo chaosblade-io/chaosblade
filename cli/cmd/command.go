@@ -21,12 +21,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 
 	"github.com/chaosblade-io/chaosblade/data"
-
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/spf13/cobra"
 )
 
 // Command is cli command interface
@@ -74,7 +74,8 @@ func SetDS(source data.SourceI) {
 
 // recordExpModel
 func (bc *baseCommand) recordExpModel(commandPath string, expModel *spec.ExpModel) (commandModel *data.ExperimentModel,
-	response *spec.Response) {
+	response *spec.Response,
+) {
 	uid := expModel.ActionFlags[UidFlag]
 	var err error
 	if uid == "" {
@@ -133,7 +134,7 @@ func (bc *baseCommand) generateUid() (string, error) {
 	return bc.generateUid()
 }
 
-//AddCommand is add child command to the parent command
+// AddCommand is add child command to the parent command
 func (bc *baseCommand) AddCommand(child Command) {
 	child.Init()
 	childCmd := child.CobraCmd()

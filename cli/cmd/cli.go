@@ -19,8 +19,9 @@ package cmd
 import (
 	"os"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 type Cli struct {
@@ -45,7 +46,7 @@ func NewCli() *Cli {
 func (cli *Cli) setFlags() {
 	flags := cli.rootCmd.PersistentFlags()
 	flags.BoolVarP(&util.Debug, "debug", "d", false, "Set client to DEBUG mode")
-	//flags.StringVarP(&util.LogLevel, "log-level", "l", "info", "level of logging wanted. 1=DEBUG, 0=INFO, -1=WARN, A higher verbosity level means a log message is less important.")
+	// flags.StringVarP(&util.LogLevel, "log-level", "l", "info", "level of logging wanted. 1=DEBUG, 0=INFO, -1=WARN, A higher verbosity level means a log message is less important.")
 }
 
 // Run command

@@ -23,8 +23,9 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 func TestQueryDiskCommand_queryDiskInfo(t *testing.T) {

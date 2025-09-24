@@ -25,16 +25,19 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/olekukonko/tablewriter"
+	"github.com/spf13/cobra"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/olekukonko/tablewriter"
-	"github.com/spf13/cobra"
 )
 
-var allCmd []string
-var BladeBinPath string
-var AllCheckExecCmds []CheckExecCmd
+var (
+	allCmd           []string
+	BladeBinPath     string
+	AllCheckExecCmds []CheckExecCmd
+)
 
 const (
 	BladeBin        = "blade"
@@ -114,6 +117,7 @@ func (doc *CheckOsCommand) checkOsAll() error {
 	doc.outPutTheResult(output)
 	return nil
 }
+
 func (doc *CheckOsCommand) outPutTheResult(output [][]string) {
 	fmt.Printf("------------summary----------")
 	table := tablewriter.NewWriter(os.Stdout)
@@ -128,7 +132,7 @@ func (doc *CheckOsCommand) execBladeCmd(checkExecCmd *CheckExecCmd, osAll bool) 
 	ch := channel.NewLocalChannel()
 	var response *spec.Response
 	for _, execResult := range checkExecCmd.ExecResult {
-		//1.1 create os cmd
+		// 1.1 create os cmd
 		response = ch.Run(context.Background(), BladeBinPath, execResult.cmd)
 		if !response.Success {
 			execResult.result = "failed"
@@ -305,7 +309,7 @@ func (doc *CheckOsCommand) buildCmdByMatchersAndFlags(flags []spec.ExpFlagSpec, 
 // bind flags
 func (doc *CheckOsCommand) bindFlagsFunction() func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
 	return func(commandFlags map[string]func() string, cmd *cobra.Command, specFlags []spec.ExpFlagSpec) {
-		//set action flags
+		// set action flags
 		for _, flag := range specFlags {
 			flagName := flag.FlagName()
 			flagDesc := flag.FlagDesc()
@@ -393,7 +397,7 @@ func (doc *CheckOsCommand) actionRunEFunc(target, scope string, actionCommand *a
 
 		default:
 			cmdStr = fmt.Sprintf("%s %s %s %s", programs[0], expModel.Target, expModel.ActionName, cmdStr)
-			checkExecCmd := CheckExecCmd{ExpName: target, ActionName: actionCommandSpec.Name(), Scope: scope, ExecResult: []*ExecResult{&ExecResult{cmd: cmdStr}}}
+			checkExecCmd := CheckExecCmd{ExpName: target, ActionName: actionCommandSpec.Name(), Scope: scope, ExecResult: []*ExecResult{{cmd: cmdStr}}}
 
 			response = *doc.execBladeCmd(&checkExecCmd, false)
 		}

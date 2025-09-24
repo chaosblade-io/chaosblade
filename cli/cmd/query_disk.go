@@ -21,9 +21,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/spf13/cobra"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/spf13/cobra"
 )
 
 type QueryDiskCommand struct {
@@ -59,7 +60,7 @@ func (qdc *QueryDiskCommand) queryDiskInfo(command *cobra.Command, arg string) e
 		}
 		disks := response.Result.(string)
 		fields := strings.Fields(disks)
-		var result = make([]string, 0)
+		result := make([]string, 0)
 		for _, disk := range fields {
 			// TODO Check the file system prefix, but should check the file system type
 			if strings.HasPrefix(disk, "/") {

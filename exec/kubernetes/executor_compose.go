@@ -53,5 +53,4 @@ func (e *ComposeExecutorForK8s) Exec(uid string, ctx context.Context, model *spe
 }
 
 func (*ComposeExecutorForK8s) SetChannel(channel spec.Channel) {
-
 }

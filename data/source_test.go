@@ -55,7 +55,7 @@ func TestGetDataFilePath(t *testing.T) {
 			name:     "existing directory",
 			envValue: "/tmp/test_existing_dir",
 			setupFunc: func() error {
-				return os.MkdirAll("/tmp/test_existing_dir", 0755)
+				return os.MkdirAll("/tmp/test_existing_dir", 0o755)
 			},
 			cleanupFunc: func() error {
 				return os.RemoveAll("/tmp/test_existing_dir")

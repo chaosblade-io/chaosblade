@@ -29,15 +29,18 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
-const ApplicationName = "chaosblade-exec-cplus"
-const RemoveAction = "remove"
+const (
+	ApplicationName = "chaosblade-exec-cplus"
+	RemoveAction    = "remove"
+)
 
-var cplusBinPath = path.Join(util.GetLibHome(), "cplus", ApplicationName)
-var scriptDefaultPath = path.Join(util.GetLibHome(), "cplus", "script")
+var (
+	cplusBinPath      = path.Join(util.GetLibHome(), "cplus", ApplicationName)
+	scriptDefaultPath = path.Join(util.GetLibHome(), "cplus", "script")
+)
 
 // 启动 spring boot application，需要校验程序是否已启动
 func Prepare(ctx context.Context, port, ip string) *spec.Response {
-
 	response := preCheck(ctx, port)
 	if !response.Success {
 		return response

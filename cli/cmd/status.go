@@ -20,10 +20,11 @@ import (
 	"encoding/json"
 	"os"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 const (
@@ -66,8 +67,8 @@ func (sc *StatusCommand) Init() {
 	sc.command.Flags().StringVar(&sc.status, "status", "", "experiment status. create type supports Created|Success|Error|Destroyed status. prepare type supports Created|Running|Error|Revoked status")
 	sc.command.Flags().StringVar(&sc.uid, "uid", "", "prepare or experiment uid")
 	sc.command.Flags().BoolVar(&sc.asc, "asc", false, "order by CreateTime, default value is false that means order by CreateTime desc")
-
 }
+
 func (sc *StatusCommand) runStatus(command *cobra.Command, args []string) error {
 	var uid string
 	if len(args) > 0 {

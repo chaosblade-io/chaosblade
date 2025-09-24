@@ -19,17 +19,17 @@ package middleware
 import (
 	"context"
 	"fmt"
+	os_exec "os/exec"
+	"path"
+	"syscall"
+
 	"github.com/chaosblade-io/chaosblade-exec-middleware/exec"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	os_exec "os/exec"
-	"path"
-	"syscall"
 )
 
-type Executor struct {
-}
+type Executor struct{}
 
 func NewExecutor() spec.Executor {
 	return &Executor{}
@@ -40,7 +40,6 @@ func (*Executor) Name() string {
 }
 
 func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
-
 	if model.ActionFlags[exec.ChannelFlag.Name] == "ssh" {
 		sshExecutor := &exec.SSHExecutor{}
 		return sshExecutor.Exec(uid, ctx, model)
