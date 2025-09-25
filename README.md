@@ -29,7 +29,8 @@ Encapsulating scenes by domain into individual projects can not only standardize
 * [chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator): Kubernetes platform experimental scenario is implemented, chaos experiments are defined by Kubernetes standard CRD method, it is very convenient to use Kubernetes resource operation method To create, update, and delete experimental scenarios, including using kubectl, client-go, etc., and also using the chaosblade cli tool described above.
 * [chaosblade-exec-jvm](https://github.com/chaosblade-io/chaosblade-exec-jvm): Java application experimental scenario implementation, using Java Agent technology to mount dynamically, without any access, zero-cost use It also supports uninstallation and completely recycles various resources created by the Agent.
 * [chaosblade-exec-cplus](https://github.com/chaosblade-io/chaosblade-exec-cplus): C ++ application experimental scenario implementation, using GDB technology to implement method and code line level experimental scenario injection.
-
+* [chaosblade-box](https://github.com/chaosblade-io/chaosblade-box): Possessing chaos engineering platform and resilience testing platform capabilities.For more information on the resilience testing platform capabilities, see the [main2](https://github.com/chaosblade-io/chaosblade-box/tree/main2) branch.
+  
 ## CLI Command
 You can download the latest chaosblade toolkit from [Releases](https://github.com/chaosblade-io/chaosblade/releases) and extract it and use it. If you want to inject Kubernetes related fault scenarios, you need to install [chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator/releases). For detailed Chinese usage documents, please see [chaosblade-help-zh-cn ](https://chaosblade-io.gitbook.io/chaosblade-help-zh-cn/).
 
