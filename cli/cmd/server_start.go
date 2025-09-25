@@ -24,11 +24,12 @@ import (
 	"path"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/spf13/cobra"
 )
 
 const startServerKey = "blade server start --nohup"
@@ -124,7 +125,7 @@ func (ssc *StartServerCommand) start0() {
 		err := http.ListenAndServe(ssc.ip+":"+ssc.port, nil)
 		if err != nil {
 			log.Errorf(context.Background(), "start blade server error, %v", err)
-			//log.Error(err, "start blade server error")
+			// log.Error(err, "start blade server error")
 			os.Exit(1)
 		}
 	}()

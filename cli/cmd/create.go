@@ -20,21 +20,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
-	"github.com/shirou/gopsutil/process"
 	"os/exec"
 	"path"
 	"strconv"
 	"time"
 
+	"github.com/shirou/gopsutil/process"
+	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/chaosblade-io/chaosblade/data"
-
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade/data"
 )
 
 // CreateCommand for create experiment
@@ -45,13 +45,15 @@ type CreateCommand struct {
 	// Actively report the create result.
 	// The installation result report is triggered only when the async value is true and the value is not empty.
 	endpoint string
-	nohup    bool //used to internal async create, no need to config
+	nohup    bool // used to internal async create, no need to config
 }
 
-const UidFlag = "uid"
-const AsyncFlag = "async"
-const EndpointFlag = "endpoint"
-const NohupFlag = "nohup"
+const (
+	UidFlag      = "uid"
+	AsyncFlag    = "async"
+	EndpointFlag = "endpoint"
+	NohupFlag    = "nohup"
+)
 
 var uid string
 
@@ -106,9 +108,9 @@ func (cc *CreateCommand) actionRunEFunc(target, scope string, actionCommand *act
 		// check timeout flag
 		tt := expModel.ActionFlags["timeout"]
 		if tt != "" {
-			//errNumber checks whether timout flag is parsable as Number
+			// errNumber checks whether timout flag is parsable as Number
 			if _, errNumber := strconv.ParseUint(tt, 10, 64); errNumber != nil {
-				//err checks whether timout flag is parsable as Time
+				// err checks whether timout flag is parsable as Time
 				if _, err := time.ParseDuration(tt); err != nil {
 					return err
 				}
@@ -256,9 +258,8 @@ func (cc *CreateCommand) actionPostRunEFunc(actionCommand *actionCommand) func(c
 			if tt == "" || async {
 				return nil
 			}
-			//err possible if timeout used as timeDuration.
+			// err possible if timeout used as timeDuration.
 			timeout, err := strconv.ParseUint(tt, 10, 64)
-
 			if err != nil {
 				// the err checked in RunE function
 				timeDuartion, _ := time.ParseDuration(tt)

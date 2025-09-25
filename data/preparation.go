@@ -107,8 +107,8 @@ func (s *Source) CheckAndInitPreTable() {
 	ctx := context.Background()
 	if err != nil {
 		log.Fatalf(ctx, "%s", err.Error())
-		//log.Error(err, "GetUserVersion err")
-		//os.Exit(1)
+		// log.Error(err, "GetUserVersion err")
+		// os.Exit(1)
 	}
 	// return directly if equal the current UserVersion
 	if version == UserVersion {
@@ -118,8 +118,8 @@ func (s *Source) CheckAndInitPreTable() {
 	exists, err := s.PreparationTableExists()
 	if err != nil {
 		log.Fatalf(ctx, "%s", err.Error())
-		//log.Error(err, "PreparationTableExists err")
-		//os.Exit(1)
+		// log.Error(err, "PreparationTableExists err")
+		// os.Exit(1)
 	}
 	if exists {
 		// check if pid column exists before adding it
@@ -132,8 +132,8 @@ func (s *Source) CheckAndInitPreTable() {
 			err := s.AlterPreparationTable(addPidColumn)
 			if err != nil {
 				log.Fatalf(ctx, "%s", err.Error())
-				//log.Error(err, "AlterPreparationTable err", "addPidColumn", addPidColumn)
-				//os.Exit(1)
+				// log.Error(err, "AlterPreparationTable err", "addPidColumn", addPidColumn)
+				// os.Exit(1)
 			}
 		}
 	} else {
@@ -141,16 +141,16 @@ func (s *Source) CheckAndInitPreTable() {
 		err = s.InitPreparationTable()
 		if err != nil {
 			log.Fatalf(ctx, "%s", err.Error())
-			//log.Error(err, "InitPreparationTable err")
-			//os.Exit(1)
+			// log.Error(err, "InitPreparationTable err")
+			// os.Exit(1)
 		}
 	}
 	// update userVersion to new
 	err = s.UpdateUserVersion(UserVersion)
 	if err != nil {
 		log.Fatalf(ctx, "%s", err.Error())
-		//log.Error(err, "UpdateUserVersion err", "UserVersion", UserVersion)
-		//os.Exit(1)
+		// log.Error(err, "UpdateUserVersion err", "UserVersion", UserVersion)
+		// os.Exit(1)
 	}
 }
 
@@ -238,7 +238,7 @@ func (s *Source) QueryPreparationByUid(uid string) (*PreparationRecord, error) {
 
 // QueryRunningPreByTypeAndProcess returns the first record matching the process id or process name
 func (s *Source) QueryRunningPreByTypeAndProcess(programType string, processName, processId string) (*PreparationRecord, error) {
-	var query = `SELECT * FROM preparation WHERE program_type = ? and status = "Running"`
+	query := `SELECT * FROM preparation WHERE program_type = ? and status = "Running"`
 	if processId != "" && processName != "" {
 		query = fmt.Sprintf(`%s and pid = ? and process = ?`, query)
 	} else if processId != "" {

@@ -19,17 +19,17 @@ package os
 import (
 	"context"
 	"fmt"
+	os_exec "os/exec"
+	"path"
+	"syscall"
+
 	"github.com/chaosblade-io/chaosblade-exec-os/exec"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	os_exec "os/exec"
-	"path"
-	"syscall"
 )
 
-type Executor struct {
-}
+type Executor struct{}
 
 func NewExecutor() spec.Executor {
 	return &Executor{}
@@ -40,15 +40,14 @@ func (*Executor) Name() string {
 }
 
 func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *spec.Response {
-
 	if model.ActionFlags[exec.ChannelFlag.Name] == "ssh" {
 		sshExecutor := &exec.SSHExecutor{}
 		return sshExecutor.Exec(uid, ctx, model)
 	}
 
-	var mode string 
+	var mode string
 	var argsArray []string
-	
+
 	_, isDestroy := spec.IsDestroy(ctx)
 	if isDestroy {
 		mode = spec.Destroy
@@ -58,7 +57,7 @@ func (e *Executor) Exec(uid string, ctx context.Context, model *spec.ExpModel) *
 
 	argsArray = append(argsArray, mode, model.Target, model.ActionName, fmt.Sprintf("--uid=%s", uid))
 	for k, v := range model.ActionFlags {
-		if v == "" ||  k == "timeout" {
+		if v == "" || k == "timeout" {
 			continue
 		}
 		argsArray = append(argsArray, fmt.Sprintf("--%s=%s", k, v))

@@ -25,10 +25,10 @@ import (
 	"sync"
 	"unicode"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
-
-	"github.com/chaosblade-io/chaosblade-spec-go/util"
 	_ "github.com/glebarez/sqlite"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"github.com/chaosblade-io/chaosblade-spec-go/util"
 )
 
 const dataFile = "chaosblade.dat"
@@ -42,8 +42,10 @@ type Source struct {
 	DB *sql.DB
 }
 
-var source SourceI
-var once = sync.Once{}
+var (
+	source SourceI
+	once   = sync.Once{}
+)
 
 func GetSource() SourceI {
 	once.Do(func() {
@@ -83,13 +85,13 @@ func GetDataFilePath() string {
 		if os.IsNotExist(err) {
 			if path.Ext(envPath) != "" {
 				parentDir := path.Dir(envPath)
-				if mkdirErr := os.MkdirAll(parentDir, 0755); mkdirErr != nil {
+				if mkdirErr := os.MkdirAll(parentDir, 0o755); mkdirErr != nil {
 					log.Warnf(context.Background(), "failed to create parent directory %s, using default path: %s", parentDir, mkdirErr.Error())
 					return path.Join(util.GetProgramPath(), dataFile)
 				}
 				return envPath
 			} else {
-				if mkdirErr := os.MkdirAll(envPath, 0755); mkdirErr != nil {
+				if mkdirErr := os.MkdirAll(envPath, 0o755); mkdirErr != nil {
 					log.Warnf(context.Background(), "failed to create directory %s, using default path: %s", envPath, mkdirErr.Error())
 					return path.Join(util.GetProgramPath(), dataFile)
 				}
@@ -111,8 +113,8 @@ func getConnection() *sql.DB {
 	database, err := sql.Open("sqlite", GetDataFilePath())
 	if err != nil {
 		log.Fatalf(context.Background(), "open data file err, %s", err.Error())
-		//log.Error(err, "open data file err")
-		//os.Exit(1)
+		// log.Error(err, "open data file err")
+		// os.Exit(1)
 	}
 	return database
 }

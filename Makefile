@@ -289,7 +289,7 @@ _package_linux_arm64:
 	@echo "Packaging for linux arm64..."
 	@$(MAKE) upx GOOS=linux GOARCH=arm64
 	@COPYFILE_DISABLE=1 tar --no-xattrs -zcvf $(call get_platform_pkg_name,linux,arm64) -C $(BUILD_TARGET) $(PLATFORM_DIR_NAME)
-	
+
 #----------------------------------------------------------------------------------
 
 # build chaosblade cli: blade
@@ -383,7 +383,7 @@ ifdef ALERTMSG
 endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm pull origin $(BLADE_EXEC_JVM_BRANCH)
 endif
-	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm; 
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm;
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
 	cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-jvm/build-target/chaosblade-$(BLADE_VERSION)/* $(OUTPUT_DIR)/
 
@@ -411,7 +411,7 @@ ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-cri, $(wildcard $(BUILD_TARGET_CACH
 else
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri pull origin $(BLADE_EXEC_CRI_BRANCH)
 endif
-	@$(eval OUTPUT_DIR := $(call get_build_output_dir)) 
+	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
 	@if [ -z "$(GOOS)" ]; then \
 		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-cri; \
 	else \
@@ -528,6 +528,18 @@ check_yaml:
 		echo "Warning: Neither wget nor curl found, skipping check_yaml"; \
 	fi
 
+.PHONY: format
+format:
+	@echo "Running goimports and gofumpt to format Go code..."
+	@./hack/update-imports.sh
+	@./hack/update-gofmt.sh
+
+.PHONY: verify
+verify:
+	@echo "Verifying Go code formatting and import order..."
+	@./hack/verify-gofmt.sh
+	@./hack/verify-imports.sh
+
 help:
 	@echo ''
 	@echo 'ChaosBlade is a powerful and versatile chaos engineering platform.'
@@ -550,6 +562,8 @@ help:
 	@printf '  \033[36m%-20s\033[0m  %s\n' "push_image" "Push Docker images to registry"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "clean" "Clean build artifacts"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "test" "Run tests"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "format" "Format Go code using gofumpt and goimports"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "verify" "Verify Go code formatting and import order"
 	@echo ''
 	@echo 'Examples:'
 	@echo '  make build                                  # Build cli for current platform'

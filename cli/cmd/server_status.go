@@ -4,10 +4,11 @@ import (
 	"context"
 	"strconv"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/shirou/gopsutil/process"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 type StatusServerCommand struct {

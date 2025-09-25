@@ -19,12 +19,13 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"strings"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/channel"
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/channel"
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 )
 
 type StopServerCommand struct {
@@ -50,7 +51,7 @@ func (ssc *StopServerCommand) run(cmd *cobra.Command, args []string) error {
 	}
 	if len(pids) == 0 {
 		log.Infof(context.Background(), "the blade server process not found, so return success for stop operation")
-		//log.Info("the blade server process not found, so return success for stop operation")
+		// log.Info("the blade server process not found, so return success for stop operation")
 		cmd.Println(spec.ReturnSuccess("success").Print())
 		return nil
 	}

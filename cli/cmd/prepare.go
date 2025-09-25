@@ -18,12 +18,13 @@ package cmd
 
 import (
 	"context"
-	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"time"
 
+	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/spf13/cobra"
 
 	"github.com/chaosblade-io/chaosblade/data"
 )
@@ -105,7 +106,7 @@ func handlePrepareResponse(ctx context.Context, cmd *cobra.Command, response *sp
 	err := GetDS().UpdatePreparationRecordByUid(uid, Running, "")
 	if err != nil {
 		log.Warnf(ctx, "update preparation record error: %s", err.Error())
-		//log.V(-1).Info("update preparation record error", "err_msg", err.Error())
+		// log.V(-1).Info("update preparation record error", "err_msg", err.Error())
 	}
 	response.Result = uid
 	cmd.Println(response.Print())

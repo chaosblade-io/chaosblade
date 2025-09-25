@@ -28,11 +28,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/shirou/gopsutil/process"
+
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
-	"github.com/shirou/gopsutil/process"
 )
 
 // attach sandbox to java process
@@ -229,7 +230,8 @@ func getUserid(ctx context.Context, pid string) (string, error) {
 }
 
 func getJavaBinAndJavaHome(ctx context.Context, javaHome string, pid string,
-	getJavaCommandLineFunc func(ctx context.Context, pid string) (commandSlice []string, err error)) (string, string) {
+	getJavaCommandLineFunc func(ctx context.Context, pid string) (commandSlice []string, err error),
+) (string, string) {
 	javaBin := "java"
 	if javaHome != "" {
 		javaBin = path.Join(javaHome, "bin/java")

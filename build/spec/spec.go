@@ -32,7 +32,6 @@ import (
 var version = "1.7.4"
 
 func main() {
-
 	if len(os.Args) < 3 {
 		log.Panicln("less yaml file path, first parameter is scenario files and the second is the target yaml file")
 	}
@@ -55,7 +54,7 @@ func main() {
 
 	models := mergeModels(osModels, cloudModels, jvmModels, cplusModels, criModels, k8sModels)
 
-	file, err := os.OpenFile(chaosSpecFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0755)
+	file, err := os.OpenFile(chaosSpecFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o755)
 	if err != nil {
 		log.Fatalf("open %s file err, %s", chaosSpecFile, err.Error())
 	}
@@ -139,7 +138,7 @@ func addFlagToActionSpec(model *spec.ExpCommandModel) {
 			flags = make([]spec.ExpFlag, 0)
 		}
 		action.ActionFlags = append(action.ActionFlags, flags...)
-		//model.ExpActions[idx] = *action
+		// model.ExpActions[idx] = *action
 	}
 	model.SetFlags(nil)
 }

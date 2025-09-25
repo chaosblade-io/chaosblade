@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 
-	"github.com/chaosblade-io/chaosblade-spec-go/spec"
-	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
 	"github.com/spf13/cobra"
+
+	"github.com/chaosblade-io/chaosblade-spec-go/spec"
+
+	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
 )
 
 type QueryK8sCommand struct {
