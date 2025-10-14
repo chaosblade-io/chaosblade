@@ -6,7 +6,8 @@
 ![license](https://img.shields.io/github/license/chaosblade-io/chaosblade.svg)
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/5032/badge)](https://bestpractices.coreinfrastructure.org/projects/5032)
 
-中文版 [README](README_CN.md)
+中文版 [README](README_CN.md)  
+Wiki: [DeepWiki](https://deepwiki.com/chaosblade-io/chaosblade-for-deepwiki)
 ## Introduction
 
 ChaosBlade is an Alibaba open source experimental injection tool that follows the principles of chaos engineering and chaos experimental models to help enterprises improve the fault tolerance of distributed systems and ensure business continuity during the process of enterprises going to cloud or moving to cloud native systems.
