@@ -1,0 +1,78 @@
+# Copyright 2025 The ChaosBlade Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Base directory for the whole execution.
+# All relative paths is based on this path.
+# default: current working directory
+baseDir = "."
+
+headerPath = "Apache-2.0.txt"
+
+# On enabled, check the license header matches exactly with whitespace.
+# Otherwise, strip the header in one line and check.
+# default: true
+strictCheck = true
+
+# Whether you use the default excludes. Check Default.EXCLUDES for the completed list.
+# To suppress part of excludes in the list, declare exact the same pattern in `includes` list.
+# default: true
+useDefaultExcludes = true
+
+excludes = [
+    "*.txt",
+    "version_info.go"
+]
+
+# The supported patterns of includes and excludes follow gitignore pattern format, plus that:
+# 1. `includes` does not support `!`
+# 2. backslash does not escape letter
+# 3. whitespaces and `#` are normal since we configure line by line
+# See also https://git-scm.com/docs/gitignore#_pattern_format
+
+# Keywords that should occur in the header, case-insensitive.
+# default: ["copyright"]
+keywords = ["copyright", ]
+
+# Whether you use the default mapping. Check DocumentType.defaultMapping() for the completed list.
+# default: true
+useDefaultMapping = true
+
+# Properties to fulfill the template.
+# For a defined key-value pair, you can use {{props["key"]}} in the header template, which will be
+# substituted with the corresponding value.
+[properties]
+inceptionYear = 2025
+copyrightOwner = "The ChaosBlade Authors"
+
+# There are also preset attributes that can be used in the header template (no need to surround them with `props[]`).:
+# * 'attrs.filename' is the current file name, like: pom.xml.
+
+# Options to configure Git features.
+[git]
+# If enabled, do not process files that are ignored by Git; possible value: ['auto', 'enable', 'disable']
+# 'auto' means this feature tries to be enabled with:
+#   * gix - if `basedir` is in a Git repository.
+#   * ignore crate's gitignore rules - if `basedir` is not in a Git repository.
+# 'enable' means always enabled with gix; failed if it is impossible.
+# default: 'auto'
+ignore = 'auto'
+# If enabled, populate file attrs determinated by Git; possible value: ['auto', 'enable', 'disable']
+# Attributes contains:
+#   * 'attrs.git_file_created_year'
+#   * 'attrs.git_file_modified_year'
+# 'auto' means this feature tries to be enabled with:
+#   * gix - if `basedir` is in a Git repository.
+# 'enable' means always enabled with gix; failed if it is impossible.
+# default: 'disable'
+attrs = 'disable'

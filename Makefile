@@ -1,3 +1,19 @@
+# Copyright 2025 The ChaosBlade Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# ...
+
 .PHONY: build build_all
 
 # Version information management
@@ -528,7 +544,7 @@ check_yaml:
 		echo "Warning: Neither wget nor curl found, skipping check_yaml"; \
 	fi
 
-.PHONY: format
+.PHONY: format license-format
 format:
 	@echo "Running goimports and gofumpt to format Go code..."
 	@./hack/update-imports.sh
@@ -539,6 +555,16 @@ verify:
 	@echo "Verifying Go code formatting and import order..."
 	@./hack/verify-gofmt.sh
 	@./hack/verify-imports.sh
+
+.PHONY: license-check
+license-check:
+	@echo "Checking license headers..."
+	docker run -it --rm -v $(shell pwd):/github/workspace ghcr.io/korandoru/hawkeye check
+
+.PHONY: license-format
+license-format:
+	@echo "Formatting license headers..."
+	docker run -it --rm -v $(shell pwd):/github/workspace ghcr.io/korandoru/hawkeye format
 
 help:
 	@echo ''
@@ -564,6 +590,7 @@ help:
 	@printf '  \033[36m%-20s\033[0m  %s\n' "test" "Run tests"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "format" "Format Go code using gofumpt and goimports"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "verify" "Verify Go code formatting and import order"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "license" "Check license headers in source files"
 	@echo ''
 	@echo 'Examples:'
 	@echo '  make build                                  # Build cli for current platform'
