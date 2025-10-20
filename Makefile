@@ -590,7 +590,7 @@ help:
 	@printf '  \033[36m%-20s\033[0m  %s\n' "test" "Run tests"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "format" "Format Go code using gofumpt and goimports"
 	@printf '  \033[36m%-20s\033[0m  %s\n' "verify" "Verify Go code formatting and import order"
-	@printf '  \033[36m%-20s\033[0m  %s\n' "license" "Check license headers in source files"
+	@printf '  \033[36m%-20s\033[0m  %s\n' "license-check" "Check license headers"
 	@echo ''
 	@echo 'Examples:'
 	@echo '  make build                                  # Build cli for current platform'
