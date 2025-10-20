@@ -544,8 +544,8 @@ check_yaml:
 		echo "Warning: Neither wget nor curl found, skipping check_yaml"; \
 	fi
 
-.PHONY: format license-format
-format:
+.PHONY: format
+format: license-format
 	@echo "Running goimports and gofumpt to format Go code..."
 	@./hack/update-imports.sh
 	@./hack/update-gofmt.sh
