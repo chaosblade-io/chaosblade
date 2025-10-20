@@ -52,6 +52,9 @@ jobs:
       - name: Run code style and import order verification
         run: make verify
 
+      - name: Check License Header
+        uses: korandoru/hawkeye@v6
+
       - name: Verify dependencies
         run: go mod verify
 
