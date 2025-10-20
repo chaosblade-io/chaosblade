@@ -3,12 +3,12 @@ module github.com/chaosblade-io/chaosblade
 go 1.25
 
 require (
-	github.com/chaosblade-io/chaosblade-exec-cloud v1.7.5
-	github.com/chaosblade-io/chaosblade-exec-cri v1.7.5
-	github.com/chaosblade-io/chaosblade-exec-middleware v1.7.5
-	github.com/chaosblade-io/chaosblade-exec-os v1.7.5
-	github.com/chaosblade-io/chaosblade-operator v1.7.6-0.20250918100041-80377c5f1d0f
-	github.com/chaosblade-io/chaosblade-spec-go v1.7.5
+	github.com/chaosblade-io/chaosblade-exec-cloud v1.8.0
+	github.com/chaosblade-io/chaosblade-exec-cri v1.8.0
+	github.com/chaosblade-io/chaosblade-exec-middleware v1.8.0
+	github.com/chaosblade-io/chaosblade-exec-os v1.8.0
+	github.com/chaosblade-io/chaosblade-operator v1.8.0
+	github.com/chaosblade-io/chaosblade-spec-go v1.8.0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/olekukonko/tablewriter v0.0.5-0.20201029120751-42e21c7531a3
 	github.com/shirou/gopsutil v3.21.11+incompatible
@@ -26,6 +26,7 @@ require (
 	github.com/Microsoft/hcsshim v0.8.21 // indirect
 	github.com/PuerkitoBio/purell v1.1.1 // indirect
 	github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578 // indirect
+	github.com/asaskevich/govalidator v0.0.0-20210307081110-f21760c49a8d // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.2.0 // indirect
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
@@ -38,6 +39,7 @@ require (
 	github.com/containerd/typeurl v1.0.2 // indirect
 	github.com/coreos/go-systemd/v22 v22.3.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/dimchansky/utfbom v1.1.1 // indirect
 	github.com/docker/distribution v2.7.1+incompatible // indirect
 	github.com/docker/docker v1.4.2-0.20200203170920-46ec8731fbce // indirect
 	github.com/docker/go-connections v0.4.0 // indirect
@@ -59,6 +61,7 @@ require (
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
+	github.com/goodhosts/hostsfile v0.1.6 // indirect
 	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/google/gofuzz v1.1.0 // indirect
 	github.com/google/uuid v1.3.0 // indirect
@@ -71,6 +74,7 @@ require (
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.10 // indirect
 	github.com/klauspost/compress v1.11.13 // indirect
+	github.com/magefile/mage v1.15.0 // indirect
 	github.com/mailru/easyjson v0.7.0 // indirect
 	github.com/mattn/go-isatty v0.0.17 // indirect
 	github.com/mattn/go-runewidth v0.0.7 // indirect
@@ -96,7 +100,7 @@ require (
 	github.com/tklauser/numcpus v0.6.1 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	go.opencensus.io v0.22.3 // indirect
-	go.uber.org/automaxprocs v1.3.0 // indirect
+	go.uber.org/automaxprocs v1.6.0 // indirect
 	golang.org/x/crypto v0.36.0 // indirect
 	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/oauth2 v0.27.0 // indirect

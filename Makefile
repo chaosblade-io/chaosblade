@@ -10,7 +10,7 @@ else
     GIT_TAG := $(shell git describe --tags --abbrev=0 2>/dev/null || echo "")
     ifeq ($(GIT_TAG),)
         # If no Git Tag exists, use default version
-        BLADE_VERSION := 1.7.5
+        BLADE_VERSION := 1.8.0
     else
         # Extract version number from Git Tag (remove v prefix)
         BLADE_VERSION := $(shell echo $(GIT_TAG) | sed 's/^v//')
@@ -72,27 +72,27 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=master
+BLADE_EXEC_OS_BRANCH=v1.8.0
 
 # chaosblade-exec-middleware
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
-BLADE_EXEC_MIDDLEWARE_BRANCH=main
+BLADE_EXEC_MIDDLEWARE_BRANCH=v1.8.0
 
 # chaosblade-exec-cloud
 BLADE_EXEC_CLOUD_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cloud.git
-BLADE_EXEC_CLOUD_BRANCH=main
+BLADE_EXEC_CLOUD_BRANCH=v1.8.0
 
 # chaosblade-exec-cri
 BLADE_EXEC_CRI_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cri.git
-BLADE_EXEC_CRI_BRANCH=main
+BLADE_EXEC_CRI_BRANCH=v1.8.0
 
 # chaosblade-exec-kubernetes
 BLADE_OPERATOR_PROJECT=https://github.com/chaosblade-io/chaosblade-operator.git
-BLADE_OPERATOR_BRANCH=master
+BLADE_OPERATOR_BRANCH=v1.8.0
 
 # chaosblade-exec-jvm
 BLADE_EXEC_JVM_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-jvm.git
-BLADE_EXEC_JVM_BRANCH=master
+BLADE_EXEC_JVM_BRANCH=v1.8.0
 
 # chaosblade-exec-cplus
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
@@ -100,7 +100,7 @@ BLADE_EXEC_CPLUS_BRANCH=master
 
 # chaosblade-spec-go
 BLADE_SPEC_GO_PROJECT=https://github.com/chaosblade-io/chaosblade-spec-go.git
-BLADE_SPEC_GO_BRANCH=master
+BLADE_SPEC_GO_BRANCH=v1.8.0
 
 # cri yaml
 CRI_YAML_FILE_NAME=chaosblade-cri-spec-$(BLADE_VERSION).yaml
