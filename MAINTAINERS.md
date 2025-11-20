@@ -12,4 +12,4 @@ the [GOVERNANCE.md](GOVERNANCE.md) file.
 | [Fei_Ye](mailto:185120555@qq.com)                    | [tiny-x](https://github.com/tiny-x)         | Individual   |
 | [Xudong_Guo](mailto:guoxudong.dev@gmail.com)         | [sunny0826](https://github.com/sunny0826)   | JiHu(GitLab) |
 | [Yuanning_Chao](mailto:chaoyuanning@chinamobile.com) | [Yuaninga](https://github.com/chaoyuanning) | China Mobile |
-| [Spencer_Cai](mailto:spencercjh@gmail.com)           | [spencercjh](https://github.com/spencercjh) | bilibili     |
+| [Spencer_Cai](mailto:spencercjh@gmail.com)           | [spencercjh](https://github.com/spencercjh) | Individual   |
