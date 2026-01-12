@@ -88,7 +88,7 @@ BUILD_TARGET_CACHE=$(BUILD_TARGET)/cache
 
 # chaosblade-exec-os
 BLADE_EXEC_OS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-os.git
-BLADE_EXEC_OS_BRANCH=v1.8.0
+BLADE_EXEC_OS_BRANCH=master
 
 # chaosblade-exec-middleware
 BLADE_EXEC_MIDDLEWARE_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-middleware.git
@@ -177,7 +177,7 @@ sync_go_mod: ## Sync go.mod dependencies with Makefile branch configuration
 	@chmod +x scripts/sync_go_mod.sh
 	@./scripts/sync_go_mod.sh
 
-build_all: pre_build nsexec os cloud middleware java cplus cri kubernetes cli upx package check_yaml  ## Build all components for current platform
+build_all: pre_build nsexec os cloud middleware java cplus cri kubernetes cli upx package check_yaml spec_yaml  ## Build all components for current platform
 	@echo "Build all components for current platform completed"
 
 pre_build: generate_version sync_go_mod ## Prepare build environment
@@ -220,7 +220,7 @@ _build_platform:
 	@mkdir -p $(OUTPUT_DIR)/bin $(OUTPUT_DIR)/lib $(OUTPUT_DIR)/yaml
 	@if [ -n "$(COMPONENTS)" ]; then \
 		if [ "$(COMPONENTS)" = "all" ]; then \
-			components="os cloud middleware java cri kubernetes cli nsexec upx check_yaml"; \
+			components="os cloud middleware java cri kubernetes cli nsexec upx check_yaml spec_yaml"; \
 		else \
 			components=`echo "$(COMPONENTS)" | tr ',' ' '`; \
 		fi; \
@@ -237,6 +237,7 @@ _build_platform:
 				"nsexec") $(MAKE) nsexec GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"upx") $(MAKE) upx GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"check_yaml") $(MAKE) check_yaml; ;; \
+				"spec_yaml") $(MAKE) spec_yaml GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				*) echo "Unknown component: $$component"; ;; \
 			esac; \
 		done; \
@@ -321,7 +322,25 @@ ifeq ($(GOOS),linux)
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
 	@if [ "$(CC_FOR_NSEXEC)" != "container" ]; then \
 		echo "Building nsexec for Linux $(GOARCH) using $(CC_FOR_NSEXEC)..."; \
-		$(CC_FOR_NSEXEC) -static nsexec.c -o $(OUTPUT_DIR)/bin/nsexec; \
+		if echo "$(CC_FOR_NSEXEC)" | grep -q "musl"; then \
+			$(CC_FOR_NSEXEC) -static nsexec.c -o $(OUTPUT_DIR)/bin/nsexec; \
+		else \
+			if [ -f /usr/lib64/libc.a ] || [ -f /usr/lib/libc.a ] || [ -f /lib/libc.a ] || [ -f /lib64/libc.a ]; then \
+				$(CC_FOR_NSEXEC) -static nsexec.c -o $(OUTPUT_DIR)/bin/nsexec || ( \
+					echo "Warning: Static linking failed, trying dynamic linking..."; \
+					$(CC_FOR_NSEXEC) nsexec.c -o $(OUTPUT_DIR)/bin/nsexec; \
+					echo "Note: Built with dynamic linking. For static linking, install glibc-static:"; \
+					echo "  - CentOS/RHEL/Alibaba Linux: yum install glibc-static"; \
+					echo "  - Ubuntu/Debian: apt-get install libc6-dev"; \
+				); \
+			else \
+				echo "Warning: Static C library not found, using dynamic linking..."; \
+				$(CC_FOR_NSEXEC) nsexec.c -o $(OUTPUT_DIR)/bin/nsexec; \
+				echo "Note: For static linking, install glibc-static:"; \
+				echo "  - CentOS/RHEL/Alibaba Linux: yum install glibc-static"; \
+				echo "  - Ubuntu/Debian: apt-get install libc6-dev"; \
+			fi; \
+		fi; \
 	elif command -v $(CONTAINER_RUNTIME) >/dev/null 2>&1 && $(CONTAINER_RUNTIME) info >/dev/null 2>&1; then \
 		echo "Building nsexec for Linux $(GOARCH) using $(CONTAINER_RUNTIME)..."; \
 		$(CONTAINER_RUNTIME) run --rm -v $(PWD):/src:Z -w /src --platform linux/$(GOARCH) alpine:latest sh -c "apk add --no-cache musl-dev gcc && gcc -static nsexec.c -o /src/$(OUTPUT_DIR)/bin/nsexec"; \
@@ -363,6 +382,15 @@ ifdef ALERTMSG
 endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware pull origin $(BLADE_EXEC_MIDDLEWARE_BRANCH)
 endif
+	@# Fix static linking issue if static libraries are not available
+	@if [ -f "$(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/Makefile" ]; then \
+		if ! grep -q "STATIC_LIBC" "$(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/Makefile"; then \
+			echo "Applying fix for static linking in chaosblade-exec-middleware..."; \
+			MW_MAKEFILE="$(BUILD_TARGET_CACHE)/chaosblade-exec-middleware/Makefile"; \
+			sed -i '/ifeq ($$(CGO_ENABLED),1)/a\\t\t# 检查静态库是否存在，如果不存在则使用动态链接\n\t\tSTATIC_LIBC := $$(shell test -f /usr/lib64/libc.a || test -f /usr/lib/libc.a || test -f /lib/libc.a || test -f /lib64/libc.a \&\& echo "yes" || echo "no")\n\t\tSTATIC_PTHREAD := $$(shell test -f /usr/lib64/libpthread.a || test -f /usr/lib/libpthread.a || test -f /lib/libpthread.a || test -f /lib64/libpthread.a \&\& echo "yes" || echo "no")\n\t\tifeq ($$(STATIC_LIBC),yes)\n\t\t  ifeq ($$(STATIC_PTHREAD),yes)\n\t\t\tLDFLAGS := -ldflags="-linkmode external -extldflags -static -s -w -X github.com\/chaosblade-io\/chaosblade-exec-middleware\/version.BladeVersion=$$(VERSION)"\n\t\t  else\n\t\t\t$$(warning Static pthread library not found, using dynamic linking. Install glibc-static for static linking: yum install glibc-static)\n\t\t\tLDFLAGS := -ldflags="-s -w -X github.com\/chaosblade-io\/chaosblade-exec-middleware\/version.BladeVersion=$$(VERSION)"\n\t\t  endif\n\t\telse\n\t\t  $$(warning Static C library not found, using dynamic linking. Install glibc-static for static linking: yum install glibc-static)\n\t\t  LDFLAGS := -ldflags="-s -w -X github.com\/chaosblade-io\/chaosblade-exec-middleware\/version.BladeVersion=$$(VERSION)"\n\t\tendif' "$$MW_MAKEFILE"; \
+			sed -i '/^[[:space:]]*LDFLAGS := -ldflags="-linkmode external -extldflags -static/s/^/# Original static linking - replaced by fix above\n\t\t# /' "$$MW_MAKEFILE"; \
+		fi; \
+	fi
 	@if [ -z "$(GOOS)" ]; then \
 		make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-middleware; \
 	else \
@@ -544,6 +572,24 @@ check_yaml:
 		echo "Warning: Neither wget nor curl found, skipping check_yaml"; \
 	fi
 
+spec_yaml: ## Generate chaosblade.spec.yaml from all scenario yaml files
+	@$(eval OUTPUT_DIR := $(call get_build_output_dir)) \
+	YAML_INPUT_DIR=$(OUTPUT_DIR)/yaml; \
+	YAML_OUTPUT_DIR=$(OUTPUT_DIR)/yaml; \
+	if [ ! -d "$$YAML_INPUT_DIR" ]; then \
+		echo "Error: YAML input directory $$YAML_INPUT_DIR does not exist"; \
+		echo "Please ensure all scenario yaml files are built first (os, cloud, middleware, java, cplus, cri, kubernetes)"; \
+		exit 1; \
+	fi; \
+	echo "Generating chaosblade.spec.yaml from scenario files in $$YAML_INPUT_DIR..."; \
+	env $(GO_MODULE) $(GO) run ./build/spec/spec.go $$YAML_INPUT_DIR $$YAML_OUTPUT_DIR; \
+	if [ -f "$$YAML_OUTPUT_DIR/chaosblade.spec.yaml" ]; then \
+		echo "Successfully generated chaosblade.spec.yaml at $$YAML_OUTPUT_DIR/chaosblade.spec.yaml"; \
+	else \
+		echo "Error: Failed to generate chaosblade.spec.yaml"; \
+		exit 1; \
+	fi
+
 .PHONY: format
 format: license-format
 	@echo "Running goimports and gofumpt to format Go code..."
@@ -605,7 +651,7 @@ help:
 	@echo '  make push_image                             # Push Docker images to registry'
 	@echo ''
 	@echo 'Component list:'
-	@echo '  cli, os, cloud, middleware, cri, cplus, java, kubernetes, nsexec, upx, check_yaml'
+	@echo '  cli, os, cloud, middleware, cri, cplus, java, kubernetes, nsexec, upx, check_yaml, spec_yaml'
 	@echo '  Use "all" to build all components'
 	@echo ''
 	@echo 'For more details, visit https://github.com/chaosblade-io/chaosblade'

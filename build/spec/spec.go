@@ -22,14 +22,11 @@ import (
 	"os"
 	"path"
 
-	"github.com/chaosblade-io/chaosblade-exec-cri/exec"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 
-	"github.com/chaosblade-io/chaosblade/cli/cmd"
+	"github.com/chaosblade-io/chaosblade/version"
 )
-
-var version = "1.7.4"
 
 func main() {
 	if len(os.Args) < 3 {
@@ -37,22 +34,24 @@ func main() {
 	}
 	filePath := os.Args[1]
 	targetPath := os.Args[2]
-	jvmSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version))
-	osSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-os-spec-%s.yaml", version))
-	cloudSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cloud-spec-%s.yaml", version))
-	k8sSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version))
-	criSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version))
-	cplusSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cplus-spec-%s.yaml", version))
+	jvmSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-jvm-spec-%s.yaml", version.Ver))
+	osSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-os-spec-%s.yaml", version.Ver))
+	cloudSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cloud-spec-%s.yaml", version.Ver))
+	middlewareSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-middleware-spec-%s.yaml", version.Ver))
+	k8sSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version.Ver))
+	criSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version.Ver))
+	cplusSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cplus-spec-%s.yaml", version.Ver))
 	chaosSpecFile := path.Join(targetPath, "chaosblade.spec.yaml")
 
 	osModels := getOsModels(osSpecFile)
 	cloudModels := getCloudModels(cloudSpecFile)
+	middlewareModels := getMiddlewareModels(middlewareSpecFile)
 	jvmModels := getJvmModels(jvmSpecFile)
 	cplusModels := getCplusModels(cplusSpecFile)
 	criModels := getCriModels(criSpecFile, jvmSpecFile)
 	k8sModels := getKubernetesModels(k8sSpecFile, jvmSpecFile)
 
-	models := mergeModels(osModels, cloudModels, jvmModels, cplusModels, criModels, k8sModels)
+	models := mergeModels(osModels, cloudModels, middlewareModels, jvmModels, cplusModels, criModels, k8sModels)
 
 	file, err := os.OpenFile(chaosSpecFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o755)
 	if err != nil {
@@ -78,6 +77,14 @@ func getCloudModels(cloudSpecFile string) *spec.Models {
 	return models
 }
 
+func getMiddlewareModels(middlewareSpecFile string) *spec.Models {
+	models, err := util.ParseSpecsToModel(middlewareSpecFile, nil)
+	if err != nil {
+		log.Fatalf("parse middleware spec failed, %s", err)
+	}
+	return models
+}
+
 func getJvmModels(jvmSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(jvmSpecFile, nil)
 	if err != nil {
@@ -89,6 +96,15 @@ func getJvmModels(jvmSpecFile string) *spec.Models {
 func getCplusModels(cplusSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(cplusSpecFile, nil)
 	if err != nil {
+		// CPlus spec file may not exist, return empty models
+		if os.IsNotExist(err) {
+			log.Printf("cplus spec file not found, skipping: %s", cplusSpecFile)
+			return &spec.Models{
+				Version: "v1",
+				Kind:    "plugin",
+				Models:  make([]spec.ExpCommandModel, 0),
+			}
+		}
 		log.Fatalf("parse cplus spec failed, %s", err)
 	}
 	return models
@@ -100,16 +116,65 @@ func getCriModels(criSpecFile, jvmSpecFile string) *spec.Models {
 		log.Fatalf("parse cri spec failed, %s", err)
 	}
 
+	// Extract container flags from CRI models
+	containerFlags := extractContainerFlags(criModels)
+
 	jvmModels := getJvmModels(jvmSpecFile)
 	for idx := range jvmModels.Models {
 		model := &jvmModels.Models[idx]
 		model.ExpScope = "cri"
-		spec.AddFlagsToModelSpec(exec.GetExecInContainerFlags, model)
+		// Add container flags to model
+		model.ExpFlags = append(model.ExpFlags, containerFlags...)
 		addFlagToActionSpec(model)
 		criModels.Models = append(criModels.Models, *model)
 	}
 
 	return criModels
+}
+
+// extractContainerFlags extracts container-related flags from CRI models
+func extractContainerFlags(criModels *spec.Models) []spec.ExpFlag {
+	containerFlagNames := map[string]bool{
+		"container-id":             true,
+		"container-name":           true,
+		"cri-endpoint":             true,
+		"container-runtime":        true,
+		"container-namespace":      true,
+		"container-label-selector": true,
+	}
+
+	flagsMap := make(map[string]spec.ExpFlag)
+	for _, model := range criModels.Models {
+		for _, action := range model.ExpActions {
+			for _, flag := range action.ActionFlags {
+				if containerFlagNames[flag.Name] {
+					flagsMap[flag.Name] = flag
+				}
+			}
+		}
+	}
+
+	// Convert map to slice, maintaining a consistent order
+	orderedFlags := []spec.ExpFlag{
+		{Name: "container-id", Desc: "Container id, when used with container-name, container-id is preferred", Required: false},
+		{Name: "container-name", Desc: "Container name, when used with container-id, container-id is preferred", Required: false},
+		{Name: "cri-endpoint", Desc: "Cri container socket endpoint", Required: false},
+		{Name: "container-runtime", Desc: "container runtime, support cri and containerd, default value is docker", Required: false},
+		{Name: "container-namespace", Desc: "container namespace, If container-runtime is containerd it will be used, default value is k8s.io", Required: false},
+		{Name: "container-label-selector", Desc: "Container label selector, when used with container-id or container-name, container-id or container-name is preferred", Required: false},
+	}
+
+	// Use flags from yaml if available, otherwise use defaults
+	result := make([]spec.ExpFlag, 0, len(orderedFlags))
+	for _, flag := range orderedFlags {
+		if yamlFlag, ok := flagsMap[flag.Name]; ok {
+			result = append(result, yamlFlag)
+		} else {
+			result = append(result, flag)
+		}
+	}
+
+	return result
 }
 
 func getKubernetesModels(k8sSpecFile, jvmSpecFile string) *spec.Models {
@@ -118,16 +183,74 @@ func getKubernetesModels(k8sSpecFile, jvmSpecFile string) *spec.Models {
 		log.Fatalf("parse kubernetes spec failed, %s", err)
 	}
 
+	// Extract resource flags from K8s models
+	resourceFlags := extractResourceFlags(models)
+
 	jvmModels := getJvmModels(jvmSpecFile)
 	for idx := range jvmModels.Models {
 		model := &jvmModels.Models[idx]
 
 		model.ExpScope = "container"
-		spec.AddFlagsToModelSpec(cmd.GetResourceFlags, model)
+		// Add resource flags to model
+		model.ExpFlags = append(model.ExpFlags, resourceFlags...)
 		addFlagToActionSpec(model)
 		models.Models = append(models.Models, *model)
 	}
 	return models
+}
+
+// extractResourceFlags extracts Kubernetes resource-related flags from K8s models
+func extractResourceFlags(k8sModels *spec.Models) []spec.ExpFlag {
+	resourceFlagNames := map[string]bool{
+		"names":           true,
+		"labels":          true,
+		"namespace":       true,
+		"kind":            true,
+		"container-names": true,
+		"container-ids":   true,
+		"evict-count":     true,
+		"evict-percent":   true,
+	}
+
+	flagsMap := make(map[string]spec.ExpFlag)
+	for _, model := range k8sModels.Models {
+		for _, action := range model.ExpActions {
+			for _, flag := range action.ActionFlags {
+				if resourceFlagNames[flag.Name] {
+					flagsMap[flag.Name] = flag
+				}
+			}
+			for _, flag := range action.ActionMatchers {
+				if resourceFlagNames[flag.Name] {
+					flagsMap[flag.Name] = flag
+				}
+			}
+		}
+	}
+
+	// Convert map to slice, maintaining a consistent order
+	orderedFlags := []spec.ExpFlag{
+		{Name: "names", Desc: "Resource names, such as pod name. You must add namespace flag for it. Multiple parameters are separated directly by commas", Required: false},
+		{Name: "labels", Desc: "Label selector, the relationship between values that are or", Required: false},
+		{Name: "namespace", Desc: "Namespace, such as default, for namespaced resources", Required: false},
+		{Name: "kind", Desc: "Resource kind, such as deployment", Required: false},
+		{Name: "container-names", Desc: "Container names, such as nginx-container", Required: false},
+		{Name: "container-ids", Desc: "Container ids", Required: false},
+		{Name: "evict-count", Desc: "Count of affected resource", Required: false},
+		{Name: "evict-percent", Desc: "Percent of affected resource, integer value without %", Required: false},
+	}
+
+	// Use flags from yaml if available, otherwise use defaults
+	result := make([]spec.ExpFlag, 0, len(orderedFlags))
+	for _, flag := range orderedFlags {
+		if yamlFlag, ok := flagsMap[flag.Name]; ok {
+			result = append(result, yamlFlag)
+		} else {
+			result = append(result, flag)
+		}
+	}
+
+	return result
 }
 
 func addFlagToActionSpec(model *spec.ExpCommandModel) {

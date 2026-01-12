@@ -6,19 +6,19 @@ import "time"
 
 var (
 	// Ver 版本号
-	Ver = "1.7.5"
+	Ver = "1.8.0"
 
 	// GitTag Git标签
-	GitTag = "v1.7.5"
+	GitTag = "v1.8.0"
 
 	// GitCommit Git提交哈希
-	GitCommit = "e2cb4f8"
+	GitCommit = "dcebc57"
 
 	// GitBranch Git分支
-	GitBranch = "1.8.0-dev"
+	GitBranch = "master"
 
 	// BuildTime 构建时间
-	BuildTime = "2025-10-20 01:58:16 UTC"
+	BuildTime = "2026-01-09 09:35:50 UTC"
 
 	// BuildTimeParsed 解析后的构建时间
 	BuildTimeParsed, _ = time.Parse("2006-01-02 15:04:05 UTC", BuildTime)
