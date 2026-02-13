@@ -29,7 +29,7 @@ import (
 	"github.com/chaosblade-io/chaosblade/cli/cmd"
 )
 
-var version = "1.7.4"
+var version = "v1.8.0"
 
 func main() {
 	if len(os.Args) < 3 {
@@ -43,6 +43,7 @@ func main() {
 	k8sSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version))
 	criSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version))
 	cplusSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cplus-spec-%s.yaml", version))
+	middlewareSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-middleware-spec-%s.yaml", version))
 	chaosSpecFile := path.Join(targetPath, "chaosblade.spec.yaml")
 
 	osModels := getOsModels(osSpecFile)
@@ -51,8 +52,8 @@ func main() {
 	cplusModels := getCplusModels(cplusSpecFile)
 	criModels := getCriModels(criSpecFile, jvmSpecFile)
 	k8sModels := getKubernetesModels(k8sSpecFile, jvmSpecFile)
-
-	models := mergeModels(osModels, cloudModels, jvmModels, cplusModels, criModels, k8sModels)
+	middlewareModels := getMiddlewareModels(middlewareSpecFile)
+	models := mergeModels(osModels, cloudModels, jvmModels, cplusModels, criModels, k8sModels, middlewareModels)
 
 	file, err := os.OpenFile(chaosSpecFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o755)
 	if err != nil {
@@ -78,6 +79,13 @@ func getCloudModels(cloudSpecFile string) *spec.Models {
 	return models
 }
 
+func getMiddlewareModels(middlewareSpecFile string) *spec.Models {
+	models, err := util.ParseSpecsToModel(middlewareSpecFile, nil)
+	if err != nil {
+		log.Fatalf("parse middleware spec failed, %s", err)
+	}
+	return models
+}
 func getJvmModels(jvmSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(jvmSpecFile, nil)
 	if err != nil {
