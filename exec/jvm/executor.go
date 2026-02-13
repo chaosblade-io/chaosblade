@@ -33,7 +33,7 @@ import (
 	"github.com/chaosblade-io/chaosblade/data"
 )
 
-const DefaultUri = "sandbox/" + DefaultNamespace + "/module/http/chaosblade"
+const DefaultUri = "sandbox/" + DefaultNamespace + "/module/http/" + DefaultNamespace
 
 // Executor for jvm experiment
 type Executor struct {
