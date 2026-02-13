@@ -39,7 +39,8 @@ import (
 // attach sandbox to java process
 var cl = channel.NewLocalChannel()
 
-const DefaultNamespace = "chaosblade"
+// const DefaultNamespace = "chaosblade"
+const DefaultNamespace = "csbusiness"
 
 // checkSudoAvailable 检查sudo命令是否可用
 func checkSudoAvailable(ctx context.Context) bool {
@@ -65,7 +66,7 @@ func Attach(ctx context.Context, port, javaHome, pid string) (*spec.Response, st
 
 // curl -s http://localhost:$2/sandbox/default/module/http/chaosblade/status 2>&1
 func check(ctx context.Context, port string) *spec.Response {
-	url := getSandboxUrl(port, "chaosblade/status", "")
+	url := getSandboxUrl(port, DefaultNamespace+"/status", "")
 	result, err, code := util.Curl(ctx, url)
 	if code == 200 {
 		return spec.ReturnSuccess(result)
@@ -80,7 +81,7 @@ func check(ctx context.Context, port string) *spec.Response {
 
 // active chaosblade bin/sandbox.sh -p $pid -P $2 -a chaosblade 2>&1
 func active(ctx context.Context, port string) *spec.Response {
-	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids=chaosblade")
+	url := getSandboxUrl(port, "sandbox-module-mgr/active", "&ids="+DefaultNamespace)
 	result, err, code := util.Curl(ctx, url)
 	if err != nil {
 		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, err))
