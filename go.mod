@@ -146,4 +146,7 @@ require (
 	sigs.k8s.io/yaml v1.2.0 // indirect
 )
 
-replace k8s.io/client-go => k8s.io/client-go v0.20.6
+replace (
+	github.com/go-logr/logr => github.com/go-logr/logr v0.4.0
+	k8s.io/client-go => k8s.io/client-go v0.20.6
+)
