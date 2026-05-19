@@ -1,0 +1,9 @@
+
+╭───────────────────────────────  ✗ TASK FAILED ───────────────────────────────╮
+│                                                                              │
+│    Task ID:    t-fail                                                        │
+│   Cause: safety_rejected: Namespace 'kube-system' is in the safety blacklist │
+│   Hint:  try a non-system namespace such as cms-demo                         │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
