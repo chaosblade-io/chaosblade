@@ -56,7 +56,6 @@ export async function resolveServer(): Promise<ServerHandle> {
 }
 
 export async function startEmbeddedServer(): Promise<ServerHandle> {
-  const py = process.env["BLADE_AI_PYTHON"] ?? "python";
   // Force --host 127.0.0.1 for two reasons:
   //   1. The embedded server is local-only by design — binding 0.0.0.0
   //      would expose the agent to the LAN, which is a real risk for
@@ -65,9 +64,7 @@ export async function startEmbeddedServer(): Promise<ServerHandle> {
   //      a socket on 0.0.0.0 then asks uvicorn to re-bind the same
   //      port. That occasionally fails silently (uvicorn ends up on a
   //      different port). 127.0.0.1 sidesteps the whole issue.
-  const args = [
-    "-m",
-    "chaos_agent.server.app",
+  const commonArgs = [
     "--host",
     "127.0.0.1",
     "--port",
@@ -75,13 +72,37 @@ export async function startEmbeddedServer(): Promise<ServerHandle> {
     "--ready-stdout",
   ];
 
+  // Two spawn modes — picked by the parent Python launcher:
+  //
+  //   * PyInstaller / curl-bash install: the launcher exports
+  //     ``BLADE_AI_SERVER_BIN`` pointing at the bundled blade-ai
+  //     binary. There is no external ``python`` on the user's PATH
+  //     in this distribution mode, so we re-invoke the same binary
+  //     with the hidden ``__embedded_server__`` subcommand. It runs
+  //     ``run_server()`` directly, bypassing typer's CLI dispatch
+  //     overhead for the server-only fast path.
+  //   * pip / npm dev / source build: env var is unset; fall back
+  //     to ``python -m chaos_agent.server.app ...`` (or whatever
+  //     ``BLADE_AI_PYTHON`` points to) — same path the project has
+  //     used since pre-PyInstaller days.
+  const bin = process.env["BLADE_AI_SERVER_BIN"];
+  let cmd: string;
+  let args: string[];
+  if (bin) {
+    cmd = bin;
+    args = ["__embedded_server__", ...commonArgs];
+  } else {
+    cmd = process.env["BLADE_AI_PYTHON"] ?? "python";
+    args = ["-m", "chaos_agent.server.app", ...commonArgs];
+  }
+
   // Pipe stderr into a per-pid log file so server tracebacks don't
   // tear up Ink's render. Best-effort: any FS error falls back to
   // discarding stderr entirely (the user can still re-run with
   // ``BLADE_AI_SERVER=...`` against a server they started themselves).
   const stderrLog = openStderrLog();
 
-  const child = spawn(py, args, {
+  const child = spawn(cmd, args, {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, PYTHONUNBUFFERED: "1" },
   });
