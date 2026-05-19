@@ -179,7 +179,6 @@ jobs:
             arch: arm64
             target: linux_arm64
             runner: ubuntu-24.04-arm
-            use_docker: true
           - os: darwin
             arch: amd64
             target: darwin_amd64
@@ -270,6 +269,19 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          # ``architecture`` is keyed off matrix.arch so each entry gets
+          # the right interpreter slice:
+          #   - linux/amd64 (ubuntu-latest, x86_64 host)         → x64
+          #   - linux/arm64 (ubuntu-24.04-arm, arm64 host)       → arm64
+          #   - darwin/amd64 (macos-latest, Apple Silicon host)  → x64
+          #         setup-python installs an x86_64 Python; macOS
+          #         transparently runs it under Rosetta 2. pip then
+          #         pulls x86_64 wheels (no universal2 dependency
+          #         dance), and PyInstaller bakes a native x86_64
+          #         bundle from that interpreter — no cross-slice
+          #         arch mismatches like the watchdog .so failure.
+          #   - darwin/arm64 (macos-latest, Apple Silicon host)  → arm64
+          architecture: ${{ matrix.arch == 'amd64' && 'x64' || 'arm64' }}
           cache: 'pip'
           cache-dependency-path: blade-ai/pyproject.toml
 
@@ -287,12 +299,12 @@ jobs:
         working-directory: blade-ai
         run: |
           set -euo pipefail
-          # macOS spec reads BLADE_TARGET_ARCH to pin the PyInstaller
-          # bootloader to the right slice (universal2 wheels). Linux
-          # native ignores it (host arch == target arch on linux/amd64).
-          # Note: darwin/amd64 builds on macos-latest (arm64 host) →
-          # PyInstaller does the universal2 cross-slice; native deps
-          # must ship universal2 wheels for this to succeed.
+          # BLADE_TARGET_ARCH is a belt-and-braces hint to blade-ai.spec
+          # so PyInstaller emits a bootloader for the right slice. The
+          # interpreter installed above is already the right arch (see
+          # architecture: above), so this mostly mirrors what PyInstaller
+          # would auto-detect — but stating it explicitly avoids surprises
+          # if a future PyInstaller version changes its default.
           case "${{ matrix.os }}-${{ matrix.arch }}" in
             darwin-amd64) export BLADE_TARGET_ARCH=x86_64 ;;
             darwin-arm64) export BLADE_TARGET_ARCH=arm64 ;;
