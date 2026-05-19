@@ -26,5 +26,18 @@ export default defineConfig({
     // by passing `vitest --reporter=verbose --bail=0`.
     bail: 0,
     reporters: ["default"],
+    // Pin locale to zh for test runs. Several Ink-render assertions
+    // (ConfirmMessage, YesNoFeedbackSelect) are written against the zh
+    // dictionary — that's documented in the file headers as "active
+    // dictionary in tests is zh". Locally on macOS this happens to
+    // pass because ``LC_ALL=zh_*`` is the developer default, but on
+    // GitHub-hosted Linux runners ``LC_ALL=C.UTF-8`` and i18n falls
+    // through to en, breaking 8 string assertions. Forcing
+    // ``BLADE_AI_LANG=zh`` here makes the test environment match the
+    // assertions regardless of host locale; ``i18n/index.ts`` reads
+    // this env var BEFORE LC_ALL/LANG, so it always wins.
+    env: {
+      BLADE_AI_LANG: "zh",
+    },
   },
 });

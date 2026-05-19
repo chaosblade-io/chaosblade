@@ -66,6 +66,10 @@ datas = [
     # would mean every binary user falls back to the legacy Python
     # TUI that never shipped this version's behaviour).
     ('tui/dist/cli.js', 'chaos_agent/_tui_assets'),
+    # Marker so Node parses cli.js as ESM without walking up the
+    # directory tree (which can hit the user's home ``package.json``
+    # in a PyInstaller bundle and trigger ``MODULE_TYPELESS_PACKAGE_JSON``).
+    ('tui/dist/package.json', 'chaos_agent/_tui_assets'),
 ]
 
 # chaosblade tool — per platform. Skip on Windows (no upstream build).

@@ -84,6 +84,16 @@ def _launch_default_tui() -> None:
         _run_python_tui()
         return
 
+    # PyInstaller --onedir / --onefile sets ``sys.frozen``. In that mode
+    # there is NO external Python interpreter on the user's PATH (the
+    # whole point of curl-bash distribution), so the TS TUI's default
+    # ``spawn("python", [...])`` fails with ENOENT. Hand it our own
+    # bundled binary path; ``server-process.ts`` reads this env var and
+    # invokes ``<bin> __embedded_server__ ...`` to start the FastAPI
+    # server instead of ``python -m chaos_agent.server.app ...``.
+    if getattr(sys, "frozen", False):
+        os.environ["BLADE_AI_SERVER_BIN"] = sys.executable
+
     argv, exec_path = bundle
     try:
         os.execvp(exec_path, argv)
@@ -209,6 +219,26 @@ app.command(name="confirm", help="Confirm or reject a pending task")(confirm_com
 app.command(name="version", help="Show version information")(version_command)
 app.command(name="update", help="Update blade-ai to the latest version")(update_command)
 app.command(name="uninstall", help="Uninstall blade-ai from the system")(uninstall_command)
+
+
+# Hidden subcommand: started by the TS TUI in PyInstaller mode to host
+# the embedded FastAPI server. Mirrors the ``python -m chaos_agent.server.app``
+# argparse contract (``_cli`` in server/app.py) but routed through the
+# bundled blade-ai binary so curl-bash installs don't need an external
+# Python on PATH. The double underscores keep it visually distinct from
+# user-facing commands; ``hidden=True`` keeps it out of ``--help``.
+@app.command(
+    name="__embedded_server__",
+    hidden=True,
+    help="Internal: launch embedded FastAPI server (TS TUI bridge).",
+)
+def _embedded_server_command(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(0, "--port"),
+    ready_stdout: bool = typer.Option(False, "--ready-stdout"),
+) -> None:
+    from chaos_agent.server.app import run_server
+    run_server(host=host, port=port, ready_stdout=ready_stdout)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,20 @@
+import { writeFileSync } from "node:fs";
 import { defineConfig } from "tsup";
 
 export default defineConfig({
   entry: ["src/cli.tsx"],
   format: ["esm"],
   target: "node22",
+  // Drop a marker package.json next to dist/cli.js. Without it, Node 22
+  // sees a bare ``.js`` file with ESM syntax and walks UP the directory
+  // tree looking for a closest ``package.json`` to determine module
+  // type. In a PyInstaller bundle the closest match might be the
+  // user's own ``~/package.json`` (CommonJS by default), triggering
+  // the ``MODULE_TYPELESS_PACKAGE_JSON`` warning + a re-parse penalty
+  // on every cold start. The marker eliminates the lookup ambiguity.
+  onSuccess: async () => {
+    writeFileSync("dist/package.json", '{"type":"module"}\n');
+  },
   banner: {
     // The bundle is ESM. Several transitive deps (rooted in
     // ``react-reconciler``) call ``require()`` at runtime — esbuild
