@@ -163,35 +163,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            platform: linux-amd64
-            chaosblade_arch: linux_amd64
-            target_arch: ''
+          - os: linux
+            arch: amd64
+            target: linux_amd64
+            runner: ubuntu-latest
+          - os: linux
+            arch: arm64
+            target: linux_arm64
+            runner: ubuntu-24.04-arm
             use_docker: true
-            docker_image: 'quay.io/pypa/manylinux2014_x86_64'
+          - os: darwin
+            arch: amd64
+            target: darwin_amd64
+            runner: macos-latest
+          - os: darwin
+            arch: arm64
+            target: darwin_arm64
+            runner: macos-latest
 
-          - os: ubuntu-24.04-arm
-            platform: linux-arm64
-            chaosblade_arch: linux_arm64
-            target_arch: ''
-            use_docker: true
-            docker_image: 'quay.io/pypa/manylinux2014_aarch64'
-
-          - os: macos-13
-            platform: darwin-amd64
-            chaosblade_arch: darwin_amd64
-            target_arch: 'x86_64'
-            use_docker: false
-            docker_image: ''
-
-          - os: macos-latest
-            platform: darwin-arm64
-            chaosblade_arch: darwin_arm64
-            target_arch: 'arm64'
-            use_docker: false
-            docker_image: ''
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -208,12 +198,11 @@ jobs:
         run: ls -la blade-ai/tui/dist/cli.js
 
       - name: Download ChaosBlade tool
-        if: matrix.chaosblade_arch != ''
         shell: bash
         run: |
           set -euo pipefail
           VER="${CHAOSBLADE_VERSION}"
-          ARCH="${{ matrix.chaosblade_arch }}"
+          ARCH="${{ matrix.target }}"
           URL="https://github.com/chaosblade-io/chaosblade/releases/download/v${VER}/chaosblade-${VER}-${ARCH}.tar.gz"
           echo "Fetching $URL"
           curl -fSL --retry 3 --retry-delay 2 -o /tmp/chaosblade.tar.gz "$URL"
@@ -225,18 +214,24 @@ jobs:
           ls -la blade-ai/vendor/chaosblade
           file blade-ai/vendor/chaosblade/blade || true
 
-      # ── Linux: build inside manylinux docker, mount blade-ai/ as /src ─
+      # ── Linux/arm64: build inside manylinux docker (glibc 2.17 baseline) ─
       - name: Build with PyInstaller (manylinux Docker)
         if: matrix.use_docker
         shell: bash
-        env:
-          BLADE_TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
+          set -euo pipefail
+          # Pick the manylinux2014 image that matches the target arch.
+          # Image base is hard-coded here (instead of in the matrix) to
+          # keep the matrix entries lean — the mapping never changes.
+          case "${{ matrix.target }}" in
+            linux_amd64) IMG=quay.io/pypa/manylinux2014_x86_64 ;;
+            linux_arm64) IMG=quay.io/pypa/manylinux2014_aarch64 ;;
+            *) echo "::error::no manylinux image for target ${{ matrix.target }}"; exit 1 ;;
+          esac
           docker run --rm \
             -v "$PWD/blade-ai:/src" \
             -w /src \
-            -e BLADE_TARGET_ARCH \
-            "${{ matrix.docker_image }}" \
+            "$IMG" \
             bash -c '
               set -euo pipefail
               export PATH=/opt/python/cp311-cp311/bin:$PATH
@@ -246,7 +241,7 @@ jobs:
               python -m PyInstaller blade-ai.spec --noconfirm
             '
 
-      # ── macOS: build natively ──────────────────────────────────────
+      # ── Native build: linux/amd64 + darwin/{amd64,arm64} ────────────
       - name: Set up Python
         if: '!matrix.use_docker'
         uses: actions/setup-python@v5
@@ -267,14 +262,24 @@ jobs:
         if: '!matrix.use_docker'
         shell: bash
         working-directory: blade-ai
-        env:
-          BLADE_TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
+          set -euo pipefail
+          # macOS spec reads BLADE_TARGET_ARCH to pin the PyInstaller
+          # bootloader to the right slice (universal2 wheels). Linux
+          # native ignores it (host arch == target arch on linux/amd64).
+          # Note: darwin/amd64 builds on macos-latest (arm64 host) →
+          # PyInstaller does the universal2 cross-slice; native deps
+          # must ship universal2 wheels for this to succeed.
+          case "${{ matrix.os }}-${{ matrix.arch }}" in
+            darwin-amd64) export BLADE_TARGET_ARCH=x86_64 ;;
+            darwin-arm64) export BLADE_TARGET_ARCH=arm64 ;;
+          esac
           python -m PyInstaller blade-ai.spec --noconfirm
 
-      # macOS ad-hoc codesign — dist/ lives at blade-ai/dist/
+      # Ad-hoc codesign so the unsigned bootloader doesn't get killed
+      # by Gatekeeper when users curl-bash install on macOS.
       - name: Ad-hoc codesign (macOS)
-        if: runner.os == 'macOS'
+        if: matrix.os == 'darwin'
         shell: bash
         run: |
           codesign --force --deep --sign - blade-ai/dist/blade-ai/blade-ai
@@ -282,13 +287,13 @@ jobs:
       - name: Package Unix archive
         shell: bash
         run: |
-          PLATFORM="${{ matrix.platform }}"
+          PLATFORM="${{ matrix.os }}-${{ matrix.arch }}"
           tar -czf "blade-ai-${PLATFORM}.tar.gz" -C blade-ai/dist blade-ai
 
       - uses: actions/upload-artifact@v4
         with:
-          name: blade-ai-${{ matrix.platform }}
-          path: blade-ai-${{ matrix.platform }}.tar.gz
+          name: blade-ai-${{ matrix.os }}-${{ matrix.arch }}
+          path: blade-ai-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
           retention-days: 1
 
