@@ -1,0 +1,366 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# blade-ai installer — curl | bash one-click installation script.
+#
+# Usage:
+#   curl -fsSL https://chaosblade.io/install-agent.sh | bash
+#   curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0
+#   curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --prefix /opt/blade-ai
+#
+# Note: ``--version`` and ``BLADE_AI_VERSION`` accept the bare semver
+# (``0.1.0``); the script internally prefixes it with ``blade-ai-v``
+# to match the chaosblade monorepo's tag scheme.
+#
+# Environment variables:
+#   BLADE_AI_VERSION           — override the version to install (default: hardcoded below)
+#   BLADE_AI_INSTALL_DIR       — override the installation directory
+#   BLADE_AI_NO_MODIFY_PATH    — set to 1 to skip shell profile PATH modification
+#   BLADE_AI_MIRROR            — override the download base URL (default: GitHub Releases)
+#   BLADE_AI_SKIP_VERIFY       — set to 1 to skip SHA256 checksum verification (NOT recommended)
+
+set -euo pipefail
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+APP_NAME="blade-ai"
+APP_VERSION="${BLADE_AI_VERSION:-0.1.0}"  # Updated per release
+# Tag namespace: chaosblade monorepo hosts blade-ai under a prefixed
+# tag so it doesn't collide with chaosblade's own ``v*`` tags. Bump
+# this prefix together with ``release-blade-ai.yml``'s trigger.
+TAG="blade-ai-v${APP_VERSION}"
+RECEIPT_HOME="$HOME/.blade-ai"
+VERSIONS_DIR="$RECEIPT_HOME/versions"
+NO_MODIFY_PATH="${BLADE_AI_NO_MODIFY_PATH:-0}"
+SKIP_VERIFY="${BLADE_AI_SKIP_VERIFY:-0}"
+
+# ── Re-exec with bash if running under sh ─────────────────────────────────────
+
+if [ -z "${BASH_VERSION:-}" ] && [ -z "${__BLADE_AI_INSTALL_REEXEC:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        export __BLADE_AI_INSTALL_REEXEC=1
+        exec bash -- "$0" "$@"
+    else
+        echo "Error: This script requires bash. Please install bash first."
+        exit 1
+    fi
+fi
+
+# ── Color support ──────────────────────────────────────────────────────────────
+
+if [ -n "${NO_COLOR+x}" ] || [ ! -t 1 ]; then
+    CYAN='' GREEN='' YELLOW='' BLUE='' RED='' BOLD='' DIM='' NC=''
+else
+    CYAN='\033[0;36m'  GREEN='\033[0;32m'  YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'   RED='\033[0;31m'    BOLD='\033[1m'
+    DIM='\033[2m'       NC='\033[0m'
+fi
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+step()   { echo -e "${BLUE}▸${NC} ${1}"; }
+ok()     { echo -ne "\033[1A\033[2K"; echo -e "${GREEN}✓${NC} ${1}"; }
+warn()   { echo -e "${YELLOW}⚠${NC} ${1}"; }
+err()    { echo -e "${RED}✗${NC} ${1}" >&2; exit 1; }
+info()   { echo -e "${DIM}${1}${NC}"; }
+
+# ── Parse arguments ────────────────────────────────────────────────────────────
+
+FORCE_INSTALL_DIR=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --version)
+            if [[ -z "${2:-}" ]] || [[ "$2" == -* ]]; then err "--version requires a value"; fi
+            APP_VERSION="$2"; shift 2 ;;
+        --prefix)
+            if [[ -z "${2:-}" ]] || [[ "$2" == -* ]]; then err "--prefix requires a value"; fi
+            FORCE_INSTALL_DIR="$2"; shift 2 ;;
+        --no-modify-path)
+            NO_MODIFY_PATH=1; shift ;;
+        --skip-verify)
+            SKIP_VERIFY=1; warn "Skipping checksum verification"; shift ;;
+        -h|--help)
+            echo "Usage: $0 [OPTIONS]"
+            echo "  --version VERSION   Install specific version (default: ${APP_VERSION})"
+            echo "  --prefix PATH       Install to custom directory"
+            echo "  --no-modify-path    Don't modify shell profile PATH"
+            echo "  --skip-verify       Skip SHA256 verification (NOT recommended)"
+            echo "  -h, --help          Show this help"
+            exit 0 ;;
+        *) err "Unknown option: $1" ;;
+    esac
+done
+
+# Re-derive TAG if --version changed APP_VERSION (mirrors the
+# ``blade-ai-v`` prefix from the initial assignment so a user passing
+# ``--version 0.2.0`` lands on tag ``blade-ai-v0.2.0``).
+TAG="blade-ai-v${APP_VERSION}"
+
+# ── Detect download tool ───────────────────────────────────────────────────────
+
+downloader() {
+    local _url="$1" _file="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fSL --progress-bar "${_url}" -o "${_file}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --show-progress -O "${_file}" "${_url}"
+    else
+        err "Neither curl nor wget found. Install one first."
+    fi
+}
+
+# ── OS & Architecture detection ────────────────────────────────────────────────
+
+step "Detecting system architecture..."
+
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+ARCH="$(uname -m)"
+
+case "${OS}-${ARCH}" in
+    linux-x86_64|linux-amd64)   PLATFORM="linux-amd64" ;;
+    linux-aarch64|linux-arm64)  PLATFORM="linux-arm64" ;;
+    darwin-x86_64|darwin-amd64) PLATFORM="darwin-amd64" ;;
+    darwin-arm64)               PLATFORM="darwin-arm64" ;;
+    *) err "Unsupported platform: ${OS}-${ARCH}" ;;
+esac
+
+ok "Detected ${PLATFORM}"
+
+# ── Determine install directory ────────────────────────────────────────────────
+
+if [[ -n "${FORCE_INSTALL_DIR}" ]]; then
+    INSTALL_DIR="${FORCE_INSTALL_DIR}"
+    NO_MODIFY_PATH=1  # Custom install dir: user manages PATH themselves
+else
+    INSTALL_DIR="${BLADE_AI_INSTALL_DIR:-${VERSIONS_DIR}/${TAG}}"
+fi
+
+BIN_DIR="${INSTALL_DIR}"
+SYMLINK_DIR="$HOME/.local/bin"
+
+# ── Download URL construction ──────────────────────────────────────────────────
+
+BASE_URL="${BLADE_AI_MIRROR:-https://github.com/chaosblade-io/chaosblade/releases/download}"
+DOWNLOAD_URL="${BASE_URL}/${TAG}/blade-ai-${PLATFORM}.tar.gz"
+CHECKSUM_URL="${BASE_URL}/${TAG}/checksums.txt"
+
+info "Download URL: ${DOWNLOAD_URL}"
+
+# ── Atomic download + verification ─────────────────────────────────────────────
+
+step "Downloading ${APP_NAME} ${APP_VERSION}..."
+
+mkdir -p "${VERSIONS_DIR}"
+TMP_DIR="$(mktemp -d "${VERSIONS_DIR}/.tmp-${TAG}-XXXXXXXXXXXX")"
+
+cleanup() { rm -rf "${TMP_DIR}"; }
+trap cleanup EXIT
+
+TMP_TAR="${TMP_DIR}/blade-ai.tar.gz"
+
+downloader "${DOWNLOAD_URL}" "${TMP_TAR}"
+
+ok "Download complete"
+
+# ── SHA256 checksum verification ──────────────────────────────────────────────
+
+if [[ "${SKIP_VERIFY}" != "1" ]]; then
+    step "Verifying checksum..."
+
+    TMP_CHECKSUM="${TMP_DIR}/checksums.txt"
+    downloader "${CHECKSUM_URL}" "${TMP_CHECKSUM}" 2>/dev/null || {
+        warn "Checksum file not found at ${CHECKSUM_URL}"
+        warn "Skipping verification (checksums.txt unavailable for this release)"
+        SKIP_VERIFY=1
+    }
+
+    if [[ "${SKIP_VERIFY}" != "1" ]]; then
+        EXPECTED_HASH="$(grep "blade-ai-${PLATFORM}.tar.gz" "${TMP_CHECKSUM}" | awk '{print $1}')"
+        if [[ -z "${EXPECTED_HASH}" ]]; then
+            err "No checksum entry for blade-ai-${PLATFORM}.tar.gz in checksums.txt"
+        fi
+
+        ACTUAL_HASH="$(command -v sha256sum >/dev/null 2>&1 && sha256sum "${TMP_TAR}" | awk '{print $1}' || shasum -a 256 "${TMP_TAR}" | awk '{print $1}')"
+
+        if [[ "${EXPECTED_HASH}" != "${ACTUAL_HASH}" ]]; then
+            err "Checksum mismatch!\n  Expected: ${EXPECTED_HASH}\n  Actual:   ${ACTUAL_HASH}"
+        fi
+
+        ok "Checksum verified"
+    fi
+fi
+
+# ── Extract ────────────────────────────────────────────────────────────────────
+
+step "Extracting package..."
+
+# --strip-components=1 removes the top-level "blade-ai/" directory from the tar
+tar --strip-components=1 -xzf "${TMP_TAR}" -C "${TMP_DIR}"
+
+ok "Extraction complete"
+
+# ── Atomic move to final destination ──────────────────────────────────────────
+
+step "Installing to ${INSTALL_DIR}..."
+
+# Remove previous version directory if it exists
+if [[ -d "${INSTALL_DIR}" ]]; then
+    rm -rf "${INSTALL_DIR}"
+fi
+
+# Atomic move: on same filesystem this is instant; cross-FS is still safe
+if ! mv "${TMP_DIR}" "${INSTALL_DIR}" 2>/dev/null; then
+    # Cross-filesystem move: fall back to copy + remove
+    mkdir -p "${INSTALL_DIR}"
+    cp -r "${TMP_DIR}/." "${INSTALL_DIR}/"
+    rm -rf "${TMP_DIR}"
+fi
+
+ok "Installed to ${INSTALL_DIR}"
+
+# Disable cleanup trap (files already in final location)
+trap - EXIT
+
+# ── Create symlink ────────────────────────────────────────────────────────────
+
+step "Creating symlink..."
+
+mkdir -p "${SYMLINK_DIR}"
+ln -sf "${INSTALL_DIR}/blade-ai" "${SYMLINK_DIR}/blade-ai"
+
+ok "Symlink created: ${SYMLINK_DIR}/blade-ai -> ${INSTALL_DIR}/blade-ai"
+
+# ── Write receipt ─────────────────────────────────────────────────────────────
+
+mkdir -p "${RECEIPT_HOME}"
+cat > "${RECEIPT_HOME}/receipt.json" <<EOF
+{
+  "version": "${APP_VERSION}",
+  "platform": "${PLATFORM}",
+  "install_dir": "${INSTALL_DIR}",
+  "symlink_dir": "${SYMLINK_DIR}",
+  "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "source": "curl-bash"
+}
+EOF
+
+# ── Write install manifest (for uninstall) ────────────────────────────────────
+
+cat > "${RECEIPT_HOME}/install-manifest.json" <<EOF
+{
+  "version": "${APP_VERSION}",
+  "platform": "${PLATFORM}",
+  "install_dir": "${INSTALL_DIR}",
+  "symlink": "${SYMLINK_DIR}/blade-ai",
+  "receipt": "${RECEIPT_HOME}/receipt.json",
+  "modified_files": []
+}
+EOF
+
+# ── PATH configuration ────────────────────────────────────────────────────────
+
+# Check if ~/.local/bin is already in PATH
+if [[ ":${PATH}:" == *":${SYMLINK_DIR}:"* ]]; then
+    NO_MODIFY_PATH=1  # Already configured
+fi
+
+if [[ "${NO_MODIFY_PATH}" == "0" ]]; then
+    step "Configuring PATH..."
+
+    # Determine which shell rc files exist and are writable
+    CURRENT_SHELL="$(basename "${SHELL}")"
+
+    modified_profiles=()
+
+    add_to_profile() {
+        local _profile="$1" _line="$2"
+        if [[ -f "${_profile}" ]] && ! grep -qF "${_line}" "${_profile}" 2>/dev/null; then
+            echo "${_line}" >> "${_profile}"
+            modified_profiles+=("${_profile}")
+        fi
+    }
+
+    case "${CURRENT_SHELL}" in
+        bash)
+            add_to_profile "$HOME/.bashrc" "export PATH=\"\$HOME/.local/bin:\$PATH\"  # blade-ai"
+            # .bash_profile for login shells (macOS Terminal)
+            if [[ -f "$HOME/.bash_profile" ]]; then
+                add_to_profile "$HOME/.bash_profile" "export PATH=\"\$HOME/.local/bin:\$PATH\"  # blade-ai"
+            fi
+            ;;
+        zsh)
+            add_to_profile "$HOME/.zshrc" "export PATH=\"\$HOME/.local/bin:\$PATH\"  # blade-ai"
+            # .zprofile for login shells
+            if [[ -f "$HOME/.zprofile" ]]; then
+                add_to_profile "$HOME/.zprofile" "export PATH=\"\$HOME/.local/bin:\$PATH\"  # blade-ai"
+            fi
+            ;;
+        fish)
+            mkdir -p "$HOME/.config/fish"
+            FISH_CONF="$HOME/.config/fish/config.fish"
+            if ! grep -qF 'fish_add_path $HOME/.local/bin' "${FISH_CONF}" 2>/dev/null; then
+                echo 'fish_add_path $HOME/.local/bin  # blade-ai' >> "${FISH_CONF}"
+                modified_profiles+=("${FISH_CONF}")
+            fi
+            ;;
+        *)
+            # Fallback: try .profile
+            add_to_profile "$HOME/.profile" "export PATH=\"\$HOME/.local/bin:\$PATH\"  # blade-ai"
+            ;;
+    esac
+
+    # Update install manifest with modified files
+    if [[ ${#modified_profiles[@]} -gt 0 ]]; then
+        MANIFEST_PATH="${RECEIPT_HOME}/install-manifest.json"
+        # Build JSON array of modified profile paths
+        MODIFIED_JSON="$(printf '%s\n' "${modified_profiles[@]}" | python3 -c "import sys,json; print(json.dumps([l.strip() for l in sys.stdin]))" 2>/dev/null)"
+        if [[ -n "${MODIFIED_JSON}" ]]; then
+            python3 -c "
+import json
+m = json.load(open('${MANIFEST_PATH}'))
+m['modified_files'] = json.loads('${MODIFIED_JSON}')
+json.dump(m, open('${MANIFEST_PATH}', 'w'), indent=2)
+" 2>/dev/null || true
+        fi
+
+        # Make PATH available in current session
+        export PATH="${SYMLINK_DIR}:${PATH}"
+
+        ok "PATH configured (${#modified_profiles[@]} profile(s) updated)"
+    else
+        warn "Could not modify any shell profile"
+        warn "Please manually add ${SYMLINK_DIR} to your PATH"
+    fi
+fi
+
+# ── GitHub Actions PATH support ────────────────────────────────────────────────
+
+if [[ -n "${GITHUB_PATH:-}" ]]; then
+    echo "${SYMLINK_DIR}" >> "${GITHUB_PATH}"
+fi
+
+# ── Success message ────────────────────────────────────────────────────────────
+
+echo ""
+echo -e "${BOLD}${GREEN}✨ blade-ai ${APP_VERSION} installed!${NC}"
+echo ""
+
+if [[ ":${PATH}:" == *":${SYMLINK_DIR}:"* ]]; then
+    echo -e "${BOLD}Start using blade-ai:${NC}"
+    echo -e "   ${BOLD}blade-ai${NC}"
+else
+    echo -e "${BOLD}Next steps:${NC}"
+    echo ""
+    echo -e "  1. Add ~/.local/bin to your PATH:"
+    echo -e "     ${BLUE}export PATH=\"\$HOME/.local/bin:\$PATH\"${NC}"
+    echo ""
+    echo -e "  2. Then start blade-ai:"
+    echo -e "     ${BLUE}blade-ai${NC}"
+    echo ""
+    echo -e "  Or restart your terminal to apply PATH changes."
+fi
+
+echo ""
+echo -e "${DIM}Uninstall: blade-ai uninstall${NC}"
+echo -e "${DIM}Update:    blade-ai update${NC}"
+echo ""

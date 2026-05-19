@@ -1,0 +1,29 @@
+blade-ai
+Copyright 2026 ChaosBlade Authors
+
+This product is part of the broader ChaosBlade ecosystem
+(https://github.com/chaosblade-io). It is licensed under the Apache
+License, Version 2.0 — see the LICENSE file at the repository root.
+
+Third-party dependencies (each licensed under its own terms; refer to
+the upstream project for canonical LICENSE / NOTICE files):
+
+  Python (pyproject.toml)
+    - LangGraph, LangChain — https://github.com/langchain-ai/langchain (MIT)
+    - FastAPI               — https://github.com/tiangolo/fastapi (MIT)
+    - Starlette             — https://github.com/encode/starlette (BSD-3-Clause)
+    - Uvicorn               — https://github.com/encode/uvicorn (BSD-3-Clause)
+    - Pydantic              — https://github.com/pydantic/pydantic (MIT)
+    - Typer                 — https://github.com/tiangolo/typer (MIT)
+    - Rich                  — https://github.com/Textualize/rich (MIT)
+
+  TypeScript / Node (tui/package.json)
+    - Ink                   — https://github.com/vadimdemedes/ink (MIT)
+    - React                 — https://github.com/facebook/react (MIT)
+    - cli-spinners          — https://github.com/sindresorhus/cli-spinners (MIT)
+    - marked                — https://github.com/markedjs/marked (MIT)
+
+This NOTICE consolidates first-party attribution and the most prominent
+runtime dependencies. It is not an exhaustive list of every transitive
+dependency; consult ``pyproject.toml`` / ``tui/package-lock.json`` for
+the full tree.
