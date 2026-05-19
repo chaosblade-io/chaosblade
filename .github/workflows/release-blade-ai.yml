@@ -152,7 +152,15 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: tui-bundle
-          path: blade-ai/tui/dist/cli.js
+          # Both cli.js (the bundle) and package.json (the {"type":"module"}
+          # marker that prevents Node 22's MODULE_TYPELESS_PACKAGE_JSON
+          # warning) are required by blade-ai.spec's datas list. Listing
+          # them explicitly (rather than uploading the whole dist/ dir)
+          # keeps the artifact small — tsup also drops a 6.5 MB cli.js.map
+          # we don't need to ship into the PyInstaller bundle.
+          path: |
+            blade-ai/tui/dist/cli.js
+            blade-ai/tui/dist/package.json
           retention-days: 7
           if-no-files-found: error
 
@@ -236,6 +244,21 @@ jobs:
               set -euo pipefail
               export PATH=/opt/python/cp311-cp311/bin:$PATH
               python --version
+
+              # tiktoken does not publish a manylinux2014_aarch64 wheel
+              # on PyPI, so pip falls back to building from sdist which
+              # requires a Rust toolchain. The manylinux2014 image does
+              # not ship with cargo, so we install rustup minimal into
+              # the throw-away container before pip install. The check
+              # is portable across both arches in case a future package
+              # tightens the same constraint on x86_64.
+              if ! command -v cargo >/dev/null 2>&1; then
+                curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --default-toolchain stable --profile minimal
+                export PATH="$HOME/.cargo/bin:$PATH"
+              fi
+              cargo --version
+
               python -m pip install --upgrade pip
               python -m pip install -e ".[dev]"
               python -m PyInstaller blade-ai.spec --noconfirm
