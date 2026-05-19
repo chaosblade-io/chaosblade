@@ -279,7 +279,7 @@ async def _list_store_trace_ids() -> list[str]:
     try:
         from chaos_agent.persistence.task_store import get_task_store
         store = await get_task_store()
-        return [row["task_id"] for row in await store.list(limit=10000)]
+        return [row["task_id"] for row in await store.list_tasks(limit=10000)]
     except Exception:
         return []
 
