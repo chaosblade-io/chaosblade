@@ -42,7 +42,14 @@ jobs:
           cache-dependency-path: blade-ai/tui/package-lock.json
 
       - name: Install
-        run: npm ci || npm install
+        # See release-blade-ai.yml for the rationale of the --ignore-scripts
+        # + explicit patch-package call. npm 10.9.2 + skipped postinstall
+        # avoids "Exit handler never called!" hangs on Linux runners.
+        run: |
+          npm install -g npm@10.9.2 || true
+          npm ci --ignore-scripts --prefer-offline --no-audit --no-fund \
+            || npm install --ignore-scripts --no-audit --no-fund
+          ./node_modules/.bin/patch-package
 
       - name: Typecheck
         run: npm run typecheck

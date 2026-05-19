@@ -107,15 +107,28 @@ jobs:
       - name: Install dependencies
         working-directory: blade-ai/tui
         run: |
-          # Workaround for npm bug "Exit handler never called!" on Node 22's
-          # bundled npm. Pin to a known-stable npm before installing.
-          # The downgrade itself can trip the same exit-handler bug AFTER
-          # the package files are swapped — `|| true` lets us keep going
-          # since the new npm@10.9.2 is already on PATH at that point.
+          # GitHub-hosted Linux runners hit npm's "Exit handler never
+          # called!" bug when patch-package runs in postinstall. Two-part
+          # workaround:
+          #
+          # 1) Pin to npm 10.9.2 — Node 22's bundled npm 11 is more
+          #    flaky here. The downgrade itself can trigger the same
+          #    exit-handler bug right after the package swap, so `|| true`
+          #    lets us keep going since the new npm is already on PATH.
+          # 2) Install with --ignore-scripts so postinstall (which runs
+          #    patch-package) is NOT executed inside npm. Then apply
+          #    patches by invoking the patch-package binary directly,
+          #    bypassing npm's lifecycle / exit handler entirely.
+          #
+          # Without (2) the job hangs forever after npm prints
+          # "Exit handler never called!" and never returns to the shell.
           npm install -g npm@10.9.2 || true
           npm --version
-          npm ci --prefer-offline --no-audit --no-fund \
-            || npm install --no-audit --no-fund
+          npm ci --ignore-scripts --prefer-offline --no-audit --no-fund \
+            || npm install --ignore-scripts --no-audit --no-fund
+          # Apply patches/ explicitly (postinstall was skipped above).
+          # Direct binary call avoids `npx`'s extra fetch / exit handler.
+          ./node_modules/.bin/patch-package
       - name: Typecheck
         working-directory: blade-ai/tui
         run: npm run typecheck

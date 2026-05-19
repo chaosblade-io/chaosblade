@@ -115,7 +115,7 @@ class TaskStore:
         merged = {**(detail_row or {}), **task_row}
         return self._row_to_dict(merged)
 
-    async def list(self, task_state: str = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    async def list_tasks(self, task_state: str = None, limit: int = 50, offset: int = 0) -> list[dict]:
         """Return tasks from the narrow table, ordered by ``gmt_create`` DESC.
 
         No large JSON fields are included (only the hot-path columns).
@@ -295,7 +295,7 @@ class TaskStore:
         Uses a single batch read of ``task_details`` to avoid N+1 queries.
         This is the primary method for the ``metric`` (no task-id) command.
         """
-        tasks = await self.list(task_state=task_state, limit=limit)
+        tasks = await self.list_tasks(task_state=task_state, limit=limit)
         if not tasks:
             return {"total": 0, "tasks": []}
 

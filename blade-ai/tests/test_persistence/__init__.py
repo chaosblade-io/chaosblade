@@ -220,7 +220,7 @@ class TestGetListCount:
         await store.upsert("t1", gmt_create="2026-01-01T00:00:00Z")
         await store.upsert("t2", gmt_create="2026-01-02T00:00:00Z")
         await store.upsert("t3", gmt_create="2026-01-03T00:00:00Z")
-        result = await store.list()
+        result = await store.list_tasks()
         assert [d["task_id"] for d in result] == ["t3", "t2", "t1"]
 
     @pytest.mark.asyncio
@@ -228,7 +228,7 @@ class TestGetListCount:
         await store.upsert("t1", skill_name="pod-kill", blade_uid="a",
                            verification={"layer1": {"status": "passed"}, "layer2": {"status": "passed"}})
         await store.upsert("t2", skill_name="pod-kill")
-        injected = await store.list(task_state="injected")
+        injected = await store.list_tasks(task_state="injected")
         assert len(injected) == 1
         assert injected[0]["task_id"] == "t1"
 
@@ -236,7 +236,7 @@ class TestGetListCount:
     async def test_list_with_limit_offset(self, store):
         for i in range(5):
             await store.upsert(f"t{i}", gmt_create=f"2026-01-0{i+1}T00:00:00Z")
-        result = await store.list(limit=2, offset=1)
+        result = await store.list_tasks(limit=2, offset=1)
         assert len(result) == 2
 
     @pytest.mark.asyncio
