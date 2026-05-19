@@ -1,0 +1,87 @@
+# Migration-ready PR / push test workflow for placement at
+# ``chaosblade-io/chaosblade/.github/workflows/test-blade-ai.yml``
+# AFTER moving fault-drill-agent into ``chaosblade/blade-ai/``.
+#
+# Differences vs the in-repo ``.github/workflows/test.yml``:
+#   * ``paths`` filter restricts triggers to changes inside
+#     ``blade-ai/**`` so chaosblade-only commits / PRs don't run this
+#     workflow.
+#   * Working directories switched to ``blade-ai/tui`` and ``blade-ai/``.
+#   * setup-python's pip cache key lives at ``blade-ai/pyproject.toml``.
+#   * pytest invocation runs from ``blade-ai/`` so chaos_agent's
+#     editable install resolves the right project.
+
+name: Test blade-ai
+
+on:
+  push:
+    branches: [main]
+    paths: ['blade-ai/**']
+  pull_request:
+    branches: [main]
+    paths: ['blade-ai/**']
+  workflow_dispatch:
+
+concurrency:
+  group: test-blade-ai-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── TS TUI: typecheck + build + smoke + vitest ─────────────────────
+  tui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: blade-ai/tui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: blade-ai/tui/package-lock.json
+
+      - name: Install
+        run: npm ci || npm install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Vitest
+        run: npm test
+
+      - name: Smoke — i18n locale detection
+        run: node scripts/smoke-i18n.mjs
+
+      - name: Smoke — slash registry + handlers
+        run: |
+          node scripts/smoke-slash.mjs
+          BLADE_AI_LANG=en node scripts/smoke-slash.mjs
+          BLADE_AI_LANG=zh node scripts/smoke-slash.mjs
+
+      # smoke-reducer needs a live Python server (BLADE_AI_SERVER) so
+      # it skips here. End-to-end coverage is captured by the manual
+      # smoke run before each release; CI only pins pure-state behaviour.
+
+  # ── Python backend: pytest ─────────────────────────────────────────
+  python:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: blade-ai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: blade-ai/pyproject.toml
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      - name: Pytest
+        run: pytest -q --maxfail=1

@@ -1,0 +1,85 @@
+diff --git a/node_modules/ink/build/ink.js b/node_modules/ink/build/ink.js
+index ef659f3..cb84d78 100644
+--- a/node_modules/ink/build/ink.js
++++ b/node_modules/ink/build/ink.js
+@@ -707,7 +707,37 @@ export default class Ink {
+             if (sync) {
+                 this.options.stdout.write(bsu);
+             }
+-            this.options.stdout.write(ansiEscapes.clearTerminal + this.fullStaticOutput + output);
++            // Backport of https://github.com/vadimdemedes/ink/pull/936:
++            // ``ansiEscapes.clearTerminal`` is ``\x1b[2J\x1b[3J\x1b[H``,
++            // and the ``\x1b[3J`` (Erase Saved Lines) wipes the host
++            // terminal's scrollback every time this branch fires. v7
++            // gates this branch behind ``shouldClearTerminalForFrame``
++            // so it doesn't fire every frame like v5 did, but the
++            // gate still trips on overflow transitions, leaving-
++            // fullscreen, and unmount — each of which would still
++            // nuke the user's session history. Replacing the
++            // sequence with ``eraseScreen + cursorTo(0,0)`` clears
++            // only the visible viewport and leaves scrollback intact.
++            //
++            // Additionally drop ``this.fullStaticOutput`` from the
++            // payload. Once the dynamic frame overflows the viewport
++            // even once, ``shouldClearTerminalForFrame`` permanently
++            // returns true (``wasOverflowing`` is sticky), so every
++            // subsequent frame would re-write the cumulative static
++            // output (Welcome card / BootDoctor / PendingTasks /
++            // every prior history item) into the viewport. Each such
++            // write scrolls the previous block into scrollback,
++            // producing the user-visible "boot cards keep reappearing
++            // at the bottom" symptom and the scroll-position drift
++            // that goes with it. Static items are already in
++            // scrollback from the initial paint and from any
++            // ``hasStaticOutput`` increments below — they don't need
++            // to be re-rendered into the viewport on every overflow
++            // tick. Writing only ``output`` here paints the live
++            // dynamic frame at viewport (0,0); content that overflows
++            // viewport scrolls naturally into scrollback once,
++            // matching the user's mental model of an append-only TUI.
++            this.options.stdout.write(ansiEscapes.eraseScreen + ansiEscapes.cursorTo(0, 0) + output);
+             this.lastOutput = output;
+             this.lastOutputToRender = outputToRender;
+             this.lastOutputHeight = outputHeight;
+diff --git a/node_modules/ink/build/log-update.js b/node_modules/ink/build/log-update.js
+index cdb5fc4..583ca16 100644
+--- a/node_modules/ink/build/log-update.js
++++ b/node_modules/ink/build/log-update.js
+@@ -1,6 +1,19 @@
+ import ansiEscapes from 'ansi-escapes';
+ import cliCursor from 'cli-cursor';
+ import { cursorPositionChanged, buildCursorSuffix, buildCursorOnlySequence, buildReturnToBottomPrefix, hideCursorEscape, } from './cursor-helpers.js';
++// Backport of https://github.com/vadimdemedes/ink/pull/917 — clamps
++// cursor-up sequences to the visible viewport height so terminals
++// (iTerm2, VS Code, tmux, Windows Terminal, kitty, …) don't snap the
++// viewport to the top of scrollback when a render's previousLineCount
++// exceeds the current viewport. Lines beyond the viewport have already
++// scrolled into scrollback and cannot be erased; clamping is therefore
++// semantically correct. Non-TTY streams (no `.rows`) fall through to
++// Infinity, i.e. no clamping. Patch is reapplied via patch-package on
++// every npm install — see patches/ink+7.0.3.patch.
++const clampToViewport = (lineCount, stream) => {
++    const rows = stream && stream.rows ? stream.rows : Infinity;
++    return Math.min(lineCount, rows);
++};
+ // Count visible lines in a string, ignoring the trailing empty element
+ // that `split('\n')` produces when the string ends with '\n'.
+ const visibleLineCount = (lines, str) => str.endsWith('\n') ? lines.length - 1 : lines.length;
+@@ -46,7 +59,7 @@ const createStandard = (stream, { showCursor = false } = {}) => {
+             previousOutput = str;
+             const returnPrefix = buildReturnToBottomPrefix(cursorWasShown, previousLineCount, previousCursorPosition);
+             stream.write(returnPrefix +
+-                ansiEscapes.eraseLines(previousLineCount) +
++                ansiEscapes.eraseLines(clampToViewport(previousLineCount, stream)) +
+                 str +
+                 cursorSuffix);
+             previousLineCount = lines.length;
+@@ -57,7 +70,7 @@ const createStandard = (stream, { showCursor = false } = {}) => {
+     };
+     render.clear = () => {
+         const prefix = buildReturnToBottomPrefix(cursorWasShown, previousLineCount, previousCursorPosition);
+-        stream.write(prefix + ansiEscapes.eraseLines(previousLineCount));
++        stream.write(prefix + ansiEscapes.eraseLines(clampToViewport(previousLineCount, stream)));
+         previousOutput = '';
+         previousLineCount = 0;
+         previousCursorPosition = undefined;
