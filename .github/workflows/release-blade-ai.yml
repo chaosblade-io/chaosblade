@@ -1,0 +1,398 @@
+# Migration-ready release workflow for placement at
+# ``chaosblade-io/chaosblade/.github/workflows/release-blade-ai.yml``
+# AFTER moving fault-drill-agent into ``chaosblade/blade-ai/``.
+#
+# Differences vs the in-repo ``.github/workflows/release.yml``:
+#   * Tag namespace switched from ``v*`` to ``blade-ai-v*`` so the
+#     ChaosBlade tool's own ``v*`` tags don't accidentally fire this
+#     pipeline.
+#   * ``paths`` filter restricts triggers to changes inside
+#     ``blade-ai/**`` — chaosblade-only commits don't waste CI minutes
+#     here.
+#   * Every project path is prefixed with ``blade-ai/`` so the workflow
+#     resolves files from the chaosblade repo root.
+#   * Working directories for npm / build / publish steps moved to
+#     ``blade-ai/`` and ``blade-ai/tui/``.
+#   * Docker volume mount targets ``$PWD/blade-ai`` so the container's
+#     ``/src`` cwd matches what blade-ai.spec expects.
+
+name: Release blade-ai
+
+on:
+  push:
+    tags: ['blade-ai-v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag to release (e.g. blade-ai-v0.3.0-alpha.1; must match all 4 version files)'
+        required: true
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  CHAOSBLADE_VERSION: '1.8.0'
+
+jobs:
+  # ── Verify all version files agree with the release tag ────────────────
+  verify-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+      tag: ${{ steps.derive.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Derive tag/version from inputs or ref
+        id: derive
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            TAG="${{ github.event.inputs.version }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          # Strip the ``blade-ai-v`` prefix to recover the bare semver
+          # used in pyproject / package.json / __version__.
+          VERSION="${TAG#blade-ai-v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Tag: $TAG · Version: $VERSION"
+
+      - name: Verify blade-ai/pyproject.toml
+        shell: bash
+        run: |
+          PKG="$(grep -E '^version = ' blade-ai/pyproject.toml | head -1 | sed -E 's/^version = "(.*)"/\1/')"
+          if [ "${{ steps.derive.outputs.version }}" != "$PKG" ]; then
+            echo "::error::blade-ai/pyproject.toml version ($PKG) ≠ tag ${{ steps.derive.outputs.tag }}"
+            exit 1
+          fi
+          echo "✓ blade-ai/pyproject.toml matches"
+
+      - name: Verify blade-ai/tui/package.json
+        shell: bash
+        run: |
+          PKG="$(node -p 'require("./blade-ai/tui/package.json").version')"
+          if [ "${{ steps.derive.outputs.version }}" != "$PKG" ]; then
+            echo "::error::blade-ai/tui/package.json version ($PKG) ≠ tag ${{ steps.derive.outputs.tag }}"
+            exit 1
+          fi
+          echo "✓ blade-ai/tui/package.json matches"
+
+      - name: Verify blade-ai/src/chaos_agent/__init__.py
+        shell: bash
+        run: |
+          PKG="$(grep -E '^__version__ = ' blade-ai/src/chaos_agent/__init__.py | head -1 | sed -E 's/^__version__ = "(.*)"/\1/')"
+          if [ "${{ steps.derive.outputs.version }}" != "$PKG" ]; then
+            echo "::error::blade-ai/src/chaos_agent/__init__.py __version__ ($PKG) ≠ tag ${{ steps.derive.outputs.tag }}"
+            exit 1
+          fi
+          echo "✓ blade-ai/src/chaos_agent/__init__.py matches"
+
+  # ── Build the TS TUI bundle once, share via artifact ───────────────────
+  build-tui:
+    needs: verify-versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: blade-ai/tui/package-lock.json
+      - name: Install dependencies
+        working-directory: blade-ai/tui
+        run: npm ci || npm install
+      - name: Typecheck
+        working-directory: blade-ai/tui
+        run: npm run typecheck
+      - name: Build bundle
+        working-directory: blade-ai/tui
+        run: npm run build
+      - name: Vitest
+        working-directory: blade-ai/tui
+        run: npm test
+      - name: Headless smokes (server-less subset)
+        working-directory: blade-ai/tui
+        run: |
+          node scripts/smoke-i18n.mjs
+          node scripts/smoke-slash.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tui-bundle
+          path: blade-ai/tui/dist/cli.js
+          retention-days: 7
+          if-no-files-found: error
+
+  # ── Build native binaries on each platform ──────────────────────────────
+  build:
+    needs: [verify-versions, build-tui]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-amd64
+            chaosblade_arch: linux_amd64
+            target_arch: ''
+            use_docker: true
+            docker_image: 'quay.io/pypa/manylinux2014_x86_64'
+
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            chaosblade_arch: linux_arm64
+            target_arch: ''
+            use_docker: true
+            docker_image: 'quay.io/pypa/manylinux2014_aarch64'
+
+          - os: macos-13
+            platform: darwin-amd64
+            chaosblade_arch: darwin_amd64
+            target_arch: 'x86_64'
+            use_docker: false
+            docker_image: ''
+
+          - os: macos-latest
+            platform: darwin-arm64
+            chaosblade_arch: darwin_arm64
+            target_arch: 'arm64'
+            use_docker: false
+            docker_image: ''
+
+          - os: windows-latest
+            platform: windows-x64
+            chaosblade_arch: ''
+            target_arch: ''
+            use_docker: false
+            docker_image: ''
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pull the TS bundle into ``blade-ai/tui/dist/cli.js`` BEFORE
+      # pyinstaller runs.
+      - uses: actions/download-artifact@v4
+        with:
+          name: tui-bundle
+          path: blade-ai/tui/dist
+      - name: Verify TS bundle in place
+        shell: bash
+        run: ls -la blade-ai/tui/dist/cli.js
+
+      - name: Download ChaosBlade tool
+        if: matrix.chaosblade_arch != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${CHAOSBLADE_VERSION}"
+          ARCH="${{ matrix.chaosblade_arch }}"
+          URL="https://github.com/chaosblade-io/chaosblade/releases/download/v${VER}/chaosblade-${VER}-${ARCH}.tar.gz"
+          echo "Fetching $URL"
+          curl -fSL --retry 3 --retry-delay 2 -o /tmp/chaosblade.tar.gz "$URL"
+          rm -rf blade-ai/vendor/chaosblade
+          mkdir -p blade-ai/vendor
+          tar -xzf /tmp/chaosblade.tar.gz -C /tmp
+          mv "/tmp/chaosblade-${VER}-${ARCH}" blade-ai/vendor/chaosblade
+          echo "blade-ai/vendor/chaosblade contents:"
+          ls -la blade-ai/vendor/chaosblade
+          file blade-ai/vendor/chaosblade/blade || true
+
+      # ── Linux: build inside manylinux docker, mount blade-ai/ as /src ─
+      - name: Build with PyInstaller (manylinux Docker)
+        if: matrix.use_docker
+        shell: bash
+        env:
+          BLADE_TARGET_ARCH: ${{ matrix.target_arch }}
+        run: |
+          docker run --rm \
+            -v "$PWD/blade-ai:/src" \
+            -w /src \
+            -e BLADE_TARGET_ARCH \
+            "${{ matrix.docker_image }}" \
+            bash -c '
+              set -euo pipefail
+              export PATH=/opt/python/cp311-cp311/bin:$PATH
+              python --version
+              python -m pip install --upgrade pip
+              python -m pip install -e ".[dev]"
+              python -m PyInstaller blade-ai.spec --noconfirm
+            '
+
+      # ── macOS / Windows: build natively ────────────────────────────
+      - name: Set up Python
+        if: '!matrix.use_docker'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: blade-ai/pyproject.toml
+
+      - name: Install project + dev tools (native)
+        if: '!matrix.use_docker'
+        shell: bash
+        working-directory: blade-ai
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Build with PyInstaller (native)
+        if: '!matrix.use_docker'
+        shell: bash
+        working-directory: blade-ai
+        env:
+          BLADE_TARGET_ARCH: ${{ matrix.target_arch }}
+        run: |
+          python -m PyInstaller blade-ai.spec --noconfirm
+
+      # macOS ad-hoc codesign — dist/ lives at blade-ai/dist/
+      - name: Ad-hoc codesign (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          codesign --force --deep --sign - blade-ai/dist/blade-ai/blade-ai
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PLATFORM="${{ matrix.platform }}"
+          tar -czf "blade-ai-${PLATFORM}.tar.gz" -C blade-ai/dist blade-ai
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Platform = "${{ matrix.platform }}"
+          Compress-Archive -Path "blade-ai/dist/blade-ai/*" -DestinationPath "blade-ai-$Platform.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blade-ai-${{ matrix.platform }}
+          path: |
+            blade-ai-${{ matrix.platform }}.tar.gz
+            blade-ai-${{ matrix.platform }}.zip
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # ── Create GitHub Release with all artifacts + checksums ───────────────
+  release:
+    needs: [verify-versions, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd artifacts
+          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
+          sha256sum *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.verify-versions.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
+            artifacts/checksums.txt
+          body: |
+            ## blade-ai ${{ needs.verify-versions.outputs.tag }}
+
+            Bundles ChaosBlade tool v${{ env.CHAOSBLADE_VERSION }} for Linux / macOS;
+            Windows binary ships TUI-only (no upstream chaosblade build).
+
+            ### Installation
+
+            **macOS / Linux:**
+            ```bash
+            curl -fsSL https://chaosblade.io/install-agent.sh | bash
+            ```
+
+            **Windows:**
+            ```powershell
+            irm https://chaosblade.io/install-agent.ps1 | iex
+            ```
+
+            **Specify version:**
+            ```bash
+            curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version ${{ needs.verify-versions.outputs.version }}
+            ```
+
+            **pip:**
+            ```bash
+            pip install blade-ai==${{ needs.verify-versions.outputs.version }}
+            ```
+
+            **npm (TUI only):**
+            ```bash
+            npm install -g @blade-ai/tui@${{ needs.verify-versions.outputs.version }}
+            ```
+
+  # ── Publish @blade-ai/tui to npm ──────────────────────────────────────
+  publish-npm:
+    needs: [verify-versions, build-tui]
+    if: startsWith(github.ref, 'refs/tags/blade-ai-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - uses: actions/download-artifact@v4
+        with:
+          name: tui-bundle
+          path: blade-ai/tui/dist
+      - name: Verify bundle is in place
+        run: ls -la blade-ai/tui/dist/cli.js
+      - name: Publish
+        working-directory: blade-ai/tui
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --ignore-scripts
+
+  # ── Publish blade-ai wheel + sdist to PyPI ────────────────────────────
+  publish-pypi:
+    needs: [verify-versions, build-tui]
+    if: startsWith(github.ref, 'refs/tags/blade-ai-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: blade-ai/pyproject.toml
+      - uses: actions/download-artifact@v4
+        with:
+          name: tui-bundle
+          path: blade-ai/tui/dist
+      - name: Install build tooling
+        run: pip install build twine
+      - name: Build wheel + sdist
+        working-directory: blade-ai
+        run: python -m build
+      - name: Verify bundle embedded in wheel
+        working-directory: blade-ai
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/*.whl)
+          if ! unzip -l "$WHEEL" | grep -q 'chaos_agent/_tui_assets/cli.js'; then
+            echo "::error::cli.js missing from $WHEEL"
+            unzip -l "$WHEEL"
+            exit 1
+          fi
+          SIZE=$(unzip -p "$WHEEL" chaos_agent/_tui_assets/cli.js | wc -c | tr -d ' ')
+          echo "✓ cli.js embedded: $SIZE bytes"
+      - name: Publish to PyPI
+        working-directory: blade-ai
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: twine upload --skip-existing dist/*
