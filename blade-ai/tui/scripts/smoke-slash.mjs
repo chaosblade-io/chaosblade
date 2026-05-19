@@ -12,13 +12,59 @@
 
 import { tsImport } from "tsx/esm/api";
 
+// === Hang diagnostics + watchdog =================================
+//
+// CI history: this script silently hangs on GitHub-hosted Linux
+// runners (Node 22) after smoke-i18n.mjs prints success. Local runs
+// (macOS Node 24, with or without LC_ALL/non-TTY stdout) finish in
+// ~1s — root cause not yet localized. Until it is, the script:
+//
+//   (a) installs a global watchdog: process.exit(1) after
+//       ``SMOKE_SLASH_TIMEOUT_MS`` so CI fails fast instead of
+//       waiting hours, and the stderr line tells you the last
+//       probe label that fired (i.e. the closest hint where the
+//       hang occurred);
+//   (b) emits a ``[probe] <label>`` line to stderr at every
+//       tsImport boundary and major test-block boundary, so the
+//       CI log shows exactly where execution stopped.
+//
+// Both blocks are diagnostic-only and can be deleted once the
+// underlying CI hang is fixed.
+const PROBE_TIMEOUT_MS = Number(
+  process.env.SMOKE_SLASH_TIMEOUT_MS ?? 120_000,
+);
+let lastProbe = "<entry>";
+function probe(label) {
+  lastProbe = label;
+  process.stderr.write(`[probe] ${label}\n`);
+}
+const watchdog = setTimeout(() => {
+  process.stderr.write(
+    `\n[probe] WATCHDOG ${PROBE_TIMEOUT_MS}ms elapsed without natural exit.\n` +
+      `[probe] Last probe label reached: ${lastProbe}\n` +
+      `[probe] Active handles: ${process._getActiveHandles?.().length ?? "?"}; ` +
+      `requests: ${process._getActiveRequests?.().length ?? "?"}\n`,
+  );
+  process.exit(1);
+}, PROBE_TIMEOUT_MS);
+watchdog.unref?.();
+probe("entry");
+
+probe("tsImport state/commands.ts");
 const cmdMod = await tsImport("../src/state/commands.ts", import.meta.url);
+probe("tsImport state/reducer.ts");
 const reducerMod = await tsImport("../src/state/reducer.ts", import.meta.url);
+probe("tsImport state/types.ts");
 const typesMod = await tsImport("../src/state/types.ts", import.meta.url);
+probe("tsImport api/client.ts");
 const clientMod = await tsImport("../src/api/client.ts", import.meta.url);
+probe("tsImport utils/replay.ts");
 const replayMod = await tsImport("../src/utils/replay.ts", import.meta.url);
+probe("tsImport utils/errorHints.ts");
 const hintsMod = await tsImport("../src/utils/errorHints.ts", import.meta.url);
+probe("tsImport utils/cursorMath.ts");
 const cursorMath = await tsImport("../src/utils/cursorMath.ts", import.meta.url);
+probe("imports done");
 
 const { buildRegistry, parseSlashLine } = cmdMod;
 const { reducer } = reducerMod;
@@ -33,6 +79,7 @@ function assert(cond, msg) {
   if (!cond) failures.push(msg);
 }
 
+probe("block: parseSlashLine");
 // --- parseSlashLine -----------------------------------------------
 {
   const r1 = parseSlashLine("");
@@ -259,6 +306,7 @@ const reg = buildRegistry();
     "input containing /retry mid-string is NL, not a slash echo");
 }
 
+probe("block: /doctor + reachable client");
 // --- /doctor handler renders diagnostics when client is reachable -
 {
   let state = { ...initialAppState };
@@ -527,6 +575,7 @@ const reg = buildRegistry();
   assert(state.config.displayMode === "dense", "/mode bogus should not change displayMode");
 }
 
+probe("block: listTasks envelope failure");
 // --- listTasks throws on envelope failure (Bug 5) -----------------
 {
   const realFetch = globalThis.fetch;
@@ -965,6 +1014,7 @@ const reg = buildRegistry();
     `aborted replay should preserve partial agent text; got ${partial?.text}`);
 }
 
+probe("block: M7.1 replay timing+abort");
 // --- M7.1: replayRecording timing + abort ------------------------
 {
   // Build a synthetic recording where each event is 100ms apart.
@@ -1146,6 +1196,7 @@ const reg = buildRegistry();
   assert(e === null, "unmatched message returns null");
 }
 
+probe("block: M6.1 path traversal (last block before first stdout)");
 // --- M6.1 self-check Bug 1: path traversal rejected ---------------
 // Two layers of defense:
 //   1. FastAPI's path matcher refuses to bind ``/recordings/{task_id}``
@@ -1757,11 +1808,14 @@ if (server) {
 }
 
 // --- summary -------------------------------------------------------
+probe("summary");
 console.log("");
 if (failures.length > 0) {
   console.error("--- FAILURES ---");
   for (const f of failures) console.error("  - " + f);
+  clearTimeout(watchdog);
   process.exit(1);
 }
 console.log("✓ all M4 slash assertions passed");
+clearTimeout(watchdog);
 process.exit(0);

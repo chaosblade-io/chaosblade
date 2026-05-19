@@ -138,17 +138,17 @@ jobs:
       - name: Vitest
         working-directory: blade-ai/tui
         run: npm test
-      # TODO(blade-ai): re-enable once smoke-slash.mjs is debugged. Hangs
-      # silently on GitHub Linux runners after smoke-i18n.mjs prints
-      # success — likely an unguarded fetch / tsImport side-effect
-      # that depends on a host-locale or DNS condition we don't have
-      # in CI. Vitest above already covers reducer + commands surface;
-      # losing the smoke is acceptable in the short term.
-      # - name: Headless smokes (server-less subset)
-      #   working-directory: blade-ai/tui
-      #   run: |
-      #     node scripts/smoke-i18n.mjs
-      #     node scripts/smoke-slash.mjs
+      - name: Headless smokes (server-less subset)
+        working-directory: blade-ai/tui
+        # smoke-slash.mjs has a built-in watchdog (default 120s) and
+        # emits ``[probe] <label>`` lines to stderr on every tsImport
+        # and major test-block boundary. If CI hangs again, the last
+        # ``[probe]`` line in the failure log pinpoints where the
+        # script stopped — diagnostics-only and removable once the
+        # underlying CI hang is understood.
+        run: |
+          node scripts/smoke-i18n.mjs
+          node scripts/smoke-slash.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: tui-bundle
@@ -264,24 +264,49 @@ jobs:
             '
 
       # ── Native build: linux/amd64 + darwin/{amd64,arm64} ────────────
+      #
+      # darwin/amd64 special case: macos-latest is an Apple Silicon
+      # (arm64) runner. To produce an x86_64 PyInstaller bundle we
+      # rely on Rosetta — but that requires a Python interpreter that
+      # actually has an x86_64 slice. Empirical CI runs show that
+      # setup-python@v5's ``architecture: x64`` is unreliable here:
+      # it can still hand back an arm64 build (which is what triggered
+      # the previous ``_watchdog_fsevents.so has arch arm64`` failure
+      # at PyInstaller COLLECT time). We therefore install python.org's
+      # official universal2 build manually for that one matrix entry
+      # — the .pkg from python.org is guaranteed to be a fat binary
+      # with both arm64 and x86_64 slices, so ``arch -x86_64 python3.11``
+      # really does run x86_64.
+      - name: Install universal2 Python from python.org (darwin/amd64)
+        if: matrix.os == 'darwin' && matrix.arch == 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYVER=3.11.9
+          PKG="python-${PYVER}-macos11.pkg"
+          curl -fSLO "https://www.python.org/ftp/python/${PYVER}/${PKG}"
+          sudo installer -pkg "${PKG}" -target /
+          rm -f "${PKG}"
+          # Push the python.org bin to PATH so subsequent steps see
+          # python3.11 from the universal2 install (not from the
+          # runner's pre-baked Python). $GITHUB_PATH is appended in
+          # order so this dir wins over later setup-python entries.
+          echo "/Library/Frameworks/Python.framework/Versions/3.11/bin" >> "$GITHUB_PATH"
+          PY=/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11
+          "$PY" --version
+          # Sanity: confirm the binary has both slices. The output
+          # should start with ``Mach-O universal binary with 2
+          # architectures: [x86_64:..., arm64:...]``.
+          file "$PY"
+
       - name: Set up Python
-        if: '!matrix.use_docker'
+        # All non-Docker matrices except darwin/amd64 (which got a
+        # universal2 Python above). Single-line if expression keeps
+        # the YAML readable; equivalent to the long disjunction.
+        if: ${{ !matrix.use_docker && !(matrix.os == 'darwin' && matrix.arch == 'amd64') }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          # ``architecture`` is keyed off matrix.arch so each entry gets
-          # the right interpreter slice:
-          #   - linux/amd64 (ubuntu-latest, x86_64 host)         → x64
-          #   - linux/arm64 (ubuntu-24.04-arm, arm64 host)       → arm64
-          #   - darwin/amd64 (macos-latest, Apple Silicon host)  → x64
-          #         setup-python installs an x86_64 Python; macOS
-          #         transparently runs it under Rosetta 2. pip then
-          #         pulls x86_64 wheels (no universal2 dependency
-          #         dance), and PyInstaller bakes a native x86_64
-          #         bundle from that interpreter — no cross-slice
-          #         arch mismatches like the watchdog .so failure.
-          #   - darwin/arm64 (macos-latest, Apple Silicon host)  → arm64
-          architecture: ${{ matrix.arch == 'amd64' && 'x64' || 'arm64' }}
           cache: 'pip'
           cache-dependency-path: blade-ai/pyproject.toml
 
@@ -290,8 +315,19 @@ jobs:
         shell: bash
         working-directory: blade-ai
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          set -euo pipefail
+          # darwin/amd64 cross-build via Rosetta. ``arch -x86_64 python3.11``
+          # forces the universal2 Python into its x86_64 slice — pip
+          # then pulls x86_64 wheels and the entire downstream Python
+          # process is x86_64. Other matrices use the host-native
+          # Python that setup-python put on PATH.
+          if [[ "${{ matrix.os }}-${{ matrix.arch }}" == "darwin-amd64" ]]; then
+            PY="arch -x86_64 python3.11"
+          else
+            PY="python"
+          fi
+          $PY -m pip install --upgrade pip
+          $PY -m pip install -e ".[dev]"
 
       - name: Build with PyInstaller (native)
         if: '!matrix.use_docker'
@@ -299,17 +335,17 @@ jobs:
         working-directory: blade-ai
         run: |
           set -euo pipefail
-          # BLADE_TARGET_ARCH is a belt-and-braces hint to blade-ai.spec
-          # so PyInstaller emits a bootloader for the right slice. The
-          # interpreter installed above is already the right arch (see
-          # architecture: above), so this mostly mirrors what PyInstaller
-          # would auto-detect — but stating it explicitly avoids surprises
-          # if a future PyInstaller version changes its default.
+          # BLADE_TARGET_ARCH is a hint to blade-ai.spec so PyInstaller
+          # emits a bootloader for the matching slice. The interpreter
+          # arch already matches (see Install step above), this just
+          # makes the intent explicit and survives PyInstaller default
+          # changes.
           case "${{ matrix.os }}-${{ matrix.arch }}" in
-            darwin-amd64) export BLADE_TARGET_ARCH=x86_64 ;;
-            darwin-arm64) export BLADE_TARGET_ARCH=arm64 ;;
+            darwin-amd64) PY="arch -x86_64 python3.11"; export BLADE_TARGET_ARCH=x86_64 ;;
+            darwin-arm64) PY="python";                  export BLADE_TARGET_ARCH=arm64  ;;
+            *)            PY="python" ;;
           esac
-          python -m PyInstaller blade-ai.spec --noconfirm
+          $PY -m PyInstaller blade-ai.spec --noconfirm
 
       # Ad-hoc codesign so the unsigned bootloader doesn't get killed
       # by Gatekeeper when users curl-bash install on macOS.
