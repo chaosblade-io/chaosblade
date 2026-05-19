@@ -23,6 +23,10 @@ on:
     tags: ['blade-ai-v*']
   workflow_dispatch:
     inputs:
+      branch:
+        description: 'Branch (or ref) to release from (e.g. master, feature/blade-ai)'
+        required: false
+        default: 'master'
       version:
         description: 'Tag to release (e.g. blade-ai-v0.3.0-alpha.1; must match all 4 version files)'
         required: true
@@ -43,6 +47,8 @@ jobs:
       tag: ${{ steps.derive.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
       - name: Derive tag/version from inputs or ref
         id: derive
         shell: bash
@@ -95,6 +101,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -159,16 +167,11 @@ jobs:
             use_docker: false
             docker_image: ''
 
-          - os: windows-latest
-            platform: windows-x64
-            chaosblade_arch: ''
-            target_arch: ''
-            use_docker: false
-            docker_image: ''
-
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
 
       # Pull the TS bundle into ``blade-ai/tui/dist/cli.js`` BEFORE
       # pyinstaller runs.
@@ -219,7 +222,7 @@ jobs:
               python -m PyInstaller blade-ai.spec --noconfirm
             '
 
-      # ── macOS / Windows: build natively ────────────────────────────
+      # ── macOS: build natively ──────────────────────────────────────
       - name: Set up Python
         if: '!matrix.use_docker'
         uses: actions/setup-python@v5
@@ -253,26 +256,16 @@ jobs:
           codesign --force --deep --sign - blade-ai/dist/blade-ai/blade-ai
 
       - name: Package Unix archive
-        if: runner.os != 'Windows'
         shell: bash
         run: |
           PLATFORM="${{ matrix.platform }}"
           tar -czf "blade-ai-${PLATFORM}.tar.gz" -C blade-ai/dist blade-ai
 
-      - name: Package Windows archive
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $Platform = "${{ matrix.platform }}"
-          Compress-Archive -Path "blade-ai/dist/blade-ai/*" -DestinationPath "blade-ai-$Platform.zip"
-
       - uses: actions/upload-artifact@v4
         with:
           name: blade-ai-${{ matrix.platform }}
-          path: |
-            blade-ai-${{ matrix.platform }}.tar.gz
-            blade-ai-${{ matrix.platform }}.zip
-          if-no-files-found: ignore
+          path: blade-ai-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
           retention-days: 1
 
   # ── Create GitHub Release with all artifacts + checksums ───────────────
@@ -288,8 +281,8 @@ jobs:
         shell: bash
         run: |
           cd artifacts
-          find . -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec mv {} . \;
-          sha256sum *.tar.gz *.zip > checksums.txt
+          find . -type f -name "*.tar.gz" -exec mv {} . \;
+          sha256sum *.tar.gz > checksums.txt
           cat checksums.txt
 
       - name: Create GitHub Release
@@ -299,24 +292,17 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
-            artifacts/*.zip
             artifacts/checksums.txt
           body: |
             ## blade-ai ${{ needs.verify-versions.outputs.tag }}
 
-            Bundles ChaosBlade tool v${{ env.CHAOSBLADE_VERSION }} for Linux / macOS;
-            Windows binary ships TUI-only (no upstream chaosblade build).
+            Bundles ChaosBlade tool v${{ env.CHAOSBLADE_VERSION }} for Linux / macOS.
 
             ### Installation
 
             **macOS / Linux:**
             ```bash
             curl -fsSL https://chaosblade.io/install-agent.sh | bash
-            ```
-
-            **Windows:**
-            ```powershell
-            irm https://chaosblade.io/install-agent.ps1 | iex
             ```
 
             **Specify version:**
@@ -337,10 +323,12 @@ jobs:
   # ── Publish @blade-ai/tui to npm ──────────────────────────────────────
   publish-npm:
     needs: [verify-versions, build-tui]
-    if: startsWith(github.ref, 'refs/tags/blade-ai-v')
+    if: startsWith(github.ref, 'refs/tags/blade-ai-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -360,10 +348,12 @@ jobs:
   # ── Publish blade-ai wheel + sdist to PyPI ────────────────────────────
   publish-pypi:
     needs: [verify-versions, build-tui]
-    if: startsWith(github.ref, 'refs/tags/blade-ai-v')
+    if: startsWith(github.ref, 'refs/tags/blade-ai-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
