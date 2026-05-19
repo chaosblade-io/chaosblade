@@ -106,7 +106,12 @@ jobs:
           cache-dependency-path: blade-ai/tui/package-lock.json
       - name: Install dependencies
         working-directory: blade-ai/tui
-        run: npm ci || npm install
+        run: |
+          # Workaround for npm bug "Exit handler never called!" on Node 22's
+          # bundled npm. Pin to a known-stable npm before installing.
+          npm install -g npm@10.9.2
+          npm ci --prefer-offline --no-audit --no-fund \
+            || npm install --no-audit --no-fund
       - name: Typecheck
         working-directory: blade-ai/tui
         run: npm run typecheck
