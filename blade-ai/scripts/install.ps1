@@ -15,6 +15,29 @@
 # chaosblade monorepo's tag scheme.
 
 $ErrorActionPreference = "Stop"
+
+# ── Windows not yet supported ──────────────────────────────────────────────────
+#
+# The release-blade-ai.yml build matrix currently ships only
+# linux-{amd64,arm64} and darwin-{amd64,arm64} tarballs — there is no
+# blade-ai-windows-x64.zip published for any tag. Running the rest of
+# this script would just fetch a 404 and corrupt the user's terminal
+# with red errors. Bail out early with an explicit message until a
+# Windows matrix entry lands.
+#
+# Track restoration in:
+#   chaosblade/.github/workflows/release-blade-ai.yml (build matrix)
+#   chaosblade/blade-ai/blade-ai.spec  (Windows codepath audit)
+Write-Host ""
+Write-Host "  ✗ blade-ai does not yet ship a Windows binary." -ForegroundColor Red
+Write-Host "    Linux / macOS users: use the bash installer instead:" -ForegroundColor Yellow
+Write-Host "      curl -fsSL https://chaosblade.io/install-agent.sh | bash" -ForegroundColor Yellow
+Write-Host "    Windows users: please track" -ForegroundColor Yellow
+Write-Host "      https://github.com/chaosblade-io/chaosblade/issues" -ForegroundColor Yellow
+Write-Host "    for Windows support, or build from source via WSL2." -ForegroundColor Yellow
+Write-Host ""
+exit 1
+
 $ToolName = "blade-ai"
 $Version = if ($env:BLADE_AI_VERSION) { $env:BLADE_AI_VERSION } else { "0.1.0" }
 # Tag namespace: chaosblade monorepo hosts blade-ai under the
