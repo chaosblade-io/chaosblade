@@ -1,10 +1,13 @@
 # BLADE AI 使用文档
 
+**语言:** 中文 | [English](USAGE_en.md)
+
 完整的安装、配置、命令、API 速查与最佳实践。如果是第一次接触，先读 [README.md](../README.md) 了解快速开始；想了解架构与设计，读 [INTRODUCTION.md](INTRODUCTION.md)。
 
 ## 目录
 
 - [安装](#安装)
+- [卸载](#卸载)
 - [首次配置](#首次配置)
 - [对话式 TUI](#对话式-tui)
 - [结构化 CLI](#结构化-cli)
@@ -23,18 +26,22 @@
 
 ### 一键脚本（推荐）
 
+不传版本时脚本会自动查询 GitHub Releases 取最新的 `blade-ai-v*` tag。固定老版本可以传 `--version` 或 `BLADE_AI_VERSION`：
+
 ```bash
-# macOS / Linux
+# macOS / Linux —— 装最新版（默认行为，自动 resolve 最新 release）
 curl -fsSL https://chaosblade.io/install-agent.sh | bash
 
-# 装指定版本（裸 semver，无 blade-ai-v 前缀）
-curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0
+# 锁定指定版本
+curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0-alpha
 
-# Windows (PowerShell)
-irm https://chaosblade.io/install-agent.ps1 | iex
+# 通过 env 传同样的版本（适合 Dockerfile / CI）
+BLADE_AI_VERSION=0.1.0-alpha curl -fsSL https://chaosblade.io/install-agent.sh | bash
 ```
 
-脚本会自动检测平台（`linux-amd64` / `linux-arm64` / `darwin-amd64` / `darwin-arm64` / `windows-x64`），从 `chaosblade-io/chaosblade` 的 `blade-ai-v<版本>` Release 下载对应归档并解压到 PATH。
+脚本会自动按 `uname -m` 探测平台，从 `chaosblade-io/chaosblade` 的 `blade-ai-v<版本>` Release 下载对应 `tar.gz` 并解压到 `~/.blade-ai/versions/blade-ai-v<版本>/`，再创建 `~/.local/bin/blade-ai` 符号链接，并把 `~/.local/bin` 加入 shell rc 的 PATH（带 `# blade-ai` 标记，方便 `uninstall.sh` 精确清理）。
+
+支持 4 个平台：`linux-amd64` / `linux-arm64` / `darwin-amd64` / `darwin-arm64`。**当前 Windows 暂不支持**（release-blade-ai.yml 不产 Windows 二进制；`install.ps1` 直接报错指引走 WSL2 / 源码构建）。
 
 预编译包是**自包含**的：内嵌 Python 运行时 + ChaosBlade v1.8.0 二进制 + 全部技能文件，解压即用，无需 Python 或任何其他依赖。这特别适合堡垒机/跳板机等受限环境。
 
@@ -43,45 +50,15 @@ irm https://chaosblade.io/install-agent.ps1 | iex
 如果 `chaosblade.io` 域名跳转尚未配置，或想离线分发：
 
 ```bash
-VERSION=0.1.0
-PLATFORM=darwin-arm64    # linux-amd64 / linux-arm64 / darwin-amd64 / darwin-arm64 / windows-x64
+VERSION=0.1.0-alpha
+PLATFORM=darwin-arm64    # linux-amd64 / linux-arm64 / darwin-amd64 / darwin-arm64
 URL="https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}"
 
-# Unix
 curl -fSLO "${URL}/blade-ai-${PLATFORM}.tar.gz"
 curl -fSLO "${URL}/checksums.txt"
 sha256sum -c --ignore-missing checksums.txt    # 校验
 tar -xzf "blade-ai-${PLATFORM}.tar.gz"
 sudo ln -sf "$PWD/blade-ai/blade-ai" /usr/local/bin/blade-ai
-
-# Windows (PowerShell)
-$Version = "0.1.0"
-$Url = "https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${Version}/blade-ai-windows-x64.zip"
-Invoke-WebRequest -Uri $Url -OutFile "blade-ai.zip"
-Expand-Archive -Path "blade-ai.zip" -DestinationPath "$env:USERPROFILE\blade-ai"
-```
-
-### pip 安装
-
-适合 Python 开发者和二次集成。pip 包内嵌 TS TUI bundle，装完直接 `blade-ai` 即可启动新 TUI：
-
-```bash
-pip install blade-ai==0.1.0
-blade-ai --version
-```
-
-### npm 安装（仅 TS TUI）
-
-如果只想要 TS TUI 二进制（例如已经有远端 `blade-ai-server`，本地只跑 UI），可以单独装 npm 包；需要 Node 22+：
-
-```bash
-npm install -g @blade-ai/tui@0.1.0
-
-# 嵌入模式：自动 spawn `python -m chaos_agent.server.app`
-blade-ai-tui
-
-# 远程模式：连一个已启动的 server，不 spawn
-BLADE_AI_SERVER=http://127.0.0.1:8080 blade-ai-tui
 ```
 
 ### 源码构建
@@ -91,7 +68,62 @@ git clone https://github.com/chaosblade-io/chaosblade.git
 cd chaosblade/blade-ai
 make dev      # 安装开发依赖
 make build    # PyInstaller 打包到 dist/blade-ai/
-./dist/blade-ai/blade-ai --version
+./dist/blade-ai/blade-ai version
+```
+
+> 当前发布通道**只通过 GitHub Releases 分发** —— 不再发 PyPI（`pip install blade-ai`）和 npm（`@blade-ai/tui`）。如果需要 pip / npm，自行 `make build` 后用 `python -m build` 打 wheel 或 `cd tui && npm publish` 推到私有 registry。
+
+## 卸载
+
+提供与 install.sh / install.ps1 对称的卸载脚本，按平台用对应版本：
+
+### macOS / Linux
+
+```bash
+# 默认全删（含 ~/.blade-ai/ 下的配置/记忆/技能/日志）
+bash <path>/uninstall.sh
+
+# 看会做什么但不实际删（推荐先跑这个）
+bash <path>/uninstall.sh --dry-run
+
+# 删二进制 + PATH，保留用户数据
+bash <path>/uninstall.sh --keep-config
+
+# 仅删某一版（多版本场景下保留其它版本和符号链接）
+bash <path>/uninstall.sh --version 0.1.0-alpha
+
+# CI 友好：跳 y/N 确认
+bash <path>/uninstall.sh --force
+```
+
+### Windows
+
+```powershell
+# 全删
+.\uninstall.ps1
+
+# 保留配置
+.\uninstall.ps1 -KeepConfig
+
+# 安全校验：仅当 manifest 记录的版本 = 0.1.0-alpha 时才执行
+.\uninstall.ps1 -Version 0.1.0-alpha
+
+# 看 plan
+.\uninstall.ps1 -DryRun
+```
+
+每次修改 shell rc / 注册表前会自动写备份（`~/.zshrc.blade-ai-uninstall.bak` / `~/.blade-ai/path-backup.txt`），误删可手动还原。`--keep-config` 模式下只清安装元数据（`install-manifest.json` + `receipt.json`），方便你下次重装从头开始。
+
+### 使用国内镜像
+
+```bash
+# 一键脚本支持自定义下载源
+BLADE_AI_MIRROR=https://your-mirror.example.com/releases/download \
+  curl -fsSL https://chaosblade.io/install-agent.sh | bash
+
+# latest 解析也可以指向自建 GitHub API mirror（罕见）
+BLADE_AI_MIRROR_API=https://your-mirror.example.com/api/releases \
+  curl -fsSL https://chaosblade.io/install-agent.sh | bash
 ```
 
 ### 使用国内镜像
@@ -670,8 +702,8 @@ node scripts/smoke-reducer.mjs    # action ↔ state 转移
 #    blade-ai/src/chaos_agent/__init__.py
 
 # 2) 提交并打标签
-git tag blade-ai-v0.1.0
-git push origin blade-ai-v0.1.0
+git tag blade-ai-v0.1.0-alpha
+git push origin blade-ai-v0.1.0-alpha
 ```
 
 CI 流程：
@@ -679,13 +711,11 @@ CI 流程：
 | 阶段 | 内容 |
 |------|------|
 | `verify-versions` | 校验三处版本字符串与标签匹配 |
-| `build-tui` | typecheck → bundle → vitest → 烟雾测试，产出 `tui/dist/cli.js` |
-| `build` | 5 平台矩阵：下载 ChaosBlade v1.8.0 → PyInstaller 打包（Linux 用 manylinux2014 docker，macOS ad-hoc codesign） |
-| `release` | 聚合产物 + checksums 创建 GitHub Release |
-| `publish-npm` | `@blade-ai/tui` 推送到 npm |
-| `publish-pypi` | `blade-ai` wheel + sdist 推送到 PyPI（验证 wheel 内嵌 `chaos_agent/_tui_assets/cli.js`） |
+| `build-tui` | npm install (--ignore-scripts) → patch-package → typecheck → tsup bundle → vitest，上传 `tui-bundle` artifact（`cli.js` + `package.json`） |
+| `build` | 4 平台矩阵 native build：linux-amd64 (ubuntu-latest) / linux-arm64 (ubuntu-24.04-arm) / darwin-amd64 (macos-latest + python.org universal2 Python + Rosetta) / darwin-arm64 (macos-latest)。各自下载对应 chaosblade tarball → PyInstaller 打包；macOS 走 ad-hoc codesign |
+| `release` | 聚合 4 份归档 + `checksums.txt` 创建 GitHub Release |
 
-整条流水线在 ~25 分钟内产出五平台可执行 + 两个公网包。
+整条流水线在 ~25 分钟内产出四平台可执行包。**当前不发 PyPI 和 npm**；分发完全通过 GitHub Releases + `install.sh` 一键脚本。
 
 ---
 
