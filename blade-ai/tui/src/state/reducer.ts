@@ -243,31 +243,33 @@ function nextId(state: AppState, prefix: string): { id: string; counter: number 
  * was running, so callers can call this unconditionally without
  * forcing extra reducer work / re-renders.
  *
- * No locator allocation: locators are tied to the visible identity
- * of a tool the user might reference via ``/show T#``. A tool whose
- * end event never reached us has no useful output to show; the
- * resulting card renders as ``(no output)`` (see
- * ``ToolMessage.showBodyPlaceholder``) and skipping the locator
- * keeps the locator namespace tied to genuinely-completed tools.
+ * No locator allocation: a sanitized tool's real output left via the
+ * confirm payload (run_id was rewritten at the interrupt() boundary,
+ * so ``on_tool_end`` never reached us), so ``/show T#`` would have
+ * nothing meaningful to surface. Locator stays unallocated.
+ *
+ * Card body: ``placeholderKey`` is set so ToolMessage's empty-body
+ * branch renders ``tool.captured_in_confirm`` instead of the default
+ * ``tool.no_output`` — the output exists in the confirm card directly
+ * below this one, not nowhere. Storing the i18n key (not the resolved
+ * string) keeps the reducer pure.
  */
 function sanitizeStuckTools(pending: HistoryItem[]): HistoryItem[] {
   let mutated = false;
   const next = pending.map((item) => {
     if (item.kind !== "tool_group") return item;
     let groupChanged = false;
-    const tools = item.tools.map((t) => {
-      if (t.status !== "running") return t;
+    const tools = item.tools.map((tool) => {
+      if (tool.status !== "running") return tool;
       groupChanged = true;
       mutated = true;
-      const elapsed = Date.now() - t.startedAt;
+      const elapsed = Date.now() - tool.startedAt;
       return {
-        ...t,
+        ...tool,
         status: "success" as const,
-        // Empty raw → ToolMessage's ``showBodyPlaceholder`` branch
-        // renders the standard ``(no output)`` line. Honest about the
-        // missing data rather than fabricating a synthetic body.
         raw: "",
-        resultPreview: "(no output)",
+        resultPreview: "",
+        placeholderKey: "tool.captured_in_confirm",
         elapsedMs: elapsed,
       };
     });
@@ -349,7 +351,7 @@ function flushLeadingStable(state: AppState): AppState {
     if (item.kind === "thinking") {
       stable = true;
     } else if (item.kind === "tool_group") {
-      stable = item.tools.every((t) => t.status !== "running");
+      stable = item.tools.every((tool) => tool.status !== "running");
     } else if (item.kind === "agent") {
       // Tail agent may still be receiving tokens; non-tail means a
       // newer item has landed behind it and the agent text is frozen.
@@ -364,7 +366,7 @@ function flushLeadingStable(state: AppState): AppState {
     // First non-fully-stable item. If it's a partially-completed
     // tool_group, harvest the completed prefix into history.
     if (item.kind === "tool_group") {
-      const splitAt = item.tools.findIndex((t) => t.status === "running");
+      const splitAt = item.tools.findIndex((tool) => tool.status === "running");
       if (splitAt > 0) {
         const flushedAlloc = nextId(
           { ...state, nextItemId: nextItemIdAfter },
@@ -958,13 +960,13 @@ export function reducer(state: AppState, action: Action): AppState {
           }
           if (item.kind === "tool_group") {
             let groupChanged = false;
-            const updatedTools = item.tools.map((t) => {
-              if (predicate(t)) {
+            const updatedTools = item.tools.map((tool) => {
+              if (predicate(tool)) {
                 matched = true;
                 groupChanged = true;
-                return finalizeWithLocator(t);
+                return finalizeWithLocator(tool);
               }
-              return t;
+              return tool;
             });
             return groupChanged ? { ...item, tools: updatedTools } : item;
           }

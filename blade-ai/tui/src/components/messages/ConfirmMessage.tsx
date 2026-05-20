@@ -1,41 +1,38 @@
 /**
- * Inline confirmation dialog rendered as a pending item.
+ * Inline confirmation dialog — Forge × Operator redesign.
  *
- * Three variants share one frame:
+ * Two tiers, by stakes:
  *
- *   - Layer 1 ``intent_confirm``    — LLM's parsed fault_intent
- *                                     + risk meter + confidence tier
- *                                     + low-confidence warning tail.
- *   - Layer 2 ``confirmation_gate`` — generated plan + safety badge.
- *   - Generic fallback              — older servers without ``payload``.
+ *   Layer 1 ``intent_confirm`` (soft check)
+ *     — no surrounding box. Top + bottom ━ rule, banner +
+ *       ⓵ INTENT CHECK headline + body. Forge.fire (#E87841) is the
+ *       chrome colour. The "soft" framing matches what the user is
+ *       being asked: "did I read your intent right?"
  *
- * The frame uses ``borderStyle="double"`` (``╔═══╗``) to set confirm
- * cards apart from the round-bordered chrome elsewhere in the TUI —
- * confirmation is a stop-and-decide moment, the heavier border draws
- * the eye. Width matches ``useBootCardWidth`` so the card lines up
- * with the welcome / doctor / pending-tasks cards above.
+ *   Layer 2 ``confirmation_gate`` (hard check)
+ *     — double-line border, forge.iron (#A8451E) — the same family
+ *       hue as forge.fire but deeper, the "heated iron" shade. The
+ *       border carries the same colour as ResultCard so the user
+ *       reads "my decision flows straight into the result". The
+ *       hard framing — "EXECUTE · this hits production" — matches
+ *       the operator vocabulary of a flight-deck arming sequence.
  *
- * Visual structure (mirrors Python TUI's intent_confirm renderer):
+ *   Generic fallback (pre-payload server) — soft frame, generic
+ *     preamble.
  *
- *   ╔══ ✻ Confirm intent · t-abc123 ════════════════╗
- *   ║   <preamble: dim line>                          ║
- *   ║                                                  ║
- *   ║   <field rows>                                   ║
- *   ║                                                  ║
- *   ║   Risk: ▆▇█ high · 12 pods                      ║   (Layer 1 only)
- *   ║   Confidence: 0.55 中                            ║
- *   ║   └─ ⚠ <warning hint>                           ║
- *   ║                                                  ║
- *   ║   Safety: ✓ SAFE — <reason>                     ║   (Layer 2 only)
- *   ║                                                  ║
- *   ║   ─────────────────────                         ║
- *   ║   [Y] proceed   [N] cancel                      ║
- *   ╚══════════════════════════════════════════════════╝
+ * Glyph language:
+ *   ⓵ ⓶  numbered step indicators on the banner ("first/second gate")
+ *   ●     filled lamp — used inside resolved-state chip
  *
- * Key handling: ConfirmMessage itself does NOT capture keystrokes —
- * the parent ``Composer`` owns the useInput call when streamState is
- * ``waiting_confirmation``. This avoids two components racing for
- * the same key (Ink's useInput fires every active subscriber).
+ * Resolved state collapses the prompt to a one-line chip:
+ *   "● ARMED · proceeding"   (approved — forge.fire / forge.iron)
+ *   "● ABORTED · stopped"    (rejected — status.err / gray.500)
+ * preserving a permanent marker in scrollback without re-occupying
+ * the full card area.
+ *
+ * Key handling: ConfirmMessage itself does NOT capture keystrokes.
+ * Composer owns useInput when streamState is ``waiting_confirmation``
+ * so two components don't race for the same key.
  */
 
 import { Box, Text } from "ink";
@@ -46,10 +43,6 @@ import {
 } from "../shared/YesNoFeedbackSelect.js";
 import { t } from "../../i18n/index.js";
 import { useAppDispatch } from "../../state/store.js";
-// ConfirmItem was the legacy single-item type; the M2 split moved its
-// fields into ``ConfirmContextItem`` (Static) + ``ConfirmPromptItem``
-// (pending). Both are imported lazily from inside the new top-level
-// component types below to avoid a top-of-file circular import.
 import { Theme } from "../../theme/colors.js";
 import { Icons } from "../../theme/icons.js";
 
@@ -57,12 +50,7 @@ import { Icons } from "../../theme/icons.js";
 // Tunables (shared with Python TUI's intent_confirm renderer)
 // ---------------------------------------------------------------------------
 
-/** Below this confidence value the panel surfaces a warning tail under
- *  the confidence row. Matches Python ``LOW_CONFIDENCE_THRESHOLD``. */
 const LOW_CONFIDENCE_THRESHOLD = 0.7;
-
-/** Risk-tier breakpoints by absolute count. Matches Python
- *  ``_RISK_TIER_LOW_MAX`` / ``_RISK_TIER_MID_MAX``. */
 const RISK_TIER_LOW_MAX = 2;
 const RISK_TIER_MID_MAX = 9;
 
@@ -94,19 +82,14 @@ function asArray(v: unknown): unknown[] | null {
 }
 
 // ---------------------------------------------------------------------------
-// Risk meter — ported from Python ``_compute_risk_info`` / ``_risk_tier``
+// Risk meter
 // ---------------------------------------------------------------------------
 
 interface RiskInfo {
-  /** ``"concrete"`` (exact count from names) | ``"bounded"`` (from
-   *  ``params.count``) | ``"unbounded"`` (label / namespace / percent). */
   kind: "concrete" | "bounded" | "unbounded";
   target: string;
   count: number;
-  /** Only set for ``"unbounded"``: i18n key fragment ``labels`` / ``namespace`` /
-   *  ``percent``, or the raw fragment for unknown scope shapes. */
   descriptor: string;
-  /** Only set for ``"concrete"``: first 1–3 names, comma-joined. */
   sample: string;
 }
 
@@ -159,24 +142,16 @@ interface RiskTier {
 
 function riskTier(count: number): RiskTier {
   if (count <= RISK_TIER_LOW_MAX) {
-    // ``▁▁▁`` (Lower One Eighth Block × 3) renders as a thin baseline
-    // smudge — barely visible in most terminal fonts. ``▁▂▃`` is a
-    // small ascending ramp that still reads as "low" but actually
-    // shows up. The ``▃`` end of low equals the ``▃`` start of
-    // medium below, giving a continuous step-up across tiers.
     return { color: Theme.status.ok, label: t("confirm.tier.low"), sparkline: "▁▂▃" };
   }
   if (count <= RISK_TIER_MID_MAX) {
-    // ``▃▅▆`` (was ``▁▃▅``) so the medium tier starts where low ends
-    // and ends where high begins (``▆`` is the first of ``▆▇█``).
-    // The visual "fill height" climbs uniformly from low → high.
     return { color: Theme.status.warn, label: t("confirm.tier.medium"), sparkline: "▃▅▆" };
   }
   return { color: Theme.status.err, label: t("confirm.tier.high"), sparkline: "▆▇█" };
 }
 
 // ---------------------------------------------------------------------------
-// Confidence styling — ported from Python ``_confidence_style`` / hint
+// Confidence styling
 // ---------------------------------------------------------------------------
 
 function confidenceColor(c: number): string {
@@ -191,10 +166,6 @@ function confidenceTierLabel(c: number): string {
   return t("confirm.tier.high");
 }
 
-/** Build the field-aware warning hint shown below the confidence row.
- *  Names the specific fields the user should sanity-check, and adds a
- *  prod-namespace flag when one fires. Matches Python
- *  ``_low_confidence_hint``. */
 function lowConfidenceHint(
   faultIntent: Record<string, unknown>,
   confidence: number,
@@ -215,7 +186,7 @@ function lowConfidenceHint(
 }
 
 // ---------------------------------------------------------------------------
-// Safety badge — ported from Python ``confirm.py`` safety branch
+// Safety badge
 // ---------------------------------------------------------------------------
 
 interface SafetyBadge {
@@ -249,8 +220,6 @@ function safetyBadge(status: string): SafetyBadge | null {
         label: t("confirm.safety.blocked"),
       };
     default:
-      // Unknown status — show the raw value with a warning hue so the
-      // user notices it's outside the known set.
       return {
         color: Theme.status.warn,
         glyph: Icons.warning,
@@ -268,7 +237,7 @@ const Field: React.FC<{ label: string; value: string }> = ({ label, value }) => 
   return (
     <Box>
       <Box minWidth={14} paddingRight={1}>
-        <Text color={Theme.text.secondary}>{label}</Text>
+        <Text color={Theme.gray[500]}>{label}</Text>
       </Box>
       <Box flexGrow={1}>
         <Text color={Theme.text.primary} wrap="wrap">
@@ -279,44 +248,155 @@ const Field: React.FC<{ label: string; value: string }> = ({ label, value }) => 
   );
 };
 
-/** Thin horizontal rule that separates body from footer. Built as a
- *  Box with only ``borderTop`` so Ink draws ``─`` chars across the
- *  available width — no manual length math, CJK-safe. */
+/** Confidence progress bar — 10 segments of ▓/░ filled by the confidence
+ *  value. Helps the user read the value at a glance instead of parsing
+ *  the digits. Width-stable: always exactly 10 cells. */
+const ConfidenceBar: React.FC<{ value: number; color: string }> = ({
+  value,
+  color,
+}) => {
+  const filled = Math.max(0, Math.min(10, Math.round(value * 10)));
+  const empty = 10 - filled;
+  return (
+    <Text color={color} bold>
+      {"█".repeat(filled)}
+      <Text color={Theme.gray[700]}>{"░".repeat(empty)}</Text>
+    </Text>
+  );
+};
+
+/** Inverse chip — the operator badge family. Shared with ToolMessage's
+ *  chip / future StatusChip primitive. Width-stable, CJK-safe.
+ *  ``inverse + color`` paints a coloured background block; the
+ *  surrounding spaces give it visible padding so it reads as a
+ *  labelled tag rather than coloured text. */
+const Chip: React.FC<{ color: string; children: string }> = ({
+  color,
+  children,
+}) => (
+  <Text inverse color={color} bold>
+    {` ${children} `}
+  </Text>
+);
+
+/** Bold horizontal rule — used by soft-tier frame as top/bottom edges
+ *  and as section separators. Implementation note: a width-bound
+ *  ``<Text>`` of ``━`` is more reliable than a ``Box`` with only
+ *  ``borderTop`` for our ``cardWidth`` use case — Ink renders the
+ *  Text at exact width, no border-rendering gotchas. */
+const RuleHeavy: React.FC<{ width: number }> = ({ width }) => (
+  <Text color={Theme.gray[700]}>{"━".repeat(Math.max(8, width))}</Text>
+);
+
+/** Light section rule inside a card body — separates "details" from
+ *  "risk meter" from "actions". */
 const SectionRule: React.FC = () => (
   <Box
     marginTop={1}
     borderStyle="single"
-    borderTop={true}
+    borderTop
     borderBottom={false}
     borderLeft={false}
     borderRight={false}
-    borderColor={Theme.text.secondary}
+    borderColor={Theme.gray[700]}
   />
 );
 
+// ---------------------------------------------------------------------------
+// Frame — two tiers ("soft" / "hard") sharing the original glyph +
+// title + preamble three-line header. The operator-vocabulary
+// "banner + headline" pair from an earlier iteration was reverted
+// per user feedback ("confirm-gate 卡片很丑陋，改回以前的，只是边
+// 框颜色还是用这个") — the redesign read as too sparse, with the
+// banner alone taking a row, a row of blank, then the rule, then the
+// select. The pre-redesign tighter "glyph + title + preamble + body"
+// stack is denser and more honest.
+// ---------------------------------------------------------------------------
+
 interface FrameProps {
-  /** Glyph drawn before the title. ``Icons.thinking`` (✻) for Layer 1,
-   *  ``Icons.warning`` (⚠) for Layer 2. */
+  /** Title-row glyph (✻ for Layer 1 intent, ⚠ for Layer 2 gate). */
   glyph: string;
-  /** Glyph color — usually the title color so the two read as one
-   *  visual unit. */
+  /** Colour for the glyph — usually matches the tier accent so the
+   *  glyph and title read as one unit. */
   glyphColor: string;
+  /** Title text (no UPPERCASE / no banner format — plain title
+   *  case, e.g. "Confirm intent" / "Confirm execution plan"). */
   title: string;
   taskId?: string;
-  /** Dim subtitle line printed under the title. */
+  /** Dim subtitle line under the title. Plain language, optional. */
   preamble: string;
-  /** Body content — fielded rows / risk meter / safety badge / etc. */
+  /** Card body — fielded rows / risk / safety / etc. */
   children: React.ReactNode;
-  /** Optional interactive Select widget. When provided, rendered below
-   *  a section rule inside the bordered box. When omitted (the
-   *  ``ConfirmContextMessage`` use-case where the prompt has been
-   *  promoted into its own pending item), the rule + select section
-   *  is skipped entirely so the context card reads as a static record
-   *  in scrollback. */
+  /** Optional Select widget. When omitted, the action footer is
+   *  skipped (used by ConfirmContextMessage — the prompt lives in a
+   *  separate pending item below it). */
   actionPrompt?: React.ReactNode;
 }
 
-const ConfirmFrame: React.FC<FrameProps> = ({
+/** Soft tier (Layer 1 intent_confirm + generic fallback) — round
+ *  border in forge.fire. Same chrome family as the boot cards /
+ *  Tool cards. */
+const ConfirmFrameSoft: React.FC<FrameProps> = ({
+  glyph,
+  glyphColor,
+  title,
+  taskId,
+  preamble,
+  children,
+  actionPrompt,
+}) => {
+  const width = useBootCardWidth();
+  return (
+    <Box paddingLeft={2} marginTop={1} flexDirection="column">
+      <Box
+        flexDirection="column"
+        borderStyle="round"
+        borderColor={Theme.forge.fire}
+        paddingX={2}
+        paddingY={0}
+        width={width}
+      >
+        {/* Title row: glyph + title · taskId */}
+        <Box>
+          <Text color={glyphColor} bold>
+            {glyph}{" "}
+          </Text>
+          <Text color={Theme.forge.fire} bold>
+            {title}
+          </Text>
+          {taskId && (
+            <Text color={Theme.gray[500]}>{`  ·  ${taskId}`}</Text>
+          )}
+        </Box>
+        {/* Preamble: dim subtitle */}
+        {preamble && (
+          <Box marginTop={1}>
+            <Text color={Theme.gray[500]}>{preamble}</Text>
+          </Box>
+        )}
+        {/* Body */}
+        <Box marginTop={1} flexDirection="column">
+          {children}
+        </Box>
+        {/* Optional action footer */}
+        {actionPrompt !== undefined && (
+          <>
+            <SectionRule />
+            <Box marginTop={1} flexDirection="column">
+              {actionPrompt}
+            </Box>
+          </>
+        )}
+      </Box>
+    </Box>
+  );
+};
+
+/** Hard tier (Layer 2 confirmation_gate) — double border in
+ *  forge.iron, same colour family as ResultCard ("your decision
+ *  flows straight into the result"). Same internal stack as the
+ *  soft tier; only the border style + colour differ. */
+const ConfirmFrameHard: React.FC<FrameProps> = ({
   glyph,
   glyphColor,
   title,
@@ -331,37 +411,30 @@ const ConfirmFrame: React.FC<FrameProps> = ({
       <Box
         flexDirection="column"
         borderStyle="double"
-        borderColor={Theme.border.focused}
+        borderColor={Theme.forge.iron}
         paddingX={2}
         paddingY={0}
         width={width}
       >
-        {/* Title row: ✻ Title · taskId */}
         <Box>
           <Text color={glyphColor} bold>
             {glyph}{" "}
           </Text>
-          <Text color={Theme.text.accent} bold>
+          <Text color={Theme.forge.iron} bold>
             {title}
           </Text>
           {taskId && (
-            <Text color={Theme.text.secondary}> · {taskId}</Text>
+            <Text color={Theme.gray[500]}>{`  ·  ${taskId}`}</Text>
           )}
         </Box>
-        {/* Preamble: dim subtitle */}
-        <Box marginTop={1}>
-          <Text color={Theme.text.secondary}>{preamble}</Text>
-        </Box>
-        {/* Body */}
+        {preamble && (
+          <Box marginTop={1}>
+            <Text color={Theme.gray[500]}>{preamble}</Text>
+          </Box>
+        )}
         <Box marginTop={1} flexDirection="column">
           {children}
         </Box>
-        {/* Section rule + Select widget (replaces the static
-         *  [Y] / [N] hint row — Select owns the keyboard now).
-         *  Suppressed entirely when ``actionPrompt`` is omitted — the
-         *  context-only render path (``ConfirmContextMessage``) drops
-         *  this block because the prompt now lives in its own
-         *  pending-only ``ConfirmPromptMessage`` card below. */}
         {actionPrompt !== undefined && (
           <>
             <SectionRule />
@@ -375,29 +448,10 @@ const ConfirmFrame: React.FC<FrameProps> = ({
   );
 };
 
-/**
- * Hook: wire a ``YesNoFeedbackSelect`` for a given ConfirmItem.
- *
- * Returns the JSX to drop into ``ConfirmFrame``'s ``actionPrompt``
- * slot. The reusable ``YesNoFeedbackSelect`` primitive owns the
- * keyboard + the three-option layout; this hook is the
- * ConfirmMessage-specific wiring that maps the user's answer onto
- * the LangGraph resume vocabulary ("approved" / "rejected") and
- * dispatches into the pubsub slot Composer's effect watches.
- *
- * Mapping:
- *   - "yes"      → ``answer: "approved"`` (operation proceeds)
- *   - "no"       → ``answer: "rejected"`` (operation cancelled)
- *   - "feedback" → ``answer: "rejected"`` + ``feedback: <text>``;
- *                  Composer's effect fires a follow-up
- *                  ``submitTurn(text)`` so the agent treats the
- *                  user's typed reply as their next message
- *
- * Only the Y/N labels are scenario-specific (intent-confirm
- * Layer 1 vs confirmation-gate Layer 2 vs generic fallback) — the
- * "Tell agent something else…" feedback option uses the same
- * ``confirm.option.feedback`` i18n key everywhere.
- */
+// ---------------------------------------------------------------------------
+// Select wiring (unchanged from previous design)
+// ---------------------------------------------------------------------------
+
 function useConfirmSelect(
   taskId: string,
   yesLabel: string,
@@ -425,11 +479,6 @@ function useConfirmSelect(
     });
   };
   const handleCancel = () => {
-    // Esc / Ctrl+C in options mode == picking "no". The server's
-    // confirmation_gate routes the graph accordingly and the SSE
-    // ends naturally. The user can still hit Esc at the input
-    // prompt afterwards if they want to fully bail out of the
-    // session — that path remains in Composer.
     dispatch({ type: "CONFIRM_USER_DECIDED", taskId, answer: "rejected" });
   };
   return (
@@ -445,7 +494,7 @@ function useConfirmSelect(
 }
 
 // ---------------------------------------------------------------------------
-// Layer 1 — intent_confirm
+// Layer 1 — intent_confirm (soft tier)
 // ---------------------------------------------------------------------------
 
 const RiskMeterRow: React.FC<{ risk: RiskInfo }> = ({ risk }) => {
@@ -464,13 +513,13 @@ const RiskMeterRow: React.FC<{ risk: RiskInfo }> = ({ risk }) => {
     return (
       <Box>
         <Box minWidth={14} paddingRight={1}>
-          <Text color={Theme.text.secondary}>{t("confirm.field.risk")}</Text>
+          <Text color={Theme.gray[500]}>{t("confirm.field.risk")}</Text>
         </Box>
         <Box flexGrow={1}>
           <Text color={Theme.status.warn} bold>
             {risk.target} · {descriptor}
           </Text>
-          <Text color={Theme.text.secondary}>
+          <Text color={Theme.gray[500]}>
             {"  ("}
             {t("confirm.risk.runtime")}
             {")"}
@@ -479,7 +528,6 @@ const RiskMeterRow: React.FC<{ risk: RiskInfo }> = ({ risk }) => {
       </Box>
     );
   }
-  // concrete | bounded
   const tier = riskTier(risk.count);
   const countLabel =
     risk.kind === "bounded"
@@ -488,18 +536,18 @@ const RiskMeterRow: React.FC<{ risk: RiskInfo }> = ({ risk }) => {
   return (
     <Box>
       <Box minWidth={14} paddingRight={1}>
-        <Text color={Theme.text.secondary}>{t("confirm.field.risk")}</Text>
+        <Text color={Theme.gray[500]}>{t("confirm.field.risk")}</Text>
       </Box>
       <Box flexGrow={1}>
         <Text color={tier.color} bold>
           {tier.sparkline} {tier.label}
         </Text>
-        <Text color={Theme.text.secondary}>{" · "}</Text>
+        <Text color={Theme.gray[500]}>{" · "}</Text>
         <Text color={tier.color} bold>
           {countLabel}
         </Text>
         {risk.sample && (
-          <Text color={Theme.text.secondary}>{`  (${risk.sample})`}</Text>
+          <Text color={Theme.gray[500]}>{`  (${risk.sample})`}</Text>
         )}
       </Box>
     </Box>
@@ -518,22 +566,21 @@ const ConfidenceRow: React.FC<{
     <Box flexDirection="column">
       <Box>
         <Box minWidth={14} paddingRight={1}>
-          <Text color={Theme.text.secondary}>
+          <Text color={Theme.gray[500]}>
             {t("confirm.field.intent_confidence")}
           </Text>
         </Box>
         <Box flexGrow={1}>
-          <Text color={color} bold>
-            {pct}
-          </Text>
-          <Text color={Theme.text.secondary}>{`  (${tierText})`}</Text>
+          <ConfidenceBar value={confidence} color={color} />
+          <Text color={color} bold>{`  ${pct}`}</Text>
+          <Text color={Theme.gray[500]}>{`  ${tierText}`}</Text>
         </Box>
       </Box>
       {lowConf && (
         <Box>
           <Box minWidth={14} />
           <Box flexGrow={1}>
-            <Text color={Theme.text.secondary}>{"└─ "}</Text>
+            <Text color={Theme.gray[500]}>{"└─ "}</Text>
             <Text color={color} bold>
               {Icons.warning}{" "}
             </Text>
@@ -550,10 +597,7 @@ const ConfidenceRow: React.FC<{
 const IntentConfirmCard: React.FC<{
   payload: Payload;
   taskId?: string;
-}> = ({
-  payload,
-  taskId,
-}) => {
+}> = ({ payload, taskId }) => {
   const fi = asRecord(payload?.["fault_intent"]) ?? {};
   const params = asRecord(fi["params"]);
   const labels = asRecord(fi["labels"]);
@@ -581,12 +625,12 @@ const IntentConfirmCard: React.FC<{
   const risk = computeRiskInfo(fi);
 
   return (
-    <ConfirmFrame
+    <ConfirmFrameSoft
       glyph={Icons.thinking}
-      glyphColor={Theme.text.accent}
+      glyphColor={Theme.forge.fire}
       title={t("confirm.intent.title")}
-      taskId={taskId}
       preamble={t("confirm.intent.preamble")}
+      taskId={taskId}
     >
       <Field label={t("confirm.field.fault_type")} value={asString(fi["fault_type"])} />
       <Field label={t("confirm.field.scope")} value={asString(fi["scope"])} />
@@ -613,12 +657,12 @@ const IntentConfirmCard: React.FC<{
           <ConfidenceRow confidence={confidence} faultIntent={fi} />
         </Box>
       )}
-    </ConfirmFrame>
+    </ConfirmFrameSoft>
   );
 };
 
 // ---------------------------------------------------------------------------
-// Layer 2 — confirmation_gate
+// Layer 2 — confirmation_gate (hard tier)
 // ---------------------------------------------------------------------------
 
 const SafetyBadgeRow: React.FC<{ status: string; reason: string }> = ({
@@ -629,35 +673,46 @@ const SafetyBadgeRow: React.FC<{ status: string; reason: string }> = ({
   if (!badge) return null;
   return (
     <Box>
-      <Box minWidth={14} paddingRight={1}>
-        <Text color={Theme.text.secondary}>{t("confirm.field.safety")}</Text>
+      <Box flexShrink={0}>
+        <Chip color={badge.color}>{`${badge.glyph} ${badge.label}`}</Chip>
       </Box>
-      <Box flexGrow={1}>
-        {/* ``flexShrink={0}`` keeps the badge label from being clipped
-         *  when the reason text wraps. Ink v7's flex layout measures
-         *  Text children more strictly than v5: without the explicit
-         *  flexShrink the badge ``WARNING`` was getting truncated to
-         *  ``WARNIN`` to make room for the wrapping reason text in
-         *  the same row. The badge is short (≤8 chars) so always
-         *  yielding its full width is the right call — the reason
-         *  has flexGrow's slack to wrap into. */}
-        <Box flexShrink={0}>
-          <Text color={badge.color} bold>
-            {badge.glyph} {badge.label}
-          </Text>
-        </Box>
-        {reason && (
-          <Text color={Theme.text.secondary} wrap="wrap">{`  — ${reason}`}</Text>
-        )}
-      </Box>
+      {reason && (
+        <Text color={Theme.gray[500]} wrap="wrap">{`  — ${reason}`}</Text>
+      )}
     </Box>
   );
 };
+
+/** Plan summary inside a nested round box — visually anchors the
+ *  most-scrutinized text in a Layer 2 confirm card. */
+const PlanBlock: React.FC<{ summary: string; width: number }> = ({
+  summary,
+  width,
+}) => (
+  <Box flexDirection="column">
+    <Box>
+      <Text color={Theme.gray[500]}>── plan ──</Text>
+    </Box>
+    <Box
+      marginTop={0}
+      paddingX={1}
+      paddingY={0}
+      borderStyle="round"
+      borderColor={Theme.gray[700]}
+      width={Math.max(20, width - 8)}
+    >
+      <Text color={Theme.text.primary} wrap="wrap">
+        {summary}
+      </Text>
+    </Box>
+  </Box>
+);
 
 const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   payload,
   taskId,
 }) => {
+  const width = useBootCardWidth();
   const skill = asString(payload?.["skill_name"]);
   const target = asRecord(payload?.["target"]);
   const planSummary = asString(payload?.["plan_summary"]);
@@ -677,29 +732,18 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   }
 
   return (
-    <ConfirmFrame
+    <ConfirmFrameHard
       glyph={Icons.warning}
       glyphColor={Theme.status.warn}
       title={t("confirm.execution.title")}
-      taskId={taskId}
       preamble={t("confirm.execution.preamble")}
+      taskId={taskId}
     >
       <Field label={t("confirm.field.skill")} value={skill} />
       <Field label={t("confirm.field.target")} value={targetStr} />
       {planSummary && (
-        <Box flexDirection="column">
-          <Box>
-            <Box minWidth={14} paddingRight={1}>
-              <Text color={Theme.text.secondary}>
-                {t("confirm.field.plan_summary")}
-              </Text>
-            </Box>
-            <Box flexGrow={1}>
-              <Text color={Theme.text.primary} wrap="wrap">
-                {planSummary}
-              </Text>
-            </Box>
-          </Box>
+        <Box marginTop={1}>
+          <PlanBlock summary={planSummary} width={width} />
         </Box>
       )}
       {safetyStatus && (
@@ -707,12 +751,12 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
           <SafetyBadgeRow status={safetyStatus} reason={safetyReason} />
         </Box>
       )}
-    </ConfirmFrame>
+    </ConfirmFrameHard>
   );
 };
 
 // ---------------------------------------------------------------------------
-// Generic fallback (pre-payload server)
+// Generic fallback (soft tier)
 // ---------------------------------------------------------------------------
 
 const GenericConfirmCard: React.FC<{ content: string; taskId?: string }> = ({
@@ -721,32 +765,24 @@ const GenericConfirmCard: React.FC<{ content: string; taskId?: string }> = ({
 }) => {
   const body = content.trim() || t("confirm.body_empty");
   return (
-    <ConfirmFrame
+    <ConfirmFrameSoft
       glyph={Icons.thinking}
-      glyphColor={Theme.text.accent}
+      glyphColor={Theme.forge.fire}
       title={t("confirm.title")}
-      taskId={taskId}
       preamble={t("confirm.generic.preamble")}
+      taskId={taskId}
     >
       <Text color={Theme.text.primary} wrap="wrap">
         {body}
       </Text>
-    </ConfirmFrame>
+    </ConfirmFrameSoft>
   );
 };
 
 // ---------------------------------------------------------------------------
-// Payload usability gates
+// Payload usability gates (unchanged)
 // ---------------------------------------------------------------------------
 
-/** True when the intent_confirm payload carries at least one field a
- *  user can read. Defends against the chrome-only "empty card" bug
- *  that hits when ``fault_intent`` is ``{}`` or all whitelist fields
- *  are blank — without this gate, the dispatcher would still pick
- *  IntentConfirmCard, every <Field> would short-circuit to null,
- *  RiskMeterRow / ConfidenceRow would also bail, and the user would
- *  see a card with title + preamble + footer and no body.
- */
 function hasIntentContent(payload: Record<string, unknown>): boolean {
   const fi = asRecord(payload["fault_intent"]);
   if (!fi) return false;
@@ -771,11 +807,6 @@ function hasIntentContent(payload: Record<string, unknown>): boolean {
   return false;
 }
 
-/** True when the confirmation_gate payload carries at least one field
- *  worth rendering. Same defense as hasIntentContent — empty payload
- *  → fall back to GenericConfirmCard so the agent's pre-formatted
- *  ``content`` body is shown instead of a blank chrome.
- */
 function hasExecutionContent(payload: Record<string, unknown>): boolean {
   if (asString(payload["skill_name"])) return true;
   if (asString(payload["plan_summary"])) return true;
@@ -787,15 +818,9 @@ function hasExecutionContent(payload: Record<string, unknown>): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Top-level dispatcher
+// Top-level dispatchers — Context (Static) + Prompt (pending)
 // ---------------------------------------------------------------------------
 
-/**
- * Static-history renderer for the heavy confirm context (plan summary,
- * safety warning, fault intent table). Burns into scrollback once at
- * ``CONFIRM_RECEIVED`` time and never updates — the live select widget
- * lives in a separate ``ConfirmPromptMessage`` pending item below.
- */
 export const ConfirmContextMessage: React.FC<{
   item: import("../../state/types.js").ConfirmContextItem;
 }> = ({ item }) => {
@@ -817,34 +842,22 @@ export const ConfirmContextMessage: React.FC<{
 };
 
 /**
- * Pending-only renderer for the live confirm select widget. Pairs with
- * ``ConfirmContextMessage`` (Static, in scrollback) — the context card
- * holds the heavy read-only plan / safety / intent table; this card
- * holds only the action prompt. Splitting the two keeps the dynamic
- * frame bounded so multi-row warnings stop pushing it past viewport
- * rows during the human-in-the-loop wait.
+ * Pending-only renderer for the live confirm select widget.
  *
- * Resolved-state branch: once the user answers, the prompt becomes a
- * one-line "✓ confirmed / ✗ cancelled" marker so it lands in
- * scrollback as a permanent record of the decision.
+ * Layer 2 lives inside its own bordered frame (matched to
+ * ExecutionConfirmCard's chrome) so the prompt visually attaches to
+ * the context card. Layer 1 / generic use a soft frame for the same
+ * reason.
+ *
+ * Resolved-state branch: once the user answers, the prompt collapses
+ * to a single-line chip ("● ARMED · proceeding" / "● ABORTED · stopped")
+ * so the timeline keeps a permanent operator-vocabulary marker
+ * without re-occupying the full card area.
  */
 export const ConfirmPromptMessage: React.FC<{
   item: import("../../state/types.js").ConfirmPromptItem;
-  /** Set ``false`` for the SECOND-and-later unresolved prompt when
-   *  pending happens to carry more than one (rare — server contract
-   *  resolves Layer 1 before emitting Layer 2 — but defensive). Only
-   *  the focused prompt's Select consumes keyboard events; the rest
-   *  render as inert chrome until they bubble up. */
   isFocused?: boolean;
 }> = ({ item, isFocused = true }) => {
-  // Hook calls live UNCONDITIONALLY at the top of the component so a
-  // single ``ConfirmPromptItem`` instance that mutates from
-  // ``resolved=false`` to ``resolved=true`` (CONFIRM_RESOLVED dispatch
-  // flips the flag in place before flushLeadingStable migrates the
-  // item) doesn't change the hook call count between renders. React's
-  // "Rendered fewer hooks than expected" guard would otherwise crash
-  // the moment the user presses Enter on a confirm. Yes/No labels are
-  // computed in line so the per-node branch doesn't add another hook.
   let yesLabel: string;
   let noLabel: string;
   if (item.node === "intent_confirm") {
@@ -858,35 +871,60 @@ export const ConfirmPromptMessage: React.FC<{
     noLabel = t("confirm.refine");
   }
   const select = useConfirmSelect(item.taskId, yesLabel, noLabel, isFocused);
-  const width = useBootCardWidth();
+  // Width is read unconditionally so the hook call order stays stable
+  // across resolved→unresolved transitions. Only the unresolved branch
+  // uses it; the resolved chip line doesn't need a width.
+  const cardWidth = useBootCardWidth();
 
   if (item.resolved) {
     const ok = item.answer === "approved";
+    const chipColor = ok ? Theme.forge.fire : Theme.status.err;
+    const chipText = ok ? t("confirm.armed_chip") : t("confirm.aborted_chip");
+    const tail = ok ? t("confirm.armed_tail") : t("confirm.aborted_tail");
     return (
       <Box paddingLeft={2} marginTop={1}>
-        <Text color={ok ? Theme.status.ok : Theme.text.secondary}>
-          {ok ? Icons.success : Icons.fail}{" "}
-          {ok
-            ? t("confirm.answered")
-            : t("confirm.answered_rejected")}
-        </Text>
+        <Text color={Theme.gray[700]}>{"╰─▶  "}</Text>
+        <Chip color={chipColor}>{`● ${chipText}`}</Chip>
+        <Text color={Theme.gray[500]}>{`  ·  ${tail}`}</Text>
       </Box>
     );
   }
 
+  // Active prompt — render the select widget alone inside a small
+  // round-bordered box. Banner / headline / taskId are intentionally
+  // OMITTED: the corresponding context card right above this prompt
+  // already carries them, so repeating them here would double-print
+  // the title.
+  //
+  // Border colour is **dim gray** regardless of tier, not the
+  // forge.fire / forge.iron used by the context card above. The
+  // visual reasoning: the context card carries the *content* the
+  // user must read (fault details, plan, safety status) — that
+  // earns the loud brand border. The prompt is just the *action
+  // surface* (select Y/N/feedback). Painting it in the same loud
+  // colour produces the user-reported "审美疲劳" — two big
+  // forge-coloured frames stacked feels noisy and makes the prompt
+  // visually compete with the content it's responding to. The dim
+  // gray frame fades into the background, so the user's eye lands
+  // on the highlighted ❯ option and the bold select labels instead
+  // of the chrome.
+  //
+  // Border style still tracks tier (round soft / double hard) so
+  // the "soft check vs hard check" hierarchy is preserved.
+  const isHard = item.node === "confirmation_gate";
+  const tierColor = Theme.gray[700];
+  const tierStyle: "double" | "round" = isHard ? "double" : "round";
   return (
     <Box paddingLeft={2} marginTop={1} flexDirection="column">
       <Box
         flexDirection="column"
-        borderStyle="round"
-        borderColor={Theme.border.focused}
+        borderStyle={tierStyle}
+        borderColor={tierColor}
         paddingX={2}
         paddingY={0}
-        width={width}
+        width={cardWidth}
       >
-        <Box marginTop={0} flexDirection="column">
-          {select}
-        </Box>
+        {select}
       </Box>
     </Box>
   );

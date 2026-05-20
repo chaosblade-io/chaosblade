@@ -37,14 +37,14 @@ import { renderMarkdown } from "../../utils/markdown.js";
 /** Rows we reserve for everything in the dynamic frame OTHER than this
  *  AgentMessage's own visible body. Covers, worst-case, the full
  *  Composer chrome (PhaseStepper ≈ 6 + LoadingIndicator with body block
- *  ≈ 10 (header 1 + separator 1 + BODY_MAX_LINES up to 8) + InputPrompt
- *  3 + Footer 2 + Composer marginTop 1 = 22), PLUS a 5-row buffer for:
+ *  ≈ 14 (header 1 + separator 1 + BODY_MAX_LINES up to 12) + InputPrompt
+ *  3 + Footer 2 + Composer marginTop 1 = 26), PLUS a 5-row buffer for:
  *    · any leading-stable item (a Thinking row or completed ToolGroup)
  *      that's queued for flush but not yet committed to ``<Static>``
  *      because the flush only fires inside TOKEN_APPENDED / TOOL_STARTED
  *    · this component's own ``marginTop=1``
  *    · 1 row of safety margin
- *  = 27 rounded to 28.
+ *  = 31 rounded to 32.
  *
  *  Why over-budgeting matters: the moment ``outputHeight >= stdout.rows``
  *  fires for a single tick, Ink's render path falls into its
@@ -55,7 +55,7 @@ import { renderMarkdown } from "../../utils/markdown.js";
  *  follow the cursor (the reported "scroll wheel hijack"). Erring on
  *  the small-frame side trims at most a few rows of agent body which
  *  the user can scroll up to read in scrollback after the turn ends. */
-const PENDING_CHROME_RESERVE = 28;
+const PENDING_CHROME_RESERVE = 32;
 /** Floor for the visible budget so a tiny terminal still shows
  *  *something* of the streaming reply rather than the bare truncation
  *  hint. */
@@ -104,9 +104,25 @@ export const AgentMessage: React.FC<{
   }, [rendered, isPending, rows, availableTerminalHeight]);
 
   return (
-    <Box paddingLeft={2} marginTop={1} flexDirection="column">
-      <Box>
-        <Text color={Theme.text.accent}>{Icons.agent} </Text>
+    <Box paddingLeft={2} marginTop={1} flexDirection="row">
+      {/* Left forge.fire rail — Forge × Operator redesign. The rail
+       *  runs the full height of the wrapped markdown body so
+       *  multi-line agent replies stay visually anchored in the
+       *  conversation channel that UserMessage / ThinkingMessage
+       *  also live in. ``borderLeft`` only is Ink's most reliable
+       *  primitive for a per-row vertical accent — Yoga sizes the
+       *  Box to fit the wrapped Text's measured height. */}
+      <Box
+        borderStyle="single"
+        borderLeft
+        borderTop={false}
+        borderBottom={false}
+        borderRight={false}
+        borderColor={Theme.forge.fire}
+        paddingLeft={1}
+        flexGrow={1}
+      >
+        <Text color={Theme.forge.fire}>{Icons.agent} </Text>
         <Box flexGrow={1}>
           <Text wrap="wrap">{visibleText}</Text>
         </Box>

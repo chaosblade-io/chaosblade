@@ -208,6 +208,8 @@ if (ENABLED) {
     cwd: process.cwd(),
     argv: process.argv,
     nodeVersion: process.version,
+    initialRows: process.stdout.rows ?? 0,
+    initialColumns: process.stdout.columns ?? 0,
   });
   // Also print to stderr so a curious user running with `2>/tmp/x`
   // can confirm activation without hunting for the file.
@@ -218,6 +220,48 @@ if (ENABLED) {
   } catch {
     // Ink may have raw mode on; ignore.
   }
+
+  // SIGWINCH watcher — write one record per resize so the log
+  // captures exactly when the user changed terminal size. The frame
+  // records on either side of a resize record show the chrome /
+  // pending re-measurement, making it easy to correlate "I resized"
+  // with "did chrome height jump and trigger an overflow".
+  //
+  // ``process.stdout`` is a Node TTY stream and emits ``resize``
+  // synchronously on SIGWINCH. We dedupe against the last seen
+  // rows/columns because some terminals re-fire ``resize`` on
+  // focus / hover events with identical dimensions.
+  let lastRows = process.stdout.rows ?? 0;
+  let lastCols = process.stdout.columns ?? 0;
+  const onResize = (): void => {
+    const newRows = process.stdout.rows ?? 0;
+    const newCols = process.stdout.columns ?? 0;
+    if (newRows === lastRows && newCols === lastCols) return;
+    writeRecord({
+      _kind: "resize",
+      ts: Date.now(),
+      oldRows: lastRows,
+      oldColumns: lastCols,
+      newRows,
+      newColumns: newCols,
+      rowsDelta: newRows - lastRows,
+      colsDelta: newCols - lastCols,
+    });
+    lastRows = newRows;
+    lastCols = newCols;
+  };
+  // Set a generous listener limit because Ink + our probe + other
+  // tooling can compete for the same emitter. The probe adds 1; we
+  // don't want a MaxListenersExceededWarning to disrupt the host
+  // terminal during a debugging session.
+  try {
+    process.stdout.setMaxListeners(
+      Math.max(15, process.stdout.getMaxListeners()),
+    );
+  } catch {
+    // best effort
+  }
+  process.stdout.on("resize", onResize);
 }
 
 export function useOverflowProbe(): void {

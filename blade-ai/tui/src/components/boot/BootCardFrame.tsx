@@ -1,10 +1,13 @@
 /**
- * Shared frame for the three boot-screen cards (Welcome, BootDoctor,
- * PendingTasks). They previously each rendered their own bordered Box
- * without a width, so Ink shrunk every card to its content and the
- * staircase of right edges looked broken. Centralising the frame here
- * gives them all the same terminal-derived width and keeps the
- * left-padding / border / paddingX boilerplate in one place.
+ * Shared bordered frame for boot-era cards (Welcome, BootDoctor,
+ * PendingTasks, Goodbye). Single round border in ``forge.fire`` (the
+ * brand orange) so all four cards read as one visual family.
+ *
+ * Internal layout is each consumer's own concern — this frame only
+ * provides the bordered Box + outer indent + width policy. The
+ * earlier title/metadata strip experiment was reverted; callers
+ * render their own headers inside the box, matching the pre-redesign
+ * structure.
  */
 
 import { Box } from "ink";
@@ -12,17 +15,9 @@ import type { ReactNode } from "react";
 import { useTerminalSize } from "../../hooks/useTerminalSize.js";
 import { Theme } from "../../theme/colors.js";
 
-// Outer wrapper pads 2 cols on the left; we leave a matching 2-col
-// gutter on the right so the card doesn't hug the terminal edge.
 const OUTER_HORIZONTAL_PAD = 4;
 const CARD_MIN_WIDTH = 32;
 
-/**
- * Width allocated to a boot card's outer Box (border included).
- * Exported as a hook so WelcomeCard — which renders a custom title-in-
- * border layout rather than using the frame — stays in lockstep with the
- * other two cards.
- */
 export function useBootCardWidth(): number {
   const { columns } = useTerminalSize();
   return Math.max(CARD_MIN_WIDTH, columns - OUTER_HORIZONTAL_PAD);
@@ -30,7 +25,9 @@ export function useBootCardWidth(): number {
 
 export interface BootCardFrameProps {
   children: ReactNode;
-  /** Inner vertical padding inside the border. WelcomeCard uses 1, the others 0. */
+  /** Inner vertical padding inside the border. WelcomeCard /
+   *  GoodbyeCard use ``1`` so brand / stats blocks breathe; the
+   *  lighter info cards default to ``0``. */
   paddingY?: number;
 }
 
@@ -44,7 +41,7 @@ export const BootCardFrame: React.FC<BootCardFrameProps> = ({
       <Box
         flexDirection="column"
         borderStyle="round"
-        borderColor={Theme.text.accent}
+        borderColor={Theme.forge.fire}
         paddingX={2}
         paddingY={paddingY}
         width={width}

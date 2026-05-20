@@ -22,7 +22,7 @@
  * end-of-turn TurnUsageItem agree on the same numbers.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { t } from "../i18n/index.js";
 import { useAppSelector } from "../state/store.js";
 import { isNarrow, useTerminalSize } from "./useTerminalSize.js";
@@ -65,13 +65,13 @@ export interface LoadingIndicatorProps {
  *  the LoadingIndicator's own ``paddingLeft={2}``. */
 const BODY_RESERVED_COLS = 4;
 
-/** Last N wrapped lines of the live thinking buffer kept visible while
- *  a thinking session is in flight. Bumped to 16 so the user can read
- *  more context of the agent's chain-of-thought before the buffer
- *  flushes into the collapsed ``▸ Thought for Ns`` row. AgentMessage's
- *  ``PENDING_CHROME_RESERVE`` already factors in the up-to-16-row body
- *  block when computing the streaming-text cap. */
-const BODY_MAX_LINES = 16;
+/** Visible CoT body row cap. The body is ambient chrome — once it
+ *  exceeds ~8 rows it starts to feel like content competing with
+ *  the actual agent reply, so we lock the upper bound here
+ *  regardless of how tall the terminal gets. On smaller terminals
+ *  the per-render math (``rows - 22``) brings the effective cap
+ *  down so the dynamic frame still fits. */
+const BODY_MAX_LINES = 8;
 
 export function useLoadingIndicator(): LoadingIndicatorProps {
   const streamState = useAppSelector((s) => s.streamState);
@@ -163,11 +163,46 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
     headerLabel = phrase;
   }
 
-  // Pre-wrap the live thinking buffer to the terminal width and keep
-  // the trailing 3 lines. Empty when no session is active. Recomputed
-  // on each render — the work is O(N) in buffer length but a single
-  // session is bounded by the LLM's CoT budget (a few KB) so this is
-  // cheap relative to the React reconcile.
+  // Throttle the thinking buffer that drives ``bodyLines``. The
+  // raw ``thoughtBuffer`` ticks every token (≥ 12 Hz from a
+  // streaming LLM) — and Ink redraws the whole 20+ row dynamic
+  // frame on every state change. Most of those redraws are pure
+  // chrome flicker: spinner advances 1 glyph, last body line gains
+  // one character, and the user perceives 8-17 fps full-frame
+  // shimmer. Letting the body lag the buffer by ~250 ms collapses
+  // those into ~4 visible body refreshes per second — slow enough
+  // to read, fast enough to feel "live", and the spinner-only
+  // redraws between updates touch a single glyph instead of the
+  // whole padded body.
+  //
+  // Spinner-driven redraws (12.5 Hz from ink-spinner's own
+  // setInterval) still happen, but those repaint the same body
+  // bytes — Ink writes the same content, so terminals with
+  // intelligent diffing produce near-zero visible flicker.
+  const BUFFER_THROTTLE_MS = 250;
+  const [displayedBuffer, setDisplayedBuffer] = useState(thoughtBuffer);
+  const lastFlushRef = useRef(Date.now());
+  useEffect(() => {
+    if (thoughtBuffer === displayedBuffer) return;
+    const now = Date.now();
+    const sinceLast = now - lastFlushRef.current;
+    if (sinceLast >= BUFFER_THROTTLE_MS) {
+      lastFlushRef.current = now;
+      setDisplayedBuffer(thoughtBuffer);
+      return;
+    }
+    const id = setTimeout(() => {
+      lastFlushRef.current = Date.now();
+      setDisplayedBuffer(thoughtBuffer);
+    }, BUFFER_THROTTLE_MS - sinceLast);
+    return () => clearTimeout(id);
+  }, [thoughtBuffer, displayedBuffer]);
+
+  // Pre-wrap the throttled buffer to the terminal width. Empty when
+  // no session is active. Recomputed on each render — the work is
+  // O(N) in buffer length but a single session is bounded by the
+  // LLM's CoT budget (a few KB) so this is cheap relative to the
+  // React reconcile.
   const narrow = isNarrow(columns);
   const bodyWidth = Math.max(20, columns - BODY_RESERVED_COLS);
   // When ``constrainHeight`` is on (default), shrink the live CoT body
@@ -179,34 +214,54 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
   // patched out of Ink's fullscreen-redraw branch. ``Ctrl+O`` toggles
   // ``constrainHeight`` off so the user can see the full thinking body
   // when needed.
+  // bodyMax — computed against the live terminal height (re-read on
+  // every SIGWINCH via ``useTerminalSize``). Two rules:
+  //
+  //   1. Capped at ``BODY_MAX_LINES`` (8) regardless of how tall
+  //      the terminal is — once the body grows beyond ~8 rows it
+  //      stops feeling like a peripheral CoT preview and starts
+  //      competing with the actual agent output for attention.
+  //   2. On small terminals where reserving 22 rows for the rest
+  //      of the chrome (PhaseStepperCard 8 + InputPrompt 5 + Footer
+  //      1 + Composer marginTop 1 + LoadingIndicator header/separator
+  //      2 + safety 5) would push the frame past stdout.rows, fall
+  //      back to ``rows - 22`` so the dynamic frame still fits.
+  //
+  // Sample bodyMax:
+  //   rows=24 → max(3, min(8, 2))  = 3   (tiny terminal, body collapses)
+  //   rows=28 → max(3, min(8, 6))  = 6
+  //   rows=30 → max(3, min(8, 8))  = 8   (8-cap binds from here)
+  //   rows=47 → max(3, min(8, 25)) = 8
+  //   rows=80 → max(3, min(8, 58)) = 8
+  //
+  // Ctrl+O (``constrainHeight=false``) lifts the "fits in viewport"
+  // rule but keeps the 8-row cap — useful when the user explicitly
+  // wants to see live CoT in scrollback while accepting that the
+  // frame may overflow.
   const bodyMax = constrainHeight
-    ? Math.max(3, Math.min(BODY_MAX_LINES, rows - 18))
+    ? Math.max(3, Math.min(BODY_MAX_LINES, rows - 22))
     : BODY_MAX_LINES;
-  // Reserve a fixed-height block for the body whenever a thinking
-  // session is open. Without this the rendered ``bodyLines.length``
-  // grows by 1–2 every few tokens (one row per wrapped CoT line)
-  // and Ink rewrites the whole dynamic frame on each growth — the
-  // user-visible "持续小闪烁" verified by the overflow probe (delta
-  // +1: 92 frames, +2: 37 frames in a single inject session). By
-  // padding leading empty rows we hold ``bodyLines.length`` constant
-  // at ``bodyMax`` for the entire thinking session, so the chrome
-  // height stops jittering. Empty padding goes BEFORE the real
-  // content so the latest thinking text always anchors at the
-  // bottom (closest to the InputPrompt) — the same visual order the
-  // user reads in scrollback. The streaming-only height jump
-  // happens exactly twice now (open + close of the session) instead
-  // of once per wrap-row addition; one start + one stop is
-  // tolerable, 100+ inter-token jitters is what the user reported
-  // as flicker.
+  // Body is ALWAYS padded to bodyMax rows during thinking so chrome
+  // height stays stable across token streaming. This trade-off was
+  // tried before with bodyMax=12 and reverted (a 12-row block
+  // pulsing on every token reads as "整块在闪"); at the much
+  // smaller bodyMax=6 the per-token rewrite spans only 6 rows of
+  // body content, which is light enough that "chrome stays still"
+  // dominates "block flashes". Padding goes AFTER the real lines so
+  // the body grows tail-f-style — fresh CoT appears under the
+  // separator and travels downward, with empty slots between the
+  // latest line and the InputPrompt fence. Once the buffer crosses
+  // ``bodyMax`` wrapped lines the padding is gone and the block
+  // starts the normal bottom-anchored scroll.
   let bodyLines: string[];
-  if (narrow || thoughtBuffer.length === 0) {
+  if (narrow || displayedBuffer.length === 0) {
     bodyLines = [];
   } else {
-    const realLines = tailWrappedLines(thoughtBuffer, bodyMax, bodyWidth);
+    const realLines = tailWrappedLines(displayedBuffer, bodyMax, bodyWidth);
     const padding = Math.max(0, bodyMax - realLines.length);
     bodyLines =
       padding > 0
-        ? [...new Array<string>(padding).fill(""), ...realLines]
+        ? [...realLines, ...new Array<string>(padding).fill("")]
         : realLines;
   }
 

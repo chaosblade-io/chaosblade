@@ -47,6 +47,13 @@ export interface ToolItem {
    *  / ``/expand`` reference past tool calls by short token without
    *  scrollback hunt. */
   locator?: string;
+  /** i18n key rendered by ToolMessage's empty-body placeholder branch
+   *  in place of the default ``tool.no_output``. Set by
+   *  ``sanitizeStuckTools`` to ``tool.captured_in_confirm`` so the card
+   *  reads "output is in the confirm below" instead of "(no output)".
+   *  Stored as a key (not a translated string) so reducers stay pure
+   *  and a future runtime locale switch resolves correctly. */
+  placeholderKey?: string;
 }
 
 /** Group of consecutive tool calls — ToolGroupMessage renders one border around them. */

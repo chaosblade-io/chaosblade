@@ -1,18 +1,37 @@
 # blade-ai Windows Installer — PowerShell one-click installation script.
 #
 # Usage:
+#   # Latest release (default — resolved from GitHub API):
 #   irm https://chaosblade.io/install-agent.ps1 | iex
-#   irm https://chaosblade.io/install-agent.ps1 | iex; Install-BladeAI -Version "0.1.0"
 #
-# Environment variables:
-#   BLADE_AI_VERSION       — override the version to install (default: hardcoded below)
-#   BLADE_AI_INSTALL_DIR   — override the installation directory
-#   BLADE_AI_MIRROR        — override the download base URL
-#   BLADE_AI_SKIP_VERIFY   — set to "1" to skip SHA256 verification (NOT recommended)
+#   # Pin a specific version (download then call with -Version):
+#   irm https://chaosblade.io/install-agent.ps1 -OutFile install.ps1
+#   .\install.ps1 -Version 0.1.0
 #
-# Note: ``BLADE_AI_VERSION`` accepts the bare semver (``0.1.0``); the
-# script internally prefixes it with ``blade-ai-v`` to match the
-# chaosblade monorepo's tag scheme.
+#   # Or via env var (works with irm | iex):
+#   $env:BLADE_AI_VERSION = "0.1.0"
+#   irm https://chaosblade.io/install-agent.ps1 | iex
+#
+# Parameters / environment:
+#   -Version VERSION       Pin a specific version (bare semver, e.g. 0.1.0).
+#                          If omitted AND $env:BLADE_AI_VERSION is unset,
+#                          the script queries GitHub for the latest
+#                          ``blade-ai-v*`` release.
+#   BLADE_AI_VERSION       Same as -Version (env var form).
+#   BLADE_AI_INSTALL_DIR   Override the install directory.
+#   BLADE_AI_MIRROR        Override the download base URL (GitHub Releases).
+#   BLADE_AI_MIRROR_API    Override the GitHub API endpoint used by
+#                          latest-version resolution (rare; for testing).
+#   BLADE_AI_SKIP_VERIFY   Set to "1" to skip SHA256 verification (NOT recommended).
+#
+# Note: ``BLADE_AI_VERSION`` / ``-Version`` accept bare semver
+# (``0.1.0``); the script internally prefixes with ``blade-ai-v`` to
+# match the chaosblade monorepo's tag scheme.
+
+[CmdletBinding()]
+param(
+    [string]$Version = ""
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -39,13 +58,23 @@ Write-Host ""
 exit 1
 
 $ToolName = "blade-ai"
-$Version = if ($env:BLADE_AI_VERSION) { $env:BLADE_AI_VERSION } else { "0.1.0" }
-# Tag namespace: chaosblade monorepo hosts blade-ai under the
-# ``blade-ai-v*`` tag namespace so it doesn't collide with chaosblade's
-# own ``v*`` tags. Bump this prefix together with
-# ``release-blade-ai.yml``'s trigger.
-$Tag = "blade-ai-v$Version"
+
+# Version resolution order:
+#   1. -Version param (highest precedence)
+#   2. $env:BLADE_AI_VERSION
+#   3. GitHub API: latest blade-ai-v* release (deferred — see
+#      Resolve-LatestVersion call below; runs after color helpers
+#      so we can show a progress line).
+#
+# Tag is computed AFTER the version is finalized.
+if (-not $Version) {
+    $Version = $env:BLADE_AI_VERSION
+}
+$Tag = ""  # set after resolution
 $SkipVerify = if ($env:BLADE_AI_SKIP_VERIFY -eq "1") { $true } else { $false }
+$ReleasesApi = if ($env:BLADE_AI_MIRROR_API) { $env:BLADE_AI_MIRROR_API } else {
+    "https://api.github.com/repos/chaosblade-io/chaosblade/releases"
+}
 
 # ── Force TLS 1.2 ──────────────────────────────────────────────────────────────
 [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
@@ -55,6 +84,73 @@ function Write-Step($msg) { Write-Host "  ▸ $msg" -ForegroundColor Blue }
 function Write-Ok($msg)   { Write-Host "  ✓ $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host "  ⚠ $msg" -ForegroundColor Yellow }
 function Write-Err($msg)  { Write-Host "  ✗ $msg" -ForegroundColor Red; exit 1 }
+
+# ── Resolve latest version from GitHub API ─────────────────────────────────────
+#
+# Mirrors install.sh's resolve_latest_version: list the chaosblade
+# monorepo's releases, filter by the ``blade-ai-v`` tag prefix, drop
+# drafts and prereleases, then sort by semver descending and return
+# the top tag's bare semver (e.g. ``0.3.0``).
+#
+# We can't hit ``/releases/latest`` because that returns chaosblade's
+# OWN top tag (``v1.x.x``), not our blade-ai sub-stream — so we paginate
+# /releases and filter client-side. Releases per call are bounded by
+# ``per_page=100``; blade-ai cadence is slow so one page is plenty.
+#
+# Returns $null on any failure (no network, malformed response, no
+# matching releases). Caller decides how to react.
+function Resolve-LatestVersion {
+    $url = "${ReleasesApi}?per_page=100"
+    $releases = $null
+    try {
+        # -UseBasicParsing keeps us off IE engine on Win PowerShell 5.1
+        # where the parsed-DOM path can throw on certain user profiles.
+        # -TimeoutSec 15 is generous; the API is cheap and small.
+        $releases = Invoke-RestMethod -Uri $url -UseBasicParsing -TimeoutSec 15 `
+                        -Headers @{ "Accept" = "application/vnd.github+json" }
+    } catch {
+        return $null
+    }
+
+    if (-not $releases) { return $null }
+
+    $prefix = "blade-ai-v"
+    $candidates = New-Object System.Collections.ArrayList
+    foreach ($r in $releases) {
+        if ($r.draft -or $r.prerelease) { continue }
+        $tag = [string]$r.tag_name
+        if (-not $tag.StartsWith($prefix)) { continue }
+        $semver = $tag.Substring($prefix.Length)
+
+        # Build a [Version] for sorting. [Version] only accepts plain
+        # ``A.B[.C[.D]]`` numeric forms — strip non-numeric suffixes
+        # (e.g. ``-rc.1``, ``+build.42``) by walking the pieces.
+        # Pre-release filter above usually catches RCs but be defensive.
+        $nums = New-Object System.Collections.ArrayList
+        foreach ($part in [regex]::Split($semver, "[.\-+]")) {
+            if ($part -match '^\d+$') {
+                [void]$nums.Add([int]$part)
+            } else {
+                break
+            }
+        }
+        if ($nums.Count -eq 0) { continue }
+        # [Version] requires at least 2 components; pad with zero.
+        while ($nums.Count -lt 2) { [void]$nums.Add(0) }
+        $vstr = ($nums -join ".")
+        try {
+            $v = [Version]$vstr
+            [void]$candidates.Add(([PSCustomObject]@{ Version = $v; Semver = $semver }))
+        } catch {
+            # Unparseable; skip this entry rather than abort.
+        }
+    }
+
+    if ($candidates.Count -eq 0) { return $null }
+
+    $sorted = $candidates | Sort-Object Version -Descending
+    return $sorted[0].Semver
+}
 
 # ── Architecture detection ──────────────────────────────────────────────────────
 # Note: On ARM64 Windows running x64 PowerShell via emulation,
@@ -69,6 +165,27 @@ $Arch = if ([System.Environment]::Is64BitOperatingSystem) {
 Write-Step "Detecting system architecture..."
 $Platform = "windows-$Arch"
 Write-Ok "Detected $Platform"
+
+# ── Resolve version (lazy) ─────────────────────────────────────────────────────
+# At this point either:
+#   - $Version was set via -Version / $env:BLADE_AI_VERSION (use as-is), OR
+#   - $Version is empty → query GitHub API for the latest blade-ai-v* release.
+# Doing this AFTER arch detection means failures interleave with the
+# rest of the progressive UI rather than printing before the banner.
+if (-not $Version) {
+    Write-Step "Resolving latest blade-ai version from GitHub..."
+    $Version = Resolve-LatestVersion
+    if (-not $Version) {
+        Write-Err ("Could not resolve the latest version. Reasons: no network, " +
+                   "GitHub API rate-limit, or no published blade-ai-v* release yet. " +
+                   "Pin a version explicitly: -Version 0.1.0 or `$env:BLADE_AI_VERSION = '0.1.0'.")
+    }
+    Write-Ok "Resolved latest: $Version"
+}
+# Tag namespace: chaosblade monorepo hosts blade-ai under
+# ``blade-ai-v*`` so it doesn't collide with chaosblade's own
+# ``v*`` tags. Bump together with release-blade-ai.yml's trigger.
+$Tag = "blade-ai-v$Version"
 
 # ── Determine install directory ────────────────────────────────────────────────
 $DefaultInstallDir = "$env:LOCALAPPDATA\Programs\$ToolName"

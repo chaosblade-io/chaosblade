@@ -1,20 +1,23 @@
 /**
- * Welcome card — single boot-screen banner. Two-column layout with the
- * agent name + version embedded in the top border (Claude-Code style):
+ * Welcome card — single boot-screen banner. Two-column layout with
+ * the agent name + version embedded in the top border:
  *
- *   ╭─── ✻ blade-ai v0.1.0 ──────────...──╮
+ *   ╭─── ✻ Blade-ai v0.1.0 ──────────...──╮
  *   │           Welcome back!     │  Tips for ... │
  *   │             █▄▄ █  …        │    • describe │
  *   │             model: ...      │  Runtime      │
  *   │             mode: ✗ confirm │    kubeconfig │
  *   ╰────────────────────────────────────────────╯
  *
- * Ink doesn't support a native ``title`` on bordered Boxes, so the top
- * row is rendered as a hand-drawn ``<Text>`` line (so we get coloured
- * border + coloured title text), and the body sits inside a Box with
- * ``borderTop={false}``. The vertical divider between the two columns
- * is the left-column Box's ``borderRight`` — Ink draws it for us using
- * the same character set as the outer border.
+ * Ink doesn't support a native ``title`` on bordered Boxes, so the
+ * top row is rendered as a hand-drawn ``<Text>`` line (so we get a
+ * coloured border + coloured title text), and the body sits inside
+ * a Box with ``borderTop={false}``. The vertical divider between
+ * the two columns is the left-column Box's ``borderRight``.
+ *
+ * Forge × Operator palette: border + title glyph use ``forge.fire``
+ * (the brand orange). Layout / structure unchanged from the
+ * pre-redesign double-column version.
  */
 
 import { Box, Text } from "ink";
@@ -25,38 +28,22 @@ import { Theme } from "../../theme/colors.js";
 import { Icons } from "../../theme/icons.js";
 import { BootCardFrame, useBootCardWidth } from "./BootCardFrame.js";
 
-// Half-block pixel-art logo for ``BLADE AI``. Each letter is a 3-cell
-// × 2-line glyph that decodes to a 3-column × 4-row pixel grid via
-// the upper/lower-half block characters (``█`` / ``▀`` / ``▄``).
-//
-// Letter pixel maps (for reference / future tweaks):
-//   B   L   A   D   E   ' '   A   I
-//   ██. █.. .██ ██. ███       .██ █..
-//   █.█ █.. █.█ █.█ █..       █.█ █..
-//   ██. █.. ███ █.█ ██.       ███ █..
-//   █.█ ███ █.█ ██. ███       █.█ █..
-//
-// The earlier ``█▄▄ / █▄█`` for the first letter rendered as a
-// lowercase ``b`` (single bowl on the bottom half — no top bar). The
-// current ``█▀▄ / █▀▄`` produces a stylised capital ``B`` with two
-// open bowls split by a centre bar, matching the casing of the
-// rest of the brand line in the title border (``Blade-ai``).
+// Half-block pixel-art logo for ``BLADE AI``. Each letter is a
+// 3-cell × 2-line glyph that decodes to a 3-column × 4-row pixel
+// grid via upper/lower-half block characters (``█`` / ``▀`` / ``▄``).
 const LOGO_LINES = [
   "█▀▄ █   ▄▀█ █▀▄ █▀▀  ▄▀█ █",
   "█▀▄ █▄▄ █▀█ █▄▀ ██▄  █▀█ █",
 ];
 
-// Logo is 27 monospace cells wide. With border + paddingX={2} we need
-// roughly 32 cols of *content* width to render the logo without
-// truncation. Below this we drop the logo; above we keep it.
+// Logo is 27 monospace cells wide. With border + paddingX={2} we
+// need ~32 cols of content width to render without truncation.
 const LOGO_MIN_COLS = 40;
 
-// Border + title colours. Accent (lavender) is the project's designated
-// emphasis colour per theme/colors.ts — using it for the frame makes the
-// boot banner pop the way Claude Code's orange frame does.
-const BORDER_COLOR = Theme.text.accent;
+// Border + title colours — forge.fire family across the boot deck.
+const BORDER_COLOR = Theme.forge.fire;
 const TITLE_NAME_COLOR = Theme.text.primary;
-const TITLE_GLYPH_COLOR = Theme.text.accent;
+const TITLE_GLYPH_COLOR = Theme.forge.fire;
 const VERSION_COLOR = Theme.text.secondary;
 
 function prettyPath(p: string, maxLen = 40): string {
@@ -68,12 +55,10 @@ function prettyPath(p: string, maxLen = 40): string {
   return ".../" + base;
 }
 
-/**
- * Build the components that go on the top-border line. We split it into
- * coloured chunks: ``╭─── `` (border) + glyph + name + version + `` ──...─╮`` (border).
- * Each chunk's visual width sums to exactly ``cardWidth`` so the body
- * Box (rendered immediately below) shares the same left/right edges.
- */
+/** Build the top-border line segments. Splits the line into coloured
+ *  chunks (border + glyph + name + version + border) whose visual
+ *  widths sum to ``cardWidth`` so the body Box below shares the same
+ *  left/right edges. */
 function topBorderSegments(
   cardWidth: number,
   glyph: string,
@@ -83,12 +68,10 @@ function topBorderSegments(
   leadDashes: string;
   trailDashes: string;
 } {
-  // Fixed chars: ╭ (1) + leading dashes (3) + " " (1) + glyph (1) + " " (1) + name + " " + version + " " (1) + trailing dashes + ╮ (1)
-  // Glyph ✻ is width-stable per icons.ts; name/version are ASCII. So
-  // visual width === string length for these inputs.
   const FIXED_LEAD = 1 /* ╭ */ + 3 /* dashes */ + 1 /* space */;
   const FIXED_TRAIL = 1 /* space */ + 1 /* ╮ */;
-  const titlePart = glyph.length + 1 /* space */ + name.length + 1 /* space */ + versionText.length;
+  const titlePart =
+    glyph.length + 1 + name.length + 1 + versionText.length;
   const trail = Math.max(3, cardWidth - FIXED_LEAD - titlePart - FIXED_TRAIL);
   return {
     leadDashes: "─".repeat(3),
@@ -99,11 +82,6 @@ function topBorderSegments(
 export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
   const { columns } = useTerminalSize();
   const cardWidth = useBootCardWidth();
-  // Two breakpoints rather than one: a moderately narrow tmux pane
-  // (~50 cols) still benefits from the logo, just stacked vertically;
-  // a very narrow split (≤40 cols) drops the logo to avoid a wrapped
-  // mess. NARROW_THRESHOLD=60 from the shared hook so the cut-over
-  // point matches Footer / SlashMenu behaviour.
   const stackVertically = columns <= NARROW_THRESHOLD;
   const showLogo = columns > LOGO_MIN_COLS;
 
@@ -120,17 +98,11 @@ export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
     t("welcome.tip.mode"),
   ];
 
-  // Mode glyph carries pass/warn semantics: ⚡ auto means "no
-  // confirm-gate" — louder, gold; ✗ confirm means "human-in-the-loop"
-  // — accent amber, signals the brand-default safe path.
   const modeGlyphColor =
     item.permissionMode === "auto" ? Theme.status.warn : Theme.text.accent;
 
   const leftBlock = (
     <Box flexDirection="column" alignItems="center">
-      {/* "Welcome back!" promoted to bold + accent so it reads as the
-       *  greeting headline rather than ambient chrome — it pairs
-       *  visually with the logo immediately below. */}
       <Text color={Theme.text.accent} bold>
         {t("welcome.welcome_back")}
       </Text>
@@ -143,9 +115,6 @@ export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
           ))}
         </Box>
       )}
-      {/* Model is the single most-asked "what am I running" fact —
-       *  bold + accent so it pops; one extra blank line above to
-       *  separate it from the logo block. */}
       <Box marginTop={1}>
         <Text color={Theme.text.accent} bold>
           {item.modelName || "(unknown model)"}
@@ -191,26 +160,17 @@ export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
         <Text color={Theme.text.primary}>{item.namespace}</Text>
       </Box>
       <Box marginTop={1}>
-        <Text color={Theme.text.secondary} italic>
-          {t("welcome.bottom_hint")}
-        </Text>
+        <Text color={Theme.text.secondary}>{t("welcome.bottom_hint")}</Text>
       </Box>
     </Box>
   );
 
   const glyph = Icons.thinking;
-  // Brand display name. Capital ``B`` matches the project's casing
-  // convention (Blade-ai) — the previous lowercase ``blade-ai`` only
-  // matched the CLI binary name. The pixel-art logo on the left
-  // already renders BLADE AI uppercase, so the title border stays
-  // mixed-case to balance visual weight without doubling the shout.
   const name = "Blade-ai";
   const versionText = `v${item.version}`;
 
-  // Narrow terminals (≤60 cols) can't fit the title into the top border
-  // without overflowing — fall back to the plain BootCardFrame and put
-  // the title as the first row inside the box, same convention as the
-  // other two boot cards.
+  // Narrow fallback: drop the title-in-border trick and use plain
+  // BootCardFrame with the title as the first inner row.
   if (stackVertically) {
     return (
       <BootCardFrame paddingY={1}>
@@ -238,13 +198,7 @@ export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
 
   return (
     <Box paddingLeft={2} marginTop={1} flexDirection="column">
-      {/*
-        Top border: hand-drawn so the title can sit inside it. ``width``
-        must be set explicitly — without it the parent flex shrinks the
-        Box and Ink wraps each ``<Text>`` to fit, which scrambles the
-        border characters. The coloured chunks add up to exactly
-        ``cardWidth`` visual cells, matching the body Box below.
-      */}
+      {/* Top border: hand-drawn so the title can sit inside it. */}
       <Box width={cardWidth} flexShrink={0}>
         <Text color={BORDER_COLOR}>{`╭${leadDashes} `}</Text>
         <Text color={TITLE_GLYPH_COLOR} bold>
@@ -255,10 +209,8 @@ export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
         <Text color={BORDER_COLOR}>{` ${trailDashes}╮`}</Text>
       </Box>
 
-      {/*
-        Body: borderTop suppressed so it stacks cleanly under the manual
-        title line; left/right/bottom borders form the rest of the box.
-      */}
+      {/* Body: borderTop suppressed so it stacks cleanly under the
+       *  manual title line; left/right/bottom borders form the rest. */}
       <Box
         width={cardWidth}
         flexDirection="column"
@@ -268,14 +220,8 @@ export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
         paddingX={0}
         paddingY={0}
       >
-        {/* Wide: 40/60 split with a coloured vertical divider in the
-            middle — drawn by the left column's ``borderRight``.
-            ``justifyContent="center"`` on the left column makes the
-            brand block (Welcome / logo / model / mode) sit at the
-            vertical middle of the card; without it the four short
-            lines pile at the top while the right column's longer
-            content stretches the card height, leaving an awkward
-            blank lower half on the left. */}
+        {/* Wide: 45/55 split with a coloured vertical divider drawn
+         *  by the left column's ``borderRight``. */}
         <Box flexDirection="row">
           <Box
             flexBasis="45%"

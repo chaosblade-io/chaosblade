@@ -24,11 +24,16 @@ set -euo pipefail
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 APP_NAME="blade-ai"
-APP_VERSION="${BLADE_AI_VERSION:-0.1.0}"  # Updated per release
+# Empty default → resolved later from GitHub API (latest blade-ai-v*
+# release). User can override via ``--version 0.1.0`` or
+# ``BLADE_AI_VERSION=0.1.0`` to pin a specific version.
+APP_VERSION="${BLADE_AI_VERSION:-}"
 # Tag namespace: chaosblade monorepo hosts blade-ai under a prefixed
 # tag so it doesn't collide with chaosblade's own ``v*`` tags. Bump
 # this prefix together with ``release-blade-ai.yml``'s trigger.
-TAG="blade-ai-v${APP_VERSION}"
+# TAG is computed AFTER version resolution (see below).
+TAG=""
+RELEASES_API="https://api.github.com/repos/chaosblade-io/chaosblade/releases"
 RECEIPT_HOME="$HOME/.blade-ai"
 VERSIONS_DIR="$RECEIPT_HOME/versions"
 NO_MODIFY_PATH="${BLADE_AI_NO_MODIFY_PATH:-0}"
@@ -81,20 +86,21 @@ while [[ $# -gt 0 ]]; do
             SKIP_VERIFY=1; warn "Skipping checksum verification"; shift ;;
         -h|--help)
             echo "Usage: $0 [OPTIONS]"
-            echo "  --version VERSION   Install specific version (default: ${APP_VERSION})"
+            echo "  --version VERSION   Install specific version (default: latest blade-ai-v* release"
+            echo "                      resolved from GitHub API). Accepts bare semver, e.g. 0.1.0."
             echo "  --prefix PATH       Install to custom directory"
             echo "  --no-modify-path    Don't modify shell profile PATH"
             echo "  --skip-verify       Skip SHA256 verification (NOT recommended)"
             echo "  -h, --help          Show this help"
+            echo ""
+            echo "Environment variables:"
+            echo "  BLADE_AI_VERSION    Same as --version (set to specific semver to pin)"
+            echo "  BLADE_AI_MIRROR     Override download base URL"
+            echo "  BLADE_AI_INSTALL_DIR  Override install directory"
             exit 0 ;;
         *) err "Unknown option: $1" ;;
     esac
 done
-
-# Re-derive TAG if --version changed APP_VERSION (mirrors the
-# ``blade-ai-v`` prefix from the initial assignment so a user passing
-# ``--version 0.2.0`` lands on tag ``blade-ai-v0.2.0``).
-TAG="blade-ai-v${APP_VERSION}"
 
 # ── Detect download tool ───────────────────────────────────────────────────────
 
@@ -108,6 +114,120 @@ downloader() {
         err "Neither curl nor wget found. Install one first."
     fi
 }
+
+# Quiet downloader for small JSON fetches (no progress bar, swallow
+# errors so the caller can decide how to react).
+downloader_quiet() {
+    local _url="$1" _file="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${_url}" -o "${_file}" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O "${_file}" "${_url}" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# Python helper used by resolve_latest_version below. Stored as a
+# string constant rather than a heredoc inside the function so we
+# don't run into ``$(... <<'PY' ... PY ...)`` parser quirks. The body
+# only uses double quotes, so single-quoted assignment preserves it
+# verbatim.
+_PY_RESOLVE_LATEST='import json, re, sys
+try:
+    releases = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+PREFIX = "blade-ai-v"
+candidates = []
+for r in releases:
+    if r.get("draft") or r.get("prerelease"):
+        continue
+    tag = r.get("tag_name", "") or ""
+    if not tag.startswith(PREFIX):
+        continue
+    semver = tag[len(PREFIX):]
+    # Build a tuple of leading integer components for sorting; stop at
+    # the first non-numeric (so ``0.1.0-rc.1`` becomes (0,1,0) and is
+    # ordered consistently before the same line plain ``0.1.0``).
+    # Pre-release filtering above usually catches RCs but
+    # belt-and-braces here.
+    nums = []
+    for part in re.split(r"[.\-+]", semver):
+        if part.isdigit():
+            nums.append(int(part))
+        else:
+            break
+    if nums:
+        candidates.append((tuple(nums), semver))
+if not candidates:
+    sys.exit(1)
+candidates.sort(reverse=True)
+print(candidates[0][1])
+'
+
+# ── Resolve latest version from GitHub API ─────────────────────────────────────
+#
+# Picks the highest-semver published release whose tag starts with
+# ``blade-ai-v``, skipping drafts and prereleases. Used when the user
+# does NOT pass --version / BLADE_AI_VERSION.
+#
+# We can't just hit ``/releases/latest`` because that endpoint returns
+# the chaosblade monorepo's own latest tag (``v1.x.x``), not our
+# blade-ai sub-stream. Instead we list ``/releases?per_page=100`` and
+# filter client-side. blade-ai release cadence is slow; one page is
+# plenty.
+#
+# Outputs the bare semver (e.g. ``0.1.0``) on stdout when successful.
+# Returns non-zero on any failure (no network, malformed JSON, no
+# matching releases) so the caller can fall back to a clear error.
+resolve_latest_version() {
+    local _tmp
+    _tmp="$(mktemp -t blade-ai-releases.XXXXXX 2>/dev/null || mktemp)" || return 1
+
+    if ! downloader_quiet "${BLADE_AI_MIRROR_API:-${RELEASES_API}}?per_page=100" "${_tmp}"; then
+        rm -f "${_tmp}"
+        return 1
+    fi
+
+    local _version=""
+    if command -v python3 >/dev/null 2>&1; then
+        # Strict path: parse JSON, filter by tag prefix, sort by
+        # semver tuple descending, pick #1. The Python source lives in
+        # ${_PY_RESOLVE_LATEST} (defined above) — embedding a heredoc
+        # inside ``$(...)`` confuses some bash parsers, so we pass the
+        # script via -c instead.
+        _version="$(python3 -c "${_PY_RESOLVE_LATEST}" "${_tmp}" 2>/dev/null)"
+    fi
+
+    # Fallback path: no python3. The GitHub API returns releases in
+    # creation-time descending order, so the first ``"tag_name":
+    # "blade-ai-v..."`` line in the body is usually the latest. This
+    # CAN pick a prerelease — caller is expected to verify via the
+    # later download attempt.
+    if [[ -z "${_version}" ]]; then
+        _version="$(grep -oE '"tag_name":[[:space:]]*"blade-ai-v[^"]+"' "${_tmp}" 2>/dev/null \
+                    | sed -E 's/.*"blade-ai-v([^"]+)".*/\1/' \
+                    | head -1)"
+    fi
+
+    rm -f "${_tmp}"
+
+    [[ -n "${_version}" ]] || return 1
+    echo "${_version}"
+}
+
+# Resolve APP_VERSION now (if user didn't pin one) and derive TAG.
+# Doing this AFTER arg parsing means --version always wins over the
+# API lookup; doing it BEFORE platform detection means we can fail
+# fast without making the user wait through the platform banner.
+if [[ -z "${APP_VERSION}" ]]; then
+    step "Resolving latest blade-ai version from GitHub..."
+    APP_VERSION="$(resolve_latest_version)" || \
+        err "Could not resolve the latest version (no network, GitHub API rate-limit, or no published blade-ai-v* release yet).\n  Pass an explicit version: --version 0.1.0 or BLADE_AI_VERSION=0.1.0"
+    ok "Resolved latest: ${APP_VERSION}"
+fi
+TAG="blade-ai-v${APP_VERSION}"
 
 # ── OS & Architecture detection ────────────────────────────────────────────────
 

@@ -1,32 +1,33 @@
 /**
  * Result card — final outcome of a fault-injection turn.
  *
- * Visual structure mirrors ConfirmMessage's frame so the user sees a
- * consistent stop-and-summarise card style across the inject pipeline:
+ * Forge × Operator redesign: shares the double-border + forge.iron
+ * colour family with Confirm Layer 2 (the "hard check" tier) so the
+ * user feels "my decision in the gate card flowed straight into
+ * this result frame". Same colour, same border weight, no chrome
+ * difference — only the status banner at the top tells whether the
+ * inject succeeded, partially recovered, or failed.
  *
- *   ╔═════ ✓ Injection succeeded · t-abc123 ════════════════╗
+ *   ╔═════ ▓ ✓ INJECTED ▓ · t-abc123 ════════════════════════╗
  *   ║                                                        ║
  *   ║   fault type   node-cpu-fullload                       ║
  *   ║   blade uid    6158c2f6c326e943                        ║
  *   ║   duration     9m31s                                   ║
  *   ║                                                        ║
- *   ║   ─────────────────────                                ║
+ *   ║   ──────────────                                       ║
  *   ║   effect       <verification line>                     ║   (only when present)
  *   ║                                                        ║
- *   ║   ─────────────────────                                ║
+ *   ║   ──────────────                                       ║
  *   ║   cause        <failure cause>                         ║   (only on failure)
  *   ║   hint         <llm hint>                              ║
- *   ╚═══════════════════════════════════════════════════════ ╝
+ *   ╚════════════════════════════════════════════════════════╝
  *     /replay t-abc123 instant — for full timeline
  *
- * Differences from ConfirmMessage:
- *   - borderColor is ``Theme.border.result`` (coral) — preserves the
- *     ResultCard brand hue from the previous round-border design so
- *     scrollback at-a-glance still tells "outcome" apart from
- *     "decision" cards (ConfirmMessage uses brand-blue focused border).
- *   - No interactive footer ([Y]/[N] etc.) — the result is final.
- *   - Status colour lives only on the title glyph + label so the eye
- *     doesn't bounce between three colours per row.
+ * Status is carried by an inverse-coloured chip (▓ glyph + label ▓)
+ * rather than a coloured-text label, matching the operator-vocabulary
+ * chip family used by Confirm-resolved markers (▓ ● ARMED ▓), Tool
+ * name chips, and Safety badges. One chip language across the whole
+ * decision/result family keeps scanning the timeline quick.
  */
 
 import { Box, Text } from "ink";
@@ -44,25 +45,25 @@ function statusVisuals(status: ResultItem["status"]) {
       return {
         color: Theme.status.ok,
         glyph: Icons.success,
-        label: t("result.status.success"),
+        label: t("result.status.success").toUpperCase(),
       };
     case "partial":
       return {
         color: Theme.status.warn,
         glyph: Icons.warning,
-        label: t("result.status.partial"),
+        label: t("result.status.partial").toUpperCase(),
       };
     case "failed":
       return {
         color: Theme.status.err,
         glyph: Icons.fail,
-        label: t("result.status.failed"),
+        label: t("result.status.failed").toUpperCase(),
       };
     default:
       return {
-        color: Theme.text.secondary,
+        color: Theme.gray[500],
         glyph: Icons.bullet,
-        label: t("result.status.unknown"),
+        label: t("result.status.unknown").toUpperCase(),
       };
   }
 }
@@ -126,31 +127,33 @@ export const ResultCard: React.FC<{ item: ResultItem }> = ({ item }) => {
     <Box paddingLeft={2} marginTop={1} flexDirection="column">
       <Box
         flexDirection="column"
-        borderStyle="double"
-        borderColor={Theme.border.result}
+        // ``bold`` (``┏━━━┓``) — Result-only border style; every
+        // other card family in the TUI uses round / double. Edge
+        // colour follows the result status so the user can read
+        // "succeeded / partial / failed" from the frame alone.
+        borderStyle="bold"
+        borderColor={color}
         paddingX={2}
-        paddingY={0}
+        paddingY={1}
         width={width}
       >
-        {/* Title row — [E#] · status glyph + label · taskId
+        {/* Title row — [E#] · ▓ status chip ▓ · taskId
          *
-         * The ``[E#]`` prefix surfaces the per-session locator the
-         * reducer assigned at RESULT_RECEIVED time so users can
-         * run ``/show E3`` / ``/copy E3`` / ``/rerun E3`` without
-         * scrollback hunting. Hidden when ``locator`` is unset
-         * (defensive — every ResultItem should have one as of
-         * Phase 1.5, but skipping renders gracefully if absent). */}
+         * Status now lives in an inverse-coloured chip (matches the
+         * Confirm-resolved chip family and ToolNameChip). Locator
+         * ``[E#]`` stays as the dim prefix the user copies for
+         * /show / /copy / /rerun lookups. */}
         <Box>
           {item.locator && (
             <Box marginRight={1}>
-              <Text color={Theme.text.secondary}>[{item.locator}]</Text>
+              <Text color={Theme.gray[500]}>[{item.locator}]</Text>
             </Box>
           )}
-          <Text color={color} bold>
-            {glyph} {label}
+          <Text inverse color={color} bold>
+            {` ${glyph} ${label} `}
           </Text>
           {item.taskId && (
-            <Text color={Theme.text.secondary}> · {item.taskId}</Text>
+            <Text color={Theme.gray[500]}>{`  ·  ${item.taskId}`}</Text>
           )}
         </Box>
 

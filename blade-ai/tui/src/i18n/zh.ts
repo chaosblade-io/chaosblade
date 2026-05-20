@@ -432,6 +432,16 @@ export const zh: Dict = {
   "confirm.execution.preamble": "请确认执行计划：",
   "confirm.generic.preamble": "请确认：",
 
+  // -- Forge × Operator 重设计：banner + headline + answered chip --
+  "confirm.intent.banner": "INTENT CHECK",
+  "confirm.execution.banner": "EXECUTE · this hits production",
+  "confirm.intent.headline": "软问：这是你想注入的故障吗？",
+  "confirm.execution.headline": "硬问：真的对集群按下注入？",
+  "confirm.armed_chip": "ARMED",
+  "confirm.aborted_chip": "ABORTED",
+  "confirm.armed_tail": "继续执行",
+  "confirm.aborted_tail": "已停止",
+
   // -- ConfirmMessage 风险计 / 置信度 tier --------------------------
   "confirm.tier.low": "低",
   "confirm.tier.medium": "中",
@@ -550,4 +560,5 @@ export const zh: Dict = {
   "tool.running": "执行中…",
   "tool.no_output": "（无输出）",
   "tool.more_lines": "… 还有 {n} 行",
+  "tool.captured_in_confirm": "（输出已随下方确认卡片送达）",
 };

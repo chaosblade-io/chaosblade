@@ -1,101 +1,172 @@
 /**
- * Blade-AI TUI palette — derived from the ChaosBlade brand family
- * (warm coral / amber). Originally adapted from Qwen Code's
- * ``qwen-dark`` theme, but the lavender accent has been replaced
- * with ``Forged Amber`` so the TUI no longer carries Qwen's brand
- * visually and instead reads as a chaos-engineering tool (warm,
- * precise, sits naturally next to the existing gold→coral gradient).
+ * blade-ai TUI palette — **Forge × Operator**.
  *
- * Design rules (locked in for M1; M2+ follow the same):
+ * Brand mood (vs. Claude Code's "muji 工具，柔琥珀消隐" muji-tool approach):
+ *   blade-ai is a chaos-engineering control panel. The operator is
+ *   about to push real disruption into a real Kubernetes cluster —
+ *   the TUI should feel like a flight-deck HUD or a blacksmith
+ *   forge, not a quiet writing aid. Two-line summary:
  *
- *   text.accent (amber)    — the *only* content-emphasis color. Used
- *                            for thinking subject, tool name highlights,
- *                            agent identifier glyph, card borders and
- *                            section headers. Anything that "should pop"
- *                            lands here.
- *   border.focused (blue)  — used only for container focus (dialogs,
- *                            inputs in focus state). Never for content.
- *   text.secondary / muted — everything ambient: timestamps, hints,
- *                            metadata, divider rules.
+ *     • Forge   — deep warm orange/iron, the colour of heated metal.
+ *                 Carries chrome, decisions, status accents.
+ *     • Operator — high-contrast section dividers, status indicator
+ *                 lamps (●/◐/◯), inverse chips for armed states.
  *
- * Background colors are listed for reference but the TUI itself does
- * NOT paint a background — Ink renders foreground text only and lets
- * the user's terminal own the canvas. The values are kept so dialog /
- * diff highlights have a reference point.
+ * Design rules (locked in for the Forge × Operator overhaul):
+ *
+ *   forge.fire (#E87841)  — primary brand. Headings, accents, agent
+ *                           leader glyph, soft-decision borders.
+ *                           Saturation deliberately ~65% — higher
+ *                           than Claude Code's #D4A27F (~40%) because
+ *                           blade-ai *should not* disappear, it
+ *                           should read as "you are operating a
+ *                           dangerous tool".
+ *   forge.iron (#A8451E)  — hard-decision borders (Layer 2 confirm,
+ *                           Result). Deeper, "this is final".
+ *   forge.ember (#FFB870) — alert-tint background (rare).
+ *
+ *   slate.* — cool, dim accent for dividers / shadows. Used sparingly
+ *             to balance the warm forge tones.
+ *
+ *   gray.100..900 — 8 grey shades, replaces the previous single
+ *                   ``secondary``. Body text, hints, metadata,
+ *                   rules, dim decorations each get their own shade.
+ *
+ *   status.* — semantic colours, kept saturation-matched to forge so
+ *              the palette has one visual temperature family. ok is
+ *              biased blue-green (forge's complement) so success
+ *              reads with weight against the warm chrome.
+ *
+ * The TUI itself paints no background — Ink renders foreground text
+ * only, the user's terminal owns the canvas. Background values exist
+ * only as reference for future inverse-chip backgrounds.
+ *
+ * ──────────────────────────────────────────────────────────────────
+ * Backwards-compatibility aliases (text.primary / text.secondary /
+ * text.accent / border.default / border.focused / border.tool /
+ * border.result / border.diagnostic / status.warnDim / status.errDim
+ * / ui.comment / ui.gradient / ui.background) are preserved at the
+ * bottom of this file so the 20+ components that still reference the
+ * old names continue to compile. The Forge × Operator overhaul
+ * progressively migrates each consumer to the new token names; this
+ * shim lets that migration land file-by-file without a giant atomic
+ * rename.
+ * ──────────────────────────────────────────────────────────────────
  */
 
+const forge = {
+  // Glow / alert tint — rarely used, only for highlight backgrounds.
+  ember: "#FFB870",
+  // Primary brand — chrome, accents, leader glyphs, soft decisions.
+  fire: "#E87841",
+  // Heated-iron deep — hard decisions, result frames, "this is final".
+  iron: "#A8451E",
+} as const;
+
+const slate = {
+  // Dim cool rules / decorative bars.
+  light: "#3D4654",
+  // Faint emphasis background (future inverse-chip surface).
+  mid: "#252C36",
+  // Deepest shadow accent — reserved for left-rail brand bar.
+  dark: "#1B2530",
+} as const;
+
+const gray = {
+  // Body text on dark terminals (~off-white). On light terminals the
+  // user's default fg takes over via Ink's no-color path.
+  100: "#EEEEEE",
+  // Secondary body text — values, labels you still want crisp.
+  300: "#BFBFBF",
+  // Metadata / hint — second-class chrome (Footer, timestamps).
+  500: "#7E848C",
+  // Decorative rules, separators, section dividers.
+  700: "#4A4F55",
+  // Very dim — used only for "almost invisible" markers.
+  900: "#252525",
+} as const;
+
+const status = {
+  // Drill state words double as colour semantics so the indicator
+  // language matches the operator vocabulary.
+  armed: forge.fire,      // pending fire-button press
+  executing: forge.iron,  // pushing real disruption
+  // Success is biased blue-green so it reads as a *result*, not as
+  // more chrome. Distinct from forge orange both in hue and weight.
+  ok: "#5BB371",
+  // Caution amber — used for "low confidence", "warn this turn".
+  warn: "#E8B341",
+  // Failure red — slightly muted so it doesn't strobe.
+  err: "#C44545",
+  // Cool info — calm, factual, for advisory metadata.
+  info: "#5A8A9A",
+  // Dim variants for non-loud uses (e.g. "running" tool border).
+  warnDim: "#8B7530",
+  errDim: "#8B3A4A",
+} as const;
+
+const border = {
+  // chrome — boot cards, headers, anything that's "framework"
+  chrome: forge.fire,
+  // info / completion — tool group rail colour
+  tool: forge.fire,
+  // soft decision — Confirm Layer 1
+  confirmSoft: forge.fire,
+  // hard decision — Confirm Layer 2 & ResultCard share the "final"
+  // colour so the user feels "my decision flowed straight into the
+  // result frame".
+  confirmHard: forge.iron,
+  result: forge.iron,
+  // diagnostic violet — runtime /doctor card stays differentiated
+  // from the orange brand family.
+  diagnostic: "#7C3AED",
+  // dim — phase stepper rule, decorative box edges, alternate panels
+  dim: gray[700],
+  // legacy alias kept for the few consumers still asking for "default"
+  default: gray[700],
+  // legacy "focus" — used to be cold blue; now alias to chrome so
+  // input-prompt focus also reads warm.
+  focused: forge.fire,
+} as const;
+
+const text = {
+  // Body text. ``undefined`` lets the user's terminal pick its
+  // default foreground (dark terminals get off-white, light terminals
+  // get black). Explicit ``gray[100]`` is intentionally NOT used here
+  // because that would paint pale gray on light backgrounds and read
+  // as near-invisible.
+  primary: undefined as string | undefined,
+  // Secondary text. Was a single value before; now aliased to gray
+  // 500 (metadata level). Components that need a slightly louder
+  // secondary should migrate to ``gray.300`` explicitly.
+  secondary: gray[500],
+  // Brand accent — chrome titles, agent leader glyph, focus state.
+  accent: forge.fire,
+  // Links (rare in TUI but kept for parity with the old palette).
+  link: "#1E88E5",
+  // Inline code colour (rare; markdown bodies handle their own).
+  code: "#1976D2",
+} as const;
+
+const ui = {
+  // Comment-style dim — currently mirrors gray.500 to stay consistent.
+  comment: gray[500],
+  // Logo gradient stops. Renders left-to-right via per-char blend.
+  // Updated to the forge family so the logo reads warm-deep instead
+  // of the old gold→coral that didn't track the new accent.
+  gradient: [forge.ember, forge.fire] as const,
+  // Reference background; Ink does not paint this.
+  background: slate.dark,
+} as const;
+
 export const Theme = {
-  text: {
-    // Body text intentionally has no explicit color so the terminal owns
-    // it: dark terminals get their default light fg (~off-white), light
-    // terminals get black. The previous fixed ``#bfbdb6`` rendered as
-    // pale-gray text on white terminals (near-invisible) and as a gray
-    // block whenever it appeared inside an ``inverse`` chip.
-    primary: undefined as string | undefined,
-    secondary: "#646A71", // soft gray — readable on both light and dark
-    // Forged Amber — sits between ``ui.gradient[0]`` (#FFD700 gold) and
-    // ``ui.gradient[1]`` (#da7959 coral), so accents and the gradient
-    // belong to the same warm family. Distinct from Claude Code's
-    // brighter orange and from Qwen Code's lavender. Deepened from the
-    // earlier ``#F2A65A`` (which fell to ~2:1 on white terminals — the
-    // welcome / boot / pending-tasks borders washed out and the
-    // section headers struggled to read). The current value preserves
-    // the same hue but lowers lightness ~15 stops to land at ~3.4:1 on
-    // white while still reading clearly amber on dark.
-    accent: "#D88A2E",
-    link: "#1E88E5", // deeper brand blue — links readable on both bg
-    code: "#1976D2", // saturated blue — inline code
-  },
-  border: {
-    default: "#3D4149", // dim gray — default panel border (intentional)
-    // Confirm-dialog focused border. Deeper than the earlier ``#39BAE6``
-    // which sat at ~2.4:1 on white. ``#1976D2`` (Material blue 700) hits
-    // ~5:1 on white and ~5:1 on dark — balanced for both.
-    focused: "#1976D2",
-    // Tool-call group border (success / done state). Deeper turquoise
-    // (~4.4:1 on white vs ~2.3:1 the earlier ``#4ECDC4`` had) so
-    // completed tool blocks pop on light terminals too. Hue family
-    // preserved — distinct from accent amber, focused blue,
-    // diagnostic violet, and result coral.
-    tool: "#0E9594",
-    // ResultCard border. Coral — the second hue of the logo
-    // gradient (``ui.gradient[1]``). Brand-coherent, warm like
-    // amber but with a redder cast so the eye distinguishes
-    // ResultCard ("operation outcome") from WelcomeCard /
-    // BootCardFrame ("brand chrome / boot context") at a glance.
-    // Deepened from ``#da7959`` (~3.3:1 on white) to ``#C45838``
-    // (~4.4:1) — same hue family, more saturated.
-    result: "#C45838",
-    // Runtime ``/doctor`` diagnostic card. Deep violet — sits in a
-    // hue family no other border occupies (welcome amber, confirm
-    // brand-blue, tool turquoise, result coral, default dim-gray),
-    // so the diagnostic panel is recognisable at a glance even when
-    // the user has multiple cards stacked in scrollback. Deepened
-    // from ``#B392F0`` (~2.2:1 on white, near-invisible) to
-    // ``#7C3AED`` (~4.5:1 on white, still vibrant on dark).
-    diagnostic: "#7C3AED",
-  },
-  status: {
-    // Mid grass-green. Deeper than the previous ``#AAD94C`` (which read
-    // as washed-out lime on white terminals — the ✓ glyph and the
-    // status-coloured value text both fell below ~2.5:1 contrast on
-    // light backgrounds). ``#22A55C`` lifts the contrast to ~3:1+ on
-    // white while staying clearly green (not yellow-green) and clearly
-    // mid-tone (not the dark forest green that would lose punch on
-    // dark terminals).
-    ok: "#22A55C",
-    warn: "#FFD700", // gold — warning
-    err: "#F26D78", // coral red — error (gentle)
-    warnDim: "#8B7530", // muted variant
-    errDim: "#8B3A4A",
-  },
-  ui: {
-    comment: "#646A71",
-    /** Logo gradient stops. Renders left-to-right via per-char blend. */
-    gradient: ["#FFD700", "#da7959"] as const,
-    /** Reference background; Ink does not paint this — kept for diff highlights. */
-    background: "#0b0e14",
-  },
+  forge,
+  slate,
+  gray,
+  status,
+  border,
+  text,
+  ui,
 } as const;
 
 /**
