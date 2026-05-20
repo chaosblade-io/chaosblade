@@ -39,17 +39,42 @@ VERSIONS_DIR="$RECEIPT_HOME/versions"
 NO_MODIFY_PATH="${BLADE_AI_NO_MODIFY_PATH:-0}"
 SKIP_VERIFY="${BLADE_AI_SKIP_VERIFY:-0}"
 
-# ── Re-exec with bash if running under sh ─────────────────────────────────────
+# ── Re-exec with bash if running under sh / bash-posix ───────────────────────
+#
+# Users often invoke the script as ``sh install.sh`` which bypasses
+# the shebang. The script uses bash-only features (arrays, ``[[ ]]``,
+# process substitution); under POSIX /bin/sh it dies at parse time
+# with cryptic ``syntax error`` messages.
+#
+# Subtle case: on macOS, ``/bin/sh`` is actually bash running in POSIX
+# mode. ``$BASH_VERSION`` is still set in that mode (because it IS
+# bash), so a naive ``[ -z "${BASH_VERSION:-}" ]`` check would miss
+# this scenario — the script would keep running with bash-posix and
+# still die on bash-only syntax. We additionally check the POSIX mode
+# flags (``$POSIXLY_CORRECT`` and ``$SHELLOPTS``) and re-exec via
+# plain bash (no --posix) when either is set.
+#
+# The guard variable prevents an infinite loop if the re-exec itself
+# somehow lands back in a constrained shell.
+__blade_ai_install_needs_reexec() {
+    [ -z "${BASH_VERSION:-}" ] && return 0
+    [ -n "${POSIXLY_CORRECT:-}" ] && return 0
+    case ":${SHELLOPTS:-}:" in
+        *":posix:"*) return 0 ;;
+    esac
+    return 1
+}
 
-if [ -z "${BASH_VERSION:-}" ] && [ -z "${__BLADE_AI_INSTALL_REEXEC:-}" ]; then
+if __blade_ai_install_needs_reexec && [ -z "${__BLADE_AI_INSTALL_REEXEC:-}" ]; then
     if command -v bash >/dev/null 2>&1; then
         export __BLADE_AI_INSTALL_REEXEC=1
-        exec bash -- "$0" "$@"
+        exec bash "$0" "$@"
     else
-        echo "Error: This script requires bash. Please install bash first."
+        echo "Error: This script requires bash. Please install bash first." >&2
         exit 1
     fi
 fi
+unset -f __blade_ai_install_needs_reexec 2>/dev/null || true
 
 # ── Color support ──────────────────────────────────────────────────────────────
 
