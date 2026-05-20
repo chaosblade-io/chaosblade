@@ -36,6 +36,45 @@
 #   * Each modified rc file gets a sibling ``.blade-ai-uninstall.bak``
 #     so a misclick is recoverable.
 
+# ── Re-exec with bash if running under sh / bash-posix ───────────────────────
+#
+# Users often invoke the script as ``sh uninstall.sh`` which bypasses
+# the shebang. The script uses bash-only features (process substitution
+# ``done < <(...)``, arrays, ``[[ ]]``); under POSIX /bin/sh it dies
+# with ``syntax error near unexpected token '<'`` during the parse
+# phase — *before* this guard can execute, if the unsupported syntax
+# is at top level (not inside a function).
+#
+# Subtle case: on macOS, ``/bin/sh`` is actually bash running in POSIX
+# mode. ``$BASH_VERSION`` is still set in that mode (because it IS
+# bash), so a naive ``[ -z "${BASH_VERSION:-}" ]`` check would miss
+# this scenario — the script would keep running with bash-posix and
+# still die on ``< <(...)``. We additionally check POSIX mode flags
+# (``$POSIXLY_CORRECT`` and ``$SHELLOPTS``) and re-exec via plain
+# bash (no --posix) when either is set.
+#
+# The guard variable prevents an infinite loop if the re-exec itself
+# somehow lands back in a constrained shell.
+__blade_ai_needs_reexec() {
+    [ -z "${BASH_VERSION:-}" ] && return 0
+    [ -n "${POSIXLY_CORRECT:-}" ] && return 0
+    case ":${SHELLOPTS:-}:" in
+        *":posix:"*) return 0 ;;
+    esac
+    return 1
+}
+
+if __blade_ai_needs_reexec && [ -z "${__BLADE_AI_UNINSTALL_REEXEC:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        export __BLADE_AI_UNINSTALL_REEXEC=1
+        exec bash "$0" "$@"
+    else
+        echo "Error: This script requires bash. Please install bash first." >&2
+        exit 1
+    fi
+fi
+unset -f __blade_ai_needs_reexec 2>/dev/null || true
+
 # pipefail catches broken pipes; deliberately no -e (best-effort) and
 # no -u (older bash on macOS 3.2 trips on empty arrays).
 set -o pipefail
@@ -283,13 +322,36 @@ fi
 # ── Confirmation ──────────────────────────────────────────────────────────────
 if [[ ${FORCE} -eq 0 ]]; then
     echo ""
-    # ``read -r`` keeps backslashes literal; -p prints prompt to stderr.
-    # We tolerate either ``y`` or ``yes`` (any case); anything else
-    # (including the default empty-Enter) cancels.
-    read -r -p "Proceed with uninstall? [y/N] " ans
+
+    # Print the prompt explicitly via printf instead of ``read -p``.
+    # ``read -p`` writes the prompt to stderr — and on some terminal
+    # / buffering combinations users have reported the prompt never
+    # reaches the screen, leaving the script silently "hanging" while
+    # actually waiting for input. printf to stdout shows up reliably.
+    #
+    # If stdin is not a tty (e.g. invoked under a pipe / nohup / CI
+    # without --force), reading would just receive EOF immediately and
+    # we'd silently fall into the "Cancelled" branch — that's
+    # surprising. Detect that case and print an actionable hint
+    # instead.
+    if [ ! -t 0 ]; then
+        printf "Proceed with uninstall? [y/N] "
+        echo ""
+        warn "stdin is not a tty — cannot ask interactively."
+        info "Re-run with --force to skip the prompt, or run from an interactive terminal."
+        exit 1
+    fi
+
+    printf "Proceed with uninstall? [y/N] "
+    ans=""
+    read -r ans || true
     case "${ans}" in
         y|Y|yes|YES|Yes) ;;
-        *) info "Cancelled."; exit 0 ;;
+        *)
+            echo ""
+            info "Cancelled."
+            exit 0
+            ;;
     esac
 fi
 
