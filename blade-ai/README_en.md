@@ -32,10 +32,10 @@ When no version is given, the script queries the GitHub Releases API and resolve
 curl -fsSL https://chaosblade.io/install-agent.sh | bash
 
 # Pin a specific version (bare semver, no blade-ai-v prefix)
-curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0-alpha
+curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0
 
 # Same via env var (works through irm | iex / docker / CI)
-BLADE_AI_VERSION=0.1.0-alpha curl -fsSL https://chaosblade.io/install-agent.sh | bash
+BLADE_AI_VERSION=0.1.0 curl -fsSL https://chaosblade.io/install-agent.sh | bash
 ```
 
 > **Windows:** `install.ps1` is in place but the current release matrix does not ship a Windows binary; the script prints a clear "not yet supported" message and points you at WSL2 / building from source. Once a Windows matrix entry lands, `irm | iex` will work immediately with the same latest-version auto-resolution.
@@ -44,7 +44,7 @@ If the `chaosblade.io` redirect is not configured yet, fetch the installer direc
 
 ```bash
 # Fetch the install script straight from the GitHub Release
-VERSION=0.1.0-alpha
+VERSION=0.1.0
 curl -fsSL "https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}/install.sh" | bash -s -- --version "${VERSION}"
 ```
 
@@ -60,7 +60,7 @@ Each release uploads 4 archives + `checksums.txt` to the `blade-ai-v<version>` R
 | macOS Apple Silicon | `blade-ai-darwin-arm64.tar.gz` |
 
 ```bash
-VERSION=0.1.0-alpha
+VERSION=0.1.0
 PLATFORM=darwin-arm64    # match your host
 URL="https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}/blade-ai-${PLATFORM}.tar.gz"
 curl -fSLO "${URL}"
@@ -71,27 +71,49 @@ tar -xzf "blade-ai-${PLATFORM}.tar.gz"
 
 ### Uninstall
 
-Companion uninstall scripts mirror the install layout — use the right one for your OS:
+`uninstall.sh` / `uninstall.ps1` are uploaded next to `install.*` in every `blade-ai-v<version>` release and mirror the install invocation style.
 
 ```bash
-# macOS / Linux — full uninstall by default (binary + config + PATH)
-bash <path>/uninstall.sh
+# macOS / Linux — one-liner (recommended; mirrors the install one-liner)
+#
+# Note: when invoked via curl | bash, stdin is not a tty, so the
+# interactive y/N prompt is disabled. Uninstall is a destructive
+# operation — you must pass --force to confirm explicitly. Combine
+# with --keep-config / --version if you don't want everything gone.
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force
 
-# Show the plan but do not delete anything
-bash <path>/uninstall.sh --dry-run
+# Run a dry-run first, then decide whether to actually delete
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --dry-run
 
-# Remove the binary + PATH entry but keep ~/.blade-ai/ (config / memory / skills)
-bash <path>/uninstall.sh --keep-config
+# Remove binary + PATH but keep ~/.blade-ai/ (config / memory / skills)
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force --keep-config
 
-# Remove a single version (in multi-version setups; symlink and other versions retained)
-bash <path>/uninstall.sh --version 0.1.0-alpha
+# Remove a single version (other versions and symlink kept in multi-version setups)
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force --version 0.1.0
+```
+
+If the `chaosblade.io` redirect is not yet configured, pull the script directly from the GitHub Release:
+
+```bash
+VERSION=0.1.0
+curl -fsSL "https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}/uninstall.sh" | bash -s -- --force
+```
+
+If you already have the script locally (e.g. after install):
+
+```bash
+# Direct terminal invocation: interactive y/N — no --force needed
+bash ~/.blade-ai/versions/blade-ai-v0.1.0/scripts/uninstall.sh --dry-run
+bash ~/.blade-ai/versions/blade-ai-v0.1.0/scripts/uninstall.sh
+bash ~/.blade-ai/versions/blade-ai-v0.1.0/scripts/uninstall.sh --keep-config
+bash ~/.blade-ai/versions/blade-ai-v0.1.0/scripts/uninstall.sh --version 0.1.0
 ```
 
 ```powershell
 # Windows (script is in place — works once install.ps1 ships a real binary)
 .\uninstall.ps1                          # full uninstall
 .\uninstall.ps1 -KeepConfig              # keep config dir
-.\uninstall.ps1 -Version 0.1.0-alpha     # safety check: only proceed if manifest matches
+.\uninstall.ps1 -Version 0.1.0     # safety check: only proceed if manifest matches
 .\uninstall.ps1 -DryRun                  # show the plan, no deletion
 ```
 
@@ -234,8 +256,8 @@ The release flow is fully automated by `chaosblade/.github/workflows/release-bla
 # 1) Bump the 3 version strings in lockstep to the target version
 #    pyproject.toml / tui/package.json / src/chaos_agent/__init__.py
 # 2) Commit and push a tag
-git tag blade-ai-v0.1.0-alpha
-git push origin blade-ai-v0.1.0-alpha
+git tag blade-ai-v0.1.0
+git push origin blade-ai-v0.1.0
 ```
 
 CI will then:
