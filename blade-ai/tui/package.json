@@ -1,6 +1,6 @@
 {
   "name": "@blade-ai/tui",
-  "version": "0.1.0-alpha",
+  "version": "0.1.0",
   "description": "Blade-AI Terminal UI (TypeScript + Ink) — talks to Python backend over HTTP+SSE.",
   "keywords": [
     "blade-ai",
