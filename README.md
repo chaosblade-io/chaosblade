@@ -8,6 +8,17 @@
 
 中文版 [README](README_CN.md)  
 Wiki: [DeepWiki](https://deepwiki.com/chaosblade-io/chaosblade-for-deepwiki)
+
+## 🔥🔥🔥 Major UPDATE：Chaosblade Agent Released - Blade AI
+<img width="2752" height="1252" alt="image" src="https://github.com/user-attachments/assets/f17ddb79-23aa-4632-89da-72c22379b5c4" />
+Blade AI serves as the intelligent agent layer within the ChaosBlade ecosystem: at the foundational level, it invokes ChaosBlade to execute fault injection; at the upper level, it incorporates orchestration capabilities such as intent understanding, security auditing, effect verification, safe recovery, and structured reporting—thereby transforming fault drills from a process of "manually writing commands" into one completed through "conversational interaction."
+
+
+For detailed information, please refer to: [Blade AI README](https://github.com/chaosblade-io/chaosblade/blob/feature/blade-ai/blade-ai/README_en.md)
+
+* Release: [blade-ai-v0.1.0](https://github.com/chaosblade-io/chaosblade/releases/tag/blade-ai-v0.1.0)
+* Code Branch: blade-ai-v0.1.0
+
 ## Introduction
 
 ChaosBlade is an Alibaba open source experimental injection tool that follows the principles of chaos engineering and chaos experimental models to help enterprises improve the fault tolerance of distributed systems and ensure business continuity during the process of enterprises going to cloud or moving to cloud native systems.
