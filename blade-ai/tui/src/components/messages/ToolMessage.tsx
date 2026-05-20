@@ -97,17 +97,24 @@ const MAX_OUTPUT_LINES = 12;
  *  lines render in history. */
 const MAX_OUTPUT_LINES_PENDING = 5;
 
-function borderColorFor(status: ToolStatus): string {
+/** Left vertical rail colour — Forge × Operator redesign collapses
+ *  the previous round-bordered card into a single left rail that
+ *  signals "this is a tool block" without spending visual real
+ *  estate on a full box. Rail tracks status so the eye can scan a
+ *  vertical list of tools and pick out failures / runners. */
+function railColorFor(status: ToolStatus): string {
   switch (status) {
     case "error":
-      return Theme.status.errDim;
+      return Theme.status.err;
     case "canceled":
-    case "running":
       return Theme.status.warnDim;
+    case "running":
+      return Theme.forge.fire;
     default:
-      // Success: agent-action turquoise (distinct from confirm /
-      // result borders, brand-coherent with the tool icon family).
-      return Theme.border.tool;
+      // Success: forge.fire — the tool family lives in the brand
+      // colour, matching Header / boot section titles for visual
+      // consistency.
+      return Theme.forge.fire;
   }
 }
 
@@ -172,10 +179,8 @@ const ToolNameChip: React.FC<{ status: ToolStatus; name: string }> = ({
 };
 
 /** Single-line horizontal rule used as a section separator inside the
- *  tool card. Implemented as a Box with only ``borderTop`` so Ink
- *  draws ``─`` across the full inner width — CJK-safe, no length math.
- *  Same primitive ConfirmMessage / ResultCard use, so the three card
- *  families share a divider grammar. */
+ *  tool block. Drawn dimly so the rail (the louder vertical line on
+ *  the left) remains the dominant chrome element. */
 const SectionRule: React.FC = () => (
   <Box
     borderStyle="single"
@@ -183,7 +188,7 @@ const SectionRule: React.FC = () => (
     borderBottom={false}
     borderLeft={false}
     borderRight={false}
-    borderColor={Theme.text.secondary}
+    borderColor={Theme.gray[700]}
   />
 );
 
@@ -248,17 +253,25 @@ export const ToolMessage: React.FC<{
 
   const fittedBody = hasBody ? fitTextWidth(truncated.body, bodyTextWidth) : "";
 
-  const borderColor = borderColorFor(item.status);
+  const railColor = railColorFor(item.status);
   const hint = item.status === "error" ? suggestionsForError(item.raw) : null;
 
   return (
     <Box paddingLeft={2} marginTop={1} flexDirection="column">
+      {/* Left rail replaces the previous round box. ``borderLeft`` only
+       *  draws a single ``│`` running the full height of the Box,
+       *  which Ink sizes to fit the content rows below — a CJK-safe,
+       *  measurement-free way to attach a vertical accent without
+       *  manually re-rendering ▎ per row. */}
       <Box
         flexDirection="column"
-        borderStyle="round"
-        borderColor={borderColor}
-        paddingX={1}
-        paddingY={0}
+        borderStyle="single"
+        borderLeft
+        borderTop={false}
+        borderBottom={false}
+        borderRight={false}
+        borderColor={railColor}
+        paddingLeft={1}
       >
         {/* Title row: [T#] · chip [glyph + name] · elapsed · node
          *
@@ -322,7 +335,7 @@ export const ToolMessage: React.FC<{
         {showBodyPlaceholder && (
           <Box>
             <Text color={Theme.text.secondary}>
-              {Icons.tree} {t("tool.no_output")}
+              {Icons.tree} {t(item.placeholderKey ?? "tool.no_output")}
             </Text>
           </Box>
         )}
@@ -345,7 +358,7 @@ export const ToolMessage: React.FC<{
         {showMoreLines && <SectionRule />}
         {showMoreLines && (
           <Box>
-            <Text color={Theme.text.secondary} italic>
+            <Text color={Theme.gray[500]}>
               {t("tool.more_lines", { n: String(truncated.hiddenLines) })}
             </Text>
           </Box>

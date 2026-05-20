@@ -43,10 +43,8 @@ export const PendingTasksCard: React.FC<{ item: PendingTasksCardItem }> = ({
         </Box>
       ) : (
         item.tasks.map((row) => (
-          // Flex row: glyph fixed-width + state fixed-width (state names
-          // are short and known; bounding them keeps the columns aligned
-          // across rows) + task_id flexible (most variable) +
-          // fault_type fills remaining space. task_id is the most
+          // Glyph fixed-width + state fixed-width + task_id flexible
+          // + fault_type fills remaining space. task_id is the most
           // valuable column for /replay / blade-ai recover invocations,
           // so we give it the bigger share via flexGrow=2.
           <Box key={row.taskId}>
@@ -61,13 +59,6 @@ export const PendingTasksCard: React.FC<{ item: PendingTasksCardItem }> = ({
                 {row.taskId}
               </Text>
             </Box>
-            {/* faultType: render only when the server actually knows
-             *  it. The previous fallback ``(unknown fault type)`` was
-             *  noise — repeating "I don't know" on every row uses
-             *  horizontal real estate without informing the user.
-             *  When unknown we just leave the trailing column blank;
-             *  the row still aligns via the flex slot's reserved
-             *  space. */}
             {row.faultType ? (
               <Box flexGrow={1} flexBasis={0}>
                 <Text color={Theme.text.secondary} wrap="truncate-end">

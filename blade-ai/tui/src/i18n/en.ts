@@ -444,6 +444,16 @@ export const en: Dict = {
   "confirm.execution.preamble": "Confirm the execution plan:",
   "confirm.generic.preamble": "Please confirm:",
 
+  // -- Forge × Operator redesign: banner + headline + armed chip ----
+  "confirm.intent.banner": "INTENT CHECK",
+  "confirm.execution.banner": "EXECUTE · this hits production",
+  "confirm.intent.headline": "Soft check: is this the fault you meant?",
+  "confirm.execution.headline": "Hard check: actually push this to the cluster?",
+  "confirm.armed_chip": "ARMED",
+  "confirm.aborted_chip": "ABORTED",
+  "confirm.armed_tail": "proceeding",
+  "confirm.aborted_tail": "stopped",
+
   // -- Risk meter / confidence tier ---------------------------------
   "confirm.tier.low": "low",
   "confirm.tier.medium": "medium",
@@ -563,4 +573,5 @@ export const en: Dict = {
   "tool.running": "running…",
   "tool.no_output": "(no output)",
   "tool.more_lines": "… +{n} more lines",
+  "tool.captured_in_confirm": "(output delivered via the confirm card below)",
 };

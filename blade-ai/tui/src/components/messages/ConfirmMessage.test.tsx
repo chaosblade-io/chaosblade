@@ -215,7 +215,10 @@ describe("ConfirmPromptMessage", () => {
     expect(frame).toContain("取消");
   });
 
-  it("collapses to the answered marker once resolved=approved", () => {
+  it("collapses to the ARMED chip once resolved=approved", () => {
+    // Forge × Operator redesign: resolved-approved collapses to a
+    // chip "● ARMED · 继续执行" (operator vocabulary) rather than
+    // the previous neutral "已确认" line.
     const item = basePrompt({
       node: "intent_confirm",
       resolved: true,
@@ -223,11 +226,13 @@ describe("ConfirmPromptMessage", () => {
     });
     const { lastFrame } = render(<ConfirmPromptMessage item={item} />);
     const frame = lastFrame() ?? "";
-    expect(frame).toContain("已确认");
+    expect(frame).toContain("ARMED");
     expect(frame).not.toContain("提交意图");
   });
 
-  it("collapses to the cancelled marker once resolved=rejected", () => {
+  it("collapses to the ABORTED chip once resolved=rejected", () => {
+    // Resolved-rejected collapses to "● ABORTED · 已停止" — the
+    // operator-vocabulary counterpart of the ARMED chip above.
     const item = basePrompt({
       node: "confirmation_gate",
       resolved: true,
@@ -235,7 +240,7 @@ describe("ConfirmPromptMessage", () => {
     });
     const { lastFrame } = render(<ConfirmPromptMessage item={item} />);
     const frame = lastFrame() ?? "";
-    expect(frame).toContain("已取消");
+    expect(frame).toContain("ABORTED");
     expect(frame).not.toContain("开始注入");
   });
 });

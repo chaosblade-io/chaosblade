@@ -38,18 +38,35 @@ interface StaticEntry {
 
 /**
  * Static estimate of how many rows the chrome below the pending area
- * occupies (Composer = PhaseStepperCard ≤ 9 + InputPrompt fence/content
- * 3 + Footer 1 + breathing 2). The number is intentionally conservative
- * — over-reserving costs us a row or two of pending body when content
- * is unusually short, but under-reserving lets the dynamic frame
- * exceed viewport rows and trips the overflow-into-scrollback path
- * we're trying to escape. PhaseStepperCard is only active during inject
- * turns; we always reserve for it because the alternative is a budget
- * that grows mid-turn and re-truncates pending items dynamically,
- * which manifests visually as content "popping in" as the stepper
+ * occupies. Updated to **26** to track the Forge × Operator redesign
+ * + thinking-body padding accumulation:
+ *
+ *   PhaseStepperCard (round border + title + 5 step rows) ........ 8
+ *   LoadingIndicator (header 1 + separator 1 + body padded 8) .. 10
+ *   InputPrompt (top fence + body + bottom fence) ................ 5
+ *   Footer (help hint + status) .................................. 1
+ *   Composer outer marginTop ..................................... 1
+ *   Safety buffer (off-by-one Yoga measurement, breathing) ....... 1
+ *                                                                 = 26
+ *
+ * The previous value (16) was set when the LoadingIndicator body
+ * grew naturally (1-3 rows typical) and PhaseStepperCard was the
+ * lighter horizontal HUD design. Both have since gained rows
+ * (padded body + bordered list-style stepper); under-reserving by
+ * 8-10 rows let pending items render past stdout.rows and triggered
+ * the user-reported "重复输出 + 闪烁" via the scrollback-pollution
+ * path. The probe showed pendingH growing to 39 / frameH to 56 on
+ * a 46-row terminal — exactly chrome=25 + (46-16)=30 budget. With
+ * the corrected reserve pendingH caps at ~20 and frameH stays
+ * inside viewport.
+ *
+ * PhaseStepperCard is only active during inject turns; we always
+ * reserve for it because the alternative is a budget that grows
+ * mid-turn and re-truncates pending items dynamically, which
+ * manifests visually as content "popping in" as the stepper
  * appears.
  */
-const CHROME_ROWS_RESERVE = 16;
+const CHROME_ROWS_RESERVE = 26;
 
 /** Lower bound on the budget passed to pending items. Below this any
  *  capped content would render as mostly the "+N folded" indicator. */

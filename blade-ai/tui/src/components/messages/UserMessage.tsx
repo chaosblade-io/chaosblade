@@ -1,9 +1,11 @@
 /**
- * User echo — rendered as a full-row amber band so the user's own
- * messages stand out clearly from agent replies and tool output.
+ * User echo — Forge × Operator palette. Rendered as a full-row amber
+ * bubble so the user's own messages anchor the conversation flow
+ * without needing a rail decoration on top of the background fill
+ * (the bubble itself is already a strong visual marker).
  *
  * Why we hand-pad each visual line:
- *   - Ink 5 only supports ``backgroundColor`` on ``<Text>``, not on
+ *   - Ink only supports ``backgroundColor`` on ``<Text>``, not on
  *     ``<Box>``. The fill stops at the last printed cell, so without
  *     manual padding a short message produces a tiny coloured chip
  *     while the rest of the row stays terminal-default — visually
@@ -13,9 +15,11 @@
  *     ``<Text>`` end up the wrong width. ``wrap-ansi`` handles word
  *     boundaries correctly (CJK + ASCII safe).
  *
- * Width target: ``useBootCardWidth`` — same value the boot cards and
- * input prompt dividers use, so the user's bubble lines up flush with
- * the rest of the chrome.
+ * The ``▎`` rail prefix used by AgentMessage / ThinkingMessage is
+ * intentionally omitted here — the bubble's coloured background
+ * already serves the same "anchor this line as part of the
+ * conversation channel" function, and adding a rail in front would
+ * double-mark the line for no extra information.
  */
 
 import { Box, Text } from "ink";
@@ -24,18 +28,14 @@ import wrapAnsi from "wrap-ansi";
 import type { UserItem } from "../../state/types.js";
 import { useBootCardWidth } from "../boot/BootCardFrame.js";
 
-// Dark amber wash. About three stops below ``Theme.text.accent``
-// (#F2A65A) so the colour family matches but the contrast is gentle —
-// readable on both default-dark and high-contrast terminal themes.
-const USER_BUBBLE_BG = "#3a2a14";
-// The bubble paints its own dark bg, so the foreground must be a
-// definite light hue rather than ``Theme.text.primary`` (which is
-// intentionally ``undefined`` so terminal-default text adapts to
-// dark/light themes). On a white terminal the terminal-default fg is
-// black, and black-on-#3a2a14 falls well below the 4.5:1 contrast
-// threshold — hard-pinning an off-white keeps the bubble readable on
-// every terminal.
-const USER_BUBBLE_FG = "#e6e1d6";
+// Deep forge wash — sits in the same family as the brand fire (it's
+// roughly fire darkened ~3 stops). Distinguishable from the
+// surrounding chrome on both light and dark terminals; carries
+// enough warmth to read as "the user's own voice".
+const USER_BUBBLE_BG = "#4A2A15";
+// Off-white foreground — the bubble paints its own dark background
+// so a definite light hue is required.
+const USER_BUBBLE_FG = "#E6E1D6";
 
 /** Right-pad ``s`` with spaces until it fills ``cols`` visual cells. */
 function padToWidth(s: string, cols: number): string {
@@ -46,11 +46,8 @@ function padToWidth(s: string, cols: number): string {
 
 export const UserMessage: React.FC<{ item: UserItem }> = ({ item }) => {
   const width = useBootCardWidth();
-
-  // Strategy: split user-typed newlines first (preserve intentional
-  // paragraph breaks), then word-wrap each paragraph to fit within
-  // the bubble's content area. The 2-cell deduction below is for the
-  // 1-cell horizontal gutter we add on each side of the text.
+  // 2-cell horizontal gutter on each side of the text inside the
+  // bubble. innerWidth governs how the message wraps.
   const innerWidth = Math.max(8, width - 2);
   const visualLines: string[] = [];
   for (const para of item.text.split("\n")) {
@@ -63,8 +60,6 @@ export const UserMessage: React.FC<{ item: UserItem }> = ({ item }) => {
       visualLines.push(line);
     }
   }
-  // Single empty input shouldn't happen (Composer trims) but guard so
-  // we still draw at least one band.
   if (visualLines.length === 0) visualLines.push("");
 
   return (

@@ -67,7 +67,11 @@ describe("WelcomeCard / wide terminal", () => {
     const { lastFrame } = render(<WelcomeCard item={SAMPLE} />);
     const frame = lastFrame() ?? "";
     expect(frame).toContain("qwen3.6-max-preview");
-    expect(frame).toMatch(/mode/);
+    // Forge × Operator redesign: the "mode" word is now expressed
+    // as a glyph (✗ confirm / ⚡ auto) sitting beside the model
+    // line, not as the bare label "mode:". Verify the permission
+    // mode glyph is present (SAMPLE uses ``confirm`` → ``✗``).
+    expect(frame).toMatch(/[✗⚡]/);
   });
 
   it("includes runtime fields (kubeconfig + namespace)", () => {

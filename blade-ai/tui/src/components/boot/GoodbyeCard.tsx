@@ -1,35 +1,26 @@
 /**
  * Farewell card — printed once on TUI exit with a session summary.
- *
  * Mirrors the Python TUI's ``tui/renderers/goodbye.py`` so a user
  * switching between the two front-ends sees a consistent send-off.
- * Visual style reuses the existing ``BootCardFrame`` (same lavender
- * border, same width policy as Welcome / EnvCheck / PendingTasks) so
- * the card slots in as the natural visual bookend to the boot panel.
+ * Visual style reuses ``BootCardFrame`` (round forge.fire border,
+ * same width policy as Welcome / Doctor / PendingTasks) so the
+ * card slots in as the natural visual bookend to the boot panel.
  *
- *   ╭──────────────────────────────────────────────────────────╮
- *   │  ✻ 再见                                                  │
- *   │                                                          │
+ *   ╭────────────────────────────────────────────────────────╮
+ *   │  ✻ 再见                                                 │
+ *   │                                                         │
  *   │  感谢使用 blade-ai，期待下次再见                          │
- *   │                                                          │
- *   │  会话概览                                                 │
- *   │      会话 ID          sess_abc123                         │
- *   │      持续时间          15m 23s                            │
- *   │      集群 / 命名空间    k8s / default                      │
- *   │                                                          │
- *   │  活动统计                                                 │
- *   │      消息交互          12 次                              │
- *   │      故障注入          3 次  (✓ 2  ✗ 1)                  │
- *   │      故障恢复          1 次                               │
- *   ╰──────────────────────────────────────────────────────────╯
- *
- * Layout choices:
- *   - 标题在框内首行（不嵌入边框），跟 BootDoctorCard 一致 — keeps the
- *     component dirt-simple, no manual top-border rendering.
- *   - K/V table uses fixed ``minWidth`` on the key column so the values
- *     visually align like a 2-column table without a real Table widget.
- *   - Counts use the i18n template ``{n} 次`` (zh) / ``{n}`` (en) so a
- *     future locale swap doesn't need code changes.
+ *   │                                                         │
+ *   │  会话概览                                                │
+ *   │      会话 ID          sess_abc123                        │
+ *   │      持续时间          15m 23s                           │
+ *   │      集群 / 命名空间    k8s / default                     │
+ *   │                                                         │
+ *   │  活动统计                                                │
+ *   │      消息交互          12 次                             │
+ *   │      故障注入          3 次  (✓ 2  ✗ 1)                 │
+ *   │      故障恢复          1 次                              │
+ *   ╰─────────────────────────────────────────────────────────╯
  */
 
 import { Box, Text } from "ink";
@@ -41,29 +32,11 @@ import { t } from "../../i18n/index.js";
 import { BootCardFrame } from "./BootCardFrame.js";
 
 export interface GoodbyeCardProps {
-  /**
-   * Latest reducer snapshot. Read once at exit by ``printGoodbye`` —
-   * the component itself never re-renders (it's mounted into a
-   * one-shot Ink instance that unmounts immediately after the first
-   * frame commits).
-   */
   state: AppState;
 }
 
-// Visual width (in terminal cells, CJK = 2) of the value-column left
-// edge. Must exceed the widest label across BOTH locales:
-//   en: "Cluster / namespace" → 19 cells
-//   zh: "集群 / 命名空间"     → 17 cells (7 CJK × 2 + 3 ASCII)
-// 22 leaves a 3-cell gap after the English worst-case and a 5-cell gap
-// after the Chinese worst-case. Yoga can't measure CJK width — it
-// counts code points — so we pre-pad the label string ourselves
-// instead of relying on Box ``minWidth`` (the original Python TUI uses
-// Rich, which IS CJK-aware, hence "looks right out of the box" over
-// there).
 const KEY_LABEL_COLS = 22;
 
-/** Format seconds → "Xh Ym Zs" / "Ym Zs" / "Zs", matching Python's
- * ``_fmt_duration`` in goodbye.py exactly. */
 function formatDuration(seconds: number): string {
   const total = Math.max(0, Math.floor(seconds));
   const h = Math.floor(total / 3600);
@@ -74,8 +47,6 @@ function formatDuration(seconds: number): string {
   return `${s}s`;
 }
 
-/** Right-pad a label with spaces so its visual width fills
- * ``KEY_LABEL_COLS`` cells. CJK-aware via ``string-width``. */
 function padLabel(s: string): string {
   const w = stringWidth(s);
   if (w >= KEY_LABEL_COLS) return s + " ";
@@ -101,9 +72,6 @@ const SectionHeader: React.FC<{ children: string }> = ({ children }) => (
   </Box>
 );
 
-/** Render the "故障注入 N 次 (✓ N ✗ N)" cell. Splits the breakdown
- * into coloured chunks so green-ok / red-fail pop without dragging
- * chalk into the component. Mirrors goodbye.py's _injection_value. */
 const InjectionValue: React.FC<{ state: AppState }> = ({ state }) => (
   <Box>
     <Text bold>{t("goodbye.value.count", { n: state.injectionCount })}</Text>

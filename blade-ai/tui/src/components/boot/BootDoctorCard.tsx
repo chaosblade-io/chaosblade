@@ -17,11 +17,8 @@ import { Icons } from "../../theme/icons.js";
 import { CheckList } from "../shared/CheckList.js";
 import { BootCardFrame } from "./BootCardFrame.js";
 
-/**
- * Render the ISO timestamp as ``HH:MM:SS`` in the local zone. Falls
- * back to the raw string when parsing fails (server clock weirdness)
- * — we'd rather show *something* than swallow.
- */
+/** Render the ISO timestamp as ``HH:MM:SS`` in the local zone. Falls
+ *  back to the raw string when parsing fails. */
 function formatTimeOfDay(iso: string): string {
   if (!iso) return "";
   const d = new Date(iso);
@@ -63,7 +60,9 @@ export const BootDoctorCard: React.FC<{ item: BootDoctorCardItem }> = ({
         {item.capturedAt && (
           <Text color={Theme.text.secondary}>
             {"  · "}
-            {t("boot.doctor.captured_at", { time: formatTimeOfDay(item.capturedAt) })}
+            {t("boot.doctor.captured_at", {
+              time: formatTimeOfDay(item.capturedAt),
+            })}
           </Text>
         )}
       </Box>
