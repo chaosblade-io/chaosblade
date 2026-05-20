@@ -4,6 +4,8 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![Release](https://img.shields.io/github/v/release/chaosblade-io/chaosblade?filter=blade-ai-v*&label=blade-ai)](https://github.com/chaosblade-io/chaosblade/releases?q=blade-ai-v)
 
+**语言:** 中文 | [English](README_en.md)
+
 > Kubernetes 混沌工程智能代理 — 说人话就能注入故障，不用背命令。
 
 BLADE AI 是 [ChaosBlade](https://github.com/chaosblade-io/chaosblade) 生态的智能代理层：底层调用 ChaosBlade 执行故障注入，上层增加意图理解、安全审查、效果验证、安全恢复和结构化报告等编排能力，让故障演练从"手写命令"变成"对话完成"。
@@ -19,32 +21,36 @@ BLADE AI 是 [ChaosBlade](https://github.com/chaosblade-io/chaosblade) 生态的
 
 ## 安装
 
-发布流水线 `release-blade-ai.yml` 会在 `blade-ai-v*` 标签推送时为五个平台产出自包含的可执行包（内嵌 Python 运行时、ChaosBlade 二进制、技能文件，解压即用）。
+发布流水线 `release-blade-ai.yml` 会在 `blade-ai-v*` 标签推送时为四个平台产出自包含的可执行包（内嵌 Python 运行时、ChaosBlade 二进制、技能文件，解压即用）：linux-amd64 / linux-arm64 / darwin-amd64 / darwin-arm64。Windows 暂不支持。
 
 ### 一键脚本（推荐）
 
+不传版本时脚本会自动查询 GitHub Releases 取最新的 `blade-ai-v*` tag，无需手动改脚本：
+
 ```bash
-# macOS / Linux —— 装最新版（chaosblade.io 域名生效后）
+# macOS / Linux —— 装最新版（默认行为，自动 resolve 最新 release）
 curl -fsSL https://chaosblade.io/install-agent.sh | bash
 
-# Windows (PowerShell)
-irm https://chaosblade.io/install-agent.ps1 | iex
+# 锁定指定版本（裸 semver，无 blade-ai-v 前缀）
+curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0-alpha
 
-# 装指定版本（标签里的 bare semver，无 blade-ai-v 前缀）
-curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0
+# 或通过 env 变量
+BLADE_AI_VERSION=0.1.0-alpha curl -fsSL https://chaosblade.io/install-agent.sh | bash
 ```
+
+> Windows: `install.ps1` 已就位但当前发布矩阵不包含 Windows 二进制；脚本会主动报「not yet supported」并指引走 WSL2 / 源码构建。Windows 矩阵恢复后 `irm | iex` 立即可用，且自带同款 latest 自动解析。
 
 如果 `chaosblade.io` 域名跳转尚未配置，可以直接从 GitHub Releases 下载脚本：
 
 ```bash
 # 直接走 GitHub Release 下载脚本
-VERSION=0.1.0
+VERSION=0.1.0-alpha
 curl -fsSL "https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}/install.sh" | bash -s -- --version "${VERSION}"
 ```
 
 ### 手动下载预编译包
 
-每次发布会上传 5 份归档 + `checksums.txt` 到 `blade-ai-v<版本>` Release：
+每次发布会上传 4 份归档 + `checksums.txt` 到 `blade-ai-v<版本>` Release：
 
 | 平台 | 归档名 |
 |------|-------|
@@ -52,28 +58,44 @@ curl -fsSL "https://github.com/chaosblade-io/chaosblade/releases/download/blade-
 | Linux ARM64 | `blade-ai-linux-arm64.tar.gz` |
 | macOS Intel | `blade-ai-darwin-amd64.tar.gz` |
 | macOS Apple Silicon | `blade-ai-darwin-arm64.tar.gz` |
-| Windows | `blade-ai-windows-x64.zip` |
 
 ```bash
-VERSION=0.1.0
+VERSION=0.1.0-alpha
 PLATFORM=darwin-arm64    # 按本机替换
 URL="https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}/blade-ai-${PLATFORM}.tar.gz"
 curl -fSLO "${URL}"
 tar -xzf "blade-ai-${PLATFORM}.tar.gz"
-./blade-ai/blade-ai --version
+./blade-ai/blade-ai version
 # 把 blade-ai/ 目录加入 PATH，或软链 blade-ai 到 /usr/local/bin
 ```
 
-### pip / npm
+### 卸载
+
+提供与 install 对称的卸载脚本，按平台用对应版本：
 
 ```bash
-# pip：内嵌 TS TUI bundle，装完直接 blade-ai
-pip install blade-ai==0.1.0
+# macOS / Linux：默认全删（含配置）
+bash <path>/uninstall.sh
 
-# npm：仅 TS TUI（适合远端已有 server 的场景），需 Node 22+
-npm install -g @blade-ai/tui@0.1.0
-BLADE_AI_SERVER=http://127.0.0.1:8080 blade-ai-tui
+# 看脚本会做什么但不删
+bash <path>/uninstall.sh --dry-run
+
+# 删二进制 + PATH，保留 ~/.blade-ai/ 配置/记忆/技能
+bash <path>/uninstall.sh --keep-config
+
+# 仅删某一版（多版本场景下，符号链接和其它版本保留）
+bash <path>/uninstall.sh --version 0.1.0-alpha
 ```
+
+```powershell
+# Windows（脚本就位但当前发布矩阵不含 Windows，等 install.ps1 能用时同样能用）
+.\uninstall.ps1                    # 全删
+.\uninstall.ps1 -KeepConfig        # 保留配置
+.\uninstall.ps1 -Version 0.1.0-alpha     # 安全校验：仅当 manifest 匹配时才删
+.\uninstall.ps1 -DryRun            # 看 plan 不删
+```
+
+每次修改 shell rc / 注册表前都会写备份（`~/.zshrc.blade-ai-uninstall.bak` / `~/.blade-ai/path-backup.txt`），误删可还原。
 
 ### 源码构建
 
@@ -173,7 +195,7 @@ blade-ai/
 ├── blade-ai.spec              ← PyInstaller 配置
 ├── Makefile                   ← dev / test / build
 ├── src/chaos_agent/           ← Python 后端（LangGraph + FastAPI）
-├── tui/                       ← TypeScript + Ink 前端（@blade-ai/tui）
+├── tui/                       ← TypeScript + Ink 前端（嵌入 PyInstaller bundle 一起发布）
 ├── skills/                    ← 故障注入技能包
 ├── scripts/                   ← install.sh / install.ps1
 └── tests/                     ← Pytest 测试
@@ -211,34 +233,20 @@ npm run typecheck
 # 1) 同步 4 处版本字符串到目标版本
 #    pyproject.toml / tui/package.json / src/chaos_agent/__init__.py
 # 2) 提交并打 tag
-git tag blade-ai-v0.1.0
-git push origin blade-ai-v0.1.0
+git tag blade-ai-v0.1.0-alpha
+git push origin blade-ai-v0.1.0-alpha
 ```
 
 CI 会：
 
-1. **verify-versions** — 比对 3 处版本与标签，不一致则失败
-2. **build-tui** — typecheck → bundle → vitest → 烟雾测试，产出 `tui/dist/cli.js`
-3. **build (5 平台矩阵)** — 下载 ChaosBlade v1.8.0 → PyInstaller 打包
-   - Linux 用 manylinux2014 docker 保证 glibc 2.17 基线
-   - macOS ad-hoc codesign
-   - 每个矩阵产出 `blade-ai-<platform>.tar.gz` / `.zip`
-4. **release** — 聚合产物 + `checksums.txt` 创建 GitHub Release
-5. **publish-npm** — `@blade-ai/tui` 推到 npm
-6. **publish-pypi** — `blade-ai` wheel + sdist 推到 PyPI（验证 wheel 内嵌 `cli.js`）
+1. **verify-versions** — 比对 3 处版本字符串与标签，不一致则失败
+2. **build-tui** — typecheck → tsup bundle → vitest → 上传 `tui-bundle` artifact（含 `cli.js` + `package.json` 标 `{"type":"module"}`）
+3. **build (4 平台矩阵)** — 下载 ChaosBlade v1.8.0 → PyInstaller 打包
+   - linux/amd64: ubuntu-latest 上 native build（glibc 2.39 baseline）
+   - linux/arm64: ubuntu-24.04-arm 上 native build
+   - darwin/amd64: macos-latest（Apple Silicon host）+ python.org universal2 Python + `arch -x86_64` 走 Rosetta 出 x86_64 bundle
+   - darwin/arm64: macos-latest 上 native + ad-hoc codesign
+   - 每个矩阵产出 `blade-ai-<os>-<arch>.tar.gz`
+4. **release** — 聚合 4 份产物 + `checksums.txt` 创建 GitHub Release
 
-整条流水线在 `~25 分钟` 内产出五平台可执行 + 两个公网包。
-
----
-
-## 反馈与贡献
-
-- **Issues**：[github.com/chaosblade-io/chaosblade/issues](https://github.com/chaosblade-io/chaosblade/issues)（请在标题加 `[blade-ai]` 前缀）
-- **钉钉群**：23177705
-- **邮箱**：chaosblade.io.01@gmail.com
-
-欢迎 Issue 与 PR，详见 [CONTRIBUTING.md](../CONTRIBUTING.md)。
-
-## License
-
-Apache 2.0，详见 [LICENSE](../LICENSE)。
+整条流水线在 ~25 分钟内产出四平台可执行包。当前不发 npm 和 PyPI。

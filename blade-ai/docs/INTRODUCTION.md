@@ -2,6 +2,8 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](../LICENSE)
 
+**语言:** 中文 | [English](INTRODUCTION_en.md)
+
 > 说人话就能注入故障，不用背命令。
 
 ## 目录
@@ -265,7 +267,7 @@ Local 模式和 Server 模式共享完全相同的 Agent Core（Graph、State、
 
 ### TUI 渲染架构
 
-默认 TUI 是 TypeScript + Ink 实现（npm 包 `@blade-ai/tui`，源码在 `tui/`），视觉对标 Claude Code / Qwen Code：
+默认 TUI 是 TypeScript + Ink 实现（源码在 `tui/`，作为 PyInstaller 二进制的一部分嵌入发布；当前不独立推送到 npm），视觉对标 Claude Code / Qwen Code：
 
 - **TS TUI 是 renderer / view layer**，不持有任何业务逻辑
 - **Python 是 agent runtime / state machine**，提供事件流
