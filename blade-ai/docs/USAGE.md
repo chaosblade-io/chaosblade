@@ -33,10 +33,10 @@
 curl -fsSL https://chaosblade.io/install-agent.sh | bash
 
 # 锁定指定版本
-curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0-alpha
+curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0
 
 # 通过 env 传同样的版本（适合 Dockerfile / CI）
-BLADE_AI_VERSION=0.1.0-alpha curl -fsSL https://chaosblade.io/install-agent.sh | bash
+BLADE_AI_VERSION=0.1.0 curl -fsSL https://chaosblade.io/install-agent.sh | bash
 ```
 
 脚本会自动按 `uname -m` 探测平台，从 `chaosblade-io/chaosblade` 的 `blade-ai-v<版本>` Release 下载对应 `tar.gz` 并解压到 `~/.blade-ai/versions/blade-ai-v<版本>/`，再创建 `~/.local/bin/blade-ai` 符号链接，并把 `~/.local/bin` 加入 shell rc 的 PATH（带 `# blade-ai` 标记，方便 `uninstall.sh` 精确清理）。
@@ -50,7 +50,7 @@ BLADE_AI_VERSION=0.1.0-alpha curl -fsSL https://chaosblade.io/install-agent.sh |
 如果 `chaosblade.io` 域名跳转尚未配置，或想离线分发：
 
 ```bash
-VERSION=0.1.0-alpha
+VERSION=0.1.0
 PLATFORM=darwin-arm64    # linux-amd64 / linux-arm64 / darwin-amd64 / darwin-arm64
 URL="https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}"
 
@@ -75,22 +75,48 @@ make build    # PyInstaller 打包到 dist/blade-ai/
 
 ## 卸载
 
-提供与 install.sh / install.ps1 对称的卸载脚本，按平台用对应版本：
+`uninstall.sh` / `uninstall.ps1` 跟 `install.*` 在每个 `blade-ai-v<版本>` Release 下一同上传，调用方式跟 install 完全对称。
 
-### macOS / Linux
+### macOS / Linux —— 一键卸载（推荐）
 
 ```bash
-# 默认全删（含 ~/.blade-ai/ 下的配置/记忆/技能/日志）
+# 一键全删（含 ~/.blade-ai/ 下的配置/记忆/技能/日志）
+#
+# 注意：curl | bash 模式下 stdin 不是 tty，脚本会拒绝交互 y/N，
+# 卸载是破坏性操作必须显式 --force 才执行。
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force
+
+# 先看 plan 再决定（--dry-run 不需要 --force，因为它本来就不删）
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --dry-run
+
+# 删二进制 + PATH，保留 ~/.blade-ai/ 用户数据
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force --keep-config
+
+# 仅删某一版（多版本场景下其它版本和符号链接保留）
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force --version 0.1.0
+```
+
+如果 `chaosblade.io` 域名跳转尚未配置，可以直接从 GitHub Release 拉脚本：
+
+```bash
+VERSION=0.1.0
+curl -fsSL "https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}/uninstall.sh" | bash -s -- --force
+```
+
+### macOS / Linux —— 本地脚本调用（已装过的人）
+
+```bash
+# 默认全删（在真实终端跑会弹 y/N 交互确认）
 bash <path>/uninstall.sh
 
-# 看会做什么但不实际删（推荐先跑这个）
+# 看会做什么但不实际删
 bash <path>/uninstall.sh --dry-run
 
 # 删二进制 + PATH，保留用户数据
 bash <path>/uninstall.sh --keep-config
 
-# 仅删某一版（多版本场景下保留其它版本和符号链接）
-bash <path>/uninstall.sh --version 0.1.0-alpha
+# 仅删某一版
+bash <path>/uninstall.sh --version 0.1.0
 
 # CI 友好：跳 y/N 确认
 bash <path>/uninstall.sh --force
@@ -105,8 +131,8 @@ bash <path>/uninstall.sh --force
 # 保留配置
 .\uninstall.ps1 -KeepConfig
 
-# 安全校验：仅当 manifest 记录的版本 = 0.1.0-alpha 时才执行
-.\uninstall.ps1 -Version 0.1.0-alpha
+# 安全校验：仅当 manifest 记录的版本 = 0.1.0 时才执行
+.\uninstall.ps1 -Version 0.1.0
 
 # 看 plan
 .\uninstall.ps1 -DryRun
@@ -702,8 +728,8 @@ node scripts/smoke-reducer.mjs    # action ↔ state 转移
 #    blade-ai/src/chaos_agent/__init__.py
 
 # 2) 提交并打标签
-git tag blade-ai-v0.1.0-alpha
-git push origin blade-ai-v0.1.0-alpha
+git tag blade-ai-v0.1.0
+git push origin blade-ai-v0.1.0
 ```
 
 CI 流程：

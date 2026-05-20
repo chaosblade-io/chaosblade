@@ -33,10 +33,10 @@ When no version is given, the installer queries the GitHub Releases API and reso
 curl -fsSL https://chaosblade.io/install-agent.sh | bash
 
 # Pin a specific version
-curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0-alpha
+curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version 0.1.0
 
 # Same via env var (good for Dockerfiles / CI)
-BLADE_AI_VERSION=0.1.0-alpha curl -fsSL https://chaosblade.io/install-agent.sh | bash
+BLADE_AI_VERSION=0.1.0 curl -fsSL https://chaosblade.io/install-agent.sh | bash
 ```
 
 The script detects your platform from `uname -m`, downloads the matching `tar.gz` from the `chaosblade-io/chaosblade` `blade-ai-v<version>` Release, extracts it to `~/.blade-ai/versions/blade-ai-v<version>/`, creates a `~/.local/bin/blade-ai` symlink, and appends `~/.local/bin` to your shell rc PATH (tagged `# blade-ai` so `uninstall.sh` can clean it precisely).
@@ -50,7 +50,7 @@ Prebuilt archives are **self-contained**: bundled Python runtime + ChaosBlade v1
 If the `chaosblade.io` redirect is not yet configured, or you want offline distribution:
 
 ```bash
-VERSION=0.1.0-alpha
+VERSION=0.1.0
 PLATFORM=darwin-arm64    # linux-amd64 / linux-arm64 / darwin-amd64 / darwin-arm64
 URL="https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}"
 
@@ -75,22 +75,50 @@ make build    # PyInstaller bundle into dist/blade-ai/
 
 ## Uninstall
 
-Companion uninstall scripts mirror install.sh / install.ps1 — pick the one for your OS:
+`uninstall.sh` / `uninstall.ps1` are uploaded next to `install.*` in every `blade-ai-v<version>` release; invocation style mirrors install.
 
-### macOS / Linux
+### macOS / Linux — one-liner (recommended)
 
 ```bash
-# Default: full uninstall (binary + config + memory + skills + logs)
+# Full uninstall (binary + config + memory + skills + logs)
+#
+# Note: under curl | bash, stdin is not a tty so the interactive
+# y/N prompt is disabled. Uninstall is destructive — you must pass
+# --force to confirm explicitly.
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force
+
+# Dry-run first to see the plan (--dry-run doesn't need --force; it
+# never deletes anything anyway)
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --dry-run
+
+# Remove binary + PATH but keep ~/.blade-ai/ user data
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force --keep-config
+
+# Remove one specific version (other versions and symlink kept in multi-version setups)
+curl -fsSL https://chaosblade.io/uninstall-agent.sh | bash -s -- --force --version 0.1.0
+```
+
+If the `chaosblade.io` redirect is not yet configured, fetch the script directly from a GitHub Release:
+
+```bash
+VERSION=0.1.0
+curl -fsSL "https://github.com/chaosblade-io/chaosblade/releases/download/blade-ai-v${VERSION}/uninstall.sh" | bash -s -- --force
+```
+
+### macOS / Linux — local script invocation (after install)
+
+```bash
+# Default: full uninstall (interactive y/N prompt in a real terminal)
 bash <path>/uninstall.sh
 
-# Show the plan but do not delete (run this first)
+# Show the plan but do not delete
 bash <path>/uninstall.sh --dry-run
 
 # Remove binary + PATH, but keep user data
 bash <path>/uninstall.sh --keep-config
 
-# Remove only one version (in multi-version setups; other versions and symlink kept)
-bash <path>/uninstall.sh --version 0.1.0-alpha
+# Remove only one specific version
+bash <path>/uninstall.sh --version 0.1.0
 
 # CI-friendly: skip y/N
 bash <path>/uninstall.sh --force
@@ -105,8 +133,8 @@ bash <path>/uninstall.sh --force
 # Keep config
 .\uninstall.ps1 -KeepConfig
 
-# Safety check: only proceed if the manifest version matches 0.1.0-alpha
-.\uninstall.ps1 -Version 0.1.0-alpha
+# Safety check: only proceed if the manifest version matches 0.1.0
+.\uninstall.ps1 -Version 0.1.0
 
 # Show plan
 .\uninstall.ps1 -DryRun
@@ -694,8 +722,8 @@ Fully driven by `chaosblade/.github/workflows/release-blade-ai.yml`:
 #    blade-ai/src/chaos_agent/__init__.py
 
 # 2) Commit and push the tag
-git tag blade-ai-v0.1.0-alpha
-git push origin blade-ai-v0.1.0-alpha
+git tag blade-ai-v0.1.0
+git push origin blade-ai-v0.1.0
 ```
 
 CI pipeline:
