@@ -6,6 +6,7 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { t } from "../../i18n/index.js";
 import type { PendingTasksCardItem } from "../../state/types.js";
 import { Theme } from "../../theme/colors.js";
@@ -27,7 +28,7 @@ function stateColor(state: string): string {
   }
 }
 
-export const PendingTasksCard: React.FC<{ item: PendingTasksCardItem }> = ({
+const PendingTasksCardInternal: React.FC<{ item: PendingTasksCardItem }> = ({
   item,
 }) => {
   return (
@@ -74,3 +75,7 @@ export const PendingTasksCard: React.FC<{ item: PendingTasksCardItem }> = ({
     </BootCardFrame>
   );
 };
+
+// React.memo: pending-tasks payload is captured once during the boot
+// sequence; item ref never changes after dispatch.
+export const PendingTasksCard = memo(PendingTasksCardInternal);

@@ -42,6 +42,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from chaos_agent.config import wizard_validators
 from chaos_agent.tui import strings
 from chaos_agent.tui.config_store import ConfigStore
 from chaos_agent.tui.console import ChaosConsole
@@ -225,112 +226,51 @@ def _default_permission(ctx: WizardCtx) -> bool:
 
 
 async def _validate_api_key(value: Any, ctx: WizardCtx) -> StepResult:
-    key = (value or "").strip()
-    if not key:
-        return StepResult(status="error", message="API key 不能为空", block=True)
+    """Thin wrapper — defers to ``config.wizard_validators.validate_api_key``.
+
+    The implementation moved out so the same logic backs the TS
+    Ink wizard (via ``POST /api/v1/wizard/validate/api-key``) and the
+    standalone CLI subcommand. We keep the StepResult shape here so
+    the WizardStep contract is unchanged.
+    """
     base_url = ctx.updates.get("api_base_url") or _default_api_url(ctx)
-    try:
-        import openai  # type: ignore
-    except ImportError:
-        return StepResult(
-            status="warn",
-            message="未安装 openai 包，无法实时校验（已接受）",
-            block=False,
-        )
-    client = openai.AsyncOpenAI(api_key=key, base_url=base_url, timeout=5.0)
-    try:
-        await asyncio.wait_for(client.models.list(), timeout=5.0)
-    except asyncio.TimeoutError:
-        return StepResult(
-            status="warn",
-            message="校验超时，可能是网络问题；已接受（首次 /run 时再确认）",
-            block=False,
-        )
-    except Exception as e:  # AuthenticationError, APIConnectionError, etc.
-        msg = str(e).lower()
-        if "401" in msg or "unauthorized" in msg or "invalid" in msg or "authentication" in msg:
-            return StepResult(
-                status="error",
-                message=(
-                    f"401 拒绝：端点 {base_url} 不接受此 key。"
-                    "请确认 key 与上一步选择的 API Base URL 来自同一供应商。"
-                ),
-                block=True,
-            )
-        if "404" in msg:
-            return StepResult(
-                status="warn",
-                message=f"端点缺少 /models（{type(e).__name__}），已接受",
-                block=False,
-            )
-        return StepResult(
-            status="warn",
-            message=f"校验异常: {type(e).__name__}（已接受）",
-            block=False,
-        )
-    return StepResult(status="ok", message="API key 校验通过")
+    model = ctx.updates.get("model_name") or _default_model(ctx)
+    result = await wizard_validators.validate_api_key(
+        api_key=value, base_url=base_url, model=model,
+    )
+    return StepResult(
+        status=result.status, message=result.message, block=result.block,
+    )
 
 
 async def _validate_api_url(value: Any, ctx: WizardCtx) -> StepResult:
-    url = (value or "").strip()
-    if not url:
-        return StepResult(status="error", message="URL 不能为空", block=True)
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return StepResult(
-            status="error",
-            message="URL 必须以 http:// 或 https:// 开头",
-            block=True,
-        )
-    return StepResult(status="ok")
+    """Thin wrapper — defers to ``config.wizard_validators.validate_api_url``."""
+    result = await wizard_validators.validate_api_url(value)
+    return StepResult(
+        status=result.status, message=result.message, block=result.block,
+    )
 
 
 async def _validate_kubeconfig(value: Any, ctx: WizardCtx) -> StepResult:
-    path = (value or "").strip()
-    if not path:
-        return StepResult(
-            status="warn",
-            message="未指定，将使用 kubectl 默认行为",
-            block=False,
-        )
-    expanded = os.path.expanduser(path)
-    if not os.path.isfile(expanded):
-        return StepResult(
-            status="warn",
-            message=f"文件不存在: {expanded}（已接受，启动后可再调整）",
-            block=False,
-        )
-    # Probe contexts in the background; populate ctx for the next step
-    ctx.discovered_contexts = await _discover_kube_contexts(expanded)
-    return StepResult(status="ok", message=f"找到 {len(ctx.discovered_contexts)} 个上下文")
+    """Thin wrapper around ``validate_kubeconfig``.
+
+    The validator returns the discovered context list in
+    ``metadata.contexts``; we copy it onto ``ctx.discovered_contexts``
+    here so the existing next-step radio-options builder still finds
+    it where it expects.
+    """
+    result = await wizard_validators.validate_kubeconfig(value)
+    contexts = result.metadata.get("contexts") if result.metadata else None
+    if isinstance(contexts, list):
+        ctx.discovered_contexts = [str(c) for c in contexts]
+    return StepResult(
+        status=result.status, message=result.message, block=result.block,
+    )
 
 
 async def _discover_kube_contexts(kubeconfig_path: str) -> list[str]:
-    if not shutil.which("kubectl"):
-        return []
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "kubectl",
-            f"--kubeconfig={kubeconfig_path}",
-            "config",
-            "get-contexts",
-            "-o",
-            "name",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3.0)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            return []
-        if proc.returncode != 0:
-            return []
-        return [ln.strip() for ln in stdout.decode("utf-8", "replace").splitlines() if ln.strip()]
-    except Exception:
-        return []
+    """Thin wrapper around ``wizard_validators.discover_kube_contexts``."""
+    return await wizard_validators.discover_kube_contexts(kubeconfig_path)
 
 
 def _kube_context_options(ctx: WizardCtx) -> list[RadioOption]:

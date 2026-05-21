@@ -32,6 +32,7 @@ async def _collect_context(state: AgentState) -> dict:
 
     # Pod memory limit (for P0 param safety check)
     scope = state.get("blade_scope", "")
+    blade_target = (state.get("blade_target") or "").lower()
     kubeconfig = state.get("kubeconfig") or ""
     target_info = state.get("target") or {}
     ns = target_info.get("namespace", "")
@@ -39,7 +40,21 @@ async def _collect_context(state: AgentState) -> dict:
     labels = target_info.get("labels") or {}
     task_id = state.get("task_id", "unknown")
 
-    if scope == "pod" and kubeconfig:
+    # Gate by ``blade_target == "mem"`` — every downstream consumer of
+    # ``pod_memory_limit_mb`` is memory-burn specific:
+    #   - direct_execute.py FCAT P0 param_override only matches when
+    #     ``param_overrides.size == "auto"`` (a memory-burn key)
+    #   - direct_execute.py OOMKill risk warning compares burn ``size``
+    #     against the limit; non-memory faults have no ``size`` param
+    #     so the comparison is meaningless
+    #   - utils/fault_context.py compute_safe_burn_size / lookup_adaptations
+    #     mem rules
+    # For cpu / network / io / disk faults this prefetch was pure waste:
+    # one extra kubectl roundtrip per drill, a "Pod memory limit: ..."
+    # log line that confused users into thinking we cared about memory,
+    # AND it set up the OOMKill block to fire a misleading warning
+    # downstream. Skipping the fetch here also removes those.
+    if scope == "pod" and blade_target == "mem" and kubeconfig:
         # Obtain session store before try block so exception path can write
         from chaos_agent.memory.session_store import get_global_session_store
         _store = get_global_session_store()

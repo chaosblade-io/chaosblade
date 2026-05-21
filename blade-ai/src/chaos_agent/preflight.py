@@ -277,29 +277,6 @@ async def _kubectl_current_context(base_cmd: list[str]) -> str:
     return ""
 
 
-async def _kubectl_apiserver_url(base_cmd: list[str]) -> str:
-    """Return the active cluster's API server URL from kubeconfig, or ''.
-
-    Reads ``.clusters[0].cluster.server`` from the minified config —
-    pure local parse via kubectl, no API roundtrip. Used by
-    ``check_k8s_connectivity`` so the success row shows the actual
-    endpoint we'd hit, not just a context-name label.
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *base_cmd, "config", "view", "--minify",
-            "-o", "jsonpath={.clusters[0].cluster.server}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0:
-            return stdout.decode(errors="replace").strip()
-    except Exception:
-        return ""
-    return ""
-
-
 async def _safe_kill(proc) -> None:
     """Reap a subprocess that timed out so we don't leak fds + zombie.
 
@@ -714,15 +691,12 @@ async def check_k8s_connectivity() -> CheckResult:
             server_version = _extract_kubectl_version(
                 stdout.decode(errors="replace"), kind="server"
             )
-            url = await _kubectl_apiserver_url(base_cmd)
-            if server_version and url:
-                msg = f"v{server_version} · {url}"
-            elif server_version:
-                msg = f"v{server_version}"
-            elif url:
-                msg = url
-            else:
-                msg = "connected"
+            # API server URL is intentionally omitted from the success
+            # message — the endpoint is sensitive (cluster IP / port)
+            # and the self-check card lives in screenshots / share
+            # logs. Server version alone is enough to confirm the
+            # connection is healthy.
+            msg = f"v{server_version}" if server_version else "connected"
             return CheckResult(name="k8s_connectivity", severity="blocking", passed=True, message=msg)
 
         error_msg = stderr.decode(errors="replace").strip()[:200]

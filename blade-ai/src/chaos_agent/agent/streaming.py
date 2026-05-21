@@ -25,10 +25,12 @@ class StreamEvent:
         result     - Final result envelope
         error      - Error during execution
         usage      - LLM call ended; carries authoritative token counts
+        context_size - PreReasoningHook snapshot of post-hook state size
+        memory_compaction - PreReasoningHook compaction lifecycle phase
         conversation_turn - Conversation turn completed (multi-invocation model)
     """
 
-    type: str  # token | thinking | tool_start | tool_end | node_start | node_end | confirm | result | error | usage | memory_compaction
+    type: str  # token | thinking | tool_start | tool_end | node_start | node_end | confirm | result | error | usage | memory_compaction | context_size
     content: str = ""
     node: str = ""
     tool_name: str = ""
@@ -92,6 +94,18 @@ class StreamEvent:
     # keep working unchanged.
     input_tokens: int = 0
     output_tokens: int = 0
+    # Context-size snapshot, populated only on
+    # ``type=context_size`` events. Emitted by PreReasoningHook after
+    # every reasoning step so the TS TUI Footer can render a live
+    # "state size / window" indicator. ``current_tokens`` is the
+    # post-hook ``count_tokens_approx × 1.2`` (the exact same number
+    # the trigger compares against), so the displayed percent
+    # corresponds 1:1 to compaction firing. All default 0 so the
+    # wire-format stripper drops them on every other event type.
+    context_current_tokens: int = 0
+    context_trigger_tokens: int = 0
+    context_max_tokens: int = 0
+    context_messages_count: int = 0
     timestamp: str = field(
         default_factory=lambda: now_iso()
     )
@@ -123,6 +137,18 @@ class StreamEvent:
         if self.type == "usage":
             out["input_tokens"] = self.input_tokens
             out["output_tokens"] = self.output_tokens
+        if self.type == "context_size":
+            # Same rationale as ``usage`` above — defensively force
+            # all four context_size fields onto the wire so the TS
+            # reducer's ``Number(x) || 0`` defenses can recognise a
+            # genuine ``0`` (empty thread on first hook call) vs an
+            # absent field (older server). Without this, a fresh
+            # state with ``current_tokens=0`` would get stripped and
+            # the Footer would treat it as "no data yet".
+            out["context_current_tokens"] = self.context_current_tokens
+            out["context_trigger_tokens"] = self.context_trigger_tokens
+            out["context_max_tokens"] = self.context_max_tokens
+            out["context_messages_count"] = self.context_messages_count
         return out
 
     def to_sse(self) -> str:

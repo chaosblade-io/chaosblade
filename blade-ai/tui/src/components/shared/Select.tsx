@@ -10,17 +10,22 @@
  *
  * Visual:
  *
- *   ❯ Yes, proceed
- *     No, cancel
- *     Tell agent something else…           ← hasFeedback option
+ *   [A] Yes, proceed                        ← focused: brand-orange + bold
+ *   [B] No, cancel
+ *   [C] Tell agent something else…          ← hasFeedback option
  *
- *   ↑↓ select · Enter confirm · 1-9 jump · Esc cancel
+ *   A-Z jump · ↑↓ select · Enter confirm · Esc cancel
+ *
+ * All `[X]` chips share column 0 — focus is signaled by colour + bold
+ * on the focused row, never by indent. Letter chips double as direct
+ * keyboard shortcuts (press `A` to jump to the first option). Number
+ * keys 1-9 stay live for users with prior muscle memory.
  *
  * In feedback mode (after Enter on a hasFeedback item):
  *
- *     Yes, proceed
- *     No, cancel
- *   ❯ Tell agent something else…
+ *   [A] Yes, proceed
+ *   [B] No, cancel
+ *   [C] Tell agent something else…
  *   ❯ <typed text>|                         ← cursor block
  *
  *   Enter send · Esc back to options
@@ -40,7 +45,7 @@ import { Icons } from "../../theme/icons.js";
 export interface SelectItem<T> {
   /** The value passed back to ``onSelect``. */
   value: T;
-  /** Display label rendered next to the cursor glyph. */
+  /** Display label rendered next to the row's `[A]` / `[B]` chip. */
   label: string;
   /**
    * When true, pressing Enter on this item switches the Select into
@@ -91,6 +96,17 @@ export function Select<T>({
   const [mode, setMode] = useState<"options" | "feedback">("options");
   const [feedbackText, setFeedbackText] = useState<string>("");
 
+  // Defensive clamp — ``items.length`` is a prop and a parent may
+  // hand us a shorter list without remounting. Without this, after a
+  // shrink (e.g. 5 → 3 items, activeIndex still 4), the first 2 ↑
+  // presses would walk 4→3→2 with zero visible movement before the
+  // highlight finally appears to move. Same stale-index bug class as
+  // InputPrompt's slash menu — use the clamped value as the base for
+  // both rendering and nav arithmetic. ``setActiveIndex`` still
+  // writes through to the underlying state.
+  const lastIdx = Math.max(0, items.length - 1);
+  const safeActiveIdx = Math.min(activeIndex, lastIdx);
+
   useInput(
     (input, key) => {
       // ──────────────────────────────────────────────────────────
@@ -113,7 +129,7 @@ export function Select<T>({
           // non-whitespace character. Esc still bounces back to options
           // if they change their mind.
           if (feedbackText.trim().length === 0) return;
-          const item = items[activeIndex];
+          const item = items[safeActiveIdx];
           if (item) {
             onSelect(item.value, feedbackText);
           }
@@ -151,17 +167,31 @@ export function Select<T>({
         return;
       }
       if (key.upArrow) {
-        setActiveIndex((i) => (i > 0 ? i - 1 : i));
+        setActiveIndex(safeActiveIdx > 0 ? safeActiveIdx - 1 : safeActiveIdx);
         return;
       }
       if (key.downArrow) {
-        setActiveIndex((i) => (i < items.length - 1 ? i + 1 : i));
+        setActiveIndex(
+          safeActiveIdx < lastIdx ? safeActiveIdx + 1 : safeActiveIdx,
+        );
         return;
       }
-      // Number-key direct jump (1-9). Same pattern as Claude Code /
-      // Qwen Code — useful for users with muscle memory. Out-of-range
-      // numbers are ignored (no auto-commit either; user still has to
-      // Enter so a stray "5" press doesn't fire an action).
+      // Letter-key direct jump (A-Z, case-insensitive). Letters are
+      // the primary affordance now that each row is prefixed with a
+      // visible `[A]` / `[B]` chip — pressing A jumps to the first
+      // option, B to the second, etc. Out-of-range letters are
+      // ignored; no auto-commit (user still presses Enter so a stray
+      // keystroke can't fire an action).
+      if (input && /^[a-zA-Z]$/.test(input)) {
+        const idx = input.toUpperCase().charCodeAt(0) - 65;
+        if (idx >= 0 && idx < items.length) {
+          setActiveIndex(idx);
+        }
+        return;
+      }
+      // Number-key direct jump (1-9) kept for muscle memory from the
+      // previous Select revision and from peers like Claude Code /
+      // Qwen Code. Same out-of-range and no-auto-commit behaviour.
       if (input && /^[1-9]$/.test(input)) {
         const idx = parseInt(input, 10) - 1;
         if (idx >= 0 && idx < items.length) {
@@ -170,7 +200,7 @@ export function Select<T>({
         return;
       }
       if (key.return) {
-        const item = items[activeIndex];
+        const item = items[safeActiveIdx];
         if (!item) return;
         if (item.hasFeedback) {
           setMode("feedback");
@@ -186,29 +216,39 @@ export function Select<T>({
   return (
     <Box flexDirection="column">
       {items.map((item, i) => {
-        const active = i === activeIndex;
+        const active = i === safeActiveIdx;
         const inOptions = mode === "options";
-        // In feedback mode the option list is informational only;
-        // we keep the active row highlighted to remind the user
-        // which option they're about to commit but the cursor
-        // glyph belongs to the feedback row instead.
-        const showCursor = active && inOptions;
+        // Three visual states per row:
+        //   - highlighted  (active + options mode)   → chip+label brand-orange + bold
+        //   - pending      (active + feedback mode)  → chip dim, label primary (reminds
+        //                                              the user which option they're
+        //                                              about to commit while they type)
+        //   - idle         (everything else)         → chip+label secondary dim
+        const highlighted = active && inOptions;
+        const pending = active && !inOptions;
+        // Letter chip for direct keyboard jump. Cap at 26; beyond
+        // that we render a blank 3-wide slot so column alignment is
+        // preserved even though the row has no shortcut. (Select is
+        // typically used with ≤5 items; >26 would be a misuse.)
+        const chip =
+          i < 26 ? `[${String.fromCharCode(65 + i)}]` : "   ";
+        const chipColor = highlighted
+          ? Theme.forge.fire
+          : Theme.text.secondary;
+        const labelColor = highlighted
+          ? Theme.forge.fire
+          : pending
+            ? Theme.text.primary
+            : Theme.text.secondary;
         return (
           <Box key={`opt-${i}`}>
-            <Box minWidth={3}>
-              <Text color={Theme.text.accent} bold={showCursor}>
-                {showCursor ? `${Icons.prompt} ` : "  "}
+            <Box minWidth={4}>
+              <Text color={chipColor} bold={highlighted}>
+                {`${chip} `}
               </Text>
             </Box>
             <Box flexGrow={1}>
-              <Text
-                color={
-                  active
-                    ? Theme.text.primary
-                    : Theme.text.secondary
-                }
-                bold={active && inOptions}
-              >
+              <Text color={labelColor} bold={highlighted}>
                 {item.label}
               </Text>
             </Box>
@@ -218,7 +258,7 @@ export function Select<T>({
       {mode === "feedback" ? (
         <>
           <Box marginTop={1}>
-            <Box minWidth={3}>
+            <Box minWidth={4}>
               <Text color={Theme.text.accent} bold>
                 {Icons.prompt}{" "}
               </Text>
@@ -249,7 +289,7 @@ export function Select<T>({
             </Box>
           </Box>
           <Box marginTop={1}>
-            <Box minWidth={3} />
+            <Box minWidth={4} />
             <Box flexGrow={1}>
               <Text color={Theme.text.secondary}>
                 {t("select.feedback.hint")}
@@ -259,7 +299,7 @@ export function Select<T>({
         </>
       ) : (
         <Box marginTop={1}>
-          <Box minWidth={3} />
+          <Box minWidth={4} />
           <Box flexGrow={1}>
             <Text color={Theme.text.secondary}>
               {t("select.options.hint")}

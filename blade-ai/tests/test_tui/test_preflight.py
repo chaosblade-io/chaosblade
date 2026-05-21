@@ -115,12 +115,13 @@ class TestCheckSkills:
 
 
 class TestCheckK8sConnectivity:
-    async def test_success_message_contains_server_version_and_url(self, monkeypatch):
+    async def test_success_message_contains_server_version_only(self, monkeypatch):
         # check_k8s_connectivity invokes ``kubectl version -o json``
-        # (liveness + server-version) followed by
-        # ``kubectl config view --minify -o jsonpath=…server`` (local
-        # parse of the active cluster's API URL). Success message
-        # shows ``v<server-version> · <url>`` per spec.
+        # (liveness + server-version) and renders the success row as
+        # ``v<server-version>``. The API server URL is deliberately
+        # omitted — it's a sensitive endpoint (cluster IP / port) that
+        # could leak through screenshots or shared logs of the
+        # self-check card.
         from chaos_agent.config import settings as _settings_mod
         monkeypatch.setattr(_settings_mod.settings, "kubectl_path", "kubectl")
         monkeypatch.setattr(_settings_mod.settings, "kubeconfig_path", "")
@@ -131,16 +132,16 @@ class TestCheckK8sConnectivity:
             b'"serverVersion":{"gitVersion":"v1.34.3-aliyun.1"}}\n'
         )
         proc_version = _make_proc(0, stdout=version_json)
-        proc_url = _make_proc(0, stdout=b"https://10.0.0.1:6443")
         with patch(
             "asyncio.create_subprocess_exec",
-            AsyncMock(side_effect=[proc_version, proc_url]),
+            AsyncMock(return_value=proc_version),
         ):
             r = await check_k8s_connectivity()
 
         assert r.passed is True
         assert "1.34.3" in r.message  # server version, not client
-        assert "https://10.0.0.1:6443" in r.message
+        assert "https://" not in r.message
+        assert ":6443" not in r.message
 
     async def test_kubectl_not_found_uses_dedicated_message(self, monkeypatch):
         from chaos_agent.config import settings as _settings_mod

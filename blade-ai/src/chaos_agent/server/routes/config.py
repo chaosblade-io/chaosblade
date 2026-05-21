@@ -151,14 +151,40 @@ async def write_config(
             message=f"failed to write config: {e}",
             request_id=getattr(req.state, "request_id", ""),
         )
+
+    # If the just-written key is LLM-bound (model_name / api_base_url /
+    # llm_api_key / etc.) the in-process agents need rebuilding so the
+    # next /turn picks up the change. ``ConfigStore`` itself classifies
+    # those keys as "cold" because the LLM client captures them at
+    # construct time; ``maybe_rebuild_agents`` is what flips them to
+    # effectively-hot for HTTP callers. Non-LLM keys (timeouts, replan
+    # budgets, …) are no-ops here.
+    from chaos_agent.server.agent_runtime import (
+        LLM_BOUND_KEYS,
+        maybe_rebuild_agents,
+    )
+
+    rebuild_error = await maybe_rebuild_agents(req.app, [key])
+
     # Read back the canonical value so the TS side renders what
     # actually landed on disk (including type coercion).
     coerced = store.get(key)
+    # ``hot_reload`` is the USER-FACING field: True when the change
+    # is effective without a restart. Two paths:
+    #   · ``is_hot`` (ConfigStore says settings.reload covers it)
+    #   · the key is LLM-bound AND ``maybe_rebuild_agents`` succeeded
+    # Critically NOT "rebuild_error is None" alone — the helper
+    # returns None when it short-circuits on non-LLM-bound keys, so
+    # using None-as-success would silently mark a hypothetical
+    # future non-LLM cold key (e.g. a db path added to the whitelist)
+    # as hot when in fact it needs a restart.
+    effective = is_hot or (key in LLM_BOUND_KEYS and rebuild_error is None)
     return JSONEnvelope.ok(
         data={
             "key": key,
             "value": coerced,
-            "hot_reload": is_hot,
+            "hot_reload": effective,
+            "rebuild_error": rebuild_error,
         },
         request_id=getattr(req.state, "request_id", ""),
     )
@@ -188,11 +214,30 @@ async def unset_config(key: str, req: Request):
             message=f"failed to unset config: {e}",
             request_id=getattr(req.state, "request_id", ""),
         )
+
+    # Same agent-rebuild contract as POST: an unset on an LLM-bound
+    # key reverts settings to the code default (e.g. unset
+    # ``model_name`` → ``qwen3.6-max-preview``), but the captured-at-
+    # startup ``ChatOpenAI`` still holds the previously-set value.
+    # Without this rebuild, the user gets a `hot_reload=false` envelope
+    # AND a stale in-process client — POST handles that, DELETE used
+    # to drop the rebuild on the floor.
+    from chaos_agent.server.agent_runtime import (
+        LLM_BOUND_KEYS,
+        maybe_rebuild_agents,
+    )
+
+    rebuild_error = await maybe_rebuild_agents(req.app, [key])
+    effective = (
+        not ConfigStore.is_cold_key(key)
+        or (key in LLM_BOUND_KEYS and rebuild_error is None)
+    )
     return JSONEnvelope.ok(
         data={
             "key": key,
             "was_present": was_present,
-            "hot_reload": not ConfigStore.is_cold_key(key),
+            "hot_reload": effective,
+            "rebuild_error": rebuild_error,
         },
         request_id=getattr(req.state, "request_id", ""),
     )

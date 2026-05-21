@@ -1,9 +1,66 @@
 """Router functions: conditional edges for the inject graph."""
 
+import time
+
 from langgraph.graph import END
 
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
+
+
+def _wall_clock_exceeded(state: AgentState) -> bool:
+    """Patch C — has the inject turn run past ``settings.max_inject_seconds``?
+
+    Reads ``state.pipeline_started_at`` (stamped on first agent_loop
+    entry). Returns ``False`` when the budget is disabled (``0``) or
+    the timestamp hasn't been stamped yet — this is intentional so the
+    guard never fires on the very first node before instrumentation
+    has had a chance to run.
+
+    Used by every ``should_continue_*`` so a single setting governs
+    inject / execute / verifier / recover loops uniformly.
+
+    Note on observability: this is a **read-only** check. The router
+    can't write state (LangGraph conditional edges are pure routing
+    functions). The companion helper ``mark_wall_clock_timeout`` (in
+    each node) writes ``state.error`` + ``state.failure_reason`` so
+    the user-facing result envelope honestly reports
+    ``WALL_CLOCK_TIMEOUT`` instead of an empty failure.
+    """
+    budget = int(settings.max_inject_seconds or 0)
+    if budget <= 0:
+        return False
+    started = float(state.get("pipeline_started_at", 0.0) or 0.0)
+    if started <= 0.0:
+        return False
+    return (time.time() - started) > budget
+
+
+def mark_wall_clock_timeout(state: AgentState, result: dict) -> dict:
+    """Patch C — mutate ``result`` to record wall-clock timeout cause.
+
+    Each LLM-loop node (``agent_loop``, ``execute_loop``, ``verifier``,
+    ``recover_verifier``) calls this just before returning. If the
+    wall-clock budget is exceeded, write ``error`` + ``failure_reason``
+    so the eventual result envelope says **why** it ended.
+
+    Idempotent: existing ``error`` / ``failure_reason`` values win
+    (an LLM-detected error is more specific than "we ran out of
+    time"). Returns ``result`` unchanged for direct chaining.
+    """
+    if not _wall_clock_exceeded(state):
+        return result
+    # Prefer pre-existing causes — wall-clock is the catch-all.
+    if not result.get("error"):
+        budget = int(settings.max_inject_seconds or 0)
+        result["error"] = f"wall-clock timeout ({budget}s)"
+    if not result.get("failure_reason"):
+        # Late import to avoid module-load circularity (errors imports
+        # nothing from agent, but agent.router is imported during
+        # graph build before errors module finishes loading).
+        from chaos_agent.errors import FailureReason
+        result["failure_reason"] = FailureReason.WALL_CLOCK_TIMEOUT.value
+    return result
 
 
 def _should_replan(state: AgentState, error_msg: str | None = None) -> bool:
@@ -40,8 +97,13 @@ def should_continue_agent_loop(state: AgentState) -> str:
     Returns:
         "continue" - more ReAct iterations needed (LLM output has tool_calls, or no skill yet)
         "extract_planning_metadata" - planning complete (LLM output is pure text + skill activated)
-        "reject" - max iterations exceeded
+        "reject" - max iterations exceeded OR wall-clock timeout reached
     """
+    # Patch C — wall-clock cap. Treat the timeout as "reject" because
+    # planning never completed; saving an incomplete plan is worse
+    # than a clean reject signal that the caller can surface.
+    if _wall_clock_exceeded(state):
+        return "reject"
     max_loop = settings.max_agent_loop
     count = state.get("agent_loop_count", 0)
 
@@ -86,9 +148,16 @@ def should_continue_execute_loop(state: AgentState) -> str:
     Returns:
         "continue" - more execution iterations needed (LLM output has tool_calls)
         "verifier" - execution complete (LLM output is pure text or blade_uid present)
-        "end" - max iterations exceeded or error
+        "end" - max iterations exceeded, error, or wall-clock timeout
         "replan" - error should be fed back to Phase 1 for re-planning
     """
+    # Patch C — wall-clock cap. End with whatever progress has been
+    # made (preserving any blade_uid the LLM did manage to land before
+    # the budget ran out). The downstream end-handler will set
+    # ``failure_reason = WALL_CLOCK_TIMEOUT`` so the result envelope
+    # is honest about why we stopped.
+    if _wall_clock_exceeded(state):
+        return "end"
     max_loop = settings.max_execute_loop
     count = state.get("execute_loop_count", 0)
 
@@ -209,7 +278,13 @@ def should_continue_verifier(state: AgentState) -> str:
     Returns:
         "continue" - more verification iterations needed (LLM has tool_calls)
         "done" - verification complete (LLM output is pure text, no tool_calls)
+                 OR wall-clock timeout reached
     """
+    # Patch C — wall-clock cap. Verifier is best-effort: stopping
+    # early with whatever evidence has accumulated is preferable to
+    # spinning Layer 2 indefinitely on an unstable cluster.
+    if _wall_clock_exceeded(state):
+        return "done"
     max_loop = settings.max_verifier_loop
     count = state.get("verifier_loop_count", 0)
 
@@ -263,8 +338,11 @@ def should_continue_recover_verifier(state: AgentState) -> str:
 
     Returns:
         "continue" - more verification iterations needed (LLM has tool_calls)
-        "done" - recovery verification complete
+        "done" - recovery verification complete OR wall-clock timeout
     """
+    # Patch C — wall-clock cap (same rationale as inject verifier).
+    if _wall_clock_exceeded(state):
+        return "done"
     max_loop = settings.max_recover_verifier_loop
     count = state.get("verifier_loop_count", 0)
 

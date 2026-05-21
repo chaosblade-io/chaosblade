@@ -40,8 +40,11 @@ import type { ServerHandle } from "./api/server-process.js";
 import { t } from "./i18n/index.js";
 import { sessionStatsRef } from "./state/sessionStats.js";
 import { StoreProvider } from "./state/store.js";
-import { isConfigSufficient, runConfigWizard } from "./utils/configGate.js";
+import { TerminalBgProvider } from "./theme/TerminalBgContext.js";
 import { printGoodbye } from "./utils/printGoodbye.js";
+import { installSynchronizedOutput } from "./utils/synchronizedOutput.js";
+import { detectTerminalBg } from "./utils/terminalBg.js";
+import { installTerminalRedrawOptimizer } from "./utils/terminalRedrawOptimizer.js";
 import { PKG_VERSION } from "./utils/version.js";
 
 async function main(): Promise<void> {
@@ -69,51 +72,13 @@ async function main(): Promise<void> {
     return;
   }
 
-  // First-run config gate. Mirrors Python TUI ``tui/app.py:169-186``:
-  // if the three required fields aren't reachable through env or
-  // config file, run the wizard inline (spawnSync, stdio inherited so
-  // it owns the terminal). After the wizard returns we re-check; only
-  // proceed when the config is now sufficient. This must run BEFORE
-  // we render Ink so the wizard panel owns the terminal cleanly.
-  if (!isConfigSufficient()) {
-    process.stdout.write(
-      "blade-ai: 检测到首次启动，缺少必填配置（llm_api_key）\n" +
-        "  正在启动配置向导…（Esc 退出，完成后自动继续）\n\n",
-    );
-    const outcome = runConfigWizard();
-    switch (outcome.kind) {
-      case "saved":
-        process.stdout.write("\n✓ 配置已保存，启动 blade-ai…\n\n");
-        break;
-      case "skipped":
-        fail(
-          "配置向导被取消。\n" +
-            "  下次启动 blade-ai 时会再次提示。\n" +
-            "  或手动配置: blade-ai config set llm_api_key <your-key>",
-        );
-        return;
-      case "still_missing":
-        fail(
-          "配置向导已退出，但 llm_api_key 仍然为空。\n" +
-            "  请重新运行 blade-ai 或手动配置: blade-ai config set llm_api_key <your-key>",
-        );
-        return;
-      case "wizard_error":
-        fail(
-          `配置向导异常退出: ${outcome.reason}\n` +
-            "  错误信息见上方输出。\n" +
-            "  可手动配置: blade-ai config set llm_api_key <your-key>",
-        );
-        return;
-      case "spawn_failed":
-        fail(
-          `无法启动配置向导: ${outcome.reason}\n` +
-            "  请确认 blade-ai Python 包已安装 (pip install blade-ai)\n" +
-            "  或手动配置: blade-ai config set llm_api_key <your-key>",
-        );
-        return;
-    }
-  }
+  // First-run config gate is now handled inside BootRunner — after
+  // the embedded Python server is up and /health responds, BootRunner
+  // checks ``GET /api/v1/wizard/needs-setup`` and, if true, renders
+  // the in-Ink ``WizardCard`` (talking to the server over HTTP) before
+  // continuing to session creation. The old pre-Ink ``runConfigWizard``
+  // helper (Python Rich subprocess) is kept for the standalone
+  // ``blade-ai config-wizard`` CLI command — see ``utils/configGate.ts``.
 
   const debug = process.env["BLADE_AI_DEBUG"] === "1";
 
@@ -134,6 +99,44 @@ async function main(): Promise<void> {
   // differ by several seconds and would otherwise leave the user
   // thinking the clock skewed.
   const capturedAt = new Date().toISOString();
+
+  // Terminal background detection — happens BEFORE the Ink render
+  // call below so stdin isn't owned yet (OSC 11 probe needs raw IO).
+  // Always resolves within ~100ms (the OSC 11 timeout); any user
+  // keystrokes that arrived during the probe are unshifted back into
+  // stdin so Ink doesn't lose them. See utils/terminalBg.ts for the
+  // detection cascade (env override → COLORFGBG → OSC 11 → fallback).
+  // The result drives <TerminalBgProvider> seeding below; consumers
+  // currently include just <UserMessage> (bubble bg/fg) but the
+  // Context shape supports adding more without further wiring.
+  const terminalBg = await detectTerminalBg();
+
+  // Two stdout monkey-patches that materially smooth out streaming
+  // output. Install BEFORE Ink's render() so every byte Ink ever
+  // writes goes through them. Restored at the END of cleanup() so
+  // every write up to that point — including the goodbye-card
+  // print — goes through the patches (they're transparent for
+  // non-eraseLine text, just defensive bookkeeping).
+  //
+  //   1. Terminal redraw optimizer: folds Ink's per-line
+  //      ``eraseLine + cursorUp`` storm into one bounded jump.
+  //      Kills "scrollback bouncing" when the user mouse-wheels
+  //      during streaming.
+  //   2. Synchronized output (DEC mode 2026): tells iTerm2 /
+  //      WezTerm / kitty to atomically commit each tick's worth
+  //      of writes. Eliminates the blank-frame flash between
+  //      eraseLines and the new lines arriving.
+  //
+  // Both no-op on a non-TTY stdout (--help piping, CI capture) or
+  // a terminal not in the supported set; both honour escape-hatch
+  // env vars (BLADE_AI_LEGACY_ERASE_LINES=1,
+  // BLADE_AI_DISABLE_SYNCHRONIZED_OUTPUT=1).
+  const restoreRedraw = process.stdout.isTTY
+    ? installTerminalRedrawOptimizer(process.stdout)
+    : () => {};
+  const restoreSync = process.stdout.isTTY
+    ? installSynchronizedOutput(process.stdout)
+    : () => {};
 
   // Step instrumentation for ``finalize`` — gated on BLADE_AI_DEBUG=1.
   // Per-fetch and per-signal bounds live inside their respective
@@ -186,6 +189,19 @@ async function main(): Promise<void> {
     // truncating mid-write.
     if (server) {
       await step("server-shutdown", server.shutdown().catch(() => undefined));
+    }
+
+    // Restore the original stdout.write so the goodbye-card writes
+    // that follow this cleanup() go through Node directly. Order
+    // matters: redraw optimizer wrapped first, sync output wrapped
+    // second — restore in reverse so the unwrapping is symmetric.
+    // Both are idempotent no-ops if their install bailed.
+    try {
+      restoreSync();
+      restoreRedraw();
+    } catch {
+      // stdout closed mid-shutdown; the patch references die with
+      // the process anyway.
     }
   };
 
@@ -260,33 +276,35 @@ async function main(): Promise<void> {
   // welcome card into <Static>.
   // ──────────────────────────────────────────────────────────────────
   inkInstance = render(
-    <StoreProvider
-      initial={{
-        bootProgress: t("boot.progress.spawning"),
-      }}
-    >
-      <BootRunner
-        version={PKG_VERSION}
-        bootCapturedAt={capturedAt}
-        debug={debug}
-        onResolved={(s, c, sid) => {
-          server = s;
-          client = c;
-          sessionId = sid;
+    <TerminalBgProvider initial={terminalBg}>
+      <StoreProvider
+        initial={{
+          bootProgress: t("boot.progress.spawning"),
         }}
-        onFailed={(msg) => {
-          // Stash the message so the post-unmount block writes it
-          // to stderr and exits 1 — we can't write to stderr here
-          // because Ink owns the terminal until unmount.
-          bootError = msg;
-          try {
-            inkInstance?.unmount();
-          } catch {
-            // already unmounted
-          }
-        }}
-      />
-    </StoreProvider>,
+      >
+        <BootRunner
+          version={PKG_VERSION}
+          bootCapturedAt={capturedAt}
+          debug={debug}
+          onResolved={(s, c, sid) => {
+            server = s;
+            client = c;
+            sessionId = sid;
+          }}
+          onFailed={(msg) => {
+            // Stash the message so the post-unmount block writes it
+            // to stderr and exits 1 — we can't write to stderr here
+            // because Ink owns the terminal until unmount.
+            bootError = msg;
+            try {
+              inkInstance?.unmount();
+            } catch {
+              // already unmounted
+            }
+          }}
+        />
+      </StoreProvider>
+    </TerminalBgProvider>,
     {
       // ``incrementalRendering`` is intentionally NOT enabled.
       // qwen-code (Ink v7) doesn't enable it either — they rely on

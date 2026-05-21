@@ -20,10 +20,14 @@ import inspect
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from langchain_core.messages import HumanMessage
 
+from chaos_agent.agent.baseline_extractors import (
+    Extractor,
+    extract_pod_top_metrics,
+)
 from chaos_agent.agent.nodes._injection_detection import _TOOL_POD_NAMESPACE, discover_tool_pods_with_nodes
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
@@ -44,12 +48,29 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BaselineCommand:
-    """A single baseline collection command specification."""
+    """A single baseline collection command specification.
+
+    ``extractors`` lets a command opt into structured-field extraction:
+    after the command's stdout is captured, each extractor parses it
+    and the resulting dict is merged into ``state["target_metadata"]``.
+    Downstream nodes (FCAT P0 size ceiling, OOMKill risk check, etc.)
+    then read those structured fields by name instead of re-issuing
+    their own kubectl call against the same data. See
+    ``chaos_agent.agent.baseline_extractors`` for the extractor contract
+    and ``extract_pod_top_metrics`` as the first concrete example.
+
+    Extractor failure is non-fatal: an extractor that raises is logged
+    at debug level and the consumer falls back to its own fresh fetch.
+    """
 
     description: str       # "Node disk usage"
     subcommand: str        # kubectl subcommand: "top", "describe", "get", "exec", "debug"
     v_args_template: str   # "node/{node_name}" or "{pod_name} -n {namespace} -- df -h"
     mode: str = "simple"   # "simple" | "debug_two_step"
+    # Optional list of structured-field extractors. Empty for free-form
+    # commands (LLM-derived baseline commands at runtime). See the
+    # ``BaselineCommand`` docstring above for the contract.
+    extractors: list[Extractor] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -80,11 +101,17 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
     ],
     # ── Target-level fallback: (scope, target) ──
     ("pod", "cpu"): [
-        BaselineCommand("Pod CPU/Memory", "top", "pod -n {namespace} {label_selector}"),
+        BaselineCommand(
+            "Pod CPU/Memory", "top", "pod -n {namespace} {label_selector}",
+            extractors=[extract_pod_top_metrics],
+        ),
         BaselineCommand("Pod conditions/restarts", "describe", "pod {pod_name} -n {namespace}"),
     ],
     ("pod", "mem"): [
-        BaselineCommand("Pod CPU/Memory", "top", "pod -n {namespace} {label_selector}"),
+        BaselineCommand(
+            "Pod CPU/Memory", "top", "pod -n {namespace} {label_selector}",
+            extractors=[extract_pod_top_metrics],
+        ),
         BaselineCommand("Pod OOM events", "describe", "pod {pod_name} -n {namespace}"),
     ],
     ("pod", "disk"): [
@@ -332,17 +359,39 @@ def _resolve_templates(
     Returns list of dicts with resolved values. Unresolvable commands
     are marked with _unresolved=True so _execute_observations can skip them.
     """
-    target_info = state.get("target") or {}
-    namespace = target_info.get("namespace", "")
-    names = target_info.get("names", [])
+    # LLM tool args occasionally arrive in unexpected shapes
+    # (string instead of dict, JSON string, comma-separated list).
+    # ``coerce_to_dict`` / ``coerce_to_list`` accept all of those and
+    # log a warning on unrecognised forms. Without this defence the
+    # ``labels.items()`` call below crashed baseline_capture with
+    # ``'str' object has no attribute 'items'`` when the LLM
+    # serialised labels as ``"app=nginx,tier=front"``.
+    from chaos_agent.utils.coerce import coerce_to_dict, coerce_to_list
+
+    target_info = coerce_to_dict(
+        state.get("target"),
+        context="baseline_capture._resolve_templates:target",
+    )
+    namespace = target_info.get("namespace", "") or ""
+    names = coerce_to_list(
+        target_info.get("names"),
+        context="baseline_capture._resolve_templates:names",
+    )
     node_name = names[0] if names else ""
     # For node-scope, names contains node names — not pod names.
     # Setting pod_name to a node name causes incorrect baseline commands
     # (e.g., kubectl exec into a "pod" that is actually a node name).
     _scope = state.get("blade_scope", "")
     pod_name = "" if _scope == "node" else (names[0] if names else "")
-    labels_dict = target_info.get("labels") or {}
-    label_selector = "-l " + ",".join(f"{k}={v}" for k, v in labels_dict.items()) if labels_dict else ""
+    labels_dict = coerce_to_dict(
+        target_info.get("labels"),
+        context="baseline_capture._resolve_templates:labels",
+    )
+    label_selector = (
+        "-l " + ",".join(f"{k}={v}" for k, v in labels_dict.items())
+        if labels_dict
+        else ""
+    )
 
     resolved = []
     for cmd in commands:
@@ -406,6 +455,13 @@ def _resolve_templates(
             "mode": mode,
             "_unresolved": unresolved,
             "_node_name": node_name,
+            # Pass extractor callables through resolution so the
+            # post-execute extraction loop can reach them. Underscore
+            # prefix marks this as an internal runtime field — the
+            # observation dicts written to ``baseline_data`` strip
+            # underscored keys, so extractors never leak onto the
+            # wire / into persisted state.
+            "_extractors": cmd.extractors,
         }
         resolved.append(entry)
 
@@ -1427,6 +1483,47 @@ def make_baseline_capture(llm=None, registry=None):
             )
             observations = await _execute_observations(resolved, kubeconfig, task_id)
 
+            # 4.5 Run per-command extractors → merge structured fields
+            # into target_metadata. This is the "free side benefit" of
+            # running baseline anyway — we parse the stdout we already
+            # captured into integers downstream nodes can consume,
+            # instead of letting them re-issue the same kubectl call.
+            # Failure of any extractor is non-fatal: log debug, skip
+            # that field, the consumer falls back to its own fetch.
+            extracted_metadata: dict = {}
+            for cmd_info, obs in zip(resolved, observations):
+                if obs.get("exit_code") != 0:
+                    continue  # don't try to parse error output
+                for extractor in cmd_info.get("_extractors") or []:
+                    try:
+                        fields = extractor(obs.get("stdout", "") or "", state)
+                    except Exception:
+                        logger.debug(
+                            "baseline extractor %s raised on %s (non-fatal)",
+                            getattr(extractor, "__name__", repr(extractor)),
+                            cmd_info.get("description", "?"),
+                            exc_info=True,
+                        )
+                        continue
+                    # Defensive: contract says extractors return a dict
+                    # (possibly empty). A buggy extractor returning the
+                    # wrong type (None / list / int) would crash the
+                    # .update() below and take baseline_capture down
+                    # with it. ``isinstance`` keeps the runner robust
+                    # against future extractor authors who break the
+                    # contract — logged debug, skipped, downstream
+                    # consumer falls back to its own fetch.
+                    if not isinstance(fields, dict):
+                        logger.debug(
+                            "baseline extractor %s returned non-dict %r "
+                            "(contract violation, ignored)",
+                            getattr(extractor, "__name__", repr(extractor)),
+                            type(fields).__name__,
+                        )
+                        continue
+                    if fields:
+                        extracted_metadata.update(fields)
+
             # 5. Assemble baseline_data
             result = {
                 "baseline_data": {
@@ -1438,6 +1535,21 @@ def make_baseline_capture(llm=None, registry=None):
                     ),
                 }
             }
+
+            # Merge extracted fields into target_metadata. ``AgentState``
+            # has no reducer for this field, so we MUST do the merge
+            # here — returning just ``extracted_metadata`` would clobber
+            # whatever direct_setup wrote earlier (e.g.
+            # ``pod_memory_limit_mb``). Empty-dict short-circuit avoids
+            # writing back an unchanged value for the common case.
+            if extracted_metadata:
+                existing_metadata = state.get("target_metadata") or {}
+                merged = {**existing_metadata, **extracted_metadata}
+                result["target_metadata"] = merged
+                logger.info(
+                    "baseline extractors produced: %s",
+                    sorted(extracted_metadata.keys()),
+                )
 
             # ── Observability: tracker complete ──
             _success = result["baseline_data"]["success_count"]

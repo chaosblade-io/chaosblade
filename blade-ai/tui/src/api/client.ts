@@ -464,27 +464,87 @@ export class BladeClient {
    * an honest savings number. ``compacted: false`` covers two cases:
    * the thread had no messages, or it was already under budget.
    */
-  async compactSession(
+  /**
+   * Stream a manual /compact run. Yields each ``StreamEvent`` as the
+   * server emits it (memory_compaction phases, result envelope, done
+   * sentinel). The caller is expected to render progress in-place
+   * — typically a spinner on ``memory_compaction phase=started`` and
+   * a final summary line on ``result``.
+   *
+   * Returns when the server emits ``done`` (or the stream closes
+   * early). Throws if the request itself fails (network / 4xx). The
+   * route's ``error`` frames flow as normal StreamEvents and the
+   * caller is responsible for surfacing them — we don't throw on
+   * them so the consumer can render a friendly message and still
+   * see the ``done`` sentinel that follows.
+   *
+   * Wire shape mirrors ``streamTurn`` exactly, so the SSE framer
+   * (parseFrame) and the StreamEvent reducer in the UI can be
+   * reused unchanged.
+   */
+  async *streamCompactSession(
     sid: string,
     threadId?: string,
-  ): Promise<Record<string, unknown>> {
+    signal?: AbortSignal,
+  ): AsyncGenerator<StreamEvent, void, void> {
     const r = await fetch(
       `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sid)}/compact`,
       {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          accept: "text/event-stream",
+          // Same rationale as streamTurn (above): close the socket
+          // after ``done`` so undici doesn't pool a freshly-finished
+          // SSE connection and hang the next request.
+          connection: "close",
+        },
         body: JSON.stringify({ thread_id: threadId ?? null }),
+        signal,
       },
     );
-    if (!r.ok) throw new Error(`compactSession failed: HTTP ${r.status}`);
-    const env = (await r.json()) as Record<string, unknown>;
-    if (env["status"] === "fail") {
-      const msg = (env["message"] as string) ?? "server error";
-      throw new Error(`compactSession: ${msg}`);
+    if (!r.ok || !r.body) {
+      throw new Error(`streamCompactSession failed: HTTP ${r.status}`);
     }
-    const data = env["data"];
-    if (data && typeof data === "object") return data as Record<string, unknown>;
-    return env;
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        buf += decoder.decode(value, { stream: true });
+
+        let sep: number;
+        while (true) {
+          const lf = buf.indexOf("\n\n");
+          const crlf = buf.indexOf("\r\n\r\n");
+          if (lf < 0 && crlf < 0) break;
+          if (lf < 0) sep = crlf;
+          else if (crlf < 0) sep = lf;
+          else sep = Math.min(lf, crlf);
+
+          const frameLen = sep;
+          const skip = buf.startsWith("\r\n", sep) ? 4 : 2;
+          const frame = buf.slice(0, frameLen);
+          buf = buf.slice(frameLen + skip);
+
+          const evt = parseFrame(frame, this.opts.onProtocolError);
+          if (evt) {
+            yield evt;
+            if (evt.type === "done") return;
+          }
+        }
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // ignore
+      }
+    }
   }
 
   /**
@@ -641,10 +701,13 @@ export class BladeClient {
    * the canonical writable list is server-side and surfaced via
    * ``getModel()``.
    *
-   * Response carries ``restart_required`` — currently always true
-   * because ``model_name`` is a cold key. A future LLM-rebuild path
-   * may flip this to false; the TS handler reads the field
-   * explicitly so the UX matches whatever the server reports.
+   * Response carries ``restart_required`` — common case is ``false``
+   * because the server rebuilds the in-process agents on write (see
+   * ``server/agent_runtime.maybe_rebuild_agents``). Flips to ``true``
+   * only on the rebuild-failure path, in which case the response
+   * also carries ``rebuild_error`` describing why. The TS handler
+   * reads the field explicitly so the "restart" tail only renders
+   * when actually needed.
    */
   async setModel(modelName: string): Promise<Record<string, unknown>> {
     const r = await fetch(`${this.baseUrl}/api/v1/model`, {

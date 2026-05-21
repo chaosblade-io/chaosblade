@@ -238,7 +238,9 @@ async def verifier(state: AgentState) -> dict:
         result_dict["failure_reason"] = enrich_failure_reason(
             base, state.get("messages", [])
         )
-    return result_dict
+    # Patch C — wall-clock cause labelling for verifier path.
+    from chaos_agent.agent.router import mark_wall_clock_timeout
+    return mark_wall_clock_timeout(state, result_dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1152,6 +1154,11 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             await _delete_debug_pod(pod_name, kubeconfig, task_id)
 
         await sync_to_store(state, result_update)
-        return result_update
+        # Patch C — wall-clock cause labelling. The router will return
+        # "done" on the next conditional-edge tick if the budget has
+        # been exceeded; stamp failure_reason here so the result is
+        # honest about why verification stopped.
+        from chaos_agent.agent.router import mark_wall_clock_timeout
+        return mark_wall_clock_timeout(state, result_update)
 
     return _verifier_with_llm

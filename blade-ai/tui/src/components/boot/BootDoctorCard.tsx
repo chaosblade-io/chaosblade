@@ -10,6 +10,7 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { t } from "../../i18n/index.js";
 import type { BootDoctorCardItem } from "../../state/types.js";
 import { Theme } from "../../theme/colors.js";
@@ -27,7 +28,7 @@ function formatTimeOfDay(iso: string): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-export const BootDoctorCard: React.FC<{ item: BootDoctorCardItem }> = ({
+const BootDoctorCardInternal: React.FC<{ item: BootDoctorCardItem }> = ({
   item,
 }) => {
   if (item.unavailable) {
@@ -70,3 +71,7 @@ export const BootDoctorCard: React.FC<{ item: BootDoctorCardItem }> = ({
     </BootCardFrame>
   );
 };
+
+// React.memo: boot doctor item is dispatched once during the boot
+// sequence and never mutated.
+export const BootDoctorCard = memo(BootDoctorCardInternal);

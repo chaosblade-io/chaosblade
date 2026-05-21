@@ -942,10 +942,18 @@ async def direct_execute(state: AgentState) -> dict:
         )
         for adj in adaptations:
             if "param_overrides" in adj.action and adj.action["param_overrides"].get("size") == "auto":
-                # Fetch current memory usage for usage-aware safety calc
-                _usage_mb = await _fetch_pod_memory_usage_mb(
-                    namespace, target_info.get("names", []), kubeconfig, task_id,
-                )
+                # Prefer the usage value baseline_capture already parsed
+                # out of its own ``kubectl top pod`` call (via
+                # ``baseline_extractors.extract_pod_top_metrics``). When
+                # present this avoids issuing the same ``kubectl top
+                # pod`` a second time. Fallback to a fresh fetch covers:
+                # baseline failed / extractor couldn't match the pod /
+                # the (pod,target) entry doesn't carry the extractor.
+                _usage_mb = (target_metadata or {}).get("pod_memory_usage_mb")
+                if _usage_mb is None:
+                    _usage_mb = await _fetch_pod_memory_usage_mb(
+                        namespace, target_info.get("names", []), kubeconfig, task_id,
+                    )
                 fcat_size_ceiling = compute_safe_burn_size(
                     target_metadata.get("pod_memory_limit_mb"),
                     pod_memory_usage_mb=_usage_mb,
@@ -1004,7 +1012,16 @@ async def direct_execute(state: AgentState) -> dict:
 
         # OOMKill risk warning: check pod memory limit before injection.
         # Prefer target_metadata (already collected by direct_setup) over re-fetching.
-        if scope == "pod":
+        # Gate by ``target == "mem"`` — the whole block compares
+        # ``params.get("size", _BURN_DEFAULT_SIZE)`` against the pod's
+        # memory limit, which only carries meaning for memory-burn
+        # faults. For cpu / network / io etc. ``size`` isn't a real
+        # param and the default-vs-limit math produces a misleading
+        # warning ("Pod memory limit too low for burn --size=..." on
+        # a CPU drill). Skipping also avoids the fallback ``kubectl
+        # ... resources.limits.memory`` call when direct_setup also
+        # skipped its prefetch for the same reason.
+        if scope == "pod" and target == "mem":
             memory_limit_mb = (target_metadata or {}).get("pod_memory_limit_mb")
             if memory_limit_mb is None:
                 # Fallback: fetch if not in target_metadata (e.g., old code path)

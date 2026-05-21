@@ -671,11 +671,12 @@ async def create_agent(
         "checkpointer": checkpointer,
         "checkpointer_conn": conn,  # aiosqlite connection for cleanup
         "session_store": session_store,
-        # Phase 3a: ``/api/v1/sessions/{sid}/compact`` reaches into the
-        # active LLM to drive the Layer-2 summary fallback in
-        # ``compact_if_needed``. Exposed on the agents dict (rather
-        # than a fresh app.state field) so existing callers stay
-        # unchanged and any future control-plane endpoint that needs
-        # the live LLM has one canonical source.
+        # Manual /compact (TUI ``commands._compact_thread`` and server
+        # ``/api/v1/sessions/{sid}/compact``) now runs the SAME
+        # PreReasoningHook the auto-trigger uses, just with force=True.
+        # Exposing the live LLM and the hook here is what lets those
+        # callers reuse the single unified compaction pipeline instead
+        # of re-implementing it.
         "llm": llm,
+        "pre_reason_hook": pre_reason_hook,
     }

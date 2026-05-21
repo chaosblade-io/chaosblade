@@ -202,6 +202,58 @@ async def safety_check(state: AgentState) -> dict:
             await sync_to_store(state, result)
             return result
 
+    # Patch D — target health pre-check. Probes the resolved target
+    # for blocker conditions (DiskPressure / Evicted / etc.) and
+    # attaches the report to state so confirmation_gate / TUI can
+    # surface it. Defaults to ``warn-only`` — even a BLOCK report does
+    # not flip safety_status unless ``settings.target_health_check_
+    # block_on_blocker = True`` is opted into. Failure is silent
+    # (kubectl issues / unknown scope → empty OK report) so a sick
+    # health check can never break the inject pipeline.
+    target_health_report: dict | None = None
+    if settings.target_health_check_enabled:
+        try:
+            from chaos_agent.agent.target_health import assess_target_health
+
+            scope = state.get("blade_scope", "") or ""
+            target_payload = state.get("target") or {}
+            kubeconfig = settings.kubeconfig_path or ""
+            health = await assess_target_health(scope, target_payload, kubeconfig)
+            target_health_report = health.to_dict()
+            logger.info(
+                "target health pre-check: scope=%s overall=%s issues=%d",
+                scope,
+                health.overall.value,
+                len(health.issues),
+            )
+            if (
+                health.is_blocking()
+                and settings.target_health_check_block_on_blocker
+            ):
+                # Hard-block path — only when operator explicitly opts in.
+                # Render a clear safety_reason so the confirm card / log
+                # explain *why* we refused even though everything else
+                # passed.
+                tracker.fail(
+                    f"Target health blocker: {health.summary()}"
+                )
+                result = {
+                    "safety_status": "rejected",
+                    "safety_reason": (
+                        f"Target health pre-check blocked the inject: "
+                        f"{health.summary()}. Set "
+                        f"BLADE_AI_TARGET_HEALTH_CHECK_BLOCK=0 to override."
+                    ),
+                    "conflict_uids": [],
+                    "target_health_report": target_health_report,
+                }
+                await sync_to_store(state, result)
+                return result
+        except Exception as exc:  # noqa: BLE001 — never fatal
+            logger.warning(
+                "target health pre-check failed (non-fatal): %s", exc
+            )
+
     tracker.complete("Safety checks passed")
     sync_node_status_to_session(state, "safety_check", "Safety checks passed",
         detail={"safety_status": "safe"})
@@ -210,5 +262,11 @@ async def safety_check(state: AgentState) -> dict:
         "safety_reason": None,
         "conflict_uids": [],
     }
+    if target_health_report is not None:
+        # Carry the report into state even when not blocking — TUI
+        # confirm card surfaces issues in WARN form (e.g. "1 active
+        # experiment, no DiskPressure but pod is Pending"). Skipping
+        # the field when no report is generated keeps state minimal.
+        result["target_health_report"] = target_health_report
     await sync_to_store(state, result)
     return result

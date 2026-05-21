@@ -753,3 +753,282 @@ class TestLLMDeriveBaselinePrompt:
         assert "Fault type: pod-cpu-fullload" in human_content
         # Should contain skill-case tag
         assert "<skill-case>" in human_content
+
+
+class TestExtractorFramework:
+    """Extractor integration: BaselineCommand.extractors must run after
+    each command completes, the resulting fields must merge into
+    target_metadata, and extractor failures must NOT break baseline
+    capture. Locked here as a regression guard — if the runner stops
+    invoking extractors, the FCAT P0 path silently goes back to issuing
+    a duplicate ``kubectl top pod``."""
+
+    def test_baseline_command_extractors_default_empty(self):
+        # Backward-compat: existing call sites that don't pass
+        # ``extractors=`` must still produce a valid BaselineCommand
+        # with no extractors attached.
+        cmd = BaselineCommand("desc", "top", "node {node_name}")
+        assert cmd.extractors == []
+
+    def test_baseline_command_extractors_round_trip(self):
+        def _noop(_stdout, _state):
+            return {}
+        cmd = BaselineCommand(
+            "desc", "top", "node {node_name}", extractors=[_noop],
+        )
+        assert cmd.extractors == [_noop]
+
+    def test_resolve_templates_preserves_extractors(self):
+        # Regression: if _resolve_templates drops the extractors
+        # field, the runner can't reach them after execution.
+        def _extr(_s, _st):
+            return {"k": "v"}
+        state = {
+            "target": {"namespace": "ns", "names": ["p"], "labels": {}},
+        }
+        cmds = [
+            BaselineCommand(
+                "Pod top", "top", "pod {pod_name} -n {namespace}",
+                extractors=[_extr],
+            ),
+        ]
+        resolved = _resolve_templates(cmds, state)
+        assert resolved[0]["_extractors"] == [_extr]
+
+    def test_pod_cpu_and_mem_commands_carry_extractor(self):
+        # Lock down that the production registry has the extractor
+        # wired up. If someone deletes it, the next ``pod cpu`` /
+        # ``pod mem`` drill silently goes back to two ``kubectl top``
+        # roundtrips (one in baseline, one in direct_execute).
+        from chaos_agent.agent.baseline_extractors import extract_pod_top_metrics
+
+        for key in (("pod", "cpu"), ("pod", "mem")):
+            cmds = BASELINE_COMMANDS[key]
+            top_cmd = next(c for c in cmds if c.subcommand == "top")
+            assert extract_pod_top_metrics in top_cmd.extractors
+
+    @pytest.mark.asyncio
+    async def test_extractors_run_and_merge_into_target_metadata(self):
+        # End-to-end: build a baseline_capture node, mock the kubectl
+        # execution to return a known ``top pod`` table, verify the
+        # extractor parses it and the parsed fields land in the
+        # returned state update's ``target_metadata``.
+        from chaos_agent.agent.baseline_extractors import extract_pod_top_metrics
+
+        fake_top_output = (
+            "NAME                              CPU(cores)   MEMORY(bytes)\n"
+            "target-pod-xyz                    50m          120Mi\n"
+        )
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            # Return one observation per command. The first matches
+            # the ``top`` baseline command and carries the table we
+            # want the extractor to parse.
+            results = []
+            for cmd in commands:
+                if cmd.get("subcommand") == "top":
+                    results.append({
+                        "description": cmd["description"],
+                        "command": "kubectl top pod ...",
+                        "exit_code": 0,
+                        "stdout": fake_top_output,
+                        "stderr": "",
+                    })
+                else:
+                    results.append({
+                        "description": cmd["description"],
+                        "command": "kubectl describe pod ...",
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                    })
+            return results
+
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "blade_scope": "pod",
+            "blade_target": "mem",
+            "blade_action": "burn",
+            "kubeconfig": "/path/to/kube",
+            "target": {
+                "namespace": "ns",
+                "names": ["target-pod-xyz"],
+                "labels": {"app": "demo"},
+            },
+            # direct_setup ran first → existing metadata must be
+            # PRESERVED across the extractor merge.
+            "target_metadata": {"pod_memory_limit_mb": 240},
+            "task_id": "t-extractor",
+            "skill_case_content": "",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            new=fake_exec,
+        ):
+            result = await node(state)
+
+        md = result.get("target_metadata") or {}
+        # Pre-existing field preserved (merge, not replace)
+        assert md.get("pod_memory_limit_mb") == 240
+        # Newly extracted fields present
+        assert md.get("pod_memory_usage_mb") == 120
+        assert md.get("pod_cpu_usage_mc") == 50
+
+    @pytest.mark.asyncio
+    async def test_extractor_exception_does_not_break_baseline(self):
+        # An extractor raising must be logged debug and skipped;
+        # baseline must still complete and return observations.
+        def _boom(_stdout, _state):
+            raise RuntimeError("parser broke")
+
+        # Inject a custom command list via a stub strategy. Easier
+        # than patching BASELINE_COMMANDS in place because we need
+        # the runtime to use OUR command (with the booming extractor).
+        async def fake_exec(commands, kubeconfig, task_id):
+            return [
+                {
+                    "description": commands[0]["description"],
+                    "command": "x",
+                    "exit_code": 0,
+                    "stdout": "anything",
+                    "stderr": "",
+                }
+            ]
+
+        # Replace _lookup_baseline_commands so the registry path
+        # returns our crafted command with the booming extractor.
+        crafted = [
+            BaselineCommand(
+                "boom test", "top", "pod {pod_name} -n {namespace}",
+                extractors=[_boom],
+            ),
+        ]
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "blade_scope": "pod",
+            "blade_target": "mem",
+            "blade_action": "burn",
+            "kubeconfig": "/k",
+            "target": {"namespace": "ns", "names": ["p"], "labels": {}},
+            "task_id": "t-boom",
+            "skill_case_content": "",
+        }
+        with (
+            patch(
+                "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+                return_value=crafted,
+            ),
+            patch(
+                "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+                new=fake_exec,
+            ),
+        ):
+            result = await node(state)
+
+        # baseline_data still produced, no exception bubbled up
+        assert "baseline_data" in result
+        assert result["baseline_data"]["success_count"] == 1
+        # No target_metadata field updates from the failed extractor
+        assert "target_metadata" not in result or "pod_memory_usage_mb" not in (
+            result.get("target_metadata") or {}
+        )
+
+    @pytest.mark.asyncio
+    async def test_extractor_skipped_when_command_failed(self):
+        # Regression: extractor must NOT run on commands with
+        # exit_code != 0. Their stdout is empty/garbage and parsing
+        # it would either produce nonsense (silent corruption) or
+        # raise (logged debug but still wasteful).
+        extractor_called = {"n": 0}
+
+        def _spy(stdout, state):
+            extractor_called["n"] += 1
+            return {"spy_called": True}
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            return [
+                {
+                    "description": commands[0]["description"],
+                    "command": "x",
+                    "exit_code": 1,  # FAILURE — extractor must not see this
+                    "stdout": "",
+                    "stderr": "kubectl error",
+                }
+            ]
+
+        crafted = [
+            BaselineCommand(
+                "spy cmd", "top", "pod {pod_name} -n {namespace}",
+                extractors=[_spy],
+            ),
+        ]
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "blade_scope": "pod", "blade_target": "mem", "blade_action": "burn",
+            "kubeconfig": "/k",
+            "target": {"namespace": "ns", "names": ["p"], "labels": {}},
+            "task_id": "t-skip",
+            "skill_case_content": "",
+        }
+        with (
+            patch(
+                "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+                return_value=crafted,
+            ),
+            patch(
+                "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+                new=fake_exec,
+            ),
+        ):
+            await node(state)
+        assert extractor_called["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_extractor_returning_non_dict_does_not_crash(self):
+        # Contract says extractors return dict. A buggy author
+        # returning a list / None / int must NOT take down the
+        # whole baseline pipeline.
+        def _bad_contract(stdout, state):
+            return ["not", "a", "dict"]
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            return [
+                {
+                    "description": commands[0]["description"],
+                    "command": "x",
+                    "exit_code": 0,
+                    "stdout": "ok",
+                    "stderr": "",
+                }
+            ]
+
+        crafted = [
+            BaselineCommand(
+                "bad contract cmd", "top", "pod {pod_name} -n {namespace}",
+                extractors=[_bad_contract],
+            ),
+        ]
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "blade_scope": "pod", "blade_target": "mem", "blade_action": "burn",
+            "kubeconfig": "/k",
+            "target": {"namespace": "ns", "names": ["p"], "labels": {}},
+            "task_id": "t-bad-contract",
+            "skill_case_content": "",
+        }
+        with (
+            patch(
+                "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+                return_value=crafted,
+            ),
+            patch(
+                "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+                new=fake_exec,
+            ),
+        ):
+            result = await node(state)
+        # Must complete without crash, with no contamination of
+        # target_metadata from the non-dict return.
+        assert "baseline_data" in result
+        md = result.get("target_metadata") or {}
+        assert "not" not in md and 0 not in md

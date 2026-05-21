@@ -890,6 +890,26 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     "action_taken": "(pending Phase 1 analysis)",
                 })
                 result["replan_history"] = history
+                # Patch E — graph-level replan is a clear attempt boundary.
+                # Begin a new pipeline attempt so the TUI / TaskStore
+                # show "attempt #N · graph_replan: <error_summary>"
+                # rather than the user perceiving silent retry. The
+                # ``target`` is the same one Phase 1 will revisit;
+                # whether Phase 1 picks a different target is recorded
+                # as a refinement of the same attempt (no new
+                # begin_attempt) — until LLM-internal target-switch
+                # detection lands as follow-up work.
+                from chaos_agent.agent.attempt_tracker import (
+                    REASON_GRAPH_REPLAN,
+                    begin_attempt,
+                )
+                attempt_delta = begin_attempt(
+                    {**state, **result},
+                    target=state.get("target"),
+                    reason=REASON_GRAPH_REPLAN,
+                    notes=replan_context.get("error_summary", "")[:200],
+                )
+                result.update(attempt_delta)
             else:
                 # Replan exhausted — convert the [REPLAN] request into
                 # a terminal failure so the router takes "end" via the
@@ -924,6 +944,11 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
 
         tracker.complete(f"Execute loop iteration {count} done")
         await sync_to_store(state, result)
-        return result
+        # Patch C — wall-clock cause labelling. If the router is about
+        # to terminate this loop due to ``settings.max_inject_seconds``,
+        # stamp ``failure_reason = WALL_CLOCK_TIMEOUT`` so the result
+        # envelope is honest. Only fires when budget > 0 and started.
+        from chaos_agent.agent.router import mark_wall_clock_timeout
+        return mark_wall_clock_timeout(state, result)
 
     return _execute_loop_with_llm

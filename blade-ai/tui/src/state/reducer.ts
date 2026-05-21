@@ -8,6 +8,8 @@
  * Static only ever sees a stable suffix grow.
  */
 
+import { findLastSafeSplitPoint } from "../utils/markdownSplit.js";
+import { perfMark } from "../utils/perfTrace.js";
 import { parseResultEnvelope } from "../utils/result.js";
 import {
   INJECT_PHASE_ORDER,
@@ -493,6 +495,29 @@ export type Action =
       layer: string;
       errorMessage: string;
     }
+  /**
+   * PreReasoningHook snapshot of post-hook state size. Fires after
+   * EVERY reasoning step regardless of whether compaction ran, so
+   * the Footer indicator stays live during the whole turn. Persists
+   * across turns — NOT reset on TURN_STARTED.
+   */
+  | {
+      type: "CONTEXT_SIZE_RECEIVED";
+      currentTokens: number;
+      triggerTokens: number;
+      maxTokens: number;
+      messagesCount: number;
+    }
+  /**
+   * Manual ``/compact`` lifecycle. Fired by the slash handler
+   * around its ``streamCompactSession`` call. Drives the
+   * ManualCompactIndicator spinner (uniform UX whether the actual
+   * compaction is noop / strip-only / LLM-driven). ``STARTED``
+   * records the wall-clock for the elapsed-seconds tail; ``DONE``
+   * clears the slot so the spinner unmounts.
+   */
+  | { type: "COMPACT_MANUAL_STARTED" }
+  | { type: "COMPACT_MANUAL_DONE" }
   | { type: "TURN_DONE" }
   | { type: "TURN_ABORTED"; reason: string }
   | { type: "MODE_TOGGLED"; mode: AppState["config"]["permissionMode"] }
@@ -591,7 +616,17 @@ export type Action =
    * cards / completed tool groups land in scrollback rather than
    * getting wiped by the next TURN_STARTED's ``pending: []`` clear.
    */
-  | { type: "TURN_TRANSITION" };
+  | { type: "TURN_TRANSITION" }
+  /**
+   * Phrase cycler heartbeat. Composer dispatches this every ~8s
+   * while ``streamState === "responding"`` (and no memory compaction
+   * is in flight) to rotate the LoadingIndicator's fallback header
+   * label. The dispatcher pre-bakes the new phrase into the action
+   * payload so the reducer stays pure (no ``Math.random`` inside the
+   * reducer). Idempotent: if ``phrase === state.idlePhrase`` the
+   * reducer returns the same state, avoiding a no-op re-render.
+   */
+  | { type: "PHRASE_TICK"; phrase: string };
 
 const PREVIEW_MAX = 80;
 const SUBJECT_MAX = 80;
@@ -693,6 +728,20 @@ export function reducer(state: AppState, action: Action): AppState {
 
     // ---------------------------------------------------------------
     case "TOKEN_APPENDED": {
+      // Perf trace #3: measure the whole reducer case body. The
+      // span captures commitThinking + flushLeadingStable + the
+      // split decision + the resulting state rebuild. Reading the
+      // log: ``dur`` per dispatch is the JS-side reducer cost; the
+      // gap between consecutive ``ts`` values is the inter-dispatch
+      // wall clock (i.e. how long Ink + React + stdout take between
+      // batched TOKEN_APPENDED events).
+      const __perfStart = performance.now();
+      const __perfMark = (extra: Record<string, unknown>): void => {
+        perfMark("reducer.TOKEN_APPENDED", {
+          dur: performance.now() - __perfStart,
+          ...extra,
+        });
+      };
       // First agent text after a thinking session means thinking is
       // over for this segment — collapse the buffer into a
       // ThinkingItem before we touch any other pending. The new item
@@ -706,29 +755,149 @@ export function reducer(state: AppState, action: Action): AppState {
       // moment its group becomes terminal, instead of waiting for the
       // next TOKEN to arrive.
       state = flushLeadingStable(state);
-      const history = state.history;
-      const pending = state.pending;
 
-      const next = [...pending];
-      const tail = next[next.length - 1];
+      // Decide the trailing agent item's incoming text. If pending
+      // already ends with an agent item we append into it; otherwise
+      // we start a fresh agent item with ``action.content``. The
+      // continuation flag is inherited from the existing tail so a
+      // mid-stream split that produced a body-only tail keeps its
+      // glyph-less rendering on subsequent token appends.
+      const tail = state.pending[state.pending.length - 1];
+      const existingIsAgent = tail && tail.kind === "agent";
+      const newText = existingIsAgent
+        ? (tail as AgentItem).text + action.content
+        : action.content;
+      const inheritedContinuation =
+        existingIsAgent ? (tail as AgentItem).continuation === true : false;
+
+      // Phase 2.3 — try to carve off a head fragment at a markdown-
+      // safe boundary (paragraph break, never inside a fenced code
+      // block) and commit it straight to history. Once committed it
+      // lives in ``<Static>`` and never re-renders again, regardless
+      // of how long the streaming reply ultimately grows. Without
+      // this, the dynamic frame would have to re-paint the entire
+      // accumulated reply on every TOKEN_APPENDED — even with the
+      // AgentMessage 8-row visual cap, the React reconcile cost on
+      // the full string scales with reply size.
+      //
+      // The split fires only when EVERY condition below holds:
+      //   1. We are EXTENDING an existing agent tail (``existingIsAgent
+      //      === true``). Without an existing agent in pending there is
+      //      nothing to split out yet — the very first chunk of a fresh
+      //      agent reply must land in pending whole.
+      //   2. ``state.pending.length === 1`` — the agent tail is the
+      //      ONLY item in pending. This is the chronology guard.
+      //      flushLeadingStable only flushes items that are *stable*;
+      //      a still-running tool_group OR an unresolved confirm
+      //      prompt sitting BEFORE the agent tail stays in pending,
+      //      and committing the head fragment to history NOW would
+      //      reorder it ahead of those items (Static is append-only,
+      //      so head would land in history while toolGroup is still
+      //      in pending — when TOOL_ENDED eventually flushes the
+      //      group, the timeline ends up as ``[head, toolGroup,
+      //      tailItem]`` which is BACKWARDS from the chronological
+      //      ``[toolGroup, head, tailItem]`` the user expects).
+      //      Wait until the blocking item resolves and flushes,
+      //      leaving the agent alone in pending; the split fires on
+      //      the next token after that.
+      //   3. ``splitPoint`` is strictly inside the text — splitPoint
+      //      === content.length means "no safe boundary found yet".
+      //   4. ``splitPoint > 0`` — splitPoint === 0 means the whole
+      //      remaining content is inside a code block that started
+      //      at offset 0; committing an empty head fragment is
+      //      pointless.
+      //   5. The remaining tail has at least one character — a split
+      //      that consumes 100% of the text would commit the lot to
+      //      history and leave an empty pending agent stub, which is
+      //      both wasteful and would confuse the next TOKEN_APPENDED
+      //      into thinking it should be a continuation.
+      //
+      // When a split fires, the head fragment reuses the existing
+      // tail's id (preserves React keys → no remount of the head row
+      // when it moves from pending to history) with the SAME
+      // ``continuation`` value as the existing tail (so the very
+      // first head keeps its ⏺ glyph and subsequent splits don't add
+      // new ones), and a new pending agent item carries the body-only
+      // tail with ``continuation: true`` so AgentMessage renders it
+      // without the leading ⏺ glyph (paragraph spacing is preserved
+      // by AgentMessage's marginTop=1 on every fragment).
+      const pendingIsAgentOnly =
+        existingIsAgent && state.pending.length === 1;
+      const splitPoint = pendingIsAgentOnly
+        ? findLastSafeSplitPoint(newText)
+        : newText.length;
+      const canSplit =
+        pendingIsAgentOnly &&
+        splitPoint > 0 &&
+        splitPoint < newText.length &&
+        newText.length - splitPoint > 0;
+
       let counter = state.nextItemId;
-      if (tail && tail.kind === "agent") {
-        // Mutate the trailing agent item's text. We replace the
-        // object reference so React/Ink re-renders correctly.
-        const updated: AgentItem = { ...tail, text: tail.text + action.content };
+
+      if (canSplit) {
+        const headText = newText.slice(0, splitPoint);
+        const tailText = newText.slice(splitPoint);
+        const headItem: AgentItem = {
+          kind: "agent",
+          id: (tail as AgentItem).id,
+          text: headText,
+          continuation: inheritedContinuation,
+        };
+        // Tail fragment: ALWAYS gets a fresh id (it's a new pending
+        // item) and is marked as a continuation so AgentMessage drops
+        // the leading ⏺ glyph. ``marginTop`` is preserved on the
+        // continuation so the paragraph spacing matches the un-split
+        // layout (each continuation starts a new paragraph by
+        // construction — the split always lands right after ``\n\n``).
+        const allocatedTail = nextId({ ...state, nextItemId: counter }, "a");
+        counter = allocatedTail.counter;
+        const tailItem: AgentItem = {
+          kind: "agent",
+          id: allocatedTail.id,
+          text: tailText,
+          continuation: true,
+        };
+        const nextPending = [...state.pending.slice(0, -1), tailItem];
+        const result = {
+          ...state,
+          history: [...state.history, headItem],
+          pending: nextPending,
+          isReceiving: true,
+          nextItemId: counter,
+        };
+        __perfMark({
+          split: true,
+          newTextLen: newText.length,
+          headLen: headText.length,
+          tailLen: tailText.length,
+          historyLen: result.history.length,
+        });
+        return result;
+      }
+
+      // No split this round — append in place exactly like the
+      // pre-2.3 path.
+      const next = [...state.pending];
+      if (existingIsAgent) {
+        const updated: AgentItem = { ...(tail as AgentItem), text: newText };
         next[next.length - 1] = updated;
       } else {
         const allocated = nextId(state, "a");
         counter = allocated.counter;
-        next.push({ kind: "agent", id: allocated.id, text: action.content });
+        next.push({ kind: "agent", id: allocated.id, text: newText });
       }
-      return {
+      const result = {
         ...state,
-        history,
         pending: next,
         isReceiving: true,
         nextItemId: counter,
       };
+      __perfMark({
+        split: false,
+        newTextLen: newText.length,
+        pendingLen: next.length,
+      });
+      return result;
     }
 
     // ---------------------------------------------------------------
@@ -801,6 +970,61 @@ export function reducer(state: AppState, action: Action): AppState {
         ...state,
         turnInputTokens: state.turnInputTokens + inAdd,
         turnOutputTokens: state.turnOutputTokens + outAdd,
+      };
+    }
+
+    // ---------------------------------------------------------------
+    case "CONTEXT_SIZE_RECEIVED": {
+      // Snapshot replace, not accumulate — each event carries the
+      // latest measurement and supersedes the previous one. Persists
+      // across turns (NOT reset on TURN_STARTED) so the Footer
+      // always reflects the most recent measurement, even between
+      // turns when no LLM is actively running.
+      //
+      // Defensive zero short-circuit: if all four fields are 0 we
+      // skip the update so a protocol glitch can't wipe the Footer's
+      // existing numbers. A real hook call always produces at least
+      // ``max_tokens > 0``, so all-zero indicates a wire issue.
+      //
+      // Also auto-clears ``contextError`` — a successful snapshot
+      // is the signal that the pipeline recovered, so the Footer
+      // can switch its tail back from "(error)" to the live "(N.N%)".
+      const cur = Math.max(0, Number(action.currentTokens) || 0);
+      const trig = Math.max(0, Number(action.triggerTokens) || 0);
+      const max = Math.max(0, Number(action.maxTokens) || 0);
+      const cnt = Math.max(0, Number(action.messagesCount) || 0);
+      if (cur === 0 && trig === 0 && max === 0 && cnt === 0) return state;
+      return {
+        ...state,
+        contextCurrentTokens: cur,
+        contextTriggerTokens: trig,
+        contextMaxTokens: max,
+        contextMessagesCount: cnt,
+        contextError: false,
+      };
+    }
+
+    // ---------------------------------------------------------------
+    case "COMPACT_MANUAL_STARTED": {
+      // Open the slot the ManualCompactIndicator subscribes to.
+      // Idempotent: if a previous /compact never closed (e.g. the
+      // handler's finally was skipped by an unhandled exception),
+      // we overwrite the slot with a fresh startedAt so the elapsed
+      // tail doesn't show stale seconds.
+      return {
+        ...state,
+        currentManualCompact: { startedAt: Date.now() },
+      };
+    }
+
+    // ---------------------------------------------------------------
+    case "COMPACT_MANUAL_DONE": {
+      // Close the slot — indicator unmounts. Always safe to dispatch
+      // unconditionally (no-op if slot was already null).
+      if (state.currentManualCompact === null) return state;
+      return {
+        ...state,
+        currentManualCompact: null,
       };
     }
 
@@ -1096,11 +1320,30 @@ export function reducer(state: AppState, action: Action): AppState {
       //      (``flushLeadingStable``) so the upcoming context card
       //      lands AFTER the in-flight Phase-1 leftovers in scrollback,
       //      preserving chronological order.
-      //   2. Append a ``confirm_context`` item directly to history.
+      //   2. FORCE-flush whatever ``flushLeadingStable`` left behind.
+      //      The rule "agent stable iff !isTail" treats a trailing
+      //      agent as "might still receive tokens", but the server
+      //      contract guarantees no further tokens arrive for this
+      //      LLM call once ``confirm`` is emitted — so the tail
+      //      agent is in fact terminal. Two reasons to force it:
+      //        (a) chronological order — agent spoke BEFORE confirm,
+      //            so it must appear ABOVE context in scrollback.
+      //            Without the force, context is pushed past a still-
+      //            pending agent, then at TURN_DONE agent commits
+      //            AFTER context — reversing the natural order users
+      //            expect to read.
+      //        (b) dyn-frame shrink — leaving agent in pending bloats
+      //            the dyn frame during the waiting_confirmation
+      //            window (every re-render writes pending+controls).
+      //            Pushing agent out leaves dyn = [prompt] + controls,
+      //            ~10 rows lighter, which reduces the chance of
+      //            re-renders pushing past viewport bottom and
+      //            triggering Ink cursor desync.
+      //   3. Append a ``confirm_context`` item directly to history.
       //      Burns into Static scrollback ONCE — the heavy plan
       //      summary / safety warning never re-paints, so the dynamic
       //      frame doesn't grow with confirm content.
-      //   3. Push a ``confirm_prompt`` item to the *now-flushed*
+      //   4. Push a ``confirm_prompt`` item to the *now-empty*
       //      pending. This is the live select widget (~6–8 rows max).
       //
       // Future ``CONFIRM_USER_DECIDED`` / ``CONFIRM_RESOLVED``
@@ -1119,11 +1362,48 @@ export function reducer(state: AppState, action: Action): AppState {
       // entire turn — which was the verified root cause of the
       // dynamic-frame overflow + scrollback pollution behaviour.
       const sanitized = sanitizeStuckTools(state.pending);
-      const flushed = flushLeadingStable(
-        sanitized === state.pending ? state : { ...state, pending: sanitized },
-      );
-      const { id: ctxId, counter: counterAfterCtx } = nextId(flushed, "c-ctx");
-      const taskId = action.taskId ?? flushed.taskId ?? "";
+      let s = sanitized === state.pending ? state : { ...state, pending: sanitized };
+      // Defensive: close any open thinking session BEFORE the flush
+      // so the ``▸ Thought for Ns`` row lands in chronological
+      // position (above the agent / above the context). In practice
+      // TOKEN_APPENDED already commits thinking when agent tokens
+      // start streaming, so by the time confirm arrives the buffer
+      // is usually empty — this guard catches the rare path where
+      // the agent transitions thinking → confirm with no token
+      // emission in between.
+      s = commitThinking(s);
+      s = flushLeadingStable(s);
+      // Force-flush whatever ``flushLeadingStable`` couldn't move
+      // (the tail-agent case described above). Exception: an
+      // UNRESOLVED ``confirm_prompt`` from a still-open prior layer
+      // (e.g. Layer-1 intent_confirm hasn't been resolved when
+      // Layer-2 confirmation_gate fires — a rare protocol race) must
+      // stay in pending because it's still the live UI the user
+      // interacts with. Flushing it to Static would commit a
+      // mid-decision widget into scrollback as "unresolved forever".
+      // Everything ELSE in pending (agent / tool_group / thinking /
+      // resolved confirm_prompt) is terminal by the time confirm
+      // arrives, so it flushes cleanly.
+      if (s.pending.length > 0) {
+        const toFlush: HistoryItem[] = [];
+        const toKeep: HistoryItem[] = [];
+        for (const item of s.pending) {
+          if (item.kind === "confirm_prompt" && !item.resolved) {
+            toKeep.push(item);
+          } else {
+            toFlush.push(item);
+          }
+        }
+        if (toFlush.length > 0) {
+          s = {
+            ...s,
+            history: [...s.history, ...toFlush],
+            pending: toKeep,
+          };
+        }
+      }
+      const { id: ctxId, counter: counterAfterCtx } = nextId(s, "c-ctx");
+      const taskId = action.taskId ?? s.taskId ?? "";
       const context: ConfirmContextItem = {
         kind: "confirm_context",
         id: ctxId,
@@ -1145,11 +1425,16 @@ export function reducer(state: AppState, action: Action): AppState {
         payload: action.payload,
       };
       return {
-        ...flushed,
-        history: [...flushed.history, context],
-        pending: [...flushed.pending, prompt],
+        ...s,
+        history: [...s.history, context],
+        // ``s.pending`` is normally empty after the force-flush; the
+        // only carry-over is an UNRESOLVED confirm_prompt from a
+        // prior layer (preserved by the toKeep branch above). Append
+        // the new prompt rather than overwriting so the prior
+        // prompt — if any — stays live.
+        pending: [...s.pending, prompt],
         streamState: "waiting_confirmation",
-        taskId: action.taskId ?? flushed.taskId,
+        taskId: action.taskId ?? s.taskId,
         nextItemId: counterAfterCtx + 1,
       };
     }
@@ -1188,52 +1473,70 @@ export function reducer(state: AppState, action: Action): AppState {
 
     // ---------------------------------------------------------------
     case "RESULT_RECEIVED": {
-      const { id, counter } = nextId(state, "r");
+      // Force-commit all pending → history BEFORE the result item
+      // lands, then push the result directly to history (NOT pending).
+      //
+      // Why: result is the turn's terminal outcome. By the time it
+      // arrives, any agent message in pending has finished streaming
+      // and any tool group has terminated. Leaving result + agent +
+      // (turn_usage + stepper) to all commit at once on TURN_DONE
+      // produces a single +11..15 row dyn-frame jump that the user
+      // sees as a flicker burst right before the cursor returns to
+      // idle. Splitting the commit into "result lands now, stepper +
+      // usage land at TURN_DONE" makes the visual transition feel
+      // smoother — each Static append is small and incremental.
+      //
+      // We DON'T call ``commitPending`` here because that helper
+      // also resets ``streamState`` to "idle" + clears thought state
+      // + finalises the phase stepper. The turn isn't over yet
+      // (TURN_DONE may still come behind a final agent reply), so
+      // those resets would prematurely tear down the live spinner
+      // and stepper. Instead we do a minimal manual flush: commit
+      // any in-flight thinking session, dump pending to history,
+      // append result, leave streamState / stepper untouched.
+      let s = commitThinking(state);
+      const { id, counter } = nextId(s, "r");
       const parsed = parseResultEnvelope(
         action.content,
-        action.taskId ?? state.taskId ?? "",
+        action.taskId ?? s.taskId ?? "",
       );
       // Locator: every ResultItem gets a per-session ``E<N>`` token
       // so ``/show E1`` / ``/copy E1`` / ``/rerun E1`` can resolve
       // it. ``userInput`` is captured from ``state.lastTurnInput`` —
       // the NL prompt that started this turn — so ``/rerun`` can
-      // surface the original description for paste-and-edit. The
-      // user-input snapshot is taken HERE because TURN_STARTED
-      // already wrote ``lastTurnInput`` and downstream actions don't
-      // change it within the same turn.
-      const locator = `E${state.locators.nextExperimentN}`;
+      // surface the original description for paste-and-edit.
+      const locator = `E${s.locators.nextExperimentN}`;
       const result: ResultItem = {
         kind: "result",
         id,
         ...parsed,
         locator,
-        userInput: state.lastTurnInput || undefined,
+        userInput: s.lastTurnInput || undefined,
       };
-      // Goodbye stats: ``parseResultEnvelope`` already maps
-      // ``data.task_state`` (failed / partial_recovered / injected /
-      // recovered / chat-completed) onto a normalized status. A
-      // ``failed`` status flips the per-turn fail flag; the
-      // ``currentTurnIsInjection`` gate (set elsewhere) decides whether
-      // counters actually move on TURN_DONE.
+      // Goodbye stats: ``parseResultEnvelope`` maps ``data.task_state``
+      // onto a normalized status. ``failed`` flips the per-turn flag;
+      // the ``currentTurnIsInjection`` gate decides whether counters
+      // actually move on TURN_DONE.
       const failedState = parsed.status === "failed";
       // Capture the task id of the experiment that just completed so
       // ``/recover latest`` and ``/review`` (no arg) can reach it
-      // without re-querying listTasks. Mirror of Python TUI's
-      // ``conversation.last_task_id``. Only update when the result
-      // actually carries a non-empty taskId — empty-string results
-      // (chat-only completions) shouldn't shadow a real prior id.
+      // without re-querying listTasks. Only update when non-empty.
       const resolvedTaskId = action.taskId || parsed.taskId || "";
       return {
-        ...state,
-        pending: [...state.pending, result],
-        taskId: action.taskId ?? state.taskId,
-        lastTaskId: resolvedTaskId || state.lastTaskId,
+        ...s,
+        // pending → history first, then result. Order matters: the
+        // result must appear AFTER the agent message / tool groups
+        // that produced it.
+        history: [...s.history, ...s.pending, result],
+        pending: [],
+        taskId: action.taskId ?? s.taskId,
+        lastTaskId: resolvedTaskId || s.lastTaskId,
         nextItemId: counter,
-        currentTurnFailed: state.currentTurnFailed || failedState,
+        currentTurnFailed: s.currentTurnFailed || failedState,
         locators: {
-          ...state.locators,
-          byId: { ...state.locators.byId, [locator]: result },
-          nextExperimentN: state.locators.nextExperimentN + 1,
+          ...s.locators,
+          byId: { ...s.locators.byId, [locator]: result },
+          nextExperimentN: s.locators.nextExperimentN + 1,
         },
       };
     }
@@ -1252,11 +1555,17 @@ export function reducer(state: AppState, action: Action): AppState {
       // set by the runner — see ``app.py:356``. Flags this turn as
       // failed; whether it counts in the inject bucket depends on
       // ``currentTurnIsInjection`` at TURN_DONE.
+      //
+      // Also flips ``contextError`` so the Footer signals "the
+      // displayed numbers may be stale" — the percent tail switches
+      // to the literal "(error)" until a fresh ``CONTEXT_SIZE_RECEIVED``
+      // clears it (auto-recovery on next successful turn).
       return {
         ...state,
         pending: [...state.pending, err],
         nextItemId: counter,
         currentTurnFailed: true,
+        contextError: true,
       };
     }
 
@@ -1530,6 +1839,15 @@ export function reducer(state: AppState, action: Action): AppState {
       };
     }
 
+    // ---------------------------------------------------------------
+    case "PHRASE_TICK": {
+      // Idempotent guard — same phrase as last tick is a no-op so
+      // we don't burn a re-render rotating the LoadingIndicator
+      // through identical bytes.
+      if (action.phrase === state.idlePhrase) return state;
+      return { ...state, idlePhrase: action.phrase };
+    }
+
     default: {
       // Exhaustive check.
       const _never: never = action;
@@ -1545,6 +1863,15 @@ function commitPending(
   state: AppState,
   options: { failed?: boolean } = {},
 ): AppState {
+  // Perf trace #4: wrap the whole commit. The "stutter at stream
+  // end" complaint points here — TURN_DONE → commitPending → one-
+  // shot Static append of every leftover pending item. Reading the
+  // log: ``dur`` is the JS work; the visible stutter is usually
+  // Ink/stdout post-processing of the result state (which we can't
+  // trace from inside the reducer). Payload reports input/output
+  // sizes so we can correlate cost with pending depth.
+  const __perfStart = performance.now();
+  const __pendingBefore = state.pending.length;
   // Close any in-flight thinking session before deciding the early
   // bail. ``commitThinking`` is idempotent so this is free when no
   // session is active. We must run it even on the trivial-pending
@@ -1621,6 +1948,11 @@ function commitPending(
     !hasStepper &&
     !hasUsage
   ) {
+    perfMark("commitPending", {
+      dur: performance.now() - __perfStart,
+      pendingBefore: __pendingBefore,
+      path: "early-bail",
+    });
     return state;
   }
 
@@ -1658,11 +1990,11 @@ function commitPending(
       currentPhaseStepper: null,
     };
   }
-  return {
+  const result = {
     ...state,
     history: [...state.history, ...state.pending],
     pending: [],
-    streamState: "idle",
+    streamState: "idle" as const,
     thoughtSubject: "",
     thoughtBuffer: "",
     thoughtStartedAt: 0,
@@ -1676,6 +2008,16 @@ function commitPending(
     // affects the live spinner, not scrollback.
     currentCompaction: null,
   };
+  perfMark("commitPending", {
+    dur: performance.now() - __perfStart,
+    pendingBefore: __pendingBefore,
+    pendingAtCommit: state.pending.length,
+    historyAfter: result.history.length,
+    hasStepper,
+    hasUsage,
+    failed,
+  });
+  return result;
 }
 
 /**

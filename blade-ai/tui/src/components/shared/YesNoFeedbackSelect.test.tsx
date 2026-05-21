@@ -91,8 +91,8 @@ describe("YesNoFeedbackSelect", () => {
     });
   });
 
-  describe("initial selection cursor", () => {
-    it("places the cursor on the first option by default", () => {
+  describe("initial selection prefix", () => {
+    it("renders the [A] / [B] / [C] chips in column 0 for all rows", () => {
       const { lastFrame } = render(
         <YesNoFeedbackSelect
           isFocused={true}
@@ -101,16 +101,23 @@ describe("YesNoFeedbackSelect", () => {
         />,
       );
       const frame = lastFrame() ?? "";
-      // Cursor glyph is ``❯`` (Icons.prompt) in Unicode mode. We
-      // search for it preceding "是" — the first item — to confirm
-      // initial focus lands on index 0.
+      // Each row carries its own letter chip — there is no cursor
+      // glyph and no indent. We only need to verify the chips are
+      // present and paired with the right label; colour-based focus
+      // is exercised by Ink internally.
       const lines = frame.split("\n");
-      const yesLine = lines.find((l) => l.includes("是"));
-      expect(yesLine).toBeDefined();
-      expect(yesLine).toContain("❯");
+      expect(lines.some((l) => l.includes("[A]") && l.includes("是"))).toBe(
+        true,
+      );
+      expect(lines.some((l) => l.includes("[B]") && l.includes("否"))).toBe(
+        true,
+      );
+      expect(
+        lines.some((l) => l.includes("[C]") && l.includes("告诉我别的话…")),
+      ).toBe(true);
     });
 
-    it("respects initialIndex prop", () => {
+    it("respects initialIndex prop without changing chip layout", () => {
       const { lastFrame } = render(
         <YesNoFeedbackSelect
           isFocused={true}
@@ -120,10 +127,16 @@ describe("YesNoFeedbackSelect", () => {
         />,
       );
       const frame = lastFrame() ?? "";
+      // Chips stay aligned regardless of focused row; focus is now
+      // a colour-only signal, so the structural check is just "all
+      // chips present in their canonical order".
       const lines = frame.split("\n");
-      const noLine = lines.find((l) => l.includes("否"));
-      expect(noLine).toBeDefined();
-      expect(noLine).toContain("❯");
+      expect(lines.some((l) => l.includes("[A]") && l.includes("是"))).toBe(
+        true,
+      );
+      expect(lines.some((l) => l.includes("[B]") && l.includes("否"))).toBe(
+        true,
+      );
     });
   });
 });

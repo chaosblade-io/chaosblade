@@ -164,6 +164,28 @@ async def lifespan(app: FastAPI):
     if checkpointer and hasattr(checkpointer, "close"):
         await checkpointer.close()
 
+    # Close the catalog-generator LLM client (lazy-built on the first
+    # ``/api/v1/skills`` request, cached on app.state.catalog_llm). The
+    # ``ChatOpenAI`` wraps an ``openai.AsyncOpenAI`` whose underlying
+    # ``httpx`` pool holds sockets / file descriptors until close — leak
+    # those on every server cycle and a busy CI host eventually starves.
+    # Gracefully absent on a process that never served /experiments, so
+    # we ``getattr`` defensively.
+    catalog_llm = getattr(app.state, "catalog_llm", None)
+    if catalog_llm is not None:
+        # ``async_client`` is langchain-openai's attribute for the
+        # underlying ``openai.AsyncOpenAI``; ``close()`` on that closes
+        # the httpx pool. Guarded by hasattr in case a future
+        # langchain-openai version renames the attribute — we'd rather
+        # log a warning than crash shutdown.
+        try:
+            inner = getattr(catalog_llm, "async_client", None)
+            if inner is not None and hasattr(inner, "close"):
+                await inner.close()
+            logger.info("Catalog LLM client closed")
+        except Exception as e:
+            logger.warning(f"Failed to close catalog LLM client: {e}")
+
     # Close TaskStore backend
     try:
         from chaos_agent.persistence.task_store import reset_task_store
@@ -214,6 +236,17 @@ def create_app() -> FastAPI:
     from chaos_agent.server.routes import model_router
 
     app.include_router(model_router)
+
+    # Phase 4 — TS Ink onboarding wizard surface. Validators delegate
+    # to ``chaos_agent.config.wizard_validators`` (shared with the
+    # legacy Python Rich wizard); persistence reuses ConfigStore so
+    # the wizard's save matches ``/api/v1/config`` semantics.
+    from chaos_agent.server.routes import wizard_router
+
+    # Import for side-effect: registers the @wizard_router.* handlers.
+    import chaos_agent.server.routes.wizard  # noqa: F401
+
+    app.include_router(wizard_router)
 
     # Health and version endpoints
     @health_router.get("/api/v1/health")

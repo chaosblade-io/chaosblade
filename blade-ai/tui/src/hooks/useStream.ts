@@ -17,6 +17,11 @@ import { useCallback, useRef } from "react";
 import type { BladeClient } from "../api/client.js";
 import type { StreamEvent } from "../api/events.js";
 import { useAppDispatch, useAppSelector } from "../state/store.js";
+import {
+  resetStreamingCounters,
+  streamingResponseCharsRef,
+} from "../state/streamingRefs.js";
+import { perfFlush, perfMark } from "../utils/perfTrace.js";
 
 export interface SubmitTurnOpts {
   /**
@@ -63,6 +68,18 @@ export interface UseStreamApi {
   beginReplay: () => AbortController;
   /** Abort the in-flight replay (called from Composer Esc handler). */
   cancelReplay: () => void;
+  /**
+   * Allocate a fresh AbortController for a manual /compact run.
+   * Mirror of ``beginReplay`` — gives the /compact slash handler an
+   * AbortSignal to pass into ``streamCompactSession`` so Esc from
+   * the Composer can interrupt the in-flight compaction. Cancels
+   * any previously-active manual compact before returning (defensive
+   * — UI gates against concurrent /compact runs anyway).
+   */
+  beginManualCompact: () => AbortController;
+  /** Abort the in-flight manual /compact (called from Composer Esc
+   *  handler when ``state.currentManualCompact`` is non-null). */
+  cancelManualCompact: () => void;
   busy: boolean;
   /** Whether the agent is paused on a confirmation prompt. */
   awaitingConfirmation: boolean;
@@ -134,6 +151,14 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
       abortRef.current = controller;
 
       dispatch({ type: "TURN_STARTED", input: trimmed });
+      // Phase 2.1 — reset the module-level streaming counters so the
+      // live tokens estimate in LoadingIndicator starts from 0 for
+      // this turn. The ref is read by ``useAnimationFrame`` inside
+      // ``useLoadingIndicator``; snap-down on decrease clears any
+      // stale value the previous turn left before the next animation
+      // frame fires. Other turn-start paths (REPLAY_STARTED) call the
+      // same helper from their handlers — keep them in sync.
+      resetStreamingCounters();
 
       // Stream throttling. SSE delivers token AND thinking events at the
       // LLM's emit rate — often 30–80 events/s during fluent generation
@@ -150,21 +175,61 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
       //     laggy (50–200 ms perceived input lag during thinking).
       //
       // We coalesce consecutive same-kind events in small buffers and
-      // flush on a 50ms timer (~20 FPS). qwen-code uses the same
-      // pattern at 60ms; we keep 50ms for token-stream parity. Users
-      // can't perceive 0–50ms latency on streamed text — characters
-      // still appear in order, just in 1–4-char clumps instead of 1
-      // at a time. Other event types (tool_start / tool_end / confirm
-      // / result / error / done / node_start / node_end / usage)
-      // trigger an immediate flush of BOTH buffers so the buffered
-      // text appears BEFORE the structural event takes the dynamic
-      // area in a different direction (e.g. agent text → tool group —
-      // we want the text rendered before the tool box).
+      // flush on a per-kind throttle timer. The two kinds use
+      // DIFFERENT throttle windows because they have different visual
+      // costs:
+      //
+      //   - ``TOKEN_THROTTLE_MS = 60`` — token events grow the agent
+      //     message in pending, which forces a redraw of the visible
+      //     pending body on every dispatch. The probe used to show
+      //     this as the dominant flicker source at 8Hz natural token
+      //     arrival × 13-row pending payload (5–15Hz being the worst
+      //     range for human perception), and we previously parked at
+      //     180ms to drop the rate to ~5Hz.
+      //
+      //     Phase 2 erased that ceiling: AgentMessage now caps the
+      //     pending body to ``PENDING_AGENT_MAX_VISIBLE = 8`` rows
+      //     (qwen-code-style MaxSizedBox), so the redraw payload is
+      //     small and constant regardless of total reply size; every
+      //     downstream history component is wrapped in ``React.memo``
+      //     so the per-token MainContent re-render walks only the
+      //     pending area; Composer subscribes narrowly to its slice
+      //     of AppStore so the chrome no longer re-renders per
+      //     dispatch. With those guards, 60ms (~16Hz) is the new
+      //     sweet spot — close to qwen-code / Claude Code (60–80ms),
+      //     short enough that prose streams letter-fluid without
+      //     bunching, and the small bounded redraw payload doesn't
+      //     reintroduce flicker.
+      //
+      //     If a future change removes the AgentMessage cap or the
+      //     memo wrappers, raise this back to ~180 — without them
+      //     16Hz of unbounded redraws will shimmer again.
+      //
+      //   - ``THINKING_THROTTLE_MS = 50`` — thinking events update
+      //     ``state.thoughtBuffer``, which only drives
+      //     ``LoadingIndicator``'s ``headerLabel`` (a single text
+      //     row, no body rendering since the qwen-code-style
+      //     single-line redesign). The dyn-frame height is constant
+      //     during thinking, so the redraw is cheap. Keeping 50ms
+      //     here means the cycler/thinking subject feels responsive
+      //     without paying the token-streaming flicker cost.
+      //
+      // Other event types (tool_start / tool_end / confirm / result
+      // / error / done / node_start / node_end / usage) trigger an
+      // immediate flush of BOTH buffers so the buffered text appears
+      // BEFORE the structural event takes the dynamic area in a
+      // different direction (e.g. agent text → tool group — we want
+      // the text rendered before the tool box).
       //
       // Two parallel buffers (instead of qwen-code's single unified
       // queue) because tokens and thinking come from disjoint phases
       // of an LLM turn — they don't interleave in practice, so we
       // don't need to merge across kinds.
+      // Throttle windows — see the comment block above for why these
+      // two kinds use different values.
+      const TOKEN_THROTTLE_MS = 60;
+      const THINKING_THROTTLE_MS = 50;
+
       let tokenBuffer = "";
       let tokenNode = "";
       let tokenFlushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -174,6 +239,10 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
           tokenFlushTimer = null;
         }
         if (tokenBuffer.length > 0) {
+          // Perf trace #2: every TOKEN_APPENDED dispatch fire. Compare
+          // count to token.raw to see throttle ratio; compare ts
+          // deltas to see actual dispatch cadence vs the 60 ms target.
+          perfMark("flushTokens", { len: tokenBuffer.length });
           dispatch({
             type: "TOKEN_APPENDED",
             content: tokenBuffer,
@@ -223,9 +292,40 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
         )) {
           if (evt.type === "token") {
             tokenBuffer += evt.content;
+            // Phase 2.1 — increment the module-level char counter on
+            // EVERY raw token event (not throttled with the dispatch).
+            // The producer side is intentionally zero-React-work; the
+            // consumer (``useAnimationFrame`` in LoadingIndicator)
+            // polls this ref at a fixed cadence and tweens the
+            // displayed value smoothly. This lets the live tokens
+            // figure climb at ~10 Hz visual smoothness regardless of
+            // the bursty LLM emission pattern (often "wait 200ms,
+            // burst 60 chars, wait 200ms…") that the previous
+            // dispatch-driven counter exposed as a 5 Hz step ladder.
+            //
+            // ``signal.aborted`` guard: under supersedePrevious (e.g.
+            // ConfirmMessage's feedback path firing
+            // ``submitTurn(feedback, { supersedePrevious: true })``),
+            // OLD's for-await may consume one or two more SSE events
+            // between the abort() call and the underlying reader
+            // throwing AbortError. Those late events would otherwise
+            // increment the ref *after* NEW's TURN_STARTED reset it
+            // to 0, producing a small phantom offset on the new
+            // turn's live tokens display. Skipping the ref bump on
+            // an already-aborted controller keeps the counter clean.
+            // We do NOT skip the buffer/timer paths the same way:
+            // those drain inside the catch's ``finally`` block, so
+            // the leftover bytes are harmless (timers cleared, no
+            // dispatch fires after the catch returns).
+            if (!controller.signal.aborted) {
+              streamingResponseCharsRef.current += evt.content.length;
+            }
+            // Perf trace #1: raw SSE token event rate. Lets us see
+            // actual LLM emit rate independent of throttled dispatch.
+            perfMark("token.raw", { bytes: evt.content.length });
             if (evt.node) tokenNode = evt.node;
             if (!tokenFlushTimer) {
-              tokenFlushTimer = setTimeout(flushTokens, 50);
+              tokenFlushTimer = setTimeout(flushTokens, TOKEN_THROTTLE_MS);
             }
             continue;
           }
@@ -233,7 +333,10 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
             thinkingBuffer += evt.content;
             if (evt.node) thinkingNode = evt.node;
             if (!thinkingFlushTimer) {
-              thinkingFlushTimer = setTimeout(flushThinking, 50);
+              thinkingFlushTimer = setTimeout(
+                flushThinking,
+                THINKING_THROTTLE_MS,
+              );
             }
             continue;
           }
@@ -244,8 +347,11 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
           applyEvent(dispatch, evt);
           if (evt.type === "done") break;
         }
-        // Drain anything that arrived in the final 50ms window before
-        // ``done`` (or before the iterator ended naturally).
+        // Drain anything still buffered before ``done`` (or before
+        // the iterator ended naturally). Worst case = TOKEN_THROTTLE_MS
+        // (200) of pending text — ``flushStreamBuffers`` clears the
+        // timers and dispatches synchronously so the final reply chunk
+        // is visible before TURN_DONE flips the UI to idle.
         flushStreamBuffers();
         dispatch({ type: "TURN_DONE" });
       } catch (err) {
@@ -276,9 +382,10 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
         dispatch({ type: "TURN_ABORTED", reason });
       } finally {
         // Cancel any pending flush timers so they can't fire dispatches
-        // after TURN_DONE / TURN_ABORTED has resolved. (Throttle window
-        // is 50ms; without this, an aborted turn could append one final
-        // batch of tokens or thinking content to the previous turn.)
+        // after TURN_DONE / TURN_ABORTED has resolved. (Throttle windows
+        // are 200ms tokens / 50ms thinking; without this, an aborted
+        // turn could append one final batch of tokens or thinking
+        // content to the previous turn after the abort handler ran.)
         if (tokenFlushTimer) {
           clearTimeout(tokenFlushTimer);
           tokenFlushTimer = null;
@@ -304,6 +411,12 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
         if (abortRef.current === controller) {
           abortRef.current = null;
         }
+        // Perf trace #5: flush the buffered marks to disk now that
+        // the turn boundary has resolved (TURN_DONE / TURN_ABORTED
+        // / supersede). Writing here keeps the log file in sync
+        // with what the user just saw on screen, so reading the
+        // log post-mortem maps cleanly to "this turn took N ms".
+        perfFlush("turn-end");
       }
     },
     [client, sessionId, dispatch, permissionMode],
@@ -361,12 +474,38 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
     // is racing the abort; let beginReplay() replace it on next call.
   }, []);
 
+  /** Manual /compact AbortController — separate from turn and replay
+   *  because /compact runs while ``streamState === "idle"`` (its own
+   *  busy gate is ``state.currentManualCompact !== null``). Keeping
+   *  three independent refs means each surface's Esc handler can
+   *  target exactly the right in-flight operation without ambiguity. */
+  const manualCompactAbortRef = useRef<AbortController | null>(null);
+
+  const beginManualCompact = useCallback((): AbortController => {
+    // Defensive: cancel any leftover compact first. UI gates against
+    // concurrent /compact calls (the handler refuses if
+    // currentManualCompact is already set), so this should be a
+    // no-op in normal flow.
+    manualCompactAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    manualCompactAbortRef.current = ctrl;
+    return ctrl;
+  }, []);
+
+  const cancelManualCompact = useCallback((): void => {
+    manualCompactAbortRef.current?.abort();
+    // Don't null here — the active for-await is racing the abort.
+    // beginManualCompact() replaces the ref on next call.
+  }, []);
+
   return {
     submitTurn,
     cancelTurn,
     resolveConfirm,
     beginReplay,
     cancelReplay,
+    beginManualCompact,
+    cancelManualCompact,
     busy:
       streamState === "responding" ||
       streamState === "waiting_confirmation",
@@ -428,7 +567,16 @@ function applyEvent(
     case "result":
       dispatch({
         type: "RESULT_RECEIVED",
-        content: evt.content,
+        // Legacy /turn results put the envelope in content as a
+        // JSON string. The newer /compact route uses payload as a
+        // typed dict and leaves content empty. Fall back to a
+        // JSON-stringified payload so RESULT_RECEIVED's reducer
+        // (which expects a string) sees the same shape either
+        // way. The /compact handler doesn't go through this
+        // dispatcher — it consumes its own stream directly — so
+        // this fallback is just defensive in case some future
+        // surface routes /compact-style events through useStream.
+        content: evt.content ?? JSON.stringify(evt.payload ?? {}),
         taskId: evt.task_id,
       });
       return;
@@ -501,6 +649,22 @@ function applyEvent(
       }
       return;
     }
+    case "context_size":
+      // PreReasoningHook fired one of these AFTER deciding whether
+      // to compact. The post-hook ``current_tokens`` is what the
+      // NEXT LLM call will see, so dispatching it drives the
+      // Footer indicator to visibly drop on compaction and grow as
+      // tool messages stack up. All four fields are forced onto the
+      // wire by the server (see streaming.py to_dict exception), so
+      // ``Number(x) || 0`` is safe even when the actual value is 0.
+      dispatch({
+        type: "CONTEXT_SIZE_RECEIVED",
+        currentTokens: Number(evt.context_current_tokens) || 0,
+        triggerTokens: Number(evt.context_trigger_tokens) || 0,
+        maxTokens: Number(evt.context_max_tokens) || 0,
+        messagesCount: Number(evt.context_messages_count) || 0,
+      });
+      return;
     case "done":
       // Handled by the caller's loop — break + dispatch TURN_DONE.
       return;

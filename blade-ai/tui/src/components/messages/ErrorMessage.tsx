@@ -8,13 +8,14 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { t } from "../../i18n/index.js";
 import type { ErrorItem } from "../../state/types.js";
 import { Theme } from "../../theme/colors.js";
 import { Icons } from "../../theme/icons.js";
 import { suggestionsForError } from "../../utils/errorHints.js";
 
-export const ErrorMessage: React.FC<{ item: ErrorItem }> = ({ item }) => {
+const ErrorMessageInternal: React.FC<{ item: ErrorItem }> = ({ item }) => {
   const hint = suggestionsForError(item.text);
   return (
     <Box paddingLeft={2} marginTop={1} flexDirection="column">
@@ -47,3 +48,8 @@ export const ErrorMessage: React.FC<{ item: ErrorItem }> = ({ item }) => {
     </Box>
   );
 };
+
+// React.memo: error items are immutable once dispatched; default
+// shallow compare on ``item`` ref skips re-rendering the suggestion
+// match + hint block on every parent re-render.
+export const ErrorMessage = memo(ErrorMessageInternal);

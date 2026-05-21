@@ -525,6 +525,38 @@ class AgentState(MessagesState):
     replan_context: Optional[dict] = None         # Phase 2 错误上下文
     replan_history: Optional[list] = None         # 历次 replan 记录
 
+    # Patch C — Wall-clock guard (single source of truth for "when did
+    # this turn start"). Stamped at agent_loop_node entry the first
+    # time. Router functions consult ``time.time() - pipeline_started_at``
+    # against ``settings.max_inject_seconds`` to enforce a turn-level
+    # timeout that's independent of iteration counters. ``0.0`` = not
+    # yet stamped (the wall-clock guard is a no-op).
+    pipeline_started_at: float = 0.0
+
+    # Patch B — Counter for INFRA_TRANSIENT short-retry budget. Each
+    # router-detected transient error increments this; ``settings.max_
+    # transient_retry`` is the hard cap before SHORT_RETRY is escalated
+    # to END_FAILED.
+    transient_retry_count: int = 0
+
+    # Patch E — Pipeline attempt tracking. ``pipeline_attempt`` starts
+    # at ``0`` and is incremented by ``begin_attempt`` (in
+    # chaos_agent.agent.attempt_tracker). ``pipeline_attempts_history``
+    # records each attempt's metadata so the TUI / TaskStore can
+    # surface "this is attempt #2 because the LLM switched targets"
+    # rather than the user seeing what looks like a retry of a failure.
+    pipeline_attempt: int = 0
+    pipeline_attempts_history: Optional[list] = None
+
+    # Patch D — Target health report from ``safety_check`` (after
+    # ``assess_target_health``). Serialised form of ``HealthReport``;
+    # see ``chaos_agent.agent.target_health`` for the schema. ``None``
+    # when the pre-check is disabled or the scope has no checker.
+    # Read by ``confirmation_gate`` / TUI confirm card to surface
+    # blocker conditions (DiskPressure, Evicted, …) before the
+    # operator approves an inject that's likely to fail.
+    target_health_report: Optional[dict] = None
+
     # Failure reason (only set when task result is "failed", None on success)
     failure_reason: Optional[str] = None
 

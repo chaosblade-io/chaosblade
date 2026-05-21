@@ -230,6 +230,15 @@ class TestShouldAutoReplan:
         """Timeout errors should NOT trigger replan."""
         assert should_auto_replan("Error: timeout waiting for blade status") is False
 
-    def test_unknown_flag_with_timeout_no_replan(self):
-        """If both unknown flag AND timeout appear, timeout (non-replanable) takes precedence."""
-        assert should_auto_replan("unknown flag: --namespace, timeout exceeded") is False
+    def test_unknown_flag_dominates_when_combined_with_timeout(self):
+        """Patch B layered classifier: USER_CONFIG (unknown flag) ranks
+        above INFRA_TRANSIENT (timeout) so a mixed string is treated
+        as REPLAN-able. Rationale: an "unknown flag" is a planning
+        bug LLM can fix on replan; a co-occurring "timeout" is just
+        ambient network noise that doesn't change what action is
+        correct. Real-world co-occurrence of both signatures in one
+        error string is rare enough that biasing toward the more
+        specific signal is safer than the legacy "timeout always
+        wins" behaviour. See ``ErrorClass`` / ``classify_error`` in
+        ``chaos_agent.errors`` for the full rule order."""
+        assert should_auto_replan("unknown flag: --namespace, timeout exceeded") is True

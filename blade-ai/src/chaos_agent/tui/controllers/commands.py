@@ -1049,50 +1049,114 @@ class CommandDispatcher:
             self._renderer.system(f"压缩失败: {e}")
 
     async def _compact_thread(self, thread_id: str) -> None:
-        from chaos_agent.memory.compactor import compact_if_needed
+        import asyncio
+        from uuid import uuid4
+
         from chaos_agent.memory.context_manager import count_tokens_approx
         from chaos_agent.config.settings import settings as s
+        from chaos_agent.observability.status_tracker import (
+            subscribe as _status_subscribe,
+            unsubscribe as _status_unsubscribe,
+        )
 
-        graph = getattr(self._runner, "_agents", {}).get("inject")
+        agents = getattr(self._runner, "_agents", {}) or {}
+        graph = agents.get("inject")
         if graph is None:
             self._renderer.system("Runner 未初始化 inject 图，无法压缩。")
             return
 
+        # Unified path: drive the SAME PreReasoningHook the auto-trigger
+        # uses, with force=True. Eliminates the dual-track risk where
+        # manual /compact emitted a HumanMessage(summary) without the
+        # "[Compressed History]" prefix, which the auto path then
+        # re-compressed on the next turn (information dilution).
+        hook = agents.get("pre_reason_hook")
+        if hook is None:
+            self._renderer.system(
+                "PreReasoningHook 未初始化（启动时 LLM/Settings 缺失）。"
+            )
+            return
+
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": s.recursion_limit}
         snapshot = await graph.aget_state(config)
-        messages = (snapshot.values or {}).get("messages") or []
+        state_values = snapshot.values or {}
+        messages = state_values.get("messages") or []
         before = count_tokens_approx(messages)
         if before == 0:
             self._renderer.system("会话尚无消息可压缩。")
             return
 
-        llm = getattr(self._runner, "_llm", None) or getattr(self._runner, "llm", None)
-        budget = max(1, int(s.context_max_tokens * s.context_compact_ratio))
+        # Subscribe to a private tracker before invoking the hook so
+        # we can render the same live progress the server-side SSE
+        # gives the TS TUI. Without this the user sees a multi-second
+        # silent pause while compact_memory's LLM call runs. The hook
+        # emits to ``state["task_id"]``, so we override it with a
+        # fresh id and subscribe to that — isolating us from any
+        # ambient auto-compaction events on the long-running task id.
+        compact_task_id = f"compact-{uuid4().hex[:12]}"
+        queue = _status_subscribe(compact_task_id)
 
-        compacted, used_lightweight = await compact_if_needed(
-            messages=list(messages),
-            max_tokens=budget,
-            llm=llm,
-        )
-        after = count_tokens_approx(compacted)
+        async def _render_events() -> None:
+            """Drain the tracker queue until cancelled. Each hook
+            event becomes a system line so the user gets continuous
+            feedback during the LLM call."""
+            try:
+                while True:
+                    evt = await queue.get()
+                    if getattr(evt, "source", "") != "memory_compression":
+                        continue
+                    phase = getattr(evt, "phase", "")
+                    if phase == "started":
+                        self._renderer.system("  LLM 摘要器运行中 …")
+                    elif phase == "completed":
+                        # Hook-level "completed" carries hook-side
+                        # estimates; we print the final authoritative
+                        # numbers below from graph state. Stay silent
+                        # here to avoid duplicate messages.
+                        pass
+                    elif phase == "failed":
+                        self._renderer.system(
+                            f"  压缩失败: {getattr(evt, 'message', 'hook failure')}"
+                        )
+            except asyncio.CancelledError:
+                pass
 
-        if after >= before:
+        render_task = asyncio.create_task(_render_events())
+        try:
+            state_for_hook = dict(state_values)
+            state_for_hook["task_id"] = compact_task_id
+            updates = await hook(state_for_hook, force=True)
+        finally:
+            render_task.cancel()
+            try:
+                await render_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            _status_unsubscribe(compact_task_id, queue)
+
+        if not updates or "messages" not in updates:
             self._renderer.system(
-                f"上下文 {before} tokens，未触发压缩（预算 {budget}）"
+                f"上下文 {before} tokens，无可压缩的历史消息。"
             )
             return
 
-        # Replace thread messages: emit RemoveMessage tombstones for the old
-        # ones, then the compacted list.
-        from langchain_core.messages import RemoveMessage
-        removals = [RemoveMessage(id=m.id) for m in messages if getattr(m, "id", None)]
-        await graph.aupdate_state(config, {"messages": removals + list(compacted)})
+        await graph.aupdate_state(config, updates)
 
-        layer = "轻量裁剪" if used_lightweight else "LLM 摘要"
+        # Recompute after by replaying through aget_state — the hook
+        # may have emitted both RemoveMessages and the summary, and
+        # the reducer's actual result is what the next turn will see.
+        snapshot_after = await graph.aget_state(config)
+        after = count_tokens_approx((snapshot_after.values or {}).get("messages") or [])
+        if after >= before:
+            self._renderer.system(
+                f"上下文 {before} tokens → {after} tokens，未实际缩减。"
+            )
+            return
+
         saved = before - after
         pct = saved * 100 // before
         self._renderer.system(
-            f"上下文已压缩（{layer}）: {before} → {after} tokens "
+            f"上下文已压缩（LLM 摘要）: {before} → {after} tokens "
             f"(节省 {saved} / {pct}%)"
         )
 

@@ -33,7 +33,7 @@
  *     ``finalize()`` skips server-shutdown (nothing was spawned yet).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { App } from "../../App.js";
 import {
   BladeClient,
@@ -43,9 +43,11 @@ import {
   resolveServer,
   type ServerHandle,
 } from "../../api/server-process.js";
+import { WizardClient } from "../../api/wizard.js";
 import { t } from "../../i18n/index.js";
 import { useAppDispatch, useAppSelector } from "../../state/store.js";
 import type { HistoryItem } from "../../state/types.js";
+import { WizardCard } from "../wizard/WizardCard.js";
 
 export interface BootRunnerProps {
   version: string;
@@ -94,6 +96,25 @@ function formatError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/**
+ * BootRunner phase state machine.
+ *
+ *   spawning      → spawn server + wait /health + check needs-setup
+ *     ├─ needs-setup=true  → wizard
+ *     └─ needs-setup=false → sessioning
+ *   wizard        → user fills config in WizardCard
+ *     ├─ saved      → sessioning
+ *     └─ cancelled  → onFailed (BootRunner cleanup kills server)
+ *   sessioning    → createSession + welcome card + onResolved → done
+ *   done          → <App> takes over (existing behaviour)
+ *
+ * Server spawn is irreversible from the wizard's perspective — once
+ * we've started the Python child we keep it (its lifetime is bound to
+ * BootRunner's effect-cleanup until ``onResolved`` transfers ownership
+ * to cli.tsx).
+ */
+type BootPhase = "spawning" | "wizard" | "sessioning" | "done";
+
 export const BootRunner: React.FC<BootRunnerProps> = ({
   version,
   bootCapturedAt,
@@ -110,30 +131,35 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
   const [client, setClient] = useState<BladeClient | null>(null);
   const [sessionId, setSessionId] = useState<string>("");
   const [serverUrl, setServerUrl] = useState<string>("");
+  const [phase, setPhase] = useState<BootPhase>("spawning");
+  // Server + client captured during the spawning phase, reused by the
+  // sessioning phase. Refs (not state) because the sessioning effect
+  // shouldn't re-run when these populate — we trigger it via the phase
+  // transition explicitly.
+  const spawnedRef = useRef<ServerHandle | null>(null);
+  const clientRef = useRef<BladeClient | null>(null);
+  // Track ownership transfer so cleanup doesn't double-kill the
+  // server after cli.tsx took it over.
+  const resolvedToCliRef = useRef(false);
+  const cancelledRef = useRef(false);
+  // Defensive: guarantee the sessioning side effect (createSession +
+  // welcome card) runs exactly once even if Effect 2 re-fires due
+  // to a stable-but-changing dep. React batches setState calls in
+  // an async block (R18+) so the phase→done flip happens in the
+  // same render as setClient/etc — but a future code change might
+  // split them; the ref keeps us safe regardless.
+  const sessioningStartedRef = useRef(false);
 
+  // -- Effect 1: spawning → health → needs-setup check ───────────────
   useEffect(() => {
-    let cancelled = false;
-    let spawnedServer: ServerHandle | null = null;
-    // ``resolvedToCli`` tracks ownership of ``spawnedServer``. Once we
-    // call ``onResolved`` cli.tsx owns the handle and is responsible
-    // for shutting it down via ``finalize`` → ``cleanup``. Until then,
-    // BootRunner's effect-cleanup is the only thing that can stop the
-    // child process if Ink unmounts mid-boot. We track this via a
-    // local ``let`` (not a useState/useRef) because the cleanup
-    // closure has to see the *current* value at unmount time, which
-    // closed-over let-vars give us — useState would only ever expose
-    // the value at effect-mount (empty deps), i.e. always false.
-    let resolvedToCli = false;
+    cancelledRef.current = false;
 
     const run = async () => {
       try {
         // -- Phase 1: spawn server --------------------------------
-        // Progress text is already showing from cli.tsx's pre-seed,
-        // so skip the redundant SHOW dispatch here.
-        spawnedServer = await resolveServer();
-        if (cancelled) {
-          // User Ctrl+C'd while we were spawning. Best-effort kill
-          // so the embedded Python process doesn't outlive the TUI.
+        const spawnedServer = await resolveServer();
+        spawnedRef.current = spawnedServer;
+        if (cancelledRef.current) {
           spawnedServer.shutdown().catch(() => undefined);
           return;
         }
@@ -152,8 +178,9 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
               }
             : undefined,
         });
+        clientRef.current = c;
         const ok = await waitForHealth(c, 10_000);
-        if (cancelled) {
+        if (cancelledRef.current) {
           spawnedServer.shutdown().catch(() => undefined);
           return;
         }
@@ -164,13 +191,74 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
           );
         }
 
+        // -- Phase 2.5: needs-setup gate --------------------------
+        // Ask the server whether the wizard should run. Server-side
+        // check keeps the gating rules (which keys are essential)
+        // out of the TS layer. Network failures fail-open (server
+        // returns false on transport error), matching the legacy
+        // configGate behaviour of "fail open and let the user reach
+        // the TUI even when validators can't run".
+        const wizardClient = new WizardClient(spawnedServer.url);
+        const needsSetup = await wizardClient.needsWizardSetup();
+        if (cancelledRef.current) {
+          spawnedServer.shutdown().catch(() => undefined);
+          return;
+        }
+        if (needsSetup) {
+          dispatch({ type: "BOOT_PROGRESS_HIDE" });
+          setServerUrl(spawnedServer.url);
+          setPhase("wizard");
+          return;
+        }
+
+        // No wizard needed → straight to sessioning.
+        setPhase("sessioning");
+      } catch (err) {
+        if (cancelledRef.current) return;
+        dispatch({ type: "BOOT_PROGRESS_HIDE" });
+        onFailed(formatError(err));
+      }
+    };
+
+    void run();
+
+    return () => {
+      cancelledRef.current = true;
+      // If we never reached the "resolved-to-cli" handoff but did
+      // manage to spawn the server, kill it so it doesn't outlive
+      // the parent. Once cli.tsx owns the handle (after onResolved),
+      // it's responsible for shutdown.
+      const s = spawnedRef.current;
+      if (s && !resolvedToCliRef.current) {
+        s.shutdown().catch(() => undefined);
+      }
+    };
+    // Deliberately empty deps: this effect runs exactly once per mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // -- Effect 2: sessioning → createSession + welcome card ──────────
+  useEffect(() => {
+    if (phase !== "sessioning") return;
+    // Idempotency guard — see comment on ``sessioningStartedRef``.
+    if (sessioningStartedRef.current) return;
+    sessioningStartedRef.current = true;
+    const spawnedServer = spawnedRef.current;
+    const c = clientRef.current;
+    if (!spawnedServer || !c) {
+      onFailed("internal error: server handle missing in sessioning phase");
+      return;
+    }
+
+    const run = async () => {
+      try {
         // -- Phase 3: createSession + state -----------------------
         dispatch({
           type: "BOOT_PROGRESS_SHOW",
           text: t("boot.progress.session"),
         });
         const sid = await c.createSession({});
-        if (cancelled) return;
+        if (cancelledRef.current) return;
 
         let sessionState: Record<string, unknown> = {};
         try {
@@ -178,7 +266,7 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
         } catch {
           // Header falls back to defaults; non-fatal.
         }
-        if (cancelled) return;
+        if (cancelledRef.current) return;
 
         // -- Phase 4: dispatch session + welcome card -------------
         const namespace = asString(sessionState["namespace"]) || "default";
@@ -229,41 +317,52 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
         // setState triggers re-render → <App> sees client/sessionId
         // → BootOrchestrator + Composer mount. ``onResolved`` then
         // transfers the ServerHandle to cli.tsx so finalize() can
-        // shut it down on exit. Set ``resolvedToCli`` BEFORE the
+        // shut it down on exit. Set the ref flag BEFORE the
         // setStates so a synchronous unmount-during-render race
         // wouldn't double-shutdown via the effect cleanup.
-        resolvedToCli = true;
+        resolvedToCliRef.current = true;
         // Notify cli.tsx so it can route SIGINT cleanup, etc.
         onResolved(spawnedServer, c, sid);
         setClient(c);
         setSessionId(sid);
         setServerUrl(spawnedServer.url);
+        setPhase("done");
       } catch (err) {
-        if (cancelled) return;
+        if (cancelledRef.current) return;
         dispatch({ type: "BOOT_PROGRESS_HIDE" });
         onFailed(formatError(err));
       }
     };
 
     void run();
+    // Cleanup for this effect — no-op; spawning effect's cleanup
+    // owns the server-shutdown logic until ``onResolved`` flips
+    // ``resolvedToCliRef``.
+  }, [phase, onResolved, onFailed, dispatch, debug, permissionMode, version]);
 
-    return () => {
-      cancelled = true;
-      // If we never reached "resolved" but did manage to spawn the
-      // server, kill it so it doesn't outlive the parent. If we
-      // already called onResolved, cli.tsx owns shutdown — don't
-      // double-fire.
-      if (spawnedServer && !resolvedToCli) {
-        spawnedServer.shutdown().catch(() => undefined);
-      }
-    };
-    // Deliberately empty deps: this effect runs exactly once per mount.
-    // ``permissionMode`` etc. are read from the closure but locking
-    // them at mount time matches the original cli.tsx behavior (the
-    // welcome card's ``permissionMode`` was captured at startup, not
-    // re-read on every state change).
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  // ── Render ────────────────────────────────────────────────────────
+
+  // Wizard phase takes over the screen — App's normal boot spinner is
+  // hidden (BOOT_PROGRESS_HIDE fired above) so the WizardCard owns the
+  // visual space. After the user saves we flip back to sessioning and
+  // <App> picks up where it left off.
+  if (phase === "wizard") {
+    return (
+      <WizardCard
+        serverUrl={serverUrl}
+        onExit={(saved) => {
+          if (saved) {
+            setPhase("sessioning");
+          } else {
+            // User cancelled the wizard. Treat as a clean exit;
+            // BootRunner's effect-cleanup will shut down the server
+            // when Ink unmounts.
+            onFailed(t("wizard.cancel_message"));
+          }
+        }}
+      />
+    );
+  }
 
   return (
     <App

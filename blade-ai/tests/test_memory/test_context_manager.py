@@ -201,6 +201,41 @@ class TestContextManager:
         expected = int(1000 * 0.7)
         assert cm.compact_threshold == expected
 
+    def test_compact_ratio_stored_on_instance(self):
+        # Bug 4 setup: the manager must KEEP the raw ratio so
+        # check_context can thread it into
+        # calculate_token_warning_state. Without this attribute the
+        # warning state always falls back to the function's default
+        # (0.85), making the operator's BLADE_AI_CONTEXT_COMPACT_RATIO
+        # setting cosmetic only.
+        cm = ContextManager(max_tokens=128_000, compact_ratio=0.6)
+        assert cm.compact_ratio == 0.6
+
+    def test_check_context_threads_compact_ratio_through(self):
+        # Bug 4 end-to-end: a ContextManager built with a lower
+        # compact_ratio MUST trigger compaction at a lower token count
+        # than one built with the default. Pre-fix, both managers
+        # behaved identically because check_context didn't pass the
+        # ratio through.
+        #
+        # Use real HumanMessages instead of MagicMock — MagicMock
+        # auto-attributes ``tool_calls`` truthily, which trips the
+        # ensure_pair_integrity heuristic and pops the message back
+        # into to_keep, masking the threshold behavior we're testing.
+        from langchain_core.messages import HumanMessage
+        # 8 messages × 35K chars / 4 ≈ 70K tokens × 1.2 ≈ 84K total
+        msgs = [HumanMessage(content="x" * 35_000) for _ in range(8)]
+        cm_default = ContextManager(max_tokens=128_000, compact_ratio=0.85)
+        cm_aggressive = ContextManager(max_tokens=128_000, compact_ratio=0.5)
+        cm_default.reserve_tokens = 1
+        cm_aggressive.reserve_tokens = 1
+        d_compact, _, _ = cm_default.check_context(msgs)
+        a_compact, _, _ = cm_aggressive.check_context(msgs)
+        # Default (threshold ≈ 108.8K): 84K is BELOW, no compaction.
+        # Aggressive (threshold = 64K): 84K is ABOVE, compaction.
+        assert d_compact == []
+        assert len(a_compact) > 0
+
 
 # ---------------------------------------------------------------------------
 # New tests: Multi-level warning + circuit breaker (Migration Point 10)
@@ -277,6 +312,55 @@ class TestCalculateTokenWarningState:
     def test_percent_left_non_negative(self):
         ws = calculate_token_warning_state(60000, 50000)
         assert ws.percent_left >= 0
+
+    def test_compact_ratio_lowers_trigger_threshold(self):
+        # Bug 4 regression guard: the operator-tunable ``compact_ratio``
+        # was dead code under the old ``max(buffer, ratio)`` formula —
+        # the buffer almost always won. The new ``min(...)`` formula
+        # MUST let a lower ratio pull the trigger earlier.
+        #
+        # Setup: 128K window. Default 0.85 ratio → threshold ≈ 108.8K
+        # (buffer floor 115K loses to ratio). With ratio 0.5 → 64K.
+        # A usage of 70K must therefore:
+        #   - sit BELOW the 0.85 trigger (108.8K), and
+        #   - sit ABOVE the 0.5 trigger (64K).
+        # If either assert flips, the regression is back.
+        below_default = calculate_token_warning_state(
+            70_000, 128_000, compact_ratio=0.85,
+        )
+        above_aggressive = calculate_token_warning_state(
+            70_000, 128_000, compact_ratio=0.5,
+        )
+        assert not below_default.is_above_auto_compact
+        assert above_aggressive.is_above_auto_compact
+
+    def test_compact_ratio_capped_by_buffer_ceiling(self):
+        # The buffer floor (max_tokens - AUTOCOMPACT_BUFFER_TOKENS) is a
+        # SAFETY ceiling on the trigger — a too-large ratio (e.g. 0.99)
+        # must NOT push compaction past it, otherwise we risk overrunning
+        # the provider's hard window before compaction has room to run.
+        ws = calculate_token_warning_state(
+            117_000, 128_000, compact_ratio=0.99,
+        )
+        # buffer ceiling = 128000 - 13000 = 115000. 0.99 * 128000 = 126720.
+        # min(115000, 126720) = 115000. 117000 > 115000 → triggers.
+        assert ws.is_above_auto_compact
+
+    def test_compact_ratio_floor_at_50_percent(self):
+        # Defensive floor: an operator typo (compact_ratio=0.05) must
+        # not let the threshold collapse to almost-zero, otherwise the
+        # system would try to compact on every single message and
+        # never make progress. The clamp keeps the trigger at ≥ 50%.
+        ws_low = calculate_token_warning_state(
+            60_000, 128_000, compact_ratio=0.05,
+        )
+        ws_normal = calculate_token_warning_state(
+            60_000, 128_000, compact_ratio=0.5,
+        )
+        # 0.05 ratio is clamped to 0.5 internally, so 60K (< 64K floor)
+        # must NOT trigger — same as the 0.5 case.
+        assert not ws_low.is_above_auto_compact
+        assert not ws_normal.is_above_auto_compact
 
 
 class TestCompactTrackingState:

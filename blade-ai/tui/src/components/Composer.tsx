@@ -78,11 +78,15 @@
  */
 
 import { Box, useApp, useInput } from "ink";
-import { useCallback, useEffect, useMemo } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import type { BladeClient } from "../api/client.js";
 import { useStream } from "../hooks/useStream.js";
 import { t } from "../i18n/index.js";
-import { useAppDispatch, useAppSelector, useAppState } from "../state/store.js";
+import {
+  useAppDispatch,
+  useAppSelector,
+  useAppStateGetter,
+} from "../state/store.js";
 import {
   buildRegistry,
   parseSlashCommand,
@@ -92,9 +96,19 @@ import {
 import { Footer } from "./Footer.js";
 import { InputPrompt } from "./InputPrompt.js";
 import { LoadingIndicator } from "./LoadingIndicator.js";
+import { ManualCompactIndicator } from "./ManualCompactIndicator.js";
 import { MemoryCompactingIndicator } from "./MemoryCompactingIndicator.js";
 import { PhaseStepperCard } from "./PhaseStepperCard.js";
-import { setProbeControlsRef } from "../utils/overflowProbe.js";
+import {
+  setProbeControlsRef,
+  setProbeFooterRef,
+  setProbeInputRef,
+  setProbeLoadingRef,
+  setProbeStepperRef,
+} from "../utils/overflowProbe.js";
+import { setChromeMeasureRef } from "../state/chromeMeasureRef.js";
+import type { DOMElement } from "ink";
+import { getPool, pickRandomDistinct } from "../utils/phrasePool.js";
 
 interface Props {
   client: BladeClient;
@@ -108,10 +122,24 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
     resolveConfirm,
     beginReplay,
     cancelReplay,
+    beginManualCompact,
+    cancelManualCompact,
     busy,
     awaitingConfirmation,
   } = useStream(client, sessionId);
-  const state = useAppState();
+  // Phase 1.2 — replaced ``useAppState()`` (whole-tree subscription
+  // that re-rendered Composer on every reducer dispatch) with two
+  // narrow tools:
+  //   · ``useAppSelector(s => s.streamState)`` — primitive, re-renders
+  //     this component ONLY when streamState transitions.
+  //   · ``useAppStateGetter()`` — returns a stable getter that reads
+  //     the latest state on demand (slash command handlers need a
+  //     state snapshot at invoke time; they don't need a live binding).
+  // Combined: Composer used to re-render on every TOKEN_APPENDED;
+  // now it re-renders only on the small set of state slices it
+  // actually needs.
+  const streamState = useAppSelector((s) => s.streamState);
+  const getAppState = useAppStateGetter();
   const dispatch = useAppDispatch();
   const app = useApp();
   const pendingDecision = useAppSelector((s) => s.pendingDecision);
@@ -140,6 +168,25 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
   // commands are static for now (no skill-driven dynamic entries yet).
   const registry = useMemo(() => buildRegistry(), []);
 
+  // Composite ref callback for the outermost controls Box. Fans the
+  // same DOM element to two consumers:
+  //
+  //   1. ``setProbeControlsRef`` — the BLADE_AI_DEBUG_OVERFLOW probe,
+  //      already there for diagnostics.
+  //   2. ``setChromeMeasureRef`` — Phase 3.2 measureElement source.
+  //      MainContent reads this in a ``useLayoutEffect`` and calls
+  //      ``measureElement`` to learn the chrome height precisely,
+  //      replacing the prior hard-coded ``CHROME_ROWS_RESERVE=26``.
+  //
+  // useCallback keeps the function identity stable across re-renders
+  // so Ink doesn't unmount + re-mount the Box ref every time Composer
+  // re-renders. Both setters are module-level functions with stable
+  // identity, so empty deps are correct.
+  const attachControlsRef = useCallback((el: DOMElement | null) => {
+    setProbeControlsRef(el);
+    setChromeMeasureRef(el);
+  }, []);
+
   // Composer's Esc/Ctrl+C handling now only fires when ``busy`` AND
   // we're NOT waiting on a confirm dialog — Select owns the keyboard
   // during waiting_confirmation. Without this gate, both
@@ -149,6 +196,15 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
   // means there's no need for the old Y/N branch anymore — Select
   // dispatches the user's choice through CONFIRM_USER_DECIDED and
   // the effect below runs the network calls.
+  // Manual /compact in-flight flag — gates a separate Esc binding
+  // below because /compact runs while ``streamState === "idle"``
+  // (so ``busy`` is false and the existing turn/replay binding is
+  // inactive). Narrow selector — only flips when the slot opens or
+  // closes, not on every reducer dispatch.
+  const manualCompactInFlight = useAppSelector(
+    (s) => s.currentManualCompact !== null,
+  );
+
   useInput(
     (input, key) => {
       const isExitKey = key.escape || (key.ctrl && input === "c");
@@ -163,6 +219,22 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
       cancelTurn();
     },
     { isActive: busy && !awaitingConfirmation },
+  );
+
+  // Separate Esc binding for manual /compact. Reason for a second
+  // useInput rather than folding it into the one above: /compact
+  // runs with ``busy === false`` (it's not a /turn), so reusing
+  // the turn binding's gate would force ``busy`` to be true during
+  // /compact, which would re-enable the LoadingIndicator and lock
+  // the InputPrompt for the wrong reason. Two narrow bindings keep
+  // each side's "what does Esc mean here?" explicit.
+  useInput(
+    (input, key) => {
+      const isExitKey = key.escape || (key.ctrl && input === "c");
+      if (!isExitKey) return;
+      cancelManualCompact();
+    },
+    { isActive: manualCompactInFlight },
   );
 
   // Ctrl+O — toggle ``constrainHeight``. Always active so the user
@@ -232,6 +304,68 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
       cancelled = true;
     };
   }, [pendingDecision, dispatch, resolveConfirm, submitTurn]);
+
+  // Phrase cycler driver — ticks ``PHRASE_TICK`` every 8s while a
+  // turn is in flight so the LoadingIndicator's fallback header label
+  // rotates through the i18n phrase pool. Without this rotation,
+  // dead-air windows (between thinking sessions, before the first
+  // tool, after a tool ends but before the next event) sit on a
+  // static label and the user has no liveness signal beyond the
+  // second counter.
+  //
+  // 8s cadence trade-off: long enough that the eye registers the
+  // change as deliberate (qwen-code uses 15s, which felt sluggish for
+  // our typical 30-60s inject turns); short enough that even ~10s
+  // replies see at least one rotation. Going below ~5s starts to
+  // feel like distracting flicker.
+  //
+  // Gating:
+  //   * ``streamState === "responding"`` — same condition that makes
+  //     the LoadingIndicator visible. No point cycling when nothing
+  //     is consuming the value.
+  //   * ``!compactionInFlight`` — during memory compaction the
+  //     ``MemoryCompactingIndicator`` owns the spinner slot
+  //     (single-spinner mutex). Pausing here prevents a phrase tick
+  //     leaking out at the moment compaction ends.
+  //
+  // De-dup with ``useRef``: the previous phrase is tracked in a ref
+  // (not in the effect's closed-over state) so successive ticks on
+  // the same active session see the *latest* picked phrase rather
+  // than the snapshot at effect-mount time. Without the ref the
+  // ``pickRandomDistinct`` call would always see ``""`` and degrade
+  // to plain uniform random — losing the "no immediate repeat"
+  // guarantee. Adding ``state.idlePhrase`` to deps would fix the
+  // staleness but tear down + rebuild the interval on every tick,
+  // breaking the 8s cadence.
+  //
+  // The reducer stays pure: ``Math.random`` is invoked here in the
+  // dispatcher and the chosen phrase is pre-baked into the action
+  // payload. The reducer also early-returns when the new phrase
+  // equals the current one (degenerate single-entry pools), avoiding
+  // a no-op re-render.
+  const lastPhraseRef = useRef<string>("");
+  useEffect(() => {
+    const active = streamState === "responding" && !compactionInFlight;
+    if (!active) return;
+    const tick = () => {
+      const pool = getPool();
+      const next = pickRandomDistinct(pool, lastPhraseRef.current);
+      lastPhraseRef.current = next;
+      dispatch({ type: "PHRASE_TICK", phrase: next });
+    };
+    // Fire immediately so the first phrase change happens at turn
+    // start (instead of 8s in). Without this, the user sees the
+    // first-pool-entry fallback until the first interval boundary.
+    tick();
+    const id = setInterval(tick, 8_000);
+    return () => clearInterval(id);
+  }, [streamState, compactionInFlight, dispatch]);
+
+  // Stable ``onExit`` reference so React.memo on InputPrompt can
+  // shallow-compare props successfully. Inline ``() => app.exit()``
+  // creates a new lambda each Composer render → memo bails →
+  // InputPrompt re-renders for nothing.
+  const handleExit = useCallback(() => app.exit(), [app]);
 
   const handleSubmit = useCallback(
     (text: string) => {
@@ -316,7 +450,13 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
         // ``InputPrompt.enterLocked`` already blocks Enter during
         // streaming. Defense-in-depth for non-prompt code paths
         // that might one day dispatch through here.)
-        if (state.streamState !== "idle") {
+        // Read state once at command-invoke time; the handler ctx
+        // gets the same snapshot. Equivalent to the old behaviour
+        // (whole-tree subscription + .streamState read), but without
+        // a live subscription that re-renders Composer on every
+        // unrelated state change.
+        const stateSnapshot = getAppState();
+        if (stateSnapshot.streamState !== "idle") {
           const allowed = parsed.sub
             ? !!matchedSub?.streamSafe
             : !!cmd.streamSafe;
@@ -351,11 +491,12 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
         const ctx: SlashCommandContext = {
           client,
           sessionId,
-          state,
+          state: stateSnapshot,
           registry,
           dispatch,
-          exit: () => app.exit(),
+          exit: handleExit,
           beginReplay,
+          beginManualCompact,
           submitTurn,
         };
 
@@ -381,11 +522,31 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
 
       void submitTurn(trimmed);
     },
-    [submitTurn, app, client, sessionId, state, dispatch, registry],
+    // ``getAppState`` is referentially stable (Store identity for the
+    // Provider lifetime), so its presence in deps doesn't churn the
+    // callback. Replaces the prior ``state`` slot which used to
+    // change on every reducer dispatch and rebuilt this callback
+    // each time. ``handleExit`` is also useCallback'd → stable.
+    //
+    // ``app`` stays in deps because it's still referenced inside the
+    // closure transitively (handleExit captures it). Keeping it here
+    // makes the lint-friendly "all referenced bindings are deps"
+    // contract visible even though removing it wouldn't actually
+    // break anything.
+    [
+      submitTurn,
+      app,
+      client,
+      sessionId,
+      getAppState,
+      dispatch,
+      registry,
+      handleExit,
+    ],
   );
 
   return (
-    <Box flexDirection="column" marginTop={1} ref={setProbeControlsRef}>
+    <Box flexDirection="column" marginTop={1} ref={attachControlsRef}>
       {/* Order matters: LoadingIndicator first, then the sticky todo
           list, then InputPrompt. The user reads the strip "right
           above where I type"; thinking / replying chrome belongs
@@ -398,18 +559,43 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
           flight, MemoryCompactingIndicator owns the spinner slot
           (LoadingIndicator's hook nullifies its own visibility). The
           two never both render — keeps the "what's happening"
-          signal singular. */}
-      {compactionInFlight && <MemoryCompactingIndicator />}
-      <LoadingIndicator />
-      {activeStepper && <PhaseStepperCard item={activeStepper} />}
-      <InputPrompt
-        disabled={awaitingConfirmation}
-        enterLocked={busy && !awaitingConfirmation}
-        registry={registry}
-        onSubmit={handleSubmit}
-        onExit={() => app.exit()}
-      />
-      <Footer />
+          signal singular.
+          ManualCompactIndicator (client-driven, runs for the whole
+          /compact lifetime) takes priority over MemoryCompactingIndicator
+          (server-driven, only the LLM call window) so a /compact-
+          initiated compaction shows ONE continuous spinner rather
+          than the server-side one flashing in and out mid-operation. */}
+      {manualCompactInFlight ? (
+        <ManualCompactIndicator />
+      ) : (
+        compactionInFlight && <MemoryCompactingIndicator />
+      )}
+      {/* Sub-control wrappers — each strip lives in its own Box so
+       *  the overflow probe (only active when BLADE_AI_DEBUG_OVERFLOW=1)
+       *  can ``measureElement`` it independently. The wrapping Box is
+       *  ``flexDirection="column"`` (the Ink default) so it does NOT
+       *  add any layout cost — Yoga collapses single-child columns
+       *  into the child's own dimensions. Production builds ignore
+       *  the refs entirely; cost is just the callback invocation
+       *  Ink would do anyway for any ref-bearing element. */}
+      <Box flexDirection="column" ref={setProbeLoadingRef}>
+        <LoadingIndicator />
+      </Box>
+      <Box flexDirection="column" ref={setProbeStepperRef}>
+        {activeStepper && <PhaseStepperCard item={activeStepper} />}
+      </Box>
+      <Box flexDirection="column" ref={setProbeInputRef}>
+        <InputPrompt
+          disabled={awaitingConfirmation}
+          enterLocked={busy && !awaitingConfirmation}
+          registry={registry}
+          onSubmit={handleSubmit}
+          onExit={handleExit}
+        />
+      </Box>
+      <Box flexDirection="column" ref={setProbeFooterRef}>
+        <Footer />
+      </Box>
     </Box>
   );
 };

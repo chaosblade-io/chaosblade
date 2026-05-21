@@ -22,11 +22,12 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { t } from "../../i18n/index.js";
 import { Theme } from "../../theme/colors.js";
 import type { ThinkingItem } from "../../state/types.js";
 
-export const ThinkingMessage: React.FC<{ item: ThinkingItem }> = ({ item }) => {
+const ThinkingMessageInternal: React.FC<{ item: ThinkingItem }> = ({ item }) => {
   const duration = formatDuration(item.durationMs);
   return (
     <Box paddingLeft={2} marginTop={1}>
@@ -36,6 +37,9 @@ export const ThinkingMessage: React.FC<{ item: ThinkingItem }> = ({ item }) => {
     </Box>
   );
 };
+
+// React.memo: trivial render but in the streaming hot loop.
+export const ThinkingMessage = memo(ThinkingMessageInternal);
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return "<1s";

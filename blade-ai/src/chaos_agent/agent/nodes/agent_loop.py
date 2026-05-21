@@ -121,6 +121,34 @@ async def agent_loop(state: AgentState) -> dict:
     count = state.get("agent_loop_count", 0) + 1
     skill_name = state.get("skill_name", "")
 
+    # Patch C — stamp the wall-clock start once per inject turn. Done
+    # at agent_loop entry (the earliest LLM-driven node) so subsequent
+    # router checks have something to compare against. The 0.0
+    # sentinel makes this idempotent for re-entry after replan.
+    import time as _time
+    if not state.get("pipeline_started_at"):
+        # Caller will merge this into state via the returned dict;
+        # in-place mutation here is also picked up by LangGraph because
+        # AgentState is a TypedDict.
+        state["pipeline_started_at"] = _time.time()
+
+    # Patch E — record this as the first pipeline attempt the very
+    # first time agent_loop runs in a turn. Subsequent re-entries
+    # (graph replan / LLM target switch / user rerun) bump the
+    # counter from their respective call sites; agent_loop only
+    # owns the "initial" reason.
+    if int(state.get("pipeline_attempt", 0) or 0) == 0:
+        from chaos_agent.agent.attempt_tracker import (
+            REASON_INITIAL,
+            begin_attempt,
+        )
+        delta = begin_attempt(
+            state,
+            target=state.get("target"),
+            reason=REASON_INITIAL,
+        )
+        state.update(delta)
+
     # Emit status event
     tracker = get_tracker(task_id)
     if skill_name:
@@ -153,7 +181,12 @@ async def agent_loop(state: AgentState) -> dict:
     # The actual LLM reasoning is handled by LangGraph's ReAct pattern
     # This node just tracks the iteration count
     tracker.complete(f"Agent loop iteration {count} done")
-    return {"agent_loop_count": count}
+    # Patch C — annotate result with WALL_CLOCK_TIMEOUT cause if the
+    # router is about to terminate due to the wall-clock budget. The
+    # router itself can't write state (it's a pure routing function),
+    # so the node must do the labelling on its way out.
+    from chaos_agent.agent.router import mark_wall_clock_timeout
+    return mark_wall_clock_timeout(state, {"agent_loop_count": count})
 
 
 def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):

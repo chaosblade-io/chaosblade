@@ -15,9 +15,11 @@
  *     ⚠  <name>                 <message>            ← non-blocking warning
  *     •  <name>                 <message>            ← pure info, no pass/fail
  *
- * Border: ``Theme.border.diagnostic`` (medium violet) — distinct from
- * every other card border so a stack of scrollback artefacts still
- * tells the user "here is the diagnostic snapshot" at a glance.
+ * Border: ``Theme.border.diagnostic`` — aliased to ``forge.fire`` (the
+ * same brand orange used by BootDoctorCard). The two doctor cards
+ * now share one colour, forming a recognisable "doctor family". This
+ * is safe because they never coexist in scrollback (boot doctor at
+ * startup splash time, runtime doctor on user-triggered ``/doctor``).
  *
  * Suggested-fixes block: lists every row whose status is not ``ok`` and
  * carries an actionable hint — server-unreachable, protocol mismatch,
@@ -27,10 +29,12 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { t } from "../i18n/index.js";
 import type { RuntimeDoctorCardItem } from "../state/types.js";
 import { Theme } from "../theme/colors.js";
 import { Icons } from "../theme/icons.js";
+import { useTerminalBgInfo } from "../theme/TerminalBgContext.js";
 import { useBootCardWidth } from "./boot/BootCardFrame.js";
 
 /** Width of the leading glyph cell (1 cell glyph + 2 cells gap). */
@@ -268,11 +272,32 @@ const Row: React.FC<{ row: DoctorRow }> = ({ row }) => (
   </Box>
 );
 
-export const RuntimeDoctorCard: React.FC<{ item: RuntimeDoctorCardItem }> = ({
+const RuntimeDoctorCardInternal: React.FC<{ item: RuntimeDoctorCardItem }> = ({
   item,
 }) => {
   const width = useBootCardWidth();
-  const rows = buildRows(item);
+  // Terminal-bg detection result is held in React Context (set once
+  // at boot by cli.tsx after the OSC 11 probe). We surface it as an
+  // info row so users debugging "why is my user-message bubble the
+  // wrong colour?" can see what we detected and which source path
+  // produced it (env override / COLORFGBG / OSC 11 / fallback).
+  // Doesn't go through buildRows because it doesn't come from the
+  // server preflight payload — it's purely a client-side concern.
+  const bgInfo = useTerminalBgInfo();
+  const bgDetail = bgInfo.rgb
+    ? `${bgInfo.kind} (${bgInfo.source}: rgb(${bgInfo.rgb.r},${bgInfo.rgb.g},${bgInfo.rgb.b}))`
+    : `${bgInfo.kind} (${bgInfo.source})`;
+  // Spread into a new array so we don't mutate buildRows' return.
+  // Functionally equivalent to .push (rows is local to this render),
+  // but cleaner — buildRows callers can trust their result is theirs.
+  const rows: DoctorRow[] = [
+    ...buildRows(item),
+    {
+      status: "info",
+      name: t("doctor.terminal_bg"),
+      body: <Text>{bgDetail}</Text>,
+    },
+  ];
   const fixes = rows.filter((r) => r.fix);
   const time = formatDateTime(item.capturedAt);
 
@@ -327,3 +352,10 @@ export const RuntimeDoctorCard: React.FC<{ item: RuntimeDoctorCardItem }> = ({
     </Box>
   );
 };
+
+// React.memo: RuntimeDoctorCard runs ``buildRows`` on every render —
+// non-trivial work that's wasted when the underlying item ref hasn't
+// changed. ``useTerminalBgInfo`` returns a stable value once the boot
+// probe completes, so the bg row addition is also a no-op between
+// renders.
+export const RuntimeDoctorCard = memo(RuntimeDoctorCardInternal);

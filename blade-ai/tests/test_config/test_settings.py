@@ -43,7 +43,10 @@ class TestSettingsDefaults:
         assert s.timeout_blade == 30
         assert s.timeout_kubectl == 30
         assert s.timeout_kubectl_exec == 60
-        assert s.timeout_llm == 180
+        # timeout_llm tightened from 180s → 30s so a misconfigured
+        # base URL surfaces a clear error in ~60s (1 retry × 30s)
+        # instead of ~9 minutes (3 retries × 180s).
+        assert s.timeout_llm == 30
         assert s.timeout_default == 60
 
     def test_default_loop_limits(self):
@@ -157,3 +160,90 @@ class TestSettingsPriority:
         from chaos_agent.config.settings import Settings
 
         assert Settings.model_config["env_prefix"] == "BLADE_AI_"
+
+
+class TestEmptyStringFallback:
+    """Empty string in config.json must NOT shadow ENV / code defaults.
+
+    Regression test for the bug where setting ``"api_base_url": ""`` in
+    config.json caused the LLM client to build with an empty base URL —
+    LangChain's ChatOpenAI silently accepts it but every subsequent
+    request hangs / 401s with no clear error surface for the user.
+    The fix treats empty / whitespace-only strings as 'unset' so the
+    next source in the priority chain (env, then default) provides the
+    real value.
+    """
+
+    def test_empty_string_in_config_falls_back_to_env(self, monkeypatch, tmp_path):
+        from chaos_agent.config.settings import Settings
+
+        config_file = tmp_path / "test_config.json"
+        config_file.write_text(
+            '{"api_base_url": "", "llm_api_key": "test"}', encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "chaos_agent.config.settings._CONFIG_FILE", config_file,
+        )
+        monkeypatch.setenv("BLADE_AI_API_BASE_URL", "https://env.example.com/v1")
+
+        s = Settings()
+        assert s.api_base_url == "https://env.example.com/v1"
+
+    def test_empty_string_in_config_falls_back_to_default(
+        self, monkeypatch, tmp_path,
+    ):
+        from chaos_agent.config.settings import Settings
+
+        config_file = tmp_path / "test_config.json"
+        config_file.write_text(
+            '{"api_base_url": "", "model_name": "", "llm_api_key": "test"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "chaos_agent.config.settings._CONFIG_FILE", config_file,
+        )
+        monkeypatch.delenv("BLADE_AI_API_BASE_URL", raising=False)
+        monkeypatch.delenv("BLADE_AI_MODEL_NAME", raising=False)
+
+        s = Settings()
+        assert s.api_base_url == (
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        assert s.model_name == "qwen3.6-max-preview"
+
+    def test_whitespace_only_string_in_config_treated_as_unset(
+        self, monkeypatch, tmp_path,
+    ):
+        from chaos_agent.config.settings import Settings
+
+        config_file = tmp_path / "test_config.json"
+        config_file.write_text(
+            '{"model_name": "   \\t", "llm_api_key": "test"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "chaos_agent.config.settings._CONFIG_FILE", config_file,
+        )
+        monkeypatch.delenv("BLADE_AI_MODEL_NAME", raising=False)
+
+        s = Settings()
+        assert s.model_name == "qwen3.6-max-preview"
+
+    def test_explicit_non_empty_string_in_config_still_overrides_env(
+        self, monkeypatch, tmp_path,
+    ):
+        """The fix must not break the canonical 'config > env > default' priority."""
+        from chaos_agent.config.settings import Settings
+
+        config_file = tmp_path / "test_config.json"
+        config_file.write_text(
+            '{"api_base_url": "https://from-config.example.com", "llm_api_key": "test"}',
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "chaos_agent.config.settings._CONFIG_FILE", config_file,
+        )
+        monkeypatch.setenv("BLADE_AI_API_BASE_URL", "https://from-env.example.com")
+
+        s = Settings()
+        assert s.api_base_url == "https://from-config.example.com"

@@ -4,30 +4,54 @@
  * Returns a single object so the LoadingIndicator component is purely
  * presentational (no store coupling, easy to snapshot-test).
  *
- * The header label adapts to phase:
- *   - "thinking" while a thinking session is open (thoughtBuffer
- *     non-empty)
- *   - "responding" while the agent is streaming the visible reply
- *     (any other receiving state — token / tool / waiting on API)
- * That keeps the spinner row honest about what stage of the turn the
- * user is watching, without resurrecting the rotating-subject
- * behaviour we just retired (which leaked the live last-sentence into
- * the header and made the spinner feel like content rather than
- * chrome).
+ * Header label resolution (priority top-down):
+ *   1. ``thoughtBuffer`` non-empty   → localized "thinking"
+ *   2. ``thoughtSubject`` set        → use directly (tool name set by
+ *      TOOL_STARTED, "resuming…"/"stopping…" set by CONFIRM_RESOLVED,
+ *      "replaying ..." set by REPLAY_STARTED)
+ *   3. else                          → ``state.idlePhrase`` (the
+ *      reducer-driven cycler ticked by Composer every 8s)
  *
- * Token counter is sourced from ``state.turnInputTokens +
- * turnOutputTokens`` — authoritative figures the server emits via the
- * ``usage`` SSE event after each LLM call. The prior chars/4
- * approximation has been retired so the live tail and the
- * end-of-turn TurnUsageItem agree on the same numbers.
+ * The previous design had a 4th branch that hardcoded "responding"
+ * whenever ``isReceiving`` was true. That made a long agent reply
+ * sit on the static word "responding" for tens of seconds — the
+ * user couldn't tell whether the agent had stalled or was still
+ * working. The reducer-driven cycler now covers that case AND the
+ * dead-air idle case with the same rotation, so the static branch
+ * is gone.
+ *
+ * Token counter — Phase 2.2 two-tier model:
+ *
+ *   1. **Live tail** (this hook) returns a smoothly-animated estimate
+ *      derived from ``streamingResponseCharsRef.current / 4``. The
+ *      ref is incremented per raw token event in ``useStream`` (zero
+ *      React work), polled here via ``useAnimationFrame`` at 100 ms.
+ *      The hook tweens between samples so the displayed figure
+ *      climbs smoothly (~10 Hz visual rate) rather than jumping in
+ *      big chunks driven by server ``usage`` events (which only land
+ *      at LLM call boundaries — often 4-8 seconds apart).
+ *   2. **Committed history row** (``TurnUsageItem`` rendered by
+ *      ``TurnUsageMessage``) uses the authoritative server figures
+ *      from ``turnInputTokens + turnOutputTokens`` for the
+ *      after-the-fact summary. The live estimate is replaced by the
+ *      exact count once the turn commits.
+ *
+ * The chars/4 approximation is the standard rough conversion (English-
+ * heavy CoT runs about 3.8-4.2 chars/token). It's not exact — the
+ * committed summary row carries the truth — but it's stable and
+ * smooth, which the live tail needs to feel "alive". The exact
+ * figures are still available for users who care; this just makes
+ * the spinner's tail counter pleasant to watch instead of stuttery.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { t } from "../i18n/index.js";
 import { useAppSelector } from "../state/store.js";
+import { streamingResponseCharsRef } from "../state/streamingRefs.js";
 import { isNarrow, useTerminalSize } from "./useTerminalSize.js";
+import { useAnimationFrame } from "./useAnimationFrame.js";
 import { tailWrappedLines } from "../utils/wrapText.js";
-import { usePhraseCycler } from "./usePhraseCycler.js";
+import { getPool } from "../utils/phrasePool.js";
 
 export interface LoadingIndicatorProps {
   visible: boolean;
@@ -39,9 +63,17 @@ export interface LoadingIndicatorProps {
   isReceiving: boolean;
   /** True while a turn is in progress (covers responding + waiting_confirmation). */
   isStreaming: boolean;
-  /** Authoritative cumulative token count for the current turn (input
-   *  + output). Sourced from server ``usage`` events. ``0`` until the
-   *  first LLM call ends, then jumps in steps. */
+  /** Smooth-animated estimate of the current turn's token count
+   *  (``streamingResponseCharsRef.current / 4``, polled by
+   *  ``useAnimationFrame``). Updates at ~10 Hz while the indicator
+   *  is visible — bursts of token chars resolve as a gentle climb,
+   *  not a step ladder. ``0`` until the first token arrives.
+   *
+   *  This is intentionally an **estimate**: the authoritative figure
+   *  lives on the committed ``TurnUsageItem`` (rendered by
+   *  ``TurnUsageMessage`` once the turn ends), sourced from server
+   *  ``usage`` events. The estimate prioritises responsiveness in
+   *  the live tail; the committed summary prioritises accuracy. */
   turnTokens: number;
   /**
    * Last ~3 visual lines of the live thinking buffer. Empty array when
@@ -79,9 +111,8 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
   const thoughtSubject = useAppSelector((s) => s.thoughtSubject);
   const isReceiving = useAppSelector((s) => s.isReceiving);
   const turnStartedAt = useAppSelector((s) => s.turnStartedAt);
-  const turnInputTokens = useAppSelector((s) => s.turnInputTokens);
-  const turnOutputTokens = useAppSelector((s) => s.turnOutputTokens);
   const constrainHeight = useAppSelector((s) => s.constrainHeight);
+  const idlePhrase = useAppSelector((s) => s.idlePhrase);
   const { columns, rows } = useTerminalSize();
 
   const isStreaming =
@@ -115,6 +146,21 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
   // (Composer's Esc handling, InputPrompt disabled).
   const visible = streamState === "responding" && !compactionInFlight;
 
+  // Phase 2.2 — smooth animated token counter. The hook polls the
+  // module-level char counter (written per-token in ``useStream``
+  // with zero React work) at 100ms while visible and tweens the
+  // displayed value upward so the counter feels alive even when
+  // raw token arrivals are bursty. Polling pauses (``null`` interval)
+  // when the indicator is hidden so we don't burn intervals during
+  // ``waiting_confirmation`` / idle. The /4 divisor is the standard
+  // chars→tokens rough conversion; for the after-the-fact exact
+  // figure the committed TurnUsageItem uses server ``usage`` events.
+  const animatedChars = useAnimationFrame(
+    streamingResponseCharsRef,
+    visible ? 100 : null,
+  );
+  const turnTokens = Math.round(animatedChars / 4);
+
   // Local 1Hz timer for elapsed seconds. Gated on ``visible`` (not
   // ``isStreaming``) so the timer also stops during
   // waiting_confirmation — every 1Hz setState here is one more
@@ -135,12 +181,6 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
     return () => clearInterval(id);
   }, [visible, turnStartedAt]);
 
-  // Witty phrase used as a fallback header label when nothing more
-  // specific is happening (e.g. waiting on the LLM's first token).
-  // Gated on ``visible`` so the 15s cycler timer is also paused
-  // during waiting_confirmation.
-  const phrase = usePhraseCycler(visible);
-
   // Header label resolution order:
   //   1. live thinking session   → localized "thinking"
   //   2. thoughtSubject set      → use it directly (tool name set by
@@ -149,18 +189,25 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
   //      This keeps the header informative during tool execution
   //      and confirm-gate transitions — a regression we'd otherwise
   //      ship by collapsing every non-thinking phase to a generic
-  //      "responding".
-  //   3. receiving content       → localized "responding"
-  //   4. waiting on first event  → rotating idle phrase
+  //      cycling phrase.
+  //   3. else                    → ``idlePhrase`` from state, ticked
+  //      by Composer's PHRASE_TICK driver every 8s so a long agent
+  //      reply / long-running node still has rotating header text
+  //      (the static "responding" branch the previous design carried
+  //      gave the user no liveness signal during such windows).
+  //
+  // Pool fallback: if the cycler hasn't ticked yet (``idlePhrase ===
+  // ""`` — e.g. fresh ``waiting_confirmation`` -> ``responding``
+  // transition before the first interval boundary), use the first
+  // pool entry so the header is never blank.
+  const fallbackPhrase = idlePhrase || getPool()[0] || "thinking";
   let headerLabel: string;
   if (thoughtBuffer.length > 0) {
     headerLabel = t("loading.thinking_label");
   } else if (thoughtSubject) {
     headerLabel = thoughtSubject;
-  } else if (isReceiving) {
-    headerLabel = t("loading.responding_label");
   } else {
-    headerLabel = phrase;
+    headerLabel = fallbackPhrase;
   }
 
   // Throttle the thinking buffer that drives ``bodyLines``. The
@@ -253,17 +300,21 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
   // latest line and the InputPrompt fence. Once the buffer crosses
   // ``bodyMax`` wrapped lines the padding is gone and the block
   // starts the normal bottom-anchored scroll.
-  let bodyLines: string[];
-  if (narrow || displayedBuffer.length === 0) {
-    bodyLines = [];
-  } else {
+  // Phase 3.5 — useMemo the wrap+pad pipeline. ``tailWrappedLines``
+  // is O(N) in buffer length and runs every render; the indicator
+  // re-renders at ~10 Hz from useAnimationFrame + every thinking
+  // append + every 1 Hz elapsed tick. Memoising on the four inputs
+  // (the only things that actually affect ``bodyLines``) collapses
+  // most of those re-renders into a cached array reference, which
+  // also helps downstream React reconciliation skip the body Box.
+  const bodyLines = useMemo<string[]>(() => {
+    if (narrow || displayedBuffer.length === 0) return [];
     const realLines = tailWrappedLines(displayedBuffer, bodyMax, bodyWidth);
     const padding = Math.max(0, bodyMax - realLines.length);
-    bodyLines =
-      padding > 0
-        ? [...realLines, ...new Array<string>(padding).fill("")]
-        : realLines;
-  }
+    return padding > 0
+      ? [...realLines, ...new Array<string>(padding).fill("")]
+      : realLines;
+  }, [narrow, displayedBuffer, bodyMax, bodyWidth]);
 
   return {
     visible,
@@ -271,7 +322,7 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
     elapsedSec,
     isReceiving,
     isStreaming,
-    turnTokens: turnInputTokens + turnOutputTokens,
+    turnTokens,
     bodyLines,
     narrow,
     bodyWidth,

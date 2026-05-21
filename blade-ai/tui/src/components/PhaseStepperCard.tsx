@@ -43,6 +43,7 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { useBootCardWidth } from "./boot/BootCardFrame.js";
 import { t } from "../i18n/index.js";
 import type { PhaseStep, PhaseStepperItem } from "../state/types.js";
@@ -99,7 +100,7 @@ const StepRow: React.FC<{ index: number; step: PhaseStep }> = ({
   );
 };
 
-export const PhaseStepperCard: React.FC<{ item: PhaseStepperItem }> = ({
+const PhaseStepperCardInternal: React.FC<{ item: PhaseStepperItem }> = ({
   item,
 }) => {
   const width = useBootCardWidth();
@@ -130,3 +131,10 @@ export const PhaseStepperCard: React.FC<{ item: PhaseStepperItem }> = ({
     </Box>
   );
 };
+
+// React.memo: phase stepper renders during the inject hot loop. The
+// item ref changes on every step transition (immutable reducer), so
+// the strip updates correctly; what memo blocks is the no-op renders
+// triggered by sibling state churn (token streams, tool events) when
+// the stepper's own state hasn't moved.
+export const PhaseStepperCard = memo(PhaseStepperCardInternal);

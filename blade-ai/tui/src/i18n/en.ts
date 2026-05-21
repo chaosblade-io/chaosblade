@@ -21,23 +21,31 @@ import type { Dict } from "./index.js";
 
 export const en: Dict = {
   // -- thinking phrase pool -----------------------------------------
+  // Domain-coloured phrases for blade-ai. The cycler shows one of
+  // these on the LoadingIndicator while there is no more specific
+  // label in flight. Each phrase maps to something the agent
+  // plausibly does over the inject pipeline (intent → safety →
+  // baseline → execute → verify → recover), so the rotation reads
+  // like the agent narrating its own work — not like a generic
+  // "thinking…" placeholder.
   "thinking.phrases": [
     "thinking",
-    "decomposing",
-    "considering",
-    "comparing tools",
-    "recalling context",
-    "weighing blast radius",
-    "verifying intent",
-    "checking safety",
-    "reviewing skills",
-    "drafting reply",
+    "evaluating blast radius",
+    "checking safety constraints",
+    "reviewing target health",
+    "consulting skill playbooks",
+    "selecting injection vector",
+    "capturing baseline metrics",
+    "observing system response",
+    "weighing rollback paths",
+    "drafting fault plan",
   ],
 
   // -- generic LoadingIndicator chrome ------------------------------
   "loading.esc_to_cancel": "esc to cancel",
   "loading.thinking_label": "thinking",
   "loading.responding_label": "responding",
+  "loading.tokens_estimate": "~{n} tokens",
 
   // -- Overflow / dynamic-frame height constraint -------------------
   "overflow.more_lines": "({count} lines folded · Ctrl+O to expand)",
@@ -96,11 +104,13 @@ export const en: Dict = {
   "command.help.desc": "List available commands",
   "command.clear.desc": "Clear the terminal scrollback for this session",
   "command.exit.desc": "Exit blade-ai",
-  "command.mode.desc": "Toggle display density — calm / working / dense (cycles when no arg)",
+  "command.mode.desc": "Set display density — pick one of the subcommands below",
   "command.mode.calm.desc": "calm — minimal density, key signals only",
   "command.mode.working.desc": "working — default density, full tool output",
   "command.mode.dense.desc": "dense — high density, every diagnostic field",
-  "command.permission.desc": "Toggle permission mode — auto / confirm",
+  "command.permission.desc": "Set permission mode — pick one of the subcommands below",
+  "command.permission.auto.desc": "auto — agent injects without asking; effective on the next /turn",
+  "command.permission.confirm.desc": "confirm — show the ARMED/ABORTED gate before each injection (default)",
   "command.session.desc": "Show session info (cluster / namespace / model / mode)",
   "command.run.desc": "Submit a natural-language turn (same as typing without slash)",
   "command.plan.desc": "Fault-injection preview (Dry-Run): intent + plan + safety_check; non-fault chat falls through to /run semantics",
@@ -161,6 +171,8 @@ export const en: Dict = {
   "help.group.session": "Session",
   "help.group.tasks": "Tasks",
   "help.group.history": "History",
+  "help.card.title": "Commands",
+  "help.card.tip": "Tip: type / then TAB to autocomplete",
 
   // -- /doctor output -----------------------------------------------
   "doctor.head": "Diagnostics",
@@ -173,6 +185,7 @@ export const en: Dict = {
   "doctor.protocol": "protocol",
   "doctor.lang": "language",
   "doctor.mode": "permission mode",
+  "doctor.terminal_bg": "terminal background",
   "doctor.preflight": "environment self-check",
   "doctor.fix.server_unreachable":
     "Check the blade-ai server is running and reachable at the URL above; restarting the TUI will respawn an embedded server locally.",
@@ -183,11 +196,13 @@ export const en: Dict = {
 
   // -- slash command outputs ----------------------------------------
   "mode.usage_unknown": "unknown mode '{value}' — expected 'auto' or 'confirm'",
+  "mode.usage_missing": "/permission needs an arg — try 'auto' / 'confirm' (current: {mode})",
   "mode.already": "permission mode already {mode}",
-  "mode.changed": "permission mode → **{mode}**",
+  "mode.changed": "permission mode → **{mode}** (takes effect on the next /turn)",
 
   // -- /mode (display density: calm / working / dense) --------------
   "display.usage_unknown": "unknown density '{value}' — expected 'calm' / 'working' / 'dense'",
+  "display.usage_missing": "/mode needs an arg — try 'calm' / 'working' / 'dense' (current: {mode})",
   "display.already": "display mode already {mode}",
   "display.changed": "display mode → **{mode}**",
 
@@ -210,12 +225,15 @@ export const en: Dict = {
   "review.created_label": "created",
 
   // -- /experiments ---------------------------------------------------
-  "command.experiments.desc": "list every fault scenario the loaded skills can run (LLM-heavy on cold cache)",
-  "experiments.loading": "loading the fault catalog (first call invokes the LLM) …",
+  "command.experiments.desc": "list every fault scenario the loaded skills can run",
+  "experiments.loading": "loading the fault catalog …",
   "experiments.failed": "failed to load experiments: {err}",
   "experiments.empty": "no experiments found — check that /skills directory contains SKILL.md files",
   "experiments.head": "fault catalog ({total} use cases):",
   "experiments.fault_count_unit": "case(s)",
+  "experiments.card.title": "Experiments",
+  "experiments.card.count": "{n} cases",
+  "experiments.card.symptom_empty": "(no symptom)",
 
   // -- /recover -------------------------------------------------------
   "command.recover.desc": "Fault recovery — pass task_id / latest, or 'list' sub to see recoverable tasks",
@@ -282,7 +300,13 @@ export const en: Dict = {
   "command.compact.desc": "Force-compact the current session's context (saves LLM tokens)",
   "compact.busy": "still streaming — wait for the current turn to finish, then retry",
   "compact.starting": "compacting the current session context …",
+  "compact.in_progress": "  LLM summariser is running — this can take several seconds",
   "compact.failed": "compaction failed: {err}",
+  // ManualCompactIndicator: spinner row visible for the entire
+  // /compact lifetime (noop / strip / LLM all uniform).
+  "compact.indicator_label": "compacting session context…",
+  "compact.indicator_meta": "({elapsed} · esc to cancel)",
+  "compact.cancelled": "compaction cancelled",
   "compact.noop": "{before} tokens, no compaction needed ({layer})",
   "compact.ok": "compacted ({layer}): {before} → {after} tokens (saved {saved} / {pct}%)",
 
@@ -304,8 +328,14 @@ export const en: Dict = {
   "model.usage": "usage:\n  /model list          — list candidate models\n  /model set <id>      — switch active model",
   "model.head": "active model: {active}",
   "model.base_url_label": "api_base_url",
-  "model.list_tail": "use **/model set <id>** to switch; restart server to fully apply",
+  "model.list_tail": "use **/model set <id>** to switch; takes effect on the next /turn",
   "model.custom_note": "custom (not in the curated list, but usable)",
+  "model.card.title": "Models",
+  "model.card.count": "{n} models",
+  "model.card.tip": "Tip: /model set <id> to switch · takes effect on the next /turn",
+  "model.card.custom_section": "custom",
+  "model.card.custom_note": "— not in the curated list",
+  "model.card.unset": "(unset)",
   "model.failed": "failed to load model list: {err}",
   "model.set_usage": "usage: /model set <model-id>",
   "model.set_ok": "wrote model_name = {id}{tail}",
@@ -363,14 +393,15 @@ export const en: Dict = {
   "replay.failed": "failed to replay {id}: {err}",
   "replay.unknown_command": "unknown command: /{name} — try /help",
 
-  "status.session": "session",
+  "status.session": "session id",
   "status.cluster": "cluster",
   "status.namespace": "namespace",
   "status.model": "model",
-  "status.mode": "mode",
+  "status.mode": "permission mode",
   "status.created": "created",
   "status.tasks": "tasks",
   "status.failed": "failed to read session state: {err}",
+  "session.card.title": "Session",
 
   // -- Header chrome ------------------------------------------------
   "header.brand_tag": "(TS preview)",
@@ -392,14 +423,30 @@ export const en: Dict = {
   "agent.truncated_earlier": "… +{n} earlier lines · full text in scrollback after turn",
 
   // -- ResultCard chrome --------------------------------------------
-  "result.label.task": "task",
-  "result.label.uid": "uid",
-  "result.label.duration": "duration",
-  "result.label.effect": "effect",
-  "result.label.cause": "cause",
-  "result.label.hint": "hint",
+  "result.label.fault": "Fault",
+  "result.label.uid": "Blade UID",
+  "result.label.duration": "Duration",
+  "result.label.summary": "Summary",
+  "result.label.cause": "Cause",
+  "result.label.hint": "Hint",
+  "result.label.why_partial": "Why partial",
+  // v3 short chip labels (rendered inside [], all uppercase)
+  "result.chip.success": "SUCCESS",
+  "result.chip.partial": "PARTIAL",
+  "result.chip.failed": "FAILED",
+  "result.chip.unknown": "RESULT",
+  // v3 in-card section headings
+  "result.section.outcome": "Outcome",
+  "result.section.effect": "Effect verified",
+  "result.section.recovery_notes": "Recovery notes",
+  "result.section.failure_analysis": "Failure analysis",
+  "result.section.side_effects": "Side effects",
+  "result.label.target": "Target",
+  "result.label.attempts": "Attempts",
+  "result.label.side_effect_item": "Side effect",
+  "result.attempts.label": "succeeded after {n} auto-replan(s)",
   "result.status.success": "Injection succeeded",
-  "result.status.partial": "Partial success",
+  "result.status.partial": "Partial recovery",
   "result.status.failed": "Injection failed",
   "result.status.unknown": "Result",
   "result.show_for_timeline": "/replay {id} instant — for full timeline",
@@ -444,6 +491,41 @@ export const en: Dict = {
   "confirm.execution.preamble": "Confirm the execution plan:",
   "confirm.generic.preamble": "Please confirm:",
 
+  // -- v3 title chip labels (bracket chip style, short uppercase) ---
+  "confirm.intent.chip": "INTENT",
+  "confirm.execution.chip": "EXECUTE",
+  "confirm.generic.chip": "CONFIRM",
+
+  // -- v3 in-card section headings ----------------------------------
+  "confirm.section.decision_signals": "Decision signals",
+  "confirm.section.execution_plan": "Execution plan",
+  "confirm.section.safety_check": "Safety check",
+  "confirm.section.parameters": "Parameters",
+  "confirm.section.target_health": "Target health",
+  "confirm.section.conflicts": "Conflicting experiments",
+  "confirm.section.audit_trail": "Audit trail",
+  // -- v3 extra field labels
+  "confirm.field.attempt": "Attempt",
+  "confirm.field.plan_path": "Plan file",
+  "confirm.field.clarification_round": "Clarification",
+  "confirm.field.intent_reasoning": "Reasoning",
+  "confirm.field.health_summary": "Summary",
+  "confirm.attempt.label": "attempt {n}",
+  "confirm.clarification.label": "{n} clarification round(s)",
+  "confirm.plan_saved": "saved ({path}) · /show plan to view",
+  "confirm.conflicts.hint": "/show experiments to inspect",
+  // Empty-state placeholders so the Parameters / Target health
+  // sections always render even when there's "nothing notable" — the
+  // section heading itself signals "we did look at this", and the
+  // empty value tells the user "all clear" / "no params specified"
+  // rather than leaving the section out (which could read as "the
+  // agent forgot to check").
+  "confirm.field.health": "health",
+  "confirm.params.none": "—",
+  "confirm.health.all_clear": "all targets healthy",
+  "confirm.health.not_run": "check not run",
+  "confirm.intent.low_conf_audit": "Why this intent:",
+
   // -- Forge × Operator redesign: banner + headline + armed chip ----
   "confirm.intent.banner": "INTENT CHECK",
   "confirm.execution.banner": "EXECUTE · this hits production",
@@ -474,7 +556,7 @@ export const en: Dict = {
   "confirm.safety.blocked": "BLOCKED",
 
   // -- Select component hints --------------------------------------
-  "select.options.hint": "↑↓ select · Enter confirm · 1-9 jump · Esc cancel",
+  "select.options.hint": "A-Z jump · ↑↓ select · Enter confirm · Esc cancel",
   "select.feedback.hint": "Enter send · Esc back to options",
   "select.feedback.placeholder": "tell the agent something else…",
 
@@ -574,4 +656,69 @@ export const en: Dict = {
   "tool.no_output": "(no output)",
   "tool.more_lines": "… +{n} more lines",
   "tool.captured_in_confirm": "(output delivered via the confirm card below)",
+
+  // -- WizardCard ---------------------------------------------------
+  "wizard.step.welcome": "Welcome",
+  "wizard.step.model": "Model",
+  "wizard.step.api_url": "API URL",
+  "wizard.step.api_key": "API Key",
+  "wizard.step.kubeconfig": "Kubeconfig",
+  "wizard.step.kube_context": "K8s Context",
+  "wizard.step.permission": "Permission",
+  "wizard.step.summary": "Review",
+  "wizard.welcome.title": "blade-ai setup",
+  "wizard.welcome.section": "Hello",
+  "wizard.welcome.body1": "8 steps and you're ready. Each step has a smart default — press Enter to accept.",
+  "wizard.welcome.body2": "Esc cancels at any time (nothing saved). ← goes back; 1-8 jumps to a completed step.",
+  "wizard.welcome.fields_section": "You'll configure",
+  "wizard.model.title": "Default model",
+  "wizard.model.recommended_section": "Recommended",
+  "wizard.model.other_section": "Other",
+  "wizard.model.custom_section": "Custom Model ID",
+  "wizard.model.custom_option": "Custom model ID...",
+  "wizard.model.custom_hint": "Any OpenAI-compatible model",
+  "wizard.model.label": "Model ID",
+  "wizard.model.placeholder": "e.g. gpt-4-turbo / deepseek-r1 / gemini-2.5-pro",
+  "wizard.api_url.title": "API Base URL",
+  "wizard.api_url.section": "Input",
+  "wizard.api_url.label": "URL",
+  "wizard.api_key.title": "LLM API Key",
+  "wizard.api_key.section": "Input",
+  "wizard.api_key.label": "API Key",
+  "wizard.kubeconfig.title": "Kubeconfig path",
+  "wizard.kubeconfig.section": "Input",
+  "wizard.kubeconfig.label": "Path",
+  "wizard.kube_context.title": "K8s Context",
+  "wizard.kube_context.section": "Discovered",
+  "wizard.permission.title": "Permission mode",
+  "wizard.permission.section": "Mode",
+  "wizard.permission.confirm_label": "confirm (recommended for prod)",
+  "wizard.permission.confirm_hint": "ask before each fault injection",
+  "wizard.permission.auto_label": "auto",
+  "wizard.permission.auto_hint": "skip confirmation (test clusters only)",
+  "wizard.summary.title": "Review & save",
+  "wizard.summary.section_config": "Config",
+  "wizard.summary.section_result": "Save result",
+  "wizard.summary.model": "Model",
+  "wizard.summary.api_url": "API URL",
+  "wizard.summary.api_key": "API Key",
+  "wizard.summary.kubeconfig": "Kubeconfig",
+  "wizard.summary.kube_context": "K8s Context",
+  "wizard.summary.kube_context_default": "(use kubeconfig current-context)",
+  "wizard.summary.permission": "Permission",
+  "wizard.summary.custom_tag": "(custom)",
+  "wizard.summary.saved_to": "Saved to",
+  "wizard.summary.saved_keys": "Written keys",
+  "wizard.summary.save_error": "Save failed",
+  "wizard.validation.in_progress": "Validating…",
+  "wizard.returned_hint": "Returned to this step — re-validate or edit",
+  "wizard.hint.welcome": "Enter to start  ·  Esc to cancel",
+  "wizard.hint.radio_with_back": "A-Z select  ·  ↑↓ move  ·  Enter confirm  ·  ← back  ·  Esc cancel",
+  "wizard.hint.text_with_back": "Enter confirm  ·  ← back  ·  1-8 jump  ·  Esc cancel",
+  "wizard.hint.model_custom": "Enter confirm  ·  Esc back to presets  ·  ← previous step",
+  "wizard.hint.summary": "Enter to save  ·  1-7 jump back to edit  ·  ← back  ·  Esc cancel",
+  "wizard.hint.saved": "Saved — press Enter to continue",
+  "wizard.hint.save_failed": "Save failed — ← back to fix or Esc to exit",
+  "wizard.cancel_message": "Setup wizard cancelled — blade-ai exiting. You'll be prompted again next launch.",
+  "wizard.model.empty_error": "Model ID cannot be empty",
 };

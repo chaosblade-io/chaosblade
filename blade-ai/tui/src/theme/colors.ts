@@ -61,6 +61,12 @@ const forge = {
   fire: "#E87841",
   // Heated-iron deep — hard decisions, result frames, "this is final".
   iron: "#A8451E",
+  // Dim fire (forge.fire desaturated ~30%) — reserved for container
+  // borders that need a brand-warm tint without competing with the
+  // saturated chips / buttons inside. First user: ConfirmMessage
+  // frames (both soft + hard tiers share this single token now, so
+  // tier is signaled by chip + glyph rather than by border colour).
+  dim: "#A87050",
 } as const;
 
 const slate = {
@@ -91,9 +97,13 @@ const status = {
   // language matches the operator vocabulary.
   armed: forge.fire,      // pending fire-button press
   executing: forge.iron,  // pushing real disruption
-  // Success is biased blue-green so it reads as a *result*, not as
-  // more chrome. Distinct from forge orange both in hue and weight.
-  ok: "#5BB371",
+  // Success — sage / yellow-green. Lives in the warm half of the
+  // colour wheel so it sits beside forge.fire (the brand orange)
+  // without clashing. The previous blue-green ``#5BB371`` read as
+  // cold against the all-orange chrome and pulled the eye away from
+  // the chrome itself. Sage keeps the "this is a result, not chrome"
+  // separation but stays in the same temperature family.
+  ok: "#A4D55C",
   // Caution amber — used for "low confidence", "warn this turn".
   warn: "#E8B341",
   // Failure red — slightly muted so it doesn't strobe.
@@ -117,9 +127,14 @@ const border = {
   // result frame".
   confirmHard: forge.iron,
   result: forge.iron,
-  // diagnostic violet — runtime /doctor card stays differentiated
-  // from the orange brand family.
-  diagnostic: "#7C3AED",
+  // diagnostic — runtime /doctor card. Now aliased to forge.fire so
+  // it pairs with BootDoctorCard (also forge.fire) as the "doctor
+  // family". The earlier violet (#7C3AED) was visually distinct but
+  // arrived as a brand-foreign colour in an otherwise warm palette;
+  // the two doctor cards never appear together in scrollback (boot
+  // doctor at splash time, runtime doctor on user-triggered /doctor),
+  // so the "must be unique" original rationale doesn't hold.
+  diagnostic: forge.fire,
   // dim — phase stepper rule, decorative box edges, alternate panels
   dim: gray[700],
   // legacy alias kept for the few consumers still asking for "default"
@@ -170,13 +185,14 @@ export const Theme = {
 } as const;
 
 /**
- * Phrase pool for the loading indicator. Cycled every 15s while the
+ * Phrase pool for the loading indicator. Cycled every 8s while the
  * agent is in the Responding state.
  *
  * The actual phrases live in the i18n dictionaries under
  * ``thinking.phrases`` — see ``../i18n/en.ts`` / ``zh.ts``. We keep
- * a tiny English fallback here in case ``usePhraseCycler`` runs before
- * i18n module init (e.g. tests that import this file directly).
+ * a tiny English fallback here in case the phrase pool helper
+ * (``utils/phrasePool.ts::getPool``) runs before i18n module init —
+ * e.g. tests that import this file directly.
  */
 export const ThinkingPhrases: readonly string[] = [
   "thinking",

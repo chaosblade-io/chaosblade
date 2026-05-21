@@ -11,24 +11,28 @@
 import type { Dict } from "./index.js";
 
 export const zh: Dict = {
-  // -- 思考短语池（15s 循环） ----------------------------------------
+  // -- 思考短语池（8s 循环） -----------------------------------------
+  // blade-ai 领域专用：每条对应注入流程里的一个真实环节
+  //（意图 → 安全 → 基线 → 执行 → 验证 → 回滚），轮播起来像 agent
+  // 在自述当前在做什么，而不是通用 "思考中" 占位。
   "thinking.phrases": [
     "思考中",
-    "拆解中",
-    "推敲中",
-    "比对工具",
-    "回忆上下文",
-    "权衡爆炸半径",
-    "校对意图",
-    "复核安全策略",
-    "对照技能目录",
-    "组织回答",
+    "评估爆炸半径",
+    "检查安全约束",
+    "巡检目标健康度",
+    "翻阅技能手册",
+    "挑选注入手法",
+    "采集基线指标",
+    "观测系统响应",
+    "评估回滚路径",
+    "起草故障方案",
   ],
 
   // -- LoadingIndicator 通用 -----------------------------------------
   "loading.esc_to_cancel": "esc 取消",
   "loading.thinking_label": "思考中",
   "loading.responding_label": "回答中",
+  "loading.tokens_estimate": "约 {n} tokens",
 
   // -- Overflow / 高度约束 -----------------------------------------
   "overflow.more_lines": "（还有 {count} 行被折叠 · Ctrl+O 展开）",
@@ -87,11 +91,13 @@ export const zh: Dict = {
   "command.help.desc": "列出可用命令",
   "command.clear.desc": "清空当前会话的 scrollback",
   "command.exit.desc": "退出 blade-ai",
-  "command.mode.desc": "切换信息密度 calm / working / dense（不带参数则循环）",
+  "command.mode.desc": "设置信息密度 —— 从下方子命令中选一个",
   "command.mode.calm.desc": "calm：极简密度，仅保留关键信号",
   "command.mode.working.desc": "working：标准密度（默认），完整呈现工具输出",
   "command.mode.dense.desc": "dense：高密度，展开所有诊断细节",
-  "command.permission.desc": "切换权限模式 auto / confirm",
+  "command.permission.desc": "设置权限模式 —— 从下方子命令中选一个",
+  "command.permission.auto.desc": "auto —— agent 直接注入不等确认，对下一次 /turn 生效",
+  "command.permission.confirm.desc": "confirm —— 注入前弹出 ARMED/ABORTED 确认卡（默认）",
   "command.session.desc": "查看会话信息（cluster / namespace / model / mode）",
   "command.status.desc": "查看当前会话信息",
   "command.run.desc": "执行故障注入（等价于直接输入自然语言）",
@@ -151,6 +157,8 @@ export const zh: Dict = {
   "help.group.session": "会话",
   "help.group.tasks": "任务",
   "help.group.history": "历史",
+  "help.card.title": "命令",
+  "help.card.tip": "提示：输入 / 后按 TAB 自动补全",
 
   // -- /doctor 输出 --------------------------------------------------
   "doctor.head": "诊断",
@@ -163,6 +171,7 @@ export const zh: Dict = {
   "doctor.protocol": "协议",
   "doctor.lang": "语言",
   "doctor.mode": "权限模式",
+  "doctor.terminal_bg": "终端背景",
   "doctor.preflight": "环境自检",
   "doctor.fix.server_unreachable":
     "检查 blade-ai server 是否在运行，且能从上述 URL 访问；本地开发可重启 TUI 触发 server 自动 spawn。",
@@ -173,11 +182,13 @@ export const zh: Dict = {
 
   // -- Slash 命令输出 ----------------------------------------------
   "mode.usage_unknown": "未知模式 '{value}' — 应为 'auto' 或 'confirm'",
+  "mode.usage_missing": "/permission 需要参数 — 请加 'auto' / 'confirm'（当前：{mode}）",
   "mode.already": "权限模式已是 {mode}",
-  "mode.changed": "权限模式 → **{mode}**",
+  "mode.changed": "权限模式 → **{mode}**（下一次 /turn 生效）",
 
   // -- /mode（显示密度，calm/working/dense）---------------------------
   "display.usage_unknown": "未知密度 '{value}' — 应为 'calm' / 'working' / 'dense'",
+  "display.usage_missing": "/mode 需要参数 — 请加 'calm' / 'working' / 'dense'（当前：{mode}）",
   "display.already": "信息密度已是 {mode}",
   "display.changed": "信息密度 → **{mode}**",
 
@@ -200,12 +211,15 @@ export const zh: Dict = {
   "review.created_label": "创建时间",
 
   // -- /experiments ---------------------------------------------------
-  "command.experiments.desc": "列出技能目录中可注入的故障实验（首次会调用 LLM）",
-  "experiments.loading": "正在加载故障实验目录（首次会调用 LLM 生成）…",
+  "command.experiments.desc": "列出技能目录中可注入的故障实验",
+  "experiments.loading": "正在加载故障实验目录 …",
   "experiments.failed": "加载故障实验失败：{err}",
   "experiments.empty": "未发现任何故障实验 — 检查 /skills 目录是否包含 SKILL.md",
   "experiments.head": "故障实验目录（共 {total} 项）：",
   "experiments.fault_count_unit": "个用例",
+  "experiments.card.title": "故障实验",
+  "experiments.card.count": "共 {n} 项",
+  "experiments.card.symptom_empty": "（未提供症状）",
 
   // -- /recover -------------------------------------------------------
   "command.recover.desc": "故障恢复 — 传 task_id / latest，或 list 子命令查看可恢复任务",
@@ -272,7 +286,13 @@ export const zh: Dict = {
   "command.compact.desc": "强制压缩当前会话上下文（节省 LLM 上下文 tokens）",
   "compact.busy": "仍在流式接收中——等待当前回合结束后再压缩",
   "compact.starting": "正在压缩当前会话上下文…",
+  "compact.in_progress": "  LLM 摘要器运行中 —— 可能需要几秒",
   "compact.failed": "压缩失败：{err}",
+  // ManualCompactIndicator: 整个 /compact 期间常驻的 spinner 行
+  // （noop / strip / LLM 三条路径统一显示）。
+  "compact.indicator_label": "正在压缩当前会话上下文…",
+  "compact.indicator_meta": "（{elapsed} · esc 取消）",
+  "compact.cancelled": "已取消压缩",
   "compact.noop": "上下文 {before} tokens，无需压缩（{layer}）",
   "compact.ok": "已压缩（{layer}）：{before} → {after} tokens（节省 {saved} / {pct}%）",
 
@@ -294,8 +314,14 @@ export const zh: Dict = {
   "model.usage": "用法：\n  /model list           — 列出候选模型\n  /model set <id>       — 切换活动模型",
   "model.head": "当前模型：{active}",
   "model.base_url_label": "api_base_url",
-  "model.list_tail": "用 **/model set <id>** 切换；切换后需要重启 server 才能完全生效",
+  "model.list_tail": "用 **/model set <id>** 切换；下一次 /turn 自动生效",
   "model.custom_note": "自定义（不在内置候选清单内，但可正常使用）",
+  "model.card.title": "模型",
+  "model.card.count": "共 {n} 个",
+  "model.card.tip": "提示：/model set <id> 切换 · 下一次 /turn 自动生效",
+  "model.card.custom_section": "custom",
+  "model.card.custom_note": "— 不在内置候选清单",
+  "model.card.unset": "（未设置）",
   "model.failed": "读取模型列表失败：{err}",
   "model.set_usage": "用法：/model set <model-id>",
   "model.set_ok": "已写入 model_name = {id}{tail}",
@@ -353,14 +379,15 @@ export const zh: Dict = {
   "replay.failed": "回放 {id} 失败：{err}",
   "replay.unknown_command": "未知命令：/{name} — 试试 /help",
 
-  "status.session": "session",
+  "status.session": "会话 ID",
   "status.cluster": "集群",
   "status.namespace": "命名空间",
   "status.model": "模型",
-  "status.mode": "模式",
+  "status.mode": "权限模式",
   "status.created": "创建时间",
   "status.tasks": "任务数",
   "status.failed": "读取会话信息失败：{err}",
+  "session.card.title": "会话",
 
   // -- Header chrome ------------------------------------------------
   "header.brand_tag": "（TS 预览版）",
@@ -379,14 +406,30 @@ export const zh: Dict = {
   "agent.truncated_earlier": "… 上方 {n} 行已折叠 · 轮结束后可在 scrollback 查看完整内容",
 
   // -- ResultCard 标签 ----------------------------------------------
-  "result.label.task": "任务",
-  "result.label.uid": "uid",
+  "result.label.fault": "故障类型",
+  "result.label.uid": "Blade UID",
   "result.label.duration": "耗时",
-  "result.label.effect": "影响",
-  "result.label.cause": "原因",
-  "result.label.hint": "提示",
+  "result.label.summary": "效果摘要",
+  "result.label.cause": "失败原因",
+  "result.label.hint": "建议",
+  "result.label.why_partial": "部分恢复原因",
+  // v3 短 chip 标签（紧贴 bracket 用，全大写）
+  "result.chip.success": "SUCCESS",
+  "result.chip.partial": "PARTIAL",
+  "result.chip.failed": "FAILED",
+  "result.chip.unknown": "RESULT",
+  // v3 卡片内分区标题
+  "result.section.outcome": "执行结果",
+  "result.section.effect": "效果验证",
+  "result.section.recovery_notes": "恢复说明",
+  "result.section.failure_analysis": "失败分析",
+  "result.section.side_effects": "副作用",
+  "result.label.target": "目标",
+  "result.label.attempts": "尝试次数",
+  "result.label.side_effect_item": "副作用",
+  "result.attempts.label": "成功（自动重规划 {n} 次后）",
   "result.status.success": "故障注入成功",
-  "result.status.partial": "部分成功",
+  "result.status.partial": "部分恢复",
   "result.status.failed": "故障注入失败",
   "result.status.unknown": "结果",
   "result.show_for_timeline": "/replay {id} instant 查看完整时间线",
@@ -432,6 +475,38 @@ export const zh: Dict = {
   "confirm.execution.preamble": "请确认执行计划：",
   "confirm.generic.preamble": "请确认：",
 
+  // -- v3 title chip 文案 (bracket chip 风格，简短全大写) ----------
+  "confirm.intent.chip": "INTENT",
+  "confirm.execution.chip": "EXECUTE",
+  "confirm.generic.chip": "CONFIRM",
+
+  // -- v3 卡片内分区标题 -------------------------------------------
+  "confirm.section.decision_signals": "决策信号",
+  "confirm.section.execution_plan": "执行计划",
+  "confirm.section.safety_check": "安全检查",
+  "confirm.section.parameters": "故障参数",
+  "confirm.section.target_health": "目标健康",
+  "confirm.section.conflicts": "冲突实验",
+  "confirm.section.audit_trail": "决策溯源",
+  // -- v3 额外字段标签
+  "confirm.field.attempt": "尝试次数",
+  "confirm.field.plan_path": "计划文件",
+  "confirm.field.clarification_round": "澄清轮次",
+  "confirm.field.intent_reasoning": "意图推理",
+  "confirm.field.health_summary": "健康摘要",
+  "confirm.attempt.label": "第 {n} 次尝试",
+  "confirm.clarification.label": "已澄清 {n} 轮",
+  "confirm.plan_saved": "已保存（{path}）· /show plan 查看",
+  "confirm.conflicts.hint": "/show experiments 查看详情",
+  // 故障参数 / 目标健康两个 section 即使"没异常"也要常驻——
+  // section 标题本身代表"我们查过了"，留个空值比直接隐藏更诚实
+  //（否则用户可能以为 agent 没检查）。
+  "confirm.field.health": "状态",
+  "confirm.params.none": "—",
+  "confirm.health.all_clear": "目标无异常",
+  "confirm.health.not_run": "未执行检查",
+  "confirm.intent.low_conf_audit": "为何识别为此意图：",
+
   // -- Forge × Operator 重设计：banner + headline + answered chip --
   "confirm.intent.banner": "INTENT CHECK",
   "confirm.execution.banner": "EXECUTE · this hits production",
@@ -462,7 +537,7 @@ export const zh: Dict = {
   "confirm.safety.blocked": "BLOCKED",
 
   // -- Select 组件提示 ---------------------------------------------
-  "select.options.hint": "↑↓ 选择 · Enter 确认 · 1-9 跳转 · Esc 取消",
+  "select.options.hint": "A-Z 跳转 · ↑↓ 选择 · Enter 确认 · Esc 取消",
   "select.feedback.hint": "Enter 发送 · Esc 返回选项",
   "select.feedback.placeholder": "告诉 agent 别的话…",
 
@@ -561,4 +636,69 @@ export const zh: Dict = {
   "tool.no_output": "（无输出）",
   "tool.more_lines": "… 还有 {n} 行",
   "tool.captured_in_confirm": "（输出已随下方确认卡片送达）",
+
+  // -- WizardCard ---------------------------------------------------
+  "wizard.step.welcome": "欢迎",
+  "wizard.step.model": "模型",
+  "wizard.step.api_url": "API URL",
+  "wizard.step.api_key": "API Key",
+  "wizard.step.kubeconfig": "Kubeconfig",
+  "wizard.step.kube_context": "K8s Context",
+  "wizard.step.permission": "权限模式",
+  "wizard.step.summary": "确认保存",
+  "wizard.welcome.title": "blade-ai 配置向导",
+  "wizard.welcome.section": "你好",
+  "wizard.welcome.body1": "8 步走完，blade-ai 就能跑起来。每步都有智能默认，按 Enter 接受。",
+  "wizard.welcome.body2": "中间任何时候按 Esc 取消（不保存），← 返回上一步，1-8 数字键跳转已完成的步骤。",
+  "wizard.welcome.fields_section": "你将配置",
+  "wizard.model.title": "默认模型",
+  "wizard.model.recommended_section": "推荐",
+  "wizard.model.other_section": "其他",
+  "wizard.model.custom_section": "自选 Model ID",
+  "wizard.model.custom_option": "自选 model ID...",
+  "wizard.model.custom_hint": "支持任何 OpenAI 兼容模型",
+  "wizard.model.label": "Model ID",
+  "wizard.model.placeholder": "例如 gpt-4-turbo / deepseek-r1 / gemini-2.5-pro",
+  "wizard.api_url.title": "API Base URL",
+  "wizard.api_url.section": "输入",
+  "wizard.api_url.label": "URL",
+  "wizard.api_key.title": "LLM API Key",
+  "wizard.api_key.section": "输入",
+  "wizard.api_key.label": "API Key",
+  "wizard.kubeconfig.title": "Kubeconfig 路径",
+  "wizard.kubeconfig.section": "输入",
+  "wizard.kubeconfig.label": "路径",
+  "wizard.kube_context.title": "K8s Context",
+  "wizard.kube_context.section": "已发现",
+  "wizard.permission.title": "权限模式",
+  "wizard.permission.section": "模式",
+  "wizard.permission.confirm_label": "confirm（推荐 prod）",
+  "wizard.permission.confirm_hint": "每次注入前弹卡片确认",
+  "wizard.permission.auto_label": "auto",
+  "wizard.permission.auto_hint": "跳过确认，自动执行（仅测试集群）",
+  "wizard.summary.title": "确认并保存",
+  "wizard.summary.section_config": "配置",
+  "wizard.summary.section_result": "保存结果",
+  "wizard.summary.model": "模型",
+  "wizard.summary.api_url": "API URL",
+  "wizard.summary.api_key": "API Key",
+  "wizard.summary.kubeconfig": "Kubeconfig",
+  "wizard.summary.kube_context": "K8s Context",
+  "wizard.summary.kube_context_default": "(使用 kubeconfig 当前 context)",
+  "wizard.summary.permission": "权限模式",
+  "wizard.summary.custom_tag": "(自选)",
+  "wizard.summary.saved_to": "已保存到",
+  "wizard.summary.saved_keys": "写入字段",
+  "wizard.summary.save_error": "保存失败",
+  "wizard.validation.in_progress": "校验中…",
+  "wizard.returned_hint": "已返回此步骤，可重新校验或编辑",
+  "wizard.hint.welcome": "Enter 开始  ·  Esc 取消",
+  "wizard.hint.radio_with_back": "A-Z 选择  ·  ↑↓ 移动  ·  Enter 确认  ·  ← 上一步  ·  Esc 取消",
+  "wizard.hint.text_with_back": "Enter 确认  ·  ← 上一步  ·  数字 1-8 跳转  ·  Esc 取消",
+  "wizard.hint.model_custom": "Enter 确认  ·  Esc 返回预设列表  ·  ← 上一步",
+  "wizard.hint.summary": "Enter 保存  ·  数字 1-7 跳回修改  ·  ← 上一步  ·  Esc 取消",
+  "wizard.hint.saved": "已保存，Enter 进入主界面",
+  "wizard.hint.save_failed": "保存失败，← 返回检查或 Esc 退出",
+  "wizard.cancel_message": "配置向导已取消，blade-ai 退出。下次启动会再次提示。",
+  "wizard.model.empty_error": "Model ID 不能为空",
 };

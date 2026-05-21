@@ -1,34 +1,37 @@
 """``/api/v1/model`` — list candidate LLMs + switch the active one.
 
 Surface mirrors Python TUI's ``/model`` slash:
-  - ``GET  /api/v1/model``   → ``{active, candidates}`` so the TS TUI
-                                can show a list with a marker on the
-                                currently-selected entry.
+  - ``GET  /api/v1/model``   → ``{active, api_base_url, candidates}``
+                                so the TS TUI can show a list with a
+                                marker on the currently-selected entry.
   - ``POST /api/v1/model``   → ``{model_name}`` body; persists the new
-                                value via ConfigStore. ``model_name`` is
-                                a cold key (see Phase 3a's
-                                ``_COLD_KEYS`` expansion), so the
-                                response always carries
-                                ``restart_required: true`` and the TS
-                                handler renders that explicitly.
+                                value via ConfigStore and rebuilds the
+                                in-process agents so the next ``/turn``
+                                picks it up — no restart needed for the
+                                common case. ``restart_required`` flips
+                                to ``true`` only on the (rare) rebuild
+                                failure path so the user knows the
+                                in-process state didn't update.
 
-Why no live hot-swap:
-  ``make_llm()`` runs once at startup and the resulting client is
-  baked into every compiled LangGraph node. Replacing ``settings
-  .model_name`` and rebuilding ``app.state.agents["llm"]`` would
-  miss the closure references inside the inject / recover graphs —
-  the running process keeps using the old client. Until the agent
-  factory grows a swappable-LLM indirection, the honest answer is
-  "writes saved, restart to apply".
+How the hot-swap works:
+  ``ConfigStore.set("model_name", v)`` writes disk + reloads the
+  module-level ``settings`` singleton. That alone isn't enough —
+  ``app.state.agents`` was constructed at lifespan startup and
+  closes over the OLD ``ChatOpenAI`` client. ``maybe_rebuild_agents``
+  (see ``server/agent_runtime``) calls ``create_agent(registry)``
+  to rebuild from scratch with the new settings, then swaps
+  ``app.state.agents`` + the ``app.state.checkpointer`` alias.
+  In-flight ``/turn`` requests keep the OLD graph they captured at
+  request start; the next ``/turn`` picks up the NEW one.
 
 Candidates list:
   Hardcoded curated set covering the providers we routinely see
   (Qwen / OpenAI / DeepSeek / Anthropic). The list is advisory —
   ``POST`` accepts any non-empty string so users with private
   deployments can point at their own model identifiers without
-  patching this file. The ``custom`` field on each candidate
-  signals to the renderer "this is one we tested" vs literal
-  passthrough.
+  patching this file. The TS card-builder appends a synthetic
+  ``custom`` section when the active model isn't found in any
+  curated provider list so the running model is always visible.
 """
 
 from __future__ import annotations
@@ -116,11 +119,12 @@ async def write_model(req: Request, payload: dict = Body(...)):
     store = ConfigStore()
     try:
         # ``set`` returns True when the key is hot (not cold). For
-        # ``model_name`` this is always False because we made it cold
-        # in Phase 3a. We call through anyway so the path stays
-        # canonical and any later un-cold-ing (when LLM hot-swap
-        # lands) takes effect without touching this route.
-        is_hot = store.set("model_name", name)
+        # ``model_name`` this is False — the LLM client captures the
+        # value at construct time, settings.reload() can't reach it.
+        # We rebuild the agents below to make the change effective
+        # *anyway* (matching the wizard /save semantics), so from the
+        # user's perspective the key behaves hot.
+        store.set("model_name", name)
     except Exception as e:  # pragma: no cover — disk / lock failures
         logger.exception("model write failed")
         return JSONEnvelope.fail(
@@ -128,15 +132,29 @@ async def write_model(req: Request, payload: dict = Body(...)):
             message=f"failed to write model_name: {e}",
             request_id=getattr(req.state, "request_id", ""),
         )
+
+    # Rebuild the in-process agents so the next /turn uses the new
+    # model. ``maybe_rebuild_agents`` handles the LLM-bound key filter
+    # + checkpointer alias sync; on failure we still report the write
+    # succeeded but flag ``restart_required`` so the user knows the
+    # in-process state didn't pick up the change.
+    from chaos_agent.server.agent_runtime import maybe_rebuild_agents
+
+    rebuild_error = await maybe_rebuild_agents(req.app, ["model_name"])
+    restart_required = rebuild_error is not None
+    if restart_required:
+        next_action = (
+            "Saved, but in-process agent rebuild failed: "
+            f"{rebuild_error}. Restart blade-ai-server to load the new model."
+        )
+    else:
+        next_action = "Next /turn will use the new model."
     return JSONEnvelope.ok(
         data={
             "active": name,
-            "restart_required": not is_hot,
-            "next_action": (
-                "Restart blade-ai-server to load the new model"
-                if not is_hot
-                else "Hot-swap applied — next turn uses the new model"
-            ),
+            "restart_required": restart_required,
+            "rebuild_error": rebuild_error,
+            "next_action": next_action,
         },
         request_id=getattr(req.state, "request_id", ""),
     )

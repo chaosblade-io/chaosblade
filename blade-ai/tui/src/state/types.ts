@@ -28,6 +28,21 @@ export interface AgentItem {
   kind: "agent";
   id: string;
   text: string;
+  /** When ``true``, this AgentItem renders as a body-only continuation
+   *  of the preceding agent reply — the leading ⏺ glyph is dropped
+   *  so multi-fragment replies read as one conversational block
+   *  instead of N stacked items each tagged with its own agent
+   *  marker. ``marginTop`` is intentionally PRESERVED (the split
+   *  always lands right after ``\n\n``, so each continuation is a
+   *  new paragraph that needs the blank-row spacer to match what
+   *  the un-split reply would have rendered).
+   *
+   *  Set by the reducer when ``findLastSafeSplitPoint`` carves a long
+   *  streaming reply into a head item (committed to history mid-
+   *  stream) and a tail item (still in pending). Defaults to
+   *  ``false`` / ``undefined`` for ordinary single-piece replies and
+   *  the original head fragment that carries the ⏺ glyph. */
+  continuation?: boolean;
 }
 
 export interface ToolItem {
@@ -86,6 +101,23 @@ export interface ResultItem {
    *  the user can paste-and-edit the original prompt without
    *  scrolling back. */
   userInput?: string;
+  /** Live target spec (namespace + names) read from final graph state.
+   *  Surfaced in the Outcome section so the user can verify the
+   *  result acted on the intended target without re-scrolling to the
+   *  confirm-gate card. Populated server-side by
+   *  ``_build_result_payload``. */
+  target?: { namespace?: string; names?: string[] };
+  /** Auto-replan attempts before this terminal state. ``> 0`` means
+   *  the LLM retried in-flight (e.g. switched targets, regenerated
+   *  the plan) — shown in the Outcome section so the user knows the
+   *  card represents the *final* attempt rather than the first. */
+  replanCount?: number;
+  /** Detailed side-effect list extracted from
+   *  ``data.side_effects`` (Python ``verification.side_effects`` dict
+   *  flattened into "label · detail" strings the card lists under
+   *  its Side effects section). Empty/undefined when nothing notable
+   *  happened beyond the primary fault — section is then hidden. */
+  sideEffects?: string[];
 }
 
 /**
@@ -326,6 +358,49 @@ export interface PendingTasksCardItem {
  * bordered frame so multiple ``/doctor`` invocations stack cleanly in
  * scrollback rather than blending into adjacent log output.
  */
+/**
+ * ``/memory show`` snapshot, rendered by ``MemoryCard`` as a
+ * doctor-style bordered card. Replaces the old plain-text
+ * ``formatMemorySnapshot`` log line so the snapshot reads as a
+ * persistent diagnostic record in scrollback (multiple ``/memory
+ * show`` calls stack cleanly, each carries its own ``capturedAt``).
+ *
+ * Data shape mirrors ``getMemoryInfo``'s return envelope — the
+ * /memory show handler maps directly from server fields without
+ * massaging, so a future server-side schema addition (e.g. new
+ * stats counter) only requires extending the ``stats`` record
+ * without touching this interface.
+ */
+export interface MemoryCardItem {
+  kind: "memory_card";
+  id: string;
+  /** TUI session id (``sess_<hex>``). */
+  sessionId: string;
+  /** ISO timestamp of session creation. Empty for an in-memory-only
+   *  session that hasn't been persisted yet. */
+  startedAt: string;
+  /** Lifecycle: ``"active"``, ``"ended"``, etc. */
+  status: string;
+  /** Cluster display name; ``""`` renders as "(未设置)". */
+  cluster: string;
+  /** Namespace; ``""`` renders as "(未设置)". */
+  namespace: string;
+  /** Recent inject/recover task ids (most recent last). */
+  recentTasks: string[];
+  /** Total task count across the session (may exceed recentTasks.length). */
+  totalTasks: number;
+  /** Stat counters from session store. Common keys: message_count,
+   *  injection_count, injection_success, injection_fail,
+   *  recovery_count. Unknown keys are tolerated by the renderer. */
+  stats: Record<string, number | string>;
+  /** Path to the on-disk memory directory. */
+  memoryDir: string;
+  /** ISO-8601 timestamp at the time this snapshot was generated.
+   *  Shown in the header tail so two cards in scrollback read in
+   *  obvious chronological order. */
+  capturedAt: string;
+}
+
 export interface RuntimeDoctorCardItem {
   kind: "runtime_doctor_card";
   id: string;
@@ -364,6 +439,163 @@ export interface RuntimeDoctorCardItem {
    *  Distinct from "0 / 0 passed" — that would be a confidently-wrong
    *  report; this flag routes the renderer to a "(unavailable)" hint. */
   preflightUnavailable: boolean;
+}
+
+/**
+ * ``/help`` snapshot — bordered command index, sibling to the doctor
+ * cards in the "info-card" family (same forge.fire border, same
+ * header grammar). Built once at dispatch time by walking the
+ * SlashCommandRegistry so re-renders are pure (no registry coupling
+ * inside the renderer), and so a /help fired during an in-flight
+ * skill load reflects the snapshot the user saw at the prompt rather
+ * than mutating mid-frame if the registry repopulates.
+ */
+export interface HelpCardItem {
+  kind: "help_card";
+  id: string;
+  /** ISO-8601 timestamp shown in the header tail. */
+  capturedAt: string;
+  /** One entry per group from ``SLASH_GROUP_ORDER`` that has at least
+   *  one visible (non-hidden) command. Empty groups are dropped at
+   *  build time so the renderer doesn't show a heading over nothing. */
+  sections: HelpCardSection[];
+  /** Localised tip line at the foot of the card. Set to empty string
+   *  to omit. */
+  tip: string;
+}
+
+export interface HelpCardSection {
+  /** Localised group name (e.g. ``General`` / ``通用``). */
+  heading: string;
+  rows: HelpCardRow[];
+}
+
+export interface HelpCardRow {
+  /** ``"top"`` for root commands (rendered bold, vertical breathing
+   *  room before each one except the first in its section); ``"sub"``
+   *  for indented subcommands rendered tight under their parent. */
+  kind: "top" | "sub";
+  /** Display name including args + aliases, pre-assembled at dispatch.
+   *  Examples: ``/exit · /quit``, ``/mode [calm|working|dense]``,
+   *  ``set <key> <value>``. */
+  name: string;
+  description: string;
+}
+
+/**
+ * ``/session`` snapshot — bordered info card, sibling to RuntimeDoctorCard
+ * and HelpCard in the "info-card" family (forge.fire chrome, header
+ * with timestamp tail, bulleted rows). Built once at dispatch time
+ * from the server's getSessionState() response + the local config
+ * snapshot. Renderer (``SessionCard.tsx``) is presentational — no
+ * client / dispatch coupling, so the card stays static after burn-in
+ * (a later mode flip doesn't mutate a card already in scrollback).
+ */
+export interface SessionCardItem {
+  kind: "session_card";
+  id: string;
+  /** ISO-8601 timestamp of when the card was captured (NOT the
+   *  session's created_at). Header tail uses this. */
+  capturedAt: string;
+  /** Ordered list of (label, value, dim) tuples — pre-assembled at
+   *  dispatch so the renderer doesn't need to know which fields
+   *  exist or what their localised labels are. ``dim=true`` flags
+   *  the value as a placeholder (``(none)`` / ``(unset)`` / ``(unknown)``)
+   *  so it renders in secondary-grey rather than primary text — a
+   *  visual cue that the field is intentionally absent, not a real
+   *  string named "(none)". */
+  rows: SessionCardRow[];
+}
+
+export interface SessionCardRow {
+  label: string;
+  value: string;
+  /** Render value column in secondary-dim. Used for placeholder
+   *  values like ``(none)`` so they don't look like real data. */
+  dim?: boolean;
+}
+
+/**
+ * ``/experiments`` snapshot — bordered fault-catalog card. Same
+ * info-card family as RuntimeDoctorCard / HelpCard / SessionCard
+ * (forge.fire chrome, header with summary tail, bulleted rows).
+ *
+ * Flat layout — category nesting is intentionally NOT preserved.
+ * Skill packs in the wild are typically 1:1 (one use case per
+ * category), so nesting just adds "▸ Category" / "Category 故障注入用例"
+ * chrome around a single row. Display-order grouping (the handler
+ * still receives categories in iteration order) preserves the rough
+ * clustering without printing the labels.
+ */
+export interface ExperimentsCardItem {
+  kind: "experiments_card";
+  id: string;
+  capturedAt: string;
+  /** Total number of use cases — shown in the header tail. */
+  totalCount: number;
+  rows: ExperimentsCardRow[];
+}
+
+export interface ExperimentsCardRow {
+  /** Use-case identifier surfaced as the row's name column.
+   *  e.g. ``Pod_OOM内存异常`` or ``节点资源不足 导致 Pod_Pending``. */
+  useCaseName: string;
+  /** Short one-line symptom shown in dim secondary, right of the
+   *  name column. Empty string falls back to a dim placeholder. */
+  faultSymptom: string;
+}
+
+/**
+ * ``/model list`` snapshot — bordered model-catalog card. Same
+ * info-card family as the other info-cards (forge.fire chrome,
+ * header with active-model tail, section dividers for providers,
+ * ●/○ row glyphs for active vs inactive).
+ *
+ * Providers are grouped because they're meaningfully different —
+ * each typically needs its own ``api_base_url`` + key combo, so
+ * "what's active" + "what can I switch to without changing other
+ * settings" is the question the user is asking.
+ */
+export interface ModelCardItem {
+  kind: "model_card";
+  id: string;
+  capturedAt: string;
+  /** The currently active model id. Empty when unset (renderer
+   *  substitutes a dim placeholder). */
+  activeModel: string;
+  /** Currently configured ``api_base_url``. Rendered as a subhead
+   *  row right under the title — it's session-level metadata, not
+   *  per-model. Empty string when unset → row hidden. */
+  apiBaseUrl: string;
+  /** Total candidates across all sections — shown in the header
+   *  tail for "13 models" style summary. */
+  totalCount: number;
+  /** Provider sections in display order (the server's iteration
+   *  order is preserved by ``buildModelCard``). A synthetic
+   *  ``custom`` section is appended when the active model isn't
+   *  in any of the curated provider lists. */
+  sections: ModelCardSection[];
+}
+
+export interface ModelCardSection {
+  /** Provider tag — ``qwen`` / ``deepseek`` / ``openai`` /
+   *  ``anthropic`` / ``custom`` / etc. Rendered as a divider
+   *  heading ``── <provider> ──``. */
+  provider: string;
+  rows: ModelCardRow[];
+}
+
+export interface ModelCardRow {
+  /** Model id surfaced as the row's name. Always ASCII for curated
+   *  rows; custom rows may carry the user's own identifier. */
+  id: string;
+  /** True for the row matching ``activeModel`` — renderer paints
+   *  it with ● + bold + forge.fire. Exactly one row in the card
+   *  is expected to be ``true``; we don't enforce here. */
+  active: boolean;
+  /** Optional dim trailing note, e.g. ``— not in curated list``
+   *  for custom entries. Empty string → no note rendered. */
+  note?: string;
 }
 
 /**
@@ -471,6 +703,11 @@ export type HistoryItem =
   | BootDoctorCardItem
   | PendingTasksCardItem
   | RuntimeDoctorCardItem
+  | MemoryCardItem
+  | HelpCardItem
+  | SessionCardItem
+  | ExperimentsCardItem
+  | ModelCardItem
   | PhaseStepperItem;
 
 export interface SessionInfo {
@@ -512,6 +749,60 @@ export interface AppState {
    */
   turnInputTokens: number;
   turnOutputTokens: number;
+  /**
+   * Last context-size snapshot from PreReasoningHook. Updated on
+   * every ``CONTEXT_SIZE_RECEIVED`` action; persists across turns
+   * (NOT reset on TURN_STARTED) because the hook runs on every LLM
+   * call regardless of turn boundary, and the Footer should always
+   * reflect the most recent measurement.
+   *
+   * ``contextMaxTokens`` is seeded with the server-side default
+   * (``DEFAULT_CONTEXT_MAX_TOKENS``) so the Footer renders proper
+   * numbers from boot, BEFORE the first hook fires. The first
+   * snapshot replaces this with whatever the operator actually
+   * configured (could differ if ``BLADE_AI_CONTEXT_MAX_TOKENS`` was
+   * set). Without the seed, Footer would have to fall back to a
+   * different layout at boot — clutter we removed deliberately.
+   *
+   * Server forces all four numeric fields onto the wire (see
+   * ``streaming.py`` to_dict exception) so genuine 0 is
+   * distinguishable from absent.
+   */
+  contextCurrentTokens: number;
+  contextTriggerTokens: number;
+  contextMaxTokens: number;
+  contextMessagesCount: number;
+  /** Sticky "something went wrong with the stream" flag. Set when
+   *  ``ERROR_RECEIVED`` fires (server pushed a type=error frame)
+   *  AND auto-cleared by the next successful ``CONTEXT_SIZE_RECEIVED``
+   *  (signal that the pipeline recovered). The Footer switches its
+   *  percent tail to the literal "(error)" while this is true so
+   *  the user knows the displayed numbers may be stale. */
+  contextError: boolean;
+  /**
+   * Client-driven slot for an in-flight manual ``/compact``. Set on
+   * ``COMPACT_MANUAL_STARTED`` (right before the slash handler opens
+   * ``streamCompactSession``), cleared on ``COMPACT_MANUAL_DONE``
+   * (in the handler's ``finally``).
+   *
+   * Drives ``ManualCompactIndicator`` — a spinner with elapsed-time
+   * tail + "esc 取消" hint that occupies the same screen slot as
+   * the auto-compaction indicator but with different semantics:
+   *
+   *   - ``currentCompaction`` — server SSE drives it; ONLY shows
+   *     while the LLM summariser is actually running. Silent for
+   *     noop / strip-only paths.
+   *   - ``currentManualCompact`` — client drives it; shows from
+   *     ``streamCompactSession`` open to close, covering noop /
+   *     LLM / error paths uniformly. Gives the user continuous
+   *     visual feedback that /compact is in flight.
+   *
+   * Both can in theory coexist for a brief moment (the server emits
+   * ``MEMORY_COMPACTION_STARTED`` during a manual /compact's LLM
+   * call), but the rendering layer picks ManualCompactIndicator
+   * first so only one spinner is visible at a time.
+   */
+  currentManualCompact: { startedAt: number } | null;
   /** Wall-clock elapsed since the current turn started (ms). UI computes derived seconds. */
   turnStartedAt: number;
   /** task_id of the in-flight turn, if any. */
@@ -728,6 +1019,25 @@ export interface AppState {
         layer: string;           // "llm_summary" today
       }
     | null;
+  /**
+   * Reducer-driven phrase cycler — fallback header label for the
+   * LoadingIndicator. While ``streamState === "responding"`` and no
+   * memory compaction is in flight, ``Composer``'s ticker effect
+   * dispatches ``PHRASE_TICK`` every 8s with a freshly picked random
+   * phrase from the i18n pool (``thinking.phrases``). The cycler runs
+   * even when ``isReceiving`` is true so a long agent reply / long-
+   * running node doesn't sit on a static label — the user gets visual
+   * feedback that the system is alive.
+   *
+   * Resolution priority in ``useLoadingIndicator``:
+   *   1. ``thoughtBuffer`` non-empty   → "thinking"
+   *   2. ``thoughtSubject`` set        → use directly (tool name etc.)
+   *   3. else                          → ``idlePhrase`` (cycles)
+   *
+   * ``""`` until the first tick lands — the hook falls back to the
+   * first pool entry in that brief window.
+   */
+  idlePhrase: string;
   /** Configuration knobs. */
   config: {
     permissionMode: "confirm" | "auto";
@@ -745,6 +1055,15 @@ export const initialAppState: AppState = {
   thoughtStartedAt: 0,
   turnInputTokens: 0,
   turnOutputTokens: 0,
+  contextCurrentTokens: 0,
+  contextTriggerTokens: 0,
+  // Seed with the server-side default so Footer renders proper
+  // "0.0k / 128k (0.0%)" from boot. The first real ``context_size``
+  // event replaces this with whatever the operator configured.
+  contextMaxTokens: 128_000,
+  contextMessagesCount: 0,
+  contextError: false,
+  currentManualCompact: null,
   turnStartedAt: 0,
   isReceiving: false,
   nextItemId: 0,
@@ -769,6 +1088,7 @@ export const initialAppState: AppState = {
   pendingDecision: null,
   currentPhaseStepper: null,
   currentCompaction: null,
+  idlePhrase: "",
   config: {
     // Default to ``confirm`` to match the Python side
     // (chaos_agent/tui/state.py: PermissionMode.CONFIRM) — chaos
