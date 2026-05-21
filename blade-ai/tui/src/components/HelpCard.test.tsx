@@ -24,7 +24,14 @@ import type { HelpCardItem } from "../state/types.js";
 const SAMPLE: HelpCardItem = {
   kind: "help_card",
   id: "help-test",
-  capturedAt: "2026-05-21T01:15:00.000+08:00",
+  // Local-time fixture (no ``Z`` / no offset). With a tz suffix the
+  // ISO instant gets re-projected to the runner's local tz — on a
+  // UTC CI runner ``2026-05-21T01:15+08:00`` becomes 2026-05-20
+  // 17:15 and the "2026-05-21" assertion fails. Stripping the offset
+  // means Date parses the fields literally per ES2015's local-time
+  // rule, so the displayed date matches the string regardless of
+  // runner tz.
+  capturedAt: "2026-05-21T13:15:00",
   sections: [
     {
       heading: "General",

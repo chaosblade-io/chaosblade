@@ -12,7 +12,16 @@ import type { ExperimentsCardItem } from "../state/types.js";
 const SAMPLE: ExperimentsCardItem = {
   kind: "experiments_card",
   id: "experiments-test",
-  capturedAt: "2026-05-21T03:00:00.000+08:00",
+  // Local-time fixture (no ``Z`` / no ``+HH:MM`` suffix). The card's
+  // ``formatDateTime`` reads ``getFullYear`` / ``getHours`` etc. on
+  // the local timezone, so an ISO string with an explicit offset
+  // gets re-projected to the runner's tz — on a UTC CI runner the
+  // displayed date is "2026-05-20" not "2026-05-21" and the toContain
+  // assertion fails. Date.parse for a date-time string WITHOUT a
+  // timezone designator defers to ES2015 local-time parsing rules,
+  // so the fields read back are exactly the literal numbers in the
+  // string regardless of runner tz.
+  capturedAt: "2026-05-21T12:00:00",
   totalCount: 4,
   rows: [
     {
@@ -46,7 +55,9 @@ describe("ExperimentsCard", () => {
     const { lastFrame } = render(<ExperimentsCard item={SAMPLE} />);
     const frame = lastFrame() ?? "";
     expect(frame).toContain("2026-05-21");
-    expect(frame).not.toContain("2026-05-21T03:00:00.000");
+    // Raw ISO must not bleed through — that's the bug-class this card
+    // exists to fix (server-side ISO → human-readable header tail).
+    expect(frame).not.toContain("2026-05-21T12:00:00");
   });
 
   it("renders every use-case name", () => {

@@ -12,7 +12,14 @@ import type { SessionCardItem } from "../state/types.js";
 const SAMPLE: SessionCardItem = {
   kind: "session_card",
   id: "session-test",
-  capturedAt: "2026-05-21T02:22:11.086040+08:00",
+  // Local-time fixture (no ``Z`` / no offset). With a tz suffix the
+  // ISO instant gets re-projected to the runner's local tz; on a
+  // UTC CI runner ``2026-05-21T02:22+08:00`` becomes 2026-05-20
+  // 18:22 and the "2026-05-21" assertion fails. Stripping the
+  // offset means ``new Date(...)`` parses fields literally per
+  // ES2015's local-time rule, so the displayed date matches the
+  // string regardless of runner tz.
+  capturedAt: "2026-05-21T14:22:11",
   rows: [
     { label: "session id", value: "sess_ef505e990bda" },
     { label: "cluster", value: "(none)", dim: true },
@@ -33,15 +40,15 @@ describe("SessionCard", () => {
   });
 
   it("formats the ISO timestamp as YYYY-MM-DD HH:MM:SS in the header", () => {
-    // Date-only assertion — local-time formatting may shift the hour
-    // depending on the test runner's TZ. The DATE component is the
-    // load-bearing signal (sortable, locale-neutral).
+    // Fixture is local-time without a tz suffix (see SAMPLE.capturedAt
+    // docstring), so both the date and time fields read back exactly
+    // as written — assertion is portable across runner timezones.
     const { lastFrame } = render(<SessionCard item={SAMPLE} />);
     const frame = lastFrame() ?? "";
     expect(frame).toContain("2026-05-21");
     // The raw ISO must NOT appear — that's the bug-class this card
     // exists to fix.
-    expect(frame).not.toContain("2026-05-21T02:22:11.086040");
+    expect(frame).not.toContain("2026-05-21T14:22:11");
   });
 
   it("renders every row's label + value", () => {
