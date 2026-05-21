@@ -19,6 +19,7 @@ export type StreamEventType =
   | "error"
   | "usage"
   | "memory_compaction"
+  | "context_size"
   | "done";
 
 export interface StreamEventBase {
@@ -92,8 +93,19 @@ export interface ConfirmEvent extends StreamEventBase {
 
 export interface ResultEvent extends StreamEventBase {
   type: "result";
-  /** Stringified JSON envelope. Parse on demand. */
-  content: string;
+  /** Stringified JSON envelope. Parse on demand.
+   *  Legacy shape — older surfaces (some inject/recover endpoints)
+   *  stuff their final envelope into ``content`` as a JSON string. */
+  content?: string;
+  /** Structured envelope. Used by newer surfaces that prefer typed
+   *  fields over re-parsing JSON — currently the /compact SSE route
+   *  populates this with ``{thread_id, tokens_before, tokens_after,
+   *  tokens_saved, compacted, layer}``. Exactly one of ``content``
+   *  or ``payload`` will be non-empty for any given result event. */
+  payload?: Record<string, unknown>;
+  /** Wall-clock duration of the operation in ms. Currently set by
+   *  the /compact route so the TUI can render "压缩用时 1.2s". */
+  duration_ms?: number;
 }
 
 export interface ErrorEvent extends StreamEventBase {
@@ -169,6 +181,33 @@ export interface MemoryCompactionEvent extends StreamEventBase {
   content?: string;
 }
 
+/**
+ * PreReasoningHook snapshot of state size, emitted after EVERY
+ * reasoning step (whether compaction fired or not). Drives the
+ * Footer's live ``current / window`` indicator. ``context_current_tokens``
+ * is the same number the hook compares against the compaction trigger,
+ * so the displayed percent corresponds 1:1 with compaction firing —
+ * if the Footer reads "85%", the next ``count_tokens_approx`` check
+ * is at the trigger line.
+ *
+ * All four fields ALWAYS arrive on the wire (forced by the server's
+ * to_dict exception, so genuine ``0`` is distinguishable from absent).
+ * Reducer can therefore use ``Number(x) || 0`` without ambiguity.
+ */
+export interface ContextSizeEvent extends StreamEventBase {
+  type: "context_size";
+  /** Post-hook estimated tokens in state.messages
+   *  (``count_tokens_approx × 1.2`` safety margin). */
+  context_current_tokens: number;
+  /** The trigger threshold the hook compares against
+   *  (``min(max - 13K, max × ratio)`` with 50% floor). */
+  context_trigger_tokens: number;
+  /** The configured ``context_max_tokens`` (LLM window size). */
+  context_max_tokens: number;
+  /** Number of messages currently in state.messages. */
+  context_messages_count: number;
+}
+
 export type StreamEvent =
   | TokenEvent
   | ThinkingEvent
@@ -181,6 +220,7 @@ export type StreamEvent =
   | ErrorEvent
   | UsageEvent
   | MemoryCompactionEvent
+  | ContextSizeEvent
   | DoneEvent;
 
 /** Type guard helper. */
@@ -199,6 +239,7 @@ export function isStreamEvent(value: unknown): value is StreamEvent {
     t === "error" ||
     t === "usage" ||
     t === "memory_compaction" ||
+    t === "context_size" ||
     t === "done"
   );
 }

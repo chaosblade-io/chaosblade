@@ -79,16 +79,17 @@ describe("registry / filter + lookup", () => {
       expect(visible).toContain(expected);
     }
     // Hidden aliases are callable but absent from the visible list.
-    // ``/status`` and ``/inject`` were renamed (to ``/session`` and
-    // ``/run`` respectively) but kept around as hidden entries so
-    // muscle memory keeps working. Assert both invariants.
+    // ``/status`` was renamed to ``/session`` but kept as a hidden
+    // entry so muscle memory keeps working. (``/inject`` used to be
+    // a hidden alias of ``/run`` too — removed since the only Python
+    // muscle memory it served has long migrated to ``/run``.)
     expect(visible).not.toContain("status");
-    expect(visible).not.toContain("inject");
     const all = reg.list({ includeHidden: true }).map((c) => c.name);
     expect(all).toContain("status");
-    expect(all).toContain("inject");
     expect(reg.get("status")?.name).toBe("status"); // resolves
-    expect(reg.get("inject")?.name).toBe("inject"); // resolves
+    // ``/inject`` must NOT resolve any more — it's been removed.
+    expect(all).not.toContain("inject");
+    expect(reg.get("inject")).toBeUndefined();
   });
 
   it("lists commands sorted by name", () => {

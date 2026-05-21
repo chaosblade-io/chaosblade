@@ -126,6 +126,7 @@ def calculate_token_warning_state(
     token_usage: int,
     max_tokens: int,
     auto_compact_enabled: bool = True,
+    compact_ratio: float = 0.85,
 ) -> TokenWarningState:
     """Calculate token warning level.
 
@@ -137,21 +138,49 @@ def calculate_token_warning_state(
         token_usage: Current token usage.
         max_tokens: Maximum context window size.
         auto_compact_enabled: Whether auto-compact is allowed.
+        compact_ratio: User-tunable trigger ratio (default 0.85). See the
+            threshold note below for how this interacts with the buffer
+            floor.
 
     Returns:
         TokenWarningState with level and boolean flags.
     """
     effective_window = max_tokens
     if auto_compact_enabled:
-        # Floor lowered from 0.80 → 0.72 (~10%) when CJK-aware estimation
-        # was introduced: with the flat chars/4 rule, CJK content was
-        # silently under-counted, so the 0.80 floor was effectively
-        # somewhere near 0.95 of real usage. With accurate estimation we
-        # need an explicit safety gap to trigger compaction before the
-        # model context actually fills.
-        auto_compact_threshold = max(
+        # Threshold = the EARLIER of two triggers (min, not max):
+        #
+        #   1. ``max_tokens - AUTOCOMPACT_BUFFER_TOKENS``  — buffer ceiling.
+        #      Never let context get within 13K of the absolute max,
+        #      otherwise the next user message could push past the
+        #      provider's hard limit before compaction has a chance to
+        #      run.
+        #
+        #   2. ``max_tokens * compact_ratio``  — user setting. Lets
+        #      the operator pull the trigger earlier (e.g. 0.5 ratio
+        #      on a 128K window = 64K trigger) for tighter sessions
+        #      or when testing the compaction path.
+        #
+        # Take the SMALLER → "whichever fires first". With defaults
+        # (0.85 × 128K = 108_800 vs 128K - 13K = 115_000), the ratio
+        # wins and we trigger at 108_800. Bumping ratio to 0.95 would
+        # let the buffer floor (115_000) win — the ratio can never
+        # delay compaction past the buffer's safety ceiling.
+        #
+        # PREVIOUS BUG: this was ``max()``, which made the buffer
+        # ALWAYS win because subtracting 13K is almost always more
+        # restrictive than ratio multiplication. The ``compact_ratio``
+        # setting was effectively dead — operators changing it saw
+        # no behavior change at the trigger threshold.
+        auto_compact_threshold = min(
             max_tokens - AUTOCOMPACT_BUFFER_TOKENS,
-            int(max_tokens * 0.72),
+            int(max_tokens * compact_ratio),
+        )
+        # Defensive floor: never go below 50% of the window even if
+        # the user typo'd a tiny ratio. Below this the system would
+        # spin trying to compact every message.
+        auto_compact_threshold = max(
+            auto_compact_threshold,
+            int(max_tokens * 0.5),
         )
     else:
         auto_compact_threshold = max_tokens
@@ -315,6 +344,16 @@ class ContextManager:
         compact_ratio: float = 0.8,
     ):
         self.max_tokens = max_tokens
+        # Keep the raw ratio AND the precomputed threshold:
+        # - ratio is what we hand to calculate_token_warning_state so
+        #   the user setting actually shapes the trigger (see the
+        #   ``min()`` formula in that function).
+        # - threshold is the legacy "rough" budget some callers still
+        #   compare against directly (e.g. the hook's post-strip
+        #   "still over budget?" check). Both must agree on intent so
+        #   the operator's BLADE_AI_CONTEXT_COMPACT_RATIO knob behaves
+        #   consistently across all consumers.
+        self.compact_ratio = compact_ratio
         self.compact_threshold = int(max_tokens * compact_ratio)
         self.reserve_tokens = 20000
 
@@ -322,6 +361,7 @@ class ContextManager:
         self,
         messages: list,
         tracking: Optional[CompactTrackingState] = None,
+        force: bool = False,
     ) -> tuple[list, list, bool]:
         """Check if context needs compaction with multi-level decision.
 
@@ -332,6 +372,12 @@ class ContextManager:
         Args:
             messages: Conversation messages.
             tracking: Optional CompactTrackingState for circuit breaker.
+            force: When True (user-initiated /compact), bypass BOTH the
+                auto-trigger threshold check AND the circuit breaker —
+                the user explicitly asked for compaction now, even if
+                we're below the threshold or have failed recently. Only
+                the split (reserve_tokens + [Compressed History]
+                preservation) runs. Default False (auto-trigger path).
 
         Returns:
             (messages_to_compact, messages_to_keep, is_valid)
@@ -339,13 +385,24 @@ class ContextManager:
             or at blocking level).
         """
         total_tokens = int(count_tokens_approx(messages) * TOKEN_ESTIMATE_SAFETY_MARGIN)
+        # Pass the instance's configured ratio so the operator's
+        # ``BLADE_AI_CONTEXT_COMPACT_RATIO`` setting actually influences
+        # the trigger. Before this fix the function silently used its
+        # 0.85 default no matter what the user configured.
         warning_state = calculate_token_warning_state(
-            total_tokens, self.max_tokens
+            total_tokens,
+            self.max_tokens,
+            compact_ratio=self.compact_ratio,
         )
 
-        # Circuit breaker: stop retrying after too many consecutive failures
+        # Circuit breaker: stop retrying after too many consecutive failures.
+        # SKIPPED on force=True — the breaker exists to protect the
+        # auto-trigger loop from hammering a broken LLM. When a user
+        # presses /compact, they want a retry; the breaker would just
+        # frustrate them and they can always wait/retry themselves.
         if (
-            tracking
+            not force
+            and tracking
             and tracking.consecutive_failures >= MAX_CONSECUTIVE_COMPACT_FAILURES
         ):
             logger.warning(
@@ -355,8 +412,10 @@ class ContextManager:
             )
             return [], messages, False
 
-        # Below auto-compact threshold — no action needed
-        if not warning_state.is_above_auto_compact:
+        # Below auto-compact threshold — no action needed.
+        # SKIPPED on force=True so manual /compact always splits and
+        # produces a summary even when usage is well below the trigger.
+        if not force and not warning_state.is_above_auto_compact:
             if warning_state.is_above_warning:
                 logger.info(
                     f"Context at {total_tokens} tokens "

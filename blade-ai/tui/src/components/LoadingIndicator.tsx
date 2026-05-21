@@ -1,27 +1,53 @@
 /**
  * Thinking / streaming indicator — the single most-watched UI element.
  *
- * Two-region layout:
+ * Single-line layout (qwen-code style):
  *
- *   ⠋ thinking  (12s · ↓ 142 tokens · esc to cancel)        ← header
- *   ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  ← separator
- *   <last 3 wrapped lines of live thinking buffer>           ← body
+ *   ⠋ thinking  (12s · esc to cancel)
  *
- * The body region only renders while a thinking session is open
- * (``bodyLines.length > 0``). Once thinking ends — token reply / tool
- * call / turn end — the reducer commits a ``ThinkingItem`` (collapsed
- * "▸ Thought for Ns") to pending and the buffer empties, so this
- * component snaps back to single-line header-only.
+ * The previous design rendered up to 8-12 wrapped rows of the live
+ * thinking buffer beneath a ┄ separator. That brought multiple
+ * compounding pain points:
  *
- * The token counter is the authoritative per-turn cumulative emitted
- * by the server's ``usage`` SSE event (LangChain ``on_chat_model_end``).
- * It jumps in steps as each LLM call lands rather than ticking
- * smoothly per token, which is honest about what's actually being
- * counted. The prior chars/4 client-side approximation has been
- * retired so this number matches the ``⚡ turn used N tokens`` summary
- * that lands at the bottom of the turn block.
+ *   1. **Chrome height churn.** Every CoT line growth (12-17 Hz under
+ *      thinking-mode streaming) extended ``bodyLines.length`` by 1,
+ *      forcing Ink to redraw the whole dynamic frame at the new
+ *      height. The eye perceived "持续小闪烁".
+ *   2. **Padded variant traded amplitude for area.** Padding the body
+ *      to a fixed ``bodyMax`` rows kept the chrome height stable, but
+ *      meant every spinner tick (12.5 Hz) re-issued an erase+rewrite
+ *      of the full ``bodyMax``-row block. The eye now perceived
+ *      "整块在闪".
+ *   3. **Resize-time leak.** Any chrome height change (thinking start
+ *      / end / wrap re-flow) intersected with the patched ink Static
+ *      semantics: rows that had been written above the current
+ *      viewport were no longer reachable by ``eraseLines(...)`` and
+ *      stuck in scrollback as永久留痕. Long turns produced screens-
+ *      worth of duplicate "⏺ VERIFICATION_CHECKLIST:" stripes.
+ *
+ * qwen-code dodges all three by simply not rendering the body. The
+ * indicator is one row: spinner + ``primaryText`` + meta. Their
+ * ``primaryText`` is ``thought.subject`` (parsed from ``**Subject**``
+ * markdown in the LLM's thinking stream) or a witty phrase fallback.
+ * We mirror the structure: ``headerLabel`` is set by the reducer
+ * from NODE_STARTED / TOOL_STARTED / phrase cycler — the live CoT
+ * buffer is *kept* in state (``state.thoughtBuffer``) for the
+ * eventual collapsed ``▸ Thought for Ns`` row in scrollback, but is
+ * **not displayed live** as multiple rows. This:
+ *
+ *   - keeps chrome height at exactly 1 row regardless of state →
+ *     no per-token redraws of the dynamic frame's body region,
+ *   - eliminates the start/end height jumps that caused scrollback
+ *     leaks on resize,
+ *   - is still informative (header text reflects the active node /
+ *     tool / phrase, refreshed by reducer on transitions).
+ *
+ * The hook ``useLoadingIndicator`` keeps returning ``bodyLines``
+ * (deprecated path) so future restoration / opt-in is a one-line
+ * change in this file. The existing field is no longer read here.
  */
 
+import { memo } from "react";
 import { Box, Text } from "ink";
 import { useLoadingIndicator } from "../hooks/useLoadingIndicator.js";
 import { t } from "../i18n/index.js";
@@ -29,36 +55,27 @@ import { Theme } from "../theme/colors.js";
 import { ThinkingSpinner } from "../theme/spinners.js";
 import { Spinner } from "./shared/Spinner.js";
 
-export const LoadingIndicator: React.FC = () => {
-  const {
-    visible,
-    headerLabel,
-    elapsedSec,
-    bodyLines,
-    narrow,
-    bodyWidth,
-  } = useLoadingIndicator();
+const LoadingIndicatorInternal: React.FC = () => {
+  const { visible, headerLabel, elapsedSec, turnTokens, narrow } =
+    useLoadingIndicator();
 
   if (!visible) return null;
 
-  // Token tally is intentionally NOT shown here anymore. The previous
-  // "↓ N tokens" tail produced two annoyances:
-  //   1. before the first ``usage`` event lands (5–30s of qwen
-  //      reasoning) we showed ``↓ -- tokens`` which read as "the
-  //      feature is broken" rather than "data not yet available".
-  //   2. it created a per-tick churn target (the live counter is
-  //      refreshed on every Spinner tick, even when unchanged) and
-  //      filled horizontal real estate without telling the user
-  //      anything they couldn't read off the ``⚡ turn used N tokens``
-  //      summary that lands at the bottom of the turn block.
-  // Authoritative per-turn total still streams in via state (the
-  // ``USAGE_RECEIVED`` action) and surfaces in TurnUsageMessage at
-  // commitPending — that's the one place users care to see it.
-  const meta = `(${formatElapsed(elapsedSec)} · ${t("loading.esc_to_cancel")})`;
+  // Live tokens estimate shown only once the counter has actually
+  // climbed off zero — a "~0 tokens" prefix during the first 200ms
+  // of a turn before any chars have arrived just adds chrome noise.
+  // ``~`` prefix flags the figure as an estimate; the committed
+  // ``⚡ turn used …`` row carries the authoritative server count.
+  const tokensSegment =
+    turnTokens > 0 ? ` · ${t("loading.tokens_estimate", { n: turnTokens })}` : "";
+  const meta = `(${formatElapsed(elapsedSec)}${tokensSegment} · ${t("loading.esc_to_cancel")})`;
 
   return (
     <Box paddingLeft={2} flexDirection="column">
-      <Box flexDirection={narrow ? "column" : "row"} alignItems={narrow ? "flex-start" : "center"}>
+      <Box
+        flexDirection={narrow ? "column" : "row"}
+        alignItems={narrow ? "flex-start" : "center"}
+      >
         <Box>
           <Box marginRight={1}>
             <Spinner type={ThinkingSpinner.type} color={Theme.text.primary} />
@@ -66,9 +83,7 @@ export const LoadingIndicator: React.FC = () => {
           <Text color={Theme.text.accent} wrap="truncate-end">
             {headerLabel}
           </Text>
-          {!narrow && (
-            <Text color={Theme.text.secondary}> {meta}</Text>
-          )}
+          {!narrow && <Text color={Theme.text.secondary}> {meta}</Text>}
         </Box>
       </Box>
       {narrow && (
@@ -76,19 +91,16 @@ export const LoadingIndicator: React.FC = () => {
           <Text color={Theme.text.secondary}>{meta}</Text>
         </Box>
       )}
-      {bodyLines.length > 0 && (
-        <Box flexDirection="column">
-          <Text color={Theme.text.secondary}>{"┄".repeat(bodyWidth)}</Text>
-          {bodyLines.map((line, i) => (
-            <Text key={`tl-${i}`} color={Theme.text.secondary}>
-              {line.length > 0 ? line : " "}
-            </Text>
-          ))}
-        </Box>
-      )}
     </Box>
   );
 };
+
+// React.memo: LoadingIndicator has zero props. The default shallow
+// prop comparison always reports "equal", so the component only
+// re-renders when its OWN ``useLoadingIndicator`` hook (or
+// inner-Spinner state) produces a new value. Composer's per-render
+// JSX walk no longer pulls this component along for the ride.
+export const LoadingIndicator = memo(LoadingIndicatorInternal);
 
 function formatElapsed(sec: number): string {
   if (sec < 60) return `${sec}s`;

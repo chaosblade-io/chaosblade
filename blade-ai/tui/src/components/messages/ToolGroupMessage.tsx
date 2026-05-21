@@ -27,10 +27,11 @@
  */
 
 import { Box } from "ink";
+import { memo } from "react";
 import type { ToolGroupItem } from "../../state/types.js";
 import { ToolMessage } from "./ToolMessage.js";
 
-export const ToolGroupMessage: React.FC<{
+const ToolGroupMessageInternal: React.FC<{
   item: ToolGroupItem;
   isPending?: boolean;
   availableTerminalHeight?: number;
@@ -55,3 +56,11 @@ export const ToolGroupMessage: React.FC<{
     </Box>
   );
 };
+
+// React.memo: paired with ToolMessage's own memo — without this
+// wrapper, the group's outer Box re-creates the per-tool element
+// array on every parent render, blocking child-level memo from
+// kicking in. Default shallow compare on the three props is enough:
+// ``item.tools`` is replaced wholesale on TOOL_STARTED/TOOL_ENDED
+// (new array ref), unchanged between those events.
+export const ToolGroupMessage = memo(ToolGroupMessageInternal);

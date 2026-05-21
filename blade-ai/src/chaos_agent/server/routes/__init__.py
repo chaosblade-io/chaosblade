@@ -15,10 +15,16 @@ health_router = APIRouter(tags=["health"])
 config_router = APIRouter(prefix="/api/v1/config", tags=["config"])
 memory_router = APIRouter(prefix="/api/v1/memory", tags=["memory"])
 # Phase 3c.1: model selection. ``GET`` lists candidates, ``POST``
-# writes ``model_name`` via ConfigStore. ``model_name`` is a cold
-# key (see ``tui/config_store._COLD_KEYS``) so a successful POST
-# always reports ``restart_required: true`` — the in-process LLM
-# instance was captured at startup and doesn't observe
-# settings.reload(). Honest "restart needed" beats a misleading
-# silent-no-op.
+# writes ``model_name`` via ConfigStore + rebuilds the in-process
+# agents via ``server/agent_runtime.maybe_rebuild_agents``. Common
+# case: ``restart_required: false`` (rebuild succeeded, next /turn
+# uses the new model). Falls back to ``restart_required: true``
+# only on rebuild failure, with the underlying error surfaced in
+# ``rebuild_error``.
 model_router = APIRouter(prefix="/api/v1/model", tags=["model"])
+# Phase 4: Onboarding wizard surface. The TS Ink wizard (UI) calls
+# these endpoints to validate user input + persist the final config.
+# Business logic lives in ``chaos_agent.config.wizard_validators``;
+# this router is a thin HTTP adapter that returns ValidationResult
+# verbatim. Persistence reuses ``ConfigStore.save_to_file``.
+wizard_router = APIRouter(prefix="/api/v1/wizard", tags=["wizard"])

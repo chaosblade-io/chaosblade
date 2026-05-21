@@ -119,13 +119,43 @@ async def confirmation_gate(state: AgentState) -> dict:
         await sync_to_store(state, result)
         return result
 
-    # Build the confirmation request
+    # Build the confirmation request.
+    #
+    # Field rationale (added beyond the original 5-key payload so the
+    # TUI confirm card can surface what's already in state instead of
+    # collapsing everything into safety_reason prose):
+    #   · ``params``               — structured fault params (cpu %,
+    #                                timeout, …); the plan_summary
+    #                                markdown otherwise hides them.
+    #   · ``target_health_report`` — DiskPressure / Evicted / Pending
+    #                                pre-check; ``state.py`` comment
+    #                                explicitly named confirm card as
+    #                                the consumer but the surface was
+    #                                missing.
+    #   · ``conflict_uids``        — structured list (was already
+    #                                embedded in safety_reason as
+    #                                free text; structured form lets
+    #                                the UI render a list + offer
+    #                                /show experiments).
+    #   · ``pipeline_attempt``     — N>1 means this is a re-attempt
+    #                                after a previous failure; the UI
+    #                                can surface "attempt N" so the
+    #                                user knows.
+    #   · ``is_complex``           — formal plan track flag.
+    #   · ``plan_path``            — saved plan file path; UI can
+    #                                show "Plan saved to xxx.md".
     confirmation_info = {
         "skill_name": skill_name,
         "target": target,
         "plan_summary": plan[:500] if plan else "",
         "safety_status": safety_status,
         "safety_reason": state.get("safety_reason"),
+        "params": state.get("params") or {},
+        "target_health_report": state.get("target_health_report"),
+        "conflict_uids": list(state.get("conflict_uids") or []),
+        "pipeline_attempt": int(state.get("pipeline_attempt") or 0),
+        "is_complex": bool(state.get("is_complex")),
+        "plan_path": state.get("plan_path") or "",
     }
 
     # P1: confirm_required without --force-override in CLI mode → reject with guidance

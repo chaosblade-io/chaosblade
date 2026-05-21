@@ -233,38 +233,100 @@ class CompactRequest(BaseModel):
 @sessions_router.post("/{sid}/compact")
 async def compact_session(sid: str, body: CompactRequest, req: Request):
     """Force-compact the conversation thread tied to a TUI session.
+    Returns an **SSE stream** so the TS TUI can render the same
+    real-time spinner/progress UX the auto-compact path gets via
+    ``/turn``.
 
-    Mirror of Python TUI's ``/compact`` slash (``tui/controllers/
-    commands.py:1038`` → ``_compact_thread``). Reaches into the
-    LangGraph inject agent's checkpointed state, runs
-    ``compact_if_needed`` on the message list, and applies the
-    result via ``aupdate_state(... RemoveMessage tombstones +
-    compacted)``. Returns before/after token counts so the TS handler
-    renders an honest "saved Ntokens / X%" line.
+    Wire format (each frame is one JSON object inside ``data:``):
+
+      - ``type=memory_compaction phase=started``  — hook entered the
+        LLM summariser; client should show a spinner.
+      - ``type=memory_compaction phase=completed`` — hook returned
+        from the LLM call. Carries hook-side estimates.
+      - ``type=memory_compaction phase=failed``    — hook raised.
+      - ``type=result``                            — terminal event,
+        carries the AUTHORITATIVE post-checkpoint
+        ``{tokens_before, tokens_after, tokens_saved, compacted,
+        layer, thread_id}`` in ``payload``. Sent AFTER the state has
+        actually been written via ``aupdate_state``.
+      - ``type=error``                             — request-level
+        failure (state read/write, missing hook). Followed by
+        ``done``.
+      - ``type=done``                              — stream end. Client
+        loop exits here.
+
+    Mechanics:
+      1. Subscribe to a private tracker keyed on a freshly minted
+         ``compact-{uuid}`` task id. We OVERRIDE ``state.task_id``
+         before passing state into the hook so its
+         ``_emit_compaction_event`` lands on OUR tracker, not the
+         long-running thread tracker (which would mix /compact events
+         with stale auto-compaction events from prior turns).
+      2. Run the hook in a background task while a consumer loop
+         drains the tracker queue and serialises events as
+         ``StreamEvent(type="memory_compaction", ...)`` — identical
+         shape to what the /turn SSE relays, so the TS TUI can reuse
+         its existing memory_compaction reducer code unchanged.
+      3. After the hook returns, apply the LangGraph state update,
+         re-read the checkpoint to compute the AUTHORITATIVE
+         ``tokens_after`` (the hook's internal estimate is computed
+         before the RemoveMessage tombstones are processed by the
+         reducer; it isn't quite right at the checkpoint level).
+      4. Emit a single ``result`` event with the route-level metrics,
+         then ``done``.
 
     Resolves the thread id in this order:
       1. ``body.thread_id`` if the client supplied one.
       2. The last entry in ``TuiSessionStore.task_ids`` for ``sid``.
-    Both must end up non-empty; otherwise we return TASK_NOT_FOUND
-    so the TS handler can show "no active conversation to compact".
+    Both must end up non-empty; otherwise we send a single ``error``
+    + ``done`` pair so the TS handler can render "no active
+    conversation to compact".
     """
+    import time
+    from fastapi.responses import StreamingResponse
+
+    from chaos_agent.agent.streaming import StreamEvent
     from chaos_agent.config.settings import settings as s
-    from chaos_agent.memory.compactor import compact_if_needed
     from chaos_agent.memory.context_manager import count_tokens_approx
+    from chaos_agent.observability.status_tracker import (
+        subscribe as _status_subscribe,
+        unsubscribe as _status_unsubscribe,
+    )
     from chaos_agent.server.routes.memory import _validate_session_id
 
     req_id = getattr(req.state, "request_id", "")
 
-    # Validate ``sid`` before passing into ``TuiSessionStore.read``,
-    # which builds ``session_dir / f"{sid}.json"`` internally — a
-    # crafted ``../../etc/passwd`` would escape the sessions
-    # directory. Same gate as ``/api/v1/memory/{sid}``.
+    # --- Pre-stream validation -------------------------------------------
+    # We do all the cheap up-front checks BEFORE starting the SSE
+    # response. Anything that fails here returns a normal JSON error
+    # envelope (matching what older clients of the JSON-shaped
+    # endpoint would see for these specific errors). Inside the
+    # stream we use ``type=error`` + ``done`` frames instead.
     bad = _validate_session_id(sid, req_id)
     if bad is not None:
         return bad
 
-    # Resolve thread id.
+    # Thread resolution. Three sources in priority order:
+    #
+    #   1. ``body.thread_id`` — caller-provided override (rare; mostly
+    #      for recovery / debugging scripts).
+    #   2. ``_GLOBAL_STORE[sid].conversation_thread_id`` — the stable
+    #      LangGraph thread allocated at ``POST /sessions``. ONE
+    #      session ↔ ONE thread, reused by every ``/turn``. This is
+    #      what every chat / inject / recover in this session shares,
+    #      so it's the right key for compaction (we want to compact
+    #      "the user's conversation", not a specific inject task).
+    #   3. Legacy fallback: ``TuiSessionStore.task_ids[-1]`` — only
+    #      populated when an inject/recover task allocates its own
+    #      task-id. A chat-only session has empty task_ids; relying on
+    #      this list alone (the original /compact implementation)
+    #      caused ``/compact`` to silently fail with TASK_NOT_FOUND
+    #      whenever the user tried to compact a pure chat thread.
     thread_id = (body.thread_id or "").strip()
+    if not thread_id:
+        sess = _GLOBAL_STORE.get(sid)
+        if sess is not None:
+            thread_id = sess.get("conversation_thread_id") or ""
     if not thread_id:
         store = get_global_tui_session_store()
         if store is not None:
@@ -290,111 +352,251 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
             message="inject agent is not initialised on this server",
             request_id=req_id,
         )
-
-    config = {
-        "configurable": {"thread_id": thread_id},
-        "recursion_limit": s.recursion_limit,
-    }
-    try:
-        snapshot = await graph.aget_state(config)
-    except Exception as e:  # pragma: no cover — defensive
-        logger.exception("compact: aget_state failed")
+    hook = agents.get("pre_reason_hook")
+    if hook is None:
         return JSONEnvelope.fail(
             code=ResponseCode.INTERNAL_ERROR,
-            message=f"failed to read thread state: {e}",
+            message="memory hook is not initialised on this server",
             request_id=req_id,
         )
 
-    messages = list((snapshot.values or {}).get("messages") or [])
-    before = count_tokens_approx(messages)
-    if before == 0:
-        return JSONEnvelope.ok(
-            data={
-                "thread_id": thread_id,
-                "tokens_before": 0,
-                "tokens_after": 0,
-                "tokens_saved": 0,
-                "compacted": False,
-                "layer": "noop",
-                "message": "no messages to compact",
-            },
-            request_id=req_id,
+    # Fresh per-call task id keeps our tracker isolated from the
+    # thread's main task id (which carries ambient auto-compaction
+    # events we don't want to mix in).
+    compact_task_id = f"compact-{uuid4().hex[:12]}"
+
+    def _convert(status_evt) -> StreamEvent | None:
+        """Translate a hook-emitted ``StatusEvent`` (source=
+        ``memory_compression``) into the wire-format
+        ``StreamEvent(type="memory_compaction", ...)`` the TS TUI's
+        /turn reducer already understands. Mirror of the helper in
+        turn.py — keeping them shape-identical means the TS client
+        can reuse one code path for both surfaces."""
+        if getattr(status_evt, "source", "") != "memory_compression":
+            return None
+        detail = getattr(status_evt, "detail", None) or {}
+        return StreamEvent(
+            type="memory_compaction",
+            content=getattr(status_evt, "message", ""),
+            task_id=compact_task_id,
+            compaction_phase=getattr(status_evt, "phase", ""),
+            tokens_before=int(
+                detail.get("total_tokens_before")
+                or detail.get("tokens_before")
+                or 0
+            ),
+            tokens_after=int(detail.get("tokens_after") or 0),
+            messages_compacted=int(
+                detail.get("messages_to_compact")
+                or detail.get("messages_compacted")
+                or 0
+            ),
+            duration_ms=float(getattr(status_evt, "duration_ms", 0.0) or 0.0),
+            layer="llm_summary",
         )
 
-    # Same budget formula as Python TUI's ``_compact_thread`` (see
-    # ``tui/controllers/commands.py:1070``). Lower-bound 1 so a
-    # mis-configured ``context_compact_ratio`` doesn't request 0.
-    budget = max(1, int(s.context_max_tokens * s.context_compact_ratio))
-    # The factory writes the live LLM into the agents dict (see
-    # ``agent/factory.py``); fall back to None so an older server
-    # without the field still produces a valid Layer-1 (lightweight)
-    # compaction without crashing.
-    llm = agents.get("llm")
-    try:
-        compacted, used_lightweight = await compact_if_needed(
-            messages=messages,
-            max_tokens=budget,
-            llm=llm,
-        )
-    except Exception as e:
-        logger.exception("compact_if_needed failed")
-        return JSONEnvelope.fail(
-            code=ResponseCode.INTERNAL_ERROR,
-            message=f"compaction failed: {e}",
-            request_id=req_id,
-        )
+    async def event_generator():
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": s.recursion_limit,
+        }
+        # Subscribe BEFORE reading state / starting the hook so we
+        # don't miss the hook's "started" event (which fires very
+        # close to its first await).
+        queue = _status_subscribe(compact_task_id)
+        # Hold a reference to the hook task at the function-scope
+        # level so the ``finally`` block can cancel it if the
+        # generator is torn down mid-stream (client disconnect /
+        # asyncio.CancelledError). Without this, an abandoned
+        # request would keep the LLM call running to completion,
+        # wasting tokens AND eventually producing a result that
+        # nobody applies to checkpoint state.
+        hook_task: asyncio.Task | None = None
+        try:
+            # Read initial state.
+            try:
+                snapshot = await graph.aget_state(config)
+            except Exception as e:
+                yield StreamEvent(
+                    type="error",
+                    content=f"failed to read thread state: {e}",
+                    task_id=compact_task_id,
+                ).to_sse()
+                yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
+                return
 
-    after = count_tokens_approx(compacted)
-    if after >= before:
-        # Either nothing was over budget or the compactor preserved
-        # everything (rare — happens when budget ≥ before). Tell the
-        # TS handler explicitly so it can show "no compaction needed"
-        # rather than "saved 0 tokens".
-        return JSONEnvelope.ok(
-            data={
-                "thread_id": thread_id,
-                "tokens_before": before,
-                "tokens_after": after,
-                "tokens_saved": 0,
-                "compacted": False,
-                "layer": "noop",
-                "budget": budget,
-            },
-            request_id=req_id,
-        )
+            state_values = snapshot.values or {}
+            messages = list(state_values.get("messages") or [])
+            before = count_tokens_approx(messages)
+            if before == 0:
+                # Nothing to compact at all — short-circuit with a
+                # result frame so the client can render "noop".
+                yield StreamEvent(
+                    type="result",
+                    task_id=compact_task_id,
+                    payload={
+                        "thread_id": thread_id,
+                        "tokens_before": 0,
+                        "tokens_after": 0,
+                        "tokens_saved": 0,
+                        "compacted": False,
+                        "layer": "noop",
+                        "message": "no messages to compact",
+                    },
+                ).to_sse()
+                yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
+                return
 
-    # Apply the compaction: emit RemoveMessage tombstones for the old
-    # ids LangGraph still has on the checkpoint, then append the
-    # compacted list. Mirror of ``_compact_thread`` line 1088.
-    try:
-        from langchain_core.messages import RemoveMessage
+            # Hand the hook a copy of state with our private task id
+            # so its events flow to our tracker.
+            state_for_hook = dict(state_values)
+            state_for_hook["task_id"] = compact_task_id
 
-        removals = [
-            RemoveMessage(id=m.id) for m in messages if getattr(m, "id", None)
-        ]
-        await graph.aupdate_state(
-            config, {"messages": removals + list(compacted)}
-        )
-    except Exception as e:
-        logger.exception("compact: aupdate_state failed")
-        return JSONEnvelope.fail(
-            code=ResponseCode.INTERNAL_ERROR,
-            message=f"failed to apply compaction: {e}",
-            request_id=req_id,
-        )
+            # Run the hook concurrently with the stream consumer.
+            t0 = time.monotonic()
+            hook_task = asyncio.create_task(hook(state_for_hook, force=True))
 
-    saved = before - after
-    return JSONEnvelope.ok(
-        data={
-            "thread_id": thread_id,
-            "tokens_before": before,
-            "tokens_after": after,
-            "tokens_saved": saved,
-            "compacted": True,
-            "layer": "lightweight" if used_lightweight else "llm_summary",
-            "budget": budget,
+            # Pump tracker events while the hook is running.
+            # ``wait_for`` with a 1s tick lets us interleave with the
+            # ``hook_task.done()`` check without busy-looping. Every
+            # 15s of idle queue (i.e. nothing emitted), we send an
+            # SSE comment line as a keepalive — most LLM calls
+            # finish faster than that, but proxies (nginx default
+            # 60s) and undici (45s) cull silent connections.
+            keepalive_idle = 0.0
+            while not hook_task.done():
+                try:
+                    status_evt = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    keepalive_idle = 0.0
+                    converted = _convert(status_evt)
+                    if converted is not None:
+                        yield converted.to_sse()
+                except asyncio.TimeoutError:
+                    keepalive_idle += 1.0
+                    if keepalive_idle >= 15.0:
+                        yield ": keepalive\n\n"
+                        keepalive_idle = 0.0
+
+            # Drain anything emitted between the last queue.get() and
+            # the hook returning. ``get_nowait`` is the right
+            # primitive — we know nothing else will be added now
+            # that hook_task is done.
+            while True:
+                try:
+                    status_evt = queue.get_nowait()
+                    converted = _convert(status_evt)
+                    if converted is not None:
+                        yield converted.to_sse()
+                except asyncio.QueueEmpty:
+                    break
+
+            # Surface hook exceptions as a structured error frame.
+            try:
+                updates = hook_task.result()
+            except Exception as e:
+                logger.exception("compact: hook failed")
+                yield StreamEvent(
+                    type="error",
+                    content=f"compaction failed: {e}",
+                    task_id=compact_task_id,
+                ).to_sse()
+                yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
+                return
+
+            # Force-mode hook returns {} when there's literally
+            # nothing to compact (everything fits in reserve_tokens).
+            if not updates or "messages" not in updates:
+                yield StreamEvent(
+                    type="result",
+                    task_id=compact_task_id,
+                    payload={
+                        "thread_id": thread_id,
+                        "tokens_before": before,
+                        "tokens_after": before,
+                        "tokens_saved": 0,
+                        "compacted": False,
+                        "layer": "noop",
+                        "message": "no historical messages to compact",
+                    },
+                ).to_sse()
+                yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
+                return
+
+            # Apply the LangGraph update.
+            try:
+                await graph.aupdate_state(config, updates)
+            except Exception as e:
+                logger.exception("compact: aupdate_state failed")
+                yield StreamEvent(
+                    type="error",
+                    content=f"failed to apply compaction: {e}",
+                    task_id=compact_task_id,
+                ).to_sse()
+                yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
+                return
+
+            # Re-read so ``after`` reflects the actual checkpoint
+            # post-reducer (RemoveMessage tombstones processed +
+            # SystemMessage summary appended).
+            try:
+                snapshot_after = await graph.aget_state(config)
+            except Exception as e:
+                logger.exception("compact: aget_state(after) failed")
+                yield StreamEvent(
+                    type="error",
+                    content=f"failed to verify compaction: {e}",
+                    task_id=compact_task_id,
+                ).to_sse()
+                yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
+                return
+
+            after = count_tokens_approx(
+                (snapshot_after.values or {}).get("messages") or []
+            )
+            saved = max(0, before - after)
+            compacted = saved > 0 and after < before
+            duration_ms = (time.monotonic() - t0) * 1000.0
+
+            yield StreamEvent(
+                type="result",
+                task_id=compact_task_id,
+                duration_ms=duration_ms,
+                payload={
+                    "thread_id": thread_id,
+                    "tokens_before": before,
+                    "tokens_after": after,
+                    "tokens_saved": saved,
+                    "compacted": compacted,
+                    "layer": "llm_summary" if compacted else "noop",
+                },
+            ).to_sse()
+            yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
+        finally:
+            # Reap the hook task if the generator was torn down
+            # before it finished (client disconnect / asyncio cancel).
+            # We DON'T await its result here — the caller is already
+            # gone and there's no state update path that would apply
+            # the LLM output anyway. Just unwind the task cleanly so
+            # asyncio doesn't log a "Task was destroyed but it is
+            # pending!" warning and so the LLM call gets a cancel
+            # signal it can act on. The hook handles CancelledError
+            # internally (it doesn't catch and swallow it).
+            if hook_task is not None and not hook_task.done():
+                hook_task.cancel()
+                try:
+                    await hook_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            _status_unsubscribe(compact_task_id, queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         },
-        request_id=req_id,
     )
 
 

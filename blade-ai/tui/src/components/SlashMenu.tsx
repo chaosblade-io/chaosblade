@@ -4,9 +4,15 @@
  * ``computeSlashState`` helper:
  *
  *  - ``root`` mode (no whitespace yet, e.g. ``/he``): list all
- *    visible commands matching the prefix, grouped by category
- *    (general / business / skills / dynamic) with one-line section
- *    headers — the same layout Python's ``tui/commands.py`` produces.
+ *    visible commands matching the prefix as a FLAT list. Ordering
+ *    follows SLASH_GROUP_ORDER (general → business → skills →
+ *    dynamic) via ``orderCandidatesByGroup`` in InputPrompt; the
+ *    menu itself doesn't render any ``General`` / ``Business`` /
+ *    ``Skills`` header rows. We used to — but they shared the same
+ *    ``forge.fire`` + bold styling as the focused row, which made
+ *    the user's selection visually indistinguishable from a header.
+ *    The group ordering alone is enough hierarchy; the section
+ *    labels were chrome.
  *
  *  - ``sub`` mode (e.g. ``/skills l``): the user finished typing a
  *    registered command followed by a space, the command has
@@ -27,11 +33,10 @@
  */
 
 import { Box, Text } from "ink";
+import { useTerminalSize } from "../hooks/useTerminalSize.js";
 import { t } from "../i18n/index.js";
 import {
-  SLASH_GROUP_ORDER,
   type SlashCommand,
-  type SlashGroup,
   type SlashSubcommand,
 } from "../state/commands.js";
 import { Theme } from "../theme/colors.js";
@@ -67,7 +72,46 @@ const NAME_COL = 16;
 // space). 2 cols matches the menu's ``minWidth=2`` arrow gutter so
 // the columns visually align.
 const DESC_GUTTER = 2;
-const VISIBLE_ROWS = 8;
+/** Default item cap on terminals tall enough to afford it. Beyond
+ *  ~8 visible items the menu starts to dominate the viewport
+ *  vertically; users can ``↓`` for more if the list runs longer. */
+const VISIBLE_ROWS_MAX = 8;
+/** Floor — always show at least 1 item so even a tight terminal can
+ *  still type-and-pick by repeatedly ↓-ing through the list. Was 3
+ *  but that left no room on terminals ≤ 12 rows. */
+const VISIBLE_ROWS_MIN = 1;
+/** Rows the slash menu burns OUTSIDE its item list, used to back out
+ *  the per-terminal item cap so ``items + chrome ≤ viewport``.
+ *  Breakdown:
+ *    · InputPrompt fence-top + body + fence-bottom .. 3
+ *    · Footer ............................................. 1
+ *    · Composer marginTop ................................. 1
+ *    · slash menu ↑ / ↓ "N more" markers (worst case 2) ... 2
+ *    · slash menu hint row (inline, no margin) ............ 1
+ *                                                          —
+ *                                                          8
+ *  Setting at 7 leaves the menu 1 row of headroom — dyn frame stays
+ *  < viewport, so the trailing ``\n`` Ink emits per render doesn't
+ *  push cursor past viewport bottom → no scrolling per re-render →
+ *  no ghost copies of the menu in scrollback. (Was 9 when group
+ *  headers were rendered — dropping them reclaimed 2 rows of
+ *  budget.) */
+const SLASH_CHROME_RESERVE = 7;
+/** Hard cutoff: when ``terminalRows < this``, suppress the menu
+ *  entirely (return null) — even MIN items + chrome can't fit, and
+ *  showing a glitching menu is worse than no menu at all. User can
+ *  still type the full command name and press Enter. */
+const SLASH_MENU_MIN_TERMINAL_ROWS = SLASH_CHROME_RESERVE + 1; // 10
+
+/** Compute the per-render item cap. Pure function so callers don't
+ *  need to remember the min/max/clamp dance. Returns ``0`` when
+ *  the terminal is too small to show even one item plus chrome —
+ *  callers should suppress the menu entirely in that case. */
+function visibleItemCap(terminalRows: number): number {
+  if (terminalRows < SLASH_MENU_MIN_TERMINAL_ROWS) return 0;
+  const budget = terminalRows - SLASH_CHROME_RESERVE;
+  return Math.max(VISIBLE_ROWS_MIN, Math.min(VISIBLE_ROWS_MAX, budget));
+}
 
 export const SlashMenu: React.FC<Props> = (props) => {
   if (props.mode === "root") return <RootMenu {...props} />;
@@ -76,114 +120,55 @@ export const SlashMenu: React.FC<Props> = (props) => {
 
 // ── Root mode ────────────────────────────────────────────────────────
 
-const GROUP_LABEL_KEY: Record<SlashGroup, string> = {
-  general: "help.group.general",
-  business: "help.group.business",
-  skills: "help.group.skills",
-  dynamic: "help.group.dynamic",
-};
-
-interface RowEntry {
-  type: "header" | "cmd";
-  group?: SlashGroup;
-  cmd?: SlashCommand;
-  /** Flat index across the visible cmd rows; -1 for headers (skipped
-   *  by the windowing math but kept inline so headers travel with
-   *  their group). */
-  flatIdx: number;
-}
-
-/** Flatten the candidate list into a header-interspersed row sequence
- *  while preserving each command's flat index for selection mapping. */
-function buildRootRows(candidates: SlashCommand[]): RowEntry[] {
-  const byGroup = new Map<SlashGroup, SlashCommand[]>();
-  for (const cmd of candidates) {
-    const list = byGroup.get(cmd.group) ?? [];
-    list.push(cmd);
-    byGroup.set(cmd.group, list);
-  }
-  const rows: RowEntry[] = [];
-  let flat = 0;
-  for (const group of SLASH_GROUP_ORDER) {
-    const cmds = byGroup.get(group);
-    if (!cmds || cmds.length === 0) continue;
-    rows.push({ type: "header", group, flatIdx: -1 });
-    for (const cmd of cmds) {
-      rows.push({ type: "cmd", cmd, flatIdx: flat });
-      flat++;
-    }
-  }
-  return rows;
-}
-
 const RootMenu: React.FC<{
   candidates: SlashCommand[];
   selectedIndex: number;
 }> = ({ candidates, selectedIndex }) => {
+  // Per-render item cap, sized to keep the whole dyn frame (menu +
+  // input + footer) inside viewport rows. Critical on small
+  // terminals — without this clamp, each ↑/↓ keypress would
+  // re-render an oversized menu, scrolling top rows into scrollback
+  // and producing the "ghost copies of the menu" symptom users saw
+  // in pre-fix screenshots. ``useTerminalSize`` subscribes to
+  // SIGWINCH so resizing live re-tightens or relaxes the cap.
+  const { rows: terminalRows } = useTerminalSize();
+  const visibleRows = visibleItemCap(terminalRows);
+
+  // Bail entirely on terminals so small that even MIN items + chrome
+  // would overflow — showing a glitching menu is worse than no menu.
+  // The user can still type the full command name and press Enter.
+  if (visibleRows === 0) return null;
+
   if (candidates.length === 0) {
     return (
-      <Box paddingLeft={4}>
+      <Box>
         <Text color={Theme.text.secondary}>{t("slash.menu.empty")}</Text>
       </Box>
     );
   }
 
-  const rows = buildRootRows(candidates);
-  // Window of cmd rows around the selected flat index, expanded to
-  // include the header that owns the first visible cmd row so the
-  // user always sees which group they're in.
-  const cmdRows = rows.filter((r) => r.type === "cmd");
-  const totalCmds = cmdRows.length;
-  let startCmd = 0;
-  let endCmd = totalCmds;
-  if (totalCmds > VISIBLE_ROWS) {
-    const half = Math.floor(VISIBLE_ROWS / 2);
-    startCmd = Math.max(0, Math.min(selectedIndex - half, totalCmds - VISIBLE_ROWS));
-    endCmd = startCmd + VISIBLE_ROWS;
-  }
-  // Map back to row indices so we keep group headers attached to
-  // their first visible command.
-  const visible: RowEntry[] = [];
-  let lastHeaderGroup: SlashGroup | null = null;
-  for (const row of rows) {
-    if (row.type === "header") {
-      lastHeaderGroup = row.group ?? null;
-      continue;
-    }
-    if (row.flatIdx >= startCmd && row.flatIdx < endCmd) {
-      // Insert the header for the active group exactly once, on the
-      // first cmd row of that group within the window.
-      if (lastHeaderGroup) {
-        visible.push({
-          type: "header",
-          group: lastHeaderGroup,
-          flatIdx: -1,
-        });
-        lastHeaderGroup = null;
-      }
-      visible.push(row);
-    }
+  // Flat windowing — same shape as SubMenu. Ordering across groups
+  // is already applied by ``orderCandidatesByGroup`` in InputPrompt,
+  // so we just slice in display order.
+  const total = candidates.length;
+  let start = 0;
+  let end = total;
+  if (total > visibleRows) {
+    const half = Math.floor(visibleRows / 2);
+    start = Math.max(0, Math.min(selectedIndex - half, total - visibleRows));
+    end = start + visibleRows;
   }
 
   return (
-    <Box flexDirection="column" paddingLeft={4}>
-      {startCmd > 0 && (
+    <Box flexDirection="column">
+      {start > 0 && (
         <Text color={Theme.text.secondary}>
-          {t("slash.menu.more_above", { n: startCmd })}
+          {t("slash.menu.more_above", { n: start })}
         </Text>
       )}
-      {visible.map((row, i) => {
-        if (row.type === "header") {
-          return (
-            <Box key={`h-${row.group}-${i}`} marginTop={i === 0 ? 0 : 1}>
-              <Text color={Theme.text.accent} bold>
-                {row.group ? t(GROUP_LABEL_KEY[row.group]) : ""}
-              </Text>
-            </Box>
-          );
-        }
-        const cmd = row.cmd!;
-        const selected = row.flatIdx === selectedIndex;
+      {candidates.slice(start, end).map((cmd, i) => {
+        const idx = start + i;
+        const selected = idx === selectedIndex;
         // ``usage`` (e.g. ``[calm|working|dense]``) is intentionally
         // NOT shown in the autocomplete dropdown — descriptions
         // already spell out the values when they matter, and the
@@ -216,12 +201,12 @@ const RootMenu: React.FC<{
           </Box>
         );
       })}
-      {endCmd < totalCmds && (
+      {end < total && (
         <Text color={Theme.text.secondary}>
-          {t("slash.menu.more_below", { n: totalCmds - endCmd })}
+          {t("slash.menu.more_below", { n: total - end })}
         </Text>
       )}
-      <Box marginTop={1}>
+      <Box>
         <Text color={Theme.text.secondary}>{t("slash.menu.hint")}</Text>
       </Box>
     </Box>
@@ -235,9 +220,18 @@ const SubMenu: React.FC<{
   subs: SlashSubcommand[];
   selectedIndex: number;
 }> = ({ parent, subs, selectedIndex }) => {
+  // Same per-render cap as RootMenu — see the comment there for the
+  // small-terminal rationale.
+  const { rows: terminalRows } = useTerminalSize();
+  const visibleRows = visibleItemCap(terminalRows);
+
+  // Same suppression as RootMenu — bail on terminals too small to
+  // host the menu without ghosts.
+  if (visibleRows === 0) return null;
+
   if (subs.length === 0) {
     return (
-      <Box flexDirection="column" paddingLeft={4}>
+      <Box flexDirection="column">
         <Text color={Theme.text.secondary}>
           /{parent.name} {parent.usage ?? ""}
         </Text>
@@ -251,14 +245,14 @@ const SubMenu: React.FC<{
   const total = subs.length;
   let start = 0;
   let end = total;
-  if (total > VISIBLE_ROWS) {
-    const half = Math.floor(VISIBLE_ROWS / 2);
-    start = Math.max(0, Math.min(selectedIndex - half, total - VISIBLE_ROWS));
-    end = start + VISIBLE_ROWS;
+  if (total > visibleRows) {
+    const half = Math.floor(visibleRows / 2);
+    start = Math.max(0, Math.min(selectedIndex - half, total - visibleRows));
+    end = start + visibleRows;
   }
 
   return (
-    <Box flexDirection="column" paddingLeft={4}>
+    <Box flexDirection="column">
       {/* Parent context line — tells the user which root they're
           currently sub-completing under. */}
       <Text color={Theme.text.accent} bold>
@@ -306,7 +300,9 @@ const SubMenu: React.FC<{
           {t("slash.menu.more_below", { n: total - end })}
         </Text>
       )}
-      <Box marginTop={1}>
+      {/* Chrome-cut: dropped ``marginTop=1`` on hint, same as
+       *  RootMenu — see comment there for rationale. */}
+      <Box>
         <Text color={Theme.text.secondary}>{t("slash.menu.hint")}</Text>
       </Box>
     </Box>

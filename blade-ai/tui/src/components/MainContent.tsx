@@ -15,8 +15,8 @@
  * thing in scrollback is the greeting (it'll never re-render either).
  */
 
-import React from "react";
-import { Box, Static } from "ink";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Box, Static, measureElement } from "ink";
 import { BootProgress } from "./boot/BootProgress.js";
 import { Header } from "./Header.js";
 import { HistoryItemDisplay } from "./HistoryItemDisplay.js";
@@ -25,6 +25,10 @@ import { useTerminalSize } from "../hooks/useTerminalSize.js";
 import { OverflowProvider } from "../contexts/OverflowContext.js";
 import { ShowMoreLines } from "./shared/ShowMoreLines.js";
 import { setProbePendingRef } from "../utils/overflowProbe.js";
+import {
+  getChromeMeasureRef,
+  subscribeChromeMeasureRef,
+} from "../state/chromeMeasureRef.js";
 
 interface Props {
   version: string;
@@ -37,9 +41,17 @@ interface StaticEntry {
 }
 
 /**
- * Static estimate of how many rows the chrome below the pending area
- * occupies. Updated to **26** to track the Forge × Operator redesign
- * + thinking-body padding accumulation:
+ * **First-paint fallback** for the chrome row reservation. Phase 3.2
+ * replaced the hard-coded reserve with ``useLayoutEffect +
+ * measureElement`` reading the real height of Composer's outer Box,
+ * so this constant only governs the very first render (before
+ * Composer has mounted and registered its ref) and acts as the
+ * safety value if ``measureElement`` ever throws or returns a bad
+ * reading. Once Composer commits, ``chromeHeight`` state takes over.
+ *
+ * Kept at **26** to track the Forge × Operator redesign + thinking-
+ * body padding accumulation, in case the dynamic measurement is
+ * unavailable:
  *
  *   PhaseStepperCard (round border + title + 5 step rows) ........ 8
  *   LoadingIndicator (header 1 + separator 1 + body padded 8) .. 10
@@ -72,6 +84,118 @@ const CHROME_ROWS_RESERVE = 26;
  *  capped content would render as mostly the "+N folded" indicator. */
 const MIN_PENDING_BUDGET = 6;
 
+/**
+ * Progressive Static replay (Phase 3.3) — split a large ``history``
+ * array into mountable chunks instead of letting Ink's ``<Static>``
+ * walk the full list on a single remount.
+ *
+ * The pain point this fixes: when ``/clear`` bumps ``historyRemountKey``
+ * AFTER a long-running session has accumulated 100+ committed items,
+ * the single re-mount tries to walk every HistoryItemDisplay subtree
+ * in one synchronous pass. AgentMessage's ``renderMarkdown`` and
+ * ToolMessage's ``truncateOutput`` each cost ~1-5 ms; 500 items × 3 ms
+ * average = a 1.5 second UI freeze before the cleared viewport finishes
+ * painting. With progressive replay, the first ``CHUNK_SIZE`` items
+ * mount synchronously and the remainder is appended via ``setImmediate``
+ * batches of ``CHUNK_SIZE`` so the event loop gets to breathe between
+ * each batch (keystrokes, spinner ticks, resize events all stay
+ * responsive). Static itself is append-only, so once an item is
+ * mounted into a batch it never re-renders.
+ *
+ * Thresholds (mirrors qwen-code's MainContent.tsx):
+ *
+ *   - ``THRESHOLD`` (100): below this we mount everything in one shot
+ *     — the freeze is imperceptible for short sessions, and skipping
+ *     the chunking machinery avoids the small extra render cycle.
+ *   - ``CHUNK_SIZE`` (50): per-tick batch size. ~50 items mounts in
+ *     under one animation frame (16ms) on typical hardware; bigger
+ *     batches lose the "breathe between" benefit.
+ *
+ * The tail-gap shortcut (see render logic) sends the full
+ * ``mergedHistory`` to Static when the gap is ≤ CHUNK_SIZE so a
+ * just-finalised item doesn't briefly disappear during normal
+ * append-after-token activity.
+ */
+export const PROGRESSIVE_REPLAY_THRESHOLD = 100;
+export const PROGRESSIVE_REPLAY_CHUNK_SIZE = 50;
+
+/** Pure helper exported so the threshold + chunk semantics can be
+ *  unit-tested without spinning up Ink + StoreProvider. The first
+ *  ``replayCount`` to feed to ``<Static>`` after a (re)mount. */
+export function initialReplayCount(length: number): number {
+  return length <= PROGRESSIVE_REPLAY_THRESHOLD
+    ? length
+    : Math.min(PROGRESSIVE_REPLAY_CHUNK_SIZE, length);
+}
+
+/** Absolute upper bound on a "real" chrome measurement on blade-ai's
+ *  current layout — LoadingIndicator (10) + PhaseStepper (8) +
+ *  InputPrompt (5) + Footer (1) + margins (2) + comfortable head-room.
+ *  Readings higher than this are almost certainly a Yoga bug or a
+ *  terminal reporting the full viewport. */
+const ABS_CHROME_CAP = 35;
+
+/**
+ * Compute the upper bound a single ``measureElement`` reading must
+ * satisfy to be accepted. Two pressures interact:
+ *
+ *   - ``ABS_CHROME_CAP`` (35): an honest chrome on this app cannot
+ *     exceed ~35 rows; values above it indicate a pathological reading.
+ *   - ``rows - MIN_PENDING_BUDGET``: on a *very* narrow terminal
+ *     (rows ≤ 12), this term collapses to ``MIN_PENDING_BUDGET`` and
+ *     the cap floors at 6 — meaning the dynamic measurement path is
+ *     effectively dead code there and the fallback ``CHROME_ROWS_RESERVE``
+ *     takes over. That's intentional: tiny terminals can't fit our
+ *     chrome anyway, so the fallback is just as good as any honest
+ *     measurement.
+ *
+ * Exported so the boundary semantics can be unit-tested without
+ * mounting Ink.
+ */
+export function chromeMeasurementCap(rows: number): number {
+  return Math.min(
+    ABS_CHROME_CAP,
+    Math.max(MIN_PENDING_BUDGET, rows - MIN_PENDING_BUDGET),
+  );
+}
+
+/**
+ * Decide whether a fresh ``measureElement`` reading should be applied
+ * to ``chromeHeight``. Returns the accepted value, or ``null`` to
+ * keep the prior ``chromeHeight`` state. Three guards in order:
+ *
+ *   1. **Must be a finite real number.** JavaScript's ``<`` and ``>``
+ *      operators return ``false`` for any comparison involving NaN, so
+ *      the legacy `if (measured < 5) return;` / `if (measured > cap) return;`
+ *      pair silently let NaN through — that NaN would then propagate
+ *      through `availableTerminalHeight = max(6, rows - NaN - 2) = NaN`
+ *      and pollute every ``MaxSizedBox`` budget in pending. Yoga has
+ *      been observed returning NaN on rapid resize when a measurement
+ *      lands between layout passes; ``Number.isFinite`` catches both
+ *      NaN and the (similarly broken) Infinity case.
+ *
+ *   2. **Lower bound 5.** Real chrome is always at least 5 rows
+ *      (InputPrompt fences + Footer + outer margin). Readings below
+ *      that mean Composer hasn't fully laid out yet — keep the prior
+ *      good value rather than jumping to a too-generous budget that
+ *      would push pending into chrome's space.
+ *
+ *   3. **Upper bound from ``chromeMeasurementCap(rows)``** — see the
+ *      cap docstring for the dual pressure (absolute ceiling vs
+ *      narrow-terminal floor).
+ *
+ * Exported pure so the failure modes are unit-testable in isolation.
+ */
+export function acceptChromeMeasurement(
+  measured: number,
+  rows: number,
+): number | null {
+  if (!Number.isFinite(measured)) return null;
+  if (measured < 5) return null;
+  if (measured > chromeMeasurementCap(rows)) return null;
+  return measured;
+}
+
 export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
   const history = useAppSelector((s) => s.history);
   const pending = useAppSelector((s) => s.pending);
@@ -79,7 +203,118 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
   const remountKey = useAppSelector((s) => s.historyRemountKey);
   const bootProgress = useAppSelector((s) => s.bootProgress);
   const constrainHeight = useAppSelector((s) => s.constrainHeight);
-  const { rows } = useTerminalSize();
+  // Phase 3.2 — these selectors are NOT consumed below; they're
+  // subscribed as ``useLayoutEffect`` re-trigger keys. Every one of
+  // them can change the chrome height that lives under the pending
+  // area (spinner show/hide, stepper show/hide, compaction indicator
+  // mutex), and we want a fresh ``measureElement`` reading right
+  // after Ink commits each transition. Without these deps the
+  // effect would only re-fire on resize.
+  const streamStateForChrome = useAppSelector((s) => s.streamState);
+  const hasStepperForChrome = useAppSelector(
+    (s) => s.currentPhaseStepper !== null,
+  );
+  const compactionInFlightForChrome = useAppSelector(
+    (s) => s.currentCompaction !== null,
+  );
+  // Phase 3.2 audit-fix — ``constrainHeight`` also affects chrome
+  // height because ``useLoadingIndicator``'s ``bodyMax`` (the padded
+  // CoT body inside LoadingIndicator) is gated on this flag. On
+  // small terminals (rows < 30) the two branches can differ by up
+  // to ~5 rows, so a Ctrl+O toggle mid-thinking changes chrome
+  // height; without this dep, measureElement wouldn't re-fire and
+  // ``chromeHeight`` would stay at the pre-toggle value until the
+  // next unrelated transition.
+  const { columns, rows } = useTerminalSize();
+
+  // Phase 3.2 — measured chrome height (LoadingIndicator + optional
+  // PhaseStepperCard + InputPrompt + Footer + outer margins). Initial
+  // state is the historical ``CHROME_ROWS_RESERVE`` constant; it acts
+  // as the first-paint fallback before Composer has mounted and as
+  // the safety value if ``measureElement`` ever fails. After the
+  // first commit cycle the useLayoutEffect below replaces it with
+  // the real value and keeps it in sync as chrome rows appear /
+  // disappear during the session.
+  const [chromeHeight, setChromeHeight] = useState<number>(
+    CHROME_ROWS_RESERVE,
+  );
+
+  // Phase 3.2 — ref-transition version bump. React commits siblings
+  // in JSX order; MainContent is mounted *before* Composer, so on
+  // the very first render our useLayoutEffect fires while
+  // ``getChromeMeasureRef()`` is still ``null``. Without this
+  // subscription the effect's deps wouldn't change until the user
+  // triggered a turn, leaving ``chromeHeight`` stuck on the
+  // fallback for the whole first session. Subscribing here means
+  // ``setChromeMeasureRef`` flips ``chromeRefVersion`` one microtask
+  // after Composer commits, the layout effect re-fires on the
+  // next render, and the real measurement lands without any user
+  // input.
+  const [chromeRefVersion, setChromeRefVersion] = useState(0);
+  useEffect(() => {
+    const unsubscribe = subscribeChromeMeasureRef(() => {
+      // Functional updater is mandatory — multiple ref transitions
+      // could batch into the same microtask flush (rare but
+      // theoretically possible during hot reload or rapid mount/
+      // unmount cycles); using ``v => v + 1`` keeps the bump
+      // monotonic regardless of how React schedules the setState.
+      setChromeRefVersion((v) => v + 1);
+    });
+    return unsubscribe;
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = getChromeMeasureRef();
+    if (!el) return;
+    let measured: number;
+    try {
+      measured = measureElement(el).height;
+    } catch {
+      // measureElement throws when the element isn't mounted. Safe
+      // to swallow — we keep the prior chromeHeight value, which is
+      // either the conservative fallback (first render) or the
+      // last good measurement.
+      return;
+    }
+    // Sanity-check the measurement via the pure ``acceptChromeMeasurement``
+    // helper. It encodes three guards (finite-number, lower-bound 5,
+    // upper-bound from ``chromeMeasurementCap(rows)``) and returns
+    // ``null`` on rejection so we keep the prior ``chromeHeight``
+    // state — see the helper's docstring for the rationale on each
+    // guard, in particular the ``Number.isFinite`` short-circuit
+    // (NaN propagates through ``< / >`` comparisons silently, which
+    // would otherwise let a Yoga-glitched NaN reading land in state
+    // and poison every downstream ``availableTerminalHeight`` math).
+    const accepted = acceptChromeMeasurement(measured, rows);
+    if (accepted === null) return;
+    // Same-reference guard: setState with the same value would still
+    // trigger a render; gate it explicitly so a no-op measure
+    // doesn't churn the render loop.
+    setChromeHeight((prev) => (prev === accepted ? prev : accepted));
+  }, [
+    rows,
+    columns,
+    streamStateForChrome,
+    hasStepperForChrome,
+    compactionInFlightForChrome,
+    // ``constrainHeight`` flips on Ctrl+O and changes ``bodyMax`` in
+    // useLoadingIndicator (used by the LoadingIndicator's padded body
+    // block). On small terminals the chrome height can swing by up to
+    // ~5 rows from this toggle alone. Without this dep, a mid-thinking
+    // Ctrl+O would leave ``chromeHeight`` stale until the next
+    // unrelated transition.
+    constrainHeight,
+    // ``pending.length`` is intentionally included: the pending area
+    // is rendered BELOW the chrome but its height growth can push the
+    // chrome into a different viewport position, and Ink's Yoga can
+    // reflow heights inside the chrome accordingly on some terminals.
+    // Re-measuring on pending depth changes catches that case cheaply.
+    pending.length,
+    // First-paint catch-up — see the chromeRefVersion subscription
+    // above. Without this dep the very first render's null-ref
+    // miss would never recover until the next state-driven re-fire.
+    chromeRefVersion,
+  ]);
 
   // Per-pending-item height budget. ``constrainHeight: false`` (toggled
   // by Ctrl+O) sends ``undefined`` so MaxSizedBox renders content
@@ -88,8 +323,14 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
   // pending item; in practice ``flushLeadingStable``'s eager harvest
   // keeps pending to one or two items at a time, so per-item cap ≈
   // total cap.
+  //
+  // The ``- 2`` safety margin absorbs a one-row Yoga rounding error
+  // (measureElement returns integer cells but Ink composes a margin
+  // outside the measured Box) and gives the pending block a one-row
+  // breathing space above InputPrompt so the next tick can grow the
+  // pending body without immediately overflowing.
   const availableTerminalHeight = constrainHeight
-    ? Math.max(MIN_PENDING_BUDGET, rows - CHROME_ROWS_RESERVE)
+    ? Math.max(MIN_PENDING_BUDGET, rows - chromeHeight - 2)
     : undefined;
 
   // Static items: header + every committed history item.
@@ -119,13 +360,79 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
   // Until session.id is set, MainContent renders only the boot
   // spinner from ``state.bootProgress`` — pending area is also
   // empty during boot. The terminal shows just the spinner row.
+  // Phase 3.3 — progressive Static replay state machine. See the
+  // ``PROGRESSIVE_REPLAY_*`` constant block for rationale. The state
+  // lives here (not in the reducer) because it's a pure render-layer
+  // concern: when remountKey changes (i.e. /clear fires), we want
+  // Ink to mount items in chunks rather than all at once.
+  const [replayCount, setReplayCount] = useState(() =>
+    initialReplayCount(history.length),
+  );
+  // Latest length kept in a ref so the setImmediate callback (which
+  // captures stale closures) always advances toward the up-to-date
+  // length, not the length at the time the effect scheduled.
+  const historyLengthRef = useRef(history.length);
+  historyLengthRef.current = history.length;
+
+  // Reset the replay window when /clear bumps remountKey. CRITICAL:
+  // this MUST run during render — NOT in a useEffect. ``remountKey``
+  // also drives the ``<Static>`` ``key`` below; Ink remounts Static
+  // synchronously on the first render with the new key. If we
+  // reset replayCount in a useEffect, that first render would have
+  // already passed the full (just-cleared) history to the new
+  // <Static>, defeating the chunking entirely. The "store previous
+  // prop in state + setState during render" pattern queues a re-render
+  // that discards this one before commit, so <Static> never sees the
+  // stale full slice. (Refs alone don't work — they don't trigger a
+  // re-render; React would commit the current render with the stale
+  // state.) See:
+  //   https://react.dev/reference/react/useState#storing-information-from-previous-renders
+  const [lastRemountKey, setLastRemountKey] = useState(remountKey);
+  if (lastRemountKey !== remountKey) {
+    setLastRemountKey(remountKey);
+    setReplayCount(initialReplayCount(historyLengthRef.current));
+  }
+
+  useEffect(() => {
+    if (replayCount >= history.length) return;
+    const remaining = history.length - replayCount;
+    if (remaining <= PROGRESSIVE_REPLAY_CHUNK_SIZE) {
+      // Within one chunk of done — jump straight to the end so we
+      // don't waste another scheduling tick on a tiny remainder.
+      setReplayCount(history.length);
+      return;
+    }
+    // setImmediate yields back to the event loop between batches.
+    // setTimeout(_, 0) would also work but setImmediate is slightly
+    // higher priority and runs before timer callbacks, which lets the
+    // user perceive each batch as "filling in fast" rather than
+    // "waiting between frames".
+    const handle = setImmediate(() => {
+      setReplayCount((c) =>
+        Math.min(c + PROGRESSIVE_REPLAY_CHUNK_SIZE, historyLengthRef.current),
+      );
+    });
+    return () => clearImmediate(handle);
+  }, [replayCount, history.length]);
+
+  // Tail-gap shortcut. Normal append (a new history item lands during
+  // streaming) creates a gap of exactly 1 — far below CHUNK_SIZE. In
+  // that common case we hand Static the full slice so the new item
+  // appears immediately instead of waiting a tick. Only when the gap
+  // is bigger than CHUNK_SIZE (i.e. /clear + long-history remount) do
+  // we slice and let the effect catch up chunk by chunk.
+  const visibleHistory =
+    history.length - replayCount <= PROGRESSIVE_REPLAY_CHUNK_SIZE
+      ? history
+      : history.slice(0, replayCount);
+
   const staticItems: StaticEntry[] = [];
   if (session.id) {
     staticItems.push({
       key: "header",
       node: <Header version={version} session={session} serverUrl={serverUrl} />,
     });
-    for (const item of history) {
+    for (const item of visibleHistory) {
       staticItems.push({
         key: item.id,
         node: <HistoryItemDisplay item={item} />,

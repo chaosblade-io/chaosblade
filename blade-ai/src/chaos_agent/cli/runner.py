@@ -2031,12 +2031,28 @@ class AgentRunner:
     # ---- version ----
 
     async def version(self) -> dict:
-        """Show version information. Equivalent to GET /api/v1/version."""
-        await self._ensure_initialized()
+        """Show version information. Equivalent to GET /api/v1/version.
+
+        ``blade-ai version`` is a metadata-only command — it shouldn't
+        require LLM credentials, a reachable model endpoint, or the
+        full graph wiring. The previous implementation called
+        ``_ensure_initialized()``, which transitively constructs the
+        LLM client (via ``create_agent`` → ``make_llm``); on a fresh
+        machine without ``OPENAI_API_KEY`` / ``DASHSCOPE_API_KEY`` set,
+        the OpenAI SDK raises ``OpenAIError: Missing credentials`` and
+        the user can't even check what version they have installed.
+        Worse, partial init left aiosqlite worker threads dangling so
+        the process hung after the traceback.
+        Init only what the response needs: the SkillRegistry, so we
+        can count ``supported_fault_count``. No LLM, no checkpointer,
+        no prerequisites.
+        """
+        if self._registry is None:
+            self._registry = SkillRegistry()
+            self._registry.load_from_directory(get_skills_dir())
         return JSONEnvelope.ok(
             data={
                 "version": __version__,
                 "supported_fault_count": len(self._registry),
             },
-            
         )

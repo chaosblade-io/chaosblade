@@ -331,6 +331,24 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             layer="llm_summary",
         )
 
+    def _convert_context_size_status(status_evt) -> StreamEvent | None:
+        """Translate a ``source == "context_size"`` StatusEvent into a
+        ``StreamEvent(type="context_size", ...)`` carrying the four
+        numbers the TS TUI's Footer needs to render its live
+        ``current/window`` indicator. Returns None for other sources
+        so the same status-pump tuple is reused by both converters."""
+        if getattr(status_evt, "source", "") != "context_size":
+            return None
+        detail = getattr(status_evt, "detail", None) or {}
+        return StreamEvent(
+            type="context_size",
+            task_id=turn_id,
+            context_current_tokens=int(detail.get("current_tokens") or 0),
+            context_trigger_tokens=int(detail.get("trigger_tokens") or 0),
+            context_max_tokens=int(detail.get("max_tokens") or 0),
+            context_messages_count=int(detail.get("messages_count") or 0),
+        )
+
     async def _merged_stream(graph_iter):
         """Yield ``("graph", raw_event)`` and ``("status", status_evt)``
         tuples interleaved as they happen. Two background tasks pump
@@ -468,6 +486,9 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                     compaction_evt = _convert_compaction_status(payload)
                     if compaction_evt is not None:
                         yield compaction_evt.to_sse()
+                    ctx_evt = _convert_context_size_status(payload)
+                    if ctx_evt is not None:
+                        yield ctx_evt.to_sse()
 
             # 2. Drain any pending interrupts. The inject pipeline has
             #    *two* interrupt() call sites — intent_confirm (Layer 1,
@@ -595,6 +616,9 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                         compaction_evt = _convert_compaction_status(payload)
                         if compaction_evt is not None:
                             yield compaction_evt.to_sse()
+                        ctx_evt = _convert_context_size_status(payload)
+                        if ctx_evt is not None:
+                            yield ctx_evt.to_sse()
 
             # 3. Final-state extraction → ``result`` envelope.
             #    Mirrors inject_stream.py's terminal-state shape so the
@@ -950,6 +974,15 @@ async def _build_result_payload(
             "fault_type": fault_type,
             "blade_uid": blade_uid,
             "duration_ms": elapsed_ms,
+            # P1-6: include the live target spec so the TUI ResultCard
+            # can show namespace + names. Without this the user has no
+            # way to verify "I actually hit the right pod/node" from
+            # the result card alone (had to scroll back to the confirm
+            # gate to check).
+            "target": values.get("target") or {},
+            # Same rationale for params — what we actually executed
+            # with, surfaced for confirm-trail audit.
+            "params": values.get("params") or {},
             "verification": strip_side_effects(values.get("verification")),
             "side_effects": values.get("verification", {}).get("side_effects")
             if isinstance(values.get("verification"), dict)

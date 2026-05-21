@@ -36,6 +36,7 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { useBootCardWidth } from "../boot/BootCardFrame.js";
 import {
   YesNoFeedbackSelect,
@@ -229,18 +230,55 @@ function safetyBadge(status: string): SafetyBadge | null {
 }
 
 // ---------------------------------------------------------------------------
+// Shared layout constants — keep every row in the card aligned to a
+// single 14-column "label gutter" so Field values and list-row body
+// text both start at column 14 from the card's inner edge.
+//
+//   Field rows:    [ label .... 14col .... ] [ value flexGrow ]
+//   List rows:     [ glyph 3 ][ name 11 ]   [ body  flexGrow ]
+//   Indented hint: [ spacer ...... 14col .. ] [ hint  flexGrow ]
+//
+// The pre-cleanup code had list rows on a 28-col name gutter which
+// pushed list bodies to column 31 — visually out of step with Field
+// values at column 14. Unifying these makes every section vertically
+// align inside the card.
+// ---------------------------------------------------------------------------
+const FIELD_LABEL_WIDTH = 14;
+const LIST_GLYPH_WIDTH = 3;
+const LIST_NAME_WIDTH = FIELD_LABEL_WIDTH - LIST_GLYPH_WIDTH;
+
+// ---------------------------------------------------------------------------
 // Shared sub-components
 // ---------------------------------------------------------------------------
 
-const Field: React.FC<{ label: string; value: string }> = ({ label, value }) => {
+const Field: React.FC<{
+  label: string;
+  value: string;
+  /** Override the label colour (default ``text.secondary``). Used by
+   *  status-tinted rows like Recovery notes "Why partial" (warn) or
+   *  Failure analysis "Cause" (err). */
+  labelColor?: string;
+  /** Override the value colour (default ``text.primary``). */
+  valueColor?: string;
+  /** Wrap multi-line values (default true — most confirm fields are
+   *  short; setting false yields ``truncate-end`` for ultra-narrow
+   *  metadata where wrap would look messy). */
+  wrap?: boolean;
+}> = ({
+  label,
+  value,
+  labelColor = Theme.gray[500],
+  valueColor = Theme.text.primary,
+  wrap = true,
+}) => {
   if (!value) return null;
   return (
     <Box>
-      <Box minWidth={14} paddingRight={1}>
-        <Text color={Theme.gray[500]}>{label}</Text>
+      <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1}>
+        <Text color={labelColor}>{label}</Text>
       </Box>
       <Box flexGrow={1}>
-        <Text color={Theme.text.primary} wrap="wrap">
+        <Text color={valueColor} wrap={wrap ? "wrap" : "truncate-end"}>
           {value}
         </Text>
       </Box>
@@ -279,15 +317,6 @@ const Chip: React.FC<{ color: string; children: string }> = ({
   </Text>
 );
 
-/** Bold horizontal rule — used by soft-tier frame as top/bottom edges
- *  and as section separators. Implementation note: a width-bound
- *  ``<Text>`` of ``━`` is more reliable than a ``Box`` with only
- *  ``borderTop`` for our ``cardWidth`` use case — Ink renders the
- *  Text at exact width, no border-rendering gotchas. */
-const RuleHeavy: React.FC<{ width: number }> = ({ width }) => (
-  <Text color={Theme.gray[700]}>{"━".repeat(Math.max(8, width))}</Text>
-);
-
 /** Light section rule inside a card body — separates "details" from
  *  "risk meter" from "actions". */
 const SectionRule: React.FC = () => (
@@ -300,6 +329,50 @@ const SectionRule: React.FC = () => (
     borderRight={false}
     borderColor={Theme.gray[700]}
   />
+);
+
+/** Title chip + heading row — v3 design. Mirrors the bracket-chip
+ *  language used in ToolMessage (`[✓ kubectl]`), so confirm and tool
+ *  cards share the same visual vocabulary.
+ *
+ *  Layout:  [glyph CHIP]  Title text   ·  task-id
+ *           └ gray bracket
+ *                 └ tier-color glyph + bold chip label (e.g. ⚠ EXECUTE)
+ *                              └ same tier-color bold title — chip + title
+ *                                read as one visual unit; the colour also
+ *                                serves as the tier signal (fire / warn)
+ *                                now that both frames share one border colour.
+ *                                          └ dim task id */
+const TitleChip: React.FC<{
+  glyph: string;
+  glyphColor: string;
+  chipLabel: string;
+  title: string;
+  taskId?: string;
+}> = ({ glyph, glyphColor, chipLabel, title, taskId }) => (
+  <Box>
+    <Text color={Theme.gray[500]}>[</Text>
+    <Text color={glyphColor} bold>{`${glyph} ${chipLabel}`}</Text>
+    <Text color={Theme.gray[500]}>{"]"}</Text>
+    <Text color={glyphColor} bold>{`  ${title}`}</Text>
+    {taskId && (
+      <Text color={Theme.gray[500]}>{`  ·  ${taskId}`}</Text>
+    )}
+  </Box>
+);
+
+/** Section heading — visual delimiter inside a confirm card.
+ *  Renders as `── label` in dim gray; lighter than a full SectionRule
+ *  and carries a label so the user knows what the next block is.
+ *  Used for "Decision signals" / "Execution plan" / "Safety check"
+ *  sub-sections in the v3 layout. */
+const SectionHeading: React.FC<{ label: string }> = ({ label }) => (
+  <Box marginTop={1}>
+    <Text color={Theme.gray[500]}>{"── "}</Text>
+    <Text color={Theme.gray[500]} bold>
+      {label}
+    </Text>
+  </Box>
 );
 
 // ---------------------------------------------------------------------------
@@ -319,6 +392,9 @@ interface FrameProps {
   /** Colour for the glyph — usually matches the tier accent so the
    *  glyph and title read as one unit. */
   glyphColor: string;
+  /** Short uppercase chip label rendered inside the [glyph LABEL]
+   *  bracket chip (v3). E.g. "INTENT" / "EXECUTE" / "CONFIRM". */
+  chipLabel: string;
   /** Title text (no UPPERCASE / no banner format — plain title
    *  case, e.g. "Confirm intent" / "Confirm execution plan"). */
   title: string;
@@ -334,11 +410,13 @@ interface FrameProps {
 }
 
 /** Soft tier (Layer 1 intent_confirm + generic fallback) — round
- *  border in forge.fire. Same chrome family as the boot cards /
- *  Tool cards. */
+ *  border in forge.dim (fire desaturated ~30%). The container
+ *  itself stays warm-toned but recedes, letting the saturated
+ *  forge.fire glyph + title inside carry the brand accent. */
 const ConfirmFrameSoft: React.FC<FrameProps> = ({
   glyph,
   glyphColor,
+  chipLabel,
   title,
   taskId,
   preamble,
@@ -351,23 +429,19 @@ const ConfirmFrameSoft: React.FC<FrameProps> = ({
       <Box
         flexDirection="column"
         borderStyle="round"
-        borderColor={Theme.forge.fire}
+        borderColor={Theme.forge.dim}
         paddingX={2}
         paddingY={0}
         width={width}
       >
-        {/* Title row: glyph + title · taskId */}
-        <Box>
-          <Text color={glyphColor} bold>
-            {glyph}{" "}
-          </Text>
-          <Text color={Theme.forge.fire} bold>
-            {title}
-          </Text>
-          {taskId && (
-            <Text color={Theme.gray[500]}>{`  ·  ${taskId}`}</Text>
-          )}
-        </Box>
+        {/* Title row: [glyph CHIP]  title · taskId  (v3 bracket chip) */}
+        <TitleChip
+          glyph={glyph}
+          glyphColor={glyphColor}
+          chipLabel={chipLabel}
+          title={title}
+          taskId={taskId}
+        />
         {/* Preamble: dim subtitle */}
         {preamble && (
           <Box marginTop={1}>
@@ -392,13 +466,17 @@ const ConfirmFrameSoft: React.FC<FrameProps> = ({
   );
 };
 
-/** Hard tier (Layer 2 confirmation_gate) — double border in
- *  forge.iron, same colour family as ResultCard ("your decision
- *  flows straight into the result"). Same internal stack as the
- *  soft tier; only the border style + colour differ. */
+/** Hard tier (Layer 2 confirmation_gate) — same dim-warm round
+ *  border as the soft tier. Tier is now signaled by the title
+ *  glyph (✻ vs ⚠) and the in-card chip colour (forge.fire vs
+ *  status.warn) rather than by border weight/colour. The previous
+ *  double-line in forge.iron read as too heavy and clashed with
+ *  the rest of the chrome (boot cards / tool rails all use single
+ *  lines too). */
 const ConfirmFrameHard: React.FC<FrameProps> = ({
   glyph,
   glyphColor,
+  chipLabel,
   title,
   taskId,
   preamble,
@@ -410,23 +488,19 @@ const ConfirmFrameHard: React.FC<FrameProps> = ({
     <Box paddingLeft={2} marginTop={1} flexDirection="column">
       <Box
         flexDirection="column"
-        borderStyle="double"
-        borderColor={Theme.forge.iron}
+        borderStyle="round"
+        borderColor={Theme.forge.dim}
         paddingX={2}
         paddingY={0}
         width={width}
       >
-        <Box>
-          <Text color={glyphColor} bold>
-            {glyph}{" "}
-          </Text>
-          <Text color={Theme.forge.iron} bold>
-            {title}
-          </Text>
-          {taskId && (
-            <Text color={Theme.gray[500]}>{`  ·  ${taskId}`}</Text>
-          )}
-        </Box>
+        <TitleChip
+          glyph={glyph}
+          glyphColor={glyphColor}
+          chipLabel={chipLabel}
+          title={title}
+          taskId={taskId}
+        />
         {preamble && (
           <Box marginTop={1}>
             <Text color={Theme.gray[500]}>{preamble}</Text>
@@ -512,7 +586,7 @@ const RiskMeterRow: React.FC<{ risk: RiskInfo }> = ({ risk }) => {
     }
     return (
       <Box>
-        <Box minWidth={14} paddingRight={1}>
+        <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1} flexShrink={0}>
           <Text color={Theme.gray[500]}>{t("confirm.field.risk")}</Text>
         </Box>
         <Box flexGrow={1}>
@@ -535,7 +609,7 @@ const RiskMeterRow: React.FC<{ risk: RiskInfo }> = ({ risk }) => {
       : `${risk.count} ${risk.target}`;
   return (
     <Box>
-      <Box minWidth={14} paddingRight={1}>
+      <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1} flexShrink={0}>
         <Text color={Theme.gray[500]}>{t("confirm.field.risk")}</Text>
       </Box>
       <Box flexGrow={1}>
@@ -565,7 +639,7 @@ const ConfidenceRow: React.FC<{
   return (
     <Box flexDirection="column">
       <Box>
-        <Box minWidth={14} paddingRight={1}>
+        <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1} flexShrink={0}>
           <Text color={Theme.gray[500]}>
             {t("confirm.field.intent_confidence")}
           </Text>
@@ -578,7 +652,7 @@ const ConfidenceRow: React.FC<{
       </Box>
       {lowConf && (
         <Box>
-          <Box minWidth={14} />
+          <Box minWidth={FIELD_LABEL_WIDTH} flexShrink={0} />
           <Box flexGrow={1}>
             <Text color={Theme.gray[500]}>{"└─ "}</Text>
             <Text color={color} bold>
@@ -624,10 +698,27 @@ const IntentConfirmCard: React.FC<{
 
   const risk = computeRiskInfo(fi);
 
+  // P2-7: Layer 1 audit trail. ``intent_reasoning`` is the LLM's own
+  // explanation for the classification; we surface it ONLY on
+  // low-confidence turns (the user is most likely to second-guess
+  // the call there). ``clarification_round`` tells the user we're
+  // already iterating — useful so they don't think "did my message
+  // get lost?". Both fields are optional; absent means no audit row.
+  const intentReasoning = asString(payload?.["intent_reasoning"]);
+  const clarificationRoundRaw = payload?.["clarification_round"];
+  const clarificationRound =
+    typeof clarificationRoundRaw === "number" && Number.isFinite(clarificationRoundRaw)
+      ? Math.max(0, Math.floor(clarificationRoundRaw))
+      : 0;
+  const showReasoning =
+    intentReasoning.length > 0 && confidence < LOW_CONFIDENCE_THRESHOLD;
+  const hasAuditTrail = showReasoning || clarificationRound > 0;
+
   return (
     <ConfirmFrameSoft
       glyph={Icons.thinking}
       glyphColor={Theme.forge.fire}
+      chipLabel={t("confirm.intent.chip")}
       title={t("confirm.intent.title")}
       preamble={t("confirm.intent.preamble")}
       taskId={taskId}
@@ -647,6 +738,9 @@ const IntentConfirmCard: React.FC<{
         label={t("confirm.field.user_description")}
         value={asString(fi["user_description"])}
       />
+      {(risk || confidence > 0) && (
+        <SectionHeading label={t("confirm.section.decision_signals")} />
+      )}
       {risk && (
         <Box marginTop={1} flexDirection="column">
           <RiskMeterRow risk={risk} />
@@ -657,6 +751,30 @@ const IntentConfirmCard: React.FC<{
           <ConfidenceRow confidence={confidence} faultIntent={fi} />
         </Box>
       )}
+      {/* P2-7: audit trail — reasoning + clarification round. Quiet
+       *  section; only renders when there's something worth showing. */}
+      {hasAuditTrail && (
+        <>
+          <SectionHeading label={t("confirm.section.audit_trail")} />
+          <Box marginTop={1} flexDirection="column">
+            {showReasoning && (
+              <Field
+                label={t("confirm.field.intent_reasoning")}
+                value={intentReasoning}
+                wrap
+              />
+            )}
+            {clarificationRound > 0 && (
+              <Field
+                label={t("confirm.field.clarification_round")}
+                value={t("confirm.clarification.label", { n: clarificationRound })}
+                labelColor={Theme.status.warn}
+                valueColor={Theme.status.warn}
+              />
+            )}
+          </Box>
+        </>
+      )}
     </ConfirmFrameSoft>
   );
 };
@@ -665,57 +783,82 @@ const IntentConfirmCard: React.FC<{
 // Layer 2 — confirmation_gate (hard tier)
 // ---------------------------------------------------------------------------
 
-const SafetyBadgeRow: React.FC<{ status: string; reason: string }> = ({
+/** One safety-check line — glyph + label + dim detail. Designed for
+ *  the v3 "Safety check" section as a list item. Total prefix width
+ *  (glyph 3 + name 11) sums to FIELD_LABEL_WIDTH so the detail column
+ *  vertically aligns with Field values elsewhere in the card. */
+const SafetyCheckRow: React.FC<{
+  glyph: string;
+  color: string;
+  label: string;
+  detail?: string;
+}> = ({ glyph, color, label, detail }) => (
+  <Box>
+    <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0}>
+      <Text color={color}>{glyph}</Text>
+    </Box>
+    <Box minWidth={LIST_NAME_WIDTH} flexShrink={0} paddingRight={1}>
+      <Text color={Theme.gray[500]} wrap="truncate-end">
+        {label}
+      </Text>
+    </Box>
+    {detail && (
+      <Box flexGrow={1}>
+        <Text color={Theme.gray[500]} wrap="wrap">
+          {detail}
+        </Text>
+      </Box>
+    )}
+  </Box>
+);
+
+/** v3 Safety section — renders the (currently single-result) safety
+ *  check as a list item. Forward-compatible: when backend payload
+ *  starts carrying ``safety_checks: [{name, status, detail}]`` the
+ *  list can grow without touching consumers. For now the single
+ *  status/reason pair maps to one row. */
+const SafetyCheckList: React.FC<{ status: string; reason: string }> = ({
   status,
   reason,
 }) => {
   const badge = safetyBadge(status);
   if (!badge) return null;
   return (
-    <Box>
-      <Box flexShrink={0}>
-        <Chip color={badge.color}>{`${badge.glyph} ${badge.label}`}</Chip>
-      </Box>
-      {reason && (
-        <Text color={Theme.gray[500]} wrap="wrap">{`  — ${reason}`}</Text>
-      )}
+    <Box flexDirection="column" marginTop={1}>
+      <SafetyCheckRow
+        glyph={badge.glyph}
+        color={badge.color}
+        label={badge.label}
+        detail={reason || undefined}
+      />
     </Box>
   );
 };
 
-/** Plan summary inside a nested round box — visually anchors the
- *  most-scrutinized text in a Layer 2 confirm card. */
-const PlanBlock: React.FC<{ summary: string; width: number }> = ({
-  summary,
-  width,
-}) => (
-  <Box flexDirection="column">
-    <Box>
-      <Text color={Theme.gray[500]}>── plan ──</Text>
-    </Box>
-    <Box
-      marginTop={0}
-      paddingX={1}
-      paddingY={0}
-      borderStyle="round"
-      borderColor={Theme.gray[700]}
-      width={Math.max(20, width - 8)}
-    >
-      <Text color={Theme.text.primary} wrap="wrap">
-        {summary}
-      </Text>
-    </Box>
-  </Box>
-);
+/** Severity → display attributes for target_health_report rows. */
+function healthRowVisuals(severity: string): { color: string; glyph: string } {
+  switch (severity) {
+    case "ok":
+      return { color: Theme.status.ok, glyph: Icons.success };
+    case "warn":
+      return { color: Theme.status.warn, glyph: Icons.warning };
+    case "block":
+      return { color: Theme.status.err, glyph: Icons.fail };
+    default:
+      return { color: Theme.text.secondary, glyph: Icons.bullet };
+  }
+}
 
 const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   payload,
   taskId,
 }) => {
-  const width = useBootCardWidth();
   const skill = asString(payload?.["skill_name"]);
   const target = asRecord(payload?.["target"]);
-  const planSummary = asString(payload?.["plan_summary"]);
+  // ``plan_summary`` is intentionally NOT read — the full plan
+  // markdown is too tall to render inline (was triggering Ink cursor
+  // desync). Only the ``plan_path`` file pointer is surfaced; the
+  // user reads the full plan off disk via ``cat`` / editor.
   const safetyStatus = asString(payload?.["safety_status"]);
   const safetyReason = asString(payload?.["safety_reason"]);
 
@@ -731,25 +874,285 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
     else if (namesStr) targetStr = `names=[${namesStr}]`;
   }
 
+  // P0-2: structured params dict surfaced as "k=v, k=v" string under
+  // the Parameters section. Mirrors how Layer 1 formats fault_intent
+  // params so the two cards read consistently.
+  const paramsDict = asRecord(payload?.["params"]);
+  const paramsStr = paramsDict
+    ? Object.entries(paramsDict)
+        .map(([k, v]) => `${k}=${asString(v)}`)
+        .filter((s) => !s.endsWith("="))
+        .join(", ")
+    : "";
+
+  // P0-1: target_health_report — DiskPressure / Evicted / etc.
+  // Schema (HealthReport.to_dict in target_health.py):
+  //   { target, overall, issues: [{severity, code, message, duration_hint}], summary }
+  const healthReport = asRecord(payload?.["target_health_report"]);
+  const healthOverall = asString(healthReport?.["overall"]);
+  const healthSummary = asString(healthReport?.["summary"]);
+  const healthIssuesRaw = healthReport?.["issues"];
+  const healthIssues = Array.isArray(healthIssuesRaw)
+    ? healthIssuesRaw
+        .map((r) => (typeof r === "object" && r !== null ? (r as Record<string, unknown>) : null))
+        .filter((r): r is Record<string, unknown> => r !== null)
+    : [];
+  // Only show the section when there's an issue to report — a clean
+  // ``overall=ok`` with no issues adds no information for the user.
+  const hasHealthIssues = healthIssues.length > 0 || (healthOverall && healthOverall !== "ok");
+
+  // P1-4: conflict_uids — structured list of existing experiment UIDs.
+  const conflictUidsRaw = payload?.["conflict_uids"];
+  const conflictUids = Array.isArray(conflictUidsRaw)
+    ? conflictUidsRaw.map(asString).filter(Boolean)
+    : [];
+
+  // P2-8: pipeline_attempt / is_complex / plan_path.
+  const pipelineAttemptRaw = payload?.["pipeline_attempt"];
+  const pipelineAttempt =
+    typeof pipelineAttemptRaw === "number" && Number.isFinite(pipelineAttemptRaw)
+      ? Math.max(0, Math.floor(pipelineAttemptRaw))
+      : 0;
+  const planPath = asString(payload?.["plan_path"]);
+
+  // Safety status placement is adaptive (v3): when there's a real
+  // problem (warning / blocked) we float the row up to the top of
+  // the card so the user sees it before scanning the plan. When the
+  // status is "safe" / empty we keep it at the bottom as the closing
+  // "Safety check" line — quiet confirmation, not a top-of-mind alert.
+  const badge = safetyStatus ? safetyBadge(safetyStatus) : null;
+  const hasProblem =
+    safetyStatus === "warning" ||
+    safetyStatus === "confirm_required" ||
+    safetyStatus === "blocked" ||
+    safetyStatus === "rejected";
+  // Guard: don't emit the "Execution plan" section heading when there
+  // is no plan content to render. Payloads with only a safety_status
+  // (e.g. an early policy-block reaching the gate before plan compose)
+  // would otherwise render a dangling heading with an empty body.
+  //
+  // ``planSummary`` (the inline 500-char markdown body) is intentionally
+  // NOT in the guard — it's also NOT rendered anywhere below. The
+  // verbose plan content lived inline before but blew the card past
+  // viewport rows (50+ rows total → Ink cursor desync → ghost copies
+  // in scrollback). We now surface ONLY the saved-file path
+  // (``planPath``), which is one row regardless of plan length;
+  // ``cat <plan_path>`` gets the full markdown on disk.
+  const hasPlanContent = Boolean(skill || targetStr || planPath);
+  // ``hasParamsContent`` retired — Parameters section now renders
+  // ALWAYS, with ``—`` placeholder when the agent didn't compute
+  // structured params. Keeping the section heading visible signals
+  // "we did look at params" instead of leaving the reader to guess.
+
   return (
     <ConfirmFrameHard
       glyph={Icons.warning}
       glyphColor={Theme.status.warn}
+      chipLabel={t("confirm.execution.chip")}
       title={t("confirm.execution.title")}
       preamble={t("confirm.execution.preamble")}
       taskId={taskId}
     >
-      <Field label={t("confirm.field.skill")} value={skill} />
-      <Field label={t("confirm.field.target")} value={targetStr} />
-      {planSummary && (
+      {/* Adaptive top alert — only fires for non-safe statuses */}
+      {hasProblem && badge && (
         <Box marginTop={1}>
-          <PlanBlock summary={planSummary} width={width} />
+          <SafetyCheckRow
+            glyph={badge.glyph}
+            color={badge.color}
+            label={badge.label}
+            detail={safetyReason || undefined}
+          />
         </Box>
       )}
-      {safetyStatus && (
-        <Box marginTop={1} flexDirection="column">
-          <SafetyBadgeRow status={safetyStatus} reason={safetyReason} />
+
+      {hasPlanContent && (
+        <>
+          <SectionHeading label={t("confirm.section.execution_plan")} />
+          <Box marginTop={1} flexDirection="column">
+            <Field label={t("confirm.field.skill")} value={skill} />
+            <Field label={t("confirm.field.target")} value={targetStr} />
+            {/* Plan body lives on disk at ``planPath`` — surfacing the
+             *  path here keeps the card single-row-per-field tall
+             *  regardless of how long the actual plan markdown is. The
+             *  inline ``plan_summary`` field (up to 500 chars / ~15
+             *  rows of markdown) was removed because it routinely
+             *  pushed the card past viewport rows and triggered Ink's
+             *  cursor desync (ghost copies of dyn frame in scrollback).
+             *  ``cat <planPath>`` is the escape hatch for full content. */}
+            {planPath && (
+              <Field
+                label={t("confirm.field.plan_path")}
+                value={t("confirm.plan_saved", { path: planPath })}
+              />
+            )}
+            {/* P2-8: attempt N — sits inside the plan section as an
+             *  audit-style row (warn-coloured but no bold so it
+             *  doesn't compete with title chip). Previously inlined
+             *  into the title which made "第 2 次尝试" read as
+             *  louder than the operational verb. */}
+            {pipelineAttempt > 1 && (
+              <Field
+                label={t("confirm.field.attempt")}
+                value={t("confirm.attempt.label", { n: pipelineAttempt })}
+                labelColor={Theme.status.warn}
+                valueColor={Theme.status.warn}
+              />
+            )}
+          </Box>
+        </>
+      )}
+
+      {/* P0-2: structured params. ALWAYS shown — even when the agent
+       *  didn't compute structured params (`paramsStr` empty) the
+       *  section heading + a `—` placeholder communicates "we did
+       *  look at parameters, there just aren't any". Previously
+       *  gated on ``hasParamsContent`` which hid the section when
+       *  empty, leaving the reader to wonder whether the check
+       *  happened. */}
+      <>
+        <SectionHeading label={t("confirm.section.parameters")} />
+        <Box marginTop={1}>
+          <Field
+            label={t("confirm.field.params")}
+            value={paramsStr || t("confirm.params.none")}
+            wrap
+          />
         </Box>
+      </>
+
+      {/* P0-1: target_health_report — DiskPressure / Evicted / etc.
+       *  ALWAYS shown (was previously gated on ``hasHealthIssues``).
+       *  Three visual states for the body:
+       *    - issues present       → list each issue with severity
+       *      glyph + code + message (row layout: glyph(3) +
+       *      code(11) + message(flex); long codes wrap to two lines)
+       *    - check ran, all clear → single ✓ row "all targets healthy"
+       *    - check didn't run     → single — row "check not run"
+       *      (happens when ``settings.target_health_check_enabled``
+       *      is false on the server side, so the payload's
+       *      ``target_health_report`` field is null) */}
+      <SectionHeading label={t("confirm.section.target_health")} />
+      <Box marginTop={1} flexDirection="column">
+        {hasHealthIssues ? (
+          <>
+            {healthSummary && (
+              <Field
+                label={t("confirm.field.health_summary")}
+                value={healthSummary}
+              />
+            )}
+            {healthIssues.map((issue, i) => {
+              const sev = asString(issue["severity"]);
+              const visuals = healthRowVisuals(sev);
+              const code = asString(issue["code"]);
+              const message = asString(issue["message"]);
+              const durationHint = asString(issue["duration_hint"]);
+              const detail = [message, durationHint && `(${durationHint})`]
+                .filter(Boolean)
+                .join(" ");
+              // Two-line variant for long codes (preserves the code
+              // identifier in full instead of truncating).
+              const isLongCode = (code || sev).length > LIST_NAME_WIDTH;
+              if (isLongCode) {
+                return (
+                  <Box key={i} flexDirection="column">
+                    <Box>
+                      <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0}>
+                        <Text color={visuals.color}>{visuals.glyph}</Text>
+                      </Box>
+                      <Box flexGrow={1}>
+                        <Text color={visuals.color}>{code || sev}</Text>
+                      </Box>
+                    </Box>
+                    {detail && (
+                      <Box>
+                        <Box minWidth={FIELD_LABEL_WIDTH} flexShrink={0} />
+                        <Box flexGrow={1}>
+                          <Text color={Theme.text.secondary} wrap="wrap">
+                            {detail}
+                          </Text>
+                        </Box>
+                      </Box>
+                    )}
+                  </Box>
+                );
+              }
+              return (
+                <Box key={i}>
+                  <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0}>
+                    <Text color={visuals.color}>{visuals.glyph}</Text>
+                  </Box>
+                  <Box minWidth={LIST_NAME_WIDTH} flexShrink={0} paddingRight={1}>
+                    <Text color={visuals.color}>{code || sev}</Text>
+                  </Box>
+                  <Box flexGrow={1}>
+                    <Text color={Theme.text.secondary} wrap="wrap">
+                      {detail}
+                    </Text>
+                  </Box>
+                </Box>
+              );
+            })}
+          </>
+        ) : healthReport === null ? (
+          // Server didn't run the check (target_health_check_enabled
+          // is false / older server build). Single ``—`` row matches
+          // the "Parameters" empty fallback style.
+          <SafetyCheckRow
+            glyph={Icons.bullet}
+            color={Theme.text.secondary}
+            label={t("confirm.field.health")}
+            detail={t("confirm.health.not_run")}
+          />
+        ) : (
+          // Check ran, all targets clean. Single ✓ row reads as
+          // "we looked at this and nothing's wrong".
+          <SafetyCheckRow
+            glyph={Icons.success}
+            color={Theme.status.ok}
+            label={t("confirm.field.health")}
+            detail={t("confirm.health.all_clear")}
+          />
+        )}
+      </Box>
+
+      {/* P1-4: structured conflict_uids list. UID rows use the
+       *  glyph + name two-column layout but with no inline label —
+       *  the uid IS the name. Hint row indents to the field-label
+       *  column so it visually nests under the list. */}
+      {conflictUids.length > 0 && (
+        <>
+          <SectionHeading label={t("confirm.section.conflicts")} />
+          <Box marginTop={1} flexDirection="column">
+            {conflictUids.map((uid, i) => (
+              <Box key={i}>
+                <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0}>
+                  <Text color={Theme.status.warn}>{Icons.warning}</Text>
+                </Box>
+                <Box flexGrow={1}>
+                  <Text color={Theme.gray[300]}>{uid}</Text>
+                </Box>
+              </Box>
+            ))}
+            <Box>
+              <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0} />
+              <Box flexGrow={1}>
+                <Text color={Theme.text.secondary}>
+                  {t("confirm.conflicts.hint")}
+                </Text>
+              </Box>
+            </Box>
+          </Box>
+        </>
+      )}
+
+      {/* Bottom Safety check section — quiet placement, only when no
+       *  prominent top alert is rendered (avoids showing safety twice). */}
+      {!hasProblem && badge && (
+        <>
+          <SectionHeading label={t("confirm.section.safety_check")} />
+          <SafetyCheckList status={safetyStatus} reason={safetyReason} />
+        </>
       )}
     </ConfirmFrameHard>
   );
@@ -768,6 +1171,7 @@ const GenericConfirmCard: React.FC<{ content: string; taskId?: string }> = ({
     <ConfirmFrameSoft
       glyph={Icons.thinking}
       glyphColor={Theme.forge.fire}
+      chipLabel={t("confirm.generic.chip")}
       title={t("confirm.title")}
       preamble={t("confirm.generic.preamble")}
       taskId={taskId}
@@ -821,7 +1225,7 @@ function hasExecutionContent(payload: Record<string, unknown>): boolean {
 // Top-level dispatchers — Context (Static) + Prompt (pending)
 // ---------------------------------------------------------------------------
 
-export const ConfirmContextMessage: React.FC<{
+const ConfirmContextMessageInternal: React.FC<{
   item: import("../../state/types.js").ConfirmContextItem;
 }> = ({ item }) => {
   if (
@@ -841,6 +1245,12 @@ export const ConfirmContextMessage: React.FC<{
   return <GenericConfirmCard content={item.content} taskId={item.taskId} />;
 };
 
+// React.memo: ConfirmContextMessage carries the heaviest layout
+// (IntentConfirmCard / ExecutionConfirmCard with risk meters, safety
+// rows, etc). Item ref is stable post-dispatch — pending churn must
+// not re-render the multi-tier card chain.
+export const ConfirmContextMessage = memo(ConfirmContextMessageInternal);
+
 /**
  * Pending-only renderer for the live confirm select widget.
  *
@@ -854,7 +1264,7 @@ export const ConfirmContextMessage: React.FC<{
  * so the timeline keeps a permanent operator-vocabulary marker
  * without re-occupying the full card area.
  */
-export const ConfirmPromptMessage: React.FC<{
+const ConfirmPromptMessageInternal: React.FC<{
   item: import("../../state/types.js").ConfirmPromptItem;
   isFocused?: boolean;
 }> = ({ item, isFocused = true }) => {
@@ -929,3 +1339,11 @@ export const ConfirmPromptMessage: React.FC<{
     </Box>
   );
 };
+
+// React.memo: pending confirm prompts churn through MainContent
+// re-renders on every streaming event. Default shallow compare on
+// (item, isFocused) gates the re-render. useConfirmSelect's hooks
+// (useAppDispatch, internal useState) stay correct because the
+// component still runs on actual prop changes — only no-op renders
+// are skipped.
+export const ConfirmPromptMessage = memo(ConfirmPromptMessageInternal);

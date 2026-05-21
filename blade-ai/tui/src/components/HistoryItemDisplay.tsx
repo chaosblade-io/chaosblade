@@ -15,13 +15,19 @@
  * ``availableTerminalHeight`` pair: same lever, simpler implementation.
  */
 
+import { memo } from "react";
 import type { HistoryItem } from "../state/types.js";
 import { BootDoctorCard } from "./boot/BootDoctorCard.js";
 import { PendingTasksCard } from "./boot/PendingTasksCard.js";
 import { WelcomeCard } from "./boot/WelcomeCard.js";
 import { PhaseStepperCard } from "./PhaseStepperCard.js";
 import { ResultCard } from "./result/ResultCard.js";
+import { ExperimentsCard } from "./ExperimentsCard.js";
+import { HelpCard } from "./HelpCard.js";
+import { MemoryCard } from "./MemoryCard.js";
+import { ModelCard } from "./ModelCard.js";
 import { RuntimeDoctorCard } from "./RuntimeDoctorCard.js";
+import { SessionCard } from "./SessionCard.js";
 import { AgentMessage } from "./messages/AgentMessage.js";
 import {
   ConfirmContextMessage,
@@ -37,7 +43,7 @@ import { TurnUsageMessage } from "./messages/TurnUsageMessage.js";
 import { UserMessage } from "./messages/UserMessage.js";
 import { MemoryCompactionMessage } from "./messages/MemoryCompactionMessage.js";
 
-export const HistoryItemDisplay: React.FC<{
+const HistoryItemDisplayInternal: React.FC<{
   item: HistoryItem;
   /** True while the item is rendering in the dynamic area (pending);
    *  false / undefined when it has been committed to ``<Static>``
@@ -113,7 +119,36 @@ export const HistoryItemDisplay: React.FC<{
       return <PendingTasksCard item={item} />;
     case "runtime_doctor_card":
       return <RuntimeDoctorCard item={item} />;
+    case "memory_card":
+      return <MemoryCard item={item} />;
+    case "help_card":
+      return <HelpCard item={item} />;
+    case "session_card":
+      return <SessionCard item={item} />;
+    case "experiments_card":
+      return <ExperimentsCard item={item} />;
+    case "model_card":
+      return <ModelCard item={item} />;
     case "phase_stepper":
       return <PhaseStepperCard item={item} />;
   }
 };
+
+// React.memo: the BIG win — MainContent re-renders 5-6 times/second
+// during streaming (pending array changes per TOKEN_APPENDED), and
+// without memo it walks history.map(...) every time, re-evaluating
+// every HistoryItemDisplay JSX and downstream component tree. The
+// outputs all go into Ink's <Static> which caches the actual stdout
+// writes, but the React reconciliation work is still done.
+//
+// Default shallow comparison handles all four props:
+//   · ``item`` — reducer creates new history items on add; existing
+//     items keep stable references, so item-by-item Object.is wins.
+//   · ``isPending`` — boolean primitive.
+//   · ``availableTerminalHeight`` — number | undefined primitive.
+//   · ``isPromptFocused`` — boolean | undefined primitive.
+//
+// Safe for memo (no useEffectEvent — verified via grep across all
+// downstream components). InputPrompt is the only ``useEffectEvent``
+// site in the codebase and it's never rendered through this router.
+export const HistoryItemDisplay = memo(HistoryItemDisplayInternal);

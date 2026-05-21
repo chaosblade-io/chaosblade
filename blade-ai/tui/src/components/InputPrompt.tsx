@@ -307,12 +307,21 @@ export const InputPrompt: React.FC<Props> = ({
             : slash.subs.length
           : 0;
       if (slash.active && slashCount > 0) {
+        // Increment/decrement off ``slash.selected`` (the clamped,
+        // visible index) rather than the raw React state. The two can
+        // diverge whenever the candidate list shrinks — e.g. Tab on
+        // ``/mode`` (root index 4) drops you into the 3-item sub menu;
+        // ``computeSlashState`` clamps the visible selection to 2 but
+        // React state is still 4, so ``i - 1`` would walk 4→3→2 with
+        // zero visible movement until the third keypress finally
+        // matches the clamp. Using the post-clamp value as the base
+        // means every keypress moves the highlight one row.
         if (key.upArrow) {
-          setSelected((i) => Math.max(0, i - 1));
+          setSelected(Math.max(0, slash.selected - 1));
           return;
         }
         if (key.downArrow) {
-          setSelected((i) => Math.min(slashCount - 1, i + 1));
+          setSelected(Math.min(slashCount - 1, slash.selected + 1));
           return;
         }
         if (key.tab) {
@@ -334,20 +343,44 @@ export const InputPrompt: React.FC<Props> = ({
         }
         if (key.return) {
           if (enterLocked) return;
-          let line: string | null = null;
+          // Parameterised commands degrade Enter into Tab — fill the
+          // buffer with ``/cmd `` (or ``/parent sub ``) and wait for
+          // the user to type the args explicitly, rather than firing
+          // the bare command. Without this guard, selecting
+          // ``/mode [calm|working|dense]`` from the menu and pressing
+          // Enter would silently cycle modes (or worse, run a
+          // required-arg command with nothing and fail). A command
+          // with subcommands counts as parameterised too — the user
+          // hasn't picked a sub yet, autocompleting to ``/parent ``
+          // lets the sub-menu pop and they keep navigating.
+          // Commands with neither usage nor subcommands (``/clear``,
+          // ``/exit``, ``/help``, ``/doctor`` …) submit immediately,
+          // matching the old behaviour.
           if (slash.mode === "root") {
             const cmd = slash.candidates[slash.selected];
-            if (cmd) line = `/${cmd.name}`;
-          } else {
-            const sub = slash.subs[slash.selected];
-            if (sub) line = `/${slash.parent.name} ${sub.name}`;
-          }
-          if (line !== null) {
+            if (!cmd) return;
+            if (cmd.usage || cmd.subcommands) {
+              replaceValue(`/${cmd.name} `);
+              return;
+            }
+            const line = `/${cmd.name}`;
             replaceValue("");
             setSelected(0);
             history.push(line);
             onSubmit(line);
+            return;
           }
+          const sub = slash.subs[slash.selected];
+          if (!sub) return;
+          if (sub.usage) {
+            replaceValue(`/${slash.parent.name} ${sub.name} `);
+            return;
+          }
+          const line = `/${slash.parent.name} ${sub.name}`;
+          replaceValue("");
+          setSelected(0);
+          history.push(line);
+          onSubmit(line);
           return;
         }
       }
@@ -634,3 +667,22 @@ export const InputPrompt: React.FC<Props> = ({
     </Box>
   );
 };
+
+// NOTE: NOT wrapped in React.memo. Tried it in Phase 1.3 and it
+// broke ALL keyboard input — typing, arrow keys, Delete all stopped
+// working. Root cause is the ``useEffectEvent`` (React 19 experimental)
+// + memo interaction: useEffectEvent stores its handler closure in a
+// ref that's updated during commit. ``memo`` skips render-and-commit
+// when props are referentially equal; the ref stops updating, so the
+// useInput callback keeps firing the original (empty-state) closure
+// no matter how many setValue calls happen. Subsequent setState
+// re-renders restore the ref, but by then the user has already
+// observed the regression on the very first keystroke.
+//
+// Composer was the parent that benefited from memoing this — it
+// re-renders on every streamState/pendingDecision change. But the
+// internal useState path (typing keystrokes) is unaffected by
+// parent re-render anyway, and the chrome rebuilds (border, prompt
+// glyph) are cheap. Net: not memoing is the correct trade-off
+// here. Footer + LoadingIndicator stayed memoed (no
+// useEffectEvent → no risk).

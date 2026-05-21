@@ -43,7 +43,20 @@ import { ACTIVE_LANG, t } from "../i18n/index.js";
 import { replayRecording } from "../utils/replay.js";
 import { PKG_VERSION } from "../utils/version.js";
 import type { Action } from "./reducer.js";
-import type { AppState } from "./types.js";
+import { resetStreamingCounters } from "./streamingRefs.js";
+import type {
+  AppState,
+  ExperimentsCardItem,
+  ExperimentsCardRow,
+  HelpCardItem,
+  HelpCardRow,
+  HelpCardSection,
+  ModelCardItem,
+  ModelCardRow,
+  ModelCardSection,
+  SessionCardItem,
+  SessionCardRow,
+} from "./types.js";
 
 /** Display order for ``/help`` and SlashMenu, matching Python's
  *  ``_GROUP_ORDER`` in ``tui/commands.py``. */
@@ -78,6 +91,13 @@ export interface SlashCommandContext {
    * caller's responsibility — useStream.beginReplay handles that.
    */
   beginReplay: () => AbortController;
+  /**
+   * Allocate a fresh AbortController for the manual /compact run.
+   * The signal is passed into ``streamCompactSession`` so the
+   * Composer's Esc handler can interrupt the in-flight compaction.
+   * Mirror of ``beginReplay`` — see useStream for the per-call
+   * cancellation contract. */
+  beginManualCompact: () => AbortController;
   /**
    * Submit a natural-language turn — used by /retry and /run. We
    * expose the Composer's bound ``submitTurn`` rather than calling
@@ -330,38 +350,105 @@ function makeDisplayModeHandler(
   };
 }
 
-/** Render the session-info card used by both ``/session`` and the
- *  hidden ``/status`` alias. Pulled out into a free function so the
- *  two command entries can share it without trampling each other's
- *  ``streamSafe`` / ``hidden`` config. */
+/** Factory for the per-mode ``/permission <mode>`` subcommand
+ *  handlers. Same direct-set pattern as ``makeDisplayModeHandler``
+ *  above. Mode change writes through to ``state.config.permissionMode``
+ *  immediately; takes effect on the NEXT ``/turn`` because the
+ *  current request (if any) was already started with its own value
+ *  baked into the server-side initial_state. */
+function makePermissionModeHandler(
+  target: AppState["config"]["permissionMode"],
+): (ctx: SlashCommandContext, args: string[]) => Promise<void> {
+  return async (ctx) => {
+    const current = ctx.state.config.permissionMode;
+    if (current === target) {
+      pushLog(ctx, t("mode.already", { mode: current }), "info");
+      return;
+    }
+    ctx.dispatch({ type: "MODE_TOGGLED", mode: target });
+    pushLog(ctx, t("mode.changed", { mode: target }), "ok");
+  };
+}
+
+/** Build + dispatch the session-info card. Shared by ``/session``
+ *  and the hidden ``/status`` alias so both commands produce the
+ *  identical card (the only difference between the two is their
+ *  ``hidden`` flag, which gates SlashMenu visibility — not output).
+ *
+ *  Failure path: server-state probe failed → fall back to a plain
+ *  warn-log instead of a card. The card requires a populated row
+ *  list, and a half-empty card on transport error would mislead
+ *  more than a clear "could not read" line.
+ *
+ *  ``created_at``'s raw ISO ``2026-05-21T02:22:11.086040+08:00`` is
+ *  intentionally NOT passed through verbatim — the card formats it
+ *  via the same ``formatDateTime`` helper RuntimeDoctorCard uses
+ *  (header tail), so all info-card timestamps share one column.
+ *  We pass the raw ISO through ``capturedAt`` and let the renderer
+ *  format. But the user's session created_at goes into its own row;
+ *  format that here so the row column lines up too.
+ */
 async function runSessionInfoHandler(ctx: SlashCommandContext): Promise<void> {
+  let state: Record<string, unknown>;
   try {
-    const state = await ctx.client.getSessionState(ctx.sessionId);
-    const taskCount = Array.isArray(state["task_ids"])
-      ? (state["task_ids"] as string[]).length
-      : 0;
-    const lines = [
-      `**${t("status.session")}**  ${ctx.sessionId}`,
-      `**${t("status.cluster")}**  ${(state["cluster"] as string) || t("common.none")}`,
-      `**${t("status.namespace")}**  ${(state["namespace"] as string) || "default"}`,
-      `**${t("status.model")}**  ${(state["model_name"] as string) || t("common.unset")}`,
-      `**${t("status.mode")}**  ${ctx.state.config.permissionMode}`,
-      `**${t("status.created")}**  ${(state["created_at"] as string) || t("common.unknown")}`,
-      `**${t("status.tasks")}**  ${taskCount}`,
-    ].join("\n");
-    pushLog(ctx, lines, "info");
+    state = await ctx.client.getSessionState(ctx.sessionId);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     pushLog(ctx, t("status.failed", { err: msg }), "warn");
+    return;
   }
+
+  const taskCount = Array.isArray(state["task_ids"])
+    ? (state["task_ids"] as string[]).length
+    : 0;
+
+  const cluster = (state["cluster"] as string) || "";
+  const model = (state["model_name"] as string) || "";
+
+  const rows: SessionCardRow[] = [
+    { label: t("status.session"), value: ctx.sessionId },
+    {
+      label: t("status.cluster"),
+      value: cluster || t("common.none"),
+      dim: !cluster,
+    },
+    {
+      label: t("status.namespace"),
+      value: (state["namespace"] as string) || "default",
+    },
+    {
+      label: t("status.model"),
+      value: model || t("common.unset"),
+      dim: !model,
+    },
+    {
+      label: t("status.mode"),
+      value: ctx.state.config.permissionMode,
+    },
+    { label: t("status.tasks"), value: String(taskCount) },
+  ];
+
+  // ``capturedAt`` is the SESSION's created_at, NOT when /session was
+  // invoked. The header tail then reads "when did this session start"
+  // — the more useful signal of the two for a user asking "what is
+  // my session?". When the server omits created_at we leave the
+  // header tail empty (renderer drops the "  · …" suffix) rather
+  // than fall back to "now", which would be misleadingly fresh on
+  // an older session.
+  const item: SessionCardItem = {
+    kind: "session_card",
+    id: `session-${Date.now()}`,
+    capturedAt: (state["created_at"] as string) || "",
+    rows,
+  };
+  ctx.dispatch({ type: "HISTORY_APPENDED", item });
 }
 
-/** Shared body for ``/run`` and the hidden ``/inject`` alias. Both
- *  treat the entire arg string as a natural-language turn and
- *  dispatch through ``submitTurn`` — same path as plain typed input.
- *  Without args we just print the usage hint instead of submitting
- *  an empty turn (which the server would reject anyway). */
-async function runOrInjectHandler(
+/** Body of ``/run``. Treats the entire arg string as a natural-language
+ *  turn and dispatches through ``submitTurn`` — same path as plain
+ *  typed input. Without args we just print the usage hint instead of
+ *  submitting an empty turn (which the server would reject anyway). */
+async function runHandler(
   ctx: SlashCommandContext,
   args: string[],
 ): Promise<void> {
@@ -418,7 +505,7 @@ async function listRecordingsHandler(
 }
 
 /** ``/plan <NL>`` — Phase 3c.2 dry-run handler. Mirrors
- *  ``runOrInjectHandler`` shape but flags the turn as ``dryRun``
+ *  ``runHandler`` shape but flags the turn as ``dryRun``
  *  so the server agent runs intent + planning + safety_check +
  *  confirmation_gate without ever side-effecting (no blade_create
  *  call, no checkpoint mutation past ``confirmation_gate``). The
@@ -639,15 +726,37 @@ async function runLocatorExpandHandler(
 }
 
 /**
- * ANSI clear-screen + scrollback wipe. Emitted by /clear before
+ * ANSI viewport-clear (preserves scrollback). Emitted by /clear before
  * dispatching HISTORY_CLEARED so the visible terminal frame matches
  * the now-empty state.
  *
- *   \x1b[3J  — erase scrollback (xterm extension; ignored elsewhere)
- *   \x1b[2J  — erase visible screen
- *   \x1b[H   — cursor home
+ *   \x1b[H   — cursor home (top-left)
+ *   \x1b[J   — erase from cursor to end of screen (i.e. whole viewport)
+ *
+ * Why we DON'T emit \x1b[3J (erase scrollback) anymore (Phase 3.4):
+ * the previous sequence ``\x1b[3J\x1b[2J\x1b[H`` wiped the user's
+ * entire scrollback history, matching ``bash clear`` semantics but
+ * diverging from how Claude Code / qwen-code / modern TUIs treat
+ * /clear. Users expect /clear to give them a fresh dialogue surface
+ * WITHOUT losing the prior session as recoverable scroll history —
+ * "clear" is about starting a new chat, not wiping the record. The
+ * scrollback wipe was also asymmetric with the in-app history reset:
+ * ``HISTORY_CLEARED`` only drops the in-memory ``history`` array,
+ * leaving the user no in-app way to recover anything, AND the
+ * terminal scrollback was simultaneously nuked — total information
+ * loss. Switching to viewport-only clear leaves the terminal-level
+ * scrollback intact so the user can scroll up to read prior turns
+ * even after /clear, matching the mental model "the conversation
+ * starts fresh, but the record is preserved".
+ *
+ * Bumping ``historyRemountKey`` (in the reducer's HISTORY_CLEARED
+ * case) is what forces Ink's ``<Static>`` to remount and start a
+ * fresh append-only stream from the cleared viewport — that part
+ * is unchanged. Ink will write new items starting at the (now
+ * home) cursor, naturally overlaying whatever scrollback content
+ * sits underneath the new viewport contents as the user scrolls.
  */
-const CLEAR_SCREEN = "\x1b[3J\x1b[2J\x1b[H";
+const CLEAR_SCREEN = "\x1b[H\x1b[J";
 
 /** Build the command registry. ``dynamicCommands`` are appended to
  *  the built-in set — used by BootOrchestrator to inject one
@@ -674,7 +783,10 @@ function buildBuiltInCommands(): SlashCommand[] {
       aliases: ["?"],
       streamSafe: true,
       async handler(ctx) {
-        pushLog(ctx, renderHelp(ctx.registry), "info");
+        ctx.dispatch({
+          type: "HISTORY_APPENDED",
+          item: buildHelpCard(ctx.registry),
+        });
       },
     },
     {
@@ -809,7 +921,13 @@ function buildBuiltInCommands(): SlashCommand[] {
       name: "mode",
       description: t("command.mode.desc"),
       group: "general",
-      usage: "[calm|working|dense]",
+      // No ``usage`` — the three subcommands (calm / working / dense)
+      // below already enumerate every valid value, and showing the same
+      // list twice ("/mode [calm|working|dense]" header + three sub
+      // rows) just thickens the help card without adding signal. The
+      // SlashMenu Enter-autocomplete branch still fires because
+      // ``subcommands`` is set; users picking ``/mode`` from the menu
+      // still get the trailing-space buffer + sub-menu fan-out.
       streamSafe: true,
       subcommands: {
         calm: {
@@ -831,63 +949,71 @@ function buildBuiltInCommands(): SlashCommand[] {
           handler: makeDisplayModeHandler("dense"),
         },
       },
-      // Bare ``/mode`` cycles calm → working → dense → calm, mirroring
-      // Python's bare-call cycle. Explicit positional arg (``/mode
-      // calm``) goes through the subcommand path above and never
-      // reaches this handler.
+      // Reachable in two cases — bare ``/mode`` (no token), or
+      // ``/mode <unknown>`` (token that didn't match any sub). Both
+      // surface a hint rather than acting. The previous bare-cycle
+      // semantic was a foot-gun: users would land on a mode without
+      // knowing which one, then re-invoke to "fix" it. Explicit
+      // ``/mode calm`` / ``working`` / ``dense`` still routes through
+      // the subcommands above and never reaches this handler.
       async handler(ctx, args) {
         const arg = (args[0] ?? "").toLowerCase();
         if (arg.length > 0) {
-          // The user typed a token after ``/mode`` that didn't match
-          // any subcommand (parser would have routed it there if it
-          // had). Surface a clear "what are the valid values" hint.
           pushLog(ctx, t("display.usage_unknown", { value: arg }), "warn");
           return;
         }
-        const current = ctx.state.config.displayMode;
-        const cycle: AppState["config"]["displayMode"][] = [
-          "calm",
-          "working",
-          "dense",
-        ];
-        const idx = cycle.indexOf(current);
-        const next = cycle[(idx === -1 ? 0 : idx + 1) % cycle.length]!;
-        if (next === current) {
-          pushLog(ctx, t("display.already", { mode: current }), "info");
-          return;
-        }
-        ctx.dispatch({ type: "DISPLAY_MODE_CHANGED", mode: next });
-        pushLog(ctx, t("display.changed", { mode: next }), "ok");
+        pushLog(
+          ctx,
+          t("display.usage_missing", { mode: ctx.state.config.displayMode }),
+          "warn",
+        );
       },
     },
     {
-      // Permission mode lives under ``/permission`` now (Phase 1.2 in
-      // the alignment plan). Mirrors Python's ``settings.permission_mode``
-      // toggle. Bare invocation flips the current value; explicit
-      // ``auto`` / ``confirm`` arg sets directly.
+      // Permission mode. Same structural shape as ``/mode`` above —
+      // two named subs (``auto`` / ``confirm``), no usage hint
+      // (subs already enumerate the values), bare invocation falls
+      // through to the handler below which surfaces a "missing arg"
+      // hint instead of implicitly toggling. The previous bare-toggle
+      // semantic was a foot-gun: ``confirm`` is the safe default and
+      // a stray ``/permission`` (no arg) silently flipping the user
+      // into ``auto`` removes the safety gate without their knowing.
       name: "permission",
       description: t("command.permission.desc"),
       group: "general",
-      usage: "[auto|confirm]",
+      // No ``usage`` — the two subs below enumerate every valid
+      // value, mirroring the ``/mode`` cleanup. SlashMenu's
+      // Enter-autocomplete branch still kicks in because
+      // ``subcommands`` is set.
       streamSafe: true,
+      subcommands: {
+        auto: {
+          name: "auto",
+          description: t("command.permission.auto.desc"),
+          streamSafe: true,
+          handler: makePermissionModeHandler("auto"),
+        },
+        confirm: {
+          name: "confirm",
+          description: t("command.permission.confirm.desc"),
+          streamSafe: true,
+          handler: makePermissionModeHandler("confirm"),
+        },
+      },
+      // Bare ``/permission`` (no token) or unknown-arg path. Subs
+      // ``/permission auto`` / ``/permission confirm`` route through
+      // the subcommand map above and never reach this handler.
       async handler(ctx, args) {
         const arg = (args[0] ?? "").toLowerCase();
-        const current = ctx.state.config.permissionMode;
-        let next: "auto" | "confirm";
-        if (arg === "auto" || arg === "confirm") {
-          next = arg;
-        } else if (arg.length > 0) {
+        if (arg.length > 0) {
           pushLog(ctx, t("mode.usage_unknown", { value: arg }), "warn");
           return;
-        } else {
-          next = current === "auto" ? "confirm" : "auto";
         }
-        if (next === current) {
-          pushLog(ctx, t("mode.already", { mode: current }), "info");
-          return;
-        }
-        ctx.dispatch({ type: "MODE_TOGGLED", mode: next });
-        pushLog(ctx, t("mode.changed", { mode: next }), "ok");
+        pushLog(
+          ctx,
+          t("mode.usage_missing", { mode: ctx.state.config.permissionMode }),
+          "warn",
+        );
       },
     },
     {
@@ -974,7 +1100,7 @@ function buildBuiltInCommands(): SlashCommand[] {
       usage: "<NL>",
       dispatchesOwnTurn: true,
       async handler(ctx, args) {
-        await runOrInjectHandler(ctx, args);
+        await runHandler(ctx, args);
       },
     },
     {
@@ -997,20 +1123,6 @@ function buildBuiltInCommands(): SlashCommand[] {
       dispatchesOwnTurn: true,
       async handler(ctx, args) {
         await planHandler(ctx, args);
-      },
-    },
-    {
-      // Hidden ``/inject`` alias of ``/run`` for users still on the
-      // older verb. Python keeps it as a hidden deprecation path; we
-      // mirror that. New code should reach ``/run`` directly.
-      name: "inject",
-      description: t("command.run.desc"),
-      group: "business",
-      hidden: true,
-      usage: "<NL>",
-      dispatchesOwnTurn: true,
-      async handler(ctx, args) {
-        await runOrInjectHandler(ctx, args);
       },
     },
     {
@@ -1192,15 +1304,17 @@ function buildBuiltInCommands(): SlashCommand[] {
     },
     {
       // ``/experiments`` — list every fault scenario the loaded skill
-      // catalog exposes, grouped by category. Backed by the heavy
-      // ``GET /api/v1/skills`` (LLM-generated on cold cache) so the
-      // first call after server start can take several seconds; we
-      // log a "loading…" line up front so users don't suspect a
-      // stalled TUI.
+      // catalog exposes. Backed by ``GET /api/v1/skills`` which is
+      // cached server-side (per-skill directory fingerprint hits a
+      // disk cache at ``~/.blade-ai/memory/tool_cache/...``); typical
+      // calls return in <50ms. First call on a freshly-installed
+      // skill that ships without a ``references/catalogue/`` dir DOES
+      // pay an LLM round-trip — but bundled skills all have catalogue
+      // dirs, so the LLM path is uncommon in practice.
       //
-      // Mirrors Python ``_cmd_experiments`` (``tui/controllers/
-      // commands.py:468+``) but renders to a flat text body since
-      // we don't have rich-table parity yet.
+      // A loading log is dispatched up front in case the cache really
+      // does miss + the LLM path fires. Cache HIT is fast enough that
+      // the user sees the loading line for ~0 frames.
       name: "experiments",
       description: t("command.experiments.desc"),
       group: "business",
@@ -1209,7 +1323,10 @@ function buildBuiltInCommands(): SlashCommand[] {
         pushLog(ctx, t("experiments.loading"), "info");
         try {
           const data = await ctx.client.listSkills();
-          pushLog(ctx, formatExperimentsCatalog(data), "info");
+          ctx.dispatch({
+            type: "HISTORY_APPENDED",
+            item: buildExperimentsCard(data),
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           pushLog(ctx, t("experiments.failed", { err: msg }), "warn");
@@ -1234,7 +1351,12 @@ function buildBuiltInCommands(): SlashCommand[] {
       name: "recover",
       description: t("command.recover.desc"),
       group: "business",
-      usage: "<task_id|latest|list>",
+      // ``list`` lives under subcommands so it's intentionally NOT
+      // in the usage hint — the parent header would otherwise read
+      // "<task_id|latest|list>" while the same ``list`` row appears
+      // again just below. The bare-handler positional args are
+      // ``task_id`` and ``latest`` only.
+      usage: "<task_id|latest>",
       subcommands: {
         list: {
           name: "list",
@@ -1685,7 +1807,42 @@ function buildBuiltInCommands(): SlashCommand[] {
           async handler(ctx) {
             try {
               const data = await ctx.client.getMemoryInfo(ctx.sessionId);
-              pushLog(ctx, formatMemorySnapshot(data), "info");
+              // Dispatch a bordered MemoryCard rather than a plain
+              // log line so the snapshot reads as a persistent
+              // diagnostic record in scrollback (parallel to /doctor's
+              // RuntimeDoctorCard). Each /memory show invocation
+              // pushes its own card with its own ``capturedAt`` so
+              // multiple snapshots stack in obvious chronological
+              // order.
+              const stats: Record<string, number | string> = {};
+              const rawStats =
+                (data["stats"] as Record<string, unknown>) ?? {};
+              for (const [k, v] of Object.entries(rawStats)) {
+                if (typeof v === "number" || typeof v === "string") {
+                  stats[k] = v;
+                }
+              }
+              ctx.dispatch({
+                type: "HISTORY_APPENDED",
+                item: {
+                  kind: "memory_card",
+                  id: `memory-${Date.now()}`,
+                  sessionId: (data["tui_session_id"] as string) ?? "",
+                  startedAt: (data["started_at"] as string) ?? "",
+                  status: (data["status"] as string) ?? "active",
+                  cluster: (data["cluster_name"] as string) ?? "",
+                  namespace: (data["namespace"] as string) ?? "",
+                  recentTasks:
+                    (data["task_ids_recent"] as string[] | undefined) ?? [],
+                  totalTasks:
+                    (data["task_count_total"] as number | undefined) ??
+                    ((data["task_ids_recent"] as string[] | undefined)?.length ??
+                      0),
+                  stats,
+                  memoryDir: (data["memory_dir"] as string) ?? "",
+                  capturedAt: new Date().toISOString(),
+                },
+              });
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               pushLog(ctx, t("memory.show_failed", { err: msg }), "warn");
@@ -1759,7 +1916,10 @@ function buildBuiltInCommands(): SlashCommand[] {
           async handler(ctx) {
             try {
               const data = await ctx.client.getModel();
-              pushLog(ctx, formatModelList(data), "info");
+              ctx.dispatch({
+                type: "HISTORY_APPENDED",
+                item: buildModelCard(data),
+              });
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               pushLog(ctx, t("model.failed", { err: msg }), "warn");
@@ -1802,10 +1962,14 @@ function buildBuiltInCommands(): SlashCommand[] {
     {
       // ``/compact`` — force the LangGraph inject thread to compact
       // its message list NOW. Mirrors Python ``_cmd_compact``
-      // (``tui/controllers/commands.py:1038``). Server-side picks the
-      // active thread from the TUI session's most recent task id and
-      // runs ``compact_if_needed`` (Layer 1 lightweight first; falls
-      // back to LLM summary if needed).
+      // (``tui/controllers/commands.py:1038``). Server-side runs the
+      // unified PreReasoningHook with ``force=True``, the same code
+      // path auto-compaction takes.
+      //
+      // The route streams SSE: ``memory_compaction`` phase events as
+      // the hook progresses, then a terminal ``result`` envelope, then
+      // ``done``. This gives the user real-time feedback during the
+      // multi-second LLM summariser call instead of a silent stall.
       //
       // NOT stream-safe — compaction mutates the checkpoint thread
       // the running turn is reading; doing it mid-stream would corrupt
@@ -1818,13 +1982,79 @@ function buildBuiltInCommands(): SlashCommand[] {
           pushLog(ctx, t("compact.busy"), "warn");
           return;
         }
-        pushLog(ctx, t("compact.starting"), "info");
+        // Open the client-side spinner slot. The Composer mounts
+        // ManualCompactIndicator while ``currentManualCompact !== null``
+        // so the user sees a continuous "正在压缩…" row + elapsed
+        // timer + esc-to-cancel hint for the entire operation
+        // (noop / strip-only / LLM-driven, all uniform).
+        ctx.dispatch({ type: "COMPACT_MANUAL_STARTED" });
+        // AbortController routed to streamCompactSession's fetch so
+        // Esc from the Composer can interrupt mid-call. The Composer
+        // wires its Esc binding to ``cancelManualCompact`` whenever
+        // the spinner slot is non-null.
+        const ctrl = ctx.beginManualCompact();
+        let resultPayload: Record<string, unknown> | null = null;
+        let sawFailure = false;
         try {
-          const data = await ctx.client.compactSession(ctx.sessionId);
-          pushLog(ctx, formatCompactResult(data), "ok");
+          for await (const evt of ctx.client.streamCompactSession(
+            ctx.sessionId,
+            undefined,
+            ctrl.signal,
+          )) {
+            if (evt.type === "memory_compaction") {
+              // Phase events drive nothing visible now — the spinner
+              // is already up from COMPACT_MANUAL_STARTED above and
+              // stays up until the slot closes. Only failure needs
+              // surfacing here so the user sees a real error reason
+              // instead of just "failed".
+              if (evt.compaction_phase === "failed") {
+                sawFailure = true;
+                pushLog(
+                  ctx,
+                  t("compact.failed", { err: evt.content || "hook failure" }),
+                  "warn",
+                );
+              }
+              // Intentionally NO log on "started" or "completed" —
+              // they're noise compared to the running spinner +
+              // final result line.
+            } else if (evt.type === "result") {
+              resultPayload = (evt.payload ?? {}) as Record<string, unknown>;
+            } else if (evt.type === "error") {
+              sawFailure = true;
+              pushLog(
+                ctx,
+                t("compact.failed", { err: evt.content || "stream error" }),
+                "warn",
+              );
+            }
+            // ``done`` is the stream terminator — streamCompactSession's
+            // generator returns on it, so we don't need to handle it
+            // here. Any other event type is ignored (forward-compat).
+          }
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          pushLog(ctx, t("compact.failed", { err: msg }), "warn");
+          // Distinguish user-initiated Esc cancel from genuine errors:
+          // an AbortError when ctrl.signal aborted is the user's
+          // explicit cancel, surface it as a friendly "cancelled" line
+          // instead of a generic "compaction failed: AbortError".
+          const isAbort =
+            err instanceof Error &&
+            (err.name === "AbortError" || ctrl.signal.aborted);
+          if (isAbort) {
+            pushLog(ctx, t("compact.cancelled"), "warn");
+          } else {
+            const msg = err instanceof Error ? err.message : String(err);
+            pushLog(ctx, t("compact.failed", { err: msg }), "warn");
+          }
+          return;
+        } finally {
+          // Always close the spinner slot — success, failure, or
+          // cancel. Without the finally, an abort would leak the
+          // indicator on screen indefinitely.
+          ctx.dispatch({ type: "COMPACT_MANUAL_DONE" });
+        }
+        if (resultPayload && !sawFailure) {
+          pushLog(ctx, formatCompactResult(resultPayload), "ok");
         }
       },
     },
@@ -1979,6 +2209,14 @@ function buildBuiltInCommands(): SlashCommand[] {
             "info",
           );
           ctx.dispatch({ type: "REPLAY_STARTED", taskId });
+          // Phase 2.1 — clear the streaming token counter so the
+          // LoadingIndicator's live "~N tokens" estimate restarts
+          // from 0 for the replay (rather than displaying the
+          // residual count left by the prior real turn). The replay
+          // recorder does NOT route through useStream's token
+          // handler, so the ref would otherwise stay at its prior
+          // value for the entire replay duration.
+          resetStreamingCounters();
           const controller = ctx.beginReplay();
           const stats = await replayRecording(events, ctx.dispatch, taskId, {
             speed,
@@ -2144,39 +2382,53 @@ function formatReviewCard(
   return lines.join("\n");
 }
 
-/** Format the ``/api/v1/skills`` envelope into a category-grouped
- *  experiments listing (mirrors Python's ``experiments_table``). */
-function formatExperimentsCatalog(data: Record<string, unknown>): string {
-  const total = (data["total"] as number) ?? 0;
-  const categories = (data["categories"] as Array<Record<string, unknown>>) ?? [];
-  if (categories.length === 0) {
-    return t("experiments.empty");
-  }
-  const lines: string[] = [t("experiments.head", { total })];
+/** Build an ExperimentsCardItem snapshot from the ``/api/v1/skills``
+ *  envelope. Pure: the renderer (``ExperimentsCard.tsx``) takes the
+ *  assembled rows and presents them with no API coupling, so a
+ *  ``/experiments`` fired while the skill registry is still loading
+ *  captures what the user actually saw — not what the registry
+ *  mutates to a few frames later.
+ *
+ *  Display rules:
+ *    - Categories are flattened to a single row sequence in the
+ *      server's iteration order. Skill packs are typically 1:1
+ *      (one use case per category), so nesting would add chrome
+ *      around a single row.
+ *    - Fault entries that lack ``use_case_name`` fall back through
+ *      ``fault_type`` → ``name`` → ``"?"`` so a partial-data row
+ *      still renders something rather than a blank line.
+ *    - Empty ``fault_symptom`` is preserved as ``""`` — the
+ *      renderer substitutes a localised placeholder so the symptom
+ *      column always carries text.
+ */
+function buildExperimentsCard(
+  data: Record<string, unknown>,
+): ExperimentsCardItem {
+  const totalRaw = data["total"];
+  const total = typeof totalRaw === "number" ? totalRaw : 0;
+  const categories =
+    (data["categories"] as Array<Record<string, unknown>>) ?? [];
+  const rows: ExperimentsCardRow[] = [];
   for (const cat of categories) {
-    const name = (cat["category"] as string) || "?";
-    const desc = (cat["description"] as string) || "";
-    const faults = (cat["faults"] as Array<Record<string, unknown>>) ?? [];
-    lines.push("");
-    lines.push(`▸ ${name}  ·  ${faults.length} ${t("experiments.fault_count_unit")}`);
-    if (desc && desc !== name) {
-      lines.push(`  ${desc}`);
-    }
-    for (const fault of faults.slice(0, 6)) {
+    const faults =
+      (cat["faults"] as Array<Record<string, unknown>>) ?? [];
+    for (const fault of faults) {
       const useCase =
         (fault["use_case_name"] as string) ||
         (fault["fault_type"] as string) ||
         (fault["name"] as string) ||
         "?";
       const symptom = (fault["fault_symptom"] as string) || "";
-      const head = symptom ? `${useCase}  —  ${symptom}` : useCase;
-      lines.push(`    • ${head}`);
-    }
-    if (faults.length > 6) {
-      lines.push(`    … +${faults.length - 6}`);
+      rows.push({ useCaseName: useCase, faultSymptom: symptom });
     }
   }
-  return lines.join("\n");
+  return {
+    kind: "experiments_card",
+    id: `experiments-${Date.now()}`,
+    capturedAt: new Date().toISOString(),
+    totalCount: total || rows.length,
+    rows,
+  };
 }
 
 /** Format the recover result envelope. The recover endpoint returns
@@ -2237,50 +2489,12 @@ function formatConfigList(data: Record<string, unknown>): string {
   return lines.join("\n");
 }
 
-/** Render the memory snapshot returned by ``getMemoryInfo`` —
- *  cluster / namespace / status / recent task tail / stats /
- *  memory_dir. Same ordering as Python TUI's ``_cmd_memory_show``
- *  for parity. */
-function formatMemorySnapshot(data: Record<string, unknown>): string {
-  const sid = (data["tui_session_id"] as string) ?? "";
-  const cluster = (data["cluster_name"] as string) || "(未设置)";
-  const ns = (data["namespace"] as string) || "(未设置)";
-  const startedAt = (data["started_at"] as string) || "";
-  const status = (data["status"] as string) || "active";
-  const tail =
-    (data["task_ids_recent"] as string[] | undefined) ?? [];
-  const total = (data["task_count_total"] as number) ?? tail.length;
-  const stats = (data["stats"] as Record<string, unknown>) ?? {};
-  const memDir = (data["memory_dir"] as string) ?? "";
-  const lines: string[] = [
-    t("memory.head", { sid }),
-    `  ${t("memory.cluster_label")}: ${cluster}`,
-    `  ${t("memory.ns_label")}: ${ns}`,
-    `  ${t("memory.started_label")}: ${startedAt || "—"}`,
-    `  ${t("memory.status_label")}: ${status}`,
-    "",
-    t("memory.recent_tasks_head", { shown: tail.length, total }),
-  ];
-  if (tail.length === 0) {
-    lines.push(`  ${t("common.unknown")}`);
-  } else {
-    for (const task of tail) {
-      lines.push(`  - ${task}`);
-    }
-  }
-  if (Object.keys(stats).length > 0) {
-    lines.push("");
-    lines.push(t("memory.stats_head"));
-    for (const [k, v] of Object.entries(stats)) {
-      lines.push(`  ${k}: ${String(v ?? "")}`);
-    }
-  }
-  if (memDir) {
-    lines.push("");
-    lines.push(`memory_dir: ${memDir}`);
-  }
-  return lines.join("\n");
-}
+// ``formatMemorySnapshot`` was removed when /memory show migrated to
+// the bordered ``MemoryCard`` (see commands.ts handler). The old
+// ``memory.head`` / ``memory.cluster_label`` etc. i18n keys remain
+// in en.ts/zh.ts as legacy entries — keep them around so a future
+// downgrade or alternative renderer can read them; they're unused
+// at the call site now.
 
 /** Render the compact result envelope. Two cases:
  *  - ``compacted: false`` — nothing to do (under budget or empty).
@@ -2299,54 +2513,83 @@ function formatCompactResult(data: Record<string, unknown>): string {
   return t("compact.ok", { before, after, saved, pct, layer });
 }
 
-/** Render the `/model list` envelope. Marks the active row with
- *  ``▸`` so the user can scan for the running model at a glance.
- *  Custom (non-curated) active models still surface in the head
- *  even though they don't appear in ``candidates``. */
-function formatModelList(data: Record<string, unknown>): string {
+/** Build a ModelCardItem snapshot from the ``/api/v1/model``
+ *  envelope. Pure: the renderer (``ModelCard.tsx``) takes the
+ *  assembled sections and presents them with no API coupling, so
+ *  ``/model list`` snapshots stay static after burn-in (a later
+ *  ``/model set`` doesn't mutate a card already in scrollback).
+ *
+ *  Display rules:
+ *    - Providers cluster in the order they first appear in the
+ *      ``candidates`` array (stable; the server's curated list is
+ *      already grouped meaningfully).
+ *    - Active model lives in its own section row, marked
+ *      ``active=true`` — renderer paints ● + bold + forge.fire.
+ *    - If the active model id isn't in any curated provider list
+ *      (user pointed at a private model), a synthetic ``custom``
+ *      section is appended carrying just that id + a localised
+ *      "not in curated list" note. Without this the user would
+ *      otherwise see no marker for their running model at all.
+ */
+function buildModelCard(data: Record<string, unknown>): ModelCardItem {
   const active = (data["active"] as string) || "";
   const baseUrl = (data["api_base_url"] as string) || "";
   const candidates =
     (data["candidates"] as Array<Record<string, unknown>>) ?? [];
-  const lines: string[] = [t("model.head", { active: active || "(unset)" })];
-  if (baseUrl) {
-    lines.push(`  ${t("model.base_url_label")}: ${baseUrl}`);
-  }
-  // Group by provider so providers cluster visually. Stable order:
-  // first occurrence of each provider in the candidates list.
+
+  // Group by provider, preserving first-occurrence order so the
+  // visual clustering follows whatever the server already curated.
   const seen: string[] = [];
-  const byProvider = new Map<string, Array<Record<string, unknown>>>();
+  const byProvider = new Map<string, ModelCardRow[]>();
+  let activeFound = false;
   for (const cand of candidates) {
     const provider = (cand["provider"] as string) || "other";
+    const id = (cand["id"] as string) || "?";
+    const note = (cand["note"] as string) || "";
+    const isActive = id === active && active.length > 0;
+    if (isActive) activeFound = true;
     if (!byProvider.has(provider)) {
       byProvider.set(provider, []);
       seen.push(provider);
     }
-    byProvider.get(provider)!.push(cand);
+    byProvider.get(provider)!.push({
+      id,
+      active: isActive,
+      ...(note ? { note: `— ${note}` } : {}),
+    });
   }
-  let activeFound = false;
-  for (const provider of seen) {
-    lines.push("");
-    lines.push(`  ${provider}`);
-    for (const cand of byProvider.get(provider) || []) {
-      const id = (cand["id"] as string) || "?";
-      const note = (cand["note"] as string) || "";
-      const marker = id === active ? "▸" : " ";
-      if (id === active) activeFound = true;
-      const tail = note ? `  — ${note}` : "";
-      lines.push(`    ${marker} ${id}${tail}`);
-    }
-  }
+  const sections: ModelCardSection[] = seen.map((provider) => ({
+    provider,
+    rows: byProvider.get(provider) ?? [],
+  }));
+
+  // Custom model: active id wasn't anywhere in the curated list.
+  // Surface a single-row synthetic section so the user still sees
+  // the running model marked active.
+  let totalCount = candidates.length;
   if (active && !activeFound) {
-    // Custom model the curated list doesn't know about. Show it as
-    // its own row at the bottom so the user still sees what's running.
-    lines.push("");
-    lines.push(`  custom`);
-    lines.push(`    ▸ ${active}  — ${t("model.custom_note")}`);
+    sections.push({
+      provider: t("model.card.custom_section"),
+      rows: [
+        {
+          id: active,
+          active: true,
+          note: t("model.card.custom_note"),
+        },
+      ],
+    });
+    totalCount += 1;
   }
-  lines.push("");
-  lines.push(t("model.list_tail"));
-  return lines.join("\n");
+
+  return {
+    kind: "model_card",
+    id: `model-${Date.now()}`,
+    capturedAt: new Date().toISOString(),
+    activeModel: active,
+    apiBaseUrl: baseUrl,
+    totalCount,
+    sections,
+  };
 }
 
 /** Render the `/skills show <name>` detail card. Surfaces metadata
@@ -2475,42 +2718,71 @@ function formatSkillsList(data: Record<string, unknown>): string {
 
 // ── helpers ──────────────────────────────────────────────────────────
 
-/** Render the /help text. Groups follow ``SLASH_GROUP_ORDER``; hidden
- *  commands are dropped (callers can still invoke them). Subcommands
- *  are indented one level under their parent so the relationship is
- *  obvious in scrollback. */
-function renderHelp(registry: SlashCommandRegistry): string {
-  const groups: Record<SlashGroup, string> = {
+/** Build a HelpCardItem snapshot from the registry. Pure: the renderer
+ *  (``HelpCard.tsx``) takes the assembled sections and presents them
+ *  with no registry coupling, so a /help fired while skill commands
+ *  are still loading captures what the user actually saw — not what
+ *  the registry mutates to a few frames later.
+ *
+ *  Display rules:
+ *    - Groups follow ``SLASH_GROUP_ORDER``; empty groups are dropped
+ *      (no dangling section heading over zero rows).
+ *    - Hidden commands are excluded — they remain callable, just not
+ *      advertised here.
+ *    - Aliases collapse into the name with a ``·`` separator
+ *      (``/exit · /quit``) rather than the legacy ``(/quit)`` tail,
+ *      tighter and matches the v3 chip vocabulary.
+ *    - Subcommands sort alphabetically; the parent's ``/cmd`` prefix
+ *      is omitted on the sub row because the indent + visual grouping
+ *      already disambiguates (and the prefix would just shove the
+ *      description column further right).
+ */
+function buildHelpCard(registry: SlashCommandRegistry): HelpCardItem {
+  const groupLabels: Record<SlashGroup, string> = {
     general: t("help.group.general"),
     business: t("help.group.business"),
     skills: t("help.group.skills"),
     dynamic: t("help.group.dynamic"),
   };
-  const out: string[] = [];
   const grouped = registry.listByGroup();
+  const sections: HelpCardSection[] = [];
   for (const group of SLASH_GROUP_ORDER) {
     const cmds = grouped[group];
     if (!cmds || cmds.length === 0) continue;
-    out.push(`**${groups[group]}**`);
+    const rows: HelpCardRow[] = [];
     for (const c of cmds) {
-      const aliases =
+      const aliasTail =
         c.aliases && c.aliases.length > 0
-          ? ` (${c.aliases.map((a) => `/${a}`).join(", ")})`
+          ? ` · ${c.aliases.map((a) => `/${a}`).join(" · ")}`
           : "";
       const usage = c.usage ? ` ${c.usage}` : "";
-      out.push(`  /${c.name}${usage}${aliases}  ·  ${c.description}`);
+      rows.push({
+        kind: "top",
+        name: `/${c.name}${usage}${aliasTail}`,
+        description: c.description,
+      });
       if (c.subcommands) {
         for (const sub of Object.values(c.subcommands).sort((a, b) =>
           a.name.localeCompare(b.name),
         )) {
           const subUsage = sub.usage ? ` ${sub.usage}` : "";
-          out.push(`    /${c.name} ${sub.name}${subUsage}  ·  ${sub.description}`);
+          rows.push({
+            kind: "sub",
+            name: `${sub.name}${subUsage}`,
+            description: sub.description,
+          });
         }
       }
     }
-    out.push("");
+    sections.push({ heading: groupLabels[group], rows });
   }
-  return out.join("\n").replace(/\n+$/, "");
+  return {
+    kind: "help_card",
+    id: `help-${Date.now()}`,
+    capturedAt: new Date().toISOString(),
+    sections,
+    tip: t("help.card.tip"),
+  };
 }
 
 function stateGlyph(state: string): string {

@@ -21,6 +21,7 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { useTerminalSize, NARROW_THRESHOLD } from "../../hooks/useTerminalSize.js";
 import { t } from "../../i18n/index.js";
 import type { WelcomeCardItem } from "../../state/types.js";
@@ -79,7 +80,7 @@ function topBorderSegments(
   };
 }
 
-export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
+const WelcomeCardInternal: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
   const { columns } = useTerminalSize();
   const cardWidth = useBootCardWidth();
   const stackVertically = columns <= NARROW_THRESHOLD;
@@ -252,3 +253,9 @@ export const WelcomeCard: React.FC<{ item: WelcomeCardItem }> = ({ item }) => {
     </Box>
   );
 };
+
+// React.memo: WelcomeCard's item ref is set once at boot and never
+// changes. The card is expensive (logo lines, two-column layout,
+// hand-drawn border) — shallow compare skips re-rendering it on
+// every downstream state churn.
+export const WelcomeCard = memo(WelcomeCardInternal);

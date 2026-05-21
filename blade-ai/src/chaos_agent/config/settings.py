@@ -18,7 +18,31 @@ _CONFIG_FILE = Path.home() / ".blade-ai" / "config.json"
 
 
 class JsonConfigSettingsSource(PydanticBaseSettingsSource):
-    """Custom settings source that reads from ~/.blade-ai/config.json."""
+    """Custom settings source that reads from ~/.blade-ai/config.json.
+
+    Empty-string semantics: a string field whose JSON value is ``""``
+    (or whitespace-only) is treated as **unset**, so the next source
+    in the priority chain (env vars, then code defaults) gets to
+    provide a value. Without this, an accidentally-blank
+    ``"api_base_url": ""`` in the config file would override the
+    sensible default and leave the LLM trying to dial an empty URL —
+    LangChain's openai client builds successfully with an empty base
+    but every request fails / hangs on timeout, with no obvious
+    error surface for the user.
+
+    Non-string types (int / float / bool / list / dict) pass through
+    as-is — their "unset" sentinels are type-specific and the wizard
+    never writes them blank anyway.
+    """
+
+    @staticmethod
+    def _is_unset(value: Any) -> bool:
+        """True if the JSON value should be treated as 'not provided'."""
+        if value is None:
+            return True
+        if isinstance(value, str) and not value.strip():
+            return True
+        return False
 
     def get_field_value(
         self, field: Field, field_name: str
@@ -29,7 +53,7 @@ class JsonConfigSettingsSource(PydanticBaseSettingsSource):
             data = json.loads(_CONFIG_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return None, field_name, False
-        if field_name in data:
+        if field_name in data and not self._is_unset(data[field_name]):
             return data[field_name], field_name, True
         return None, field_name, False
 
@@ -42,7 +66,7 @@ class JsonConfigSettingsSource(PydanticBaseSettingsSource):
         except (json.JSONDecodeError, OSError):
             return data
         for field_name in self.settings_cls.model_fields:
-            if field_name in file_data:
+            if field_name in file_data and not self._is_unset(file_data[field_name]):
                 data[field_name] = file_data[field_name]
         return data
 
@@ -76,7 +100,13 @@ class Settings(BaseSettings):
     llm_api_key: str = ""                     # BLADE_AI_LLM_API_KEY
     model_name: str = "qwen3.6-max-preview"               # BLADE_AI_MODEL_NAME
     api_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # BLADE_AI_API_BASE_URL
-    llm_max_retries: int = 3                  # BLADE_AI_LLM_MAX_RETRIES
+    # LLM retry budget. 1 (down from 3) keeps the UX honest: a single
+    # silent retry covers a transient network blip; more retries just
+    # delay the visible error by ``N × timeout_llm`` seconds while the
+    # user stares at a spinner. The actual transient error is also
+    # surfaced via the ``on_llm_error`` tracing callback so the user
+    # sees the retry happening even before it resolves.
+    llm_max_retries: int = 1                  # BLADE_AI_LLM_MAX_RETRIES
     llm_temperature: float = 0.7              # BLADE_AI_LLM_TEMPERATURE
     llm_enable_thinking: bool = True           # BLADE_AI_LLM_ENABLE_THINKING，启用模型深度思考模式(如Qwen的enable_thinking)
 
@@ -116,7 +146,13 @@ class Settings(BaseSettings):
     timeout_blade: int = 30                  # BLADE_AI_TIMEOUT_BLADE
     timeout_kubectl: int = 30                # BLADE_AI_TIMEOUT_KUBECTL
     timeout_kubectl_exec: int = 60           # BLADE_AI_TIMEOUT_KUBECTL_EXEC
-    timeout_llm: int = 180                   # BLADE_AI_TIMEOUT_LLM
+    # LLM single-call timeout. 30s (down from 180) — a healthy LLM
+    # call typically returns in well under 10s; anything past 30s is
+    # almost certainly a connectivity / DNS / firewall issue rather
+    # than slow inference. Combined with ``llm_max_retries=1``, the
+    # absolute worst case before the user sees a clear error is
+    # ~60s instead of ~9 minutes.
+    timeout_llm: int = 30                    # BLADE_AI_TIMEOUT_LLM
     timeout_default: int = 60                # BLADE_AI_TIMEOUT_DEFAULT
     timeout_skill_script: int = 60           # BLADE_AI_TIMEOUT_SKILL_SCRIPT，skill 脚本执行超时
 
@@ -153,6 +189,28 @@ class Settings(BaseSettings):
     max_replan_count: int = 3                    # BLADE_AI_MAX_REPLAN_COUNT
     replan_auto_trigger: bool = True             # BLADE_AI_REPLAN_AUTO_TRIGGER, 自动检测可replan的错误模式
     replan_reset_execute_count: bool = True      # BLADE_AI_REPLAN_RESET_EXECUTE_COUNT, replan后重置execute_loop_count
+
+    # Patch C — Wall-clock timeout 兜底
+    # 单次 inject turn 的硬性墙钟上限。0 = 关闭（保留历史行为）；>0
+    # 时所有 ``should_continue_*`` router 都会检查并强制走 "end" 分
+    # 支。配合 patch B 的 INFRA_TRANSIENT short-retry 一起使用，避
+    # 免基础设施抖动让 turn 跑数分钟还在转圈。
+    max_inject_seconds: int = 0                  # BLADE_AI_MAX_INJECT_SECONDS
+
+    # Patch B — INFRA_TRANSIENT 类错误的额外短重试预算
+    # 当 ``classify_error`` 判定 ErrorAction.SHORT_RETRY 时，router
+    # 允许 LLM 再发起最多 N 次同样的 tool 调用；超出后转 "end"。3
+    # 是经验上不会让用户感到卡顿的合理上限。
+    max_transient_retry: int = 3                 # BLADE_AI_MAX_TRANSIENT_RETRY
+
+    # Patch D — Target health pre-check
+    # ``target_health_check_enabled`` 控制 agent_loop 提交 fault_intent
+    # 前是否调用 ``assess_target_health`` 把目标的 DiskPressure /
+    # Evicted / Pending 等 blocker 注入 confirm card 的 payload。
+    # ``target_health_check_block_on_blocker`` 控制检测到 BLOCK 时是
+    # 否阻断 graph（默认仅 warn-only，把信息丢给用户/LLM 决策）。
+    target_health_check_enabled: bool = True              # BLADE_AI_TARGET_HEALTH_CHECK
+    target_health_check_block_on_blocker: bool = False    # BLADE_AI_TARGET_HEALTH_CHECK_BLOCK
 
     # Retry配置
     retry_max_retries: int = 3               # BLADE_AI_RETRY_MAX_RETRIES

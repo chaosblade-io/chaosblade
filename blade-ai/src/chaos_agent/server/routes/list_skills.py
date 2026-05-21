@@ -3,7 +3,7 @@
 import logging
 from collections import defaultdict
 
-from fastapi import Request
+from fastapi import FastAPI, Request
 
 from chaos_agent.config.settings import settings
 from chaos_agent.models.schemas import JSONEnvelope
@@ -11,6 +11,36 @@ from chaos_agent.server.routes import skills_router
 from chaos_agent.utils.fault_type import extract_fault_type
 
 logger = logging.getLogger(__name__)
+
+
+def _get_or_create_catalog_llm(app: FastAPI):
+    """Lazy process-singleton for the catalog-generator LLM client.
+
+    Construction is cheap (no network), but every fresh ``ChatOpenAI``
+    spins up its own ``openai.AsyncOpenAI`` with a dedicated ``httpx``
+    connection pool — a few sockets / file descriptors held until GC
+    runs. Rebuilding on every ``/api/v1/skills`` request quietly racks
+    those up; once the user hits cache HITs (no actual API traffic)
+    the client is also pure waste.
+
+    Strategy: build on the first request that reaches here, cache on
+    ``app.state.catalog_llm``, reuse for the lifetime of the process.
+    The lifespan shutdown hook (``server/app.py``) calls into the
+    underlying httpx pool to close the sockets cleanly.
+
+    Stored on ``app.state`` (not a module global) so a multi-app test
+    setup can't cross-contaminate, and so the close-on-shutdown hook
+    has a known well-typed handle to reach.
+    """
+    cached = getattr(app.state, "catalog_llm", None)
+    if cached is not None:
+        return cached
+    from chaos_agent.agent.factory import make_llm
+
+    llm = make_llm(max_retries=1, timeout=30)
+    app.state.catalog_llm = llm
+    logger.info("Catalog LLM client created (lazy)")
+    return llm
 
 
 @skills_router.get("/skills")
@@ -26,13 +56,12 @@ async def list_skills(
     scenarios. Results are cached; use no_cache=true to force regeneration.
     """
     from chaos_agent.skills.catalog_generator import generate_skill_catalog
-    from chaos_agent.agent.factory import make_llm
 
     registry = req.app.state.skill_registry
 
     categories_dict = defaultdict(lambda: {"category": "", "description": "", "faults": []})
 
-    llm = make_llm(temperature=0, max_retries=1, timeout=30)
+    llm = _get_or_create_catalog_llm(req.app)
 
     for name, meta in registry.metadata.items():
         # Apply filters

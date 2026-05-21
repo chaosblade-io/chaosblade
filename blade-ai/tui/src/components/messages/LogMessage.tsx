@@ -8,6 +8,7 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import type { LogItem } from "../../state/types.js";
 import { Theme } from "../../theme/colors.js";
 
@@ -57,7 +58,7 @@ function splitBold(text: string): Array<{ text: string; bold: boolean }> {
   return out;
 }
 
-export const LogMessage: React.FC<{ item: LogItem }> = ({ item }) => {
+const LogMessageInternal: React.FC<{ item: LogItem }> = ({ item }) => {
   const color = levelColor(item.level);
   const lines = item.text.split("\n");
   return (
@@ -83,3 +84,9 @@ export const LogMessage: React.FC<{ item: LogItem }> = ({ item }) => {
     </Box>
   );
 };
+
+// React.memo: per-line splitBold parser is non-trivial — multi-line
+// /help / /tasks output runs the parser N times per render. Item ref
+// is stable post-dispatch; default shallow compare prevents repeat
+// work.
+export const LogMessage = memo(LogMessageInternal);

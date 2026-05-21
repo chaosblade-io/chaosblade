@@ -58,11 +58,67 @@ export function parseResultEnvelope(
   const verification = asString(data["verification"]);
 
   // Side effects → terse summary chip ("HPA scaled · 1 pod restarted")
-  const sideEffects = data["side_effects"];
+  // PLUS a per-row list (e.g. "1 pod restart · accounting-6fb...qn2vr")
+  // surfaced in the ResultCard "Side effects" section. The single
+  // summary chip is kept for back-compat with the legacy single-row
+  // ResultCard layout; the new ``sideEffects`` array drives the v3
+  // multi-row section.
+  const sideEffectsRaw = data["side_effects"];
   let restartCount = 0;
-  if (typeof sideEffects === "object" && sideEffects !== null) {
-    const restarts = (sideEffects as Record<string, unknown>)["container_restarts"];
-    if (Array.isArray(restarts)) restartCount = restarts.length;
+  const sideEffectList: string[] = [];
+  if (typeof sideEffectsRaw === "object" && sideEffectsRaw !== null) {
+    const restarts = (sideEffectsRaw as Record<string, unknown>)["container_restarts"];
+    if (Array.isArray(restarts)) {
+      restartCount = restarts.length;
+      for (const r of restarts) {
+        if (typeof r === "string") {
+          sideEffectList.push(`pod restart · ${r}`);
+        } else if (r && typeof r === "object") {
+          const obj = r as Record<string, unknown>;
+          const name = asString(obj["name"]) || asString(obj["pod"]);
+          const reason = asString(obj["reason"]);
+          const label = name
+            ? reason
+              ? `pod restart · ${name} (${reason})`
+              : `pod restart · ${name}`
+            : "pod restart";
+          sideEffectList.push(label);
+        }
+      }
+    }
+    // Other side-effect categories the agent may surface in future
+    // (HPA scaling, log warnings, …). Flatten anything iterable into
+    // a "<key> · <value>" row so additions to the server contract
+    // light up here without a client release.
+    for (const [k, v] of Object.entries(sideEffectsRaw as Record<string, unknown>)) {
+      if (k === "container_restarts") continue;
+      if (Array.isArray(v)) {
+        for (const item of v) {
+          sideEffectList.push(
+            `${k} · ${typeof item === "string" ? item : JSON.stringify(item)}`,
+          );
+        }
+      }
+    }
+  }
+
+  // Replan count — surfaced in Outcome section as "succeeded after N
+  // auto-replan(s)". 0 means clean first-try; we omit the field then.
+  const replanCount = asNumber(data["replan_count"]);
+
+  // Live target spec — verifies "did we hit the intended target".
+  let target: { namespace?: string; names?: string[] } | undefined;
+  const rawTarget = data["target"];
+  if (rawTarget && typeof rawTarget === "object" && !Array.isArray(rawTarget)) {
+    const t = rawTarget as Record<string, unknown>;
+    const ns = asString(t["namespace"]);
+    const namesRaw = t["names"];
+    const names = Array.isArray(namesRaw)
+      ? namesRaw.map(asString).filter(Boolean)
+      : [];
+    if (ns || names.length > 0) {
+      target = { namespace: ns || undefined, names: names.length ? names : undefined };
+    }
   }
 
   // Compose a single-line effect summary. Verification often itself
@@ -117,6 +173,9 @@ export function parseResultEnvelope(
     summary,
     cause,
     hint,
+    target,
+    replanCount: replanCount > 0 ? replanCount : undefined,
+    sideEffects: sideEffectList.length > 0 ? sideEffectList : undefined,
   };
 }
 

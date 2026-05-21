@@ -64,6 +64,7 @@
 
 import { Box, Text } from "ink";
 import InkSpinner from "ink-spinner";
+import { memo } from "react";
 import { useTerminalSize } from "../../hooks/useTerminalSize.js";
 import { t } from "../../i18n/index.js";
 import type { ToolItem, ToolStatus } from "../../state/types.js";
@@ -108,13 +109,18 @@ function railColorFor(status: ToolStatus): string {
       return Theme.status.err;
     case "canceled":
       return Theme.status.warnDim;
-    case "running":
-      return Theme.forge.fire;
     default:
-      // Success: forge.fire — the tool family lives in the brand
-      // colour, matching Header / boot section titles for visual
-      // consistency.
-      return Theme.forge.fire;
+      // Success / running: neutral mid-gray rail. Previously this
+      // returned ``forge.fire``, but that placed the brand color on
+      // every tool card on screen (often 3-10 cards per agent turn)
+      // → high-saturation overload. The mid-gray rail keeps the
+      // Gestalt grouping (vertical line frames the tool block) while
+      // letting the orange be a true accent on agent ``⏺`` only.
+      //
+      // Error / canceled keep their semantic status colors because
+      // those ARE the warnings clig.dev / NNG say warm colors are
+      // reserved for — they appear rarely and should grab attention.
+      return Theme.text.secondary;
   }
 }
 
@@ -148,32 +154,51 @@ function chipGlyphFor(status: ToolStatus): string {
   }
 }
 
-/** Inverse-coloured chip carrying the status glyph and tool name.
- *  ``inverse`` swaps fg/bg so ``color={chipColor}`` paints a status-
- *  coded background — terminal-portable across every ANSI palette and
- *  much louder than border colour alone, which gets washed out in
- *  dark themes. Surrounding spaces give the chip visible padding so
- *  it reads as a labelled tag rather than coloured text. */
+/** Bracket-bounded chip: ``[ ✓ kubectl ]``.
+ *
+ *  Replaces the previous inverse-bg chip, which painted a saturated
+ *  status-colored background on every tool card. With agents
+ *  routinely calling 3-10 tools per turn, that meant the screen was
+ *  perpetually full of colored chip blocks → eye fatigue. The new
+ *  shape uses outline (closure) instead of fill:
+ *
+ *    - ``[`` ``]`` brackets in ``text.secondary`` give the chip its
+ *      silhouette without a background block (Gestalt closure via
+ *      outline, not fill).
+ *    - The status-color glyph (``✓`` ok / ``⊶`` running / ``✗`` err)
+ *      is the single high-information visual element — color now
+ *      *means* something (status) instead of being decoration.
+ *    - Tool name in ``bold`` default fg = the most scannable token
+ *      on the line, in the terminal's native fg so it adapts to
+ *      both light- and dark-bg themes.
+ *
+ *  Brand color (``forge.fire``) is intentionally absent here so it
+ *  remains a true accent reserved for ``AgentMessage``'s ``⏺``
+ *  glyph (per clig.dev "use color sparingly" + NNG "warm bright
+ *  colors for warnings, sparingly").
+ */
 const ToolNameChip: React.FC<{ status: ToolStatus; name: string }> = ({
   status,
   name,
 }) => {
-  const chipColor = chipColorFor(status);
-  if (status === "running") {
-    // Animated spinner inside the chip — the chip stays the same
-    // amber while the ⊶⊷ glyph rotates; signals "in flight" without
-    // breaking the chip silhouette.
-    return (
-      <Text inverse color={chipColor} bold>
-        {" "}
-        <InkSpinner type={ToolSpinner.type} />
-        {` ${name} `}
-      </Text>
-    );
-  }
+  const glyphColor = chipColorFor(status);
+  const Bracket: React.FC<{ children: string }> = ({ children }) => (
+    <Text color={Theme.text.secondary}>{children}</Text>
+  );
   return (
-    <Text inverse color={chipColor} bold>
-      {` ${chipGlyphFor(status)} ${name} `}
+    <Text>
+      <Bracket>[ </Bracket>
+      {status === "running" ? (
+        <Text color={glyphColor}>
+          <InkSpinner type={ToolSpinner.type} />
+        </Text>
+      ) : (
+        <Text color={glyphColor} bold>
+          {chipGlyphFor(status)}
+        </Text>
+      )}
+      <Text bold>{` ${name} `}</Text>
+      <Bracket>]</Bracket>
     </Text>
   );
 };
@@ -192,7 +217,7 @@ const SectionRule: React.FC = () => (
   />
 );
 
-export const ToolMessage: React.FC<{
+const ToolMessageInternal: React.FC<{
   item: ToolItem;
   isPending?: boolean;
   /** Per-card row budget set by ``MainContent``'s
@@ -257,12 +282,20 @@ export const ToolMessage: React.FC<{
   const hint = item.status === "error" ? suggestionsForError(item.raw) : null;
 
   return (
-    <Box paddingLeft={2} marginTop={1} flexDirection="column">
-      {/* Left rail replaces the previous round box. ``borderLeft`` only
-       *  draws a single ``│`` running the full height of the Box,
-       *  which Ink sizes to fit the content rows below — a CJK-safe,
-       *  measurement-free way to attach a vertical accent without
-       *  manually re-rendering ▎ per row. */}
+    <Box paddingLeft={4} marginTop={1} flexDirection="column">
+      {/* ``paddingLeft={4}`` (was 2) — tool card is indented 2 cols
+       *  more than AgentMessage's ``paddingLeft={2}``, so tools sit
+       *  visually subordinate to the agent text above. Combined with
+       *  the gray rail (vs agent's no-rail) and the bracketed chip
+       *  (vs agent's ⏺ glyph), this gives 3 independent contrast
+       *  axes between the two block types (NNG: "Don't rely only on
+       *  color to communicate visual hierarchy").
+       *
+       *  Left rail still uses Ink's ``borderLeft`` for a single
+       *  ``│`` running the full height of the Box. Now in
+       *  ``text.secondary`` mid-gray (see railColorFor) so it
+       *  groups the tool block by structure rather than by
+       *  competing for attention. */}
       <Box
         flexDirection="column"
         borderStyle="single"
@@ -286,7 +319,19 @@ export const ToolMessage: React.FC<{
         <Box>
           {item.locator && (
             <Box marginRight={1}>
-              <Text color={Theme.text.secondary}>[{item.locator}]</Text>
+              {/* Locator chip mirrors ToolNameChip's bracket style
+               *  (secondary-grey brackets + brighter inner text) so the
+               *  two chips read as a pair. Inner text is gray.300 + bold
+               *  — one step brighter than secondary so the locator
+               *  reads as "namable identifier" without competing with
+               *  the status-coded chip beside it. */}
+              <Text>
+                <Text color={Theme.text.secondary}>[</Text>
+                <Text color={Theme.gray[300]} bold>
+                  {item.locator}
+                </Text>
+                <Text color={Theme.text.secondary}>]</Text>
+              </Text>
             </Box>
           )}
           <ToolNameChip status={item.status} name={item.name} />
@@ -384,3 +429,11 @@ export const ToolMessage: React.FC<{
     </Box>
   );
 };
+
+// React.memo: ToolMessage renders inside the streaming hot loop —
+// every committed-tool card in history would re-render on every
+// TOKEN_APPENDED without memo, even though only the in-flight tool's
+// item ref changes. Default shallow compare on (item, isPending,
+// availableTerminalHeight) catches the no-op case. Safe: no
+// useEffectEvent in this tree.
+export const ToolMessage = memo(ToolMessageInternal);

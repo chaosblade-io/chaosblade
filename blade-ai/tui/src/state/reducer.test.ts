@@ -348,6 +348,84 @@ describe("reducer / locator allocation", () => {
   });
 });
 
+describe("reducer / RESULT_RECEIVED commit-direct-to-history", () => {
+  // Locks in the方案 B contract: result lands in ``history`` directly,
+  // NOT in ``pending``. Pending is fully drained when result arrives so
+  // the agent message + tool groups that produced it ride along to
+  // history in the same dispatch — preventing the +11 row dyn-frame
+  // jump that occurred when result joined pending alongside an
+  // already-large agent body.
+  it("commits result directly to history, leaves pending empty", () => {
+    const s = fold([
+      { type: "TURN_STARTED", input: "inject CPU" },
+      { type: "TOKEN_APPENDED", content: "Working on it", node: "agent" },
+      {
+        type: "RESULT_RECEIVED",
+        content: JSON.stringify({
+          status: "success",
+          data: { task_id: "task-X", task_state: "injected" },
+        }),
+        taskId: "task-X",
+      },
+    ]);
+    // Pending must be empty after RESULT_RECEIVED — result didn't queue
+    // up alongside the agent message.
+    expect(s.pending).toHaveLength(0);
+    // history contains agent + result, in that order. Order matters:
+    // result is the *outcome* of the agent's work, so it must appear
+    // AFTER the agent message in scrollback.
+    const kinds = s.history.map((it) => it.kind);
+    const agentIdx = kinds.lastIndexOf("agent");
+    const resultIdx = kinds.lastIndexOf("result");
+    expect(agentIdx).toBeGreaterThan(-1);
+    expect(resultIdx).toBeGreaterThan(agentIdx);
+  });
+
+  it("flushes an in-flight thinking session before committing result", () => {
+    // commitThinking is called at the top of RESULT_RECEIVED so a
+    // thinking session that was open when result arrived gets a
+    // ``▸ Thought for Ns`` row in scrollback rather than being silently
+    // discarded.
+    const s = fold([
+      { type: "TURN_STARTED", input: "inject" },
+      { type: "THINKING_APPENDED", content: "deciding…", node: "agent" },
+      {
+        type: "RESULT_RECEIVED",
+        content: JSON.stringify({
+          status: "success",
+          data: { task_id: "t", task_state: "injected" },
+        }),
+        taskId: "t",
+      },
+    ]);
+    const kinds = s.history.map((it) => it.kind);
+    expect(kinds).toContain("thinking");
+    expect(kinds).toContain("result");
+    // thoughtBuffer must be cleared as a side-effect of commitThinking
+    // — no leaked partial thinking state into TURN_DONE.
+    expect(s.thoughtBuffer).toBe("");
+  });
+
+  it("does NOT reset streamState — turn is still in flight after RESULT_RECEIVED", () => {
+    // The turn isn't over until TURN_DONE arrives behind result. If
+    // RESULT_RECEIVED reset streamState to "idle", the LoadingIndicator
+    // would visibly disappear mid-turn. Guard against future refactors
+    // that try to reuse commitPending here.
+    const s = fold([
+      { type: "TURN_STARTED", input: "inject" },
+      {
+        type: "RESULT_RECEIVED",
+        content: JSON.stringify({
+          status: "success",
+          data: { task_id: "t", task_state: "injected" },
+        }),
+        taskId: "t",
+      },
+    ]);
+    expect(s.streamState).toBe("responding");
+  });
+});
+
 describe("reducer / TOKEN_APPENDED coalescing", () => {
   it("appends to a single trailing AgentItem, not multiple", () => {
     const s = fold([
@@ -360,6 +438,152 @@ describe("reducer / TOKEN_APPENDED coalescing", () => {
     expect(agentItems).toHaveLength(1);
     if (agentItems[0]?.kind === "agent") {
       expect(agentItems[0].text).toBe("Hello, world!");
+    }
+  });
+
+  it("commits the head fragment to history when an extending token crosses a \\n\\n boundary", () => {
+    // Phase 2.3 — mid-stream Static commit. First TOKEN_APPENDED
+    // creates the agent tail. Second TOKEN_APPENDED extends past
+    // a paragraph boundary; findLastSafeSplitPoint returns the offset
+    // just past the \n\n, so the head fragment ("Para one.\n\n")
+    // moves to history and the tail ("Para two streaming") becomes
+    // a continuation AgentItem in pending.
+    //
+    // The split deliberately only fires when we have an existing
+    // agent tail to extend — see the reducer comment for why
+    // (chronology with non-agent items in pending).
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "TOKEN_APPENDED", content: "Para one.", node: "n" },
+      { type: "TOKEN_APPENDED", content: "\n\nPara two streaming", node: "n" },
+    ]);
+    const inHistory = s.history.filter((i) => i.kind === "agent");
+    const inPending = s.pending.filter((i) => i.kind === "agent");
+    expect(inHistory).toHaveLength(1);
+    expect(inPending).toHaveLength(1);
+    if (inHistory[0]?.kind === "agent") {
+      expect(inHistory[0].text).toBe("Para one.\n\n");
+      // First fragment keeps the ⏺ glyph — continuation is unset/false.
+      expect(inHistory[0].continuation ?? false).toBe(false);
+    }
+    if (inPending[0]?.kind === "agent") {
+      expect(inPending[0].text).toBe("Para two streaming");
+      // Tail is a continuation — no glyph, no marginTop in render.
+      expect(inPending[0].continuation).toBe(true);
+    }
+  });
+
+  it("does NOT split the very first TOKEN_APPENDED of an agent reply", () => {
+    // Without an existing agent tail to extend, the split is deferred
+    // to the next token — even when the first chunk already contains
+    // a paragraph break. This preserves chronology when pending
+    // contains non-agent items (e.g. a running tool group) that would
+    // otherwise be reordered behind a prematurely-committed head.
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "TOKEN_APPENDED", content: "Para one.\n\nPara two", node: "n" },
+    ]);
+    const inHistory = s.history.filter((i) => i.kind === "agent");
+    const inPending = s.pending.filter((i) => i.kind === "agent");
+    expect(inHistory).toHaveLength(0);
+    expect(inPending).toHaveLength(1);
+    if (inPending[0]?.kind === "agent") {
+      expect(inPending[0].text).toBe("Para one.\n\nPara two");
+      expect(inPending[0].continuation ?? false).toBe(false);
+    }
+  });
+
+  it("does NOT split while a running tool group sits in front of the agent tail", () => {
+    // Chronology guard: if a running tool group is in pending before
+    // the agent tail (rare but legal — server may stream a token while
+    // tool is still in flight, or a future LangGraph topology may
+    // interleave them), committing the head fragment to history NOW
+    // would put it ahead of the toolGroup in scrollback when the
+    // group eventually flushes. The split must wait until the tail
+    // is alone in pending.
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "TOOL_STARTED", callId: "c1", name: "kubectl", node: "n" },
+      { type: "TOKEN_APPENDED", content: "Para one.", node: "n" },
+      { type: "TOKEN_APPENDED", content: "\n\nPara two streaming", node: "n" },
+    ]);
+    // Nothing should land in history — toolGroup is still running so
+    // flushLeadingStable can't drain pending past it, and our split
+    // guard sees pending.length > 1 and refuses to commit a head.
+    const inHistoryAgents = s.history.filter((i) => i.kind === "agent");
+    expect(inHistoryAgents).toHaveLength(0);
+    // Agent text accumulated in pending as a single item.
+    const inPendingAgents = s.pending.filter((i) => i.kind === "agent");
+    expect(inPendingAgents).toHaveLength(1);
+    if (inPendingAgents[0]?.kind === "agent") {
+      expect(inPendingAgents[0].text).toBe("Para one.\n\nPara two streaming");
+      expect(inPendingAgents[0].continuation ?? false).toBe(false);
+    }
+  });
+
+  it("chains continuations across consecutive splits", () => {
+    // Three paragraphs spread across three TOKEN_APPENDED events:
+    //   Para A → first event creates initial AgentItem
+    //   "\n\nPara B" → split fires: A→history, B(continuation)→pending
+    //   "\n\nPara C streaming" → split fires AGAIN: B→history (continuation
+    //     inherited as true → still no glyph), C(continuation)→pending
+    //
+    // Verifies that subsequent splits propagate ``continuation: true``
+    // through the head fragment so multi-paragraph replies don't
+    // sprout new ⏺ glyphs mid-block.
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "TOKEN_APPENDED", content: "Para A.", node: "n" },
+      { type: "TOKEN_APPENDED", content: "\n\nPara B.", node: "n" },
+      { type: "TOKEN_APPENDED", content: "\n\nPara C streaming", node: "n" },
+    ]);
+    const inHistory = s.history.filter((i) => i.kind === "agent");
+    const inPending = s.pending.filter((i) => i.kind === "agent");
+    expect(inHistory).toHaveLength(2);
+    expect(inPending).toHaveLength(1);
+    if (inHistory[0]?.kind === "agent") {
+      // First head — original ⏺ glyph carrier.
+      expect(inHistory[0].text).toBe("Para A.\n\n");
+      expect(inHistory[0].continuation ?? false).toBe(false);
+    }
+    if (inHistory[1]?.kind === "agent") {
+      // Second head — continuation propagates from the prior tail.
+      expect(inHistory[1].text).toBe("Para B.\n\n");
+      expect(inHistory[1].continuation).toBe(true);
+    }
+    if (inPending[0]?.kind === "agent") {
+      expect(inPending[0].text).toBe("Para C streaming");
+      expect(inPending[0].continuation).toBe(true);
+    }
+  });
+
+  it("does NOT split when the tail is inside an unclosed code block", () => {
+    // After the first chunk establishes the agent tail, the second
+    // chunk adds an unclosed fence. Splitting would orphan the open
+    // fence — findLastSafeSplitPoint returns the start of the block,
+    // so the split DOES fire but only commits the prose before the
+    // fence; the code block stays in pending until it closes.
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "TOKEN_APPENDED", content: "Para one.", node: "n" },
+      {
+        type: "TOKEN_APPENDED",
+        content: "\n\n```python\ndef streaming():",
+        node: "n",
+      },
+    ]);
+    const inHistory = s.history.filter((i) => i.kind === "agent");
+    const inPending = s.pending.filter((i) => i.kind === "agent");
+    expect(inHistory).toHaveLength(1);
+    expect(inPending).toHaveLength(1);
+    if (inHistory[0]?.kind === "agent") {
+      expect(inHistory[0].text).toBe("Para one.\n\n");
+    }
+    if (inPending[0]?.kind === "agent") {
+      // The open-fence content remained in pending; only prose before
+      // the fence was committed.
+      expect(inPending[0].text).toBe("```python\ndef streaming():");
+      expect(inPending[0].continuation).toBe(true);
     }
   });
 
@@ -1171,6 +1395,96 @@ describe("reducer / CONFIRM_RECEIVED", () => {
     }
   });
 
+  // The next 3 tests lock in the CONFIRM_RECEIVED force-flush contract:
+  // by the time confirm arrives, server has stopped emitting tokens for
+  // this LLM call, so any agent / tool_group / thinking still in pending
+  // must be force-flushed to history BEFORE pushing context — otherwise
+  // (a) context shows ABOVE agent in scrollback (wrong chronological
+  // order) and (b) the dyn frame stays bloated during the
+  // waiting_confirmation window (more re-render cost, more risk of
+  // Ink cursor desync).
+
+  it("force-flushes a tail-agent into history before pushing context", () => {
+    // Tail-agent is NOT eligible for flushLeadingStable
+    // (``stable iff !isTail`` rule) so without the force-flush it
+    // would stay in pending, and context would push past it,
+    // reversing chronological order.
+    const s = fold([
+      { type: "TURN_STARTED", input: "inject CPU" },
+      { type: "TOKEN_APPENDED", content: "I will inject", node: "agent" },
+      {
+        type: "CONFIRM_RECEIVED",
+        content: "plan",
+        taskId: "task-3",
+        node: "confirmation_gate",
+        payload: {},
+      },
+    ]);
+    // Agent must be in history.
+    const agentInHistory = s.history.filter((i) => i.kind === "agent");
+    expect(agentInHistory).toHaveLength(1);
+    // Pending must contain ONLY the new prompt — agent is gone.
+    expect(s.pending.filter((i) => i.kind === "agent")).toHaveLength(0);
+    expect(s.pending.filter((i) => i.kind === "confirm_prompt")).toHaveLength(1);
+  });
+
+  it("preserves chronological order: agent BEFORE context in history", () => {
+    // Agent text was streamed first chronologically, so it must
+    // appear ABOVE context in scrollback order. Without the
+    // force-flush, context lands first (TURN_DONE later flushes
+    // agent, putting it AFTER context — inverted order).
+    const s = fold([
+      { type: "TURN_STARTED", input: "inject" },
+      { type: "TOKEN_APPENDED", content: "I will inject", node: "agent" },
+      {
+        type: "CONFIRM_RECEIVED",
+        content: "plan",
+        taskId: "t",
+        node: "confirmation_gate",
+        payload: {},
+      },
+    ]);
+    const kinds = s.history.map((i) => i.kind);
+    const agentIdx = kinds.indexOf("agent");
+    const contextIdx = kinds.indexOf("confirm_context");
+    expect(agentIdx).toBeGreaterThan(-1);
+    expect(contextIdx).toBeGreaterThan(agentIdx);
+  });
+
+  it("keeps an UNRESOLVED prior confirm_prompt in pending across a new confirm", () => {
+    // Two confirms back-to-back without resolution: the first prompt
+    // is the live UI the user is interacting with — flushing it as
+    // "unresolved forever" into Static would be wrong. Force-flush
+    // explicitly skips this case via the toKeep branch.
+    const s = fold([
+      { type: "TURN_STARTED", input: "inject" },
+      {
+        type: "CONFIRM_RECEIVED",
+        content: "intent",
+        taskId: "task-A",
+        node: "intent_confirm",
+        payload: {},
+      },
+      // Note: NO CONFIRM_RESOLVED for task-A before task-B fires.
+      {
+        type: "CONFIRM_RECEIVED",
+        content: "plan",
+        taskId: "task-B",
+        node: "confirmation_gate",
+        payload: {},
+      },
+    ]);
+    // Both prompts must still be in pending (neither got force-flushed
+    // because both are unresolved).
+    expect(
+      s.pending.filter((i) => i.kind === "confirm_prompt"),
+    ).toHaveLength(2);
+    // Both contexts went to history at receipt time.
+    expect(
+      s.history.filter((i) => i.kind === "confirm_context"),
+    ).toHaveLength(2);
+  });
+
   it("accumulates two confirm_context cards across both interrupt layers", () => {
     // Both intent_confirm and confirmation_gate fire on a single turn.
     // Each lands a separate context card in history; pending holds
@@ -1723,6 +2037,37 @@ describe("reducer / CONSTRAIN_HEIGHT_TOGGLED", () => {
   });
 });
 
+describe("reducer / PHRASE_TICK", () => {
+  it("idlePhrase starts empty", () => {
+    const s = fold([]);
+    expect(s.idlePhrase).toBe("");
+  });
+
+  it("PHRASE_TICK overwrites idlePhrase with the action payload", () => {
+    const s = fold([
+      { type: "PHRASE_TICK", phrase: "evaluating blast radius" },
+    ]);
+    expect(s.idlePhrase).toBe("evaluating blast radius");
+  });
+
+  it("returns the same state reference when phrase is unchanged", () => {
+    // Idempotency guard: dispatching the same phrase twice should
+    // skip the spread + reassign so React bail-outs the re-render.
+    const s1 = fold([{ type: "PHRASE_TICK", phrase: "checking safety" }]);
+    const s2 = reducer(s1, { type: "PHRASE_TICK", phrase: "checking safety" });
+    expect(s2).toBe(s1);
+  });
+
+  it("sequential ticks rotate idlePhrase", () => {
+    const s = fold([
+      { type: "PHRASE_TICK", phrase: "thinking" },
+      { type: "PHRASE_TICK", phrase: "drafting fault plan" },
+      { type: "PHRASE_TICK", phrase: "observing system response" },
+    ]);
+    expect(s.idlePhrase).toBe("observing system response");
+  });
+});
+
 describe("reducer / flushLeadingStable partial tool_group split", () => {
   it("splits a leading-completed prefix out of a still-running tool_group", () => {
     // Boundary case during concurrent tool calls (verifier_loop fires
@@ -2048,5 +2393,194 @@ describe("reducer / Phase 4 memory compaction lifecycle", () => {
     );
     expect(compactionItems).toHaveLength(2);
     expect(s.currentCompaction).toBeNull();
+  });
+});
+
+describe("reducer / CONTEXT_SIZE_RECEIVED", () => {
+  // Regression guard for the Footer state-size indicator pipeline:
+  // hook emits → useStream dispatches → reducer must store the four
+  // numbers AND persist them across TURN_STARTED.
+
+  it("stores all four fields on snapshot", () => {
+    const s = reducer(initialAppState, {
+      type: "CONTEXT_SIZE_RECEIVED",
+      currentTokens: 95_000,
+      triggerTokens: 108_800,
+      maxTokens: 128_000,
+      messagesCount: 47,
+    });
+    expect(s.contextCurrentTokens).toBe(95_000);
+    expect(s.contextTriggerTokens).toBe(108_800);
+    expect(s.contextMaxTokens).toBe(128_000);
+    expect(s.contextMessagesCount).toBe(47);
+  });
+
+  it("seeds contextMaxTokens with the server default at boot", () => {
+    // The Footer needs proper numbers from the very first render —
+    // before any context_size event arrives. We seed with the
+    // server-side default (128k) so the indicator renders
+    // "0.0k / 128k (0.0%)" at boot.
+    expect(initialAppState.contextMaxTokens).toBe(128_000);
+    expect(initialAppState.contextCurrentTokens).toBe(0);
+    expect(initialAppState.contextError).toBe(false);
+  });
+
+  it("clears contextError on a fresh snapshot", () => {
+    // If an ERROR_RECEIVED flipped contextError to true, the next
+    // successful context_size event signals recovery and the Footer
+    // should switch the tail back from "(error)" to live percent.
+    const s = fold([
+      {
+        type: "ERROR_RECEIVED",
+        message: "stream blew up",
+        taskId: "turn-x",
+      },
+      {
+        type: "CONTEXT_SIZE_RECEIVED",
+        currentTokens: 50_000,
+        triggerTokens: 108_800,
+        maxTokens: 128_000,
+        messagesCount: 20,
+      },
+    ]);
+    expect(s.contextError).toBe(false);
+    expect(s.contextCurrentTokens).toBe(50_000);
+  });
+
+  it("ERROR_RECEIVED sets contextError so Footer signals stale data", () => {
+    const s = reducer(initialAppState, {
+      type: "ERROR_RECEIVED",
+      message: "boom",
+      taskId: "turn-x",
+    });
+    expect(s.contextError).toBe(true);
+  });
+
+  it("a later snapshot supersedes the earlier one (replace, not accumulate)", () => {
+    const s = fold([
+      {
+        type: "CONTEXT_SIZE_RECEIVED",
+        currentTokens: 100_000,
+        triggerTokens: 108_800,
+        maxTokens: 128_000,
+        messagesCount: 50,
+      },
+      // compaction fired between the two; current drops
+      {
+        type: "CONTEXT_SIZE_RECEIVED",
+        currentTokens: 35_000,
+        triggerTokens: 108_800,
+        maxTokens: 128_000,
+        messagesCount: 12,
+      },
+    ]);
+    expect(s.contextCurrentTokens).toBe(35_000);
+    expect(s.contextMessagesCount).toBe(12);
+  });
+
+  it("survives TURN_STARTED (cross-turn persistence)", () => {
+    // The hook fires regardless of turn boundary, and the Footer
+    // should keep displaying the last measurement even between
+    // turns. Resetting on TURN_STARTED would cause the indicator
+    // to flicker back to "no data" between turns.
+    const s = fold([
+      {
+        type: "CONTEXT_SIZE_RECEIVED",
+        currentTokens: 80_000,
+        triggerTokens: 108_800,
+        maxTokens: 128_000,
+        messagesCount: 30,
+      },
+      { type: "TURN_STARTED", input: "next request" },
+    ]);
+    expect(s.contextCurrentTokens).toBe(80_000);
+    expect(s.contextMaxTokens).toBe(128_000);
+  });
+
+  it("ignores all-zero snapshots so a protocol glitch doesn't wipe the slot", () => {
+    // First a real snapshot, then a buggy all-zero one. The Footer
+    // should keep showing the real numbers, not flip back to
+    // "no data" mode (which would render as ns:default).
+    const s = fold([
+      {
+        type: "CONTEXT_SIZE_RECEIVED",
+        currentTokens: 50_000,
+        triggerTokens: 108_800,
+        maxTokens: 128_000,
+        messagesCount: 20,
+      },
+      {
+        type: "CONTEXT_SIZE_RECEIVED",
+        currentTokens: 0,
+        triggerTokens: 0,
+        maxTokens: 0,
+        messagesCount: 0,
+      },
+    ]);
+    expect(s.contextCurrentTokens).toBe(50_000);
+    expect(s.contextMaxTokens).toBe(128_000);
+  });
+});
+
+describe("reducer / COMPACT_MANUAL lifecycle", () => {
+  // Regression guard for ManualCompactIndicator's data source.
+  // The /compact slash handler dispatches STARTED before opening the
+  // SSE stream and DONE in its finally. The reducer must:
+  //   - open a slot with a wall-clock startedAt on STARTED
+  //   - close (null) the slot on DONE
+  //   - be idempotent on DONE-when-already-closed
+
+  it("STARTED opens the slot with current time", () => {
+    const before = Date.now();
+    const s = reducer(initialAppState, { type: "COMPACT_MANUAL_STARTED" });
+    const after = Date.now();
+    expect(s.currentManualCompact).not.toBeNull();
+    if (s.currentManualCompact) {
+      expect(s.currentManualCompact.startedAt).toBeGreaterThanOrEqual(before);
+      expect(s.currentManualCompact.startedAt).toBeLessThanOrEqual(after);
+    }
+  });
+
+  it("DONE closes the slot", () => {
+    const s = fold([
+      { type: "COMPACT_MANUAL_STARTED" },
+      { type: "COMPACT_MANUAL_DONE" },
+    ]);
+    expect(s.currentManualCompact).toBeNull();
+  });
+
+  it("DONE is a no-op when slot is already null", () => {
+    // Initial state already has currentManualCompact=null. Dispatching
+    // DONE again must not throw or change the state reference.
+    const s = reducer(initialAppState, { type: "COMPACT_MANUAL_DONE" });
+    expect(s).toBe(initialAppState);
+  });
+
+  it("STARTED twice overwrites the slot (defensive against stale state)", () => {
+    // Race scenario: previous /compact's finally was skipped (e.g.
+    // unhandled exception). The next STARTED must reset startedAt
+    // rather than refusing the open — otherwise the elapsed timer
+    // would show stale seconds for the new run.
+    const first = reducer(initialAppState, { type: "COMPACT_MANUAL_STARTED" });
+    const firstStartedAt = first.currentManualCompact?.startedAt ?? 0;
+    // Force a measurable delta — Date.now() granularity on most
+    // platforms is 1ms, so a synchronous reducer call inside a tight
+    // loop can land on the same ms. A busy loop here would be flaky;
+    // instead we mock Date.now via the second STARTED's natural delay
+    // by checking the slot is REPLACED (not merged) and the startedAt
+    // is monotonically forward.
+    const second = reducer(first, { type: "COMPACT_MANUAL_STARTED" });
+    expect(second.currentManualCompact).not.toBeNull();
+    if (second.currentManualCompact) {
+      expect(second.currentManualCompact.startedAt).toBeGreaterThanOrEqual(
+        firstStartedAt,
+      );
+    }
+    // And it's a new object reference, not the old one.
+    expect(second.currentManualCompact).not.toBe(first.currentManualCompact);
+  });
+
+  it("initial state has the slot null", () => {
+    expect(initialAppState.currentManualCompact).toBeNull();
   });
 });

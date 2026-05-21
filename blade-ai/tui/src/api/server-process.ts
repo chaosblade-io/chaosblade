@@ -21,10 +21,11 @@
  */
 
 import { type ChildProcess, spawn } from "node:child_process";
-import { createWriteStream, mkdirSync, type WriteStream } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { createWriteStream, existsSync, mkdirSync, type WriteStream } from "node:fs";
+import { homedir, platform } from "node:os";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 
 export interface ServerHandle {
   /** Base URL the client should hit, e.g. http://127.0.0.1:54123 */
@@ -37,6 +38,68 @@ export interface ServerHandle {
 
 const READY_PREFIX = "BLADE_AI_READY port=";
 const SPAWN_TIMEOUT_MS = 20_000;
+
+/**
+ * Find the Python interpreter to spawn ``chaos_agent.server.app`` with.
+ *
+ * Resolution order (first hit wins):
+ *
+ *   1. ``BLADE_AI_PYTHON`` env var — explicit override, no fallback.
+ *      Used by CI / containers / users with non-standard layouts.
+ *
+ *   2. A project-local virtualenv discovered by walking up the
+ *      filesystem from this source file. We check the three common
+ *      venv directory names (``.venv`` / ``venv`` / ``env``) under
+ *      each ancestor. This is the path that makes ``npm run start``
+ *      work out-of-the-box for a developer who set up a venv at the
+ *      project root and forgot to activate it before launching the
+ *      TUI — the exact failure mode that produced ``spawn python
+ *      ENOENT`` on systems where ``python`` isn't on PATH (modern
+ *      macOS / Debian-derived distros have ``python3`` only).
+ *
+ *   3. ``python3`` — falls back to the platform-conventional name.
+ *      Modern macOS, Debian, Ubuntu, RHEL 9+ all expose the
+ *      interpreter as ``python3``; the bare ``python`` name is no
+ *      longer guaranteed to exist. The Windows fallback below
+ *      overrides this when the platform is win32 because
+ *      python.org installers register ``python.exe`` (no ``3``).
+ *
+ *   4. ``python`` — last-ditch generic fallback, kept so the
+ *      behaviour matches the pre-discovery version when nothing
+ *      else lights up. If neither ``python3`` nor ``python`` is on
+ *      PATH the spawn will surface ENOENT, same as before.
+ *
+ * The PyInstaller / curl-bash distribution path is unaffected — its
+ * launcher sets ``BLADE_AI_SERVER_BIN`` and we never reach this
+ * resolver. See the bin/non-bin branch in ``startEmbeddedServer``.
+ */
+function resolvePythonExecutable(): string {
+  const explicit = process.env["BLADE_AI_PYTHON"];
+  if (explicit && explicit.length > 0) return explicit;
+
+  const isWindows = platform() === "win32";
+  // Walk up from this source file looking for a venv. ``.venv``
+  // first (modern uv / Poetry default), then plain ``venv`` (older
+  // Python tutorials), then ``env`` (some Conda exports). 8 levels
+  // is plenty — anything deeper than that is malformed.
+  let dir = dirname(fileURLToPath(import.meta.url));
+  const venvNames = [".venv", "venv", "env"];
+  const subpath = isWindows
+    ? ["Scripts", "python.exe"]
+    : ["bin", "python"];
+  for (let i = 0; i < 8; i++) {
+    for (const venv of venvNames) {
+      const candidate = join(dir, venv, ...subpath);
+      if (existsSync(candidate)) return candidate;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+
+  // Fallback to platform-conventional name.
+  return isWindows ? "python" : "python3";
+}
 
 /**
  * Resolve the server handle based on environment.
@@ -81,10 +144,14 @@ export async function startEmbeddedServer(): Promise<ServerHandle> {
   //     with the hidden ``__embedded_server__`` subcommand. It runs
   //     ``run_server()`` directly, bypassing typer's CLI dispatch
   //     overhead for the server-only fast path.
-  //   * pip / npm dev / source build: env var is unset; fall back
-  //     to ``python -m chaos_agent.server.app ...`` (or whatever
-  //     ``BLADE_AI_PYTHON`` points to) — same path the project has
-  //     used since pre-PyInstaller days.
+  //   * pip / npm dev / source build: env var is unset; ask
+  //     ``resolvePythonExecutable`` for the interpreter (which auto-
+  //     discovers a project-local venv before falling back to
+  //     ``python3`` / ``python`` on PATH) and run
+  //     ``-m chaos_agent.server.app``. The venv discovery makes
+  //     ``npm run start`` work without manually activating a venv
+  //     first, fixing the ``spawn python ENOENT`` symptom on
+  //     systems whose PATH only has ``python3``.
   const bin = process.env["BLADE_AI_SERVER_BIN"];
   let cmd: string;
   let args: string[];
@@ -92,7 +159,7 @@ export async function startEmbeddedServer(): Promise<ServerHandle> {
     cmd = bin;
     args = ["__embedded_server__", ...commonArgs];
   } else {
-    cmd = process.env["BLADE_AI_PYTHON"] ?? "python";
+    cmd = resolvePythonExecutable();
     args = ["-m", "chaos_agent.server.app", ...commonArgs];
   }
 

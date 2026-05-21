@@ -20,6 +20,7 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { t } from "../../i18n/index.js";
 import { Theme } from "../../theme/colors.js";
 import type { MemoryCompactionItem } from "../../state/types.js";
@@ -47,7 +48,7 @@ function formatDuration(ms: number): string {
   return `${m}m${s.toString().padStart(2, "0")}s`;
 }
 
-export const MemoryCompactionMessage: React.FC<{ item: MemoryCompactionItem }> = ({
+const MemoryCompactionMessageInternal: React.FC<{ item: MemoryCompactionItem }> = ({
   item,
 }) => {
   if (!item.succeeded) {
@@ -97,3 +98,8 @@ export const MemoryCompactionMessage: React.FC<{ item: MemoryCompactionItem }> =
     </Box>
   );
 };
+
+// React.memo: MemoryCompactionItem is created at COMPLETED/FAILED and
+// then committed to history — never mutated. Shallow compare on the
+// ``item`` ref is the right gate.
+export const MemoryCompactionMessage = memo(MemoryCompactionMessageInternal);

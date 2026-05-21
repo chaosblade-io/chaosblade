@@ -7,6 +7,7 @@ Errors are classified by severity:
 """
 
 from enum import Enum
+from typing import NamedTuple
 
 
 class ErrorSeverity(Enum):
@@ -188,6 +189,9 @@ class FailureReason(Enum):
     # --- System ---
     INTERNAL_ERROR = "internal_error"            # Unhandled exception
 
+    # Patch C — Wall-clock timeout (settings.max_inject_seconds)
+    WALL_CLOCK_TIMEOUT = "wall_clock_timeout"    # Single turn exceeded budget seconds
+
 
 # ---------------------------------------------------------------------------
 # LLM diagnosis extraction for failure_reason enrichment
@@ -239,13 +243,229 @@ def enrich_failure_reason(
 
 
 def should_auto_replan(error_message: str) -> bool:
-    """Pattern-match blade/kubectl error messages to determine replan eligibility.
+    """Legacy boolean classifier — replanable / not replanable.
 
-    Returns True if the error message suggests a problem that Phase 1 could
-    re-investigate with its richer tool set (e.g., target disappeared,
-    parameter mismatch).
+    Implemented on top of :func:`classify_error` so the new richer
+    classification is the source of truth. Kept for callers that
+    haven't migrated to the new ``ErrorAction`` API.
     """
+    return classify_error(error_message).action == ErrorAction.REPLAN
+
+
+# ---------------------------------------------------------------------------
+# Hierarchical error classification — single source of truth for "what
+# should the router do with this error". The legacy ``_REPLANABLE_PATTERNS``
+# / ``_NON_REPLANABLE_PATTERNS`` lists above are preserved as-is for any
+# direct readers, but ``classify_error`` is the recommended API.
+# ---------------------------------------------------------------------------
+
+
+class ErrorClass(Enum):
+    """Hierarchical error categorisation for the inject pipeline.
+
+    Each class maps deterministically to an :class:`ErrorAction` via
+    :data:`_CLASS_TO_ACTION`, so adding a new pattern only requires
+    editing one table — the router itself stays generic.
+    """
+
+    INFRA_PERSISTENT = "infra_persistent"
+    """Infrastructure problem retry can't fix.
+
+    Examples: node ``DiskPressure``, RBAC denial, kubeconfig token
+    expired. Operator action required offline.
+    """
+
+    INFRA_TRANSIENT = "infra_transient"
+    """Infrastructure blip — same call may succeed seconds later.
+
+    Examples: ``timeout``, ``connection refused``, ``bad file
+    descriptor`` (kubeconfig handle), ``no such host``.
+    """
+
+    USER_CONFIG = "user_config"
+    """Bad LLM-generated args; replan with Phase 1's richer tools fixes.
+
+    Examples: ``invalid parameter``, ``unknown flag``, regex mismatch.
+    """
+
+    TARGET_GONE = "target_gone"
+    """Target object disappeared since planning; replan w/ new target.
+
+    Examples: ``resource not found``, ``no matches for kind``.
+    """
+
+    QUOTA_EXCEEDED = "quota_exceeded"
+    """Cluster-level resource limit hit; not auto-recoverable.
+
+    Examples: ``ResourceQuota exceeded``, ``limit exceeded``.
+    """
+
+    AUTH_DENIED = "auth_denied"
+    """Authentication / authorisation failure; needs operator fix.
+
+    Examples: ``permission denied``, ``forbidden``, ``unauthorized``,
+    ``x509 certificate expired``.
+    """
+
+    UNKNOWN = "unknown"
+    """No pattern matched — conservative default to ``END_FAILED``.
+
+    Choosing END_FAILED over CONTINUE is intentional: the previous
+    binary classifier returned False on unknown errors which the
+    router translated as "keep going", producing the user-reported
+    "loop forever" symptom on infrastructure failures we hadn't
+    catalogued yet.
+    """
+
+
+class ErrorAction(Enum):
+    """Canonical router action for a classified error."""
+
+    REPLAN = "replan"
+    """Phase 1 with new context can probably fix this."""
+
+    SHORT_RETRY = "retry"
+    """Same call may succeed shortly — let the LLM re-issue it.
+
+    Subject to a separate retry counter (``settings.max_transient_retry``)
+    so genuinely persistent transients still terminate.
+    """
+
+    END_FAILED = "end"
+    """Stop the graph and report failure."""
+
+    ASK_USER = "ask_user"
+    """Need a human decision (auth, quota). Routes to ``reject`` node."""
+
+
+_CLASS_TO_ACTION: dict[ErrorClass, ErrorAction] = {
+    ErrorClass.USER_CONFIG: ErrorAction.REPLAN,
+    ErrorClass.TARGET_GONE: ErrorAction.REPLAN,
+    ErrorClass.INFRA_TRANSIENT: ErrorAction.SHORT_RETRY,
+    ErrorClass.INFRA_PERSISTENT: ErrorAction.END_FAILED,
+    ErrorClass.QUOTA_EXCEEDED: ErrorAction.ASK_USER,
+    ErrorClass.AUTH_DENIED: ErrorAction.ASK_USER,
+    ErrorClass.UNKNOWN: ErrorAction.END_FAILED,
+}
+
+
+# Pattern lists — order matters within the outer list (first match wins
+# across classes). Patterns are matched case-insensitively as substrings.
+_CLASSIFY_RULES: list[tuple[ErrorClass, list[str]]] = [
+    # Auth must come first — "x509: certificate expired" contains
+    # ``timeout``-like words in some forms; classifying as auth is safer.
+    (
+        ErrorClass.AUTH_DENIED,
+        [
+            "permission denied",
+            "forbidden",
+            "unauthorized",
+            "x509",
+            "certificate has expired",
+            "certificate verify failed",
+            "tls handshake failure",
+        ],
+    ),
+    (
+        ErrorClass.QUOTA_EXCEEDED,
+        [
+            "exceeded quota",
+            "resourcequota",
+            "limit exceeded",
+            "exceeded the resource limit",
+        ],
+    ),
+    (
+        ErrorClass.TARGET_GONE,
+        [
+            "resource not found",
+            "target not found",
+            "not found",
+            "no matches for kind",
+            "no resources found",
+        ],
+    ),
+    (
+        ErrorClass.USER_CONFIG,
+        [
+            "invalid parameter",
+            "flag mismatch",
+            "unsupported flag",
+            "unknown flag",
+            "invalid argument",
+            "validation error",
+        ],
+    ),
+    (
+        ErrorClass.INFRA_PERSISTENT,
+        # Node / system pressure conditions persist; retrying the same
+        # call accomplishes nothing. Kubernetes "Evicted" is here for
+        # the same reason — the pod isn't coming back without a node fix.
+        [
+            "diskpressure",
+            "memorypressure",
+            "networkunavailable",
+            "pidpressure",
+            "node not ready",
+            "evicted",
+        ],
+    ),
+    (
+        ErrorClass.INFRA_TRANSIENT,
+        # ``bad file descriptor`` is the kubeconfig-handle reuse bug
+        # that motivated this whole patch. ``i/o timeout`` covers the
+        # generic golang client behaviour. Add new transient signatures
+        # here as they're observed in production logs.
+        [
+            "timeout",
+            "deadline exceeded",
+            "connection refused",
+            "connection reset",
+            "bad file descriptor",
+            "no such host",
+            "i/o timeout",
+            "tls handshake timeout",
+            "server gave http response to https client",
+            "broken pipe",
+            "eof",
+        ],
+    ),
+]
+
+
+class ClassificationResult(NamedTuple):
+    """Outcome of :func:`classify_error`.
+
+    Attributes:
+        error_class: Bucketed category of the error.
+        action: Recommended router action.
+        matched_pattern: The substring that triggered the match
+            (``None`` for ``UNKNOWN``). Useful for telemetry / logs.
+    """
+
+    error_class: ErrorClass
+    action: ErrorAction
+    matched_pattern: str | None
+
+
+def classify_error(error_message: str | None) -> ClassificationResult:
+    """Classify an error message into ``(ErrorClass, ErrorAction, pattern)``.
+
+    The classification is deterministic: the first matching pattern in
+    :data:`_CLASSIFY_RULES` wins. Empty / ``None`` input → ``UNKNOWN``.
+
+    Returns a :class:`ClassificationResult` so callers can log the
+    structured class while routing on the action. Never raises.
+    """
+    if not error_message:
+        return ClassificationResult(
+            ErrorClass.UNKNOWN, _CLASS_TO_ACTION[ErrorClass.UNKNOWN], None
+        )
     msg_lower = error_message.lower()
-    if any(p in msg_lower for p in _NON_REPLANABLE_PATTERNS):
-        return False
-    return any(p in msg_lower for p in _REPLANABLE_PATTERNS)
+    for ec, patterns in _CLASSIFY_RULES:
+        for p in patterns:
+            if p in msg_lower:
+                return ClassificationResult(ec, _CLASS_TO_ACTION[ec], p)
+    return ClassificationResult(
+        ErrorClass.UNKNOWN, _CLASS_TO_ACTION[ErrorClass.UNKNOWN], None
+    )

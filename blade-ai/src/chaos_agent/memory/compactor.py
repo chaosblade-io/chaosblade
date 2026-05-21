@@ -1,4 +1,4 @@
-"""LLM-based structured compaction for Session Memory (Layer 2).
+"""LLM-based structured compaction for Session Memory.
 
 Generates structured summaries from conversation history using the
 Claude Code two-step compaction pattern: <analysis> drafting + <summary> output.
@@ -7,10 +7,13 @@ Supports three compaction modes (BASE / PARTIAL / UP_TO) and provides
 post-compaction context recovery aligned with Claude Code's
 createPlanAttachmentIfNeeded / createSkillAttachmentIfNeeded.
 
-Implements layered compaction aligned with Claude Code's sessionMemoryCompact.ts:
-- Layer 1: try_lightweight_compact() — trim messages without LLM
-- Layer 2: compact_memory() — full LLM-based structured summary
-- compact_if_needed() — entry point that tries Layer 1 first, falls back to Layer 2
+Single compaction entry point: ``PreReasoningHook`` (memory/hook.py).
+The hook handles both the auto-trigger path (called before every LLM
+reasoning step) and the manual ``/compact`` path (called with
+``force=True``). This module exposes the LLM summary primitive
+``compact_memory()`` plus a few helpers it composes with
+(``extract_critical_context``, ``build_post_compact_context_message``,
+``format_compact_summary``).
 """
 
 import logging
@@ -236,7 +239,6 @@ def format_compact_summary(raw_summary: str) -> str:
 # Aligned with Claude Code's POST_COMPACT_MAX_TOKENS_PER_SKILL / SKILLS_TOKEN_BUDGET
 POST_COMPACT_MAX_TOKENS_PER_SKILL = 5000
 POST_COMPACT_SKILLS_TOKEN_BUDGET = 25000
-POST_COMPACT_TOKEN_BUDGET = 50000
 
 SKILL_TRUNCATION_MARKER = (
     "\n\n[... skill content truncated; "
@@ -685,199 +687,11 @@ def _simple_compact(messages: list, previous_summary: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Layered Compaction (Migration Point 13)
-# Aligned with Claude Code's sessionMemoryCompact.ts + autoCompact.ts
+# Note: ``compact_if_needed`` and ``try_lightweight_compact`` were removed
+# when the manual ``/compact`` path was unified onto ``PreReasoningHook``
+# (called with ``force=True``). The hook is now the single source of truth
+# for compaction logic across both auto-trigger and user-initiated paths.
+# Manual callers (TUI ``commands._compact_thread`` / server
+# ``/api/v1/sessions/{sid}/compact``) reach the hook via
+# ``agents["pre_reason_hook"]``.
 # ---------------------------------------------------------------------------
-
-# Lightweight compaction config — aligned with Claude Code's DEFAULT_SM_COMPACT_CONFIG
-LIGHTWEIGHT_COMPACT_MIN_TOKENS = 10_000
-LIGHTWEIGHT_COMPACT_MIN_MESSAGES = 5
-LIGHTWEIGHT_COMPACT_MAX_TOKENS = 40_000
-
-# Marker added when lightweight compaction drops messages
-LIGHTWEIGHT_DROPPED_MARKER = (
-    "[Earlier conversation messages were trimmed to save context space. "
-    "Key information has been preserved above.]"
-)
-
-
-def try_lightweight_compact(
-    messages: list,
-    max_tokens: int,
-    min_keep_messages: int = LIGHTWEIGHT_COMPACT_MIN_MESSAGES,
-) -> Optional[tuple[list, list]]:
-    """Try lightweight message trimming without calling LLM.
-
-    Aligned with Claude Code's trySessionMemoryCompaction() from
-    sessionMemoryCompact.ts. This is Layer 1 of the layered compaction
-    strategy — it simply drops old messages and keeps recent ones,
-    which is much cheaper than a full LLM summary.
-
-    Use this when the context is only slightly over budget and a
-    full LLM summary would be overkill (e.g., only one extra round
-    of conversation pushed the context over the limit).
-
-    Args:
-        messages: All conversation messages.
-        max_tokens: Maximum allowed token budget.
-        min_keep_messages: Minimum number of recent messages to keep.
-
-    Returns:
-        (messages_to_drop, messages_to_keep) tuple if lightweight compaction
-        is suitable, or None if the context is too large for trimming alone
-        (a full LLM summary is needed instead).
-    """
-    from chaos_agent.memory.context_manager import count_tokens_approx
-
-    total_tokens = count_tokens_approx(messages)
-
-    # If even after trimming to the max budget we'd still be over max_tokens,
-    # lightweight compaction isn't sufficient — need full LLM summary
-    if total_tokens - LIGHTWEIGHT_COMPACT_MAX_TOKENS > max_tokens:
-        logger.debug(
-            f"Lightweight compact not suitable: "
-            f"total={total_tokens}, even trimming {LIGHTWEIGHT_COMPACT_MAX_TOKENS} "
-            f"tokens would leave {total_tokens - LIGHTWEIGHT_COMPACT_MAX_TOKENS} "
-            f"which exceeds max={max_tokens}"
-        )
-        return None
-
-    # If total is already within budget, no compaction needed
-    if total_tokens <= max_tokens:
-        return None
-
-    # Walk backwards from the most recent messages, accumulating tokens
-    # until we stay within LIGHTWEIGHT_COMPACT_MAX_TOKENS
-    kept_tokens = 0
-    keep_from = len(messages)
-    for i in range(len(messages) - 1, -1, -1):
-        msg_tokens = count_tokens_approx([messages[i]])
-        if kept_tokens + msg_tokens > LIGHTWEIGHT_COMPACT_MAX_TOKENS:
-            break
-        kept_tokens += msg_tokens
-        keep_from = i
-
-    # Ensure we keep at least min_keep_messages
-    min_keep_from = len(messages) - min_keep_messages
-    if min_keep_from < 0:
-        min_keep_from = 0
-    keep_from = min(keep_from, min_keep_from)
-
-    # If we'd keep everything, no trimming needed
-    if keep_from == 0:
-        return None
-
-    messages_to_drop = messages[:keep_from]
-    messages_to_keep = messages[keep_from:]
-
-    # Ensure we don't split tool_call/tool_result pairs
-    # If the first message in to_keep is a tool result, move it back
-    if messages_to_keep:
-        first_keep = messages_to_keep[0]
-        # Tool result without preceding tool_call → move to drop
-        if hasattr(first_keep, "type") and first_keep.type == "tool":
-            messages_to_drop.append(messages_to_keep.pop(0))
-
-    logger.info(
-        f"Lightweight compact: dropping {len(messages_to_drop)} messages "
-        f"({count_tokens_approx(messages_to_drop)} tokens), "
-        f"keeping {len(messages_to_keep)} messages "
-        f"({count_tokens_approx(messages_to_keep)} tokens)"
-    )
-
-    return messages_to_drop, messages_to_keep
-
-
-async def compact_if_needed(
-    messages: list,
-    max_tokens: int,
-    previous_summary: str = "",
-    state: Optional[dict] = None,
-    llm=None,
-    mode: CompactionMode = CompactionMode.BASE,
-) -> tuple[list, bool]:
-    """Layered compaction entry point: try lightweight trim first, then LLM summary.
-
-    Aligned with Claude Code's autoCompactIfNeeded() which first calls
-    trySessionMemoryCompaction() (lightweight trim) and only falls back
-    to compactConversation() (full LLM summary) if trimming is insufficient.
-
-    This two-layer approach saves LLM tokens and latency for simple cases
-    where the context is only slightly over budget.
-
-    Args:
-        messages: All conversation messages.
-        max_tokens: Maximum allowed token budget.
-        previous_summary: Previous compressed summary to build upon.
-        state: Optional AgentState dict for context recovery.
-        llm: LangChain LLM instance.
-        mode: Compaction mode for LLM summary (BASE/PARTIAL/UP_TO).
-
-    Returns:
-        (compacted_messages, used_lightweight) tuple:
-        - compacted_messages: The resulting message list after compaction.
-        - used_lightweight: True if lightweight trim was used, False if LLM summary.
-    """
-    from langchain_core.messages import HumanMessage
-    from chaos_agent.memory.context_manager import count_tokens_approx
-
-    total_tokens = count_tokens_approx(messages)
-    if total_tokens <= max_tokens:
-        # No compaction needed
-        return messages, False
-
-    # Layer 1: Try lightweight trim (no LLM needed)
-    lightweight_result = try_lightweight_compact(messages, max_tokens)
-    if lightweight_result is not None:
-        dropped, kept = lightweight_result
-
-        # Extract critical context from dropped messages
-        critical_context = {}
-        if state is not None:
-            critical_context = extract_critical_context(dropped, state)
-
-        # Build context-recovery message from dropped messages
-        context_msg = build_post_compact_context_message(critical_context)
-
-        # Assemble result: context recovery + lightweight marker + kept messages
-        result = []
-        if context_msg:
-            result.append(HumanMessage(content=context_msg))
-        result.append(HumanMessage(content=LIGHTWEIGHT_DROPPED_MARKER))
-        result.extend(kept)
-
-        logger.info(
-            f"Lightweight compaction applied: "
-            f"{count_tokens_approx(result)} tokens in result "
-            f"(was {total_tokens})"
-        )
-        return result, True
-
-    # Layer 2: Full LLM summary (fallback)
-    logger.info(
-        f"Lightweight compaction not suitable, "
-        f"falling back to LLM summary ({total_tokens} tokens)"
-    )
-
-    # Split messages: compact the old ones, keep the recent ones
-    from chaos_agent.memory.context_manager import ContextManager
-    cm = ContextManager(max_tokens=max_tokens)
-    to_compact, to_keep, is_valid = cm.check_context(messages)
-
-    if not to_compact:
-        # ContextManager didn't find anything to compact
-        return messages, False
-
-    summary = await compact_memory(
-        to_compact,
-        previous_summary=previous_summary,
-        llm=llm,
-        mode=mode,
-        state=state,
-    )
-
-    # Build result: summary message + kept messages
-    result = [HumanMessage(content=summary)]
-    result.extend(to_keep)
-
-    return result, False

@@ -14,6 +14,7 @@
  */
 
 import { Box, Text } from "ink";
+import { memo } from "react";
 import { t } from "../../i18n/index.js";
 import { Theme } from "../../theme/colors.js";
 import type { TurnUsageItem } from "../../state/types.js";
@@ -30,7 +31,7 @@ function formatTokens(n: number): string {
   return `${(n / 1000).toFixed(1)}k`;
 }
 
-export const TurnUsageMessage: React.FC<{ item: TurnUsageItem }> = ({
+const TurnUsageMessageInternal: React.FC<{ item: TurnUsageItem }> = ({
   item,
 }) => {
   const total = formatTokens(item.inputTokens + item.outputTokens);
@@ -44,3 +45,7 @@ export const TurnUsageMessage: React.FC<{ item: TurnUsageItem }> = ({
     </Box>
   );
 };
+
+// React.memo: TurnUsageItem is created at TURN_DONE and never mutated;
+// shallow compare on ``item`` ref is the right gate.
+export const TurnUsageMessage = memo(TurnUsageMessageInternal);

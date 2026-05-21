@@ -7,20 +7,16 @@ from chaos_agent.memory.compactor import (
     _simple_compact,
     _strip_large_tool_outputs,
     build_post_compact_context_message,
-    compact_if_needed,
     compact_memory,
     COMPACTION_PROMPT,
     CompactionMode,
     extract_critical_context,
     format_compact_summary,
-    LIGHTWEIGHT_COMPACT_MIN_MESSAGES,
-    LIGHTWEIGHT_DROPPED_MARKER,
     NO_TOOLS_PREAMBLE,
     NO_TOOLS_TRAILER,
     POST_COMPACT_SKILLS_TOKEN_BUDGET,
     SKILL_TRUNCATION_MARKER,
     _STRIP_TOOL_MARKER,
-    try_lightweight_compact,
     truncate_to_tokens,
 )
 
@@ -465,150 +461,13 @@ class TestBuildPostCompactContextWithSkillContent:
 # ---------------------------------------------------------------------------
 
 
-class TestTryLightweightCompact:
-    """Test try_lightweight_compact lightweight message trimming."""
-
-    def _make_msg(self, content: str, msg_type: str = "human") -> MagicMock:
-        msg = MagicMock()
-        msg.type = msg_type
-        msg.content = content
-        return msg
-
-    def test_returns_none_when_within_budget(self):
-        """No compaction needed if total tokens <= max_tokens."""
-        msgs = [self._make_msg("short message")]
-        result = try_lightweight_compact(msgs, max_tokens=10000)
-        assert result is None
-
-    def test_returns_none_when_too_large_for_lightweight(self):
-        """If even trimming won't help, return None (need full LLM summary)."""
-        # Create a very large message set
-        msgs = [self._make_msg("x" * 4000) for _ in range(100)]
-        # max_tokens = 100 but total is huge → lightweight can't help
-        result = try_lightweight_compact(msgs, max_tokens=100)
-        assert result is None
-
-    def test_returns_drop_keep_when_slightly_over(self):
-        """Slightly over budget: lightweight trim should work."""
-        # 30 messages * 100 chars = 3000 chars ≈ 750 tokens
-        msgs = [self._make_msg(f"message {i} " + "a" * 100) for i in range(30)]
-        # max_tokens = 500 → slightly over the 750 token usage
-        result = try_lightweight_compact(msgs, max_tokens=500)
-        if result is not None:
-            dropped, kept = result
-            assert len(kept) < len(msgs)
-            assert len(kept) >= LIGHTWEIGHT_COMPACT_MIN_MESSAGES
-
-    def test_min_keep_messages_respected(self):
-        """Always keep at least min_keep_messages."""
-        msgs = [self._make_msg(f"msg {i} " + "b" * 200) for i in range(20)]
-        result = try_lightweight_compact(
-            msgs, max_tokens=200, min_keep_messages=5
-        )
-        if result is not None:
-            dropped, kept = result
-            assert len(kept) >= 5
-
-    def test_tool_result_not_split(self):
-        """Don't split a tool result from its tool call."""
-        ai_msg = self._make_msg("calling tool", msg_type="ai")
-        ai_msg.tool_calls = [{"name": "test"}]
-        tool_msg = self._make_msg("tool result", msg_type="tool")
-        msgs = [self._make_msg("old " + "c" * 300) for _ in range(10)] + [ai_msg, tool_msg]
-
-        result = try_lightweight_compact(msgs, max_tokens=200)
-        if result is not None:
-            dropped, kept = result
-            # If tool result is first in kept, it should have been moved to dropped
-            # or the AI message should also be in kept
-            if kept:
-                first_type = getattr(kept[0], "type", None)
-                if first_type == "tool":
-                    # Tool result without AI message — should have been moved
-                    assert False, "Tool result split from AI message"
-
-    def test_empty_messages_returns_none(self):
-        result = try_lightweight_compact([], max_tokens=500)
-        assert result is None
-
-
-class TestCompactIfNeeded:
-    """Test compact_if_needed layered compaction entry point."""
-
-    def _make_msg(self, content: str, msg_type: str = "human") -> MagicMock:
-        msg = MagicMock()
-        msg.type = msg_type
-        msg.content = content
-        return msg
-
-    async def test_no_compaction_when_within_budget(self):
-        msgs = [self._make_msg("short message")]
-        result, used_lightweight = await compact_if_needed(
-            msgs, max_tokens=10000
-        )
-        assert result == msgs
-        assert used_lightweight is False
-
-    async def test_lightweight_compact_for_slight_overflow(self):
-        """Slightly over budget → lightweight trim (no LLM)."""
-        # 30 messages * ~125 tokens = ~3750 tokens
-        msgs = [self._make_msg(f"message {i} " + "a" * 400) for i in range(30)]
-        # max_tokens = 1000 → slightly over, lightweight should work
-        result, used_lightweight = await compact_if_needed(
-            msgs, max_tokens=1000
-        )
-        if used_lightweight:
-            # Should contain the dropped marker
-            contents = [getattr(m, "content", "") for m in result]
-            assert any(LIGHTWEIGHT_DROPPED_MARKER in c for c in contents if isinstance(c, str))
-            # Should have fewer messages than original
-            assert len(result) < len(msgs)
-        else:
-            # If lightweight didn't work (due to budget math), LLM summary was used
-            # That's also acceptable
-            pass
-
-    async def test_lightweight_preserves_context_with_state(self):
-        """When state is provided, critical context is recovered even in lightweight mode."""
-        blade_msg = self._make_msg('blade_uid: abc123def')
-        msgs = [blade_msg] + [self._make_msg(f"filler {i} " + "z" * 400) for i in range(20)]
-        state = {"skill_name": "pod-kill", "blade_uid": "abc123def"}
-
-        result, used_lightweight = await compact_if_needed(
-            msgs, max_tokens=500, state=state
-        )
-        if used_lightweight:
-            contents = [getattr(m, "content", "") for m in result]
-            text = " ".join(c for c in contents if isinstance(c, str))
-            # Context recovery should include blade_uid and skill info
-            assert "abc123def" in text or "pod-kill" in text
-
-    async def test_fallback_to_llm_when_lightweight_insufficient(self):
-        """When lightweight can't help, fall back to LLM summary."""
-        # Create a huge message set that exceeds lightweight capacity
-        msgs = [self._make_msg("x" * 4000) for _ in range(100)]
-        mock_llm = AsyncMock()
-        mock_llm.ainvoke = AsyncMock(
-            return_value=MagicMock(content="<summary>LLM summary result</summary>")
-        )
-
-        result, used_lightweight = await compact_if_needed(
-            msgs, max_tokens=100, llm=mock_llm
-        )
-        assert used_lightweight is False
-        # Result should contain the LLM summary
-        contents = [getattr(m, "content", "") for m in result]
-        assert any("LLM summary result" in c for c in contents if isinstance(c, str))
-
-    async def test_no_llm_and_lightweight_insufficient(self):
-        """When no LLM and lightweight can't help, return messages as-is."""
-        msgs = [self._make_msg("x" * 4000) for _ in range(100)]
-        result, used_lightweight = await compact_if_needed(
-            msgs, max_tokens=100, llm=None
-        )
-        # Without LLM, can't do full summary; lightweight returns None
-        # compact_if_needed falls back to compact_memory which uses _simple_compact
-        assert len(result) > 0
+# ---------------------------------------------------------------------------
+# Note: ``TestTryLightweightCompact`` and ``TestCompactIfNeeded`` test
+# classes were removed when those functions were retired in favour of
+# the unified ``PreReasoningHook`` (called with ``force=True`` for the
+# manual /compact path). Hook-level coverage lives in
+# ``test_hook.py::TestPreReasoningHookForceCompact``.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------

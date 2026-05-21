@@ -88,13 +88,27 @@ async def intent_confirm(state: AgentState) -> dict:
             {"fault_intent": fault_intent, "intent_confidence": intent_confidence},
         )
 
-    # Build confirmation payload for TUI rendering
+    # Build confirmation payload for TUI rendering.
+    #
+    # Extra fields beyond the original 4-key payload (Layer 1 v3 audit
+    # trail — visible only when relevant):
+    #   · ``intent_reasoning``     — LLM's own explanation of why it
+    #                                classified this fault_type. UI
+    #                                surfaces it on low-confidence
+    #                                turns so the user can audit
+    #                                "why did the agent pick this?".
+    #   · ``clarification_round`` — N>0 means we've already asked the
+    #                                user once for clarification; UI
+    #                                can show "round N of N" so the
+    #                                user knows we're iterating.
     summary = _format_intent_summary(fault_intent)
     confirmation_info = {
         "type": "intent_confirm",
         "fault_intent": fault_intent,
         "summary": summary,
         "intent_confidence": intent_confidence,
+        "intent_reasoning": state.get("intent_reasoning") or "",
+        "clarification_round": int(state.get("clarification_round") or 0),
     }
 
     # Interrupt: TUI renders the summary and collects Y/N

@@ -129,6 +129,11 @@ async def save_memory(state: AgentState) -> dict:
         updates = {"finished_at": now_iso()}
         tracker.complete("Non-injection intent saved")
         sync_node_status_to_session(state, "save_memory", "Non-injection intent saved")
+        # Patch E — close out the current attempt (if any) so the
+        # history entry has end_at + outcome populated. Idempotent
+        # for chat / recover where no attempt was started.
+        from chaos_agent.agent.attempt_tracker import end_attempt as _end
+        updates.update(_end(state, outcome="success"))
         await sync_to_store(state, updates)
         return updates
 
@@ -330,4 +335,17 @@ async def save_memory(state: AgentState) -> dict:
             task_id, exc_info=True,
         )
 
+    # Patch E — close out the current attempt with the right outcome.
+    # Outcome derives from the same signals used to decide the result
+    # envelope: ``failure_reason`` set → failed; otherwise success.
+    # ``end_attempt`` is idempotent on empty history so chat / replay
+    # paths don't break.
+    from chaos_agent.agent.attempt_tracker import end_attempt as _end
+    _outcome = "failed" if state.get("failure_reason") else "success"
+    end_delta = _end(state, outcome=_outcome)
+    if end_delta:
+        # Merge into the existing updates dict so both the legacy
+        # ``finished_at`` write and the attempt-close land in the same
+        # state mutation.
+        updates.update(end_delta)
     return updates

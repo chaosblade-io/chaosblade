@@ -176,6 +176,255 @@ class TestMemorySessionIdValidation:
         assert body["code"] in (2001, 5099), body
 
 
+class TestCompactSessionSSE:
+    """The /sessions/{sid}/compact endpoint streams SSE so the TS TUI
+    can render live progress during the multi-second LLM summariser
+    call. Lock the wire shape: events come in order
+    (memory_compaction → result → done), and the result envelope
+    carries the route-level authoritative numbers."""
+
+    def _make_client_with_compact(self, hook, graph):
+        """Spin up an isolated FastAPI app with just the sessions
+        router and ``app.state.agents`` wired so /compact can find
+        the inject graph and pre-reason hook."""
+        app = FastAPI()
+        from chaos_agent.server.routes.sessions import sessions_router
+
+        app.state.agents = {"inject": graph, "pre_reason_hook": hook}
+        app.include_router(sessions_router)
+        return TestClient(app)
+
+    @staticmethod
+    def _parse_sse(body_text: str) -> list[dict]:
+        """Split a raw SSE response body into the JSON data blobs
+        (one per frame). Comment lines (``: keepalive``) are dropped."""
+        import json as _json
+
+        frames: list[dict] = []
+        for frame in body_text.split("\n\n"):
+            data_parts: list[str] = []
+            for line in frame.splitlines():
+                if line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    data_parts.append(line[5:].lstrip())
+            if data_parts:
+                frames.append(_json.loads("".join(data_parts)))
+        return frames
+
+    def test_streams_result_and_done_on_success(self):
+        from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
+
+        # Stub state snapshots: ``before`` has 4K-token worth of msgs,
+        # ``after`` has the summary message. The route asserts both
+        # before > 0 (so we don't short-circuit at the noop branch)
+        # and after < before (so it emits ``compacted=true``).
+        before_msgs = [
+            HumanMessage(content="x" * 4000, id=f"m-{i}") for i in range(8)
+        ]
+        after_msgs = [
+            SystemMessage(content="[Compressed History]\nsummary")
+        ]
+
+        class _Snapshot:
+            def __init__(self, msgs):
+                self.values = {"messages": msgs, "task_id": "old-task"}
+
+        call_count = {"n": 0}
+
+        class _StubGraph:
+            async def aget_state(self, _config):
+                # First call returns ``before`` (route reads initial
+                # state); subsequent calls return ``after`` (route
+                # reads post-update state for the authoritative
+                # ``tokens_after``).
+                call_count["n"] += 1
+                return _Snapshot(before_msgs if call_count["n"] == 1 else after_msgs)
+
+            async def aupdate_state(self, _config, _updates):
+                pass
+
+        # Stub hook: emit a "started" + "completed" through the
+        # tracker (so the route's converter has something to relay),
+        # then return the standard LangGraph updates shape.
+        async def _stub_hook(state, *, force):
+            assert force is True
+            from chaos_agent.observability.status_tracker import (
+                StatusEvent,
+                get_tracker,
+            )
+            task_id = state.get("task_id", "")
+            tracker = get_tracker(task_id)
+            tracker.emit(StatusEvent(
+                task_id=task_id, phase="started", category="node",
+                source="memory_compression", message="Compressing 8 messages",
+                detail={"total_tokens_before": 1000},
+            ))
+            tracker.emit(StatusEvent(
+                task_id=task_id, phase="completed", category="node",
+                source="memory_compression", message="done",
+                duration_ms=1234.0,
+                detail={"messages_compacted": 8, "tokens_before": 1000, "tokens_after": 200},
+            ))
+            return {
+                "messages": [RemoveMessage(id=m.id) for m in before_msgs]
+                + [SystemMessage(content="[Compressed History]\nstub")],
+                "compressed_summary": "stub",
+            }
+
+        client = self._make_client_with_compact(_stub_hook, _StubGraph())
+        # Stub the TuiSessionStore lookup by passing thread_id directly.
+        r = client.post(
+            "/api/v1/sessions/sess_abc123/compact",
+            json={"thread_id": "thread-xyz"},
+        )
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/event-stream")
+
+        frames = self._parse_sse(r.text)
+        types = [f.get("type") for f in frames]
+        # Order: at least one memory_compaction (started) before
+        # ``result``, then ``done`` last.
+        assert "memory_compaction" in types
+        assert "result" in types
+        assert types[-1] == "done"
+        # Order: result must come AFTER all memory_compaction frames.
+        result_idx = types.index("result")
+        last_mc_idx = max(i for i, t in enumerate(types) if t == "memory_compaction")
+        assert last_mc_idx < result_idx
+
+        # Result frame carries authoritative route-level numbers.
+        result = next(f for f in frames if f["type"] == "result")
+        payload = result["payload"]
+        assert payload["thread_id"] == "thread-xyz"
+        assert payload["tokens_before"] > payload["tokens_after"]
+        assert payload["compacted"] is True
+        assert payload["layer"] == "llm_summary"
+
+    def test_streams_noop_when_thread_empty(self):
+        class _Snapshot:
+            values = {"messages": [], "task_id": "old"}
+
+        class _StubGraph:
+            async def aget_state(self, _config):
+                return _Snapshot()
+
+            async def aupdate_state(self, _config, _updates):
+                raise AssertionError("must not be called on noop path")
+
+        async def _stub_hook(*_a, **_kw):
+            raise AssertionError("hook must not run when there's nothing to compact")
+
+        client = self._make_client_with_compact(_stub_hook, _StubGraph())
+        r = client.post(
+            "/api/v1/sessions/sess_empty1/compact",
+            json={"thread_id": "thread-empty"},
+        )
+        assert r.status_code == 200
+
+        frames = self._parse_sse(r.text)
+        types = [f.get("type") for f in frames]
+        assert types[-1] == "done"
+        result = next(f for f in frames if f["type"] == "result")
+        assert result["payload"]["compacted"] is False
+        assert result["payload"]["layer"] == "noop"
+
+    def test_streams_error_frame_when_hook_raises(self):
+        from langchain_core.messages import HumanMessage
+
+        before_msgs = [HumanMessage(content="x" * 4000, id="m-0")]
+
+        class _Snapshot:
+            def __init__(self):
+                self.values = {"messages": before_msgs, "task_id": "old"}
+
+        class _StubGraph:
+            async def aget_state(self, _config):
+                return _Snapshot()
+
+            async def aupdate_state(self, _config, _updates):
+                raise AssertionError("must not be called when hook raises")
+
+        async def _stub_hook(*_a, **_kw):
+            raise RuntimeError("compaction down")
+
+        client = self._make_client_with_compact(_stub_hook, _StubGraph())
+        r = client.post(
+            "/api/v1/sessions/sess_err1/compact",
+            json={"thread_id": "thread-err"},
+        )
+        assert r.status_code == 200
+
+        frames = self._parse_sse(r.text)
+        types = [f.get("type") for f in frames]
+        assert "error" in types
+        assert types[-1] == "done"
+        err = next(f for f in frames if f["type"] == "error")
+        assert "compaction down" in err.get("content", "")
+
+    def test_resolves_thread_from_in_memory_session_store(self):
+        # Regression guard: ``/compact`` MUST find the thread via the
+        # in-memory ``_GLOBAL_STORE[sid].conversation_thread_id`` (the
+        # stable LangGraph thread every turn of this session shares),
+        # NOT via the on-disk ``TuiSessionStore.task_ids`` list (which
+        # is only populated by actual inject/recover tasks).
+        #
+        # Pre-fix, a chat-only session (empty task_ids) silently
+        # returned TASK_NOT_FOUND from /compact even though a perfectly
+        # valid conversation thread existed in checkpointer state.
+        from langchain_core.messages import HumanMessage
+        from chaos_agent.server.routes.sessions import _GLOBAL_STORE
+
+        # Seed the in-memory store with a session carrying the stable
+        # conversation thread id (same shape SessionStore.create
+        # produces at POST /sessions).
+        sid = "sess_compactthread1"
+        _GLOBAL_STORE._items[sid] = {  # type: ignore[attr-defined]
+            "conversation_thread_id": "conv-stable-abc",
+            "first_turn_done": True,
+        }
+        try:
+            captured_thread: list[str] = []
+
+            class _StubGraph:
+                async def aget_state(self, config):
+                    # Capture the thread_id the route passed in. If
+                    # /compact regresses back to ``task_ids[-1]``,
+                    # this assertion is what catches it.
+                    captured_thread.append(config["configurable"]["thread_id"])
+
+                    class _Snap:
+                        values = {
+                            "messages": [
+                                HumanMessage(content="x" * 4000, id="m-1"),
+                            ],
+                            "task_id": "stale",
+                        }
+                    return _Snap()
+
+                async def aupdate_state(self, _config, _updates):
+                    pass
+
+            async def _stub_hook(*_a, **_kw):
+                return {}  # noop: nothing splittable
+
+            client = self._make_client_with_compact(_stub_hook, _StubGraph())
+            r = client.post(
+                f"/api/v1/sessions/{sid}/compact",
+                json={"thread_id": None},  # NO explicit override
+            )
+            assert r.status_code == 200
+            # Stream must complete (not return TASK_NOT_FOUND envelope).
+            frames = self._parse_sse(r.text)
+            types = [f.get("type") for f in frames]
+            assert "done" in types, f"expected SSE done frame, got: {types}"
+            # And the thread id the route picked must be the stable
+            # conversation_thread_id, not whatever was in task_ids.
+            assert captured_thread == ["conv-stable-abc"]
+        finally:
+            _GLOBAL_STORE._items.pop(sid, None)  # type: ignore[attr-defined]
+
+
 class TestConfigWriteWhitelist:
     """``/config`` rejects writes to anything outside the writable set,
     so a malicious caller can't rotate ``llm_api_key`` or ``tasks_pg_dsn``
@@ -762,6 +1011,14 @@ class TestStreamEventMemoryCompactionFields:
         assert "messages_compacted" not in d
         assert "duration_ms" not in d
         assert "layer" not in d
+        # Same falsy-strip must apply to context_size fields on
+        # non-context_size events — otherwise every token frame
+        # would carry useless ``context_current_tokens: 0, ...`` and
+        # bloat the SSE wire for no benefit.
+        assert "context_current_tokens" not in d
+        assert "context_trigger_tokens" not in d
+        assert "context_max_tokens" not in d
+        assert "context_messages_count" not in d
 
     def test_memory_compaction_event_serialises_fields(self):
         from chaos_agent.agent.streaming import StreamEvent
@@ -785,6 +1042,50 @@ class TestStreamEventMemoryCompactionFields:
         assert d["messages_compacted"] == 23
         assert d["duration_ms"] == 6234.0
         assert d["layer"] == "llm_summary"
+
+    def test_context_size_event_carries_all_fields(self):
+        from chaos_agent.agent.streaming import StreamEvent
+
+        evt = StreamEvent(
+            type="context_size",
+            task_id="turn-ctx",
+            context_current_tokens=95000,
+            context_trigger_tokens=108800,
+            context_max_tokens=128000,
+            context_messages_count=47,
+        )
+        d = evt.to_dict()
+        assert d["type"] == "context_size"
+        assert d["context_current_tokens"] == 95000
+        assert d["context_trigger_tokens"] == 108800
+        assert d["context_max_tokens"] == 128000
+        assert d["context_messages_count"] == 47
+
+    def test_context_size_event_forces_zero_onto_wire(self):
+        # Regression guard: a context_size frame whose
+        # current_tokens is genuinely 0 (empty thread, first hook call
+        # against a fresh state) MUST still arrive with the field on
+        # the wire. Without the to_dict special-case, the falsy strip
+        # would drop ``context_current_tokens: 0`` and the TS reducer
+        # would see ``undefined`` → 0 → no display change → Footer
+        # silently stays on the last value or falls back to
+        # ``ns:default``, both wrong.
+        from chaos_agent.agent.streaming import StreamEvent
+
+        evt = StreamEvent(
+            type="context_size",
+            task_id="turn-fresh",
+            context_current_tokens=0,
+            context_trigger_tokens=108800,
+            context_max_tokens=128000,
+            context_messages_count=0,
+        )
+        d = evt.to_dict()
+        # All four fields PRESENT even when value is 0.
+        assert d["context_current_tokens"] == 0
+        assert d["context_trigger_tokens"] == 108800
+        assert d["context_max_tokens"] == 128000
+        assert d["context_messages_count"] == 0
 
 
 class TestHookFanOutToTuiTracker:
