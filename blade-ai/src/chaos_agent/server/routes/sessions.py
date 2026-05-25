@@ -347,9 +347,13 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
     agents = getattr(req.app.state, "agents", None) or {}
     graph = agents.get("inject")
     if graph is None:
+        # Lifespan deferred ``create_agent`` because essential LLM
+        # config is missing — surface NEEDS_SETUP so the TUI can
+        # redirect into the wizard instead of treating this as a
+        # generic internal failure.
         return JSONEnvelope.fail(
-            code=ResponseCode.INTERNAL_ERROR,
-            message="inject agent is not initialised on this server",
+            code=ResponseCode.NEEDS_SETUP,
+            message="LLM config missing; run the setup wizard first.",
             request_id=req_id,
         )
     hook = agents.get("pre_reason_hook")

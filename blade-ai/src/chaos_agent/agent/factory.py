@@ -7,14 +7,19 @@ from chaos_agent.config.settings import settings
 from chaos_agent.skills.registry import SkillRegistry
 from chaos_agent.tools import (
     blade_create,
-    blade_destroy,
     blade_status,
     blade_query_k8s,
     kubectl,
+    kubectl_ro,
     safe_read_file,
     safe_write_file,
     read_knowledge_resource,
 )
+# blade_destroy intentionally not imported here. Phase 1 must not see
+# it (post-task-ce9647931ce1 mutation lockdown) and Phase 2 also
+# doesn't bind it (destruction is framework-controlled by the recover
+# graph or by inject/inject_stream auto-cleanup paths, which import
+# blade_destroy directly from chaos_agent.tools.blade).
 
 logger = logging.getLogger(__name__)
 
@@ -140,10 +145,10 @@ def _build_skill_tools(registry: SkillRegistry):
 
     @lc_tool
     def activate_skill(skill_name: str) -> str:
-        """Activate a chaos-engineering skill and load its full instructions.
+        """Phase 1 ONLY. Activate a chaos-engineering skill and load its full instructions.
 
         When to use:
-          - Phase 1 planning, before drafting a plan or invoking blade_create.
+          - Phase 1 planning, ONCE per task before reading skill resources.
           - Re-activate when switching fault types within the same task.
           - Do NOT skip — every fault injection MUST be backed by an activated skill.
 
@@ -169,7 +174,12 @@ def _build_skill_tools(registry: SkillRegistry):
 
     @lc_tool
     def read_skill_resource(skill_name: str, resource_path: str) -> str:
-        """Read a resource file from an activated skill's directory.
+        """Phase 1 / Phase 2 read-only. Read a resource file from an activated skill.
+
+        Templates inside (blade/kubectl command snippets) are EXECUTION
+        templates Phase 2 runs automatically — do NOT execute them yourself
+        in Phase 1. Use them to understand WHAT will happen and decide IF
+        the plan is safe.
 
         When to use:
           - You need a reference (commands.md, examples.yaml, ...) bundled
@@ -196,7 +206,28 @@ def _build_skill_tools(registry: SkillRegistry):
             result = registry.read_resource(skill_name, resource_path)
             if not result or not result.strip():
                 return f"Resource '{resource_path}' in skill '{skill_name}' is empty or contains no content."
-            return result
+            # Phase-aware wrapper. Every skill use-case markdown contains
+            # `blade create k8s pod-cpu fullload ...` style EXECUTION
+            # TEMPLATES that Phase 2 runs automatically. Without this
+            # header, an LLM in Phase 1 reading a template tends to
+            # mimic it via whatever tools it has (kubectl exec ... blade
+            # create) — caught in task-ce9647931ce1 where the LLM read
+            # Pod_CPU_应用资源争抢.md, saw the blade-create template, and
+            # immediately ran the equivalent via kubectl exec. The header
+            # sets the right frame ("this is a recipe you're reading,
+            # not following") so the LLM treats the commands as plan
+            # input rather than imperatives.
+            wrapped = (
+                "[Skill resource — REFERENCE for planning]\n"
+                "The injection / verification commands shown below are\n"
+                "EXECUTION TEMPLATES that Phase 2 will run automatically\n"
+                "once your plan is approved. In Phase 1 (current), use them\n"
+                "to understand WHAT will happen and decide IF the plan is\n"
+                "safe. DO NOT execute them yourself in this phase.\n"
+                "─────────────────────────────────────────────────────\n\n"
+                f"{result}"
+            )
+            return wrapped
         except FileNotFoundError:
             available = registry.list_resources(skill_name)
             available_str = "\n".join(f"  - {r}" for r in available) if available else "  (none found)"
@@ -208,7 +239,7 @@ def _build_skill_tools(registry: SkillRegistry):
 
     @lc_tool
     def read_file(file_path: str) -> str:
-        """Read a file from the local filesystem.
+        """Phase 1 / Phase 2 read-only. Read a file from the local filesystem.
 
         When to use:
           - The user referenced a file path in their request.
@@ -270,7 +301,11 @@ def _build_skill_tools(registry: SkillRegistry):
 
     @lc_tool
     def save_fault_plan(plan_content: str, task_id: str) -> str:
-        """Save a fault injection plan as `<task_id>.md` in the plan directory.
+        """Phase 1 ONLY. Save a fault injection plan as `<task_id>.md` in the plan directory.
+
+        Writes to the local plan dir (does NOT touch the cluster). After
+        calling this, your next message should be your final summary text
+        WITHOUT tool_calls — the system advances to Phase 2.
 
         When to use:
           - End of Phase 1, after the plan is finalized and before the
@@ -342,7 +377,10 @@ def _build_skill_tools(registry: SkillRegistry):
         params: str = "",
         timeout: int = 0,
     ) -> str:
-        """Execute a script from a skill's scripts/ directory.
+        """Phase 2 / verifier ONLY. Execute a script from a skill's scripts/ directory.
+
+        Side effects depend on the script. NOT available in Phase 1
+        planning (scripts may perform mutating operations).
 
         When to use:
           - Phase 2 / verifier needs a side-effect-free probe that the skill
@@ -467,18 +505,27 @@ async def create_agent(
     # fired; only a transient K8s API connection error prevented an
     # unauthorised injection.
     #
-    # ``blade_destroy`` STAYS — it is destructive but cannot create
-    # any new fault. Its only effect is to stop an existing experiment
-    # (identified by UID, which the planner has to discover via
-    # ``blade_status`` first). Legitimate Phase 1 use: the planner
-    # spots a stale / orphan experiment from a previous run on the same
-    # target and cleans it up before drafting the new plan. This also
-    # serves the replan path (post-Phase-2 failure) where partial state
-    # may need to be torn down before re-planning.
+    # ``blade_destroy`` REMOVED from phase1_tools (post-task-ce9647931ce1):
+    # it mutates cluster state, so leaving it in the schema only to let
+    # the phase1_screener reject it at runtime would burn LLM turns on a
+    # tool the LLM "sees" but can't actually use. Per the user goal of
+    # "have the LLM go right on the first try, not via error-recovery",
+    # the only consistent choice is to hide it from Phase 1 entirely.
+    # Orphan cleanup is deferred to a future ``pre_execute_cleanup`` node
+    # that runs deterministically (no LLM dispatch) between
+    # confirmation_gate and execute_loop.
     #
     # ``blade_status`` STAYS — read-only: lists current experiments,
     # confirms ChaosBlade is installed.
-    # ``kubectl`` STAYS — read-only target inspection (get / describe).
+    # ``kubectl_ro`` (NOT full ``kubectl``) — read-only target inspection
+    # only (get / describe / top / logs / version / cluster-info /
+    # api-resources / explain / auth). The full ``kubectl`` was the
+    # bypass vector in task-ce9647931ce1: with full kubectl bound here,
+    # the LLM that撞 the blade_create blacklist pivoted to
+    # ``kubectl exec <chaosblade-controller-pod> -- blade create ...``
+    # and injected anyway. ``kubectl_ro``'s ``Literal`` type
+    # constraint on ``subcommand`` makes that bypass impossible at the
+    # tool-schema level.
     #
     # Excludes ``write_file`` / ``search_files`` /
     # ``execute_skill_script`` for the same "planning is read-only +
@@ -489,8 +536,8 @@ async def create_agent(
         _read_file,
         _save_fault_plan,
         blade_status,
-        blade_destroy,
-        kubectl,
+        # blade_destroy intentionally absent — see comment above
+        kubectl_ro,                # ← was: kubectl (full surface)
         read_knowledge_resource,
     ]
 

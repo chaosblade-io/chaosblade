@@ -61,6 +61,11 @@ class ResponseCode(IntEnum):
     # Internal / runtime (5xxx)
     NO_BLADE_UID = 5000
     SERVER_SHUTTING_DOWN = 5001
+    # Backend booted but the LLM-bound agent graph isn't built yet —
+    # essential config (api_key / model / base_url) is still missing.
+    # The TUI BootRunner reads this code to redirect the user into
+    # the wizard instead of surfacing the underlying OpenAIError.
+    NEEDS_SETUP = 5002
     # Generic internal failure — disk write, lock contention, etc.
     # Used by /config / /memory / /compact handlers when the client
     # bears no fault but the operation still couldn't complete.

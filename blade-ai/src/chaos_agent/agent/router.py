@@ -296,10 +296,12 @@ def should_continue_verifier(state: AgentState) -> str:
     if reverify_gaps:
         reverify_count = state.get("reverify_count", 0)
         from chaos_agent.utils.fault_context import lookup_adaptations
+        from chaos_agent.agent.fault_spec import read_fault_spec as _rfs
+        _spec = _rfs(state)
         adaptations = lookup_adaptations(
-            state.get("blade_scope", ""),
-            state.get("blade_target", ""),
-            state.get("blade_action", ""),
+            _spec.scope if _spec else "",
+            _spec.blade_target if _spec else "",
+            _spec.blade_action if _spec else "",
             state.get("target_metadata") or {},
             rule_type="verification_integrity_guard",
         )
@@ -453,7 +455,7 @@ def should_continue_intent_clarification(state: AgentState) -> str:
 def route_after_intent_confirm(state: AgentState) -> str:
     """Route after intent confirmation gate.
 
-    If user approved (confirmed_intent still "inject" + fault_intent exists),
+    If user approved (confirmed_intent still "inject" + fault_spec exists),
     proceed to agent_loop. Otherwise user rejected/modified — graph ends,
     TUI waits for next input to continue the conversation.
 
@@ -461,7 +463,7 @@ def route_after_intent_confirm(state: AgentState) -> str:
         "agent_loop" - user confirmed, proceed to planning/execution
         END          - user rejected, wait for next input
     """
-    if state.get("confirmed_intent") == "inject" and state.get("fault_intent"):
+    if state.get("confirmed_intent") == "inject" and state.get("fault_spec"):
         return "agent_loop"
     return END
 

@@ -7,6 +7,7 @@ import shlex
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 from chaos_agent.agent.env_info import compute_env_info
+from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
 from chaos_agent.agent.nodes._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
@@ -36,60 +37,94 @@ from chaos_agent.observability.status_tracker import (
 logger = logging.getLogger(__name__)
 
 
-def _extract_target_from_kubectl_get(
+def _derive_spec_fields_from_kubectl_get(
     v_args: str,
-    existing_target: dict | None,
-    state_target: dict | None,
     blacklist: list[str],
 ) -> dict:
-    """Extract target info (namespace, labels, resource_type) from a kubectl get call.
+    """Parse a ``kubectl get`` v_args string into FaultSpec field updates.
 
-    Uses write-once semantics: each field is only set if not already present
-    in *existing_target*.  Additionally, namespaces in *blacklist* are never
-    set (auxiliary queries to kube-system etc. must not pollute the target).
+    Returns a dict of fields that can be passed to ``FaultSpec.replace(**dict)``.
+    Each field is only included if successfully parsed; the caller
+    applies write-once semantics (don't override a spec field that
+    already has a value).
 
-    Returns the updated target dict (may be empty if nothing was extracted).
+    What we parse:
+      - ``namespace`` from ``-n NS`` / ``--namespace NS`` / ``--namespace=NS``
+      - ``labels`` from ``-l selector`` / ``--selector selector`` (dict-typed,
+        unlike the old code which stored raw str)
+      - ``scope`` from the first non-flag positional (``pods`` / ``nodes`` / etc.)
+      - ``names`` from positional 2+ (``kubectl get pod my-pod``)
+
+    The previous code in this slot stored labels as a raw string and
+    never extracted names — those gaps are what made the original
+    NL-mode bug silent. Both are fixed here.
+
+    Used by CLI NL path where ``intent_clarification`` doesn't run,
+    so the spec must be built lazily from the LLM's planning actions.
     """
-    target = dict(existing_target or {})
+    updates: dict = {}
     v_parts = _split_args(v_args)
 
-    # Parse namespace: -n <ns> / --namespace <ns> / --namespace=<ns>
+    # namespace
     for i, p in enumerate(v_parts):
-        ns_candidate = None
         if p in ("-n", "--namespace") and i + 1 < len(v_parts):
-            ns_candidate = v_parts[i + 1]
+            ns = v_parts[i + 1]
         elif p.startswith("--namespace="):
-            ns_candidate = p.split("=", 1)[1]
-        if ns_candidate and not target.get("namespace") and ns_candidate not in blacklist:
-            target["namespace"] = ns_candidate
-
-    # Parse label selector: -l <sel> / --selector <sel> / --selector=<sel>
-    for i, p in enumerate(v_parts):
-        label_candidate = None
-        if p in ("-l", "--selector") and i + 1 < len(v_parts):
-            label_candidate = v_parts[i + 1]
-        elif p.startswith("--selector="):
-            label_candidate = p.split("=", 1)[1]
-        if label_candidate and not target.get("labels"):
-            target["labels"] = label_candidate
-
-    # Determine resource_type from first non-flag token
-    for p in v_parts:
-        if not p.startswith("-"):
-            if not target.get("resource_type"):
-                if p in ("nodes", "node", "no"):
-                    target["resource_type"] = "node"
-                elif p in ("pods", "pod", "po"):
-                    target["resource_type"] = "pod"
+            ns = p.split("=", 1)[1]
+        else:
+            continue
+        if ns and ns not in blacklist:
+            updates["namespace"] = ns
             break
 
-    # Preserve namespace from existing state for cluster-scoped queries
-    if not target.get("namespace"):
-        existing_ns = (state_target or {}).get("namespace", "")
-        if existing_ns:
-            target["namespace"] = existing_ns
+    # labels — parse selector into dict[str, str] (not the raw str
+    # the old code stored, which violated the FaultSpec.labels contract)
+    for i, p in enumerate(v_parts):
+        if p in ("-l", "--selector") and i + 1 < len(v_parts):
+            sel = v_parts[i + 1]
+        elif p.startswith("--selector="):
+            sel = p.split("=", 1)[1]
+        else:
+            continue
+        parsed: dict = {}
+        for piece in sel.split(","):
+            piece = piece.strip()
+            if "=" in piece:
+                k, _, v = piece.partition("=")
+                parsed[k.strip()] = v.strip()
+        if parsed:
+            updates["labels"] = parsed
+        break
 
-    return target
+    # scope + names from positionals (skip flag tokens AND their values)
+    _SCOPE_ALIASES = {
+        "pods": "pod", "pod": "pod", "po": "pod",
+        "nodes": "node", "node": "node", "no": "node",
+        "deployments": "deployment", "deployment": "deployment", "deploy": "deployment",
+        "services": "service", "service": "service", "svc": "service",
+    }
+    positionals: list[str] = []
+    i = 0
+    while i < len(v_parts):
+        p = v_parts[i]
+        if p in ("-n", "--namespace", "-l", "--selector",
+                 "-o", "--output", "--field-selector"):
+            i += 2  # skip flag + value
+            continue
+        if p.startswith("-"):
+            i += 1
+            continue
+        positionals.append(p)
+        i += 1
+    if positionals:
+        canonical = _SCOPE_ALIASES.get(positionals[0].lower())
+        if canonical:
+            updates["scope"] = canonical
+            # positional[1:] are specific resource names
+            names = [n for n in positionals[1:] if not n.startswith("-")]
+            if names:
+                updates["names"] = tuple(names)
+    return updates
 
 
 def _split_args(args: str) -> list[str]:
@@ -142,9 +177,13 @@ async def agent_loop(state: AgentState) -> dict:
             REASON_INITIAL,
             begin_attempt,
         )
+        # attempt_tracker stores the target snapshot for audit; we
+        # pass the FaultSpec dict (richer than the old legacy 4-field
+        # target — includes blade_target/action/params so the history
+        # entry can answer "what fault did attempt N try to inject").
         delta = begin_attempt(
             state,
-            target=state.get("target"),
+            target=state.get("fault_spec"),
             reason=REASON_INITIAL,
         )
         state.update(delta)
@@ -289,25 +328,25 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
             # This eliminates the 3× redundancy (system prompt + P2 + docstring).
             _injections_for_state = []
 
-            # --- Inject structured fault_intent from intent_clarification ---
-            fault_intent = state.get("fault_intent")
-            if count == 1 and fault_intent and not is_replan:
+            # --- Inject structured fault context from FaultSpec ---
+            _spec = read_fault_spec(state)
+            if count == 1 and _spec and not is_replan and _spec.is_complete:
                 fi_lines = [
                     "[FAULT INTENT — collected from user dialogue]",
-                    f"Fault type: {fault_intent.get('fault_type', '?')}",
-                    f"Scope: {fault_intent.get('scope', '?')}",
-                    f"Target: {fault_intent.get('target', '?')}",
-                    f"Action: {fault_intent.get('action', '?')}",
-                    f"Namespace: {fault_intent.get('namespace', '?')}",
+                    f"Fault type: {_spec.fault_type or '?'}",
+                    f"Scope: {_spec.scope or '?'}",
+                    f"Target: {_spec.blade_target or '?'}",
+                    f"Action: {_spec.blade_action or '?'}",
+                    f"Namespace: {_spec.namespace or '?'}",
                 ]
-                if fault_intent.get("labels"):
-                    fi_lines.append(f"Labels: {fault_intent['labels']}")
-                if fault_intent.get("names"):
-                    fi_lines.append(f"Names: {', '.join(fault_intent['names'])}")
-                if fault_intent.get("params"):
-                    fi_lines.append(f"Params: {json.dumps(fault_intent['params'], ensure_ascii=False)}")
-                if fault_intent.get("user_description"):
-                    fi_lines.append(f"User request: {fault_intent['user_description']}")
+                if _spec.labels:
+                    fi_lines.append(f"Labels: {dict(_spec.labels)}")
+                if _spec.names:
+                    fi_lines.append(f"Names: {', '.join(_spec.names)}")
+                if _spec.params:
+                    fi_lines.append(f"Params: {json.dumps(dict(_spec.params), ensure_ascii=False)}")
+                if _spec.user_description:
+                    fi_lines.append(f"User request: {_spec.user_description}")
                 fi_lines.append(
                     "\nProceed directly: activate the matching skill, verify the "
                     "target if not already verified, and generate your execution plan."
@@ -408,16 +447,60 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
                     result["skill_name"] = tc_args["skill_name"]
                     logger.info(f"Skill activated: {tc_args['skill_name']}")
 
-                # Extract target info from kubectl(subcommand="get") calls
-                if tc_name == "kubectl" and tc_args.get("subcommand") == "get":
-                    updated = _extract_target_from_kubectl_get(
-                        v_args=tc_args.get("v_args", ""),
-                        existing_target=result.get("target"),
-                        state_target=state.get("target"),
-                        blacklist=settings.blacklist_namespaces,
+                # Lazy spec derivation from LLM's kubectl get probes.
+                #
+                # Why this exists: CLI NL mode (``blade-ai inject
+                # --input "..."``) doesn't go through
+                # intent_clarification (route_after_load_memory keys
+                # on interaction_mode). The entry-point spec is a
+                # placeholder with empty scope/names/namespace.
+                # Without lazy derivation, safety_check rejects every
+                # CLI NL turn with "No target specified".
+                #
+                # Why this is safe vs target_guard: this only fires
+                # in the PLANNING phase (before confirmation_gate
+                # freezes approved_target). target_guard's drift
+                # protection runs in execute_loop (post-confirm),
+                # where the spec is locked and any mid-loop change
+                # to the approval gets caught.
+                #
+                # Write-once semantics: only fill fields the spec
+                # is missing, never overwrite. If intent_clarification
+                # already populated the spec (TUI path), this block
+                # finds nothing to update and is effectively a no-op.
+                # Catch ``get`` / ``describe`` / ``top`` — all three share
+                # the same positional shape (``kind [name] -n ns -l sel``)
+                # and the LLM uses any of them to probe. Without
+                # ``describe`` / ``top`` here, CLI NL flows where the LLM
+                # prefers ``kubectl describe pod foo`` over ``kubectl get
+                # pod foo`` would never get namespace/names derived.
+                if (
+                    tc_name == "kubectl"
+                    and tc_args.get("subcommand") in ("get", "describe", "top")
+                ):
+                    _spec_now = (
+                        FaultSpec.from_dict(result["fault_spec"])
+                        if "fault_spec" in result
+                        else read_fault_spec(state)
                     )
-                    if updated:
-                        result["target"] = updated
+                    if _spec_now is not None and not _spec_now.is_complete:
+                        derived = _derive_spec_fields_from_kubectl_get(
+                            v_args=tc_args.get("v_args", ""),
+                            blacklist=settings.blacklist_namespaces,
+                        )
+                        # write-once: only fill missing fields
+                        updates: dict = {}
+                        for k, v in derived.items():
+                            current = getattr(_spec_now, k, None)
+                            if not current:
+                                updates[k] = v
+                        if updates:
+                            new_spec = _spec_now.replace(**updates)
+                            result["fault_spec"] = new_spec.to_dict()
+                            logger.info(
+                                "agent_loop: derived spec fields from "
+                                "LLM kubectl get: %s", updates,
+                            )
 
                 # Extract plan from save_fault_plan calls
                 if tc_name == "save_fault_plan":

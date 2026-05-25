@@ -6,6 +6,7 @@ from chaos_agent.agent.nodes._conflict_check import check_blade_conflicts
 from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
+from chaos_agent.agent.target_guard import freeze_approved_target
 from chaos_agent.config.settings import settings
 from chaos_agent.errors import FailureReason
 from chaos_agent.observability.status_tracker import (
@@ -28,8 +29,12 @@ async def safety_check(state: AgentState) -> dict:
     Returns updated safety_status and safety_reason.
     """
     task_id = state.get("task_id", "unknown")
-    target = state.get("target") or {}
-    namespace = target.get("namespace", "")
+    # Single source of truth: read the FaultSpec written by entry-point
+    # constructors or intent_clarification. Falls back to an empty spec
+    # when missing so the no-target check below still fires uniformly.
+    from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+    spec = read_fault_spec(state) or FaultSpec()
+    namespace = spec.namespace
     skill_name = state.get("skill_name", "")
 
     tracker = get_tracker(task_id)
@@ -69,8 +74,10 @@ async def safety_check(state: AgentState) -> dict:
         await sync_to_store(state, result)
         return result
 
-    # 3. Basic target validation
-    if not target:
+    # 3. Basic target validation — spec must at least carry a scope
+    # (cluster-scoped resources can have empty namespace; pod/container
+    # need namespace via the FaultSpec.is_complete contract).
+    if not spec.scope:
         tracker.fail("No target specified")
         sync_node_status_to_session(state, "safety_check",
             "Safety check rejected: no target specified",
@@ -86,21 +93,19 @@ async def safety_check(state: AgentState) -> dict:
     # 4. Blade conflict detection (enhanced with target overlap)
     kubeconfig = _resolve_kubeconfig(state)
     if kubeconfig:
-        namespace = target.get("namespace", "")
-        raw_labels = state.get("params", {}).get("labels", "") or target.get("labels", "")
-        # Normalize labels to comma-separated "k=v" string.
-        # target["labels"] may be a dict {"app": "accounting"} from CLI runner,
-        # while params["labels"] is already a string like "app=accounting".
-        if isinstance(raw_labels, dict):
-            labels = ",".join(f"{k}={v}" for k, v in raw_labels.items())
-        else:
-            labels = str(raw_labels) if raw_labels else ""
-        target_names = ",".join(target.get("names", []))
+        namespace = spec.namespace
+        # spec.labels is contract-typed dict[str, str] — no isinstance
+        # dance needed. The previous coerce dance existed because
+        # state.target.labels could be a str (agent_loop lazy extract)
+        # or a dict (CLI structured input); FaultSpec normalises both
+        # at construction time.
+        labels = ",".join(f"{k}={v}" for k, v in spec.labels.items())
+        target_names = ",".join(spec.names)
 
         # Build scope-target-action for action compatibility check (P1)
-        scope = state.get("blade_scope", "")
-        blade_target = state.get("blade_target", "")
-        action = state.get("blade_action", "")
+        scope = spec.scope
+        blade_target = spec.blade_target
+        action = spec.blade_action
         request_sta = f"{scope}-{blade_target}-{action}" if scope and blade_target and action else ""
 
         uids, conflict_details = await check_blade_conflicts(
@@ -215,10 +220,17 @@ async def safety_check(state: AgentState) -> dict:
         try:
             from chaos_agent.agent.target_health import assess_target_health
 
-            scope = state.get("blade_scope", "") or ""
-            target_payload = state.get("target") or {}
+            # assess_target_health still consumes the legacy dict
+            # shape; project the spec through to that contract here.
+            target_payload = {
+                "namespace": spec.namespace,
+                "names": list(spec.names),
+                "labels": dict(spec.labels),
+                "resource_type": spec.scope,
+            }
             kubeconfig = settings.kubeconfig_path or ""
-            health = await assess_target_health(scope, target_payload, kubeconfig)
+            health = await assess_target_health(spec.scope, target_payload, kubeconfig)
+            scope = spec.scope
             target_health_report = health.to_dict()
             logger.info(
                 "target health pre-check: scope=%s overall=%s issues=%d",
@@ -268,5 +280,25 @@ async def safety_check(state: AgentState) -> dict:
         # experiment, no DiskPressure but pod is Pending"). Skipping
         # the field when no report is generated keeps state minimal.
         result["target_health_report"] = target_health_report
+
+    # When this safety_check return causes the router to AUTO-APPROVE
+    # (status=safe + needs_confirmation=False → route_after_safety →
+    # baseline_capture, bypassing confirmation_gate), there is no
+    # other place that freezes ``approved_target`` for the screener
+    # to compare against. Without freezing here, the screener would
+    # see ``approved_target=None`` in enforcing mode and REJECT every
+    # destructive call in this turn as "no approval on record".
+    # Mirrors the freeze logic in confirmation_gate; safe to do
+    # unconditionally because the user-prompted gate will overwrite
+    # this with the same snapshot on its own approve path.
+    result["approved_target"] = freeze_approved_target(
+        target={"namespace": spec.namespace, "names": list(spec.names),
+                "labels": dict(spec.labels), "resource_type": spec.scope},
+        params=dict(spec.params),
+        blade_scope=spec.scope,
+        blade_target=spec.blade_target,
+        blade_action=spec.blade_action,
+    )
+
     await sync_to_store(state, result)
     return result

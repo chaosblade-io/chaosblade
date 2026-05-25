@@ -8,7 +8,7 @@
  * user pick between a fixed answer ("approve" / "reject") and a
  * free-form reply that becomes the agent's next user message.
  *
- * Visual:
+ * Visual (options mode):
  *
  *   [A] Yes, proceed                        ← focused: brand-orange + bold
  *   [B] No, cancel
@@ -21,14 +21,26 @@
  * keyboard shortcuts (press `A` to jump to the first option). Number
  * keys 1-9 stay live for users with prior muscle memory.
  *
- * In feedback mode (after Enter on a hasFeedback item):
+ * In feedback mode (after Enter on a hasFeedback item) the chosen
+ * row's LABEL slot becomes an inline input — the row's chip and
+ * position do not move:
  *
  *   [A] Yes, proceed
  *   [B] No, cancel
- *   [C] Tell agent something else…
- *   ❯ <typed text>|                         ← cursor block
+ *   [C] ❯ <typed text>▌                     ← label becomes input;
+ *                                             chip [C] still anchors it
  *
  *   Enter send · Esc back to options
+ *
+ * **Why inline instead of an extra row below**: the previous layout
+ * appended a separate ``❯ ...▌`` row + an extra blank below the
+ * options, growing the total row count by ~2 in feedback mode. When
+ * the user Esc'd back to options, Ink's incremental-rendering path on
+ * Apple Terminal (no DEC 2026) occasionally left a stale ``[C]`` row
+ * behind during the row-count shrink, surfacing as a duplicated
+ * option. Keeping row count CONSTANT across the feedback↔options
+ * transition makes the bug structurally impossible — Ink never has
+ * to issue an ``eraseLines`` for the freed tail.
  *
  * Keyboard handling lives entirely inside this component; callers
  * just pass ``isFocused`` to gate participation. The hosting
@@ -116,8 +128,14 @@ export function Select<T>({
         // Esc inside feedback mode is "cancel correction" — go back
         // to options without firing onCancel. Lets the user change
         // their mind about the option after starting to type.
+        //
+        // We ALSO clear ``feedbackText`` here so re-entering feedback
+        // mode later starts from a clean buffer (previous behaviour
+        // preserved the text, which surprised users who expected Esc
+        // to be a full reset).
         if (key.escape) {
           setMode("options");
+          setFeedbackText("");
           return;
         }
         if (key.return) {
@@ -132,6 +150,7 @@ export function Select<T>({
           const item = items[safeActiveIdx];
           if (item) {
             onSelect(item.value, feedbackText);
+            setFeedbackText("");
           }
           return;
         }
@@ -218,14 +237,18 @@ export function Select<T>({
       {items.map((item, i) => {
         const active = i === safeActiveIdx;
         const inOptions = mode === "options";
+        // The hasFeedback item, while active in feedback mode,
+        // morphs its LABEL slot into an inline input. The row's
+        // chip stays at `[X]` and at the same position — only the
+        // label payload changes. This keeps total row count constant
+        // across feedback↔options transitions (see header comment).
+        const isInlineInput = active && !inOptions && item.hasFeedback;
         // Three visual states per row:
         //   - highlighted  (active + options mode)   → chip+label brand-orange + bold
-        //   - pending      (active + feedback mode)  → chip dim, label primary (reminds
-        //                                              the user which option they're
-        //                                              about to commit while they type)
+        //   - pending      (active + feedback mode)  → chip kept dim, label slot
+        //                                              becomes the inline input
         //   - idle         (everything else)         → chip+label secondary dim
         const highlighted = active && inOptions;
-        const pending = active && !inOptions;
         // Letter chip for direct keyboard jump. Cap at 26; beyond
         // that we render a blank 3-wide slot so column alignment is
         // preserved even though the row has no shortcut. (Select is
@@ -234,79 +257,68 @@ export function Select<T>({
           i < 26 ? `[${String.fromCharCode(65 + i)}]` : "   ";
         const chipColor = highlighted
           ? Theme.forge.fire
-          : Theme.text.secondary;
+          : isInlineInput
+            ? Theme.text.accent
+            : Theme.text.secondary;
         const labelColor = highlighted
           ? Theme.forge.fire
-          : pending
-            ? Theme.text.primary
-            : Theme.text.secondary;
+          : Theme.text.secondary;
         return (
           <Box key={`opt-${i}`}>
             <Box minWidth={4}>
-              <Text color={chipColor} bold={highlighted}>
+              <Text color={chipColor} bold={highlighted || isInlineInput}>
                 {`${chip} `}
               </Text>
             </Box>
             <Box flexGrow={1}>
-              <Text color={labelColor} bold={highlighted}>
-                {item.label}
-              </Text>
+              {isInlineInput ? (
+                // Inline input — replaces the option label in place.
+                // Uses ``wrap="truncate-end"`` so long text never
+                // forces the row to grow into multiple terminal rows
+                // (which would re-introduce the row-count instability
+                // the inlining was designed to avoid).
+                <Text wrap="truncate-end">
+                  <Text color={Theme.text.accent} bold>
+                    {Icons.prompt}{" "}
+                  </Text>
+                  {feedbackText.length === 0 ? (
+                    <>
+                      <Text color={Theme.text.accent}>{"▌"}</Text>
+                      <Text color={Theme.text.secondary}>
+                        {` ${t("select.feedback.placeholder")}`}
+                      </Text>
+                    </>
+                  ) : (
+                    <>
+                      <Text color={Theme.text.primary}>{feedbackText}</Text>
+                      <Text color={Theme.text.accent}>{"▌"}</Text>
+                    </>
+                  )}
+                </Text>
+              ) : (
+                <Text color={labelColor} bold={highlighted}>
+                  {item.label}
+                </Text>
+              )}
             </Box>
           </Box>
         );
       })}
-      {mode === "feedback" ? (
-        <>
-          <Box marginTop={1}>
-            <Box minWidth={4}>
-              <Text color={Theme.text.accent} bold>
-                {Icons.prompt}{" "}
-              </Text>
-            </Box>
-            <Box flexGrow={1}>
-              {feedbackText.length === 0 ? (
-                // Empty buffer: cursor block FIRST, placeholder as a
-                // dim hint to its right. The pre-fix layout rendered
-                // ``placeholder ▌`` which read as "the user typed the
-                // placeholder text and the cursor sits at end-of-line"
-                // — exactly the confusion reported. Mirrors the
-                // InputPrompt empty-buffer rendering for consistency.
-                <>
-                  <Text color={Theme.text.accent}>{"▌"}</Text>
-                  <Text color={Theme.text.secondary}>
-                    {` ${t("select.feedback.placeholder")}`}
-                  </Text>
-                </>
-              ) : (
-                // Non-empty: typed text in primary, cursor block at
-                // the end (we don't track an in-string caret yet —
-                // the feedback box is single-line append-only).
-                <>
-                  <Text color={Theme.text.primary}>{feedbackText}</Text>
-                  <Text color={Theme.text.accent}>{"▌"}</Text>
-                </>
-              )}
-            </Box>
-          </Box>
-          <Box marginTop={1}>
-            <Box minWidth={4} />
-            <Box flexGrow={1}>
-              <Text color={Theme.text.secondary}>
-                {t("select.feedback.hint")}
-              </Text>
-            </Box>
-          </Box>
-        </>
-      ) : (
-        <Box marginTop={1}>
-          <Box minWidth={4} />
-          <Box flexGrow={1}>
-            <Text color={Theme.text.secondary}>
-              {t("select.options.hint")}
-            </Text>
-          </Box>
+      {/* Single hint row — content swaps per mode but the row itself
+       *  is always rendered. Together with the inline-input layout
+       *  above, this guarantees the Select's total row count is
+       *  constant across feedback↔options transitions, so Ink's
+       *  incremental rendering never has to handle a shrink. */}
+      <Box marginTop={1}>
+        <Box minWidth={4} />
+        <Box flexGrow={1}>
+          <Text color={Theme.text.secondary}>
+            {mode === "feedback"
+              ? t("select.feedback.hint")
+              : t("select.options.hint")}
+          </Text>
         </Box>
-      )}
+      </Box>
     </Box>
   );
 }

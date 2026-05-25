@@ -48,6 +48,19 @@ LLM_BOUND_KEYS: frozenset[str] = frozenset({
 })
 
 
+def agents_ready(app: FastAPI) -> bool:
+    """True iff lifespan or wizard /save built the agent graph.
+
+    Lifespan now defers ``create_agent`` when essential LLM config
+    (api_key / model_name / api_base_url) is missing on first boot —
+    in that mode ``app.state.agents`` is ``None`` and routes that
+    dereference ``agents['inject'|'recover']`` must respond with a
+    NEEDS_SETUP envelope rather than crash. Centralised here so every
+    guarded route reads the same predicate.
+    """
+    return bool(getattr(app.state, "agents", None))
+
+
 async def maybe_rebuild_agents(
     app: FastAPI,
     changed_keys: Iterable[str],

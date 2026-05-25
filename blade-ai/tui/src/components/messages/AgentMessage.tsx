@@ -34,12 +34,10 @@ import { Theme } from "../../theme/colors.js";
 import { Icons } from "../../theme/icons.js";
 import { renderMarkdown } from "../../utils/markdown.js";
 
-/** Floor for the visible budget. Applied AFTER the
- *  ``PENDING_AGENT_MAX_VISIBLE`` cap so a tiny terminal (where
- *  ``availableTerminalHeight`` could shrink below the cap) still
- *  shows ≥ 5 rows of streaming reply rather than just the truncation
- *  prefix with no body. Inequality always holds:
- *  ``PENDING_MIN_VISIBLE (5) ≤ PENDING_AGENT_MAX_VISIBLE (8)``. */
+/** Floor for the visible budget. Applied as the lower bound on
+ *  ``availableTerminalHeight`` so a very narrow terminal still shows
+ *  ≥ 5 rows of streaming reply rather than just the truncation
+ *  prefix with no body underneath. */
 const PENDING_MIN_VISIBLE = 5;
 /** Hard cap on the pending agent's visible row count, regardless of
  *  how much height the terminal could afford.
@@ -58,26 +56,43 @@ const PENDING_MIN_VISIBLE = 5;
  *  reads it as "the live tail is updating" instead of "the whole
  *  screen is shaking".
  *
- *  Trade-off: when the agent body exceeds 8 rows, the user sees the
+ *  Trade-off: when the agent body exceeds the cap, the user sees the
  *  prefix "+N earlier lines · full text in scrollback after turn"
- *  followed by the most recent 7 rows. Once the agent message
+ *  followed by the most recent (cap-1) rows. Once the agent message
  *  commits to history (``isPending=false``), the full text is
  *  re-rendered in Static so nothing is permanently hidden — they can
  *  always scroll up to read the full reply. The qwen-code TUI uses
- *  the same pattern (``MaxSizedBox`` with a tight pin-height); this
- *  is the industry-standard solution for streaming-agent flicker. */
-const PENDING_AGENT_MAX_VISIBLE = 8;
+ *  the same pattern (``MaxSizedBox`` with a viewport-relative pin);
+ *  this is the industry-standard solution for streaming-agent
+ *  flicker.
+ *
+ *  Cap policy (May 2026): the cap is **viewport-relative**, not a
+ *  hardcoded constant. We cap at ``availableTerminalHeight`` (the
+ *  per-pending budget MainContent computes, already net of chrome).
+ *  Reasoning:
+ *    - Replies that fit on one screen render in full → no visual
+ *      jitter, the user sees the whole reply unfolded as it streams.
+ *    - Replies that would overflow the viewport fold automatically
+ *      → avoids Ink's fullscreen-redraw branch (kills scrollback
+ *      bouncing, spinner stutter, keyboard lag).
+ *  The previous design pinned a hard ``PENDING_AGENT_MAX_VISIBLE = 8``
+ *  which was over-aggressive: even a 12-line reply on a 50-row
+ *  terminal got truncated despite plenty of room. The viewport-
+ *  relative cap removes the artificial ceiling while keeping the
+ *  flicker-mitigation behaviour where it actually matters. */
 
 const AgentMessageInternal: React.FC<{
   item: AgentItem;
   isPending?: boolean;
   /** Per-pending-item row budget from ``MainContent``. Already
-   *  accounts for the chrome that lives below pending (Composer +
-   *  InputPrompt + Footer + stepper). The pending agent's visible
-   *  height further caps to ``min(this, PENDING_AGENT_MAX_VISIBLE)``
-   *  so streaming flicker doesn't scale with terminal height.
-   *  ``undefined`` (Ctrl+O / constrainHeight=false) opts out of any
-   *  cap — full content is rendered, viewport overflow accepted. */
+   *  accounts for the chrome below pending (Composer + InputPrompt +
+   *  Footer + stepper) and a 2-row safety buffer. The pending agent's
+   *  visible height caps directly at this value — no separate hard
+   *  ceiling — so any reply that fits on one screen renders in full,
+   *  while only over-viewport replies fold to dodge Ink's fullscreen
+   *  redraw branch. ``undefined`` (Ctrl+O / constrainHeight=false)
+   *  opts out of any cap — full content is rendered, viewport
+   *  overflow accepted. */
   availableTerminalHeight?: number;
 }> = ({ item, isPending, availableTerminalHeight }) => {
   const { columns } = useTerminalSize();
@@ -99,22 +114,21 @@ const AgentMessageInternal: React.FC<{
     // Ctrl+O (``constrainHeight=false``) sends ``availableTerminalHeight=
     // undefined`` to indicate the user EXPLICITLY wants full content
     // visible, accepting that the dyn frame may overflow viewport. In
-    // that mode we skip the 8-row cap entirely — the user has opted
-    // out of flicker mitigation in favour of seeing everything.
+    // that mode we skip the cap entirely.
     if (availableTerminalHeight === undefined) return rendered;
-    // Budget resolution (smallest wins — we want as tight a cap as
-    // safely possible during streaming):
-    //   1. ``PENDING_AGENT_MAX_VISIBLE`` (8) — hard cap that prevents
-    //      streaming flicker from scaling with terminal height.
-    //   2. ``availableTerminalHeight`` from MainContent — accounts
-    //      for chrome below pending (controls + footer + stepper).
-    // ``Math.max(PENDING_MIN_VISIBLE, ...)`` floors the result so a
-    // tiny terminal still shows something rather than just the
-    // "+N earlier lines" hint with no body.
-    const budget = Math.max(
-      PENDING_MIN_VISIBLE,
-      Math.min(PENDING_AGENT_MAX_VISIBLE, availableTerminalHeight),
-    );
+    // Cap directly at ``availableTerminalHeight`` — no separate hard
+    // ceiling. MainContent has already subtracted chrome (Composer +
+    // InputPrompt + Footer + stepper) and a 2-row buffer, so this
+    // value is the largest the pending body can grow without pushing
+    // the dynamic frame past viewport rows (which would trip Ink's
+    // fullscreen-redraw branch and cause scrollback bouncing /
+    // spinner stutter / keyboard lag).
+    //
+    // ``Math.max(PENDING_MIN_VISIBLE, ...)`` floors the budget so a
+    // very narrow terminal (e.g. 6 rows visible after chrome) still
+    // shows a body line, not just the "+N earlier lines" hint sitting
+    // alone with nothing under it.
+    const budget = Math.max(PENDING_MIN_VISIBLE, availableTerminalHeight);
     const lines = rendered.split("\n");
     if (lines.length <= budget) return rendered;
     const dropped = lines.length - (budget - 1);

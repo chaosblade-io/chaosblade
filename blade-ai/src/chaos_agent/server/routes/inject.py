@@ -6,6 +6,7 @@ import uuid
 
 from fastapi import Request
 
+from chaos_agent.agent.fault_spec import FaultSpec
 from chaos_agent.config.settings import settings
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode
 from chaos_agent.server.routes import inject_router
@@ -25,57 +26,37 @@ async def inject_fault(request: InjectRequest, req: Request):
     if task_tracker.is_shutting_down:
         return JSONEnvelope.fail(code=ResponseCode.SERVER_SHUTTING_DOWN, message="Server is shutting down", request_id=getattr(req.state, "request_id", ""))
 
+    # Lifespan deferred ``create_agent`` because LLM config wasn't
+    # set yet — the TUI should redirect to the setup wizard rather
+    # than receive a 500 from the OpenAIError we'd raise downstream.
+    if agents is None:
+        return JSONEnvelope.fail(
+            code=ResponseCode.NEEDS_SETUP,
+            message="LLM config missing; run the setup wizard first.",
+            request_id=getattr(req.state, "request_id", ""),
+        )
+
     # Runtime override: kubeconfig/context from request
     if request.kubeconfig:
         settings.kubeconfig_path = request.kubeconfig
     if request.context:
         settings.kube_context = request.context
 
-    # Build initial state
-    if request.input and not all([request.scope, request.target, request.action, request.target_name, request.namespace]):
-        # NL mode: minimal initial state, Agent infers from description
-        initial_state = {
-            "task_id": task_id,
-            "tui_session_id": "",
-            "operation": "inject",
-            "target": None,
-            "params": request.params or {},
-            "params_flags": request.params_flags or [],
-            "needs_confirmation": request.confirm,
-            "safety_status": "pending",
-            "input": request.input,
-            "direct": request.direct,
-            "blade_scope": request.scope,
-            "blade_target": request.target,
-            "blade_action": request.action,
-            "kubeconfig": request.kubeconfig or settings.kubeconfig_path,
-            "kube_context": request.context or settings.kube_context,
-        }
-        target_names = []
-    else:
-        # Structured mode: target info from explicit params
-        target_names = [n.strip() for n in request.target_name.split(",")] if request.target_name else []
-        initial_state = {
-            "task_id": task_id,
-            "tui_session_id": "",
-            "operation": "inject",
-            "target": {
-                "namespace": request.namespace,
-                "resource_type": request.scope,
-                "names": target_names,
-                "labels": request.labels or {},
-            },
-            "params": request.params or {},
-            "params_flags": request.params_flags or [],
-            "needs_confirmation": request.confirm,
-            "safety_status": "pending",
-            "direct": request.direct,
-            "blade_scope": request.scope,
-            "blade_target": request.target,
-            "blade_action": request.action,
-            "kubeconfig": request.kubeconfig or settings.kubeconfig_path,
-            "kube_context": request.context or settings.kube_context,
-        }
+    # Build initial state. FaultSpec is the single source of truth for
+    # fault identity + tuning; consumers read via ``read_fault_spec``.
+    spec = FaultSpec.from_http_request(request)
+    target_names = list(spec.names)
+    initial_state = {
+        "task_id": task_id,
+        "tui_session_id": "",
+        "operation": "inject",
+        "fault_spec": spec.to_dict(),
+        "needs_confirmation": request.confirm,
+        "safety_status": "pending",
+        "direct": request.direct,
+        "kubeconfig": request.kubeconfig or settings.kubeconfig_path,
+        "kube_context": request.context or settings.kube_context,
+    }
 
     # Execute inject graph asynchronously
     config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}

@@ -283,26 +283,37 @@ const InputRow: React.FC<{
   mask?: boolean;
 }> = ({ label, value, placeholder, mask = false }) => {
   const masked = mask ? "•".repeat(Math.max(0, value.length - 4)) + value.slice(-4) : value;
+  // DO NOT wrap the value+cursor in a ``<Box flexGrow={1}>``. flexGrow
+  // forces Yoga to assign that Box a fixed pixel-width slot equal to
+  // ``row_width - label_width``. Every keystroke remeasures the
+  // contained Text against that slot; for CJK input where
+  // ``string-width``'s cell count disagrees with the terminal by even
+  // 1 cell, the text overflows the slot and Yoga reflows the row to
+  // 2 logical rows. Ink's incremental renderer writes the new frame
+  // 1 line below the old anchor, leaving the previous frame's tail
+  // row as a ghost blank — visible as "每按一次输入多一行空格".
+  //
+  // Plain Box (no flexGrow) sizes itself to its content, same shape
+  // as ``InputPrompt`` and Select's inline-input row, which both
+  // re-render cleanly per keystroke without growing the frame.
   return (
     <Box>
       <Box minWidth={FIELD_LABEL_WIDTH} flexShrink={0}>
         <Text color={Theme.gray[500]}>{label}</Text>
       </Box>
-      <Box flexGrow={1}>
-        {value.length === 0 ? (
-          <>
-            <Text color={Theme.forge.fire}>▌</Text>
-            {placeholder && (
-              <Text color={Theme.text.secondary}>{` ${placeholder}`}</Text>
-            )}
-          </>
-        ) : (
-          <>
-            <Text bold>{masked}</Text>
-            <Text color={Theme.forge.fire}>▌</Text>
-          </>
-        )}
-      </Box>
+      {value.length === 0 ? (
+        <>
+          <Text color={Theme.forge.fire}>▌</Text>
+          {placeholder && (
+            <Text color={Theme.text.secondary}>{` ${placeholder}`}</Text>
+          )}
+        </>
+      ) : (
+        <>
+          <Text bold>{masked}</Text>
+          <Text color={Theme.forge.fire}>▌</Text>
+        </>
+      )}
     </Box>
   );
 };
@@ -337,6 +348,7 @@ function renderWelcomeStep() {
 function renderModelStep(
   state: WizardState,
   focusedRadioIdx: number,
+  inputBuffer: string,
 ) {
   const presets = state.modelPresets;
   if (state.values.model_is_custom) {
@@ -346,7 +358,7 @@ function renderModelStep(
         <Box marginTop={1}>
           <InputRow
             label={t("wizard.model.label")}
-            value={state.values.model_name}
+            value={inputBuffer}
             placeholder={t("wizard.model.placeholder")}
           />
         </Box>
@@ -392,14 +404,14 @@ function renderModelStep(
   );
 }
 
-function renderApiUrlStep(state: WizardState) {
+function renderApiUrlStep(state: WizardState, inputBuffer: string) {
   return (
     <>
       <SectionHeading label={t("wizard.api_url.section")} />
       <Box marginTop={1}>
         <InputRow
           label={t("wizard.api_url.label")}
-          value={state.values.api_base_url}
+          value={inputBuffer}
           placeholder="https://api.example.com/v1"
         />
       </Box>
@@ -410,14 +422,14 @@ function renderApiUrlStep(state: WizardState) {
   );
 }
 
-function renderApiKeyStep(state: WizardState) {
+function renderApiKeyStep(state: WizardState, inputBuffer: string) {
   return (
     <>
       <SectionHeading label={t("wizard.api_key.section")} />
       <Box marginTop={1}>
         <InputRow
           label={t("wizard.api_key.label")}
-          value={state.values.llm_api_key}
+          value={inputBuffer}
           placeholder="sk-..."
           mask
         />
@@ -429,14 +441,14 @@ function renderApiKeyStep(state: WizardState) {
   );
 }
 
-function renderKubeconfigStep(state: WizardState) {
+function renderKubeconfigStep(state: WizardState, inputBuffer: string) {
   return (
     <>
       <SectionHeading label={t("wizard.kubeconfig.section")} />
       <Box marginTop={1}>
         <InputRow
           label={t("wizard.kubeconfig.label")}
-          value={state.values.kubeconfig_path}
+          value={inputBuffer}
           placeholder="~/.kube/config"
         />
       </Box>
@@ -806,8 +818,17 @@ export const WizardCard: React.FC<{
       dispatch({ type: "STEP_BACK" });
       return;
     }
-    // 1-8 digit: jump to completed step
-    if (input && /^[1-9]$/.test(input)) {
+    // 1-8 digit: jump to completed step. SUPPRESSED inside text-input
+    // steps because users legitimately type digits there (port in a
+    // URL, secrets containing digits, the digits a CJK IME emits when
+    // committing a candidate via 1/2/3/4). Falling through to the
+    // step's text-input handler is what we want in those cases.
+    const isTextInputStep =
+      state.currentStep === "api_url" ||
+      state.currentStep === "api_key" ||
+      state.currentStep === "kubeconfig" ||
+      (state.currentStep === "model" && state.values.model_is_custom);
+    if (!isTextInputStep && input && /^[1-9]$/.test(input)) {
       const idx = parseInt(input, 10) - 1;
       if (idx < STEP_ORDER.length) {
         const target = STEP_ORDER[idx];
@@ -951,13 +972,13 @@ export const WizardCard: React.FC<{
       case "welcome":
         return renderWelcomeStep();
       case "model":
-        return renderModelStep(state, safeFocusedIdx);
+        return renderModelStep(state, safeFocusedIdx, inputBuffer);
       case "api_url":
-        return renderApiUrlStep(state);
+        return renderApiUrlStep(state, inputBuffer);
       case "api_key":
-        return renderApiKeyStep(state);
+        return renderApiKeyStep(state, inputBuffer);
       case "kubeconfig":
-        return renderKubeconfigStep(state);
+        return renderKubeconfigStep(state, inputBuffer);
       case "kube_context":
         return renderKubeContextStep(state, safeFocusedIdx);
       case "permission":
@@ -1023,6 +1044,27 @@ export const WizardCard: React.FC<{
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
+/** Strip terminal control bytes (CR / LF / TAB / 0x00-0x1F / 0x7F) from
+ *  a chunk before it lands in the input buffer.
+ *
+ *  Why this matters for the wizard:
+ *    Chinese IMEs on macOS (and some Windows IMEs) commit a candidate
+ *    selection by sending the chosen characters together with a stray
+ *    ``\r`` or ``\n`` in the same input chunk. Rendering that buffer
+ *    via ``<Text>{value}</Text>`` then makes the row span two terminal
+ *    rows — visible as "每按一次输入法选词多一行空格" because Ink's
+ *    incremental renderer writes the new (taller) frame below the old
+ *    anchor without erasing the trailing empty cell of the previous
+ *    frame.
+ *
+ *  Filtering printable-only here matches what ``InputPrompt`` does at
+ *  the Composer layer for the same reason — the slash-menu code there
+ *  ignores any chunk that's just a single non-printable byte. */
+const CONTROL_BYTE_RE = /[\x00-\x1F\x7F]/g;
+function stripControlBytes(input: string): string {
+  return input.replace(CONTROL_BYTE_RE, "");
+}
+
 /** Handle character / backspace / delete on a text input buffer. */
 function handleTextInput(
   input: string,
@@ -1046,8 +1088,9 @@ function handleTextInput(
   ) {
     return;
   }
-  if (input && input.length > 0) {
-    setBuffer((s) => s + input);
+  const sanitized = input ? stripControlBytes(input) : "";
+  if (sanitized.length > 0) {
+    setBuffer((s) => s + sanitized);
   }
 }
 

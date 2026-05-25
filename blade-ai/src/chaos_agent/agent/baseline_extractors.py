@@ -152,8 +152,9 @@ def extract_pod_top_metrics(stdout: str, state: dict) -> dict[str, Any]:
     fresh ``kubectl top`` (see ``direct_execute._fetch_pod_memory_usage_mb``
     for the canonical fallback pattern).
     """
-    target_info = state.get("target") or {}
-    names = target_info.get("names") or []
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    spec = read_fault_spec(state)
+    names = list(spec.names) if spec else []
     if not names:
         return {}
     target_pod = names[0]

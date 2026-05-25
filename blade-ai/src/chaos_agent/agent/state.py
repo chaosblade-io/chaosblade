@@ -355,29 +355,24 @@ def build_status_data(task_id: str, values: dict) -> dict:
     Used by both CLI AgentRunner.status() and Server status route.
     """
 
+    from chaos_agent.agent.fault_spec import FaultSpec
+
     skill_name = values.get("skill_name") or ""
     blade_uid = values.get("blade_uid") or ""
-    blade_params = values.get("params") or {}
-    target = values.get("target") or {}
+    spec = FaultSpec.from_dict(values.get("fault_spec"))
+    blade_params = dict(spec.params) if spec else {}
+    target = {
+        "namespace": spec.namespace if spec else "",
+        "names": list(spec.names) if spec else [],
+        "labels": dict(spec.labels) if spec else {},
+        "resource_type": spec.scope if spec else "",
+    }
     verification = values.get("verification")
     error = values.get("error")
     safety_reason = values.get("safety_reason") or ""
 
-    # Infer fault_type from state fields or blade params
-    fault_type = ""
-    # Priority 1: blade_scope/blade_target/blade_action from structured params
-    if values.get("blade_scope") and values.get("blade_target") and values.get("blade_action"):
-        fault_type = f"{values['blade_scope']}-{values['blade_target']}-{values['blade_action']}"
-    # Priority 2: from blade_params dict (LLM mode)
-    if not fault_type and blade_params:
-        scope = blade_params.get("scope", "")
-        action = blade_params.get("action", "")
-        target_action = blade_params.get("target", "")
-        if scope and target_action and action:
-            fault_type = f"{scope}-{target_action}-{action}"
-    # Priority 3: skill_name fallback
-    if not fault_type:
-        fault_type = skill_name
+    # Infer fault_type from spec; fall back to skill_name
+    fault_type = spec.fault_type if (spec and spec.fault_type) else skill_name
 
     # Timestamps
     created_at = values.get("created_at") or ""
@@ -446,13 +441,9 @@ class AgentState(MessagesState):
     # Skill matching
     skill_name: Optional[str] = None
 
-    # Target specification
-    target: Optional[dict] = None  # {namespace, names, labels, resource_type}
-
-    # Fault parameters
-    params: Optional[dict] = None
-
-    # Natural language description (NL mode)
+    # Natural language description (NL mode entry, used only by entry-
+    # point routing — not authoritative for fault context, which lives
+    # on ``fault_spec.user_description`` after FaultSpec construction).
     input: Optional[str] = None
 
     # Safety assessment
@@ -573,14 +564,14 @@ class AgentState(MessagesState):
     # Injection verification summary (Layer 2 observations from inject phase, used as baseline for recover)
     inject_verification_summary: Optional[str] = None
 
-    # Structured fault parameters (direct mode + LLM mode hints)
-    blade_scope: Optional[str] = None    # node / pod / container
-    blade_target: Optional[str] = None   # cpu / network / disk / ...
-    blade_action: Optional[str] = None   # fullload / delay / loss / ...
+    # ``direct`` mode flag — entry-point routing only, not part of
+    # FaultSpec because the spec describes WHAT to inject, not the
+    # execution-path choice (direct vs LLM ReAct).
     direct: bool = False                 # True: skip LLM, go direct path
-    duration: int = 0                    # Fault duration in seconds (user-specified via --duration/-d)
-    params_flags: Optional[list] = None  # Boolean bare-key flags ["read", "write"]
-    blade_parsed_flags: Optional[dict] = None  # Parsed key params from flags: {"path": "/tmp", "percent": "85", ...}
+    # Parsed key params from blade flags (runtime artefact of
+    # ``execute_loop`` parsing the LLM's ``blade_create`` invocation —
+    # downstream verifier consumes ``state.blade_parsed_flags``).
+    blade_parsed_flags: Optional[dict] = None  # {"path": "/tmp", "percent": "85", ...}
 
     # Original replicas for kubectl scale-based faults (resource_name -> replica_count)
     # Used to safely restore replicas after scale-down injection
@@ -608,7 +599,6 @@ class AgentState(MessagesState):
     dialogue_round: int = 0                      # Overall dialogue round tracking (chat + clarification)
     intent_reasoning: Optional[str] = None       # LLM classification reasoning (audit trail)
     needs_task_selection: bool = False            # RECOVER intent needs user to pick a task
-    fault_intent: Optional[dict] = None          # Structured fault intent from intent_clarification
 
     # Dry-Run multi-turn planning (TUI `/plan`).
     # When True: confirmation_gate emits a "what would happen" AIMessage and
@@ -616,3 +606,50 @@ class AgentState(MessagesState):
     # can iterate the plan over multiple turns and finally call `/run` (no
     # args) which sets dry_run=False and re-invokes the pipeline.
     dry_run: bool = False
+
+    # Single source of truth for "what fault to inject where".
+    # Populated at every entry point (CLI structured / CLI NL / HTTP API
+    # / TUI / direct) via ``FaultSpec.from_*`` constructors; rewritten
+    # by ``intent_clarification`` once the LLM emits ``submit_fault_intent``
+    # in NL flows. Consumers read it via ``read_fault_spec(state)`` and
+    # get back a strongly-typed ``FaultSpec`` instance. See
+    # ``chaos_agent.agent.fault_spec`` for the dataclass and constructors.
+    #
+    # Schema (dict form for LangGraph checkpoint compat):
+    #   {namespace, scope, names: list[str], labels: dict[str, str],
+    #    blade_target, blade_action, params: dict[str, str],
+    #    params_flags: list[str], duration_seconds: int,
+    #    source: str, user_description: str}
+    #
+    # ``None`` = no fault context yet (rare; would only happen if a
+    # caller bypasses the entry-point constructors).
+    fault_spec: Optional[dict] = None
+
+    # Target-drift guard — frozen snapshot of "what the user approved".
+    # Populated by ``confirmation_gate`` when the user accepts a plan;
+    # consumed by the screener node in front of ``execute_loop``'s
+    # ToolNode (see ``chaos_agent.agent.target_guard``). Cleared on
+    # TURN_DONE / TURN_ABORTED / replan so the next confirmation_gate
+    # freezes a fresh approval. Schema mirrors
+    # ``target_guard.ApprovedTarget`` (dict form for LangGraph
+    # serialisability):
+    #   {scope, namespace, names: list[str], labels: dict[str, str],
+    #    is_namespace_wide: bool, blade_target, blade_action,
+    #    lock_fault_type: bool}
+    # ``None`` = no approval on record (planning phase, or post-cleanup).
+    approved_target: Optional[dict] = None
+
+    # Transient routing hint written by the two screeners (one per
+    # phase) and consumed by their respective ``route_after_*``
+    # dispatcher on the next conditional edge:
+    #   - ``phase1_screener``    writes "pass" or "retry"
+    #     (consumed by ``route_after_phase1_screener``)
+    #   - ``tool_screener``      writes "pass", "replan", or "retry"
+    #     (consumed by ``route_after_screener``)
+    # The field is shared because (a) the two screeners run in
+    # disjoint graph regions (phase 1 = before confirmation, phase 2 =
+    # after baseline_capture), so values never collide; (b) every
+    # screener invocation overwrites the field at function entry, so
+    # no stale value can leak from one pass to another. Not meant for
+    # cross-turn persistence.
+    screener_route: Optional[str] = None

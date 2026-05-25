@@ -568,15 +568,18 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             # P1: Use build_system_prompt with PromptMode dispatch
             from chaos_agent.agent.prompts import build_system_prompt, PromptMode
             from chaos_agent.agent.env_info import compute_env_info
+            from chaos_agent.agent.fault_spec import read_fault_spec
             plan = state.get("plan")
             plan_path = state.get("plan_path")
-            # Build structured_params_hint from blade_scope/blade_target/blade_action
-            blade_scope = state.get("blade_scope")
-            blade_target = state.get("blade_target")
-            blade_action = state.get("blade_action")
+            # Build structured_params_hint from FaultSpec
+            _spec_for_hint = read_fault_spec(state)
             structured_params_hint = ""
-            if blade_scope and blade_target and blade_action:
-                structured_params_hint = f"scope={blade_scope}, target={blade_target}, action={blade_action}"
+            if _spec_for_hint and _spec_for_hint.is_complete:
+                structured_params_hint = (
+                    f"scope={_spec_for_hint.scope}, "
+                    f"target={_spec_for_hint.blade_target}, "
+                    f"action={_spec_for_hint.blade_action}"
+                )
             # Resolve env_info: prefer constructor arg, fallback to dynamic computation
             resolved_env_info = env_info or await compute_env_info(task_id)
             execute_prompt = build_system_prompt(
@@ -666,10 +669,11 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 tc_name, tc_args = extract_tool_call_fields(tc)
 
                 if tc_name == "blade_create":
-                    result["params"] = tc_args
-                    result["blade_scope"] = tc_args.get("scope")
-                    result["blade_target"] = tc_args.get("target")
-                    result["blade_action"] = tc_args.get("action")
+                    # Note: scope/target/action/params are NOT written back
+                    # to state — they're already pinned on fault_spec by
+                    # intent_clarification and target_guard prevents drift.
+                    # Mid-loop write would create stale duplicates that
+                    # mask the user-approved values.
                     # Parse key parameters from flags string for verifier consumption
                     flags_str = tc_args.get("flags", "")
                     if flags_str:
@@ -677,13 +681,11 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                         parsed = parse_blade_flags(flags_str)
                         if parsed:
                             result["blade_parsed_flags"] = parsed
-                    # Extract namespace from blade_create to ensure target has it
-                    # (LLM may pass namespace even for node-scope faults as context metadata)
-                    if tc_args.get("namespace"):
-                        target = result.get("target") or state.get("target") or {}
-                        if not target.get("namespace"):
-                            target["namespace"] = tc_args["namespace"]
-                            result["target"] = target
+                    # Namespace harvest from LLM-emitted blade_create no longer
+                    # writes to state.target — fault_spec is the source of
+                    # truth and target_guard intercepts any drift. The LLM
+                    # passing a different namespace than approved would have
+                    # been logged by the screener.
                     logger.info(f"Blade create params: {tc_args}")
 
                     # FCAT P0: param safety guard for LLM mode
@@ -692,9 +694,11 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     from chaos_agent.utils.fault_context import (
                         lookup_adaptations, compute_safe_burn_size,
                     )
-                    _scope = state.get("blade_scope") or tc_args.get("scope", "")
-                    _target = state.get("blade_target") or tc_args.get("target", "")
-                    _action = state.get("blade_action") or tc_args.get("action", "")
+                    from chaos_agent.agent.fault_spec import read_fault_spec as _rfs
+                    _spec_for_fcat = _rfs(state)
+                    _scope = (_spec_for_fcat.scope if _spec_for_fcat else "") or tc_args.get("scope", "")
+                    _target = (_spec_for_fcat.blade_target if _spec_for_fcat else "") or tc_args.get("target", "")
+                    _action = (_spec_for_fcat.blade_action if _spec_for_fcat else "") or tc_args.get("action", "")
                     adaptations = lookup_adaptations(
                         _scope, _target, _action, target_metadata,
                         rule_type="param_override",
@@ -747,11 +751,12 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     if "blade" in v_args and "create" in v_args:
                         parsed = _parse_blade_create_from_v_args(v_args)
                         if parsed:
-                            result["params"] = parsed
-                            result["blade_scope"] = parsed["scope"]
-                            result["blade_target"] = parsed["target"]
-                            result["blade_action"] = parsed["action"]
-                            # Parse key parameters from flags for verifier consumption
+                            # Same reasoning as the blade_create branch above:
+                            # scope/target/action/params are pinned on
+                            # fault_spec and target_guard prevents drift,
+                            # so we don't shadow them with LLM-derived
+                            # values here. Only blade_parsed_flags (a
+                            # pure runtime artefact) is harvested.
                             flags_str = parsed.get("flags", "")
                             if flags_str:
                                 from chaos_agent.utils.fault_type import parse_blade_flags
@@ -879,6 +884,12 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     result["execute_loop_count"] = 0
                 # Clear error (moved to replan_context, global error triggers "end")
                 result["error"] = None
+                # Clear the frozen approved_target so the next
+                # confirmation_gate (after agent_loop re-plans) freezes
+                # a fresh approval. Without this, the screener would
+                # compare new tool_calls against the stale approval
+                # whose plan we just decided to abandon.
+                result["approved_target"] = None
                 # Conditionally preserve blade_uid
                 if not replan_context.get("existing_blade_uids"):
                     result["blade_uid"] = None
@@ -905,7 +916,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 )
                 attempt_delta = begin_attempt(
                     {**state, **result},
-                    target=state.get("target"),
+                    target=state.get("fault_spec"),
                     reason=REASON_GRAPH_REPLAN,
                     notes=replan_context.get("error_summary", "")[:200],
                 )

@@ -98,10 +98,34 @@ async def lifespan(app: FastAPI):
     prereq_checker = PrerequisitesChecker()
     await prereq_checker.check_startup_prerequisites(registry)
 
-    # Create agents with checkpointer
-    agents = await create_agent(registry)
-    app.state.agents = agents
-    app.state.checkpointer = agents.get("checkpointer")
+    # First-run gate: skip create_agent when essential LLM config is
+    # missing. ``make_llm()`` calls ``ChatOpenAI(api_key=...)`` which
+    # raises ``OpenAIError`` immediately on an empty api_key — that
+    # would crash the lifespan startup and the backend would never
+    # become reachable. But the TS TUI's BootRunner needs the backend
+    # to be alive to call ``/api/v1/wizard/needs-setup`` and render
+    # the setup wizard. The wizard's ``/save`` endpoint calls
+    # ``maybe_rebuild_agents`` afterwards which builds the graph
+    # against the now-complete config — so we just defer construction
+    # until then.
+    from chaos_agent.config.wizard_validators import (
+        missing_essential_config,
+    )
+    _missing = missing_essential_config()
+    if _missing:
+        logger.warning(
+            "Essential LLM config missing (%s); skipping agent "
+            "creation. Wizard /save will build agents once config "
+            "is complete.",
+            ", ".join(_missing),
+        )
+        agents: dict = {}
+        app.state.agents = None
+        app.state.checkpointer = None
+    else:
+        agents = await create_agent(registry)
+        app.state.agents = agents
+        app.state.checkpointer = agents.get("checkpointer")
 
     # Initialize task tracker for graceful shutdown
     task_tracker = TaskTracker()
@@ -150,8 +174,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"TUI session sweep failed: {e}")
 
-    # Close checkpointer connection
-    conn = agents.get("checkpointer_conn")
+    # Close checkpointer connection. Read from app.state (not the
+    # local ``agents`` captured at startup) so that a wizard /save
+    # which rebuilt the graph mid-lifecycle gets its checkpointer
+    # cleaned up too — otherwise the new aiosqlite fd leaks.
+    _current_agents = getattr(app.state, "agents", None) or {}
+    conn = _current_agents.get("checkpointer_conn")
     if conn is not None:
         try:
             await conn.close()
@@ -160,7 +188,7 @@ async def lifespan(app: FastAPI):
             logger.warning(f"Failed to close checkpointer connection: {e}")
 
     # Close checkpointer
-    checkpointer = agents.get("checkpointer")
+    checkpointer = _current_agents.get("checkpointer")
     if checkpointer and hasattr(checkpointer, "close"):
         await checkpointer.close()
 

@@ -15,6 +15,7 @@ from typing import Optional
 
 from chaos_agent import __version__
 from chaos_agent.agent.factory import create_agent
+from chaos_agent.agent.fault_spec import FaultSpec
 from chaos_agent.agent.streaming import StreamEvent, parse_stream_event
 from chaos_agent.config.settings import settings
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode, build_inject_envelope
@@ -407,56 +408,32 @@ class AgentRunner:
         task_id = f"task-{uuid.uuid4()}"
         tui_session_id = kwargs.get("tui_session_id", "") or ""
 
-        # Build initial state (same logic as inject)
+        # Build initial state. FaultSpec is the single source of truth
+        # for fault identity + tuning — entry points construct it and
+        # no longer write the legacy scattered fields. Consumers read
+        # via ``read_fault_spec(state)``.
         _ts = now_iso()
         _interaction_mode = kwargs.get("interaction_mode", "cli")
         _dry_run = bool(kwargs.get("dry_run", False))
         if kwargs.get("input"):
-            initial_state = {
-                "task_id": task_id,
-                "tui_session_id": tui_session_id,
-                "operation": "inject",
-                "target": None,
-                "params": kwargs.get("params") or {},
-                "needs_confirmation": kwargs.get("confirm", False),
-                "safety_status": "pending",
-                "input": kwargs["input"],
-                "kubeconfig": kwargs.get("kubeconfig", ""),
-                "kube_context": kwargs.get("context", ""),
-                "created_at": _ts,
-                "direct": False,
-                "duration": kwargs.get("duration", 0),
-                "interaction_mode": _interaction_mode,
-                "dry_run": _dry_run,
-            }
-            target_names = []
+            spec = FaultSpec.from_cli_nl(input_text=kwargs["input"], kwargs=kwargs)
         else:
-            target_names = [n.strip() for n in kwargs["target_name"].split(",")] if kwargs.get("target_name") else []
-            initial_state = {
-                "task_id": task_id,
-                "tui_session_id": tui_session_id,
-                "operation": "inject",
-                "target": {
-                    "namespace": kwargs["namespace"],
-                    "resource_type": kwargs.get("scope", ""),
-                    "names": target_names,
-                    "labels": kwargs.get("labels") or {},
-                },
-                "params": kwargs.get("params") or {},
-                "needs_confirmation": kwargs.get("confirm", False),
-                "safety_status": "pending",
-                "kubeconfig": kwargs.get("kubeconfig", ""),
-                "kube_context": kwargs.get("context", ""),
-                "created_at": _ts,
-                "blade_scope": kwargs.get("scope"),
-                "blade_target": kwargs.get("target"),
-                "blade_action": kwargs.get("action"),
-                "direct": kwargs.get("direct", False),
-                "params_flags": kwargs.get("params_flags"),
-                "duration": kwargs.get("duration", 0),
-                "interaction_mode": _interaction_mode,
-                "dry_run": _dry_run,
-            }
+            spec = FaultSpec.from_cli_structured(kwargs)
+        target_names = list(spec.names)
+        initial_state = {
+            "task_id": task_id,
+            "tui_session_id": tui_session_id,
+            "operation": "inject",
+            "fault_spec": spec.to_dict(),
+            "needs_confirmation": kwargs.get("confirm", False),
+            "safety_status": "pending",
+            "kubeconfig": kwargs.get("kubeconfig", ""),
+            "kube_context": kwargs.get("context", ""),
+            "created_at": _ts,
+            "direct": kwargs.get("direct", False) if not kwargs.get("input") else False,
+            "interaction_mode": _interaction_mode,
+            "dry_run": _dry_run,
+        }
 
         config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
         graph = self._agents["inject"]
@@ -673,27 +650,19 @@ class AgentRunner:
                     return
 
                 # Fault injection result
+                from chaos_agent.agent.fault_spec import (
+                    legacy_params_dict, legacy_target_dict, read_fault_spec,
+                )
                 safety_status = values.get("safety_status", "unknown")
-                result_target = values.get("target", {}) or {}
-                blade_params = values.get("params") or {}
-                ns = result_target.get("namespace") or kwargs.get("namespace") or blade_params.get("namespace") or ""
+                result_target = legacy_target_dict(values)
+                blade_params = legacy_params_dict(values)
+                ns = result_target.get("namespace") or kwargs.get("namespace") or ""
                 names = result_target.get("names") or target_names or [kwargs.get("target_name", "")]
-                fault_type = ""
-                # Priority 1: from CLI structured params
-                if kwargs.get("scope") and kwargs.get("target") and kwargs.get("action"):
-                    fault_type = f"{kwargs['scope']}-{kwargs['target']}-{kwargs['action']}"
-                blade_params = values.get("params") or {}
-
-                # Priority 2: from blade_params (LLM mode)
-                if not fault_type and blade_params:
-                    scope = blade_params.get("scope", "")
-                    action = blade_params.get("action", "")
-                    target_action = blade_params.get("target", "")
-                    if scope and target_action and action:
-                        fault_type = f"{scope}-{target_action}-{action}"
-                # Priority 3: skill_name fallback
-                if not fault_type:
-                    fault_type = skill_name
+                _spec = read_fault_spec(values)
+                fault_type = (
+                    _spec.fault_type if (_spec and _spec.fault_type)
+                    else skill_name or ""
+                )
 
                 from chaos_agent.memory.session_store import build_verification_simple
                 verification = values.get("verification")
@@ -852,52 +821,27 @@ class AgentRunner:
         task_id = f"task-{uuid.uuid4()}"
         tui_session_id = kwargs.get("tui_session_id", "") or ""
 
-        # NL mode: minimal initial state, Agent infers everything from description
+        # Same single-source-of-truth pattern as inject_stream: FaultSpec
+        # only, no legacy scattered fields.
         _ts2 = now_iso()
         if kwargs.get("input"):
-            initial_state = {
-                "task_id": task_id,
-                "tui_session_id": tui_session_id,
-                "operation": "inject",
-                "target": None,
-                "params": kwargs.get("params") or {},
-                "needs_confirmation": kwargs.get("confirm", False),
-                "safety_status": "pending",
-                "input": kwargs["input"],
-                "kubeconfig": kwargs.get("kubeconfig", ""),
-                "kube_context": kwargs.get("context", ""),
-                "created_at": _ts2,
-                "direct": False,
-                "duration": kwargs.get("duration", 0),
-                "interaction_mode": "cli",
-            }
-            target_names = []
+            spec = FaultSpec.from_cli_nl(input_text=kwargs["input"], kwargs=kwargs)
         else:
-            target_names = [n.strip() for n in kwargs["target_name"].split(",")] if kwargs.get("target_name") else []
-            initial_state = {
-                "task_id": task_id,
-                "tui_session_id": tui_session_id,
-                "operation": "inject",
-                "target": {
-                    "namespace": kwargs["namespace"],
-                    "resource_type": kwargs.get("scope", ""),
-                    "names": target_names,
-                    "labels": kwargs.get("labels") or {},
-                },
-                "params": kwargs.get("params") or {},
-                "needs_confirmation": kwargs.get("confirm", False),
-                "safety_status": "pending",
-                "kubeconfig": kwargs.get("kubeconfig", ""),
-                "kube_context": kwargs.get("context", ""),
-                "created_at": _ts2,
-                "blade_scope": kwargs.get("scope"),
-                "blade_target": kwargs.get("target"),
-                "blade_action": kwargs.get("action"),
-                "direct": kwargs.get("direct", False),
-                "params_flags": kwargs.get("params_flags"),
-                "duration": kwargs.get("duration", 0),
-                "interaction_mode": "cli",
-            }
+            spec = FaultSpec.from_cli_structured(kwargs)
+        target_names = list(spec.names)
+        initial_state = {
+            "task_id": task_id,
+            "tui_session_id": tui_session_id,
+            "operation": "inject",
+            "fault_spec": spec.to_dict(),
+            "needs_confirmation": kwargs.get("confirm", False),
+            "safety_status": "pending",
+            "kubeconfig": kwargs.get("kubeconfig", ""),
+            "kube_context": kwargs.get("context", ""),
+            "created_at": _ts2,
+            "direct": kwargs.get("direct", False) if not kwargs.get("input") else False,
+            "interaction_mode": "cli",
+        }
 
         config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
 
@@ -956,6 +900,7 @@ class AgentRunner:
                     )
 
             # Build response from graph result
+            from chaos_agent.agent.fault_spec import legacy_target_dict
             safety_status = "approved"
             plan_summary = ""
             blade_uid = ""
@@ -966,7 +911,7 @@ class AgentRunner:
                 safety_status = result.get("safety_status", "approved")
                 plan_summary = result.get("plan_summary", "")
                 blade_uid = result.get("blade_uid", "")
-                result_target = result.get("target", {}) or {}
+                result_target = legacy_target_dict(result)
                 skill_name = result.get("skill_name", "")
                 verification = result.get("verification")
 
@@ -1260,20 +1205,19 @@ class AgentRunner:
                     if task_state == "injecting":
                         task_state = "injected"
 
-                    result_target = values.get("target", {}) or {}
-                    blade_params = values.get("params") or {}
-                    ns = result_target.get("namespace") or blade_params.get("namespace") or ""
+                    from chaos_agent.agent.fault_spec import (
+                        legacy_params_dict, legacy_target_dict, read_fault_spec,
+                    )
+                    result_target = legacy_target_dict(values)
+                    blade_params = legacy_params_dict(values)
+                    ns = result_target.get("namespace") or ""
                     names = result_target.get("names") or []
                     skill_name = values.get("skill_name", "")
-                    fault_type = ""
-                    if blade_params:
-                        scope = blade_params.get("scope", "")
-                        action = blade_params.get("action", "")
-                        target_action = blade_params.get("target", "")
-                        if scope and target_action and action:
-                            fault_type = f"{scope}-{target_action}-{action}"
-                    if not fault_type:
-                        fault_type = skill_name
+                    _spec_for_ft = read_fault_spec(values)
+                    fault_type = (
+                        _spec_for_ft.fault_type if (_spec_for_ft and _spec_for_ft.fault_type)
+                        else skill_name or ""
+                    )
 
                     merged_error = values.get("failure_reason") or values.get("error") or ""
                     yield StreamEvent(
@@ -1565,20 +1509,19 @@ class AgentRunner:
                     task_state = infer_task_state(values)
                     if task_state == "injecting":
                         task_state = "injected"
-                    result_target = values.get("target", {}) or {}
-                    blade_params = values.get("params") or {}
-                    ns = result_target.get("namespace") or blade_params.get("namespace") or ""
+                    from chaos_agent.agent.fault_spec import (
+                        legacy_params_dict, legacy_target_dict, read_fault_spec,
+                    )
+                    result_target = legacy_target_dict(values)
+                    blade_params = legacy_params_dict(values)
+                    ns = result_target.get("namespace") or ""
                     names = result_target.get("names") or []
                     skill_name = values.get("skill_name", "")
-                    fault_type = ""
-                    if blade_params:
-                        scope = blade_params.get("scope", "")
-                        action = blade_params.get("action", "")
-                        target_action = blade_params.get("target", "")
-                        if scope and target_action and action:
-                            fault_type = f"{scope}-{target_action}-{action}"
-                    if not fault_type:
-                        fault_type = skill_name
+                    _spec_for_ft = read_fault_spec(values)
+                    fault_type = (
+                        _spec_for_ft.fault_type if (_spec_for_ft and _spec_for_ft.fault_type)
+                        else skill_name or ""
+                    )
                     merged_error = values.get("failure_reason") or values.get("error") or ""
                     yield StreamEvent(
                         type="result",
