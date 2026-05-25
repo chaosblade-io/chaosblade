@@ -8,6 +8,7 @@ import uuid
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
+from chaos_agent.agent.fault_spec import FaultSpec
 from chaos_agent.agent.state import extract_ui_diagnostics, strip_side_effects
 from chaos_agent.agent.streaming import StreamEvent, parse_stream_event
 from chaos_agent.config.settings import settings
@@ -41,50 +42,39 @@ async def inject_stream(request: InjectRequest, req: Request):
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
 
+    # First-run gate — see inject.py for the rationale.
+    if agents is None:
+        return StreamingResponse(
+            iter([StreamEvent(
+                type="error",
+                content="LLM config missing; run the setup wizard first.",
+                task_id=task_id,
+            ).to_sse()]),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
     # Runtime override
     if request.kubeconfig:
         settings.kubeconfig_path = request.kubeconfig
     if request.context:
         settings.kube_context = request.context
 
-    # Build initial state
-    if request.input and not all([request.fault_type, request.target_type, request.target_name, request.namespace]):
-        initial_state = {
-            "task_id": task_id,
-            "tui_session_id": "",
-            "operation": "inject",
-            "target": None,
-            "params": request.params or {},
-            "needs_confirmation": request.confirm,
-            "safety_status": "pending",
-            "input": request.input,
-            "kubeconfig": request.kubeconfig or settings.kubeconfig_path,
-            "kube_context": request.context or settings.kube_context,
-        }
-        target_names = []
-    else:
-        target_names = [n.strip() for n in request.target_name.split(",")]
-        initial_state = {
-            "task_id": task_id,
-            "tui_session_id": "",
-            "operation": "inject",
-            "target": {
-                "namespace": request.namespace,
-                "resource_type": request.target_type,
-                "names": target_names,
-            },
-            "params": request.params or {},
-            "needs_confirmation": request.confirm,
-            "safety_status": "pending",
-            "kubeconfig": request.kubeconfig or settings.kubeconfig_path,
-            "kube_context": request.context or settings.kube_context,
-            "created_at": now_iso(),
-            "blade_scope": request.scope,
-            "blade_target": request.target,
-            "blade_action": request.action,
-            "direct": request.direct,
-            "params_flags": request.params_flags or [],
-        }
+    # Build initial state — FaultSpec is the single source of truth.
+    spec = FaultSpec.from_http_request(request)
+    target_names = list(spec.names)
+    initial_state = {
+        "task_id": task_id,
+        "tui_session_id": "",
+        "operation": "inject",
+        "fault_spec": spec.to_dict(),
+        "needs_confirmation": request.confirm,
+        "safety_status": "pending",
+        "kubeconfig": request.kubeconfig or settings.kubeconfig_path,
+        "kube_context": request.context or settings.kube_context,
+        "created_at": now_iso(),
+        "direct": request.direct,
+    }
 
     config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
     graph = agents["inject"]
@@ -165,11 +155,14 @@ async def inject_stream(request: InjectRequest, req: Request):
 
                 # Fault injection result
                 from chaos_agent.agent.state import infer_task_state
+                from chaos_agent.agent.fault_spec import (
+                    legacy_params_dict, legacy_target_dict,
+                )
                 safety_status = values.get("safety_status", "unknown")
-                result_target = values.get("target", {}) or {}
-                blade_params = values.get("params") or {}
-                ns = result_target.get("namespace", "") or request.namespace or blade_params.get("namespace", "") or ""
-                res_type = result_target.get("resource_type", "") or request.target_type or ""
+                result_target = legacy_target_dict(values)
+                blade_params = legacy_params_dict(values)
+                ns = result_target.get("namespace", "") or request.namespace or ""
+                res_type = result_target.get("resource_type", "") or request.scope or ""
                 names = result_target.get("names", []) or target_names or [request.target_name or ""]
 
                 # Infer correct task_state from full graph state

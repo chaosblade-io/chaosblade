@@ -312,12 +312,13 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                 else:
                     # Build Layer 1 prompt and add to state.messages
                     layer1_system_prompt = _build_layer1_recovery_prompt(is_kubectl_blade=bool(_kubectl_injection))
-                    target = state.get("target") or {}
+                    from chaos_agent.agent.fault_spec import read_fault_spec as _rfs_rvl
+                    _spec_rvl = _rfs_rvl(state)
                     layer1_human_content = (
                         f"## Fault Context\n"
                         f"Skill: {skill_name}\n"
-                        f"Target namespace: {target.get('namespace', '')}\n"
-                        f"Target names: {target.get('names', [])}\n"
+                        f"Target namespace: {_spec_rvl.namespace if _spec_rvl else ''}\n"
+                        f"Target names: {list(_spec_rvl.names) if _spec_rvl else []}\n"
                         f"Kubeconfig: {kubeconfig or '(default)'}\n"
                     )
                     # Structured key parameters from parsed flags (e.g. path, percent, size)
@@ -806,7 +807,14 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                 messages.extend(_build_recover_baseline_tool_messages(_baseline))
 
         if is_first_layer2:
-            target = state.get("target") or {}
+            from chaos_agent.agent.fault_spec import read_fault_spec as _rfs_rvl2
+            _spec_rvl2 = _rfs_rvl2(state)
+            target = {
+                "namespace": _spec_rvl2.namespace if _spec_rvl2 else "",
+                "names": list(_spec_rvl2.names) if _spec_rvl2 else [],
+                "labels": dict(_spec_rvl2.labels) if _spec_rvl2 else {},
+                "resource_type": _spec_rvl2.scope if _spec_rvl2 else "",
+            }
 
             # For ChaosBlade faults, Layer 1 didn't use LLM so inject_context
             # wasn't added to state.messages. Add it now with _no_session marker.
@@ -962,8 +970,8 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
             if _blade_parsed:
                 context += f"Blade key parameters: {_blade_parsed}\n"
             # Inline path semantics for node-disk recovery verification
-            _blade_scope_rv = state.get("blade_scope")
-            _blade_target_rv = state.get("blade_target")
+            _blade_scope_rv = _spec_rvl2.scope if _spec_rvl2 else ""
+            _blade_target_rv = _spec_rvl2.blade_target if _spec_rvl2 else ""
             if _blade_target_rv == "disk" and _blade_scope_rv == "node" and "path" in _blade_parsed:
                 _path_val = _blade_parsed["path"]
                 _path_norm = _path_val.rstrip("/")
@@ -998,7 +1006,10 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                         f"ALL mounted filesystems and identify which partition shows decreased usage.\n"
                     )
             # Dynamic parameter-dependent hints (e.g., partition-aware verification for disk fill)
-            _compound_key_rv = (state.get("blade_target") or "", state.get("blade_action") or "")
+            _compound_key_rv = (
+                _spec_rvl2.blade_target if _spec_rvl2 else "",
+                _spec_rvl2.blade_action if _spec_rvl2 else "",
+            )
             _generator_rv = _PARAM_HINT_GENERATORS.get(_compound_key_rv)
             if _generator_rv and _blade_parsed:
                 _dynamic_hint_rv = _generator_rv(_blade_parsed)
@@ -1024,9 +1035,9 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                     f"Do NOT omit the kubeconfig parameter.\n"
                 )
             # Tool pod context: provide accurate information about tool pod capabilities
-            _blade_scope = state.get("blade_scope")
-            _blade_target = state.get("blade_target")
-            _blade_action = state.get("blade_action")
+            _blade_scope = _spec_rvl2.scope if _spec_rvl2 else ""
+            _blade_target = _spec_rvl2.blade_target if _spec_rvl2 else ""
+            _blade_action = _spec_rvl2.blade_action if _spec_rvl2 else ""
             _tool_pod_name = state.get("kubectl_exec_pod_name")
             if _blade_scope == "node" and _tool_pod_name:
                 context += (

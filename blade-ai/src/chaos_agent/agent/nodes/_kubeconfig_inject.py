@@ -18,15 +18,17 @@ logger = logging.getLogger(__name__)
 def _resolve_kubeconfig(state: AgentState) -> str:
     """Resolve kubeconfig from state with multi-level fallback.
 
-    Priority: state.kubeconfig > state.params.kubeconfig > settings.kubeconfig_path
+    Priority: state.kubeconfig > spec.params.kubeconfig > settings.kubeconfig_path
     """
     kc = state.get("kubeconfig", "")
     if kc:
         return kc
-    params = state.get("params") or {}
-    kc = params.get("kubeconfig", "")
-    if kc:
-        return kc
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    spec = read_fault_spec(state)
+    if spec:
+        kc = spec.params.get("kubeconfig", "")
+        if kc:
+            return kc
     return settings.kubeconfig_path
 
 

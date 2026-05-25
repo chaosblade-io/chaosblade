@@ -8,4 +8,4 @@
 # stays canonical for wheel filenames; the M11 release.yml guards
 # refuse to publish on any drift between pyproject.toml,
 # tui/package.json, and this file.
-__version__ = "0.1.0"
+__version__ = "0.1.1"

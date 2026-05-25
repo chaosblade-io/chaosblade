@@ -900,28 +900,31 @@ async def direct_execute(state: AgentState) -> dict:
         {},
     )
 
-    # 1. Build blade_create arguments from state
-    scope = state.get("blade_scope", "")
-    target = state.get("blade_target", "")
-    action = state.get("blade_action", "")
-    target_info = state.get("target") or {}
-    namespace = target_info.get("namespace") or ""
-    names = ",".join(target_info.get("names", []))
-    labels_dict = target_info.get("labels") or {}
-    labels_str = ",".join(f"{k}={v}" for k, v in labels_dict.items())
+    # 1. Build blade_create arguments from the FaultSpec — single
+    # source of truth. The 8-field flat layout means we no longer have
+    # to read state.target / state.blade_* / state.params separately
+    # and worry about cross-field consistency.
+    from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+    spec = read_fault_spec(state) or FaultSpec()
+    scope = spec.scope
+    target = spec.blade_target
+    action = spec.blade_action
+    namespace = spec.namespace
+    names = ",".join(spec.names)
+    labels_str = ",".join(f"{k}={v}" for k, v in spec.labels.items())
     kubeconfig = state.get("kubeconfig") or ""
-    params = state.get("params") or {}
-    params_flags = state.get("params_flags") or []
+    params = dict(spec.params)
+    params_flags = list(spec.params_flags)
     target_metadata = state.get("target_metadata") or {}
 
     # Duration auto-boost: MIDDLE layer of three-layer guarantee
     from chaos_agent.utils.fault_type import ensure_min_duration
     _duration = ensure_min_duration(
-        state.get("duration", 0), scope, target, action,
+        spec.duration_seconds, scope, target, action,
     )
-    if _duration != state.get("duration", 0):
+    if _duration != spec.duration_seconds:
         logger.info(
-            f"Duration auto-adjusted from {state.get('duration', 0)}s to {_duration}s "
+            f"Duration auto-adjusted from {spec.duration_seconds}s to {_duration}s "
             f"for {scope}-{target}-{action}"
         )
 

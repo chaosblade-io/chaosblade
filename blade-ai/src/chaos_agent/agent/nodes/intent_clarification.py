@@ -25,9 +25,10 @@ import logging
 import uuid
 from typing import Optional
 
-from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool as lc_tool
 
+from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
 from chaos_agent.agent.prompts.builders import build_system_prompt
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.state import AgentState
@@ -76,7 +77,7 @@ MAX_DIALOGUE_ROUNDS = 999
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _bootstrap_task_session(
+def bootstrap_task_session(
     op_task_id: str,
     operation: str,
     tui_session_id: str,
@@ -85,6 +86,12 @@ def _bootstrap_task_session(
     """Register the freshly-allocated ``op_task_id`` with the global
     SessionStore so subsequent ``append_messages`` / ``finalize_session``
     calls can write to ``memory/tasks/<op_task_id>.json``.
+
+    **Public** (no leading underscore) because ``intent_confirm.py`` also
+    invokes it: the inject pipeline's session bootstrap happens AFTER
+    user approval (Option A — see header comment in intent_confirm), so
+    both nodes need access. The recover branch in this file still calls
+    it from the clarification side (no second confirmation gate).
 
     Why this lives here: ``_allocate_operation_task_id`` is the moment
     the inject / recover pipeline takes over from intent clarification.
@@ -1058,7 +1065,17 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
         # Build system prompt via section-based builder (U-shaped:
         # CRITICAL rules at beginning + end, dynamic completeness
         # signal + confirmed parameters below CACHE_BOUNDARY).
-        fault_intent_existing = state.get("fault_intent") or {}
+        #
+        # The mid-conversation fault intent now lives on
+        # ``state.fault_spec`` (entry-point placeholder or previous
+        # turn's confirmed spec). Internal merge logic still works on
+        # the legacy ``fault_intent`` dict shape, so we project the
+        # spec through ``to_intent_dict()`` for that merge — return
+        # paths below then convert the merged dict back to a spec.
+        existing_spec = read_fault_spec(state)
+        fault_intent_existing = (
+            existing_spec.to_intent_dict() if existing_spec else {}
+        )
 
         # --- Fast-path: detect submit_fault_intent completion from ToolNode ---
         # If any trailing ToolMessage (from the most recent ToolNode batch)
@@ -1133,53 +1150,49 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
                         f"{updated_intent.get('action')} @ "
                         f"{updated_intent.get('namespace')}"
                     )
-                # Persist dialogue
+                # Persist dialogue (audit log on disk; happens regardless
+                # of whether the user later approves or rejects the intent
+                # in ``intent_confirm``).
                 persist_list = _build_dialogue_persist_list(
                     messages, system_msg=None,
                     human_msg=current_human_msg,
                     dialogue_round=dialogue_round,
                 )
                 _persist_dialogue(tui_session_id, persist_list)
-                # Trim messages and return confirmed state
-                remove_list = []
-                if len(messages) > 4:
-                    for msg in messages[:-4]:
-                        msg_id = getattr(msg, "id", None)
-                        if msg_id:
-                            remove_list.append(RemoveMessage(id=msg_id))
-                summary_msg = SystemMessage(content=(
-                    f"[Intent Clarification Summary]\n"
-                    f"Dialogue rounds: {dialogue_round}\n"
-                    f"Confirmed intent: inject\n"
-                    f"Fault: {updated_intent.get('fault_type', 'unknown')} → "
-                    f"{updated_intent['scope']}/{updated_intent['target']}/"
-                    f"{updated_intent['action']} @ {updated_intent['namespace']}"
-                ))
-                result_messages = remove_list + [summary_msg]
                 # Birth the operational task_id here — this is the
                 # transition point where the inject pipeline takes
-                # over from clarification.
+                # over from clarification. Allocation is idempotent
+                # (a previously-allocated ``task-<hex>`` is reused),
+                # has no disk side effect, and keeping it here
+                # preserves tracker continuity for the downstream
+                # ``intent_confirm`` node (whose tracker is keyed on
+                # ``state.task_id``).
                 op_task_id = _allocate_operation_task_id(state.get("task_id", ""))
-                # Register with the global SessionStore so the inject
-                # pipeline's task file (``memory/tasks/<op_task_id>.json``)
-                # is created NOW, before any agent_loop / safety_check /
-                # execute_loop messages need to land in it. The
-                # IntentClarificationSummary is the handoff boundary —
-                # it goes in as the first entry. See
-                # ``_bootstrap_task_session`` for the full rationale.
-                _bootstrap_task_session(
-                    op_task_id,
-                    operation="inject",
-                    tui_session_id=tui_session_id,
-                    handoff_message=summary_msg,
+                # NOTE — Option A: intentionally NOT trimming messages
+                # here, NOT building the IntentClarificationSummary, and
+                # NOT calling ``bootstrap_task_session``. Those side
+                # effects are deferred to ``intent_confirm``'s approved /
+                # dry_run branches so a user-initiated rejection at the
+                # confirm gate leaves the full clarification dialogue
+                # intact for the next conversational turn (avoids the
+                # "agent forgets the last 5 rounds after I said no"
+                # surprise). The submit_fault_intent AIMessage and its
+                # paired ToolMessage stay in ``state.messages`` and get
+                # cleaned up wholesale by ``intent_confirm.approved``'s
+                # trim.
+                # Persist the converged intent as a FaultSpec — single
+                # source of truth from this point on. Downstream
+                # consumers (intent_confirm, agent_loop, safety_check,
+                # baseline_capture, ...) read via ``read_fault_spec``.
+                new_spec = FaultSpec.from_intent_args(
+                    updated_intent, existing=existing_spec,
                 )
                 return merge_hook_updates({
                     "confirmed_intent": "inject",
-                    "fault_intent": updated_intent,
+                    "fault_spec": new_spec.to_dict(),
                     "intent_confidence": 1.0,
                     "intent_reasoning": "submit_fault_intent tool executed",
                     "dialogue_round": dialogue_round + 1,
-                    "messages": result_messages,
                     "task_id": op_task_id,
                 }, hook_updates)
 
@@ -1253,7 +1266,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
                 # same fault-intent fields), so the task file starts
                 # empty — recover_handler / recover_verifier_loop
                 # populate it via the standard append_messages path.
-                _bootstrap_task_session(
+                bootstrap_task_session(
                     op_task_id,
                     operation="recover",
                     tui_session_id=tui_session_id,
@@ -1285,9 +1298,12 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
                 dialogue_round=dialogue_round,
             )
             _persist_dialogue(tui_session_id, persist_list)
+            mid_spec = FaultSpec.from_intent_args(
+                updated_intent, existing=existing_spec,
+            )
             return merge_hook_updates({
                 "messages": [filtered],
-                "fault_intent": updated_intent,
+                "fault_spec": mid_spec.to_dict(),
                 "clarification_round": clarification_round + 1,
                 "dialogue_round": dialogue_round + 1,
             }, hook_updates)
@@ -1308,9 +1324,12 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
             dialogue_round=dialogue_round,
         )
         _persist_dialogue(tui_session_id, persist_list)
+        mid_spec = FaultSpec.from_intent_args(
+            updated_intent, existing=existing_spec,
+        )
         return merge_hook_updates({
             "messages": [safe_response],
-            "fault_intent": updated_intent,
+            "fault_spec": mid_spec.to_dict(),
             "dialogue_round": dialogue_round + 1,
         }, hook_updates)
 

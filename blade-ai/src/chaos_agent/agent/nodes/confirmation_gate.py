@@ -5,8 +5,10 @@ import logging
 from langchain_core.messages import AIMessage
 from langgraph.types import interrupt
 
+from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
+from chaos_agent.agent.target_guard import freeze_approved_target
 from chaos_agent.errors import FailureReason
 from chaos_agent.observability.status_tracker import (
     get_tracker,
@@ -19,29 +21,26 @@ logger = logging.getLogger(__name__)
 def _format_dry_run_preview(state: AgentState) -> str:
     """Render a human-readable preview of what would happen if approved."""
     skill_name = state.get("skill_name", "(未识别)")
-    target = state.get("target") or {}
-    params = state.get("params") or {}
+    spec = read_fault_spec(state) or FaultSpec()
     plan = state.get("plan_summary") or state.get("plan") or ""
 
     lines = ["📋 Dry-Run 预览 — 仅展示计划，不会真正执行。"]
     lines.append(f"  • 技能: {skill_name}")
 
-    if isinstance(target, dict) and target:
-        ns = target.get("namespace", "—")
-        names = target.get("names") or []
-        names_str = ", ".join(str(n) for n in names) if isinstance(names, list) else str(names)
-        lines.append(f"  • 目标: namespace={ns}  names=[{names_str or '—'}]")
+    if spec.namespace or spec.names:
+        ns = spec.namespace or "—"
+        names_str = ", ".join(spec.names) if spec.names else "—"
+        lines.append(f"  • 目标: namespace={ns}  names=[{names_str}]")
 
-    if isinstance(params, dict) and params:
-        scope = params.get("scope", "")
-        action = params.get("action", "")
-        target_act = params.get("target", "")
-        if scope or target_act or action:
-            lines.append(f"  • 故障类型: {'-'.join(p for p in (scope, target_act, action) if p)}")
-        for k, v in params.items():
-            if k in ("scope", "action", "target", "namespace"):
-                continue
-            lines.append(f"  • {k}: {v}")
+    if spec.fault_type:
+        lines.append(f"  • 故障类型: {spec.fault_type}")
+    for k, v in spec.params.items():
+        # Skip the 4 keys that the legacy nested-params format used to
+        # carry scope/action/target/namespace alongside tuning fields —
+        # those are now first-class spec attributes, displayed above.
+        if k in ("scope", "action", "target", "namespace"):
+            continue
+        lines.append(f"  • {k}: {v}")
 
     safety_status = state.get("safety_status", "")
     if safety_status:
@@ -77,7 +76,17 @@ async def confirmation_gate(state: AgentState) -> dict:
     task_id = state.get("task_id", "unknown")
     plan = state.get("plan", "")
     skill_name = state.get("skill_name", "")
-    target = state.get("target") or {}
+    # Read FaultSpec once and project to legacy target dict for the
+    # confirm_info payload (TUI confirm card still consumes the
+    # 4-key target dict shape — TUI rendering layer change is out
+    # of scope for the state refactor).
+    spec = read_fault_spec(state) or FaultSpec()
+    target = {
+        "namespace": spec.namespace,
+        "names": list(spec.names),
+        "labels": dict(spec.labels),
+        "resource_type": spec.scope,
+    }
     safety_status = state.get("safety_status", "safe")
 
     # Emit status: waiting for confirmation
@@ -115,7 +124,10 @@ async def confirmation_gate(state: AgentState) -> dict:
         sync_node_status_to_session(state, "confirmation_gate",
             "Auto-approved via --force-override",
             detail={"approved": True, "bypass": "force_override"})
-        result = {"needs_confirmation": False}
+        result = {
+            "needs_confirmation": False,
+            "approved_target": _freeze_from_state(state),
+        }
         await sync_to_store(state, result)
         return result
 
@@ -150,7 +162,7 @@ async def confirmation_gate(state: AgentState) -> dict:
         "plan_summary": plan[:500] if plan else "",
         "safety_status": safety_status,
         "safety_reason": state.get("safety_reason"),
-        "params": state.get("params") or {},
+        "params": dict(spec.params),
         "target_health_report": state.get("target_health_report"),
         "conflict_uids": list(state.get("conflict_uids") or []),
         "pipeline_attempt": int(state.get("pipeline_attempt") or 0),
@@ -182,7 +194,13 @@ async def confirmation_gate(state: AgentState) -> dict:
         tracker.complete("Execution approved by user")
         sync_node_status_to_session(state, "confirmation_gate", "Execution approved",
             detail={"approved": True})
-        result = {"needs_confirmation": False}
+        # Freeze the approved target so execute_loop's screener can
+        # compare every subsequent tool_call against this snapshot.
+        # See chaos_agent.agent.target_guard for the policy.
+        result = {
+            "needs_confirmation": False,
+            "approved_target": _freeze_from_state(state),
+        }
         await sync_to_store(state, result)
         return result
     else:
@@ -194,6 +212,30 @@ async def confirmation_gate(state: AgentState) -> dict:
             "safety_reason": "User rejected the execution",
             "needs_confirmation": False,
             "failure_reason": f"{FailureReason.USER_REJECTED.value}: User rejected the execution at confirmation gate",
+            # Clear any stale approval — the next attempt will refreeze.
+            "approved_target": None,
         }
         await sync_to_store(state, result)
         return result
+
+
+def _freeze_from_state(state: AgentState) -> dict | None:
+    """Convenience wrapper around ``freeze_approved_target`` that
+    reads from the FaultSpec — the single source of truth. Returns
+    None when no spec is on state (the caller should not be reaching
+    this function in that case, but we default-deny to make the bug
+    visible in the screener's WARNING log rather than silently
+    constructing an empty approval)."""
+    spec = read_fault_spec(state)
+    if spec is None:
+        return None
+    return freeze_approved_target(
+        target={
+            "namespace": spec.namespace, "names": list(spec.names),
+            "labels": dict(spec.labels), "resource_type": spec.scope,
+        },
+        params=dict(spec.params),
+        blade_scope=spec.scope,
+        blade_target=spec.blade_target,
+        blade_action=spec.blade_action,
+    )

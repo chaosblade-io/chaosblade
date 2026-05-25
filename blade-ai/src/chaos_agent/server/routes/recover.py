@@ -6,7 +6,7 @@ import uuid
 from fastapi import Request
 
 from chaos_agent.config.settings import settings
-from chaos_agent.models.schemas import ResponseCode
+from chaos_agent.models.schemas import JSONEnvelope, ResponseCode
 from chaos_agent.server.routes import recover_router
 from chaos_agent.server.schemas import RecoverRequest
 
@@ -27,6 +27,14 @@ async def recover_fault(request: RecoverRequest, req: Request):
     record_task_id = f"task-{uuid.uuid4()}"
     req_id = getattr(req.state, "request_id", "")
 
+    # First-run gate — agents are deferred until the wizard completes.
+    if agents is None:
+        return JSONEnvelope.fail(
+            code=ResponseCode.NEEDS_SETUP,
+            message="LLM config missing; run the setup wizard first.",
+            request_id=req_id,
+        )
+
     config = {"configurable": {"thread_id": inject_task_id}, "recursion_limit": settings.recursion_limit}
 
     try:
@@ -35,9 +43,12 @@ async def recover_fault(request: RecoverRequest, req: Request):
         if not current_state or not current_state.values:
             return JSONEnvelope.fail(code=ResponseCode.TASK_NOT_FOUND, message=f"Task not found: {inject_task_id}", request_id=req_id)
 
+        from chaos_agent.agent.fault_spec import (
+            legacy_params_dict, legacy_target_dict,
+        )
         state_values = current_state.values
         blade_uid = state_values.get("blade_uid", "")
-        target = state_values.get("target", {}) or {}
+        target = legacy_target_dict(state_values)
         skill_name = state_values.get("skill_name", "")
         kubeconfig = state_values.get("kubeconfig", "")
         inject_tui_session_id = state_values.get("tui_session_id", "") or ""
@@ -64,7 +75,10 @@ async def recover_fault(request: RecoverRequest, req: Request):
             "skill_case_content": state_values.get("skill_case_content", ""),
             "inject_verification_summary": state_values.get("inject_verification_summary", ""),
             "inject_context": inject_context,
-            "target": target,
+            # recover graph still consumes the fault_spec from inject's
+            # checkpoint via state.fault_spec — pass it forward so the
+            # recover verifier knows what fault to verify recovery of.
+            "fault_spec": state_values.get("fault_spec"),
             "kubeconfig": kubeconfig,
             "injection_method": state_values.get("injection_method"),
             "kubectl_exec_pod_name": state_values.get("kubectl_exec_pod_name"),
@@ -111,7 +125,7 @@ async def recover_fault(request: RecoverRequest, req: Request):
         names = target.get("names", []) if target else []
         ns = target.get("namespace", "") if target else ""
         if not ns:
-            inject_params = state_values.get("params") or {}
+            inject_params = legacy_params_dict(state_values)
             ns = inject_params.get("namespace", "")
 
         from chaos_agent.memory.session_store import build_verification_simple

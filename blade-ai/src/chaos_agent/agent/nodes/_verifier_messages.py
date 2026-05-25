@@ -262,9 +262,10 @@ async def _fresh_restart_count(
     restarted AFTER the precheck ran (stale data scenario).  Returns
     the current restartCount or None on any error.
     """
-    target_info = state.get("target") or {}
-    namespace = target_info.get("namespace", "")
-    target_names = target_info.get("names", [])
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    spec = read_fault_spec(state)
+    namespace = spec.namespace if spec else ""
+    target_names = list(spec.names) if spec else []
     if not namespace or not target_names:
         return None
     pod_name = target_names[0]
@@ -304,7 +305,9 @@ async def _check_container_restart_fast_path(
     Returns None (fall-through to LLM Layer 2) on any error or missing data.
     """
     # Guard: only for pod-scope faults
-    blade_scope = state.get("blade_scope", "")
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    spec = read_fault_spec(state)
+    blade_scope = spec.scope if spec else ""
     if blade_scope != "pod":
         return None
 
@@ -312,10 +315,9 @@ async def _check_container_restart_fast_path(
     if not layer1.is_passed():
         return None
 
-    # Resolve target pod identity
-    target_info = state.get("target") or {}
-    namespace = target_info.get("namespace", "")
-    target_names = target_info.get("names", [])
+    # Resolve target pod identity from FaultSpec
+    namespace = spec.namespace if spec else ""
+    target_names = list(spec.names) if spec else []
 
     if not namespace or not target_names:
         return None
@@ -644,9 +646,11 @@ def _build_layer2_messages(
     # These state-derived variables are needed by _build_baseline_tool_messages
     # and are also used inside the count==1 block; extract them here to avoid
     # NameError on count>1.
-    _params = state.get("params") or {}
-    _blade_target = state.get("blade_target") or _params.get("target")
-    _blade_action = state.get("blade_action") or _params.get("action")
+    from chaos_agent.agent.fault_spec import read_fault_spec as _rfs_vm
+    _spec_vm = _rfs_vm(state)
+    _params = dict(_spec_vm.params) if _spec_vm else {}
+    _blade_target = _spec_vm.blade_target if _spec_vm else ""
+    _blade_action = _spec_vm.blade_action if _spec_vm else ""
     _blade_parsed = state.get("blade_parsed_flags") or {}
 
     _baseline = state.get("baseline_data")
@@ -670,17 +674,17 @@ def _build_layer2_messages(
 
     if count == 1:
         # First iteration: inject full Layer 1 context
-        target = state.get("target") or {}
-        params = state.get("params") or {}
+        target = {
+            "namespace": _spec_vm.namespace if _spec_vm else "",
+            "names": list(_spec_vm.names) if _spec_vm else [],
+            "labels": dict(_spec_vm.labels) if _spec_vm else {},
+            "resource_type": _spec_vm.scope if _spec_vm else "",
+        }
+        params = _params
         injection_method = state.get("injection_method")
-        blade_scope = state.get("blade_scope")
-        blade_target = state.get("blade_target")
-        blade_action = state.get("blade_action")
-        # Fallback: extract from params dict if individual fields are None
-        if not blade_scope or not blade_target or not blade_action:
-            blade_scope = blade_scope or params.get("scope")
-            blade_target = blade_target or params.get("target")
-            blade_action = blade_action or params.get("action")
+        blade_scope = _spec_vm.scope if _spec_vm else ""
+        blade_target = _blade_target
+        blade_action = _blade_action
 
         # Build Layer 1 context section (adapted for skipped vs passed)
         if layer1.status == "skipped":

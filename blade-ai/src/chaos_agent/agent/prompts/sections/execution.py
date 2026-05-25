@@ -29,11 +29,30 @@ def get_tools_section(phase: int = 1) -> str:
 
     return """## Tool Usage Guidelines
 
+### Phase Boundary (CRITICAL — read first)
+You are in **Phase 1 (planning)**. Your job is **research + plan**, not injection.
+
+**Tools available in Phase 1**:
+- Read-only inspection: `kubectl(subcommand="get"/"describe")`, `activate_skill`, `read_skill_resource`,
+  `read_file`, `read_knowledge_resource`
+- Plan persistence: `save_fault_plan`
+- Cleanup utilities (rarely used here): `blade_status`, `blade_destroy`
+
+**Tools NOT available in Phase 1** (calling them will fail with "not a valid tool"):
+- `blade_create` — fault injection is reserved for Phase 2 (execute_loop) which
+  the framework enters automatically AFTER `confirmation_gate` approves the plan
+- `kubectl(subcommand="exec")` — out of scope here, but Phase 2 can use it
+
+**Do NOT** attempt to inject during Phase 1 — even if the user "already confirmed"
+in chat. The confirmation_gate is a graph node that gates Phase 2 transition;
+nothing prior to that node performs injection. If you call `blade_create` here,
+the call is rejected and the user sees a confusing error.
+
 ### Tool Selection Priority
 1. **Skill references first (after skill activation)**: Use `read_skill_resource` to read skill reference files for accurate, up-to-date command syntax and parameters
 2. **Knowledge docs for domain context**: Especially BEFORE skill activation or when no skill is active, use `read_knowledge_resource` to read knowledge documents — do NOT guess or improvise blade commands
-3. **Read before write**: Use `kubectl(subcommand="get"/"describe")` for verification, reserve `kubectl(subcommand="exec")` for active checks
-4. **Blade tools for faults**: Use `blade_create`/`blade_destroy`/`blade_status` for fault lifecycle, never improvise blade commands
+3. **Read before write**: Use `kubectl(subcommand="get"/"describe")` for verification — `exec` is Phase 2 only
+4. **Plan, don't execute**: Your output is the input to `confirmation_gate`. Capture the intended `blade_create` arguments in your plan (via `save_fault_plan`); the executor (Phase 2) will issue the actual call.
 
 ### Resource Lookup Priority
 When you need blade command syntax or parameters:
@@ -43,7 +62,7 @@ When you need blade command syntax or parameters:
 
 ### Parallel Calls
 - You MAY make multiple independent kubectl calls in a single turn (e.g., check pods AND nodes simultaneously)
-- Do NOT make dependent calls in parallel (e.g., don't call blade_create before reading the skill)
+- Do NOT make dependent calls in parallel (e.g., don't call `kubectl describe` before the matching `kubectl get` returns)
 
 ### Avoid Redundancy
 - Do not re-activate a skill that is already active (check conversation history)

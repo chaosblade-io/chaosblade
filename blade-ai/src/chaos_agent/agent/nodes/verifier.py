@@ -503,7 +503,9 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         # - Host filesystem checks (kubectl debug) are for nodefs, not imagefs
         # Always discover the target-node tool pod for node-scope faults.
         tool_pod_name = state.get("kubectl_exec_pod_name")
-        _blade_scope = state.get("blade_scope") or (state.get("params") or {}).get("scope")
+        from chaos_agent.agent.fault_spec import read_fault_spec as _rfs
+        _spec = _rfs(state)
+        _blade_scope = _spec.scope if _spec else ""
 
         if _blade_scope == "node":
             target_node = _resolve_target_node(state)
@@ -694,8 +696,9 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                         # injection window — the fault likely CAUSED it.
                         # Set side_effects so infer_task_state maps to
                         # "injected" (success) rather than "failed".
-                        _target_info = state.get("target") or {}
-                        _target_names = _target_info.get("names", [])
+                        from chaos_agent.agent.fault_spec import read_fault_spec as _rfs2
+                        _spec2 = _rfs2(state)
+                        _target_names = list(_spec2.names) if _spec2 else []
                         verification.setdefault("side_effects", {})["container_restarts"] = [
                             {
                                 "pod": _target_names[0] if _target_names else "unknown",
@@ -892,7 +895,9 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
 
             # Programmatic coverage warning (safety net)
             layer1_affected = layer1.affected_count
-            target_names = (state.get("target") or {}).get("names", [])
+            from chaos_agent.agent.fault_spec import read_fault_spec as _rfs3
+            _spec3 = _rfs3(state)
+            target_names = list(_spec3.names) if _spec3 else []
             if layer1_affected > 0 and len(target_names) > layer1_affected:
                 coverage_warning = (
                     f"Coverage: {layer1_affected}/{len(target_names)} target resources "
@@ -985,10 +990,12 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             if gaps:
                 reverify_count = state.get("reverify_count", 0)
                 target_metadata = state.get("target_metadata") or {}
+                from chaos_agent.agent.fault_spec import read_fault_spec as _rfs4
+                _spec4 = _rfs4(state)
                 adaptations = lookup_adaptations(
-                    state.get("blade_scope", ""),
-                    state.get("blade_target", ""),
-                    state.get("blade_action", ""),
+                    _spec4.scope if _spec4 else "",
+                    _spec4.blade_target if _spec4 else "",
+                    _spec4.blade_action if _spec4 else "",
                     target_metadata,
                     rule_type="verification_integrity_guard",
                 )

@@ -25,6 +25,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from chaos_agent.agent.fault_spec import SOURCE_TUI, FaultSpec
 from chaos_agent.agent.state import (
     extract_ui_diagnostics,
     infer_task_state,
@@ -168,6 +169,22 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             headers=SSE_HEADERS,
         )
 
+    # First-run gate — lifespan deferred ``create_agent`` because
+    # essential LLM config wasn't set yet. The TUI's REPL surfaces
+    # this as a redirect into the setup wizard instead of crashing
+    # downstream on ``agents['inject']`` dereference.
+    if agents is None:
+        return StreamingResponse(
+            iter([
+                StreamEvent(
+                    type="error",
+                    content="LLM config missing; run the setup wizard first.",
+                ).to_sse()
+            ]),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
+
     # Per-turn correlation ID. The ``turn-`` prefix is intentional:
     # during intent clarification / chat / capability Q&A there is
     # no "task" yet — the user is still talking, not running an
@@ -231,14 +248,19 @@ async def turn(sid: str, body: TurnRequest, req: Request):
     # LangGraph's per-field merge semantics, and clobbering them
     # would silently undo confirmed parameters mid-dialogue.
     if is_first_turn:
+        # TUI is always NL — write a placeholder FaultSpec at entry.
+        # intent_clarification will rewrite this with the full spec
+        # once the LLM converges on a submit_fault_intent tool_call.
+        spec = FaultSpec.placeholder_nl(
+            user_description=body.input or "",
+            source=SOURCE_TUI,
+        )
         initial_state = {
             "task_id": turn_id,
             "tui_session_id": sid,
             "interaction_mode": "tui",
             "operation": "inject",
-            "target": None,
-            "params": {},
-            "input": body.input,
+            "fault_spec": spec.to_dict(),
             "needs_confirmation": body.permission_mode == "confirm",
             "safety_status": "pending",
             "kubeconfig": settings.kubeconfig_path,
@@ -938,13 +960,15 @@ async def _build_result_payload(
         task_state = "injected" if blade_uid else "failed"
 
     skill_name = values.get("skill_name", "") or ""
-    params = values.get("params") or {}
+    # Project fault_spec to legacy shapes used by the response envelope.
+    from chaos_agent.agent.fault_spec import (
+        legacy_params_dict, legacy_target_dict, read_fault_spec,
+    )
+    spec = read_fault_spec(values)
+    params = legacy_params_dict(values)
     fault_type = ""
-    scope = (params.get("scope") or "").strip()
-    target = (params.get("target") or "").strip()
-    action = (params.get("action") or "").strip()
-    if scope and target and action:
-        fault_type = f"{scope}-{target}-{action}"
+    if spec and spec.fault_type:
+        fault_type = spec.fault_type
     elif skill_name:
         fault_type = skill_name
 
@@ -979,10 +1003,10 @@ async def _build_result_payload(
             # way to verify "I actually hit the right pod/node" from
             # the result card alone (had to scroll back to the confirm
             # gate to check).
-            "target": values.get("target") or {},
+            "target": legacy_target_dict(values),
             # Same rationale for params — what we actually executed
             # with, surfaced for confirm-trail audit.
-            "params": values.get("params") or {},
+            "params": params,
             "verification": strip_side_effects(values.get("verification")),
             "side_effects": values.get("verification", {}).get("side_effects")
             if isinstance(values.get("verification"), dict)

@@ -468,10 +468,10 @@ _BASELINE_INTEGRITY_PROMPT: str = (
 
 def _resolve_target_node(state: AgentState) -> str | None:
     """Extract the target node name from state for node-level faults."""
-    target = state.get("target") or {}
-    names = target.get("names", [])
-    if names and isinstance(names, list):
-        return names[0]
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    spec = read_fault_spec(state)
+    if spec and spec.names:
+        return spec.names[0]
     return None
 
 

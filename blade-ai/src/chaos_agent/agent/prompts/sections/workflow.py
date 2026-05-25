@@ -146,37 +146,94 @@ For the full heuristic catalogue (method-by-fault-type mapping, evidence suffici
 
 
 def get_workflow_section() -> str:
-    """Workflow phases section.
+    """Workflow phases section — path-guided ("how to succeed") not禁令式.
 
-    Compact rewrite: keeps the Analyze / Activate / Verify verbs (frozen by
-    ``tests/test_agent/test_prompts.py``) plus Phase 1 / Phase 2 headers.
-    Long-form heuristics (label discovery, node-disk path → partition mapping,
-    plan template) are sourced on demand from skill resources / knowledge docs.
+    Rewrite goal (post task-ce9647931ce1 incident): the prior wording was a
+    禁令 ("Do NOT inject faults in Phase 1, no `kubectl exec ... blade create`,
+    ...") that the LLM ignored under execution pressure — it撞 the
+    blade_create black-list, saw the error message list ``kubectl`` as an
+    alternative, and ran ``kubectl exec ... blade create`` instead. The new
+    text shifts emphasis to **the success path** (what to do, then stop),
+    explicitly lists Phase 1's read-only tool surface, and explains that
+    mutation tools will be bound automatically once the plan is approved.
+
+    Keeps the Analyze / Activate / Verify verbs frozen by
+    ``tests/test_agent/test_prompts.py``.
     """
     return """## Workflow
 You operate in TWO phases — the system transitions automatically.
 
-### Phase 1: Planning
-1. **Analyze** the user's request → fault type, target (namespace / resource / names), parameters.
+### Phase 1 (current): Planning — read-only by enforcement
+
+Your output contract this turn:
+1. **Analyze** the FAULT INTENT in your first human message → fault type,
+   target (namespace / resource / names), parameters.
 2. **Activate** the matching skill ONCE via `activate_skill` (do NOT re-activate).
-3. **Verify** the target exists with kubectl get / describe before any execution decision.
+3. **Verify** the target exists with read-only kubectl (`get` / `describe`)
+   before any plan decision.
    - If `-l <label>` returns empty, drop the label, list by name, then inspect
      `.metadata.labels` to discover the real key (e.g. `app.kubernetes.io/name`).
-4. **Read** skill resources / knowledge docs to determine the correct blade command and flags.
-   - Resource-mapping heuristics (e.g. `--path` → imagefs vs nodefs for node-disk fill) are
-     guidance only — verify on the live node with `df -h` before concluding.
-5. **Assess complexity**:
-   - Simple (single target, single fault, trivial rollback): skip plan, go to step 6.
-   - Complex (multi-target, multi-step, cascading, large blast radius, non-trivial rollback):
-     call `save_fault_plan` with a markdown plan containing the standard sections
-     (Task Summary / Execution Steps / Expected Impact / Rollback and Recovery / Verification Methods).
-     Pass the `task_id` from the user's conversation.
-6. When ready to execute, output a FINAL summary text (no tool_calls) — the system transitions to Phase 2.
+4. **Read** skill resources / knowledge docs to determine the correct blade
+   command and flags. Treat the templates inside as RECIPES for Phase 2 —
+   do not execute them here.
+   - Resource-mapping heuristics (e.g. `--path` → imagefs vs nodefs for
+     node-disk fill) are guidance only — verify on the live node with
+     read-only kubectl `top` / `describe` before concluding.
+5. **Assess complexity** (optional save_fault_plan):
+   - Simple (single target, single fault, trivial rollback): skip plan, go
+     to step 6.
+   - Complex (multi-target, multi-step, cascading, large blast radius,
+     non-trivial rollback): call `save_fault_plan` with a markdown plan
+     containing the standard sections (Task Summary / Execution Steps /
+     Expected Impact / Rollback and Recovery / Verification Methods). Pass
+     the `task_id` from the user's conversation.
+6. **Emit a final summary text WITHOUT any tool_calls.** This is your output
+   contract — the system advances to Phase 2 the moment you stop calling
+   tools.
 
-### Phase 2: Execution (automatic)
-Tools `blade_create`, `blade_status`, `blade_destroy`, and `kubectl` are bound automatically.
-Do NOT inject faults in Phase 1 (no `kubectl exec ... blade create`, no `blade_create`).
-Do NOT write files unless the user asks."""
+### Available tools in Phase 1 (the only tools you have right now)
+
+Read-only / planning tools — these are ALL you have:
+- `activate_skill`, `read_skill_resource` — load skill knowledge
+- `read_knowledge_resource`, `read_file` — load reference docs
+- kubectl read subset (`get`, `describe`, `top`, `logs`, ...) — verify target
+- `blade_status` — list existing experiments (read-only)
+- `save_fault_plan` — persist plan markdown (writes to local plan dir,
+  does not touch the cluster)
+
+NOT available in Phase 1 (intentional — runtime enforced):
+- `blade_create`, `blade_destroy` — mutate cluster state
+- Full `kubectl` (`exec`, `delete`, `patch`, `apply`, `scale`, `taint`,
+  `cordon`, `drain`, `rollout`, `debug`, `edit`, `replace`, ...)
+- `execute_skill_script` — may run mutating scripts
+
+These mutation tools are bound automatically in Phase 2 (executor). You
+will NOT have to call them; the executor is a separate LLM turn with the
+full surface.
+
+### What happens after step 6 (Phase 2 onward, for awareness)
+
+When you emit text without tool_calls, the framework runs:
+  `safety_check` → `confirmation_gate` (user approval) → `baseline_capture`
+  → `execute_loop` (a different LLM turn with `blade_create` / full
+  `kubectl` / `execute_skill_script` bound).
+
+If the user rejects at confirmation_gate, this run ends with no side
+effects — exactly because Phase 1 made no cluster changes. That guarantee
+is the whole point of the two-phase split.
+
+### Anti-patterns (runtime will REJECT — do not waste turns trying)
+
+- Calling `blade_create` directly here.
+- `kubectl exec <chaosblade-controller-pod> -- blade create ...` (semantic
+  equivalent of `blade_create`; the runtime classifies it the same way
+  and will reject it).
+- `kubectl create -f` / `kubectl apply -f` of any ChaosBlade CR.
+- Any `kubectl` subcommand outside the read subset above.
+
+Such calls return an `Error: phase1_readonly_violation` ToolMessage and
+waste your turn. The fast path is always: finish reading, write your
+plan summary, stop calling tools."""
 
 
 def get_nl_mode_section() -> str:

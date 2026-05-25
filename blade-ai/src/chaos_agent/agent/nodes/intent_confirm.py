@@ -16,12 +16,22 @@ from __future__ import annotations
 
 import logging
 
+from langchain_core.messages import RemoveMessage, SystemMessage
 from langgraph.types import interrupt
 
+from chaos_agent.agent.fault_spec import read_fault_spec
+from chaos_agent.agent.nodes.intent_clarification import bootstrap_task_session
 from chaos_agent.agent.state import AgentState
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
 
 logger = logging.getLogger(__name__)
+
+
+# Trim window: how many tail messages survive untouched on commit.
+# Picked to mirror the previous ``intent_clarification`` fast-path
+# behaviour (last 4) so post-commit Phase 1 LLM context size matches
+# the pre-Option-A baseline.
+_TRIM_TAIL_KEEP = 4
 
 
 def _format_intent_summary(fault_intent: dict) -> str:
@@ -44,6 +54,88 @@ def _format_intent_summary(fault_intent: dict) -> str:
     return "\n".join(parts)
 
 
+def _build_handoff_summary(fault_intent: dict, dialogue_round: int) -> SystemMessage:
+    """Build the ``[Intent Clarification Summary]`` SystemMessage that
+    marks the boundary between intent dialogue and inject execution.
+
+    Format and content are kept identical to the pre-Option-A summary
+    that ``intent_clarification`` used to produce — downstream consumers
+    (``session_store._split_at_handoff``, ``cli/runner.py`` handoff
+    detection at ~478, ``cli/runner.py`` at ~919) match on the
+    ``[Intent Clarification Summary]`` content prefix, so producing the
+    same string from a different node is a transparent move.
+    """
+    return SystemMessage(content=(
+        f"[Intent Clarification Summary]\n"
+        f"Dialogue rounds: {dialogue_round}\n"
+        f"Confirmed intent: inject\n"
+        f"Fault: {fault_intent.get('fault_type', 'unknown')} → "
+        f"{fault_intent.get('scope', '')}/{fault_intent.get('target', '')}/"
+        f"{fault_intent.get('action', '')} @ {fault_intent.get('namespace', '')}"
+    ))
+
+
+def _build_trim_remove_list(messages: list) -> list[RemoveMessage]:
+    """Build the RemoveMessage list that drops everything except the
+    last ``_TRIM_TAIL_KEEP`` messages.
+
+    Mirrors the pre-Option-A trim logic verbatim — the only behavioural
+    difference is *when* it runs (post-approval here vs at intent
+    convergence in the old design). Messages without an ``id`` are
+    silently skipped because ``RemoveMessage`` is keyed on id; this
+    matches LangGraph's add_messages reducer contract.
+    """
+    if len(messages) <= _TRIM_TAIL_KEEP:
+        return []
+    remove_list: list[RemoveMessage] = []
+    for msg in messages[:-_TRIM_TAIL_KEEP]:
+        msg_id = getattr(msg, "id", None)
+        if msg_id:
+            remove_list.append(RemoveMessage(id=msg_id))
+    return remove_list
+
+
+def _commit_inject_handoff(state: AgentState, fault_intent: dict) -> dict:
+    """Run the inject pipeline handoff side effects (trim + bootstrap +
+    summary) and produce the state delta to return.
+
+    Shared by the ``approved`` and ``dry_run`` branches of
+    ``intent_confirm`` — both commit to running the inject pipeline,
+    just at different points in the user's mental model (explicit Y/N
+    vs. ``/plan`` preview).
+
+    What this function does:
+      1. Builds the ``[Intent Clarification Summary]`` SystemMessage
+         marking the dialogue→execution boundary.
+      2. Builds a ``RemoveMessage`` list dropping everything except the
+         last ``_TRIM_TAIL_KEEP`` messages.
+      3. Calls ``bootstrap_task_session`` to register the ``task_id``
+         with the global SessionStore and seed the on-disk task file
+         with the summary as the first entry.
+
+    The trim was previously performed inside ``intent_clarification``
+    on intent convergence, regardless of whether the user later
+    approved. Moving it here means a user-initiated rejection at the
+    confirm gate keeps the full clarification dialogue intact, so the
+    next conversational turn can pick up where it left off instead of
+    forcing the agent to re-establish facts from scratch.
+    """
+    messages = state.get("messages", [])
+    dialogue_round = int(state.get("dialogue_round") or 0)
+    summary_msg = _build_handoff_summary(fault_intent, dialogue_round)
+    remove_list = _build_trim_remove_list(messages)
+
+    op_task_id = state.get("task_id", "") or ""
+    if op_task_id:
+        bootstrap_task_session(
+            op_task_id,
+            operation="inject",
+            tui_session_id=state.get("tui_session_id", "") or "",
+            handoff_message=summary_msg,
+        )
+    return {"messages": remove_list + [summary_msg]}
+
+
 async def intent_confirm(state: AgentState) -> dict:
     """Pause and ask user to confirm their fault injection intent.
 
@@ -54,7 +146,12 @@ async def intent_confirm(state: AgentState) -> dict:
     Command(resume="rejected") to abort (graph ends, back to TUI REPL).
     """
     task_id = state.get("task_id", "")
-    fault_intent = state.get("fault_intent") or {}
+    # Single source of truth — the fault_spec written by
+    # intent_clarification. Projected through ``to_intent_dict()`` for
+    # the helpers below (render / handoff) which still take the
+    # legacy dict shape; the spec itself stays in state.
+    spec = read_fault_spec(state)
+    fault_intent = spec.to_intent_dict() if spec else {}
     intent_confidence = float(state.get("intent_confidence") or 0.0)
 
     tracker = get_tracker(task_id) if task_id else None
@@ -78,7 +175,15 @@ async def intent_confirm(state: AgentState) -> dict:
             )
             tracker.complete("Dry-Run: bypassed Layer-1 confirm")
         logger.info("intent_confirm bypassed for dry_run task %s", task_id)
-        return {}
+        # Dry-Run mirrors the approved path: ``/plan <NL>`` runs the
+        # full inject pipeline as a preview, so the downstream
+        # agent_loop / safety_check stages need the same clean
+        # ``[Intent Clarification Summary]`` handoff and trimmed
+        # message list they would see on a real approval. Skipping
+        # this would leave Phase 1 reading the verbose clarification
+        # dialogue and produce a different plan preview than the
+        # post-Option-A approved flow.
+        return _commit_inject_handoff(state, fault_intent)
 
     if tracker:
         tracker.start(
@@ -118,13 +223,35 @@ async def intent_confirm(state: AgentState) -> dict:
         if tracker:
             tracker.complete("用户确认意图，进入执行阶段")
         logger.info("Intent confirmed by user: %s", fault_intent.get("fault_type"))
-        return {}
+        # Option A handoff: the trim + bootstrap side effects used to
+        # fire from ``intent_clarification`` the moment intent
+        # converged, which meant the working messages list shrank even
+        # when the user later rejected at this gate. Moving them to
+        # the approved branch keeps the full clarification dialogue
+        # alive across rejections (so a continued conversation can
+        # refine, not restart) and stops orphan task files from being
+        # created for rejected intents.
+        return _commit_inject_handoff(state, fault_intent)
     else:
-        # User rejected — clear confirmed_intent so router routes to END
+        # User rejected — clear confirmed_intent so router routes to END.
+        # Notably we do NOT touch ``messages`` here: the full
+        # clarification dialogue stays in working memory so the user's
+        # next turn can iterate on the already-established context
+        # instead of forcing the agent to re-collect baseline facts.
+        # ``task_id`` also stays as ``task-<hex>`` (allocated by
+        # ``intent_clarification``) — ``bootstrap_task_session`` is
+        # idempotent on re-entry (``store.has_active`` guard) so a
+        # subsequent approval reuses the same id without re-creating
+        # the on-disk file.
         if tracker:
             tracker.complete("用户拒绝意图，返回对话")
         logger.info("Intent rejected by user, returning to conversation")
+        # Do NOT clear ``fault_spec`` on reject — the user often wants
+        # to refine the intent in the next turn (change namespace,
+        # add a label selector, ...). Keeping the spec lets the next
+        # ``intent_clarification`` run continue merging on top of
+        # what was already captured. Only ``confirmed_intent`` is
+        # reset so the router takes the END path.
         return {
             "confirmed_intent": None,
-            "fault_intent": None,
         }

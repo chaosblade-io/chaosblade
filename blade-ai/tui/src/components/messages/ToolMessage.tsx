@@ -1,5 +1,24 @@
 /**
- * Tool call — bordered single-call card.
+ * Tool call — TWO visual forms (Phase 4.A).
+ *
+ * **Compact form** (``isPending=true``): single-line entry used while
+ * the tool is still in the dynamic frame. Renders as
+ *
+ *   [T1] ⊶ kubectl   2.3s · phase1
+ *
+ * One row regardless of body content. The chip's status colour
+ * (orange running / green ✓ / red ✗) carries the state, the
+ * elapsed/node tail provides context. Body output is suppressed in
+ * this form because the dynamic frame must stay small — every byte
+ * gets erase+rewritten on every Ink commit, and on terminals without
+ * DEC 2026 (Apple Terminal in particular) those erases produce
+ * visible flicker proportional to the dynamic frame's row count.
+ *
+ * **Full bordered card form** (``isPending=false``): used in
+ * committed history. Static is append-only, so this card paints once
+ * and never repaints — the 5-12 row footprint costs nothing visually.
+ * Visual grammar (bordered card with title chip / section rule /
+ * body / hint block):
  *
  * Generic renderer for any tool the agent can invoke — no shape /
  * format assumptions about the result payload. Agnostic over:
@@ -217,6 +236,80 @@ const SectionRule: React.FC = () => (
   />
 );
 
+/**
+ * Single-row compact form rendered while the tool is in the dynamic
+ * frame (``isPending=true``). Not memo'd here — the parent
+ * ``ToolMessage`` already memoises and decides which form to mount.
+ *
+ * Sizing: GUARANTEED 1 row regardless of body content, terminal
+ * width, locator chip presence, or metadata length. Layout strategy
+ * mirrors qwen-code's compact tool row (``ToolMessage.tsx:407``):
+ * a SINGLE outer ``<Text wrap="truncate-end">`` contains every
+ * span as nested ``<Text>`` children. Ink renders nested Text as
+ * inline spans within the outer Text's word-wrap context, and
+ * ``truncate-end`` clips overflow at the parent box's column edge
+ * with ``…`` instead of wrapping to a new line. The outer ``<Box>``
+ * exists only for ``paddingLeft`` (Ink Box can carry padding,
+ * Text cannot).
+ *
+ * Why this matters: a previous ``<Box flexDirection="row">`` shape
+ * with sibling Text spans inherited Ink's default ``wrap="wrap"``,
+ * so a narrow-terminal render of a long tool name + locator + meta
+ * could push the row to 2-3 visual lines, defeating the whole
+ * "single-row compact form" promise. The Apple-Terminal flicker
+ * mitigation depends on the dynamic frame staying small; even one
+ * extra wrapped row across N concurrent tools multiplies into
+ * meaningful frame growth.
+ */
+const ToolMessageCompact: React.FC<{ item: ToolItem }> = ({ item }) => {
+  const elapsedStr = formatElapsed(item.elapsedMs);
+  const chipColor = chipColorFor(item.status);
+  const isRunning = item.status === "running";
+  // Pre-build the metadata tail so the JSX stays flat. Both
+  // ``elapsedStr`` and ``item.node`` are ``string`` (formatElapsed
+  // returns ``""`` on missing ms; node is required on ToolItem) so
+  // the ``||`` falsy check correctly skips the tail when both are
+  // empty.
+  const hasMeta = Boolean(elapsedStr) || Boolean(item.node);
+  const metaSeparator = elapsedStr && item.node ? " · " : "";
+  return (
+    <Box paddingLeft={4}>
+      <Text wrap="truncate-end">
+        {item.locator ? (
+          <>
+            <Text color={Theme.text.secondary}>[</Text>
+            <Text bold>{item.locator}</Text>
+            <Text color={Theme.text.secondary}>] </Text>
+          </>
+        ) : null}
+        {/* Status glyph carries the load-bearing signal — chip colour
+         *  = state. Running tools spin the small inline spinner so
+         *  the user can tell "still working" from "stuck". Other
+         *  states use a static glyph. ``<InkSpinner>`` itself
+         *  renders ``<Text>`` internally; nesting Text inside Text
+         *  is well-supported by Ink (qwen-code's ``GeminiSpinner``
+         *  uses the same pattern in their Footer / inline-spinner
+         *  sites). */}
+        {isRunning ? (
+          <Text color={chipColor}>
+            <InkSpinner type={ToolSpinner.type} />
+          </Text>
+        ) : (
+          <Text color={chipColor} bold>
+            {chipGlyphFor(item.status)}
+          </Text>
+        )}
+        <Text bold>{` ${item.name}`}</Text>
+        {hasMeta ? (
+          <Text color={Theme.text.secondary}>
+            {`  ·  ${elapsedStr}${metaSeparator}${item.node}`}
+          </Text>
+        ) : null}
+      </Text>
+    </Box>
+  );
+};
+
 const ToolMessageInternal: React.FC<{
   item: ToolItem;
   isPending?: boolean;
@@ -227,7 +320,20 @@ const ToolMessageInternal: React.FC<{
    *  this and uses the full ``MAX_OUTPUT_LINES`` cap. */
   availableTerminalHeight?: number;
 }> = ({ item, isPending, availableTerminalHeight }) => {
+  // ALWAYS call hooks unconditionally so the hook order stays stable
+  // across the compact / full-card branches (a future change that
+  // toggles ``isPending`` mid-life would otherwise violate Rules of
+  // Hooks). ``columns`` is only consumed by the full-card branch but
+  // calling ``useTerminalSize`` is free.
   const { columns } = useTerminalSize();
+  // Phase 4.A — divert in-flight tools to the single-row compact form.
+  // See the file-level docstring for the rationale (Apple Terminal
+  // flicker, dynamic-frame size). Body / hint / locator absorption
+  // happens in the full-card path below; the compact form is
+  // intentionally read-only display.
+  if (isPending) {
+    return <ToolMessageCompact item={item} />;
+  }
   const elapsedStr = formatElapsed(item.elapsedMs);
   const isErr = item.status === "error" || item.status === "canceled";
   const isRunning = item.status === "running";
@@ -319,31 +425,44 @@ const ToolMessageInternal: React.FC<{
         <Box>
           {item.locator && (
             <Box marginRight={1}>
-              {/* Locator chip mirrors ToolNameChip's bracket style
-               *  (secondary-grey brackets + brighter inner text) so the
-               *  two chips read as a pair. Inner text is gray.300 + bold
-               *  — one step brighter than secondary so the locator
-               *  reads as "namable identifier" without competing with
-               *  the status-coded chip beside it. */}
+              {/* Locator chip mirrors ToolNameChip exactly: secondary-
+               *  grey brackets + bold default-fg inner text. Why
+               *  default fg instead of an explicit colour: the tool
+               *  name beside this chip is also default-fg-bold, so
+               *  ``[T1]`` and ``[ ✓ activate_skill ]`` read as a
+               *  visual pair regardless of light- or dark-terminal
+               *  background. The previous ``gray.300`` looked dim
+               *  on light terminals (low contrast against off-white)
+               *  while the tool name stayed crisp — visually inconsistent. */}
               <Text>
                 <Text color={Theme.text.secondary}>[</Text>
-                <Text color={Theme.gray[300]} bold>
-                  {item.locator}
-                </Text>
+                <Text bold>{item.locator}</Text>
                 <Text color={Theme.text.secondary}>]</Text>
               </Text>
             </Box>
           )}
           <ToolNameChip status={item.status} name={item.name} />
-          <Box flexGrow={1} />
-          {elapsedStr && (
-            <Text color={Theme.text.secondary}>{elapsedStr}</Text>
-          )}
-          {item.node && elapsedStr && (
-            <Text color={Theme.text.secondary}> · </Text>
-          )}
-          {item.node && (
-            <Text color={Theme.text.secondary}>{item.node}</Text>
+          {/* Elapsed + node metadata pinned with a fixed 2-col gap
+           *  AFTER the tool-name chip — NOT pushed to the right edge
+           *  with ``flexGrow``. Reason: with the previous spacer, the
+           *  visual gap between ``]`` and ``5ms`` jumped from 0 to
+           *  20+ cols depending on the tool name's length (long names
+           *  collapsed the spacer, short names blew it open). The
+           *  metadata is informational, not a right-rail status —
+           *  reading it next to the chip flows better than chasing
+           *  the cursor across the row. */}
+          {(elapsedStr || item.node) && (
+            <Box marginLeft={2}>
+              {elapsedStr && (
+                <Text color={Theme.text.secondary}>{elapsedStr}</Text>
+              )}
+              {item.node && elapsedStr && (
+                <Text color={Theme.text.secondary}> · </Text>
+              )}
+              {item.node && (
+                <Text color={Theme.text.secondary}>{item.node}</Text>
+              )}
+            </Box>
           )}
         </Box>
 
@@ -362,7 +481,7 @@ const ToolMessageInternal: React.FC<{
             <Text color={Theme.text.secondary}>{Icons.tree} </Text>
             <Box flexGrow={1}>
               <Text
-                color={isErr ? Theme.status.err : Theme.text.primary}
+                color={isErr ? Theme.status.err : Theme.text.secondary}
                 wrap="truncate-end"
               >
                 {fittedBody}

@@ -3,11 +3,20 @@
 Unified kubectl tool that supports all subcommands via a single entry point.
 Tool signature faithfully maps kubectl global flags so the LLM can naturally
 pass --kubeconfig, --context, --cluster etc. when needed.
+
+Two flavours bound at the graph layer:
+  - ``kubectl`` (this module) — full surface (exec, delete, patch, ...);
+    used in phase 2 / verifier where mutation is expected.
+  - ``kubectl_ro`` (this module) — read-only subset (get/describe/top/
+    logs/...); used in phase 1 planning. Constrains the subcommand at
+    the tool signature level so the LLM cannot accidentally call a
+    mutating verb in the planning phase.
 """
 
 import logging
 import re
 import shlex
+from typing import Literal
 
 from langchain_core.tools import tool
 
@@ -83,7 +92,14 @@ async def kubectl(
     context: str = "",
     cluster: str = "",
 ) -> str:
-    """Execute a kubectl subcommand against the Kubernetes cluster.
+    """Phase 2 (execution) tool. Full kubectl with mutation subcommands bound.
+
+    Mutating: supports exec / delete / patch / apply / scale / taint /
+    cordon / drain / rollout / debug / edit / replace and more. ChaosBlade-
+    aware: auto-injects ``--timeout`` for ``exec ... blade create``.
+
+    NOT available in Phase 1 (planning); use ``kubectl_ro`` there for
+    read-only inspection.
 
     Single entry point covering all kubectl subcommands. Pick `subcommand` and
     pass the rest of the CLI args as `v_args`.
@@ -278,3 +294,89 @@ async def kubectl(
         )
 
     return output
+
+
+# ── Phase 1 read-only kubectl flavour ──────────────────────────────────
+#
+# Background (task-ce9647931ce1): planning-phase agent_loop had the full
+# ``kubectl`` bound, and the LLM — once it撞 the ``blade_create`` black-
+# list — pivoted to ``kubectl exec <chaosblade-controller-pod> -- blade
+# create ...`` to inject anyway. The whole point of the agent_loop →
+# safety_check → confirmation_gate → execute_loop pipeline is that
+# planning has zero side effects, so the user's reject at
+# confirmation_gate actually leaves the cluster untouched.
+#
+# Mitigation strategy (multi-layer, see design plan):
+#   - Layer A (THIS): physically remove mutation subcommands from the
+#     Phase 1 tool surface. The LLM cannot call what's not in the schema.
+#   - Layer D: ToolNode error handler refuses to list "try one of [...]"
+#     alternatives that would re-suggest the bypass.
+#   - Layer F: a phase1_screener as last-resort runtime check.
+#
+# The ``Literal`` type below is enforced by LangChain's tool argument
+# validation; passing any other subcommand returns a Pydantic
+# ValidationError that ToolNode catches and surfaces via the Layer D
+# error handler.
+PHASE1_READONLY_SUBCOMMANDS: tuple[str, ...] = (
+    "get", "describe", "top", "logs",
+    "version", "cluster-info", "api-resources", "explain", "auth",
+)
+
+
+@tool
+async def kubectl_ro(
+    subcommand: Literal[
+        "get", "describe", "top", "logs",
+        "version", "cluster-info", "api-resources", "explain", "auth",
+    ],
+    v_args: str = "",
+    kubeconfig: str = "",
+    context: str = "",
+    cluster: str = "",
+) -> str:
+    """Phase 1 ONLY. Read-only kubectl for planning observations.
+
+    When to use (Phase 1 = planning, observation only):
+      - Verify the target Pod / Node / Namespace exists (`get`, `describe`).
+      - Inspect labels / status / events (`describe`, `get -o json`).
+      - Capture baseline metrics (`top`).
+      - Read application logs for symptom evidence (`logs`).
+      - Discover available API resources (`api-resources`, `explain`).
+      - Check effective permissions (`auth can-i`).
+
+    Constraints:
+      - This tool ONLY accepts the read-only subcommands above. Any
+        attempt to call ``exec``, ``delete``, ``patch``, ``apply``,
+        ``scale``, ``taint``, ``cordon``, ``drain``, ``rollout``,
+        ``debug``, ``edit``, ``replace``, etc. is REJECTED at the
+        argument-validation layer (Pydantic ``Literal`` enforcement).
+      - For mutating operations, the full ``kubectl`` tool is bound
+        automatically in Phase 2 after the user approves your plan —
+        you don't need them here. Just verify the target and assess
+        blast radius.
+
+    Inputs / Output: same shape as the full ``kubectl`` tool. This is a
+    thin wrapper that re-uses ``kubectl``'s execution logic with the
+    subcommand domain constrained.
+    """
+    # Belt-and-braces defense: even if Literal validation is bypassed
+    # (e.g. some future schema serialization quirk), runtime check
+    # rejects mutating subcommands. Returns a structured error that
+    # the Layer D handler-style message mirrors.
+    if subcommand not in PHASE1_READONLY_SUBCOMMANDS:
+        return (
+            f"Error: kubectl_ro does not accept subcommand '{subcommand}'.\n"
+            f"Phase 1 (planning) is read-only by enforcement. Allowed "
+            f"subcommands: {', '.join(PHASE1_READONLY_SUBCOMMANDS)}.\n"
+            f"Mutation subcommands (exec/delete/patch/apply/scale/...) "
+            f"are bound in Phase 2 after your plan is approved."
+        )
+    # Delegate to the full kubectl tool, which already handles all the
+    # global args, output formatting, large-output hints, etc.
+    return await kubectl.ainvoke({
+        "subcommand": subcommand,
+        "v_args": v_args,
+        "kubeconfig": kubeconfig,
+        "context": context,
+        "cluster": cluster,
+    })

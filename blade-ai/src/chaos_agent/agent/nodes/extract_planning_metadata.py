@@ -140,10 +140,12 @@ async def extract_planning_metadata(state: AgentState) -> dict:
         dict with keys to merge into State. May be empty if all fields
         are already populated (direct mode).
     """
+    from chaos_agent.agent.fault_spec import read_fault_spec
+
     result: dict = {}
     messages = state.get("messages", [])
 
-    # ── 1. skill_case_content ──
+    # 1. skill_case_content — needed by baseline_capture's LLM strategy.
     if not state.get("skill_case_content"):
         skill_case = _extract_skill_case_from_messages(messages)
         if skill_case:
@@ -153,35 +155,47 @@ async def extract_planning_metadata(state: AgentState) -> dict:
                 "from messages (%d chars)", len(skill_case),
             )
 
-    # ── 2. blade_scope/target/action ──
-    existing_scope = state.get("blade_scope", "")
-    existing_target = state.get("blade_target", "")
-    existing_action = state.get("blade_action", "")
+    # 2. fault_spec scope/blade_target/blade_action derivation.
+    #
+    # TUI mode: intent_clarification populates the spec from the user's
+    # explicit submit_fault_intent — spec.is_complete is True here, this
+    # block is a no-op.
+    #
+    # CLI NL mode: the entry point only writes a placeholder spec
+    # (user_description + source). LLM's planning actions (activate
+    # skill, read use-case) carry the fault_type information; without
+    # this lazy derivation, safety_check would reject every CLI NL turn
+    # with "No target specified".
+    spec = read_fault_spec(state)
+    if spec is not None and not (
+        spec.scope and spec.blade_target and spec.blade_action
+    ):
+        source_case = (
+            result.get("skill_case_content")
+            or state.get("skill_case_content")
+            or ""
+        )
+        derived_scope, derived_target, derived_action = _derive_scope_target_action(source_case)
+        if not derived_scope:
+            derived_scope = _derive_scope_from_resource_path(messages)
 
-    if not existing_scope or not existing_target or not existing_action:
-        # Strategy 1: derive from skill_case_content (most reliable)
-        source_case = result.get("skill_case_content") or state.get("skill_case_content") or ""
-        scope, target, action = _derive_scope_target_action(source_case)
-
-        # Strategy 2 fallback: derive scope from resource_path
-        if not scope:
-            scope = _derive_scope_from_resource_path(messages)
-
-        # Write only missing fields (don't overwrite existing values)
-        if scope and not existing_scope:
-            result["blade_scope"] = scope
-        if target and not existing_target:
-            result["blade_target"] = target
-        if action and not existing_action:
-            result["blade_action"] = action
-
-        if result.get("blade_scope"):
+        # Build a partial-update dict for spec.replace() — only fill
+        # fields the spec is missing. write-once semantics prevent
+        # subsequent re-derivations from clobbering an earlier value.
+        updates: dict = {}
+        if derived_scope and not spec.scope:
+            updates["scope"] = derived_scope
+        if derived_target and not spec.blade_target:
+            updates["blade_target"] = derived_target
+        if derived_action and not spec.blade_action:
+            updates["blade_action"] = derived_action
+        if updates:
+            new_spec = spec.replace(**updates)
+            result["fault_spec"] = new_spec.to_dict()
             logger.info(
-                "extract_planning_metadata: derived blade scope/target/action "
-                "= %s/%s/%s",
-                result.get("blade_scope", existing_scope),
-                result.get("blade_target", existing_target),
-                result.get("blade_action", existing_action),
+                "extract_planning_metadata: derived spec fields %s "
+                "(CLI NL or initially incomplete spec path)",
+                {k: v for k, v in updates.items()},
             )
 
     return result

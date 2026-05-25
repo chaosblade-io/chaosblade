@@ -19,6 +19,14 @@ async def confirm_task(task_id: str, request: ConfirmRequest, req: Request):
     agents = req.app.state.agents
     req_id = getattr(req.state, "request_id", "")
 
+    # First-run gate — agents are deferred until the wizard completes.
+    if agents is None:
+        return JSONEnvelope.fail(
+            code=ResponseCode.NEEDS_SETUP,
+            message="LLM config missing; run the setup wizard first.",
+            request_id=req_id,
+        )
+
     if request.action not in ("approve", "reject"):
         return JSONEnvelope.fail(code=ResponseCode.INVALID_ACTION, message="Invalid action, must be 'approve' or 'reject'", request_id=req_id)
 

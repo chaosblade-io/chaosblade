@@ -80,7 +80,11 @@ async def blade_create(
     flags: str = "",
     task_id: str = "",
 ) -> str:
-    """Create a ChaosBlade K8s fault injection experiment.
+    """Phase 2 ONLY. Create a ChaosBlade K8s fault injection experiment.
+
+    Mutating: triggers actual chaos against the target. NOT available in
+    Phase 1 (planning). Returns the experiment UID for tracking and
+    later destroy.
 
     Generates `blade create k8s <scope>-<target> <action> [flags]`.
 
@@ -187,9 +191,12 @@ async def blade_create(
 
 @tool
 async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
-    """Destroy a ChaosBlade experiment by UID to recover the fault.
+    """Mutating. Destroy a ChaosBlade experiment by UID to recover the fault.
 
-    Runs `blade destroy <UID>`.
+    Runs `blade destroy <UID>`. NOT available in Phase 1 planning — the
+    runtime classifies this as a mutation and the phase 1 screener will
+    reject it. Use this in the recover graph or via framework-controlled
+    cleanup paths only.
 
     When to use:
       - Recovery phase, or to abort an in-progress injection.
@@ -225,9 +232,10 @@ async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
 
 @tool
 async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
-    """Query a ChaosBlade experiment's CLI-side status.
+    """Phase 1 / Phase 2 read-only. Query a ChaosBlade experiment's CLI-side status.
 
-    Runs `blade status [--uid <UID>]`.
+    Runs `blade status [--uid <UID>]`. Read-only — listing existing
+    experiments does not mutate cluster state.
 
     When to use:
       - Verifier Layer 1: confirm the experiment is "Success" after blade_create.
@@ -266,7 +274,7 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
 
 @tool
 async def blade_query_k8s(uid: str = "", kubeconfig: str = "") -> str:
-    """Query the cluster-side status of a ChaosBlade K8s experiment.
+    """Phase 2 read-only. Query the cluster-side status of a ChaosBlade K8s experiment.
 
     Runs `blade query k8s create <UID>`. Returns which pods / nodes the
     experiment actually selected, distinct from blade_status which only shows

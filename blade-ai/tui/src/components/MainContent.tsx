@@ -447,10 +447,45 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
         whenever /clear bumps it. Without that, Ink's append-only Static
         keeps every previously-rendered item in scrollback regardless of
         the items array — /clear would have no visible effect.
+
+        ``session.id`` gate is LOAD-BEARING. Do NOT mount ``<Static>``
+        before the session has been created. Original symptom: the
+        first-run wizard (which renders right after boot, never mounts
+        ``<Static>`` itself) accumulated blank rows above the card —
+        not per keystroke, but starting from the first wizard step
+        TRANSITION (e.g. picking a preset model and advancing to the
+        URL step). Captured via ``BLADE_AI_WIZARD_DEBUG=1``: at that
+        transition Ink's ``renderInteractiveFrame`` started taking its
+        ``hasStaticOutput`` branch, which writes ``staticOutput`` (here
+        a ghostly ``\n\n\n\n`` for the leftover empty Static's yoga
+        height=4) between ``log.clear()`` and the new frame. Each
+        subsequent re-render did the same — 4 extra blank rows per
+        render, pushing the frame down.
+
+        Why the ghost: boot mounts App → MainContent → ``<Static
+        items={[]}>``. Ink's reconciler writes that Static instance
+        into ``rootNode.staticNode``. When BootRunner flips phase to
+        ``"wizard"`` and ``<App>`` unmounts, Ink's ``removeChild``
+        cleanup is supposed to reset ``rootNode.staticNode = undefined``
+        — but the cleanup races React 19's commit phase, and the yoga
+        node (held separately by ``cleanupYogaNode``) survives long
+        enough for a later layout pass to recompute its height to 4.
+        Once that's stored on the surviving staticNode, every frame
+        thereafter is contaminated by the bad branch.
+
+        ConfirmMessage doesn't show the symptom because it lives below
+        a real, content-filled Static (chat history). Even though the
+        same ``hasStaticOutput`` branch fires there, ``staticOutput``
+        is the real history bytes which Ink already flushed to
+        scrollback — the visual effect is invisible. The wizard had no
+        history above, so the 4 empty newlines per render were the
+        only thing on screen and the drift was directly visible.
       */}
-      <Static key={remountKey} items={staticItems}>
-        {(entry) => <Box key={entry.key}>{entry.node}</Box>}
-      </Static>
+      {session.id && (
+        <Static key={remountKey} items={staticItems}>
+          {(entry) => <Box key={entry.key}>{entry.node}</Box>}
+        </Static>
+      )}
       {/* Boot-time spinner row, only visible during the brief window
           between welcome-card paint and doctor/pending-tasks cards
           landing in history. Sits ABOVE pending so a mid-boot turn

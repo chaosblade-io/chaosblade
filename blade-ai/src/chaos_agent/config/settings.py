@@ -241,6 +241,24 @@ class Settings(BaseSettings):
     # Skill 脚本执行配置
     skill_script_max_output: int = 4000  # BLADE_AI_SKILL_SCRIPT_MAX_OUTPUT，返回给 LLM 的 stdout 最大字符数
 
+    # Target-drift guard 子系统 (chaos_agent.agent.target_guard).
+    # 默认 False 是灰度开关——先在生产环境观察 screener 的 log-only
+    # 判定，确认无误判后改为 True 才真正拦截 execute_loop 的偏离调用。
+    target_guard_enforcing: bool = True  # BLADE_AI_TARGET_GUARD_ENFORCING
+    # 是否允许 _execute_skill_script 工具（默认 False = 禁用）。脚本
+    # 内容对 classifier 不透明，开启等同于给 execute_loop 一个无法
+    # 审计的 escape hatch；只有信任 skill 来源的运营场景才打开。
+    skill_script_default_allow: bool = False  # BLADE_AI_SKILL_SCRIPT_DEFAULT_ALLOW
+
+    # Phase 1 (planning) screener enforcement (default True). When True,
+    # any tool_call classified as non-readonly is rejected at the
+    # phase1_screener node and the LLM is asked to retry. When False,
+    # violations are logged at WARNING level but the call still proceeds
+    # through phase1_tools — only useful for post-incident analysis;
+    # production should stay True. See
+    # ``chaos_agent.agent.nodes.phase1_screener`` for rationale.
+    phase1_screener_enforcing: bool = True  # BLADE_AI_PHASE1_SCREENER_ENFORCING
+
     # 日志级别 (DEBUG=显示LLM迭代详情, INFO=正常输出, WARNING=静默模式)
     log_level: str = "DEBUG"                  # BLADE_AI_LOG_LEVEL
 

@@ -409,9 +409,25 @@ def extract_critical_context(messages: list, state: dict) -> dict:
                 # Multiple skills: join with separator
                 context["active_skill_content"] = "\n---\n".join(skill_contents)
 
-    # 4. Current target info
-    if state.get("target"):
-        context["target"] = state["target"]
+    # 4-6. Fault context — read from FaultSpec, project to the keys
+    # post-compact context consumers expect (target dict / blade_scope /
+    # blade_target / blade_action). This is read-only projection;
+    # state.fault_spec remains the single source of truth.
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    spec = read_fault_spec(state)
+    if spec:
+        context["target"] = {
+            "namespace": spec.namespace,
+            "names": list(spec.names),
+            "labels": dict(spec.labels),
+            "resource_type": spec.scope,
+        }
+        if spec.scope:
+            context["blade_scope"] = spec.scope
+        if spec.blade_target:
+            context["blade_target"] = spec.blade_target
+        if spec.blade_action:
+            context["blade_action"] = spec.blade_action
 
     # 5. Plan info
     if state.get("plan_path"):
@@ -419,15 +435,8 @@ def extract_critical_context(messages: list, state: dict) -> dict:
     if state.get("plan"):
         context["plan"] = state["plan"]
 
-    # 6. Injection method and blade metadata (needed by verifier across iterations)
     if state.get("injection_method"):
         context["injection_method"] = state["injection_method"]
-    if state.get("blade_scope"):
-        context["blade_scope"] = state["blade_scope"]
-    if state.get("blade_target"):
-        context["blade_target"] = state["blade_target"]
-    if state.get("blade_action"):
-        context["blade_action"] = state["blade_action"]
 
     return context
 

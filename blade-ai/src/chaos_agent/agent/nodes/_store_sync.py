@@ -35,10 +35,41 @@ def _extract_db_fields(merged: dict) -> tuple[dict, dict]:
     ``skill_case_content`` (full SKILL.md text) is mapped to ``skill_use_case``
     as a *reference* — we store the skill_name instead of the full content,
     because the full content can be rebuilt from the skills/ directory.
+
+    ``fault_spec`` is projected to the existing DB columns the audit
+    surface still consumes (``target`` / ``params`` / ``scope`` /
+    ``target_name`` / ``action`` / ``duration``). Keeps the DB schema
+    stable while state-side single-source-of-truth lives on
+    ``state.fault_spec``.
     """
+    # Project fault_spec into the DB columns that the schema actually
+    # defines (see ``task_store_backend._TASK_COLUMNS`` /
+    # ``_DETAIL_COLUMNS`` — namespace/target_name/target/params are
+    # present; scope/blade_*/duration are NOT columns and would be
+    # silently dropped by the column-membership filter below).
+    from chaos_agent.agent.fault_spec import FaultSpec
+    spec = FaultSpec.from_dict(merged.get("fault_spec"))
+    if spec:
+        merged = dict(merged)  # don't mutate caller's dict
+        merged.setdefault("target", {
+            "namespace": spec.namespace,
+            "names": list(spec.names),
+            "labels": dict(spec.labels),
+            "resource_type": spec.scope,
+        })
+        merged.setdefault("params", dict(spec.params))
+        merged.setdefault("namespace", spec.namespace)
+        merged.setdefault("target_name", ",".join(spec.names))
+
     task_fields: dict[str, Any] = {}
     detail_fields: dict[str, Any] = {}
     for key, value in merged.items():
+        # ``fault_spec`` itself is not a DB column; it's the state-side
+        # source of truth. The projection above already pushed its
+        # fields into target/params/scope/etc. Skip the raw fault_spec
+        # dict so we don't try to write it to a non-existent column.
+        if key == "fault_spec":
+            continue
         db_key = _STATE_TO_DB_MAP.get(key, key)
         if db_key == "task_id":
             continue

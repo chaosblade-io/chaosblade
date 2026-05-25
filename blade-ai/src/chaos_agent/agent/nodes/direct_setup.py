@@ -26,18 +26,19 @@ async def _collect_context(state: AgentState) -> dict:
     downstream nodes (safety_check, baseline_capture, direct_execute)
     can query FCAT without re-fetching.
     """
+    from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
     from chaos_agent.agent.nodes.direct_execute import _fetch_pod_memory_limit_mb
 
     metadata: dict = {}
 
-    # Pod memory limit (for P0 param safety check)
-    scope = state.get("blade_scope", "")
-    blade_target = (state.get("blade_target") or "").lower()
+    # Pod memory limit (for P0 param safety check) — read from FaultSpec
+    spec = read_fault_spec(state) or FaultSpec()
+    scope = spec.scope
+    blade_target = spec.blade_target.lower()
     kubeconfig = state.get("kubeconfig") or ""
-    target_info = state.get("target") or {}
-    ns = target_info.get("namespace", "")
-    names = target_info.get("names", [])
-    labels = target_info.get("labels") or {}
+    ns = spec.namespace
+    names = list(spec.names)
+    labels = dict(spec.labels)
     task_id = state.get("task_id", "unknown")
 
     # Gate by ``blade_target == "mem"`` — every downstream consumer of
@@ -126,16 +127,16 @@ def make_direct_setup(registry: SkillRegistry) -> Callable:
             return result
 
         # 2. Build plan summary (for confirmation_gate and verifier)
-        scope = state.get("blade_scope", "")
-        target = state.get("blade_target", "")
-        action = state.get("blade_action", "")
-        target_info = state.get("target") or {}
-        ns = target_info.get("namespace", "")
-        names = target_info.get("names", [])
+        from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+        spec = read_fault_spec(state) or FaultSpec()
+        scope = spec.scope
+        target = spec.blade_target
+        action = spec.blade_action
+        ns = spec.namespace
+        names = list(spec.names)
 
-        params = state.get("params") or {}
-        param_str = ", ".join(f"{k}={v}" for k, v in params.items() if v)
-        flags_str = " ".join(state.get("params_flags") or [])
+        param_str = ", ".join(f"{k}={v}" for k, v in spec.params.items() if v)
+        flags_str = " ".join(spec.params_flags)
 
         plan = (
             f"Direct blade injection: blade create k8s {scope}-{target} {action}\n"

@@ -359,34 +359,40 @@ def _resolve_templates(
     Returns list of dicts with resolved values. Unresolvable commands
     are marked with _unresolved=True so _execute_observations can skip them.
     """
-    # LLM tool args occasionally arrive in unexpected shapes
-    # (string instead of dict, JSON string, comma-separated list).
-    # ``coerce_to_dict`` / ``coerce_to_list`` accept all of those and
-    # log a warning on unrecognised forms. Without this defence the
-    # ``labels.items()`` call below crashed baseline_capture with
-    # ``'str' object has no attribute 'items'`` when the LLM
-    # serialised labels as ``"app=nginx,tier=front"``.
-    from chaos_agent.utils.coerce import coerce_to_dict, coerce_to_list
+    from chaos_agent.agent.fault_spec import read_fault_spec
 
-    target_info = coerce_to_dict(
-        state.get("target"),
-        context="baseline_capture._resolve_templates:target",
-    )
-    namespace = target_info.get("namespace", "") or ""
-    names = coerce_to_list(
-        target_info.get("names"),
-        context="baseline_capture._resolve_templates:names",
-    )
+    # Single source of truth — FaultSpec contracts names as
+    # ``tuple[str, ...]`` and labels as ``dict[str, str]`` so we
+    # don't need the old coerce-on-read defensive layer. The previous
+    # design read state.target/state.blade_scope directly with
+    # coerce_to_dict / coerce_to_list to absorb LLM-side shape drift;
+    # all that shape normalisation now lives in FaultSpec's
+    # constructors so consumers get clean types.
+    spec = read_fault_spec(state)
+    if spec is None:
+        # No spec → no useful target info → produce one unresolved
+        # entry per command so the caller logs + skips uniformly.
+        return [
+            {
+                "description": cmd.description,
+                "subcommand": cmd.subcommand,
+                "v_args": cmd.v_args_template,
+                "mode": cmd.mode,
+                "_unresolved": True,
+                "_node_name": "",
+                "_extractors": cmd.extractors,
+            }
+            for cmd in commands
+        ]
+
+    namespace = spec.namespace
+    names = list(spec.names)
     node_name = names[0] if names else ""
     # For node-scope, names contains node names — not pod names.
     # Setting pod_name to a node name causes incorrect baseline commands
     # (e.g., kubectl exec into a "pod" that is actually a node name).
-    _scope = state.get("blade_scope", "")
-    pod_name = "" if _scope == "node" else (names[0] if names else "")
-    labels_dict = coerce_to_dict(
-        target_info.get("labels"),
-        context="baseline_capture._resolve_templates:labels",
-    )
+    pod_name = "" if spec.scope == "node" else (names[0] if names else "")
+    labels_dict = spec.labels
     label_selector = (
         "-l " + ",".join(f"{k}={v}" for k, v in labels_dict.items())
         if labels_dict
@@ -1348,10 +1354,15 @@ def make_baseline_capture(llm=None, registry=None):
         )
 
         try:
-            # 1. Extract parameters from state
-            scope = state.get("blade_scope", "")
-            target = state.get("blade_target", "")
-            action = state.get("blade_action", "")
+            # 1. Extract parameters from state.fault_spec — single
+            # source of truth. ``read_fault_spec`` returns a typed
+            # FaultSpec so we read scope/blade_target/blade_action
+            # directly instead of from 3 separate state fields.
+            from chaos_agent.agent.fault_spec import read_fault_spec
+            spec = read_fault_spec(state)
+            scope = spec.scope if spec else ""
+            target = spec.blade_target if spec else ""
+            action = spec.blade_action if spec else ""
             skill_case = state.get("skill_case_content", "")
             kubeconfig = state.get("kubeconfig", "")
 

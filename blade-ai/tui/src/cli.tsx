@@ -306,43 +306,57 @@ async function main(): Promise<void> {
       </StoreProvider>
     </TerminalBgProvider>,
     {
-      // ``incrementalRendering`` is intentionally NOT enabled.
-      // qwen-code (Ink v7) doesn't enable it either — they rely on
-      // strict height-capping to keep the dynamic frame ≤
-      // ``stdout.rows``, same strategy we use. Enabling incremental
-      // would leave "ghost" frames when content shifts vertically
-      // (e.g. a confirm card pushes the LoadingIndicator from row R
-      // to row R+25 and the old row R copy isn't erased), which is
-      // exactly the "two stacked ⠴ thinking lines with different
-      // elapsed counters" the user reported.
+      // ``incrementalRendering: true`` — line-level diff in
+      // ``log-update.js``. Ink writes each rendered line, compares
+      // it to the same row of the previous frame, and **skips
+      // unchanged lines** (only ``cursorNextLine`` advances past
+      // them) instead of rewriting the whole dynamic frame. Source
+      // (node_modules/ink/build/log-update.js:185-205):
       //
-      // ``maxFps: 30`` matches Ink's default and qwen-code (which
-      // also leaves it unset, defaulting to 30). Why not the previous
-      // 4 fps:
+      //     // We do not write lines if the contents are the same.
+      //     // This prevents flickering during renders.
+      //     if (nextLines[i] === previousLines[i]) {
+      //       buffer.push(ansiEscapes.cursorNextLine);
+      //       continue;
+      //     }
       //
-      //   - ``ink-spinner`` ticks internally at 12.5 fps ("dots"
-      //     profile, 80ms per frame). At 4 fps stdout writes only
-      //     surface every 3rd internal frame — the rotation reads
-      //     as "skipping" rather than spinning. ≥ 13 fps is needed
-      //     for the spinner to look smooth; 30 lines up with the
-      //     animation cadence and matches what users expect from
-      //     other Ink-based agent CLIs.
-      //   - Input echo lag at 4 fps is up to 250ms per keystroke
-      //     (worst case, when a state-changing render is queued).
-      //     30 fps caps that at ~33ms — below the perception
-      //     threshold for typing latency.
-      //   - The selection-stability and flicker-tail concerns the
-      //     old comment cited are now handled structurally: the
-      //     reducer's ``flushLeadingStable`` peels stable items out
-      //     of pending so the dynamic frame never grows past the
-      //     viewport, and the streaming-event throttle in
-      //     ``useStream`` (50ms / 20 fps for both token and thinking
-      //     events) bounds how often reducer work fires regardless
-      //     of paint rate.
+      // **Why this matters on Apple Terminal / non-DEC-2026
+      // terminals**: standard mode writes
+      // ``eraseLines(N) + N rows of new content`` on every frame. The
+      // terminal first erases all N rows (visibly blanking them),
+      // then fills back. A user mid-selection sees their selection
+      // wiped on each spinner tick because the cells transit
+      // through "blank". With incremental mode the spinner row is
+      // the only one rewritten — the other 14 rows of the dynamic
+      // frame keep their selection state. Same fix Ink itself
+      // documents for "flickering during renders".
       //
-      // Static appends (history flushes) bypass maxFps so they
-      // remain immediate; only the "redraw the dynamic frame"
-      // path is throttled.
+      // **Why we previously avoided it**: comments cited a
+      // "ghost frame on vertical shift" hazard. That was Ink
+      // issue #909, fixed in #910 (https://github.com/vadimdemedes/
+      // ink/pull/910), shipped in v6.0.x. We're on v7.0.3 — the
+      // incremental code now correctly emits ``eraseLines(prev -
+      // visible)`` + ``cursorUp`` when the row count shrinks, and
+      // ``\x1b[J`` (eraseEndLine) per row per write to keep
+      // overflow bytes from dangling. Verified by reading the
+      // source.
+      //
+      // **Escape hatch**: ``BLADE_AI_LEGACY_RENDERING=1`` falls
+      // back to standard mode for users on terminals that
+      // misbehave with the incremental cursor sequences. Should
+      // not be needed on iTerm2 / WezTerm / kitty / Apple Terminal
+      // / Windows Terminal / xterm — all of which implement the
+      // CSI cursor commands incremental mode relies on. If a
+      // future terminal proves problematic, escape via env var
+      // instead of ripping out the optimization.
+      //
+      // ``maxFps: 30`` — see prior history; matches Ink default
+      // and qwen-code. Caps spinner-driven repaints at the same
+      // rate as ink-spinner's 12.5 fps animation cadence. With
+      // incremental mode, hitting the cap is far cheaper because
+      // unchanged lines don't get written at all.
+      incrementalRendering:
+        process.env["BLADE_AI_LEGACY_RENDERING"] !== "1",
       maxFps: 30,
     },
   );

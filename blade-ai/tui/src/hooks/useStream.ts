@@ -187,10 +187,10 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
       //     range for human perception), and we previously parked at
       //     180ms to drop the rate to ~5Hz.
       //
-      //     Phase 2 erased that ceiling: AgentMessage now caps the
-      //     pending body to ``PENDING_AGENT_MAX_VISIBLE = 8`` rows
-      //     (qwen-code-style MaxSizedBox), so the redraw payload is
-      //     small and constant regardless of total reply size; every
+      //     Phase 2 erased that ceiling: AgentMessage caps the pending
+      //     body at ``availableTerminalHeight`` (viewport-relative,
+      //     qwen-code-style), so the redraw payload is bounded by the
+      //     screen rather than the total reply size; every
       //     downstream history component is wrapped in ``React.memo``
       //     so the per-token MainContent re-render walks only the
       //     pending area; Composer subscribes narrowly to its slice

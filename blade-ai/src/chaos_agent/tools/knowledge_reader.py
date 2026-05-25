@@ -174,7 +174,7 @@ def _build_outline(content: str) -> str:
 
 @tool
 async def read_knowledge_resource(filename: str, section: str = "") -> str:
-    """Read a knowledge document by filename for domain expertise.
+    """Phase 1 / Phase 2 read-only. Read a knowledge document by filename for domain expertise.
 
     When to use:
       - You need K8s syntax / JSONPath / verification heuristics / chaos

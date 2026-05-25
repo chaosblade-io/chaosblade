@@ -26,7 +26,14 @@ async def load_memory(state: AgentState) -> dict:
     task_id = state.get("task_id", "unknown")
     working_dir = settings.working_dir
     memory_dir = settings.resolved_memory_dir
-    updates = {}
+    # Wipe per-turn transient fields that should NOT bleed across turns
+    # via the LangGraph checkpoint. ``approved_target`` is the most
+    # important one — without this clear, a chat-only follow-up turn
+    # could inherit the previous inject turn's frozen approval and
+    # cause the screener to false-positive on read-only or unrelated
+    # tool_calls. confirmation_gate refreezes a fresh approval on the
+    # next user approve, so wiping at turn-start is safe.
+    updates: dict = {"approved_target": None, "screener_route": None}
 
     tracker = get_tracker(task_id)
     tracker.start(
@@ -44,12 +51,14 @@ async def load_memory(state: AgentState) -> dict:
         logger.warning(f"Failed to load operational memory: {e}")
         updates["operational_notes"] = ""
 
-    # Load experiment history for the target (from TaskStore)
+    # Load experiment history for the target (from TaskStore) — namespace
+    # comes from the FaultSpec written at entry.
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    _spec = read_fault_spec(state)
     try:
         from chaos_agent.persistence.task_store import get_task_store
         store = await get_task_store()
-        target = state.get("target") or {}
-        namespace = target.get("namespace", "")
+        namespace = _spec.namespace if _spec else ""
         active = await store.query_active(namespace=namespace)
         updates["experiment_history"] = active
     except Exception as e:
@@ -59,28 +68,25 @@ async def load_memory(state: AgentState) -> dict:
     tracker.complete("Memory loaded")
     sync_node_status_to_session(state, "load_memory", "Memory loaded")
 
-    # If NL description is present, inject it as a HumanMessage so the Agent can see it
-    nl_description = state.get("input")
+    # Per-turn chat input takes priority — ``state.input`` is set by
+    # entry points on every invocation (TUI first turn, TUI continuing
+    # turn, CLI NL re-invocation). Falls through to FaultSpec's
+    # ``user_description`` (NL placeholder seed) and finally to the
+    # structured synthetic prompt for direct mode (no input, complete
+    # spec).
+    nl_description = state.get("input") or (_spec.user_description if _spec else "")
     if nl_description:
         updates["messages"] = [HumanMessage(content=nl_description)]
-    elif state.get("blade_scope") and state.get("blade_target") and state.get("blade_action"):
-        # Structured mode: synthesize HumanMessage from blade parameters
-        # so the LLM receives a clear fault injection request
-        scope = state["blade_scope"]
-        target = state["blade_target"]
-        action = state["blade_action"]
-        target_info = state.get("target") or {}
-        ns = target_info.get("namespace", "")
-        names = target_info.get("names", [])
-        parts = [f"执行故障注入：{scope}-{target}-{action}"]
-        if ns:
-            parts.append(f"目标命名空间: {ns}")
-        if names:
-            names_str = ", ".join(names) if isinstance(names, list) else names
-            parts.append(f"目标名称: {names_str}")
-        params = state.get("params") or {}
-        if params:
-            param_str = ", ".join(f"{k}={v}" for k, v in params.items() if v)
+    elif _spec and _spec.is_complete:
+        # Direct mode (no NL input, structured spec) — synthesise a
+        # HumanMessage from the spec so the agent has a clear request.
+        parts = [f"执行故障注入：{_spec.scope}-{_spec.blade_target}-{_spec.blade_action}"]
+        if _spec.namespace:
+            parts.append(f"目标命名空间: {_spec.namespace}")
+        if _spec.names:
+            parts.append(f"目标名称: {', '.join(_spec.names)}")
+        if _spec.params:
+            param_str = ", ".join(f"{k}={v}" for k, v in _spec.params.items() if v)
             if param_str:
                 parts.append(f"参数: {param_str}")
         kubeconfig = state.get("kubeconfig") or ""
