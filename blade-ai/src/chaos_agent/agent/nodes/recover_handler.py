@@ -29,12 +29,24 @@ logger = logging.getLogger(__name__)
 async def recover_handler(state: AgentState) -> dict:
     """Bridge node for recover intent — prepares context for recover_graph launch.
 
-    Scenarios:
-    - No active experiments → inform user, no recovery possible
-    - Exactly 1 active experiment → auto-select, set recover_task_id
-    - Multiple active experiments → list them, user selects via intent_context
+    If intent_clarification already set recover_task_id (LLM guided the user
+    through query_active_experiments), this node passes through without
+    redundant queries. Only runs the full lookup as fallback when
+    recover_task_id is missing.
     """
     task_id = state.get("task_id", "unknown")
+
+    # If intent_clarification already resolved the target, pass through.
+    existing_recover_tid = state.get("recover_task_id", "")
+    if existing_recover_tid:
+        tracker = get_tracker(task_id) if task_id else None
+        if tracker:
+            tracker.start(StatusCategory.NODE, "recover_handler", "已有恢复目标")
+            tracker.complete(f"pass-through → {existing_recover_tid}")
+        return {
+            "operation": "recover",
+            "recover_task_id": existing_recover_tid,
+        }
 
     # Manual tracker for observability
     tracker = get_tracker(task_id) if task_id else None
@@ -51,6 +63,11 @@ async def recover_handler(state: AgentState) -> dict:
             if tracker:
                 tracker.update("无活跃实验")
                 tracker.complete()
+            try:
+                from chaos_agent.agent.dispatch import dispatch_node_message
+                await dispatch_node_message("recover_handler", msg)
+            except Exception:
+                pass
             return {
                 "operation": "recover",
                 "messages": [AIMessage(content=msg)],
@@ -79,6 +96,11 @@ async def recover_handler(state: AgentState) -> dict:
             if tracker:
                 tracker.update(f"自动选择实验 {tid}")
                 tracker.complete()
+            try:
+                from chaos_agent.agent.dispatch import dispatch_node_message
+                await dispatch_node_message("recover_handler", msg)
+            except Exception:
+                pass
             return {
                 "operation": "recover",
                 "recover_task_id": tid,
@@ -101,6 +123,11 @@ async def recover_handler(state: AgentState) -> dict:
         lines.append("\n请回复编号或 task_id 来选择要恢复的实验。")
         msg = "\n".join(lines)
 
+        try:
+            from chaos_agent.agent.dispatch import dispatch_node_message
+            await dispatch_node_message("recover_handler", msg)
+        except Exception:
+            pass
         return {
             "operation": "recover",
             "needs_task_selection": True,

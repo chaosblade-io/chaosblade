@@ -332,6 +332,28 @@ def _build_skill_tools(registry: SkillRegistry):
         except Exception as e:
             return f"Error saving plan: {e}"
 
+    @lc_tool
+    def finish_planning(summary: str, rejected: bool = False, rejection_reason: str = "") -> str:
+        """Signal that Phase 1 is complete — either proceed to execution or reject the request.
+
+        This is the REQUIRED way to end Phase 1. Two modes:
+        - Normal (default): proceed to safety check → user confirmation → execution.
+        - Rejection: rejected=True. The request cannot be fulfilled. The system will
+          end the run cleanly without any cluster changes.
+
+        Inputs:
+          - summary: Brief summary of the plan (normal) or the rejection decision.
+          - rejected: Set to True to reject the request. Default False.
+          - rejection_reason: Why the request is rejected (only when rejected=True).
+
+        Output: Confirmation message.
+
+        Side effects: None (control signal only — the system handles the transition).
+        """
+        if rejected:
+            return f"Planning rejected. Reason: {rejection_reason or summary}"
+        return f"Planning finalized. Summary: {summary}"
+
     # Build dynamic script catalog for tool description
     _scripts_catalog_parts = []
     for _sk_name, _sk_meta in registry.metadata.items():
@@ -446,12 +468,14 @@ def _build_skill_tools(registry: SkillRegistry):
         "{_scripts_catalog}", _scripts_catalog
     )
 
-    return [activate_skill, read_skill_resource, read_file, write_file, save_fault_plan, execute_skill_script]
+    return [activate_skill, read_skill_resource, read_file, write_file, save_fault_plan, finish_planning, execute_skill_script]
 
 
 async def create_agent(
     registry: SkillRegistry,
     checkpointer=None,
+    *,
+    mcp_manager=None,
 ) -> dict:
     """Create compiled graph instances for inject and recover.
 
@@ -459,6 +483,12 @@ async def create_agent(
         registry: SkillRegistry with skills loaded
         checkpointer: LangGraph checkpointer for state persistence.
                       If None, uses AsyncSqliteSaver.
+        mcp_manager: Optional ``McpManager`` (E9). When provided, per-phase
+                     external MCP tools are appended to the corresponding
+                     built-in tool list. Filtering by attach_to is
+                     enforced inside ``McpManager.tools_for_phase``.
+                     ``None`` (default) → built-in tools only, zero
+                     behavioural change from pre-E9 builds.
 
     Returns:
         Dict with compiled graph instances: {"inject": ..., "recover": ...}
@@ -470,6 +500,7 @@ async def create_agent(
     _read_skill_resource = _skill_tools_by_name["read_skill_resource"]
     _read_file = _skill_tools_by_name["read_file"]
     _save_fault_plan = _skill_tools_by_name["save_fault_plan"]
+    _finish_planning = _skill_tools_by_name["finish_planning"]
     _execute_skill_script = _skill_tools_by_name["execute_skill_script"]
 
     # Clarification tools: only available in intent_clarification node (TUI mode).
@@ -477,17 +508,25 @@ async def create_agent(
     # directly — NOT a ToolNode tool. submit_fault_intent is now a real @tool
     # processed by ToolNode (produces ToolMessage feedback for the model).
     # Multi-invocation model: ask_human removed; conversation turns are handled
-    # by graph termination + TUI REPL loop. ToolNode processes: kubectl (target
-    # verification), activate_skill + read_skill_resource (browse fault types),
-    # submit_fault_intent (signal intent convergence).
-    from chaos_agent.agent.nodes.intent_clarification import submit_fault_intent
+    # by graph termination + TUI REPL loop. ToolNode processes: kubectl_ro
+    # (read-only target verification), activate_skill + read_skill_resource
+    # (browse fault types), submit_fault_intent (signal intent convergence).
+    #
+    # ``kubectl_ro`` (NOT full ``kubectl``) — same rationale as phase1_tools:
+    # intent_clarification is a pre-planning stage; only read-only inspection
+    # is appropriate. Full kubectl was the bypass vector in sess_1e39e8f4dcce
+    # where the LLM called `kubectl scale` to directly mutate kube-system.
+    from chaos_agent.agent.nodes.intent_clarification import submit_fault_intent, query_active_experiments
 
     clarification_tools = [
-        kubectl,
+        kubectl_ro,
         _activate_skill,
         _read_skill_resource,
         submit_fault_intent,
+        query_active_experiments,
     ]
+    if mcp_manager is not None:
+        clarification_tools = clarification_tools + mcp_manager.tools_for_phase("clarification")
 
     # P1-1: Phase 1 (planning / agent_loop) — tightened tool surface.
     # Phase 1 (agent_loop / planning) tool surface.
@@ -535,11 +574,14 @@ async def create_agent(
         _read_skill_resource,
         _read_file,
         _save_fault_plan,
+        _finish_planning,
         blade_status,
         # blade_destroy intentionally absent — see comment above
         kubectl_ro,                # ← was: kubectl (full surface)
         read_knowledge_resource,
     ]
+    if mcp_manager is not None:
+        phase1_tools = phase1_tools + mcp_manager.tools_for_phase("phase1")
 
     # P1-1: Phase 2 (execution / execute_loop) — tightened tool surface.
     # Excludes blade_destroy and read_skill_resource:
@@ -555,6 +597,8 @@ async def create_agent(
         _execute_skill_script,
         read_knowledge_resource,
     ]
+    if mcp_manager is not None:
+        phase2_tools = phase2_tools + mcp_manager.tools_for_phase("phase2")
 
     verifier_tools = [
         kubectl,
@@ -562,6 +606,8 @@ async def create_agent(
         _execute_skill_script,
         read_knowledge_resource,
     ]
+    if mcp_manager is not None:
+        verifier_tools = verifier_tools + mcp_manager.tools_for_phase("verifier")
 
     recover_verifier_tools = [
         kubectl,
@@ -569,6 +615,10 @@ async def create_agent(
         _execute_skill_script,
         read_knowledge_resource,
     ]
+    if mcp_manager is not None:
+        # Recover verifier shares the same MCP attach_to as the inject
+        # verifier phase — both are read-only verification work.
+        recover_verifier_tools = recover_verifier_tools + mcp_manager.tools_for_phase("verifier")
 
     # Set up checkpointer
     conn = None  # aiosqlite connection ref for cleanup
@@ -649,7 +699,18 @@ async def create_agent(
     from chaos_agent.observability import status_tracker as _st_mod
     _st_mod._tracing_callback = _tracing_callback
 
-    llm = make_llm(callbacks=[_tracing_callback])
+    # Initialize OTel GenAI parallel export (no-op if not installed/enabled)
+    from chaos_agent.observability.otel_genai import (
+        init_otel_genai, OTelGenAICallback, is_otel_available,
+    )
+    init_otel_genai()
+    llm_callbacks: list = [_tracing_callback]
+    if is_otel_available():
+        _otel_callback = OTelGenAICallback()
+        _st_mod._otel_callback = _otel_callback
+        llm_callbacks.append(_otel_callback)
+
+    llm = make_llm(callbacks=llm_callbacks)
     thinking_status = "enabled" if settings.llm_enable_thinking else "disabled"
     logger.info(f"LLM initialized: {settings.model_name} (thinking {thinking_status}, with tracing callback)")
 
@@ -666,9 +727,12 @@ async def create_agent(
         from chaos_agent.memory.tui_session_store import get_global_tui_session_store
 
         memory_base = settings.resolved_memory_dir
+        ctx_max_tokens, ctx_compact_ratio = settings.resolve_context_budget(
+            settings.model_name
+        )
         context_manager = ContextManager(
-            max_tokens=settings.context_max_tokens,
-            compact_ratio=settings.context_compact_ratio,
+            max_tokens=ctx_max_tokens,
+            compact_ratio=ctx_compact_ratio,
         )
         tool_compactor = ToolResultCompactor(cache_dir=memory_base / "tool_cache")
         session_store = SessionStore(task_dir=memory_base / "tasks")
@@ -718,6 +782,7 @@ async def create_agent(
         "checkpointer": checkpointer,
         "checkpointer_conn": conn,  # aiosqlite connection for cleanup
         "session_store": session_store,
+        "skill_registry": registry,
         # Manual /compact (TUI ``commands._compact_thread`` and server
         # ``/api/v1/sessions/{sid}/compact``) now runs the SAME
         # PreReasoningHook the auto-trigger uses, just with force=True.

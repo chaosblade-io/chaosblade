@@ -9,7 +9,8 @@ from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
 from chaos_agent.agent.target_guard import freeze_approved_target
-from chaos_agent.errors import FailureReason
+from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
@@ -18,46 +19,10 @@ from chaos_agent.observability.status_tracker import (
 logger = logging.getLogger(__name__)
 
 
-def _format_dry_run_preview(state: AgentState) -> str:
-    """Render a human-readable preview of what would happen if approved."""
-    skill_name = state.get("skill_name", "(未识别)")
-    spec = read_fault_spec(state) or FaultSpec()
-    plan = state.get("plan_summary") or state.get("plan") or ""
-
-    lines = ["📋 Dry-Run 预览 — 仅展示计划，不会真正执行。"]
-    lines.append(f"  • 技能: {skill_name}")
-
-    if spec.namespace or spec.names:
-        ns = spec.namespace or "—"
-        names_str = ", ".join(spec.names) if spec.names else "—"
-        lines.append(f"  • 目标: namespace={ns}  names=[{names_str}]")
-
-    if spec.fault_type:
-        lines.append(f"  • 故障类型: {spec.fault_type}")
-    for k, v in spec.params.items():
-        # Skip the 4 keys that the legacy nested-params format used to
-        # carry scope/action/target/namespace alongside tuning fields —
-        # those are now first-class spec attributes, displayed above.
-        if k in ("scope", "action", "target", "namespace"):
-            continue
-        lines.append(f"  • {k}: {v}")
-
-    safety_status = state.get("safety_status", "")
-    if safety_status:
-        lines.append(f"  • 安全检查: {safety_status}")
-    safety_reason = state.get("safety_reason")
-    if safety_reason:
-        lines.append(f"  • 安全说明: {safety_reason}")
-
-    if plan:
-        lines.append("")
-        lines.append("📝 计划摘要:")
-        for ln in str(plan).strip().splitlines():
-            lines.append(f"  {ln}")
-
-    lines.append("")
-    lines.append("继续 /plan <修改建议> 调整计划，或 /run 落地执行。")
-    return "\n".join(lines)
+def _generate_dry_run_plan(state: AgentState) -> str:
+    """Generate a complete injection plan for dry_run (/plan) output."""
+    from chaos_agent.agent.plan_generator import generate_injection_plan
+    return generate_injection_plan(state)
 
 
 async def confirmation_gate(state: AgentState) -> dict:
@@ -98,21 +63,21 @@ async def confirmation_gate(state: AgentState) -> dict:
         {"skill_name": skill_name, "target": target},
     )
 
-    # Dry-Run preview: emit the "what would happen" AIMessage and exit cleanly.
+    # Dry-Run: generate a complete injection plan and emit as AIMessage.
     if state.get("dry_run"):
-        preview = _format_dry_run_preview(state)
-        logger.info("dry_run preview emitted for task %s", task_id)
-        tracker.complete("Dry-Run preview rendered")
+        plan_text = _generate_dry_run_plan(state)
+        logger.info("dry_run plan generated for task %s", task_id)
+        tracker.complete("Dry-Run plan generated")
         sync_node_status_to_session(
             state,
             "confirmation_gate",
-            "Dry-Run preview rendered",
+            "Dry-Run plan generated",
             detail={"dry_run": True},
         )
         result = {
-            "messages": [AIMessage(content=preview)],
+            "messages": [AIMessage(content=plan_text)],
             "needs_confirmation": False,
-            "plan_summary": state.get("plan_summary") or plan or "",
+            "plan_summary": plan_text,
         }
         await sync_to_store(state, result)
         return result
@@ -156,8 +121,27 @@ async def confirmation_gate(state: AgentState) -> dict:
     #   · ``is_complex``           — formal plan track flag.
     #   · ``plan_path``            — saved plan file path; UI can
     #                                show "Plan saved to xxx.md".
+    #   · ``fault_intent``         — semantic classification from L1
+    #                                (fault_type / scope / target /
+    #                                action). The L2 confirm card
+    #                                previously only had ``target``
+    #                                (namespace + names) — operators
+    #                                had to reverse-engineer "is this
+    #                                a mem-load?" from ``params`` keys.
+    #                                Surfacing the L1 classification
+    #                                makes the fault category visible
+    #                                at a glance without changing
+    #                                anything else.
+    fault_intent_brief = {
+        "fault_type": spec.fault_type,    # derived: "{scope}-{target}-{action}"
+        "scope":      spec.scope,
+        "target":     spec.blade_target,  # blade "target" axis: cpu / mem / network / ...
+        "action":     spec.blade_action,  # blade "action" axis: fullload / load / loss / ...
+    } if spec and spec.fault_type else None
+
     confirmation_info = {
         "skill_name": skill_name,
+        "fault_intent": fault_intent_brief,
         "target": target,
         "plan_summary": plan[:500] if plan else "",
         "safety_status": safety_status,
@@ -168,6 +152,11 @@ async def confirmation_gate(state: AgentState) -> dict:
         "pipeline_attempt": int(state.get("pipeline_attempt") or 0),
         "is_complex": bool(state.get("is_complex")),
         "plan_path": state.get("plan_path") or "",
+        # E10 — multi-dimensional numeric safety score for confirm card
+        # display. None when safety_check hasn't run (e.g. dry_run path).
+        "safety_score": state.get("safety_score"),
+        # E18 — injection feasibility report (headroom assessment).
+        "feasibility_report": state.get("feasibility_report"),
     }
 
     # P1: confirm_required without --force-override in CLI mode → reject with guidance
@@ -182,7 +171,7 @@ async def confirmation_gate(state: AgentState) -> dict:
             "safety_status": "rejected",
             "safety_reason": f"{safety_reason} Add --force-override to proceed.",
             "needs_confirmation": False,
-            "failure_reason": f"{FailureReason.SAFETY_REJECTED.value}: confirm_required without --force-override; {safety_reason}",
+            **fail_state(FailureCategory.SAFETY_REJECTED, f"confirm_required without --force-override; {safety_reason}"),
         }
         await sync_to_store(state, result)
         return result
@@ -211,7 +200,7 @@ async def confirmation_gate(state: AgentState) -> dict:
             "safety_status": "rejected",
             "safety_reason": "User rejected the execution",
             "needs_confirmation": False,
-            "failure_reason": f"{FailureReason.USER_REJECTED.value}: User rejected the execution at confirmation gate",
+            **fail_state(FailureCategory.USER_REJECTED, "User rejected the execution at confirmation gate"),
             # Clear any stale approval — the next attempt will refreeze.
             "approved_target": None,
         }

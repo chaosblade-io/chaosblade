@@ -38,6 +38,14 @@ async def dispatch_phase_completed(node: str, phase: str) -> None:
     await adispatch_custom_event("phase_completed", {"node": node, "phase": phase})
 
 
+async def dispatch_node_message(node: str, content: str) -> None:
+    """Emit a node_message event for programmatic text not produced by an LLM call.
+
+    parse_stream_event converts this to a token StreamEvent so the TUI displays it.
+    """
+    await adispatch_custom_event("node_message", {"node": node, "content": content})
+
+
 def with_phase_events(
     node_name: str,
     phase: str,

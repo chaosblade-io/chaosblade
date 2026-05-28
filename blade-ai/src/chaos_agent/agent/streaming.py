@@ -2,6 +2,7 @@
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -45,11 +46,13 @@ class StreamEvent:
     # row ("completed"/"failed") transition.
     compaction_phase: str = ""
     # Approximate token counts straddling the compaction. ``before`` is
-    # ``count_tokens_approx`` over the messages slated for compaction;
-    # ``after`` is the same metric over the post-compaction tail. Both
-    # are best-effort estimates (the LLM's actual token cost lands on
-    # ``usage`` events) — the user just needs a relative magnitude to
-    # judge whether the compaction freed real context.
+    # ``count_tokens_messages(...).safe_count`` over the messages
+    # slated for compaction; ``after`` is the same metric over the
+    # post-compaction tail. Both are best-effort estimates that carry
+    # an internal quality tag (EXACT / APPROXIMATE / HEURISTIC, see
+    # ``chaos_agent.memory.tokens``) — the LLM's actual token cost
+    # lands on ``usage`` events. The user just needs a relative
+    # magnitude to judge whether the compaction freed real context.
     tokens_before: int = 0
     tokens_after: int = 0
     # How many input messages got rolled into the summary. Useful in
@@ -57,8 +60,9 @@ class StreamEvent:
     # summary") so the user grasps the savings beyond raw tokens.
     messages_compacted: int = 0
     # Wall-clock duration of the compaction call in milliseconds.
-    # ``count_tokens_approx`` is cheap; the LLM call is what makes
-    # this multi-second-grade. Lets the TUI show "压缩用时 6.3s".
+    # ``count_tokens_messages`` is cheap (tiktoken Rust path is ~3-6×
+    # the legacy heuristic); the LLM call is what makes this
+    # multi-second-grade. Lets the TUI show "压缩用时 6.3s".
     duration_ms: float = 0.0
     # Layer label for diagnostics: ``"llm_summary"`` (the only path
     # that surfaces UI today) or ``"lightweight"`` (reserved for a
@@ -98,10 +102,12 @@ class StreamEvent:
     # ``type=context_size`` events. Emitted by PreReasoningHook after
     # every reasoning step so the TS TUI Footer can render a live
     # "state size / window" indicator. ``current_tokens`` is the
-    # post-hook ``count_tokens_approx × 1.2`` (the exact same number
-    # the trigger compares against), so the displayed percent
-    # corresponds 1:1 to compaction firing. All default 0 so the
-    # wire-format stripper drops them on every other event type.
+    # post-hook ``count_tokens_messages(...).safe_count`` (the exact
+    # same number the trigger compares against — per-quality margin,
+    # 1.0/1.05/1.20, see ``chaos_agent.memory.tokens``), so the
+    # displayed percent corresponds 1:1 to compaction firing. All
+    # default 0 so the wire-format stripper drops them on every other
+    # event type.
     context_current_tokens: int = 0
     context_trigger_tokens: int = 0
     context_max_tokens: int = 0
@@ -156,6 +162,16 @@ class StreamEvent:
         return f"data: {json.dumps(self.to_dict(), ensure_ascii=False)}\n\n"
 
 
+# Nodes whose LLM token / thinking chunks should NOT stream to the TUI.
+# Their final output is delivered via the result envelope (e.g. ``save_memory``
+# attaches the postmortem markdown to the result payload, which the TUI
+# renders as PostmortemSection). Streaming the tokens would render the
+# same content twice — once as agent text, once as the card.
+# ``on_chat_model_end`` (→ usage event) is NOT gated, so token accounting
+# stays accurate for the per-turn footer.
+_SILENT_TOKEN_NODES: frozenset[str] = frozenset({"save_memory"})
+
+
 def parse_stream_event(raw_event: dict) -> Optional[StreamEvent]:
     """Parse a LangGraph astream_events (v2) raw event into a StreamEvent.
 
@@ -178,11 +194,17 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent]:
         if chunk is None:
             return None
 
+        node = _extract_node_name(raw_event)
+        # Drop token/thinking from nodes whose output is delivered via
+        # the result envelope (postmortem). Usage events still pass
+        # through on_chat_model_end so token counting stays correct.
+        if node in _SILENT_TOKEN_NODES:
+            return None
+
         # Check for thinking/reasoning content (from Qwen enable_thinking mode)
         additional_kwargs = getattr(chunk, "additional_kwargs", {}) or {}
         reasoning_content = additional_kwargs.get("reasoning_content", "")
         if reasoning_content:
-            node = _extract_node_name(raw_event)
             return StreamEvent(type="thinking", content=reasoning_content, node=node)
 
         content = getattr(chunk, "content", "") or ""
@@ -196,8 +218,6 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent]:
             content = "".join(text_parts)
         if not content:
             return None
-        # Determine source node from tags or name
-        node = _extract_node_name(raw_event)
         return StreamEvent(type="token", content=content, node=node)
 
     elif event_name == "on_tool_start":
@@ -266,6 +286,14 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent]:
                 node=data.get("node", ""),
                 phase=data.get("phase", "") or "",
             )
+        elif custom_name == "node_message":
+            content = data.get("content", "")
+            if content:
+                return StreamEvent(
+                    type="token",
+                    content=content,
+                    node=data.get("node", ""),
+                )
         return None
 
     # Silently ignore other events (on_chat_model_start, on_chain_start, etc.)
@@ -330,3 +358,119 @@ def _extract_node_name(raw_event: dict) -> str:
     if "langgraph_node" in metadata:
         return metadata["langgraph_node"]
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Server-side SSE token batching
+# ---------------------------------------------------------------------------
+
+_BATCHABLE_TYPES = frozenset(("token", "thinking"))
+
+
+class SSEBatcher:
+    """Accumulates token/thinking events and flushes on deadline or size.
+
+    Usage inside an event loop::
+
+        batcher = SSEBatcher()
+        for event in stream:
+            for sse_str in batcher.feed(event):
+                yield sse_str
+        for sse_str in batcher.flush():
+            yield sse_str
+
+    Non-batchable events pass through immediately (after flushing any
+    pending batch so event ordering is preserved).
+
+    When ``flush_interval_ms <= 0``, batching is disabled and every
+    event passes through immediately (zero-overhead).
+    """
+
+    __slots__ = (
+        "_interval_s", "_flush_chars", "_disabled",
+        "_token_buf", "_token_node",
+        "_thinking_buf", "_thinking_node",
+        "_batch_start", "_task_id",
+    )
+
+    def __init__(self, flush_interval_ms: int = 30, flush_chars: int = 30):
+        self._disabled = flush_interval_ms <= 0
+        self._interval_s = flush_interval_ms / 1000.0
+        self._flush_chars = flush_chars
+        self._token_buf = ""
+        self._token_node = ""
+        self._thinking_buf = ""
+        self._thinking_node = ""
+        self._batch_start: float = 0.0
+        self._task_id = ""
+
+    def _flush_pending(self) -> list[str]:
+        out: list[str] = []
+        if self._token_buf:
+            out.append(StreamEvent(
+                type="token", content=self._token_buf,
+                node=self._token_node, task_id=self._task_id,
+            ).to_sse())
+            self._token_buf = ""
+            self._token_node = ""
+        if self._thinking_buf:
+            out.append(StreamEvent(
+                type="thinking", content=self._thinking_buf,
+                node=self._thinking_node, task_id=self._task_id,
+            ).to_sse())
+            self._thinking_buf = ""
+            self._thinking_node = ""
+        self._batch_start = 0.0
+        return out
+
+    def _has_pending(self) -> bool:
+        return bool(self._token_buf or self._thinking_buf)
+
+    def _deadline_exceeded(self) -> bool:
+        if self._batch_start <= 0.0:
+            return False
+        return (time.monotonic() - self._batch_start) >= self._interval_s
+
+    def feed(self, evt: StreamEvent) -> list[str]:
+        """Accept one event; return zero or more SSE strings to yield."""
+        if self._disabled:
+            return [evt.to_sse()]
+
+        if evt.task_id:
+            self._task_id = evt.task_id
+
+        # Check time-based flush before processing the new event.
+        result: list[str] = []
+        if self._has_pending() and self._deadline_exceeded():
+            result.extend(self._flush_pending())
+
+        if evt.type not in _BATCHABLE_TYPES:
+            # Structural event: flush pending first, then pass through.
+            result.extend(self._flush_pending())
+            result.append(evt.to_sse())
+            return result
+
+        # Accumulate batchable event.
+        if not self._has_pending():
+            self._batch_start = time.monotonic()
+
+        if evt.type == "token":
+            self._token_buf += evt.content
+            if evt.node:
+                self._token_node = evt.node
+        else:
+            self._thinking_buf += evt.content
+            if evt.node:
+                self._thinking_node = evt.node
+
+        # Size threshold flush.
+        if (len(self._token_buf) + len(self._thinking_buf)) >= self._flush_chars:
+            result.extend(self._flush_pending())
+
+        return result
+
+    def flush(self) -> list[str]:
+        """Force-flush any remaining buffered content."""
+        if self._disabled:
+            return []
+        return self._flush_pending()

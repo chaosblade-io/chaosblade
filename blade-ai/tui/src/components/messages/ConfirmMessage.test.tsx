@@ -117,9 +117,16 @@ describe("ConfirmContextMessage", () => {
       expect(frame).toContain("]");
     });
 
-    it("renders the '决策信号' section heading when risk or confidence exists", () => {
+    it("renders risk / confidence rows when payload carries them", () => {
+      // Section heading was removed 2026-05-26 per UX request; the
+      // rows themselves stay. We assert the risk-meter glyph and the
+      // confidence percentage to confirm the content didn't regress.
       const { lastFrame } = render(<ConfirmContextMessage item={item} />);
-      expect(lastFrame() ?? "").toContain("决策信号");
+      const frame = lastFrame() ?? "";
+      // Risk meter renders a tier glyph + target word.
+      expect(frame).toMatch(/▁|▂|▃|▅|█/);
+      // Confidence row prints a percentage.
+      expect(frame).toMatch(/\d+%/);
     });
   });
 
@@ -197,21 +204,17 @@ describe("ConfirmContextMessage", () => {
       expect(frame).toContain("]");
     });
 
-    it("places the safety section at the BOTTOM when status is safe", () => {
-      // 'safe' status renders quietly inside the '── 安全检查' section
-      // headed by a divider line — never as a top alert.
-      // We match the divider-prefixed section heading so the card
-      // title '确认执行计划' doesn't collide with the substring check.
+    it("places the safety row at the BOTTOM when status is safe", () => {
+      // Section dividers were removed 2026-05-26; we now use the
+      // skill-name row as the top anchor and the SAFE glyph as the
+      // bottom marker to confirm the ordering survived.
       const { lastFrame } = render(<ConfirmContextMessage item={item} />);
       const frame = lastFrame() ?? "";
-      expect(frame).toContain("── 安全检查");
-      // Sanity check: '── 执行计划' heading must appear ABOVE
-      // '── 安全检查' in the rendered frame (top-to-bottom order).
-      const planIdx = frame.indexOf("── 执行计划");
-      const safetyIdx = frame.indexOf("── 安全检查");
-      expect(planIdx).toBeGreaterThan(-1);
+      const skillIdx = frame.indexOf("node-cpu-fullload");
+      const safetyIdx = frame.indexOf("SAFE");
+      expect(skillIdx).toBeGreaterThan(-1);
       expect(safetyIdx).toBeGreaterThan(-1);
-      expect(planIdx).toBeLessThan(safetyIdx);
+      expect(skillIdx).toBeLessThan(safetyIdx);
     });
 
     it("floats the safety alert to the TOP when status is a warning", () => {
@@ -226,16 +229,15 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      // Top alert: WARNING badge must appear BEFORE the
-      // '── 执行计划' section heading.
+      // WARNING badge must appear BEFORE the skill-name row.
       const warningIdx = frame.indexOf("WARNING");
-      const planHeadingIdx = frame.indexOf("── 执行计划");
+      const skillIdx = frame.indexOf("node-cpu-fullload");
       expect(warningIdx).toBeGreaterThan(-1);
-      expect(planHeadingIdx).toBeGreaterThan(-1);
-      expect(warningIdx).toBeLessThan(planHeadingIdx);
-      // And the bottom '── 安全检查' heading should NOT appear —
-      // adaptive placement means safety shows in exactly one place.
-      expect(frame).not.toContain("── 安全检查");
+      expect(skillIdx).toBeGreaterThan(-1);
+      expect(warningIdx).toBeLessThan(skillIdx);
+      // Adaptive placement: warning shouldn't ALSO render as a bottom
+      // SAFE row — only one safety chip per card.
+      expect(frame).not.toContain("SAFE");
     });
 
     it("renders the Parameters section when payload carries a params dict", () => {
@@ -251,12 +253,11 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      expect(frame).toContain("── 故障参数");
       expect(frame).toContain("cpu_percent=80");
       expect(frame).toContain("timeout=600");
     });
 
-    it("ALWAYS renders Parameters + Target health sections (even when empty)", () => {
+    it("ALWAYS renders Parameters + Target health rows (even when empty)", () => {
       // Empty payload — no params, no health_report. The two sections
       // should still render with placeholder values so the reader
       // knows "agent did look at this, there's just nothing notable".
@@ -276,10 +277,8 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      expect(frame).toContain("── 故障参数");
       // Empty params → "—" placeholder
       expect(frame).toContain("—");
-      expect(frame).toContain("── 目标健康");
       // No health_report → "check not run" placeholder
       expect(frame).toContain("未执行检查");
     });
@@ -301,7 +300,6 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      expect(frame).toContain("── 目标健康");
       expect(frame).toContain("目标无异常");
     });
 
@@ -329,10 +327,62 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      expect(frame).toContain("── 目标健康");
       expect(frame).toContain("node.disk_pressure");
       expect(frame).toContain("DiskPressure");
       expect(frame).toContain("103d");
+    });
+
+    it("renders the feasibility section when severity is impossible", () => {
+      const cr = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "pod-mem-load",
+          target: { namespace: "cms-demo", names: ["accounting-xyz"] },
+          plan_summary: "blade create",
+          safety_status: "safe",
+          feasibility_report: {
+            severity: "impossible",
+            headroom: 0.021,
+            current_value: "230Mi (95.8%)",
+            limit_value: "240Mi",
+            target_value: "235Mi (98%)",
+            message: "Memory at 95.8% (230Mi/240Mi), target 98% — only 5Mi headroom",
+            recommendation: "Pick a Pod with lower memory usage",
+          },
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("230Mi/240Mi");
+      expect(frame).toContain("only 5Mi");
+      expect(frame).toContain("Pick a Pod");
+    });
+
+    it("renders feasibility all-clear when severity is ok", () => {
+      const cr = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "pod-mem-load",
+          target: { namespace: "cms-demo", names: ["accounting-xyz"] },
+          plan_summary: "blade create",
+          safety_status: "safe",
+          feasibility_report: {
+            severity: "ok",
+            headroom: 0.38,
+            current_value: "100Mi (41.7%)",
+            limit_value: "240Mi",
+            target_value: "192Mi (80%)",
+            message: "Sufficient headroom (38%)",
+            recommendation: "",
+          },
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("注入可行");
+      expect(frame).toContain("headroom 38%");
+      expect(frame).toContain("100Mi (41.7%)");
+      expect(frame).toContain("192Mi");
     });
 
     it("renders the Conflicting experiments section + hint when conflict_uids non-empty", () => {
@@ -348,7 +398,6 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      expect(frame).toContain("── 冲突实验");
       expect(frame).toContain("b62ac6d9b907d620");
       expect(frame).toContain("32e2dd17209337c0");
       expect(frame).toContain("/show experiments");
@@ -366,7 +415,7 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      // Attempt now lives as a Field row under '── 执行计划', not
+      // Attempt now lives as a Field row inside the execution-plan block, not
       // as a title suffix. The number itself + the label both show.
       expect(frame).toContain("第 2 次尝试");
       expect(frame).toContain("尝试次数");
@@ -407,11 +456,11 @@ describe("ConfirmContextMessage", () => {
       expect(codeLine).not.toContain("DiskPressure");
     });
 
-    it("skips the Execution-plan heading when no plan fields are present", () => {
+    it("skips the Execution-plan rows when no plan fields are present", () => {
       // Safety-only payload (e.g. early policy block) — must not
-      // render a dangling '── 执行计划' heading with an empty body.
-      // (The card title '确认执行计划' still appears at the top;
-      // we check for the divider-prefixed heading instead.)
+      // render skill / target rows with empty values. Section dividers
+      // were removed 2026-05-26; we assert the absence of the inline
+      // skill label as a proxy for "execution-plan block didn't render".
       const safetyOnly = baseContext({
         node: "confirmation_gate",
         payload: {
@@ -421,9 +470,177 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={safetyOnly} />);
       const frame = lastFrame() ?? "";
-      expect(frame).not.toContain("── 执行计划");
+      // Field labels for skill/target should NOT render when there's
+      // no plan content.
+      expect(frame).not.toContain("技能");
       // Safety alert still appears at the top.
       expect(frame).toContain("BLOCKED");
+    });
+
+    it("renders the safety score panel when payload.safety_score is present", () => {
+      // E10 — multi-dimensional safety score should render overall +
+      // 4 dimensions when the payload carries it.
+      const withScore = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "pod-cpu-fullload",
+          target: { namespace: "prod", names: ["api-gateway"] },
+          plan_summary: "blade create",
+          safety_status: "safe",
+          safety_reason: null,
+          safety_score: {
+            overall: 78,
+            level: "high",
+            blast_radius: { value: 30, explanation: "scope=pod (30), 1 target (+0)" },
+            frequency: { value: 0, explanation: "no conflicts, first attempt" },
+            time: { value: 70, explanation: "business hours, weekday" },
+            topology: { value: 70, explanation: "production namespace 'prod'" },
+            weights: { blast_radius: 0.4, topology: 0.3, frequency: 0.2, time: 0.1 },
+          },
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={withScore} />);
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("78");                       // overall value
+      expect(frame).toContain("production namespace");     // topology explanation
+      expect(frame).toContain("business hours");           // time explanation
+    });
+
+    it("omits the safety score panel when payload.safety_score is missing", () => {
+      // Backward compatibility — older server builds don't emit
+      // safety_score. Card should render normally without the panel.
+      const noScore = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "pod-cpu-fullload",
+          target: { namespace: "default", names: ["p1"] },
+          plan_summary: "blade create",
+          safety_status: "safe",
+          safety_reason: null,
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={noScore} />);
+      const frame = lastFrame() ?? "";
+      // Score panel section heading should NOT appear when no score data.
+      // We look for the en/zh i18n strings for safety_score section.
+      expect(frame).not.toContain("Safety score");
+      expect(frame).not.toContain("风险评分");
+    });
+
+    it("renders the Fault row when payload.fault_intent is populated", () => {
+      // task-f8320b6ff844 regression: the L2 card previously had no
+      // semantic indicator of fault category — operators had to guess
+      // from ``params`` keys. Wiring fault_intent from confirmation_gate
+      // to ExecutionConfirmCard surfaces the L1 classification.
+      const withIntent = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "k8s-chaos-skills",
+          target: { namespace: "cms-demo", names: ["accounting-6fbdb464c7-qn2vr"] },
+          plan_summary: "blade create",
+          safety_status: "safe",
+          safety_reason: null,
+          fault_intent: {
+            fault_type: "pod-mem-load",
+            scope: "pod",
+            target: "mem",
+            action: "load",
+          },
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={withIntent} />);
+      const frame = lastFrame() ?? "";
+      // The fault_type appears verbatim.
+      expect(frame).toContain("pod-mem-load");
+      // The (scope/target/action) triple appears as supplementary context.
+      expect(frame).toContain("pod/mem/load");
+    });
+
+    it("omits the Fault row when fault_intent is missing/null", () => {
+      // Dry-run / clarification-incomplete path: producer sets
+      // fault_intent=None when FaultSpec has no derivable fault_type.
+      // The row must not render an empty "Fault: " line in that case.
+      const noIntent = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "skill",
+          target: { namespace: "default", names: ["p1"] },
+          plan_summary: "blade create",
+          safety_status: "safe",
+          fault_intent: null,
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={noIntent} />);
+      const frame = lastFrame() ?? "";
+      // Skill still renders, but no Fault label.
+      expect(frame).toContain("skill");
+      expect(frame).not.toContain("故障");
+      expect(frame).not.toContain("Fault");
+    });
+
+    it("omits the Fault row when fault_intent.fault_type is empty string", () => {
+      // Half-populated dict edge case: rendering must guard on
+      // ``fault_type`` truthiness (not just dict presence) — otherwise
+      // an empty string would render as "  ()" or just "  " in the
+      // value column.
+      const blankType = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "skill",
+          plan_summary: "blade create",
+          safety_status: "safe",
+          fault_intent: { fault_type: "", scope: "pod", target: "", action: "" },
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={blankType} />);
+      const frame = lastFrame() ?? "";
+      expect(frame).not.toContain("故障");
+      expect(frame).not.toContain("Fault");
+    });
+
+    it("renders Complexity row only when is_complex === true", () => {
+      // is_complex=true badge surfaces "this routed through
+      // save_fault_plan and has a formal plan". The TS code was
+      // previously not reading the field at all (ConfirmMessage.tsx
+      // had a comment naming it but no read site).
+      const complexPlan = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "node-cpu-fullload",
+          plan_summary: "complex plan markdown",
+          safety_status: "safe",
+          is_complex: true,
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={complexPlan} />);
+      const frame = lastFrame() ?? "";
+      // i18n strings (zh dict is active by default in tests; check both
+      // so the test isn't locale-coupled).
+      const matchesZh = frame.includes("复杂度") || frame.includes("复杂任务");
+      const matchesEn = frame.includes("Complexity") || frame.includes("complex");
+      expect(matchesZh || matchesEn).toBe(true);
+    });
+
+    it("omits Complexity row for simple plans (is_complex absent or false)", () => {
+      // Silence on the happy path — simple plans don't carry a
+      // redundant "simple plan" badge. Guarantee that false / undefined
+      // both suppress the row.
+      for (const flag of [false, undefined]) {
+        const simple = baseContext({
+          node: "confirmation_gate",
+          payload: {
+            skill_name: "node-cpu-fullload",
+            plan_summary: "simple plan",
+            safety_status: "safe",
+            ...(flag !== undefined ? { is_complex: flag } : {}),
+          },
+        });
+        const { lastFrame } = render(<ConfirmContextMessage item={simple} />);
+        const frame = lastFrame() ?? "";
+        expect(frame).not.toContain("复杂度");
+        expect(frame).not.toContain("Complexity");
+        expect(frame).not.toContain("复杂任务");
+      }
     });
   });
 

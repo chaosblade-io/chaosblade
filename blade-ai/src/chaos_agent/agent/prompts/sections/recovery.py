@@ -153,7 +153,7 @@ Examples by fault type — observe the LEFT column to set PrimaryEvidenceObserve
 | pod-mem load       | Memory usage returned to baseline (kubectl top)                  | Pod Running alone; absence of new OOMKill alone  |
 | pod-disk burn      | Burn files removed; I/O back to baseline; df back to baseline    | Pod Running, no new restart                      |
 | pod-disk fill      | Disk usage below original threshold (df -h on imagefs/rootfs)    | DiskPressure cleared alone                       |
-| pod-network loss   | Packets flowing; endpoints populated; connection succeeds        | Pod Running, no new restart                      |
+| pod-network drop   | Packets flowing; endpoints populated; connection succeeds        | Pod Running, no new restart                      |
 | pod-kill           | Pod Ready 1/1 AND restartCount stable since recovery action      | Pod still in CrashLoopBackOff                    |
 
 Set PrimaryEvidenceObserved: true ONLY if you directly observed at least one

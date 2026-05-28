@@ -8,7 +8,6 @@ and Layer 1 result serialization/restoration).
 import json
 import logging
 from collections import namedtuple
-from dataclasses import dataclass, field
 
 from langchain_core.messages import ToolMessage
 
@@ -20,45 +19,12 @@ from chaos_agent.agent.nodes._injection_detection import (
     _TOOL_POD_LABEL_SELECTOR,
 )
 from chaos_agent.agent.state import AgentState
+from chaos_agent.agent.verdict import Layer1Result, Layer1Status
 from chaos_agent.observability.status_tracker import get_tracker
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Refactor 1: 提取 Layer 1 结果为 dataclass
-# 原因: 之前用 3 个局部变量 (layer1_status, layer1_details, layer1_result_str)
-#        在函数间传递，且 layer1_result_str 在后续迭代中丢失（不在 verification dict 中）
-# 做法: 统一为一个 dataclass，可以完整存储和恢复，避免信息丢失
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Layer1Result:
-    """Structured result from Layer 1 verification."""
-
-    status: str = "unknown"       # passed / failed / error / skipped
-    details: str = ""             # human-readable summary
-    raw_output: str = ""          # blade_status raw JSON output (for LLM context)
-    resource_statuses: list[dict] = field(default_factory=list)  # blade_query_k8s statuses[]
-    affected_count: int = 0       # number of resources affected (len of resource_statuses)
-    expired: bool = False         # True if experiment status is Destroyed/Revoked (timeout expired)
-
-    def is_passed(self) -> bool:
-        return self.status == "passed"
-
-    def is_terminal(self) -> bool:
-        """Whether Layer 1 reached a terminal (non-passed) state.
-
-        Note: "skipped" is NOT terminal — it means Layer 1 is not applicable
-        for non-ChaosBlade faults (no blade_uid, no blade_create attempted).
-        Layer 2 should still proceed in this case.
-
-        Note: "expired" (Destroyed/Revoked due to timeout) is also NOT terminal —
-        the fault was injected but expired before verification. Layer 2 should still
-        proceed so the LLM can report 'recovered_before_observation'.
-        """
-        if self.expired:
-            return False
-        return self.status in ("failed", "error")
+# Layer1Result is now a Pydantic model imported from chaos_agent.agent.verdict
 
 
 # ---------------------------------------------------------------------------
@@ -684,23 +650,9 @@ async def _run_layer1_verification(
 def _restore_layer1_from_state(state: AgentState) -> Layer1Result:
     """Restore Layer 1 result from a previous iteration's cache."""
     cache = state.get("inject_layer1_cache") or {}
-    return Layer1Result(
-        status=cache.get("status", "unknown"),
-        details=cache.get("details", ""),
-        raw_output=cache.get("raw_output", ""),
-        resource_statuses=cache.get("resource_statuses", []),
-        affected_count=cache.get("affected_count", 0),
-        expired=cache.get("expired", False),
-    )
+    return Layer1Result.model_validate(cache) if cache else Layer1Result()
 
 
 def _layer1_to_dict(result: Layer1Result) -> dict:
-    """Convert Layer1Result to the verification.layer1 dict, including raw_output."""
-    return {
-        "status": result.status,
-        "details": result.details,
-        "raw_output": result.raw_output,
-        "resource_statuses": result.resource_statuses,
-        "affected_count": result.affected_count,
-        "expired": result.expired,
-    }
+    """Convert Layer1Result to the verification.layer1 dict."""
+    return result.model_dump()

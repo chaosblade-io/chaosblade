@@ -42,6 +42,7 @@ import {
   YesNoFeedbackSelect,
   type YesNoFeedbackAnswer,
 } from "../shared/YesNoFeedbackSelect.js";
+import { Select, type SelectItem } from "../shared/Select.js";
 import { t } from "../../i18n/index.js";
 import { useAppDispatch } from "../../state/store.js";
 import { Theme } from "../../theme/colors.js";
@@ -738,9 +739,6 @@ const IntentConfirmCard: React.FC<{
         label={t("confirm.field.user_description")}
         value={asString(fi["user_description"])}
       />
-      {(risk || confidence > 0) && (
-        <SectionHeading label={t("confirm.section.decision_signals")} />
-      )}
       {risk && (
         <Box marginTop={1} flexDirection="column">
           <RiskMeterRow risk={risk} />
@@ -751,29 +749,24 @@ const IntentConfirmCard: React.FC<{
           <ConfidenceRow confidence={confidence} faultIntent={fi} />
         </Box>
       )}
-      {/* P2-7: audit trail — reasoning + clarification round. Quiet
-       *  section; only renders when there's something worth showing. */}
       {hasAuditTrail && (
-        <>
-          <SectionHeading label={t("confirm.section.audit_trail")} />
-          <Box marginTop={1} flexDirection="column">
-            {showReasoning && (
-              <Field
-                label={t("confirm.field.intent_reasoning")}
-                value={intentReasoning}
-                wrap
-              />
-            )}
-            {clarificationRound > 0 && (
-              <Field
-                label={t("confirm.field.clarification_round")}
-                value={t("confirm.clarification.label", { n: clarificationRound })}
-                labelColor={Theme.status.warn}
-                valueColor={Theme.status.warn}
-              />
-            )}
-          </Box>
-        </>
+        <Box marginTop={1} flexDirection="column">
+          {showReasoning && (
+            <Field
+              label={t("confirm.field.intent_reasoning")}
+              value={intentReasoning}
+              wrap
+            />
+          )}
+          {clarificationRound > 0 && (
+            <Field
+              label={t("confirm.field.clarification_round")}
+              value={t("confirm.clarification.label", { n: clarificationRound })}
+              labelColor={Theme.status.warn}
+              valueColor={Theme.status.warn}
+            />
+          )}
+        </Box>
       )}
     </ConfirmFrameSoft>
   );
@@ -804,7 +797,7 @@ const SafetyCheckRow: React.FC<{
     </Box>
     {detail && (
       <Box flexGrow={1}>
-        <Text color={Theme.gray[500]} wrap="wrap">
+        <Text color={Theme.text.primary} wrap="wrap">
           {detail}
         </Text>
       </Box>
@@ -891,6 +884,7 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   const healthReport = asRecord(payload?.["target_health_report"]);
   const healthOverall = asString(healthReport?.["overall"]);
   const healthSummary = asString(healthReport?.["summary"]);
+  const healthCheckedDetail = asString(healthReport?.["checked_detail"]);
   const healthIssuesRaw = healthReport?.["issues"];
   const healthIssues = Array.isArray(healthIssuesRaw)
     ? healthIssuesRaw
@@ -900,6 +894,17 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   // Only show the section when there's an issue to report — a clean
   // ``overall=ok`` with no issues adds no information for the user.
   const hasHealthIssues = healthIssues.length > 0 || (healthOverall && healthOverall !== "ok");
+
+  // E18: feasibility_report — injection headroom assessment.
+  const feasibilityReport = asRecord(payload?.["feasibility_report"]);
+  const feasSeverity = asString(feasibilityReport?.["severity"]);
+  const feasMessage = asString(feasibilityReport?.["message"]);
+  const feasRecommendation = asString(feasibilityReport?.["recommendation"]);
+  const feasHeadroom = feasibilityReport?.["headroom"];
+  const feasCurrentValue = asString(feasibilityReport?.["current_value"]);
+  const feasLimitValue = asString(feasibilityReport?.["limit_value"]);
+  const feasTargetValue = asString(feasibilityReport?.["target_value"]);
+  const hasFeasibilityIssue = feasibilityReport != null && feasSeverity !== "" && feasSeverity !== "ok";
 
   // P1-4: conflict_uids — structured list of existing experiment UIDs.
   const conflictUidsRaw = payload?.["conflict_uids"];
@@ -914,6 +919,42 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
       ? Math.max(0, Math.floor(pipelineAttemptRaw))
       : 0;
   const planPath = asString(payload?.["plan_path"]);
+  // ``is_complex`` is the formal-plan-track flag (true → the agent
+  // routed through ``save_fault_plan`` and produced a multi-section
+  // plan markdown). Surfaced as a small chip only when true so simple
+  // plans don't carry a redundant "simple plan" badge — silence is
+  // the happy-path baseline.
+  const isComplex = payload?.["is_complex"] === true;
+
+  // L1 semantic classification (fault_type / scope / target / action).
+  // Previously L2 only carried ``target`` (namespace + names), so the
+  // operator had to reverse-engineer "is this a mem-load?" from
+  // ``params`` keys. Surfacing the L1 classification here makes the
+  // fault category visible at a glance.
+  //
+  // ``fault_intent`` may be ``null`` (dry-run / clarification-incomplete
+  // path on the producer — confirmation_gate.py sets None when
+  // FaultSpec has no derivable fault_type). Render only when fault_type
+  // is non-empty; the (scope/target/action) triple is informational
+  // and may be empty.
+  const faultIntent = asRecord(payload?.["fault_intent"]);
+  const faultType = asString(faultIntent?.["fault_type"]);
+  let faultBrief = "";
+  if (faultType) {
+    const triple = [
+      asString(faultIntent?.["scope"]),
+      asString(faultIntent?.["target"]),
+      asString(faultIntent?.["action"]),
+    ].filter(Boolean).join("/");
+    faultBrief = triple ? `${faultType}  (${triple})` : faultType;
+  }
+
+  // E10 — multi-dimensional numeric safety score. The score dict, when
+  // present, carries per-dimension { value, explanation } entries plus
+  // an aggregated `overall` (0-100) and `level` (low/medium/high/critical).
+  // Absent payload → panel is skipped (backward-compatible with older
+  // server builds that don't compute the score yet).
+  const safetyScore = asRecord(payload?.["safety_score"]);
 
   // Safety status placement is adaptive (v3): when there's a real
   // problem (warning / blocked) we float the row up to the top of
@@ -938,7 +979,7 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   // in scrollback). We now surface ONLY the saved-file path
   // (``planPath``), which is one row regardless of plan length;
   // ``cat <plan_path>`` gets the full markdown on disk.
-  const hasPlanContent = Boolean(skill || targetStr || planPath);
+  const hasPlanContent = Boolean(skill || targetStr || planPath || faultBrief);
   // ``hasParamsContent`` retired — Parameters section now renders
   // ALWAYS, with ``—`` placeholder when the agent didn't compute
   // structured params. Keeping the section heading visible signals
@@ -967,8 +1008,19 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
 
       {hasPlanContent && (
         <>
-          <SectionHeading label={t("confirm.section.execution_plan")} />
           <Box marginTop={1} flexDirection="column">
+            {/* Fault classification — sits ABOVE skill / target because
+             *  "what fault" is the highest-level operator question.
+             *  Previously the reader had to reverse-engineer the fault
+             *  category from ``params`` keys (e.g. ``mem-percent`` →
+             *  mem-load). Surfacing the L1-derived fault_type +
+             *  (scope/target/action) triple removes that reverse-step. */}
+            {faultBrief && (
+              <Field
+                label={t("confirm.field.fault")}
+                value={faultBrief}
+              />
+            )}
             <Field label={t("confirm.field.skill")} value={skill} />
             <Field label={t("confirm.field.target")} value={targetStr} />
             {/* Plan body lives on disk at ``planPath`` — surfacing the
@@ -998,6 +1050,18 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
                 valueColor={Theme.status.warn}
               />
             )}
+            {/* is_complex chip — formal-plan-track flag (true → the
+             *  agent ran save_fault_plan and produced a multi-section
+             *  plan markdown). Renders only when true so simple plans
+             *  don't carry a redundant "simple plan" badge. */}
+            {isComplex && (
+              <Field
+                label={t("confirm.field.complexity")}
+                value={t("confirm.complexity.complex")}
+                labelColor={Theme.status.warn}
+                valueColor={Theme.status.warn}
+              />
+            )}
           </Box>
         </>
       )}
@@ -1009,16 +1073,13 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
        *  gated on ``hasParamsContent`` which hid the section when
        *  empty, leaving the reader to wonder whether the check
        *  happened. */}
-      <>
-        <SectionHeading label={t("confirm.section.parameters")} />
-        <Box marginTop={1}>
-          <Field
-            label={t("confirm.field.params")}
-            value={paramsStr || t("confirm.params.none")}
-            wrap
-          />
-        </Box>
-      </>
+      <Box marginTop={1}>
+        <Field
+          label={t("confirm.field.params")}
+          value={paramsStr || t("confirm.params.none")}
+          wrap
+        />
+      </Box>
 
       {/* P0-1: target_health_report — DiskPressure / Evicted / etc.
        *  ALWAYS shown (was previously gated on ``hasHealthIssues``).
@@ -1031,16 +1092,9 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
        *      (happens when ``settings.target_health_check_enabled``
        *      is false on the server side, so the payload's
        *      ``target_health_report`` field is null) */}
-      <SectionHeading label={t("confirm.section.target_health")} />
       <Box marginTop={1} flexDirection="column">
         {hasHealthIssues ? (
           <>
-            {healthSummary && (
-              <Field
-                label={t("confirm.field.health_summary")}
-                value={healthSummary}
-              />
-            )}
             {healthIssues.map((issue, i) => {
               const sev = asString(issue["severity"]);
               const visuals = healthRowVisuals(sev);
@@ -1050,47 +1104,14 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
               const detail = [message, durationHint && `(${durationHint})`]
                 .filter(Boolean)
                 .join(" ");
-              // Two-line variant for long codes (preserves the code
-              // identifier in full instead of truncating).
-              const isLongCode = (code || sev).length > LIST_NAME_WIDTH;
-              if (isLongCode) {
-                return (
-                  <Box key={i} flexDirection="column">
-                    <Box>
-                      <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0}>
-                        <Text color={visuals.color}>{visuals.glyph}</Text>
-                      </Box>
-                      <Box flexGrow={1}>
-                        <Text color={visuals.color}>{code || sev}</Text>
-                      </Box>
-                    </Box>
-                    {detail && (
-                      <Box>
-                        <Box minWidth={FIELD_LABEL_WIDTH} flexShrink={0} />
-                        <Box flexGrow={1}>
-                          <Text color={Theme.text.secondary} wrap="wrap">
-                            {detail}
-                          </Text>
-                        </Box>
-                      </Box>
-                    )}
-                  </Box>
-                );
-              }
               return (
-                <Box key={i}>
-                  <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0}>
-                    <Text color={visuals.color}>{visuals.glyph}</Text>
-                  </Box>
-                  <Box minWidth={LIST_NAME_WIDTH} flexShrink={0} paddingRight={1}>
-                    <Text color={visuals.color}>{code || sev}</Text>
-                  </Box>
-                  <Box flexGrow={1}>
-                    <Text color={Theme.text.secondary} wrap="wrap">
-                      {detail}
-                    </Text>
-                  </Box>
-                </Box>
+                <SafetyCheckRow
+                  key={i}
+                  glyph={visuals.glyph}
+                  color={visuals.color}
+                  label={t("confirm.field.health")}
+                  detail={detail ? `${detail} [${code}]` : code}
+                />
               );
             })}
           </>
@@ -1105,13 +1126,50 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
             detail={t("confirm.health.not_run")}
           />
         ) : (
-          // Check ran, all targets clean. Single ✓ row reads as
-          // "we looked at this and nothing's wrong".
           <SafetyCheckRow
             glyph={Icons.success}
             color={Theme.status.ok}
             label={t("confirm.field.health")}
-            detail={t("confirm.health.all_clear")}
+            detail={healthCheckedDetail ? `${t("confirm.health.all_clear")} (${healthCheckedDetail})` : t("confirm.health.all_clear")}
+          />
+        )}
+      </Box>
+
+      {/* E18: feasibility assessment — ALWAYS shown (matches
+       *  target_health pattern: ok/issue/not-run). */}
+      <Box flexDirection="column">
+        {hasFeasibilityIssue ? (
+          <>
+            <SafetyCheckRow
+              glyph={feasSeverity === "impossible" ? Icons.fail : feasSeverity === "skipped" ? "○" : Icons.warning}
+              color={feasSeverity === "impossible" ? Theme.status.err : feasSeverity === "skipped" ? Theme.text.secondary : Theme.status.warn}
+              label={t("confirm.field.feasibility")}
+              detail={feasMessage}
+            />
+            {feasRecommendation && (
+              <Box>
+                <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0} />
+                <Box flexGrow={1}>
+                  <Text color={Theme.text.secondary} wrap="wrap">
+                    {feasRecommendation}
+                  </Text>
+                </Box>
+              </Box>
+            )}
+          </>
+        ) : feasibilityReport === null ? (
+          <SafetyCheckRow
+            glyph={Icons.bullet}
+            color={Theme.text.secondary}
+            label={t("confirm.field.feasibility")}
+            detail={t("confirm.feasibility.not_run")}
+          />
+        ) : (
+          <SafetyCheckRow
+            glyph={Icons.success}
+            color={Theme.status.ok}
+            label={t("confirm.field.feasibility")}
+            detail={`${t("confirm.feasibility.all_clear")} (headroom ${typeof feasHeadroom === "number" ? `${Math.round(feasHeadroom * 100)}%` : "—"}, 当前 ${feasCurrentValue || "—"}, 目标 ${feasTargetValue || "—"})`}
           />
         )}
       </Box>
@@ -1122,7 +1180,6 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
        *  column so it visually nests under the list. */}
       {conflictUids.length > 0 && (
         <>
-          <SectionHeading label={t("confirm.section.conflicts")} />
           <Box marginTop={1} flexDirection="column">
             {conflictUids.map((uid, i) => (
               <Box key={i}>
@@ -1146,15 +1203,116 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
         </>
       )}
 
+      {/* E10 — multi-dimensional safety score panel. Overall score +
+       *  each dimension (blast_radius / frequency / time / topology)
+       *  with one-line explanation. Color of the overall row tracks
+       *  level (low=ok, medium/high=warn, critical=err). Section is
+       *  skipped entirely when payload.safety_score is absent (older
+       *  server build), so old confirm cards render unchanged. */}
+      {safetyScore && (
+        <>
+          <Box marginTop={1} flexDirection="column">
+            {(() => {
+              const overall = asString(safetyScore["overall"]) || "0";
+              const level = asString(safetyScore["level"]) || "low";
+              const levelColor =
+                level === "critical"
+                  ? Theme.status.err
+                  : level === "high" || level === "medium"
+                    ? Theme.status.warn
+                    : Theme.status.ok;
+              return (
+                <Field
+                  label={t("safety_score.overall")}
+                  value={`${overall}/100 (${t(`safety_score.level.${level}`)})`}
+                  valueColor={levelColor}
+                />
+              );
+            })()}
+            {(["blast_radius", "frequency", "time", "topology"] as const).map(
+              (dim) => {
+                const d = asRecord(safetyScore[dim]);
+                if (!d) return null;
+                const value = asString(d["value"]) || "0";
+                const explanation = asString(d["explanation"]) || "";
+                return (
+                  <Field
+                    key={dim}
+                    label={t(`safety_score.${dim}`)}
+                    value={`${value} — ${explanation}`}
+                    wrap
+                  />
+                );
+              },
+            )}
+          </Box>
+        </>
+      )}
+
       {/* Bottom Safety check section — quiet placement, only when no
        *  prominent top alert is rendered (avoids showing safety twice). */}
       {!hasProblem && badge && (
-        <>
-          <SectionHeading label={t("confirm.section.safety_check")} />
-          <SafetyCheckList status={safetyStatus} reason={safetyReason} />
-        </>
+        <SafetyCheckList status={safetyStatus} reason={safetyReason} />
       )}
     </ConfirmFrameHard>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Target change card (drift confirmation)
+// ---------------------------------------------------------------------------
+
+const TargetChangeCard: React.FC<{ payload: Payload; taskId?: string }> = ({
+  payload,
+}) => {
+  const cardWidth = useBootCardWidth();
+  const p = payload ?? {};
+  const reason = asString(p["reason"]);
+  const original = asRecord(p["original"]);
+  const proposed = asRecord(p["proposed"]);
+
+  const renderTarget = (target: Record<string, unknown> | null) => {
+    if (!target) return <Text dimColor>—</Text>;
+    const ns = asString(target["namespace"]) || "default";
+    const names = target["names"];
+    const labels = target["labels"];
+    const parts: string[] = [`ns=${ns}`];
+    if (Array.isArray(names) && names.length > 0) {
+      parts.push(`names=[${names.join(", ")}]`);
+    }
+    if (labels && typeof labels === "object" && Object.keys(labels).length > 0) {
+      const pairs = Object.entries(labels as Record<string, string>)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(", ");
+      parts.push(`labels={${pairs}}`);
+    }
+    return <Text>{parts.join("  ")}</Text>;
+  };
+
+  return (
+    <Box paddingLeft={2} marginTop={1} flexDirection="column">
+      <Box
+        flexDirection="column"
+        borderStyle="double"
+        borderColor={Theme.status.warn}
+        paddingX={2}
+        paddingY={0}
+        width={cardWidth}
+      >
+        <Text bold color={Theme.status.warn}>
+          {t("confirm.targetChange.title")}
+        </Text>
+        {reason ? <Text dimColor>{reason}</Text> : null}
+        <Box marginTop={1} flexDirection="column">
+          <Text bold>{t("confirm.targetChange.original")}</Text>
+          {renderTarget(original)}
+        </Box>
+        <Box marginTop={1} flexDirection="column">
+          <Text bold>{t("confirm.targetChange.proposed")}</Text>
+          {renderTarget(proposed)}
+        </Box>
+      </Box>
+    </Box>
   );
 };
 
@@ -1222,12 +1380,88 @@ function hasExecutionContent(payload: Record<string, unknown>): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Plan builder — selection card (interactive options)
+// ---------------------------------------------------------------------------
+
+const PlanSelectionCard: React.FC<{ payload: Payload; taskId?: string }> = ({
+  payload,
+  taskId,
+}) => {
+  const question = asString(payload?.["question"]);
+  return (
+    <ConfirmFrameSoft
+      glyph={Icons.thinking}
+      glyphColor={Theme.forge.fire}
+      chipLabel="PLAN"
+      title={t("confirm.plan_builder.title")}
+      preamble=""
+      taskId={taskId}
+    >
+      <Text color={Theme.text.primary} wrap="wrap">
+        {question || t("confirm.plan_builder.default_question")}
+      </Text>
+    </ConfirmFrameSoft>
+  );
+};
+
+function usePlanBuilderSelect(
+  taskId: string,
+  payload: Record<string, unknown> | undefined,
+  isFocused: boolean,
+): React.JSX.Element {
+  const dispatch = useAppDispatch();
+  const rawOptions = (payload?.["options"] ?? []) as Array<{
+    key: string;
+    label: string;
+    description?: string;
+    recommended?: boolean;
+  }>;
+
+  const items: SelectItem<string>[] = rawOptions.map((opt) => ({
+    value: opt.key,
+    label: `${opt.label}${opt.description ? `（${opt.description}）` : ""}${opt.recommended ? " ⭐" : ""}`,
+    hasFeedback: opt.key === "free_input",
+  }));
+
+  // Fallback: if no options, show a single free-input
+  if (items.length === 0) {
+    items.push({ value: "free_input", label: t("confirm.plan_builder.free_input"), hasFeedback: true });
+  }
+
+  const handleSelect = (value: string, feedback?: string) => {
+    // For free_input, send the typed text as the answer
+    const answer = value === "free_input" && feedback != null ? feedback : value;
+    dispatch({
+      type: "CONFIRM_USER_DECIDED",
+      taskId,
+      answer,
+    });
+  };
+
+  const handleCancel = () => {
+    dispatch({ type: "CONFIRM_USER_DECIDED", taskId, answer: "rejected" });
+  };
+
+  return (
+    <Select<string>
+      items={items}
+      isFocused={isFocused}
+      onSelect={handleSelect}
+      onCancel={handleCancel}
+    />
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Top-level dispatchers — Context (Static) + Prompt (pending)
 // ---------------------------------------------------------------------------
 
 const ConfirmContextMessageInternal: React.FC<{
   item: import("../../state/types.js").ConfirmContextItem;
 }> = ({ item }) => {
+  if (item.payload && item.node === "plan_builder") {
+    return <PlanSelectionCard payload={item.payload} taskId={item.taskId} />;
+  }
   if (
     item.payload &&
     item.node === "intent_confirm" &&
@@ -1241,6 +1475,13 @@ const ConfirmContextMessageInternal: React.FC<{
     hasExecutionContent(item.payload)
   ) {
     return <ExecutionConfirmCard payload={item.payload} taskId={item.taskId} />;
+  }
+  if (
+    item.payload &&
+    item.node === "tool_screener" &&
+    asString(item.payload["type"]) === "target_change"
+  ) {
+    return <TargetChangeCard payload={item.payload} taskId={item.taskId} />;
   }
   return <GenericConfirmCard content={item.content} taskId={item.taskId} />;
 };
@@ -1268,25 +1509,25 @@ const ConfirmPromptMessageInternal: React.FC<{
   item: import("../../state/types.js").ConfirmPromptItem;
   isFocused?: boolean;
 }> = ({ item, isFocused = true }) => {
-  let yesLabel: string;
-  let noLabel: string;
-  if (item.node === "intent_confirm") {
-    yesLabel = t("confirm.intent.proceed");
-    noLabel = t("confirm.intent.refine");
-  } else if (item.node === "confirmation_gate") {
-    yesLabel = t("confirm.execution.proceed");
-    noLabel = t("confirm.execution.cancel");
-  } else {
-    yesLabel = t("confirm.proceed");
-    noLabel = t("confirm.refine");
-  }
-  const select = useConfirmSelect(item.taskId, yesLabel, noLabel, isFocused);
   // Width is read unconditionally so the hook call order stays stable
-  // across resolved→unresolved transitions. Only the unresolved branch
-  // uses it; the resolved chip line doesn't need a width.
+  // across resolved→unresolved transitions.
   const cardWidth = useBootCardWidth();
 
+  // Resolved state — collapsed chip
   if (item.resolved) {
+    if (item.node === "plan_builder") {
+      // Plan builder: show the selected option's label (not just the key)
+      const rawAnswer = item.answer || "—";
+      const opts = (item.payload?.["options"] ?? []) as Array<{key: string; label: string}>;
+      const matched = opts.find((o) => o.key === rawAnswer);
+      const display = matched ? matched.label : rawAnswer;
+      return (
+        <Box paddingLeft={2} marginTop={1}>
+          <Text color={Theme.gray[700]}>{"╰─▶  "}</Text>
+          <Chip color={Theme.forge.fire}>{`● ${display}`}</Chip>
+        </Box>
+      );
+    }
     const ok = item.answer === "approved";
     const chipColor = ok ? Theme.forge.fire : Theme.status.err;
     const chipText = ok ? t("confirm.armed_chip") : t("confirm.aborted_chip");
@@ -1300,29 +1541,45 @@ const ConfirmPromptMessageInternal: React.FC<{
     );
   }
 
-  // Active prompt — render the select widget alone inside a small
-  // round-bordered box. Banner / headline / taskId are intentionally
-  // OMITTED: the corresponding context card right above this prompt
-  // already carries them, so repeating them here would double-print
-  // the title.
-  //
-  // Border colour is **dim gray** regardless of tier, not the
-  // forge.fire / forge.iron used by the context card above. The
-  // visual reasoning: the context card carries the *content* the
-  // user must read (fault details, plan, safety status) — that
-  // earns the loud brand border. The prompt is just the *action
-  // surface* (select Y/N/feedback). Painting it in the same loud
-  // colour produces the user-reported "审美疲劳" — two big
-  // forge-coloured frames stacked feels noisy and makes the prompt
-  // visually compete with the content it's responding to. The dim
-  // gray frame fades into the background, so the user's eye lands
-  // on the highlighted ❯ option and the bold select labels instead
-  // of the chrome.
-  //
-  // Border style still tracks tier (round soft / double hard) so
-  // the "soft check vs hard check" hierarchy is preserved.
-  const isHard = item.node === "confirmation_gate";
-  const tierColor = Theme.gray[700];
+  // Plan builder: dynamic options select
+  if (item.node === "plan_builder") {
+    const planSelect = usePlanBuilderSelect(item.taskId, item.payload, isFocused);
+    return (
+      <Box paddingLeft={2} marginTop={1} flexDirection="column">
+        <Box
+          flexDirection="column"
+          borderStyle="round"
+          borderColor={Theme.gray[700]}
+          paddingX={2}
+          paddingY={0}
+          width={cardWidth}
+        >
+          {planSelect}
+        </Box>
+      </Box>
+    );
+  }
+
+  // Standard confirm select (intent_confirm / confirmation_gate / generic)
+  let yesLabel: string;
+  let noLabel: string;
+  if (item.node === "intent_confirm") {
+    yesLabel = t("confirm.intent.proceed");
+    noLabel = t("confirm.intent.refine");
+  } else if (item.node === "confirmation_gate") {
+    yesLabel = t("confirm.execution.proceed");
+    noLabel = t("confirm.execution.cancel");
+  } else if (item.node === "tool_screener") {
+    yesLabel = t("confirm.targetChange.approve");
+    noLabel = t("confirm.targetChange.reject");
+  } else {
+    yesLabel = t("confirm.proceed");
+    noLabel = t("confirm.refine");
+  }
+  const select = useConfirmSelect(item.taskId, yesLabel, noLabel, isFocused);
+
+  const isHard = item.node === "confirmation_gate" || item.node === "tool_screener";
+  const tierColor = item.node === "tool_screener" ? Theme.status.warn : Theme.gray[700];
   const tierStyle: "double" | "round" = isHard ? "double" : "round";
   return (
     <Box paddingLeft={2} marginTop={1} flexDirection="column">

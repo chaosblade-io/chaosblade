@@ -1,13 +1,11 @@
 """Verifier messages domain: synthetic message construction for Layer 2.
 
-Extracted from verifier.py to isolate the ~1300-line messages construction
-logic (baseline ToolMessages, restart precheck, and the full Layer 2 prompt
-builder) from the verifier node entry points and orchestration code.
+Extracted from verifier.py to isolate the messages construction logic
+(baseline ToolMessages and the full Layer 2 prompt builder) from the
+verifier node entry points and orchestration code.
 """
 
-import asyncio
 import logging
-from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -27,7 +25,6 @@ from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
 
 logger = logging.getLogger(__name__)
-_RESTART_PRECHECK_TOOL_CALL_ID = "restart_precheck_check"
 _BASELINE_TOOL_CALL_ID = "baseline_collector"
 _METRICS_TOOL_CALL_ID = "baseline_collector_metrics"
 
@@ -35,7 +32,6 @@ _METRICS_TOOL_CALL_ID = "baseline_collector_metrics"
 _SYNTHETIC_TOOL_CALL_IDS = frozenset({
     _BASELINE_TOOL_CALL_ID,
     _METRICS_TOOL_CALL_ID,
-    _RESTART_PRECHECK_TOOL_CALL_ID,
 })
 
 # Marker for the main verifier context HumanMessage — used to identify
@@ -228,362 +224,10 @@ def _build_baseline_tool_messages(
     return [ai_msg_1, tool_msg_1, ai_msg_2, tool_msg_2]
 
 
-# ---------------------------------------------------------------------------
-# Container Restart Fast Path
-# Before entering the LLM ReAct loop for Layer 2, deterministically check
-# whether the target container restarted during the injection window.
-# If a restart is detected AND Layer 1 passed → the fault executed but
-# evidence was destroyed by the restart → return recovered_before_observation
-# with side_effects field so infer_phase maps to verification_passed.
-# Applies to ALL pod-scope fault types, not just disk-burn.
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ContainerRestartDetection:
-    """Result of container restart pre-check."""
-    restart_detected: bool = False
-    pod_name: str = ""
-    restart_count: int = 0
-    reason: str = ""  # OOMKilled, Error, Completed, etc.
-    finished_at: str = ""  # ISO 8601 timestamp
-    restart_delta: int = 0              # NEW: restart count increase from baseline
-    baseline_restart_count: int = -1    # NEW: -1 = unknown baseline
 
 
-async def _fresh_restart_count(
-    state: AgentState,
-    kubeconfig: str,
-    *,
-    task_id: str = "",
-) -> int | None:
-    """Query the current restart count for freshness verification.
-
-    Used by programmatic fact enforcement to detect if the container
-    restarted AFTER the precheck ran (stale data scenario).  Returns
-    the current restartCount or None on any error.
-    """
-    from chaos_agent.agent.fault_spec import read_fault_spec
-    spec = read_fault_spec(state)
-    namespace = spec.namespace if spec else ""
-    target_names = list(spec.names) if spec else []
-    if not namespace or not target_names:
-        return None
-    pod_name = target_names[0]
-    try:
-        from chaos_agent.tools.shell import run_command
-        from chaos_agent.tools.kubectl import _build_kubectl_global_args
-        from chaos_agent.config.settings import settings as _settings
-
-        kubectl_path = _settings.kubectl_path
-        global_args_str = " ".join(_build_kubectl_global_args(kubeconfig))
-        cmd = (
-            f"{kubectl_path} {global_args_str} "
-            f"get pod {pod_name} -n {namespace} "
-            f"-o jsonpath={{.status.containerStatuses[0].restartCount}}"
-        )
-        rc, stdout, _ = await run_command(
-            cmd, timeout=_settings.timeout_kubectl, task_id=task_id,
-            source="verifier-enforcement-freshness",
-        )
-        if rc == 0 and stdout and stdout.strip().isdigit():
-            return int(stdout.strip())
-    except Exception:
-        pass
-    return None
 
 
-async def _check_container_restart_fast_path(
-    state: AgentState,
-    layer1: Layer1Result,
-    kubeconfig: str,
-    *,
-    task_id: str = "",
-) -> ContainerRestartDetection | None:
-    """Check if the target container restarted during the injection window.
-
-    Returns ContainerRestartDetection if a restart was detected, None otherwise.
-    Returns None (fall-through to LLM Layer 2) on any error or missing data.
-    """
-    # Guard: only for pod-scope faults
-    from chaos_agent.agent.fault_spec import read_fault_spec
-    spec = read_fault_spec(state)
-    blade_scope = spec.scope if spec else ""
-    if blade_scope != "pod":
-        return None
-
-    # Guard: Layer 1 must have passed
-    if not layer1.is_passed():
-        return None
-
-    # Resolve target pod identity from FaultSpec
-    namespace = spec.namespace if spec else ""
-    target_names = list(spec.names) if spec else []
-
-    if not namespace or not target_names:
-        return None
-
-    # Use the first target pod for the check
-    pod_name = target_names[0]
-
-    try:
-        from chaos_agent.tools.shell import run_command
-        from chaos_agent.tools.kubectl import _build_kubectl_global_args
-        from chaos_agent.config.settings import settings as _settings
-
-        kubectl_path = _settings.kubectl_path
-        global_args_str = " ".join(_build_kubectl_global_args(kubeconfig))
-
-        # Query pod status as JSON
-        cmd = (
-            f"{kubectl_path} {global_args_str} "
-            f"get pod {pod_name} -n {namespace} "
-            f"-o json"
-        )
-        rc, stdout, _ = await run_command(
-            cmd, timeout=_settings.timeout_kubectl, task_id=task_id,
-            source="verifier-restart-precheck",
-        )
-        if rc != 0 or not stdout:
-            return None
-
-        import json
-        try:
-            pod_data = json.loads(stdout)
-        except json.JSONDecodeError:
-            return None
-
-        # Extract container statuses
-        container_statuses = (
-            pod_data.get("status", {}).get("containerStatuses") or []
-        )
-        if not container_statuses:
-            return None
-
-        cs = container_statuses[0]
-        restart_count = cs.get("restartCount", 0)
-
-        # Check lastState.terminated for restart reason
-        last_state = cs.get("lastState", {}) or {}
-        terminated = last_state.get("terminated", {}) or {}
-        reason = terminated.get("reason", "")
-        finished_at = terminated.get("finishedAt", "")
-
-        # If restartCount > 0 AND there's a terminated state, the container
-        # restarted at some point. Compare against baseline to avoid flagging
-        # pre-existing restarts as injection-caused.
-        baseline_restart_count = _extract_baseline_restart_count(
-            state.get("baseline_data")
-        )
-        restart_delta = (
-            restart_count - baseline_restart_count
-            if baseline_restart_count >= 0
-            else None
-        )
-
-        # No NEW restart relative to baseline. However, if the container
-        # has a termination reason (e.g. OOMKilled), the restartCount
-        # increment may have a latency of a few seconds — the container
-        # could be in the process of restarting. Wait and re-check once.
-        if restart_delta is not None and restart_delta <= 0:
-            if not reason:
-                return ContainerRestartDetection(
-                    restart_detected=False,
-                    pod_name=pod_name,
-                    restart_count=restart_count,
-                    baseline_restart_count=baseline_restart_count,
-                    restart_delta=restart_delta or 0,
-                    reason="",
-                    finished_at="",
-                )
-            await asyncio.sleep(3)
-            rc2, stdout2, _ = await run_command(
-                cmd, timeout=_settings.timeout_kubectl,
-                task_id=task_id,
-                source="verifier-restart-precheck-retry",
-            )
-            if rc2 == 0 and stdout2:
-                try:
-                    pod_data2 = json.loads(stdout2)
-                except json.JSONDecodeError:
-                    pod_data2 = None
-                if pod_data2:
-                    cs_list2 = (
-                        pod_data2.get("status", {}).get("containerStatuses") or []
-                    )
-                    if cs_list2:
-                        cs2 = cs_list2[0]
-                        new_rc = cs2.get("restartCount", 0)
-                        new_delta = (
-                            new_rc - baseline_restart_count
-                            if baseline_restart_count >= 0
-                            else None
-                        )
-                        if new_delta is not None and new_delta > 0:
-                            last_state2 = cs2.get("lastState", {}) or {}
-                            terminated2 = last_state2.get("terminated", {}) or {}
-                            reason2 = terminated2.get("reason", "")
-                            finished_at2 = terminated2.get("finishedAt", "")
-                            if reason2:
-                                return ContainerRestartDetection(
-                                    restart_detected=True,
-                                    pod_name=pod_name,
-                                    restart_count=new_rc,
-                                    reason=reason2,
-                                    finished_at=finished_at2,
-                                    restart_delta=new_delta,
-                                    baseline_restart_count=baseline_restart_count,
-                                )
-            # 3-second retry confirmed: still no new restart
-            return ContainerRestartDetection(
-                restart_detected=False,
-                pod_name=pod_name,
-                restart_count=restart_count,
-                baseline_restart_count=baseline_restart_count,
-                restart_delta=restart_delta or 0,
-                reason="",
-                finished_at="",
-            )
-
-        if (restart_delta is None or restart_delta > 0) and reason:
-            # Time-window comparison: if the OOMKill/termination event occurred
-            # BEFORE the injection started, it is a pre-existing condition and
-            # should NOT be attributed to the fault injection.
-            injection_start = state.get("injection_start_time")
-            if injection_start and finished_at:
-                try:
-                    from chaos_agent.utils.time import parse_iso_timestamp
-                    inject_dt = parse_iso_timestamp(injection_start)
-                    kill_dt = parse_iso_timestamp(finished_at)
-                    if kill_dt < inject_dt:
-                        logger.info(
-                            "Container restart fast path: OOMKill at %s is BEFORE "
-                            "injection start %s — pre-existing condition, not caused by injection",
-                            finished_at, injection_start,
-                        )
-                        return ContainerRestartDetection(
-                            restart_detected=False,
-                            pod_name=pod_name,
-                            restart_count=restart_count,
-                            reason=reason,
-                            finished_at=finished_at,
-                            restart_delta=restart_delta if restart_delta is not None else -1,
-                            baseline_restart_count=baseline_restart_count,
-                        )
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Timestamp parsing failed in restart precheck: "
-                        "injection_start=%s, finishedAt=%s — falling through to LLM",
-                        injection_start, finished_at,
-                    )
-            return ContainerRestartDetection(
-                restart_detected=True,
-                pod_name=pod_name,
-                restart_count=restart_count,
-                reason=reason,
-                finished_at=finished_at,
-                restart_delta=restart_delta if restart_delta is not None else -1,
-                baseline_restart_count=baseline_restart_count,
-            )
-
-        # restart_delta > 0 but no termination reason — still report the
-        # restart fact so downstream has the numeric values
-        if restart_delta is not None and restart_delta > 0:
-            return ContainerRestartDetection(
-                restart_detected=True,
-                pod_name=pod_name,
-                restart_count=restart_count,
-                reason=reason or "unknown",
-                finished_at=finished_at,
-                restart_delta=restart_delta,
-                baseline_restart_count=baseline_restart_count,
-            )
-        # Fallback: no new restart, no special reason — return negative result
-        # with values for transparency
-        return ContainerRestartDetection(
-            restart_detected=False,
-            pod_name=pod_name,
-            restart_count=restart_count,
-            baseline_restart_count=baseline_restart_count,
-            restart_delta=restart_delta or 0,
-            reason="",
-            finished_at="",
-        )
-
-    except Exception:
-        # Best-effort: never block verification on pre-check failure
-        logger.warning("Container restart fast path failed, falling through to LLM")
-        return None
-
-
-def _extract_baseline_restart_count(baseline_data: dict | None) -> int:
-    """Extract restartCount from baseline kubectl describe pod output.
-    Returns -1 if not found (unknown baseline)."""
-    if not baseline_data:
-        return -1
-    for obs in baseline_data.get("observations", []):
-        stdout = obs.get("stdout", "")
-        import re
-        m = re.search(r"Restart\s+Count:\s*(\d+)", stdout)
-        if m:
-            return int(m.group(1))
-    return -1
-
-
-# _compute_baseline_confidence moved to _verifier_shared.py
-
-# _determine_level, _CONTRADICTION_INDICATORS, _CHECKLIST_PATTERNS,
-# _parse_checklist_items, _has_checklist, _detect_checklist_conclusion_inconsistency,
-# _count_verification_steps_in_skill_case, _has_injection_verification_section,
-# _extract_verification_step_descriptions, _validate_step_number_coverage,
-# _try_parse_json, _has_format_reminder, _parse_verification_result
-# moved to _verifier_layer2_parse.py
-
-
-# Hint generators and fault verification hints moved to _verifier_hints.py
-
-
-# ---------------------------------------------------------------------------
-# Restart precheck → synthetic ToolMessage injection
-# ---------------------------------------------------------------------------
-
-
-def _build_restart_precheck_tool_messages(precheck: dict) -> list:
-    """Build synthetic AIMessage + ToolMessage pair for restart precheck conclusion."""
-    if precheck.get("restart_detected"):
-        content = (
-            f"Programmatic pre-check result: container DID restart during injection.\n"
-            f"restartCount={precheck.get('restart_count', '?')}, "
-            f"baseline={precheck.get('baseline_restart_count', '?')}, "
-            f"delta={precheck.get('restart_delta', '?')}, "
-            f"reason={precheck.get('reason', 'unknown')}.\n"
-            f"This restart is CONSISTENT WITH the fault having an effect."
-        )
-    else:
-        content = (
-            f"Programmatic pre-check result: NO container restart during injection.\n"
-            f"restartCount={precheck.get('restart_count', '?')}, "
-            f"baseline={precheck.get('baseline_restart_count', '?')}, "
-            f"delta={precheck.get('restart_delta', 0)}.\n"
-            f"Any OOMKilled/CrashLoop events in kubectl describe pod LastState are "
-            f"PRE-EXISTING conditions from BEFORE the injection. "
-            f"You MUST NOT attribute them to the fault injection."
-        )
-
-    ai_msg = AIMessage(
-        content="",
-        tool_calls=[{
-            "name": "container_restart_precheck",
-            "args": {},
-            "id": _RESTART_PRECHECK_TOOL_CALL_ID,
-            "type": "tool_call",
-        }],
-    )
-    tool_msg = ToolMessage(
-        content=content,
-        tool_call_id=_RESTART_PRECHECK_TOOL_CALL_ID,
-        name="container_restart_precheck",
-    )
-    return [ai_msg, tool_msg]
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +245,6 @@ def _build_layer2_messages(
     kubeconfig: str,
     count: int,
     tool_pod_name: str | None = None,
-    restart_precheck_result: dict | None = None,
 ) -> list:
     """Build messages for Layer 2 LLM invocation.
 
@@ -663,15 +306,6 @@ def _build_layer2_messages(
             messages.extend(_build_baseline_tool_messages(
                 _baseline, _blade_target, _blade_action, _blade_parsed,
             ))
-    _precheck = restart_precheck_result or state.get("restart_precheck")
-    if _precheck and "restart_detected" in _precheck:
-        _precheck_in_state = any(
-            getattr(m, "tool_call_id", "") == _RESTART_PRECHECK_TOOL_CALL_ID
-            for m in messages if isinstance(m, ToolMessage)
-        )
-        if not _precheck_in_state:
-            messages.extend(_build_restart_precheck_tool_messages(_precheck))
-
     if count == 1:
         # First iteration: inject full Layer 1 context
         target = {

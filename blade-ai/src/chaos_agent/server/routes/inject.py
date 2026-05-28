@@ -67,7 +67,14 @@ async def inject_fault(request: InjectRequest, req: Request):
         session_store.create_session(task_id, operation="inject")
 
     async def _run_inject():
+        from chaos_agent.observability.otel_genai import get_task_span_manager
+        from chaos_agent.observability import status_tracker as _st_mod
+        _tsm = get_task_span_manager()
+        _otel_cb = getattr(_st_mod, "_otel_callback", None)
         try:
+            _tsm.start_task_span(task_id)
+            if _otel_cb is not None:
+                _otel_cb.set_task_id(task_id)
             result = await agents["inject"].ainvoke(initial_state, config)
             return result
         except Exception as e:
@@ -121,7 +128,6 @@ async def inject_fault(request: InjectRequest, req: Request):
                             blade_params = values_fin.get("params") or {}
                     except Exception:
                         pass
-                    from chaos_agent.models.schemas import JSONEnvelope
                     from chaos_agent.memory.session_store import build_verification_simple
                     from chaos_agent.agent.state import infer_task_state
 
@@ -159,6 +165,7 @@ async def inject_fault(request: InjectRequest, req: Request):
                     )
                 except Exception:
                     logger.warning(f"Failed to finalize session for task {task_id}")
+            _tsm.end_task_span(task_id)
 
     task = asyncio.create_task(_run_inject())
     task_tracker.register(task_id, task)

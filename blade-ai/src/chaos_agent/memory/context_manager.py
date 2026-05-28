@@ -7,6 +7,17 @@ Aligned with Claude Code's autoCompact.ts:
 - Multi-level token warning (NORMAL → WARNING → ERROR → AUTO_COMPACT → BLOCKING)
 - Dynamic threshold calculation with buffer tokens
 - Circuit breaker (MAX_CONSECUTIVE_COMPACT_FAILURES) to prevent infinite retry
+
+Token counting note (E1):
+  Token math in this module — both per-string and per-message-list —
+  delegates to ``chaos_agent.memory.tokens`` which selects an
+  appropriate tokenizer (tiktoken native / family-prefix /
+  HuggingFace AutoTokenizer / CJK heuristic) based on
+  ``settings.model_name`` and tags the result with a quality grade +
+  safety margin. Callers in this file pull ``safe_count`` from the
+  returned ``TokenCount`` so the threshold checks automatically widen
+  when the quality is HEURISTIC. There is no longer a single global
+  fudge factor — each count carries its own appropriate margin.
 """
 
 import logging
@@ -14,52 +25,28 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
+from chaos_agent.memory.tokens import (
+    TokenCount,
+    TokenCountQuality,
+    count_tokens,
+    count_tokens_messages,
+)
+
 logger = logging.getLogger(__name__)
 
-# Mixed token estimation: CJK ~1.5 chars/token, ASCII ~4 chars/token.
-# A flat `chars/4` rule under-counts CJK by 35-50% on short text and 10-20%
-# on mixed-language system prompts, which let context overflow before compaction
-# could trigger. The split below keeps deviation under ~20% vs. tiktoken
-# (cl100k_base) on realistic mixed prompts.
-_CJK_CHARS_PER_TOKEN = 1.5
-_ASCII_CHARS_PER_TOKEN = 4
 
-# Safety margin for token estimation inaccuracy (aligned with OpenClaw's SAFETY_MARGIN).
-TOKEN_ESTIMATE_SAFETY_MARGIN = 1.2
-
-
-def _is_cjk(ch: str) -> bool:
-    """True if `ch` is in a CJK or CJK-adjacent Unicode block.
-
-    Covers Han ideographs and the punctuation/fullwidth ranges that BPE
-    tokenizers (cl100k/o200k/Qwen) all tokenize at codepoint density. Without
-    fullwidth punctuation in this set, real Chinese system prompts deviate
-    >30% from tiktoken because chars like `，：；` get counted at ASCII density.
-    """
-    code = ord(ch)
-    return (
-        0x3000 <= code <= 0x303F      # CJK Symbols and Punctuation
-        or 0x3400 <= code <= 0x4DBF   # CJK Unified Ideographs Extension A
-        or 0x4E00 <= code <= 0x9FFF   # CJK Unified Ideographs
-        or 0xFF00 <= code <= 0xFFEF   # Halfwidth and Fullwidth Forms
-    )
-
-
-def estimate_tokens(text: str) -> int:
-    """Approximate token count using a CJK-aware mixed heuristic.
-
-    CJK characters consume far fewer chars per token than ASCII because most
-    BPE tokenizers tokenize CJK ideographs at the codepoint level. Using a flat
-    chars/4 estimator silently under-counts Chinese-heavy content; this function
-    splits the count and applies the appropriate ratio to each side.
-
-    Returns 0 for empty/None input.
-    """
-    if not text:
-        return 0
-    cjk_count = sum(1 for c in text if _is_cjk(c))
-    ascii_count = len(text) - cjk_count
-    return int(cjk_count / _CJK_CHARS_PER_TOKEN + ascii_count / _ASCII_CHARS_PER_TOKEN)
+# Re-exports for callers that still want the bare integer view. New
+# code should call ``count_tokens(...)`` / ``count_tokens_messages(...)``
+# directly to get quality tags.
+__all__ = [
+    "count_tokens",
+    "count_tokens_messages",
+    "TokenCount",
+    "TokenCountQuality",
+    "CompactLevel",
+    "TokenWarningState",
+    "calculate_token_warning_state",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -221,31 +208,6 @@ def calculate_token_warning_state(
 
 
 # ---------------------------------------------------------------------------
-# Token counting
-# ---------------------------------------------------------------------------
-
-
-def count_tokens_approx(messages: list) -> int:
-    """Approximate token count for a list of messages.
-
-    Delegates per-string counting to `estimate_tokens` so CJK and ASCII are
-    weighted differently. For production accuracy, swap in a model-specific
-    tokenizer (tiktoken/transformers).
-    """
-    total = 0
-    for msg in messages:
-        content = getattr(msg, "content", "")
-        if isinstance(content, str):
-            total += estimate_tokens(content)
-        elif isinstance(content, list):
-            # Handle list content (e.g., multi-modal messages)
-            for item in content:
-                if isinstance(item, dict) and "text" in item:
-                    total += estimate_tokens(item["text"])
-    return total
-
-
-# ---------------------------------------------------------------------------
 # Message pair integrity
 # ---------------------------------------------------------------------------
 
@@ -384,7 +346,13 @@ class ContextManager:
             is_valid=False means context is blocked (circuit breaker tripped
             or at blocking level).
         """
-        total_tokens = int(count_tokens_approx(messages) * TOKEN_ESTIMATE_SAFETY_MARGIN)
+        # safe_count = count × per-quality safety margin (1.0 for tiktoken
+        # native, 1.05 for cross-family BPE, 1.20 for legacy heuristic).
+        # The threshold check thus auto-widens when the underlying tokenizer
+        # is less accurate, replacing the old global SAFETY_MARGIN=1.2.
+        # No ``model=`` arg needed — count_tokens_messages reads
+        # ``settings.model_name`` by default (see _resolve_model in tokens.py).
+        total_tokens = count_tokens_messages(messages).safe_count
         # Pass the instance's configured ratio so the operator's
         # ``BLADE_AI_CONTEXT_COMPACT_RATIO`` setting actually influences
         # the trigger. Before this fix the function silently used its
@@ -439,11 +407,15 @@ class ContextManager:
 
         # First pass: pull out all [Compressed History] summaries into to_keep
         # This ensures previous compression results are never re-compressed.
+        # Use raw ``count`` here (not ``safe_count``) — we're accumulating
+        # toward ``reserve_tokens`` to decide how much room is left for
+        # tail-keeping, not making a threshold decision; over-counting at
+        # this step would under-keep useful recent context.
         summary_indices = set()
         for i, msg in enumerate(messages):
             if _is_compressed_history(msg):
                 messages_to_keep.append(msg)
-                kept_tokens += count_tokens_approx([msg])
+                kept_tokens += count_tokens_messages([msg]).count
                 summary_indices.add(i)
 
         # Second pass: reserve recent messages (skipping summaries already kept)
@@ -451,7 +423,7 @@ class ContextManager:
         for msg in reversed(messages):
             if _is_compressed_history(msg):
                 continue  # Already added above
-            msg_tokens = count_tokens_approx([msg])
+            msg_tokens = count_tokens_messages([msg]).count
             if kept_tokens + msg_tokens > self.reserve_tokens:
                 break
             recent_keep.insert(0, msg)

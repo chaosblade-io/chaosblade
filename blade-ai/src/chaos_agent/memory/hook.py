@@ -14,15 +14,191 @@ from chaos_agent.memory.compactor import compact_memory
 from chaos_agent.memory.context_manager import (
     CompactTrackingState,
     ContextManager,
-    TOKEN_ESTIMATE_SAFETY_MARGIN,
-    count_tokens_approx,
-    estimate_tokens,
     strip_large_outputs,
 )
 from chaos_agent.memory.session_store import SessionStore
+from chaos_agent.memory.tokens import count_tokens, count_tokens_messages
 from chaos_agent.memory.tool_compactor import ToolResultCompactor
+from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# E2 Phase 2A — structured metric extraction (runs BEFORE truncation)
+# ---------------------------------------------------------------------------
+
+_AUTO_EXTRACTED_MARKER = "[Auto-extracted:"
+
+
+def _find_tool_command(target_msg, all_messages: list) -> str:
+    """Find the command string for a ToolMessage by index-then-extract.
+
+    Thin convenience wrapper around ``_build_tool_call_index`` +
+    ``_command_from_parent`` for callers that have a single ToolMessage
+    in hand and don't care about reusing the index (notably tests).
+    The hot path in ``_extract_tool_metrics`` builds the index once
+    per hook call and avoids the per-call rebuild here.
+    """
+    tool_call_id = getattr(target_msg, "tool_call_id", "") or ""
+    if not tool_call_id:
+        return ""
+    parent = _build_tool_call_index(all_messages).get(tool_call_id)
+    return _command_from_parent(parent, tool_call_id)
+
+
+def _format_metric_summary(metrics: dict[str, str]) -> str:
+    """Render the metric dict as the one-line head prefix.
+
+    Pipe-separated with explicit markers so an operator scanning the
+    raw output can locate the auto-summary at a glance. Order is dict
+    insertion order, which matches the parser invocation order — stable
+    for tests.
+    """
+    body = " | ".join(f"{k}={v}" for k, v in metrics.items())
+    return f"{_AUTO_EXTRACTED_MARKER} {body}]\n"
+
+
+def _is_json_shaped(content: str) -> bool:
+    """Quick sniff: does ``content`` look like a JSON object/array root?
+
+    Used to decide whether to prepend the ``[Auto-extracted: …]``
+    summary into the ToolMessage content. JSON-shaped results MUST stay
+    syntactically valid JSON because ``tool_compactor.compact``'s first
+    strategy is ``smart_strip_k8s_json(content, max_bytes)``, which
+    runs ``json.loads(content)``. Any non-JSON prefix breaks the parse,
+    forces a fallback to dumb boundary truncation, and we lose the
+    intelligent K8s field stripping (drops managedFields / annotations,
+    keeps only essentials by ``kind``).
+
+    For JSON-shaped content the metrics still land in
+    ``additional_kwargs['extracted_metrics']`` for the state-side
+    timeline + Phase 3 cross-check; the LLM can still read the
+    canonical fields out of the smart-stripped JSON itself
+    (RestartCount, etc. survive the stripping).
+    """
+    s = content.lstrip()
+    return s.startswith("{") or s.startswith("[")
+
+
+def _build_tool_call_index(messages: list) -> dict[str, object]:
+    """Precompute ``{tool_call_id: AIMessage}`` in one pass over messages.
+
+    Lets ``_extract_tool_metrics`` resolve each ToolMessage's parent
+    in O(1) instead of doing a fresh reverse-scan per ToolMessage.
+    Cost is one full forward scan; benefit grows quadratically with
+    message-list length.
+    """
+    index: dict[str, object] = {}
+    for m in messages:
+        tool_calls = getattr(m, "tool_calls", None) or []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                tc_id = tc.get("id", "") or ""
+            else:
+                tc_id = getattr(tc, "id", "") or ""
+            if tc_id and tc_id not in index:
+                index[tc_id] = m
+    return index
+
+
+def _command_from_parent(parent_msg, tool_call_id: str) -> str:
+    """Extract the command string for a given tool_call_id from its
+    parent AIMessage's tool_calls list.
+
+    Uses value-only join (not ``k=v``) so e.g.
+    ``{"subcommand": "get", "v_args": "pod my-pod"}`` flattens to
+    ``"get pod my-pod"`` and the metric extractor's substring
+    dispatch still finds ``"get pod"`` as a contiguous match.
+    """
+    if parent_msg is None:
+        return ""
+    tool_calls = getattr(parent_msg, "tool_calls", None) or []
+    for tc in tool_calls:
+        if isinstance(tc, dict):
+            tc_id = tc.get("id", "") or ""
+            args = tc.get("args", {}) or {}
+        else:
+            tc_id = getattr(tc, "id", "") or ""
+            args = getattr(tc, "args", {}) or {}
+        if tc_id == tool_call_id:
+            if isinstance(args, dict):
+                return " ".join(str(v) for v in args.values() if v not in (None, ""))
+            return str(args)
+    return ""
+
+
+def _extract_tool_metrics(messages: list) -> None:
+    """For each ToolMessage that hasn't been processed yet, run the
+    metric extractor and (a) store the dict in
+    ``msg.additional_kwargs['extracted_metrics']``, (b) prepend a
+    ``[Auto-extracted: …]`` line to the message content (skipped for
+    JSON-shaped content — see ``_is_json_shaped``).
+
+    Idempotent: messages whose ``additional_kwargs`` already carries
+    ``extracted_metrics`` are skipped, so the hook can be called
+    multiple times per turn without duplicating the summary line.
+
+    Pure mutation (no return) — same convention as ``tool_compactor``
+    elsewhere in this module.
+    """
+    # Lazy import to avoid a circular import (hook is imported by graph
+    # construction; the extractor lives under agent.nodes which itself
+    # transitively pulls in fault_spec and other graph-adjacent modules).
+    from chaos_agent.agent.nodes._metric_extractor import extract_metrics
+
+    parent_index: dict[str, object] | None = None  # built lazily on first need
+
+    for msg in messages:
+        if getattr(msg, "type", None) != "tool":
+            continue
+        # Skip if we've already processed this ToolMessage in a prior turn.
+        akw = getattr(msg, "additional_kwargs", None)
+        if not isinstance(akw, dict):
+            continue
+        if "extracted_metrics" in akw:
+            continue
+        content = getattr(msg, "content", "")
+        # Only text content — multi-modal tool results are out of scope
+        # for the per-format text parsers. Empty content also falls
+        # here; mark with the flag so we don't re-walk it next turn.
+        if not isinstance(content, str) or not content.strip():
+            akw["extracted_metrics"] = {}
+            continue
+        # Belt-and-braces: a content that ALREADY starts with the
+        # marker means a prior process inserted the summary but didn't
+        # set the additional_kwargs flag (e.g. legacy session replay).
+        # Don't double-prepend.
+        if content.lstrip().startswith(_AUTO_EXTRACTED_MARKER):
+            akw["extracted_metrics"] = {}  # mark as processed
+            continue
+
+        # Lazy-build the parent index on first ToolMessage that needs
+        # it — saves the O(M) scan when all ToolMessages are already
+        # flag-marked.
+        if parent_index is None:
+            parent_index = _build_tool_call_index(messages)
+        tc_id = getattr(msg, "tool_call_id", "") or ""
+        command = _command_from_parent(parent_index.get(tc_id), tc_id)
+        tool_name = getattr(msg, "name", "") or ""
+        try:
+            metrics = extract_metrics(tool_name, command, content)
+        except Exception as e:  # extractor must never raise, but guard anyway
+            logger.debug("metric extractor failed: %s", e)
+            metrics = {}
+
+        # Always set the flag (even when {}) so we don't re-walk this
+        # message on every subsequent hook invocation.
+        akw["extracted_metrics"] = metrics
+        # JSON-shaped content: skip the head prepend to preserve
+        # ``smart_strip_k8s_json`` validity. See ``_is_json_shaped``
+        # for the full rationale. Metrics still travel via
+        # additional_kwargs to the Phase 2B state accumulator.
+        if metrics and not _is_json_shaped(content):
+            try:
+                msg.content = _format_metric_summary(metrics) + content
+            except Exception as e:
+                logger.debug("metric summary prepend failed: %s", e)
 
 
 class PreReasoningHook:
@@ -57,6 +233,61 @@ class PreReasoningHook:
             state = CompactTrackingState()
             self._tracking[task_id] = state
         return state
+
+    def _build_observation_update(self, messages: list, state: dict) -> dict:
+        """E2 Phase 2B — collect newly extracted metrics into the
+        timeline on ``state.metric_observations``.
+
+        ``_extract_tool_metrics`` already populated
+        ``additional_kwargs['extracted_metrics']`` on each ToolMessage
+        in this turn. Here we promote the non-empty entries we haven't
+        seen before (matched by ``tool_call_id``) into a structured
+        list on state. The list survives ``[Compressed History]``
+        compaction because it lives on state, not on the message list
+        — which is exactly the gap E2 was designed to close
+        (1KB historical truncation + LLM-summary compaction both
+        destroy in-message metric history).
+
+        Returns ``{}`` when no new observations were captured (so the
+        caller can spread it into the return dict without bumping
+        state version when nothing changed).
+        """
+        current = list(state.get("metric_observations") or [])
+        seen_ids = {obs.get("tool_call_id") for obs in current if obs.get("tool_call_id")}
+        # iteration tag: SUM of the major loop counters present on
+        # state. This makes the value monotonically non-decreasing
+        # across phases (inject → verify) within a task, which is what
+        # any timeline analysis needs. The previous ``or`` fallback
+        # could regress from agent_loop_count=15 (inject phase) to
+        # verifier_loop_count=1 (first verifier turn), producing a
+        # nonsensical "iteration went backwards" series.
+        iteration = (
+            int(state.get("agent_loop_count", 0) or 0)
+            + int(state.get("verifier_loop_count", 0) or 0)
+        )
+        ts = now_iso()
+
+        new_obs: list[dict] = []
+        for msg in messages:
+            if getattr(msg, "type", None) != "tool":
+                continue
+            akw = getattr(msg, "additional_kwargs", {}) or {}
+            metrics = akw.get("extracted_metrics") or {}
+            if not metrics:
+                continue
+            tc_id = getattr(msg, "tool_call_id", "") or ""
+            if not tc_id or tc_id in seen_ids:
+                continue
+            new_obs.append({
+                "iteration": int(iteration),
+                "timestamp": ts,
+                "tool_call_id": tc_id,
+                "tool_name": getattr(msg, "name", "") or "",
+                "metrics": dict(metrics),
+            })
+        if not new_obs:
+            return {}
+        return {"metric_observations": current + new_obs}
 
     def _emit_context_size_snapshot(
         self,
@@ -168,6 +399,28 @@ class PreReasoningHook:
         self._state_confirmed_intent = state.get("confirmed_intent")
         self._state_tui_session_id = state.get("tui_session_id", "")
 
+        # 0. Structured metric extraction (E2) — MUST run BEFORE truncation.
+        # The extractor reads each new ToolMessage's raw content, derives
+        # a small dict of named metrics (RestartCount=8, Disk usage=26%, …),
+        # and stores it in ``msg.additional_kwargs['extracted_metrics']``
+        # plus prepends a one-line ``[Auto-extracted: …]`` summary to
+        # the content HEAD. The summary survives the 1KB historical
+        # ``truncate_text`` because that retains the head only, so the
+        # metrics remain visible to the LLM even after compression. The
+        # ``additional_kwargs`` copy survives both truncation and
+        # ``[Compressed History]`` compaction (compaction's summariser
+        # operates on content; additional_kwargs ride along on the
+        # message object until the message itself is removed). The
+        # state-side accumulator below reads from these
+        # additional_kwargs to build the verification timeline.
+        _extract_tool_metrics(messages)
+        # Build the state-side append to metric_observations
+        # ONCE here, then spread it into whichever return branch fires
+        # below. We can't accumulate at each branch because they
+        # bypass each other — the strip-only branch never reaches the
+        # compaction branch's append.
+        obs_update = self._build_observation_update(messages, state)
+
         # 1. Tool output truncation (modifies messages in-place)
         messages = self.tool_compactor.compact(messages, task_id=task_id)
 
@@ -209,13 +462,17 @@ class PreReasoningHook:
             # Tool compaction modifies messages in-place (same IDs, changed content).
             # No state update needed — the message objects in state are already modified.
             # Write memory status to session file (always), but do NOT show in CLI.
-            total_tokens = int(count_tokens_approx(messages) * TOKEN_ESTIMATE_SAFETY_MARGIN)
+            # safe_count = raw × per-quality margin (1.0/1.05/1.20).
+            # Replaces the global ``× 1.2`` fudge; the multiplier now
+            # tracks how accurate the underlying tokenizer actually is
+            # for the configured model.
+            total_tokens = count_tokens_messages(messages).safe_count
             self._persist_to_session(
                 task_id,
                 f"Memory OK: {len(messages)} messages, ~{total_tokens} tokens",
             )
             self._emit_context_size_snapshot(task_id, total_tokens, len(messages))
-            return {}
+            return obs_update
 
         # --- Intermediate route: try aggressive tool output truncation first ---
         # If we can get below the compaction threshold by just truncating tool
@@ -229,7 +486,7 @@ class PreReasoningHook:
         # input = cheaper call), then fall through to compact_memory.
         if not force:
             combined = stripped + to_keep
-            combined_tokens = int(count_tokens_approx(combined) * TOKEN_ESTIMATE_SAFETY_MARGIN)
+            combined_tokens = count_tokens_messages(combined).safe_count
             if combined_tokens < self.context_manager.compact_threshold:
                 logger.info(
                     f"Aggressive tool truncation sufficient: {combined_tokens} tokens "
@@ -251,11 +508,14 @@ class PreReasoningHook:
                 # dropped, and we'd hit the same threshold again next turn,
                 # paying the strip cost over and over with zero effect.
                 self._emit_context_size_snapshot(task_id, combined_tokens, len(combined))
-                return {"messages": stripped}
+                return {**obs_update, "messages": stripped}
 
-        # Calculate total tokens before compression for observability
+        # Calculate total tokens before compression for observability.
+        # Single-message observability — use raw .count (not safe_count)
+        # so the logged number matches what we'd actually send to the
+        # LLM, not an inflated threshold-safe view.
         total_tokens_before = sum(
-            estimate_tokens(getattr(msg, "content", ""))
+            count_tokens(getattr(msg, "content", "") or "").count
             for msg in to_compact
             if isinstance(getattr(msg, "content", ""), str)
         )
@@ -297,7 +557,10 @@ class PreReasoningHook:
             )
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            tokens_after = int(count_tokens_approx(to_keep) * TOKEN_ESTIMATE_SAFETY_MARGIN)
+            # Post-compaction view used by circuit breaker logic — safe_count
+            # so a still-too-large kept slice errs toward "didn't make
+            # progress" rather than masking a failed compaction.
+            tokens_after = count_tokens_messages(to_keep).safe_count
             # Circuit breaker bookkeeping: a successful compaction
             # resets the consecutive-failure counter (so a transient
             # LLM outage doesn't permanently trip the breaker once the
@@ -350,15 +613,18 @@ class PreReasoningHook:
         # Append new summary (don't replace previous summaries)
         # The previous [Compressed History] messages are in to_keep and untouched.
         # Emit the post-compaction state size so the Footer indicator
-        # visibly drops in real time when the summary lands.
+        # visibly drops in real time when the summary lands. safe_count
+        # keeps Footer / circuit-breaker math consistent with the same
+        # threshold semantics used at the entry check above.
         post_compaction_messages = list(to_keep) + [summary_message]
-        post_compaction_tokens = int(
-            count_tokens_approx(post_compaction_messages) * TOKEN_ESTIMATE_SAFETY_MARGIN
-        )
+        post_compaction_tokens = count_tokens_messages(
+            post_compaction_messages,
+        ).safe_count
         self._emit_context_size_snapshot(
             task_id, post_compaction_tokens, len(post_compaction_messages),
         )
         return {
+            **obs_update,
             "messages": remove_messages + [summary_message],
             "compressed_summary": summary,
         }

@@ -25,7 +25,7 @@ summary: "Advisory good-practice rules, the Blast Radius Assessment Framework (s
 - Verify side effects after each destructive action.
 - If unsure about safety, mark as warning and request confirmation.
 - Prefer test/dev namespaces over production — rationale in chaos-engineering-principles Q9.1/Q9.3.
-- For network faults (`pod-network loss`/`delay`), prefer port-specific
+- For network faults (`pod-network drop`), prefer port-specific
   parameters (`--local-port`, `--remote-port`, `--destination-ip`) to
   minimize blast radius. Only use full-interface injection
   (`--percent 100` without port filter) when the intent is to test

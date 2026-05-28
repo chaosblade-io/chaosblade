@@ -20,3 +20,4 @@ class PromptMode(Enum):
     MINIMAL = "minimal"             # execute_loop: 跳过 chat_routing/workflow/nl_mode
     VERIFICATION = "verification"   # verifier_loop: 仅安全+知识+经验+验证指令
     INTENT = "intent"               # intent_clarification: U-shaped 对话+收敛+路由
+    PLAN_BUILDER = "plan_builder"   # plan_builder: 引导式方案构建 (multi-turn)

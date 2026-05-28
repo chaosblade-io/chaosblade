@@ -31,7 +31,7 @@ from chaos_agent.agent.state import (
     infer_task_state,
     strip_side_effects,
 )
-from chaos_agent.agent.streaming import StreamEvent, parse_stream_event
+from chaos_agent.agent.streaming import SSEBatcher, StreamEvent, parse_stream_event
 from chaos_agent.config.settings import settings
 from chaos_agent.server.routes.sessions import SessionStore, get_store, sessions_router
 from chaos_agent.utils.time import now_iso
@@ -114,13 +114,16 @@ def _content_from_interrupt_payload(payload: dict) -> str:
         ``payload["summary"]``.
       * ``confirmation_gate`` puts a plan summary at
         ``payload["plan_summary"]``.
+      * ``plan_builder`` puts the question text at
+        ``payload["question"]``.
 
     Falling back to a JSON dump is a last-resort defense — every current
-    interrupt() call site supplies one of the two keys above.
+    interrupt() call site supplies one of the keys above.
     """
     return (
         payload.get("summary")
         or payload.get("plan_summary")
+        or payload.get("question")
         or json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
@@ -144,6 +147,99 @@ SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+
+
+def _rebuild_inject_verification_summary(verification: dict | None) -> str:
+    """Rebuild inject_verification_summary from the stored verification dict."""
+    if not verification or not isinstance(verification, dict):
+        return ""
+    layer2 = verification.get("layer2")
+    if not layer2 or not isinstance(layer2, dict):
+        return ""
+    details = layer2.get("details", "")
+    if not details:
+        return ""
+    return f"Layer2={layer2.get('status', 'unknown')}, Details={details}"
+
+
+async def _build_recover_initial_from_store(
+    task_id: str,
+    rec_task_id: str,
+    tui_session_id: str,
+    agents: dict,
+) -> dict | None:
+    """Build recover_initial from task_store, bypassing LangGraph checkpoint.
+
+    Used for cross-session TUI recovery where the checkpoint is stored
+    under conversation_thread_id (not task_id) and can't be looked up.
+    """
+    from chaos_agent.persistence.task_store import get_task_store
+
+    store = await get_task_store()
+    record = await store.get(task_id)
+    if not record or not record.get("blade_uid"):
+        return None
+
+    target = record.get("target") or {}
+    if isinstance(target, str):
+        try:
+            target = json.loads(target)
+        except (json.JSONDecodeError, TypeError):
+            target = {}
+    params = record.get("params") or {}
+    if isinstance(params, str):
+        try:
+            params = json.loads(params)
+        except (json.JSONDecodeError, TypeError):
+            params = {}
+
+    fault_spec = {
+        "namespace": target.get("namespace", ""),
+        "scope": target.get("resource_type", ""),
+        "names": target.get("names", []),
+        "labels": target.get("labels", {}),
+        "blade_target": "",
+        "blade_action": "",
+        "params": params,
+        "params_flags": [],
+        "duration_seconds": 0,
+        "source": "task_store_rebuild",
+        "user_description": "",
+    }
+
+    skill_name = record.get("skill_name", "")
+    skill_case_content = ""
+    if skill_name:
+        try:
+            registry = agents.get("skill_registry")
+            if registry:
+                skill_case_content = registry.activate(skill_name)
+        except Exception:
+            pass
+
+    return {
+        "task_id": rec_task_id,
+        "tui_session_id": tui_session_id,
+        "parent_task_id": task_id,
+        "operation": "recover",
+        "blade_uid": record.get("blade_uid", ""),
+        "skill_name": skill_name,
+        "skill_case_content": skill_case_content,
+        "inject_verification_summary": _rebuild_inject_verification_summary(record.get("verification")),
+        "inject_context": record.get("inject_context") or "",
+        "baseline_data": record.get("baseline_data"),
+        "fault_spec": fault_spec,
+        "kubeconfig": record.get("kubeconfig") or "",
+        "injection_method": record.get("injection_method"),
+        "kubectl_exec_pod_name": record.get("kubectl_exec_pod_name"),
+        "created_at": str(record.get("gmt_create") or ""),
+        "verifier_loop_count": 0,
+        "verification": None,
+        "recover_verification": None,
+        "messages": [],
+        "inject_layer1_cache": None,
+        "recover_layer1_cache": None,
+    }
 
 
 @sessions_router.post("/{sid}/turn")
@@ -279,6 +375,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             "input": body.input,
             "confirmed_intent": "unset",
             "intent_confidence": 0.0,
+            "recover_task_id": "",
             "safety_status": "pending",
             "agent_loop_count": 0,
             "execute_loop_count": 0,
@@ -369,6 +466,36 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             context_trigger_tokens=int(detail.get("trigger_tokens") or 0),
             context_max_tokens=int(detail.get("max_tokens") or 0),
             context_messages_count=int(detail.get("messages_count") or 0),
+        )
+
+    def _convert_postmortem_status(status_evt) -> StreamEvent | None:
+        """R17 — translate save_memory's postmortem tracker events into
+        ``node_start`` / ``node_end`` SSE frames so the TUI spinner can
+        surface the 5-30s "Generating postmortem..." phase. Without
+        this, the user sees a silent gap between the verifier finishing
+        and the ResultCard appearing.
+
+        Maps StatusPhase → SSE type:
+          STARTED   → node_start (sets thoughtSubject = "postmortem")
+          RUNNING   → node_start (refresh with new message)
+          COMPLETED → node_end   (clear subject)
+          FAILED    → node_end   (subject cleared; failure surfaces in
+                                  the eventual ResultCard cause field)
+        """
+        if getattr(status_evt, "source", "") != "postmortem":
+            return None
+        phase = getattr(status_evt, "phase", "")
+        msg = getattr(status_evt, "message", "") or "Generating postmortem"
+        # COMPLETED / FAILED → close out the spinner subject
+        if phase in ("completed", "failed"):
+            return StreamEvent(
+                type="node_end", task_id=turn_id, node="postmortem",
+                content=msg, phase="save",
+            )
+        # STARTED / RUNNING → keep / refresh the subject
+        return StreamEvent(
+            type="node_start", task_id=turn_id, node="postmortem",
+            content=msg, phase="save",
         )
 
     async def _merged_stream(graph_iter):
@@ -486,10 +613,22 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                     pass
 
     async def event_generator():
+        from chaos_agent.observability.otel_genai import get_task_span_manager
+        from chaos_agent.observability import status_tracker as _st_mod
+        _tsm = get_task_span_manager()
+        _otel_cb = getattr(_st_mod, "_otel_callback", None)
+
         stream_task = asyncio.current_task()
         task_tracker.register(turn_id, stream_task)
         turn_started_monotonic = time.monotonic()
+        batcher = SSEBatcher(
+            flush_interval_ms=settings.sse_batch_interval_ms,
+            flush_chars=settings.sse_batch_chars,
+        )
         try:
+            _tsm.start_task_span(turn_id)
+            if _otel_cb is not None:
+                _otel_cb.set_task_id(turn_id)
             # 1. Stream the initial graph invocation, with memory-
             #    compaction status events merged in concurrently
             #    (see _merged_stream comment above).
@@ -503,14 +642,22 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                     evt = parse_stream_event(payload)
                     if evt is not None:
                         evt.task_id = turn_id
-                        yield evt.to_sse()
+                        for sse in batcher.feed(evt):
+                            yield sse
                 elif kind == "status":
+                    for sse in batcher.flush():
+                        yield sse
                     compaction_evt = _convert_compaction_status(payload)
                     if compaction_evt is not None:
                         yield compaction_evt.to_sse()
                     ctx_evt = _convert_context_size_status(payload)
                     if ctx_evt is not None:
                         yield ctx_evt.to_sse()
+                    pm_evt = _convert_postmortem_status(payload)
+                    if pm_evt is not None:
+                        yield pm_evt.to_sse()
+            for sse in batcher.flush():
+                yield sse
 
             # 2. Drain any pending interrupts. The inject pipeline has
             #    *two* interrupt() call sites — intent_confirm (Layer 1,
@@ -605,7 +752,12 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                         yield ": keepalive\n\n"
                         continue
 
-                normalised = _normalise_answer(answer)
+                # plan_builder passes through raw selection ("A", "B", free text);
+                # other nodes normalize to "approved"/"rejected".
+                if interrupted_node == "plan_builder":
+                    normalised = answer
+                else:
+                    normalised = _normalise_answer(answer)
 
                 # Resume the graph. The next astream_events run drains
                 # tokens / tool / phase events until either the next
@@ -633,14 +785,191 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                         evt = parse_stream_event(payload)
                         if evt is not None:
                             evt.task_id = turn_id
-                            yield evt.to_sse()
+                            for sse in batcher.feed(evt):
+                                yield sse
                     elif kind == "status":
+                        for sse in batcher.flush():
+                            yield sse
                         compaction_evt = _convert_compaction_status(payload)
                         if compaction_evt is not None:
                             yield compaction_evt.to_sse()
                         ctx_evt = _convert_context_size_status(payload)
                         if ctx_evt is not None:
                             yield ctx_evt.to_sse()
+                for sse in batcher.flush():
+                    yield sse
+
+            # 2.5 Auto-recover: when inject_graph classified recover intent
+            #     with a confirmed target, invoke recover_graph and stream it.
+            _recover_final = await graph.aget_state(config)
+            _rv = _recover_final.values if _recover_final else {}
+            _recover_inject_tid = _rv.get("recover_task_id", "")
+            if (
+                _rv.get("confirmed_intent") == "recover"
+                and _recover_inject_tid
+                and not _recover_final.next  # not paused at interrupt
+            ):
+                recover_graph = agents.get("recover")
+                if recover_graph is not None:
+                    # Resolve inject state for the target experiment.
+                    # Priority 1: aget_state by task_id — authoritative for
+                    # CLI-originated experiments (thread_id = task_id).
+                    # Priority 2: current conversation state (_rv) — for
+                    # same-session TUI recovery where the inject checkpoint
+                    # lives under conversation_thread_id, not task_id.
+                    sv = None
+                    _inj_config = {
+                        "configurable": {"thread_id": _recover_inject_tid},
+                        "recursion_limit": settings.recursion_limit,
+                    }
+                    try:
+                        _inj_state = await agents["inject"].aget_state(_inj_config)
+                    except Exception:
+                        _inj_state = None
+                    if _inj_state and _inj_state.values and _inj_state.values.get("blade_uid"):
+                        sv = _inj_state.values
+                    elif _rv.get("blade_uid"):
+                        sv = _rv
+                    if sv:
+                        from chaos_agent.utils.inject_context import build_inject_context
+
+                        _rec_task_id = _rv.get("task_id", f"task-{uuid4().hex[:12]}")
+                        recover_initial = {
+                            "task_id": _rec_task_id,
+                            "tui_session_id": sv.get("tui_session_id", ""),
+                            "parent_task_id": _recover_inject_tid,
+                            "operation": "recover",
+                            "blade_uid": sv.get("blade_uid", ""),
+                            "skill_name": sv.get("skill_name", ""),
+                            "skill_case_content": sv.get("skill_case_content", ""),
+                            "inject_verification_summary": sv.get("inject_verification_summary", ""),
+                            "inject_context": build_inject_context(sv.get("messages", [])),
+                            "fault_spec": sv.get("fault_spec"),
+                            "kubeconfig": sv.get("kubeconfig", ""),
+                            "injection_method": sv.get("injection_method"),
+                            "kubectl_exec_pod_name": sv.get("kubectl_exec_pod_name"),
+                            "created_at": sv.get("created_at", ""),
+                            "verifier_loop_count": 0,
+                            "verification": None,
+                            "recover_verification": None,
+                            "messages": [],
+                            "inject_layer1_cache": None,
+                            "recover_layer1_cache": None,
+                        }
+                        recover_config = {
+                            "configurable": {"thread_id": _rec_task_id},
+                            "recursion_limit": settings.recursion_limit,
+                        }
+
+                        # Stream recover_graph events
+                        async for kind, payload in _merged_stream(
+                            recover_graph.astream_events(
+                                recover_initial, recover_config, version="v2"
+                            ),
+                        ):
+                            if await req.is_disconnected():
+                                return
+                            if kind == "graph":
+                                evt = parse_stream_event(payload)
+                                if evt is not None:
+                                    evt.task_id = turn_id
+                                    for sse in batcher.feed(evt):
+                                        yield sse
+                            elif kind == "status":
+                                for sse in batcher.flush():
+                                    yield sse
+                        for sse in batcher.flush():
+                            yield sse
+
+                        # Emit recover result card
+                        _rec_result = await _build_recover_result_payload(
+                            recover_graph, recover_config,
+                            _rec_task_id, _recover_inject_tid,
+                            sv, turn_started_monotonic,
+                        )
+                        if _rec_result is not None:
+                            store.add_task(sid, _rec_task_id)
+                            from chaos_agent.memory.tui_session_store import (
+                                get_global_tui_session_store,
+                            )
+                            _tui_store = get_global_tui_session_store()
+                            if _tui_store is not None:
+                                try:
+                                    _tui_store.add_task(sid, _rec_task_id)
+                                except Exception:
+                                    logger.warning(
+                                        "recover task_id disk persist failed "
+                                        "sid=%s task=%s", sid, _rec_task_id,
+                                    )
+                            yield StreamEvent(
+                                type="result",
+                                content=json.dumps(_rec_result, ensure_ascii=False),
+                                task_id=turn_id,
+                            ).to_sse()
+                    else:
+                        # Priority 3: rebuild from task_store (cross-session TUI)
+                        _rec_task_id = _rv.get("task_id", f"task-{uuid4().hex[:12]}")
+                        recover_initial = await _build_recover_initial_from_store(
+                            _recover_inject_tid, _rec_task_id, sid, agents,
+                        )
+                        if recover_initial is not None:
+                            recover_config = {
+                                "configurable": {"thread_id": _rec_task_id},
+                                "recursion_limit": settings.recursion_limit,
+                            }
+                            async for kind, payload in _merged_stream(
+                                recover_graph.astream_events(
+                                    recover_initial, recover_config, version="v2"
+                                ),
+                            ):
+                                if await req.is_disconnected():
+                                    return
+                                if kind == "graph":
+                                    evt = parse_stream_event(payload)
+                                    if evt is not None:
+                                        evt.task_id = turn_id
+                                        for sse in batcher.feed(evt):
+                                            yield sse
+                                elif kind == "status":
+                                    for sse in batcher.flush():
+                                        yield sse
+                            for sse in batcher.flush():
+                                yield sse
+
+                            _rec_result = await _build_recover_result_payload(
+                                recover_graph, recover_config,
+                                _rec_task_id, _recover_inject_tid,
+                                recover_initial, turn_started_monotonic,
+                            )
+                            if _rec_result is not None:
+                                store.add_task(sid, _rec_task_id)
+                                from chaos_agent.memory.tui_session_store import (
+                                    get_global_tui_session_store,
+                                )
+                                _tui_store = get_global_tui_session_store()
+                                if _tui_store is not None:
+                                    try:
+                                        _tui_store.add_task(sid, _rec_task_id)
+                                    except Exception:
+                                        logger.warning(
+                                            "recover task_id disk persist failed "
+                                            "sid=%s task=%s", sid, _rec_task_id,
+                                        )
+                                yield StreamEvent(
+                                    type="result",
+                                    content=json.dumps(_rec_result, ensure_ascii=False),
+                                    task_id=turn_id,
+                                ).to_sse()
+                        else:
+                            logger.warning(
+                                "Auto-recover: no inject state found for %s",
+                                _recover_inject_tid,
+                            )
+                            yield StreamEvent(
+                                type="error",
+                                content=f"无法找到实验 {_recover_inject_tid} 的注入状态，恢复已跳过。",
+                                task_id=turn_id,
+                            ).to_sse()
 
             # 3. Final-state extraction → ``result`` envelope.
             #    Mirrors inject_stream.py's terminal-state shape so the
@@ -723,6 +1052,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             ).to_sse()
             yield StreamEvent(type="done", task_id=turn_id).to_sse()
         finally:
+            _tsm.end_task_span(turn_id)
             # Drop any orphaned interrupt future so a client that
             # disconnected mid-confirm doesn't leak it. ``cancel_interrupt``
             # is a no-op when the future is missing or already resolved.
@@ -939,19 +1269,27 @@ async def _build_result_payload(
     plan_summary = values.get("plan_summary", "") or ""
 
     # Whitelist what counts as an operational turn worth a result
-    # card: only ``inject`` and ``recover`` are user-initiated
-    # operations with outcomes the user wants to see. Everything else
+    # card: only ``inject`` is a user-initiated operation with outcomes
+    # the user wants to see in the inject graph. Everything else
     # (``chat``, ``unset`` mid-clarification, missing intent for a
     # pure-text reply) is conversational; the agent's text reply IS
     # the result and showing a green "Injection succeeded" card on
     # top would mislead.
+    #
+    # ``recover`` in inject_graph is a BRIDGE state — intent was
+    # classified but the actual recover pipeline runs separately
+    # (recover_graph launched by TUI ConversationController). The
+    # state still carries residual blade_uid/verification/postmortem
+    # from the previous inject turn (checkpoint inheritance), so
+    # emitting a result card here would re-display the old inject's
+    # failure card. Suppress it.
     #
     # Why not the previous heuristic that also checked for empty
     # blade_uid/plan_summary: that incorrectly skipped FAILED inject
     # turns (intent="inject", but no blade_uid/plan_summary because
     # execution didn't make it that far). Failed injects deserve a
     # card showing the failure, not silence.
-    if confirmed_intent not in ("inject", "recover"):
+    if confirmed_intent != "inject":
         return None
 
     # Inject turn — full payload.
@@ -1011,6 +1349,58 @@ async def _build_result_payload(
             "side_effects": values.get("verification", {}).get("side_effects")
             if isinstance(values.get("verification"), dict)
             else None,
+            # T6 — postmortem payload from save_memory (None when not
+            # generated: disabled / non-inject intent / non-whitelist
+            # failure / LLM timeout). TS TUI tolerates absence.
+            "postmortem": values.get("postmortem"),
             **diagnostics,
+        },
+    }
+
+
+async def _build_recover_result_payload(
+    recover_graph,
+    recover_config: dict,
+    recover_task_id: str,
+    inject_task_id: str,
+    inject_state_values: dict,
+    started_monotonic: float,
+) -> dict | None:
+    """Build a result card payload for recover_graph completion."""
+    try:
+        final = await recover_graph.aget_state(recover_config)
+    except Exception:
+        return None
+    if not final or not final.values:
+        return None
+
+    values = final.values
+    elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
+
+    is_recovered = False
+    recovery_level = "failed"
+    result_dict = values.get("result")
+    if isinstance(result_dict, dict):
+        is_recovered = result_dict.get("recovered", False)
+        recovery_level = result_dict.get("recovery_level", "recovered" if is_recovered else "failed")
+
+    task_state = recovery_level if is_recovered else "failed"
+
+    blade_uid = inject_state_values.get("blade_uid", "")
+    skill_name = inject_state_values.get("skill_name", "")
+    from chaos_agent.agent.fault_spec import legacy_target_dict
+    target = legacy_target_dict(inject_state_values)
+
+    return {
+        "status": "success",
+        "data": {
+            "task_id": recover_task_id,
+            "task_state": task_state,
+            "fault_type": skill_name,
+            "blade_uid": blade_uid,
+            "duration_ms": elapsed_ms,
+            "target": target,
+            "params": {},
+            "verification": strip_side_effects(values.get("recover_verification")),
         },
     }

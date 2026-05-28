@@ -111,6 +111,15 @@ class HealthReport:
     issues: list[HealthIssue] = field(default_factory=list)
     """All problems found, ordered by ``severity`` desc then ``code``."""
 
+    checked_detail: str = ""
+    """Scope-specific one-liner describing what was verified.
+
+    Set by each checker. Examples:
+      - node: "Ready, 无压力, agent 在线"
+      - pod: "Running, 容器正常"
+    Used by confirm card to show what the check actually covered.
+    """
+
     def is_blocking(self) -> bool:
         """True iff a hard-block condition was found."""
         return self.overall == HealthSeverity.BLOCK
@@ -142,6 +151,7 @@ class HealthReport:
                 for i in self.issues
             ],
             "summary": self.summary(),
+            "checked_detail": self.checked_detail,
         }
 
 
@@ -187,6 +197,7 @@ class NodeHealthChecker:
     async def check(
         self, target: dict, kubeconfig: str
     ) -> HealthReport:
+        from chaos_agent.config.settings import settings
         from chaos_agent.utils.coerce import coerce_to_list
 
         names = coerce_to_list(
@@ -197,12 +208,34 @@ class NodeHealthChecker:
                 target=target,
                 overall=HealthSeverity.OK,
                 issues=[],
+                checked_detail="node 无目标",
             )
 
-        # Defer real kubectl to the integration layer; the helper
-        # below is the only function patched in unit tests.
         conditions = await _query_node_conditions(names[0], kubeconfig)
-        return _build_node_report(target, conditions)
+        report = _build_node_report(target, conditions)
+
+        # ChaosBlade agent existence — node scope requires DaemonSet pod on target.
+        agent_checked = False
+        if settings.blade_agent_check_enabled and kubeconfig:
+            agent_checked = True
+            agent_ok = await _query_blade_agent_on_node(names[0], kubeconfig)
+            if not agent_ok:
+                report.issues.append(
+                    HealthIssue(
+                        severity=HealthSeverity.BLOCK,
+                        code="node.blade_agent_missing",
+                        message=f"ChaosBlade agent pod not found on node {names[0]}",
+                    )
+                )
+                report.overall = HealthSeverity.BLOCK
+
+        if report.overall == HealthSeverity.OK:
+            detail = "Node Ready, 无 DiskPressure/MemoryPressure/PIDPressure/NetworkUnavailable"
+            if agent_checked:
+                detail += ", blade-agent 在线"
+            report.checked_detail = detail
+
+        return report
 
 
 class PodHealthChecker:
@@ -223,21 +256,44 @@ class PodHealthChecker:
     async def check(
         self, target: dict, kubeconfig: str
     ) -> HealthReport:
-        from chaos_agent.utils.coerce import coerce_to_list
-
-        names = coerce_to_list(
-            target.get("names"), context="PodHealthChecker:names"
-        )
         namespace = target.get("namespace", "default")
-        if not names:
+        pod_names = await _resolve_pod_names(target, kubeconfig)
+        if not pod_names:
             return HealthReport(
                 target=target,
                 overall=HealthSeverity.OK,
                 issues=[],
+                checked_detail="pod 无可解析目标",
             )
 
-        status = await _query_pod_status(names[0], namespace, kubeconfig)
-        return _build_pod_report(target, status)
+        _SEV_ORDER = {HealthSeverity.OK: 0, HealthSeverity.WARN: 1, HealthSeverity.BLOCK: 2}
+        all_issues: list[HealthIssue] = []
+        worst = HealthSeverity.OK
+        checked_pods: list[str] = []
+        for pod_name in pod_names:
+            status = await _query_pod_status(pod_name, namespace, kubeconfig)
+            report = _build_pod_report(target, status)
+            for issue in report.issues:
+                issue.message = f"[{pod_name}] {issue.message}"
+                all_issues.append(issue)
+            if _SEV_ORDER.get(report.overall, 0) > _SEV_ORDER.get(worst, 0):
+                worst = report.overall
+            checked_pods.append(pod_name)
+
+        if worst == HealthSeverity.OK:
+            detail = (
+                f"{len(checked_pods)} pod(s) checked, "
+                f"无 Evicted/CrashLoopBackOff/ImagePullBackOff"
+            )
+        else:
+            detail = f"{len(all_issues)} issue(s) across {len(checked_pods)} pod(s)"
+
+        return HealthReport(
+            target=target,
+            overall=worst,
+            issues=all_issues,
+            checked_detail=detail,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +379,23 @@ def _build_node_report(target: dict, conditions: list[dict]) -> HealthReport:
     for cond in conditions or []:
         ctype = cond.get("type", "")
         cstatus = cond.get("status", "")
+
+        # Ready condition: status != "True" means node is unreachable
+        if ctype == "Ready" and cstatus != "True":
+            duration = _format_condition_duration(
+                cond.get("lastTransitionTime", "")
+            )
+            issues.append(
+                HealthIssue(
+                    severity=HealthSeverity.BLOCK,
+                    code="node.not_ready",
+                    message=f"Node is NotReady for {duration or 'unknown duration'}",
+                    duration_hint=duration,
+                )
+            )
+            continue
+
+        # Pressure conditions: status == "True" means active pressure
         if cstatus != "True":
             continue
         code = _NODE_BLOCKING_CONDITIONS.get(ctype)
@@ -351,6 +424,34 @@ def _build_pod_report(target: dict, status: dict) -> HealthReport:
 
         {"phase": "Running", "conditions": [...], "reason": "Evicted"?}
     """
+    _error = status.get("_error")
+    if _error == "namespace_not_found":
+        ns = target.get("namespace", "unknown")
+        return HealthReport(
+            target=target,
+            overall=HealthSeverity.BLOCK,
+            issues=[HealthIssue(
+                severity=HealthSeverity.BLOCK,
+                code="pod.namespace_not_found",
+                message=f"Namespace '{ns}' does not exist in the cluster",
+            )],
+            checked_detail=f"Namespace '{ns}' not found",
+        )
+    if _error == "resource_not_found":
+        names = target.get("names", [])
+        name = names[0] if names else "unknown"
+        ns = target.get("namespace", "default")
+        return HealthReport(
+            target=target,
+            overall=HealthSeverity.BLOCK,
+            issues=[HealthIssue(
+                severity=HealthSeverity.BLOCK,
+                code="pod.not_found",
+                message=f"Pod '{name}' not found in namespace '{ns}'",
+            )],
+            checked_detail=f"Pod '{name}' not found in '{ns}'",
+        )
+
     issues: list[HealthIssue] = []
     phase = status.get("phase", "")
     reason = status.get("reason", "")
@@ -430,10 +531,10 @@ async def _query_node_conditions(
     """
     if not node_name:
         return []
-    from chaos_agent.tools.kubectl import kubectl as _kubectl
+    from chaos_agent.tools.kubectl import _kubectl_impl
 
     try:
-        raw = await _kubectl(
+        raw = await _kubectl_impl(
             subcommand="get",
             v_args=f"node {node_name} -o json",
             kubeconfig=kubeconfig or "",
@@ -468,6 +569,81 @@ async def _query_node_conditions(
     return conds
 
 
+async def _query_blade_agent_on_node(
+    node_name: str, kubeconfig: str
+) -> bool:
+    """Check if ChaosBlade agent DaemonSet pod is Running on target node.
+
+    Returns True if at least one matching pod is found, False otherwise.
+    Never raises — returns True on error (fail-open: assume agent is there).
+    """
+    from chaos_agent.config.settings import settings
+    from chaos_agent.tools.kubectl import _kubectl_impl
+
+    try:
+        raw = await _kubectl_impl(
+            subcommand="get",
+            v_args=(
+                f"pod -n {settings.blade_agent_namespace} "
+                f"--field-selector=spec.nodeName={node_name},status.phase=Running "
+                f"-l {settings.blade_agent_label} --no-headers"
+            ),
+            kubeconfig=kubeconfig or "",
+        )
+    except Exception as exc:
+        logger.warning(
+            "_query_blade_agent_on_node: kubectl error for %s: %s",
+            node_name, exc,
+        )
+        return True  # fail-open
+
+    if raw is None:
+        return True  # fail-open
+    return len(raw.strip()) > 0
+
+
+async def _resolve_pod_names(target: dict, kubeconfig: str) -> list[str]:
+    """Resolve real pod names from a target dict.
+
+    When the user selects pods via labels (e.g. app=accounting), ``names``
+    contains the app/deployment name, not actual pod names.  This function
+    resolves to the list of real pod names that kubectl can query.
+
+    Resolution order:
+      1. ``labels`` non-empty → ``kubectl get pod -l … -n …`` → all pod names
+      2. ``names`` as-is (assumed to be real pod names)
+      3. empty list
+    """
+    from chaos_agent.utils.coerce import coerce_to_list
+
+    labels = target.get("labels") or {}
+    namespace = target.get("namespace", "default")
+    names = coerce_to_list(target.get("names"), context="_resolve_pod_names")
+
+    if labels:
+        label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
+        from chaos_agent.tools.kubectl import _kubectl_impl
+        try:
+            raw = await _kubectl_impl(
+                subcommand="get",
+                v_args=(
+                    f"pod -l {label_selector} -n {namespace} "
+                    f"--field-selector=status.phase=Running "
+                    f"-o jsonpath='{{range .items[*]}}{{.metadata.name}} {{end}}'"
+                ),
+                kubeconfig=kubeconfig or "",
+            )
+            pod_names = [
+                n for n in (raw or "").strip().strip("'\"").split() if n
+            ]
+            if pod_names:
+                return pod_names
+        except Exception:
+            pass
+
+    return list(names)
+
+
 async def _query_pod_status(
     pod_name: str, namespace: str, kubeconfig: str
 ) -> dict:
@@ -479,7 +655,7 @@ async def _query_pod_status(
     """
     if not pod_name:
         return {}
-    from chaos_agent.tools.kubectl import kubectl as _kubectl
+    from chaos_agent.tools.kubectl import _kubectl_impl
 
     args = f"pod {pod_name}"
     if namespace:
@@ -487,7 +663,7 @@ async def _query_pod_status(
     args += " -o json"
 
     try:
-        raw = await _kubectl(
+        raw = await _kubectl_impl(
             subcommand="get",
             v_args=args,
             kubeconfig=kubeconfig or "",
@@ -505,6 +681,11 @@ async def _query_pod_status(
     s = raw.strip()
     if s.startswith("Error"):
         logger.debug("_query_pod_status: kubectl reported error: %s", s[:200])
+        s_lower = s.lower()
+        if "not found" in s_lower and "namespace" in s_lower:
+            return {"_error": "namespace_not_found", "phase": "", "reason": ""}
+        if "not found" in s_lower:
+            return {"_error": "resource_not_found", "phase": "", "reason": ""}
         return {}
     try:
         data = _json.loads(s)

@@ -98,7 +98,13 @@ async def maybe_rebuild_agents(
     try:
         from chaos_agent.agent.factory import create_agent
 
-        new_agents = await create_agent(registry)
+        # E9 — preserve MCP manager across rebuilds. Wizard /save and
+        # model swap trigger maybe_rebuild_agents AFTER lifespan startup
+        # has already connected MCP servers; pass the existing manager
+        # so the new compiled graphs retain the same MCP tool surface.
+        # Without this, every rebuild silently drops all MCP tools.
+        mcp_manager = getattr(app.state, "mcp_manager", None)
+        new_agents = await create_agent(registry, mcp_manager=mcp_manager)
         # NOTE: we don't close the previous ``checkpointer_conn`` /
         # ``checkpointer`` here even though we drop the only reference.
         # An in-flight ``/turn`` captured the OLD compiled graph at

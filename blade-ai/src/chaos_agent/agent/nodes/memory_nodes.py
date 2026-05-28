@@ -1,8 +1,29 @@
 """Memory nodes: load and save operational/session memory within the graph."""
 
+import asyncio
 import logging
 
 from langchain_core.messages import HumanMessage
+
+
+def _format_duration_ms(ms) -> str:
+    """Render a duration in ms as ``Ns`` / ``Nm Ns``; empty when unknown."""
+    try:
+        ms_int = int(ms or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ms_int <= 0:
+        return ""
+    seconds = ms_int // 1000
+    if seconds < 60:
+        return f"{seconds}s"
+    return f"{seconds // 60}m {seconds % 60}s"
+
+
+def read_fault_spec_lazy(state):
+    """Defer fault_spec import to avoid eager top-level cycle."""
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    return read_fault_spec(state)
 
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
@@ -223,53 +244,175 @@ async def save_memory(state: AgentState) -> dict:
     sync_node_status_to_session(state, "save_memory", "Experiment saved to TaskStore",
         detail={"verification_level": (state.get("verification") or {}).get("level", "unknown")})
 
+    # T6 — postmortem auto-generation. Gated by settings + experiment
+    # outcome (only real injections / qualifying failures get the LLM
+    # call). All exceptions are swallowed and degrade to postmortem=None
+    # so the result envelope still ships unimpeded.
+    postmortem_payload: dict | None = None
+    try:
+        from chaos_agent.agent.postmortem import (
+            build_postmortem_context,
+            generate_postmortem,
+            save_postmortem,
+            should_generate_postmortem,
+        )
+        from chaos_agent.agent.postmortem.generator import make_summary
+
+        if should_generate_postmortem(dict(state), settings):
+            # R17 — use a dedicated source ("postmortem") instead of
+            # piggybacking on "save_memory" so turn.py's
+            # ``_convert_postmortem_status`` can pick this signal out
+            # of the StatusEvent stream and surface it to the TUI as a
+            # visible spinner phase. Without a dedicated source the
+            # status would be indistinguishable from generic save_memory
+            # tracker events (which are dropped by the converter
+            # whitelist) and the user would see a silent 5-30s pause.
+            tracker.start(
+                StatusCategory.NODE, "postmortem",
+                "Generating postmortem (LLM)...",
+            )
+            # R10 — wire the SAME tracing / OTel callbacks as the main
+            # graph LLM so postmortem's token usage flows into
+            # ``TaskTrace.total_token_input/output`` + OTel GenAI export.
+            # Without this, the TUI Footer's per-turn token counter
+            # under-reports by 1-3K and monitoring dashboards are blind
+            # to this LLM call entirely.
+            from chaos_agent.agent.factory import make_llm
+            from chaos_agent.observability import status_tracker as _st_mod
+            _pm_callbacks: list = []
+            _trace_cb = getattr(_st_mod, "_tracing_callback", None)
+            if _trace_cb is not None:
+                _pm_callbacks.append(_trace_cb)
+            _otel_cb = getattr(_st_mod, "_otel_callback", None)
+            if _otel_cb is not None:
+                _pm_callbacks.append(_otel_cb)
+            pm_llm = make_llm(callbacks=_pm_callbacks or None)
+            context = build_postmortem_context(
+                dict(state),
+                max_messages=settings.postmortem_max_messages,
+            )
+            try:
+                markdown_body = await generate_postmortem(
+                    context, pm_llm,
+                    timeout=settings.postmortem_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Postmortem LLM call timed out after %ds for task %s",
+                    settings.postmortem_timeout_seconds, task_id,
+                )
+                tracker.update("Postmortem skipped (timeout)")
+                markdown_body = ""
+            except Exception as e:
+                logger.warning(
+                    "Postmortem LLM call failed for task %s: %s", task_id, e,
+                )
+                tracker.update(f"Postmortem skipped ({type(e).__name__})")
+                markdown_body = ""
+
+            if markdown_body:
+                # Header metadata derived from the same state the LLM
+                # used — keeps the on-disk file self-describing.
+                _spec = read_fault_spec_lazy(state)
+                header_meta = {
+                    "skill_name": state.get("skill_name", "") or "unknown",
+                    "namespace": (_spec.namespace if _spec else "") or "unknown",
+                    "status": (state.get("verification") or {}).get("level", "unknown") if isinstance(state.get("verification"), dict) else "unknown",
+                    "duration": _format_duration_ms((state.get("result") or {}).get("duration_ms", 0)) if isinstance(state.get("result"), dict) else "",
+                    "generated_at": now_iso(),
+                }
+                try:
+                    pm_path = save_postmortem(
+                        task_id, markdown_body, header_meta=header_meta,
+                    )
+                    postmortem_payload = {
+                        "path": str(pm_path),
+                        "markdown": markdown_body,
+                        "summary": make_summary(markdown_body),
+                    }
+                    tracker.update(
+                        f"Postmortem saved ({len(markdown_body)} chars)",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Postmortem write failed for task %s: %s", task_id, e,
+                    )
+                    tracker.update("Postmortem skipped (write error)")
+    except Exception:
+        # Outermost catch — postmortem subsystem must NEVER crash
+        # save_memory. Any import error / unexpected exception lands here.
+        logger.exception("Postmortem subsystem unexpected error for task %s", task_id)
+
     # Set finished_at timestamp for the task
     updates = {"finished_at": now_iso()}
+    # R11 — ALWAYS write the postmortem field (even when None) to
+    # OVERWRITE any leftover value from a prior experiment that shares
+    # this LangGraph thread (server mode uses ``conv-<sid>`` as the
+    # thread_id, so state.postmortem persists across inject runs within
+    # one TUI session). Without this, a subsequent SAFETY_REJECTED /
+    # USER_REJECTED inject that skips postmortem generation would
+    # inherit the previous experiment's postmortem dict and surface it
+    # on the current ResultCard — a serious data-correctness bug.
+    updates["postmortem"] = postmortem_payload
 
-    # Infer failure_reason if not already set but task is in a failed state
-    if not state.get("failure_reason"):
-        from chaos_agent.errors import FailureReason, enrich_failure_reason
+    # Infer failure_detail if not already set but task is in a failed state
+    if not state.get("failure_detail"):
+        from chaos_agent.agent.state_helpers import fail_state
+        from chaos_agent.agent.verdict import FailureCategory
+
         error = state.get("error")
         verification = state.get("verification")
         replan_count = state.get("replan_count", 0)
         replan_context = state.get("replan_context")
-        safety_status = state.get("safety_status", "")
         msgs = state.get("messages", [])
 
         if error:
-            # Replan exhaustion: had replan context but still failed
             if replan_count > 0 and replan_context:
-                base = (
-                    f"{FailureReason.REPLAN_EXHAUSTED.value}: "
-                    f"Replan exhausted after {replan_count} attempt(s), "
-                    f"last error: {error[:200]}"
+                _fs = fail_state(
+                    FailureCategory.REPLAN_EXHAUSTED,
+                    f"attempts={replan_count}, last_error={error[:200]}",
+                    msgs,
                 )
-                updates["failure_reason"] = enrich_failure_reason(base, msgs)
             else:
-                base = f"{FailureReason.EXECUTION_FAILED.value}: {error[:300]}"
-                updates["failure_reason"] = enrich_failure_reason(base, msgs)
+                _fs = fail_state(
+                    FailureCategory.EXECUTION_FAILED,
+                    error[:300],
+                    msgs,
+                )
+            updates.update(_fs)
         elif verification and isinstance(verification, dict):
-            # Verification failed (reached save_memory via verifier → "done")
             l1 = verification.get("layer1", {})
             l2 = verification.get("layer2", {})
             level = verification.get("level", "")
             if level in ("unverified",) or l1.get("status") == "failed" or l2.get("status") == "failed":
                 l1_status = l1.get("status", "unknown")
                 l2_status = l2.get("status", "unknown")
-                base = (
-                    f"{FailureReason.VERIFICATION_FAILED.value}: "
-                    f"Layer1={l1_status}, Layer2={l2_status}, level={level}"
+                _fs = fail_state(
+                    FailureCategory.VERIFICATION_FAILED,
+                    f"Layer1={l1_status}, Layer2={l2_status}, level={level}",
+                    msgs,
                 )
-                updates["failure_reason"] = enrich_failure_reason(base, msgs)
-        # Replan exhaustion but error was cleared (moved to replan_context during replan).
-        # Without this, the response would have result="failed" but error="", which is confusing.
+                updates.update(_fs)
         elif replan_count > 0 and replan_context and not state.get("blade_uid") and not verification:
-            base = (
-                f"{FailureReason.REPLAN_EXHAUSTED.value}: "
-                f"Replan exhausted after {replan_count} attempt(s), "
-                f"injection never succeeded"
+            _fs = fail_state(
+                FailureCategory.REPLAN_EXHAUSTED,
+                f"attempts={replan_count}, injection never succeeded",
+                msgs,
             )
-            updates["failure_reason"] = enrich_failure_reason(base, msgs)
+            updates.update(_fs)
+
+    # Persist inject_context for cross-session recovery.
+    # Task_store has the column but inject flow never populates it;
+    # compute it here where messages are complete.
+    if not state.get("inject_context"):
+        try:
+            from chaos_agent.utils.inject_context import build_inject_context
+            _msgs = state.get("messages", [])
+            _ctx = build_inject_context(_msgs)
+            if _ctx:
+                updates["inject_context"] = _ctx
+        except Exception:
+            pass
 
     await sync_to_store(state, updates)
 
@@ -293,25 +436,69 @@ async def save_memory(state: AgentState) -> dict:
             if confirmed_intent in ("chat", "recover"):
                 final_status = "completed"
             elif state.get("blade_uid") and not (
-                state.get("error") or updates.get("failure_reason")
+                state.get("error") or updates.get("error")
             ):
                 final_status = "completed"
             else:
                 final_status = "failed"
-            # Build a human-readable result_summary from verification
-            # so the JSON snapshot at rest carries the same outcome
-            # signal the live ResultCard surfaces.
-            result_summary_str = ""
+            # Build a structured result_summary envelope (matching
+            # inject.py / inject_stream.py / recover.py format) so the
+            # JSON snapshot at rest carries the same data the live
+            # ResultCard surfaces via SSE.
+            result_summary: str | dict = ""
             try:
-                from chaos_agent.memory.session_store import (
-                    build_result_summary,
+                from chaos_agent.agent.state import infer_task_state, extract_ui_diagnostics
+                from chaos_agent.agent.fault_spec import legacy_target_dict, legacy_params_dict
+                from chaos_agent.memory.session_store import build_verification_simple
+                from chaos_agent.models.schemas import build_inject_envelope
+
+                merged = dict(state)
+                merged.update(updates)
+
+                task_state = infer_task_state(merged)
+                if task_state == "injecting":
+                    task_state = "injected" if merged.get("blade_uid") else "failed"
+
+                result_target = legacy_target_dict(merged)
+                blade_params = legacy_params_dict(merged)
+                skill_name_fin = merged.get("skill_name", "")
+                blade_uid = merged.get("blade_uid", "")
+
+                fault_type = ""
+                if blade_params:
+                    _s = blade_params.get("scope", "")
+                    _a = blade_params.get("action", "")
+                    _t = blade_params.get("target", "")
+                    if _s and _t and _a:
+                        fault_type = f"{_s}-{_t}-{_a}"
+                if not fault_type:
+                    fault_type = skill_name_fin
+
+                names = result_target.get("names", [])
+                ns = result_target.get("namespace", "") or blade_params.get("namespace", "")
+                verification = merged.get("verification")
+                failure_reason = (
+                    (merged.get("failure_detail") or {}).get("context", "")
+                    if merged.get("failure_detail")
+                    else (merged.get("error") or "")
                 )
-                _v = state.get("verification") or {}
-                if isinstance(_v, dict):
-                    result_summary_str = build_result_summary(_v)
+
+                result_summary = build_inject_envelope(
+                    {
+                        "task_id": task_id,
+                        "task_state": task_state,
+                        "fault_type": fault_type,
+                        "blade_uid": blade_uid,
+                        "targets": [{"name": n, "namespace": ns} for n in names],
+                        "verification": build_verification_simple(verification) if verification else None,
+                        **extract_ui_diagnostics(merged),
+                    },
+                    task_state,
+                    failure_reason,
+                )
             except Exception:
                 logger.debug(
-                    "build_result_summary failed for task=%s",
+                    "build result_summary failed for task=%s",
                     task_id, exc_info=True,
                 )
             # Flush the FULL conversation history to disk before
@@ -331,7 +518,7 @@ async def save_memory(state: AgentState) -> dict:
             store.finalize_session(
                 task_id,
                 remaining_messages=full_messages,
-                result_summary=result_summary_str,
+                result_summary=result_summary,
                 status=final_status,
             )
     except Exception:
@@ -341,13 +528,8 @@ async def save_memory(state: AgentState) -> dict:
             task_id, exc_info=True,
         )
 
-    # Patch E — close out the current attempt with the right outcome.
-    # Outcome derives from the same signals used to decide the result
-    # envelope: ``failure_reason`` set → failed; otherwise success.
-    # ``end_attempt`` is idempotent on empty history so chat / replay
-    # paths don't break.
     from chaos_agent.agent.attempt_tracker import end_attempt as _end
-    _outcome = "failed" if state.get("failure_reason") else "success"
+    _outcome = "failed" if (state.get("failure_detail") or state.get("error")) else "success"
     end_delta = _end(state, outcome=_outcome)
     if end_delta:
         # Merge into the existing updates dict so both the legacy

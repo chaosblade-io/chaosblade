@@ -16,13 +16,13 @@ Symbols:
 
 import json
 import logging
-from dataclasses import dataclass
 
 from langchain_core.messages import AIMessage, ToolMessage
 
 from chaos_agent.agent.nodes._injection_detection import (
     _was_blade_create_attempted,
 )
+from chaos_agent.agent.verdict import Layer1Result
 
 logger = logging.getLogger(__name__)
 
@@ -30,36 +30,16 @@ _DESTROYED_STATES = frozenset({"Destroyed", "destroyed"})
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 result dataclass
+# Layer 1 result — reuses verdict.Layer1Result (Pydantic)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class RecoverLayer1Result:
-    """Structured result from recover Layer 1 verification."""
-
-    status: str = "unknown"       # passed / failed / error / skipped
-    details: str = ""             # human-readable summary
-    raw_output: str = ""          # blade_destroy raw output
-
-    def is_passed(self) -> bool:
-        return self.status == "passed"
-
-    def is_terminal(self) -> bool:
-        """Whether Layer 1 reached a terminal (non-passed) state.
-
-        Note: "skipped" is NOT terminal — it means Layer 1 is not applicable
-        for non-ChaosBlade faults (no blade_uid). Layer 2 should still proceed.
-        """
-        return self.status in ("failed", "error")
+# Backward-compat alias so existing imports don't break.
+RecoverLayer1Result = Layer1Result
 
 
-def _recover_layer1_to_dict(result: RecoverLayer1Result) -> dict:
-    """Convert RecoverLayer1Result to dict for state storage."""
-    return {
-        "status": result.status,
-        "details": result.details,
-        "raw_output": result.raw_output,
-    }
+def _recover_layer1_to_dict(result: Layer1Result) -> dict:
+    """Convert Layer1Result to dict for state storage."""
+    return result.model_dump()
 
 
 # ---------------------------------------------------------------------------

@@ -99,7 +99,7 @@ async def sync_to_store(state: dict, updated_fields: dict) -> None:
     the graph pipeline is never disrupted.
     """
     task_id = state.get("task_id", "") or updated_fields.get("task_id", "")
-    if not task_id:
+    if not task_id or task_id.startswith("turn-"):
         return
     try:
         from chaos_agent.persistence.task_store import get_task_store

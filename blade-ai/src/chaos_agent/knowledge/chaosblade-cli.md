@@ -45,14 +45,19 @@ blade create k8s <scope>-<target> <action> [flags]
 | --- | --- |
 | `pod-cpu fullload` | `--cpu-percent 80` (single CPU) ; `--cpu-count 2 --cpu-percent 100` (pin 2 cores) |
 | `pod-memory load` | `--mem-percent 70` ; `--mem-size 512` (MB) ; `--mode cache` (cache vs ram) |
-| `pod-network delay` | `--time 3000 --offset 1000 --interface eth0` ; add `--local-port 8080` to scope to a port |
-| `pod-network loss` | `--percent 50 --interface eth0` ; `--destination-ip 10.1.2.3` for outbound-only loss |
-| `pod-network corrupt` / `duplicate` / `reorder` | similar `--percent` semantics as loss |
+| ~~`pod-network delay`~~ | **v1.8.0 不可用** — 旧版参数: `--time 3000 --offset 1000 --interface eth0 --local-port 8080`。需 Tier 2 tc qdisc 替代 |
+| `pod-network drop` | `--interface eth0` ; `--destination-ip 10.1.2.3` for outbound-only. **全量丢包，不支持 `--percent`**（iptables DROP） |
+| ~~`pod-network corrupt` / `duplicate` / `reorder`~~ | **不适用 v1.8.0** — 仅 `dns`、`drop`、`occupy` 可用 |
 | `pod-disk fill` | `--path /tmp --size 1024` (MB). Path is inside the container; check writable mounts first |
 | `pod-disk burn` | `--read --write --size 50` for IO contention |
 | `pod-process kill` | `--process java` ; `--process-cmd "java -jar"` |
 | `pod-pod fail` | drops the pod via the pod controller — verify with restart count |
 | `pod-network dns` | `--domain www.example.com --ip 10.0.0.0` (both **required**). Modifies `/etc/hosts` — see [DNS note](#dns-fault-note) below |
+| `pod-network occupy` | `--port 8080` — 占用指定端口 |
+
+> **⚠️ blade v1.8.0 网络子命令变更**：`pod-network` 仅支持 `dns` / `drop` / `occupy`。
+> 旧版 `loss`（tc netem, 支持 --percent）→ 新版 `drop`（iptables DROP, **不支持 --percent**, 全量丢包）；旧版 `delay` / `corrupt` / `duplicate` / `reorder` 在 v1.8.0 中不可用。
+> 如需 delay 效果，请使用 Tier 2 kubectl-native 方案（tc qdisc）或升级 blade 版本。
 
 ### Container Scope
 
@@ -74,7 +79,7 @@ ChaosBlade rejects `--namespace` and `--labels` for node scope — the
 | `node-cpu fullload` | `--cpu-percent 80` |
 | `node-memory load` | `--mem-percent 70` (node scope accepts ONLY `--mem-percent`, not `--mem-size`) |
 | `node-disk fill` | `--path /tmp --size 1024`. Path resolution depends on mount layout — see "Resource Mapping" below. |
-| `node-network delay` / `loss` | same network flags as pod scope, but applied at the node interface |
+| `node-network drop` | `--interface` flags same as pod scope, applied at node interface. **不支持 `--percent`**（全量丢包）。(v1.8.0: `delay`/`loss` 不可用) |
 | `node-process kill` | targets host processes — exercise extreme caution |
 
 ### Resource Mapping for `node-disk fill`

@@ -62,6 +62,15 @@ from chaos_agent.agent.prompts.sections.verification import (
     get_verifier_output_format_section,
     get_verifier_kubeconfig_section,
 )
+from chaos_agent.agent.prompts.sections.plan_builder import (
+    get_plan_builder_role_section,
+    get_plan_builder_critical_rules_section,
+    get_plan_builder_workflow_section,
+    get_plan_builder_tools_section,
+    get_plan_builder_output_format_section,
+    get_plan_builder_progress_section,
+    get_plan_builder_critical_rules_reminder_section,
+)
 from chaos_agent.agent.prompts.sections.workflow import (
     get_verification_heuristics_compact_section,
 )
@@ -325,6 +334,40 @@ def build_intent_clarification_prompt(
     return _enforce_prompt_budget(prompt, PromptMode.INTENT)
 
 
+def build_plan_builder_prompt(
+    collected_faults: list | None = None,
+    fault_spec=None,
+    **kwargs,
+) -> str:
+    """Build plan_builder system prompt using U-shaped composition.
+
+    Same pattern as build_intent_clarification_prompt():
+    CRITICAL at BEGINNING + END, dynamic below CACHE_BOUNDARY.
+    """
+    stable_sections = [
+        get_plan_builder_role_section(),
+        get_plan_builder_critical_rules_section(),
+        get_plan_builder_workflow_section(),
+        get_plan_builder_tools_section(),
+        get_plan_builder_output_format_section(),
+    ]
+
+    dynamic_sections: list[str] = []
+    progress = get_plan_builder_progress_section(
+        collected_faults or [], fault_spec
+    )
+    if progress:
+        dynamic_sections.append(progress)
+
+    parts = [s for s in stable_sections if s]
+    parts.append(CACHE_BOUNDARY.strip())
+    parts.extend(s for s in dynamic_sections if s)
+    parts.append(get_plan_builder_critical_rules_reminder_section())
+
+    prompt = "\n\n".join(parts)
+    return _enforce_prompt_budget(prompt, PromptMode.PLAN_BUILDER)
+
+
 # ---------------------------------------------------------------------------
 # P1: PromptMode-driven builder dispatch
 # ---------------------------------------------------------------------------
@@ -334,6 +377,7 @@ _BUILDER_DISPATCH = {
     PromptMode.MINIMAL: build_execute_system_prompt,
     PromptMode.VERIFICATION: build_verifier_prompt,
     PromptMode.INTENT: build_intent_clarification_prompt,
+    PromptMode.PLAN_BUILDER: build_plan_builder_prompt,
 }
 
 

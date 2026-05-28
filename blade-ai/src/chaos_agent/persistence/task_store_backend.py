@@ -17,7 +17,11 @@ from chaos_agent.utils.time import now_iso
 # Columns stored as JSON strings in the DB
 _JSON_COLUMNS: frozenset[str] = frozenset(
     {"target", "params", "verification", "recover_verification", "result",
-     "baseline_data"}
+     "baseline_data",
+     # R18 — postmortem dict (path/markdown/summary) JSON-serialised.
+     "postmortem",
+     # E18 — safety pre-check report dicts.
+     "target_health_report", "feasibility_report"}
 )
 
 # tasks table — narrow, hot path (16 columns)
@@ -36,6 +40,11 @@ _DETAIL_COLUMNS: list[str] = [
     "verification", "recover_verification", "result",
     "failure_reason",
     "baseline_data", "inject_context", "skill_use_case",
+    "injection_method", "kubectl_exec_pod_name",
+    # R18 — postmortem dict (JSON-serialised), see save_memory.
+    "postmortem",
+    # E18 — safety pre-check reports (JSON-serialised).
+    "target_health_report", "feasibility_report",
     "total_token_input", "total_token_output",
     "total_llm_calls", "total_tool_calls", "total_duration_ms",
     "gmt_create", "gmt_modified",
@@ -187,6 +196,20 @@ class StorageBackend(Protocol):
 
     async def select_spans(self, task_id: str) -> list[dict]:
         """SELECT * FROM task_spans WHERE task_id = ? ORDER BY id"""
+        ...
+
+    # -- sessions ------------------------------------------------------------
+
+    async def upsert_session(self, session_id: str, columns: list[str], values: list) -> None:
+        """INSERT … ON CONFLICT(session_id) DO UPDATE SET … for the *sessions* table."""
+        ...
+
+    async def select_session(self, session_id: str) -> Optional[dict]:
+        """SELECT * FROM sessions WHERE session_id = ?"""
+        ...
+
+    async def select_sessions_ordered(self, limit: int, offset: int, status: str = "") -> list[dict]:
+        """SELECT * FROM sessions [WHERE status=?] ORDER BY gmt_create DESC LIMIT ? OFFSET ?"""
         ...
 
     # -- lifecycle -----------------------------------------------------------

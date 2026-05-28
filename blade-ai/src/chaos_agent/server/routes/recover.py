@@ -37,6 +37,17 @@ async def recover_fault(request: RecoverRequest, req: Request):
 
     config = {"configurable": {"thread_id": inject_task_id}, "recursion_limit": settings.recursion_limit}
 
+    # Init OTel refs before try so the except block can safely call
+    # end_task_span even if an exception fires before start_task_span.
+    from chaos_agent.observability.otel_genai import get_task_span_manager
+    from chaos_agent.observability import status_tracker as _st_mod
+    _tsm = get_task_span_manager()
+    _otel_cb = getattr(_st_mod, "_otel_callback", None)
+    # Pre-init vars referenced in except block to avoid UnboundLocalError
+    # if an early exception fires before their assignment inside try.
+    blade_uid = ""
+    session_store = None
+
     try:
         # Get current state from inject graph checkpoint
         current_state = await agents["inject"].aget_state(config)
@@ -104,6 +115,11 @@ async def recover_fault(request: RecoverRequest, req: Request):
                 baseline_messages=inject_messages,
             )
 
+        # OTel task span for recover operation (refs initialised above)
+        _tsm.start_task_span(record_task_id)
+        if _otel_cb is not None:
+            _otel_cb.set_task_id(record_task_id)
+
         # Execute recover graph (includes two-layer verification)
         result = await agents["recover"].ainvoke(initial_state, config)
 
@@ -130,14 +146,14 @@ async def recover_fault(request: RecoverRequest, req: Request):
 
         from chaos_agent.memory.session_store import build_verification_simple
 
+        _tsm.end_task_span(record_task_id)
+
         if not is_recovered:
             # Extract failure_reason from graph result
             failure_reason = result.get("failure_reason") if isinstance(result, dict) else None
             merged_error = failure_reason or result.get("error") or "Recovery verification failed" if isinstance(result, dict) else "Recovery verification failed"
             if session_store:
                 try:
-                    from chaos_agent.models.schemas import JSONEnvelope
-                    from chaos_agent.memory.session_store import build_verification_simple
                     session_store.finalize_session(
                         record_task_id,
                         remaining_messages=remaining_messages,
@@ -173,8 +189,6 @@ async def recover_fault(request: RecoverRequest, req: Request):
 
         if session_store:
             try:
-                from chaos_agent.models.schemas import JSONEnvelope
-                from chaos_agent.memory.session_store import build_verification_simple
                 session_store.finalize_session(
                     record_task_id,
                     remaining_messages=remaining_messages,
@@ -202,6 +216,7 @@ async def recover_fault(request: RecoverRequest, req: Request):
         )
 
     except Exception as e:
+        _tsm.end_task_span(record_task_id)
         logger.exception(f"Recover failed for task {inject_task_id}")
         if session_store:
             try:

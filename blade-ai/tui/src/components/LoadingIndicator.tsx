@@ -42,9 +42,15 @@
  *   - is still informative (header text reflects the active node /
  *     tool / phrase, refreshed by reducer on transitions).
  *
- * The hook ``useLoadingIndicator`` keeps returning ``bodyLines``
- * (deprecated path) so future restoration / opt-in is a one-line
- * change in this file. The existing field is no longer read here.
+ * 2026-05-26 perf cleanup — the previously deprecated ``bodyLines``
+ * path (kept as a "future restoration switch") has been removed from
+ * ``useLoadingIndicator`` along with its 250ms ``displayedBuffer``
+ * throttle and the ``tailWrappedLines`` wrap+pad pipeline. Reason:
+ * even though the body wasn't rendered, the supporting useEffect /
+ * useMemo / useState / useRef chain still fired on every thinking
+ * token dispatch (10-20Hz under streaming) and burned scheduler /
+ * subscription work. Re-adding live CoT body in the future would now
+ * be a deliberate new feature instead of unblocking a dormant path.
  */
 
 import { memo } from "react";

@@ -95,6 +95,19 @@ export const BootOrchestrator: React.FC<BootOrchestratorProps> = ({
           };
       dispatch({ type: "HISTORY_APPENDED", item: doctorItem });
 
+      // Seed the footer's context indicator with the real model budget
+      // so it never flickers from the 128k placeholder to the actual value.
+      const ctxMax = preflight?.["context_max_tokens"];
+      if (typeof ctxMax === "number" && ctxMax > 0) {
+        dispatch({
+          type: "CONTEXT_SIZE_RECEIVED",
+          currentTokens: 0,
+          triggerTokens: 0,
+          maxTokens: ctxMax,
+          messagesCount: 0,
+        });
+      }
+
       // ── Phase 2: pending tasks ─────────────────────────────────
       dispatch({
         type: "BOOT_PROGRESS_SHOW",

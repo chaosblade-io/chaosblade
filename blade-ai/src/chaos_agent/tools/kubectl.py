@@ -162,6 +162,17 @@ async def kubectl(
       - "force delete a stuck Pod" → delete with --force --grace-period=0
       - "remove a taint" → taint with the taint key followed by '-' (e.g., "nodes <node> key-")
     """
+    return await _kubectl_impl(subcommand, v_args, kubeconfig, context, cluster)
+
+
+async def _kubectl_impl(
+    subcommand: str,
+    v_args: str = "",
+    kubeconfig: str = "",
+    context: str = "",
+    cluster: str = "",
+) -> str:
+    """Shared kubectl execution logic used by both kubectl and kubectl_ro."""
     cmd = [settings.kubectl_path]
     cmd.extend(_build_kubectl_global_args(kubeconfig, context, cluster))
     cmd.append(subcommand)
@@ -371,12 +382,7 @@ async def kubectl_ro(
             f"Mutation subcommands (exec/delete/patch/apply/scale/...) "
             f"are bound in Phase 2 after your plan is approved."
         )
-    # Delegate to the full kubectl tool, which already handles all the
-    # global args, output formatting, large-output hints, etc.
-    return await kubectl.ainvoke({
-        "subcommand": subcommand,
-        "v_args": v_args,
-        "kubeconfig": kubeconfig,
-        "context": context,
-        "cluster": cluster,
-    })
+    # Call the shared implementation directly — NOT kubectl.ainvoke(),
+    # which would emit a nested on_tool_start event causing the TUI to
+    # render a duplicate tool card.
+    return await _kubectl_impl(subcommand, v_args, kubeconfig, context, cluster)

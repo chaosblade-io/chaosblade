@@ -68,10 +68,13 @@ async def preflight(req: Request):
 
     # namespace is per-session, not a global setting — the TUI already
     # has it in its store from createSession; we don't echo it here.
+    ctx_max_tokens, _ = settings.resolve_context_budget(settings.model_name)
+
     return JSONEnvelope.ok(
         data={
             "kubeconfig": kubeconfig,
             "model_name": settings.model_name or "",
+            "context_max_tokens": ctx_max_tokens,
             "passed_count": sum(1 for c in results if c.passed),
             "total_count": len(results),
             "checks": [

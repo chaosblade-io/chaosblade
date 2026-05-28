@@ -1052,7 +1052,7 @@ class CommandDispatcher:
         import asyncio
         from uuid import uuid4
 
-        from chaos_agent.memory.context_manager import count_tokens_approx
+        from chaos_agent.memory.tokens import count_tokens_messages
         from chaos_agent.config.settings import settings as s
         from chaos_agent.observability.status_tracker import (
             subscribe as _status_subscribe,
@@ -1081,7 +1081,9 @@ class CommandDispatcher:
         snapshot = await graph.aget_state(config)
         state_values = snapshot.values or {}
         messages = state_values.get("messages") or []
-        before = count_tokens_approx(messages)
+        # /compact reports raw token counts to the user — match the server
+        # path semantics (sessions.py uses .count, not safe_count).
+        before = count_tokens_messages(messages).count
         if before == 0:
             self._renderer.system("会话尚无消息可压缩。")
             return
@@ -1146,7 +1148,9 @@ class CommandDispatcher:
         # may have emitted both RemoveMessages and the summary, and
         # the reducer's actual result is what the next turn will see.
         snapshot_after = await graph.aget_state(config)
-        after = count_tokens_approx((snapshot_after.values or {}).get("messages") or [])
+        after = count_tokens_messages(
+            (snapshot_after.values or {}).get("messages") or [],
+        ).count
         if after >= before:
             self._renderer.system(
                 f"上下文 {before} tokens → {after} tokens，未实际缩减。"

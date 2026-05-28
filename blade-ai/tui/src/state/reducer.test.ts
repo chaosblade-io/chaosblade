@@ -612,6 +612,129 @@ describe("reducer / TOKEN_APPENDED coalescing", () => {
     expect(inHistory).toHaveLength(1);
     expect(inPending).toHaveLength(1);
   });
+
+  describe("short-agent protection (Qwen reasoning/content interleave)", () => {
+    // Guards the MIN_AGENT_LEN_FOR_SPLIT=50 rule added 2026-05-26 after
+    // task-f8320b6ff844 showed orphan blocks from interleaved thinking:
+    // Qwen's enable_thinking mode emits reasoning_content chunks
+    // interleaved with content chunks. Without this guard, the second
+    // token's commitThinking + flushLeadingStable would flush the
+    // short agent to history, leaving the rest of the same logical
+    // reply as a separate agent block.
+
+    it("keeps agent intact when mid-content thinking arrives on a SHORT agent (<50 chars)", () => {
+      const s = fold([
+        { type: "TURN_STARTED", input: "hi" },
+        // First reasoning burst — commits as ThinkingItem on the next
+        // TOKEN_APPENDED ("I"), which is expected (agent is empty so
+        // protection doesn't apply yet).
+        { type: "THINKING_APPENDED", content: "thinking 4s", node: "n" },
+        { type: "TOKEN_APPENDED", content: "I", node: "n" },
+        // Second reasoning burst arriving mid-content. With the guard,
+        // this should NOT commit a ThinkingItem because the agent is
+        // still 1 char (< 50) — the buffer is preserved.
+        { type: "THINKING_APPENDED", content: "thinking <1s", node: "n" },
+        { type: "TOKEN_APPENDED", content: " acknowledge", node: "n" },
+      ]);
+      const allAgents = [...s.history, ...s.pending].filter(
+        (i) => i.kind === "agent",
+      );
+      // Single connected agent — no "I" orphan.
+      expect(allAgents).toHaveLength(1);
+      const agent = allAgents[0];
+      if (agent?.kind === "agent") {
+        expect(agent.text).toBe("I acknowledge");
+      }
+      // Mid-content thinking is suppressed: commitThinking sees
+      // suppressMidContentThinking=true and clears the buffer without
+      // creating a ThinkingItem.
+      expect(s.thoughtBuffer).toBe("");
+    });
+
+    it("suppresses mid-content thinking even when agent exceeds threshold", () => {
+      // With suppressMidContentThinking, mid-content reasoning chunks
+      // are discarded regardless of agent length — no trailing or
+      // interleaved ThinkingItems.
+      const longText =
+        "This is a sufficiently long agent response that exceeds the fifty character threshold for splitting";
+      const s = fold([
+        { type: "TURN_STARTED", input: "hi" },
+        { type: "THINKING_APPENDED", content: "early thought", node: "n" },
+        // Agent grows past 50 chars in a single TOKEN_APPENDED.
+        {
+          type: "TOKEN_APPENDED",
+          content: longText,
+          node: "n",
+        },
+        // Mid-content thinking — suppressed by the flag.
+        { type: "THINKING_APPENDED", content: "mid", node: "n" },
+        { type: "TOKEN_APPENDED", content: " continuing", node: "n" },
+      ]);
+      // Only the initial "early thought" produces a ThinkingItem.
+      // The "mid" thinking is suppressed.
+      const thinking = [...s.history, ...s.pending].filter(
+        (i) => i.kind === "thinking",
+      );
+      expect(thinking).toHaveLength(1);
+      // Agent text continues seamlessly (no split).
+      const agents = [...s.history, ...s.pending].filter(
+        (i) => i.kind === "agent",
+      );
+      expect(agents).toHaveLength(1);
+      if (agents[0]?.kind === "agent") {
+        expect(agents[0].text).toBe(longText + " continuing");
+      }
+      // Buffer is drained (discarded by suppress, not committed).
+      expect(s.thoughtBuffer).toBe("");
+    });
+
+    it("keeps CJK mid-sentence fragment intact (regression: 12-char split)", () => {
+      // Reproduces the user-reported rendering issue: Qwen emits
+      // "我必须拒绝这个请求。作为" (12 chars) then a second thinking
+      // chunk, then the rest of the response. With threshold=8, this
+      // split; with threshold=50, it stays intact.
+      const s = fold([
+        { type: "TURN_STARTED", input: "全集群注入" },
+        { type: "THINKING_APPENDED", content: "analyzing request", node: "n" },
+        { type: "TOKEN_APPENDED", content: "我必须拒绝这个请求。作为", node: "n" },
+        { type: "THINKING_APPENDED", content: "safety check", node: "n" },
+        { type: "TOKEN_APPENDED", content: "专业工具，我需要指出安全风险。", node: "n" },
+      ]);
+      const allAgents = [...s.history, ...s.pending].filter(
+        (i) => i.kind === "agent",
+      );
+      expect(allAgents).toHaveLength(1);
+      if (allAgents[0]?.kind === "agent") {
+        expect(allAgents[0].text).toBe(
+          "我必须拒绝这个请求。作为专业工具，我需要指出安全风险。",
+        );
+      }
+      // Mid-content thinking is suppressed: commitThinking clears
+      // the buffer on the second TOKEN_APPENDED dispatch.
+      expect(s.thoughtBuffer).toBe("");
+    });
+
+    it("suppresses deferred thinking at TURN_DONE (no trailing ThinkingItem)", () => {
+      const s = fold([
+        { type: "TURN_STARTED", input: "hi" },
+        { type: "THINKING_APPENDED", content: "ephemeral", node: "n" },
+        { type: "TOKEN_APPENDED", content: "x", node: "n" },
+        // Second thinking arrives mid-content. Suppress is armed
+        // after TOKEN_APPENDED, so this thinking is discarded.
+        { type: "THINKING_APPENDED", content: "deferred", node: "n" },
+        { type: "TURN_DONE" },
+      ]);
+      // Only the initial "ephemeral" thinking produces a ThinkingItem.
+      // The "deferred" mid-content thinking is suppressed — no trailing
+      // "▸ 思考用时 <1s" after the response.
+      const thinking = [...s.history, ...s.pending].filter(
+        (i) => i.kind === "thinking",
+      );
+      expect(thinking).toHaveLength(1);
+      // Buffer is drained at turn end.
+      expect(s.thoughtBuffer).toBe("");
+    });
+  });
 });
 
 describe("reducer / TOOL_STARTED + TOOL_ENDED matching", () => {
@@ -1577,6 +1700,94 @@ describe("reducer / thinking session commit", () => {
     });
     expect(s2.thoughtStartedAt).toBe(startedAt);
     expect(s2.thoughtBuffer).toBe("first more");
+  });
+
+  describe("hasActiveThinking edge-trigger (2026-05-26 perf)", () => {
+    // The LoadingIndicator subscribes to ``hasActiveThinking`` instead
+    // of ``thoughtBuffer`` so it doesn't re-render on every token
+    // chunk. These tests pin the edge-trigger semantics so a future
+    // refactor can't quietly turn it back into per-chunk noise.
+
+    it("flips false → true on the FIRST THINKING_APPENDED of a session", () => {
+      const s = fold([
+        { type: "TURN_STARTED", input: "hi" },
+      ]);
+      expect(s.hasActiveThinking).toBe(false);
+      const next = reducer(s, {
+        type: "THINKING_APPENDED", content: "first chunk", node: "n",
+      });
+      expect(next.hasActiveThinking).toBe(true);
+    });
+
+    it("stays true across N subsequent THINKING_APPENDED chunks", () => {
+      const s = fold([
+        { type: "TURN_STARTED", input: "hi" },
+        { type: "THINKING_APPENDED", content: "a", node: "n" },
+        { type: "THINKING_APPENDED", content: "b", node: "n" },
+        { type: "THINKING_APPENDED", content: "c", node: "n" },
+        { type: "THINKING_APPENDED", content: "d", node: "n" },
+      ]);
+      // 4 dispatches, only 1 edge. Subscribers should not have been
+      // notified of a "change" for the 2nd/3rd/4th appends.
+      expect(s.hasActiveThinking).toBe(true);
+      expect(s.thoughtBuffer).toBe("abcd");
+    });
+
+    it("flips true → false when commitThinking finalises the session (TOKEN_APPENDED)", () => {
+      const s = fold([
+        { type: "TURN_STARTED", input: "hi" },
+        { type: "THINKING_APPENDED", content: "x", node: "n" },
+        { type: "TOKEN_APPENDED", content: "Hi", node: "n" },
+      ]);
+      expect(s.hasActiveThinking).toBe(false);
+    });
+
+    it("flips true → false when commitThinking finalises via TOOL_STARTED", () => {
+      const s = fold([
+        { type: "TURN_STARTED", input: "hi" },
+        { type: "THINKING_APPENDED", content: "x", node: "n" },
+        {
+          type: "TOOL_STARTED", callId: "c1", name: "kubectl", node: "n",
+        },
+      ]);
+      expect(s.hasActiveThinking).toBe(false);
+    });
+
+    it("resets to false on TURN_STARTED (new turn clears any leftover)", () => {
+      const s = fold([
+        { type: "TURN_STARTED", input: "first" },
+        { type: "THINKING_APPENDED", content: "stale", node: "n" },
+        { type: "TURN_STARTED", input: "second" },
+      ]);
+      expect(s.hasActiveThinking).toBe(false);
+    });
+
+    it("maintains the invariant hasActiveThinking === (thoughtBuffer.length > 0) across a mixed sequence", () => {
+      // Drives the reducer through every transition path that touches
+      // either field — TURN_STARTED, THINKING_APPENDED (first + Nth),
+      // TOKEN_APPENDED (commits), TOOL_STARTED (commits), TURN_DONE
+      // (commits), REPLAY_STARTED (resets) — and asserts the invariant
+      // at every intermediate state. Guards against a future refactor
+      // that updates ``thoughtBuffer`` without re-deriving the boolean,
+      // which would silently break the LoadingIndicator's header swap.
+      const sequence: Action[] = [
+        { type: "TURN_STARTED", input: "hi" },
+        { type: "THINKING_APPENDED", content: "a", node: "n" },
+        { type: "THINKING_APPENDED", content: "b", node: "n" },
+        { type: "TOKEN_APPENDED", content: "x", node: "n" },
+        { type: "THINKING_APPENDED", content: "c", node: "n" },
+        { type: "TOOL_STARTED", callId: "c1", name: "kubectl", node: "n" },
+        { type: "TURN_STARTED", input: "again" },
+        { type: "THINKING_APPENDED", content: "d", node: "n" },
+        { type: "TURN_DONE" },
+        { type: "REPLAY_STARTED", taskId: "t1" },
+      ];
+      let state: AppState = initialAppState;
+      for (const action of sequence) {
+        state = reducer(state, action);
+        expect(state.hasActiveThinking).toBe(state.thoughtBuffer.length > 0);
+      }
+    });
   });
 
   it("preserves a ThinkingItem across the first TOKEN_APPENDED after thinking", () => {

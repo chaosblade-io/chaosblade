@@ -173,6 +173,20 @@ async def create_session(body: CreateSessionRequest) -> dict[str, str]:
             )
         except Exception as e:
             logger.warning(f"TuiSessionStore.create failed for {sid}: {e}")
+    # Persist to DB for SQL-queryable session listing.
+    try:
+        from chaos_agent.persistence.task_store import get_task_store
+        from chaos_agent.utils.time import now_iso
+        task_store = await get_task_store()
+        await task_store.record_session(
+            sid,
+            status="active",
+            cluster_name=body.cluster or "",
+            namespace=body.namespace or "default",
+            started_at=now_iso(),
+        )
+    except Exception as e:
+        logger.warning(f"TaskStore.record_session failed for {sid}: {e}")
     logger.info(f"Created TUI session {sid}")
     return {"session_id": sid}
 
@@ -189,6 +203,14 @@ async def delete_session(sid: str) -> dict[str, bool]:
             store.finalize(sid, status="completed")
         except Exception as e:
             logger.warning(f"TuiSessionStore.finalize failed for {sid}: {e}")
+    # Update DB record status.
+    try:
+        from chaos_agent.persistence.task_store import get_task_store
+        from chaos_agent.utils.time import now_iso
+        task_store = await get_task_store()
+        await task_store.record_session(sid, status="completed", finished_at=now_iso())
+    except Exception as e:
+        logger.warning(f"TaskStore.record_session(finalize) failed for {sid}: {e}")
     _GLOBAL_STORE.delete(sid)
     return {"ok": True}
 
@@ -287,7 +309,7 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
 
     from chaos_agent.agent.streaming import StreamEvent
     from chaos_agent.config.settings import settings as s
-    from chaos_agent.memory.context_manager import count_tokens_approx
+    from chaos_agent.memory.tokens import count_tokens_messages
     from chaos_agent.observability.status_tracker import (
         subscribe as _status_subscribe,
         unsubscribe as _status_unsubscribe,
@@ -431,7 +453,12 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
 
             state_values = snapshot.values or {}
             messages = list(state_values.get("messages") or [])
-            before = count_tokens_approx(messages)
+            # /compact streaming surface — report the headline number to
+            # the user (the "you were at N tokens, compressed to M"). Use
+            # raw .count for display; safe_count would inflate by margin
+            # and confuse users comparing against their own kubectl/blade
+            # cost dashboards.
+            before = count_tokens_messages(messages).count
             if before == 0:
                 # Nothing to compact at all — short-circuit with a
                 # result frame so the client can render "noop".
@@ -554,9 +581,11 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
                 yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
                 return
 
-            after = count_tokens_approx(
-                (snapshot_after.values or {}).get("messages") or []
-            )
+            # Pair with the `before` reading above — same accounting
+            # (raw .count) so the saved-tokens math is consistent.
+            after = count_tokens_messages(
+                (snapshot_after.values or {}).get("messages") or [],
+            ).count
             saved = max(0, before - after)
             compacted = saved > 0 and after < before
             duration_ms = (time.monotonic() - t0) * 1000.0

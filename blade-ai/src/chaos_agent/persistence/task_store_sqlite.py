@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS task_details (
     recover_verification TEXT,
     result              TEXT,
     failure_reason      TEXT,
+    postmortem          TEXT,
+    target_health_report TEXT,
+    feasibility_report  TEXT,
     total_token_input   INTEGER NOT NULL DEFAULT 0,
     total_token_output  INTEGER NOT NULL DEFAULT 0,
     total_llm_calls     INTEGER NOT NULL DEFAULT 0,
@@ -92,25 +95,42 @@ CREATE INDEX IF NOT EXISTS idx_task_spans_task_id ON task_spans(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_spans_gmt_create ON task_spans(gmt_create);
 """
 
-_SCHEMA_DDL = _TASKS_DDL + _DETAILS_DDL + _SPANS_DDL
+_SESSIONS_DDL = """\
+CREATE TABLE IF NOT EXISTS sessions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'active',
+    cluster_name    TEXT DEFAULT '',
+    namespace       TEXT DEFAULT '',
+    started_at      TEXT,
+    finished_at     TEXT,
+    gmt_create      TEXT,
+    gmt_modified    TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uk_sessions_session_id ON sessions(session_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
+CREATE INDEX IF NOT EXISTS idx_sessions_gmt_create ON sessions(gmt_create);
+"""
+
+_SCHEMA_DDL = _TASKS_DDL + _DETAILS_DDL + _SPANS_DDL + _SESSIONS_DDL
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_upsert_sql(table: str, columns: list[str]) -> str:
-    """Build an ``INSERT … ON CONFLICT(task_id) DO UPDATE SET`` statement.
+def _build_upsert_sql(table: str, columns: list[str], conflict_col: str = "task_id") -> str:
+    """Build an ``INSERT … ON CONFLICT(<col>) DO UPDATE SET`` statement.
 
     The ``id`` column (auto-increment PK) is excluded from column lists at
     the call-site, so it never appears here.
     """
     col_names = ", ".join(columns)
     placeholders = ", ".join("?" for _ in columns)
-    update_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in columns if c != "task_id")
+    update_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in columns if c != conflict_col)
     return (
         f"INSERT INTO {table} ({col_names}) VALUES ({placeholders}) "
-        f"ON CONFLICT(task_id) DO UPDATE SET {update_clause}"
+        f"ON CONFLICT({conflict_col}) DO UPDATE SET {update_clause}"
     )
 
 
@@ -181,6 +201,30 @@ class SQLiteBackend:
             pass
         try:
             await conn.execute("ALTER TABLE task_details ADD COLUMN skill_use_case TEXT")
+        except Exception:
+            pass
+        try:
+            # R18 — postmortem dict (JSON-serialised: path/markdown/summary).
+            # Stored so future SQL queries can aggregate / filter by
+            # postmortem content without having to walk
+            # ~/.blade-ai/postmortems/ on disk.
+            await conn.execute("ALTER TABLE task_details ADD COLUMN postmortem TEXT")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE task_details ADD COLUMN target_health_report TEXT")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE task_details ADD COLUMN feasibility_report TEXT")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE task_details ADD COLUMN injection_method TEXT")
+        except Exception:
+            pass
+        try:
+            await conn.execute("ALTER TABLE task_details ADD COLUMN kubectl_exec_pod_name TEXT")
         except Exception:
             pass
         await conn.commit()
@@ -357,6 +401,37 @@ class SQLiteBackend:
             "SELECT * FROM task_spans WHERE task_id = ? ORDER BY id",
             (task_id,),
         )
+        rows = await cursor.fetchall()
+        return [_row_to_dict(r) for r in rows]
+
+    # -- sessions ------------------------------------------------------------
+
+    async def upsert_session(self, session_id: str, columns: list[str], values: list) -> None:
+        sql = _build_upsert_sql("sessions", columns, conflict_col="session_id")
+        conn = await self._get_conn()
+        await conn.execute(sql, values)
+        await conn.commit()
+
+    async def select_session(self, session_id: str) -> Optional[dict]:
+        conn = await self._get_conn()
+        cursor = await conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+        return _row_to_dict(row) if row else None
+
+    async def select_sessions_ordered(self, limit: int, offset: int, status: str = "") -> list[dict]:
+        conn = await self._get_conn()
+        if status:
+            cursor = await conn.execute(
+                "SELECT * FROM sessions WHERE status = ? ORDER BY gmt_create DESC LIMIT ? OFFSET ?",
+                (status, limit, offset),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT * FROM sessions ORDER BY gmt_create DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
         rows = await cursor.fetchall()
         return [_row_to_dict(r) for r in rows]
 

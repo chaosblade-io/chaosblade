@@ -10,7 +10,8 @@ from chaos_agent.agent.nodes._injection_detection import discover_tool_pods
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
-from chaos_agent.errors import FailureReason, enrich_failure_reason
+from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.memory.session_store import get_global_session_store
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
 from chaos_agent.tools.blade import blade_create
@@ -1140,7 +1141,7 @@ async def direct_execute(state: AgentState) -> dict:
                 )
                 sync_node_status_to_session(
                     state, "direct_execute", _preflight_msg,
-                    detail={"failure_reason": "PREREQUISITE_FAILED"},
+                    detail={"failure_category": "prerequisite_failed"},
                 )
             else:
                 logger.info(
@@ -1156,11 +1157,9 @@ async def direct_execute(state: AgentState) -> dict:
 
         if _preflight_blocked:
             return {
-                "error": _preflight_msg,
-                "failure_reason": enrich_failure_reason(
-                    f"{FailureReason.PREREQUISITE_FAILED.value}: "
-                    f"no running ChaosBlade DaemonSet pod on target node(s) "
-                    f"{', '.join(_missing_nodes)}",
+                **fail_state(
+                    FailureCategory.PREREQUISITE_FAILED,
+                    f"no running ChaosBlade DaemonSet pod on target node(s) {', '.join(_missing_nodes)}",
                     state.get("messages", []),
                 ),
                 "params": result_params,
@@ -1344,11 +1343,11 @@ async def direct_execute(state: AgentState) -> dict:
             if isinstance(blade_result, str)
             else "blade_create returned no UID"
         )
-        base_reason = f"{FailureReason.EXECUTION_FAILED.value}: blade_create failed (and kubectl exec fallback also failed)"
         result = {
-            "error": error_msg,
-            "failure_reason": enrich_failure_reason(
-                base_reason, state.get("messages", [])
+            **fail_state(
+                FailureCategory.EXECUTION_FAILED,
+                "blade_create failed (and kubectl exec fallback also failed)",
+                state.get("messages", []),
             ),
             "injection_method": "host_blade",
             "params": result_params,

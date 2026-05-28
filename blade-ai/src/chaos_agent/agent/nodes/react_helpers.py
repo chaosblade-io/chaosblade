@@ -10,10 +10,12 @@ here is either:
 """
 
 import logging
+import re
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from chaos_agent.config.settings import settings
+from chaos_agent.errors import ErrorClass, classify_error
 
 logger = logging.getLogger(__name__)
 
@@ -303,10 +305,25 @@ def _compare_tool_outputs(
 
 def _is_observation_command(tool_name: str, args: dict) -> bool:
     """Check if a tool call is an observation/diagnostic command (not mutation)."""
-    if tool_name != "kubectl":
+    if tool_name not in ("kubectl", "kubectl_ro"):
         return False
     subcmd = args.get("subcommand", "")
     return subcmd in ("get", "describe", "top", "exec", "logs", "debug")
+
+
+def suggest_verify_command(tool_name: str) -> str:
+    """Suggest a tool-appropriate verification command."""
+    if "blade" in tool_name:
+        return (
+            "Run `blade <subcommand> -h` to check supported flags "
+            "(via kubectl exec if host blade is unavailable)"
+        )
+    if "kubectl" in tool_name:
+        return "Run `kubectl <subcommand> --help` to check supported flags"
+    return (
+        f"Check the actual interface of `{tool_name}` — "
+        "the error message itself is the best clue about what went wrong"
+    )
 
 
 def _build_strategy_hints(tool_name: str, subcommand: str | None = None, args: dict | None = None) -> str:
@@ -319,7 +336,7 @@ def _build_strategy_hints(tool_name: str, subcommand: str | None = None, args: d
             "- Check a different scope (pod vs node vs namespace vs cluster).\n"
             "- If the fault effect is not observable with current tools, conclude based on available evidence."
         )
-    if tool_name == "kubectl" and subcommand == "get":
+    if tool_name in ("kubectl", "kubectl_ro") and subcommand == "get":
         return (
             "- 使用 --field-selector 缩小范围（如 --field-selector spec.nodeName=<node>）\n"
             "- 使用 -o name 仅获取资源名称\n"
@@ -334,9 +351,11 @@ def _build_strategy_hints(tool_name: str, subcommand: str | None = None, args: d
         )
     if tool_name in ("blade_create", "blade_destroy"):
         return (
-            "- 检查参数是否正确（namespace, labels, timeout 等）\n"
-            "- 使用 blade_query_k8s 查看已有的实验\n"
-            "- 尝试简化参数，避免使用不支持的选项"
+            "- " + suggest_verify_command(tool_name) + "\n"
+            "- If a parameter was rejected, do NOT retry — remove it and verify\n"
+            "- Runtime errors override documentation — trust the tool, not the docs\n"
+            "- Use blade_query_k8s to check existing experiments\n"
+            "- Simplify parameters — use only what the tool actually supports"
         )
     return (
         "- 尝试换用其他工具或不同的参数组合\n"
@@ -402,13 +421,13 @@ def detect_repeated_tool_calls(messages: list) -> str | None:
         tool_name = fp.split("(")[0]
         matched_args = None
         subcmd = None
-        if tool_name == "kubectl":
+        if tool_name in ("kubectl", "kubectl_ro"):
             for msg2 in recent:
                 if not isinstance(msg2, AIMessage):
                     continue
                 for tc2 in (getattr(msg2, "tool_calls", None) or []):
                     tc2_name, tc2_args = extract_tool_call_fields(tc2)
-                    if tc2_name == "kubectl" and _fingerprint_tool_call(tc2_name, tc2_args) == fp:
+                    if tc2_name == tool_name and _fingerprint_tool_call(tc2_name, tc2_args) == fp:
                         subcmd = tc2_args.get("subcommand")
                         matched_args = tc2_args
                         break
@@ -425,6 +444,60 @@ def detect_repeated_tool_calls(messages: list) -> str | None:
         )
 
     return None
+
+
+def detect_action_stagnation(messages: list, threshold: int | None = None) -> tuple[str | None, str | None]:
+    """Detect consecutive calls to the same tool name (regardless of args).
+
+    Unlike detect_repeated_tool_calls (which requires identical fingerprints),
+    this catches "parameter thrashing" where the LLM calls the same tool
+    with slightly different arguments each time.
+
+    Scans at most ``loop_detection_window`` messages from the tail to
+    stay consistent with ``detect_repeated_tool_calls`` and avoid
+    unbounded reverse scans on long conversations.
+
+    Returns:
+        (hint_message, stagnant_tool_name) or (None, None) if no stagnation.
+    """
+    _threshold = threshold if threshold is not None else settings.stagnation_threshold
+    if _threshold < 2:
+        return None, None
+
+    window = settings.loop_detection_window
+    recent = messages[-window:] if len(messages) > window else messages
+
+    streak = 0
+    streak_tool: str | None = None
+
+    for msg in reversed(recent):
+        if not isinstance(msg, AIMessage):
+            continue
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not tool_calls:
+            break
+        if len(tool_calls) != 1:
+            break
+        name, _ = extract_tool_call_fields(tool_calls[0])
+        if not name:
+            break
+        if streak_tool is None:
+            streak_tool = name
+        if name != streak_tool:
+            break
+        streak += 1
+
+    if streak >= _threshold and streak_tool:
+        hint = (
+            f"**ACTION_STAGNATION**: You have called `{streak_tool}` {streak} consecutive times "
+            f"with no progress. This tool has been temporarily removed. "
+            f"You MUST now either:\n"
+            f"- Call `finish_planning` to finalize your plan and proceed to execution phase.\n"
+            f"- Use a DIFFERENT tool if you need additional information.\n"
+            f"Do NOT attempt to call `{streak_tool}` again."
+        )
+        return hint, streak_tool
+    return None, None
 
 
 def summarize_llm_response(response) -> tuple[str, list[str]]:
@@ -467,3 +540,106 @@ def summarize_llm_response(response) -> tuple[str, list[str]]:
 
     summary = "\n".join(lines) if lines else "(empty response)"
     return summary, tool_names
+
+
+# ---------------------------------------------------------------------------
+# Tier 4: Tool error introspection (runtime feedback > static docs)
+# ---------------------------------------------------------------------------
+
+_NON_INTERFACE_ERRORS = frozenset({
+    ErrorClass.INFRA_TRANSIENT,
+    ErrorClass.INFRA_PERSISTENT,
+    ErrorClass.AUTH_DENIED,
+    ErrorClass.TARGET_GONE,
+    ErrorClass.QUOTA_EXCEEDED,
+})
+
+_REJECTED_PARAM_PATTERNS = [
+    re.compile(r"unknown flag:\s*(\S+)"),
+    re.compile(r"unknown shorthand flag:\s*'(\S+)'"),
+    re.compile(r"flag provided but not defined:\s*(\S+)"),
+    re.compile(r"(?:invalid|illegal) option[:\s]+[-]*([\w-]+)"),
+    re.compile(r"unrecognized arguments?:\s*(\S+)"),
+    re.compile(
+        r"(?:unsupported|unknown|invalid)\s+"
+        r"(?:flag|option|parameter|argument)[:\s]+(\S+)"
+    ),
+]
+
+_HINT_MARKER = "TOOL ERROR — VERIFY BEFORE RETRY"
+
+
+def _should_trigger_introspection(error_class: ErrorClass) -> bool:
+    """Denylist: trigger for ALL errors except known non-interface ones."""
+    return error_class not in _NON_INTERFACE_ERRORS
+
+
+def extract_rejected_params(error_text: str) -> list[str]:
+    """Best-effort extraction of rejected parameters from an error message."""
+    if not error_text:
+        return []
+    found: list[str] = []
+    for pat in _REJECTED_PARAM_PATTERNS:
+        for m in pat.finditer(error_text):
+            val = m.group(1).strip("'\"").rstrip(".,;:!?)")
+            if val and val not in found:
+                found.append(val)
+    return found
+
+
+def _build_introspection_hint(
+    tool_name: str, error_content: str, rejected_params: list[str],
+) -> str:
+    parts = [
+        f"**{_HINT_MARKER}**: `{tool_name}` returned an error.",
+        error_content[:200],
+        "",
+        "Runtime feedback overrides documentation. Before retrying:",
+    ]
+    if rejected_params:
+        flags_str = ", ".join(f"`{f}`" for f in rejected_params)
+        parts.append(
+            f"- Parameter(s) {flags_str} were REJECTED — do NOT retry with them"
+        )
+    parts.extend([
+        "- " + suggest_verify_command(tool_name),
+        "- Adapt your approach to match what the tool actually supports",
+        "- If documentation says X is supported but the tool rejects it, the tool is right",
+    ])
+    return "\n".join(parts)
+
+
+def detect_tool_error_hint(messages: list) -> str | None:
+    """Scan recent ToolMessages for errors that warrant introspection.
+
+    Returns a hint string if a qualifying error is found and no
+    duplicate hint already exists in messages. Returns None otherwise.
+    """
+    window = min(len(messages), 10)
+    recent = messages[-window:]
+
+    for msg in reversed(recent):
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = msg.content if isinstance(msg.content, str) else ""
+        if not content.startswith("Error"):
+            continue
+
+        result = classify_error(content)
+        if not _should_trigger_introspection(result.error_class):
+            continue
+
+        tool_name = getattr(msg, "name", "") or ""
+        if any(
+            isinstance(m, HumanMessage)
+            and isinstance(m.content, str)
+            and _HINT_MARKER in m.content
+            and f"`{tool_name}`" in m.content
+            for m in recent
+        ):
+            continue
+
+        rejected = extract_rejected_params(content)
+        return _build_introspection_hint(tool_name, content, rejected)
+
+    return None

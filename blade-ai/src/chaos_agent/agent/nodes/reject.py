@@ -4,7 +4,8 @@ import logging
 
 from chaos_agent.agent.nodes._store_sync import sync_to_store
 from chaos_agent.agent.state import AgentState
-from chaos_agent.errors import FailureReason
+from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
@@ -14,8 +15,8 @@ from chaos_agent.utils.time import now_iso
 logger = logging.getLogger(__name__)
 
 
-def _infer_failure_reason(state: AgentState) -> str:
-    """Infer the appropriate FailureReason for the reject node.
+def _infer_failure_detail(state: AgentState) -> dict:
+    """Infer the appropriate FailureCategory for the reject node.
 
     Reject is reached from:
     - should_continue_agent_loop: max iterations (planning_timeout)
@@ -26,18 +27,15 @@ def _infer_failure_reason(state: AgentState) -> str:
     safety_reason = state.get("safety_reason") or ""
 
     if safety_status == "rejected":
-        if "blacklist" in safety_reason.lower():
-            return f"{FailureReason.SAFETY_REJECTED.value}: {safety_reason}"
         if "user" in safety_reason.lower() or "reject" in safety_reason.lower():
-            return f"{FailureReason.USER_REJECTED.value}: {safety_reason}"
-        return f"{FailureReason.SAFETY_REJECTED.value}: {safety_reason}"
+            return fail_state(FailureCategory.USER_REJECTED, safety_reason)
+        return fail_state(FailureCategory.SAFETY_REJECTED, safety_reason)
 
-    # Fallback: agent_loop max iterations (no skill after max loops)
     agent_loop_count = state.get("agent_loop_count", 0)
     if agent_loop_count > 0:
-        return f"{FailureReason.PLANNING_TIMEOUT.value}: Agent loop exceeded max iterations without completing planning"
+        return fail_state(FailureCategory.PLANNING_TIMEOUT, "max_iterations exceeded")
 
-    return f"{FailureReason.SAFETY_REJECTED.value}: {safety_reason or 'Unknown rejection reason'}"
+    return fail_state(FailureCategory.SAFETY_REJECTED, safety_reason or "Unknown rejection reason")
 
 
 async def reject(state: AgentState) -> dict:
@@ -45,8 +43,6 @@ async def reject(state: AgentState) -> dict:
 
     This node is reached when the agent loop exceeds max iterations,
     safety checks fail, or the user rejects the confirmation.
-
-    Returns updated error, result, and failure_reason fields.
     """
     task_id = state.get("task_id", "unknown")
     reason = state.get("safety_reason", "Unknown reason")
@@ -61,8 +57,11 @@ async def reject(state: AgentState) -> dict:
     )
     tracker.fail(f"Rejected: {error_val}")
 
-    # Trust upstream-set failure_reason if present; otherwise infer as fallback.
-    failure_reason = state.get("failure_reason") or _infer_failure_reason(state)
+    # Trust upstream-set failure_detail if present; otherwise infer as fallback.
+    if state.get("failure_detail"):
+        fs = {"failure_detail": state["failure_detail"]}
+    else:
+        fs = _infer_failure_detail(state)
 
     result = {
         "result": {
@@ -70,7 +69,7 @@ async def reject(state: AgentState) -> dict:
             "reason": error_val,
         },
         "error": error_val,
-        "failure_reason": failure_reason,
+        "failure_detail": fs.get("failure_detail"),
         "finished_at": now_iso(),
     }
     await sync_to_store(state, result)

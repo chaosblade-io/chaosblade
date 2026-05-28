@@ -7,14 +7,59 @@ Configuration priority (highest to lowest):
 """
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Tuple, Type
 
 from pydantic import Field, AliasChoices
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+logger = logging.getLogger(__name__)
+
 # Path to the unified config file managed by `blade-ai config`
 _CONFIG_FILE = Path.home() / ".blade-ai" / "config.json"
+
+# Models we've already warned about, to silence repeat WARNINGs when
+# resolve_context_budget is called many times for the same unconfigured
+# model. Cleared on Settings.reload() so a user who edits
+# model_budgets mid-session gets fresh feedback.
+_WARNED_FALLBACK_MODELS: set[str] = set()
+
+
+# v7 M2 — per-model context budgets.
+#
+# Each entry maps a model-name PREFIX (case-insensitive) to its
+# context window size + the compact_ratio that's appropriate for
+# that window. The resolver picks the longest matching prefix, then
+# falls back to the global ``context_max_tokens`` /
+# ``context_compact_ratio`` settings if nothing matches.
+#
+# Window sources: provider docs (claude.ai/docs, platform.openai.com,
+# dashscope.aliyun.com, deepseek docs, bigmodel.cn).
+# Compact-ratio rationale: smaller/cheaper models can fill more of the
+# window before compacting (0.90); models with large windows want to
+# leave more headroom for tool outputs (0.80–0.85).
+_DEFAULT_MODEL_BUDGETS: dict[str, dict[str, float | int]] = {
+    # Anthropic
+    "claude-opus":      {"max_tokens": 200_000, "compact_ratio": 0.85},
+    "claude-sonnet":    {"max_tokens": 200_000, "compact_ratio": 0.85},
+    "claude-haiku":     {"max_tokens": 200_000, "compact_ratio": 0.90},
+    # OpenAI
+    "gpt-4o":           {"max_tokens": 128_000, "compact_ratio": 0.85},
+    "gpt-4":            {"max_tokens": 128_000, "compact_ratio": 0.85},
+    "o1":               {"max_tokens": 128_000, "compact_ratio": 0.85},
+    # Alibaba Qwen (DashScope)
+    "qwen3.6-max":      {"max_tokens": 131_072, "compact_ratio": 0.80},
+    "qwen3-max":        {"max_tokens": 131_072, "compact_ratio": 0.80},
+    "qwen3":            {"max_tokens": 131_072, "compact_ratio": 0.80},
+    "qwen-max":         {"max_tokens":  32_768, "compact_ratio": 0.80},
+    "qwen-plus":        {"max_tokens":  32_768, "compact_ratio": 0.80},
+    # DeepSeek
+    "deepseek":         {"max_tokens":  64_000, "compact_ratio": 0.80},
+    # Zhipu GLM
+    "glm-4":            {"max_tokens": 128_000, "compact_ratio": 0.85},
+    "glm-5":            {"max_tokens": 128_000, "compact_ratio": 0.85},
+}
 
 
 class JsonConfigSettingsSource(PydanticBaseSettingsSource):
@@ -113,6 +158,10 @@ class Settings(BaseSettings):
     # Verifier配置
     verifier_json_mode: bool = True            # BLADE_AI_VERIFIER_JSON_MODE，最终迭代启用 response_format JSON 模式强制结构化输出
 
+    tokenizer_model_override: str = ""        # BLADE_AI_TOKENIZER_MODEL_OVERRIDE，非空时替代 model_name 用于 tokenizer 选型（如 fine-tune 模型回落已知 base）
+    tokenizer_use_hf: bool = False            # BLADE_AI_TOKENIZER_USE_HF，启用 HuggingFace AutoTokenizer 兜底（Layer 3，按需加载 transformers）
+    tokenizer_use_vendor_api: bool = False    # BLADE_AI_TOKENIZER_USE_VENDOR_API，预留：未来调用厂商 count_tokens API（当前 no-op）
+
     # Server配置
     server_port: int = 8089                   # BLADE_AI_SERVER_PORT
     server_host: str = "0.0.0.0"              # BLADE_AI_SERVER_HOST
@@ -126,6 +175,23 @@ class Settings(BaseSettings):
 
     # 经验自进化开关
     self_evolution: bool = False              # BLADE_AI_SELF_EVOLUTION
+
+    # T6 postmortem 自动生成开关
+    # 默认开 — TUI 用户主线场景；L4 lib 用户可通过环境变量 opt-out
+    #
+    # ⚠️ 隐私：postmortem 生成会把 fault_spec / user_description /
+    #   最近 N 条 messages 摘要 / verification.side_effects 等数据
+    #   塞进 LLM context。当配置的是云端 LLM (DashScope / OpenAI /
+    #   Anthropic 等) 时，这些数据将**离开本地 host**。涉及敏感业务
+    #   名 / 生产 namespace / 机密 pod 命名时，建议 opt-out (置
+    #   BLADE_AI_POSTMORTEM_ENABLED=false) 或切到本地 LLM (Ollama 等)。
+    postmortem_enabled: bool = True           # BLADE_AI_POSTMORTEM_ENABLED
+    # LLM 调用上限（秒）；超时降级为 postmortem=None，不阻塞 result 输出
+    # 默认 30s 覆盖典型场景；慢模型 / 大 prompt 可调到 60-120s
+    postmortem_timeout_seconds: int = 300      # BLADE_AI_POSTMORTEM_TIMEOUT_SECONDS
+    # 喂给 LLM 的 messages 尾部条数；超过此数取最后 N 条 + 一句"前面省略 X 条"
+    # 也是隐私边界：减小可缩小上传 LLM 的对话窗口
+    postmortem_max_messages: int = 100         # BLADE_AI_POSTMORTEM_MAX_MESSAGES
 
     # 工具路径 (blade_path 使用 get_bundled_blade_path() 自动检测内嵌/系统 blade)
     blade_path: str = ""                    # BLADE_AI_BLADE_PATH, 空值则自动检测
@@ -164,19 +230,59 @@ class Settings(BaseSettings):
     # 默认 1800s (30 分钟) 对绝大多数排查场景够用；遇到复杂研判可调长，例如 7200 (2h)
     confirm_wait_timeout: int = 1800         # BLADE_AI_CONFIRM_WAIT_TIMEOUT
 
+    # OpenTelemetry GenAI export (parallel to built-in tracing)
+    otel_enabled: bool = False              # BLADE_AI_OTEL_ENABLED
+    otel_endpoint: str = ""                 # BLADE_AI_OTEL_ENDPOINT (gRPC, e.g. http://localhost:4317)
+    otel_service_name: str = "blade-ai"     # BLADE_AI_OTEL_SERVICE_NAME
+    otel_provider_name: str = ""            # BLADE_AI_OTEL_PROVIDER_NAME (空=auto-detect from api_base_url)
+    # When true, GET /metrics serves the OTel meter's data in Prometheus
+    # text format (scraped via the same FastAPI port). Independent of
+    # otel_enabled — you can run Prometheus-only or OTLP-only.
+    prometheus_enabled: bool = False        # BLADE_AI_PROMETHEUS_ENABLED
+
+    # E10 — multi-dimensional safety score (blast_radius / frequency /
+    # time / topology). Always computed (cheap), advisory by default.
+    # The ``time`` dimension uses Beijing time (UTC+8) per the project's
+    # global timezone convention in ``chaos_agent.utils.time``.
+    # Routing flag below lets a high overall upgrade safety_status.
+    #
+    # CAVEAT: enabling routing_enabled changes the inject graph's
+    # routing. ``safe + needs_confirmation=False`` normally auto-executes
+    # (skips confirmation_gate); after escalation to ``warning`` /
+    # ``confirm_required`` the graph forces a confirmation_gate interrupt
+    # which CLI / non-interactive runs cannot respond to and will block
+    # on. Use only in TUI / HTTP modes that actually drive the confirm
+    # response, or pair with ``--force-override`` in CLI.
+    safety_score_routing_enabled: bool = False    # BLADE_AI_SAFETY_SCORE_ROUTING_ENABLED
+    safety_score_warning_threshold: int = 70      # BLADE_AI_SAFETY_SCORE_WARNING_THRESHOLD
+    safety_score_confirm_threshold: int = 90      # BLADE_AI_SAFETY_SCORE_CONFIRM_THRESHOLD
+    # When true, topology dimension augments heuristic with a kubectl
+    # query (replica count for deployments). Falls back silently on
+    # kubectl error — never blocks safety_check.
+    safety_score_topology_deep: bool = False      # BLADE_AI_SAFETY_SCORE_TOPOLOGY_DEEP
+
+    # Per-server attach_to allowlist is the second-level gate.
+    mcp_enabled: bool = False                     # BLADE_AI_MCP_ENABLED
+    mcp_config_path: str = "~/.blade-ai/mcp.json" # BLADE_AI_MCP_CONFIG_PATH (empty → ~/.blade-ai/mcp.json)
+    mcp_connect_timeout_seconds: int = 30         # BLADE_AI_MCP_CONNECT_TIMEOUT_SECONDS
+
     # kubectl 输出控制
     kubectl_max_output_bytes: int = 32768       # BLADE_AI_KUBECTL_MAX_OUTPUT_BYTES，超过此大小的 JSON 输出追加提示
 
     # 安全配置
-    safety_blacklist_namespaces: str = "kube-system,kube-public"  # BLADE_AI_SAFETY_BLACKLIST_NAMESPACES
+    safety_blacklist_namespaces: str = ""  # BLADE_AI_SAFETY_BLACKLIST_NAMESPACES
 
     # Agent Loop上限
-    max_agent_loop: int = 50                 # BLADE_AI_MAX_AGENT_LOOP
-    max_execute_loop: int = 50               # BLADE_AI_MAX_EXECUTE_LOOP
-    max_verifier_loop: int = 30              # BLADE_AI_MAX_VERIFIER_LOOP
-    max_recover_verifier_loop: int = 30      # BLADE_AI_MAX_RECOVER_VERIFIER_LOOP
-    max_recover_layer1_iterations: int = 30  # BLADE_AI_MAX_RECOVER_LAYER1_ITERATIONS (non-ChaosBlade LLM sub-loop)
-    recursion_limit: int = 150               # BLADE_AI_RECURSION_LIMIT
+    max_agent_loop: int = 100                # BLADE_AI_MAX_AGENT_LOOP
+    max_execute_loop: int = 100              # BLADE_AI_MAX_EXECUTE_LOOP
+    max_verifier_loop: int = 60              # BLADE_AI_MAX_VERIFIER_LOOP
+    max_recover_verifier_loop: int = 60      # BLADE_AI_MAX_RECOVER_VERIFIER_LOOP
+    max_recover_layer1_iterations: int = 60  # BLADE_AI_MAX_RECOVER_LAYER1_ITERATIONS (non-ChaosBlade LLM sub-loop)
+    max_plan_builder_rounds: int = 40        # BLADE_AI_MAX_PLAN_BUILDER_ROUNDS
+    max_clarification_rounds: int = 10       # BLADE_AI_MAX_CLARIFICATION_ROUNDS
+    max_dialogue_rounds: int = 999           # BLADE_AI_MAX_DIALOGUE_ROUNDS
+    stagnation_threshold: int = 5            # BLADE_AI_STAGNATION_THRESHOLD，同一工具连续调用 N 次触发 action stagnation
+    recursion_limit: int = 500               # BLADE_AI_RECURSION_LIMIT
 
     # 循环检测（重复工具调用）
     loop_detection_window: int = 10          # BLADE_AI_LOOP_DETECTION_WINDOW，检测最近 N 条消息
@@ -209,8 +315,15 @@ class Settings(BaseSettings):
     # Evicted / Pending 等 blocker 注入 confirm card 的 payload。
     # ``target_health_check_block_on_blocker`` 控制检测到 BLOCK 时是
     # 否阻断 graph（默认仅 warn-only，把信息丢给用户/LLM 决策）。
-    target_health_check_enabled: bool = True              # BLADE_AI_TARGET_HEALTH_CHECK
-    target_health_check_block_on_blocker: bool = False    # BLADE_AI_TARGET_HEALTH_CHECK_BLOCK
+    target_health_check_enabled: bool = True              # BLADE_AI_TARGET_HEALTH_CHECK_ENABLED
+    target_health_check_block_on_blocker: bool = False    # BLADE_AI_TARGET_HEALTH_CHECK_BLOCK_ON_BLOCKER
+
+    blade_agent_check_enabled: bool = True               # BLADE_AI_BLADE_AGENT_CHECK_ENABLED
+    blade_agent_namespace: str = "chaosblade"            # BLADE_AI_BLADE_AGENT_NAMESPACE
+    blade_agent_label: str = "app=chaosblade-tool"       # BLADE_AI_BLADE_AGENT_LABEL
+
+    feasibility_check_enabled: bool = True               # BLADE_AI_FEASIBILITY_CHECK_ENABLED
+    feasibility_check_block_on_impossible: bool = False   # BLADE_AI_FEASIBILITY_CHECK_BLOCK_ON_IMPOSSIBLE
 
     # Retry配置
     retry_max_retries: int = 3               # BLADE_AI_RETRY_MAX_RETRIES
@@ -234,9 +347,22 @@ class Settings(BaseSettings):
     # 会话存储配置
     save_system_message: bool = True  # BLADE_AI_SAVE_SYSTEM_MESSAGE，是否在会话文件中保存SystemMessage
 
-    # 上下文窗口配置
-    context_max_tokens: int = 128000  # BLADE_AI_CONTEXT_MAX_TOKENS，LLM上下文窗口大小，用于记忆压缩阈值计算
-    context_compact_ratio: float = 0.85  # BLADE_AI_CONTEXT_COMPACT_RATIO，压缩触发比例
+    # 上下文窗口配置（per-model 优先；这两项是兜底，仅当 model_budgets
+    # 中没有匹配前缀时才生效。resolve_context_budget() 是单一入口）
+    context_max_tokens: int = 128000  # BLADE_AI_CONTEXT_MAX_TOKENS，LLM上下文窗口大小（fallback）
+    context_compact_ratio: float = 0.85  # BLADE_AI_CONTEXT_COMPACT_RATIO，压缩触发比例（fallback）
+
+    # v7 M2 — per-model 上下文预算覆盖。键是模型名前缀（大小写不敏感），
+    # 值是 {"max_tokens": int, "compact_ratio": float}。空 dict 时直接走
+    # _DEFAULT_MODEL_BUDGETS；用户在此添加的条目会按"最长前缀优先"覆盖
+    # 内置默认。整体匹配不到时回落 context_max_tokens / context_compact_ratio。
+    # env 用 BLADE_AI_MODEL_BUDGETS 传 JSON 字符串。
+    model_budgets: dict[str, dict[str, float | int]] = Field(default_factory=dict)
+
+    # SSE token batching — server-side coalescing of token/thinking events.
+    # 0 = disabled (each event yields immediately, legacy behaviour).
+    sse_batch_interval_ms: int = 30  # BLADE_AI_SSE_BATCH_INTERVAL_MS
+    sse_batch_chars: int = 30        # BLADE_AI_SSE_BATCH_CHARS
 
     # Skill 脚本执行配置
     skill_script_max_output: int = 4000  # BLADE_AI_SKILL_SCRIPT_MAX_OUTPUT，返回给 LLM 的 stdout 最大字符数
@@ -297,6 +423,55 @@ class Settings(BaseSettings):
             return self.tasks_db_path
         return self.resolved_memory_dir / "tasks.db"
 
+    def resolve_context_budget(self, model: str | None = None) -> tuple[int, float]:
+        """Return ``(max_tokens, compact_ratio)`` for ``model``.
+
+        Lookup order:
+          1. ``model_budgets`` (user-set; longest matching prefix wins)
+          2. ``_DEFAULT_MODEL_BUDGETS`` (built-in; longest matching prefix wins)
+          3. ``(context_max_tokens, context_compact_ratio)`` global fallback
+
+        Prefix matching is case-insensitive; empty model falls straight to
+        the global fallback.
+
+        Logs a WARNING the first time a model name falls through to the
+        global fallback — that path is "guess and hope," so the user
+        should add a ``model_budgets`` entry. Subsequent calls for the
+        same model name stay silent.
+        """
+        name = (model or self.model_name or "").lower()
+        if not name:
+            return self.context_max_tokens, self.context_compact_ratio
+
+        for source in (self.model_budgets, _DEFAULT_MODEL_BUDGETS):
+            best_prefix: str | None = None
+            for prefix in source:
+                if name.startswith(prefix.lower()):
+                    if best_prefix is None or len(prefix) > len(best_prefix):
+                        best_prefix = prefix
+            if best_prefix is not None:
+                budget = source[best_prefix]
+                try:
+                    return int(budget["max_tokens"]), float(budget["compact_ratio"])
+                except (KeyError, ValueError, TypeError):
+                    # Malformed user entry — try the next source rather than crash.
+                    continue
+
+        if name not in _WARNED_FALLBACK_MODELS:
+            _WARNED_FALLBACK_MODELS.add(name)
+            logger.warning(
+                "Context budget for model=%r not found in model_budgets or "
+                "_DEFAULT_MODEL_BUDGETS; falling back to globals "
+                "(max_tokens=%d, compact_ratio=%.2f). If this model's real "
+                "window differs significantly, add an entry to "
+                "settings.model_budgets to avoid early compaction or "
+                "context_length_exceeded errors.",
+                model or self.model_name,
+                self.context_max_tokens,
+                self.context_compact_ratio,
+            )
+        return self.context_max_tokens, self.context_compact_ratio
+
     def reload(self) -> "Settings":
         """Re-read config.json and environment variables.
 
@@ -306,6 +481,9 @@ class Settings(BaseSettings):
         new_settings = self.__class__()
         for field_name in self.__class__.model_fields:
             object.__setattr__(self, field_name, getattr(new_settings, field_name))
+        # Reset the per-process warning dedup so users who fixed
+        # model_budgets and reloaded get fresh feedback next call.
+        _WARNED_FALLBACK_MODELS.clear()
         return self
 
 

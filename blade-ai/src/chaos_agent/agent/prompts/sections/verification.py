@@ -36,7 +36,9 @@ def get_verifier_critical_rules_section() -> str:
 
 4. **recovered_before_observation ≠ failed** — 'failed' means "I checked and the fault was absent". 'recovered_before_observation' means "the fault was transient and had already dissipated by the time I checked". If ALL steps are 'recovered_before_observation', Overall MUST be 'unverified'.
 
-5. **RestartCount comparison vs baseline** — Compare current restartCount with the pre-injection baseline RestartCount. Only a NEW restart (restartCount > baseline) indicates a restart during the injection window. Same restartCount = no new restart."""
+5. **RestartCount comparison vs baseline** — Compare current restartCount with the pre-injection baseline RestartCount. Only a NEW restart (restartCount > baseline) indicates a restart during the injection window. Same restartCount = no new restart.
+
+6. **Runtime feedback overrides documentation** — If a tool rejects a parameter or returns an unexpected error, trust the tool — verify its actual interface before retrying."""
 
 
 def get_verifier_tools_section() -> str:
@@ -211,7 +213,7 @@ Examples by fault type:
 | pod-mem load | Memory usage > threshold | OOMKill alone IS primary for memory faults |
 | pod-disk burn | Burn files visible, I/O metrics elevated, df increase | OOMKill, container restart |
 | pod-disk fill | Disk usage > fill percentage (e.g., >85%) | Pod eviction, DiskPressure (may be absent below threshold) |
-| pod-network loss | Packets dropped, endpoints empty, connection refused | Pod restart, high latency on other ports |
+| pod-network drop | Packets dropped, endpoints empty, connection refused | Pod restart, high latency on other ports |
 | pod-kill | Pod in CrashLoopBackOff, restartCount increased | (Pod kill primary effect IS the restart) |
 
 Set PrimaryEvidenceObserved: true ONLY if you directly observed at least one

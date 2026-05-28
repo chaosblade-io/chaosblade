@@ -14,8 +14,270 @@ from langchain_core.messages import HumanMessage
 from chaos_agent.agent.nodes._verifier_shared import (
     _parse_status_keyword,
 )
+from chaos_agent.agent.verdict import (
+    Checklist,
+    ChecklistItem,
+    ChecklistItemStatus,
+    InjectVerdict,
+    Layer1Result,
+    Layer1Status,
+    Layer2Result,
+    Layer2Status,
+    StructuredWarning,
+    VerificationResult,
+    WarningCode,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# E2 Phase 3 — Evidence cross-check
+# ---------------------------------------------------------------------------
+#
+# After the LLM emits its VERIFICATION_RESULT, this helper compares the
+# baseline→post numbers it CITES in evidence against the structured
+# metric timeline accumulated on state.metric_observations
+# (populated by PreReasoningHook from each ToolMessage's extracted_metrics).
+#
+# Failure mode this catches: the LLM claims "RestartCount 7 → 8 (Δ+1)"
+# in evidence — but the timeline shows RestartCount stayed at 7 across
+# every iteration. Without this cross-check the LLM could declare
+# ``verified`` based on a hallucinated change. We don't try to be clever
+# about partial agreement; the rule is simple — if the LLM claims a
+# change AND the timeline says no change for the same metric, downgrade
+# the verdict and warn.
+
+# Number with optional unit suffix (%, m for millicores, Mi/Gi/Ki for memory).
+# The whitespace tolerance covers both "7 → 8" and "7→8". Unit suffix
+# groups are non-capturing — we only care about the numeric values for
+# delta computation; unit parsing happens later via _parse_numeric.
+_DELTA_PATTERN = re.compile(
+    r"(?P<base>\d+(?:\.\d+)?)\s*(?:%|m|Mi|Gi|Ki)?\s*(?:→|->|to|—>)\s*"
+    r"(?P<post>\d+(?:\.\d+)?)\s*(?:%|m|Mi|Gi|Ki)?",
+    re.IGNORECASE,
+)
+
+# How many chars of left context to scan for a metric-name mention.
+# Smaller window → fewer false positives; larger → catches metric name
+# preceding multiple sentences. 80 chars ≈ one sentence.
+_METRIC_CONTEXT_LOOKBACK = 80
+
+
+def _parse_numeric(value: str) -> float | None:
+    """Pull a float out of a metric-value string, dropping units.
+
+    Recognises percent, millicores, Mi/Gi/Ki. Returns ``None`` when no
+    leading number can be extracted (e.g. ``"True"``, ``"OOMKilled"``).
+    """
+    if not value:
+        return None
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)", value)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _metric_alias(name: str) -> str:
+    """Normalise a metric name for substring matching against LLM evidence.
+
+    Drops parenthetical qualifiers and lowercases — so
+    ``"Disk usage (overlay)"`` matches LLM text mentioning
+    ``"disk usage"`` regardless of whether it spelled out the partition.
+    """
+    return re.sub(r"\s*\([^)]*\)", "", name).strip().lower()
+
+
+def _pick_metric_by_context(
+    context_lc: str,
+    truth: dict[str, tuple[float, float]],
+) -> str | None:
+    """Resolve which truth metric a given evidence context refers to.
+
+    Two priorities:
+
+    1. **Full-name hit** — if the context literally contains the
+       full metric name (e.g. ``"disk usage (overlay)"``), that's the
+       answer. Most specific signal wins.
+    2. **Alias hit** — fall back to the parenthetical-stripped form
+       (e.g. ``"disk usage"`` matching either overlay or nodefs). When
+       multiple metrics share the same alias, prefer the one with the
+       LONGEST full name, on the theory that more-qualified metric
+       names are usually more recently added and thus more specific.
+       If still ambiguous, return ``None`` rather than guess wrong —
+       false silence here is better than a false contradiction
+       downgrading a real-injection verdict.
+
+    Returns ``None`` when no metric name appears in the context window.
+    """
+    # Priority 1: full-name match (deterministic — exactly one full
+    # name per truth key, no ambiguity).
+    for metric_name in truth:
+        if metric_name.lower() in context_lc:
+            return metric_name
+
+    # Priority 2: alias match. Collect all candidates, dedupe by alias
+    # to detect collisions.
+    alias_hits = [m for m in truth if _metric_alias(m) in context_lc]
+    if not alias_hits:
+        return None
+    if len(alias_hits) == 1:
+        return alias_hits[0]
+
+    # Multiple aliases collide (e.g. "Disk usage (overlay)" and
+    # "Disk usage (nodefs)" both alias to "disk usage"). The evidence
+    # didn't qualify which one — refuse to guess. Returning None here
+    # is the conservative-side path: we skip the cross-check for this
+    # delta rather than risk a false contradiction warning that
+    # would wrongly downgrade a valid verdict.
+    return None
+
+
+def _collect_evidence_text(result: dict) -> str:
+    """Gather every free-text field where the LLM could cite numbers.
+
+    Pulls from layer2.details + checklist[].evidence + warnings.
+    Concatenated with newline separators so context-lookback regex
+    doesn't span across unrelated fields.
+    """
+    parts: list[str] = []
+    l2_details = (result.get("layer2") or {}).get("details", "")
+    if l2_details:
+        parts.append(l2_details)
+    for item in (result.get("checklist") or {}).get("items", []) or []:
+        ev = item.get("evidence", "")
+        if ev:
+            parts.append(ev)
+    return "\n".join(parts)
+
+
+def _build_truth_deltas(
+    observations: list[dict],
+) -> dict[str, tuple[float, float]]:
+    """For each metric seen across observations, compute (baseline, post).
+
+    Baseline = earliest iteration's value; post = latest iteration's
+    value. Skips metrics where either value isn't numeric (e.g.
+    ``"OOMKilled"``, ``"True"``) — those have their own categorical
+    detection elsewhere and don't fit the delta-comparison model.
+    """
+    by_metric: dict[str, list[tuple[int, str]]] = {}
+    for obs in observations or []:
+        iteration = int(obs.get("iteration", 0))
+        for name, value in (obs.get("metrics") or {}).items():
+            by_metric.setdefault(name, []).append((iteration, value))
+
+    deltas: dict[str, tuple[float, float]] = {}
+    for name, values in by_metric.items():
+        if len(values) < 2:
+            continue
+        values.sort(key=lambda t: t[0])
+        base = _parse_numeric(values[0][1])
+        post = _parse_numeric(values[-1][1])
+        if base is None or post is None:
+            continue
+        deltas[name] = (base, post)
+    return deltas
+
+
+def _find_contradictions(
+    evidence: str,
+    truth: dict[str, tuple[float, float]],
+    n_obs: int,
+) -> list[str]:
+    """Scan evidence for ``X→Y`` deltas that contradict ``truth``.
+
+    Conservative MVP: only flags the "LLM claims change, truth shows
+    no change" case. Inverse cases are handled elsewhere
+    (``_detect_checklist_conclusion_inconsistency``).
+    """
+    contradictions: list[str] = []
+    for match in _DELTA_PATTERN.finditer(evidence):
+        base_str, post_str = match.group("base"), match.group("post")
+        try:
+            llm_base, llm_post = float(base_str), float(post_str)
+        except ValueError:
+            continue
+        llm_delta = llm_post - llm_base
+        if llm_delta == 0:
+            continue  # LLM claims no change — nothing to disprove
+
+        ctx_start = max(0, match.start() - _METRIC_CONTEXT_LOOKBACK)
+        context_lc = evidence[ctx_start:match.start()].lower()
+        metric = _pick_metric_by_context(context_lc, truth)
+        if metric is None:
+            continue
+
+        truth_base, truth_post = truth[metric]
+        # Only flag the strong-signal case: truth shows ZERO change but
+        # LLM cites a non-zero delta. Partial mismatches (e.g. truth
+        # delta = +1, LLM delta = +5) might still be a real change the
+        # LLM rounded — too noisy to flag.
+        if truth_post - truth_base == 0:
+            contradictions.append(
+                f"LLM evidence cites {metric} "
+                f"{base_str}→{post_str} (Δ={llm_delta:+g}), "
+                f"but observation timeline shows no change "
+                f"(stayed at {truth_base:g} across {n_obs} iteration(s))"
+            )
+    return contradictions
+
+
+def _apply_contradiction_downgrade(
+    result: dict,
+    contradictions: list[str],
+) -> None:
+    """Append contradiction warnings and downgrade verdict in-place.
+
+    Same downgrade direction as
+    ``_detect_checklist_conclusion_inconsistency``: ``passed`` →
+    ``partial`` (objective signal overrides subjective judgement).
+    Verdicts already worse than passed are left alone.
+    """
+    warnings = result.setdefault("warnings", [])
+    for c in contradictions:
+        warnings.append(c)
+    if (result.get("layer2") or {}).get("status") == "passed":
+        result["layer2"]["status"] = "partial"
+    if result.get("level") == "verified":
+        result["level"] = "partial"
+        warnings.append(
+            "Verdict downgraded verified→partial due to evidence/timeline "
+            "contradiction(s) above. Objective metric measurements override "
+            "the LLM's stated conclusion."
+        )
+
+
+def cross_check_evidence(
+    result: dict,
+    observations: list[dict] | None,
+) -> dict:
+    """Detect LLM evidence numbers that contradict the observation timeline.
+
+    Pipeline:
+      1. Build per-metric truth deltas from observations.
+      2. Gather all free-text evidence the LLM emitted.
+      3. Find contradictions (LLM claims delta, truth says zero).
+      4. If any: append warnings + downgrade verdict.
+
+    Returns ``result`` (mutated). Safe to call with empty / missing
+    observations — early-exits with no mutation.
+    """
+    if not observations:
+        return result
+    truth = _build_truth_deltas(observations)
+    if not truth:
+        return result
+    evidence = _collect_evidence_text(result)
+    if not evidence:
+        return result
+    contradictions = _find_contradictions(evidence, truth, len(observations))
+    if contradictions:
+        _apply_contradiction_downgrade(result, contradictions)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -576,3 +838,110 @@ def _parse_verification_result(text: str) -> dict:
         )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# E3 — dict → VerificationResult conversion
+# ---------------------------------------------------------------------------
+
+_WARNING_TEXT_TO_CODE: list[tuple[str, WarningCode]] = [
+    ("Layer 2 skipped", WarningCode.LAYER2_SKIPPED),
+    ("Layer 2 (fault-specific) verification was skipped", WarningCode.LAYER2_SKIPPED),
+    ("Layer 2 (fault-specific) verification result is unknown", WarningCode.LAYER2_SKIPPED),
+    ("experiment expired", WarningCode.EXPERIMENT_EXPIRED),
+    ("Fault experiment expired", WarningCode.EXPERIMENT_EXPIRED),
+    ("skipped step", WarningCode.CHECKLIST_HAS_SKIPPED),
+    ("recovered_before_observation", WarningCode.CHECKLIST_RECOVERED_BEFORE_OBS),
+    ("No Verification Checklist detected", WarningCode.NO_CHECKLIST_DETECTED),
+    ("Contradiction:", WarningCode.CONTRADICTION_OVERRIDE),
+    ("Checklist-conclusion inconsistency", WarningCode.CHECKLIST_CONCLUSION_INCONSISTENCY),
+    ("PrimaryEvidenceObserved=false", WarningCode.PRIMARY_EVIDENCE_NOT_OBSERVED),
+    ("coverage", WarningCode.COVERAGE_INCOMPLETE),
+    ("See verification details", WarningCode.SEE_VERIFICATION_DETAILS),
+    ("baseline available", WarningCode.BASELINE_AVAILABLE_NOT_USED),
+]
+
+
+def _classify_warning(text: str) -> WarningCode:
+    """Map a freeform warning string to a WarningCode."""
+    text_lower = text.lower()
+    for fragment, code in _WARNING_TEXT_TO_CODE:
+        if fragment.lower() in text_lower:
+            return code
+    return WarningCode.SEE_VERIFICATION_DETAILS
+
+
+def dict_to_verification_result(raw: dict) -> VerificationResult:
+    """Convert a raw _parse_verification_result dict to a VerificationResult model.
+
+    Keeps _parse_verification_result unchanged (battle-tested parsing) and
+    adds a structured conversion layer at the boundary.
+    """
+    # Layer 1
+    l1_raw = raw.get("layer1") or {}
+    layer1 = Layer1Result(
+        status=l1_raw.get("status", "unknown"),
+        details=l1_raw.get("details", ""),
+        raw_output=l1_raw.get("raw_output", ""),
+        resource_statuses=l1_raw.get("resource_statuses", []),
+        affected_count=l1_raw.get("affected_count", 0),
+        expired=l1_raw.get("expired", False),
+    )
+
+    # Layer 2
+    l2_raw = raw.get("layer2") or {}
+    layer2 = Layer2Result(
+        status=l2_raw.get("status", "unknown"),
+        details=l2_raw.get("details", ""),
+    )
+
+    # Checklist
+    checklist = None
+    cl_raw = raw.get("checklist")
+    if cl_raw and isinstance(cl_raw, dict):
+        items = []
+        for item in cl_raw.get("items", []):
+            if isinstance(item, dict):
+                try:
+                    items.append(ChecklistItem(
+                        step=item.get("step", 0),
+                        description=item.get("description", ""),
+                        status=item.get("status", "passed"),
+                        evidence=item.get("evidence", ""),
+                    ))
+                except (ValueError, KeyError):
+                    pass
+        checklist = Checklist(
+            items=items,
+            total_count=cl_raw.get("total_count", len(items)),
+            skipped_count=cl_raw.get("skipped_count", 0),
+            non_passed_count=cl_raw.get("non_passed_count", 0),
+        )
+
+    # Warnings
+    warnings: list[StructuredWarning] = []
+    for w in raw.get("warnings", []):
+        if isinstance(w, str):
+            warnings.append(StructuredWarning(code=_classify_warning(w), detail=w))
+        elif isinstance(w, dict):
+            warnings.append(StructuredWarning.model_validate(w))
+
+    # Level
+    level_str = raw.get("level", "unverified")
+    try:
+        level = InjectVerdict(level_str)
+    except ValueError:
+        level = InjectVerdict.UNVERIFIED
+
+    return VerificationResult(
+        level=level,
+        layer1=layer1,
+        layer2=layer2,
+        checklist=checklist,
+        warnings=warnings,
+        baseline_used=raw.get("baseline_used"),
+        baseline_confidence=raw.get("baseline_confidence"),
+        primary_evidence_observed=raw.get("primary_evidence_observed"),
+        side_effects=raw.get("side_effects"),
+        overall=raw.get("overall", ""),
+    )

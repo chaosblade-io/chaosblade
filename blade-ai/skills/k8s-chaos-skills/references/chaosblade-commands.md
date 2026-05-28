@@ -12,7 +12,7 @@ blade create k8s <scope>-<target> <action> [flags]
 
 - `<scope>`: 作用范围，可选 `pod`、`node`、`container`
 - `<target>`: 故障目标，如 `cpu`、`network`、`disk`、`process`、`pod`(仅Pod级别)
-- `<action>`: 故障动作，如 `fullload`、`delay`、`loss`、`fill`、`kill`
+- `<action>`: 故障动作，如 `fullload`、`drop`、`dns`、`occupy`、`fill`、`kill`
 
 ## Action 对照表（scope-target → 可用 action）
 
@@ -20,18 +20,18 @@ blade create k8s <scope>-<target> <action> [flags]
 |---|---|---|
 | pod-cpu | `fullload` | CPU 满载 |
 | pod-mem | `load` | 内存占用 |
-| pod-network | `delay`, `loss`, `dns`, `corrupt`, `duplicate` | 网络故障 |
+| pod-network | `dns`, `drop`, `occupy` | 网络故障 (v1.8.0) |
 | pod-disk | `fill`, `burn` | 磁盘填充 / IO 负载 |
 | pod-process | `kill`, `stop` | 进程操作 |
 | pod-pod | `delete` | Pod 删除 |
 | pod-IO | `delay`, `errno` | 文件系统 IO 故障 |
 | node-cpu | `fullload` | CPU 满载 |
 | node-mem | `load` | 内存占用 |
-| node-network | `delay`, `loss` | 网络故障 |
+| node-network | `drop` | 网络故障 (v1.8.0: `delay`/`loss` → `drop`) |
 | node-disk | `fill`, `burn` | 磁盘填充 / IO 负载 (**无 fullload**) |
 | node-process | `kill`, `stop` | 进程操作 |
 | container-cpu | `fullload` | CPU 满载 |
-| container-network | `delay`, `loss` | 网络故障 |
+| container-network | `drop` | 网络故障 (v1.8.0: `delay`/`loss` → `drop`) |
 | container-process | `kill`, `stop` | 进程操作 |
 | container-container | `remove` | 容器删除 |
 
@@ -100,6 +100,8 @@ blade create k8s pod-mem load \
 
 ### 3. Pod 网络延迟
 
+> **⚠️ v1.8.0 不可用**：`pod-network delay` 在 blade v1.8.0 中不存在（仅 `dns`/`drop`/`occupy`）。如需延迟效果，使用 Tier 2 kubectl-native 方案（tc qdisc）。以下为旧版参考：
+
 ```bash
 blade create k8s pod-network delay \
   --namespace <ns> \
@@ -123,23 +125,23 @@ blade create k8s pod-network delay \
 ### 4. Pod 网络丢包
 
 ```bash
-blade create k8s pod-network loss \
+blade create k8s pod-network drop \
   --namespace <ns> \
   --labels "app=<app>" \
-  --percent <0-100> \
   --interface eth0 \
   --kubeconfig ~/.kube/config
 ```
 
+> **⚠️ drop 是全量丢包**（iptables DROP 语义），**不支持 `--percent`**。不带端口/IP 过滤时丢弃该接口的所有流量。
+
 | Flag | 说明 | 默认值 |
 |------|------|--------|
-| `--percent` | 丢包率百分比 | - |
 | `--interface` | 网络接口 | eth0 |
 | `--local-port` | 本地端口 | 全部 |
 | `--remote-port` | 远程端口 | 全部 |
 | `--destination-ip` | 目标 IP | 全部 |
 
-> **爆炸半径控制提示**：对 network loss/delay 故障,优先使用 `--local-port` 或 `--remote-port` 限制影响端口范围,避免全端口丢包影响 DNS、监控等非目标流量。仅在测试完全网络分区时使用不加端口过滤的全接口注入。
+> **爆炸半径控制提示**：drop 默认丢弃全部流量，**必须**使用 `--local-port` 或 `--remote-port` 或 `--destination-ip` 限制影响范围，避免丢弃 DNS、监控等非目标流量。仅在测试完全网络分区时使用不加过滤的全接口注入。
 
 ### 5. Pod DNS 故障
 
@@ -308,6 +310,8 @@ Flags 与 Pod 内存压力一致（`--mode`、`--mem-percent`、`--reserve`、`-
 
 ### 3. 节点网络延迟
 
+> **⚠️ v1.8.0 不可用**：`node-network delay` 在 blade v1.8.0 中不存在。以下为旧版参考：
+
 ```bash
 blade create k8s node-network delay \
   --names <节点名> \
@@ -319,12 +323,13 @@ blade create k8s node-network delay \
 ### 4. 节点网络丢包
 
 ```bash
-blade create k8s node-network loss \
+blade create k8s node-network drop \
   --names <节点名> \
-  --percent <0-100> \
   --interface eth0 \
   --kubeconfig ~/.kube/config
 ```
+
+> **⚠️ 同 Pod drop：全量丢包，不支持 `--percent`。** 用 `--local-port`/`--destination-ip` 缩小范围。
 
 Node 网络 Flags 与 Pod 网络一致（`--interface`、`--local-port`、`--remote-port`、`--destination-ip` 等）。
 
@@ -401,6 +406,8 @@ blade create k8s container-cpu fullload \
 
 ### 2. 容器网络延迟
 
+> **⚠️ v1.8.0 不可用**：`container-network delay` 在 blade v1.8.0 中不存在。以下为旧版参考：
+
 ```bash
 blade create k8s container-network delay \
   --namespace <ns> \
@@ -466,7 +473,7 @@ blade version
 blade create -h
 
 # 查看某个场景的详细帮助
-blade create k8s pod-network delay -h
+blade create k8s pod-network drop -h
 ```
 
 ---
@@ -488,12 +495,10 @@ blade create k8s pod-network delay -h
 
 | 故障场景 | 命令 |
 |---------|------|
-| Pod 网络延迟 | `blade create k8s pod-network delay --time 3000 --namespace <ns> --labels "app=<app>"` |
-| Pod 网络丢包 | `blade create k8s pod-network loss --percent 60 --namespace <ns> --labels "app=<app>"` |
-| Pod 网络丢包(指定端口) | `blade create k8s pod-network loss --percent 100 --local-port 3306 --namespace <ns> --labels "app=<app>"` |
+| Pod 网络丢包(全量) | `blade create k8s pod-network drop --interface eth0 --namespace <ns> --labels "app=<app>"` |
+| Pod 网络丢包(指定端口) | `blade create k8s pod-network drop --local-port 3306 --namespace <ns> --labels "app=<app>"` |
 | Pod DNS 故障 | `blade create k8s pod-network dns --domain example.com --ip 1.1.1.1 --namespace <ns> --labels "app=<app>"` |
-| 节点网络延迟 | `blade create k8s node-network delay --time 3000 --interface eth0 --names <node>` |
-| 节点网络丢包 | `blade create k8s node-network loss --percent 100 --interface eth0 --names <node>` |
+| 节点网络丢包 | `blade create k8s node-network drop --interface eth0 --names <node>` |
 
 ### 磁盘故障类
 
@@ -636,10 +641,9 @@ kubectl delete chaosblade --all
 kubectl get pods -n chaosblade -l app=otel-c-tool --kubeconfig=/path/to/config
 # 2. 通过 tool Pod 执行 blade create
 kubectl exec otel-c-tool-xxxxx -n chaosblade -- \
-  blade create k8s pod-network loss \
+  blade create k8s pod-network drop \
   --namespace cms-demo \
   --labels "app=myapp" \
-  --percent 100 \
   --interface eth0 \
   --kubeconfig=/path/to/config
 # 3. 从输出中提取 blade_uid

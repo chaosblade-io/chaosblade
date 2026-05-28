@@ -5,16 +5,98 @@ import logging
 from chaos_agent.agent.nodes._conflict_check import check_blade_conflicts
 from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
+from chaos_agent.agent.safety_score import (
+    compute_safety_score,
+    maybe_escalate_status,
+)
 from chaos_agent.agent.state import AgentState
 from chaos_agent.agent.target_guard import freeze_approved_target
 from chaos_agent.config.settings import settings
-from chaos_agent.errors import FailureReason
+from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _get_topology_deep_signal(spec, kubeconfig: str) -> tuple[int, str]:
+    """Optional async kubectl query for deployment replica count.
+
+    Only applies to deployment scope with a named target. Returns
+    (0, "") on any error so safety_check never fails because of it.
+    """
+    if not kubeconfig or spec.scope != "deployment" or not spec.names:
+        return (0, "")
+    try:
+        import asyncio as _asyncio
+        cmd = [
+            "kubectl", "--kubeconfig", kubeconfig,
+            "get", "deployment", spec.names[0],
+            "-n", spec.namespace,
+            "-o", "jsonpath={.spec.replicas}",
+        ]
+        proc = await _asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=5.0)
+        except _asyncio.TimeoutError:
+            proc.kill()
+            return (0, "")
+        if proc.returncode != 0:
+            return (0, "")
+        replicas = int(stdout.decode().strip() or 0)
+        if replicas == 1:
+            return (20, "deployment has 1 replica (SPOF)")
+        if replicas == 2:
+            return (10, "deployment has 2 replicas (limited redundancy)")
+        return (0, "")
+    except Exception as e:
+        logger.debug("topology deep signal failed: %s", e)
+        return (0, "")
+
+
+def _attach_safety_score(
+    result: dict,
+    spec,
+    state: AgentState,
+    deep_signal: tuple[int, str] | None = None,
+) -> dict:
+    """Compute safety_score and merge into result; escalate status if enabled.
+
+    Always advisory: never downgrades. Escalation is gated by
+    ``settings.safety_score_routing_enabled``.
+    """
+    context = {
+        "conflict_uids": result.get("conflict_uids") or state.get("conflict_uids") or [],
+        "pipeline_attempt": state.get("pipeline_attempt") or 0,
+    }
+    if deep_signal is not None:
+        context["topology_deep_signal"] = deep_signal
+
+    score = compute_safety_score(spec, context)
+    result["safety_score"] = score.to_dict()
+
+    if settings.safety_score_routing_enabled:
+        current = result.get("safety_status") or state.get("safety_status") or "safe"
+        new = maybe_escalate_status(
+            current,
+            score.overall,
+            warning_thresh=settings.safety_score_warning_threshold,
+            confirm_thresh=settings.safety_score_confirm_threshold,
+        )
+        if new != current:
+            result["safety_status"] = new
+            logger.info(
+                "safety_score escalation: %s → %s (overall=%d)",
+                current, new, score.overall,
+            )
+    return result
 
 
 async def safety_check(state: AgentState) -> dict:
@@ -25,8 +107,15 @@ async def safety_check(state: AgentState) -> dict:
     2. Target existence (must be verified by agent_loop already)
     3. Conflict detection (active experiments on cluster)
     4. Skill existence
+    5. Target health pre-check (optional, gated by settings)
 
-    Returns updated safety_status and safety_reason.
+    E10 — also attaches a multi-dimensional ``safety_score`` dict to
+    every return path (blast_radius / frequency / time / topology +
+    weighted overall + level). When
+    ``settings.safety_score_routing_enabled`` is on, a high overall
+    can upgrade ``safety_status`` from safe → warning → confirm_required.
+
+    Returns updated safety_status, safety_reason, and safety_score.
     """
     task_id = state.get("task_id", "unknown")
     # Single source of truth: read the FaultSpec written by entry-point
@@ -55,8 +144,9 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "rejected",
             "safety_reason": f"Namespace '{namespace}' is in the safety blacklist",
-            "failure_reason": f"{FailureReason.SAFETY_REJECTED.value}: Namespace '{namespace}' is in the safety blacklist",
+            **fail_state(FailureCategory.SAFETY_REJECTED, f"namespace={namespace}"),
         }
+        result = _attach_safety_score(result, spec, state)
         await sync_to_store(state, result)
         return result
 
@@ -69,8 +159,9 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "rejected",
             "safety_reason": "No skill activated",
-            "failure_reason": f"{FailureReason.PREREQUISITE_FAILED.value}: No skill activated before safety check",
+            **fail_state(FailureCategory.PREREQUISITE_FAILED, "no skill activated"),
         }
+        result = _attach_safety_score(result, spec, state)
         await sync_to_store(state, result)
         return result
 
@@ -85,24 +176,36 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "rejected",
             "safety_reason": "No target specified",
-            "failure_reason": f"{FailureReason.PREREQUISITE_FAILED.value}: No target specified",
+            **fail_state(FailureCategory.PREREQUISITE_FAILED, "no target specified"),
         }
+        result = _attach_safety_score(result, spec, state)
         await sync_to_store(state, result)
         return result
 
-    # 4. Blade conflict detection (enhanced with target overlap)
+    # Resolve kubeconfig once — used by both the E10 deep topology
+    # signal (optional) and the blade conflict detection below.
     kubeconfig = _resolve_kubeconfig(state)
+
+    # E10 — optional deep K8s topology signal (replica count). Fetched
+    # once here so all downstream return paths use the same signal.
+    # No-op + (0, "") when the flag is off, kubeconfig missing, or the
+    # query fails — never blocks safety_check.
+    deep_signal: tuple[int, str] | None = None
+    if settings.safety_score_topology_deep:
+        deep_signal = await _get_topology_deep_signal(spec, kubeconfig or "")
+
+    # 4. Blade conflict detection — record result, do NOT early-return.
+    # Health/feasibility checks below always run regardless of conflicts
+    # so the user sees the full picture in the confirm card.
+    conflict_status: str | None = None  # "confirm_required" | "warning" | None
+    conflict_reason: str = ""
+    conflict_uids: list = []
+    conflict_extra: dict = {}
     if kubeconfig:
         namespace = spec.namespace
-        # spec.labels is contract-typed dict[str, str] — no isinstance
-        # dance needed. The previous coerce dance existed because
-        # state.target.labels could be a str (agent_loop lazy extract)
-        # or a dict (CLI structured input); FaultSpec normalises both
-        # at construction time.
         labels = ",".join(f"{k}={v}" for k, v in spec.labels.items())
         target_names = ",".join(spec.names)
 
-        # Build scope-target-action for action compatibility check (P1)
         scope = spec.scope
         blade_target = spec.blade_target
         action = spec.blade_action
@@ -115,6 +218,7 @@ async def safety_check(state: AgentState) -> dict:
             request_scope_target_action=request_sta,
         )
         if uids:
+            conflict_uids = uids
             overlapping = [c for c in conflict_details if c.overlaps_target]
             same_action = [c for c in conflict_details if c.same_action_as_request]
             overlap_desc = "; ".join(c.overlap_reason for c in overlapping) if overlapping else ""
@@ -128,53 +232,23 @@ async def safety_check(state: AgentState) -> dict:
                     rule_type="conflict_escalation",
                 )
                 if adaptations:
-                    # Escalate to confirm_required (stronger than warning)
                     active_same_action_uids = [c.uid for c in same_action]
-                    tracker.complete(
-                        f"Safety check: confirm_required — {len(same_action)} same-action experiment(s) "
-                        f"on target (FCAT P1 escalation)"
+                    conflict_status = "confirm_required"
+                    conflict_reason = (
+                        f"{len(same_action)} active experiment(s) with the SAME action "
+                        f"({scope}-{blade_target}-{action}) already target this resource. "
+                        f"Compound effects make individual verification impossible. "
+                        f"Use --force-override to proceed anyway."
                     )
-                    sync_node_status_to_session(state, "safety_check",
-                        "Same-target same-action overlay detected (confirm_required)",
-                        detail={"safety_status": "confirm_required",
-                                "reason": "same_target_same_action",
-                                "same_action_uids": active_same_action_uids,
-                                "conflict_count": len(uids)})
-                    # Populate target_metadata.active_same_action_experiments for downstream
                     if target_metadata is None:
                         target_metadata = {}
                     target_metadata["active_same_action_experiments"] = active_same_action_uids
-                    result = {
-                        "safety_status": "confirm_required",
-                        "safety_reason": (
-                            f"{len(same_action)} active experiment(s) with the SAME action "
-                            f"({scope}-{blade_target}-{action}) already target this resource. "
-                            f"Compound effects make individual verification impossible. "
-                            f"Use --force-override to proceed anyway."
-                        ),
-                        "conflict_uids": uids,
-                        "target_metadata": target_metadata,
-                    }
-                    await sync_to_store(state, result)
-                    return result
+                    conflict_extra = {"target_metadata": target_metadata}
 
-            # Active experiments detected → warning (including target overlap)
-            if overlapping:
-                tracker.complete(
-                    f"Safety checks passed with warning: {len(uids)} active experiment(s), "
-                    f"{len(overlapping)} target the same resource(s)"
-                )
-                sync_node_status_to_session(state, "safety_check",
-                    f"Safety checks passed with warning: {len(overlapping)} experiment(s) "
-                    f"target overlap",
-                    detail={"safety_status": "warning", "reason": "target_overlap",
-                            "overlap_count": len(overlapping),
-                            "overlap_uids": [c.uid for c in overlapping],
-                            "conflict_count": len(uids),
-                            "conflict_uids": uids[:5]})
-                result = {
-                    "safety_status": "warning",
-                    "safety_reason": (
+            if conflict_status is None:
+                conflict_status = "warning"
+                if overlapping:
+                    conflict_reason = (
                         f"{len(uids)} active ChaosBlade experiment(s) already exist on this cluster. "
                         f"WARNING: {len(overlapping)} of them target the SAME resource(s): "
                         f"{overlap_desc}. "
@@ -182,115 +256,146 @@ async def safety_check(state: AgentState) -> dict:
                         f"compound effects and cannot be individually verified. "
                         f"Consider destroying the conflicting experiment(s) first: "
                         f"{', '.join(c.uid for c in overlapping)}"
-                    ),
-                    "conflict_uids": uids,
-                }
-            else:
-                # Namespace-level overlap only → warning (existing behavior)
-                tracker.complete(
-                    f"Safety checks passed with warning: {len(uids)} active experiment(s) detected"
-                )
-                sync_node_status_to_session(state, "safety_check",
-                    f"Safety checks passed with warning: {len(uids)} active experiment(s)",
-                    detail={"safety_status": "warning", "conflict_count": len(uids),
-                            "conflict_uids": uids[:5]})
-                result = {
-                    "safety_status": "warning",
-                    "safety_reason": (
+                    )
+                else:
+                    conflict_reason = (
                         f"{len(uids)} active ChaosBlade experiment(s) already exist on this cluster: "
                         f"{', '.join(uids[:5])}. "
                         f"No direct target overlap detected, but compound effects are possible. "
                         f"Consider destroying existing experiments first before proceeding."
-                    ),
-                    "conflict_uids": uids,
-                }
-            await sync_to_store(state, result)
-            return result
+                    )
 
-    # Patch D — target health pre-check. Probes the resolved target
-    # for blocker conditions (DiskPressure / Evicted / etc.) and
-    # attaches the report to state so confirmation_gate / TUI can
-    # surface it. Defaults to ``warn-only`` — even a BLOCK report does
-    # not flip safety_status unless ``settings.target_health_check_
-    # block_on_blocker = True`` is opted into. Failure is silent
-    # (kubectl issues / unknown scope → empty OK report) so a sick
-    # health check can never break the inject pipeline.
+    # 5. Target health pre-check — always runs regardless of conflicts.
     target_health_report: dict | None = None
+    health_rejected = False
     if settings.target_health_check_enabled:
         try:
             from chaos_agent.agent.target_health import assess_target_health
 
-            # assess_target_health still consumes the legacy dict
-            # shape; project the spec through to that contract here.
             target_payload = {
                 "namespace": spec.namespace,
                 "names": list(spec.names),
                 "labels": dict(spec.labels),
                 "resource_type": spec.scope,
             }
-            kubeconfig = settings.kubeconfig_path or ""
-            health = await assess_target_health(spec.scope, target_payload, kubeconfig)
-            scope = spec.scope
+            health = await assess_target_health(spec.scope, target_payload, kubeconfig or "")
             target_health_report = health.to_dict()
             logger.info(
                 "target health pre-check: scope=%s overall=%s issues=%d",
-                scope,
-                health.overall.value,
-                len(health.issues),
+                spec.scope, health.overall.value, len(health.issues),
             )
-            if (
-                health.is_blocking()
-                and settings.target_health_check_block_on_blocker
-            ):
-                # Hard-block path — only when operator explicitly opts in.
-                # Render a clear safety_reason so the confirm card / log
-                # explain *why* we refused even though everything else
-                # passed.
-                tracker.fail(
-                    f"Target health blocker: {health.summary()}"
-                )
-                result = {
-                    "safety_status": "rejected",
-                    "safety_reason": (
-                        f"Target health pre-check blocked the inject: "
-                        f"{health.summary()}. Set "
-                        f"BLADE_AI_TARGET_HEALTH_CHECK_BLOCK=0 to override."
-                    ),
-                    "conflict_uids": [],
-                    "target_health_report": target_health_report,
-                }
-                await sync_to_store(state, result)
-                return result
+            tracker.update(
+                f"Target health: {health.overall.value} ({len(health.issues)} issue(s))",
+                {"debug": True, "target_health_report": target_health_report},
+            )
+            sync_node_status_to_session(state, "safety_check",
+                f"Target health pre-check: {health.overall.value}, "
+                f"{len(health.issues)} issue(s)",
+                detail={"target_health_report": target_health_report})
+            if health.is_blocking() and settings.target_health_check_block_on_blocker:
+                health_rejected = True
         except Exception as exc:  # noqa: BLE001 — never fatal
-            logger.warning(
-                "target health pre-check failed (non-fatal): %s", exc
+            logger.warning("target health pre-check failed (non-fatal): %s", exc)
+
+    # 6. Injection feasibility assessment — always runs regardless of conflicts.
+    feasibility_report: dict | None = None
+    feas_rejected = False
+    if settings.feasibility_check_enabled:
+        try:
+            from chaos_agent.agent.feasibility import assess_feasibility, FeasibilitySeverity
+
+            feas = await assess_feasibility(spec, kubeconfig or "")
+            if feas is not None:
+                feasibility_report = feas.to_dict()
+                logger.info(
+                    "feasibility assessment: blade_target=%s severity=%s headroom=%.2f",
+                    spec.blade_target, feas.severity.value, feas.headroom,
+                )
+                tracker.update(
+                    f"Feasibility: {feas.severity.value} (headroom={feas.headroom:.2f})",
+                    {"debug": True, "feasibility_report": feasibility_report},
+                )
+                sync_node_status_to_session(state, "safety_check",
+                    f"Feasibility assessment: {feas.severity.value}, "
+                    f"headroom={feas.headroom:.2f}, {feas.message}",
+                    detail={"feasibility_report": feasibility_report})
+                if (
+                    feas.severity == FeasibilitySeverity.IMPOSSIBLE
+                    and settings.feasibility_check_block_on_impossible
+                ):
+                    feas_rejected = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("feasibility check failed (non-fatal): %s", exc)
+
+    # 7. Determine final status: rejected > confirm_required > warning > safe
+    if health_rejected or feas_rejected:
+        reject_reasons = []
+        if health_rejected:
+            reject_reasons.append(
+                f"Target health blocker: {health.summary()}. "
+                f"Set BLADE_AI_TARGET_HEALTH_CHECK_BLOCK=0 to override."
             )
+        if feas_rejected:
+            reject_reasons.append(
+                f"Injection not feasible: {feas.message}. {feas.recommendation}"
+            )
+        if conflict_reason:
+            reject_reasons.append(f"Also: {conflict_reason}")
+        tracker.fail("; ".join(reject_reasons[:1]))
+        sync_node_status_to_session(state, "safety_check",
+            f"Safety check rejected: {reject_reasons[0][:80]}",
+            detail={"safety_status": "rejected"})
+        result = {
+            "safety_status": "rejected",
+            "safety_reason": " ".join(reject_reasons),
+            "conflict_uids": conflict_uids,
+            **conflict_extra,
+        }
+    elif conflict_status == "confirm_required":
+        tracker.complete(
+            f"Safety check: confirm_required — conflicts on target"
+        )
+        sync_node_status_to_session(state, "safety_check",
+            "Same-target same-action overlay detected (confirm_required)",
+            detail={"safety_status": "confirm_required",
+                    "conflict_count": len(conflict_uids)})
+        result = {
+            "safety_status": "confirm_required",
+            "safety_reason": conflict_reason,
+            "conflict_uids": conflict_uids,
+            **conflict_extra,
+        }
+    elif conflict_status == "warning":
+        tracker.complete(
+            f"Safety checks passed with warning: {len(conflict_uids)} active experiment(s)"
+        )
+        sync_node_status_to_session(state, "safety_check",
+            f"Safety checks passed with warning: {len(conflict_uids)} active experiment(s)",
+            detail={"safety_status": "warning",
+                    "conflict_count": len(conflict_uids),
+                    "conflict_uids": conflict_uids[:5]})
+        result = {
+            "safety_status": "warning",
+            "safety_reason": conflict_reason,
+            "conflict_uids": conflict_uids,
+        }
+    else:
+        tracker.complete("Safety checks passed")
+        sync_node_status_to_session(state, "safety_check", "Safety checks passed",
+            detail={"safety_status": "safe"})
+        result = {
+            "safety_status": "safe",
+            "safety_reason": None,
+            "conflict_uids": [],
+        }
 
-    tracker.complete("Safety checks passed")
-    sync_node_status_to_session(state, "safety_check", "Safety checks passed",
-        detail={"safety_status": "safe"})
-    result = {
-        "safety_status": "safe",
-        "safety_reason": None,
-        "conflict_uids": [],
-    }
+    # Always attach reports so TUI confirm card shows full picture.
     if target_health_report is not None:
-        # Carry the report into state even when not blocking — TUI
-        # confirm card surfaces issues in WARN form (e.g. "1 active
-        # experiment, no DiskPressure but pod is Pending"). Skipping
-        # the field when no report is generated keeps state minimal.
         result["target_health_report"] = target_health_report
+    if feasibility_report is not None:
+        result["feasibility_report"] = feasibility_report
 
-    # When this safety_check return causes the router to AUTO-APPROVE
-    # (status=safe + needs_confirmation=False → route_after_safety →
-    # baseline_capture, bypassing confirmation_gate), there is no
-    # other place that freezes ``approved_target`` for the screener
-    # to compare against. Without freezing here, the screener would
-    # see ``approved_target=None`` in enforcing mode and REJECT every
-    # destructive call in this turn as "no approval on record".
-    # Mirrors the freeze logic in confirmation_gate; safe to do
-    # unconditionally because the user-prompted gate will overwrite
-    # this with the same snapshot on its own approve path.
+    # Freeze approved_target for screener comparison (mirrors confirmation_gate).
     result["approved_target"] = freeze_approved_target(
         target={"namespace": spec.namespace, "names": list(spec.names),
                 "labels": dict(spec.labels), "resource_type": spec.scope},
@@ -300,5 +405,6 @@ async def safety_check(state: AgentState) -> dict:
         blade_action=spec.blade_action,
     )
 
+    result = _attach_safety_score(result, spec, state, deep_signal)
     await sync_to_store(state, result)
     return result

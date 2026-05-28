@@ -46,8 +46,7 @@ from chaos_agent.tui.theme import Colors, Icons, Theme
 _ACTION_LABELS: dict[str, tuple[str, str]] = {
     "fullload":       ("CPU 满载",       "stop-cpu-fullload"),
     "load":           ("负载注入",       "stop-load"),
-    "delay":          ("网络延迟",       "stop-delay"),
-    "loss":           ("丢包",           "stop-loss"),
+    "drop":           ("网络丢包",       "stop-drop"),
     "kill":           ("强杀",           "重新拉起容器"),
     "fail":           ("失败注入",       "stop-fail"),
     "burn":           ("内存满载",       "stop-burn-mem"),

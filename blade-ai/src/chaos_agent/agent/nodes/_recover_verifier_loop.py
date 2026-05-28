@@ -54,7 +54,8 @@ from chaos_agent.agent.nodes.react_helpers import (
 )
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
-from chaos_agent.errors import FailureReason
+from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.memory.session_store import NO_SESSION_MARKER
 from chaos_agent.observability.status_tracker import (
     get_tracker,
@@ -166,11 +167,10 @@ async def recover_verifier(state: AgentState) -> dict:
 
     result_dict = {"result": result, "recover_verification": verification, "finished_at": now_iso()}
     if not _recovered:
-        base = (
-            f"{FailureReason.RECOVERY_FAILED.value}: "
-            f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}"
-        )
-        result_dict["failure_reason"] = base
+        result_dict.update(fail_state(
+            FailureCategory.RECOVERY_FAILED,
+            f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}",
+        ))
     return result_dict
 
 
@@ -237,10 +237,9 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                 "result": result,
                 "recover_verification": verification,
                 "finished_at": now_iso(),
-                "failure_reason": (
-                    f"{FailureReason.RECOVERY_VERIFICATION_TIMEOUT.value}: "
-                    f"Recover verifier exceeded max iterations ({settings.max_recover_verifier_loop}), "
-                    f"could not confirm recovery"
+                **fail_state(
+                    FailureCategory.RECOVERY_VERIFICATION_TIMEOUT,
+                    f"max_iterations={settings.max_recover_verifier_loop}",
                 ),
             }
             await sync_to_store(state, result_dict)
@@ -482,15 +481,14 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                                     "recovered": False,
                                 }
                                 tracker.complete(f"Recovery failed at Layer 1: {layer1.status}")
-                                base = (
-                                    f"{FailureReason.RECOVERY_FAILED.value}: "
-                                    f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}"
-                                )
                                 result_dict = {
                                     "result": result,
                                     "recover_verification": verification,
                                     "finished_at": now_iso(),
-                                    "failure_reason": base,
+                                    **fail_state(
+                                        FailureCategory.RECOVERY_FAILED,
+                                        f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}",
+                                    ),
                                 }
                                 result_update.update(result_dict)
                                 await sync_to_store(state, result_update)
@@ -557,7 +555,7 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                     "result": result,
                     "recover_verification": verification,
                     "finished_at": now_iso(),
-                    "failure_reason": f"{FailureReason.RECOVERY_FAILED.value}: Layer1=error, Layer2=skipped",
+                    **fail_state(FailureCategory.RECOVERY_FAILED, "Layer1=error, Layer2=skipped"),
                 }
                 await sync_to_store(state, result_dict)
                 return result_dict
@@ -689,15 +687,14 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                             "recovered": False,
                         }
                         tracker.complete(f"Recovery failed at Layer 1: {layer1.status}")
-                        base = (
-                            f"{FailureReason.RECOVERY_FAILED.value}: "
-                            f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}"
-                        )
                         result_dict = {
                             "result": result,
                             "recover_verification": verification,
                             "finished_at": now_iso(),
-                            "failure_reason": base,
+                            **fail_state(
+                                FailureCategory.RECOVERY_FAILED,
+                                f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}",
+                            ),
                         }
                         result_update.update(result_dict)
                         await sync_to_store(state, result_update)
@@ -755,15 +752,14 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                 "recovered": False,
             }
             tracker.complete(f"Recovery failed at Layer 1: {layer1.status}")
-            base = (
-                f"{FailureReason.RECOVERY_FAILED.value}: "
-                f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}"
-            )
             result_dict = {
                 "result": result,
                 "recover_verification": verification,
                 "finished_at": now_iso(),
-                "failure_reason": base,
+                **fail_state(
+                    FailureCategory.RECOVERY_FAILED,
+                    f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}",
+                ),
             }
             await sync_to_store(state, result_dict)
             return result_dict
@@ -1370,13 +1366,11 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
             result_update["finished_at"] = now_iso()
             result_update["messages"] = _main_hm_for_state + _synthetic_for_state + [response]
 
-            # Set failure_reason when recovery is not confirmed
             if not result["recovered"]:
-                base = (
-                    f"{FailureReason.RECOVERY_FAILED.value}: "
-                    f"Layer1={layer1.status}, Layer2={l2_status}, level={verification['level']}"
-                )
-                result_update["failure_reason"] = base
+                result_update.update(fail_state(
+                    FailureCategory.RECOVERY_FAILED,
+                    f"Layer1={layer1.status}, Layer2={l2_status}, level={verification['level']}",
+                ))
 
             level = verification["level"]
             l1_status = layer1.status

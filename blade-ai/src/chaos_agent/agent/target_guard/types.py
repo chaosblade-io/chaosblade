@@ -166,6 +166,12 @@ class EffectiveTarget:
     blade_action: str = ""
     confidence: ConfidenceLevel = ConfidenceLevel.HIGH
     raw_command: str = ""
+    # Tier 1 injection: kubectl exec into a tool pod (chaosblade ns)
+    # then blade create inside. The inner blade command may not carry
+    # --namespace (blade v1.8.0 rejects it for some subcommands).
+    # Guard skips namespace check; names/labels check still validates
+    # target identity.
+    is_tier1_exec: bool = False
 
 
 @dataclass

@@ -175,6 +175,7 @@ class Renderer:
                 result.render_result(
                     self.console, event.data, event.task_id,
                     display_mode=display_mode,
+                    state=self._state,
                 )
                 if self._recorder is not None:
                     self._recorder.stop()

@@ -114,11 +114,14 @@ def _serialize_message_full(msg) -> dict:
         reasoning_content = additional_kwargs.get("reasoning_content")
         if reasoning_content:
             result["reasoning_content"] = reasoning_content
+        ts = additional_kwargs.get("_ts")
+        if ts:
+            result["time"] = ts
 
     tool_calls = getattr(msg, "tool_calls", None)
     if tool_calls:
         result["tool_calls"] = [
-            {"name": tc.get("name", ""), "args": tc.get("args", {})}
+            {"name": tc.get("name", ""), "args": tc.get("args", {}), "id": tc.get("id", "")}
             for tc in tool_calls
         ]
 
@@ -140,14 +143,24 @@ def _message_dedup_key(msg_dict: dict) -> str:
 
     Falls back to content-based key only when ``id`` is absent (should
     not normally happen but provides a safety net).
+
+    Round-2 hardening: all dict accesses are defensive (``.get`` with
+    fallback, ``str`` coercion before slicing). Bug 2's read-side
+    dedup runs this over **every** entry loaded from disk, including
+    possibly-corrupt or schema-drifted ones; a KeyError or TypeError
+    here would crash the entire ``read_session`` call.
     """
-    msg_id = msg_dict.get("id", "")
+    msg_id = msg_dict.get("id") or ""
     if msg_id:
         return f"id:{msg_id}"
-    # No id — fall back to type+content+tool_call_id composite
-    content_preview = msg_dict.get("content", "")[:200]
-    tool_call_id = msg_dict.get("tool_call_id", "")
-    return f"{msg_dict['type']}|{content_preview}|{tool_call_id}"
+    # No id — fall back to type+content+tool_call_id composite. Coerce
+    # everything to str first so multi-modal content (list/dict) or
+    # missing 'type' don't blow up the whole read path.
+    msg_type = msg_dict.get("type") or "unknown"
+    content_raw = msg_dict.get("content") or ""
+    content_preview = str(content_raw)[:200]
+    tool_call_id = msg_dict.get("tool_call_id") or ""
+    return f"{msg_type}|{content_preview}|{tool_call_id}"
 
 
 def build_result_summary(verification: dict) -> str:
@@ -187,21 +200,51 @@ def build_verification_simple(verification: dict) -> dict | None:
 class SessionStore:
     """Persist per-task conversation messages using JSONL + periodic snapshots.
 
-    File layout for an active task:
-      - ``<task_dir>/<task_id>.json``  — Snapshot (compaction checkpoint).
-      - ``<task_dir>/<task_id>.jsonl`` — Append-only increment log.
+    ─── File layout ─────────────────────────────────────────────────
+    Active task (mid-conversation):
+      ``<task_dir>/<task_id>.json``            ← Snapshot checkpoint
+      ``<task_dir>/<task_id>.jsonl``           ← Append-only increment log
+      ``<task_dir>/<task_id>.jsonl.compacted`` ← Transient (only during
+                                                  crashed _compact recovery)
 
-    On append, new messages are written to the ``.jsonl`` file (O(K) I/O
-    instead of rewriting the full JSON).  When the JSONL exceeds a
-    configurable threshold, a full snapshot is written atomically and
-    the JSONL is truncated.
+    Finalized task:
+      ``<task_dir>/<task_id>.json``  — single complete archival record
+      (``.jsonl`` is deleted by ``finalize_session``)
 
-    On finalization, a single complete ``.json`` is written atomically
-    and the ``.jsonl`` is deleted.  Legacy ``.json``-only files from
-    before this change are still readable by ``read_session()``.
+    ─── Why two files? ──────────────────────────────────────────────
+    ``append_messages`` is O(K) (K = new messages) instead of O(N)
+    (N = full conversation history) that ``.json`` rewrite would cost.
+
+    ─── Reading the complete history ────────────────────────────────
+    ALWAYS go through ``read_session(task_id)`` — it combines snapshot
+    + increments and dedupes. Direct ``cat <task_id>.json`` will look
+    "stale" or "almost empty" because between compactions the snapshot
+    lags behind. Direct ``cat <task_id>.jsonl`` shows only the increments
+    since the last snapshot, not the full history. Both are
+    intentional, not a bug.
+
+    ─── Invariant ───────────────────────────────────────────────────
+    ``.json["messages"]`` and ``.jsonl`` are **disjoint sets** of
+    messages by design. The previous version of ``create_session``
+    violated this for ``initial_messages`` (Bug 1, fixed); the
+    ``_compact`` crash window can also violate it temporarily (Bug 3,
+    handled by orphan ``.jsonl.compacted`` recovery + Bug 2 read-time
+    dedup as defense-in-depth).
+
+    ─── Compaction ──────────────────────────────────────────────────
+    When ``.jsonl`` accumulates ``compaction_threshold`` entries
+    (default 50), ``_compact`` rotates ``.jsonl`` → ``.jsonl.compacted``,
+    writes a fresh ``.json`` snapshot atomically (tempfile + rename),
+    then deletes the orphan. Any crash during this sequence leaves
+    ``.jsonl.compacted`` on disk; ``read_session`` recovers by
+    replaying it and deduping (id-based) against the snapshot.
+
+    ─── Legacy ──────────────────────────────────────────────────────
+    Files written by prior versions (snapshot-only ``.json``) remain
+    readable through ``read_session``.
     """
 
-    def __init__(self, task_dir: Path, compaction_threshold: int = 500):
+    def __init__(self, task_dir: Path, compaction_threshold: int = 50):
         self.task_dir = task_dir.expanduser()
         self.task_dir.mkdir(parents=True, exist_ok=True)
         # In-memory buffer for active tasks, keyed by task_id.
@@ -235,6 +278,14 @@ class SessionStore:
     def _jsonl_path(self, task_id: str) -> Path:
         """Return the JSONL increment-log path for a task."""
         return self.task_dir / f"{task_id}.jsonl"
+
+    def _compacted_path(self, task_id: str) -> Path:
+        """Sentinel name used by ``_compact`` to atomically rename
+        ``.jsonl`` aside while writing the snapshot. Recovery on next
+        ``read_session`` replays this file and relies on Bug 2 dedup
+        in ``read_session`` to drop duplicates if the snapshot already
+        absorbed it (Bug 3)."""
+        return self.task_dir / f"{task_id}.jsonl.compacted"
 
     def create_session(
         self,
@@ -292,15 +343,38 @@ class SessionStore:
         # can find the task in _active_sessions.
         self._active_sessions[task_id] = session_data
 
-        # Write initial_messages as the FIRST entries in the task file.
+        # Bug 1: write the empty skeleton FIRST, then append initial_messages
+        # via the normal jsonl path. The old order (append-then-write)
+        # caused both files to hold initial_messages — read_session()
+        # concat would then double-count them. With this order the
+        # ``.json`` is a true skeleton (messages=[]) and the ``.jsonl``
+        # holds all increments including initial_messages, preserving
+        # the invariant "snapshot + increments are disjoint sets".
+        #
+        # Round-5: use ``_atomic_write_json`` only (the old non-atomic
+        # ``_write_json`` was deleted). It used to silently log +
+        # return on OSError, hiding disk failures and leaving an
+        # in-memory-only registration that subsequent ``read_session``
+        # calls returned as None. Catching + rolling back the
+        # registration on failure makes the failure explicit (raise
+        # propagates to caller) and prevents the inconsistent
+        # half-registered state.
+        try:
+            self._atomic_write_json(task_id)
+        except OSError:
+            # Roll back in-memory registration so subsequent
+            # append_messages doesn't write a jsonl with no matching
+            # .json snapshot (which would make read_session return None
+            # despite the data existing on disk).
+            self._active_sessions.pop(task_id, None)
+            raise
+
+        # Write initial_messages as the FIRST entries in the jsonl log.
         # This is the P0-7-6 handoff: IntentClarificationSummary marks
         # the boundary between intent dialogue (session file) and
         # execution content (stored in task file).
         if initial_messages:
             self.append_messages(task_id, initial_messages)
-
-        # Flush the initial state (including any initial_messages) to disk.
-        self._write_json(task_id)
 
         # Opportunistically index into the TUI session forward list.
         if tui_session_id:
@@ -347,8 +421,36 @@ class SessionStore:
                 existing_keys.add(key)
 
         if new_entries:
+            # Bug A: write disk FIRST, then update in-memory. If the
+            # disk write fails, in-memory remains untouched so the next
+            # append_messages call will retry (these new_entries will
+            # not be in existing_keys → re-classified as new). This
+            # makes disk the source of truth and prevents silent data
+            # loss when the next read_session() comes from disk.
+            #
+            # Round-5 silent-fail audit: this catch is INTENTIONALLY
+            # silent (does not raise) — unlike ``_atomic_write_json``
+            # which now propagates OSError. Rationale:
+            #   - Callers (memory/hook.py PreReasoningHook,
+            #     tools/shell.py command-execution recorder) are
+            #     fire-and-forget ARCHIVAL paths. A graph node must
+            #     not fail mid-inject because the session file write
+            #     glitched.
+            #   - The retry-via-dedup behaviour above (in-memory
+            #     unchanged → next append re-classifies as new)
+            #     gives transparent self-healing for transient errors.
+            #   - Persistent disk failure is still observable through
+            #     the WARNING log + the read_session()-returns-stale
+            #     symptom.
+            try:
+                self._append_to_jsonl(task_id, new_entries)
+            except OSError as e:
+                logger.warning(
+                    f"Failed to append JSONL for task {task_id} "
+                    f"(in-memory unchanged; will retry on next append): {e}"
+                )
+                return
             session["messages"].extend(new_entries)
-            self._append_to_jsonl(task_id, new_entries)
             if self._needs_compaction(task_id):
                 self._compact(task_id)
 
@@ -359,8 +461,19 @@ class SessionStore:
             logger.warning(f"Task {task_id} not found, skipping raw message append")
             return
 
+        # Bug A: same write-disk-first ordering as append_messages.
+        # Round-5 silent-fail audit: see append_messages for rationale
+        # — this is an INTENTIONALLY-silent archival path (raise here
+        # would crash the calling tool execution recorder mid-stream).
+        try:
+            self._append_to_jsonl(task_id, [msg_dict])
+        except OSError as e:
+            logger.warning(
+                f"Failed to append raw message for task {task_id} "
+                f"(in-memory unchanged): {e}"
+            )
+            return
         session["messages"].append(msg_dict)
-        self._append_to_jsonl(task_id, [msg_dict])
         if self._needs_compaction(task_id):
             self._compact(task_id)
 
@@ -412,16 +525,37 @@ class SessionStore:
         session["status"] = status
         session["result_summary"] = result_summary or None
 
-        self._atomic_write_json(task_id)
-
-        # Clean up the JSONL increment log — the final .json is the
-        # complete archival record and no further appends are expected.
-        jsonl_path = self._jsonl_path(task_id)
+        # Round-3: _atomic_write_json now raises on disk failure.
+        # finalize is called from graph nodes via fire-and-forget /
+        # try-except patterns; we catch here to avoid propagating an
+        # OSError to LangGraph and aborting the surrounding flow.
+        # If snapshot write fails, the data is still in ``.jsonl``
+        # (which we deliberately DON'T unlink below in that case)
+        # and read_session reconstructs from it.
+        snapshot_ok = True
         try:
-            if jsonl_path.exists():
-                jsonl_path.unlink()
+            self._atomic_write_json(task_id)
         except OSError as e:
-            logger.warning(f"Failed to delete JSONL for task {task_id}: {e}")
+            snapshot_ok = False
+            logger.warning(
+                f"Snapshot write failed during finalize for task {task_id} "
+                f"(leaving .jsonl/.jsonl.compacted intact so data is still "
+                f"recoverable via read_session): {e}"
+            )
+
+        # Clean up the JSONL increment log + any leftover compact
+        # orphan — the final .json is the complete archival record
+        # and no further appends are expected. Skip cleanup if
+        # snapshot write failed (the jsonl is now the source of truth).
+        if snapshot_ok:
+            jsonl_path = self._jsonl_path(task_id)
+            compacted_path = self._compacted_path(task_id)
+            for p in (jsonl_path, compacted_path):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except OSError as e:
+                    logger.warning(f"Failed to delete {p.name} for task {task_id}: {e}")
         self._jsonl_counts.pop(task_id, None)
 
         del self._active_sessions[task_id]
@@ -430,13 +564,19 @@ class SessionStore:
     def read_session(self, task_id: str) -> Optional[dict]:
         """Read a task session from disk, reconstructing from snapshot + JSONL.
 
-        Handles three cases:
-        1. Finalized / legacy task (only .json exists) — read directly.
-        2. Active task (.json snapshot + .jsonl increments) — replay JSONL.
-        3. Corrupt JSONL lines — skip with a warning.
+        Reconstruction sources (in priority order):
+          1. ``.json`` — snapshot (required).
+          2. ``.jsonl.compacted`` — orphan from crashed _compact (Bug 3
+             recovery); replay then unlink.
+          3. ``.jsonl`` — live increment log.
+
+        After concat, run Bug 2 dedup on the full list (id-based
+        ``_message_dedup_key``) so any duplicates from Bug 1 / Bug 3
+        crash windows are dropped instead of being returned.
         """
         json_path = self._file_path(task_id)
         jsonl_path = self._jsonl_path(task_id)
+        compacted_path = self._compacted_path(task_id)
 
         if not json_path.exists():
             return None
@@ -447,29 +587,57 @@ class SessionStore:
             logger.warning(f"Failed to read task {task_id}: {e}")
             return None
 
-        # No JSONL — finalized or legacy format, return as-is.
-        if not jsonl_path.exists():
-            return data
+        all_messages = list(data.get("messages", []))
 
-        # Replay JSONL increments onto the snapshot.
+        # Bug 3 recovery — orphan ``.jsonl.compacted`` means _compact
+        # crashed mid-rotation. Replay it; Bug 2 dedup at the end drops
+        # duplicates if the snapshot already absorbed this content.
+        if compacted_path.exists():
+            all_messages.extend(self._replay_jsonl_file(compacted_path, task_id))
+            try:
+                compacted_path.unlink()
+            except OSError as e:
+                logger.warning(f"Failed to clean orphan .jsonl.compacted: {e}")
+
+        # Replay live JSONL increments.
+        if jsonl_path.exists():
+            all_messages.extend(self._replay_jsonl_file(jsonl_path, task_id))
+
+        # Bug 2 — id-based dedup, preserving first-seen order. Saves us
+        # from Bug 1 / Bug 3 crash duplicates, also defends against any
+        # future write-path bug that double-writes a message.
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        for msg in all_messages:
+            key = _message_dedup_key(msg)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(msg)
+        data["messages"] = deduped
+
+        return data
+
+    @staticmethod
+    def _replay_jsonl_file(path: Path, task_id: str) -> list[dict]:
+        """Read all valid JSON lines from a jsonl file. Skips corrupt
+        lines with a warning. Returns [] on OSError."""
+        out: list[dict] = []
         try:
-            incremental_messages = []
-            with open(jsonl_path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     try:
-                        incremental_messages.append(json.loads(line))
+                        out.append(json.loads(line))
                     except json.JSONDecodeError:
                         logger.warning(
-                            f"Corrupt JSONL line in task {task_id}, skipping"
+                            f"Corrupt JSONL line in {path.name} for task {task_id}, skipping"
                         )
-            data["messages"] = data.get("messages", []) + incremental_messages
         except OSError as e:
-            logger.warning(f"Failed to read JSONL for task {task_id}: {e}")
-
-        return data
+            logger.warning(f"Failed to read {path.name} for task {task_id}: {e}")
+        return out
 
     def list_tasks(self) -> list[str]:
         """List all task IDs from files on disk."""
@@ -487,15 +655,19 @@ class SessionStore:
 
         This is the core I/O optimization: instead of rewriting the entire
         JSON file on every append, we only write new entries to a JSONL file.
+
+        Raises ``OSError`` on disk failure so callers can decide whether to
+        roll back their in-memory state. Bug A regression: previously this
+        method swallowed OSError + logged warning, leaving in-memory
+        ``session["messages"]`` updated while disk state was not — a
+        subsequent ``read_session()`` from disk silently dropped the
+        missing messages.
         """
         jsonl_path = self._jsonl_path(task_id)
-        try:
-            with open(jsonl_path, "a", encoding="utf-8") as f:
-                for entry in entries:
-                    f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
-            self._jsonl_counts[task_id] = self._jsonl_counts.get(task_id, 0) + len(entries)
-        except OSError as e:
-            logger.warning(f"Failed to append JSONL for task {task_id}: {e}")
+        with open(jsonl_path, "a", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        self._jsonl_counts[task_id] = self._jsonl_counts.get(task_id, 0) + len(entries)
 
     def _needs_compaction(self, task_id: str) -> bool:
         """Check whether the JSONL line count exceeds the compaction threshold.
@@ -506,58 +678,137 @@ class SessionStore:
         return self._jsonl_counts.get(task_id, 0) >= self._compaction_threshold
 
     def _compact(self, task_id: str) -> None:
-        """Write a full snapshot atomically and truncate the JSONL log.
+        """Write a full snapshot atomically and rotate the JSONL log.
 
-        Uses atomic write (tempfile + rename) for the snapshot so the
-        checkpoint is always valid.  Truncates (not deletes) the JSONL
-        to avoid orphaned file-descriptor writes from concurrent appends.
+        Bug 3 — crash-safe ordering:
+          0. If a previous compact crashed and left an orphan
+             ``.jsonl.compacted``, MERGE it into the current ``.jsonl``
+             before rotation. POSIX ``os.replace`` would otherwise
+             silently overwrite the orphan and lose data — the orphan
+             may be the only on-disk copy of those messages if the
+             previous crash happened before ``_atomic_write_json``
+             finished.
+          1. Atomically rename ``.jsonl`` → ``.jsonl.compacted``.
+          2. Write the full snapshot to ``.json`` via tempfile+rename.
+          3. ``unlink`` ``.jsonl.compacted``.
+
+        Any crash between steps leaves ``.jsonl.compacted`` on disk;
+        ``read_session`` replays it and dedups (Bug 2).
+
+        Bug B: only reset ``_jsonl_counts`` after the full sequence
+        succeeds. If unlink fails the counter stays, next compact
+        will retry the cleanup.
         """
-        self._atomic_write_json(task_id)
+        import os
         jsonl_path = self._jsonl_path(task_id)
+        compacted_path = self._compacted_path(task_id)
+
+        # Step 0 — orphan reclaim. If an orphan .jsonl.compacted exists
+        # from a previous crashed compact, prepend its content to the
+        # current .jsonl so the upcoming rename doesn't overwrite it.
+        # The orphan may hold messages that aren't yet in any snapshot.
+        if compacted_path.exists():
+            try:
+                logger.info(
+                    f"Found orphan .jsonl.compacted for task {task_id}; "
+                    f"merging into live jsonl before rotation"
+                )
+                orphan_content = compacted_path.read_text(encoding="utf-8")
+                # Prepend orphan to live jsonl by rewriting it
+                live_content = (
+                    jsonl_path.read_text(encoding="utf-8")
+                    if jsonl_path.exists()
+                    else ""
+                )
+                merged = orphan_content
+                if merged and not merged.endswith("\n"):
+                    merged += "\n"
+                merged += live_content
+                jsonl_path.write_text(merged, encoding="utf-8")
+                compacted_path.unlink()
+            except OSError as e:
+                logger.warning(
+                    f"Failed to merge orphan .jsonl.compacted for {task_id}: {e}; "
+                    f"aborting compact to avoid data loss"
+                )
+                return
+
+        # Step 1: atomic rename. Skip if .jsonl doesn't exist (compact
+        # called on freshly-created session with no appends).
+        if jsonl_path.exists():
+            try:
+                os.replace(str(jsonl_path), str(compacted_path))
+            except OSError as e:
+                logger.warning(f"Failed to rename JSONL for compact ({task_id}): {e}")
+                return
+
+        # Step 2: write snapshot atomically. If this fails the orphan
+        # .jsonl.compacted still holds the rotated content — MUST NOT
+        # proceed to step 3 (would unlink the only on-disk copy).
+        # Round-3 fix: _atomic_write_json now raises; without this
+        # catch+return, unconditional unlink in step 3 caused true
+        # data loss when snapshot write failed.
         try:
-            jsonl_path.write_text("", encoding="utf-8")
+            self._atomic_write_json(task_id)
         except OSError as e:
-            logger.warning(f"Failed to truncate JSONL for task {task_id}: {e}")
+            logger.warning(
+                f"Snapshot write failed during compact for task {task_id} "
+                f"(orphan .jsonl.compacted preserved, counter not reset; "
+                f"read_session will replay orphan, next append retries compact): {e}"
+            )
+            return
+
+        # Step 3: delete the orphan. If this fails leave it — the next
+        # read_session replays + dedups (Bug 2), no data loss.
+        try:
+            if compacted_path.exists():
+                compacted_path.unlink()
+        except OSError as e:
+            logger.warning(
+                f"Compact cleanup failed for task {task_id} "
+                f"(snapshot OK, orphan .jsonl.compacted will be "
+                f"replayed and deduped on next read): {e}"
+            )
+            return
+
         self._jsonl_counts[task_id] = 0
 
-    def _write_json(self, task_id: str) -> None:
-        """Write task data to JSON file (non-atomic, for initial skeleton only).
+    def _atomic_write_json(self, task_id: str) -> None:
+        """Write task data using atomic tempfile + rename.
 
-        Used exclusively by ``create_session`` to write the empty-messages
-        skeleton.  All subsequent appends go through ``_append_to_jsonl``.
+        Round-3 fix: raises ``OSError`` on disk failure (was silently
+        log + return). Callers MUST catch and decide what to do — in
+        particular ``_compact`` must NOT proceed to unlink the orphan
+        ``.jsonl.compacted`` if the snapshot write failed.
+
+        Round-4 fix: ``os.replace`` failure (e.g. cross-device boundary
+        on NFS / overlayfs, target locked on Windows, target dir
+        permission flip) used to leak the ``.json.tmp`` file forever.
+        Now any raise path through this function cleans up the tempfile
+        via try/finally + success flag.
         """
         session = self._active_sessions.get(task_id)
         if session is None:
             return
         file_path = self._file_path(task_id)
+        data = self._serialize_for_write(session)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.task_dir), suffix=".json.tmp"
+        )
+        import os
+        success = False
         try:
-            data = self._serialize_for_write(session)
-            file_path.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2, default=str),
-                encoding="utf-8",
-            )
-        except OSError as e:
-            logger.warning(f"Failed to write task {task_id}: {e}")
-
-    def _atomic_write_json(self, task_id: str) -> None:
-        """Write task data using atomic tempfile + rename (for finalization)."""
-        session = self._active_sessions.get(task_id)
-        if session is None:
-            return
-        file_path = self._file_path(task_id)
-        try:
-            data = self._serialize_for_write(session)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(self.task_dir), suffix=".json.tmp"
-            )
-            try:
-                with open(fd, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2, default=str)
-            except Exception:
-                import os
-                os.unlink(tmp_path)
-                raise
-            import os
+            with open(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
             os.replace(tmp_path, str(file_path))
-        except OSError as e:
-            logger.warning(f"Failed to atomic-write task {task_id}: {e}")
+            success = True
+        finally:
+            if not success:
+                # Any raise path (json.dump error, os.replace error,
+                # disk full mid-write) lands here. Clean the tempfile
+                # so a partial / orphaned ``.json.tmp`` doesn't
+                # accumulate in task_dir across retries.
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass

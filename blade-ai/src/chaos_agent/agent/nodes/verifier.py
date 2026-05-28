@@ -51,14 +51,14 @@ from chaos_agent.agent.nodes._verifier_layer2_parse import (
     _detect_checklist_conclusion_inconsistency,  # noqa: F401
     _has_injection_verification_section,  # noqa: F401
     _extract_verification_step_descriptions,  # noqa: F401
+    cross_check_evidence,
+    dict_to_verification_result,  # noqa: F401
 )
 from chaos_agent.agent.nodes._verifier_messages import (
     _SYNTHETIC_TOOL_CALL_IDS,
     _VERIFIER_CONTEXT_KWARGS_KEY,
     _METRICS_TOOL_CALL_ID,  # noqa: F401  re-export for tests
     _BASELINE_TOOL_CALL_ID,  # noqa: F401  re-export for tests
-    _check_container_restart_fast_path,
-    _fresh_restart_count,
     _build_layer2_messages,
     _build_baseline_tool_messages,  # noqa: F401
 )
@@ -69,7 +69,9 @@ from chaos_agent.agent.nodes._verifier_shared import (
 )
 from chaos_agent.agent.nodes.baseline_capture import _parse_debug_pod_name, _delete_debug_pod
 from chaos_agent.agent.nodes.react_helpers import (
+    detect_action_stagnation,
     detect_repeated_tool_calls,
+    detect_tool_error_hint,
     emit_debug_tool_messages,
     extract_persistent_hm,
     extract_synthetic_messages,
@@ -80,7 +82,8 @@ from chaos_agent.agent.nodes.react_helpers import (
 from chaos_agent.agent.prompts import build_system_prompt, PromptMode
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
-from chaos_agent.errors import FailureReason, enrich_failure_reason
+from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
@@ -105,6 +108,51 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Entry point 1: Simple verifier (no LLM, Layer 1 only)
 # ---------------------------------------------------------------------------
+
+async def _cleanup_debug_pods(
+    state: AgentState,
+    kubeconfig: str,
+    task_id: str,
+    result_update: dict,
+) -> None:
+    """Programmatic debug-pod cleanup with cross-reentry dedup.
+
+    Scans the message history for ``kubectl debug node/...`` pods created
+    by the LLM, diffs against ``state.cleaned_debug_pods`` (pods we've
+    already attempted to delete in earlier verifier re-entries), deletes
+    only the new ones, and writes the merged set back into
+    ``result_update`` so the next re-entry sees them as already-handled.
+
+    Why the diff matters (post task-712629116b64):
+    Without it, every verifier re-entry (reverify loop, ReAct iteration)
+    would re-scan the full history, re-discover the same pod names, and
+    re-issue ``kubectl delete``. After the first delete the pod is gone
+    and every retry returns ``Error from server (NotFound)``, inflating
+    the failure-rate stat (observed as 8 spurious NotFound failures on
+    a single task).
+
+    Failed deletes are still recorded in ``cleaned_debug_pods`` —
+    ``_delete_debug_pod`` is best-effort and a transient failure doesn't
+    deserve automatic cleanup retries; the operator can ``kubectl delete``
+    by hand if a pod truly stuck. The intent here is "cleanup *tried* to
+    remove each pod once", not "guarantee removal".
+    """
+    discovered_pods: set[str] = set()
+    for msg in state.get("messages", []):
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "kubectl":
+            msg_content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            pod_name = _parse_debug_pod_name(msg_content)
+            if pod_name:
+                discovered_pods.add(pod_name)
+    already_cleaned: set[str] = set(state.get("cleaned_debug_pods") or [])
+    pods_to_delete = discovered_pods - already_cleaned
+    for pod_name in pods_to_delete:
+        logger.info(f"Programmatic cleanup: deleting debug pod {pod_name}")
+        await _delete_debug_pod(pod_name, kubeconfig, task_id)
+    if pods_to_delete:
+        # Sorted list — deterministic for snapshot diffs + LangGraph JSON.
+        result_update["cleaned_debug_pods"] = sorted(already_cleaned | pods_to_delete)
+
 
 async def verifier(state: AgentState) -> dict:
     """Simple verifier without LLM: only Layer 1 (blade_status + blade_query_k8s)."""
@@ -231,13 +279,11 @@ async def verifier(state: AgentState) -> dict:
 
     result_dict = {"result": result, "verification": verification}
     if not _verified:
-        base = (
-            f"{FailureReason.VERIFICATION_FAILED.value}: "
-            f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}"
-        )
-        result_dict["failure_reason"] = enrich_failure_reason(
-            base, state.get("messages", [])
-        )
+        result_dict.update(fail_state(
+            FailureCategory.VERIFICATION_FAILED,
+            f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}",
+            state.get("messages", []),
+        ))
     # Patch C — wall-clock cause labelling for verifier path.
     from chaos_agent.agent.router import mark_wall_clock_timeout
     return mark_wall_clock_timeout(state, result_dict)
@@ -348,143 +394,17 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 "verified": False,
             }
             tracker.complete(f"Verification failed at Layer 1: {layer1.status}")
-            base = (
-                f"{FailureReason.VERIFICATION_FAILED.value}: "
-                f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}"
-            )
             result_dict = {
                 "result": result,
                 "verification": verification,
-                "failure_reason": enrich_failure_reason(
-                    base, state.get("messages", [])
+                **fail_state(
+                    FailureCategory.VERIFICATION_FAILED,
+                    f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}",
+                    state.get("messages", []),
                 ),
             }
             await sync_to_store(state, result_dict)
             return result_dict
-
-        # ---- Container Restart Fast Path ----
-        # Deterministic pre-check before entering LLM Layer 2 loop.
-        # If the target container restarted during injection AND L1 passed,
-        # the fault executed but evidence was destroyed by the restart.
-        # Return recovered_before_observation with side_effects so
-        # infer_phase maps to verification_passed (valid drill finding).
-        #
-        # IMPORTANT: The fast path result is stored in a local variable
-        # (_restart_precheck) and passed directly to _build_layer2_messages
-        # because LangGraph state is immutable within a single node invocation
-        # — we cannot write to state and read it back in the same iteration.
-        _restart_precheck: dict | None = None
-        if count == 1:
-            restart_result = await _check_container_restart_fast_path(
-                state, layer1, kubeconfig, task_id=task_id,
-            )
-            # Store fast path result (including negative conclusion) as
-            # AUTHORITATIVE FACT for Layer 2 prompt injection.
-            # This prevents the LLM from re-deriving restart status from
-            # raw kubectl output and making timestamp comparison errors.
-            if restart_result is not None:
-                _restart_precheck = {
-                    "restart_detected": restart_result.restart_detected,
-                    "restart_count": restart_result.restart_count,
-                    "baseline_restart_count": restart_result.baseline_restart_count,
-                    "restart_delta": restart_result.restart_delta,
-                    "reason": restart_result.reason,
-                    "finished_at": restart_result.finished_at,
-                }
-            else:
-                # fast path returned None = kubectl/JSON failure, data unavailable
-                _restart_precheck = {
-                    "restart_detected": False,
-                    "restart_count": -1,
-                    "baseline_restart_count": -1,
-                    "restart_delta": -1,
-                    "reason": "data_unavailable",
-                    "finished_at": "",
-                    "conclusion": "no_restart_data_unavailable",
-                }
-            if restart_result is not None and restart_result.restart_detected:
-                verification = {
-                    "level": "partial",
-                    "layer1": _layer1_to_dict(layer1),
-                    "layer2": {
-                        "status": "recovered_before_observation",
-                        "details": (
-                            f"Container restarted during injection "
-                            f"(reason: {restart_result.reason}, "
-                            f"restartCount: {restart_result.restart_count}). "
-                            f"Fault executed (L1 confirmed) but evidence "
-                            f"destroyed by restart. The restart is CONSISTENT WITH "
-                            f"the fault having an effect, but does not constitute "
-                            f"direct confirmation — side effects are weak evidence."
-                        ),
-                    },
-                    "baseline_confidence": _compute_baseline_confidence(state),
-                    "side_effects": {
-                        "container_restarts": [
-                            {
-                                "pod": restart_result.pod_name,
-                                "restart_count": restart_result.restart_count,
-                                "reason": restart_result.reason,
-                                "finished_at": restart_result.finished_at,
-                            }
-                        ],
-                    },
-                    "warnings": [
-                        f"Container restart detected during injection "
-                        f"({restart_result.reason}). Fault evidence destroyed, "
-                        f"but the restart alone cannot confirm causation. "
-                        f"This is a side effect (weak evidence). "
-                        f"Direct primary evidence (burn files, I/O metrics) "
-                        f"was not observed and could not be verified.",
-                    ],
-                }
-                result = {
-                    "task_id": task_id,
-                    "skill": skill_name,
-                    "blade_uid": blade_uid,
-                    "verified": False,  # level="partial" → not fully verified
-                }
-                _restart_msg = (
-                    f"Verification: partial (container restart fast path) "
-                    f"(Layer1: {layer1.status}, "
-                    f"Layer2: recovered_before_observation, "
-                    f"reason: {restart_result.reason})"
-                )
-                tracker.complete(_restart_msg)
-                result_dict = {
-                    "result": result,
-                    "verification": verification,
-                    "verifier_loop_count": count,
-                    "inject_layer1_cache": _layer1_to_dict(layer1),
-                    "restart_precheck": _restart_precheck,
-                    "inject_verification_summary": (
-                        f"Layer2=recovered_before_observation, "
-                        f"Details=Container restart ({restart_result.reason}), "
-                        f"evidence destroyed"
-                    ),
-                }
-                # Record fast path to session
-                _task_id_local = state.get("task_id", "")
-                if hook and getattr(hook, "session_store", None) and _task_id_local:
-                    hook.session_store.append_raw_message(_task_id_local, {
-                        "type": "system",
-                        "content": (
-                            f"[Verifier Fast Path] Container restart detected "
-                            f"on {restart_result.pod_name} "
-                            f"(reason={restart_result.reason}). "
-                            f"Skipping Layer 2 LLM iterations. "
-                            f"Classification: recovered_before_observation."
-                        ),
-                        "detail": {
-                            "layer": "fast_path",
-                            "status": "recovered_before_observation",
-                            "pod_name": restart_result.pod_name,
-                            "restart_count": restart_result.restart_count,
-                            "reason": restart_result.reason,
-                        },
-                    })
-                await sync_to_store(state, result_dict)
-                return result_dict
 
         # ---- Layer 2: LLM with tools for fault-specific verification ----
         # Call pre_reason_hook (memory compaction + session recording)
@@ -530,7 +450,6 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         messages = _build_layer2_messages(
             state, layer1, blade_uid, skill_name, kubeconfig, count,
             tool_pod_name=tool_pod_name,
-            restart_precheck_result=_restart_precheck,
         )
 
         # Extract synthetic AIMessage+ToolMessage pairs from the local messages
@@ -549,6 +468,24 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         loop_hint = detect_repeated_tool_calls(state.get("messages", []))
         if loop_hint:
             messages.append(HumanMessage(content=loop_hint))
+
+        # Action stagnation detection (tool-name level)
+        stagnation_hint, stagnant_tool = detect_action_stagnation(state.get("messages", []))
+        if stagnation_hint:
+            verifier_hint = (
+                f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
+                f"multiple consecutive times with no progress. "
+                f"This tool has been temporarily removed. You MUST now either:\n"
+                f"- Use a DIFFERENT tool or subcommand to gather verification evidence.\n"
+                f"- Output your verification conclusion based on evidence already collected.\n"
+                f"Do NOT attempt to call `{stagnant_tool}` again."
+            )
+            messages.append(HumanMessage(content=verifier_hint))
+
+        # Tool error introspection (runtime feedback > static docs)
+        error_hint = detect_tool_error_hint(messages)
+        if error_hint:
+            messages.append(HumanMessage(content=error_hint))
 
         # On last iteration, force LLM to produce a summary (unbind tools)
         # Use JSON mode (response_format) when enabled for guaranteed structured output
@@ -575,7 +512,13 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         elif count >= settings.max_verifier_loop:
             llm_to_call = llm
         else:
-            llm_to_call = llm.bind_tools(tools) if tools else llm
+            tools_this_iter = list(tools) if tools else []
+            if stagnant_tool:
+                tools_this_iter = [
+                    t for t in tools_this_iter
+                    if getattr(t, "name", "") != stagnant_tool
+                ]
+            llm_to_call = llm.bind_tools(tools_this_iter) if tools_this_iter else llm
 
         # Record system prompt to session store (dedup handles repeated prompts)
         verifier_prompt = build_system_prompt(PromptMode.VERIFICATION)
@@ -594,11 +537,6 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             "verifier_loop_count": count,
             "inject_layer1_cache": _layer1_to_dict(layer1),  # persist for subsequent iterations
         }
-        # Persist restart_precheck to state so subsequent iterations can
-        # recover it (the first iteration computes it, later ones need it
-        # when rebuilding the L2 prompt).
-        if _restart_precheck is not None:
-            result_update["restart_precheck"] = _restart_precheck
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if tool_calls:
@@ -645,102 +583,28 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 # JSON failed or not JSON mode → fall back to text parsing
                 verification = _parse_verification_result(content)
 
+            # E2 Phase 3 — cross-check LLM evidence numbers against
+            # the observation timeline (state.metric_observations,
+            # populated by PreReasoningHook from each ToolMessage's
+            # extracted_metrics). Catches the "LLM cites a baseline→post
+            # delta that the structured metrics say didn't happen"
+            # hallucination — downgrades verified→partial when found.
+            # Safe to run on either JSON or text-parsed verification —
+            # both shapes carry layer2/checklist/warnings in the same
+            # dict structure cross_check_evidence reads from.
+            verification = cross_check_evidence(
+                verification,
+                state.get("metric_observations"),
+            )
+
             verification["layer1"] = _layer1_to_dict(layer1)
 
             # ---- Programmatic Fact Enforcement ----
-            # The LLM may ignore AUTHORITATIVE facts injected into the prompt and
-            # re-derive incorrect conclusions from raw kubectl output (e.g.,
-            # attributing a pre-existing OOMKill to the injection window despite
-            # restart_precheck confirming no restart). This block programmatically
-            # overrides LLM conclusions that contradict known programmatic facts.
-            # Unlike prompt-based instructions, this enforcement is deterministic
-            # and cannot be overridden by the LLM.
-            _precheck_enforce = _restart_precheck or state.get("restart_precheck")
+            # Deterministic overrides when programmatic checks contradict LLM conclusions.
             _burn_enforce = state.get("disk_burn_post_check")
             _enforcement_applied = False
 
-            # Enforcement 1: restart_precheck says NO restart, but LLM blamed restart
-            if _precheck_enforce and not _precheck_enforce.get("restart_detected"):
-                _l2_status_val = verification.get("layer2", {}).get("status", "unknown")
-                _l2_details_lower = verification.get("layer2", {}).get("details", "").lower()
-                _restart_kws = (
-                    "oomkill", "oom kill", "restart", "restarted",
-                    "crashloop", "container restart",
-                )
-                _llm_blamed_restart = any(kw in _l2_details_lower for kw in _restart_kws)
-                # Also check checklist items for restart attribution
-                if not _llm_blamed_restart:
-                    for _ci in verification.get("checklist", {}).get("items", []):
-                        if _ci.get("status") in ("recovered_before_observation", "failed", "partial"):
-                            _ev_lower = _ci.get("evidence", "").lower()
-                            if any(kw in _ev_lower for kw in _restart_kws):
-                                _llm_blamed_restart = True
-                                break
-                if _l2_status_val in ("recovered_before_observation", "failed", "partial") and _llm_blamed_restart:
-                    # Freshness check: re-verify restart count hasn't changed
-                    # since precheck.  If the container restarted during the
-                    # LLM's ReAct loop, the precheck data is stale and we must
-                    # NOT override the LLM's (now correct) conclusion.
-                    _precheck_rc = _precheck_enforce.get("restart_count")
-                    _fresh_rc = await _fresh_restart_count(
-                        state, kubeconfig, task_id=task_id,
-                    )
-                    if _fresh_rc is not None and _precheck_rc is not None and _fresh_rc != _precheck_rc:
-                        logger.info(
-                            "Programmatic enforcement ABORTED: restart count changed "
-                            "since precheck (precheck=%s, current=%s). Container "
-                            "likely restarted during LLM ReAct loop. LLM conclusion stands.",
-                            _precheck_rc, _fresh_rc,
-                        )
-                        # The restart happened AFTER precheck but DURING the
-                        # injection window — the fault likely CAUSED it.
-                        # Set side_effects so infer_task_state maps to
-                        # "injected" (success) rather than "failed".
-                        from chaos_agent.agent.fault_spec import read_fault_spec as _rfs2
-                        _spec2 = _rfs2(state)
-                        _target_names = list(_spec2.names) if _spec2 else []
-                        verification.setdefault("side_effects", {})["container_restarts"] = [
-                            {
-                                "pod": _target_names[0] if _target_names else "unknown",
-                                "restart_count": _fresh_rc,
-                                "reason": "detected_by_freshness_check",
-                                "note": "restart occurred after precheck, likely caused by fault injection",
-                            }
-                        ]
-                        _enforcement_applied = True  # trigger level recalc
-                    else:
-                        _delta = _precheck_enforce.get("restart_delta", 0)
-                        logger.info(
-                            "Programmatic enforcement: LLM concluded %s due to restart/OOMKill, "
-                            "but restart_precheck confirmed NO restart (delta=%s, fresh_rc=%s). Overriding.",
-                            _l2_status_val, _delta, _fresh_rc,
-                        )
-                        verification["layer2"]["status"] = "passed"
-                        verification["layer2"]["details"] = (
-                            f"Programmatic restart pre-check: no container restart during injection "
-                            f"(delta={_delta}). OOMKill in LastState is PRE-EXISTING. "
-                            f"LLM conclusion overridden."
-                        )
-                        # Fix checklist items incorrectly attributed to restart.
-                        # When no restart occurred, ALL "recovered_before_observation"
-                        # items are invalid — the premise "evidence was destroyed
-                        # by restart" is false.  Override them regardless of whether
-                        # the evidence text mentions restart keywords.
-                        for _ci in verification.get("checklist", {}).get("items", []):
-                            if _ci.get("status") == "recovered_before_observation":
-                                _ci["status"] = "passed"
-                                _ci["evidence"] = (
-                                    f"[OVERRIDE] Programmatic check: no restart (delta={_delta}). "
-                                    f"Pre-existing OOMKill did not destroy evidence. "
-                                    f"Fault effect is still observable."
-                                )
-                        verification.setdefault("warnings", []).append(
-                            "Programmatic override: LLM attributed pre-existing OOMKill to "
-                            f"injection, but restart_precheck confirmed no restart (delta={_delta})."
-                        )
-                        _enforcement_applied = True
-
-            # Enforcement 2: disk_burn_post_check says I/O ACTIVE, but LLM concluded otherwise.
+            # Enforcement: disk_burn_post_check says I/O ACTIVE, but LLM concluded otherwise.
             # When I/O is confirmed ACTIVE, the fault has NOT "recovered before observation" —
             # it is still in effect.  Override ALL non-passed checklist items, not just those
             # whose evidence text happens to contain I/O keywords.  The LLM may have marked
@@ -851,6 +715,8 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             skill_case = state.get("skill_case_content", "")
             missing_step_nums = None  # Initialize before conditional assignment
             deviated_step_nums = None
+            expected_steps = 0
+            executed_steps = 0
             if skill_case and verification.get("checklist"):
                 expected_steps = _count_verification_steps_in_skill_case(skill_case)
                 executed_steps = verification["checklist"].get("total_executed", 0)
@@ -1104,8 +970,8 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             # force it to true and add an auditable warning. BaselineUsed is a FACT
             # (baseline data exists in the HumanMessage) not an LLM opinion — the LLM
             # may ignore it but the data was there for comparison. This mirrors the
-            # restart_precheck / disk_burn_post_check override pattern — deterministic
-            # code checks LLM conclusion against a programmatic fact.
+            # disk_burn_post_check override pattern — deterministic code checks LLM
+            # conclusion against a programmatic fact.
             _bl_conf = verification.get("baseline_confidence", "none")
             if _bl_conf in ("high", "partial") and not verification.get("baseline_used"):
                 _bl_used_orig = verification.get("baseline_used")  # None or False before override
@@ -1144,21 +1010,9 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result_update, hook_updates)
 
-        # ---- Programmatic Debug Pod Cleanup ----
-        # Scan all ToolMessages from kubectl tool calls during this verification
-        # to extract debug pod names created by LLM, then delete them.
-        # This enforces cleanup deterministically — prompt-only approach is
-        # unreliable (matches the Programmatic Fact Enforcement paradigm).
-        debug_pods_created: set[str] = set()
-        for msg in state.get("messages", []):
-            if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "kubectl":
-                msg_content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                pod_name = _parse_debug_pod_name(msg_content)
-                if pod_name:
-                    debug_pods_created.add(pod_name)
-        for pod_name in debug_pods_created:
-            logger.info(f"Programmatic cleanup: deleting debug pod {pod_name}")
-            await _delete_debug_pod(pod_name, kubeconfig, task_id)
+        # Programmatic debug-pod cleanup with cross-reentry dedup.
+        # See ``_cleanup_debug_pods`` for the full rationale + invariants.
+        await _cleanup_debug_pods(state, kubeconfig, task_id, result_update)
 
         await sync_to_store(state, result_update)
         # Patch C — wall-clock cause labelling. The router will return

@@ -23,12 +23,18 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Optional
+from typing import Annotated, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool as lc_tool
+from pydantic import BeforeValidator
 
+from chaos_agent.config.settings import settings
 from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+from chaos_agent.agent.nodes.react_helpers import (
+    detect_action_stagnation,
+    detect_repeated_tool_calls,
+)
 from chaos_agent.agent.prompts.builders import build_system_prompt
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.state import AgentState
@@ -46,7 +52,8 @@ CLASSIFY_INTENT_TOOL = {
     "name": "classify_intent",
     "description": (
         "Route a non-inject intent. Call this ONLY when the user clearly "
-        "wants to recover a previous experiment, or to end the conversation "
+        "wants to recover a previous experiment (and you have confirmed "
+        "which one via query_active_experiments), or to end the conversation "
         "(chat/goodbye). Do NOT call this for cluster queries or capability "
         "questions — answer those directly using kubectl / read_skill_resource."
     ),
@@ -64,13 +71,20 @@ CLASSIFY_INTENT_TOOL = {
                 "maximum": 1.0,
                 "description": "How confident you are. 1.0 = sure, 0.5 = uncertain.",
             },
+            "recover_task_id": {
+                "type": "string",
+                "description": (
+                    "The task_id of the experiment to recover. Required when "
+                    "intent='recover'. Get this from query_active_experiments."
+                ),
+            },
         },
         "required": ["intent", "confidence"],
     },
 }
 
-MAX_CLARIFICATION_ROUNDS = 5
-MAX_DIALOGUE_ROUNDS = 999
+MAX_CLARIFICATION_ROUNDS = settings.max_clarification_rounds
+MAX_DIALOGUE_ROUNDS = settings.max_dialogue_rounds
 
 
 # ---------------------------------------------------------------------------
@@ -193,91 +207,24 @@ def _extract_classify_intent(tool_calls: list) -> Optional[dict]:
             return {
                 "intent": intent if intent in valid else "chat",
                 "confidence": min(1.0, max(0.0, confidence)),
+                "recover_task_id": args.get("recover_task_id", ""),
             }
     return None
 
 
 # ---------------------------------------------------------------------------
-# Real tool: submit_fault_intent (executed by ToolNode, produces ToolMessage)
+# Argument coercion helpers
+#
+# Used by BOTH the Pydantic ``BeforeValidator`` on ``submit_fault_intent``
+# (so JSON-stringified args from LLM tool_calls pass schema validation
+# instead of dying with ``Input should be a valid list/dict``) AND by
+# ``_extract_submit_args`` (which reads raw tool_call args directly from
+# message history, bypassing ToolNode's schema validation entirely).
+#
+# Both paths must apply identical normalisation so the fault_intent the
+# downstream pipeline sees is shape-stable regardless of which path
+# produced it.
 # ---------------------------------------------------------------------------
-
-@lc_tool
-def submit_fault_intent(
-    fault_type: str,
-    scope: str,
-    target: str,
-    action: str,
-    namespace: str = "default",
-    names: list[str] | None = None,
-    labels: dict[str, str] | None = None,
-    params: dict[str, str] | None = None,
-    user_description: str = "",
-) -> str:
-    """Submit the collected fault injection intent for execution.
-
-    Call this ONLY after:
-    1. All required parameters are confirmed in dialogue with the user.
-    2. You have shown a complete intent summary in your last reply.
-    3. The user explicitly approved (said "执行" / "确认" / "开始" / "go" etc.).
-
-    Pass every field you've derived from the dialogue — do NOT leave them
-    blank expecting the system to re-extract them from chat history. The
-    structured args you submit here are the source of truth that drives
-    the downstream confirmation card and the inject pipeline.
-
-    The (scope, target, action) triple mirrors the ChaosBlade command
-    model ``blade create <scope> <target> <action> --<flag>=<value>``.
-    Treat the values listed below as *common* examples, NOT a closed
-    enum — ChaosBlade supports many more (e.g. action="loss" / "fill" /
-    "ifdown" / "reorder"; target="dns" / "file" / "jvm" / "kubelet").
-    The authoritative set of legal triples and their required ``params``
-    flags is published by ``read_skill_resource``; consult it BEFORE
-    calling this tool whenever you're unsure about the fault you're
-    about to submit.
-
-    Args:
-        fault_type: Composite identifier — by convention the dash-joined
-                    triple ``"<scope>-<target>-<action>"``, e.g.
-                    ``"node-cpu-fullload"`` / ``"pod-network-loss"``.
-                    Acts as the human-readable label on the confirm
-                    card. Required.
-        scope: K8s resource family the fault attaches to. Common values:
-               ``"pod"``, ``"node"``, ``"container"``. ChaosBlade also
-               supports workload kinds (deployment / statefulset / ...)
-               via skills. Required.
-        target: Subsystem under attack. Common values: ``"cpu"`` /
-                ``"mem"`` / ``"network"`` / ``"disk"`` / ``"process"``;
-                skill catalogue may expose more (``"dns"`` /
-                ``"file"`` / ``"jvm"`` / ...). Required.
-        action: Concrete fault action. Common values vary per target:
-                cpu→``"fullload"``; mem→``"load"``; network→``"delay"``
-                / ``"loss"`` / ``"duplicate"`` / ``"corrupt"`` /
-                ``"reorder"``; disk→``"burn"`` / ``"fill"``;
-                process→``"kill"`` / ``"stop"``. Required.
-        namespace: K8s namespace. Defaults to ``"default"`` — node-scope
-                   faults conventionally use ``"default"`` and the user
-                   rarely says so explicitly.
-        names: Specific resource names (pods/nodes). Pass when the user
-               named a target.
-        labels: Label selector dict like ``{"app": "nginx"}``.
-        params: Fault-type-specific flags. The keys depend on the
-                ``(scope, target, action)`` triple — read the skill
-                spec for the canonical set. Common shapes:
-                  - cpu-fullload: ``{"percent": "80",
-                    "timeout": "600"}``
-                  - network-delay: ``{"time": "200",
-                    "interface": "eth0"}``
-                  - network-loss: ``{"percent": "30"}``
-                  - disk-fill: ``{"path": "/data", "size": "10000"}``
-                  - process-kill: ``{"process": "nginx",
-                    "signal": "9"}``
-                Values must be strings.
-        user_description: User's original natural-language request.
-
-    Returns:
-        Acknowledgment string consumed by the dialogue gateway.
-    """
-    return "✓ 故障注入意图已提交，正在进入执行确认阶段。"
 
 
 def _coerce_to_list(raw, field_name: str = "") -> list:
@@ -378,6 +325,155 @@ def _coerce_to_dict(raw, field_name: str = "") -> dict:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# Pydantic BeforeValidator wrappers for submit_fault_intent
+#
+# These run BEFORE Pydantic checks the declared type on a tool_call arg.
+# They convert a JSON-stringified list/dict into the real Python type so
+# the ``list[str]`` / ``dict[str, str]`` annotations succeed.
+#
+# Without them, LLM-emitted ``names='["a"]'`` / ``params='{"k":"v"}'``
+# (a known qwen-class quirk) would fail schema validation at the
+# ``@lc_tool`` boundary with
+#   ``Input should be a valid list``
+#   ``Input should be a valid dictionary``
+# and the LLM would never get to call the tool — observed in
+# sess_27ec8f3ef6b2 where a single submit_fault_intent attempt was
+# rejected and the dialogue ended without recovery.
+#
+# Empty container -> None preserves the "field omitted" semantics so
+# downstream consumers that distinguish None from {} / [] (e.g.
+# fault_spec validators) see no surprising change from the pre-coerce
+# default.
+# ---------------------------------------------------------------------------
+
+
+def _validate_names(v):
+    if v is None:
+        return None
+    coerced = _coerce_to_list(v, "names")
+    return coerced if coerced else None
+
+
+def _validate_labels(v):
+    if v is None:
+        return None
+    coerced = _coerce_to_dict(v, "labels")
+    return coerced if coerced else None
+
+
+def _validate_params(v):
+    if v is None:
+        return None
+    coerced = _coerce_to_dict(v, "params")
+    return coerced if coerced else None
+
+
+# ---------------------------------------------------------------------------
+# Real tool: submit_fault_intent (executed by ToolNode, produces ToolMessage)
+# ---------------------------------------------------------------------------
+
+@lc_tool
+def submit_fault_intent(
+    fault_type: str,
+    scope: str,
+    target: str,
+    action: str,
+    namespace: str = "default",
+    names: Annotated[Optional[list[str]], BeforeValidator(_validate_names)] = None,
+    labels: Annotated[Optional[dict[str, str]], BeforeValidator(_validate_labels)] = None,
+    params: Annotated[Optional[dict[str, str]], BeforeValidator(_validate_params)] = None,
+    user_description: str = "",
+) -> str:
+    """Submit the collected fault injection intent for execution.
+
+    Call this ONLY after:
+    1. All required parameters are confirmed in dialogue with the user.
+    2. You have shown a complete intent summary in your last reply.
+    3. The user explicitly approved (said "执行" / "确认" / "开始" / "go" etc.).
+
+    Pass every field you've derived from the dialogue — do NOT leave them
+    blank expecting the system to re-extract them from chat history. The
+    structured args you submit here are the source of truth that drives
+    the downstream confirmation card and the inject pipeline.
+
+    The (scope, target, action) triple mirrors the ChaosBlade command
+    model ``blade create <scope> <target> <action> --<flag>=<value>``.
+    Treat the values listed below as *common* examples, NOT a closed
+    enum — ChaosBlade supports many more (e.g. action="drop" / "fill" /
+    "occupy"; target="dns" / "file" / "jvm" / "kubelet").
+    The authoritative set of legal triples and their required ``params``
+    flags is published by ``read_skill_resource``; consult it BEFORE
+    calling this tool whenever you're unsure about the fault you're
+    about to submit.
+
+    Args:
+        fault_type: Composite identifier — by convention the dash-joined
+                    triple ``"<scope>-<target>-<action>"``, e.g.
+                    ``"node-cpu-fullload"`` / ``"pod-network-drop"``.
+                    Acts as the human-readable label on the confirm
+                    card. Required.
+        scope: K8s resource family the fault attaches to. Common values:
+               ``"pod"``, ``"node"``, ``"container"``. ChaosBlade also
+               supports workload kinds (deployment / statefulset / ...)
+               via skills. Required.
+        target: Subsystem under attack. Common values: ``"cpu"`` /
+                ``"mem"`` / ``"network"`` / ``"disk"`` / ``"process"``;
+                skill catalogue may expose more (``"dns"`` /
+                ``"file"`` / ``"jvm"`` / ...). Required.
+        action: Concrete fault action. Common values vary per target:
+                cpu→``"fullload"``; mem→``"load"``; network→``"drop"``
+                / ``"dns"`` / ``"occupy"`` (v1.8.0 only supports these three);
+                disk→``"burn"`` / ``"fill"``;
+                process→``"kill"`` / ``"stop"``. Required.
+        namespace: K8s namespace. Defaults to ``"default"`` — node-scope
+                   faults conventionally use ``"default"`` and the user
+                   rarely says so explicitly.
+        names: Specific resource names (pods/nodes). Pass when the user
+               named a target.
+        labels: Label selector dict like ``{"app": "nginx"}``.
+        params: Fault-type-specific flags. The keys depend on the
+                ``(scope, target, action)`` triple — read the skill
+                spec for the canonical set. Common shapes:
+                  - cpu-fullload: ``{"percent": "80",
+                    "timeout": "600"}``
+                  - network-drop: ``{"interface": "eth0"}``
+                    (drops all packets; no --percent support)
+                  - disk-fill: ``{"path": "/data", "size": "10000"}``
+                  - process-kill: ``{"process": "nginx",
+                    "signal": "9"}``
+                Values must be strings.
+        user_description: User's original natural-language request.
+
+    Returns:
+        Acknowledgment string consumed by the dialogue gateway.
+    """
+    return "✓ 故障注入意图已提交，正在进入执行确认阶段。"
+
+
+@lc_tool
+async def query_active_experiments() -> str:
+    """Query currently active fault experiments that can be recovered.
+
+    Call this when the user wants to recover/undo a fault injection.
+    Returns a list of recoverable experiments with their task_id, fault_type,
+    and namespace. Use the task_id from the results when calling
+    classify_intent(intent="recover", recover_task_id="task-xxx").
+    """
+    from chaos_agent.persistence.task_store import get_task_store
+    store = await get_task_store()
+    active = await store.query_active()
+    if not active:
+        return "当前没有活跃的故障注入实验，无需恢复。"
+    lines = [f"当前有 {len(active)} 个可恢复的活跃实验:"]
+    for i, t in enumerate(active[:10], 1):
+        tid = t.get("task_id", "?")
+        fault = t.get("skill") or t.get("skill_name") or "?"
+        ns = (t.get("target") or {}).get("namespace", "?")
+        lines.append(f"  {i}. task_id={tid}, fault_type={fault}, namespace={ns}")
+    return "\n".join(lines)
+
+
 def _extract_submit_args(messages: list) -> dict:
     """Pull the most recent submit_fault_intent tool_call args from history.
 
@@ -447,7 +543,7 @@ def _extract_submit_args(messages: list) -> dict:
 
 
 _INTENT_CONTENT_FALLBACKS = {
-    "recover": "好的,我来帮你恢复实验。请告诉我要恢复的 task_id,或者描述一下要回滚的故障。",
+    "recover": "好的，正在为您恢复实验。",
     "chat": "好的,随时回来找我。",
     "inject": "好的，已记下你的需求，请确认下面的故障注入意图。",
     # "unset" is not a terminal intent — the user is still in dialogue.
@@ -620,7 +716,7 @@ _TARGET_KEYWORDS = {
 _ACTION_MAP = {
     "cpu": "fullload",
     "mem": "load",
-    "network": "delay",
+    "network": "drop",
     "disk": "burn",
     "process": "kill",
 }
@@ -1202,15 +1298,44 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
                 fault_intent=fault_intent_existing,
             )
         )
+
+        # --- Anti-stagnation detection (same mechanism as agent_loop) ---
+        loop_hint = detect_repeated_tool_calls(messages)
+        _, stagnant_tool = detect_action_stagnation(messages)
+
+        intent_stagnation_hint = None
+        if stagnant_tool:
+            intent_stagnation_hint = (
+                f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` too many "
+                f"consecutive times with no progress. This tool has been temporarily "
+                f"removed. You MUST now either:\n"
+                f"- Call `submit_fault_intent` if you have collected enough fault parameters.\n"
+                f"- Use a DIFFERENT tool (activate_skill, read_skill_resource) for more info.\n"
+                f"- Output a plain text response to conclude this conversation turn.\n"
+                f"Do NOT attempt to call `{stagnant_tool}` again."
+            )
+
+        tools_this_iter = list(tools or [])
+        if stagnant_tool:
+            tools_this_iter = [
+                t for t in tools_this_iter
+                if getattr(t, "name", "") != stagnant_tool
+                or getattr(t, "name", "") == "submit_fault_intent"
+            ]
+
         function_schemas = [CLASSIFY_INTENT_TOOL]
-        llm_bound = llm.bind_tools(function_schemas + (tools or []))
+        llm_bound = llm.bind_tools(function_schemas + tools_this_iter)
+
+        llm_messages = [system_msg] + messages[-20:]
+        if loop_hint:
+            llm_messages.append(HumanMessage(content=loop_hint))
+        if intent_stagnation_hint:
+            llm_messages.append(HumanMessage(content=intent_stagnation_hint))
 
         try:
             if tracker:
                 tracker.update("调用 LLM...")
-            response = await llm_bound.ainvoke(
-                [system_msg] + messages[-20:]
-            )
+            response = await llm_bound.ainvoke(llm_messages)
         except Exception as e:
             logger.error("Intent clarification LLM failed: %s", e)
             if tracker:
@@ -1249,6 +1374,16 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
                 if tracker:
                     tracker.complete(f"意图路由: {intent}")
                 filtered = _filter_internal_tools_from_response(response, intent=intent)
+                # Dispatch only when LLM produced no text (fallback was used).
+                # When the LLM DID produce text, on_chat_model_stream already
+                # streamed those tokens — dispatching again would duplicate.
+                raw_content = getattr(response, "content", "") or ""
+                if not raw_content.strip():
+                    try:
+                        from chaos_agent.agent.dispatch import dispatch_node_message
+                        await dispatch_node_message("intent_clarification", filtered.content)
+                    except Exception:
+                        pass
                 persist_list = _build_dialogue_persist_list(
                     messages, response=response,
                     system_msg=system_msg,
@@ -1275,6 +1410,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
                 return merge_hook_updates({
                     "confirmed_intent": intent,
                     "intent_confidence": classification["confidence"],
+                    "recover_task_id": classification.get("recover_task_id", ""),
                     "messages": [filtered],
                     "task_id": op_task_id,
                 }, hook_updates)
