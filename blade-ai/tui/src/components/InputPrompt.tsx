@@ -250,6 +250,15 @@ export const InputPrompt: React.FC<Props> = ({
     [enterLocked, registry, value, selected],
   );
 
+  // Detect if buffer is a recognized slash command (exact match, not prefix).
+  const isValidCommand = useMemo(() => {
+    if (!value.startsWith("/")) return false;
+    const text = value.slice(1);
+    const firstSpace = text.search(/\s/);
+    const rootRaw = firstSpace === -1 ? text : text.slice(0, firstSpace);
+    return rootRaw.length > 0 && !!registry.get(rootRaw);
+  }, [value, registry]);
+
   // Replace the buffer + reset cursor to the codepoint-end. Used by
   // history nav, slash Tab-complete, and Esc-clear so they all
   // converge on a consistent post-update cursor position.
@@ -603,6 +612,7 @@ export const InputPrompt: React.FC<Props> = ({
   // buffer is empty). Body text colour stays primary either way —
   // we don't want the user's own typed draft to read as dim/grey.
   const promptColor = enterLocked ? Theme.text.secondary : Theme.text.accent;
+  const bufferColor = isValidCommand ? Theme.text.accent : Theme.text.primary;
   // Inverse-block under-cursor: keep the highlight visible (so users
   // can still tell where the cursor sits while drafting), but in the
   // dim band — same signal family as the prompt glyph.
@@ -626,7 +636,7 @@ export const InputPrompt: React.FC<Props> = ({
           </>
         ) : (
           <>
-            <Text color={Theme.text.primary}>
+            <Text color={bufferColor}>
               {renderWithNewlineMarkers(beforeRaw)}
             </Text>
             {underCp === "\n" ? (
@@ -638,7 +648,7 @@ export const InputPrompt: React.FC<Props> = ({
             ) : (
               <Text color={promptColor}>▌</Text>
             )}
-            <Text color={Theme.text.primary}>
+            <Text color={bufferColor}>
               {renderWithNewlineMarkers(afterRaw)}
             </Text>
           </>

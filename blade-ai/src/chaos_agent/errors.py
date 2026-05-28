@@ -162,39 +162,8 @@ _NON_REPLANABLE_PATTERNS = [
 ]
 
 
-class FailureReason(Enum):
-    """Categorized failure reason for task result.
-
-    Only set when the task result is "failed". Not set on success.
-    """
-
-    # --- Planning phase ---
-    PLANNING_TIMEOUT = "planning_timeout"        # Agent loop max iterations exceeded
-    SAFETY_REJECTED = "safety_rejected"          # Safety check blocked the operation
-    USER_REJECTED = "user_rejected"              # User rejected the confirmation
-
-    # --- Execution phase ---
-    PREREQUISITE_FAILED = "prerequisite_failed"    # Pre-condition not met (e.g., no DaemonSet pod)
-    EXECUTION_FAILED = "execution_failed"        # Execute loop error (non-replanable)
-    EXECUTION_TIMEOUT = "execution_timeout"      # Execute loop max iterations exceeded
-    REPLAN_EXHAUSTED = "replan_exhausted"        # Replan count exhausted, still failing
-
-    # --- Verification phase ---
-    VERIFICATION_FAILED = "verification_failed"  # Post-injection verification failed
-
-    # --- Recovery phase ---
-    RECOVERY_FAILED = "recovery_failed"          # Fault recovery failed
-    RECOVERY_VERIFICATION_TIMEOUT = "recovery_verification_timeout"  # Recover verifier max iterations
-
-    # --- System ---
-    INTERNAL_ERROR = "internal_error"            # Unhandled exception
-
-    # Patch C — Wall-clock timeout (settings.max_inject_seconds)
-    WALL_CLOCK_TIMEOUT = "wall_clock_timeout"    # Single turn exceeded budget seconds
-
-
 # ---------------------------------------------------------------------------
-# LLM diagnosis extraction for failure_reason enrichment
+# LLM diagnosis extraction (used by state_helpers.fail_state)
 # ---------------------------------------------------------------------------
 
 _DIAGNOSIS_FALLBACK = "未能从 Agent 推理记录中提取失败根因分析"
@@ -234,12 +203,6 @@ def extract_llm_diagnosis(messages: list, max_length: int = 500) -> str:
     return _DIAGNOSIS_FALLBACK
 
 
-def enrich_failure_reason(
-    base_reason: str, messages: list, max_length: int = 500
-) -> str:
-    """Append LLM diagnosis to a templated failure_reason string."""
-    diagnosis = extract_llm_diagnosis(messages, max_length)
-    return f"{base_reason} | llm_analysis: {diagnosis}"
 
 
 def should_auto_replan(error_message: str) -> bool:
@@ -282,10 +245,21 @@ class ErrorClass(Enum):
     descriptor`` (kubeconfig handle), ``no such host``.
     """
 
+    INTERFACE_MISMATCH = "interface_mismatch"
+    """Tool rejected the command syntax — the caller's model of the tool
+    interface is wrong.
+
+    Examples: ``unknown flag``, ``unknown command``, ``flag provided but
+    not defined``.  Distinguished from :attr:`USER_CONFIG` because the
+    rejected parameter/subcommand does NOT exist in the tool and must
+    never be retried; ``USER_CONFIG`` means the parameter exists but the
+    value or usage is wrong.
+    """
+
     USER_CONFIG = "user_config"
     """Bad LLM-generated args; replan with Phase 1's richer tools fixes.
 
-    Examples: ``invalid parameter``, ``unknown flag``, regex mismatch.
+    Examples: ``invalid parameter``, ``invalid argument``, regex mismatch.
     """
 
     TARGET_GONE = "target_gone"
@@ -339,6 +313,7 @@ class ErrorAction(Enum):
 
 
 _CLASS_TO_ACTION: dict[ErrorClass, ErrorAction] = {
+    ErrorClass.INTERFACE_MISMATCH: ErrorAction.REPLAN,
     ErrorClass.USER_CONFIG: ErrorAction.REPLAN,
     ErrorClass.TARGET_GONE: ErrorAction.REPLAN,
     ErrorClass.INFRA_TRANSIENT: ErrorAction.SHORT_RETRY,
@@ -386,12 +361,20 @@ _CLASSIFY_RULES: list[tuple[ErrorClass, list[str]]] = [
         ],
     ),
     (
+        ErrorClass.INTERFACE_MISMATCH,
+        [
+            "unknown flag",
+            "unknown command",
+            "unknown shorthand flag",
+            "flag provided but not defined",
+        ],
+    ),
+    (
         ErrorClass.USER_CONFIG,
         [
             "invalid parameter",
             "flag mismatch",
             "unsupported flag",
-            "unknown flag",
             "invalid argument",
             "validation error",
         ],

@@ -135,19 +135,27 @@ export function parseResultEnvelope(
   if (restartCount > 0) parts.push(`${restartCount} pod restart${restartCount === 1 ? "" : "s"}`);
   const summary = parts.join(" · ");
 
-  // Failure cause / hint split — failure_reason is shaped
-  // "<base> | llm_analysis: <hint>" by Python's enrich_failure_reason.
-  const failureReason = asString(data["failure_reason"]);
+  // Failure cause / hint — prefer structured failure_detail over legacy failure_reason.
   let cause: string | undefined;
   let hint: string | undefined;
-  if (failureReason) {
-    const sep = " | llm_analysis: ";
-    if (failureReason.includes(sep)) {
-      const idx = failureReason.indexOf(sep);
-      cause = failureReason.slice(0, idx).trim();
-      hint = failureReason.slice(idx + sep.length).trim();
-    } else {
-      cause = failureReason;
+  const failureDetail = data["failure_detail"] as Record<string, unknown> | undefined;
+  if (failureDetail && typeof failureDetail === "object" && failureDetail["category"]) {
+    const category = asString(failureDetail["category"]);
+    const context = asString(failureDetail["context"]);
+    cause = context ? `${category}: ${context}` : category;
+    hint = asString(failureDetail["llm_analysis"]) || undefined;
+  } else {
+    // Legacy fallback: failure_reason shaped "<base> | llm_analysis: <hint>"
+    const failureReason = asString(data["failure_reason"]);
+    if (failureReason) {
+      const sep = " | llm_analysis: ";
+      if (failureReason.includes(sep)) {
+        const idx = failureReason.indexOf(sep);
+        cause = failureReason.slice(0, idx).trim();
+        hint = failureReason.slice(idx + sep.length).trim();
+      } else {
+        cause = failureReason;
+      }
     }
   }
 
@@ -164,6 +172,22 @@ export function parseResultEnvelope(
   // models/schemas.py. Anything else falls through to "unknown".
   else if (env.status === "success") status = "success";
 
+  // T6 — postmortem payload. Server sends ``null`` when generation
+  // was skipped (disabled / non-inject / non-whitelist failure /
+  // LLM timeout); we leave the field undefined in that case so
+  // PostmortemSection can shortcut on `!item.postmortem`.
+  let postmortem: ResultItem["postmortem"];
+  const rawPm = data["postmortem"];
+  if (rawPm && typeof rawPm === "object" && !Array.isArray(rawPm)) {
+    const pm = rawPm as Record<string, unknown>;
+    const path = asString(pm["path"]);
+    const markdown = asString(pm["markdown"]);
+    const pmSummary = asString(pm["summary"]);
+    if (path && markdown) {
+      postmortem = { path, markdown, summary: pmSummary };
+    }
+  }
+
   return {
     taskId,
     status,
@@ -176,6 +200,8 @@ export function parseResultEnvelope(
     target,
     replanCount: replanCount > 0 ? replanCount : undefined,
     sideEffects: sideEffectList.length > 0 ? sideEffectList : undefined,
+    sideEffectsSummary: asString(data["side_effects_summary"]) || undefined,
+    postmortem,
   };
 }
 

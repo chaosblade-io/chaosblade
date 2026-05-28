@@ -35,13 +35,16 @@ from chaos_agent.server.routes.inject import inject_router
 from chaos_agent.server.routes.inject_stream import inject_stream  # noqa: F401 - registers route
 from chaos_agent.server.routes.list_skills import skills_router
 from chaos_agent.server.routes.metric import metric_router
+from chaos_agent.server.routes.prometheus import prometheus_router
 from chaos_agent.server.routes.recordings import recordings_router
 from chaos_agent.server.routes.recover import recover_router
 from chaos_agent.server.routes.sessions import sessions_router
 from chaos_agent.server.routes.status_stream import status_stream  # noqa: F401 - registers route
+from chaos_agent.agent.prompts.knowledge_watcher import KnowledgeWatcher
 from chaos_agent.skills.loader import get_skills_dir
 from chaos_agent.skills.prerequisites import PrerequisitesChecker
 from chaos_agent.skills.registry import SkillRegistry
+from chaos_agent.skills.watcher import SkillWatcher
 from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
@@ -94,9 +97,41 @@ async def lifespan(app: FastAPI):
     registry.load_from_directory(get_skills_dir())
     app.state.skill_registry = registry
 
+    # Hot-reload watchers. Both are no-ops if watchdog isn't installed
+    # or the target dir doesn't exist (logged as a single WARN line).
+    # SkillWatcher rebuilds the SkillRegistry on SKILL.md / script
+    # changes; KnowledgeWatcher rebuilds the knowledge_registry cache
+    # on .md changes under src/chaos_agent/knowledge/. Both stop in
+    # the shutdown block below.
+    skill_watcher = SkillWatcher(get_skills_dir(), registry)
+    skill_watcher.start()
+    app.state.skill_watcher = skill_watcher
+
+    knowledge_watcher = KnowledgeWatcher()
+    knowledge_watcher.start()
+    app.state.knowledge_watcher = knowledge_watcher
+
     # Check prerequisites
     prereq_checker = PrerequisitesChecker()
     await prereq_checker.check_startup_prerequisites(registry)
+
+    # E9 — MCP client manager. Connect to external MCP servers in
+    # parallel with per-server timeout; failure isolation guarantees
+    # a single bad server doesn't block startup. Tools are surfaced
+    # to the agent via per-phase allowlist (attach_to) inside
+    # create_agent below.
+    mcp_manager = None
+    if settings.mcp_enabled:
+        from chaos_agent.mcp.manager import McpManager
+        mcp_manager = McpManager()
+        try:
+            await mcp_manager.connect_all(
+                connect_timeout_seconds=settings.mcp_connect_timeout_seconds,
+            )
+        except Exception as e:
+            logger.warning(f"MCP startup failed (continuing without MCP): {e}")
+            mcp_manager = None
+    app.state.mcp_manager = mcp_manager
 
     # First-run gate: skip create_agent when essential LLM config is
     # missing. ``make_llm()`` calls ``ChatOpenAI(api_key=...)`` which
@@ -123,7 +158,7 @@ async def lifespan(app: FastAPI):
         app.state.agents = None
         app.state.checkpointer = None
     else:
-        agents = await create_agent(registry)
+        agents = await create_agent(registry, mcp_manager=mcp_manager)
         app.state.agents = agents
         app.state.checkpointer = agents.get("checkpointer")
 
@@ -153,6 +188,20 @@ async def lifespan(app: FastAPI):
 
     # --- Shutdown ---
     logger.info("Graceful shutdown initiated...")
+
+    # Stop hot-reload watchers FIRST — before drain — so a SKILL.md /
+    # knowledge .md edit happening during the drain window can't fire
+    # a registry reload while an in-flight task is still using it.
+    # Each stop is guarded: a failed stop must not block the rest of
+    # shutdown.
+    for attr in ("skill_watcher", "knowledge_watcher"):
+        w = getattr(app.state, attr, None)
+        if w is not None:
+            try:
+                w.stop()
+            except Exception as e:
+                logger.warning(f"Failed to stop {attr}: {e}")
+
     await task_tracker.drain()
 
     # Finalize any TUI sessions that didn't get a clean DELETE — a TS
@@ -214,6 +263,21 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Failed to close catalog LLM client: {e}")
 
+    # Flush and shutdown OTel GenAI export (no-op if not initialized)
+    try:
+        from chaos_agent.observability.otel_genai import shutdown_otel_genai
+        shutdown_otel_genai()
+    except Exception as e:
+        logger.warning(f"OTel GenAI shutdown failed: {e}")
+
+    # E9 — disconnect MCP clients + reap stdio child processes
+    _mcp = getattr(app.state, "mcp_manager", None)
+    if _mcp is not None:
+        try:
+            await _mcp.disconnect_all()
+        except Exception as e:
+            logger.warning(f"MCP disconnect failed: {e}")
+
     # Close TaskStore backend
     try:
         from chaos_agent.persistence.task_store import reset_task_store
@@ -246,6 +310,7 @@ def create_app() -> FastAPI:
     app.include_router(inject_router)
     app.include_router(recover_router)
     app.include_router(metric_router)
+    app.include_router(prometheus_router)
     app.include_router(skills_router)
     app.include_router(confirm_router)
     app.include_router(sessions_router)

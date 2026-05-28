@@ -193,6 +193,7 @@ _trackers: dict[str, StatusTracker] = {}
 
 # Shared tracing callback reference (set by factory.py during init)
 _tracing_callback = None
+_otel_callback = None
 
 
 def get_tracker(task_id: str) -> StatusTracker:
@@ -236,6 +237,8 @@ async def track_status(task_id: str, source: str, message: str, category: str = 
     # Set the tracing callback's current task_id so LLM calls are attributed correctly
     if _tracing_callback is not None:
         _tracing_callback.set_task_id(task_id)
+    if _otel_callback is not None:
+        _otel_callback.set_task_id(task_id)
 
     # Create a tracer span for this node execution
     from chaos_agent.observability.tracer import get_trace

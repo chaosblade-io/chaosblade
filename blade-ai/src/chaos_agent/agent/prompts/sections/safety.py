@@ -16,7 +16,6 @@ def get_safety_section(level: str = "full") -> str:
     hard_rules = """## Safety Rules
 
 ### Hard Rules (NEVER violate)
-- NEVER inject faults into kube-system or kube-public namespaces
 - NEVER proceed when safety_check returns a violation
 - NEVER attempt to bypass namespace blacklist
 - NEVER inject without verifying the target exists first
@@ -46,7 +45,7 @@ def get_safety_section(level: str = "full") -> str:
 - Verify side effects after each destructive action
 - If unsure about safety, mark as warning and request confirmation
 - Prefer test/dev namespaces over production when the user doesn't specify
-- For network faults (pod-network loss/delay), prefer port-specific parameters (--local-port, --remote-port, --destination-ip) to minimize blast radius. Only use full-interface injection (--percent 100 without port filter) when the intent is to test complete network partition
+- For network faults (pod-network drop), prefer port-specific parameters (--local-port, --remote-port, --destination-ip) to minimize blast radius. Only use full-interface injection (--percent 100 without port filter) when the intent is to test complete network partition
 - Timeout values should balance observability and safety: too short (< 30s) and the fault may not become observable before auto-recovery; too long (> 600s) increases residual damage risk. Consider: metrics-server sampling interval (15-30s), time needed for Layer 2 verification, and blast radius — larger scope = shorter timeout
 
 ### Blast Radius Assessment Framework

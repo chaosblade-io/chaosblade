@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 # ── ChaosBlade command pattern ──
 # Format: blade create k8s <scope>-<target> <action>
-# Examples: pod-disk burn, node-cpu fullload, pod-network loss
+# Examples: pod-disk burn, node-cpu fullload, pod-network drop
 _CB_SCOPE_TARGET_ACTION_RE = re.compile(
     r'(?:blade\s+create\s+k8s\s+)?'
     r'(?P<scope>pod|node|container)-(?P<target>\w+)\s+(?P<action>\w+)',
@@ -154,6 +154,30 @@ async def extract_planning_metadata(state: AgentState) -> dict:
                 "extract_planning_metadata: extracted skill_case_content "
                 "from messages (%d chars)", len(skill_case),
             )
+
+    # 1b. Guard: reject planning if no catalogue use-case was loaded.
+    # Only enforce when messages exist (agent_loop has run). Empty messages
+    # means direct_setup path or test — no guard needed.
+    has_case = bool(
+        result.get("skill_case_content") or state.get("skill_case_content")
+    )
+    if messages and not has_case:
+        from langchain_core.messages import SystemMessage
+        logger.warning(
+            "extract_planning_metadata: no catalogue use-case loaded, "
+            "rejecting planning and routing back to agent_loop",
+        )
+        result["planning_rejected"] = True
+        result["messages"] = [SystemMessage(content=(
+            "[PLANNING REJECTED] No catalogue use-case was loaded during planning.\n\n"
+            "You must either:\n"
+            "  1. Follow the skill discovery flow described in SKILL.md: "
+            "use read_skill_resource to browse the catalogue directory, "
+            "locate a matching use-case file, and load its full content.\n"
+            "  2. Or inform the user: this fault scenario is not currently supported.\n\n"
+            "Do NOT proceed with a plan based solely on general command references."
+        ))]
+        return result
 
     # 2. fault_spec scope/blade_target/blade_action derivation.
     #

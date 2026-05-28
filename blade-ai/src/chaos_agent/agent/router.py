@@ -41,10 +41,10 @@ def mark_wall_clock_timeout(state: AgentState, result: dict) -> dict:
 
     Each LLM-loop node (``agent_loop``, ``execute_loop``, ``verifier``,
     ``recover_verifier``) calls this just before returning. If the
-    wall-clock budget is exceeded, write ``error`` + ``failure_reason``
+    wall-clock budget is exceeded, write ``error`` + ``failure_detail``
     so the eventual result envelope says **why** it ended.
 
-    Idempotent: existing ``error`` / ``failure_reason`` values win
+    Idempotent: existing ``error`` / ``failure_detail`` values win
     (an LLM-detected error is more specific than "we ran out of
     time"). Returns ``result`` unchanged for direct chaining.
     """
@@ -54,12 +54,12 @@ def mark_wall_clock_timeout(state: AgentState, result: dict) -> dict:
     if not result.get("error"):
         budget = int(settings.max_inject_seconds or 0)
         result["error"] = f"wall-clock timeout ({budget}s)"
-    if not result.get("failure_reason"):
-        # Late import to avoid module-load circularity (errors imports
-        # nothing from agent, but agent.router is imported during
-        # graph build before errors module finishes loading).
-        from chaos_agent.errors import FailureReason
-        result["failure_reason"] = FailureReason.WALL_CLOCK_TIMEOUT.value
+    if not result.get("failure_detail"):
+        from chaos_agent.agent.state_helpers import fail_state
+        from chaos_agent.agent.verdict import FailureCategory
+        budget = int(settings.max_inject_seconds or 0)
+        _fs = fail_state(FailureCategory.WALL_CLOCK_TIMEOUT, f"budget={budget}s")
+        result.setdefault("failure_detail", _fs["failure_detail"])
     return result
 
 
@@ -115,17 +115,24 @@ def should_continue_agent_loop(state: AgentState) -> str:
     if state.get("safety_status") == "rejected":
         return "reject"
 
+    # Error set by agent_loop node (terminal conclusion detection)
+    if state.get("error"):
+        return "reject"
+
     # Check the last message for tool_calls (LLM ReAct pattern)
     messages = state.get("messages", [])
     if messages:
         last_msg = messages[-1]
         # If the last message has tool_calls, continue the ReAct loop
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+            for tc in last_msg.tool_calls:
+                tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                if tc_name == "finish_planning":
+                    return "extract_planning_metadata"
             return "continue"
         # If the last message is an AI message without tool_calls,
         # the LLM has finished its turn
         if hasattr(last_msg, "type") and last_msg.type == "ai":
-            content = getattr(last_msg, "content", "") or ""
             # If a skill was activated → planning complete, proceed to metadata extraction
             if state.get("skill_name"):
                 return "extract_planning_metadata"
@@ -190,14 +197,13 @@ def should_continue_execute_loop(state: AgentState) -> str:
         # If the last message is an AI message without tool_calls,
         # check whether execution actually succeeded before routing to verifier.
         if hasattr(last_msg, "type") and last_msg.type == "ai":
-            # Only route to verifier if injection succeeded (blade_uid present).
-            # Without blade_uid, the LLM may be proposing a correction plan
-            # or preparing alternative approaches — keep executing.
             if state.get("blade_uid"):
                 return "verifier"
-            # No blade_uid: continue the loop to give LLM more turns.
-            # Safety: max_loop guard at the top of this function prevents
-            # unbounded execution.
+            # Text-only without blade_uid: the execute_loop node's
+            # terminal-conclusion detection normally sets error (caught
+            # by the error check above → "end"). This "continue" is a
+            # fallback for edge cases (empty content, replan cleared
+            # the error, etc.).
             return "continue"
 
     return "continue"
@@ -383,15 +389,46 @@ def route_after_load_memory(state: AgentState) -> str:
 
     Returns:
         "direct_setup" - direct mode: skip LLM, go to deterministic setup
+        "plan_builder" - TUI /plan mode: guided plan construction
+        "safety_check" - /run after plan_builder (spec + skill_name ready)
         "intent_clarification" - TUI mode: go to intent recognition first
-        "agent_loop" - CLI mode: normal ReAct planning loop (skip intent_clarification)
+        "agent_loop" - CLI mode: normal ReAct planning loop
     """
     if state.get("direct", False):
         return "direct_setup"
+    # TUI /plan mode: guided plan construction
+    if state.get("dry_run") and state.get("interaction_mode") == "tui":
+        return "plan_builder"
+    # /run after plan_builder completed: skip directly to safety_check.
+    # plan_builder has already set skill_name (via activate_skill interception)
+    # and fault_spec (via submit_plan). All safety_check prerequisites met.
+    if (
+        not state.get("dry_run")
+        and state.get("interaction_mode") == "tui"
+        and _spec_ready_for_execute(state)
+    ):
+        return "safety_check"
     # TUI mode: route to intent_clarification for guided conversation
     if state.get("interaction_mode") == "tui":
         return "intent_clarification"
     return "agent_loop"
+
+
+def _spec_ready_for_execute(state: AgentState) -> bool:
+    """Check if plan_builder has completed and spec is ready for execution.
+
+    Requirements for safety_check:
+      - plan_confirmed: submit_plan was called successfully
+      - fault_spec.is_complete: scope/target/action/namespace all filled
+      - skill_name: activate_skill was called during plan building
+    """
+    if not state.get("plan_confirmed"):
+        return False
+    if not state.get("skill_name"):
+        return False
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    spec = read_fault_spec(state)
+    return spec is not None and getattr(spec, "is_complete", False)
 
 
 def route_after_intent_clarification(state: AgentState) -> str:
@@ -449,6 +486,21 @@ def should_continue_intent_clarification(state: AgentState) -> str:
 
     # No confirmed_intent and no tool_calls — LLM produced pure text.
     # Conversation turn is complete; graph ends, TUI waits for next input.
+    return END
+
+
+def should_continue_plan_builder(state: AgentState) -> str:
+    """Decide whether to continue the plan_builder ReAct loop.
+
+    Returns:
+        "continue" - has tool_calls (kubectl_ro etc.), go to plan_builder_tools
+        END        - pure text or submit_plan handled, graph done for this turn
+    """
+    messages = state.get("messages", [])
+    if messages:
+        last_msg = messages[-1]
+        if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+            return "continue"
     return END
 
 

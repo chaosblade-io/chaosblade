@@ -11,10 +11,13 @@ from chaos_agent.agent.nodes.agent_loop import make_agent_loop
 from chaos_agent.agent.nodes.baseline_capture import make_baseline_capture
 from chaos_agent.agent.nodes.confirmation_gate import confirmation_gate
 from chaos_agent.agent.nodes.direct_execute import direct_execute
+from chaos_agent.agent.nodes.se_snapshot import se_snapshot_node
+from chaos_agent.agent.nodes.se_detect import se_detect_node
 from chaos_agent.agent.nodes.direct_setup import make_direct_setup
 from chaos_agent.agent.nodes.execute_loop import make_execute_loop
 from chaos_agent.agent.nodes.extract_planning_metadata import extract_planning_metadata
 from chaos_agent.agent.nodes.intent_clarification import make_intent_clarification
+from chaos_agent.agent.nodes.plan_builder import make_plan_builder
 from chaos_agent.agent.nodes.intent_confirm import intent_confirm
 from chaos_agent.agent.nodes.memory_nodes import load_memory, save_memory
 from chaos_agent.agent.nodes.recover_handler import recover_handler
@@ -35,6 +38,7 @@ from chaos_agent.agent.router import (
     should_continue_execute_loop,
     should_continue_verifier,
     should_continue_recover_verifier,
+    should_continue_plan_builder,
     route_after_load_memory,
     route_after_safety,
     route_after_confirmation,
@@ -155,7 +159,7 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
     graph = StateGraph(AgentState)
 
     # Create loop nodes with hook and LLM injection
-    agent_loop_node = make_agent_loop(hook=pre_reason_hook, llm=llm, tools=phase1_tools, skill_catalog=skill_catalog)
+    agent_loop_node = make_agent_loop(hook=pre_reason_hook, llm=llm, tools=phase1_tools, skill_catalog=skill_catalog, registry=registry)
     execute_loop_node = make_execute_loop(hook=pre_reason_hook, llm=llm, tools=phase2_tools, skill_catalog=skill_catalog, env_info=None)
 
     # Build verifier with LLM support and verifier tools
@@ -170,11 +174,19 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
     # Intent clarification node (TUI mode only)
     intent_clarification_node = make_intent_clarification(llm=llm, tools=clarification_tools, hook=pre_reason_hook)
 
+    # Plan builder node (TUI /plan mode — guided plan construction)
+    plan_builder_node = make_plan_builder(llm=llm, tools=clarification_tools, hook=pre_reason_hook)
+
     # Add nodes (pipeline nodes wrapped with phase events for TUI stepper)
     graph.add_node("load_memory", load_memory)
     graph.add_node("intent_clarification", with_phase_events("intent_clarification", "intent", intent_clarification_node))
+    graph.add_node("plan_builder", with_phase_events("plan_builder", "intent", plan_builder_node))
     if clarification_tools:
         graph.add_node("clarification_tools", ToolNode(clarification_tools))
+        graph.add_node("plan_builder_tools", ToolNode(
+            clarification_tools,
+            handle_tool_errors=_phase1_handle_tool_error,
+        ))
     graph.add_node("agent_loop", with_phase_events("agent_loop", "inject", agent_loop_node))
     # phase1_screener sits between agent_loop and phase1_tools — the
     # planning-phase analog of the phase 2 tool_screener. Reuses the
@@ -195,6 +207,7 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
     graph.add_node("extract_planning_metadata", extract_planning_metadata)
     graph.add_node("direct_setup", direct_setup_node)
     graph.add_node("baseline_capture", with_phase_events("baseline_capture", "inject", baseline_capture_node))
+    graph.add_node("se_snapshot", se_snapshot_node)
     graph.add_node("safety_check", with_phase_events("safety_check", "safety", safety_check))
     graph.add_node("confirmation_gate", with_phase_events("confirmation_gate", "safety", confirmation_gate))
     graph.add_node("execute_loop", with_phase_events("execute_loop", "inject", execute_loop_node))
@@ -209,6 +222,7 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
     graph.add_node("verifier_loop", with_phase_events("verifier_loop", "verify", verifier_node))
     if verifier_tools:
         graph.add_node("verifier_tools", ToolNode(verifier_tools))
+    graph.add_node("se_detect", se_detect_node)
     graph.add_node("save_memory", save_memory)
     graph.add_node("reject", reject)
     graph.add_node("recover_handler", recover_handler)
@@ -227,11 +241,17 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
     # Set entry point
     graph.set_entry_point("load_memory")
 
-    # load_memory → conditional routing (direct_setup, intent_clarification, or agent_loop)
+    # load_memory → conditional routing
     graph.add_conditional_edges(
         "load_memory",
         route_after_load_memory,
-        {"agent_loop": "agent_loop", "direct_setup": "direct_setup", "intent_clarification": "intent_clarification"},
+        {
+            "agent_loop": "agent_loop",
+            "direct_setup": "direct_setup",
+            "intent_clarification": "intent_clarification",
+            "plan_builder": "plan_builder",
+            "safety_check": "safety_check",
+        },
     )
 
     # intent_clarification ⇄ clarification_tools (ReAct loop for TUI intent recognition)
@@ -261,6 +281,17 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
                 "intent_clarification": "intent_clarification",
             },
         )
+
+    # plan_builder ⇄ plan_builder_tools (ReAct loop for guided plan construction)
+    if clarification_tools:
+        graph.add_conditional_edges(
+            "plan_builder",
+            should_continue_plan_builder,
+            {"continue": "plan_builder_tools", END: END},
+        )
+        graph.add_edge("plan_builder_tools", "plan_builder")
+    else:
+        graph.add_edge("plan_builder", END)
 
     # intent_confirm → agent_loop (approved) or END (rejected/modified)
     graph.add_conditional_edges(
@@ -304,9 +335,14 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
     )
     graph.add_edge("phase1_tools", "agent_loop")
 
-    # extract_planning_metadata → safety_check
-    # (fills State gap for NL mode before baseline_capture)
-    graph.add_edge("extract_planning_metadata", "safety_check")
+    # extract_planning_metadata → safety_check OR agent_loop
+    # Guard: if no catalogue use-case was loaded, route back to agent_loop
+    # so the LLM can follow the discovery flow or inform the user.
+    graph.add_conditional_edges(
+        "extract_planning_metadata",
+        lambda s: "agent_loop" if s.get("planning_rejected") else "safety_check",
+        {"agent_loop": "agent_loop", "safety_check": "safety_check"},
+    )
 
     # safety_check → confirmation_gate or baseline_capture or reject
     # (execute_loop is no longer a direct destination from safety_check;
@@ -352,23 +388,27 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
         "tool_screener",
         route_after_screener,
         {
-            # All tool_calls cleared the guard → run them as usual.
+            # All tool_calls cleared the guard (or user approved drift
+            # via interrupt) → run them as usual.
             "pass": "phase2_tools",
-            # Target drift detected → re-plan from agent_loop (next
-            # confirmation_gate refreezes a fresh approval).
+            # Legacy edge retained for graph schema compat; screener no
+            # longer produces "replan" (drift uses interrupt instead).
             "replan": "agent_loop",
-            # Banned / unknown call → LLM retries with the rejection
-            # ToolMessages already appended by the screener.
+            # Banned / unknown call, or user rejected drift →
+            # LLM retries with fabricated rejection ToolMessages.
             "retry": "execute_loop",
         },
     )
     graph.add_edge("phase2_tools", "execute_loop")
 
-    # baseline_capture → conditional routing by execution mode
+    # baseline_capture → se_snapshot (side-effect pre-injection snapshot)
+    graph.add_edge("baseline_capture", "se_snapshot")
+
+    # se_snapshot → conditional routing by execution mode
     # direct mode → direct_execute (deterministic skill execution)
     # NL mode → execute_loop (LLM ReAct loop)
     graph.add_conditional_edges(
-        "baseline_capture",
+        "se_snapshot",
         route_after_baseline,
         {
             "direct_execute": "direct_execute",
@@ -393,13 +433,16 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
             should_continue_verifier,
             {
                 "continue": "verifier_tools",
-                "done": "save_memory",
+                "done": "se_detect",
             },
         )
         graph.add_edge("verifier_tools", "verifier_loop")
     else:
-        # No verifier tools: verifier_loop goes straight to save_memory
-        graph.add_edge("verifier_loop", "save_memory")
+        # No verifier tools: verifier_loop goes straight to se_detect
+        graph.add_edge("verifier_loop", "se_detect")
+
+    # se_detect → save_memory (side-effect post-injection detection)
+    graph.add_edge("se_detect", "save_memory")
 
     # save_memory → END
     graph.add_edge("save_memory", END)

@@ -96,11 +96,11 @@ async def blade_create(
     Inputs:
       - scope: "pod" | "container" | "node".
       - target: fault target — "cpu" | "memory" | "network" | "disk" | "process" | "pod".
-      - action: "fullload" | "delay" | "loss" | "fill" | "burn" | "kill" | "delete".
+      - action: "fullload" | "drop" | "dns" | "occupy" | "fill" | "burn" | "kill" | "delete".
       - namespace / names / labels / kubeconfig / evict_count / evict_percent: passthrough.
       - flags: scenario-specific CLI string. Examples:
           pod-cpu fullload    → "--cpu-percent 80"
-          pod-network delay   → "--time 3000 --offset 1000 --interface eth0"
+          pod-network drop    → "--interface eth0" (drops all packets, no --percent)
           node-disk fill      → "--path /tmp --size 1024"
         See knowledge resource `chaosblade-cli.md` for the full flag catalog.
 

@@ -9,6 +9,10 @@ metric_router = APIRouter(prefix="/api/v1", tags=["metric"])
 skills_router = APIRouter(prefix="/api/v1", tags=["skills"])
 confirm_router = APIRouter(prefix="/api/v1", tags=["confirm"])
 health_router = APIRouter(tags=["health"])
+# Prometheus scrape endpoint — convention is bare /metrics at root,
+# no /api/v1 prefix. Gated by settings.prometheus_enabled inside the
+# handler (returns 404 when disabled).
+prometheus_router = APIRouter(tags=["prometheus"])
 # Phase 3a: TS TUI control-plane endpoints. Each prefix is its own
 # router so the OpenAPI tags stay clean and the route file imports
 # stay one-purpose.

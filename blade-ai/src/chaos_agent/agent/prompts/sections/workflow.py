@@ -187,9 +187,18 @@ Your output contract this turn:
      containing the standard sections (Task Summary / Execution Steps /
      Expected Impact / Rollback and Recovery / Verification Methods). Pass
      the `task_id` from the user's conversation.
-6. **Emit a final summary text WITHOUT any tool_calls.** This is your output
-   contract — the system advances to Phase 2 the moment you stop calling
-   tools.
+5b. **Reject if warranted**: If the request violates safety red lines, has no
+    matching use-case in the catalogue, or the target is infeasible, call
+    `finish_planning(summary="<what you found>", rejected=True,
+    rejection_reason="<specific reason>")`. The system will end the run
+    cleanly without any cluster changes. Do NOT output a free-text refusal
+    without calling `finish_planning`.
+6. **End Phase 1** by calling `finish_planning`:
+   - `finish_planning(summary="...")` → proceed to safety check and execution.
+   - `finish_planning(summary="...", rejected=True, rejection_reason="...")` →
+     reject the request (the system ends cleanly).
+   This is your output contract. Do NOT end Phase 1 by emitting free text
+   without calling `finish_planning`.
 
 ### Available tools in Phase 1 (the only tools you have right now)
 
@@ -200,6 +209,7 @@ Read-only / planning tools — these are ALL you have:
 - `blade_status` — list existing experiments (read-only)
 - `save_fault_plan` — persist plan markdown (writes to local plan dir,
   does not touch the cluster)
+- `finish_planning` — signal end of Phase 1 (proceed or reject)
 
 NOT available in Phase 1 (intentional — runtime enforced):
 - `blade_create`, `blade_destroy` — mutate cluster state
@@ -213,14 +223,10 @@ full surface.
 
 ### What happens after step 6 (Phase 2 onward, for awareness)
 
-When you emit text without tool_calls, the framework runs:
-  `safety_check` → `confirmation_gate` (user approval) → `baseline_capture`
-  → `execute_loop` (a different LLM turn with `blade_create` / full
-  `kubectl` / `execute_skill_script` bound).
-
-If the user rejects at confirmation_gate, this run ends with no side
-effects — exactly because Phase 1 made no cluster changes. That guarantee
-is the whole point of the two-phase split.
+When you call `finish_planning`:
+- Normal: safety_check → confirmation_gate (user approval) → baseline_capture
+  → execute_loop (a different LLM turn with blade_create / full kubectl bound).
+- Rejected: the system routes to the reject node — no side effects, clean end.
 
 ### Anti-patterns (runtime will REJECT — do not waste turns trying)
 
@@ -232,8 +238,8 @@ is the whole point of the two-phase split.
 - Any `kubectl` subcommand outside the read subset above.
 
 Such calls return an `Error: phase1_readonly_violation` ToolMessage and
-waste your turn. The fast path is always: finish reading, write your
-plan summary, stop calling tools."""
+waste your turn. The fast path is always: finish reading, then call
+`finish_planning`."""
 
 
 def get_nl_mode_section() -> str:
@@ -278,15 +284,34 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
 
     parts.extend([
         "\n### Replan Instructions",
-        "1. Use kubectl(subcommand=\"get\"/\"describe\") to re-verify the target",
+        "1. Re-verify the target using available tools (kubectl, blade_status, etc.)",
         "2. Use read_skill_resource to re-read the skill for correct parameters",
-        "3. Generate a CORRECTED plan — do NOT repeat the same approach that failed",
-        "4. When ready, output a summary. The system will route to safety check before execution.",
+        "3. **Runtime overrides documentation**: If the error indicates a rejected "
+        "parameter/command/syntax, do NOT include it in your corrected plan. "
+        "Plan a verification step first: run the tool's help/usage command "
+        "to discover its actual interface before calling it.",
+        "4. Generate a CORRECTED plan — do NOT repeat the same approach that failed",
+        "5. When ready, output a summary. The system will route to safety check before execution.",
     ])
 
+    # Inject rejected params prohibition
+    rejected = replan_context.get("rejected_params", [])
+    if rejected:
+        parts.append("\n### REJECTED PARAMETERS — DO NOT USE")
+        parts.append(f"The tool rejected: {', '.join(f'`{p}`' for p in rejected)}")
+        parts.append("These do NOT exist in the current tool version.")
+        parts.append("Your corrected plan MUST NOT include any of them.")
+
+    # Inject tool-specific verification suggestions
+    ctx_failed_tools = replan_context.get("failed_tool_names", [])
+    if ctx_failed_tools:
+        from chaos_agent.agent.nodes.react_helpers import suggest_verify_command
+        parts.append("\n### VERIFY BEFORE RETRY")
+        for t in ctx_failed_tools:
+            parts.append(f"- `{t}`: {suggest_verify_command(t)}")
+
     # Add alternative injection approaches when blade_create failed
-    failed_tool_names = [fc.get("name", "") for fc in (replan_context.get("failed_tool_calls", []) or [])]
-    blade_create_failed = "blade_create" in failed_tool_names
+    blade_create_failed = "blade_create" in (ctx_failed_tools or [])
     if blade_create_failed:
         parts.extend([
             "",

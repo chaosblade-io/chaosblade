@@ -136,7 +136,11 @@ def target_drift_guard(
         )
 
     # ---- 5. Namespace check (cluster-scoped kinds exempt) ---------------
-    if effective_scope not in CLUSTER_SCOPED_KINDS:
+    # Tier 1 injection (kubectl exec into tool pod → blade create)
+    # legitimately omits --namespace when blade v1.8.0 rejects it.
+    # The actual target is identified by --names/--labels; the guard's
+    # step 6 (resource selection) validates identity.
+    if effective_scope not in CLUSTER_SCOPED_KINDS and not effective.is_tier1_exec:
         approved_ns = (approved.namespace or "default").strip()
         effective_ns = (effective.namespace or "default").strip()
         if approved_ns != effective_ns:

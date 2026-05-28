@@ -72,7 +72,7 @@ def get_intent_critical_rules_section() -> str:
 
 3. **classify_intent is ONLY for recover/chat routing** — Do NOT use classify_intent
    for cluster queries ("集群健康吗") or capability questions ("你能做什么").
-   Answer those directly using kubectl or read_skill_resource.
+   Answer those directly using kubectl_ro or read_skill_resource.
 
 4. **NEVER submit targeting protected namespaces** — kube-system and kube-public
    are protected. If the user requests injection into these namespaces, explain
@@ -91,7 +91,7 @@ def get_intent_safety_section() -> str:
     """
     return """## Safety (Intent Clarification Phase)
 
-- ALWAYS verify the target exists with kubectl(subcommand="get"/"describe")
+- ALWAYS verify the target exists with kubectl_ro(subcommand="get"/"describe")
   before submitting submit_fault_intent — prevents injecting into
   non-existent resources
 - When uncertain about target validity or parameter correctness, continue
@@ -123,11 +123,15 @@ and fault detail convergence.
 
 ### Intent Routing
 When the user explicitly expresses these intents, call classify_intent:
-- Recover/undo experiment → classify_intent(intent="recover")
 - Goodbye/no need → classify_intent(intent="chat")
+- Recover/undo experiment:
+  1. Call query_active_experiments to get the list of recoverable experiments.
+  2. Present results to user — ask which one to recover.
+  3. User confirms → classify_intent(intent="recover", recover_task_id="task-xxx")
+  4. Do NOT call classify_intent("recover") without a confirmed recover_task_id.
 
 ### Cluster Query / Capability Introduction — Answer directly, do NOT route
-- "集群健康吗" / "有哪些 pod" / "当前实验状态" → use kubectl(subcommand="get"/"describe")
+- "集群健康吗" / "有哪些 pod" / "当前实验状态" → use kubectl_ro(subcommand="get"/"describe")
   directly, then report real results in content field. Do NOT call classify_intent.
 - "你能做什么" / "有哪些故障类型" / "怎么用" → use read_skill_resource to browse
   catalog or chaos_types entries, then introduce in content field.
@@ -147,7 +151,7 @@ When the user expresses intent to inject a fault (even vaguely), enter convergen
 
 ### Collection Steps
 1. Collect step by step: fault type → target scope → namespace → resource
-2. Use kubectl(subcommand="get"/"describe") to verify target exists
+2. Use kubectl_ro(subcommand="get"/"describe") to verify target exists
 3. Use read_skill_resource to browse available fault types and skill directory
 4. Ask for missing information in content field (one question at a time)
 5. When sufficient information is collected, call submit_fault_intent
@@ -224,11 +228,11 @@ def get_intent_tools_section() -> str:
       names=["cn-hongkong.10.0.1.101"],
       params={"percent": "80", "timeout": "600"})
     submit_fault_intent(
-      fault_type="pod-network-loss", scope="pod", target="network",
-      action="loss", namespace="cms-demo",
+      fault_type="pod-network-drop", scope="pod", target="network",
+      action="drop", namespace="cms-demo",
       labels={"app": "nginx"},
-      params={"percent": "30", "interface": "eth0"},
-      user_description="给 nginx 注入 30% 丢包")
+      params={"interface": "eth0", "local-port": "8080"},
+      user_description="给 nginx 注入网络丢包")
     submit_fault_intent(
       fault_type="pod-process-kill", scope="pod", target="process",
       action="kill", namespace="cms-demo",
@@ -239,10 +243,14 @@ def get_intent_tools_section() -> str:
       action="fill", namespace="default",
       names=["cn-hongkong.10.0.1.101"],
       params={"path": "/data", "size": "5000"})
-- `kubectl` (subcommand="get"/"describe"): Verify target existence AND answer
-  cluster queries
+- `kubectl_ro` (subcommand="get"/"describe"): Verify target existence AND answer
+  cluster queries (read-only — mutation subcommands like scale/delete/patch are
+  rejected at the schema level)
 - `activate_skill` / `read_skill_resource`: Browse fault types and skill
   directory for capability questions and convergence support
+- `query_active_experiments`: Query recoverable (active) fault experiments.
+  Call this when the user wants to recover/undo a fault. Use the returned
+  task_id in classify_intent(intent="recover", recover_task_id="...")
 
 ### Tools NOT Available (Do NOT call these)
 - `blade_create`, `blade_destroy`, `blade_status`, `blade_query_k8s` —

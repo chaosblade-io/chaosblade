@@ -65,7 +65,7 @@ class TaskStore:
         4. Sets ``gmt_create`` (preserved on update) / ``gmt_modified``.
         5. Splits merged fields into tasks + task_details and writes both.
         """
-        if not task_id:
+        if not task_id or task_id.startswith("turn-"):
             return
 
         # 1. Read current tasks row
@@ -449,6 +449,31 @@ class TaskStore:
             if scope and target_action and action:
                 return f"{scope}-{target_action}-{action}"
         return task.get("skill_name", "")
+
+    # -- sessions ------------------------------------------------------------
+
+    _SESSION_COLUMNS: list[str] = [
+        "session_id", "status", "cluster_name", "namespace",
+        "started_at", "finished_at", "gmt_create", "gmt_modified",
+    ]
+
+    async def record_session(self, session_id: str, **fields: object) -> None:
+        """Insert or update a session record."""
+        if not session_id:
+            return
+        existing = await self._backend.select_session(session_id)
+        merged: dict = dict(existing) if existing else {"session_id": session_id}
+        merged.update(fields)
+        merged["session_id"] = session_id
+        _set_timestamps(merged, existing)
+
+        cols = [c for c in self._SESSION_COLUMNS if c in merged]
+        vals = [merged[c] for c in cols]
+        await self._backend.upsert_session(session_id, cols, vals)
+
+    async def list_sessions(self, status: str = "", limit: int = 50, offset: int = 0) -> list[dict]:
+        """Return sessions ordered by gmt_create DESC."""
+        return await self._backend.select_sessions_ordered(limit, offset, status=status)
 
 
 # ---------------------------------------------------------------------------

@@ -12,8 +12,11 @@ from chaos_agent.agent.nodes._kubeconfig_inject import (
 )
 from chaos_agent.agent.nodes._store_sync import sync_to_store
 from chaos_agent.agent.nodes.react_helpers import (
+    detect_action_stagnation,
     detect_repeated_tool_calls,
+    detect_tool_error_hint,
     emit_debug_tool_messages,
+    extract_rejected_params,
     extract_tool_call_fields,
     log_reasoning_content,
     record_ai_message,
@@ -23,12 +26,14 @@ from chaos_agent.agent.nodes.react_helpers import (
 from chaos_agent.agent.prompts import REPLAN_MARKER
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
-from chaos_agent.errors import FailureReason, enrich_failure_reason
+from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
 from chaos_agent.utils.blade_uid import extract_blade_uid
+from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -107,7 +112,7 @@ def _extract_blade_uid_from_messages(messages: list) -> str | None:
 
 
 # Regex for: blade create k8s <scope>-<target> <action>
-# e.g. "blade create k8s pod-network loss --percent 100 ..."
+# e.g. "blade create k8s pod-network drop --percent 100 ..."
 _BLADE_CREATE_K8S_RE = re.compile(
     r"blade\s+create\s+k8s\s+(\w+)-(\w+)\s+(\w+)"
 )
@@ -152,15 +157,27 @@ def _build_replan_context(state: AgentState, error_summary: str) -> dict:
                 except (json.JSONDecodeError, TypeError):
                     if "error" in content.lower() or "fail" in content.lower():
                         failed_calls.append({"name": name, "error": content[:500]})
+            elif content.startswith("Error"):
+                failed_calls.append({"name": name, "error": content[:500]})
 
-            if len(failed_calls) >= 3:
+            if len(failed_calls) >= 5:
                 break
+
+    # Extract rejected params from all error sources
+    all_rejected: list[str] = extract_rejected_params(error_summary)
+    failed_tool_names: set[str] = set()
+    for fc in failed_calls:
+        all_rejected.extend(extract_rejected_params(fc.get("error", "")))
+        if fc.get("name"):
+            failed_tool_names.add(fc["name"])
 
     return {
         "error_summary": error_summary.replace(REPLAN_MARKER, "").strip()[:1000],
         "failed_tool_calls": failed_calls,
         "existing_blade_uids": existing_uids,
         "iteration_at_failure": state.get("execute_loop_count", 0),
+        "rejected_params": list(dict.fromkeys(all_rejected)),
+        "failed_tool_names": sorted(failed_tool_names),
     }
 
 
@@ -241,6 +258,11 @@ def _detect_consecutive_idle_turns(
     tool_calls, the LLM is likely stuck in a "can't execute" loop and should
     either try a new tool or make a definitive conclusion.
 
+    Early-exit on duplication: if just 2 consecutive idle AI messages have
+    substantially similar content (first 50 chars match), the hint fires
+    immediately — prevents the user from seeing the same text 3× before
+    intervention.
+
     The hint adapts to ``replan_exhausted``: when ``replan_count >=
     max_replan_count`` the system can no longer route ``[REPLAN]`` back
     to Phase 1, so suggesting it would invite an infinite loop where
@@ -260,17 +282,31 @@ def _detect_consecutive_idle_turns(
             if len(recent_ai) >= threshold:
                 break
 
-    if len(recent_ai) < threshold:
-        return None
+    # Early-exit on content duplication: if the last 2 AI messages are
+    # both text-only AND have substantially similar content (first 50
+    # chars match), fire the hint immediately — prevents the user from
+    # seeing the same output repeated before the count-based threshold.
+    content_dup = False
+    if len(recent_ai) >= 2:
+        m0, m1 = recent_ai[0], recent_ai[1]
+        idle0 = not (hasattr(m0, "tool_calls") and m0.tool_calls)
+        idle1 = not (hasattr(m1, "tool_calls") and m1.tool_calls)
+        if idle0 and idle1:
+            c0 = (getattr(m0, "content", "") or "").strip()
+            c1 = (getattr(m1, "content", "") or "").strip()
+            if c0 and c1 and c0[:50] == c1[:50]:
+                content_dup = True
 
-    # Check if ALL recent AI messages have no tool_calls
-    all_idle = all(
-        not (hasattr(m, "tool_calls") and m.tool_calls)
-        for m in recent_ai
-    )
-
-    if not all_idle:
-        return None
+    if not content_dup:
+        # Original path: need threshold consecutive idle turns
+        if len(recent_ai) < threshold:
+            return None
+        all_idle = all(
+            not (hasattr(m, "tool_calls") and m.tool_calls)
+            for m in recent_ai
+        )
+        if not all_idle:
+            return None
 
     if replan_exhausted:
         return (
@@ -364,10 +400,10 @@ async def execute_loop(state: AgentState) -> dict:
             f"{task_id}"
         )
         tracker.fail(f"Execute loop exceeded max iterations ({MAX_EXECUTE_LOOP})")
-        return {
-            "error": f"Execute loop exceeded max iterations ({MAX_EXECUTE_LOOP})",
-            "failure_reason": f"{FailureReason.EXECUTION_TIMEOUT.value}: Execute loop exceeded max iterations ({MAX_EXECUTE_LOOP})",
-        }
+        return fail_state(
+            FailureCategory.EXECUTION_TIMEOUT,
+            f"max_iterations={MAX_EXECUTE_LOOP}",
+        )
 
     tracker.complete(f"Execute loop iteration {count} done")
     return {"execute_loop_count": count}
@@ -404,11 +440,11 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 f"{task_id}"
             )
             tracker.fail(f"Execute loop exceeded max iterations ({MAX_EXECUTE_LOOP})")
-            base = f"{FailureReason.EXECUTION_TIMEOUT.value}: Execute loop exceeded max iterations ({MAX_EXECUTE_LOOP})"
-            result = {
-                "error": f"Execute loop exceeded max iterations ({MAX_EXECUTE_LOOP})",
-                "failure_reason": enrich_failure_reason(base, state.get("messages", [])),
-            }
+            result = fail_state(
+                FailureCategory.EXECUTION_TIMEOUT,
+                f"max_iterations={MAX_EXECUTE_LOOP}",
+                state.get("messages", []),
+            )
             await sync_to_store(state, result)
             return result
 
@@ -443,13 +479,6 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             and not state.get("blade_uid")
         )
         if zombie_replan:
-            base = (
-                f"{FailureReason.REPLAN_EXHAUSTED.value}: "
-                f"Replan cap reached at {state.get('replan_count', 0)} "
-                f"and the LLM cannot make further progress; terminating "
-                f"the turn so the router can take the ``state.error`` "
-                f"end-branch."
-            )
             stuck_error = (
                 f"Replan exhausted after {state.get('replan_count', 0)} "
                 f"attempt(s); no further injection paths available."
@@ -463,9 +492,10 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             )
             tracker.fail(stuck_error)
             result = {
-                "error": stuck_error,
-                "failure_reason": enrich_failure_reason(
-                    base, state.get("messages", [])
+                **fail_state(
+                    FailureCategory.REPLAN_EXHAUSTED,
+                    f"attempts={state.get('replan_count', 0)}",
+                    state.get("messages", []),
                 ),
                 "replan_requested": False,
                 "execute_loop_count": count,
@@ -489,6 +519,26 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             loop_hint = detect_repeated_tool_calls(messages)
             if loop_hint:
                 messages.append(HumanMessage(content=loop_hint))
+
+            # --- Action stagnation detection (tool-name level, ignores args) ---
+            stagnation_hint, stagnant_tool = detect_action_stagnation(messages)
+            if stagnation_hint:
+                exec_hint = (
+                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
+                    f"multiple consecutive times with no progress. "
+                    f"This tool has been temporarily removed. You MUST now either:\n"
+                    f"- Use a DIFFERENT tool to achieve the injection goal.\n"
+                    f"- Output your conclusion if injection already succeeded "
+                    f"(include blade_uid if available).\n"
+                    f"- Output [REPLAN] if the current approach is not working.\n"
+                    f"Do NOT attempt to call `{stagnant_tool}` again."
+                )
+                messages.append(HumanMessage(content=exec_hint))
+
+            # --- Tool error introspection (runtime feedback > static docs) ---
+            error_hint = detect_tool_error_hint(messages)
+            if error_hint:
+                messages.append(HumanMessage(content=error_hint))
 
             # --- Consecutive idle turn detection (text-only loop breaking) ---
             #
@@ -595,7 +645,13 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             if count >= MAX_EXECUTE_LOOP:
                 llm_to_call = llm
             else:
-                llm_to_call = llm.bind_tools(tools) if tools else llm
+                tools_this_iter = list(tools) if tools else []
+                if stagnant_tool:
+                    tools_this_iter = [
+                        t for t in tools_this_iter
+                        if getattr(t, "name", "") != stagnant_tool
+                    ]
+                llm_to_call = llm.bind_tools(tools_this_iter) if tools_this_iter else llm
 
             # Record system prompt to session store (dedup handles repeated prompts)
             record_system_prompt(hook, state, execute_prompt)
@@ -615,6 +671,9 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         if blade_uid and blade_uid != state.get("blade_uid"):
             result["blade_uid"] = blade_uid
             logger.info(f"Extracted blade_uid from ToolMessage: {blade_uid}")
+            if not state.get("injection_start_time"):
+                result["injection_start_time"] = now_iso()
+                logger.info("Set injection_start_time (blade_uid first seen)")
 
         # Detect injection method for verifier Layer 1 strategy selection
         current_injection_method = state.get("injection_method")
@@ -808,19 +867,42 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result, hook_updates)
 
+        # --- Terminal conclusion detection ---
+        # In Phase 2, the LLM has tools bound. Text-only output (no
+        # tool_calls) means the LLM has concluded — it either cannot
+        # inject or is summarizing a result. If no blade_uid exists,
+        # the injection didn't happen; mark as failure so the router's
+        # existing error-branch ends the loop. Without this, the router
+        # returns "continue" and the LLM repeats the same conclusion.
+        # Skip when content contains [REPLAN] — the replan logic below
+        # handles that path with proper state transitions.
+        if response is not None:
+            _has_tool_calls = bool(getattr(response, "tool_calls", None))
+            _has_uid = bool(result.get("blade_uid") or state.get("blade_uid"))
+            _resp_content = (getattr(response, "content", "") or "").strip()
+            if (
+                not _has_tool_calls
+                and not _has_uid
+                and not result.get("error")
+                and _resp_content
+                and REPLAN_MARKER not in _resp_content
+            ):
+                result.update(fail_state(
+                    FailureCategory.EXECUTION_FAILED,
+                    "LLM concluded without tool use",
+                    state.get("messages", []) + result.get("messages", []),
+                ))
+
         # --- Last-iteration failure attribution ---
         if count >= MAX_EXECUTE_LOOP:
             existing_uid = result.get("blade_uid") or state.get("blade_uid")
             if not existing_uid:
-                base = (
-                    f"{FailureReason.EXECUTION_TIMEOUT.value}: "
-                    f"Execute loop reached max iterations ({MAX_EXECUTE_LOOP}) "
-                    f"without successful injection"
+                _fs = fail_state(
+                    FailureCategory.EXECUTION_TIMEOUT,
+                    f"max_iterations={MAX_EXECUTE_LOOP}",
+                    state.get("messages", []) + result.get("messages", []),
                 )
-                result["error"] = f"Execute loop reached max iterations ({MAX_EXECUTE_LOOP})"
-                result["failure_reason"] = enrich_failure_reason(
-                    base, state.get("messages", []) + result.get("messages", [])
-                )
+                result.update(_fs)
 
         # --- Replan detection ---
         replan_requested = False
@@ -928,21 +1010,12 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 # execute_loop_count (let the loop-budget guard work
                 # too) and do NOT clear blade_uid (any existing
                 # injection still needs the recover path to find it).
-                base = (
-                    f"{FailureReason.REPLAN_EXHAUSTED.value}: "
-                    f"LLM requested replan after {current_replan_count} "
-                    f"attempt(s) but max_replan_count "
-                    f"({_max_replan}) reached. Last error: "
-                    f"{(replan_context or {}).get('error_summary', '')[:300]}"
+                _fs = fail_state(
+                    FailureCategory.REPLAN_EXHAUSTED,
+                    f"attempts={current_replan_count}, last_error={(replan_context or {}).get('error_summary', '')[:200]}",
+                    state.get("messages", []) + result.get("messages", []),
                 )
-                result["error"] = (
-                    f"Replan exhausted after {current_replan_count} "
-                    f"attempt(s); last LLM request: "
-                    f"{(replan_context or {}).get('error_summary', '')[:200]}"
-                )
-                result["failure_reason"] = enrich_failure_reason(
-                    base, state.get("messages", []) + result.get("messages", [])
-                )
+                result.update(_fs)
                 # Drop replan_requested so a leftover True from a
                 # prior iteration can't keep the router circling.
                 result["replan_requested"] = False

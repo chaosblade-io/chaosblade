@@ -427,12 +427,17 @@ export const zh: Dict = {
   "result.label.target": "目标",
   "result.label.attempts": "尝试次数",
   "result.label.side_effect_item": "副作用",
+  "result.side_effects_none": "未检测到连带影响",
   "result.attempts.label": "成功（自动重规划 {n} 次后）",
   "result.status.success": "故障注入成功",
   "result.status.partial": "部分恢复",
   "result.status.failed": "故障注入失败",
   "result.status.unknown": "结果",
   "result.show_for_timeline": "/replay {id} instant 查看完整时间线",
+
+  // -- Postmortem (T6) ---------------------------------------------
+  "postmortem.title": "事后分析",
+  "postmortem.saved_at": "完整 markdown: {path}",
 
   // -- ConfirmMessage chrome ----------------------------------------
   "confirm.title": "确认意图",
@@ -451,6 +456,11 @@ export const zh: Dict = {
   "confirm.execution.title": "确认执行计划",
   "confirm.execution.proceed": "开始注入",
   "confirm.execution.cancel": "取消",
+  "confirm.targetChange.title": "目标变更确认",
+  "confirm.targetChange.original": "原始目标",
+  "confirm.targetChange.proposed": "Agent 提议目标",
+  "confirm.targetChange.approve": "批准变更",
+  "confirm.targetChange.reject": "拒绝",
 
   // -- ConfirmMessage 字段标签 --------------------------------------
   "confirm.field.fault_type": "故障类型",
@@ -488,12 +498,32 @@ export const zh: Dict = {
   "confirm.section.target_health": "目标健康",
   "confirm.section.conflicts": "冲突实验",
   "confirm.section.audit_trail": "决策溯源",
+  "confirm.section.safety_score": "风险评分",
+  // E10 — 多维度风险评分面板
+  "safety_score.overall": "总分",
+  "safety_score.blast_radius": "影响面",
+  "safety_score.frequency": "重复度",
+  "safety_score.time": "时段",
+  "safety_score.topology": "拓扑",
+  "safety_score.level.low": "低",
+  "safety_score.level.medium": "中",
+  "safety_score.level.high": "高",
+  "safety_score.level.critical": "严重",
   // -- v3 额外字段标签
   "confirm.field.attempt": "尝试次数",
   "confirm.field.plan_path": "计划文件",
   "confirm.field.clarification_round": "澄清轮次",
   "confirm.field.intent_reasoning": "意图推理",
   "confirm.field.health_summary": "健康摘要",
+  // 故障分类一行——把 L1 已识别的 fault_type + (scope/target/action)
+  // 显式呈现，避免运维要靠 params 反推。"故障" 这个 label 与
+  // confirm.field.fault_type（位于 L1 卡片，仅显示主类型）刻意区分：
+  // 这里给的是完整三维语义，L1 那个只是类型本身。
+  "confirm.field.fault": "故障",
+  // 复杂任务标记——is_complex=true 时显示，避免 simple plan 出现
+  // 冗余 "简单任务" 字样。颜色用 warn 提醒用户这是带正式计划文件的注入。
+  "confirm.field.complexity": "复杂度",
+  "confirm.complexity.complex": "复杂任务（已生成正式计划）",
   "confirm.attempt.label": "第 {n} 次尝试",
   "confirm.clarification.label": "已澄清 {n} 轮",
   "confirm.plan_saved": "已保存（{path}）· /show plan 查看",
@@ -505,6 +535,9 @@ export const zh: Dict = {
   "confirm.params.none": "—",
   "confirm.health.all_clear": "目标无异常",
   "confirm.health.not_run": "未执行检查",
+  "confirm.field.feasibility": "可行性",
+  "confirm.feasibility.all_clear": "注入可行",
+  "confirm.feasibility.not_run": "未执行检查",
   "confirm.intent.low_conf_audit": "为何识别为此意图：",
 
   // -- Forge × Operator 重设计：banner + headline + answered chip --
@@ -548,6 +581,11 @@ export const zh: Dict = {
 
   // -- ConfirmMessage 选项标签 -------------------------------------
   "confirm.option.feedback": "告诉 agent 别的话…",
+
+  // -- ConfirmMessage Plan Builder --------------------------------
+  "confirm.plan_builder.title": "方案引导",
+  "confirm.plan_builder.default_question": "请选择一项",
+  "confirm.plan_builder.free_input": "自由输入",
 
   // -- SlashMenu 提示 -----------------------------------------------
   "slash.menu.hint": "↑↓ 选择 · Enter/Tab 应用 · Esc 取消",

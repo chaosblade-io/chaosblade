@@ -11,10 +11,11 @@ AIMessage:
   3. Aggregate verdicts and choose one of three routes:
 
      - ``pass``  — all calls allowed; ToolNode executes normally.
-     - ``replan`` — at least one call drifted; clear the approval,
-                    set replan_requested + replan_context, and route
-                    back to ``agent_loop`` so a fresh plan can be
-                    user-approved.
+     - ``interrupt`` — at least one call drifted; pause graph via
+                       interrupt() for human confirmation. Approve
+                       corrects fault_spec + approved_target and passes;
+                       reject retries (LLM gets one chance to
+                       self-correct before hard termination).
      - ``retry`` — at least one call was BANNED/UNKNOWN; fabricate
                    ToolMessage rejections so the LLM sees the failure
                    and tries again next iteration. Route back to
@@ -44,17 +45,21 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from chaos_agent.agent.attempt_tracker import (
-    REASON_LLM_TARGET_SWITCH,
-    begin_attempt,
-)
+from langgraph.types import interrupt
+
+from chaos_agent.agent.fault_spec import read_fault_spec
 from chaos_agent.agent.state import AgentState
+from chaos_agent.agent.state_helpers import fail_state
 from chaos_agent.agent.target_guard import (
+    ApprovedTarget,
+    EffectiveTarget,
     GuardVerdict,
     approved_from_dict,
+    freeze_approved_target,
     infer_effective_target,
     target_drift_guard,
 )
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -73,8 +78,8 @@ async def tool_screener(state: AgentState) -> dict:
 
     Returns a state delta. The delta always sets ``screener_route`` so
     the conditional edge can dispatch deterministically; it may also
-    append synthetic ``ToolMessage`` responses (for REJECT cases) and
-    set replan fields (for DRIFT cases).
+    append synthetic ``ToolMessage`` responses (for REJECT/BANNED cases)
+    or interrupt for human confirmation (for DRIFT cases).
 
     Fail-open policy: if the screener itself throws (classifier crash
     on malformed args, unexpected tool_call shape, etc.) the whole
@@ -180,81 +185,57 @@ async def tool_screener(state: AgentState) -> dict:
         for d in decisions
     ]
 
-    delta: dict[str, Any] = {
-        "messages": rejection_msgs,
-        "screener_route": (
-            SCREENER_ROUTE_REPLAN if has_drift else SCREENER_ROUTE_RETRY
-        ),
-    }
-
+    # --- Drift path: interrupt for human confirmation ---
     if has_drift:
-        # Build a replan context summarising the drift so agent_loop
-        # can re-plan with awareness of what the LLM tried (and was
-        # blocked from).
         drifted = [d for d in decisions if d["verdict"] == GuardVerdict.REJECT_DRIFT.value]
-        summary_lines = [
-            f"target_guard rejected tool_call due to drift from approved target:",
-        ]
-        for d in drifted:
-            summary_lines.append(
-                f"  - {d['tool_name']}: {d['reason']}. {d['suggestion']}"
-            )
-        replan_context = {
-            "error_summary": "\n".join(summary_lines)[:1000],
-            "failed_tool_calls": [
-                {"name": d["tool_name"], "error": d["reason"]}
+        first_eff = drifted[0].get("effective") if drifted else None
+        drift_reject_count = int(state.get("drift_reject_count") or 0)
+
+        if drift_reject_count >= 1:
+            # Already rejected once — hard terminate.
+            return {
+                "messages": rejection_msgs,
+                "screener_route": SCREENER_ROUTE_RETRY,
+                **fail_state(
+                    FailureCategory.USER_REJECTED,
+                    "Target drift persists after user rejection; terminating.",
+                ),
+            }
+
+        _reason = drifted[0]["reason"] if drifted else ""
+        drift_info = {
+            "type": "target_change",
+            "summary": f"Target change detected: {_reason}",
+            "reason": _reason,
+            "original": _format_approved_for_card(approved),
+            "proposed": _format_effective_for_card(first_eff) if first_eff else {},
+            "tool_calls": [
+                {"name": d["tool_name"], "reason": d["reason"]}
                 for d in drifted
             ],
-            "existing_blade_uids": [],
-            "iteration_at_failure": state.get("execute_loop_count", 0),
-            "trigger": "target_drift_guard",
         }
-        current_replan_count = int(state.get("replan_count", 0) or 0)
-        try:
-            max_replan = int(settings.max_replan_count)
-        except (TypeError, ValueError):
-            max_replan = 2
-        if current_replan_count < max_replan:
-            delta.update({
-                "replan_requested": True,
-                "replan_context": replan_context,
-                "replan_count": current_replan_count + 1,
-                # Approval is invalidated — the next confirmation_gate
-                # will refreeze after agent_loop produces a fresh plan.
-                "approved_target": None,
-                "error": None,
-            })
-            if settings.replan_reset_execute_count:
-                delta["execute_loop_count"] = 0
 
-            # Patch E — screener-triggered replans are a distinct
-            # attempt category from graph_replan: they signal "agent
-            # behaved unsafely" rather than "tool execution failed".
-            # Recording them under REASON_LLM_TARGET_SWITCH lets the
-            # TUI / TaskStore surface "attempt #N · target switch
-            # blocked by guard" so operators can spot patterns of LLM
-            # misbehaviour. The pre-merged state is passed via the
-            # spread so begin_attempt sees the about-to-increment
-            # replan_count + replan_requested values.
-            attempt_delta = begin_attempt(
-                {**state, **delta},
-                target=state.get("fault_spec"),
-                reason=REASON_LLM_TARGET_SWITCH,
-                notes=replan_context["error_summary"][:200],
-            )
-            delta.update(attempt_delta)
+        user_decision = interrupt(drift_info)
+
+        if user_decision == "approved":
+            spec_delta = _apply_drift_correction(state, first_eff)
+            return {
+                "screener_route": SCREENER_ROUTE_PASS,
+                "drift_reject_count": 0,
+                **spec_delta,
+            }
         else:
-            # Out of replan budget — route to retry path instead so the
-            # LLM at least gets a chance to abort gracefully. The
-            # ToolMessages already carry the rejection reasons.
-            delta["screener_route"] = SCREENER_ROUTE_RETRY
-            logger.warning(
-                "target_guard: drift detected but replan_count=%d already at max=%d; "
-                "falling back to retry-in-place",
-                current_replan_count, max_replan,
-            )
+            return {
+                "messages": rejection_msgs,
+                "screener_route": SCREENER_ROUTE_RETRY,
+                "drift_reject_count": drift_reject_count + 1,
+            }
 
-    return delta
+    # --- Non-drift reject (BANNED / UNKNOWN): retry in place ---
+    return {
+        "messages": rejection_msgs,
+        "screener_route": SCREENER_ROUTE_RETRY,
+    }
 
 
 def route_after_screener(state: AgentState) -> str:
@@ -293,11 +274,70 @@ def _format_rejection_for_llm(decision: dict[str, Any], approved_missing: bool) 
             "destructive calls until confirmation_gate has been passed."
         )
     parts.append(
-        "If your intended target is genuinely different, emit a [REPLAN] "
-        "to revise the plan; otherwise correct the tool_call to match "
-        "the approved target."
+        "Correct the tool_call to match the approved target, "
+        "or abort if the task cannot proceed."
     )
     return " ".join(parts)
+
+
+def _format_approved_for_card(approved: ApprovedTarget | None) -> dict:
+    if approved is None:
+        return {}
+    return {
+        "scope": approved.scope,
+        "namespace": approved.namespace,
+        "names": list(approved.names),
+        "labels": dict(approved.labels),
+        "blade_target": approved.blade_target,
+    }
+
+
+def _format_effective_for_card(eff: EffectiveTarget) -> dict:
+    return {
+        "scope": eff.scope,
+        "namespace": eff.namespace,
+        "names": list(eff.names),
+        "labels": dict(eff.labels),
+        "blade_target": eff.blade_target,
+    }
+
+
+def _apply_drift_correction(state: AgentState, eff: EffectiveTarget | None) -> dict:
+    """Correct fault_spec + refreeze approved_target after user approves drift."""
+    from chaos_agent.config.settings import settings as _settings
+
+    spec = read_fault_spec(state)
+    if not spec or not eff:
+        return {}
+
+    corrections: dict = {}
+    if eff.namespace and eff.namespace != spec.namespace:
+        if eff.namespace not in (_settings.blacklist_namespaces or []):
+            corrections["namespace"] = eff.namespace
+    if eff.names and tuple(eff.names) != spec.names:
+        corrections["names"] = tuple(eff.names)
+    if eff.labels and eff.labels != spec.labels:
+        corrections["labels"] = eff.labels
+
+    if corrections:
+        new_spec = spec.replace(**corrections)
+    else:
+        new_spec = spec
+
+    result: dict = {"fault_spec": new_spec.to_dict()}
+    result["approved_target"] = freeze_approved_target(
+        target={
+            "namespace": new_spec.namespace,
+            "names": list(new_spec.names),
+            "labels": dict(new_spec.labels),
+            "resource_type": new_spec.scope,
+        },
+        params=dict(new_spec.params),
+        blade_scope=new_spec.scope,
+        blade_target=new_spec.blade_target,
+        blade_action=new_spec.blade_action,
+    )
+    return result
 
 
 __all__ = [

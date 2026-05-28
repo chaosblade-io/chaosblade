@@ -10,8 +10,10 @@ from fastapi.responses import StreamingResponse
 
 from chaos_agent.agent.fault_spec import FaultSpec
 from chaos_agent.agent.state import extract_ui_diagnostics, strip_side_effects
-from chaos_agent.agent.streaming import StreamEvent, parse_stream_event
+from chaos_agent.agent.streaming import SSEBatcher, StreamEvent, parse_stream_event
 from chaos_agent.config.settings import settings
+from chaos_agent.memory.session_store import build_verification_simple
+from chaos_agent.models.schemas import JSONEnvelope
 from chaos_agent.server.routes import inject_router
 from chaos_agent.server.schemas import InjectRequest
 from chaos_agent.utils.time import now_iso
@@ -85,10 +87,22 @@ async def inject_stream(request: InjectRequest, req: Request):
         session_store.create_session(task_id, operation="inject")
 
     async def event_generator():
+        from chaos_agent.observability.otel_genai import get_task_span_manager
+        from chaos_agent.observability import status_tracker as _st_mod
+        _tsm = get_task_span_manager()
+        _otel_cb = getattr(_st_mod, "_otel_callback", None)
+
         # Register with task tracker for graceful shutdown
         stream_task = asyncio.current_task()
         task_tracker.register(task_id, stream_task)
+        batcher = SSEBatcher(
+            flush_interval_ms=settings.sse_batch_interval_ms,
+            flush_chars=settings.sse_batch_chars,
+        )
         try:
+            _tsm.start_task_span(task_id)
+            if _otel_cb is not None:
+                _otel_cb.set_task_id(task_id)
             # Stream first invoke
             async for raw_event in graph.astream_events(initial_state, config, version="v2"):
                 if await req.is_disconnected():
@@ -97,7 +111,10 @@ async def inject_stream(request: InjectRequest, req: Request):
                 stream_evt = parse_stream_event(raw_event)
                 if stream_evt is not None:
                     stream_evt.task_id = task_id
-                    yield stream_evt.to_sse()
+                    for sse in batcher.feed(stream_evt):
+                        yield sse
+            for sse in batcher.flush():
+                yield sse
 
             # Check if paused at confirmation_gate
             current_state = await graph.aget_state(config)
@@ -127,7 +144,10 @@ async def inject_stream(request: InjectRequest, req: Request):
                             stream_evt = parse_stream_event(raw_event)
                             if stream_evt is not None:
                                 stream_evt.task_id = task_id
-                                yield stream_evt.to_sse()
+                                for sse in batcher.feed(stream_evt):
+                                    yield sse
+                        for sse in batcher.flush():
+                            yield sse
 
             # Extract final result
             final_state = await graph.aget_state(config)
@@ -192,6 +212,8 @@ async def inject_stream(request: InjectRequest, req: Request):
                             "verification": strip_side_effects(values.get("verification")),
                             "created_at": now_iso(),
                             "estimated_duration_ms": 0,
+                            # T6 — postmortem payload (None when not generated)
+                            "postmortem": values.get("postmortem"),
                             **extract_ui_diagnostics(values),
                         },
                         request_id=getattr(req.state, "request_id", ""),
@@ -230,6 +252,7 @@ async def inject_stream(request: InjectRequest, req: Request):
                 task_id=task_id,
             ).to_sse()
         finally:
+            _tsm.end_task_span(task_id)
             # Finalize session: flush remaining messages from final graph state
             if session_store:
                 try:
@@ -256,8 +279,6 @@ async def inject_stream(request: InjectRequest, req: Request):
                             blade_params = values_fin.get("params") or {}
                     except Exception:
                         pass
-                    from chaos_agent.models.schemas import JSONEnvelope
-                    from chaos_agent.memory.session_store import build_verification_simple
                     from chaos_agent.agent.state import infer_task_state
 
                     inferred_state = infer_task_state(values_fin) if values_fin else "unknown"

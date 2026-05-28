@@ -105,6 +105,21 @@ def get_guidelines_section(include_method_switching: bool = True) -> str:
             recall.
     """
     base = """## Important Guidelines
+
+### Runtime Feedback Priority (CRITICAL)
+Your knowledge about tool interfaces comes from documentation, which may be
+outdated or wrong. The tool's actual behavior at runtime is always the ground truth.
+
+When ANY tool returns an error or unexpected result:
+1. DO NOT assume the documentation is correct and the tool is wrong
+2. The tool is RIGHT — adapt your approach to match what the tool actually does
+3. Before retrying a failed command, verify the tool's actual interface
+   (e.g. run the tool's help/usage command) to see what it really supports
+4. If a parameter/flag/subcommand was rejected, it does NOT exist in the
+   current tool version — do NOT retry it, regardless of what documentation says
+5. If the tool's output contradicts skill instructions or knowledge docs,
+   trust the tool output and adapt your approach
+
 - Follow the skill instructions exactly - do not improvise blade commands
 - Capture the blade UID from every create command - it is needed for recovery
 - Report results in a structured format including blade_uid, status, and verification details

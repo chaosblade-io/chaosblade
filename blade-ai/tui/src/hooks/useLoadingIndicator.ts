@@ -42,15 +42,26 @@
  * smooth, which the live tail needs to feel "alive". The exact
  * figures are still available for users who care; this just makes
  * the spinner's tail counter pleasant to watch instead of stuttery.
+ *
+ * 2026-05-26 perf cleanup — removed the live CoT body render path
+ * (``bodyLines`` + ``displayedBuffer`` 250ms throttle + ``bodyMax`` /
+ * ``bodyWidth`` calculations + the ``tailWrappedLines`` wrap pipeline).
+ * The LoadingIndicator only renders a single-line spinner+header
+ * (per the qwen-code-style redesign documented in
+ * ``components/LoadingIndicator.tsx``); the body machinery was kept as
+ * a dead-code "future restoration switch" but every LLM streaming
+ * dispatch still ran its useEffect / useMemo / useState chain. Removing
+ * the deprecated path drops a useEffect + useState + useRef + useMemo
+ * tuple that was firing 10-20Hz under thinking streams, alongside the
+ * O(N) wrap+pad work even when nothing rendered the result.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { t } from "../i18n/index.js";
 import { useAppSelector } from "../state/store.js";
 import { streamingResponseCharsRef } from "../state/streamingRefs.js";
 import { isNarrow, useTerminalSize } from "./useTerminalSize.js";
 import { useAnimationFrame } from "./useAnimationFrame.js";
-import { tailWrappedLines } from "../utils/wrapText.js";
 import { getPool } from "../utils/phrasePool.js";
 
 export interface LoadingIndicatorProps {
@@ -75,45 +86,29 @@ export interface LoadingIndicatorProps {
    *  ``usage`` events. The estimate prioritises responsiveness in
    *  the live tail; the committed summary prioritises accuracy. */
   turnTokens: number;
-  /**
-   * Last ~3 visual lines of the live thinking buffer. Empty array when
-   * no thinking session is active. Rendered as the dim-color body
-   * block under the header.
-   */
-  bodyLines: string[];
   /** True on terminals narrower than ``NARROW_THRESHOLD`` — host uses
    *  this to fold the meta tail onto its own row. Re-exposed here so
    *  the LoadingIndicator doesn't need a second ``useTerminalSize``
    *  subscription. */
   narrow: boolean;
-  /** Width (in code units) used to wrap ``bodyLines`` — same value
-   *  the LoadingIndicator uses for its dashed separator so the rule
-   *  matches the visible body block. */
-  bodyWidth: number;
 }
-
-/** Width budget reserved for the left padding (2) + a 2-col safety
- *  margin so soft-wrapped content doesn't kiss the right edge. Mirrors
- *  the LoadingIndicator's own ``paddingLeft={2}``. */
-const BODY_RESERVED_COLS = 4;
-
-/** Visible CoT body row cap. The body is ambient chrome — once it
- *  exceeds ~8 rows it starts to feel like content competing with
- *  the actual agent reply, so we lock the upper bound here
- *  regardless of how tall the terminal gets. On smaller terminals
- *  the per-render math (``rows - 22``) brings the effective cap
- *  down so the dynamic frame still fits. */
-const BODY_MAX_LINES = 8;
 
 export function useLoadingIndicator(): LoadingIndicatorProps {
   const streamState = useAppSelector((s) => s.streamState);
-  const thoughtBuffer = useAppSelector((s) => s.thoughtBuffer);
+  // 2026-05-26 perf — was ``s.thoughtBuffer`` (changes per token,
+  // 10-20Hz under streaming, forcing this hook + LoadingIndicator
+  // to re-render at every chunk). Switched to ``s.hasActiveThinking``
+  // (edge-triggered boolean — only changes on the 0→N / N→0
+  // session-boundary transitions). The LoadingIndicator only needs
+  // to know IF thinking is happening to swap the header label —
+  // not WHAT, since thinking content isn't displayed in the spinner
+  // row (only in the eventual "▸ Thought for Ns" collapse).
+  const hasActiveThinking = useAppSelector((s) => s.hasActiveThinking);
   const thoughtSubject = useAppSelector((s) => s.thoughtSubject);
   const isReceiving = useAppSelector((s) => s.isReceiving);
   const turnStartedAt = useAppSelector((s) => s.turnStartedAt);
-  const constrainHeight = useAppSelector((s) => s.constrainHeight);
   const idlePhrase = useAppSelector((s) => s.idlePhrase);
-  const { columns, rows } = useTerminalSize();
+  const { columns } = useTerminalSize();
 
   const isStreaming =
     streamState === "responding" || streamState === "waiting_confirmation";
@@ -202,7 +197,7 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
   // pool entry so the header is never blank.
   const fallbackPhrase = idlePhrase || getPool()[0] || "thinking";
   let headerLabel: string;
-  if (thoughtBuffer.length > 0) {
+  if (hasActiveThinking) {
     headerLabel = t("loading.thinking_label");
   } else if (thoughtSubject) {
     headerLabel = thoughtSubject;
@@ -210,111 +205,7 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
     headerLabel = fallbackPhrase;
   }
 
-  // Throttle the thinking buffer that drives ``bodyLines``. The
-  // raw ``thoughtBuffer`` ticks every token (≥ 12 Hz from a
-  // streaming LLM) — and Ink redraws the whole 20+ row dynamic
-  // frame on every state change. Most of those redraws are pure
-  // chrome flicker: spinner advances 1 glyph, last body line gains
-  // one character, and the user perceives 8-17 fps full-frame
-  // shimmer. Letting the body lag the buffer by ~250 ms collapses
-  // those into ~4 visible body refreshes per second — slow enough
-  // to read, fast enough to feel "live", and the spinner-only
-  // redraws between updates touch a single glyph instead of the
-  // whole padded body.
-  //
-  // Spinner-driven redraws (12.5 Hz from ink-spinner's own
-  // setInterval) still happen, but those repaint the same body
-  // bytes — Ink writes the same content, so terminals with
-  // intelligent diffing produce near-zero visible flicker.
-  const BUFFER_THROTTLE_MS = 250;
-  const [displayedBuffer, setDisplayedBuffer] = useState(thoughtBuffer);
-  const lastFlushRef = useRef(Date.now());
-  useEffect(() => {
-    if (thoughtBuffer === displayedBuffer) return;
-    const now = Date.now();
-    const sinceLast = now - lastFlushRef.current;
-    if (sinceLast >= BUFFER_THROTTLE_MS) {
-      lastFlushRef.current = now;
-      setDisplayedBuffer(thoughtBuffer);
-      return;
-    }
-    const id = setTimeout(() => {
-      lastFlushRef.current = Date.now();
-      setDisplayedBuffer(thoughtBuffer);
-    }, BUFFER_THROTTLE_MS - sinceLast);
-    return () => clearTimeout(id);
-  }, [thoughtBuffer, displayedBuffer]);
-
-  // Pre-wrap the throttled buffer to the terminal width. Empty when
-  // no session is active. Recomputed on each render — the work is
-  // O(N) in buffer length but a single session is bounded by the
-  // LLM's CoT budget (a few KB) so this is cheap relative to the
-  // React reconcile.
   const narrow = isNarrow(columns);
-  const bodyWidth = Math.max(20, columns - BODY_RESERVED_COLS);
-  // When ``constrainHeight`` is on (default), shrink the live CoT body
-  // budget so the LoadingIndicator + downstream chrome (PhaseStepperCard
-  // + InputPrompt + Footer ≈ 13 rows) + any pending item still fit in
-  // the viewport. Without this clamp, a long thinking session pushes
-  // the dynamic frame past terminal rows and the bottom of the live
-  // CoT scrolls into scrollback every render — exactly the symptom we
-  // patched out of Ink's fullscreen-redraw branch. ``Ctrl+O`` toggles
-  // ``constrainHeight`` off so the user can see the full thinking body
-  // when needed.
-  // bodyMax — computed against the live terminal height (re-read on
-  // every SIGWINCH via ``useTerminalSize``). Two rules:
-  //
-  //   1. Capped at ``BODY_MAX_LINES`` (8) regardless of how tall
-  //      the terminal is — once the body grows beyond ~8 rows it
-  //      stops feeling like a peripheral CoT preview and starts
-  //      competing with the actual agent output for attention.
-  //   2. On small terminals where reserving 22 rows for the rest
-  //      of the chrome (PhaseStepperCard 8 + InputPrompt 5 + Footer
-  //      1 + Composer marginTop 1 + LoadingIndicator header/separator
-  //      2 + safety 5) would push the frame past stdout.rows, fall
-  //      back to ``rows - 22`` so the dynamic frame still fits.
-  //
-  // Sample bodyMax:
-  //   rows=24 → max(3, min(8, 2))  = 3   (tiny terminal, body collapses)
-  //   rows=28 → max(3, min(8, 6))  = 6
-  //   rows=30 → max(3, min(8, 8))  = 8   (8-cap binds from here)
-  //   rows=47 → max(3, min(8, 25)) = 8
-  //   rows=80 → max(3, min(8, 58)) = 8
-  //
-  // Ctrl+O (``constrainHeight=false``) lifts the "fits in viewport"
-  // rule but keeps the 8-row cap — useful when the user explicitly
-  // wants to see live CoT in scrollback while accepting that the
-  // frame may overflow.
-  const bodyMax = constrainHeight
-    ? Math.max(3, Math.min(BODY_MAX_LINES, rows - 22))
-    : BODY_MAX_LINES;
-  // Body is ALWAYS padded to bodyMax rows during thinking so chrome
-  // height stays stable across token streaming. This trade-off was
-  // tried before with bodyMax=12 and reverted (a 12-row block
-  // pulsing on every token reads as "整块在闪"); at the much
-  // smaller bodyMax=6 the per-token rewrite spans only 6 rows of
-  // body content, which is light enough that "chrome stays still"
-  // dominates "block flashes". Padding goes AFTER the real lines so
-  // the body grows tail-f-style — fresh CoT appears under the
-  // separator and travels downward, with empty slots between the
-  // latest line and the InputPrompt fence. Once the buffer crosses
-  // ``bodyMax`` wrapped lines the padding is gone and the block
-  // starts the normal bottom-anchored scroll.
-  // Phase 3.5 — useMemo the wrap+pad pipeline. ``tailWrappedLines``
-  // is O(N) in buffer length and runs every render; the indicator
-  // re-renders at ~10 Hz from useAnimationFrame + every thinking
-  // append + every 1 Hz elapsed tick. Memoising on the four inputs
-  // (the only things that actually affect ``bodyLines``) collapses
-  // most of those re-renders into a cached array reference, which
-  // also helps downstream React reconciliation skip the body Box.
-  const bodyLines = useMemo<string[]>(() => {
-    if (narrow || displayedBuffer.length === 0) return [];
-    const realLines = tailWrappedLines(displayedBuffer, bodyMax, bodyWidth);
-    const padding = Math.max(0, bodyMax - realLines.length);
-    return padding > 0
-      ? [...realLines, ...new Array<string>(padding).fill("")]
-      : realLines;
-  }, [narrow, displayedBuffer, bodyMax, bodyWidth]);
 
   return {
     visible,
@@ -323,8 +214,6 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
     isReceiving,
     isStreaming,
     turnTokens,
-    bodyLines,
     narrow,
-    bodyWidth,
   };
 }

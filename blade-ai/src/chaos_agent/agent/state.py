@@ -1,10 +1,22 @@
 """AgentState definition for LangGraph StateGraph."""
 
-from typing import Optional
+from typing import Annotated, Optional
 
 from langgraph.graph import MessagesState
+from langgraph.graph.message import add_messages
 
 from chaos_agent.utils.time import now_iso, parse_iso_timestamp
+
+
+def _ts_add_messages(left, right):
+    """Wrap add_messages to stamp Beijing wall-clock on every incoming message."""
+    ts = now_iso()
+    if isinstance(right, list):
+        for msg in right:
+            kwargs = getattr(msg, "additional_kwargs", None)
+            if isinstance(kwargs, dict):
+                kwargs.setdefault("_ts", ts)
+    return add_messages(left, right)
 
 
 def infer_task_state(values: dict) -> str:
@@ -116,11 +128,11 @@ def infer_task_state(values: dict) -> str:
         if level in ("verified", "partial"):
             return "injected"
         return "failed"
-    # Side-effect confirmation: L1 passed + container restart destroyed evidence
+    # Side-effect confirmation: L1 passed + evidence destroyed by side-effect
     # → not a failure, but a valid drill finding (e.g., burn → OOMKill → restart)
     if l1_pass and l2_status == "recovered_before_observation":
         side_effects = verification.get("side_effects") if isinstance(verification, dict) else None
-        if side_effects and side_effects.get("container_restarts"):
+        if side_effects and any(v for v in side_effects.values() if v):
             return "injected"
         return "failed"
     return "failed"
@@ -333,6 +345,60 @@ def _extract_side_effects(verification: dict | None) -> dict:
     return dict(raw)
 
 
+def _build_side_effects_summary(verification: dict | None) -> str:
+    """Build a one-line summary of all side-effect detection results.
+
+    Enumerates every detector category with its count so the TUI can
+    display "what was checked" regardless of whether issues were found.
+    The summary is assembled here (backend) so new detectors automatically
+    appear without a TUI release.
+    """
+    from chaos_agent.agent.nodes._side_effect_detectors import _DETECTORS
+
+    if not isinstance(verification, dict):
+        return ""
+    raw = verification.get("side_effects")
+    detected = dict(raw) if isinstance(raw, dict) else {}
+
+    _KEY_LABELS = {
+        "container_restarts": "容器重启",
+        "evicted_pods": "Pod驱逐",
+        "oom_killed_pods": "OOMKill",
+        "crash_loop_pods": "CrashLoop",
+        "endpoint_removals": "Endpoint移除",
+        "hpa_scaling": "HPA扩缩",
+        "probe_failures": "探针失败",
+        "dependency_errors": "依赖异常",
+    }
+
+    parts = []
+    for d in _DETECTORS:
+        items = detected.get(d.key, [])
+        count = len(items) if isinstance(items, list) else 0
+        label = _KEY_LABELS.get(d.key, d.key)
+        parts.append(f"{label}: {count}")
+
+    total = sum(len(v) for v in detected.values() if isinstance(v, list))
+    if total == 0:
+        return f"未检测到连带影响 ({', '.join(parts)})"
+    return f"检测到 {total} 项连带影响 ({', '.join(parts)})"
+
+
+def _derive_failure_reason(values: dict) -> str:
+    """Derive a failure_reason string from state, preferring failure_detail."""
+    reason = values.get("failure_reason") or ""
+    if reason:
+        return reason
+    detail = values.get("failure_detail")
+    if not detail or not isinstance(detail, dict):
+        return ""
+    from chaos_agent.agent.verdict import FailureDetail
+    try:
+        return FailureDetail.model_validate(detail).to_reason_string()
+    except Exception:
+        return detail.get("category", "")
+
+
 def extract_ui_diagnostics(values: dict) -> dict:
     """Return the UI-visible diagnostic fields for a result envelope payload.
 
@@ -341,11 +407,17 @@ def extract_ui_diagnostics(values: dict) -> dict:
     surface the same set without recopying boilerplate. Anything that flows
     through here becomes visible in `render_result` via `_read_diagnostic`.
     """
+    failure_detail = values.get("failure_detail")
+    failure_reason = _derive_failure_reason(values)
+
+    verification = values.get("verification")
     return {
-        "failure_reason": values.get("failure_reason") or "",
+        "failure_reason": failure_reason,
+        "failure_detail": failure_detail,
         "replan_count": int(values.get("replan_count") or 0),
         "replan_history": list(values.get("replan_history") or []),
-        "side_effects": _extract_side_effects(values.get("verification")),
+        "side_effects": _extract_side_effects(verification),
+        "side_effects_summary": _build_side_effects_summary(verification),
     }
 
 
@@ -388,8 +460,9 @@ def build_status_data(task_id: str, values: dict) -> dict:
         except (ValueError, TypeError):
             pass
 
-    # Merge failure_reason into error (failure_reason is more descriptive)
-    merged_error = values.get("failure_reason") or error or ""
+    failure_detail = values.get("failure_detail")
+    failure_reason_raw = _derive_failure_reason(values)
+    merged_error = failure_reason_raw or error or ""
 
     task_state = infer_task_state(values)
     stage = infer_stage(values)
@@ -413,7 +486,8 @@ def build_status_data(task_id: str, values: dict) -> dict:
         "side_effects": _extract_side_effects(verification),
         "plan_summary": values.get("plan_summary", ""),
         "error": merged_error,
-        "failure_reason": values.get("failure_reason") or "",
+        "failure_reason": failure_reason_raw,
+        "failure_detail": failure_detail,
         "intent_confidence": float(values.get("intent_confidence") or 0.0),
         "replan_count": int(values.get("replan_count") or 0),
         "replan_history": list(values.get("replan_history") or []),
@@ -431,6 +505,9 @@ def build_status_data(task_id: str, values: dict) -> dict:
 
 class AgentState(MessagesState):
     """State for the Chaos Engineering Agent inject/recover graphs."""
+
+    # Override MessagesState.messages to inject wall-clock timestamps
+    messages: Annotated[list, _ts_add_messages]
 
     # Task identification
     task_id: str = ""
@@ -450,6 +527,10 @@ class AgentState(MessagesState):
     safety_status: str = "pending"  # pending/safe/unsafe/warning/rejected
     safety_reason: Optional[str] = None
     conflict_uids: Optional[list[str]] = None  # UIDs of existing active experiments
+    # E10 — multi-dimensional numeric safety score (0-100 per dim +
+    # weighted overall). Stored as dict (not SafetyScore) for the same
+    # JSON-roundtrip reason FaultSpec uses dict-form on state.
+    safety_score: Optional[dict] = None
 
     # Confirmation
     needs_confirmation: bool = False
@@ -481,6 +562,17 @@ class AgentState(MessagesState):
     # Verification (two-layer: layer1=blade_status, layer2=fault-specific)
     verification: Optional[dict] = None
     recover_verification: Optional[dict] = None
+
+    # E2 — structured observation timeline. Each entry:
+    #   {iteration: int, timestamp: ISO 8601, tool_call_id: str,
+    #    tool_name: str, metrics: dict[str, str]}
+    # Populated by PreReasoningHook from ToolMessage extracted_metrics
+    # across ALL nodes (inject / recover / verifier), not just verifier —
+    # the field name is intentionally generic. Survives [Compressed
+    # History] compaction because it lives on state, not on the message
+    # list, which is what makes the Phase 3 evidence cross-check in
+    # verifier verdict parsing robust to compression.
+    metric_observations: Optional[list[dict]] = None
 
     # Layer 1 result caches (persisted across ReAct tool_call iterations)
     # Without these, layer1 results are lost when LLM makes tool_calls,
@@ -547,9 +639,24 @@ class AgentState(MessagesState):
     # blocker conditions (DiskPressure, Evicted, …) before the
     # operator approves an inject that's likely to fail.
     target_health_report: Optional[dict] = None
+    # E18 — Injection feasibility report (headroom assessment).
+    # Shape: FeasibilityReport.to_dict() from chaos_agent.agent.feasibility.
+    feasibility_report: Optional[dict] = None
 
     # Failure reason (only set when task result is "failed", None on success)
     failure_reason: Optional[str] = None
+    # E3 — Structured failure detail (FailureDetail.model_dump()). Replaces
+    # the freeform failure_reason string with category + context + llm_analysis.
+    failure_detail: Optional[dict] = None
+
+    # T6 — Postmortem auto-generation output. Populated by save_memory after
+    # the experiment finalises; None when postmortem is disabled, the task
+    # belongs to a non-injection intent, the failure category lies outside
+    # the postmortem whitelist, or LLM generation timed out / errored.
+    # Shape: {"path": str, "markdown": str, "summary": str}.
+    # Goes into the result envelope (data.postmortem) verbatim so the TS
+    # TUI can render PostmortemSection without a second round-trip.
+    postmortem: Optional[dict] = None
 
     # Injection method tracking (used by verifier to choose verification strategy)
     injection_method: Optional[str] = None  # "host_blade" | "kubectl_exec" | "kubectl_native" | None
@@ -560,6 +667,11 @@ class AgentState(MessagesState):
 
     # Skill use-case content (populated during injection, used by Layer 2 verification)
     skill_case_content: Optional[str] = None  # Full content of the matched skill use-case file
+    matched_use_case_path: Optional[str] = None  # Catalogue path resolved by match_use_case()
+
+    # Guard flag: extract_planning_metadata sets True when no catalogue
+    # case was loaded; conditional edge routes back to agent_loop.
+    planning_rejected: bool = False
 
     # Injection verification summary (Layer 2 observations from inject phase, used as baseline for recover)
     inject_verification_summary: Optional[str] = None
@@ -585,9 +697,22 @@ class AgentState(MessagesState):
     evidence_snapshot: Optional[dict] = None  # P0: quick evidence after blade_create (ls + df)
     disk_burn_post_check: Optional[dict] = None   # Post-injection I/O throughput verification result
     disk_fill_post_check: Optional[dict] = None    # Post-injection fill file verification result
-    restart_precheck: Optional[dict] = None  # Fast-path container restart detection result
+    se_snapshot: Optional[dict] = None       # Pre-injection side-effect snapshot (SideEffectSnapshot.to_dict())
     reverify_count: int = 0                  # P2: verifier re-verification attempt count
     reverify_gaps: Optional[list[str]] = None # P2: gap types that triggered re-verification
+    # Debug pods the verifier's programmatic cleanup has already attempted
+    # to delete. Persisted across verifier re-entries (reverify loop, ReAct
+    # iterations) so cleanup is exactly-once per pod.
+    #
+    # Without this, every verifier re-entry re-scans the full message history,
+    # re-discovers the same pod names, and re-issues ``kubectl delete``. After
+    # the first delete succeeds, subsequent attempts return "NotFound" and
+    # inflate the failure-rate stat (observed as 8 spurious NotFound failures
+    # in task-712629116b64).
+    #
+    # ``list[str]`` not ``set[str]``: LangGraph checkpoint requires JSON-
+    # serialisable shapes. Stored sorted for deterministic snapshots.
+    cleaned_debug_pods: Optional[list[str]] = None
     force_override: bool = False             # P1: CLI --force-override flag
 
     # Intent clarification (TUI mode)
@@ -599,6 +724,7 @@ class AgentState(MessagesState):
     dialogue_round: int = 0                      # Overall dialogue round tracking (chat + clarification)
     intent_reasoning: Optional[str] = None       # LLM classification reasoning (audit trail)
     needs_task_selection: bool = False            # RECOVER intent needs user to pick a task
+    recover_task_id: Optional[str] = None        # task_id of the inject experiment to recover
 
     # Dry-Run multi-turn planning (TUI `/plan`).
     # When True: confirmation_gate emits a "what would happen" AIMessage and
@@ -653,3 +779,12 @@ class AgentState(MessagesState):
     # no stale value can leak from one pass to another. Not meant for
     # cross-turn persistence.
     screener_route: Optional[str] = None
+
+    # Drift-interrupt rejection counter. Incremented when user rejects a
+    # target-change confirmation card. When >= 1, the next drift detection
+    # hard-terminates instead of interrupting again.
+    drift_reject_count: int = 0
+
+    # Plan builder (interactive guided plan construction via TUI /plan)
+    plan_builder_round: int = 0        # Dialogue round counter within plan_builder
+    plan_confirmed: bool = False       # submit_plan completed; /run routes to safety_check

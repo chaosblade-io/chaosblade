@@ -114,9 +114,10 @@ def make_direct_setup(registry: SkillRegistry) -> Callable:
             skill_content = registry.activate(_DIRECT_SKILL_NAME)
         except KeyError:
             logger.error(f"Skill '{_DIRECT_SKILL_NAME}' not found in registry")
+            from chaos_agent.agent.state_helpers import fail_state
+            from chaos_agent.agent.verdict import FailureCategory
             result = {
-                "error": f"Skill '{_DIRECT_SKILL_NAME}' not registered",
-                "failure_reason": "skill_not_found",
+                **fail_state(FailureCategory.PREREQUISITE_FAILED, f"skill={_DIRECT_SKILL_NAME} not found"),
                 "skill_name": "",
             }
             tracker.fail(f"Skill '{_DIRECT_SKILL_NAME}' not found")

@@ -35,13 +35,26 @@ def _read_diagnostic(data: dict, key: str, default):
     return default
 
 
-def _split_failure_reason(reason: str) -> tuple[str, str]:
-    """Split ``"<base> | llm_analysis: <details>"`` into (cause, hint).
+def _extract_failure_cause_hint(data: dict) -> tuple[str, str]:
+    """Extract (cause, hint) from either structured ``failure_detail`` or legacy ``failure_reason``.
 
-    `enrich_failure_reason` (errors.py) appends the LLM diagnosis after a
-    fixed separator. Splitting lets the UI present cause + hint on two lines
-    instead of dumping the whole concatenated string after `Error:`.
+    Prefers structured: ``failure_detail.category`` + ``failure_detail.context`` as cause,
+    ``failure_detail.llm_analysis`` as hint.
+    Falls back to legacy split on ``" | llm_analysis: "`` separator.
     """
+    detail = _read_diagnostic(data, "failure_detail", None)
+    if isinstance(detail, dict) and detail.get("category"):
+        cause = detail["category"]
+        ctx = detail.get("context", "")
+        if ctx:
+            cause = f"{cause}: {ctx}"
+        hint = detail.get("llm_analysis", "") or ""
+        return cause, hint
+
+    # Legacy fallback
+    reason = _read_diagnostic(data, "failure_reason", "") or ""
+    if not reason:
+        return "", ""
     sep = " | llm_analysis: "
     if sep in reason:
         base, _, analysis = reason.partition(sep)
@@ -63,33 +76,50 @@ def _truncate_reason(text: str, limit: int = _REPLAN_REASON_MAX_LEN) -> str:
 
 
 def _render_side_effects(body: Text, side_effects: dict) -> None:
-    """Render chaos-eng side effects (container restarts, etc.) as value signals.
-
-    The agent strips these from ``verification`` so older API consumers don't
-    see an unexpected nested field, but they're the most valuable observable
-    for an operator: "your fault crashed something for real". We render them
-    in a dedicated row, styled as a warning rather than an error — the
-    experiment succeeded *and* destabilized the target, which is the point.
-    """
-    restarts = side_effects.get("container_restarts")
-    if not restarts:
+    """Render all side-effect categories detected by the se_detect node."""
+    if not side_effects or not any(
+        isinstance(v, list) and v for v in side_effects.values()
+    ):
         return
+
     body.append("\n")
     body.append("  \u2500\u2500 Side Effects ", style=Colors.DIM)
     body.append("\u2500" * 32 + "\n", style=Colors.DIM)
-    for entry in restarts:
-        if not isinstance(entry, dict):
+
+    for key, items in side_effects.items():
+        if not isinstance(items, list) or not items:
             continue
+        for entry in items:
+            if not isinstance(entry, dict):
+                continue
+            _render_side_effect_entry(body, key, entry)
+
+
+def _render_side_effect_entry(body: Text, category: str, entry: dict) -> None:
+    """Render a single side-effect entry with category-aware formatting."""
+    body.append(f"  {Icons.WARNING} ", style=Colors.WARNING)
+
+    if category == "container_restarts":
         pod = entry.get("pod") or "unknown"
-        count = entry.get("restart_count")
+        count = entry.get("restart_count") or entry.get("restart_delta")
         reason = entry.get("reason") or entry.get("note") or ""
-        body.append(f"  {Icons.WARNING} ", style=Colors.WARNING)
         body.append(f"{pod} restarted", style=Colors.WARNING)
         if isinstance(count, int) and count > 0:
             body.append(f" {count}\u00d7", style=f"bold {Colors.WARNING}")
         if reason:
             body.append(f" \u2014 {_truncate_reason(reason)}", style=Colors.MUTED)
-        body.append("\n")
+    else:
+        label = category.replace("_", " ").title()
+        name = (
+            entry.get("pod") or entry.get("service") or
+            entry.get("hpa") or entry.get("pattern") or ""
+        )
+        detail = entry.get("reason") or entry.get("message") or ""
+        body.append(f"{label}: {name}", style=Colors.WARNING)
+        if detail:
+            body.append(f" \u2014 {_truncate_reason(detail)}", style=Colors.MUTED)
+
+    body.append("\n")
 
 
 def _render_replan_history(
@@ -256,11 +286,25 @@ def _render_physical_timeline(
     body.append(f"{summary}\n", style=Colors.MUTED)
 
 
+def _latest_experiment_locator(state) -> str:
+    """Return the most recently allocated experiment locator (e.g. 'E1'), or ''."""
+    if state is None:
+        return ""
+    locators = getattr(state, "locators", None)
+    if locators is None:
+        return ""
+    experiments = locators.list_experiments()
+    if not experiments:
+        return ""
+    return experiments[-1].locator
+
+
 def render_result(
     console: ChaosConsole,
     data: dict,
     task_id: str = "",
     display_mode: DisplayMode = DisplayMode.WORKING,
+    state=None,
 ) -> None:
     if not isinstance(data, dict):
         console.print_text(f"  Result: {data}", style=Colors.SUCCESS)
@@ -294,6 +338,9 @@ def render_result(
 
     # Build title
     title = Text()
+    locator = _latest_experiment_locator(state)
+    if locator:
+        title.append(f" [{locator}]", style=f"bold {title_style}")
     title.append(f" {icon} ", style=f"bold {title_style}")
     title.append(title_text, style=f"bold {title_style}")
 
@@ -372,12 +419,11 @@ def render_result(
     _render_physical_timeline(body, data, display_mode)
 
     # Error details for failed results.
-    # Prefer the structured failure_reason (split into cause + hint) over
+    # Prefer the structured failure_detail (category + context + hint) over
     # the raw merged_error so failed runs show *why* on one line and the
     # LLM diagnosis on a second, instead of a single ungrokable blob.
     if status not in ("success",):
-        failure_reason = _read_diagnostic(data, "failure_reason", "") or ""
-        cause, hint = _split_failure_reason(failure_reason) if failure_reason else ("", "")
+        cause, hint = _extract_failure_cause_hint(data)
         if cause:
             body.append("  Cause: ", style=f"bold {Colors.ERROR}")
             body.append(f"{cause}\n", style=Colors.ERROR)

@@ -88,7 +88,7 @@ import { performance } from "node:perf_hooks";
 import { useLayoutEffect } from "react";
 import { measureElement, type DOMElement } from "ink";
 import { useTerminalSize } from "../hooks/useTerminalSize.js";
-import { useAppSelector } from "../state/store.js";
+import { useAppSelector, useAppStateGetter } from "../state/store.js";
 import type { HistoryItem } from "../state/types.js";
 
 /**
@@ -770,7 +770,14 @@ export function useOverflowProbe(): void {
     return last?.kind === "agent" ? last.text.length : 0;
   });
   const hasStepper = useAppSelector((s) => s.currentPhaseStepper !== null);
-  const thinkingLen = useAppSelector((s) => s.thoughtBuffer.length);
+  // 2026-05-26 perf — was ``s.thoughtBuffer.length`` (changes per token,
+  // forcing the App re-render cascade on every thinking chunk even when
+  // ``ENABLED === false``). Switched to the edge-triggered boolean so we
+  // only re-render on the 0→N / N→0 transition. Precise length is read
+  // non-subscribing via ``getState`` inside the ENABLED branch below so
+  // the ``thinkingLen`` log field is unchanged for downstream jq queries.
+  const hasActiveThinking = useAppSelector((s) => s.hasActiveThinking);
+  const getState = useAppStateGetter();
   const streamState = useAppSelector((s) => s.streamState);
   const bootProgress = useAppSelector((s) => s.bootProgress);
   const historyLen = useAppSelector((s) => s.history.length);
@@ -871,6 +878,13 @@ export function useOverflowProbe(): void {
     const actionsBatched = actionCountSinceLastFrame;
     actionCountSinceLastFrame = 0;
     lastFrameTs = now;
+
+    // Read precise thoughtBuffer length non-subscribing — the hook
+    // itself only subscribes to ``hasActiveThinking`` (edge-triggered)
+    // to avoid per-token re-renders when the probe is disabled.
+    const thinkingLen = hasActiveThinking
+      ? getState().thoughtBuffer.length
+      : 0;
 
     const record = {
       seq: ++frameSeq,

@@ -415,6 +415,21 @@ function commitThinking(state: AppState): AppState {
   if (state.thoughtBuffer.length === 0 && state.thoughtStartedAt === 0) {
     return state;
   }
+  // Suppress mid-content thinking: once the first ThinkingItem for a
+  // response segment has been committed and content tokens have started
+  // flowing, subsequent reasoning chunks within the same segment are
+  // silently discarded. This prevents trailing "▸ 思考用时 <1s" blocks
+  // after the response text — caused by Qwen's enable_thinking mode
+  // emitting reasoning_content interleaved with content.
+  if (state.suppressMidContentThinking) {
+    return {
+      ...state,
+      thoughtBuffer: "",
+      thoughtSubject: "",
+      thoughtStartedAt: 0,
+      hasActiveThinking: false,
+    };
+  }
   const durationMs =
     state.thoughtStartedAt > 0 ? Date.now() - state.thoughtStartedAt : 0;
   const { id, counter } = nextId(state, "th");
@@ -429,6 +444,7 @@ function commitThinking(state: AppState): AppState {
     thoughtBuffer: "",
     thoughtSubject: "",
     thoughtStartedAt: 0,
+    hasActiveThinking: false,  // N → 0 edge: session committed to pending
     nextItemId: counter,
   };
 }
@@ -455,7 +471,7 @@ export type Action =
       node?: string;
       payload?: Record<string, unknown>;
     }
-  | { type: "CONFIRM_RESOLVED"; taskId: string; answer: "approved" | "rejected" }
+  | { type: "CONFIRM_RESOLVED"; taskId: string; answer: string }
   | { type: "RESULT_RECEIVED"; content: string; taskId?: string }
   | { type: "ERROR_RECEIVED"; message: string; taskId?: string }
   /**
@@ -602,7 +618,8 @@ export type Action =
   | {
       type: "CONFIRM_USER_DECIDED";
       taskId: string;
-      answer: "approved" | "rejected";
+      /** "approved"/"rejected" for confirm gates; raw key for plan_builder. */
+      answer: string;
       feedback?: string;
     }
   | { type: "CONFIRM_DECISION_CONSUMED" }
@@ -630,6 +647,7 @@ export type Action =
 
 const PREVIEW_MAX = 80;
 const SUBJECT_MAX = 80;
+
 
 /**
  * Graph nodes that are reached only when the LLM has decided to go
@@ -697,6 +715,8 @@ export function reducer(state: AppState, action: Action): AppState {
         thoughtSubject: "",
         thoughtBuffer: "",
         thoughtStartedAt: 0,
+        hasActiveThinking: false,
+        suppressMidContentThinking: false,
         turnInputTokens: 0,
         turnOutputTokens: 0,
         currentPhaseStepper: null,
@@ -742,19 +762,22 @@ export function reducer(state: AppState, action: Action): AppState {
           ...extra,
         });
       };
-      // First agent text after a thinking session means thinking is
-      // over for this segment — collapse the buffer into a
-      // ThinkingItem before we touch any other pending. The new item
-      // lands BEFORE the agent reply in pending order, which is the
-      // chronologically correct read order in scrollback.
+      // Commit any buffered thinking into a ThinkingItem before
+      // appending content tokens. With suppressMidContentThinking
+      // active, this is a no-op (buffer cleared without creating an
+      // item) — mid-content reasoning from Qwen's enable_thinking
+      // mode is silently discarded. The first call (suppress=false)
+      // creates the single ThinkingItem that shows "▸ 思考用时 Ns"
+      // before the response text.
       state = commitThinking(state);
-      // Flush leading "stable" pending items into history before we
-      // grow the dynamic area with token text. See ``flushLeadingStable``
-      // for the rationale — same mechanism re-used by TOOL_ENDED so a
-      // tool that completes mid-conversation gets out of pending the
-      // moment its group becomes terminal, instead of waiting for the
-      // next TOKEN to arrive.
       state = flushLeadingStable(state);
+      // Arm suppression: content tokens are flowing, so any
+      // subsequent reasoning chunks within this response segment
+      // are noise. Reset at boundary events (TOOL_STARTED / CONFIRM
+      // / NODE change / TURN_STARTED).
+      if (!state.suppressMidContentThinking) {
+        state = { ...state, suppressMidContentThinking: true };
+      }
 
       // Decide the trailing agent item's incoming text. If pending
       // already ends with an agent item we append into it; otherwise
@@ -929,10 +952,18 @@ export function reducer(state: AppState, action: Action): AppState {
       const buffer = flushed.thoughtBuffer + action.content;
       const startedAt =
         flushed.thoughtStartedAt > 0 ? flushed.thoughtStartedAt : Date.now();
+      // Edge-trigger ``hasActiveThinking``: only flip on the 0→N
+      // transition so high-frequency subscribers (LoadingIndicator)
+      // don't re-render for every appended token. The ``thoughtBuffer``
+      // itself still updates per chunk for the eventual collapse.
+      const wasActive = flushed.thoughtBuffer.length > 0;
+      const isActive = buffer.length > 0;
       return {
         ...flushed,
         thoughtBuffer: buffer,
         thoughtStartedAt: startedAt,
+        hasActiveThinking:
+          wasActive !== isActive ? isActive : flushed.hasActiveThinking,
         isReceiving: true,
       };
     }
@@ -1045,6 +1076,10 @@ export function reducer(state: AppState, action: Action): AppState {
       ) {
         return state;
       }
+      // Tool boundary — un-suppress so the thinking that preceded
+      // this tool call gets its own ThinkingItem (genuine multi-phase
+      // thinking: think → tool → think → reply).
+      state = { ...state, suppressMidContentThinking: false };
       // Tool start interrupts any thinking session — collapse the
       // buffer first so the ThinkingItem lands BEFORE the new tool
       // group in pending order. Idempotent when no session is
@@ -1305,6 +1340,7 @@ export function reducer(state: AppState, action: Action): AppState {
         currentTurnIsInjection: nextIsInjection,
         currentPhaseStepper: nextStepper,
         nextItemId: stepperCounter,
+        suppressMidContentThinking: false,
       };
     }
 
@@ -1371,6 +1407,7 @@ export function reducer(state: AppState, action: Action): AppState {
       // is usually empty — this guard catches the rare path where
       // the agent transitions thinking → confirm with no token
       // emission in between.
+      s = { ...s, suppressMidContentThinking: false };
       s = commitThinking(s);
       s = flushLeadingStable(s);
       // Force-flush whatever ``flushLeadingStable`` couldn't move
@@ -1790,6 +1827,7 @@ export function reducer(state: AppState, action: Action): AppState {
         thoughtSubject: `replaying ${action.taskId}`,
         thoughtBuffer: "",
         thoughtStartedAt: 0,
+        hasActiveThinking: false,
         turnInputTokens: 0,
         turnOutputTokens: 0,
         currentPhaseStepper: null,
@@ -1998,6 +2036,7 @@ function commitPending(
     thoughtSubject: "",
     thoughtBuffer: "",
     thoughtStartedAt: 0,
+    hasActiveThinking: false,
     turnStartedAt: 0,
     isReceiving: false,
     // Phase 4 — defensive end-of-turn cleanup. Any in-flight compaction

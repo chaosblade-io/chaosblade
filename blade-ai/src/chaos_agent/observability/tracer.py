@@ -203,7 +203,7 @@ async def _persist_span(task_id: str, span: NodeSpan) -> None:
     Also ensures the task row exists in the DB so that
     ``update_task_summary`` can find a row to update.
     """
-    if not task_id:
+    if not task_id or task_id.startswith("turn-"):
         return
     try:
         from chaos_agent.persistence.task_store import get_task_store
@@ -227,7 +227,7 @@ async def _persist_span(task_id: str, span: NodeSpan) -> None:
 
 async def _persist_summary(task_id: str, trace: TaskTrace) -> None:
     """Update the summary fields on the task_details row in TaskStore."""
-    if not task_id:
+    if not task_id or task_id.startswith("turn-"):
         return
     try:
         from chaos_agent.persistence.task_store import get_task_store

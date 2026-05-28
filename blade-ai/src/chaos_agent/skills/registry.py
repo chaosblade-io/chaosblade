@@ -44,16 +44,25 @@ class SkillRegistry:
     def metadata(self) -> dict[str, SkillMetadata]:
         return self._metadata
 
-    def load_from_directory(self, skills_dir: Path) -> None:
-        """Scan skills_dir and load Tier 1 metadata for all valid skills.
+    def _scan_directory(
+        self, skills_dir: Path,
+    ) -> tuple[dict[str, SkillMetadata], dict[str, Path]]:
+        """Scan ``skills_dir`` and return ``(metadata, skill_dirs)`` dicts.
 
-        Invalid skills are skipped with a warning log. Skills whose name
-        appears in ``settings.disabled_skills`` are skipped silently with
-        an INFO log so the user can re-enable them later.
+        Pure function: does not mutate ``self``. Validation, duplicate
+        detection within this scan, and ``disabled_skills`` filtering all
+        happen inline. Returns empty dicts when the directory is missing.
+
+        Shared by ``load_from_directory`` (additive init path) and
+        ``reload`` (atomic swap path) — keeping the scan logic in one place
+        means both paths apply identical validation/filtering rules.
         """
+        new_metadata: dict[str, SkillMetadata] = {}
+        new_skill_dirs: dict[str, Path] = {}
+
         if not skills_dir.exists():
             logger.warning(f"Skills directory not found: {skills_dir}")
-            return
+            return new_metadata, new_skill_dirs
 
         disabled = set(settings.disabled_skills or [])
 
@@ -63,7 +72,6 @@ class SkillRegistry:
             if not (skill_dir / "SKILL.md").exists():
                 continue
 
-            # Validate skill structure
             is_valid, errors = self._validator.validate(skill_dir)
             if not is_valid:
                 logger.warning(
@@ -83,9 +91,10 @@ class SkillRegistry:
                     )
                     continue
 
-                # Duplicate skill name conflict detection
-                if meta.name in self._metadata:
-                    existing_dir = self._skill_dirs[meta.name]
+                # Intra-scan duplicate (two skill dirs in same scan declare
+                # the same name) — keep the first, warn about the rest.
+                if meta.name in new_metadata:
+                    existing_dir = new_skill_dirs[meta.name]
                     logger.warning(
                         f"Duplicate skill name '{meta.name}': "
                         f"'{skill_dir}' conflicts with already-loaded '{existing_dir}', "
@@ -93,40 +102,88 @@ class SkillRegistry:
                     )
                     continue
 
-                self._metadata[meta.name] = meta
-                self._skill_dirs[meta.name] = skill_dir
+                new_metadata[meta.name] = meta
+                new_skill_dirs[meta.name] = skill_dir
                 logger.info(f"Loaded skill: {meta.name} ({meta.category})")
             except Exception as e:
                 logger.warning(f"Failed to load skill from {skill_dir}: {e}")
 
-    def reload(self, skills_dir: Optional[Path] = None) -> None:
-        """Reload all skills (for hot-reload).
+        return new_metadata, new_skill_dirs
 
-        Clears all caches and re-scans the directory.
+    def load_from_directory(self, skills_dir: Path) -> None:
+        """Scan ``skills_dir`` and ADD newly-discovered skills to the registry.
+
+        Additive: does not remove or replace existing skills already in
+        the registry. For full hot-reload semantics (atomically replace the
+        registry contents with what's currently on disk), use ``reload()``.
+
+        Invalid skills are skipped with a warning log. Skills whose name
+        appears in ``settings.disabled_skills`` are skipped silently with
+        an INFO log so the user can re-enable them later.
         """
-        self._metadata.clear()
-        self._instructions_cache.clear()
-        self._skill_dirs.clear()
+        scanned_meta, scanned_dirs = self._scan_directory(skills_dir)
+        # Additive merge — preserve already-loaded entries, add the rest.
+        for name, meta in scanned_meta.items():
+            if name in self._metadata:
+                # Cross-scan duplicate (caller is loading from a second dir
+                # that overlaps with what's already loaded).
+                existing_dir = self._skill_dirs.get(name)
+                logger.warning(
+                    f"Duplicate skill name '{name}': '{scanned_dirs[name]}' "
+                    f"conflicts with already-loaded '{existing_dir}', skipping"
+                )
+                continue
+            self._metadata[name] = meta
+            self._skill_dirs[name] = scanned_dirs[name]
+
+    def reload(self, skills_dir: Optional[Path] = None) -> None:
+        """Hot-reload via copy-and-swap atomic replacement.
+
+        Builds fresh ``metadata`` / ``skill_dirs`` dicts off ``self``, then
+        atomically reassigns them. Concurrent readers (``activate`` /
+        ``get_skill`` / ``__contains__``) running in another thread always
+        see either the fully-old or the fully-new state — never a
+        half-cleared one. This fixes the race window the legacy
+        ``clear() + rescan`` had against ``SkillWatcher``'s Timer thread.
+
+        Tier 2 ``_instructions_cache`` is reset: any cached instructions
+        may reference now-stale content; the next ``activate()`` call
+        repopulates from disk.
+
+        If ``skills_dir`` is not provided, falls back to the parent of
+        any currently-loaded skill (preserves prior reload signature).
+        """
+        # Resolve which parent directory to scan.
         dir_to_scan = skills_dir or next(iter(self._skill_dirs.values()), None)
-        if dir_to_scan is not None:
-            # If we had skill_dirs, get the parent; otherwise use as-is
-            if not dir_to_scan.exists():
-                return
-            # Determine if this is a single skill dir or the parent skills dir
-            parent = dir_to_scan.parent
-            if (parent / "SKILL.md").exists() or not any(
-                d.is_dir() and (d / "SKILL.md").exists() for d in parent.iterdir()
+        if dir_to_scan is None or not dir_to_scan.exists():
+            return
+
+        # Normalise: ``skill_dirs`` values point at individual skill dirs;
+        # we need to scan their parent (the directory CONTAINING skill
+        # subdirs). When ``dir_to_scan`` is already such a parent, its
+        # immediate children include at least one ``SKILL.md``-bearing dir.
+        has_skill_subdirs = any(
+            d.is_dir() and (d / "SKILL.md").exists()
+            for d in dir_to_scan.iterdir()
+        )
+        if not has_skill_subdirs:
+            dir_to_scan = dir_to_scan.parent
+            if not any(
+                d.is_dir() and (d / "SKILL.md").exists()
+                for d in dir_to_scan.iterdir()
             ):
-                # It's a single skill dir, scan the parent
-                pass
-            # Always scan the parent directory that contains skill subdirs
-            # Try the parent first
-            if any(d.is_dir() and (d / "SKILL.md").exists() for d in dir_to_scan.iterdir()):
-                self.load_from_directory(dir_to_scan)
-            else:
-                parent = dir_to_scan.parent
-                if any(d.is_dir() and (d / "SKILL.md").exists() for d in parent.iterdir()):
-                    self.load_from_directory(parent)
+                return  # nothing to scan anywhere
+
+        new_metadata, new_skill_dirs = self._scan_directory(dir_to_scan)
+
+        # Atomic swap. Reader-visible state moves from old-snapshot to
+        # new-snapshot in two single-bytecode reference assignments. A
+        # reader that interleaves with these only observes a skill
+        # appearing/disappearing — the correct behaviour when the user
+        # has just added/removed a skill on disk.
+        self._skill_dirs = new_skill_dirs
+        self._metadata = new_metadata
+        self._instructions_cache = {}
 
     def build_catalog_prompt(self) -> str:
         """Generate skill catalog text for system prompt / activate_skill tool description."""
@@ -211,11 +268,10 @@ class SkillRegistry:
     # under the same target (e.g., disk+fill vs disk+burn both under "磁盘").
     _ACTION_KEYWORD_MAP = {
         "fill": ("填充", "fill", "使用率", "空间"),      # 目录级：使用率、空间 → 磁盘使用率目录
-        "fullload": ("fullload", "满载"),                 # 去除 "CPU"/"cpu"（与 target 交叉）
+        "fullload": ("fullload", "满载", "使用率"),          # "使用率" 区分 cpu使用率过高 vs CPU_Throttling
         "burn": ("burn", "IO", "读写"),                    # 目录级：IO、读写 → 磁盘IO目录
         "load": ("load", "加载", "压力"),                  # 内存压力场景
-        "delay": ("delay", "延迟"),
-        "loss": ("loss", "丢包"),
+        "drop": ("drop", "丢包", "丢弃"),
         "kill": ("kill", "杀死"),
         "dns": ("dns", "DNS", "域名"),
     }
@@ -253,15 +309,18 @@ class SkillRegistry:
             if not matching_dirs:
                 continue
 
-            # Step 2: If target keywords available, narrow down
+            # Step 2: Narrow by target keywords
             target_keywords = self._TARGET_KEYWORD_MAP.get(target, (target,))
-            if target_keywords and len(matching_dirs) > 1:
+            if target_keywords:
                 narrowed = [
                     d for d in matching_dirs
                     if any(kw in d.name for kw in target_keywords)
                 ]
                 if narrowed:
                     matching_dirs = narrowed
+                elif target in self._TARGET_KEYWORD_MAP:
+                    # Known target with zero directory matches → no case exists
+                    continue
 
             # Step 2.5: Further narrow by action keywords (directory-level)
             # NOTE: Must be outside Step 2's if block so it executes even when

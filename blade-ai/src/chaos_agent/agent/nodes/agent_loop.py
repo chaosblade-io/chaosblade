@@ -14,7 +14,9 @@ from chaos_agent.agent.nodes._kubeconfig_inject import (
 )
 from chaos_agent.agent.nodes._store_sync import sync_to_store
 from chaos_agent.agent.nodes.react_helpers import (
+    detect_action_stagnation,
     detect_repeated_tool_calls,
+    detect_tool_error_hint,
     emit_debug_tool_messages,
     extract_tool_call_fields,
     log_reasoning_content,
@@ -28,7 +30,8 @@ from chaos_agent.agent.prompts import (
 )
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
-from chaos_agent.errors import FailureReason, enrich_failure_reason
+from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
@@ -212,9 +215,8 @@ async def agent_loop(state: AgentState) -> dict:
         )
         tracker.fail(f"Agent loop exceeded max iterations ({MAX_AGENT_LOOP})")
         return {
-            "error": f"Agent loop exceeded max iterations ({MAX_AGENT_LOOP})",
             "safety_status": "rejected",
-            "failure_reason": f"{FailureReason.PLANNING_TIMEOUT.value}: Agent loop exceeded max iterations ({MAX_AGENT_LOOP})",
+            **fail_state(FailureCategory.PLANNING_TIMEOUT, f"max_iterations={MAX_AGENT_LOOP}"),
         }
 
     # The actual LLM reasoning is handled by LangGraph's ReAct pattern
@@ -228,7 +230,7 @@ async def agent_loop(state: AgentState) -> dict:
     return mark_wall_clock_timeout(state, {"agent_loop_count": count})
 
 
-def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
+def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", registry=None):
     """Create an agent_loop node with optional PreReasoningHook and LLM.
 
     When llm is provided, the node performs actual LLM reasoning
@@ -276,11 +278,9 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
                 f"{task_id}"
             )
             tracker.fail(f"Agent loop exceeded max iterations ({MAX_AGENT_LOOP})")
-            base = f"{FailureReason.PLANNING_TIMEOUT.value}: Agent loop exceeded max iterations ({MAX_AGENT_LOOP})"
             result = {
-                "error": f"Agent loop exceeded max iterations ({MAX_AGENT_LOOP})",
                 "safety_status": "rejected",
-                "failure_reason": enrich_failure_reason(base, state.get("messages", [])),
+                **fail_state(FailureCategory.PLANNING_TIMEOUT, f"max_iterations={MAX_AGENT_LOOP}", state.get("messages", [])),
             }
             await sync_to_store(state, result)
             return result
@@ -294,6 +294,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
         emit_debug_tool_messages(tracker, state)
 
         # 3. Collect environment info and call LLM with bound tools
+        _resolved_use_case_path = None
         if llm is not None:
             messages = list(state.get("messages", []))
 
@@ -347,10 +348,34 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
                     fi_lines.append(f"Params: {json.dumps(dict(_spec.params), ensure_ascii=False)}")
                 if _spec.user_description:
                     fi_lines.append(f"User request: {_spec.user_description}")
-                fi_lines.append(
-                    "\nProceed directly: activate the matching skill, verify the "
-                    "target if not already verified, and generate your execution plan."
-                )
+
+                _resolved_use_case_path = state.get("matched_use_case_path")
+                if not _resolved_use_case_path and registry:
+                    _resolved_use_case_path = registry.match_use_case(
+                        _spec.scope, _spec.blade_target, _spec.blade_action,
+                    )
+                if _resolved_use_case_path:
+                    _catalogue_dir = _resolved_use_case_path.rsplit("/", 1)[0] + "/"
+                    fi_lines.append(
+                        f"\nMatched catalogue directory: {_catalogue_dir}"
+                        f"\nBest match: {_resolved_use_case_path}"
+                        "\n→ List the directory with read_skill_resource to see all "
+                        "available cases, then read the one that best matches "
+                        "the user's scenario."
+                    )
+                    fi_lines.append(
+                        "\nProceed: activate the matching skill, verify the "
+                        "target if not already verified, and generate your execution plan."
+                    )
+                else:
+                    fi_lines.append(
+                        "\n⚠️ No matching catalogue case found for this fault type."
+                        "\nYou MUST follow the discovery flow in SKILL.md: "
+                        "use read_skill_resource to browse the catalogue, "
+                        "locate a matching use-case, and load it."
+                        "\nIf no match exists after discovery, inform the user "
+                        "this scenario is not currently supported and STOP."
+                    )
                 fi_msg = HumanMessage(content="\n".join(fi_lines))
                 messages.append(fi_msg)
                 _injections_for_state.append(fi_msg)
@@ -359,6 +384,16 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
             loop_hint = detect_repeated_tool_calls(messages)
             if loop_hint:
                 messages.append(HumanMessage(content=loop_hint))
+
+            # --- Action stagnation detection (tool-name level, ignores args) ---
+            stagnation_hint, stagnant_tool = detect_action_stagnation(messages)
+            if stagnation_hint:
+                messages.append(HumanMessage(content=stagnation_hint))
+
+            # --- Tool error introspection (runtime feedback > static docs) ---
+            error_hint = detect_tool_error_hint(messages)
+            if error_hint:
+                messages.append(HumanMessage(content=error_hint))
 
             # --- Convergence hints (planning conclusion prompts) ---
             # Aligned with execute_loop's 3-tier convergence system.
@@ -371,8 +406,11 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
                     f"**Iteration Progress**: You are on iteration {count} of max "
                     f"{MAX_AGENT_LOOP} ({remaining} remaining). "
                     f"If you have already activated a skill and verified the target, "
-                    f"output your FINAL planning summary now (pure text, no tool calls) "
-                    f"so execution can begin. Do not repeat queries you have already made."
+                    f"call `finish_planning` with a brief summary to proceed to execution. "
+                    f"If you have determined the request cannot be fulfilled (safety violation, "
+                    f"no matching use-case), call `finish_planning` with `rejected=True` "
+                    f"and `rejection_reason`. "
+                    f"Do not repeat queries you have already made."
                 )))
             elif count == MAX_AGENT_LOOP - 1:
                 # Tier 2: Urgent warning — second-to-last iteration
@@ -380,7 +418,9 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
                     f"**CRITICAL WARNING**: This is iteration {count} of max "
                     f"{MAX_AGENT_LOOP} — your SECOND-TO-LAST iteration.\n"
                     f"If a skill is activated and you have gathered enough context:\n"
-                    f"  - Output your final planning summary NOW (no tool calls).\n"
+                    f"  - Call `finish_planning` with a summary NOW (preferred).\n"
+                    f"If the request is infeasible:\n"
+                    f"  - Call `finish_planning(rejected=True, rejection_reason=\"...\")` now.\n"
                     f"If you absolutely need one more piece of information:\n"
                     f"  - Make ONE final tool call — you MUST conclude on the next "
                     f"iteration.\n"
@@ -403,7 +443,13 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
             if count >= MAX_AGENT_LOOP:
                 llm_with_tools = llm
             else:
-                llm_with_tools = llm.bind_tools(tools) if tools else llm
+                tools_this_iter = list(tools) if tools else []
+                if stagnant_tool:
+                    tools_this_iter = [
+                        t for t in tools_this_iter
+                        if getattr(t, "name", "") != stagnant_tool
+                    ]
+                llm_with_tools = llm.bind_tools(tools_this_iter) if tools_this_iter else llm
 
             # Record system prompt to session store (dedup handles repeated prompts)
             record_system_prompt(hook, state, system_prompt)
@@ -415,7 +461,11 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
             response = None
 
         # 4. Build result
-        result = {"agent_loop_count": count}
+        result = {"agent_loop_count": count, "planning_rejected": False}
+
+        # Persist matched catalogue path for downstream nodes (verifier etc.)
+        if _resolved_use_case_path:
+            result["matched_use_case_path"] = _resolved_use_case_path
 
         # Reset safety_status for replan so safety_check re-evaluates the corrected plan
         if is_replan:
@@ -475,7 +525,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
                 # prefers ``kubectl describe pod foo`` over ``kubectl get
                 # pod foo`` would never get namespace/names derived.
                 if (
-                    tc_name == "kubectl"
+                    tc_name in ("kubectl", "kubectl_ro")
                     and tc_args.get("subcommand") in ("get", "describe", "top")
                 ):
                     _spec_now = (
@@ -510,6 +560,56 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
                         result["plan"] = plan_content
                         logger.info(f"Fault plan generated ({len(plan_content)} chars)")
 
+                if tc_name == "finish_planning":
+                    if tc_args.get("rejected"):
+                        reason = tc_args.get("rejection_reason") or tc_args.get("summary", "Agent rejected the request")
+                        result.update(fail_state(
+                            FailureCategory.PLANNING_REJECTED,
+                            reason,
+                            state.get("messages", []) + result.get("messages", []),
+                        ))
+                    else:
+                        summary = tc_args.get("summary", "")
+                        if summary and not result.get("plan"):
+                            result["plan"] = summary
+
+            # Satisfy ToolMessage contract when finish_planning bypasses ToolNode.
+            # Generate synthetic ToolMessages for ALL tool_calls in this response
+            # so the message history stays valid for downstream LLM calls.
+            _has_finish_planning = any(
+                (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")) == "finish_planning"
+                for tc in tool_calls
+            )
+            if _has_finish_planning:
+                synthetic_tms = []
+                for tc in tool_calls:
+                    _tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+                    _tc_id = (
+                        tc.get("id", "") if isinstance(tc, dict)
+                        else getattr(tc, "id", "")
+                    ) or f"call_{_tc_name}_{count}"
+                    if _tc_name == "finish_planning":
+                        _fp_args = (tc.get("args") or {}) if isinstance(tc, dict) else (getattr(tc, "args", None) or {})
+                        _fp_rejected = _fp_args.get("rejected", False)
+                        _fp_summary = _fp_args.get("summary", "")
+                        if _fp_rejected:
+                            _fp_reason = _fp_args.get("rejection_reason") or _fp_summary
+                            tm_content = f"Planning rejected. Reason: {_fp_reason}"
+                        else:
+                            tm_content = f"Planning finalized. Summary: {_fp_summary}"
+                        synthetic_tms.append(ToolMessage(
+                            content=tm_content,
+                            tool_call_id=_tc_id,
+                            name="finish_planning",
+                        ))
+                    else:
+                        synthetic_tms.append(ToolMessage(
+                            content="(skipped — finish_planning signaled end of planning phase)",
+                            tool_call_id=_tc_id,
+                            name=_tc_name,
+                        ))
+                result["messages"] = result.get("messages", []) + synthetic_tms
+
             # Emit debug-level status event with LLM reasoning summary
             if settings.is_debug:
                 debug_info, tool_names = summarize_llm_response(response)
@@ -536,6 +636,25 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = ""):
 
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result, hook_updates)
+
+        # --- Terminal conclusion detection ---
+        # In Phase 1, the LLM has tools bound (activate_skill,
+        # read_skill_resource, kubectl_ro, finish_planning). Text-only
+        # output without activating a skill means the LLM concluded it
+        # cannot plan this injection. Set error so the router's
+        # error-branch routes to "reject" — without this, the router
+        # returns "continue" and the LLM repeats the same conclusion.
+        if response is not None:
+            _has_tool_calls = bool(getattr(response, "tool_calls", None))
+            _has_skill = bool(result.get("skill_name") or state.get("skill_name"))
+            if not _has_tool_calls and not _has_skill and not result.get("error"):
+                _conclusion = (getattr(response, "content", "") or "").strip()
+                if _conclusion:
+                    result.update(fail_state(
+                        FailureCategory.PLANNING_TIMEOUT,
+                        "LLM concluded without tool use or skill activation",
+                        state.get("messages", []) + result.get("messages", []),
+                    ))
 
         tracker.complete(f"Agent loop iteration {count} done")
         await sync_to_store(state, result)

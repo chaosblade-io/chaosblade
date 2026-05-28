@@ -149,7 +149,7 @@ jobs:
       #   run: |
       #     node scripts/smoke-i18n.mjs
       #     node scripts/smoke-slash.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: tui-bundle
           # Both cli.js (the bundle) and package.json (the {"type":"module"}
@@ -196,7 +196,7 @@ jobs:
 
       # Pull the TS bundle into ``blade-ai/tui/dist/cli.js`` BEFORE
       # pyinstaller runs.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           name: tui-bundle
           path: blade-ai/tui/dist
@@ -361,7 +361,7 @@ jobs:
           PLATFORM="${{ matrix.os }}-${{ matrix.arch }}"
           tar -czf "blade-ai-${PLATFORM}.tar.gz" -C blade-ai/dist blade-ai
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: blade-ai-${{ matrix.os }}-${{ matrix.arch }}
           path: blade-ai-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
@@ -373,7 +373,7 @@ jobs:
     needs: [verify-versions, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -386,7 +386,7 @@ jobs:
           cat checksums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.verify-versions.outputs.tag }}
           generate_release_notes: true

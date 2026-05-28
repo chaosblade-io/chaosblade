@@ -85,6 +85,7 @@ async def _finalize_inject_session(
     is_open_conversation: bool | None = None,
     error_log_level: str = "warning",
     precomputed_values: dict | None = None,
+    tui_session_store=None,
 ) -> None:
     """Finalize an inject-type session by reading final graph state and
     persisting the result envelope.
@@ -121,6 +122,14 @@ async def _finalize_inject_session(
         caller (e.g. for ``is_open_conversation`` computation).
         When provided, the internal ``aget_state`` call is skipped,
         avoiding a redundant checkpoint read.
+    tui_session_store : TuiSessionStore | None
+        Caller's ``self._tui_session_store``. Needed only on the
+        ``is_open_conversation=True`` path so mid-conversation intent
+        dialogue is routed to the TUI session file instead of the task
+        session file. ``None`` (default) falls back to ``session_store``.
+        This is a parameter rather than a free ``self`` reference
+        because ``_finalize_inject_session`` is a module-level function,
+        not a method.
     """
     if not session_store:
         return
@@ -169,10 +178,13 @@ async def _finalize_inject_session(
         # (intent clarification phase), not task file.
         if is_open_conversation is True:
             try:
-                # Route intent dialogue to TUI session store
+                # Route intent dialogue to TUI session store. Note this
+                # is a module-level function, so the caller must pass
+                # ``tui_session_store`` explicitly — using ``self``
+                # here would NameError at runtime.
                 tui_ses_id = values_fin.get("tui_session_id", "") if values_fin else ""
-                if self._tui_session_store and tui_ses_id:
-                    self._tui_session_store.append_dialogue(tui_ses_id, remaining)
+                if tui_session_store and tui_ses_id:
+                    tui_session_store.append_dialogue(tui_ses_id, remaining)
                 else:
                     # Fallback: no tui_session_store available (non-TUI mode)
                     session_store.append_messages(session_id, remaining)
@@ -353,8 +365,24 @@ class AgentRunner:
         prereq_checker = PrerequisitesChecker()
         await prereq_checker.check_startup_prerequisites(self._registry)
 
+        # E9 — CLI MCP client init. Same lifecycle as server lifespan
+        # (connect_all with per-server timeout), but persisted on the
+        # runner instance and torn down in close().
+        from chaos_agent.config.settings import settings as _settings
+        self._mcp_manager = None
+        if _settings.mcp_enabled:
+            from chaos_agent.mcp.manager import McpManager
+            self._mcp_manager = McpManager()
+            try:
+                await self._mcp_manager.connect_all(
+                    connect_timeout_seconds=_settings.mcp_connect_timeout_seconds,
+                )
+            except Exception as e:
+                logger.warning(f"MCP startup failed (continuing): {e}")
+                self._mcp_manager = None
+
         # Create agents with checkpointer
-        self._agents = await create_agent(self._registry)
+        self._agents = await create_agent(self._registry, mcp_manager=self._mcp_manager)
         self._checkpointer_conn = self._agents.get("checkpointer_conn")
         self._session_store = self._agents.get("session_store")
         self._initialized = True
@@ -791,6 +819,7 @@ class AgentRunner:
                 is_open_conversation=_is_open if _interaction_mode == "tui" else None,
                 error_log_level="warning",
                 precomputed_values=_vals if _interaction_mode == "tui" else None,
+                tui_session_store=self._tui_session_store,
             )
             done_event.set()
             if printer_task is not None:
@@ -1025,6 +1054,7 @@ class AgentRunner:
                 kwargs=kwargs,
                 is_open_conversation=None,  # blocking inject always finalizes
                 error_log_level="warning",
+                tui_session_store=self._tui_session_store,
             )
             done_event.set()
             await printer_task
@@ -1041,6 +1071,16 @@ class AgentRunner:
                 logger.warning(f"Failed to close checkpointer connection: {e}")
             finally:
                 self._checkpointer_conn = None
+
+        # E9 — MCP client disconnect (reap stdio children, close HTTP sessions)
+        _mcp = getattr(self, "_mcp_manager", None)
+        if _mcp is not None:
+            try:
+                await _mcp.disconnect_all()
+            except Exception as e:
+                logger.warning(f"MCP disconnect failed: {e}")
+            finally:
+                self._mcp_manager = None
 
         # Close TaskStore backend
         try:
@@ -1303,6 +1343,7 @@ class AgentRunner:
                 is_open_conversation=_is_open_conv,
                 error_log_level="debug",
                 precomputed_values=_vals,
+                tui_session_store=self._tui_session_store,
             )
             done_event.set()
             unsubscribe(thread_id, status_queue)

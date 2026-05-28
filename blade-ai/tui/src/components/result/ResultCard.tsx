@@ -43,6 +43,7 @@
 import { Box, Text } from "ink";
 import { memo } from "react";
 import { useBootCardWidth } from "../boot/BootCardFrame.js";
+import { PostmortemSection } from "./PostmortemSection.js";
 import { t } from "../../i18n/index.js";
 import type { ResultItem } from "../../state/types.js";
 import { Theme } from "../../theme/colors.js";
@@ -196,6 +197,8 @@ const ResultCardInternal: React.FC<{ item: ResultItem }> = ({ item }) => {
     else if (namesStr) targetStr = namesStr;
   }
   const hasSideEffects = !!item.sideEffects && item.sideEffects.length > 0;
+  const hasSideEffectsSummary = !!item.sideEffectsSummary;
+  const showSideEffects = item.status === "success" || item.status === "partial";
   const replanCount = item.replanCount ?? 0;
   // Guard: skip the Outcome section entirely when no metadata field
   // is populated. Without this guard, a malformed payload (no
@@ -288,28 +291,36 @@ const ResultCardInternal: React.FC<{ item: ResultItem }> = ({ item }) => {
           </>
         )}
 
-        {/* Side effects — bullet list of unintended outcomes the
-         *  injection produced (pod restarts, HPA scaling, etc.).
-         *  Section is omitted when the payload carries nothing
-         *  notable so a clean run doesn't render an empty heading. */}
-        {hasSideEffects && (
+        {/* Side effects — always shown on successful injection.
+         *  Body uses backend-assembled summary (covers all detector
+         *  categories dynamically); falls back to item list when
+         *  specific effects were detected. */}
+        {showSideEffects && (
           <>
             <SectionHeading label={t("result.section.side_effects")} />
             <Box marginTop={1} flexDirection="column">
-              {item.sideEffects!.map((effect, i) => (
-                <Box key={i}>
-                  <Box minWidth={ROW_LABEL_WIDTH}>
-                    <Text color={Theme.text.secondary}>
-                      {i === 0 ? t("result.label.side_effect_item") : ""}
-                    </Text>
+              {hasSideEffects ? (
+                item.sideEffects!.map((effect, i) => (
+                  <Box key={i}>
+                    <Box minWidth={ROW_LABEL_WIDTH}>
+                      <Text color={Theme.text.secondary}>
+                        {i === 0 ? t("result.label.side_effect_item") : ""}
+                      </Text>
+                    </Box>
+                    <Box flexGrow={1}>
+                      <Text color={Theme.gray[300]} wrap="wrap">
+                        {effect}
+                      </Text>
+                    </Box>
                   </Box>
-                  <Box flexGrow={1}>
-                    <Text color={Theme.gray[300]} wrap="wrap">
-                      {effect}
-                    </Text>
-                  </Box>
-                </Box>
-              ))}
+                ))
+              ) : (
+                <Field
+                  label={t("result.label.side_effect_item")}
+                  value={item.sideEffectsSummary || t("result.side_effects_none")}
+                  wrap
+                />
+              )}
             </Box>
           </>
         )}
@@ -359,6 +370,18 @@ const ResultCardInternal: React.FC<{ item: ResultItem }> = ({ item }) => {
           </>
         )}
       </Box>
+
+      {/* T6 — PostmortemSection sits BETWEEN the main result box and
+       *  the Replay hint. Rendered only when the server attached a
+       *  postmortem payload (success / qualifying failure with LLM
+       *  generation enabled). Absent when disabled / timed out — the
+       *  card collapses cleanly to its original shape. */}
+      {item.postmortem && (
+        <PostmortemSection
+          markdown={item.postmortem.markdown}
+          path={item.postmortem.path}
+        />
+      )}
 
       {/* Replay hint sits OUTSIDE the box (matches the original
        *  card's affordance — a slash command suggestion the user

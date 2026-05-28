@@ -115,30 +115,21 @@ def parse_blade_flags(flags_str: str) -> dict[str, str]:
 _FAULT_TYPE_MIN_DURATION: dict[tuple[str, str, str], int] = {
     # Node-level: high latency (kubectl debug + host-level commands)
     ("node", "disk", "fill"): 600,
-    ("node", "network", "delay"): 600,
-    ("node", "network", "loss"): 600,
+    ("node", "network", "drop"): 600,
     ("node", "cpu", "fullload"): 600,
     ("node", "mem", "load"): 600,
     ("node", "disk", "burn"): 600,
-    ("node", "network", "corrupt"): 600,
-    ("node", "network", "duplicate"): 600,
-    ("node", "network", "reorder"): 600,
     # Pod-level: medium latency (kubectl top/exec/describe)
     ("pod", "cpu", "fullload"): 600,
     ("pod", "mem", "load"): 600,
-    ("pod", "network", "delay"): 600,
-    ("pod", "network", "loss"): 600,
+    ("pod", "network", "drop"): 600,
     ("pod", "disk", "fill"): 600,
     ("pod", "disk", "burn"): 600,
-    ("pod", "network", "corrupt"): 600,
-    ("pod", "network", "duplicate"): 600,
-    ("pod", "network", "reorder"): 600,
     ("pod", "process", "kill"): 600,
     # Container-level
     ("container", "cpu", "fullload"): 600,
     ("container", "mem", "load"): 600,
-    ("container", "network", "delay"): 600,
-    ("container", "network", "loss"): 600,
+    ("container", "network", "drop"): 600,
 }
 
 # Default minimum duration when fault type is not in the table

@@ -62,6 +62,12 @@ SCOPE_READONLY = "__readonly__"
 SCOPE_BANNED = "__banned__"
 SCOPE_UNKNOWN = "__unknown__"
 
+# Namespaces where ChaosBlade tool pods are deployed. When kubectl exec
+# targets a pod in one of these namespaces, the inner blade command is
+# a Tier 1 injection — the namespace of the ACTUAL target differs from
+# the tool pod's namespace.
+TOOL_POD_NAMESPACES: frozenset[str] = frozenset({"chaosblade"})
+
 
 # ---------------------------------------------------------------------------
 # Kind canonicalisation — kubectl accepts singular / plural / short
@@ -348,7 +354,8 @@ def infer_effective_target(
     if tool_name in ("blade_status", "blade_query_k8s",
                      "read_knowledge_resource", "read_skill_resource",
                      "activate_skill", "submit_fault_intent",
-                     "kubectl_ro", "read_file", "save_fault_plan"):
+                     "kubectl_ro", "read_file", "save_fault_plan",
+                     "finish_planning"):
         return EffectiveTarget(
             scope=SCOPE_READONLY,
             namespace="",
@@ -797,7 +804,7 @@ def _classify_inline_blade(
     blade_action = rest[0] if rest else ""
 
     # Parse flags inside the inner cmd
-    ns = parse_namespace(rest, default="default")
+    ns = parse_namespace(rest, default="")
     names = _parse_blade_names(rest)
     labels = parse_labels(rest)
     node_name = _parse_flag_value(rest, "--node")
@@ -808,8 +815,25 @@ def _classify_inline_blade(
     else:
         scope = BLADE_TARGET_TO_SCOPE.get(target_hint, scope_hint or "pod")
 
+    # Tier 1 detection: outer exec into a tool pod namespace + inner
+    # blade k8s command without explicit --namespace. Blade v1.8.0
+    # rejects --namespace for some subcommands (e.g. pod-network), so
+    # the agent legitimately omits it.
+    is_tier1 = (
+        is_k8s
+        and fallback_ns in TOOL_POD_NAMESPACES
+        and not ns  # no explicit --namespace in inner blade args
+    )
+
     # Cluster-scoped resources don't carry namespace
-    effective_ns = "" if scope == "node" else (ns or "default")
+    if scope == "node":
+        effective_ns = ""
+    elif ns:
+        effective_ns = ns
+    elif is_tier1:
+        effective_ns = ""
+    else:
+        effective_ns = "default"
 
     # Resolve names
     if scope == "node" and node_name:
@@ -832,6 +856,7 @@ def _classify_inline_blade(
         blade_action=blade_action,
         confidence=ConfidenceLevel.HIGH,
         raw_command=raw_command,
+        is_tier1_exec=is_tier1,
     )
 
 

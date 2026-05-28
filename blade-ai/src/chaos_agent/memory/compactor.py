@@ -249,10 +249,11 @@ SKILL_TRUNCATION_MARKER = (
 def truncate_to_tokens(content: str, max_tokens: int) -> str:
     """Truncate content to roughly max_tokens tokens, keeping the head.
 
-    Aligned with Claude Code's token-aware truncation. Uses the CJK-aware
-    `estimate_tokens` heuristic; the char budget is calibrated against the
-    actual content's chars/token ratio so CJK-heavy text isn't over- or
-    under-truncated.
+    Aligned with Claude Code's token-aware truncation. Uses the model-
+    aware ``chaos_agent.memory.tokens.count_tokens`` (tiktoken when the
+    configured model is recognised, CJK heuristic when not); the char
+    budget is calibrated against the content's actual chars/token
+    ratio so CJK-heavy text isn't over- or under-truncated.
 
     Args:
         content: Text content to potentially truncate.
@@ -262,14 +263,18 @@ def truncate_to_tokens(content: str, max_tokens: int) -> str:
         Content truncated to the token budget with a truncation marker
         if it exceeded the budget.
     """
-    from chaos_agent.memory.context_manager import estimate_tokens
+    from chaos_agent.memory.tokens import count_tokens
 
-    actual_tokens = estimate_tokens(content)
+    # Single-text count — use raw .count, not .safe_count: budgeting char
+    # truncation off an inflated value would over-trim. The downstream
+    # consumer cares about LLM-side accuracy, not threshold-direction
+    # safety, so the tighter number is correct here.
+    actual_tokens = count_tokens(content).count
     if actual_tokens <= max_tokens:
         return content
     # Calibrate chars/token from this content (mixed CJK/ASCII safe).
     chars_per_token = len(content) / actual_tokens if actual_tokens else 4
-    marker_tokens = estimate_tokens(SKILL_TRUNCATION_MARKER)
+    marker_tokens = count_tokens(SKILL_TRUNCATION_MARKER).count
     available_tokens = max(0, max_tokens - marker_tokens)
     char_budget = max(0, int(available_tokens * chars_per_token))
     return content[:char_budget] + SKILL_TRUNCATION_MARKER
@@ -386,9 +391,12 @@ def extract_critical_context(messages: list, state: dict) -> dict:
                 skill_content, POST_COMPACT_MAX_TOKENS_PER_SKILL
             )
 
-            # Then, check total budget
-            from chaos_agent.memory.context_manager import estimate_tokens
-            truncated_tokens = estimate_tokens(truncated)
+            # Then, check total budget. Single-text count, raw value —
+            # we're summing toward a hard budget cap, not making a
+            # threshold-trigger decision, so the more accurate count
+            # is the right one.
+            from chaos_agent.memory.tokens import count_tokens
+            truncated_tokens = count_tokens(truncated).count
             if total_skill_tokens + truncated_tokens > POST_COMPACT_SKILLS_TOKEN_BUDGET:
                 # Truncate further to remaining budget
                 remaining = POST_COMPACT_SKILLS_TOKEN_BUDGET - total_skill_tokens

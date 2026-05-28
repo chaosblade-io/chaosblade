@@ -59,7 +59,7 @@ export interface SubmitTurnOpts {
 export interface UseStreamApi {
   submitTurn: (input: string, opts?: SubmitTurnOpts) => Promise<void>;
   cancelTurn: () => void;
-  resolveConfirm: (taskId: string, answer: "approved" | "rejected") => Promise<void>;
+  resolveConfirm: (taskId: string, answer: string) => Promise<void>;
   /**
    * Allocate a fresh AbortController for a /replay run. Cancels any
    * previously-active replay before returning. The /replay handler
@@ -227,8 +227,20 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
       // don't need to merge across kinds.
       // Throttle windows — see the comment block above for why these
       // two kinds use different values.
+      //
+      // TOKEN goes to AgentMessage and the user sees the live token
+      // crawl, so we keep it tight (60ms ≈ 16Hz).
+      //
+      // THINKING only feeds ``state.thoughtBuffer`` for the eventual
+      // "▸ Thought for Ns" collapse — the live spinner doesn't display
+      // thinking text (see LoadingIndicator.tsx docblock), so 100ms
+      // (10Hz) is plenty for the buffer to accumulate without burning
+      // CPU on useLoadingIndicator re-renders. Was 50ms; doubling it
+      // halves the spinner-row dispatch frequency under Terminal.app
+      // (no GPU accel, sensitive to high-frequency dynamic frame
+      // updates), eliminating the perceived spinner jitter.
       const TOKEN_THROTTLE_MS = 60;
-      const THINKING_THROTTLE_MS = 50;
+      const THINKING_THROTTLE_MS = 100;
 
       let tokenBuffer = "";
       let tokenNode = "";
@@ -436,7 +448,7 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
   }, [client, sessionId]);
 
   const resolveConfirm = useCallback(
-    async (taskId: string, answer: "approved" | "rejected") => {
+    async (taskId: string, answer: string) => {
       // Optimistically reflect the answer in the UI; the SSE stream
       // is still open and will continue spitting events after the
       // server runs Command(resume=...).

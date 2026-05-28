@@ -56,3 +56,5 @@ site-build
 
 build/image/blade/chaosblade-*
 
+/blade-ai/tui/node_modules
+

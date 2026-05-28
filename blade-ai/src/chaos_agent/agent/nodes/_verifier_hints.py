@@ -108,174 +108,14 @@ def _extract_baseline_key_metrics(
 ) -> dict[str, str]:
     """Extract structured key metrics from baseline observations.
 
-    Returns a dict of metric_name → concise_value strings that LLM can
-    directly compare against its kubectl observations, without needing
-    to parse raw kubectl output to find the key numbers.
-
-    This addresses the root cause of "BaselineUsed=false" errors: LLM
-    sees raw kubectl output but fails to extract and compare key metrics
-    against baseline. By providing a pre-extracted summary, LLM only
-    needs to match its current observations to these named values.
+    Thin wrapper around ``_metric_extractor.extract_baseline_metrics``
+    (E2). The actual parsing lives in the shared extractor so Layer 2
+    verification can reuse the same per-format parsers on
+    post-injection kubectl output, not just baseline. Returns the
+    fault-filtered dict the existing Layer 2 prompt builder expects.
     """
-    metrics: dict[str, str] = {}
-    for obs in baseline.get("observations", []):
-        desc = obs.get("description", "").lower()
-        stdout = obs.get("stdout", "")
-        if obs.get("exit_code") != 0 or not stdout:
-            continue
-
-        # Disk usage from df -h (overlay/root partition)
-        # Covers: "Container disk usage", "Node disk usage",
-        #         plus any description containing "disk usage" or "df"
-        if "disk usage" in desc or "df" in desc:
-            _m = _parse_df_h_metrics(stdout)
-            if _m:
-                metrics.update(_m)
-
-        # Target path directory size from du -sh
-        if "directory size" in desc or "du" in desc:
-            for line in stdout.strip().splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 2 and parts[0]:
-                    metrics["Target path size"] = parts[0]
-                    break
-
-        # Pod status from kubectl describe pod (RestartCount, Ready, OOMKill)
-        # Covers all baseline_capture pod-describe descriptions:
-        #   "Pod status", "Pod conditions", "Pod conditions/restarts",
-        #   "Pod OOM events", "Pod events", "describe pod"
-        if ("pod" in desc and ("status" in desc or "conditions" in desc
-                               or "events" in desc or "restarts" in desc
-                               or "oom" in desc)) or "describe pod" in desc:
-            rc = _parse_restart_count(stdout)
-            if rc is not None:
-                metrics["RestartCount"] = str(rc)
-            if "Ready   True" in stdout or "Ready           True" in stdout:
-                metrics["Pod Ready"] = "True"
-            elif "Ready   False" in stdout:
-                metrics["Pod Ready"] = "False"
-            if "OOMKilled" in stdout:
-                metrics["Last termination reason"] = "OOMKilled"
-
-        # Disk IO from /proc/diskstats or iostat
-        # Covers: "Node disk IO", "Node disk IO utilization",
-        #         "Container disk IO utilization", "diskstats"
-        if "disk io" in desc or "diskstats" in desc or "io utilization" in desc:
-            _m = _parse_diskstats_summary(stdout)
-            if _m:
-                metrics.update(_m)
-
-        # CPU iowait from /proc/stat or iostat -c
-        # Covers: "Node CPU iowait", "Container CPU iowait", "iowait"
-        if "iowait" in desc:
-            _m = _parse_proc_stat_iowait(stdout)
-            if _m:
-                metrics.update(_m)
-
-        # Resource usage from kubectl top (CPU/Memory percentages)
-        # Covers: "Pod CPU/Memory", "Node resource usage", "Pod resource usage",
-        #         plus any description mentioning memory/top/usage with resource context
-        if ("cpu" in desc or "memory" in desc or "resource" in desc) and (
-            "top" in desc or "usage" in desc or "/" in desc
-        ):
-            for line in stdout.strip().splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 3 and ("mi" in parts[-1].lower() or "%" in parts[-1]):
-                    metrics["Memory usage"] = parts[-1]
-                    if len(parts) >= 4 and ("mi" in parts[2].lower() or "m" in parts[2].lower()):
-                        metrics["CPU usage"] = parts[2]
-                    break
-
-    return _filter_metrics_by_fault(metrics, blade_target, blade_action)
-
-
-def _parse_df_h_metrics(stdout: str) -> dict[str, str]:
-    """Parse df -h output to extract overlay/root partition metrics."""
-    metrics: dict[str, str] = {}
-    for line in stdout.strip().splitlines():
-        parts = line.strip().split()
-        if len(parts) < 6:
-            continue
-        if parts[0] == "Filesystem":
-            continue
-        use_pct, mount = parts[4], parts[5]
-        if mount == "/" or parts[0].startswith("overlay"):
-            metrics["Disk usage (overlay)"] = f"{use_pct} ({parts[2]}/{parts[1]})"
-    return metrics
-
-
-def _parse_restart_count(stdout: str) -> int | None:
-    """Extract Restart Count from kubectl describe pod output."""
-    for line in stdout.splitlines():
-        if "Restart Count" in line:
-            val = line.strip().split()[-1]
-            try:
-                return int(val)
-            except ValueError:
-                pass
-    return None
-
-
-def _parse_diskstats_summary(stdout: str) -> dict[str, str]:
-    """Parse /proc/diskstats to extract write throughput hint."""
-    for line in stdout.strip().splitlines():
-        parts = line.strip().split()
-        if len(parts) < 11:
-            continue
-        name = parts[2]
-        if name.startswith("vdb") or name.startswith("sdb"):
-            return {f"Disk writes ({name})": f"{parts[9]} sectors"}
-    return {}
-
-
-def _parse_proc_stat_iowait(stdout: str) -> dict[str, str]:
-    """Parse /proc/stat first line for iowait percentage."""
-    for line in stdout.strip().splitlines():
-        if line.startswith("cpu ") and not line.startswith("cpu0"):
-            parts = line.strip().split()
-            if len(parts) >= 6:
-                try:
-                    idle = int(parts[4])
-                    iowait = int(parts[5])
-                    pct = round(iowait / max(idle + iowait, 1) * 100, 1)
-                    return {"CPU iowait %": f"{pct}%"}
-                except (ValueError, ZeroDivisionError):
-                    pass
-    return {}
-
-
-def _filter_metrics_by_fault(
-    metrics: dict[str, str],
-    blade_target: str,
-    blade_action: str,
-) -> dict[str, str]:
-    """Keep only metrics relevant to the fault type to reduce noise.
-
-    Metric keys in the dict may include:
-    - Disk usage (overlay), Target path size, RestartCount, Pod Ready,
-      Last termination reason, Disk writes, CPU iowait %, Memory usage, CPU usage
-    Prefix matching (startswith) is used so "Disk usage" matches both
-    "Disk usage (overlay)" and plain "Disk usage".
-    """
-    always_keep = {"RestartCount", "Pod Ready", "Last termination reason",
-                    "Target path size"}
-    fault_metrics: dict[str, set[str]] = {
-        "disk": {"Disk usage", "Disk writes", "CPU iowait", "Target path size"},
-        "cpu": {"CPU usage", "Memory usage", "CPU iowait"},
-        "mem": {"Memory usage", "CPU usage"},
-        "network": {"Memory usage", "CPU usage"},
-        "process": {"RestartCount", "Pod Ready"},
-    }
-    relevant = set(always_keep)
-    target_key = blade_target.lower() if blade_target else ""
-    if target_key in fault_metrics:
-        for prefix in fault_metrics[target_key]:
-            for k in metrics:
-                if k.lower().startswith(prefix.lower()):
-                    relevant.add(k)
-    if not target_key or target_key not in fault_metrics:
-        relevant = set(metrics.keys()) | always_keep
-    return {k: v for k, v in metrics.items() if k in relevant}
+    from chaos_agent.agent.nodes._metric_extractor import extract_baseline_metrics
+    return extract_baseline_metrics(baseline, blade_target, blade_action)
 
 
 _COMMAND_PRIORITY_HINT = (
@@ -430,8 +270,7 @@ def _disk_burn_param_hints(parsed_flags: dict, scope: str | None = None) -> str:
 _PARAM_HINT_GENERATORS: dict[tuple[str, str], typing.Callable[..., str | None]] = {
     ("disk", "fill"): _disk_fill_param_hints,
     ("disk", "burn"): _disk_burn_param_hints,
-    # Future: ("network", "delay"): _network_delay_param_hints,
-    # Future: ("network", "loss"): _network_loss_param_hints,
+    # Future: ("network", "drop"): _network_drop_param_hints,
     # Future: ("cpu", "fullload"): _cpu_fullload_param_hints,
 }
 

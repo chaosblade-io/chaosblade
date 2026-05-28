@@ -444,12 +444,17 @@ export const en: Dict = {
   "result.label.target": "Target",
   "result.label.attempts": "Attempts",
   "result.label.side_effect_item": "Side effect",
+  "result.side_effects_none": "No collateral impact detected",
   "result.attempts.label": "succeeded after {n} auto-replan(s)",
   "result.status.success": "Injection succeeded",
   "result.status.partial": "Partial recovery",
   "result.status.failed": "Injection failed",
   "result.status.unknown": "Result",
   "result.show_for_timeline": "/replay {id} instant — for full timeline",
+
+  // -- Postmortem (T6) ---------------------------------------------
+  "postmortem.title": "Postmortem",
+  "postmortem.saved_at": "Full markdown: {path}",
 
   // -- ConfirmMessage chrome ----------------------------------------
   "confirm.title": "Confirm intent",
@@ -468,6 +473,11 @@ export const en: Dict = {
   "confirm.execution.title": "Confirm execution plan",
   "confirm.execution.proceed": "inject",
   "confirm.execution.cancel": "cancel",
+  "confirm.targetChange.title": "Target change confirmation",
+  "confirm.targetChange.original": "Original target",
+  "confirm.targetChange.proposed": "Proposed target",
+  "confirm.targetChange.approve": "approve change",
+  "confirm.targetChange.reject": "reject",
 
   // -- ConfirmMessage field labels ----------------------------------
   "confirm.field.fault_type": "Fault type",
@@ -504,12 +514,35 @@ export const en: Dict = {
   "confirm.section.target_health": "Target health",
   "confirm.section.conflicts": "Conflicting experiments",
   "confirm.section.audit_trail": "Audit trail",
+  "confirm.section.safety_score": "Safety score",
+  // E10 — multi-dimensional safety score panel labels
+  "safety_score.overall": "Overall",
+  "safety_score.blast_radius": "Blast radius",
+  "safety_score.frequency": "Frequency",
+  "safety_score.time": "Time",
+  "safety_score.topology": "Topology",
+  "safety_score.level.low": "low",
+  "safety_score.level.medium": "medium",
+  "safety_score.level.high": "high",
+  "safety_score.level.critical": "critical",
   // -- v3 extra field labels
   "confirm.field.attempt": "Attempt",
   "confirm.field.plan_path": "Plan file",
   "confirm.field.clarification_round": "Clarification",
   "confirm.field.intent_reasoning": "Reasoning",
   "confirm.field.health_summary": "Summary",
+  // Fault classification — L1's fault_type + (scope/target/action)
+  // triple, surfaced in L2 so operators see "this is mem-load" at a
+  // glance instead of inferring from ``params`` keys. Distinct from
+  // ``confirm.field.fault_type`` (which lives in L1 and shows the bare
+  // type only); this label denotes the full 3-axis semantic tag.
+  "confirm.field.fault": "Fault",
+  // Complexity flag — is_complex=true means the agent ran
+  // save_fault_plan and produced a formal multi-section plan markdown.
+  // Only rendered when true so simple plans don't carry a noisy
+  // "simple plan" badge.
+  "confirm.field.complexity": "Complexity",
+  "confirm.complexity.complex": "complex (formal plan generated)",
   "confirm.attempt.label": "attempt {n}",
   "confirm.clarification.label": "{n} clarification round(s)",
   "confirm.plan_saved": "saved ({path}) · /show plan to view",
@@ -524,6 +557,9 @@ export const en: Dict = {
   "confirm.params.none": "—",
   "confirm.health.all_clear": "all targets healthy",
   "confirm.health.not_run": "check not run",
+  "confirm.field.feasibility": "feasibility",
+  "confirm.feasibility.all_clear": "injection feasible",
+  "confirm.feasibility.not_run": "check not run",
   "confirm.intent.low_conf_audit": "Why this intent:",
 
   // -- Forge × Operator redesign: banner + headline + armed chip ----
@@ -567,6 +603,11 @@ export const en: Dict = {
 
   // -- ConfirmMessage option labels ---------------------------------
   "confirm.option.feedback": "Tell the agent something else…",
+
+  // -- ConfirmMessage Plan Builder --------------------------------
+  "confirm.plan_builder.title": "Plan Guide",
+  "confirm.plan_builder.default_question": "Please select an option",
+  "confirm.plan_builder.free_input": "Free input",
   "confirm.field.intent_confidence": "Intent confidence",
 
   // -- SlashMenu hint -----------------------------------------------

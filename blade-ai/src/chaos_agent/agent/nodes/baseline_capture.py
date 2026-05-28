@@ -91,11 +91,7 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
                         f"{{debug_pod}} -n {_TOOL_POD_NAMESPACE} -- iostat -xd 1 3",
                         mode="debug_two_step"),
     ],
-    ("pod", "network", "loss"): [
-        BaselineCommand("Service endpoints", "get", "endpoints -n {namespace}"),
-        BaselineCommand("Pod conditions", "describe", "pod {pod_name} -n {namespace}"),
-    ],
-    ("pod", "network", "delay"): [
+    ("pod", "network", "drop"): [
         BaselineCommand("Service endpoints", "get", "endpoints -n {namespace}"),
         BaselineCommand("Pod conditions", "describe", "pod {pod_name} -n {namespace}"),
     ],
