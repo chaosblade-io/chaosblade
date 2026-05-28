@@ -167,10 +167,10 @@ describe("ResultCard", () => {
       expect(replannedFrame).toContain("2");
     });
 
-    it("renders the Side effects section only when non-empty", () => {
+    it("renders the Side effects section always for success/partial", () => {
       const noEffects = baseResult({ sideEffects: undefined });
       const noFrame = render(<ResultCard item={noEffects} />).lastFrame() ?? "";
-      expect(noFrame).not.toContain("── 副作用");
+      expect(noFrame).toContain("── 副作用");
 
       const withEffects = baseResult({
         sideEffects: [
