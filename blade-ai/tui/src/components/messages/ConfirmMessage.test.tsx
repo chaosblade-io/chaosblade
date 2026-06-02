@@ -163,9 +163,11 @@ describe("ConfirmContextMessage", () => {
       );
     });
 
-    it("renders the safety status as the SAFE badge", () => {
+    it("renders the safety status as the safe badge", () => {
       const { lastFrame } = render(<ConfirmContextMessage item={item} />);
-      expect(lastFrame() ?? "").toContain("SAFE");
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("✓");
+      expect(frame).toContain("安全");
     });
 
     it("composes the target line as namespace + names", () => {
@@ -187,7 +189,8 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      expect(frame).toContain("WARNING");
+      expect(frame).toContain("⚠");
+      expect(frame).toContain("安全");
       const normalized = frame
         .replace(/[║╔╗╚╝═─│╭╮╰╯]/g, " ")
         .replace(/\s+/g, " ");
@@ -206,12 +209,12 @@ describe("ConfirmContextMessage", () => {
 
     it("places the safety row at the BOTTOM when status is safe", () => {
       // Section dividers were removed 2026-05-26; we now use the
-      // skill-name row as the top anchor and the SAFE glyph as the
+      // skill-name row as the top anchor and the safe checkmark as the
       // bottom marker to confirm the ordering survived.
       const { lastFrame } = render(<ConfirmContextMessage item={item} />);
       const frame = lastFrame() ?? "";
       const skillIdx = frame.indexOf("node-cpu-fullload");
-      const safetyIdx = frame.indexOf("SAFE");
+      const safetyIdx = frame.indexOf("✓");
       expect(skillIdx).toBeGreaterThan(-1);
       expect(safetyIdx).toBeGreaterThan(-1);
       expect(skillIdx).toBeLessThan(safetyIdx);
@@ -229,15 +232,12 @@ describe("ConfirmContextMessage", () => {
       });
       const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
       const frame = lastFrame() ?? "";
-      // WARNING badge must appear BEFORE the skill-name row.
-      const warningIdx = frame.indexOf("WARNING");
+      // Warning icon must appear BEFORE the skill-name row.
+      const warningIdx = frame.indexOf("⚠");
       const skillIdx = frame.indexOf("node-cpu-fullload");
       expect(warningIdx).toBeGreaterThan(-1);
       expect(skillIdx).toBeGreaterThan(-1);
       expect(warningIdx).toBeLessThan(skillIdx);
-      // Adaptive placement: warning shouldn't ALSO render as a bottom
-      // SAFE row — only one safety chip per card.
-      expect(frame).not.toContain("SAFE");
     });
 
     it("renders the Parameters section when payload carries a params dict", () => {
@@ -474,7 +474,8 @@ describe("ConfirmContextMessage", () => {
       // no plan content.
       expect(frame).not.toContain("技能");
       // Safety alert still appears at the top.
-      expect(frame).toContain("BLOCKED");
+      expect(frame).toContain("✗");
+      expect(frame).toContain("安全");
     });
 
     it("renders the safety score panel when payload.safety_score is present", () => {
