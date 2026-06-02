@@ -223,19 +223,23 @@ jobs:
           ls -la blade-ai/vendor/chaosblade
           file blade-ai/vendor/chaosblade/blade || true
 
-      # ── Linux/arm64: build inside manylinux docker (glibc 2.17 baseline) ─
-      - name: Build with PyInstaller (manylinux Docker)
+      # ── Linux: build inside Debian Bullseye Docker (glibc 2.31 baseline) ─
+      #
+      # manylinux2014 images ship a statically-linked Python (no
+      # libpython3.x.so), which PyInstaller cannot use — it requires a
+      # shared library at bundle time.  Debian Bullseye's python3.11
+      # package includes the shared lib and targets glibc 2.31, which
+      # covers any host with glibc ≥ 2.31 (CentOS 8+, Alma 9+, Ubuntu
+      # 20.04+, Amazon Linux 2023, etc).
+      - name: Build with PyInstaller (Debian Bullseye Docker)
         if: matrix.use_docker
         shell: bash
         run: |
           set -euo pipefail
-          # Pick the manylinux2014 image that matches the target arch.
-          # Image base is hard-coded here (instead of in the matrix) to
-          # keep the matrix entries lean — the mapping never changes.
           case "${{ matrix.target }}" in
-            linux_amd64) IMG=quay.io/pypa/manylinux2014_x86_64 ;;
-            linux_arm64) IMG=quay.io/pypa/manylinux2014_aarch64 ;;
-            *) echo "::error::no manylinux image for target ${{ matrix.target }}"; exit 1 ;;
+            linux_amd64)  IMG=python:3.11-slim-bullseye ;;
+            linux_arm64)  IMG=python:3.11-slim-bullseye ;;
+            *) echo "::error::no Docker image for target ${{ matrix.target }}"; exit 1 ;;
           esac
           docker run --rm \
             -v "$PWD/blade-ai:/src" \
@@ -243,22 +247,20 @@ jobs:
             "$IMG" \
             bash -c '
               set -euo pipefail
-              export PATH=/opt/python/cp311-cp311/bin:$PATH
               python --version
 
-              # tiktoken does not publish a manylinux2014_aarch64 wheel
-              # on PyPI, so pip falls back to building from sdist which
-              # requires a Rust toolchain. The manylinux2014 image does
-              # not ship with cargo, so we install rustup minimal into
-              # the throw-away container before pip install. The check
-              # is portable across both arches in case a future package
-              # tightens the same constraint on x86_64.
+              # Verify the shared library is present (PyInstaller
+              # requirement).
+              python -c "import sysconfig; print(sysconfig.get_config_var(\"LDLIBRARY\"))"
+
+              # tiktoken may need to build from source on some
+              # platforms — install Rust just in case.
               if ! command -v cargo >/dev/null 2>&1; then
                 curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
                   | sh -s -- -y --default-toolchain stable --profile minimal
                 export PATH="$HOME/.cargo/bin:$PATH"
               fi
-              cargo --version
+              cargo --version || true
 
               python -m pip install --upgrade pip
               python -m pip install -e ".[dev]"
