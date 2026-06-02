@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore", message="Core Pydantic V1 functionality", cate
 
 import typer
 
+from chaos_agent.cli.commands.capabilities_cmd import capabilities_sync
 from chaos_agent.cli.commands.config import config_command
 from chaos_agent.cli.commands.confirm import confirm_command
 from chaos_agent.cli.commands.inject import inject_command
@@ -215,6 +216,7 @@ app.command(name="inject", help="Inject a fault into a Kubernetes target")(injec
 app.command(name="recover", help="Recover a fault injection by task ID")(recover_command)
 app.command(name="metric", help="Query task status and execution metrics")(metric_command)
 app.command(name="list", help="List supported fault capabilities")(list_command)
+app.command(name="capabilities-sync", help="Sync: probe blade + LLM generate commands for each skill case (slow, manual)")(capabilities_sync)
 app.command(name="confirm", help="Confirm or reject a pending task")(confirm_command)
 app.command(name="version", help="Show version information")(version_command)
 app.command(name="update", help="Update blade-ai to the latest version")(update_command)

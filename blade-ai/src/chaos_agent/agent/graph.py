@@ -20,6 +20,7 @@ from chaos_agent.agent.nodes.intent_clarification import make_intent_clarificati
 from chaos_agent.agent.nodes.plan_builder import make_plan_builder
 from chaos_agent.agent.nodes.intent_confirm import intent_confirm
 from chaos_agent.agent.nodes.memory_nodes import load_memory, save_memory
+from chaos_agent.agent.nodes.plan_change_confirm import plan_change_confirm
 from chaos_agent.agent.nodes.recover_handler import recover_handler
 from chaos_agent.agent.nodes.recover_verifier import make_recover_verifier
 from chaos_agent.agent.nodes.reject import reject
@@ -33,6 +34,8 @@ from chaos_agent.agent.nodes.tool_screener import (
     tool_screener,
 )
 from chaos_agent.agent.nodes.verifier import make_verifier
+from chaos_agent.agent.nodes._verifier_finalize import make_finalize_verification
+from chaos_agent.agent.nodes._recover_finalize import make_finalize_recover_verification
 from chaos_agent.agent.router import (
     should_continue_agent_loop,
     should_continue_execute_loop,
@@ -40,12 +43,17 @@ from chaos_agent.agent.router import (
     should_continue_recover_verifier,
     should_continue_plan_builder,
     route_after_load_memory,
+    route_after_phase1_tools,
     route_after_safety,
     route_after_confirmation,
     route_after_baseline,
     route_after_direct_execute,
     route_after_intent_clarification,
     route_after_intent_confirm,
+    route_after_verifier_tools,
+    route_after_finalize,
+    route_after_recover_verifier_tools,
+    route_after_recover_finalize,
     should_continue_intent_clarification,
 )
 from chaos_agent.agent.state import AgentState
@@ -164,6 +172,9 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
 
     # Build verifier with LLM support and verifier tools
     verifier_node = make_verifier(hook=pre_reason_hook, llm=llm, tools=verifier_tools, registry=registry)
+    # Scheme B: finalize_verification node parses the submit_verification
+    # verdict (or text fallback) and runs all post-processing + cleanup.
+    finalize_verification_node = make_finalize_verification(registry=registry)
 
     # Direct path node: deterministic skill activation (no LLM)
     direct_setup_node = make_direct_setup(registry=registry)
@@ -205,6 +216,7 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
         handle_tool_errors=_phase1_handle_tool_error,
     ))
     graph.add_node("extract_planning_metadata", extract_planning_metadata)
+    graph.add_node("plan_change_confirm", plan_change_confirm)
     graph.add_node("direct_setup", direct_setup_node)
     graph.add_node("baseline_capture", with_phase_events("baseline_capture", "inject", baseline_capture_node))
     graph.add_node("se_snapshot", se_snapshot_node)
@@ -220,6 +232,7 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
     graph.add_node("tool_screener", tool_screener)
     graph.add_node("phase2_tools", ToolNode(phase2_tools))
     graph.add_node("verifier_loop", with_phase_events("verifier_loop", "verify", verifier_node))
+    graph.add_node("finalize_verification", with_phase_events("finalize_verification", "verify", finalize_verification_node))
     if verifier_tools:
         graph.add_node("verifier_tools", ToolNode(verifier_tools))
     graph.add_node("se_detect", se_detect_node)
@@ -333,15 +346,25 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
             "retry": "agent_loop",
         },
     )
-    graph.add_edge("phase1_tools", "agent_loop")
+    graph.add_conditional_edges(
+        "phase1_tools",
+        route_after_phase1_tools,
+        {
+            "agent_loop": "agent_loop",
+            "extract_planning_metadata": "extract_planning_metadata",
+            "plan_change_confirm": "plan_change_confirm",
+        },
+    )
+    graph.add_edge("plan_change_confirm", "agent_loop")
 
-    # extract_planning_metadata → safety_check OR agent_loop
+    # extract_planning_metadata → safety_check OR agent_loop OR reject
     # Guard: if no catalogue use-case was loaded, route back to agent_loop
     # so the LLM can follow the discovery flow or inform the user.
+    # If error is set (e.g. finish_planning rejected), route to reject.
     graph.add_conditional_edges(
         "extract_planning_metadata",
-        lambda s: "agent_loop" if s.get("planning_rejected") else "safety_check",
-        {"agent_loop": "agent_loop", "safety_check": "safety_check"},
+        lambda s: "reject" if s.get("error") else ("agent_loop" if s.get("planning_rejected") else "safety_check"),
+        {"agent_loop": "agent_loop", "safety_check": "safety_check", "reject": "reject"},
     )
 
     # safety_check → confirmation_gate or baseline_capture or reject
@@ -426,20 +449,50 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
         },
     )
 
-    # verifier_loop ⇄ verifier_tools (ReAct loop for Layer 2 verification)
+    # verifier_loop ⇄ verifier_tools → finalize_verification (Scheme B).
+    # verifier_loop is a pure ReAct step. When the LLM calls tools, they run
+    # in verifier_tools; route_after_verifier_tools then sends submit_verification
+    # to finalize_verification (verdict) or other tools back to verifier_loop.
+    # A text-only verdict (no tool_calls) routes straight to finalize_verification
+    # (fallback). finalize either loops back for re-verification or → se_detect.
     if verifier_tools:
         graph.add_conditional_edges(
             "verifier_loop",
             should_continue_verifier,
             {
                 "continue": "verifier_tools",
+                "finalize": "finalize_verification",
                 "done": "se_detect",
             },
         )
-        graph.add_edge("verifier_tools", "verifier_loop")
+        graph.add_conditional_edges(
+            "verifier_tools",
+            route_after_verifier_tools,
+            {
+                "verifier_loop": "verifier_loop",
+                "finalize": "finalize_verification",
+            },
+        )
     else:
-        # No verifier tools: verifier_loop goes straight to se_detect
-        graph.add_edge("verifier_loop", "se_detect")
+        # No verifier tools: LLM can only emit text → finalize, or early-exit.
+        graph.add_conditional_edges(
+            "verifier_loop",
+            should_continue_verifier,
+            {
+                "continue": "finalize_verification",
+                "finalize": "finalize_verification",
+                "done": "se_detect",
+            },
+        )
+    # finalize_verification → se_detect (done) or back to verifier_loop (reverify).
+    graph.add_conditional_edges(
+        "finalize_verification",
+        route_after_finalize,
+        {
+            "verifier_loop": "verifier_loop",
+            "se_detect": "se_detect",
+        },
+    )
 
     # se_detect → save_memory (side-effect post-injection detection)
     graph.add_edge("se_detect", "save_memory")
@@ -480,28 +533,61 @@ def build_recover_graph(
 
     # Build recover verifier with LLM support
     recover_verifier_node = make_recover_verifier(hook=pre_reason_hook, llm=llm, tools=verifier_tools, registry=registry)
+    # Scheme B: finalize_recover_verification node owns Layer 2 finalization
+    # (parse verdict + guard + retry + cleanup).
+    finalize_recover_node = make_finalize_recover_verification(registry=registry)
 
     # Nodes
     graph.add_node("recover_verifier_loop", with_phase_events("recover_verifier_loop", "recovery", recover_verifier_node))
+    graph.add_node("finalize_recover_verification", with_phase_events("finalize_recover_verification", "recovery", finalize_recover_node))
     if verifier_tools:
         graph.add_node("recover_verifier_tools", ToolNode(verifier_tools))
 
     graph.set_entry_point("recover_verifier_loop")
 
-    # recover_verifier_loop ⇄ recover_verifier_tools (ReAct loop)
+    # recover_verifier_loop ⇄ recover_verifier_tools → finalize_recover_verification (Scheme B).
+    # Mirrors the inject verifier wiring: tool_calls run in recover_verifier_tools;
+    # route_after_recover_verifier_tools sends submit_recover_verification to finalize
+    # (verdict) or other tools back to the loop. A Layer 2 verdict text routes straight
+    # to finalize (fallback). finalize either loops back (guard/retry) or → END.
     if verifier_tools:
         graph.add_conditional_edges(
             "recover_verifier_loop",
             should_continue_recover_verifier,
             {
                 "continue": "recover_verifier_tools",
+                "finalize": "finalize_recover_verification",
                 "done": END,
             },
         )
-        graph.add_edge("recover_verifier_tools", "recover_verifier_loop")
+        graph.add_conditional_edges(
+            "recover_verifier_tools",
+            route_after_recover_verifier_tools,
+            {
+                "recover_verifier_loop": "recover_verifier_loop",
+                "finalize": "finalize_recover_verification",
+            },
+        )
     else:
-        # No verifier tools: goes straight to END
-        graph.add_edge("recover_verifier_loop", END)
+        # No verifier tools: LLM can only emit text → finalize, or early-exit.
+        graph.add_conditional_edges(
+            "recover_verifier_loop",
+            should_continue_recover_verifier,
+            {
+                "continue": "finalize_recover_verification",
+                "finalize": "finalize_recover_verification",
+                "done": END,
+            },
+        )
+    # finalize_recover_verification → END (done) or back to recover_verifier_loop (guard/retry).
+    graph.add_conditional_edges(
+        "finalize_recover_verification",
+        route_after_recover_finalize,
+        {
+            "recover_verifier_loop": "recover_verifier_loop",
+            "done": END,
+        },
+    )
 
     return graph
 

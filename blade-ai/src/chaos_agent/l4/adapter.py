@@ -32,7 +32,7 @@ def test_task_to_initial_state(task: L4TestTask) -> dict:
         "tui_session_id": "",
         "operation": "inject",
         "fault_spec": fault_spec_dict,
-        "direct": payload.get("direct", True),
+        "direct": payload.get("direct", False),
         "needs_confirmation": False,
         "safety_status": "pending",
         "interaction_mode": "l4",  # Avoid CLI auto-reject in confirmation_gate

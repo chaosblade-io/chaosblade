@@ -128,6 +128,20 @@ class ApprovedTarget:
     blade_target: str = ""
     blade_action: str = ""
     lock_fault_type: bool = True
+    # Owner resource names discovered at freeze time. When approved
+    # scope=pod, this contains the names of Deployments/DaemonSets/etc.
+    # whose selector matches the approved labels. Used by the guard to
+    # validate owner-scope operations at the instance level.
+    owner_names: tuple[str, ...] = ()
+    # Cross-scope operations: kubectl-native faults (cordon + delete pod)
+    # may need to operate on a different scope than the primary one.
+    # When scope=node, secondary_scopes=("pod",) allows pod-level
+    # operations (e.g. delete pod on the target node).
+    secondary_scopes: tuple[str, ...] = ()
+    # Namespace for secondary scope operations. Node scope is cluster-
+    # scoped (namespace=""), but secondary pod operations need a namespace.
+    # Preserved from FaultSpec.namespace before cluster-scope clearing.
+    secondary_namespace: str = ""
 
 
 @dataclass(frozen=True)

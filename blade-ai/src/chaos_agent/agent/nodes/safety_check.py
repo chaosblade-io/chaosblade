@@ -10,7 +10,7 @@ from chaos_agent.agent.safety_score import (
     maybe_escalate_status,
 )
 from chaos_agent.agent.state import AgentState
-from chaos_agent.agent.target_guard import freeze_approved_target
+from chaos_agent.agent.target_guard import discover_owner_names, freeze_approved_target
 from chaos_agent.config.settings import settings
 from chaos_agent.agent.state_helpers import fail_state
 from chaos_agent.agent.verdict import FailureCategory
@@ -78,6 +78,10 @@ def _attach_safety_score(
     }
     if deep_signal is not None:
         context["topology_deep_signal"] = deep_signal
+    br_scope = state.get("blast_radius_scope") or ""
+    if br_scope:
+        context["blast_radius_scope"] = br_scope
+        context["blast_radius_detail"] = state.get("blast_radius_detail") or ""
 
     score = compute_safety_score(spec, context)
     result["safety_score"] = score.to_dict()
@@ -96,6 +100,35 @@ def _attach_safety_score(
                 "safety_score escalation: %s → %s (overall=%d)",
                 current, new, score.overall,
             )
+
+    # Cluster-wide blast radius: always escalate to at least "warning",
+    # independent of safety_score_routing_enabled. A self-declared
+    # cluster-wide execution scope is a fundamental safety signal that
+    # should never be silently ignored.
+    if br_scope == "cluster-wide":
+        current = result.get("safety_status") or state.get("safety_status") or "safe"
+        if current == "safe":
+            br_detail = state.get("blast_radius_detail") or ""
+            result["safety_status"] = "warning"
+            existing_reason = result.get("safety_reason") or ""
+            br_warning = (
+                "Cluster-wide blast radius: execution will mutate resources "
+                "beyond the target scope."
+            )
+            if br_detail:
+                br_warning += f" {br_detail}"
+            result["safety_reason"] = (
+                f"{existing_reason}; {br_warning}" if existing_reason
+                else br_warning
+            )
+            existing_detail = result.get("safety_checked_detail") or ""
+            result["safety_checked_detail"] = (
+                f"{existing_detail}, 爆炸半径: cluster-wide"
+            )
+            logger.info(
+                "blast_radius escalation: safe → warning (scope=%s)", br_scope,
+            )
+
     return result
 
 
@@ -220,28 +253,29 @@ async def safety_check(state: AgentState) -> dict:
         if uids:
             conflict_uids = uids
             overlapping = [c for c in conflict_details if c.overlaps_target]
-            same_action = [c for c in conflict_details if c.same_action_as_request]
+            same_action_same_target = [
+                c for c in conflict_details
+                if c.same_action_as_request and c.overlaps_target
+            ]
             overlap_desc = "; ".join(c.overlap_reason for c in overlapping) if overlapping else ""
 
             # P1: FCAT conflict_escalation check for same-target same-action
             target_metadata = state.get("target_metadata") or {}
-            if same_action and target_metadata is not None:
+            if same_action_same_target:
                 from chaos_agent.utils.fault_context import lookup_adaptations
                 adaptations = lookup_adaptations(
                     scope, blade_target, action, target_metadata,
                     rule_type="conflict_escalation",
                 )
                 if adaptations:
-                    active_same_action_uids = [c.uid for c in same_action]
+                    active_same_action_uids = [c.uid for c in same_action_same_target]
                     conflict_status = "confirm_required"
                     conflict_reason = (
-                        f"{len(same_action)} active experiment(s) with the SAME action "
+                        f"{len(same_action_same_target)} active experiment(s) with the SAME action "
                         f"({scope}-{blade_target}-{action}) already target this resource. "
                         f"Compound effects make individual verification impossible. "
                         f"Use --force-override to proceed anyway."
                     )
-                    if target_metadata is None:
-                        target_metadata = {}
                     target_metadata["active_same_action_experiments"] = active_same_action_uids
                     conflict_extra = {"target_metadata": target_metadata}
 
@@ -362,6 +396,7 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "confirm_required",
             "safety_reason": conflict_reason,
+            "safety_checked_detail": f"namespace={namespace} 合规, {len(conflict_uids)} 冲突实验 (同目标同动作)",
             "conflict_uids": conflict_uids,
             **conflict_extra,
         }
@@ -377,7 +412,19 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "warning",
             "safety_reason": conflict_reason,
+            "safety_checked_detail": f"namespace={namespace} 合规, {len(conflict_uids)} 活跃实验 (非同动作)",
             "conflict_uids": conflict_uids,
+        }
+    elif not kubeconfig:
+        tracker.complete("Safety checks passed (conflict check skipped: no kubeconfig)")
+        sync_node_status_to_session(state, "safety_check",
+            "Conflict check skipped (no kubeconfig)",
+            detail={"safety_status": "warning"})
+        result = {
+            "safety_status": "warning",
+            "safety_reason": "冲突检测跳过 (无 kubeconfig)，无法确认集群上是否存在活跃实验",
+            "safety_checked_detail": f"namespace={namespace} 合规, 冲突检测跳过 (无 kubeconfig)",
+            "conflict_uids": [],
         }
     else:
         tracker.complete("Safety checks passed")
@@ -386,6 +433,7 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "safe",
             "safety_reason": None,
+            "safety_checked_detail": f"namespace={namespace} 合规, 无冲突实验",
             "conflict_uids": [],
         }
 
@@ -396,6 +444,10 @@ async def safety_check(state: AgentState) -> dict:
         result["feasibility_report"] = feasibility_report
 
     # Freeze approved_target for screener comparison (mirrors confirmation_gate).
+    kubeconfig = state.get("kubeconfig", "")
+    owner_names = await discover_owner_names(
+        spec.scope, spec.namespace, dict(spec.labels), kubeconfig,
+    )
     result["approved_target"] = freeze_approved_target(
         target={"namespace": spec.namespace, "names": list(spec.names),
                 "labels": dict(spec.labels), "resource_type": spec.scope},
@@ -403,6 +455,7 @@ async def safety_check(state: AgentState) -> dict:
         blade_scope=spec.scope,
         blade_target=spec.blade_target,
         blade_action=spec.blade_action,
+        owner_names=owner_names,
     )
 
     result = _attach_safety_score(result, spec, state, deep_signal)

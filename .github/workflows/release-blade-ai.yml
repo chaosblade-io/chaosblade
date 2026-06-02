@@ -149,7 +149,7 @@ jobs:
       #   run: |
       #     node scripts/smoke-i18n.mjs
       #     node scripts/smoke-slash.mjs
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: tui-bundle
           # Both cli.js (the bundle) and package.json (the {"type":"module"}
@@ -175,10 +175,12 @@ jobs:
             arch: amd64
             target: linux_amd64
             runner: ubuntu-latest
+            use_docker: true
           - os: linux
             arch: arm64
             target: linux_arm64
             runner: ubuntu-24.04-arm
+            use_docker: true
           - os: darwin
             arch: amd64
             target: darwin_amd64
@@ -196,7 +198,7 @@ jobs:
 
       # Pull the TS bundle into ``blade-ai/tui/dist/cli.js`` BEFORE
       # pyinstaller runs.
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           name: tui-bundle
           path: blade-ai/tui/dist
@@ -361,7 +363,7 @@ jobs:
           PLATFORM="${{ matrix.os }}-${{ matrix.arch }}"
           tar -czf "blade-ai-${PLATFORM}.tar.gz" -C blade-ai/dist blade-ai
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: blade-ai-${{ matrix.os }}-${{ matrix.arch }}
           path: blade-ai-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
@@ -373,7 +375,7 @@ jobs:
     needs: [verify-versions, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
 

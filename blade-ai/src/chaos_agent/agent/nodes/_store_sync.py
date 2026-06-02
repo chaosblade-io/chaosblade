@@ -135,6 +135,7 @@ def sync_node_status_to_session(
                 "type": "system",
                 "content": f"[{node_name}] {message}",
                 "detail": detail or {},
+                "node": node_name,
             })
     except Exception:
         logger.exception(f"Session status sync failed for node {node_name}")

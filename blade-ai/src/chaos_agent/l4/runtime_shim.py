@@ -35,6 +35,9 @@ class NullRuntime:
     def require_approval(self, risk_level: str = "high") -> bool:
         return True  # Test mode: auto-approve
 
+    def emit_event(self, event_type: str, data: dict) -> None:
+        pass
+
     def finish(self, status: str = "passed") -> None:
         return None
 

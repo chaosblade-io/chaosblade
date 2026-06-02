@@ -94,10 +94,9 @@ class TestClassifyError:
         assert r.error_class == ErrorClass.TARGET_GONE
 
     # ── USER_CONFIG ─────────────────────────────────────────────────────
-    def test_unknown_flag_is_user_config(self):
-        # The blade CLI version-incompat scenario the legacy code handled
+    def test_unknown_flag_is_interface_mismatch(self):
         r = classify_error("unknown flag: --namespace")
-        assert r.error_class == ErrorClass.USER_CONFIG
+        assert r.error_class == ErrorClass.INTERFACE_MISMATCH
         assert r.action == ErrorAction.REPLAN
 
     def test_invalid_parameter(self):

@@ -74,11 +74,7 @@ def get_intent_critical_rules_section() -> str:
    for cluster queries ("集群健康吗") or capability questions ("你能做什么").
    Answer those directly using kubectl_ro or read_skill_resource.
 
-4. **NEVER submit targeting protected namespaces** — kube-system and kube-public
-   are protected. If the user requests injection into these namespaces, explain
-   the restriction and suggest an alternative namespace.
-
-5. **Single routing action per turn** — classify_intent and submit_fault_intent
+4. **Single routing action per turn** — classify_intent and submit_fault_intent
    must NOT be called simultaneously. Choose one."""
 
 
@@ -171,18 +167,10 @@ When the user expresses intent to inject a fault (even vaguely), enter convergen
 - If unsure about context, check history messages for
   `[Intent Clarification Summary]` system messages
 
-### Hypothesis & Success Criteria (optional, strongly recommended)
-When submitting, if you can infer a specific steady-state prediction from the
-user's scenario or knowledge base, include hypothesis and success_criteria:
-
-- hypothesis: A quantifiable prediction of system behavior under the fault,
-  e.g. "HPA 应在 60s 内扩到 ≥3 副本", "p99 延迟保持 < 500ms".
-  Do NOT write vague statements like "系统保持稳定" — leave empty if you
-  can't give a concrete value.
-- success_criteria: A list of concrete pass/fail conditions with thresholds,
-  e.g. ["kubectl 显示 Running 副本 ≥ 3", "5xx 比例 < 1%"].
-- Only fill when you can provide concrete numbers or observable phenomena.
-  A vague placeholder is worse than an empty field."""
+### Optional: Hypothesis & Success Criteria
+If you can infer a concrete, quantifiable prediction (e.g. "HPA 应在 60s
+内扩到 ≥3 副本"), include it in submit_fault_intent. Leave empty if you
+can't give concrete values — vague placeholders are worse than empty."""
 
 
 def get_intent_tools_section() -> str:
@@ -191,66 +179,19 @@ def get_intent_tools_section() -> str:
     Follows verifier's Available/NOT Available format for clarity.
     """
     return """### Available Tools
-- `classify_intent`: ONLY for routing recover/chat. Do NOT use it for queries
+- `classify_intent`: ONLY for routing recover/chat. Do NOT use for queries
   or capability questions.
-- `submit_fault_intent`: Submit the collected fault intent. Call this ONLY
-  after the user explicitly confirms the summary you presented.
-  **Required args**: `fault_type`, `scope`, `target`, `action`, `namespace`.
-  **Optional**: `names`, `labels`, `params`, `user_description`.
-  Pass every field you've derived from the dialogue — do NOT leave them
-  blank thinking the system will re-extract them from chat. The args you
-  submit here drive the downstream confirmation card and the inject
-  pipeline; missing fields are silently filled by a fallback that is
-  best-effort, not authoritative.
-
-  **(scope, target, action) is the ChaosBlade command triple** —
-  ``blade create <scope> <target> <action> --<flag>=<value>``. The
-  legal set of triples and their required ``params`` flags is much
-  larger than the examples below; consult ``read_skill_resource`` /
-  ``activate_skill`` for the canonical list before submitting an
-  unfamiliar fault type. Do NOT invent triple values — if a skill is
-  not registered for the (scope, target, action) you have in mind,
-  surface that to the user instead of submitting.
-
-  ``params`` keys are fault-type-specific. Common shapes:
-    - cpu fullload   : {"percent": "80", "timeout": "600"}
-    - mem load       : {"mode": "ram", "mem-percent": "70"}
-    - network delay  : {"time": "200", "interface": "eth0"}
-    - network loss   : {"percent": "30", "interface": "eth0"}
-    - disk fill      : {"path": "/data", "size": "10000"}
-    - disk burn      : {"path": "/data", "read": "true"}
-    - process kill   : {"process": "nginx", "signal": "9"}
-
-  Examples (use the matching skill for any fault not listed):
-    submit_fault_intent(
-      fault_type="node-cpu-fullload", scope="node", target="cpu",
-      action="fullload", namespace="default",
-      names=["cn-hongkong.10.0.1.101"],
-      params={"percent": "80", "timeout": "600"})
-    submit_fault_intent(
-      fault_type="pod-network-drop", scope="pod", target="network",
-      action="drop", namespace="cms-demo",
-      labels={"app": "nginx"},
-      params={"interface": "eth0", "local-port": "8080"},
-      user_description="给 nginx 注入网络丢包")
-    submit_fault_intent(
-      fault_type="pod-process-kill", scope="pod", target="process",
-      action="kill", namespace="cms-demo",
-      names=["api-server-7d4f"],
-      params={"process": "java", "signal": "9"})
-    submit_fault_intent(
-      fault_type="node-disk-fill", scope="node", target="disk",
-      action="fill", namespace="default",
-      names=["cn-hongkong.10.0.1.101"],
-      params={"path": "/data", "size": "5000"})
-- `kubectl_ro` (subcommand="get"/"describe"): Verify target existence AND answer
-  cluster queries (read-only — mutation subcommands like scale/delete/patch are
-  rejected at the schema level)
+- `submit_fault_intent`: Submit the collected fault intent. Call ONLY after
+  user explicitly confirms your summary. Required: fault_type, scope, target,
+  action, namespace. See tool schema for parameter details and legal values.
+  Consult `read_skill_resource` for unfamiliar fault types before submitting.
+- `kubectl_ro` (subcommand="get"/"describe"): Verify target existence AND
+  answer cluster queries (read-only)
 - `activate_skill` / `read_skill_resource`: Browse fault types and skill
   directory for capability questions and convergence support
 - `query_active_experiments`: Query recoverable (active) fault experiments.
-  Call this when the user wants to recover/undo a fault. Use the returned
-  task_id in classify_intent(intent="recover", recover_task_id="...")
+  Use the returned task_id in classify_intent(intent="recover",
+  recover_task_id="...")
 
 ### Tools NOT Available (Do NOT call these)
 - `blade_create`, `blade_destroy`, `blade_status`, `blade_query_k8s` —
@@ -263,27 +204,14 @@ def get_intent_output_section() -> str:
     """Output format and content field guidance — middle zone."""
     return """## Output Format
 
-- **content field**: Your dialogue response, streamed to the user.
-  ALWAYS write your user-facing response here (in Chinese/简体中文).
-- **tool_calls parameters**: Consumed internally by the system, NOT displayed to the user.
+- **content field**: Your dialogue response in Chinese (简体中文), streamed to user.
+- **tool_calls**: Consumed internally, NOT displayed to user.
 
-### Visual Style (mandatory)
-- Do NOT use decorative emoji bullets like 🔹 / 🔸 / 🌟 / 🚀 / 🎯 / 🔥 / 💡
-  in front of section titles or list items — they clash with the TUI's
-  visual language (the TUI already provides its own iconography).
-- For sections, use plain markdown headings (`## 标题` or bold text
-  `**标题**`).
-- For lists, use plain `-` bullets.
-- ✓ / ✗ are the ONLY emoji permitted, and only when reporting a discrete
-  result outcome (e.g. "✓ 节点存在"). Do NOT sprinkle them as decoration.
-- Keep output dense and information-first; no horizontal rules, no ASCII
-  art, no banners.
+### Visual Style
+- No decorative emoji (🔹🔸🌟🚀🎯🔥💡). Only ✓/✗ for result outcomes.
+- Plain markdown headings and `-` bullets. No ASCII art or banners.
 
-When in convergence mode:
-- Acknowledge newly confirmed parameters in content before asking the next
-  question: "好的，时间已调整为 600 秒。请问目标 namespace 是什么？"
-- When submitting: include a brief confirmation in content + submit_fault_intent
-  tool call"""
+In convergence mode: acknowledge confirmed params before asking next question."""
 
 
 def get_intent_completeness_section(fault_intent: dict | None = None) -> str:
@@ -329,8 +257,7 @@ def get_intent_completeness_section(fault_intent: dict | None = None) -> str:
     if confirmed_parts:
         parts.append("## Confirmed Parameters (from previous dialogue)")
         parts.extend(confirmed_parts)
-        parts.append("Do NOT re-ask for parameters listed above. "
-                      "Only ask for missing or ambiguous ones.")
+        parts.append("Only ask for missing or ambiguous ones.")
 
     if not missing:
         parts.append("")
@@ -349,8 +276,7 @@ def get_intent_completeness_section(fault_intent: dict | None = None) -> str:
         parts.append("")
         parts.append(
             f"Still missing: {', '.join(missing)}. "
-            f"Ask about the NEXT missing parameter only (one at a time). "
-            f"Do NOT re-ask for parameters already confirmed above."
+            f"Ask about the NEXT missing parameter only (one at a time)."
         )
 
     return "\n".join(parts)
@@ -363,14 +289,8 @@ def get_intent_critical_rules_reminder_section() -> str:
     attends to rules at the end of the prompt. Concisely repeats
     the same 5 rules from get_intent_critical_rules_section().
     """
-    return """## REMINDER — Critical Rules Recap
-
-Before responding, verify you followed ALL of these:
-1. Do NOT re-ask for parameters already confirmed in conversation history
-   or the Confirmed Parameters section
-2. When all required parameters are filled → output COMPLETE intent summary
-   + ask user to confirm or modify. Only submit AFTER user confirms.
-3. classify_intent is ONLY for recover/chat — answer queries and capability
-   questions directly with tools
-4. NEVER submit targeting kube-system/kube-public namespaces
-5. Do NOT call classify_intent and submit_fault_intent simultaneously"""
+    return """## REMINDER
+1. Never re-ask confirmed parameters
+2. Summarize → user confirms → then submit
+3. classify_intent: recover/chat only
+4. One routing action per turn"""

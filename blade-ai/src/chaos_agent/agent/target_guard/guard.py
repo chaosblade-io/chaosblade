@@ -69,6 +69,18 @@ CLUSTER_SCOPED_KINDS: frozenset[str] = frozenset({
     "clusterrolebinding", "storageclass",
 })
 
+# K8s ownership: approved scope → set of resource kinds that OWN it.
+# When approved=pod and effective=deployment, the LLM is operating on
+# the pod's owner (e.g. kubectl scale deployment) to affect the pods —
+# this is a legitimate injection method, not scope drift.
+OWNER_SCOPES: dict[str, frozenset[str]] = {
+    "pod": frozenset({
+        "deployment", "daemonset", "statefulset",
+        "replicaset", "job", "cronjob",
+    }),
+    "deployment": frozenset({"replicaset"}),
+}
+
 
 def target_drift_guard(
     effective: EffectiveTarget,
@@ -127,20 +139,58 @@ def target_drift_guard(
     # ---- 4. Scope (kind) check ------------------------------------------
     approved_scope = canonicalise_kind(approved.scope)
     effective_scope = canonicalise_kind(effective.scope)
+    is_owner_scope = False
+    is_secondary_scope = False
     if approved_scope != effective_scope:
-        return GuardDecision(
-            verdict=GuardVerdict.REJECT_DRIFT,
-            reason=f"scope drift: approved={approved_scope} effective={effective_scope}",
-            effective=effective,
-            suggestion=_build_suggestion(approved),
-        )
+        owners = OWNER_SCOPES.get(approved_scope, frozenset())
+        secondary = set(approved.secondary_scopes or ())
+        if effective_scope in owners:
+            is_owner_scope = True
+        elif effective_scope in secondary:
+            is_secondary_scope = True
+        else:
+            return GuardDecision(
+                verdict=GuardVerdict.REJECT_DRIFT,
+                reason=f"scope drift: approved={approved_scope} effective={effective_scope}",
+                effective=effective,
+                suggestion=_build_suggestion(approved),
+            )
 
     # ---- 5. Namespace check (cluster-scoped kinds exempt) ---------------
     # Tier 1 injection (kubectl exec into tool pod → blade create)
     # legitimately omits --namespace when blade v1.8.0 rejects it.
     # The actual target is identified by --names/--labels; the guard's
     # step 6 (resource selection) validates identity.
-    if effective_scope not in CLUSTER_SCOPED_KINDS and not effective.is_tier1_exec:
+    if is_secondary_scope:
+        # Secondary scope (e.g. pod ops under node approval): validate
+        # against secondary_namespace (preserved from FaultSpec before
+        # cluster-scope clearing). Cluster-scoped effective targets
+        # (node, pv) skip namespace check — they have no namespace.
+        # However, blade_create targeting nodes (blade_target set) is a
+        # real scope escalation and must still be blocked.
+        if effective_scope in CLUSTER_SCOPED_KINDS and effective.blade_target:
+            return GuardDecision(
+                verdict=GuardVerdict.REJECT_DRIFT,
+                reason=f"scope drift: blade {effective.blade_target} targets {effective_scope} under {approved_scope} approval",
+                effective=effective,
+                suggestion=_build_suggestion(approved),
+            )
+        if effective_scope not in CLUSTER_SCOPED_KINDS:
+            check_ns = (approved.secondary_namespace or "default").strip()
+            effective_ns = (effective.namespace or "default").strip()
+            # Exempt tool pod namespaces (e.g. "chaosblade") for cluster-scoped
+            # approved targets: node-scope faults legitimately need access to
+            # injection infrastructure (exec into tool pods for blade operations).
+            from chaos_agent.agent.target_guard.classifier import TOOL_POD_NAMESPACES
+            is_tool_ns = effective_ns in TOOL_POD_NAMESPACES
+            if check_ns != effective_ns and not is_tool_ns:
+                return GuardDecision(
+                    verdict=GuardVerdict.REJECT_DRIFT,
+                    reason=f"secondary namespace drift: approved={check_ns} effective={effective_ns}",
+                    effective=effective,
+                    suggestion=_build_suggestion(approved),
+                )
+    elif effective_scope not in CLUSTER_SCOPED_KINDS and not effective.is_tier1_exec:
         approved_ns = (approved.namespace or "default").strip()
         effective_ns = (effective.namespace or "default").strip()
         if approved_ns != effective_ns:
@@ -155,16 +205,42 @@ def target_drift_guard(
     # is_namespace_wide is an explicit operator opt-in saying "any
     # resource of this kind in this namespace is OK". Used for
     # demo/test envs where the user does not want to enumerate names.
-    if not approved.is_namespace_wide:
-        names_ok = _check_names_subset(approved, effective)
-        labels_ok = _check_labels_superset(approved, effective)
-        if not names_ok and not labels_ok:
-            return GuardDecision(
-                verdict=GuardVerdict.REJECT_DRIFT,
-                reason=_format_name_drift_reason(approved, effective),
-                effective=effective,
-                suggestion=_build_suggestion(approved),
-            )
+    # Secondary scope: skip names/labels check — pod names cannot match
+    # node names, and the namespace check above is sufficient.
+    if is_secondary_scope:
+        pass
+    elif not approved.is_namespace_wide:
+        if is_owner_scope:
+            # Owner-scope: validate at instance level using
+            # pre-discovered owner_names (frozen at confirmation_gate).
+            if approved.owner_names and effective.names:
+                if not all(n in approved.owner_names for n in effective.names):
+                    return GuardDecision(
+                        verdict=GuardVerdict.REJECT_DRIFT,
+                        reason=(
+                            f"owner drift: effective names {list(effective.names)} "
+                            f"not in approved owners {list(approved.owner_names)}"
+                        ),
+                        effective=effective,
+                        suggestion=_build_suggestion(approved),
+                    )
+            elif not approved.owner_names:
+                logger.info(
+                    "target_guard: no owner_names on record, namespace-only "
+                    "anchoring for owner-scope (approved=%s, effective=%s/%s ns=%s)",
+                    approved.scope, effective.scope,
+                    effective.names, effective.namespace,
+                )
+        else:
+            names_ok = _check_names_subset(approved, effective)
+            labels_ok = _check_labels_superset(approved, effective)
+            if not names_ok and not labels_ok:
+                return GuardDecision(
+                    verdict=GuardVerdict.REJECT_DRIFT,
+                    reason=_format_name_drift_reason(approved, effective),
+                    effective=effective,
+                    suggestion=_build_suggestion(approved),
+                )
 
     # ---- 7. Blade target lock (fault TYPE, not method) ------------------
     # Only compare when BOTH sides carry a blade_target. Switching

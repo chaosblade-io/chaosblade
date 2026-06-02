@@ -16,6 +16,7 @@ from typing import Optional
 
 from langchain_core.messages import RemoveMessage, SystemMessage
 
+from chaos_agent.agent.node_names import INTENT_CLARIFICATION
 from chaos_agent.config.settings import settings
 from chaos_agent.utils.time import now_iso
 
@@ -117,6 +118,9 @@ def _serialize_message_full(msg) -> dict:
         ts = additional_kwargs.get("_ts")
         if ts:
             result["time"] = ts
+        node = additional_kwargs.get("_node")
+        if node:
+            result["node"] = node
 
     tool_calls = getattr(msg, "tool_calls", None)
     if tool_calls:
@@ -128,6 +132,9 @@ def _serialize_message_full(msg) -> dict:
     tool_call_id = getattr(msg, "tool_call_id", None)
     if tool_call_id:
         result["tool_call_id"] = tool_call_id
+
+    if "time" not in result:
+        result["time"] = now_iso()
 
     return result
 
@@ -194,6 +201,19 @@ def build_verification_simple(verification: dict) -> dict | None:
     warnings = verification.get("warnings")
     if warnings:
         result["warnings"] = warnings
+
+    checklist = verification.get("checklist", {})
+    items = checklist.get("items", []) if isinstance(checklist, dict) else []
+    if items:
+        result["evidence"] = [
+            {"step": it.get("step"), "status": it.get("status"), "detail": it.get("evidence", "")}
+            for it in items if isinstance(it, dict)
+        ]
+
+    layer2_details = layer2.get("details", "")
+    if layer2_details:
+        result["evidence_summary"] = layer2_details
+
     return result
 
 
@@ -374,7 +394,7 @@ class SessionStore:
         # the boundary between intent dialogue (session file) and
         # execution content (stored in task file).
         if initial_messages:
-            self.append_messages(task_id, initial_messages)
+            self.append_messages(task_id, initial_messages, node_name=INTENT_CLARIFICATION)
 
         # Opportunistically index into the TUI session forward list.
         if tui_session_id:
@@ -388,7 +408,7 @@ class SessionStore:
             except Exception as e:
                 logger.debug(f"TUI session forward-index update skipped: {e}")
 
-    def append_messages(self, task_id: str, messages: list) -> None:
+    def append_messages(self, task_id: str, messages: list, node_name: str = "") -> None:
         """Append serialized messages to the task record."""
         session = self._active_sessions.get(task_id)
         if session is None:
@@ -412,6 +432,11 @@ class SessionStore:
             _msg_kwargs = getattr(msg, "additional_kwargs", None) or {}
             if _msg_kwargs.get(NO_SESSION_MARKER):
                 continue
+
+            if node_name:
+                _real_kwargs = getattr(msg, "additional_kwargs", None)
+                if isinstance(_real_kwargs, dict):
+                    _real_kwargs.setdefault("_node", node_name)
 
             entry = _serialize_message_full(msg)
             key = _message_dedup_key(entry)
@@ -461,6 +486,9 @@ class SessionStore:
             logger.warning(f"Task {task_id} not found, skipping raw message append")
             return
 
+        if "time" not in msg_dict:
+            msg_dict["time"] = now_iso()
+
         # Bug A: same write-disk-first ordering as append_messages.
         # Round-5 silent-fail audit: see append_messages for rationale
         # — this is an INTENTIONALLY-silent archival path (raise here
@@ -494,7 +522,7 @@ class SessionStore:
         """
         session = self._active_sessions.get(task_id)
         if session is None:
-            logger.warning(f"Task {task_id} not found for finalization")
+            logger.debug(f"Task {task_id} not found for finalization")
             return
 
         if remaining_messages:

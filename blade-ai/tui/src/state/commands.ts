@@ -1222,25 +1222,8 @@ function buildBuiltInCommands(): SlashCommand[] {
             total: visible.length,
             grand: total,
           });
-          const rows = visible.slice(0, limit).map((row) => {
-            const id = (row["task_id"] as string) ?? "?";
-            // Prefer ``status`` over ``task_state`` — the metric table
-            // returns the user-facing status field (success/failed/
-            // injecting/...), and stateGlyph already handles unknown
-            // values. Falls back to task_state for older server
-            // payloads.
-            const status =
-              (row["status"] as string) || (row["task_state"] as string) || "?";
-            // Python's tasks_table prefers a ``scope-target-action``
-            // joined fault label when ``params`` is present; mirror
-            // that so the row reads the same in both TUIs.
-            const fault = formatFaultType(row);
-            const created = (row["gmt_create"] as string) ||
-              (row["created_at"] as string) ||
-              "";
-            const createdShort = created.replace("T", " ").slice(0, 19);
-            return `  ${stateGlyph(status)}  ${id}  ${fault || t("common.unknown")}  · ${createdShort}`;
-          });
+          const sliced = visible.slice(0, limit);
+          const rows = formatTasksTable(sliced);
           pushLog(ctx, [head, ...rows].join("\n"), "info");
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -2800,6 +2783,62 @@ function stateGlyph(state: string): string {
     default:
       return "·";
   }
+}
+
+function truncate(s: string, n: number): string {
+  if (!s) return "—";
+  return s.length <= n ? s : s.slice(0, n - 1) + "…";
+}
+
+function formatTasksTable(tasks: Array<Record<string, unknown>>): string[] {
+  const parsed = tasks.map((row) => {
+    const id = (row["task_id"] as string) ?? "?";
+    const status =
+      (row["status"] as string) || (row["task_state"] as string) || "?";
+    const fault = formatFaultType(row) || t("common.unknown");
+    const phase = (row["phase"] as string) || "—";
+    const summary = (row["summary"] as Record<string, unknown>) || {};
+    const durationMs = (summary["total_duration_ms"] as number) || 0;
+    const duration = durationMs > 0 ? formatMs(durationMs) : "—";
+    const created =
+      (row["gmt_create"] as string) || (row["created_at"] as string) || "";
+    const createdShort = created.replace("T", " ").slice(0, 19) || "—";
+    return { id, status, fault, phase, duration, createdShort };
+  });
+
+  const col = {
+    st: Math.max(6, ...parsed.map((r) => `${stateGlyph(r.status)} ${r.status}`.length)) + 1,
+    id: Math.max(7, ...parsed.map((r) => truncate(r.id, 22).length)) + 1,
+    ft: Math.max(10, ...parsed.map((r) => truncate(r.fault, 22).length)) + 1,
+    ph: Math.max(5, ...parsed.map((r) => truncate(r.phase, 14).length)) + 1,
+    du: Math.max(8, ...parsed.map((r) => r.duration.length)) + 1,
+  };
+
+  const hdr =
+    `  ${"STATUS".padEnd(col.st)}` +
+    `${"TASK ID".padEnd(col.id)}` +
+    `${"FAULT TYPE".padEnd(col.ft)}` +
+    `${"PHASE".padEnd(col.ph)}` +
+    `${"DURATION".padStart(col.du)}` +
+    `  CREATED`;
+  const sep =
+    `  ${"─".repeat(col.st - 1)} ` +
+    `${"─".repeat(col.id - 1)} ` +
+    `${"─".repeat(col.ft - 1)} ` +
+    `${"─".repeat(col.ph - 1)} ` +
+    `${"─".repeat(col.du - 1)} ` +
+    `${"─".repeat(19)}`;
+
+  const lines = [hdr, sep];
+  for (const r of parsed) {
+    const stCol = `${stateGlyph(r.status)} ${r.status}`.padEnd(col.st);
+    const idCol = truncate(r.id, 22).padEnd(col.id);
+    const ftCol = truncate(r.fault, 22).padEnd(col.ft);
+    const phCol = truncate(r.phase, 14).padEnd(col.ph);
+    const duCol = r.duration.padStart(col.du);
+    lines.push(`  ${stCol}${idCol}${ftCol}${phCol}${duCol}  ${r.createdShort}`);
+  }
+  return lines;
 }
 
 function formatBytes(n: number): string {

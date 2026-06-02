@@ -13,6 +13,7 @@ from chaos_agent.agent.nodes.react_helpers import (
     detect_repeated_tool_calls,
     _compare_tool_outputs,
 )
+from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.config.settings import settings
 
 
@@ -47,7 +48,7 @@ class TestAgentLoop:
 
         result = await agent_loop(state)
         assert "error" in result
-        assert "max iterations" in result["error"].lower()
+        assert "planning_timeout" in result["error"]
         assert result["safety_status"] == "rejected"
 
     @pytest.mark.asyncio
@@ -280,143 +281,6 @@ class TestAgentLoopConvergence:
         assert any("FINAL ITERATION" in t for t in human_texts)
 
 
-class TestExtractTargetFromKubectlGet:
-    """Tests for _extract_target_from_kubectl_get write-once + blacklist guard."""
-
-    DEFAULT_BLACKLIST = ["kube-system", "kube-public"]
-
-    def test_namespace_set_from_first_query(self):
-        """Namespace is extracted when target is empty."""
-        from chaos_agent.agent.nodes.agent_loop import _extract_target_from_kubectl_get
-
-        result = _extract_target_from_kubectl_get(
-            v_args="pods -n cms-demo -l app=payment",
-            existing_target=None,
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result["namespace"] == "cms-demo"
-        assert result["labels"] == "app=payment"
-        assert result["resource_type"] == "pod"
-
-    def test_blacklisted_namespace_does_not_overwrite(self):
-        """A kubectl get to kube-system must NOT overwrite an existing namespace."""
-        from chaos_agent.agent.nodes.agent_loop import _extract_target_from_kubectl_get
-
-        result = _extract_target_from_kubectl_get(
-            v_args="pods -n kube-system -l app=chaosblade -o name",
-            existing_target={"namespace": "cms-demo"},
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result["namespace"] == "cms-demo"
-
-    def test_blacklisted_namespace_skipped_when_empty(self):
-        """Even when target namespace is empty, blacklisted ns is not set."""
-        from chaos_agent.agent.nodes.agent_loop import _extract_target_from_kubectl_get
-
-        result = _extract_target_from_kubectl_get(
-            v_args="pods -n kube-system -l app=chaosblade",
-            existing_target=None,
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert "namespace" not in result
-
-    def test_namespace_write_once(self):
-        """After namespace is set, a second call with a different ns does not overwrite."""
-        from chaos_agent.agent.nodes.agent_loop import _extract_target_from_kubectl_get
-
-        # First call sets namespace
-        result = _extract_target_from_kubectl_get(
-            v_args="svc payment -n cms-demo",
-            existing_target=None,
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result["namespace"] == "cms-demo"
-
-        # Second call with different namespace: write-once prevents overwrite
-        result2 = _extract_target_from_kubectl_get(
-            v_args="pods -n monitoring -l app=prometheus",
-            existing_target=result,
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result2["namespace"] == "cms-demo"
-
-    def test_labels_write_once(self):
-        """After labels is set, a second call with a different selector does not overwrite."""
-        from chaos_agent.agent.nodes.agent_loop import _extract_target_from_kubectl_get
-
-        result = _extract_target_from_kubectl_get(
-            v_args="pods -n cms-demo -l app=payment",
-            existing_target=None,
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result["labels"] == "app=payment"
-
-        result2 = _extract_target_from_kubectl_get(
-            v_args="pods -n cms-demo -l app=chaosblade",
-            existing_target=result,
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result2["labels"] == "app=payment"
-
-    def test_resource_type_write_once(self):
-        """After resource_type is set, a second call does not overwrite."""
-        from chaos_agent.agent.nodes.agent_loop import _extract_target_from_kubectl_get
-
-        result = _extract_target_from_kubectl_get(
-            v_args="pods -n cms-demo -l app=payment",
-            existing_target=None,
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result["resource_type"] == "pod"
-
-        result2 = _extract_target_from_kubectl_get(
-            v_args="nodes -n cms-demo",
-            existing_target=result,
-            state_target=None,
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result2["resource_type"] == "pod"
-
-    def test_namespace_preserved_from_state_for_cluster_scoped_query(self):
-        """Cluster-scoped query (no -n flag) preserves namespace from state_target."""
-        from chaos_agent.agent.nodes.agent_loop import _extract_target_from_kubectl_get
-
-        result = _extract_target_from_kubectl_get(
-            v_args="nodes",
-            existing_target=None,
-            state_target={"namespace": "cms-demo"},
-            blacklist=self.DEFAULT_BLACKLIST,
-        )
-        assert result["namespace"] == "cms-demo"
-
-    def test_empty_blacklist_still_write_once(self):
-        """With empty blacklist, write-once still prevents overwrite."""
-        from chaos_agent.agent.nodes.agent_loop import _extract_target_from_kubectl_get
-
-        result = _extract_target_from_kubectl_get(
-            v_args="pods -n cms-demo",
-            existing_target=None,
-            state_target=None,
-            blacklist=[],
-        )
-        assert result["namespace"] == "cms-demo"
-
-        result2 = _extract_target_from_kubectl_get(
-            v_args="pods -n other-ns",
-            existing_target=result,
-            state_target=None,
-            blacklist=[],
-        )
-        assert result2["namespace"] == "cms-demo"
-
 
 # ---------------------------------------------------------------------------
 # Tests for _compare_tool_outputs — output-aware loop detection
@@ -611,3 +475,76 @@ class TestDetectRepeatedToolCalls:
         # Window=4 means only last 4 messages: tc1 AIMessage, tc1 ToolMessage, tc2 AIMessage, tc2 ToolMessage
         # That's only 2 calls → below threshold 3
         assert result is None
+
+
+class TestFinishPlanningRejection:
+    """Tests for finish_planning with rejected=True."""
+
+    MAX = 10
+
+    def _make_state(self):
+        return {
+            "task_id": "task-fp-reject",
+            "operation": "inject",
+            "agent_loop_count": 3,
+            "skill_name": "k8s-chaos-skills",
+            "messages": [],
+            "replan_context": None,
+            "replan_history": None,
+            "replan_count": 0,
+            "target": {"namespace": "test-ns"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_finish_planning_passes_through_to_toolnode(self, monkeypatch):
+        """finish_planning tool_calls pass through agent_loop without inline processing.
+
+        After refactor, agent_loop no longer handles finish_planning/save_fault_plan
+        inline — they go through ToolNode and are processed by extract_planning_metadata.
+        agent_loop should simply return the AIMessage containing the tool_call.
+        """
+        import chaos_agent.agent.nodes.agent_loop as loop_mod
+        monkeypatch.setattr(loop_mod, "MAX_AGENT_LOOP", self.MAX)
+        monkeypatch.setattr(settings, "max_agent_loop", self.MAX)
+
+        mock_response = MagicMock()
+        mock_response.content = "Cannot inject into kube-system."
+        mock_response.tool_calls = [
+            {
+                "name": "finish_planning",
+                "args": {
+                    "summary": "kube-system is protected",
+                    "rejected": True,
+                    "rejection_reason": "Safety red line: kube-system namespace",
+                },
+                "id": "tc_fp_reject",
+            }
+        ]
+        mock_response.additional_kwargs = {}
+
+        llm = MagicMock()
+        bound_llm = MagicMock()
+        bound_llm.ainvoke = AsyncMock(return_value=mock_response)
+        llm.bind_tools = MagicMock(return_value=bound_llm)
+
+        mock_tool = MagicMock()
+        mock_tool.name = "test_tool"
+
+        node = make_agent_loop(llm=llm, tools=[mock_tool], skill_catalog="test")
+        monkeypatch.setattr(
+            "chaos_agent.agent.nodes.agent_loop.compute_env_info",
+            AsyncMock(return_value=""),
+        )
+        monkeypatch.setattr(
+            "chaos_agent.agent.nodes.agent_loop.sync_to_store",
+            AsyncMock(),
+        )
+
+        state = self._make_state()
+        result = await node(state)
+
+        # agent_loop no longer sets error/plan for finish_planning —
+        # it passes through to ToolNode → extract_planning_metadata
+        assert "error" not in result
+        assert "failure_detail" not in result
+        assert "messages" in result

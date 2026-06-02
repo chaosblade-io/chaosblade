@@ -6,6 +6,7 @@ import re
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from chaos_agent.agent.node_names import EXECUTE_LOOP
 from chaos_agent.agent.nodes._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
@@ -89,8 +90,26 @@ def _extract_blade_uid_from_messages(messages: list) -> str | None:
     ToolMessage instead of a blade_create ToolMessage.
 
     Priority: blade_create result > kubectl exec blade result.
+    Only kubectl exec calls whose v_args contain "blade create" are
+    considered — other kubectl outputs (get -o json, describe, etc.)
+    are NOT scanned to prevent false-positive extraction from K8s
+    resource metadata.uid fields.
     """
     kubectl_uid = None  # fallback uid from kubectl exec
+
+    # Build a set of tool_call_ids that correspond to "kubectl exec ... blade create"
+    blade_exec_call_ids: set[str] = set()
+    for msg in messages:
+        if not hasattr(msg, "tool_calls"):
+            continue
+        for tc in (msg.tool_calls or []):
+            name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+            args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+            tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+            if name == "kubectl" and isinstance(args, dict):
+                v_args = args.get("v_args", "")
+                if "blade" in v_args and "create" in v_args:
+                    blade_exec_call_ids.add(tc_id)
 
     for msg in reversed(messages):
         if not isinstance(msg, ToolMessage):
@@ -104,9 +123,11 @@ def _extract_blade_uid_from_messages(messages: list) -> str | None:
             if uid:
                 return uid
 
-        # Priority 2: kubectl ToolMessage containing ChaosBlade output
+        # Priority 2: kubectl exec blade ToolMessage ONLY
         if msg_name == "kubectl" and not kubectl_uid:
-            kubectl_uid = _parse_blade_uid_from_content(content)
+            tool_call_id = getattr(msg, "tool_call_id", "") or ""
+            if tool_call_id in blade_exec_call_ids:
+                kubectl_uid = _parse_blade_uid_from_content(content)
 
     return kubectl_uid
 
@@ -201,51 +222,44 @@ def _detect_replanable_tool_error(messages: list) -> str | None:
     return None
 
 
+_BLADE_ERROR_COOLDOWN_TURNS = 3
+
+
 def _is_llm_handling_blade_error(messages: list) -> bool:
-    """Check if the LLM is already actively handling a blade error with alternatives.
+    """Check if the LLM is still within a recovery window after a blade error.
 
-    When blade_create fails and the LLM's last AIMessage shows it's already
-    trying alternative approaches (kubectl exec blade, kubectl-native operations,
-    or retrying blade_create), we should NOT auto-replan — let the LLM continue
-    its own recovery.
+    After blade_create fails, the LLM often needs multiple steps to recover:
+    e.g. ``kubectl get pods`` (find tool pods) → ``kubectl exec blade -h``
+    (check flags) → ``blade_create`` (retry with correct params).
 
-    Returns:
-        True if the most recent AIMessage with tool_calls indicates the LLM
-        is actively handling a blade error.
+    Rather than pattern-matching each intermediate step (which is fragile
+    and incomplete), we use a cooldown window: if the most recent blade
+    error is within the last N AIMessage turns, the LLM is presumed to
+    still be recovering and auto-replan is suppressed.
+
+    Returns True to suppress auto-replan, False to allow it.
     """
     if not messages:
         return False
 
-    # Find the last AIMessage with tool_calls
+    ai_turns_since_error = 0
+    found_blade_error = False
+
     for msg in reversed(messages):
-        if not isinstance(msg, AIMessage):
-            continue
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        if not tool_calls:
-            continue
+        if isinstance(msg, AIMessage):
+            ai_turns_since_error += 1
+            if ai_turns_since_error > _BLADE_ERROR_COOLDOWN_TURNS:
+                break
+        elif isinstance(msg, ToolMessage):
+            name = getattr(msg, "name", "") or ""
+            if name in ("blade_create", "blade_query_k8s"):
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                status = getattr(msg, "status", "") or ""
+                if status == "error" or "failed" in content.lower() or "error" in content.lower():
+                    found_blade_error = True
+                    break
 
-        for tc in tool_calls:
-            tc_name, tc_args = extract_tool_call_fields(tc)
-
-            # LLM is trying kubectl exec to run blade as alternative
-            if tc_name == "kubectl":
-                subcommand = tc_args.get("subcommand", "")
-                v_args = tc_args.get("v_args", "")
-                # kubectl exec ... -- blade create/destroy/status
-                if subcommand == "exec" and "blade" in v_args:
-                    return True
-                # kubectl-native alternatives: scale, cordon, patch, taint
-                if subcommand in ("scale", "cordon", "patch", "taint"):
-                    return True
-
-            # LLM is retrying blade_create (with adjusted params)
-            if tc_name == "blade_create":
-                return True
-
-        # Only check the most recent AIMessage with tool_calls
-        break
-
-    return False
+    return found_blade_error and ai_turns_since_error <= _BLADE_ERROR_COOLDOWN_TURNS
 
 
 def _detect_consecutive_idle_turns(
@@ -421,6 +435,18 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         return execute_loop
 
     async def _execute_loop_with_llm(state: AgentState) -> dict:
+        # 0. Reset time_wait consecutive-call guard if last round included
+        # any non-wait tool (allows time_wait to be called again after a
+        # real tool like kubectl ran).
+        from chaos_agent.tools.wait import mark_other_tool_called
+        messages = state.get("messages", [])
+        for msg in reversed(messages):
+            if isinstance(msg, ToolMessage):
+                if getattr(msg, "name", "") != "time_wait":
+                    mark_other_tool_called()
+                    break
+                break  # most recent ToolMessage is time_wait → don't reset
+
         # 1. Iteration count + limit check
         task_id = state.get("task_id", "unknown")
         skill_name = state.get("skill_name", "")
@@ -523,16 +549,27 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             # --- Action stagnation detection (tool-name level, ignores args) ---
             stagnation_hint, stagnant_tool = detect_action_stagnation(messages)
             if stagnation_hint:
-                exec_hint = (
-                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
-                    f"multiple consecutive times with no progress. "
-                    f"This tool has been temporarily removed. You MUST now either:\n"
-                    f"- Use a DIFFERENT tool to achieve the injection goal.\n"
-                    f"- Output your conclusion if injection already succeeded "
-                    f"(include blade_uid if available).\n"
-                    f"- Output [REPLAN] if the current approach is not working.\n"
-                    f"Do NOT attempt to call `{stagnant_tool}` again."
-                )
+                if ":" in stagnant_tool:
+                    base_tool = stagnant_tool.split(":")[0]
+                    exec_hint = (
+                        f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
+                        f"multiple consecutive times with no progress. "
+                        f"Stop using this subcommand. You can still use `{base_tool}` "
+                        f"with OTHER subcommands (patch, delete, scale, etc.) "
+                        f"to complete remaining injection steps.\n"
+                        f"Do NOT call `{stagnant_tool}` again."
+                    )
+                else:
+                    exec_hint = (
+                        f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
+                        f"multiple consecutive times with no progress. "
+                        f"This tool has been temporarily removed. You MUST now either:\n"
+                        f"- Use a DIFFERENT tool to achieve the injection goal.\n"
+                        f"- Output your conclusion if injection already succeeded "
+                        f"(include blade_uid if available).\n"
+                        f"- Output [REPLAN] if the current approach is not working.\n"
+                        f"Do NOT attempt to call `{stagnant_tool}` again."
+                    )
                 messages.append(HumanMessage(content=exec_hint))
 
             # --- Tool error introspection (runtime feedback > static docs) ---
@@ -646,7 +683,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 llm_to_call = llm
             else:
                 tools_this_iter = list(tools) if tools else []
-                if stagnant_tool:
+                if stagnant_tool and ":" not in stagnant_tool:
                     tools_this_iter = [
                         t for t in tools_this_iter
                         if getattr(t, "name", "") != stagnant_tool
@@ -654,7 +691,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 llm_to_call = llm.bind_tools(tools_this_iter) if tools_this_iter else llm
 
             # Record system prompt to session store (dedup handles repeated prompts)
-            record_system_prompt(hook, state, execute_prompt)
+            record_system_prompt(hook, state, execute_prompt, node_name=EXECUTE_LOOP)
 
             response = await llm_to_call.ainvoke(
                 [SystemMessage(content=execute_prompt)] + messages
@@ -675,13 +712,23 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 result["injection_start_time"] = now_iso()
                 logger.info("Set injection_start_time (blade_uid first seen)")
 
-        # Detect injection method for verifier Layer 1 strategy selection
-        current_injection_method = state.get("injection_method")
-        if not current_injection_method:
-            detected_method = _detect_injection_method(messages, blade_uid)
-            if detected_method:
+        # Detect injection method for verifier Layer 1 strategy selection.
+        # Re-detect every iteration: hybrid injections (kubectl patch + blade_create)
+        # start as kubectl_native but must upgrade when blade_uid appears.
+        current_injection_method = state.get("injection_method") or result.get("injection_method")
+        detected_method = _detect_injection_method(messages, blade_uid)
+        if detected_method and detected_method != current_injection_method:
+            # blade > kubectl: if blade_uid appeared, upgrade from kubectl_native
+            if current_injection_method == "kubectl_native" and detected_method in ("host_blade", "kubectl_exec"):
+                result["injection_method"] = detected_method
+                logger.info(f"Upgraded injection_method: {current_injection_method} → {detected_method}")
+            elif not current_injection_method:
                 result["injection_method"] = detected_method
                 logger.info(f"Detected injection_method: {detected_method}")
+            # Set injection_start_time for non-ChaosBlade methods too.
+            if not state.get("injection_start_time") and "injection_start_time" not in result:
+                result["injection_start_time"] = now_iso()
+                logger.info("Set injection_start_time (%s detected)", detected_method or current_injection_method)
 
         # Extract kubectl exec injection pod name for verifier preference
         current_pod_name = state.get("kubectl_exec_pod_name")
@@ -717,7 +764,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             result["messages"] = [response]
 
             # Immediately save AI message (including reasoning_content) to session
-            record_ai_message(hook, state, response)
+            record_ai_message(hook, state, response, node_name=EXECUTE_LOOP)
 
             # Diagnostic log for reasoning_content presence
             log_reasoning_content(response, "Execute loop", count)
@@ -787,7 +834,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                                     else f"{target_metadata.get('pod_memory_limit_mb')}MB"
                                 )
                                 _fcat_msg = f"[FCAT P0] {adj.id}: size adjusted to {tc_args.get(key, safe_size)}MB (pod_memory_limit={_mem_str})"
-                                _fcat_store.append_messages(_fcat_tid, [_HM(content=_fcat_msg)])
+                                _fcat_store.append_messages(_fcat_tid, [_HM(content=_fcat_msg)], node_name=EXECUTE_LOOP)
                             # Debug-mode CLI display (truncated)
                             if settings.is_debug and tracker:
                                 _mem_str_dbg = (
@@ -879,6 +926,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         if response is not None:
             _has_tool_calls = bool(getattr(response, "tool_calls", None))
             _has_uid = bool(result.get("blade_uid") or state.get("blade_uid"))
+            _injection_method = result.get("injection_method") or state.get("injection_method")
             _resp_content = (getattr(response, "content", "") or "").strip()
             if (
                 not _has_tool_calls
@@ -886,12 +934,63 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 and not result.get("error")
                 and _resp_content
                 and REPLAN_MARKER not in _resp_content
+                and not _injection_method
             ):
-                result.update(fail_state(
-                    FailureCategory.EXECUTION_FAILED,
+                if not state.get("_execute_text_nudged"):
+                    # First text-only output: nudge LLM to execute instead
+                    # of summarizing. Give it one more chance before failing.
+                    result.setdefault("messages", []).append(
+                        HumanMessage(content=(
+                            "**EXECUTION REQUIRED**: You output text instead of "
+                            "calling a tool. You are in Phase 2 (execution) — "
+                            "the plan is already approved. You MUST call "
+                            "`kubectl` or `blade_create` NOW to inject the "
+                            "fault. Do NOT output plans, summaries, or wait "
+                            "for confirmation. Execute immediately."
+                        ))
+                    )
+                    result["_execute_text_nudged"] = True
+                else:
+                    result.update(fail_state(
+                        FailureCategory.EXECUTION_FAILED,
                     "LLM concluded without tool use",
                     state.get("messages", []) + result.get("messages", []),
                 ))
+
+            # --- kubectl_native step completeness check ---
+            # When the LLM concludes (text-only) after a kubectl_native
+            # injection, verify all skill case 演练步骤 have been executed.
+            # If steps are missing, nudge the LLM to continue and clear
+            # injection_method so the router returns "continue".
+            if (
+                not _has_tool_calls
+                and _injection_method == "kubectl_native"
+                and not state.get("_kubectl_step_nudged")
+            ):
+                from chaos_agent.agent.nodes._injection_detection import (
+                    check_injection_step_completeness,
+                )
+                _skill_case = (
+                    result.get("skill_case_content")
+                    or state.get("skill_case_content", "")
+                )
+                _all_msgs = (
+                    state.get("messages", [])
+                    + result.get("messages", [])
+                )
+                _nudge = check_injection_step_completeness(
+                    _skill_case, _all_msgs,
+                )
+                if _nudge:
+                    logger.info(
+                        "kubectl_native step completeness: incomplete, "
+                        "nudging LLM to continue"
+                    )
+                    result.setdefault("messages", []).append(
+                        HumanMessage(content=_nudge)
+                    )
+                    result["injection_method"] = None
+                    result["_kubectl_step_nudged"] = True
 
         # --- Last-iteration failure attribution ---
         if count >= MAX_EXECUTE_LOOP:

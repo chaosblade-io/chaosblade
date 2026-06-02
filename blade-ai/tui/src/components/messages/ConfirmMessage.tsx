@@ -821,8 +821,8 @@ const SafetyCheckList: React.FC<{ status: string; reason: string }> = ({
       <SafetyCheckRow
         glyph={badge.glyph}
         color={badge.color}
-        label={badge.label}
-        detail={reason || undefined}
+        label={t("confirm.field.safety")}
+        detail={reason || t("confirm.safety.all_clear")}
       />
     </Box>
   );
@@ -854,6 +854,7 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   // user reads the full plan off disk via ``cat`` / editor.
   const safetyStatus = asString(payload?.["safety_status"]);
   const safetyReason = asString(payload?.["safety_reason"]);
+  const safetyCheckedDetail = asString(payload?.["safety_checked_detail"]);
 
   let targetStr = "";
   if (target) {
@@ -996,12 +997,12 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
     >
       {/* Adaptive top alert — only fires for non-safe statuses */}
       {hasProblem && badge && (
-        <Box marginTop={1}>
+        <Box marginTop={1} flexDirection="column">
           <SafetyCheckRow
             glyph={badge.glyph}
             color={badge.color}
-            label={badge.label}
-            detail={safetyReason || undefined}
+            label={t("confirm.field.safety")}
+            detail={safetyReason || safetyCheckedDetail || badge.label}
           />
         </Box>
       )}
@@ -1148,7 +1149,7 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
             />
             {feasRecommendation && (
               <Box>
-                <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0} />
+                <Box minWidth={FIELD_LABEL_WIDTH} flexShrink={0} />
                 <Box flexGrow={1}>
                   <Text color={Theme.text.secondary} wrap="wrap">
                     {feasRecommendation}
@@ -1252,7 +1253,7 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
       {/* Bottom Safety check section — quiet placement, only when no
        *  prominent top alert is rendered (avoids showing safety twice). */}
       {!hasProblem && badge && (
-        <SafetyCheckList status={safetyStatus} reason={safetyReason} />
+        <SafetyCheckList status={safetyStatus} reason={safetyCheckedDetail || safetyReason} />
       )}
     </ConfirmFrameHard>
   );
@@ -1264,10 +1265,12 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
 
 const TargetChangeCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   payload,
+  taskId,
 }) => {
   const cardWidth = useBootCardWidth();
   const p = payload ?? {};
   const reason = asString(p["reason"]);
+  const agentReason = asString(p["agent_reason"]);
   const original = asRecord(p["original"]);
   const proposed = asRecord(p["proposed"]);
 
@@ -1293,24 +1296,88 @@ const TargetChangeCard: React.FC<{ payload: Payload; taskId?: string }> = ({
     <Box paddingLeft={2} marginTop={1} flexDirection="column">
       <Box
         flexDirection="column"
-        borderStyle="double"
+        borderStyle="single"
         borderColor={Theme.status.warn}
         paddingX={2}
         paddingY={0}
         width={cardWidth}
       >
-        <Text bold color={Theme.status.warn}>
-          {t("confirm.targetChange.title")}
-        </Text>
-        {reason ? <Text dimColor>{reason}</Text> : null}
-        <Box marginTop={1} flexDirection="column">
-          <Text bold>{t("confirm.targetChange.original")}</Text>
-          {renderTarget(original)}
+        <TitleChip
+          glyph={Icons.warning}
+          glyphColor={Theme.status.warn}
+          chipLabel={t("confirm.targetChange.chip")}
+          title={t("confirm.targetChange.title")}
+          taskId={taskId}
+        />
+        <Box marginTop={1}>
+          <Text color={Theme.gray[500]}>{t("confirm.targetChange.preamble")}</Text>
         </Box>
-        <Box marginTop={1} flexDirection="column">
-          <Text bold>{t("confirm.targetChange.proposed")}</Text>
-          {renderTarget(proposed)}
+        <Box flexDirection="column">
+          <SectionHeading label={t("confirm.targetChange.agentReason")} />
+          <Text wrap="wrap">{agentReason || t("confirm.targetChange.agentReasonEmpty")}</Text>
         </Box>
+        {reason ? (
+          <Box marginTop={1}>
+            <Text dimColor>{reason}</Text>
+          </Box>
+        ) : null}
+        <SectionHeading label={t("confirm.targetChange.original")} />
+        {renderTarget(original)}
+        <SectionHeading label={t("confirm.targetChange.proposed")} />
+        {renderTarget(proposed)}
+      </Box>
+    </Box>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// Plan change card (replan fault type switch)
+// ---------------------------------------------------------------------------
+
+const PlanChangeCard: React.FC<{ payload: Payload; taskId?: string }> = ({
+  payload,
+  taskId,
+}) => {
+  const cardWidth = useBootCardWidth();
+  const p = payload ?? {};
+  const reason = asString(p["reason"]);
+  const original = asRecord(p["original"]);
+  const proposed = asRecord(p["proposed"]);
+
+  const renderFaultType = (ft: Record<string, unknown> | null) => {
+    if (!ft) return <Text dimColor>—</Text>;
+    const scope = asString(ft["scope"]);
+    const target = asString(ft["blade_target"]);
+    const action = asString(ft["blade_action"]);
+    return <Text>{`${scope}-${target}-${action}`}</Text>;
+  };
+
+  return (
+    <Box paddingLeft={2} marginTop={1} flexDirection="column">
+      <Box
+        flexDirection="column"
+        borderStyle="single"
+        borderColor={Theme.status.warn}
+        paddingX={2}
+        paddingY={0}
+        width={cardWidth}
+      >
+        <TitleChip
+          glyph={Icons.warning}
+          glyphColor={Theme.status.warn}
+          chipLabel={t("confirm.planChange.chip")}
+          title={t("confirm.planChange.title")}
+          taskId={taskId}
+        />
+        <Box marginTop={1}>
+          <Text color={Theme.gray[500]}>{t("confirm.planChange.preamble")}</Text>
+        </Box>
+        <SectionHeading label={t("confirm.planChange.reason")} />
+        <Text wrap="wrap">{reason}</Text>
+        <SectionHeading label={t("confirm.planChange.original")} />
+        {renderFaultType(original)}
+        <SectionHeading label={t("confirm.planChange.proposed")} />
+        {renderFaultType(proposed)}
       </Box>
     </Box>
   );
@@ -1483,6 +1550,13 @@ const ConfirmContextMessageInternal: React.FC<{
   ) {
     return <TargetChangeCard payload={item.payload} taskId={item.taskId} />;
   }
+  if (
+    item.payload &&
+    item.node === "plan_change_confirm" &&
+    asString(item.payload["type"]) === "plan_change"
+  ) {
+    return <PlanChangeCard payload={item.payload} taskId={item.taskId} />;
+  }
   return <GenericConfirmCard content={item.content} taskId={item.taskId} />;
 };
 
@@ -1572,15 +1646,20 @@ const ConfirmPromptMessageInternal: React.FC<{
   } else if (item.node === "tool_screener") {
     yesLabel = t("confirm.targetChange.approve");
     noLabel = t("confirm.targetChange.reject");
+  } else if (item.node === "plan_change_confirm") {
+    yesLabel = t("confirm.planChange.approve");
+    noLabel = t("confirm.planChange.reject");
   } else {
     yesLabel = t("confirm.proceed");
     noLabel = t("confirm.refine");
   }
   const select = useConfirmSelect(item.taskId, yesLabel, noLabel, isFocused);
 
-  const isHard = item.node === "confirmation_gate" || item.node === "tool_screener";
-  const tierColor = item.node === "tool_screener" ? Theme.status.warn : Theme.gray[700];
-  const tierStyle: "double" | "round" = isHard ? "double" : "round";
+  const isHard = item.node === "confirmation_gate" || item.node === "tool_screener" || item.node === "plan_change_confirm";
+  const tierColor = (item.node === "tool_screener" || item.node === "plan_change_confirm") ? Theme.status.warn : Theme.gray[700];
+  const tierStyle: "double" | "single" | "round" = item.node === "confirmation_gate"
+    ? "double"
+    : isHard ? "single" : "round";
   return (
     <Box paddingLeft={2} marginTop={1} flexDirection="column">
       <Box

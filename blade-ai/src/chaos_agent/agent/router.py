@@ -4,6 +4,12 @@ import time
 
 from langgraph.graph import END
 
+from langchain_core.messages import ToolMessage
+
+from chaos_agent.agent.nodes._verifier_submit import (
+    SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+    SUBMIT_VERIFICATION_TOOL_NAME,
+)
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
 
@@ -125,10 +131,6 @@ def should_continue_agent_loop(state: AgentState) -> str:
         last_msg = messages[-1]
         # If the last message has tool_calls, continue the ReAct loop
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
-            for tc in last_msg.tool_calls:
-                tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
-                if tc_name == "finish_planning":
-                    return "extract_planning_metadata"
             return "continue"
         # If the last message is an AI message without tool_calls,
         # the LLM has finished its turn
@@ -147,6 +149,34 @@ def should_continue_agent_loop(state: AgentState) -> str:
 
     # Otherwise continue the ReAct loop
     return "continue"
+
+
+def route_after_phase1_tools(state: AgentState) -> str:
+    """Route after phase1_tools ToolNode execution.
+
+    Detects if the just-executed tool batch contains a planning-exit
+    signal (finish_planning or save_fault_plan). If so, skip the extra
+    agent_loop iteration and go directly to extract_planning_metadata.
+
+    Skips error ToolMessages (status="error") — those indicate the tool
+    invocation failed (e.g. arg validation) and the LLM should retry.
+    """
+    messages = state.get("messages", [])
+    if not messages:
+        return "agent_loop"
+
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            break
+        if getattr(msg, "status", None) == "error":
+            continue
+        msg_name = getattr(msg, "name", "") or ""
+        if msg_name in ("finish_planning", "save_fault_plan"):
+            return "extract_planning_metadata"
+        if msg_name == "propose_plan_change" and state.get("replan_context"):
+            return "plan_change_confirm"
+
+    return "agent_loop"
 
 
 def should_continue_execute_loop(state: AgentState) -> str:
@@ -183,11 +213,9 @@ def should_continue_execute_loop(state: AgentState) -> str:
             return "replan"
         return "end"
 
-    # If we have a blade_uid, execution likely succeeded
-    if state.get("blade_uid"):
-        return "verifier"
-
     # Check the last message for tool_calls (LLM ReAct pattern)
+    # blade_uid alone does NOT mean execution is complete — hybrid injections
+    # (blade_create + kubectl steps) need to continue after blade succeeds.
     messages = state.get("messages", [])
     if messages:
         last_msg = messages[-1]
@@ -198,6 +226,8 @@ def should_continue_execute_loop(state: AgentState) -> str:
         # check whether execution actually succeeded before routing to verifier.
         if hasattr(last_msg, "type") and last_msg.type == "ai":
             if state.get("blade_uid"):
+                return "verifier"
+            if state.get("injection_method"):
                 return "verifier"
             # Text-only without blade_uid: the execute_loop node's
             # terminal-conclusion detection normally sets error (caught
@@ -274,114 +304,183 @@ def route_after_baseline(state: AgentState) -> str:
 
 
 def should_continue_verifier(state: AgentState) -> str:
-    """Decide whether to continue the inject verifier ReAct loop or finish.
+    """Decide what happens after the verifier_loop LLM step (Scheme B).
 
-    Checks the ``verification`` state key (inject verifier's output).
-
-    P2: Also checks reverify_gaps — if gaps were detected and reverify_count
-    hasn't exceeded max_reverify_attempts, forces another verification round.
+    verifier_loop is now a pure ReAct step; finalization lives in the
+    finalize_verification node.
 
     Returns:
-        "continue" - more verification iterations needed (LLM has tool_calls)
-        "done" - verification complete (LLM output is pure text, no tool_calls)
-                 OR wall-clock timeout reached
+        "continue" - LLM emitted tool_calls (incl. submit_verification) →
+                     run them in verifier_tools, then route_after_verifier_tools
+                     decides finalize vs continue.
+        "finalize" - LLM emitted text without tool_calls → hand the text
+                     verdict to finalize_verification (text fallback).
+        "done"     - early-exit terminal: wall-clock / max iterations, or
+                     verification already set inline by verifier_loop
+                     (max-guard or Layer 1 failure) → straight to se_detect.
+
+    Re-verification is NOT handled here anymore — finalize_verification sets
+    the reverify prompt and route_after_finalize loops back to verifier_loop.
     """
-    # Patch C — wall-clock cap. Verifier is best-effort: stopping
-    # early with whatever evidence has accumulated is preferable to
-    # spinning Layer 2 indefinitely on an unstable cluster.
-    if _wall_clock_exceeded(state):
-        return "done"
-    max_loop = settings.max_verifier_loop
-    count = state.get("verifier_loop_count", 0)
-
-    if count >= max_loop:
-        return "done"
-
-    # P2: re-verification triggered by verification gaps
-    reverify_gaps = state.get("reverify_gaps")
-    if reverify_gaps:
-        reverify_count = state.get("reverify_count", 0)
-        from chaos_agent.utils.fault_context import lookup_adaptations
-        from chaos_agent.agent.fault_spec import read_fault_spec as _rfs
-        _spec = _rfs(state)
-        adaptations = lookup_adaptations(
-            _spec.scope if _spec else "",
-            _spec.blade_target if _spec else "",
-            _spec.blade_action if _spec else "",
-            state.get("target_metadata") or {},
-            rule_type="verification_integrity_guard",
-        )
-        max_attempts = 1  # default
-        if adaptations:
-            max_attempts = adaptations[0].action.get("max_reverify_attempts", 1)
-        if reverify_count <= max_attempts:
-            return "continue"
-
-    # If verification result is already set, we're done
+    # Early-exit terminals set verification inline (node max-guard at
+    # count>max, or Layer 1 failure). Those are truly done.
     if state.get("verification"):
         return "done"
 
+    # Patch C — wall-clock cap. A timeout is an ABNORMAL cutoff: the node
+    # already stamped a failure (mark_wall_clock_timeout); give up cleanly.
+    if _wall_clock_exceeded(state):
+        return "done"
+
+    # Max-iteration cap. On the final allowed iteration (count==max) the node
+    # forces a text-only verdict (JSON mode / unbound tools) — a NORMAL forced
+    # completion. That verdict must still be PROCESSED, so route to
+    # finalize_verification rather than dropping it via "done" (which would
+    # leave verification unset and lose the verdict).
+    max_loop = settings.max_verifier_loop
+    count = state.get("verifier_loop_count", 0)
+    if count >= max_loop:
+        return "finalize"
+
     # Check the last message for tool_calls
     messages = state.get("messages", [])
     if messages:
         last_msg = messages[-1]
-        # If the last message has tool_calls, continue the ReAct loop
+        # tool_calls (incl. submit_verification) → run them; routing after
+        # verifier_tools decides finalize vs continue.
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
             return "continue"
-        # If the last message is an AI message without tool_calls,
-        # verification is complete
+        # AI text without tool_calls → finalize from text (fallback path).
         if hasattr(last_msg, "type") and last_msg.type == "ai":
-            return "done"
+            return "finalize"
 
-    # Default: continue
+    # Default: continue the loop.
     return "continue"
+
+
+def route_after_verifier_tools(state: AgentState) -> str:
+    """Route after the verifier_tools ToolNode (Scheme B).
+
+    Mirrors ``route_after_phase1_tools``: scan the just-executed
+    ToolMessages; if ``submit_verification`` ran, the verifier declared its
+    verdict → go to finalize_verification. Otherwise it was ordinary
+    evidence-gathering (kubectl/...) → back to verifier_loop for the next
+    ReAct turn. Error ToolMessages are skipped so a failed call doesn't
+    masquerade as a submit.
+    """
+    messages = state.get("messages", [])
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            break
+        if getattr(msg, "status", None) == "error":
+            continue
+        if getattr(msg, "name", "") == SUBMIT_VERIFICATION_TOOL_NAME:
+            return "finalize"
+    return "verifier_loop"
+
+
+def route_after_finalize(state: AgentState) -> str:
+    """Route after finalize_verification (Scheme B).
+
+    finalize sets ``verification`` only when it has a final verdict. When it
+    instead found verification gaps with budget remaining, it leaves
+    ``verification`` unset and appends a re-verify prompt → loop back to
+    verifier_loop. Otherwise → se_detect.
+    """
+    if state.get("verification"):
+        return "se_detect"
+    return "verifier_loop"
 
 
 def should_continue_recover_verifier(state: AgentState) -> str:
-    """Decide whether to continue the recover verifier ReAct loop or finish.
+    """Decide what happens after the recover_verifier_loop step (Scheme B).
 
-    Checks the ``recover_verification`` state key (recover verifier's output).
-    Separate from should_continue_verifier to avoid false "done" caused by
-    the inject graph's ``verification`` key leaking through shared checkpoints.
+    recover_verifier_loop is now a pure ReAct step; Layer 2 finalization lives
+    in the finalize_recover_verification node.
 
     Returns:
-        "continue" - more verification iterations needed (LLM has tool_calls)
-        "done" - recovery verification complete OR wall-clock timeout
+        "continue" - LLM emitted tool_calls (incl. submit_recover_verification),
+                     OR a Layer 1 → Layer 2 transition text (RECOVERY_EXECUTION_RESULT
+                     before Layer 2 has built its context).
+        "finalize" - a Layer 2 verdict text (no tool_calls, Layer 2 context built)
+                     → finalize_recover_verification (text fallback).
+        "done"     - early-exit terminal: wall-clock / max iterations, or
+                     recover_verification already set inline (max-guard or
+                     Layer 1 failure) → END.
+
+    The Layer 1 → Layer 2 transition is distinguished from a Layer 2 verdict by
+    ``layer2_context_added``: it's only True once Layer 2 has run, so transition
+    text (before Layer 2) routes "continue", while verdict text routes "finalize".
     """
-    # Patch C — wall-clock cap (same rationale as inject verifier).
-    if _wall_clock_exceeded(state):
-        return "done"
-    max_loop = settings.max_recover_verifier_loop
-    count = state.get("verifier_loop_count", 0)
-
-    if count >= max_loop:
-        return "done"
-
-    # If recover verification result is already set, we're done
+    # Early-exit terminals set recover_verification inline (node max-guard at
+    # count>max, or Layer 1 failure). Those are truly done.
     if state.get("recover_verification"):
         return "done"
 
-    # If Layer 1 passed and we're transitioning to Layer 2, continue the loop
-    # even though the last message is an AI message without tool_calls.
-    # Without this check, the router would see the Layer 1 AI final result
-    # (RECOVERY_EXECUTION_RESULT) and incorrectly return "done", skipping Layer 2.
-    if state.get("recover_phase") == "layer2_verification":
-        return "continue"
+    # Patch C — wall-clock cap: abnormal cutoff, the node stamped a failure.
+    if _wall_clock_exceeded(state):
+        return "done"
 
-    # Check the last message for tool_calls
+    # Max-iteration cap. On the final allowed iteration the node forces a
+    # text-only Layer 2 verdict, which must still be processed → route to
+    # finalize_recover_verification. BUT only when we're actually in Layer 2
+    # (layer2_context_added): the recover node's Layer 1 recovery-execution
+    # sub-loop also consumes verifier_loop_count, and a Layer-1 transition text
+    # is NOT a verdict. If the budget ran out still in Layer 1, we're done
+    # (Layer 2 never reached) — matching the pre-Scheme-B behaviour.
+    max_loop = settings.max_recover_verifier_loop
+    count = state.get("verifier_loop_count", 0)
+    if count >= max_loop:
+        return "finalize" if state.get("layer2_context_added") else "done"
+
     messages = state.get("messages", [])
     if messages:
         last_msg = messages[-1]
-        # If the last message has tool_calls, continue the ReAct loop
+        # tool_calls (incl. submit_recover_verification) → run them; routing
+        # after recover_verifier_tools decides finalize vs continue.
         if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
             return "continue"
-        # If the last message is an AI message without tool_calls,
-        # verification is complete
         if hasattr(last_msg, "type") and last_msg.type == "ai":
-            return "done"
+            # AI text: a Layer 2 verdict (context built) → finalize;
+            # a Layer 1 → Layer 2 transition (context not yet built) → continue.
+            if state.get("layer2_context_added"):
+                return "finalize"
+            return "continue"
 
     # Default: continue
     return "continue"
+
+
+def route_after_recover_verifier_tools(state: AgentState) -> str:
+    """Route after the recover_verifier_tools ToolNode (Scheme B).
+
+    Mirrors route_after_verifier_tools: if submit_recover_verification ran, the
+    verifier declared its verdict → finalize_recover_verification. Otherwise it
+    was ordinary evidence-gathering / recovery actions → back to
+    recover_verifier_loop.
+    """
+    messages = state.get("messages", [])
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            break
+        if getattr(msg, "status", None) == "error":
+            continue
+        if getattr(msg, "name", "") == SUBMIT_RECOVER_VERIFICATION_TOOL_NAME:
+            return "finalize"
+    return "recover_verifier_loop"
+
+
+def route_after_recover_finalize(state: AgentState) -> str:
+    """Route after finalize_recover_verification (Scheme B).
+
+    finalize sets ``recover_verification`` only when it has a final verdict.
+    When it instead found a gap (no kubectl check) or retried recovery, it
+    leaves recover_verification unset and appends a prompt → loop back to
+    recover_verifier_loop. Otherwise → END.
+    """
+    if state.get("recover_verification"):
+        return "done"
+    return "recover_verifier_loop"
 
 
 def route_after_load_memory(state: AgentState) -> str:

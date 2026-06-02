@@ -214,25 +214,25 @@ class NodeHealthChecker:
         conditions = await _query_node_conditions(names[0], kubeconfig)
         report = _build_node_report(target, conditions)
 
-        # ChaosBlade agent existence — node scope requires DaemonSet pod on target.
-        agent_checked = False
+        # chaosblade-tool existence — node scope requires DaemonSet pod on target.
+        tool_checked = False
         if settings.blade_agent_check_enabled and kubeconfig:
-            agent_checked = True
-            agent_ok = await _query_blade_agent_on_node(names[0], kubeconfig)
-            if not agent_ok:
+            tool_checked = True
+            tool_ok = await _query_blade_agent_on_node(names[0], kubeconfig)
+            if not tool_ok:
                 report.issues.append(
                     HealthIssue(
                         severity=HealthSeverity.BLOCK,
-                        code="node.blade_agent_missing",
-                        message=f"ChaosBlade agent pod not found on node {names[0]}",
+                        code="node.chaosblade_tool_missing",
+                        message=f"chaosblade-tool pod not found on node {names[0]}",
                     )
                 )
                 report.overall = HealthSeverity.BLOCK
 
         if report.overall == HealthSeverity.OK:
             detail = "Node Ready, 无 DiskPressure/MemoryPressure/PIDPressure/NetworkUnavailable"
-            if agent_checked:
-                detail += ", blade-agent 在线"
+            if tool_checked:
+                detail += ", chaosblade-tool 在线"
             report.checked_detail = detail
 
         return report
@@ -633,9 +633,13 @@ async def _resolve_pod_names(target: dict, kubeconfig: str) -> list[str]:
                 ),
                 kubeconfig=kubeconfig or "",
             )
-            pod_names = [
-                n for n in (raw or "").strip().strip("'\"").split() if n
-            ]
+            # kubectl_impl appends a hint when no resources match
+            # (e.g. "💡 No resources matched..."). Detect and skip.
+            stripped = (raw or "").strip().strip("'\"")
+            if not stripped or "💡" in stripped or "No resources" in stripped:
+                pod_names = []
+            else:
+                pod_names = [n for n in stripped.split() if n]
             if pod_names:
                 return pod_names
         except Exception:

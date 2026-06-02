@@ -8,7 +8,7 @@
 **资源准备**：
 1. 确认目标应用已正常运行，且有对外网络调用（数据库、缓存、上下游服务等）
 2. 确认监控系统可观测网络请求成功率和延迟指标
-3. 确认目标 Pod 使用的网络接口名称（通常为 eth0）
+3. 确认目标 Pod 的标签选择器和命名空间
 
 **演练步骤**：
 1. 确认目标 Pod 的标签选择器和命名空间：
@@ -20,11 +20,10 @@
    blade create k8s pod-network drop \
      --namespace <namespace> \
      --labels "<label-key>=<label-value>" \
-     --interface eth0 \
-     --local-port <port> \
+     --source-port <port> \
      --kubeconfig <kubeconfig-path>
    ```
-   - `--local-port`：限定丢包端口（如 3306 丢弃 MySQL 流量、53 丢弃 DNS 流量）
+   - `--source-port`：限定丢包端口（如 3306 丢弃 MySQL 流量、53 丢弃 DNS 流量）
    - 不指定端口时为全量丢包（慎用，影响所有流量包括监控和健康检查）
 3. 记录返回的 blade_uid，用于后续恢复
 

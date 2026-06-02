@@ -111,8 +111,11 @@ def check_kubeconfig() -> CheckResult:
 
 def check_kubectl() -> CheckResult:
     """Check that kubectl is executable."""
-    path = settings.kubectl_path
-    if shutil.which(path):
+    from chaos_agent.utils.blade_paths import is_executable
+    # is_executable (not bare shutil.which): kubectl_path may be configured
+    # as a full path, and shutil.which mishandles a path-shaped cmd on
+    # Windows before Python 3.12 (in scope via requires-python >=3.11).
+    if is_executable(settings.kubectl_path):
         return CheckResult(name="kubectl", severity="blocking", passed=True)
 
     return CheckResult(
@@ -125,18 +128,25 @@ def check_kubectl() -> CheckResult:
 
 
 def check_blade() -> CheckResult:
-    """Check that ChaosBlade binary is executable (warning: kubectl exec fallback available)."""
-    blade = settings._resolve_blade_path()
-    if blade and (os.path.isfile(blade) or shutil.which(blade)):
+    """Check that ChaosBlade binary is executable (warning: kubectl exec fallback available).
+
+    Pure detection — does NOT download. The CLI download step runs
+    separately in ``run_command`` (with stderr progress), and the agent's
+    ``blade_create`` ensures the binary on first injection. Keeping
+    preflight side-effect-free is what lets the async TUI preflight stay
+    within its 8s budget.
+    """
+    from chaos_agent.utils.blade_paths import is_executable
+    if is_executable(settings._resolve_blade_path()):
         return CheckResult(name="blade", severity="warning", passed=True)
 
     return CheckResult(
         name="blade",
         severity="warning",
         passed=False,
-        message="blade 不可用",
-        fix="将通过 kubectl exec 降级执行。建议安装 ChaosBlade 以获得完整能力:\n"
-            "  blade-ai config set blade_path <path>",
+        message="blade 未安装（首次注入时自动下载，或降级为 kubectl exec）",
+        fix="首次注入会自动下载 ChaosBlade（约 51MB）；\n"
+            "如需手动指定: blade-ai config set blade_path <path>",
     )
 
 
@@ -167,7 +177,7 @@ VERSION_CHECKS: list[Callable[[], CheckResult]] = []
 # slow one doesn't block the whole gather; ``server/routes/preflight.py``
 # wraps the gather with a global wait_for as the outer safety net.
 #
-# Why the LLM probe doesn't use ``settings.timeout_llm`` (180s):
+# Why the LLM probe doesn't use ``settings.llm_read_timeout`` (180s):
 #     That's the budget for a real chat completion — Qwen with
 #     ``enable_thinking`` plus reasoning can easily take 5-10s end to
 #     end. The preflight check doesn't need to run inference at all;
@@ -585,6 +595,12 @@ async def check_blade_version() -> CheckResult:
     so the preflight result matches what the agent will see at runtime.
     Severity stays ``warning`` — a missing blade falls back to
     ``kubectl exec``, so it's not blocking.
+
+    Pure detection — does NOT download. A 51MB download here would block
+    the event loop and blow the 8s preflight budget (see
+    server/routes/preflight.py). The binary is fetched off the hot path:
+    the agent's ``blade_create`` calls ``ensure_chaosblade_async()`` on
+    first injection.
     """
     from chaos_agent.agent.env_info import _get_blade_version
 
@@ -603,9 +619,9 @@ async def check_blade_version() -> CheckResult:
             name="blade",
             severity="warning",
             passed=False,
-            message=f"blade 不可用 (path={settings._resolve_blade_path() or settings.blade_path})",
-            fix="安装 ChaosBlade 并 blade-ai config set blade_path <path>\n"
-                "未安装时 agent 会通过 kubectl exec 降级执行",
+            message="blade 未安装（首次注入时自动下载，或降级为 kubectl exec）",
+            fix="首次注入会自动下载 ChaosBlade（约 51MB）；\n"
+                "如需手动指定: blade-ai config set blade_path <path>",
         )
 
     # Show the resolved blade binary path so users can confirm which
@@ -1065,6 +1081,51 @@ def map_error(exc: Exception) -> Optional[CheckResult]:
 
 # ── Command orchestration ──────────────────────────────────────────
 
+def _ensure_blade_for_cli() -> None:
+    """Download ChaosBlade for CLI inject/recover, with a stderr progress line.
+
+    Best-effort and idempotent: returns instantly when blade is already
+    resolvable; a download failure is non-fatal (the agent degrades to
+    kubectl exec). Runs only in the sync CLI path, so the blocking
+    download here is fine — there is no event loop or preflight budget.
+    """
+    from chaos_agent.utils.blade_paths import is_executable
+    if is_executable(settings._resolve_blade_path()):
+        return
+    try:
+        from chaos_agent.chaosblade_installer import (
+            CHAOSBLADE_VERSION,
+            ensure_chaosblade,
+        )
+    except Exception:
+        return
+
+    last_pct = [-1]
+
+    def _progress(done: int, total: int) -> None:
+        if total <= 0:
+            return
+        pct = int(done * 100 / total)
+        if pct != last_pct[0]:
+            last_pct[0] = pct
+            sys.stderr.write(
+                f"\r  ⏳ 下载 ChaosBlade v{CHAOSBLADE_VERSION}: "
+                f"{pct}% ({done / 1048576:.1f}/{total / 1048576:.1f} MB)"
+            )
+            sys.stderr.flush()
+
+    sys.stderr.write("ChaosBlade 未安装，正在为首次使用下载...\n")
+    sys.stderr.flush()
+    try:
+        ensure_chaosblade(on_progress=_progress)
+        sys.stderr.write("\n  ✓ ChaosBlade 就绪\n")
+    except Exception as e:
+        sys.stderr.write(
+            f"\n  ⚠ ChaosBlade 下载失败 ({e})；将尝试 kubectl exec 降级执行。\n"
+        )
+    sys.stderr.flush()
+
+
 def run_command(
     checks: list[Callable[[], CheckResult]],
     local_fn: Callable[[Any], Awaitable[Any]],
@@ -1085,6 +1146,14 @@ def run_command(
         results = run(checks)
         if display(results):
             raise typer.Exit(code=1)
+        # Pre-emptively fetch ChaosBlade for commands that need it
+        # (inject/recover include check_blade). Done in the sync CLI path
+        # — no event loop yet, no 8s budget — with a stderr progress line,
+        # so the user sees the one-time 51MB download up front rather than
+        # a silent pause mid-injection. blade_create still ensures it as a
+        # safety net; both are idempotent.
+        if check_blade in checks:
+            _ensure_blade_for_cli()
 
     # Phase 2
     backend = get_backend()

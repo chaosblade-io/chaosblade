@@ -127,7 +127,7 @@ class TestPreflightNodeScopeCheck:
             result = await direct_execute(state)
 
         assert "error" in result
-        assert "prerequisite_failed" in result.get("failure_reason", "")
+        assert result.get("failure_detail", {}).get("category") == "prerequisite_failed"
 
     @pytest.mark.asyncio
     async def test_preflight_available_node_proceeds(self):
@@ -226,7 +226,7 @@ class TestPreflightNodeScopeCheck:
             result = await direct_execute(state)
 
         # Fail-open: pre-flight exception must NOT produce PREREQUISITE_FAILED
-        assert "prerequisite_failed" not in result.get("failure_reason", ""), (
+        assert result.get("failure_detail", {}).get("category") != "prerequisite_failed", (
             f"Fail-open violated: got PREREQUISITE_FAILED "
             f"but pre-flight exception should not block injection"
         )

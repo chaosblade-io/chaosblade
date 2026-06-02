@@ -5,6 +5,7 @@ from typing import Callable
 
 from langchain_core.messages import HumanMessage
 
+from chaos_agent.agent.node_names import DIRECT_SETUP
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
@@ -73,13 +74,13 @@ async def _collect_context(state: AgentState) -> dict:
                     f"[FCAT Context] Pod memory limit: "
                     + (f"{mem_limit}MB" if mem_limit is not None else "not available / query failed")
                 )
-                _store.append_messages(_tid, [HumanMessage(content=_msg)])
+                _store.append_messages(_tid, [HumanMessage(content=_msg)], node_name=DIRECT_SETUP)
         except Exception:
             logger.debug("Failed to fetch pod memory limit for FCAT", exc_info=True)
             if _store and _tid:
                 _store.append_messages(_tid, [HumanMessage(
                     content="[FCAT Context] Pod memory limit: query failed (exception)"
-                )])
+                )], node_name=DIRECT_SETUP)
 
     # Active same-action experiments (for P1 conflict escalation)
     # This will be populated by safety_check's conflict_check; here we
@@ -121,7 +122,7 @@ def make_direct_setup(registry: SkillRegistry) -> Callable:
                 "skill_name": "",
             }
             tracker.fail(f"Skill '{_DIRECT_SKILL_NAME}' not found")
-            sync_node_status_to_session(state, "direct_setup",
+            sync_node_status_to_session(state, DIRECT_SETUP,
                 f"Skill '{_DIRECT_SKILL_NAME}' not found",
                 detail={"safety_status": "rejected", "reason": "skill_not_found"})
             await sync_to_store(state, result)
@@ -147,18 +148,52 @@ def make_direct_setup(registry: SkillRegistry) -> Callable:
             + f"Scope: {scope}, Target: {target}, Action: {action}"
         )
 
-        # 3. Read use-case specific content for verifier Layer 2
+        # 3. Read use-case specific content for verifier Layer 2.
+        # match_use_cases returns ALL matching skill cases (not just the
+        # first). When multiple cases share the same (scope, target, action)
+        # — e.g. pod-cpu-fullload matches both "Pod CPU 使用率过高" AND
+        # "HPA 副本达到上限" — load all of them so the verifier LLM can
+        # pick the verification steps most relevant to the actual situation.
         skill_case_content = ""
+        use_case_path = None
         try:
-            use_case_path = registry.match_use_case(
+            all_matches = registry.match_use_cases(
                 scope=scope, target=target, action=action
             )
-            if use_case_path:
-                skill_case_content = registry.read_resource(_DIRECT_SKILL_NAME, use_case_path)
-                logger.info(
-                    f"Direct setup: loaded use-case content from {use_case_path} "
-                    f"({len(skill_case_content)} chars)"
-                )
+            if all_matches:
+                use_case_path = all_matches[0]
+                if len(all_matches) == 1:
+                    skill_case_content = registry.read_resource(
+                        _DIRECT_SKILL_NAME, all_matches[0]
+                    )
+                    logger.info(
+                        f"Direct setup: loaded use-case from {all_matches[0]} "
+                        f"({len(skill_case_content)} chars)"
+                    )
+                else:
+                    # Multiple candidates: load all and let verifier LLM
+                    # choose the right verification methodology.
+                    parts = []
+                    for i, path in enumerate(all_matches):
+                        try:
+                            content = registry.read_resource(_DIRECT_SKILL_NAME, path)
+                            label = path.split("/")[-1].replace(".md", "")
+                            parts.append(
+                                f"--- Candidate {i+1}: {label} ---\n{content}"
+                            )
+                        except Exception:
+                            pass
+                    skill_case_content = (
+                        f"Multiple skill cases match this injection ({len(all_matches)} candidates). "
+                        f"Read ALL candidates below and choose the verification steps "
+                        f"most relevant to the ACTUAL cluster state (e.g. check if HPA "
+                        f"exists before using HPA verification steps).\n\n"
+                        + "\n\n".join(parts)
+                    )
+                    logger.info(
+                        f"Direct setup: loaded {len(all_matches)} candidate use-cases: "
+                        f"{all_matches}"
+                    )
         except Exception as e:
             logger.warning(f"Failed to read use-case content for direct mode: {e}")
 
@@ -185,7 +220,7 @@ def make_direct_setup(registry: SkillRegistry) -> Callable:
             logger.info(f"FCAT: collected target_metadata: {list(target_metadata.keys())}")
 
         tracker.complete(f"Direct setup done: skill '{_DIRECT_SKILL_NAME}' activated")
-        sync_node_status_to_session(state, "direct_setup", "Skill activated, use-case loaded",
+        sync_node_status_to_session(state, DIRECT_SETUP, "Skill activated, use-case loaded",
             detail={"skill_name": _DIRECT_SKILL_NAME, "use_case_loaded": bool(skill_case_content)})
         await sync_to_store(state, result)
 
@@ -195,7 +230,7 @@ def make_direct_setup(registry: SkillRegistry) -> Callable:
         _store = get_global_session_store()
         _tid = state.get("task_id", "")
         if _store and _tid:
-            _store.append_messages(_tid, messages)
+            _store.append_messages(_tid, messages, node_name=DIRECT_SETUP)
 
         return result
 

@@ -143,5 +143,5 @@ class TestIntentPrefixInjection:
             "scope": "pod", "target": "cpu",
         })
         assert "Confirmed Parameters" in section
-        assert "Do NOT re-ask" in section
+        assert "missing" in section.lower() or "ambiguous" in section.lower()
         assert "scope: pod" in section

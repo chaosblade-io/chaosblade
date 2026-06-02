@@ -15,13 +15,13 @@ from chaos_agent.agent.prompts.constants import CACHE_BOUNDARY
 
 class TestInjectInputIsNlKwarg:
     def test_accepts_input_is_nl_true(self):
-        # Should not raise; NL Mode section stays present unconditionally.
+        # Should not raise; NL mode steps are covered by Workflow section.
         prompt = build_inject_system_prompt(skill_catalog="x", input_is_nl=True)
-        assert "Natural Language Mode" in prompt
+        assert "Workflow" in prompt
 
     def test_accepts_input_is_nl_false(self):
         prompt = build_inject_system_prompt(skill_catalog="x", input_is_nl=False)
-        assert "Natural Language Mode" in prompt
+        assert "Workflow" in prompt
 
 
 class TestInjectCacheBoundary:
@@ -58,10 +58,10 @@ class TestInjectSlimmedSections:
     def test_uses_brief_role_section(self):
         prompt = build_inject_system_prompt(skill_catalog="x")
         # Brief role drops the "What You Can Do" subsection but preserves
-        # "Chaos Engineering Agent" and the kube-system safety token.
+        # "Chaos Engineering Agent" and the Safety Rules token.
         assert "What You Can Do" not in prompt
         assert "Chaos Engineering Agent" in prompt
-        assert "kube-system" in prompt
+        assert "Safety Rules" in prompt
 
     def test_uses_hard_only_safety(self):
         prompt = build_inject_system_prompt(skill_catalog="x")
@@ -115,12 +115,13 @@ class TestExecuteSlimmedSections:
         prompt = build_execute_system_prompt(skill_catalog="x")
         # Executor still bound by Hard Rules + Caution Compliance.
         assert "### Hard Rules" in prompt
-        assert "kube-system" in prompt
+        assert "namespace blacklist" in prompt
 
-    def test_keeps_method_switching_block(self):
+    def test_keeps_failure_handling_block(self):
         prompt = build_execute_system_prompt(skill_catalog="x")
-        # Executor needs method switching guidance when blade_create fails.
-        assert "Injection Method Switching" in prompt
+        # Executor needs failure handling guidance when blade_create fails.
+        # Merged from Injection Method Switching + blade_create Fallback + METHOD CONSTRAINT.
+        assert "blade_create Fails" in prompt
 
     def test_keeps_execution_directives(self):
         prompt = build_execute_system_prompt(skill_catalog="x")

@@ -69,7 +69,12 @@ async def test_rebuilds_and_swaps_state_on_llm_bound_change(fake_app):
     ) as create:
         err = await maybe_rebuild_agents(fake_app, ["model_name"])
     assert err is None
-    create.assert_awaited_once_with(fake_app.state.skill_registry)
+    # E9 — rebuild forwards the existing mcp_manager so MCP tools
+    # don't get silently dropped on wizard /save / model swap.
+    create.assert_awaited_once_with(
+        fake_app.state.skill_registry,
+        mcp_manager=fake_app.state.mcp_manager,
+    )
     assert fake_app.state.agents == new_agents
     # Checkpointer alias must sync — turn / sessions routes read it
     # directly without going through agents dict.

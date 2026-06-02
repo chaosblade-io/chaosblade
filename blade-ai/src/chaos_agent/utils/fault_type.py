@@ -54,6 +54,11 @@ def build_blade_create_args(
         {scope, target, action, namespace, names, labels, kubeconfig,
          evict_count, evict_percent, flags}
     """
+    # Duration auto-boost: if params already has "timeout", override its value;
+    # otherwise append --timeout after params. Either way, only one --timeout.
+    if duration > 0 and params and "timeout" in params:
+        params["timeout"] = str(duration)
+
     flags_parts = []
     if params:
         for k, v in params.items():
@@ -61,7 +66,7 @@ def build_blade_create_args(
     if params_flags:
         for flag in params_flags:
             flags_parts.append(f"--{flag}")
-    if duration > 0:
+    if duration > 0 and (not params or "timeout" not in params):
         flags_parts.extend(["--timeout", str(duration)])
 
     return {

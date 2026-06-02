@@ -1305,18 +1305,28 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
 
         intent_stagnation_hint = None
         if stagnant_tool:
-            intent_stagnation_hint = (
-                f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` too many "
-                f"consecutive times with no progress. This tool has been temporarily "
-                f"removed. You MUST now either:\n"
-                f"- Call `submit_fault_intent` if you have collected enough fault parameters.\n"
-                f"- Use a DIFFERENT tool (activate_skill, read_skill_resource) for more info.\n"
-                f"- Output a plain text response to conclude this conversation turn.\n"
-                f"Do NOT attempt to call `{stagnant_tool}` again."
-            )
+            if ":" in stagnant_tool:
+                base_tool = stagnant_tool.split(":")[0]
+                intent_stagnation_hint = (
+                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` too many "
+                    f"consecutive times with no progress. Stop using this subcommand. "
+                    f"You can still use `{base_tool}` with OTHER subcommands.\n"
+                    f"- Call `submit_fault_intent` if you have collected enough fault parameters.\n"
+                    f"Do NOT call `{stagnant_tool}` again."
+                )
+            else:
+                intent_stagnation_hint = (
+                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` too many "
+                    f"consecutive times with no progress. This tool has been temporarily "
+                    f"removed. You MUST now either:\n"
+                    f"- Call `submit_fault_intent` if you have collected enough fault parameters.\n"
+                    f"- Use a DIFFERENT tool (activate_skill, read_skill_resource) for more info.\n"
+                    f"- Output a plain text response to conclude this conversation turn.\n"
+                    f"Do NOT attempt to call `{stagnant_tool}` again."
+                )
 
         tools_this_iter = list(tools or [])
-        if stagnant_tool:
+        if stagnant_tool and ":" not in stagnant_tool:
             tools_this_iter = [
                 t for t in tools_this_iter
                 if getattr(t, "name", "") != stagnant_tool

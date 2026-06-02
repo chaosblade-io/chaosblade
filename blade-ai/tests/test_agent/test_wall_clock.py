@@ -14,7 +14,7 @@ from chaos_agent.agent.router import (
     should_continue_recover_verifier,
     should_continue_verifier,
 )
-from chaos_agent.errors import FailureReason
+from chaos_agent.agent.verdict import FailureCategory
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ class TestMarkWallClockTimeout:
         out = mark_wall_clock_timeout(state, result)
         assert out is result  # in-place chain
         assert "error" not in out
-        assert "failure_reason" not in out
+        assert "failure_detail" not in out
 
     def test_writes_when_exceeded(self, monkeypatch):
         from chaos_agent.config.settings import settings
@@ -143,7 +143,7 @@ class TestMarkWallClockTimeout:
         result = {"agent_loop_count": 1}
         out = mark_wall_clock_timeout(state, result)
         assert "wall-clock timeout" in out["error"]
-        assert out["failure_reason"] == FailureReason.WALL_CLOCK_TIMEOUT.value
+        assert out["failure_detail"]["category"] == FailureCategory.WALL_CLOCK_TIMEOUT.value
 
     def test_existing_error_preserved(self, monkeypatch):
         """LLM-detected failures are more specific than 'we ran out of time'."""
@@ -152,12 +152,12 @@ class TestMarkWallClockTimeout:
         state = {"pipeline_started_at": time.time() - 600}
         result = {
             "error": "blade create failed: permission denied",
-            "failure_reason": "execution_failed: rbac",
+            "failure_detail": {"category": "execution_failed", "context": "rbac"},
         }
         out = mark_wall_clock_timeout(state, result)
         # Pre-existing values win
         assert out["error"] == "blade create failed: permission denied"
-        assert out["failure_reason"] == "execution_failed: rbac"
+        assert out["failure_detail"]["category"] == "execution_failed"
 
     def test_disabled_budget_never_writes(self, monkeypatch):
         from chaos_agent.config.settings import settings

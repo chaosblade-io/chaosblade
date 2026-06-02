@@ -1,4 +1,14 @@
-"""Tests for token-aware context manager."""
+"""Tests for token-aware context manager.
+
+Note (E1): Token-counting was extracted to
+``chaos_agent.memory.tokens`` with a 4-layer model-aware fallback.
+The exhaustive CJK / mixed / multi-modal coverage lives in
+``tests/test_memory/test_tokens.py``. The two test classes that used
+to exercise the legacy ``estimate_tokens`` / ``count_tokens_approx``
+symbols were removed because their semantics are now Layer 4 of the
+new module, fully covered by ``TestLayer4HeuristicFallback`` and
+``TestMessageAggregation`` over there.
+"""
 
 from unittest.mock import MagicMock
 
@@ -10,134 +20,11 @@ from chaos_agent.memory.context_manager import (
     STRIP_MARKER,
     TokenWarningState,
     calculate_token_warning_state,
-    count_tokens_approx,
     ensure_pair_integrity,
-    estimate_tokens,
     group_messages_by_round,
     post_compact_cleanup,
     strip_large_outputs,
 )
-
-
-# ---------------------------------------------------------------------------
-# Original tests (preserved)
-# ---------------------------------------------------------------------------
-
-
-class TestEstimateTokens:
-    """CJK-aware token estimator (P0-1)."""
-
-    def test_empty_string_is_zero(self):
-        assert estimate_tokens("") == 0
-        assert estimate_tokens(None) == 0
-
-    def test_pure_ascii_uses_4_chars_per_token(self):
-        # 40 ASCII chars / 4 = 10 tokens (preserves prior behaviour)
-        assert estimate_tokens("a" * 40) == 10
-
-    def test_pure_cjk_uses_higher_density(self):
-        # 30 CJK chars / 1.5 = 20 tokens — meaningfully more than the
-        # old chars/4 heuristic which would have estimated only 7.
-        cjk = "你" * 30
-        result = estimate_tokens(cjk)
-        assert result == 20
-        # The fix MUST count CJK at strictly higher density than ASCII.
-        assert result > 30 // 4
-
-    def test_mixed_cjk_and_ascii(self):
-        # "你好world" → 2 CJK + 5 ASCII → 2/1.5 + 5/4 = 1 + 1 = 2 tokens (int floor)
-        assert estimate_tokens("你好world") == 2
-
-    def test_cjk_punctuation_counts_as_cjk(self):
-        # All five chars fall in U+3000–U+303F or U+FF00–U+FFEF
-        assert estimate_tokens("。、，；：") == int(5 / 1.5)
-
-    def test_dramatically_higher_density_than_legacy_chars_per_4(self):
-        """The whole point of P0-1: CJK is no longer under-counted."""
-        cjk_text = "你" * 100
-        legacy_chars_per_4 = len(cjk_text) // 4  # = 25
-        new_estimate = estimate_tokens(cjk_text)
-        # New estimator must produce a value notably higher than the legacy
-        # heuristic (~2.5×) to fix the under-trigger of compaction.
-        assert new_estimate >= legacy_chars_per_4 * 2
-
-    def test_real_mixed_prompt_higher_than_legacy(self):
-        """Reality check on a representative mixed CJK/ASCII system prompt."""
-        prompt = (
-            "你是一个混沌工程智能体，负责在 Kubernetes 集群中安全地执行故障注入演练。\n"
-            "Always confirm destructive operations before proceeding."
-        )
-        legacy = len(prompt) // 4
-        new_estimate = estimate_tokens(prompt)
-        # On mixed CJK/ASCII content the new estimator must report meaningfully
-        # higher token usage so that compaction triggers in time.
-        assert new_estimate > legacy
-
-    def test_qwen_style_tokenizer_within_20_percent(self):
-        """Verification standard: < 20% deviation vs a CJK-aware tokenizer.
-
-        The project's primary LLMs (Qwen, DeepSeek) tokenize CJK at ~1.5
-        chars/token — the ratio this estimator was calibrated against. We
-        approximate that here using tiktoken's o200k_base, which treats
-        common CJK characters with multi-codepoint merges similar to Qwen.
-        """
-        try:
-            import tiktoken
-        except ImportError:
-            import pytest
-            pytest.skip("tiktoken not installed")
-        try:
-            enc = tiktoken.get_encoding("o200k_base")
-        except Exception:
-            import pytest
-            pytest.skip("o200k_base encoding unavailable")
-        prompt = (
-            "你是一个混沌工程智能体，负责在 Kubernetes 集群中安全地执行故障注入演练。\n"
-            "你的核心职责包括：1) 解析用户意图 2) 生成安全的注入计划 3) 执行 ChaosBlade 命令 "
-            "4) 验证故障已生效 5) 在演练结束后恢复并清理。\n"
-            "Always confirm destructive operations with the operator before proceeding."
-        )
-        actual = len(enc.encode(prompt))
-        estimated = estimate_tokens(prompt)
-        deviation = abs(estimated - actual) / actual
-        assert deviation < 0.20, (
-            f"estimate={estimated} vs o200k_base={actual}: {deviation:.1%} deviation"
-        )
-
-
-class TestCountTokensApprox:
-    """Test approximate token counting."""
-
-    def test_empty_list(self):
-        assert count_tokens_approx([]) == 0
-
-    def test_string_content(self):
-        msg = MagicMock()
-        msg.content = "a" * 40  # ~10 tokens
-        result = count_tokens_approx([msg])
-        assert result == 10
-
-    def test_list_content(self):
-        msg = MagicMock()
-        msg.content = [{"text": "a" * 40}]  # ~10 tokens
-        result = count_tokens_approx([msg])
-        assert result == 10
-
-    def test_non_string_content(self):
-        msg = MagicMock()
-        msg.content = 12345  # not string or list
-        result = count_tokens_approx([msg])
-        assert result == 0
-
-    def test_multiple_messages(self):
-        msgs = [MagicMock(content="a" * 40), MagicMock(content="b" * 80)]
-        result = count_tokens_approx(msgs)
-        assert result == 30  # 10 + 20
-
-    def test_cjk_message_counted_at_higher_density(self):
-        msg = MagicMock(content="中文" * 30)  # 60 CJK chars
-        # ASCII heuristic would have given 60//4 = 15 tokens; CJK gives 60/1.5 = 40
-        assert count_tokens_approx([msg]) == 40
 
 
 class TestEnsurePairIntegrity:
@@ -218,21 +105,35 @@ class TestContextManager:
         # behaved identically because check_context didn't pass the
         # ratio through.
         #
-        # Use real HumanMessages instead of MagicMock — MagicMock
-        # auto-attributes ``tool_calls`` truthily, which trips the
-        # ensure_pair_integrity heuristic and pops the message back
-        # into to_keep, masking the threshold behavior we're testing.
+        # Use real HumanMessages with VARIED content. The original
+        # test used "x" * 35_000 which the legacy chars/4 heuristic
+        # estimated at ~8750 tokens but tiktoken-based counters (E1)
+        # correctly compress to ~10 tokens (BPE handles repeated
+        # chars efficiently). Realistic varied prose produces
+        # predictable token counts under any tokenizer.
         from langchain_core.messages import HumanMessage
-        # 8 messages × 35K chars / 4 ≈ 70K tokens × 1.2 ≈ 84K total
-        msgs = [HumanMessage(content="x" * 35_000) for _ in range(8)]
+        # Build ~5000-token messages × 16 → ~80k tokens total, well
+        # above the aggressive 64k threshold but below the default
+        # 108.8k threshold (compact_ratio=0.85 of 128k).
+        sentence = (
+            "The chaos engineering agent must safely plan, execute, "
+            "verify, and recover ChaosBlade experiments on Kubernetes "
+            "clusters with measurable steady-state hypotheses. "
+            "故障注入演练 必须 在可控范围内 进行，每次注入前 都需要 "
+            "明确的回滚方案 和 监控指标。"
+        )
+        # ~1 token per ASCII word + ~1 token per CJK char ≈ ~60 tokens
+        # per sentence × 80 repeats = ~4800 tokens per message
+        long_content = (sentence + "\n") * 80
+        msgs = [HumanMessage(content=long_content) for _ in range(16)]
         cm_default = ContextManager(max_tokens=128_000, compact_ratio=0.85)
         cm_aggressive = ContextManager(max_tokens=128_000, compact_ratio=0.5)
         cm_default.reserve_tokens = 1
         cm_aggressive.reserve_tokens = 1
         d_compact, _, _ = cm_default.check_context(msgs)
         a_compact, _, _ = cm_aggressive.check_context(msgs)
-        # Default (threshold ≈ 108.8K): 84K is BELOW, no compaction.
-        # Aggressive (threshold = 64K): 84K is ABOVE, compaction.
+        # Default (threshold ≈ 108.8K): ~80K is BELOW, no compaction.
+        # Aggressive (threshold = 64K): ~80K is ABOVE, compaction.
         assert d_compact == []
         assert len(a_compact) > 0
 

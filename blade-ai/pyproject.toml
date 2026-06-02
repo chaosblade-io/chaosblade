@@ -8,8 +8,12 @@ name = "blade-ai"
 # src/chaos_agent/__init__.py, and src/chaos_agent/server/schemas.py.
 # The M11 release.yml guards enforce tag↔file equality before
 # publishing — bump all four in one commit.
-version = "0.2.0"
+version = "0.3.0"
 description = "Chaos Engineering Agent for Kubernetes fault injection"
+
+authors = [
+    { name = "林曜(526255)", email = "jiangzelin.jzl@alibaba-inc.com" }
+]
 
 requires-python = ">=3.11"
 dependencies = [
@@ -42,6 +46,11 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "pytest-mock>=3.12",
+    # Build backend — already in [build-system].requires (uv build auto-installs
+    # it in the isolated build env). Listed here too so it lands in the dev
+    # .venv, letting the IDE resolve hatch_build.py's BuildHookInterface import
+    # and `uv build --no-build-isolation` work.
+    "hatchling>=1.0",
 ]
 postgres = ["asyncpg>=0.29"]
 
@@ -51,6 +60,17 @@ blade-ai-server = "chaos_agent.server.app:run_server"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/chaos_agent"]
+# Keep junk out of force-included dirs: macOS Finder droppings, and the
+# runtime logs ChaosBlade writes under vendor/chaosblade/logs/ after it's
+# been run locally (the CI-downloaded tarball has none). Applies to the
+# platform-wheel hook's vendor force-include too.
+exclude = ["**/.DS_Store", "**/chaosblade/logs/**"]
+
+# Platform wheels: the build hook bakes vendor/chaosblade into the wheel
+# and stamps a platform tag when BLADE_AI_WHEEL_PLATFORM is set (CI). A
+# no-op for the universal wheel. See hatch_build.py.
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
 
 # Embed the TS TUI bundle so wheel users get the new TUI without an
 # extra `npm install -g`. The bundle must be built BEFORE `uv build` —
@@ -62,6 +82,13 @@ packages = ["src/chaos_agent"]
 # repo tree to find tui/dist/cli.js for that case.
 [tool.hatch.build.targets.wheel.force-include]
 "tui/dist/cli.js" = "chaos_agent/_tui_assets/cli.js"
+# Bundle the default skill pack into the wheel. Skills are platform-
+# independent markdown + scripts (~216K), so unlike the ChaosBlade
+# binary (downloaded at runtime per-platform) they ship directly in
+# the wheel. On first run, get_skills_dir() materializes this bundled
+# copy into ``~/.blade-ai/skills`` so it's user-editable + hot-reloadable
+# and ``blade-ai skills install`` can add more alongside it.
+"skills/k8s-chaos-skills" = "chaos_agent/_skills/k8s-chaos-skills"
 
 # sdist intentionally excludes node_modules / dist / coverage etc. so
 # `uv build --sdist` doesn't ship multi-MB build artifacts. Source

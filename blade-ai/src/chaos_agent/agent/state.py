@@ -526,11 +526,17 @@ class AgentState(MessagesState):
     # Safety assessment
     safety_status: str = "pending"  # pending/safe/unsafe/warning/rejected
     safety_reason: Optional[str] = None
+    safety_checked_detail: Optional[str] = None
     conflict_uids: Optional[list[str]] = None  # UIDs of existing active experiments
     # E10 — multi-dimensional numeric safety score (0-100 per dim +
     # weighted overall). Stored as dict (not SafetyScore) for the same
     # JSON-roundtrip reason FaultSpec uses dict-form on state.
     safety_score: Optional[dict] = None
+
+    # Execution-level blast radius declared by the LLM in finish_planning.
+    # "target-only" | "namespace-wide" | "cluster-wide"
+    blast_radius_scope: Optional[str] = None
+    blast_radius_detail: Optional[str] = None
 
     # Confirmation
     needs_confirmation: bool = False
@@ -585,12 +591,24 @@ class AgentState(MessagesState):
     # "layer2_verification" = LLM-driven verification phase
     recover_phase: str = "layer1_recovery"
 
+    # Recovery Layer 1 type: "deterministic" (host blade_destroy) or "llm_driven"
+    # (non-ChaosBlade / kubectl-exec injection). Set by recover_verifier_loop when
+    # Layer 1 transitions to Layer 2; consumed by Layer 2 prompt builder and
+    # finalize_recover_verification's retry-recovery path.
+    recover_layer1_type: Optional[str] = None
+
     # Layer 1 iteration count (separate from verifier_loop_count)
     layer1_iteration_count: int = 0
 
     # Whether Layer 2 context has been added to messages
     # (needed because non-ChaosBlade Layer 2 may start at count > 1)
     layer2_context_added: bool = False
+
+    # Scheme B (recover): set by recover_verifier_loop to signal
+    # finalize_recover_verification that the verdict was produced on the FIRST
+    # Layer 2 turn (before any kubectl verification) → finalize's anti-laziness
+    # guard fires once and loops back. Mirrors the old is_first_layer2 guard.
+    recover_layer2_first: bool = False
 
     # Memory (Layer 2-3)
     compressed_summary: Optional[str] = None
@@ -784,6 +802,11 @@ class AgentState(MessagesState):
     # target-change confirmation card. When >= 1, the next drift detection
     # hard-terminates instead of interrupting again.
     drift_reject_count: int = 0
+
+    # Plan-change rejection counter (replan fault type switch).
+    # Incremented when user rejects a plan change proposal. When >= 2,
+    # plan_change_confirm hard-terminates via fail_state.
+    plan_change_reject_count: int = 0
 
     # Plan builder (interactive guided plan construction via TUI /plan)
     plan_builder_round: int = 0        # Dialogue round counter within plan_builder

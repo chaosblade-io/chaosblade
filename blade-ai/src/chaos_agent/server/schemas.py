@@ -132,6 +132,7 @@ class FaultTypeInfo(BaseModel):
     target_types: list[str] = []
     params: list[SkillParameterInfo] = []
     example_cmd: str = ""
+    example_cmd_direct: str = ""
 
 
 class CategoryInfo(BaseModel):
@@ -146,6 +147,28 @@ class SkillsListResponse(BaseModel):
     """Response data for list skills command."""
 
     total: int = 0
+    categories: list[CategoryInfo] = []
+
+
+class FaultCase(BaseModel):
+    """A single skill case with generated inject commands."""
+
+    category: str
+    use_case_name: str = ""
+    resource_path: str = ""
+    fault_symptom: str = ""
+    inject_kind: str = "unknown"
+    nl_cmd: str = ""
+    structured_cmd: str = ""
+    direct_cmd: str = ""
+    direct_hint: str = ""
+
+
+class CapabilitiesListResponse(BaseModel):
+    """Response data for list command (new: from capabilities sync)."""
+
+    total: int = 0
+    blade_version: str = ""
     categories: list[CategoryInfo] = []
 
 

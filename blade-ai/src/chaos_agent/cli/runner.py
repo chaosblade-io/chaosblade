@@ -27,7 +27,12 @@ from chaos_agent.observability.status_tracker import (
     StatusPhase,
     StatusCategory,
 )
-from chaos_agent.skills.catalog_generator import generate_skill_catalog
+from chaos_agent.skills.catalog_generator import (
+    generate_skill_catalog,
+    infer_scope,
+    infer_blade_params,
+    build_direct_cmd,
+)
 from chaos_agent.skills.loader import get_skills_dir
 from chaos_agent.skills.prerequisites import PrerequisitesChecker
 from chaos_agent.skills.registry import SkillRegistry
@@ -1895,7 +1900,7 @@ class AgentRunner:
 
         # Create a lightweight LLM instance for catalog generation
         from chaos_agent.agent.factory import make_llm
-        llm = make_llm(temperature=0.3, max_retries=2, timeout=60)
+        llm = make_llm(temperature=0.3, max_retries=2, read_timeout=60)
 
         for name, meta in self._registry.metadata.items():
             if params.get("category") and meta.category != params["category"]:
@@ -1935,22 +1940,35 @@ class AgentRunner:
                         "fault_symptom": uc["fault_symptom"],
                         "resource_path": uc["resource_path"],
                         "example_cmd": uc["example_cmd"],
+                        "example_cmd_direct": uc.get("example_cmd_direct", ""),
                     })
             else:
                 # Fallback — skill has no extractable scenarios
                 categories_dict[cat]["category"] = cat
                 categories_dict[cat]["description"] = f"{cat} related faults"
+                scope = infer_scope(cat)
+                desc = meta.description.split(chr(46))[0] if meta.description else name
+                if scope == "node":
+                    nl_cmd = (
+                        f'blade-ai inject -i "帮我注入{desc}故障，'
+                        f'目标为<node-name>，'
+                        f'kubeconfig路径为<kubeconfig>"'
+                    )
+                else:
+                    nl_cmd = (
+                        f'blade-ai inject -i "帮我注入{desc}故障，'
+                        f'命名空间为<namespace>，目标为<name>，'
+                        f'kubeconfig路径为<kubeconfig>"'
+                    )
+                blade_params = infer_blade_params(cat, scope=scope)
                 categories_dict[cat]["faults"].append({
                     "fault_type": extract_fault_type(cat),
                     "name": name.replace("-", " ").title(),
                     "description": (
                         meta.description.split(".")[0] if meta.description else ""
                     ),
-                    "example_cmd": (
-                        f'blade-ai inject -i "帮我注入{meta.description.split(chr(46))[0] if meta.description else name}故障，'
-                        f'命名空间为<namespace>，目标为<name>，'
-                        f'kubeconfig路径为<kubeconfig>"'
-                    ),
+                    "example_cmd": nl_cmd,
+                    "example_cmd_direct": build_direct_cmd(blade_params) if blade_params else "",
                 })
 
         categories = list(categories_dict.values())

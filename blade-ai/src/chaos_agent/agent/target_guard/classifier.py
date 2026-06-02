@@ -46,6 +46,7 @@ allows the call.
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 from typing import Any
 
@@ -192,13 +193,17 @@ def parse_namespace(args: list[str], default: str = "default") -> str:
 
 
 def parse_labels(args: list[str]) -> dict[str, str]:
-    """Extract the label selector from a kubectl ``-l`` / ``--selector`` flag.
+    """Extract the label selector from ``-l``/``--selector``/``--labels`` flags.
 
     Returns a dict of {key: value}. Operator-style selectors
     (``key!=value``, ``key in (v1,v2)``) are flattened to {key: raw}
     so equality-comparison stays simple — the guard treats any
     non-trivial selector difference as drift anyway.
     Missing flag returns {}.
+
+    Recognises both kubectl flags (``-l``, ``--selector``) and the
+    ChaosBlade CLI flag (``--labels``) so that inline ``blade create``
+    commands inside ``kubectl exec`` are correctly classified.
 
     Stops at the ``--`` separator so a ``kubectl exec POD -- prog -l x``
     doesn't leak the inner program's ``-l`` flag into the outer
@@ -211,11 +216,11 @@ def parse_labels(args: list[str]) -> dict[str, str]:
         if a == "--":
             break
         raw_selector = ""
-        if a in ("-l", "--selector"):
+        if a in ("-l", "--selector", "--labels"):
             if i + 1 < len(args):
                 raw_selector = args[i + 1]
                 i += 1
-        elif a.startswith("-l=") or a.startswith("--selector="):
+        elif a.startswith("-l=") or a.startswith("--selector=") or a.startswith("--labels="):
             raw_selector = a.split("=", 1)[1]
         if raw_selector:
             for pair in raw_selector.split(","):
@@ -264,8 +269,17 @@ READONLY_CONFIG_SUBS: frozenset[str] = frozenset({
 # mutating subs change kubeconfig itself; ``certificate`` issues TLS
 # certs.
 BANNED_KUBECTL_SUBS: frozenset[str] = frozenset({
-    "apply",     # nearly always uses -f, target depends on YAML content
+    # "apply" removed — handled by _uses_file_input + stdin_data whitelist
     "certificate",  # CSR approval — outside chaos scope
+})
+
+# Resources allowed to be created via kubectl apply/create -f with stdin_data.
+# Only low-risk resources that don't run workloads. Workload resources
+# (Deployment, DaemonSet, Pod, Job, etc.) are NOT allowed.
+ALLOWED_MANIFEST_KINDS: frozenset[str] = frozenset({
+    "persistentvolumeclaim", "pvc",
+    "persistentvolume", "pv",
+    "configmap", "secret", "namespace",
 })
 
 # Destructive kubectl subcommands we DO classify. Each maps to a
@@ -275,6 +289,7 @@ DESTRUCTIVE_KUBECTL_SUBS: frozenset[str] = frozenset({
     "patch", "set", "delete", "edit", "replace", "run",
     "label", "annotate", "autoscale", "expose", "debug",
     "attach", "port-forward", "proxy", "cp", "create", "rollout",
+    "apply",
 })
 
 
@@ -351,11 +366,13 @@ def infer_effective_target(
     # read subset, so by reaching here we already know it's safe.
     # ``read_file`` / ``save_fault_plan`` touch the local FS only (not
     # the cluster) — safe for both phases.
-    if tool_name in ("blade_status", "blade_query_k8s",
+    if tool_name in ("blade_help", "blade_status", "blade_query_k8s",
                      "read_knowledge_resource", "read_skill_resource",
                      "activate_skill", "submit_fault_intent",
                      "kubectl_ro", "read_file", "save_fault_plan",
-                     "finish_planning"):
+                     "finish_planning", "propose_plan_change",
+                     "submit_verification", "submit_recover_verification",
+                     "time_wait"):
         return EffectiveTarget(
             scope=SCOPE_READONLY,
             namespace="",
@@ -390,8 +407,11 @@ def infer_effective_target(
     if tool_name == "blade_create":
         return _classify_blade_create(_coerce_args_dict(tool_args), raw_command)
 
-    if tool_name == "kubectl":
-        return _classify_kubectl(_coerce_args_list(tool_args), raw_command)
+    if tool_name in ("kubectl", "kubectl_verify"):
+        raw_args = _coerce_args_dict(tool_args) if isinstance(tool_args, dict) else None
+        return _classify_kubectl(
+            _coerce_args_list(tool_args), raw_command, raw_args=raw_args,
+        )
 
     # Unknown tool — default-deny. Forces operator to add explicit
     # classification rather than silently allowing new tools.
@@ -476,7 +496,10 @@ def _parse_label_string(s: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def _classify_kubectl(args: list[str], raw_command: str) -> EffectiveTarget:
+def _classify_kubectl(
+    args: list[str], raw_command: str,
+    *, raw_args: dict | None = None,
+) -> EffectiveTarget:
     """Dispatch on kubectl subcommand."""
     if not args:
         return EffectiveTarget(
@@ -517,12 +540,16 @@ def _classify_kubectl(args: list[str], raw_command: str) -> EffectiveTarget:
             raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
         )
 
-    # Stdin/-f file inputs cannot be safely classified — content is
-    # not in args. Banned for any destructive subcommand that accepts
-    # -f (create/replace/patch/set/delete/edit). ``apply`` already
-    # banned above.
-    if sub in ("create", "replace", "patch", "set", "delete", "edit"):
+    # Stdin/-f file inputs: when stdin_data is provided AND the YAML
+    # contains only whitelisted resource kinds, allow the operation.
+    # Otherwise ban — content from -f <file> is not visible to us.
+    if sub in ("apply", "create", "replace", "patch", "set", "delete", "edit"):
         if _uses_file_input(rest):
+            stdin_data = (raw_args or {}).get("stdin_data", "") if raw_args else ""
+            if stdin_data:
+                return _classify_kubectl_stdin_manifest(
+                    stdin_data, rest, raw_command,
+                )
             return EffectiveTarget(
                 scope=SCOPE_BANNED, namespace="",
                 raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
@@ -530,6 +557,14 @@ def _classify_kubectl(args: list[str], raw_command: str) -> EffectiveTarget:
 
     # Read-only — no comparison needed.
     if sub in READONLY_KUBECTL_SUBS:
+        return EffectiveTarget(
+            scope=SCOPE_READONLY, namespace="",
+            raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
+        )
+
+    # Any subcommand invoked with -h/--help is a help request — prints
+    # usage text and never mutates state.
+    if _has_help_flag(rest):
         return EffectiveTarget(
             scope=SCOPE_READONLY, namespace="",
             raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
@@ -593,6 +628,10 @@ def _classify_kubectl(args: list[str], raw_command: str) -> EffectiveTarget:
     if sub == "create":
         # create RESOURCE name (without -f) — limited use, classify
         # by resource kind.
+        return _classify_kubectl_resource(rest, raw_command, default_kind=None)
+
+    if sub == "apply":
+        # apply without -f (already handled above) — classify by resource.
         return _classify_kubectl_resource(rest, raw_command, default_kind=None)
 
     # Anything else: unknown subcommand → default-deny.
@@ -706,6 +745,58 @@ def _uses_file_input(args: list[str]) -> bool:
     return False
 
 
+def _extract_all_kinds_from_yaml(yaml_str: str) -> list[str]:
+    """Extract ALL 'kind' fields from YAML (handles multi-document ``---``)."""
+    return re.findall(r"^kind:\s*(\S+)", yaml_str, re.MULTILINE)
+
+
+def _extract_name_from_yaml(yaml_str: str) -> str:
+    """Extract first ``metadata.name`` from YAML string."""
+    m = re.search(r"^\s+name:\s*(\S+)", yaml_str, re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def _extract_namespace_from_yaml(yaml_str: str) -> str:
+    """Extract first ``metadata.namespace`` from YAML string."""
+    m = re.search(r"^\s+namespace:\s*(\S+)", yaml_str, re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def _classify_kubectl_stdin_manifest(
+    stdin_data: str,
+    rest: list[str],
+    raw_command: str,
+) -> EffectiveTarget:
+    """Classify ``kubectl apply/create -f -`` with inline YAML via stdin_data.
+
+    Multi-document safety: ALL ``kind`` values must be in
+    ``ALLOWED_MANIFEST_KINDS``. A single non-whitelisted kind causes
+    the entire call to be BANNED.
+    """
+    kinds = _extract_all_kinds_from_yaml(stdin_data)
+    if not kinds:
+        return EffectiveTarget(
+            scope=SCOPE_BANNED, namespace="",
+            raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
+        )
+    if not all(k.lower() in ALLOWED_MANIFEST_KINDS for k in kinds):
+        return EffectiveTarget(
+            scope=SCOPE_BANNED, namespace="",
+            raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
+        )
+    namespace = parse_namespace(rest, default="")
+    if not namespace:
+        namespace = _extract_namespace_from_yaml(stdin_data)
+    name = _extract_name_from_yaml(stdin_data)
+    return EffectiveTarget(
+        scope=canonicalise_kind(kinds[0]),
+        namespace=namespace,
+        names=(name,) if name else (),
+        confidence=ConfidenceLevel.HIGH,
+        raw_command=raw_command,
+    )
+
+
 # ---------------------------------------------------------------------------
 # kubectl exec — recursive into inner command
 # ---------------------------------------------------------------------------
@@ -731,6 +822,14 @@ def _classify_kubectl_exec(args: list[str], raw_command: str) -> EffectiveTarget
         # Pure stdio attach — acts on the pod.
         return EffectiveTarget(
             scope="pod", namespace=ns, names=(pod_name,),
+            raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
+        )
+
+    # Help request in inner command → read-only regardless of what
+    # program runs (blade -h, blade create k8s pod-network drop -h, etc.)
+    if _has_help_flag(inner):
+        return EffectiveTarget(
+            scope=SCOPE_READONLY, namespace="",
             raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
         )
 
@@ -779,11 +878,11 @@ def _classify_inline_blade(
     from the LangChain tool_call). Here we parse the CLI tokens.
     """
     if len(inner) < 2 or inner[0] != "blade" or inner[1] != "create":
-        # Not a blade create — could be blade status (read-only inside
-        # exec). Treat conservatively as pod-scope.
+        # Non-create blade commands (status/destroy/query/version/prepare/revoke)
+        # don't target new k8s resources — guard drift comparison not applicable.
         return EffectiveTarget(
-            scope="pod", namespace=fallback_ns, names=(fallback_pod,),
-            raw_command=raw_command, confidence=ConfidenceLevel.LOW,
+            scope=SCOPE_READONLY, namespace="",
+            raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
         )
 
     # blade create [k8s] <target>-<sub> <action> [flags]
@@ -840,6 +939,8 @@ def _classify_inline_blade(
         effective_names: tuple[str, ...] = (node_name,)
     elif names:
         effective_names = names
+    elif labels:
+        effective_names = ()
     elif fallback_pod and scope == "pod":
         # Inside ``kubectl exec POD -- blade create k8s pod-cpu ...``
         # if no --names given, it implicitly targets the host pod.
@@ -1147,6 +1248,15 @@ def _extract_after_double_dash(args: list[str]) -> list[str]:
     except ValueError:
         return []
     return args[idx + 1:]
+
+
+def _has_help_flag(args: list[str]) -> bool:
+    """True if ``-h`` or ``--help`` appears anywhere in *args*.
+
+    Used to short-circuit classification: any command invoked with a
+    help flag only prints usage text and never mutates state.
+    """
+    return "-h" in args or "--help" in args
 
 
 def _coerce_args_dict(tool_args: Any) -> dict[str, Any]:

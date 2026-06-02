@@ -37,7 +37,7 @@ class TestExecuteLoop:
 
         result = await execute_loop(state)
         assert "error" in result
-        assert "max iterations" in result["error"].lower()
+        assert "execution_timeout" in result["error"]
 
     @pytest.mark.asyncio
     async def test_at_max_iterations_still_ok(self, sample_agent_state, monkeypatch):
@@ -157,13 +157,18 @@ class TestExtractBladeUidKubectlExec:
     """Tests for _extract_blade_uid_from_messages with kubectl exec blade output."""
 
     def test_kubectl_exec_blade_success(self):
-        """kubectl ToolMessage with ChaosBlade success JSON → extract uid."""
-        msg = ToolMessage(
+        """kubectl exec blade ToolMessage with ChaosBlade success JSON → extract uid."""
+        from langchain_core.messages import AIMessage
+        ai_msg = AIMessage(content="", tool_calls=[{
+            "name": "kubectl", "id": "tc1",
+            "args": {"subcommand": "exec", "v_args": "pod1 -n chaosblade -- blade create k8s pod-cpu fullload"},
+        }])
+        tool_msg = ToolMessage(
             content='{"code":200,"success":true,"result":"a0f2357a939a9bb8"}',
             tool_call_id="tc1",
             name="kubectl",
         )
-        assert _extract_blade_uid_from_messages([msg]) == "a0f2357a939a9bb8"
+        assert _extract_blade_uid_from_messages([ai_msg, tool_msg]) == "a0f2357a939a9bb8"
 
     def test_kubectl_exec_blade_failure(self):
         """kubectl ToolMessage with ChaosBlade failure JSON → None."""
@@ -201,6 +206,11 @@ class TestExtractBladeUidKubectlExec:
 
     def test_failed_blade_create_with_kubectl_success(self):
         """Failed blade_create + successful kubectl exec → kubectl uid as fallback."""
+        from langchain_core.messages import AIMessage
+        ai_msg = AIMessage(content="", tool_calls=[{
+            "name": "kubectl", "id": "tc2",
+            "args": {"subcommand": "exec", "v_args": "pod1 -n chaosblade -- blade create k8s pod-cpu fullload"},
+        }])
         msg1 = ToolMessage(
             content='Error: blade create failed (exit 1): unknown flag: --namespace',
             tool_call_id="tc1",
@@ -211,12 +221,17 @@ class TestExtractBladeUidKubectlExec:
             tool_call_id="tc2",
             name="kubectl",
         )
-        messages = [msg1, msg2]
+        messages = [ai_msg, msg1, msg2]
         # msg1 is not valid JSON, msg2 provides the fallback uid
         assert _extract_blade_uid_from_messages(messages) == "a0f2357a939a9bb8"
 
     def test_multiple_kubectl_results_uses_latest(self):
         """Multiple kubectl exec blade results → returns the latest one."""
+        from langchain_core.messages import AIMessage
+        ai_msg = AIMessage(content="", tool_calls=[
+            {"name": "kubectl", "id": "tc1", "args": {"subcommand": "exec", "v_args": "pod1 -- blade create k8s pod-cpu fullload"}},
+            {"name": "kubectl", "id": "tc2", "args": {"subcommand": "exec", "v_args": "pod1 -- blade create k8s pod-cpu fullload"}},
+        ])
         msg1 = ToolMessage(
             content='{"code":200,"success":true,"result":"old-kubectl-uid"}',
             tool_call_id="tc1",
@@ -227,7 +242,7 @@ class TestExtractBladeUidKubectlExec:
             tool_call_id="tc2",
             name="kubectl",
         )
-        messages = [msg1, msg2]
+        messages = [ai_msg, msg1, msg2]
         # Reversed scan: msg2 is found first
         assert _extract_blade_uid_from_messages(messages) == "new-kubectl-uid"
 
@@ -310,3 +325,63 @@ class TestParseBladeCreateFromVArgs:
         v_args = "some-pod -n default -- cat /etc/hosts"
         result = _parse_blade_create_from_v_args(v_args)
         assert result is None
+
+
+class TestIsLlmHandlingBladeError:
+    """Cooldown-window based suppression of auto-replan."""
+
+    def _blade_error_tm(self, content="Error: blade create failed (exit 1): unknown flag"):
+        return ToolMessage(content=content, name="blade_create", tool_call_id="tc-1", status="error")
+
+    def _ok_tm(self, name="kubectl"):
+        return ToolMessage(content="NAME  READY\npod-1  1/1", name=name, tool_call_id="tc-2")
+
+    def _ai(self, tool_calls=None):
+        return AIMessage(content="", tool_calls=tool_calls or [{"name": "kubectl", "args": {"subcommand": "get"}, "id": "tc-2"}])
+
+    def test_suppresses_within_cooldown(self):
+        from chaos_agent.agent.nodes.execute_loop import _is_llm_handling_blade_error
+        msgs = [
+            self._blade_error_tm(),
+            self._ai(),  # 1 AI turn since error
+        ]
+        assert _is_llm_handling_blade_error(msgs) is True
+
+    def test_suppresses_at_boundary(self):
+        from chaos_agent.agent.nodes.execute_loop import _is_llm_handling_blade_error, _BLADE_ERROR_COOLDOWN_TURNS
+        msgs = [self._blade_error_tm()]
+        for _ in range(_BLADE_ERROR_COOLDOWN_TURNS):
+            msgs.append(self._ai())
+            msgs.append(self._ok_tm())
+        assert _is_llm_handling_blade_error(msgs) is True
+
+    def test_allows_replan_after_cooldown(self):
+        from chaos_agent.agent.nodes.execute_loop import _is_llm_handling_blade_error, _BLADE_ERROR_COOLDOWN_TURNS
+        msgs = [self._blade_error_tm()]
+        for _ in range(_BLADE_ERROR_COOLDOWN_TURNS + 1):
+            msgs.append(self._ai())
+            msgs.append(self._ok_tm())
+        assert _is_llm_handling_blade_error(msgs) is False
+
+    def test_no_blade_error_returns_false(self):
+        from chaos_agent.agent.nodes.execute_loop import _is_llm_handling_blade_error
+        msgs = [
+            self._ok_tm(),
+            self._ai(),
+        ]
+        assert _is_llm_handling_blade_error(msgs) is False
+
+    def test_empty_messages(self):
+        from chaos_agent.agent.nodes.execute_loop import _is_llm_handling_blade_error
+        assert _is_llm_handling_blade_error([]) is False
+
+    def test_multi_step_recovery_suppressed(self):
+        """Simulates the real scenario: blade fail → kubectl get (investigate) → kubectl exec blade -h."""
+        from chaos_agent.agent.nodes.execute_loop import _is_llm_handling_blade_error
+        msgs = [
+            self._blade_error_tm(),
+            self._ai([{"name": "kubectl", "args": {"subcommand": "get"}, "id": "tc-2"}]),
+            self._ok_tm(),
+            self._ai([{"name": "kubectl", "args": {"subcommand": "exec", "v_args": "tool-pod -- blade -h"}, "id": "tc-3"}]),
+        ]
+        assert _is_llm_handling_blade_error(msgs) is True

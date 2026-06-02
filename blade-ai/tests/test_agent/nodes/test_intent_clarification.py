@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from tests._helpers import intent_dict_from_result
 from chaos_agent.agent.nodes.intent_clarification import (
     CLASSIFY_INTENT_TOOL,
     _ensure_visible_content,
@@ -118,14 +119,14 @@ class TestSubmitFaultIntentTool:
         # Full structured submission with every optional field — what
         # the prompt now instructs the LLM to do.
         result = submit_fault_intent.invoke({
-            "fault_type": "pod-network-delay",
+            "fault_type": "pod-network-drop",
             "scope": "pod",
             "target": "network",
-            "action": "delay",
+            "action": "drop",
             "namespace": "cms-demo",
             "labels": {"app": "nginx"},
-            "params": {"percent": "80", "timeout": "600"},
-            "user_description": "给 nginx 注入 80% 网络延迟",
+            "params": {"interface": "eth0", "timeout": "600"},
+            "user_description": "给 nginx 注入网络丢包",
         })
         assert "已提交" in result
 
@@ -149,6 +150,119 @@ class TestSubmitFaultIntentTool:
         required = set(schema.get("required", []))
         assert {"fault_type", "scope", "target", "action"} <= required
         assert {"namespace", "names", "labels", "params", "user_description"} <= props
+
+    def test_schema_still_advertises_typed_collections_to_llm(self):
+        # The BeforeValidator must NOT leak into the JSON schema the LLM
+        # sees — otherwise the LLM might be tempted to pass strings
+        # deliberately. The schema for names/labels/params should still
+        # describe array / object types (with `null` allowed for the
+        # optional default), exactly as before the validator was added.
+        schema = submit_fault_intent.args_schema.model_json_schema()
+        props = schema["properties"]
+        # `names` accepts list[str] | null
+        names_types = {b.get("type") for b in props["names"]["anyOf"]}
+        assert names_types == {"array", "null"}
+        # `labels` / `params` accept dict[str, str] | null
+        for f in ("labels", "params"):
+            types = {b.get("type") for b in props[f]["anyOf"]}
+            assert types == {"object", "null"}, f"{f} schema drift: {types}"
+
+    def test_submit_fault_intent_accepts_json_stringified_names(self):
+        # Reproduces the failing tool_call from sess_27ec8f3ef6b2 L30:
+        # qwen-class LLM emitted ``names`` as a JSON string. Pre-fix,
+        # this raised ``Input should be a valid list`` at the @lc_tool
+        # boundary and the dialogue terminated. Post-fix the
+        # BeforeValidator coerces the string into a list before
+        # Pydantic's type check runs.
+        result = submit_fault_intent.invoke({
+            "fault_type": "node-disk-fill",
+            "scope": "node",
+            "target": "disk",
+            "action": "fill",
+            "namespace": "cms-demo",
+            "names": '["cn-hongkong.10.0.1.101"]',
+        })
+        assert "已提交" in result
+
+    def test_submit_fault_intent_accepts_json_stringified_dicts(self):
+        # Companion to the names case: ``params`` and ``labels`` are
+        # also commonly JSON-stringified by qwen-class models.
+        result = submit_fault_intent.invoke({
+            "fault_type": "node-disk-fill",
+            "scope": "node",
+            "target": "disk",
+            "action": "fill",
+            "namespace": "cms-demo",
+            "names": '["cn-hongkong.10.0.1.101"]',
+            "labels": '{"app": "nginx"}',
+            "params": '{"path": "/var/lib/containerd", "percent": "90", "timeout": "300"}',
+        })
+        assert "已提交" in result
+
+    def test_submit_fault_intent_extracts_json_strings_into_real_types(self):
+        # Belt-and-braces: confirm the BeforeValidator actually parsed
+        # the strings into real list / dict (not just "didn't raise").
+        # We construct the args model directly and inspect the parsed
+        # values.
+        validated = submit_fault_intent.args_schema.model_validate({
+            "fault_type": "pod-network-drop",
+            "scope": "pod",
+            "target": "network",
+            "action": "drop",
+            "namespace": "cms-demo",
+            "names": '["pod-a", "pod-b"]',
+            "labels": '{"app": "nginx", "tier": "frontend"}',
+            "params": '{"interface": "eth0"}',
+        })
+        assert validated.names == ["pod-a", "pod-b"]
+        assert validated.labels == {"app": "nginx", "tier": "frontend"}
+        assert validated.params == {"interface": "eth0"}
+
+    def test_submit_fault_intent_native_collections_still_accepted(self):
+        # Don't regress the happy path: real list / dict (the textbook
+        # function-calling shape) must continue to validate cleanly.
+        validated = submit_fault_intent.args_schema.model_validate({
+            "fault_type": "pod-cpu-fullload",
+            "scope": "pod",
+            "target": "cpu",
+            "action": "fullload",
+            "namespace": "cms-demo",
+            "names": ["accounting-7d4f"],
+            "params": {"percent": "80", "timeout": "300"},
+        })
+        assert validated.names == ["accounting-7d4f"]
+        assert validated.params == {"percent": "80", "timeout": "300"}
+        assert validated.labels is None
+
+    def test_submit_fault_intent_malformed_dict_degrades_to_none(self):
+        # The coerce contract for params/labels is fail-soft: anything
+        # that's neither a real dict nor a JSON-stringified dict
+        # (e.g. a plain string "bad", a list, or a number) is degraded
+        # to None — equivalent to "field omitted". This is intentional:
+        # a single bad arg from the LLM must not nuke the entire turn,
+        # because _extract_submit_args + the dialogue history fallback
+        # can still recover the real values. We assert the degradation
+        # rather than raise so a regression that re-introduces strict
+        # validation (and breaks the resilience promise) is caught.
+        validated = submit_fault_intent.args_schema.model_validate({
+            "fault_type": "x", "scope": "x", "target": "x", "action": "x",
+            "params": ["this", "is", "a", "list"],   # dict expected
+            "labels": "not-a-json-object",
+        })
+        assert validated.params is None
+        assert validated.labels is None
+
+    def test_submit_fault_intent_plain_name_string_wraps_to_single_list(self):
+        # A non-JSON-shaped string for ``names`` (no surrounding ``[``
+        # / ``]``) is treated as a single name typed without brackets —
+        # the only ambiguity-tolerant branch in _coerce_to_list. A
+        # regression that drops this branch would force the LLM into
+        # always emitting JSON arrays, losing a degree of robustness.
+        validated = submit_fault_intent.args_schema.model_validate({
+            "fault_type": "x", "scope": "pod", "target": "x", "action": "x",
+            "names": "single-pod-name",
+        })
+        assert validated.names == ["single-pod-name"]
 
 
 class TestIntentClarificationNode:
@@ -175,17 +289,16 @@ class TestIntentClarificationNode:
         assert "再见" in result["messages"][0].content
 
     @pytest.mark.asyncio
-    async def test_submit_fault_intent_fast_path_bootstraps_session_store(
+    async def test_submit_fault_intent_fast_path_does_not_bootstrap_session_store(
         self, tmp_path
     ):
-        """Regression: when the fast-path allocates ``op_task_id`` it
-        MUST also call ``SessionStore.create_session(...)`` so the
-        on-disk ``memory/tasks/<op_task_id>.json`` exists. Before the
-        fix the TUI ``/turn`` flow never registered the task with the
-        SessionStore, leaving ``memory/tasks/`` empty for every TUI-
-        mode injection — replay had nothing to play, and the boot
-        ``PendingTasksCard`` had no way to pick up the in-flight
-        injection on TUI restart.
+        """Option A invariant: ``intent_clarification``'s inject fast-path
+        allocates the ``task-<hex>`` id (so tracker continuity carries
+        into ``intent_confirm``) but MUST NOT call
+        ``SessionStore.create_session(...)`` — the bootstrap is
+        deferred to ``intent_confirm.approved`` so a user-initiated
+        rejection at the confirm gate doesn't leave an orphan task file
+        on disk.
         """
         from chaos_agent.memory.session_store import (
             SessionStore,
@@ -229,24 +342,29 @@ class TestIntentClarificationNode:
             assert result["confirmed_intent"] == "inject"
             op_task_id = result["task_id"]
             assert op_task_id.startswith("task-")
-            # The on-disk JSON file must exist immediately after the
-            # fast-path returns.
+            # The on-disk JSON file must NOT exist yet — bootstrap is
+            # deferred to ``intent_confirm.approved``.
             task_json = tmp_path / "tasks" / f"{op_task_id}.json"
-            assert task_json.exists(), (
-                f"Expected SessionStore to create {task_json} when the "
-                "inject fast-path allocates op_task_id; got nothing."
+            assert not task_json.exists(), (
+                f"Expected no task file at {task_json} after the inject "
+                "fast-path; bootstrap should fire in intent_confirm.approved."
             )
-            import json as _json
-            data = _json.loads(task_json.read_text())
-            assert data["taskId"] == op_task_id
-            assert data["operation"] == "inject"
-            assert data["tui_session_id"] == "sess_bootstrap_test"
-            # The IntentClarificationSummary handoff must be the first
-            # entry in the task file (P0-7-6 contract).
-            assert len(data["messages"]) >= 1
-            first = data["messages"][0]
-            assert first["type"] == "system"
-            assert first["content"].startswith("[Intent Clarification Summary]")
+            # Likewise the in-memory active session must be unset until
+            # approval commits.
+            assert not store.has_active(op_task_id)
+            # And the messages delta must NOT carry an
+            # ``[Intent Clarification Summary]`` SystemMessage — that
+            # marker is built and inserted by ``intent_confirm.approved``
+            # at the same moment the task file is bootstrapped.
+            from langchain_core.messages import SystemMessage
+            for m in result.get("messages", []) or []:
+                if isinstance(m, SystemMessage):
+                    assert not str(getattr(m, "content", "")).startswith(
+                        "[Intent Clarification Summary]"
+                    ), (
+                        "intent_clarification must not emit the summary "
+                        "marker — that's the intent_confirm contract."
+                    )
         finally:
             set_global_session_store(None)  # type: ignore[arg-type]
 
@@ -294,10 +412,10 @@ class TestIntentClarificationNode:
         assert result["confirmed_intent"] == "inject"
         # Values must come from the LLM's structured args, not from
         # programmatic regex extraction of the dialogue.
-        assert result["fault_intent"]["fault_type"] == "pod-cpu-fullload"
-        assert result["fault_intent"]["scope"] == "pod"
-        assert result["fault_intent"]["namespace"] == "production"
-        assert result["fault_intent"]["labels"] == {"app": "account"}
+        assert intent_dict_from_result(result)["fault_type"] == "pod-cpu-fullload"
+        assert intent_dict_from_result(result)["scope"] == "pod"
+        assert intent_dict_from_result(result)["namespace"] == "production"
+        assert intent_dict_from_result(result)["labels"] == {"app": "account"}
         assert result["intent_confidence"] == 1.0
         # LLM should NOT have been called (fast-path skips it)
         mock_llm.bind_tools.assert_not_called()
@@ -349,7 +467,7 @@ class TestIntentClarificationNode:
         }
         result = await node(state)
         assert result["confirmed_intent"] == "inject"
-        assert result["fault_intent"]["scope"] == "pod"
+        assert intent_dict_from_result(result)["scope"] == "pod"
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
@@ -688,7 +806,7 @@ class TestExtractSubmitArgsCoercion:
             "fault_intent": {},
         })
         assert result["confirmed_intent"] == "inject"
-        fi = result["fault_intent"]
+        fi = intent_dict_from_result(result)
         assert fi["names"] == ["cn-hongkong.10.0.1.63"]
         assert fi["params"] == {"percent": "80", "timeout": "600"}
         # LLM should NOT have been re-invoked — fast-path committed.
@@ -721,7 +839,7 @@ class TestExtractSubmitArgsCoercion:
         })
         # No crash; fast-path still commits the rest of the intent.
         assert result["confirmed_intent"] == "inject"
-        assert result["fault_intent"]["names"] == ["node-1"]
+        assert intent_dict_from_result(result)["names"] == ["node-1"]
 
     @pytest.mark.asyncio
     async def test_bare_string_name_wraps_to_single_element_list(self):
@@ -749,7 +867,7 @@ class TestExtractSubmitArgsCoercion:
             "fault_intent": {},
         })
         assert result["confirmed_intent"] == "inject"
-        assert result["fault_intent"]["names"] == ["node-7"]
+        assert intent_dict_from_result(result)["names"] == ["node-7"]
 
     @pytest.mark.asyncio
     async def test_numeric_param_values_coerced_to_str(self):
@@ -760,10 +878,10 @@ class TestExtractSubmitArgsCoercion:
         ``dict[str, str]``."""
         mock_llm = AsyncMock()
         messages = self._build_messages({
-            "fault_type": "pod-network-delay",
+            "fault_type": "pod-network-drop",
             "scope": "pod",
             "target": "network",
-            "action": "delay",
+            "action": "drop",
             "namespace": "cms-demo",
             "names": ["nginx"],
             "params": {"percent": 80, "timeout": 600, "verbose": True},
@@ -777,7 +895,7 @@ class TestExtractSubmitArgsCoercion:
             "fault_intent": {},
         })
         assert result["confirmed_intent"] == "inject"
-        assert result["fault_intent"]["params"] == {
+        assert intent_dict_from_result(result)["params"] == {
             "percent": "80",
             "timeout": "600",
             "verbose": "True",
@@ -803,13 +921,13 @@ class TestFastPathLLMArgsPriority:
         ai_msg = AIMessage(
             content="",
             tool_calls=[_submit_fault_tc(
-                fault_type="pod-network-delay",
+                fault_type="pod-network-drop",
                 scope="pod",
                 target="network",
-                action="delay",
+                action="drop",
                 namespace="cms-demo",
                 names=["nginx-7d4f-abc12"],
-                params={"percent": "80", "timeout": "600"},
+                params={"interface": "eth0", "timeout": "600"},
             )],
             id="ai_full_1",
         )
@@ -819,7 +937,7 @@ class TestFastPathLLMArgsPriority:
             tool_call_id="call_submit_1",
         )
         messages = [
-            HumanMessage(content="给 cms-demo 注入 80% 网络延迟 10 分钟", id="h1"),
+            HumanMessage(content="给 cms-demo 注入网络丢包 10 分钟", id="h1"),
             ai_msg,
             tool_msg,
         ]
@@ -832,15 +950,15 @@ class TestFastPathLLMArgsPriority:
             "fault_intent": {},
         })
         assert result["confirmed_intent"] == "inject"
-        fi = result["fault_intent"]
-        assert fi["fault_type"] == "pod-network-delay"
+        fi = intent_dict_from_result(result)
+        assert fi["fault_type"] == "pod-network-drop"
         assert fi["scope"] == "pod"
         assert fi["target"] == "network"
-        assert fi["action"] == "delay"
+        assert fi["action"] == "drop"
         assert fi["namespace"] == "cms-demo"
         assert fi["names"] == ["nginx-7d4f-abc12"]
         # ``params`` values are coerced to str by ``_extract_submit_args``.
-        assert fi["params"] == {"percent": "80", "timeout": "600"}
+        assert fi["params"] == {"interface": "eth0", "timeout": "600"}
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
@@ -895,10 +1013,10 @@ class TestFastPathLLMArgsPriority:
         # Namespace recovered by either: (a) regex fallback parsing the
         # AI summary, or (b) node-scope default. Either is acceptable
         # — both produce ``default`` for this case.
-        assert result["fault_intent"]["namespace"] == "default"
+        assert intent_dict_from_result(result)["namespace"] == "default"
         # LLM-supplied fields still win where present.
-        assert result["fault_intent"]["fault_type"] == "node-cpu-fullload"
-        assert result["fault_intent"]["names"] == ["cn-hongkong.10.0.1.101"]
+        assert intent_dict_from_result(result)["fault_type"] == "node-cpu-fullload"
+        assert intent_dict_from_result(result)["names"] == ["cn-hongkong.10.0.1.101"]
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
@@ -952,7 +1070,7 @@ class TestFastPathLLMArgsPriority:
             "fault_intent": {},
         })
         assert result["confirmed_intent"] == "inject"
-        fi = result["fault_intent"]
+        fi = intent_dict_from_result(result)
         # Regex fallback recovers all four required fields.
         assert fi["scope"] == "pod"
         assert fi["target"] == "cpu"
@@ -1001,8 +1119,8 @@ class TestFastPathLLMArgsPriority:
             "fault_intent": {},
         })
         assert result["confirmed_intent"] == "inject"
-        assert result["fault_intent"]["scope"] == "node"
-        assert result["fault_intent"]["namespace"] == "default"
+        assert intent_dict_from_result(result)["scope"] == "node"
+        assert intent_dict_from_result(result)["namespace"] == "default"
         mock_llm.bind_tools.assert_not_called()
 
 
@@ -1063,9 +1181,14 @@ class TestHookIntegration:
         assert result["messages"][0].content == "Hello!"
 
     @pytest.mark.asyncio
-    async def test_fast_path_cleans_old_messages(self):
-        """Fast-path emits RemoveMessages for old dialogue history."""
-        from langchain_core.messages import HumanMessage, RemoveMessage
+    async def test_fast_path_does_not_trim_messages(self):
+        """Option A invariant: ``intent_clarification``'s inject fast-path
+        no longer emits RemoveMessages or the
+        ``[Intent Clarification Summary]`` SystemMessage. Both side
+        effects move to ``intent_confirm.approved`` so a user-initiated
+        rejection preserves the full clarification dialogue.
+        """
+        from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 
         mock_llm = AsyncMock()
 
@@ -1083,38 +1206,51 @@ class TestHookIntegration:
         old_messages.append(tool_msg)
 
         node = make_intent_clarification(llm=mock_llm)
+        from chaos_agent.agent.fault_spec import FaultSpec
+        _spec = FaultSpec(
+            scope="pod", blade_target="cpu", blade_action="fullload",
+            namespace="default", labels={"app": "myapp"},
+        )
         state = {
             "confirmed_intent": None,
             "messages": old_messages,
             "clarification_round": 0,
             "dialogue_round": 3,
-            "fault_intent": {
-                "fault_type": "cpu-fullload",
-                "scope": "pod",
-                "target": "cpu",
-                "action": "fullload",
-                "namespace": "default",
-                "labels": "app=myapp",
-            },
+            "fault_spec": _spec.to_dict(),
         }
         result = await node(state)
 
         assert result["confirmed_intent"] == "inject"
-        msgs = result["messages"]
-        # Should have RemoveMessages for messages[:-4] = first 2 messages
-        remove_msgs = [m for m in msgs if isinstance(m, RemoveMessage)]
-        assert len(remove_msgs) == 2
-        assert remove_msgs[0].id == "msg_id_0"
-        assert remove_msgs[1].id == "msg_id_1"
-        # Summary SystemMessage
-        from langchain_core.messages import SystemMessage
-        sys_msgs = [m for m in msgs if isinstance(m, SystemMessage)]
-        assert len(sys_msgs) == 1
-        assert "[Intent Clarification Summary]" in sys_msgs[0].content
+        # The return value must NOT carry a ``messages`` delta produced
+        # by intent_clarification itself. (Hook updates may inject
+        # their own RemoveMessages — ``test_hook_compaction_passes_through``
+        # covers that case — but absent a hook the inject branch must
+        # be empty here.)
+        msgs = result.get("messages", []) or []
+        clarification_remove = [m for m in msgs if isinstance(m, RemoveMessage)]
+        assert clarification_remove == [], (
+            "intent_clarification.inject must not emit RemoveMessages — "
+            "that side effect is now intent_confirm.approved's job."
+        )
+        clarification_summary = [
+            m for m in msgs
+            if isinstance(m, SystemMessage)
+            and str(getattr(m, "content", "")).startswith(
+                "[Intent Clarification Summary]"
+            )
+        ]
+        assert clarification_summary == [], (
+            "intent_clarification.inject must not emit the summary marker."
+        )
 
     @pytest.mark.asyncio
-    async def test_hook_compaction_with_fast_path(self):
-        """Hook compaction + fast-path: both sets of RemoveMessages merge."""
+    async def test_hook_compaction_passes_through(self):
+        """Option A invariant: hook-emitted RemoveMessages still flow
+        through ``intent_clarification.inject`` (PreReasoningHook is
+        independent of where the post-confirm trim runs), but the node
+        itself contributes nothing to the messages delta — exactly one
+        RemoveMessage from the hook, zero from the fast-path.
+        """
         from langchain_core.messages import HumanMessage, RemoveMessage
 
         mock_llm = AsyncMock()
@@ -1137,27 +1273,25 @@ class TestHookIntegration:
         old_messages.append(tool_msg)
 
         node = make_intent_clarification(llm=mock_llm, hook=mock_hook)
+        from chaos_agent.agent.fault_spec import FaultSpec
+        _spec_hook = FaultSpec(
+            scope="pod", blade_target="cpu", blade_action="fullload",
+            namespace="default", labels={"app": "myapp"},
+        )
         state = {
             "confirmed_intent": None,
             "messages": old_messages,
             "clarification_round": 0,
             "dialogue_round": 0,
-            "fault_intent": {
-                "fault_type": "cpu-fullload",
-                "scope": "pod",
-                "target": "cpu",
-                "action": "fullload",
-                "namespace": "default",
-                "labels": "app=myapp",
-            },
+            "fault_spec": _spec_hook.to_dict(),
         }
         result = await node(state)
 
         assert result["confirmed_intent"] == "inject"
-        msgs = result["messages"]
+        msgs = result.get("messages", []) or []
         remove_msgs = [m for m in msgs if isinstance(m, RemoveMessage)]
-        # 1 from hook + 2 from dialogue cleanup (6 - 4 = 2 old messages)
-        assert len(remove_msgs) == 3
+        # Exactly the hook's RemoveMessage — no fast-path additions.
+        assert len(remove_msgs) == 1
         assert remove_msgs[0].id == "hook_remove_1"
 
 
@@ -1249,13 +1383,13 @@ class TestMergeKnownParams:
         msgs = [HumanMessage(content="给 pod 注入网络故障")]
         merged = _merge_known_params_into_fault_intent(msgs, {})
         assert merged["target"] == "network"
-        assert merged["action"] == "delay"
+        assert merged["action"] == "drop"
 
     def test_existing_action_not_overwritten(self):
         msgs = [HumanMessage(content="pod 网络")]
-        merged = _merge_known_params_into_fault_intent(msgs, {"action": "loss"})
+        merged = _merge_known_params_into_fault_intent(msgs, {"action": "drop"})
         # action already set — derivation shouldn't overwrite
-        assert merged["action"] == "loss"
+        assert merged["action"] == "drop"
 
     def test_percent_extraction(self):
         msgs = [HumanMessage(content="CPU 占用 80%")]
@@ -1423,4 +1557,4 @@ class TestCompletenessSignal:
             "scope": "pod", "target": "cpu",
         })
         assert "Confirmed Parameters" in section
-        assert "Do NOT re-ask" in section
+        assert "missing" in section.lower() or "ambiguous" in section.lower()

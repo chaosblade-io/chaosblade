@@ -4,6 +4,7 @@ import logging
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
+from chaos_agent.agent.node_names import RECOVER_VERIFIER
 from chaos_agent.agent.nodes._injection_detection import (
     _was_kubectl_blade_injection_successful,
     _was_blade_create_attempted,
@@ -368,7 +369,7 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                     messages.append(HumanMessage(content=layer1_human_content))
 
                     # Record system prompt to session store
-                    record_system_prompt(hook, state, layer1_system_prompt)
+                    record_system_prompt(hook, state, layer1_system_prompt, node_name=RECOVER_VERIFIER)
 
                     # Bind tools and call LLM
                     max_l1 = settings.max_recover_layer1_iterations
@@ -523,6 +524,7 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                         "details": layer1.details,
                         "raw_output": (layer1.raw_output or "")[:500],
                     },
+                    "node": RECOVER_VERIFIER,
                 })
 
         elif recover_phase == "layer1_recovery" and count > 1:
@@ -725,6 +727,7 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
                         "details": layer1.details,
                         "raw_output": (layer1.raw_output or "")[:500],
                     },
+                    "node": RECOVER_VERIFIER,
                 })
 
         else:
@@ -779,7 +782,13 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
 
         # Determine Layer 1 type: "deterministic" (blade_destroy on host) or "llm_driven"
         # (non-ChaosBlade or kubectl exec injection). Used by Layer 2 prompt and context.
-        _layer1_is_deterministic = state.get("recover_layer1_type", "deterministic" if blade_uid else "llm_driven") == "deterministic"
+        # recover_layer1_type may be None (field default for fresh runs where
+        # the deterministic path didn't explicitly set it). Fall back to the
+        # blade_uid heuristic in that case.
+        _rl1_type = state.get("recover_layer1_type")
+        if _rl1_type is None:
+            _rl1_type = "deterministic" if blade_uid else "llm_driven"
+        _layer1_is_deterministic = _rl1_type == "deterministic"
 
         # Build messages for LLM
         # inject_ctx_msg: for ChaosBlade faults, Layer 1 didn't add inject context to state.messages
@@ -1085,34 +1094,15 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
             context += (
                 f"{instructions_section}\n"
                 f"{layer2_instruction}"
-                    "For example, if CPU stress was injected, use kubectl(subcommand='exec', ...) to run `top -bn1` inside the pod "
-                    "or kubectl(subcommand='describe', ...) to check Pod restart count and conditions.\n"
-                    "**POLLING STRATEGY**: Fault recovery may have a short delay before effects fully clear. Follow this approach:\n"
-                    "  - Perform your first verification check. If it clearly shows the fault has fully cleared "
-                    "(e.g., CPU back to baseline, pod running normally, disk usage back to normal), "
-                    "wait ~10 seconds and do ONE more confirmation check.\n"
-                    "  - If the confirmation check also shows recovery, output your RECOVERY_VERIFICATION_RESULT immediately — no further checks needed.\n"
-                    "  - If the first check shows the fault is still present, wait ~10 seconds and check again. "
-                    "Repeat every ~10 seconds until recovery is confirmed.\n"
-                    "  - If the fault persists after multiple checks (approaching the iteration limit), conclude based on overall trend.\n"
-                    "**ADAPTIVE VERIFICATION PRINCIPLE**:\n"
-                    "If the SAME verification command produces the SAME result twice:\n"
-                    "1. STOP repeating — the result will not change with a 3rd attempt.\n"
-                    "2. ASK yourself: Is there a DIFFERENT metric, partition, resource, or "
-                    "namespace I should be checking instead?\n"
-                    "3. EXAMPLES of strategy pivots:\n"
-                    "   - Disk: df showed no change on one partition → check OTHER partitions "
-                    "(overlay vs root), or check node conditions (DiskPressure) instead\n"
-                    "   - CPU: top showed no change → check cgroups, or check application latency\n"
-                    "   - Network: curl succeeded → check different endpoints, or check packet loss "
-                    "with a different tool\n"
-                    "4. Maximum 2 identical checks per verification method — then SWITCH to a "
-                    "different approach. Repeating a non-productive command wastes verification "
-                    "budget and delays detection of the real issue.\n"
-                    "\n**Baseline Comparison**: Apply Baseline Comparison Rules from your system prompt when comparing metrics.\n"
-                    "**Layer 1 Limitation**: Layer 1 confirms blade_destroy succeeded — this does NOT prove the fault effect is gone. "
-                    "Your Layer 2 kubectl observations are the ONLY way to confirm actual recovery.\n"
-                    "**Minimal containers**: If kubectl exec returns 'command not found', use kubectl describe instead.\n"
+                "**POLLING STRATEGY (CRITICAL)**: Recovery effects may take seconds to clear. "
+                "Check at least twice before concluding. If first check shows recovery, "
+                "do ONE confirmation check. If fault persists, re-check every ~10s.\n\n"
+                "**ADAPTIVE VERIFICATION (CRITICAL)**: "
+                "If the SAME command produces the SAME result twice → STOP repeating. "
+                "Switch to a DIFFERENT metric, partition, resource, or namespace. "
+                "Maximum 2 identical checks per method — then pivot.\n\n"
+                "**Minimal containers**: If kubectl exec returns 'command not found', "
+                "use kubectl describe instead.\n"
             )
             messages.append(HumanMessage(
                 content=context,
@@ -1190,7 +1180,7 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
         system_prompt = _build_recover_verifier_prompt(is_chaosblade=_layer1_is_deterministic)
 
         # Record system prompt to session store (dedup handles repeated prompts)
-        record_system_prompt(hook, state, system_prompt)
+        record_system_prompt(hook, state, system_prompt, node_name=RECOVER_VERIFIER)
 
         response = await llm_to_call.ainvoke(
             [SystemMessage(content=system_prompt)] + messages
@@ -1208,195 +1198,37 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
         }
 
         tool_calls = getattr(response, "tool_calls", None) or []
-        if tool_calls:
-            # LLM wants to call tools — continue ReAct loop
-            # Persist inject_ctx_msg to state for ChaosBlade faults (non-ChaosBlade already has it from Layer 1)
-            # Synthetic messages prepend BEFORE inject_ctx_msg and response so
-            # routing checks state[-1] = response (real AIMessage).
-            result_update["messages"] = _main_hm_for_state + _synthetic_for_state + ([inject_ctx_msg] if inject_ctx_msg else []) + [response]
+        # Scheme B: recover_verifier_loop Layer 2 is a pure ReAct step.
+        # Persist the response (+ synthetic/context messages); routing decides
+        # next — should_continue_recover_verifier sends tool_calls -> tools, or
+        # a Layer 2 verdict text -> finalize_recover_verification. All Layer 2
+        # finalization (guard + parse + baseline + retry + cleanup) now lives
+        # in the finalize_recover_verification node.
+        result_update["messages"] = (
+            _main_hm_for_state + _synthetic_for_state
+            + ([inject_ctx_msg] if inject_ctx_msg else []) + [response]
+        )
+        # Pass the first-Layer2 signal to finalize_recover_verification so its
+        # anti-laziness guard fires exactly once (a conclusion produced before
+        # any kubectl verification ran). Mirrors the original is_first_layer2 guard.
+        result_update["recover_layer2_first"] = is_first_layer2
 
-            # Emit debug-level status event with LLM reasoning summary
-            if settings.is_debug:
-                debug_info, tool_names = summarize_llm_response(response)
-                tracker.update(
-                    f"Recover Layer 2 iteration {count} LLM:\n{debug_info}",
-                    {"debug": True, "iteration": count, "tool_calls": tool_names},
-                )
-            else:
-                tool_names = [
-                    extract_tool_call_fields(tc)[0]
-                    for tc in tool_calls
-                ]
-                tracker.update(
-                    f"Recover Layer 2 iteration {count}: calling tools",
-                    {"iteration": count, "tool_calls": tool_names},
-                )
-        else:
-            # LLM produced final text — parse verification result
-            content = getattr(response, "content", "") or ""
-
-            # Programmatic guard: reject conclusions without verification commands
-            # on the FIRST Layer 2 iteration. LLM must execute at least one kubectl
-            # command to observe the CURRENT post-recovery state. Using baseline
-            # data (pre-injection) as "post-recovery" evidence is INVALID.
-            if is_first_layer2:
-                # Check if ANY kubectl/blade tool call was executed in Layer 2.
-                # Layer 1's tool calls (blade destroy, kubectl get pods) are in
-                # state.messages, so we need to distinguish them. The simplest
-                # heuristic: if is_first_layer2 AND no tool_calls in this response,
-                # the LLM skipped verification entirely.
-                logger.warning(
-                    f"Recover Layer 2 first iteration produced conclusion without "
-                    f"executing any verification commands for task {task_id}. "
-                    f"Forcing re-verification."
-                )
-                tracker.update(
-                    "Layer 2 first iteration: conclusion without verification commands — forcing re-check",
-                    {"iteration": count, "guard": "no_verification_commands"},
-                )
-                # Inject a mandatory verification prompt and continue the loop
-                # instead of accepting the conclusion.
-                result_update["messages"] = _main_hm_for_state + _synthetic_for_state + ([inject_ctx_msg] if inject_ctx_msg else []) + [response, HumanMessage(content=(
-                    "⚠️ Your verification conclusion was rejected because you did NOT execute "
-                    "any kubectl verification commands in this Layer 2 iteration. "
-                    "The baseline data provided earlier was captured BEFORE fault injection — "
-                    "it is NOT the current post-recovery state.\n\n"
-                    "You MUST now execute kubectl commands (e.g., kubectl exec to check disk usage, "
-                    "kubectl describe to check pod status) to observe the CURRENT state of the target. "
-                    "Only then can you output a valid RECOVERY_VERIFICATION_RESULT.\n\n"
-                    "Do NOT output RECOVERY_VERIFICATION_RESULT again until you have executed at "
-                    "least one verification command and observed the CURRENT state."
-                ))]
-                await sync_to_store(state, result_update)
-                return result_update
-
-            # Emit RUNNING event for the final reasoning before completing
-            if settings.is_debug:
-                debug_info, _ = summarize_llm_response(response)
-                tracker.update(
-                    f"Recover Layer 2 iteration {count} LLM (final):\n{debug_info}",
-                    {"debug": True, "iteration": count, "tool_calls": []},
-                )
-            else:
-                tracker.update(
-                    f"Recover Layer 2 iteration {count}: producing final verification",
-                    {"iteration": count, "tool_calls": []},
-                )
-
-            verification = _parse_recovery_verification_result(content, skill_name=skill_name)
-            verification["layer1"] = _recover_layer1_to_dict(layer1)
-
-            # Baseline confidence fallback + Programmatic Fact Enforcement
-            if "baseline_confidence" not in verification:
-                verification["baseline_confidence"] = _compute_baseline_confidence(state)
-            if verification.get("baseline_confidence") == "high" and not verification.get("baseline_used"):
-                verification.setdefault("warnings", []).append(
-                    "Pre-injection baseline was available (confidence=high) but LLM "
-                    "did not perform baseline comparison. Verification relies on "
-                    "absolute thresholds instead of more reliable before/after delta."
-                )
-
-            # If Layer 2 says fault still active, retry recovery ONCE (only on first failure)
-            # to handle ChaosBlade's known behavior where blade_destroy returns success
-            # but the stress process may not be actually killed.
-            # For non-ChaosBlade faults, inject a recovery retry prompt instead of blade_destroy.
-            l2_status = verification.get("layer2", {}).get("status", "unknown")
-            already_retried = any(
-                isinstance(m, HumanMessage) and "recovery retry" in (getattr(m, "content", "") or "")
-                for m in state.get("messages", [])
+        if settings.is_debug:
+            debug_info, _dbg_tool_names = summarize_llm_response(response)
+            tracker.update(
+                f"Recover Layer 2 iteration {count} LLM:\n{debug_info}",
+                {"debug": True, "iteration": count, "tool_calls": _dbg_tool_names},
             )
-            if l2_status == "failed" and not already_retried and count < settings.max_recover_verifier_loop - 1:
-                if blade_uid and _layer1_is_deterministic:
-                    # ChaosBlade path: retry blade_destroy on host
-                    logger.warning(
-                        f"Layer 2 detected fault still active for task {task_id}, "
-                        f"retrying blade_destroy (uid={blade_uid})"
-                    )
-                    tracker.update(
-                        "Layer 2 detected fault still active, retrying blade_destroy",
-                        {"retry": True, "blade_uid": blade_uid},
-                    )
-                    try:
-                        from chaos_agent.tools.blade import blade_destroy as _blade_destroy
-                        retry_output = await _blade_destroy.ainvoke(
-                            {"uid": blade_uid, "kubeconfig": kubeconfig}
-                        )
-                        retry_raw = retry_output if isinstance(retry_output, str) else str(retry_output)
-                        logger.info(f"blade_destroy retry output: {retry_raw[:200]}")
-                        # Inject retry result as a HumanMessage for the next iteration
-                        result_update["messages"] = _main_hm_for_state + _synthetic_for_state + ([inject_ctx_msg] if inject_ctx_msg else []) + [HumanMessage(content=(
-                            f"**recovery retry executed**\n"
-                            f"blade_destroy output: {retry_raw[:500]}\n\n"
-                            f"Please verify again whether the fault has been removed."
-                        ))]
-                        # Don't finalize — let the next iteration re-verify
-                        await sync_to_store(state, result_update)
-                        return result_update
-                    except Exception as retry_err:
-                        logger.warning(f"blade_destroy retry failed: {retry_err}")
-                else:
-                    # Non-ChaosBlade path: inject recovery retry prompt for LLM
-                    logger.warning(
-                        f"Layer 2 detected fault still active for task {task_id}, "
-                        f"injecting recovery retry prompt (non-ChaosBlade, no blade_uid)"
-                    )
-                    tracker.update(
-                        "Layer 2 detected fault still active, injecting recovery retry prompt",
-                        {"retry": True, "blade_uid": blade_uid},
-                    )
-                    result_update["messages"] = _main_hm_for_state + _synthetic_for_state + ([inject_ctx_msg] if inject_ctx_msg else []) + [HumanMessage(content=(
-                        "**recovery retry required**: The fault effect is STILL PRESENT.\n"
-                        "Please re-attempt recovery using alternative methods. "
-                        "For example, if kubectl(subcommand=\"patch\") failed, try kubectl(subcommand=\"delete\") with --force --grace-period=0. "
-                        "If one approach didn't work, try a different programmatic approach.\n\n"
-                        "After re-attempting recovery, verify again whether the fault has been removed."
-                    ))]
-                    await sync_to_store(state, result_update)
-                    return result_update
-
-            result = {
-                "task_id": task_id,
-                "skill": skill_name,
-                "blade_uid": blade_uid,
-                "recovered": verification["level"] in ("recovered", "partial"),
-                "recovery_level": verification["level"],
-            }
-            result_update["result"] = result
-            result_update["recover_verification"] = verification
-            result_update["finished_at"] = now_iso()
-            result_update["messages"] = _main_hm_for_state + _synthetic_for_state + [response]
-
-            if not result["recovered"]:
-                result_update.update(fail_state(
-                    FailureCategory.RECOVERY_FAILED,
-                    f"Layer1={layer1.status}, Layer2={l2_status}, level={verification['level']}",
-                ))
-
-            level = verification["level"]
-            l1_status = layer1.status
-            warnings = verification.get("warnings", [])
-            status_msg = f"Recovery verification: {level} (Layer1: {l1_status}, Layer2: {l2_status})"
-            if warnings:
-                status_msg += f" (warnings: {len(warnings)})"
-            tracker.complete(status_msg)
+        else:
+            _tc_names = [extract_tool_call_fields(tc)[0] for tc in tool_calls]
+            tracker.update(
+                f"Recover Layer 2 iteration {count}: "
+                + ("calling tools" if tool_calls else "emitting verdict text"),
+                {"iteration": count, "tool_calls": _tc_names},
+            )
 
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result_update, hook_updates)
-
-        # ---- Programmatic Debug Pod Cleanup ----
-        # Same pattern as verifier.py: scan ToolMessages for kubectl debug pod
-        # names and delete them deterministically.
-        debug_pods_created: set[str] = set()
-        for msg in state.get("messages", []):
-            if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "kubectl":
-                msg_content = msg.content if isinstance(msg.content, str) else str(msg.content)
-                pod_name = _parse_debug_pod_name(msg_content)
-                if pod_name:
-                    debug_pods_created.add(pod_name)
-        for pod_name in debug_pods_created:
-            logger.info(f"Programmatic cleanup: deleting debug pod {pod_name}")
-            await _delete_debug_pod(pod_name, kubeconfig, task_id)
-
         await sync_to_store(state, result_update)
         return result_update
 

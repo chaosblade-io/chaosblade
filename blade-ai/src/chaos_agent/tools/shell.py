@@ -5,6 +5,7 @@ import logging
 import time
 from typing import Optional
 
+from chaos_agent.agent.node_names import EXECUTE_LOOP
 from chaos_agent.config.settings import settings
 from chaos_agent.errors import ToolGuardError, ToolTimeoutError
 from chaos_agent.memory.session_store import get_global_session_store
@@ -63,6 +64,7 @@ def _persist_to_session(
                 "type": "tool_execution",
                 "content": f"[shell] {cmd_str}",
                 "detail": detail,
+                "node": EXECUTE_LOOP,
             })
     except Exception:
         logger.debug("SessionStore write failed for task %s", task_id)
@@ -75,6 +77,7 @@ async def run_command(
     skip_guard: bool = False,
     env_override: Optional[dict[str, str]] = None,
     source: Optional[str] = None,
+    stdin_data: str = "",
 ) -> CommandResult:
     """Execute a command safely via async subprocess.
 
@@ -89,6 +92,8 @@ async def run_command(
         source: Override the status tracker source name. Defaults to cmd[0].
                 Use a descriptive name (e.g. "conflict-check") for programmatic
                 pre-checks to distinguish them from LLM-initiated tool calls.
+        stdin_data: If non-empty, piped to the subprocess stdin. Used by
+                    kubectl apply/create -f - to pass YAML manifests.
 
     Returns:
         CommandResult with exit_code, stdout, stderr, duration_ms.
@@ -130,12 +135,15 @@ async def run_command(
             sub_env = {**os.environ, **env_override}
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE if stdin_data else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=sub_env,
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
+            proc.communicate(
+                input=stdin_data.encode("utf-8") if stdin_data else None,
+            ),
             timeout=cmd_timeout,
         )
     except asyncio.TimeoutError:

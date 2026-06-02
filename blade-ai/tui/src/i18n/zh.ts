@@ -456,11 +456,23 @@ export const zh: Dict = {
   "confirm.execution.title": "确认执行计划",
   "confirm.execution.proceed": "开始注入",
   "confirm.execution.cancel": "取消",
+  "confirm.targetChange.chip": "DRIFT",
   "confirm.targetChange.title": "目标变更确认",
+  "confirm.targetChange.preamble": "Agent 正在尝试操作与已批准不同的目标。",
+  "confirm.targetChange.agentReason": "Agent 理由",
+  "confirm.targetChange.agentReasonEmpty": "Agent 未提供理由",
   "confirm.targetChange.original": "原始目标",
   "confirm.targetChange.proposed": "Agent 提议目标",
   "confirm.targetChange.approve": "批准变更",
   "confirm.targetChange.reject": "拒绝",
+  "confirm.planChange.chip": "PLAN",
+  "confirm.planChange.title": "计划变更确认",
+  "confirm.planChange.preamble": "Agent 在重新规划后发现原故障类型不可行，建议替换方案：",
+  "confirm.planChange.reason": "变更原因",
+  "confirm.planChange.original": "原故障类型",
+  "confirm.planChange.proposed": "建议故障类型",
+  "confirm.planChange.approve": "批准变更",
+  "confirm.planChange.reject": "拒绝",
 
   // -- ConfirmMessage 字段标签 --------------------------------------
   "confirm.field.fault_type": "故障类型",
@@ -568,6 +580,7 @@ export const zh: Dict = {
   "confirm.safety.safe": "SAFE",
   "confirm.safety.warning": "WARNING",
   "confirm.safety.blocked": "BLOCKED",
+  "confirm.safety.all_clear": "安全检查通过",
 
   // -- Select 组件提示 ---------------------------------------------
   "select.options.hint": "A-Z 跳转 · ↑↓ 选择 · Enter 确认 · Esc 取消",

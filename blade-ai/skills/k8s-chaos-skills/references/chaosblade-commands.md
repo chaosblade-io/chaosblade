@@ -128,20 +128,21 @@ blade create k8s pod-network delay \
 blade create k8s pod-network drop \
   --namespace <ns> \
   --labels "app=<app>" \
-  --interface eth0 \
   --kubeconfig ~/.kube/config
 ```
 
-> **⚠️ drop 是全量丢包**（iptables DROP 语义），**不支持 `--percent`**。不带端口/IP 过滤时丢弃该接口的所有流量。
+> **⚠️ drop 是全量丢包**（iptables DROP 语义），**不支持 `--percent` 和 `--interface`**。不带端口/IP 过滤时丢弃所有出方向流量。
 
 | Flag | 说明 | 默认值 |
 |------|------|--------|
-| `--interface` | 网络接口 | eth0 |
-| `--local-port` | 本地端口 | 全部 |
-| `--remote-port` | 远程端口 | 全部 |
+| `--source-port` | 源端口（逗号分隔） | 全部 |
+| `--destination-port` | 目标端口（逗号分隔） | 全部 |
+| `--source-ip` | 源 IP | 全部 |
 | `--destination-ip` | 目标 IP | 全部 |
+| `--network-traffic` | 流量方向：`in` / `out` | - |
+| `--string-pattern` | 匹配数据包内容 | - |
 
-> **爆炸半径控制提示**：drop 默认丢弃全部流量，**必须**使用 `--local-port` 或 `--remote-port` 或 `--destination-ip` 限制影响范围，避免丢弃 DNS、监控等非目标流量。仅在测试完全网络分区时使用不加过滤的全接口注入。
+> **爆炸半径控制提示**：drop 默认丢弃全部流量，**必须**使用 `--source-port` 或 `--destination-port` 或 `--destination-ip` 限制影响范围，避免丢弃 DNS、监控等非目标流量。仅在测试完全网络分区时使用不加过滤的注入。
 
 ### 5. Pod DNS 故障
 
@@ -325,13 +326,12 @@ blade create k8s node-network delay \
 ```bash
 blade create k8s node-network drop \
   --names <节点名> \
-  --interface eth0 \
   --kubeconfig ~/.kube/config
 ```
 
-> **⚠️ 同 Pod drop：全量丢包，不支持 `--percent`。** 用 `--local-port`/`--destination-ip` 缩小范围。
+> **⚠️ 同 Pod drop：全量丢包，不支持 `--percent` 和 `--interface`。** 用 `--source-port`/`--destination-ip` 缩小范围。
 
-Node 网络 Flags 与 Pod 网络一致（`--interface`、`--local-port`、`--remote-port`、`--destination-ip` 等）。
+Node 网络 Flags 与 Pod 网络一致（`--source-port`、`--destination-port`、`--source-ip`、`--destination-ip`、`--network-traffic` 等）。
 
 ### 5. 节点磁盘填充
 
@@ -495,10 +495,10 @@ blade create k8s pod-network drop -h
 
 | 故障场景 | 命令 |
 |---------|------|
-| Pod 网络丢包(全量) | `blade create k8s pod-network drop --interface eth0 --namespace <ns> --labels "app=<app>"` |
-| Pod 网络丢包(指定端口) | `blade create k8s pod-network drop --local-port 3306 --namespace <ns> --labels "app=<app>"` |
+| Pod 网络丢包(全量) | `blade create k8s pod-network drop --namespace <ns> --labels "app=<app>"` |
+| Pod 网络丢包(指定端口) | `blade create k8s pod-network drop --source-port 3306 --namespace <ns> --labels "app=<app>"` |
 | Pod DNS 故障 | `blade create k8s pod-network dns --domain example.com --ip 1.1.1.1 --namespace <ns> --labels "app=<app>"` |
-| 节点网络丢包 | `blade create k8s node-network drop --interface eth0 --names <node>` |
+| 节点网络丢包 | `blade create k8s node-network drop --names <node>` |
 
 ### 磁盘故障类
 
@@ -644,7 +644,6 @@ kubectl exec otel-c-tool-xxxxx -n chaosblade -- \
   blade create k8s pod-network drop \
   --namespace cms-demo \
   --labels "app=myapp" \
-  --interface eth0 \
   --kubeconfig=/path/to/config
 # 3. 从输出中提取 blade_uid
 # {"code":200,"success":true,"result":"abc123"}

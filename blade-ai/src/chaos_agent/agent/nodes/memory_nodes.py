@@ -5,6 +5,8 @@ import logging
 
 from langchain_core.messages import HumanMessage
 
+from chaos_agent.agent.node_names import MEMORY_NODE
+
 
 def _format_duration_ms(ms) -> str:
     """Render a duration in ms as ``Ns`` / ``Nm Ns``; empty when unknown."""
@@ -125,7 +127,7 @@ async def load_memory(state: AgentState) -> dict:
         _store = get_global_session_store()
         _tid = state.get("task_id", "")
         if _store and _tid:
-            _store.append_messages(_tid, msgs)
+            _store.append_messages(_tid, msgs, node_name=MEMORY_NODE)
 
     await sync_to_store(state, updates)
     return updates
@@ -435,8 +437,10 @@ async def save_memory(state: AgentState) -> dict:
             # ``infer_task_state`` makes downstream filtering trivial.
             if confirmed_intent in ("chat", "recover"):
                 final_status = "completed"
-            elif state.get("blade_uid") and not (
-                state.get("error") or updates.get("error")
+            elif not (state.get("error") or updates.get("error")) and (
+                state.get("blade_uid")
+                or state.get("injection_method")
+                or task_state in ("injected", "recovered", "partial_recovered")
             ):
                 final_status = "completed"
             else:

@@ -10,6 +10,8 @@ description: |
 scripts:
   - name: list_scenarios.py
     description: "列出当前支持的所有故障演练场景（JSON 结构化输出）"
+  - name: inject_cni_exhaust.py
+    description: "CNI IP 耗尽注入 — 自动计算副本数，精确耗尽目标节点 IP 而不触发 OutOfpods。参数: --namespace <ns> --node <node> --kubeconfig <path>"
 ---
 
 # K8s 故障演练

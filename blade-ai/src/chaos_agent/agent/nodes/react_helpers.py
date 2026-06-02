@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Tier 1: Pure-function extractions (identical code across files)
 # ---------------------------------------------------------------------------
 
-def record_system_prompt(hook, state: dict, prompt_text: str) -> None:
+def record_system_prompt(hook, state: dict, prompt_text: str, node_name: str = "") -> None:
     """Record a system prompt to the session store (dedup handles repeated prompts).
 
     Parameters
@@ -35,13 +35,18 @@ def record_system_prompt(hook, state: dict, prompt_text: str) -> None:
         AgentState dict — reads ``task_id`` from it.
     prompt_text : str
         The system prompt content to record.
+    node_name : str
+        Graph node that produced this prompt (stamped as ``_node`` in additional_kwargs).
     """
     _task_id_local = state.get("task_id", "")
     if hook and getattr(hook, "session_store", None) and _task_id_local:
-        hook.session_store.append_messages(_task_id_local, [SystemMessage(content=prompt_text)])
+        msg = SystemMessage(content=prompt_text)
+        if node_name:
+            msg.additional_kwargs["_node"] = node_name
+        hook.session_store.append_messages(_task_id_local, [msg])
 
 
-def record_ai_message(hook, state: dict, response) -> None:
+def record_ai_message(hook, state: dict, response, node_name: str = "") -> None:
     """Immediately save an AI message (including reasoning_content) to session.
 
     Parameters
@@ -51,10 +56,16 @@ def record_ai_message(hook, state: dict, response) -> None:
         AgentState dict — reads ``task_id`` from it.
     response : AIMessage
         The LLM response to record.
+    node_name : str
+        Graph node that produced this response (stamped as ``_node`` in additional_kwargs).
     """
     _task_id_local = state.get("task_id", "")
     if hook and getattr(hook, "session_store", None) and _task_id_local:
         try:
+            if node_name:
+                kwargs = getattr(response, "additional_kwargs", None)
+                if isinstance(kwargs, dict):
+                    kwargs.setdefault("_node", node_name)
             hook.session_store.append_messages(_task_id_local, [response])
         except Exception:
             pass
@@ -478,24 +489,46 @@ def detect_action_stagnation(messages: list, threshold: int | None = None) -> tu
             break
         if len(tool_calls) != 1:
             break
-        name, _ = extract_tool_call_fields(tool_calls[0])
+        name, args = extract_tool_call_fields(tool_calls[0])
         if not name:
             break
+        # For kubectl tools, distinguish by subcommand so that a normal
+        # read-write-read cycle (get → patch → get → describe) does not
+        # trigger stagnation.  Only consecutive calls to the SAME
+        # subcommand (e.g. 5× kubectl:get) count.
+        if name in ("kubectl", "kubectl_ro", "kubectl_verify"):
+            sub = args.get("subcommand", "") if isinstance(args, dict) else ""
+            key = f"{name}:{sub}" if sub else name
+        else:
+            key = name
         if streak_tool is None:
-            streak_tool = name
-        if name != streak_tool:
+            streak_tool = key
+        if key != streak_tool:
             break
         streak += 1
 
     if streak >= _threshold and streak_tool:
-        hint = (
-            f"**ACTION_STAGNATION**: You have called `{streak_tool}` {streak} consecutive times "
-            f"with no progress. This tool has been temporarily removed. "
-            f"You MUST now either:\n"
-            f"- Call `finish_planning` to finalize your plan and proceed to execution phase.\n"
-            f"- Use a DIFFERENT tool if you need additional information.\n"
-            f"Do NOT attempt to call `{streak_tool}` again."
-        )
+        if ":" in streak_tool:
+            # Subcommand-level stagnation (e.g. kubectl:get).
+            # The tool itself is NOT removed — other subcommands
+            # (patch, delete, etc.) may still be needed.
+            base_tool = streak_tool.split(":")[0]
+            hint = (
+                f"**ACTION_STAGNATION**: You have called `{streak_tool}` {streak} consecutive times "
+                f"with no progress. Stop using this subcommand. "
+                f"You can still use `{base_tool}` with other subcommands to proceed.\n"
+                f"Do NOT call `{streak_tool}` again."
+            )
+        else:
+            # Full tool stagnation — tool will be removed by caller.
+            hint = (
+                f"**ACTION_STAGNATION**: You have called `{streak_tool}` {streak} consecutive times "
+                f"with no progress. This tool has been temporarily removed. "
+                f"You MUST now either:\n"
+                f"- Call `finish_planning` to finalize your plan and proceed to execution phase.\n"
+                f"- Use a DIFFERENT tool if you need additional information.\n"
+                f"Do NOT attempt to call `{streak_tool}` again."
+            )
         return hint, streak_tool
     return None, None
 

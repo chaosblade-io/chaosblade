@@ -35,6 +35,25 @@ from chaos_agent.agent.prompts.sections.recovery import (
 from chaos_agent.config.settings import settings
 
 
+async def _drive_finalize(state: dict, loop_result: dict) -> dict:
+    """Scheme B helper: run finalize_recover_verification on a loop result.
+
+    The recover_verifier_loop node no longer finalizes the Layer 2 verdict
+    inline — it persists the response and routing hands off to the
+    finalize_recover_verification node. This helper mirrors that hand-off so
+    tests can assert the final verdict: merge the loop's result_update into
+    state (messages append, other keys overwrite), then invoke the finalize
+    node.
+    """
+    from chaos_agent.agent.nodes._recover_finalize import (
+        make_finalize_recover_verification,
+    )
+    merged = {**state, **{k: v for k, v in loop_result.items() if k != "messages"}}
+    merged["messages"] = list(state.get("messages", [])) + list(loop_result.get("messages", []))
+    fnode = make_finalize_recover_verification()
+    return await fnode(merged)
+
+
 # ---------------------------------------------------------------------------
 # RecoverLayer1Result
 # ---------------------------------------------------------------------------
@@ -354,14 +373,16 @@ class TestMakeRecoverVerifier:
                 "verifier_loop_count": 0,
             }
             result = await node(state)
-            # First iteration: LLM output conclusion without verification commands
-            # → programmatic guard intercepts → no final result yet
-            assert "result" not in result, "First iteration should NOT produce final result"
-            # Guard should inject mandatory verification prompt
-            assert any("rejected" in getattr(m, "content", "") for m in result.get("messages", [])), \
-                "Guard should inject a rejection prompt forcing LLM to execute commands"
-            # Loop count should increment
+            # Loop count increments; loop persists the conclusion + first-Layer2 flag.
             assert result["verifier_loop_count"] == 1
+            assert result.get("recover_layer2_first") is True
+            # finalize_recover_verification's guard intercepts the first-turn
+            # conclusion (no kubectl verification ran) → no final result, inject
+            # a rejection prompt forcing the LLM to verify.
+            fin = await _drive_finalize(state, result)
+            assert "recover_verification" not in fin, "First-turn conclusion must be rejected, not finalized"
+            assert any("rejected" in getattr(m, "content", "") for m in fin.get("messages", [])), \
+                "Guard should inject a rejection prompt forcing LLM to execute commands"
 
     @pytest.mark.asyncio
     async def test_layer2_final_text(self):
@@ -400,8 +421,11 @@ class TestMakeRecoverVerifier:
                 "recover_phase": "layer2_verification",  # Already in Layer 2 phase
             }
             result = await node(state)
-            assert result["result"]["recovered"] is True
-            assert result["recover_verification"]["level"] == "recovered"
+            # Non-first iteration → guard bypassed; finalize parses the verdict.
+            assert result.get("recover_layer2_first") is False
+            fin = await _drive_finalize(state, result)
+            assert fin["result"]["recovered"] is True
+            assert fin["recover_verification"]["level"] == "recovered"
 
     @pytest.mark.asyncio
     async def test_layer2_tool_call_continues_loop(self):
@@ -505,13 +529,15 @@ class TestParseLayer1RecoveryResult:
 class TestBuildRecoverVerifierPrompt:
     def test_chaosblade_label(self):
         prompt = _build_recover_verifier_prompt(is_chaosblade=True)
-        # The output format line should use "blade_destroy" label
-        assert "Layer1 (blade_destroy): passed" in prompt
+        # Scheme B: verdict submitted via submit_recover_verification; the
+        # blade_destroy label still appears in the text fallback block.
+        assert "blade_destroy" in prompt
+        assert "submit_recover_verification" in prompt
 
     def test_non_chaosblade_label(self):
         prompt = _build_recover_verifier_prompt(is_chaosblade=False)
-        # The output format line should use "recovery execution" label
-        assert "Layer1 (recovery execution): passed" in prompt
+        assert "recovery execution" in prompt
+        assert "submit_recover_verification" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -626,8 +652,10 @@ class TestMakeRecoverVerifierNonChaosBlade:
             "layer2_context_added": True,  # Context was built in iteration 2
         }
         result3 = await node(state3)
-        assert result3["result"]["recovered"] is True
-        assert result3["recover_verification"]["level"] == "recovered"
+        # Layer 2 conclusion (non-first iteration) → guard bypassed; finalize verdict.
+        fin = await _drive_finalize(state3, result3)
+        assert fin["result"]["recovered"] is True
+        assert fin["recover_verification"]["level"] == "recovered"
 
     @pytest.mark.asyncio
     async def test_non_chaosblade_layer1_failed_skips_layer2(self):
@@ -724,7 +752,8 @@ class TestMakeRecoverVerifierNonChaosBlade:
             "layer1_iteration_count": 1,
         }
         result2 = await node(state2)
-        assert result2["result"]["recovered"] is True
+        fin = await _drive_finalize(state2, result2)
+        assert fin["result"]["recovered"] is True
 
     @pytest.mark.asyncio
     async def test_chaosblade_path_unchanged(self):
@@ -790,7 +819,8 @@ class TestMakeRecoverVerifierNonChaosBlade:
                 "layer1_iteration_count": 1,
             }
             result2 = await node(state2)
-            assert result2["result"]["recovered"] is True
+            fin = await _drive_finalize(state2, result2)
+            assert fin["result"]["recovered"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1235,8 +1265,10 @@ class TestMakeRecoverVerifierKubectlExecRouting:
             "layer1_iteration_count": 1,
         }
         result3 = await node(state3)
-        assert result3["result"]["recovered"] is True
-        assert result3["recover_verification"]["level"] == "recovered"
+        # Layer 2 conclusion (non-first iteration) → guard bypassed; finalize verdict.
+        fin = await _drive_finalize(state3, result3)
+        assert fin["result"]["recovered"] is True
+        assert fin["recover_verification"]["level"] == "recovered"
 
     @pytest.mark.asyncio
     async def test_kubectl_exec_inject_context_contains_destroy_instructions(self):

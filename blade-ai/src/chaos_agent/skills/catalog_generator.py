@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from chaos_agent.config.settings import settings
+from chaos_agent.utils.fault_type import extract_fault_type
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +234,100 @@ def _parse_llm_json(raw_text: str) -> Optional[list[dict]]:
             "fault_symptom": item.get("fault_symptom", ""),
             "resource_path": item.get("resource_path", ""),
             "example_cmd": item.get("example_cmd", ""),
+            "example_cmd_direct": item.get("example_cmd_direct", ""),
         })
 
     return result
+
+
+def infer_scope(category: str) -> str:
+    """Infer blade scope from catalogue directory name."""
+    ft = extract_fault_type(category)
+    if ft in ("Node", "Pod", "Service", "Workload"):
+        return ft.lower()
+    cat_lower = category.lower()
+    if "dns" in cat_lower:
+        return "pod"
+    return "pod"
+
+
+def infer_blade_params(category: str, *, scope: str | None = None) -> dict | None:
+    """Try to infer scope/target/action from category name.
+
+    Returns ``{"scope": ..., "target": ..., "action": ...}`` or ``None``
+    when the category is a symptom without a clear blade mapping
+    (e.g. Pod_Pending, Pod_镜像拉取失败).
+
+    Pass a pre-computed *scope* to skip the redundant ``infer_scope`` call.
+    """
+    if scope is None:
+        scope = infer_scope(category)
+    cat_lower = category.lower()
+
+    target: str | None = None
+    if any(k in cat_lower for k in ("cpu", "throttling")):
+        target = "cpu"
+    elif any(k in cat_lower for k in ("内存", "oom", "mem")):
+        target = "mem"
+    elif any(k in cat_lower for k in ("磁盘", "disk", "云盘")):
+        target = "disk"
+    elif any(k in cat_lower for k in ("网络", "network", "丢包", "dns")):
+        target = "network"
+
+    if not target:
+        return None
+
+    action: str | None = None
+    if target == "cpu":
+        action = "fullload"
+    elif target == "mem":
+        action = "load"
+    elif target == "disk":
+        action = "burn" if any(k in cat_lower for k in ("io", "读写")) else "fill"
+    elif target == "network":
+        if "dns" in cat_lower:
+            action = "dns"
+        elif any(k in cat_lower for k in ("丢包", "drop")):
+            action = "drop"
+        else:
+            action = "delay"
+
+    if not action:
+        return None
+    return {"scope": scope, "target": target, "action": action}
+
+
+def build_nl_cmd(display: str, category: str, scope: str) -> str:
+    """Build a scope-aware natural-language example command."""
+    desc = f'{display}导致{category.replace("_", " ")}故障'
+    if scope == "node":
+        return (
+            f'blade-ai inject -i "帮我注入{desc}，'
+            f'目标为<node-name>，'
+            f'kubeconfig路径为<kubeconfig>"'
+        )
+    return (
+        f'blade-ai inject -i "帮我注入{desc}，'
+        f'命名空间为<namespace>，目标为<name>，'
+        f'kubeconfig路径为<kubeconfig>"'
+    )
+
+
+def build_direct_cmd(params: dict) -> str:
+    """Build a structured example command from inferred blade params."""
+    scope = params["scope"]
+    name_ph = "<node-name>" if scope == "node" else "<name>"
+    parts = [
+        "blade-ai inject",
+        f"--scope {scope}",
+        f"--target {params['target']}",
+        f"--action {params['action']}",
+        f"-n {name_ph}",
+    ]
+    if scope != "node":
+        parts.append("--namespace <namespace>")
+    parts.append("--kubeconfig <kubeconfig>")
+    return " ".join(parts)
 
 
 def _generate_from_catalogue(catalogue_dir: Path, skill_name: str) -> Optional[list[dict]]:
@@ -260,13 +352,13 @@ def _generate_from_catalogue(catalogue_dir: Path, skill_name: str) -> Optional[l
             # Try to read fault_symptom from the .md file
             fault_symptom = _extract_fault_symptom(md_file)
 
-            # Build example command
+            # Build example commands (scope-aware)
             display = root_cause.replace("_", " ")
-            example_cmd = (
-                f'blade-ai inject -i "帮我注入{display}导致{category.replace("_", " ")}故障，'
-                f'命名空间为<namespace>，目标为<name>，'
-                f'kubeconfig路径为<kubeconfig>"'
-            )
+            scope = infer_scope(category)
+            example_cmd = build_nl_cmd(display, category, scope)
+
+            blade_params = infer_blade_params(category, scope=scope)
+            example_cmd_direct = build_direct_cmd(blade_params) if blade_params else ""
 
             use_cases.append({
                 "category": category,
@@ -274,6 +366,7 @@ def _generate_from_catalogue(catalogue_dir: Path, skill_name: str) -> Optional[l
                 "fault_symptom": fault_symptom,
                 "resource_path": resource_path,
                 "example_cmd": example_cmd,
+                "example_cmd_direct": example_cmd_direct,
             })
 
     return use_cases if use_cases else None

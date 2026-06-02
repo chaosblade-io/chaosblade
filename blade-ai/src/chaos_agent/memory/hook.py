@@ -10,6 +10,7 @@ import time
 
 from langchain_core.messages import SystemMessage, RemoveMessage
 
+from chaos_agent.agent.node_names import MEMORY_HOOK, TOOL_RESULT
 from chaos_agent.memory.compactor import compact_memory
 from chaos_agent.memory.context_manager import (
     CompactTrackingState,
@@ -654,6 +655,13 @@ class PreReasoningHook:
                 return
 
             # Inject/recover execution → task JSONL (existing behavior)
+            # Stamp _node on ToolMessages (their only write path is through here)
+            from langchain_core.messages import ToolMessage as _TM
+            for msg in messages:
+                if isinstance(msg, _TM):
+                    _kwargs = getattr(msg, "additional_kwargs", None)
+                    if isinstance(_kwargs, dict):
+                        _kwargs.setdefault("_node", TOOL_RESULT)
             self.session_store.append_messages(task_id, messages)
         except Exception as e:
             logger.warning(f"Failed to append messages for task {task_id}: {e}")
@@ -666,6 +674,7 @@ class PreReasoningHook:
                     "type": "system",
                     "content": f"[Memory Compression] {message}",
                     "detail": detail or {},
+                    "node": MEMORY_HOOK,
                 })
             except Exception:
                 pass  # Session persistence is best-effort

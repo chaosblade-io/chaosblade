@@ -55,7 +55,7 @@ def _intent_concrete() -> dict:
 def _intent_unbounded_label() -> dict:
     return {
         "target": "pod",
-        "action": "delay",
+        "action": "drop",
         "namespace": "default",
         "labels": "app=worker",
     }
@@ -147,13 +147,13 @@ class TestHypothesisComposition:
 class TestActionLabelAndRollback:
     def test_known_action_label(self):
         assert _action_label("fullload") == "CPU \u6ee1\u8f7d"
-        assert _action_label("delay") == "\u7f51\u7edc\u5ef6\u8fdf"
+        assert _action_label("drop") == "\u7f51\u7edc\u4e22\u5305"
 
     def test_unknown_action_label_falls_through(self):
         assert _action_label("weird") == "weird"
 
     def test_known_rollback_hint(self):
-        assert _rollback_hint("delay") == "stop-delay"
+        assert _rollback_hint("drop") == "stop-drop"
         assert _rollback_hint("kill")
 
     def test_unknown_rollback_hint_is_empty(self):

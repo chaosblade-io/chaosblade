@@ -11,9 +11,9 @@ from chaos_agent.agent.prompts.constants import REPLAN_MARKER
 def get_fault_effect_delay_section() -> str:
     """Fault effect delay awareness — shared by inject and verifier prompts."""
     return """### Fault Effect Delay
-Fault injection is NOT instantaneous. After `blade create` reports Success:
+Fault injection is NOT instantaneous. After the injection command reports Success:
 - The actual fault effect may take **5-30 seconds** to become observable
-- ChaosBlade daemon pod needs to receive the instruction and start the stress process
+- The injection tool needs to deploy and start the fault process on the target
 - Kubernetes metrics-server has its own sampling interval (typically 15-30s)"""
 
 
@@ -197,49 +197,34 @@ Your output contract this turn:
    - `finish_planning(summary="...")` → proceed to safety check and execution.
    - `finish_planning(summary="...", rejected=True, rejection_reason="...")` →
      reject the request (the system ends cleanly).
+   When proceeding (not rejecting), you MUST include `blast_radius_scope` —
+   the system uses it for safety assessment. Classification rules:
+   - `"target-only"` — only the declared target is mutated (e.g. patch one
+     deployment, blade_create on specific pods).
+   - `"namespace-wide"` — other resources in the target namespace are affected
+     (e.g. delete all pods in a namespace).
+   - `"cluster-wide"` — resources outside the target namespace are mutated
+     (e.g. taint/cordon nodes, modify cluster-level resources). This triggers
+     elevated safety review.
+   Also include `blast_radius_detail` describing the mutation scope (e.g.
+   "Will taint 3 nodes where target pods run").
+   If you read multiple skill case files during planning, you MUST include
+   `skill_case_resource` with the resource_path of the chosen case (e.g.
+   `skill_case_resource="references/catalogue/Pod_镜像拉取失败/Pod_镜像拉取失败_镜像不存在或标签错误.md"`).
+   This tells the system which case to use for verification.
    This is your output contract. Do NOT end Phase 1 by emitting free text
    without calling `finish_planning`.
 
-### Available tools in Phase 1 (the only tools you have right now)
+### Phase 1 tools (read-only — runtime enforced)
 
-Read-only / planning tools — these are ALL you have:
-- `activate_skill`, `read_skill_resource` — load skill knowledge
-- `read_knowledge_resource`, `read_file` — load reference docs
-- kubectl read subset (`get`, `describe`, `top`, `logs`, ...) — verify target
-- `blade_status` — list existing experiments (read-only)
-- `save_fault_plan` — persist plan markdown (writes to local plan dir,
-  does not touch the cluster)
-- `finish_planning` — signal end of Phase 1 (proceed or reject)
+Available: `activate_skill`, `read_skill_resource`, `read_knowledge_resource`,
+`read_file`, kubectl (`get`/`describe`/`top`/`logs`), `blade_status`,
+`save_fault_plan`, `finish_planning`.
 
-NOT available in Phase 1 (intentional — runtime enforced):
-- `blade_create`, `blade_destroy` — mutate cluster state
-- Full `kubectl` (`exec`, `delete`, `patch`, `apply`, `scale`, `taint`,
-  `cordon`, `drain`, `rollout`, `debug`, `edit`, `replace`, ...)
-- `execute_skill_script` — may run mutating scripts
-
-These mutation tools are bound automatically in Phase 2 (executor). You
-will NOT have to call them; the executor is a separate LLM turn with the
-full surface.
-
-### What happens after step 6 (Phase 2 onward, for awareness)
-
-When you call `finish_planning`:
-- Normal: safety_check → confirmation_gate (user approval) → baseline_capture
-  → execute_loop (a different LLM turn with blade_create / full kubectl bound).
-- Rejected: the system routes to the reject node — no side effects, clean end.
-
-### Anti-patterns (runtime will REJECT — do not waste turns trying)
-
-- Calling `blade_create` directly here.
-- `kubectl exec <chaosblade-controller-pod> -- blade create ...` (semantic
-  equivalent of `blade_create`; the runtime classifies it the same way
-  and will reject it).
-- `kubectl create -f` / `kubectl apply -f` of any ChaosBlade CR.
-- Any `kubectl` subcommand outside the read subset above.
-
-Such calls return an `Error: phase1_readonly_violation` ToolMessage and
-waste your turn. The fast path is always: finish reading, then call
-`finish_planning`."""
+NOT available: `blade_create`, `blade_destroy`, full kubectl (`exec`/`delete`/
+`patch`/`scale`/...), `execute_skill_script`. Calling them returns
+`Error: phase1_readonly_violation`. Mutation tools are bound in Phase 2
+automatically after `finish_planning` → safety_check → user approval."""
 
 
 def get_nl_mode_section() -> str:
@@ -325,6 +310,20 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
             "",
             "See Important Guidelines → Injection Method Switching for detailed constraints on method selection.",
         ])
+
+    parts.extend([
+        "",
+        "### Plan Change (fault type switch)",
+        "If after analyzing the Phase 2 failure you determine the original fault type "
+        "is fundamentally not viable on this target (e.g., iptables not installed for "
+        "network-drop, insufficient disk space for disk-fill), you may propose an "
+        "alternative fault type using `propose_plan_change`. The user will see a "
+        "comparison card and approve or reject the change.",
+        "",
+        "Do NOT use propose_plan_change for parameter adjustments — those can be "
+        "handled within the same fault type. Only use it when the fault TYPE "
+        "(scope/target/action) must change.",
+    ])
 
     return "\n".join(parts)
 

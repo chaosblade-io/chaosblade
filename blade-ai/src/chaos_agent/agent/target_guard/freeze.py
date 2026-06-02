@@ -19,10 +19,13 @@ field names + defaults.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
-from .guard import CLUSTER_SCOPED_KINDS
+from .guard import CLUSTER_SCOPED_KINDS, OWNER_SCOPES
 from .types import ApprovedTarget
+
+logger = logging.getLogger(__name__)
 
 # Re-export for callers that want to skip ``freeze_approved_target``
 # and build directly from a FaultSpec instance.  We keep the legacy
@@ -40,6 +43,7 @@ def freeze_approved_target(
     blade_action: Optional[str],
     *,
     lock_fault_type: bool = True,
+    owner_names: tuple[str, ...] = (),
 ) -> Optional[dict]:
     """Build the ``approved_target`` dict to store in AgentState.
 
@@ -88,10 +92,25 @@ def freeze_approved_target(
     namespace = str(target.get("namespace") or "").strip()
     if not namespace and scope not in CLUSTER_SCOPED_KINDS:
         namespace = "default"
+    # Cross-scope: secondary scopes for operations that need resources
+    # beyond the primary scope (e.g. node faults needing pod delete,
+    # pod faults needing PVC creation).
+    secondary_namespace = ""
+    secondary_scopes: tuple[str, ...] = ()
     if scope in CLUSTER_SCOPED_KINDS:
+        secondary_namespace = namespace  # preserve before clearing
+        if scope == "node":
+            secondary_scopes = ("pod", "deployment", "daemonset", "statefulset")
         # Cluster-scoped resources never carry a namespace; null it
         # to keep the snapshot tidy.
         namespace = ""
+    elif scope in ("pod", "deployment", "statefulset", "daemonset"):
+        # Workload faults may need to:
+        # - Create dependency resources (PVC, ConfigMap, Secret)
+        # - Delete/patch pods belonging to the workload
+        # - Taint/cordon nodes to affect pod scheduling (e.g. Taint→Pending)
+        secondary_scopes = ("pvc", "persistentvolumeclaim", "pv", "persistentvolume", "configmap", "secret", "pod", "node")
+        secondary_namespace = namespace
 
     # ---- Names (accept CSV string for back-compat) ------------------------
     raw_names = target.get("names") or []
@@ -125,6 +144,9 @@ def freeze_approved_target(
         "blade_target": bt,
         "blade_action": ba,
         "lock_fault_type": bool(lock_fault_type),
+        "owner_names": list(owner_names),
+        "secondary_scopes": list(secondary_scopes),
+        "secondary_namespace": secondary_namespace,
     }
 
 
@@ -150,7 +172,58 @@ def approved_from_dict(d: Optional[dict]) -> Optional[ApprovedTarget]:
         blade_target=str(d.get("blade_target") or ""),
         blade_action=str(d.get("blade_action") or ""),
         lock_fault_type=bool(d.get("lock_fault_type", True)),
+        owner_names=tuple(str(n) for n in (d.get("owner_names") or [])),
+        secondary_scopes=tuple(str(s) for s in (d.get("secondary_scopes") or [])),
+        secondary_namespace=str(d.get("secondary_namespace") or ""),
     )
 
 
-__all__ = ["approved_from_dict", "freeze_approved_target"]
+async def discover_owner_names(
+    scope: str,
+    namespace: str,
+    labels: dict[str, str],
+    kubeconfig: str = "",
+) -> tuple[str, ...]:
+    """Query the cluster for owner resources whose selector matches ``labels``.
+
+    When scope=pod, finds Deployments/DaemonSets/StatefulSets in the
+    same namespace whose ``spec.selector.matchLabels`` are a subset of
+    the given labels. Returns their names so the guard can validate
+    owner-scope operations at the instance level.
+
+    Best-effort: returns empty tuple on any failure (guard falls back
+    to namespace-only anchoring).
+    """
+    if scope not in OWNER_SCOPES or not labels or not namespace:
+        return ()
+
+    from chaos_agent.config.settings import settings
+    from chaos_agent.tools.kubectl import _build_kubectl_global_args
+    from chaos_agent.tools.shell import run_command
+
+    label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
+    owner_kinds = OWNER_SCOPES[scope]
+    found: list[str] = []
+
+    for kind in sorted(owner_kinds):
+        cmd = [settings.kubectl_path]
+        cmd.extend(_build_kubectl_global_args(kubeconfig))
+        cmd.extend([
+            "get", kind, "-n", namespace,
+            "-l", label_selector,
+            "-o", "jsonpath={.items[*].metadata.name}",
+        ])
+        try:
+            result = await run_command(cmd, timeout=settings.timeout_kubectl)
+            if result.exit_code == 0 and result.stdout.strip():
+                found.extend(result.stdout.strip().split())
+        except Exception as e:
+            logger.debug("discover_owner_names: %s query failed: %s", kind, e)
+
+    if found:
+        logger.info("discover_owner_names: found owners %s for labels=%s in ns=%s",
+                     found, labels, namespace)
+    return tuple(found)
+
+
+__all__ = ["approved_from_dict", "discover_owner_names", "freeze_approved_target"]

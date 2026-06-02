@@ -49,7 +49,9 @@ def _extract_param_from_flag(flag: str, param_name: str) -> str:
         Extracted value, or empty string if not found.
     """
     bare = param_name.lstrip("-")
-    # Match --param=value or --param value
+    # Match --param=value or --param value. \S+ stops at whitespace;
+    # blade CLI uses comma-separated values (--names a,b,c) so this
+    # captures the full value string for all known flag formats.
     pattern = rf"--{bare}=(\S+)|--{bare}\s+(\S+)"
     match = re.search(pattern, flag)
     if match:
@@ -60,14 +62,20 @@ def _extract_param_from_flag(flag: str, param_name: str) -> str:
 def _parse_scope_target_action_from_flag(flag: str) -> str:
     """Extract scope-target-action from a blade Flag string.
 
-    Flag format: "k8s pod-disk burn --namespace cms-demo ..."
-    Returns: "pod-disk-burn" or empty string if parsing fails.
+    Flag format (k8s): "k8s pod-disk burn --namespace cms-demo ..."
+    Flag format (host): "cpu fullload --cpu-percent 80 ..."
+    Returns: "pod-disk-burn" / "cpu-fullload" or empty string if parsing fails.
     """
-    # Match "k8s <scope-target> <action>" — two separate tokens.
-    # e.g. "k8s pod-disk burn" → "pod-disk-burn"
+    # k8s mode: "k8s <scope-target> <action>"
     match = re.search(r"k8s\s+(\S+)\s+(\S+)", flag)
     if match:
-        return f"{match.group(1)}-{match.group(2)}"  # e.g. "pod-disk-burn"
+        return f"{match.group(1)}-{match.group(2)}"
+    # host mode fallback: "<target> <action>" (first two non-flag tokens)
+    stripped = flag.strip()
+    if stripped:
+        match = re.match(r"(\S+)\s+(\S+)", stripped)
+        if match and not match.group(1).startswith("--"):
+            return f"{match.group(1)}-{match.group(2)}"
     return ""
 
 
@@ -203,7 +211,9 @@ async def check_blade_conflicts(
                 )
             return ([], [])
 
-        # Step 2: Run blade status --type create in the first available pod
+        # Step 2: Run blade status --type create in the first available pod.
+        # Any single pod suffices: blade status --type create queries
+        # ChaosBlade CRDs via the K8s API, returning cluster-wide results.
         status_cmd = (
             ["kubectl", "exec", pods[0], "-n", _TOOL_POD_NAMESPACE]
             + kubeconfig_args
@@ -212,14 +222,12 @@ async def check_blade_conflicts(
         status_result = await run_command(status_cmd, task_id=task_id, source="conflict-check")
         raw = status_result.stdout
 
-        # Parse UIDs from output (handles both table and JSON format)
-        uids = re.findall(r"[0-9a-f]{16}", raw)
-
         # Build ConflictInfo list with overlap analysis when JSON is available
+        uids: list[str] = []
         conflict_details: list[ConflictInfo] = []
 
-        # Optional: filter by namespace and/or labels using JSON output.
-        # blade status --type create returns JSON like:
+        # Prefer structured JSON parsing over regex. blade status --type
+        # create returns JSON like:
         #   {"code":200,"success":true,"result":[{"Uid":"...","Flag":"..."}]}
         json_parsed = False
         if raw.strip():
@@ -229,7 +237,6 @@ async def check_blade_conflicts(
                     result_list = data.get("result", [])
                     if isinstance(result_list, list):
                         json_parsed = True
-                        filtered: list[str] = []
                         for exp in result_list:
                             if not isinstance(exp, dict):
                                 continue
@@ -285,15 +292,18 @@ async def check_blade_conflicts(
                                     request_scope_target_action=request_scope_target_action,
                                 )
 
-                            filtered.append(uid)
+                            uids.append(uid)
                             conflict_details.append(ci)
-                        uids = filtered
             except Exception:
-                # Fall back to regex-extracted UIDs on parse failure
-                pass
+                logger.warning(
+                    "blade status JSON parse failed; falling back to regex UID extraction"
+                )
 
-        # If JSON was not parsed, build basic ConflictInfo from regex UIDs
+        # Fallback: regex-extract UIDs from raw output when JSON parsing
+        # failed or returned non-standard format. These UIDs are unfiltered
+        # (no namespace/status filtering possible without structured data).
         if not json_parsed:
+            uids = re.findall(r"[0-9a-f]{16}", raw)
             for uid in uids:
                 conflict_details.append(ConflictInfo(uid=uid))
         overlapping = [c for c in conflict_details if c.overlaps_target]

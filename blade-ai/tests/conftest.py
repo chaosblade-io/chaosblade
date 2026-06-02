@@ -194,19 +194,40 @@ def mock_run_command_fail(mocker):
 # ── AgentState sample ────────────────────────────────────────────────────
 
 
+def replace_fault_spec(state: dict, **field_updates) -> None:
+    """Test helper: update specific fields of state.fault_spec in place.
+
+    Tests that used to mutate ``state['target']`` / ``state['blade_scope']``
+    / etc. should call this helper instead — the FaultSpec refactor
+    consolidated those scattered fields into a single immutable spec.
+
+    Example::
+
+        replace_fault_spec(state, namespace="kube-system", names=("coredns",))
+        replace_fault_spec(state, scope="node", blade_target="cpu")
+    """
+    from chaos_agent.agent.fault_spec import FaultSpec
+    existing = FaultSpec.from_dict(state.get("fault_spec")) or FaultSpec()
+    state["fault_spec"] = existing.replace(**field_updates).to_dict()
+
+
 @pytest.fixture
 def sample_agent_state():
     """Build a minimal AgentState dict for testing."""
+    from chaos_agent.agent.fault_spec import FaultSpec
+    _spec = FaultSpec.from_cli_structured({
+        "scope": "pod",
+        "target": "kill",
+        "action": "delete",
+        "namespace": "default",
+        "target_name": "my-pod",
+        "params": {"duration": "60"},
+    })
     return {
         "task_id": "task-20260420-120000-abc123",
         "operation": "inject",
         "skill_name": None,
-        "target": {
-            "namespace": "default",
-            "resource_type": "pod",
-            "names": ["my-pod"],
-        },
-        "params": {"duration": 60},
+        "fault_spec": _spec.to_dict(),
         "safety_status": "pending",
         "safety_reason": None,
         "needs_confirmation": False,

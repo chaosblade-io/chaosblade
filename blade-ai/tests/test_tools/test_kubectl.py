@@ -1,11 +1,17 @@
 """Tests for kubectl CLI tool wrapper."""
 
+import pytest
+
 from chaos_agent.tools.guard import CommandResult
 from chaos_agent.tools.kubectl import (
+    PHASE1_READONLY_SUBCOMMANDS,
+    VERIFIER_SUBCOMMANDS,
     _build_kubectl_global_args,
     _is_json_output,
     _split_args,
     kubectl,
+    kubectl_ro,
+    kubectl_verify,
 )
 
 
@@ -252,8 +258,8 @@ class TestKubectlExec:
             "cluster": "",
         })
         call_kwargs = mock_run_command.call_args[1]
-        # exec subcommand should use timeout_kubectl_exec (60s by default)
-        assert call_kwargs.get("timeout") == 60
+        # exec subcommand should use timeout_kubectl_exec (180s by default)
+        assert call_kwargs.get("timeout") == 180
 
     async def test_exec_with_kubeconfig(self, mock_run_command):
         result = await kubectl.ainvoke({
@@ -582,7 +588,7 @@ class TestKubectlTimeouts:
             "cluster": "",
         })
         call_kwargs = mock_run_command.call_args[1]
-        assert call_kwargs.get("timeout") == 60
+        assert call_kwargs.get("timeout") == 180
 
 
 class TestSplitArgs:
@@ -737,3 +743,177 @@ class TestKubectlJsonpathQuoting:
         # Should have exactly one --kubeconfig (from the parameter)
         assert len(kubeconfig_indices) == 1
         assert cmd[kubeconfig_indices[0] + 1] == "/explicit/kubeconfig"
+
+
+# ============================================================================
+# kubectl_ro — Phase 1 read-only flavour
+#
+# Tests focus on the things that distinguish kubectl_ro from kubectl:
+#   - Literal subcommand constraint matches PHASE1_READONLY_SUBCOMMANDS
+#   - Runtime defensive check (subcommand outside Literal still rejected)
+#   - Legitimate readonly calls delegate to the full kubectl correctly
+# Tests do NOT re-cover behavior already verified for kubectl
+# (kubeconfig handling, large-output hints, etc.) — those flow through
+# unchanged via the delegation in kubectl_ro's body.
+# ============================================================================
+
+
+class TestKubectlRoSubcommandTable:
+    """Literal type annotation and the runtime allowlist must stay in
+    sync — they are both authoritative for what counts as read-only.
+
+    If a future change extends PHASE1_READONLY_SUBCOMMANDS without
+    updating the Literal (or vice versa), the LLM-facing surface
+    diverges from the runtime check. This test wires them together.
+    """
+
+    def test_literal_matches_runtime_allowlist(self):
+        # Read the schema LangChain actually exposes to the LLM — the
+        # Pydantic-generated JSON schema with the Literal type rendered
+        # as an ``enum`` array. This is what LangGraph's ToolNode uses
+        # to validate incoming args, so it's the authoritative source
+        # for "what subcommands the LLM can call".
+        schema = kubectl_ro.args_schema.model_json_schema()
+        enum_values = schema["properties"]["subcommand"].get("enum", [])
+        assert set(enum_values) == set(PHASE1_READONLY_SUBCOMMANDS), (
+            f"kubectl_ro Literal/enum {enum_values} drifted from "
+            f"PHASE1_READONLY_SUBCOMMANDS {PHASE1_READONLY_SUBCOMMANDS} — "
+            f"keep both in sync when adding/removing subcommands"
+        )
+
+    def test_allowlist_excludes_mutating_subcommands(self):
+        mutating = {
+            "exec", "delete", "patch", "apply", "scale", "taint",
+            "cordon", "drain", "rollout", "debug", "edit", "replace",
+            "run", "create", "label", "annotate", "expose",
+        }
+        assert mutating.isdisjoint(set(PHASE1_READONLY_SUBCOMMANDS)), (
+            f"PHASE1_READONLY_SUBCOMMANDS leaked a mutating subcommand: "
+            f"{mutating & set(PHASE1_READONLY_SUBCOMMANDS)}"
+        )
+
+
+class TestKubectlRoRuntimeDefence:
+    """Even if Literal validation is somehow bypassed (e.g. an LLM
+    SDK that ignores schema), the runtime check inside kubectl_ro's
+    body still rejects mutating subcommands."""
+
+    @pytest.mark.asyncio
+    async def test_runtime_rejects_exec(self):
+        # Bypass Pydantic validation by calling the underlying async
+        # coroutine directly. ``StructuredTool.coroutine`` is the
+        # original ``@tool``-decorated async function (``.func`` is
+        # None for async-only tools).
+        result = await kubectl_ro.coroutine(
+            subcommand="exec",
+            v_args="some-pod -- ls",
+        )
+        assert "Error" in result
+        assert "phase 1" in result.lower() or "read-only" in result.lower()
+        for sub in PHASE1_READONLY_SUBCOMMANDS:
+            assert sub in result  # the allowlist is shown to the LLM
+
+    @pytest.mark.asyncio
+    async def test_runtime_rejects_delete(self):
+        result = await kubectl_ro.coroutine(
+            subcommand="delete", v_args="pod x",
+        )
+        assert "Error" in result
+        assert "phase 1" in result.lower() or "read-only" in result.lower()
+
+
+class TestKubectlRoDelegation:
+    """Legitimate read-only calls should produce the same command line
+    as the full kubectl tool — we delegate to it internally."""
+
+    @pytest.mark.asyncio
+    async def test_get_delegates_to_kubectl(self, mock_run_command):
+        await kubectl_ro.ainvoke({
+            "subcommand": "get",
+            "v_args": "pods -n cms-demo",
+            "kubeconfig": "/kc",
+            "context": "",
+            "cluster": "",
+        })
+        cmd = mock_run_command.call_args[0][0]
+        # Same command shape the full kubectl would emit
+        assert cmd[0].endswith("kubectl")
+        assert "--kubeconfig" in cmd and "/kc" in cmd
+        assert "get" in cmd
+        assert "pods" in cmd and "-n" in cmd and "cms-demo" in cmd
+
+    @pytest.mark.asyncio
+    async def test_describe_delegates(self, mock_run_command):
+        await kubectl_ro.ainvoke({
+            "subcommand": "describe",
+            "v_args": "pod my-pod -n ns",
+        })
+        cmd = mock_run_command.call_args[0][0]
+        assert "describe" in cmd
+        assert "pod" in cmd and "my-pod" in cmd
+
+    @pytest.mark.asyncio
+    async def test_top_delegates(self, mock_run_command):
+        await kubectl_ro.ainvoke({
+            "subcommand": "top",
+            "v_args": "pod accounting-x -n cms-demo",
+        })
+        cmd = mock_run_command.call_args[0][0]
+        assert "top" in cmd
+
+
+# ============================================================================
+# kubectl_verify — Verifier-phase flavour (ro + exec)
+# ============================================================================
+
+
+class TestKubectlVerifySubcommandTable:
+    """Literal type annotation and VERIFIER_SUBCOMMANDS must stay in sync."""
+
+    def test_literal_matches_runtime_allowlist(self):
+        schema = kubectl_verify.args_schema.model_json_schema()
+        enum_values = schema["properties"]["subcommand"].get("enum", [])
+        assert set(enum_values) == set(VERIFIER_SUBCOMMANDS)
+
+    def test_includes_exec(self):
+        assert "exec" in VERIFIER_SUBCOMMANDS
+
+    def test_includes_all_readonly(self):
+        assert set(PHASE1_READONLY_SUBCOMMANDS).issubset(set(VERIFIER_SUBCOMMANDS))
+
+    def test_excludes_mutating_subcommands(self):
+        mutating = {
+            "delete", "patch", "apply", "scale", "taint",
+            "cordon", "drain", "rollout", "edit", "replace",
+            "run", "create", "label", "annotate", "expose",
+        }
+        assert mutating.isdisjoint(set(VERIFIER_SUBCOMMANDS)), (
+            f"VERIFIER_SUBCOMMANDS leaked a mutating subcommand: "
+            f"{mutating & set(VERIFIER_SUBCOMMANDS)}"
+        )
+
+
+class TestKubectlVerifyRuntimeDefence:
+
+    @pytest.mark.asyncio
+    async def test_runtime_rejects_scale(self):
+        result = await kubectl_verify.coroutine(
+            subcommand="scale",
+            v_args="deployment/coredns --replicas=0 -n kube-system",
+        )
+        assert "Error" in result
+        assert "verifier" in result.lower() or "observation" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_runtime_rejects_delete(self):
+        result = await kubectl_verify.coroutine(
+            subcommand="delete", v_args="pod x",
+        )
+        assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_runtime_rejects_patch(self):
+        result = await kubectl_verify.coroutine(
+            subcommand="patch", v_args="deploy x -p '{}'",
+        )
+        assert "Error" in result

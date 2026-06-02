@@ -188,6 +188,96 @@ class TestAssessTargetHealth:
 
 
 # ---------------------------------------------------------------------------
+# _resolve_pod_names — label-based pod resolution
+# ---------------------------------------------------------------------------
+
+
+class TestResolvePodNames:
+    @pytest.mark.asyncio
+    async def test_labels_resolve_all_pods(self, monkeypatch):
+        from chaos_agent.agent import target_health
+
+        async def fake_resolve(t, kc):
+            assert t.get("labels")
+            return ["accounting-6fb-qn2vr", "accounting-6fb-xqhdd", "accounting-6fb-zf458"]
+
+        monkeypatch.setattr(target_health, "_resolve_pod_names", fake_resolve)
+
+        queried_pods = []
+
+        async def fake_status(name, ns, kc):
+            queried_pods.append(name)
+            return {"phase": "Running"}
+
+        monkeypatch.setattr(target_health, "_query_pod_status", fake_status)
+        checker = PodHealthChecker()
+        report = await checker.check(
+            {"labels": {"app": "accounting"}, "names": ["accounting"], "namespace": "cms-demo"},
+            "",
+        )
+        assert report.overall == HealthSeverity.OK
+        assert len(queried_pods) == 3
+
+    @pytest.mark.asyncio
+    async def test_one_unhealthy_pod_among_healthy(self, monkeypatch):
+        from chaos_agent.agent import target_health
+
+        async def fake_resolve(t, kc):
+            return ["pod-a", "pod-b", "pod-c"]
+
+        monkeypatch.setattr(target_health, "_resolve_pod_names", fake_resolve)
+
+        async def fake_status(name, ns, kc):
+            if name == "pod-b":
+                return {"phase": "Failed", "reason": "Evicted"}
+            return {"phase": "Running"}
+
+        monkeypatch.setattr(target_health, "_query_pod_status", fake_status)
+        report = await assess_target_health(
+            "pod",
+            {"labels": {"app": "myapp"}, "namespace": "default"},
+            "",
+        )
+        assert report.overall == HealthSeverity.BLOCK
+        assert any("pod-b" in i.message for i in report.issues)
+
+    @pytest.mark.asyncio
+    async def test_no_labels_uses_names(self):
+        from chaos_agent.agent import target_health
+
+        target = {"names": ["exact-pod-123"], "namespace": "ns"}
+        result = await target_health._resolve_pod_names(target, "")
+        assert result == ["exact-pod-123"]
+
+    @pytest.mark.asyncio
+    async def test_no_labels_no_names_returns_empty(self):
+        from chaos_agent.agent import target_health
+
+        result = await target_health._resolve_pod_names({"namespace": "ns"}, "")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_all_pods_healthy(self, monkeypatch):
+        from chaos_agent.agent import target_health
+
+        async def fake_resolve(t, kc):
+            return ["accounting-6fb-qn2vr"]
+
+        async def fake_status(name, ns, kc):
+            return {"phase": "Running"}
+
+        monkeypatch.setattr(target_health, "_resolve_pod_names", fake_resolve)
+        monkeypatch.setattr(target_health, "_query_pod_status", fake_status)
+
+        report = await assess_target_health(
+            "pod",
+            {"labels": {"app": "accounting"}, "names": ["accounting"], "namespace": "cms-demo"},
+            "",
+        )
+        assert report.overall == HealthSeverity.OK
+
+
+# ---------------------------------------------------------------------------
 # Plugin registration
 # ---------------------------------------------------------------------------
 
@@ -280,8 +370,8 @@ class TestSafetyCheckIntegration:
             "messages": [],
         }
         out = await safety_check_module.safety_check(state)
-        # Default policy: report attached but inject NOT rejected
-        assert out.get("safety_status") == "safe"
+        # No kubeconfig → conflict check skipped → warning (not rejected)
+        assert out.get("safety_status") in ("safe", "warning")
         assert "target_health_report" in out
         report = out["target_health_report"]
         assert report["overall"] == "block"
@@ -388,8 +478,8 @@ class TestSafetyCheckIntegration:
         # Should still pass safety — health check failure is swallowed
         # via assess_target_health's try/except (returns OK on bug);
         # the report attachment may or may not be present, but
-        # safety must succeed.
-        assert out.get("safety_status") == "safe"
+        # safety must not be rejected.
+        assert out.get("safety_status") in ("safe", "warning")
 
 
 class TestHealthReportToDict:
@@ -419,3 +509,110 @@ class TestHealthReportToDict:
         assert ok.is_blocking() is False
         assert warn.is_blocking() is False
         assert block.is_blocking() is True
+
+
+# ---------------------------------------------------------------------------
+# Node Ready condition (improvement 2)
+# ---------------------------------------------------------------------------
+
+
+class TestNodeReadyCondition:
+    def test_not_ready_blocks(self):
+        conditions = [
+            {"type": "Ready", "status": "False", "lastTransitionTime": "2026-05-20T10:00:00Z"},
+        ]
+        report = _build_node_report({"names": ["node-1"]}, conditions)
+        assert report.overall == HealthSeverity.BLOCK
+        assert any(i.code == "node.not_ready" for i in report.issues)
+        assert "NotReady" in report.issues[0].message
+
+    def test_ready_unknown_blocks(self):
+        conditions = [
+            {"type": "Ready", "status": "Unknown", "lastTransitionTime": ""},
+        ]
+        report = _build_node_report({"names": ["node-1"]}, conditions)
+        assert report.overall == HealthSeverity.BLOCK
+        assert report.issues[0].code == "node.not_ready"
+
+    def test_ready_true_is_ok(self):
+        conditions = [
+            {"type": "Ready", "status": "True"},
+        ]
+        report = _build_node_report({"names": ["node-1"]}, conditions)
+        assert report.overall == HealthSeverity.OK
+
+    def test_not_ready_plus_pressure(self):
+        conditions = [
+            {"type": "Ready", "status": "False", "lastTransitionTime": ""},
+            {"type": "DiskPressure", "status": "True", "lastTransitionTime": ""},
+        ]
+        report = _build_node_report({"names": ["node-1"]}, conditions)
+        assert report.overall == HealthSeverity.BLOCK
+        codes = {i.code for i in report.issues}
+        assert "node.not_ready" in codes
+        assert "node.disk_pressure" in codes
+
+
+# ---------------------------------------------------------------------------
+# ChaosBlade agent existence (improvement 4)
+# ---------------------------------------------------------------------------
+
+
+class TestBladeAgentCheck:
+    @pytest.mark.asyncio
+    async def test_agent_missing_blocks(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            "chaos_agent.agent.target_health._query_node_conditions",
+            AsyncMock(return_value=[{"type": "Ready", "status": "True"}]),
+        )
+        monkeypatch.setattr(
+            "chaos_agent.agent.target_health._query_blade_agent_on_node",
+            AsyncMock(return_value=False),
+        )
+        report = await assess_target_health(
+            "node",
+            {"names": ["worker-01"], "namespace": "", "labels": {}, "resource_type": "node"},
+            kubeconfig="/fake/kubeconfig",
+        )
+        assert report.overall == HealthSeverity.BLOCK
+        assert any(i.code == "node.chaosblade_tool_missing" for i in report.issues)
+
+    @pytest.mark.asyncio
+    async def test_agent_present_is_ok(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            "chaos_agent.agent.target_health._query_node_conditions",
+            AsyncMock(return_value=[{"type": "Ready", "status": "True"}]),
+        )
+        monkeypatch.setattr(
+            "chaos_agent.agent.target_health._query_blade_agent_on_node",
+            AsyncMock(return_value=True),
+        )
+        report = await assess_target_health(
+            "node",
+            {"names": ["worker-01"], "namespace": "", "labels": {}, "resource_type": "node"},
+            kubeconfig="/fake/kubeconfig",
+        )
+        assert report.overall == HealthSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_agent_check_disabled(self, monkeypatch):
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            "chaos_agent.agent.target_health._query_node_conditions",
+            AsyncMock(return_value=[{"type": "Ready", "status": "True"}]),
+        )
+        monkeypatch.setattr(
+            "chaos_agent.config.settings.settings.blade_agent_check_enabled", False
+        )
+        # _query_blade_agent_on_node is NOT mocked — should never be called
+        report = await assess_target_health(
+            "node",
+            {"names": ["worker-01"], "namespace": "", "labels": {}, "resource_type": "node"},
+            kubeconfig="/fake/kubeconfig",
+        )
+        assert report.overall == HealthSeverity.OK

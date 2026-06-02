@@ -28,6 +28,7 @@ from chaos_agent.agent.baseline_extractors import (
     Extractor,
     extract_pod_top_metrics,
 )
+from chaos_agent.agent.node_names import BASELINE_CAPTURE
 from chaos_agent.agent.nodes._injection_detection import _TOOL_POD_NAMESPACE, discover_tool_pods_with_nodes
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
@@ -91,6 +92,11 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
                         f"{{debug_pod}} -n {_TOOL_POD_NAMESPACE} -- iostat -xd 1 3",
                         mode="debug_two_step"),
     ],
+    ("pod", "process", "kill"): [
+        BaselineCommand("Service endpoints", "get", "endpoints -n {namespace} {label_selector}"),
+        BaselineCommand("Pod status/restarts", "get", "pods -n {namespace} {label_selector} -o wide"),
+        BaselineCommand("Pod events", "describe", "pod {pod_name} -n {namespace}"),
+    ],
     ("pod", "network", "drop"): [
         BaselineCommand("Service endpoints", "get", "endpoints -n {namespace}"),
         BaselineCommand("Pod conditions", "describe", "pod {pod_name} -n {namespace}"),
@@ -140,6 +146,11 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
         BaselineCommand("Pods on node", "get",
                         "pods -o wide -A --field-selector spec.nodeName={node_name}"),
     ],
+    ("node", "process"): [
+        BaselineCommand("Node conditions", "describe", "node {node_name}"),
+        BaselineCommand("Pods on node", "get",
+                        "pods -o wide -A --field-selector spec.nodeName={node_name}"),
+    ],
 }
 
 # Scope-only fallback (used when no match in BASELINE_COMMANDS at any level)
@@ -147,6 +158,12 @@ _SCOPE_FALLBACK: dict[str, list[BaselineCommand]] = {
     "node": [BaselineCommand("Node resource usage", "top", "node {node_name}")],
     "pod": [BaselineCommand("Pod resource usage", "top",
                             "pod -n {namespace} {label_selector}")],
+    "deployment": [
+        BaselineCommand("Deployment status", "get",
+                        "deployment -n {namespace} -o wide"),
+        BaselineCommand("Pod status", "get",
+                        "pods -n {namespace} {label_selector} -o wide"),
+    ],
 }
 
 # iostat two-level fallback chain for containers without sysstat installed.
@@ -390,7 +407,7 @@ def _resolve_templates(
     pod_name = "" if spec.scope == "node" else (names[0] if names else "")
     labels_dict = spec.labels
     label_selector = (
-        "-l " + ",".join(f"{k}={v}" for k, v in labels_dict.items())
+        ",".join(f"{k}={v}" for k, v in labels_dict.items())
         if labels_dict
         else ""
     )
@@ -1139,6 +1156,10 @@ async def _llm_derive_baseline_commands(
     scope: str,
     target: str,
     action: str,
+    *,
+    namespace: str = "",
+    names: tuple[str, ...] = (),
+    labels: dict[str, str] | None = None,
 ) -> list[BaselineCommand]:
     """Let LLM derive baseline collection commands from full skill content.
 
@@ -1151,9 +1172,40 @@ async def _llm_derive_baseline_commands(
     if not llm or not skill_case_content:
         return []
 
+    # Build target context so the LLM uses correct resource names/labels
+    target_lines = [f"Fault type: {scope}-{target}-{action}", f"Fault scope: {scope}"]
+    if namespace:
+        target_lines.append(f"Namespace: {namespace}")
+    if names:
+        target_lines.append(f"Resource names: {', '.join(names[:5])}")
+    if labels:
+        label_str = ", ".join(f"{k}={v}" for k, v in labels.items())
+        target_lines.append(f"Label selector: {label_str}")
+
+    # Show template variable → resolved value mapping so the LLM
+    # uses template variables instead of hardcoding values.
+    pod_name = names[0] if names else ""
+    label_selector_val = (
+        ",".join(f"{k}={v}" for k, v in labels.items()) if labels else ""
+    )
+    var_lines = ["\nTemplate variable values (use these in v_args_template):"]
+    if namespace:
+        var_lines.append(f"  {{namespace}} → {namespace}")
+    if pod_name and scope != "node":
+        var_lines.append(f"  {{pod_name}} → {pod_name}")
+    if pod_name and scope == "node":
+        var_lines.append(f"  {{node_name}} → {pod_name}")
+    if label_selector_val:
+        var_lines.append(
+            f"  {{label_selector}} → {label_selector_val} "
+            f"(raw value — always use with -l flag, e.g. -l {{label_selector}})"
+        )
+    target_lines.extend(var_lines)
+
+    target_context = "\n".join(target_lines)
+
     human_prompt = (
-        f"Fault type: {scope}-{target}-{action}\n"
-        f"Fault scope: {scope}\n\n"
+        f"{target_context}\n\n"
         f"<skill-case>\n{skill_case_content}\n</skill-case>\n\n"
         "Based on the skill-case content above, derive pre-injection baseline "
         "metrics. Focus primarily on baseline_facts and symptoms sections; "
@@ -1173,6 +1225,93 @@ async def _llm_derive_baseline_commands(
         return _validate_and_filter_commands(commands)
     except Exception as e:
         logger.warning(f"LLM baseline derivation failed: {e}")
+        return []
+
+
+_LLM_BASELINE_MAX_RETRIES = 2
+
+
+async def _llm_retry_failed_commands(
+    llm,
+    skill_case_content: str,
+    scope: str,
+    target: str,
+    action: str,
+    failed_observations: list[dict],
+    *,
+    namespace: str = "",
+    names: tuple[str, ...] = (),
+    labels: dict[str, str] | None = None,
+) -> list[BaselineCommand]:
+    """Re-derive baseline commands with execution error feedback.
+
+    Called when LLM-generated commands fail at runtime (e.g. bad flags,
+    wrong resource type). Feeds the error output back to the LLM so it
+    can self-correct.
+    """
+    if not llm or not failed_observations:
+        return []
+
+    error_lines = []
+    for obs in failed_observations:
+        stderr_preview = (obs.get("stderr") or "")[:300]
+        error_lines.append(
+            f"- Command: `{obs.get('command', '')}`\n"
+            f"  exit_code={obs.get('exit_code')}\n"
+            f"  stderr: {stderr_preview}"
+        )
+    error_feedback = "\n".join(error_lines)
+
+    target_lines = [f"Fault type: {scope}-{target}-{action}", f"Fault scope: {scope}"]
+    if namespace:
+        target_lines.append(f"Namespace: {namespace}")
+    if names:
+        target_lines.append(f"Resource names: {', '.join(names[:5])}")
+    if labels:
+        label_str = ", ".join(f"{k}={v}" for k, v in labels.items())
+        target_lines.append(f"Label selector: {label_str}")
+
+    pod_name = names[0] if names else ""
+    label_selector_val = (
+        ",".join(f"{k}={v}" for k, v in labels.items()) if labels else ""
+    )
+    var_lines = ["\nTemplate variable values (use these in v_args_template):"]
+    if namespace:
+        var_lines.append(f"  {{namespace}} → {namespace}")
+    if pod_name and scope != "node":
+        var_lines.append(f"  {{pod_name}} → {pod_name}")
+    if pod_name and scope == "node":
+        var_lines.append(f"  {{node_name}} → {pod_name}")
+    if label_selector_val:
+        var_lines.append(
+            f"  {{label_selector}} → {label_selector_val} "
+            f"(raw value — always use with -l flag, e.g. -l {{label_selector}})"
+        )
+    target_lines.extend(var_lines)
+
+    target_context = "\n".join(target_lines)
+
+    human_prompt = (
+        f"{target_context}\n\n"
+        f"<skill-case>\n{skill_case_content}\n</skill-case>\n\n"
+        "The following baseline commands FAILED during execution:\n\n"
+        f"{error_feedback}\n\n"
+        "Analyze the errors and generate CORRECTED replacement commands. "
+        "Output ONLY the corrected commands as a JSON list.\n\n"
+        + _build_scope_specific_examples(scope)
+    )
+
+    try:
+        from langchain_core.messages import SystemMessage as SM, HumanMessage as HM
+        response = await llm.ainvoke([
+            SM(content=_BASELINE_SYSTEM_PROMPT),
+            HM(content=human_prompt),
+        ])
+        raw = response.content if hasattr(response, "content") else str(response)
+        commands = _parse_llm_json_output(raw)
+        return _validate_and_filter_commands(commands)
+    except Exception as e:
+        logger.warning("LLM baseline retry failed: %s", e)
         return []
 
 
@@ -1379,9 +1518,23 @@ def make_baseline_capture(llm=None, registry=None):
                     "Strategy: LLM-driven baseline derivation...",
                     {"step": "strategy", "strategy": "llm"},
                 )
-                return await _llm_derive_baseline_commands(
-                    llm, skill_case, scope, target, action,
-                )
+                try:
+                    return await asyncio.wait_for(
+                        _llm_derive_baseline_commands(
+                            llm, skill_case, scope, target, action,
+                            namespace=spec.namespace if spec else "",
+                            names=spec.names if spec else (),
+                            labels=dict(spec.labels) if spec and spec.labels else None,
+                        ),
+                        timeout=settings.timeout_baseline_llm,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "LLM baseline derivation timed out after %ds, "
+                        "falling back to registry",
+                        settings.timeout_baseline_llm,
+                    )
+                    return []
 
             def _registry_strategy():
                 return _lookup_baseline_commands(scope, target, action)
@@ -1466,7 +1619,7 @@ def make_baseline_capture(llm=None, registry=None):
                             )
                     # Write P3 session event after processing each supplement
                     if _p3_added_dims:
-                        sync_node_status_to_session(state, "baseline_capture",
+                        sync_node_status_to_session(state, BASELINE_CAPTURE,
                             f"P3 baseline supplement: added {', '.join(_p3_added_dims)} dimensions",
                             detail={"dimensions": _p3_added_dims, "rule_id": supp.id})
                         if settings.is_debug and tracker:
@@ -1489,6 +1642,82 @@ def make_baseline_capture(llm=None, registry=None):
                 {"step": "execute", "command_count": len(resolved)},
             )
             observations = await _execute_observations(resolved, kubeconfig, task_id)
+
+            # 4.1 LLM retry: when LLM-generated commands fail execution,
+            # feed errors back to the LLM and let it self-correct (up to
+            # _LLM_BASELINE_MAX_RETRIES attempts).
+            if source == "llm" and llm:
+                all_pairs = list(zip(resolved, observations))
+
+                for retry_num in range(1, _LLM_BASELINE_MAX_RETRIES + 1):
+                    failed_obs = [o for _, o in all_pairs
+                                  if o.get("exit_code") != 0]
+                    if not failed_obs:
+                        break
+
+                    logger.info(
+                        "LLM baseline retry %d/%d: %d command(s) failed",
+                        retry_num, _LLM_BASELINE_MAX_RETRIES, len(failed_obs),
+                    )
+                    tracker.update(
+                        f"LLM retry {retry_num}/{_LLM_BASELINE_MAX_RETRIES}: "
+                        f"{len(failed_obs)} command(s) failed, "
+                        f"regenerating with error feedback...",
+                        {"step": "llm_retry", "attempt": retry_num,
+                         "failed_count": len(failed_obs)},
+                    )
+
+                    try:
+                        retry_commands = await asyncio.wait_for(
+                            _llm_retry_failed_commands(
+                                llm, skill_case, scope, target, action,
+                                failed_obs,
+                                namespace=spec.namespace if spec else "",
+                                names=spec.names if spec else (),
+                                labels=dict(spec.labels) if spec and spec.labels else None,
+                            ),
+                            timeout=settings.timeout_baseline_llm,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "LLM baseline retry %d timed out after %ds",
+                            retry_num, settings.timeout_baseline_llm,
+                        )
+                        break
+                    if not retry_commands:
+                        logger.info(
+                            "LLM retry %d: no corrected commands returned",
+                            retry_num,
+                        )
+                        break
+
+                    retry_resolved = _resolve_templates(retry_commands, state)
+                    retry_viable = [
+                        c for c in retry_resolved if not c.get("_unresolved")
+                    ]
+                    if not retry_viable:
+                        break
+
+                    retry_obs = await _execute_observations(
+                        retry_resolved, kubeconfig, task_id,
+                    )
+
+                    # Keep original successes, replace failures with retry
+                    success_pairs = [
+                        (r, o) for r, o in all_pairs
+                        if o.get("exit_code") == 0
+                    ]
+                    all_pairs = success_pairs + list(
+                        zip(retry_resolved, retry_obs)
+                    )
+
+                if all_pairs:
+                    resolved, observations = (
+                        [r for r, _ in all_pairs],
+                        [o for _, o in all_pairs],
+                    )
+                else:
+                    resolved, observations = [], []
 
             # 4.5 Run per-command extractors → merge structured fields
             # into target_metadata. This is the "free side benefit" of
@@ -1587,7 +1816,7 @@ def make_baseline_capture(llm=None, registry=None):
 
             # ── Observability: session status ──
             sync_node_status_to_session(
-                state, "baseline_capture",
+                state, BASELINE_CAPTURE,
                 f"Baseline collected ({source}): {_success}/{_total} succeeded",
                 detail={
                     "source": source,
@@ -1621,7 +1850,7 @@ def make_baseline_capture(llm=None, registry=None):
                     if obs.get("stderr"):
                         _obs_parts.append(f"stderr:\n```\n{obs['stderr']}\n```")
                     _session_msgs.append(HumanMessage(content="\n".join(_obs_parts)))
-                _store.append_messages(_tid, _session_msgs)
+                _store.append_messages(_tid, _session_msgs, node_name=BASELINE_CAPTURE)
 
             return result
 
@@ -1638,7 +1867,7 @@ def make_baseline_capture(llm=None, registry=None):
             }
             tracker.fail(f"Baseline capture failed: {e}")
             sync_node_status_to_session(
-                state, "baseline_capture",
+                state, BASELINE_CAPTURE,
                 f"Baseline capture failed: {e}",
                 detail={"source": "error", "error": str(e)},
             )

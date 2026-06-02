@@ -9,8 +9,10 @@ from chaos_agent.agent.nodes.baseline_capture import (
     BaselineCommand,
     BASELINE_COMMANDS,
     _BASELINE_SYSTEM_PROMPT,
+    _LLM_BASELINE_MAX_RETRIES,
     _TOOL_POD_NAMESPACE,
     _build_scope_specific_examples,
+    _llm_retry_failed_commands,
     _lookup_baseline_commands,
     _resolve_templates,
     _parse_debug_pod_name,
@@ -88,7 +90,7 @@ class TestTemplateResolution:
                 "labels": {"app": "nginx", "tier": "frontend"},
             },
         }
-        cmds = [BaselineCommand("Pod CPU", "top", "pod -n {namespace} {label_selector}")]
+        cmds = [BaselineCommand("Pod CPU", "top", "pod -n {namespace} -l {label_selector}")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
         assert "-l app=nginx,tier=frontend" in result[0]["v_args"]
@@ -1032,3 +1034,359 @@ class TestExtractorFramework:
         assert "baseline_data" in result
         md = result.get("target_metadata") or {}
         assert "not" not in md and 0 not in md
+
+
+# ---------------------------------------------------------------------------
+# Fix: pod-process-kill registry entry
+# ---------------------------------------------------------------------------
+
+
+class TestPodProcessKillRegistryEntry:
+    """Verify (pod, process, kill) exact match returns endpoints + pod status."""
+
+    def test_exact_match_exists(self):
+        result = _lookup_baseline_commands("pod", "process", "kill")
+        assert len(result) == 3
+        descriptions = [c.description for c in result]
+        assert "Service endpoints" in descriptions
+        assert "Pod status/restarts" in descriptions
+        assert "Pod events" in descriptions
+
+    def test_endpoints_uses_label_selector(self):
+        result = _lookup_baseline_commands("pod", "process", "kill")
+        ep_cmd = next(c for c in result if c.description == "Service endpoints")
+        assert "{label_selector}" in ep_cmd.v_args_template
+
+    def test_pod_status_uses_wide_output(self):
+        result = _lookup_baseline_commands("pod", "process", "kill")
+        status_cmd = next(c for c in result if c.description == "Pod status/restarts")
+        assert "-o wide" in status_cmd.v_args_template
+
+    def test_target_fallback_still_works_for_other_actions(self):
+        """(pod, process, <other>) should still fall back to the (pod, process) entry."""
+        result = _lookup_baseline_commands("pod", "process", "stop")
+        assert len(result) == 2
+        descriptions = [c.description for c in result]
+        assert "Pod status" in descriptions
+        assert "Pod events" in descriptions
+
+
+# ---------------------------------------------------------------------------
+# Fix: LLM retry on execution failure
+# ---------------------------------------------------------------------------
+
+
+class TestLLMRetryFailedCommands:
+    """Verify _llm_retry_failed_commands feeds errors back to LLM."""
+
+    @pytest.mark.asyncio
+    async def test_retry_sends_error_feedback(self):
+        """LLM retry prompt must contain the failed command and its error."""
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
+            {"description": "Fixed endpoints", "subcommand": "get",
+             "v_args_template": "endpoints -n {namespace} {label_selector}",
+             "mode": "simple"},
+        ])))
+
+        failed_obs = [{
+            "command": "kubectl get endpoints -n cms-demo -l -l opentelemetry.io/name=rec",
+            "exit_code": 1,
+            "stderr": "error: there is no need to specify a resource type",
+        }]
+
+        result = await _llm_retry_failed_commands(
+            mock_llm, "skill content", "pod", "process", "kill", failed_obs,
+        )
+        assert len(result) == 1
+        assert result[0].description == "Fixed endpoints"
+
+        # Verify error feedback was included in the prompt
+        call_args = mock_llm.ainvoke.call_args
+        messages = call_args[0][0]
+        human_content = messages[1].content
+        assert "FAILED" in human_content
+        assert "-l -l" in human_content
+        assert "error: there is no need" in human_content
+
+    @pytest.mark.asyncio
+    async def test_retry_returns_empty_on_llm_failure(self):
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(side_effect=RuntimeError("API error"))
+        result = await _llm_retry_failed_commands(
+            mock_llm, "skill", "pod", "process", "kill",
+            [{"command": "bad", "exit_code": 1, "stderr": "err"}],
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_retry_returns_empty_when_no_llm(self):
+        result = await _llm_retry_failed_commands(
+            None, "skill", "pod", "process", "kill",
+            [{"command": "bad", "exit_code": 1, "stderr": "err"}],
+        )
+        assert result == []
+
+    def test_max_retries_constant(self):
+        assert _LLM_BASELINE_MAX_RETRIES == 2
+
+
+class TestBaselineCaptureRetryIntegration:
+    """End-to-end: LLM commands fail → retry with error feedback → succeed."""
+
+    @pytest.mark.asyncio
+    async def test_retry_replaces_failed_with_corrected(self):
+        """When LLM commands fail execution, retry produces working commands."""
+        call_count = {"n": 0}
+
+        mock_llm = AsyncMock()
+
+        def make_response(content):
+            r = MagicMock()
+            r.content = content
+            return r
+
+        # First call: initial derivation (returns command with -l -l bug)
+        # Second call: retry derivation (returns corrected command)
+        def ainvoke_side_effect(messages):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return make_response(json.dumps([
+                    {"description": "Endpoints", "subcommand": "get",
+                     "v_args_template": "endpoints -n {namespace} {label_selector}",
+                     "mode": "simple"},
+                ]))
+            else:
+                return make_response(json.dumps([
+                    {"description": "Fixed endpoints", "subcommand": "get",
+                     "v_args_template": "endpoints -n {namespace} {label_selector}",
+                     "mode": "simple"},
+                ]))
+
+        mock_llm.ainvoke = AsyncMock(side_effect=ainvoke_side_effect)
+
+        exec_call_count = {"n": 0}
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            exec_call_count["n"] += 1
+            results = []
+            for cmd in commands:
+                if exec_call_count["n"] == 1:
+                    # First execution: fail
+                    results.append({
+                        "description": cmd["description"],
+                        "command": "kubectl get endpoints -n cms-demo -l -l ...",
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": "error: there is no need to specify a resource type",
+                    })
+                else:
+                    # Retry execution: succeed
+                    results.append({
+                        "description": cmd["description"],
+                        "command": "kubectl get endpoints -n cms-demo -l ...",
+                        "exit_code": 0,
+                        "stdout": "NAME       ENDPOINTS\nrec-svc    10.0.1.1:8080",
+                        "stderr": "",
+                    })
+            return results
+
+        node = make_baseline_capture(llm=mock_llm, registry=None)
+        state = {
+            "task_id": "test-retry",
+            "blade_scope": "pod",
+            "blade_target": "process",
+            "blade_action": "kill",
+            "skill_case_content": "some skill case content",
+            "target": {
+                "namespace": "cms-demo",
+                "names": ["rec-pod"],
+                "labels": {"opentelemetry.io/name": "recommendation"},
+            },
+            "kubeconfig": "/path/to/kubeconfig",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            new=fake_exec,
+        ):
+            result = await node(state)
+
+        assert result["baseline_data"]["source"] == "llm"
+        assert result["baseline_data"]["success_count"] == 1
+        # LLM was called twice: initial + retry
+        assert call_count["n"] == 2
+        # Execution was called twice: initial + retry
+        assert exec_call_count["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_all_succeed(self):
+        """When all LLM commands succeed, no retry is attempted."""
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
+            {"description": "Pod status", "subcommand": "get",
+             "v_args_template": "pods -n {namespace} {label_selector}",
+             "mode": "simple"},
+        ])))
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            return [{
+                "description": commands[0]["description"],
+                "command": "kubectl get pods ...",
+                "exit_code": 0,
+                "stdout": "NAME   READY   STATUS\nrec-pod   1/1   Running",
+                "stderr": "",
+            }]
+
+        node = make_baseline_capture(llm=mock_llm, registry=None)
+        state = {
+            "task_id": "test-no-retry",
+            "blade_scope": "pod",
+            "blade_target": "process",
+            "blade_action": "kill",
+            "skill_case_content": "skill case",
+            "target": {
+                "namespace": "cms-demo",
+                "names": ["rec-pod"],
+                "labels": {"app": "rec"},
+            },
+            "kubeconfig": "/path/to/kubeconfig",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            new=fake_exec,
+        ):
+            result = await node(state)
+
+        assert result["baseline_data"]["success_count"] == 1
+        # LLM called only once (no retry)
+        assert mock_llm.ainvoke.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_preserves_original_successes(self):
+        """Original successful commands are kept across retries."""
+        call_count = {"n": 0}
+
+        mock_llm = AsyncMock()
+
+        def make_response(content):
+            r = MagicMock()
+            r.content = content
+            return r
+
+        def ainvoke_side_effect(messages):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Initial: 2 commands
+                return make_response(json.dumps([
+                    {"description": "Pod status", "subcommand": "get",
+                     "v_args_template": "pods -n {namespace} {label_selector}",
+                     "mode": "simple"},
+                    {"description": "Endpoints", "subcommand": "get",
+                     "v_args_template": "endpoints -n {namespace} {label_selector}",
+                     "mode": "simple"},
+                ]))
+            else:
+                # Retry: corrected command for the failed one
+                return make_response(json.dumps([
+                    {"description": "Fixed endpoints", "subcommand": "get",
+                     "v_args_template": "endpoints -n {namespace}",
+                     "mode": "simple"},
+                ]))
+
+        mock_llm.ainvoke = AsyncMock(side_effect=ainvoke_side_effect)
+
+        exec_call_count = {"n": 0}
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            exec_call_count["n"] += 1
+            results = []
+            for cmd in commands:
+                if exec_call_count["n"] == 1:
+                    # First execution: first succeeds, second fails
+                    if "pods" in cmd.get("v_args", ""):
+                        results.append({
+                            "description": cmd["description"],
+                            "command": "kubectl get pods ...",
+                            "exit_code": 0,
+                            "stdout": "OK",
+                            "stderr": "",
+                        })
+                    else:
+                        results.append({
+                            "description": cmd["description"],
+                            "command": "kubectl get endpoints ...",
+                            "exit_code": 1,
+                            "stdout": "",
+                            "stderr": "error",
+                        })
+                else:
+                    # Retry: succeed
+                    results.append({
+                        "description": cmd["description"],
+                        "command": "kubectl get endpoints -n cms-demo",
+                        "exit_code": 0,
+                        "stdout": "ENDPOINTS OK",
+                        "stderr": "",
+                    })
+            return results
+
+        node = make_baseline_capture(llm=mock_llm, registry=None)
+        state = {
+            "task_id": "test-partial",
+            "blade_scope": "pod",
+            "blade_target": "process",
+            "blade_action": "kill",
+            "skill_case_content": "skill case",
+            "target": {
+                "namespace": "cms-demo",
+                "names": ["rec-pod"],
+                "labels": {"app": "rec"},
+            },
+            "kubeconfig": "/path/to/kubeconfig",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            new=fake_exec,
+        ):
+            result = await node(state)
+
+        # Original success (1) + retry success (1) = 2
+        assert result["baseline_data"]["success_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_no_retry_for_registry_source(self):
+        """Retry only applies to LLM source, not registry."""
+        exec_call_count = {"n": 0}
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            exec_call_count["n"] += 1
+            return [{
+                "description": commands[0]["description"],
+                "command": "kubectl ...",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "error",
+            }]
+
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "task_id": "test-no-retry-registry",
+            "blade_scope": "pod",
+            "blade_target": "process",
+            "blade_action": "kill",
+            "target": {
+                "namespace": "cms-demo",
+                "names": ["rec-pod"],
+                "labels": {"app": "rec"},
+            },
+            "kubeconfig": "/path/to/kubeconfig",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            new=fake_exec,
+        ):
+            result = await node(state)
+
+        assert result["baseline_data"]["source"] == "registry"
+        # Only one execution call — no retry for registry
+        assert exec_call_count["n"] == 1

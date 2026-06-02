@@ -62,11 +62,12 @@ class TestInjectGraphFlow:
         # Step 4: safety_check
         result = await safety_check(state)
         state.update(result)
-        assert state["safety_status"] == "safe"
+        # No kubeconfig in test → conflict check skipped → warning
+        assert state["safety_status"] == "warning"
 
-        # Step 5: Route after safety → baseline_capture (all modes share baseline_capture)
+        # Step 5: Route after safety → confirmation_gate (warning needs confirmation)
         route = route_after_safety(state)
-        assert route == "baseline_capture"
+        assert route == "confirmation_gate"
 
         # Step 6: baseline_capture (shared across all modes)
         # In this test we skip actual baseline_capture execution (it requires kubectl access).
@@ -119,6 +120,14 @@ class TestInjectGraphFlow:
         monkeypatch.setattr(al_mod, "MAX_AGENT_LOOP", 10)
 
         state = sample_agent_state.copy()
+        # Override fault_spec to target the blacklisted namespace —
+        # the fixture's default spec is in "default" namespace which
+        # would pass the blacklist check.
+        from chaos_agent.agent.fault_spec import FaultSpec
+        state["fault_spec"] = FaultSpec.from_cli_structured({
+            "scope": "pod", "target": "kill", "action": "delete",
+            "namespace": "kube-system", "target_name": "coredns",
+        }).to_dict()
         state["target"] = {"namespace": "kube-system", "names": ["coredns"]}
         state["plan"] = "Inject fault into kube-system"
         state["skill_name"] = "pod-delete"
@@ -161,12 +170,12 @@ class TestInjectGraphFlow:
         state["skill_name"] = "pod-delete"
         state["needs_confirmation"] = True
 
-        # safety_check passes
+        # safety_check: no kubeconfig → conflict check skipped → warning
         result = await safety_check(state)
         state.update(result)
-        assert state["safety_status"] == "safe"
+        assert state["safety_status"] == "warning"
 
-        # Route after safety → confirmation_gate (because needs_confirmation=True)
+        # Route after safety → confirmation_gate (warning + needs_confirmation)
         route = route_after_safety(state)
         assert route == "confirmation_gate"
 

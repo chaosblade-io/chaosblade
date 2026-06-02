@@ -55,11 +55,11 @@ class TestReject:
         result = await reject(state)
         assert "result" in result
         assert "error" in result
-        assert "failure_reason" in result
+        assert "failure_detail" in result
         assert set(result["result"].keys()) == {"status", "reason"}
-        assert set(result.keys()) == {"result", "error", "finished_at", "failure_reason"}
-        # failure_reason should contain a categorized reason
-        assert result["failure_reason"].startswith("safety_rejected:")
+        assert set(result.keys()) == {"result", "error", "finished_at", "failure_detail"}
+        # failure_detail should contain a categorized reason
+        assert result["failure_detail"]["category"] == "safety_rejected"
 
     @pytest.mark.asyncio
     async def test_user_rejected_message(self):

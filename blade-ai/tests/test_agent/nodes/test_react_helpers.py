@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from chaos_agent.agent.nodes.react_helpers import (
+    detect_action_stagnation,
     emit_debug_tool_messages,
     extract_persistent_hm,
     extract_synthetic_messages,
@@ -437,3 +438,315 @@ class TestEmitDebugToolMessages:
         emit_debug_tool_messages(tracker, state)
 
         assert tracker._emitted_tool_ids == {"tm_1"}
+
+
+# ---------------------------------------------------------------------------
+# detect_action_stagnation
+# ---------------------------------------------------------------------------
+
+class TestDetectActionStagnation:
+    def test_no_stagnation_below_threshold(self):
+        messages = [
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {"subcommand": "get"}, "id": f"tc_{i}"}])
+            for i in range(4)
+        ]
+        hint, tool = detect_action_stagnation(messages, threshold=5)
+        assert hint is None
+        assert tool is None
+
+    def test_stagnation_at_threshold(self):
+        messages = [
+            AIMessage(content="", tool_calls=[{"name": "save_fault_plan", "args": {"plan_content": f"v{i}"}, "id": f"tc_{i}"}])
+            for i in range(6)
+        ]
+        hint, tool = detect_action_stagnation(messages, threshold=5)
+        assert hint is not None
+        assert tool == "save_fault_plan"
+        assert "ACTION_STAGNATION" in hint
+
+    def test_different_tools_no_stagnation(self):
+        messages = [
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {}, "id": "tc_1"}]),
+            AIMessage(content="", tool_calls=[{"name": "activate_skill", "args": {}, "id": "tc_2"}]),
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {}, "id": "tc_3"}]),
+        ]
+        hint, tool = detect_action_stagnation(messages, threshold=2)
+        assert hint is None
+
+    def test_pure_text_breaks_streak(self):
+        messages = [
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {}, "id": "tc_1"}]),
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {}, "id": "tc_2"}]),
+            AIMessage(content="thinking...", tool_calls=[]),
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {}, "id": "tc_3"}]),
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {}, "id": "tc_4"}]),
+        ]
+        hint, tool = detect_action_stagnation(messages, threshold=3)
+        assert hint is None
+
+    def test_multi_tool_call_breaks_streak(self):
+        messages = [
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {}, "id": "tc_1"}]),
+            AIMessage(content="", tool_calls=[
+                {"name": "kubectl", "args": {}, "id": "tc_2"},
+                {"name": "activate_skill", "args": {}, "id": "tc_3"},
+            ]),
+            AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {}, "id": "tc_4"}]),
+        ]
+        hint, tool = detect_action_stagnation(messages, threshold=2)
+        assert hint is None
+
+
+# ---------------------------------------------------------------------------
+# Tool error introspection (runtime feedback > static docs)
+# ---------------------------------------------------------------------------
+
+from chaos_agent.agent.nodes.react_helpers import (
+    _should_trigger_introspection,
+    suggest_verify_command,
+    detect_tool_error_hint,
+    extract_rejected_params,
+)
+from chaos_agent.errors import ErrorClass
+
+
+class TestShouldTriggerIntrospection:
+    def test_interface_mismatch_triggers(self):
+        assert _should_trigger_introspection(ErrorClass.INTERFACE_MISMATCH) is True
+
+    def test_user_config_triggers(self):
+        assert _should_trigger_introspection(ErrorClass.USER_CONFIG) is True
+
+    def test_unknown_triggers(self):
+        assert _should_trigger_introspection(ErrorClass.UNKNOWN) is True
+
+    def test_transient_does_not_trigger(self):
+        assert _should_trigger_introspection(ErrorClass.INFRA_TRANSIENT) is False
+
+    def test_persistent_does_not_trigger(self):
+        assert _should_trigger_introspection(ErrorClass.INFRA_PERSISTENT) is False
+
+    def test_auth_denied_does_not_trigger(self):
+        assert _should_trigger_introspection(ErrorClass.AUTH_DENIED) is False
+
+    def test_target_gone_does_not_trigger(self):
+        assert _should_trigger_introspection(ErrorClass.TARGET_GONE) is False
+
+    def test_quota_exceeded_does_not_trigger(self):
+        assert _should_trigger_introspection(ErrorClass.QUOTA_EXCEEDED) is False
+
+
+class TestExtractRejectedParams:
+    def test_unknown_flag(self):
+        assert extract_rejected_params("unknown flag: --percent") == ["--percent"]
+
+    def test_unknown_shorthand(self):
+        assert extract_rejected_params("unknown shorthand flag: '-p' in -p") == ["-p"]
+
+    def test_flag_provided_but_not_defined(self):
+        r = extract_rejected_params("flag provided but not defined: --foo")
+        assert "--foo" in r
+
+    def test_invalid_option_posix(self):
+        r = extract_rejected_params("invalid option: --bar")
+        assert "bar" in r
+
+    def test_argparse_unrecognized(self):
+        r = extract_rejected_params("unrecognized arguments: --baz")
+        assert "--baz" in r
+
+    def test_generic_unsupported_parameter(self):
+        r = extract_rejected_params("unsupported parameter: --qux")
+        assert "--qux" in r
+
+    def test_empty_input(self):
+        assert extract_rejected_params("") == []
+
+    def test_no_match(self):
+        assert extract_rejected_params("some random error") == []
+
+    def test_dedup_within_single_message(self):
+        r = extract_rejected_params(
+            "unknown flag: --foo and also unknown flag: --foo"
+        )
+        assert r == ["--foo"]
+
+    def test_strips_trailing_punctuation(self):
+        assert extract_rejected_params("unknown flag: --percent.") == ["--percent"]
+        assert extract_rejected_params("unknown flag: --foo,") == ["--foo"]
+        assert extract_rejected_params("unknown flag: --bar;") == ["--bar"]
+        assert extract_rejected_params("unknown flag: --baz)") == ["--baz"]
+
+
+class TestSuggestVerifyCommand:
+    def test_blade_tool(self):
+        s = suggest_verify_command("blade_create")
+        assert "blade" in s
+        assert "-h" in s
+
+    def test_kubectl_tool(self):
+        s = suggest_verify_command("kubectl")
+        assert "kubectl" in s
+        assert "--help" in s
+
+    def test_kubectl_ro(self):
+        s = suggest_verify_command("kubectl_ro")
+        assert "kubectl" in s
+
+    def test_unknown_tool_generic(self):
+        s = suggest_verify_command("some_new_tool")
+        assert "some_new_tool" in s
+        assert "error message" in s
+
+
+class TestDetectToolErrorHint:
+    def test_blade_unknown_flag(self):
+        msgs = [
+            ToolMessage(
+                content="Error: unknown flag: --percent",
+                name="blade_create",
+                tool_call_id="tc1",
+            )
+        ]
+        hint = detect_tool_error_hint(msgs)
+        assert hint is not None
+        assert "TOOL ERROR" in hint
+        assert "`--percent`" in hint
+        assert "blade" in hint
+
+    def test_blade_generic_error(self):
+        msgs = [
+            ToolMessage(
+                content="Error: blade create failed (exit 1): invalid argument",
+                name="blade_create",
+                tool_call_id="tc1",
+            )
+        ]
+        hint = detect_tool_error_hint(msgs)
+        assert hint is not None
+        assert "TOOL ERROR" in hint
+
+    def test_kubectl_error(self):
+        msgs = [
+            ToolMessage(
+                content="Error: invalid option: --foo",
+                name="kubectl",
+                tool_call_id="tc1",
+            )
+        ]
+        hint = detect_tool_error_hint(msgs)
+        assert hint is not None
+        assert "kubectl" in hint
+
+    def test_unknown_tool(self):
+        msgs = [
+            ToolMessage(
+                content="Error: validation error: bad input",
+                name="some_new_tool",
+                tool_call_id="tc1",
+            )
+        ]
+        hint = detect_tool_error_hint(msgs)
+        assert hint is not None
+        assert "some_new_tool" in hint
+
+    def test_skips_transient(self):
+        msgs = [
+            ToolMessage(
+                content="Error: connection refused",
+                name="blade_create",
+                tool_call_id="tc1",
+            )
+        ]
+        hint = detect_tool_error_hint(msgs)
+        assert hint is None
+
+    def test_skips_non_error_content(self):
+        msgs = [
+            ToolMessage(
+                content='{"success": true, "result": "uid-123"}',
+                name="blade_create",
+                tool_call_id="tc1",
+            )
+        ]
+        hint = detect_tool_error_hint(msgs)
+        assert hint is None
+
+    def test_dedup_same_tool_error(self):
+        msgs = [
+            ToolMessage(
+                content="Error: unknown flag: --percent",
+                name="blade_create",
+                tool_call_id="tc1",
+            ),
+            HumanMessage(
+                content="**TOOL ERROR — VERIFY BEFORE RETRY**: `blade_create` returned an error."
+            ),
+            ToolMessage(
+                content="Error: unknown flag: --percent",
+                name="blade_create",
+                tool_call_id="tc2",
+            ),
+        ]
+        hint = detect_tool_error_hint(msgs)
+        assert hint is None
+
+    def test_dedup_allows_different_tool(self):
+        msgs = [
+            ToolMessage(
+                content="Error: unknown flag: --percent",
+                name="blade_create",
+                tool_call_id="tc1",
+            ),
+            HumanMessage(
+                content="**TOOL ERROR — VERIFY BEFORE RETRY**: `blade_create` returned an error."
+            ),
+            ToolMessage(
+                content="Error: unknown flag: --foo",
+                name="kubectl",
+                tool_call_id="tc2",
+            ),
+        ]
+        hint = detect_tool_error_hint(msgs)
+        assert hint is not None
+        assert "kubectl" in hint
+
+
+class TestClassifyErrorInterfaceMismatch:
+    def test_unknown_flag(self):
+        from chaos_agent.errors import classify_error
+        r = classify_error("Error: unknown flag: --percent")
+        assert r.error_class == ErrorClass.INTERFACE_MISMATCH
+
+    def test_unknown_command(self):
+        from chaos_agent.errors import classify_error
+        r = classify_error('Error: unknown command "loss"')
+        assert r.error_class == ErrorClass.INTERFACE_MISMATCH
+
+    def test_unknown_shorthand(self):
+        from chaos_agent.errors import classify_error
+        r = classify_error("unknown shorthand flag: '-p' in -p")
+        assert r.error_class == ErrorClass.INTERFACE_MISMATCH
+
+    def test_flag_not_defined(self):
+        from chaos_agent.errors import classify_error
+        r = classify_error("flag provided but not defined: --bar")
+        assert r.error_class == ErrorClass.INTERFACE_MISMATCH
+
+    def test_invalid_parameter_still_user_config(self):
+        from chaos_agent.errors import classify_error
+        r = classify_error("invalid parameter: bad value")
+        assert r.error_class == ErrorClass.USER_CONFIG
+
+    def test_invalid_argument_still_user_config(self):
+        from chaos_agent.errors import classify_error
+        r = classify_error("invalid argument: --mem-size 0")
+        assert r.error_class == ErrorClass.USER_CONFIG
+
+
+class TestStrategyHintsBlade:
+    def test_blade_create_includes_verify(self):
+        from chaos_agent.agent.nodes.react_helpers import _build_strategy_hints
+        hint = _build_strategy_hints("blade_create")
+        assert "-h" in hint or "--help" in hint
+        assert "Runtime" in hint or "runtime" in hint

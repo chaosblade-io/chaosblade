@@ -147,7 +147,7 @@ class Settings(BaseSettings):
     api_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"  # BLADE_AI_API_BASE_URL
     # LLM retry budget. 1 (down from 3) keeps the UX honest: a single
     # silent retry covers a transient network blip; more retries just
-    # delay the visible error by ``N × timeout_llm`` seconds while the
+    # delay the visible error by ``N × llm_read_timeout`` seconds while the
     # user stares at a spinner. The actual transient error is also
     # surfaced via the ``on_llm_error`` tracing callback so the user
     # sees the retry happening even before it resolves.
@@ -169,6 +169,9 @@ class Settings(BaseSettings):
     # Skill配置
     skills_dir: Path = Path("~/.blade-ai/skills")  # BLADE_AI_SKILLS_DIR，运行时通过 get_skills_dir() 动态解析
     disabled_skills: list[str] = []                # BLADE_AI_DISABLED_SKILLS，被用户主动禁用的技能（保留文件但加载时跳过）
+
+    # ChaosBlade vendor 目录（pip install 用户的运行时安装目标）
+    chaosblade_vendor_dir: Path = Path("~/.blade-ai/vendor")  # BLADE_AI_CHAOSBLADE_VENDOR_DIR
 
     # 确认开关
     confirmation_required: bool = True        # BLADE_AI_CONFIRMATION_REQUIRED
@@ -211,14 +214,20 @@ class Settings(BaseSettings):
     # 分工具超时配置(秒)
     timeout_blade: int = 30                  # BLADE_AI_TIMEOUT_BLADE
     timeout_kubectl: int = 30                # BLADE_AI_TIMEOUT_KUBECTL
-    timeout_kubectl_exec: int = 60           # BLADE_AI_TIMEOUT_KUBECTL_EXEC
-    # LLM single-call timeout. 30s (down from 180) — a healthy LLM
-    # call typically returns in well under 10s; anything past 30s is
-    # almost certainly a connectivity / DNS / firewall issue rather
-    # than slow inference. Combined with ``llm_max_retries=1``, the
-    # absolute worst case before the user sees a clear error is
-    # ~60s instead of ~9 minutes.
-    timeout_llm: int = 30                    # BLADE_AI_TIMEOUT_LLM
+    timeout_kubectl_exec: int = 180          # BLADE_AI_TIMEOUT_KUBECTL_EXEC
+    # LLM timeout split into connect vs read (httpx.Timeout semantics).
+    # ``llm_connect_timeout`` bounds TCP/TLS connection establishment —
+    # short (10s) so a misconfigured base URL / DNS / firewall surfaces a
+    # clear error fast. ``llm_read_timeout`` bounds how long we wait for
+    # the model's response (time-to-first-token + between-chunk gaps when
+    # streaming, or whole-body wait when non-streaming) — generous (180s)
+    # because thinking models (Qwen enable_thinking) can take well over
+    # 30s to produce their reasoning on complex ReAct prompts. A single
+    # scalar would have to choose one number for both, forcing either slow
+    # connect-failure or premature read-timeout; splitting them avoids that.
+    llm_connect_timeout: int = 10            # BLADE_AI_LLM_CONNECT_TIMEOUT
+    llm_read_timeout: int = 600              # BLADE_AI_LLM_READ_TIMEOUT
+    timeout_baseline_llm: int = 600            # BLADE_AI_TIMEOUT_BASELINE_LLM，baseline LLM 策略总超时
     timeout_default: int = 60                # BLADE_AI_TIMEOUT_DEFAULT
     timeout_skill_script: int = 60           # BLADE_AI_TIMEOUT_SKILL_SCRIPT，skill 脚本执行超时
 
@@ -374,7 +383,7 @@ class Settings(BaseSettings):
     # 是否允许 _execute_skill_script 工具（默认 False = 禁用）。脚本
     # 内容对 classifier 不透明，开启等同于给 execute_loop 一个无法
     # 审计的 escape hatch；只有信任 skill 来源的运营场景才打开。
-    skill_script_default_allow: bool = False  # BLADE_AI_SKILL_SCRIPT_DEFAULT_ALLOW
+    skill_script_default_allow: bool = True  # BLADE_AI_SKILL_SCRIPT_DEFAULT_ALLOW
 
     # Phase 1 (planning) screener enforcement (default True). When True,
     # any tool_call classified as non-readonly is rejected at the

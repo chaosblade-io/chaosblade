@@ -57,7 +57,8 @@ _INT_KEYS = {
     "timeout_blade",
     "timeout_kubectl",
     "timeout_kubectl_exec",
-    "timeout_llm",
+    "llm_connect_timeout",
+    "llm_read_timeout",
     "timeout_default",
     "timeout_skill_script",
 }
@@ -99,6 +100,10 @@ _COLD_KEYS = frozenset({
     "llm_temperature",
     "llm_enable_thinking",
     "verifier_json_mode",
+    # LLM timeout (httpx.Timeout) is baked into the ChatOpenAI client at
+    # make_llm() time, so changing it needs a restart like the others.
+    "llm_connect_timeout",
+    "llm_read_timeout",
 })
 
 

@@ -11,7 +11,14 @@
 
 **演练步骤**：
 1. 记录应用 A 当前的探针配置
-2. 修改应用 A 的 Deployment，添加或修改 startupProbe 使其窗口不足以覆盖应用启动时间：
+2. 记录 Deployment 当前 maxUnavailable 值，并临时设为 100%（确保滚动更新能完成，故障注入的新 Pod 不会 Ready，默认策略下 K8s 不会终止旧 Pod，导致滚动更新死锁）：
+   ```bash
+   kubectl get deployment <deployment-name> -n <namespace> \
+     -o jsonpath='{.spec.strategy.rollingUpdate.maxUnavailable}'
+   kubectl patch deployment <deployment-name> -n <namespace> --type='json' \
+     -p='[{"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":"100%"}]'
+   ```
+3. 修改应用 A 的 Deployment，添加或修改 startupProbe 使其窗口不足以覆盖应用启动时间：
    ```yaml
    startupProbe:
      httpGet:
@@ -21,20 +28,19 @@
      periodSeconds: 5
    ```
    （总等待时间 = failureThreshold × periodSeconds = 15 秒，远小于应用实际启动时间）
-3. 同时确保 livenessProbe 存在，使得 startupProbe 失败后触发容器重启
-4. 触发 Pod 重建（如 rollout restart）
-5. 观察 Pod 启动行为
+4. 同时确保 livenessProbe 存在，使得 startupProbe 失败后触发容器重启
+5. 等待 Pod 滚动更新完成，确认所有旧 Pod 已被替换
+6. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段）
+7. 观察 Pod 启动行为
 
 **注入验证**：
-1. 执行 `kubectl get pods`，确认 Pod RESTARTS 持续增长，状态为 CrashLoopBackOff
-2. 执行 `kubectl describe pod <pod-name>`，确认 Events 显示 `Startup probe failed`
-3. 查看容器日志，确认应用正在启动但未完成初始化就被杀
+1. 执行 `kubectl rollout status deployment <deployment-name>`，确认滚动更新已完成（所有旧 Pod 已被替换）。如果滚动更新未完成（卡死），则故障未完全生效，不可判定为 verified
+2. 执行 `kubectl get pods`，确认**所有**目标 Pod 的 RESTARTS 持续增长，状态为 CrashLoopBackOff（不是仅一个新 Pod，而是全部副本）
+3. 执行 `kubectl describe pod <pod-name>`，确认 Events 显示 `Startup probe failed`
+4. 查看容器日志，确认应用正在启动但未完成初始化就被杀
 
 **注入恢复**：
-1. 恢复应用 A 的 Deployment，增大 startupProbe 的窗口时间：
-   - 增大 failureThreshold（如 30）
-   - 或增大 periodSeconds（如 10）
-   - 确保 failureThreshold × periodSeconds > 应用实际启动时间
+1. 恢复应用 A 的 Deployment，增大 startupProbe 的窗口时间（若原本无 startupProbe，则移除）
 2. 等待 Pod 滚动更新完成
 
 **恢复验证**：

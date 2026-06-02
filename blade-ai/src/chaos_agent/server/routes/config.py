@@ -56,7 +56,8 @@ _WRITABLE_KEYS: frozenset[str] = frozenset(
         "timeout_blade",
         "timeout_kubectl",
         "timeout_kubectl_exec",
-        "timeout_llm",
+        "llm_connect_timeout",
+        "llm_read_timeout",
         "timeout_default",
         # Loop / recursion budgets.
         "max_agent_loop",

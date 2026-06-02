@@ -26,10 +26,14 @@ class TestResolveKubeconfig:
 
     def test_params_kubeconfig_second_priority(self):
         from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
+        from chaos_agent.agent.fault_spec import FaultSpec
 
+        # Now params live on FaultSpec, not state.params — the fallback
+        # path checks spec.params.kubeconfig.
+        spec = FaultSpec(params={"kubeconfig": "/path/from/params"})
         state = {
             "kubeconfig": "",
-            "params": {"kubeconfig": "/path/from/params"},
+            "fault_spec": spec.to_dict(),
         }
         assert _resolve_kubeconfig(state) == "/path/from/params"
 

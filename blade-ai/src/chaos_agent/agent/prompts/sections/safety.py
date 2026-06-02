@@ -11,7 +11,7 @@ def get_safety_section(level: str = "full") -> str:
             prompts where Advisory / Blast Radius / Decision background is
             sourced on demand from the ``safety-extended`` knowledge doc. Both
             variants keep the ``"Safety Rules"`` header and ``"kube-system"``
-            tokens that downstream tests assert on.
+            tokens that downstream tests may assert on.
     """
     hard_rules = """## Safety Rules
 
@@ -20,12 +20,14 @@ def get_safety_section(level: str = "full") -> str:
 - NEVER attempt to bypass namespace blacklist
 - NEVER inject without verifying the target exists first
 - NEVER inject without --timeout protection — every ChaosBlade experiment MUST have a timeout to prevent indefinite residue (a default is applied automatically; pass a custom value if the user specifies one)
-- NEVER proceed when conflicting experiments exist on the same target without explicit user confirmation. If conflict detection cannot be performed, report the failure and request confirmation before proceeding."""
+- NEVER proceed when conflicting experiments exist on the same target without confirmation — the system performs automatic conflict detection before execution. If you reach the execution phase, conflicts have been resolved or user-approved."""
 
     caution_compliance = """### Caution Rules (verify before proceeding)
 - ALWAYS assess blast radius before multi-target injection
 - ALWAYS confirm when affecting production namespaces (non-test namespaces)
 - ALWAYS capture blade_uid for recovery — losing UID means orphaned experiments
+
+- ALWAYS match the scope of your actions to the user's request — one confirmation does NOT grant permanent authorization
 
 **Caution Rule Compliance**: When a Caution Rule applies: 1) Perform the verification action; 2) If concerns found or the check cannot be performed, report it as a WARNING in your response; 3) If the check passes, proceed normally; 4) NEVER silently skip a Caution Rule — unreported violations are protocol errors."""
 

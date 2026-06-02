@@ -6,6 +6,7 @@ import shlex
 
 from langchain_core.messages import HumanMessage, ToolMessage
 
+from chaos_agent.agent.node_names import DIRECT_EXECUTE
 from chaos_agent.agent.nodes._injection_detection import discover_tool_pods
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
@@ -51,6 +52,58 @@ def _disk_fill_warning(params: dict) -> str | None:
 _PARAM_OBSERVABILITY_WARNINGS: dict[tuple[str, str], callable] = {
     ("disk", "fill"): _disk_fill_warning,
 }
+
+# ---------------------------------------------------------------------------
+# Required-flag auto-completion: ensure critical flags are present for
+# each scope+target+action combination. Without these, blade may report
+# "Success" but produce no observable effect (e.g., mem load without
+# --mode ram, or node-mem without --include-buffer-cache).
+#
+# This is the DETERMINISTIC safety net — it does NOT depend on LLM or
+# prompt quality. If a flag is missing, it's added with a known-good
+# default. If already present, it's left unchanged.
+# ---------------------------------------------------------------------------
+
+# (scope, target, action) → {param: default, ...} + [bare_flags]
+_REQUIRED_PARAMS: dict[tuple[str, str, str], tuple[dict[str, str], list[str]]] = {
+    # mem load: --mode ram is essential (without it, mem-burn may not allocate
+    # physical RAM, showing no effect in kubectl top)
+    ("pod", "mem", "load"):       ({"mode": "ram"}, []),
+    ("node", "mem", "load"):      ({"mode": "ram"}, ["include-buffer-cache", "avoid-being-killed"]),
+    ("container", "mem", "load"): ({"mode": "ram"}, []),
+    # disk burn: --read and/or --write must be set (without them, no IO is generated)
+    ("pod", "disk", "burn"):      ({}, ["read", "write"]),
+    ("node", "disk", "burn"):     ({}, ["read", "write"]),
+}
+
+
+def _auto_complete_params(
+    scope: str, target: str, action: str,
+    params: dict, params_flags: list,
+) -> list[str]:
+    """Auto-add known-required flags if missing. Mutates params/params_flags in place.
+
+    Returns list of what was added (for logging). Empty if nothing needed.
+    """
+    key = (scope, target, action)
+    if key not in _REQUIRED_PARAMS:
+        return []
+
+    required_kv, required_bare = _REQUIRED_PARAMS[key]
+    added = []
+
+    for k, default in required_kv.items():
+        if k not in params:
+            params[k] = default
+            added.append(f"{k}={default}")
+
+    for flag in required_bare:
+        if flag not in params_flags:
+            params_flags.append(flag)
+            added.append(f"--{flag}")
+
+    return added
+
 
 # ---------------------------------------------------------------------------
 # Burn parameter auto-boost: widens the effect window for transient disk I/O
@@ -929,6 +982,17 @@ async def direct_execute(state: AgentState) -> dict:
             f"for {scope}-{target}-{action}"
         )
 
+    # ── Required-flag auto-completion ──────────────────────────────────
+    # Deterministic safety net: auto-add flags that are known-required
+    # for certain scope+target+action combinations to produce the
+    # intended effect. Same pattern as ensure_min_duration for --timeout.
+    _completions = _auto_complete_params(scope, target, action, params, params_flags)
+    if _completions:
+        logger.info(
+            "Auto-completed params for %s-%s %s: %s",
+            scope, target, action, _completions,
+        )
+
     # Burn parameter auto-boost: widen the effect window for transient disk I/O
     if target == "disk" and action == "burn":
         original_params = params.copy()
@@ -981,7 +1045,7 @@ async def direct_execute(state: AgentState) -> dict:
                     f"pod_memory_usage={_usage_mb or 'unknown'}MB, "
                     f"size={params.get('size', 'auto')}MB"
                 )
-                _session_store.append_messages(_task_id_local, [HumanMessage(content=_p0_msg)])
+                _session_store.append_messages(_task_id_local, [HumanMessage(content=_p0_msg)], node_name=DIRECT_EXECUTE)
             if settings.is_debug and tracker:
                 tracker.update(
                     (f"[FCAT P0] ceiling={fcat_size_ceiling}MB, "
@@ -1002,7 +1066,7 @@ async def direct_execute(state: AgentState) -> dict:
                     f"[FCAT P0] Burn params auto-boosted (no FCAT ceiling): "
                     f"size={params.get('size')}MB"
                 )
-                _session_store.append_messages(_task_id_local, [HumanMessage(content=_boost_msg)])
+                _session_store.append_messages(_task_id_local, [HumanMessage(content=_boost_msg)], node_name=DIRECT_EXECUTE)
             if settings.is_debug and tracker:
                 tracker.update(
                     f"[FCAT P0] Burn params auto-boosted (no FCAT ceiling): size={params.get('size')}MB"[:200],
@@ -1067,6 +1131,7 @@ async def direct_execute(state: AgentState) -> dict:
                 _session_store.append_messages(
                     _task_id_local,
                     [HumanMessage(content=_mem_msg)],
+                    node_name=DIRECT_EXECUTE,
                 )
 
     args = build_blade_create_args(
@@ -1264,7 +1329,7 @@ async def direct_execute(state: AgentState) -> dict:
             tracker.complete(
                 f"Direct execute done via kubectl exec fallback: blade_uid={blade_uid}"
             )
-            sync_node_status_to_session(state, "direct_execute",
+            sync_node_status_to_session(state, DIRECT_EXECUTE,
                 f"Injection completed via kubectl exec fallback, blade_uid={blade_uid}",
                 detail={"blade_uid": blade_uid, "injection_method": "kubectl_exec",
                         "fallback_used": True})
@@ -1309,7 +1374,7 @@ async def direct_execute(state: AgentState) -> dict:
                 if _snap_store and _snap_tid:
                     _snap_store.append_messages(_snap_tid, [HumanMessage(
                         content=f"[FCAT P0] Evidence snapshot captured ({len(snapshot_data)} commands): {_snap_summary}"
-                    )])
+                    )], node_name=DIRECT_EXECUTE)
                 if settings.is_debug and tracker:
                     tracker.update(
                         f"[FCAT P0] Evidence snapshot captured ({len(snapshot_data)} cmds): {_snap_summary}"[:200],
@@ -1320,7 +1385,7 @@ async def direct_execute(state: AgentState) -> dict:
             _session_store = get_global_session_store()
             _task_id_local = state.get("task_id", "")
             if _session_store and _task_id_local:
-                _session_store.append_messages(_task_id_local, result["messages"])
+                _session_store.append_messages(_task_id_local, result["messages"], node_name=DIRECT_EXECUTE)
             # Post-injection effect check: programmatic fill file verification
             # for disk-fill faults (bridges CRD Success ↔ filesystem reality gap)
             disk_fill_check = await _verify_disk_fill_effect(
@@ -1366,7 +1431,7 @@ async def direct_execute(state: AgentState) -> dict:
             ],
         }
         tracker.fail(f"blade_create failed: {error_msg[:200]}")
-        sync_node_status_to_session(state, "direct_execute",
+        sync_node_status_to_session(state, DIRECT_EXECUTE,
             f"Injection failed: {error_msg[:200]}",
             detail={"injection_method": "host_blade", "fallback_used": False,
                     "safety_status": "rejected", "reason": "blade_create_failed"})
@@ -1375,7 +1440,7 @@ async def direct_execute(state: AgentState) -> dict:
         _session_store = get_global_session_store()
         _task_id_local = state.get("task_id", "")
         if _session_store and _task_id_local:
-            _session_store.append_messages(_task_id_local, result["messages"])
+            _session_store.append_messages(_task_id_local, result["messages"], node_name=DIRECT_EXECUTE)
         return result
 
     result = {
@@ -1423,7 +1488,7 @@ async def direct_execute(state: AgentState) -> dict:
             )
 
     tracker.complete(f"Direct execute done: blade_uid={blade_uid}")
-    sync_node_status_to_session(state, "direct_execute",
+    sync_node_status_to_session(state, DIRECT_EXECUTE,
         f"Injection completed, blade_uid={blade_uid}",
         detail={"blade_uid": blade_uid, "injection_method": "host_blade",
                 "fallback_used": False})
@@ -1432,7 +1497,7 @@ async def direct_execute(state: AgentState) -> dict:
     _session_store = get_global_session_store()
     _task_id_local = state.get("task_id", "")
     if _session_store and _task_id_local:
-        _session_store.append_messages(_task_id_local, result["messages"])
+        _session_store.append_messages(_task_id_local, result["messages"], node_name=DIRECT_EXECUTE)
     # Post-injection effect check: programmatic fill file verification
     disk_fill_check = await _verify_disk_fill_effect(
         scope, target, action, names, kubeconfig, params, blade_uid, task_id,

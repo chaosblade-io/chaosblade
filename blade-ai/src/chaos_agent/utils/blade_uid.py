@@ -110,17 +110,30 @@ def _strategy_json_aware(text: str):
                 if isinstance(result, dict):
                     uid = result.get("uid")
                     if isinstance(uid, str) and uid:
-                        if data.get("success") is False:
+                        error_msg = (data.get("error") or "").lower()
+                        # Distinguish "still initializing" from "truly failed":
+                        # - "unexpected status ... Initialized, please wait"
+                        #   → CRD accepted, operator still bootstrapping.
+                        #   The experiment MAY succeed; extract uid so the
+                        #   verifier can check status later.
+                        # - "command not found" / "exec failed" / other
+                        #   → injection process actually failed; ignore uid.
+                        _is_initializing = (
+                            "please wait" in error_msg
+                            or "initialized" in error_msg
+                        )
+                        if data.get("success") is False and not _is_initializing:
                             logger.info(
-                                "blade_uid extraction: 54000 + success=false, "
-                                "treating as failed injection (uid=%s ignored)",
+                                "blade_uid extraction: 54000 + success=false + "
+                                "terminal error, treating as failed (uid=%s ignored)",
                                 uid,
                             )
                             saw_failed_54000 = True
                         else:
-                            logger.debug(
-                                "blade_uid extraction: 54000 + success=%s, "
-                                "extracted uid=%s", data.get("success"), uid,
+                            logger.info(
+                                "blade_uid extraction: 54000, extracted uid=%s "
+                                "(initializing=%s)",
+                                uid, _is_initializing,
                             )
                             return uid
 

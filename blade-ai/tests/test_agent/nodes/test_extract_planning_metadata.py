@@ -13,6 +13,7 @@ from chaos_agent.agent.nodes.extract_planning_metadata import (
     _extract_skill_case_from_messages,
     _derive_scope_target_action,
     _derive_scope_from_resource_path,
+    _has_browsed_catalogue,
     extract_planning_metadata,
 )
 from chaos_agent.agent.state import AgentState
@@ -152,14 +153,18 @@ class TestExtractSkillCaseFromMessages:
         result = _extract_skill_case_from_messages(messages)
         assert result == ""
 
-    def test_prefers_last_use_case_when_multiple(self):
-        """When multiple use-case ToolMessages exist, take the last one."""
+    def test_prefers_first_use_case_when_multiple_no_disambiguation(self):
+        """When multiple use-case ToolMessages exist without plan/AI references, take the first one.
+
+        The LLM typically reads the primary case first, then alternatives
+        for comparison. Without disambiguation signals, first-read wins.
+        """
         messages = [
             _make_tool_msg_read_skill(SAMPLE_SKILL_CASE, tool_call_id="tc_1"),
             _make_tool_msg_read_skill(SAMPLE_SKILL_CASE_NODE_CPU, tool_call_id="tc_2"),
         ]
         result = _extract_skill_case_from_messages(messages)
-        assert result == SAMPLE_SKILL_CASE_NODE_CPU
+        assert result == SAMPLE_SKILL_CASE
 
     def test_skips_use_case_without_markers(self):
         """ToolMessage without use-case markers (故障现象/注入验证/恢复验证) is skipped."""
@@ -295,7 +300,13 @@ class TestExtractPlanningMetadataNode:
 
     @pytest.mark.asyncio
     async def test_nl_mode_full_extraction(self):
-        """NL mode: all fields extracted from messages."""
+        """NL mode: skill_case_content extracted from messages.
+
+        Note: blade_scope/blade_target/blade_action derivation moved
+        out of this node when FaultSpec became the single source of
+        truth — those fields are now written by intent_clarification
+        from submit_fault_intent's args.
+        """
         state = AgentState(
             task_id="test-task",
             messages=[
@@ -312,9 +323,6 @@ class TestExtractPlanningMetadataNode:
         )
         result = await extract_planning_metadata(state)
         assert result["skill_case_content"] == SAMPLE_SKILL_CASE
-        assert result["blade_scope"] == "pod"
-        assert result["blade_target"] == "disk"
-        assert result["blade_action"] == "burn"
 
     @pytest.mark.asyncio
     async def test_direct_mode_not_affected(self):
@@ -373,9 +381,8 @@ class TestExtractPlanningMetadataNode:
         )
         result = await extract_planning_metadata(state)
         assert result["skill_case_content"] == weak_skill_case
-        assert result["blade_scope"] == "pod"
-        # target/action may be empty (no ChaosBlade command in skill_case)
-        # This is expected — registry fallback uses (scope, target) level
+        # Note: scope derivation moved to intent_clarification — this
+        # node now only extracts skill_case_content.
 
     @pytest.mark.asyncio
     async def test_no_messages_returns_empty(self):
@@ -383,3 +390,168 @@ class TestExtractPlanningMetadataNode:
         state = AgentState(task_id="test-task", messages=[])
         result = await extract_planning_metadata(state)
         assert result == {}
+
+    @pytest.mark.asyncio
+    async def test_guard_rejects_when_no_case_loaded(self):
+        """Messages exist but no catalogue case → planning_rejected=True."""
+        state = AgentState(
+            task_id="test-task",
+            messages=[
+                HumanMessage(content="inject network loss"),
+                AIMessage(content="I will inject network loss"),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result["planning_rejected"] is True
+        assert len(result["messages"]) == 1
+        assert "PLANNING REJECTED" in result["messages"][0].content
+
+    @pytest.mark.asyncio
+    async def test_guard_passes_when_case_in_state(self):
+        """skill_case_content already in state → guard does not trigger."""
+        state = AgentState(
+            task_id="test-task",
+            messages=[HumanMessage(content="inject")],
+            skill_case_content=SAMPLE_SKILL_CASE,
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+
+    @pytest.mark.asyncio
+    async def test_guard_passes_when_case_in_messages(self):
+        """Case extracted from messages → guard does not trigger."""
+        state = AgentState(
+            task_id="test-task",
+            messages=[
+                HumanMessage(content="inject"),
+                ToolMessage(
+                    content=SAMPLE_SKILL_CASE,
+                    tool_call_id="call_1",
+                    name="read_skill_resource",
+                ),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        assert result.get("skill_case_content") == SAMPLE_SKILL_CASE
+
+
+# ---------------------------------------------------------------------------
+# _has_browsed_catalogue — catalogue browse detection
+# ---------------------------------------------------------------------------
+
+
+class TestHasBrowsedCatalogue:
+
+    def test_browsed(self):
+        msgs = [
+            AIMessage(content="", tool_calls=[{
+                "name": "read_skill_resource", "id": "c1", "type": "tool_call",
+                "args": {"skill_name": "k8s", "resource_path": "references/catalogue/"},
+            }]),
+        ]
+        assert _has_browsed_catalogue(msgs) is True
+
+    def test_browsed_subdir(self):
+        msgs = [
+            AIMessage(content="", tool_calls=[{
+                "name": "read_skill_resource", "id": "c1", "type": "tool_call",
+                "args": {"skill_name": "k8s", "resource_path": "references/catalogue/Pod_OOM内存异常/"},
+            }]),
+        ]
+        assert _has_browsed_catalogue(msgs) is True
+
+    def test_not_browsed(self):
+        msgs = [
+            AIMessage(content="", tool_calls=[{
+                "name": "kubectl_ro", "id": "c1", "type": "tool_call",
+                "args": {"subcommand": "get", "v_args": "pods"},
+            }]),
+        ]
+        assert _has_browsed_catalogue(msgs) is False
+
+    def test_empty_messages(self):
+        assert _has_browsed_catalogue([]) is False
+
+
+# ---------------------------------------------------------------------------
+# Catalogue rejection guard
+# ---------------------------------------------------------------------------
+
+
+class TestCatalogueRejectionGuard:
+
+    @pytest.mark.asyncio
+    async def test_rejection_without_catalogue_browse_is_nudged(self):
+        """LLM rejects without browsing catalogue → nudge, not reject."""
+        state = AgentState(
+            task_id="test-task",
+            messages=[
+                AIMessage(content="", tool_calls=[{
+                    "name": "finish_planning", "id": "fp1", "type": "tool_call",
+                    "args": {"summary": "not supported", "rejected": True,
+                             "rejection_reason": "ChaosBlade cannot do this"},
+                }]),
+                ToolMessage(
+                    content="Planning rejected. Reason: ChaosBlade cannot do this",
+                    tool_call_id="fp1", name="finish_planning",
+                ),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+        assert result.get("_catalogue_rejection_nudged") is True
+        assert "error" not in result
+        assert any("REJECTION NOT ACCEPTED" in m.content
+                    for m in result.get("messages", []))
+
+    @pytest.mark.asyncio
+    async def test_rejection_after_catalogue_browse_is_accepted(self):
+        """LLM browsed catalogue then rejects → accepted as real rejection."""
+        state = AgentState(
+            task_id="test-task",
+            messages=[
+                AIMessage(content="", tool_calls=[{
+                    "name": "read_skill_resource", "id": "rs1", "type": "tool_call",
+                    "args": {"skill_name": "k8s",
+                             "resource_path": "references/catalogue/"},
+                }]),
+                ToolMessage(
+                    content="Directory: ...", tool_call_id="rs1",
+                    name="read_skill_resource",
+                ),
+                AIMessage(content="", tool_calls=[{
+                    "name": "finish_planning", "id": "fp1", "type": "tool_call",
+                    "args": {"summary": "no match", "rejected": True,
+                             "rejection_reason": "No matching use case"},
+                }]),
+                ToolMessage(
+                    content="Planning rejected. Reason: No matching use case",
+                    tool_call_id="fp1", name="finish_planning",
+                ),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert "error" in result
+        assert result.get("_catalogue_rejection_nudged") is not True
+
+    @pytest.mark.asyncio
+    async def test_nudge_only_once(self):
+        """Second rejection after nudge → accepted (no infinite loop)."""
+        state = AgentState(
+            task_id="test-task",
+            _catalogue_rejection_nudged=True,
+            messages=[
+                AIMessage(content="", tool_calls=[{
+                    "name": "finish_planning", "id": "fp2", "type": "tool_call",
+                    "args": {"summary": "still not supported", "rejected": True,
+                             "rejection_reason": "Really not supported"},
+                }]),
+                ToolMessage(
+                    content="Planning rejected. Reason: Really not supported",
+                    tool_call_id="fp2", name="finish_planning",
+                ),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert "error" in result

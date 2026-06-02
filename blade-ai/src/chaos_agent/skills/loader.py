@@ -15,12 +15,55 @@ import yaml
 from chaos_agent.skills.models import SkillMetadata, SkillParameter, ScriptInfo
 
 
-def get_skills_dir() -> Path:
-    """Resolve skills directory with PyInstaller binary support.
+def _wheel_bundled_skills_dir() -> Optional[Path]:
+    """Return the wheel-bundled default skills dir, or None.
 
-    Priority: config.json > env var > bundled skills/ > dev path
-    A directory is only considered a match if it exists AND contains at least
-    one sub-directory with a SKILL.md file (i.e. has actual skills).
+    pip-install users get the default skill pack force-included into the
+    wheel at ``chaos_agent/_skills/`` (see pyproject.toml). This is the
+    source-of-truth that gets materialized into ``~/.blade-ai/skills`` on
+    first run. ``Path(__file__)`` is ``chaos_agent/skills/loader.py`` →
+    ``parent.parent`` is the ``chaos_agent`` package dir.
+    """
+    bundled = Path(__file__).parent.parent / "_skills"
+    return bundled if _has_skills(bundled) else None
+
+
+def _materialize_bundled_skills(target: Path) -> bool:
+    """Copy each wheel-bundled skill into ``target`` if missing.
+
+    Returns True if ``target`` ends up containing at least one skill.
+    Per-skill copy (not a top-level copytree) so a user who later adds
+    their own skills alongside the defaults never has them clobbered, and
+    a partially-populated target is topped up rather than skipped.
+    """
+    import shutil
+
+    bundled = _wheel_bundled_skills_dir()
+    if bundled is None:
+        return False
+    target.mkdir(parents=True, exist_ok=True)
+    for skill_dir in bundled.iterdir():
+        if not (skill_dir.is_dir() and (skill_dir / "SKILL.md").is_file()):
+            continue
+        dest = target / skill_dir.name
+        if dest.exists():
+            continue
+        try:
+            shutil.copytree(skill_dir, dest)
+        except Exception:
+            # Best-effort: a copy failure (perms, race) shouldn't crash
+            # skill resolution — fall through to whatever's already there.
+            pass
+    return _has_skills(target)
+
+
+def get_skills_dir() -> Path:
+    """Resolve skills directory with PyInstaller + wheel-bundle support.
+
+    Priority: config.json > env var > PyInstaller bundle > dev path >
+    wheel-bundled defaults (materialized into config dir).
+    A directory is only considered a match if it exists AND contains at
+    least one sub-directory with a SKILL.md file (i.e. has actual skills).
     """
     # 1. config.json setting (highest priority, managed by `blade-ai config`)
     from chaos_agent.config.settings import settings
@@ -48,7 +91,18 @@ def get_skills_dir() -> Path:
     if _has_skills(dev_skills):
         return dev_skills
 
-    # 5. Fallback: create the default config dir so there is something to use
+    # 5. Wheel-bundled defaults → materialize into the writable config dir.
+    #    pip-install users land here on first run: skills ship inside the
+    #    wheel (chaos_agent/_skills) but get copied into ~/.blade-ai/skills
+    #    so they're user-editable, hot-reloadable (SkillWatcher), and
+    #    ``blade-ai skills install`` can add more alongside. Mirrors the
+    #    ChaosBlade ``~/.blade-ai/vendor`` materialization pattern.
+    if config_dir:
+        config_path = Path(str(config_dir)).expanduser()
+        if _materialize_bundled_skills(config_path):
+            return config_path
+
+    # 6. Fallback: create the default config dir so there is something to use
     if config_dir:
         config_path = Path(str(config_dir)).expanduser()
         config_path.mkdir(parents=True, exist_ok=True)
@@ -190,10 +244,18 @@ def load_skill_resource(skill_dir: Path, resource_path: str) -> str:
     if not full_path.exists():
         raise FileNotFoundError(f"Resource not found: {full_path}")
     if full_path.is_dir():
-        # Return directory listing so the caller can pick a specific file
-        files = [str(f.relative_to(skill_dir)) for f in full_path.iterdir() if f.is_file()]
-        subdirs = [str(d.relative_to(skill_dir)) + "/" for d in full_path.iterdir() if d.is_dir()]
-        items = sorted(subdirs + files)
+        items: list[str] = []
+        for child in sorted(full_path.iterdir()):
+            if child.name.startswith("."):
+                continue
+            rel = str(child.relative_to(skill_dir))
+            if child.is_file():
+                items.append(rel)
+            elif child.is_dir():
+                items.append(rel + "/")
+                for sub_file in sorted(child.iterdir()):
+                    if sub_file.is_file() and not sub_file.name.startswith("."):
+                        items.append(str(sub_file.relative_to(skill_dir)))
         return f"Directory: {resource_path}/\nContents:\n" + "\n".join(f"  - {i}" for i in items) if items else f"Directory: {resource_path}/ (empty)"
     return full_path.read_text(encoding="utf-8")
 

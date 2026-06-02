@@ -207,6 +207,187 @@ class TestToolGuardCheck:
         assert allowed is False
         assert "Dangerous pattern" in reason
 
+    def test_kubectl_exec_solo_pipe_in_container_allowed(self):
+        """Regression: solo ``|`` after ``--`` for exec must be allowed.
+
+        Real LLM output (task-f8320b6ff844, msg #85): wanted to verify
+        the chaosblade child process inside the chaosblade-tool DaemonSet
+        with ``kubectl exec ... -- ps aux | grep mem``. Pre-fix the
+        bare ``|`` token triggered SUSPICIOUS_SOLO_TOKENS and blocked the
+        verification path. Post-fix the ``|`` lives in container_command
+        which is exempt from the solo-token check.
+
+        Note: under exec-form (shell=False) the ``|`` is forwarded as a
+        literal argv to the container's ``ps``, not a host pipeline —
+        no injection surface on the host. Real pipe semantics require
+        ``-- sh -c "ps aux | grep mem"`` (already worked: the ``|``
+        sits inside a single quoted token).
+        """
+        allowed, _ = self.guard.check([
+            "kubectl", "exec", "chaosblade-tool-xxxx", "-n", "chaosblade",
+            "--", "ps", "aux", "|", "grep", "mem",
+        ])
+        assert allowed is True
+
+    @pytest.mark.parametrize("solo", [";", "|", "&", "||", "&&", ">", "<"])
+    def test_kubectl_exec_all_solo_metachars_in_container_allowed(self, solo):
+        """All SUSPICIOUS_SOLO_TOKENS are exempt inside container_command.
+
+        Companion to the regression above — locks the rule "solo
+        metachars after ``--`` are container-side, not host-side" for
+        every token in the set so a future tightening that re-checks
+        cmd-wide surfaces here, not just for ``|``.
+        """
+        allowed, _ = self.guard.check([
+            "kubectl", "exec", "pod", "--", "sh", "-c", "true", solo, "echo", "x",
+        ])
+        assert allowed is True
+
+    def test_kubectl_solo_pipe_outside_exec_still_blocked(self):
+        """Solo ``|`` in host part (no ``--`` / non-exec subcommand)
+        must still be rejected — the relaxation is scoped to
+        container_command only."""
+        allowed, reason = self.guard.check(["kubectl", "get", "pods", "|"])
+        assert allowed is False
+        assert "Dangerous pattern" in reason
+
+    def test_blade_solo_pipe_still_blocked(self):
+        """blade has no ``--`` separator → all tokens are host-side →
+        solo ``|`` must still be rejected."""
+        allowed, reason = self.guard.check(["blade", "create", "|"])
+        assert allowed is False
+        assert "Dangerous pattern" in reason
+
+    # ── E11 — AST-level parser edge cases ───────────────────────────────
+
+    def test_kubectl_field_selector_with_special_chars(self):
+        """E11: --field-selector value is a payload, not a shell command.
+        Old host_part regex would have joined and could mis-detect; new
+        parser puts it in data_payload_values so it's skipped."""
+        allowed, _ = self.guard.check([
+            "kubectl", "get", "pods",
+            "--field-selector", "status.phase=Running",
+        ])
+        assert allowed is True
+
+    def test_blade_subcommand_parsed_correctly(self):
+        """E11: blade AST parser identifies subcommand + value flags
+        without consuming positional args."""
+        allowed, _ = self.guard.check([
+            "blade", "create", "pod", "network", "delay",
+            "--time", "3000", "--interface", "eth0",
+            "--names", "my-pod", "--namespace", "default",
+        ])
+        assert allowed is True
+
+    def test_unknown_kubectl_flag_treated_as_value_taking(self):
+        """E11: unknown flag consumes next token (conservative
+        fallback). Subcommand + remaining positional still parsed."""
+        allowed, _ = self.guard.check([
+            "kubectl", "get", "--made-up-future-flag", "value", "pods",
+        ])
+        # Should still pass: 'get' is allowed, no dangerous patterns
+        assert allowed is True
+
+    def test_blade_boolean_flag_h_does_not_consume_next_token(self):
+        """E11 Gap A regression: blade -h is boolean, must not eat the
+        next positional. If it did, parser would mis-locate 'pod' as
+        the -h value and the subcommand check would still work, but
+        a future check that depends on positional_args being correct
+        would silently break."""
+        from chaos_agent.tools.guard_parser import parse_command
+        p = parse_command(["blade", "create", "-h", "pod"])
+        assert p.subcommand == "create"
+        assert "pod" in p.positional_args
+        assert ("-h", None) in p.flags
+
+    def test_kubectl_get_with_double_dash_treated_as_positional(self):
+        """E11 Gap B regression: `--` outside exec/run/attach/debug
+        MUST NOT split container_command. Otherwise a misplaced `--`
+        would become a bypass channel for shell-pattern checks on
+        anything that follows."""
+        from chaos_agent.tools.guard_parser import parse_command
+        p = parse_command(["kubectl", "get", "--", "pod"])
+        assert p.subcommand == "get"
+        assert p.container_command == ()
+        # 'pod' must end up somewhere that host_relevant_tokens covers
+        assert "pod" in p.host_relevant_tokens()
+
+    def test_kubectl_global_boolean_flag_does_not_misidentify_subcommand(self):
+        """E11 first-principles regression: the OLD inline parser
+        (pre-E11) skipped any `-` token + the NEXT token together
+        (assumed every flag was value-taking). That silently
+        misidentified the subcommand whenever a global boolean flag
+        appeared before it.
+
+        Example: ``kubectl --insecure-skip-tls-verify get pods``
+          - OLD parser: skip --insecure-skip-tls-verify + skip 'get'
+            → subcommand="pods" → "pods" not in whitelist → REJECTED
+            (false positive — get is a legal subcommand)
+          - NEW parser: --insecure-skip-tls-verify is in
+            KUBECTL_BOOLEAN_FLAGS → no consume → subcommand="get"
+            → ALLOWED ✓
+
+        This test was absent from the original 28 — none of them
+        exercised a boolean global flag before the subcommand. Add
+        it so a future revert of the AST parser would surface here
+        instead of silently regressing real LLM-generated commands.
+        """
+        allowed, reason = self.guard.check([
+            "kubectl", "--insecure-skip-tls-verify", "get", "pods",
+        ])
+        assert allowed is True, f"expected allow, got: {reason}"
+
+    @pytest.mark.parametrize("boolean_flag", [
+        "--insecure-skip-tls-verify",
+        "--help",
+        "-h",
+    ])
+    def test_kubectl_boolean_flag_before_subcommand(self, boolean_flag):
+        """Parameterized companion to the regression above — every
+        kubectl global boolean flag must allow subcommand to be
+        identified correctly when placed before it."""
+        cmd = ["kubectl", boolean_flag, "get", "pods"]
+        allowed, _ = self.guard.check(cmd)
+        assert allowed is True
+
+    def test_container_command_with_dangerous_single_token_allowed(self):
+        """E11 mutation-testing regression: the existing
+        ``test_kubectl_exec_dangerous_in_container_allowed`` uses
+        ``[blade, create, k8s, pod-cpu, fullload]`` as the container
+        command — each token is harmless individually, so the test
+        cannot distinguish between
+
+          (a) host_relevant_tokens() correctly EXCLUDES container_command
+          (b) host_relevant_tokens() includes container_command BUT
+              the test cmd happens to have no matching token
+
+        Both produce ALLOW. This test closes that gap by using a
+        container command whose SINGLE token ``"rm -rf /"`` does match
+        the ``rm\\s+-rf`` regex. If a future change accidentally
+        promotes container_command into host_relevant_tokens, this
+        test flips to FAIL.
+        """
+        allowed, _ = self.guard.check([
+            "kubectl", "exec", "pod", "--",
+            "sh", "-c", "rm -rf /",  # single token "rm -rf /" matches rm\s+-rf
+        ])
+        assert allowed is True
+
+    def test_data_payload_with_dangerous_single_token_allowed(self):
+        """E11 mutation-testing regression: similar gap for
+        data_payload_values. The existing -p JSON payload tests use
+        ``{"spec":{...}}`` which doesn't match any blacklist pattern
+        in single-token form. This one uses a payload that DOES match
+        the regex, so a future change that leaks payload values into
+        host_relevant_tokens would surface here.
+        """
+        allowed, _ = self.guard.check([
+            "kubectl", "patch", "pvc", "x", "-n", "default",
+            "-p", '{"spec":{"x":"rm -rf /"}}',  # single token contains rm -rf
+        ])
+        assert allowed is True
+
 
 class TestToolGuardCustom:
     """Test ToolGuard with custom configuration."""

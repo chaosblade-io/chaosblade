@@ -447,6 +447,11 @@ class ToolResultCompactor:
         ]
 
         for idx, (i, msg) in enumerate(tool_results):
+            # Skill case content is the primary authority for downstream
+            # nodes (baseline, execute, verifier) — never truncate it.
+            if getattr(msg, "name", "") == "read_skill_resource":
+                continue
+
             is_recent = idx >= len(tool_results) - self.KEEP_RECENT_N
             max_bytes = self.RECENT_MAX_BYTES if is_recent else self.OLD_MAX_BYTES
 

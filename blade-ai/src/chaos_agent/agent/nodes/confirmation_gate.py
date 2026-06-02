@@ -146,6 +146,7 @@ async def confirmation_gate(state: AgentState) -> dict:
         "plan_summary": plan[:500] if plan else "",
         "safety_status": safety_status,
         "safety_reason": state.get("safety_reason"),
+        "safety_checked_detail": state.get("safety_checked_detail"),
         "params": dict(spec.params),
         "target_health_report": state.get("target_health_report"),
         "conflict_uids": list(state.get("conflict_uids") or []),
@@ -214,10 +215,16 @@ def _freeze_from_state(state: AgentState) -> dict | None:
     None when no spec is on state (the caller should not be reaching
     this function in that case, but we default-deny to make the bug
     visible in the screener's WARNING log rather than silently
-    constructing an empty approval)."""
+    constructing an empty approval).
+
+    Reuses ``owner_names`` from the ``approved_target`` that
+    safety_check already froze (avoiding a redundant cluster query).
+    """
     spec = read_fault_spec(state)
     if spec is None:
         return None
+    existing = state.get("approved_target") or {}
+    owner_names = tuple(existing.get("owner_names") or ())
     return freeze_approved_target(
         target={
             "namespace": spec.namespace, "names": list(spec.names),
@@ -227,4 +234,5 @@ def _freeze_from_state(state: AgentState) -> dict | None:
         blade_scope=spec.scope,
         blade_target=spec.blade_target,
         blade_action=spec.blade_action,
+        owner_names=owner_names,
     )

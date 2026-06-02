@@ -473,11 +473,23 @@ export const en: Dict = {
   "confirm.execution.title": "Confirm execution plan",
   "confirm.execution.proceed": "inject",
   "confirm.execution.cancel": "cancel",
+  "confirm.targetChange.chip": "DRIFT",
   "confirm.targetChange.title": "Target change confirmation",
+  "confirm.targetChange.preamble": "The agent is attempting to operate on a different target than approved.",
+  "confirm.targetChange.agentReason": "Agent reasoning",
+  "confirm.targetChange.agentReasonEmpty": "Agent did not provide a reason",
   "confirm.targetChange.original": "Original target",
   "confirm.targetChange.proposed": "Proposed target",
   "confirm.targetChange.approve": "approve change",
   "confirm.targetChange.reject": "reject",
+  "confirm.planChange.chip": "PLAN",
+  "confirm.planChange.title": "Plan Change Confirmation",
+  "confirm.planChange.preamble": "Agent has determined the original fault type is not viable after replanning and proposes an alternative:",
+  "confirm.planChange.reason": "Reason for change",
+  "confirm.planChange.original": "Original fault type",
+  "confirm.planChange.proposed": "Proposed fault type",
+  "confirm.planChange.approve": "approve change",
+  "confirm.planChange.reject": "reject",
 
   // -- ConfirmMessage field labels ----------------------------------
   "confirm.field.fault_type": "Fault type",
@@ -590,6 +602,7 @@ export const en: Dict = {
   "confirm.safety.safe": "SAFE",
   "confirm.safety.warning": "WARNING",
   "confirm.safety.blocked": "BLOCKED",
+  "confirm.safety.all_clear": "Safety check passed",
 
   // -- Select component hints --------------------------------------
   "select.options.hint": "A-Z jump · ↑↓ select · Enter confirm · Esc cancel",

@@ -40,6 +40,7 @@ _PHASE_STEP_MAP: dict[str, str] = {
     "execute_loop": "fault_injection",
     "direct_execute": "fault_injection",
     "verifier_loop": "verification",
+    "finalize_verification": "verification",
 }
 
 
@@ -341,11 +342,24 @@ class L4ResilienceAgent:
                 step_attrs_accumulator[f"tool.{tool_name}.input"] = str(tool_input)[
                     :500
                 ]
+                if hasattr(runtime, "emit_event"):
+                    runtime.emit_event("tool_start", {
+                        "message": f"调用工具: {tool_name}",
+                        "tool": tool_name,
+                        "input": str(tool_input)[:500],
+                    })
 
             elif kind == "on_tool_end" and runtime:
                 tool_name = event.get("name", "")
                 output = event.get("data", {}).get("output", "")
                 step_attrs_accumulator[f"tool.{tool_name}.status"] = "ok"
+                if hasattr(runtime, "emit_event"):
+                    runtime.emit_event("tool_end", {
+                        "message": f"工具返回: {tool_name}",
+                        "level": "ok",
+                        "tool": tool_name,
+                        "summary": str(output)[:2000],
+                    })
                 if tool_name in ("blade_create", "blade_status", "kubectl"):
                     try:
                         runtime.tool.execute(
@@ -391,9 +405,87 @@ class L4ResilienceAgent:
                                 },
                             )()
                         )
+                if msg and hasattr(runtime, "emit_event"):
+                    content = ""
+                    if hasattr(msg, "content"):
+                        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    # Thinking models (Qwen enable_thinking) put the chain-of-
+                    # thought in reasoning_content with empty content on tool-call
+                    # turns. Fall back to reasoning so the live stream still shows
+                    # the model's thinking on those turns, not just the final answer.
+                    rc = ""
+                    if hasattr(msg, "additional_kwargs"):
+                        rc = msg.additional_kwargs.get("reasoning_content", "") or ""
+                    if content:
+                        runtime.emit_event("llm_thought", {
+                            "message": content[:500],
+                            "content": content[:3000],
+                        })
+                    elif rc:
+                        runtime.emit_event("llm_thought", {
+                            "message": rc[:500],
+                            "content": rc[:3000],
+                        })
 
             if self._cancel_event.is_set():
                 raise _CancelRequested()
+
+        # --- Bootstrap session for task file persistence ---
+        try:
+            from chaos_agent.memory.session_store import get_global_session_store
+            _store = get_global_session_store()
+            if _store and not _store.has_active(task.task_id):
+                _store.create_session(task.task_id, operation="inject")
+        except Exception:
+            pass
+
+        # --- StatusTracker → runtime bridge ---
+        # Subscribe to blade-ai's internal tracker events and forward
+        # them as user-facing progress messages to the platform runtime.
+        # Only COMPLETED/FAILED events are forwarded (skip high-frequency
+        # STARTED/RUNNING updates and debug-only events).
+        _tracker_task: asyncio.Task | None = None
+        _tracker_queue = None
+        if runtime and hasattr(runtime, "emit_event"):
+            try:
+                from chaos_agent.observability.status_tracker import subscribe
+
+                _tracker_queue = subscribe(task.task_id)
+
+                async def _drain_tracker():
+                    while True:
+                        try:
+                            ev = await _tracker_queue.get()
+                        except asyncio.CancelledError:
+                            return
+                        if ev is None:
+                            return
+                        phase = ev.phase
+                        msg = ev.message or ""
+                        source = ev.source or ""
+                        detail = ev.detail or {}
+                        # Skip: no message, debug-only events, high-freq updates
+                        if not msg:
+                            continue
+                        if detail.get("debug"):
+                            continue
+                        if phase not in ("completed", "failed"):
+                            continue
+                        level = "ok" if phase == "completed" else "error"
+                        try:
+                            runtime.emit_event("agent_progress", {
+                                "message": f"[{source}] {msg}",
+                                "source": source,
+                                "phase": phase,
+                                "level": level,
+                                "duration_ms": ev.duration_ms,
+                            })
+                        except Exception:
+                            pass
+
+                _tracker_task = asyncio.create_task(_drain_tracker())
+            except Exception:
+                _tracker_queue = None
 
         # --- Main execution flow ---
         try:
@@ -429,6 +521,18 @@ class L4ResilienceAgent:
                 trajectory_id=trajectory_id,
             )
         finally:
+            if _tracker_task and not _tracker_task.done():
+                _tracker_task.cancel()
+                try:
+                    await _tracker_task
+                except asyncio.CancelledError:
+                    pass
+            if _tracker_queue is not None:
+                try:
+                    from chaos_agent.observability.status_tracker import unsubscribe
+                    unsubscribe(task.task_id, _tracker_queue)
+                except Exception:
+                    pass
             if current_step_cm:
                 current_step_cm.__exit__(None, None, None)
                 current_step = None
@@ -445,6 +549,25 @@ class L4ResilienceAgent:
         # Budget check (C5)
         if runtime:
             result = self._check_budget(runtime, result, state.values)
+
+        # Emit structured conclusion event so the platform UI shows a
+        # clear result card (not buried in "模型思考").
+        if runtime and hasattr(runtime, "emit_event"):
+            verification = state.values.get("verification") or {}
+            level = verification.get("level", "unknown") if isinstance(verification, dict) else "unknown"
+            blade_uid = state.values.get("blade_uid", "")
+            runtime.emit_event("conclusion", {
+                "message": (
+                    f"故障注入{'成功' if result.status == 'passed' else '失败'}"
+                    f" | 验证级别: {level}"
+                    f"{f' | blade_uid: {blade_uid}' if blade_uid else ''}"
+                ),
+                "status": result.status,
+                "level": level,
+                "blade_uid": blade_uid,
+                "trajectory_id": trajectory_id,
+                "summary": result.summary or "",
+            })
 
         # Note: runtime.finish() is intentionally NOT called here.
         # It is invoked once by the outer _async_execute() finally block with

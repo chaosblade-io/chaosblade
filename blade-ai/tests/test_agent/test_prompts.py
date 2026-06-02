@@ -45,7 +45,6 @@ class TestInjectSystemPrompt:
         assert "Skill Index" in INJECT_SYSTEM_PROMPT
 
     def test_contains_safety_rules(self):
-        assert "kube-system" in INJECT_SYSTEM_PROMPT
         assert "Safety Rules" in INJECT_SYSTEM_PROMPT
 
     def test_contains_activate_skill_instruction(self):
@@ -64,9 +63,13 @@ class TestVerifierPrompt:
         assert "blade_status" in VERIFIER_PROMPT
 
     def test_contains_structured_output(self):
+        # Scheme B: verdict is submitted via the submit_verification tool with
+        # structured args (overall / layer2_status), not a free-text
+        # VERIFICATION_RESULT block.
         assert "verified" in VERIFIER_PROMPT
-        assert "Layer1" in VERIFIER_PROMPT
-        assert "Layer2" in VERIFIER_PROMPT
+        assert "submit_verification" in VERIFIER_PROMPT
+        assert "overall" in VERIFIER_PROMPT
+        assert "layer2_status" in VERIFIER_PROMPT
 
 
 class TestSectionFunctions:
@@ -89,7 +92,7 @@ class TestSectionFunctions:
 
     def test_safety_section_contains_rules(self):
         section = get_safety_section()
-        assert "kube-system" in section
+        assert "namespace blacklist" in section
         assert "NEVER" in section
         assert "ALWAYS" in section
 
@@ -147,9 +150,7 @@ class TestBuildInjectSystemPrompt:
         prompt = build_inject_system_prompt(skill_catalog="test-skill")
         # All major section headers should be present
         assert "Workflow" in prompt
-        assert "Natural Language Mode" in prompt
         assert "Safety Rules" in prompt
-        assert "Executing Actions with Care" in prompt
         assert "Tool Usage Guidelines" in prompt
         assert "Communication Style" in prompt
         assert "K8s Cluster Connection" in prompt
@@ -196,14 +197,13 @@ class TestIntentClarificationSectionFunctions:
         # NOT a classifier assertion
         assert "NOT a classifier" in section
 
-    def test_critical_rules_section_has_5_rules(self):
+    def test_critical_rules_section_has_4_rules(self):
         section = get_intent_critical_rules_section()
         assert "CRITICAL RULES" in section
-        # 5 specific rules present
+        # 4 specific rules present
         assert "NEVER re-ask" in section
         assert "summarize intent" in section
         assert "classify_intent is ONLY" in section
-        assert "protected namespaces" in section
         assert "Single routing action" in section
         # Execution keywords present (Chinese — user-facing trigger words)
         assert "开始" in section or "执行" in section
@@ -226,8 +226,7 @@ class TestIntentClarificationSectionFunctions:
         section = get_intent_convergence_section()
         assert "ONE question at a time" in section
         assert "submit_fault_intent" in section
-        assert "hypothesis" in section
-        assert "success_criteria" in section
+        assert "Hypothesis" in section
 
     def test_tools_section_has_available_not_available(self):
         section = get_intent_tools_section()
@@ -260,10 +259,9 @@ class TestIntentClarificationSectionFunctions:
     def test_reminder_section_recaps_rules(self):
         section = get_intent_critical_rules_reminder_section()
         assert "REMINDER" in section
-        assert "Do NOT re-ask" in section
-        assert "intent summary" in section
-        assert "classify_intent is ONLY" in section
-        assert "kube-system" in section
+        assert "re-ask" in section
+        assert "submit" in section
+        assert "classify_intent" in section
 
 
 class TestBuildIntentClarificationPrompt:
@@ -281,7 +279,7 @@ class TestBuildIntentClarificationPrompt:
         # CRITICAL rules near beginning (primacy zone)
         critical_pos = prompt.find("CRITICAL RULES")
         # REMINDER near end (recency zone)
-        reminder_pos = prompt.find("REMINDER — Critical Rules Recap")
+        reminder_pos = prompt.find("## REMINDER")
         assert critical_pos > 0
         assert reminder_pos > 0
         assert reminder_pos > critical_pos

@@ -99,3 +99,39 @@ class TestCreateApp:
         app = create_app()
         routes = [route.path for route in app.routes]
         assert "/api/v1/version" in routes
+
+
+class TestLifespanWatchers:
+    """Lifespan integration: SkillWatcher + KnowledgeWatcher set up on
+    startup and stopped on shutdown.
+
+    Uses TestClient as a context manager — that's what triggers FastAPI's
+    lifespan startup/shutdown hooks. Without the with-block the lifespan
+    never runs (which is why the older TestCreateApp tests above don't
+    cover this code path).
+    """
+
+    def test_lifespan_starts_and_stops_both_watchers(self, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        # Avoid creating a real LLM client during the test — the lifespan
+        # guards on missing essentials and skips agent construction.
+        monkeypatch.setenv("BLADE_AI_LLM_API_KEY", "")
+
+        app = create_app()
+
+        with TestClient(app) as client:
+            # During the with-block, lifespan startup has completed.
+            assert hasattr(app.state, "skill_watcher")
+            assert hasattr(app.state, "knowledge_watcher")
+            assert app.state.skill_watcher is not None
+            assert app.state.knowledge_watcher is not None
+            # Sanity: health endpoint still works while watchers run.
+            r = client.get("/api/v1/health")
+            assert r.status_code == 200
+
+        # After exiting the with-block, shutdown has completed. The
+        # watchers were stop()ed — their internal _observer should be
+        # back to None (set to None inside stop()).
+        assert app.state.skill_watcher._impl._observer is None
+        assert app.state.knowledge_watcher._impl._observer is None

@@ -321,7 +321,33 @@ def _build_layer2_messages(
         blade_action = _blade_action
 
         # Build Layer 1 context section (adapted for skipped vs passed)
-        if layer1.status == "skipped":
+        _is_self_destructive = (
+            layer1.status == "skipped"
+            and "self-destructive" in (layer1.details or "").lower()
+        )
+        if _is_self_destructive:
+            layer1_context = (
+                "## Layer 1 Result (SKIPPED — self-destructive fault)\n"
+                f"blade_status unreachable: {layer1.details}\n\n"
+                "## WARNING: Target node is NotReady\n"
+                "The target node lost connectivity — this is likely the "
+                "injection effect itself (e.g. containerd/kubelet stopped). "
+                "Your verification MUST use commands that go through the "
+                "API server (not the node):\n"
+                "- `kubectl get nodes` — confirm node NotReady\n"
+                "- `kubectl get pods` — check for ContainerCreating / Terminating\n"
+                "- `kubectl describe pod` — check Events for runtime errors\n"
+                "- `kubectl get events` — check for node-level events\n"
+                "Do NOT use `kubectl exec` into pods on the affected node "
+                "(it will fail because the node is unreachable).\n\n"
+            )
+            layer2_instruction = (
+                "This is a self-destructive fault: the injection destroyed "
+                "the node's communication channel. Verify the EFFECT of the "
+                "fault (node NotReady, pods in abnormal state) rather than "
+                "the injection mechanism (blade_status).\n"
+            )
+        elif layer1.status == "skipped":
             layer1_context = (
                 "## Layer 1 Result\n"
                 "Layer 1 skipped: non-ChaosBlade fault (no blade_uid). "
@@ -662,14 +688,50 @@ def _build_layer2_messages(
                 f"You MUST follow its verification approach as the primary reference.\n\n"
                 f"<skill-case>\n{skill_case}\n</skill-case>\n\n"
             )
-            # Three-tier verification mode based on skill case structure:
+            # Four-tier verification mode based on skill case structure:
+            # Mode 0 (Multi-candidate): multiple candidates → LLM chooses
             # Mode 1 (Template): 注入验证 has parseable numbered/bullet steps → pre-filled checklist
             # Mode 2 (Guided):  注入验证 exists but unparseable (prose only) → point LLM to prose
             # Mode 3 (Free):    no 注入验证 → current generic guidance
-            step_descs = _extract_verification_step_descriptions(skill_case)
-            has_section = _has_injection_verification_section(skill_case)
+            is_multi_candidate = "--- Candidate" in skill_case
 
-            if step_descs:
+            if is_multi_candidate:
+                # ═══ Mode 0: MULTI-CANDIDATE — LLM picks the right one ═══
+                context += (
+                    f"### Verification Strategy (Multi-candidate)\n"
+                    f"Multiple skill cases are provided above. You MUST:\n"
+                    f"1. Read ALL candidates carefully\n"
+                    f"2. Choose the ONE most relevant to the actual fault "
+                    f"(scope={blade_scope}, target={blade_target}, "
+                    f"action={blade_action})\n"
+                    f"3. State which candidate you chose and why "
+                    f"(one sentence)\n"
+                    f"4. Follow THAT candidate's **注入验证** steps as your "
+                    f"verification checklist. If it has no 注入验证 section, "
+                    f"design your own checklist based on the candidate's "
+                    f"content. Do NOT mix content from different candidates\n"
+                    f"5. Output a VERIFICATION_CHECKLIST section with each "
+                    f"step and its result before VERIFICATION_RESULT\n\n"
+                    f"Rules:\n"
+                    f"1. Replace [status] with: passed, failed, skipped, "
+                    f"recovered_before_observation, or expected\n"
+                    f"2. After [status], write \" — \" followed by brief "
+                    f"evidence\n"
+                    f"3. If a step cannot be executed, mark as skipped "
+                    f"with reason\n"
+                    f"4. **MANDATORY OUTPUT**: You MUST output a "
+                    f"'VERIFICATION_CHECKLIST:' section BEFORE your final "
+                    f"'VERIFICATION_RESULT:' section.\n"
+                    f"5. **chosen_candidate**: When calling "
+                    f"`submit_verification`, you MUST set "
+                    f"`chosen_candidate` to the candidate number you chose "
+                    f"(e.g. `chosen_candidate=2` for Candidate 2).\n"
+                )
+            else:
+                step_descs = _extract_verification_step_descriptions(skill_case)
+                has_section = _has_injection_verification_section(skill_case)
+
+            if not is_multi_candidate and step_descs:
                 # ═══ Mode 1: TEMPLATE — structured steps extracted ═══
                 template_lines = []
                 for i, desc in enumerate(step_descs, start=1):
@@ -699,7 +761,7 @@ def _build_layer2_messages(
                     f"\"Step N: passed — <what you did> (deviation: <why you deviated>)\". "
                     f"If you execute the step as specified, no deviation note is needed.\n"
                 )
-            elif has_section:
+            elif not is_multi_candidate and has_section:
                 # ═══ Mode 2: GUIDED — 注入验证 exists but unparseable ═══
                 context += (
                     "### Verification Strategy (Guided)\n"
@@ -720,7 +782,7 @@ def _build_layer2_messages(
                     "'VERIFICATION_CHECKLIST:' section BEFORE your final "
                     "'VERIFICATION_RESULT:' section.\n"
                 )
-            else:
+            elif not is_multi_candidate:
                 # ═══ Mode 3: FREE — no 注入验证 section at all ═══
                 context += (
                     "### Verification Strategy:\n"
@@ -745,79 +807,50 @@ def _build_layer2_messages(
                     "be flagged as potentially incomplete and may be downgraded "
                     "from 'verified' to 'partial'.\n"
                 )
+            pass  # NEGATIVE EVIDENCE moved to core behavioral rules (outside if/else)
+            # Mode 1 only: step completeness tracking
+            if not is_multi_candidate and step_descs:
+                context += (
+                    "Note — Step completeness: your VERIFICATION_CHECKLIST MUST cover ALL "
+                    f"{len(step_descs)} steps listed above. Any step not executed must appear "
+                    "as '[SKIPPED] Step N: <reason>'. Omitting steps is a protocol violation.\n\n"
+                )
             context += (
-                # --- New structural rules (v2: no domain-specific examples) ---
-                "**NEGATIVE EVIDENCE ENUMERATION (CRITICAL)**:\n"
-                "Before concluding Layer2 'passed', you MUST include a 'Negative Evidence' section "
-                "in your reasoning that explicitly lists EVERY observation contradicting or weakening "
-                "the conclusion that the fault is in effect. For each item, either:\n"
-                "(a) Dismiss it with factual basis (not speculation), or\n"
-                "(b) Accept it as valid counter-evidence.\n"
-                "If ANY verification criterion from the skill case is demonstrably NOT met, you MUST "
-                "conclude Layer2 as 'partial' or 'failed' — NOT 'passed'. "
-                "Do NOT override unmet criteria with speculative explanations "
-                "unless you have direct supporting evidence for the explanation itself.\n\n"
-                "**STEP COMPLETENESS TRACKING**:\n"
-                "1. At the START of your verification, list all steps from the skill case's 注入验证 section.\n"
-                "2. Your final VERIFICATION_CHECKLIST MUST cover ALL listed steps. "
-                "Any step not executed must appear as '[SKIPPED] Step N: <reason>'. "
-                "Omitting steps entirely is a protocol violation.\n\n"
-                "**IMPORTANT — Example of WRONG vs CORRECT output:**\n"
-                "WRONG (protocol violation — steps silently omitted):\n"
-                "  VERIFICATION_CHECKLIST:\n"
-                "  - Step 1: passed — CPU usage is 80% of limit via kubectl top\n"
-                "  - Step 2: passed — sustained across two checks\n"
-                "  - Step 3: passed — no blast radius issues\n"
-                "  (Only 3 steps listed when skill case defines 4 — Steps 3,4 silently dropped!)\n\n"
-                "CORRECT:\n"
-                "  VERIFICATION_CHECKLIST:\n"
-                "  - Step 1: passed — CPU usage is ~160m (80% of 200m limit)\n"
-                "  - Step 2: passed — kubectl exec <pod> -- ps aux | grep chaos shows chaos_cpu process\n"
-                "  - [SKIPPED] Step 3: APM tool not available in this cluster — cannot analyze CPU hotspots\n"
-                "  - Step 4: passed — kubectl logs <pod> --tail=50 shows increased latency\n"
-                "  (All 4 steps from skill case accounted for; Step 3 explicitly marked SKIPPED with reason)\n"
-                "\n"
-                "**LAYER BOUNDARY ENFORCEMENT**:\n"
-                "VERIFICATION_CHECKLIST must ONLY contain Layer 2 checks (observable fault effects). "
-                "Do NOT include Layer 1 items (blade_status results, experiment registration status, "
-                "operator pod health). These belong in the 'Layer1 (blade_status)' line of "
-                "VERIFICATION_RESULT, NOT in the checklist.\n\n"
-                # --- End new structural rules ---
-                "**Evidence-Conclusion Consistency (CRITICAL)**: Before concluding Layer2 'passed', "
-                "you MUST verify that NO evidence contradicts your conclusion. "
-                "If ANY key verification criterion from the skill case is NOT met "
-                "(e.g., skill case expects 'Endpoints removed' but Endpoints are still present, "
-                "or skill case expects 'Pod restart' but restart count is 0), "
-                "you MUST conclude Layer2 as 'partial' (some evidence supports the fault) "
-                "or 'failed' (key criteria unmet), NOT 'passed'. "
-                "A single unmet mandatory criterion overrides all passing criteria.\n\n"
-                "**Checklist Status Choice (CRITICAL)**:\n"
+                "**Checklist Status Choice**:\n"
                 "- The checklist reports OBSERVED FACTS, not predictions.\n"
-                "- If you ran `kubectl describe` and MemoryPressure is currently False → 'failed' (checked, condition not met).\n"
-                "- If you ran `kubectl top` and memory is 95% → 'passed' (checked, condition met).\n"
-                "- If a check requires a tool you cannot access → 'skipped' (never attempted).\n"
-                "- Rule of thumb: did you call a kubectl command for this step?\n"
-                "  Yes → 'passed' or 'failed'. No → 'skipped'.\n"
+                "- Did you call a kubectl command for this step? Yes → 'passed' or 'failed'. No → 'skipped'.\n"
                 "- Timing uncertainty belongs in Warnings, not in checklist status.\n"
-                "- **Fault Effect vs Injection Action**: Checklist steps must describe OBSERVED FAULT EFFECTS "
-                "(what happened to the target), NOT injection actions (what the tool did). "
-                "Examples of INVALID evidence: 'pod was killed', 'blade_create returned success', "
-                "'endpoints controller updated'. "
-                "Examples of VALID evidence: 'Endpoints list is empty', 'curl to Service timed out', "
-                "'kubectl top shows CPU at 95%'.\n"
-                "- If the expected fault effect was never observed (because the target already recovered "
-                "before verification), step status MUST be 'recovered_before_observation'. "
-                "This is a protocol requirement — do NOT infer fault effect from injection action. "
-                "'recovered_before_observation' is distinct from 'failed': 'failed' means you checked "
-                "and the fault was absent; 'recovered_before_observation' means the fault was transient "
-                "and had already dissipated by the time you checked.\n"
-                "- **pod-disk-burn TRANSIENT FAULT EXAMPLE**: pod-disk-burn creates temporary "
-                "files that are automatically deleted when the experiment completes. "
-                "If you check after completion and find burn files gone BUT df -h shows "
-                "a significant usage increase from baseline (1-2GB+), this IS evidence the "
-                "burn occurred. Use 'recovered_before_observation', NOT 'failed'. "
-                "If df -h shows NO change AND no files found → 'failed' (burn likely never executed).\n\n"
+                "- 'recovered_before_observation': the fault was transient and had dissipated "
+                "by the time you checked — distinct from 'failed' (checked, fault absent).\n\n"
             )
+            # disk-burn transient fault rules (moved from system prompt)
+            if blade_target == "disk" and blade_action == "burn":
+                context += (
+                    "**Transient fault rules** (disk-burn): burn creates temporary files "
+                    "deleted on experiment completion. If ANY intermediate observation shows "
+                    "clear fault effects (metrics above baseline, burn files present), mark "
+                    "'passed' — even if later observation shows effect dissipated. "
+                    "Use 'recovered_before_observation' ONLY when NO observation at ANY "
+                    "point showed fault effects. If burn files gone BUT df -h shows usage "
+                    "increase from baseline (1-2GB+), use 'recovered_before_observation'. "
+                    "If df -h shows NO change AND no files → 'failed'.\n\n"
+                )
+            # Container restart detection (moved from system prompt)
+            if blade_target in ("mem", "process"):
+                context += (
+                    "**Container Restart Detection**: If the target container restarted "
+                    "during injection (restartCount increased, lastState.terminated present, "
+                    "OOMKilling events), classify as 'recovered_before_observation' — the "
+                    "restart is a SIDE EFFECT, not primary evidence. Set "
+                    "PrimaryEvidenceObserved: false when only a restart is observed.\n\n"
+                )
+            # ChaosBlade-specific: layer boundary
+            if blade_uid:
+                context += (
+                    "Note — Layer boundary: VERIFICATION_CHECKLIST must ONLY contain Layer 2 "
+                    "checks (observable fault effects). Do NOT include Layer 1 items "
+                    "(blade_status, experiment registration).\n\n"
+                )
         else:
             context += (
                 "No skill use-case content is available. Design verification based on "
@@ -833,8 +866,30 @@ def _build_layer2_messages(
                 "strategies, kubectl field reference). Use `read_knowledge_resource` to "
                 "load them before designing your verification plan.\n\n"
             )
+        # ── Core behavioral rules (always added, positioned early) ──
         context += (
             f"{layer2_instruction}"
+        )
+        context += (
+            "**NEGATIVE EVIDENCE ENUMERATION (CRITICAL)**:\n"
+            "Before concluding Layer2 'passed', you MUST include a 'Negative Evidence' section "
+            "in your reasoning that explicitly lists EVERY observation contradicting or weakening "
+            "the conclusion that the fault is in effect. For each item, either:\n"
+            "(a) Dismiss it with factual basis (not speculation), or\n"
+            "(b) Accept it as valid counter-evidence.\n"
+            "If ANY verification criterion is demonstrably NOT met, you MUST "
+            "conclude Layer2 as 'partial' or 'failed' — NOT 'passed'.\n\n"
+        )
+        context += (
+            f"**POLLING STRATEGY (CRITICAL)**: Fault effect may take 5-30s to appear. "
+            f"Check at least 3 times before concluding. If any check shows the fault IS "
+            f"in effect, conclude 'passed' immediately.\n"
+            f"If after 3 checks NO evidence found → Layer2 'failed', Overall 'unverified'. "
+            f"Do NOT conclude 'partial' when NO evidence exists.\n\n"
+            f"**ADAPTIVE VERIFICATION (CRITICAL)**:\n"
+            f"If the SAME command produces the SAME result twice → STOP repeating. "
+            f"Switch to a DIFFERENT metric, partition, resource, or namespace. "
+            f"Maximum 2 identical checks per method — then pivot.\n\n"
         )
         # Add fault-specific verification hints when metadata is available
         verification_hints = _get_fault_verification_hints(
@@ -847,58 +902,27 @@ def _build_layer2_messages(
                 f"\n### Fault-Specific Verification Hints\n"
                 f"{verification_hints}\n\n"
             )
-        # Injection method note: when kubectl_exec was used, the injection method
-        # may differ from the skill case's recommendation
+        # Injection method note: when kubectl_exec was used
         if injection_method == "kubectl_exec":
             context += (
                 "\n### Injection Method Note\n"
                 "The fault was injected via `kubectl exec` (the standard `blade_create` tool "
                 "was unavailable). This means the injection method may differ from the skill "
                 "case's recommended approach. You MUST:\n"
-                "1. Check whether the ACTUAL injection method (see Fault Context above) "
-                "produces the same fault effects described in the skill case's verification steps\n"
-                "2. If the expected fault effect differs (e.g., skill case expects 'Endpoints "
-                "removed' but network loss leaves Endpoints present), note this as a WARNING "
-                "and adapt your verification accordingly\n"
-                "3. In your Verification Checklist, explicitly state whether each step's "
-                "expected outcome is achievable with the actual injection method\n\n"
+                "1. Check whether the ACTUAL injection method produces the same fault effects "
+                "described in the skill case's verification steps\n"
+                "2. If the expected fault effect differs, note this as a WARNING "
+                "and adapt your verification accordingly\n\n"
             )
-        context += (
-            f"**POLLING STRATEGY (CRITICAL)**: Fault injection has delay — the fault effect may take 5-30 seconds to appear. "
-            f"You MUST check at least 3 times with ~10 seconds between checks before concluding. "
-            f"Follow this pattern:\n"
-            f"  1st check → if no effect seen, do NOT conclude 'failed'. Just say 'Checking again...' and re-check.\n"
-            f"  2nd check → if still no effect, note the elapsed time and check once more.\n"
-            f"  3rd check → only now, if still no effect after 3 checks, you may conclude 'failed'.\n"
-            f"If any check shows the fault IS in effect, conclude 'passed' immediately (no need for more checks).\n\n"
-            f"**CRITICAL**: If after 3 checks the fault effect is NOT observable "
-            f"(e.g., all endpoints still present, no 5xx errors, no resource pressure), "
-            f"you MUST conclude Layer2 as 'failed' and Overall as 'unverified'. "
-            f"Do NOT conclude 'partial' when NO evidence of the fault was found — "
-            f"'partial' is only for when SOME evidence exists but is inconclusive.\n\n"
-            f"**ADAPTIVE VERIFICATION PRINCIPLE**:\n"
-            f"If the SAME verification command produces the SAME result twice:\n"
-            f"1. STOP repeating — the result will not change with a 3rd attempt.\n"
-            f"2. ASK yourself: Is there a DIFFERENT metric, partition, resource, or "
-            f"namespace I should be checking instead?\n"
-            f"3. EXAMPLES of strategy pivots:\n"
-            f"   - Disk: df showed no change on one partition → check OTHER partitions "
-            f"(overlay vs root), or check node conditions (DiskPressure) instead\n"
-            f"   - CPU: top showed no change → check cgroups, or check application latency\n"
-            f"   - Network: curl succeeded → check different endpoints, or check packet loss "
-            f"with a different tool\n"
-            f"   - Pod: Pod still Running → check if the correct label selector was used, "
-            f"or check events for recent changes\n"
-            f"4. Maximum 2 identical checks per verification method — then SWITCH to a "
-            f"different approach. Repeating a non-productive command wastes verification "
-            f"budget and delays detection of the real issue.\n\n"
-            f"{_BASELINE_INTEGRITY_PROMPT}\n\n"
-            f"**Layer 1 Limitation**: Layer 1 only checks whether the ChaosBlade experiment "
-            f"exists and reports Status=Running/Success. It does NOT verify that the fault "
-            f"effect is actually observable on the target. A Layer 1 'passed' result means "
-            f"the experiment is registered, NOT that the fault is taking effect. "
-            f"Your Layer 2 verification is the ONLY way to confirm the fault is actually working.\n\n"
-        )
+        # ── Conditional rules (only when relevant) ──
+        if baseline and baseline.get("success_count", 0) > 0:
+            context += f"{_BASELINE_INTEGRITY_PROMPT}\n\n"
+        if blade_uid:
+            context += (
+                "**Layer 1 Limitation**: Layer 1 only checks whether the ChaosBlade experiment "
+                "is registered. It does NOT verify that the fault effect is observable. "
+                "Your Layer 2 verification is the ONLY way to confirm the fault is working.\n\n"
+            )
         # BusyBox / minimal container note: conditional on injection method
         if injection_method == "kubectl_exec":
             context += (
@@ -913,42 +937,27 @@ def _build_layer2_messages(
         else:
             context += (
                 "**NOTE**: Some minimal container images lack common shell utilities (top, ps, netstat, etc.). "
-                "If kubectl(subcommand='exec', ...) returns empty output or \"command not found\", do NOT retry similar commands — "
-                "the container simply lacks those tools. Instead, use kubectl(subcommand='describe', ...) for Pod-level "
-                "metrics (restart count, conditions, events) as an alternative.\n\n"
+                "If kubectl(subcommand='exec', ...) returns empty output or \"command not found\", do NOT retry — "
+                "use kubectl(subcommand='describe', ...) instead.\n\n"
             )
+        # ── Always-on helpers ──
         context += (
-            f"### Coverage Verification\n"
-            f"Before concluding Layer2, verify that ALL expected target resources show the fault effect:\n"
-            f"1. Compare affected_count from Layer 1 against the number of matching target resources\n"
-            f"2. If coverage is incomplete (e.g., 1/3 pods affected), investigate WHY:\n"
-            f"   - ChaosBlade `--labels` defaults to affecting ONE matching resource unless `--effect-count` is specified\n"
-            f"   - Use `kubectl get pods -l <label> -n <ns>` to count matching resources\n"
-            f"3. Report coverage gaps in VERIFICATION_RESULT → Warnings (e.g., \"Coverage: 1/3 pods affected\")\n\n"
-            f"### Unexpected Metric Changes\n"
-            f"When comparing metrics across ALL target resources, investigate any UNEXPECTED changes "
-            f"NOT explained by the fault injection:\n"
-            f"1. If a resource shows metric changes contrary to the fault's expected effect (e.g., memory "
-            f"DECREASED on non-targeted pods), note this as an anomaly\n"
-            f"2. Check `kubectl describe pod` for recent events (restarts, evictions, OOMKilled)\n"
-            f"3. Common causes: pod restart (metrics reset), HPA scaling (new pods with baseline metrics), "
-            f"metrics-server sampling variation (15-30s intervals)\n"
-            f"4. Include anomalies in your Negative Evidence section\n\n"
-            f"### Application Impact Verification\n"
-            f"When the skill case requires verifying application-level impact (e.g., \"响应延迟增大\"), "
-            f"you MUST perform at least ONE application-level check:\n"
-            f"1. `kubectl logs` — search for timeout/error/latency keywords\n"
-            f"2. `kubectl exec` — run curl/wget against the service to measure response time\n"
-            f"3. `kubectl get events` — check for application-level events (Evicted, Unhealthy)\n"
-            f"4. If container lacks tools (no curl/wget), use `kubectl describe` as alternative\n"
-            f"5. If a skill verification step cannot be executed, mark it as [SKIPPED] with reason — do NOT omit it\n\n"
-            f"### Debug Pod Cleanup (CRITICAL)\n"
-            f"If you create a debug pod via `kubectl debug node/...`, you MUST delete it before "
-            f"finishing verification using `kubectl delete pod <debug-pod-name> -n <namespace> "
-            f"--force --grace-period=0`. Add cleanup as a final step in your verification checklist. "
-            f"Failure to clean up debug pods will leak cluster resources.\n"
-            f"{convergence_hint}"
+            f"### Test Pod Namespace Selection\n"
+            f"When you need a Running application pod for verification tests "
+            f"(DNS resolution, network connectivity, service calls), do NOT "
+            f"only search the `default` namespace. Search in the TARGET "
+            f"namespace first ({target.get('namespace', '') or 'see Fault Context'}), "
+            f"then other namespaces with workloads. For cluster-wide faults "
+            f"(DNS, node-level), any Running pod with shell access can serve "
+            f"as a test target.\n\n"
         )
+        if blade_scope == "node":
+            context += (
+                f"### Debug Pod Cleanup\n"
+                f"If you create a debug pod via `kubectl debug node/...`, you MUST delete it "
+                f"before finishing verification. Add cleanup as a final step in your checklist.\n"
+            )
+        context += convergence_hint
         messages.append(HumanMessage(
             content=context,
             additional_kwargs={_VERIFIER_CONTEXT_KWARGS_KEY: True},

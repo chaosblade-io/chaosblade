@@ -53,7 +53,11 @@ class TestConfirmationGate:
 
         call_args = mock_interrupt.call_args[0][0]
         assert call_args["skill_name"] == "pod-delete"
-        assert call_args["target"] == {"namespace": "default", "names": ["my-pod"]}
+        # confirmation_gate projects fault_spec to the 4-key target
+        # dict shape — the order of fields and the inclusion of
+        # labels/resource_type is contract-tied to the spec layout.
+        assert call_args["target"]["namespace"] == "default"
+        assert call_args["target"]["names"] == ["my-pod"]
         assert "plan_summary" in call_args
         assert call_args["safety_status"] == "safe"
 
@@ -134,14 +138,19 @@ class TestConfirmationGate:
     async def test_none_target_handled(self, sample_agent_state):
         state = sample_agent_state
         state["skill_name"] = "pod-delete"
-        state["target"] = None
+        # Clear fault_spec so confirmation_gate produces an empty-shape
+        # target dict (the FaultSpec's default zero values).
+        state["fault_spec"] = None
         state["plan"] = "Plan"
 
         with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
             await confirmation_gate(state)
 
         call_args = mock_interrupt.call_args[0][0]
-        assert call_args["target"] == {}
+        # When no spec on record, target dict is all empty defaults.
+        assert call_args["target"] == {
+            "namespace": "", "names": [], "labels": {}, "resource_type": "",
+        }
 
     @pytest.mark.asyncio
     async def test_unexpected_decision_rejected(self, sample_agent_state):
@@ -155,3 +164,58 @@ class TestConfirmationGate:
             result = await confirmation_gate(state)
 
         assert result["safety_status"] == "rejected"
+
+    @pytest.mark.asyncio
+    async def test_fault_intent_brief_in_confirmation_info(self, sample_agent_state):
+        """fault_intent (fault_type / scope / target / action) must reach
+        the TUI confirm card. Prior to wiring, L2 only had ``target``
+        (namespace + names) — operators had to reverse-engineer the
+        fault category from ``params`` keys (e.g. seeing ``mem-percent``
+        to infer mem-load). Surfacing the L1 semantic classification
+        in L2's payload makes "this is a mem-load" visible at a glance.
+
+        Fixture-provided spec is pod/kill/delete → fault_type
+        ``pod-kill-delete``.
+        """
+        state = sample_agent_state
+        state["skill_name"] = "pod-delete"
+        state["plan"] = "Delete pod"
+        state["safety_status"] = "safe"
+
+        with patch(
+            "chaos_agent.agent.nodes.confirmation_gate.interrupt",
+            return_value="approved",
+        ) as mock_interrupt:
+            await confirmation_gate(state)
+
+        payload = mock_interrupt.call_args[0][0]
+        intent = payload.get("fault_intent")
+        assert intent is not None, "fault_intent must be present in confirm payload"
+        assert intent["fault_type"] == "pod-kill-delete"
+        assert intent["scope"] == "pod"
+        assert intent["target"] == "kill"
+        assert intent["action"] == "delete"
+
+    @pytest.mark.asyncio
+    async def test_fault_intent_is_none_when_spec_empty(self, sample_agent_state):
+        """When the spec is missing / incomplete (no fault_type derivable),
+        the field must be ``None`` — not ``{}`` and not a half-empty dict
+        — so the TUI's truthy check (``if faultIntent``) correctly
+        suppresses the Fault row instead of rendering ``"  ()"``.
+
+        Empty spec is the dry-run / clarification-incomplete path.
+        """
+        state = sample_agent_state
+        state["fault_spec"] = None
+        state["skill_name"] = "skill"
+        state["plan"] = "p"
+        state["safety_status"] = "safe"
+
+        with patch(
+            "chaos_agent.agent.nodes.confirmation_gate.interrupt",
+            return_value="approved",
+        ) as mock_interrupt:
+            await confirmation_gate(state)
+
+        payload = mock_interrupt.call_args[0][0]
+        assert payload.get("fault_intent") is None

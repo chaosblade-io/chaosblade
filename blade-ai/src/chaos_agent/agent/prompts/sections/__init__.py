@@ -8,7 +8,7 @@ from chaos_agent.agent.prompts.sections.execution import (
     get_execution_directives_section,
 )
 from chaos_agent.agent.prompts.sections.experience_section import get_experience_section
-from chaos_agent.agent.prompts.sections.identity import get_role_section, get_env_section
+from chaos_agent.agent.prompts.sections.identity import get_role_section, get_executor_role_section, get_env_section
 from chaos_agent.agent.prompts.sections.intent import (
     get_intent_role_section,
     get_intent_critical_rules_section,

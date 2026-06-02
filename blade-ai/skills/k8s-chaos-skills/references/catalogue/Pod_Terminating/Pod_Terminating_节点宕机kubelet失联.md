@@ -12,7 +12,7 @@
 **演练步骤**：
 1. 定位运行应用 A 的目标节点
 2. 先通过 kubectl 删除应用 A 在目标节点上的 Pod（触发 Terminating）
-3. 立即使用 chaosblade 对目标节点注入网络完全丢包（--percent 100），并设置 `--timeout 300`，模拟节点宕机导致 kubelet 失联
+3. 立即使用 chaosblade 对目标节点注入网络完全丢包（node-network drop 即全量丢包，不需要 --percent），并设置 `--timeout 300`，模拟节点宕机导致 kubelet 失联
 4. 观察 Pod Terminating 状态持续时间
 
 **注入验证**：

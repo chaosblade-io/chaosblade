@@ -21,7 +21,6 @@ from chaos_agent.agent.prompts.sections.workflow import (
 class TestRoleSectionBrief:
     def test_brief_keeps_critical_tokens(self):
         s = get_role_section(brief=True)
-        assert "kube-system" in s
         assert "Safety Rules" in s
         assert "Chaos Engineering Agent" in s
 
@@ -39,10 +38,10 @@ class TestRoleSectionBrief:
 
 
 class TestSafetySectionLevel:
-    def test_hard_only_keeps_header_and_kube_system(self):
+    def test_hard_only_keeps_header_and_namespace_blacklist(self):
         s = get_safety_section(level="hard_only")
         assert "Safety Rules" in s
-        assert "kube-system" in s
+        assert "namespace blacklist" in s
 
     def test_hard_only_keeps_caution_compliance(self):
         s = get_safety_section(level="hard_only")
@@ -110,13 +109,14 @@ class TestWorkflowSectionTokens:
 
 
 class TestGuidelinesSectionMethodSwitching:
-    def test_default_includes_method_switching(self):
-        assert "Injection Method Switching" in get_guidelines_section()
+    def test_default_includes_conflict_check(self):
+        # Method switching content moved to execution directives.
+        # include_method_switching=True now controls Conflict Check inclusion.
+        assert "Conflict Check" in get_guidelines_section()
 
-    def test_omit_method_switching(self):
+    def test_omit_conflict_check(self):
         s = get_guidelines_section(include_method_switching=False)
-        assert "Injection Method Switching" not in s
-        assert "METHOD CONSTRAINT" not in s
+        assert "Conflict Check" not in s
 
     def test_omit_keeps_blade_uid_token(self):
         # test_prompts::test_guidelines_section_contains_blade_uid asserts this.

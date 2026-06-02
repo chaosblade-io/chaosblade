@@ -8,9 +8,9 @@ from chaos_agent.agent.factory import _build_skill_tools, create_agent
 class TestBuildSkillTools:
     """Tests for _build_skill_tools."""
 
-    def test_returns_six_tools(self, mock_registry):
+    def test_returns_eight_tools(self, mock_registry):
         tools = _build_skill_tools(mock_registry)
-        assert len(tools) == 6
+        assert len(tools) == 8
 
     def test_tool_names(self, mock_registry):
         tools = _build_skill_tools(mock_registry)
@@ -20,6 +20,7 @@ class TestBuildSkillTools:
         assert "read_file" in tool_names
         assert "write_file" in tool_names
         assert "save_fault_plan" in tool_names
+        assert "finish_planning" in tool_names
         assert "execute_skill_script" in tool_names
         # search_files was removed in P2-1: it was registered but never bound
         # to any phase, so it served no purpose.
@@ -220,15 +221,33 @@ class TestPhaseToolSurface:
             assert required in names, f"phase2 missing {required}"
 
     def test_phase1_prompt_omits_disallowed_tools(self):
-        """Phase 1 system prompt must not advertise removed tools."""
+        """Phase 1 system prompt must not advertise removed tools AS USABLE.
+
+        ``write_file`` and ``execute_skill_script`` are intentionally listed
+        in the workflow's "NOT available in Phase 1" section so the LLM
+        knows which tools it'll find in Phase 2 (the listing reduces test-
+        and-fail tool calls — see Layer C of the phase 1 readonly plan).
+        We assert the listings appear ONLY in the not-available context,
+        not as positive recommendations.
+        """
         from chaos_agent.agent.prompts import build_inject_system_prompt
 
         prompt = build_inject_system_prompt(skill_catalog="(none)")
 
-        # Removed in Phase 1 — must not appear in tool guidance
-        assert "write_file" not in prompt or "Do NOT write files" in prompt
+        # write_file: only allowed mention is the "Do NOT write files"
+        # advisory or the "NOT available" section listing
+        assert (
+            "write_file" not in prompt
+            or "Do NOT write files" in prompt
+            or "NOT available in Phase 1" in prompt
+        )
+        # search_files is fully dead (no binding anywhere), should be
+        # completely absent
         assert "search_files" not in prompt
-        assert "execute_skill_script" not in prompt
+        # execute_skill_script: must not appear as an available tool.
+        # It may appear in the NOT-available listing or not at all —
+        # both are safe since runtime rejects it regardless.
+        assert "execute_skill_script" not in prompt or "NOT available" in prompt or "not available" in prompt.lower()
 
     @pytest.mark.asyncio
     async def test_no_phase_binds_dead_tools(self, mock_registry):

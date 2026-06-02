@@ -526,6 +526,28 @@ def _has_injection_verification_section(content: str) -> bool:
     return "注入验证" in content
 
 
+_CANDIDATE_SPLIT_RE = re.compile(r'^---\s*Candidate\s+\d+\s*:.*?---\s*$', re.MULTILINE)
+
+
+def _split_candidates(content: str) -> list[str]:
+    """Split multi-candidate skill_case into individual candidate texts.
+
+    Returns a list of candidate bodies (1-indexed in the original text,
+    0-indexed in the returned list).  Single-candidate content returns
+    ``[content]`` unchanged.
+    """
+    markers = list(_CANDIDATE_SPLIT_RE.finditer(content))
+    if len(markers) < 2:
+        return [content]
+
+    candidates: list[str] = []
+    for i, m in enumerate(markers):
+        body_start = m.end()
+        body_end = markers[i + 1].start() if i + 1 < len(markers) else len(content)
+        candidates.append(content[body_start:body_end].strip())
+    return candidates
+
+
 def _extract_verification_step_descriptions(content: str) -> list[str]:
     """Extract verification step descriptions from skill case's 注入验证 section.
 

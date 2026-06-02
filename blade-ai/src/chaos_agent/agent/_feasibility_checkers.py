@@ -443,7 +443,7 @@ class NetworkFeasibilityChecker:
             )
 
         interface = spec.params.get("interface", "eth0")
-        iface_exists = await _check_interface_exists(
+        iface_exists, iface_detail = await _check_interface_exists(
             pod_name, namespace, interface, kubeconfig
         )
         if iface_exists is False:
@@ -457,6 +457,56 @@ class NetworkFeasibilityChecker:
                 recommendation=(
                     f"Check available interfaces: kubectl exec {pod_name} "
                     f"-n {namespace} -- ip link show"
+                ),
+            )
+        if iface_exists is None:
+            return FeasibilityReport(
+                severity=FeasibilitySeverity.TIGHT,
+                headroom=0.5,
+                current_value=f"interface check failed: {iface_detail}",
+                limit_value="",
+                target_value=f"--interface {interface}",
+                message=(
+                    f"Cannot verify interface '{interface}' in Pod {pod_name}: {iface_detail}"
+                ),
+                recommendation=(
+                    f"Verify: kubectl exec {pod_name} -n {namespace} "
+                    f"-- cat /sys/class/net/{interface}/operstate"
+                ),
+            )
+
+        has_iptables, iptables_detail = await _check_iptables_available(
+            pod_name, namespace, kubeconfig
+        )
+        if has_iptables is False:
+            return FeasibilityReport(
+                severity=FeasibilitySeverity.IMPOSSIBLE,
+                headroom=0.0,
+                current_value="iptables not found",
+                limit_value="",
+                target_value="",
+                message=(
+                    f"iptables not available in Pod {pod_name} "
+                    f"— ChaosBlade network faults require iptables"
+                ),
+                recommendation=(
+                    "Use a container image that includes iptables, "
+                    "or consider CNI-level network policy injection"
+                ),
+            )
+        if has_iptables is None:
+            return FeasibilityReport(
+                severity=FeasibilitySeverity.TIGHT,
+                headroom=0.5,
+                current_value=f"iptables check failed: {iptables_detail}",
+                limit_value="",
+                target_value="",
+                message=(
+                    f"Cannot verify iptables in Pod {pod_name}: {iptables_detail}"
+                ),
+                recommendation=(
+                    "Network injection may fail if iptables is missing. "
+                    f"Verify: kubectl exec {pod_name} -n {namespace} -- iptables --version"
                 ),
             )
 
@@ -480,7 +530,7 @@ class NetworkFeasibilityChecker:
         return FeasibilityReport(
             severity=FeasibilitySeverity.OK,
             headroom=1.0,
-            current_value=f"phase=Running, interface={interface} present",
+            current_value=f"phase=Running, interface={interface} present, iptables available",
             limit_value="",
             target_value="",
             message="Network injection feasible",
@@ -516,10 +566,13 @@ async def _fetch_pod_phase(
 
 async def _check_interface_exists(
     pod_name: str, namespace: str, interface: str, kubeconfig: str
-) -> bool | None:
+) -> tuple[bool | None, str]:
     """Check if network interface exists in pod via /sys/class/net/.
 
-    Returns True if exists, False if confirmed missing, None if cannot determine.
+    Returns:
+        (True, "") — interface confirmed present
+        (False, reason) — interface confirmed missing
+        (None, reason) — indeterminate (timeout/unexpected error)
     """
     from chaos_agent.config.settings import settings
     from chaos_agent.tools.kubectl import _build_kubectl_global_args
@@ -532,16 +585,52 @@ async def _check_interface_exists(
 
     try:
         result = await run_command(
-            cmd, timeout=5, task_id="", skip_guard=True, source="feasibility-check",
+            cmd, timeout=10, task_id="", skip_guard=True, source="feasibility-check",
         )
         if result.exit_code == 0:
-            return True
-        stderr = (result.stderr or "").lower()
-        if "no such file or directory" in stderr:
-            return False
-        return None
-    except Exception:
-        return None
+            return True, ""
+        stderr = (result.stderr or "").strip()
+        if "no such file or directory" in stderr.lower():
+            return False, stderr
+        return None, stderr or f"exit code {result.exit_code}"
+    except Exception as exc:
+        return None, str(exc)
+
+
+async def _check_iptables_available(
+    pod_name: str, namespace: str, kubeconfig: str
+) -> tuple[bool | None, str]:
+    """Check if iptables is available in the pod container.
+
+    ChaosBlade network faults (drop/delay/loss/corrupt) work by injecting
+    iptables rules inside the target container's network namespace.
+
+    Returns:
+        (True, "") — confirmed available
+        (False, reason) — confirmed missing
+        (None, reason) — indeterminate (timeout/unexpected error)
+    """
+    from chaos_agent.config.settings import settings
+    from chaos_agent.tools.kubectl import _build_kubectl_global_args
+    from chaos_agent.tools.shell import run_command
+
+    kubectl_path = settings.kubectl_path
+    global_args = _build_kubectl_global_args(kubeconfig)
+    cmd = [kubectl_path, *global_args, "exec", pod_name, "-n", namespace,
+           "--", "iptables", "--version"]
+
+    try:
+        result = await run_command(
+            cmd, timeout=10, task_id="", skip_guard=True, source="feasibility-check",
+        )
+        if result.exit_code == 0:
+            return True, ""
+        stderr = (result.stderr or "").strip()
+        if "not found" in stderr.lower():
+            return False, stderr
+        return None, stderr or f"exit code {result.exit_code}"
+    except Exception as exc:
+        return None, str(exc)
 
 
 async def _check_active_network_experiment(
@@ -582,6 +671,164 @@ async def _check_active_network_experiment(
 
 
 # ---------------------------------------------------------------------------
+# Disk checker
+# ---------------------------------------------------------------------------
+
+
+class DiskFeasibilityChecker:
+    blade_target = "disk"
+
+    async def assess(
+        self, spec: "FaultSpec", kubeconfig: str
+    ) -> FeasibilityReport | None:
+        path = spec.params.get("path", "/")
+        is_node = spec.scope == "node"
+
+        if is_node:
+            if not spec.names:
+                return None
+            node_name = spec.names[0]
+            usage_pct, total_gb = await _fetch_node_disk_usage(
+                node_name, path, kubeconfig
+            )
+        else:
+            pod_name = await _resolve_first_pod(spec, kubeconfig)
+            if not pod_name:
+                return None
+            usage_pct, total_gb = await _fetch_pod_disk_usage(
+                pod_name, spec.namespace or "default", path, kubeconfig
+            )
+
+        if usage_pct is None:
+            return None
+
+        total_str = f"{total_gb}G" if total_gb else "?"
+
+        if spec.blade_action == "fill":
+            target_pct = _parse_int_param(spec.params.get("percent"))
+            if target_pct is None:
+                target_pct = 90
+            headroom = (target_pct - usage_pct) / 100
+            if headroom <= _HEADROOM_IMPOSSIBLE:
+                return FeasibilityReport(
+                    severity=FeasibilitySeverity.IMPOSSIBLE,
+                    headroom=max(0.0, headroom),
+                    current_value=f"{usage_pct}% (path={path})",
+                    limit_value=total_str,
+                    target_value=f"{target_pct}%",
+                    message=(
+                        f"Disk at {usage_pct}% on {path}, target {target_pct}% "
+                        f"— already near/above target"
+                    ),
+                    recommendation="Choose a path with more free space",
+                )
+            elif headroom <= _HEADROOM_TIGHT:
+                return FeasibilityReport(
+                    severity=FeasibilitySeverity.TIGHT,
+                    headroom=headroom,
+                    current_value=f"{usage_pct}% (path={path})",
+                    limit_value=total_str,
+                    target_value=f"{target_pct}%",
+                    message=(
+                        f"Disk at {usage_pct}% on {path}, target {target_pct}% "
+                        f"— tight headroom"
+                    ),
+                    recommendation="Injection may succeed but fill amount is small",
+                )
+            return FeasibilityReport(
+                severity=FeasibilitySeverity.OK,
+                headroom=headroom,
+                current_value=f"{usage_pct}% (path={path})",
+                limit_value=total_str,
+                target_value=f"{target_pct}%",
+                message=f"Sufficient disk headroom ({headroom:.0%})",
+                recommendation="",
+            )
+
+        # burn: just verify path is accessible and report current usage
+        return FeasibilityReport(
+            severity=FeasibilitySeverity.OK,
+            headroom=1.0 - usage_pct / 100,
+            current_value=f"{usage_pct}% (path={path})",
+            limit_value=total_str,
+            target_value=f"IO burn on {path}",
+            message=f"Disk burn feasible, current usage {usage_pct}%",
+            recommendation="",
+        )
+
+
+async def _fetch_node_disk_usage(
+    node_name: str, path: str, kubeconfig: str
+) -> tuple[int | None, int | None]:
+    """Get disk usage % and total GB for a path on a node via tool pod.
+
+    Uses `kubectl exec <tool-pod-on-node> -- df <path>` to check.
+    Falls back to `kubectl get node` ephemeral-storage if tool pod unavailable.
+    """
+    import re as _re
+
+    # Find tool pod on target node
+    stdout = await _run_kubectl(
+        ["get", "pods", "-n", "chaosblade", "-l", "app=otel-c-tool",
+         "-o", "wide", "--no-headers"],
+        kubeconfig, timeout=8,
+    )
+    if not stdout:
+        return None, None
+
+    tool_pod = None
+    for line in stdout.strip().splitlines():
+        cols = _re.split(r"\s{2,}", line.strip())
+        if len(cols) >= 7 and cols[2] == "Running" and cols[6] == node_name:
+            tool_pod = cols[0]
+            break
+
+    if not tool_pod:
+        return None, None
+
+    # df on the path inside the tool pod (host filesystem is mounted)
+    df_out = await _run_kubectl(
+        ["exec", tool_pod, "-n", "chaosblade", "--",
+         "df", "-P", path],
+        kubeconfig, timeout=10,
+    )
+    return _parse_df_output(df_out)
+
+
+async def _fetch_pod_disk_usage(
+    pod_name: str, namespace: str, path: str, kubeconfig: str
+) -> tuple[int | None, int | None]:
+    """Get disk usage % and total GB for a path inside a pod."""
+    df_out = await _run_kubectl(
+        ["exec", pod_name, "-n", namespace, "--",
+         "df", "-P", path],
+        kubeconfig, timeout=10,
+    )
+    return _parse_df_output(df_out)
+
+
+def _parse_df_output(df_out: str | None) -> tuple[int | None, int | None]:
+    """Parse `df -P` output → (usage_percent, total_gb)."""
+    if not df_out:
+        return None, None
+    lines = df_out.strip().splitlines()
+    if len(lines) < 2:
+        return None, None
+    # df -P format: Filesystem  1024-blocks  Used  Available  Capacity  Mounted
+    parts = lines[-1].split()
+    if len(parts) < 5:
+        return None, None
+    try:
+        total_kb = int(parts[1])
+        total_gb = round(total_kb / 1024 / 1024, 1)
+        pct_str = parts[4].replace("%", "")
+        usage_pct = int(pct_str)
+        return usage_pct, total_gb
+    except (ValueError, IndexError):
+        return None, None
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -590,3 +837,4 @@ def register_all() -> None:
     register_feasibility_checker(MemoryFeasibilityChecker())
     register_feasibility_checker(CpuFeasibilityChecker())
     register_feasibility_checker(NetworkFeasibilityChecker())
+    register_feasibility_checker(DiskFeasibilityChecker())

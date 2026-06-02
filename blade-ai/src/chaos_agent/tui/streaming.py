@@ -333,7 +333,9 @@ _THINKING_NODE_PHASE_MAP = {
     "execute_loop": "inject",
     "direct_execute": "inject",
     "verifier_loop": "verify",
+    "finalize_verification": "verify",
     "recover_verifier_loop": "recovery",
+    "finalize_recover_verification": "recovery",
     "recover_handler": "recovery",
 }
 

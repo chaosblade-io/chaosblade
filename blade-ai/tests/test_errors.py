@@ -126,13 +126,12 @@ class TestRecoverableErrors:
 
 
 # ---------------------------------------------------------------------------
-# Tests for extract_llm_diagnosis / enrich_failure_reason
+# Tests for extract_llm_diagnosis
 # ---------------------------------------------------------------------------
 
 from chaos_agent.errors import (
     _DIAGNOSIS_FALLBACK,
     extract_llm_diagnosis,
-    enrich_failure_reason,
 )
 from langchain_core.messages import AIMessage, HumanMessage
 
@@ -188,20 +187,6 @@ class TestExtractLlmDiagnosis:
         assert "Content diagnosis" in result
 
 
-class TestEnrichFailureReason:
-    """Test enrich_failure_reason helper."""
-
-    def test_appends_diagnosis(self):
-        msgs = [AIMessage(content="Node missing ChaosBlade Agent, injection blocked")]
-        result = enrich_failure_reason("verification_failed: Layer1=skipped", msgs)
-        assert result.startswith("verification_failed: Layer1=skipped")
-        assert "| llm_analysis:" in result
-        assert "Node missing ChaosBlade Agent" in result
-
-    def test_fallback_when_no_diagnosis(self):
-        result = enrich_failure_reason("verification_failed: Layer1=skipped", [])
-        assert "| llm_analysis:" in result
-        assert _DIAGNOSIS_FALLBACK in result
 
 
 class TestShouldAutoReplan:

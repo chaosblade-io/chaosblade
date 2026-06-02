@@ -37,11 +37,31 @@ def get_bundled_blade_path() -> str:
 
     The lookup order is:
 
-    1. PyInstaller bundle: ``<base>/vendor/chaosblade/blade``
-    2. Source tree: ``<project-root>/vendor/chaosblade/blade``
-    3. Environment variable ``BLADE_AI_BLADE_PATH``
-    4. System PATH (just ``"blade"``)
+    1. Runtime vendor dir: ``~/.blade-ai/vendor/chaosblade/blade``
+    2. Wheel-bundled (platform wheel): ``<chaos_agent>/_vendor/chaosblade/blade``
+    3. PyInstaller bundle: ``<base>/vendor/chaosblade/blade``
+    4. Source tree: ``<project-root>/vendor/chaosblade/blade``
+    5. Environment variable ``BLADE_AI_BLADE_PATH``
+    6. System PATH (just ``"blade"``)
     """
+    # Check runtime vendor dir (pip install + first-use download)
+    from chaos_agent.config.settings import settings
+    runtime_blade = settings.chaosblade_vendor_dir.expanduser() / "chaosblade" / "blade"
+    if runtime_blade.is_file():
+        runtime_blade.chmod(runtime_blade.stat().st_mode | 0o111)
+        logger.debug(f"Using runtime vendor blade: {runtime_blade}")
+        return str(runtime_blade)
+
+    # Check wheel-bundled location (platform wheel force-includes the binary
+    # at chaos_agent/_vendor/chaosblade/). ``parents[1]`` from this file
+    # (utils/blade_paths.py) is the ``chaos_agent`` package dir. pip may
+    # strip the +x bit from zip members, so re-add it here.
+    wheel_blade = Path(__file__).resolve().parents[1] / "_vendor" / "chaosblade" / "blade"
+    if wheel_blade.is_file():
+        wheel_blade.chmod(wheel_blade.stat().st_mode | 0o111)
+        logger.debug(f"Using wheel-bundled blade: {wheel_blade}")
+        return str(wheel_blade)
+
     base = _get_base_path()
 
     # Check bundled location
@@ -74,3 +94,30 @@ def get_bundled_blade_path() -> str:
 
     logger.warning("blade binary not found (not bundled, not in PATH)")
     return "blade"
+
+
+def is_executable(cmd: str) -> bool:
+    """Return True if ``cmd`` resolves to a usable executable.
+
+    ``cmd`` may be either shape a binary resolver returns:
+      - a full / relative path (bundled, runtime vendor, repo, configured)
+      - a bare command name to resolve on PATH
+
+    These need different checks, and crucially they must NOT be conflated
+    by passing a path to ``shutil.which``. On Windows before Python 3.12,
+    ``shutil.which`` mishandles a ``cmd`` that contains a directory
+    component and returns ``None`` even for a valid executable — and the
+    project's ``requires-python = ">=3.11"`` puts 3.11-on-Windows in scope.
+    So: anything with a directory component is checked as a file directly;
+    only a bare name goes through ``shutil.which``.
+
+    Shared by the blade and kubectl presence checks (preflight) and the
+    runtime blade-availability probe (chaosblade_installer).
+    """
+    if not cmd:
+        return False
+    if os.path.dirname(cmd):
+        # Has a path component → check the file directly, never via which().
+        return os.path.isfile(cmd)
+    # Bare command name → PATH lookup (no directory component, Windows-safe).
+    return shutil.which(cmd) is not None

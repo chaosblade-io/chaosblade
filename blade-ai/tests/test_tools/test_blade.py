@@ -1,6 +1,6 @@
 """Tests for ChaosBlade CLI tool wrappers."""
 
-from chaos_agent.tools.blade import _build_kubeconfig_arg, blade_create, blade_destroy, blade_query_k8s, blade_status
+from chaos_agent.tools.blade import _build_kubeconfig_arg, blade_create, blade_destroy, blade_help, blade_query_k8s, blade_status
 
 
 class TestBuildKubeconfigArg:
@@ -300,6 +300,49 @@ class TestBladeStatus:
         kwargs = mock_run_command.call_args[1]
         env_override = kwargs.get("env_override")
         assert env_override == {"KUBECONFIG": "/my/kubeconfig"}
+
+
+class TestBladeHelp:
+    """Test blade_help tool function."""
+
+    async def test_help_toplevel(self, mock_run_command):
+        await blade_help.ainvoke({"subcommand": ""})
+        cmd = mock_run_command.call_args[0][0]
+        assert cmd == ["blade", "-h"]
+
+    async def test_help_create(self, mock_run_command):
+        await blade_help.ainvoke({"subcommand": "create"})
+        cmd = mock_run_command.call_args[0][0]
+        assert cmd == ["blade", "create", "-h"]
+
+    async def test_help_deep_subcommand(self, mock_run_command):
+        await blade_help.ainvoke({"subcommand": "create k8s pod-network drop"})
+        cmd = mock_run_command.call_args[0][0]
+        assert cmd == ["blade", "create", "k8s", "pod-network", "drop", "-h"]
+
+    async def test_help_filters_flags(self, mock_run_command):
+        await blade_help.ainvoke({"subcommand": "create k8s --names foo"})
+        cmd = mock_run_command.call_args[0][0]
+        assert cmd == ["blade", "create", "k8s", "foo", "-h"]
+        assert "--names" not in cmd
+
+    async def test_help_deduplicates_h(self, mock_run_command):
+        await blade_help.ainvoke({"subcommand": "create -h"})
+        cmd = mock_run_command.call_args[0][0]
+        assert cmd == ["blade", "create", "-h"]
+        assert cmd.count("-h") == 1
+
+    async def test_help_short_timeout(self, mock_run_command):
+        await blade_help.ainvoke({"subcommand": "create"})
+        call_kwargs = mock_run_command.call_args[1]
+        assert call_kwargs.get("timeout") == 10
+
+    async def test_help_exception(self, mocker):
+        import chaos_agent.tools.blade as blade_mod
+        mocker.patch.object(blade_mod, "_get_blade_path", return_value="blade")
+        mocker.patch.object(blade_mod, "run_command", side_effect=RuntimeError("no blade"))
+        result = await blade_help.ainvoke({"subcommand": "create"})
+        assert "Error" in result
 
 
 class TestBladeQueryK8s:

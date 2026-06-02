@@ -16,8 +16,11 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 logger = logging.getLogger(__name__)
 
-# kubectl subcommands that can perform fault injection (non-ChaosBlade methods)
-_KUBECTL_INJECT_SUBCOMMANDS = {"scale", "patch", "cordon", "taint", "set"}
+# kubectl subcommands that can perform fault injection (non-ChaosBlade methods).
+# Covers all mutating operations that an LLM might use as alternative injection
+# after blade_create fails: resource removal (delete), node evacuation (drain),
+# selector/label manipulation (label), and the original set (scale/patch/cordon/taint/set).
+_KUBECTL_INJECT_SUBCOMMANDS = {"scale", "patch", "cordon", "taint", "set", "delete", "drain", "label"}
 
 # Label selector for ChaosBlade tool pods
 _TOOL_POD_LABEL_SELECTOR = "app=otel-c-tool"
@@ -257,12 +260,20 @@ def discover_tool_pods_with_nodes(kubectl_output: str) -> list[tuple[str, str]]:
         line = line.strip()
         if not line:
             continue
-        # -o wide format: NAME READY STATUS RESTARTS AGE IP NODE ...
-        match = re.match(r"^(\S+)\s+\S+\s+(\S+)\s+\S+\s+\S+\s+\S+\s+(\S+)", line)
-        if match:
-            pod_name = match.group(1)
-            status = match.group(2)
-            node_name = match.group(3)
+        # -o wide format: NAME READY STATUS RESTARTS AGE IP NODE [NOMINATED NODE] [READINESS GATES]
+        # RESTARTS can be "0" or "1 (20d ago)" (contains spaces+parens), so we
+        # can't rely on fixed \S+ column counts. Instead: match NAME, READY,
+        # STATUS as the first 3 columns, then skip everything up to the NODE
+        # column by finding the node-like token (contains dots or "cn-" prefix).
+        #
+        # Robust approach: split by 2+ spaces (column separator), which handles
+        # the RESTARTS column as a single unit since kubectl aligns with spaces.
+        cols = re.split(r"\s{2,}", line)
+        # Expected cols: [NAME, READY, STATUS, RESTARTS, AGE, IP, NODE, ...]
+        if len(cols) >= 7:
+            pod_name = cols[0]
+            status = cols[2]
+            node_name = cols[6]
             if status == "Running":
                 running_pods.append((pod_name, node_name))
 
@@ -380,3 +391,136 @@ def _find_pod_name_from_aimessages(messages: list, *, v_args_hint: str = "") -> 
                 if pod_name:
                     return pod_name
     return None
+
+
+# ---------------------------------------------------------------------------
+# Injection step completeness check
+# ---------------------------------------------------------------------------
+
+# kubectl verbs that appear in skill case 演练步骤
+_STEP_KUBECTL_VERBS = frozenset({
+    "cordon", "uncordon", "taint", "delete", "scale", "patch",
+    "drain", "label", "annotate",
+})
+
+
+def _extract_drill_steps(skill_case: str) -> list[str]:
+    """Extract 演练步骤 from skill case content.
+
+    Returns the text of each numbered step.
+    """
+    if "演练步骤" not in skill_case:
+        return []
+    start = skill_case.index("演练步骤")
+    remainder = skill_case[start:]
+    header_end = remainder.find('\n')
+    if header_end < 0:
+        return []
+    body = remainder[header_end:]
+    next_section = re.search(r'\n\*\*[^*]+\*\*', body)
+    section = body[:next_section.start()] if next_section else body
+    steps = re.findall(r'^\s*\d+\.\s+(.+)', section, re.MULTILINE)
+    return [s.split('\n')[0].strip() for s in steps if s.strip()]
+
+
+# Chinese verb → kubectl subcommand mapping
+_CHINESE_VERB_MAP: dict[str, str] = {
+    "删除": "delete",
+    "缩容": "scale",
+    "扩容": "scale",
+    "标记为不可调度": "cordon",
+    "取消不可调度": "uncordon",
+    "添加污点": "taint",
+    "移除污点": "taint",
+}
+
+
+def _extract_kubectl_verbs_from_step(step_text: str) -> set[str]:
+    """Extract kubectl verb keywords from a single 演练步骤 text."""
+    found: set[str] = set()
+    lower = step_text.lower()
+    for verb in _STEP_KUBECTL_VERBS:
+        if verb in lower:
+            found.add(verb)
+    for cn, en in _CHINESE_VERB_MAP.items():
+        if cn in step_text:
+            found.add(en)
+    return found
+
+
+def _get_executed_kubectl_verbs(messages: list) -> set[str]:
+    """Scan ToolMessages to find which kubectl write subcommands were executed."""
+    lookup = _build_tool_call_args_lookup(messages)
+    executed: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, ToolMessage):
+            continue
+        if getattr(msg, "name", "") != "kubectl":
+            continue
+        content = msg.content or ""
+        if content.startswith("Error:"):
+            continue
+        tc_id = getattr(msg, "tool_call_id", "")
+        if tc_id and tc_id in lookup:
+            sub = lookup[tc_id].get("subcommand", "")
+            if sub in _KUBECTL_INJECT_SUBCOMMANDS:
+                executed.add(sub)
+    return executed
+
+
+def check_injection_step_completeness(
+    skill_case: str,
+    messages: list,
+) -> str | None:
+    """Check if all kubectl injection steps from 演练步骤 have been executed.
+
+    Returns a nudge message listing remaining steps, or None if complete.
+    """
+    if not skill_case:
+        return None
+
+    steps = _extract_drill_steps(skill_case)
+
+    # Primary: extract from 演练步骤 section
+    # Fallback: scan injection-related content (before recovery sections)
+    if steps:
+        required_verbs: dict[str, str] = {}
+        for step in steps:
+            verbs = _extract_kubectl_verbs_from_step(step)
+            for v in verbs:
+                first_line = step.split('\n')[0].strip()
+                required_verbs[v] = first_line
+    else:
+        # Truncate before recovery sections to avoid matching recovery commands
+        injection_content = skill_case
+        for marker in ("注入恢复", "恢复验证", "**注入恢复**", "**恢复验证**"):
+            idx = injection_content.find(marker)
+            if idx >= 0:
+                injection_content = injection_content[:idx]
+                break
+        required_verbs = {}
+        all_verbs = _extract_kubectl_verbs_from_step(injection_content)
+        for v in all_verbs:
+            required_verbs[v] = f"kubectl {v} (from skill case)"
+
+    if not required_verbs:
+        return None
+
+    executed = _get_executed_kubectl_verbs(messages)
+    missing = {v: desc for v, desc in required_verbs.items() if v not in executed}
+
+    if not missing:
+        return None
+
+    lines = [
+        "**INCOMPLETE INJECTION**: The skill case requires multiple "
+        "injection steps, but you only completed some of them. "
+        "You MUST execute the remaining steps before concluding:\n",
+    ]
+    for verb, desc in missing.items():
+        lines.append(f"- **{verb}**: {desc}")
+    lines.append(
+        "\nExecute these remaining steps now using kubectl. "
+        "Do NOT skip any step — each is required to produce the full fault effect."
+    )
+    return "\n".join(lines)

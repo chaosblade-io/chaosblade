@@ -15,6 +15,7 @@ import logging
 
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
+from chaos_agent.agent.node_names import VERIFIER
 from chaos_agent.agent.nodes._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
@@ -40,7 +41,7 @@ from chaos_agent.agent.nodes._verifier_layer1 import (
     _find_blade_query_in_messages,  # noqa: F401
     _run_layer1_via_kubectl_exec,  # noqa: F401
 )
-from chaos_agent.agent.nodes._verifier_layer2_parse import (
+from chaos_agent.agent.nodes._verifier_layer2_parse import (  # noqa: F401 — re-exports for tests
     _count_verification_steps_in_skill_case,  # noqa: F401
     _validate_step_number_coverage,  # noqa: F401
     _try_parse_json,  # noqa: F401
@@ -51,7 +52,8 @@ from chaos_agent.agent.nodes._verifier_layer2_parse import (
     _detect_checklist_conclusion_inconsistency,  # noqa: F401
     _has_injection_verification_section,  # noqa: F401
     _extract_verification_step_descriptions,  # noqa: F401
-    cross_check_evidence,
+    _split_candidates,  # noqa: F401
+    cross_check_evidence,  # noqa: F401
     dict_to_verification_result,  # noqa: F401
 )
 from chaos_agent.agent.nodes._verifier_messages import (
@@ -109,49 +111,9 @@ logger = logging.getLogger(__name__)
 # Entry point 1: Simple verifier (no LLM, Layer 1 only)
 # ---------------------------------------------------------------------------
 
-async def _cleanup_debug_pods(
-    state: AgentState,
-    kubeconfig: str,
-    task_id: str,
-    result_update: dict,
-) -> None:
-    """Programmatic debug-pod cleanup with cross-reentry dedup.
-
-    Scans the message history for ``kubectl debug node/...`` pods created
-    by the LLM, diffs against ``state.cleaned_debug_pods`` (pods we've
-    already attempted to delete in earlier verifier re-entries), deletes
-    only the new ones, and writes the merged set back into
-    ``result_update`` so the next re-entry sees them as already-handled.
-
-    Why the diff matters (post task-712629116b64):
-    Without it, every verifier re-entry (reverify loop, ReAct iteration)
-    would re-scan the full history, re-discover the same pod names, and
-    re-issue ``kubectl delete``. After the first delete the pod is gone
-    and every retry returns ``Error from server (NotFound)``, inflating
-    the failure-rate stat (observed as 8 spurious NotFound failures on
-    a single task).
-
-    Failed deletes are still recorded in ``cleaned_debug_pods`` —
-    ``_delete_debug_pod`` is best-effort and a transient failure doesn't
-    deserve automatic cleanup retries; the operator can ``kubectl delete``
-    by hand if a pod truly stuck. The intent here is "cleanup *tried* to
-    remove each pod once", not "guarantee removal".
-    """
-    discovered_pods: set[str] = set()
-    for msg in state.get("messages", []):
-        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "kubectl":
-            msg_content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            pod_name = _parse_debug_pod_name(msg_content)
-            if pod_name:
-                discovered_pods.add(pod_name)
-    already_cleaned: set[str] = set(state.get("cleaned_debug_pods") or [])
-    pods_to_delete = discovered_pods - already_cleaned
-    for pod_name in pods_to_delete:
-        logger.info(f"Programmatic cleanup: deleting debug pod {pod_name}")
-        await _delete_debug_pod(pod_name, kubeconfig, task_id)
-    if pods_to_delete:
-        # Sorted list — deterministic for snapshot diffs + LangGraph JSON.
-        result_update["cleaned_debug_pods"] = sorted(already_cleaned | pods_to_delete)
+# _cleanup_debug_pods moved to _verifier_finalize.py (Scheme B). Re-exported
+# for back-compat with callers/tests importing it from this module.
+from chaos_agent.agent.nodes._verifier_finalize import _cleanup_debug_pods  # noqa: E402,F401
 
 
 async def verifier(state: AgentState) -> dict:
@@ -207,6 +169,7 @@ async def verifier(state: AgentState) -> dict:
                     "details": layer1.details,
                     "raw_output": (layer1.raw_output or "")[:500],
                 },
+                "node": VERIFIER,
             })
         except Exception:
             pass  # Session persistence is best-effort
@@ -340,6 +303,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 "verified": False,  # Cannot confirm — Layer 2 was not completed
             }
             result_dict = {"result": result, "verification": verification}
+            await _cleanup_debug_pods(state, kubeconfig, task_id, result_dict)
             await sync_to_store(state, result_dict)
             return result_dict
 
@@ -373,6 +337,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                         "details": layer1.details,
                         "raw_output": (layer1.raw_output or "")[:500],
                     },
+                    "node": VERIFIER,
                 })
         else:
             # Reuse cached result from previous iteration
@@ -403,6 +368,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                     state.get("messages", []),
                 ),
             }
+            await _cleanup_debug_pods(state, kubeconfig, task_id, result_dict)
             await sync_to_store(state, result_dict)
             return result_dict
 
@@ -472,14 +438,25 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         # Action stagnation detection (tool-name level)
         stagnation_hint, stagnant_tool = detect_action_stagnation(state.get("messages", []))
         if stagnation_hint:
-            verifier_hint = (
-                f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
-                f"multiple consecutive times with no progress. "
-                f"This tool has been temporarily removed. You MUST now either:\n"
-                f"- Use a DIFFERENT tool or subcommand to gather verification evidence.\n"
-                f"- Output your verification conclusion based on evidence already collected.\n"
-                f"Do NOT attempt to call `{stagnant_tool}` again."
-            )
+            if ":" in stagnant_tool:
+                base_tool = stagnant_tool.split(":")[0]
+                verifier_hint = (
+                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
+                    f"multiple consecutive times with no progress. "
+                    f"Stop using this subcommand. You can still use `{base_tool}` "
+                    f"with OTHER subcommands (describe, logs, etc.) "
+                    f"to gather verification evidence.\n"
+                    f"Do NOT call `{stagnant_tool}` again."
+                )
+            else:
+                verifier_hint = (
+                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
+                    f"multiple consecutive times with no progress. "
+                    f"This tool has been temporarily removed. You MUST now either:\n"
+                    f"- Use a DIFFERENT tool or subcommand to gather verification evidence.\n"
+                    f"- Output your verification conclusion based on evidence already collected.\n"
+                    f"Do NOT attempt to call `{stagnant_tool}` again."
+                )
             messages.append(HumanMessage(content=verifier_hint))
 
         # Tool error introspection (runtime feedback > static docs)
@@ -513,7 +490,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             llm_to_call = llm
         else:
             tools_this_iter = list(tools) if tools else []
-            if stagnant_tool:
+            if stagnant_tool and ":" not in stagnant_tool:
                 tools_this_iter = [
                     t for t in tools_this_iter
                     if getattr(t, "name", "") != stagnant_tool
@@ -522,7 +499,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
 
         # Record system prompt to session store (dedup handles repeated prompts)
         verifier_prompt = build_system_prompt(PromptMode.VERIFICATION)
-        record_system_prompt(hook, state, verifier_prompt)
+        record_system_prompt(hook, state, verifier_prompt, node_name=VERIFIER)
 
         response = await llm_to_call.ainvoke(
             [SystemMessage(content=verifier_prompt)] + messages
@@ -539,486 +516,30 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         }
 
         tool_calls = getattr(response, "tool_calls", None) or []
-        if tool_calls:
-            # LLM wants to call tools — continue ReAct loop
-            # Synthetic messages prepend BEFORE response so routing checks
-            # state[-1] = response (real AIMessage), not synthetic AIMessage.
-            result_update["messages"] = _main_hm_for_state + _synthetic_for_state + [response]
+        # Scheme B: verifier_loop is a pure ReAct step. Persist the response
+        # (+ synthetic context messages); routing decides what is next —
+        # should_continue_verifier sends tool_calls -> verifier_tools, or
+        # text -> finalize_verification. All finalization (parse verdict +
+        # post-process + debug-pod cleanup) now lives in finalize_verification.
+        result_update["messages"] = _main_hm_for_state + _synthetic_for_state + [response]
 
-            # Emit debug-level status event with LLM reasoning summary
-            if settings.is_debug:
-                debug_info, tool_names = summarize_llm_response(response)
-                tracker.update(
-                    f"Layer 2 iteration {count} LLM:\n{debug_info}",
-                    {"debug": True, "iteration": count, "tool_calls": tool_names},
-                )
-            else:
-                tool_names = [
-                    extract_tool_call_fields(tc)[0]
-                    for tc in tool_calls
-                ]
-                tracker.update(
-                    f"Layer 2 iteration {count}: calling tools",
-                    {"iteration": count, "tool_calls": tool_names},
-                )
+        if settings.is_debug:
+            debug_info, _dbg_tool_names = summarize_llm_response(response)
+            tracker.update(
+                f"Layer 2 iteration {count} LLM:\n{debug_info}",
+                {"debug": True, "iteration": count, "tool_calls": _dbg_tool_names},
+            )
         else:
-            # LLM produced final text — parse verification result
-            content = getattr(response, "content", "") or ""
-            # Emit RUNNING event for the final reasoning before completing
-            if settings.is_debug:
-                debug_info, _ = summarize_llm_response(response)
-                tracker.update(
-                    f"Layer 2 iteration {count} LLM (final):\n{debug_info}",
-                    {"debug": True, "iteration": count, "tool_calls": []},
-                )
-            else:
-                tracker.update(
-                    f"Layer 2 iteration {count}: producing final verification",
-                    {"iteration": count, "tool_calls": []},
-                )
-
-            # Try JSON parsing first (JSON mode final iteration path)
-            verification = _try_parse_json(content)
-            if verification is None:
-                # JSON failed or not JSON mode → fall back to text parsing
-                verification = _parse_verification_result(content)
-
-            # E2 Phase 3 — cross-check LLM evidence numbers against
-            # the observation timeline (state.metric_observations,
-            # populated by PreReasoningHook from each ToolMessage's
-            # extracted_metrics). Catches the "LLM cites a baseline→post
-            # delta that the structured metrics say didn't happen"
-            # hallucination — downgrades verified→partial when found.
-            # Safe to run on either JSON or text-parsed verification —
-            # both shapes carry layer2/checklist/warnings in the same
-            # dict structure cross_check_evidence reads from.
-            verification = cross_check_evidence(
-                verification,
-                state.get("metric_observations"),
+            _tc_names = [extract_tool_call_fields(tc)[0] for tc in tool_calls]
+            tracker.update(
+                f"Layer 2 iteration {count}: "
+                + ("calling tools" if tool_calls else "emitting verdict text"),
+                {"iteration": count, "tool_calls": _tc_names},
             )
-
-            verification["layer1"] = _layer1_to_dict(layer1)
-
-            # ---- Programmatic Fact Enforcement ----
-            # Deterministic overrides when programmatic checks contradict LLM conclusions.
-            _burn_enforce = state.get("disk_burn_post_check")
-            _enforcement_applied = False
-
-            # Enforcement: disk_burn_post_check says I/O ACTIVE, but LLM concluded otherwise.
-            # When I/O is confirmed ACTIVE, the fault has NOT "recovered before observation" —
-            # it is still in effect.  Override ALL non-passed checklist items, not just those
-            # whose evidence text happens to contain I/O keywords.  The LLM may have marked
-            # steps as recovered/failed because it couldn't detect the burn from its limited
-            # tool choices (df -h, ls), not because the burn actually stopped.
-            if _burn_enforce and _burn_enforce.get("burn_io_detected"):
-                _active_parts = _burn_enforce.get("active_partitions", [])
-                _parts_str = ", ".join(
-                    f"{p['name']}: ~{p['write_throughput_mb_s']} MB/s"
-                    for p in _active_parts[:3]
-                ) or "measured"
-                _io_overridden = False
-                for _ci in verification.get("checklist", {}).get("items", []):
-                    if _ci.get("status") in ("failed", "recovered_before_observation", "partial"):
-                        _ci["status"] = "passed"
-                        _ci["evidence"] = (
-                            f"[OVERRIDE] Programmatic I/O check confirmed ACTIVE "
-                            f"(write throughput: {_parts_str}). "
-                            f"Fault is still in effect — LLM observation was insufficient, "
-                            f"not evidence of recovery."
-                        )
-                        _io_overridden = True
-                if _io_overridden:
-                    logger.info(
-                        "Programmatic enforcement: disk_burn_post_check confirmed I/O ACTIVE, "
-                        "but LLM checklist marked steps as failed/recovered. Overridden."
-                    )
-                    # Also override L2 status: if I/O is proven ACTIVE, the fault
-                    # is in effect and L2 cannot be failed/recovered.
-                    _l2_val = verification.get("layer2", {}).get("status", "unknown")
-                    if _l2_val in ("failed", "recovered_before_observation", "partial"):
-                        verification["layer2"]["status"] = "passed"
-                        verification["layer2"]["details"] = (
-                            f"Programmatic I/O check: disk burn ACTIVE "
-                            f"(write throughput: {_parts_str}). "
-                            f"LLM conclusion overridden."
-                        )
-                    if _l2_val in ("failed", "recovered_before_observation", "partial"):
-                        _l2_desc = (
-                            "the fault was absent" if _l2_val == "failed"
-                            else "the fault effect had already dissipated before observation"
-                            if _l2_val == "recovered_before_observation"
-                            else "the fault effect was only partially confirmed"
-                        )
-                        verification.setdefault("warnings", []).append(
-                            f"Programmatic override: disk_burn_post_check confirmed I/O ACTIVE "
-                            f"(write throughput: {_parts_str}), but LLM concluded "
-                            f"{_l2_desc} (original status: '{_l2_val}')."
-                        )
-                    else:
-                        verification.setdefault("warnings", []).append(
-                            f"Programmatic override: disk_burn_post_check confirmed I/O ACTIVE "
-                            f"(write throughput: {_parts_str}) "
-                            f"(LLM Layer2 concluded '{_l2_val}'; override applied to individual checklist steps only)."
-                        )
-                    _enforcement_applied = True
-
-            # Recalculate verification level after enforcement
-            if _enforcement_applied:
-                _all_items = verification.get("checklist", {}).get("items", [])
-                if _all_items:
-                    _remaining_bad = sum(
-                        1 for _ci in _all_items
-                        if _ci.get("status") in ("failed", "recovered_before_observation", "partial")
-                    )
-                    if _remaining_bad == 0 and verification.get("layer2", {}).get("status") == "passed":
-                        verification["level"] = "verified"
-                    elif verification.get("layer2", {}).get("status") == "passed" and _remaining_bad > 0:
-                        verification["level"] = "partial"
-
-            # Format guard: re-prompt if LLM didn't follow output format
-            # Only on non-final iterations — final iteration stays as-is
-            if (verification["layer2"]["status"] == "unknown"
-                    and count < settings.max_verifier_loop
-                    and not _has_format_reminder(state.get("messages", []))):
-
-                tracker.update(
-                    f"Layer 2 iteration {count}: LLM output missing VERIFICATION_RESULT format, "
-                    f"re-prompting for structured output",
-                    {"debug": True, "iteration": count, "re_prompt": True},
-                )
-
-                reminder = HumanMessage(content=(
-                    "上一轮输出缺少要求的 VERIFICATION_RESULT 格式。请按 EXACT 格式重新输出：\n\n"
-                    "VERIFICATION_CHECKLIST:\n"
-                    "- Step 1: passed/failed/skipped — 证据\n"
-                    "- ...\n\n"
-                    "VERIFICATION_RESULT:\n"
-                    "- Layer1 (blade_status): passed/failed/skipped\n"
-                    "- Layer2 (fault-specific): passed/failed/skipped - 摘要\n"
-                    "- Overall: verified/partial/unverified\n"
-                    "- BaselineUsed: true/false\n"
-                    "- Warnings: any warnings, or \"none\"\n\n"
-                    "Layer2: 'passed'=故障效果可观测; 'failed'=故障效果不可观测。\n"
-                    "勿用 markdown 表格或 emoji，仅纯文本 bullet 格式。"
-                ))
-
-                result_update["messages"] = _main_hm_for_state + _synthetic_for_state + [response, reminder]
-                result_update["verifier_loop_count"] = count
-                result_update["inject_layer1_cache"] = _layer1_to_dict(layer1)
-                from chaos_agent.memory.hook import merge_hook_updates
-                merge_hook_updates(result_update, hook_updates)
-                # NOTE: verification is NOT set → router returns "continue"
-                await sync_to_store(state, result_update)
-                return result_update
-
-            # Step coverage: compare executed steps against expected from skill case
-            skill_case = state.get("skill_case_content", "")
-            missing_step_nums = None  # Initialize before conditional assignment
-            deviated_step_nums = None
-            expected_steps = 0
-            executed_steps = 0
-            if skill_case and verification.get("checklist"):
-                expected_steps = _count_verification_steps_in_skill_case(skill_case)
-                executed_steps = verification["checklist"].get("total_executed", 0)
-
-                # Step-number-level coverage validation (P3 improvement)
-                checklist_items = verification["checklist"].get("items", [])
-                missing_step_nums, deviated_step_nums = _validate_step_number_coverage(
-                    skill_case, checklist_items,
-                )
-
-                if missing_step_nums:
-                    # Specific step numbers are missing from the checklist
-                    step_list = ", ".join(str(s) for s in missing_step_nums)
-                    verification["warnings"].append(
-                        f"Step coverage: steps {step_list} from skill case "
-                        f"are missing from the verification checklist. "
-                        f"Every step must be accounted for (even if marked skipped). "
-                        f"Verification may be incomplete."
-                    )
-                    if not _enforcement_applied:
-                        # Only downgrade when enforcement has NOT confirmed the fault
-                        # effect. When enforcement is active, programmatic checks are
-                        # authoritative; missing LLM steps do not negate confirmed
-                        # physical evidence.
-                        if verification["layer2"]["status"] == "passed":
-                            verification["layer2"]["status"] = "partial"
-                            if verification.get("level") == "verified":
-                                verification["level"] = "partial"
-                elif expected_steps > 0 and executed_steps < expected_steps:
-                    # Fallback: count-based check when step numbers aren't parseable
-                    missing = expected_steps - executed_steps
-                    verification["warnings"].append(
-                        f"Step coverage: {executed_steps}/{expected_steps} steps executed. "
-                        f"{missing} step(s) never attempted (not even marked [SKIPPED]). "
-                        f"Verification may be incomplete."
-                    )
-                    if not _enforcement_applied:
-                        if verification["layer2"]["status"] == "passed":
-                            verification["layer2"]["status"] = "partial"
-                            if verification.get("level") == "verified":
-                                verification["level"] = "partial"
-
-            # Programmatic coverage warning (safety net)
-            layer1_affected = layer1.affected_count
-            from chaos_agent.agent.fault_spec import read_fault_spec as _rfs3
-            _spec3 = _rfs3(state)
-            target_names = list(_spec3.names) if _spec3 else []
-            if layer1_affected > 0 and len(target_names) > layer1_affected:
-                coverage_warning = (
-                    f"Coverage: {layer1_affected}/{len(target_names)} target resources "
-                    f"affected by ChaosBlade experiment."
-                )
-                warnings = verification.get("warnings", [])
-                if coverage_warning not in warnings:
-                    warnings.append(coverage_warning)
-                    verification["warnings"] = warnings
-
-            # P2: Verification integrity guard — detect gaps and trigger re-verification
-            from chaos_agent.utils.fault_context import (
-                VerificationGap, lookup_adaptations,
-            )
-            gaps: list[VerificationGap] = []
-
-            # Clear previous reverify_gaps at the start of each iteration.
-            # If gaps are still found, reverify_gaps will be re-set below.
-            # This prevents stale gaps from causing infinite loops via
-            # should_continue_verifier's reverify check.
-            if state.get("reverify_gaps"):
-                result_update["reverify_gaps"] = None
-
-            # Gap A: step coverage gap (already detected above)
-            # Skip step_gap when enforcement confirmed the fault effect --
-            # re-verification won't help because LLM attention degradation
-            # is the root cause, not missing information.
-            if not _enforcement_applied:
-                if missing_step_nums:
-                    gaps.append(VerificationGap(
-                        gap_type="step_gap",
-                        description=f"Steps {missing_step_nums} from skill case missing from checklist",
-                        missing_steps=missing_step_nums,
-                    ))
-                elif expected_steps > 0 and executed_steps < expected_steps:
-                    missing_count = expected_steps - executed_steps
-                    gaps.append(VerificationGap(
-                        gap_type="step_gap",
-                        description=f"{executed_steps}/{expected_steps} steps executed, {missing_count} missing",
-                    ))
-
-            # Gap B: Layer1 evidence contradiction (blade Success but 0 affected)
-            if layer1.status == "passed" and layer1.affected_count == 0:
-                gaps.append(VerificationGap(
-                    gap_type="layer1_contradiction",
-                    description="blade reports Success but 0 resources affected",
-                ))
-
-            # Gap C: Layer2 conclusion contradicts Layer1 facts (e.g., OOMKill detected)
-            l2_status_val = verification.get("layer2", {}).get("status", "unknown")
-            side_effects = verification.get("side_effects") or {}
-            container_restarts = side_effects.get("container_restarts", False)
-            if l2_status_val == "passed" and container_restarts:
-                gaps.append(VerificationGap(
-                    gap_type="layer2_layer1_conflict",
-                    description="Layer2 says verified but container restarts (OOMKill) detected in Layer1",
-                ))
-
-            # Gap D: Baseline available but LLM did not use it
-            _baseline = state.get("baseline_data")
-            _baseline_available = (
-                _baseline and _baseline.get("success_count", 0) > 0
-            )
-            _baseline_used = verification.get("baseline_used", False)
-            if _baseline_available and not _baseline_used:
-                gaps.append(VerificationGap(
-                    gap_type="baseline_used_check",
-                    description=(
-                        "Pre-injection baseline data was available but BaselineUsed=false. "
-                        "You MUST compare your observations against the pre-injection baseline "
-                        "data. Set BaselineUsed: true and include "
-                        "baseline → current (Δchange) comparisons in your checklist evidence."
-                    ),
-                ))
-
-            # Gap E: PrimaryEvidenceObserved inconsistent with Overall
-            _peo = verification.get("primary_evidence_observed", False)
-            _overall = verification.get("overall", "")
-            if not _peo and _overall == "verified":
-                gaps.append(VerificationGap(
-                    gap_type="primary_evidence_consistency",
-                    description=(
-                        "PrimaryEvidenceObserved=false but Overall=verified. "
-                        "When no primary evidence was observed, Overall MUST be 'partial' "
-                        "or 'unverified', NOT 'verified'. Correct your Overall verdict."
-                    ),
-                ))
-
-            # If gaps found and re-verification budget allows, inject re-verify prompt
-            if gaps:
-                reverify_count = state.get("reverify_count", 0)
-                target_metadata = state.get("target_metadata") or {}
-                from chaos_agent.agent.fault_spec import read_fault_spec as _rfs4
-                _spec4 = _rfs4(state)
-                adaptations = lookup_adaptations(
-                    _spec4.scope if _spec4 else "",
-                    _spec4.blade_target if _spec4 else "",
-                    _spec4.blade_action if _spec4 else "",
-                    target_metadata,
-                    rule_type="verification_integrity_guard",
-                )
-                max_attempts = 1
-                if adaptations:
-                    max_attempts = adaptations[0].action.get("max_reverify_attempts", 1)
-
-                if reverify_count < max_attempts:
-                    gap_descriptions = "; ".join(g.description for g in gaps)
-                    logger.info(
-                        "P2 verification gaps detected: %s — triggering re-verification (attempt %d/%d)",
-                        gap_descriptions, reverify_count + 1, max_attempts,
-                    )
-                    # Inject re-verification prompt into messages
-                    # Build gap-specific remediation instructions for each gap type
-                    _gap_instructions = []
-                    for _g in gaps:
-                        if _g.gap_type == "step_gap":
-                            _missing = _g.missing_steps or []
-                            _step_str = ", ".join(str(s) for s in _missing) if _missing else "unknown"
-                            _gap_instructions.append(
-                                f"- STEP GAP: Skill case steps [{_step_str}] are missing from your "
-                                f"checklist. Add each missing step with status and evidence. "
-                                f"Use [SKIPPED] only if the tool is genuinely unavailable, "
-                                f"with the specific reason."
-                            )
-                        elif _g.gap_type == "layer1_contradiction":
-                            _gap_instructions.append(
-                                "- LAYER1 CONTRADICTION: blade reports Success but 0 resources "
-                                "affected. Explain why 0 affected resources is consistent (or "
-                                "inconsistent) with your Layer2 conclusion."
-                            )
-                        elif _g.gap_type == "layer2_layer1_conflict":
-                            _gap_instructions.append(
-                                "- LAYER2/LAYER1 CONFLICT: You marked Layer2=passed but "
-                                "Layer1 detected container restarts (e.g., OOMKill). A restart "
-                                "is a SIDE EFFECT, not primary evidence of the fault's intended "
-                                "physical effect. Reconcile: is the restart evidence of the "
-                                "fault, or did the restart destroy primary evidence?"
-                            )
-                        elif _g.gap_type == "baseline_used_check":
-                            _gap_instructions.append(
-                                "- BASELINE NOT USED: Pre-injection baseline data was available "
-                                "in the HumanMessage. You MUST include \"baseline: X → current: Y "
-                                "(ΔZ)\" comparisons in your checklist evidence and set "
-                                "BaselineUsed: true."
-                            )
-                        elif _g.gap_type == "primary_evidence_consistency":
-                            _gap_instructions.append(
-                                "- EVIDENCE/CONCLUSION CONFLICT: PrimaryEvidenceObserved=false "
-                                "but Overall=verified. When no primary evidence was directly "
-                                "observed, Overall MUST be 'partial' or 'unverified', NOT 'verified'."
-                            )
-                        else:
-                            _gap_instructions.append(f"- {_g.description}")
-                    _instructions_str = "\n".join(_gap_instructions)
-                    reverify_msg = (
-                        f"Verification gaps detected:\n{_instructions_str}\n\n"
-                        f"You MUST account for ALL gaps above in your re-attempted verification. "
-                        f"Re-attempt verification now."
-                    )
-                    from langchain_core.messages import HumanMessage as _HM
-                    # Prepend synthetic messages before response + reverify HM
-                    # (this will be overwritten by the final result_update["messages"]
-                    # assignment below, which also includes _synthetic_for_state)
-                    result_update["messages"] = _main_hm_for_state + _synthetic_for_state + [response, _HM(content=reverify_msg)]
-                    result_update["reverify_count"] = reverify_count + 1
-                    result_update["reverify_gaps"] = [g.gap_type for g in gaps]
-                    # Clear verification to force another verifier loop iteration
-                    # (should_continue_verifier checks reverify_gaps)
-                    sync_node_status_to_session(state, "verifier",
-                        f"P2 re-verification triggered: {gap_descriptions} (attempt {reverify_count + 1}/{max_attempts})",
-                        detail={"gap_types": [g.gap_type for g in gaps],
-                                "attempt": reverify_count + 1, "max_attempts": max_attempts})
-                    if settings.is_debug and tracker:
-                        tracker.update(
-                            f"[P2] re-verification triggered: {gap_descriptions} (attempt {reverify_count + 1}/{max_attempts})"[:200],
-                            {"debug": True, "fcat": True},
-                        )
-                else:
-                    logger.info(
-                        "P2 verification gaps detected but max reverify attempts (%d) reached — degrading to partial",
-                        max_attempts,
-                    )
-                    sync_node_status_to_session(state, "verifier",
-                        f"P2 re-verification max attempts reached, degrading to partial ({max_attempts} attempts)",
-                        detail={"gap_types": [g.gap_type for g in gaps], "max_attempts": max_attempts})
-                    if settings.is_debug and tracker:
-                        tracker.update(
-                            f"[P2] max attempts reached, degrading to partial ({max_attempts})"[:200],
-                            {"debug": True, "fcat": True},
-                        )
-
-            result = {
-                "task_id": task_id,
-                "skill": skill_name,
-                "blade_uid": blade_uid,
-                "verified": verification["level"] == "verified",
-            }
-            result_update["result"] = result
-            # Ensure baseline_confidence is set on LLM-parsed verification dicts
-            if "baseline_confidence" not in verification:
-                verification["baseline_confidence"] = _compute_baseline_confidence(state)
-            # Programmatic Fact Enforcement: when baseline data was available
-            # (confidence=high or partial) but LLM did not declare BaselineUsed=true,
-            # force it to true and add an auditable warning. BaselineUsed is a FACT
-            # (baseline data exists in the HumanMessage) not an LLM opinion — the LLM
-            # may ignore it but the data was there for comparison. This mirrors the
-            # disk_burn_post_check override pattern — deterministic code checks LLM
-            # conclusion against a programmatic fact.
-            _bl_conf = verification.get("baseline_confidence", "none")
-            if _bl_conf in ("high", "partial") and not verification.get("baseline_used"):
-                _bl_used_orig = verification.get("baseline_used")  # None or False before override
-                verification["baseline_used"] = True
-                verification.setdefault("warnings", []).append(
-                    f"Programmatic override: BaselineUsed forced to true — pre-injection "
-                    f"baseline was available (confidence={_bl_conf}) but LLM declared "
-                    f"BaselineUsed={_bl_used_orig}. Verification data included baseline metrics; "
-                    f"LLM may have ignored them, but the comparison opportunity existed."
-                )
-                logger.info(
-                    "Programmatic enforcement: BaselineUsed forced from %s to true "
-                    "(baseline_confidence=%s)",
-                    _bl_used_orig, _bl_conf,
-                )
-            result_update["verification"] = verification
-            result_update["messages"] = _main_hm_for_state + _synthetic_for_state + [response]
-
-            # Save injection verification summary for recover phase baseline comparison
-            l2_details = verification.get("layer2", {}).get("details", "")
-            if l2_details:
-                result_update["inject_verification_summary"] = (
-                    f"Layer2={verification.get('layer2', {}).get('status', 'unknown')}, "
-                    f"Details={l2_details}"
-                )
-
-            level = verification["level"]
-            l1_status = layer1.status
-            l2_status = verification.get("layer2", {}).get("status", "unknown")
-            warnings = verification.get("warnings", [])
-            status_msg = f"Verification: {level} (Layer1: {l1_status}, Layer2: {l2_status})"
-            if warnings:
-                status_msg += f" | warnings: {'; '.join(warnings)}"
-            tracker.complete(status_msg)
 
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result_update, hook_updates)
-
-        # Programmatic debug-pod cleanup with cross-reentry dedup.
-        # See ``_cleanup_debug_pods`` for the full rationale + invariants.
-        await _cleanup_debug_pods(state, kubeconfig, task_id, result_update)
-
         await sync_to_store(state, result_update)
-        # Patch C — wall-clock cause labelling. The router will return
-        # "done" on the next conditional-edge tick if the budget has
-        # been exceeded; stamp failure_reason here so the result is
-        # honest about why verification stopped.
         from chaos_agent.agent.router import mark_wall_clock_timeout
         return mark_wall_clock_timeout(state, result_update)
 

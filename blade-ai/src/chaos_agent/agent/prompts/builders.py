@@ -25,6 +25,7 @@ from chaos_agent.agent.prompts.constants import (
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.prompts.sections import (
     get_role_section,
+    get_executor_role_section,
     get_env_section,
     get_knowledge_summary_section,
     get_experience_section,
@@ -149,9 +150,7 @@ def build_inject_system_prompt(
     stable_sections.extend([
         get_workflow_section(),
         get_verification_strategy_section(brief=True),
-        get_nl_mode_section(),
         get_safety_section(level="hard_only"),
-        get_actions_section(),
         get_tools_section(phase=1),
         get_output_section(),
         get_k8s_connection_section(),
@@ -208,11 +207,10 @@ def build_execute_system_prompt(
     #   * failure_modes         → dropped (sourced on demand from failure-modes.md)
     #   * safety                → hard_only (executor still bound by Hard Rules)
     sections = [
-        get_role_section(brief=True),
+        get_executor_role_section(),
         get_experience_section(),
         get_knowledge_summary_section(),
         get_safety_section(level="hard_only"),
-        get_actions_section(),
         get_tools_section(phase=2),
         get_output_section(),
         get_k8s_connection_section(),

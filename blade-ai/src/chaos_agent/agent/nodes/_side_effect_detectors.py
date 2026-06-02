@@ -178,17 +178,20 @@ async def capture_snapshot(namespace: str, kubeconfig: str) -> SideEffectSnapsho
     kubectl_path = settings.kubectl_path
     global_args = " ".join(_build_kubectl_global_args(kubeconfig))
 
-    pods_cmd = f"{kubectl_path} {global_args} get pods -n {namespace} -o json"
-    ep_cmd = f"{kubectl_path} {global_args} get endpoints -n {namespace} -o json"
+    pods_cmd = [kubectl_path, *global_args.split(), "get", "pods", "-n", namespace, "-o", "json"]
+    ep_cmd = [kubectl_path, *global_args.split(), "get", "endpoints", "-n", namespace, "-o", "json"]
 
     try:
-        (rc_p, stdout_p, _), (rc_e, stdout_e, _) = await asyncio.gather(
+        result_p, result_e = await asyncio.gather(
             run_command(pods_cmd, timeout=settings.timeout_kubectl, source="se-snapshot-pods"),
             run_command(ep_cmd, timeout=settings.timeout_kubectl, source="se-snapshot-endpoints"),
         )
     except Exception as e:
         logger.warning("se_snapshot capture failed: %s", e)
         return None
+
+    rc_p, stdout_p = result_p.exit_code, result_p.stdout
+    rc_e, stdout_e = result_e.exit_code, result_e.stdout
 
     pods: dict[str, PodSnapshot] = {}
     if rc_p == 0 and stdout_p:
@@ -239,16 +242,17 @@ async def fetch_post_inject_state(
     kubectl_path = settings.kubectl_path
     global_args = " ".join(_build_kubectl_global_args(kubeconfig))
 
-    pods_cmd = f"{kubectl_path} {global_args} get pods -n {namespace} -o json"
-    events_cmd = f"{kubectl_path} {global_args} get events -n {namespace} -o json"
-    ep_cmd = f"{kubectl_path} {global_args} get endpoints -n {namespace} -o json"
+    _ga = global_args.split()
+    pods_cmd = [kubectl_path, *_ga, "get", "pods", "-n", namespace, "-o", "json"]
+    events_cmd = [kubectl_path, *_ga, "get", "events", "-n", namespace, "-o", "json"]
+    ep_cmd = [kubectl_path, *_ga, "get", "endpoints", "-n", namespace, "-o", "json"]
 
-    logs_cmd = ""
+    logs_cmd: list[str] = []
     if target_names:
-        logs_cmd = (
-            f"{kubectl_path} {global_args} logs {target_names[0]} "
-            f"-n {namespace} --since-time={injection_start_time} --tail=200"
-        )
+        logs_cmd = [
+            kubectl_path, *_ga, "logs", target_names[0],
+            "-n", namespace, f"--since-time={injection_start_time}", "--tail=200",
+        ]
 
     tasks = [
         run_command(pods_cmd, timeout=settings.timeout_kubectl, source="se-detect-pods"),
@@ -266,19 +270,17 @@ async def fetch_post_inject_state(
     def _safe_json(result) -> dict:
         if isinstance(result, Exception):
             return {}
-        rc, stdout, _ = result
-        if rc != 0 or not stdout:
+        if result.exit_code != 0 or not result.stdout:
             return {}
         try:
-            return json.loads(stdout)
+            return json.loads(result.stdout)
         except (json.JSONDecodeError, ValueError):
             return {}
 
     def _safe_text(result) -> str:
         if isinstance(result, Exception):
             return ""
-        rc, stdout, _ = result
-        return stdout if rc == 0 else ""
+        return result.stdout if result.exit_code == 0 else ""
 
     pods_json = _safe_json(results[0])
     events_json = _safe_json(results[1])

@@ -14,6 +14,7 @@ from chaos_agent.agent.nodes._injection_detection import (
 from chaos_agent.agent.nodes.verifier import (
     verifier,
     _run_layer1_verification,
+    _cleanup_debug_pods,
     Layer1Result,
 )
 from chaos_agent.agent.state import infer_task_state
@@ -1061,6 +1062,7 @@ from chaos_agent.agent.nodes.verifier import (
     _count_verification_steps_in_skill_case,
     _has_injection_verification_section,
     _extract_verification_step_descriptions,
+    _split_candidates,
     _validate_step_number_coverage,
     _try_parse_json,
     _has_format_reminder,
@@ -2585,3 +2587,309 @@ class TestSyntheticMessagePersistence:
         )
         assert _METRICS_TOOL_CALL_ID == "baseline_collector_metrics"
         assert _METRICS_TOOL_CALL_ID in _SYNTHETIC_TOOL_CALL_IDS
+
+
+class TestCleanupDebugPodsDedup:
+    """Pin the cross-reentry idempotency of _cleanup_debug_pods.
+
+    Pre-fix (task-712629116b64): every verifier re-entry re-scanned the
+    full message history and re-issued ``kubectl delete`` for every debug
+    pod found. After the first delete the pod is gone, so every retry
+    returns ``Error from server (NotFound)`` — observed as 8 spurious
+    NotFound failures on a single task, inflating the failure-rate stat
+    while doing zero useful work.
+
+    Post-fix: ``state.cleaned_debug_pods`` carries the set of pods already
+    attempted; the diff isolates only genuinely new pods so each pod is
+    deleted at most once across the entire verifier lifecycle.
+    """
+
+    @staticmethod
+    def _debug_tm(pod_name: str, call_id: str | None = None) -> ToolMessage:
+        """Build a ToolMessage that the parser recognises as 'kubectl
+        debug created this pod'. Format mirrors what kubectl 1.25+
+        actually emits."""
+        return ToolMessage(
+            content=(
+                f"Creating debugging pod {pod_name} with container "
+                f"debugger on node cn-test.10.0.1.1."
+            ),
+            name="kubectl",
+            tool_call_id=call_id or f"call_{pod_name}",
+        )
+
+    @pytest.mark.asyncio
+    async def test_first_call_deletes_all_discovered_pods(self):
+        """First verifier invocation: 2 pods in history, both must be
+        deleted, and both names must be persisted into result_update."""
+        state = {
+            "messages": [
+                self._debug_tm("node-debugger-cn-test-aaa"),
+                self._debug_tm("node-debugger-cn-test-bbb"),
+            ],
+            # No cleaned_debug_pods on state yet → first-time call
+        }
+        result_update: dict = {}
+
+        deleted: list[str] = []
+
+        async def _fake_delete(pod_name, _kc, _tid):
+            deleted.append(pod_name)
+
+        with patch(
+            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            new=_fake_delete,
+        ):
+            await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
+
+        assert sorted(deleted) == [
+            "node-debugger-cn-test-aaa",
+            "node-debugger-cn-test-bbb",
+        ]
+        # Both pods now persisted as cleaned (sorted for determinism).
+        assert result_update["cleaned_debug_pods"] == [
+            "node-debugger-cn-test-aaa",
+            "node-debugger-cn-test-bbb",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_reentry_with_same_pods_performs_zero_deletes(self):
+        """Verifier re-entry (reverify, ReAct iteration): same pods in
+        history but state already lists them as cleaned. _delete must
+        NOT be called — this is the core regression fix.
+        """
+        state = {
+            "messages": [
+                self._debug_tm("node-debugger-cn-test-aaa"),
+                self._debug_tm("node-debugger-cn-test-bbb"),
+            ],
+            "cleaned_debug_pods": [
+                "node-debugger-cn-test-aaa",
+                "node-debugger-cn-test-bbb",
+            ],
+        }
+        result_update: dict = {}
+
+        deleted: list[str] = []
+
+        async def _fake_delete(pod_name, _kc, _tid):
+            deleted.append(pod_name)
+
+        with patch(
+            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            new=_fake_delete,
+        ):
+            await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
+
+        # Zero delete attempts → zero spurious NotFound errors.
+        assert deleted == []
+        # No write back when there's nothing to do (avoid noise in
+        # result_update + LangGraph checkpoint).
+        assert "cleaned_debug_pods" not in result_update
+
+    @pytest.mark.asyncio
+    async def test_reentry_with_new_pod_deletes_only_the_new_one(self):
+        """LLM creates a fresh debug pod during reverify (e.g. retry
+        after connection error). The dedup must isolate only the new pod
+        — the previously-cleaned pods stay out of the delete batch, but
+        the persisted set MUST grow to include the new pod so the next
+        re-entry also skips it.
+        """
+        state = {
+            "messages": [
+                self._debug_tm("node-debugger-cn-test-aaa"),  # already cleaned
+                self._debug_tm("node-debugger-cn-test-bbb"),  # already cleaned
+                self._debug_tm("node-debugger-cn-test-ccc"),  # NEW this re-entry
+            ],
+            "cleaned_debug_pods": [
+                "node-debugger-cn-test-aaa",
+                "node-debugger-cn-test-bbb",
+            ],
+        }
+        result_update: dict = {}
+
+        deleted: list[str] = []
+
+        async def _fake_delete(pod_name, _kc, _tid):
+            deleted.append(pod_name)
+
+        with patch(
+            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            new=_fake_delete,
+        ):
+            await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
+
+        assert deleted == ["node-debugger-cn-test-ccc"]
+        # Merged + sorted: previous two stay, new one joins.
+        assert result_update["cleaned_debug_pods"] == [
+            "node-debugger-cn-test-aaa",
+            "node-debugger-cn-test-bbb",
+            "node-debugger-cn-test-ccc",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_failed_delete_still_recorded_so_no_retry(self):
+        """``_delete_debug_pod`` is best-effort — if it fails (network
+        glitch, RBAC), we still record the pod as 'attempted' so the
+        next re-entry doesn't retry. Otherwise a single transient failure
+        would re-introduce the N-spurious-failures pattern the dedup
+        was built to prevent.
+        """
+        state = {
+            "messages": [self._debug_tm("node-debugger-flaky")],
+        }
+        result_update: dict = {}
+
+        async def _failing_delete(pod_name, _kc, _tid):
+            # _delete_debug_pod internally swallows exceptions and logs
+            # a warning — it returns None either way. We simulate that
+            # contract here (silent failure).
+            return None
+
+        with patch(
+            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            new=_failing_delete,
+        ):
+            await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
+
+        # Pod recorded even though "delete" returned without confirming.
+        # If a future regression makes us re-attempt failed deletes, this
+        # assertion will catch it.
+        assert result_update["cleaned_debug_pods"] == ["node-debugger-flaky"]
+
+    @pytest.mark.asyncio
+    async def test_no_debug_pods_in_history_is_a_noop(self):
+        """No kubectl-debug messages → no deletes, no state write.
+        Avoids noise on the common path where the LLM didn't use debug.
+        """
+        state = {
+            "messages": [
+                ToolMessage(content="random output", name="kubectl",
+                            tool_call_id="x"),
+                ToolMessage(content="blade output", name="blade_status",
+                            tool_call_id="y"),
+            ],
+        }
+        result_update: dict = {}
+
+        deleted: list[str] = []
+
+        async def _fake_delete(pod_name, _kc, _tid):
+            deleted.append(pod_name)
+
+        with patch(
+            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            new=_fake_delete,
+        ):
+            await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
+
+        assert deleted == []
+        assert "cleaned_debug_pods" not in result_update
+
+    @pytest.mark.asyncio
+    async def test_non_kubectl_toolmessages_are_ignored(self):
+        """Defensive: a `blade_create` ToolMessage whose content happens
+        to contain a string that looks like a pod name should NOT be
+        parsed as a debug-pod creation, because the parser only inspects
+        ToolMessages whose ``name == "kubectl"``. Pinning this prevents
+        a future "scan all ToolMessages" generalisation from accidentally
+        triggering deletes for non-debug pods.
+        """
+        state = {
+            "messages": [
+                ToolMessage(
+                    content="Creating debugging pod node-debugger-evil ...",
+                    name="blade_create",  # not "kubectl"
+                    tool_call_id="bc",
+                ),
+            ],
+        }
+        result_update: dict = {}
+
+        deleted: list[str] = []
+
+        async def _fake_delete(pod_name, _kc, _tid):
+            deleted.append(pod_name)
+
+        with patch(
+            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            new=_fake_delete,
+        ):
+            await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
+
+        assert deleted == []
+
+
+# ---------------------------------------------------------------------------
+# _split_candidates — multi-candidate skill_case splitting
+# ---------------------------------------------------------------------------
+
+
+class TestSplitCandidates:
+    """Tests for _split_candidates()."""
+
+    MULTI = (
+        "Multiple skill cases match.\n\n"
+        "--- Candidate 1: Service_调用失败_kube-proxy异常 ---\n"
+        "**注入验证**：\n"
+        "1. 确认 kube-proxy 不存在\n"
+        "2. 访问 Service ClusterIP\n"
+        "3. 检查 iptables 规则\n"
+        "\n"
+        "--- Candidate 2: Service_负载均衡异常_后端不可达 ---\n"
+        "**注入验证**：\n"
+        "1. kubectl get endpoints\n"
+        "2. 向 Service 发送请求\n"
+        "3. 查看 Ingress 状态\n"
+        "4. 确认流量调度\n"
+    )
+
+    def test_split_two_candidates(self):
+        parts = _split_candidates(self.MULTI)
+        assert len(parts) == 2
+
+    def test_candidate1_has_3_steps(self):
+        parts = _split_candidates(self.MULTI)
+        assert _count_verification_steps_in_skill_case(parts[0]) == 3
+
+    def test_candidate2_has_4_steps(self):
+        parts = _split_candidates(self.MULTI)
+        assert _count_verification_steps_in_skill_case(parts[1]) == 4
+
+    def test_candidate2_step_descriptions(self):
+        parts = _split_candidates(self.MULTI)
+        descs = _extract_verification_step_descriptions(parts[1])
+        assert len(descs) == 4
+        assert "kubectl get endpoints" in descs[0]
+        assert "Ingress" in descs[2]
+
+    def test_single_candidate_returns_list_of_one(self):
+        single = "**注入验证**：\n1. 检查 CPU\n2. 检查内存\n"
+        parts = _split_candidates(single)
+        assert len(parts) == 1
+        assert parts[0] == single
+
+    def test_empty_content(self):
+        assert _split_candidates("") == [""]
+
+    def test_validate_against_chosen_candidate(self):
+        """_validate_step_number_coverage on candidate 2 expects 4 steps."""
+        parts = _split_candidates(self.MULTI)
+        items = [
+            {"step": 1, "status": "passed", "evidence": "endpoints empty"},
+            {"step": 2, "status": "passed", "evidence": "5xx"},
+            {"step": 3, "status": "passed", "evidence": "health check fail"},
+            {"step": 4, "status": "passed", "evidence": "traffic rerouted"},
+        ]
+        missing, _ = _validate_step_number_coverage(parts[1], items)
+        assert missing == []
+
+    def test_validate_missing_step_from_chosen_candidate(self):
+        parts = _split_candidates(self.MULTI)
+        items = [
+            {"step": 1, "status": "passed", "evidence": "endpoints empty"},
+            {"step": 3, "status": "passed", "evidence": "health check fail"},
+        ]
+        missing, _ = _validate_step_number_coverage(parts[1], items)
+        assert 2 in missing
+        assert 4 in missing

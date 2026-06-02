@@ -74,6 +74,18 @@ def _parse_blade_status_output(raw: str) -> tuple[str, str, bool]:
             f"because they have already dissipated. Recommend increasing --duration to >= 60s.",
             True,
         )
+    # Transient state: blade reports "please wait" when the experiment
+    # is mid-transition (e.g. Initialized→Running during setup, or
+    # Running→Destroyed during teardown). The fault may already be
+    # in effect — let Layer 2 verify the actual cluster state.
+    error_msg = res.get("Error", "")
+    if "please wait" in error_msg.lower():
+        return (
+            "warning",
+            f"Experiment in transient state ({error_msg}). "
+            f"Layer 2 will verify actual cluster state.",
+            False,
+        )
     return "failed", f"Experiment status: {exp_status}", False
 
 
@@ -460,13 +472,17 @@ async def _run_layer1_verification(
     can see each check individually.
     """
     if not blade_uid:
-        # Distinguish two scenarios when blade_uid is empty:
-        # 1. ChaosBlade injection was attempted but failed → "failed" (terminal, blocks Layer 2)
-        # 2. Non-ChaosBlade fault (kubectl-based) → "skipped" (not terminal, Layer 2 proceeds)
         if messages and _was_blade_create_attempted(messages):
+            # blade_create was called but extract_blade_uid rejected the UID
+            # (e.g., 54000+success=false). blade's error report may be wrong
+            # (ChaosBlade may use fallback mechanisms like tc instead of
+            # iptables). Mark as WARNING (non-terminal) — Layer 2 will
+            # verify actual cluster state to determine the truth.
             return Layer1Result(
-                status="failed",
-                details="blade_create was called but produced no valid UID — injection likely failed",
+                status="warning",
+                details="blade_create was called but reported error — "
+                        "fault may still be in effect via fallback mechanisms. "
+                        "Layer 2 will verify actual cluster state.",
             )
         return Layer1Result(
             status="skipped",
@@ -563,7 +579,42 @@ async def _run_layer1_verification(
                         layer1_status = "failed"
                         layer1_details = f"blade_status: Running, but {q_details}"
                     elif q_status == "passed":
-                        layer1_details = f"blade_status: Running, {q_details}"
+                        # CRD status settle guard: ChaosBlade CRD reports
+                        # Success immediately upon creation, then asynchronously
+                        # exec's the fault process into the target container.
+                        # If exec fails (e.g. "dd: command not found" in minimal
+                        # images), the CRD status flips to Error a few seconds
+                        # later. Querying too early sees stale Success. Wait
+                        # briefly and re-query to catch async failures.
+                        import asyncio
+                        if tracker:
+                            tracker.update(
+                                "CRD settle guard: waiting 5s to confirm injection process started",
+                                {"step": "crd_settle_guard"},
+                            )
+                        await asyncio.sleep(5)
+                        try:
+                            recheck_output = await blade_query_k8s.ainvoke(
+                                {"uid": blade_uid, "kubeconfig": kubeconfig}
+                            )
+                            recheck_raw = recheck_output if isinstance(recheck_output, str) else str(recheck_output)
+                            recheck = _parse_blade_query_k8s_output(recheck_raw)
+                            if recheck.status == "failed":
+                                q_status = "failed"
+                                q_details = f"re-check after 5s: {recheck.details}"
+                                q_resource_statuses = recheck.resource_statuses
+                                q_affected_count = recheck.affected_count
+                                query_status_str = q_status
+                                query_details_str = q_details
+                                layer1_status = "failed"
+                                layer1_details = f"blade_status: Running, but {q_details}"
+                                logger.info("CRD settle guard: status flipped to failed after 5s re-check")
+                            elif recheck.expired:
+                                layer1_expired = True
+                            else:
+                                layer1_details = f"blade_status: Running, {q_details} (confirmed after re-check)"
+                        except Exception:
+                            layer1_details = f"blade_status: Running, {q_details}"
                     else:
                         # q_status == "unknown": non-critical, keep blade_status result
                         if not layer1_details:
@@ -600,6 +651,44 @@ async def _run_layer1_verification(
                     f"but blade_uid={blade_uid} was extracted from kubectl exec injection output. "
                     f"Host blade binary may be incompatible."
                 )
+
+        # Fallback 3: Self-destructive fault detection.
+        # Some faults (e.g. node-process stop containerd) destroy the very
+        # communication channel Layer 1 uses to verify. The injection
+        # succeeds, but blade_status/blade_query_k8s fail because the
+        # target node is now unreachable. Detect this by checking if the
+        # failure is a connectivity error AND the target node is NotReady
+        # (which is observable via API server, not via the dead node).
+        if layer1_status == "failed" and blade_uid:
+            _conn_keywords = (
+                "connection refused", "connection timed out",
+                "unreachable", "dial tcp", "i/o timeout",
+            )
+            _all_text = ((layer1_details or "") + (raw or "")).lower()
+            if any(kw in _all_text for kw in _conn_keywords):
+                try:
+                    from chaos_agent.tools.kubectl import kubectl_ro as _kro
+                    _node_out = await _kro.ainvoke({
+                        "subcommand": "get",
+                        "v_args": "nodes",
+                        "kubeconfig": kubeconfig,
+                    })
+                    _node_str = _node_out if isinstance(_node_out, str) else str(_node_out)
+                    if "NotReady" in _node_str:
+                        logger.info(
+                            "Self-destructive fault detected: Layer 1 failed due to "
+                            "connectivity loss, target node is NotReady — skipping "
+                            "Layer 1 to let Layer 2 verify the actual fault effect"
+                        )
+                        layer1_status = "skipped"
+                        layer1_details = (
+                            "blade_status unreachable (node connectivity lost), "
+                            "but target node is NotReady — consistent with a "
+                            "self-destructive fault (e.g. containerd/kubelet stop). "
+                            "Layer 2 will verify the actual fault effect."
+                        )
+                except Exception as _sde:
+                    logger.debug(f"Self-destructive fault check failed: {_sde}")
 
         return Layer1Result(
             status=layer1_status,

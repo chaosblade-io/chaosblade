@@ -25,20 +25,27 @@ class TestBuildInjectGraph:
             "load_memory",
             "intent_clarification",
             "intent_confirm",
+            "plan_builder",
             "agent_loop",
             "direct_setup",
             "baseline_capture",
+            "se_snapshot",
             "phase1_tools",
+            "phase1_screener",  # planning-phase mutation guard
             "safety_check",
             "confirmation_gate",
             "extract_planning_metadata",
             "execute_loop",
             "direct_execute",
+            "tool_screener",
             "phase2_tools",
             "verifier_loop",
+            "finalize_verification",
+            "se_detect",
             "save_memory",
             "reject",
             "recover_handler",
+            "plan_change_confirm",
         }
         assert expected == node_names
 
@@ -82,4 +89,65 @@ class TestBuildRecoverGraph:
         graph = build_recover_graph()
         compiled = graph.compile()
         assert compiled is not None
+
+
+class TestPhase1ToolErrorHandler:
+    """Tests for the custom phase1 ToolNode error handler (Layer D).
+
+    The handler MUST satisfy two contracts simultaneously:
+      1. Tell the LLM which tool was rejected (so it understands).
+      2. NEVER list alternative tools (LangGraph's default does
+         this; that's what trained the LLM to bypass via
+         kubectl exec in task-ce9647931ce1).
+    """
+
+    def test_recognizes_unknown_tool_error(self):
+        from chaos_agent.agent.graph import _phase1_handle_tool_error
+        err = ValueError(
+            "Error: blade_create is not a valid tool, "
+            "try one of [activate_skill, kubectl, ...]."
+        )
+        msg = _phase1_handle_tool_error(err)
+        assert "blade_create" in msg
+        assert "Phase 1" in msg
+        assert "final summary text" in msg.lower()
+        # Critical: must NOT echo the "try one of [...]" list
+        assert "try one of" not in msg.lower()
+        assert "[activate_skill" not in msg
+
+    def test_recognizes_invocation_error(self):
+        """Pydantic validation error on tool args (e.g. kubectl_ro
+        with subcommand='exec' violating its Literal type) wraps in
+        TOOL_INVOCATION_ERROR_TEMPLATE."""
+        from chaos_agent.agent.graph import _phase1_handle_tool_error
+        err = ValueError(
+            "Error invoking tool 'kubectl_ro' with kwargs "
+            "{'subcommand': 'exec'} with error:\n "
+            "1 validation error for kubectl_ro\nsubcommand\n  "
+            "Input should be 'get', 'describe', ..."
+        )
+        msg = _phase1_handle_tool_error(err)
+        assert "kubectl_ro" in msg
+        assert "Phase 1" in msg
+
+    def test_recognizes_execution_error(self):
+        """Tool body raised — wrapped in TOOL_EXECUTION_ERROR_TEMPLATE."""
+        from chaos_agent.agent.graph import _phase1_handle_tool_error
+        err = ValueError(
+            "Error executing tool 'some_tool' with kwargs {} with "
+            "error:\n RuntimeError: oops"
+        )
+        msg = _phase1_handle_tool_error(err)
+        assert "some_tool" in msg
+
+    def test_unrecognized_error_falls_back_safely(self):
+        """When no regex matches, use ``<unknown>`` placeholder but
+        still deliver the Phase 1 enforcement message."""
+        from chaos_agent.agent.graph import _phase1_handle_tool_error
+        err = RuntimeError("totally unrelated error format")
+        msg = _phase1_handle_tool_error(err)
+        assert "<unknown>" in msg
+        assert "Phase 1" in msg
+        # Critical: still doesn't leak alternatives
+        assert "try one of" not in msg.lower()
 

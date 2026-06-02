@@ -120,7 +120,10 @@ def _score_to_level(score: int) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _score_blast_radius(spec: "FaultSpec") -> DimensionScore:
+def _score_blast_radius(
+    spec: "FaultSpec",
+    context: dict | None = None,
+) -> DimensionScore:
     # An empty scope is a degenerate input (safety_check rejects these
     # before E10 gets called in practice, but rejected paths still call
     # the scorer for display consistency). Treat as 0 instead of falling
@@ -149,6 +152,26 @@ def _score_blast_radius(spec: "FaultSpec") -> DimensionScore:
         f"scope={spec.scope or 'unknown'} ({scope_base}), "
         f"{count_desc} (+{count_mod})"
     )
+
+    # Execution-level blast radius override: the LLM declares whether
+    # the actual implementation mutates resources beyond the target
+    # (e.g. tainting all cluster nodes for a deployment-scoped fault).
+    # This overrides the FaultSpec-based score when the execution scope
+    # is wider than the target scope.
+    ctx = context or {}
+    br_scope = ctx.get("blast_radius_scope", "")
+    br_detail = ctx.get("blast_radius_detail", "")
+    if br_scope == "cluster-wide" and value < 90:
+        value = 90
+        explanation += f"; execution={br_scope} (override→90)"
+        if br_detail:
+            explanation += f" [{br_detail}]"
+    elif br_scope == "namespace-wide" and value < 60:
+        value = 60
+        explanation += f"; execution={br_scope} (override→60)"
+        if br_detail:
+            explanation += f" [{br_detail}]"
+
     return DimensionScore(value=value, explanation=explanation)
 
 
@@ -318,7 +341,7 @@ def compute_safety_score(
     ctx = context or {}
     w = weights or DEFAULT_WEIGHTS
 
-    br = _score_blast_radius(spec)
+    br = _score_blast_radius(spec, ctx)
     fr = _score_frequency(ctx)
     tm = _score_time(spec, ctx)
     tp = _score_topology(spec, ctx)

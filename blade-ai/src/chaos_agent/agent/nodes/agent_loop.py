@@ -6,6 +6,7 @@ import shlex
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from chaos_agent.agent.node_names import AGENT_LOOP
 from chaos_agent.agent.env_info import compute_env_info
 from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
 from chaos_agent.agent.nodes._kubeconfig_inject import (
@@ -38,6 +39,12 @@ from chaos_agent.observability.status_tracker import (
 )
 
 logger = logging.getLogger(__name__)
+
+_WORKLOAD_SCOPES = frozenset({
+    "container", "pod", "deployment", "service",
+    "statefulset", "daemonset",
+})
+_INFRA_SCOPES = frozenset({"node"})
 
 
 def _derive_spec_fields_from_kubectl_get(
@@ -107,12 +114,20 @@ def _derive_spec_fields_from_kubectl_get(
         "services": "service", "service": "service", "svc": "service",
     }
     positionals: list[str] = []
+    _SHELL_OPERATORS = {"|", "||", "&&", ";", ">", ">>", "<"}
     i = 0
     while i < len(v_parts):
         p = v_parts[i]
+        if p in _SHELL_OPERATORS:
+            break
         if p in ("-n", "--namespace", "-l", "--selector",
-                 "-o", "--output", "--field-selector"):
+                 "-o", "--output", "--field-selector", "--kubeconfig"):
             i += 2  # skip flag + value
+            continue
+        if p.startswith("--") and "=" not in p:
+            # Unknown --flag with separate value: skip flag + value
+            # to prevent flag values from leaking into names.
+            i += 2
             continue
         if p.startswith("-"):
             i += 1
@@ -122,12 +137,72 @@ def _derive_spec_fields_from_kubectl_get(
     if positionals:
         canonical = _SCOPE_ALIASES.get(positionals[0].lower())
         if canonical:
-            updates["scope"] = canonical
-            # positional[1:] are specific resource names
+            # Only infer scope if the command targets a SPECIFIC resource
+            # (has names or labels). A bare "kubectl get nodes" is an
+            # environment probe, not a target declaration.
             names = [n for n in positionals[1:] if not n.startswith("-")]
-            if names:
-                updates["names"] = tuple(names)
+            has_labels = "labels" in updates
+            if names or has_labels:
+                updates["scope"] = canonical
+                if names:
+                    updates["names"] = tuple(names)
     return updates
+
+
+def _extract_validated_labels_from_history(messages: list) -> dict | None:
+    """Extract labels from the most recent kubectl -l query that returned results.
+
+    Scans messages backwards for a kubectl get/describe ToolMessage whose
+    content indicates actual resources were found. Then traces back to the
+    corresponding AIMessage tool_call to extract the -l selector value.
+
+    Returns the labels dict, or None if no validated labels found.
+    """
+    from langchain_core.messages import ToolMessage as _TM
+
+    # Build tool_call_id → v_args map for kubectl calls with -l
+    tc_map: dict[str, str] = {}
+    for msg in messages:
+        if not hasattr(msg, "tool_calls"):
+            continue
+        for tc in (msg.tool_calls or []):
+            tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+            tc_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+            if not isinstance(tc_args, dict):
+                continue
+            if tc_args.get("subcommand") in ("get", "describe", "top"):
+                v_args = tc_args.get("v_args", "")
+                if "-l " in v_args or "--selector" in v_args:
+                    tc_map[tc_id] = v_args
+
+    # Find most recent non-empty ToolMessage matching a -l query
+    for msg in reversed(messages):
+        if not isinstance(msg, _TM):
+            continue
+        tcid = getattr(msg, "tool_call_id", "")
+        if tcid not in tc_map:
+            continue
+        content = getattr(msg, "content", "") or ""
+        if (
+            not content.strip()
+            or "No resources" in content
+            or content.startswith("Error:")
+            or len(content) < 20
+        ):
+            continue
+        # Extract -l selector from the corresponding tool_call v_args
+        v_args = tc_map[tcid]
+        parts = _split_args(v_args)
+        for i, p in enumerate(parts):
+            if p in ("-l", "--selector") and i + 1 < len(parts):
+                labels: dict[str, str] = {}
+                for piece in parts[i + 1].split(","):
+                    if "=" in piece:
+                        k, _, v = piece.partition("=")
+                        labels[k.strip()] = v.strip()
+                if labels:
+                    return labels
+    return None
 
 
 def _split_args(args: str) -> list[str]:
@@ -298,6 +373,18 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         if llm is not None:
             messages = list(state.get("messages", []))
 
+            # Validated labels: extract from the most recent kubectl -l
+            # query that returned non-empty results. Overwrites any
+            # previously guessed (unvalidated) labels.
+            _validated_labels = _extract_validated_labels_from_history(messages)
+            _pending_label_spec: dict | None = None
+            if _validated_labels:
+                _spec_for_labels = read_fault_spec(state)
+                if _spec_for_labels and dict(_spec_for_labels.labels) != _validated_labels:
+                    _pending_label_spec = _spec_for_labels.replace(
+                        labels=_validated_labels
+                    ).to_dict()
+
             # Inject replan error context as HumanMessage
             if is_replan:
                 error_msg = HumanMessage(content=(
@@ -350,11 +437,31 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                     fi_lines.append(f"User request: {_spec.user_description}")
 
                 _resolved_use_case_path = state.get("matched_use_case_path")
+                _all_matches: list[str] = []
                 if not _resolved_use_case_path and registry:
-                    _resolved_use_case_path = registry.match_use_case(
+                    _all_matches = registry.match_use_cases(
                         _spec.scope, _spec.blade_target, _spec.blade_action,
                     )
-                if _resolved_use_case_path:
+                    if _all_matches:
+                        _resolved_use_case_path = _all_matches[0]
+                if _all_matches and len(_all_matches) > 1:
+                    fi_lines.append(
+                        f"\nMultiple catalogue cases match this fault ({len(_all_matches)} candidates):"
+                    )
+                    for _mp in _all_matches:
+                        _label = _mp.split("/")[-1].replace(".md", "")
+                        fi_lines.append(f"  - {_mp}  ({_label})")
+                    fi_lines.append(
+                        "\n→ Read each candidate with read_skill_resource to decide "
+                        "which verification methodology fits the user's actual scenario. "
+                        "For example, if the user wants to test HPA scaling, choose the "
+                        "HPA case even though the injection command is pod-cpu-fullload."
+                    )
+                    fi_lines.append(
+                        "\nProceed: activate the matching skill, read the best-fit "
+                        "use-case, verify the target, and generate your execution plan."
+                    )
+                elif _resolved_use_case_path:
                     _catalogue_dir = _resolved_use_case_path.rsplit("/", 1)[0] + "/"
                     fi_lines.append(
                         f"\nMatched catalogue directory: {_catalogue_dir}"
@@ -444,7 +551,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 llm_with_tools = llm
             else:
                 tools_this_iter = list(tools) if tools else []
-                if stagnant_tool:
+                if stagnant_tool and ":" not in stagnant_tool:
                     tools_this_iter = [
                         t for t in tools_this_iter
                         if getattr(t, "name", "") != stagnant_tool
@@ -452,7 +559,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 llm_with_tools = llm.bind_tools(tools_this_iter) if tools_this_iter else llm
 
             # Record system prompt to session store (dedup handles repeated prompts)
-            record_system_prompt(hook, state, system_prompt)
+            record_system_prompt(hook, state, system_prompt, node_name=AGENT_LOOP)
 
             response = await llm_with_tools.ainvoke(
                 [SystemMessage(content=system_prompt)] + messages
@@ -462,6 +569,10 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
 
         # 4. Build result
         result = {"agent_loop_count": count, "planning_rejected": False}
+
+        # Apply deferred validated label update (computed pre-LLM)
+        if _pending_label_spec:
+            result["fault_spec"] = _pending_label_spec
 
         # Persist matched catalogue path for downstream nodes (verifier etc.)
         if _resolved_use_case_path:
@@ -473,6 +584,8 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             result["needs_confirmation"] = False
             # Clear replan_requested so Phase 2 doesn't immediately re-trigger
             result["replan_requested"] = False
+            result["blast_radius_scope"] = None
+            result["blast_radius_detail"] = None
 
         if response is not None:
             # Programmatic kubeconfig injection: ensure every kubectl/blade tool call
@@ -483,7 +596,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             result["messages"] = _injections_for_state + [response]
 
             # Immediately save AI message (including reasoning_content) to session
-            record_ai_message(hook, state, response)
+            record_ai_message(hook, state, response, node_name=AGENT_LOOP)
 
             # Diagnostic log for reasoning_content presence
             log_reasoning_content(response, "Agent loop", count)
@@ -496,6 +609,14 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 if tc_name == "activate_skill" and tc_args.get("skill_name"):
                     result["skill_name"] = tc_args["skill_name"]
                     logger.info(f"Skill activated: {tc_args['skill_name']}")
+
+                if tc_name == "finish_planning":
+                    br_scope = tc_args.get("blast_radius_scope", "")
+                    br_detail = tc_args.get("blast_radius_detail", "")
+                    if br_scope:
+                        result["blast_radius_scope"] = br_scope
+                    if br_detail:
+                        result["blast_radius_detail"] = br_detail
 
                 # Lazy spec derivation from LLM's kubectl get probes.
                 #
@@ -538,9 +659,18 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                             v_args=tc_args.get("v_args", ""),
                             blacklist=settings.blacklist_namespaces,
                         )
-                        # write-once: only fill missing fields
+                        # Strict write-once: only fill fields the spec
+                        # is missing. Scope is NOT overridden here —
+                        # extract_planning_metadata derives the
+                        # authoritative scope from the skill case.
+                        # Allowing kubectl queries to override scope
+                        # (the old has_precise_scope logic) caused
+                        # exploratory node queries to corrupt the scope
+                        # from "deployment" to "node".
                         updates: dict = {}
                         for k, v in derived.items():
+                            if k == "labels":
+                                continue  # labels written by validated extraction only
                             current = getattr(_spec_now, k, None)
                             if not current:
                                 updates[k] = v
@@ -552,63 +682,6 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                                 "LLM kubectl get: %s", updates,
                             )
 
-                # Extract plan from save_fault_plan calls
-                if tc_name == "save_fault_plan":
-                    plan_content = tc_args.get("plan_content", "")
-                    if plan_content:
-                        result["is_complex"] = True
-                        result["plan"] = plan_content
-                        logger.info(f"Fault plan generated ({len(plan_content)} chars)")
-
-                if tc_name == "finish_planning":
-                    if tc_args.get("rejected"):
-                        reason = tc_args.get("rejection_reason") or tc_args.get("summary", "Agent rejected the request")
-                        result.update(fail_state(
-                            FailureCategory.PLANNING_REJECTED,
-                            reason,
-                            state.get("messages", []) + result.get("messages", []),
-                        ))
-                    else:
-                        summary = tc_args.get("summary", "")
-                        if summary and not result.get("plan"):
-                            result["plan"] = summary
-
-            # Satisfy ToolMessage contract when finish_planning bypasses ToolNode.
-            # Generate synthetic ToolMessages for ALL tool_calls in this response
-            # so the message history stays valid for downstream LLM calls.
-            _has_finish_planning = any(
-                (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")) == "finish_planning"
-                for tc in tool_calls
-            )
-            if _has_finish_planning:
-                synthetic_tms = []
-                for tc in tool_calls:
-                    _tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
-                    _tc_id = (
-                        tc.get("id", "") if isinstance(tc, dict)
-                        else getattr(tc, "id", "")
-                    ) or f"call_{_tc_name}_{count}"
-                    if _tc_name == "finish_planning":
-                        _fp_args = (tc.get("args") or {}) if isinstance(tc, dict) else (getattr(tc, "args", None) or {})
-                        _fp_rejected = _fp_args.get("rejected", False)
-                        _fp_summary = _fp_args.get("summary", "")
-                        if _fp_rejected:
-                            _fp_reason = _fp_args.get("rejection_reason") or _fp_summary
-                            tm_content = f"Planning rejected. Reason: {_fp_reason}"
-                        else:
-                            tm_content = f"Planning finalized. Summary: {_fp_summary}"
-                        synthetic_tms.append(ToolMessage(
-                            content=tm_content,
-                            tool_call_id=_tc_id,
-                            name="finish_planning",
-                        ))
-                    else:
-                        synthetic_tms.append(ToolMessage(
-                            content="(skipped — finish_planning signaled end of planning phase)",
-                            tool_call_id=_tc_id,
-                            name=_tc_name,
-                        ))
-                result["messages"] = result.get("messages", []) + synthetic_tms
 
             # Emit debug-level status event with LLM reasoning summary
             if settings.is_debug:
@@ -617,22 +690,6 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                     f"Iteration {count} LLM:\n{debug_info}",
                     {"debug": True, "iteration": count, "tool_calls": tool_names},
                 )
-
-        # Extract plan_path from save_fault_plan ToolMessage results
-        if result.get("is_complex"):
-            messages = state.get("messages", [])
-            for msg in reversed(messages):
-                if not isinstance(msg, ToolMessage):
-                    continue
-                msg_name = getattr(msg, "name", "") or ""
-                if msg_name != "save_fault_plan":
-                    continue
-                content = msg.content if isinstance(msg.content, str) else ""
-                # Response format: "Plan saved to /path/to/file\n\n..."
-                if content.startswith("Plan saved to "):
-                    first_line = content.split("\n")[0]
-                    result["plan_path"] = first_line.replace("Plan saved to ", "").strip()
-                    break
 
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result, hook_updates)

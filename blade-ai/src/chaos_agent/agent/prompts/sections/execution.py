@@ -29,25 +29,6 @@ def get_tools_section(phase: int = 1) -> str:
 
     return """## Tool Usage Guidelines
 
-### Phase Boundary (CRITICAL — read first)
-You are in **Phase 1 (planning)**. Your job is **research + plan**, not injection.
-
-**Tools available in Phase 1**:
-- Read-only inspection: `kubectl(subcommand="get"/"describe")`, `activate_skill`, `read_skill_resource`,
-  `read_file`, `read_knowledge_resource`
-- Plan persistence: `save_fault_plan`
-- Cleanup utilities (rarely used here): `blade_status`, `blade_destroy`
-
-**Tools NOT available in Phase 1** (calling them will fail with "not a valid tool"):
-- `blade_create` — fault injection is reserved for Phase 2 (execute_loop) which
-  the framework enters automatically AFTER `confirmation_gate` approves the plan
-- `kubectl(subcommand="exec")` — out of scope here, but Phase 2 can use it
-
-**Do NOT** attempt to inject during Phase 1 — even if the user "already confirmed"
-in chat. The confirmation_gate is a graph node that gates Phase 2 transition;
-nothing prior to that node performs injection. If you call `blade_create` here,
-the call is rejected and the user sees a confusing error.
-
 ### Tool Selection Priority
 1. **Skill references first (after skill activation)**: Use `read_skill_resource` to read skill reference files for accurate, up-to-date command syntax and parameters
 2. **Knowledge docs for domain context**: Especially BEFORE skill activation or when no skill is active, use `read_knowledge_resource` to read knowledge documents — do NOT guess or improvise blade commands
@@ -84,12 +65,8 @@ def get_k8s_connection_section() -> str:
     """K8s cluster connection section."""
     return """## K8s Cluster Connection
 All kubectl and blade tools support optional `kubeconfig`, `context`, and `cluster` parameters.
-If the user specifies a kubeconfig path or cluster context in their description,
-you MUST pass it to the tool calls so the commands target the correct cluster.
-For blade_create, you MUST pass `namespace` and `names` as explicit parameters instead of putting them in flags.
-IMPORTANT: For node-scope faults (scope=node), pass the `namespace` parameter for context tracking only.
-The blade_create tool will automatically omit --namespace from the CLI command for node scope,
-since ChaosBlade does not accept it. Namespace is still useful for metadata and tracking affected workloads."""
+If the user specifies a kubeconfig path or cluster context, you MUST pass it to every tool call.
+For blade_create parameter details (namespace/names handling), see the tool schema."""
 
 
 def get_guidelines_section(include_method_switching: bool = True) -> str:
@@ -123,26 +100,15 @@ When ANY tool returns an error or unexpected result:
 - Follow the skill instructions exactly - do not improvise blade commands
 - Capture the blade UID from every create command - it is needed for recovery
 - Report results in a structured format including blade_uid, status, and verification details
-- If verification fails, do NOT retry injection without user guidance
+- If verification fails, do NOT retry injection without user guidance"""
 
-### Pre-injection Conflict Check
+    conflict_check = """### Pre-injection Conflict Check
 Conflict checking is performed automatically by the system before you are invoked.
 If active experiments were detected, you would have been routed through a confirmation gate.
-When you reach this execution phase, it means either:
-- No conflicts were detected, OR
-- The user has explicitly confirmed proceeding despite existing experiments
 You do NOT need to run additional conflict checks — focus on executing the fault injection."""
 
-    method_switching = """### Injection Method Switching
-When `blade_create` fails and you switch to an alternative injection method (e.g., kubectl exec blade, kubectl-native operations):
-1. ChaosBlade commands include a default `--timeout` automatically; if the user specifies a custom timeout, pass it explicitly. For kubectl-native alternatives (scale/cordon/patch/taint), timeout is not applicable
-2. You MUST verify the blast radius remains consistent with the original plan
-3. You MUST still capture the blade_uid or equivalent recovery identifier
-4. Report the method switch in your response so the user is aware
-5. **See Execution Phase Directives → Method Constraint** for the critical rule on which methods are permitted."""
-
     if include_method_switching:
-        return f"{base}\n\n{method_switching}"
+        return f"{base}\n\n{conflict_check}"
     return base
 
 
@@ -168,34 +134,30 @@ def get_execution_directives_section(
         "## EXECUTION PHASE DIRECTIVES",
         "You are now in the execution phase. The plan has been approved.",
         "Follow the skill instructions precisely to inject the fault.",
-        "Use blade_create to inject ChaosBlade faults, and kubectl (with subcommands patch/delete/exec etc.) for K8s operations and diagnostics.",
+        "Use blade_create to inject ChaosBlade faults, and kubectl for K8s operations.",
         "",
-        "### blade_create Fallback: kubectl exec into Tool Pod",
-        "If blade_create fails (e.g., 'unknown flag', version incompatibility), use kubectl exec as fallback:",
-        "1. Find a running tool pod: `kubectl get pods -n chaosblade -l app=otel-c-tool --kubeconfig=<path>`",
-        "2. Execute blade inside the pod: `kubectl exec <pod> -n chaosblade -- blade create k8s <scenario> [flags]` "
-        "(a default --timeout is applied automatically; add `--timeout <seconds>` in v_args "
-        "if the user specifies a custom value)",
-        "   NOTE: Do NOT add --kubeconfig inside the blade command (v_args). Inside the tool pod, blade uses the pod's ServiceAccount to access the API server — no kubeconfig needed.",
-        "   The kubectl tool's own kubeconfig parameter (for connecting to the cluster) should still be passed via the dedicated 'kubeconfig' parameter.",
-        "3. Extract blade_uid from the JSON response — it is still valid for blade_destroy recovery",
-        "4. If no tool pod is available, consider kubectl-native alternatives (scale/cordon/patch/taint)",
+        "### When blade_create Fails",
+        "1. **Fallback — kubectl exec tool pod**:\n"
+        "   `kubectl get pods -n chaosblade -l app=otel-c-tool` → find a running pod →\n"
+        "   `kubectl exec <pod> -n chaosblade -- blade create k8s <scenario> [flags]`\n"
+        "   NOTE: no --kubeconfig inside blade command (pod uses ServiceAccount).\n"
+        "   Extract blade_uid from the JSON response.\n"
+        "2. **Constraint**: alternative methods MUST come from the skill case's "
+        "injection section. Do NOT improvise methods not listed there.\n"
+        "3. **If all methods exhausted** → output `[REPLAN]`.\n"
+        "4. If no tool pod available → consider kubectl-native alternatives "
+        "(scale/cordon/patch/taint).\n\n"
+        "Rules:\n"
+        "- timeout: auto-applied by tools; pass explicitly only if user specifies custom value\n"
+        "- blade_uid: always capture from response for recovery\n"
+        "- blast radius: must remain consistent with original plan\n"
+        "- report: notify user of any method switch",
         "",
-        "**SAFETY**: Every ChaosBlade experiment must have --timeout protection. "
-        "The tools apply a default timeout automatically. "
-        "If the user specifies a custom timeout, pass it explicitly — "
-        "the tools will use the provided value instead of the default.",
-        "",
-        "### METHOD CONSTRAINT (critical rule)",
-        "Alternative injection methods MUST come from the skill case's injection section "
-        "(the section describing how to inject the fault, e.g., \"Injection Method Selection\"). "
-        "The ChaosBlade command reference lists ALL possible ChaosBlade commands — it is a "
-        "reference document, NOT a prescription for this specific task. "
-        "Only the injection methods explicitly described in the skill case are valid alternatives. "
-        "If all listed methods have been exhausted without success, output `[REPLAN]` "
-        "rather than improvising a new method not mentioned in the skill case.",
-        "",
-        "If a plan exists, execute each step in order.",
+        "### MULTI-STEP INJECTION (kubectl-native)",
+        "When the skill case requires multiple kubectl commands:\n"
+        "1. Execute each step IN ORDER\n"
+        "2. Check result before proceeding to next step\n"
+        "3. Continue until ALL steps are done — do NOT conclude after first success",
     ]
 
     if skill_name:

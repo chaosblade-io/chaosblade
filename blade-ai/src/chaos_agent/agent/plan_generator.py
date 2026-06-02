@@ -255,7 +255,7 @@ def _resolve_baseline_template(template: str, spec: FaultSpec) -> str:
     node_name = names[0] if names else ""
     pod_name = "" if spec.scope == "node" else (names[0] if names else "")
     label_selector = (
-        "-l " + ",".join(f"{k}={v}" for k, v in spec.labels.items())
+        ",".join(f"{k}={v}" for k, v in spec.labels.items())
         if spec.labels else ""
     )
 

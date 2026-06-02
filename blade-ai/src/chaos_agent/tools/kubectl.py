@@ -88,6 +88,7 @@ def _is_json_output(v_args: str) -> bool:
 async def kubectl(
     subcommand: str,
     v_args: str = "",
+    stdin_data: str = "",
     kubeconfig: str = "",
     context: str = "",
     cluster: str = "",
@@ -108,13 +109,16 @@ async def kubectl(
       - Cluster inspection in any phase (get / describe / top / logs).
       - Phase 2 mutation (delete / patch / set / scale / cordon / uncordon / taint).
       - Verification probing inside containers or on nodes (exec / debug).
-      - Do NOT use `apply`, `create`, `replace`, `edit`, `expose`, `run`,
-        `autoscale`, `rollout` — those create/mutate workloads outside the
-        chaos scope and are blocked by ToolGuard.
+      - Creating non-workload resources (PV / PVC / Secret / ConfigMap):
+        use ``subcommand="apply"`` with ``v_args="-f -"`` and pass the
+        YAML via ``stdin_data``. Workload resources (Deployment, Pod, Job,
+        etc.) are blocked.
+      - Do NOT use ``exec ... | kubectl apply`` or ``exec ... kubectl create``
+        to create resources — this causes namespace drift and will be rejected.
 
     Inputs:
       - subcommand: one of {get, describe, top, logs, exec, delete, patch, set,
-                            scale, cordon, uncordon, taint, debug}.
+                            scale, cordon, uncordon, taint, debug, apply}.
       - v_args: subcommand arguments as a single shell-quoted string. Examples:
           get      → "pods -n <ns> -o json"
                      "pods -n <ns> -l app=nginx --field-selector=status.phase=Pending"
@@ -129,7 +133,10 @@ async def kubectl(
           patch    → "pod <pod> -n <ns> --type=json -p '[{\\"op\\":\\"add\\",\\"path\\":\\"/metadata/labels/x\\",\\"value\\":\\"y\\"}]'"
           scale    → "deployment <name> -n <ns> --replicas=0"
           taint    → "nodes <node> key=value:NoSchedule"   |   "nodes <node> key-"
+          apply    → "-f -" (with stdin_data containing PV/PVC/Secret/ConfigMap YAML)
         See knowledge resource `kubectl-recipes.md` for the long-tail catalogue.
+      - stdin_data: YAML content for ``apply -f -``. Pass the full YAML here
+        instead of embedding it in v_args or using exec heredoc.
       - kubeconfig / context / cluster: optional overrides
         (do NOT embed --kubeconfig in v_args — it is auto-stripped).
 
@@ -141,6 +148,14 @@ async def kubectl(
       - get / describe / top / logs / exec (read-only commands inside containers): none.
       - delete / patch / set / scale / cordon / uncordon / taint / debug: mutate
         cluster state. Treat as Phase 2 actions and verify aftermath.
+
+    Self-help (IMPORTANT — use this instead of guessing from memory):
+      - Pass `--help` or `-h` in v_args to see the real usage of any subcommand.
+        Example: kubectl(subcommand="get", v_args="--help")
+      - This returns the live kubectl help text, which is ALWAYS more accurate
+        than documentation, skill instructions, or knowledge resources.
+      - When a command fails with an unknown flag or argument error, call
+        `--help` BEFORE retrying — do NOT guess from prior context.
 
     Constraints (MUST READ before calling):
       - No shell features: `|`, `;`, `&&`, `>`, `$()` are NOT supported. Use
@@ -162,7 +177,7 @@ async def kubectl(
       - "force delete a stuck Pod" → delete with --force --grace-period=0
       - "remove a taint" → taint with the taint key followed by '-' (e.g., "nodes <node> key-")
     """
-    return await _kubectl_impl(subcommand, v_args, kubeconfig, context, cluster)
+    return await _kubectl_impl(subcommand, v_args, kubeconfig, context, cluster, stdin_data=stdin_data)
 
 
 async def _kubectl_impl(
@@ -171,6 +186,7 @@ async def _kubectl_impl(
     kubeconfig: str = "",
     context: str = "",
     cluster: str = "",
+    stdin_data: str = "",
 ) -> str:
     """Shared kubectl execution logic used by both kubectl and kubectl_ro."""
     cmd = [settings.kubectl_path]
@@ -251,7 +267,7 @@ async def _kubectl_impl(
     timeout = settings.timeout_kubectl_exec if subcommand in ("exec", "debug") else settings.timeout_kubectl
 
     try:
-        result = await run_command(cmd, timeout=timeout)
+        result = await run_command(cmd, timeout=timeout, stdin_data=stdin_data)
     except Exception as e:
         return f"Error: kubectl {subcommand} failed: {e}"
 
@@ -355,6 +371,14 @@ async def kubectl_ro(
       - Discover available API resources (`api-resources`, `explain`).
       - Check effective permissions (`auth can-i`).
 
+    Self-help (IMPORTANT — use this instead of guessing from memory):
+      - Pass `--help` or `-h` in v_args to see the real usage of any subcommand.
+        Example: kubectl_ro(subcommand="get", v_args="--help")
+      - This returns the live kubectl help text, which is ALWAYS more accurate
+        than documentation, skill instructions, or knowledge resources.
+      - When a command fails with an unknown flag or argument error, call
+        `--help` BEFORE retrying — do NOT guess from prior context.
+
     Constraints:
       - This tool ONLY accepts the read-only subcommands above. Any
         attempt to call ``exec``, ``delete``, ``patch``, ``apply``,
@@ -385,4 +409,69 @@ async def kubectl_ro(
     # Call the shared implementation directly — NOT kubectl.ainvoke(),
     # which would emit a nested on_tool_start event causing the TUI to
     # render a duplicate tool card.
+    return await _kubectl_impl(subcommand, v_args, kubeconfig, context, cluster)
+
+
+VERIFIER_SUBCOMMANDS: tuple[str, ...] = (
+    "get", "describe", "top", "logs",
+    "version", "cluster-info", "api-resources", "explain", "auth",
+    "exec",
+)
+
+
+@tool
+async def kubectl_verify(
+    subcommand: Literal[
+        "get", "describe", "top", "logs",
+        "version", "cluster-info", "api-resources", "explain", "auth",
+        "exec",
+    ],
+    v_args: str = "",
+    kubeconfig: str = "",
+    context: str = "",
+    cluster: str = "",
+) -> str:
+    """Verifier phase ONLY. Observation kubectl with ``exec`` for in-pod probing.
+
+    When to use (verification = observe fault effects AFTER injection):
+      - Check pod / node / endpoint state changes (`get`, `describe`).
+      - Compare current metrics against pre-injection baseline (`top`).
+      - Read application logs for error evidence (`logs`).
+      - Probe inside containers for fault symptoms (`exec`):
+        DNS resolution: ``exec <pod> -n <ns> -- nslookup <service>``
+        HTTP health:    ``exec <pod> -n <ns> -- wget -qO- --timeout=3 <url>``
+        Process state:  ``exec <pod> -n <ns> -- ps aux``
+        Network:        ``exec <pod> -n <ns> -- ping -c 3 <target>``
+
+    Self-help (IMPORTANT — use this instead of guessing from memory):
+      - Pass `--help` or `-h` in v_args to see the real usage of any subcommand.
+        Example: kubectl_verify(subcommand="get", v_args="--help")
+      - This returns the live kubectl help text, which is ALWAYS more accurate
+        than documentation, skill instructions, or knowledge resources.
+      - When a command fails with an unknown flag or argument error, call
+        `--help` BEFORE retrying — do NOT guess from prior context.
+
+    Constraints:
+      - This tool accepts read-only subcommands plus ``exec`` for in-pod
+        observation. Any attempt to call ``scale``, ``delete``, ``patch``,
+        ``apply``, ``cordon``, ``drain``, ``taint``, ``rollout``,
+        ``debug``, ``edit``, ``replace``, ``create``, ``run``, etc. is
+        REJECTED. The verifier's job is to OBSERVE fault effects, not
+        to inject faults — injection is done in the execution phase.
+      - ``kubectl exec`` constraints: no shell features (`|`, `;`, `&&`),
+        no `-l/--selector` (resolve pod name first via `get`), no `-it`
+        (non-interactive context).
+
+    Inputs / Output: same shape as the full ``kubectl`` tool. This is a
+    thin wrapper that re-uses ``kubectl``'s execution logic with the
+    subcommand domain constrained.
+    """
+    if subcommand not in VERIFIER_SUBCOMMANDS:
+        return (
+            f"Error: kubectl_verify does not accept subcommand '{subcommand}'.\n"
+            f"The verifier phase is observation-only. Allowed "
+            f"subcommands: {', '.join(VERIFIER_SUBCOMMANDS)}.\n"
+            f"Mutation subcommands (scale/delete/patch/...) are only "
+            f"available in the execution phase."
+        )
     return await _kubectl_impl(subcommand, v_args, kubeconfig, context, cluster)

@@ -202,11 +202,27 @@ async def tool_screener(state: AgentState) -> dict:
                 ),
             }
 
+        # CLI mode: no interactive human to confirm drift — reject and
+        # let LLM self-correct. Second drift hits drift_reject_count>=1
+        # hard-terminate above.
+        if state.get("interaction_mode") == "cli":
+            logger.warning(
+                "target_guard: drift in CLI mode (count=%d), rejecting tool_calls",
+                drift_reject_count,
+            )
+            return {
+                "messages": rejection_msgs,
+                "screener_route": SCREENER_ROUTE_RETRY,
+                "drift_reject_count": drift_reject_count + 1,
+            }
+
         _reason = drifted[0]["reason"] if drifted else ""
+        agent_reason = _extract_agent_reason(last_msg)
         drift_info = {
             "type": "target_change",
             "summary": f"Target change detected: {_reason}",
             "reason": _reason,
+            "agent_reason": agent_reason,
             "original": _format_approved_for_card(approved),
             "proposed": _format_effective_for_card(first_eff) if first_eff else {},
             "tool_calls": [
@@ -300,6 +316,34 @@ def _format_effective_for_card(eff: EffectiveTarget) -> dict:
         "labels": dict(eff.labels),
         "blade_target": eff.blade_target,
     }
+
+
+_AGENT_REASON_MAX_LEN = 200
+
+
+def _extract_agent_reason(msg: AIMessage) -> str:
+    """Extract a short explanation from the AIMessage that triggered drift.
+
+    Prefers ``content`` (the LLM's visible text); falls back to a
+    truncated ``reasoning_content`` (thinking trace).
+
+    ``content`` may be a str or a list of content blocks (multimodal /
+    thinking models). We normalise to str before truncating.
+    """
+    raw = getattr(msg, "content", "") or ""
+    if isinstance(raw, list):
+        raw = " ".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in raw
+        ).strip()
+    text = raw.strip() if isinstance(raw, str) else ""
+    if text:
+        return text[:_AGENT_REASON_MAX_LEN]
+    additional = getattr(msg, "additional_kwargs", None) or {}
+    reasoning = (additional.get("reasoning_content", "") or "").strip()
+    if reasoning:
+        return reasoning[:_AGENT_REASON_MAX_LEN]
+    return ""
 
 
 def _apply_drift_correction(state: AgentState, eff: EffectiveTarget | None) -> dict:

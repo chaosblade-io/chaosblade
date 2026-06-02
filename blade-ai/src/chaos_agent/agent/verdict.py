@@ -34,6 +34,7 @@ class RecoverVerdict(str, Enum):
 class Layer1Status(str, Enum):
     PASSED = "passed"
     FAILED = "failed"
+    WARNING = "warning"
     ERROR = "error"
     SKIPPED = "skipped"
     UNKNOWN = "unknown"

@@ -45,7 +45,7 @@ def get_recover_role_section() -> str:
 **IMPORTANT: You are in Layer 2 (VERIFICATION phase).**
 - DO NOT execute recovery actions — that was Layer 1's job
 - DO NOT output RECOVERY_EXECUTION_RESULT — that is Layer 1's format
-- You MUST output RECOVERY_VERIFICATION_RESULT format below"""
+- You MUST conclude by CALLING the submit_recover_verification tool (see Output below)"""
 
 
 def get_recover_critical_rules_section() -> str:
@@ -79,7 +79,7 @@ def get_recover_critical_rules_section() -> str:
 def get_recover_tools_section() -> str:
     """Available tools for recovery verification."""
     return """### Available Tools
-- `kubectl`: Run kubectl commands for cluster verification
+- `kubectl_verify`: Run kubectl commands (get, describe, top, exec, logs) for cluster observation. Does NOT support mutation subcommands (scale, delete, patch, etc.)
 - `read_skill_resource`: Read skill resource files (e.g., recovery verification instructions)
 - `read_knowledge_resource`: Read domain knowledge documents (check Domain Knowledge Index)"""
 
@@ -122,45 +122,24 @@ def get_recover_output_format_section(*, layer1_label: str = "blade_destroy") ->
     Args:
         layer1_label: "blade_destroy" for ChaosBlade, "recovery execution" for non-CB.
     """
-    return f"""## Output (MANDATORY — Machine-Parseable format)
+    return f"""## Output (MANDATORY — submit via the submit_recover_verification tool)
 
-Your final output MUST follow this format EXACTLY. No markdown tables or emoji.
-If still gathering evidence, call tools instead of outputting text.
+When ready to conclude (after running kubectl to observe CURRENT post-recovery
+state), call `submit_recover_verification`. This tool call IS your verdict —
+do NOT also write free-text. Debug pod cleanup is automatic.
 
-RECOVERY_VERIFICATION_CHECKLIST:
-- Step 1: passed/failed/skipped/partial/expected — brief evidence (baseline→current Δ%)
-- Step 2: ...
+If still gathering evidence, call kubectl_verify instead — do NOT call
+submit_recover_verification yet. See the tool schema for argument details.
+Fallback: if tool calling unavailable, output a plain-text
+RECOVERY_VERIFICATION_RESULT block with Layer1 ({layer1_label}), Layer2,
+BaselineUsed, Overall, Warnings.
 
-RECOVERY_VERIFICATION_RESULT:
-- Layer1 ({layer1_label}): passed
-- Layer2 (fault-specific): passed/failed/partial/skipped — evidence summary
-- PrimaryEvidenceObserved: true/false
-- BaselineUsed: true/false
-- Overall: recovered/partial/unrecovered
-- Warnings: text or "none"
-
-Status: passed | failed | skipped | partial | expected(negative=anticipated)
-Overall: recovered(all pass) | partial(some skip) | unrecovered(still present)
-
-**Primary Evidence Definition** (for PrimaryEvidenceObserved field):
-Primary evidence of RECOVERY = DIRECT observation that the fault's specific
-physical effect has been REMOVED. It is fault-type-specific, NOT generic health.
-
-Examples by fault type — observe the LEFT column to set PrimaryEvidenceObserved=true:
-| Fault              | Primary evidence of REMOVAL (set true)                           | NOT primary (set false)                          |
-|--------------------|------------------------------------------------------------------|--------------------------------------------------|
-| pod-cpu fullload   | CPU usage returned to baseline (kubectl top)                     | Pod Running alone, no new restart                |
-| pod-mem load       | Memory usage returned to baseline (kubectl top)                  | Pod Running alone; absence of new OOMKill alone  |
-| pod-disk burn      | Burn files removed; I/O back to baseline; df back to baseline    | Pod Running, no new restart                      |
-| pod-disk fill      | Disk usage below original threshold (df -h on imagefs/rootfs)    | DiskPressure cleared alone                       |
-| pod-network drop   | Packets flowing; endpoints populated; connection succeeds        | Pod Running, no new restart                      |
-| pod-kill           | Pod Ready 1/1 AND restartCount stable since recovery action      | Pod still in CrashLoopBackOff                    |
-
-Set PrimaryEvidenceObserved: true ONLY if you directly observed at least one
-PRIMARY recovery indicator listed above for the current fault type.
-If only generic indicators (pod Running, no events) observed, set false.
-IMPORTANT: PrimaryEvidenceObserved MUST be consistent with Overall:
-- If PrimaryEvidenceObserved=false, Overall CANNOT be "recovered" — use "partial" at best.
+**Primary Evidence of Recovery**:
+Primary evidence = the SPECIFIC fault effect is now ABSENT (metric returned
+to baseline, artifacts removed, connections restored). NOT generic health
+(pod Running, no restarts). Set PrimaryEvidenceObserved: true ONLY when you
+directly observed the fault-specific effect being removed.
+If PrimaryEvidenceObserved=false, Overall CANNOT be "recovered" — use "partial".
 
 RECOVERY_VERIFICATION_CHECKLIST is mandatory — parsed programmatically."""
 
@@ -174,7 +153,7 @@ def get_recover_critical_rules_reminder_section() -> str:
     """
     return """## REMINDER — Critical Rules Recap
 
-Before outputting RECOVERY_VERIFICATION_RESULT, verify you followed ALL of these:
+Before calling submit_recover_verification, verify you followed ALL of these:
 1. You executed kubectl commands to observe CURRENT (post-recovery) state — NOT stale baseline/injection data
 2. PrimaryEvidenceObserved reflects DIRECT observation of fault effect being absent — NOT generic health
 3. Baseline comparison identifies the EXACT resource (partition/device/node), not just 'disk'"""

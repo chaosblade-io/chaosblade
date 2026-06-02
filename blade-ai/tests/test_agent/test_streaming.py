@@ -121,6 +121,39 @@ class TestParseStreamEvent:
         assert evt is not None
         assert evt.content == "only this"
 
+    def test_parse_save_memory_token_dropped(self):
+        """save_memory's postmortem LLM tokens must NOT stream to the TUI.
+
+        The postmortem content is attached to the result envelope and
+        rendered by PostmortemSection. Letting its tokens also flow as
+        type=token events double-renders the same markdown body once as
+        agent chat text and once as the card.
+        """
+        class FakeChunk:
+            content = "## Summary\n本次实验..."
+
+        raw = {
+            "event": "on_chat_model_stream",
+            "data": {"chunk": FakeChunk()},
+            "tags": ["langsmith:nodes:save_memory"],
+            "metadata": {},
+        }
+        assert parse_stream_event(raw) is None
+
+    def test_parse_save_memory_thinking_dropped(self):
+        """Reasoning chunks from save_memory's LLM are also filtered."""
+        class FakeChunk:
+            content = ""
+            additional_kwargs = {"reasoning_content": "deciding what to write..."}
+
+        raw = {
+            "event": "on_chat_model_stream",
+            "data": {"chunk": FakeChunk()},
+            "tags": ["langsmith:nodes:save_memory"],
+            "metadata": {},
+        }
+        assert parse_stream_event(raw) is None
+
     def test_parse_on_tool_start(self):
         """Parse a tool invocation start event."""
         raw = {

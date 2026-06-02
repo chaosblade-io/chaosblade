@@ -163,10 +163,13 @@ class TestCheckKubectl:
     def test_custom_kubectl_path(self, monkeypatch, tmp_path):
         from chaos_agent.config import settings as _settings_mod
 
-        custom_path = str(tmp_path / "my-kubectl")
-        monkeypatch.setattr(_settings_mod.settings, "kubectl_path", custom_path)
-        with patch("shutil.which", return_value=custom_path):
-            result = check_kubectl()
+        # A configured kubectl_path is a real file on disk. is_executable
+        # validates it via os.path.isfile (NOT shutil.which, which mishandles
+        # path-shaped cmds on Windows < 3.12), so the file must actually exist.
+        custom = tmp_path / "my-kubectl"
+        custom.write_text("#!/bin/sh\n")
+        monkeypatch.setattr(_settings_mod.settings, "kubectl_path", str(custom))
+        result = check_kubectl()
         assert result.passed is True
 
 
@@ -194,7 +197,11 @@ class TestCheckBlade:
             result = check_blade()
         assert result.passed is False
         assert result.severity == "warning"
-        assert "降级" in result.fix
+        # check_blade is now pure detection (no download). It communicates
+        # both the auto-download-on-first-inject path and the kubectl exec
+        # fallback via message; the fix line points at manual override.
+        assert "降级" in result.message
+        assert "blade_path" in result.fix
 
     def test_blade_is_warning_not_blocking(self, monkeypatch):
         """blade check is always severity=warning, never blocking."""

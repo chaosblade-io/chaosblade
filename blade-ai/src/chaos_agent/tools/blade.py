@@ -124,6 +124,19 @@ async def blade_create(
         the fault type (≥ 600s). You only need to set --timeout if you want a
         longer duration; you cannot make it shorter.
     """
+    # Universal first-use trigger: pip-install users get a pure-Python wheel
+    # with no blade binary. Ensure it exists before the first mutating
+    # injection — off the event loop, best-effort. If the download fails
+    # (offline), the host blade path below fails and callers (direct_execute)
+    # fall back to kubectl exec into a cluster tool pod. This is the ONE
+    # chokepoint every injection path funnels through (CLI direct, CLI NL,
+    # TUI, server API), so it's the single place that needs the trigger.
+    try:
+        from chaos_agent.chaosblade_installer import ensure_chaosblade_async
+        await ensure_chaosblade_async()
+    except Exception as e:
+        logger.warning("ChaosBlade ensure failed (continuing to kubectl-exec fallback): %s", e)
+
     # ChaosBlade K8s format: blade create k8s <scope>-<target> <action>
     cmd = [_get_blade_path(), "create", "k8s", f"{scope}-{target}", action]
 
@@ -184,6 +197,38 @@ async def blade_create(
         if result.stderr and result.stderr.strip():
             parts.append(result.stderr.strip())
         combined = "\n".join(parts) if parts else "(no output)"
+
+        # If a UID is present in the output, the CRD was created even though
+        # execution reported an error. The experiment may actually be in effect
+        # (e.g., ChaosBlade used a fallback mechanism like tc instead of iptables).
+        # Use raw JSON parsing here — NOT extract_blade_uid, which intentionally
+        # rejects 54000+success=false UIDs. We want the UID regardless of
+        # blade's self-reported success status, because the CRD exists in the
+        # cluster and may be causing real effects.
+        import re
+        uid_match = re.search(r'"uid"\s*:\s*"([a-f0-9]{16,})"', combined)
+        uid_in_error = uid_match.group(1) if uid_match else None
+        if uid_in_error:
+            return (
+                f"Warning: blade create returned error (exit {result.exit_code}) "
+                f"but experiment CRD was created (UID: {uid_in_error}). "
+                f"The experiment MAY be in effect despite the error "
+                f"(ChaosBlade operator may retry with fallback mechanisms). "
+                f"Do NOT conclude failure or attempt alternative injection methods. "
+                f"Instead, POLL the cluster state repeatedly to check if the "
+                f"fault takes effect (the operator needs time to retry):\n"
+                f"  1. Call time_wait(seconds=30) to give the operator time to retry\n"
+                f"  2. Check the target's actual status with kubectl get node/pod\n"
+                f"  3. If fault effect is visible, the injection SUCCEEDED "
+                f"— report success with UID {uid_in_error}\n"
+                f"  4. If not visible, call time_wait(seconds=30) once more "
+                f"and check again\n"
+                f"  5. Only after 2 waits + checks with NO fault effect, "
+                f"conclude failure\n"
+                f"  6. Do NOT try alternative injection methods before "
+                f"completing these checks\n"
+                f"Raw output: {combined}"
+            )
         return f"Error: blade create failed (exit {result.exit_code}): {combined}"
 
     return result.stdout
@@ -270,6 +315,47 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
         return f"Error: blade status failed: {e}"
 
     return result.stdout
+
+
+@tool
+async def blade_help(subcommand: str = "") -> str:
+    """Phase 1 / Phase 2 read-only. Query ChaosBlade CLI help for any subcommand.
+
+    Runs `blade [subcommand...] -h`. Read-only — only prints help text,
+    never creates or modifies experiments.
+
+    When to use:
+      - Phase 1 planning: verify correct flags before writing the plan.
+        Skill docs and knowledge resources may be outdated; this tool
+        gives the ground truth from the installed blade binary.
+      - Phase 2 execution: double-check flag syntax before blade_create.
+
+    Inputs:
+      - subcommand: space-separated subcommand path. Examples:
+          ""                            → `blade -h` (top-level help)
+          "create"                      → `blade create -h`
+          "create k8s"                  → `blade create k8s -h`
+          "create k8s pod-network"      → `blade create k8s pod-network -h`
+          "create k8s pod-network drop" → `blade create k8s pod-network drop -h`
+
+    Output: Help text from the blade CLI.
+
+    Side effects: None (read-only).
+    """
+    tokens = _split_args(subcommand)
+    tokens = [t for t in tokens
+              if t not in ("-h", "--help") and not t.startswith("--")]
+    cmd = [_get_blade_path()] + tokens + ["-h"]
+
+    try:
+        result = await run_command(cmd, timeout=10)
+    except Exception as e:
+        return f"Error: blade help failed: {e}"
+
+    output = result.stdout.strip()
+    if not output and result.stderr:
+        output = result.stderr.strip()
+    return output or "(no help output)"
 
 
 @tool

@@ -1,0 +1,29 @@
+
+  📋 Plan
+
+  ┌──────────────┬──────────────────────────────────────────┐                   
+  │ Scope:       │ pod                                      │                   
+  │ Namespace:   │ cms-demo                                 │                   
+  │ Names:       │ accounting-6fbdb464c7-qn2vr              │                   
+  │ Params:      │ mem-percent=98, timeout=600              │                   
+  │ Attempt:     │ #2 (re-attempt)                          │                   
+  └──────────────┴──────────────────────────────────────────┘                   
+
+  🛡 Safety: ⚠ WARNING — 1 active experiment on same target
+
+  ⚠ Target Health: WARN  pod.history.frequent_oom(warn); 
+pod.memory.headroom_low(warn)
+    ⚠ [pod.history.frequent_oom] Pod has been OOMKilled 7 times; last 14d ago  
+(14d)
+    ⚠ [pod.memory.headroom_low] Current 222Mi / Limit 240Mi (92.5%); only 13Mi 
+headroom for mem-percent=98.
+
+  Safety Score: 31/100  [low]
+    blast_radius=25  ·  frequency=40  ·  time=30  ·  topology=35
+
+  ⚠ Active experiments: 1  (UIDs: 8e223093ba130ee3)
+
+
+  ────────────────────────────────────────────────────
+  [Y] Approve    [N] Reject
+

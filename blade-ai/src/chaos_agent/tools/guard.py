@@ -67,6 +67,9 @@ class ToolGuard:
         "cordon",
         "uncordon",
         "taint",
+        "apply",
+        "create",
+        "rollout",
     }
 
     PARAM_BLACKLIST_PATTERNS = [

@@ -260,6 +260,7 @@ class SkillRegistry:
         "mem": ("内存", "OOM"),
         "disk": ("磁盘",),
         "network": ("网络", "network"),
+        "process": ("进程", "process"),
     }
 
     # Action keyword to catalogue file/directory name keyword mapping
@@ -272,15 +273,24 @@ class SkillRegistry:
         "burn": ("burn", "IO", "读写"),                    # 目录级：IO、读写 → 磁盘IO目录
         "load": ("load", "加载", "压力"),                  # 内存压力场景
         "drop": ("drop", "丢包", "丢弃"),
+        "loss": ("loss", "丢包", "丢失"),                   # 丢包 == packet loss → Pod_网络丢包
         "kill": ("kill", "杀死"),
         "dns": ("dns", "DNS", "域名"),
     }
 
-    def match_use_case(self, scope: str, target: str, action: str) -> Optional[str]:
-        """Find a catalogue use-case file matching the given fault parameters.
+    def match_use_cases(self, scope: str, target: str, action: str) -> list[str]:
+        """Find ALL catalogue use-case files matching the given fault parameters.
 
-        Scans the skill's ``references/catalogue/`` directory for a use-case
-        .md file that matches the fault scope and target.
+        Scans the skill's ``references/catalogue/`` directory for use-case
+        .md files that match the fault scope and target. Returns ALL matches
+        (not just the first) so callers can disambiguate — e.g. the LLM can
+        choose the most relevant one when multiple skill cases share the same
+        (scope, target, action) combination.
+
+        Additionally searches **related scopes**: when scope="pod" and
+        target="cpu", also checks the "workload" scope to find composite
+        scenarios (like HPA) that USE pod-cpu-fullload as their injection
+        mechanism but have a different verification methodology.
 
         Args:
             scope: Blade scope (node/pod/service/workload/container).
@@ -288,68 +298,130 @@ class SkillRegistry:
             action: Blade action (fullload/load/delay/loss/fill/kill/burn).
 
         Returns:
-            Relative resource path (e.g. ``references/catalogue/Node_CPU使用率过高/Node_CPU使用率过高_异常进程占用.md``)
-            or None if no match found.
+            List of relative resource paths. Empty list if no match found.
+            Ordered by relevance (primary scope first, then related scopes).
         """
-        # Find the skill that has a catalogue directory
-        for skill_name, skill_dir in self._skill_dirs.items():
-            catalogue_dir = skill_dir / "references" / "catalogue"
-            if not catalogue_dir.exists():
-                continue
+        results: list[str] = []
+        seen: set[str] = set()
 
-            # Step 1: Match scope to directory prefix
-            scope_prefixes = self._SCOPE_PREFIX_MAP.get(scope, (scope.capitalize() + "_",))
-            matching_dirs = []
-            for entry in sorted(catalogue_dir.iterdir()):
-                if not entry.is_dir():
-                    continue
-                if any(entry.name.startswith(p) for p in scope_prefixes):
-                    matching_dirs.append(entry)
+        # Search the primary scope first, then related scopes.
+        # Related scopes catch composite scenarios (e.g. HPA uses pod-cpu
+        # but lives under workload scope).
+        scopes_to_search = [scope]
+        # Related scopes catch cross-layer fault chains:
+        #   pod → workload: e.g. pod-cpu-fullload triggers HPA (workload scope)
+        #   pod → service: e.g. pod-process kill → Service Endpoints removal
+        #   node → workload: e.g. node-cordon affects DaemonSet scheduling
+        #   node → pod: e.g. node-process stop containerd → Pod ContainerCreating
+        _RELATED_SCOPES = {
+            "pod": ["workload", "service"],
+            "node": ["workload", "pod", "service"],
+        }
+        scopes_to_search.extend(_RELATED_SCOPES.get(scope, []))
 
-            if not matching_dirs:
-                continue
-
-            # Step 2: Narrow by target keywords
-            target_keywords = self._TARGET_KEYWORD_MAP.get(target, (target,))
-            if target_keywords:
-                narrowed = [
-                    d for d in matching_dirs
-                    if any(kw in d.name for kw in target_keywords)
-                ]
-                if narrowed:
-                    matching_dirs = narrowed
-                elif target in self._TARGET_KEYWORD_MAP:
-                    # Known target with zero directory matches → no case exists
+        for search_scope in scopes_to_search:
+            is_related = search_scope != scope
+            for skill_name, skill_dir in self._skill_dirs.items():
+                catalogue_dir = skill_dir / "references" / "catalogue"
+                if not catalogue_dir.exists():
                     continue
 
-            # Step 2.5: Further narrow by action keywords (directory-level)
-            # NOTE: Must be outside Step 2's if block so it executes even when
-            # Step 2 is skipped (e.g., only 1 directory after Step 1).
-            # When multiple directories match the target, action keywords
-            # distinguish different fault phenomena (e.g., disk fill vs disk IO burn).
-            action_keywords = self._ACTION_KEYWORD_MAP.get(action, ())
-            if action_keywords:
-                action_narrowed = [
-                    d for d in matching_dirs
-                    if any(kw in d.name for kw in action_keywords)
-                ]
-                if action_narrowed:  # only apply if it narrows (avoids zero-match)
-                    matching_dirs = action_narrowed
-
-            # Step 3: Pick the first matching directory and find .md files,
-            # sorted by action keyword relevance (best action match first).
-            # Files with no action match still appear at the end as fallbacks.
-            action_keywords = self._ACTION_KEYWORD_MAP.get(action, (action,))
-            for match_dir in matching_dirs:
-                md_files = sorted(
-                    (f for f in match_dir.iterdir() if f.suffix == ".md"),
-                    key=lambda f: -sum(1 for kw in action_keywords if kw.lower() in f.name.lower()),
+                # Step 1: Match scope to directory prefix
+                scope_prefixes = self._SCOPE_PREFIX_MAP.get(
+                    search_scope, (search_scope.capitalize() + "_",)
                 )
-                if md_files:
-                    # Return relative path from skill_dir
-                    return str(md_files[0].relative_to(skill_dir))
+                matching_dirs = []
+                for entry in sorted(catalogue_dir.iterdir()):
+                    if not entry.is_dir():
+                        continue
+                    if any(entry.name.startswith(p) for p in scope_prefixes):
+                        matching_dirs.append(entry)
 
-        return None
+                if not matching_dirs:
+                    continue
+
+                # Step 2: Narrow by target keywords.
+                # For related scopes, filter at FILE level (not directory):
+                # only individual .md files whose content mentions BOTH the
+                # target AND action keywords are kept. Requiring both avoids
+                # generic words (e.g. "process") causing false positives.
+                if is_related:
+                    target_keywords = self._TARGET_KEYWORD_MAP.get(target, (target,))
+                    action_keywords = self._ACTION_KEYWORD_MAP.get(action, (action,))
+                    if target_keywords:
+                        _related_file_matches: list[Path] = []
+                        for d in matching_dirs:
+                            for f in sorted(d.iterdir()):
+                                if f.suffix != ".md":
+                                    continue
+                                try:
+                                    text = f.read_text(encoding="utf-8")[:2000]
+                                    text_lower = text.lower()
+                                    has_target = any(kw.lower() in text_lower for kw in target_keywords)
+                                    has_action = any(kw.lower() in text_lower for kw in action_keywords)
+                                    if has_target and has_action:
+                                        _related_file_matches.append(f)
+                                except Exception:
+                                    pass
+                        # Inject matched files directly into results,
+                        # bypassing Step 2.5 and Step 3 (which are
+                        # directory-level and would re-expand).
+                        for mf in _related_file_matches:
+                            rel = str(mf.relative_to(skill_dir))
+                            if rel not in seen:
+                                seen.add(rel)
+                                results.append(rel)
+                        continue  # skip Step 2.5 + Step 3 for this scope
+                else:
+                    target_keywords = self._TARGET_KEYWORD_MAP.get(target, (target,))
+                    if target_keywords:
+                        narrowed = [
+                            d for d in matching_dirs
+                            if any(kw in d.name for kw in target_keywords)
+                        ]
+                        if narrowed:
+                            matching_dirs = narrowed
+                        elif target in self._TARGET_KEYWORD_MAP:
+                            continue
+
+                # Step 2.5: Further narrow by action keywords (directory-level)
+                # Also skip for related scopes (same rationale).
+                if not is_related:
+                    action_keywords = self._ACTION_KEYWORD_MAP.get(action, ())
+                    if action_keywords:
+                        action_narrowed = [
+                            d for d in matching_dirs
+                            if any(kw in d.name for kw in action_keywords)
+                        ]
+                        if action_narrowed:
+                            matching_dirs = action_narrowed
+
+                # Step 3: Collect ALL matching .md files (not just the first)
+                action_keywords = self._ACTION_KEYWORD_MAP.get(action, (action,))
+                for match_dir in matching_dirs:
+                    md_files = sorted(
+                        (f for f in match_dir.iterdir() if f.suffix == ".md"),
+                        key=lambda f: -sum(
+                            1 for kw in action_keywords if kw.lower() in f.name.lower()
+                        ),
+                    )
+                    for md_file in md_files:
+                        rel = str(md_file.relative_to(skill_dir))
+                        if rel not in seen:
+                            seen.add(rel)
+                            results.append(rel)
+
+        return results
+
+    def match_use_case(self, scope: str, target: str, action: str) -> Optional[str]:
+        """Find a catalogue use-case file matching the given fault parameters.
+
+        Convenience wrapper around ``match_use_cases`` that returns only the
+        first (most relevant) match. Backward compatible with all existing
+        callers.
+        """
+        matches = self.match_use_cases(scope, target, action)
+        return matches[0] if matches else None
 
     def __len__(self) -> int:
         return len(self._metadata)

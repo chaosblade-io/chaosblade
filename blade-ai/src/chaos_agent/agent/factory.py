@@ -7,6 +7,7 @@ from chaos_agent.config.settings import settings
 from chaos_agent.skills.registry import SkillRegistry
 from chaos_agent.tools import (
     blade_create,
+    blade_help,
     blade_status,
     blade_query_k8s,
     kubectl,
@@ -82,8 +83,10 @@ def make_llm(
     *,
     temperature: float | None = None,
     max_retries: int | None = None,
-    timeout: int | None = None,
+    connect_timeout: float | None = None,
+    read_timeout: float | None = None,
     callbacks: list | None = None,
+    enable_thinking: bool | None = None,
 ):
     """Create a ChatOpenAI instance with project-standard configuration.
 
@@ -101,12 +104,23 @@ def make_llm(
         LLM sampling temperature.  Defaults to ``settings.llm_temperature``.
     max_retries : int | None
         Maximum retry count for API calls.  Defaults to ``settings.llm_max_retries``.
-    timeout : int | None
-        Request timeout in seconds.  Defaults to ``settings.timeout_llm``.
+    connect_timeout : float | None
+        TCP/TLS connection-establishment timeout (s). Defaults to
+        ``settings.llm_connect_timeout``. Keep short so connectivity
+        failures surface fast.
+    read_timeout : float | None
+        Response read timeout (s) — time-to-first-token + between-chunk
+        gaps when streaming, or whole-body wait when non-streaming.
+        Defaults to ``settings.llm_read_timeout``. Keep generous so
+        slow thinking models aren't cut off mid-inference.
     callbacks : list | None
         LangChain callbacks list (e.g. tracing).  Defaults to ``None``.
     """
+    import httpx
     from langchain_openai import ChatOpenAI
+
+    _connect = connect_timeout if connect_timeout is not None else settings.llm_connect_timeout
+    _read = read_timeout if read_timeout is not None else settings.llm_read_timeout
 
     llm_kwargs = dict(
         model=settings.model_name,
@@ -114,7 +128,10 @@ def make_llm(
         base_url=settings.api_base_url,
         temperature=temperature if temperature is not None else settings.llm_temperature,
         max_retries=max_retries if max_retries is not None else settings.llm_max_retries,
-        timeout=timeout if timeout is not None else settings.timeout_llm,
+        # Split connect vs read: connection failures fail fast (_connect),
+        # slow inference gets a generous response budget (_read). A scalar
+        # timeout would apply one value to both, forcing a bad tradeoff.
+        timeout=httpx.Timeout(timeout=float(_read), connect=float(_connect)),
         # Forward ``stream_options.include_usage=true`` to the OpenAI-
         # compatible API so the final stream chunk carries token usage.
         # Without this, LangChain assembles the streamed AIMessage with
@@ -129,7 +146,8 @@ def make_llm(
     )
     if callbacks:
         llm_kwargs["callbacks"] = callbacks
-    if settings.llm_enable_thinking:
+    _thinking = enable_thinking if enable_thinking is not None else settings.llm_enable_thinking
+    if _thinking:
         llm_kwargs["extra_body"] = {"enable_thinking": True}
     return ChatOpenAI(**llm_kwargs)
 
@@ -300,7 +318,7 @@ def _build_skill_tools(registry: SkillRegistry):
             return f"Error writing file '{file_path}': {e}"
 
     @lc_tool
-    def save_fault_plan(plan_content: str, task_id: str) -> str:
+    def save_fault_plan(plan_content: str, task_id: str, skill_case_resource: str = "") -> str:
         """Phase 1 ONLY. Save a fault injection plan as `<task_id>.md` in the plan directory.
 
         Writes to the local plan dir (does NOT touch the cluster). After
@@ -317,6 +335,9 @@ def _build_skill_tools(registry: SkillRegistry):
           - plan_content: full plan in Markdown (target / parameters /
             verification methods / recovery / blast radius).
           - task_id: task identifier used as the filename.
+          - skill_case_resource: The resource_path of the chosen skill case file
+            (e.g. "references/catalogue/Pod_镜像拉取失败/Pod_镜像拉取失败_镜像不存在或标签错误.md").
+            Required when multiple skill cases were read during planning.
 
         Output: confirmation including the saved path, or "Error:" prefix.
 
@@ -333,7 +354,14 @@ def _build_skill_tools(registry: SkillRegistry):
             return f"Error saving plan: {e}"
 
     @lc_tool
-    def finish_planning(summary: str, rejected: bool = False, rejection_reason: str = "") -> str:
+    def finish_planning(
+        summary: str,
+        rejected: bool = False,
+        rejection_reason: str = "",
+        blast_radius_scope: str = "",
+        blast_radius_detail: str = "",
+        skill_case_resource: str = "",
+    ) -> str:
         """Signal that Phase 1 is complete — either proceed to execution or reject the request.
 
         This is the REQUIRED way to end Phase 1. Two modes:
@@ -345,6 +373,20 @@ def _build_skill_tools(registry: SkillRegistry):
           - summary: Brief summary of the plan (normal) or the rejection decision.
           - rejected: Set to True to reject the request. Default False.
           - rejection_reason: Why the request is rejected (only when rejected=True).
+          - blast_radius_scope: Scope of the execution's actual impact on the cluster.
+            Must be one of: "target-only" (only the target resource is mutated),
+            "namespace-wide" (mutations affect other resources in the target namespace),
+            "cluster-wide" (mutations affect resources outside the target namespace,
+            e.g. tainting all nodes, modifying cluster-level resources).
+            The system uses this to assess safety — cluster-wide scope triggers
+            elevated safety review.
+          - blast_radius_detail: One-line description of what cluster resources
+            the execution will mutate beyond the target (e.g. "Will taint 30 nodes
+            cluster-wide to block scheduling").
+          - skill_case_resource: The resource_path of the chosen skill case file
+            (e.g. "references/catalogue/Pod_镜像拉取失败/Pod_镜像拉取失败_镜像不存在或标签错误.md").
+            Required when multiple skill cases were read during planning —
+            tells the system which one to use for verification.
 
         Output: Confirmation message.
 
@@ -353,6 +395,31 @@ def _build_skill_tools(registry: SkillRegistry):
         if rejected:
             return f"Planning rejected. Reason: {rejection_reason or summary}"
         return f"Planning finalized. Summary: {summary}"
+
+    @lc_tool
+    def propose_plan_change(reason: str, scope: str, target: str, action: str) -> str:
+        """Replan ONLY. Propose changing the fault type when the current approach failed.
+
+        When to use:
+          - During replan (after Phase 2 failure), when you have determined the
+            original fault type cannot be injected but an alternative exists.
+          - Do NOT use during initial planning — complete your plan with
+            finish_planning instead.
+
+        Inputs:
+          - reason: why the original fault type failed and why the alternative
+            should work (1-2 sentences).
+          - scope: proposed ChaosBlade scope (pod/node/container).
+          - target: proposed ChaosBlade target (cpu/mem/network/disk/...).
+          - action: proposed ChaosBlade action (fullload/burn/drop/delay/...).
+
+        Output: confirmation of proposal submission. The user will be asked
+                to approve or reject the change.
+        """
+        return (
+            f"Plan change proposed: {scope}-{target}-{action}. "
+            f"Reason: {reason}"
+        )
 
     # Build dynamic script catalog for tool description
     _scripts_catalog_parts = []
@@ -468,7 +535,7 @@ def _build_skill_tools(registry: SkillRegistry):
         "{_scripts_catalog}", _scripts_catalog
     )
 
-    return [activate_skill, read_skill_resource, read_file, write_file, save_fault_plan, finish_planning, execute_skill_script]
+    return [activate_skill, read_skill_resource, read_file, write_file, save_fault_plan, finish_planning, propose_plan_change, execute_skill_script]
 
 
 async def create_agent(
@@ -501,6 +568,7 @@ async def create_agent(
     _read_file = _skill_tools_by_name["read_file"]
     _save_fault_plan = _skill_tools_by_name["save_fault_plan"]
     _finish_planning = _skill_tools_by_name["finish_planning"]
+    _propose_plan_change = _skill_tools_by_name["propose_plan_change"]
     _execute_skill_script = _skill_tools_by_name["execute_skill_script"]
 
     # Clarification tools: only available in intent_clarification node (TUI mode).
@@ -575,6 +643,8 @@ async def create_agent(
         _read_file,
         _save_fault_plan,
         _finish_planning,
+        _propose_plan_change,
+        blade_help,
         blade_status,
         # blade_destroy intentionally absent — see comment above
         kubectl_ro,                # ← was: kubectl (full surface)
@@ -589,31 +659,42 @@ async def create_agent(
     #     or replan), the executor must not abort experiments mid-run.
     #   - read_skill_resource: skill content was loaded in Phase 1 and is
     #     already embedded in the execution prompt; re-reading wastes tokens.
+    from chaos_agent.tools.wait import time_wait
     phase2_tools = [
         blade_create,
+        blade_help,
         blade_status,
         blade_query_k8s,
         kubectl,
         _execute_skill_script,
         read_knowledge_resource,
+        time_wait,
     ]
     if mcp_manager is not None:
         phase2_tools = phase2_tools + mcp_manager.tools_for_phase("phase2")
 
+    # submit_verification (Scheme B): control-signal tool the verifier LLM
+    # calls to submit a structured verdict and end verification.
+    # route_after_verifier_tools routes its execution to finalize_verification.
+    from chaos_agent.agent.nodes._verifier_submit import submit_verification
+    from chaos_agent.tools.kubectl import kubectl_verify
     verifier_tools = [
-        kubectl,
+        kubectl_verify,
         _read_skill_resource,
         _execute_skill_script,
         read_knowledge_resource,
+        submit_verification,
     ]
     if mcp_manager is not None:
         verifier_tools = verifier_tools + mcp_manager.tools_for_phase("verifier")
 
+    from chaos_agent.agent.nodes._verifier_submit import submit_recover_verification
     recover_verifier_tools = [
-        kubectl,
+        kubectl_verify,
         _read_skill_resource,
         _execute_skill_script,
         read_knowledge_resource,
+        submit_recover_verification,
     ]
     if mcp_manager is not None:
         # Recover verifier shares the same MCP attach_to as the inject
@@ -635,8 +716,15 @@ async def create_agent(
             # that closes the connection on __aexit__, making it unsuitable for
             # long-lived checkpointer instances. Direct aiosqlite connection stays
             # open as long as we hold the reference.
+            from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+            serde = JsonPlusSerializer(
+                allowed_msgpack_modules=[
+                    ("chaos_agent.agent.verdict", "Layer1Status"),
+                    ("chaos_agent.agent.verdict", "FailureCategory"),
+                ],
+            )
             conn = await aiosqlite.connect(str(checkpoint_path))
-            checkpointer = AsyncSqliteSaver(conn=conn)
+            checkpointer = AsyncSqliteSaver(conn=conn, serde=serde)
             await checkpointer.setup()
             logger.info(f"Checkpointer initialized at {checkpoint_path}")
         except ImportError:
