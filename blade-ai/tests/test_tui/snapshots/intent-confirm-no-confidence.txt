@@ -1,0 +1,15 @@
+
+  The following fault injection intent has been identified:
+
+  ┌──────────────┬────────────────────────────────────────┐                     
+  │ Fault Type:  │ cpu-fullload                           │                     
+  │ Scope:       │ pod                                    │                     
+  │ Target:      │ cpu                                    │                     
+  │ Action:      │ fullload                               │                     
+  │ Namespace:   │ cms-demo                               │                     
+  └──────────────┴────────────────────────────────────────┘                     
+
+
+  ────────────────────────────────────────────────────
+  [Y] Confirm & Execute    [N] Continue Conversation
+

@@ -1,0 +1,514 @@
+"""Tests for token-aware context manager.
+
+Note (E1): Token-counting was extracted to
+``chaos_agent.memory.tokens`` with a 4-layer model-aware fallback.
+The exhaustive CJK / mixed / multi-modal coverage lives in
+``tests/test_memory/test_tokens.py``. The two test classes that used
+to exercise the legacy ``estimate_tokens`` / ``count_tokens_approx``
+symbols were removed because their semantics are now Layer 4 of the
+new module, fully covered by ``TestLayer4HeuristicFallback`` and
+``TestMessageAggregation`` over there.
+"""
+
+from unittest.mock import MagicMock
+
+from chaos_agent.memory.context_manager import (
+    CompactLevel,
+    CompactTrackingState,
+    ContextManager,
+    MAX_CONSECUTIVE_COMPACT_FAILURES,
+    STRIP_MARKER,
+    TokenWarningState,
+    calculate_token_warning_state,
+    ensure_pair_integrity,
+    group_messages_by_round,
+    post_compact_cleanup,
+    strip_large_outputs,
+)
+
+
+class TestEnsurePairIntegrity:
+    """Test tool_call/tool_result pair integrity."""
+
+    def test_empty_to_compact(self):
+        to_compact, to_keep = ensure_pair_integrity([], [MagicMock()])
+        assert to_compact == []
+        assert len(to_keep) == 1
+
+    def test_last_message_has_tool_calls(self):
+        """If last in to_compact has tool_calls, move it to to_keep."""
+        msg_with_calls = MagicMock()
+        msg_with_calls.tool_calls = [{"name": "test"}]
+
+        to_keep = [MagicMock()]
+        to_compact = [MagicMock(), msg_with_calls]
+
+        result_compact, result_keep = ensure_pair_integrity(to_compact, to_keep)
+        # The message with tool_calls should be moved to to_keep
+        assert msg_with_calls not in result_compact
+
+    def test_no_tool_calls_unchanged(self):
+        msg = MagicMock()
+        msg.tool_calls = []
+        to_compact = [msg]
+        to_keep = [MagicMock()]
+
+        result_compact, result_keep = ensure_pair_integrity(to_compact, to_keep)
+        assert len(result_compact) == 1
+
+
+class TestContextManager:
+    """Test ContextManager.check_context()."""
+
+    def test_below_threshold_no_compaction(self):
+        cm = ContextManager(max_tokens=50000)
+        msgs = [MagicMock(content="short message")]
+        to_compact, to_keep, valid = cm.check_context(msgs)
+        assert to_compact == []
+        assert to_keep == msgs
+
+    def test_above_threshold_triggers_compaction(self):
+        cm = ContextManager(max_tokens=100)
+        # Override reserve_tokens to be small so compaction actually happens
+        cm.reserve_tokens = 10
+        msgs = [MagicMock(content="a" * 400) for _ in range(10)]  # Large messages
+        to_compact, to_keep, valid = cm.check_context(msgs)
+        assert len(to_compact) > 0
+
+    def test_reserves_recent_messages(self):
+        cm = ContextManager(max_tokens=100)
+        recent_msg = MagicMock(content="recent")
+        msgs = [MagicMock(content="a" * 400) for _ in range(10)] + [recent_msg]
+        to_compact, to_keep, valid = cm.check_context(msgs)
+        # The recent message should be in to_keep
+        assert recent_msg in to_keep
+
+    def test_compact_threshold_calculation(self):
+        cm = ContextManager(max_tokens=1000, compact_ratio=0.7)
+        expected = int(1000 * 0.7)
+        assert cm.compact_threshold == expected
+
+    def test_compact_ratio_stored_on_instance(self):
+        # Bug 4 setup: the manager must KEEP the raw ratio so
+        # check_context can thread it into
+        # calculate_token_warning_state. Without this attribute the
+        # warning state always falls back to the function's default
+        # (0.85), making the operator's BLADE_AI_CONTEXT_COMPACT_RATIO
+        # setting cosmetic only.
+        cm = ContextManager(max_tokens=128_000, compact_ratio=0.6)
+        assert cm.compact_ratio == 0.6
+
+    def test_check_context_threads_compact_ratio_through(self):
+        # Bug 4 end-to-end: a ContextManager built with a lower
+        # compact_ratio MUST trigger compaction at a lower token count
+        # than one built with the default. Pre-fix, both managers
+        # behaved identically because check_context didn't pass the
+        # ratio through.
+        #
+        # Use real HumanMessages with VARIED content. The original
+        # test used "x" * 35_000 which the legacy chars/4 heuristic
+        # estimated at ~8750 tokens but tiktoken-based counters (E1)
+        # correctly compress to ~10 tokens (BPE handles repeated
+        # chars efficiently). Realistic varied prose produces
+        # predictable token counts under any tokenizer.
+        from langchain_core.messages import HumanMessage
+        # Build ~5000-token messages × 16 → ~80k tokens total, well
+        # above the aggressive 64k threshold but below the default
+        # 108.8k threshold (compact_ratio=0.85 of 128k).
+        sentence = (
+            "The chaos engineering agent must safely plan, execute, "
+            "verify, and recover ChaosBlade experiments on Kubernetes "
+            "clusters with measurable steady-state hypotheses. "
+            "故障注入演练 必须 在可控范围内 进行，每次注入前 都需要 "
+            "明确的回滚方案 和 监控指标。"
+        )
+        # ~1 token per ASCII word + ~1 token per CJK char ≈ ~60 tokens
+        # per sentence × 80 repeats = ~4800 tokens per message
+        long_content = (sentence + "\n") * 80
+        msgs = [HumanMessage(content=long_content) for _ in range(16)]
+        cm_default = ContextManager(max_tokens=128_000, compact_ratio=0.85)
+        cm_aggressive = ContextManager(max_tokens=128_000, compact_ratio=0.5)
+        cm_default.reserve_tokens = 1
+        cm_aggressive.reserve_tokens = 1
+        d_compact, _, _ = cm_default.check_context(msgs)
+        a_compact, _, _ = cm_aggressive.check_context(msgs)
+        # Default (threshold ≈ 108.8K): ~80K is BELOW, no compaction.
+        # Aggressive (threshold = 64K): ~80K is ABOVE, compaction.
+        assert d_compact == []
+        assert len(a_compact) > 0
+
+
+# ---------------------------------------------------------------------------
+# New tests: Multi-level warning + circuit breaker (Migration Point 10)
+# ---------------------------------------------------------------------------
+
+
+class TestCompactLevel:
+    """Test CompactLevel enum."""
+
+    def test_levels_exist(self):
+        assert CompactLevel.NORMAL.value == "normal"
+        assert CompactLevel.WARNING.value == "warning"
+        assert CompactLevel.ERROR.value == "error"
+        assert CompactLevel.AUTO_COMPACT.value == "auto_compact"
+        assert CompactLevel.BLOCKING.value == "blocking"
+
+
+class TestTokenWarningState:
+    """Test TokenWarningState dataclass."""
+
+    def test_fields(self):
+        state = TokenWarningState(
+            percent_left=50,
+            level=CompactLevel.WARNING,
+            is_above_warning=True,
+            is_above_error=False,
+            is_above_auto_compact=False,
+            is_at_blocking=False,
+        )
+        assert state.percent_left == 50
+        assert state.level == CompactLevel.WARNING
+
+
+class TestCalculateTokenWarningState:
+    """Test calculate_token_warning_state multi-level decision."""
+
+    def test_normal_level_low_usage(self):
+        ws = calculate_token_warning_state(1000, 50000)
+        assert ws.level == CompactLevel.NORMAL
+        assert not ws.is_above_warning
+        assert not ws.is_above_auto_compact
+        assert not ws.is_at_blocking
+
+    def test_warning_level_approaching_threshold(self):
+        # With max=50000, auto_compact_threshold = max(37000, 36000) = 37000
+        # warning_threshold = max(37000 - 20000, 0) = 17000
+        ws = calculate_token_warning_state(21000, 50000)
+        assert ws.is_above_warning
+        assert ws.level in (CompactLevel.WARNING, CompactLevel.ERROR, CompactLevel.AUTO_COMPACT)
+
+    def test_auto_compact_level_above_threshold(self):
+        # auto_compact_threshold = max(50000 - 13000, 50000 * 0.72) = max(37000, 36000) = 37000
+        ws = calculate_token_warning_state(41000, 50000)
+        assert ws.is_above_auto_compact
+        assert ws.level in (CompactLevel.AUTO_COMPACT, CompactLevel.BLOCKING)
+
+    def test_blocking_level_at_limit(self):
+        # blocking_limit = 50000 - 3000 = 47000
+        ws = calculate_token_warning_state(48000, 50000)
+        assert ws.is_at_blocking
+        assert ws.level == CompactLevel.BLOCKING
+
+    def test_auto_compact_disabled(self):
+        ws = calculate_token_warning_state(38000, 50000, auto_compact_enabled=False)
+        assert not ws.is_above_auto_compact
+        # Should not reach AUTO_COMPACT level, might be ERROR or WARNING
+        assert ws.level != CompactLevel.AUTO_COMPACT or ws.level == CompactLevel.BLOCKING
+
+    def test_percent_left_decreases(self):
+        ws_low = calculate_token_warning_state(1000, 50000)
+        ws_high = calculate_token_warning_state(30000, 50000)
+        assert ws_low.percent_left > ws_high.percent_left
+
+    def test_percent_left_non_negative(self):
+        ws = calculate_token_warning_state(60000, 50000)
+        assert ws.percent_left >= 0
+
+    def test_compact_ratio_lowers_trigger_threshold(self):
+        # Bug 4 regression guard: the operator-tunable ``compact_ratio``
+        # was dead code under the old ``max(buffer, ratio)`` formula —
+        # the buffer almost always won. The new ``min(...)`` formula
+        # MUST let a lower ratio pull the trigger earlier.
+        #
+        # Setup: 128K window. Default 0.85 ratio → threshold ≈ 108.8K
+        # (buffer floor 115K loses to ratio). With ratio 0.5 → 64K.
+        # A usage of 70K must therefore:
+        #   - sit BELOW the 0.85 trigger (108.8K), and
+        #   - sit ABOVE the 0.5 trigger (64K).
+        # If either assert flips, the regression is back.
+        below_default = calculate_token_warning_state(
+            70_000, 128_000, compact_ratio=0.85,
+        )
+        above_aggressive = calculate_token_warning_state(
+            70_000, 128_000, compact_ratio=0.5,
+        )
+        assert not below_default.is_above_auto_compact
+        assert above_aggressive.is_above_auto_compact
+
+    def test_compact_ratio_capped_by_buffer_ceiling(self):
+        # The buffer floor (max_tokens - AUTOCOMPACT_BUFFER_TOKENS) is a
+        # SAFETY ceiling on the trigger — a too-large ratio (e.g. 0.99)
+        # must NOT push compaction past it, otherwise we risk overrunning
+        # the provider's hard window before compaction has room to run.
+        ws = calculate_token_warning_state(
+            117_000, 128_000, compact_ratio=0.99,
+        )
+        # buffer ceiling = 128000 - 13000 = 115000. 0.99 * 128000 = 126720.
+        # min(115000, 126720) = 115000. 117000 > 115000 → triggers.
+        assert ws.is_above_auto_compact
+
+    def test_compact_ratio_floor_at_50_percent(self):
+        # Defensive floor: an operator typo (compact_ratio=0.05) must
+        # not let the threshold collapse to almost-zero, otherwise the
+        # system would try to compact on every single message and
+        # never make progress. The clamp keeps the trigger at ≥ 50%.
+        ws_low = calculate_token_warning_state(
+            60_000, 128_000, compact_ratio=0.05,
+        )
+        ws_normal = calculate_token_warning_state(
+            60_000, 128_000, compact_ratio=0.5,
+        )
+        # 0.05 ratio is clamped to 0.5 internally, so 60K (< 64K floor)
+        # must NOT trigger — same as the 0.5 case.
+        assert not ws_low.is_above_auto_compact
+        assert not ws_normal.is_above_auto_compact
+
+
+class TestCompactTrackingState:
+    """Test circuit breaker tracking state."""
+
+    def test_default_values(self):
+        ts = CompactTrackingState()
+        assert ts.compacted is False
+        assert ts.turn_count == 0
+        assert ts.consecutive_failures == 0
+
+    def test_custom_values(self):
+        ts = CompactTrackingState(compacted=True, turn_count=5, consecutive_failures=2)
+        assert ts.compacted is True
+        assert ts.turn_count == 5
+        assert ts.consecutive_failures == 2
+
+
+class TestContextManagerWithTracking:
+    """Test ContextManager.check_context() with circuit breaker."""
+
+    def test_circuit_breaker_trips(self):
+        """When consecutive failures exceed limit, no compaction attempted."""
+        cm = ContextManager(max_tokens=100)
+        cm.reserve_tokens = 10
+        tracking = CompactTrackingState(
+            consecutive_failures=MAX_CONSECUTIVE_COMPACT_FAILURES
+        )
+        msgs = [MagicMock(content="a" * 400) for _ in range(10)]
+        to_compact, to_keep, valid = cm.check_context(msgs, tracking=tracking)
+        assert to_compact == []
+        assert valid is False  # Blocked by circuit breaker
+
+    def test_circuit_breaker_not_tripped_under_limit(self):
+        """When failures are under limit, compaction proceeds normally."""
+        cm = ContextManager(max_tokens=100)
+        cm.reserve_tokens = 10
+        tracking = CompactTrackingState(consecutive_failures=1)
+        msgs = [MagicMock(content="a" * 400) for _ in range(10)]
+        to_compact, to_keep, valid = cm.check_context(msgs, tracking=tracking)
+        assert len(to_compact) > 0
+
+    def test_no_tracking_compacts_normally(self):
+        """Without tracking state, compaction works as before."""
+        cm = ContextManager(max_tokens=100)
+        cm.reserve_tokens = 10
+        msgs = [MagicMock(content="a" * 400) for _ in range(10)]
+        to_compact, to_keep, valid = cm.check_context(msgs, tracking=None)
+        assert len(to_compact) > 0
+
+    def test_blocking_level_returns_invalid(self):
+        """At blocking level, is_valid is False even without tracking."""
+        cm = ContextManager(max_tokens=100)
+        cm.reserve_tokens = 10
+        # Create very large messages to exceed blocking limit
+        msgs = [MagicMock(content="z" * 2000) for _ in range(10)]
+        to_compact, to_keep, valid = cm.check_context(msgs)
+        # At blocking level, valid should be False
+        assert valid is False
+
+
+# ---------------------------------------------------------------------------
+# New tests: group_messages_by_round (Migration Point 8)
+# ---------------------------------------------------------------------------
+
+
+class TestGroupMessagesByRound:
+    """Test group_messages_by_round() robust API round grouping."""
+
+    def _make_msg(self, content: str, msg_type: str = "human", has_tool_calls: bool = False) -> MagicMock:
+        msg = MagicMock()
+        msg.type = msg_type
+        msg.content = content
+        if has_tool_calls:
+            msg.tool_calls = [{"name": "test", "args": {}}]
+        else:
+            msg.tool_calls = []
+        return msg
+
+    def test_empty_messages(self):
+        assert group_messages_by_round([]) == []
+
+    def test_single_human_message(self):
+        msgs = [self._make_msg("hello")]
+        groups = group_messages_by_round(msgs)
+        assert len(groups) == 1
+        assert len(groups[0]) == 1
+
+    def test_ai_with_tool_calls_starts_new_group(self):
+        """AI message with tool_calls starts a new round."""
+        msgs = [
+            self._make_msg("user question"),
+            self._make_msg("thinking", msg_type="ai", has_tool_calls=True),
+            self._make_msg("tool result", msg_type="tool"),
+        ]
+        groups = group_messages_by_round(msgs)
+        # First group: user question
+        # Second group: AI + tool result
+        assert len(groups) == 2
+        assert groups[1][0].content == "thinking"
+        assert groups[1][1].content == "tool result"
+
+    def test_consecutive_ai_messages_form_separate_groups(self):
+        """Each AI message starts its own group."""
+        msgs = [
+            self._make_msg("user1"),
+            self._make_msg("response1", msg_type="ai"),
+            self._make_msg("user2"),
+            self._make_msg("response2", msg_type="ai"),
+        ]
+        groups = group_messages_by_round(msgs)
+        assert len(groups) >= 2
+
+    def test_tool_result_not_split_from_ai(self):
+        """Tool results must stay with their AI caller."""
+        msgs = [
+            self._make_msg("user"),
+            self._make_msg("calling tool", msg_type="ai", has_tool_calls=True),
+            self._make_msg("result 1", msg_type="tool"),
+            self._make_msg("result 2", msg_type="tool"),
+        ]
+        groups = group_messages_by_round(msgs)
+        # Find the group with the AI message
+        ai_group = None
+        for g in groups:
+            if any(getattr(m, "type", "") == "ai" for m in g):
+                ai_group = g
+                break
+        assert ai_group is not None
+        # Both tool results should be in the same group as the AI message
+        tool_count = sum(1 for m in ai_group if getattr(m, "type", "") == "tool")
+        assert tool_count == 2
+
+    def test_all_messages_preserved(self):
+        """No messages should be lost during grouping."""
+        msgs = [
+            self._make_msg("user"),
+            self._make_msg("ai", msg_type="ai", has_tool_calls=True),
+            self._make_msg("result", msg_type="tool"),
+            self._make_msg("user2"),
+        ]
+        groups = group_messages_by_round(msgs)
+        total_msgs = sum(len(g) for g in groups)
+        assert total_msgs == len(msgs)
+
+
+# ---------------------------------------------------------------------------
+# New tests: strip_large_outputs (Migration Point 8)
+# ---------------------------------------------------------------------------
+
+
+class TestStripLargeOutputs:
+    """Test strip_large_outputs() progressive compression."""
+
+    def _make_tool_msg(self, content: str) -> MagicMock:
+        msg = MagicMock()
+        msg.type = "tool"
+        msg.content = content
+        return msg
+
+    def _make_human_msg(self, content: str) -> MagicMock:
+        msg = MagicMock()
+        msg.type = "human"
+        msg.content = content
+        return msg
+
+    def test_short_tool_output_unchanged(self):
+        content = "short output"
+        msgs = [self._make_tool_msg(content)]
+        result = strip_large_outputs(msgs)
+        assert result[0].content == content
+
+    def test_large_tool_output_truncated(self):
+        # Content above threshold
+        long_content = "x" * 3000
+        msgs = [self._make_tool_msg(long_content)]
+        result = strip_large_outputs(msgs)
+        assert STRIP_MARKER in result[0].content
+        assert len(result[0].content) < len(long_content)
+
+    def test_head_and_tail_preserved(self):
+        long_content = "A" * 600 + "MIDDLE" + "Z" * 600
+        msgs = [self._make_tool_msg(long_content)]
+        result = strip_large_outputs(msgs)
+        assert result[0].content.startswith("AAA")
+        assert result[0].content.endswith("ZZZ")
+
+    def test_human_messages_not_stripped(self):
+        long_content = "x" * 5000
+        msgs = [self._make_human_msg(long_content)]
+        result = strip_large_outputs(msgs)
+        assert result[0].content == long_content
+
+    def test_custom_threshold(self):
+        content = "x" * 500
+        msgs = [self._make_tool_msg(content)]
+        # Default threshold (2000) — should not strip
+        result_default = strip_large_outputs(msgs)
+        assert result_default[0].content == content
+        # Custom threshold (100) — should strip
+        result_custom = strip_large_outputs(msgs, threshold=100)
+        assert STRIP_MARKER in result_custom[0].content
+
+    def test_empty_messages(self):
+        result = strip_large_outputs([])
+        assert result == []
+
+
+# ---------------------------------------------------------------------------
+# New tests: post_compact_cleanup (Migration Point 8)
+# ---------------------------------------------------------------------------
+
+
+class TestPostCompactCleanup:
+    """Test post_compact_cleanup() cache clearing."""
+
+    def test_returns_dict(self):
+        state = {"task_id": "test-task"}
+        result = post_compact_cleanup(state)
+        assert isinstance(result, dict)
+
+    def test_marks_compacted_this_turn(self):
+        state = {"task_id": "test-task"}
+        result = post_compact_cleanup(state)
+        assert result.get("_compacted_this_turn") is True
+
+    def test_empty_task_id(self):
+        state = {}
+        result = post_compact_cleanup(state)
+        assert isinstance(result, dict)
+        # Should still mark compaction
+        assert result.get("_compacted_this_turn") is True
+
+    def test_clears_env_cache(self):
+        """Verify env cache is cleared for the task."""
+        import asyncio
+        from chaos_agent.agent.env_info import compute_env_info, clear_env_cache
+
+        # Populate cache
+        asyncio.run(compute_env_info(task_id="cleanup-test"))
+
+        state = {"task_id": "cleanup-test"}
+        result = post_compact_cleanup(state)
+
+        # After cleanup, next compute_env_info should re-collect
+        # (we can't easily verify this without mocking, but at least no error)
+        assert isinstance(result, dict)
+
+        # Clean up
+        clear_env_cache()

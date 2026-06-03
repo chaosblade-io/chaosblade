@@ -1,0 +1,12 @@
+
+  📋 Plan
+
+  对 cms-demo 命名空间下的 accounting Pod 注入 90% 内存压力
+
+
+  🛡 Safety: ✓ SAFE
+
+
+  ────────────────────────────────────────────────────
+  [Y] Approve    [N] Reject
+

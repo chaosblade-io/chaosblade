@@ -412,7 +412,8 @@ func addTimeoutFlag(flags []spec.ExpFlagSpec) []spec.ExpFlagSpec {
 	}
 	if !contains {
 		// set action flags, always add timeout param
-		flags = append(flags,
+		flags = append(
+			flags,
 			&spec.ExpFlag{
 				Name:     "timeout",
 				Desc:     "set timeout for experiment in seconds",

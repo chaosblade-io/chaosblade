@@ -1,0 +1,16 @@
+
+╭────────────────────────────  ✓ INJECTION SUCCESS ────────────────────────────╮
+│                                                                              │
+│    Task ID:     t-rich                                                       │
+│    Fault Type:  cpu-fullload                                                 │
+│    State:       injected                                                     │
+│                                                                              │
+│   ── Replan History ───────────────────────────────                          │
+│   v1 ✗ blast radius too large (>30% of namespace)                            │
+│   v2 ✓ agent improved the plan and succeeded                                 │
+│                                                                              │
+│   ── Side Effects ────────────────────────────────                           │
+│   ⚠ web-1 restarted 1× — OOMKilled                                           │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

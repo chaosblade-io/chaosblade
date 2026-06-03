@@ -1,0 +1,64 @@
+{
+  "name": "@blade-ai/tui",
+  "version": "0.3.0",
+  "description": "Blade-AI Terminal UI (TypeScript + Ink) — talks to Python backend over HTTP+SSE.",
+  "keywords": [
+    "blade-ai",
+    "chaos-engineering",
+    "kubernetes",
+    "tui",
+    "ink",
+    "terminal"
+  ],
+  "homepage": "https://github.com/chaosblade-io/chaosblade/tree/main/blade-ai/tui",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chaosblade-io/chaosblade.git",
+    "directory": "blade-ai/tui"
+  },
+  "bugs": {
+    "url": "https://github.com/chaosblade-io/chaosblade/issues"
+  },
+  "license": "Apache-2.0",
+  "author": "ChaosBlade Authors",
+  "type": "module",
+  "files": [
+    "dist"
+  ],
+  "bin": {
+    "blade-ai-tui": "./dist/cli.js"
+  },
+  "scripts": {
+    "dev": "tsx watch --tsconfig tsconfig.json src/cli.tsx",
+    "start": "tsx src/cli.tsx",
+    "build": "tsup",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "postinstall": "patch-package",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "cli-spinners": "^2.9.0",
+    "ink": "^7.0.3",
+    "ink-spinner": "^5.0.0",
+    "marked": "^14.1.4",
+    "marked-terminal": "^7.3.0",
+    "react": "^19.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.0",
+    "ink-testing-library": "^4.0.0",
+    "patch-package": "^8.0.1",
+    "tsup": "^8.3.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

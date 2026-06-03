@@ -11,7 +11,7 @@ releases
 tmp
 .idea/
 .vscode/
-
+.claude/
 # Architecture specific extensions/prefixes
 trace.out
 *.out
@@ -55,4 +55,6 @@ build/spec/*.yaml
 site-build
 
 build/image/blade/chaosblade-*
+
+/blade-ai/tui/node_modules
 

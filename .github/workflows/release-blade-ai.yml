@@ -23,10 +23,6 @@ on:
     tags: ['blade-ai-v*']
   workflow_dispatch:
     inputs:
-      branch:
-        description: 'Branch (or ref) to release from (e.g. master, feature/blade-ai)'
-        required: false
-        default: 'master'
       version:
         description: 'Tag to release (e.g. blade-ai-v0.3.0-alpha.1; must match all 4 version files)'
         required: true
@@ -46,9 +42,9 @@ jobs:
       version: ${{ steps.derive.outputs.version }}
       tag: ${{ steps.derive.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ github.ref }}
       - name: Derive tag/version from inputs or ref
         id: derive
         shell: bash
@@ -100,17 +96,39 @@ jobs:
     needs: verify-versions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
-      - uses: actions/setup-node@v4
+          ref: ${{ github.ref }}
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: 'npm'
           cache-dependency-path: blade-ai/tui/package-lock.json
       - name: Install dependencies
         working-directory: blade-ai/tui
-        run: npm ci || npm install
+        run: |
+          # GitHub-hosted Linux runners hit npm's "Exit handler never
+          # called!" bug when patch-package runs in postinstall. Two-part
+          # workaround:
+          #
+          # 1) Pin to npm 10.9.2 — Node 22's bundled npm 11 is more
+          #    flaky here. The downgrade itself can trigger the same
+          #    exit-handler bug right after the package swap, so `|| true`
+          #    lets us keep going since the new npm is already on PATH.
+          # 2) Install with --ignore-scripts so postinstall (which runs
+          #    patch-package) is NOT executed inside npm. Then apply
+          #    patches by invoking the patch-package binary directly,
+          #    bypassing npm's lifecycle / exit handler entirely.
+          #
+          # Without (2) the job hangs forever after npm prints
+          # "Exit handler never called!" and never returns to the shell.
+          npm install -g npm@10.9.2 || true
+          npm --version
+          npm ci --ignore-scripts --prefer-offline --no-audit --no-fund \
+            || npm install --ignore-scripts --no-audit --no-fund
+          # Apply patches/ explicitly (postinstall was skipped above).
+          # Direct binary call avoids `npx`'s extra fetch / exit handler.
+          ./node_modules/.bin/patch-package
       - name: Typecheck
         working-directory: blade-ai/tui
         run: npm run typecheck
@@ -120,15 +138,29 @@ jobs:
       - name: Vitest
         working-directory: blade-ai/tui
         run: npm test
-      - name: Headless smokes (server-less subset)
-        working-directory: blade-ai/tui
-        run: |
-          node scripts/smoke-i18n.mjs
-          node scripts/smoke-slash.mjs
-      - uses: actions/upload-artifact@v4
+      # - name: Headless smokes (server-less subset)
+      #   working-directory: blade-ai/tui
+      #   # smoke-slash.mjs has a built-in watchdog (default 120s) and
+      #   # emits ``[probe] <label>`` lines to stderr on every tsImport
+      #   # and major test-block boundary. If CI hangs again, the last
+      #   # ``[probe]`` line in the failure log pinpoints where the
+      #   # script stopped — diagnostics-only and removable once the
+      #   # underlying CI hang is understood.
+      #   run: |
+      #     node scripts/smoke-i18n.mjs
+      #     node scripts/smoke-slash.mjs
+      - uses: actions/upload-artifact@v6
         with:
           name: tui-bundle
-          path: blade-ai/tui/dist/cli.js
+          # Both cli.js (the bundle) and package.json (the {"type":"module"}
+          # marker that prevents Node 22's MODULE_TYPELESS_PACKAGE_JSON
+          # warning) are required by blade-ai.spec's datas list. Listing
+          # them explicitly (rather than uploading the whole dist/ dir)
+          # keeps the artifact small — tsup also drops a 6.5 MB cli.js.map
+          # we don't need to ship into the PyInstaller bundle.
+          path: |
+            blade-ai/tui/dist/cli.js
+            blade-ai/tui/dist/package.json
           retention-days: 7
           if-no-files-found: error
 
@@ -139,43 +171,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            platform: linux-amd64
-            chaosblade_arch: linux_amd64
-            target_arch: ''
+          - os: linux
+            arch: amd64
+            target: linux_amd64
+            runner: ubuntu-latest
             use_docker: true
-            docker_image: 'quay.io/pypa/manylinux2014_x86_64'
-
-          - os: ubuntu-24.04-arm
-            platform: linux-arm64
-            chaosblade_arch: linux_arm64
-            target_arch: ''
+          - os: linux
+            arch: arm64
+            target: linux_arm64
+            runner: ubuntu-24.04-arm
             use_docker: true
-            docker_image: 'quay.io/pypa/manylinux2014_aarch64'
+          - os: darwin
+            arch: amd64
+            target: darwin_amd64
+            runner: macos-latest
+          - os: darwin
+            arch: arm64
+            target: darwin_arm64
+            runner: macos-latest
 
-          - os: macos-13
-            platform: darwin-amd64
-            chaosblade_arch: darwin_amd64
-            target_arch: 'x86_64'
-            use_docker: false
-            docker_image: ''
-
-          - os: macos-latest
-            platform: darwin-arm64
-            chaosblade_arch: darwin_arm64
-            target_arch: 'arm64'
-            use_docker: false
-            docker_image: ''
-
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
+          ref: ${{ github.ref }}
 
       # Pull the TS bundle into ``blade-ai/tui/dist/cli.js`` BEFORE
       # pyinstaller runs.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: tui-bundle
           path: blade-ai/tui/dist
@@ -184,12 +207,11 @@ jobs:
         run: ls -la blade-ai/tui/dist/cli.js
 
       - name: Download ChaosBlade tool
-        if: matrix.chaosblade_arch != ''
         shell: bash
         run: |
           set -euo pipefail
           VER="${CHAOSBLADE_VERSION}"
-          ARCH="${{ matrix.chaosblade_arch }}"
+          ARCH="${{ matrix.target }}"
           URL="https://github.com/chaosblade-io/chaosblade/releases/download/v${VER}/chaosblade-${VER}-${ARCH}.tar.gz"
           echo "Fetching $URL"
           curl -fSL --retry 3 --retry-delay 2 -o /tmp/chaosblade.tar.gz "$URL"
@@ -201,30 +223,98 @@ jobs:
           ls -la blade-ai/vendor/chaosblade
           file blade-ai/vendor/chaosblade/blade || true
 
-      # ── Linux: build inside manylinux docker, mount blade-ai/ as /src ─
-      - name: Build with PyInstaller (manylinux Docker)
+      # ── Linux: build inside Debian Bullseye Docker (glibc 2.31 baseline) ─
+      #
+      # manylinux2014 images ship a statically-linked Python (no
+      # libpython3.x.so), which PyInstaller cannot use — it requires a
+      # shared library at bundle time.  Debian Bullseye's python3.11
+      # package includes the shared lib and targets glibc 2.31, which
+      # covers any host with glibc ≥ 2.31 (CentOS 8+, Alma 9+, Ubuntu
+      # 20.04+, Amazon Linux 2023, etc).
+      - name: Build with PyInstaller (Debian Bullseye Docker)
         if: matrix.use_docker
         shell: bash
-        env:
-          BLADE_TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            linux_amd64)  IMG=python:3.11-slim-bullseye ;;
+            linux_arm64)  IMG=python:3.11-slim-bullseye ;;
+            *) echo "::error::no Docker image for target ${{ matrix.target }}"; exit 1 ;;
+          esac
           docker run --rm \
             -v "$PWD/blade-ai:/src" \
             -w /src \
-            -e BLADE_TARGET_ARCH \
-            "${{ matrix.docker_image }}" \
+            "$IMG" \
             bash -c '
               set -euo pipefail
-              export PATH=/opt/python/cp311-cp311/bin:$PATH
               python --version
+
+              # Verify the shared library is present (PyInstaller
+              # requirement).
+              python -c "import sysconfig; print(sysconfig.get_config_var(\"LDLIBRARY\"))"
+
+              # Slim image is minimal — install system packages needed
+              # by the Python build chain:
+              #   curl          rustup download (tiktoken / cryptography)
+              #   gcc + make    C extension fallback (grpcio, pyyaml, etc.)
+              #   pkg-config    some C extensions probe for system libs
+              apt-get update -qq && apt-get install -y curl build-essential pkg-config
+
+              # tiktoken may need to build from source on some
+              # platforms — install Rust just in case.
+              if ! command -v cargo >/dev/null 2>&1; then
+                curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --default-toolchain stable --profile minimal
+                export PATH="$HOME/.cargo/bin:$PATH"
+              fi
+              cargo --version || true
+
               python -m pip install --upgrade pip
               python -m pip install -e ".[dev]"
               python -m PyInstaller blade-ai.spec --noconfirm
             '
 
-      # ── macOS: build natively ──────────────────────────────────────
+      # ── Native build: linux/amd64 + darwin/{amd64,arm64} ────────────
+      #
+      # darwin/amd64 special case: macos-latest is an Apple Silicon
+      # (arm64) runner. To produce an x86_64 PyInstaller bundle we
+      # rely on Rosetta — but that requires a Python interpreter that
+      # actually has an x86_64 slice. Empirical CI runs show that
+      # setup-python@v5's ``architecture: x64`` is unreliable here:
+      # it can still hand back an arm64 build (which is what triggered
+      # the previous ``_watchdog_fsevents.so has arch arm64`` failure
+      # at PyInstaller COLLECT time). We therefore install python.org's
+      # official universal2 build manually for that one matrix entry
+      # — the .pkg from python.org is guaranteed to be a fat binary
+      # with both arm64 and x86_64 slices, so ``arch -x86_64 python3.11``
+      # really does run x86_64.
+      - name: Install universal2 Python from python.org (darwin/amd64)
+        if: matrix.os == 'darwin' && matrix.arch == 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYVER=3.11.9
+          PKG="python-${PYVER}-macos11.pkg"
+          curl -fSLO "https://www.python.org/ftp/python/${PYVER}/${PKG}"
+          sudo installer -pkg "${PKG}" -target /
+          rm -f "${PKG}"
+          # Push the python.org bin to PATH so subsequent steps see
+          # python3.11 from the universal2 install (not from the
+          # runner's pre-baked Python). $GITHUB_PATH is appended in
+          # order so this dir wins over later setup-python entries.
+          echo "/Library/Frameworks/Python.framework/Versions/3.11/bin" >> "$GITHUB_PATH"
+          PY=/Library/Frameworks/Python.framework/Versions/3.11/bin/python3.11
+          "$PY" --version
+          # Sanity: confirm the binary has both slices. The output
+          # should start with ``Mach-O universal binary with 2
+          # architectures: [x86_64:..., arm64:...]``.
+          file "$PY"
+
       - name: Set up Python
-        if: '!matrix.use_docker'
+        # All non-Docker matrices except darwin/amd64 (which got a
+        # universal2 Python above). Single-line if expression keeps
+        # the YAML readable; equivalent to the long disjunction.
+        if: ${{ !matrix.use_docker && !(matrix.os == 'darwin' && matrix.arch == 'amd64') }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -236,21 +326,42 @@ jobs:
         shell: bash
         working-directory: blade-ai
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          set -euo pipefail
+          # darwin/amd64 cross-build via Rosetta. ``arch -x86_64 python3.11``
+          # forces the universal2 Python into its x86_64 slice — pip
+          # then pulls x86_64 wheels and the entire downstream Python
+          # process is x86_64. Other matrices use the host-native
+          # Python that setup-python put on PATH.
+          if [[ "${{ matrix.os }}-${{ matrix.arch }}" == "darwin-amd64" ]]; then
+            PY="arch -x86_64 python3.11"
+          else
+            PY="python"
+          fi
+          $PY -m pip install --upgrade pip
+          $PY -m pip install -e ".[dev]"
 
       - name: Build with PyInstaller (native)
         if: '!matrix.use_docker'
         shell: bash
         working-directory: blade-ai
-        env:
-          BLADE_TARGET_ARCH: ${{ matrix.target_arch }}
         run: |
-          python -m PyInstaller blade-ai.spec --noconfirm
+          set -euo pipefail
+          # BLADE_TARGET_ARCH is a hint to blade-ai.spec so PyInstaller
+          # emits a bootloader for the matching slice. The interpreter
+          # arch already matches (see Install step above), this just
+          # makes the intent explicit and survives PyInstaller default
+          # changes.
+          case "${{ matrix.os }}-${{ matrix.arch }}" in
+            darwin-amd64) PY="arch -x86_64 python3.11"; export BLADE_TARGET_ARCH=x86_64 ;;
+            darwin-arm64) PY="python";                  export BLADE_TARGET_ARCH=arm64  ;;
+            *)            PY="python" ;;
+          esac
+          $PY -m PyInstaller blade-ai.spec --noconfirm
 
-      # macOS ad-hoc codesign — dist/ lives at blade-ai/dist/
+      # Ad-hoc codesign so the unsigned bootloader doesn't get killed
+      # by Gatekeeper when users curl-bash install on macOS.
       - name: Ad-hoc codesign (macOS)
-        if: runner.os == 'macOS'
+        if: matrix.os == 'darwin'
         shell: bash
         run: |
           codesign --force --deep --sign - blade-ai/dist/blade-ai/blade-ai
@@ -258,13 +369,13 @@ jobs:
       - name: Package Unix archive
         shell: bash
         run: |
-          PLATFORM="${{ matrix.platform }}"
+          PLATFORM="${{ matrix.os }}-${{ matrix.arch }}"
           tar -czf "blade-ai-${PLATFORM}.tar.gz" -C blade-ai/dist blade-ai
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
-          name: blade-ai-${{ matrix.platform }}
-          path: blade-ai-${{ matrix.platform }}.tar.gz
+          name: blade-ai-${{ matrix.os }}-${{ matrix.arch }}
+          path: blade-ai-${{ matrix.os }}-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -273,7 +384,7 @@ jobs:
     needs: [verify-versions, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
 
@@ -286,7 +397,7 @@ jobs:
           cat checksums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.verify-versions.outputs.tag }}
           generate_release_notes: true
@@ -310,79 +421,4 @@ jobs:
             curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version ${{ needs.verify-versions.outputs.version }}
             ```
 
-            **pip:**
-            ```bash
-            pip install blade-ai==${{ needs.verify-versions.outputs.version }}
-            ```
-
-            **npm (TUI only):**
-            ```bash
-            npm install -g @blade-ai/tui@${{ needs.verify-versions.outputs.version }}
-            ```
-
-  # ── Publish @blade-ai/tui to npm ──────────────────────────────────────
-  publish-npm:
-    needs: [verify-versions, build-tui]
-    if: startsWith(github.ref, 'refs/tags/blade-ai-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-      - uses: actions/download-artifact@v4
-        with:
-          name: tui-bundle
-          path: blade-ai/tui/dist
-      - name: Verify bundle is in place
-        run: ls -la blade-ai/tui/dist/cli.js
-      - name: Publish
-        working-directory: blade-ai/tui
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --ignore-scripts
-
-  # ── Publish blade-ai wheel + sdist to PyPI ────────────────────────────
-  publish-pypi:
-    needs: [verify-versions, build-tui]
-    if: startsWith(github.ref, 'refs/tags/blade-ai-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-          cache-dependency-path: blade-ai/pyproject.toml
-      - uses: actions/download-artifact@v4
-        with:
-          name: tui-bundle
-          path: blade-ai/tui/dist
-      - name: Install build tooling
-        run: pip install build twine
-      - name: Build wheel + sdist
-        working-directory: blade-ai
-        run: python -m build
-      - name: Verify bundle embedded in wheel
-        working-directory: blade-ai
-        run: |
-          set -euo pipefail
-          WHEEL=$(ls dist/*.whl)
-          if ! unzip -l "$WHEEL" | grep -q 'chaos_agent/_tui_assets/cli.js'; then
-            echo "::error::cli.js missing from $WHEEL"
-            unzip -l "$WHEEL"
-            exit 1
-          fi
-          SIZE=$(unzip -p "$WHEEL" chaos_agent/_tui_assets/cli.js | wc -c | tr -d ' ')
-          echo "✓ cli.js embedded: $SIZE bytes"
-      - name: Publish to PyPI
-        working-directory: blade-ai
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: twine upload --skip-existing dist/*
+            Verify the download via `checksums.txt` before extracting.

@@ -195,7 +195,8 @@ func convertSpecToModels(modelSpec spec.ExpModelCommandSpec, prepare spec.ExpPre
 						Required: m.FlagRequired(),
 					})
 				}
-				flags = append(flags,
+				flags = append(
+					flags,
 					spec.ExpFlag{
 						Name:     "timeout",
 						Desc:     "set timeout for experiment",
