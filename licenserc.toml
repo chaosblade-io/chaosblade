@@ -31,7 +31,10 @@ useDefaultExcludes = true
 
 excludes = [
     "*.txt",
-    "version_info.go"
+    "version_info.go",
+    "blade-ai/",
+    ".github/workflows/release-blade-ai.yml",
+    ".github/workflows/test-blade-ai.yml",
 ]
 
 # The supported patterns of includes and excludes follow gitignore pattern format, plus that:
