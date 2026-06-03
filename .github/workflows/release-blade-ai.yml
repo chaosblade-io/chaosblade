@@ -253,6 +253,13 @@ jobs:
               # requirement).
               python -c "import sysconfig; print(sysconfig.get_config_var(\"LDLIBRARY\"))"
 
+              # Slim image is minimal — install system packages needed
+              # by the Python build chain:
+              #   curl          rustup download (tiktoken / cryptography)
+              #   gcc + make    C extension fallback (grpcio, pyyaml, etc.)
+              #   pkg-config    some C extensions probe for system libs
+              apt-get update -qq && apt-get install -y curl build-essential pkg-config
+
               # tiktoken may need to build from source on some
               # platforms — install Rust just in case.
               if ! command -v cargo >/dev/null 2>&1; then
