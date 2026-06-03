@@ -6,6 +6,15 @@
 ![license](https://img.shields.io/github/license/chaosblade-io/chaosblade.svg)
 
 
+## 🔥🔥🔥 重大更新 ChaosBlade Agent 发布: Blade AI
+<img width="2752" height="1252" alt="image" src="https://github.com/user-attachments/assets/f17ddb79-23aa-4632-89da-72c22379b5c4" />
+BLADE AI 是 ChaosBlade 生态的智能代理层：底层调用 ChaosBlade 执行故障注入，上层增加意图理解、安全审查、效果验证、安全恢复和结构化报告等编排能力，让故障演练从"手写命令"变成"对话完成"。
+
+更多介绍请查看: [Blade AI README](https://github.com/chaosblade-io/chaosblade/blob/feature/blade-ai/blade-ai/README.md)
+
+* 安装包: [blade-ai-v0.1.0](https://github.com/chaosblade-io/chaosblade/releases/tag/blade-ai-v0.1.0)
+* 代码分支: blade-ai-v0.1.0
+
 ## 项目介绍
 ChaosBlade 是阿里巴巴开源的一款遵循混沌工程原理和混沌实验模型的实验注入工具，帮助企业提升分布式系统的容错能力，并且在企业上云或往云原生系统迁移过程中业务连续性保障。
 
