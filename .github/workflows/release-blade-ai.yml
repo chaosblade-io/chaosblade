@@ -283,8 +283,8 @@ jobs:
         run: |
           set -euo pipefail
           case "${{ matrix.target }}" in
-            linux_amd64)  IMG=python:3.11-slim-bullseye ;;
-            linux_arm64)  IMG=python:3.11-slim-bullseye ;;
+            linux_amd64)  IMG=python:3.11-slim-bookworm ;;
+            linux_arm64)  IMG=python:3.11-slim-bookworm ;;
             *) echo "::error::no Docker image for target ${{ matrix.target }}"; exit 1 ;;
           esac
           docker run --rm \
