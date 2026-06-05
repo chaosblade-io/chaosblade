@@ -81,6 +81,15 @@ _vendor_blade = PROJECT_ROOT / "vendor" / "chaosblade"
 if not _is_windows and _vendor_blade.exists() and (_vendor_blade / "blade").exists():
     datas.append(('vendor/chaosblade', 'vendor/chaosblade'))
 
+# Node.js runtime — bundled so the TS TUI works without the user
+# installing Node separately. CI's matrix step downloads the
+# platform-matching Node binary into ``vendor/node/``. On Windows
+# the binary is ``node.exe``; on Unix it's ``node``.
+_vendor_node = PROJECT_ROOT / "vendor" / "node"
+_node_bin = _vendor_node / ("node.exe" if _is_windows else "node")
+if _vendor_node.exists() and _node_bin.exists():
+    datas.append(('vendor/node', 'vendor/node'))
+
 # Auto-collect data files shipped inside any chaos_agent submodule
 # (e.g. prompt section markdown bundled alongside Python code).
 # Empty result is fine — collect_data_files returns [] when the

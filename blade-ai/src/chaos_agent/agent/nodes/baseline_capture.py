@@ -1543,8 +1543,8 @@ def make_baseline_capture(llm=None, registry=None):
                 return _SCOPE_FALLBACK.get(scope, [])
 
             strategy_chain = [
-                ("llm", _llm_strategy),
                 ("registry", _registry_strategy),
+                ("llm", _llm_strategy),
                 ("scope_fallback", _scope_fallback_strategy),
             ]
 

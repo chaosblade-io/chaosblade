@@ -18,6 +18,7 @@ from chaos_agent.tui.bridge import EventBridge
 from chaos_agent.tui.intent import IntentRouter, IntentType
 from chaos_agent.tui.interrupt import InterruptHandler
 from chaos_agent.tui.state import ConversationMode, SessionState
+from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class ConversationController:
             console=console, renderer=renderer, state=state
         )
         self._intent_router = IntentRouter()
+        self._interrupt_cb = self._make_interrupt_cb()
         # Persists past `_start_stream`'s finally so cancel/recover can read it.
         self._last_task_id: str = ""
         # Multi-invocation conversation thread tracking
@@ -130,6 +132,41 @@ class ConversationController:
     def classify_intent(self, text: str) -> IntentType:
         return self._intent_router.classify(text)
 
+    def _make_interrupt_cb(self):
+        """Wrap interrupt_handler to sidewrite the user's confirm answer."""
+        raw_cb = self._interrupt_handler.handle_interrupt
+
+        async def _cb(interrupt_info: dict) -> str:
+            answer = await raw_cb(interrupt_info)
+            _store = getattr(self._runner, "_tui_session_store", None)
+            if _store and self._state.tui_session_id:
+                _store.append_event(
+                    self._state.tui_session_id, {
+                        "ts": now_iso(),
+                        "source": "user",
+                        "task_id": "",
+                        "event_type": "confirm_answer",
+                        "data": {"content": answer},
+                    },
+                )
+            return answer
+
+        return _cb
+
+    def _sidewrite_user_input(self, text: str) -> None:
+        """Record user input to the Display Store (fire-and-forget)."""
+        _store = getattr(self._runner, "_tui_session_store", None)
+        if _store and self._state.tui_session_id:
+            _store.append_event(
+                self._state.tui_session_id, {
+                    "ts": now_iso(),
+                    "source": "user",
+                    "task_id": "",
+                    "event_type": "user_input",
+                    "data": {"content": text},
+                },
+            )
+
     async def _start_stream(self, input_text: str, *, dry_run: bool = False, **kwargs) -> None:
         """Start a new inject stream (first message in a conversation)."""
         if not self._runner:
@@ -147,10 +184,11 @@ class ConversationController:
         # In dry-run mode the gate never interrupts, so we don't need to ask
         # for a confirmation prompt — surface the preview directly.
         confirm = (not dry_run) and self._state.permission_mode == PermissionMode.CONFIRM
-        interrupt_cb = self._interrupt_handler.handle_interrupt
+        interrupt_cb = self._interrupt_cb
 
         try:
-            stream = self._runner.inject_stream(
+            self._sidewrite_user_input(input_text)
+            raw_stream = self._runner.inject_stream(
                 input=input_text,
                 confirm=confirm,
                 interrupt_callback=interrupt_cb,
@@ -158,6 +196,9 @@ class ConversationController:
                 tui_session_id=self._state.tui_session_id,
                 dry_run=dry_run,
                 **kwargs,
+            )
+            stream = self._runner._wrap_stream_with_sidewrite(
+                raw_stream, self._state.tui_session_id,
             )
 
             self._state.set_streaming(True)
@@ -171,10 +212,16 @@ class ConversationController:
                         task_id = event.task_id
                         self._last_task_id = task_id
                         self._state.set_active_task(task_id)
+                    if event.type == "result" and event.task_id:
+                        self._last_task_id = event.task_id
                     # conversation_turn signals the graph ended normally
-                    # in intent_clarification (multi-invocation model)
+                    # in intent_clarification (multi-invocation model).
+                    # For /plan (dry_run), the event carries the Pipeline
+                    # task_id so lift_dry_run_and_run can find the checkpoint.
                     if event.type == "conversation_turn":
                         entered_conversation = True
+                        if event.task_id:
+                            task_id = event.task_id
                         continue
                     if event.type == "error":
                         # inject pipeline failed / safety-rejected: runner
@@ -227,13 +274,17 @@ class ConversationController:
             return
 
         thread_id = self._conversation_thread_id
-        interrupt_cb = self._interrupt_handler.handle_interrupt
+        interrupt_cb = self._interrupt_cb
 
         try:
-            stream = self._runner.converse_stream(
-                thread_id=thread_id,
+            self._sidewrite_user_input(user_message)
+            raw_stream = self._runner.converse_stream(
+                session_id=thread_id,
                 user_message=user_message,
                 interrupt_callback=interrupt_cb,
+            )
+            stream = self._runner._wrap_stream_with_sidewrite(
+                raw_stream, self._state.tui_session_id, source="intent",
             )
 
             self._state.set_streaming(True)
@@ -248,6 +299,8 @@ class ConversationController:
                     # If we get a "result" event, the full pipeline completed
                     # (agent_loop → execute → verify), conversation ends
                     if event.type == "result":
+                        if event.task_id:
+                            self._last_task_id = event.task_id
                         self._end_conversation()
                     if event.type == "error":
                         turn_had_error = True
@@ -296,11 +349,16 @@ class ConversationController:
         return self._conversation_thread_id
 
     async def is_dry_run_thread(self) -> bool:
-        """True when the current conversation thread is in Dry-Run state."""
+        """True when the current conversation thread is in Dry-Run state.
+
+        After /plan, _conversation_thread_id points to the Pipeline
+        Graph checkpoint (task_id) where dry_run=True.
+        """
         if not (self._in_conversation and self._conversation_thread_id and self._runner):
             return False
         try:
-            graph = getattr(self._runner, "_agents", {}).get("inject")
+            agents = getattr(self._runner, "_agents", {})
+            graph = agents.get("pipeline")
             if graph is None:
                 return False
             snap = await graph.aget_state(
@@ -320,11 +378,14 @@ class ConversationController:
             self._renderer.error("当前没有可落地的 Dry-Run 计划")
             return
 
-        interrupt_cb = self._interrupt_handler.handle_interrupt
+        interrupt_cb = self._interrupt_cb
         try:
-            stream = self._runner.lift_dry_run_and_run(
+            raw_stream = self._runner.lift_dry_run_and_run(
                 thread_id=thread_id,
                 interrupt_callback=interrupt_cb,
+            )
+            stream = self._runner._wrap_stream_with_sidewrite(
+                raw_stream, self._state.tui_session_id,
             )
             self._state.set_streaming(True)
             self._state.set_active_task(thread_id)
@@ -372,17 +433,20 @@ class ConversationController:
             self._renderer.error("AgentRunner not initialized")
             return
 
-        interrupt_cb = self._interrupt_handler.handle_interrupt
+        interrupt_cb = self._interrupt_cb
 
         resume_value = None
         if interrupt_info:
-            resume_value = await self._interrupt_handler.handle_interrupt(interrupt_info)
+            resume_value = await self._interrupt_cb(interrupt_info)
 
         try:
-            stream = self._runner.resume_stream(
+            raw_stream = self._runner.resume_stream(
                 task_id=task_id,
                 resume_value=resume_value,
                 interrupt_callback=interrupt_cb,
+            )
+            stream = self._runner._wrap_stream_with_sidewrite(
+                raw_stream, self._state.tui_session_id,
             )
             async for event in stream:
                 await self._bridge.process_stream_event(event)

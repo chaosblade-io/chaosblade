@@ -157,6 +157,53 @@ async def _fetch_memory_limit_mb(
     return parse_k8s_memory_to_mb(raw)
 
 
+async def _fetch_node_memory_usage_mb(
+    node_name: str, kubeconfig: str
+) -> int | None:
+    """kubectl top node → memory usage in MB."""
+    stdout = await _run_kubectl(
+        ["top", "node", node_name, "--no-headers"],
+        kubeconfig,
+    )
+    if not stdout:
+        return None
+    parts = stdout.split()
+    for p in parts[1:]:
+        upper = p.upper()
+        if upper.endswith("MI") or upper.endswith("MIB"):
+            try:
+                return int(upper.rstrip("MIB").rstrip("MI"))
+            except ValueError:
+                pass
+        elif upper.endswith("GI") or upper.endswith("GIB"):
+            try:
+                return int(float(upper.rstrip("GIB").rstrip("GI")) * 1024)
+            except ValueError:
+                pass
+    return None
+
+
+async def _fetch_node_memory_capacity_mb(
+    node_name: str, kubeconfig: str
+) -> int | None:
+    """kubectl get node → status.allocatable.memory in MB."""
+    from chaos_agent.utils.fault_type import parse_k8s_memory_to_mb
+
+    stdout = await _run_kubectl(
+        [
+            "get", "node", node_name,
+            "-o", "jsonpath={.status.allocatable.memory}",
+        ],
+        kubeconfig,
+    )
+    if not stdout:
+        return None
+    raw = stdout.strip().strip("'\"")
+    if not raw:
+        return None
+    return parse_k8s_memory_to_mb(raw)
+
+
 async def _fetch_cpu_usage_millicores(
     name: str, namespace: str, kubeconfig: str, *, is_node: bool = False
 ) -> int | None:
@@ -250,17 +297,29 @@ class MemoryFeasibilityChecker:
     async def assess(
         self, spec: "FaultSpec", kubeconfig: str
     ) -> FeasibilityReport | None:
-        if not spec.namespace:
-            return None
         target_percent = _parse_int_param(spec.params.get("mem-percent"))
         if target_percent is None or target_percent <= 0:
             return None
 
-        pod_name = await _resolve_first_pod(spec, kubeconfig)
-        if not pod_name:
-            return None
-        usage_mb = await _fetch_memory_usage_mb(pod_name, spec.namespace, kubeconfig)
-        limit_mb = await _fetch_memory_limit_mb(pod_name, spec.namespace, kubeconfig)
+        is_node = spec.scope == "node"
+        if is_node:
+            if not spec.names:
+                return None
+            name = spec.names[0]
+        else:
+            if not spec.namespace:
+                return None
+            name = await _resolve_first_pod(spec, kubeconfig)
+            if not name:
+                return None
+
+        if is_node:
+            usage_mb = await _fetch_node_memory_usage_mb(name, kubeconfig)
+            limit_mb = await _fetch_node_memory_capacity_mb(name, kubeconfig)
+        else:
+            usage_mb = await _fetch_memory_usage_mb(name, spec.namespace, kubeconfig)
+            limit_mb = await _fetch_memory_limit_mb(name, spec.namespace, kubeconfig)
+
         if usage_mb is None or limit_mb is None or limit_mb == 0:
             return None
 

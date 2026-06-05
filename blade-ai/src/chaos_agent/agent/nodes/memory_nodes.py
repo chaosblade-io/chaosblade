@@ -133,6 +133,69 @@ async def load_memory(state: AgentState) -> dict:
     return updates
 
 
+async def pipeline_init(state: AgentState) -> dict:
+    """Entry node for Pipeline Graph — load operational context.
+
+    Equivalent to load_memory but without intent routing. Used by
+    CLI (direct + NL) and TUI after Intent Graph confirms inject.
+    """
+    task_id = state.get("task_id", "unknown")
+    memory_dir = settings.resolved_memory_dir
+    updates: dict = {"approved_target": None, "screener_route": None}
+
+    tracker = get_tracker(task_id)
+    tracker.start(StatusCategory.NODE, "pipeline_init", "Loading operational context")
+
+    try:
+        op_memory = OperationalMemory(memory_dir / "MEMORY.md")
+        updates["operational_notes"] = op_memory.read()
+    except Exception as e:
+        logger.warning(f"Failed to load operational memory: {e}")
+        updates["operational_notes"] = ""
+
+    from chaos_agent.agent.fault_spec import read_fault_spec
+    _spec = read_fault_spec(state)
+    try:
+        from chaos_agent.persistence.task_store import get_task_store
+        store = await get_task_store()
+        namespace = _spec.namespace if _spec else ""
+        updates["experiment_history"] = await store.query_active(namespace=namespace)
+    except Exception as e:
+        logger.warning(f"Failed to load experiment history: {e}")
+        updates["experiment_history"] = []
+
+    nl_description = state.get("input") or (_spec.user_description if _spec else "")
+    if nl_description:
+        updates["messages"] = [HumanMessage(content=nl_description)]
+    elif _spec and _spec.is_complete:
+        parts = [f"执行故障注入：{_spec.scope}-{_spec.blade_target}-{_spec.blade_action}"]
+        if _spec.namespace:
+            parts.append(f"目标命名空间: {_spec.namespace}")
+        if _spec.names:
+            parts.append(f"目标名称: {', '.join(_spec.names)}")
+        if _spec.params:
+            param_str = ", ".join(f"{k}={v}" for k, v in _spec.params.items() if v)
+            if param_str:
+                parts.append(f"参数: {param_str}")
+        kubeconfig = state.get("kubeconfig") or ""
+        if kubeconfig:
+            parts.append(f"kubeconfig: {kubeconfig}")
+        updates["messages"] = [HumanMessage(content="\n".join(parts))]
+
+    msgs = updates.get("messages")
+    if msgs:
+        from chaos_agent.memory.session_store import get_global_session_store
+        _store = get_global_session_store()
+        _tid = state.get("task_id", "")
+        if _store and _tid:
+            _store.append_messages(_tid, msgs, node_name=MEMORY_NODE)
+
+    tracker.complete("Pipeline context loaded")
+    sync_node_status_to_session(state, "pipeline_init", "Context loaded")
+    await sync_to_store(state, updates)
+    return updates
+
+
 async def save_memory(state: AgentState) -> dict:
     """Save experiment results to history and optionally update MEMORY.md.
 

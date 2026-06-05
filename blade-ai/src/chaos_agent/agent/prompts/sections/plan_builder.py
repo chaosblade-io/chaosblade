@@ -122,6 +122,18 @@ Stage 3: PLAN GENERATION
 - After ALL fault parameters confirmed
 - Call submit_plan with the complete structured data
 
+### Batch / Multi-Scenario Mode
+When the plan involves multiple faults, adapt the workflow:
+1. Use kubectl_ro to discover available targets in the namespace
+2. Use activate_skill + read_skill_resource to understand fault capabilities
+3. Design N diverse faults, then submit ALL in one submit_plan call
+   with faults=[...], execution_order="serial" — do NOT submit separately
+
+Diversity principles:
+- Spread across different fault types (cpu/mem/network/disk/process)
+- Target different resources (avoid stacking faults on the same pod)
+- Use standard parameters unless the user specifies otherwise
+
 KEY: After EVERY kubectl_ro / activate_skill / read_skill_resource return,
 use the results to build the NEXT question's options. The tool result is
 not the end — it's the INPUT for constructing a better question.
@@ -158,10 +170,32 @@ def get_plan_builder_tools_section() -> str:
 
 ### Plan Submission (internal — node-handled)
 - **submit_plan**: Generate the final injection plan. Call ONLY after ALL
-  decisions are confirmed by the user. Parameters:
+  decisions are confirmed by the user. Every fault MUST have scope, target,
+  and action filled — incomplete faults will be dropped.
+  Parameters:
   - faults: array of {scope, target, action, namespace, names, labels, params}
   - execution_order: "serial" | "parallel" (for multiple faults)
-  - interval_seconds: integer (interval between serial faults)"""
+  - interval_seconds: integer (interval between serial faults)
+
+  Example — single fault:
+    submit_plan(faults=[{
+      "scope": "pod", "target": "cpu", "action": "fullload",
+      "namespace": "cms-demo", "names": ["payment-7b4f8c-x1z"],
+      "params": {"time": "300", "cpu-percent": "80"}
+    }])
+
+  Example — batch (3 faults):
+    submit_plan(faults=[
+      {"scope": "pod", "target": "cpu", "action": "fullload",
+       "namespace": "cms-demo", "names": ["payment-7b4f8c-x1z"],
+       "params": {"time": "300", "cpu-percent": "80"}},
+      {"scope": "pod", "target": "mem", "action": "load",
+       "namespace": "cms-demo", "names": ["order-5d9a2b-k3m"],
+       "params": {"time": "300", "mem-percent": "80"}},
+      {"scope": "pod", "target": "network", "action": "delay",
+       "namespace": "cms-demo", "names": ["gateway-8c1e4f-p7q"],
+       "params": {"time": "300", "time-ms": "500"}},
+    ], execution_order="serial", interval_seconds=10)"""
 
 
 def get_plan_builder_output_format_section() -> str:

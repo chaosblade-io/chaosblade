@@ -190,7 +190,7 @@ class TestCompactSessionSSE:
         app = FastAPI()
         from chaos_agent.server.routes.sessions import sessions_router
 
-        app.state.agents = {"inject": graph, "pre_reason_hook": hook}
+        app.state.agents = {"inject": graph, "intent": graph, "pipeline": graph, "pre_reason_hook": hook}
         app.include_router(sessions_router)
         return TestClient(app)
 
@@ -823,26 +823,13 @@ class TestIntentConfirmDryRunSkip:
         assert called["interrupt"] is False, (
             "intent_confirm must NOT call interrupt() in dry_run mode"
         )
-        # After Option A the dry_run branch ALSO commits the inject
-        # handoff (trim + summary + bootstrap_task_session) so the
-        # downstream agent_loop sees the same clean state it gets on a
-        # real approval. The shape of the delta is therefore a messages
-        # list ending in the ``[Intent Clarification Summary]`` marker,
-        # not the previous empty-dict short-circuit.
-        from langchain_core.messages import SystemMessage
-        msgs = result.get("messages") or []
-        assert msgs, (
-            "dry_run must produce a messages delta with the "
+        # Dual-graph model: handoff_summary carries the summary.
+        summary = result.get("handoff_summary", "")
+        assert summary, (
+            "dry_run must produce handoff_summary with the "
             "[Intent Clarification Summary] handoff; got nothing"
         )
-        last = msgs[-1]
-        assert isinstance(last, SystemMessage), (
-            "dry_run messages delta must end with a SystemMessage "
-            f"summary; got {type(last).__name__}"
-        )
-        assert str(getattr(last, "content", "")).startswith(
-            "[Intent Clarification Summary]"
-        )
+        assert summary.startswith("[Intent Clarification Summary]")
 
     @pytest.mark.asyncio
     async def test_non_dry_run_still_interrupts(self, monkeypatch):

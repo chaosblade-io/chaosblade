@@ -163,10 +163,9 @@ describe("ConfirmContextMessage", () => {
       );
     });
 
-    it("renders the safety status as the safe badge", () => {
+    it("renders the safety status label", () => {
       const { lastFrame } = render(<ConfirmContextMessage item={item} />);
       const frame = lastFrame() ?? "";
-      expect(frame).toContain("✓");
       expect(frame).toContain("安全");
     });
 
@@ -208,13 +207,10 @@ describe("ConfirmContextMessage", () => {
     });
 
     it("places the safety row at the BOTTOM when status is safe", () => {
-      // Section dividers were removed 2026-05-26; we now use the
-      // skill-name row as the top anchor and the safe checkmark as the
-      // bottom marker to confirm the ordering survived.
       const { lastFrame } = render(<ConfirmContextMessage item={item} />);
       const frame = lastFrame() ?? "";
       const skillIdx = frame.indexOf("node-cpu-fullload");
-      const safetyIdx = frame.indexOf("✓");
+      const safetyIdx = frame.indexOf("安全");
       expect(skillIdx).toBeGreaterThan(-1);
       expect(safetyIdx).toBeGreaterThan(-1);
       expect(skillIdx).toBeLessThan(safetyIdx);
@@ -474,7 +470,6 @@ describe("ConfirmContextMessage", () => {
       // no plan content.
       expect(frame).not.toContain("技能");
       // Safety alert still appears at the top.
-      expect(frame).toContain("✗");
       expect(frame).toContain("安全");
     });
 

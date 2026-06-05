@@ -173,9 +173,14 @@ async def blade_create(
         # Timeout specified (by LLM or CLI): check if it meets the minimum
         timeout_idx = cmd.index("--timeout")
         if timeout_idx + 1 < len(cmd):
-            current_val = cmd[timeout_idx + 1]
+            current_val = cmd[timeout_idx + 1].rstrip("sS")
+            cmd[timeout_idx + 1] = current_val
+            try:
+                current_int = int(current_val)
+            except (ValueError, TypeError):
+                current_int = 0
             effective_timeout = ensure_min_duration(current_val, scope, target, action)
-            if effective_timeout != int(current_val):
+            if effective_timeout != current_int:
                 cmd[timeout_idx + 1] = str(effective_timeout)
                 logger.info(
                     f"Auto-boosted --timeout from {current_val}s to {effective_timeout}s "

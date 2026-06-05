@@ -73,14 +73,22 @@ def _launch_default_tui() -> None:
         _run_python_tui()
         return
 
-    bundle = _resolve_ts_bundle()
+    bundle, reason = _resolve_ts_bundle()
     if bundle is None:
         if pref == "ts":
-            sys.stderr.write(
-                "blade-ai: BLADE_AI_TUI=ts but the TS bundle was not found.\n"
-                "  install: npm install -g @blade-ai/tui\n"
-                "  or build from source: npm --prefix tui run build\n"
-            )
+            if reason == "node_missing":
+                sys.stderr.write(
+                    "blade-ai: BLADE_AI_TUI=ts but Node.js is not installed.\n"
+                    "  The TS TUI bundle (cli.js) is present but requires Node.js >= 22 to run.\n"
+                    "  Install Node.js: https://nodejs.org/\n"
+                    "  Or use the Python TUI: BLADE_AI_TUI=legacy blade-ai\n"
+                )
+            else:
+                sys.stderr.write(
+                    "blade-ai: BLADE_AI_TUI=ts but the TS bundle was not found.\n"
+                    "  install: npm install -g @blade-ai/tui\n"
+                    "  or build from source: npm --prefix tui run build\n"
+                )
             sys.exit(1)
         _run_python_tui()
         return
@@ -94,6 +102,20 @@ def _launch_default_tui() -> None:
     # server instead of ``python -m chaos_agent.server.app ...``.
     if getattr(sys, "frozen", False):
         os.environ["BLADE_AI_SERVER_BIN"] = sys.executable
+        # PyInstaller prepends _internal/ to LD_LIBRARY_PATH with its
+        # old libstdc++ (manylinux2014). Node needs GLIBCXX_3.4.30+
+        # which that old lib doesn't have. Replace LD_LIBRARY_PATH
+        # with vendor/node/lib/ (ships Node's own libstdc++) so Node
+        # loads the right version regardless of what the system has.
+        _node_lib = Path(sys._MEIPASS) / "vendor" / "node" / "lib"
+        if _node_lib.is_dir():
+            os.environ["LD_LIBRARY_PATH"] = str(_node_lib)
+        else:
+            _orig_ldpath = os.environ.get("LD_LIBRARY_PATH_ORIG")
+            if _orig_ldpath is not None:
+                os.environ["LD_LIBRARY_PATH"] = _orig_ldpath
+            elif "LD_LIBRARY_PATH" in os.environ:
+                del os.environ["LD_LIBRARY_PATH"]
 
     argv, exec_path = bundle
     try:
@@ -106,11 +128,21 @@ def _launch_default_tui() -> None:
         _run_python_tui()
 
 
-def _resolve_ts_bundle() -> tuple[list[str], str] | None:
+# Sentinel reasons returned alongside None from _resolve_ts_bundle to
+# distinguish "bundle not found" from "bundle found but Node missing".
+_REASON_NOT_FOUND = "not_found"
+_REASON_NODE_MISSING = "node_missing"
+
+
+def _resolve_ts_bundle() -> tuple[tuple[list[str], str] | None, str]:
     """Locate an executable form of the TS bundle.
 
-    Returns ``(argv, exec_path)`` suitable for ``os.execvp``, or
-    ``None`` if no candidate exists in this environment.
+    Returns ``((argv, exec_path), reason)`` where the first element is
+    suitable for ``os.execvp``, or ``(None, reason)`` if the bundle
+    can't be launched. ``reason`` is one of:
+      - ``"not_found"`` — no cli.js exists in any expected location.
+      - ``"node_missing"`` — cli.js was found but Node.js is absent.
+      - ``"ok"`` — bundle resolved successfully.
 
     Search order:
       1. ``BLADE_AI_TUI_BIN`` env — explicit override for tests / dev
@@ -135,9 +167,16 @@ def _resolve_ts_bundle() -> tuple[list[str], str] | None:
     version. A ``.js`` candidate requires Node in ``PATH``; a binary
     candidate is execed directly.
     """
+    # Track whether we found a .js file but couldn't exec it (no Node).
+    found_js_but_no_node = False
+
     override = os.environ.get("BLADE_AI_TUI_BIN")
     if override:
-        return _exec_form(Path(override))
+        form, needs_node = _exec_form(Path(override))
+        if form is not None:
+            return form, "ok"
+        if needs_node:
+            found_js_but_no_node = True
 
     # PyInstaller onedir/onefile mode sets ``sys._MEIPASS`` to the data
     # root. In practice, PyInstaller (>=6) also rewrites ``__file__`` to
@@ -148,45 +187,89 @@ def _resolve_ts_bundle() -> tuple[list[str], str] | None:
     if meipass:
         frozen = Path(meipass) / "chaos_agent" / "_tui_assets" / "cli.js"
         if frozen.is_file():
-            form = _exec_form(frozen)
+            form, needs_node = _exec_form(frozen)
             if form is not None:
-                return form
+                return form, "ok"
+            if needs_node:
+                found_js_but_no_node = True
 
     here = Path(__file__).resolve()
 
     embedded = here.parents[1] / "_tui_assets" / "cli.js"
     if embedded.is_file():
-        form = _exec_form(embedded)
+        form, needs_node = _exec_form(embedded)
         if form is not None:
-            return form
+            return form, "ok"
+        if needs_node:
+            found_js_but_no_node = True
 
     shim = shutil.which("blade-ai-tui")
     if shim:
-        return ([shim], shim)
+        return ([shim], shim), "ok"
 
     for parent in here.parents:
         candidate = parent / "tui" / "dist" / "cli.js"
         if candidate.is_file():
-            return _exec_form(candidate)
+            form, needs_node = _exec_form(candidate)
+            if form is not None:
+                return form, "ok"
+            if needs_node:
+                found_js_but_no_node = True
+            break
         # Don't escape past the repo — once we hit the FS root, give up.
         if parent == parent.parent:
+            break
+
+    reason = _REASON_NODE_MISSING if found_js_but_no_node else _REASON_NOT_FOUND
+    return None, reason
+
+
+def _find_bundled_node() -> str | None:
+    """Return the path to the bundled Node.js binary, if present.
+
+    PyInstaller bundles vendor/node/node into the data root. Check
+    there first; this makes the standalone binary self-contained.
+    Dev-tree fallback stops at the project root (pyproject.toml).
+    """
+    node_name = "node.exe" if sys.platform.startswith("win") else "node"
+
+    # PyInstaller frozen mode
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        bundled = Path(meipass) / "vendor" / "node" / node_name
+        if bundled.is_file() and os.access(bundled, os.X_OK):
+            return str(bundled)
+
+    # Dev-tree: walk up from this file, stop at project root
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "vendor" / "node" / node_name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        if (parent / "pyproject.toml").is_file():
             break
 
     return None
 
 
-def _exec_form(candidate: Path) -> tuple[list[str], str] | None:
-    """Pack a path into the (argv, exec_path) shape ``execvp`` wants."""
+def _exec_form(candidate: Path) -> tuple[tuple[list[str], str] | None, bool]:
+    """Pack a path into the (argv, exec_path) shape ``execvp`` wants.
+
+    Returns ``(result, needs_node)`` where ``needs_node`` is True when
+    the candidate is a .js file but Node.js was not found anywhere
+    (neither bundled nor in PATH).
+    """
     if not candidate.exists():
-        return None
+        return None, False
     if candidate.suffix == ".js":
-        node = shutil.which("node")
+        # Prefer bundled node (PyInstaller / vendor), then PATH.
+        node = _find_bundled_node() or shutil.which("node")
         if node is None:
-            return None
-        return ([node, str(candidate)], node)
+            return None, True
+        return ([node, str(candidate)], node), False
     if os.access(candidate, os.X_OK):
-        return ([str(candidate)], str(candidate))
-    return None
+        return ([str(candidate)], str(candidate)), False
+    return None, False
 
 
 def _run_python_tui() -> None:

@@ -2,7 +2,7 @@
 
 import logging
 
-from chaos_agent.agent.graph import build_inject_graph, build_recover_graph
+from chaos_agent.agent.graph import build_recover_graph
 from chaos_agent.config.settings import settings
 from chaos_agent.skills.registry import SkillRegistry
 from chaos_agent.tools import (
@@ -156,11 +156,6 @@ def _build_skill_tools(registry: SkillRegistry):
     """Build skill-related tools with dynamic catalog from registry."""
     from langchain_core.tools import tool as lc_tool
 
-    # PATD: activate_skill docstring only carries skill name list (not full catalog).
-    # Full descriptions are in the system prompt's stable Skill Index section.
-    # This eliminates the 3× redundancy (system prompt + P2 + docstring).
-    skill_names_str = ", ".join(registry.list_skills())
-
     @lc_tool
     def activate_skill(skill_name: str) -> str:
         """Phase 1 ONLY. Activate a chaos-engineering skill and load its full instructions.
@@ -171,7 +166,9 @@ def _build_skill_tools(registry: SkillRegistry):
           - Do NOT skip — every fault injection MUST be backed by an activated skill.
 
         Inputs:
-          - skill_name: one of: {skill_names_str}
+          - skill_name: an available skill name. If unsure which names
+            exist, call with any name — the error response lists all
+            currently available skills.
 
         Output: the activated skill's full markdown content (SKILL.md body
                 including safety rules, decision flow, use-case catalogue).
@@ -180,8 +177,9 @@ def _build_skill_tools(registry: SkillRegistry):
         Side effects: marks the skill as the current active context for this task.
 
         Constraints (MUST READ before calling):
-          - Only names listed above are accepted; unknown names
-            return an error listing the available choices.
+          - Unknown names return an error listing the available choices.
+            Do NOT guess — use a name from that list or from the system
+            prompt's Skill Index (when present).
         """
         try:
             return registry.activate(skill_name)
@@ -421,25 +419,6 @@ def _build_skill_tools(registry: SkillRegistry):
             f"Reason: {reason}"
         )
 
-    # Build dynamic script catalog for tool description
-    _scripts_catalog_parts = []
-    for _sk_name, _sk_meta in registry.metadata.items():
-        _sk_scripts = registry.list_scripts(_sk_name)
-        if _sk_scripts:
-            _scripts_catalog_parts.append(f"  [{_sk_name}]")
-            for _sc in _sk_scripts:
-                _params_desc = ""
-                if _sc.get("parameters"):
-                    _params_desc = ", ".join(
-                        f"{p['name']}({'required' if p.get('required') else 'optional'})"
-                        for p in _sc["parameters"]
-                    )
-                    _params_desc = f" params: {_params_desc}"
-                _scripts_catalog_parts.append(
-                    f"    - {_sc['name']}: {_sc.get('description', '(no description)')}{_params_desc}"
-                )
-    _scripts_catalog = "\n".join(_scripts_catalog_parts) if _scripts_catalog_parts else "  (no scripts declared)"
-
     def _fuzzy_match_script(requested: str, available: list[str]) -> str | None:
         """Suggest a similar script name using simple prefix/suffix matching."""
         requested_lower = requested.lower()
@@ -474,17 +453,15 @@ def _build_skill_tools(registry: SkillRegistry):
         When to use:
           - Phase 2 / verifier needs a side-effect-free probe that the skill
             author bundled (list_scenarios, check_health, etc.).
-          - Do NOT invent script names — only entries in the catalog below
-            are accepted.
+          - Do NOT invent script names — if unsure which scripts exist,
+            call with any name and the error response lists all available
+            scripts for that skill.
 
         Inputs:
           - skill_name: owning skill of the script.
           - script_name: filename exactly as listed (e.g. "list_scenarios.py").
           - params: CLI arg string (e.g. "--namespace default").
           - timeout: seconds; 0 = use default 60s.
-
-        Available scripts by skill:
-        {_scripts_catalog}
 
         Output: stdout from the script, or "Error:" with available names +
                 a fuzzy-match suggestion when the script is unknown.
@@ -521,19 +498,6 @@ def _build_skill_tools(registry: SkillRegistry):
             )
         except Exception as e:
             return f"Error executing script '{script_name}' from skill '{skill_name}': {e}"
-
-    # Replace docstring placeholders with actual content so the LLM
-    # sees the real listing rather than literal placeholder text.
-    # Use str.replace (not str.format) because names may contain
-    # "{" or "}" which would crash str.format.
-    # PATD: activate_skill uses {skill_names_str} (name list only,
-    # not full catalog), set via .replace like {catalog} before.
-    activate_skill.description = activate_skill.description.replace(
-        "{skill_names_str}", skill_names_str
-    )
-    execute_skill_script.description = execute_skill_script.description.replace(
-        "{_scripts_catalog}", _scripts_catalog
-    )
 
     return [activate_skill, read_skill_resource, read_file, write_file, save_fault_plan, finish_planning, propose_plan_change, execute_skill_script]
 
@@ -584,13 +548,14 @@ async def create_agent(
     # intent_clarification is a pre-planning stage; only read-only inspection
     # is appropriate. Full kubectl was the bypass vector in sess_1e39e8f4dcce
     # where the LLM called `kubectl scale` to directly mutate kube-system.
-    from chaos_agent.agent.nodes.intent_clarification import submit_fault_intent, query_active_experiments
+    from chaos_agent.agent.nodes.intent_clarification import submit_fault_intent, submit_batch_intent, query_active_experiments
 
     clarification_tools = [
         kubectl_ro,
         _activate_skill,
         _read_skill_resource,
         submit_fault_intent,
+        submit_batch_intent,
         query_active_experiments,
     ]
     if mcp_manager is not None:
@@ -684,17 +649,20 @@ async def create_agent(
         _execute_skill_script,
         read_knowledge_resource,
         submit_verification,
+        time_wait,
     ]
     if mcp_manager is not None:
         verifier_tools = verifier_tools + mcp_manager.tools_for_phase("verifier")
 
     from chaos_agent.agent.nodes._verifier_submit import submit_recover_verification
     recover_verifier_tools = [
+        kubectl,
         kubectl_verify,
         _read_skill_resource,
         _execute_skill_script,
         read_knowledge_resource,
         submit_recover_verification,
+        time_wait,
     ]
     if mcp_manager is not None:
         # Recover verifier shares the same MCP attach_to as the inject
@@ -842,16 +810,26 @@ async def create_agent(
     from chaos_agent.observability.tracer import init_tracer
     await init_tracer()
 
-    # Build and compile inject graph
-    inject_graph = build_inject_graph(
+    # Build and compile Intent Graph (dialogue layer)
+    from chaos_agent.agent.graph import build_intent_graph
+    intent_graph = build_intent_graph(
+        clarification_tools=clarification_tools,
+        llm=llm,
+        registry=registry,
+        pre_reason_hook=pre_reason_hook,
+    )
+    intent_compiled = intent_graph.compile(checkpointer=checkpointer)
+
+    # Build and compile Pipeline Graph (execution layer)
+    from chaos_agent.agent.graph import build_pipeline_graph
+    pipeline_graph = build_pipeline_graph(
         phase1_tools, phase2_tools,
         verifier_tools=verifier_tools,
-        pre_reason_hook=pre_reason_hook, llm=llm,
-        skill_catalog=registry.build_catalog_prompt(),
-        registry=registry,
         clarification_tools=clarification_tools,
+        pre_reason_hook=pre_reason_hook, llm=llm,
+        registry=registry,
     )
-    inject_compiled = inject_graph.compile(checkpointer=checkpointer)
+    pipeline_compiled = pipeline_graph.compile(checkpointer=checkpointer)
 
     # Build and compile recover graph
     recover_graph = build_recover_graph(
@@ -865,18 +843,13 @@ async def create_agent(
     )
 
     return {
-        "inject": inject_compiled,
+        "intent": intent_compiled,
+        "pipeline": pipeline_compiled,
         "recover": recover_compiled,
         "checkpointer": checkpointer,
-        "checkpointer_conn": conn,  # aiosqlite connection for cleanup
+        "checkpointer_conn": conn,
         "session_store": session_store,
         "skill_registry": registry,
-        # Manual /compact (TUI ``commands._compact_thread`` and server
-        # ``/api/v1/sessions/{sid}/compact``) now runs the SAME
-        # PreReasoningHook the auto-trigger uses, just with force=True.
-        # Exposing the live LLM and the hook here is what lets those
-        # callers reuse the single unified compaction pipeline instead
-        # of re-implementing it.
         "llm": llm,
         "pre_reason_hook": pre_reason_hook,
     }

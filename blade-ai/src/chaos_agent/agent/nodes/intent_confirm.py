@@ -20,7 +20,6 @@ from langchain_core.messages import RemoveMessage, SystemMessage
 from langgraph.types import interrupt
 
 from chaos_agent.agent.fault_spec import read_fault_spec
-from chaos_agent.agent.nodes.intent_clarification import bootstrap_task_session
 from chaos_agent.agent.state import AgentState
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
 
@@ -76,19 +75,24 @@ def _build_handoff_summary(fault_intent: dict, dialogue_round: int) -> SystemMes
 
 
 def _build_trim_remove_list(messages: list) -> list[RemoveMessage]:
-    """Build the RemoveMessage list that drops everything except the
-    last ``_TRIM_TAIL_KEEP`` messages.
+    """Build the RemoveMessage list that drops old dialogue messages
+    while preserving ``[Task Summary]`` and ``[Compressed History]``
+    markers.
 
-    Mirrors the pre-Option-A trim logic verbatim — the only behavioural
-    difference is *when* it runs (post-approval here vs at intent
-    convergence in the old design). Messages without an ``id`` are
-    silently skipped because ``RemoveMessage`` is keyed on id; this
-    matches LangGraph's add_messages reducer contract.
+    Task summaries record previous inject/recover results — the LLM
+    needs them to answer "what happened last time?" across multiple
+    tasks in the same session. Compressed history summaries are the
+    output of PreReasoningHook's LLM compaction and must survive
+    trimming for the same reason.
     """
     if len(messages) <= _TRIM_TAIL_KEEP:
         return []
+    _PRESERVE_PREFIXES = ("[Task Summary]", "[Compressed History]")
     remove_list: list[RemoveMessage] = []
     for msg in messages[:-_TRIM_TAIL_KEEP]:
+        content = getattr(msg, "content", "") or ""
+        if any(content.startswith(p) for p in _PRESERVE_PREFIXES):
+            continue
         msg_id = getattr(msg, "id", None)
         if msg_id:
             remove_list.append(RemoveMessage(id=msg_id))
@@ -96,44 +100,21 @@ def _build_trim_remove_list(messages: list) -> list[RemoveMessage]:
 
 
 def _commit_inject_handoff(state: AgentState, fault_intent: dict) -> dict:
-    """Run the inject pipeline handoff side effects (trim + bootstrap +
-    summary) and produce the state delta to return.
+    """Run the inject pipeline handoff and produce the state delta.
 
-    Shared by the ``approved`` and ``dry_run`` branches of
-    ``intent_confirm`` — both commit to running the inject pipeline,
-    just at different points in the user's mental model (explicit Y/N
-    vs. ``/plan`` preview).
-
-    What this function does:
-      1. Builds the ``[Intent Clarification Summary]`` SystemMessage
-         marking the dialogue→execution boundary.
-      2. Builds a ``RemoveMessage`` list dropping everything except the
-         last ``_TRIM_TAIL_KEEP`` messages.
-      3. Calls ``bootstrap_task_session`` to register the ``task_id``
-         with the global SessionStore and seed the on-disk task file
-         with the summary as the first entry.
-
-    The trim was previously performed inside ``intent_clarification``
-    on intent convergence, regardless of whether the user later
-    approved. Moving it here means a user-initiated rejection at the
-    confirm gate keeps the full clarification dialogue intact, so the
-    next conversational turn can pick up where it left off instead of
-    forcing the agent to re-establish facts from scratch.
+    Dual-graph model: ``handoff_summary`` is read by the Runner to
+    seed Pipeline Graph messages. bootstrap_task_session is called
+    by the Runner layer, not here.
     """
     messages = state.get("messages", [])
     dialogue_round = int(state.get("dialogue_round") or 0)
     summary_msg = _build_handoff_summary(fault_intent, dialogue_round)
     remove_list = _build_trim_remove_list(messages)
 
-    op_task_id = state.get("task_id", "") or ""
-    if op_task_id:
-        bootstrap_task_session(
-            op_task_id,
-            operation="inject",
-            tui_session_id=state.get("tui_session_id", "") or "",
-            handoff_message=summary_msg,
-        )
-    return {"messages": remove_list + [summary_msg]}
+    return {
+        "messages": remove_list,
+        "handoff_summary": summary_msg.content,
+    }
 
 
 async def intent_confirm(state: AgentState) -> dict:
@@ -206,7 +187,18 @@ async def intent_confirm(state: AgentState) -> dict:
     #                                user once for clarification; UI
     #                                can show "round N of N" so the
     #                                user knows we're iterating.
-    summary = _format_intent_summary(fault_intent)
+    batch_args = state.get("batch_submit_args")
+    if batch_args and isinstance(batch_args, dict) and batch_args.get("faults"):
+        batch_faults = batch_args["faults"]
+        batch_lines = [f"批量故障注入: {len(batch_faults)} 个故障 (串行执行)"]
+        for i, f in enumerate(batch_faults, 1):
+            batch_lines.append(
+                f"  {i}. {f.get('scope','')}-{f.get('target','')}-{f.get('action','')} "
+                f"@ {f.get('namespace','')}/{', '.join(f.get('names', [])) or '*'}"
+            )
+        summary = "\n".join(batch_lines)
+    else:
+        summary = _format_intent_summary(fault_intent)
     confirmation_info = {
         "type": "intent_confirm",
         "fault_intent": fault_intent,
@@ -214,6 +206,7 @@ async def intent_confirm(state: AgentState) -> dict:
         "intent_confidence": intent_confidence,
         "intent_reasoning": state.get("intent_reasoning") or "",
         "clarification_round": int(state.get("clarification_round") or 0),
+        "batch_faults": batch_args.get("faults") if batch_args else None,
     }
 
     # Interrupt: TUI renders the summary and collects Y/N

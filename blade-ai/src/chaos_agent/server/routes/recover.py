@@ -50,7 +50,7 @@ async def recover_fault(request: RecoverRequest, req: Request):
 
     try:
         # Get current state from inject graph checkpoint
-        current_state = await agents["inject"].aget_state(config)
+        current_state = await agents["pipeline"].aget_state(config)
         if not current_state or not current_state.values:
             return JSONEnvelope.fail(code=ResponseCode.TASK_NOT_FOUND, message=f"Task not found: {inject_task_id}", request_id=req_id)
 
@@ -95,8 +95,11 @@ async def recover_fault(request: RecoverRequest, req: Request):
             "kubectl_exec_pod_name": state_values.get("kubectl_exec_pod_name"),
             "created_at": state_values.get("created_at", ""),  # Preserve inject's created_at
             "verifier_loop_count": 0,
-            "verification": None,       # Clear inject graph's verification
-            "recover_verification": None,  # Clear stale recover verification
+            "verification": None,
+            "recover_verification": None,
+            "error": None,
+            "failure_reason": None,
+            "failure_detail": None,
             "messages": [],             # Clear inject graph's conversation
             "inject_layer1_cache": None,   # Clear inject layer1 cache
             "recover_layer1_cache": None,  # Clear stale recover layer1 cache

@@ -27,6 +27,7 @@ import logging
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from chaos_agent.agent.fault_spec import read_fault_spec
+from chaos_agent.memory.session_store import get_global_session_store
 from chaos_agent.agent.node_names import FINALIZE_VERIFICATION, VERIFIER
 from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
@@ -204,6 +205,44 @@ def _last_ai_text(messages: list) -> str:
         if content:
             return content if isinstance(content, str) else str(content)
     return ""
+
+
+def _format_verification_detail(verification: dict, layer1) -> str:
+    """Format verification verdict as readable text for TUI display."""
+    level = verification.get("level", "unknown")
+    l2 = verification.get("layer2", {})
+    l2_status = l2.get("status", "unknown") if isinstance(l2, dict) else "unknown"
+    l2_details = l2.get("details", "") if isinstance(l2, dict) else ""
+    checklist = verification.get("checklist", {})
+    items = checklist.get("items", []) if isinstance(checklist, dict) else []
+    warnings = verification.get("warnings", [])
+
+    icon_map = {"passed": "✓", "failed": "✗", "partial": "◐",
+                "skipped": "○", "recovered_before_observation": "◇"}
+    level_icon = {"verified": "✓", "partial": "◐", "unverified": "✗"}.get(level, "·")
+
+    lines = [f"{level_icon} Verification: {level} (Layer1: {layer1.status}, Layer2: {l2_status})"]
+
+    if l2_details:
+        lines.append(f"  {l2_details}")
+
+    if items:
+        lines.append("")
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            step = item.get("step", "?")
+            st = item.get("status", "?")
+            ev = item.get("evidence", "")
+            icon = icon_map.get(st, "·")
+            lines.append(f"  {icon} Step {step}: {st} — {ev}")
+
+    if warnings:
+        lines.append("")
+        for w in warnings:
+            lines.append(f"  ⚠ {w}")
+
+    return "\n".join(lines)
 
 
 def make_finalize_verification(registry=None):
@@ -545,6 +584,19 @@ def make_finalize_verification(registry=None):
         if warnings:
             status_msg += f" | warnings: {'; '.join(warnings)}"
         tracker.complete(status_msg)
+
+        # Write verification detail to session store as plain text.
+        # Renders in the TUI conversation stream between the tool card
+        # and ResultCard — not inside any card or tool box, no line limit.
+        _store = get_global_session_store()
+        if _store and task_id:
+            detail_text = _format_verification_detail(verification, layer1)
+            if detail_text:
+                _store.append_messages(
+                    task_id,
+                    [HumanMessage(content=f"[Verification Result]\n{detail_text}")],
+                    node_name="finalize_verification",
+                )
 
         # Programmatic debug-pod cleanup (moved here; dedup preserved).
         await _cleanup_debug_pods(state, kubeconfig, task_id, result_update)

@@ -57,22 +57,20 @@ class TestBuildSkillTools:
     def test_activate_skill_catalog_placeholder_resolved(self, mock_registry):
         """activate_skill description must not contain literal placeholders.
 
-        PATD: {catalog} replaced with {skill_names_str} (name list only,
-        not full descriptions). Both must be resolved at build time.
+        Skill names are no longer frozen into the description — the LLM
+        reads them from the dynamic Skill Index in the system prompt.
         """
         tools = _build_skill_tools(mock_registry)
         activate_tool = next(t for t in tools if t.name == "activate_skill")
         assert "{skill_names_str}" not in activate_tool.description
         assert "{catalog}" not in activate_tool.description
-        # PATD: skill names (not full descriptions) are in the docstring
-        assert "test-skill" in activate_tool.description
+        assert "available" in activate_tool.description.lower()
 
-    def test_execute_skill_script_catalog_placeholder_resolved(self, mock_registry):
-        """execute_skill_script description must not contain literal '{_scripts_catalog}'."""
+    def test_execute_skill_script_no_frozen_placeholder(self, mock_registry):
+        """execute_skill_script description must not contain frozen placeholders."""
         tools = _build_skill_tools(mock_registry)
         execute_tool = next(t for t in tools if t.name == "execute_skill_script")
         assert "{_scripts_catalog}" not in execute_tool.description
-        assert "Available scripts" in execute_tool.description
 
 
 class TestCreateAgent:
@@ -89,7 +87,7 @@ class TestCreateAgent:
             checkpointer=False,
         )
 
-        assert "inject" in result
+        assert "pipeline" in result
         assert "recover" in result
         assert "checkpointer" in result
 
@@ -100,7 +98,7 @@ class TestCreateAgent:
             checkpointer=False,
         )
 
-        inject = result["inject"]
+        inject = result["pipeline"]
         assert hasattr(inject, "ainvoke")
 
     @pytest.mark.asyncio
@@ -130,7 +128,7 @@ class TestCreateAgent:
             checkpointer=None,
         )
         # Should return a dict with both graphs regardless
-        assert "inject" in result
+        assert "pipeline" in result
         assert "recover" in result
 
         # Close aiosqlite connection to prevent ResourceWarning
@@ -145,7 +143,7 @@ class TestCreateAgent:
             checkpointer=False,
         )
 
-        assert result["inject"] is not None
+        assert result["pipeline"] is not None
         assert result["recover"] is not None
 
 
@@ -262,7 +260,7 @@ class TestPhaseToolSurface:
         result = await create_agent(registry=mock_registry, checkpointer=False)
 
         dead_names = {"web_search", "search_files"}
-        for graph_key in ("inject", "recover"):
+        for graph_key in ("pipeline", "recover"):
             graph = result[graph_key]
             assert graph is not None
             # Walk the compiled graph's nodes and inspect any LLM with bound

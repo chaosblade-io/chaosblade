@@ -128,6 +128,71 @@ def _content_from_interrupt_payload(payload: dict) -> str:
     )
 
 
+def _format_auto_approve_info(node: str, payload: dict) -> str:
+    """Format interrupt payload for auto-mode display (token, not card)."""
+    lines = [f"[Auto-approved: {node}]"]
+
+    if node == "confirmation_gate":
+        fi = payload.get("fault_intent") or {}
+        ft = fi.get("fault_type", "")
+        if ft:
+            lines.append(f"故障: {ft}")
+        target = payload.get("target") or {}
+        ns = target.get("namespace", "")
+        names = target.get("names", [])
+        if ns or names:
+            lines.append(f"目标: {ns}/{', '.join(names) if names else '*'}")
+        params = payload.get("params") or {}
+        if params:
+            lines.append(f"参数: {', '.join(f'{k}={v}' for k, v in params.items() if v)}")
+        safety = payload.get("safety_status", "")
+        if safety:
+            reason = payload.get("safety_checked_detail") or payload.get("safety_reason") or ""
+            lines.append(f"安全: {safety}" + (f" ({reason})" if reason else ""))
+        health = payload.get("target_health_report") or {}
+        if health:
+            lines.append(f"健康: {health.get('overall', '?')} ({health.get('summary', '')})")
+        feas = payload.get("feasibility_report") or {}
+        if feas and feas.get("severity"):
+            lines.append(f"可行性: {feas.get('severity')} ({feas.get('message', '')})")
+        score = payload.get("safety_score") or {}
+        if score:
+            lines.append(f"安全评分: {score.get('overall', '?')}/100 ({score.get('level', '')})")
+    elif node == "plan_change_confirm":
+        reason = payload.get("reason", "")
+        original = payload.get("original") or {}
+        proposed = payload.get("proposed") or {}
+        if original.get("fault_type"):
+            lines.append(f"原方案: {original['fault_type']}")
+        if proposed.get("fault_type"):
+            lines.append(f"新方案: {proposed['fault_type']}")
+        if reason:
+            lines.append(f"原因: {reason}")
+    elif node == "tool_screener":
+        reason = payload.get("reason", "")
+        agent_reason = payload.get("agent_reason", "")
+        original = payload.get("original") or {}
+        proposed = payload.get("proposed") or {}
+        if original:
+            ns = original.get("namespace", "")
+            names = original.get("names", [])
+            lines.append(f"批准目标: {ns}/{', '.join(names) if names else '*'}")
+        if proposed:
+            ns = proposed.get("namespace", "")
+            names = proposed.get("names", [])
+            lines.append(f"实际目标: {ns}/{', '.join(names) if names else '*'}")
+        if reason:
+            lines.append(f"偏移原因: {reason}")
+        if agent_reason:
+            lines.append(f"Agent 解释: {agent_reason}")
+    else:
+        content = _content_from_interrupt_payload(payload)
+        if content:
+            lines.append(content)
+
+    return "\n".join(lines)
+
+
 def _normalise_answer(answer: str) -> str:
     """Normalise a free-text confirmation answer to LangGraph's expected resume token.
 
@@ -351,51 +416,37 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             user_description=body.input or "",
             source=SOURCE_TUI,
         )
+        # Dual-graph model: Intent Graph only needs dialogue-level fields.
+        # Pipeline-level fields (operation, safety_status, created_at)
+        # are set when Pipeline Graph is launched in the dual-graph block.
         initial_state = {
             "task_id": turn_id,
             "tui_session_id": sid,
             "interaction_mode": "tui",
-            "operation": "inject",
             "fault_spec": spec.to_dict(),
-            "needs_confirmation": body.permission_mode == "confirm",
-            "safety_status": "pending",
+            "needs_confirmation": True,
             "kubeconfig": settings.kubeconfig_path,
             "kube_context": settings.kube_context,
-            "created_at": now_iso(),
-            # Phase 3c.2 — pass dry_run through to the agent graph.
-            # ``router.route_after_safety_check`` and
-            # ``confirmation_gate`` already branch on this flag
-            # (state.py declared the field; this wires the request
-            # body to it). False default = legacy ``/run`` semantics.
             "dry_run": body.dry_run,
         }
     else:
+        # Dual-graph model: subsequent turns only reset Intent Graph fields.
+        # Pipeline fields (agent_loop_count, safety_status, etc.) are
+        # irrelevant here — Pipeline Graph starts fresh each time.
         initial_state = {
             "task_id": turn_id,
             "input": body.input,
             "confirmed_intent": "unset",
             "intent_confidence": 0.0,
-            "recover_task_id": "",
-            "safety_status": "pending",
-            "agent_loop_count": 0,
-            "execute_loop_count": 0,
-            "verifier_loop_count": 0,
-            "error": None,
-            "failure_reason": None,
-            "replan_requested": False,
-            "replan_count": 0,
-            "replan_context": None,
-            # Re-assert dry_run per turn — the checkpointer would
-            # otherwise carry the previous turn's value forward, so
-            # ``/run`` after ``/plan`` would silently inherit dry_run
-            # and never actually inject. Always set to body's value.
             "dry_run": body.dry_run,
         }
     config = {
         "configurable": {"thread_id": thread_id},
         "recursion_limit": settings.recursion_limit,
     }
-    graph = agents["inject"]
+    intent_graph = agents["intent"]
+    pipeline_graph = agents["pipeline"]
+    graph = intent_graph  # Phase 1: Intent Graph
 
     # Memory-compaction status pipeline (Phase 4 / 4a).
     #
@@ -612,7 +663,25 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                 except asyncio.CancelledError:
                     pass
 
+    # Display Store sidewrite — capture all events for full session recovery.
+    from chaos_agent.memory.tui_session_store import get_global_tui_session_store as _get_tui_store
+
+    def _sidewrite(evt: StreamEvent, source: str = "pipeline") -> None:
+        try:
+            _ts = _get_tui_store()
+            if _ts is not None and sid:
+                _ts.append_event(sid, {
+                    "ts": evt.timestamp,
+                    "source": source,
+                    "task_id": evt.task_id or "",
+                    "event_type": evt.type,
+                    "data": evt.to_dict(),
+                })
+        except Exception:
+            pass
+
     async def event_generator():
+        nonlocal graph, config
         from chaos_agent.observability.otel_genai import get_task_span_manager
         from chaos_agent.observability import status_tracker as _st_mod
         _tsm = get_task_span_manager()
@@ -629,6 +698,18 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             _tsm.start_task_span(turn_id)
             if _otel_cb is not None:
                 _otel_cb.set_task_id(turn_id)
+            try:
+                _ts = _get_tui_store()
+                if _ts is not None and sid:
+                    _ts.append_event(sid, {
+                        "ts": now_iso(),
+                        "source": "user",
+                        "task_id": turn_id,
+                        "event_type": "user_input",
+                        "data": {"content": body.input},
+                    })
+            except Exception:
+                pass
             # 1. Stream the initial graph invocation, with memory-
             #    compaction status events merged in concurrently
             #    (see _merged_stream comment above).
@@ -642,6 +723,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                     evt = parse_stream_event(payload)
                     if evt is not None:
                         evt.task_id = turn_id
+                        _sidewrite(evt)
                         for sse in batcher.feed(evt):
                             yield sse
                 elif kind == "status":
@@ -649,12 +731,15 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                         yield sse
                     compaction_evt = _convert_compaction_status(payload)
                     if compaction_evt is not None:
+                        _sidewrite(compaction_evt)
                         yield compaction_evt.to_sse()
                     ctx_evt = _convert_context_size_status(payload)
                     if ctx_evt is not None:
+                        _sidewrite(ctx_evt)
                         yield ctx_evt.to_sse()
                     pm_evt = _convert_postmortem_status(payload)
                     if pm_evt is not None:
+                        _sidewrite(pm_evt)
                         yield pm_evt.to_sse()
             for sse in batcher.flush():
                 yield sse
@@ -692,13 +777,15 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                 # can render fielded forms (intent fields vs plan
                 # fields). ``content`` keeps a pre-formatted string for
                 # v1 clients that don't read ``payload``.
-                yield StreamEvent(
+                _confirm_evt = StreamEvent(
                     type="confirm",
                     content=_content_from_interrupt_payload(payload),
                     node=interrupted_node,
                     task_id=turn_id,
                     payload=payload,
-                ).to_sse()
+                )
+                _sidewrite(_confirm_evt)
+                yield _confirm_evt.to_sse()
 
                 # interrupt_id == turn_id. Future is set by
                 # /sessions/:id/interrupt. We bound the wait so a
@@ -732,11 +819,13 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                     if remaining <= 0:
                         store.cancel_interrupt(turn_id)
                         minutes = settings.confirm_wait_timeout // 60
-                        yield StreamEvent(
+                        _timeout_evt = StreamEvent(
                             type="error",
                             content=f"Confirmation timed out ({minutes} min)",
                             task_id=turn_id,
-                        ).to_sse()
+                        )
+                        _sidewrite(_timeout_evt)
+                        yield _timeout_evt.to_sse()
                         yield StreamEvent(type="done", task_id=turn_id).to_sse()
                         return
                     slice_s = min(_CONFIRM_KEEPALIVE_INTERVAL_S, remaining)
@@ -758,6 +847,19 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                     normalised = answer
                 else:
                     normalised = _normalise_answer(answer)
+
+                try:
+                    _ts = _get_tui_store()
+                    if _ts is not None and sid:
+                        _ts.append_event(sid, {
+                            "ts": now_iso(),
+                            "source": "user",
+                            "task_id": turn_id,
+                            "event_type": "confirm_answer",
+                            "data": {"content": normalised},
+                        })
+                except Exception:
+                    pass
 
                 # Resume the graph. The next astream_events run drains
                 # tokens / tool / phase events until either the next
@@ -785,6 +887,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                         evt = parse_stream_event(payload)
                         if evt is not None:
                             evt.task_id = turn_id
+                            _sidewrite(evt)
                             for sse in batcher.feed(evt):
                                 yield sse
                     elif kind == "status":
@@ -792,15 +895,448 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                             yield sse
                         compaction_evt = _convert_compaction_status(payload)
                         if compaction_evt is not None:
+                            _sidewrite(compaction_evt)
                             yield compaction_evt.to_sse()
                         ctx_evt = _convert_context_size_status(payload)
                         if ctx_evt is not None:
+                            _sidewrite(ctx_evt)
                             yield ctx_evt.to_sse()
                 for sse in batcher.flush():
                     yield sse
 
-            # 2.5 Auto-recover: when inject_graph classified recover intent
-            #     with a confirmed target, invoke recover_graph and stream it.
+            # 2.5 Dual-graph: if Intent Graph confirmed inject, launch Pipeline Graph
+            _intent_final = await graph.aget_state(config)
+            _iv = _intent_final.values if _intent_final else {}
+            _confirmed = _iv.get("confirmed_intent")
+
+            # Batch inject → launch Pipeline Graph with batch_submit_args
+            if (
+                _confirmed == "batch_inject"
+                and _iv.get("batch_submit_args")
+                and not _intent_final.next
+            ):
+                _p_task_id = f"task-{uuid4().hex[:12]}"
+                _tui_sid = _iv.get("tui_session_id", "") or sid
+                _handoff = _iv.get("handoff_summary", "")
+
+                from langchain_core.messages import SystemMessage as _SM
+
+                _p_config = {
+                    "configurable": {"thread_id": _p_task_id},
+                    "recursion_limit": settings.recursion_limit,
+                }
+                _p_input = {
+                    "task_id": _p_task_id,
+                    "tui_session_id": _tui_sid,
+                    "operation": "inject",
+                    "interaction_mode": "tui",
+                    "kubeconfig": settings.kubeconfig_path,
+                    "kube_context": settings.kube_context,
+                    "batch_submit_args": _iv.get("batch_submit_args"),
+                    "fault_spec": _iv.get("fault_spec"),
+                    "needs_confirmation": True,
+                    "messages": [_SM(content=_handoff)] if _handoff else [],
+                    "created_at": now_iso(),
+                    "dry_run": False,
+                }
+
+                # Stream Pipeline Graph (batch_setup → agent_loop → full pipeline per fault)
+                async for kind, payload in _merged_stream(
+                    pipeline_graph.astream_events(_p_input, _p_config, version="v2"),
+                ):
+                    if await req.is_disconnected():
+                        break
+                    if kind == "graph":
+                        evt = parse_stream_event(payload)
+                        if evt is not None:
+                            evt.task_id = turn_id
+                            _sidewrite(evt)
+                            for sse in batcher.feed(evt):
+                                yield sse
+                    elif kind == "status":
+                        for sse in batcher.flush():
+                            yield sse
+                        compaction_evt = _convert_compaction_status(payload)
+                        if compaction_evt is not None:
+                            _sidewrite(compaction_evt)
+                            yield compaction_evt.to_sse()
+                        ctx_evt = _convert_context_size_status(payload)
+                        if ctx_evt is not None:
+                            _sidewrite(ctx_evt)
+                            yield ctx_evt.to_sse()
+                for sse in batcher.flush():
+                    yield sse
+
+                # Handle interrupts (confirmation_gate for each batch fault).
+                while True:
+                    _bp_cur = await pipeline_graph.aget_state(_p_config)
+                    if not (_bp_cur and _bp_cur.next):
+                        break
+                    _bp_pending = _extract_pending_interrupt(_bp_cur)
+                    if _bp_pending is None:
+                        break
+                    _bp_node, _bp_payload = _bp_pending
+
+                    _bp_auto = body.permission_mode != "confirm"
+                    if _bp_auto and _bp_node in ("confirmation_gate", "plan_change_confirm", "tool_screener"):
+                        # Auto mode: show info as token (read-only) instead of
+                        # confirm (which triggers TUI waiting_confirmation state).
+                        _bp_info_evt = StreamEvent(
+                            type="token",
+                            content=f"\n{_format_auto_approve_info(_bp_node, _bp_payload)}\n",
+                            task_id=turn_id,
+                        )
+                        _sidewrite(_bp_info_evt)
+                        yield _bp_info_evt.to_sse()
+                        _bp_normalised = "approved"
+                    else:
+                        _bp_confirm_evt = StreamEvent(
+                            type="confirm",
+                            content=_content_from_interrupt_payload(_bp_payload),
+                            node=_bp_node, task_id=turn_id,
+                            payload=_bp_payload,
+                        )
+                        _sidewrite(_bp_confirm_evt)
+                        yield _bp_confirm_evt.to_sse()
+
+                        _bp_fut = store.register_interrupt(turn_id)
+                        _bp_deadline = asyncio.get_event_loop().time() + settings.confirm_wait_timeout
+                        _bp_answer = ""
+                        _bp_timed_out = False
+                        while True:
+                            _bp_remaining = _bp_deadline - asyncio.get_event_loop().time()
+                            if _bp_remaining <= 0:
+                                store.cancel_interrupt(turn_id)
+                                _bp_timed_out = True
+                                break
+                            _bp_slice = min(_CONFIRM_KEEPALIVE_INTERVAL_S, _bp_remaining)
+                            try:
+                                _bp_answer = await asyncio.wait_for(
+                                    asyncio.shield(_bp_fut), timeout=_bp_slice,
+                                )
+                                break
+                            except asyncio.TimeoutError:
+                                yield ": keepalive\n\n"
+                                continue
+                        if _bp_timed_out:
+                            break
+                        if _bp_node == "plan_builder":
+                            _bp_normalised = _bp_answer
+                        else:
+                            _bp_normalised = _normalise_answer(_bp_answer)
+
+                    try:
+                        _bp_ts = _get_tui_store()
+                        if _bp_ts is not None and sid:
+                            _bp_ts.append_event(sid, {
+                                "ts": now_iso(), "source": "user",
+                                "task_id": turn_id, "event_type": "confirm_answer",
+                                "data": {"content": _bp_normalised},
+                            })
+                    except Exception:
+                        pass
+
+                    async for kind, payload in _merged_stream(
+                        pipeline_graph.astream_events(
+                            Command(resume=_bp_normalised), _p_config, version="v2",
+                        ),
+                    ):
+                        if await req.is_disconnected():
+                            break
+                        if kind == "graph":
+                            evt = parse_stream_event(payload)
+                            if evt is not None:
+                                evt.task_id = turn_id
+                                _sidewrite(evt)
+                                for sse in batcher.feed(evt):
+                                    yield sse
+                        elif kind == "status":
+                            for sse in batcher.flush():
+                                yield sse
+                    for sse in batcher.flush():
+                        yield sse
+
+                # Batch post-processing: register task_ids + write summary
+                _bp_final = await pipeline_graph.aget_state(_p_config)
+                _bpv = _bp_final.values if _bp_final else {}
+                _batch_results = _bpv.get("batch_results") or []
+
+                for _br in _batch_results:
+                    _br_tid = _br.get("task_id", "")
+                    if _br_tid:
+                        store.add_task(sid, _br_tid)
+                        _br_tui = _get_tui_store()
+                        if _br_tui is not None:
+                            try:
+                                _br_tui.add_task(sid, _br_tid)
+                            except Exception:
+                                pass
+
+                # Batch summary → Intent Graph + aggregated postmortem file
+                if _batch_results:
+                    # 1. Aggregate per-fault postmortems into one batch report
+                    _batch_pm_path_str = ""
+                    try:
+                        from pathlib import Path
+                        _pm_dir = Path(settings.resolved_memory_dir).parent / "postmortems"
+                        _pm_sections = [
+                            f"# 批量故障注入分析报告\n",
+                            f"共 {len(_batch_results)} 个故障\n",
+                        ]
+                        for _bi, _br in enumerate(_batch_results):
+                            _br_tid = _br.get("task_id", "")
+                            _br_ft = _br.get("fault_type", "unknown")
+                            _br_ts = _br.get("task_state", "unknown")
+                            _pm = _br.get("postmortem")
+                            _pm_sections.append(f"---\n\n## 故障 {_bi+1}: {_br_ft} → {_br_ts}\n")
+                            _pm_sections.append(f"task_id: `{_br_tid}`\n")
+                            if _pm and isinstance(_pm, dict) and _pm.get("markdown"):
+                                _pm_sections.append(_pm["markdown"])
+                            else:
+                                _pm_path = _pm_dir / f"{_br_tid}.md" if _br_tid else None
+                                if _pm_path and _pm_path.exists():
+                                    _pm_sections.append(_pm_path.read_text(encoding="utf-8"))
+                                else:
+                                    _pm_sections.append("*事后分析未生成*\n")
+
+                        _batch_pm_file = _pm_dir / f"batch-{turn_id}.md"
+                        _pm_dir.mkdir(parents=True, exist_ok=True)
+                        _batch_pm_file.write_text("\n".join(_pm_sections), encoding="utf-8")
+                        _batch_pm_path_str = str(_batch_pm_file)
+
+                        _pm_evt = StreamEvent(
+                            type="token",
+                            content=f"\n📝 批量分析报告: {_batch_pm_path_str}\n",
+                            task_id=turn_id,
+                        )
+                        _sidewrite(_pm_evt)
+                        yield _pm_evt.to_sse()
+                    except Exception:
+                        logger.warning("Failed to write batch postmortem report", exc_info=True)
+
+                    # 2. Write summary + report path to Intent Graph (single write)
+                    try:
+                        _bs_parts = [f"[Batch Summary] {len(_batch_results)} faults"]
+                        for _bi, _br in enumerate(_batch_results):
+                            _bs_ok = _br.get("task_state") in ("injected",)
+                            _bs_parts.append(
+                                f"  {_bi+1}. {_br.get('fault_type','')} "
+                                f"→ {_br.get('task_state','unknown')} "
+                                f"{'✓' if _bs_ok else '✗'} "
+                                f"(task={_br.get('task_id','')})"
+                            )
+                        if _batch_pm_path_str:
+                            _bs_parts.append(f"批量分析报告: {_batch_pm_path_str}")
+                        from langchain_core.messages import SystemMessage as _BsSM
+                        await intent_graph.aupdate_state(
+                            {"configurable": {"thread_id": thread_id},
+                             "recursion_limit": settings.recursion_limit},
+                            {
+                                "messages": [_BsSM(content="\n".join(_bs_parts))],
+                                "batch_submit_args": None,
+                            },
+                            as_node="save_dialogue",
+                        )
+                    except Exception:
+                        logger.warning("Failed to write batch summary to Intent Graph", exc_info=True)
+
+            elif (
+                _confirmed == "inject"
+                and _iv.get("fault_spec")
+                and not _intent_final.next
+            ):
+                _p_task_id = _iv.get("task_id", f"task-{uuid4().hex[:12]}")
+                _handoff = _iv.get("handoff_summary", "")
+                _tui_sid = _iv.get("tui_session_id", "") or sid
+
+                from chaos_agent.agent.nodes.intent_clarification import bootstrap_task_session
+                from langchain_core.messages import SystemMessage as _SM
+                if _p_task_id:
+                    bootstrap_task_session(
+                        _p_task_id, operation="inject",
+                        tui_session_id=_tui_sid,
+                        handoff_message=_SM(content=_handoff) if _handoff else None,
+                    )
+
+                _p_config = {
+                    "configurable": {"thread_id": _p_task_id},
+                    "recursion_limit": settings.recursion_limit,
+                }
+                _p_input = {
+                    "task_id": _p_task_id,
+                    "tui_session_id": _tui_sid,
+                    "operation": "inject",
+                    "confirmed_intent": "inject",
+                    "fault_spec": _iv.get("fault_spec"),
+                    "needs_confirmation": True,
+                    "interaction_mode": "tui",
+                    "kubeconfig": settings.kubeconfig_path,
+                    "kube_context": settings.kube_context,
+                    "messages": [_SM(content=_handoff)] if _handoff else [],
+                    "safety_status": "pending",
+                    "created_at": now_iso(),
+                    "dry_run": body.dry_run,
+                }
+
+                # Stream Pipeline Graph with merged status
+                async for kind, payload in _merged_stream(
+                    pipeline_graph.astream_events(_p_input, _p_config, version="v2"),
+                ):
+                    if await req.is_disconnected():
+                        return
+                    if kind == "graph":
+                        evt = parse_stream_event(payload)
+                        if evt is not None:
+                            evt.task_id = turn_id
+                            _sidewrite(evt)
+                            for sse in batcher.feed(evt):
+                                yield sse
+                    elif kind == "status":
+                        for sse in batcher.flush():
+                            yield sse
+                        compaction_evt = _convert_compaction_status(payload)
+                        if compaction_evt is not None:
+                            _sidewrite(compaction_evt)
+                            yield compaction_evt.to_sse()
+                        ctx_evt = _convert_context_size_status(payload)
+                        if ctx_evt is not None:
+                            _sidewrite(ctx_evt)
+                            yield ctx_evt.to_sse()
+                for sse in batcher.flush():
+                    yield sse
+
+                # Handle Pipeline Graph interrupts (confirmation_gate)
+                while True:
+                    _p_cur = await pipeline_graph.aget_state(_p_config)
+                    if not (_p_cur and _p_cur.next):
+                        break
+                    _p_pending = _extract_pending_interrupt(_p_cur)
+                    if _p_pending is None:
+                        break
+                    _p_node, _p_payload = _p_pending
+
+                    _p_auto = body.permission_mode != "confirm"
+                    if _p_auto and _p_node in ("confirmation_gate", "plan_change_confirm", "tool_screener"):
+                        _p_info_evt = StreamEvent(
+                            type="token",
+                            content=f"\n{_format_auto_approve_info(_p_node, _p_payload)}\n",
+                            task_id=turn_id,
+                        )
+                        _sidewrite(_p_info_evt)
+                        yield _p_info_evt.to_sse()
+                        _p_normalised = "approved"
+                    else:
+                        _p_confirm_evt = StreamEvent(
+                            type="confirm",
+                            content=_content_from_interrupt_payload(_p_payload),
+                            node=_p_node,
+                            task_id=turn_id,
+                            payload=_p_payload,
+                        )
+                        _sidewrite(_p_confirm_evt)
+                        yield _p_confirm_evt.to_sse()
+
+                        _p_fut = store.register_interrupt(turn_id)
+                        _p_deadline = asyncio.get_event_loop().time() + settings.confirm_wait_timeout
+                        _p_answer = ""
+                        while True:
+                            _p_remaining = _p_deadline - asyncio.get_event_loop().time()
+                            if _p_remaining <= 0:
+                                store.cancel_interrupt(turn_id)
+                                yield StreamEvent(type="error", content="Confirmation timed out", task_id=turn_id).to_sse()
+                                yield StreamEvent(type="done", task_id=turn_id).to_sse()
+                                return
+                            try:
+                                _p_answer = await asyncio.wait_for(asyncio.shield(_p_fut), timeout=min(_CONFIRM_KEEPALIVE_INTERVAL_S, _p_remaining))
+                                break
+                            except asyncio.TimeoutError:
+                                yield ": keepalive\n\n"
+                                continue
+
+                        _p_normalised = _normalise_answer(_p_answer) if _p_node != "plan_builder" else _p_answer
+
+                    try:
+                        _ts2 = _get_tui_store()
+                        if _ts2 is not None and sid:
+                            _ts2.append_event(sid, {
+                                "ts": now_iso(), "source": "user",
+                                "task_id": turn_id, "event_type": "confirm_answer",
+                                "data": {"content": _p_normalised},
+                            })
+                    except Exception:
+                        pass
+
+                    async for kind, payload in _merged_stream(
+                        pipeline_graph.astream_events(
+                            Command(resume=_p_normalised), _p_config, version="v2",
+                        ),
+                    ):
+                        if await req.is_disconnected():
+                            return
+                        if kind == "graph":
+                            evt = parse_stream_event(payload)
+                            if evt is not None:
+                                evt.task_id = turn_id
+                                _sidewrite(evt)
+                                for sse in batcher.feed(evt):
+                                    yield sse
+                        elif kind == "status":
+                            for sse in batcher.flush():
+                                yield sse
+                    for sse in batcher.flush():
+                        yield sse
+
+                # Dry-run (plan_builder path): skip result extraction
+                if body.dry_run:
+                    pass  # plan preview already streamed as tokens
+                else:
+                    # Swap graph/config for result extraction below
+                    graph = pipeline_graph
+                    config = _p_config
+                    store.add_task(sid, _p_task_id)
+
+                    # Write task summary back to Intent Graph
+                    try:
+                        _pfinal_for_summary = await pipeline_graph.aget_state(_p_config)
+                        _psv = _pfinal_for_summary.values if _pfinal_for_summary else {}
+                        _p_ts = infer_task_state(_psv) if _psv else "unknown"
+                        from chaos_agent.agent.fault_spec import read_fault_spec as _rfs
+                        from chaos_agent.agent.state import extract_ui_diagnostics as _ext_diag
+                        from chaos_agent.memory.session_store import build_verification_simple as _bvs
+                        _p_spec = _rfs(_psv) if _psv else None
+                        _p_ft = (_p_spec.fault_type if _p_spec and _p_spec.fault_type else _psv.get("skill_name", ""))
+                        _p_ns = _p_spec.namespace if _p_spec else ""
+                        _p_names = ", ".join(_p_spec.names) if _p_spec and _p_spec.names else ""
+                        _p_uid = _psv.get("blade_uid", "")
+                        _p_verif = _psv.get("verification")
+                        _p_vs = _bvs(_p_verif) if _p_verif else None
+                        _p_diag = _ext_diag(_psv)
+
+                        _p_parts = [
+                            f"[Task Summary] task_id={_p_task_id}",
+                            f"类型: {_p_ft} | 目标: {_p_ns}/{_p_names}",
+                            f"结果: {_p_ts} | blade_uid: {_p_uid}",
+                        ]
+                        if _p_vs:
+                            _p_parts.append(f"验证: {_p_vs.get('level','?')} (L1={_p_vs.get('layer1',{}).get('status','?')}, L2={_p_vs.get('layer2',{}).get('status','?')})")
+                        if _p_diag.get("side_effects_summary"):
+                            _p_parts.append(f"副作用: {_p_diag['side_effects_summary']}")
+                        if _p_diag.get("failure_reason"):
+                            _p_parts.append(f"失败原因: {_p_diag['failure_reason']}")
+                        from langchain_core.messages import SystemMessage as _SummarySM
+                        _summary_text = "\n".join(_p_parts)
+                        await intent_graph.aupdate_state(
+                            {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit},
+                            {"messages": [_SummarySM(content=_summary_text)], "pipeline_task_id": _p_task_id},
+                            as_node="save_dialogue",
+                        )
+                        _tui_s = _get_tui_store()
+                        if _tui_s and sid:
+                            _tui_s.append_dialogue(sid, [_SummarySM(content=_summary_text)])
+                    except Exception:
+                        logger.debug("Failed to write task summary to Intent Graph", exc_info=True)
+
+            # 2.6 Auto-recover: when Intent Graph classified recover intent
             _recover_final = await graph.aget_state(config)
             _rv = _recover_final.values if _recover_final else {}
             _recover_inject_tid = _rv.get("recover_task_id", "")
@@ -823,7 +1359,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                         "recursion_limit": settings.recursion_limit,
                     }
                     try:
-                        _inj_state = await agents["inject"].aget_state(_inj_config)
+                        _inj_state = await agents["pipeline"].aget_state(_inj_config)
                     except Exception:
                         _inj_state = None
                     if _inj_state and _inj_state.values and _inj_state.values.get("blade_uid"):
@@ -855,6 +1391,9 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                             "messages": [],
                             "inject_layer1_cache": None,
                             "recover_layer1_cache": None,
+                            "error": None,
+                            "failure_reason": None,
+                            "failure_detail": None,
                         }
                         recover_config = {
                             "configurable": {"thread_id": _rec_task_id},
@@ -873,6 +1412,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                                 evt = parse_stream_event(payload)
                                 if evt is not None:
                                     evt.task_id = turn_id
+                                    _sidewrite(evt, source="recover")
                                     for sse in batcher.feed(evt):
                                         yield sse
                             elif kind == "status":
@@ -901,11 +1441,13 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                                         "recover task_id disk persist failed "
                                         "sid=%s task=%s", sid, _rec_task_id,
                                     )
-                            yield StreamEvent(
+                            _rec_evt = StreamEvent(
                                 type="result",
                                 content=json.dumps(_rec_result, ensure_ascii=False),
                                 task_id=turn_id,
-                            ).to_sse()
+                            )
+                            _sidewrite(_rec_evt, source="recover")
+                            yield _rec_evt.to_sse()
                     else:
                         # Priority 3: rebuild from task_store (cross-session TUI)
                         _rec_task_id = _rv.get("task_id", f"task-{uuid4().hex[:12]}")
@@ -928,6 +1470,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                                     evt = parse_stream_event(payload)
                                     if evt is not None:
                                         evt.task_id = turn_id
+                                        _sidewrite(evt, source="recover")
                                         for sse in batcher.feed(evt):
                                             yield sse
                                 elif kind == "status":
@@ -955,21 +1498,25 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                                             "recover task_id disk persist failed "
                                             "sid=%s task=%s", sid, _rec_task_id,
                                         )
-                                yield StreamEvent(
+                                _rec_evt2 = StreamEvent(
                                     type="result",
                                     content=json.dumps(_rec_result, ensure_ascii=False),
                                     task_id=turn_id,
-                                ).to_sse()
+                                )
+                                _sidewrite(_rec_evt2, source="recover")
+                                yield _rec_evt2.to_sse()
                         else:
                             logger.warning(
                                 "Auto-recover: no inject state found for %s",
                                 _recover_inject_tid,
                             )
-                            yield StreamEvent(
+                            _no_state_evt = StreamEvent(
                                 type="error",
                                 content=f"无法找到实验 {_recover_inject_tid} 的注入状态，恢复已跳过。",
                                 task_id=turn_id,
-                            ).to_sse()
+                            )
+                            _sidewrite(_no_state_evt)
+                            yield _no_state_evt.to_sse()
 
             # 3. Final-state extraction → ``result`` envelope.
             #    Mirrors inject_stream.py's terminal-state shape so the
@@ -980,7 +1527,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             #    that the inject/recover pipeline allocated for itself
             #    (in intent_clarification on the inject/recover
             #    transition). Turn.py never invents a ``task-`` id.
-            result_payload = await _build_result_payload(
+            result_payload = None if body.dry_run else await _build_result_payload(
                 graph, config, turn_id, turn_started_monotonic
             )
             if result_payload is not None:
@@ -1025,31 +1572,35 @@ async def turn(sid: str, body: TurnRequest, req: Request):
                                 f"task_id disk persist failed sid={sid} "
                                 f"task={op_task_id}: {e}"
                             )
-                yield StreamEvent(
+                _result_evt = StreamEvent(
                     type="result",
                     content=json.dumps(result_payload, ensure_ascii=False),
                     task_id=turn_id,
-                ).to_sse()
+                )
+                _sidewrite(_result_evt)
+                yield _result_evt.to_sse()
 
             # 4. Done terminator.
             yield StreamEvent(type="done", task_id=turn_id).to_sse()
 
         except asyncio.CancelledError:
             logger.info(f"Turn {turn_id} cancelled by client")
-            yield StreamEvent(
-                type="error",
-                content="Turn cancelled",
-                task_id=turn_id,
-            ).to_sse()
+            _cancel_evt = StreamEvent(
+                type="error", content="Turn cancelled", task_id=turn_id,
+            )
+            _sidewrite(_cancel_evt)
+            yield _cancel_evt.to_sse()
             yield StreamEvent(type="done", task_id=turn_id).to_sse()
             raise
         except Exception as e:
             logger.exception(f"Turn failed for {turn_id}")
-            yield StreamEvent(
+            _exc_evt = StreamEvent(
                 type="error",
                 content=f"{type(e).__name__}: {e}",
                 task_id=turn_id,
-            ).to_sse()
+            )
+            _sidewrite(_exc_evt)
+            yield _exc_evt.to_sse()
             yield StreamEvent(type="done", task_id=turn_id).to_sse()
         finally:
             _tsm.end_task_span(turn_id)

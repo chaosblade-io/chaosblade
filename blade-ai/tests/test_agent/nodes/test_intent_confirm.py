@@ -119,20 +119,14 @@ class TestIntentConfirmDecisionRouting:
 
     @pytest.mark.asyncio
     async def test_approved_emits_handoff_summary(self):
-        """After Option A the approved branch is no longer a no-op:
-        it commits the inject-pipeline handoff (trim + summary +
-        bootstrap_task_session). The full mechanics are exercised in
-        ``TestIntentConfirmApprovedHandoff``; here we just pin the
-        existence of the marker so a regression to "return {}"
-        is caught early.
+        """Dual-graph model: approved branch writes handoff_summary
+        (string) instead of appending SystemMessage to messages.
         """
-        with patch.object(ic_mod, "bootstrap_task_session", lambda *_a, **_k: None), \
-             patch.object(ic_mod, "interrupt", return_value="approved"):
+        with patch.object(ic_mod, "interrupt", return_value="approved"):
             result = await intent_confirm(_state())
-        msgs = result.get("messages") or []
-        sys_msgs = [m for m in msgs if isinstance(m, SystemMessage)]
-        assert sys_msgs, "approved branch must emit the IntentClarificationSummary"
-        assert str(sys_msgs[0].content).startswith("[Intent Clarification Summary]")
+        summary = result.get("handoff_summary", "")
+        assert summary, "approved branch must set handoff_summary"
+        assert summary.startswith("[Intent Clarification Summary]")
 
     @pytest.mark.asyncio
     async def test_rejected_clears_confirmed_intent_only(self):
@@ -205,104 +199,47 @@ class TestIntentConfirmApprovedHandoff:
     @pytest.mark.asyncio
     async def test_trim_drops_all_but_last_four(self, monkeypatch):
         monkeypatch.setattr(ic_mod, "interrupt", lambda *_a, **_k: "approved")
-        called: dict = {}
-
-        def fake_bootstrap(op_task_id, *, operation, tui_session_id, handoff_message):
-            called["op_task_id"] = op_task_id
-            called["operation"] = operation
-            called["tui_session_id"] = tui_session_id
-            called["handoff_message"] = handoff_message
-
-        monkeypatch.setattr(ic_mod, "bootstrap_task_session", fake_bootstrap)
 
         # 6 messages — trim window keeps last 4, drops first 2.
         state = _handoff_state(_make_dialogue_messages(6))
         result = await intent_confirm(state)
 
-        # bootstrap_task_session fires exactly once with the inject tag
-        # and the same summary that lands in the messages delta.
-        assert called["op_task_id"] == "task-deadbeef"
-        assert called["operation"] == "inject"
-        assert called["tui_session_id"] == "sess_test"
-        assert isinstance(called["handoff_message"], SystemMessage)
-        assert str(called["handoff_message"].content).startswith(
-            "[Intent Clarification Summary]"
-        )
-
         delta = result.get("messages") or []
         remove_msgs = [m for m in delta if isinstance(m, RemoveMessage)]
-        sys_msgs = [m for m in delta if isinstance(m, SystemMessage)]
         assert len(remove_msgs) == 2
         assert {m.id for m in remove_msgs} == {"m-0", "m-1"}
-        assert len(sys_msgs) == 1
-        # The on-disk seed and the in-memory marker are the same object.
-        assert sys_msgs[0] is called["handoff_message"]
-        # Summary content must reflect the spec actually written in
-        # ``_handoff_state`` (pod-cpu-fullload @ production). A stealth
-        # regression where ``read_fault_spec`` silently returns None
-        # (e.g. wrong state key, broken from_dict) would produce
-        # "Fault: unknown → // @ " here; pinning the composed fault
-        # type string catches that path independently of the prefix.
-        summary_text = str(sys_msgs[0].content)
-        assert "Fault: pod-cpu-fullload" in summary_text
-        assert "pod/cpu/fullload @ production" in summary_text
-        assert "Dialogue rounds: 3" in summary_text
+
+        # handoff_summary carries the summary (not messages)
+        summary = result.get("handoff_summary", "")
+        assert summary.startswith("[Intent Clarification Summary]")
+        assert "Fault: pod-cpu-fullload" in summary
+        assert "pod/cpu/fullload @ production" in summary
+        assert "Dialogue rounds: 3" in summary
 
     @pytest.mark.asyncio
     async def test_short_history_skips_trim_but_emits_summary(self, monkeypatch):
-        """When working memory has ≤4 messages the trim is a no-op,
-        but the summary still lands so downstream consumers always see
-        the dialogue→execution boundary."""
         monkeypatch.setattr(ic_mod, "interrupt", lambda *_a, **_k: "approved")
-        monkeypatch.setattr(ic_mod, "bootstrap_task_session", lambda *_a, **_k: None)
 
         state = _handoff_state(_make_dialogue_messages(2))
         result = await intent_confirm(state)
 
         delta = result.get("messages") or []
         assert [m for m in delta if isinstance(m, RemoveMessage)] == []
-        sys_msgs = [m for m in delta if isinstance(m, SystemMessage)]
-        assert len(sys_msgs) == 1
-        assert str(sys_msgs[0].content).startswith("[Intent Clarification Summary]")
-
-    @pytest.mark.asyncio
-    async def test_missing_task_id_skips_bootstrap(self, monkeypatch):
-        """Defensive: if upstream forgot to allocate a ``task-<hex>``
-        the confirm node still produces the messages delta (so the
-        graph keeps running) but skips ``bootstrap_task_session``
-        rather than passing it an empty id."""
-        monkeypatch.setattr(ic_mod, "interrupt", lambda *_a, **_k: "approved")
-        called: dict = {"n": 0}
-        monkeypatch.setattr(
-            ic_mod, "bootstrap_task_session",
-            lambda *_a, **_k: called.__setitem__("n", called["n"] + 1),
-        )
-
-        state = _handoff_state(_make_dialogue_messages(2))
-        state["task_id"] = ""
-        await intent_confirm(state)
-        assert called["n"] == 0
+        summary = result.get("handoff_summary", "")
+        assert summary.startswith("[Intent Clarification Summary]")
 
 
 class TestIntentConfirmRejectedPreservesDialogue:
     @pytest.mark.asyncio
     async def test_rejection_does_not_touch_messages_or_bootstrap(self, monkeypatch):
-        """The whole point of Option A: rejection leaves the working
-        message list untouched (so the next conversational turn can
-        iterate on already-established context) and produces no on-disk
-        task file (so a discarded intent doesn't leave clutter behind).
+        """Rejection leaves the working message list untouched so the
+        next conversational turn can iterate on established context.
         """
         monkeypatch.setattr(ic_mod, "interrupt", lambda *_a, **_k: "rejected")
-        bootstrap_called: dict = {"n": 0}
-        monkeypatch.setattr(
-            ic_mod, "bootstrap_task_session",
-            lambda *_a, **_k: bootstrap_called.__setitem__("n", bootstrap_called["n"] + 1),
-        )
 
         state = _handoff_state(_make_dialogue_messages(8))
         result = await intent_confirm(state)
 
-        assert bootstrap_called["n"] == 0
         assert "messages" not in result, (
             "rejection must NOT touch messages — dialogue is preserved "
             "so the next turn iterates on established context"
@@ -326,25 +263,18 @@ class TestIntentConfirmDryRunHandoff:
         handoff so the plan preview is generated against the same
         Phase-1 LLM context the real flow would see.
         """
-        called: dict = {"interrupt": 0, "bootstrap": 0}
+        called: dict = {"interrupt": 0}
 
         def fake_interrupt(*_a, **_k):
             called["interrupt"] += 1
             return "should-not-be-used"
 
         monkeypatch.setattr(ic_mod, "interrupt", fake_interrupt)
-        monkeypatch.setattr(
-            ic_mod, "bootstrap_task_session",
-            lambda *_a, **_k: called.__setitem__("bootstrap", called["bootstrap"] + 1),
-        )
 
         state = _handoff_state(_make_dialogue_messages(6), dry_run=True)
         result = await intent_confirm(state)
 
         assert called["interrupt"] == 0, "dry_run must NOT trigger interrupt()"
-        assert called["bootstrap"] == 1, "dry_run must still bootstrap the task session"
 
-        delta = result.get("messages") or []
-        sys_msgs = [m for m in delta if isinstance(m, SystemMessage)]
-        assert len(sys_msgs) == 1
-        assert str(sys_msgs[0].content).startswith("[Intent Clarification Summary]")
+        summary = result.get("handoff_summary", "")
+        assert summary.startswith("[Intent Clarification Summary]")

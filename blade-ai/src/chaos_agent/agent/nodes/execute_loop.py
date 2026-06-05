@@ -423,7 +423,7 @@ async def execute_loop(state: AgentState) -> dict:
     return {"execute_loop_count": count}
 
 
-def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_info=None):
+def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_info=None, registry=None):
     """Create an execute_loop node with optional PreReasoningHook and LLM.
 
     When llm is provided, the node performs actual LLM reasoning
@@ -671,7 +671,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             resolved_env_info = env_info or await compute_env_info(task_id)
             execute_prompt = build_system_prompt(
                 PromptMode.MINIMAL,
-                skill_catalog=skill_catalog,
+                skill_catalog=registry.build_catalog_prompt() if registry else skill_catalog,
                 skill_name=skill_name,
                 plan=plan or "",
                 plan_path=plan_path or "",

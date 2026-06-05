@@ -57,6 +57,7 @@ function mapNodeToStep(
   node: string,
   phase: string,
 ): PhaseName | null {
+  if (node === "batch_setup") return null;
   if (phase === "intent") return "intent";
   if (phase === "verify") return "verify";
   if (phase === "safety") {
@@ -351,7 +352,15 @@ function flushLeadingStable(state: AppState): AppState {
     const isTail = flushCount === len - 1;
     let stable = false;
     if (item.kind === "thinking") {
-      stable = true;
+      // Thinking is always immutable, BUT: don't flush it when the
+      // very next item is a still-streaming tail agent. Ink's renderer
+      // appends "\n" after every Static flush (renderer.js L45); if
+      // thinking lands in Static while agent stays in pending, that
+      // trailing "\n" + agent's marginTop={1} produces a double blank
+      // line between "▸ 思考用时" and "⏺ reply". Keeping them
+      // together in pending avoids the Static/pending boundary gap.
+      const next = state.pending[flushCount + 1];
+      stable = !(next?.kind === "agent" && flushCount + 1 === len - 1);
     } else if (item.kind === "tool_group") {
       stable = item.tools.every((tool) => tool.status !== "running");
     } else if (item.kind === "agent") {
@@ -1317,9 +1326,18 @@ export function reducer(state: AppState, action: Action): AppState {
       //   - The stepper is finalised + appended to pending inside
       //     ``commitPending`` so it lands in scrollback at the end of
       //     the turn block as a phase-progress snapshot.
-      const stepName = mapNodeToStep(action.node, action.phase ?? "");
+      // Batch loop-back: when batch_setup fires, the pipeline is
+      // starting a new fault iteration. Clear the stepper so the
+      // subsequent safety_check NODE_STARTED creates a fresh one
+      // starting from the "safety" phase — otherwise the monotonic
+      // ratchet would keep it stuck at "verify" from the previous fault.
       let nextStepper = state.currentPhaseStepper;
       let stepperCounter = state.nextItemId;
+      if (action.node === "batch_setup" && nextStepper !== null) {
+        nextStepper = null;
+      }
+
+      const stepName = mapNodeToStep(action.node, action.phase ?? "");
       if (stepName !== null) {
         const activeIndex = INJECT_PHASE_ORDER.indexOf(stepName);
         if (nextStepper) {

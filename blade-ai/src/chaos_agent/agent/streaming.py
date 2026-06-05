@@ -294,6 +294,29 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent]:
                     content=content,
                     node=data.get("node", ""),
                 )
+        elif custom_name == "batch_fault_result":
+            result_entry = data.get("result", {})
+            task_state = result_entry.get("task_state", "unknown")
+            import json as _json
+            envelope_data = {
+                "task_id": result_entry.get("task_id", ""),
+                "task_state": task_state,
+                "fault_type": result_entry.get("fault_type", ""),
+                "blade_uid": result_entry.get("blade_uid", ""),
+                "duration_ms": result_entry.get("duration_ms", 0),
+            }
+            for k in ("target", "verification", "side_effects", "postmortem",
+                       "failure_reason", "failure_detail", "side_effects_summary"):
+                v = result_entry.get(k)
+                if v is not None:
+                    envelope_data[k] = v
+            return StreamEvent(
+                type="result",
+                content=_json.dumps({
+                    "status": "success" if task_state in ("injected", "recovered", "partial_recovered") else "fail",
+                    "data": envelope_data,
+                }, ensure_ascii=False),
+            )
         return None
 
     # Silently ignore other events (on_chat_model_start, on_chain_start, etc.)

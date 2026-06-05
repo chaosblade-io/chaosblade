@@ -51,19 +51,24 @@ logger = logging.getLogger(__name__)
 CLASSIFY_INTENT_TOOL = {
     "name": "classify_intent",
     "description": (
-        "Route a non-inject intent. Call this ONLY when the user clearly "
-        "wants to recover a previous experiment (and you have confirmed "
-        "which one via query_active_experiments), or to end the conversation "
-        "(chat/goodbye). Do NOT call this for cluster queries or capability "
-        "questions — answer those directly using kubectl / read_skill_resource."
+        "Route a non-inject intent. Call this when the user clearly "
+        "wants to recover a previous experiment, to end the conversation "
+        "(chat/goodbye), or to perform batch/multi-scenario fault injection "
+        "(batch_inject). Do NOT call this for single fault injection — "
+        "use submit_fault_intent for that. Do NOT call this for cluster "
+        "queries or capability questions — answer those directly."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "intent": {
                 "type": "string",
-                "enum": ["recover", "chat"],
-                "description": "The classified intent type.",
+                "enum": ["recover", "chat", "batch_inject"],
+                "description": (
+                    "The classified intent type. Use 'batch_inject' when "
+                    "the user's request involves more than one fault — "
+                    "multiple targets, multiple fault types, or an explicit count."
+                ),
             },
             "confidence": {
                 "type": "number",
@@ -452,6 +457,63 @@ def submit_fault_intent(
 
 
 @lc_tool
+def submit_batch_intent(
+    faults: list[dict],
+    execution_order: str = "serial",
+    interval_seconds: int = 0,
+) -> str:
+    """Submit multiple fault injection intents for batch execution.
+
+    Call this when the user wants to inject multiple faults at once.
+    Each fault is an independent intent with its own target — infer from
+    conversation context how to assign targets:
+      - all faults on the same node/pod → share the same names
+      - each fault on a different node/pod → assign different names per fault
+      - user specifies explicitly → follow user instruction
+
+    Each fault dict must have: scope, target, action, namespace.
+    Optional: names (list[str]), labels (dict), params (dict), fault_type (str).
+
+    Args:
+        faults: List of fault dicts. Each must have scope, target, action,
+                namespace. Each fault can have its own names/labels independently.
+        execution_order: "serial" (default) or "parallel".
+        interval_seconds: Seconds between serial faults (default 0).
+    """
+    return "✓ 批量故障注入意图已提交，正在进入执行确认阶段。"
+
+
+def _extract_submit_batch_intent(messages: list) -> dict | None:
+    """Extract submit_batch_intent args from the most recent tool_call."""
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") == "tool":
+            continue
+        if getattr(msg, "type", "") == "ai":
+            for tc in getattr(msg, "tool_calls", None) or []:
+                if tc.get("name") != "submit_batch_intent":
+                    continue
+                args = tc.get("args") or {}
+                faults = args.get("faults", [])
+                if not isinstance(faults, list):
+                    continue
+                valid = []
+                for f in faults:
+                    if not isinstance(f, dict):
+                        continue
+                    if f.get("scope") and f.get("target") and f.get("action"):
+                        valid.append(f)
+                if not valid:
+                    return None
+                return {
+                    "faults": valid,
+                    "execution_order": args.get("execution_order", "serial"),
+                    "interval_seconds": int(args.get("interval_seconds", 0)),
+                }
+            break
+    return None
+
+
+@lc_tool
 async def query_active_experiments() -> str:
     """Query currently active fault experiments that can be recovered.
 
@@ -546,6 +608,7 @@ _INTENT_CONTENT_FALLBACKS = {
     "recover": "好的，正在为您恢复实验。",
     "chat": "好的,随时回来找我。",
     "inject": "好的，已记下你的需求，请确认下面的故障注入意图。",
+    "batch_inject": "好的，进入批量规划模式，我将为你制定多场景故障注入方案。",
     # "unset" is not a terminal intent — the user is still in dialogue.
     # Use a neutral acknowledgment that doesn't repeat the generic template.
     "unset": "好的，我继续帮你确认参数。",
@@ -1085,13 +1148,14 @@ def _persist_dialogue(tui_session_id: str, messages: list) -> None:
         logger.debug(f"Dialogue persistence skipped: {e}")
 
 
-def make_intent_clarification(llm=None, tools: list = None, hook=None):
+def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=None):
     """Create the intent_clarification node function.
 
     Args:
         llm: LangChain LLM instance.
         tools: ToolNode tools (kubectl, activate_skill, read_skill_resource).
         hook: Optional PreReasoningHook for memory compaction.
+        registry: SkillRegistry for dynamic skill catalog in system prompts.
     """
     async def intent_clarification(state: AgentState) -> dict:
         messages = state.get("messages", [])
@@ -1135,6 +1199,19 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
         # and won't re-ask for them.
         if confirmed_intent == "unset":
             logger.info("Intent partially converged (unset), continuing dialogue")
+
+        # Fast-path: batch intent previously submitted but rejected at intent_confirm.
+        # batch_submit_args is still in state — re-confirm directly without LLM call.
+        if (
+            state.get("batch_submit_args")
+            and confirmed_intent in (None, "unset")
+            and state.get("fault_spec")
+        ):
+            logger.info("Batch intent ready (previously rejected), re-confirming")
+            return {
+                "confirmed_intent": "batch_inject",
+                "intent_confidence": 1.0,
+            }
 
         if llm is None:
             if tracker:
@@ -1292,10 +1369,63 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
                     "task_id": op_task_id,
                 }, hook_updates)
 
+        # ── submit_batch_intent (batch injection) ──
+        # Outside has_submit_tool_msg block: submit_batch_intent ToolMessage
+        # has a different tool name so has_submit_tool_msg is False.
+        has_batch_tool_msg = False
+        if messages:
+            for msg in reversed(messages):
+                msg_type = getattr(msg, "type", "")
+                if msg_type == "tool":
+                    if getattr(msg, "name", "") == "submit_batch_intent":
+                        has_batch_tool_msg = True
+                        break
+                else:
+                    break
+        if has_batch_tool_msg:
+            batch_args = _extract_submit_batch_intent(messages)
+            if batch_args:
+                batch_faults = batch_args["faults"]
+                first = batch_faults[0]
+                first_spec = FaultSpec(
+                    scope=str(first.get("scope", "")),
+                    blade_target=str(first.get("target", "")),
+                    blade_action=str(first.get("action", "")),
+                    namespace=str(first.get("namespace", "")),
+                    names=tuple(first.get("names") or []),
+                    labels=dict(first.get("labels") or {}),
+                    params=dict(first.get("params") or {}),
+                    source="tui",
+                )
+                if tracker:
+                    tracker.complete(f"批量意图收敛: {len(batch_faults)} faults")
+                persist_list = _build_dialogue_persist_list(
+                    messages, system_msg=None,
+                    human_msg=current_human_msg,
+                    dialogue_round=dialogue_round,
+                )
+                _persist_dialogue(tui_session_id, persist_list)
+                op_task_id = _allocate_operation_task_id(state.get("task_id", ""))
+                return merge_hook_updates({
+                    "confirmed_intent": "batch_inject",
+                    "fault_spec": first_spec.to_dict(),
+                    "batch_submit_args": {
+                        "faults": batch_faults,
+                        "execution_order": batch_args.get("execution_order", "serial"),
+                        "interval_seconds": batch_args.get("interval_seconds", 0),
+                    },
+                    "intent_confidence": 1.0,
+                    "intent_reasoning": "submit_batch_intent tool executed",
+                    "dialogue_round": dialogue_round + 1,
+                    "task_id": op_task_id,
+                }, hook_updates)
+
         system_msg = SystemMessage(
             content=build_system_prompt(
                 PromptMode.INTENT,
                 fault_intent=fault_intent_existing,
+                skill_catalog=registry.build_catalog_prompt() if registry else "",
+                batch_submit_args=state.get("batch_submit_args"),
             )
         )
 
@@ -1379,8 +1509,20 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None):
                     "intent_confidence": classification["confidence"],
                     "messages": [filtered],
                 }, hook_updates)
+            elif intent == "batch_inject":
+                # Fallback: LLM called classify_intent instead of submit_batch_intent.
+                # Do NOT set confirmed_intent — reply with guidance to use the right tool.
+                if tracker:
+                    tracker.complete("批量意图 → 引导使用 submit_batch_intent")
+                return merge_hook_updates({
+                    "messages": [AIMessage(
+                        content="检测到批量注入意图。请使用 kubectl_ro 查询目标资源，"
+                                "然后调用 submit_batch_intent(faults=[...]) 提交所有故障意图。"
+                    )],
+                    "dialogue_round": dialogue_round + 1,
+                }, hook_updates)
             else:
-                # recover (the only non-chat option after the enum was narrowed)
+                # recover
                 if tracker:
                     tracker.complete(f"意图路由: {intent}")
                 filtered = _filter_internal_tools_from_response(response, intent=intent)

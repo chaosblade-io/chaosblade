@@ -75,7 +75,7 @@ async def inject_fault(request: InjectRequest, req: Request):
             _tsm.start_task_span(task_id)
             if _otel_cb is not None:
                 _otel_cb.set_task_id(task_id)
-            result = await agents["inject"].ainvoke(initial_state, config)
+            result = await agents["pipeline"].ainvoke(initial_state, config)
             return result
         except Exception as e:
             logger.exception(f"Inject failed for task {task_id}")
@@ -83,7 +83,7 @@ async def inject_fault(request: InjectRequest, req: Request):
             # Auto-rollback: if blade_create succeeded but graph crashed later,
             # we must destroy the experiment to avoid orphaned faults.
             try:
-                current_state = await agents["inject"].aget_state(config)
+                current_state = await agents["pipeline"].aget_state(config)
                 if current_state and current_state.values:
                     blade_uid = current_state.values.get("blade_uid", "")
                     kubeconfig = current_state.values.get("kubeconfig", "")
@@ -115,7 +115,7 @@ async def inject_fault(request: InjectRequest, req: Request):
                     blade_params = {}
                     values_fin = {}
                     try:
-                        final_state = await agents["inject"].aget_state(config)
+                        final_state = await agents["pipeline"].aget_state(config)
                         if final_state and final_state.values:
                             values_fin = final_state.values
                             remaining = values_fin.get("messages", [])

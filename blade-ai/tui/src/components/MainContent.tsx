@@ -15,7 +15,7 @@
  * thing in scrollback is the greeting (it'll never re-render either).
  */
 
-import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Box, Static, measureElement } from "ink";
 import { BootProgress } from "./boot/BootProgress.js";
 import { Header } from "./Header.js";
@@ -426,19 +426,22 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
       ? history
       : history.slice(0, replayCount);
 
-  const staticItems: StaticEntry[] = [];
-  if (session.id) {
-    staticItems.push({
-      key: "header",
-      node: <Header version={version} session={session} serverUrl={serverUrl} />,
-    });
+  const staticItems = useMemo((): StaticEntry[] => {
+    if (!session.id) return [];
+    const items: StaticEntry[] = [
+      {
+        key: "header",
+        node: <Header version={version} session={session} serverUrl={serverUrl} />,
+      },
+    ];
     for (const item of visibleHistory) {
-      staticItems.push({
+      items.push({
         key: item.id,
         node: <HistoryItemDisplay item={item} />,
       });
     }
-  }
+    return items;
+  }, [session, visibleHistory, version, serverUrl]);
 
   return (
     <>

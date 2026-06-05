@@ -104,7 +104,7 @@ async def _finalize_inject_session(
         The active session store (``self._session_store``).
     graph_or_agent : CompiledGraph | dict
         Object with ``aget_state(config)`` method — either the compiled
-        graph passed to streaming methods, or ``self._agents["inject"]``
+        graph passed to streaming methods, or ``self._agents["pipeline"]``
         for the blocking ``inject()`` method.  Ignored when
         ``precomputed_values`` is provided.
     config : RunnableConfig
@@ -346,6 +346,32 @@ class AgentRunner:
         self._checkpointer_conn = None  # hold ref for cleanup
         self._tui_session_store = None  # set by TUI app
 
+    def _sidewrite_event(
+        self,
+        session_id: str,
+        evt: "StreamEvent",
+        source: str = "pipeline",
+    ) -> None:
+        """Fire-and-forget: persist a StreamEvent to the Display Store."""
+        if not self._tui_session_store or not session_id:
+            return
+        try:
+            self._tui_session_store.append_event(session_id, {
+                "ts": evt.timestamp,
+                "source": source,
+                "task_id": evt.task_id or "",
+                "event_type": evt.type,
+                "data": evt.to_dict(),
+            })
+        except Exception:
+            pass
+
+    async def _wrap_stream_with_sidewrite(self, stream, session_id: str, source: str = "pipeline"):
+        """Wrap an async generator to sidewrite all StreamEvents."""
+        async for evt in stream:
+            self._sidewrite_event(session_id, evt, source)
+            yield evt
+
     async def initialize(self):
         """Explicitly initialize Agent Core components.
 
@@ -433,6 +459,24 @@ class AgentRunner:
         """
         await self._ensure_initialized()
 
+        # TUI mode: delegate to dual-graph converse_stream
+        _interaction_mode = kwargs.get("interaction_mode", "cli")
+        if _interaction_mode == "tui":
+            session_id = kwargs.get("tui_session_id", "") or ""
+            input_text = kwargs.get("input", "")
+            async for evt in self.converse_stream(
+                session_id, input_text,
+                interrupt_callback=interrupt_callback,
+                tui_session_id=session_id,
+                interaction_mode="tui",
+                kubeconfig=kwargs.get("kubeconfig", ""),
+                kube_context=kwargs.get("context", ""),
+                needs_confirmation=kwargs.get("confirm", False),
+                dry_run=kwargs.get("dry_run", False),
+            ):
+                yield evt
+            return
+
         if kwargs.get("kubeconfig"):
             settings.kubeconfig_path = kwargs["kubeconfig"]
         if kwargs.get("context"):
@@ -469,7 +513,7 @@ class AgentRunner:
         }
 
         config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
-        graph = self._agents["inject"]
+        graph = self._agents["pipeline"]
 
         # Write initial task state to TaskStore before graph starts
         try:
@@ -919,17 +963,17 @@ class AgentRunner:
                 sys.stderr.flush()
 
             # First invoke - will pause at confirmation_gate (or complete if chat)
-            result = await self._agents["inject"].ainvoke(initial_state, config)
+            result = await self._agents["pipeline"].ainvoke(initial_state, config)
 
             # If confirmation is NOT required, auto-approve and wait for completion
             # Only resume if the graph is actually paused at confirmation_gate
             if not kwargs.get("confirm", False):
                 from langgraph.types import Command
 
-                current_state = await self._agents["inject"].aget_state(config)
+                current_state = await self._agents["pipeline"].aget_state(config)
                 # If graph is waiting for human input (at confirmation_gate), resume it
                 if current_state and current_state.next:
-                    result = await self._agents["inject"].ainvoke(
+                    result = await self._agents["pipeline"].ainvoke(
                         Command(resume="approved"), config
                     )
 
@@ -1020,7 +1064,7 @@ class AgentRunner:
             # we must destroy the experiment to avoid orphaned faults.
             rollback_status = ""
             try:
-                current_state = await self._agents["inject"].aget_state(config)
+                current_state = await self._agents["pipeline"].aget_state(config)
                 if current_state and current_state.values:
                     blade_uid = current_state.values.get("blade_uid", "")
                     kubeconfig = current_state.values.get("kubeconfig", "")
@@ -1055,7 +1099,7 @@ class AgentRunner:
         finally:
             # Finalize session: flush remaining messages from final graph state
             await _finalize_inject_session(
-                self._session_store, self._agents["inject"], config, task_id,
+                self._session_store, self._agents["pipeline"], config, task_id,
                 kwargs=kwargs,
                 is_open_conversation=None,  # blocking inject always finalizes
                 error_log_level="warning",
@@ -1096,262 +1140,309 @@ class AgentRunner:
 
     # ---- resume_stream ----
 
-    async def converse_stream(self, thread_id: str, user_message: str, interrupt_callback=None):
-        """Continue a multi-turn conversation on an existing thread.
+    async def converse_stream(self, session_id: str, user_message: str, interrupt_callback=None, **kwargs):
+        """Dual-graph TUI conversation: Intent Graph → Pipeline Graph.
 
-        Multi-invocation model: each user message is an independent graph
-        invocation sharing the same thread_id. The checkpoint preserves state
-        (messages, confirmed_intent, etc.) across turns.
+        Phase 1 (Intent Graph, thread_id=session_id):
+          Stream intent_clarification dialogue. On inject intent,
+          intent_confirm fires interrupt(). After approval, handoff_summary
+          and fault_spec are extracted.
 
-        Flow:
-          1. Append HumanMessage to graph state via input
-          2. Graph starts from entry_point → load_memory → intent_clarification
-          3. intent_clarification sees full conversation history + new message
-          4. If pure text response → graph ends (END), TUI waits for next input
-          5. If submit_fault_intent → intent_confirm (interrupt) → agent_loop
+        Phase 2 (Pipeline Graph, thread_id=task_id):
+          Only runs when confirmed_intent == "inject". Streams the full
+          injection pipeline (agent_loop → safety → execute → verify).
 
-        Args:
-            thread_id: The thread_id from the first invocation (task_id).
-            user_message: The user's new message text.
-            interrupt_callback: Async callable(interrupt_info: dict) -> str
-                for handling interrupt points (intent_confirm, confirmation_gate).
+        Chat / recover / unresolved intents end at Phase 1 with
+        a conversation_turn event.
 
         Yields:
             StreamEvent: token, tool_start, tool_end, confirm, result, error, conversation_turn
         """
         await self._ensure_initialized()
 
-        from langchain_core.messages import HumanMessage
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from langgraph.types import Command
 
-        config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
-        graph = self._agents["inject"]
+        intent_graph = self._agents["intent"]
+        pipeline_graph = self._agents["pipeline"]
+        intent_config = {"configurable": {"thread_id": session_id}, "recursion_limit": settings.recursion_limit}
 
-        # Input for this turn: new user message + selective state reset.
-        # LangGraph merges this with the checkpoint state (messages get appended
-        # via add_messages reducer). Intent state is carried forward so
-        # intent_clarification can build on previous dialogue rounds rather than
-        # re-inferring from scratch. Pipeline state is reset so a new injection
-        # attempt starts clean.
-        #
-        # Key change: confirmed_intent is set to "unset" (not None) so the
-        # short-circuit branch in intent_clarification (which only passes
-        # through on "inject"/"chat"/"recover") does not fire. fault_intent
-        # and clarification_round are intentionally omitted — the checkpoint
-        # values are preserved via LangGraph's state merge semantics.
-        turn_input = {
+        # Session-level fields for Intent Graph (needed on first turn;
+        # subsequent turns carry them via checkpoint merge).
+        intent_input = {
             "messages": [HumanMessage(content=user_message)],
-            # "unset" prevents short-circuit while signalling "intent in progress"
             "confirmed_intent": "unset",
-            "intent_confidence": 0.0,
-            # Clear stale "input" from checkpoint (first invocation sets
-            # input="你好" via inject_stream; subsequent turns carry it via
-            # checkpoint merge). Without this, load_memory re-creates
-            # HumanMessage(content="你好") every turn, polluting the
-            # conversation history and corrupting _persist_dialogue's
-            # reverse-search for current_human_msg.
-            "input": None,
-            # fault_intent and clarification_round are NOT in turn_input —
-            # checkpoint values are preserved (simple override, no reducer).
-            # Reset pipeline state so a new injection attempt starts clean
-            "agent_loop_count": 0,
-            "execute_loop_count": 0,
-            "verifier_loop_count": 0,
-            "safety_status": "pending",
-            "error": None,
-            "failure_reason": None,
-            "replan_requested": False,
-            "replan_count": 0,
-            "replan_context": None,
         }
+        # Merge session-level kwargs (tui_session_id, kubeconfig,
+        # needs_confirmation, dry_run, interaction_mode, etc.)
+        _session_keys = (
+            "tui_session_id", "interaction_mode", "kubeconfig",
+            "kube_context", "needs_confirmation", "dry_run",
+        )
+        for k in _session_keys:
+            if k in kwargs:
+                intent_input[k] = kwargs[k]
 
-        # Suppress stderr status output in TUI mode
-        status_queue = subscribe(thread_id)
-        done_event = asyncio.Event()
+        turn_tokens_seen = False
+        pipeline_started = False
+        pipeline_task_id = ""
 
         try:
-            # Stream graph execution for this turn
-            turn_tokens_seen = False
-            async for event in graph.astream_events(turn_input, config, version="v2"):
+            # ── Phase 1: Intent Graph ──────────────────────────────
+            async for event in intent_graph.astream_events(intent_input, intent_config, version="v2"):
                 stream_evt = parse_stream_event(event)
                 if stream_evt is not None:
-                    stream_evt.task_id = thread_id
+                    stream_evt.task_id = session_id
                     if stream_evt.type == "token":
                         turn_tokens_seen = True
                     yield stream_evt
 
-            # Handle interrupts (intent_confirm, confirmation_gate)
-            resume_event_count = 0
+            # Handle Intent Graph interrupts (intent_confirm)
             while True:
-                current_state = await graph.aget_state(config)
+                cur = await intent_graph.aget_state(intent_config)
+                if not (cur and cur.next):
+                    break
 
-                if not (current_state and current_state.next):
-                    break  # Graph completed normally (reached END)
-
-                # Extract interrupt info
                 interrupt_info = None
-                for task in (current_state.tasks or []):
-                    if hasattr(task, 'interrupts') and task.interrupts:
-                        interrupt_info = task.interrupts[0].value
+                for t in (cur.tasks or []):
+                    if hasattr(t, "interrupts") and t.interrupts:
+                        interrupt_info = t.interrupts[0].value
                         break
-
                 if not interrupt_info:
                     break
 
                 if interrupt_callback:
-                    # Self-contained callback: renders UI and returns answer directly.
-                    # No need to yield "confirm" event — the callback handles everything.
                     response = await interrupt_callback(interrupt_info)
-                    from langgraph.types import Command
-
-                    async for event in graph.astream_events(
-                        Command(resume=response), config, version="v2"
+                    async for event in intent_graph.astream_events(
+                        Command(resume=response), intent_config, version="v2"
                     ):
-                        resume_event_count += 1
                         stream_evt = parse_stream_event(event)
                         if stream_evt is not None:
-                            stream_evt.task_id = thread_id
+                            stream_evt.task_id = session_id
                             if stream_evt.type == "token":
                                 turn_tokens_seen = True
                             yield stream_evt
-                    logger.info(
-                        "Resume after interrupt yielded %d events (thread_id=%s)",
-                        resume_event_count, thread_id,
-                    )
                 else:
-                    # No callback — yield confirm event and break (caller handles externally)
-                    next_nodes = list(current_state.next)
-                    yield StreamEvent(
-                        type="confirm",
-                        content=json.dumps(interrupt_info, ensure_ascii=False) if isinstance(interrupt_info, dict) else str(interrupt_info),
-                        node=next_nodes[0] if next_nodes else "interrupt",
-                        task_id=thread_id,
-                    )
-                    logger.warning(f"Unhandled interrupt in converse_stream for {thread_id}")
                     break
 
-            # Determine whether this was a full pipeline completion or just
-            # a conversation turn. Only yield "result" when the injection pipeline
-            # actually ran (blade_uid present). For non-inject intents (chat/query/
-            # explore/recover), the LLM response was already streamed as tokens —
-            # just yield conversation_turn so the TUI stays in conversation mode.
-            final_state = await graph.aget_state(config)
-            if final_state and final_state.values:
-                values = final_state.values
-                blade_uid = values.get("blade_uid", "")
+            # Read Intent Graph result
+            intent_final = await intent_graph.aget_state(intent_config)
+            iv = intent_final.values if intent_final else {}
+            confirmed = iv.get("confirmed_intent")
+
+            # ── Phase 2: Pipeline Graph (inject only) ──────────────
+            if confirmed == "inject" and iv.get("fault_spec"):
+                pipeline_started = True
+                task_id = iv.get("task_id", f"task-{uuid.uuid4()}")
+                pipeline_task_id = task_id
+                handoff = iv.get("handoff_summary", "")
+                tui_sid = iv.get("tui_session_id", "") or session_id
+
+                # Bootstrap task session (moved from intent_confirm)
+                from chaos_agent.agent.nodes.intent_clarification import bootstrap_task_session
+                if task_id:
+                    handoff_msg = SystemMessage(content=handoff) if handoff else None
+                    bootstrap_task_session(
+                        task_id, operation="inject",
+                        tui_session_id=tui_sid,
+                        handoff_message=handoff_msg,
+                    )
+
+                pipeline_config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
+                pipeline_input = {
+                    "task_id": task_id,
+                    "tui_session_id": tui_sid,
+                    "operation": "inject",
+                    "confirmed_intent": "inject",
+                    "fault_spec": iv.get("fault_spec"),
+                    "needs_confirmation": iv.get("needs_confirmation", True),
+                    "interaction_mode": "tui",
+                    "kubeconfig": iv.get("kubeconfig", ""),
+                    "kube_context": iv.get("kube_context", ""),
+                    "messages": [SystemMessage(content=handoff)] if handoff else [],
+                    "safety_status": "pending",
+                    "created_at": now_iso(),
+                }
+
+                # Stream Pipeline Graph
+                async for event in pipeline_graph.astream_events(pipeline_input, pipeline_config, version="v2"):
+                    stream_evt = parse_stream_event(event)
+                    if stream_evt is not None:
+                        stream_evt.task_id = task_id
+                        if stream_evt.type == "token":
+                            turn_tokens_seen = True
+                        yield stream_evt
+
+                # Handle Pipeline interrupts (confirmation_gate)
+                while True:
+                    cur = await pipeline_graph.aget_state(pipeline_config)
+                    if not (cur and cur.next):
+                        break
+                    interrupt_info = None
+                    _interrupt_node = ""
+                    for t in (cur.tasks or []):
+                        if hasattr(t, "interrupts") and t.interrupts:
+                            interrupt_info = t.interrupts[0].value
+                            _interrupt_node = getattr(t, "name", "")
+                            break
+                    if not interrupt_info:
+                        break
+                    # Auto mode: skip confirmation_gate without user interaction
+                    _auto_mode = not iv.get("needs_confirmation", True)
+                    if _auto_mode and _interrupt_node == "confirmation_gate":
+                        response = "approved"
+                    elif interrupt_callback:
+                        response = await interrupt_callback(interrupt_info)
+                    else:
+                        break
+                    async for event in pipeline_graph.astream_events(
+                        Command(resume=response), pipeline_config, version="v2"
+                    ):
+                        stream_evt = parse_stream_event(event)
+                        if stream_evt is not None:
+                            stream_evt.task_id = task_id
+                            if stream_evt.type == "token":
+                                turn_tokens_seen = True
+                            yield stream_evt
+
+                # Build and yield result from Pipeline Graph
+                pfinal = await pipeline_graph.aget_state(pipeline_config)
+                pv = pfinal.values if pfinal else {}
+
+                # Dry-run (plan_builder path): no result card.
+                # Emit conversation_turn with pipeline task_id so the TUI's
+                # _conversation_thread_id points to the Pipeline checkpoint
+                # (needed by lift_dry_run_and_run / is_dry_run_thread).
+                if pv.get("dry_run"):
+                    yield StreamEvent(type="conversation_turn", content="", task_id=task_id)
+                    return
+
+                blade_uid = pv.get("blade_uid", "")
 
                 if blade_uid:
-                    # Full injection pipeline completed — yield structured result
                     from chaos_agent.memory.session_store import build_verification_simple
                     from chaos_agent.agent.state import extract_ui_diagnostics, infer_task_state
                     from chaos_agent.models.schemas import build_inject_envelope
+                    from chaos_agent.agent.fault_spec import legacy_params_dict, legacy_target_dict, read_fault_spec
 
-                    verification = values.get("verification")
-                    task_state = infer_task_state(values)
+                    verification = pv.get("verification")
+                    task_state = infer_task_state(pv)
                     if task_state == "injecting":
                         task_state = "injected"
-
-                    from chaos_agent.agent.fault_spec import (
-                        legacy_params_dict, legacy_target_dict, read_fault_spec,
-                    )
-                    result_target = legacy_target_dict(values)
-                    blade_params = legacy_params_dict(values)
+                    result_target = legacy_target_dict(pv)
                     ns = result_target.get("namespace") or ""
                     names = result_target.get("names") or []
-                    skill_name = values.get("skill_name", "")
-                    _spec_for_ft = read_fault_spec(values)
-                    fault_type = (
-                        _spec_for_ft.fault_type if (_spec_for_ft and _spec_for_ft.fault_type)
-                        else skill_name or ""
-                    )
+                    skill_name = pv.get("skill_name", "")
+                    _spec = read_fault_spec(pv)
+                    fault_type = (_spec.fault_type if (_spec and _spec.fault_type) else skill_name or "")
+                    merged_error = pv.get("failure_reason") or pv.get("error") or ""
 
-                    merged_error = values.get("failure_reason") or values.get("error") or ""
                     yield StreamEvent(
                         type="result",
                         content=json.dumps(build_inject_envelope(
                             {
-                                "task_id": thread_id,
+                                "task_id": task_id,
                                 "result": task_state,
                                 "fault_type": fault_type,
                                 "blade_uid": blade_uid,
                                 "targets": [{"name": n, "namespace": ns} for n in names],
                                 "verification": build_verification_simple(verification),
                                 "error": merged_error,
-                                **extract_ui_diagnostics(values),
+                                **extract_ui_diagnostics(pv),
                             }, task_state, merged_error,
                         ), ensure_ascii=False),
-                        task_id=thread_id,
+                        task_id=task_id,
                     )
                 else:
-                    # Non-injection path (chat/query/explore/recover or pure text):
-                    # The LLM response was already streamed as tokens. Signal
-                    # conversation_turn so the TUI stays in conversation mode.
-                    # EXCEPT when there's an error or rejection from a failed pipeline.
-                    error_msg = values.get("failure_reason") or values.get("error") or ""
-                    safety_rejected = values.get("safety_status") == "rejected"
-
-                    if error_msg or safety_rejected:
+                    # Pipeline ran but no blade_uid (error / rejection)
+                    error_msg = pv.get("failure_reason") or pv.get("error") or ""
+                    if error_msg or pv.get("safety_status") == "rejected":
                         yield StreamEvent(
                             type="error",
-                            content=error_msg or values.get("safety_reason") or "Request rejected",
-                            task_id=thread_id,
+                            content=error_msg or pv.get("safety_reason") or "Request rejected",
+                            task_id=task_id,
                         )
-                    if not turn_tokens_seen:
-                        synthetic = _extract_visible_reply(values)
-                        if synthetic:
-                            yield StreamEvent(
-                                type="token",
-                                content=synthetic,
-                                task_id=thread_id,
-                            )
-                    yield StreamEvent(
-                        type="conversation_turn",
-                        content="",
-                        task_id=thread_id,
-                    )
+                    # Use session_id (not pipeline task_id) so the TUI's
+                    # _conversation_thread_id stays = session_id for the
+                    # next converse_stream call.
+                    yield StreamEvent(type="conversation_turn", content="", task_id=session_id)
+
+                # Write task summary back to Intent Graph + session file
+                try:
+                    from chaos_agent.agent.state import infer_task_state
+                    from chaos_agent.agent.fault_spec import read_fault_spec as _read_spec
+                    from chaos_agent.agent.state import extract_ui_diagnostics as _extract_diag
+                    from chaos_agent.memory.session_store import build_verification_simple as _build_verif
+                    ts = infer_task_state(pv) if pv else "unknown"
+                    _spec = _read_spec(pv) if pv else None
+                    _ft = (_spec.fault_type if _spec and _spec.fault_type else pv.get("skill_name", ""))
+                    _ns = _spec.namespace if _spec else ""
+                    _names = ", ".join(_spec.names) if _spec and _spec.names else ""
+                    _uid = pv.get("blade_uid", "")
+                    _verif = pv.get("verification")
+                    _verif_simple = _build_verif(_verif) if _verif else None
+                    _diag = _extract_diag(pv)
+                    _se_summary = _diag.get("side_effects_summary", "")
+
+                    _verif_line = ""
+                    if _verif_simple:
+                        _v_level = _verif_simple.get("level", "unknown")
+                        _v_l1 = _verif_simple.get("layer1", {}).get("status", "?")
+                        _v_l2 = _verif_simple.get("layer2", {}).get("status", "?")
+                        _verif_line = f"验证: {_v_level} (L1={_v_l1}, L2={_v_l2})"
+
+                    summary_parts = [
+                        f"[Task Summary] task_id={task_id}",
+                        f"类型: {_ft} | 目标: {_ns}/{_names}",
+                        f"结果: {ts} | blade_uid: {_uid}",
+                    ]
+                    if _verif_line:
+                        summary_parts.append(_verif_line)
+                    if _se_summary:
+                        summary_parts.append(f"副作用: {_se_summary}")
+                    if _diag.get("failure_reason"):
+                        summary_parts.append(f"失败原因: {_diag['failure_reason']}")
+                    summary = "\n".join(summary_parts)
+                    summary_msg = SystemMessage(content=summary)
+                    await intent_graph.aupdate_state(intent_config, {
+                        "messages": [summary_msg],
+                        "pipeline_task_id": task_id,
+                    }, as_node="save_dialogue")
+                    # Also persist to session file for audit trail
+                    if self._tui_session_store and session_id:
+                        self._tui_session_store.append_dialogue(session_id, [summary_msg])
+                except Exception:
+                    logger.debug("Failed to write task summary to Intent Graph", exc_info=True)
+
             else:
-                yield StreamEvent(
-                    type="conversation_turn",
-                    content="",
-                    task_id=thread_id,
-                )
+                # Non-inject: chat / recover / unresolved
+                if not turn_tokens_seen:
+                    synthetic = _extract_visible_reply(iv)
+                    if synthetic:
+                        yield StreamEvent(type="token", content=synthetic, task_id=session_id)
+                yield StreamEvent(type="conversation_turn", content="", task_id=session_id)
 
         except Exception as e:
-            logger.exception(f"converse_stream failed for thread {thread_id}")
-            yield StreamEvent(
-                type="error",
-                content=f"Conversation failed: {e}",
-                task_id=thread_id,
-            )
+            logger.exception(f"converse_stream failed for session {session_id}")
+            yield StreamEvent(type="error", content=f"Conversation failed: {e}", task_id=session_id)
         finally:
-            # Persist messages from this turn. Finalize only when the
-            # conversation has truly ended (pipeline ran with blade_uid,
-            # error/rejection, or user said goodbye); otherwise keep the
-            # session active for the next turn.
-            # Compute is_open_conversation here (needs local graph state)
-            # rather than inside _finalize_inject_session.
-            _is_open_conv = False
-            _vals = {}
-            try:
-                _fgs = await graph.aget_state(config)
-                _vals = _fgs.values if _fgs and _fgs.values else {}
-                _is_open_conv = (
-                    not _vals.get("blade_uid", "")
-                    and not (_vals.get("failure_reason") or _vals.get("error"))
-                    and _vals.get("safety_status") != "rejected"
-                    and _vals.get("confirmed_intent") not in ("chat",)
-                )
-            except Exception:
-                pass
-            await _finalize_inject_session(
-                self._session_store, graph, config, thread_id,
-                kwargs=None,  # converse_stream has no CLI kwargs for fault_type
-                is_open_conversation=_is_open_conv,
-                error_log_level="debug",
-                precomputed_values=_vals,
-                tui_session_store=self._tui_session_store,
-            )
-            done_event.set()
-            unsubscribe(thread_id, status_queue)
+            if pipeline_started and pipeline_task_id:
+                try:
+                    _pfinal = await pipeline_graph.aget_state(
+                        {"configurable": {"thread_id": pipeline_task_id}}
+                    )
+                    _pvals = _pfinal.values if _pfinal else {}
+                    await _finalize_inject_session(
+                        self._session_store, pipeline_graph,
+                        {"configurable": {"thread_id": pipeline_task_id}},
+                        pipeline_task_id,
+                        is_open_conversation=False,
+                        error_log_level="debug",
+                        precomputed_values=_pvals,
+                        tui_session_store=self._tui_session_store,
+                    )
+                except Exception:
+                    logger.debug("Pipeline session finalize failed", exc_info=True)
 
     # ---- resume_stream ----
 
@@ -1374,7 +1465,7 @@ class AgentRunner:
         await self._ensure_initialized()
 
         config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
-        graph = self._agents["inject"]
+        graph = self._agents["pipeline"]
 
         current_state = await graph.aget_state(config)
         if not current_state or not current_state.next:
@@ -1469,7 +1560,7 @@ class AgentRunner:
         from langgraph.types import Command
 
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": settings.recursion_limit}
-        graph = self._agents["inject"]
+        graph = self._agents["pipeline"]
 
         snapshot = await graph.aget_state(config)
         if not snapshot or not snapshot.values:
@@ -1623,7 +1714,7 @@ class AgentRunner:
             logger.warning(f"Failed to query active tasks: {e}")
             return []
 
-        graph = self._agents["inject"]
+        graph = self._agents["pipeline"]
         interrupted = []
 
         for task in active_tasks:
@@ -1683,7 +1774,7 @@ class AgentRunner:
 
         try:
             # Get current state from inject graph checkpoint
-            current_state = await self._agents["inject"].aget_state(config)
+            current_state = await self._agents["pipeline"].aget_state(config)
             if not current_state or not current_state.values:
                 return JSONEnvelope.fail(code=ResponseCode.TASK_NOT_FOUND, message=f"Task not found: {inject_task_id}")
 
@@ -1730,6 +1821,9 @@ class AgentRunner:
                 "recover_phase": "layer1_recovery",  # Reset to Layer 1 for fresh recover
                 "layer1_iteration_count": 0,   # Reset Layer 1 iteration counter
                 "layer2_context_added": False,  # Reset Layer 2 context flag
+                "error": None,              # Clear stale error from previous attempt
+                "failure_reason": None,     # Clear stale failure_reason
+                "failure_detail": None,     # Clear stale failure_detail
             }
 
             # Write recover initial state to TaskStore (keyed by inject_task_id —
@@ -2006,7 +2100,7 @@ class AgentRunner:
             from langgraph.types import Command
 
             resume_value = "approved" if action == "approve" else "rejected"
-            await self._agents["inject"].ainvoke(Command(resume=resume_value), config)
+            await self._agents["pipeline"].ainvoke(Command(resume=resume_value), config)
 
             new_state = "injecting" if action == "approve" else "cancelled"
 

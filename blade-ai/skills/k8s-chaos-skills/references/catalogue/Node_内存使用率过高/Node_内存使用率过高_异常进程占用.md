@@ -14,6 +14,12 @@
 2. 使用 chaosblade 对该节点注入内存压力，模拟异常进程占用节点内存
 3. 观察节点内存使用率及 Pod 状态变化
 
+**注入命令**：
+```bash
+blade create k8s node-mem load --mode ram --mem-percent 90 --names <节点名> --kubeconfig <path> --timeout 600
+```
+> **必须使用 `--mode ram`**。默认的 cache 模式在 cgroup v2 节点上不会增加实际物理内存占用（仅填充页缓存），kubectl top 观测不到变化。`--mode ram` 通过分配匿名内存直接占用物理 RAM。
+
 **注入验证**：
 1. 查看节点内存使用率监控，确认持续超过 90%
 2. 执行 `kubectl describe node <节点名>`，确认 MemoryPressure 条件为 True

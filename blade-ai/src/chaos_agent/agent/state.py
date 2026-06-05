@@ -811,3 +811,60 @@ class AgentState(MessagesState):
     # Plan builder (interactive guided plan construction via TUI /plan)
     plan_builder_round: int = 0        # Dialogue round counter within plan_builder
     plan_confirmed: bool = False       # submit_plan completed; /run routes to safety_check
+
+    # Batch fault injection (submit_plan with multiple faults)
+    # Stores the full submit_plan args when faults[] has more than 1 entry.
+    # Single-fault submit_plan does NOT populate this (backward compatible).
+    batch_submit_args: Optional[dict] = None
+
+    # Batch execution progress (loop-back within Pipeline Graph)
+    current_fault_index: int = 0
+    batch_results: Optional[list] = None
+
+
+class IntentState(MessagesState):
+    """State for the Intent Graph (conversation layer).
+
+    Contains only dialogue-level fields. Execution-level fields
+    (blade_uid, verification, safety_status, skill_name, etc.)
+    live on AgentState in the Pipeline Graph.
+    """
+
+    messages: Annotated[list, _ts_add_messages]
+
+    tui_session_id: str = ""
+    interaction_mode: str = "tui"
+
+    # Intent recognition
+    confirmed_intent: Optional[str] = None
+    intent_confidence: float = 0.0
+    clarification_round: int = 0
+    dialogue_round: int = 0
+    intent_reasoning: Optional[str] = None
+
+    # Recover target
+    needs_task_selection: bool = False
+    recover_task_id: Optional[str] = None
+
+    # Pipeline dispatch
+    pipeline_task_id: Optional[str] = None
+    pipeline_result_summary: Optional[str] = None
+    handoff_summary: Optional[str] = None
+
+    # FaultSpec (converged from intent_clarification)
+    fault_spec: Optional[dict] = None
+    input: Optional[str] = None
+
+    # Batch fault injection (from submit_batch_intent)
+    batch_submit_args: Optional[dict] = None
+
+    # Session-level
+    kubeconfig: Optional[str] = None
+    kube_context: Optional[str] = None
+    needs_confirmation: bool = False
+    dry_run: bool = False
+    compressed_summary: Optional[str] = None
+    operational_notes: Optional[str] = None
+
+    # Task ID (allocated by _allocate_operation_task_id in intent_clarification)
+    task_id: str = ""

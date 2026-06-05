@@ -39,6 +39,8 @@ class FakeBridge:
 class FakeRunner:
     """Yields a pre-canned event sequence from ``inject_stream``."""
 
+    _tui_session_store = None
+
     def __init__(self, events: list[StreamEvent]):
         self._events = events
 
@@ -47,6 +49,10 @@ class FakeRunner:
             for e in self._events:
                 yield e
         return _gen()
+
+    async def _wrap_stream_with_sidewrite(self, stream, session_id, source="pipeline"):
+        async for evt in stream:
+            yield evt
 
     async def cleanup(self) -> None:
         pass
@@ -126,11 +132,17 @@ class TestLastTurnWasInjection:
         that bookkeeping here to lock the contract."""
 
         class BoomRunner:
+            _tui_session_store = None
+
             def inject_stream(self, **_kwargs):
                 async def _gen():
                     raise RuntimeError("boom")
                     yield  # pragma: no cover
                 return _gen()
+
+            async def _wrap_stream_with_sidewrite(self, stream, session_id, source="pipeline"):
+                async for evt in stream:
+                    yield evt
 
             async def cleanup(self) -> None:
                 pass

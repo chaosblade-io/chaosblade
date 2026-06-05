@@ -70,9 +70,9 @@ def get_intent_critical_rules_section() -> str:
    submit_fault_intent AFTER the user confirms the summary. This is mandatory —
    never submit without showing the full intent and getting user approval.
 
-3. **classify_intent is ONLY for recover/chat routing** — Do NOT use classify_intent
-   for cluster queries ("集群健康吗") or capability questions ("你能做什么").
-   Answer those directly using kubectl_ro or read_skill_resource.
+3. **classify_intent is ONLY for recover/chat/batch_inject routing** — Do NOT use
+   classify_intent for cluster queries or capability questions. Answer those
+   directly using kubectl_ro or read_skill_resource.
 
 4. **Single routing action per turn** — classify_intent and submit_fault_intent
    must NOT be called simultaneously. Choose one."""
@@ -125,6 +125,11 @@ When the user explicitly expresses these intents, call classify_intent:
   2. Present results to user — ask which one to recover.
   3. User confirms → classify_intent(intent="recover", recover_task_id="task-xxx")
   4. Do NOT call classify_intent("recover") without a confirmed recover_task_id.
+- Batch/multi-scenario injection → use submit_batch_intent (NOT classify_intent):
+  When the user wants more than one fault, gather fault details using
+  kubectl_ro + activate_skill, then call submit_batch_intent(faults=[...])
+  with all faults in one call. Do NOT use classify_intent for batch —
+  use submit_batch_intent directly.
 
 ### Cluster Query / Capability Introduction — Answer directly, do NOT route
 - "集群健康吗" / "有哪些 pod" / "当前实验状态" → use kubectl_ro(subcommand="get"/"describe")
@@ -166,6 +171,13 @@ When the user expresses intent to inject a fault (even vaguely), enter convergen
   submit_fault_intent's params field
 - If unsure about context, check history messages for
   `[Intent Clarification Summary]` system messages
+- `[Batch Summary]` or `[Batch Progress]` system messages contain results of
+  previously executed batch fault injections. When the user asks about injection
+  results, cite the task_state and task_id from these summaries directly —
+  do NOT say you cannot access results or ask the user to check elsewhere
+- If you see a previous `submit_batch_intent` tool call in history that was
+  rejected (user cancelled), and the user now says to proceed/execute, re-call
+  `submit_batch_intent` with the same faults — do NOT just chat about it
 
 ### Optional: Hypothesis & Success Criteria
 If you can infer a concrete, quantifiable prediction (e.g. "HPA 应在 60s
@@ -179,9 +191,9 @@ def get_intent_tools_section() -> str:
     Follows verifier's Available/NOT Available format for clarity.
     """
     return """### Available Tools
-- `classify_intent`: ONLY for routing recover/chat. Do NOT use for queries
-  or capability questions.
-- `submit_fault_intent`: Submit the collected fault intent. Call ONLY after
+- `classify_intent`: For routing recover/chat/batch_inject intents only.
+  Do NOT use for cluster queries or capability questions.
+- `submit_fault_intent`: Submit a single fault intent. Call ONLY after
   user explicitly confirms your summary. Required: fault_type, scope, target,
   action, namespace. See tool schema for parameter details and legal values.
   Consult `read_skill_resource` for unfamiliar fault types before submitting.
@@ -189,6 +201,12 @@ def get_intent_tools_section() -> str:
   answer cluster queries (read-only)
 - `activate_skill` / `read_skill_resource`: Browse fault types and skill
   directory for capability questions and convergence support
+- `submit_batch_intent`: Submit multiple fault intents for batch execution.
+  Call when the user's request involves more than one fault. Each fault in
+  the faults array must have scope, target, action, namespace, and can have
+  its own names independently. Infer target assignment from context:
+  same target for all faults, or different targets per fault.
+  Gather details first (kubectl_ro + activate_skill), then submit all at once.
 - `query_active_experiments`: Query recoverable (active) fault experiments.
   Use the returned task_id in classify_intent(intent="recover",
   recover_task_id="...")
@@ -214,7 +232,10 @@ def get_intent_output_section() -> str:
 In convergence mode: acknowledge confirmed params before asking next question."""
 
 
-def get_intent_completeness_section(fault_intent: dict | None = None) -> str:
+def get_intent_completeness_section(
+    fault_intent: dict | None = None,
+    batch_submit_args: dict | None = None,
+) -> str:
     """Dynamic section: completeness signal + confirmed parameters.
 
     Placed below CACHE_BOUNDARY so stable sections can be cached across turns.
@@ -225,11 +246,34 @@ def get_intent_completeness_section(fault_intent: dict | None = None) -> str:
     prompt signal:
     - missing_slots == [] → "ALL REQUIRED PARAMETERS FILLED, MUST submit"
     - missing_slots != [] → "Still missing X/Y/Z, ask about the NEXT one only"
+    - batch_submit_args present → "BATCH INTENT READY, re-submit on user confirm"
 
     Conditional requirements:
     - scope=pod → names or labels required
     - scope=node → names required
     """
+    # Batch intent ready (from a previous rejected submit_batch_intent)
+    if batch_submit_args and isinstance(batch_submit_args, dict):
+        faults = batch_submit_args.get("faults", [])
+        if faults:
+            parts = [
+                "## Batch Intent Ready (from previous dialogue)",
+                f"  {len(faults)} faults previously submitted via submit_batch_intent",
+            ]
+            for i, f in enumerate(faults, 1):
+                parts.append(
+                    f"  {i}. {f.get('scope','')}-{f.get('target','')}-{f.get('action','')} "
+                    f"@ {f.get('namespace','')}/{', '.join(f.get('names', [])) or '*'}"
+                )
+            parts.append("")
+            parts.append(
+                "⚠️ BATCH INTENT WAS PREVIOUSLY REJECTED BY USER. "
+                "If the user now says to proceed/execute/continue, "
+                "call submit_batch_intent with the SAME faults immediately. "
+                "Do NOT just chat about it — actually call the tool."
+            )
+            return "\n".join(parts)
+
     if fault_intent is None:
         return ""
 
@@ -292,5 +336,5 @@ def get_intent_critical_rules_reminder_section() -> str:
     return """## REMINDER
 1. Never re-ask confirmed parameters
 2. Summarize → user confirms → then submit
-3. classify_intent: recover/chat only
+3. classify_intent: recover/chat/batch_inject only — not for queries
 4. One routing action per turn"""

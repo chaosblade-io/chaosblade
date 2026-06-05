@@ -483,6 +483,24 @@ def route_after_recover_finalize(state: AgentState) -> str:
     return "recover_verifier_loop"
 
 
+def route_pipeline_start(state: AgentState) -> str:
+    """Pipeline Graph entry routing — four paths.
+
+    Returns:
+        "direct_setup"  - CLI direct mode
+        "plan_builder"  - TUI /plan dry-run
+        "batch_setup"   - batch inject (from submit_batch_intent)
+        "agent_loop"    - CLI NL / TUI inject
+    """
+    if state.get("direct", False):
+        return "direct_setup"
+    if state.get("dry_run") and state.get("interaction_mode") == "tui":
+        return "plan_builder"
+    if state.get("batch_submit_args"):
+        return "batch_setup"
+    return "agent_loop"
+
+
 def route_after_load_memory(state: AgentState) -> str:
     """Decide which path to take after load_memory.
 
@@ -534,13 +552,13 @@ def route_after_intent_clarification(state: AgentState) -> str:
     """Decide what happens after intent_clarification.
 
     Returns:
-        "agent_loop"       - user confirmed fault injection intent
+        "agent_loop"       - user confirmed fault injection intent (inject or batch_inject)
         "recover_handler"  - user wants to recover a previous injection
         "save_memory"      - chat intent (direct end, no special handler)
         "intent_clarification" - intent still unclear, continue dialogue
     """
     confirmed_intent = state.get("confirmed_intent")
-    if confirmed_intent == "inject":
+    if confirmed_intent in ("inject", "batch_inject"):
         return "agent_loop"
     if confirmed_intent == "recover":
         return "recover_handler"
@@ -555,19 +573,20 @@ def should_continue_intent_clarification(state: AgentState) -> str:
 
     Multi-invocation model:
     - inject → "intent_confirm" (user must confirm intent before execution)
+    - batch_inject → "intent_confirm" (user confirms batch intent before execution)
     - has tool_calls (kubectl, etc.) → "continue" (ReAct within single invocation)
     - pure text → END (conversation turn done, TUI waits for next input)
 
     Returns:
         "continue"         - LLM has tool_calls (kubectl, etc.), continue the loop
-        "intent_confirm"   - intent confirmed as inject, needs user confirmation
+        "intent_confirm"   - intent confirmed as inject or batch_inject
         "recover_handler"  - intent confirmed as recover
         "save_memory"      - chat intent (direct end)
         END                - conversation turn done, wait for next user input
     """
     # Check confirmed_intent first
     confirmed_intent = state.get("confirmed_intent")
-    if confirmed_intent == "inject":
+    if confirmed_intent in ("inject", "batch_inject"):
         return "intent_confirm"
     if confirmed_intent == "recover":
         return "recover_handler"
@@ -614,7 +633,7 @@ def route_after_intent_confirm(state: AgentState) -> str:
         "agent_loop" - user confirmed, proceed to planning/execution
         END          - user rejected, wait for next input
     """
-    if state.get("confirmed_intent") == "inject" and state.get("fault_spec"):
+    if state.get("confirmed_intent") in ("inject", "batch_inject") and state.get("fault_spec"):
         return "agent_loop"
     return END
 
@@ -631,3 +650,37 @@ def route_after_direct_execute(state: AgentState) -> str:
     if state.get("error"):
         return "end"
     return "verifier"
+
+
+def route_after_save_memory(state: AgentState) -> str:
+    """Decide what happens after save_memory.
+
+    Returns:
+        "batch_next" - batch in progress, collect result and advance index
+        END          - non-batch path (single inject, recover, chat)
+
+    Always routes to batch_next when batch_submit_args has faults —
+    including the last fault. batch_next appends the result, then
+    route_after_batch_next decides whether to loop or END.
+    """
+    batch_args = state.get("batch_submit_args")
+    if batch_args and isinstance(batch_args, dict) and batch_args.get("faults"):
+        return "batch_next"
+    return END
+
+
+def route_after_batch_next(state: AgentState) -> str:
+    """Decide what happens after batch_next.
+
+    Returns:
+        "batch_setup" - more faults to execute
+        END           - all faults completed
+    """
+    batch_args = state.get("batch_submit_args")
+    if not batch_args or not isinstance(batch_args, dict):
+        return END
+    faults = batch_args.get("faults", [])
+    current = state.get("current_fault_index", 0)
+    if current < len(faults):
+        return "batch_setup"
+    return END

@@ -11,10 +11,13 @@ from chaos_agent.agent.router import (
     route_after_phase1_tools,
     route_after_safety,
     route_after_baseline,
+    route_after_save_memory,
+    route_after_batch_next,
     should_continue_agent_loop,
     should_continue_execute_loop,
     should_continue_verifier,
     should_continue_recover_verifier,
+    should_continue_plan_builder,
     route_after_verifier_tools,
     route_after_finalize,
     route_after_recover_verifier_tools,
@@ -491,3 +494,92 @@ class TestSchemeBVerifierRouting:
 
     def test_route_after_recover_finalize_loops(self):
         assert route_after_recover_finalize({"recover_verification": None}) == "recover_verifier_loop"
+
+
+class TestShouldContinuePlanBuilder:
+    """Test should_continue_plan_builder routing."""
+
+    def test_tool_calls_continues(self):
+        state = {"messages": [AIMessage(content="", tool_calls=[{"name": "kubectl_ro", "args": {}, "id": "1"}])]}
+        assert should_continue_plan_builder(state) == "continue"
+
+    def test_no_tool_calls_ends(self):
+        state = {"messages": [AIMessage(content="plan done")]}
+        from langgraph.graph import END
+        assert should_continue_plan_builder(state) == END
+
+    def test_no_plan_confirmed_ends(self):
+        state = {"messages": [AIMessage(content="cancelled")], "plan_confirmed": False}
+        from langgraph.graph import END
+        assert should_continue_plan_builder(state) == END
+
+    def test_empty_messages_no_confirm_ends(self):
+        state = {"messages": []}
+        from langgraph.graph import END
+        assert should_continue_plan_builder(state) == END
+
+
+class TestRouteAfterSaveMemory:
+    """Test route_after_save_memory routing — batch loop vs END."""
+
+    def test_batch_in_progress_routes_to_batch_next(self):
+        state = {"batch_submit_args": {"faults": [{"scope": "pod"}, {"scope": "node"}]}}
+        assert route_after_save_memory(state) == "batch_next"
+
+    def test_single_fault_batch_routes_to_batch_next(self):
+        state = {"batch_submit_args": {"faults": [{"scope": "pod"}]}}
+        assert route_after_save_memory(state) == "batch_next"
+
+    def test_no_batch_args_ends(self):
+        from langgraph.graph import END
+        assert route_after_save_memory({}) == END
+
+    def test_none_batch_args_ends(self):
+        from langgraph.graph import END
+        assert route_after_save_memory({"batch_submit_args": None}) == END
+
+    def test_empty_faults_ends(self):
+        from langgraph.graph import END
+        assert route_after_save_memory({"batch_submit_args": {"faults": []}}) == END
+
+    def test_non_dict_batch_args_ends(self):
+        from langgraph.graph import END
+        assert route_after_save_memory({"batch_submit_args": "invalid"}) == END
+
+
+class TestRouteAfterBatchNext:
+    """Test route_after_batch_next routing — loop or END."""
+
+    def test_more_faults_loops_to_batch_setup(self):
+        state = {
+            "batch_submit_args": {"faults": [{"scope": "pod"}, {"scope": "node"}, {"scope": "pod"}]},
+            "current_fault_index": 1,
+        }
+        assert route_after_batch_next(state) == "batch_setup"
+
+    def test_last_fault_done_ends(self):
+        from langgraph.graph import END
+        state = {
+            "batch_submit_args": {"faults": [{"scope": "pod"}, {"scope": "node"}]},
+            "current_fault_index": 2,
+        }
+        assert route_after_batch_next(state) == END
+
+    def test_exact_boundary_ends(self):
+        from langgraph.graph import END
+        state = {
+            "batch_submit_args": {"faults": [{"scope": "pod"}]},
+            "current_fault_index": 1,
+        }
+        assert route_after_batch_next(state) == END
+
+    def test_index_zero_with_faults_loops(self):
+        state = {
+            "batch_submit_args": {"faults": [{"scope": "pod"}]},
+            "current_fault_index": 0,
+        }
+        assert route_after_batch_next(state) == "batch_setup"
+
+    def test_no_batch_args_ends(self):
+        from langgraph.graph import END
+        assert route_after_batch_next({"current_fault_index": 0}) == END

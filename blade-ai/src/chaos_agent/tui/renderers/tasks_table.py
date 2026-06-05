@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
+from rich.box import ROUNDED
 from rich.table import Table
 from rich.text import Text
 
@@ -96,24 +97,40 @@ def render_tasks(
             console.print_text("  暂无任务记录", style=Colors.MUTED)
         return
 
+    # Status icons
+    _STATUS_ICONS = {
+        "injected": "✓", "success": "✓", "recovered": "✓", "completed": "✓",
+        "failed": "✗", "error": "✗",
+        "partial": "◐", "partial_recovered": "◐", "waiting_input": "◐",
+    }
+
     table = Table(
-        title=f"任务列表  •  filter={flt}  •  {len(visible)}/{total}",
+        title=f"  ✻ Tasks  ·  {flt}  ·  {len(visible)}/{total}",
         title_style=f"bold {Colors.BRAND}",
-        header_style="bold",
+        title_justify="left",
+        header_style=f"bold {Colors.MUTED}",
         border_style=Colors.BRAND,
-        expand=False,
-        pad_edge=False,
+        box=ROUNDED,
+        expand=True,
+        padding=(0, 1),
+        show_lines=False,
     )
-    table.add_column("Task ID", overflow="fold", no_wrap=False)
-    table.add_column("Fault Type", overflow="fold")
-    table.add_column("Phase")
-    table.add_column("Status")
-    table.add_column("Duration", justify="right")
-    table.add_column("Created", overflow="fold")
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("Task ID", min_width=14, no_wrap=True)
+    table.add_column("Fault", min_width=20, overflow="fold")
+    table.add_column("Target", min_width=16, overflow="fold")
+    table.add_column("Status", min_width=8, no_wrap=True)
+    table.add_column("Verify", min_width=8, no_wrap=True)
+    table.add_column("Duration", justify="right", min_width=7, no_wrap=True)
+    table.add_column("Created", min_width=16, no_wrap=True)
 
     for t in visible:
         status = (t.get("status") or "").lower() or "unknown"
-        fault_type = t.get("skill_name") or "—"
+        icon = _STATUS_ICONS.get(status, "·")
+        icon_style = _status_style(status)
+
+        # Fault type: prefer scope-target-action, fallback to skill_name
+        fault_type = "—"
         params = t.get("params") or {}
         if isinstance(params, dict) and params:
             scope = params.get("scope", "")
@@ -122,18 +139,44 @@ def render_tasks(
             joined = "-".join(p for p in (scope, target, action) if p)
             if joined:
                 fault_type = joined
-        phase = t.get("phase") or "—"
-        duration = _duration(int((t.get("summary") or {}).get("total_duration_ms") or 0))
-        created = (t.get("gmt_create") or "").replace("T", " ")[:19] or "—"
+        if fault_type == "—":
+            fault_type = t.get("skill_name") or "—"
 
-        status_text = Text(status, style=_status_style(status))
+        # Target: namespace/name
+        targets = (t.get("summary") or {}).get("targets") or []
+        if targets and isinstance(targets, list):
+            first = targets[0] if isinstance(targets[0], dict) else {}
+            ns = first.get("namespace", "")
+            name = first.get("name", "")
+            target_str = f"{ns}/{name}" if ns and name else (name or ns or "—")
+        else:
+            target_str = "—"
+
+        # Verification level
+        verification = (t.get("summary") or {}).get("verification") or {}
+        if isinstance(verification, dict):
+            verify_level = verification.get("level", "—")
+        else:
+            verify_level = "—"
+        verify_style = (
+            Colors.SUCCESS if verify_level == "verified"
+            else Colors.WARNING if verify_level == "partial"
+            else Colors.ERROR if verify_level == "unverified"
+            else Colors.MUTED
+        )
+
+        duration = _duration(int((t.get("summary") or {}).get("total_duration_ms") or 0))
+        created = (t.get("gmt_create") or "").replace("T", " ")[:16] or "—"
+
         table.add_row(
-            _short(t.get("task_id") or "", 36),
-            _short(fault_type, 36),
-            _short(phase, 18),
-            status_text,
-            duration,
-            created,
+            Text(icon, style=icon_style),
+            Text(_short(t.get("task_id") or "", 18), style=Colors.MUTED),
+            Text(_short(fault_type, 24)),
+            Text(_short(target_str, 24)),
+            Text(status, style=_status_style(status)),
+            Text(verify_level, style=verify_style),
+            Text(duration, style=Colors.MUTED),
+            Text(created, style=Colors.MUTED),
         )
 
     console.print(table)

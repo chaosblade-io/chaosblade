@@ -136,6 +136,13 @@ def get_execution_directives_section(
         "Follow the skill instructions precisely to inject the fault.",
         "Use blade_create to inject ChaosBlade faults, and kubectl for K8s operations.",
         "",
+        "### Before Constructing blade_create Commands",
+        "Always call `blade_help(subcommand='create k8s <scope>-<target> <action>')` "
+        "BEFORE your first blade_create call to verify available flags and their syntax. "
+        "Use the help output — not memory or skill docs alone — to choose correct flags "
+        "(e.g. --mode ram for memory injection). Skill docs may omit optional flags "
+        "that are critical for the injection to take effect.",
+        "",
         "### When blade_create Fails",
         "1. **Fallback — kubectl exec tool pod**:\n"
         "   `kubectl get pods -n chaosblade -l app=otel-c-tool` → find a running pod →\n"

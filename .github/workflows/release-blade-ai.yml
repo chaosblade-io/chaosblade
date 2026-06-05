@@ -33,6 +33,7 @@ permissions:
 
 env:
   CHAOSBLADE_VERSION: '1.8.0'
+  NODE_VERSION: '24.16.0'
 
 jobs:
   # ── Verify all version files agree with the release tag ────────────────
@@ -174,20 +175,28 @@ jobs:
           - os: linux
             arch: amd64
             target: linux_amd64
+            node_arch: linux-x64
+            node_ext: tar.xz
             runner: ubuntu-latest
             use_docker: true
           - os: linux
             arch: arm64
             target: linux_arm64
+            node_arch: linux-arm64
+            node_ext: tar.xz
             runner: ubuntu-24.04-arm
             use_docker: true
           - os: darwin
             arch: amd64
             target: darwin_amd64
+            node_arch: darwin-x64
+            node_ext: tar.gz
             runner: macos-latest
           - os: darwin
             arch: arm64
             target: darwin_arm64
+            node_arch: darwin-arm64
+            node_ext: tar.gz
             runner: macos-latest
 
     runs-on: ${{ matrix.runner }}
@@ -222,6 +231,43 @@ jobs:
           echo "blade-ai/vendor/chaosblade contents:"
           ls -la blade-ai/vendor/chaosblade
           file blade-ai/vendor/chaosblade/blade || true
+
+      # ── Download Node.js runtime for bundling into the binary ────────
+      # The TS TUI (tui/dist/cli.js) needs Node to run. By bundling
+      # the Node binary we make the standalone binary truly zero-dep.
+      # Only the ``node`` executable is kept (not npm/npx/corepack).
+      - name: Download Node.js runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER="${NODE_VERSION}"
+          ARCH="${{ matrix.node_arch }}"
+          EXT="${{ matrix.node_ext }}"
+          BASENAME="node-v${VER}-${ARCH}"
+          URL="https://nodejs.org/dist/v${VER}/${BASENAME}.${EXT}"
+          echo "Fetching $URL"
+          curl -fSL --retry 3 --retry-delay 2 -o /tmp/node-archive "$URL"
+          rm -rf blade-ai/vendor/node
+          mkdir -p blade-ai/vendor/node
+          if [ "$EXT" = "tar.xz" ]; then
+            tar -xJf /tmp/node-archive -C /tmp
+            cp "/tmp/${BASENAME}/bin/node" blade-ai/vendor/node/node
+          else
+            tar -xzf /tmp/node-archive -C /tmp
+            cp "/tmp/${BASENAME}/bin/node" blade-ai/vendor/node/node
+          fi
+          chmod +x blade-ai/vendor/node/node* 2>/dev/null || true
+          # Bundle libstdc++/libgcc_s that this Node was linked against.
+          # On old-glibc targets (Alinux 3 / RHEL 8) the system libstdc++
+          # lacks GLIBCXX_3.4.30; shipping Node's own copy ensures it works.
+          mkdir -p blade-ai/vendor/node/lib
+          for lib in $(ldd blade-ai/vendor/node/node 2>/dev/null | grep -oP '/\S+lib(stdc\+\+|gcc_s)\S+' || true); do
+            [ -f "$lib" ] && cp -L "$lib" blade-ai/vendor/node/lib/ && echo "Bundled: $lib"
+          done
+          ls -la blade-ai/vendor/node/lib/ 2>/dev/null || true
+          echo "blade-ai/vendor/node contents:"
+          ls -laR blade-ai/vendor/node
+          file blade-ai/vendor/node/node* || true
 
       # ── Linux: build inside Debian Bullseye Docker (glibc 2.31 baseline) ─
       #
@@ -315,7 +361,7 @@ jobs:
         # universal2 Python above). Single-line if expression keeps
         # the YAML readable; equivalent to the long disjunction.
         if: ${{ !matrix.use_docker && !(matrix.os == 'darwin' && matrix.arch == 'amd64') }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'

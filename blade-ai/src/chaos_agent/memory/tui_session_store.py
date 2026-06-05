@@ -55,7 +55,14 @@ class TuiSessionStore:
     def __init__(self, session_dir: Path, compaction_threshold: int = 50):
         self.session_dir = session_dir.expanduser()
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        self._events_dir = self.session_dir.parent / "tui"
+        self._events_dir.mkdir(parents=True, exist_ok=True)
         self._compaction_threshold = compaction_threshold
+        # Token/thinking stream buffers for event coalescing.
+        # Keyed by tui_session_id. Flushed on non-streamable event.
+        self._token_buf: dict[str, str] = {}
+        self._thinking_buf: dict[str, str] = {}
+        self._buf_meta: dict[str, dict] = {}  # ts, source, task_id from first chunk
         # In-memory buffers for active sessions
         self._active_sessions: dict[str, dict] = {}
         # In-memory dedup key sets, keyed by tui_session_id.
@@ -71,6 +78,13 @@ class TuiSessionStore:
     def _jsonl_path(self, tui_session_id: str) -> Path:
         """Return the JSONL increment-log path for a session."""
         return self.session_dir / f"{tui_session_id}.jsonl"
+
+    def _events_jsonl_path(self, tui_session_id: str) -> Path:
+        """Return the events JSONL path (full StreamEvent audit trail).
+
+        Stored under ``<memory_dir>/tui/`` (sibling of sessions/ and tasks/).
+        """
+        return self._events_dir / f"{tui_session_id}.events.jsonl"
 
     def create(
         self,
@@ -243,6 +257,7 @@ class TuiSessionStore:
 
     def finalize(self, tui_session_id: str, status: str = "completed") -> None:
         """Mark the session as finished and atomically flush."""
+        self._flush_event_buffers(tui_session_id)
         session = self._active_sessions.get(tui_session_id)
         if session is None:
             session = self._load_from_disk(tui_session_id)
@@ -313,6 +328,106 @@ class TuiSessionStore:
             logger.warning(f"Failed to read JSONL for session {tui_session_id}: {e}")
 
         return data
+
+    # ------------------------------------------------------------------
+    # Event audit trail (Display Store)
+    # ------------------------------------------------------------------
+
+    _STREAMABLE = frozenset(("token", "thinking"))
+    _SKIP = frozenset(("node_start", "node_end"))
+
+    def append_event(self, tui_session_id: str, event_dict: dict) -> None:
+        """Append a StreamEvent record to the events JSONL.
+
+        Token and thinking events are coalesced into a single record
+        per contiguous run (60 thinking chunks → 1 merged record).
+        node_start/node_end are dropped (internal signals, not needed
+        for TUI recovery). All other events are written immediately.
+        """
+        event_type = event_dict.get("event_type", "")
+
+        if event_type in self._SKIP:
+            return
+
+        if event_type in self._STREAMABLE:
+            content = (event_dict.get("data") or {}).get("content", "")
+            buf_key = f"_{'token' if event_type == 'token' else 'thinking'}_buf"
+            buf = getattr(self, buf_key)
+            buf[tui_session_id] = buf.get(tui_session_id, "") + content
+            if tui_session_id not in self._buf_meta:
+                self._buf_meta[tui_session_id] = {
+                    "ts": event_dict.get("ts", ""),
+                    "source": event_dict.get("source", ""),
+                    "task_id": event_dict.get("task_id", ""),
+                }
+            return
+
+        # Non-streamable event: flush buffers first, then write this event
+        self._flush_event_buffers(tui_session_id)
+        self._write_event(tui_session_id, event_dict)
+
+    def flush_events(self, tui_session_id: str) -> None:
+        """Flush any pending token/thinking buffers to disk."""
+        self._flush_event_buffers(tui_session_id)
+
+    def _flush_event_buffers(self, tui_session_id: str) -> None:
+        meta = self._buf_meta.pop(tui_session_id, None)
+        if meta is None:
+            return
+        for event_type, buf_dict in (
+            ("thinking", self._thinking_buf),
+            ("token", self._token_buf),
+        ):
+            content = buf_dict.pop(tui_session_id, "")
+            if content:
+                self._write_event(tui_session_id, {
+                    "ts": meta.get("ts", ""),
+                    "source": meta.get("source", ""),
+                    "task_id": meta.get("task_id", ""),
+                    "event_type": event_type,
+                    "data": {"content": content},
+                })
+
+    def _write_event(self, tui_session_id: str, event_dict: dict) -> None:
+        path = self._events_jsonl_path(tui_session_id)
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(event_dict, ensure_ascii=False, default=str)
+                    + "\n"
+                )
+        except OSError as e:
+            logger.warning(
+                f"Failed to append event for session {tui_session_id}: {e}"
+            )
+
+    def read_events(self, tui_session_id: str) -> list[dict]:
+        """Read the full event audit trail for a session.
+
+        Returns an empty list when the file doesn't exist or is
+        unreadable. Corrupt lines are skipped with a warning.
+        """
+        path = self._events_jsonl_path(tui_session_id)
+        if not path.exists():
+            return []
+        out: list[dict] = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        out.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            f"Corrupt event line in session {tui_session_id}, skipping"
+                        )
+        except OSError as e:
+            logger.warning(
+                f"Failed to read events for session {tui_session_id}: {e}"
+            )
+        return out
 
     # ------------------------------------------------------------------
     # Private: JSONL incremental write

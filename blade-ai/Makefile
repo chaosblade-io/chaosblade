@@ -1,14 +1,16 @@
 .PHONY: build wheel wheel-platform clean dev server install run test dist package checksums \
-        dev-tui build-tui install-tui test-tui typecheck-tui clean-tui
+        dev-tui build-tui install-tui test-tui typecheck-tui clean-tui download-node
+
+# Pinned Node.js version for bundling into the standalone binary.
+NODE_VERSION ?= 24.16.0
 
 # PyInstaller standalone binary (curl-install / offline distribution).
-# Self-contained: the ChaosBlade tool is bundled INTO the binary, so it
-# must exist in vendor/ at build time. Auto-download the platform-matching
-# tarball when missing (same version + checksums as the runtime installer
-# via download_chaosblade) so a fresh checkout builds without a manual
-# step. build-tui is a prerequisite — blade-ai.spec force-bundles
-# tui/dist/cli.js and fails loud at Analysis time if it's absent.
-build: build-tui
+# Self-contained: the ChaosBlade tool AND Node.js runtime are bundled INTO
+# the binary, so they must exist in vendor/ at build time. Auto-download
+# platform-matching tarballs when missing so a fresh checkout builds
+# without a manual step. build-tui is a prerequisite — blade-ai.spec
+# force-bundles tui/dist/cli.js and fails loud at Analysis time if absent.
+build: build-tui download-node
 	@HOST=$$(uv run python -c "from chaos_agent.chaosblade_installer import _detect_platform; print(_detect_platform())"); \
 	CUR=$$(cat vendor/chaosblade/.arch 2>/dev/null || echo none); \
 	if [ "$$CUR" != "$$HOST" ]; then \
@@ -16,6 +18,39 @@ build: build-tui
 		uv run python -c "from pathlib import Path; from chaos_agent.chaosblade_installer import download_chaosblade; download_chaosblade(Path('vendor/chaosblade'))"; \
 	fi
 	uv run pyinstaller blade-ai.spec --noconfirm
+
+# Download the platform-matching Node.js binary into vendor/node/.
+# Only the ``node`` executable is kept (not npm/npx/corepack) to
+# minimise bundled size (~50 MB). Skips if already present.
+download-node:
+	@if [ -x vendor/node/node ]; then \
+		echo "vendor/node/node already present — skipping download"; \
+	else \
+		echo "Downloading Node.js v$(NODE_VERSION) for bundling..."; \
+		OS=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+		ARCH=$$(uname -m); \
+		case "$$ARCH" in x86_64) ARCH=x64;; aarch64|arm64) ARCH=arm64;; esac; \
+		case "$$OS" in darwin) EXT=tar.gz;; *) EXT=tar.xz;; esac; \
+		BASENAME="node-v$(NODE_VERSION)-$$OS-$$ARCH"; \
+		URL="https://nodejs.org/dist/v$(NODE_VERSION)/$$BASENAME.$$EXT"; \
+		echo "Fetching $$URL"; \
+		curl -fSL --retry 3 --retry-delay 2 -o /tmp/node-archive.$$EXT "$$URL"; \
+		rm -rf vendor/node; mkdir -p vendor/node; \
+		if [ "$$EXT" = "tar.xz" ]; then \
+			tar -xJf /tmp/node-archive.$$EXT -C /tmp; \
+		else \
+			tar -xzf /tmp/node-archive.$$EXT -C /tmp; \
+		fi; \
+		cp "/tmp/$$BASENAME/bin/node" vendor/node/node; \
+		chmod +x vendor/node/node; \
+		echo "Bundled: vendor/node/node ($$(vendor/node/node --version))"; \
+		if [ "$$OS" = "linux" ]; then \
+			mkdir -p vendor/node/lib; \
+			for lib in $$(ldd vendor/node/node 2>/dev/null | grep -oP '/\S+lib(stdc\+\+|gcc_s)\S+' || true); do \
+				[ -f "$$lib" ] && cp -L "$$lib" vendor/node/lib/ && echo "Bundled lib: $$lib"; \
+			done; \
+		fi; \
+	fi
 
 # Build the UNIVERSAL pip wheel (blade_ai-*-py3-none-any.whl). The TS TUI
 # bundle is force-included by pyproject.toml, so it must exist BEFORE
@@ -71,6 +106,7 @@ checksums: package
 
 clean:
 	rm -rf build dist
+	rm -rf vendor/node
 	rm -f blade-ai-*.tar.gz checksums.txt
 	find ./src -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null
 	find ./tests -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null

@@ -106,9 +106,10 @@ def get_verifier_delay_section() -> str:
 {get_fault_effect_delay_section()}
 
 **Therefore:**
-- Do NOT conclude "fault not in effect" based on a SINGLE observation. If the first check shows no effect, wait and re-check.
-- You have multiple iterations available. Use iteration 1-2 for initial checks, and if results are inconclusive, use iteration 3-4 for re-verification after the delay.
-- If `kubectl top` shows low CPU on the first try, check again in a later iteration — the CPU spike may not have appeared yet.
+- Do NOT conclude "fault not in effect" based on a SINGLE observation.
+- If the first check shows no effect, call `time_wait(seconds=20)` to wait for the fault to propagate, then re-check the SAME metrics.
+- Only conclude "unverified" when a SECOND observation AFTER waiting still shows no change from baseline.
+- Two consecutive checks without waiting in between prove nothing — the fault simply hasn't had time to take effect.
 - If `kubectl exec` returns empty (container lacks tools), switch to `kubectl describe` and `kubectl get -o json` for Pod-level signals.
 
 {get_multi_iteration_section()}

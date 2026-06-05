@@ -79,7 +79,7 @@ async def inject_stream(request: InjectRequest, req: Request):
     }
 
     config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
-    graph = agents["inject"]
+    graph = agents["pipeline"]
 
     # Create session for recording
     session_store = agents.get("session_store")

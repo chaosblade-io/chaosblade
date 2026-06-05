@@ -1060,9 +1060,9 @@ class CommandDispatcher:
         )
 
         agents = getattr(self._runner, "_agents", {}) or {}
-        graph = agents.get("inject")
+        graph = agents.get("intent") or agents.get("pipeline")
         if graph is None:
-            self._renderer.system("Runner 未初始化 inject 图，无法压缩。")
+            self._renderer.system("Runner 未初始化，无法压缩。")
             return
 
         # Unified path: drive the SAME PreReasoningHook the auto-trigger

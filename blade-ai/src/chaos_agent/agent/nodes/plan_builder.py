@@ -115,13 +115,14 @@ PRESENT_OPTIONS_TOOL = {
 _INTERNAL_TOOLS = frozenset(("submit_plan", "present_options"))
 
 
-def make_plan_builder(llm=None, tools: list = None, hook=None):
+def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
     """Create the plan_builder node function.
 
     Args:
         llm: LangChain LLM instance.
         tools: Phase1 tools (kubectl_ro, activate_skill, read_skill_resource).
         hook: Optional PreReasoningHook for memory compaction.
+        registry: SkillRegistry for dynamic skill catalog in system prompts.
     """
 
     async def plan_builder(state: AgentState) -> dict:
@@ -149,6 +150,7 @@ def make_plan_builder(llm=None, tools: list = None, hook=None):
             content=build_system_prompt(
                 PromptMode.PLAN_BUILDER,
                 fault_spec=existing_spec,
+                skill_catalog=registry.build_catalog_prompt() if registry else "",
             )
         )
 
@@ -182,6 +184,7 @@ def make_plan_builder(llm=None, tools: list = None, hook=None):
             # ── Priority 1: submit_plan ──
             submit_args = _extract_submit_plan(tool_calls)
             if submit_args:
+                submit_args = _validate_submit_plan(submit_args)
                 new_spec = _build_spec_from_submit(submit_args, existing_spec)
                 plan_text = _format_final_plan(submit_args, state, new_spec)
                 if tracker:
@@ -189,12 +192,21 @@ def make_plan_builder(llm=None, tools: list = None, hook=None):
                 _persist_dialogue(tui_session_id, _build_dialogue_persist_list(
                     messages, accumulated, response, system_msg, plan_builder_round,
                 ))
-                return merge_hook_updates({
+                result_dict = {
                     "messages": accumulated + [AIMessage(content=plan_text)],
                     "fault_spec": new_spec.to_dict(),
                     "plan_confirmed": True,
                     "plan_builder_round": plan_builder_round + rounds_this_invoke + 1,
-                }, hook_updates)
+                }
+                # Store full batch args when multiple faults submitted
+                faults = submit_args.get("faults", [])
+                if len(faults) > 1:
+                    result_dict["batch_submit_args"] = {
+                        "faults": faults,
+                        "execution_order": submit_args.get("execution_order", "serial"),
+                        "interval_seconds": submit_args.get("interval_seconds", 0),
+                    }
+                return merge_hook_updates(result_dict, hook_updates)
 
             # ── Priority 2: present_options → interrupt() ──
             options_args = _extract_present_options(tool_calls)
@@ -310,6 +322,39 @@ def _extract_submit_plan(tool_calls: list) -> dict | None:
         if tc.get("name") == "submit_plan":
             return tc.get("args", {})
     return None
+
+
+def _validate_submit_plan(args: dict) -> dict:
+    """Validate and sanitize submit_plan arguments.
+
+    Ensures faults array is non-empty and each fault has scope/target/action.
+    Drops invalid entries and logs warnings.
+    """
+    faults = args.get("faults", [])
+    if not isinstance(faults, list) or not faults:
+        logger.warning("submit_plan: empty or invalid faults array")
+        return args
+
+    valid = []
+    for i, f in enumerate(faults):
+        if not isinstance(f, dict):
+            logger.warning("submit_plan: fault[%d] is not a dict, skipping", i)
+            continue
+        if not (f.get("scope") and f.get("target") and f.get("action")):
+            logger.warning(
+                "submit_plan: fault[%d] missing scope/target/action: %s, skipping",
+                i, {k: f.get(k) for k in ("scope", "target", "action")},
+            )
+            continue
+        valid.append(f)
+
+    if not valid:
+        logger.warning("submit_plan: no valid faults after validation, keeping originals")
+        return args
+
+    args = dict(args)
+    args["faults"] = valid
+    return args
 
 
 def _extract_present_options(tool_calls: list) -> dict | None:

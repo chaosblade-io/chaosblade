@@ -281,6 +281,7 @@ def build_verifier_prompt() -> str:
 
 def build_intent_clarification_prompt(
     fault_intent: dict | None = None,
+    skill_catalog: str = "",
     **kwargs,
 ) -> str:
     """Build intent_clarification system prompt using U-shaped composition.
@@ -313,12 +314,16 @@ def build_intent_clarification_prompt(
         get_intent_dialogue_modes_section(),
         get_intent_convergence_section(),
         get_intent_tools_section(),
+        get_skill_index_section(skill_catalog),
         get_intent_output_section(),
     ]
 
     # Dynamic sections (below cache boundary — may change between turns)
     dynamic_sections = []
-    completeness = get_intent_completeness_section(fault_intent)
+    completeness = get_intent_completeness_section(
+        fault_intent,
+        batch_submit_args=kwargs.get("batch_submit_args"),
+    )
     if completeness:
         dynamic_sections.append(completeness)
 
@@ -335,6 +340,7 @@ def build_intent_clarification_prompt(
 def build_plan_builder_prompt(
     collected_faults: list | None = None,
     fault_spec=None,
+    skill_catalog: str = "",
     **kwargs,
 ) -> str:
     """Build plan_builder system prompt using U-shaped composition.
@@ -347,6 +353,7 @@ def build_plan_builder_prompt(
         get_plan_builder_critical_rules_section(),
         get_plan_builder_workflow_section(),
         get_plan_builder_tools_section(),
+        get_skill_index_section(skill_catalog),
         get_plan_builder_output_format_section(),
     ]
 

@@ -367,7 +367,7 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
         )
 
     agents = getattr(req.app.state, "agents", None) or {}
-    graph = agents.get("inject")
+    graph = agents.get("intent")
     if graph is None:
         # Lifespan deferred ``create_agent`` because essential LLM
         # config is missing — surface NEEDS_SETUP so the TUI can

@@ -404,7 +404,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             #       P2 tool_result injection removed (3× redundancy eliminated)
             system_prompt = build_system_prompt(
                 PromptMode.FULL,
-                skill_catalog=skill_catalog,
+                skill_catalog=registry.build_catalog_prompt() if registry else skill_catalog,
                 input_is_nl=bool(state.get("input")),
                 env_info=env_info,
                 replan_context=replan_context if is_replan else None,

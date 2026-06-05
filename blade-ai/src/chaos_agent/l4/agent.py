@@ -124,7 +124,7 @@ class _ChaosAgentPool:
 
             checkpointer = MemorySaver()
             agents = asyncio.run(create_agent(registry, checkpointer=checkpointer))
-            self.inject_graph = agents["inject"]
+            self.inject_graph = agents["pipeline"]
             self.recover_graph = agents["recover"]
             self.skill_registry = registry
             self._initialized = True

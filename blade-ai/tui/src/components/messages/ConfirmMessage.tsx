@@ -674,6 +674,8 @@ const IntentConfirmCard: React.FC<{
   taskId?: string;
 }> = ({ payload, taskId }) => {
   const fi = asRecord(payload?.["fault_intent"]) ?? {};
+  const batchFaults = asArray(payload?.["batch_faults"]);
+  const isBatch = batchFaults != null && batchFaults.length > 0;
   const params = asRecord(fi["params"]);
   const labels = asRecord(fi["labels"]);
   const names = asArray(fi["names"]);
@@ -699,12 +701,6 @@ const IntentConfirmCard: React.FC<{
 
   const risk = computeRiskInfo(fi);
 
-  // P2-7: Layer 1 audit trail. ``intent_reasoning`` is the LLM's own
-  // explanation for the classification; we surface it ONLY on
-  // low-confidence turns (the user is most likely to second-guess
-  // the call there). ``clarification_round`` tells the user we're
-  // already iterating — useful so they don't think "did my message
-  // get lost?". Both fields are optional; absent means no audit row.
   const intentReasoning = asString(payload?.["intent_reasoning"]);
   const clarificationRoundRaw = payload?.["clarification_round"];
   const clarificationRound =
@@ -720,26 +716,53 @@ const IntentConfirmCard: React.FC<{
       glyph={Icons.thinking}
       glyphColor={Theme.forge.fire}
       chipLabel={t("confirm.intent.chip")}
-      title={t("confirm.intent.title")}
-      preamble={t("confirm.intent.preamble")}
+      title={isBatch ? `${t("confirm.intent.title")}  ·  ${batchFaults.length} 个故障` : t("confirm.intent.title")}
+      preamble={isBatch ? "已识别如下批量故障注入意图（串行执行）：" : t("confirm.intent.preamble")}
       taskId={taskId}
     >
-      <Field label={t("confirm.field.fault_type")} value={asString(fi["fault_type"])} />
-      <Field label={t("confirm.field.scope")} value={asString(fi["scope"])} />
-      <Field label={t("confirm.field.target")} value={asString(fi["target"])} />
-      <Field label={t("confirm.field.action")} value={asString(fi["action"])} />
-      <Field
-        label={t("confirm.field.namespace")}
-        value={asString(fi["namespace"])}
-      />
-      <Field label={t("confirm.field.labels")} value={labelsStr} />
-      <Field label={t("confirm.field.names")} value={namesStr} />
-      <Field label={t("confirm.field.params")} value={paramsStr} />
-      <Field
-        label={t("confirm.field.user_description")}
-        value={asString(fi["user_description"])}
-      />
-      {risk && (
+      {isBatch ? (
+        /* Batch: render each fault as a compact row */
+        <Box flexDirection="column">
+          {batchFaults.map((raw, i) => {
+            const f = asRecord(raw) ?? {};
+            const fScope = asString(f["scope"]);
+            const fTarget = asString(f["target"]);
+            const fAction = asString(f["action"]);
+            const fNs = asString(f["namespace"]);
+            const fNames = asArray(f["names"]);
+            const fNamesStr = fNames ? fNames.map(asString).filter(Boolean).join(", ") : "*";
+            return (
+              <Box key={i}>
+                <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1}>
+                  <Text color={Theme.gray[500]}>{`故障 ${i + 1}`}</Text>
+                </Box>
+                <Box flexGrow={1}>
+                  <Text color={Theme.text.primary} bold>
+                    {`${fScope}-${fTarget}-${fAction}`}
+                  </Text>
+                  <Text color={Theme.gray[500]}>
+                    {`  @ ${fNs}/${fNamesStr}`}
+                  </Text>
+                </Box>
+              </Box>
+            );
+          })}
+        </Box>
+      ) : (
+        /* Single fault: existing structured fields */
+        <>
+          <Field label={t("confirm.field.fault_type")} value={asString(fi["fault_type"])} />
+          <Field label={t("confirm.field.scope")} value={asString(fi["scope"])} />
+          <Field label={t("confirm.field.target")} value={asString(fi["target"])} />
+          <Field label={t("confirm.field.action")} value={asString(fi["action"])} />
+          <Field label={t("confirm.field.namespace")} value={asString(fi["namespace"])} />
+          <Field label={t("confirm.field.labels")} value={labelsStr} />
+          <Field label={t("confirm.field.names")} value={namesStr} />
+          <Field label={t("confirm.field.params")} value={paramsStr} />
+          <Field label={t("confirm.field.user_description")} value={asString(fi["user_description"])} />
+        </>
+      )}
+      {!isBatch && risk && (
         <Box marginTop={1} flexDirection="column">
           <RiskMeterRow risk={risk} />
         </Box>
@@ -785,24 +808,8 @@ const SafetyCheckRow: React.FC<{
   color: string;
   label: string;
   detail?: string;
-}> = ({ glyph, color, label, detail }) => (
-  <Box>
-    <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0}>
-      <Text color={color}>{glyph}</Text>
-    </Box>
-    <Box minWidth={LIST_NAME_WIDTH} flexShrink={0} paddingRight={1}>
-      <Text color={Theme.gray[500]} wrap="truncate-end">
-        {label}
-      </Text>
-    </Box>
-    {detail && (
-      <Box flexGrow={1}>
-        <Text color={Theme.text.primary} wrap="wrap">
-          {detail}
-        </Text>
-      </Box>
-    )}
-  </Box>
+}> = ({ label, detail }) => (
+  <Field label={label} value={detail || ""} wrap />
 );
 
 /** v3 Safety section — renders the (currently single-result) safety

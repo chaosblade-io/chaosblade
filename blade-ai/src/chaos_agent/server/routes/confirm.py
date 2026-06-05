@@ -36,7 +36,7 @@ async def confirm_task(task_id: str, request: ConfirmRequest, req: Request):
         from langgraph.types import Command
 
         resume_value = "approved" if request.action == "approve" else "rejected"
-        await agents["inject"].ainvoke(Command(resume=resume_value), config)
+        await agents["pipeline"].ainvoke(Command(resume=resume_value), config)
 
         new_state = "injecting" if request.action == "approve" else "cancelled"
 

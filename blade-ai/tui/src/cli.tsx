@@ -111,26 +111,16 @@ async function main(): Promise<void> {
   // Context shape supports adding more without further wiring.
   const terminalBg = await detectTerminalBg();
 
-  // Two stdout monkey-patches that materially smooth out streaming
-  // output. Install BEFORE Ink's render() so every byte Ink ever
-  // writes goes through them. Restored at the END of cleanup() so
-  // every write up to that point — including the goodbye-card
-  // print — goes through the patches (they're transparent for
-  // non-eraseLine text, just defensive bookkeeping).
+  // Two stdout monkey-patches that smooth out streaming output.
+  // Install BEFORE Ink's render() so every byte goes through them.
   //
-  //   1. Terminal redraw optimizer: folds Ink's per-line
-  //      ``eraseLine + cursorUp`` storm into one bounded jump.
-  //      Kills "scrollback bouncing" when the user mouse-wheels
-  //      during streaming.
-  //   2. Synchronized output (DEC mode 2026): tells iTerm2 /
-  //      WezTerm / kitty to atomically commit each tick's worth
-  //      of writes. Eliminates the blank-frame flash between
-  //      eraseLines and the new lines arriving.
-  //
-  // Both no-op on a non-TTY stdout (--help piping, CI capture) or
-  // a terminal not in the supported set; both honour escape-hatch
-  // env vars (BLADE_AI_LEGACY_ERASE_LINES=1,
-  // BLADE_AI_DISABLE_SYNCHRONIZED_OUTPUT=1).
+  //   1. Redraw optimizer: folds Ink's per-line eraseLine+cursorUp
+  //      storm into one bounded jump.
+  //   2. Synchronized output (DEC mode 2026): wraps each event-loop
+  //      tick's writes in one atomic bsu/esu pair. Ink has built-in
+  //      per-operation sync, but our tick-level wrapper is strictly
+  //      stronger — it prevents intermediate paints between Ink's
+  //      separate static-output and dynamic-frame writes.
   const restoreRedraw = process.stdout.isTTY
     ? installTerminalRedrawOptimizer(process.stdout)
     : () => {};
@@ -191,10 +181,7 @@ async function main(): Promise<void> {
       await step("server-shutdown", server.shutdown().catch(() => undefined));
     }
 
-    // Restore the original stdout.write so the goodbye-card writes
-    // that follow this cleanup() go through Node directly. Order
-    // matters: redraw optimizer wrapped first, sync output wrapped
-    // second — restore in reverse so the unwrapping is symmetric.
+    // Restore original stdout.write — reverse install order.
     // Both are idempotent no-ops if their install bailed.
     try {
       restoreSync();
@@ -306,8 +293,6 @@ async function main(): Promise<void> {
       </StoreProvider>
     </TerminalBgProvider>,
     {
-      incrementalRendering: true,
-      concurrent: true,
       maxFps: 30,
     },
   );
