@@ -232,10 +232,12 @@ def _get_preflight_openai_client(
 def _self_check_timeout() -> int:
     """Bound the kubectl self-check timeout so startup never blocks 30s.
 
-    Production runs use settings.timeout_kubectl; preflight prefers the
-    smaller of (15, configured) to keep the panel responsive.
+    Must be strictly less than ``_PREFLIGHT_BUDGET_S`` (8s) so that
+    individual kubectl checks timeout *before* the outer wait_for
+    cancels the entire gather — otherwise a single slow check causes
+    ALL results (including fast local checks) to be discarded.
     """
-    return min(15, settings.timeout_kubectl or 15)
+    return min(6, settings.timeout_kubectl or 15)
 
 
 def _pretty_path(p: str | Path) -> str:

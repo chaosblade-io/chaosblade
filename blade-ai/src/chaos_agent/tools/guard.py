@@ -70,6 +70,11 @@ class ToolGuard:
         "apply",
         "create",
         "rollout",
+        "version",
+        "cluster-info",
+        "api-resources",
+        "explain",
+        "auth",
     }
 
     PARAM_BLACKLIST_PATTERNS = [
