@@ -133,3 +133,41 @@ describe("acceptChromeMeasurement", () => {
     expect(acceptChromeMeasurement(8, 10)).toBeNull();
   });
 });
+
+describe("acceptChromeMeasurement — hysteresis (issue #1301)", () => {
+  it("suppresses ±1 oscillation when prev is provided", () => {
+    // prev=20, measured=21 → keep 20 (not 21)
+    expect(acceptChromeMeasurement(21, 80, 20)).toBe(20);
+    // prev=20, measured=19 → keep 20 (not 19)
+    expect(acceptChromeMeasurement(19, 80, 20)).toBe(20);
+    // prev=20, measured=20 → keep 20 (exact match)
+    expect(acceptChromeMeasurement(20, 80, 20)).toBe(20);
+  });
+
+  it("accepts jumps > 1 row even with prev", () => {
+    // Real layout change: chrome grows from 20 to 25
+    expect(acceptChromeMeasurement(25, 80, 20)).toBe(25);
+    // Real layout change: chrome shrinks from 20 to 15
+    expect(acceptChromeMeasurement(15, 80, 20)).toBe(15);
+    // Boundary: exactly ±2 should pass through
+    expect(acceptChromeMeasurement(22, 80, 20)).toBe(22);
+    expect(acceptChromeMeasurement(18, 80, 20)).toBe(18);
+  });
+
+  it("ignores prev when it is undefined (backward compatibility)", () => {
+    // No prev → behaves exactly as before
+    expect(acceptChromeMeasurement(20, 80)).toBe(20);
+    expect(acceptChromeMeasurement(21, 80)).toBe(21);
+  });
+
+  it("hysteresis does not bypass other guards", () => {
+    // NaN still rejected even with prev
+    expect(acceptChromeMeasurement(Number.NaN, 80, 20)).toBeNull();
+    // Below 5 still rejected
+    expect(acceptChromeMeasurement(3, 80, 20)).toBeNull();
+    // Above cap still rejected
+    expect(acceptChromeMeasurement(36, 80, 20)).toBeNull();
+    // Infinity still rejected
+    expect(acceptChromeMeasurement(Number.POSITIVE_INFINITY, 80, 20)).toBeNull();
+  });
+});
