@@ -649,22 +649,16 @@ async def compact_memory(
         # Prepare messages, truncating if too long
         compact_msgs = _prepare_compaction_messages(messages_to_compact)
 
-        try:
-            response = await llm.ainvoke(
-                [SystemMessage(content=prompt)] + compact_msgs
-            )
-            # Log reasoning_content in debug mode (enable_thinking)
-            additional_kwargs = getattr(response, "additional_kwargs", {}) or {}
-            reasoning_content = additional_kwargs.get("reasoning_content", "")
-            if reasoning_content and settings.is_debug:
-                text = reasoning_content[:300] + ("..." if len(reasoning_content) > 300 else "")
-                logger.debug(f"💭 compaction thinking: {text}")
-            summary = response.content
-            # Format the two-step summary (strip <analysis>, format <summary>)
-            summary = format_compact_summary(summary)
-        except Exception as e:
-            logger.warning(f"LLM compaction failed, falling back to simple compact: {e}")
-            summary = _simple_compact(messages_to_compact, previous_summary)
+        response = await llm.ainvoke(
+            [SystemMessage(content=prompt)] + compact_msgs
+        )
+        additional_kwargs = getattr(response, "additional_kwargs", {}) or {}
+        reasoning_content = additional_kwargs.get("reasoning_content", "")
+        if reasoning_content and settings.is_debug:
+            text = reasoning_content[:300] + ("..." if len(reasoning_content) > 300 else "")
+            logger.debug(f"💭 compaction thinking: {text}")
+        summary = response.content
+        summary = format_compact_summary(summary)
 
     # Prepend context-recovery message if critical context was extracted
     context_msg = build_post_compact_context_message(critical_context)
@@ -676,15 +670,31 @@ async def compact_memory(
 
 def _prepare_compaction_messages(messages: list) -> list:
     """Truncate messages list to fit within compaction input budget."""
-    total_chars = 0
+    total_chars = sum(
+        len(c) for msg in messages
+        if isinstance((c := getattr(msg, "content", "")), str)
+    )
+    if total_chars <= MAX_COMPACTION_INPUT_CHARS:
+        return messages
+
     result = []
-    for msg in messages:
+    kept_chars = 0
+    for msg in reversed(messages):
         content = getattr(msg, "content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        if total_chars > MAX_COMPACTION_INPUT_CHARS:
+        msg_chars = len(content) if isinstance(content, str) else 0
+        if kept_chars + msg_chars > MAX_COMPACTION_INPUT_CHARS:
             break
         result.append(msg)
+        kept_chars += msg_chars
+
+    result.reverse()
+
+    dropped = len(messages) - len(result)
+    logger.warning(
+        f"Compaction input truncated: dropped {dropped} oldest of "
+        f"{len(messages)} messages ({total_chars - kept_chars} chars over "
+        f"{MAX_COMPACTION_INPUT_CHARS} budget)"
+    )
     return result
 
 

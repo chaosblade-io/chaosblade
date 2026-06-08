@@ -20,8 +20,9 @@ def _build_registry() -> list[dict]:
     """Scan knowledge/ directory, parse frontmatter from each .md file.
 
     Returns a sorted list of metadata dicts. Files without valid frontmatter
-    are skipped with a warning (they will NOT appear in the knowledge index,
-    but can still be read via read_knowledge_resource if the filename is known).
+    are skipped with a warning — they will NOT appear in the knowledge index
+    and cannot be read via read_knowledge_resource (which validates against
+    this registry).
     """
     registry = []
     if not KNOWLEDGE_DIR.is_dir():

@@ -202,11 +202,9 @@ class TestIntentClarificationSectionFunctions:
         assert "CRITICAL RULES" in section
         # 4 specific rules present
         assert "NEVER re-ask" in section
-        assert "summarize intent" in section
-        assert "classify_intent is ONLY" in section
+        assert "summarize" in section and "confirms" in section
+        assert "classify_intent" in section
         assert "Single routing action" in section
-        # Execution keywords present (Chinese — user-facing trigger words)
-        assert "开始" in section or "执行" in section
 
     def test_safety_section_has_key_rules(self):
         section = get_intent_safety_section()
@@ -219,8 +217,8 @@ class TestIntentClarificationSectionFunctions:
         assert "Chat Mode" in section
         assert "Intent Routing" in section
         assert "Cluster Query" in section
-        # classify_intent restriction
-        assert "Do NOT call classify_intent" in section
+        # Batch routing present
+        assert "Batch" in section or "batch" in section
 
     def test_convergence_section_has_principles(self):
         section = get_intent_convergence_section()

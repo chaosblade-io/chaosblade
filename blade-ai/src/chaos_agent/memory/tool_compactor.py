@@ -442,16 +442,15 @@ class ToolResultCompactor:
             messages = time_result
 
         # Step 2: Size-based two-stage truncation
+        # Exclude read_skill_resource from the list so it doesn't
+        # inflate len(tool_results) and shift the recency window.
         tool_results = [
-            (i, msg) for i, msg in enumerate(messages) if is_tool_message(msg)
+            (i, msg)
+            for i, msg in enumerate(messages)
+            if is_tool_message(msg) and getattr(msg, "name", "") != "read_skill_resource"
         ]
 
         for idx, (i, msg) in enumerate(tool_results):
-            # Skill case content is the primary authority for downstream
-            # nodes (baseline, execute, verifier) — never truncate it.
-            if getattr(msg, "name", "") == "read_skill_resource":
-                continue
-
             is_recent = idx >= len(tool_results) - self.KEEP_RECENT_N
             max_bytes = self.RECENT_MAX_BYTES if is_recent else self.OLD_MAX_BYTES
 
@@ -459,24 +458,32 @@ class ToolResultCompactor:
             if not isinstance(content, str):
                 continue
 
+            akw = getattr(msg, "additional_kwargs", None) or {}
+            if akw.get("_truncated_budget") == max_bytes:
+                continue
+
             if len(content.encode("utf-8", errors="replace")) > max_bytes:
                 original_size = len(content.encode("utf-8", errors="replace"))
                 cache_path = self._cache_to_disk(content, task_id)
 
-                # Try smart strip for K8s JSON responses first
-                stripped = smart_strip_k8s_json(content, max_bytes)
+                notice = build_truncation_notice(
+                    original_size, max_bytes, is_recent, cache_path
+                )
+                notice_bytes = len(notice.encode("utf-8", errors="replace"))
+                truncate_budget = max(max_bytes - notice_bytes, max_bytes // 2)
+
+                stripped = smart_strip_k8s_json(content, truncate_budget)
                 if stripped is not None:
                     msg.content = stripped
                 else:
-                    # Not a K8s list JSON — try boundary-aware JSON truncation
                     if content.lstrip().startswith("{") or content.lstrip().startswith("["):
-                        msg.content = truncate_json_at_boundary(content, max_bytes)
+                        msg.content = truncate_json_at_boundary(content, truncate_budget)
                     else:
-                        msg.content = truncate_text(content, max_bytes)
+                        msg.content = truncate_text(content, truncate_budget)
 
-                # Append actionable truncation notice
-                msg.content += build_truncation_notice(
-                    original_size, max_bytes, is_recent, cache_path
-                )
+                msg.content += notice
+
+                if isinstance(akw, dict):
+                    akw["_truncated_budget"] = max_bytes
 
         return messages

@@ -13,6 +13,7 @@ from langchain_core.messages import SystemMessage, RemoveMessage
 from chaos_agent.agent.node_names import MEMORY_HOOK, TOOL_RESULT
 from chaos_agent.memory.compactor import compact_memory
 from chaos_agent.memory.context_manager import (
+    MAX_CONSECUTIVE_COMPACT_FAILURES,
     CompactTrackingState,
     ContextManager,
     strip_large_outputs,
@@ -583,21 +584,21 @@ class PreReasoningHook:
             )
         except Exception as e:
             duration_ms = (time.monotonic() - start_time) * 1000
-            # Circuit breaker: count this failure. After
-            # MAX_CONSECUTIVE_COMPACT_FAILURES in a row, the next
-            # check_context call will short-circuit with valid=False
-            # and we'll stop hammering the LLM with a request it
-            # clearly can't handle (e.g. provider 5xx, malformed
-            # response, OOM in the summariser).
             tracking.consecutive_failures += 1
             self._emit_compaction_event(
                 task_id,
                 "failed",
-                f"Compression failed: {e}",
+                f"LLM compaction failed ({tracking.consecutive_failures}/"
+                f"{MAX_CONSECUTIVE_COMPACT_FAILURES}): {e}",
                 category="node",
                 duration_ms=duration_ms,
             )
-            raise
+            logger.warning(
+                f"LLM compaction failed for task {task_id}, "
+                f"skipping this turn (failures: {tracking.consecutive_failures}/"
+                f"{MAX_CONSECUTIVE_COMPACT_FAILURES}): {e}"
+            )
+            return obs_update
 
         # 5. Build LangGraph-compatible state update:
         #    Remove compacted messages + add incremental summary message

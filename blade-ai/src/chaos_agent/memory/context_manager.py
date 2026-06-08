@@ -441,16 +441,34 @@ class ContextManager:
         messages_to_compact = [m for m in messages if id(m) not in keep_ids]
 
         # Ensure tool_call/tool_result pairs are not split.
-        # Use group_messages_by_round for robust grouping: if the first
-        # message in to_keep is a tool result (without its AI caller),
-        # move the entire round back to to_compact.
+        # Scan to_keep from the start, skipping [Compressed History]
+        # summaries: any ToolMessage whose AI caller is in to_compact
+        # is an orphan and must move back so the pair stays together.
         if messages_to_keep and messages_to_compact:
-            first_keep = messages_to_keep[0]
-            if hasattr(first_keep, "type") and first_keep.type == "tool":
-                # Tool result without its AI caller — move it back
-                messages_to_compact.append(messages_to_keep.pop(0))
+            i = 0
+            while i < len(messages_to_keep):
+                if _is_compressed_history(messages_to_keep[i]):
+                    i += 1
+                    continue
+                msg = messages_to_keep[i]
+                if not (hasattr(msg, "type") and msg.type == "tool"):
+                    break
+                tc_id = getattr(msg, "tool_call_id", None)
+                caller_in_compact = False
+                if tc_id:
+                    for cm in messages_to_compact:
+                        for tc in getattr(cm, "tool_calls", []):
+                            if tc.get("id") == tc_id:
+                                caller_in_compact = True
+                                break
+                        if caller_in_compact:
+                            break
+                if not caller_in_compact:
+                    break
+                messages_to_compact.append(messages_to_keep.pop(i))
 
-        # Additional safety: use ensure_pair_integrity for edge cases
+        # Additional safety: if the last message in to_compact is an AI
+        # with tool_calls, its results may be in to_keep — pull it over.
         messages_to_compact, messages_to_keep = ensure_pair_integrity(
             messages_to_compact, messages_to_keep
         )

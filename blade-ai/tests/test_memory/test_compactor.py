@@ -1,5 +1,6 @@
 """Tests for LLM-based structured compaction."""
 
+import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from chaos_agent.memory.compactor import (
@@ -44,13 +45,12 @@ class TestCompactMemoryWithLLM:
         prompt_text = call_args[0].content
         assert "old summary" in prompt_text
 
-    async def test_llm_exception_fallback(self, mocker):
+    async def test_llm_exception_propagates(self, mocker):
         failing_llm = AsyncMock()
         failing_llm.ainvoke = AsyncMock(side_effect=RuntimeError("LLM down"))
         msgs = [MagicMock(content="some content")]
-        result = await compact_memory(msgs, llm=failing_llm)
-        # Should fall back to simple compact
-        assert "Compressed History" in result
+        with pytest.raises(RuntimeError, match="LLM down"):
+            await compact_memory(msgs, llm=failing_llm)
 
 
 class TestCompactMemoryWithoutLLM:

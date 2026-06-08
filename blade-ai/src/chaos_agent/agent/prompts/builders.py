@@ -48,6 +48,7 @@ from chaos_agent.agent.prompts.sections.intent import (
     get_intent_critical_rules_section,
     get_intent_safety_section,
     get_intent_dialogue_modes_section,
+    get_intent_batch_design_section,
     get_intent_convergence_section,
     get_intent_tools_section,
     get_intent_output_section,
@@ -310,8 +311,9 @@ def build_intent_clarification_prompt(
         get_intent_role_section(),
         get_intent_critical_rules_section(),
         get_intent_safety_section(),
-        # Middle zone: dialogue modes, convergence, tools, output
+        # Middle zone: modes, batch design, convergence, tools, output
         get_intent_dialogue_modes_section(),
+        get_intent_batch_design_section(),
         get_intent_convergence_section(),
         get_intent_tools_section(),
         get_skill_index_section(skill_catalog),

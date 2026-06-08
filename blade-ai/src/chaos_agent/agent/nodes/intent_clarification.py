@@ -51,23 +51,21 @@ logger = logging.getLogger(__name__)
 CLASSIFY_INTENT_TOOL = {
     "name": "classify_intent",
     "description": (
-        "Route a non-inject intent. Call this when the user clearly "
-        "wants to recover a previous experiment, to end the conversation "
-        "(chat/goodbye), or to perform batch/multi-scenario fault injection "
-        "(batch_inject). Do NOT call this for single fault injection — "
-        "use submit_fault_intent for that. Do NOT call this for cluster "
-        "queries or capability questions — answer those directly."
+        "Route a non-inject intent. Call this ONLY when the user clearly "
+        "wants to recover a previous experiment or to end the conversation "
+        "(chat/goodbye). Do NOT call this for fault injection (single or "
+        "batch) — use submit_fault_intent or submit_batch_intent directly. "
+        "Do NOT call this for cluster queries or capability questions."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "intent": {
                 "type": "string",
-                "enum": ["recover", "chat", "batch_inject"],
+                "enum": ["recover", "chat"],
                 "description": (
-                    "The classified intent type. Use 'batch_inject' when "
-                    "the user's request involves more than one fault — "
-                    "multiple targets, multiple fault types, or an explicit count."
+                    "The classified intent type. 'recover' for undoing a "
+                    "previous experiment, 'chat' for goodbye/no-need."
                 ),
             },
             "confidence": {
@@ -208,7 +206,7 @@ def _extract_classify_intent(tool_calls: list) -> Optional[dict]:
                     confidence = float(confidence)
                 except (ValueError, TypeError):
                     confidence = 0.0
-            valid = ("recover", "chat")
+            valid = ("recover", "chat", "batch_inject")
             return {
                 "intent": intent if intent in valid else "chat",
                 "confidence": min(1.0, max(0.0, confidence)),
@@ -465,8 +463,17 @@ def submit_batch_intent(
     """Submit multiple fault injection intents for batch execution.
 
     Call this when the user wants to inject multiple faults at once.
-    Each fault is an independent intent with its own target — infer from
-    conversation context how to assign targets:
+
+    DIVERSITY PRINCIPLE — when user asks for "N种场景/scenarios":
+      - FIRST maximize fault type diversity: pick N different fault types
+        (cpu, mem, network, disk, process, jvm, etc.)
+      - THEN assign each fault to a different target resource for maximum
+        coverage (different pods/nodes)
+      - ANTI-PATTERN: same fault type × N different targets is NOT "N种场景"
+      - Only repeat a fault type when user explicitly requests it or when
+        available types are fewer than N
+
+    Target assignment (after type diversity is satisfied):
       - all faults on the same node/pod → share the same names
       - each fault on a different node/pod → assign different names per fault
       - user specifies explicitly → follow user instruction

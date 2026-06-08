@@ -579,7 +579,7 @@ class TestIntentClarificationNode:
         props = CLASSIFY_INTENT_TOOL["parameters"]["properties"]
         assert "intent" in props
         assert "confidence" in props
-        assert props["intent"]["enum"] == ["recover", "chat", "batch_inject"]
+        assert props["intent"]["enum"] == ["recover", "chat"]
 
     @pytest.mark.asyncio
     async def test_submit_fault_intent_is_real_tool(self):
