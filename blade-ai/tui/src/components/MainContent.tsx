@@ -189,10 +189,21 @@ export function chromeMeasurementCap(rows: number): number {
 export function acceptChromeMeasurement(
   measured: number,
   rows: number,
+  prev?: number,
 ): number | null {
   if (!Number.isFinite(measured)) return null;
   if (measured < 5) return null;
   if (measured > chromeMeasurementCap(rows)) return null;
+  // Hysteresis: suppress ±1 oscillation noise.
+  // On Linux terminals (no DEC 2026 sync), Yoga integer rounding can
+  // cause measureElement to alternate between N and N±1 across renders,
+  // creating a visible flicker feedback loop. When the new measurement
+  // differs from the previously accepted value by at most 1 row, treat
+  // it as layout noise and keep the stable previous value.
+  // See: https://github.com/chaosblade-io/chaosblade/issues/1301
+  if (prev !== undefined && Math.abs(measured - prev) <= 1) {
+    return prev;
+  }
   return measured;
 }
 
@@ -238,6 +249,13 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
   const [chromeHeight, setChromeHeight] = useState<number>(
     CHROME_ROWS_RESERVE,
   );
+
+  // Hysteresis ref — tracks the last accepted chromeHeight synchronously
+  // so useLayoutEffect can pass it to acceptChromeMeasurement without
+  // adding chromeHeight to the deps array (which would cause an infinite
+  // effect loop). Updated synchronously before the async setState.
+  // See: https://github.com/chaosblade-io/chaosblade/issues/1301
+  const chromeHeightRef = useRef<number>(CHROME_ROWS_RESERVE);
 
   // Phase 3.2 — ref-transition version bump. React commits siblings
   // in JSX order; MainContent is mounted *before* Composer, so on
@@ -285,8 +303,11 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
     // (NaN propagates through ``< / >`` comparisons silently, which
     // would otherwise let a Yoga-glitched NaN reading land in state
     // and poison every downstream ``availableTerminalHeight`` math).
-    const accepted = acceptChromeMeasurement(measured, rows);
+    const accepted = acceptChromeMeasurement(measured, rows, chromeHeightRef.current);
     if (accepted === null) return;
+    // Sync the ref before async setState so the next useLayoutEffect
+    // invocation sees the latest accepted value for hysteresis.
+    chromeHeightRef.current = accepted;
     // Same-reference guard: setState with the same value would still
     // trigger a render; gate it explicitly so a no-op measure
     // doesn't churn the render loop.
