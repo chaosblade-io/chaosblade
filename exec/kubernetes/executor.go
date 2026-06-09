@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -66,7 +67,10 @@ func (*Executor) Name() string {
 func (e *Executor) SetChannel(channel spec.Channel) {
 }
 
-var cli client.Client
+var (
+	cli   client.Client
+	cliMu sync.Mutex
+)
 
 func QueryStatus(ctx context.Context, operation, kubeconfig, proxyURL, token string) (*spec.Response, bool) {
 	uid := ctx.Value(spec.Uid).(string)
@@ -128,6 +132,12 @@ func QueryStatus(ctx context.Context, operation, kubeconfig, proxyURL, token str
 }
 
 func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel) *spec.Response {
+	// kubewiz 模式判断（最高优先级）
+	kubewizURL := expModel.ActionFlags[KubewizURLFlag.Name]
+	if kubewizURL != "" {
+		return e.execViaKubewiz(uid, ctx, expModel, kubewizURL)
+	}
+
 	config := expModel.ActionFlags[KubeConfigFlag.Name]
 	if config != "" {
 		if ok := util.IsExist(config); !ok {
@@ -175,13 +185,13 @@ func (e *Executor) Exec(uid string, ctx context.Context, expModel *spec.ExpModel
 		ctx, cancel := context.WithTimeout(ctx, duration)
 		defer cancel()
 		ticker := time.NewTicker(time.Second)
-	TickerLoop:
-		for range ticker.C {
+		defer ticker.Stop()
+
+		for {
 			select {
 			case <-ctx.Done():
-				ticker.Stop()
-				break TickerLoop
-			default:
+				return response
+			case <-ticker.C:
 				response, completed = QueryStatus(ctx, operation, config, proxyURL, token)
 				if completed {
 					return response
@@ -331,7 +341,8 @@ func convertExpModelToChaosBladeObject(uid string, expModel *spec.ExpModel) v1al
 func convertFlagsToResourceFlags(flags map[string]string) []v1alpha1.FlagSpec {
 	flagSpecs := make([]v1alpha1.FlagSpec, 0)
 	for name, values := range flags {
-		if name == KubeConfigFlag.Name || name == WaitingTimeFlag.Name || name == KubectlProxyFlag.Name || name == TokenFlag.Name {
+		if name == KubeConfigFlag.Name || name == WaitingTimeFlag.Name || name == KubectlProxyFlag.Name || name == TokenFlag.Name ||
+			name == KubewizURLFlag.Name || name == ClusterUUIDFlag.Name || name == KubewizTokenFlag.Name {
 			continue
 		}
 		valueArr := strings.Split(values, ",")
@@ -378,14 +389,169 @@ func update(cli client.Client, chaosblade *v1alpha1.ChaosBlade) error {
 }
 
 func getClient(kubeconfig, proxyURL, token string) (client.Client, error) {
-	if cli == nil {
-		c, err := newClient(kubeconfig, proxyURL, token)
-		if err != nil {
-			return nil, err
-		}
-		cli = c
+	cliMu.Lock()
+	defer cliMu.Unlock()
+	if cli != nil {
+		return cli, nil
 	}
+	c, err := newClient(kubeconfig, proxyURL, token)
+	if err != nil {
+		return nil, err
+	}
+	cli = c
 	return cli, nil
+}
+
+// execViaKubewiz 通过 kubewiz-core 任务委托模式执行 K8s 操作
+func (e *Executor) execViaKubewiz(uid string, ctx context.Context, expModel *spec.ExpModel, kubewizURL string) *spec.Response {
+	// 校验 uid 非空，避免后续生成空标识的 CR
+	if uid == "" {
+		return spec.ResponseFailWithFlags(spec.ParameterLess, "uid")
+	}
+	clusterUUID := expModel.ActionFlags[ClusterUUIDFlag.Name]
+	kubewizToken := expModel.ActionFlags[KubewizTokenFlag.Name]
+
+	if clusterUUID == "" {
+		return spec.ResponseFailWithFlags(spec.ParameterLess, ClusterUUIDFlag.Name)
+	}
+	if kubewizToken == "" {
+		return spec.ResponseFailWithFlags(spec.ParameterLess, KubewizTokenFlag.Name)
+	}
+
+	kc := NewKubewizClient(kubewizURL, clusterUUID, kubewizToken)
+
+	// destroy 走原有逻辑（单任务）
+	if suid, ok := spec.IsDestroy(ctx); ok {
+		taskUUID, err := kc.SubmitDestroyTask(suid)
+		if err != nil {
+			log.Errorf(ctx, "submit kubewiz destroy task failed: %v", err)
+			return spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-submit", err)
+		}
+		log.Infof(ctx, "kubewiz destroy task submitted: %s", taskUUID)
+
+		waitingTime := expModel.ActionFlags[WaitingTimeFlag.Name]
+		if waitingTime == "" {
+			waitingTime = DefaultWaitingTime
+		}
+		duration, parseErr := time.ParseDuration(waitingTime)
+		if parseErr != nil {
+			duration = 20 * time.Second
+		}
+
+		pollCtx, cancel := context.WithTimeout(ctx, duration)
+		defer cancel()
+		task, pollErr := kc.PollTaskUntilDone(pollCtx, taskUUID, 2*time.Second)
+		if pollErr != nil {
+			return spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-timeout",
+				fmt.Sprintf("destroy task %s not completed within %s", taskUUID, waitingTime))
+		}
+		return kc.ConvertTaskToResponse(ctx, task, suid, "destroy")
+	}
+
+	// === create 两阶段流程 ===
+
+	// 阶段1: 提交 kubectl apply 创建 CR
+	createTaskUUID, err := kc.SubmitCreateTask(uid, expModel)
+	if err != nil {
+		log.Errorf(ctx, "submit kubewiz create task failed: %v", err)
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-submit", err)
+	}
+	log.Infof(ctx, "kubewiz create task submitted: %s", createTaskUUID)
+
+	// 等待创建任务完成
+	waitingTime := expModel.ActionFlags[WaitingTimeFlag.Name]
+	if waitingTime == "" {
+		waitingTime = DefaultWaitingTime
+	}
+	duration, parseErr := time.ParseDuration(waitingTime)
+	if parseErr != nil {
+		duration = 20 * time.Second
+	}
+
+	createCtx, createCancel := context.WithTimeout(ctx, duration)
+	defer createCancel()
+	createTask, pollErr := kc.PollTaskUntilDone(createCtx, createTaskUUID, 2*time.Second)
+	if pollErr != nil {
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-timeout",
+			fmt.Sprintf("create task %s not completed within %s", createTaskUUID, waitingTime))
+	}
+	// 如果创建任务本身失败（比如 kubectl apply 报错）
+	if createTask.Status == kubewizTaskFailed {
+		errMsg := ""
+		// 优先从 artifact 获取实际执行错误
+		if len(createTask.ArtifactURLs) > 0 {
+			if output, err := kc.GetArtifact(ctx, createTask.ArtifactURLs[0]); err == nil && strings.TrimSpace(output) != "" {
+				errMsg = strings.TrimSpace(output)
+			}
+		}
+		if errMsg == "" {
+			errMsg = createTask.ErrorMessage
+		}
+		if errMsg == "" {
+			errMsg = "kubectl apply failed"
+		}
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-create", errMsg)
+	}
+	// 创建任务被取消，直接返回失败
+	if createTask.Status == kubewizTaskCancelled {
+		return spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-create", "task cancelled")
+	}
+
+	// 阶段2: 循环查询 CR 状态直到终态
+	var lastResponse *spec.Response
+	queryDeadline := time.Now().Add(duration)
+	for time.Now().Before(queryDeadline) {
+		time.Sleep(2 * time.Second)
+
+		queryTaskUUID, err := kc.SubmitQueryTask(uid)
+		if err != nil {
+			log.Warnf(ctx, "submit kubewiz query task failed: %v", err)
+			continue
+		}
+
+		queryCtx, queryCancel := context.WithTimeout(ctx, 15*time.Second)
+		queryTask, pollErr := kc.PollTaskUntilDone(queryCtx, queryTaskUUID, 2*time.Second)
+		queryCancel()
+
+		if pollErr != nil {
+			log.Warnf(ctx, "query task poll timeout: %v", pollErr)
+			continue
+		}
+		if queryTask.Status != kubewizTaskCompleted {
+			log.Warnf(ctx, "query task failed: %s", queryTask.ErrorMessage)
+			continue
+		}
+
+		// 获取 artifact（kubectl get -o json 的输出）
+		response := kc.ConvertTaskToResponse(ctx, queryTask, uid, "create")
+		lastResponse = response
+
+		// 检查是否到达终态
+		if !response.Success {
+			// 明确失败（phase=Error 或 UnexpectedStatus），直接返回
+			return response
+		}
+		// 检查 result 中的 phase
+		if result, ok := response.Result.(map[string]interface{}); ok {
+			if phase, ok := result["phase"].(string); ok {
+				if phase == "Running" || phase == "Error" {
+					return response
+				}
+			}
+		} else {
+			// 无法从 response 中提取 phase（如 artifact 获取失败），继续轮询
+			log.Warnf(ctx, "unable to extract phase from response result, continue polling")
+			continue
+		}
+	}
+
+	// 超时：优先返回最后一次查询结果，否则返回超时错误
+	if lastResponse != nil {
+		return spec.ResponseFailWithResult(spec.K8sExecFailed, lastResponse.Result,
+			"kubewiz-timeout", fmt.Sprintf("CR %s did not reach terminal phase within %s (last phase included)", uid, waitingTime))
+	}
+	return spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-timeout",
+		fmt.Sprintf("CR %s did not reach terminal phase within %s", uid, waitingTime))
 }
 
 func newClient(kubeConfig, proxyURL, token string) (client.Client, error) {

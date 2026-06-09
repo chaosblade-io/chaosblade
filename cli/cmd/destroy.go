@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -47,6 +48,9 @@ type DestroyCommand struct {
 	forceRemove           bool
 	expTarget, kubeconfig string
 	proxyURL, token       string
+	kubewizURL            string
+	clusterUUID           string
+	kubewizToken          string
 }
 
 func (dc *DestroyCommand) Init() {
@@ -68,6 +72,9 @@ func (dc *DestroyCommand) Init() {
 	flags.StringVar(&dc.kubeconfig, KubeconfigFlag, "", "The config file of kubernetes cluster. Used to destroy creating k8s experiments without using blade command")
 	flags.StringVar(&dc.proxyURL, ProxyURLFlag, "", "Kubectl proxy URL for accessing Kubernetes API, e.g., http://localhost:8001")
 	flags.StringVar(&dc.token, TokenFlag, "", "Bearer token for Kubernetes API authentication")
+	flags.StringVar(&dc.kubewizURL, "kubewiz-url", "", "Kubewiz core service URL for delegated K8s operations")
+	flags.StringVar(&dc.clusterUUID, "cluster-uuid", "", "Target cluster UUID in kubewiz")
+	flags.StringVar(&dc.kubewizToken, "kubewiz-token", "", "Token for kubewiz-core authentication")
 	dc.baseExpCommandService = newBaseExpCommandService(dc)
 }
 
@@ -167,6 +174,10 @@ func (dc *DestroyCommand) destroyExperimentByUid(model *data.ExperimentModel, ui
 
 // destroyK8sExperimentWithoutRecord deletes chaosblade resources by name in the cluster.
 func (dc *DestroyCommand) destroyK8sExperimentWithoutRecord(uid string) (*spec.Response, error) {
+	// kubewiz 模式：直接提交 kubectl delete
+	if dc.kubewizURL != "" {
+		return dc.destroyViaKubewiz(uid)
+	}
 	if uid == "" || dc.kubeconfig == "" {
 		return nil, spec.ResponseFailWithFlags(spec.ParameterLess,
 			"usage: blade destroy UID --target k8s --kubeconfig KUBECONFIG")
@@ -190,10 +201,42 @@ func (dc *DestroyCommand) destroyK8sExperimentWithoutRecord(uid string) (*spec.R
 
 // checkAndForceRemoveForK8sExp deletes chaosblade resource by resource name if force-remove is true
 func (dc *DestroyCommand) checkAndForceRemoveForK8sExp(name, kubeconfig, proxyURL string) error {
-	if dc.forceRemove {
-		return kubernetes.RemoveFinalizer(name, kubeconfig, proxyURL, dc.token)
+	if !dc.forceRemove {
+		return nil
 	}
-	return nil
+	if dc.kubewizURL != "" {
+		// kubewiz 模式下 kubectl delete 已彻底删除 CR，无需额外移除 finalizer
+		return nil
+	}
+	return kubernetes.RemoveFinalizer(name, kubeconfig, proxyURL, dc.token)
+}
+
+// destroyViaKubewiz 通过 kubewiz 通道销毁 K8s 实验
+func (dc *DestroyCommand) destroyViaKubewiz(uid string) (*spec.Response, error) {
+	if dc.clusterUUID == "" {
+		return nil, spec.ResponseFailWithFlags(spec.ParameterLess, "cluster-uuid")
+	}
+	if dc.kubewizToken == "" {
+		return nil, spec.ResponseFailWithFlags(spec.ParameterLess, "kubewiz-token")
+	}
+	kc := kubernetes.NewKubewizClient(dc.kubewizURL, dc.clusterUUID, dc.kubewizToken)
+	taskUUID, err := kc.SubmitDestroyTask(uid)
+	if err != nil {
+		return nil, spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-submit", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	task, pollErr := kc.PollTaskUntilDone(ctx, taskUUID, 2*time.Second)
+	if pollErr != nil {
+		return nil, spec.ResponseFailWithFlags(spec.K8sExecFailed, "kubewiz-timeout", pollErr)
+	}
+
+	response := kc.ConvertTaskToResponse(ctx, task, uid, "destroy")
+	if response.Success {
+		return response, nil
+	}
+	return nil, response
 }
 
 // checkAndForceRemoveForExpRecord deletes experiment record by uid if force-remove is true

@@ -44,6 +44,21 @@ var TokenFlag = &spec.ExpFlag{
 	Desc: "Bearer token for Kubernetes API authentication",
 }
 
+var KubewizURLFlag = &spec.ExpFlag{
+	Name: "kubewiz-url",
+	Desc: "Kubewiz core service URL for delegated K8s operations, e.g., http://kubewiz-core:8080",
+}
+
+var ClusterUUIDFlag = &spec.ExpFlag{
+	Name: "cluster-uuid",
+	Desc: "Target cluster UUID in kubewiz (required when using --kubewiz-url)",
+}
+
+var KubewizTokenFlag = &spec.ExpFlag{
+	Name: "kubewiz-token",
+	Desc: "JWT token for kubewiz-core authentication",
+}
+
 // var log = logf.Log.WithName("Kubernetes")
 func NewCommandModelSpec() spec.ExpModelCommandSpec {
 	return &CommandModelSpec{
@@ -51,6 +66,7 @@ func NewCommandModelSpec() spec.ExpModelCommandSpec {
 			ExpActions: []spec.ExpActionCommandSpec{},
 			ExpFlags: []spec.ExpFlagSpec{
 				KubeConfigFlag, WaitingTimeFlag, KubectlProxyFlag, TokenFlag,
+				KubewizURLFlag, ClusterUUIDFlag, KubewizTokenFlag,
 			},
 		},
 	}
