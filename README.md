@@ -43,6 +43,62 @@ Encapsulating scenes by domain into individual projects can not only standardize
 * [chaosblade-exec-cplus](https://github.com/chaosblade-io/chaosblade-exec-cplus): C ++ application experimental scenario implementation, using GDB technology to implement method and code line level experimental scenario injection.
 * [chaosblade-box](https://github.com/chaosblade-io/chaosblade-box): Possessing chaos engineering platform and resilience testing platform capabilities.For more information on the resilience testing platform capabilities, see the [main2](https://github.com/chaosblade-io/chaosblade-box/tree/main2) branch.
   
+## Quick Start
+
+This guide helps you run your first fault injection on Kubernetes in under 5 minutes using ChaosBlade. We'll inject a CPU stress fault into a Pod as a minimal example.
+
+### Prerequisites
+
+Before you begin, make sure you have:
+
+- [ ] **kubectl access** to a running Kubernetes cluster (`kubectl cluster-info` returns successfully)
+- [ ] A **target namespace** with at least one running Pod (default: `default`)
+- [ ] **ChaosBlade installed**:
+  - [ ] The [chaosblade](https://github.com/chaosblade-io/chaosblade/releases) CLI toolkit downloaded and extracted (the `blade` binary is on your `PATH`)
+  - [ ] The [chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator/releases) deployed to your cluster (required for Kubernetes scenarios)
+
+Install the operator with Helm:
+
+```shell script
+helm install chaosblade-operator chaosblade-operator-<version>.tgz --namespace chaosblade --create-namespace
+```
+
+Verify the operator is running:
+
+```shell script
+kubectl get pods -n chaosblade
+```
+
+### Inject Your First Fault (CPU Stress)
+
+Run a cpu full-load fault against a Pod in the `default` namespace:
+
+```shell script
+blade create k8s pod-cpu fullload   --cpu-percent 80   --kubeconfig ~/.kube/config   --names <pod-name>   --namespace default
+```
+
+If the injection succeeds, ChaosBlade returns a JSON result containing an experiment `uid`. Save this `uid` to check status or destroy the experiment later:
+
+```json
+{"code":200,"success":true,"result":"<experiment-uid>"}
+```
+
+### Check the Experiment Status
+
+```shell script
+blade status <experiment-uid>
+```
+
+### Recover (Destroy the Fault)
+
+Always recover after your drill to restore the target to normal:
+
+```shell script
+blade destroy <experiment-uid>
+```
+
+That's it! You've completed a full inject-verify-recover cycle. To explore more scenarios, run `blade create k8s -h` or see [Chaos Engineering Practice under Cloud Native](CLOUDNATIVE.md).
+
 ## CLI Command
 You can download the latest chaosblade toolkit from [Releases](https://github.com/chaosblade-io/chaosblade/releases) and extract it and use it. If you want to inject Kubernetes related fault scenarios, you need to install [chaosblade-operator](https://github.com/chaosblade-io/chaosblade-operator/releases). For detailed Chinese usage documents, please see [chaosblade-help-zh-cn ](https://chaosblade-io.gitbook.io/chaosblade-help-zh-cn/).
 
