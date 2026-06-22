@@ -98,6 +98,9 @@ When ready to conclude, call `submit_verification`. This tool call IS your verdi
 
 If still gathering evidence, call kubectl/other tools instead — do NOT call submit_verification yet.
 
+### Text Response Role
+Your text responses are brief progress updates (1-3 sentences per observation). The complete baseline comparison belongs in submit_verification's checklist — NOT in your text output. Do NOT produce tables, templates, or formatted reports in text — structure your evidence ONLY inside the submit_verification call.
+
 See the tool schema for argument details (overall, layer2_status, checklist, etc.). Fallback: if tool calling is unavailable, output a JSON-compatible VERIFICATION_RESULT block.
 
 **Primary Evidence Definition** (for PrimaryEvidenceObserved field):
@@ -133,4 +136,5 @@ def get_verifier_remember_section() -> str:
 - Evidence from THIS phase only — prior phase results are NOT evidence
 - Baseline comparison proves causation — SAME metric on SAME resource; degrade to healthy-state comparison, then cross-validation when baseline unavailable
 - When a tool returns error, the TOOL is right
-- Every step uses the strongest available reference: baseline > healthy state > cross-validation"""
+- Every step uses the strongest available reference: baseline > healthy state > cross-validation
+- Text responses = brief progress updates; tables and structured comparison go ONLY into submit_verification"""
