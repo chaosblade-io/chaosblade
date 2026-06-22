@@ -32,7 +32,7 @@ permissions:
   contents: write
 
 env:
-  CHAOSBLADE_VERSION: '1.8.0'
+  CHAOSBLADE_VERSION: '1.9.0-alpha'
   NODE_VERSION: '24.16.0'
 
 jobs:
@@ -221,7 +221,7 @@ jobs:
           set -euo pipefail
           VER="${CHAOSBLADE_VERSION}"
           ARCH="${{ matrix.target }}"
-          URL="https://github.com/chaosblade-io/chaosblade/releases/download/v${VER}/chaosblade-${VER}-${ARCH}.tar.gz"
+          URL="https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/${VER}/chaosblade-${VER}-${ARCH}.tar.gz"
           echo "Fetching $URL"
           curl -fSL --retry 3 --retry-delay 2 -o /tmp/chaosblade.tar.gz "$URL"
           rm -rf blade-ai/vendor/chaosblade
