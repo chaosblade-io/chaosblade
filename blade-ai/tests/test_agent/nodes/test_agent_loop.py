@@ -388,7 +388,7 @@ class TestDetectRepeatedToolCalls:
         assert result is None
 
     def test_identical_outputs_triggers_loop(self, monkeypatch):
-        """3 identical calls with identical outputs → LOOP DETECTED with '基本一致'."""
+        """3 identical calls with identical outputs → LOOP DETECTED."""
         monkeypatch.setattr(settings, "loop_detection_window", 12)
         monkeypatch.setattr(settings, "loop_detection_threshold", 3)
 
@@ -403,7 +403,7 @@ class TestDetectRepeatedToolCalls:
         result = detect_repeated_tool_calls(messages)
         assert result is not None
         assert "LOOP DETECTED" in result
-        assert "基本一致" in result
+        assert "REFLECT" in result
 
     def test_differing_outputs_suppresses_loop(self, monkeypatch):
         """3 calls but outputs differ (CPU 3m→97m→161m) → suppressed, returns None."""
@@ -422,7 +422,7 @@ class TestDetectRepeatedToolCalls:
         assert result is None
 
     def test_no_outputs_triggers_loop_with_fallback_message(self, monkeypatch):
-        """3 calls with no ToolMessages → LOOP DETECTED with '无法获取'."""
+        """3 calls with no ToolMessages → LOOP DETECTED."""
         monkeypatch.setattr(settings, "loop_detection_window", 12)
         monkeypatch.setattr(settings, "loop_detection_threshold", 3)
 
@@ -434,7 +434,7 @@ class TestDetectRepeatedToolCalls:
         result = detect_repeated_tool_calls(messages)
         assert result is not None
         assert "LOOP DETECTED" in result
-        assert "无法获取" in result
+        assert "REFLECT" in result
 
     def test_non_kubectl_repeated_tool(self, monkeypatch):
         """Repeated non-kubectl tool (e.g., read_skill_resource) with identical outputs triggers loop."""
@@ -453,8 +453,7 @@ class TestDetectRepeatedToolCalls:
         result = detect_repeated_tool_calls(messages)
         assert result is not None
         assert "LOOP DETECTED" in result
-        # No UnboundLocalError for subcmd
-        assert "基本一致" in result
+        assert "REFLECT" in result
 
     def test_window_limits_scope(self, monkeypatch):
         """Only calls within the window are counted."""

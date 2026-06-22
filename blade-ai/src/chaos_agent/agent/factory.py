@@ -16,6 +16,7 @@ from chaos_agent.tools import (
     safe_write_file,
     read_knowledge_resource,
 )
+
 # blade_destroy intentionally not imported here. Phase 1 must not see
 # it (post-task-ce9647931ce1 mutation lockdown) and Phase 2 also
 # doesn't bind it (destruction is framework-controlled by the recover
@@ -128,6 +129,9 @@ def make_llm(
         base_url=settings.api_base_url,
         temperature=temperature if temperature is not None else settings.llm_temperature,
         max_retries=max_retries if max_retries is not None else settings.llm_max_retries,
+        # streaming=True 让 astream_events 产生 on_chat_model_stream 事件，
+        # 支持前端逐 token 流式展示 LLM 思考过程。
+        streaming=True,
         # Split connect vs read: connection failures fail fast (_connect),
         # slow inference gets a generous response budget (_read). A scalar
         # timeout would apply one value to both, forcing a bad tradeoff.
@@ -356,6 +360,7 @@ def _build_skill_tools(registry: SkillRegistry):
         summary: str,
         rejected: bool = False,
         rejection_reason: str = "",
+        alternatives: str = "",
         blast_radius_scope: str = "",
         blast_radius_detail: str = "",
         skill_case_resource: str = "",
@@ -371,6 +376,10 @@ def _build_skill_tools(registry: SkillRegistry):
           - summary: Brief summary of the plan (normal) or the rejection decision.
           - rejected: Set to True to reject the request. Default False.
           - rejection_reason: Why the request is rejected (only when rejected=True).
+          - alternatives: When rejected=True, provide 2-4 feasible fault scenarios
+            that CAN be executed against the same target. Each must be a concrete,
+            actionable scenario based on the catalogue, ChaosBlade, or kubectl-native
+            injection methods. Format as a numbered list.
           - blast_radius_scope: Scope of the execution's actual impact on the cluster.
             Must be one of: "target-only" (only the target resource is mutated),
             "namespace-wide" (mutations affect other resources in the target namespace),
@@ -391,7 +400,10 @@ def _build_skill_tools(registry: SkillRegistry):
         Side effects: None (control signal only — the system handles the transition).
         """
         if rejected:
-            return f"Planning rejected. Reason: {rejection_reason or summary}"
+            parts = [f"Planning rejected. Reason: {rejection_reason or summary}"]
+            if alternatives:
+                parts.append(f"\nAlternatives:\n{alternatives}")
+            return "".join(parts)
         return f"Planning finalized. Summary: {summary}"
 
     @lc_tool
@@ -748,6 +760,14 @@ async def create_agent(
             prompt, completion = _extract_token_usage(response)
             trace.total_token_input += prompt
             trace.total_token_output += completion
+            # Diagnostic: log routing and extraction result
+            is_dummy = self._current_task_id is None or self._current_task_id not in _traces
+            if is_dummy or (not prompt and not completion):
+                logger.warning(
+                    "_DynamicTracingCallback.on_llm_end: task_id=%r, is_dummy_trace=%s, "
+                    "extracted prompt=%d completion=%d",
+                    self._current_task_id, is_dummy, prompt, completion,
+                )
 
     _tracing_callback = _DynamicTracingCallback()
 

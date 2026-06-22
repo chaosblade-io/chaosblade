@@ -50,7 +50,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -629,7 +629,7 @@ async def _resolve_pod_names(target: dict, kubeconfig: str) -> list[str]:
                 v_args=(
                     f"pod -l {label_selector} -n {namespace} "
                     f"--field-selector=status.phase=Running "
-                    f"-o jsonpath='{{range .items[*]}}{{.metadata.name}} {{end}}'"
+                    f"-o jsonpath={{.items[*].metadata.name}}"
                 ),
                 kubeconfig=kubeconfig or "",
             )

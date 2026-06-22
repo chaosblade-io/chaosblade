@@ -6,6 +6,17 @@ from chaos_agent.agent.state import (
     infer_phase,
     infer_task_state,
 )
+from chaos_agent.agent.state_lifecycle import (
+    STATE_DURABLE_FACT_FIELDS,
+    STATE_FIELD_GROUPS,
+    STATE_FIELD_POLICIES,
+    ensure_recover_runtime_defaults,
+    iter_state_fields,
+    per_fault_reset_state,
+    recover_reset_state,
+    state_field_policy,
+    state_field_group,
+)
 
 
 class TestAgentStateDefaults:
@@ -49,6 +60,111 @@ class TestAgentStateDefaults:
         assert state.get("blade_action") is None
         assert state.get("params_flags") is None
         assert state.get("direct", False) is False
+
+    def test_declares_runtime_checkpoint_fields(self):
+        annotations = AgentState.__annotations__
+        for field in (
+            "plan_summary",
+            "_planning_alternatives",
+            "_catalogue_rejection_nudged",
+            "_execute_text_nudged",
+            "_kubectl_step_nudged",
+        ):
+            assert field in annotations
+
+    def test_all_agent_state_fields_are_lifecycle_classified(self):
+        annotations = set(AgentState.__annotations__)
+        classified = set(iter_state_fields())
+
+        assert annotations - classified == set()
+        assert classified - annotations == set()
+
+    def test_state_field_groups_do_not_overlap(self):
+        seen = {}
+        duplicates = {}
+        for group, fields in STATE_FIELD_GROUPS.items():
+            for field in fields:
+                if field in seen:
+                    duplicates.setdefault(field, [seen[field]]).append(group)
+                seen[field] = group
+
+        assert duplicates == {}
+        assert state_field_group("blade_uid") == "execution"
+        assert state_field_group("recover_verification") == "verification"
+
+    def test_durable_facts_are_not_cleared_by_per_fault_reset(self):
+        reset_fields = set(per_fault_reset_state())
+        durable_fields = set(STATE_DURABLE_FACT_FIELDS)
+        classified = set(iter_state_fields())
+
+        assert reset_fields - classified == set()
+        assert "blade_uid" in reset_fields
+        assert "verification" in reset_fields
+        assert "task_id" not in reset_fields
+        assert "kubeconfig" not in reset_fields
+        assert "batch_results" not in reset_fields
+        assert "created_at" not in reset_fields
+        assert "task_id" in durable_fields
+        assert "fault_spec" in durable_fields
+
+    def test_state_field_policies_match_lifecycle_tables(self):
+        assert set(STATE_FIELD_POLICIES) == set(iter_state_fields())
+        assert tuple(STATE_FIELD_POLICIES) == iter_state_fields()
+        assert STATE_DURABLE_FACT_FIELDS == tuple(
+            name
+            for name, policy in STATE_FIELD_POLICIES.items()
+            if policy.durable
+        )
+        assert set(per_fault_reset_state()) == {
+            name
+            for name, policy in STATE_FIELD_POLICIES.items()
+            if policy.reset_on_batch_fault
+        }
+        assert set(recover_reset_state()) == {
+            name
+            for name, policy in STATE_FIELD_POLICIES.items()
+            if policy.reset_on_recover
+        }
+
+        blade_policy = state_field_policy("blade_uid")
+        assert blade_policy is not None
+        assert blade_policy.group == "execution"
+        assert blade_policy.durable is True
+        assert blade_policy.reset_on_batch_fault is True
+        assert blade_policy.reset_on_recover is False
+
+        recover_policy = state_field_policy("recover_verification")
+        assert recover_policy is not None
+        assert recover_policy.group == "verification"
+        assert recover_policy.reset_on_batch_fault is True
+        assert recover_policy.reset_on_recover is True
+
+    def test_recover_reset_fields_are_lifecycle_classified(self):
+        reset_fields = set(recover_reset_state())
+        classified = set(iter_state_fields())
+
+        assert reset_fields - classified == set()
+        assert "messages" in reset_fields
+        assert "verification" in reset_fields
+        assert "recover_verification" in reset_fields
+        assert "blade_uid" not in reset_fields
+        assert "fault_spec" not in reset_fields
+
+    def test_reset_defaults_are_not_shared_between_calls(self):
+        first = recover_reset_state()
+        second = recover_reset_state()
+
+        first["messages"].append("stale")
+
+        assert second["messages"] == []
+
+    def test_ensure_recover_runtime_defaults_does_not_share_mutable_defaults(self):
+        first = ensure_recover_runtime_defaults({"task_id": "recover-a"})
+        second = ensure_recover_runtime_defaults({"task_id": "recover-b"})
+
+        first["messages"].append("stale")
+
+        assert second["messages"] == []
 
 
 class TestAgentStateFields:
@@ -290,6 +406,37 @@ class TestBuildStatusDataExposedFields:
         assert data["failure_reason"].startswith("safety_rejected")
         # merged_error keeps backward compat for older consumers
         assert data["error"].startswith("safety_rejected")
+
+    def test_fault_type_target_and_params_project_from_fault_spec(self):
+        data = build_status_data(
+            "t-fs",
+            {
+                "skill_name": "stale-skill",
+                "fault_spec": {
+                    "namespace": "cms-demo",
+                    "scope": "pod",
+                    "names": ["pod-a"],
+                    "labels": {"app": "demo"},
+                    "blade_target": "network",
+                    "blade_action": "loss",
+                    "params": {"percent": "100"},
+                    "params_flags": [],
+                    "duration_seconds": 0,
+                    "source": "test",
+                    "user_description": "",
+                },
+            },
+        )
+
+        assert data["fault_type"] == "pod-network-loss"
+        assert data["skill_name"] == "stale-skill"
+        assert data["target"] == {
+            "namespace": "cms-demo",
+            "names": ["pod-a"],
+            "labels": {"app": "demo"},
+            "resource_type": "pod",
+        }
+        assert data["params"] == {"percent": "100"}
 
     def test_failure_reason_empty_when_absent(self):
         data = build_status_data("t-fr2", {})

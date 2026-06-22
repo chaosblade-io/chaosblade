@@ -3,11 +3,14 @@
  *
  * Public API:
  *
- *   const { submitTurn, cancelTurn, busy } = useStream(client, sessionId);
+ *   const { submitTurn, submitRecover, cancelTurn, busy } = useStream(client, sessionId);
  *
  * - ``submitTurn(input)``: dispatches TURN_STARTED, opens an SSE stream,
  *   pumps each event into a corresponding reducer action, and dispatches
  *   TURN_DONE / TURN_ABORTED at the end.
+ * - ``submitRecover(taskId)``: dispatches the same turn lifecycle, but
+ *   reads from /recover-stream so slash-command recovery renders like a
+ *   natural-language recovery turn.
  * - ``cancelTurn()``: aborts the in-flight fetch and POSTs to
  *   /sessions/:id/cancel so the server-side LangGraph task is cancelled.
  * - ``busy``: convenience flag from the reducer's streamState.
@@ -58,6 +61,7 @@ export interface SubmitTurnOpts {
 
 export interface UseStreamApi {
   submitTurn: (input: string, opts?: SubmitTurnOpts) => Promise<void>;
+  submitRecover: (taskId: string, displayInput?: string) => Promise<void>;
   cancelTurn: () => void;
   resolveConfirm: (taskId: string, answer: string) => Promise<void>;
   /**
@@ -434,6 +438,132 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
     [client, sessionId, dispatch, permissionMode],
   );
 
+  const submitRecover = useCallback(
+    async (taskId: string, displayInput?: string) => {
+      const trimmed = taskId.trim();
+      if (!trimmed) return;
+
+      // Same lifecycle as a normal turn, but the event producer is the
+      // dedicated recover endpoint. Keeping this inside useStream means
+      // slash recovery gets AgentMessage, ToolGroupMessage, ResultCard,
+      // usage accounting, and Esc cancellation through the same reducer
+      // path as natural-language recovery and inject.
+      abortRef.current?.abort();
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      dispatch({ type: "TURN_STARTED", input: displayInput?.trim() || `/recover ${trimmed}` });
+      resetStreamingCounters();
+
+      const TOKEN_THROTTLE_MS = 60;
+      const THINKING_THROTTLE_MS = 100;
+
+      let tokenBuffer = "";
+      let tokenNode = "";
+      let tokenFlushTimer: ReturnType<typeof setTimeout> | null = null;
+      const flushTokens = () => {
+        if (tokenFlushTimer) {
+          clearTimeout(tokenFlushTimer);
+          tokenFlushTimer = null;
+        }
+        if (tokenBuffer.length > 0) {
+          perfMark("flushTokens", { len: tokenBuffer.length });
+          dispatch({
+            type: "TOKEN_APPENDED",
+            content: tokenBuffer,
+            node: tokenNode,
+          });
+          tokenBuffer = "";
+          tokenNode = "";
+        }
+      };
+
+      let thinkingBuffer = "";
+      let thinkingNode = "";
+      let thinkingFlushTimer: ReturnType<typeof setTimeout> | null = null;
+      const flushThinking = () => {
+        if (thinkingFlushTimer) {
+          clearTimeout(thinkingFlushTimer);
+          thinkingFlushTimer = null;
+        }
+        if (thinkingBuffer.length > 0) {
+          dispatch({
+            type: "THINKING_APPENDED",
+            content: thinkingBuffer,
+            node: thinkingNode,
+          });
+          thinkingBuffer = "";
+          thinkingNode = "";
+        }
+      };
+
+      const flushStreamBuffers = () => {
+        flushTokens();
+        flushThinking();
+      };
+
+      try {
+        for await (const evt of client.streamRecover(trimmed, controller.signal)) {
+          if (evt.type === "token") {
+            tokenBuffer += evt.content;
+            if (!controller.signal.aborted) {
+              streamingResponseCharsRef.current += evt.content.length;
+            }
+            perfMark("token.raw", { bytes: evt.content.length });
+            if (evt.node) tokenNode = evt.node;
+            if (!tokenFlushTimer) {
+              tokenFlushTimer = setTimeout(flushTokens, TOKEN_THROTTLE_MS);
+            }
+            continue;
+          }
+          if (evt.type === "thinking") {
+            thinkingBuffer += evt.content;
+            if (evt.node) thinkingNode = evt.node;
+            if (!thinkingFlushTimer) {
+              thinkingFlushTimer = setTimeout(
+                flushThinking,
+                THINKING_THROTTLE_MS,
+              );
+            }
+            continue;
+          }
+          flushStreamBuffers();
+          applyEvent(dispatch, evt);
+          if (evt.type === "done") break;
+        }
+        flushStreamBuffers();
+        dispatch({ type: "TURN_DONE" });
+      } catch (err) {
+        if (controller.signal.aborted) {
+          dispatch({ type: "TURN_ABORTED", reason: "Cancelled by user" });
+          return;
+        }
+        const reason = err instanceof Error ? err.message : String(err);
+        dispatch({ type: "TURN_ABORTED", reason });
+      } finally {
+        if (tokenFlushTimer) {
+          clearTimeout(tokenFlushTimer);
+          tokenFlushTimer = null;
+        }
+        if (thinkingFlushTimer) {
+          clearTimeout(thinkingFlushTimer);
+          thinkingFlushTimer = null;
+        }
+        try {
+          controller.abort();
+        } catch {
+          // ignore
+        }
+        if (abortRef.current === controller) {
+          abortRef.current = null;
+        }
+        perfFlush("turn-end");
+      }
+    },
+    [client, dispatch],
+  );
+
   const cancelTurn = useCallback(() => {
     // Only act when there's actually an SSE turn in flight. Composer's
     // Esc handler unconditionally calls both ``cancelTurn`` and
@@ -512,6 +642,7 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
 
   return {
     submitTurn,
+    submitRecover,
     cancelTurn,
     resolveConfirm,
     beginReplay,

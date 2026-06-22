@@ -744,9 +744,17 @@ class TestClassifyErrorInterfaceMismatch:
         assert r.error_class == ErrorClass.USER_CONFIG
 
 
-class TestStrategyHintsBlade:
-    def test_blade_create_includes_verify(self):
-        from chaos_agent.agent.nodes.react_helpers import _build_strategy_hints
-        hint = _build_strategy_hints("blade_create")
-        assert "-h" in hint or "--help" in hint
-        assert "Runtime" in hint or "runtime" in hint
+class TestPhaseSpecificLoopHints:
+    def test_build_loop_hint_intent(self):
+        from chaos_agent.agent.nodes.react_helpers import _build_loop_hint
+        hint = _build_loop_hint("kubectl_ro(subcommand=get)", 3, "intent")
+        assert "LOOP DETECTED" in hint
+        assert "REFLECT" in hint
+        assert "Simplify" in hint
+        assert "Escalate" in hint
+
+    def test_build_loop_hint_unknown_phase_falls_back_to_intent(self):
+        from chaos_agent.agent.nodes.react_helpers import _build_loop_hint
+        hint = _build_loop_hint("some_tool()", 3, "unknown_phase")
+        assert "REFLECT" in hint
+        assert "discovery method" in hint

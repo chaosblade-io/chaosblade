@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from chaos_agent.agent.fault_spec import read_fault_spec
+from chaos_agent.agent.fault_spec import fault_type_from_state, read_fault_spec
+from chaos_agent.agent.operation_outcome import read_inject_verification, read_operation_outcome
 from chaos_agent.agent.verdict import FailureCategory
 
 # Failure categories worth a postmortem. The rest (USER_REJECTED,
@@ -33,10 +34,11 @@ def should_generate_postmortem(state: dict, settings) -> bool:
     Conditions (ALL must hold):
       1. settings.postmortem_enabled is True
       2. Task is an inject (not chat / recover-bridge)
-      3. EITHER blade_uid is set (real injection happened, success or
-         post-inject failure) OR the failure category is in the
-         postmortem whitelist (real experiment, just failed verification
-         / execution / replan)
+      3. ANY of:
+         a) blade_uid is set (ChaosBlade injection happened)
+         b) verification completed (non-blade injection that reached
+            verifier — e.g. kubectl patch/delete scenarios)
+         c) failure category is in the postmortem whitelist
 
     A return value of ``False`` lets the caller cleanly skip postmortem
     generation without raising / logging — postmortem is opportunistic.
@@ -45,13 +47,19 @@ def should_generate_postmortem(state: dict, settings) -> bool:
         return False
 
     if state.get("confirmed_intent") not in ("inject",):
-        # chat / recover-bridge / unset — nothing to post-mortem
         return False
 
     if state.get("blade_uid"):
         return True
 
-    failure_detail = state.get("failure_detail") or {}
+    verification = read_inject_verification(state)
+    if isinstance(verification, dict) and verification.get("level") in (
+        "verified", "unverified", "partial",
+    ):
+        return True
+
+    outcome = read_operation_outcome(state)
+    failure_detail = outcome.failure_detail or {}
     category = failure_detail.get("category") if isinstance(failure_detail, dict) else None
     return category in _POSTMORTEM_FAILURE_WHITELIST
 
@@ -74,9 +82,7 @@ def build_postmortem_context(state: dict, *, max_messages: int = 30) -> dict[str
     spec = read_fault_spec(state)
     fault_spec_dict = spec.to_dict() if spec else {}
 
-    verification = state.get("verification") or {}
-    if not isinstance(verification, dict):
-        verification = {}
+    verification = read_inject_verification(state) or {}
 
     side_effects = verification.get("side_effects") or {}
     if not isinstance(side_effects, dict):
@@ -99,8 +105,9 @@ def build_postmortem_context(state: dict, *, max_messages: int = 30) -> dict[str
         baseline_summary = {}
 
     safety_score = state.get("safety_score") or {}
-    failure_detail = state.get("failure_detail") or {}
-    result = state.get("result") or {}
+    outcome = read_operation_outcome(state)
+    failure_detail = outcome.failure_detail or {}
+    result = outcome.result or {}
 
     messages_raw = state.get("messages") or []
     elided = max(0, len(messages_raw) - max_messages)
@@ -109,7 +116,7 @@ def build_postmortem_context(state: dict, *, max_messages: int = 30) -> dict[str
 
     return {
         "task_id": state.get("task_id", ""),
-        "skill_name": state.get("skill_name", ""),
+        "skill_name": fault_type_from_state(state),
         "fault_spec": fault_spec_dict,
         "blade_uid": state.get("blade_uid", "") or "",
         "result": {

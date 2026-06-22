@@ -9,6 +9,7 @@ from tests._helpers import intent_dict_from_result
 from chaos_agent.agent.nodes.intent_clarification import (
     CLASSIFY_INTENT_TOOL,
     _ensure_visible_content,
+    _allocate_operation_task_id,
     _extract_classify_intent,
     _merge_known_params_into_fault_intent,
     submit_fault_intent,
@@ -66,6 +67,23 @@ def _ask_human_tc(question: str = "What do you mean?"):
         "id": "call_ask_1",
         "args": {"question": question},
     }
+
+
+def test_tui_turn_ids_allocate_distinct_operation_task_ids():
+    """Each TS TUI turn must become a fresh operation task when dispatched."""
+
+    first = _allocate_operation_task_id("turn-first")
+    second = _allocate_operation_task_id("turn-second")
+
+    assert first.startswith("task-")
+    assert second.startswith("task-")
+    assert first != second
+
+
+def test_cli_task_id_is_still_reused():
+    """CLI callers may pre-mint a task id before entering the graph."""
+
+    assert _allocate_operation_task_id("task-existing") == "task-existing"
 
 
 class TestExtractClassifyIntent:

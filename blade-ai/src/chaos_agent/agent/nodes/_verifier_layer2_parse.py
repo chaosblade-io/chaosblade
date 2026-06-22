@@ -13,16 +13,15 @@ from langchain_core.messages import HumanMessage
 
 from chaos_agent.agent.nodes._verifier_shared import (
     _parse_status_keyword,
+    has_checklist,
+    parse_checklist_items,
 )
 from chaos_agent.agent.verdict import (
     Checklist,
     ChecklistItem,
-    ChecklistItemStatus,
     InjectVerdict,
     Layer1Result,
-    Layer1Status,
     Layer2Result,
-    Layer2Status,
     StructuredWarning,
     VerificationResult,
     WarningCode,
@@ -347,62 +346,19 @@ _CHECKLIST_PATTERNS = [
 
 
 def _parse_checklist_items(text: str) -> list[dict]:
-    """Parse Verification Checklist items from LLM output.
-
-    Returns list of dicts with 'step' (int), 'status' (str), and
-    optional 'evidence' (str) keys.
-    """
-    items = []
-    seen_steps: set[str] = set()
-
-    # Scope search to the VERIFICATION_CHECKLIST section if present
-    checklist_section = text
-    if "VERIFICATION_CHECKLIST:" in text:
-        start = text.index("VERIFICATION_CHECKLIST:") + len("VERIFICATION_CHECKLIST:")
-        remainder = text[start:]
-        if "VERIFICATION_RESULT:" in remainder:
-            end = remainder.index("VERIFICATION_RESULT:")
-            checklist_section = remainder[:end]
-        else:
-            checklist_section = remainder
-
-    for pattern in _CHECKLIST_PATTERNS:
-        for match in pattern.finditer(checklist_section):
-            # Determine step number
-            if "[skipped]" in match.group(0).lower():
-                # [SKIPPED] pattern: group(1) may be None
-                step_str = match.group(1) if match.group(1) else str(len(seen_steps) + 1)
-                status = "skipped"
-            else:
-                step_str = match.group(1)
-                status = match.group(2).lower()
-
-            if step_str in seen_steps:
-                continue
-            seen_steps.add(step_str)
-            try:
-                step_num = int(step_str)
-            except ValueError:
-                step_num = len(items) + 1
-            item: dict = {"step": step_num, "status": status}
-            # Extract evidence text (group 3 in patterns that capture it)
-            evidence = match.group(3) if match.lastindex and match.lastindex >= 3 else None
-            if evidence:
-                item["evidence"] = evidence.strip()
-            items.append(item)
-
-    return items
+    """Parse Verification Checklist items from LLM output."""
+    return parse_checklist_items(
+        text,
+        section_marker="VERIFICATION_CHECKLIST:",
+        end_marker="VERIFICATION_RESULT:",
+        patterns=_CHECKLIST_PATTERNS,
+        capture_evidence=True,
+    )
 
 
 def _has_checklist(text: str) -> bool:
     """Check if text contains a Verification Checklist section or items."""
-    if "VERIFICATION_CHECKLIST:" in text:
-        return True
-    # Also check for individual checklist item patterns
-    for pattern in _CHECKLIST_PATTERNS:
-        if pattern.search(text):
-            return True
-    return False
+    return has_checklist(text, section_marker="VERIFICATION_CHECKLIST:", patterns=_CHECKLIST_PATTERNS)
 
 
 def _detect_checklist_conclusion_inconsistency(

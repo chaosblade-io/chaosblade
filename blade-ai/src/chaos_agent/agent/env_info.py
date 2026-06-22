@@ -38,8 +38,13 @@ async def compute_env_info(task_id: str = "") -> dict:
     env["k8s_available"] = await _check_k8s_available()
 
     # Static info from settings
-    env["kubeconfig_path"] = settings.kubeconfig_path or "(default)"
-    env["kube_context"] = settings.kube_context or "(current)"
+    env["kube_connection_mode"] = settings.kube_connection_mode
+    if settings.kube_connection_mode == "kubewiz":
+        env["kubeconfig_path"] = "(kubewiz)"
+        env["kube_context"] = "(kubewiz)"
+    else:
+        env["kubeconfig_path"] = settings.kubeconfig_path or "(default)"
+        env["kube_context"] = settings.kube_context or "(current)"
     env["model_name"] = settings.model_name
 
     if task_id:
@@ -87,20 +92,11 @@ async def _get_blade_version() -> str:
 async def _check_k8s_available() -> bool:
     """Check if kubectl can reach a cluster."""
     try:
-        cmd = [settings.kubectl_path, "cluster-info"]
-        if settings.kubeconfig_path:
-            cmd.extend(["--kubeconfig", settings.kubeconfig_path])
-        if settings.kube_context:
-            cmd.extend(["--context", settings.kube_context])
+        from chaos_agent.tools.kubectl import exec_kubectl_raw
 
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=10)
-        return proc.returncode == 0
-    except (FileNotFoundError, asyncio.TimeoutError, OSError):
+        result = await exec_kubectl_raw("cluster-info", [], timeout=10.0)
+        return result.exit_code == 0
+    except Exception:
         return False
 
 

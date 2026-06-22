@@ -2,14 +2,19 @@
 
 import time
 
-from langgraph.graph import END
-
 from langchain_core.messages import ToolMessage
+from langgraph.graph import END
 
 from chaos_agent.agent.nodes._verifier_submit import (
     SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
     SUBMIT_VERIFICATION_TOOL_NAME,
 )
+from chaos_agent.agent.operation_outcome import (
+    read_inject_verification,
+    read_operation_outcome,
+    read_recover_verification,
+)
+from chaos_agent.agent.skill_identity import has_active_skill
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
 
@@ -122,7 +127,7 @@ def should_continue_agent_loop(state: AgentState) -> str:
         return "reject"
 
     # Error set by agent_loop node (terminal conclusion detection)
-    if state.get("error"):
+    if read_operation_outcome(state).error:
         return "reject"
 
     # Check the last message for tool_calls (LLM ReAct pattern)
@@ -136,7 +141,7 @@ def should_continue_agent_loop(state: AgentState) -> str:
         # the LLM has finished its turn
         if hasattr(last_msg, "type") and last_msg.type == "ai":
             # If a skill was activated → planning complete, proceed to metadata extraction
-            if state.get("skill_name"):
+            if has_active_skill(state):
                 return "extract_planning_metadata"
             # No skill yet → might still be planning,
             # continue the loop to give LLM more turns
@@ -144,7 +149,7 @@ def should_continue_agent_loop(state: AgentState) -> str:
 
     # Fallback: if there's a plan and skill_name from a previous iteration,
     # proceed to metadata extraction
-    if state.get("plan") and state.get("skill_name"):
+    if state.get("plan") and has_active_skill(state):
         return "extract_planning_metadata"
 
     # Otherwise continue the ReAct loop
@@ -208,8 +213,9 @@ def should_continue_execute_loop(state: AgentState) -> str:
         return "replan"
 
     # Error with auto-replan detection
-    if state.get("error"):
-        if _should_replan(state, state["error"]):
+    outcome = read_operation_outcome(state)
+    if outcome.error:
+        if _should_replan(state, outcome.error):
             return "replan"
         return "end"
 
@@ -324,7 +330,7 @@ def should_continue_verifier(state: AgentState) -> str:
     """
     # Early-exit terminals set verification inline (node max-guard at
     # count>max, or Layer 1 failure). Those are truly done.
-    if state.get("verification"):
+    if read_inject_verification(state):
         return "done"
 
     # Patch C — wall-clock cap. A timeout is an ABNORMAL cutoff: the node
@@ -387,7 +393,7 @@ def route_after_finalize(state: AgentState) -> str:
     ``verification`` unset and appends a re-verify prompt → loop back to
     verifier_loop. Otherwise → se_detect.
     """
-    if state.get("verification"):
+    if read_inject_verification(state):
         return "se_detect"
     return "verifier_loop"
 
@@ -414,7 +420,7 @@ def should_continue_recover_verifier(state: AgentState) -> str:
     """
     # Early-exit terminals set recover_verification inline (node max-guard at
     # count>max, or Layer 1 failure). Those are truly done.
-    if state.get("recover_verification"):
+    if read_recover_verification(state):
         return "done"
 
     # Patch C — wall-clock cap: abnormal cutoff, the node stamped a failure.
@@ -478,7 +484,7 @@ def route_after_recover_finalize(state: AgentState) -> str:
     leaves recover_verification unset and appends a prompt → loop back to
     recover_verifier_loop. Otherwise → END.
     """
-    if state.get("recover_verification"):
+    if read_recover_verification(state):
         return "done"
     return "recover_verifier_loop"
 
@@ -541,7 +547,7 @@ def _spec_ready_for_execute(state: AgentState) -> bool:
     """
     if not state.get("plan_confirmed"):
         return False
-    if not state.get("skill_name"):
+    if not has_active_skill(state):
         return False
     from chaos_agent.agent.fault_spec import read_fault_spec
     spec = read_fault_spec(state)
@@ -647,7 +653,7 @@ def route_after_direct_execute(state: AgentState) -> str:
     """
     if state.get("blade_uid"):
         return "verifier"
-    if state.get("error"):
+    if read_operation_outcome(state).error:
         return "end"
     return "verifier"
 

@@ -122,6 +122,26 @@ class TestBuildContext:
         assert ctx["side_effects"] == {"evicted_pods": ["p1"]}
         assert ctx["verification"]["level"] == "verified"
 
+    def test_skill_name_projects_canonical_fault_type_from_fault_spec(self):
+        ctx = build_postmortem_context({
+            "skill_name": "stale-skill",
+            "fault_spec": {
+                "namespace": "cms-demo",
+                "scope": "pod",
+                "names": ["pod-a"],
+                "labels": {},
+                "blade_target": "network",
+                "blade_action": "loss",
+                "params": {},
+                "params_flags": [],
+                "duration_seconds": 0,
+                "source": "test",
+                "user_description": "",
+            },
+        })
+
+        assert ctx["skill_name"] == "pod-network-loss"
+
 
 # ─── generator ─────────────────────────────────────────────────────
 

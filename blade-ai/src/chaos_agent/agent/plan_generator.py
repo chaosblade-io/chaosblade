@@ -84,7 +84,8 @@ def _section_inject_command(spec: FaultSpec, state: AgentState) -> str:
     if args.get("flags"):
         for flag_pair in _split_flags(args["flags"]):
             parts.append(f"  {flag_pair}")
-    if kubeconfig:
+    from chaos_agent.config.settings import settings
+    if settings.kube_connection_mode != "kubewiz" and kubeconfig:
         parts.append(f"  --kubeconfig {kubeconfig}")
 
     cmd_str = " \\\n".join(parts)
@@ -254,8 +255,11 @@ def _resolve_baseline_template(template: str, spec: FaultSpec) -> str:
     names = list(spec.names)
     node_name = names[0] if names else ""
     pod_name = "" if spec.scope == "node" else (names[0] if names else "")
+    # 与 ``baseline_capture._resolve_templates`` 保持一致：``{label_selector}``
+    # 必须渲染成 ``-l key=value``，否则 plan 预览展示的命令直接复制粘贴
+    # 也是错的（kubectl 会把裸 ``key=value`` 当 pod name）。
     label_selector = (
-        ",".join(f"{k}={v}" for k, v in spec.labels.items())
+        "-l " + ",".join(f"{k}={v}" for k, v in spec.labels.items())
         if spec.labels else ""
     )
 

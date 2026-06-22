@@ -11,6 +11,8 @@ import re
 from chaos_agent.agent.nodes._verifier_shared import (
     _has_negative_prefix,
     _parse_status_keyword,
+    has_checklist,
+    parse_checklist_items,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,7 +27,7 @@ def _build_recover_verifier_prompt(*, is_chaosblade: bool = True) -> str:
 
     Delegates to section functions in recovery.py, following the same
     architecture pattern as the inject verifier (verification.py).
-    CRITICAL rules at BEGINNING (primacy) + END (recency), with
+    Core Principles at BEGINNING (primacy) + REMEMBER at END (recency), with
     low-priority information in the middle.
 
     Args:
@@ -93,54 +95,22 @@ _RECOVERY_ABSENCE_PHRASES = (
 
 
 def _parse_recovery_checklist_items(text: str) -> list[dict]:
-    """Parse Recovery Verification Checklist items from LLM output.
-
-    Mirrors _parse_checklist_items() from verifier.py but scoped to
-    RECOVERY_VERIFICATION_CHECKLIST section and supports "partial" status.
-
-    Returns list of dicts with 'step' (int) and 'status' (str) keys.
-    """
-    items = []
-    seen_steps: set[str] = set()
-
-    checklist_section = text
-    if "RECOVERY_VERIFICATION_CHECKLIST:" in text:
-        start = text.index("RECOVERY_VERIFICATION_CHECKLIST:") + len("RECOVERY_VERIFICATION_CHECKLIST:")
-        remainder = text[start:]
-        if "RECOVERY_VERIFICATION_RESULT:" in remainder:
-            end = remainder.index("RECOVERY_VERIFICATION_RESULT:")
-            checklist_section = remainder[:end]
-        else:
-            checklist_section = remainder
-
-    for pattern in _RECOVERY_CHECKLIST_PATTERNS:
-        for match in pattern.finditer(checklist_section):
-            if "[skipped]" in match.group(0).lower():
-                step_str = match.group(1) if match.group(1) else str(len(seen_steps) + 1)
-                status = "skipped"
-            else:
-                step_str = match.group(1)
-                status = match.group(2).lower()
-
-            if step_str in seen_steps:
-                continue
-            seen_steps.add(step_str)
-            try:
-                step_num = int(step_str)
-            except ValueError:
-                step_num = len(items) + 1
-            items.append({"step": step_num, "status": status})
-
-    return items
+    """Parse Recovery Verification Checklist items from LLM output."""
+    return parse_checklist_items(
+        text,
+        section_marker="RECOVERY_VERIFICATION_CHECKLIST:",
+        end_marker="RECOVERY_VERIFICATION_RESULT:",
+        patterns=_RECOVERY_CHECKLIST_PATTERNS,
+    )
 
 
 def _has_recovery_checklist(text: str) -> bool:
     """Check if text contains a Recovery Verification Checklist section or items."""
-    if "RECOVERY_VERIFICATION_CHECKLIST:" in text:
-        return True
-    # Check both Pattern 0 (Step N: / Check N:) and Pattern 2 (bare N.)
-    # to match the prompt's suggested format and common LLM variations.
-    return bool(_RECOVERY_CHECKLIST_PATTERNS[0].search(text)) or bool(_RECOVERY_CHECKLIST_PATTERNS[2].search(text))
+    return has_checklist(
+        text,
+        section_marker="RECOVERY_VERIFICATION_CHECKLIST:",
+        patterns=[_RECOVERY_CHECKLIST_PATTERNS[0], _RECOVERY_CHECKLIST_PATTERNS[2]],
+    )
 
 
 def _count_recovery_steps_in_skill_case(content: str) -> int:

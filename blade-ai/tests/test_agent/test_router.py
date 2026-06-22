@@ -119,7 +119,12 @@ class TestShouldContinueExecuteLoop:
     @patch("chaos_agent.agent.router.settings")
     def test_has_blade_uid_goes_to_verifier(self, mock_settings):
         mock_settings.max_execute_loop = 15
-        state = {"execute_loop_count": 1, "blade_uid": "abc123", "error": None}
+        state = {
+            "execute_loop_count": 1,
+            "blade_uid": "abc123",
+            "error": None,
+            "messages": [AIMessage(content="done")],
+        }
         assert should_continue_execute_loop(state) == "verifier"
 
     @patch("chaos_agent.agent.router.settings")

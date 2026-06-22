@@ -33,6 +33,10 @@ class ScriptInfo:
     timeout: Optional[int] = None      # Per-script timeout in seconds
 
 
+# Default skill type constant — use this instead of hardcoding the string.
+SKILL_TYPE_FAULT_INJECTION = "fault-injection"
+
+
 @dataclass
 class SkillMetadata:
     """Tier 1: Only metadata loaded at startup.
@@ -48,6 +52,7 @@ class SkillMetadata:
     target: str = ""
     required_tools: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    skill_type: str = SKILL_TYPE_FAULT_INJECTION
     parameters: list[SkillParameter] = field(default_factory=list)
     scripts: list[ScriptInfo] = field(default_factory=list)
 

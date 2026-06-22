@@ -23,6 +23,7 @@ from typing import Optional
 
 from langchain_core.messages import SystemMessage
 
+from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -366,8 +367,9 @@ def extract_critical_context(messages: list, state: dict) -> dict:
     skill_names = []
 
     # Collect all active skill names (current + any from state history)
-    if state.get("skill_name"):
-        skill_names.append(state["skill_name"])
+    active_skill_name = read_active_skill_name(state)
+    if active_skill_name:
+        skill_names.append(active_skill_name)
     if state.get("active_skills"):
         for s in state["active_skills"]:
             if s not in skill_names:
@@ -523,63 +525,6 @@ def build_post_compact_context_message(critical_context: dict) -> str:
 # Maximum length for the compaction prompt + messages to avoid recursive overflow
 MAX_COMPACTION_INPUT_CHARS = 100_000
 
-# Large tool output stripping config (simplified microCompact)
-_STRIP_TOOL_HEAD_CHARS = 500
-_STRIP_TOOL_TAIL_CHARS = 500
-_STRIP_TOOL_THRESHOLD_CHARS = 2000
-_STRIP_TOOL_MARKER = "\n... [tool output truncated] ...\n"
-
-
-def _strip_large_tool_outputs(messages: list) -> list:
-    """Progressively compress large tool outputs before full compaction.
-
-    Aligned with Claude Code's microCompact.ts: before sending messages to
-    the LLM for compaction, truncate oversized tool result content to reduce
-    token usage. This is a simpler alternative to the full microCompact that
-    works at the message level rather than per-tool granularity.
-
-    Args:
-        messages: Conversation messages to strip.
-
-    Returns:
-        New message list with oversized tool outputs truncated.
-    """
-    result = []
-    modified = False
-
-    for msg in messages:
-        content = getattr(msg, "content", "")
-        if not isinstance(content, str):
-            result.append(msg)
-            continue
-
-        # Only strip tool result messages
-        is_tool = hasattr(msg, "type") and msg.type == "tool"
-        if not is_tool or len(content) <= _STRIP_TOOL_THRESHOLD_CHARS:
-            result.append(msg)
-            continue
-
-        # Truncate: keep head + marker + tail
-        head = content[:_STRIP_TOOL_HEAD_CHARS]
-        tail = content[-_STRIP_TOOL_TAIL_CHARS:]
-        truncated = head + _STRIP_TOOL_MARKER + tail
-
-        if hasattr(msg, "model_copy") and hasattr(msg, "__fields__"):
-            # LangChain BaseModel subclass — use model_copy for immutable update
-            new_msg = msg.model_copy(update={"content": truncated})
-        else:
-            # Mutable mock or plain object — set directly
-            msg.content = truncated
-            new_msg = msg
-        result.append(new_msg)
-        modified = True
-
-    if modified:
-        logger.debug("Stripped large tool outputs before compaction")
-
-    return result
-
-
 def _get_compact_prompt(mode: CompactionMode = CompactionMode.BASE) -> str:
     """Build the full compaction prompt for the given mode.
 
@@ -633,10 +578,6 @@ async def compact_memory(
     critical_context = {}
     if state is not None:
         critical_context = extract_critical_context(messages_to_compact, state)
-
-    # Progressive compression: strip large tool outputs before compaction
-    # (aligned with Claude Code's microCompact — reduce token usage before LLM call)
-    messages_to_compact = _strip_large_tool_outputs(messages_to_compact)
 
     if llm is None:
         # Fallback: simple concatenation summary

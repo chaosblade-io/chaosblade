@@ -113,12 +113,15 @@ class FailureDetail(BaseModel):
     category: FailureCategory
     context: str = ""
     llm_analysis: str = ""
+    alternatives: str = ""
 
     def to_reason_string(self) -> str:
         """Legacy-compatible failure_reason string."""
         base = f"{self.category.value}: {self.context}" if self.context else self.category.value
         if self.llm_analysis:
-            return f"{base} | llm_analysis: {self.llm_analysis}"
+            base = f"{base} | llm_analysis: {self.llm_analysis}"
+        if self.alternatives:
+            base = f"{base}\n\n可行替代方案:\n{self.alternatives}"
         return base
 
 

@@ -23,10 +23,10 @@ END, absent (guard/retry loop-back) → recover_verifier_loop.
 
 import logging
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 
-from chaos_agent.agent.node_names import FINALIZE_RECOVER_VERIFICATION
-from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
+from chaos_agent.agent.operation_outcome import write_recover_verification
+from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig, sync_kubewiz_runtime
 from chaos_agent.agent.nodes._recover_layer1 import (
     RecoverLayer1Result,
     _recover_layer1_to_dict,
@@ -34,8 +34,13 @@ from chaos_agent.agent.nodes._recover_layer1 import (
 from chaos_agent.agent.nodes._recover_layer2_parse import _parse_recovery_verification_result
 from chaos_agent.agent.nodes._store_sync import sync_to_store
 from chaos_agent.agent.nodes._verifier_finalize import _cleanup_debug_pods
-from chaos_agent.agent.nodes._verifier_shared import _compute_baseline_confidence
+from chaos_agent.agent.nodes._verifier_shared import (
+    _compute_baseline_confidence,
+    extract_submit_args,
+    last_ai_text,
+)
 from chaos_agent.agent.nodes._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState
 from chaos_agent.agent.state_helpers import fail_state
 from chaos_agent.agent.verdict import FailureCategory
@@ -86,45 +91,15 @@ def _recover_verification_from_submit_args(args: dict, skill_name: str = "") -> 
 
 
 def _extract_recover_submit_args(messages: list) -> dict | None:
-    """Return args of the most recent submit_recover_verification tool_call, or None.
-
-    Only scans messages AFTER the last guard/retry HumanMessage that finalize
-    itself injected, preventing stale args from a prior round being re-used.
-    """
-    boundary_idx = -1
-    for i, msg in enumerate(messages):
-        if isinstance(msg, HumanMessage):
-            content = getattr(msg, "content", "") or ""
-            if _GUARD_MARKER in content or _RETRY_MARKER in content:
-                boundary_idx = i
-
-    search_slice = messages[boundary_idx + 1:] if boundary_idx >= 0 else messages
-
-    for msg in reversed(search_slice):
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        for tc in tool_calls:
-            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
-            if name == SUBMIT_RECOVER_VERIFICATION_TOOL_NAME:
-                args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
-                return args or {}
-    return None
+    """Return args of the most recent submit_recover_verification tool_call, or None."""
+    return extract_submit_args(
+        messages,
+        tool_name=SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+        guard_markers=(_GUARD_MARKER, _RETRY_MARKER),
+    )
 
 
-def _last_ai_text(messages: list) -> str:
-    """Return the content of the last assistant message (text fallback source).
-
-    The assistant message is the last entry that is neither a HumanMessage,
-    ToolMessage, nor SystemMessage — robust to both real AIMessage (type="ai")
-    and test doubles (MagicMock without .type).
-    """
-    from langchain_core.messages import SystemMessage
-    for msg in reversed(messages):
-        if isinstance(msg, (HumanMessage, ToolMessage, SystemMessage)):
-            continue
-        content = getattr(msg, "content", "") or ""
-        if content:
-            return content if isinstance(content, str) else str(content)
-    return ""
+_last_ai_text = last_ai_text
 
 
 def _phrase_in_messages(messages: list, phrase: str) -> bool:
@@ -139,9 +114,10 @@ def make_finalize_recover_verification(registry=None):
 
     async def finalize_recover_verification(state: AgentState) -> dict:
         task_id = state.get("task_id", "")
-        skill_name = state.get("skill_name", "")
+        skill_name = read_active_skill_name(state)
         blade_uid = state.get("blade_uid", "")
         kubeconfig = _resolve_kubeconfig(state)
+        sync_kubewiz_runtime(state)
         count = state.get("verifier_loop_count", 0)
         messages = state.get("messages", [])
 
@@ -261,9 +237,12 @@ def make_finalize_recover_verification(registry=None):
             "recovered": verification["level"] in ("recovered", "partial"),
             "recovery_level": verification["level"],
         }
-        result_update["result"] = result
-        result_update["recover_verification"] = verification
-        result_update["finished_at"] = now_iso()
+        result_update = write_recover_verification(
+            result_update,
+            result=result,
+            verification=verification,
+            finished_at=now_iso(),
+        )
 
         if not result["recovered"]:
             result_update.update(fail_state(

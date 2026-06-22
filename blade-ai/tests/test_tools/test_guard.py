@@ -55,7 +55,7 @@ class TestToolGuardCheck:
         allowed, _ = self.guard.check(["kubectl", subcmd, "pods"])
         assert allowed is True
 
-    @pytest.mark.parametrize("subcmd", ["apply", "rollout", "edit", "create", "replace"])
+    @pytest.mark.parametrize("subcmd", ["edit", "replace"])
     def test_kubectl_forbidden_subcommands(self, subcmd):
         allowed, reason = self.guard.check(["kubectl", subcmd, "something"])
         assert allowed is False
@@ -81,7 +81,7 @@ class TestToolGuardCheck:
     def test_kubectl_with_kubeconfig_forbidden_subcommand(self):
         """Even with --kubeconfig, forbidden subcommands are still rejected."""
         allowed, reason = self.guard.check([
-            "kubectl", "--kubeconfig", "/my/kubeconfig", "apply", "-f", "pod.yaml",
+            "kubectl", "--kubeconfig", "/my/kubeconfig", "edit", "deployment", "my-app",
         ])
         assert allowed is False
         assert "subcommand not allowed" in reason

@@ -7,59 +7,38 @@ _ENV_STABLE_KEYS = frozenset({
 })
 
 
-def get_role_section(brief: bool = False) -> str:
+def get_role_section() -> str:
     """Role definition section for planning (agent_loop).
 
-    Args:
-        brief: When True, return a compact ≤12-line variant for cache-tight
-            prompts. The brief form still preserves the
-            "Safety Rules" tokens that downstream tests assert on.
+    Tool-agnostic: no concrete tool names (ChaosBlade, kubectl) — only
+    abstract terms (fault injection, mutations). Phase 1 is read-only
+    (planning), so the role says "plan", not "execute/verify/recover".
     """
-    if brief:
-        return """You are a Chaos Engineering Agent for Kubernetes fault injection.
-
-Safely plan, execute, verify, and recover ChaosBlade / kubectl experiments on K8s clusters.
-
-### Hard Boundaries (see Safety Rules for full list)
-- NO arbitrary kubectl mutations outside of skill-case-defined injection methods
-- NO arbitrary shell on the host
-- NO bypassing safety checks — if one fails, STOP and report"""
-
     return """You are a Chaos Engineering Agent for Kubernetes fault injection.
 
-Your role is to safely execute fault injection experiments on K8s clusters using ChaosBlade and kubectl.
+Safely plan fault injection experiments on K8s clusters.
 
-### What You Can Do
-- Plan and execute fault injection experiments (CPU stress, network delay, pod kill, etc.)
-- Use kubectl mutation commands (patch, scale, cordon, taint, delete) when they are defined as the injection method in a skill case
-- Verify fault effects using kubectl and ChaosBlade tools
-- Recover experiments and diagnose recovery issues
-- Answer questions about K8s and chaos engineering
-
-### What You Cannot Do
-- Execute kubectl mutations that are NOT part of the skill case's injection method
-- Execute arbitrary shell commands on the host machine
-- Bypass safety checks — if a check fails, you MUST stop and report"""
+### Hard Boundaries (see Safety Rules for full list)
+- NO arbitrary mutations outside of skill-case-defined injection methods
+- NO arbitrary shell on the host
+- NO bypassing safety checks — if one fails, STOP and report"""
 
 
 def get_executor_role_section() -> str:
     """Role definition section for execution (execute_loop).
 
-    Distinct from get_role_section: explicitly scopes the role to INJECTION
-    only, prohibiting recovery actions that belong to the recovery phase.
+    Execution-specific rules (stop after success, tool is ground truth)
+    live in executor Core Principles and REMEMBER (U-shaped attention),
+    NOT here — single-source principle.
     """
     return """You are a Chaos Engineering Fault Injector for Kubernetes.
 
-You are in the EXECUTION PHASE — the plan has been approved. You MUST call tools (kubectl, blade_create) to inject the fault NOW. Do NOT just output text.
-
-Your role:
-- INJECT the fault by calling the appropriate tools (kubectl scale/patch/delete, blade_create)
-- Once the fault is confirmed active, stop calling tools
-- Do NOT undo, reduce, or recover the fault — recovery is a separate phase
-- If the fault is already present, verify it via tool calls and report
+You are in the EXECUTION PHASE — the plan has been approved.
+You MUST call tools to inject the fault NOW. Do NOT just output text.
+Tool errors are expected — they are how you discover the actual interface.
 
 ### Hard Boundaries (see Safety Rules for full list)
-- NO arbitrary kubectl mutations outside of skill-case-defined injection methods
+- NO arbitrary mutations outside of skill-case-defined injection methods
 - NO arbitrary shell on the host
 - NO bypassing safety checks — if one fails, STOP and report"""
 

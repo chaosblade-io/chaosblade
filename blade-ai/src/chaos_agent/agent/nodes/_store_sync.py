@@ -9,6 +9,7 @@ graph pipeline.
 import logging
 from typing import Any
 
+from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.persistence.task_store_backend import (
     _DETAIL_COLUMNS,
     _TASK_COLUMNS,
@@ -75,7 +76,7 @@ def _extract_db_fields(merged: dict) -> tuple[dict, dict]:
             continue
         # skill_case_content → skill_use_case: store skill_name reference, not full text
         if key == "skill_case_content":
-            skill_name = merged.get("skill_name", "")
+            skill_name = read_active_skill_name(merged)
             db_key = "skill_use_case"
             value = skill_name  # Reference: can rebuild full content from skills/ dir
         if db_key in _TASK_COLUMNS:

@@ -43,6 +43,7 @@
 import { Box, Text } from "ink";
 import { memo } from "react";
 import { useBootCardWidth } from "../boot/BootCardFrame.js";
+import { PlanPreviewSection } from "./PlanPreviewSection.js";
 import { PostmortemSection } from "./PostmortemSection.js";
 import { t } from "../../i18n/index.js";
 import type { ResultItem } from "../../state/types.js";
@@ -58,14 +59,15 @@ interface StatusVisuals {
   title: string;
 }
 
-function statusVisuals(status: ResultItem["status"]): StatusVisuals {
+function statusVisuals(status: ResultItem["status"], operation?: ResultItem["operation"]): StatusVisuals {
+  const isRecover = operation === "recover";
   switch (status) {
     case "success":
       return {
         color: Theme.status.ok,
         glyph: Icons.success,
         chipLabel: t("result.chip.success"),
-        title: t("result.status.success"),
+        title: t(isRecover ? "result.status.success.recover" : "result.status.success"),
       };
     case "partial":
       return {
@@ -79,7 +81,7 @@ function statusVisuals(status: ResultItem["status"]): StatusVisuals {
         color: Theme.status.err,
         glyph: Icons.fail,
         chipLabel: t("result.chip.failed"),
-        title: t("result.status.failed"),
+        title: t(isRecover ? "result.status.failed.recover" : "result.status.failed"),
       };
     default:
       return {
@@ -177,7 +179,7 @@ const Field: React.FC<{
 };
 
 const ResultCardInternal: React.FC<{ item: ResultItem }> = ({ item }) => {
-  const { color, glyph, chipLabel, title } = statusVisuals(item.status);
+  const { color, glyph, chipLabel, title } = statusVisuals(item.status, item.operation);
   const width = useBootCardWidth();
 
   const hasEffect = !!item.summary;
@@ -380,6 +382,16 @@ const ResultCardInternal: React.FC<{ item: ResultItem }> = ({ item }) => {
         <PostmortemSection
           markdown={item.postmortem.markdown}
           path={item.postmortem.path}
+        />
+      )}
+
+      {/* Alternatives — rendered for failed results when failure_detail
+       *  carries an alternatives field. Sits after postmortem so the
+       *  user reads outcome → analysis → postmortem → what else to try. */}
+      {item.alternatives && (
+        <PlanPreviewSection
+          markdown={item.alternatives}
+          title={t("plan_preview.alternatives_title")}
         />
       )}
 

@@ -51,16 +51,24 @@ _DEFAULT_FAULTS = [
 
 async def stub_agent_loop(state: AgentState) -> dict:
     """Simulate agent_loop: activate skill + produce plan text."""
+    idx = state.get("current_fault_index", 0)
     spec_dict = state.get("fault_spec") or {}
     scope = spec_dict.get("scope", "")
     target = spec_dict.get("blade_target", "")
     action = spec_dict.get("blade_action", "")
-    return {
+    result = {
         "skill_name": "k8s-chaos-skills",
         "plan": f"Inject {scope}-{target}-{action}",
         "messages": [AIMessage(content=f"Plan: {scope}-{target}-{action}")],
         "agent_loop_count": state.get("agent_loop_count", 0) + 1,
     }
+    if idx == 0:
+        result.update({
+            "plan_summary": "stale plan summary from fault 0",
+            "_planning_alternatives": "stale alternatives from fault 0",
+            "_catalogue_rejection_nudged": True,
+        })
+    return result
 
 
 async def stub_safety_check(state: AgentState) -> dict:
@@ -78,10 +86,20 @@ async def stub_execute(state: AgentState) -> dict:
     if state.get("safety_status") == "rejected":
         return {}
     idx = state.get("current_fault_index", 0)
-    return {
+    result = {
         "blade_uid": f"blade-uid-{idx}",
         "messages": [AIMessage(content=f"Injected fault {idx}")],
     }
+    if idx == 0:
+        result.update({
+            "_execute_text_nudged": True,
+            "_kubectl_step_nudged": True,
+            "recover_verification": {"level": "recovered"},
+            "inject_layer1_cache": {"status": "passed"},
+            "metric_observations": [{"name": "stale metric"}],
+            "postmortem": {"summary": "fault 0 postmortem"},
+        })
+    return result
 
 
 async def stub_save_memory(state: AgentState) -> dict:
@@ -319,3 +337,36 @@ class TestBatchFlow:
         # Should NOT contain fault 0's "Injected fault 0" message
         assert not any("Injected fault 0" in c for c in contents), \
             f"Fault 0 messages leaked into fault 1: {contents}"
+
+    @pytest.mark.asyncio
+    async def test_per_fault_runtime_state_is_reset(self, graph):
+        """Batch setup clears per-fault runtime fields before the next fault."""
+        compiled, _ = graph
+        config = {"configurable": {"thread_id": "test-runtime-reset"}}
+        init = {
+            "messages": [], "current_fault_index": 0, "batch_results": [],
+            "batch_submit_args": {
+                "faults": _DEFAULT_FAULTS,
+                "execution_order": "serial", "interval_seconds": 0,
+            },
+        }
+
+        await compiled.ainvoke(init, config)
+        await compiled.ainvoke(Command(resume="approved"), config)
+
+        state = await compiled.aget_state(config)
+        values = state.values
+
+        assert state.next
+        assert values.get("current_fault_index") == 1
+        assert values.get("blade_uid") is None
+        assert values.get("recover_verification") is None
+        assert values.get("inject_layer1_cache") is None
+        assert values.get("metric_observations") is None
+        assert values.get("postmortem") is None
+        assert values.get("plan_summary") == ""
+        assert values.get("_planning_alternatives") == ""
+        assert values.get("_catalogue_rejection_nudged") is False
+        assert values.get("_execute_text_nudged") is False
+        assert values.get("_kubectl_step_nudged") is False
+        assert values.get("agent_loop_count") == 1

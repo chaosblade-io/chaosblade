@@ -27,9 +27,10 @@ import logging
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from chaos_agent.agent.fault_spec import read_fault_spec
-from chaos_agent.memory.session_store import get_global_session_store
-from chaos_agent.agent.node_names import FINALIZE_VERIFICATION, VERIFIER
-from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
+from chaos_agent.agent.node_names import FINALIZE_VERIFICATION
+from chaos_agent.agent.operation_outcome import write_inject_verification
+from chaos_agent.agent.nodes._debug_pod import parse_debug_pod_info, delete_debug_pod
+from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig, sync_kubewiz_runtime
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.nodes._verifier_layer1 import _layer1_to_dict, _restore_layer1_from_state
 from chaos_agent.agent.nodes._verifier_layer2_parse import (
@@ -41,11 +42,19 @@ from chaos_agent.agent.nodes._verifier_layer2_parse import (
     _validate_step_number_coverage,
     cross_check_evidence,
 )
-from chaos_agent.agent.nodes._verifier_shared import _compute_baseline_confidence
+from chaos_agent.agent.nodes._verifier_shared import (
+    _compute_baseline_confidence,
+    extract_submit_args,
+    last_ai_text,
+)
 from chaos_agent.agent.nodes._verifier_submit import SUBMIT_VERIFICATION_TOOL_NAME
-from chaos_agent.agent.nodes.baseline_capture import _parse_debug_pod_name, _delete_debug_pod
+from chaos_agent.agent.skill_identity import read_active_skill_name
+from chaos_agent.memory.session_store import get_global_session_store
+
+# Backward-compat aliases
+_parse_debug_pod_info = parse_debug_pod_info
+_delete_debug_pod = delete_debug_pod
 from chaos_agent.agent.state import AgentState
-from chaos_agent.config.settings import settings
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
 
 logger = logging.getLogger(__name__)
@@ -60,27 +69,26 @@ async def _cleanup_debug_pods(
     """Programmatic debug-pod cleanup with cross-reentry dedup.
 
     Scans the message history for ``kubectl debug node/...`` pods created
-    by the LLM, diffs against ``state.cleaned_debug_pods`` (pods we've
-    already attempted to delete in earlier verifier re-entries), deletes
-    only the new ones, and writes the merged set back into
-    ``result_update`` so the next re-entry sees them as already-handled.
-
-    Moved here from verifier_loop (Scheme B): cleanup now runs once, at
-    finalize, rather than every ReAct iteration. The dedup is still needed
-    because finalize can be reached more than once (re-verification rounds).
+    by the LLM, extracts both pod name and namespace from the ToolMessage
+    content. Diffs against ``state.cleaned_debug_pods`` (pods we've already
+    attempted to delete in earlier verifier re-entries), deletes only the
+    new ones, and writes the merged set back into ``result_update`` so the
+    next re-entry sees them as already-handled.
     """
-    discovered_pods: set[str] = set()
+    # discovered: pod_name -> namespace
+    discovered_pods: dict[str, str] = {}
     for msg in state.get("messages", []):
-        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "kubectl":
+        if isinstance(msg, ToolMessage) and getattr(msg, "name", "") in ("kubectl", "kubectl_verify"):
             msg_content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            pod_name = _parse_debug_pod_name(msg_content)
+            pod_name, ns = _parse_debug_pod_info(msg_content)
             if pod_name:
-                discovered_pods.add(pod_name)
+                discovered_pods[pod_name] = ns
     already_cleaned: set[str] = set(state.get("cleaned_debug_pods") or [])
-    pods_to_delete = discovered_pods - already_cleaned
+    pods_to_delete = set(discovered_pods.keys()) - already_cleaned
     for pod_name in pods_to_delete:
-        logger.info(f"Programmatic cleanup: deleting debug pod {pod_name}")
-        await _delete_debug_pod(pod_name, kubeconfig, task_id)
+        ns = discovered_pods[pod_name]
+        logger.info(f"Programmatic cleanup: deleting debug pod {pod_name} in namespace {ns}")
+        await _delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns)
     if pods_to_delete:
         result_update["cleaned_debug_pods"] = sorted(already_cleaned | pods_to_delete)
 
@@ -161,50 +169,15 @@ def _verification_from_submit_args(args: dict) -> dict:
 
 
 def _extract_submit_args(messages: list) -> dict | None:
-    """Return the args of the most recent submit_verification tool_call, or None.
-
-    Only scans messages AFTER the last reverify/guard HumanMessage that finalize
-    itself injected (identified by the "Verification gaps" / "re-verification"
-    / "GUARD" marker). This prevents stale submit args from a prior round being
-    re-used after a reverify loop-back (where the LLM may answer with text
-    instead of a second submit call).
-    """
-    # Find the boundary: last HumanMessage that finalize injected for reverify/guard.
-    boundary_idx = -1
-    for i, msg in enumerate(messages):
-        if isinstance(msg, HumanMessage):
-            content = getattr(msg, "content", "") or ""
-            if "Verification gaps" in content or "re-verification" in content:
-                boundary_idx = i
-
-    # Only scan after the boundary (or from start if no boundary).
-    search_slice = messages[boundary_idx + 1:] if boundary_idx >= 0 else messages
-
-    for msg in reversed(search_slice):
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        for tc in tool_calls:
-            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
-            if name == SUBMIT_VERIFICATION_TOOL_NAME:
-                args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
-                return args or {}
-    return None
+    """Return the args of the most recent submit_verification tool_call, or None."""
+    return extract_submit_args(
+        messages,
+        tool_name=SUBMIT_VERIFICATION_TOOL_NAME,
+        guard_markers=("Verification gaps", "re-verification"),
+    )
 
 
-def _last_ai_text(messages: list) -> str:
-    """Return the content of the last assistant message (text fallback source).
-
-    The assistant message is the last entry that is neither a HumanMessage,
-    ToolMessage, nor SystemMessage — robust to both real AIMessage (type="ai")
-    and test doubles (MagicMock without .type).
-    """
-    from langchain_core.messages import SystemMessage
-    for msg in reversed(messages):
-        if isinstance(msg, (HumanMessage, ToolMessage, SystemMessage)):
-            continue
-        content = getattr(msg, "content", "") or ""
-        if content:
-            return content if isinstance(content, str) else str(content)
-    return ""
+_last_ai_text = last_ai_text
 
 
 def _format_verification_detail(verification: dict, layer1) -> str:
@@ -250,9 +223,10 @@ def make_finalize_verification(registry=None):
 
     async def finalize_verification(state: AgentState) -> dict:
         task_id = state.get("task_id", "")
-        skill_name = state.get("skill_name", "")
+        skill_name = read_active_skill_name(state)
         blade_uid = state.get("blade_uid", "")
         kubeconfig = _resolve_kubeconfig(state)
+        sync_kubewiz_runtime(state)
         count = state.get("verifier_loop_count", 0)
         messages = state.get("messages", [])
 
@@ -566,15 +540,20 @@ def make_finalize_verification(registry=None):
             "blade_uid": blade_uid,
             "verified": verification["level"] == "verified",
         }
-        result_update["result"] = result
-        result_update["verification"] = verification
 
         l2_details = verification.get("layer2", {}).get("details", "")
+        summary_kwargs = {}
         if l2_details:
-            result_update["inject_verification_summary"] = (
+            summary_kwargs["inject_verification_summary"] = (
                 f"Layer2={verification.get('layer2', {}).get('status', 'unknown')}, "
                 f"Details={l2_details}"
             )
+        result_update = write_inject_verification(
+            result_update,
+            result=result,
+            verification=verification,
+            **summary_kwargs,
+        )
 
         level = verification["level"]
         l1_status = layer1.status

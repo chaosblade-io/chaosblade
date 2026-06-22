@@ -7,16 +7,15 @@ import shlex
 from langchain_core.messages import HumanMessage, ToolMessage
 
 from chaos_agent.agent.node_names import DIRECT_EXECUTE
-from chaos_agent.agent.nodes._injection_detection import discover_tool_pods
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
-from chaos_agent.config.settings import settings
 from chaos_agent.agent.state_helpers import fail_state
 from chaos_agent.agent.verdict import FailureCategory
+from chaos_agent.config.settings import settings
 from chaos_agent.memory.session_store import get_global_session_store
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
 from chaos_agent.tools.blade import blade_create
-from chaos_agent.tools.kubectl import _build_kubectl_global_args, _split_args
+from chaos_agent.tools.kubectl import _adapt_kubewiz_result, _split_args, build_kubectl_cmd
 from chaos_agent.tools.shell import run_command
 from chaos_agent.utils.blade_uid import extract_blade_uid
 from chaos_agent.utils.fault_type import build_blade_create_args
@@ -171,24 +170,21 @@ async def _fetch_pod_memory_limit_mb(
 
     try:
         from chaos_agent.tools.shell import run_command
-        from chaos_agent.tools.kubectl import _build_kubectl_global_args
+        from chaos_agent.tools.kubectl import build_kubectl_cmd
         from chaos_agent.config.settings import settings as _settings
         from chaos_agent.utils.fault_type import parse_k8s_memory_to_mb
-
-        kubectl_path = _settings.kubectl_path
-        global_args = _build_kubectl_global_args(kubeconfig)
 
         # Build command as list (run_command requires list[str], not string)
         if names:
             pod_name = names[0].split(",")[0] if isinstance(names[0], str) else names[0]
-            cmd = [kubectl_path, *global_args, "get", "pod", pod_name,
+            cmd = build_kubectl_cmd("get", ["pod", pod_name,
                    "-n", namespace,
-                   "-o", "jsonpath={.spec.containers[0].resources.limits.memory}"]
+                   "-o", "jsonpath={.spec.containers[0].resources.limits.memory}"], kubeconfig=kubeconfig)
         elif labels:
             label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
-            cmd = [kubectl_path, *global_args, "get", "pods",
+            cmd = build_kubectl_cmd("get", ["pods",
                    "-n", namespace, "-l", label_selector,
-                   "-o", "jsonpath={.items[0].spec.containers[0].resources.limits.memory}"]
+                   "-o", "jsonpath={.items[0].spec.containers[0].resources.limits.memory}"], kubeconfig=kubeconfig)
         else:
             return None
 
@@ -196,6 +192,7 @@ async def _fetch_pod_memory_limit_mb(
             cmd, timeout=_settings.timeout_kubectl, task_id=task_id,
             source="direct_execute-memory-limit",
         )
+        result = _adapt_kubewiz_result(result)
         if result.exit_code != 0 or not result.stdout:
             if tracker:
                 tracker.update(
@@ -246,18 +243,17 @@ async def _fetch_pod_memory_usage_mb(
         return None
     try:
         from chaos_agent.tools.shell import run_command
-        from chaos_agent.tools.kubectl import _build_kubectl_global_args
+        from chaos_agent.tools.kubectl import build_kubectl_cmd
         from chaos_agent.config.settings import settings as _settings
 
-        kubectl_path = _settings.kubectl_path
-        global_args = _build_kubectl_global_args(kubeconfig)
         pod_name = names[0].split(",")[0] if isinstance(names[0], str) else names[0]
-        cmd = [kubectl_path, *global_args, "top", "pod", pod_name,
-               "-n", namespace, "--no-headers"]
+        cmd = build_kubectl_cmd("top", ["pod", pod_name,
+               "-n", namespace, "--no-headers"], kubeconfig=kubeconfig)
         result = await run_command(
             cmd, timeout=_settings.timeout_kubectl, task_id=task_id,
             source="direct_execute-memory-usage",
         )
+        result = _adapt_kubewiz_result(result)
         if result.exit_code != 0 or not result.stdout:
             return None
         # Parse: "pod-name  123m  208Mi" → extract Mi value
@@ -371,46 +367,44 @@ async def _try_kubectl_exec_fallback(
         {"blade_uid": str, "pod_name": str, "output": str} on success,
         None if fallback is impossible or fails.
     """
-    # Step 1: Discover a running otel-c-tool pod via direct run_command
+    # Step 1: Discover a running tool pod via cluster-wide search
     # (pass task_id so tracker events are emitted for CLI visibility)
-    cmd = [settings.kubectl_path]
-    cmd.extend(_build_kubectl_global_args(kubeconfig))
-    cmd.append("get")
-    cmd.extend(_split_args("pods -n chaosblade -l app=otel-c-tool -o wide"))
-    try:
-        get_result = await run_command(cmd, timeout=settings.timeout_kubectl, task_id=task_id)
-    except Exception as e:
-        logger.warning("Fallback: failed to discover tool pods: %s", e)
-        return None
-    if get_result.exit_code != 0:
-        logger.warning(
-            "Fallback: failed to discover tool pods (exit=%d): %s",
-            get_result.exit_code, get_result.stderr[:200],
-        )
-        return None
-    pods = discover_tool_pods(get_result.stdout)
-    if not pods:
-        logger.warning("Fallback: no running otel-c-tool pods found")
-        return None
+    from chaos_agent.agent.nodes._injection_detection import (
+        discover_tool_pods_cluster_wide,
+        discover_tool_pod_on_node,
+    )
+
+    pod_name = None
+    pod_ns = None
 
     # For node-scope, prefer a tool pod on the target node for observability.
     # CRD-based injection works from any pod, but selecting the target node's
     # pod keeps logs and diagnostics co-located with the fault target.
-    pod_name = pods[0]
     if scope == "node" and names:
-        from chaos_agent.agent.nodes._injection_detection import discover_tool_pods_with_nodes
-        pods_with_nodes = discover_tool_pods_with_nodes(get_result.stdout)
-        _target_nodes = {n.strip() for n in names.split(",") if n.strip()}
-        for pname, pnode in pods_with_nodes:
-            if pnode in _target_nodes:
-                pod_name = pname
+        _target_nodes = [n.strip() for n in names.split(",") if n.strip()]
+        for _tnode in _target_nodes:
+            result = await discover_tool_pod_on_node(_tnode, kubeconfig, task_id)
+            if result:
+                pod_name, pod_ns = result
+                logger.info(
+                    "Fallback: node-scope selected pod %s (ns=%s) on node %s",
+                    pod_name, pod_ns, _tnode,
+                )
                 break
-        # If no pod on target node, fall back to any available pod (CRD still works)
-        logger.info(
-            "Fallback: node-scope selected pod %s (target nodes: %s)",
-            pod_name, ', '.join(_target_nodes),
-        )
-    logger.info(f"Fallback: using tool pod {pod_name}")
+
+    # Fall back to any available pod cluster-wide (CRD still works from any pod)
+    if not pod_name:
+        try:
+            all_pods = await discover_tool_pods_cluster_wide(kubeconfig, task_id)
+        except Exception as e:
+            logger.warning("Fallback: failed to discover tool pods: %s", e)
+            return None
+        if not all_pods:
+            logger.warning("Fallback: no running tool pods found cluster-wide")
+            return None
+        pod_name, pod_ns = all_pods[0]
+
+    logger.info(f"Fallback: using tool pod {pod_name} (ns={pod_ns})")
 
     # Step 2: Build blade command (without --kubeconfig)
     blade_cmd = _build_blade_command_for_exec(
@@ -422,25 +416,24 @@ async def _try_kubectl_exec_fallback(
         labels=labels,
         flags=flags,
     )
-    v_args = f"{pod_name} -n chaosblade -- {blade_cmd}"
+    v_args = f"{pod_name} -n {pod_ns} -- {blade_cmd}"
 
     # Step 3: Execute via kubectl exec (direct run_command for tracker visibility)
-    cmd = [settings.kubectl_path]
-    cmd.extend(_build_kubectl_global_args(kubeconfig))
-    cmd.append("exec")
-    cmd.extend(_split_args(v_args))
     # Defense-in-depth: _build_blade_command_for_exec already handles --timeout
     # inject/boost, but in case it didn't (shouldn't happen), catch it here.
+    exec_args = _split_args(v_args)
     if re.search(r"\bblade\s+create\b", v_args) and "--timeout" not in v_args:
         from chaos_agent.utils.fault_type import ensure_min_duration
         effective_timeout = ensure_min_duration(None, scope, target, action)
-        cmd.extend(["--timeout", str(effective_timeout)])
+        exec_args.extend(["--timeout", str(effective_timeout)])
         logger.info(
             "Fallback: auto-injected --timeout %ss into kubectl exec blade create",
             effective_timeout,
         )
+    cmd = build_kubectl_cmd("exec", exec_args, kubeconfig=kubeconfig)
     try:
         exec_result = await run_command(cmd, timeout=settings.timeout_kubectl_exec, task_id=task_id)
+        exec_result = _adapt_kubewiz_result(exec_result)
     except Exception as e:
         logger.warning("Fallback: kubectl exec failed: %s", e)
         return None
@@ -510,46 +503,27 @@ async def _verify_disk_fill_effect(
 
     # Discover tool pod on the TARGET node (not injection pod)
     from chaos_agent.tools.shell import run_command
-    from chaos_agent.tools.kubectl import _build_kubectl_global_args, _split_args
-    from chaos_agent.agent.nodes._injection_detection import discover_tool_pods_with_nodes, _TOOL_POD_NAMESPACE, _TOOL_POD_LABEL_SELECTOR
+    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.agent.nodes._injection_detection import discover_tool_pod_on_node as _discover_on_node
 
-    # Step 1: Discover tool pod on target node
-    discover_cmd = [settings.kubectl_path]
-    discover_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    discover_cmd.extend(["get", "pods", "-n", _TOOL_POD_NAMESPACE,
-                         "-l", _TOOL_POD_LABEL_SELECTOR, "-o", "wide"])
-    try:
-        discover_result = await run_command(discover_cmd, timeout=settings.timeout_kubectl,
-                                            task_id=task_id)
-        pods_with_nodes = discover_tool_pods_with_nodes(discover_result.stdout)
-    except Exception as e:
-        logger.warning(f"disk-fill post-check: failed to discover tool pods: {e}")
-        return None
-
-    target_pod = None
-    for pod_name, pod_node in pods_with_nodes:
-        if pod_node == node_name:
-            target_pod = pod_name
-            break
-
-    if not target_pod:
+    # Step 1: Discover tool pod on target node (cluster-wide search)
+    pod_result = await _discover_on_node(node_name, kubeconfig, task_id)
+    if not pod_result:
         logger.warning(
             f"disk-fill post-check: no tool pod found on target node {node_name}"
         )
         return None
 
-    logger.info(f"disk-fill post-check: using tool pod {target_pod} on {node_name}")
+    target_pod, target_pod_ns = pod_result
+    logger.info(f"disk-fill post-check: using tool pod {target_pod} (ns={target_pod_ns}) on {node_name}")
 
     # Step 2: Check for fill file in the tool pod's overlay filesystem
-    check_cmd = [settings.kubectl_path]
-    check_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    check_cmd.append("exec")
-    check_cmd.extend(_split_args(
-        f"{target_pod} -n {_TOOL_POD_NAMESPACE} -- ls -lh {fill_path}/"
-    ))
+    check_cmd = build_kubectl_cmd("exec",
+        f"{target_pod} -n {target_pod_ns} -- ls -lh {fill_path}/", kubeconfig=kubeconfig)
     try:
         check_result = await run_command(check_cmd, timeout=settings.timeout_kubectl,
                                          task_id=task_id)
+        check_result = _adapt_kubewiz_result(check_result)
     except Exception as e:
         logger.warning(f"disk-fill post-check: kubectl exec failed: {e}")
         return None
@@ -559,15 +533,12 @@ async def _verify_disk_fill_effect(
     has_fill_file = any(pat in stdout for pat in ("chaos_fill", "chaosblade"))
 
     # Step 3: Check overlay df for usage increase
-    df_cmd = [settings.kubectl_path]
-    df_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    df_cmd.append("exec")
-    df_cmd.extend(_split_args(
-        f"{target_pod} -n {_TOOL_POD_NAMESPACE} -- df -h {fill_path}"
-    ))
+    df_cmd = build_kubectl_cmd("exec",
+        f"{target_pod} -n {target_pod_ns} -- df -h {fill_path}", kubeconfig=kubeconfig)
     try:
         df_result = await run_command(df_cmd, timeout=settings.timeout_kubectl,
                                       task_id=task_id)
+        df_result = _adapt_kubewiz_result(df_result)
     except Exception as e:
         logger.warning(f"disk-fill post-check: df -h failed: {e}")
         df_result = None
@@ -629,9 +600,9 @@ async def _verify_disk_burn_effect(
         return None
 
     from chaos_agent.tools.shell import run_command
-    from chaos_agent.tools.kubectl import _build_kubectl_global_args, _split_args
+    from chaos_agent.tools.kubectl import build_kubectl_cmd
     from chaos_agent.agent.nodes._injection_detection import (
-        discover_tool_pods_with_nodes, _TOOL_POD_NAMESPACE, _TOOL_POD_LABEL_SELECTOR,
+        discover_tool_pod_on_node as _discover_on_node_burn,
     )
 
     # Resolve the exec target: where to sample /proc/diskstats from.
@@ -643,33 +614,16 @@ async def _verify_disk_burn_effect(
 
     if scope == "node":
         node_name = names  # --names maps to node name for node-level faults
-        # Discover tool pod on the TARGET node
-        discover_cmd = [settings.kubectl_path]
-        discover_cmd.extend(_build_kubectl_global_args(kubeconfig))
-        discover_cmd.extend(["get", "pods", "-n", _TOOL_POD_NAMESPACE,
-                             "-l", _TOOL_POD_LABEL_SELECTOR, "-o", "wide"])
-        try:
-            discover_result = await run_command(
-                discover_cmd, timeout=settings.timeout_kubectl, task_id=task_id,
-            )
-            pods_with_nodes = discover_tool_pods_with_nodes(discover_result.stdout)
-        except Exception as e:
-            logger.warning(f"disk-burn post-check: failed to discover tool pods: {e}")
-            return None
-
-        for pod_name, pod_node in pods_with_nodes:
-            if pod_node == node_name:
-                exec_pod_name = pod_name
-                break
-
-        if not exec_pod_name:
+        # Discover tool pod on the TARGET node (cluster-wide search)
+        pod_result = await _discover_on_node_burn(node_name, kubeconfig, task_id)
+        if not pod_result:
             logger.warning(
                 f"disk-burn post-check: no tool pod found on target node {node_name}"
             )
             return None
 
-        exec_pod_namespace = _TOOL_POD_NAMESPACE
-        logger.info(f"disk-burn post-check: using tool pod {exec_pod_name} on {node_name}")
+        exec_pod_name, exec_pod_namespace = pod_result
+        logger.info(f"disk-burn post-check: using tool pod {exec_pod_name} (ns={exec_pod_namespace}) on {node_name}")
 
     elif scope == "pod":
         # Primary: exec into the target pod directly
@@ -678,17 +632,14 @@ async def _verify_disk_burn_effect(
         exec_pod_namespace = namespace or "default"
 
         # Try sampling /proc/diskstats from the target pod
-        try_sample_cmd = [settings.kubectl_path]
-        try_sample_cmd.extend(_build_kubectl_global_args(kubeconfig))
-        try_sample_cmd.append("exec")
-        try_sample_cmd.extend(_split_args(
-            f"{pod_name} -n {exec_pod_namespace} -- cat /proc/diskstats"
-        ))
+        try_sample_cmd = build_kubectl_cmd("exec",
+            f"{pod_name} -n {exec_pod_namespace} -- cat /proc/diskstats", kubeconfig=kubeconfig)
 
         try:
             probe_result = await run_command(
                 try_sample_cmd, timeout=settings.timeout_kubectl, task_id=task_id,
             )
+            probe_result = _adapt_kubewiz_result(probe_result)
             if probe_result.exit_code == 0 and probe_result.stdout:
                 exec_pod_name = pod_name
                 logger.info(
@@ -705,16 +656,15 @@ async def _verify_disk_burn_effect(
                 f"cat /proc/diskstats, falling back to tool pod"
             )
             # Discover which node the target pod is on
-            node_cmd = [settings.kubectl_path]
-            node_cmd.extend(_build_kubectl_global_args(kubeconfig))
-            node_cmd.extend([
-                "get", "pod", pod_name, "-n", exec_pod_namespace,
+            node_cmd = build_kubectl_cmd("get", [
+                "pod", pod_name, "-n", exec_pod_namespace,
                 "-o", "jsonpath={.spec.nodeName}",
-            ])
+            ], kubeconfig=kubeconfig)
             try:
                 node_result = await run_command(
                     node_cmd, timeout=settings.timeout_kubectl, task_id=task_id,
                 )
+                node_result = _adapt_kubewiz_result(node_result)
                 if node_result.exit_code == 0 and node_result.stdout:
                     node_name = node_result.stdout.strip()
             except Exception:
@@ -727,52 +677,32 @@ async def _verify_disk_burn_effect(
                 )
                 return None
 
-            # Find tool pod on that node
-            discover_cmd = [settings.kubectl_path]
-            discover_cmd.extend(_build_kubectl_global_args(kubeconfig))
-            discover_cmd.extend(["get", "pods", "-n", _TOOL_POD_NAMESPACE,
-                                 "-l", _TOOL_POD_LABEL_SELECTOR, "-o", "wide"])
-            try:
-                discover_result = await run_command(
-                    discover_cmd, timeout=settings.timeout_kubectl, task_id=task_id,
-                )
-                pods_with_nodes = discover_tool_pods_with_nodes(discover_result.stdout)
-            except Exception as e:
-                logger.warning(f"disk-burn post-check: failed to discover tool pods: {e}")
-                return None
-
-            for tp_name, tp_node in pods_with_nodes:
-                if tp_node == node_name:
-                    exec_pod_name = tp_name
-                    break
-
-            if not exec_pod_name:
+            # Find tool pod on that node (cluster-wide search)
+            tool_pod_result = await _discover_on_node_burn(node_name, kubeconfig, task_id)
+            if not tool_pod_result:
                 logger.warning(
                     f"disk-burn post-check: no tool pod found on node "
                     f"{node_name} for pod {pod_name}"
                 )
                 return None
 
-            exec_pod_namespace = _TOOL_POD_NAMESPACE
+            exec_pod_name, exec_pod_namespace = tool_pod_result
             logger.info(
                 f"disk-burn post-check: using tool pod {exec_pod_name} "
-                f"on {node_name} (fallback for pod {pod_name})"
+                f"(ns={exec_pod_namespace}) on {node_name} (fallback for pod {pod_name})"
             )
     else:
         return None
 
     # Step 2: Sample /proc/diskstats twice with 5-second interval
-    sample_cmd_prefix = [settings.kubectl_path]
-    sample_cmd_prefix.extend(_build_kubectl_global_args(kubeconfig))
-    sample_cmd_prefix.append("exec")
-    sample_cmd_prefix.extend(_split_args(
-        f"{exec_pod_name} -n {exec_pod_namespace} -- cat /proc/diskstats"
-    ))
+    sample_cmd_prefix = build_kubectl_cmd("exec",
+        f"{exec_pod_name} -n {exec_pod_namespace} -- cat /proc/diskstats", kubeconfig=kubeconfig)
 
     try:
         sample1_result = await run_command(
             sample_cmd_prefix, timeout=settings.timeout_kubectl, task_id=task_id,
         )
+        sample1_result = _adapt_kubewiz_result(sample1_result)
         sample1_text = sample1_result.stdout or ""
     except Exception as e:
         logger.warning(f"disk-burn post-check: first diskstats sample failed: {e}")
@@ -785,6 +715,7 @@ async def _verify_disk_burn_effect(
         sample2_result = await run_command(
             sample_cmd_prefix, timeout=settings.timeout_kubectl, task_id=task_id,
         )
+        sample2_result = _adapt_kubewiz_result(sample2_result)
         sample2_text = sample2_result.stdout or ""
     except Exception as e:
         logger.warning(f"disk-burn post-check: second diskstats sample failed: {e}")
@@ -914,17 +845,18 @@ async def _capture_evidence_snapshot(
             await asyncio.sleep(delay)
             snapshot_data = {}
             for cmd in commands:
-                kubectl_args_str = " ".join(_build_kubectl_global_args(kubeconfig))
-                exec_cmd = (
-                    f"{settings.kubectl_path} {kubectl_args_str} "
-                    f"exec {names.split(',')[0]} -n {namespace} -- {cmd}"
-                )
-                rc, stdout, stderr = await run_command(
+                exec_cmd = build_kubectl_cmd("exec", [
+                    names.split(',')[0], "-n", namespace, "--",
+                ] + _split_args(cmd), kubeconfig=kubeconfig)
+                result = await run_command(
                     exec_cmd, timeout=10, task_id=task_id,
                     source="direct_execute-evidence-snapshot",
                 )
+                result = _adapt_kubewiz_result(result)
                 snapshot_data[cmd] = {
-                    "rc": rc, "stdout": stdout[:2000], "stderr": stderr[:500],
+                    "rc": result.exit_code,
+                    "stdout": result.stdout[:2000],
+                    "stderr": result.stderr[:500],
                 }
             logger.info(
                 "FCAT: %s — evidence snapshot captured (%d commands)",
@@ -938,306 +870,114 @@ async def _capture_evidence_snapshot(
     return None
 
 
-async def direct_execute(state: AgentState) -> dict:
-    """Directly invoke blade_create without LLM, replacing execute_loop.
 
-    Constructs blade_create arguments from AgentState's structured
-    parameters (blade_scope/blade_target/blade_action/params/params_flags),
-    calls blade_create.ainvoke(), and extracts the blade_uid.
+async def _apply_burn_adjustments(
+    params: dict,
+    scope: str, target: str, action: str,
+    target_metadata: dict,
+    namespace: str, spec_names: list[str],
+    kubeconfig: str, task_id: str,
+    tracker, state: AgentState,
+) -> tuple[dict, int | None]:
+    """Apply disk-burn parameter auto-boost (size, count, nohup).
 
-    The params dict is set in the same format that execute_loop would
-    produce from blade_create tool_call args, ensuring verifier and
-    build_status_data work correctly.
+    Returns (modified_params, fcat_size_ceiling).
     """
-    task_id = state.get("task_id", "unknown")
+    if target != "disk" or action != "burn":
+        return params, None
 
-    tracker = get_tracker(task_id)
-    tracker.start(
-        StatusCategory.NODE,
-        "direct_execute",
-        "Direct execute: calling blade_create",
-        {},
+    original_params = params.copy()
+
+    _session_store = get_global_session_store()
+    _task_id_local = state.get("task_id", "")
+
+    # FCAT P0: compute safe burn size from target_metadata
+    fcat_size_ceiling = None
+    from chaos_agent.utils.fault_context import lookup_adaptations, compute_safe_burn_size
+    adaptations = lookup_adaptations(
+        scope, target, action, target_metadata, rule_type="param_override",
     )
-
-    # 1. Build blade_create arguments from the FaultSpec — single
-    # source of truth. The 8-field flat layout means we no longer have
-    # to read state.target / state.blade_* / state.params separately
-    # and worry about cross-field consistency.
-    from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
-    spec = read_fault_spec(state) or FaultSpec()
-    scope = spec.scope
-    target = spec.blade_target
-    action = spec.blade_action
-    namespace = spec.namespace
-    names = ",".join(spec.names)
-    labels_str = ",".join(f"{k}={v}" for k, v in spec.labels.items())
-    kubeconfig = state.get("kubeconfig") or ""
-    params = dict(spec.params)
-    params_flags = list(spec.params_flags)
-    target_metadata = state.get("target_metadata") or {}
-
-    # Duration auto-boost: MIDDLE layer of three-layer guarantee
-    from chaos_agent.utils.fault_type import ensure_min_duration
-    _duration = ensure_min_duration(
-        spec.duration_seconds, scope, target, action,
-    )
-    if _duration != spec.duration_seconds:
-        logger.info(
-            f"Duration auto-adjusted from {spec.duration_seconds}s to {_duration}s "
-            f"for {scope}-{target}-{action}"
-        )
-
-    # ── Required-flag auto-completion ──────────────────────────────────
-    # Deterministic safety net: auto-add flags that are known-required
-    # for certain scope+target+action combinations to produce the
-    # intended effect. Same pattern as ensure_min_duration for --timeout.
-    _completions = _auto_complete_params(scope, target, action, params, params_flags)
-    if _completions:
-        logger.info(
-            "Auto-completed params for %s-%s %s: %s",
-            scope, target, action, _completions,
-        )
-
-    # Burn parameter auto-boost: widen the effect window for transient disk I/O
-    if target == "disk" and action == "burn":
-        original_params = params.copy()
-
-        # Session store (used by P0 and OOMKill risk messages below)
-        _session_store = get_global_session_store()
-        _task_id_local = state.get("task_id", "")
-
-        # FCAT P0: compute safe burn size from target_metadata
-        # Also fetch current memory usage for usage-aware size calculation.
-        fcat_size_ceiling = None
-        from chaos_agent.utils.fault_context import lookup_adaptations, compute_safe_burn_size
-        adaptations = lookup_adaptations(
-            scope, target, action, target_metadata, rule_type="param_override",
-        )
-        for adj in adaptations:
-            if "param_overrides" in adj.action and adj.action["param_overrides"].get("size") == "auto":
-                # Prefer the usage value baseline_capture already parsed
-                # out of its own ``kubectl top pod`` call (via
-                # ``baseline_extractors.extract_pod_top_metrics``). When
-                # present this avoids issuing the same ``kubectl top
-                # pod`` a second time. Fallback to a fresh fetch covers:
-                # baseline failed / extractor couldn't match the pod /
-                # the (pod,target) entry doesn't carry the extractor.
-                _usage_mb = (target_metadata or {}).get("pod_memory_usage_mb")
-                if _usage_mb is None:
-                    _usage_mb = await _fetch_pod_memory_usage_mb(
-                        namespace, target_info.get("names", []), kubeconfig, task_id,
-                    )
-                fcat_size_ceiling = compute_safe_burn_size(
-                    target_metadata.get("pod_memory_limit_mb"),
-                    pod_memory_usage_mb=_usage_mb,
+    for adj in adaptations:
+        if "param_overrides" in adj.action and adj.action["param_overrides"].get("size") == "auto":
+            _usage_mb = (target_metadata or {}).get("pod_memory_usage_mb")
+            if _usage_mb is None:
+                _usage_mb = await _fetch_pod_memory_usage_mb(
+                    namespace, list(spec_names), kubeconfig, task_id,
                 )
-                logger.info(
-                    "FCAT: %s matched, size_ceiling=%d (limit=%sMB, usage=%sMB)",
-                    adj.id, fcat_size_ceiling,
-                    target_metadata.get("pod_memory_limit_mb"),
-                    _usage_mb,
-                )
-                break
-
-        params = _auto_boost_burn_params(params, size_ceiling=fcat_size_ceiling)
-
-        # P0 ceiling computed → always write session message (regardless of param change)
-        if fcat_size_ceiling is not None:
-            if _session_store and _task_id_local:
-                _p0_msg = (
-                    f"[FCAT P0] P0-param-safety-burn-lowmem: ceiling={fcat_size_ceiling}MB, "
-                    f"pod_memory_limit={target_metadata.get('pod_memory_limit_mb', 'unknown')}MB, "
-                    f"pod_memory_usage={_usage_mb or 'unknown'}MB, "
-                    f"size={params.get('size', 'auto')}MB"
-                )
-                _session_store.append_messages(_task_id_local, [HumanMessage(content=_p0_msg)], node_name=DIRECT_EXECUTE)
-            if settings.is_debug and tracker:
-                tracker.update(
-                    (f"[FCAT P0] ceiling={fcat_size_ceiling}MB, "
-                     f"limit={target_metadata.get('pod_memory_limit_mb', 'unknown')}MB, "
-                     f"usage={_usage_mb or 'unknown'}MB, "
-                     f"size={params.get('size', 'auto')}MB")[:200],
-                    {"debug": True, "fcat": True},
-                )
-            if params != original_params:
-                logger.info(
-                    "Burn params auto-boosted (FCAT P0): size=%s (ceiling=%d)",
-                    params.get("size"), fcat_size_ceiling,
-                )
-        elif params != original_params:
-            # No P0 ceiling → auto-boost without FCAT intervention
-            if _session_store and _task_id_local:
-                _boost_msg = (
-                    f"[FCAT P0] Burn params auto-boosted (no FCAT ceiling): "
-                    f"size={params.get('size')}MB"
-                )
-                _session_store.append_messages(_task_id_local, [HumanMessage(content=_boost_msg)], node_name=DIRECT_EXECUTE)
-            if settings.is_debug and tracker:
-                tracker.update(
-                    f"[FCAT P0] Burn params auto-boosted (no FCAT ceiling): size={params.get('size')}MB"[:200],
-                    {"debug": True, "fcat": True},
-                )
+            fcat_size_ceiling = compute_safe_burn_size(
+                target_metadata.get("pod_memory_limit_mb"),
+                pod_memory_usage_mb=_usage_mb,
+            )
             logger.info(
-                "Burn params auto-boosted for %s-%s-%s: %s injected",
-                scope, target, action,
-                set(params.keys()) - set(original_params.keys()),
+                "FCAT: %s matched, size_ceiling=%d (limit=%sMB, usage=%sMB)",
+                adj.id, fcat_size_ceiling,
+                target_metadata.get("pod_memory_limit_mb"),
+                _usage_mb,
             )
+            break
 
-        # OOMKill risk warning: check pod memory limit before injection.
-        # Prefer target_metadata (already collected by direct_setup) over re-fetching.
-        # Gate by ``target == "mem"`` — the whole block compares
-        # ``params.get("size", _BURN_DEFAULT_SIZE)`` against the pod's
-        # memory limit, which only carries meaning for memory-burn
-        # faults. For cpu / network / io etc. ``size`` isn't a real
-        # param and the default-vs-limit math produces a misleading
-        # warning ("Pod memory limit too low for burn --size=..." on
-        # a CPU drill). Skipping also avoids the fallback ``kubectl
-        # ... resources.limits.memory`` call when direct_setup also
-        # skipped its prefetch for the same reason.
-        if scope == "pod" and target == "mem":
-            memory_limit_mb = (target_metadata or {}).get("pod_memory_limit_mb")
-            if memory_limit_mb is None:
-                # Fallback: fetch if not in target_metadata (e.g., old code path)
-                memory_limit_mb = await _fetch_pod_memory_limit_mb(
-                    namespace=namespace,
-                    names=target_info.get("names", []),
-                    labels=labels_dict,
-                    kubeconfig=kubeconfig,
-                    task_id=task_id,
-                )
-            if memory_limit_mb is not None and memory_limit_mb < _OOMKILL_RISK_THRESHOLD_MB:
-                burn_size = params.get("size", _BURN_DEFAULT_SIZE)
-                if fcat_size_ceiling is not None and int(burn_size) <= fcat_size_ceiling:
-                    # FCAT already reduced the size — just log it
-                    logger.info(
-                        "FCAT P0: burn size already reduced to %s (OOMKill risk mitigated)",
-                        burn_size,
-                    )
-                else:
-                    burn_warning = (
-                        f"Pod memory limit ({memory_limit_mb}MB) may be too low for "
-                        f"burn --size={burn_size} (~{burn_size}MB*100=10GB total I/O). "
-                        f"OOMKill is likely. If OOMKill occurs, the verifier will "
-                        f"detect it as a side-effect-confirmed result. "
-                        f"To reduce OOMKill risk, specify --params size=20 explicitly."
-                    )
-                    logger.warning(burn_warning)
-                    tracker.update(
-                        f"WARNING: {burn_warning}",
-                        {"warning": True, "memory_limit_mb": memory_limit_mb},
-                    )
-            # Persist memory limit result to session store
-            if _session_store and _task_id_local:
-                _mem_msg = (
-                    f"[OOMKill Risk] Pod memory limit: {memory_limit_mb}MB"
-                    if memory_limit_mb is not None
-                    else "[OOMKill Risk] Pod memory limit: not available"
-                )
-                _session_store.append_messages(
-                    _task_id_local,
-                    [HumanMessage(content=_mem_msg)],
-                    node_name=DIRECT_EXECUTE,
-                )
+    params = _auto_boost_burn_params(params, size_ceiling=fcat_size_ceiling)
 
-    args = build_blade_create_args(
-        scope=scope,
-        target=target,
-        action=action,
-        namespace=namespace,
-        names=names,
-        labels=labels_str,
-        kubeconfig=kubeconfig,
-        params=params,
-        params_flags=params_flags,
-        duration=_duration,
-    )
-
-    # 2. Parameter observability warning (before blade_create)
-    warning_fn = _PARAM_OBSERVABILITY_WARNINGS.get((target, action))
-    if warning_fn:
-        try:
-            warning_msg = warning_fn(params)
-            if warning_msg:
-                tracker.update(f"WARNING: {warning_msg}", {"warning": True})
-        except Exception:
-            logger.debug("Parameter observability warning check failed", exc_info=True)
-
-    # 2.5 Pre-flight check: for node-scope, verify DaemonSet pod on target node(s)
-    # This prevents wasting time on injections that are guaranteed to fail
-    # (e.g., target node has DiskPressure and DaemonSet pod is Evicted).
-    result_params = {
-        "scope": scope,
-        "target": target,
-        "action": action,
-        "namespace": namespace,
-        "names": names,
-        "labels": labels_str,
-    }
-
-    if scope == "node" and names:
-        from chaos_agent.agent.nodes._injection_detection import (
-            discover_tool_pods_with_nodes, _TOOL_POD_NAMESPACE, _TOOL_POD_LABEL_SELECTOR,
+    # P0 ceiling computed → always write session message
+    if fcat_size_ceiling is not None:
+        if _session_store and _task_id_local:
+            _p0_msg = (
+                f"[FCAT P0] P0-param-safety-burn-lowmem: ceiling={fcat_size_ceiling}MB, "
+                f"pod_memory_limit={target_metadata.get('pod_memory_limit_mb', 'unknown')}MB, "
+                f"pod_memory_usage={_usage_mb or 'unknown'}MB, "
+                f"size={params.get('size', 'auto')}MB"
+            )
+            _session_store.append_messages(_task_id_local, [HumanMessage(content=_p0_msg)], node_name=DIRECT_EXECUTE)
+        if settings.is_debug and tracker:
+            tracker.update(
+                (f"[FCAT P0] ceiling={fcat_size_ceiling}MB, "
+                 f"limit={target_metadata.get('pod_memory_limit_mb', 'unknown')}MB, "
+                 f"usage={_usage_mb or 'unknown'}MB, "
+                 f"size={params.get('size', 'auto')}MB")[:200],
+                {"debug": True, "fcat": True},
+            )
+        if params != original_params:
+            logger.info(
+                "Burn params auto-boosted (FCAT P0): size=%s (ceiling=%d)",
+                params.get("size"), fcat_size_ceiling,
+            )
+    elif params != original_params:
+        if _session_store and _task_id_local:
+            _boost_msg = (
+                f"[FCAT P0] Burn params auto-boosted (no FCAT ceiling): "
+                f"size={params.get('size')}MB"
+            )
+            _session_store.append_messages(_task_id_local, [HumanMessage(content=_boost_msg)], node_name=DIRECT_EXECUTE)
+        if settings.is_debug and tracker:
+            tracker.update(
+                f"[FCAT P0] Burn params auto-boosted (no FCAT ceiling): size={params.get('size')}MB"[:200],
+                {"debug": True, "fcat": True},
+            )
+        logger.info(
+            "Burn params auto-boosted for %s-%s-%s: %s injected",
+            scope, target, action,
+            set(params.keys()) - set(original_params.keys()),
         )
-        _preflight_cmd = [settings.kubectl_path]
-        _preflight_cmd.extend(_build_kubectl_global_args(kubeconfig))
-        _preflight_cmd.extend([
-            "get", "pods", "-n", _TOOL_POD_NAMESPACE,
-            "-l", _TOOL_POD_LABEL_SELECTOR, "-o", "wide",
-        ])
-        _preflight_blocked = False
-        try:
-            _preflight_result = await run_command(
-                _preflight_cmd, timeout=settings.timeout_kubectl, task_id=task_id,
-            )
-            _pods_with_nodes = discover_tool_pods_with_nodes(_preflight_result.stdout)
 
-            _target_nodes = [n.strip() for n in names.split(",") if n.strip()]
-            _available_nodes = {pnode for _, pnode in _pods_with_nodes}
-            _missing_nodes = [n for n in _target_nodes if n not in _available_nodes]
+    return params, fcat_size_ceiling
 
-            if _missing_nodes:
-                _preflight_blocked = True
-                _preflight_msg = (
-                    f"目标节点 {', '.join(_missing_nodes)} 上无 Running 的 ChaosBlade "
-                    f"DaemonSet Pod，节点级故障注入不可行。"
-                    f"请检查节点 DiskPressure/MemoryPressure 状态及 DaemonSet 运行情况。"
-                )
-                logger.error("Pre-flight check FAILED: %s", _preflight_msg)
-                tracker.complete(
-                    f"Pre-flight check failed: no running DaemonSet pod on "
-                    f"{', '.join(_missing_nodes)}",
-                    detail={"prerequisite": "daemonset_pod_on_target_node",
-                            "missing_nodes": _missing_nodes},
-                )
-                sync_node_status_to_session(
-                    state, "direct_execute", _preflight_msg,
-                    detail={"failure_category": "prerequisite_failed"},
-                )
-            else:
-                logger.info(
-                    "Pre-flight check passed: DaemonSet pod available on %s",
-                    ', '.join(_target_nodes),
-                )
-        except Exception:
-            # 检查失败时不阻塞，避免网络抖动误杀正常注入 (fail-open)
-            logger.warning(
-                "Pre-flight check raised exception, skipping (fail-open): ",
-                exc_info=True,
-            )
 
-        if _preflight_blocked:
-            return {
-                **fail_state(
-                    FailureCategory.PREREQUISITE_FAILED,
-                    f"no running ChaosBlade DaemonSet pod on target node(s) {', '.join(_missing_nodes)}",
-                    state.get("messages", []),
-                ),
-                "params": result_params,
-                "execute_loop_count": 1,
-                "messages": [],
-            }
+async def _run_blade_create_with_fallback(
+    state: AgentState,
+    args: dict,
+    result_params: dict,
+    blade_parsed_flags: dict | None,
+    scope: str, target: str, action: str,
+    namespace: str, names: str,
+    kubeconfig: str, params: dict,
+    target_metadata: dict,
+    task_id: str, tracker,
+) -> dict:
+    """Execute blade_create, handle retries and kubectl exec fallback.
 
-    # 3. Call blade_create
+    Returns the final result dict for direct_execute.
+    """
+    # Call blade_create
     flags_str = args.get("flags", "")
     result_params["flags"] = flags_str
     logger.info(
@@ -1246,26 +986,23 @@ async def direct_execute(state: AgentState) -> dict:
     )
     blade_result = await blade_create.ainvoke({**args, "task_id": task_id})
 
-    # 4. Extract blade_uid from result JSON
+    # Extract blade_uid from result JSON
     blade_uid = _parse_blade_uid_from_content(blade_result)
 
-    # 5. Parse key parameters from flags string for verifier consumption
-    blade_parsed_flags = None
-    if flags_str:
+    # Parse key parameters from flags string for verifier consumption
+    if not blade_parsed_flags and flags_str:
         from chaos_agent.utils.fault_type import parse_blade_flags
         parsed = parse_blade_flags(flags_str)
         if parsed:
             blade_parsed_flags = parsed
 
-    # 6. Error handling with kubectl exec fallback
+    # Error handling with kubectl exec fallback
     if not blade_uid:
-        # Diagnostic: log host blade output so we can see why it failed
         logger.warning(
             "Host blade_create returned no uid. raw_output(%d)=%r",
             len(str(blade_result)) if blade_result else 0,
             str(blade_result)[:500] if blade_result else "(empty)",
         )
-        # New: pattern-match known environmental errors for better diagnostics
         raw_output = str(blade_result) if blade_result else ""
         diag_hint = ""
         if "bad file descriptor" in raw_output:
@@ -1283,11 +1020,7 @@ async def direct_execute(state: AgentState) -> dict:
         if diag_hint:
             logger.warning("Host blade_create diagnostic: %s", diag_hint)
 
-        # --- Namespace compatibility retry ---
-        # Some ChaosBlade versions (particularly host-installed binaries) do not
-        # support --namespace for k8s sub-commands.  The blade_create tool
-        # docstring documents this known issue.  Retry without --namespace before
-        # falling back to kubectl exec.
+        # Namespace compatibility retry
         if "unknown flag" in raw_output and "--namespace" in raw_output:
             logger.info(
                 "Host blade_create failed with 'unknown flag: --namespace'. "
@@ -1309,9 +1042,8 @@ async def direct_execute(state: AgentState) -> dict:
                     "Falling back to kubectl exec."
                 )
 
-    # 7. Second check after namespace retry — fall back to kubectl exec if still no uid
+    # Fall back to kubectl exec if still no uid
     if not blade_uid:
-        # --- Fallback: try kubectl exec into cluster tool pod ---
         fallback_result = await _try_kubectl_exec_fallback(
             scope=scope,
             target=target,
@@ -1363,7 +1095,6 @@ async def direct_execute(state: AgentState) -> dict:
                     ),
                 ],
             }
-            # P0-evidence-snapshot: also capture for kubectl_exec fallback path
             snapshot_data = await _capture_evidence_snapshot(
                 scope, target, action, target_metadata or {},
                 namespace, names, kubeconfig, task_id,
@@ -1386,20 +1117,15 @@ async def direct_execute(state: AgentState) -> dict:
                         {"debug": True, "fcat": True},
                     )
             await sync_to_store(state, result)
-            # Record messages to session store (direct_execute bypasses PreReasoningHook)
             _session_store = get_global_session_store()
             _task_id_local = state.get("task_id", "")
             if _session_store and _task_id_local:
                 _session_store.append_messages(_task_id_local, result["messages"], node_name=DIRECT_EXECUTE)
-            # Post-injection effect check: programmatic fill file verification
-            # for disk-fill faults (bridges CRD Success ↔ filesystem reality gap)
             disk_fill_check = await _verify_disk_fill_effect(
                 scope, target, action, names, kubeconfig, params, blade_uid, task_id,
             )
             if disk_fill_check:
                 result["disk_fill_post_check"] = disk_fill_check
-            # Post-injection effect check: programmatic I/O throughput verification
-            # for disk-burn faults (bridges CRD Success ↔ I/O pressure reality gap)
             disk_burn_check = await _verify_disk_burn_effect(
                 scope, target, action, names, kubeconfig, params, blade_uid, task_id,
                 namespace=namespace,
@@ -1441,13 +1167,13 @@ async def direct_execute(state: AgentState) -> dict:
             detail={"injection_method": "host_blade", "fallback_used": False,
                     "safety_status": "rejected", "reason": "blade_create_failed"})
         await sync_to_store(state, result)
-        # Record messages to session store (direct_execute bypasses PreReasoningHook)
         _session_store = get_global_session_store()
         _task_id_local = state.get("task_id", "")
         if _session_store and _task_id_local:
             _session_store.append_messages(_task_id_local, result["messages"], node_name=DIRECT_EXECUTE)
         return result
 
+    # Success path: blade_create returned a uid
     result = {
         "blade_uid": blade_uid,
         "injection_method": "host_blade",
@@ -1468,8 +1194,6 @@ async def direct_execute(state: AgentState) -> dict:
         ],
     }
 
-    # P0-evidence-snapshot: capture quick evidence after blade_create
-    # for low-memory pods that may OOMKill before verifier can observe.
     snapshot_data = await _capture_evidence_snapshot(
         scope, target, action, target_metadata or {},
         namespace, names, kubeconfig, task_id,
@@ -1498,18 +1222,15 @@ async def direct_execute(state: AgentState) -> dict:
         detail={"blade_uid": blade_uid, "injection_method": "host_blade",
                 "fallback_used": False})
     await sync_to_store(state, result)
-    # Record messages to session store (direct_execute bypasses PreReasoningHook)
     _session_store = get_global_session_store()
     _task_id_local = state.get("task_id", "")
     if _session_store and _task_id_local:
         _session_store.append_messages(_task_id_local, result["messages"], node_name=DIRECT_EXECUTE)
-    # Post-injection effect check: programmatic fill file verification
     disk_fill_check = await _verify_disk_fill_effect(
         scope, target, action, names, kubeconfig, params, blade_uid, task_id,
     )
     if disk_fill_check:
         result["disk_fill_post_check"] = disk_fill_check
-    # Post-injection effect check: programmatic I/O throughput verification
     disk_burn_check = await _verify_disk_burn_effect(
         scope, target, action, names, kubeconfig, params, blade_uid, task_id,
         namespace=namespace,
@@ -1517,3 +1238,203 @@ async def direct_execute(state: AgentState) -> dict:
     if disk_burn_check:
         result["disk_burn_post_check"] = disk_burn_check
     return result
+
+
+async def direct_execute(state: AgentState) -> dict:
+    """Directly invoke blade_create without LLM, replacing execute_loop.
+
+    Constructs blade_create arguments from AgentState's structured
+    parameters, calls blade_create.ainvoke(), and extracts the blade_uid.
+    """
+    task_id = state.get("task_id", "unknown")
+
+    tracker = get_tracker(task_id)
+    tracker.start(
+        StatusCategory.NODE,
+        "direct_execute",
+        "Direct execute: calling blade_create",
+        {},
+    )
+
+    # 1. Build blade_create arguments from FaultSpec
+    from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+    spec = read_fault_spec(state) or FaultSpec()
+    scope = spec.scope
+    target = spec.blade_target
+    action = spec.blade_action
+    namespace = spec.namespace
+    names = ",".join(spec.names)
+    labels_str = ",".join(f"{k}={v}" for k, v in spec.labels.items())
+    kubeconfig = state.get("kubeconfig") or ""
+    params = dict(spec.params)
+    params_flags = list(spec.params_flags)
+    target_metadata = state.get("target_metadata") or {}
+
+    # Duration auto-boost
+    from chaos_agent.utils.fault_type import ensure_min_duration
+    _duration = ensure_min_duration(
+        spec.duration_seconds, scope, target, action,
+    )
+    if _duration != spec.duration_seconds:
+        logger.info(
+            f"Duration auto-adjusted from {spec.duration_seconds}s to {_duration}s "
+            f"for {scope}-{target}-{action}"
+        )
+
+    # Required-flag auto-completion
+    _completions = _auto_complete_params(scope, target, action, params, params_flags)
+    if _completions:
+        logger.info(
+            "Auto-completed params for %s-%s %s: %s",
+            scope, target, action, _completions,
+        )
+
+    # Burn parameter adjustments (disk-burn only)
+    params, _fcat_ceiling = await _apply_burn_adjustments(
+        params, scope, target, action,
+        target_metadata, namespace, list(spec.names),
+        kubeconfig, task_id, tracker, state,
+    )
+
+    # OOMKill risk warning for memory-burn faults: compare burn size
+    # against pod memory limit. Only meaningful for target=="mem" where
+    # the size param represents memory allocation.
+    if scope == "pod" and target == "mem":
+        memory_limit_mb = (target_metadata or {}).get("pod_memory_limit_mb")
+        if memory_limit_mb is None:
+            memory_limit_mb = await _fetch_pod_memory_limit_mb(
+                namespace=namespace,
+                names=list(spec.names),
+                labels=dict(spec.labels),
+                kubeconfig=kubeconfig,
+                task_id=task_id,
+            )
+        if memory_limit_mb is not None and memory_limit_mb < _OOMKILL_RISK_THRESHOLD_MB:
+            burn_size = params.get("size", _BURN_DEFAULT_SIZE)
+            burn_warning = (
+                f"Pod memory limit ({memory_limit_mb}MB) may be too low for "
+                f"burn --size={burn_size} (~{burn_size}MB*100=10GB total I/O). "
+                f"OOMKill is likely. If OOMKill occurs, the verifier will "
+                f"detect it as a side-effect-confirmed result. "
+                f"To reduce OOMKill risk, specify --params size=20 explicitly."
+            )
+            logger.warning(burn_warning)
+            tracker.update(
+                f"WARNING: {burn_warning}",
+                {"warning": True, "memory_limit_mb": memory_limit_mb},
+            )
+        _session_store = get_global_session_store()
+        if _session_store and task_id:
+            _mem_msg = (
+                f"[OOMKill Risk] Pod memory limit: {memory_limit_mb}MB"
+                if memory_limit_mb is not None
+                else "[OOMKill Risk] Pod memory limit: not available"
+            )
+            _session_store.append_messages(
+                task_id,
+                [HumanMessage(content=_mem_msg)],
+                node_name=DIRECT_EXECUTE,
+            )
+
+    args = build_blade_create_args(
+        scope=scope,
+        target=target,
+        action=action,
+        namespace=namespace,
+        names=names,
+        labels=labels_str,
+        kubeconfig=kubeconfig,
+        params=params,
+        params_flags=params_flags,
+        duration=_duration,
+    )
+
+    # Parameter observability warning
+    warning_fn = _PARAM_OBSERVABILITY_WARNINGS.get((target, action))
+    if warning_fn:
+        try:
+            warning_msg = warning_fn(params)
+            if warning_msg:
+                tracker.update(f"WARNING: {warning_msg}", {"warning": True})
+        except Exception:
+            logger.debug("Parameter observability warning check failed", exc_info=True)
+
+    result_params = {
+        "scope": scope,
+        "target": target,
+        "action": action,
+        "namespace": namespace,
+        "names": names,
+        "labels": labels_str,
+    }
+
+    # Pre-flight check: for node-scope, verify DaemonSet pod on target node(s)
+    if scope == "node" and names:
+        from chaos_agent.agent.nodes._injection_detection import (
+            discover_tool_pods_cluster_wide_with_nodes,
+        )
+        _preflight_blocked = False
+        try:
+            _pods_with_nodes = await discover_tool_pods_cluster_wide_with_nodes(
+                kubeconfig, task_id,
+            )
+
+            _target_nodes = [n.strip() for n in names.split(",") if n.strip()]
+            _available_nodes = {pnode for _, _, pnode in _pods_with_nodes}
+            _missing_nodes = [n for n in _target_nodes if n not in _available_nodes]
+
+            if _missing_nodes:
+                _preflight_blocked = True
+                _preflight_msg = (
+                    f"目标节点 {', '.join(_missing_nodes)} 上无 Running 的 ChaosBlade "
+                    f"DaemonSet Pod，节点级故障注入不可行。"
+                    f"请检查节点 DiskPressure/MemoryPressure 状态及 DaemonSet 运行情况。"
+                )
+                logger.error("Pre-flight check FAILED: %s", _preflight_msg)
+                tracker.complete(
+                    f"Pre-flight check failed: no running DaemonSet pod on "
+                    f"{', '.join(_missing_nodes)}",
+                    detail={"prerequisite": "daemonset_pod_on_target_node",
+                            "missing_nodes": _missing_nodes},
+                )
+                sync_node_status_to_session(
+                    state, "direct_execute", _preflight_msg,
+                    detail={"failure_category": "prerequisite_failed"},
+                )
+            else:
+                logger.info(
+                    "Pre-flight check passed: DaemonSet pod available on %s",
+                    ', '.join(_target_nodes),
+                )
+        except Exception:
+            logger.warning(
+                "Pre-flight check raised exception, skipping (fail-open): ",
+                exc_info=True,
+            )
+
+        if _preflight_blocked:
+            return {
+                **fail_state(
+                    FailureCategory.PREREQUISITE_FAILED,
+                    f"no running ChaosBlade DaemonSet pod on target node(s) {', '.join(_missing_nodes)}",
+                    state.get("messages", []),
+                ),
+                "params": result_params,
+                "execute_loop_count": 1,
+                "messages": [],
+            }
+
+    # Parse blade_parsed_flags from spec
+    blade_parsed_flags = None
+    flags_str = args.get("flags", "")
+    if flags_str:
+        from chaos_agent.utils.fault_type import parse_blade_flags
+        parsed = parse_blade_flags(flags_str)
+        if parsed:
+            blade_parsed_flags = parsed
+
+    return await _run_blade_create_with_fallback(
+        state, args, result_params, blade_parsed_flags,
+        scope, target, action, namespace, names,
+        kubeconfig, params, target_metadata, task_id, tracker,
+    )

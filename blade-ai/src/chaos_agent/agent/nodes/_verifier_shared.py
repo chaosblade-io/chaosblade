@@ -4,6 +4,8 @@ Decouples the cross-file dependency on private symbols so both files
 can be independently split into sub-modules without circular imports.
 """
 
+import re
+
 from chaos_agent.agent.state import AgentState
 
 
@@ -111,7 +113,7 @@ def _get_node_disk_topology_hints(blade_action: str | None = None) -> str:
     )
     if blade_action == "fill":
         base += (
-            "- `df -h /host` inside kubectl debug shows nodefs ONLY. If the fill targeted "
+            "- `df -h /host` inside the host-access pod shows nodefs ONLY. If the fill targeted "
             "imagefs, this command shows NO change even though fill succeeded — this is a "
             "FALSE NEGATIVE, not a failed injection.\n"
             "- YOUR FIRST CHECK MUST BE `df -h` (bare, no path) to list ALL mounted "
@@ -149,3 +151,133 @@ def _get_node_disk_topology_hints(blade_action: str | None = None) -> str:
             "— use `/proc/diskstats` delta sampling instead.\n"
         )
     return base
+
+
+# ---------------------------------------------------------------------------
+# Submit args extraction (used by both verifier & recover finalize)
+# ---------------------------------------------------------------------------
+
+def extract_submit_args(
+    messages: list,
+    *,
+    tool_name: str,
+    guard_markers: tuple[str, ...],
+) -> dict | None:
+    """Return args of the most recent submit tool_call, or None.
+
+    Only scans messages AFTER the last HumanMessage containing any guard_marker
+    string, preventing stale args from a prior round being re-used.
+    """
+    from langchain_core.messages import HumanMessage
+    boundary_idx = -1
+    for i, msg in enumerate(messages):
+        if isinstance(msg, HumanMessage):
+            content = getattr(msg, "content", "") or ""
+            if any(marker in content for marker in guard_markers):
+                boundary_idx = i
+
+    search_slice = messages[boundary_idx + 1:] if boundary_idx >= 0 else messages
+
+    for msg in reversed(search_slice):
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        for tc in tool_calls:
+            name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
+            if name == tool_name:
+                args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {})
+                return args or {}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Last AI text extraction (used by both verifier & recover finalize)
+# ---------------------------------------------------------------------------
+
+def last_ai_text(messages: list) -> str:
+    """Return the content of the last assistant message (text fallback source).
+
+    The assistant message is the last entry that is neither a HumanMessage,
+    ToolMessage, nor SystemMessage — robust to both real AIMessage (type="ai")
+    and test doubles (MagicMock without .type).
+    """
+    from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+    for msg in reversed(messages):
+        if isinstance(msg, (HumanMessage, ToolMessage, SystemMessage)):
+            continue
+        content = getattr(msg, "content", "") or ""
+        if content:
+            return content if isinstance(content, str) else str(content)
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Shared checklist parsing (used by both verifier & recover_verifier L2 parse)
+# ---------------------------------------------------------------------------
+
+def parse_checklist_items(
+    text: str,
+    *,
+    section_marker: str,
+    end_marker: str,
+    patterns: list[re.Pattern],
+    capture_evidence: bool = False,
+) -> list[dict]:
+    """Parse verification checklist items from LLM output.
+
+    Args:
+        section_marker: e.g. "VERIFICATION_CHECKLIST:" or "RECOVERY_VERIFICATION_CHECKLIST:"
+        end_marker: e.g. "VERIFICATION_RESULT:" or "RECOVERY_VERIFICATION_RESULT:"
+        patterns: compiled regex patterns (each must have group(1)=step, group(2)=status)
+        capture_evidence: if True, extract group(3) as 'evidence' when present
+    """
+    items: list[dict] = []
+    seen_steps: set[str] = set()
+
+    checklist_section = text
+    if section_marker in text:
+        start = text.index(section_marker) + len(section_marker)
+        remainder = text[start:]
+        if end_marker in remainder:
+            end = remainder.index(end_marker)
+            checklist_section = remainder[:end]
+        else:
+            checklist_section = remainder
+
+    for pattern in patterns:
+        for match in pattern.finditer(checklist_section):
+            if "[skipped]" in match.group(0).lower():
+                step_str = match.group(1) if match.group(1) else str(len(seen_steps) + 1)
+                status = "skipped"
+            else:
+                step_str = match.group(1)
+                status = match.group(2).lower()
+
+            if step_str in seen_steps:
+                continue
+            seen_steps.add(step_str)
+            try:
+                step_num = int(step_str)
+            except ValueError:
+                step_num = len(items) + 1
+            item: dict = {"step": step_num, "status": status}
+            if capture_evidence:
+                evidence = match.group(3) if match.lastindex and match.lastindex >= 3 else None
+                if evidence:
+                    item["evidence"] = evidence.strip()
+            items.append(item)
+
+    return items
+
+
+def has_checklist(
+    text: str,
+    *,
+    section_marker: str,
+    patterns: list[re.Pattern],
+) -> bool:
+    """Check if text contains a checklist section or items."""
+    if section_marker in text:
+        return True
+    for pattern in patterns:
+        if pattern.search(text):
+            return True
+    return False

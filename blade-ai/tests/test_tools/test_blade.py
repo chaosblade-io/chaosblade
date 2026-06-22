@@ -254,17 +254,22 @@ class TestBladeDestroy:
     async def test_successful_destroy(self, mock_run_command, monkeypatch):
         from chaos_agent.config.settings import settings as _settings
         monkeypatch.setattr(_settings, "kubeconfig_path", "")
+        monkeypatch.setattr(_settings, "kube_connection_mode", "kubeconfig")
         result = await blade_destroy.ainvoke({"uid": "abc123", "kubeconfig": ""})
         mock_run_command.assert_called_once()
         cmd = mock_run_command.call_args[0][0]
         assert cmd == ["blade", "destroy", "abc123"]
 
-    async def test_destroy_failure_returns_error(self, mock_run_command_fail):
+    async def test_destroy_failure_returns_error(self, mock_run_command_fail, monkeypatch):
+        from chaos_agent.config.settings import settings as _settings
+        monkeypatch.setattr(_settings, "kube_connection_mode", "kubeconfig")
         result = await blade_destroy.ainvoke({"uid": "abc123", "kubeconfig": ""})
         assert "Error" in result
         assert "blade destroy failed" in result
 
-    async def test_destroy_with_kubeconfig(self, mock_run_command):
+    async def test_destroy_with_kubeconfig(self, mock_run_command, monkeypatch):
+        from chaos_agent.config.settings import settings as _settings
+        monkeypatch.setattr(_settings, "kube_connection_mode", "kubeconfig")
         result = await blade_destroy.ainvoke({
             "uid": "abc123",
             "kubeconfig": "/my/kubeconfig",
@@ -272,6 +277,18 @@ class TestBladeDestroy:
         cmd = mock_run_command.call_args[0][0]
         assert "--kubeconfig" in cmd
         assert "/my/kubeconfig" in cmd
+
+    async def test_destroy_kubewiz_adds_target_k8s(self, mock_run_command, monkeypatch):
+        from chaos_agent.config.settings import settings as _settings
+        monkeypatch.setattr(_settings, "kube_connection_mode", "kubewiz")
+        monkeypatch.setattr(_settings, "kubewiz_url", "https://kubewiz.example.com")
+        monkeypatch.setattr(_settings, "kubewiz_cluster_uuid", "uuid-123")
+        monkeypatch.setattr(_settings, "kubewiz_token", "tok-abc")
+        result = await blade_destroy.ainvoke({"uid": "abc123", "kubeconfig": ""})
+        cmd = mock_run_command.call_args[0][0]
+        assert "--target" in cmd
+        assert "k8s" in cmd
+        assert "--kubewiz-url" in cmd
 
 
 class TestBladeStatus:

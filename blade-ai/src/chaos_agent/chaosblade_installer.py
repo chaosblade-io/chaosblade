@@ -35,7 +35,7 @@ from chaos_agent.config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-CHAOSBLADE_VERSION = "1.8.0"
+CHAOSBLADE_VERSION = "1.9.0-alpha"
 
 _DOWNLOAD_URL_TEMPLATE = (
     "https://chaosblade.oss-cn-hangzhou.aliyuncs.com/agent/github/"
@@ -43,10 +43,10 @@ _DOWNLOAD_URL_TEMPLATE = (
 )
 
 _CHECKSUMS: dict[str, str] = {
-    "darwin_amd64": "4046c8435c1673e83d37284d68b55e3da2069550125b66ce3161b84ecdf1ea90",
-    "darwin_arm64": "d0e3b2f4d8e9a228f1da1c7e2680cca870ac02d3de0710f2407d67bdb796357b",
-    "linux_amd64": "a49bb08dfe2a2292c60600ad8e34bf922fe11449317a03c67120838f6e7ee236",
-    "linux_arm64": "9a4e62c94f3af31fdfa6648d64df3e074d98039e31eab9dd2b1bd159fd614502",
+    "darwin_amd64": "70c06b465f9d8cf40106ce9d88e960ae64a7db1577bc0b79147ee019e311851d",
+    "darwin_arm64": "2f41dc14b22fe18840cca0a12931fd73e2eef10e41ebd01d5fe7279c34cce213",
+    "linux_amd64": "dc6ab90244015af34cb4f4722653c1506a428aab9f0b18435aca64f8866316fd",
+    "linux_arm64": "5a496e8f377aac9a9eef80ffd0073d7cc90ccba060604aa245990cc3ee8b7bcc",
 }
 
 # Canonical map: ChaosBlade release arch → pip wheel platform tag. Used by

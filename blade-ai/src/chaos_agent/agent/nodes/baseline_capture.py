@@ -7,10 +7,15 @@ Shared across ALL execution modes (direct and NL) — baseline_capture runs
 after safety_check/confirmation_gate for every fault injection flow, then
 route_after_baseline dispatches to direct_execute or execute_loop.
 
-Strategy priority:
+Strategy priority (matches the actual chain in ``make_baseline_capture``):
   1. LLM-driven (parse full skill_case_content to derive commands)
   2. Python Registry three-level lookup (scope,target,action) -> (scope,target) -> (scope,)
   3. Scope fallback
+
+Each strategy is gated by a *full-viability* check: only a strategy whose
+commands are all executable after template resolution short-circuits the
+chain. Partially-viable strategies are remembered as a best-effort
+fallback that is used if no later strategy produces a complete set.
 
 Design principle: best-effort — any failure does NOT block injection.
 """
@@ -29,18 +34,66 @@ from chaos_agent.agent.baseline_extractors import (
     extract_pod_top_metrics,
 )
 from chaos_agent.agent.node_names import BASELINE_CAPTURE
-from chaos_agent.agent.nodes._injection_detection import _TOOL_POD_NAMESPACE, discover_tool_pods_with_nodes
+from chaos_agent.agent.nodes._debug_pod import (
+    create_and_wait_debug_pod,
+    delete_debug_pod,
+    parse_debug_pod_name,
+    wait_for_debug_pod_ready,
+    DEBUG_CONTAINER_NAME,
+)
+from chaos_agent.agent.nodes._injection_detection import (
+    _TOOL_POD_NAMESPACE,
+    discover_tool_pod_on_node,
+)
+from chaos_agent.agent.nodes._kubeconfig_inject import sync_kubewiz_runtime
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
-from chaos_agent.errors import ToolGuardError, ToolTimeoutError
 from chaos_agent.memory.session_store import get_global_session_store
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
-from chaos_agent.tools.kubectl import _build_kubectl_global_args, _split_args
+from chaos_agent.tools.kubectl import _adapt_kubewiz_result, _split_args, build_kubectl_cmd, display_cmd
 from chaos_agent.tools.shell import run_command
 from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Observation success judgement
+# ---------------------------------------------------------------------------
+#
+# kubectl can return exit_code=0 even on partial failures. For example, when a
+# jsonpath template containing a space is split by the remote shell into two
+# arguments, kubectl will resolve the first as a valid path while treating the
+# second as a (non-existent) pod name — producing
+# ``Error from server (NotFound)`` on stdout/stderr while still exiting 0.
+# Counting that observation as a success masks real failures from the verifier
+# and downstream consumers, so every success check must inspect the captured
+# output as well as exit_code.
+#
+# Note: the kubewiz channel sometimes merges stderr into stdout, so we always
+# scan stdout for these markers regardless of where the error was reported.
+_KUBECTL_ERROR_MARKERS = (
+    "Error from server",
+    "error: ",
+)
+
+
+def _is_observation_success(obs: dict) -> bool:
+    """Return True iff a baseline observation truly succeeded.
+
+    Rules:
+      * exit_code != 0  → False
+      * exit_code == 0 but stdout contains a kubectl error marker → False
+      * otherwise → True
+    """
+    if obs.get("exit_code") != 0:
+        return False
+    stdout = obs.get("stdout") or ""
+    for marker in _KUBECTL_ERROR_MARKERS:
+        if marker in stdout:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -94,24 +147,29 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
     ],
     ("pod", "process", "kill"): [
         BaselineCommand("Service endpoints", "get", "endpoints -n {namespace} {label_selector}"),
-        BaselineCommand("Pod status/restarts", "get", "pods -n {namespace} {label_selector} -o wide"),
+        BaselineCommand("Pod status/restarts", "get", "pod {pod_name} -n {namespace} -o wide"),
         BaselineCommand("Pod events", "describe", "pod {pod_name} -n {namespace}"),
     ],
     ("pod", "network", "drop"): [
-        BaselineCommand("Service endpoints", "get", "endpoints -n {namespace}"),
+        BaselineCommand("Service endpoints", "get", "endpoints -n {namespace} {label_selector}"),
         BaselineCommand("Pod conditions", "describe", "pod {pod_name} -n {namespace}"),
     ],
     # ── Target-level fallback: (scope, target) ──
+    # NOTE: pod-scope injection always carries a precise ``names[0]`` (the
+    # ChaosBlade target pod). Use {pod_name} as the primary locator so a
+    # caller that only supplied ``names`` (labels={}) still gets a viable
+    # ``kubectl top``. Aligns with extract_pod_top_metrics, which itself
+    # filters output by ``names[0]`` regardless of how the row was fetched.
     ("pod", "cpu"): [
         BaselineCommand(
-            "Pod CPU/Memory", "top", "pod -n {namespace} {label_selector}",
+            "Pod CPU/Memory", "top", "pod {pod_name} -n {namespace}",
             extractors=[extract_pod_top_metrics],
         ),
         BaselineCommand("Pod conditions/restarts", "describe", "pod {pod_name} -n {namespace}"),
     ],
     ("pod", "mem"): [
         BaselineCommand(
-            "Pod CPU/Memory", "top", "pod -n {namespace} {label_selector}",
+            "Pod CPU/Memory", "top", "pod {pod_name} -n {namespace}",
             extractors=[extract_pod_top_metrics],
         ),
         BaselineCommand("Pod OOM events", "describe", "pod {pod_name} -n {namespace}"),
@@ -120,11 +178,11 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
         BaselineCommand("Container disk usage", "exec", "{pod_name} -n {namespace} -- df -h"),
     ],
     ("pod", "network"): [
-        BaselineCommand("Service endpoints", "get", "endpoints -n {namespace}"),
+        BaselineCommand("Service endpoints", "get", "endpoints -n {namespace} {label_selector}"),
         BaselineCommand("Pod conditions", "describe", "pod {pod_name} -n {namespace}"),
     ],
     ("pod", "process"): [
-        BaselineCommand("Pod status", "get", "pods -n {namespace} {label_selector}"),
+        BaselineCommand("Pod status", "get", "pod {pod_name} -n {namespace}"),
         BaselineCommand("Pod events", "describe", "pod {pod_name} -n {namespace}"),
     ],
     ("node", "cpu"): [
@@ -157,7 +215,7 @@ BASELINE_COMMANDS: dict[tuple[str, ...], list[BaselineCommand]] = {
 _SCOPE_FALLBACK: dict[str, list[BaselineCommand]] = {
     "node": [BaselineCommand("Node resource usage", "top", "node {node_name}")],
     "pod": [BaselineCommand("Pod resource usage", "top",
-                            "pod -n {namespace} {label_selector}")],
+                            "pod {pod_name} -n {namespace}")],
     "deployment": [
         BaselineCommand("Deployment status", "get",
                         "deployment -n {namespace} -o wide"),
@@ -268,10 +326,24 @@ _ALLOWED_EXEC_COMMANDS = frozenset({
 # defense is the responsibility layer, prompt rules are the knowledge layer).
 # ---------------------------------------------------------------------------
 _BASELINE_SYSTEM_PROMPT = (
-    # ── Primacy zone (highest LLM attention): role + critical rules ──
+    # ── Primacy zone: role + core principle (WHY + WHAT) ──
     "You are a chaos engineering baseline collection strategist. "
-    "Derive the pre-injection baseline metrics for before/after comparison.\n\n"
+    "Derive the pre-injection baseline for causation attribution.\n\n"
 
+    "# Core Principle\n"
+    "Your baseline is the control for causation attribution. "
+    "The verifier will compare post-injection state against YOUR baseline "
+    "to determine if changes are fault-caused or pre-existing. "
+    "If you miss a metric, the verifier CANNOT prove causation for it.\n\n"
+
+    "Reason about what states the fault WILL modify — both quantitative "
+    "metrics (CPU, memory, disk, network) and qualitative state "
+    "(replica count, pod phase, endpoint list, node condition). "
+    "Collect baseline for each affected state, on the EXACT resource "
+    "the fault targets. The verifier can only compare the SAME metric "
+    "on the SAME resource.\n\n"
+
+    # ── Middle zone: syntax rules (HOW) ──
     "### CRITICAL RULES (mandatory — violations produce unexecutable commands)\n\n"
 
     "1. **Scope→Variables mapping** — node-scope uses {node_name}, {debug_pod}; "
@@ -292,10 +364,9 @@ _BASELINE_SYSTEM_PROMPT = (
     '  {"description": "...", "subcommand": "get|top|describe|exec|debug", '
     '"v_args_template": "...", "mode": "simple|debug_two_step"}\n\n'
 
-    "5. **Conciseness** — 2-4 commands maximum. Focus on metrics most "
-    "relevant to the fault type.\n\n"
+    "5. **Conciseness** — 2-4 commands maximum, covering all states the "
+    "fault will modify.\n\n"
 
-    # ── Middle zone (lowest attention): schema details + template variables ──
     "### Output Schema Details\n"
     "- description: short metric label (e.g., 'Node disk usage', "
     "'Pod CPU/Memory')\n"
@@ -307,12 +378,14 @@ _BASELINE_SYSTEM_PROMPT = (
     "Available: {namespace}, {node_name}, {pod_name}, "
     "{label_selector}, {debug_pod}\n\n"
 
-    # ── Recency zone (highest LLM attention): critical rules reminder ──
-    "### REMINDER (critical rules recap)\n"
-    "1. Scope→variables: node={node_name},{debug_pod}; "
+    # ── Recency zone: WHY + WHAT recap + critical syntax ──
+    "### REMINDER\n"
+    "1. Reason first: what will the fault modify? → collect baseline for that\n"
+    "2. SAME metric on SAME resource — the verifier compares these\n"
+    "3. Scope→variables: node={node_name},{debug_pod}; "
     "pod={pod_name},{namespace},{label_selector}\n"
-    "2. {debug_pod} → mode MUST be debug_two_step\n"
-    "3. Only output the JSON list, no other text\n"
+    "4. {debug_pod} → mode MUST be debug_two_step\n"
+    "5. Only output the JSON list, no other text\n"
 )
 
 # FCAT P3: dimension → {scope → BaselineCommand} mapping
@@ -406,8 +479,12 @@ def _resolve_templates(
     # (e.g., kubectl exec into a "pod" that is actually a node name).
     pod_name = "" if spec.scope == "node" else (names[0] if names else "")
     labels_dict = spec.labels
+    # kubectl 必须用 ``-l key=value`` 形式才能把字符串识别为 label selector；
+    # 仅给 ``key=value`` 会被当成裸 pod name 触发 NotFound（参见
+    # 历史 task acc1015c 的 ``kubectl top pod -n arms-prom app=node-exporter``
+    # 报 ``pod "app=node-exporter" not found``）。
     label_selector = (
-        ",".join(f"{k}={v}" for k, v in labels_dict.items())
+        "-l " + ",".join(f"{k}={v}" for k, v in labels_dict.items())
         if labels_dict
         else ""
     )
@@ -513,31 +590,31 @@ async def _execute_observations(
     observations = []
 
     # ── Pre-create debug pods for all debug_two_step commands ──
-    debug_pods: dict[str, str] = {}  # node_name -> pod_name
+    debug_pods: dict[str, tuple[str, str]] = {}  # node_name -> (pod_name, namespace)
     # Tool pod fallback: when debug pod creation fails, discover a tool pod
-    tool_pod_fallbacks: dict[str, str] = {}  # node_name -> tool_pod_name
+    tool_pod_fallbacks: dict[str, tuple[str, str]] = {}  # node_name -> (pod_name, namespace)
     debug_two_step_cmds = [c for c in commands if c.get("mode") == "debug_two_step"]
 
     if debug_two_step_cmds:
         node_names = set(c.get("_node_name", "") for c in debug_two_step_cmds)
         node_names.discard("")
         for node_name in node_names:
-            pod_name = await _create_and_wait_debug_pod(
+            result = await _create_and_wait_debug_pod(
                 node_name, kubeconfig, task_id,
             )
-            if pod_name:
-                debug_pods[node_name] = pod_name
+            if result:
+                debug_pods[node_name] = result
             else:
                 # Fallback: try to find a tool pod on this node
-                tool_pod = await _discover_tool_pod_on_node(
+                tool_pod_info = await discover_tool_pod_on_node(
                     node_name, kubeconfig, task_id,
                 )
-                if tool_pod:
-                    tool_pod_fallbacks[node_name] = tool_pod
+                if tool_pod_info:
+                    tool_pod_fallbacks[node_name] = tool_pod_info
                     logger.info(
                         "Debug pod unavailable for node %s, using tool pod %s "
-                        "as fallback for baseline commands",
-                        node_name, tool_pod,
+                        "in namespace %s as fallback for baseline commands",
+                        node_name, tool_pod_info[0], tool_pod_info[1],
                     )
 
     try:
@@ -563,9 +640,10 @@ async def _execute_observations(
                             cmd_info, kubeconfig, task_id, debug_pods,
                         )
                     elif node_name in tool_pod_fallbacks:
+                        pod_name, pod_ns = tool_pod_fallbacks[node_name]
                         obs = await _exec_in_tool_pod(
                             cmd_info, kubeconfig, task_id,
-                            tool_pod_fallbacks[node_name],
+                            pod_name, pod_ns,
                         )
                     else:
                         obs = {
@@ -589,10 +667,12 @@ async def _execute_observations(
                         or obs.get("stderr", "")[:200]
                         or "(empty)"
                     )
-                    _status = (
-                        "ok" if obs.get("exit_code") == 0
-                        else f"exit={obs.get('exit_code')}"
-                    )
+                    if _is_observation_success(obs):
+                        _status = "ok"
+                    elif obs.get("exit_code") == 0:
+                        _status = "exit=0(stderr_error)"
+                    else:
+                        _status = f"exit={obs.get('exit_code')}"
                     tracker.update(
                         f"[{idx}/{len(commands)}] {obs['description']}: "
                         f"{_status} — {_preview}",
@@ -617,8 +697,8 @@ async def _execute_observations(
                     )
     finally:
         # ── Cleanup all debug pods ──
-        for pod_name in debug_pods.values():
-            await _delete_debug_pod(pod_name, kubeconfig, task_id)
+        for pod_name, ns in debug_pods.values():
+            await _delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns)
 
     return observations
 
@@ -630,16 +710,14 @@ async def _exec_simple(cmd_info: dict, kubeconfig: str, task_id: str) -> dict:
     (because sysstat is not installed in the container), automatically
     retries with BusyBox-compatible iostat first, then /proc fallback.
     """
-    cmd = [settings.kubectl_path]
-    cmd.extend(_build_kubectl_global_args(kubeconfig))
-    cmd.append(cmd_info["subcommand"])
-    cmd.extend(_split_args(cmd_info["v_args"]))
+    cmd = build_kubectl_cmd(cmd_info["subcommand"], cmd_info["v_args"], kubeconfig=kubeconfig)
     timeout = (
         settings.timeout_kubectl_exec
         if cmd_info["subcommand"] == "exec"
         else settings.timeout_kubectl
     )
     result = await run_command(cmd, timeout=timeout, task_id=task_id)
+    result = _adapt_kubewiz_result(result)
 
     # Two-level iostat fallback
     if result.exit_code != 0 and cmd_info["subcommand"] == "exec":
@@ -650,18 +728,16 @@ async def _exec_simple(cmd_info: dict, kubeconfig: str, task_id: str) -> dict:
                     "iostat unavailable in container, retrying with "
                     "fallback: %s", fb_v_args,
                 )
-                fb_cmd = [settings.kubectl_path]
-                fb_cmd.extend(_build_kubectl_global_args(kubeconfig))
-                fb_cmd.append("exec")
-                fb_cmd.extend(_split_args(fb_v_args))
+                fb_cmd = build_kubectl_cmd("exec", fb_v_args, kubeconfig=kubeconfig)
                 fb_result = await run_command(
                     fb_cmd, timeout=settings.timeout_kubectl_exec,
                     task_id=task_id,
                 )
+                fb_result = _adapt_kubewiz_result(fb_result)
                 if fb_result.exit_code == 0:
                     return {
                         "description": cmd_info["description"],
-                        "command": " ".join(fb_cmd),
+                        "command": display_cmd(fb_cmd),
                         "exit_code": 0,
                         "stdout": fb_result.stdout,
                         "stderr": fb_result.stderr,
@@ -669,7 +745,7 @@ async def _exec_simple(cmd_info: dict, kubeconfig: str, task_id: str) -> dict:
 
     return {
         "description": cmd_info["description"],
-        "command": " ".join(cmd),
+        "command": display_cmd(cmd),
         "exit_code": result.exit_code,
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -695,38 +771,18 @@ async def _exec_debug_two_step(
         }
 
     # Step 1: kubectl debug node/{node} -n {namespace} --image=busybox -- sleep 3600
-    debug_cmd = [settings.kubectl_path]
-    debug_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    debug_cmd.extend([
-        "debug", f"node/{node_name}", "-n", _TOOL_POD_NAMESPACE,
-        "--image=busybox", "--", "sleep", "3600",
-    ])
-    debug_result = await run_command(
-        debug_cmd, timeout=settings.timeout_kubectl_exec, task_id=task_id,
-    )
-
-    if debug_result.exit_code != 0:
+    # Auto-discover namespace via create_and_wait_debug_pod
+    create_result = await _create_and_wait_debug_pod(node_name, kubeconfig, task_id)
+    if not create_result:
         return {
             "description": cmd_info["description"],
-            "command": " ".join(debug_cmd),
-            "exit_code": debug_result.exit_code,
-            "stdout": debug_result.stdout,
-            "stderr": debug_result.stderr,
-        }
-
-    # Parse debug pod name from output like "pod/<name> created"
-    debug_pod = _parse_debug_pod_name(debug_result.stdout)
-    if not debug_pod:
-        return {
-            "description": cmd_info["description"],
-            "command": " ".join(debug_cmd),
+            "command": "",
             "exit_code": -1,
-            "stdout": debug_result.stdout,
-            "stderr": "Failed to parse debug pod name from output",
+            "stdout": "",
+            "stderr": f"Failed to create debug pod for node {node_name}",
         }
 
-    # Step 1.5: wait for container readiness (prevents race condition)
-    await _wait_for_debug_pod_ready(debug_pod, kubeconfig, task_id)
+    debug_pod, pod_ns = create_result
 
     try:
         # Step 2: kubectl exec {debug_pod} -n {namespace} -c debugger -- {cmd}
@@ -735,30 +791,27 @@ async def _exec_debug_two_step(
         # Namespace defense: ensure exec targets the same namespace as the debug pod
         _has_ns = "-n " in v_args or "--namespace " in v_args
         _has_correct_ns = (
-            f"-n {_TOOL_POD_NAMESPACE}" in v_args
-            or f"--namespace {_TOOL_POD_NAMESPACE}" in v_args
+            f"-n {pod_ns}" in v_args
+            or f"--namespace {pod_ns}" in v_args
         )
         if _has_ns and not _has_correct_ns:
             logger.warning(
                 "Overriding namespace in debug_two_step exec to '%s'",
-                _TOOL_POD_NAMESPACE,
+                pod_ns,
             )
             v_args = re.sub(
                 r'(-n\s+|--namespace\s+)\S+',
-                f'-n {_TOOL_POD_NAMESPACE}', v_args, count=1,
+                f'-n {pod_ns}', v_args, count=1,
             )
         elif not _has_ns:
             # No namespace at all — insert after debug pod name
-            v_args = v_args.replace(debug_pod, f"{debug_pod} -n {_TOOL_POD_NAMESPACE}", 1)
+            v_args = v_args.replace(debug_pod, f"{debug_pod} -n {pod_ns}", 1)
 
-        exec_cmd = [settings.kubectl_path]
-        exec_cmd.extend(_build_kubectl_global_args(kubeconfig))
-        exec_cmd.append("exec")
-        exec_cmd.extend(["-c", _DEBUG_CONTAINER_NAME])
-        exec_cmd.extend(_split_args(v_args))
+        exec_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(v_args), kubeconfig=kubeconfig)
         exec_result = await run_command(
             exec_cmd, timeout=settings.timeout_kubectl_exec, task_id=task_id,
         )
+        exec_result = _adapt_kubewiz_result(exec_result)
 
         # Two-level iostat fallback
         if exec_result.exit_code != 0:
@@ -769,19 +822,16 @@ async def _exec_debug_two_step(
                         "iostat unavailable in debug pod, retrying with "
                         "fallback: %s", fb_v_args,
                     )
-                    fb_cmd = [settings.kubectl_path]
-                    fb_cmd.extend(_build_kubectl_global_args(kubeconfig))
-                    fb_cmd.append("exec")
-                    fb_cmd.extend(["-c", _DEBUG_CONTAINER_NAME])
-                    fb_cmd.extend(_split_args(fb_v_args))
+                    fb_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(fb_v_args), kubeconfig=kubeconfig)
                     fb_result = await run_command(
                         fb_cmd, timeout=settings.timeout_kubectl_exec,
                         task_id=task_id,
                     )
+                    fb_result = _adapt_kubewiz_result(fb_result)
                     if fb_result.exit_code == 0:
                         return {
                             "description": cmd_info["description"],
-                            "command": " ".join(fb_cmd),
+                            "command": display_cmd(fb_cmd),
                             "exit_code": 0,
                             "stdout": fb_result.stdout,
                             "stderr": fb_result.stderr,
@@ -789,212 +839,87 @@ async def _exec_debug_two_step(
 
         return {
             "description": cmd_info["description"],
-            "command": " ".join(exec_cmd),
+            "command": display_cmd(exec_cmd),
             "exit_code": exec_result.exit_code,
             "stdout": exec_result.stdout,
             "stderr": exec_result.stderr,
         }
     finally:
         # Step 3: cleanup debug pod
-        await _delete_debug_pod(debug_pod, kubeconfig, task_id)
+        await _delete_debug_pod(debug_pod, kubeconfig, task_id, namespace=pod_ns)
 
 
 def _parse_debug_pod_name(output: str) -> str:
-    """Extract debug pod name from kubectl debug output.
-
-    Handles formats like:
-      - "Creating debugging pod node-debugger-xxx with container debugger on node yyy."
-      - "pod/node-name-debug-xxxxx created"
-      - "Starting debugging pod node-name-debug-xxxxx..."
-    """
-    if not output:
-        return ""
-    # K8s 1.25+ format: "Creating debugging pod node-debugger-xxx ..."
-    m = re.search(r'pod\s+(node-debugger-\S+)', output)
-    if m:
-        return m.group(1).rstrip(".,;:")
-    # Match pod name after "pod/" or "pod " in the output
-    m = re.search(r'pod[/\s]+(\S+?-debug-\S+)', output)
-    if m:
-        return m.group(1)
-    # Alternative: match any valid pod name followed by "created"
-    m = re.search(r'(\S+-debug-\S+)\s+created', output)
-    if m:
-        return m.group(1)
-    return ""
+    """Backward-compat wrapper — delegates to shared _debug_pod module."""
+    return parse_debug_pod_name(output)
 
 
 # ---------------------------------------------------------------------------
 # Debug pod lifecycle helpers (create + wait + exec + delete)
 # ---------------------------------------------------------------------------
 
-# Default container name used by `kubectl debug node/<node>`
-_DEBUG_CONTAINER_NAME = "debugger"
+# Default container name — backward-compat alias for shared module constant
+_DEBUG_CONTAINER_NAME = DEBUG_CONTAINER_NAME
 
 
 async def _wait_for_debug_pod_ready(
     pod_name: str, kubeconfig: str, task_id: str, timeout: int = 60,
 ) -> bool:
-    """Wait for debug pod container to be ready before exec.
-
-    kubectl debug returns after creating the Pod object in etcd, NOT after
-    the container is running.  This wait bridges the gap.
-    Best-effort: returns False on timeout, caller still tries exec.
-    """
-    # Preferred: kubectl wait --for=condition=Ready
-    wait_cmd = [settings.kubectl_path]
-    wait_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    wait_cmd.extend([
-        "wait", "--for=condition=Ready", f"pod/{pod_name}",
-        "-n", _TOOL_POD_NAMESPACE, f"--timeout={timeout}s",
-    ])
-    try:
-        result = await run_command(
-            wait_cmd, timeout=timeout + 10, task_id=task_id,
-        )
-        if result.exit_code == 0:
-            return True
-    except (ToolGuardError, ToolTimeoutError):
-        logger.info(
-            "kubectl wait blocked/timed out, falling back to polling for %s",
-            pod_name,
-        )
-
-    # Fallback: poll container ready status
-    for _ in range(6):
-        await asyncio.sleep(2)
-        check_cmd = [settings.kubectl_path]
-        check_cmd.extend(_build_kubectl_global_args(kubeconfig))
-        check_cmd.extend([
-            "get", pod_name, "-n", _TOOL_POD_NAMESPACE,
-            "-o", "jsonpath={.status.containerStatuses[0].ready}",
-        ])
-        try:
-            check_result = await run_command(
-                check_cmd, timeout=settings.timeout_kubectl, task_id=task_id,
-            )
-            if check_result.stdout.strip() == "true":
-                return True
-        except (ToolGuardError, ToolTimeoutError):
-            continue
-
-    logger.warning(
-        "Debug pod %s not ready after wait, will try exec anyway", pod_name,
-    )
-    return False
+    """Backward-compat wrapper — delegates to shared _debug_pod module."""
+    return await wait_for_debug_pod_ready(pod_name, kubeconfig, task_id, timeout)
 
 
 async def _create_and_wait_debug_pod(
     node_name: str, kubeconfig: str, task_id: str,
-) -> str | None:
-    """Create a debug pod and wait for container readiness.
-
-    Returns pod name or None on failure.
-    """
-    debug_cmd = [settings.kubectl_path]
-    debug_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    debug_cmd.extend([
-        "debug", f"node/{node_name}", "-n", _TOOL_POD_NAMESPACE,
-        "--image=busybox", "--", "sleep", "3600",
-    ])
-    debug_result = await run_command(
-        debug_cmd, timeout=settings.timeout_kubectl_exec, task_id=task_id,
-    )
-    if debug_result.exit_code != 0:
-        logger.warning(
-            "Failed to create debug pod for node %s: %s",
-            node_name, debug_result.stderr[:200],
-        )
-        return None
-
-    pod_name = _parse_debug_pod_name(debug_result.stdout)
-    if not pod_name:
-        logger.warning(
-            "Failed to parse debug pod name from: %s",
-            debug_result.stdout[:200],
-        )
-        return None
-
-    # Critical fix: wait for container readiness (prevents race condition)
-    await _wait_for_debug_pod_ready(pod_name, kubeconfig, task_id)
-    return pod_name
+) -> tuple[str, str] | None:
+    """Backward-compat wrapper — delegates to shared _debug_pod module."""
+    return await create_and_wait_debug_pod(node_name, kubeconfig, task_id)
 
 
 async def _delete_debug_pod(
     pod_name: str, kubeconfig: str, task_id: str,
+    namespace: str = "",
 ) -> None:
-    """Delete a debug pod. Best-effort, logs warning on failure."""
-    del_cmd = [settings.kubectl_path]
-    del_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    del_cmd.extend([
-        "delete", "pod", pod_name, "-n", _TOOL_POD_NAMESPACE,
-        "--force", "--grace-period=0",
-    ])
-    try:
-        await run_command(del_cmd, timeout=30, task_id=task_id)
-    except Exception:
-        logger.warning("Failed to delete debug pod %s", pod_name)
-
-
-async def _discover_tool_pod_on_node(
-    node_name: str, kubeconfig: str, task_id: str,
-) -> str | None:
-    """Discover a running tool pod on the specified node.
-
-    Returns pod name or None if no running pod found on that node.
-    """
-    list_cmd = [settings.kubectl_path]
-    list_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    list_cmd.extend([
-        "get", "pods", "-n", _TOOL_POD_NAMESPACE,
-        "-l", "app=otel-c-tool", "-o", "wide",
-    ])
-    try:
-        result = await run_command(list_cmd, timeout=settings.timeout_kubectl, task_id=task_id)
-        if result.exit_code == 0:
-            pods_with_nodes = discover_tool_pods_with_nodes(result.stdout)
-            for pod, node in pods_with_nodes:
-                if node == node_name:
-                    return pod
-    except Exception as e:
-        logger.warning("Failed to discover tool pods: %s", e)
-    return None
+    """Backward-compat wrapper — delegates to shared _debug_pod module."""
+    await delete_debug_pod(pod_name, kubeconfig, task_id, namespace=namespace)
 
 
 async def _exec_in_tool_pod(
     cmd_info: dict, kubeconfig: str, task_id: str,
-    tool_pod_name: str,
+    tool_pod_name: str, tool_pod_namespace: str,
 ) -> dict:
     """Execute a baseline command in a tool pod (fallback when debug pod unavailable).
 
     Unlike debug pod exec, this does NOT add '-c debugger' because tool pods
     have a single container (not an ephemeral debugger container).
     The v_args template is adapted: {debug_pod} is replaced with the tool pod name.
+    The namespace is taken from the discovered tool pod, not hardcoded —
+    real clusters often deploy chaosblade-tool in 'default' rather than 'chaosblade'.
     """
     v_args = cmd_info["v_args"].replace("{debug_pod}", tool_pod_name)
 
-    # Ensure correct namespace
+    # Ensure correct namespace (use the actual namespace where tool pod lives)
     _has_ns = "-n " in v_args or "--namespace " in v_args
     _has_correct_ns = (
-        f"-n {_TOOL_POD_NAMESPACE}" in v_args
-        or f"--namespace {_TOOL_POD_NAMESPACE}" in v_args
+        f"-n {tool_pod_namespace}" in v_args
+        or f"--namespace {tool_pod_namespace}" in v_args
     )
     if _has_ns and not _has_correct_ns:
         v_args = re.sub(
             r'(-n\s+|--namespace\s+)\S+',
-            f'-n {_TOOL_POD_NAMESPACE}', v_args, count=1,
+            f'-n {tool_pod_namespace}', v_args, count=1,
         )
     elif not _has_ns:
-        v_args = v_args.replace(tool_pod_name, f"{tool_pod_name} -n {_TOOL_POD_NAMESPACE}", 1)
+        v_args = v_args.replace(
+            tool_pod_name, f"{tool_pod_name} -n {tool_pod_namespace}", 1,
+        )
 
-    exec_cmd = [settings.kubectl_path]
-    exec_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    exec_cmd.append("exec")
     # NOTE: No '-c debugger' — tool pods have a single main container
-    exec_cmd.extend(_split_args(v_args))
+    exec_cmd = build_kubectl_cmd("exec", v_args, kubeconfig=kubeconfig)
     exec_result = await run_command(
         exec_cmd, timeout=settings.timeout_kubectl_exec, task_id=task_id,
     )
+    exec_result = _adapt_kubewiz_result(exec_result)
 
     # Two-level iostat fallback (same as debug pod path)
     if exec_result.exit_code != 0:
@@ -1005,18 +930,16 @@ async def _exec_in_tool_pod(
                     "iostat unavailable in tool pod, retrying with "
                     "fallback: %s", fb_v_args,
                 )
-                fb_cmd = [settings.kubectl_path]
-                fb_cmd.extend(_build_kubectl_global_args(kubeconfig))
-                fb_cmd.append("exec")
-                fb_cmd.extend(_split_args(fb_v_args))
+                fb_cmd = build_kubectl_cmd("exec", fb_v_args, kubeconfig=kubeconfig)
                 fb_result = await run_command(
                     fb_cmd, timeout=settings.timeout_kubectl_exec,
                     task_id=task_id,
                 )
+                fb_result = _adapt_kubewiz_result(fb_result)
                 if fb_result.exit_code == 0:
                     return {
                         "description": cmd_info["description"],
-                        "command": " ".join(fb_cmd),
+                        "command": display_cmd(fb_cmd),
                         "exit_code": 0,
                         "stdout": fb_result.stdout,
                         "stderr": fb_result.stderr,
@@ -1024,7 +947,7 @@ async def _exec_in_tool_pod(
 
     return {
         "description": cmd_info["description"],
-        "command": " ".join(exec_cmd),
+        "command": display_cmd(exec_cmd),
         "exit_code": exec_result.exit_code,
         "stdout": exec_result.stdout,
         "stderr": exec_result.stderr,
@@ -1033,15 +956,15 @@ async def _exec_in_tool_pod(
 
 async def _exec_in_debug_pod(
     cmd_info: dict, kubeconfig: str, task_id: str,
-    debug_pods: dict[str, str],
+    debug_pods: dict[str, tuple[str, str]],
 ) -> dict:
     """Execute a command in an existing debug pod (no create/destroy).
 
     Used by _execute_observations when reusing a shared debug pod.
     """
     node_name = cmd_info.get("_node_name", "")
-    pod_name = debug_pods.get(node_name, "")
-    if not pod_name:
+    pod_info = debug_pods.get(node_name)
+    if not pod_info:
         return {
             "description": cmd_info["description"],
             "command": "",
@@ -1050,31 +973,29 @@ async def _exec_in_debug_pod(
             "stderr": f"No debug pod for node {node_name}",
         }
 
+    pod_name, pod_ns = pod_info
     v_args = cmd_info["v_args"].replace("{debug_pod}", pod_name)
 
     # Namespace defense: ensure exec targets the same namespace as the debug pod
     _has_ns = "-n " in v_args or "--namespace " in v_args
     _has_correct_ns = (
-        f"-n {_TOOL_POD_NAMESPACE}" in v_args
-        or f"--namespace {_TOOL_POD_NAMESPACE}" in v_args
+        f"-n {pod_ns}" in v_args
+        or f"--namespace {pod_ns}" in v_args
     )
     if _has_ns and not _has_correct_ns:
         v_args = re.sub(
             r'(-n\s+|--namespace\s+)\S+',
-            f'-n {_TOOL_POD_NAMESPACE}', v_args, count=1,
+            f'-n {pod_ns}', v_args, count=1,
         )
     elif not _has_ns:
         # No namespace at all — insert after pod name
-        v_args = v_args.replace(pod_name, f"{pod_name} -n {_TOOL_POD_NAMESPACE}", 1)
+        v_args = v_args.replace(pod_name, f"{pod_name} -n {pod_ns}", 1)
 
-    exec_cmd = [settings.kubectl_path]
-    exec_cmd.extend(_build_kubectl_global_args(kubeconfig))
-    exec_cmd.append("exec")
-    exec_cmd.extend(["-c", _DEBUG_CONTAINER_NAME])
-    exec_cmd.extend(_split_args(v_args))
+    exec_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(v_args), kubeconfig=kubeconfig)
     exec_result = await run_command(
         exec_cmd, timeout=settings.timeout_kubectl_exec, task_id=task_id,
     )
+    exec_result = _adapt_kubewiz_result(exec_result)
 
     # Two-level iostat fallback
     if exec_result.exit_code != 0:
@@ -1085,19 +1006,16 @@ async def _exec_in_debug_pod(
                     "iostat unavailable in debug pod, retrying with "
                     "fallback: %s", fb_v_args,
                 )
-                fb_cmd = [settings.kubectl_path]
-                fb_cmd.extend(_build_kubectl_global_args(kubeconfig))
-                fb_cmd.append("exec")
-                fb_cmd.extend(["-c", _DEBUG_CONTAINER_NAME])
-                fb_cmd.extend(_split_args(fb_v_args))
+                fb_cmd = build_kubectl_cmd("exec", ["-c", _DEBUG_CONTAINER_NAME] + _split_args(fb_v_args), kubeconfig=kubeconfig)
                 fb_result = await run_command(
                     fb_cmd, timeout=settings.timeout_kubectl_exec,
                     task_id=task_id,
                 )
+                fb_result = _adapt_kubewiz_result(fb_result)
                 if fb_result.exit_code == 0:
                     return {
                         "description": cmd_info["description"],
-                        "command": " ".join(fb_cmd),
+                        "command": display_cmd(fb_cmd),
                         "exit_code": 0,
                         "stdout": fb_result.stdout,
                         "stderr": fb_result.stderr,
@@ -1105,7 +1023,7 @@ async def _exec_in_debug_pod(
 
     return {
         "description": cmd_info["description"],
-        "command": " ".join(exec_cmd),
+        "command": display_cmd(exec_cmd),
         "exit_code": exec_result.exit_code,
         "stdout": exec_result.stdout,
         "stderr": exec_result.stderr,
@@ -1184,9 +1102,14 @@ async def _llm_derive_baseline_commands(
 
     # Show template variable → resolved value mapping so the LLM
     # uses template variables instead of hardcoding values.
+    # 注意：``{label_selector}`` 经 ``_resolve_templates`` 渲染后**已含
+    # ``-l `` 前缀**（例如 ``-l app=foo``），LLM 生成的 v_args_template
+    # 必须直接使用 ``{label_selector}``，禁止再叠 ``-l``，否则会拼出
+    # ``-l -l app=foo`` 让 kubectl 报错。
     pod_name = names[0] if names else ""
     label_selector_val = (
-        ",".join(f"{k}={v}" for k, v in labels.items()) if labels else ""
+        "-l " + ",".join(f"{k}={v}" for k, v in labels.items())
+        if labels else ""
     )
     var_lines = ["\nTemplate variable values (use these in v_args_template):"]
     if namespace:
@@ -1198,7 +1121,8 @@ async def _llm_derive_baseline_commands(
     if label_selector_val:
         var_lines.append(
             f"  {{label_selector}} → {label_selector_val} "
-            f"(raw value — always use with -l flag, e.g. -l {{label_selector}})"
+            f"(already includes -l prefix — use as-is, "
+            f"do NOT prepend another -l)"
         )
     target_lines.extend(var_lines)
 
@@ -1207,10 +1131,11 @@ async def _llm_derive_baseline_commands(
     human_prompt = (
         f"{target_context}\n\n"
         f"<skill-case>\n{skill_case_content}\n</skill-case>\n\n"
-        "Based on the skill-case content above, derive pre-injection baseline "
-        "metrics. Focus primarily on baseline_facts and symptoms sections; "
-        "injection verification also provides useful hints about expected "
-        "changes.\n\n"
+        "Based on the skill-case content, reason about what states this fault "
+        "will modify. The baseline_facts and symptoms sections describe expected "
+        "changes; injection verification provides additional hints. "
+        "Generate commands to capture pre-injection baseline for each affected "
+        "state.\n\n"
         + _build_scope_specific_examples(scope)
     )
 
@@ -1500,15 +1425,32 @@ def make_baseline_capture(llm=None, registry=None):
             action = spec.blade_action if spec else ""
             skill_case = state.get("skill_case_content", "")
             kubeconfig = state.get("kubeconfig", "")
+            sync_kubewiz_runtime(state)
 
             # 2. Strategy selection with Viability Gate
-            # Each strategy is tried in priority order. A strategy's output is
-            # only accepted if at least one command is *viable* (executable after
-            # template resolution). If 0 viable, we fall through to the next
-            # strategy — preventing "has output but can't execute" from blocking
-            # the fallback chain.
+            # Each strategy is tried in priority order (llm → registry →
+            # scope_fallback). A strategy's output is accepted only if it
+            # is *fully viable* (every command is executable after template
+            # resolution). A *partially viable* strategy (some commands
+            # unresolved) is remembered as a fallback but does NOT
+            # short-circuit the chain — we keep trying later strategies
+            # in case one of them produces a complete set. If no strategy
+            # is fully viable, the first partial result we saw is used as
+            # a best-effort fallback.
+            #
+            # Rationale (task 23ee60d retro): the previous "any-viable wins"
+            # rule let a half-broken strategy (e.g. label_selector unresolved
+            # because labels={}, pod_name fine) lock in as the source, which
+            # silently dropped the ``kubectl top`` baseline and left the
+            # verifier without an authoritative pre-injection memory value.
+            # The full-viability gate ensures fallback strategies still get
+            # a chance when the first hit is incomplete.
             commands = []
             source = "none"
+            partial_commands: list = []
+            partial_source = ""
+            partial_viable = 0
+            partial_total = 0
 
             # Strategy chain: (name, factory). Evaluated lazily.
             async def _llm_strategy():
@@ -1543,8 +1485,8 @@ def make_baseline_capture(llm=None, registry=None):
                 return _SCOPE_FALLBACK.get(scope, [])
 
             strategy_chain = [
-                ("registry", _registry_strategy),
                 ("llm", _llm_strategy),
+                ("registry", _registry_strategy),
                 ("scope_fallback", _scope_fallback_strategy),
             ]
 
@@ -1560,31 +1502,72 @@ def make_baseline_capture(llm=None, registry=None):
                 if not strategy_commands:
                     continue
 
-                # Viability Gate: check how many commands survive template resolution
+                # Viability Gate: how many commands survive template resolution
                 resolved_preview = _resolve_templates(strategy_commands, state)
                 viable_count = sum(1 for c in resolved_preview if not c.get("_unresolved"))
+                total_count = len(strategy_commands)
 
-                if viable_count > 0:
-                    commands = strategy_commands
-                    source = strategy_name
-                    tracker.update(
-                        f"Strategy selected: {strategy_name} "
-                        f"({viable_count}/{len(strategy_commands)} viable)",
-                        {"step": "strategy", "source": strategy_name,
-                         "viable": viable_count, "total": len(strategy_commands)},
-                    )
-                    break  # first viable strategy wins
-                else:
+                if viable_count == 0:
                     logger.warning(
                         "Strategy '%s' produced %d command(s) but 0 viable "
                         "(all unresolved after template resolution), trying next",
-                        strategy_name, len(strategy_commands),
+                        strategy_name, total_count,
                     )
                     tracker.update(
                         f"Strategy {strategy_name}: 0 viable, falling back",
                         {"step": "strategy", "source": strategy_name,
-                         "viable": 0, "total": len(strategy_commands)},
+                         "viable": 0, "total": total_count},
                     )
+                    continue
+
+                if viable_count == total_count:
+                    # Fully viable — lock in this strategy.
+                    commands = strategy_commands
+                    source = strategy_name
+                    tracker.update(
+                        f"Strategy selected: {strategy_name} "
+                        f"({viable_count}/{total_count} viable, complete)",
+                        {"step": "strategy", "source": strategy_name,
+                         "viable": viable_count, "total": total_count},
+                    )
+                    break
+
+                # Partial: keep first partial as fallback, but continue trying
+                # later strategies (e.g. LLM) for a complete set.
+                if not partial_commands:
+                    partial_commands = strategy_commands
+                    partial_source = strategy_name
+                    partial_viable = viable_count
+                    partial_total = total_count
+                logger.info(
+                    "Strategy '%s' is partial (%d/%d viable), retained as "
+                    "fallback; continuing strategy chain",
+                    strategy_name, viable_count, total_count,
+                )
+                tracker.update(
+                    f"Strategy {strategy_name}: partial "
+                    f"({viable_count}/{total_count}), keep trying",
+                    {"step": "strategy", "source": strategy_name,
+                     "viable": viable_count, "total": total_count,
+                     "partial": True},
+                )
+
+            # No fully-viable strategy — fall back to the first partial we saw.
+            if not commands and partial_commands:
+                commands = partial_commands
+                source = partial_source
+                logger.warning(
+                    "No fully-viable baseline strategy; using partial '%s' "
+                    "(%d/%d viable) as best-effort fallback",
+                    partial_source, partial_viable, partial_total,
+                )
+                tracker.update(
+                    f"Strategy selected: {partial_source} (partial fallback, "
+                    f"{partial_viable}/{partial_total} viable)",
+                    {"step": "strategy", "source": partial_source,
+                     "viable": partial_viable, "total": partial_total,
+                     "partial_fallback": True},
+                )
 
             # P3: FCAT baseline_supplement — enrich with dimensions from knowledge docs
             target_metadata = state.get("target_metadata") or {}
@@ -1643,9 +1626,12 @@ def make_baseline_capture(llm=None, registry=None):
             )
             observations = await _execute_observations(resolved, kubeconfig, task_id)
 
-            # 4.1 LLM retry: when LLM-generated commands fail execution,
-            # feed errors back to the LLM and let it self-correct (up to
-            # _LLM_BASELINE_MAX_RETRIES attempts).
+            # 4.0.5 LLM self-correcting retry: when LLM-generated commands
+            # fail execution, feed errors back to the LLM and let it
+            # self-correct (up to _LLM_BASELINE_MAX_RETRIES attempts).
+            # Runs BEFORE the strategy-level fallback (4.0.7) so that the
+            # LLM is given a chance to fix itself before we abandon the
+            # primary strategy and reach for registry / scope_fallback.
             if source == "llm" and llm:
                 all_pairs = list(zip(resolved, observations))
 
@@ -1702,10 +1688,13 @@ def make_baseline_capture(llm=None, registry=None):
                         retry_resolved, kubeconfig, task_id,
                     )
 
-                    # Keep original successes, replace failures with retry
+                    # Keep original successes, replace failures with retry.
+                    # Use _is_observation_success so kubectl partial failures
+                    # (exit_code=0 + 'Error from server' in stdout) are treated
+                    # as failures and properly retried.
                     success_pairs = [
                         (r, o) for r, o in all_pairs
-                        if o.get("exit_code") == 0
+                        if _is_observation_success(o)
                     ]
                     all_pairs = success_pairs + list(
                         zip(retry_resolved, retry_obs)
@@ -1718,6 +1707,78 @@ def make_baseline_capture(llm=None, registry=None):
                     )
                 else:
                     resolved, observations = [], []
+
+            # 4.0.7 Execution-level strategy fallback：
+            # 当前 strategy 的 Viability Gate 仅校验 "模板 placeholder 是否填得上"，
+            # 不保证命令真的能跑通（典型反例：模板拼接缺 ``-l`` 前缀时
+            # ``label_selector`` 字符串非空 → viable_count > 0 → 锁定该策略 →
+            # 执行全部失败 → 没机会回落到下一级策略）。
+            #
+            # 设计意图（LLM 优先链：llm → registry → scope_fallback）：
+            #   首选策略命中且至少 1 条跑通 → 沿用首选
+            #   首选策略命中但全部跑挂      → 自动回落到链中其他未尝试的策略
+            #   首选策略完全没给           → 直接走下一级（已由 viable gate 处理）
+            #
+            # 注意：source == "llm" 时同样会进入此段，因为 4.0.5 已经给过
+            # LLM 最多 3 次 self-correcting retry，retry 仍救不回来才会走
+            # 到这里。``_attempted = {source}`` 保证 LLM 不会被再调一次，
+            # 也就杜绝了"LLM 已经退化失败 → 再调 LLM"的死循环风险。
+            if (
+                observations
+                and not any(_is_observation_success(o) for o in observations)
+            ):
+                _attempted = {source}
+                for _fb_name, _fb_fn in strategy_chain:
+                    if _fb_name in _attempted:
+                        continue
+                    try:
+                        _fb_commands = await _fb_fn() \
+                            if inspect.iscoroutinefunction(_fb_fn) \
+                            else _fb_fn()
+                    except Exception as e:
+                        logger.warning(
+                            "Fallback strategy '%s' raised exception: %s",
+                            _fb_name, e,
+                        )
+                        _attempted.add(_fb_name)
+                        continue
+                    if not _fb_commands:
+                        _attempted.add(_fb_name)
+                        continue
+                    _fb_resolved_preview = _resolve_templates(_fb_commands, state)
+                    _fb_viable = sum(
+                        1 for c in _fb_resolved_preview
+                        if not c.get("_unresolved")
+                    )
+                    if _fb_viable == 0:
+                        _attempted.add(_fb_name)
+                        continue
+
+                    logger.warning(
+                        "Strategy '%s' executed 0/%d succeeded, "
+                        "falling through to '%s' (%d/%d viable)",
+                        source, len(observations),
+                        _fb_name, _fb_viable, len(_fb_commands),
+                    )
+                    tracker.update(
+                        f"Strategy {source}: 0/{len(observations)} succeeded, "
+                        f"falling through to {_fb_name}",
+                        {"step": "strategy_fallback",
+                         "from": source, "to": _fb_name,
+                         "from_total": len(observations)},
+                    )
+
+                    commands = list(_fb_commands)
+                    source = _fb_name
+                    resolved = _resolve_templates(commands, state)
+                    observations = await _execute_observations(
+                        resolved, kubeconfig, task_id,
+                    )
+                    _attempted.add(_fb_name)
+
+                    if any(_is_observation_success(o) for o in observations):
+                        break
+                    # 否则继续遍历下一个 strategy
 
             # 4.5 Run per-command extractors → merge structured fields
             # into target_metadata. This is the "free side benefit" of
@@ -1767,7 +1828,7 @@ def make_baseline_capture(llm=None, registry=None):
                     "source": source,
                     "observations": observations,
                     "success_count": sum(
-                        1 for o in observations if o.get("exit_code") == 0
+                        1 for o in observations if _is_observation_success(o)
                     ),
                 }
             }

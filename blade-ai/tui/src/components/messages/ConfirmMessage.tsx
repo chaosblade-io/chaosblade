@@ -43,6 +43,7 @@ import {
   type YesNoFeedbackAnswer,
 } from "../shared/YesNoFeedbackSelect.js";
 import { Select, type SelectItem } from "../shared/Select.js";
+import { PlanPreviewSection } from "../result/PlanPreviewSection.js";
 import { t } from "../../i18n/index.js";
 import { useAppDispatch } from "../../state/store.js";
 import { Theme } from "../../theme/colors.js";
@@ -1182,33 +1183,22 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
         )}
       </Box>
 
-      {/* P1-4: structured conflict_uids list. UID rows use the
-       *  glyph + name two-column layout but with no inline label —
-       *  the uid IS the name. Hint row indents to the field-label
-       *  column so it visually nests under the list. */}
+      {/* P1-4: structured conflict_uids list. First row carries the
+       *  field label aligned with other Field rows; subsequent UIDs
+       *  indent to the value column. Hint row adds glyph-width indent
+       *  so it visually nests under the UID values. */}
       {conflictUids.length > 0 && (
-        <>
-          <Box marginTop={1} flexDirection="column">
-            {conflictUids.map((uid, i) => (
-              <Box key={i}>
-                <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0}>
-                  <Text color={Theme.status.warn}>{Icons.warning}</Text>
-                </Box>
-                <Box flexGrow={1}>
-                  <Text color={Theme.gray[300]}>{uid}</Text>
-                </Box>
-              </Box>
-            ))}
-            <Box>
-              <Box minWidth={LIST_GLYPH_WIDTH} flexShrink={0} />
-              <Box flexGrow={1}>
-                <Text color={Theme.text.secondary}>
-                  {t("confirm.conflicts.hint")}
-                </Text>
-              </Box>
-            </Box>
+        <Box marginTop={1}>
+          <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1} flexShrink={0}>
+            <Text color={Theme.gray[500]}>{t("confirm.field.conflicts")}</Text>
           </Box>
-        </>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text color={Theme.status.warn}>{Icons.warning} </Text>
+            <Text wrap="wrap" color={Theme.gray[300]}>
+              {conflictUids.join("  ")}
+            </Text>
+          </Box>
+        </Box>
       )}
 
       {/* E10 — multi-dimensional safety score panel. Overall score +
@@ -1548,7 +1538,17 @@ const ConfirmContextMessageInternal: React.FC<{
     item.node === "confirmation_gate" &&
     hasExecutionContent(item.payload)
   ) {
-    return <ExecutionConfirmCard payload={item.payload} taskId={item.taskId} />;
+    const planMarkdown = item.payload.plan_preview_markdown as string | undefined;
+    return (
+      <Box flexDirection="column">
+        {planMarkdown && (
+          <Box paddingLeft={2}>
+            <PlanPreviewSection markdown={planMarkdown} />
+          </Box>
+        )}
+        <ExecutionConfirmCard payload={item.payload} taskId={item.taskId} />
+      </Box>
+    );
   }
   if (
     item.payload &&

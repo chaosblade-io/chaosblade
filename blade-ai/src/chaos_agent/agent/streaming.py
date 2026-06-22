@@ -172,17 +172,26 @@ class StreamEvent:
 _SILENT_TOKEN_NODES: frozenset[str] = frozenset({"save_memory"})
 
 
-def parse_stream_event(raw_event: dict) -> Optional[StreamEvent]:
+def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEvent]]:
     """Parse a LangGraph astream_events (v2) raw event into a StreamEvent.
 
     Handles:
     - on_chat_model_stream  → type=token (response content) or type=thinking (reasoning_content)
     - on_tool_start         → type=tool_start
     - on_tool_end           → type=tool_end
+    - on_chat_model_end     → type=usage (token counts); or [type=token, type=usage]
+                              when content is empty but reasoning_content has the
+                              reply (Qwen enable_thinking short-response fallback)
 
     When enable_thinking mode is active (e.g., Qwen), reasoning_content
     from the model is emitted as type=thinking events, separate from
     the regular token stream.
+
+    For short responses (e.g. "你好"), Qwen sometimes puts the entire
+    reply inside ``<think>...</think>``, leaving ``content`` empty.
+    In that case ``on_chat_model_end`` returns BOTH a synthetic token
+    event (carrying reasoning_content) AND the usage event, so the user
+    sees the reply and token counts are preserved.
 
     Returns None for events we don't care about.
     """
@@ -258,7 +267,39 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent]:
         output = raw_event.get("data", {}).get("output")
         if output is None:
             return None
+
+        # Qwen enable_thinking short-response fallback: when the model
+        # puts the entire reply inside <think>…</think>, ``content`` is
+        # empty and no token events were streamed during on_chat_model_stream.
+        # Return BOTH a synthetic token (carrying reasoning_content) AND
+        # the usage event so the user sees the reply AND token counts.
+        node = _extract_node_name(raw_event)
+        synthetic_token: StreamEvent | None = None
+        if node not in _SILENT_TOKEN_NODES:
+            _content = getattr(output, "content", "") or ""
+            if isinstance(_content, list):
+                _content = "".join(
+                    p.get("text", "") for p in _content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            if not _content.strip():
+                _ak = getattr(output, "additional_kwargs", {}) or {}
+                _rc = _ak.get("reasoning_content", "") or ""
+                if _rc.strip():
+                    synthetic_token = StreamEvent(
+                        type="token", content=_rc, node=node,
+                    )
+
         prompt, completion = _extract_token_usage(output)
+        if synthetic_token:
+            events = [synthetic_token]
+            if prompt or completion:
+                events.append(StreamEvent(
+                    type="usage",
+                    input_tokens=int(prompt),
+                    output_tokens=int(completion),
+                ))
+            return events
         if not (prompt or completion):
             return None
         return StreamEvent(
@@ -321,6 +362,24 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent]:
 
     # Silently ignore other events (on_chat_model_start, on_chain_start, etc.)
     return None
+
+
+def parse_stream_events(raw_event: dict) -> list[StreamEvent]:
+    """Like :func:`parse_stream_event` but always returns a list (may be empty).
+
+    Convenience wrapper so callers don't need to handle the ``Optional``
+    / ``list`` union return type of :func:`parse_stream_event`::
+
+        for stream_evt in parse_stream_events(event):
+            stream_evt.task_id = task_id
+            yield stream_evt
+    """
+    parsed = parse_stream_event(raw_event)
+    if parsed is None:
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    return [parsed]
 
 
 def _extract_tool_output_content(output) -> str:

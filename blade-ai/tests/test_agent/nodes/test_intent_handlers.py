@@ -85,6 +85,17 @@ class TestRecoverHandler:
         assert "失败" in result["messages"][0].content
 
     @pytest.mark.asyncio
+    async def test_pass_through_when_recover_task_id_set(self, sample_agent_state):
+        """recover_task_id already resolved by intent_clarification → skip store query."""
+        sample_agent_state["recover_task_id"] = "task-already-known"
+
+        result = await recover_handler(sample_agent_state)
+
+        assert result["operation"] == "recover"
+        assert result["recover_task_id"] == "task-already-known"
+        assert "messages" not in result
+
+    @pytest.mark.asyncio
     async def test_enrichment_fallback_to_raw_data(self, sample_agent_state):
         """store.get returns None for a task → fall back to query_active raw data."""
         mock_store = AsyncMock()

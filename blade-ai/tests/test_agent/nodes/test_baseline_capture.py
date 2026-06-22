@@ -90,10 +90,11 @@ class TestTemplateResolution:
                 "labels": {"app": "nginx", "tier": "frontend"},
             },
         }
-        cmds = [BaselineCommand("Pod CPU", "top", "pod -n {namespace} -l {label_selector}")]
+        # ``{label_selector}`` 渲染时已含 ``-l `` 前缀，模板里不再叠 ``-l``。
+        cmds = [BaselineCommand("Pod CPU", "top", "pod -n {namespace} {label_selector}")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
-        assert "-l app=nginx,tier=frontend" in result[0]["v_args"]
+        assert result[0]["v_args"] == "pod -n default -l app=nginx,tier=frontend"
         assert result[0]["_unresolved"] is False
 
 
@@ -362,7 +363,9 @@ class TestFallbackChain:
             "kubeconfig": "/path/to/kubeconfig",
         }
         with patch("chaos_agent.agent.nodes.baseline_capture._execute_observations",
-                    new_callable=AsyncMock, return_value=[]):
+                    new_callable=AsyncMock, return_value=[]), \
+             patch("chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+                   return_value=[]):
             result = await node(state)
         assert result["baseline_data"]["source"] == "llm"
 
@@ -668,15 +671,18 @@ class TestLLMDeriveBaselinePrompt:
         assert "iostat" in _BASELINE_SYSTEM_PROMPT
 
     def test_system_prompt_u_shape_primacy(self):
-        """Critical rules must appear in the primacy zone (first 500 chars)."""
-        primacy_zone = _BASELINE_SYSTEM_PROMPT[:500]
-        assert "CRITICAL RULES" in primacy_zone
-        assert "Scope→Variables" in primacy_zone
+        """Core Principle must appear in the primacy zone (first 600 chars).
+        CRITICAL RULES is in the middle zone (syntax), not primacy."""
+        primacy_zone = _BASELINE_SYSTEM_PROMPT[:750]
+        assert "Core Principle" in primacy_zone
+        assert "causation attribution" in primacy_zone
+        assert "SAME metric" in primacy_zone
 
     def test_system_prompt_u_shape_recency(self):
-        """REMINDER must appear in the recency zone (last 300 chars)."""
-        recency_zone = _BASELINE_SYSTEM_PROMPT[-300:]
+        """REMINDER must appear in the recency zone (last 400 chars)."""
+        recency_zone = _BASELINE_SYSTEM_PROMPT[-400:]
         assert "REMINDER" in recency_zone
+        assert "SAME metric" in recency_zone
         assert "Scope→variables" in recency_zone
 
     def test_system_prompt_no_debug_prohibition_rule(self):
@@ -734,7 +740,7 @@ class TestLLMDeriveBaselinePrompt:
 
     @pytest.mark.asyncio
     async def test_human_prompt_focus_guidance(self):
-        """HumanMessage should use focused guidance, not 'Based on ALL content above'."""
+        """HumanMessage should use fault-impact reasoning guidance."""
         mock_llm = AsyncMock()
         mock_response = MagicMock()
         mock_response.content = "[]"
@@ -748,8 +754,8 @@ class TestLLMDeriveBaselinePrompt:
         call_args = mock_llm.ainvoke.call_args
         messages = call_args[0][0]
         human_content = messages[1].content
-        # Should have focused guidance, not the old "Based on ALL content above"
-        assert "Focus primarily on baseline_facts" in human_content
+        # Should guide fault-impact reasoning, not old "Based on ALL content above"
+        assert "reason about what states" in human_content
         assert "Based on ALL content above" not in human_content
         # Should contain fault type info
         assert "Fault type: pod-cpu-fullload" in human_content
@@ -1208,6 +1214,9 @@ class TestBaselineCaptureRetryIntegration:
         with patch(
             "chaos_agent.agent.nodes.baseline_capture._execute_observations",
             new=fake_exec,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+            return_value=[],
         ):
             result = await node(state)
 
@@ -1254,6 +1263,9 @@ class TestBaselineCaptureRetryIntegration:
         with patch(
             "chaos_agent.agent.nodes.baseline_capture._execute_observations",
             new=fake_exec,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+            return_value=[],
         ):
             result = await node(state)
 
@@ -1347,6 +1359,9 @@ class TestBaselineCaptureRetryIntegration:
         with patch(
             "chaos_agent.agent.nodes.baseline_capture._execute_observations",
             new=fake_exec,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+            return_value=[],
         ):
             result = await node(state)
 
@@ -1354,8 +1369,13 @@ class TestBaselineCaptureRetryIntegration:
         assert result["baseline_data"]["success_count"] == 2
 
     @pytest.mark.asyncio
-    async def test_no_retry_for_registry_source(self):
-        """Retry only applies to LLM source, not registry."""
+    async def test_registry_falls_back_to_scope_when_all_fail(self):
+        """Execution-level fallback：registry 全部失败应回落到 scope_fallback。
+
+        旧行为是 "registry 不 retry，原地 0/N 收摊"；新行为是 "当前 strategy
+        执行 0/N succeeded 时回落到 strategy_chain 中下一个 viable strategy"
+        （source != 'llm'，LLM 走自己的 4.1 retry 路径）。
+        """
         exec_call_count = {"n": 0}
 
         async def fake_exec(commands, kubeconfig, task_id):
@@ -1387,6 +1407,7 @@ class TestBaselineCaptureRetryIntegration:
         ):
             result = await node(state)
 
-        assert result["baseline_data"]["source"] == "registry"
-        # Only one execution call — no retry for registry
-        assert exec_call_count["n"] == 1
+        # registry 跑挂 → 回落 scope_fallback（仍跑挂，但 source 应已切换）
+        assert result["baseline_data"]["source"] == "scope_fallback"
+        # 两次执行：1 次 registry + 1 次 scope_fallback（LLM 不可用，链路到此为止）
+        assert exec_call_count["n"] == 2

@@ -19,7 +19,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+from chaos_agent.agent.fault_spec import (
+    FaultSpec,
+    fault_parts_from_name,
+    fault_spec_from_legacy_state,
+    fault_type_from_state,
+    read_fault_spec,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +688,75 @@ class TestReadFaultSpec:
         }
         out = read_fault_spec(state)
         assert out == spec
+
+
+class TestFaultTypeFromState:
+    def test_prefers_fault_spec_over_stale_skill_name(self):
+        state = {
+            "skill_name": "stale-skill",
+            "fault_type": "stale-fault-type",
+            "fault_spec": FaultSpec(
+                namespace="ns",
+                scope="pod",
+                names=("pod-a",),
+                blade_target="network",
+                blade_action="loss",
+            ).to_dict(),
+        }
+
+        assert fault_type_from_state(state) == "pod-network-loss"
+
+    def test_falls_back_to_legacy_skill_name(self):
+        assert fault_type_from_state({"skill_name": "pod-cpu-fullload"}) == "pod-cpu-fullload"
+
+    def test_falls_back_to_legacy_fault_type_then_explicit_default(self):
+        assert fault_type_from_state({"fault_type": "node-disk-fill"}) == "node-disk-fill"
+        assert fault_type_from_state({}, fallback="unknown") == "unknown"
+
+
+class TestLegacyFaultSpecProjection:
+    def test_fault_parts_from_name_parses_multi_segment_action(self):
+        assert fault_parts_from_name("pod-network-delay") == ("pod", "network", "delay")
+        assert fault_parts_from_name("workload-replica-scale-down") == (
+            "workload",
+            "replica",
+            "scale-down",
+        )
+        assert fault_parts_from_name("cpu") == ("", "", "")
+
+    def test_rebuilds_from_task_store_shape(self):
+        spec = fault_spec_from_legacy_state(
+            {
+                "skill_name": "node-disk-fill",
+                "target": {
+                    "namespace": "",
+                    "names": ["node-a"],
+                    "labels": {},
+                    "resource_type": "node",
+                },
+                "params": {"percent": "85"},
+                "duration_seconds": 60,
+            },
+            source="test_legacy",
+        )
+
+        assert spec is not None
+        assert spec.to_dict() == {
+            "namespace": "",
+            "scope": "node",
+            "names": ["node-a"],
+            "labels": {},
+            "blade_target": "disk",
+            "blade_action": "fill",
+            "params": {"percent": "85"},
+            "params_flags": [],
+            "duration_seconds": 60,
+            "source": "test_legacy",
+            "user_description": "",
+        }
+
+    def test_returns_none_when_no_fault_context_exists(self):
+        assert fault_spec_from_legacy_state({}) is None
 
 
 # ---------------------------------------------------------------------------

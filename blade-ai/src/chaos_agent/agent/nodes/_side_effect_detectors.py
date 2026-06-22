@@ -172,14 +172,11 @@ def run_all_detectors(
 async def capture_snapshot(namespace: str, kubeconfig: str) -> SideEffectSnapshot | None:
     """Capture pre-injection namespace state. Returns None on failure."""
     from chaos_agent.tools.shell import run_command
-    from chaos_agent.tools.kubectl import _build_kubectl_global_args
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
     from chaos_agent.config.settings import settings
 
-    kubectl_path = settings.kubectl_path
-    global_args = " ".join(_build_kubectl_global_args(kubeconfig))
-
-    pods_cmd = [kubectl_path, *global_args.split(), "get", "pods", "-n", namespace, "-o", "json"]
-    ep_cmd = [kubectl_path, *global_args.split(), "get", "endpoints", "-n", namespace, "-o", "json"]
+    pods_cmd = build_kubectl_cmd("get", ["pods", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig)
+    ep_cmd = build_kubectl_cmd("get", ["endpoints", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig)
 
     try:
         result_p, result_e = await asyncio.gather(
@@ -190,6 +187,8 @@ async def capture_snapshot(namespace: str, kubeconfig: str) -> SideEffectSnapsho
         logger.warning("se_snapshot capture failed: %s", e)
         return None
 
+    result_p = _adapt_kubewiz_result(result_p)
+    result_e = _adapt_kubewiz_result(result_e)
     rc_p, stdout_p = result_p.exit_code, result_p.stdout
     rc_e, stdout_e = result_e.exit_code, result_e.stdout
 
@@ -236,23 +235,19 @@ async def fetch_post_inject_state(
 ) -> PostInjectState:
     """Query current namespace state for side-effect diffing."""
     from chaos_agent.tools.shell import run_command
-    from chaos_agent.tools.kubectl import _build_kubectl_global_args
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
     from chaos_agent.config.settings import settings
 
-    kubectl_path = settings.kubectl_path
-    global_args = " ".join(_build_kubectl_global_args(kubeconfig))
-
-    _ga = global_args.split()
-    pods_cmd = [kubectl_path, *_ga, "get", "pods", "-n", namespace, "-o", "json"]
-    events_cmd = [kubectl_path, *_ga, "get", "events", "-n", namespace, "-o", "json"]
-    ep_cmd = [kubectl_path, *_ga, "get", "endpoints", "-n", namespace, "-o", "json"]
+    pods_cmd = build_kubectl_cmd("get", ["pods", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig)
+    events_cmd = build_kubectl_cmd("get", ["events", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig)
+    ep_cmd = build_kubectl_cmd("get", ["endpoints", "-n", namespace, "-o", "json"], kubeconfig=kubeconfig)
 
     logs_cmd: list[str] = []
     if target_names:
-        logs_cmd = [
-            kubectl_path, *_ga, "logs", target_names[0],
-            "-n", namespace, f"--since-time={injection_start_time}", "--tail=200",
-        ]
+        logs_cmd = build_kubectl_cmd("logs", [
+            target_names[0], "-n", namespace,
+            f"--since-time={injection_start_time}", "--tail=200",
+        ], kubeconfig=kubeconfig)
 
     tasks = [
         run_command(pods_cmd, timeout=settings.timeout_kubectl, source="se-detect-pods"),
@@ -270,6 +265,7 @@ async def fetch_post_inject_state(
     def _safe_json(result) -> dict:
         if isinstance(result, Exception):
             return {}
+        result = _adapt_kubewiz_result(result)
         if result.exit_code != 0 or not result.stdout:
             return {}
         try:
@@ -280,6 +276,7 @@ async def fetch_post_inject_state(
     def _safe_text(result) -> str:
         if isinstance(result, Exception):
             return ""
+        result = _adapt_kubewiz_result(result)
         return result.stdout if result.exit_code == 0 else ""
 
     pods_json = _safe_json(results[0])

@@ -20,9 +20,7 @@ def recover_command(
         return await backend.recover(task_id, target_name=target_name, force=force)
 
     async def _server(backend):
-        return await backend.post("/api/v1/recover", {
-            "task_id": task_id, "target_name": target_name, "force": force,
-        })
+        return await backend.recover(task_id, target_name=target_name, force=force)
 
     result = run_command(RECOVER_CHECKS, _local, _server)
     typer.echo(format_output(result, output))

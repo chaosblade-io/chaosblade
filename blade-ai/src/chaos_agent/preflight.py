@@ -81,6 +81,21 @@ def expand_kubeconfig_path(path: str) -> str:
 
 def check_kubeconfig() -> CheckResult:
     """Check that a readable kubeconfig exists."""
+    if settings.kube_connection_mode == "kubewiz":
+        missing = []
+        if not settings.kubewiz_cluster_uuid:
+            missing.append("BLADE_AI_KUBEWIZ_CLUSTER_UUID")
+        if not settings.kubewiz_profile:
+            missing.append("BLADE_AI_KUBEWIZ_PROFILE")
+        if missing:
+            return CheckResult(
+                name="kubeconfig",
+                severity="blocking",
+                passed=False,
+                message=f"kubewiz mode: missing required config: {', '.join(missing)}",
+                fix="Set via environment variables or blade-ai config set",
+            )
+        return CheckResult(name="kubeconfig", severity="blocking", passed=True)
     raw = settings.kubeconfig_path
     path = expand_kubeconfig_path(raw)
     if not path:
@@ -110,8 +125,18 @@ def check_kubeconfig() -> CheckResult:
 
 
 def check_kubectl() -> CheckResult:
-    """Check that kubectl is executable."""
+    """Check that kubectl (or wiz in kubewiz mode) is executable."""
     from chaos_agent.utils.blade_paths import is_executable
+    if settings.kube_connection_mode == "kubewiz":
+        if is_executable(settings.wiz_path):
+            return CheckResult(name="kubectl", severity="blocking", passed=True)
+        return CheckResult(
+            name="kubectl",
+            severity="blocking",
+            passed=False,
+            message=f"wiz 不可用 (path={settings.wiz_path})",
+            fix="安装 wiz CLI，或 blade-ai config set wiz_path <path>",
+        )
     # is_executable (not bare shutil.which): kubectl_path may be configured
     # as a full path, and shutil.which mishandles a path-shaped cmd on
     # Windows before Python 3.12 (in scope via requires-python >=3.11).
@@ -230,14 +255,14 @@ def _get_preflight_openai_client(
 
 
 def _self_check_timeout() -> int:
-    """Bound the kubectl self-check timeout so startup never blocks 30s.
+    """Bound the kubectl self-check timeout so startup never blocks too long.
 
-    Must be strictly less than ``_PREFLIGHT_BUDGET_S`` (8s) so that
+    Must be strictly less than ``_PREFLIGHT_BUDGET_S`` (15s) so that
     individual kubectl checks timeout *before* the outer wait_for
     cancels the entire gather — otherwise a single slow check causes
     ALL results (including fast local checks) to be discarded.
     """
-    return min(6, settings.timeout_kubectl or 15)
+    return min(10, settings.timeout_kubectl or 15)
 
 
 def _pretty_path(p: str | Path) -> str:
@@ -416,6 +441,9 @@ async def check_kubeconfig_live() -> CheckResult:
     runtime). Bonus: catches inter-field invariants (missing user, bad
     auth-info ref) that a pure YAML structure check would miss.
     """
+    if settings.kube_connection_mode == "kubewiz":
+        return CheckResult(name="kubeconfig", severity="blocking", passed=True,
+                           message="kubewiz mode (no kubeconfig needed)")
     path_raw = settings.kubeconfig_path
     path = expand_kubeconfig_path(path_raw)
     if not path:
@@ -505,8 +533,55 @@ async def check_kubeconfig_live() -> CheckResult:
     )
 
 
+async def _check_wiz_version() -> CheckResult:
+    """Run ``wiz version`` and extract the client version."""
+    import json as _json
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            settings.wiz_path, "version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+    except FileNotFoundError:
+        return CheckResult(
+            name="kubectl", severity="blocking", passed=False,
+            message=f"wiz 不可用 (path={settings.wiz_path})",
+            fix="安装 wiz CLI，或 blade-ai config set wiz_path <path>",
+        )
+    except asyncio.TimeoutError:
+        await _safe_kill(proc)
+        return CheckResult(
+            name="kubectl", severity="blocking", passed=False,
+            message="wiz version 超时",
+        )
+    except Exception as e:
+        return CheckResult(
+            name="kubectl", severity="blocking", passed=False,
+            message=f"wiz version 调用异常: {e}",
+        )
+
+    if proc.returncode != 0:
+        return CheckResult(
+            name="kubectl", severity="blocking", passed=False,
+            message="wiz version 退出码非零",
+            fix="检查 wiz CLI 安装及登录状态",
+        )
+
+    try:
+        obj = _json.loads(stdout.decode(errors="replace"))
+        version = obj.get("client", "")
+    except (ValueError, KeyError):
+        version = ""
+
+    msg = f"wiz v{version}" if version else "wiz ready"
+    return CheckResult(name="kubectl", severity="blocking", passed=True, message=msg)
+
+
 async def check_kubectl_version() -> CheckResult:
     """Run the same kubectl the agent uses, ask for its version."""
+    if settings.kube_connection_mode == "kubewiz":
+        return await _check_wiz_version()
     base_cmd, _ = _kubectl_base_cmd()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -686,70 +761,40 @@ def check_skills() -> CheckResult:
 
 
 async def check_k8s_connectivity() -> CheckResult:
-    """Probe K8s cluster reachability AND fetch its server version.
+    """Probe K8s cluster reachability AND fetch its server version."""
+    from chaos_agent.tools.kubectl import exec_kubectl_raw
 
-    We use ``kubectl version -o json`` rather than ``cluster-info`` —
-    ``version`` requires API connectivity (same liveness signal as
-    cluster-info) AND returns a structured ``serverVersion.gitVersion``
-    we can surface in the success line. Failures get the same kubectl
-    error text the old cluster-info path returned.
-    """
-    base_cmd, _ = _kubectl_base_cmd()
     timeout = _self_check_timeout()
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *base_cmd, "version", "-o", "json",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-
-        if proc.returncode == 0:
-            server_version = _extract_kubectl_version(
-                stdout.decode(errors="replace"), kind="server"
-            )
-            # API server URL is intentionally omitted from the success
-            # message — the endpoint is sensitive (cluster IP / port)
-            # and the self-check card lives in screenshots / share
-            # logs. Server version alone is enough to confirm the
-            # connection is healthy.
-            msg = f"v{server_version}" if server_version else "connected"
-            return CheckResult(name="k8s_connectivity", severity="blocking", passed=True, message=msg)
-
-        error_msg = stderr.decode(errors="replace").strip()[:200]
-        return CheckResult(
-            name="k8s_connectivity",
-            severity="blocking",
-            passed=False,
-            message=f"kubectl version failed: {error_msg}",
-            fix="Check kubeconfig path and cluster access:\n  blade-ai config set kubeconfig_path <path>",
-        )
-    except asyncio.TimeoutError:
-        await _safe_kill(proc)
-        return CheckResult(
-            name="k8s_connectivity",
-            severity="blocking",
-            passed=False,
-            message=f"kubectl version timed out ({timeout}s)",
-            fix="Check network connectivity to K8s API server",
-        )
-    except FileNotFoundError:
-        return CheckResult(
-            name="k8s_connectivity",
-            severity="blocking",
-            passed=False,
-            message="kubectl not found",
-            fix="Install kubectl or set path: blade-ai config set kubectl_path <path>",
-        )
+        result = await exec_kubectl_raw("version", ["-o", "json"], timeout=timeout)
     except Exception as e:
         return CheckResult(
-            name="k8s_connectivity",
-            severity="blocking",
-            passed=False,
-            message=f"K8s connectivity check failed: {e}",
-            fix="Check kubectl and kubeconfig configuration",
+            name="k8s_connectivity", severity="blocking", passed=False,
+            message=f"Unexpected error: {str(e)[:100]}", fix="Check cluster connectivity",
         )
+
+    if result.exit_code == -1:
+        # timeout or not found
+        msg = result.stderr or "kubectl/wiz not found or timed out"
+        fix = "Check kubeconfig path and cluster access:\n  blade-ai config set kubeconfig_path <path>"
+        if "not found" in msg:
+            fix = "Install kubectl or set path: blade-ai config set kubectl_path <path>"
+        elif "timed out" in msg:
+            fix = "Check network connectivity to K8s API server"
+        return CheckResult(name="k8s_connectivity", severity="blocking", passed=False, message=msg, fix=fix)
+
+    if result.exit_code == 0:
+        server_version = _extract_kubectl_version(result.stdout, kind="server")
+        msg = f"v{server_version}" if server_version else "connected"
+        return CheckResult(name="k8s_connectivity", severity="blocking", passed=True, message=msg)
+
+    error_msg = (result.stderr or result.stdout).strip()[:200]
+    return CheckResult(
+        name="k8s_connectivity", severity="blocking", passed=False,
+        message=f"kubectl version failed: {error_msg}",
+        fix="Check kubeconfig path and cluster access:\n  blade-ai config set kubeconfig_path <path>",
+    )
 
 
 def _operator_replicas_ready(stdout_text: str) -> bool:
@@ -771,16 +816,14 @@ def _operator_replicas_ready(stdout_text: str) -> bool:
 
 
 def _parse_operator_jsonpath(stdout_text: str) -> tuple[list[str], list[str]]:
-    """Split the combined replicas+images jsonpath output.
+    """Split the combined name+replicas+images jsonpath output.
 
     Format produced by the kubectl jsonpath in ``check_chaosblade_operator``:
 
-        <replicas>|<image>[,<image>]*\\n
-        <replicas>|<image>[,<image>]*\\n
-        ...
+        <name>|<replicas>|<image>[,<image>]*\\n
 
-    Returns ``(replica_tokens, image_tokens)``. Each token list is
-    flattened — order matches deployment-then-container.
+    Only deployments whose name contains "chaosblade" are included.
+    Returns ``(replica_tokens, image_tokens)``.
     """
     replicas: list[str] = []
     images: list[str] = []
@@ -788,15 +831,46 @@ def _parse_operator_jsonpath(stdout_text: str) -> tuple[list[str], list[str]]:
         line = line.strip()
         if not line:
             continue
-        rep, sep, img_csv = line.partition("|")
-        rep = rep.strip()
+        parts = line.split("|", 2)
+        if len(parts) < 3:
+            continue
+        name, rep, img_csv = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if "chaosblade" not in name:
+            continue
         if rep:
             replicas.append(rep)
-        if sep and img_csv:
+        if img_csv:
             for img in img_csv.split(","):
                 img = img.strip()
                 if img:
                     images.append(img)
+    return replicas, images
+
+
+def _parse_operator_json(stdout_text: str) -> tuple[list[str], list[str]]:
+    """Parse ``kubectl get deploy -A -o json`` output for operator check.
+
+    Searches all namespaces for deployments whose name contains
+    "chaosblade" — the operator may be installed in any namespace.
+    """
+    import json as _json
+    replicas: list[str] = []
+    images: list[str] = []
+    try:
+        data = _json.loads(stdout_text)
+        items = data.get("items", [])
+        for item in items:
+            name = item.get("metadata", {}).get("name", "")
+            if "chaosblade" not in name:
+                continue
+            avail = item.get("status", {}).get("availableReplicas", 0)
+            replicas.append(str(avail or 0))
+            for container in item.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []):
+                img = container.get("image", "")
+                if img:
+                    images.append(img)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        pass
     return replicas, images
 
 
@@ -830,81 +904,57 @@ def _extract_operator_image_version(images: list[str]) -> str:
 
 
 async def check_chaosblade_operator() -> CheckResult:
-    """Check if ChaosBlade Operator is deployed and capture its image tag.
+    """Check if ChaosBlade Operator is deployed and capture its image tag."""
+    from chaos_agent.tools.kubectl import exec_kubectl_raw
 
-    Uses a custom-columns query to grab BOTH the available replica
-    counts and the container image strings in a single round-trip.
-    Output format is two columns separated by a vertical bar:
-    ``"<replicas> | <image>[,image]..."`` per row. Replicas drive
-    pass/fail; image tag drives the success message.
-    """
-    base_cmd, _ = _kubectl_base_cmd()
+    if settings.kube_connection_mode == "kubewiz":
+        v_args = ["deploy", "-A", "-o", "json"]
+    else:
+        _jsonpath = "jsonpath={range .items[*]}{.metadata.name}|{.status.availableReplicas}|{range .spec.template.spec.containers[*]}{.image},{end}{'\\n'}{end}"
+        v_args = ["deploy", "-A", "-o", _jsonpath]
+
     timeout = _self_check_timeout()
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *base_cmd, "get", "deploy", "-n", "chaosblade",
-            "-o", "jsonpath={range .items[*]}{.status.availableReplicas}|{range .spec.template.spec.containers[*]}{.image},{end}{'\\n'}{end}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-
-        if proc.returncode == 0:
-            stdout_text = stdout.decode(errors="replace").strip()
-            replica_tokens, image_tokens = _parse_operator_jsonpath(stdout_text)
-            if _operator_replicas_ready(" ".join(replica_tokens)):
-                version = _extract_operator_image_version(image_tokens)
-                msg = f"v{version}" if version else "ready"
-                return CheckResult(
-                    name="chaosblade_operator",
-                    severity="warning",
-                    passed=True,
-                    message=msg,
-                )
-            return CheckResult(
-                name="chaosblade_operator",
-                severity="warning",
-                passed=False,
-                message="ChaosBlade Operator not ready (no available replicas)",
-                fix="Check Operator status: kubectl get pods -n chaosblade",
-            )
-
-        return CheckResult(
-            name="chaosblade_operator",
-            severity="warning",
-            passed=False,
-            message="ChaosBlade Operator not deployed",
-            fix="Install ChaosBlade Operator:\n"
-                "  helm repo add chaosblade https://chaosblade-io.github.io/charts\n"
-                "  helm install chaosblade-operator chaosblade/chaosblade-operator -n chaosblade --create-namespace\n"
-                "Or: /doctor for guided installation",
-        )
-    except asyncio.TimeoutError:
-        await _safe_kill(proc)
-        return CheckResult(
-            name="chaosblade_operator",
-            severity="warning",
-            passed=False,
-            message=f"Operator check timed out ({timeout}s)",
-            fix="Check cluster connectivity",
-        )
-    except FileNotFoundError:
-        return CheckResult(
-            name="chaosblade_operator",
-            severity="warning",
-            passed=False,
-            message="kubectl not found",
-            fix="Install kubectl or set path: blade-ai config set kubectl_path <path>",
-        )
+        result = await exec_kubectl_raw("get", v_args, timeout=timeout)
     except Exception as e:
         return CheckResult(
-            name="chaosblade_operator",
-            severity="warning",
-            passed=False,
-            message=f"Operator check failed: {e}",
-            fix="Install ChaosBlade Operator manually",
+            name="chaosblade_operator", severity="warning", passed=False,
+            message=f"Unexpected error: {str(e)[:100]}", fix="Check cluster connectivity",
         )
+
+    if result.exit_code == -1:
+        msg = result.stderr or "timed out or kubectl not found"
+        if "not found" in msg:
+            return CheckResult(name="chaosblade_operator", severity="warning", passed=False,
+                message="kubectl not found", fix="Install kubectl or set path: blade-ai config set kubectl_path <path>")
+        return CheckResult(name="chaosblade_operator", severity="warning", passed=False,
+            message=f"Operator check timed out ({timeout}s)", fix="Check cluster connectivity")
+
+    if result.exit_code == 0:
+        stdout_text = result.stdout.strip()
+        if settings.kube_connection_mode == "kubewiz":
+            replica_tokens, image_tokens = _parse_operator_json(stdout_text)
+        else:
+            replica_tokens, image_tokens = _parse_operator_jsonpath(stdout_text)
+        if _operator_replicas_ready(" ".join(replica_tokens)):
+            version = _extract_operator_image_version(image_tokens)
+            msg = f"v{version}" if version else "ready"
+            return CheckResult(name="chaosblade_operator", severity="warning", passed=True, message=msg)
+        return CheckResult(
+            name="chaosblade_operator", severity="warning", passed=False,
+            message="ChaosBlade Operator not ready (no available replicas)",
+            fix="Check Operator status: kubectl get deploy -A | grep chaosblade",
+        )
+
+    return CheckResult(
+        name="chaosblade_operator", severity="warning", passed=False,
+        message="ChaosBlade Operator not deployed",
+        fix="Install ChaosBlade Operator:\n"
+            "  helm repo add chaosblade https://chaosblade-io.github.io/charts\n"
+            "  helm install chaosblade-operator chaosblade/chaosblade-operator -n chaosblade --create-namespace\n"
+            "Or: /doctor for guided installation",
+    )
 
 
 async def run_tui_checks() -> list[CheckResult]:
@@ -912,7 +962,7 @@ async def run_tui_checks() -> list[CheckResult]:
 
     All seven checks are live. ``asyncio.gather`` runs them concurrently;
     per-check timeouts bound individual checks and the endpoint's outer
-    ``wait_for(8s)`` (see ``server/routes/preflight.py``) bounds the whole
+    ``wait_for(15s)`` (see ``server/routes/preflight.py``) bounds the whole
     panel. The order here is the display order the boot card uses.
     """
     raw = await asyncio.gather(

@@ -10,12 +10,16 @@ Called after save_memory in the batch loop. Responsibilities:
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 
 from langchain_core.callbacks import adispatch_custom_event
 
-from chaos_agent.agent.fault_spec import read_fault_spec
+from chaos_agent.agent.fault_spec import fault_type_from_state
+from chaos_agent.agent.operation_outcome import (
+    read_inject_verification,
+    read_operation_outcome,
+    read_verification_side_effects,
+)
 from chaos_agent.agent.state import AgentState, infer_task_state
 
 logger = logging.getLogger(__name__)
@@ -26,24 +30,23 @@ async def batch_next(state: AgentState) -> dict:
     batch_args = state.get("batch_submit_args") or {}
     faults = batch_args.get("faults", [])
 
-    spec = read_fault_spec(state)
     task_state = infer_task_state(dict(state))
 
     from chaos_agent.agent.fault_spec import legacy_target_dict
     from chaos_agent.agent.state import extract_ui_diagnostics, strip_side_effects
 
-    verification = state.get("verification")
+    verification = read_inject_verification(state)
+    outcome = read_operation_outcome(state)
     entry = {
         "task_id": state.get("task_id", ""),
         "blade_uid": state.get("blade_uid"),
         "task_state": task_state,
-        "fault_type": (spec.fault_type if spec and spec.fault_type
-                       else state.get("skill_name", "")),
-        "error": state.get("error"),
+        "fault_type": fault_type_from_state(dict(state)),
+        "error": outcome.error,
         "target": legacy_target_dict(dict(state)),
         "verification": strip_side_effects(verification),
-        "side_effects": verification.get("side_effects") if isinstance(verification, dict) else None,
-        "postmortem": state.get("postmortem"),
+        "side_effects": read_verification_side_effects(verification),
+        "postmortem": outcome.postmortem,
         "duration_ms": 0,
         **extract_ui_diagnostics(dict(state)),
     }

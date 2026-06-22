@@ -14,6 +14,7 @@ Two flavours bound at the graph layer:
 """
 
 import logging
+import os
 import re
 import shlex
 from typing import Literal
@@ -21,6 +22,7 @@ from typing import Literal
 from langchain_core.tools import tool
 
 from chaos_agent.config.settings import settings
+from chaos_agent.tools.guard import CommandResult
 from chaos_agent.tools.shell import run_command
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,7 @@ def _build_kubectl_global_args(
     # --kubeconfig: tool param > settings fallback
     kc = kubeconfig or settings.kubeconfig_path
     if kc:
+        kc = os.path.expanduser(kc)
         args.extend(["--kubeconfig", kc])
 
     # --context: tool param > settings fallback
@@ -69,6 +72,160 @@ def _build_kubectl_global_args(
         args.extend(["--cluster", cluster])
 
     return args
+
+
+def build_kubectl_cmd(
+    subcommand: str,
+    v_args: "list[str] | str" = "",
+    kubeconfig: str = "",
+    context: str = "",
+    cluster: str = "",
+) -> list[str]:
+    """Unified kubectl command builder.
+
+    kubeconfig mode: [kubectl, --kubeconfig, ..., subcommand, ...args]
+    kubewiz mode: [wiz, task, exec, --command, "kubectl subcommand args", --cluster-uuid, ..., --profile, ...]
+
+    In kubewiz mode, the kubectl portion is baked into a single --command string.
+    Callers must pass ALL kubectl arguments at call time; appending to the
+    returned list will NOT add args to the kubectl command.
+    """
+    if isinstance(v_args, str) and v_args:
+        args_list = _split_args(v_args)
+    elif isinstance(v_args, list):
+        args_list = v_args
+    else:
+        args_list = []
+
+    if settings.kube_connection_mode == "kubewiz":
+        kubectl_parts = ["kubectl", subcommand] + args_list
+        kubectl_cmd_str = " ".join(shlex.quote(p) for p in kubectl_parts)
+        cmd = [
+            settings.wiz_path, "task", "exec",
+            "--command", kubectl_cmd_str,
+            "--cluster-uuid", settings.kubewiz_cluster_uuid,
+            "--profile", settings.kubewiz_profile,
+        ]
+        return cmd
+
+    cmd = [settings.kubectl_path]
+    cmd.extend(_build_kubectl_global_args(kubeconfig, context, cluster))
+    cmd.append(subcommand)
+    cmd.extend(args_list)
+    return cmd
+
+
+def _adapt_kubewiz_result(result: CommandResult) -> CommandResult:
+    """Parse wiz stdout protocol and return corrected CommandResult.
+
+    Wiz protocol:
+    - wiz exit_code=0: stdout first line is 'exit_code: N', rest is kubectl output
+    - wiz exit_code!=0: wiz itself failed, stderr has error message
+
+    Returns CommandResult with kubectl's real exit_code and clean stdout.
+    """
+    if settings.kube_connection_mode != "kubewiz":
+        return result
+
+    # wiz 自身异常
+    if result.exit_code != 0:
+        return result  # stderr 已包含 wiz 错误信息
+
+    # wiz 正常，解析 stdout 第一行 exit_code: N
+    stdout = result.stdout
+    lines = stdout.split('\n', 1)
+
+    if not lines or not lines[0].startswith("exit_code:"):
+        # 协议违规：stdout 必须以 exit_code: 开头
+        return CommandResult(
+            exit_code=1,
+            stdout="",
+            stderr=f"wiz protocol error: stdout missing exit_code prefix. raw={stdout[:200]}",
+            duration_ms=result.duration_ms,
+        )
+
+    try:
+        real_exit_code = int(lines[0].split(':', 1)[1].strip())
+    except (ValueError, IndexError):
+        real_exit_code = 1
+    clean_stdout = lines[1] if len(lines) > 1 else ""
+
+    return CommandResult(
+        exit_code=real_exit_code,
+        stdout=clean_stdout,
+        stderr=result.stderr,
+        duration_ms=result.duration_ms,
+    )
+
+
+async def exec_kubectl_raw(
+    subcommand: str,
+    v_args: "list[str] | str" = "",
+    kubeconfig: str = "",
+    context: str = "",
+    cluster: str = "",
+    timeout: float = 30.0,
+) -> CommandResult:
+    """Execute kubectl with kubewiz protocol handling (no audit overhead).
+
+    Layer 1: protocol translation only.
+    - Builds correct command (with shlex.quote in kubewiz mode)
+    - Runs subprocess directly
+    - Parses wiz output protocol
+    - Returns clean CommandResult
+
+    Use this for lightweight internal checks (preflight, env_info, safety_check).
+    For LLM-driven tool calls, use _kubectl_impl() which adds audit/guard.
+    """
+    import asyncio as _asyncio
+
+    cmd = build_kubectl_cmd(subcommand, v_args, kubeconfig, context, cluster)
+
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await _asyncio.wait_for(
+            proc.communicate(), timeout=timeout,
+        )
+    except _asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        return CommandResult(exit_code=-1, stdout="", stderr=f"timed out after {timeout}s")
+    except FileNotFoundError:
+        return CommandResult(exit_code=-1, stdout="", stderr="kubectl/wiz not found")
+
+    raw_result = CommandResult(
+        exit_code=proc.returncode or 0,
+        stdout=stdout_bytes.decode("utf-8", errors="replace"),
+        stderr=stderr_bytes.decode("utf-8", errors="replace"),
+    )
+    return _adapt_kubewiz_result(raw_result)
+
+
+def display_cmd(cmd: list[str]) -> str:
+    """Return a human/LLM-facing command string.
+
+    In kubewiz mode the actual cmd is [wiz, task, exec, --command, "kubectl ..."].
+    This function extracts the kubectl portion so callers never expose wiz internals.
+    In kubeconfig mode it simply joins the list.
+    """
+    if (
+        settings.kube_connection_mode == "kubewiz"
+        and len(cmd) >= 5
+        and cmd[1:3] == ["task", "exec"]
+    ):
+        try:
+            idx = cmd.index("--command")
+            return cmd[idx + 1]
+        except (ValueError, IndexError):
+            pass
+    return " ".join(cmd)
 
 
 def _is_json_output(v_args: str) -> bool:
@@ -189,12 +346,20 @@ async def _kubectl_impl(
     stdin_data: str = "",
 ) -> str:
     """Shared kubectl execution logic used by both kubectl and kubectl_ro."""
-    cmd = [settings.kubectl_path]
-    cmd.extend(_build_kubectl_global_args(kubeconfig, context, cluster))
-    cmd.append(subcommand)
+    # kubewiz mode does not support stdin piping
+    if settings.kube_connection_mode == "kubewiz" and stdin_data:
+        return (
+            "Error: kubewiz mode does not support stdin piping. "
+            "Use imperative commands instead: "
+            "kubectl create configmap NAME --from-literal=key=value, "
+            "kubectl create secret generic NAME --from-literal=key=value"
+        )
+
+    selector_removed = False
+    processed_args: list[str] = []
+
     if v_args:
         # Defensive: strip --kubeconfig embedded in v_args by LLM mistake.
-        # kubeconfig should be passed via the dedicated 'kubeconfig' parameter.
         if "--kubeconfig" in v_args:
             v_args = re.sub(r"--kubeconfig\s+\S+", "", v_args).strip()
             logger.warning(
@@ -203,7 +368,6 @@ async def _kubectl_impl(
             )
 
         # Validate exec subcommand: reject -l/--selector (not supported by kubectl exec)
-        selector_removed = False
         if subcommand == "exec":
             selector_pattern = re.compile(r"(?:^|\s)(-l|--selector)\s+\S+")
             if selector_pattern.search(v_args):
@@ -214,18 +378,11 @@ async def _kubectl_impl(
                     "Removed from v_args. Use kubectl get to discover the pod name first."
                 )
 
-        cmd.extend(_split_args(v_args))
+        processed_args = _split_args(v_args)
 
     # Auto-inject/boost --timeout for kubectl exec blade create commands.
-    # When the LLM falls back to kubectl exec to run blade create (bypassing the
-    # blade_create tool's auto-timeout logic), we must ensure --timeout is present
-    # AND meets the minimum recommended duration.  This mirrors blade_create's
-    # auto-injection/boost logic (blade.py).
-    # IMPORTANT: Must match "blade create" as a contiguous token sequence, not
-    # "blade" + "create" separately (e.g., "blade status --type create" would
-    # be a false positive and --timeout is invalid for blade status).
+    # Must happen BEFORE build_kubectl_cmd (kubewiz mode bakes args into a string).
     if subcommand == "exec" and v_args and re.search(r"\bblade\s+create\b", v_args):
-        # Extract scope/target/action from "blade create k8s <scope>-<target> <action>"
         _fault_match = re.search(
             r"blade\s+create\s+k8s\s+(pod|node|container)-(\w+)\s+(\w+)", v_args
         )
@@ -235,25 +392,22 @@ async def _kubectl_impl(
         )
         from chaos_agent.utils.fault_type import ensure_min_duration
         if "--timeout" not in v_args:
-            # No timeout specified: auto-inject recommended minimum
             effective_timeout = ensure_min_duration(None, _scope, _target, _action)
-            cmd.extend(["--timeout", str(effective_timeout)])
+            processed_args.extend(["--timeout", str(effective_timeout)])
             logger.info(
                 f"Auto-injected --timeout {effective_timeout}s into "
                 f"kubectl exec blade create command"
             )
         else:
-            # Timeout specified: check if it meets the minimum
             try:
                 _timeout_match = re.search(r"--timeout\s+(\d+)", v_args)
                 if _timeout_match:
                     _current_val = _timeout_match.group(1)
                     _effective = ensure_min_duration(_current_val, _scope, _target, _action)
                     if _effective != int(_current_val):
-                        # Replace in cmd list (which was built from _split_args)
-                        for i, token in enumerate(cmd):
-                            if token == "--timeout" and i + 1 < len(cmd) and cmd[i + 1] == _current_val:
-                                cmd[i + 1] = str(_effective)
+                        for i, token in enumerate(processed_args):
+                            if token == "--timeout" and i + 1 < len(processed_args) and processed_args[i + 1] == _current_val:
+                                processed_args[i + 1] = str(_effective)
                                 logger.info(
                                     f"Auto-boosted --timeout from {_current_val}s to {_effective}s "
                                     f"for {_scope}-{_target}-{_action} (recommended minimum)"
@@ -261,6 +415,8 @@ async def _kubectl_impl(
                                 break
             except (ValueError, TypeError):
                 pass
+
+    cmd = build_kubectl_cmd(subcommand, processed_args, kubeconfig, context, cluster)
 
     # exec/debug subcommands use longer timeout (container commands may be slow;
     # debug needs to pull images and create ephemeral containers)
@@ -271,8 +427,12 @@ async def _kubectl_impl(
     except Exception as e:
         return f"Error: kubectl {subcommand} failed: {e}"
 
+    result = _adapt_kubewiz_result(result)
+
     if result.exit_code != 0:
-        return f"Error: kubectl {subcommand} failed: {result.stderr}"
+        # kubewiz 模式下错误信息在 stdout，直接模式在 stderr
+        error_detail = result.stderr or result.stdout
+        return f"Error: kubectl {subcommand} failed: {error_detail}"
 
     output = result.stdout
 
@@ -300,10 +460,14 @@ async def _kubectl_impl(
 
     # Debug pod cleanup hint — ephemeral debug containers should be deleted after use
     if subcommand == "debug":
+        # Extract the namespace used for this debug pod (needed by cleanup scanner)
+        _ns_match = re.search(r'(?:-n\s+|--namespace[=\s])(\S+)', v_args)
+        _debug_ns = _ns_match.group(1) if _ns_match else "default"
         output += (
-            "\n\n💡 The debug container is ephemeral. "
+            f"\n\n[debug-pod-ns: {_debug_ns}]"
+            "\n💡 The debug container is ephemeral. "
             "If you are done with debugging, clean up with: "
-            "kubectl(subcommand='delete', v_args='pod <debug-pod-name> -n <ns>'). "
+            f"kubectl(subcommand='delete', v_args='pod <debug-pod-name> -n {_debug_ns}'). "
             "The debug pod name usually starts with the target node/pod name followed by '-debug'."
         )
 
@@ -415,7 +579,7 @@ async def kubectl_ro(
 VERIFIER_SUBCOMMANDS: tuple[str, ...] = (
     "get", "describe", "top", "logs",
     "version", "cluster-info", "api-resources", "explain", "auth",
-    "exec",
+    "exec", "debug",
 )
 
 
@@ -424,7 +588,7 @@ async def kubectl_verify(
     subcommand: Literal[
         "get", "describe", "top", "logs",
         "version", "cluster-info", "api-resources", "explain", "auth",
-        "exec",
+        "exec", "debug",
     ],
     v_args: str = "",
     kubeconfig: str = "",
@@ -442,6 +606,14 @@ async def kubectl_verify(
         HTTP health:    ``exec <pod> -n <ns> -- wget -qO- --timeout=3 <url>``
         Process state:  ``exec <pod> -n <ns> -- ps aux``
         Network:        ``exec <pod> -n <ns> -- ping -c 3 <target>``
+      - Probe host filesystem / kernel state on a node (`debug`):
+        ``debug node/<node> --image=busybox -- sleep 3600`` then
+        ``exec <debug-pod> -n default -- cat /host/proc/loadavg``.
+        Host paths inside the debug pod live under ``/host/...``.
+        Always pass ``-- sleep 3600`` (or another keep-alive); never ``-it``.
+        Clean up the debug pod with ``delete`` is NOT possible from this
+        tool (no ``delete`` here) — the framework's verifier finalization
+        scans message history and removes the debug pod automatically.
 
     Self-help (IMPORTANT — use this instead of guessing from memory):
       - Pass `--help` or `-h` in v_args to see the real usage of any subcommand.
@@ -452,10 +624,11 @@ async def kubectl_verify(
         `--help` BEFORE retrying — do NOT guess from prior context.
 
     Constraints:
-      - This tool accepts read-only subcommands plus ``exec`` for in-pod
-        observation. Any attempt to call ``scale``, ``delete``, ``patch``,
-        ``apply``, ``cordon``, ``drain``, ``taint``, ``rollout``,
-        ``debug``, ``edit``, ``replace``, ``create``, ``run``, etc. is
+      - This tool accepts read-only subcommands plus ``exec`` (in-pod
+        observation) and ``debug`` (host-level observation via an
+        ephemeral debug pod). Any attempt to call ``scale``, ``delete``,
+        ``patch``, ``apply``, ``cordon``, ``drain``, ``taint``,
+        ``rollout``, ``edit``, ``replace``, ``create``, ``run``, etc. is
         REJECTED. The verifier's job is to OBSERVE fault effects, not
         to inject faults — injection is done in the execution phase.
       - ``kubectl exec`` constraints: no shell features (`|`, `;`, `&&`),

@@ -247,10 +247,11 @@ class TestCheckChaosbladeOperator:
         monkeypatch.setattr(_settings_mod.settings, "kubectl_path", "kubectl")
         monkeypatch.setattr(_settings_mod.settings, "kubeconfig_path", "")
         monkeypatch.setattr(_settings_mod.settings, "kube_context", "")
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "kubeconfig")
 
         with patch(
             "asyncio.create_subprocess_exec",
-            AsyncMock(return_value=_make_proc(0, stdout=b"3")),
+            AsyncMock(return_value=_make_proc(0, stdout=b"chaosblade-operator|3|ghcr.io/chaosblade-io/chaosblade-operator:1.7.4\n")),
         ):
             r = await check_chaosblade_operator()
 
@@ -263,10 +264,11 @@ class TestCheckChaosbladeOperator:
         monkeypatch.setattr(_settings_mod.settings, "kubectl_path", "kubectl")
         monkeypatch.setattr(_settings_mod.settings, "kubeconfig_path", "")
         monkeypatch.setattr(_settings_mod.settings, "kube_context", "")
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "kubeconfig")
 
         with patch(
             "asyncio.create_subprocess_exec",
-            AsyncMock(return_value=_make_proc(0, stdout=b"0 1")),
+            AsyncMock(return_value=_make_proc(0, stdout=b"chaosblade-operator|0|img:v1\nchaosblade-tool|1|img:v1\n")),
         ):
             r = await check_chaosblade_operator()
 

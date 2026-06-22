@@ -93,7 +93,9 @@ def get_verification_heuristics_compact_section() -> str:
 - **Minimal container**: If `kubectl exec` returns "command not found", switch to `kubectl describe` or `kubectl get -o json`. Do NOT retry similar commands.
 - **Method priority**: Skill instructions > knowledge patterns > general health checks. CPU/Memory → kubectl top + describe; Network → connectivity test; Disk → df -h + describe node; Pod kill → get pods + describe.
 - **Evidence**: Need 2+ independent data points from different verification layers. Single data point = hint, not conclusion.
-- **Ambiguous**: Cross-validate with different commands. "No signal" ≠ "no fault" until timing is accounted for."""
+- **Ambiguous**: Cross-validate with different commands. "No signal" ≠ "no fault" until timing is accounted for.
+- **Transient faults**: Some faults produce cyclic/short-lived effects. If ANY observation shows a clear change from baseline, mark 'passed', NOT 'recovered_before_observation'. Only use 'recovered_before_observation' when NO observation at ANY point showed fault effects.
+- **RestartCount**: Compare current restartCount with pre-injection baseline. Only a NEW restart (count > baseline) indicates restart during injection window."""
 
 
 # ---------------------------------------------------------------------------
@@ -145,17 +147,75 @@ For the full heuristic catalogue (method-by-fault-type mapping, evidence suffici
     return "\n".join(parts)
 
 
-def get_workflow_section() -> str:
-    """Workflow phases section — path-guided ("how to succeed") not禁令式.
+def get_core_principles_section() -> str:
+    """Core anti-hallucination principles — primacy zone anchor.
 
-    Rewrite goal (post task-ce9647931ce1 incident): the prior wording was a
-    禁令 ("Do NOT inject faults in Phase 1, no `kubectl exec ... blade create`,
-    ...") that the LLM ignored under execution pressure — it撞 the
-    blade_create black-list, saw the error message list ``kubectl`` as an
-    alternative, and ran ``kubectl exec ... blade create`` instead. The new
-    text shifts emphasis to **the success path** (what to do, then stop),
-    explicitly lists Phase 1's read-only tool surface, and explains that
-    mutation tools will be bound automatically once the plan is approved.
+    Concise form of Workflow's Ground Truth, placed at the prompt beginning
+    for U-shaped attention. The full version with rationale lives in
+    Workflow's Ground Truth subsection; REMEMBER at the end reinforces
+    these same rules (recency zone).
+    """
+    return """# Core Principles
+- FAULT INTENT parameters are UNVERIFIED — verify with tools before trusting them
+- When tool output contradicts FAULT INTENT or documentation, the TOOL is correct
+- Before calling finish_planning, you MUST cite tool output that proves the target exists"""
+
+
+def get_remember_section() -> str:
+    """REMEMBER segment — recency zone anchor for U-shaped attention.
+
+    Reinforces the anti-hallucination principles from Core Principles and
+    Workflow Ground Truth, plus one workflow rule about propose_plan_change.
+    """
+    return """# REMEMBER
+- FAULT INTENT parameters are UNVERIFIED — verify with tools before trusting them
+- When tool output contradicts FAULT INTENT or documentation, the TOOL is correct
+- Before calling finish_planning, you MUST cite tool output that proves the target exists
+- Do NOT use propose_plan_change for parameter fixes — only for fault TYPE changes"""
+
+
+def get_executor_core_principles_section() -> str:
+    """Core execution principles — primacy zone anchor for Phase 2.
+
+    Phase 2's root cause: the LLM's tool interface knowledge from docs
+    (skill case, knowledge docs) is UNVERIFIED. The tool's runtime behavior
+    (help output, error messages) is the ground truth.
+
+    Mirrors Phase 1's get_core_principles_section() pattern: same root
+    principle (tool is ground truth), applied to the execution context.
+    Three rules form a complete loop — before calling (discover),
+    during failure (adapt), during success (stop).
+    """
+    return """# Core Principles
+- Tool interface knowledge from docs is UNVERIFIED — discover the actual interface from the tool itself
+- When a tool returns error, the TOOL is right — adapt immediately, do not retry or re-plan
+- When the injection tool returns success, STOP — do not verify or recover"""
+
+
+def get_executor_remember_section() -> str:
+    """REMEMBER segment — recency zone anchor for Phase 2 U-shaped attention.
+
+    Reinforces the same three rules from executor Core Principles, plus
+    one replan escape rule. Must stay verbatim aligned with Core Principles
+    for U-shaped attention integrity.
+    """
+    return """# REMEMBER
+- Tool interface knowledge from docs is UNVERIFIED — discover the actual interface from the tool itself
+- When a tool returns error, the TOOL is right — adapt immediately, do not retry or re-plan
+- When the injection tool returns success, STOP — do not verify or recover
+- If all injection methods fail, output [REPLAN] — do not retry exhausted approaches"""
+
+
+def get_workflow_section() -> str:
+    """Workflow phases section — tool-agnostic, verification as structural backbone.
+
+    Design principles:
+    1. Ground Truth at top — establishes fact priority (tool > FAULT INTENT > docs).
+    2. Verification (Step 3) is the structural centerpiece, not buried in a list.
+    3. Tool-agnostic — no external CLI tool names (blade/kubectl) in principle
+       sections. Concrete tool names live only in the Tools section.
+       Internal framework APIs (activate_skill, finish_planning, etc.) keep
+       their names — they are the agent's own interface.
 
     Keeps the Analyze / Activate / Verify verbs frozen by
     ``tests/test_agent/test_prompts.py``.
@@ -165,78 +225,65 @@ You operate in TWO phases — the system transitions automatically.
 
 ### Phase 1 (current): Planning — read-only by enforcement
 
-Your output contract this turn:
-1. **Analyze** the FAULT INTENT in your first human message → fault type,
-   target (namespace / resource / names), parameters.
+### Ground Truth
+FAULT INTENT parameters are UNVERIFIED. When tool output contradicts them,
+the TOOL is correct — use verified values, not original ones.
+The same applies to documentation: when a tool's runtime behavior contradicts
+skill docs or knowledge docs, the tool is right. Adapt to what the tool
+actually does.
+
+### Steps
+1. **Analyze** the FAULT INTENT → fault type, target (namespace / resource /
+   names), parameters. Note: these are UNVERIFIED — do not trust them yet.
 2. **Activate** the matching skill ONCE via `activate_skill` (do NOT re-activate).
-3. **Verify** the target exists with read-only kubectl (`get` / `describe`)
-   before any plan decision.
-   - If `-l <label>` returns empty, drop the label, list by name, then inspect
-     `.metadata.labels` to discover the real key (e.g. `app.kubernetes.io/name`).
-4. **Read** skill resources / knowledge docs to determine the correct blade
-   command and flags. Treat the templates inside as RECIPES for Phase 2 —
-   do not execute them here.
-   - Resource-mapping heuristics (e.g. `--path` → imagefs vs nodefs for
-     node-disk fill) are guidance only — verify on the live node with
-     read-only kubectl `top` / `describe` before concluding.
-5. **Assess complexity** (optional save_fault_plan):
-   - Simple (single target, single fault, trivial rollback): skip plan, go
-     to step 6.
-   - Complex (multi-target, multi-step, cascading, large blast radius,
-     non-trivial rollback): call `save_fault_plan` with a markdown plan
-     containing the standard sections (Task Summary / Execution Steps /
-     Expected Impact / Rollback and Recovery / Verification Methods). Pass
-     the `task_id` from the user's conversation.
-5b. **Reject if warranted**: If the request violates safety red lines, has no
-    matching use-case in the catalogue, or the target is infeasible, call
-    `finish_planning(summary="<what you found>", rejected=True,
-    rejection_reason="<specific reason>")`. The system will end the run
-    cleanly without any cluster changes. Do NOT output a free-text refusal
-    without calling `finish_planning`.
-6. **End Phase 1** by calling `finish_planning`:
+3. **Verify** the target exists with read-only cluster query tools — THE
+   critical step for plan reliability:
+   - Query the target by the provided identifier (labels, names, etc.)
+   - If the query returns empty → the identifier is WRONG. List resources
+     by name, inspect their metadata to discover the correct identifier.
+   - Before proceeding, state: "Verified: N resources match <key>=<value>"
+   - You MUST be able to cite the specific tool output that proves the
+     target exists. If you cannot cite evidence, do NOT proceed.
+4. **Read** skill resources / knowledge docs to determine the correct
+   injection command and parameters. Treat templates as RECIPES for
+   Phase 2 — do not execute them here.
+5. **Assess complexity** (optional `save_fault_plan`):
+   - Simple (single target, single fault, trivial rollback): skip plan,
+     go to step 6.
+   - Complex (multi-target, multi-step, cascading, large blast radius):
+     call `save_fault_plan` with a markdown plan (Task Summary /
+     Execution Steps / Expected Impact / Rollback and Recovery /
+     Verification Methods). Pass the `task_id` from the user's conversation.
+   - When writing Verification Methods: fault effects are NOT instantaneous
+     (may take 5-30s to propagate). Plan for multi-iteration verification
+     (2+ checks before concluding "no effect").
+5b. **Reject ONLY when technically impossible**: You may ONLY call
+   `finish_planning(rejected=True, ...)` when the request **cannot be done**:
+   target does not exist after verification, no matching use-case after
+   browsing the catalogue, or the injection method is fundamentally
+   unsupported on this target.
+   In ALL other cases — including safety concerns or blast-radius warnings
+   — you MUST complete planning normally (`rejected=False`) and include
+   your concerns in the `summary`. The system handles risk decisions via
+   `safety_check` → `confirmation_gate`.
+   When rejecting, provide 2-4 actionable alternatives against the same target
+   (numbered list, each with fault type + brief description + risk level).
+6. **End Phase 1** by calling `finish_planning` with VERIFIED parameters:
    - `finish_planning(summary="...")` → proceed to safety check and execution.
    - `finish_planning(summary="...", rejected=True, rejection_reason="...")` →
      reject the request (the system ends cleanly).
-   When proceeding (not rejecting), you MUST include `blast_radius_scope` —
-   the system uses it for safety assessment. Classification rules:
-   - `"target-only"` — only the declared target is mutated (e.g. patch one
-     deployment, blade_create on specific pods).
-   - `"namespace-wide"` — other resources in the target namespace are affected
-     (e.g. delete all pods in a namespace).
-   - `"cluster-wide"` — resources outside the target namespace are mutated
-     (e.g. taint/cordon nodes, modify cluster-level resources). This triggers
-     elevated safety review.
-   Also include `blast_radius_detail` describing the mutation scope (e.g.
-   "Will taint 3 nodes where target pods run").
-   If you read multiple skill case files during planning, you MUST include
-   `skill_case_resource` with the resource_path of the chosen case (e.g.
-   `skill_case_resource="references/catalogue/Pod_镜像拉取失败/Pod_镜像拉取失败_镜像不存在或标签错误.md"`).
-   This tells the system which case to use for verification.
-   This is your output contract. Do NOT end Phase 1 by emitting free text
-   without calling `finish_planning`.
+   When proceeding, you MUST include:
+   - `blast_radius_scope`: `"target-only"` | `"namespace-wide"` |
+     `"cluster-wide"` (cluster-wide triggers elevated safety review)
+   - `blast_radius_detail`: specific resources affected
+   - `skill_case_resource`: resource_path of chosen case (if multiple were read)
+   Do NOT end Phase 1 without calling `finish_planning`.
 
-### Phase 1 tools (read-only — runtime enforced)
+### Phase 2 (automatic): Execution — mutation tools bound after approval.
+Phase 1 is read-only. Mutation tools are bound automatically in Phase 2
+after `finish_planning` → safety_check → user approval. See Tool Usage
+Guidelines for available tools."""
 
-Available: `activate_skill`, `read_skill_resource`, `read_knowledge_resource`,
-`read_file`, kubectl (`get`/`describe`/`top`/`logs`), `blade_status`,
-`save_fault_plan`, `finish_planning`.
-
-NOT available: `blade_create`, `blade_destroy`, full kubectl (`exec`/`delete`/
-`patch`/`scale`/...), `execute_skill_script`. Calling them returns
-`Error: phase1_readonly_violation`. Mutation tools are bound in Phase 2
-automatically after `finish_planning` → safety_check → user approval."""
-
-
-def get_nl_mode_section() -> str:
-    """Natural language mode section."""
-    return """## Natural Language Mode
-When the user provides a natural language description instead of structured parameters:
-1. **Extract** fault_type, target (namespace, resource_type, names), and params from the description
-2. **Activate** the matching skill based on the extracted fault_type
-3. **Verify** the target exists using kubectl tools before injection
-4. **Execute** following the skill instructions
-
-If the description is ambiguous, ask for clarification rather than guessing."""
 
 
 def get_replan_section(replan_context: dict | None = None, replan_history: list | None = None) -> str:
@@ -251,16 +298,20 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
     ]
     existing_uids = replan_context.get("existing_blade_uids", [])
     if existing_uids:
-        parts.append(f"**Existing blade experiments (partial success)**: {', '.join(existing_uids)}")
-        parts.append("Decide whether to destroy existing experiments or build on top of them.")
+        parts.append(f"**Existing experiments (partial success)**: {', '.join(existing_uids)}")
+        parts.append("Decide whether to recover existing experiments or build on top of them.")
     else:
-        parts.append("No blade experiments were successfully created.")
+        parts.append("No experiments were successfully created.")
 
     failed_calls = replan_context.get("failed_tool_calls", [])
     if failed_calls:
-        parts.append("\n### Failed Tool Calls")
-        for fc in failed_calls:
-            parts.append(f"- `{fc.get('name', '?')}` args={fc.get('args', {})} → {fc.get('error', '?')}")
+        parts.append("\n### Failure Chain (chronological — analyze the FULL chain)")
+        for i, fc in enumerate(failed_calls, 1):
+            parts.append(f"{i}. `{fc.get('name', '?')}` args={fc.get('args', {})}")
+            parts.append(f"   → {fc.get('error', '?')}")
+        parts.append("")
+        parts.append("Look for the ROOT CAUSE at the beginning of the chain,")
+        parts.append("not just the last error. The last error is often a symptom.")
 
     if replan_history:
         parts.append("\n### Previous Replan Attempts (DO NOT repeat these approaches)")
@@ -269,14 +320,14 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
 
     parts.extend([
         "\n### Replan Instructions",
-        "1. Re-verify the target using available tools (kubectl, blade_status, etc.)",
-        "2. Use read_skill_resource to re-read the skill for correct parameters",
+        "1. Re-verify the target using available read-only tools",
+        "2. Re-read the skill case to confirm correct injection parameters",
         "3. **Runtime overrides documentation**: If the error indicates a rejected "
         "parameter/command/syntax, do NOT include it in your corrected plan. "
-        "Plan a verification step first: run the tool's help/usage command "
-        "to discover its actual interface before calling it.",
-        "4. Generate a CORRECTED plan — do NOT repeat the same approach that failed",
-        "5. When ready, output a summary. The system will route to safety check before execution.",
+        "Plan a verification step: run the tool's help/usage command to discover "
+        "its actual interface before calling it.",
+        "4. Generate a CORRECTED plan — do NOT repeat the approach that failed",
+        "5. When ready, call `finish_planning`. The system routes to safety check before execution.",
     ])
 
     # Inject rejected params prohibition
@@ -295,33 +346,39 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
         for t in ctx_failed_tools:
             parts.append(f"- `{t}`: {suggest_verify_command(t)}")
 
-    # Add alternative injection approaches when blade_create failed
-    blade_create_failed = "blade_create" in (ctx_failed_tools or [])
-    if blade_create_failed:
+    # Error classification decision tree — tool-agnostic
+    if ctx_failed_tools:
         parts.extend([
             "",
-            "### Alternative Injection Approaches (PLANNING ONLY — do NOT execute in Phase 1)",
-            "blade_create failed on the host (likely due to an incompatible blade version or missing CLI). "
-            "Consider these alternatives when generating your corrected plan:",
+            "### Analyzing the Failure",
+            "Before deciding your approach, analyze WHY the failure occurred:",
             "",
-            "1. **kubectl exec into tool pod** — preserves blade_uid for automatic recovery via blade_destroy",
-            "2. **kubectl-native injection** (scale/cordon/patch/taint) — no blade_uid; manual rollback required; Layer 2 will verify fault effect",
-            "3. **Adjust blade parameters** — check `blade create k8s <scenario> -h` for supported flags in Phase 2",
+            "- **Parameter error** (target not found, identifier mismatch):",
+            "  Fix the parameters and retry with the SAME fault type.",
+            "  Do NOT use propose_plan_change.",
             "",
-            "See Important Guidelines → Injection Method Switching for detailed constraints on method selection.",
+            "- **Environment error** (tool not available, dependency missing):",
+            "  Consider alternative injection methods from the skill case.",
+            "  You MAY use propose_plan_change if the fault type is",
+            "  fundamentally not viable on this target.",
+            "",
+            "- **Execution error** (tool ran but injection failed):",
+            "  Re-read the skill case, verify parameters, and retry.",
+            "  Only escalate to plan change if repeated attempts fail.",
+            "",
+            "Check the failure chain above to determine which category applies.",
         ])
 
     parts.extend([
         "",
         "### Plan Change (fault type switch)",
-        "If after analyzing the Phase 2 failure you determine the original fault type "
-        "is fundamentally not viable on this target (e.g., iptables not installed for "
-        "network-drop, insufficient disk space for disk-fill), you may propose an "
-        "alternative fault type using `propose_plan_change`. The user will see a "
-        "comparison card and approve or reject the change.",
+        "If after analyzing the failure you determine the original fault type "
+        "is fundamentally not viable on this target, you may propose an "
+        "alternative fault type using `propose_plan_change`. The user will see "
+        "a comparison card and approve or reject the change.",
         "",
-        "Do NOT use propose_plan_change for parameter adjustments — those can be "
-        "handled within the same fault type. Only use it when the fault TYPE "
+        "Do NOT use propose_plan_change for parameter adjustments — those can "
+        "be handled within the same fault type. Only use it when the fault TYPE "
         "(scope/target/action) must change.",
     ])
 
@@ -329,10 +386,16 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
 
 
 def get_replan_directive_for_execution() -> str:
-    """Replan directive for Phase 2's prompt — tells LLM about [REPLAN] mechanism."""
+    """Replan directive for Phase 2's prompt — tells LLM about [REPLAN] mechanism.
+
+    This section is tool-agnostic — it describes the replan mechanism
+    (output [REPLAN] marker) without listing specific tool names. The
+    concrete Phase 2 tools are listed in the Tools section and execution
+    directives, not here.
+    """
     return f"""### Replan Mechanism
-If you encounter an error that you CANNOT resolve with the available Phase 2 tools (blade_create, blade_status, kubectl, execute_skill_script):
+If you encounter an error that you CANNOT resolve with the available Phase 2 tools:
 1. Output `{REPLAN_MARKER}` followed by a detailed description of the problem
 2. Include what you tried, what failed, and what information or approach might help
-3. The system will route back to Phase 1, which has richer tools (read_skill_resource, blade_destroy, save_fault_plan) for investigation and re-planning
+3. The system will route back to Phase 1, which has richer read-only tools for investigation and re-planning
 4. Only use {REPLAN_MARKER} when you have genuinely exhausted Phase 2 capabilities — do NOT use it for transient errors that can be retried"""

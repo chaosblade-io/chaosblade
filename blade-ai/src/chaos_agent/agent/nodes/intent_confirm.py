@@ -76,18 +76,23 @@ def _build_handoff_summary(fault_intent: dict, dialogue_round: int) -> SystemMes
 
 def _build_trim_remove_list(messages: list) -> list[RemoveMessage]:
     """Build the RemoveMessage list that drops old dialogue messages
-    while preserving ``[Task Summary]`` and ``[Compressed History]``
+    while preserving operation summaries and ``[Compressed History]``
     markers.
 
-    Task summaries record previous inject/recover results — the LLM
-    needs them to answer "what happened last time?" across multiple
-    tasks in the same session. Compressed history summaries are the
-    output of PreReasoningHook's LLM compaction and must survive
+    Operation summaries record previous inject/batch/recover results —
+    the LLM needs them to answer "what happened last time?" across
+    multiple tasks in the same session. Compressed history summaries are
+    the output of PreReasoningHook's LLM compaction and must survive
     trimming for the same reason.
     """
     if len(messages) <= _TRIM_TAIL_KEEP:
         return []
-    _PRESERVE_PREFIXES = ("[Task Summary]", "[Compressed History]")
+    _PRESERVE_PREFIXES = (
+        "[Task Summary]",
+        "[Batch Summary]",
+        "[Recover Summary]",
+        "[Compressed History]",
+    )
     remove_list: list[RemoveMessage] = []
     for msg in messages[:-_TRIM_TAIL_KEEP]:
         content = getattr(msg, "content", "") or ""

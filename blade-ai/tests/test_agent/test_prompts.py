@@ -1,75 +1,34 @@
 """Tests for system prompt templates."""
 
 from chaos_agent.agent.prompts import (
-    INJECT_SYSTEM_PROMPT,
-    VERIFIER_PROMPT,
     build_inject_system_prompt,
     build_intent_clarification_prompt,
     get_role_section,
+    get_core_principles_section,
+    get_remember_section,
+    get_executor_core_principles_section,
+    get_executor_remember_section,
     get_workflow_section,
-    get_nl_mode_section,
     get_safety_section,
-    get_actions_section,
     get_tools_section,
-    get_output_section,
-    get_k8s_connection_section,
     get_guidelines_section,
     get_env_section,
 )
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.prompts.sections.intent import (
     get_intent_role_section,
-    get_intent_critical_rules_section,
-    get_intent_safety_section,
-    get_intent_dialogue_modes_section,
-    get_intent_convergence_section,
+    get_intent_priorities_section,
+    get_intent_dialogue_routing_section,
+    get_intent_parameter_model_section,
+    get_intent_inject_flow_section,
+    get_intent_recover_flow_section,
+    get_intent_batch_flow_section,
+    get_intent_operation_freshness_section,
     get_intent_tools_section,
     get_intent_output_section,
     get_intent_completeness_section,
-    get_intent_critical_rules_reminder_section,
+    get_intent_reminder_section,
 )
-
-
-class TestInjectSystemPrompt:
-    """Test INJECT_SYSTEM_PROMPT (deprecated backward-compat constant)."""
-
-    def test_contains_skill_index_section(self):
-        """PATD: skill index is now in stable section, not a {skill_catalog} placeholder.
-
-        The deprecated INJECT_SYSTEM_PROMPT constant was built with
-        skill_catalog="{skill_catalog}" which produced a raw fallback.
-        PATD replaces this with get_skill_index_section() which parses
-        "- name: description" format and produces a structured Skill Index.
-        """
-        # Skill Index section is present (PATD stable section)
-        assert "Skill Index" in INJECT_SYSTEM_PROMPT
-
-    def test_contains_safety_rules(self):
-        assert "Safety Rules" in INJECT_SYSTEM_PROMPT
-
-    def test_contains_activate_skill_instruction(self):
-        assert "activate_skill" in INJECT_SYSTEM_PROMPT
-
-    def test_contains_workflow_steps(self):
-        assert "Analyze" in INJECT_SYSTEM_PROMPT
-        assert "Activate" in INJECT_SYSTEM_PROMPT
-        assert "Verify" in INJECT_SYSTEM_PROMPT
-
-
-class TestVerifierPrompt:
-    """Test VERIFIER_PROMPT."""
-
-    def test_contains_verification_steps(self):
-        assert "blade_status" in VERIFIER_PROMPT
-
-    def test_contains_structured_output(self):
-        # Scheme B: verdict is submitted via the submit_verification tool with
-        # structured args (overall / layer2_status), not a free-text
-        # VERIFICATION_RESULT block.
-        assert "verified" in VERIFIER_PROMPT
-        assert "submit_verification" in VERIFIER_PROMPT
-        assert "overall" in VERIFIER_PROMPT
-        assert "layer2_status" in VERIFIER_PROMPT
 
 
 class TestSectionFunctions:
@@ -85,50 +44,76 @@ class TestSectionFunctions:
         assert "Phase 2" in section
         assert "activate_skill" in section
 
-    def test_nl_mode_section_contains_extract(self):
-        section = get_nl_mode_section()
-        assert "Extract" in section
-        assert "ambiguous" in section
-
     def test_safety_section_contains_rules(self):
         section = get_safety_section()
         assert "namespace blacklist" in section
         assert "NEVER" in section
         assert "ALWAYS" in section
 
-    def test_actions_section_contains_scope_matching(self):
-        """迁移点 2: 审慎性指导"""
-        section = get_actions_section()
-        assert "Scope Matching" in section
-        assert "Irreversible Operations" in section
-        assert "Progressive Caution" in section
-        assert "blast radius" in section
-
     def test_tools_section_contains_priority(self):
         """迁移点 3: 工具使用规范"""
-        section = get_tools_section()
+        section = get_tools_section(phase=1)
         assert "Tool Selection Priority" in section
         assert "Parallel Calls" in section
         assert "Avoid Redundancy" in section
         assert "read_skill_resource" in section
-        assert "Resource Lookup Priority" in section
+        assert "Timeout Protection" in section
 
-    def test_output_section_contains_style(self):
-        """迁移点 4: 沟通效率与输出风格"""
-        section = get_output_section()
-        assert "Lead with conclusions" in section
-        assert "Structured results" in section
-        assert "blade_uid" in section
-
-    def test_k8s_connection_section_contains_kubeconfig(self):
-        section = get_k8s_connection_section()
-        assert "kubeconfig" in section
-        assert "namespace" in section
-
-    def test_guidelines_section_contains_blade_uid(self):
-        section = get_guidelines_section()
-        assert "blade UID" in section
+    def test_guidelines_section_contains_follow_instructions(self):
+        section = get_guidelines_section(phase=2)
         assert "improvise" in section
+        assert "Runtime Feedback Priority" in section
+
+    def test_core_principles_section_content(self):
+        section = get_core_principles_section()
+        assert "# Core Principles" in section
+        assert "FAULT INTENT parameters are UNVERIFIED" in section
+        assert "TOOL is correct" in section
+        assert "finish_planning" in section
+
+    def test_remember_section_content(self):
+        section = get_remember_section()
+        assert "# REMEMBER" in section
+        assert "FAULT INTENT parameters are UNVERIFIED" in section
+        assert "TOOL is correct" in section
+        assert "finish_planning" in section
+        assert "propose_plan_change" in section
+
+    def test_core_principles_and_remember_are_aligned(self):
+        """REMEMBER must reinforce the same rules as Core Principles (U-shaped attention)."""
+        core = get_core_principles_section()
+        remember = get_remember_section()
+        # Each Core Principles rule must appear verbatim in REMEMBER
+        for line in core.splitlines():
+            if line.startswith("- "):
+                assert line in remember, (
+                    f"Core Principles rule not found in REMEMBER: {line!r}"
+                )
+
+    def test_executor_core_principles_section_content(self):
+        section = get_executor_core_principles_section()
+        assert "# Core Principles" in section
+        assert "UNVERIFIED" in section
+        assert "TOOL is right" in section
+        assert "STOP" in section
+
+    def test_executor_remember_section_content(self):
+        section = get_executor_remember_section()
+        assert "# REMEMBER" in section
+        assert "UNVERIFIED" in section
+        assert "TOOL is right" in section
+        assert "STOP" in section
+        assert "[REPLAN]" in section
+
+    def test_executor_core_principles_and_remember_are_aligned(self):
+        """REMEMBER must reinforce the same rules as executor Core Principles."""
+        core = get_executor_core_principles_section()
+        remember = get_executor_remember_section()
+        for line in core.splitlines():
+            if line.startswith("- "):
+                assert line in remember, (
+                    f"Executor Core Principles rule not found in REMEMBER: {line!r}"
+                )
 
     def test_env_section_format(self):
         section = get_env_section({"blade_version": "1.7.0", "k8s_available": True})
@@ -152,9 +137,13 @@ class TestBuildInjectSystemPrompt:
         assert "Workflow" in prompt
         assert "Safety Rules" in prompt
         assert "Tool Usage Guidelines" in prompt
-        assert "Communication Style" in prompt
-        assert "K8s Cluster Connection" in prompt
         assert "Important Guidelines" in prompt
+        # REMEMBER segment (U-shaped recency zone)
+        assert "# REMEMBER" in prompt
+        # Removed from Phase 1 (tool-agnostic redesign):
+        # Communication Style and K8s Cluster Connection are Phase 2 only
+        assert "Communication Style" not in prompt
+        assert "K8s Cluster Connection" not in prompt
 
     def test_with_env_info(self):
         """迁移点 7: 环境信息注入"""
@@ -179,11 +168,6 @@ class TestBuildInjectSystemPrompt:
         # No double newlines from empty sections
         assert "\n\n\n\n" not in prompt
 
-    def test_backward_compat_with_old_constant(self):
-        """INJECT_SYSTEM_PROMPT still contains key content for backward compat."""
-        assert "Chaos Engineering Agent" in INJECT_SYSTEM_PROMPT
-        assert "Skill Index" in INJECT_SYSTEM_PROMPT
-
 
 class TestIntentClarificationSectionFunctions:
     """Test intent clarification section functions — English, U-shaped."""
@@ -192,51 +176,70 @@ class TestIntentClarificationSectionFunctions:
         section = get_intent_role_section()
         assert "Blade AI" in section
         assert "chaos engineering" in section
-        # Chinese output instruction present
-        assert "简体中文" in section
-        # NOT a classifier assertion
-        assert "NOT a classifier" in section
+        # Three intent types present (lowercase in role section)
+        assert "inject" in section
+        assert "batch" in section
+        assert "recover" in section
 
-    def test_critical_rules_section_has_4_rules(self):
-        section = get_intent_critical_rules_section()
-        assert "CRITICAL RULES" in section
-        # 4 specific rules present
-        assert "NEVER re-ask" in section
-        assert "summarize" in section and "confirms" in section
+    def test_priorities_section_has_3_priorities(self):
+        section = get_intent_priorities_section()
+        assert "Three Priorities" in section
+        assert "Truthfulness" in section
+        assert "Proactiveness" in section
+        assert "Convergence" in section
+
+    def test_dialogue_routing_section_has_routes(self):
+        section = get_intent_dialogue_routing_section()
+        assert "Dialogue Routing" in section
         assert "classify_intent" in section
-        assert "Single routing action" in section
+        assert "Recover" in section
+        assert "Batch" in section
 
-    def test_safety_section_has_key_rules(self):
-        section = get_intent_safety_section()
-        assert "verify the target" in section
-        assert "uncertain" in section
-        assert "test/dev namespaces" in section
+    def test_parameter_model_section(self):
+        section = get_intent_parameter_model_section()
+        assert "scope" in section
+        assert "target" in section
+        assert "action" in section
+        assert "namespace" in section
 
-    def test_dialogue_modes_section_has_three_modes(self):
-        section = get_intent_dialogue_modes_section()
-        assert "Chat Mode" in section
-        assert "Intent Routing" in section
-        assert "Cluster Query" in section
-        # Batch routing present
-        assert "Batch" in section or "batch" in section
-
-    def test_convergence_section_has_principles(self):
-        section = get_intent_convergence_section()
-        assert "ONE question at a time" in section
+    def test_inject_flow_section(self):
+        section = get_intent_inject_flow_section()
+        assert "Inject Flow" in section
         assert "submit_fault_intent" in section
-        assert "Hypothesis" in section
+        assert "Probe" in section
+        assert "Recommend" in section
 
-    def test_tools_section_has_available_not_available(self):
+    def test_recover_flow_section(self):
+        section = get_intent_recover_flow_section()
+        assert "Recover Flow" in section
+        assert "classify_intent" in section
+        assert "recover_task_id" in section
+
+    def test_batch_flow_section(self):
+        section = get_intent_batch_flow_section()
+        assert "Batch Flow" in section
+        assert "Diversity Principle" in section
+        assert "fault type diversity" in section
+        assert "submit_batch_intent" in section
+
+    def test_operation_freshness_section(self):
+        section = get_intent_operation_freshness_section()
+        assert "Operation Freshness" in section
+        assert "stale" in section
+        assert "re-query" in section
+
+    def test_tools_section_has_categories(self):
         section = get_intent_tools_section()
-        assert "Available Tools" in section
-        assert "NOT Available" in section
-        assert "blade_create" in section
-        assert "kubectl" in section
+        assert "Probe" in section
+        assert "Submit" in section
+        assert "Route" in section
+        assert "bound to you" in section
 
-    def test_output_section_has_content_field(self):
+    def test_output_section(self):
         section = get_intent_output_section()
-        assert "content field" in section
-        assert "简体中文" in section
+        assert "Chinese" in section
+        assert "structured plain text" in section
+        assert "emoji" in section
 
     def test_completeness_section_all_filled(self):
         section = get_intent_completeness_section({
@@ -255,11 +258,11 @@ class TestIntentClarificationSectionFunctions:
         assert section == ""
 
     def test_reminder_section_recaps_rules(self):
-        section = get_intent_critical_rules_reminder_section()
-        assert "REMINDER" in section
-        assert "re-ask" in section
+        section = get_intent_reminder_section()
+        assert "REMEMBER" in section
+        assert "kubectl_ro" in section
         assert "submit" in section
-        assert "classify_intent" in section
+        assert "Probe" in section
 
 
 class TestBuildIntentClarificationPrompt:
@@ -268,19 +271,19 @@ class TestBuildIntentClarificationPrompt:
     def test_basic_assembly(self):
         prompt = build_intent_clarification_prompt()
         assert "Blade AI" in prompt
-        assert "CRITICAL RULES" in prompt
-        assert "REMINDER" in prompt
+        assert "Three Priorities" in prompt
+        assert "REMEMBER" in prompt
 
     def test_u_shaped_structure(self):
-        """CRITICAL rules at beginning + reminder at end."""
+        """Priorities at beginning + reminder at end."""
         prompt = build_intent_clarification_prompt()
-        # CRITICAL rules near beginning (primacy zone)
-        critical_pos = prompt.find("CRITICAL RULES")
-        # REMINDER near end (recency zone)
-        reminder_pos = prompt.find("## REMINDER")
-        assert critical_pos > 0
+        # Priorities near beginning (primacy zone)
+        priorities_pos = prompt.find("Three Priorities")
+        # REMEMBER near end (recency zone)
+        reminder_pos = prompt.find("# REMEMBER")
+        assert priorities_pos > 0
         assert reminder_pos > 0
-        assert reminder_pos > critical_pos
+        assert reminder_pos > priorities_pos
         # Reminder should be in the last 20% of the prompt
         assert reminder_pos > len(prompt) * 0.8
 
@@ -304,9 +307,15 @@ class TestBuildIntentClarificationPrompt:
         # but the ## header section should NOT be present without fault_intent.
         assert "## Confirmed Parameters" not in prompt
 
+    def test_inject_flow_in_assembled_prompt(self):
+        prompt = build_intent_clarification_prompt()
+        assert "Inject Flow" in prompt
+        assert "Recover Flow" in prompt
+        assert "Batch Flow" in prompt
+
     def test_prompt_mode_intent(self):
         """PromptMode.INTENT routes to build_intent_clarification_prompt."""
         from chaos_agent.agent.prompts.builders import build_system_prompt
         prompt = build_system_prompt(PromptMode.INTENT)
         assert "Blade AI" in prompt
-        assert "CRITICAL RULES" in prompt
+        assert "Three Priorities" in prompt

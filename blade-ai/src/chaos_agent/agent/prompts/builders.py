@@ -30,13 +30,12 @@ from chaos_agent.agent.prompts.sections import (
     get_knowledge_summary_section,
     get_experience_section,
     get_workflow_section,
-    get_verification_strategy_section,
-    get_nl_mode_section,
+    get_core_principles_section,
+    get_remember_section,
+    get_executor_core_principles_section,
+    get_executor_remember_section,
     get_safety_section,
-    get_actions_section,
     get_tools_section,
-    get_output_section,
-    get_k8s_connection_section,
     get_guidelines_section,
     get_skill_index_section,
     get_replan_section,
@@ -45,24 +44,18 @@ from chaos_agent.agent.prompts.sections import (
 )
 from chaos_agent.agent.prompts.sections.intent import (
     get_intent_role_section,
-    get_intent_critical_rules_section,
-    get_intent_safety_section,
-    get_intent_dialogue_modes_section,
-    get_intent_batch_design_section,
-    get_intent_convergence_section,
+    get_intent_priorities_section,
+    get_intent_dialogue_routing_section,
+    get_intent_parameter_model_section,
+    get_intent_inject_flow_section,
+    get_intent_recover_flow_section,
+    get_intent_batch_flow_section,
+    get_intent_operation_freshness_section,
     get_intent_tools_section,
+    get_intent_reflection_section,
     get_intent_output_section,
     get_intent_completeness_section,
-    get_intent_critical_rules_reminder_section,
-)
-from chaos_agent.agent.prompts.sections.verification import (
-    get_verifier_role_section,
-    get_verifier_critical_rules_section,
-    get_verifier_critical_rules_reminder_section,
-    get_verifier_tools_section,
-    get_verifier_layer2_section,
-    get_verifier_output_format_section,
-    get_verifier_kubeconfig_section,
+    get_intent_reminder_section,
 )
 from chaos_agent.agent.prompts.sections.plan_builder import (
     get_plan_builder_role_section,
@@ -72,6 +65,14 @@ from chaos_agent.agent.prompts.sections.plan_builder import (
     get_plan_builder_output_format_section,
     get_plan_builder_progress_section,
     get_plan_builder_critical_rules_reminder_section,
+)
+from chaos_agent.agent.prompts.sections.verification import (
+    get_verifier_role_section,
+    get_verifier_core_principles_section,
+    get_verifier_remember_section,
+    get_verifier_tools_section,
+    get_verifier_layer2_section,
+    get_verifier_output_format_section,
 )
 from chaos_agent.agent.prompts.sections.workflow import (
     get_verification_heuristics_compact_section,
@@ -133,30 +134,37 @@ def build_inject_system_prompt(
     _ = input_is_nl
 
     # Stable sections (above cache boundary — reusable across turns).
-    # Phase 4 slimming:
-    #   * role             → brief variant (≤12 lines, keeps kube-system / Safety Rules tokens)
-    #   * safety           → hard_only variant (Hard Rules + Caution Compliance only)
-    #   * verification     → brief variant (5-line principles; full heuristics in knowledge doc)
-    #   * guidelines       → no method-switching block (Phase 1 doesn't execute)
-    #   * failure_modes    → dropped (sourced on demand from failure-modes.md)
-    # PATD: skill index is now in stable section (unchanged across turns).
-    # Previously it was in dynamic section + P2 tool_result injection,
-    # creating 3× redundancy (system prompt + P2 + tool docstring).
+    #
+    # Tool abstraction boundary:
+    # - Internal framework APIs (activate_skill, finish_planning, save_fault_plan,
+    #   propose_plan_change, read_skill_resource, read_knowledge_resource) —
+    #   keep original names in ALL sections. These are the agent's own interface.
+    # - External CLI tools (blade_create, blade_destroy, blade_status, kubectl) —
+    #   abstract in principle sections (Workflow/Guidelines/Safety/Replan) using
+    #   generic terms (injection tool, cluster query tool, experiment ID).
+    #   Concrete names appear ONLY in Phase 2 Tools section, execution
+    #   directives, and skill case files. Phase 1 Tools section is also
+    #   tool-agnostic.
+    # When adding a new injection tool (chaos-mesh, litmus, etc.), only update
+    # the Phase 2 Tools section + execution directives + skill catalogue —
+    #   principle sections need no changes.
     stable_sections = [
-        get_role_section(brief=True),
+        get_role_section(),
+        get_core_principles_section(),
         get_experience_section(),
         get_knowledge_summary_section(),
         get_skill_index_section(skill_catalog),
     ]
     stable_sections.extend([
         get_workflow_section(),
-        get_verification_strategy_section(brief=True),
         get_safety_section(level="hard_only"),
         get_tools_section(phase=1),
-        get_output_section(),
-        get_k8s_connection_section(),
-        get_guidelines_section(include_method_switching=False),
+        get_guidelines_section(include_method_switching=False, phase=1),
     ])
+    # REMEMBER segment — U-shaped attention recency zone.
+    # Reinforces the anti-hallucination principles from Core Principles
+    # and Workflow Ground Truth.
+    stable_sections.append(get_remember_section())
 
     # Dynamic sections (below cache boundary — may change between turns)
     dynamic_sections = []
@@ -187,12 +195,14 @@ def build_execute_system_prompt(
     plan: str = "",
     plan_path: str = "",
     structured_params_hint: str = "",
+    user_params_hint: str = "",
     **kwargs,
 ) -> str:
-    """Build execute_loop system prompt.
+    """Build execute_loop system prompt with U-shaped attention.
 
-    Reuses main prompt structure but excludes planning-specific sections
-    (chat_routing, workflow, nl_mode) and appends execution-phase directives.
+    Same pattern as build_inject_system_prompt, build_verifier_prompt,
+    build_intent_clarification_prompt, and build_plan_builder_prompt:
+    Core Principles at BEGINNING (primacy) + REMEMBER at END (recency).
 
     Args:
         skill_catalog: The available skills catalog string.
@@ -203,48 +213,43 @@ def build_execute_system_prompt(
             structured params (e.g., "scope=pod, target=cpu, action=fullload").
             When set, the LLM should use these parameters instead of inferring.
     """
-    # Phase 4 slimming for execute_loop:
-    #   * verification_strategy → dropped (verifier_loop owns full heuristics)
-    #   * failure_modes         → dropped (sourced on demand from failure-modes.md)
-    #   * safety                → hard_only (executor still bound by Hard Rules)
+    # U-shaped attention: Core Principles at BEGINNING (primacy effect)
     sections = [
         get_executor_role_section(),
+        get_executor_core_principles_section(),
         get_experience_section(),
         get_knowledge_summary_section(),
         get_safety_section(level="hard_only"),
         get_tools_section(phase=2),
-        get_output_section(),
-        get_k8s_connection_section(),
-        get_guidelines_section(include_method_switching=True),
+        get_guidelines_section(include_method_switching=True, phase=2),
     ]
 
-    # Inject env info if provided
+    # Inject env info if provided (after Core Principles, before Experience)
     if kwargs.get("env_info"):
-        sections.insert(1, get_env_section(kwargs["env_info"]))
+        sections.insert(2, get_env_section(kwargs["env_info"]))
 
-    # PATD: Phase 2 only needs T1 — active skill name + key directive.
-    # Previously injected full catalog (433 chars) even though Phase 2
-    # never selects skills (selection is Phase 1's job).
-    if skill_name:
-        sections.append(f"Active skill: {skill_name}")
-        sections.append("Follow the use-case steps exactly. Do not improvise fault injection operations.")
-    else:
-        # Fallback when no skill is active (shouldn't happen in normal flow)
+    # Fallback: inject full catalog when no skill is active
+    # (shouldn't happen in normal flow — Phase 1 selects the skill)
+    if not skill_name:
         sections.append(get_skill_index_section(skill_catalog))
 
-    # Append execution-specific directives (extracted section function)
+    # Execution-specific directives (skill_name injected here, not above)
     sections.append(
         "\n---\n"
         + get_execution_directives_section(
             skill_name=skill_name,
             structured_params_hint=structured_params_hint,
+            user_params_hint=user_params_hint,
             plan=plan,
             plan_path=plan_path,
         )
     )
 
-    # Append replan directive for Phase 2
+    # Replan directive
     sections.append(get_replan_directive_for_execution())
+
+    # U-shaped attention: REMEMBER at END (recency zone)
+    sections.append(get_executor_remember_section())
 
     prompt = "\n\n".join(s for s in sections if s)
     return _enforce_prompt_budget(prompt, PromptMode.MINIMAL)
@@ -262,9 +267,9 @@ def build_verifier_prompt() -> str:
     experience = get_experience_section()
 
     parts = [
-        # U-shaped attention: CRITICAL rules at BEGINNING (primacy effect)
+        # U-shaped attention: Core Principles at BEGINNING (primacy)
         get_verifier_role_section(),
-        get_verifier_critical_rules_section(),
+        get_verifier_core_principles_section(),
         experience if experience else "",
         get_knowledge_summary_section(),
         get_verifier_tools_section(),
@@ -272,9 +277,8 @@ def build_verifier_prompt() -> str:
         # Compact merged section replaces 5 separate sections (P2-3)
         get_verification_heuristics_compact_section(),
         get_verifier_output_format_section(),
-        get_verifier_kubeconfig_section(),
-        # U-shaped attention: CRITICAL rules at END (recency effect)
-        get_verifier_critical_rules_reminder_section(),
+        # U-shaped attention: REMEMBER at END (recency)
+        get_verifier_remember_section(),
     ]
     prompt = "\n\n".join(p for p in parts if p)
     return _enforce_prompt_budget(prompt, PromptMode.VERIFICATION)
@@ -307,17 +311,21 @@ def build_intent_clarification_prompt(
     """
     # Stable sections (above cache boundary — reusable across turns)
     stable_sections = [
-        # U-shaped attention: CRITICAL rules at BEGINNING (primacy effect)
+        # §1-2: Role + Priorities at BEGINNING (primacy effect)
         get_intent_role_section(),
-        get_intent_critical_rules_section(),
-        get_intent_safety_section(),
-        # Middle zone: modes, batch design, convergence, tools, output
-        get_intent_dialogue_modes_section(),
-        get_intent_batch_design_section(),
-        get_intent_convergence_section(),
+        get_intent_priorities_section(),
+        # §3-9: Routing, model, flows, tools
+        get_intent_dialogue_routing_section(),
+        get_intent_parameter_model_section(),
+        get_intent_inject_flow_section(),
+        get_intent_recover_flow_section(),
+        get_intent_batch_flow_section(),
+        get_intent_operation_freshness_section(),
         get_intent_tools_section(),
-        get_skill_index_section(skill_catalog),
+        get_intent_reflection_section(),
         get_intent_output_section(),
+        # §12: Skill Index (dynamic catalog)
+        get_skill_index_section(skill_catalog),
     ]
 
     # Dynamic sections (below cache boundary — may change between turns)
@@ -332,8 +340,8 @@ def build_intent_clarification_prompt(
     parts = [s for s in stable_sections if s]
     parts.append(CACHE_BOUNDARY.strip())
     parts.extend(s for s in dynamic_sections if s)
-    # U-shaped attention: CRITICAL rules at END (recency effect)
-    parts.append(get_intent_critical_rules_reminder_section())
+    # §13: Reminder at END (recency effect)
+    parts.append(get_intent_reminder_section())
 
     prompt = "\n\n".join(parts)
     return _enforce_prompt_budget(prompt, PromptMode.INTENT)

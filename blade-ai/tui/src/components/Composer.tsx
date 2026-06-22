@@ -118,6 +118,7 @@ interface Props {
 export const Composer: React.FC<Props> = ({ client, sessionId }) => {
   const {
     submitTurn,
+    submitRecover,
     cancelTurn,
     resolveConfirm,
     beginReplay,
@@ -498,6 +499,7 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
           beginReplay,
           beginManualCompact,
           submitTurn,
+          submitRecover,
         };
 
         // Subcommand match → dispatch to the sub's handler. The sub

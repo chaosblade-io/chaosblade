@@ -27,12 +27,12 @@ logger = logging.getLogger(__name__)
 # is ~15s. The TUI boot screen makes the user stare at a black terminal
 # during this window — bound the total to something snappier.
 #
-# Half of the per-check timeout gives slow-but-healthy clusters time to
-# answer while still keeping the perceived boot latency under 8s. If
-# the budget blows, asyncio.wait_for raises and the endpoint returns
-# empty checks; cli.tsx renders the doctor card as "unavailable" and
-# the user can re-run /doctor on a per-need basis.
-_PREFLIGHT_BUDGET_S = 8.0
+# The budget matches the per-check timeout so slow-but-healthy clusters
+# have a full window to answer. If the budget blows, asyncio.wait_for
+# raises and the endpoint returns 504; the TS client renders the doctor
+# card as "unavailable" and the user can re-run /doctor on a per-need
+# basis.
+_PREFLIGHT_BUDGET_S = 15.0
 
 
 @health_router.get("/api/v1/preflight")

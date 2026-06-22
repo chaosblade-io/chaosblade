@@ -6,8 +6,10 @@ Configuration priority (highest to lowest):
   3. Code defaults
 """
 
+import contextvars
 import json
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Tuple, Type
 
@@ -207,6 +209,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("BLADE_AI_KUBECONFIG_PATH", "KUBECONFIG"),
     )  # BLADE_AI_KUBECONFIG_PATH / KUBECONFIG
     kube_context: str = ""        # BLADE_AI_KUBE_CONTEXT，空值则使用 kubeconfig 当前 context
+
+    # Kubewiz 连接模式配置（网络隔离场景下通过 kubewiz 通道连接集群）
+    kube_connection_mode: str = "kubeconfig"   # BLADE_AI_KUBE_CONNECTION_MODE ("kubeconfig" | "kubewiz")
+    kubewiz_url: str = ""                      # BLADE_AI_KUBEWIZ_URL (kubewiz-core 服务地址，blade 用)
+    kubewiz_cluster_uuid: str = ""             # BLADE_AI_KUBEWIZ_CLUSTER_UUID (目标集群 UUID)
+    kubewiz_token: str = ""                    # BLADE_AI_KUBEWIZ_TOKEN (认证 token，blade 用)
+    kubewiz_profile: str = ""                  # BLADE_AI_KUBEWIZ_PROFILE (wiz task exec 的 --profile)
+    wiz_path: str = "wiz"                      # BLADE_AI_WIZ_PATH (wiz 二进制路径)
 
     # 全局默认超时(秒)
     command_timeout: int = 60                # BLADE_AI_COMMAND_TIMEOUT
@@ -496,12 +506,68 @@ class Settings(BaseSettings):
         return self
 
 
-def _get_settings() -> Settings:
-    """Get or create the global Settings instance."""
-    global settings
-    if settings is None:
-        settings = Settings()
-    return settings
+_settings_var: contextvars.ContextVar[Settings | None] = contextvars.ContextVar(
+    "blade_ai_settings", default=None
+)
+
+_default_settings = Settings()
 
 
-settings = Settings()
+class _SettingsProxy:
+    """Transparent proxy routing attribute access to the active Settings.
+
+    Reads from ContextVar if set (SDK multi-tenant), otherwise falls
+    back to _default_settings (CLI/TUI single-tenant). The 97 existing
+    ``from chaos_agent.config.settings import settings`` sites import
+    this proxy object and see no difference.
+    """
+
+    def _current(self) -> Settings:
+        return _settings_var.get() or _default_settings
+
+    def __getattr__(self, name: str):
+        return getattr(self._current(), name)
+
+    def __setattr__(self, name: str, value):
+        object.__setattr__(self._current(), name, value)
+
+    def __repr__(self) -> str:
+        current = self._current()
+        source = "contextvar" if _settings_var.get() is not None else "default"
+        return f"<_SettingsProxy source={source} {current!r}>"
+
+
+@contextmanager
+def blade_ai_context(**overrides):
+    """Create an isolated Settings scope for the current execution context.
+
+    Usage (SDK multi-tenant)::
+
+        with blade_ai_context(kube_connection_mode="kubewiz",
+                              kubewiz_cluster_uuid="xxx"):
+            agent.execute(runtime, task)
+
+    Settings is constructed from env/config.json + overrides (same
+    priority chain as normal). The ContextVar is reset on exit, so
+    the scope is bounded to the ``with`` block. Works in sync threads
+    (L4 execute), async coroutines, and asyncio.gather concurrency.
+    """
+    new_settings = Settings(**overrides)
+    token = _settings_var.set(new_settings)
+    try:
+        yield new_settings
+    finally:
+        _settings_var.reset(token)
+
+
+def get_current_settings() -> Settings:
+    """Return the active Settings instance (ContextVar or default).
+
+    Use this when you need the actual Settings object (e.g. for
+    isinstance checks or passing as a parameter). For normal attribute
+    access, just use ``settings.xxx`` directly.
+    """
+    return _settings_var.get() or _default_settings
+
+
+settings: Settings = _SettingsProxy()  # type: ignore[assignment]

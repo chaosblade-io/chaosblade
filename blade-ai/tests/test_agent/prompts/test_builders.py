@@ -55,10 +55,9 @@ class TestInjectCacheBoundary:
 
 
 class TestInjectSlimmedSections:
-    def test_uses_brief_role_section(self):
+    def test_role_section_content(self):
         prompt = build_inject_system_prompt(skill_catalog="x")
-        # Brief role drops the "What You Can Do" subsection but preserves
-        # "Chaos Engineering Agent" and the Safety Rules token.
+        # Role section preserves "Chaos Engineering Agent" and Safety Rules.
         assert "What You Can Do" not in prompt
         assert "Chaos Engineering Agent" in prompt
         assert "Safety Rules" in prompt
@@ -71,11 +70,15 @@ class TestInjectSlimmedSections:
         assert "### Decision Framework" not in prompt
         assert "### Advisory Rules" not in prompt
 
-    def test_uses_brief_verification_strategy(self):
+    def test_verification_merged_into_workflow(self):
         prompt = build_inject_system_prompt(skill_catalog="x")
-        # Brief variant collapses the Strategy header and removes per-fault recipes.
-        assert "Verification Strategy (Principles)" in prompt
+        # Phase 5: verification strategy section removed from Phase 1 —
+        # key principles (delay awareness, evidence sufficiency) merged
+        # into Workflow Step 3. The standalone section header is gone.
+        assert "Verification Strategy (Principles)" not in prompt
         assert "### Verification Method Selection Reasoning" not in prompt
+        # But the delay awareness principle IS present (merged into Workflow)
+        assert "NOT instantaneous" in prompt
 
     def test_drops_failure_modes_section(self):
         prompt = build_inject_system_prompt(skill_catalog="x")
@@ -119,9 +122,10 @@ class TestExecuteSlimmedSections:
 
     def test_keeps_failure_handling_block(self):
         prompt = build_execute_system_prompt(skill_catalog="x")
-        # Executor needs failure handling guidance when blade_create fails.
-        # Merged from Injection Method Switching + blade_create Fallback + METHOD CONSTRAINT.
-        assert "blade_create Fails" in prompt
+        # Executor needs failure handling guidance — abstracted as
+        # Injection Failure Escalation (tool-agnostic principle).
+        assert "Injection Failure Escalation" in prompt
+        assert "[REPLAN]" in prompt
 
     def test_keeps_execution_directives(self):
         prompt = build_execute_system_prompt(skill_catalog="x")

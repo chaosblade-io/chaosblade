@@ -38,7 +38,7 @@ class TestEnumValues:
         assert set(v.value for v in RecoverVerdict) == {"recovered", "partial", "failed"}
 
     def test_layer1_status_values(self):
-        assert set(v.value for v in Layer1Status) == {"passed", "failed", "error", "skipped", "unknown"}
+        assert set(v.value for v in Layer1Status) == {"passed", "failed", "error", "skipped", "unknown", "warning"}
 
     def test_layer2_status_values(self):
         assert set(v.value for v in Layer2Status) == {

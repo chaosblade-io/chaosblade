@@ -1575,8 +1575,13 @@ export function reducer(state: AppState, action: Action): AppState {
       const failedState = parsed.status === "failed";
       // Capture the task id of the experiment that just completed so
       // ``/recover latest`` and ``/review`` (no arg) can reach it
-      // without re-querying listTasks. Only update when non-empty.
-      const resolvedTaskId = action.taskId || parsed.taskId || "";
+      // without re-querying listTasks. The SSE frame's outer task_id is
+      // often the conversation turn id (``turn-*``); the operational
+      // inject id that recover needs lives inside the result envelope's
+      // ``data.task_id``. Prefer the parsed payload id, and do not let a
+      // recover result overwrite the latest injectable task id.
+      const resolvedTaskId =
+        parsed.operation === "recover" ? "" : parsed.taskId || action.taskId || "";
       return {
         ...s,
         // pending → history first, then result. Order matters: the

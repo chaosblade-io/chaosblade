@@ -433,11 +433,17 @@ export const zh: Dict = {
   "result.status.partial": "部分恢复",
   "result.status.failed": "故障注入失败",
   "result.status.unknown": "结果",
+  "result.status.success.recover": "故障恢复成功",
+  "result.status.failed.recover": "故障恢复失败",
   "result.show_for_timeline": "/replay {id} instant 查看完整时间线",
 
   // -- Postmortem (T6) ---------------------------------------------
   "postmortem.title": "事后分析",
   "postmortem.saved_at": "完整 markdown: {path}",
+
+  // -- PlanPreviewSection（注入计划 / 替代方案）--------------------------
+  "plan_preview.title": "注入计划预览",
+  "plan_preview.alternatives_title": "替代方案",
 
   // -- ConfirmMessage chrome ----------------------------------------
   "confirm.title": "确认意图",
@@ -539,6 +545,7 @@ export const zh: Dict = {
   "confirm.attempt.label": "第 {n} 次尝试",
   "confirm.clarification.label": "已澄清 {n} 轮",
   "confirm.plan_saved": "已保存（{path}）· /show plan 查看",
+  "confirm.field.conflicts": "冲突实验",
   "confirm.conflicts.hint": "/show experiments 查看详情",
   // 故障参数 / 目标健康两个 section 即使"没异常"也要常驻——
   // section 标题本身代表"我们查过了"，留个空值比直接隐藏更诚实

@@ -304,27 +304,66 @@ export class BladeClient {
   }
 
   /**
-   * POST /api/v1/recover — trigger fault recovery for an injected
-   * task. The endpoint is request/response (not SSE) — the server
-   * runs the recover graph synchronously and returns the final
-   * envelope, so this can take tens of seconds for a real cluster.
-   *
-   * The handler ``/recover <id>`` shows a "running…" line and waits;
-   * the user can Esc-cancel via the same channel they cancel turns.
+   * POST /api/v1/recover-stream — SSE streaming recovery.
+   * Streams real-time events (token, tool_start, tool_end, result, etc.)
+   * while the recover graph runs. Wire format identical to streamTurn.
    */
-  async recoverTask(taskId: string): Promise<Record<string, unknown>> {
-    const r = await fetch(`${this.baseUrl}/api/v1/recover`, {
+  async *streamRecover(
+    taskId: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<StreamEvent, void, void> {
+    const r = await fetch(`${this.baseUrl}/api/v1/recover-stream`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+        accept: "text/event-stream",
+        connection: "close",
+      },
       body: JSON.stringify({ task_id: taskId }),
+      signal,
     });
-    if (!r.ok) throw new Error(`recoverTask failed: HTTP ${r.status}`);
-    const env = (await r.json()) as Record<string, unknown>;
-    // Recover returns a fail envelope on verification failure with
-    // ``data`` populated — we still want callers to see the data so
-    // they can render the failure reason. Hand the full envelope back
-    // and let the handler decide how to format.
-    return env;
+    if (!r.ok || !r.body) {
+      throw new Error(`streamRecover failed: HTTP ${r.status}`);
+    }
+
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) return;
+        buf += decoder.decode(value, { stream: true });
+
+        let sep: number;
+        while (true) {
+          const lf = buf.indexOf("\n\n");
+          const crlf = buf.indexOf("\r\n\r\n");
+          if (lf < 0 && crlf < 0) break;
+          if (lf < 0) sep = crlf;
+          else if (crlf < 0) sep = lf;
+          else sep = Math.min(lf, crlf);
+
+          const frameLen = sep;
+          const skip = buf.startsWith("\r\n", sep) ? 4 : 2;
+          const frame = buf.slice(0, frameLen);
+          buf = buf.slice(frameLen + skip);
+
+          const evt = parseFrame(frame, this.opts.onProtocolError);
+          if (evt) {
+            yield evt;
+            if (evt.type === "done") return;
+          }
+        }
+      }
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // ignore
+      }
+    }
   }
 
   /**

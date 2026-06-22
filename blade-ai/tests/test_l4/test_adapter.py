@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from chaos_agent.l4 import adapter as _adapter_mod
 from chaos_agent.l4.schemas import L4TaskResult, L4TestTask
 
@@ -13,23 +15,32 @@ _build_recover = _adapter_mod.build_recover_initial_state
 _make_traj_id = _adapter_mod.make_trajectory_id
 
 
+def _valid_payload(**overrides):
+    payload = {
+        "fault_intent": {
+            "scope": "pod",
+            "target": "cpu",
+            "action": "fullload",
+            "namespace": "cms-demo",
+            "names": ["app=myapp"],
+            "labels": {"app": "myapp"},
+            "params": {"cpu-percent": "80"},
+            "duration": 300,
+        },
+        "kubeconfig": "/home/user/.kube/config",
+    }
+    payload.update(overrides)
+    return payload
+
+
 class TestTestTaskToInitialState:
     """Test inbound conversion: L4TestTask → inject graph initial_state."""
 
-    def test_basic_conversion(self):
+    def test_fault_intent_conversion(self):
         task = L4TestTask(
             task_id="t-001",
             intent="inject pod cpu fault",
-            payload={
-                "fault_scope": "pod",
-                "fault_target": "cpu",
-                "fault_action": "fullload",
-                "namespace": "cms-demo",
-                "target_names": ["app=myapp"],
-                "params": {"cpu-percent": "80"},
-                "duration": 300,
-                "kubeconfig": "/home/user/.kube/config",
-            },
+            payload=_valid_payload(),
         )
         state = _to_initial_state(task)
 
@@ -45,42 +56,60 @@ class TestTestTaskToInitialState:
         assert fs["blade_target"] == "cpu"
         assert fs["blade_action"] == "fullload"
         assert fs["names"] == ["app=myapp"]
+        assert fs["labels"] == {"app": "myapp"}
         assert fs["params"] == {"cpu-percent": "80"}
         assert fs["duration_seconds"] == 300
         assert fs["source"] == "l4_sdk"
         assert fs["user_description"] == "inject pod cpu fault"
 
-    def test_none_payload_safety(self):
-        """payload=None should not crash."""
-        task = L4TestTask(task_id="t-002", intent="test", payload=None)
-        state = _to_initial_state(task)
-        assert state["fault_spec"]["namespace"] == "default"
-        assert state["direct"] is False
+    def test_flat_payload_without_fault_intent_fails_closed(self):
+        """Flat fields (fault_scope etc) are no longer accepted — must use fault_intent."""
+        task = L4TestTask(
+            task_id="t-002",
+            intent="inject pod cpu fault",
+            payload={
+                "fault_scope": "pod",
+                "fault_target": "cpu",
+                "fault_action": "fullload",
+                "namespace": "cms-demo",
+                "target_names": ["app=myapp"],
+            },
+        )
+        with pytest.raises(ValueError, match="fault_intent"):
+            _to_initial_state(task)
 
-    def test_empty_payload_defaults(self):
-        task = L4TestTask(task_id="t-003", intent="test")
-        state = _to_initial_state(task)
-        assert state["fault_spec"]["scope"] == "pod"
-        assert state["fault_spec"]["blade_target"] == "cpu"
-        assert state["fault_spec"]["blade_action"] == "fullload"
-        assert state["fault_spec"]["duration_seconds"] == 600
+    def test_none_payload_fails_closed(self):
+        task = L4TestTask(task_id="t-003", intent="test", payload=None)
+        with pytest.raises(ValueError, match="fault_intent"):
+            _to_initial_state(task)
+
+    def test_empty_payload_fails_closed(self):
+        task = L4TestTask(task_id="t-004", intent="test")
+        with pytest.raises(ValueError, match="fault_intent"):
+            _to_initial_state(task)
+
+    def test_missing_required_field_fails_closed(self):
+        payload = _valid_payload(fault_intent={"scope": "pod", "target": "cpu"})
+        task = L4TestTask(task_id="t-005", intent="test", payload=payload)
+        with pytest.raises(ValueError, match="missing required field"):
+            _to_initial_state(task)
 
     def test_direct_false_override(self):
         task = L4TestTask(
-            task_id="t-004",
+            task_id="t-006",
             intent="test",
-            payload={"direct": False},
+            payload=_valid_payload(direct=False),
         )
         state = _to_initial_state(task)
         assert state["direct"] is False
 
     def test_messages_empty(self):
-        task = L4TestTask(task_id="t-005", intent="test")
+        task = L4TestTask(task_id="t-007", intent="test", payload=_valid_payload())
         state = _to_initial_state(task)
         assert state["messages"] == []
 
     def test_safety_status_pending(self):
-        task = L4TestTask(task_id="t-006", intent="test")
+        task = L4TestTask(task_id="t-008", intent="test", payload=_valid_payload())
         state = _to_initial_state(task)
         assert state["safety_status"] == "pending"
 

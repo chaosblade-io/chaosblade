@@ -282,10 +282,8 @@ class TestPhaseToolSurface:
     def test_phase2_prompt_omits_disallowed_tools(self):
         """Phase 2 system prompt must not actively promote tools that aren't bound.
 
-        Negation copy ("blade_destroy is NOT bound in this phase ...") is
-        intentional — it tells the LLM why a tool it might recall from
-        training is unavailable. We only forbid PROMOTION patterns
-        ("Use blade_destroy ...").
+        The prompt uses a general tool constraint ("Only call tools that are
+        bound to you"). We only forbid PROMOTION patterns ("Use blade_destroy ...").
         """
         from chaos_agent.agent.prompts import build_execute_system_prompt
 

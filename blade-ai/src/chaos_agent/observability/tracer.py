@@ -175,6 +175,14 @@ class TracingCallback(BaseCallbackHandler):
         prompt, completion = _extract_token_usage(response)
         self.trace.total_token_input += prompt
         self.trace.total_token_output += completion
+        if not prompt and not completion:
+            logger.warning(
+                "TracingCallback.on_llm_end: extracted (0, 0) tokens. "
+                "response type=%s, has_generations=%s, has_llm_output=%s",
+                type(response).__name__,
+                bool(getattr(response, "generations", None)),
+                bool(getattr(response, "llm_output", None)),
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -272,6 +272,79 @@ describe("reducer / locator allocation", () => {
     expect(s.lastTaskId).toBe("task-A");
   });
 
+  it("RESULT_RECEIVED prefers payload task_id over outer turn id for /recover latest", () => {
+    // /turn result frames are keyed by the conversation turn id, while
+    // the inject pipeline id recover needs is in content.data.task_id.
+    const s = fold([
+      { type: "TURN_STARTED", input: "inject CPU" },
+      {
+        type: "RESULT_RECEIVED",
+        content: JSON.stringify({
+          status: "success",
+          data: { task_id: "task-inject", task_state: "injected" },
+        }),
+        taskId: "turn-abc123",
+      },
+    ]);
+    expect(s.lastTaskId).toBe("task-inject");
+  });
+
+  it("RESULT_RECEIVED preserves recover operation and partial status", () => {
+    const s = fold([
+      { type: "TURN_STARTED", input: "/recover task-A" },
+      {
+        type: "RESULT_RECEIVED",
+        content: JSON.stringify({
+          status: "success",
+          data: {
+            task_id: "task-R",
+            operation: "recover",
+            task_state: "partial_recovered",
+            fault_type: "pod-network-loss",
+            blade_uid: "uid-1",
+          },
+        }),
+        taskId: "task-R",
+      },
+    ]);
+    const result = s.history.find((item) => item.kind === "result");
+    expect(result).toBeDefined();
+    if (result && result.kind === "result") {
+      expect(result.taskId).toBe("task-R");
+      expect(result.operation).toBe("recover");
+      expect(result.status).toBe("partial");
+    }
+  });
+
+  it("recover results do not overwrite latest injectable task id", () => {
+    const s = fold([
+      { type: "TURN_STARTED", input: "inject CPU" },
+      {
+        type: "RESULT_RECEIVED",
+        content: JSON.stringify({
+          status: "success",
+          data: { task_id: "task-inject", task_state: "injected" },
+        }),
+        taskId: "turn-inject",
+      },
+      { type: "TURN_DONE" },
+      { type: "TURN_STARTED", input: "/recover task-inject" },
+      {
+        type: "RESULT_RECEIVED",
+        content: JSON.stringify({
+          status: "success",
+          data: {
+            task_id: "task-recover",
+            operation: "recover",
+            task_state: "recovered",
+          },
+        }),
+        taskId: "task-recover",
+      },
+    ]);
+    expect(s.lastTaskId).toBe("task-inject");
+  });
+
   it("lastTaskId follows the MOST recent task, not the first", () => {
     const s = fold([
       { type: "TURN_STARTED", input: "first" },

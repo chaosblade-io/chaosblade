@@ -14,7 +14,7 @@ KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
 
 def _get_allowed_files() -> set[str]:
     """Get allowed filenames from the auto-discovered registry (not hardcoded)."""
-    from chaos_agent.agent.prompts.knowledge_registry import get_knowledge_registry
+    from chaos_agent.utils.knowledge_registry import get_knowledge_registry
     return {entry["filename"] for entry in get_knowledge_registry()}
 
 

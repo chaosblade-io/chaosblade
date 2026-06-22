@@ -3,6 +3,8 @@
 import json
 from unittest.mock import AsyncMock, patch
 
+from langchain_core.messages import AIMessage
+
 import pytest
 
 from chaos_agent.agent.nodes.agent_loop import agent_loop
@@ -28,6 +30,7 @@ class TestInjectGraphFlow:
     async def test_successful_inject_flow(self, sample_agent_state, tmp_memory_dir, monkeypatch):
         """Test a successful inject flow through all nodes."""
         monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
         monkeypatch.setattr(settings, "working_dir", tmp_memory_dir.parent)
         monkeypatch.setattr(settings, "max_agent_loop", 10)
         monkeypatch.setattr(settings, "max_execute_loop", 15)
@@ -82,6 +85,7 @@ class TestInjectGraphFlow:
 
         # Simulate blade returning a UID
         state["blade_uid"] = "exp-abc123"
+        state["messages"] = [AIMessage(content="Injection complete")]
 
         # Step 8: Route after execute_loop → verifier
         route = should_continue_execute_loop(state)

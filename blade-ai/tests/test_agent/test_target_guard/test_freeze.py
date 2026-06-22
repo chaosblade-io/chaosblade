@@ -12,7 +12,9 @@ from chaos_agent.agent.target_guard import (
     ApprovedTarget,
     approved_from_dict,
     freeze_approved_target,
+    freeze_approved_target_from_spec,
 )
+from chaos_agent.agent.fault_spec import FaultSpec
 
 
 class TestFreezeApprovedTarget:
@@ -34,7 +36,7 @@ class TestFreezeApprovedTarget:
             "blade_target": "cpu", "blade_action": "fullload",
             "lock_fault_type": True,
             "owner_names": [],
-            "secondary_scopes": ["pvc", "persistentvolumeclaim", "configmap", "secret", "pod", "node"],
+            "secondary_scopes": ["pvc", "persistentvolumeclaim", "pv", "persistentvolume", "configmap", "secret", "pod", "node"],
             "secondary_namespace": "prod",
         }
 
@@ -142,6 +144,60 @@ class TestFreezeApprovedTarget:
             lock_fault_type=False,
         )
         assert d["lock_fault_type"] is False
+
+
+class TestFreezeApprovedTargetFromSpec:
+    def test_matches_legacy_constructor_for_fault_spec(self):
+        spec = FaultSpec(
+            namespace="prod",
+            scope="pod",
+            names=("pod-a",),
+            labels={"app": "demo"},
+            blade_target="network",
+            blade_action="loss",
+            params={"percent": "100"},
+        )
+
+        direct = freeze_approved_target_from_spec(
+            spec,
+            owner_names=("deploy-a",),
+        )
+        legacy = freeze_approved_target(
+            target={
+                "namespace": "prod",
+                "names": ["pod-a"],
+                "labels": {"app": "demo"},
+                "resource_type": "pod",
+            },
+            params={"percent": "100"},
+            blade_scope="pod",
+            blade_target="network",
+            blade_action="loss",
+            owner_names=("deploy-a",),
+        )
+
+        assert direct == legacy
+
+    def test_accepts_fault_spec_dict(self):
+        spec = FaultSpec(
+            namespace="prod",
+            scope="pod",
+            names=("pod-a",),
+            blade_target="cpu",
+            blade_action="fullload",
+        )
+
+        d = freeze_approved_target_from_spec(spec.to_dict())
+
+        assert d is not None
+        assert d["scope"] == "pod"
+        assert d["namespace"] == "prod"
+        assert d["names"] == ["pod-a"]
+        assert d["blade_target"] == "cpu"
+
+    def test_none_or_malformed_spec_returns_none(self):
+        assert freeze_approved_target_from_spec(None) is None
+        assert freeze_approved_target_from_spec({"scope": []}) is None
 
 
 class TestApprovedFromDict:

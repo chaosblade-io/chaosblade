@@ -138,12 +138,14 @@ export function parseResultEnvelope(
   // Failure cause / hint — prefer structured failure_detail over legacy failure_reason.
   let cause: string | undefined;
   let hint: string | undefined;
+  let alternatives: string | undefined;
   const failureDetail = data["failure_detail"] as Record<string, unknown> | undefined;
   if (failureDetail && typeof failureDetail === "object" && failureDetail["category"]) {
     const category = asString(failureDetail["category"]);
     const context = asString(failureDetail["context"]);
     cause = context ? `${category}: ${context}` : category;
     hint = asString(failureDetail["llm_analysis"]) || undefined;
+    alternatives = asString(failureDetail["alternatives"]) || undefined;
   } else {
     // Legacy fallback: failure_reason shaped "<base> | llm_analysis: <hint>"
     const failureReason = asString(data["failure_reason"]);
@@ -188,15 +190,23 @@ export function parseResultEnvelope(
     }
   }
 
+  // Operation type — "inject" or "recover". Default to undefined (caller
+  // treats absence as "inject" for backward-compat with older servers).
+  const operationRaw = asString(data["operation"]);
+  const operation: ResultItem["operation"] =
+    operationRaw === "recover" ? "recover" : operationRaw === "inject" ? "inject" : undefined;
+
   return {
     taskId,
     status,
+    operation,
     faultType,
     bladeUid,
     duration,
     summary,
     cause,
     hint,
+    alternatives,
     target,
     replanCount: replanCount > 0 ? replanCount : undefined,
     sideEffects: sideEffectList.length > 0 ? sideEffectList : undefined,

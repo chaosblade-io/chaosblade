@@ -1,8 +1,10 @@
-"""Shared kubeconfig injection utility for execute_loop.
+"""Shared kubeconfig/kubewiz injection utility for execute_loop.
 
 Provides:
 - _resolve_kubeconfig: Multi-level fallback kubeconfig resolution from AgentState
 - inject_kubeconfig_into_tool_calls: Programmatic kubeconfig injection into LLM tool calls
+- _resolve_kubewiz_cluster_uuid / _resolve_kubewiz_profile: kubewiz param resolution
+- sync_kubewiz_runtime: Sync per-session kubewiz params into settings for tool dispatch
 """
 
 import logging
@@ -54,11 +56,26 @@ def inject_kubeconfig_into_tool_calls(
         response: The LLM's AIMessage response containing tool_calls.
         kubeconfig: The kubeconfig path to inject.
     """
-    if not kubeconfig:
-        return
-
     tool_calls = getattr(response, "tool_calls", None) or []
     if not tool_calls:
+        return
+
+    # kubewiz mode: connection info comes from settings, not kubeconfig param.
+    # Clear any kubeconfig the LLM might have passed to avoid conflicts.
+    if settings.kube_connection_mode == "kubewiz":
+        for tc in tool_calls:
+            args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+            if args.get("kubeconfig"):
+                if isinstance(tc, dict):
+                    tc["args"]["kubeconfig"] = ""
+                else:
+                    try:
+                        tc.args["kubeconfig"] = ""  # type: ignore[index]
+                    except (TypeError, AttributeError):
+                        pass
+        return
+
+    if not kubeconfig:
         return
 
     injected_count = 0
@@ -103,3 +120,36 @@ def inject_kubeconfig_into_tool_calls(
             f"inject_kubeconfig_into_tool_calls: injected kubeconfig "
             f"into {injected_count} tool call(s)"
         )
+
+
+def _resolve_kubewiz_cluster_uuid(state: AgentState) -> str:
+    """Resolve kubewiz cluster UUID: state > settings."""
+    uuid = state.get("kubewiz_cluster_uuid", "")
+    if uuid:
+        return uuid
+    return settings.kubewiz_cluster_uuid
+
+
+def _resolve_kubewiz_profile(state: AgentState) -> str:
+    """Resolve kubewiz profile: state > settings."""
+    profile = state.get("kubewiz_profile", "")
+    if profile:
+        return profile
+    return settings.kubewiz_profile
+
+
+def sync_kubewiz_runtime(state: AgentState) -> None:
+    """Sync per-session kubewiz params from state into settings.
+
+    Called by graph nodes before tool dispatch so that
+    build_kubectl_cmd / _build_kubeconfig_arg (which read settings)
+    pick up per-session overrides.
+    """
+    if settings.kube_connection_mode != "kubewiz":
+        return
+    uuid = _resolve_kubewiz_cluster_uuid(state)
+    if uuid:
+        settings.kubewiz_cluster_uuid = uuid
+    profile = _resolve_kubewiz_profile(state)
+    if profile:
+        settings.kubewiz_profile = profile

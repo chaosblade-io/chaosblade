@@ -658,8 +658,13 @@ class TestMakeRecoverVerifierNonChaosBlade:
         assert fin["recover_verification"]["level"] == "recovered"
 
     @pytest.mark.asyncio
-    async def test_non_chaosblade_layer1_failed_skips_layer2(self):
-        """Non-ChaosBlade: Layer 1 fails → skip Layer 2."""
+    async def test_non_chaosblade_layer1_failed_continues_to_layer2(self):
+        """Non-ChaosBlade: Layer 1 fails → continues to Layer 2 verification.
+
+        Layer 1 failure (e.g. kubectl patch 422) should NOT skip Layer 2,
+        because the fault may have self-recovered (e.g. Operator restored the Pod).
+        The result should transition to layer2_verification phase.
+        """
         mock_l1_response = MagicMock()
         mock_l1_response.content = (
             "RECOVERY_EXECUTION_RESULT:\n"
@@ -689,8 +694,13 @@ class TestMakeRecoverVerifierNonChaosBlade:
             "inject_context": "Injected finalizers on pod test-pod",
         }
         result = await node(state)
-        assert result["result"]["recovered"] is False
-        assert result["recover_verification"]["level"] == "unrecovered"
+        # Should NOT produce a final result — transitions to Layer 2 instead
+        assert "result" not in result, "Layer 1 failure should not produce final result for non-ChaosBlade"
+        assert result["recover_phase"] == "layer2_verification"
+        assert result["recover_layer1_type"] == "llm_driven"
+        # Layer 1 cache should reflect the failure
+        cache = result.get("recover_layer1_cache", {})
+        assert cache.get("status") == "failed"
 
     @pytest.mark.asyncio
     async def test_non_chaosblade_no_inject_context_skips_layer1(self):
@@ -989,24 +999,55 @@ class TestWasBladeCreateAttemptedRecover:
 
 class TestRunRecoverLayer1KubectlRouting:
     @pytest.mark.asyncio
-    async def test_blade_destroy_failed_stays_failed(self):
-        """When blade_destroy fails (regardless of kubectl injection),
-        Layer 1 stays 'failed' — kubectl exec routing happens before _run_recover_layer1."""
+    async def test_blade_destroy_failed_but_experiment_gone_passes(self):
+        """When blade_destroy fails but experiment CRD is already gone (not found),
+        Layer 1 passes — the experiment was auto-recovered (timeout expiry)."""
         from chaos_agent.agent.nodes.recover_verifier import _run_recover_layer1
 
         destroy_output = json.dumps({
             "code": 500, "success": False,
             "error": "record not found, if it's k8s experiment, please add --target k8s flag to retry"
         })
+        status_output = json.dumps({
+            "code": 63061, "success": False,
+            "error": "Error from server (NotFound): chaosblades.chaosblade.io \"uid-k8s-abc\" not found"
+        })
 
         with patch("chaos_agent.tools.blade.blade_destroy") as mock_destroy:
             mock_destroy.ainvoke = AsyncMock(return_value=destroy_output)
+            with patch("chaos_agent.tools.blade.blade_status") as mock_status:
+                mock_status.ainvoke = AsyncMock(return_value=status_output)
 
-            result = await _run_recover_layer1(
-                "uid-k8s-abc", "/path/to/kubeconfig", messages=[]
-            )
-            assert result.status == "failed"
-            assert result.is_terminal()
+                result = await _run_recover_layer1(
+                    "uid-k8s-abc", "/path/to/kubeconfig", messages=[]
+                )
+                assert result.status == "passed"
+
+    @pytest.mark.asyncio
+    async def test_blade_destroy_failed_experiment_still_running(self):
+        """When blade_destroy fails and experiment is still Running,
+        Layer 1 stays 'failed'."""
+        from chaos_agent.agent.nodes.recover_verifier import _run_recover_layer1
+
+        destroy_output = json.dumps({
+            "code": 500, "success": False,
+            "error": "kubewiz guard blocked kubectl delete chaosblade"
+        })
+        status_output = json.dumps({
+            "code": 200, "success": True,
+            "result": {"uid": "uid-k8s-abc", "status": "Running"}
+        })
+
+        with patch("chaos_agent.tools.blade.blade_destroy") as mock_destroy:
+            mock_destroy.ainvoke = AsyncMock(return_value=destroy_output)
+            with patch("chaos_agent.tools.blade.blade_status") as mock_status:
+                mock_status.ainvoke = AsyncMock(return_value=status_output)
+
+                result = await _run_recover_layer1(
+                    "uid-k8s-abc", "/path/to/kubeconfig", messages=[]
+                )
+                assert result.status == "failed"
+                assert result.is_terminal()
 
     @pytest.mark.asyncio
     async def test_blade_destroy_succeeds_normally(self):
@@ -1054,11 +1095,11 @@ class TestBuildRecoverVerifierPromptSignature:
         assert "recovery execution" in prompt
 
     def test_prompt_contains_format_constraint(self):
-        """Layer 2 prompt must warn against using RECOVERY_EXECUTION_RESULT format."""
+        """Recover verifier prompt must use submit_recover_verification, not RECOVERY_EXECUTION_RESULT."""
         prompt = _build_recover_verifier_prompt(is_chaosblade=False)
-        assert "RECOVERY_EXECUTION_RESULT" in prompt
+        assert "submit_recover_verification" in prompt
         assert "RECOVERY_VERIFICATION_RESULT" in prompt
-        assert "VERIFICATION phase" in prompt
+        assert "successfully recovered" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -2348,25 +2389,25 @@ class TestBuildRecoverVerifierSystemPrompt:
     """Tests for P0-1: U-shaped prompt composition from sections/recovery.py."""
 
     def test_u_shape_primacy_zone(self):
-        """Critical rules appear at the BEGINNING of the prompt (primacy effect)."""
+        """Core Principles appear at the BEGINNING of the prompt (primacy effect)."""
         prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
-        # CRITICAL RULES must appear before the middle-zone sections
+        # Core Principles must appear before the middle-zone sections
         # (knowledge summary, tools, skill priority, kubeconfig)
-        rules_pos = prompt.index("CRITICAL RULES")
+        rules_pos = prompt.index("Core Principles")
         knowledge_pos = prompt.index("Domain Knowledge")
         assert rules_pos < knowledge_pos
-        assert "Execute kubectl" in prompt[:500]
+        assert "Evidence MUST come from" in prompt[:600]
 
     def test_u_shape_recency_zone(self):
-        """Critical rules reminder appears at the END of the prompt (recency effect)."""
+        """REMEMBER section appears at the END of the prompt (recency effect)."""
         prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
-        # REMINDER section must appear AFTER all middle-zone sections
-        reminder_pos = prompt.index("REMINDER")
+        # REMEMBER section must appear AFTER all middle-zone sections
+        remember_pos = prompt.index("REMEMBER")
         output_format_pos = prompt.index("RECOVERY_VERIFICATION_RESULT")
-        assert reminder_pos > output_format_pos
-        # Tail of prompt must contain the 3-rule recap
-        assert "Critical Rules Recap" in prompt[-500:]
-        assert "CURRENT (post-recovery)" in prompt[-300:]
+        assert remember_pos > output_format_pos
+        # Tail of prompt must contain the REMEMBER recap
+        assert "REMEMBER" in prompt[-500:]
+        assert "stale data is NOT evidence" in prompt[-400:]
 
     def test_chaosblade_label(self):
         """is_chaosblade=True → Layer1 label is 'blade_destroy'."""
@@ -2379,16 +2420,15 @@ class TestBuildRecoverVerifierSystemPrompt:
         assert "recovery execution" in prompt
 
     def test_all_sections_present(self):
-        """All 8 section functions are composed in the prompt."""
+        """All section functions are composed in the prompt."""
         prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
-        assert "VERIFICATION phase" in prompt
-        assert "CRITICAL RULES" in prompt
+        assert "successfully recovered" in prompt
+        assert "Core Principles" in prompt
         assert "Domain Knowledge" in prompt or "Knowledge" in prompt
         assert "kubectl" in prompt
         assert "Skill Use-Case Priority" in prompt
-        assert "Kubeconfig Requirement" in prompt
         assert "RECOVERY_VERIFICATION_RESULT" in prompt
-        assert "REMINDER" in prompt
+        assert "REMEMBER" in prompt
 
     def test_baseline_integrity_compact(self):
         """Compact baseline integrity rules (4 rules + 1 example) are present."""
@@ -2403,3 +2443,16 @@ class TestBuildRecoverVerifierSystemPrompt:
         # The compact version has 4 concise rules; the full version has verbose
         # "FORMAT REQUIREMENT" text — ensure compact doesn't include it
         assert "FORMAT REQUIREMENT" not in prompt
+
+    def test_three_level_degradation_in_principles(self):
+        """Core Principles mention healthy-state comparison as middle degradation level."""
+        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        assert "healthy state" in prompt.lower() or "healthy-state" in prompt.lower()
+        assert "cross-validate" in prompt.lower() or "cross-validation" in prompt.lower()
+
+    def test_output_format_has_status_definitions(self):
+        """Output Format defines Overall and per-step status values."""
+        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        assert "recovered" in prompt
+        assert "unrecovered" in prompt
+        assert "partial" in prompt

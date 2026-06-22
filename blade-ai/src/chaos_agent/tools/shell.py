@@ -5,7 +5,6 @@ import logging
 import time
 from typing import Optional
 
-from chaos_agent.agent.node_names import EXECUTE_LOOP
 from chaos_agent.config.settings import settings
 from chaos_agent.errors import ToolGuardError, ToolTimeoutError
 from chaos_agent.memory.session_store import get_global_session_store
@@ -64,7 +63,7 @@ def _persist_to_session(
                 "type": "tool_execution",
                 "content": f"[shell] {cmd_str}",
                 "detail": detail,
-                "node": EXECUTE_LOOP,
+                "node": "execute_loop",
             })
     except Exception:
         logger.debug("SessionStore write failed for task %s", task_id)

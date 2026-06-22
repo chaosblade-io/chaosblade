@@ -2,7 +2,7 @@
 
 These guard the contract that:
 
-* the ``brief`` / ``level`` / ``include_method_switching`` parameters return
+* the ``level`` / ``include_method_switching`` parameters return
   a strictly slimmer variant while preserving the frozen tokens that other
   tests in ``test_prompts.py`` rely on, and
 * the default-argument call still produces the original full output (already
@@ -10,31 +10,11 @@ These guard the contract that:
 """
 
 from chaos_agent.agent.prompts.sections.execution import get_guidelines_section
-from chaos_agent.agent.prompts.sections.identity import get_role_section
 from chaos_agent.agent.prompts.sections.safety import get_safety_section
 from chaos_agent.agent.prompts.sections.workflow import (
     get_verification_strategy_section,
     get_workflow_section,
 )
-
-
-class TestRoleSectionBrief:
-    def test_brief_keeps_critical_tokens(self):
-        s = get_role_section(brief=True)
-        assert "Safety Rules" in s
-        assert "Chaos Engineering Agent" in s
-
-    def test_brief_is_shorter_than_full(self):
-        assert len(get_role_section(brief=True)) < len(get_role_section())
-
-    def test_brief_under_12_lines(self):
-        # Plan target: ≤ 12 lines including blank lines.
-        assert len(get_role_section(brief=True).splitlines()) <= 12
-
-    def test_default_unchanged_full_output(self):
-        s = get_role_section()
-        assert "What You Can Do" in s
-        assert "What You Cannot Do" in s
 
 
 class TestSafetySectionLevel:
@@ -118,13 +98,25 @@ class TestGuidelinesSectionMethodSwitching:
         s = get_guidelines_section(include_method_switching=False)
         assert "Conflict Check" not in s
 
-    def test_omit_keeps_blade_uid_token(self):
-        # test_prompts::test_guidelines_section_contains_blade_uid asserts this.
+    def test_omit_keeps_follow_instructions_token(self):
         s = get_guidelines_section(include_method_switching=False)
-        assert "blade UID" in s
         assert "improvise" in s
 
+    def test_phase1_omits_runtime_feedback(self):
+        # Phase 1: Ground Truth in Workflow covers this principle.
+        s = get_guidelines_section(include_method_switching=False, phase=1)
+        assert "Runtime Feedback Priority" not in s
+
+    def test_phase2_keeps_runtime_feedback(self):
+        s = get_guidelines_section(include_method_switching=False, phase=2)
+        assert "Runtime Feedback Priority" in s
+
+    def test_phase1_is_shorter_than_phase2(self):
+        assert len(get_guidelines_section(include_method_switching=False, phase=1)) < len(
+            get_guidelines_section(include_method_switching=False, phase=2)
+        )
+
     def test_omit_is_shorter_than_default(self):
-        assert len(get_guidelines_section(include_method_switching=False)) < len(
+        assert len(get_guidelines_section(include_method_switching=False, phase=2)) < len(
             get_guidelines_section()
         )

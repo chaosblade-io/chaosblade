@@ -9,6 +9,8 @@ Borrowed from Claude Code's CLAUDE.md and OpenClaw's context file budgeting.
 import warnings
 from pathlib import Path
 
+from chaos_agent.agent.fault_spec import fault_type_from_state
+from chaos_agent.agent.operation_outcome import read_inject_verification, read_operation_outcome
 from chaos_agent.agent.prompts.constants import MAX_AGENT_MD_BYTES
 
 AGENT_MD_PATH = Path.home() / ".blade-ai" / "AGENT.md"
@@ -96,9 +98,9 @@ def append_experience(task_summary: str, state: dict) -> dict:
     - Experiences that duplicate existing rules
     """
     # 1. 从 state 中提取关键信息
-    skill_name = state.get("skill_name", "")
-    verification = state.get("verification", {})
-    errors = state.get("error", "")
+    fault_type = fault_type_from_state(state)
+    verification = read_inject_verification(state) or {}
+    errors = read_operation_outcome(state).error
     l2_status = verification.get("layer2", {}).get("status", "") if isinstance(verification, dict) else ""
 
     # 2. 判断是否有值得记录的经验
@@ -117,7 +119,7 @@ def append_experience(task_summary: str, state: dict) -> dict:
     # Determine the category based on what happened
     if has_failure and "safety" in str(errors).lower():
         category = "Safety Rules"
-    elif has_failure and skill_name:
+    elif has_failure and fault_type:
         category = "Fault Injection"
     elif has_verification_issue:
         category = "Verification"
@@ -125,7 +127,7 @@ def append_experience(task_summary: str, state: dict) -> dict:
         category = "K8s Cluster"
 
     # Build the experience entry
-    rule_text = task_summary[:200] if task_summary else f"Issue with {skill_name}"
+    rule_text = task_summary[:200] if task_summary else f"Issue with {fault_type}"
     why_text = str(errors)[:300] if errors else f"Verification {l2_status}"
     how_text = "Apply caution when encountering similar scenarios."
 

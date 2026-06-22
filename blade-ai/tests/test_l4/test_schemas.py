@@ -36,9 +36,9 @@ class TestL4TestTask:
         task = L4TestTask(
             task_id="t-002",
             intent="inject",
-            payload={"fault_scope": "pod", "namespace": "cms"},
+            payload={"fault_intent": {"scope": "pod", "namespace": "cms"}},
         )
-        assert task.payload["fault_scope"] == "pod"
+        assert task.payload["fault_intent"]["scope"] == "pod"
 
 
 class TestL4AgentError:
@@ -127,19 +127,27 @@ class TestFaultPayloadSchema:
     def test_is_object_type(self):
         assert FAULT_PAYLOAD_SCHEMA["type"] == "object"
 
-    def test_required_fields(self):
-        required = FAULT_PAYLOAD_SCHEMA["required"]
-        assert "fault_scope" in required
-        assert "fault_target" in required
-        assert "fault_action" in required
-        assert "namespace" in required
+    def test_requires_fault_intent(self):
+        assert FAULT_PAYLOAD_SCHEMA["required"] == ["fault_intent"]
+
+    def test_no_legacy_flat_fields(self):
+        props = FAULT_PAYLOAD_SCHEMA["properties"]
+        assert "fault_scope" not in props
+        assert "fault_target" not in props
+        assert "fault_action" not in props
 
     def test_properties_present(self):
         props = FAULT_PAYLOAD_SCHEMA["properties"]
-        assert "target_names" in props
-        assert "target_labels" in props
-        assert "params" in props
-        assert "duration" in props
+        assert "fault_intent" in props
         assert "kubeconfig" in props
         assert "direct" in props
         assert "auto_recover" in props
+
+    def test_fault_intent_schema_required_fields(self):
+        intent_schema = FAULT_PAYLOAD_SCHEMA["properties"]["fault_intent"]
+        assert set(intent_schema["required"]) == {
+            "scope",
+            "target",
+            "action",
+            "namespace",
+        }

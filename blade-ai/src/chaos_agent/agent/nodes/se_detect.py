@@ -4,6 +4,10 @@ import asyncio
 import logging
 
 from chaos_agent.agent.fault_spec import read_fault_spec
+from chaos_agent.agent.operation_outcome import (
+    read_inject_verification,
+    write_inject_verification,
+)
 from chaos_agent.agent.nodes._side_effect_detectors import (
     DetectionContext,
     SideEffectSnapshot,
@@ -102,9 +106,9 @@ async def se_detect_node(state: AgentState) -> dict:
         {"side_effects": detected},
     )
 
-    verification = dict(state.get("verification") or {})
+    verification = read_inject_verification(state) or {}
     existing_se = dict(verification.get("side_effects") or {})
     existing_se.update(detected)
     verification["side_effects"] = existing_se
 
-    return {"verification": verification}
+    return write_inject_verification(verification=verification)

@@ -511,6 +511,14 @@ describe("Phase 2 / new command registration", () => {
     expect(reg.get("recover")?.streamSafe).not.toBe(true);
   });
 
+  it("/recover bare-root dispatches its own streaming turn", () => {
+    // The root handler calls ctx.submitRecover(), which dispatches
+    // TURN_STARTED and routes /recover-stream through the normal
+    // AgentMessage / ToolGroup / ResultCard pipeline. Composer must not
+    // synthesize a separate slash echo first.
+    expect(reg.get("recover")?.dispatchesOwnTurn).toBe(true);
+  });
+
   it("/review parses 'E1' arg through parseSlashCommand", () => {
     const r = parseSlashCommand("/review E1", reg);
     expect(r?.root).toBe("review");

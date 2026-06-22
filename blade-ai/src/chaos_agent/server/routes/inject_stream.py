@@ -9,10 +9,9 @@ from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.state import extract_ui_diagnostics, strip_side_effects
+from chaos_agent.agent.state_builders import build_inject_initial_state
 from chaos_agent.agent.streaming import SSEBatcher, StreamEvent, parse_stream_event
 from chaos_agent.config.settings import settings
-from chaos_agent.memory.session_store import build_verification_simple
 from chaos_agent.models.schemas import JSONEnvelope
 from chaos_agent.server.routes import inject_router
 from chaos_agent.server.schemas import InjectRequest
@@ -65,18 +64,16 @@ async def inject_stream(request: InjectRequest, req: Request):
     # Build initial state — FaultSpec is the single source of truth.
     spec = FaultSpec.from_http_request(request)
     target_names = list(spec.names)
-    initial_state = {
-        "task_id": task_id,
-        "tui_session_id": "",
-        "operation": "inject",
-        "fault_spec": spec.to_dict(),
-        "needs_confirmation": request.confirm,
-        "safety_status": "pending",
-        "kubeconfig": request.kubeconfig or settings.kubeconfig_path,
-        "kube_context": request.context or settings.kube_context,
-        "created_at": now_iso(),
-        "direct": request.direct,
-    }
+    initial_state = build_inject_initial_state(
+        task_id=task_id,
+        fault_spec=spec,
+        needs_confirmation=request.confirm,
+        kubeconfig=request.kubeconfig or settings.kubeconfig_path,
+        kube_context=request.context or settings.kube_context,
+        kubewiz_cluster_uuid=getattr(request, "cluster_uuid", "") or settings.kubewiz_cluster_uuid,
+        kubewiz_profile=getattr(request, "profile", "") or settings.kubewiz_profile,
+        direct=request.direct,
+    )
 
     config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
     graph = agents["pipeline"]
@@ -153,8 +150,6 @@ async def inject_stream(request: InjectRequest, req: Request):
             final_state = await graph.aget_state(config)
             if final_state and final_state.values:
                 values = final_state.values
-                skill_name = values.get("skill_name", "")
-                blade_uid = values.get("blade_uid", "")
 
                 # Non-injection intent completed via intent_clarification (TUI mode)
                 confirmed_intent = values.get("confirmed_intent")
@@ -174,48 +169,16 @@ async def inject_stream(request: InjectRequest, req: Request):
                     return
 
                 # Fault injection result
-                from chaos_agent.agent.state import infer_task_state
-                from chaos_agent.agent.fault_spec import (
-                    legacy_params_dict, legacy_target_dict,
-                )
-                safety_status = values.get("safety_status", "unknown")
-                result_target = legacy_target_dict(values)
-                blade_params = legacy_params_dict(values)
-                ns = result_target.get("namespace", "") or request.namespace or ""
-                res_type = result_target.get("resource_type", "") or request.scope or ""
-                names = result_target.get("names", []) or target_names or [request.target_name or ""]
-
-                # Infer correct task_state from full graph state
-                task_state = infer_task_state(values)
-                if task_state == "injecting":
-                    task_state = "injected" if blade_uid else "failed"
+                from chaos_agent.server.routes.turn_result import build_inject_data_from_state
+                _data = build_inject_data_from_state(values, task_id)
+                _data["plan_summary"] = values.get("plan_summary", "")
+                _data["needs_confirm"] = request.confirm
+                _data["created_at"] = now_iso()
 
                 yield StreamEvent(
                     type="result",
                     content=json.dumps(JSONEnvelope.ok(
-                        data={
-                            "task_id": task_id,
-                            "fault_type": request.fault_type or skill_name or "",
-                            "targets": [
-                                {
-                                    "target_type": res_type,
-                                    "target_name": name,
-                                    "namespace": ns,
-                                    "state": task_state,
-                                    "blade_uid": blade_uid,
-                                }
-                                for name in names
-                            ],
-                            "params": request.params,
-                            "plan_summary": values.get("plan_summary", ""),
-                            "needs_confirm": request.confirm,
-                            "verification": strip_side_effects(values.get("verification")),
-                            "created_at": now_iso(),
-                            "estimated_duration_ms": 0,
-                            # T6 — postmortem payload (None when not generated)
-                            "postmortem": values.get("postmortem"),
-                            **extract_ui_diagnostics(values),
-                        },
+                        data=_data,
                         request_id=getattr(req.state, "request_id", ""),
                     ), ensure_ascii=False),
                     task_id=task_id,
@@ -257,60 +220,22 @@ async def inject_stream(request: InjectRequest, req: Request):
             if session_store:
                 try:
                     remaining = []
-                    verification = None
-                    blade_uid = ""
-                    target = None
-                    skill_name_fin = ""
-                    error_fin = ""
-                    failure_reason_fin = ""
-                    blade_params = {}
                     values_fin = {}
                     try:
                         final_state = await graph.aget_state(config)
                         if final_state and final_state.values:
                             values_fin = final_state.values
                             remaining = values_fin.get("messages", [])
-                            verification = values_fin.get("verification")
-                            blade_uid = values_fin.get("blade_uid", "")
-                            target = values_fin.get("target")
-                            skill_name_fin = values_fin.get("skill_name", "")
-                            error_fin = values_fin.get("error") or ""
-                            failure_reason_fin = values_fin.get("failure_reason") or ""
-                            blade_params = values_fin.get("params") or {}
                     except Exception:
                         pass
-                    from chaos_agent.agent.state import infer_task_state
-
-                    inferred_state = infer_task_state(values_fin) if values_fin else "unknown"
-                    if inferred_state == "injecting":
-                        inferred_state = "injected" if blade_uid else "failed"
-
-                    fault_type_fin = ""
-                    if blade_params:
-                        _s = blade_params.get("scope", "")
-                        _a = blade_params.get("action", "")
-                        _t = blade_params.get("target", "")
-                        if _s and _t and _a:
-                            fault_type_fin = f"{_s}-{_t}-{_a}"
-                    if not fault_type_fin:
-                        fault_type_fin = skill_name_fin
-
-                    merged_error_fin = failure_reason_fin or error_fin or ""
-                    names = target.get("names", []) if target else []
-                    ns = target.get("namespace", "") if target else ""
-                    ns = ns or blade_params.get("namespace", "")
+                    from chaos_agent.server.routes.turn_result import build_inject_data_from_state
+                    _data = build_inject_data_from_state(values_fin, task_id) if values_fin else {
+                        "task_id": task_id, "task_state": "unknown", "error": "",
+                    }
                     session_store.finalize_session(
                         task_id,
                         remaining_messages=remaining,
-                        result_summary=JSONEnvelope.ok(data={
-                            "task_id": task_id,
-                            "result": inferred_state,
-                            "fault_type": fault_type_fin,
-                            "blade_uid": blade_uid,
-                            "targets": [{"name": n, "namespace": ns} for n in names],
-                            "verification": build_verification_simple(verification),
-                            "error": merged_error_fin,
-                        }),
+                        result_summary=JSONEnvelope.ok(data=_data),
                         status="completed",
                     )
                 except Exception:

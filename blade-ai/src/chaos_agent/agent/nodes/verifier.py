@@ -13,33 +13,23 @@ When the LLM outputs a final text (no tool_calls), the loop ends.
 
 import logging
 
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from chaos_agent.agent.node_names import VERIFIER
+from chaos_agent.agent.nodes._debug_pod import parse_debug_pod_name, delete_debug_pod
 from chaos_agent.agent.nodes._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
+    sync_kubewiz_runtime,
 )
-from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
-from chaos_agent.agent.nodes._verifier_hints import (
-    # Re-exported for backward compatibility (test_verifier.py imports
-    # these symbols from verifier.py — keep them resolvable here even
-    # though their definitions live in the split helper modules).
-    _resolve_target_node,
-    _discover_tool_pod_for_verification,
-    _disk_fill_param_hints,  # noqa: F401
-    _derive_disk_fill_partition,  # noqa: F401
-    _PARAM_HINT_GENERATORS,  # noqa: F401
-    _BASELINE_INTEGRITY_PROMPT,  # noqa: F401
-    _COMMAND_PRIORITY_HINT,  # noqa: F401
-)
+from chaos_agent.agent.nodes._store_sync import sync_to_store
 from chaos_agent.agent.nodes._verifier_layer1 import (
-    Layer1Result,  # noqa: F401
+    # noqa: F401
     _run_layer1_verification,
     _restore_layer1_from_state,
     _layer1_to_dict,
-    _find_blade_query_in_messages,  # noqa: F401
-    _run_layer1_via_kubectl_exec,  # noqa: F401
+    # noqa: F401
+    # noqa: F401
 )
 from chaos_agent.agent.nodes._verifier_layer2_parse import (  # noqa: F401 — re-exports for tests
     _count_verification_steps_in_skill_case,  # noqa: F401
@@ -59,17 +49,25 @@ from chaos_agent.agent.nodes._verifier_layer2_parse import (  # noqa: F401 — r
 from chaos_agent.agent.nodes._verifier_messages import (
     _SYNTHETIC_TOOL_CALL_IDS,
     _VERIFIER_CONTEXT_KWARGS_KEY,
-    _METRICS_TOOL_CALL_ID,  # noqa: F401  re-export for tests
-    _BASELINE_TOOL_CALL_ID,  # noqa: F401  re-export for tests
+    # noqa: F401  re-export for tests
+    # noqa: F401  re-export for tests
     _build_layer2_messages,
-    _build_baseline_tool_messages,  # noqa: F401
+    # noqa: F401
 )
 from chaos_agent.agent.nodes._verifier_shared import (
     _compute_baseline_confidence,
-    _IMAGEFS_PATHS,  # noqa: F401
-    _NODEFS_PATHS,  # noqa: F401
+    # noqa: F401
+    # noqa: F401
 )
-from chaos_agent.agent.nodes.baseline_capture import _parse_debug_pod_name, _delete_debug_pod
+
+# Backward-compat aliases (some tests still import these from verifier→baseline_capture)
+_parse_debug_pod_name = parse_debug_pod_name
+_delete_debug_pod = delete_debug_pod
+from chaos_agent.agent.nodes.llm_step_helpers import (
+    build_stagnation_hint,
+    filter_stagnant_tool,
+    post_invoke_debug,
+)
 from chaos_agent.agent.nodes.react_helpers import (
     detect_action_stagnation,
     detect_repeated_tool_calls,
@@ -79,9 +77,10 @@ from chaos_agent.agent.nodes.react_helpers import (
     extract_synthetic_messages,
     extract_tool_call_fields,
     record_system_prompt,
-    summarize_llm_response,
 )
+from chaos_agent.agent.operation_outcome import write_inject_verification
 from chaos_agent.agent.prompts import build_system_prompt, PromptMode
+from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
 from chaos_agent.agent.state_helpers import fail_state
@@ -120,7 +119,7 @@ async def verifier(state: AgentState) -> dict:
     """Simple verifier without LLM: only Layer 1 (blade_status + blade_query_k8s)."""
     task_id = state.get("task_id", "")
     blade_uid = state.get("blade_uid", "")
-    skill_name = state.get("skill_name", "")
+    skill_name = read_active_skill_name(state)
     kubeconfig = _resolve_kubeconfig(state)
 
     # Defense-in-depth: if blade_uid is empty in state, try to recover it
@@ -240,7 +239,7 @@ async def verifier(state: AgentState) -> dict:
     else:
         tracker.complete(f"Verification result: {layer1.status}")
 
-    result_dict = {"result": result, "verification": verification}
+    result_dict = write_inject_verification(result=result, verification=verification)
     if not _verified:
         result_dict.update(fail_state(
             FailureCategory.VERIFICATION_FAILED,
@@ -273,7 +272,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
     async def _verifier_with_llm(state: AgentState) -> dict:
         task_id = state.get("task_id", "")
         blade_uid = state.get("blade_uid", "")
-        skill_name = state.get("skill_name", "")
+        skill_name = read_active_skill_name(state)
         kubeconfig = _resolve_kubeconfig(state)
         count = state.get("verifier_loop_count", 0) + 1
 
@@ -302,7 +301,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 "blade_uid": blade_uid,
                 "verified": False,  # Cannot confirm — Layer 2 was not completed
             }
-            result_dict = {"result": result, "verification": verification}
+            result_dict = write_inject_verification(result=result, verification=verification)
             await _cleanup_debug_pods(state, kubeconfig, task_id, result_dict)
             await sync_to_store(state, result_dict)
             return result_dict
@@ -359,15 +358,15 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 "verified": False,
             }
             tracker.complete(f"Verification failed at Layer 1: {layer1.status}")
-            result_dict = {
-                "result": result,
-                "verification": verification,
-                **fail_state(
+            result_dict = write_inject_verification(
+                fail_state(
                     FailureCategory.VERIFICATION_FAILED,
                     f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}",
                     state.get("messages", []),
                 ),
-            }
+                result=result,
+                verification=verification,
+            )
             await _cleanup_debug_pods(state, kubeconfig, task_id, result_dict)
             await sync_to_store(state, result_dict)
             return result_dict
@@ -382,36 +381,12 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         emit_debug_tool_messages(tracker, state, seed_existing=True)
 
         # Resolve tool pod name for Layer 2 context.
-        # For node-level faults, the injection pod may be on a DIFFERENT node
-        # (kubectl exec fallback picks any running pod). The PRIMARY verification
-        # target for node-level faults is the tool pod ON THE TARGET NODE, because:
-        # - CRD-mode disk fill writes to THAT pod's overlay filesystem (imagefs)
-        # - Host filesystem checks (kubectl debug) are for nodefs, not imagefs
-        # Always discover the target-node tool pod for node-scope faults.
+        # The injection pod is preserved here so the existing tool-pod hints
+        # in _build_layer2_messages still work for non-host-access checks.
+        # Host-level filesystem checks now go through
+        # kubectl_verify(subcommand="debug"); the verifier finalization
+        # scans message history and removes any debug pods automatically.
         tool_pod_name = state.get("kubectl_exec_pod_name")
-        from chaos_agent.agent.fault_spec import read_fault_spec as _rfs
-        _spec = _rfs(state)
-        _blade_scope = _spec.scope if _spec else ""
-
-        if _blade_scope == "node":
-            target_node = _resolve_target_node(state)
-            if target_node:
-                discovered = await _discover_tool_pod_for_verification(
-                    kubeconfig, task_id=task_id, target_node=target_node
-                )
-                if discovered:
-                    tool_pod_name = discovered
-                    logger.info(
-                        f"Node-level fault: using target-node tool pod {discovered} "
-                        f"(on {target_node}) for Layer 2 verification"
-                    )
-                elif tool_pod_name:
-                    logger.warning(
-                        f"No tool pod found on target node {target_node}. "
-                        f"Injection pod {tool_pod_name} is on a DIFFERENT node — "
-                        f"clearing tool_pod_name to avoid misleading PRIMARY VERIFICATION hints."
-                    )
-                    tool_pod_name = None
 
         messages = _build_layer2_messages(
             state, layer1, blade_uid, skill_name, kubeconfig, count,
@@ -431,32 +406,21 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         _main_hm_for_state = extract_persistent_hm(messages, state, _VERIFIER_CONTEXT_KWARGS_KEY)
 
         # Repeated tool call detection (reuse from agent_loop)
-        loop_hint = detect_repeated_tool_calls(state.get("messages", []))
+        loop_hint = detect_repeated_tool_calls(state.get("messages", []), phase="verify")
         if loop_hint:
             messages.append(HumanMessage(content=loop_hint))
 
         # Action stagnation detection (tool-name level)
-        stagnation_hint, stagnant_tool = detect_action_stagnation(state.get("messages", []))
-        if stagnation_hint:
-            if ":" in stagnant_tool:
-                base_tool = stagnant_tool.split(":")[0]
-                verifier_hint = (
-                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
-                    f"multiple consecutive times with no progress. "
-                    f"Stop using this subcommand. You can still use `{base_tool}` "
-                    f"with OTHER subcommands (describe, logs, etc.) "
-                    f"to gather verification evidence.\n"
-                    f"Do NOT call `{stagnant_tool}` again."
-                )
-            else:
-                verifier_hint = (
-                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
-                    f"multiple consecutive times with no progress. "
-                    f"This tool has been temporarily removed. You MUST now either:\n"
-                    f"- Use a DIFFERENT tool or subcommand to gather verification evidence.\n"
-                    f"- Output your verification conclusion based on evidence already collected.\n"
-                    f"Do NOT attempt to call `{stagnant_tool}` again."
-                )
+        _, stagnant_tool = detect_action_stagnation(state.get("messages", []), phase="verify")
+        if stagnant_tool:
+            verifier_hint = build_stagnation_hint(
+                stagnant_tool,
+                colon_suffix="(describe, logs, etc.) to gather verification evidence",
+                else_actions=[
+                    "Use a DIFFERENT tool or subcommand to gather verification evidence.",
+                    "Output your verification conclusion based on evidence already collected.",
+                ],
+            )
             messages.append(HumanMessage(content=verifier_hint))
 
         # Tool error introspection (runtime feedback > static docs)
@@ -489,12 +453,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         elif count >= settings.max_verifier_loop:
             llm_to_call = llm
         else:
-            tools_this_iter = list(tools) if tools else []
-            if stagnant_tool and ":" not in stagnant_tool:
-                tools_this_iter = [
-                    t for t in tools_this_iter
-                    if getattr(t, "name", "") != stagnant_tool
-                ]
+            tools_this_iter = filter_stagnant_tool(tools, stagnant_tool)
             llm_to_call = llm.bind_tools(tools_this_iter) if tools_this_iter else llm
 
         # Record system prompt to session store (dedup handles repeated prompts)
@@ -508,6 +467,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         # Programmatic kubeconfig injection: ensure every kubectl/blade tool call
         # has the correct kubeconfig, even if the LLM forgot to include it.
         inject_kubeconfig_into_tool_calls(response, kubeconfig)
+        sync_kubewiz_runtime(state)
 
         # Build result
         result_update = {
@@ -524,11 +484,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         result_update["messages"] = _main_hm_for_state + _synthetic_for_state + [response]
 
         if settings.is_debug:
-            debug_info, _dbg_tool_names = summarize_llm_response(response)
-            tracker.update(
-                f"Layer 2 iteration {count} LLM:\n{debug_info}",
-                {"debug": True, "iteration": count, "tool_calls": _dbg_tool_names},
-            )
+            post_invoke_debug(tracker, response, count, "Layer 2 iteration")
         else:
             _tc_names = [extract_tool_call_fields(tc)[0] for tc in tool_calls]
             tracker.update(

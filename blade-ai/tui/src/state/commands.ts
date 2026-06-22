@@ -110,6 +110,14 @@ export interface SlashCommandContext {
     input: string,
     opts?: { dryRun?: boolean },
   ) => Promise<void> | void;
+  /**
+   * Submit a task recovery turn through /recover-stream while reusing the
+   * same reducer-backed streaming UI as natural-language turns.
+   */
+  submitRecover?: (
+    taskId: string,
+    displayInput?: string,
+  ) => Promise<void> | void;
 }
 
 /** Subcommand under a two-level command (e.g. ``/skills list``). The
@@ -846,7 +854,7 @@ function buildBuiltInCommands(): SlashCommand[] {
         //      instead of the user staring at the stale boot snapshot.
         //
         // ``Promise.all`` — preflight is the slowest probe (server-side
-        // 8s budget) but the others typically finish in well under 1s,
+        // 15s budget) but the others typically finish in well under 1s,
         // so we wait on the slowest. Acceptable: the user invoked
         // ``/doctor`` precisely to inspect the current state, a couple
         // of seconds for a definitive answer is fine.
@@ -1321,7 +1329,9 @@ function buildBuiltInCommands(): SlashCommand[] {
       //
       //   /recover list             → list interrupted (injecting/
       //                                injected) tasks via /api/v1/metric
-      //   /recover <task_id>        → POST /api/v1/recover, render result
+      //   /recover <task_id>        → POST /api/v1/recover-stream and render
+      //                                through the same reducer pipeline as
+      //                                natural-language recovery
       //
       // The bare-root handler treats the first arg as a task_id; if
       // the user typed ``/recover list`` ``list`` is matched as a sub
@@ -1329,11 +1339,13 @@ function buildBuiltInCommands(): SlashCommand[] {
       // (_cmd_recover_list + _cmd_recover) on the same command name.
       //
       // Not stream-safe at the gate level — recovery is a real cluster
-      // mutation, must run idle. Also not own-turn (request/response
-      // not SSE) so the synthetic slash echo is fine.
+      // mutation, must run idle. The root handler dispatches its own
+      // streaming turn via ctx.submitRecover, so Composer must suppress
+      // the synthetic slash echo.
       name: "recover",
       description: t("command.recover.desc"),
       group: "business",
+      dispatchesOwnTurn: true,
       // ``list`` lives under subcommands so it's intentionally NOT
       // in the usage hint — the parent header would otherwise read
       // "<task_id|latest|list>" while the same ``list`` row appears
@@ -1405,6 +1417,7 @@ function buildBuiltInCommands(): SlashCommand[] {
       },
       async handler(ctx, args) {
         let taskId = (args[0] || "").trim();
+        const displayArg = taskId;
         // ``/recover latest`` — translate to the most recently
         // completed task. Mirrors Python ``_cmd_recover``
         // (``tui/controllers/commands.py:840``) which does the same
@@ -1424,21 +1437,15 @@ function buildBuiltInCommands(): SlashCommand[] {
           return;
         }
         if (ctx.state.streamState !== "idle") {
-          // Defence-in-depth — Composer's gate already caught the
-          // streaming case (recover isn't stream-safe), but a future
-          // direct-dispatch caller might bypass that. Recovery
-          // mutates the cluster, so reject hard.
           pushLog(ctx, t("recover.busy"), "warn");
           return;
         }
-        pushLog(ctx, t("recover.starting", { id: taskId }), "info");
-        try {
-          const env = await ctx.client.recoverTask(taskId);
-          pushLog(ctx, formatRecoverResult(taskId, env), "info");
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          pushLog(ctx, t("recover.failed", { id: taskId, err: msg }), "warn");
+        if (!ctx.submitRecover) {
+          pushLog(ctx, t("retry.unavailable"), "warn");
+          return;
         }
+        ctx.dispatch({ type: "RECOVERY_TRIGGERED" });
+        await ctx.submitRecover(taskId, `/recover ${displayArg || taskId}`);
       },
     },
     {
@@ -2412,46 +2419,6 @@ function buildExperimentsCard(
     totalCount: total || rows.length,
     rows,
   };
-}
-
-/** Format the recover result envelope. The recover endpoint returns
- *  ``status: "success"`` on recovery, ``status: "fail"`` with a
- *  populated ``data`` block on verification failure. We surface
- *  ``error`` / ``recovery_level`` so the user sees why instead of a
- *  bare "failed". */
-function formatRecoverResult(
-  taskId: string,
-  env: Record<string, unknown>,
-): string {
-  const status = (env["status"] as string) || "";
-  const data = (env["data"] as Record<string, unknown>) || {};
-  const result = (data["result"] as string) || "";
-  const blade = (data["blade_uid"] as string) || "";
-  const targets = (data["targets"] as Array<Record<string, unknown>>) || [];
-  const targetSummary = targets
-    .map((tg) => {
-      const name = (tg["name"] as string) || "?";
-      const ns = (tg["namespace"] as string) || "";
-      return ns ? `${name}@${ns}` : name;
-    })
-    .join(", ");
-  if (status === "success") {
-    const lines = [
-      t("recover.success_head", { id: taskId, level: result || "recovered" }),
-    ];
-    if (blade) lines.push(`  ${t("review.uid_label")}: ${blade}`);
-    if (targetSummary) lines.push(`  ${t("recover.targets_label")}: ${targetSummary}`);
-    return lines.join("\n");
-  }
-  const errMsg =
-    (data["error"] as string) ||
-    (env["message"] as string) ||
-    t("recover.unknown_error");
-  const lines = [t("recover.fail_head", { id: taskId })];
-  if (blade) lines.push(`  ${t("review.uid_label")}: ${blade}`);
-  if (targetSummary) lines.push(`  ${t("recover.targets_label")}: ${targetSummary}`);
-  lines.push(`  ${t("recover.error_label")}: ${errMsg}`);
-  return lines.join("\n");
 }
 
 /** Render the masked config dict + path for ``/config list``.

@@ -31,7 +31,12 @@ from .classifier import (
     parse_labels,
     parse_namespace,
 )
-from .freeze import approved_from_dict, discover_owner_names, freeze_approved_target
+from .freeze import (
+    approved_from_dict,
+    discover_owner_names,
+    freeze_approved_target,
+    freeze_approved_target_from_spec,
+)
 from .guard import CLUSTER_SCOPED_KINDS, target_drift_guard
 from .types import (
     ApprovedTarget,
@@ -56,6 +61,7 @@ __all__ = [
     "canonicalise_kind",
     "discover_owner_names",
     "freeze_approved_target",
+    "freeze_approved_target_from_spec",
     "infer_effective_target",
     "parse_labels",
     "parse_namespace",

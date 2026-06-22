@@ -149,11 +149,15 @@ class TestDestroyedStatusFilter:
 
     def _make_blade_status_mock(self, monkeypatch, blade_output: str):
         """Patch run_command inside the function's local import."""
+        from chaos_agent.config.settings import settings as _s
+        monkeypatch.setattr(_s, "kube_connection_mode", "kubeconfig")
+
         async def fake_run_command(cmd, **kwargs):
             from chaos_agent.tools.shell import CommandResult
-            if "get" in cmd and "pods" in cmd:
+            cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "get" in cmd_str and "pods" in cmd_str:
                 return CommandResult(
-                    stdout="NAME                READY   STATUS    RESTARTS   AGE\notel-c-tool-abc12   1/1     Running   0          32d\n",
+                    stdout="chaosblade   otel-c-tool-abc12   1/1   Running   0   32d\n",
                     stderr="", exit_code=0, duration_ms=100.0,
                 )
             return CommandResult(

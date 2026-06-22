@@ -46,7 +46,7 @@ class TestSettingsDefaults:
         # LLM timeout split into connect (fast-fail on bad URL/DNS) vs
         # read (generous so thinking models aren't cut off mid-inference).
         assert s.llm_connect_timeout == 10
-        assert s.llm_read_timeout == 180
+        assert s.llm_read_timeout == 600
         assert s.timeout_default == 60
 
     def test_default_loop_limits(self):

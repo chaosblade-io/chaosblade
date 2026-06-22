@@ -20,12 +20,12 @@ import uuid
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langgraph.types import interrupt
 
-from chaos_agent.config.settings import settings
 from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
 from chaos_agent.agent.plan_generator import generate_injection_plan
 from chaos_agent.agent.prompts.builders import build_system_prompt
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.state import AgentState
+from chaos_agent.config.settings import settings
 from chaos_agent.memory.hook import merge_hook_updates
 from chaos_agent.memory.session_store import NO_SESSION_MARKER
 from chaos_agent.observability.status_tracker import StatusCategory, get_tracker

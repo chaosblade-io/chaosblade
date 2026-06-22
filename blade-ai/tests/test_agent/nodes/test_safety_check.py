@@ -12,14 +12,15 @@ class TestSafetyCheck:
     @pytest.mark.asyncio
     async def test_all_checks_pass(self, sample_agent_state, monkeypatch):
         monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
         state = sample_agent_state
         state["skill_name"] = "pod-delete"
         state["target"] = {"namespace": "default", "names": ["my-pod"]}
 
         result = await safety_check(state)
-        # No kubeconfig → conflict check skipped → warning (not safe)
+        # No kubeconfig + kubeconfig mode → conflict check skipped → warning
         assert result["safety_status"] == "warning"
-        assert "kubeconfig" in result["safety_reason"]
+        assert "集群连接" in result["safety_reason"]
 
     @pytest.mark.asyncio
     async def test_all_checks_pass_with_kubeconfig(self, sample_agent_state, monkeypatch):
@@ -132,13 +133,14 @@ class TestSafetyCheck:
     async def test_allowed_namespace(self, sample_agent_state, monkeypatch):
         monkeypatch.setattr(settings, "safety_blacklist_namespaces", "kube-system,kube-public")
         monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
 
         state = sample_agent_state
         state["skill_name"] = "pod-delete"
         state["target"] = {"namespace": "production", "names": ["my-app"]}
 
         result = await safety_check(state)
-        # No kubeconfig → conflict check skipped → warning
+        # No kubeconfig + kubeconfig mode → conflict check skipped → warning
         assert result["safety_status"] == "warning"
 
     @pytest.mark.asyncio
@@ -205,6 +207,7 @@ class TestSafetyCheck:
     async def test_routing_escalation_default_off(self, sample_agent_state, monkeypatch):
         """E10 — default (routing flag off) doesn't escalate even with high score."""
         monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
         # routing flag NOT set → defaults to False
         state = sample_agent_state
         state["skill_name"] = "pod-delete"
@@ -220,7 +223,7 @@ class TestSafetyCheck:
         )
 
         result = await safety_check(state)
-        # No kubeconfig → base status is "warning" (conflict check skipped).
+        # No kubeconfig + kubeconfig mode → base status is "warning" (conflict check skipped).
         # High score but routing flag off → no score-based escalation beyond warning.
         assert result["safety_status"] == "warning"
         assert result["safety_score"]["overall"] >= 50

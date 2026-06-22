@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import sys
 
-
 REQUIRED_FIELDS = ("llm_api_key", "model_name", "api_base_url")
 
 

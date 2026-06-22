@@ -11,7 +11,6 @@ import logging
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
-
 from langgraph.types import interrupt
 
 from chaos_agent.agent.fault_spec import read_fault_spec
@@ -95,6 +94,22 @@ async def plan_change_confirm(state: AgentState) -> dict:
             f"Plan change approved: {spec.fault_type} → {new_spec.fault_type}",
             detail={"approved": True, "old_fault_type": spec.fault_type,
                     "new_fault_type": new_spec.fault_type})
+
+        # Build context hint preserving namespace/target selectors so
+        # downstream nodes (safety_check, baseline) don't regress to defaults.
+        target_ctx_parts = []
+        if new_spec.namespace:
+            target_ctx_parts.append(f"namespace={new_spec.namespace}")
+        if new_spec.names:
+            target_ctx_parts.append(f"names={new_spec.names}")
+        if new_spec.labels:
+            target_ctx_parts.append(f"labels={new_spec.labels}")
+        target_ctx = ", ".join(target_ctx_parts)
+        context_hint = (
+            f" Target context preserved: {target_ctx}."
+            if target_ctx else ""
+        )
+
         result = {
             "fault_spec": new_spec.to_dict(),
             "skill_name": None,
@@ -103,10 +118,21 @@ async def plan_change_confirm(state: AgentState) -> dict:
             "is_complex": False,
             "matched_use_case_path": None,
             "plan_change_reject_count": 0,
+            # Clear stale skill_case_content so extract_planning_metadata
+            # will re-extract from the new skill's messages.
+            "skill_case_content": None,
             "messages": [HumanMessage(content=(
                 f"[PLAN CHANGE APPROVED] Fault type changed to "
-                f"{new_spec.fault_type}. Re-activate the correct skill "
-                f"and continue planning with the new approach."
+                f"{new_spec.fault_type}.{context_hint} "
+                f"Re-activate the correct skill "
+                f"and continue planning with the new approach.\n\n"
+                f"Find a matching catalogue use-case for the new fault type "
+                f"({new_spec.fault_type}). If the original use-case is still "
+                f"applicable to the new fault type, you may continue using it "
+                f"with the updated parameters. Only call "
+                f"finish_planning(rejected=True) if no use-case (original or "
+                f"new) can be applied to the new fault type. "
+                f"Do NOT use an unrelated use-case from a different fault category."
             ))],
         }
         await sync_to_store(state, result)

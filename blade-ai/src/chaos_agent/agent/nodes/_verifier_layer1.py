@@ -14,12 +14,10 @@ from langchain_core.messages import ToolMessage
 from chaos_agent.agent.nodes._injection_detection import (
     _was_kubectl_blade_injection_successful,
     _was_blade_create_attempted,
-    discover_tool_pods,
     _TOOL_POD_NAMESPACE,
-    _TOOL_POD_LABEL_SELECTOR,
 )
 from chaos_agent.agent.state import AgentState
-from chaos_agent.agent.verdict import Layer1Result, Layer1Status
+from chaos_agent.agent.verdict import Layer1Result
 from chaos_agent.observability.status_tracker import get_tracker
 
 logger = logging.getLogger(__name__)
@@ -63,7 +61,7 @@ def _parse_blade_status_output(raw: str) -> tuple[str, str, bool]:
     if not isinstance(res, dict):
         return "passed", "blade_status: Success (experiment running)", False
 
-    exp_status = res.get("Status", res.get("status", ""))
+    exp_status = res.get("Status", res.get("status", "")) or res.get("phase", "")
     if exp_status in _RUNNING_STATES:
         return "passed", f"blade_status: {exp_status} (experiment running)", False
     if exp_status in _EXPIRED_STATES:
@@ -248,20 +246,20 @@ async def _run_layer1_via_kubectl_exec(
 
     try:
         from chaos_agent.tools.shell import run_command
-        from chaos_agent.tools.kubectl import _build_kubectl_global_args
-
-        kubeconfig_args = _build_kubectl_global_args(kubeconfig=kubeconfig)
+        from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
 
         # Step 0: Try the original injection pod first (if known)
         if injection_pod_name:
             # PRIMARY: blade query k8s (queries CRD, works with CRD UID)
             # blade status <crd_uid> returns "record not found" inside pod
             # because pod's local experiment DB uses a different UID.
-            query_cmd = (["kubectl", "exec", injection_pod_name, "-n", _TOOL_POD_NAMESPACE]
-                         + kubeconfig_args
-                         + ["--", "blade", "query", "k8s", "create", blade_uid])
+            query_cmd = build_kubectl_cmd("exec", [
+                injection_pod_name, "-n", _TOOL_POD_NAMESPACE,
+                "--", "blade", "query", "k8s", "create", blade_uid,
+            ], kubeconfig=kubeconfig)
             try:
                 query_run_result = await run_command(query_cmd, task_id=task_id, source="verifier-L1")
+                query_run_result = _adapt_kubewiz_result(query_run_result)
                 raw = query_run_result.stdout
 
                 # Check if blade query k8s is available (not in older ChaosBlade versions)
@@ -301,11 +299,13 @@ async def _run_layer1_via_kubectl_exec(
                 )
 
             # FALLBACK: blade status (searches local DB, CRD UID may not be found)
-            status_cmd = (["kubectl", "exec", injection_pod_name, "-n", _TOOL_POD_NAMESPACE]
-                          + kubeconfig_args
-                          + ["--", "blade", "status", blade_uid])
+            status_cmd = build_kubectl_cmd("exec", [
+                injection_pod_name, "-n", _TOOL_POD_NAMESPACE,
+                "--", "blade", "status", blade_uid,
+            ], kubeconfig=kubeconfig)
             try:
                 status_result = await run_command(status_cmd, task_id=task_id, source="verifier-L1")
+                status_result = _adapt_kubewiz_result(status_result)
                 raw = status_result.stdout
 
                 # Check if the original pod is unavailable
@@ -346,13 +346,21 @@ async def _run_layer1_via_kubectl_exec(
                     f"falling back to pod discovery"
                 )
 
-        # Step 1: Discover running tool pods
-        discover_cmd = ["kubectl", "get", "pods", "-n", _TOOL_POD_NAMESPACE,
-                        "-l", _TOOL_POD_LABEL_SELECTOR] + kubeconfig_args
-        discover_result = await run_command(discover_cmd, task_id=task_id, source="verifier-L1")
-        pods = discover_tool_pods(discover_result.stdout)
+        # Step 1: Discover running tool pods (cluster-wide)
+        from chaos_agent.agent.nodes._injection_detection import discover_tool_pods_cluster_wide
+        try:
+            pods_with_ns = await discover_tool_pods_cluster_wide(kubeconfig, task_id)
+        except Exception as e:
+            msg = f"kubectl exec: failed to discover tool pods: {e}"
+            if tracker:
+                tracker.update(f"Layer 1 (kubectl exec): {msg} -> skipped",
+                               {"step": "discover_pods", "status": "skipped"})
+            return Layer1Result(
+                status="skipped",
+                details=f"{msg} (infrastructure issue, not experiment failure)",
+            )
 
-        if not pods:
+        if not pods_with_ns:
             msg = "kubectl exec: no running tool pods found, cannot verify blade status"
             if tracker:
                 tracker.update(f"Layer 1 (kubectl exec): {msg} -> skipped",
@@ -367,13 +375,15 @@ async def _run_layer1_via_kubectl_exec(
         # NOTE: blade status v1.8.0 does NOT support --kubeconfig flag.
         # Inside the pod, blade can access the API server directly without kubeconfig.
         last_error = None
-        for pod_name in pods[:2]:
+        for pod_name, pod_ns in pods_with_ns[:2]:
             # PRIMARY: blade query k8s (queries CRD, works with CRD UID)
-            query_cmd = (["kubectl", "exec", pod_name, "-n", _TOOL_POD_NAMESPACE]
-                         + kubeconfig_args
-                         + ["--", "blade", "query", "k8s", "create", blade_uid])
+            query_cmd = build_kubectl_cmd("exec", [
+                pod_name, "-n", pod_ns,
+                "--", "blade", "query", "k8s", "create", blade_uid,
+            ], kubeconfig=kubeconfig)
             try:
                 query_result = await run_command(query_cmd, task_id=task_id, source="verifier-L1")
+                query_result = _adapt_kubewiz_result(query_result)
                 raw = query_result.stdout
 
                 # Check for Type A infrastructure errors
@@ -402,11 +412,13 @@ async def _run_layer1_via_kubectl_exec(
                 logger.debug(f"blade query k8s failed in pod {pod_name}: {e}, trying blade status")
 
             # FALLBACK: blade status (searches local DB, CRD UID may not be found)
-            status_cmd = (["kubectl", "exec", pod_name, "-n", _TOOL_POD_NAMESPACE]
-                          + kubeconfig_args
-                          + ["--", "blade", "status", blade_uid])
+            status_cmd = build_kubectl_cmd("exec", [
+                pod_name, "-n", pod_ns,
+                "--", "blade", "status", blade_uid,
+            ], kubeconfig=kubeconfig)
             try:
                 status_result = await run_command(status_cmd, task_id=task_id, source="verifier-L1")
+                status_result = _adapt_kubewiz_result(status_result)
                 raw = status_result.stdout
 
                 # Check for Type A infrastructure errors (can't execute command)
@@ -515,11 +527,13 @@ async def _run_layer1_verification(
         raw = status_output if isinstance(status_output, str) else str(status_output)
         layer1_status, layer1_details, layer1_expired = _parse_blade_status_output(raw)
 
-        # NEW: If blade_status returns "record not found" on host, try blade_query_k8s
-        # This handles CRD UID not found in host blade's local DB
+        # If blade_status failed because the experiment isn't in the local DB,
+        # fall back to blade_query_k8s (cluster-side CRD query).
+        # Two cases: (1) explicit "record not found" message, (2) empty stdout
+        # (kubewiz mode — experiment runs remotely, no local record exists).
         _fallback_used = False
-        if layer1_status == "failed" and "record not found" in raw.lower():
-            logger.info("blade_status returned 'record not found', trying blade_query_k8s as fallback")
+        if layer1_status == "failed" and (not raw.strip() or "record not found" in raw.lower()):
+            logger.info(f"blade_status local DB miss (raw={raw[:80]!r}), trying blade_query_k8s as fallback")
             try:
                 query_output = await blade_query_k8s.ainvoke(
                     {"uid": blade_uid, "kubeconfig": kubeconfig}

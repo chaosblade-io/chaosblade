@@ -150,10 +150,9 @@ def make_direct_setup(registry: SkillRegistry) -> Callable:
 
         # 3. Read use-case specific content for verifier Layer 2.
         # match_use_cases returns ALL matching skill cases (not just the
-        # first). When multiple cases share the same (scope, target, action)
-        # — e.g. pod-cpu-fullload matches both "Pod CPU 使用率过高" AND
-        # "HPA 副本达到上限" — load all of them so the verifier LLM can
-        # pick the verification steps most relevant to the actual situation.
+        # first). Always present ALL matches as candidates and let the
+        # verifier LLM decide which one is most relevant — the program
+        # must NOT make this decision, even when there is only 1 match.
         skill_case_content = ""
         use_case_path = None
         try:
@@ -162,38 +161,31 @@ def make_direct_setup(registry: SkillRegistry) -> Callable:
             )
             if all_matches:
                 use_case_path = all_matches[0]
-                if len(all_matches) == 1:
-                    skill_case_content = registry.read_resource(
-                        _DIRECT_SKILL_NAME, all_matches[0]
-                    )
-                    logger.info(
-                        f"Direct setup: loaded use-case from {all_matches[0]} "
-                        f"({len(skill_case_content)} chars)"
-                    )
-                else:
-                    # Multiple candidates: load all and let verifier LLM
-                    # choose the right verification methodology.
-                    parts = []
-                    for i, path in enumerate(all_matches):
-                        try:
-                            content = registry.read_resource(_DIRECT_SKILL_NAME, path)
-                            label = path.split("/")[-1].replace(".md", "")
-                            parts.append(
-                                f"--- Candidate {i+1}: {label} ---\n{content}"
-                            )
-                        except Exception:
-                            pass
+                # Always use candidate format — let verifier LLM confirm
+                # the case is relevant before following its steps.
+                parts = []
+                for i, path in enumerate(all_matches):
+                    try:
+                        content = registry.read_resource(_DIRECT_SKILL_NAME, path)
+                        label = path.split("/")[-1].replace(".md", "")
+                        parts.append(
+                            f"--- Candidate {i+1}: {label} ---\n{content}"
+                        )
+                    except Exception:
+                        pass
+                if parts:
                     skill_case_content = (
-                        f"Multiple skill cases match this injection ({len(all_matches)} candidates). "
-                        f"Read ALL candidates below and choose the verification steps "
-                        f"most relevant to the ACTUAL cluster state (e.g. check if HPA "
-                        f"exists before using HPA verification steps).\n\n"
+                        f"{len(all_matches)} skill case(s) matched this injection. "
+                        f"Read ALL candidates below, then choose the ONE whose "
+                        f"verification steps best match the ACTUAL cluster state. "
+                        f"If only 1 candidate is listed, still confirm it is "
+                        f"relevant before following its steps.\n\n"
                         + "\n\n".join(parts)
                     )
-                    logger.info(
-                        f"Direct setup: loaded {len(all_matches)} candidate use-cases: "
-                        f"{all_matches}"
-                    )
+                logger.info(
+                    f"Direct setup: loaded {len(all_matches)} candidate use-cases: "
+                    f"{all_matches}"
+                )
         except Exception as e:
             logger.warning(f"Failed to read use-case content for direct mode: {e}")
 

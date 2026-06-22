@@ -61,13 +61,14 @@ async def is_metrics_server_available(kubeconfig: str) -> bool:
 
 async def _run_kubectl(args: list[str], kubeconfig: str, timeout: int = 8) -> str | None:
     """Run a kubectl command. Returns stdout on success, None on any error."""
-    from chaos_agent.config.settings import settings
-    from chaos_agent.tools.kubectl import _build_kubectl_global_args
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
     from chaos_agent.tools.shell import run_command
 
-    kubectl_path = settings.kubectl_path
-    global_args = _build_kubectl_global_args(kubeconfig)
-    cmd = [kubectl_path, *global_args, *args]
+    if not args:
+        return None
+    subcommand = args[0]
+    sub_args = args[1:]
+    cmd = build_kubectl_cmd(subcommand, sub_args, kubeconfig=kubeconfig)
 
     try:
         result = await run_command(
@@ -77,6 +78,7 @@ async def _run_kubectl(args: list[str], kubeconfig: str, timeout: int = 8) -> st
             skip_guard=True,
             source="feasibility-check",
         )
+        result = _adapt_kubewiz_result(result)
         if result.exit_code != 0 or not result.stdout:
             return None
         return result.stdout.strip()
@@ -633,19 +635,17 @@ async def _check_interface_exists(
         (False, reason) — interface confirmed missing
         (None, reason) — indeterminate (timeout/unexpected error)
     """
-    from chaos_agent.config.settings import settings
-    from chaos_agent.tools.kubectl import _build_kubectl_global_args
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
     from chaos_agent.tools.shell import run_command
 
-    kubectl_path = settings.kubectl_path
-    global_args = _build_kubectl_global_args(kubeconfig)
-    cmd = [kubectl_path, *global_args, "exec", pod_name, "-n", namespace,
-           "--", "cat", f"/sys/class/net/{interface}/operstate"]
+    cmd = build_kubectl_cmd("exec", [pod_name, "-n", namespace,
+           "--", "cat", f"/sys/class/net/{interface}/operstate"], kubeconfig=kubeconfig)
 
     try:
         result = await run_command(
             cmd, timeout=10, task_id="", skip_guard=True, source="feasibility-check",
         )
+        result = _adapt_kubewiz_result(result)
         if result.exit_code == 0:
             return True, ""
         stderr = (result.stderr or "").strip()
@@ -659,34 +659,43 @@ async def _check_interface_exists(
 async def _check_iptables_available(
     pod_name: str, namespace: str, kubeconfig: str
 ) -> tuple[bool | None, str]:
-    """Check if iptables is available in the pod container.
+    """Check if iptables is *functionally* available in the pod container.
 
     ChaosBlade network faults (drop/delay/loss/corrupt) work by injecting
     iptables rules inside the target container's network namespace.
+    Simply checking `iptables --version` only verifies the binary exists but
+    does NOT confirm the container has CAP_NET_ADMIN.  We use `iptables -L -n`
+    which actually requires the capability to list rules.
 
     Returns:
-        (True, "") — confirmed available
-        (False, reason) — confirmed missing
+        (True, "") — confirmed available (binary exists AND has permissions)
+        (False, reason) — confirmed unavailable (missing binary or no permission)
         (None, reason) — indeterminate (timeout/unexpected error)
     """
-    from chaos_agent.config.settings import settings
-    from chaos_agent.tools.kubectl import _build_kubectl_global_args
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
     from chaos_agent.tools.shell import run_command
 
-    kubectl_path = settings.kubectl_path
-    global_args = _build_kubectl_global_args(kubeconfig)
-    cmd = [kubectl_path, *global_args, "exec", pod_name, "-n", namespace,
-           "--", "iptables", "--version"]
+    # Use `iptables -L -n` to verify actual functionality.
+    # This requires CAP_NET_ADMIN; without it, exit_code != 0.
+    cmd = build_kubectl_cmd("exec", [pod_name, "-n", namespace,
+           "--", "iptables", "-L", "-n"], kubeconfig=kubeconfig)
 
     try:
         result = await run_command(
             cmd, timeout=10, task_id="", skip_guard=True, source="feasibility-check",
         )
+        result = _adapt_kubewiz_result(result)
         if result.exit_code == 0:
             return True, ""
         stderr = (result.stderr or "").strip()
         if "not found" in stderr.lower():
-            return False, stderr
+            return False, f"iptables binary not found: {stderr}"
+        # Permission denied or capability missing — treat as unavailable
+        if any(kw in stderr.lower() for kw in (
+            "permission denied", "operation not permitted",
+            "getsockopt", "nf_tables",
+        )):
+            return False, f"iptables not functional (likely missing CAP_NET_ADMIN): {stderr}"
         return None, stderr or f"exit code {result.exit_code}"
     except Exception as exc:
         return None, str(exc)

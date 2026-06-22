@@ -158,25 +158,43 @@ def truncate_text(text: str, max_bytes: int) -> str:
 _GLOBAL_PARAMS = {"kubeconfig", "context", "cluster"}
 
 
+def _split_key_index(key: str) -> tuple[str, int | None]:
+    """Split 'containerStatuses[0]' into ('containerStatuses', 0)."""
+    bracket = key.find("[")
+    if bracket > 0 and key.endswith("]"):
+        return key[:bracket], int(key[bracket + 1:-1])
+    return key, None
+
+
 def _extract_nested(obj: dict, path: str):
     """Extract a value from a nested dict using dot-separated path.
 
+    Supports 'key[N]' combined format (e.g. 'containerStatuses[0].restartCount')
+    as well as standalone '[N]' segments.
     Returns None if the path doesn't exist or an intermediate value is not a dict/list.
     """
     keys = path.split(".")
     current = obj
     for key in keys:
-        # Handle array index like [0]
+        # Handle standalone array index like [0]
         if key.startswith("[") and key.endswith("]"):
             idx = int(key[1:-1])
             if isinstance(current, list) and 0 <= idx < len(current):
                 current = current[idx]
             else:
                 return None
-        elif isinstance(current, dict) and key in current:
-            current = current[key]
+            continue
+        # Handle combined key[N] format (e.g. containerStatuses[0])
+        base, arr_idx = _split_key_index(key)
+        if isinstance(current, dict) and base in current:
+            current = current[base]
         else:
             return None
+        if arr_idx is not None:
+            if isinstance(current, list) and 0 <= arr_idx < len(current):
+                current = current[arr_idx]
+            else:
+                return None
     return current
 
 
@@ -216,19 +234,19 @@ def _strip_item(item: dict, fields: list[str]) -> dict:
     for field_path in fields:
         value = _extract_nested(item, field_path)
         if value is not None:
-            # Reconstruct the nested path in the result
             keys = field_path.split(".")
             target = result
             for key in keys[:-1]:
                 if key.startswith("["):
-                    continue  # Skip array indices in reconstruction
-                if key not in target:
-                    target[key] = {}
-                target = target[key]
-            # Handle the final key
+                    continue
+                base, _ = _split_key_index(key)
+                if base not in target:
+                    target[base] = {}
+                target = target[base]
             final_key = keys[-1]
+            final_base, _ = _split_key_index(final_key)
             if isinstance(target, dict):
-                target[final_key] = value
+                target[final_base] = value
     return result
 
 

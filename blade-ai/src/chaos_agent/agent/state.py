@@ -5,6 +5,13 @@ from typing import Annotated, Optional
 from langgraph.graph import MessagesState
 from langgraph.graph.message import add_messages
 
+from chaos_agent.agent.operation_outcome import (
+    read_failure_reason,
+    read_inject_verification,
+    read_operation_outcome,
+    read_recover_verification,
+)
+from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.utils.time import now_iso, parse_iso_timestamp
 
 
@@ -40,11 +47,12 @@ def infer_task_state(values: dict) -> str:
 
     operation = values.get("operation", "")
     safety_status = values.get("safety_status", "pending")
-    skill_name = values.get("skill_name")
+    active_skill_name = read_active_skill_name(values)
     blade_uid = values.get("blade_uid")
-    verification = values.get("verification")
-    error = values.get("error")
-    result = values.get("result") or {}
+    verification = read_inject_verification(values)
+    outcome = read_operation_outcome(values)
+    error = outcome.error
+    result = outcome.result or {}
     if not isinstance(result, dict):
         result = {}
 
@@ -66,7 +74,7 @@ def infer_task_state(values: dict) -> str:
 
     # Recovery operation
     if operation == "recover":
-        recover_verification = values.get("recover_verification")
+        recover_verification = read_recover_verification(values)
         if recover_verification:
             if result.get("recovered"):
                 # Distinguish full recovery from partial recovery
@@ -89,7 +97,7 @@ def infer_task_state(values: dict) -> str:
         # Still in injection process
         if blade_uid:
             return "injecting"
-        if skill_name:
+        if active_skill_name:
             return "injecting"
         return "injecting"
 
@@ -176,10 +184,11 @@ def infer_phase(values: dict) -> str:
 
     operation = values.get("operation", "")
     safety_status = values.get("safety_status", "pending")
-    skill_name = values.get("skill_name")
+    active_skill_name = read_active_skill_name(values)
     blade_uid = values.get("blade_uid")
-    verification = values.get("verification")
-    error = values.get("error")
+    verification = read_inject_verification(values)
+    outcome = read_operation_outcome(values)
+    error = outcome.error
     needs_confirmation = values.get("needs_confirmation", False)
 
     if error:
@@ -200,9 +209,9 @@ def infer_phase(values: dict) -> str:
 
     # --- Recovery phases ---
     if operation == "recover":
-        recover_verification = values.get("recover_verification")
+        recover_verification = read_recover_verification(values)
         if recover_verification:
-            result = values.get("result") or {}
+            result = outcome.result or {}
             if not isinstance(result, dict):
                 result = {}
             if result.get("recovered"):
@@ -212,9 +221,9 @@ def infer_phase(values: dict) -> str:
         return "recovering"
 
     # --- Injection phases ---
-    if not skill_name and not blade_uid:
+    if not active_skill_name and not blade_uid:
         return "planning"
-    if not skill_name and blade_uid:
+    if not active_skill_name and blade_uid:
         # blade created but skill not yet identified (edge case)
         return "executing"
     if needs_confirmation:
@@ -386,17 +395,7 @@ def _build_side_effects_summary(verification: dict | None) -> str:
 
 def _derive_failure_reason(values: dict) -> str:
     """Derive a failure_reason string from state, preferring failure_detail."""
-    reason = values.get("failure_reason") or ""
-    if reason:
-        return reason
-    detail = values.get("failure_detail")
-    if not detail or not isinstance(detail, dict):
-        return ""
-    from chaos_agent.agent.verdict import FailureDetail
-    try:
-        return FailureDetail.model_validate(detail).to_reason_string()
-    except Exception:
-        return detail.get("category", "")
+    return read_failure_reason(values)
 
 
 def extract_ui_diagnostics(values: dict) -> dict:
@@ -407,10 +406,11 @@ def extract_ui_diagnostics(values: dict) -> dict:
     surface the same set without recopying boilerplate. Anything that flows
     through here becomes visible in `render_result` via `_read_diagnostic`.
     """
-    failure_detail = values.get("failure_detail")
-    failure_reason = _derive_failure_reason(values)
+    outcome = read_operation_outcome(values)
+    failure_detail = outcome.failure_detail
+    failure_reason = outcome.failure_reason
 
-    verification = values.get("verification")
+    verification = read_inject_verification(values)
     return {
         "failure_reason": failure_reason,
         "failure_detail": failure_detail,
@@ -427,24 +427,20 @@ def build_status_data(task_id: str, values: dict) -> dict:
     Used by both CLI AgentRunner.status() and Server status route.
     """
 
-    from chaos_agent.agent.fault_spec import FaultSpec
+    from chaos_agent.agent.fault_spec import (
+        fault_type_from_state,
+        legacy_params_dict,
+        legacy_target_dict,
+    )
 
-    skill_name = values.get("skill_name") or ""
+    active_skill_name = read_active_skill_name(values)
     blade_uid = values.get("blade_uid") or ""
-    spec = FaultSpec.from_dict(values.get("fault_spec"))
-    blade_params = dict(spec.params) if spec else {}
-    target = {
-        "namespace": spec.namespace if spec else "",
-        "names": list(spec.names) if spec else [],
-        "labels": dict(spec.labels) if spec else {},
-        "resource_type": spec.scope if spec else "",
-    }
-    verification = values.get("verification")
-    error = values.get("error")
+    blade_params = legacy_params_dict(values)
+    target = legacy_target_dict(values)
+    verification = read_inject_verification(values)
     safety_reason = values.get("safety_reason") or ""
 
-    # Infer fault_type from spec; fall back to skill_name
-    fault_type = spec.fault_type if (spec and spec.fault_type) else skill_name
+    fault_type = fault_type_from_state(values)
 
     # Timestamps
     created_at = values.get("created_at") or ""
@@ -460,9 +456,10 @@ def build_status_data(task_id: str, values: dict) -> dict:
         except (ValueError, TypeError):
             pass
 
-    failure_detail = values.get("failure_detail")
-    failure_reason_raw = _derive_failure_reason(values)
-    merged_error = failure_reason_raw or error or ""
+    outcome = read_operation_outcome(values)
+    failure_detail = outcome.failure_detail
+    failure_reason_raw = outcome.failure_reason
+    merged_error = outcome.error
 
     task_state = infer_task_state(values)
     stage = infer_stage(values)
@@ -474,7 +471,8 @@ def build_status_data(task_id: str, values: dict) -> dict:
         "status": status,
         "phase": infer_phase(values),
         "fault_type": fault_type,
-        "skill_name": skill_name,
+        "skill_name": active_skill_name,
+        "active_skill_name": active_skill_name,
         "target": target,
         "params": blade_params or None,
         "blade_uid": blade_uid,
@@ -482,7 +480,7 @@ def build_status_data(task_id: str, values: dict) -> dict:
         "safety_reason": safety_reason,
         "needs_confirm": values.get("needs_confirmation", False),
         "verification": strip_side_effects(verification),
-        "recover_verification": strip_side_effects(values.get("recover_verification")),
+        "recover_verification": strip_side_effects(read_recover_verification(values)),
         "side_effects": _extract_side_effects(verification),
         "plan_summary": values.get("plan_summary", ""),
         "error": merged_error,
@@ -504,322 +502,137 @@ def build_status_data(task_id: str, values: dict) -> dict:
 
 
 class AgentState(MessagesState):
-    """State for the Chaos Engineering Agent inject/recover graphs."""
+    """State for the Chaos Engineering Agent inject/recover graphs.
 
-    # Override MessagesState.messages to inject wall-clock timestamps
+    Fields are grouped by lifecycle phase. Within each group, fields
+    appear in the order they are typically populated.
+    """
+
+    # ── Core Identity ──────────────────────────────────────────────
     messages: Annotated[list, _ts_add_messages]
-
-    # Task identification
     task_id: str = ""
-    tui_session_id: str = ""  # Owning TUI session (empty for non-TUI callers)
-    parent_task_id: str = ""  # For recover: the inject task_id being recovered
-    operation: str = ""  # inject/recover/chat
+    tui_session_id: str = ""             # Owning TUI session (empty for non-TUI callers)
+    parent_task_id: str = ""             # For recover: the inject task_id being recovered
+    operation: str = ""                  # inject / recover / chat
 
-    # Skill matching
+    # ── Intent & Input ─────────────────────────────────────────────
+    input: Optional[str] = None          # NL description (entry-point routing only)
+    confirmed_intent: Optional[str] = None   # "inject" | "recover" | "chat" | None
+    interaction_mode: str = "cli"        # "cli" / "tui"
+    intent_context: Optional[str] = None     # Intent description text (passed to planning node)
+    intent_confidence: float = 0.0       # Confidence score 0.0-1.0
+    clarification_round: int = 0         # Low-confidence clarification round tracking
+    dialogue_round: int = 0              # Overall dialogue round tracking (chat + clarification)
+    intent_reasoning: Optional[str] = None   # LLM classification reasoning (audit trail)
+    needs_task_selection: bool = False    # RECOVER intent needs user to pick a task
+    recover_task_id: Optional[str] = None    # task_id of the inject experiment to recover
+    dry_run: bool = False                # TUI /plan dry-run mode
+
+    # ── Planning ───────────────────────────────────────────────────
     skill_name: Optional[str] = None
+    fault_spec: Optional[dict] = None    # FaultSpec dict (see chaos_agent.agent.fault_spec)
+    skill_case_content: Optional[str] = None     # Full content of the matched skill use-case file
+    matched_use_case_path: Optional[str] = None  # Catalogue path resolved by match_use_case()
+    plan: Optional[str] = None
+    plan_summary: str = ""               # Human-facing execution preview / dry-run summary
+    plan_path: Optional[str] = None      # saved plan file path (memory/plan/{task_id}.md)
+    is_complex: Optional[bool] = None    # True if task requires a formal plan document
+    planning_rejected: bool = False      # No catalogue case loaded; edge routes back
+    _planning_rejection_reason: Optional[str] = None  # LLM rejection_reason for fail diagnosis
+    _planning_alternatives: str = ""     # LLM-proposed alternatives after planning rejection
+    _catalogue_rejection_nudged: bool = False  # Guard: nudge only once before accepting rejection
+    plan_builder_round: int = 0          # Dialogue round counter within plan_builder
+    plan_confirmed: bool = False         # submit_plan completed; /run routes to safety_check
 
-    # Natural language description (NL mode entry, used only by entry-
-    # point routing — not authoritative for fault context, which lives
-    # on ``fault_spec.user_description`` after FaultSpec construction).
-    input: Optional[str] = None
-
-    # Safety assessment
-    safety_status: str = "pending"  # pending/safe/unsafe/warning/rejected
+    # ── Safety ─────────────────────────────────────────────────────
+    safety_status: str = "pending"       # pending / safe / unsafe / warning / rejected
     safety_reason: Optional[str] = None
     safety_checked_detail: Optional[str] = None
-    conflict_uids: Optional[list[str]] = None  # UIDs of existing active experiments
-    # E10 — multi-dimensional numeric safety score (0-100 per dim +
-    # weighted overall). Stored as dict (not SafetyScore) for the same
-    # JSON-roundtrip reason FaultSpec uses dict-form on state.
-    safety_score: Optional[dict] = None
-
-    # Execution-level blast radius declared by the LLM in finish_planning.
-    # "target-only" | "namespace-wide" | "cluster-wide"
-    blast_radius_scope: Optional[str] = None
+    conflict_uids: Optional[list[str]] = None    # UIDs of existing active experiments
+    safety_score: Optional[dict] = None          # Multi-dimensional numeric safety score (dict form)
+    blast_radius_scope: Optional[str] = None     # "target-only" | "namespace-wide" | "cluster-wide"
     blast_radius_detail: Optional[str] = None
+    target_health_report: Optional[dict] = None  # HealthReport dict (see chaos_agent.agent.target_health)
+    feasibility_report: Optional[dict] = None    # FeasibilityReport dict (see chaos_agent.agent.feasibility)
 
-    # Confirmation
+    # ── Confirmation ───────────────────────────────────────────────
     needs_confirmation: bool = False
+    approved_target: Optional[dict] = None   # ApprovedTarget dict (see chaos_agent.agent.target_guard)
+    drift_reject_count: int = 0          # Target-change rejection counter
+    plan_change_reject_count: int = 0    # Replan fault type switch rejection counter
+    screener_route: Optional[str] = None # Transient routing hint: "pass" / "retry" / "replan"
 
-    # Execution plan
-    plan: Optional[str] = None
-    plan_path: Optional[str] = None  # saved plan file path (memory/plan/{task_id}.md)
-    is_complex: Optional[bool] = None  # True if task requires a formal plan document
-
-    # ChaosBlade experiment UID
-    blade_uid: Optional[str] = None
-
-    # Inject-phase context for recover LLM (not recorded in session)
-    inject_context: Optional[str] = None
-
-    # K8s connection
+    # ── Execution ──────────────────────────────────────────────────
+    blade_uid: Optional[str] = None      # ChaosBlade experiment UID
+    injection_method: Optional[str] = None   # "host_blade" | "kubectl_exec" | "kubectl_native"
+    kubectl_exec_pod_name: Optional[str] = None  # Tool pod used during kubectl exec injection
+    blade_parsed_flags: Optional[dict] = None    # {"path": "/tmp", "percent": "85", ...}
+    direct: bool = False                 # True: skip LLM, go direct path
+    original_replicas: Optional[dict] = None     # kubectl scale-based faults: {resource -> count}
     kubeconfig: Optional[str] = None
     kube_context: Optional[str] = None
+    kubewiz_cluster_uuid: Optional[str] = None
+    kubewiz_profile: Optional[str] = None
+    inject_context: Optional[str] = None     # Inject-phase context for recover LLM
+    baseline_data: Optional[dict] = None     # Pre-injection baseline (from baseline_capture node)
+    target_metadata: Optional[dict] = None   # {pod_memory_limit_mb, active_same_action_experiments, ...}
+    evidence_snapshot: Optional[dict] = None  # P0: quick evidence after blade_create (ls + df)
+    disk_burn_post_check: Optional[dict] = None   # Post-injection I/O throughput verification
+    disk_fill_post_check: Optional[dict] = None   # Post-injection fill file verification
+    se_snapshot: Optional[dict] = None       # Pre-injection side-effect snapshot
+    force_override: bool = False             # CLI --force-override flag
+    _execute_text_nudged: bool = False       # Guard: nudge execute_loop only once for text-only exit
+    _kubectl_step_nudged: bool = False       # Guard: nudge kubectl-native incomplete steps only once
+    batch_submit_args: Optional[dict] = None     # Multi-fault submit_plan args
+    current_fault_index: int = 0
+    batch_results: Optional[list] = None
 
-    # Results
-    result: Optional[dict] = None
-    error: Optional[str] = None
-
-    # Timestamps
-    created_at: Optional[str] = None   # ISO 8601, set at task creation
-    finished_at: Optional[str] = None  # ISO 8601, set when task finishes
-    injection_start_time: Optional[str] = None  # ISO 8601, set when blade_create succeeds
-
-    # Verification (two-layer: layer1=blade_status, layer2=fault-specific)
-    verification: Optional[dict] = None
+    # ── Verification ───────────────────────────────────────────────
+    verification: Optional[dict] = None          # Two-layer: layer1=blade_status, layer2=fault-specific
     recover_verification: Optional[dict] = None
-
-    # E2 — structured observation timeline. Each entry:
-    #   {iteration: int, timestamp: ISO 8601, tool_call_id: str,
-    #    tool_name: str, metrics: dict[str, str]}
-    # Populated by PreReasoningHook from ToolMessage extracted_metrics
-    # across ALL nodes (inject / recover / verifier), not just verifier —
-    # the field name is intentionally generic. Survives [Compressed
-    # History] compaction because it lives on state, not on the message
-    # list, which is what makes the Phase 3 evidence cross-check in
-    # verifier verdict parsing robust to compression.
-    metric_observations: Optional[list[dict]] = None
-
-    # Layer 1 result caches (persisted across ReAct tool_call iterations)
-    # Without these, layer1 results are lost when LLM makes tool_calls,
-    # causing "Layer1: unknown" on subsequent iterations.
-    inject_layer1_cache: Optional[dict] = None
+    inject_layer1_cache: Optional[dict] = None   # Persisted across ReAct iterations
     recover_layer1_cache: Optional[dict] = None
+    metric_observations: Optional[list[dict]] = None  # Structured observation timeline (all nodes)
+    inject_verification_summary: Optional[str] = None  # Layer 2 observations for recover baseline
+    reverify_count: int = 0              # Re-verification attempt count
+    reverify_gaps: Optional[list[str]] = None    # Gap types that triggered re-verification
+    cleaned_debug_pods: Optional[list[str]] = None   # Debug pods already cleaned up (exactly-once)
 
-    # Recovery phase tracking (for non-ChaosBlade faults)
-    # "layer1_recovery" = LLM-driven recovery execution phase
-    # "layer2_verification" = LLM-driven verification phase
-    recover_phase: str = "layer1_recovery"
-
-    # Recovery Layer 1 type: "deterministic" (host blade_destroy) or "llm_driven"
-    # (non-ChaosBlade / kubectl-exec injection). Set by recover_verifier_loop when
-    # Layer 1 transitions to Layer 2; consumed by Layer 2 prompt builder and
-    # finalize_recover_verification's retry-recovery path.
-    recover_layer1_type: Optional[str] = None
-
-    # Layer 1 iteration count (separate from verifier_loop_count)
+    # ── Recovery ───────────────────────────────────────────────────
+    recover_phase: str = "layer1_recovery"   # "layer1_recovery" | "layer2_verification"
+    recover_layer1_type: Optional[str] = None    # "deterministic" | "llm_driven"
     layer1_iteration_count: int = 0
+    layer2_context_added: bool = False       # Non-ChaosBlade Layer 2 may start at count > 1
+    recover_layer2_first: bool = False       # Verdict on first Layer 2 turn (anti-laziness guard)
 
-    # Whether Layer 2 context has been added to messages
-    # (needed because non-ChaosBlade Layer 2 may start at count > 1)
-    layer2_context_added: bool = False
-
-    # Scheme B (recover): set by recover_verifier_loop to signal
-    # finalize_recover_verification that the verdict was produced on the FIRST
-    # Layer 2 turn (before any kubectl verification) → finalize's anti-laziness
-    # guard fires once and loops back. Mirrors the old is_first_layer2 guard.
-    recover_layer2_first: bool = False
-
-    # Memory (Layer 2-3)
-    compressed_summary: Optional[str] = None
-    experiment_history: Optional[list] = None
-    operational_notes: Optional[str] = None
-
-    # Loop control
+    # ── Loop Control ───────────────────────────────────────────────
     agent_loop_count: int = 0
     execute_loop_count: int = 0
     verifier_loop_count: int = 0
-
-    # Replan control (Phase 2 → Phase 1 feedback loop)
-    replan_requested: bool = False                # LLM 或自动检测触发的 replan 请求
-    replan_count: int = 0                         # replan 循环次数
-    replan_context: Optional[dict] = None         # Phase 2 错误上下文
-    replan_history: Optional[list] = None         # 历次 replan 记录
-
-    # Patch C — Wall-clock guard (single source of truth for "when did
-    # this turn start"). Stamped at agent_loop_node entry the first
-    # time. Router functions consult ``time.time() - pipeline_started_at``
-    # against ``settings.max_inject_seconds`` to enforce a turn-level
-    # timeout that's independent of iteration counters. ``0.0`` = not
-    # yet stamped (the wall-clock guard is a no-op).
-    pipeline_started_at: float = 0.0
-
-    # Patch B — Counter for INFRA_TRANSIENT short-retry budget. Each
-    # router-detected transient error increments this; ``settings.max_
-    # transient_retry`` is the hard cap before SHORT_RETRY is escalated
-    # to END_FAILED.
-    transient_retry_count: int = 0
-
-    # Patch E — Pipeline attempt tracking. ``pipeline_attempt`` starts
-    # at ``0`` and is incremented by ``begin_attempt`` (in
-    # chaos_agent.agent.attempt_tracker). ``pipeline_attempts_history``
-    # records each attempt's metadata so the TUI / TaskStore can
-    # surface "this is attempt #2 because the LLM switched targets"
-    # rather than the user seeing what looks like a retry of a failure.
-    pipeline_attempt: int = 0
+    pipeline_started_at: float = 0.0     # Wall-clock guard (0.0 = not yet stamped)
+    transient_retry_count: int = 0       # INFRA_TRANSIENT short-retry budget
+    pipeline_attempt: int = 0            # Attempt tracking (incremented by begin_attempt)
     pipeline_attempts_history: Optional[list] = None
+    replan_requested: bool = False
+    replan_count: int = 0
+    replan_context: Optional[dict] = None
+    replan_history: Optional[list] = None
+    _replan_loop_reset: Optional[int] = None  # Tracks which replan_count has been loop-reset
 
-    # Patch D — Target health report from ``safety_check`` (after
-    # ``assess_target_health``). Serialised form of ``HealthReport``;
-    # see ``chaos_agent.agent.target_health`` for the schema. ``None``
-    # when the pre-check is disabled or the scope has no checker.
-    # Read by ``confirmation_gate`` / TUI confirm card to surface
-    # blocker conditions (DiskPressure, Evicted, …) before the
-    # operator approves an inject that's likely to fail.
-    target_health_report: Optional[dict] = None
-    # E18 — Injection feasibility report (headroom assessment).
-    # Shape: FeasibilityReport.to_dict() from chaos_agent.agent.feasibility.
-    feasibility_report: Optional[dict] = None
-
-    # Failure reason (only set when task result is "failed", None on success)
+    # ── Results ────────────────────────────────────────────────────
+    result: Optional[dict] = None
+    error: Optional[str] = None
     failure_reason: Optional[str] = None
-    # E3 — Structured failure detail (FailureDetail.model_dump()). Replaces
-    # the freeform failure_reason string with category + context + llm_analysis.
-    failure_detail: Optional[dict] = None
+    failure_detail: Optional[dict] = None    # FailureDetail dict (category + context + llm_analysis)
+    postmortem: Optional[dict] = None        # {"path": str, "markdown": str, "summary": str}
+    created_at: Optional[str] = None         # ISO 8601
+    finished_at: Optional[str] = None        # ISO 8601
+    injection_start_time: Optional[str] = None   # ISO 8601, set when blade_create succeeds
 
-    # T6 — Postmortem auto-generation output. Populated by save_memory after
-    # the experiment finalises; None when postmortem is disabled, the task
-    # belongs to a non-injection intent, the failure category lies outside
-    # the postmortem whitelist, or LLM generation timed out / errored.
-    # Shape: {"path": str, "markdown": str, "summary": str}.
-    # Goes into the result envelope (data.postmortem) verbatim so the TS
-    # TUI can render PostmortemSection without a second round-trip.
-    postmortem: Optional[dict] = None
-
-    # Injection method tracking (used by verifier to choose verification strategy)
-    injection_method: Optional[str] = None  # "host_blade" | "kubectl_exec" | "kubectl_native" | None
-
-    # Tool pod name used during kubectl exec injection (recorded at injection time,
-    # used by verifier/recover_verifier to prefer the original pod)
-    kubectl_exec_pod_name: Optional[str] = None
-
-    # Skill use-case content (populated during injection, used by Layer 2 verification)
-    skill_case_content: Optional[str] = None  # Full content of the matched skill use-case file
-    matched_use_case_path: Optional[str] = None  # Catalogue path resolved by match_use_case()
-
-    # Guard flag: extract_planning_metadata sets True when no catalogue
-    # case was loaded; conditional edge routes back to agent_loop.
-    planning_rejected: bool = False
-
-    # Injection verification summary (Layer 2 observations from inject phase, used as baseline for recover)
-    inject_verification_summary: Optional[str] = None
-
-    # ``direct`` mode flag — entry-point routing only, not part of
-    # FaultSpec because the spec describes WHAT to inject, not the
-    # execution-path choice (direct vs LLM ReAct).
-    direct: bool = False                 # True: skip LLM, go direct path
-    # Parsed key params from blade flags (runtime artefact of
-    # ``execute_loop`` parsing the LLM's ``blade_create`` invocation —
-    # downstream verifier consumes ``state.blade_parsed_flags``).
-    blade_parsed_flags: Optional[dict] = None  # {"path": "/tmp", "percent": "85", ...}
-
-    # Original replicas for kubectl scale-based faults (resource_name -> replica_count)
-    # Used to safely restore replicas after scale-down injection
-    original_replicas: Optional[dict] = None  # {"accounting": 3, ...}
-
-    # Pre-injection baseline for direct mode (captured by baseline_capture node)
-    baseline_data: Optional[dict] = None
-
-    # FCAT context (collected once at direct_setup / execute_loop entry, reused downstream)
-    target_metadata: Optional[dict] = None   # {pod_memory_limit_mb, active_same_action_experiments, ...}
-    evidence_snapshot: Optional[dict] = None  # P0: quick evidence after blade_create (ls + df)
-    disk_burn_post_check: Optional[dict] = None   # Post-injection I/O throughput verification result
-    disk_fill_post_check: Optional[dict] = None    # Post-injection fill file verification result
-    se_snapshot: Optional[dict] = None       # Pre-injection side-effect snapshot (SideEffectSnapshot.to_dict())
-    reverify_count: int = 0                  # P2: verifier re-verification attempt count
-    reverify_gaps: Optional[list[str]] = None # P2: gap types that triggered re-verification
-    # Debug pods the verifier's programmatic cleanup has already attempted
-    # to delete. Persisted across verifier re-entries (reverify loop, ReAct
-    # iterations) so cleanup is exactly-once per pod.
-    #
-    # Without this, every verifier re-entry re-scans the full message history,
-    # re-discovers the same pod names, and re-issues ``kubectl delete``. After
-    # the first delete succeeds, subsequent attempts return "NotFound" and
-    # inflate the failure-rate stat (observed as 8 spurious NotFound failures
-    # in task-712629116b64).
-    #
-    # ``list[str]`` not ``set[str]``: LangGraph checkpoint requires JSON-
-    # serialisable shapes. Stored sorted for deterministic snapshots.
-    cleaned_debug_pods: Optional[list[str]] = None
-    force_override: bool = False             # P1: CLI --force-override flag
-
-    # Intent clarification (TUI mode)
-    confirmed_intent: Optional[str] = None  # "inject" | "recover" | "chat" | None
-    interaction_mode: str = "cli"  # "cli" / "tui"
-    intent_context: Optional[str] = None         # Intent description text (passed to planning node)
-    intent_confidence: float = 0.0               # Confidence score 0.0-1.0
-    clarification_round: int = 0                 # Low-confidence clarification round tracking
-    dialogue_round: int = 0                      # Overall dialogue round tracking (chat + clarification)
-    intent_reasoning: Optional[str] = None       # LLM classification reasoning (audit trail)
-    needs_task_selection: bool = False            # RECOVER intent needs user to pick a task
-    recover_task_id: Optional[str] = None        # task_id of the inject experiment to recover
-
-    # Dry-Run multi-turn planning (TUI `/plan`).
-    # When True: confirmation_gate emits a "what would happen" AIMessage and
-    # the router exits to END before any side-effecting node runs. The user
-    # can iterate the plan over multiple turns and finally call `/run` (no
-    # args) which sets dry_run=False and re-invokes the pipeline.
-    dry_run: bool = False
-
-    # Single source of truth for "what fault to inject where".
-    # Populated at every entry point (CLI structured / CLI NL / HTTP API
-    # / TUI / direct) via ``FaultSpec.from_*`` constructors; rewritten
-    # by ``intent_clarification`` once the LLM emits ``submit_fault_intent``
-    # in NL flows. Consumers read it via ``read_fault_spec(state)`` and
-    # get back a strongly-typed ``FaultSpec`` instance. See
-    # ``chaos_agent.agent.fault_spec`` for the dataclass and constructors.
-    #
-    # Schema (dict form for LangGraph checkpoint compat):
-    #   {namespace, scope, names: list[str], labels: dict[str, str],
-    #    blade_target, blade_action, params: dict[str, str],
-    #    params_flags: list[str], duration_seconds: int,
-    #    source: str, user_description: str}
-    #
-    # ``None`` = no fault context yet (rare; would only happen if a
-    # caller bypasses the entry-point constructors).
-    fault_spec: Optional[dict] = None
-
-    # Target-drift guard — frozen snapshot of "what the user approved".
-    # Populated by ``confirmation_gate`` when the user accepts a plan;
-    # consumed by the screener node in front of ``execute_loop``'s
-    # ToolNode (see ``chaos_agent.agent.target_guard``). Cleared on
-    # TURN_DONE / TURN_ABORTED / replan so the next confirmation_gate
-    # freezes a fresh approval. Schema mirrors
-    # ``target_guard.ApprovedTarget`` (dict form for LangGraph
-    # serialisability):
-    #   {scope, namespace, names: list[str], labels: dict[str, str],
-    #    is_namespace_wide: bool, blade_target, blade_action,
-    #    lock_fault_type: bool}
-    # ``None`` = no approval on record (planning phase, or post-cleanup).
-    approved_target: Optional[dict] = None
-
-    # Transient routing hint written by the two screeners (one per
-    # phase) and consumed by their respective ``route_after_*``
-    # dispatcher on the next conditional edge:
-    #   - ``phase1_screener``    writes "pass" or "retry"
-    #     (consumed by ``route_after_phase1_screener``)
-    #   - ``tool_screener``      writes "pass", "replan", or "retry"
-    #     (consumed by ``route_after_screener``)
-    # The field is shared because (a) the two screeners run in
-    # disjoint graph regions (phase 1 = before confirmation, phase 2 =
-    # after baseline_capture), so values never collide; (b) every
-    # screener invocation overwrites the field at function entry, so
-    # no stale value can leak from one pass to another. Not meant for
-    # cross-turn persistence.
-    screener_route: Optional[str] = None
-
-    # Drift-interrupt rejection counter. Incremented when user rejects a
-    # target-change confirmation card. When >= 1, the next drift detection
-    # hard-terminates instead of interrupting again.
-    drift_reject_count: int = 0
-
-    # Plan-change rejection counter (replan fault type switch).
-    # Incremented when user rejects a plan change proposal. When >= 2,
-    # plan_change_confirm hard-terminates via fail_state.
-    plan_change_reject_count: int = 0
-
-    # Plan builder (interactive guided plan construction via TUI /plan)
-    plan_builder_round: int = 0        # Dialogue round counter within plan_builder
-    plan_confirmed: bool = False       # submit_plan completed; /run routes to safety_check
-
-    # Batch fault injection (submit_plan with multiple faults)
-    # Stores the full submit_plan args when faults[] has more than 1 entry.
-    # Single-fault submit_plan does NOT populate this (backward compatible).
-    batch_submit_args: Optional[dict] = None
-
-    # Batch execution progress (loop-back within Pipeline Graph)
-    current_fault_index: int = 0
-    batch_results: Optional[list] = None
+    # ── Memory ─────────────────────────────────────────────────────
+    compressed_summary: Optional[str] = None
+    experiment_history: Optional[list] = None
+    operational_notes: Optional[str] = None
 
 
 class IntentState(MessagesState):
@@ -861,6 +674,8 @@ class IntentState(MessagesState):
     # Session-level
     kubeconfig: Optional[str] = None
     kube_context: Optional[str] = None
+    kubewiz_cluster_uuid: Optional[str] = None
+    kubewiz_profile: Optional[str] = None
     needs_confirmation: bool = False
     dry_run: bool = False
     compressed_summary: Optional[str] = None

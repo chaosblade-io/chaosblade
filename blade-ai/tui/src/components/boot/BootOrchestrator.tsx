@@ -37,9 +37,9 @@ export interface BootOrchestratorProps {
 }
 
 // Soft cap on preflight wait. MUST exceed the server's outer
-// ``_PREFLIGHT_BUDGET_S`` (currently 8s); 10s leaves a healthy 2s
+// ``_PREFLIGHT_BUDGET_S`` (currently 15s); 17s leaves a healthy 2s
 // buffer for network + uvicorn dispatch.
-const PREFLIGHT_BUDGET_MS = 10_000;
+const PREFLIGHT_BUDGET_MS = 17_000;
 
 export const BootOrchestrator: React.FC<BootOrchestratorProps> = ({
   client,

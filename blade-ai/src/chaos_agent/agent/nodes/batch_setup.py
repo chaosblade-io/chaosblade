@@ -24,88 +24,12 @@ from langchain_core.messages import HumanMessage, RemoveMessage
 from chaos_agent.agent.fault_spec import SOURCE_TUI, FaultSpec
 from chaos_agent.agent.nodes._store_sync import sync_to_store
 from chaos_agent.agent.state import AgentState
+from chaos_agent.agent.state_lifecycle import build_batch_iteration_state
 from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
 
 REMOVE_ALL_MESSAGES = "__remove_all__"
-
-# Per-fault fields to reset at each batch iteration.
-# skill_name IS reset — agent_loop re-activates per fault so each fault
-# gets the correct skill_case_content for its specific scope/target/action.
-_BATCH_RESET_FIELDS: dict = {
-    "operation": "inject",
-    "confirmed_intent": "inject",
-    "dry_run": False,
-    "skill_name": None,
-    "skill_case_content": None,
-    "matched_use_case_path": None,
-    "safety_status": "pending",
-    "safety_reason": None,
-    "safety_checked_detail": None,
-    "conflict_uids": None,
-    "safety_score": None,
-    "blast_radius_scope": None,
-    "blast_radius_detail": None,
-    "target_health_report": None,
-    "feasibility_report": None,
-    "approved_target": None,
-    "plan": None,
-    "plan_path": None,
-    "is_complex": None,
-    "planning_rejected": False,
-    "blade_uid": None,
-    "injection_method": None,
-    "kubectl_exec_pod_name": None,
-    "blade_parsed_flags": None,
-    "inject_context": None,
-    "injection_start_time": None,
-    "original_replicas": None,
-    "direct": False,
-    "force_override": False,
-    "verification": None,
-    "recover_verification": None,
-    "metric_observations": None,
-    "inject_layer1_cache": None,
-    "recover_layer1_cache": None,
-    "inject_verification_summary": None,
-    "baseline_data": None,
-    "target_metadata": None,
-    "evidence_snapshot": None,
-    "disk_burn_post_check": None,
-    "disk_fill_post_check": None,
-    "se_snapshot": None,
-    "reverify_count": 0,
-    "reverify_gaps": None,
-    "cleaned_debug_pods": None,
-    "result": None,
-    "error": None,
-    "failure_reason": None,
-    "failure_detail": None,
-    "postmortem": None,
-    "finished_at": None,
-    "agent_loop_count": 0,
-    "execute_loop_count": 0,
-    "verifier_loop_count": 0,
-    "pipeline_started_at": 0.0,
-    "transient_retry_count": 0,
-    "pipeline_attempt": 0,
-    "pipeline_attempts_history": None,
-    "replan_requested": False,
-    "replan_count": 0,
-    "replan_context": None,
-    "replan_history": None,
-    "screener_route": None,
-    "drift_reject_count": 0,
-    "plan_change_reject_count": 0,
-    "compressed_summary": None,
-    "parent_task_id": "",
-    "recover_phase": "layer1_recovery",
-    "recover_layer1_type": None,
-    "layer1_iteration_count": 0,
-    "layer2_context_added": False,
-    "recover_layer2_first": False,
-}
 
 
 def _normalize_batch_args(state: dict) -> dict:
@@ -174,7 +98,7 @@ async def batch_setup(state: AgentState) -> dict:
         user_description=existing.get("user_description", ""),
     )
 
-    new_task_id = f"task-{uuid4().hex[:12]}"
+    new_task_id = f"task-{uuid4()}"
     tui_sid = state.get("tui_session_id", "")
 
     try:
@@ -189,18 +113,16 @@ async def batch_setup(state: AgentState) -> dict:
 
     agent_prompt = _build_agent_prompt(spec, idx, len(faults))
 
-    result = dict(_BATCH_RESET_FIELDS)
-    result.update({
-        "task_id": new_task_id,
-        "fault_spec": spec.to_dict(),
-        "created_at": now_iso(),
-        "needs_confirmation": True,
-        "batch_submit_args": batch_args,
-        "messages": [
+    result = build_batch_iteration_state(
+        task_id=new_task_id,
+        spec=spec,
+        batch_args=batch_args,
+        created_at=now_iso(),
+        messages=[
             RemoveMessage(id=REMOVE_ALL_MESSAGES),
             HumanMessage(content=agent_prompt),
         ],
-    })
+    )
 
     await sync_to_store(state, result)
     return result

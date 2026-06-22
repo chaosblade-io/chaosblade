@@ -189,7 +189,7 @@ class SkillRegistry:
         """Generate skill catalog text for system prompt / activate_skill tool description."""
         lines = []
         for name, meta in self._metadata.items():
-            lines.append(f"- {name}: {meta.description}")
+            lines.append(f"- {name} [{meta.skill_type}]: {meta.description}")
         return "\n".join(lines)
 
     def activate(self, skill_name: str) -> str:
@@ -275,6 +275,9 @@ class SkillRegistry:
         "drop": ("drop", "丢包", "丢弃"),
         "loss": ("loss", "丢包", "丢失"),                   # 丢包 == packet loss → Pod_网络丢包
         "kill": ("kill", "杀死"),
+        "delete": ("delete", "删除"),                       # pod-pod delete → Pod_被删除
+        "fail": ("fail", "失败", "篡改"),                  # pod-pod fail → Pod_镜像拉取失败
+        "delay": ("delay", "延迟"),                         # pod-network delay → 网络延迟
         "dns": ("dns", "DNS", "域名"),
     }
 

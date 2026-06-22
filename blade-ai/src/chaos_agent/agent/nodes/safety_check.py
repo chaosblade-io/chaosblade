@@ -3,17 +3,18 @@
 import logging
 
 from chaos_agent.agent.nodes._conflict_check import check_blade_conflicts
-from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
+from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig, sync_kubewiz_runtime
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.safety_score import (
     compute_safety_score,
     maybe_escalate_status,
 )
+from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState
-from chaos_agent.agent.target_guard import discover_owner_names, freeze_approved_target
-from chaos_agent.config.settings import settings
 from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.target_guard import discover_owner_names, freeze_approved_target_from_spec
 from chaos_agent.agent.verdict import FailureCategory
+from chaos_agent.config.settings import settings
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
@@ -28,29 +29,20 @@ async def _get_topology_deep_signal(spec, kubeconfig: str) -> tuple[int, str]:
     Only applies to deployment scope with a named target. Returns
     (0, "") on any error so safety_check never fails because of it.
     """
-    if not kubeconfig or spec.scope != "deployment" or not spec.names:
+    if spec.scope != "deployment" or not spec.names:
         return (0, "")
     try:
-        import asyncio as _asyncio
-        cmd = [
-            "kubectl", "--kubeconfig", kubeconfig,
-            "get", "deployment", spec.names[0],
-            "-n", spec.namespace,
-            "-o", "jsonpath={.spec.replicas}",
-        ]
-        proc = await _asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=_asyncio.subprocess.PIPE,
-            stderr=_asyncio.subprocess.PIPE,
+        from chaos_agent.tools.kubectl import exec_kubectl_raw
+
+        result = await exec_kubectl_raw(
+            "get",
+            ["deployment", spec.names[0], "-n", spec.namespace, "-o", "jsonpath={.spec.replicas}"],
+            kubeconfig=kubeconfig,
+            timeout=5.0,
         )
-        try:
-            stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=5.0)
-        except _asyncio.TimeoutError:
-            proc.kill()
+        if result.exit_code != 0:
             return (0, "")
-        if proc.returncode != 0:
-            return (0, "")
-        replicas = int(stdout.decode().strip() or 0)
+        replicas = int(result.stdout.strip() or 0)
         if replicas == 1:
             return (20, "deployment has 1 replica (SPOF)")
         if replicas == 2:
@@ -157,7 +149,7 @@ async def safety_check(state: AgentState) -> dict:
     from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
     spec = read_fault_spec(state) or FaultSpec()
     namespace = spec.namespace
-    skill_name = state.get("skill_name", "")
+    skill_name = read_active_skill_name(state)
 
     tracker = get_tracker(task_id)
     tracker.start(
@@ -218,6 +210,7 @@ async def safety_check(state: AgentState) -> dict:
     # Resolve kubeconfig once — used by both the E10 deep topology
     # signal (optional) and the blade conflict detection below.
     kubeconfig = _resolve_kubeconfig(state)
+    sync_kubewiz_runtime(state)
 
     # E10 — optional deep K8s topology signal (replica count). Fetched
     # once here so all downstream return paths use the same signal.
@@ -234,7 +227,8 @@ async def safety_check(state: AgentState) -> dict:
     conflict_reason: str = ""
     conflict_uids: list = []
     conflict_extra: dict = {}
-    if kubeconfig:
+    _can_reach_cluster = bool(kubeconfig) or settings.kube_connection_mode == "kubewiz"
+    if _can_reach_cluster:
         namespace = spec.namespace
         labels = ",".join(f"{k}={v}" for k, v in spec.labels.items())
         target_names = ",".join(spec.names)
@@ -415,15 +409,15 @@ async def safety_check(state: AgentState) -> dict:
             "safety_checked_detail": f"namespace={namespace} 合规, {len(conflict_uids)} 活跃实验 (非同动作)",
             "conflict_uids": conflict_uids,
         }
-    elif not kubeconfig:
-        tracker.complete("Safety checks passed (conflict check skipped: no kubeconfig)")
+    elif not _can_reach_cluster:
+        tracker.complete("Safety checks passed (conflict check skipped: no cluster access)")
         sync_node_status_to_session(state, "safety_check",
-            "Conflict check skipped (no kubeconfig)",
+            "Conflict check skipped (no cluster access)",
             detail={"safety_status": "warning"})
         result = {
             "safety_status": "warning",
-            "safety_reason": "冲突检测跳过 (无 kubeconfig)，无法确认集群上是否存在活跃实验",
-            "safety_checked_detail": f"namespace={namespace} 合规, 冲突检测跳过 (无 kubeconfig)",
+            "safety_reason": "冲突检测跳过 (无集群连接)，无法确认集群上是否存在活跃实验",
+            "safety_checked_detail": f"namespace={namespace} 合规, 冲突检测跳过 (无集群连接)",
             "conflict_uids": [],
         }
     else:
@@ -448,13 +442,8 @@ async def safety_check(state: AgentState) -> dict:
     owner_names = await discover_owner_names(
         spec.scope, spec.namespace, dict(spec.labels), kubeconfig,
     )
-    result["approved_target"] = freeze_approved_target(
-        target={"namespace": spec.namespace, "names": list(spec.names),
-                "labels": dict(spec.labels), "resource_type": spec.scope},
-        params=dict(spec.params),
-        blade_scope=spec.scope,
-        blade_target=spec.blade_target,
-        blade_action=spec.blade_action,
+    result["approved_target"] = freeze_approved_target_from_spec(
+        spec,
         owner_names=owner_names,
     )
 

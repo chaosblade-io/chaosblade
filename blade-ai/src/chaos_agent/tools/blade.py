@@ -40,14 +40,24 @@ def _get_blade_path() -> str:
 
 
 def _build_kubeconfig_arg(kubeconfig: str = "") -> list[str]:
-    """Build --kubeconfig flag for blade commands.
+    """Build cluster connection flags for blade commands.
 
-    Priority: explicit parameter > settings (includes KUBECONFIG env via AliasChoices).
+    kubewiz mode: returns --kubewiz-url/--cluster-uuid/--kubewiz-token flags.
+    kubeconfig mode: returns --kubeconfig flag.
 
     NOTE: ChaosBlade v1.8.0 ``blade status`` does NOT support --kubeconfig.
     Only ``blade create``, ``blade destroy``, and ``blade query k8s`` accept it.
     For ``blade status``, the caller must set the KUBECONFIG env var instead.
     """
+    if settings.kube_connection_mode == "kubewiz":
+        args: list[str] = []
+        if settings.kubewiz_url:
+            args.extend(["--kubewiz-url", settings.kubewiz_url])
+        if settings.kubewiz_cluster_uuid:
+            args.extend(["--cluster-uuid", settings.kubewiz_cluster_uuid])
+        if settings.kubewiz_token:
+            args.extend(["--kubewiz-token", settings.kubewiz_token])
+        return args
     kc = kubeconfig or settings.kubeconfig_path
     if kc:
         return ["--kubeconfig", kc]
@@ -58,8 +68,11 @@ def _build_kubeconfig_env(kubeconfig: str = "") -> dict[str, str] | None:
     """Build env override with KUBECONFIG set for blade commands that don't
     support the --kubeconfig flag (e.g. ``blade status`` in v1.8.0).
 
-    Returns None if no kubeconfig override is needed (let existing env pass through).
+    kubewiz mode: returns None (connection via CLI flags, not env var).
+    kubeconfig mode: returns {"KUBECONFIG": path} if configured.
     """
+    if settings.kube_connection_mode == "kubewiz":
+        return None
     kc = kubeconfig or settings.kubeconfig_path
     if kc:
         return {"KUBECONFIG": kc}
@@ -214,14 +227,35 @@ async def blade_create(
         uid_match = re.search(r'"uid"\s*:\s*"([a-f0-9]{16,})"', combined)
         uid_in_error = uid_match.group(1) if uid_match else None
         if uid_in_error:
+            # Classify the error to decide whether polling makes sense.
+            # Terminal errors (permission denied, tool not found, etc.) will
+            # NEVER self-heal no matter how long the operator retries — tell
+            # the agent immediately so it doesn't waste cycles polling.
+            from chaos_agent.errors import classify_error, ErrorAction
+            classification = classify_error(combined)
+
+            if classification.action != ErrorAction.SHORT_RETRY:
+                # Terminal error — no point polling.
+                return (
+                    f"Error: injection FAILED permanently "
+                    f"(exit {result.exit_code}, class={classification.error_class.value}). "
+                    f"Experiment CRD was created (UID: {uid_in_error}) but the fault "
+                    f"CANNOT take effect — the operator will not recover from this. "
+                    f"Matched pattern: {classification.matched_pattern or 'unknown'}. "
+                    f"Do NOT poll or wait; either REPLAN with a different approach "
+                    f"or report failure. "
+                    f"To clean up, call blade_destroy(uid='{uid_in_error}').\n"
+                    f"Raw output: {combined}"
+                )
+
+            # Transient infra error (timeout, connection reset, etc.) — the
+            # operator may retry with fallback mechanisms. Poll makes sense.
             return (
                 f"Warning: blade create returned error (exit {result.exit_code}) "
                 f"but experiment CRD was created (UID: {uid_in_error}). "
-                f"The experiment MAY be in effect despite the error "
-                f"(ChaosBlade operator may retry with fallback mechanisms). "
-                f"Do NOT conclude failure or attempt alternative injection methods. "
-                f"Instead, POLL the cluster state repeatedly to check if the "
-                f"fault takes effect (the operator needs time to retry):\n"
+                f"The error appears TRANSIENT ({classification.matched_pattern}); "
+                f"the ChaosBlade operator may retry with fallback mechanisms. "
+                f"POLL the cluster state to check if the fault takes effect:\n"
                 f"  1. Call time_wait(seconds=30) to give the operator time to retry\n"
                 f"  2. Check the target's actual status with kubectl get node/pod\n"
                 f"  3. If fault effect is visible, the injection SUCCEEDED "
@@ -267,6 +301,10 @@ async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
         rare case where destroy returns success but the stress process lingers.
     """
     cmd = [_get_blade_path(), "destroy", uid]
+    # kubewiz mode: experiments are K8s CRDs, not local DB records.
+    # Without --target k8s, blade looks in local DB and returns "record not found".
+    if settings.kube_connection_mode == "kubewiz":
+        cmd.extend(["--target", "k8s"])
     cmd.extend(_build_kubeconfig_arg(kubeconfig))
 
     try:
@@ -275,7 +313,9 @@ async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
         return f"Error: blade destroy failed: {e}"
 
     if result.exit_code != 0:
-        return f"Error: blade destroy failed (exit {result.exit_code}): {result.stderr}"
+        stderr = result.stderr.strip() if result.stderr else ""
+        stdout = result.stdout.strip() if result.stdout else ""
+        return f"Error: blade destroy failed (exit {result.exit_code}): {stderr or stdout}"
 
     return result.stdout
 
@@ -307,11 +347,25 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
         kubeconfig via the KUBECONFIG env var instead. No action required from
         the caller.
     """
+    # kubewiz mode: blade status does NOT support --kubewiz-url flags
+    # (only local DB). Delegate to blade query k8s which queries the
+    # remote cluster CRD via kubewiz.
+    if settings.kube_connection_mode == "kubewiz" and uid:
+        cmd = [_get_blade_path(), "query", "k8s", "create", uid]
+        cmd.extend(_build_kubeconfig_arg(kubeconfig))
+        try:
+            result = await run_command(cmd, timeout=settings.timeout_blade)
+        except Exception as e:
+            return f"Error: blade status (kubewiz) failed: {e}"
+        stdout = result.stdout.strip() if result.stdout else ""
+        stderr = result.stderr.strip() if result.stderr else ""
+        return stdout or stderr or ""
+
     cmd = [_get_blade_path(), "status"]
     if uid:
         cmd.extend(["--uid", uid])
-    # blade status in v1.8.0 does NOT support --kubeconfig flag;
-    # pass via KUBECONFIG env var instead
+    # kubeconfig mode: blade status v1.8.0 does NOT support --kubeconfig flag,
+    # so pass via KUBECONFIG env var instead
     env_override = _build_kubeconfig_env(kubeconfig)
 
     try:

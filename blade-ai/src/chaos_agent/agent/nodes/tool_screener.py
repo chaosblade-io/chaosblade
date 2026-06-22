@@ -44,7 +44,6 @@ import logging
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
-
 from langgraph.types import interrupt
 
 from chaos_agent.agent.fault_spec import read_fault_spec
@@ -55,7 +54,7 @@ from chaos_agent.agent.target_guard import (
     EffectiveTarget,
     GuardVerdict,
     approved_from_dict,
-    freeze_approved_target,
+    freeze_approved_target_from_spec,
     infer_effective_target,
     target_drift_guard,
 )
@@ -369,18 +368,7 @@ def _apply_drift_correction(state: AgentState, eff: EffectiveTarget | None) -> d
         new_spec = spec
 
     result: dict = {"fault_spec": new_spec.to_dict()}
-    result["approved_target"] = freeze_approved_target(
-        target={
-            "namespace": new_spec.namespace,
-            "names": list(new_spec.names),
-            "labels": dict(new_spec.labels),
-            "resource_type": new_spec.scope,
-        },
-        params=dict(new_spec.params),
-        blade_scope=new_spec.scope,
-        blade_target=new_spec.blade_target,
-        blade_action=new_spec.blade_action,
-    )
+    result["approved_target"] = freeze_approved_target_from_spec(new_spec)
     return result
 
 

@@ -309,6 +309,49 @@ class TestParseStreamEvent:
         }
         assert parse_stream_event(raw) is None
 
+    def test_parse_on_chat_model_end_reasoning_fallback_returns_both(self):
+        """Qwen enable_thinking short-response: content empty but
+        reasoning_content present → returns [token, usage] (not just token)."""
+
+        class QwenShortResponseMsg:
+            content = ""
+            additional_kwargs = {"reasoning_content": "你好！我是故障演练助手。"}
+            usage_metadata = {"input_tokens": 12, "output_tokens": 8}
+
+        raw = {
+            "event": "on_chat_model_end",
+            "data": {"output": QwenShortResponseMsg()},
+            "tags": [],
+            "metadata": {},
+        }
+        result = parse_stream_event(raw)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        assert result[0].type == "token"
+        assert result[0].content == "你好！我是故障演练助手。"
+        assert result[1].type == "usage"
+        assert result[1].input_tokens == 12
+        assert result[1].output_tokens == 8
+
+    def test_parse_on_chat_model_end_reasoning_fallback_no_usage(self):
+        """reasoning_content present but no usage_metadata → [token] only."""
+
+        class QwenShortNoUsage:
+            content = ""
+            additional_kwargs = {"reasoning_content": "hi"}
+
+        raw = {
+            "event": "on_chat_model_end",
+            "data": {"output": QwenShortNoUsage()},
+            "tags": [],
+            "metadata": {},
+        }
+        result = parse_stream_event(raw)
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert result[0].type == "token"
+        assert result[0].content == "hi"
+
     def test_parse_on_llm_end_routes_to_usage_event(self):
         """on_llm_end (non-chat LLMs) takes the same usage path."""
 

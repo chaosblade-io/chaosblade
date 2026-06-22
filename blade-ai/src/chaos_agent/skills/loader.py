@@ -12,7 +12,7 @@ from typing import Optional
 
 import yaml
 
-from chaos_agent.skills.models import SkillMetadata, SkillParameter, ScriptInfo
+from chaos_agent.skills.models import SkillMetadata, SkillParameter, ScriptInfo, SKILL_TYPE_FAULT_INJECTION
 
 
 def _wheel_bundled_skills_dir() -> Optional[Path]:
@@ -219,6 +219,7 @@ def load_skill_metadata(skill_dir: Path) -> SkillMetadata:
         target=frontmatter.get("target", ""),
         required_tools=frontmatter.get("required_tools", []) or [],
         tags=frontmatter.get("tags", []) or [],
+        skill_type=frontmatter.get("skill_type", SKILL_TYPE_FAULT_INJECTION),
         parameters=_parse_parameters(frontmatter.get("parameters")),
         scripts=_parse_scripts(frontmatter.get("scripts")),
     )

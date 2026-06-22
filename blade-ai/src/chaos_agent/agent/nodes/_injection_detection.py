@@ -26,6 +26,9 @@ _KUBECTL_INJECT_SUBCOMMANDS = {"scale", "patch", "cordon", "taint", "set", "dele
 _TOOL_POD_LABEL_SELECTOR = "app=otel-c-tool"
 _TOOL_POD_NAMESPACE = "chaosblade"
 
+# Known tool pod label selectors (tried in order)
+_TOOL_POD_LABEL_CANDIDATES = ["app=chaosblade-tool", "app=otel-c-tool"]
+
 
 def _build_tool_call_args_lookup(messages: list) -> dict:
     """Build a mapping from tool_call_id to tool call args.
@@ -188,96 +191,156 @@ def _was_blade_create_attempted(messages: list) -> bool:
     return False
 
 
-def discover_tool_pods(kubectl_output: str) -> list[str]:
-    """Parse kubectl get pods output to find Running tool pod names.
+def _parse_all_ns_pods(output: str) -> list[tuple[str, str]]:
+    """Parse kubectl get pods -A --no-headers output.
 
-    Used by the verifier to find an available tool pod for Layer 1
-    kubectl-exec-based blade_status checks (when injection_method
-    is "kubectl_exec" and host blade_status is unavailable).
-
-    Args:
-        kubectl_output: Output from `kubectl get pods -n chaosblade -l app=otel-c-tool`.
-            Expected format::
-
-                NAME                   READY   STATUS    RESTARTS   AGE
-                otel-c-tool-xxxxx     1/1     Running   0          1d
-                otel-c-tool-yyyyy     1/1     Running   0          2d
+    Format: NAMESPACE  NAME  READY  STATUS  RESTARTS  AGE
 
     Returns:
-        List of pod names with STATUS = "Running". Empty list if no
-        running pods found or output is unparseable.
+        List of (pod_name, namespace) tuples for Running pods.
     """
-    if not kubectl_output or not isinstance(kubectl_output, str):
+    if not output or not isinstance(output, str):
         return []
 
-    lines = kubectl_output.strip().splitlines()
-    if len(lines) < 2:
-        return []
-
-    running_pods = []
-    for line in lines[1:]:  # Skip header
-        line = line.strip()
-        if not line:
-            continue
-        # Parse kubectl table output: NAME READY STATUS RESTARTS AGE
-        # Use regex to handle variable whitespace
-        match = re.match(r"^(\S+)\s+\S+\s+(\S+)", line)
-        if match:
-            pod_name = match.group(1)
-            status = match.group(2)
+    result: list[tuple[str, str]] = []
+    for line in output.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            namespace = parts[0]
+            pod_name = parts[1]
+            status = parts[3]
             if status == "Running":
-                running_pods.append(pod_name)
+                result.append((pod_name, namespace))
+    return result
 
-    return running_pods
+
+def _parse_all_ns_pods_wide(output: str) -> list[tuple[str, str, str]]:
+    """Parse kubectl get pods -A --no-headers -o wide output.
+
+    Wide format columns: NAMESPACE  NAME  READY  STATUS  RESTARTS  AGE  IP  NODE  ...
+    Returns: List of (pod_name, namespace, node_name) tuples for Running pods.
+    """
+    if not output or not isinstance(output, str):
+        return []
+    result: list[tuple[str, str, str]] = []
+    for line in output.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 8:  # Wide format has at least 8 columns
+            namespace = parts[0]
+            pod_name = parts[1]
+            status = parts[3]
+            node_name = parts[7]
+            if status == "Running":
+                result.append((pod_name, namespace, node_name))
+    return result
 
 
-def discover_tool_pods_with_nodes(kubectl_output: str) -> list[tuple[str, str]]:
-    """Parse kubectl get pods -o wide output to find Running tool pods with their node names.
+async def discover_tool_pod_on_node(
+    node_name: str, kubeconfig: str, task_id: str = "",
+) -> tuple[str, str] | None:
+    """Find a Running ChaosBlade tool pod on the specified node (cluster-wide).
 
-    Used by the verifier to find a tool pod on a specific target node for
-    Layer 2 verification of node-level faults.
-
-    Args:
-        kubectl_output: Output from `kubectl get pods -n chaosblade -l app=otel-c-tool -o wide`.
-            Expected format::
-
-                NAME                READY   STATUS    RESTARTS   AGE   IP           NODE
-                otel-c-tool-xxxxx  1/1     Running   0          1d    10.0.2.145   cn-hongkong.10.0.2.145
+    Tries known label selectors in order with -A (all-namespaces) and -o wide
+    to match pods by their hosting node.
 
     Returns:
-        List of (pod_name, node_name) tuples for pods with STATUS = "Running".
-        Empty list if no running pods found or output is unparseable.
+        (pod_name, namespace) tuple if found, None otherwise.
     """
-    if not kubectl_output or not isinstance(kubectl_output, str):
-        return []
+    from chaos_agent.tools.shell import run_command
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
+    from chaos_agent.config.settings import settings
 
-    lines = kubectl_output.strip().splitlines()
-    if len(lines) < 2:
-        return []
-
-    running_pods = []
-    for line in lines[1:]:  # Skip header
-        line = line.strip()
-        if not line:
+    for label in _TOOL_POD_LABEL_CANDIDATES:
+        cmd = build_kubectl_cmd("get", [
+            "pods", "-A", "-l", label, "--no-headers", "-o", "wide",
+        ], kubeconfig=kubeconfig)
+        try:
+            result = await run_command(
+                cmd,
+                timeout=settings.timeout_kubectl,
+                task_id=task_id,
+                source="baseline-capture",
+            )
+            result = _adapt_kubewiz_result(result)
+        except Exception as e:
+            logger.warning(
+                "Failed to discover tool pods on node %s with label %s: %s",
+                node_name, label, e,
+            )
             continue
-        # -o wide format: NAME READY STATUS RESTARTS AGE IP NODE [NOMINATED NODE] [READINESS GATES]
-        # RESTARTS can be "0" or "1 (20d ago)" (contains spaces+parens), so we
-        # can't rely on fixed \S+ column counts. Instead: match NAME, READY,
-        # STATUS as the first 3 columns, then skip everything up to the NODE
-        # column by finding the node-like token (contains dots or "cn-" prefix).
-        #
-        # Robust approach: split by 2+ spaces (column separator), which handles
-        # the RESTARTS column as a single unit since kubectl aligns with spaces.
-        cols = re.split(r"\s{2,}", line)
-        # Expected cols: [NAME, READY, STATUS, RESTARTS, AGE, IP, NODE, ...]
-        if len(cols) >= 7:
-            pod_name = cols[0]
-            status = cols[2]
-            node_name = cols[6]
-            if status == "Running":
-                running_pods.append((pod_name, node_name))
+        pods = _parse_all_ns_pods_wide(result.stdout)
+        for pod_name, ns, node in pods:
+            if node == node_name:
+                return (pod_name, ns)
+    return None
 
-    return running_pods
+
+async def discover_tool_pods_cluster_wide(
+    kubeconfig: str, task_id: str = "",
+) -> list[tuple[str, str]]:
+    """Discover ChaosBlade tool pods across all namespaces.
+
+    Tries known label selectors in order, returns on first success.
+    Uses -A (all-namespaces) to avoid hardcoding the namespace.
+
+    Returns:
+        List of (pod_name, namespace) tuples for Running pods.
+    """
+    from chaos_agent.tools.shell import run_command
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
+    from chaos_agent.config.settings import settings
+
+    for label in _TOOL_POD_LABEL_CANDIDATES:
+        cmd = build_kubectl_cmd("get", [
+            "pods", "-A", "-l", label, "--no-headers",
+        ], kubeconfig=kubeconfig)
+        result = await run_command(
+            cmd,
+            timeout=settings.timeout_kubectl,
+            task_id=task_id,
+            source="conflict-check",
+        )
+        result = _adapt_kubewiz_result(result)
+        pods = _parse_all_ns_pods(result.stdout)
+        if pods:
+            return pods
+    return []
+
+
+async def discover_tool_pods_cluster_wide_with_nodes(
+    kubeconfig: str, task_id: str = "",
+) -> list[tuple[str, str, str]]:
+    """Discover ChaosBlade tool pods across all namespaces with node info.
+
+    Tries known label selectors in order, returns on first success.
+    Uses -A (all-namespaces) and -o wide to include node placement.
+
+    Returns:
+        List of (pod_name, namespace, node_name) tuples for Running pods.
+    """
+    from chaos_agent.tools.shell import run_command
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
+    from chaos_agent.config.settings import settings
+
+    for label in _TOOL_POD_LABEL_CANDIDATES:
+        cmd = build_kubectl_cmd("get", [
+            "pods", "-A", "-l", label, "--no-headers", "-o", "wide",
+        ], kubeconfig=kubeconfig)
+        try:
+            result = await run_command(
+                cmd,
+                timeout=settings.timeout_kubectl,
+                task_id=task_id,
+                source="tool-pod-discovery",
+            )
+            result = _adapt_kubewiz_result(result)
+        except Exception as e:
+            logger.warning("Failed to discover tool pods with label %s: %s", label, e)
+            continue
+        pods = _parse_all_ns_pods_wide(result.stdout)
+        if pods:
+            return pods
+    return []
 
 
 def _extract_kubectl_exec_pod_name(messages: list) -> str | None:

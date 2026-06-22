@@ -1,4 +1,4 @@
-"""Execution sections: tool usage, output style, K8s connection, guidelines, and execution directives."""
+"""Execution sections: tool usage, guidelines, and execution directives."""
 
 
 def get_tools_section(phase: int = 1) -> str:
@@ -6,84 +6,70 @@ def get_tools_section(phase: int = 1) -> str:
 
     Args:
         phase: 1 = planning (agent_loop), 2 = execution (execute_loop).
-            Phase 2 omits skill-resource-reading guidance because the active
-            skill's content is already embedded in the execution prompt and
-            the corresponding tools are not bound to the executor.
+            Phase 2 omits skill-resource-reading guidance because the
+            skill case content is in the conversation history from Phase 1
+            (read_skill_resource ToolMessages), not in the system prompt.
     """
     if phase == 2:
         return """## Tool Usage Guidelines
 
 ### Tool Selection Priority
-1. **Skill content is in your prompt**: The active skill's instructions have already been loaded for this phase — do NOT call skill-reading tools (they are not bound here). Re-read the relevant section of your prompt.
+1. **Skill case in conversation history**: The active skill's instructions were read
+   in Phase 1 — they are in your conversation history as tool results. Re-read them
+   as a STARTING POINT for injection commands. Do NOT call skill-reading tools (not bound here).
 2. **Knowledge docs for domain context**: When you need supplementary domain knowledge, use `read_knowledge_resource`. Do NOT guess or improvise blade commands.
-3. **Read before write**: Use `kubectl(subcommand="get"/"describe")` for verification, reserve `kubectl(subcommand="exec")` for active checks.
-4. **Blade tools for faults**: Use `blade_create` / `blade_status` for fault creation and inspection. `blade_destroy` is NOT bound in this phase — recovery is framework-controlled.
+3. **Pre-injection checks only**: Use `kubectl(subcommand="get"/"describe")` ONLY to confirm the target exists before injection. Do NOT use kubectl to verify injection effects — that is handled automatically after execution.
+4. **Blade tools for faults**: Use `blade_create` to inject faults. Call `blade_help`
+   first to verify available flags — skill docs may be outdated. Only call tools that
+   are bound to you in this phase — recovery is framework-controlled.
 
 ### Parallel Calls
 - You MAY make multiple independent kubectl calls in a single turn (e.g., check pods AND nodes simultaneously)
-- Do NOT make dependent calls in parallel (e.g., wait for blade_create result before running blade_status)
+- Do NOT make dependent calls in parallel
 
 ### Avoid Redundancy
-- Do not repeat kubectl queries that were just answered in a previous tool result
-- Do not call blade_status repeatedly for the same uid in the same turn"""
+- Do not repeat kubectl queries that were just answered in a previous tool result"""
 
     return """## Tool Usage Guidelines
 
 ### Tool Selection Priority
-1. **Skill references first (after skill activation)**: Use `read_skill_resource` to read skill reference files for accurate, up-to-date command syntax and parameters
-2. **Knowledge docs for domain context**: Especially BEFORE skill activation or when no skill is active, use `read_knowledge_resource` to read knowledge documents — do NOT guess or improvise blade commands
-3. **Read before write**: Use `kubectl(subcommand="get"/"describe")` for verification — `exec` is Phase 2 only
-4. **Plan, don't execute**: Your output is the input to `confirmation_gate`. Capture the intended `blade_create` arguments in your plan (via `save_fault_plan`); the executor (Phase 2) will issue the actual call.
+1. **Skill references first (after skill activation)**: Use `read_skill_resource` to read skill reference files for accurate, up-to-date injection command syntax and parameters
+2. **Knowledge docs for domain context**: Especially BEFORE skill activation or when no skill is active, use `read_knowledge_resource` to read knowledge documents — do NOT guess or improvise injection commands
+3. **Read before write**: Use cluster query tools for verification — mutation tools are Phase 2 only
+4. **Plan, don't execute**: Your output is the input to `confirmation_gate`. Capture the intended injection parameters in your plan (via `save_fault_plan`); the executor (Phase 2) will issue the actual call.
 
-### Resource Lookup Priority
-When you need blade command syntax or parameters:
-1. **Skill references** (`read_skill_resource`) — contains accurate, up-to-date command reference
-2. **Knowledge docs** (`read_knowledge_resource`) — contains supplementary domain knowledge
-3. **Never guess** — if unsure, always read the reference first
+### Timeout Protection
+Every fault injection experiment MUST have timeout protection to prevent
+indefinite residue. The default timeout is applied automatically by the
+injection tool. Pass a custom value only if the user specifies one.
 
 ### Parallel Calls
-- You MAY make multiple independent kubectl calls in a single turn (e.g., check pods AND nodes simultaneously)
-- Do NOT make dependent calls in parallel (e.g., don't call `kubectl describe` before the matching `kubectl get` returns)
+- You MAY make multiple independent cluster query calls in a single turn (e.g., check pods AND nodes simultaneously)
+- Do NOT make dependent calls in parallel
 
 ### Avoid Redundancy
 - Do not re-activate a skill that is already active (check conversation history)
-- Do not repeat kubectl queries that were just answered in a previous tool result"""
+- Do not repeat cluster queries that were just answered in a previous tool result"""
 
 
-def get_output_section() -> str:
-    """Communication style section."""
-    return """## Communication Style
-
-- **Lead with conclusions**: State the result first, then supporting details
-- **Key milestones**: Brief updates at critical points (skill activated, fault injected, verification started)
-- **Errors and blockers**: Provide full detail only when something goes wrong or is blocked
-- **Avoid verbosity**: Do not narrate your reasoning process unless the user asks
-- **Structured results**: Use consistent format for blade results: `blade_uid | status | target | details`"""
-
-
-def get_k8s_connection_section() -> str:
-    """K8s cluster connection section."""
-    return """## K8s Cluster Connection
-All kubectl and blade tools support optional `kubeconfig`, `context`, and `cluster` parameters.
-If the user specifies a kubeconfig path or cluster context, you MUST pass it to every tool call.
-For blade_create parameter details (namespace/names handling), see the tool schema."""
-
-
-def get_guidelines_section(include_method_switching: bool = True) -> str:
+def get_guidelines_section(
+    include_method_switching: bool = True,
+    phase: int = 2,
+) -> str:
     """Important guidelines section.
 
     Args:
-        include_method_switching: When False, omit the Injection Method
-            Switching subsection — used by Phase 1 (planning) where the LLM
-            cannot execute and the rules are not yet relevant. Phase 2
-            (execute_loop) keeps the default ``True`` so the executor sees
-            method-switching constraints. The detailed switching catalogue
-            also lives in the ``chaosblade-cli`` knowledge doc for on-demand
-            recall.
+        include_method_switching: When False, omit the Conflict Check
+            subsection — used by Phase 1 (planning) where the LLM cannot
+            execute and the rules are not yet relevant. Phase 2 (execute_loop)
+            keeps the default ``True`` so the executor sees conflict-check
+            constraints.
+        phase: 1 = planning (omit Runtime Feedback Priority — already covered
+            by Workflow's Ground Truth section). 2 = execution (full version
+            with Runtime Feedback Priority, since the executor deals with tool
+            errors directly).
     """
-    base = """## Important Guidelines
-
-### Runtime Feedback Priority (CRITICAL)
+    runtime_feedback = """### Runtime Feedback Priority
 Your knowledge about tool interfaces comes from documentation, which may be
 outdated or wrong. The tool's actual behavior at runtime is always the ground truth.
 
@@ -95,12 +81,23 @@ When ANY tool returns an error or unexpected result:
 4. If a parameter/flag/subcommand was rejected, it does NOT exist in the
    current tool version — do NOT retry it, regardless of what documentation says
 5. If the tool's output contradicts skill instructions or knowledge docs,
-   trust the tool output and adapt your approach
+   trust the tool output and adapt your approach"""
 
-- Follow the skill instructions exactly - do not improvise blade commands
-- Capture the blade UID from every create command - it is needed for recovery
-- Report results in a structured format including blade_uid, status, and verification details
-- If verification fails, do NOT retry injection without user guidance"""
+    lines = [
+        "## Important Guidelines",
+        "",
+    ]
+    # Phase 1: Ground Truth in Workflow already covers this principle.
+    # Phase 2: still needs it because executor deals with tool errors directly.
+    if phase == 2:
+        lines.append(runtime_feedback)
+        lines.append("")
+
+    # Shared rule: both phases must follow skill instructions
+    lines.append(
+        "- Follow the skill instructions exactly — do not improvise injection commands"
+    )
+    base = "\n".join(lines)
 
     conflict_check = """### Pre-injection Conflict Check
 Conflict checking is performed automatically by the system before you are invoked.
@@ -115,67 +112,63 @@ You do NOT need to run additional conflict checks — focus on executing the fau
 def get_execution_directives_section(
     skill_name: str = "",
     structured_params_hint: str = "",
+    user_params_hint: str = "",
     plan: str = "",
     plan_path: str = "",
 ) -> str:
     """Execution phase directives for Phase 2 (execute_loop).
 
-    Replaces the inline exec_directives list that was previously in
-    builders.py, providing better testability and separation.
+    Tool-agnostic execution principles. Specific tool operation steps
+    (blade_help syntax, kubectl exec fallback) live in knowledge docs,
+    not here — per the abstraction layering design principle.
 
     Args:
         skill_name: Active skill name (optional).
         structured_params_hint: Pre-defined scope/target/action hint from CLI
             structured params (e.g., "scope=pod, target=cpu, action=fullload").
+        user_params_hint: JSON-serialised user-provided fault parameters.
         plan: Execution plan text.
         plan_path: Path to saved plan file.
     """
     parts = [
         "## EXECUTION PHASE DIRECTIVES",
-        "You are now in the execution phase. The plan has been approved.",
-        "Follow the skill instructions precisely to inject the fault.",
-        "Use blade_create to inject ChaosBlade faults, and kubectl for K8s operations.",
+        "The plan has been approved.",
         "",
-        "### Before Constructing blade_create Commands",
-        "Always call `blade_help(subcommand='create k8s <scope>-<target> <action>')` "
-        "BEFORE your first blade_create call to verify available flags and their syntax. "
-        "Use the help output — not memory or skill docs alone — to choose correct flags "
-        "(e.g. --mode ram for memory injection). Skill docs may omit optional flags "
-        "that are critical for the injection to take effect.",
+        "### Injection Failure Escalation",
+        "1. Try the standard injection tool based on skill case instructions",
+        "2. If it fails, READ the error — the error tells you what's actually wrong",
+        "3. Adapt parameters based on the error and retry",
+        "4. If adaptation fails, try alternative methods from the skill case",
+        "5. If all methods fail, output `[REPLAN]`",
+        "Do NOT improvise methods not listed in the skill case.",
         "",
-        "### When blade_create Fails",
-        "1. **Fallback — kubectl exec tool pod**:\n"
-        "   `kubectl get pods -n chaosblade -l app=otel-c-tool` → find a running pod →\n"
-        "   `kubectl exec <pod> -n chaosblade -- blade create k8s <scenario> [flags]`\n"
-        "   NOTE: no --kubeconfig inside blade command (pod uses ServiceAccount).\n"
-        "   Extract blade_uid from the JSON response.\n"
-        "2. **Constraint**: alternative methods MUST come from the skill case's "
-        "injection section. Do NOT improvise methods not listed there.\n"
-        "3. **If all methods exhausted** → output `[REPLAN]`.\n"
-        "4. If no tool pod available → consider kubectl-native alternatives "
-        "(scale/cordon/patch/taint).\n\n"
-        "Rules:\n"
-        "- timeout: auto-applied by tools; pass explicitly only if user specifies custom value\n"
-        "- blade_uid: always capture from response for recovery\n"
-        "- blast radius: must remain consistent with original plan\n"
-        "- report: notify user of any method switch",
+        "### Multi-Step Execution",
+        "When the skill case requires multiple injection steps:",
+        "- Execute each step IN ORDER",
+        "- Check result before proceeding to next step",
+        "- Continue until ALL steps are done — do NOT conclude after first success",
         "",
-        "### MULTI-STEP INJECTION (kubectl-native)",
-        "When the skill case requires multiple kubectl commands:\n"
-        "1. Execute each step IN ORDER\n"
-        "2. Check result before proceeding to next step\n"
-        "3. Continue until ALL steps are done — do NOT conclude after first success",
+        "### Parameter Priority",
+        "When the skill case template uses a default value and the user specified",
+        "a different value, the USER'S value takes priority.",
     ]
 
     if skill_name:
-        parts.append(f"Active skill: {skill_name}")
+        parts.append(f"\nActive skill: {skill_name}")
 
     if structured_params_hint:
         parts.append("")
         parts.append("### STRUCTURED FAULT PARAMETERS (pre-defined)")
-        parts.append("The user has pre-defined the fault parameters. Use these EXACT values for blade_create:")
+        parts.append("The user has pre-defined the fault parameters. Use these EXACT values:")
         parts.append(f"  {structured_params_hint}")
-        parts.append("Do NOT override these values. Construct the blade command from these parameters directly.")
+        parts.append("Do NOT override these values.")
+
+    if user_params_hint:
+        parts.append("")
+        parts.append("### USER-SPECIFIED PARAMETERS")
+        parts.append("The user provided these fault-specific parameters:")
+        parts.append(f"  {user_params_hint}")
+        parts.append("These user parameters always take priority over template defaults.")
 
     if plan:
         plan_ref = f" (saved at {plan_path})" if plan_path else ""
@@ -183,6 +176,5 @@ def get_execution_directives_section(
         parts.append(f"### EXECUTION PLAN{plan_ref}")
         parts.append("This task was assessed as complex. Execute step by step:")
         parts.append(f"---\n{plan}\n---")
-        parts.append("After completing all injection steps, verify results and report blade_uid for each experiment.")
 
     return "\n".join(parts)

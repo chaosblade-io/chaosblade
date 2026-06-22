@@ -29,8 +29,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import tool as lc_tool
 from pydantic import BeforeValidator
 
-from chaos_agent.config.settings import settings
 from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+from chaos_agent.agent.nodes.llm_step_helpers import (
+    build_stagnation_hint,
+    filter_stagnant_tool,
+)
 from chaos_agent.agent.nodes.react_helpers import (
     detect_action_stagnation,
     detect_repeated_tool_calls,
@@ -38,6 +41,7 @@ from chaos_agent.agent.nodes.react_helpers import (
 from chaos_agent.agent.prompts.builders import build_system_prompt
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.state import AgentState
+from chaos_agent.config.settings import settings
 from chaos_agent.memory.hook import merge_hook_updates
 from chaos_agent.memory.session_store import NO_SESSION_MARKER
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
@@ -191,7 +195,7 @@ def _allocate_operation_task_id(current_task_id: str) -> str:
     """
     if isinstance(current_task_id, str) and current_task_id.startswith("task-"):
         return current_task_id
-    return f"task-{uuid.uuid4().hex[:12]}"
+    return f"task-{uuid.uuid4()}"
 
 
 def _extract_classify_intent(tool_calls: list) -> Optional[dict]:
@@ -1437,38 +1441,28 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
         )
 
         # --- Anti-stagnation detection (same mechanism as agent_loop) ---
-        loop_hint = detect_repeated_tool_calls(messages)
-        _, stagnant_tool = detect_action_stagnation(messages)
+        loop_hint = detect_repeated_tool_calls(messages, phase="intent")
+        _, stagnant_tool = detect_action_stagnation(messages, phase="intent")
 
         intent_stagnation_hint = None
         if stagnant_tool:
+            intent_stagnation_hint = build_stagnation_hint(
+                stagnant_tool,
+                colon_suffix="",
+                else_actions=[
+                    "Call `submit_fault_intent` if you have collected enough fault parameters.",
+                    "Use a DIFFERENT tool (activate_skill, read_skill_resource) for more info.",
+                    "Output a plain text response to conclude this conversation turn.",
+                ],
+            )
             if ":" in stagnant_tool:
-                base_tool = stagnant_tool.split(":")[0]
-                intent_stagnation_hint = (
-                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` too many "
-                    f"consecutive times with no progress. Stop using this subcommand. "
-                    f"You can still use `{base_tool}` with OTHER subcommands.\n"
-                    f"- Call `submit_fault_intent` if you have collected enough fault parameters.\n"
-                    f"Do NOT call `{stagnant_tool}` again."
-                )
-            else:
-                intent_stagnation_hint = (
-                    f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` too many "
-                    f"consecutive times with no progress. This tool has been temporarily "
-                    f"removed. You MUST now either:\n"
-                    f"- Call `submit_fault_intent` if you have collected enough fault parameters.\n"
-                    f"- Use a DIFFERENT tool (activate_skill, read_skill_resource) for more info.\n"
-                    f"- Output a plain text response to conclude this conversation turn.\n"
-                    f"Do NOT attempt to call `{stagnant_tool}` again."
-                )
+                _submit_line = "- Call `submit_fault_intent` if you have collected enough fault parameters.\n"
+                _footer = f"Do NOT call `{stagnant_tool}` again."
+                intent_stagnation_hint = intent_stagnation_hint.replace(_footer, _submit_line + _footer)
 
-        tools_this_iter = list(tools or [])
-        if stagnant_tool and ":" not in stagnant_tool:
-            tools_this_iter = [
-                t for t in tools_this_iter
-                if getattr(t, "name", "") != stagnant_tool
-                or getattr(t, "name", "") == "submit_fault_intent"
-            ]
+        tools_this_iter = filter_stagnant_tool(
+            tools, stagnant_tool, preserve={"submit_fault_intent"},
+        )
 
         function_schemas = [CLASSIFY_INTENT_TOOL]
         llm_bound = llm.bind_tools(function_schemas + tools_this_iter)

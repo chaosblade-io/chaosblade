@@ -10,8 +10,14 @@ from chaos_agent.agent.node_names import EXECUTE_LOOP
 from chaos_agent.agent.nodes._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
+    sync_kubewiz_runtime,
 )
 from chaos_agent.agent.nodes._store_sync import sync_to_store
+from chaos_agent.agent.nodes.llm_step_helpers import (
+    build_stagnation_hint,
+    filter_stagnant_tool,
+    post_invoke_debug,
+)
 from chaos_agent.agent.nodes.react_helpers import (
     detect_action_stagnation,
     detect_repeated_tool_calls,
@@ -22,13 +28,13 @@ from chaos_agent.agent.nodes.react_helpers import (
     log_reasoning_content,
     record_ai_message,
     record_system_prompt,
-    summarize_llm_response,
 )
 from chaos_agent.agent.prompts import REPLAN_MARKER
+from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState
-from chaos_agent.config.settings import settings
 from chaos_agent.agent.state_helpers import fail_state
 from chaos_agent.agent.verdict import FailureCategory
+from chaos_agent.config.settings import settings
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
@@ -389,6 +395,331 @@ def _detect_injection_method(messages: list, blade_uid: str | None) -> str | Non
 
     return None
 
+def _build_execution_hints(
+    messages: list,
+    state: AgentState,
+) -> tuple[list[HumanMessage], str | None]:
+    """Build all execution-phase hints to inject before the LLM call.
+
+    Returns (hints, stagnant_tool) where stagnant_tool is the tool name
+    that should be filtered from bindings, or None.
+    """
+    hints: list[HumanMessage] = []
+
+    loop_hint = detect_repeated_tool_calls(messages, phase="execute")
+    if loop_hint:
+        hints.append(HumanMessage(content=loop_hint))
+
+    _, stagnant_tool = detect_action_stagnation(messages, phase="execute")
+    if stagnant_tool:
+        exec_hint = build_stagnation_hint(
+            stagnant_tool,
+            colon_suffix="(patch, delete, scale, etc.) to complete remaining injection steps",
+            else_actions=[
+                "Use a DIFFERENT tool to achieve the injection goal.",
+                "Output your conclusion if injection already succeeded "
+                "(include blade_uid if available).",
+                "Output [REPLAN] if the current approach is not working.",
+            ],
+        )
+        hints.append(HumanMessage(content=exec_hint))
+
+    error_hint = detect_tool_error_hint(messages)
+    if error_hint:
+        hints.append(HumanMessage(content=error_hint))
+
+    try:
+        _max_replan = int(settings.max_replan_count)
+    except (TypeError, ValueError):
+        _max_replan = 2
+    replan_exhausted = state.get("replan_count", 0) >= _max_replan
+    idle_hint = _detect_consecutive_idle_turns(
+        messages, replan_exhausted=replan_exhausted
+    )
+    if idle_hint:
+        hints.append(HumanMessage(content=idle_hint))
+
+    # conflict_uids: already handled by the pre-execution conflict gate.
+    # Residual experiments are NOT the executor's concern — do NOT inject
+    # hints about them, as they cause the LLM to investigate/verify instead
+    # of focusing on its injection task.
+
+    return hints, stagnant_tool
+
+
+def _process_response_tool_calls(
+    response,
+    state: AgentState,
+    result: dict,
+    tracker,
+    count: int,
+) -> None:
+    """Process tool_calls from the LLM response: blade params, FCAT, scale tracking."""
+    tool_calls = getattr(response, "tool_calls", None) or []
+    for tc in tool_calls:
+        tc_name, tc_args = extract_tool_call_fields(tc)
+
+        if tc_name == "blade_create":
+            flags_str = tc_args.get("flags", "")
+            if flags_str:
+                from chaos_agent.utils.fault_type import parse_blade_flags
+                parsed = parse_blade_flags(flags_str)
+                if parsed:
+                    result["blade_parsed_flags"] = parsed
+            logger.info(f"Blade create params: {tc_args}")
+
+            target_metadata = state.get("target_metadata") or {}
+            from chaos_agent.utils.fault_context import (
+                lookup_adaptations, compute_safe_burn_size,
+            )
+            from chaos_agent.agent.fault_spec import read_fault_spec as _rfs
+            _spec_for_fcat = _rfs(state)
+            _scope = (_spec_for_fcat.scope if _spec_for_fcat else "") or tc_args.get("scope", "")
+            _target = (_spec_for_fcat.blade_target if _spec_for_fcat else "") or tc_args.get("target", "")
+            _action = (_spec_for_fcat.blade_action if _spec_for_fcat else "") or tc_args.get("action", "")
+            adaptations = lookup_adaptations(
+                _scope, _target, _action, target_metadata,
+                rule_type="param_override",
+            )
+            for adj in adaptations:
+                if adj.mode in ("llm", "both") and "param_overrides" in adj.action:
+                    for key, val in adj.action["param_overrides"].items():
+                        if key == "size" and val == "auto":
+                            safe_size = compute_safe_burn_size(
+                                target_metadata.get("pod_memory_limit_mb")
+                            )
+                            tc_args[key] = str(safe_size)
+                        else:
+                            tc_args[key] = val
+                    logger.info(
+                        "FCAT: %s applied, params adjusted: %s",
+                        adj.id, adj.action["param_overrides"],
+                    )
+                    from chaos_agent.memory.session_store import get_global_session_store
+                    _fcat_store = get_global_session_store()
+                    _fcat_tid = state.get("task_id", "")
+                    if _fcat_store and _fcat_tid:
+                        _mem_str = (
+                            "unavailable" if target_metadata.get("pod_memory_limit_mb") is None
+                            else f"{target_metadata.get('pod_memory_limit_mb')}MB"
+                        )
+                        _fcat_msg = f"[FCAT P0] {adj.id}: size adjusted to {tc_args.get(key, safe_size)}MB (pod_memory_limit={_mem_str})"
+                        _fcat_store.append_messages(_fcat_tid, [HumanMessage(content=_fcat_msg)], node_name=EXECUTE_LOOP)
+                    if settings.is_debug and tracker:
+                        _mem_str_dbg = (
+                            "unavailable" if target_metadata.get("pod_memory_limit_mb") is None
+                            else f"{target_metadata.get('pod_memory_limit_mb')}MB"
+                        )
+                        tracker.update(
+                            f"[FCAT P0] {adj.id}: size→{tc_args.get(key, safe_size)}MB (pod_mem={_mem_str_dbg})"[:200],
+                            {"debug": True, "fcat": True},
+                        )
+
+        if tc_name == "kubectl" and tc_args.get("subcommand") == "exec":
+            v_args = tc_args.get("v_args", "") or ""
+            if "blade" in v_args and "create" in v_args:
+                parsed = _parse_blade_create_from_v_args(v_args)
+                if parsed:
+                    flags_str = parsed.get("flags", "")
+                    if flags_str:
+                        from chaos_agent.utils.fault_type import parse_blade_flags
+                        parsed_flags = parse_blade_flags(flags_str)
+                        if parsed_flags:
+                            result["blade_parsed_flags"] = parsed_flags
+                    logger.info(
+                        f"Kubectl exec blade params: scope={parsed['scope']}, "
+                        f"target={parsed['target']}, action={parsed['action']}"
+                    )
+
+        if tc_name == "kubectl" and tc_args.get("subcommand") == "scale":
+            v_args = tc_args.get("v_args", "")
+            import re as _re
+            replicas_match = _re.search(r"--replicas=(\d+)", v_args)
+            resource_match = _re.search(
+                r"(?:deployment|statefulset)\s+(\S+)", v_args
+            )
+            if replicas_match and resource_match:
+                new_replicas = int(replicas_match.group(1))
+                resource_name = resource_match.group(1)
+                existing = state.get("original_replicas") or {}
+                if resource_name not in existing:
+                    orig_count = _extract_original_replicas_from_messages(
+                        state.get("messages", []), resource_name
+                    )
+                    if orig_count is not None and orig_count != new_replicas:
+                        existing[resource_name] = orig_count
+                        result["original_replicas"] = existing
+                        logger.info(
+                            f"Recorded original_replicas: {resource_name}={orig_count}"
+                        )
+
+    post_invoke_debug(tracker, response, count, "Iteration")
+
+
+def _detect_terminal_conclusion(
+    response,
+    state: AgentState,
+    result: dict,
+) -> None:
+    """Detect when LLM gives a text-only terminal conclusion in Phase 2.
+
+    The executor's job is ONLY injection. When the LLM outputs text (no
+    tool_calls), we check whether it has actually performed an injection
+    action. If an injection method has been detected (blade_uid set or
+    injection_method detected), the text conclusion is the natural exit
+    signal — do NOT nudge it back. Only nudge when NO injection action
+    has been taken at all.
+    """
+    _has_tool_calls = bool(getattr(response, "tool_calls", None))
+    _has_uid = bool(result.get("blade_uid") or state.get("blade_uid"))
+    _injection_method = result.get("injection_method") or state.get("injection_method")
+    _resp_content = (getattr(response, "content", "") or "").strip()
+
+    # If LLM already performed injection (uid set or method detected),
+    # a text conclusion is the correct exit — let it through.
+    if _has_uid or _injection_method:
+        return
+
+    if (
+        not _has_tool_calls
+        and not result.get("error")
+        and _resp_content
+        and REPLAN_MARKER not in _resp_content
+    ):
+        if not state.get("_execute_text_nudged"):
+            result.setdefault("messages", []).append(
+                HumanMessage(content=(
+                    "**EXECUTION REQUIRED**: You output text instead of "
+                    "calling a tool. You are in Phase 2 (execution) — "
+                    "the plan is already approved. You MUST call "
+                    "`kubectl` or `blade_create` NOW to inject the "
+                    "fault. Do NOT output plans, summaries, or wait "
+                    "for confirmation. Execute immediately."
+                ))
+            )
+            result["_execute_text_nudged"] = True
+        else:
+            result.update(fail_state(
+                FailureCategory.EXECUTION_FAILED,
+                "LLM concluded without tool use",
+                state.get("messages", []) + result.get("messages", []),
+            ))
+
+    if (
+        not _has_tool_calls
+        and _injection_method == "kubectl_native"
+        and not state.get("_kubectl_step_nudged")
+    ):
+        from chaos_agent.agent.nodes._injection_detection import (
+            check_injection_step_completeness,
+        )
+        _skill_case = (
+            result.get("skill_case_content")
+            or state.get("skill_case_content", "")
+        )
+        _all_msgs = (
+            state.get("messages", [])
+            + result.get("messages", [])
+        )
+        _nudge = check_injection_step_completeness(
+            _skill_case, _all_msgs,
+        )
+        if _nudge:
+            logger.info(
+                "kubectl_native step completeness: incomplete, "
+                "nudging LLM to continue"
+            )
+            result.setdefault("messages", []).append(
+                HumanMessage(content=_nudge)
+            )
+            result["injection_method"] = None
+            result["_kubectl_step_nudged"] = True
+
+
+def _handle_replan(
+    response,
+    state: AgentState,
+    result: dict,
+) -> None:
+    """Detect [REPLAN] requests (explicit or auto) and apply state transitions."""
+    replan_requested = False
+    replan_context = None
+
+    if response is not None:
+        content = getattr(response, "content", "") or ""
+        if REPLAN_MARKER in content:
+            replan_requested = True
+            replan_context = _build_replan_context(state, content)
+            logger.info(f"Phase 2 LLM requested replan: {content[:200]}")
+
+    if not replan_requested:
+        all_messages = state.get("messages", [])
+        error_msg = _detect_replanable_tool_error(all_messages)
+        if error_msg:
+            if _is_llm_handling_blade_error(all_messages):
+                logger.warning(
+                    "LLM is switching injection method — safety re-evaluation "
+                    "not triggered for method switch"
+                )
+            else:
+                replan_requested = True
+                replan_context = _build_replan_context(state, error_msg)
+                logger.info(f"Auto-detected replanable error: {error_msg[:200]}")
+
+    if not replan_requested:
+        return
+
+    try:
+        _max_replan = int(settings.max_replan_count)
+    except (TypeError, ValueError):
+        _max_replan = 2
+    current_replan_count = state.get("replan_count", 0)
+    replan_can_fire = current_replan_count < _max_replan
+
+    if replan_can_fire:
+        result["replan_requested"] = True
+        result["replan_context"] = replan_context
+        result["replan_count"] = current_replan_count + 1
+        if settings.replan_reset_execute_count:
+            result["execute_loop_count"] = 0
+        result["error"] = None
+        result["approved_target"] = None
+        if not replan_context.get("existing_blade_uids"):
+            result["blade_uid"] = None
+        history = list(state.get("replan_history") or [])
+        history.append({
+            "attempt": result["replan_count"],
+            "original_error": replan_context.get("error_summary", ""),
+            "action_taken": "(pending Phase 1 analysis)",
+        })
+        result["replan_history"] = history
+        from chaos_agent.agent.attempt_tracker import (
+            REASON_GRAPH_REPLAN,
+            begin_attempt,
+        )
+        attempt_delta = begin_attempt(
+            {**state, **result},
+            target=state.get("fault_spec"),
+            reason=REASON_GRAPH_REPLAN,
+            notes=replan_context.get("error_summary", "")[:200],
+        )
+        result.update(attempt_delta)
+    else:
+        _fs = fail_state(
+            FailureCategory.REPLAN_EXHAUSTED,
+            f"attempts={current_replan_count}, last_error={(replan_context or {}).get('error_summary', '')[:200]}",
+            state.get("messages", []) + result.get("messages", []),
+        )
+        result.update(_fs)
+        result["replan_requested"] = False
+        logger.warning(
+            "Replan exhausted: LLM emitted [REPLAN] but "
+            "replan_count=%d already at max=%d; converting to "
+            "terminal failure",
+            current_replan_count, _max_replan,
+        )
+
+
 async def execute_loop(state: AgentState) -> dict:
     """Phase 2: ReAct loop for execution.
 
@@ -397,7 +728,7 @@ async def execute_loop(state: AgentState) -> dict:
     Returns updated state fields.
     """
     task_id = state.get("task_id", "unknown")
-    skill_name = state.get("skill_name", "")
+    skill_name = read_active_skill_name(state)
     count = state.get("execute_loop_count", 0) + 1
 
     tracker = get_tracker(task_id)
@@ -449,7 +780,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
 
         # 1. Iteration count + limit check
         task_id = state.get("task_id", "unknown")
-        skill_name = state.get("skill_name", "")
+        skill_name = read_active_skill_name(state)
         count = state.get("execute_loop_count", 0) + 1
 
         tracker = get_tracker(task_id)
@@ -541,78 +872,9 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         if llm is not None:
             messages = list(state.get("messages", []))
 
-            # --- Repeated tool call detection (loop breaking) ---
-            loop_hint = detect_repeated_tool_calls(messages)
-            if loop_hint:
-                messages.append(HumanMessage(content=loop_hint))
-
-            # --- Action stagnation detection (tool-name level, ignores args) ---
-            stagnation_hint, stagnant_tool = detect_action_stagnation(messages)
-            if stagnation_hint:
-                if ":" in stagnant_tool:
-                    base_tool = stagnant_tool.split(":")[0]
-                    exec_hint = (
-                        f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
-                        f"multiple consecutive times with no progress. "
-                        f"Stop using this subcommand. You can still use `{base_tool}` "
-                        f"with OTHER subcommands (patch, delete, scale, etc.) "
-                        f"to complete remaining injection steps.\n"
-                        f"Do NOT call `{stagnant_tool}` again."
-                    )
-                else:
-                    exec_hint = (
-                        f"**ACTION_STAGNATION**: You have called `{stagnant_tool}` "
-                        f"multiple consecutive times with no progress. "
-                        f"This tool has been temporarily removed. You MUST now either:\n"
-                        f"- Use a DIFFERENT tool to achieve the injection goal.\n"
-                        f"- Output your conclusion if injection already succeeded "
-                        f"(include blade_uid if available).\n"
-                        f"- Output [REPLAN] if the current approach is not working.\n"
-                        f"Do NOT attempt to call `{stagnant_tool}` again."
-                    )
-                messages.append(HumanMessage(content=exec_hint))
-
-            # --- Tool error introspection (runtime feedback > static docs) ---
-            error_hint = detect_tool_error_hint(messages)
-            if error_hint:
-                messages.append(HumanMessage(content=error_hint))
-
-            # --- Consecutive idle turn detection (text-only loop breaking) ---
-            #
-            # Pass ``replan_exhausted`` so the hint stops suggesting
-            # ``[REPLAN]`` once the router can no longer act on it.
-            # Without this, the LLM follows the hint, the router
-            # falls through to "continue" (because ``_should_replan``
-            # returns False at max), and we burn iterations on
-            # identical replan-requesting responses until Esc — the
-            # exact loop reported by users on environment-blocked
-            # injections (DiskPressure, etc.).
-            try:
-                _max_replan = int(settings.max_replan_count)
-            except (TypeError, ValueError):
-                _max_replan = 2
-            replan_exhausted = state.get("replan_count", 0) >= _max_replan
-            idle_hint = _detect_consecutive_idle_turns(
-                messages, replan_exhausted=replan_exhausted
-            )
-            if idle_hint:
-                messages.append(HumanMessage(content=idle_hint))
-
-            # --- Conflict awareness (pre-existing experiments known to be on the cluster) ---
-            conflict_uids = state.get("conflict_uids", [])
-            if conflict_uids:
-                uids_str = ", ".join(conflict_uids[:5])
-                total = len(conflict_uids)
-                messages.append(HumanMessage(content=(
-                    f"**Residual Experiments Detected**: {total} active ChaosBlade experiment(s) "
-                    f"already exist on this cluster (UIDs: {uids_str}). "
-                    f"The user was informed and chose to proceed. You MUST:\n"
-                    f"1. Be aware of potential compound effects with these existing experiments.\n"
-                    f"2. Include a note about existing experiments in your conclusion.\n"
-                    f"3. Only destroy your own experiment (blade_uid from your blade_create call) "
-                    f"during recovery. Do NOT destroy the listed residual experiments unless "
-                    f"explicitly requested by the user."
-                )))
+            # --- Execution hints (stagnation, idle, conflict, errors) ---
+            hints, stagnant_tool = _build_execution_hints(messages, state)
+            messages.extend(hints)
 
             # --- Convergence hints (last-iteration conclusion prompts) ---
             remaining = MAX_EXECUTE_LOOP - count
@@ -621,21 +883,22 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 messages.append(HumanMessage(content=(
                     f"**Iteration Progress**: You are on iteration {count} of max {MAX_EXECUTE_LOOP} "
                     f"({remaining} remaining). "
-                    f"If fault injection has not succeeded yet, focus on completing the blade_create call "
-                    f"with correct parameters. If repeated attempts fail, consider outputting [REPLAN] "
-                    f"to request a revised plan from Phase 1."
+                    f"Your ONLY job is to execute the injection command. "
+                    f"If you have already called blade_create or executed the kubectl injection "
+                    f"commands and they returned success, output a brief conclusion NOW and stop "
+                    f"calling tools. Do NOT verify injection effects — that is the verifier's job. "
+                    f"If injection has not been attempted yet, execute it now. "
+                    f"If repeated attempts fail, output [REPLAN]."
                 )))
             elif count == MAX_EXECUTE_LOOP - 1:
                 # Tier 2: Urgent warning — second-to-last iteration
                 messages.append(HumanMessage(content=(
                     f"**CRITICAL WARNING**: This is iteration {count} of max {MAX_EXECUTE_LOOP} — "
                     f"your SECOND-TO-LAST iteration.\n"
-                    f"If fault injection has not succeeded:\n"
-                    f"  - Make ONE final attempt with blade_create using the correct parameters.\n"
-                    f"  - If you cannot succeed, output [REPLAN] to request a new plan, "
-                    f"or provide a brief conclusion explaining the failure.\n"
-                    f"If injection already succeeded (blade_create returned a UID), "
-                    f"output a brief summary and stop calling tools."
+                    f"If injection was already executed successfully, output a brief conclusion "
+                    f"with the blade_uid and STOP. Do NOT call any more tools.\n"
+                    f"If injection has not been attempted, make ONE final attempt now.\n"
+                    f"If injection failed, output [REPLAN] or a brief failure conclusion."
                 )))
             elif count >= MAX_EXECUTE_LOOP:
                 # Tier 3: Final conclusion — tools unbound, must provide conclusion
@@ -643,11 +906,9 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     f"**FINAL ITERATION**: This is iteration {count} of max {MAX_EXECUTE_LOOP}. "
                     f"NO more iterations are available. Tools are no longer available.\n"
                     f"You MUST provide a definitive conclusion NOW:\n"
-                    f"1. **If injection succeeded** (a blade_uid was obtained in earlier iterations): "
-                    f"State the blade_uid and confirm what fault was injected.\n"
-                    f"2. **If injection failed**: Explain the specific failure reason — "
-                    f"what you attempted, what errors occurred, and why injection could not be completed.\n"
-                    f"3. **If you need a new plan**: Output [REPLAN] to request Phase 1 re-planning.\n\n"
+                    f"1. **If injection succeeded**: State the blade_uid and what fault was injected.\n"
+                    f"2. **If injection failed**: Explain the specific failure reason.\n"
+                    f"3. **If you need a new plan**: Output [REPLAN].\n\n"
                     f"Your response will be recorded as the final execution result."
                 )))
 
@@ -667,6 +928,12 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     f"target={_spec_for_hint.blade_target}, "
                     f"action={_spec_for_hint.blade_action}"
                 )
+            # Build user_params_hint from FaultSpec.params so user-specified
+            # values (e.g. finalizer=...) take priority over skill template
+            # placeholders during Phase 2 execution.
+            user_params_hint = ""
+            if _spec_for_hint and _spec_for_hint.params:
+                user_params_hint = json.dumps(dict(_spec_for_hint.params), ensure_ascii=False)
             # Resolve env_info: prefer constructor arg, fallback to dynamic computation
             resolved_env_info = env_info or await compute_env_info(task_id)
             execute_prompt = build_system_prompt(
@@ -676,18 +943,14 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 plan=plan or "",
                 plan_path=plan_path or "",
                 structured_params_hint=structured_params_hint,
+                user_params_hint=user_params_hint,
                 env_info=resolved_env_info,
             )
             # On last iteration, unbind tools to force text conclusion
             if count >= MAX_EXECUTE_LOOP:
                 llm_to_call = llm
             else:
-                tools_this_iter = list(tools) if tools else []
-                if stagnant_tool and ":" not in stagnant_tool:
-                    tools_this_iter = [
-                        t for t in tools_this_iter
-                        if getattr(t, "name", "") != stagnant_tool
-                    ]
+                tools_this_iter = filter_stagnant_tool(tools, stagnant_tool)
                 llm_to_call = llm.bind_tools(tools_this_iter) if tools_this_iter else llm
 
             # Record system prompt to session store (dedup handles repeated prompts)
@@ -760,6 +1023,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             # has the correct kubeconfig, even if the LLM forgot to include it.
             kubeconfig = _resolve_kubeconfig(state)
             inject_kubeconfig_into_tool_calls(response, kubeconfig)
+            sync_kubewiz_runtime(state)
 
             result["messages"] = [response]
 
@@ -769,228 +1033,13 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             # Diagnostic log for reasoning_content presence
             log_reasoning_content(response, "Execute loop", count)
 
-            # Extract blade_uid and params from blade_create tool calls
-            tool_calls = getattr(response, "tool_calls", None) or []
-            for tc in tool_calls:
-                tc_name, tc_args = extract_tool_call_fields(tc)
-
-                if tc_name == "blade_create":
-                    # Note: scope/target/action/params are NOT written back
-                    # to state — they're already pinned on fault_spec by
-                    # intent_clarification and target_guard prevents drift.
-                    # Mid-loop write would create stale duplicates that
-                    # mask the user-approved values.
-                    # Parse key parameters from flags string for verifier consumption
-                    flags_str = tc_args.get("flags", "")
-                    if flags_str:
-                        from chaos_agent.utils.fault_type import parse_blade_flags
-                        parsed = parse_blade_flags(flags_str)
-                        if parsed:
-                            result["blade_parsed_flags"] = parsed
-                    # Namespace harvest from LLM-emitted blade_create no longer
-                    # writes to state.target — fault_spec is the source of
-                    # truth and target_guard intercepts any drift. The LLM
-                    # passing a different namespace than approved would have
-                    # been logged by the screener.
-                    logger.info(f"Blade create params: {tc_args}")
-
-                    # FCAT P0: param safety guard for LLM mode
-                    # Adjust burn --size when target pod has low memory limit.
-                    target_metadata = state.get("target_metadata") or {}
-                    from chaos_agent.utils.fault_context import (
-                        lookup_adaptations, compute_safe_burn_size,
-                    )
-                    from chaos_agent.agent.fault_spec import read_fault_spec as _rfs
-                    _spec_for_fcat = _rfs(state)
-                    _scope = (_spec_for_fcat.scope if _spec_for_fcat else "") or tc_args.get("scope", "")
-                    _target = (_spec_for_fcat.blade_target if _spec_for_fcat else "") or tc_args.get("target", "")
-                    _action = (_spec_for_fcat.blade_action if _spec_for_fcat else "") or tc_args.get("action", "")
-                    adaptations = lookup_adaptations(
-                        _scope, _target, _action, target_metadata,
-                        rule_type="param_override",
-                    )
-                    for adj in adaptations:
-                        if adj.mode in ("llm", "both") and "param_overrides" in adj.action:
-                            for key, val in adj.action["param_overrides"].items():
-                                if key == "size" and val == "auto":
-                                    safe_size = compute_safe_burn_size(
-                                        target_metadata.get("pod_memory_limit_mb")
-                                    )
-                                    tc_args[key] = str(safe_size)
-                                else:
-                                    tc_args[key] = val
-                            logger.info(
-                                "FCAT: %s applied, params adjusted: %s",
-                                adj.id, adj.action["param_overrides"],
-                            )
-                            # Write FCAT P0 decision to session for audit trail
-                            from chaos_agent.memory.session_store import get_global_session_store
-                            from langchain_core.messages import HumanMessage as _HM
-                            _fcat_store = get_global_session_store()
-                            _fcat_tid = state.get("task_id", "")
-                            if _fcat_store and _fcat_tid:
-                                _mem_str = (
-                                    "unavailable" if target_metadata.get("pod_memory_limit_mb") is None
-                                    else f"{target_metadata.get('pod_memory_limit_mb')}MB"
-                                )
-                                _fcat_msg = f"[FCAT P0] {adj.id}: size adjusted to {tc_args.get(key, safe_size)}MB (pod_memory_limit={_mem_str})"
-                                _fcat_store.append_messages(_fcat_tid, [_HM(content=_fcat_msg)], node_name=EXECUTE_LOOP)
-                            # Debug-mode CLI display (truncated)
-                            if settings.is_debug and tracker:
-                                _mem_str_dbg = (
-                                    "unavailable" if target_metadata.get("pod_memory_limit_mb") is None
-                                    else f"{target_metadata.get('pod_memory_limit_mb')}MB"
-                                )
-                                tracker.update(
-                                    f"[FCAT P0] {adj.id}: size→{tc_args.get(key, safe_size)}MB (pod_mem={_mem_str_dbg})"[:200],
-                                    {"debug": True, "fcat": True},
-                                )
-
-                # Extract params from kubectl exec blade create (fallback path)
-                # When the LLM bypasses blade_create tool by using kubectl exec
-                # to run blade commands inside a cluster pod, the actual fault
-                # parameters are embedded in v_args.  Parse them out so that
-                # fault_type, verifier hints, and status API reflect the real
-                # injection — not the stale params from a prior blade_create.
-                if tc_name == "kubectl" and tc_args.get("subcommand") == "exec":
-                    v_args = tc_args.get("v_args", "") or ""
-                    if "blade" in v_args and "create" in v_args:
-                        parsed = _parse_blade_create_from_v_args(v_args)
-                        if parsed:
-                            # Same reasoning as the blade_create branch above:
-                            # scope/target/action/params are pinned on
-                            # fault_spec and target_guard prevents drift,
-                            # so we don't shadow them with LLM-derived
-                            # values here. Only blade_parsed_flags (a
-                            # pure runtime artefact) is harvested.
-                            flags_str = parsed.get("flags", "")
-                            if flags_str:
-                                from chaos_agent.utils.fault_type import parse_blade_flags
-                                parsed_flags = parse_blade_flags(flags_str)
-                                if parsed_flags:
-                                    result["blade_parsed_flags"] = parsed_flags
-                            logger.info(
-                                f"Kubectl exec blade params: scope={parsed['scope']}, "
-                                f"target={parsed['target']}, action={parsed['action']}"
-                            )
-
-                # Track kubectl scale operations to preserve original replica counts
-                if tc_name == "kubectl" and tc_args.get("subcommand") == "scale":
-                    v_args = tc_args.get("v_args", "")
-                    # Extract resource name and new replica count from v_args
-                    # e.g. "deployment accounting -n cms-demo --replicas=1"
-                    import re as _re
-                    replicas_match = _re.search(r"--replicas=(\d+)", v_args)
-                    # Match "deployment <name>" or "statefulset <name>"
-                    resource_match = _re.search(
-                        r"(?:deployment|statefulset)\s+(\S+)", v_args
-                    )
-                    if replicas_match and resource_match:
-                        new_replicas = int(replicas_match.group(1))
-                        resource_name = resource_match.group(1)
-                        # Only record if we don't already have the original count
-                        existing = state.get("original_replicas") or {}
-                        if resource_name not in existing:
-                            # We need the original count from pre-injection state.
-                            # Try to extract from messages (Phase 1 verification output)
-                            orig_count = _extract_original_replicas_from_messages(
-                                state.get("messages", []), resource_name
-                            )
-                            if orig_count is not None and orig_count != new_replicas:
-                                existing[resource_name] = orig_count
-                                result["original_replicas"] = existing
-                                logger.info(
-                                    f"Recorded original_replicas: {resource_name}={orig_count}"
-                                )
-
-            # Emit debug-level status event with LLM reasoning summary
-            if settings.is_debug:
-                debug_info, tool_names = summarize_llm_response(response)
-                tracker.update(
-                    f"Iteration {count} LLM:\n{debug_info}",
-                    {"debug": True, "iteration": count, "tool_calls": tool_names},
-                )
+            _process_response_tool_calls(response, state, result, tracker, count)
 
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result, hook_updates)
 
-        # --- Terminal conclusion detection ---
-        # In Phase 2, the LLM has tools bound. Text-only output (no
-        # tool_calls) means the LLM has concluded — it either cannot
-        # inject or is summarizing a result. If no blade_uid exists,
-        # the injection didn't happen; mark as failure so the router's
-        # existing error-branch ends the loop. Without this, the router
-        # returns "continue" and the LLM repeats the same conclusion.
-        # Skip when content contains [REPLAN] — the replan logic below
-        # handles that path with proper state transitions.
         if response is not None:
-            _has_tool_calls = bool(getattr(response, "tool_calls", None))
-            _has_uid = bool(result.get("blade_uid") or state.get("blade_uid"))
-            _injection_method = result.get("injection_method") or state.get("injection_method")
-            _resp_content = (getattr(response, "content", "") or "").strip()
-            if (
-                not _has_tool_calls
-                and not _has_uid
-                and not result.get("error")
-                and _resp_content
-                and REPLAN_MARKER not in _resp_content
-                and not _injection_method
-            ):
-                if not state.get("_execute_text_nudged"):
-                    # First text-only output: nudge LLM to execute instead
-                    # of summarizing. Give it one more chance before failing.
-                    result.setdefault("messages", []).append(
-                        HumanMessage(content=(
-                            "**EXECUTION REQUIRED**: You output text instead of "
-                            "calling a tool. You are in Phase 2 (execution) — "
-                            "the plan is already approved. You MUST call "
-                            "`kubectl` or `blade_create` NOW to inject the "
-                            "fault. Do NOT output plans, summaries, or wait "
-                            "for confirmation. Execute immediately."
-                        ))
-                    )
-                    result["_execute_text_nudged"] = True
-                else:
-                    result.update(fail_state(
-                        FailureCategory.EXECUTION_FAILED,
-                    "LLM concluded without tool use",
-                    state.get("messages", []) + result.get("messages", []),
-                ))
-
-            # --- kubectl_native step completeness check ---
-            # When the LLM concludes (text-only) after a kubectl_native
-            # injection, verify all skill case 演练步骤 have been executed.
-            # If steps are missing, nudge the LLM to continue and clear
-            # injection_method so the router returns "continue".
-            if (
-                not _has_tool_calls
-                and _injection_method == "kubectl_native"
-                and not state.get("_kubectl_step_nudged")
-            ):
-                from chaos_agent.agent.nodes._injection_detection import (
-                    check_injection_step_completeness,
-                )
-                _skill_case = (
-                    result.get("skill_case_content")
-                    or state.get("skill_case_content", "")
-                )
-                _all_msgs = (
-                    state.get("messages", [])
-                    + result.get("messages", [])
-                )
-                _nudge = check_injection_step_completeness(
-                    _skill_case, _all_msgs,
-                )
-                if _nudge:
-                    logger.info(
-                        "kubectl_native step completeness: incomplete, "
-                        "nudging LLM to continue"
-                    )
-                    result.setdefault("messages", []).append(
-                        HumanMessage(content=_nudge)
-                    )
-                    result["injection_method"] = None
-                    result["_kubectl_step_nudged"] = True
+            _detect_terminal_conclusion(response, state, result)
 
         # --- Last-iteration failure attribution ---
         if count >= MAX_EXECUTE_LOOP:
@@ -1003,127 +1052,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 )
                 result.update(_fs)
 
-        # --- Replan detection ---
-        replan_requested = False
-        replan_context = None
-
-        if response is not None:
-            content = getattr(response, "content", "") or ""
-            # 1. LLM explicitly outputs [REPLAN]
-            if REPLAN_MARKER in content:
-                replan_requested = True
-                replan_context = _build_replan_context(state, content)
-                logger.info(f"Phase 2 LLM requested replan: {content[:200]}")
-
-        # 2. Auto-detect from error in blade_create ToolMessages
-        #    BUT suppress if the LLM is already actively handling the error
-        #    (e.g., trying kubectl exec blade or kubectl-native alternatives)
-        if not replan_requested:
-            all_messages = state.get("messages", [])
-            error_msg = _detect_replanable_tool_error(all_messages)
-            if error_msg:
-                if _is_llm_handling_blade_error(all_messages):
-                    logger.warning(
-                        "LLM is switching injection method — safety re-evaluation "
-                        "not triggered for method switch"
-                    )
-                else:
-                    replan_requested = True
-                    replan_context = _build_replan_context(state, error_msg)
-                    logger.info(f"Auto-detected replanable error: {error_msg[:200]}")
-
-        if replan_requested:
-            # Gate the replan side-effects on ``replan_count <
-            # max_replan_count``. Without this gate, [REPLAN]
-            # detection would always (a) reset ``execute_loop_count``
-            # to 0, (b) clear ``error`` to None, and (c) increment
-            # ``replan_count`` past max. Once max is reached the
-            # router refuses the "replan" branch (``_should_replan``
-            # returns False) but the cleared error / reset count
-            # mean it ALSO can't take the "end" branch — it falls
-            # through to "continue", the LLM keeps following the
-            # convergence-hint instruction to emit ``[REPLAN]``, and
-            # the loop never terminates short of user Esc. Reported
-            # symptom: identical "[REPLAN]" replies emitted forever
-            # on hard-blocked injections (DiskPressure / API
-            # errors). The fix splits the two branches so a
-            # post-max [REPLAN] becomes an honest terminal failure
-            # the router CAN end on.
-            try:
-                _max_replan = int(settings.max_replan_count)
-            except (TypeError, ValueError):
-                _max_replan = 2
-            current_replan_count = state.get("replan_count", 0)
-            replan_can_fire = current_replan_count < _max_replan
-
-            if replan_can_fire:
-                result["replan_requested"] = True
-                result["replan_context"] = replan_context
-                result["replan_count"] = current_replan_count + 1
-                # Reset execute_loop_count for fresh budget on re-entry
-                if settings.replan_reset_execute_count:
-                    result["execute_loop_count"] = 0
-                # Clear error (moved to replan_context, global error triggers "end")
-                result["error"] = None
-                # Clear the frozen approved_target so the next
-                # confirmation_gate (after agent_loop re-plans) freezes
-                # a fresh approval. Without this, the screener would
-                # compare new tool_calls against the stale approval
-                # whose plan we just decided to abandon.
-                result["approved_target"] = None
-                # Conditionally preserve blade_uid
-                if not replan_context.get("existing_blade_uids"):
-                    result["blade_uid"] = None
-                # Update replan_history
-                history = list(state.get("replan_history") or [])
-                history.append({
-                    "attempt": result["replan_count"],
-                    "original_error": replan_context.get("error_summary", ""),
-                    "action_taken": "(pending Phase 1 analysis)",
-                })
-                result["replan_history"] = history
-                # Patch E — graph-level replan is a clear attempt boundary.
-                # Begin a new pipeline attempt so the TUI / TaskStore
-                # show "attempt #N · graph_replan: <error_summary>"
-                # rather than the user perceiving silent retry. The
-                # ``target`` is the same one Phase 1 will revisit;
-                # whether Phase 1 picks a different target is recorded
-                # as a refinement of the same attempt (no new
-                # begin_attempt) — until LLM-internal target-switch
-                # detection lands as follow-up work.
-                from chaos_agent.agent.attempt_tracker import (
-                    REASON_GRAPH_REPLAN,
-                    begin_attempt,
-                )
-                attempt_delta = begin_attempt(
-                    {**state, **result},
-                    target=state.get("fault_spec"),
-                    reason=REASON_GRAPH_REPLAN,
-                    notes=replan_context.get("error_summary", "")[:200],
-                )
-                result.update(attempt_delta)
-            else:
-                # Replan exhausted — convert the [REPLAN] request into
-                # a terminal failure so the router takes "end" via the
-                # ``state.get("error")`` branch. Do NOT reset
-                # execute_loop_count (let the loop-budget guard work
-                # too) and do NOT clear blade_uid (any existing
-                # injection still needs the recover path to find it).
-                _fs = fail_state(
-                    FailureCategory.REPLAN_EXHAUSTED,
-                    f"attempts={current_replan_count}, last_error={(replan_context or {}).get('error_summary', '')[:200]}",
-                    state.get("messages", []) + result.get("messages", []),
-                )
-                result.update(_fs)
-                # Drop replan_requested so a leftover True from a
-                # prior iteration can't keep the router circling.
-                result["replan_requested"] = False
-                logger.warning(
-                    "Replan exhausted: LLM emitted [REPLAN] but "
-                    "replan_count=%d already at max=%d; converting to "
-                    "terminal failure",
-                    current_replan_count, _max_replan,
-                )
+        _handle_replan(response, state, result)
 
         tracker.complete(f"Execute loop iteration {count} done")
         await sync_to_store(state, result)

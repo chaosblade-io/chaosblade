@@ -9,6 +9,32 @@ from chaos_agent.l4.agent import L4ResilienceAgent, _ChaosAgentPool
 from chaos_agent.l4.schemas import L4TaskResult, L4TestTask
 
 
+def _valid_payload(**overrides):
+    payload = {
+        "fault_intent": {
+            "scope": "pod",
+            "target": "cpu",
+            "action": "fullload",
+            "namespace": "cms-demo",
+            "names": ["app=myapp"],
+            "params": {"cpu-percent": "80"},
+            "duration": 300,
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _asyncio_run_returns(result):
+    def _run(coro):
+        close = getattr(coro, "close", None)
+        if close is not None:
+            close()
+        return result
+
+    return _run
+
+
 class TestChaosAgentPool:
     """Test _ChaosAgentPool initialization and thread safety."""
 
@@ -59,6 +85,121 @@ class TestL4ResilienceAgentCancel:
         assert not agent.is_cancel_requested()
 
 
+class TestL4ResilienceAgentRecover:
+    """Test explicit L4 recover path."""
+
+    @pytest.mark.asyncio
+    async def test_explicit_recover_uses_snapshot_resolver_without_checkpoint(self, monkeypatch):
+        from chaos_agent.agent import task_snapshot
+        from chaos_agent.agent.task_snapshot import RecoverInitialResolution
+
+        class _MissingInjectGraph:
+            async def aget_state(self, config):
+                return None
+
+        class _RecoverGraph:
+            def __init__(self):
+                self.initial = None
+                self.config = None
+
+            async def ainvoke(self, initial, config):
+                self.initial = initial
+                self.config = config
+                return {
+                    "operation": "recover",
+                    "result": {"recovered": True, "recovery_level": "recovered"},
+                    "recover_verification": {"layer1": {"status": "passed"}},
+                    "messages": [],
+                }
+
+        class _SessionStore:
+            def __init__(self):
+                self.created = None
+                self.finalized = None
+
+            def create_session(self, task_id, **kwargs):
+                self.created = (task_id, kwargs)
+
+            def finalize_session(self, task_id, **kwargs):
+                self.finalized = (task_id, kwargs)
+
+        captured = {}
+
+        async def fake_resolve(
+            inject_task_id,
+            *,
+            record_task_id,
+            checkpoint_values,
+            agents,
+            kubeconfig_override=None,
+            **kwargs,
+        ):
+            captured["inject_task_id"] = inject_task_id
+            captured["record_task_id"] = record_task_id
+            captured["checkpoint_values"] = checkpoint_values
+            captured["agents"] = agents
+            captured["kubeconfig_override"] = kubeconfig_override
+            initial = {
+                "task_id": record_task_id,
+                "parent_task_id": inject_task_id,
+                "operation": "recover",
+                "tui_session_id": "sid-from-snapshot",
+                "blade_uid": "uid-from-snapshot",
+                "skill_name": "pod-cpu-fullload",
+                "fault_spec": {
+                    "namespace": "default",
+                    "scope": "pod",
+                    "names": ["demo"],
+                    "labels": {},
+                    "blade_target": "cpu",
+                    "blade_action": "fullload",
+                    "params": {"cpu-percent": "80"},
+                },
+                "kubeconfig": kubeconfig_override or "",
+                "messages": [],
+            }
+            return RecoverInitialResolution(
+                initial_state=initial,
+                source_values={"messages": ["baseline"], "blade_uid": "uid-from-snapshot"},
+                source="snapshot",
+            )
+
+        session_store = _SessionStore()
+        monkeypatch.setattr(task_snapshot, "resolve_recover_initial_state", fake_resolve)
+        monkeypatch.setattr(
+            "chaos_agent.memory.session_store.get_global_session_store",
+            lambda: session_store,
+        )
+
+        recover_graph = _RecoverGraph()
+        pool = MagicMock()
+        pool.inject_graph = _MissingInjectGraph()
+        pool.recover_graph = recover_graph
+        pool.skill_registry = object()
+        task = L4TestTask(
+            task_id="l4-recover-task",
+            intent="recover",
+            payload={
+                "inject_task_id": "task-inject-missing-checkpoint",
+                "kubeconfig": "/tmp/kubeconfig",
+            },
+        )
+
+        result = await L4ResilienceAgent()._async_recover_explicit(pool, None, task)
+
+        assert result.status == "passed"
+        assert captured["inject_task_id"] == "task-inject-missing-checkpoint"
+        assert captured["checkpoint_values"] == {}
+        assert captured["agents"] == {"skill_registry": pool.skill_registry}
+        assert captured["kubeconfig_override"] == "/tmp/kubeconfig"
+        assert recover_graph.initial["task_id"] == captured["record_task_id"]
+        assert recover_graph.config["configurable"]["thread_id"] == captured["record_task_id"]
+        assert session_store.created[0] == captured["record_task_id"]
+        assert session_store.created[1]["tui_session_id"] == "sid-from-snapshot"
+        assert session_store.created[1]["baseline_messages"] == ["baseline"]
+        assert session_store.finalized[0] == captured["record_task_id"]
+
+
 class TestL4ResilienceAgentIdempotent:
     """Test B3 idempotent behavior."""
 
@@ -85,7 +226,9 @@ class TestL4ResilienceAgentIdempotent:
         assert len(agent._completed) == 100
 
         # Execute one more — triggers eviction of oldest entry
-        mock_asyncio_run.return_value = L4TaskResult(task_id="t-0100", status="passed")
+        mock_asyncio_run.side_effect = _asyncio_run_returns(
+            L4TaskResult(task_id="t-0100", status="passed")
+        )
         task = L4TestTask(task_id="t-0100", intent="test")
         agent.execute(None, task)
 
@@ -102,7 +245,7 @@ class TestL4ResilienceAgentExecute:
     def test_execute_calls_async_execute(self, mock_asyncio_run, mock_pool):
         mock_pool.return_value = MagicMock()
         expected = L4TaskResult(task_id="t-001", status="passed")
-        mock_asyncio_run.return_value = expected
+        mock_asyncio_run.side_effect = _asyncio_run_returns(expected)
 
         agent = L4ResilienceAgent()
         task = L4TestTask(task_id="t-001", intent="test")
@@ -116,7 +259,7 @@ class TestL4ResilienceAgentExecute:
     def test_execute_caches_result(self, mock_asyncio_run, mock_pool):
         mock_pool.return_value = MagicMock()
         expected = L4TaskResult(task_id="t-002", status="failed")
-        mock_asyncio_run.return_value = expected
+        mock_asyncio_run.side_effect = _asyncio_run_returns(expected)
 
         agent = L4ResilienceAgent()
         task = L4TestTask(task_id="t-002", intent="test")
@@ -128,7 +271,9 @@ class TestL4ResilienceAgentExecute:
     @patch("chaos_agent.l4.agent.asyncio.run")
     def test_execute_clears_buffer(self, mock_asyncio_run, mock_pool):
         mock_pool.return_value = MagicMock()
-        mock_asyncio_run.return_value = L4TaskResult(task_id="t-003", status="passed")
+        mock_asyncio_run.side_effect = _asyncio_run_returns(
+            L4TaskResult(task_id="t-003", status="passed")
+        )
 
         agent = L4ResilienceAgent()
         agent._state_transitions_buffer = [{"old": "data"}]
@@ -202,7 +347,9 @@ class TestL4ResilienceAgentFinishTiming:
         runtime = self._make_runtime()
         pool = MagicMock()
         task = L4TestTask(
-            task_id="t-finish-1", intent="x", payload={"auto_recover": True}
+            task_id="t-finish-1",
+            intent="x",
+            payload=_valid_payload(auto_recover=True),
         )
 
         async def fake_inject(*a, **kw):
@@ -232,7 +379,9 @@ class TestL4ResilienceAgentFinishTiming:
         runtime = self._make_runtime()
         pool = MagicMock()
         task = L4TestTask(
-            task_id="t-finish-2", intent="x", payload={"auto_recover": True}
+            task_id="t-finish-2",
+            intent="x",
+            payload=_valid_payload(auto_recover=True),
         )
 
         async def fake_inject(*a, **kw):
@@ -260,7 +409,9 @@ class TestL4ResilienceAgentFinishTiming:
         runtime.heal = MagicMock(return_value=type("HR", (), {"healed": False})())
         pool = MagicMock()
         task = L4TestTask(
-            task_id="t-finish-3", intent="x", payload={"auto_recover": True}
+            task_id="t-finish-3",
+            intent="x",
+            payload=_valid_payload(auto_recover=True),
         )
 
         async def fake_inject(*a, **kw):
@@ -281,7 +432,9 @@ class TestL4ResilienceAgentFinishTiming:
         runtime.heal = MagicMock(return_value=type("HR", (), {"healed": True})())
         pool = MagicMock()
         task = L4TestTask(
-            task_id="t-finish-4", intent="x", payload={"auto_recover": False}
+            task_id="t-finish-4",
+            intent="x",
+            payload=_valid_payload(auto_recover=False),
         )
 
         call_count = {"inject": 0}
@@ -310,7 +463,9 @@ class TestL4ResilienceAgentFinishTiming:
         runtime = self._make_runtime()
         pool = MagicMock()
         task = L4TestTask(
-            task_id="t-finish-5", intent="x", payload={"auto_recover": False}
+            task_id="t-finish-5",
+            intent="x",
+            payload=_valid_payload(auto_recover=False),
         )
 
         async def fake_inject(*a, **kw):

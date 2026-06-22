@@ -7,9 +7,10 @@ from langgraph.types import interrupt
 
 from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
+from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState
-from chaos_agent.agent.target_guard import freeze_approved_target
 from chaos_agent.agent.state_helpers import fail_state
+from chaos_agent.agent.target_guard import freeze_approved_target_from_spec
 from chaos_agent.agent.verdict import FailureCategory
 from chaos_agent.observability.status_tracker import (
     get_tracker,
@@ -23,6 +24,29 @@ def _generate_dry_run_plan(state: AgentState) -> str:
     """Generate a complete injection plan for dry_run (/plan) output."""
     from chaos_agent.agent.plan_generator import generate_injection_plan
     return generate_injection_plan(state)
+
+
+def _build_plan_preview_markdown(state: dict) -> str:
+    """Build a Markdown preview string for the injection plan.
+
+    Uses only the restricted Markdown subset (## / ### / - / **bold** / `code`).
+    Returns an empty string when there is nothing to preview.
+    """
+    parts: list[str] = []
+
+    plan = state.get("plan", "")
+    if plan:
+        parts.append(f"## Plan Overview\n\n{plan}")
+
+    scope = state.get("blast_radius_scope", "")
+    detail = state.get("blast_radius_detail", "")
+    if scope:
+        blast = f"**{scope}**"
+        if detail:
+            blast += f" — {detail}"
+        parts.append(f"## Blast Radius\n\n{blast}")
+
+    return "\n\n".join(parts)
 
 
 async def confirmation_gate(state: AgentState) -> dict:
@@ -40,7 +64,7 @@ async def confirmation_gate(state: AgentState) -> dict:
     """
     task_id = state.get("task_id", "unknown")
     plan = state.get("plan", "")
-    skill_name = state.get("skill_name", "")
+    skill_name = read_active_skill_name(state)
     # Read FaultSpec once and project to legacy target dict for the
     # confirm_info payload (TUI confirm card still consumes the
     # 4-key target dict shape — TUI rendering layer change is out
@@ -158,6 +182,7 @@ async def confirmation_gate(state: AgentState) -> dict:
         "safety_score": state.get("safety_score"),
         # E18 — injection feasibility report (headroom assessment).
         "feasibility_report": state.get("feasibility_report"),
+        "plan_preview_markdown": _build_plan_preview_markdown(state),
     }
 
     # P1: confirm_required without --force-override in CLI mode → reject with guidance
@@ -197,11 +222,12 @@ async def confirmation_gate(state: AgentState) -> dict:
         tracker.fail("Execution rejected by user")
         sync_node_status_to_session(state, "confirmation_gate", "Execution rejected",
             detail={"approved": False})
+        planning_alternatives = state.get("_planning_alternatives", "")
         result = {
             "safety_status": "rejected",
             "safety_reason": "User rejected the execution",
             "needs_confirmation": False,
-            **fail_state(FailureCategory.USER_REJECTED, "User rejected the execution at confirmation gate"),
+            **fail_state(FailureCategory.USER_REJECTED, "User rejected the execution at confirmation gate", alternatives=planning_alternatives),
             # Clear any stale approval — the next attempt will refreeze.
             "approved_target": None,
         }
@@ -225,14 +251,4 @@ def _freeze_from_state(state: AgentState) -> dict | None:
         return None
     existing = state.get("approved_target") or {}
     owner_names = tuple(existing.get("owner_names") or ())
-    return freeze_approved_target(
-        target={
-            "namespace": spec.namespace, "names": list(spec.names),
-            "labels": dict(spec.labels), "resource_type": spec.scope,
-        },
-        params=dict(spec.params),
-        blade_scope=spec.scope,
-        blade_target=spec.blade_target,
-        blade_action=spec.blade_action,
-        owner_names=owner_names,
-    )
+    return freeze_approved_target_from_spec(spec, owner_names=owner_names)

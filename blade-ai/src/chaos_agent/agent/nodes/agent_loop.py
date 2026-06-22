@@ -4,16 +4,21 @@ import json
 import logging
 import shlex
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
-from chaos_agent.agent.node_names import AGENT_LOOP
 from chaos_agent.agent.env_info import compute_env_info
 from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+from chaos_agent.agent.node_names import AGENT_LOOP
 from chaos_agent.agent.nodes._kubeconfig_inject import (
     _resolve_kubeconfig,
     inject_kubeconfig_into_tool_calls,
+    sync_kubewiz_runtime,
 )
 from chaos_agent.agent.nodes._store_sync import sync_to_store
+from chaos_agent.agent.nodes.llm_step_helpers import (
+    filter_stagnant_tool,
+    post_invoke_debug,
+)
 from chaos_agent.agent.nodes.react_helpers import (
     detect_action_stagnation,
     detect_repeated_tool_calls,
@@ -23,16 +28,16 @@ from chaos_agent.agent.nodes.react_helpers import (
     log_reasoning_content,
     record_ai_message,
     record_system_prompt,
-    summarize_llm_response,
 )
 from chaos_agent.agent.prompts import (
     build_system_prompt,
     PromptMode,
 )
+from chaos_agent.agent.skill_identity import has_active_skill, read_active_skill_name
 from chaos_agent.agent.state import AgentState
-from chaos_agent.config.settings import settings
 from chaos_agent.agent.state_helpers import fail_state
 from chaos_agent.agent.verdict import FailureCategory
+from chaos_agent.config.settings import settings
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
@@ -222,113 +227,33 @@ def _split_args(args: str) -> list[str]:
 MAX_AGENT_LOOP = settings.max_agent_loop
 
 
-async def agent_loop(state: AgentState) -> dict:
-    """Phase 1: ReAct loop for planning.
-
-    The LLM analyzes the request, activates the appropriate skill,
-    verifies the target, and generates an execution plan.
-
-    Returns updated state fields.
-    """
-    task_id = state.get("task_id", "unknown")
-    count = state.get("agent_loop_count", 0) + 1
-    skill_name = state.get("skill_name", "")
-
-    # Patch C — stamp the wall-clock start once per inject turn. Done
-    # at agent_loop entry (the earliest LLM-driven node) so subsequent
-    # router checks have something to compare against. The 0.0
-    # sentinel makes this idempotent for re-entry after replan.
-    import time as _time
-    if not state.get("pipeline_started_at"):
-        # Caller will merge this into state via the returned dict;
-        # in-place mutation here is also picked up by LangGraph because
-        # AgentState is a TypedDict.
-        state["pipeline_started_at"] = _time.time()
-
-    # Patch E — record this as the first pipeline attempt the very
-    # first time agent_loop runs in a turn. Subsequent re-entries
-    # (graph replan / LLM target switch / user rerun) bump the
-    # counter from their respective call sites; agent_loop only
-    # owns the "initial" reason.
-    if int(state.get("pipeline_attempt", 0) or 0) == 0:
-        from chaos_agent.agent.attempt_tracker import (
-            REASON_INITIAL,
-            begin_attempt,
-        )
-        # attempt_tracker stores the target snapshot for audit; we
-        # pass the FaultSpec dict (richer than the old legacy 4-field
-        # target — includes blade_target/action/params so the history
-        # entry can answer "what fault did attempt N try to inject").
-        delta = begin_attempt(
-            state,
-            target=state.get("fault_spec"),
-            reason=REASON_INITIAL,
-        )
-        state.update(delta)
-
-    # Emit status event
-    tracker = get_tracker(task_id)
-    if skill_name:
-        tracker.start(
-            StatusCategory.NODE,
-            "agent_loop",
-            f"Agent loop iteration {count}: thinking with skill '{skill_name}'",
-            {"iteration": count, "skill_name": skill_name},
-        )
-    else:
-        tracker.start(
-            StatusCategory.NODE,
-            "agent_loop",
-            f"Agent loop iteration {count}: deep thinking and planning...",
-            {"iteration": count},
-        )
-
-    if count > MAX_AGENT_LOOP:
-        logger.warning(
-            f"Agent loop exceeded max iterations ({MAX_AGENT_LOOP}) for task "
-            f"{task_id}"
-        )
-        tracker.fail(f"Agent loop exceeded max iterations ({MAX_AGENT_LOOP})")
-        return {
-            "safety_status": "rejected",
-            **fail_state(FailureCategory.PLANNING_TIMEOUT, f"max_iterations={MAX_AGENT_LOOP}"),
-        }
-
-    # The actual LLM reasoning is handled by LangGraph's ReAct pattern
-    # This node just tracks the iteration count
-    tracker.complete(f"Agent loop iteration {count} done")
-    # Patch C — annotate result with WALL_CLOCK_TIMEOUT cause if the
-    # router is about to terminate due to the wall-clock budget. The
-    # router itself can't write state (it's a pure routing function),
-    # so the node must do the labelling on its way out.
-    from chaos_agent.agent.router import mark_wall_clock_timeout
-    return mark_wall_clock_timeout(state, {"agent_loop_count": count})
-
-
 def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", registry=None):
     """Create an agent_loop node with optional PreReasoningHook and LLM.
 
     When llm is provided, the node performs actual LLM reasoning
     (calling the model with bound tools, returning the response as a message).
-    When llm is None, behaves identically to the plain agent_loop
-    (only tracks iteration count, for test compatibility).
+    When llm is None (and hook is None), the node only tracks the
+    iteration count and enforces the max-iteration limit — a lightweight
+    path used for testing.
     """
-    if llm is None and hook is None:
-        return agent_loop
 
     async def _agent_loop_with_llm(state: AgentState) -> dict:
         # 1. Iteration count + limit check (original logic preserved)
         task_id = state.get("task_id", "unknown")
         count = state.get("agent_loop_count", 0) + 1
-        skill_name = state.get("skill_name", "")
+        skill_name = read_active_skill_name(state)
 
         # --- Replan entry detection ---
         replan_context = state.get("replan_context")
         replan_history = state.get("replan_history")
         is_replan = replan_context is not None and state.get("replan_count", 0) > 0
 
-        if is_replan:
-            # Reset agent_loop_count for fresh planning budget
+        if is_replan and count > 1 and state.get("_replan_loop_reset") != state.get("replan_count"):
+            # Reset agent_loop_count once on first entry after replan.
+            # Subsequent iterations must NOT reset (otherwise MAX_AGENT_LOOP
+            # safety check can never trigger — unbounded loop risk).
+            # We detect "first entry" by checking if _replan_loop_reset
+            # hasn't been set to current replan_count yet.
             count = 1
 
         tracker = get_tracker(task_id)
@@ -353,12 +278,33 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 f"{task_id}"
             )
             tracker.fail(f"Agent loop exceeded max iterations ({MAX_AGENT_LOOP})")
+            rejection_reason = state.get("_planning_rejection_reason", "")
+            alternatives = state.get("_planning_alternatives", "") if rejection_reason else ""
+            category = FailureCategory.PLANNING_REJECTED if rejection_reason else FailureCategory.PLANNING_TIMEOUT
+            analysis = rejection_reason or (
+                f"Agent 在 {MAX_AGENT_LOOP} 轮迭代内未能完成规划，"
+                "可能原因：目标资源不存在、参数不合法或 LLM 无法收敛到有效方案。"
+                "建议检查目标资源状态后重试。"
+            )
             result = {
                 "safety_status": "rejected",
-                **fail_state(FailureCategory.PLANNING_TIMEOUT, f"max_iterations={MAX_AGENT_LOOP}", state.get("messages", [])),
+                **fail_state(
+                    category,
+                    rejection_reason or f"max_iterations={MAX_AGENT_LOOP}",
+                    state.get("messages", []),
+                    alternatives=alternatives,
+                    llm_analysis=analysis,
+                ),
             }
             await sync_to_store(state, result)
             return result
+
+        # Lightweight path: no LLM, no hook — only track iteration count.
+        # Used for testing and backward compatibility.
+        if llm is None and hook is None:
+            tracker.complete(f"Agent loop iteration {count} done")
+            from chaos_agent.agent.router import mark_wall_clock_timeout
+            return mark_wall_clock_timeout(state, {"agent_loop_count": count})
 
         # 2. Call pre_reason_hook (memory compaction)
         hook_updates = {}
@@ -420,7 +366,12 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             _spec = read_fault_spec(state)
             if count == 1 and _spec and not is_replan and _spec.is_complete:
                 fi_lines = [
-                    "[FAULT INTENT — collected from user dialogue]",
+                    "[FAULT INTENT — UNVERIFIED parameters from user dialogue]",
+                    "⚠️ These parameters have NOT been validated against the cluster.",
+                    "You MUST verify each target parameter (namespace, labels, names) with",
+                    "available cluster query tools. If a parameter doesn't match cluster",
+                    "reality, discover and use the CORRECT value — do NOT trust these values.",
+                    "",
                     f"Fault type: {_spec.fault_type or '?'}",
                     f"Scope: {_spec.scope or '?'}",
                     f"Target: {_spec.blade_target or '?'}",
@@ -442,35 +393,28 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                     _all_matches = registry.match_use_cases(
                         _spec.scope, _spec.blade_target, _spec.blade_action,
                     )
-                    if _all_matches:
-                        _resolved_use_case_path = _all_matches[0]
-                if _all_matches and len(_all_matches) > 1:
+                if _all_matches:
+                    fi_lines.append(f"\nCatalogue candidates ({len(_all_matches)}):")
+                    candidate_dirs: list[str] = []
+                    for m in _all_matches:
+                        parts = m.split("/")
+                        cat_idx = parts.index("catalogue") if "catalogue" in parts else -1
+                        if cat_idx >= 0 and cat_idx + 1 < len(parts):
+                            d = "/".join(parts[:cat_idx + 2]) + "/"
+                            if d not in candidate_dirs:
+                                candidate_dirs.append(d)
+                    for d in candidate_dirs:
+                        fi_lines.append(f"  - {d}")
+                    fi_lines.append("")
                     fi_lines.append(
-                        f"\nMultiple catalogue cases match this fault ({len(_all_matches)} candidates):"
-                    )
-                    for _mp in _all_matches:
-                        _label = _mp.split("/")[-1].replace(".md", "")
-                        fi_lines.append(f"  - {_mp}  ({_label})")
-                    fi_lines.append(
-                        "\n→ Read each candidate with read_skill_resource to decide "
-                        "which verification methodology fits the user's actual scenario. "
-                        "For example, if the user wants to test HPA scaling, choose the "
-                        "HPA case even though the injection command is pod-cpu-fullload."
-                    )
-                    fi_lines.append(
-                        "\nProceed: activate the matching skill, read the best-fit "
-                        "use-case, verify the target, and generate your execution plan."
+                        "You MUST browse these directories with read_skill_resource, "
+                        "read the candidate case files, and select the one that best "
+                        "matches the user's fault scenario. Do NOT assume the first "
+                        "candidate is correct \u2014 review the case content before deciding."
                     )
                 elif _resolved_use_case_path:
-                    _catalogue_dir = _resolved_use_case_path.rsplit("/", 1)[0] + "/"
                     fi_lines.append(
-                        f"\nMatched catalogue directory: {_catalogue_dir}"
-                        f"\nBest match: {_resolved_use_case_path}"
-                        "\n→ List the directory with read_skill_resource to see all "
-                        "available cases, then read the one that best matches "
-                        "the user's scenario."
-                    )
-                    fi_lines.append(
+                        f"\nPreviously matched catalogue path: {_resolved_use_case_path}"
                         "\nProceed: activate the matching skill, verify the "
                         "target if not already verified, and generate your execution plan."
                     )
@@ -488,12 +432,12 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 _injections_for_state.append(fi_msg)
 
             # --- Repeated tool call detection (loop breaking) ---
-            loop_hint = detect_repeated_tool_calls(messages)
+            loop_hint = detect_repeated_tool_calls(messages, phase="planning")
             if loop_hint:
                 messages.append(HumanMessage(content=loop_hint))
 
             # --- Action stagnation detection (tool-name level, ignores args) ---
-            stagnation_hint, stagnant_tool = detect_action_stagnation(messages)
+            stagnation_hint, stagnant_tool = detect_action_stagnation(messages, phase="planning")
             if stagnation_hint:
                 messages.append(HumanMessage(content=stagnation_hint))
 
@@ -550,12 +494,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             if count >= MAX_AGENT_LOOP:
                 llm_with_tools = llm
             else:
-                tools_this_iter = list(tools) if tools else []
-                if stagnant_tool and ":" not in stagnant_tool:
-                    tools_this_iter = [
-                        t for t in tools_this_iter
-                        if getattr(t, "name", "") != stagnant_tool
-                    ]
+                tools_this_iter = filter_stagnant_tool(tools, stagnant_tool)
                 llm_with_tools = llm.bind_tools(tools_this_iter) if tools_this_iter else llm
 
             # Record system prompt to session store (dedup handles repeated prompts)
@@ -569,6 +508,11 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
 
         # 4. Build result
         result = {"agent_loop_count": count, "planning_rejected": False}
+
+        # Mark that the replan loop counter has been reset for this replan
+        # attempt, so subsequent iterations don't reset again.
+        if is_replan and count == 1:
+            result["_replan_loop_reset"] = state.get("replan_count")
 
         # Apply deferred validated label update (computed pre-LLM)
         if _pending_label_spec:
@@ -592,6 +536,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             # has the correct kubeconfig, even if the LLM forgot to include it.
             kubeconfig = _resolve_kubeconfig(state)
             inject_kubeconfig_into_tool_calls(response, kubeconfig)
+            sync_kubewiz_runtime(state)
 
             result["messages"] = _injections_for_state + [response]
 
@@ -683,13 +628,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                             )
 
 
-            # Emit debug-level status event with LLM reasoning summary
-            if settings.is_debug:
-                debug_info, tool_names = summarize_llm_response(response)
-                tracker.update(
-                    f"Iteration {count} LLM:\n{debug_info}",
-                    {"debug": True, "iteration": count, "tool_calls": tool_names},
-                )
+            post_invoke_debug(tracker, response, count, "Iteration")
 
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result, hook_updates)
@@ -703,7 +642,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         # returns "continue" and the LLM repeats the same conclusion.
         if response is not None:
             _has_tool_calls = bool(getattr(response, "tool_calls", None))
-            _has_skill = bool(result.get("skill_name") or state.get("skill_name"))
+            _has_skill = bool(result.get("skill_name") or has_active_skill(state))
             if not _has_tool_calls and not _has_skill and not result.get("error"):
                 _conclusion = (getattr(response, "content", "") or "").strip()
                 if _conclusion:
@@ -718,3 +657,8 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         return result
 
     return _agent_loop_with_llm
+
+
+# Module-level export: lightweight agent_loop (no LLM) for backward
+# compatibility with tests and integration code that import agent_loop directly.
+agent_loop = make_agent_loop()

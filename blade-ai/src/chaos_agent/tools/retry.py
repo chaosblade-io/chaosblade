@@ -7,6 +7,7 @@ blade.py, kubectl.py, and LLM call wrappers.
 import asyncio
 import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Awaitable, TypeVar
 
@@ -29,14 +30,16 @@ class RetryConfig:
 
 
 async def retry_with_backoff(
-    func: Awaitable[T],
+    func: Callable[[], Awaitable[T]],
     config: RetryConfig | None = None,
     retryable_exceptions: tuple[type[Exception], ...] = (Exception,),
 ) -> T:
     """Execute an async function with exponential backoff retry.
 
     Args:
-        func: The awaitable to execute.
+        func: A zero-arg callable that returns an awaitable (e.g. a lambda
+            or partial wrapping an async function). Called fresh on each
+            attempt so a new coroutine is produced every time.
         config: Retry configuration. Uses defaults if not provided.
         retryable_exceptions: Exception types that should trigger a retry.
 
@@ -53,7 +56,7 @@ async def retry_with_backoff(
 
     for attempt in range(config.max_retries + 1):
         try:
-            return await func
+            return await func()
         except retryable_exceptions as e:
             last_exception = e
 
@@ -76,7 +79,7 @@ async def retry_with_backoff(
 
 
 async def retry_if_transient(
-    func: Awaitable[T],
+    func: Callable[[], Awaitable[T]],
     config: RetryConfig | None = None,
 ) -> T:
     """Retry only on transient ChaosAgentError instances.
@@ -90,7 +93,7 @@ async def retry_if_transient(
 
     for attempt in range(config.max_retries + 1):
         try:
-            return await func
+            return await func()
         except Exception as e:
             last_exception = e
 

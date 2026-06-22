@@ -188,22 +188,14 @@ async def check_blade_conflicts(
 
     try:
         from chaos_agent.tools.shell import run_command
-        from chaos_agent.tools.kubectl import _build_kubectl_global_args
+        from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
         from chaos_agent.agent.nodes._injection_detection import (
-            discover_tool_pods, _TOOL_POD_NAMESPACE, _TOOL_POD_LABEL_SELECTOR,
+            discover_tool_pods_cluster_wide,
         )
 
-        kubeconfig_args = _build_kubectl_global_args(kubeconfig=kubeconfig)
-
-        # Step 1: Discover running tool pods
-        discover_cmd = (
-            ["kubectl", "get", "pods", "-n", _TOOL_POD_NAMESPACE,
-             "-l", _TOOL_POD_LABEL_SELECTOR]
-            + kubeconfig_args
-        )
-        discover_result = await run_command(discover_cmd, task_id=task_id, source="conflict-check")
-        pods = discover_tool_pods(discover_result.stdout)
-        if not pods:
+        # Step 1: Discover running tool pods (all-namespaces, multiple label candidates)
+        pods_with_ns = await discover_tool_pods_cluster_wide(kubeconfig, task_id)
+        if not pods_with_ns:
             if tracker:
                 tracker.complete(
                     "Pre-injection conflict check: no tool pods found (skipped)",
@@ -214,12 +206,13 @@ async def check_blade_conflicts(
         # Step 2: Run blade status --type create in the first available pod.
         # Any single pod suffices: blade status --type create queries
         # ChaosBlade CRDs via the K8s API, returning cluster-wide results.
-        status_cmd = (
-            ["kubectl", "exec", pods[0], "-n", _TOOL_POD_NAMESPACE]
-            + kubeconfig_args
-            + ["--", "blade", "status", "--type", "create"]
-        )
+        pod_name, pod_ns = pods_with_ns[0]
+        status_cmd = build_kubectl_cmd("exec", [
+            pod_name, "-n", pod_ns,
+            "--", "blade", "status", "--type", "create",
+        ], kubeconfig=kubeconfig)
         status_result = await run_command(status_cmd, task_id=task_id, source="conflict-check")
+        status_result = _adapt_kubewiz_result(status_result)
         raw = status_result.stdout
 
         # Build ConflictInfo list with overlap analysis when JSON is available

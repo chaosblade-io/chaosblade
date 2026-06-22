@@ -7,6 +7,8 @@ are safely absorbed without side effects.
 
 from __future__ import annotations
 
+from chaos_agent.l4.schemas import PendingCard
+
 
 class NullRuntime:
     """No-op runtime. All methods are safe no-ops."""
@@ -34,6 +36,24 @@ class NullRuntime:
 
     def require_approval(self, risk_level: str = "high") -> bool:
         return True  # Test mode: auto-approve
+
+    def present_card(self, card: PendingCard) -> dict | None:
+        """Human-in-the-loop card protocol (v0.5.0).
+
+        Upper layers (ai-testing-platform / TUI / Server) override this
+        method to surface the card to the user and block until a decision
+        arrives. Returning ``None`` means "no callback registered" — the
+        SDK falls back to ``pre_approved`` / ``require_approval`` legacy
+        path with a DeprecationWarning.
+
+        Expected return shape::
+
+            {"decision": "approved" | "rejected", "answer": str | None}
+
+        ``answer`` is reserved for ``intent_confirm`` request_modify but
+        SDK ignores it (decision must be ``approved`` / ``rejected``).
+        """
+        return None
 
     def emit_event(self, event_type: str, data: dict) -> None:
         pass

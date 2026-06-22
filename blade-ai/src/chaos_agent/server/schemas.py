@@ -56,7 +56,7 @@ class InjectRequest(BaseModel):
 
 
 class RecoverRequest(BaseModel):
-    """Request body for POST /api/v1/recover."""
+    """Request body for POST /api/v1/recover-stream."""
 
     task_id: str = Field(..., description="Task ID to recover")
     target_name: Optional[str] = Field(None, description="Specific target to recover (partial recovery)")
@@ -181,6 +181,5 @@ class VersionResponse(BaseModel):
     blade_version: str = ""
     kubectl_version: str = ""
     supported_fault_count: int = 0
-
 
 

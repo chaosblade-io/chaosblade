@@ -8,6 +8,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from chaos_agent.agent.factory import create_agent
+from chaos_agent.agent.prompts.knowledge_watcher import KnowledgeWatcher
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.tui_session_store import (
     TuiSessionStore,
@@ -20,10 +21,11 @@ from chaos_agent.server.middleware import (
     RequestIDMiddleware,
     TimingMiddleware,
 )
+from chaos_agent.server.routes import config as _config  # noqa: F401 - registers /api/v1/config
 from chaos_agent.server.routes import (
     health_router,
+    recover_router,
 )
-from chaos_agent.server.routes import config as _config  # noqa: F401 - registers /api/v1/config
 from chaos_agent.server.routes import interrupt as _interrupt  # noqa: F401 - registers /interrupt + /cancel
 from chaos_agent.server.routes import memory as _memory  # noqa: F401 - registers /api/v1/memory
 from chaos_agent.server.routes import model as _model  # noqa: F401 - Phase 3c.1 model select
@@ -37,10 +39,9 @@ from chaos_agent.server.routes.list_skills import skills_router
 from chaos_agent.server.routes.metric import metric_router
 from chaos_agent.server.routes.prometheus import prometheus_router
 from chaos_agent.server.routes.recordings import recordings_router
-from chaos_agent.server.routes.recover import recover_router
+from chaos_agent.server.routes.recover_stream import recover_stream  # noqa: F401 - registers route
 from chaos_agent.server.routes.sessions import sessions_router
 from chaos_agent.server.routes.status_stream import status_stream  # noqa: F401 - registers route
-from chaos_agent.agent.prompts.knowledge_watcher import KnowledgeWatcher
 from chaos_agent.skills.loader import get_skills_dir
 from chaos_agent.skills.prerequisites import PrerequisitesChecker
 from chaos_agent.skills.registry import SkillRegistry
@@ -223,11 +224,25 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"TUI session sweep failed: {e}")
 
+    # Finalize orphaned task sessions (SessionStore) — same pattern as
+    # TUI sessions above.  After drain() completes, any task still in
+    # _active_sessions was interrupted (timeout or unfinished stream).
+    _current_agents = getattr(app.state, "agents", None) or {}
+    try:
+        _task_ss = _current_agents.get("session_store")
+        if _task_ss:
+            for tid in list(_task_ss._active_sessions):
+                try:
+                    _task_ss.finalize_session(tid, remaining_messages=[], status="aborted")
+                except Exception as e:
+                    logger.warning(f"Failed to finalize task session {tid}: {e}")
+    except Exception as e:
+        logger.warning(f"Task session sweep failed: {e}")
+
     # Close checkpointer connection. Read from app.state (not the
     # local ``agents`` captured at startup) so that a wizard /save
     # which rebuilt the graph mid-lifecycle gets its checkpointer
     # cleaned up too — otherwise the new aiosqlite fd leaks.
-    _current_agents = getattr(app.state, "agents", None) or {}
     conn = _current_agents.get("checkpointer_conn")
     if conn is not None:
         try:

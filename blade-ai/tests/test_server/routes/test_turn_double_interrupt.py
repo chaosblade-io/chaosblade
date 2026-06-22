@@ -31,11 +31,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from chaos_agent.server.routes.turn import (
-    _build_result_payload,
-    _content_from_interrupt_payload,
-    _extract_pending_interrupt,
-    _normalise_answer,
+from chaos_agent.server.routes.turn_interrupt import (
+    content_from_interrupt_payload as _content_from_interrupt_payload,
+    extract_pending_interrupt as _extract_pending_interrupt,
+    normalise_answer as _normalise_answer,
+)
+from chaos_agent.server.routes.turn_result import (
+    build_inject_data_from_state as _build_inject_data_from_state,
+    build_result_payload as _build_result_payload,
 )
 
 
@@ -237,11 +240,18 @@ class TestBuildResultPayloadPauseGuard:
                 "confirmed_intent": "inject",
                 "blade_uid": "blade-uid-xyz",
                 "task_id": "task-abc",
-                "params": {
-                    "scope": "node",
-                    "target": "cpu",
-                    "action": "fullload",
+                "fault_spec": {
                     "namespace": "cms-demo",
+                    "scope": "node",
+                    "names": ["node-a"],
+                    "labels": {},
+                    "blade_target": "cpu",
+                    "blade_action": "fullload",
+                    "params": {"cpu-percent": "80"},
+                    "params_flags": [],
+                    "duration_seconds": 0,
+                    "source": "test",
+                    "user_description": "",
                 },
                 "skill_name": "node-cpu-fullload",
             },
@@ -254,6 +264,40 @@ class TestBuildResultPayloadPauseGuard:
         assert result["data"]["task_id"] == "task-abc"
         assert result["data"]["fault_type"] == "node-cpu-fullload"
         assert result["data"]["blade_uid"] == "blade-uid-xyz"
+        assert result["data"]["target"]["names"] == ["node-a"]
+        assert result["data"]["params"] == {"cpu-percent": "80"}
+
+    def test_inject_data_projects_target_and_params_from_fault_spec(self):
+        data = _build_inject_data_from_state(
+            {
+                "confirmed_intent": "inject",
+                "blade_uid": "blade-uid-xyz",
+                "skill_name": "stale-skill-name",
+                "fault_spec": {
+                    "namespace": "cms-demo",
+                    "scope": "pod",
+                    "names": ["pod-a"],
+                    "labels": {"app": "demo"},
+                    "blade_target": "network",
+                    "blade_action": "loss",
+                    "params": {"percent": "100"},
+                    "params_flags": [],
+                    "duration_seconds": 0,
+                    "source": "test",
+                    "user_description": "",
+                },
+            },
+            "task-abc",
+        )
+
+        assert data["fault_type"] == "pod-network-loss"
+        assert data["target"] == {
+            "namespace": "cms-demo",
+            "names": ["pod-a"],
+            "labels": {"app": "demo"},
+            "resource_type": "pod",
+        }
+        assert data["params"] == {"percent": "100"}
 
     @pytest.mark.asyncio
     async def test_returns_none_when_intent_not_inject_or_recover(self):

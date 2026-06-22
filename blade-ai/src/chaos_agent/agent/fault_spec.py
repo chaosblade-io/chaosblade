@@ -522,6 +522,108 @@ def legacy_params_dict(state_or_values: dict) -> dict:
     return dict(spec.params) if spec else {}
 
 
+def fault_parts_from_name(name: str) -> tuple[str, str, str]:
+    """Infer scope/blade_target/blade_action from names like pod-cpu-fullload."""
+    if not isinstance(name, str) or not name:
+        return "", "", ""
+    parts = [p for p in name.split("-") if p]
+    if len(parts) < 3:
+        return "", "", ""
+    return parts[0], parts[1], "-".join(parts[2:])
+
+
+def fault_spec_from_legacy_state(
+    state: dict,
+    *,
+    source: str = "legacy_state",
+) -> Optional[FaultSpec]:
+    """Rebuild a FaultSpec from pre-FaultSpec scattered state fields.
+
+    This is the only compatibility bridge for old checkpoints / TaskStore
+    records that still contain ``target`` + ``params`` + ``skill_name`` instead
+    of a canonical ``fault_spec`` dict. New entry points should construct
+    ``FaultSpec`` directly and store ``spec.to_dict()``.
+    """
+    target = coerce_to_dict(state.get("target"), context="fault_spec.legacy.target")
+    params = coerce_to_dict(state.get("params"), context="fault_spec.legacy.params")
+
+    scope, blade_target, blade_action = fault_parts_from_name(
+        coerce_to_str(
+            state.get("skill_name") or state.get("fault_type"),
+            default="",
+            context="fault_spec.legacy.fault_type",
+        )
+    )
+    scope = (
+        coerce_to_str(state.get("blade_scope"), default="", context="fault_spec.legacy.blade_scope")
+        or coerce_to_str(target.get("resource_type"), default="", context="fault_spec.legacy.resource_type")
+        or scope
+    )
+    blade_target = (
+        coerce_to_str(state.get("blade_target"), default="", context="fault_spec.legacy.blade_target")
+        or blade_target
+    )
+    blade_action = (
+        coerce_to_str(state.get("blade_action"), default="", context="fault_spec.legacy.blade_action")
+        or blade_action
+    )
+    params_flags = tuple(
+        str(item) for item in coerce_to_list(
+            state.get("params_flags"),
+            context="fault_spec.legacy.params_flags",
+        )
+    )
+    duration_seconds = coerce_to_int(
+        state.get("duration_seconds") or state.get("duration"),
+        default=0,
+        context="fault_spec.legacy.duration",
+    )
+
+    if not any((target, scope, blade_target, blade_action, params, params_flags, duration_seconds)):
+        return None
+
+    return FaultSpec(
+        namespace=coerce_to_str(target.get("namespace"), default="", context="fault_spec.legacy.namespace"),
+        scope=scope,
+        names=tuple(
+            str(item) for item in coerce_to_list(
+                target.get("names"),
+                context="fault_spec.legacy.names",
+            )
+        ),
+        labels=coerce_to_dict(target.get("labels"), context="fault_spec.legacy.labels"),
+        blade_target=blade_target,
+        blade_action=blade_action,
+        params=params,
+        params_flags=params_flags,
+        duration_seconds=duration_seconds,
+        source=source,
+        user_description=coerce_to_str(
+            state.get("user_description") or state.get("input"),
+            default="",
+            context="fault_spec.legacy.user_description",
+        ),
+    )
+
+
+def fault_type_from_state(state_or_values: dict, *, fallback: str = "") -> str:
+    """Return the canonical fault type for UI/API/reporting boundaries.
+
+    ``fault_spec`` is the source of truth.  ``skill_name`` / ``fault_type`` are
+    accepted only as legacy fallback values for old checkpoints and external
+    callers that have not yet migrated their state shape.
+    """
+    spec = read_fault_spec(state_or_values)
+    if spec and spec.fault_type:
+        return spec.fault_type
+    return str(
+        state_or_values.get("skill_name")
+        or state_or_values.get("fault_type")
+        or fallback
+        or ""
+    )
+
+
 def read_fault_spec(state: dict) -> Optional[FaultSpec]:
     """Pull the FaultSpec out of state in normalised form.
 
@@ -542,17 +644,8 @@ def read_fault_spec(state: dict) -> Optional[FaultSpec]:
     spec = FaultSpec.from_dict(state.get("fault_spec"))
     if spec is not None:
         return spec
-    # Legacy fallback — for older test fixtures and any out-of-tree
-    # caller that hasn't yet migrated. Production entry points always
-    # set fault_spec, so this branch firing in production is a bug
-    # (entry point forgot to construct the spec); log a WARNING so
-    # the failure is visible instead of silently papering over it
-    # with a reconstructed-from-stale-fields spec.
-    legacy_target = state.get("target")
-    legacy_scope = state.get("blade_scope")
-    legacy_blade_target = state.get("blade_target")
-    legacy_action = state.get("blade_action")
-    if not any((legacy_target, legacy_scope, legacy_blade_target, legacy_action)):
+    legacy_spec = fault_spec_from_legacy_state(state)
+    if legacy_spec is None:
         return None
     logger.warning(
         "read_fault_spec: state.fault_spec missing — falling back to legacy "
@@ -560,25 +653,18 @@ def read_fault_spec(state: dict) -> Optional[FaultSpec]:
         "FaultSpec.from_xxx (state keys present: %s).",
         sorted(k for k in state if k in (
             "target", "blade_scope", "blade_target", "blade_action",
-            "params", "params_flags", "duration",
+            "params", "params_flags", "duration", "duration_seconds",
+            "skill_name", "fault_type",
         )),
     )
-    target = legacy_target or {}
-    return FaultSpec(
-        namespace=str(target.get("namespace") or ""),
-        scope=str(legacy_scope or target.get("resource_type") or ""),
-        names=tuple(target.get("names") or ()),
-        labels=target.get("labels") or {},
-        blade_target=str(legacy_blade_target or ""),
-        blade_action=str(legacy_action or ""),
-        params=state.get("params") or {},
-        params_flags=tuple(state.get("params_flags") or ()),
-        duration_seconds=int(state.get("duration") or 0),
-    )
+    return legacy_spec
 
 
 __all__ = [
     "FaultSpec",
+    "fault_parts_from_name",
+    "fault_spec_from_legacy_state",
+    "fault_type_from_state",
     "legacy_params_dict",
     "legacy_target_dict",
     "read_fault_spec",

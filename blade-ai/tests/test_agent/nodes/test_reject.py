@@ -70,12 +70,11 @@ class TestReject:
 
     @pytest.mark.asyncio
     async def test_safety_reason_with_error_none(self):
-        """When safety_reason is set but error is explicitly None."""
+        """When error is None, reject still surfaces the safety reason."""
         state = {"safety_reason": "Blacklisted", "error": None}
 
         result = await reject(state)
-        # state.get("error", "Blacklisted") returns None (key exists with value None)
-        assert result["result"]["reason"] is None
+        assert result["result"]["reason"] == "Blacklisted"
 
     @pytest.mark.asyncio
     async def test_empty_safety_reason_with_error(self):

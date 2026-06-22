@@ -450,11 +450,17 @@ export const en: Dict = {
   "result.status.partial": "Partial recovery",
   "result.status.failed": "Injection failed",
   "result.status.unknown": "Result",
+  "result.status.success.recover": "Recovery succeeded",
+  "result.status.failed.recover": "Recovery failed",
   "result.show_for_timeline": "/replay {id} instant — for full timeline",
 
   // -- Postmortem (T6) ---------------------------------------------
   "postmortem.title": "Postmortem",
   "postmortem.saved_at": "Full markdown: {path}",
+
+  // -- PlanPreviewSection (injection plan / alternatives) ----------------
+  "plan_preview.title": "Injection Plan Preview",
+  "plan_preview.alternatives_title": "Alternatives",
 
   // -- ConfirmMessage chrome ----------------------------------------
   "confirm.title": "Confirm intent",
@@ -558,6 +564,7 @@ export const en: Dict = {
   "confirm.attempt.label": "attempt {n}",
   "confirm.clarification.label": "{n} clarification round(s)",
   "confirm.plan_saved": "saved ({path}) · /show plan to view",
+  "confirm.field.conflicts": "Conflicts",
   "confirm.conflicts.hint": "/show experiments to inspect",
   // Empty-state placeholders so the Parameters / Target health
   // sections always render even when there's "nothing notable" — the

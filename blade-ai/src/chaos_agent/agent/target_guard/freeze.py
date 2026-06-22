@@ -2,13 +2,14 @@
 
 ``AgentState`` stores ``approved_target`` as a plain dict (LangGraph
 serialises state via Pydantic + JSON, and frozen dataclasses don't
-round-trip cleanly through the checkpointer). The two helpers here
+round-trip cleanly through the checkpointer). The helpers here
 are the only place this dict shape is constructed or consumed:
 
-  - ``freeze_approved_target`` — confirmation_gate calls this when
-    the user accepts a plan. Pulls the relevant fields out of
-    ``state.target`` / ``state.params`` / ``state.blade_*`` and
-    produces the canonical dict.
+  - ``freeze_approved_target_from_spec`` — graph nodes call this when
+    the user accepts a plan. It projects ``FaultSpec`` into the
+    canonical approved-target snapshot.
+  - ``freeze_approved_target`` — legacy-compatible lower-level
+    constructor that accepts the historical target/params/blade_* pieces.
   - ``approved_from_dict`` — the screener node calls this to hydrate
     a dict back into an ``ApprovedTarget`` for the guard.
 
@@ -22,17 +23,48 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+from chaos_agent.agent.fault_spec import FaultSpec
 from .guard import CLUSTER_SCOPED_KINDS, OWNER_SCOPES
 from .types import ApprovedTarget
 
 logger = logging.getLogger(__name__)
 
-# Re-export for callers that want to skip ``freeze_approved_target``
-# and build directly from a FaultSpec instance.  We keep the legacy
-# ``freeze_approved_target(target, params, blade_*)`` signature too
-# because confirmation_gate / safety_check assemble the same dict
-# from their local FaultSpec read and the contract is cleaner than
-# threading a FaultSpec object through this single-purpose module.
+def freeze_approved_target_from_spec(
+    spec: FaultSpec | dict | None,
+    *,
+    lock_fault_type: bool = True,
+    owner_names: tuple[str, ...] = (),
+) -> Optional[dict]:
+    """Build the ``approved_target`` snapshot from a FaultSpec.
+
+    ``FaultSpec`` is the source of truth for the operator-approved intent.
+    This helper is the graph-facing constructor; it keeps nodes from
+    hand-assembling the old target/params/blade_* shape and accidentally
+    reviving scattered state fields as facts.
+    """
+    if isinstance(spec, dict):
+        spec_obj = FaultSpec.from_dict(spec)
+    elif isinstance(spec, FaultSpec):
+        spec_obj = spec
+    else:
+        spec_obj = None
+    if spec_obj is None:
+        return None
+
+    return freeze_approved_target(
+        target={
+            "namespace": spec_obj.namespace,
+            "names": list(spec_obj.names),
+            "labels": dict(spec_obj.labels),
+            "resource_type": spec_obj.scope,
+        },
+        params=dict(spec_obj.params),
+        blade_scope=spec_obj.scope,
+        blade_target=spec_obj.blade_target,
+        blade_action=spec_obj.blade_action,
+        lock_fault_type=lock_fault_type,
+        owner_names=owner_names,
+    )
 
 
 def freeze_approved_target(
@@ -198,7 +230,7 @@ async def discover_owner_names(
         return ()
 
     from chaos_agent.config.settings import settings
-    from chaos_agent.tools.kubectl import _build_kubectl_global_args
+    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
     from chaos_agent.tools.shell import run_command
 
     label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
@@ -206,15 +238,14 @@ async def discover_owner_names(
     found: list[str] = []
 
     for kind in sorted(owner_kinds):
-        cmd = [settings.kubectl_path]
-        cmd.extend(_build_kubectl_global_args(kubeconfig))
-        cmd.extend([
-            "get", kind, "-n", namespace,
+        cmd = build_kubectl_cmd("get", [
+            kind, "-n", namespace,
             "-l", label_selector,
             "-o", "jsonpath={.items[*].metadata.name}",
-        ])
+        ], kubeconfig=kubeconfig)
         try:
             result = await run_command(cmd, timeout=settings.timeout_kubectl)
+            result = _adapt_kubewiz_result(result)
             if result.exit_code == 0 and result.stdout.strip():
                 found.extend(result.stdout.strip().split())
         except Exception as e:
@@ -226,4 +257,9 @@ async def discover_owner_names(
     return tuple(found)
 
 
-__all__ = ["approved_from_dict", "discover_owner_names", "freeze_approved_target"]
+__all__ = [
+    "approved_from_dict",
+    "discover_owner_names",
+    "freeze_approved_target",
+    "freeze_approved_target_from_spec",
+]

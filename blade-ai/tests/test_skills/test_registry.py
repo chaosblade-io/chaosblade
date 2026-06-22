@@ -419,7 +419,7 @@ class TestRegistryMatchUseCase:
         """Pod cpu fullload should match Pod_cpu使用率过高."""
         result = registry.match_use_case("pod", "cpu", "fullload")
         assert result is not None
-        assert "cpu使用率过高" in result
+        assert "CPU使用率过高" in result
 
     def test_node_cpu_fullload(self, registry):
         """Node cpu fullload should match Node_CPU使用率过高."""

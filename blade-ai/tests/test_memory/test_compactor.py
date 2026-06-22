@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock
 from chaos_agent.memory.compactor import (
     _prepare_compaction_messages,
     _simple_compact,
-    _strip_large_tool_outputs,
     build_post_compact_context_message,
     compact_memory,
     COMPACTION_PROMPT,
@@ -17,7 +16,6 @@ from chaos_agent.memory.compactor import (
     NO_TOOLS_TRAILER,
     POST_COMPACT_SKILLS_TOKEN_BUDGET,
     SKILL_TRUNCATION_MARKER,
-    _STRIP_TOOL_MARKER,
     truncate_to_tokens,
 )
 
@@ -469,65 +467,6 @@ class TestBuildPostCompactContextWithSkillContent:
 # ``test_hook.py::TestPreReasoningHookForceCompact``.
 # ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# New tests: _strip_large_tool_outputs (Migration Point 8)
-# ---------------------------------------------------------------------------
-
-
-class TestStripLargeToolOutputs:
-    """Test _strip_large_tool_outputs() progressive compression before compaction."""
-
-    def _make_tool_msg(self, content: str) -> MagicMock:
-        msg = MagicMock()
-        msg.type = "tool"
-        msg.content = content
-        return msg
-
-    def _make_human_msg(self, content: str) -> MagicMock:
-        msg = MagicMock()
-        msg.type = "human"
-        msg.content = content
-        return msg
-
-    def test_short_tool_output_unchanged(self):
-        content = "short tool output"
-        msgs = [self._make_tool_msg(content)]
-        result = _strip_large_tool_outputs(msgs)
-        assert result[0].content == content
-
-    def test_large_tool_output_truncated(self):
-        long_content = "x" * 3000
-        msgs = [self._make_tool_msg(long_content)]
-        result = _strip_large_tool_outputs(msgs)
-        assert _STRIP_TOOL_MARKER in result[0].content
-        assert len(result[0].content) < len(long_content)
-
-    def test_human_messages_not_stripped(self):
-        long_content = "y" * 5000
-        msgs = [self._make_human_msg(long_content)]
-        result = _strip_large_tool_outputs(msgs)
-        assert result[0].content == long_content
-
-    def test_head_and_tail_preserved(self):
-        long_content = "A" * 600 + "MIDDLE" + "Z" * 600
-        msgs = [self._make_tool_msg(long_content)]
-        result = _strip_large_tool_outputs(msgs)
-        assert result[0].content.startswith("AAA")
-        assert result[0].content.endswith("ZZZ")
-
-    def test_empty_messages(self):
-        result = _strip_large_tool_outputs([])
-        assert result == []
-
-    def test_integrated_in_compact_memory(self):
-        """_strip_large_tool_outputs is called inside compact_memory."""
-        import asyncio
-        tool_msg = self._make_tool_msg("x" * 3000)
-        msgs = [tool_msg]
-        # compact_memory without LLM should still work after stripping
-        result = asyncio.run(compact_memory(msgs, llm=None))
-        assert "Compressed History" in result
 
 
 # ---------------------------------------------------------------------------

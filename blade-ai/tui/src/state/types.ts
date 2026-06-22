@@ -84,6 +84,9 @@ export interface ResultItem {
   id: string;
   taskId: string;
   status: "success" | "partial" | "failed" | "unknown";
+  /** The operation type — "inject" or "recover". Defaults to "inject"
+   *  when absent (backward-compat with older server versions). */
+  operation?: "inject" | "recover";
   faultType: string;
   bladeUid: string;
   duration: string;
@@ -92,6 +95,10 @@ export interface ResultItem {
   /** Optional cause/hint pair when failure_reason is set. */
   cause?: string;
   hint?: string;
+  /** Alternatives markdown extracted from failure_detail.alternatives
+   *  when the injection failed. Rendered via PlanPreviewSection below
+   *  the main card (between failure analysis and postmortem). */
+  alternatives?: string;
   /** Stable per-session locator (``E1``, ``E2`` …) assigned at
    *  ``RESULT_RECEIVED`` time. Lets ``/show`` / ``/copy`` / ``/rerun``
    *  reference past results by short token without scrollback hunt. */

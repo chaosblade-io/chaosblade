@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 
+from chaos_agent.agent.operation_outcome import read_operation_outcome
 from chaos_agent.l4.schemas import L4AgentError
 
 # Ordered patterns: first match wins
@@ -51,7 +52,7 @@ def map_error_class(exc: Exception) -> str:
 
 def _extract_error(values: dict, task_state: str) -> L4AgentError:
     """Extract error information from graph final state into L4AgentError."""
-    error_msg = values.get("error", "") or values.get("error_message", "")
+    error_msg = read_operation_outcome(values).error or values.get("error_message", "")
     if not error_msg and task_state == "rejected":
         error_msg = (
             f"Task rejected: safety_status={values.get('safety_status', 'unknown')}"

@@ -552,7 +552,7 @@ class PreReasoningHook:
         try:
             previous_summary = state.get("compressed_summary", "")
             summary = await compact_memory(
-                to_compact,
+                stripped,
                 previous_summary=previous_summary,
                 llm=self.llm,
                 state=state,

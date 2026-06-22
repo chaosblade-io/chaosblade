@@ -314,14 +314,6 @@ def _compare_tool_outputs(
     return all(o == first for o in outputs[1:]), True
 
 
-def _is_observation_command(tool_name: str, args: dict) -> bool:
-    """Check if a tool call is an observation/diagnostic command (not mutation)."""
-    if tool_name not in ("kubectl", "kubectl_ro"):
-        return False
-    subcmd = args.get("subcommand", "")
-    return subcmd in ("get", "describe", "top", "exec", "logs", "debug")
-
-
 def suggest_verify_command(tool_name: str) -> str:
     """Suggest a tool-appropriate verification command."""
     if "blade" in tool_name:
@@ -337,45 +329,78 @@ def suggest_verify_command(tool_name: str) -> str:
     )
 
 
-def _build_strategy_hints(tool_name: str, subcommand: str | None = None, args: dict | None = None) -> str:
-    """Build strategy hints based on the tool name for loop-breaking guidance."""
-    if args and _is_observation_command(tool_name, args):
-        return (
-            "- Repeating the same observation command will NOT produce different results.\n"
-            "- Check a DIFFERENT metric, partition, resource, or namespace.\n"
-            "- Use a different kubectl subcommand (describe vs get vs exec vs top).\n"
-            "- Check a different scope (pod vs node vs namespace vs cluster).\n"
-            "- If the fault effect is not observable with current tools, conclude based on available evidence."
-        )
-    if tool_name in ("kubectl", "kubectl_ro") and subcommand == "get":
-        return (
-            "- 使用 --field-selector 缩小范围（如 --field-selector spec.nodeName=<node>）\n"
-            "- 使用 -o name 仅获取资源名称\n"
-            "- 使用 -o jsonpath 提取特定字段\n"
-            "- 指定资源名称查询单个资源"
-        )
-    if tool_name == "execute_skill_script":
-        return (
-            "- 检查脚本名称是否正确（使用 list_scripts 查看可用脚本）\n"
-            "- 尝试使用其他可用脚本\n"
-            "- 直接使用 kubectl 工具代替"
-        )
-    if tool_name in ("blade_create", "blade_destroy"):
-        return (
-            "- " + suggest_verify_command(tool_name) + "\n"
-            "- If a parameter was rejected, do NOT retry — remove it and verify\n"
-            "- Runtime errors override documentation — trust the tool, not the docs\n"
-            "- Use blade_query_k8s to check existing experiments\n"
-            "- Simplify parameters — use only what the tool actually supports"
-        )
-    return (
-        "- 尝试换用其他工具或不同的参数组合\n"
-        "- 如果结果已足够，直接给出结论\n"
-        "- 如果需要更多信息，尝试不同角度的查询"
+# ---------------------------------------------------------------------------
+# Phase-specific reflection hints (principle-level, zero tool/flag names)
+# ---------------------------------------------------------------------------
+
+_LOOP_HINTS: dict[str, str] = {
+    "intent": (
+        "REFLECT: Your discovery method doesn't match how the system actually works. "
+        "The query syntax or approach itself may be invalid.\n\n"
+        "NEXT:\n"
+        "1. Simplify — reduce your query to its broadest possible form.\n"
+        "2. Change — try a fundamentally different discovery approach.\n"
+        "3. Escalate — present what you found to the user, let them guide you."
+    ),
+    "planning": (
+        "REFLECT: What you're trying to verify may not exist in the expected form. "
+        "\"Not found\" after a broad search IS a valid outcome.\n\n"
+        "NEXT:\n"
+        "1. Broaden — verify at a wider scope without assumptions.\n"
+        "2. Accept — if the target genuinely doesn't exist, that's a valid result. "
+        "Reject the plan with evidence rather than searching endlessly.\n"
+        "3. Conclude — don't keep looking for what isn't there."
+    ),
+    "execute": (
+        "REFLECT: Your execution method may be incompatible with the actual runtime. "
+        "Tool interfaces can differ from documentation.\n\n"
+        "NEXT:\n"
+        "1. Verify interface — confirm what the tool actually supports before retrying.\n"
+        "2. Simplify — reduce to the minimum viable parameters.\n"
+        "3. Fallback — switch to an alternative execution path."
+    ),
+    "verify": (
+        "REFLECT: The effect may not be observable through your current approach. "
+        "It may need a different angle, wider scope, or more propagation time.\n\n"
+        "NEXT:\n"
+        "1. Change angle — observe from a fundamentally different perspective.\n"
+        "2. Broaden — check at a higher scope or different system layer.\n"
+        "3. Conclude — form your verdict from evidence already collected."
+    ),
+    "recover": (
+        "REFLECT: The recovery target may no longer exist, or this recovery method "
+        "doesn't apply to the current state.\n\n"
+        "NEXT:\n"
+        "1. Check state — verify whether the target is still recoverable.\n"
+        "2. Alternative — try a different recovery path entirely.\n"
+        "3. Conclude — report the actual state and form your verdict."
+    ),
+}
+
+_STAGNATION_HINTS: dict[str, str] = _LOOP_HINTS  # Same reflection body for both detection types
+
+
+def _build_loop_hint(fp: str, count: int, phase: str) -> str:
+    """Build phase-specific loop detection hint."""
+    detection = (
+        f"**LOOP DETECTED**: `{fp}` repeated {count} times with identical results.\n\n"
     )
+    body = _LOOP_HINTS.get(phase, _LOOP_HINTS["intent"])
+    return detection + body
 
 
-def detect_repeated_tool_calls(messages: list) -> str | None:
+def _build_stagnation_hint(tool: str, streak: int, phase: str) -> str:
+    """Build phase-specific stagnation hint."""
+    detection = (
+        f"**ACTION_STAGNATION**: `{tool}` called {streak} times with varying "
+        f"parameters, no progress.\n\n"
+    )
+    body = _STAGNATION_HINTS.get(phase, _STAGNATION_HINTS["intent"])
+    suffix = f"\n\nDo NOT call `{tool}` again with the same subcommand."
+    return detection + body + suffix
+
+
+def detect_repeated_tool_calls(messages: list, phase: str = "intent") -> str | None:
     """Scan recent messages for repeated identical tool calls.
 
     Returns a LOOP DETECTED hint if the same tool call fingerprint
@@ -429,35 +454,12 @@ def detect_repeated_tool_calls(messages: list) -> str | None:
         if have_outputs and not all_identical:
             continue
 
-        tool_name = fp.split("(")[0]
-        matched_args = None
-        subcmd = None
-        if tool_name in ("kubectl", "kubectl_ro"):
-            for msg2 in recent:
-                if not isinstance(msg2, AIMessage):
-                    continue
-                for tc2 in (getattr(msg2, "tool_calls", None) or []):
-                    tc2_name, tc2_args = extract_tool_call_fields(tc2)
-                    if tc2_name == tool_name and _fingerprint_tool_call(tc2_name, tc2_args) == fp:
-                        subcmd = tc2_args.get("subcommand")
-                        matched_args = tc2_args
-                        break
-                if subcmd:
-                    break
-
-        strategy_hints = _build_strategy_hints(tool_name, subcommand=subcmd, args=matched_args)
-        result_clause = "基本一致" if have_outputs else "无法获取"
-        return (
-            f"**LOOP DETECTED**: 你已用相同参数调用 {fp} 超过 {threshold} 次，"
-            f"每次调用返回的结果{result_clause}。"
-            f"当前方法无效，必须换策略：\n"
-            f"{strategy_hints}"
-        )
+        return _build_loop_hint(fp, count, phase)
 
     return None
 
 
-def detect_action_stagnation(messages: list, threshold: int | None = None) -> tuple[str | None, str | None]:
+def detect_action_stagnation(messages: list, threshold: int | None = None, phase: str = "intent") -> tuple[str | None, str | None]:
     """Detect consecutive calls to the same tool name (regardless of args).
 
     Unlike detect_repeated_tool_calls (which requires identical fingerprints),
@@ -508,27 +510,7 @@ def detect_action_stagnation(messages: list, threshold: int | None = None) -> tu
         streak += 1
 
     if streak >= _threshold and streak_tool:
-        if ":" in streak_tool:
-            # Subcommand-level stagnation (e.g. kubectl:get).
-            # The tool itself is NOT removed — other subcommands
-            # (patch, delete, etc.) may still be needed.
-            base_tool = streak_tool.split(":")[0]
-            hint = (
-                f"**ACTION_STAGNATION**: You have called `{streak_tool}` {streak} consecutive times "
-                f"with no progress. Stop using this subcommand. "
-                f"You can still use `{base_tool}` with other subcommands to proceed.\n"
-                f"Do NOT call `{streak_tool}` again."
-            )
-        else:
-            # Full tool stagnation — tool will be removed by caller.
-            hint = (
-                f"**ACTION_STAGNATION**: You have called `{streak_tool}` {streak} consecutive times "
-                f"with no progress. This tool has been temporarily removed. "
-                f"You MUST now either:\n"
-                f"- Call `finish_planning` to finalize your plan and proceed to execution phase.\n"
-                f"- Use a DIFFERENT tool if you need additional information.\n"
-                f"Do NOT attempt to call `{streak_tool}` again."
-            )
+        hint = _build_stagnation_hint(streak_tool, streak, phase)
         return hint, streak_tool
     return None, None
 

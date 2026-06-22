@@ -13,10 +13,7 @@ import logging
 import typing
 
 from chaos_agent.agent.nodes._injection_detection import (
-    discover_tool_pods,
-    discover_tool_pods_with_nodes,
-    _TOOL_POD_NAMESPACE,
-    _TOOL_POD_LABEL_SELECTOR,
+    discover_tool_pod_on_node,
 )
 from chaos_agent.agent.nodes._verifier_shared import (
     _IMAGEFS_PATHS,
@@ -305,59 +302,6 @@ _BASELINE_INTEGRITY_PROMPT: str = (
 )
 
 
-def _resolve_target_node(state: AgentState) -> str | None:
-    """Extract the target node name from state for node-level faults."""
-    from chaos_agent.agent.fault_spec import read_fault_spec
-    spec = read_fault_spec(state)
-    if spec and spec.names:
-        return spec.names[0]
-    return None
-
-
-async def _discover_tool_pod_for_verification(
-    kubeconfig: str, task_id: str = "", target_node: str | None = None
-) -> str | None:
-    """Discover a running tool pod for Layer 2 verification.
-
-    When target_node is provided, only returns a pod running on that node.
-    When target_node is None, returns the first available running pod.
-    """
-    from chaos_agent.tools.shell import run_command
-    kubeconfig_args = ["--kubeconfig", kubeconfig] if kubeconfig else []
-
-    if target_node:
-        # Use -o wide to get node info for filtering
-        discover_cmd = ["kubectl", "get", "pods", "-n", _TOOL_POD_NAMESPACE,
-                        "-l", _TOOL_POD_LABEL_SELECTOR, "-o", "wide"] + kubeconfig_args
-        try:
-            result = await run_command(discover_cmd, task_id=task_id, source="verifier-L2-pod-discovery")
-            pods_with_nodes = discover_tool_pods_with_nodes(result.stdout)
-            for pod_name, node_name in pods_with_nodes:
-                if node_name == target_node:
-                    logger.info(f"Discovered tool pod on target node {target_node}: {pod_name}")
-                    return pod_name
-            logger.info(f"No tool pod found on target node {target_node}")
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to discover tool pods for verification: {e}")
-            return None
-    else:
-        # Original behavior: first available pod
-        discover_cmd = ["kubectl", "get", "pods", "-n", _TOOL_POD_NAMESPACE,
-                        "-l", _TOOL_POD_LABEL_SELECTOR] + kubeconfig_args
-        try:
-            result = await run_command(discover_cmd, task_id=task_id, source="verifier-L2-pod-discovery")
-            pods = discover_tool_pods(result.stdout)
-            if pods:
-                logger.info(f"Discovered tool pod for Layer 2 verification: {pods[0]}")
-                return pods[0]
-            logger.info("No running tool pods found for Layer 2 verification")
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to discover tool pods for verification: {e}")
-            return None
-
-
 def _get_fault_verification_hints(
     blade_scope: str | None,
     blade_target: str | None,
@@ -412,40 +356,11 @@ def _get_fault_verification_hints(
 
     # Node-level overlay filesystem hint
     if blade_scope == "node":
-        _version_skew_note = (
-            "\nkubectl debug version note: kubectl debug node/ uses the EphemeralContainers API, "
-            "which has breaking changes between K8s versions. When kubectl client and server "
-            "versions differ by more than ±1 minor version, the command may return \"NotFound\". "
-            "If kubectl debug fails: fall back to API-level checks only (kubectl describe node, "
-            "kubectl get events) which are always available. You CANNOT use kubectl run as an "
-            "alternative — it is not in the allowed subcommand list. Do not attempt kubectl run."
-        )
-        if injection_pod_name:
-            hints.append(
-                f"Node-level fault: Regular pods see OVERLAY filesystem, NOT the host.\n"
-                f"For host filesystem checks (df -h on host, iostat, du on host paths), "
-                f"use kubectl debug with the TWO-STEP approach:\n"
-                f"  Step 1: kubectl(subcommand='debug', v_args='node/<node_name> --image=busybox -- sleep 3600')\n"
-                f"  Step 2: From output, find debug pod name, then:\n"
-                f"    kubectl(subcommand='exec', v_args='<debug-pod> -n default -- <command>')\n"
-                f"CRITICAL: Must include '-- sleep 3600' in Step 1 — bare busybox exits immediately.\n"
-                f"Host paths use /host/ prefix (e.g., /host/tmp, /host/var/log).\n"
-                f"For API-level checks (describe node, top node), use kubectl directly or "
-                f"the tool pod `{injection_pod_name}`."
-                f"{_version_skew_note}"
-            )
-        else:
-            hints.append(
-                "Node-level fault: Regular pods see OVERLAY filesystem, NOT the host.\n"
-                "For API-level checks (describe node, top node), use kubectl directly.\n"
-                "For host filesystem checks (df -h, iostat, du on host paths), use kubectl debug:\n"
-                "  Step 1: kubectl(subcommand='debug', v_args='node/<node_name> --image=busybox -- sleep 3600')\n"
-                "  Step 2: From output, find debug pod name, then:\n"
-                "    kubectl(subcommand='exec', v_args='<debug-pod> -n default -- <command>')\n"
-                "CRITICAL: Must include '-- sleep 3600' in Step 1 — bare busybox exits immediately.\n"
-                "Host paths use /host/ prefix (e.g., /host/tmp, /host/var/log)."
-                f"{_version_skew_note}"
-            )
+        # Host-level checks are done via kubectl_verify(subcommand="debug").
+        # Host paths inside the debug pod live under /host/...; the
+        # verifier finalization scans message history and removes the
+        # debug pod automatically (no manual cleanup required).
+        pass
 
     # Fault metadata (factual context) — OR so partial metadata is still useful
     if blade_scope or blade_target or blade_action:

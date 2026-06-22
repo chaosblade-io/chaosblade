@@ -120,12 +120,53 @@ class TestAgentClientConvenience:
         assert call_args[0][0] == "/api/v1/inject"
 
     @pytest.mark.asyncio
-    async def test_recover_calls_post(self):
+    async def test_recover_consumes_stream_result(self):
         client = AgentClient(base_url="http://localhost:8089")
-        client.post = AsyncMock(return_value={"code": 0})
 
-        result = await client.recover(task_id="task-123")
-        client.post.assert_called_once()
+        class _StreamResponse:
+            def raise_for_status(self):
+                return None
+
+            async def aiter_lines(self):
+                yield 'data: {"type":"result","content":"{\\"status\\":\\"success\\",\\"data\\":{\\"task_id\\":\\"task-recover\\",\\"operation\\":\\"recover\\",\\"task_state\\":\\"recovered\\",\\"blade_uid\\":\\"uid-1\\",\\"target\\":{\\"namespace\\":\\"default\\",\\"names\\":[\\"pod-a\\"]}}}"}'
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class _Client:
+            def __init__(self):
+                self.stream_args = None
+                self.stream_kwargs = None
+
+            def stream(self, *args, **kwargs):
+                self.stream_args = args
+                self.stream_kwargs = kwargs
+                return _StreamResponse()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+        fake_client = _Client()
+        with patch("httpx.AsyncClient", return_value=fake_client):
+            result = await client.recover(task_id="task-123")
+
+        assert result["status"] == "success"
+        assert result["code"] == 0
+        assert result["data"]["task_id"] == "task-123"
+        assert result["data"]["recover_task_id"] == "task-recover"
+        assert result["data"]["result"] == "recovered"
+        assert result["data"]["targets"] == [{"name": "pod-a", "namespace": "default"}]
+        assert fake_client.stream_args[:2] == (
+            "POST",
+            "http://localhost:8089/api/v1/recover-stream",
+        )
+        assert fake_client.stream_kwargs["json"]["task_id"] == "task-123"
 
     @pytest.mark.asyncio
     async def test_metric_with_task_id_calls_get(self):

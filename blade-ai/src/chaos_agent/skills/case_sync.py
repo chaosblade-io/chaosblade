@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from chaos_agent.skills.capability_probe import _INFRA_FLAGS, probe_capabilities
+from chaos_agent.skills.loader import load_skill_metadata
+from chaos_agent.skills.models import SKILL_TYPE_FAULT_INJECTION
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +226,32 @@ async def sync_capabilities(
     Returns:
         The full catalog dict (also written to output_path)
     """
+    # Skill type filter: capabilities-sync only handles fault-injection skills.
+    # catalogue_root points at <skill_dir>/references/catalogue/, so the skill
+    # dir is two levels up. Non-fault-injection skills (e.g. tool-use type)
+    # have no blade injection commands to generate, so we skip early.
+    skill_dir = catalogue_root.parent.parent
+    try:
+        skill_meta = load_skill_metadata(skill_dir)
+    except Exception as e:
+        logger.warning("Failed to load skill metadata for %s: %s", skill_dir, e)
+        skill_meta = None
+    if skill_meta and skill_meta.skill_type != SKILL_TYPE_FAULT_INJECTION:
+        logger.info(
+            "Skipping capabilities-sync for skill '%s' (skill_type=%s, not fault-injection)",
+            skill_meta.name, skill_meta.skill_type,
+        )
+        empty_catalog = {
+            "blade_version": "",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "total": 0,
+            "cases": [],
+        }
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(empty_catalog, f, ensure_ascii=False, indent=2)
+        return empty_catalog
+
     logger.info("Probing blade capabilities (help-only)...")
     caps = probe_capabilities(blade_path)
     logger.info(

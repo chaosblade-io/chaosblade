@@ -180,12 +180,30 @@ def extract_llm_diagnosis(messages: list, max_length: int = 500) -> str:
     for msg in reversed(messages):
         if not (hasattr(msg, "type") and msg.type == "ai"):
             continue
-        # Skip messages that are purely tool calls with no text
-        if hasattr(msg, "tool_calls") and msg.tool_calls and not getattr(msg, "content", ""):
-            continue
+
+        content = getattr(msg, "content", "")
+
+        # When AIMessage has tool_calls but no text content, try extracting
+        # diagnosis from tool_call args (e.g. finish_planning rejection_reason)
+        if hasattr(msg, "tool_calls") and msg.tool_calls and not content:
+            for tc in msg.tool_calls:
+                args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                if not isinstance(args, dict):
+                    continue
+                diagnosis = (
+                    args.get("rejection_reason")
+                    or args.get("reason")
+                    or args.get("analysis")
+                    or args.get("explanation")
+                    or ""
+                )
+                if isinstance(diagnosis, str) and len(diagnosis) >= 20:
+                    if len(diagnosis) > max_length:
+                        return diagnosis[:max_length] + "..."
+                    return diagnosis
+            continue  # tool_calls had nothing useful, keep scanning
 
         text = ""
-        content = getattr(msg, "content", "")
         if isinstance(content, str) and len(content) >= 20:
             text = content
         else:

@@ -477,7 +477,7 @@ class TestResultPayloadShape:
         and must surface ``postmortem`` on data."""
         from unittest.mock import MagicMock
 
-        from chaos_agent.server.routes.turn import _build_result_payload
+        from chaos_agent.server.routes.turn_result import build_result_payload as _build_result_payload
 
         # Mock graph + aget_state to return a fake terminal state
         fake_state = MagicMock()
@@ -518,7 +518,7 @@ class TestResultPayloadShape:
         explicit None is the cleaner contract)."""
         from unittest.mock import MagicMock
 
-        from chaos_agent.server.routes.turn import _build_result_payload
+        from chaos_agent.server.routes.turn_result import build_result_payload as _build_result_payload
 
         fake_state = MagicMock()
         fake_state.next = None

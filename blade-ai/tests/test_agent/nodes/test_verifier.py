@@ -15,8 +15,8 @@ from chaos_agent.agent.nodes.verifier import (
     verifier,
     _run_layer1_verification,
     _cleanup_debug_pods,
-    Layer1Result,
 )
+from chaos_agent.agent.verdict import Layer1Result
 from chaos_agent.agent.state import infer_task_state
 
 
@@ -215,9 +215,9 @@ class TestRunLayer1Verification:
         """No blade_uid + blade_create in messages → ChaosBlade injection failed → failed."""
         msg = ToolMessage(content='{"code": 500, "success": false}', name="blade_create", tool_call_id="tc1")
         result = await _run_layer1_verification("", "", task_id="t2", messages=[msg])
-        assert result.status == "failed"
+        assert result.status == "warning"
         assert "blade_create" in result.details
-        assert result.is_terminal()
+        assert not result.is_terminal()
 
     @pytest.mark.asyncio
     async def test_no_blade_uid_no_messages_arg(self):
@@ -351,7 +351,7 @@ class TestChaosBladeFailedNoUid:
             ),
         ]
         result = await verifier(state)
-        assert result["verification"]["layer1"]["status"] == "failed"
+        assert result["verification"]["layer1"]["status"] == "warning"
         assert result["result"]["verified"] is False
 
 
@@ -510,7 +510,7 @@ class TestWasBladeCreateAttemptedKubectlOverride:
 
 class TestFindBladeQueryInMessages:
     def test_find_matching_query(self):
-        from chaos_agent.agent.nodes.verifier import _find_blade_query_in_messages
+        from chaos_agent.agent.nodes._verifier_layer1 import _find_blade_query_in_messages
         query_output = json.dumps({
             "code": 200,
             "success": True,
@@ -528,7 +528,7 @@ class TestFindBladeQueryInMessages:
         assert result == query_output
 
     def test_no_matching_uid(self):
-        from chaos_agent.agent.nodes.verifier import _find_blade_query_in_messages
+        from chaos_agent.agent.nodes._verifier_layer1 import _find_blade_query_in_messages
         msg = ToolMessage(
             content='{"code":200,"success":true,"result":{"uid":"other-uid"}}',
             name="kubectl",
@@ -538,7 +538,7 @@ class TestFindBladeQueryInMessages:
         assert result == ""
 
     def test_no_kubectl_messages(self):
-        from chaos_agent.agent.nodes.verifier import _find_blade_query_in_messages
+        from chaos_agent.agent.nodes._verifier_layer1 import _find_blade_query_in_messages
         msg = ToolMessage(content="some output", name="blade_create", tool_call_id="tc1")
         result = _find_blade_query_in_messages([msg], "a0f2357a939a9bb8")
         assert result == ""
@@ -822,8 +822,8 @@ class TestKubectlNativeInjectionLayer1:
         messages = [msg1] + kubectl_msgs
 
         result = await _run_layer1_verification("", "", task_id="t-no-alt", messages=messages)
-        assert result.status == "failed"
-        assert result.is_terminal()
+        assert result.status == "warning"
+        assert not result.is_terminal()
 
 
 class TestExtractKubectlExecPodName:
@@ -943,7 +943,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
     @pytest.mark.asyncio
     async def test_original_pod_succeeds(self):
         """Original pod is available → uses blade query k8s directly, no discovery needed."""
-        from chaos_agent.agent.nodes.verifier import _run_layer1_via_kubectl_exec
+        from chaos_agent.agent.nodes._verifier_layer1 import _run_layer1_via_kubectl_exec
         from chaos_agent.tools.shell import CommandResult
 
         # blade query k8s returns success for a running experiment
@@ -973,7 +973,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
     @pytest.mark.asyncio
     async def test_original_pod_not_found_falls_back(self):
         """Original pod blade query k8s returns error → falls back to blade status → discovery."""
-        from chaos_agent.agent.nodes.verifier import _run_layer1_via_kubectl_exec
+        from chaos_agent.agent.nodes._verifier_layer1 import _run_layer1_via_kubectl_exec
         from chaos_agent.tools.shell import CommandResult
 
         # blade query k8s returns error on original pod (unavailable)
@@ -990,7 +990,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
         )
         discover_result = CommandResult(
             exit_code=0,
-            stdout="NAME                   READY   STATUS    RESTARTS   AGE\notel-c-tool-new   1/1     Running   0          1d",
+            stdout="chaosblade   otel-c-tool-new   1/1   Running   0   1d",
             stderr="",
         )
         # blade query k8s on discovered pod succeeds
@@ -1018,12 +1018,12 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
     @pytest.mark.asyncio
     async def test_no_original_pod_discovers_normally(self):
         """No original pod name → falls through to discovery, uses blade query k8s."""
-        from chaos_agent.agent.nodes.verifier import _run_layer1_via_kubectl_exec
+        from chaos_agent.agent.nodes._verifier_layer1 import _run_layer1_via_kubectl_exec
         from chaos_agent.tools.shell import CommandResult
 
         discover_result = CommandResult(
             exit_code=0,
-            stdout="NAME                   READY   STATUS    RESTARTS   AGE\notel-c-tool-abc   1/1     Running   0          1d",
+            stdout="chaosblade   otel-c-tool-abc   1/1   Running   0   1d",
             stderr="",
         )
         # blade query k8s on discovered pod succeeds
@@ -1054,7 +1054,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
 # Tests for checklist parsing and automatic level downgrade
 # ---------------------------------------------------------------------------
 
-from chaos_agent.agent.nodes.verifier import (
+from chaos_agent.agent.nodes._verifier_layer2_parse import (
     _parse_checklist_items,
     _has_checklist,
     _parse_verification_result,
@@ -1840,7 +1840,7 @@ class TestFormatGuard:
 # _disk_fill_param_hints / _PARAM_HINT_GENERATORS
 # ---------------------------------------------------------------------------
 
-from chaos_agent.agent.nodes.verifier import (
+from chaos_agent.agent.nodes._verifier_hints import (
     _disk_fill_param_hints,
     _PARAM_HINT_GENERATORS,
     _IMAGEFS_PATHS,
@@ -2118,7 +2118,7 @@ class TestDiskFillParamHintsBaselineIntegrity:
 # TestDeriveDiskFillPartition
 # ---------------------------------------------------------------------------
 
-from chaos_agent.agent.nodes.verifier import (
+from chaos_agent.agent.nodes._verifier_hints import (
     _derive_disk_fill_partition,
     _COMMAND_PRIORITY_HINT,
 )
@@ -2301,7 +2301,7 @@ class TestBaselineComparisonInLayer2Context:
 
     def test_baseline_in_context_when_available(self):
         """When baseline_data with success_count > 0, baseline is injected as synthetic ToolMessage."""
-        from chaos_agent.agent.nodes.verifier import (
+        from chaos_agent.agent.nodes._verifier_messages import (
             _build_baseline_tool_messages,
         )
         state = self._build_direct_state_with_baseline(baseline_success=True)
@@ -2326,10 +2326,10 @@ class TestBaselineComparisonInLayer2Context:
 
     def test_baseline_not_in_humanmessage_when_available(self):
         """When baseline_data is available, it should NOT be in the HumanMessage content."""
-        from chaos_agent.agent.nodes.verifier import _build_layer2_messages
+        from chaos_agent.agent.nodes._verifier_messages import _build_layer2_messages
         state = self._build_direct_state_with_baseline(baseline_success=True)
         # Build Layer 2 messages and check HumanMessage does NOT contain baseline section
-        from chaos_agent.agent.nodes.verifier import Layer1Result
+        from chaos_agent.agent.verdict import Layer1Result
         layer1 = Layer1Result(
             status="passed",
             affected_count=1,
@@ -2461,11 +2461,11 @@ class TestSyntheticMessagePersistence:
     def test_extract_synthetic_for_state_on_count1(self, baseline_state):
         """On count==1, _build_layer2_messages injects synthetic messages,
         and _synthetic_for_state extraction picks them up."""
-        from chaos_agent.agent.nodes.verifier import (
+        from chaos_agent.agent.nodes._verifier_messages import (
             _build_layer2_messages,
             _SYNTHETIC_TOOL_CALL_IDS,
-            Layer1Result,
         )
+        from chaos_agent.agent.verdict import Layer1Result
 
         layer1 = Layer1Result(status="passed", affected_count=1, raw_output="Success")
         msgs = _build_layer2_messages(
@@ -2498,12 +2498,12 @@ class TestSyntheticMessagePersistence:
         """On count>1, when baseline ToolMessages are already in
         state['messages'], _build_layer2_messages should NOT re-inject them."""
 
-        from chaos_agent.agent.nodes.verifier import (
+        from chaos_agent.agent.nodes._verifier_messages import (
             _build_baseline_tool_messages,
             _build_layer2_messages,
             _BASELINE_TOOL_CALL_ID,
-            Layer1Result,
         )
+        from chaos_agent.agent.verdict import Layer1Result
 
         # Build synthetic messages as if they were persisted from count==1
         baseline = baseline_state["baseline_data"]
@@ -2531,11 +2531,11 @@ class TestSyntheticMessagePersistence:
         """On count>1, when baseline ToolMessages are NOT in
         state['messages'], _build_layer2_messages should inject them."""
 
-        from chaos_agent.agent.nodes.verifier import (
+        from chaos_agent.agent.nodes._verifier_messages import (
             _build_layer2_messages,
             _BASELINE_TOOL_CALL_ID,
-            Layer1Result,
         )
+        from chaos_agent.agent.verdict import Layer1Result
 
         # State has messages but WITHOUT synthetic baseline messages
         baseline_state["messages"] = [
@@ -2559,7 +2559,7 @@ class TestSyntheticMessagePersistence:
         """When _synthetic_for_state is prepended BEFORE response,
         the last message in result_update is response (routing-safe)."""
 
-        from chaos_agent.agent.nodes.verifier import (
+        from chaos_agent.agent.nodes._verifier_messages import (
             _build_baseline_tool_messages,
         )
 
@@ -2581,7 +2581,7 @@ class TestSyntheticMessagePersistence:
 
     def test_metrics_tool_call_id_constant(self):
         """Verify _METRICS_TOOL_CALL_ID is defined and equals 'baseline_collector_metrics'."""
-        from chaos_agent.agent.nodes.verifier import (
+        from chaos_agent.agent.nodes._verifier_messages import (
             _METRICS_TOOL_CALL_ID,
             _SYNTHETIC_TOOL_CALL_IDS,
         )
@@ -2633,7 +2633,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid):
+        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
             deleted.append(pod_name)
 
         with patch(
@@ -2672,7 +2672,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid):
+        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
             deleted.append(pod_name)
 
         with patch(
@@ -2710,7 +2710,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid):
+        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
             deleted.append(pod_name)
 
         with patch(
@@ -2740,7 +2740,7 @@ class TestCleanupDebugPodsDedup:
         }
         result_update: dict = {}
 
-        async def _failing_delete(pod_name, _kc, _tid):
+        async def _failing_delete(pod_name, _kc, _tid, namespace=""):
             # _delete_debug_pod internally swallows exceptions and logs
             # a warning — it returns None either way. We simulate that
             # contract here (silent failure).
@@ -2774,7 +2774,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid):
+        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
             deleted.append(pod_name)
 
         with patch(
@@ -2808,7 +2808,7 @@ class TestCleanupDebugPodsDedup:
 
         deleted: list[str] = []
 
-        async def _fake_delete(pod_name, _kc, _tid):
+        async def _fake_delete(pod_name, _kc, _tid, namespace=""):
             deleted.append(pod_name)
 
         with patch(

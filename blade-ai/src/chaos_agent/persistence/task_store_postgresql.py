@@ -259,7 +259,7 @@ class PostgreSQLBackend:
     async def select_active_tasks(self, namespace: str = "", target_name: str = "") -> list[dict]:
         conditions = ["task_state IN ('injecting', 'injected')"]
         params: list = []
-        idx = 1
+        idx = 0
         if namespace:
             idx += 1
             conditions.append(f"namespace = ${idx}")

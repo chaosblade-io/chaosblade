@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -52,12 +53,22 @@ def get_global_tui_session_store() -> Optional["TuiSessionStore"]:
 
 
 class TuiSessionStore:
+    # Maximum number of sessions to keep in memory. When exceeded, the oldest
+    # sessions (by started_at) are evicted from in-memory buffers. Disk files
+    # are NOT deleted — only the in-memory cache is trimmed. Subsequent access
+    # to evicted sessions will reload from disk via _load_from_disk().
+    _MAX_ACTIVE_SESSIONS = 200
+
     def __init__(self, session_dir: Path, compaction_threshold: int = 50):
         self.session_dir = session_dir.expanduser()
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self._events_dir = self.session_dir.parent / "tui"
         self._events_dir.mkdir(parents=True, exist_ok=True)
         self._compaction_threshold = compaction_threshold
+        # Thread lock for protecting compound operations on _active_sessions.
+        # RLock (reentrant) because add_task() -> create() nests lock acquisition.
+        # In TUI (single-thread) this is effectively a no-op.
+        self._lock = threading.RLock()
         # Token/thinking stream buffers for event coalescing.
         # Keyed by tui_session_id. Flushed on non-streamable event.
         self._token_buf: dict[str, str] = {}
@@ -86,6 +97,35 @@ class TuiSessionStore:
         """
         return self._events_dir / f"{tui_session_id}.events.jsonl"
 
+    def _maybe_evict(self) -> None:
+        """Evict oldest sessions from in-memory cache when limit is exceeded.
+
+        MUST be called while self._lock is held. Disk files are NOT deleted —
+        only the in-memory buffers are trimmed. Subsequent access to evicted
+        sessions will transparently reload from disk via _load_from_disk().
+        """
+        if len(self._active_sessions) < self._MAX_ACTIVE_SESSIONS:
+            return
+        # Sort by started_at, evict oldest 20%
+        evict_count = max(1, len(self._active_sessions) // 5)
+        sorted_ids = sorted(
+            self._active_sessions.keys(),
+            key=lambda sid: self._active_sessions[sid].get("started_at", ""),
+        )
+        for sid in sorted_ids[:evict_count]:
+            # Flush to disk before evicting (best-effort)
+            try:
+                self._write_json(sid)
+            except Exception:
+                pass
+            self._active_sessions.pop(sid, None)
+            self._existing_keys.pop(sid, None)
+            self._jsonl_counts.pop(sid, None)
+        logger.debug(
+            "TuiSessionStore: evicted %d sessions from memory (remaining: %d)",
+            evict_count, len(self._active_sessions),
+        )
+
     def create(
         self,
         tui_session_id: str,
@@ -93,47 +133,53 @@ class TuiSessionStore:
         namespace: str = "",
     ) -> None:
         """Initialize a new TUI session file."""
-        _ts = now_iso()
-        data = {
-            "tui_session_id": tui_session_id,
-            "started_at": _ts,
-            "finished_at": None,
-            "status": "active",
-            "cluster_name": cluster_name,
-            "namespace": namespace,
-            "task_ids": [],
-            "messages": [],
-            "stats": {
-                "message_count": 0,
-                "injection_count": 0,
-                "injection_success": 0,
-                "injection_fail": 0,
-                "recovery_count": 0,
-            },
-        }
-        # Register in-memory before writing
-        self._active_sessions[tui_session_id] = data
-        self._existing_keys[tui_session_id] = set()
-        self._jsonl_counts[tui_session_id] = 0
-        self._write_json(tui_session_id)
+        with self._lock:
+            # Double-check inside lock to prevent duplicate create
+            if tui_session_id in self._active_sessions:
+                return
+            self._maybe_evict()
+            _ts = now_iso()
+            data = {
+                "tui_session_id": tui_session_id,
+                "started_at": _ts,
+                "finished_at": None,
+                "status": "active",
+                "cluster_name": cluster_name,
+                "namespace": namespace,
+                "task_ids": [],
+                "messages": [],
+                "stats": {
+                    "message_count": 0,
+                    "injection_count": 0,
+                    "injection_success": 0,
+                    "injection_fail": 0,
+                    "recovery_count": 0,
+                },
+            }
+            # Register in-memory before writing
+            self._active_sessions[tui_session_id] = data
+            self._existing_keys[tui_session_id] = set()
+            self._jsonl_counts[tui_session_id] = 0
+            self._write_json(tui_session_id)
 
     def add_task(self, tui_session_id: str, task_id: str) -> None:
         """Append a task_id to the session's task list (no-op if already present)."""
-        session = self._active_sessions.get(tui_session_id)
-        if session is None:
-            # Load from disk if not in memory
-            session = self._load_from_disk(tui_session_id)
+        with self._lock:
+            session = self._active_sessions.get(tui_session_id)
             if session is None:
-                logger.warning(
-                    f"add_task: session {tui_session_id} missing; creating fresh"
-                )
-                self.create(tui_session_id)
-                session = self._active_sessions[tui_session_id]
+                # Load from disk if not in memory
+                session = self._load_from_disk(tui_session_id)
+                if session is None:
+                    logger.warning(
+                        f"add_task: session {tui_session_id} missing; creating fresh"
+                    )
+                    self.create(tui_session_id)
+                    session = self._active_sessions[tui_session_id]
 
-        task_ids = session.setdefault("task_ids", [])
-        if task_id and task_id not in task_ids:
-            task_ids.append(task_id)
-            self._write_json(tui_session_id)
+            task_ids = session.setdefault("task_ids", [])
+            if task_id and task_id not in task_ids:
+                task_ids.append(task_id)
+                self._write_json(tui_session_id)
 
     def append_dialogue(self, tui_session_id: str, messages: list) -> None:
         """Append intent clarification dialogue messages to the session file.
@@ -145,50 +191,37 @@ class TuiSessionStore:
         during intent clarification (PreReasoningHook no longer writes
         here).
         """
-        session = self._active_sessions.get(tui_session_id)
-        if session is None:
-            # Load from disk if not in memory
-            session = self._load_from_disk(tui_session_id)
+        with self._lock:
+            session = self._active_sessions.get(tui_session_id)
             if session is None:
-                logger.warning(
-                    f"append_dialogue: session {tui_session_id} missing; skipping"
-                )
-                return
+                # Load from disk if not in memory
+                session = self._load_from_disk(tui_session_id)
+                if session is None:
+                    logger.warning(
+                        f"append_dialogue: session {tui_session_id} missing; skipping"
+                    )
+                    return
 
-        existing_keys = self._existing_keys.get(tui_session_id, set())
-        from chaos_agent.memory.session_store import _message_dedup_key
+            existing_keys = self._existing_keys.get(tui_session_id, set())
+            from chaos_agent.memory.session_store import _message_dedup_key
 
-        new_entries = []
-        for msg in messages:
-            serialized = self._serialize_dialogue_message(msg)
-            key = _message_dedup_key(serialized)
-            if key in existing_keys:
-                continue
-            new_entries.append(serialized)
-            existing_keys.add(key)
+            new_entries = []
+            for msg in messages:
+                serialized = self._serialize_dialogue_message(msg)
+                key = _message_dedup_key(serialized)
+                if key in existing_keys:
+                    continue
+                new_entries.append(serialized)
+                existing_keys.add(key)
 
-        if new_entries:
-            session.setdefault("messages", []).extend(new_entries)
-            session["stats"]["message_count"] = len(session["messages"])
-            self._existing_keys[tui_session_id] = existing_keys
-            self._append_to_jsonl(tui_session_id, new_entries)
-            # Flush the full snapshot to ``.json`` after every append so
-            # the snapshot is never out-of-sync with ``.jsonl``. Why this
-            # matters: a reader of ``~/.blade-ai/memory/sessions/<sid>.json``
-            # mid-session (the user opening the file in an editor, or
-            # any tool that consumes the audit trail) was previously
-            # seeing a snapshot frozen at the last ``add_task`` /
-            # ``update_stats`` call — which on a chat-only turn means
-            # nothing, so the just-streamed dialogue lived only in
-            # ``.jsonl``. The cost here is one ~50 KB JSON write per
-            # turn (~1 ms on SSD); cheap enough that the perf savings
-            # of a JSONL-only mid-session path don't justify the UX
-            # surprise of "I asked the agent and the file didn't
-            # update". Atomic-write is reserved for finalize where
-            # crash-safety actually matters.
-            self._write_json(tui_session_id)
-            if self._needs_compaction(tui_session_id):
-                self._compact(tui_session_id)
+            if new_entries:
+                session.setdefault("messages", []).extend(new_entries)
+                session["stats"]["message_count"] = len(session["messages"])
+                self._existing_keys[tui_session_id] = existing_keys
+                self._append_to_jsonl(tui_session_id, new_entries)
+                self._write_json(tui_session_id)
+                if self._needs_compaction(tui_session_id):
+                    self._compact(tui_session_id)
 
     def read_dialogue(self, tui_session_id: str) -> list[dict]:
         """Read all intent clarification dialogue messages from session file.
@@ -309,8 +342,13 @@ class TuiSessionStore:
         if not jsonl_path.exists():
             return data
 
-        # Replay JSONL increments onto the snapshot.
+        # Replay JSONL increments onto the snapshot, deduplicating entries
+        # that already exist in the snapshot (append_dialogue writes both
+        # .json and .jsonl, so they overlap in the normal non-crash path).
         try:
+            from chaos_agent.memory.session_store import _message_dedup_key
+
+            existing_keys = {_message_dedup_key(m) for m in data.get("messages", [])}
             incremental_messages = []
             with open(jsonl_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -318,12 +356,18 @@ class TuiSessionStore:
                     if not line:
                         continue
                     try:
-                        incremental_messages.append(json.loads(line))
+                        entry = json.loads(line)
                     except json.JSONDecodeError:
                         logger.warning(
                             f"Corrupt JSONL line in session {tui_session_id}, skipping"
                         )
-            data["messages"] = data.get("messages", []) + incremental_messages
+                        continue
+                    key = _message_dedup_key(entry)
+                    if key not in existing_keys:
+                        incremental_messages.append(entry)
+                        existing_keys.add(key)
+            if incremental_messages:
+                data["messages"] = data.get("messages", []) + incremental_messages
         except OSError as e:
             logger.warning(f"Failed to read JSONL for session {tui_session_id}: {e}")
 

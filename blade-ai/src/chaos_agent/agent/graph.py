@@ -7,37 +7,37 @@ from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
 from chaos_agent.agent.dispatch import with_phase_events
+from chaos_agent.agent.nodes._recover_finalize import make_finalize_recover_verification
+from chaos_agent.agent.nodes._verifier_finalize import make_finalize_verification
 from chaos_agent.agent.nodes.agent_loop import make_agent_loop
 from chaos_agent.agent.nodes.baseline_capture import make_baseline_capture
+from chaos_agent.agent.nodes.batch_next import batch_next
+from chaos_agent.agent.nodes.batch_setup import batch_setup
 from chaos_agent.agent.nodes.confirmation_gate import confirmation_gate
 from chaos_agent.agent.nodes.direct_execute import direct_execute
-from chaos_agent.agent.nodes.se_snapshot import se_snapshot_node
-from chaos_agent.agent.nodes.se_detect import se_detect_node
 from chaos_agent.agent.nodes.direct_setup import make_direct_setup
 from chaos_agent.agent.nodes.execute_loop import make_execute_loop
 from chaos_agent.agent.nodes.extract_planning_metadata import extract_planning_metadata
 from chaos_agent.agent.nodes.intent_clarification import make_intent_clarification
-from chaos_agent.agent.nodes.plan_builder import make_plan_builder
-from chaos_agent.agent.nodes.batch_setup import batch_setup
-from chaos_agent.agent.nodes.batch_next import batch_next
 from chaos_agent.agent.nodes.intent_confirm import intent_confirm
 from chaos_agent.agent.nodes.memory_nodes import load_memory, save_memory
+from chaos_agent.agent.nodes.phase1_screener import (
+    phase1_screener,
+    route_after_phase1_screener,
+)
+from chaos_agent.agent.nodes.plan_builder import make_plan_builder
 from chaos_agent.agent.nodes.plan_change_confirm import plan_change_confirm
 from chaos_agent.agent.nodes.recover_handler import recover_handler
 from chaos_agent.agent.nodes.recover_verifier import make_recover_verifier
 from chaos_agent.agent.nodes.reject import reject
 from chaos_agent.agent.nodes.safety_check import safety_check
-from chaos_agent.agent.nodes.phase1_screener import (
-    phase1_screener,
-    route_after_phase1_screener,
-)
+from chaos_agent.agent.nodes.se_detect import se_detect_node
+from chaos_agent.agent.nodes.se_snapshot import se_snapshot_node
 from chaos_agent.agent.nodes.tool_screener import (
     route_after_screener,
     tool_screener,
 )
 from chaos_agent.agent.nodes.verifier import make_verifier
-from chaos_agent.agent.nodes._verifier_finalize import make_finalize_verification
-from chaos_agent.agent.nodes._recover_finalize import make_finalize_recover_verification
 from chaos_agent.agent.router import (
     should_continue_agent_loop,
     should_continue_execute_loop,
@@ -242,7 +242,11 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
     if verifier_tools:
         graph.add_node("verifier_tools", ToolNode(verifier_tools, handle_tool_errors=True))
     graph.add_node("se_detect", se_detect_node)
-    graph.add_node("save_memory", save_memory)
+    # Wrap save_memory in phase events so the platform UI renders a
+    # dedicated ``事后分析`` (postmortem) container that hosts the LLM
+    # postmortem generation and TaskStore persistence work. Tagged under
+    # the new ``postmortem`` phase family — distinct from inject/verify.
+    graph.add_node("save_memory", with_phase_events("save_memory", "postmortem", save_memory))
     graph.add_node("reject", reject)
     graph.add_node("recover_handler", recover_handler)
     # Wrap intent_confirm in phase events so the TUI stepper shows a
@@ -275,7 +279,7 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
 
     # intent_clarification ⇄ clarification_tools (ReAct loop for TUI intent recognition)
     # Multi-invocation model: pure text → END (turn done), inject → intent_confirm,
-    # batch_inject → plan_builder (multi-fault planning)
+    # batch_inject → intent_confirm (multi-fault intent confirmation)
     if clarification_tools:
         graph.add_conditional_edges(
             "intent_clarification",
@@ -283,7 +287,6 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
             {
                 "continue": "clarification_tools",
                 "intent_confirm": "intent_confirm",
-                "plan_builder": "plan_builder",
                 "recover_handler": "recover_handler",
                 "save_memory": "save_memory",
                 END: END,
@@ -297,7 +300,6 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
             route_after_intent_clarification,
             {
                 "agent_loop": "agent_loop",
-                "plan_builder": "plan_builder",
                 "recover_handler": "recover_handler",
                 "save_memory": "save_memory",
                 "intent_clarification": "intent_clarification",
@@ -674,7 +676,6 @@ def build_intent_graph(
             {
                 "continue": "clarification_tools",
                 "intent_confirm": "intent_confirm",
-                "plan_builder": "save_dialogue",
                 "recover_handler": "recover_handler",
                 "save_memory": "save_dialogue",
                 END: END,
@@ -687,7 +688,6 @@ def build_intent_graph(
             route_after_intent_clarification,
             {
                 "agent_loop": "intent_confirm",
-                "plan_builder": "save_dialogue",
                 "recover_handler": "recover_handler",
                 "save_memory": "save_dialogue",
                 "intent_clarification": "intent_clarification",

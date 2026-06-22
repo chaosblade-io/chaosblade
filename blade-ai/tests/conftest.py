@@ -31,6 +31,9 @@ def _isolate_task_store(tmp_path, monkeypatch):
     # Redirect DB path to tmp so tests never touch production data
     monkeypatch.setattr(_settings_mod.settings, "tasks_db_path", tmp_path / "tasks.db")
     monkeypatch.setattr(_settings_mod.settings, "memory_dir", tmp_path)
+    # Force kubeconfig mode so tests are deterministic regardless of
+    # the developer's ~/.blade-ai/config.json (which may set kubewiz).
+    monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "kubeconfig")
 
     yield
 

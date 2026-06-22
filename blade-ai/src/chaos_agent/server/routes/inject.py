@@ -7,9 +7,11 @@ import uuid
 from fastapi import Request
 
 from chaos_agent.agent.fault_spec import FaultSpec
+from chaos_agent.agent.state_builders import build_inject_initial_state
 from chaos_agent.config.settings import settings
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode
 from chaos_agent.server.routes import inject_router
+from chaos_agent.server.routes.turn_result import build_inject_data_from_state
 from chaos_agent.server.schemas import InjectRequest
 
 logger = logging.getLogger(__name__)
@@ -46,17 +48,16 @@ async def inject_fault(request: InjectRequest, req: Request):
     # fault identity + tuning; consumers read via ``read_fault_spec``.
     spec = FaultSpec.from_http_request(request)
     target_names = list(spec.names)
-    initial_state = {
-        "task_id": task_id,
-        "tui_session_id": "",
-        "operation": "inject",
-        "fault_spec": spec.to_dict(),
-        "needs_confirmation": request.confirm,
-        "safety_status": "pending",
-        "direct": request.direct,
-        "kubeconfig": request.kubeconfig or settings.kubeconfig_path,
-        "kube_context": request.context or settings.kube_context,
-    }
+    initial_state = build_inject_initial_state(
+        task_id=task_id,
+        fault_spec=spec,
+        needs_confirmation=request.confirm,
+        direct=request.direct,
+        kubeconfig=request.kubeconfig or settings.kubeconfig_path,
+        kube_context=request.context or settings.kube_context,
+        kubewiz_cluster_uuid=getattr(request, "cluster_uuid", "") or settings.kubewiz_cluster_uuid,
+        kubewiz_profile=getattr(request, "profile", "") or settings.kubewiz_profile,
+    )
 
     # Execute inject graph asynchronously
     config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
@@ -106,60 +107,44 @@ async def inject_fault(request: InjectRequest, req: Request):
             if session_store:
                 try:
                     remaining = []
-                    verification = None
                     blade_uid = ""
-                    target = None
-                    skill_name_fin = ""
-                    error_fin = ""
-                    failure_reason_fin = ""
-                    blade_params = {}
                     values_fin = {}
                     try:
                         final_state = await agents["pipeline"].aget_state(config)
                         if final_state and final_state.values:
                             values_fin = final_state.values
                             remaining = values_fin.get("messages", [])
-                            verification = values_fin.get("verification")
                             blade_uid = values_fin.get("blade_uid", "")
-                            target = values_fin.get("target")
-                            skill_name_fin = values_fin.get("skill_name", "")
-                            error_fin = values_fin.get("error") or ""
-                            failure_reason_fin = values_fin.get("failure_reason") or ""
-                            blade_params = values_fin.get("params") or {}
                     except Exception:
                         pass
-                    from chaos_agent.memory.session_store import build_verification_simple
                     from chaos_agent.agent.state import infer_task_state
 
                     inferred_state = infer_task_state(values_fin) if values_fin else "unknown"
                     if inferred_state == "injecting":
                         inferred_state = "injected" if blade_uid else "failed"
-
-                    fault_type_fin = ""
-                    if blade_params:
-                        _s = blade_params.get("scope", "")
-                        _a = blade_params.get("action", "")
-                        _t = blade_params.get("target", "")
-                        if _s and _t and _a:
-                            fault_type_fin = f"{_s}-{_t}-{_a}"
-                    if not fault_type_fin:
-                        fault_type_fin = skill_name_fin
-
-                    merged_error_fin = failure_reason_fin or error_fin or ""
+                    data = build_inject_data_from_state(values_fin, task_id) if values_fin else {
+                        "task_id": task_id,
+                        "task_state": inferred_state,
+                        "fault_type": "",
+                        "blade_uid": blade_uid,
+                        "target": {},
+                        "verification": None,
+                        "error": "",
+                    }
+                    target = data.get("target") if isinstance(data.get("target"), dict) else {}
                     names = target.get("names", []) if target else []
                     ns = target.get("namespace", "") if target else ""
-                    ns = ns or blade_params.get("namespace", "")
                     session_store.finalize_session(
                         task_id,
                         remaining_messages=remaining,
                         result_summary=JSONEnvelope.ok(data={
                             "task_id": task_id,
                             "result": inferred_state,
-                            "fault_type": fault_type_fin,
-                            "blade_uid": blade_uid,
+                            "fault_type": data.get("fault_type", ""),
+                            "blade_uid": data.get("blade_uid", ""),
                             "targets": [{"name": n, "namespace": ns} for n in names],
-                            "verification": build_verification_simple(verification),
-                            "error": merged_error_fin,
+                            "verification": data.get("verification"),
+                            "error": data.get("error", ""),
                         }),
                         status="completed",
                     )

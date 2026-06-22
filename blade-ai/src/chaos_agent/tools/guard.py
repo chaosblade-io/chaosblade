@@ -50,7 +50,7 @@ class CommandResult:
 class ToolGuard:
     """Security guard for tool command execution."""
 
-    ALLOWED_COMMANDS = {"blade", "kubectl", "df", "ping", "sleep"}
+    ALLOWED_COMMANDS = {"blade", "kubectl", "wiz", "df", "ping", "sleep"}
 
     KUBECTL_ALLOWED_SUBCOMMANDS = {
         "get",
@@ -121,6 +121,20 @@ class ToolGuard:
         if binary == "kubectl" and parsed.subcommand:
             if parsed.subcommand not in self.kubectl_subcommands:
                 return False, f"kubectl subcommand not allowed: {parsed.subcommand}"
+
+        # 3b. wiz command: extract kubectl subcommand from --command value
+        if binary == "wiz" and "--command" in cmd:
+            try:
+                idx = cmd.index("--command")
+                kubectl_str = cmd[idx + 1]
+                parts = kubectl_str.split()
+                # Expected: "kubectl <subcommand> ..."
+                if len(parts) >= 2 and parts[0] == "kubectl":
+                    wiz_sub = parts[1]
+                    if wiz_sub not in self.kubectl_subcommands:
+                        return False, f"kubectl subcommand not allowed: {wiz_sub}"
+            except (ValueError, IndexError):
+                pass
 
         # 4 + 5. Token-level checks (SUSPICIOUS_SOLO_TOKENS + regex
         # blacklist) on host-relevant tokens only. Excludes

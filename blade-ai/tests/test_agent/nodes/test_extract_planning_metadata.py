@@ -532,7 +532,11 @@ class TestCatalogueRejectionGuard:
             ],
         )
         result = await extract_planning_metadata(state)
-        assert "error" in result
+        # LLM browsed catalogue then rejected → genuine rejection.
+        # error is set so routing terminates at reject node (not agent_loop).
+        assert result.get("planning_rejected") is True
+        assert result.get("error") == "No matching use case"
+        assert result.get("_planning_rejection_reason") == "No matching use case"
         assert result.get("_catalogue_rejection_nudged") is not True
 
     @pytest.mark.asyncio
@@ -554,4 +558,8 @@ class TestCatalogueRejectionGuard:
             ],
         )
         result = await extract_planning_metadata(state)
-        assert "error" in result
+        # Second rejection after nudge → genuine rejection, terminate.
+        # error is set so routing terminates at reject node (not agent_loop).
+        assert result.get("planning_rejected") is True
+        assert result.get("error") == "Really not supported"
+        assert result.get("_planning_rejection_reason") == "Really not supported"

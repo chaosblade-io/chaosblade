@@ -31,8 +31,20 @@ class TestGetAgentCard:
     def test_capabilities_non_empty(self):
         card = get_agent_card()
         assert len(card["capabilities"]) >= 6
-        assert "resilience.chaos.pod_cpu" in card["capabilities"]
-        assert "resilience.recovery.deterministic" in card["capabilities"]
+        assert "chaos.inject.pod.cpu" in card["capabilities"]
+        assert "chaos.recover" in card["capabilities"]
+
+    def test_capability_groups_present(self):
+        card = get_agent_card()
+        groups = card["capability_groups"]
+        assert isinstance(groups, list) and len(groups) >= 4
+        names = [g["name"] for g in groups]
+        assert "故障注入" in names
+        assert "集群只读观察" in names
+        # 每组都有 summary + 至少一个 example
+        for g in groups:
+            assert g.get("summary")
+            assert g.get("examples")
 
     def test_keywords_include_chinese(self):
         card = get_agent_card()
@@ -42,7 +54,9 @@ class TestGetAgentCard:
         card = get_agent_card()
         schema = card["input_schema"]
         assert schema["type"] == "object"
-        assert "fault_scope" in schema["required"]
+        assert schema["required"] == ["fault_intent"]
+        assert "fault_intent" in schema["properties"]
+        assert "fault_scope" not in schema["properties"]
 
     def test_output_schema_present(self):
         card = get_agent_card()

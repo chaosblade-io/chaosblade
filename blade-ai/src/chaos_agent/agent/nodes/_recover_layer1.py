@@ -69,6 +69,14 @@ def _parse_blade_destroy_output(raw: str) -> tuple[str, str]:
 
 def _parse_blade_status_destroyed(raw: str) -> tuple[str, str]:
     """Check blade_status output confirms experiment is Destroyed."""
+    if not raw or not raw.strip():
+        return "passed", "blade_status: empty response (experiment not found)"
+
+    # Quick check for NotFound before JSON parsing — kubewiz mode returns
+    # error JSON with "not found" when CRD is already deleted.
+    if "not found" in raw.lower() or "notfound" in raw.lower():
+        return "passed", "blade_status: experiment CRD not found (already destroyed)"
+
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
@@ -79,13 +87,17 @@ def _parse_blade_status_destroyed(raw: str) -> tuple[str, str]:
     if not (data.get("success") or data.get("code") == 200):
         if data.get("code") == 406:
             return "passed", "blade_status: experiment data not found (already destroyed)"
+        # kubewiz mode: blade query k8s returns code 63061 with NotFound error
+        error_msg = data.get("error", "")
+        if "not found" in error_msg.lower() or "notfound" in error_msg.lower():
+            return "passed", "blade_status: experiment CRD not found (already destroyed)"
         return "failed", f"blade_status check failed: {raw[:200]}"
 
     res = data.get("result", {})
     if not isinstance(res, dict):
         return "passed", "blade_status: Destroyed"
 
-    exp_status = res.get("Status", res.get("status", ""))
+    exp_status = res.get("Status", res.get("status", "")) or res.get("phase", "")
     if exp_status in _DESTROYED_STATES:
         return "passed", "blade_status confirms: Destroyed"
     if exp_status in ("Running", "running"):
@@ -339,6 +351,29 @@ async def _run_recover_layer1(
         destroy_status, destroy_details = _parse_blade_destroy_output(destroy_raw)
 
         if destroy_status == "failed":
+            # Fallback: destroy failed (e.g. kubewiz guard blocked the delete),
+            # but the experiment may already be gone (timeout auto-expiry).
+            # Check via blade_status — if CRD is not found, treat as recovered.
+            try:
+                status_output = await blade_status.ainvoke(
+                    {"uid": blade_uid, "kubeconfig": kubeconfig}
+                )
+                status_raw = status_output if isinstance(status_output, str) else str(status_output)
+                if "not found" in status_raw.lower() or "notfound" in status_raw.lower():
+                    return RecoverLayer1Result(
+                        status="passed",
+                        details="blade_destroy failed but experiment CRD already removed (timeout auto-expiry)",
+                        raw_output=f"destroy: {destroy_raw}\nstatus: {status_raw}",
+                    )
+                check_status, check_details = _parse_blade_status_destroyed(status_raw)
+                if check_status == "passed":
+                    return RecoverLayer1Result(
+                        status="passed",
+                        details=f"blade_destroy failed but {check_details}",
+                        raw_output=f"destroy: {destroy_raw}\nstatus: {status_raw}",
+                    )
+            except Exception as fallback_err:
+                logger.debug(f"destroy-failed fallback status check also failed: {fallback_err}")
             return RecoverLayer1Result(
                 status="failed",
                 details=destroy_details,

@@ -72,20 +72,21 @@ import-time backward compatibility (tests / external callers)."""
 # rwx only. Locks shared-host scenarios down.
 _FILE_MODE = 0o600
 _DIR_MODE = 0o700
-
-# task_id format guard. Matches the ``task-<hex>`` shape allocated by
-# intent_clarification / direct_setup. Rejects path traversal attempts
-# and accidental empty / overly long inputs.
-_TASK_ID_PATTERN = re.compile(r"^task-[a-z0-9]{4,64}$")
-
+_TASK_ID_RE = re.compile(r"^task-[a-z0-9][a-z0-9-]*$")
 
 def _validate_task_id(task_id: str) -> None:
-    """Raise ValueError on malformed task_id (path traversal guard)."""
-    if not isinstance(task_id, str) or not _TASK_ID_PATTERN.fullmatch(task_id):
-        raise ValueError(
-            f"Invalid task_id format: {task_id!r}. "
-            f"Expected 'task-<4-64 hex chars>'."
-        )
+    """Validate generated task ids before using them in filesystem paths.
+
+    Task ids are generated internally (``task-`` + uuid-like suffix), not
+    user-supplied input. This still rejects malformed values so tests or a
+    corrupted state can never escape POSTMORTEM_DIR or create odd filenames.
+    """
+    if not isinstance(task_id, str) or not task_id:
+        raise ValueError(f"task_id must be a non-empty string, got {task_id!r}")
+    if "/" in task_id or "\\" in task_id or ".." in task_id:
+        raise ValueError(f"task_id contains unsafe path characters: {task_id!r}")
+    if not _TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(f"task_id must match task-[a-z0-9][a-z0-9-]*, got {task_id!r}")
 
 
 def _path_for(task_id: str, root: Optional[Path] = None) -> Path:
