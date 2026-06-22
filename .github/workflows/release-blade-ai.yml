@@ -375,19 +375,31 @@ jobs:
           set -euo pipefail
           # darwin/amd64 cross-build via Rosetta. ``arch -x86_64 python3.11``
           # forces the universal2 Python into its x86_64 slice. We also
-          # set _PYTHON_HOST_PLATFORM so pip requests x86_64-only wheels
-          # — without this, pip can pull an arm64 wheel for packages
-          # like cryptography (whose _rust.abi3.so is arch-specific),
-          # causing PyInstaller's COLLECT step to fail with
-          # IncompatibleBinaryArchError.
+          # set _PYTHON_HOST_PLATFORM=macosx-11.0-x86_64 so pip:
+          #   1) generates x86_64-only platform tags (no arm64), which
+          #      prevents pulling arm64-only wheels like
+          #      ``cryptography-*-macosx_11_0_arm64.whl`` whose
+          #      ``_rust.abi3.so`` has no x86_64 slice;
+          #   2) still matches universal2 wheels (e.g.
+          #      ``macosx_10_12_universal2``), because universal2
+          #      contains x86_64 and 10.12 <= 11.0.
+          # The macOS version MUST be >= 10.12 (the min macOS of the
+          # universal2 cryptography wheel); using 10.9 here previously
+          # caused pip to skip the universal2 wheel and fall back to a
+          # source build that failed due to openssl-sys cross-compile.
+          # ``--only-binary cryptography`` is a belt-and-suspenders guard:
+          # if no compatible wheel is found, fail fast instead of
+          # attempting a source build that cannot cross-compile openssl.
           if [[ "${{ matrix.os }}-${{ matrix.arch }}" == "darwin-amd64" ]]; then
             PY="arch -x86_64 python3.11"
-            export _PYTHON_HOST_PLATFORM=macosx-10.9-x86_64
+            export _PYTHON_HOST_PLATFORM=macosx-11.0-x86_64
+            ONLY_BIN="--only-binary cryptography"
           else
             PY="python"
+            ONLY_BIN=""
           fi
           $PY -m pip install --upgrade pip
-          $PY -m pip install -e ".[dev]"
+          $PY -m pip install $ONLY_BIN -e ".[dev]"
 
       - name: Build with PyInstaller (native)
         if: '!matrix.use_docker'
