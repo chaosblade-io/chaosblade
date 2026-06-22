@@ -374,12 +374,15 @@ jobs:
         run: |
           set -euo pipefail
           # darwin/amd64 cross-build via Rosetta. ``arch -x86_64 python3.11``
-          # forces the universal2 Python into its x86_64 slice — pip
-          # then pulls x86_64 wheels and the entire downstream Python
-          # process is x86_64. Other matrices use the host-native
-          # Python that setup-python put on PATH.
+          # forces the universal2 Python into its x86_64 slice. We also
+          # set _PYTHON_HOST_PLATFORM so pip requests x86_64-only wheels
+          # — without this, pip can pull an arm64 wheel for packages
+          # like cryptography (whose _rust.abi3.so is arch-specific),
+          # causing PyInstaller's COLLECT step to fail with
+          # IncompatibleBinaryArchError.
           if [[ "${{ matrix.os }}-${{ matrix.arch }}" == "darwin-amd64" ]]; then
             PY="arch -x86_64 python3.11"
+            export _PYTHON_HOST_PLATFORM=macosx-10.9-x86_64
           else
             PY="python"
           fi
