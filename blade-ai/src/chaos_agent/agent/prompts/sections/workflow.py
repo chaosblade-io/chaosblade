@@ -165,13 +165,15 @@ def get_remember_section() -> str:
     """REMEMBER segment — recency zone anchor for U-shaped attention.
 
     Reinforces the anti-hallucination principles from Core Principles and
-    Workflow Ground Truth, plus one workflow rule about propose_plan_change.
+    Workflow Ground Truth, plus workflow rules about propose_plan_change
+    and rejection when environment blocks all injection methods.
     """
     return """# REMEMBER
 - FAULT INTENT parameters are UNVERIFIED — verify with tools before trusting them
 - When tool output contradicts FAULT INTENT or documentation, the TOOL is correct
 - Before calling finish_planning, you MUST cite tool output that proves the target exists
-- Do NOT use propose_plan_change for parameter fixes — only for fault TYPE changes"""
+- Do NOT use propose_plan_change for parameter fixes — only for fault TYPE changes
+- If no viable injection path remains after exhausting alternatives, call finish_planning(rejected=True) — do NOT loop indefinitely"""
 
 
 def get_executor_core_principles_section() -> str:
@@ -263,11 +265,11 @@ actually does.
    - When writing Verification Methods: fault effects are NOT instantaneous
      (may take 5-30s to propagate). Plan for multi-iteration verification
      (2+ checks before concluding "no effect").
-5b. **Reject ONLY when technically impossible**: You may ONLY call
+5b. **Reject when technically impossible**: Call
    `finish_planning(rejected=True, ...)` when the request **cannot be done**:
    target does not exist after verification, no matching use-case after
-   browsing the catalogue, or the injection method is fundamentally
-   unsupported on this target.
+   browsing the catalogue, OR no viable injection path remains after
+   exhausting alternatives in the skill case.
    In ALL other cases — including safety concerns or blast-radius warnings
    — you MUST complete planning normally (`rejected=False`) and include
    your concerns in the `summary`. The system handles risk decisions via
@@ -334,6 +336,10 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
         "its actual interface before calling it.",
         "4. Generate a CORRECTED plan — do NOT repeat the approach that failed",
         "5. When ready, call `finish_planning`. The system routes to safety check before execution.",
+        "6. If no viable path forward remains (all alternatives exhausted, plan",
+        "   change rejected, or environment blocks all methods), call",
+        "   `finish_planning(rejected=True, rejection_reason=\"...\")` — do NOT",
+        "   continue observing.",
     ])
 
     # Inject rejected params prohibition
@@ -363,10 +369,11 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
             "  Fix the parameters and retry with the SAME fault type.",
             "  Do NOT use propose_plan_change.",
             "",
-            "- **Environment error** (tool not available, dependency missing):",
+            "- **Environment error** (tool not available, dependency missing, command blocked):",
             "  Consider alternative injection methods from the skill case.",
             "  You MAY use propose_plan_change if the fault type is",
             "  fundamentally not viable on this target.",
+            "  If all alternatives are also blocked, call `finish_planning(rejected=True)` to end cleanly.",
             "",
             "- **Execution error** (tool ran but injection failed):",
             "  Re-read the skill case, verify parameters, and retry.",
