@@ -1188,15 +1188,20 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
        *  indent to the value column. Hint row adds glyph-width indent
        *  so it visually nests under the UID values. */}
       {conflictUids.length > 0 && (
-        <Box marginTop={1}>
-          <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1} flexShrink={0}>
-            <Text color={Theme.gray[500]}>{t("confirm.field.conflicts")}</Text>
+        <Box marginTop={1} flexDirection="column">
+          <Box>
+            <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1} flexShrink={0}>
+              <Text color={Theme.gray[500]}>{t("confirm.field.conflicts")}</Text>
+            </Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text color={Theme.status.warn}>{Icons.warning} </Text>
+              <Text wrap="wrap" color={Theme.gray[300]}>
+                {conflictUids.join("  ")}
+              </Text>
+            </Box>
           </Box>
-          <Box flexGrow={1} flexShrink={1}>
-            <Text color={Theme.status.warn}>{Icons.warning} </Text>
-            <Text wrap="wrap" color={Theme.gray[300]}>
-              {conflictUids.join("  ")}
-            </Text>
+          <Box paddingLeft={FIELD_LABEL_WIDTH + 1}>
+            <Text color={Theme.gray[500]}>{t("confirm.conflicts.hint")}</Text>
           </Box>
         </Box>
       )}
