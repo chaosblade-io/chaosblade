@@ -14,7 +14,7 @@ def test_result_and_finalize_paths_do_not_read_legacy_target_params_directly():
             'values_fin.get("target")',
             'values_fin.get("params")',
         ],
-        "src/chaos_agent/server/routes/turn_result.py": [
+        "src/chaos_agent/agent/operation_result.py": [
             'values.get("target")',
             'values.get("params")',
         ],
@@ -47,9 +47,8 @@ def test_result_reporting_paths_use_fault_type_projection_helper():
 
     checked_files = [
         "src/chaos_agent/agent/state.py",
-        "src/chaos_agent/server/routes/turn_result.py",
-        "src/chaos_agent/server/routes/turn_event_stream.py",
-        "src/chaos_agent/cli/runner.py",
+        "src/chaos_agent/agent/operation_summary.py",
+        "src/chaos_agent/agent/operation_result.py",
         "src/chaos_agent/agent/nodes/batch_next.py",
         "src/chaos_agent/agent/postmortem/builder.py",
         "src/chaos_agent/agent/experience.py",
@@ -75,10 +74,12 @@ def test_result_reporting_paths_use_fault_type_projection_helper():
 def test_cli_recover_display_projects_params_from_fault_spec_helper():
     """CLI recover display should not read legacy params as source of truth."""
 
-    text = (PROJECT_ROOT / "src/chaos_agent/cli/runner.py").read_text(encoding="utf-8")
+    runner_text = (PROJECT_ROOT / "src/chaos_agent/cli/runner.py").read_text(encoding="utf-8")
+    result_text = (PROJECT_ROOT / "src/chaos_agent/agent/operation_result.py").read_text(encoding="utf-8")
 
-    assert 'state_values.get("params")' not in text
-    assert "legacy_params_dict(state_values)" in text
+    assert 'state_values.get("params")' not in runner_text
+    assert "build_recover_cli_data_from_state" in runner_text
+    assert "legacy_params_dict(dict(values or {}))" in result_text
 
 
 def test_recover_snapshot_paths_share_fault_name_parser():

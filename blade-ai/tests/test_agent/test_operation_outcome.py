@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from chaos_agent.agent.operation_outcome import (
+    build_verification_simple,
     read_inject_verification,
     read_merged_error,
     read_operation_outcome,
@@ -96,6 +97,57 @@ def test_side_effects_read_from_inject_verification():
     assert verification["side_effects"]["container_restarts"][0]["pod"] == "p1"
 
 
+def test_build_verification_simple_flattens_evidence_and_details():
+    verification = {
+        "level": "strong",
+        "layer1": {"status": "passed"},
+        "layer2": {"status": "passed", "details": "all checks passed"},
+        "baseline_confidence": "high",
+        "baseline_used": True,
+        "warnings": ["late sample"],
+        "checklist": {
+            "items": [
+                {"step": "kubectl get pod", "status": "passed", "evidence": "Running"},
+                {"ignored": "malformed but still a dict"},
+                "bad-item",
+            ]
+        },
+    }
+
+    assert build_verification_simple(verification) == {
+        "level": "strong",
+        "layer1": {"status": "passed"},
+        "layer2": {"status": "passed"},
+        "baseline_confidence": "high",
+        "baseline_used": True,
+        "warnings": ["late sample"],
+        "evidence": [
+            {"step": "kubectl get pod", "status": "passed", "detail": "Running"},
+            {"step": None, "status": None, "detail": ""},
+        ],
+        "evidence_summary": "all checks passed",
+    }
+
+
+def test_build_verification_simple_tolerates_malformed_layers():
+    assert build_verification_simple({}) is None
+    assert build_verification_simple(None) is None
+    assert build_verification_simple(
+        {
+            "level": "weak",
+            "layer1": "bad-layer",
+            "layer2": None,
+            "checklist": "bad-checklist",
+        }
+    ) == {
+        "level": "weak",
+        "layer1": {"status": "unknown"},
+        "layer2": {"status": "unknown"},
+        "baseline_confidence": "none",
+        "baseline_used": None,
+    }
+
+
 def test_operation_outcome_prefers_failure_reason_over_error():
     state = {
         "result": {"verified": False},
@@ -145,6 +197,10 @@ def test_raw_verification_field_reads_are_limited_to_boundaries_and_payloads():
             'verification = data.get("verification")',
         ),
         (
+            "src/chaos_agent/agent/operation_summary.py",
+            'verification = data.get("verification")',
+        ),
+        (
             "src/chaos_agent/server/routes/inject.py",
             '"verification": data.get("verification"),',
         ),
@@ -170,6 +226,22 @@ def test_raw_verification_field_reads_are_limited_to_boundaries_and_payloads():
 
     unexpected = findings - allowed
     assert unexpected == set()
+
+
+def test_verification_projection_owner_is_operation_outcome():
+    """Agent/CLI code should not depend on memory.session_store for projection."""
+
+    checked_files = [
+        "src/chaos_agent/agent/operation_summary.py",
+        "src/chaos_agent/cli/runner.py",
+    ]
+    violations = []
+    for rel in checked_files:
+        text = (PROJECT_ROOT / rel).read_text(encoding="utf-8")
+        if "from chaos_agent.memory.session_store import build_verification_simple" in text:
+            violations.append(rel)
+
+    assert violations == []
 
 
 def test_known_state_consumers_do_not_use_legacy_outcome_reads():

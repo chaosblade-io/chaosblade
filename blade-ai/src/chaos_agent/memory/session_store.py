@@ -183,38 +183,11 @@ def build_result_summary(verification: dict) -> str:
 
 def build_verification_simple(verification: dict) -> dict | None:
     """Flatten verification dict into a compact format for API responses."""
-    if not verification or not isinstance(verification, dict):
-        return None
-    layer1 = verification.get("layer1", {})
-    layer2 = verification.get("layer2", {})
-    result = {
-        "level": verification.get("level", "unknown"),
-        "layer1": {
-            "status": layer1.get("status", "unknown"),
-        },
-        "layer2": {
-            "status": layer2.get("status", "unknown"),
-        },
-        "baseline_confidence": verification.get("baseline_confidence", "none"),
-        "baseline_used": verification.get("baseline_used"),
-    }
-    warnings = verification.get("warnings")
-    if warnings:
-        result["warnings"] = warnings
+    from chaos_agent.agent.operation_outcome import (
+        build_verification_simple as _build_verification_simple,
+    )
 
-    checklist = verification.get("checklist", {})
-    items = checklist.get("items", []) if isinstance(checklist, dict) else []
-    if items:
-        result["evidence"] = [
-            {"step": it.get("step"), "status": it.get("status"), "detail": it.get("evidence", "")}
-            for it in items if isinstance(it, dict)
-        ]
-
-    layer2_details = layer2.get("details", "")
-    if layer2_details:
-        result["evidence_summary"] = layer2_details
-
-    return result
+    return _build_verification_simple(verification)
 
 
 class SessionStore:

@@ -675,6 +675,12 @@ function applyEvent(
         node: evt.node ?? "",
       });
       return;
+    case "llm_start":
+      dispatch({
+        type: "LLM_STARTED",
+        node: evt.node ?? "",
+      });
+      return;
     case "tool_start":
       dispatch({
         type: "TOOL_STARTED",

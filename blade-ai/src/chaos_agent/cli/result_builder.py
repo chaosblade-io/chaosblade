@@ -40,8 +40,6 @@ def _extract_visible_reply(values: dict) -> str:
 def _build_inject_result_events(
     values: dict | None,
     task_id: str,
-    kwargs: dict,
-    target_names: list[str],
     turn_tokens_seen: bool,
     interaction_mode: str,
 ) -> tuple[list[StreamEvent], bool]:
@@ -85,7 +83,7 @@ def _build_inject_result_events(
         ))
         return events, True
 
-    from chaos_agent.server.routes.turn_result import build_inject_data_from_state
+    from chaos_agent.agent.operation_result import build_inject_data_from_state
     result_data = build_inject_data_from_state(values, task_id)
 
     return [StreamEvent(

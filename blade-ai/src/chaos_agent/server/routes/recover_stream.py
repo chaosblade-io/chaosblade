@@ -175,20 +175,19 @@ async def recover_stream(request: RecoverRequest, req: Request):
                     return
 
                 try:
-                    from langchain_core.messages import SystemMessage
-                    from chaos_agent.memory.tui_session_store import get_global_tui_session_store
+                    from chaos_agent.agent.operation_summary import build_recover_summary_text
+                    from chaos_agent.memory.operation_summary_writer import write_operation_summary
                     from chaos_agent.server.routes.sessions import get_store as get_tui_session_store
-                    from chaos_agent.server.routes.turn_event_stream import _build_recover_summary_text
 
-                    summary_text = _build_recover_summary_text(
+                    summary_text = build_recover_summary_text(
                         result_payload,
                         inject_task_id,
                         state_values,
                     )
                     if summary_text:
-                        summary_msg = SystemMessage(content=summary_text)
+                        tui_session_index_store = get_tui_session_store()
                         session_meta = (
-                            get_tui_session_store().get(inject_tui_session_id)
+                            tui_session_index_store.get(inject_tui_session_id)
                             if inject_tui_session_id
                             else None
                         )
@@ -198,33 +197,21 @@ async def recover_stream(request: RecoverRequest, req: Request):
                             else ""
                         )
                         intent_graph = agents.get("intent") if isinstance(agents, dict) else None
-                        if intent_graph is not None and thread_id:
-                            try:
-                                await intent_graph.aupdate_state(
-                                    {
-                                        "configurable": {"thread_id": thread_id},
-                                        "recursion_limit": settings.recursion_limit,
-                                    },
-                                    {
-                                        "messages": [summary_msg],
-                                        "confirmed_intent": None,
-                                        "recover_task_id": None,
-                                        "pipeline_task_id": record_task_id,
-                                    },
-                                    as_node="save_dialogue",
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "Failed to write recover-stream summary to Intent Graph",
-                                    exc_info=True,
-                                )
-
-                        tui_store = get_global_tui_session_store()
-                        if tui_store is not None and inject_tui_session_id:
-                            tui_store.append_dialogue(inject_tui_session_id, [summary_msg])
-                            tui_store.add_task(inject_tui_session_id, record_task_id)
-                        if inject_tui_session_id:
-                            get_tui_session_store().add_task(inject_tui_session_id, record_task_id)
+                        await write_operation_summary(
+                            summary_text,
+                            intent_graph=intent_graph,
+                            thread_id=thread_id,
+                            state_update={
+                                "confirmed_intent": None,
+                                "recover_task_id": None,
+                                "pipeline_task_id": record_task_id,
+                            },
+                            tui_session_id=inject_tui_session_id,
+                            session_index_store=tui_session_index_store,
+                            task_id=record_task_id,
+                            recursion_limit=settings.recursion_limit,
+                            raise_graph_error=False,
+                        )
                 except Exception:
                     logger.warning(
                         "Failed to persist recover-stream summary for %s",

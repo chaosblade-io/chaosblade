@@ -48,6 +48,14 @@ from chaos_agent.skills.registry import SkillRegistry
 from chaos_agent.skills.watcher import SkillWatcher
 from chaos_agent.utils.time import now_iso
 
+# Module-level flag set by run_server() when the TUI spawn mode is active.
+# When non-None, the lifespan handler prints "BLADE_AI_READY port=N" AFTER
+# startup completes (skill loading, LLM creation, checkpointer setup, etc.),
+# so the TUI's 10s health-check timer doesn't start counting down during
+# lifespan initialization — which can take 2+ seconds on cold starts and
+# indefinitely if a stale process holds the SQLite lock.
+_ready_stdout_port: int | None = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -184,6 +192,15 @@ async def lifespan(app: FastAPI):
     logger.info(
         f"Blade AI Server ready - {len(registry)} skills loaded"
     )
+
+    # Print the ready signal AFTER lifespan startup completes, so the
+    # TUI's health-check timer doesn't start counting down while we're
+    # still loading skills / LLM / checkpointer. The TUI scans stdout
+    # for this exact prefix; anything before it is treated as log noise.
+    global _ready_stdout_port
+    if _ready_stdout_port is not None:
+        print(f"BLADE_AI_READY port={_ready_stdout_port}", flush=True)
+        _ready_stdout_port = None  # one-shot
 
     yield
 
@@ -385,10 +402,11 @@ def run_server(
     Optional arguments support the TS TUI's embedded-server mode:
       - ``port=0`` lets the OS allocate a free port (we resolve it before
         uvicorn starts so the chosen port can be advertised).
-      - ``ready_stdout=True`` prints a single ``BLADE_AI_READY port=N``
-        line to stdout once the chosen port is bound, so the TS CLI can
-        ``readline`` it and connect. Anything before the line is allowed
-        to be log noise; the TS side scans line-by-line.
+      - ``ready_stdout=True`` defers the ``BLADE_AI_READY port=N`` signal
+        to the lifespan handler, which prints it AFTER startup completes
+        (skill loading, LLM creation, checkpointer setup). This ensures
+        the TUI's 10s health-check timer doesn't start counting down
+        during lifespan initialization.
     """
     import socket
 
@@ -409,10 +427,12 @@ def run_server(
             resolved_port = s.getsockname()[1]
 
     if ready_stdout:
-        # The TS server-process.ts watches for this exact prefix.
-        # Use stdout (not stderr) and flush so the line is delivered
-        # immediately even when stdout is line-buffered.
-        print(f"BLADE_AI_READY port={resolved_port}", flush=True)
+        # Set the module-level flag so the lifespan handler prints the
+        # ready signal AFTER startup completes. Printing here (before
+        # uvicorn.run) would make the TUI start its 10s health-check
+        # timer while lifespan is still loading skills / LLM / DB.
+        global _ready_stdout_port
+        _ready_stdout_port = resolved_port
 
     uvicorn.run(
         create_app(),

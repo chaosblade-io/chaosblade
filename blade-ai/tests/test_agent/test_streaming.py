@@ -140,6 +140,30 @@ class TestParseStreamEvent:
         }
         assert parse_stream_event(raw) is None
 
+    def test_parse_on_chat_model_start(self):
+        """on_chat_model_start → llm_start event for thinking-duration tracking."""
+        raw = {
+            "event": "on_chat_model_start",
+            "data": {"input": []},
+            "tags": ["langsmith:nodes:agent_loop"],
+            "metadata": {},
+        }
+        evt = parse_stream_event(raw)
+        assert evt is not None
+        assert evt.type == "llm_start"
+        assert evt.node == "agent_loop"
+        assert evt.content == ""
+
+    def test_parse_on_chat_model_start_silent_node(self):
+        """on_chat_model_start from silent nodes (e.g. save_memory) is dropped."""
+        raw = {
+            "event": "on_chat_model_start",
+            "data": {"input": []},
+            "tags": ["langsmith:nodes:save_memory"],
+            "metadata": {},
+        }
+        assert parse_stream_event(raw) is None
+
     def test_parse_save_memory_thinking_dropped(self):
         """Reasoning chunks from save_memory's LLM are also filtered."""
         class FakeChunk:
@@ -351,6 +375,35 @@ class TestParseStreamEvent:
         assert len(result) == 1
         assert result[0].type == "token"
         assert result[0].content == "hi"
+
+    def test_parse_on_chat_model_end_tool_call_no_synthetic_token(self):
+        """Tool-call turn: content empty + reasoning_content present +
+        tool_calls present → NO synthetic token (only usage).
+
+        This is the normal agent-loop pattern: LLM thinks (reasoning_content)
+        about which tool to call, then emits tool_calls with empty content.
+        The reasoning is internal and should NOT be dumped as agent text.
+        """
+
+        class QwenToolCallMsg:
+            content = ""
+            additional_kwargs = {"reasoning_content": "I should call kubectl to check…"}
+            tool_calls = [{"name": "kubectl", "args": {"command": "get pods"}}]
+            usage_metadata = {"input_tokens": 50, "output_tokens": 20}
+
+        raw = {
+            "event": "on_chat_model_end",
+            "data": {"output": QwenToolCallMsg()},
+            "tags": [],
+            "metadata": {},
+        }
+        result = parse_stream_event(raw)
+        # Only usage event, no synthetic token
+        assert result is not None
+        assert not isinstance(result, list)
+        assert result.type == "usage"
+        assert result.input_tokens == 50
+        assert result.output_tokens == 20
 
     def test_parse_on_llm_end_routes_to_usage_event(self):
         """on_llm_end (non-chat LLMs) takes the same usage path."""

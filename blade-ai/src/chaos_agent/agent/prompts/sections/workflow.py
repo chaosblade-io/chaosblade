@@ -184,12 +184,18 @@ def get_executor_core_principles_section() -> str:
     Mirrors Phase 1's get_core_principles_section() pattern: same root
     principle (tool is ground truth), applied to the execution context.
     Three rules form a complete loop — before calling (discover),
-    during failure (adapt), during success (stop).
+    during failure (adapt), after completion (stop).
+
+    The 'stop' rule is step-aware: a fault injection may consist of
+    multiple atomic steps (e.g., kubectl patch → kubectl delete → observe).
+    A single step's success is progress, not completion. The LLM must
+    continue calling tools until ALL steps are done, then STOP and let
+    the verifier handle verification.
     """
     return """# Core Principles
 - Tool interface knowledge from docs is UNVERIFIED — discover the actual interface from the tool itself
 - When a tool returns error, the TOOL is right — adapt immediately, do not retry or re-plan
-- When the injection tool returns success, STOP — do not verify or recover"""
+- When ALL injection steps are complete, STOP — do not verify or recover (verification is automatic)"""
 
 
 def get_executor_remember_section() -> str:
@@ -202,7 +208,7 @@ def get_executor_remember_section() -> str:
     return """# REMEMBER
 - Tool interface knowledge from docs is UNVERIFIED — discover the actual interface from the tool itself
 - When a tool returns error, the TOOL is right — adapt immediately, do not retry or re-plan
-- When the injection tool returns success, STOP — do not verify or recover
+- When ALL injection steps are complete, STOP — do not verify or recover (verification is automatic)
 - If all injection methods fail, output [REPLAN] — do not retry exhausted approaches"""
 
 

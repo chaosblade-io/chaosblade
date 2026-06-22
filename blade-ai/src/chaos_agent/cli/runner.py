@@ -16,10 +16,12 @@ from typing import Optional
 from chaos_agent import __version__
 from chaos_agent.agent.factory import create_agent
 from chaos_agent.agent.fault_spec import FaultSpec
+from chaos_agent.agent.operation_summary import build_task_summary_text
 from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.agent.state_builders import build_inject_initial_state
 from chaos_agent.agent.streaming import StreamEvent, parse_stream_events
 from chaos_agent.config.settings import settings
+from chaos_agent.memory.operation_summary_writer import write_operation_summary
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode, build_inject_envelope
 from chaos_agent.observability.status_tracker import (
     subscribe,
@@ -227,7 +229,6 @@ class AgentRunner:
             spec = FaultSpec.from_cli_nl(input_text=kwargs["input"], kwargs=kwargs)
         else:
             spec = FaultSpec.from_cli_structured(kwargs)
-        target_names = list(spec.names)
         initial_state = build_inject_initial_state(
             task_id=task_id,
             tui_session_id=tui_session_id,
@@ -416,8 +417,7 @@ class AgentRunner:
             final_state = await graph.aget_state(config)
             _values = final_state.values if final_state and final_state.values else None
             result_events, should_return = _build_inject_result_events(
-                _values, task_id, kwargs, target_names,
-                turn_tokens_seen, _interaction_mode,
+                _values, task_id, turn_tokens_seen, _interaction_mode,
             )
             for evt in result_events:
                 yield evt
@@ -435,23 +435,19 @@ class AgentRunner:
                 content=f"Inject failed: {msg}{rollback_info}",
                 task_id=task_id,
             )
-            # Build fault_type from CLI params for error response
-            err_fault_type = ""
-            if kwargs.get("scope") and kwargs.get("target") and kwargs.get("action"):
-                err_fault_type = f"{kwargs['scope']}-{kwargs['target']}-{kwargs['action']}"
+            from chaos_agent.agent.operation_result import build_inject_status_data_from_state
+
             yield StreamEvent(
                 type="result",
                 content=json.dumps(JSONEnvelope.fail(
                     code=code,
                     message=f"Inject failed: {msg}{rollback_info}",
-                    data={
-                        "task_id": task_id,
-                        "result": "failed",
-                        "fault_type": err_fault_type,
-                        "blade_uid": "",
-                        "targets": [],
-                        "error": f"internal_error: Inject failed: {msg}{rollback_info}",
-                    },
+                    data=build_inject_status_data_from_state(
+                        initial_state,
+                        task_id,
+                        result="failed",
+                        error=f"internal_error: Inject failed: {msg}{rollback_info}",
+                    ),
                 ), ensure_ascii=False),
                 task_id=task_id,
             )
@@ -526,7 +522,6 @@ class AgentRunner:
             spec = FaultSpec.from_cli_nl(input_text=kwargs["input"], kwargs=kwargs)
         else:
             spec = FaultSpec.from_cli_structured(kwargs)
-        target_names = list(spec.names)
         initial_state = build_inject_initial_state(
             task_id=task_id,
             tui_session_id=tui_session_id,
@@ -597,10 +592,6 @@ class AgentRunner:
                         Command(resume="approved"), config
                     )
 
-            # Build response from graph result
-            from chaos_agent.agent.fault_spec import legacy_target_dict
-            safety_status = "approved"
-            plan_summary = ""
             # Non-injection intent completed via intent_clarification (TUI mode)
             confirmed_intent = result.get("confirmed_intent") if isinstance(result, dict) else ""
             if confirmed_intent in ("chat", "recover"):
@@ -612,7 +603,7 @@ class AgentRunner:
                     },
                 )
 
-            from chaos_agent.server.routes.turn_result import build_inject_data_from_state
+            from chaos_agent.agent.operation_result import build_inject_data_from_state
             inject_data = build_inject_data_from_state(
                 result if isinstance(result, dict) else {}, task_id,
             )
@@ -626,19 +617,18 @@ class AgentRunner:
 
             rollback_status = await auto_rollback(self._agents["pipeline"], config)
 
-            # Build fault_type from CLI params for error response
-            err_fault_type = ""
-            if kwargs.get("scope") and kwargs.get("target") and kwargs.get("action"):
-                err_fault_type = f"{kwargs['scope']}-{kwargs['target']}-{kwargs['action']}"
+            from chaos_agent.agent.operation_result import build_inject_status_data_from_state
 
-            return JSONEnvelope.fail(code=code, message=f"Inject failed: {msg}{rollback_status}", data={
-                "task_id": task_id,
-                "result": "failed",
-                "fault_type": err_fault_type,
-                "blade_uid": "",
-                "targets": [],
-                "error": f"internal_error: Inject failed: {msg}{rollback_status}",
-            })
+            return JSONEnvelope.fail(
+                code=code,
+                message=f"Inject failed: {msg}{rollback_status}",
+                data=build_inject_status_data_from_state(
+                    initial_state,
+                    task_id,
+                    result="failed",
+                    error=f"internal_error: Inject failed: {msg}{rollback_status}",
+                ),
+            )
         finally:
             # Finalize session: flush remaining messages from final graph state
             await _finalize_inject_session(
@@ -861,7 +851,7 @@ class AgentRunner:
 
                 if blade_uid:
                     from chaos_agent.models.schemas import build_inject_envelope
-                    from chaos_agent.server.routes.turn_result import build_inject_data_from_state
+                    from chaos_agent.agent.operation_result import build_inject_data_from_state
 
                     _data = build_inject_data_from_state(pv, task_id)
                     yield StreamEvent(
@@ -888,52 +878,16 @@ class AgentRunner:
 
                 # Write task summary back to Intent Graph + session file
                 try:
-                    from chaos_agent.agent.state import infer_task_state
-                    from chaos_agent.agent.fault_spec import (
-                        fault_type_from_state as _fault_type_from_state,
-                        read_fault_spec as _read_spec,
+                    summary = build_task_summary_text(pv, task_id)
+                    await write_operation_summary(
+                        summary,
+                        intent_graph=intent_graph,
+                        thread_id=session_id,
+                        state_update={"pipeline_task_id": task_id},
+                        tui_session_id=session_id,
+                        tui_session_store=self._tui_session_store,
+                        recursion_limit=settings.recursion_limit,
                     )
-                    from chaos_agent.agent.operation_outcome import read_inject_verification
-                    from chaos_agent.agent.state import extract_ui_diagnostics as _extract_diag
-                    from chaos_agent.memory.session_store import build_verification_simple as _build_verif
-                    ts = infer_task_state(pv) if pv else "unknown"
-                    _spec = _read_spec(pv) if pv else None
-                    _ft = _fault_type_from_state(pv) if pv else ""
-                    _ns = _spec.namespace if _spec else ""
-                    _names = ", ".join(_spec.names) if _spec and _spec.names else ""
-                    _uid = pv.get("blade_uid", "")
-                    _verif = read_inject_verification(pv)
-                    _verif_simple = _build_verif(_verif) if _verif else None
-                    _diag = _extract_diag(pv)
-                    _se_summary = _diag.get("side_effects_summary", "")
-
-                    _verif_line = ""
-                    if _verif_simple:
-                        _v_level = _verif_simple.get("level", "unknown")
-                        _v_l1 = _verif_simple.get("layer1", {}).get("status", "?")
-                        _v_l2 = _verif_simple.get("layer2", {}).get("status", "?")
-                        _verif_line = f"验证: {_v_level} (L1={_v_l1}, L2={_v_l2})"
-
-                    summary_parts = [
-                        f"[Task Summary] task_id={task_id}",
-                        f"类型: {_ft} | 目标: {_ns}/{_names}",
-                        f"结果: {ts} | blade_uid: {_uid}",
-                    ]
-                    if _verif_line:
-                        summary_parts.append(_verif_line)
-                    if _se_summary:
-                        summary_parts.append(f"副作用: {_se_summary}")
-                    if _diag.get("failure_reason"):
-                        summary_parts.append(f"失败原因: {_diag['failure_reason']}")
-                    summary = "\n".join(summary_parts)
-                    summary_msg = SystemMessage(content=summary)
-                    await intent_graph.aupdate_state(intent_config, {
-                        "messages": [summary_msg],
-                        "pipeline_task_id": task_id,
-                    }, as_node="save_dialogue")
-                    # Also persist to session file for audit trail
-                    if self._tui_session_store and session_id:
-                        self._tui_session_store.append_dialogue(session_id, [summary_msg])
                 except Exception:
                     logger.debug("Failed to write task summary to Intent Graph", exc_info=True)
 
@@ -1158,7 +1112,7 @@ class AgentRunner:
                 blade_uid = values.get("blade_uid", "")
                 if blade_uid:
                     from chaos_agent.models.schemas import build_inject_envelope
-                    from chaos_agent.server.routes.turn_result import build_inject_data_from_state
+                    from chaos_agent.agent.operation_result import build_inject_data_from_state
 
                     _data = build_inject_data_from_state(values, thread_id)
                     yield StreamEvent(
@@ -1289,11 +1243,6 @@ class AgentRunner:
             blade_uid = initial_state.get("blade_uid", "") or ""
             skill_name = read_active_skill_name(initial_state)
             inject_tui_session_id = initial_state.get("tui_session_id", "") or ""
-            fault_spec = initial_state.get("fault_spec") or {}
-            target = {
-                "names": list(fault_spec.get("names") or []),
-                "namespace": fault_spec.get("namespace", "") or "",
-            }
 
             # Write recover initial state to TaskStore (keyed by inject_task_id —
             # the drill-level identifier; recover outcome updates the same row).
@@ -1321,112 +1270,84 @@ class AgentRunner:
             if not settings.is_debug:
                 sys.stderr.write("  ⏳ 故障恢复进行中，AI 正在执行恢复并验证，请耐心等待...\n")
                 sys.stderr.flush()
-            recover_start = time.monotonic()
             result = await self._agents["recover"].ainvoke(initial_state, config)
-            recover_duration_ms = int((time.monotonic() - recover_start) * 1000)
 
-            # Extract verification results from graph output
-            is_recovered = False
-            recovery_level = "recovered"
-            verification = None
-            recover_outcome = None
-            if isinstance(result, dict):
-                from chaos_agent.agent.operation_outcome import (
-                    read_operation_outcome,
-                    read_recover_verification,
-                )
-                recover_outcome = read_operation_outcome(result)
-                result_dict = recover_outcome.result or {}
-                is_recovered = result_dict.get("recovered", False)
-                recovery_level = result_dict.get("recovery_level", "recovered")
-                verification = read_recover_verification(result)
+            from chaos_agent.agent.operation_result import (
+                build_recover_cli_data_from_state,
+            )
 
-            # Build targets info (fallback to projected FaultSpec params for namespace)
-            names = target.get("names", []) if target else []
-            ns = target.get("namespace", "") if target else ""
-            if not ns:
-                from chaos_agent.agent.fault_spec import legacy_params_dict
-
-                inject_params = legacy_params_dict(state_values)
-                ns = inject_params.get("namespace", "")
-
-            from chaos_agent.memory.session_store import build_verification_simple
-
-            if not is_recovered:
-                error_msg = recover_outcome.error if recover_outcome is not None else None
-                error_msg = error_msg or "Recovery verification failed"
-                recover_fail_data = {
-                    "task_id": inject_task_id,
-                    "result": "failed",
-                    "blade_uid": blade_uid,
-                    "targets": [{"name": name, "namespace": ns} for name in names],
-                    "error": error_msg,
-                }
+            recover_data = build_recover_cli_data_from_state(
+                result if isinstance(result, dict) else {},
+                inject_task_id,
+                state_values,
+            )
+            if recover_data.get("result") == "failed":
+                error_msg = recover_data.get("error") or "Recovery verification failed"
+                recover_fail_data = {**recover_data, "error": error_msg}
                 return JSONEnvelope.fail(
                     code=ResponseCode.NO_BLADE_UID,
                     message=error_msg,
                     data=recover_fail_data,
                 )
 
-            return JSONEnvelope.ok(
-                data={
-                    "task_id": inject_task_id,
-                    "result": recovery_level,
-                    "blade_uid": blade_uid,
-                    "targets": [{"name": name, "namespace": ns} for name in names],
-                    "verification": build_verification_simple(verification),
-                },
-            )
+            return JSONEnvelope.ok(data=recover_data)
 
         except Exception as e:
             code, msg = _format_error(e)
             logger.exception(f"Local recover failed for task {inject_task_id}")
-            return JSONEnvelope.fail(code=code, message=f"Recovery failed: {msg}", data={
-                "task_id": inject_task_id,
-                "result": "failed",
-                "blade_uid": blade_uid or "",
-                "targets": [],
-                "error": f"internal_error: Recovery failed: {msg}",
-            })
+            from chaos_agent.agent.operation_result import (
+                build_recover_cli_failure_data_from_state,
+            )
+
+            return JSONEnvelope.fail(
+                code=code,
+                message=f"Recovery failed: {msg}",
+                data=build_recover_cli_failure_data_from_state(
+                    inject_task_id,
+                    state_values,
+                    blade_uid=blade_uid or "",
+                    error=f"internal_error: Recovery failed: {msg}",
+                ),
+            )
         finally:
             # Finalize session: flush remaining messages from final graph state
             if self._session_store:
                 try:
                     remaining = []
-                    recover_verification = None
                     merged_error_fin = ""
                     values_fin = {}
                     try:
                         final_graph_state = await self._agents["recover"].aget_state(config)
                         if final_graph_state and final_graph_state.values:
-                            from chaos_agent.agent.operation_outcome import (
-                                read_operation_outcome,
-                                read_recover_verification,
-                            )
+                            from chaos_agent.agent.operation_outcome import read_operation_outcome
+
                             values_fin = final_graph_state.values
                             remaining = values_fin.get("messages", [])
-                            recover_verification = read_recover_verification(values_fin)
                             merged_error_fin = read_operation_outcome(values_fin).error
                     except Exception:
                         pass
-                    from chaos_agent.memory.session_store import build_verification_simple
                     from chaos_agent.agent.state import infer_task_state
 
                     inferred_state = infer_task_state(values_fin) if values_fin else "recovered"
+                    from chaos_agent.agent.operation_result import (
+                        build_recover_cli_data_from_state,
+                    )
 
-                    names_fin = target.get("names", []) if target else []
-                    ns_fin = target.get("namespace", "") if target else ""
+                    result_data = build_recover_cli_data_from_state(
+                        values_fin,
+                        inject_task_id,
+                        state_values,
+                    )
+                    result_data["result"] = inferred_state
+                    result_data["error"] = merged_error_fin
                     self._session_store.finalize_session(
                         record_task_id,
                         remaining_messages=remaining,
-                        result_summary=build_inject_envelope({
-                            "task_id": inject_task_id,
-                            "result": inferred_state,
-                            "blade_uid": blade_uid,
-                            "targets": [{"name": n, "namespace": ns_fin} for n in names_fin],
-                            "verification": build_verification_simple(recover_verification),
-                            "error": merged_error_fin,
-                        }, inferred_state, merged_error_fin),
+                        result_summary=build_inject_envelope(
+                            result_data,
+                            inferred_state,
+                            merged_error_fin,
+                        ),
                         status="completed",
                     )
                 except Exception:

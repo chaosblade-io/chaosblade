@@ -569,42 +569,25 @@ def _detect_terminal_conclusion(
     injection_method detected), the text conclusion is the natural exit
     signal — do NOT nudge it back. Only nudge when NO injection action
     has been taken at all.
+
+    EXCEPTION: kubectl_native injections are often multi-step (e.g.,
+    ``patch`` to add a finalizer, then ``delete`` to trigger
+    termination). Setting ``injection_method = kubectl_native`` after
+    the first step and then allowing a text-only exit would silently
+    skip remaining steps. Before letting kubectl_native exit, we must
+    verify step completeness via ``check_injection_step_completeness``.
     """
     _has_tool_calls = bool(getattr(response, "tool_calls", None))
     _has_uid = bool(result.get("blade_uid") or state.get("blade_uid"))
     _injection_method = result.get("injection_method") or state.get("injection_method")
     _resp_content = (getattr(response, "content", "") or "").strip()
 
-    # If LLM already performed injection (uid set or method detected),
-    # a text conclusion is the correct exit — let it through.
-    if _has_uid or _injection_method:
+    # Blade injection (uid set) → single-step, text conclusion is correct.
+    if _has_uid:
         return
 
-    if (
-        not _has_tool_calls
-        and not result.get("error")
-        and _resp_content
-        and REPLAN_MARKER not in _resp_content
-    ):
-        if not state.get("_execute_text_nudged"):
-            result.setdefault("messages", []).append(
-                HumanMessage(content=(
-                    "**EXECUTION REQUIRED**: You output text instead of "
-                    "calling a tool. You are in Phase 2 (execution) — "
-                    "the plan is already approved. You MUST call "
-                    "`kubectl` or `blade_create` NOW to inject the "
-                    "fault. Do NOT output plans, summaries, or wait "
-                    "for confirmation. Execute immediately."
-                ))
-            )
-            result["_execute_text_nudged"] = True
-        else:
-            result.update(fail_state(
-                FailureCategory.EXECUTION_FAILED,
-                "LLM concluded without tool use",
-                state.get("messages", []) + result.get("messages", []),
-            ))
-
+    # kubectl_native may be multi-step. Before allowing a text-only
+    # exit, verify all steps from the skill case are complete.
     if (
         not _has_tool_calls
         and _injection_method == "kubectl_native"
@@ -634,6 +617,38 @@ def _detect_terminal_conclusion(
             )
             result["injection_method"] = None
             result["_kubectl_step_nudged"] = True
+            return  # Don't fall through to generic nudge below
+
+    # Non-kubectl_native injection method (host_blade, kubectl_exec)
+    # or kubectl_native with all steps complete → exit is correct.
+    if _injection_method:
+        return
+
+    # No injection method at all — text-only without any injection action.
+    if (
+        not _has_tool_calls
+        and not result.get("error")
+        and _resp_content
+        and REPLAN_MARKER not in _resp_content
+    ):
+        if not state.get("_execute_text_nudged"):
+            result.setdefault("messages", []).append(
+                HumanMessage(content=(
+                    "**EXECUTION REQUIRED**: You output text instead of "
+                    "calling a tool. You are in Phase 2 (execution) — "
+                    "the plan is already approved. You MUST call "
+                    "`kubectl` or `blade_create` NOW to inject the "
+                    "fault. Do NOT output plans, summaries, or wait "
+                    "for confirmation. Execute immediately."
+                ))
+            )
+            result["_execute_text_nudged"] = True
+        else:
+            result.update(fail_state(
+                FailureCategory.EXECUTION_FAILED,
+                "LLM concluded without tool use",
+                state.get("messages", []) + result.get("messages", []),
+            ))
 
 
 def _handle_replan(

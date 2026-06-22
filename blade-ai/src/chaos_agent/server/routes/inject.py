@@ -7,11 +7,17 @@ import uuid
 from fastapi import Request
 
 from chaos_agent.agent.fault_spec import FaultSpec
+from chaos_agent.agent.operation_result import (
+    build_inject_status_data_from_state,
+)
 from chaos_agent.agent.state_builders import build_inject_initial_state
 from chaos_agent.config.settings import settings
+from chaos_agent.memory.session_finalizer import (
+    RESULT_SUMMARY_STATUS_ENVELOPE,
+    finalize_inject_session,
+)
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode
 from chaos_agent.server.routes import inject_router
-from chaos_agent.server.routes.turn_result import build_inject_data_from_state
 from chaos_agent.server.schemas import InjectRequest
 
 logger = logging.getLogger(__name__)
@@ -47,7 +53,6 @@ async def inject_fault(request: InjectRequest, req: Request):
     # Build initial state. FaultSpec is the single source of truth for
     # fault identity + tuning; consumers read via ``read_fault_spec``.
     spec = FaultSpec.from_http_request(request)
-    target_names = list(spec.names)
     initial_state = build_inject_initial_state(
         task_id=task_id,
         fault_spec=spec,
@@ -104,52 +109,13 @@ async def inject_fault(request: InjectRequest, req: Request):
             return {"error": f"{type(e).__name__}: {e}"}
         finally:
             # Finalize session: flush remaining messages from final graph state
-            if session_store:
-                try:
-                    remaining = []
-                    blade_uid = ""
-                    values_fin = {}
-                    try:
-                        final_state = await agents["pipeline"].aget_state(config)
-                        if final_state and final_state.values:
-                            values_fin = final_state.values
-                            remaining = values_fin.get("messages", [])
-                            blade_uid = values_fin.get("blade_uid", "")
-                    except Exception:
-                        pass
-                    from chaos_agent.agent.state import infer_task_state
-
-                    inferred_state = infer_task_state(values_fin) if values_fin else "unknown"
-                    if inferred_state == "injecting":
-                        inferred_state = "injected" if blade_uid else "failed"
-                    data = build_inject_data_from_state(values_fin, task_id) if values_fin else {
-                        "task_id": task_id,
-                        "task_state": inferred_state,
-                        "fault_type": "",
-                        "blade_uid": blade_uid,
-                        "target": {},
-                        "verification": None,
-                        "error": "",
-                    }
-                    target = data.get("target") if isinstance(data.get("target"), dict) else {}
-                    names = target.get("names", []) if target else []
-                    ns = target.get("namespace", "") if target else ""
-                    session_store.finalize_session(
-                        task_id,
-                        remaining_messages=remaining,
-                        result_summary=JSONEnvelope.ok(data={
-                            "task_id": task_id,
-                            "result": inferred_state,
-                            "fault_type": data.get("fault_type", ""),
-                            "blade_uid": data.get("blade_uid", ""),
-                            "targets": [{"name": n, "namespace": ns} for n in names],
-                            "verification": data.get("verification"),
-                            "error": data.get("error", ""),
-                        }),
-                        status="completed",
-                    )
-                except Exception:
-                    logger.warning(f"Failed to finalize session for task {task_id}")
+            await finalize_inject_session(
+                session_store,
+                agents["pipeline"],
+                config,
+                task_id,
+                result_summary_mode=RESULT_SUMMARY_STATUS_ENVELOPE,
+            )
             _tsm.end_task_span(task_id)
 
     task = asyncio.create_task(_run_inject())
@@ -160,21 +126,13 @@ async def inject_fault(request: InjectRequest, req: Request):
 
     task.add_done_callback(_on_task_done)
 
-    # Build fault_type from structured params
-    fault_type = ""
-    if request.scope and request.target and request.action:
-        fault_type = f"{request.scope}-{request.target}-{request.action}"
-
     # Return immediate response
     return JSONEnvelope.ok(
-        data={
-            "task_id": task_id,
-            "result": "pending",
-            "fault_type": fault_type,
-            "targets": [
-                {"name": name, "namespace": request.namespace or ""}
-                for name in (target_names or [request.target_name or ""])
-            ],
-        },
+        data=build_inject_status_data_from_state(
+            initial_state,
+            task_id,
+            result="pending",
+            include_blade_uid=False,
+        ),
         request_id=getattr(req.state, "request_id", ""),
     )

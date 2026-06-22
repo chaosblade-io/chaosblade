@@ -8,10 +8,11 @@
  *     against an already-running ``blade-ai-server``.
  *
  *   - **embedded**: spawn ``python -m chaos_agent.server.app --port 0
- *     --ready-stdout``, parse the ``BLADE_AI_READY port=N`` line we
- *     printed from app.py, and connect to ``http://127.0.0.1:N``.
- *     Wired to SIGTERM → SIGKILL on shutdown so a hung server can't
- *     orphan past the TUI.
+ *     --ready-stdout``, parse the ``BLADE_AI_READY port=N`` line printed
+ *     by the lifespan handler AFTER startup completes (skill loading,
+ *     LLM creation, checkpointer setup), and connect to
+ *     ``http://127.0.0.1:N``.  Wired to SIGTERM → SIGKILL on shutdown
+ *     so a hung server can't orphan past the TUI.
  *
  * Streams:
  *   - stdout: piped, scanned for the ready line, then drained.
@@ -37,6 +38,13 @@ export interface ServerHandle {
 }
 
 const READY_PREFIX = "BLADE_AI_READY port=";
+// The ready signal is printed by the lifespan handler AFTER startup
+// completes (Python import + port discovery + skill loading + LLM +
+// checkpointer). 20s covers cold starts (~2-3s typical) with ample
+// margin for slow systems. If a stale process holds the SQLite lock,
+// lifespan hangs and this timeout fires — a more accurate error than
+// the old "did not pass /health within 10s" which fired because the
+// ready signal was printed before uvicorn started.
 const SPAWN_TIMEOUT_MS = 20_000;
 
 /**

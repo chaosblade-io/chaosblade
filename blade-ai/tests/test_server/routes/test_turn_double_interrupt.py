@@ -36,10 +36,10 @@ from chaos_agent.server.routes.turn_interrupt import (
     extract_pending_interrupt as _extract_pending_interrupt,
     normalise_answer as _normalise_answer,
 )
-from chaos_agent.server.routes.turn_result import (
+from chaos_agent.agent.operation_result import (
     build_inject_data_from_state as _build_inject_data_from_state,
-    build_result_payload as _build_result_payload,
 )
+from chaos_agent.server.routes.turn_result import build_result_payload as _build_result_payload
 
 
 # ---------------------------------------------------------------------------

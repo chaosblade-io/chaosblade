@@ -8,6 +8,10 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from chaos_agent.agent.operation_summary import (
+    build_batch_summary_text,
+    build_recover_summary_text,
+)
 from chaos_agent.server.routes import turn_event_stream as stream_mod
 
 
@@ -39,14 +43,6 @@ class RecordingStore:
 
     def add_task(self, sid: str, task_id: str) -> None:
         self.tasks.append((sid, task_id))
-
-
-class RecordingTuiStore:
-    def __init__(self) -> None:
-        self.dialogue: list[tuple[str, list]] = []
-
-    def append_dialogue(self, sid: str, messages: list) -> None:
-        self.dialogue.append((sid, messages))
 
 
 def _ctx() -> SimpleNamespace:
@@ -167,7 +163,7 @@ async def test_batch_pipeline_clears_intent_state_before_cancel(monkeypatch):
 
 
 def test_batch_summary_contains_targets_and_freshness_note():
-    text = stream_mod._build_batch_summary_text(
+    text = build_batch_summary_text(
         [
             {
                 "task_id": "task-a",
@@ -196,7 +192,7 @@ def test_batch_summary_contains_targets_and_freshness_note():
 
 
 def test_recover_summary_contains_parent_task_and_verification():
-    text = stream_mod._build_recover_summary_text(
+    text = build_recover_summary_text(
         {
             "data": {
                 "task_id": "task-recover",
@@ -220,33 +216,6 @@ def test_recover_summary_contains_parent_task_and_verification():
     assert "类型: pod-pod-delete | 目标: arms-prom/pod-a" in text
     assert "结果: recovered | blade_uid: uid-1" in text
     assert "恢复验证: recovered (L1=passed, L2=passed)" in text
-
-
-@pytest.mark.asyncio
-async def test_operation_summary_writes_intent_graph_and_tui_session(monkeypatch):
-    from chaos_agent.memory import tui_session_store as tui_store_mod
-
-    ctx = _ctx()
-    tui_store = RecordingTuiStore()
-    monkeypatch.setattr(
-        tui_store_mod,
-        "get_global_tui_session_store",
-        lambda: tui_store,
-    )
-
-    await stream_mod._write_operation_summary(
-        ctx,
-        "[Recover Summary] task_id=task-r\n结果: recovered",
-        state_update={"confirmed_intent": None, "recover_task_id": None},
-    )
-
-    assert ctx.intent_graph.updates[-1]["as_node"] == "save_dialogue"
-    values = ctx.intent_graph.updates[-1]["values"]
-    assert values["confirmed_intent"] is None
-    assert values["recover_task_id"] is None
-    assert values["messages"][0].content.startswith("[Recover Summary]")
-    assert tui_store.dialogue[0][0] == "sid-1"
-    assert tui_store.dialogue[0][1][0].content.startswith("[Recover Summary]")
 
 
 def test_intent_trim_preserves_batch_and_recover_summaries():

@@ -5,70 +5,12 @@ from __future__ import annotations
 import logging
 import time
 
-from chaos_agent.agent.state import (
-    extract_ui_diagnostics,
-    infer_task_state,
-    strip_side_effects,
-)
-from chaos_agent.agent.operation_outcome import (
-    read_inject_verification,
-    read_operation_outcome,
-    read_recover_verification,
-    read_verification_side_effects,
+from chaos_agent.agent.operation_result import (
+    build_inject_data_from_state,
+    build_recover_data_from_state,
 )
 
 logger = logging.getLogger(__name__)
-
-
-def build_inject_data_from_state(
-    values: dict,
-    task_id: str,
-    *,
-    elapsed_ms: int = 0,
-) -> dict:
-    """Build a unified inject result data dict from graph state values.
-
-    All result construction paths (CLI runner, SSE stream, TUI turn)
-    should call this to avoid field set divergence.
-    """
-    from chaos_agent.agent.fault_spec import (
-        fault_type_from_state,
-        legacy_params_dict,
-        legacy_target_dict,
-    )
-
-    task_state = infer_task_state(values)
-    if task_state == "injecting":
-        task_state = "injected" if values.get("blade_uid") else "failed"
-
-    fault_type = fault_type_from_state(values)
-
-    blade_uid = values.get("blade_uid", "") or ""
-    target = legacy_target_dict(values)
-    params = legacy_params_dict(values)
-    verification = read_inject_verification(values)
-    outcome = read_operation_outcome(values)
-
-    diagnostics: dict = {}
-    try:
-        diagnostics = extract_ui_diagnostics(values) or {}
-    except Exception:
-        pass
-
-    return {
-        "task_id": task_id,
-        "task_state": task_state,
-        "fault_type": fault_type,
-        "blade_uid": blade_uid,
-        "duration_ms": elapsed_ms,
-        "target": target,
-        "params": params,
-        "verification": strip_side_effects(verification),
-        "side_effects": read_verification_side_effects(verification),
-        "postmortem": outcome.postmortem,
-        "error": outcome.error,
-        **diagnostics,
-    }
 
 
 async def build_recover_initial_from_store(
@@ -153,41 +95,12 @@ async def build_recover_result_payload(
     values = final.values
     elapsed_ms = int((time.monotonic() - started_monotonic) * 1000)
 
-    is_recovered = False
-    recovery_level = "failed"
-    outcome = read_operation_outcome(values)
-    result_dict = outcome.result
-    if isinstance(result_dict, dict):
-        is_recovered = result_dict.get("recovered", False)
-        recovery_level = result_dict.get("recovery_level", "recovered" if is_recovered else "failed")
-
-    if not is_recovered:
-        task_state = "failed"
-    elif recovery_level == "partial":
-        task_state = "partial_recovered"
-    else:
-        task_state = "recovered"
-
-    blade_uid = inject_state_values.get("blade_uid", "")
-    from chaos_agent.agent.fault_spec import (
-        fault_type_from_state,
-        legacy_params_dict,
-        legacy_target_dict,
-    )
-    target = legacy_target_dict(inject_state_values)
-    params = legacy_params_dict(inject_state_values)
-
     return {
         "status": "success",
-        "data": {
-            "task_id": recover_task_id,
-            "operation": "recover",
-            "task_state": task_state,
-            "fault_type": fault_type_from_state(inject_state_values),
-            "blade_uid": blade_uid,
-            "duration_ms": elapsed_ms,
-            "target": target,
-            "params": params,
-            "verification": strip_side_effects(read_recover_verification(values)),
-        },
+        "data": build_recover_data_from_state(
+            values,
+            recover_task_id,
+            inject_state_values,
+            elapsed_ms=elapsed_ms,
+        ),
     }

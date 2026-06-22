@@ -10,6 +10,7 @@
 export type StreamEventType =
   | "token"
   | "thinking"
+  | "llm_start"
   | "tool_start"
   | "tool_end"
   | "node_start"
@@ -37,6 +38,15 @@ export interface TokenEvent extends StreamEventBase {
 export interface ThinkingEvent extends StreamEventBase {
   type: "thinking";
   content: string;
+  node?: string;
+}
+
+/** LLM call started (on_chat_model_start). Carries no content —
+ *  the TUI uses the arrival timestamp to stamp ``thoughtStartedAt``
+ *  BEFORE the prefill phase, so "思考用时" includes prompt-processing
+ *  latency rather than only the thinking-token streaming duration. */
+export interface LlmStartEvent extends StreamEventBase {
+  type: "llm_start";
   node?: string;
 }
 
@@ -211,6 +221,7 @@ export interface ContextSizeEvent extends StreamEventBase {
 export type StreamEvent =
   | TokenEvent
   | ThinkingEvent
+  | LlmStartEvent
   | ToolStartEvent
   | ToolEndEvent
   | NodeStartEvent
@@ -230,6 +241,7 @@ export function isStreamEvent(value: unknown): value is StreamEvent {
   return (
     t === "token" ||
     t === "thinking" ||
+    t === "llm_start" ||
     t === "tool_start" ||
     t === "tool_end" ||
     t === "node_start" ||

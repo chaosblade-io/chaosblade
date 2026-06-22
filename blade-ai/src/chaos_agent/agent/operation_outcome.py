@@ -60,6 +60,54 @@ def read_verification_side_effects(verification: Mapping[str, Any] | None) -> An
     return _copy_optional(verification.get("side_effects"))
 
 
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
+def build_verification_simple(verification: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Flatten a verification dict into the compact API/memory projection."""
+
+    if not isinstance(verification, Mapping) or not verification:
+        return None
+
+    layer1 = _as_mapping(verification.get("layer1"))
+    layer2 = _as_mapping(verification.get("layer2"))
+    result: dict[str, Any] = {
+        "level": verification.get("level", "unknown"),
+        "layer1": {
+            "status": layer1.get("status", "unknown"),
+        },
+        "layer2": {
+            "status": layer2.get("status", "unknown"),
+        },
+        "baseline_confidence": verification.get("baseline_confidence", "none"),
+        "baseline_used": verification.get("baseline_used"),
+    }
+
+    warnings = verification.get("warnings")
+    if warnings:
+        result["warnings"] = _copy_optional(warnings)
+
+    checklist = verification.get("checklist", {})
+    items = checklist.get("items", []) if isinstance(checklist, Mapping) else []
+    if items:
+        result["evidence"] = [
+            {
+                "step": it.get("step"),
+                "status": it.get("status"),
+                "detail": it.get("evidence", ""),
+            }
+            for it in items
+            if isinstance(it, Mapping)
+        ]
+
+    layer2_details = layer2.get("details", "")
+    if layer2_details:
+        result["evidence_summary"] = layer2_details
+
+    return result
+
+
 def read_failure_reason(state: Mapping[str, Any]) -> str:
     """Read or derive the canonical failure reason string."""
 
@@ -138,4 +186,3 @@ def write_recover_verification(
     if finished_at is not _MISSING:
         update["finished_at"] = finished_at
     return update
-

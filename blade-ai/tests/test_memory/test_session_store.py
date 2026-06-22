@@ -9,6 +9,7 @@ from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, Syst
 from chaos_agent.memory.session_store import (
     SessionStore,
     _split_at_handoff,
+    build_verification_simple,
 )
 
 
@@ -28,6 +29,20 @@ def store(task_dir):
 def compacting_store(task_dir):
     """SessionStore with a very low compaction threshold for testing."""
     return SessionStore(task_dir, compaction_threshold=5)
+
+
+def test_build_verification_simple_compat_proxy():
+    """Legacy memory-layer helper delegates to operation_outcome projection."""
+
+    assert build_verification_simple(
+        {"level": "recovered", "layer1": {"status": "passed"}, "layer2": {}}
+    ) == {
+        "level": "recovered",
+        "layer1": {"status": "passed"},
+        "layer2": {"status": "unknown"},
+        "baseline_confidence": "none",
+        "baseline_used": None,
+    }
 
 
 class TestCreateSession:

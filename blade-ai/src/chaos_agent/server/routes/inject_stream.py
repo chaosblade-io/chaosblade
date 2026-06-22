@@ -12,6 +12,10 @@ from chaos_agent.agent.fault_spec import FaultSpec
 from chaos_agent.agent.state_builders import build_inject_initial_state
 from chaos_agent.agent.streaming import SSEBatcher, StreamEvent, parse_stream_event
 from chaos_agent.config.settings import settings
+from chaos_agent.memory.session_finalizer import (
+    RESULT_SUMMARY_DATA_ENVELOPE,
+    finalize_inject_session,
+)
 from chaos_agent.models.schemas import JSONEnvelope
 from chaos_agent.server.routes import inject_router
 from chaos_agent.server.schemas import InjectRequest
@@ -63,7 +67,6 @@ async def inject_stream(request: InjectRequest, req: Request):
 
     # Build initial state — FaultSpec is the single source of truth.
     spec = FaultSpec.from_http_request(request)
-    target_names = list(spec.names)
     initial_state = build_inject_initial_state(
         task_id=task_id,
         fault_spec=spec,
@@ -169,7 +172,7 @@ async def inject_stream(request: InjectRequest, req: Request):
                     return
 
                 # Fault injection result
-                from chaos_agent.server.routes.turn_result import build_inject_data_from_state
+                from chaos_agent.agent.operation_result import build_inject_data_from_state
                 _data = build_inject_data_from_state(values, task_id)
                 _data["plan_summary"] = values.get("plan_summary", "")
                 _data["needs_confirm"] = request.confirm
@@ -217,29 +220,13 @@ async def inject_stream(request: InjectRequest, req: Request):
         finally:
             _tsm.end_task_span(task_id)
             # Finalize session: flush remaining messages from final graph state
-            if session_store:
-                try:
-                    remaining = []
-                    values_fin = {}
-                    try:
-                        final_state = await graph.aget_state(config)
-                        if final_state and final_state.values:
-                            values_fin = final_state.values
-                            remaining = values_fin.get("messages", [])
-                    except Exception:
-                        pass
-                    from chaos_agent.server.routes.turn_result import build_inject_data_from_state
-                    _data = build_inject_data_from_state(values_fin, task_id) if values_fin else {
-                        "task_id": task_id, "task_state": "unknown", "error": "",
-                    }
-                    session_store.finalize_session(
-                        task_id,
-                        remaining_messages=remaining,
-                        result_summary=JSONEnvelope.ok(data=_data),
-                        status="completed",
-                    )
-                except Exception:
-                    logger.warning(f"Failed to finalize session for task {task_id}")
+            await finalize_inject_session(
+                session_store,
+                graph,
+                config,
+                task_id,
+                result_summary_mode=RESULT_SUMMARY_DATA_ENVELOPE,
+            )
             task_tracker.unregister(task_id)
 
     return StreamingResponse(

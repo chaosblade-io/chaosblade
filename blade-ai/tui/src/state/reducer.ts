@@ -421,7 +421,20 @@ function flushLeadingStable(state: AppState): AppState {
 }
 
 function commitThinking(state: AppState): AppState {
-  if (state.thoughtBuffer.length === 0 && state.thoughtStartedAt === 0) {
+  if (state.thoughtBuffer.length === 0) {
+    // No thinking content was generated. If LLM_STARTED stamped
+    // thoughtStartedAt, clear it without creating a ThinkingItem —
+    // we only show "▸ 思考用时 Ns" when reasoning_content was actually
+    // streamed. This prevents phantom thinking rows on non-thinking
+    // models or simple responses where the LLM call started but no
+    // reasoning_content arrived.
+    if (state.thoughtStartedAt > 0) {
+      return {
+        ...state,
+        thoughtStartedAt: 0,
+        hasActiveThinking: false,
+      };
+    }
     return state;
   }
   // Suppress mid-content thinking: once the first ThinkingItem for a
@@ -462,6 +475,7 @@ export type Action =
   | { type: "TURN_STARTED"; input: string }
   | { type: "TOKEN_APPENDED"; content: string; node: string }
   | { type: "THINKING_APPENDED"; content: string; node: string }
+  | { type: "LLM_STARTED"; node: string }
   | { type: "USAGE_RECEIVED"; inputTokens: number; outputTokens: number }
   | { type: "TOOL_STARTED"; callId: string; name: string; node: string }
   | {
@@ -934,46 +948,50 @@ export function reducer(state: AppState, action: Action): AppState {
 
     // ---------------------------------------------------------------
     case "THINKING_APPENDED": {
-      // Accumulate into the session buffer. The first chunk of a new
-      // session also stamps ``thoughtStartedAt`` so commitThinking
-      // can compute a duration when the session ends. Subsequent
-      // chunks leave the timestamp alone (preserving the original
-      // start). We deliberately do NOT touch ``thoughtSubject`` here:
+      // Accumulate reasoning_content into the session buffer.
+      // thoughtStartedAt was already stamped by LLM_STARTED;
+      // we deliberately do NOT touch thoughtSubject here:
       // LoadingIndicator picks up the live thinking buffer directly
-      // for its body block, and ``thoughtSubject`` is the channel
+      // for its body block, and thoughtSubject is the channel
       // for *non-thinking* phase labels (tool name, "resuming…",
-      // replay banner). Re-deriving a "last sentence" on every chunk
-      // was O(N) per dispatch with no consumer — pure waste.
-      //
-      // First chunk of a session is also a flush trigger: by the time
-      // the next LLM call has started thinking, anything sitting in
-      // pending from before (a resolved confirm card, a stale agent
-      // text, a done tool group) is by definition done mutating.
-      // Flushing here unblocks the execute_loop / verifier_loop
-      // transition where the agent thinks for several seconds before
-      // emitting any token / tool — without this hook those leftovers
-      // sit in the dynamic frame for the whole thinking window,
-      // tripping the fullscreen-redraw branch on every NODE_STARTED
-      // re-render.
-      const isFirstChunk =
-        state.thoughtBuffer.length === 0 && state.thoughtStartedAt === 0;
-      const flushed = isFirstChunk ? flushLeadingStable(state) : state;
-      const buffer = flushed.thoughtBuffer + action.content;
-      const startedAt =
-        flushed.thoughtStartedAt > 0 ? flushed.thoughtStartedAt : Date.now();
+      // replay banner).
+      const buffer = state.thoughtBuffer + action.content;
       // Edge-trigger ``hasActiveThinking``: only flip on the 0→N
       // transition so high-frequency subscribers (LoadingIndicator)
       // don't re-render for every appended token. The ``thoughtBuffer``
       // itself still updates per chunk for the eventual collapse.
-      const wasActive = flushed.thoughtBuffer.length > 0;
+      const wasActive = state.thoughtBuffer.length > 0;
       const isActive = buffer.length > 0;
       return {
-        ...flushed,
+        ...state,
         thoughtBuffer: buffer,
-        thoughtStartedAt: startedAt,
         hasActiveThinking:
-          wasActive !== isActive ? isActive : flushed.hasActiveThinking,
+          wasActive !== isActive ? isActive : state.hasActiveThinking,
         isReceiving: true,
+      };
+    }
+
+    // ---------------------------------------------------------------
+    case "LLM_STARTED": {
+      // on_chat_model_start fired — the LLM call has begun. Stamp
+      // thoughtStartedAt NOW so "思考用时" includes the prefill
+      // (prompt-processing) phase, not just the thinking-token
+      // streaming duration. Without this, complex prompts with long
+      // system messages show 1-2s "思考用时" when the model actually
+      // spent 5-10s processing the prompt before emitting any token.
+      //
+      // Also flush leading stable items: by the time a new LLM call
+      // starts, anything in pending from the previous node is done
+      // mutating — resolved confirm cards, stale agent text, done
+      // tool groups. Flushing here keeps the dynamic frame small
+      // during the thinking window.
+      if (state.thoughtStartedAt > 0) {
+        return state;
+      }
+      const flushed = flushLeadingStable(state);
+      return {
+        ...flushed,
+        thoughtStartedAt: Date.now(),
       };
     }
 

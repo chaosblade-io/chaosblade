@@ -1748,10 +1748,11 @@ describe("reducer / HISTORY_CLEARED", () => {
 });
 
 describe("reducer / thinking session commit", () => {
-  it("stamps thoughtStartedAt on the first THINKING_APPENDED", () => {
+  it("stamps thoughtStartedAt on LLM_STARTED, not THINKING_APPENDED", () => {
     const before = Date.now();
     const s = fold([
       { type: "TURN_STARTED", input: "hi" },
+      { type: "LLM_STARTED", node: "n" },
       { type: "THINKING_APPENDED", content: "Let me think…", node: "n" },
     ]);
     expect(s.thoughtBuffer).toBe("Let me think…");
@@ -1761,6 +1762,7 @@ describe("reducer / thinking session commit", () => {
   it("preserves thoughtStartedAt across subsequent thinking chunks", () => {
     const s1 = fold([
       { type: "TURN_STARTED", input: "hi" },
+      { type: "LLM_STARTED", node: "n" },
       { type: "THINKING_APPENDED", content: "first", node: "n" },
     ]);
     const startedAt = s1.thoughtStartedAt;
@@ -1999,6 +2001,55 @@ describe("reducer / thinking session commit", () => {
     ]);
     expect(s.thoughtSubject).toBe("kubectl");
     expect(s.thoughtBuffer).toBe("Now let me reflect.");
+  });
+
+  it("LLM_STARTED stamps thoughtStartedAt before THINKING_APPENDED arrives", () => {
+    // The core fix: LLM_STARTED (on_chat_model_start) fires before
+    // any reasoning_content chunks. thoughtStartedAt is stamped at
+    // LLM_STARTED, and THINKING_APPENDED must NOT overwrite it. This
+    // ensures "思考用时" includes the prefill (prompt-processing)
+    // phase, not just the thinking-token streaming duration.
+    const s = fold([
+      { type: "TURN_STARTED", input: "complex question" },
+      { type: "LLM_STARTED", node: "agent_loop" },
+      { type: "THINKING_APPENDED", content: "reasoning…", node: "agent_loop" },
+    ]);
+    expect(s.thoughtStartedAt).toBeGreaterThan(0);
+    expect(s.thoughtBuffer).toBe("reasoning…");
+  });
+
+  it("LLM_STARTED does not create phantom ThinkingItem when no thinking follows", () => {
+    // If the LLM call starts but no reasoning_content arrives (e.g.
+    // non-thinking model or simple response), commitThinking should
+    // clear thoughtStartedAt WITHOUT creating a ThinkingItem.
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "LLM_STARTED", node: "agent_loop" },
+      { type: "TOKEN_APPENDED", content: "answer", node: "agent_loop" },
+      { type: "TURN_DONE" },
+    ]);
+    expect(s.history.find((i) => i.kind === "thinking")).toBeUndefined();
+    expect(s.thoughtStartedAt).toBe(0);
+  });
+
+  it("LLM_STARTED + THINKING_APPENDED + TOKEN_APPENDED produces ThinkingItem with accurate duration", () => {
+    // Verify the full flow: LLM_STARTED stamps thoughtStartedAt,
+    // THINKING_APPENDED preserves it, TOKEN_APPENDED commits a
+    // ThinkingItem with duration measured from LLM_STARTED time.
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "LLM_STARTED", node: "agent_loop" },
+      { type: "THINKING_APPENDED", content: "thinking…", node: "agent_loop" },
+      { type: "TOKEN_APPENDED", content: "answer", node: "agent_loop" },
+    ]);
+    const thinking = [...s.history, ...s.pending].find(
+      (i) => i.kind === "thinking",
+    );
+    expect(thinking).toBeDefined();
+    if (thinking?.kind === "thinking") {
+      expect(thinking.durationMs).toBeGreaterThanOrEqual(0);
+    }
+    expect(s.thoughtStartedAt).toBe(0);
   });
 });
 

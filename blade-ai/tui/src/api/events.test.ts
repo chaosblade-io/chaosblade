@@ -15,6 +15,7 @@ describe("api / isStreamEvent type guard", () => {
   const allTypes = [
     "token",
     "thinking",
+    "llm_start",
     "tool_start",
     "tool_end",
     "node_start",

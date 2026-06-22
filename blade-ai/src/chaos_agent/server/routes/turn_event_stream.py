@@ -15,12 +15,17 @@ from chaos_agent.agent.intent_handoff import (
     clear_dispatched_operation_payload_update,
     detect_dispatchable_operation,
 )
+from chaos_agent.agent.operation_summary import (
+    build_batch_summary_text,
+    build_recover_summary_text,
+    build_task_summary_text,
+)
 from chaos_agent.agent.state_builders import build_inject_initial_state
 from chaos_agent.agent.streaming import SSEBatcher, StreamEvent, parse_stream_events
 from chaos_agent.agent.task_snapshot import resolve_recover_initial_state
-from chaos_agent.agent.fault_spec import fault_type_from_state
 from chaos_agent.agent.skill_identity import has_active_skill
 from chaos_agent.config.settings import settings
+from chaos_agent.memory.operation_summary_writer import write_operation_summary
 from chaos_agent.server.routes.turn_interrupt import (
     ConfirmTimeout,
     content_from_interrupt_payload,
@@ -60,154 +65,6 @@ class TurnContext:
     # Mutable — event_generator may reassign for result extraction
     result_graph: Any = field(default=None, init=False)
     result_config: dict = field(default_factory=dict, init=False)
-
-
-_POST_OPERATION_FRESHNESS_NOTE = (
-    "后续目标建议: 本概要及更早历史中的资源名仅作历史上下文；"
-    "若要复用这些目标，必须重新 kubectl 验证当前存在性。"
-)
-
-
-def _format_summary_target(target: Any) -> str:
-    """Format a result target dict for compact operation summaries."""
-    if not isinstance(target, dict):
-        return ""
-
-    namespace = str(target.get("namespace") or "")
-    names = target.get("names") or []
-    labels = target.get("labels") or {}
-
-    if isinstance(names, (list, tuple)) and names:
-        target_text = ", ".join(str(n) for n in names if n is not None)
-    elif isinstance(labels, dict) and labels:
-        target_text = ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
-    else:
-        target_text = ""
-
-    if namespace and target_text:
-        return f"{namespace}/{target_text}"
-    if namespace:
-        return namespace
-    return target_text
-
-
-async def _write_operation_summary(
-    ctx: TurnContext,
-    summary_text: str,
-    *,
-    state_update: dict | None = None,
-) -> None:
-    """Persist an operation summary to both Intent Graph and TUI session."""
-    if not summary_text:
-        return
-
-    from langchain_core.messages import SystemMessage as _SM
-    from chaos_agent.memory.tui_session_store import get_global_tui_session_store as _get_tui_store
-
-    summary_msg = _SM(content=summary_text)
-    update = {"messages": [summary_msg]}
-    if state_update:
-        update.update(state_update)
-
-    graph_error = None
-    try:
-        await ctx.intent_graph.aupdate_state(
-            {
-                "configurable": {"thread_id": ctx.thread_id},
-                "recursion_limit": settings.recursion_limit,
-            },
-            update,
-            as_node="save_dialogue",
-        )
-    except Exception as exc:
-        graph_error = exc
-
-    try:
-        _tui_s = _get_tui_store()
-        if _tui_s and ctx.sid:
-            _tui_s.append_dialogue(ctx.sid, [summary_msg])
-    except Exception:
-        logger.warning("Failed to write operation summary to TUI session", exc_info=True)
-
-    if graph_error is not None:
-        raise graph_error
-
-
-def _build_batch_summary_text(batch_results: list, batch_pm_path: str = "") -> str:
-    """Build the durable summary written after a batch injection."""
-    if not batch_results:
-        return ""
-
-    parts = [
-        f"[Batch Summary] {len(batch_results)} faults",
-        "操作: batch_inject",
-    ]
-    for idx, result in enumerate(batch_results):
-        if not isinstance(result, dict):
-            continue
-        task_state = result.get("task_state", "unknown")
-        ok = task_state in ("injected",)
-        target_text = _format_summary_target(result.get("target"))
-        target_suffix = f" target={target_text}" if target_text else ""
-        parts.append(
-            f"  {idx + 1}. {result.get('fault_type', '')} "
-            f"→ {task_state} "
-            f"{'✓' if ok else '✗'} "
-            f"(task={result.get('task_id', '')})"
-            f"{target_suffix}"
-        )
-        failure_reason = result.get("failure_reason") or result.get("error")
-        if failure_reason:
-            parts.append(f"     失败原因: {failure_reason}")
-
-    if batch_pm_path:
-        parts.append(f"批量分析报告: {batch_pm_path}")
-    parts.append(_POST_OPERATION_FRESHNESS_NOTE)
-    return "\n".join(parts)
-
-
-def _build_recover_summary_text(
-    recover_result: dict | None,
-    parent_task_id: str,
-    inject_state_values: dict | None,
-) -> str:
-    """Build the durable summary written after a recovery operation."""
-    if not isinstance(recover_result, dict):
-        return ""
-
-    data = recover_result.get("data")
-    if not isinstance(data, dict):
-        return ""
-
-    inject_state_values = inject_state_values or {}
-    task_id = data.get("task_id") or ""
-    task_state = data.get("task_state") or data.get("result") or "unknown"
-    fault_type = (
-        data.get("fault_type")
-        or fault_type_from_state(inject_state_values)
-        or "unknown"
-    )
-    blade_uid = data.get("blade_uid") or inject_state_values.get("blade_uid", "")
-    target_text = _format_summary_target(data.get("target"))
-    verification = data.get("verification")
-
-    parts = [
-        f"[Recover Summary] task_id={task_id}",
-        f"parent_task_id: {parent_task_id}",
-        f"类型: {fault_type} | 目标: {target_text}",
-        f"结果: {task_state} | blade_uid: {blade_uid}",
-    ]
-    if isinstance(verification, dict):
-        parts.append(
-            "恢复验证: "
-            f"{verification.get('level', '?')} "
-            f"(L1={verification.get('layer1', {}).get('status', '?')}, "
-            f"L2={verification.get('layer2', {}).get('status', '?')})"
-        )
-    if data.get("error"):
-        parts.append(f"失败原因: {data['error']}")
-    parts.append(_POST_OPERATION_FRESHNESS_NOTE)
-    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +367,6 @@ async def _run_inject_pipeline(ctx, iv, batcher, sidewrite, converters):
     """Launch and stream the single-inject Pipeline Graph."""
     from langchain_core.messages import SystemMessage as _SM
     from chaos_agent.agent.nodes.intent_clarification import bootstrap_task_session
-    from chaos_agent.agent.state import infer_task_state, extract_ui_diagnostics
 
     _handoff_data = build_pipeline_handoff_from_intent_state(
         iv,
@@ -572,38 +428,14 @@ async def _run_inject_pipeline(ctx, iv, batcher, sidewrite, converters):
         try:
             _pfinal = await ctx.pipeline_graph.aget_state(_p_config)
             _psv = _pfinal.values if _pfinal else {}
-            _p_ts = infer_task_state(_psv) if _psv else "unknown"
-            from chaos_agent.agent.fault_spec import (
-                fault_type_from_state as _fault_type_from_state,
-                read_fault_spec as _rfs,
-            )
-            from chaos_agent.agent.operation_outcome import read_inject_verification
-            from chaos_agent.memory.session_store import build_verification_simple as _bvs
-            _p_spec = _rfs(_psv) if _psv else None
-            _p_ft = _fault_type_from_state(_psv) if _psv else ""
-            _p_ns = _p_spec.namespace if _p_spec else ""
-            _p_names = ", ".join(_p_spec.names) if _p_spec and _p_spec.names else ""
-            _p_uid = _psv.get("blade_uid", "")
-            _p_verif = read_inject_verification(_psv)
-            _p_vs = _bvs(_p_verif) if _p_verif else None
-            _p_diag = extract_ui_diagnostics(_psv)
-            _p_parts = [
-                f"[Task Summary] task_id={_p_task_id}",
-                f"类型: {_p_ft} | 目标: {_p_ns}/{_p_names}",
-                f"结果: {_p_ts} | blade_uid: {_p_uid}",
-            ]
-            if _p_vs:
-                _p_parts.append(f"验证: {_p_vs.get('level','?')} (L1={_p_vs.get('layer1',{}).get('status','?')}, L2={_p_vs.get('layer2',{}).get('status','?')})")
-            if _p_diag.get("side_effects_summary"):
-                _p_parts.append(f"副作用: {_p_diag['side_effects_summary']}")
-            if _p_diag.get("failure_reason"):
-                _p_parts.append(f"失败原因: {_p_diag['failure_reason']}")
-            _p_parts.append(_POST_OPERATION_FRESHNESS_NOTE)
-            _summary_text = "\n".join(_p_parts)
-            await _write_operation_summary(
-                ctx,
+            _summary_text = build_task_summary_text(_psv, _p_task_id)
+            await write_operation_summary(
                 _summary_text,
+                intent_graph=ctx.intent_graph,
+                thread_id=ctx.thread_id,
                 state_update={"pipeline_task_id": _p_task_id},
+                tui_session_id=ctx.sid,
+                recursion_limit=settings.recursion_limit,
             )
         except Exception:
             logger.debug("Failed to write task summary to Intent Graph", exc_info=True)
@@ -749,14 +581,17 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
 
             # Write summary to Intent Graph
             try:
-                _batch_summary_text = _build_batch_summary_text(
+                _batch_summary_text = build_batch_summary_text(
                     _batch_results,
                     _batch_pm_path_str,
                 )
-                await _write_operation_summary(
-                    ctx,
+                await write_operation_summary(
                     _batch_summary_text,
+                    intent_graph=ctx.intent_graph,
+                    thread_id=ctx.thread_id,
                     state_update=clear_dispatched_operation_payload_update(),
+                    tui_session_id=ctx.sid,
+                    recursion_limit=settings.recursion_limit,
                 )
             except Exception:
                 logger.warning("Failed to write batch summary to Intent Graph", exc_info=True)
@@ -862,19 +697,22 @@ async def _run_recover(ctx, graph, config, turn_started_monotonic, batcher, side
             except Exception:
                 logger.warning("recover task_id disk persist failed sid=%s task=%s", ctx.sid, _rec_task_id)
         try:
-            _recover_summary_text = _build_recover_summary_text(
+            _recover_summary_text = build_recover_summary_text(
                 _rec_result,
                 _recover_inject_tid,
                 sv,
             )
-            await _write_operation_summary(
-                ctx,
+            await write_operation_summary(
                 _recover_summary_text,
+                intent_graph=ctx.intent_graph,
+                thread_id=ctx.thread_id,
                 state_update={
                     "confirmed_intent": None,
                     "recover_task_id": None,
                     "pipeline_task_id": _rec_task_id,
                 },
+                tui_session_id=ctx.sid,
+                recursion_limit=settings.recursion_limit,
             )
         except Exception:
             logger.warning("Failed to write recover summary to Intent Graph", exc_info=True)

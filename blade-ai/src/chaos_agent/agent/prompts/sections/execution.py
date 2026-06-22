@@ -19,9 +19,10 @@ def get_tools_section(phase: int = 1) -> str:
    as a STARTING POINT for injection commands. Do NOT call skill-reading tools (not bound here).
 2. **Knowledge docs for domain context**: When you need supplementary domain knowledge, use `read_knowledge_resource`. Do NOT guess or improvise blade commands.
 3. **Pre-injection checks only**: Use `kubectl(subcommand="get"/"describe")` ONLY to confirm the target exists before injection. Do NOT use kubectl to verify injection effects — that is handled automatically after execution.
-4. **Blade tools for faults**: Use `blade_create` to inject faults. Call `blade_help`
-   first to verify available flags — skill docs may be outdated. Only call tools that
-   are bound to you in this phase — recovery is framework-controlled.
+4. **Injection tools**: Use the injection tool specified by the skill case (`blade_create`,
+   `kubectl`, etc.). Call `blade_help` first to verify available flags when using blade —
+   skill docs may be outdated. Only call tools that are bound to you in this phase —
+   recovery is framework-controlled.
 
 ### Parallel Calls
 - You MAY make multiple independent kubectl calls in a single turn (e.g., check pods AND nodes simultaneously)
@@ -143,10 +144,11 @@ def get_execution_directives_section(
         "Do NOT improvise methods not listed in the skill case.",
         "",
         "### Multi-Step Execution",
-        "When the skill case requires multiple injection steps:",
-        "- Execute each step IN ORDER",
+        "A fault injection may consist of multiple atomic steps. When the skill case defines multiple steps:",
+        "- Execute each step IN ORDER — call the tool for each step, do NOT just describe what you will do",
         "- Check result before proceeding to next step",
-        "- Continue until ALL steps are done — do NOT conclude after first success",
+        "- A single step's success is progress, not completion — immediately call the next tool",
+        "- When ALL steps are done, output a brief conclusion (the verifier will handle verification)",
         "",
         "### Parameter Priority",
         "When the skill case template uses a default value and the user specified",

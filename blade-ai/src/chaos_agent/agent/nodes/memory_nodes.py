@@ -452,7 +452,7 @@ async def _finalize_session_store(
 
             result_summary: str | dict = ""
             try:
-                from chaos_agent.server.routes.turn_result import build_inject_data_from_state
+                from chaos_agent.agent.operation_result import build_inject_data_from_state
                 from chaos_agent.models.schemas import build_inject_envelope
 
                 _data = build_inject_data_from_state(merged, task_id)

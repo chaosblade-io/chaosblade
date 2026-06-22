@@ -18,6 +18,7 @@ class StreamEvent:
     Types:
         token      - LLM token (partial text output)
         thinking   - LLM thinking/reasoning token (from enable_thinking mode)
+        llm_start  - LLM call started (on_chat_model_start; enables accurate thinking-duration measurement)
         tool_start - Tool invocation started
         tool_end   - Tool invocation completed (content = result string)
         node_start - Graph node started
@@ -31,7 +32,7 @@ class StreamEvent:
         conversation_turn - Conversation turn completed (multi-invocation model)
     """
 
-    type: str  # token | thinking | tool_start | tool_end | node_start | node_end | confirm | result | error | usage | memory_compaction | context_size
+    type: str  # token | thinking | llm_start | tool_start | tool_end | node_start | node_end | confirm | result | error | usage | memory_compaction | context_size
     content: str = ""
     node: str = ""
     tool_name: str = ""
@@ -273,6 +274,12 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
         # empty and no token events were streamed during on_chat_model_stream.
         # Return BOTH a synthetic token (carrying reasoning_content) AND
         # the usage event so the user sees the reply AND token counts.
+        #
+        # IMPORTANT: only apply when the LLM did NOT produce tool_calls.
+        # In agent-loop tool-call turns, content is empty (the response
+        # is in tool_calls) but reasoning_content carries the model's
+        # internal thinking about which tool to call — that should NOT
+        # be dumped to the user as agent text.
         node = _extract_node_name(raw_event)
         synthetic_token: StreamEvent | None = None
         if node not in _SILENT_TOKEN_NODES:
@@ -283,12 +290,14 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
                     if isinstance(p, dict) and p.get("type") == "text"
                 )
             if not _content.strip():
-                _ak = getattr(output, "additional_kwargs", {}) or {}
-                _rc = _ak.get("reasoning_content", "") or ""
-                if _rc.strip():
-                    synthetic_token = StreamEvent(
-                        type="token", content=_rc, node=node,
-                    )
+                _tool_calls = getattr(output, "tool_calls", None) or []
+                if not _tool_calls:
+                    _ak = getattr(output, "additional_kwargs", {}) or {}
+                    _rc = _ak.get("reasoning_content", "") or ""
+                    if _rc.strip():
+                        synthetic_token = StreamEvent(
+                            type="token", content=_rc, node=node,
+                        )
 
         prompt, completion = _extract_token_usage(output)
         if synthetic_token:
@@ -360,7 +369,20 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
             )
         return None
 
-    # Silently ignore other events (on_chat_model_start, on_chain_start, etc.)
+    if event_name == "on_chat_model_start":
+        # LLM call started. Emit llm_start so the TUI can stamp
+        # thoughtStartedAt at the actual beginning of the LLM call —
+        # BEFORE the prefill phase and before any reasoning_content
+        # chunks arrive. Without this, "思考用时" only measures the
+        # streaming duration of thinking tokens, missing the prefill
+        # latency (prompt processing) which can be several seconds for
+        # long system prompts.
+        node = _extract_node_name(raw_event)
+        if node in _SILENT_TOKEN_NODES:
+            return None
+        return StreamEvent(type="llm_start", node=node)
+
+    # Silently ignore other events (on_chain_start, etc.)
     return None
 
 
