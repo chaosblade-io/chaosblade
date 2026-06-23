@@ -1,6 +1,7 @@
 """blade-ai uninstall command: remove blade-ai from the system."""
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import typer
 
 def _read_manifest() -> dict | None:
     """Read the install manifest from ~/.blade-ai/install-manifest.json."""
-    manifest_path = Path.home() / ".blade-ai" / "install-manifest.json"
+    manifest_path = Path(os.path.expanduser("~/.blade-ai/install-manifest.json"))
     if not manifest_path.exists():
         return None
     try:
@@ -82,9 +83,9 @@ def uninstall_command(
         typer.echo(f"  Binary dir: {install_dir}")
         typer.echo(f"  Symlink:    {symlink}")
         if not keep_config:
-            typer.echo(f"  Config:     {Path.home() / '.blade-ai'}")
+            typer.echo(f"  Config:     {os.path.expanduser('~/.blade-ai')}")
         else:
-            typer.echo(f"  Config:     {Path.home() / '.blade-ai'} (KEPT)")
+            typer.echo(f"  Config:     {os.path.expanduser('~/.blade-ai')} (KEPT)")
         confirm = typer.prompt("Proceed? [y/N]", default="n")
         if confirm.lower() != "y":
             typer.echo("Cancelled.")
@@ -117,7 +118,7 @@ def uninstall_command(
             typer.echo("✓ Cleaned PATH from Windows registry")
 
     # 5. Remove config directory (unless --keep-config)
-    config_dir = Path.home() / ".blade-ai"
+    config_dir = Path(os.path.expanduser("~/.blade-ai"))
     if not keep_config:
         if config_dir.exists():
             shutil.rmtree(config_dir)

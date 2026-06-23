@@ -60,10 +60,10 @@ def get_postmortem_dir() -> Path:
         return settings.resolved_memory_dir.parent / "postmortems"
     except Exception:
         # Settings unavailable (e.g. during very early import) → safe default
-        return Path.home() / ".blade-ai" / "postmortems"
+        return Path(os.path.expanduser("~/.blade-ai/postmortems"))
 
 
-POSTMORTEM_DIR = Path.home() / ".blade-ai" / "postmortems"
+POSTMORTEM_DIR = Path(os.path.expanduser("~/.blade-ai/postmortems"))
 """Default postmortem root. Prefer ``get_postmortem_dir()`` for runtime
 resolution that follows BLADE_AI_MEMORY_DIR; this constant is kept for
 import-time backward compatibility (tests / external callers)."""

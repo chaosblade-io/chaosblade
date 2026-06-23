@@ -38,7 +38,7 @@ def _detect_platform() -> str:
 
 def _read_receipt() -> dict | None:
     """Read the install receipt from ~/.blade-ai/receipt.json."""
-    receipt_path = Path.home() / ".blade-ai" / "receipt.json"
+    receipt_path = Path(os.path.expanduser("~/.blade-ai/receipt.json"))
     if not receipt_path.exists():
         return None
     try:
@@ -86,7 +86,7 @@ def _download_and_install(version: str, platform_str: str) -> bool:
     ext = "zip" if is_windows else "tar.gz"
     download_url = f"{base_url}/{tag}/blade-ai-{platform_str}.{ext}"
 
-    versions_dir = Path.home() / ".blade-ai" / "versions"
+    versions_dir = Path(os.path.expanduser("~/.blade-ai/versions"))
     final_dir = versions_dir / tag  # e.g. versions/v0.1.0
     tmp_dir = Path(tempfile.mkdtemp(prefix=f".tmp-{tag}-", dir=str(versions_dir)))
 
@@ -121,7 +121,7 @@ def _download_and_install(version: str, platform_str: str) -> bool:
         symlink_path.symlink_to(final_dir / "blade-ai")
 
         # Update receipt
-        receipt_dir = Path.home() / ".blade-ai"
+        receipt_dir = Path(os.path.expanduser("~/.blade-ai"))
         receipt_dir.mkdir(parents=True, exist_ok=True)
         receipt_path = receipt_dir / "receipt.json"
         receipt = {

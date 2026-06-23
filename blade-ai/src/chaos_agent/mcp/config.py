@@ -146,7 +146,7 @@ def load_mcp_config(path: Path | None = None) -> list[McpServerConfig]:
     not as an error). Malformed JSON / invalid shape → raises.
     """
     if path is None:
-        path = Path.home() / ".blade-ai" / "mcp.json"
+        path = Path(os.path.expanduser("~/.blade-ai/mcp.json"))
 
     if not path.exists():
         logger.info("mcp.json not found at %s — MCP disabled", path)

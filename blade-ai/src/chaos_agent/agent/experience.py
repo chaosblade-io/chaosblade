@@ -6,6 +6,7 @@ enabling the Agent to learn from past operations.
 Borrowed from Claude Code's CLAUDE.md and OpenClaw's context file budgeting.
 """
 
+import os
 import warnings
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from chaos_agent.agent.fault_spec import fault_type_from_state
 from chaos_agent.agent.operation_outcome import read_inject_verification, read_operation_outcome
 from chaos_agent.agent.prompts.constants import MAX_AGENT_MD_BYTES
 
-AGENT_MD_PATH = Path.home() / ".blade-ai" / "AGENT.md"
+AGENT_MD_PATH = Path(os.path.expanduser("~/.blade-ai/AGENT.md"))
 MAX_AGENT_MD_LINES = 200
 
 
