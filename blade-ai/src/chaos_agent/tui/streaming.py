@@ -51,9 +51,9 @@ _STREAM_TIMEOUT = 10.0
 _REASONING_LEAK_PATTERNS = (
     # "所有必填项已收集完毕，现在应该调用 submit_fault_intent..."
     # Self-referential LLM planning: mentions calling/submitting internal
-    # tools like submit_fault_intent, classify_intent, kubectl. Real
+    # tools like submit_fault_intent, recover_task, kubectl. Real
     # LLMs never tell the user "I'm about to call submit_fault_intent".
-    r"^.{0,6}(?:所有|全部|必填|必要|已收集|已确认|已获).*?(?:应该|需要|现在|接下来|下一步).{0,30}(?:调用|提交|使用|执行|触发).{0,50}(?:submit_fault_intent|classify_intent|kubectl|activate_skill|blade).{0,30}$",
+    r"^.{0,6}(?:所有|全部|必填|必要|已收集|已确认|已获).*?(?:应该|需要|现在|接下来|下一步).{0,30}(?:调用|提交|使用|执行|触发).{0,50}(?:submit_fault_intent|recover_task|kubectl|activate_skill|blade).{0,30}$",
     # "用户提供了节点名称 cms-node-1"
     # The LLM narrating the user's actions (meta-reasoning, NOT user-facing)
     r"^.{0,6}(?:用户|user).{0,30}(?:提供|给出|说|输入|mentioned|provided).{0,40}(?:节点|namespace|pod|参数|标签|label|target).{0,30}$",
@@ -167,9 +167,9 @@ class StreamingPrinter:
         clean_buffer = _strip_reasoning_leaks(self._buffer)
         if not clean_buffer.strip():
             # All content was reasoning — discard the whole buffer.
-            # The node's _ensure_visible_content fallback will have
-            # provided a clean template reply via AIMessage.content,
-            # which runner yields as a synthetic token if needed.
+            # The LLM should produce visible content directly; if it
+            # only emits reasoning, the node returns the raw response
+            # and the runner yields it as a synthetic token if needed.
             return
         # Vertical breath: 1 blank line before agent response,
         # separating it from preceding user message / tool output.

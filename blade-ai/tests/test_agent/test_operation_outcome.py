@@ -214,6 +214,7 @@ def test_raw_verification_field_reads_are_limited_to_boundaries_and_payloads():
         PROJECT_ROOT / "src/chaos_agent/agent",
         PROJECT_ROOT / "src/chaos_agent/server/routes",
         PROJECT_ROOT / "src/chaos_agent/cli",
+        PROJECT_ROOT / "src/chaos_agent/l4",
     ]
     findings = set()
     for root in search_roots:
@@ -255,11 +256,15 @@ def test_known_state_consumers_do_not_use_legacy_outcome_reads():
         ],
         "src/chaos_agent/server/routes/turn_event_stream.py": [
             '_psv.get("verification")',
+            '_vals.get("error")',
+            '_vals.get("failure_reason")',
         ],
         "src/chaos_agent/cli/runner.py": [
             'pv.get("verification")',
             'pv.get("failure_reason")',
             'pv.get("error")',
+            '_vals.get("failure_reason")',
+            '_vals.get("error")',
             'result.get("recover_verification")',
             'result.get("failure_reason")',
             'result.get("error")',
@@ -270,6 +275,9 @@ def test_known_state_consumers_do_not_use_legacy_outcome_reads():
         "src/chaos_agent/cli/result_builder.py": [
             'values.get("failure_reason")',
             'values.get("error")',
+        ],
+        "src/chaos_agent/l4/agent.py": [
+            'recover_result.get("recover_verification")',
         ],
     }
 

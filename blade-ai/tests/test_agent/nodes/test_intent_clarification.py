@@ -7,12 +7,11 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from tests._helpers import intent_dict_from_result
 from chaos_agent.agent.nodes.intent_clarification import (
-    CLASSIFY_INTENT_TOOL,
-    _ensure_visible_content,
     _allocate_operation_task_id,
-    _extract_classify_intent,
+    _extract_recover_task_id,
     _merge_known_params_into_fault_intent,
     submit_fault_intent,
+    recover_task,
     MAX_DIALOGUE_ROUNDS,
     make_intent_clarification,
 )
@@ -31,11 +30,11 @@ def _make_llm_response(tool_calls=None, content=""):
     )
 
 
-def _classify_tc(intent: str, confidence: float):
+def _recover_tc(task_id: str = "task-test123"):
     return {
-        "name": "classify_intent",
-        "id": f"call_cls_{intent}",
-        "args": {"intent": intent, "confidence": confidence},
+        "name": "recover_task",
+        "id": "call_recover_1",
+        "args": {"task_id": task_id},
     }
 
 
@@ -86,38 +85,39 @@ def test_cli_task_id_is_still_reused():
     assert _allocate_operation_task_id("task-existing") == "task-existing"
 
 
-class TestExtractClassifyIntent:
+class TestExtractRecoverTaskId:
+    """Tests for _extract_recover_task_id helper."""
 
-    def test_extracts_valid_intents(self):
-        for intent in ("recover", "chat"):
-            result = _extract_classify_intent([_classify_tc(intent, 0.9)])
-            assert result["intent"] == intent
-            assert result["confidence"] == 0.9
+    def test_extracts_task_id_from_recover_tool_call(self):
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[_recover_tc("task-abc123")],
+            id="ai_1",
+        )
+        tool_msg = ToolMessage(
+            content="Recover request received for task: task-abc123",
+            tool_call_id="call_recover_1",
+            name="recover_task",
+            id="tool_1",
+        )
+        result = _extract_recover_task_id([ai_msg, tool_msg])
+        assert result == "task-abc123"
 
-    def test_clamps_invalid_intent_to_chat(self):
-        # Old intents that the LLM might produce from training memory must
-        # all collapse to chat (the safety net).
-        for stale in ("inject", "query", "explore"):
-            tc = [{"name": "classify_intent", "args": {"intent": stale, "confidence": 0.5}}]
-            result = _extract_classify_intent(tc)
-            assert result["intent"] == "chat"
+    def test_returns_empty_for_no_recover_tool_call(self):
+        ai_msg = AIMessage(content="hello", tool_calls=[], id="ai_1")
+        result = _extract_recover_task_id([ai_msg])
+        assert result == ""
 
-    def test_clamps_confidence_out_of_range(self):
-        result = _extract_classify_intent([_classify_tc("chat", 1.5)])
-        assert result["confidence"] == 1.0
-        result2 = _extract_classify_intent([_classify_tc("chat", -0.3)])
-        assert result2["confidence"] == 0.0
+    def test_returns_empty_for_empty_messages(self):
+        assert _extract_recover_task_id([]) == ""
 
-    def test_parses_string_confidence(self):
-        tc = [{"name": "classify_intent", "args": {"intent": "chat", "confidence": "0.8"}}]
-        result = _extract_classify_intent(tc)
-        assert result["confidence"] == 0.8
 
-    def test_returns_none_for_empty_tool_calls(self):
-        assert _extract_classify_intent([]) is None
+class TestRecoverTaskTool:
+    """Tests for the recover_task @tool function."""
 
-    def test_ignores_non_classify_intent_calls(self):
-        assert _extract_classify_intent([_ask_human_tc()]) is None
+    def test_recover_task_returns_ack(self):
+        result = recover_task.invoke({"task_id": "task-xyz"})
+        assert "task-xyz" in result
 
 
 class TestSubmitFaultIntentTool:
@@ -489,63 +489,38 @@ class TestIntentClarificationNode:
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_classify_recover_routes_correctly(self):
+    async def test_recover_task_tool_message_routes_correctly(self):
+        """recover_task ToolMessage should set confirmed_intent='recover'."""
         mock_llm = AsyncMock()
-        response = _make_llm_response(
-            tool_calls=[_classify_tc("recover", 0.9)])
+        # LLM won't be called — fast-path detects ToolMessage before LLM invocation
         mock_llm.bind_tools = MagicMock(
-            return_value=AsyncMock(ainvoke=AsyncMock(return_value=response)))
+            return_value=AsyncMock(ainvoke=AsyncMock(return_value=_make_llm_response())))
+
+        ai_msg = AIMessage(
+            content="好的，正在为您恢复实验。",
+            tool_calls=[_recover_tc("task-recover-001")],
+            id="ai_recover",
+        )
+        tool_msg = ToolMessage(
+            content="Recover request received for task: task-recover-001",
+            tool_call_id="call_recover_1",
+            name="recover_task",
+            id="tool_recover",
+        )
 
         node = make_intent_clarification(llm=mock_llm)
-        state = {"confirmed_intent": None, "messages": [MagicMock()],
-                 "clarification_round": 0, "dialogue_round": 0}
+        state = {
+            "confirmed_intent": None,
+            "messages": [ai_msg, tool_msg],
+            "clarification_round": 0,
+            "dialogue_round": 0,
+            "task_id": "",
+            "tui_session_id": "",
+        }
         result = await node(state)
         assert result["confirmed_intent"] == "recover"
-
-    @pytest.mark.asyncio
-    async def test_chat_with_ask_human_still_exits(self):
-        """Multi-invocation model: classify_intent(chat) always means goodbye,
-        even if ask_human is also called. ask_human gets stripped."""
-        mock_llm = AsyncMock()
-        response = _make_llm_response(
-            content="你好！我是 Chaos Agent。",
-            tool_calls=[
-                _classify_tc("chat", 0.9),
-                _ask_human_tc("想了解故障注入能力吗？"),
-            ],
-        )
-        mock_llm.bind_tools = MagicMock(
-            return_value=AsyncMock(ainvoke=AsyncMock(return_value=response)))
-
-        node = make_intent_clarification(llm=mock_llm)
-        state = {"confirmed_intent": None, "messages": [MagicMock()],
-                 "clarification_round": 0, "dialogue_round": 0}
-        result = await node(state)
-        assert result["confirmed_intent"] == "chat"
-        assert result["intent_confidence"] == 0.9
-        msg = result["messages"][0]
-        assert msg.content == "你好！我是 Chaos Agent。"
-        # ask_human is stripped (it's not classify_intent/submit_fault_intent,
-        # but _filter_internal_tools_from_response keeps non-internal tools)
-        # In practice ask_human passes through the filter since it's not internal
-        filtered_tc = msg.tool_calls
-        assert all(tc["name"] != "classify_intent" for tc in filtered_tc)
-
-    @pytest.mark.asyncio
-    async def test_chat_without_ask_human_exits(self):
-        mock_llm = AsyncMock()
-        response = _make_llm_response(
-            content="再见！",
-            tool_calls=[_classify_tc("chat", 0.95)],
-        )
-        mock_llm.bind_tools = MagicMock(
-            return_value=AsyncMock(ainvoke=AsyncMock(return_value=response)))
-
-        node = make_intent_clarification(llm=mock_llm)
-        state = {"confirmed_intent": None, "messages": [MagicMock()],
-                 "clarification_round": 0, "dialogue_round": 0}
-        result = await node(state)
-        assert result["confirmed_intent"] == "chat"
+        assert result["recover_task_id"] == "task-recover-001"
+        mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_ask_human_only_routes_to_tools(self):
@@ -591,13 +566,7 @@ class TestIntentClarificationNode:
         result = await node(state)
         assert result["confirmed_intent"] == "chat"
 
-    @pytest.mark.asyncio
-    async def test_classify_intent_schema(self):
-        assert CLASSIFY_INTENT_TOOL["name"] == "classify_intent"
-        props = CLASSIFY_INTENT_TOOL["parameters"]["properties"]
-        assert "intent" in props
-        assert "confidence" in props
-        assert props["intent"]["enum"] == ["recover", "chat"]
+
 
     @pytest.mark.asyncio
     async def test_submit_fault_intent_is_real_tool(self):
@@ -663,24 +632,6 @@ class TestIntentClarificationNode:
         assert any(tc["name"] == "submit_fault_intent" for tc in msg.tool_calls)
 
     @pytest.mark.asyncio
-    async def test_classify_recover_strips_classify_tool_call(self):
-        """classify_intent(recover) should not leave orphaned tool_call in messages."""
-        mock_llm = AsyncMock()
-        response = _make_llm_response(
-            content="好的，我来帮你恢复。",
-            tool_calls=[_classify_tc("recover", 0.9)])
-        mock_llm.bind_tools = MagicMock(
-            return_value=AsyncMock(ainvoke=AsyncMock(return_value=response)))
-
-        node = make_intent_clarification(llm=mock_llm)
-        state = {"confirmed_intent": None, "messages": [MagicMock()],
-                 "clarification_round": 0, "dialogue_round": 0}
-        result = await node(state)
-        assert result["confirmed_intent"] == "recover"
-        msg = result["messages"][0]
-        assert not getattr(msg, "tool_calls", [])
-
-    @pytest.mark.asyncio
     async def test_kubectl_tool_call_passes_through(self):
         """LLM calling kubectl (cluster Q&A) → no confirmed_intent,
         message passes through, rounds increment, ToolNode runs next."""
@@ -735,28 +686,6 @@ class TestIntentClarificationNode:
         assert result["clarification_round"] == 1
         msg = result["messages"][0]
         assert any(tc["name"] == "read_skill_resource" for tc in msg.tool_calls)
-
-    @pytest.mark.asyncio
-    async def test_chat_classify_does_not_increment_rounds(self):
-        """classify_intent(chat) exits immediately — no round increment in result."""
-        mock_llm = AsyncMock()
-        response = _make_llm_response(
-            content="你好！",
-            tool_calls=[
-                _classify_tc("chat", 0.9),
-                _ask_human_tc("想了解什么？"),
-            ],
-        )
-        mock_llm.bind_tools = MagicMock(
-            return_value=AsyncMock(ainvoke=AsyncMock(return_value=response)))
-
-        node = make_intent_clarification(llm=mock_llm)
-        state = {"confirmed_intent": None, "messages": [MagicMock()],
-                 "clarification_round": 2, "dialogue_round": 5}
-        result = await node(state)
-        assert result["confirmed_intent"] == "chat"
-        assert "dialogue_round" not in result
-        assert "clarification_round" not in result
 
 
 class TestExtractSubmitArgsCoercion:
@@ -1151,8 +1080,7 @@ class TestHookIntegration:
         from langchain_core.messages import RemoveMessage
 
         mock_llm = AsyncMock()
-        response = _make_llm_response(content="再见！",
-                                      tool_calls=[_classify_tc("chat", 0.95)])
+        response = _make_llm_response(content="再见！")
         mock_llm.bind_tools = MagicMock(
             return_value=AsyncMock(ainvoke=AsyncMock(return_value=response)))
 
@@ -1170,9 +1098,9 @@ class TestHookIntegration:
                  "clarification_round": 0, "dialogue_round": 0}
         result = await node(state)
 
-        assert result["confirmed_intent"] == "chat"
+        assert "confirmed_intent" not in result
         assert result["compressed_summary"] == "摘要内容"
-        # Messages: [RemoveMessage x2] + [filtered AIMessage]
+        # Messages: [RemoveMessage x2] + [AIMessage]
         msgs = result["messages"]
         remove_msgs = [m for m in msgs if isinstance(m, RemoveMessage)]
         assert len(remove_msgs) == 2
@@ -1311,63 +1239,6 @@ class TestHookIntegration:
         # Exactly the hook's RemoveMessage — no fast-path additions.
         assert len(remove_msgs) == 1
         assert remove_msgs[0].id == "hook_remove_1"
-
-
-class TestEnsureVisibleContent:
-    """End-to-end behaviour of the content-only fallback (no reasoning_content).
-
-    After removing the reasoning_content fallback path, _ensure_visible_content
-    only returns response.content or a templated fallback. reasoning_content is
-    never exposed to the user — it's captured separately in the session file
-    via _filter_internal_tools_raw for auditability.
-    """
-
-    def _resp(self, content="", reasoning=""):
-        msg = AIMessage(content=content, id="t")
-        if reasoning:
-            msg.additional_kwargs = {"reasoning_content": reasoning}
-        return msg
-
-    def test_content_preferred_when_present(self):
-        out = _ensure_visible_content(
-            self._resp(content="好的，已经收到。", reasoning="ignore me"),
-            intent="inject",
-        )
-        assert out == "好的，已经收到。"
-
-    def test_reasoning_not_used_when_content_empty(self):
-        # reasoning_content is NEVER exposed to the user, regardless of
-        # whether it looks "clean" or "leaky". The session file captures
-        # it separately for audit.
-        out = _ensure_visible_content(
-            self._resp(content="", reasoning="OK, I'll get the cluster status."),
-            intent="",
-        )
-        # Must fall through to template, NOT use reasoning
-        assert "cluster status" not in out
-        assert out  # non-empty template
-
-    def test_leaky_reasoning_replaced_with_template(self):
-        # Even "leaky" reasoning is never exposed — same path as above
-        leaky = (
-            "用户提供了节点名称：cn-hongkong.10.0.1.62。 回顾上下文：\n"
-            "• 意图：注入故障 (inject)\n• 故障类型：node-cpu-fullload"
-        )
-        out = _ensure_visible_content(
-            self._resp(content="", reasoning=leaky), intent="inject"
-        )
-        assert "用户提供了" not in out
-        assert "回顾上下文" not in out
-        assert "已记下" in out or "好的" in out
-
-    def test_empty_content_and_empty_reasoning_uses_template(self):
-        out = _ensure_visible_content(self._resp(content=""), intent="chat")
-        assert "再回来" in out or "找我" in out
-
-    def test_inject_template_exists(self):
-        out = _ensure_visible_content(self._resp(content=""), intent="inject")
-        assert out
-        assert out != "好的,我在听,请继续告诉我你想做什么。"
 
 
 class TestMergeKnownParams:

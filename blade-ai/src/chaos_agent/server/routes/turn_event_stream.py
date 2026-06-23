@@ -26,6 +26,10 @@ from chaos_agent.agent.task_snapshot import resolve_recover_initial_state
 from chaos_agent.agent.skill_identity import has_active_skill
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.operation_summary_writer import write_operation_summary
+from chaos_agent.memory.session_finalizer import (
+    RESULT_SUMMARY_RECOVER_PAYLOAD,
+    finalize_recover_session,
+)
 from chaos_agent.server.routes.turn_interrupt import (
     ConfirmTimeout,
     content_from_interrupt_payload,
@@ -344,7 +348,9 @@ async def _finalize_task_session(graph, config, turn_id, store_cancel_fn):
                     logger.warning("Pre-finalize flush failed for task=%s", _op_tid, exc_info=True)
             if not paused_at_interrupt:
                 _vals = _final.values if _final else {}
-                if _vals.get("blade_uid") and not (_vals.get("error") or _vals.get("failure_reason")):
+                from chaos_agent.agent.operation_outcome import read_operation_outcome
+
+                if _vals.get("blade_uid") and not read_operation_outcome(_vals).error:
                     _final_status = "completed"
                 else:
                     _final_status = "cancelled"
@@ -729,16 +735,15 @@ async def _run_recover(ctx, graph, config, turn_started_monotonic, batcher, side
         from chaos_agent.memory.session_store import get_global_session_store
         _rec_store = get_global_session_store()
         if _rec_store and _rec_store.has_active(_rec_task_id):
-            _rec_final = await recover_graph.aget_state(recover_config)
-            _rec_msgs = list((_rec_final.values or {}).get("messages", [])) if _rec_final else []
-            _rec_data = _rec_result.get("data") if isinstance(_rec_result, dict) else {}
-            _rec_task_state = _rec_data.get("task_state") if isinstance(_rec_data, dict) else ""
-            _rec_status = "failed" if _rec_task_state == "failed" else "completed"
-            _rec_store.finalize_session(
+            await finalize_recover_session(
+                _rec_store,
+                recover_graph,
+                recover_config,
                 _rec_task_id,
-                remaining_messages=_rec_msgs,
-                result_summary=_rec_result if _rec_result is not None else "",
-                status=_rec_status,
+                _recover_inject_tid,
+                sv,
+                result_payload=_rec_result if isinstance(_rec_result, dict) else None,
+                result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
             )
     except Exception:
         logger.warning("Failed to finalize recover session %s", _rec_task_id, exc_info=True)

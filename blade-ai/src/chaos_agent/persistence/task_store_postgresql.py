@@ -52,6 +52,7 @@ _DETAILS_DDL = """\
 CREATE TABLE IF NOT EXISTS task_details (
     id                  BIGSERIAL PRIMARY KEY,
     task_id             TEXT NOT NULL,
+    fault_spec          TEXT,
     target              TEXT,
     params              TEXT,
     input               TEXT,
@@ -187,6 +188,10 @@ class PostgreSQLBackend:
             statements = [s.strip() for s in _SCHEMA_DDL.split(";") if s.strip()]
             for stmt in statements:
                 await conn.execute(stmt)
+            try:
+                await conn.execute("ALTER TABLE task_details ADD COLUMN fault_spec TEXT")
+            except Exception:
+                pass
             # Migration: add failure_reason column if not exists
             try:
                 await conn.execute("ALTER TABLE task_details ADD COLUMN failure_reason TEXT")

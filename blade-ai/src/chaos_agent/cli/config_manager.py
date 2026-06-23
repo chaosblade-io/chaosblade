@@ -16,12 +16,13 @@ File format:
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-CONFIG_DIR = Path.home() / ".blade-ai"
+CONFIG_DIR = Path(os.path.expanduser("~/.blade-ai"))
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # Legacy mode file for migration

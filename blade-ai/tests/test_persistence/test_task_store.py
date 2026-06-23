@@ -80,6 +80,7 @@ class TestSchema:
         assert "id" in col_names
         assert "gmt_create" in col_names
         assert "gmt_modified" in col_names
+        assert "fault_spec" in col_names
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +289,24 @@ class TestQueryActive:
         assert active[0]["task_id"] == "t1"
 
     @pytest.mark.asyncio
+    async def test_filter_by_fault_spec_projection(self, store):
+        fault_spec = {
+            "namespace": "prod",
+            "scope": "pod",
+            "names": ["pod1"],
+            "labels": {},
+            "blade_target": "network",
+            "blade_action": "loss",
+            "params": {"percent": "100"},
+        }
+        await store.upsert("t1", fault_spec=fault_spec, skill_name="pod-network-loss")
+
+        active = await store.query_active(namespace="prod", target_name="pod1")
+
+        assert len(active) == 1
+        assert active[0]["task_id"] == "t1"
+
+    @pytest.mark.asyncio
     async def test_compatible_format(self, store):
         await store.upsert("t1", skill_name="pod-kill", target={"namespace": "default"}, blade_uid="abc")
         active = await store.query_active()
@@ -429,6 +448,30 @@ class TestMetricMethods:
         await store.upsert("t1", params={"scope": "pod", "target": "cpu", "action": "fullload"})
         metric = await store.get_metric("t1")
         assert metric["fault_type"] == "pod-cpu-fullload"
+
+    @pytest.mark.asyncio
+    async def test_get_metric_fault_type_prefers_fault_spec_projection(self, store):
+        fault_spec = {
+            "namespace": "default",
+            "scope": "pod",
+            "names": ["pod-a"],
+            "labels": {},
+            "blade_target": "network",
+            "blade_action": "loss",
+            "params": {"percent": "100"},
+            "source": "test",
+        }
+        await store.upsert(
+            "t1",
+            skill_name="stale-active-skill",
+            fault_spec=fault_spec,
+        )
+
+        metric = await store.get_metric("t1")
+        data = await store.get("t1")
+
+        assert metric["fault_type"] == "pod-network-loss"
+        assert data["fault_spec"] == fault_spec
 
     @pytest.mark.asyncio
     async def test_get_metric_computes_duration_ms(self, store):

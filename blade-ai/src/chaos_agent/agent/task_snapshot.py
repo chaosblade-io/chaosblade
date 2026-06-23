@@ -85,6 +85,49 @@ def _target_from_result_data(data: dict) -> dict:
     }
 
 
+def _target_from_fault_spec(spec: dict) -> dict:
+    if not spec:
+        return {}
+    raw_names = spec.get("names") or []
+    if isinstance(raw_names, str):
+        names = [raw_names] if raw_names else []
+    elif isinstance(raw_names, (list, tuple)):
+        names = [str(name) for name in raw_names if name]
+    else:
+        names = []
+    labels = spec.get("labels")
+    labels = dict(labels) if isinstance(labels, dict) else {}
+    namespace = spec.get("namespace", "") or ""
+    scope = spec.get("scope", "") or ""
+    if not (namespace or names or labels or scope):
+        return {}
+    return {
+        "namespace": namespace,
+        "names": names,
+        "labels": labels,
+        "resource_type": scope,
+    }
+
+
+def _params_from_fault_spec(spec: dict) -> dict:
+    params = spec.get("params") if spec else None
+    return dict(params) if isinstance(params, dict) else {}
+
+
+def _fault_type_from_fault_spec(spec: dict) -> str:
+    if not spec:
+        return ""
+    return "-".join(
+        str(part)
+        for part in (
+            spec.get("scope", ""),
+            spec.get("blade_target", ""),
+            spec.get("blade_action", ""),
+        )
+        if part
+    )
+
+
 def _session_messages_to_langchain(messages: list[dict]) -> list:
     """Best-effort conversion of SessionStore message dicts back to messages."""
     if not messages:
@@ -357,6 +400,7 @@ class TaskSnapshot:
     has_increment_log: bool = False
     target: dict = field(default_factory=dict)
     params: dict = field(default_factory=dict)
+    stored_fault_spec: dict = field(default_factory=dict)
     blade_uid: str = ""
     skill_name: str = ""
     verification: dict | None = None
@@ -379,16 +423,39 @@ class TaskSnapshot:
             return None
 
         record = record or {}
-        record_target = _coerce_json_dict(record.get("target"))
-        session_target = _target_from_result_data(result_data)
-        record_params = _coerce_json_dict(record.get("params"))
-        session_params = _coerce_json_dict(result_data.get("params"))
+        record_fault_spec = _coerce_json_dict(record.get("fault_spec"))
+        session_fault_spec = _coerce_json_dict(result_data.get("fault_spec"))
+        record_target = (
+            _target_from_fault_spec(record_fault_spec)
+            or _coerce_json_dict(record.get("target"))
+        )
+        session_target = (
+            _target_from_fault_spec(session_fault_spec)
+            or _target_from_result_data(result_data)
+        )
+        record_params = (
+            _params_from_fault_spec(record_fault_spec)
+            or _coerce_json_dict(record.get("params"))
+        )
+        session_params = (
+            _params_from_fault_spec(session_fault_spec)
+            or _coerce_json_dict(result_data.get("params"))
+        )
         session_blade_uid = _extract_blade_uid_from_session(
             session,
             prefer_messages=has_increment_log,
         )
-        record_skill_name = record.get("skill_name") or record.get("fault_type") or ""
-        session_skill_name = result_data.get("fault_type") or ""
+        record_skill_name = (
+            _fault_type_from_fault_spec(record_fault_spec)
+            or record.get("skill_name")
+            or record.get("fault_type")
+            or ""
+        )
+        session_skill_name = (
+            _fault_type_from_fault_spec(session_fault_spec)
+            or result_data.get("fault_type")
+            or ""
+        )
         session_inject_context = _build_inject_context_from_session(session)
 
         resolved_tui_session_id = tui_session_id
@@ -404,6 +471,7 @@ class TaskSnapshot:
             skill_name = session_skill_name or record_skill_name
             verification = result_data.get("verification") or record.get("verification")
             inject_context = session_inject_context or record.get("inject_context") or ""
+            stored_fault_spec = session_fault_spec or record_fault_spec
         else:
             target = record_target or session_target
             params = record_params or session_params
@@ -411,6 +479,7 @@ class TaskSnapshot:
             skill_name = record_skill_name or session_skill_name
             verification = record.get("verification") or result_data.get("verification")
             inject_context = record.get("inject_context") or session_inject_context or ""
+            stored_fault_spec = record_fault_spec or session_fault_spec
 
         return cls(
             task_id=task_id,
@@ -420,6 +489,7 @@ class TaskSnapshot:
             has_increment_log=has_increment_log,
             target=target,
             params=params,
+            stored_fault_spec=stored_fault_spec,
             blade_uid=blade_uid,
             skill_name=skill_name,
             verification=verification if isinstance(verification, dict) else None,
@@ -433,6 +503,37 @@ class TaskSnapshot:
         return bool(self.blade_uid) or (bool(self.skill_name) and bool(self.target))
 
     def fault_spec(self) -> dict:
+        if self.stored_fault_spec:
+            merged = dict(self.stored_fault_spec)
+            scope, blade_target, blade_action = fault_parts_from_name(self.skill_name)
+            if self.target:
+                merged["namespace"] = self.target.get("namespace", "") or ""
+                merged["scope"] = (
+                    self.target.get("resource_type", "")
+                    or scope
+                    or merged.get("scope", "")
+                )
+                merged["names"] = list(self.target.get("names") or [])
+                merged["labels"] = dict(self.target.get("labels") or {})
+            elif scope and not merged.get("scope"):
+                merged["scope"] = scope
+            if blade_target:
+                merged["blade_target"] = blade_target
+            if blade_action:
+                merged["blade_action"] = blade_action
+            if self.params:
+                merged["params"] = dict(self.params or {})
+            else:
+                merged.setdefault("params", {})
+            merged["params_flags"] = list(merged.get("params_flags") or [])
+            try:
+                merged["duration_seconds"] = int(merged.get("duration_seconds") or 0)
+            except (TypeError, ValueError):
+                merged["duration_seconds"] = 0
+            merged.setdefault("source", "task_snapshot_rebuild")
+            merged.setdefault("user_description", "")
+            return merged
+
         spec = fault_spec_from_legacy_state(
             {
                 "target": self.target,
@@ -613,6 +714,7 @@ async def resolve_recover_initial_state(
                     initial,
                     inject_task_id,
                     checkpoint_values=checkpoint_values,
+                    snapshot=snapshot,
                 ),
                 snapshot=snapshot,
                 checkpoint_values=dict(checkpoint_values),
@@ -660,6 +762,8 @@ def _merge_snapshot_checkpoint_fault_spec(
 ) -> dict:
     checkpoint_spec = _coerce_json_dict(checkpoint_values.get("fault_spec"))
     merged = dict(checkpoint_spec)
+    if snapshot.stored_fault_spec:
+        merged.update(snapshot.stored_fault_spec)
 
     scope, blade_target, blade_action = fault_parts_from_name(snapshot.skill_name)
     if snapshot.target:
@@ -696,6 +800,7 @@ def _source_values_from_initial(
     inject_task_id: str,
     *,
     checkpoint_values: dict | None = None,
+    snapshot: TaskSnapshot | None = None,
 ) -> dict:
     checkpoint_values = checkpoint_values or {}
     source_values = dict(checkpoint_values)
@@ -715,8 +820,17 @@ def _source_values_from_initial(
         "target": target,
         "params": dict(fault_spec.get("params") or {}),
         "inject_context": initial.get("inject_context", "") or "",
+        "inject_verification_summary": initial.get("inject_verification_summary", "") or "",
+        "baseline_data": initial.get("baseline_data"),
+        "kubeconfig": initial.get("kubeconfig", "") or "",
+        "kube_context": initial.get("kube_context", "") or "",
+        "injection_method": initial.get("injection_method"),
+        "kubectl_exec_pod_name": initial.get("kubectl_exec_pod_name"),
+        "created_at": initial.get("created_at", "") or "",
         "messages": list(checkpoint_values.get("messages") or []),
     })
+    if snapshot is not None and isinstance(snapshot.verification, dict):
+        source_values["verification"] = dict(snapshot.verification)
     return source_values
 
 

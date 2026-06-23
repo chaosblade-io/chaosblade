@@ -22,6 +22,7 @@ SRC_ROOT = PROJECT_ROOT / "src/chaos_agent"
 _STATE_LIKE_RECEIVERS = {
     "_psv",
     "_rv",
+    "_vals",
     "checkpoint_values",
     "inject_state_values",
     "inject_values",
@@ -57,6 +58,9 @@ class _StateReadVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
+        if not isinstance(node.ctx, ast.Load):
+            self.generic_visit(node)
+            return
         field = _constant_subscript_key(node.slice)
         if field in self.fields_to_track and _is_state_like_receiver(node.value):
             self.reads.append((field, node.lineno, _line(self.path, node.lineno)))

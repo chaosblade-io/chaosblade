@@ -466,9 +466,14 @@ class AgentRunner:
                 try:
                     _fgs = await graph.aget_state(config)
                     _vals = _fgs.values if _fgs and _fgs.values else {}
+                    from chaos_agent.agent.operation_outcome import (
+                        read_operation_outcome,
+                    )
+
+                    _outcome = read_operation_outcome(_vals)
                     _is_open = (
                         not _vals.get("blade_uid", "")
-                        and not (_vals.get("failure_reason") or _vals.get("error"))
+                        and not _outcome.error
                         and _vals.get("safety_status") != "rejected"
                         and _vals.get("confirmed_intent") not in ("chat",)
                     )
@@ -1312,46 +1317,20 @@ class AgentRunner:
         finally:
             # Finalize session: flush remaining messages from final graph state
             if self._session_store:
-                try:
-                    remaining = []
-                    merged_error_fin = ""
-                    values_fin = {}
-                    try:
-                        final_graph_state = await self._agents["recover"].aget_state(config)
-                        if final_graph_state and final_graph_state.values:
-                            from chaos_agent.agent.operation_outcome import read_operation_outcome
+                from chaos_agent.memory.session_finalizer import (
+                    RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+                    finalize_recover_session,
+                )
 
-                            values_fin = final_graph_state.values
-                            remaining = values_fin.get("messages", [])
-                            merged_error_fin = read_operation_outcome(values_fin).error
-                    except Exception:
-                        pass
-                    from chaos_agent.agent.state import infer_task_state
-
-                    inferred_state = infer_task_state(values_fin) if values_fin else "recovered"
-                    from chaos_agent.agent.operation_result import (
-                        build_recover_cli_data_from_state,
-                    )
-
-                    result_data = build_recover_cli_data_from_state(
-                        values_fin,
-                        inject_task_id,
-                        state_values,
-                    )
-                    result_data["result"] = inferred_state
-                    result_data["error"] = merged_error_fin
-                    self._session_store.finalize_session(
-                        record_task_id,
-                        remaining_messages=remaining,
-                        result_summary=build_inject_envelope(
-                            result_data,
-                            inferred_state,
-                            merged_error_fin,
-                        ),
-                        status="completed",
-                    )
-                except Exception:
-                    logger.warning(f"Failed to finalize recover session {record_task_id}")
+                await finalize_recover_session(
+                    self._session_store,
+                    self._agents["recover"],
+                    config,
+                    record_task_id,
+                    inject_task_id,
+                    state_values,
+                    result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+                )
             done_event.set()
             await printer_task
             unsubscribe(record_task_id, status_queue)

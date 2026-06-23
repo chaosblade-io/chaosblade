@@ -10,6 +10,7 @@ from chaos_agent.agent.fault_spec import (
     fault_type_from_state,
     legacy_params_dict,
     legacy_target_dict,
+    read_fault_spec,
 )
 from chaos_agent.agent.operation_outcome import (
     build_verification_simple,
@@ -23,6 +24,11 @@ from chaos_agent.agent.state import (
     infer_task_state,
     strip_side_effects,
 )
+
+
+def _fault_spec_dict(values: Mapping[str, Any]) -> dict[str, Any]:
+    spec = read_fault_spec(dict(values or {}))
+    return spec.to_dict() if spec else {}
 
 
 def build_inject_data_from_state(
@@ -53,6 +59,7 @@ def build_inject_data_from_state(
         "fault_type": fault_type_from_state(state_values),
         "blade_uid": state_values.get("blade_uid", "") or "",
         "duration_ms": elapsed_ms,
+        "fault_spec": _fault_spec_dict(state_values),
         "target": legacy_target_dict(state_values),
         "params": legacy_params_dict(state_values),
         "verification": strip_side_effects(verification),
@@ -78,6 +85,7 @@ def build_unknown_inject_data(
         "fault_type": "",
         "blade_uid": blade_uid or "",
         "duration_ms": 0,
+        "fault_spec": {},
         "target": {},
         "params": {},
         "verification": None,
@@ -177,6 +185,7 @@ def build_recover_data_from_state(
         "fault_type": fault_type_from_state(inject_state),
         "blade_uid": inject_state.get("blade_uid", "") or "",
         "duration_ms": elapsed_ms,
+        "fault_spec": _fault_spec_dict(inject_state),
         "target": legacy_target_dict(inject_state),
         "params": legacy_params_dict(inject_state),
         "verification": strip_side_effects(read_recover_verification(recover_state)),

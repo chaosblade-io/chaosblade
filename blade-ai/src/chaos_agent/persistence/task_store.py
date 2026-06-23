@@ -440,15 +440,32 @@ class TaskStore:
 
     @staticmethod
     def _compute_fault_type(task: dict) -> str:
-        """Infer fault_type from params."""
+        """Infer fault_type through the shared FaultSpec projection."""
+        from chaos_agent.agent.fault_spec import FaultSpec, fault_type_from_state
+
+        state = dict(task or {})
         params = task.get("params") or {}
-        if params:
+        if isinstance(params, dict):
             scope = params.get("scope", "")
             action = params.get("action", "")
             target_action = params.get("target", "")
             if scope and target_action and action:
-                return f"{scope}-{target_action}-{action}"
-        return task.get("skill_name", "")
+                target = task.get("target") if isinstance(task.get("target"), dict) else {}
+                state["fault_spec"] = FaultSpec(
+                    namespace=str(target.get("namespace") or ""),
+                    scope=str(scope),
+                    names=tuple(str(n) for n in (target.get("names") or [])),
+                    labels=dict(target.get("labels") or {}),
+                    blade_target=str(target_action),
+                    blade_action=str(action),
+                    params={
+                        k: v
+                        for k, v in params.items()
+                        if k not in {"scope", "target", "action"}
+                    },
+                    source="task_store_legacy_params",
+                ).to_dict()
+        return fault_type_from_state(state)
 
     # -- sessions ------------------------------------------------------------
 

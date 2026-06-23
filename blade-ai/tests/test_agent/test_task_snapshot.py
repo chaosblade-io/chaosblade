@@ -1,9 +1,14 @@
 import pytest
+from pathlib import Path
 
 from chaos_agent.agent.task_snapshot import (
     TaskSnapshot,
     build_recover_initial_from_task_snapshot,
+    resolve_recover_initial_state,
 )
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _target(name: str) -> dict:
@@ -174,6 +179,102 @@ def test_task_snapshot_builds_fault_spec_from_merged_context():
     }
 
 
+def test_task_snapshot_prefers_record_fault_spec_over_stale_legacy_fields():
+    snapshot = TaskSnapshot.from_sources(
+        task_id="task-inject",
+        record={
+            "skill_name": "pod-cpu-fullload",
+            "target": _target("stale-pod"),
+            "params": {"cpu-percent": "80"},
+            "fault_spec": {
+                "namespace": "prod",
+                "scope": "pod",
+                "names": ["fresh-pod"],
+                "labels": {"app": "demo"},
+                "blade_target": "network",
+                "blade_action": "loss",
+                "params": {"percent": "100"},
+                "params_flags": [],
+                "duration_seconds": 0,
+                "source": "task_store",
+                "user_description": "",
+            },
+        },
+        session=None,
+        has_increment_log=False,
+    )
+
+    assert snapshot is not None
+    assert snapshot.skill_name == "pod-network-loss"
+    assert snapshot.target == {
+        "namespace": "prod",
+        "names": ["fresh-pod"],
+        "labels": {"app": "demo"},
+        "resource_type": "pod",
+    }
+    assert snapshot.params == {"percent": "100"}
+    assert snapshot.fault_spec()["blade_target"] == "network"
+    assert snapshot.fault_spec()["names"] == ["fresh-pod"]
+
+
+def test_task_snapshot_increment_log_can_override_record_fault_spec():
+    snapshot = TaskSnapshot.from_sources(
+        task_id="task-inject",
+        record={
+            "skill_name": "pod-network-loss",
+            "fault_spec": {
+                "namespace": "prod",
+                "scope": "pod",
+                "names": ["old-pod"],
+                "labels": {},
+                "blade_target": "network",
+                "blade_action": "loss",
+                "params": {"percent": "100"},
+                "params_flags": [],
+                "duration_seconds": 0,
+                "source": "task_store",
+                "user_description": "",
+            },
+        },
+        session={
+            "result_summary": {
+                "data": {
+                    "fault_type": "pod-cpu-fullload",
+                    "target": _target("session-pod"),
+                    "params": {"cpu-percent": "80"},
+                }
+            },
+            "messages": [],
+        },
+        has_increment_log=True,
+    )
+
+    assert snapshot is not None
+    assert snapshot.skill_name == "pod-cpu-fullload"
+    assert snapshot.target["names"] == ["session-pod"]
+    assert snapshot.params == {"cpu-percent": "80"}
+    assert snapshot.fault_spec()["blade_target"] == "cpu"
+    assert snapshot.fault_spec()["names"] == ["session-pod"]
+
+
+def test_task_snapshot_incomplete_fault_spec_does_not_mask_legacy_target():
+    snapshot = TaskSnapshot.from_sources(
+        task_id="task-inject",
+        record={
+            "skill_name": "pod-cpu-fullload",
+            "target": _target("legacy-pod"),
+            "params": {"cpu-percent": "80"},
+            "fault_spec": {"params": {"cpu-percent": "90"}},
+        },
+        session=None,
+        has_increment_log=False,
+    )
+
+    assert snapshot is not None
+    assert snapshot.target["names"] == ["legacy-pod"]
+    assert snapshot.fault_spec()["duration_seconds"] == 0
+
+
 @pytest.mark.asyncio
 async def test_recover_initial_from_task_snapshot_uses_snapshot_fields():
     class _Registry:
@@ -222,3 +323,88 @@ async def test_recover_initial_from_task_snapshot_uses_snapshot_fields():
     assert initial["kube_context"] == "ctx-a"
     assert initial["injection_method"] == "kubectl_exec"
     assert initial["kubectl_exec_pod_name"] == "tool-pod-a"
+
+
+def test_runtime_recover_entrypoints_use_task_snapshot_resolver():
+    """Recover entrypoints should not bypass TaskSnapshot merge policy."""
+
+    required_resolver_paths = {
+        "src/chaos_agent/cli/runner.py",
+        "src/chaos_agent/server/routes/recover_common.py",
+        "src/chaos_agent/server/routes/turn_event_stream.py",
+        "src/chaos_agent/server/routes/turn_result.py",
+        "src/chaos_agent/l4/agent.py",
+    }
+    allowed_checkpoint_builder_paths = {
+        "src/chaos_agent/agent/recovery_state.py",
+        "src/chaos_agent/agent/task_snapshot.py",
+        # Compatibility helper used by adapter unit tests and older SDK callers;
+        # runtime L4 recover paths are guarded above through l4/agent.py.
+        "src/chaos_agent/l4/adapter.py",
+    }
+
+    violations = []
+    for rel in required_resolver_paths:
+        text = (PROJECT_ROOT / rel).read_text(encoding="utf-8")
+        if "resolve_recover_initial_state" not in text:
+            violations.append(f"{rel}: missing resolve_recover_initial_state")
+
+    for path in (PROJECT_ROOT / "src/chaos_agent").rglob("*.py"):
+        rel = path.relative_to(PROJECT_ROOT).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if (
+            "build_recover_initial_from_checkpoint" in text
+            and rel not in allowed_checkpoint_builder_paths
+        ):
+            violations.append(f"{rel}: direct build_recover_initial_from_checkpoint")
+
+    assert violations == []
+
+
+@pytest.mark.asyncio
+async def test_resolver_source_values_preserve_snapshot_verification(monkeypatch):
+    """Recover graph stays clean while result/reporting source values keep inject facts."""
+
+    from chaos_agent.agent import task_snapshot
+
+    snapshot = TaskSnapshot.from_sources(
+        task_id="task-inject",
+        record={
+            "blade_uid": "uid-from-store",
+            "skill_name": "pod-cpu-fullload",
+            "target": _target("demo"),
+            "params": {"cpu-percent": "80"},
+            "kubeconfig": "/snapshot/kubeconfig",
+            "verification": {
+                "level": "verified",
+                "layer2": {"status": "passed", "details": "snapshot verification"},
+            },
+        },
+        session={"messages": []},
+        has_increment_log=False,
+    )
+    assert snapshot is not None
+
+    async def fake_load_task_snapshot(task_id, *, tui_session_id=""):
+        assert task_id == "task-inject"
+        return snapshot
+
+    monkeypatch.setattr(task_snapshot, "load_task_snapshot", fake_load_task_snapshot)
+
+    resolution = await resolve_recover_initial_state(
+        "task-inject",
+        record_task_id="task-recover",
+        checkpoint_values={
+            "verification": {"level": "stale-checkpoint"},
+            "messages": ["baseline-message"],
+        },
+    )
+
+    assert resolution is not None
+    assert resolution.initial_state["verification"] is None
+    assert resolution.source_values["verification"] == snapshot.verification
+    assert resolution.source_values["inject_verification_summary"] == (
+        "Layer2=passed, Details=snapshot verification"
+    )
+    assert resolution.source_values["kubeconfig"] == "/snapshot/kubeconfig"
+    assert resolution.source_values["messages"] == ["baseline-message"]

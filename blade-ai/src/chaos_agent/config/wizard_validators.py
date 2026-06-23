@@ -139,7 +139,7 @@ def _read_config_file() -> dict:
     set always returns true; that hides the fact that the user never
     chose a model and short-circuits the wizard.
     """
-    path = Path.home() / ".blade-ai" / "config.json"
+    path = Path(os.path.expanduser("~/.blade-ai/config.json"))
     if not path.exists():
         return {}
     try:

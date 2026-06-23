@@ -182,7 +182,9 @@ def build_recover_summary(
     task_state = data.get("task_state") or data.get("result") or "unknown"
     fault_type = data.get("fault_type") or fault_type_from_state(inject_values) or "unknown"
     blade_uid = data.get("blade_uid") or inject_values.get("blade_uid", "")
-    target_text = format_summary_target(data.get("target"))
+    target_text = format_summary_target(data.get("target")) or _format_state_target(
+        inject_values
+    )
     verification = data.get("verification")
 
     parts = [

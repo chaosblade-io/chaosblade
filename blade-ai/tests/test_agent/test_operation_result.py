@@ -49,6 +49,7 @@ def test_build_inject_data_uses_fault_spec_projection():
     assert data["fault_type"] == "pod-cpu-fullload"
     assert data["blade_uid"] == "uid-1"
     assert data["duration_ms"] == 123
+    assert data["fault_spec"] == _inject_state()["fault_spec"]
     assert data["target"]["namespace"] == "arms-prom"
     assert data["target"]["names"] == ["pod-a"]
     assert data["params"] == {"cpu-percent": "80"}
@@ -82,6 +83,7 @@ def test_build_recover_data_uses_inject_state_for_fault_and_target():
         "fault_type": "pod-cpu-fullload",
         "blade_uid": "uid-1",
         "duration_ms": 456,
+        "fault_spec": _inject_state()["fault_spec"],
         "target": {
             "namespace": "arms-prom",
             "names": ["pod-a"],
@@ -95,6 +97,46 @@ def test_build_recover_data_uses_inject_state_for_fault_and_target():
             "layer2": {"status": "passed"},
         },
     }
+
+
+def test_recover_data_does_not_mix_recover_state_inject_facts():
+    wrong_recover_spec = FaultSpec(
+        namespace="wrong-ns",
+        scope="node",
+        names=("wrong-node",),
+        blade_target="network",
+        blade_action="loss",
+    )
+    recover_state = {
+        "operation": "recover",
+        "fault_spec": wrong_recover_spec.to_dict(),
+        "blade_uid": "wrong-uid",
+        "verification": {
+            "level": "stale-inject-verification",
+            "layer1": {"status": "failed"},
+            "layer2": {"status": "failed"},
+        },
+        "result": {"recovered": True, "recovery_level": "recovered"},
+        "recover_verification": {
+            "level": "recovered",
+            "layer1": {"status": "passed"},
+            "layer2": {"status": "passed"},
+        },
+    }
+
+    data = build_recover_data_from_state(
+        recover_state,
+        "task-recover",
+        _inject_state(),
+    )
+
+    assert data["task_state"] == "recovered"
+    assert data["fault_type"] == "pod-cpu-fullload"
+    assert data["blade_uid"] == "uid-1"
+    assert data["target"]["namespace"] == "arms-prom"
+    assert data["target"]["names"] == ["pod-a"]
+    assert data["verification"]["level"] == "recovered"
+    assert data["verification"]["layer1"]["status"] == "passed"
 
 
 def test_recover_cli_data_preserves_legacy_shape():
@@ -176,6 +218,7 @@ def test_unknown_inject_data_uses_complete_result_card_shape():
         "fault_type": "",
         "blade_uid": "uid-1",
         "duration_ms": 0,
+        "fault_spec": {},
         "target": {},
         "params": {},
         "verification": None,
@@ -255,5 +298,25 @@ def test_agent_cli_memory_layers_do_not_depend_on_turn_result_route():
             text = path.read_text(encoding="utf-8")
             if "chaos_agent.server.routes.turn_result" in text:
                 violations.append(rel)
+
+    assert violations == []
+
+
+def test_recover_result_builders_keep_recover_and_inject_lanes_separate():
+    """Recover result builders should not project inject facts from recover state."""
+
+    text = (PROJECT_ROOT / "src/chaos_agent/agent/operation_result.py").read_text(
+        encoding="utf-8"
+    )
+    forbidden_snippets = [
+        "fault_type_from_state(recover_state)",
+        "legacy_target_dict(recover_state)",
+        "legacy_params_dict(recover_state)",
+        'recover_state.get("blade_uid"',
+        "read_inject_verification(recover_state)",
+        "read_recover_verification(inject_state)",
+    ]
+
+    violations = [snippet for snippet in forbidden_snippets if snippet in text]
 
     assert violations == []

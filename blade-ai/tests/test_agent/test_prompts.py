@@ -191,9 +191,9 @@ class TestIntentClarificationSectionFunctions:
     def test_dialogue_routing_section_has_routes(self):
         section = get_intent_dialogue_routing_section()
         assert "Dialogue Routing" in section
-        assert "classify_intent" in section
         assert "Recover" in section
         assert "Batch" in section
+        assert "Pure text response" in section
 
     def test_parameter_model_section(self):
         section = get_intent_parameter_model_section()
@@ -212,8 +212,8 @@ class TestIntentClarificationSectionFunctions:
     def test_recover_flow_section(self):
         section = get_intent_recover_flow_section()
         assert "Recover Flow" in section
-        assert "classify_intent" in section
-        assert "recover_task_id" in section
+        assert "recover_task" in section
+        assert "task_id" in section
 
     def test_batch_flow_section(self):
         section = get_intent_batch_flow_section()

@@ -109,7 +109,7 @@ class TestL4ResilienceAgentRecover:
                     "operation": "recover",
                     "result": {"recovered": True, "recovery_level": "recovered"},
                     "recover_verification": {"layer1": {"status": "passed"}},
-                    "messages": [],
+                    "messages": ["recover-msg"],
                 }
 
         class _SessionStore:
@@ -198,6 +198,7 @@ class TestL4ResilienceAgentRecover:
         assert session_store.created[1]["tui_session_id"] == "sid-from-snapshot"
         assert session_store.created[1]["baseline_messages"] == ["baseline"]
         assert session_store.finalized[0] == captured["record_task_id"]
+        assert session_store.finalized[1]["remaining_messages"] == ["recover-msg"]
 
 
 class TestL4ResilienceAgentIdempotent:

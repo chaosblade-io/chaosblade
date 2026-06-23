@@ -6,14 +6,13 @@ LLM naturally transitions between modes based on conversation context:
 
 1. **Chat / Q&A** — greetings, chitchat, cluster queries (kubectl), capability
    questions (read_skill_resource) → answer directly in content (text only).
-2. **Route** — explicit recover intent → classify_intent("recover");
-   user says goodbye → classify_intent("chat").
+2. **Route** — explicit recover intent → recover_task(task_id=...).
 3. **Converge** — fault injection intent (clear or vague) → collect details via
    kubectl + skills → submit_fault_intent.
 
 Multi-invocation model: each user message = independent graph invocation.
 Pure text response = conversation turn done (graph ends, TUI waits for next input).
-Only classify_intent/submit_fault_intent trigger state transitions.
+Only submit_fault_intent/submit_batch_intent/recover_task trigger state transitions.
 
 CLI mode skips this node entirely via route_after_load_memory routing.
 """
@@ -47,48 +46,6 @@ from chaos_agent.memory.session_store import NO_SESSION_MARKER
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Function calling schemas (parsed by the node, NOT ToolNode tools)
-# ---------------------------------------------------------------------------
-
-CLASSIFY_INTENT_TOOL = {
-    "name": "classify_intent",
-    "description": (
-        "Route a non-inject intent. Call this ONLY when the user clearly "
-        "wants to recover a previous experiment or to end the conversation "
-        "(chat/goodbye). Do NOT call this for fault injection (single or "
-        "batch) — use submit_fault_intent or submit_batch_intent directly. "
-        "Do NOT call this for cluster queries or capability questions."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "intent": {
-                "type": "string",
-                "enum": ["recover", "chat"],
-                "description": (
-                    "The classified intent type. 'recover' for undoing a "
-                    "previous experiment, 'chat' for goodbye/no-need."
-                ),
-            },
-            "confidence": {
-                "type": "number",
-                "minimum": 0.0,
-                "maximum": 1.0,
-                "description": "How confident you are. 1.0 = sure, 0.5 = uncertain.",
-            },
-            "recover_task_id": {
-                "type": "string",
-                "description": (
-                    "The task_id of the experiment to recover. Required when "
-                    "intent='recover'. Get this from query_active_experiments."
-                ),
-            },
-        },
-        "required": ["intent", "confidence"],
-    },
-}
 
 MAX_CLARIFICATION_ROUNDS = settings.max_clarification_rounds
 MAX_DIALOGUE_ROUNDS = settings.max_dialogue_rounds
@@ -196,27 +153,6 @@ def _allocate_operation_task_id(current_task_id: str) -> str:
     if isinstance(current_task_id, str) and current_task_id.startswith("task-"):
         return current_task_id
     return f"task-{uuid.uuid4()}"
-
-
-def _extract_classify_intent(tool_calls: list) -> Optional[dict]:
-    """Extract classify_intent result from LLM tool calls."""
-    for tc in tool_calls:
-        if tc.get("name") == "classify_intent":
-            args = tc.get("args", {})
-            intent = args.get("intent", "chat")
-            confidence = args.get("confidence", 0.0)
-            if isinstance(confidence, str):
-                try:
-                    confidence = float(confidence)
-                except (ValueError, TypeError):
-                    confidence = 0.0
-            valid = ("recover", "chat", "batch_inject")
-            return {
-                "intent": intent if intent in valid else "chat",
-                "confidence": min(1.0, max(0.0, confidence)),
-                "recover_task_id": args.get("recover_task_id", ""),
-            }
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -524,6 +460,26 @@ def _extract_submit_batch_intent(messages: list) -> dict | None:
     return None
 
 
+def _extract_recover_task_id(messages: list) -> str:
+    """Extract task_id from the most recent recover_task tool_call.
+
+    Walks backwards through messages to find the AIMessage that owns
+    the recover_task ToolMessage, then returns the ``task_id`` arg.
+    Returns empty string if not found (recover_handler will fall back
+    to querying active experiments).
+    """
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") == "tool":
+            continue
+        if getattr(msg, "type", "") == "ai":
+            for tc in getattr(msg, "tool_calls", None) or []:
+                if tc.get("name") == "recover_task":
+                    args = tc.get("args") or {}
+                    return str(args.get("task_id", ""))
+            break
+    return ""
+
+
 @lc_tool
 async def query_active_experiments() -> str:
     """Query currently active fault experiments that can be recovered.
@@ -531,7 +487,7 @@ async def query_active_experiments() -> str:
     Call this when the user wants to recover/undo a fault injection.
     Returns a list of recoverable experiments with their task_id, fault_type,
     and namespace. Use the task_id from the results when calling
-    classify_intent(intent="recover", recover_task_id="task-xxx").
+    recover_task(task_id="task-xxx").
     """
     from chaos_agent.persistence.task_store import get_task_store
     store = await get_task_store()
@@ -545,6 +501,21 @@ async def query_active_experiments() -> str:
         ns = (t.get("target") or {}).get("namespace", "?")
         lines.append(f"  {i}. task_id={tid}, fault_type={fault}, namespace={ns}")
     return "\n".join(lines)
+
+
+@lc_tool
+def recover_task(task_id: str) -> str:
+    """Recover (undo) a previously injected fault experiment.
+
+    Call this when the user wants to undo/rollback/recover a previous
+    fault injection. Use query_active_experiments first to find the
+    task_id if the user didn't specify one.
+
+    Args:
+        task_id: The task_id of the experiment to recover.
+            Get this from query_active_experiments if not specified by the user.
+    """
+    return f"Recover request received for task: {task_id}"
 
 
 def _extract_submit_args(messages: list) -> dict:
@@ -615,90 +586,6 @@ def _extract_submit_args(messages: list) -> dict:
     return {}
 
 
-_INTENT_CONTENT_FALLBACKS = {
-    "recover": "好的，正在为您恢复实验。",
-    "chat": "好的,随时回来找我。",
-    "inject": "好的，已记下你的需求，请确认下面的故障注入意图。",
-    "batch_inject": "好的，进入批量规划模式，我将为你制定多场景故障注入方案。",
-    # "unset" is not a terminal intent — the user is still in dialogue.
-    # Use a neutral acknowledgment that doesn't repeat the generic template.
-    "unset": "好的，我继续帮你确认参数。",
-}
-
-# Heuristic patterns that indicate a reasoning/metacognition paragraph
-# leaking into content. Qwen enable_thinking sometimes puts reasoning
-# text directly in content instead of additional_kwargs.reasoning_content.
-_REASONING_STRIP_PATTERNS = (
-    # "所有必填项已收集完毕，现在应该调用 submit_fault_intent 提交实验请求。"
-    # Self-referential LLM planning: mentions calling/submitting internal
-    # tools like submit_fault_intent, classify_intent, kubectl. Real
-    # LLMs never tell the user "I'm about to call submit_fault_intent".
-    r"^.{0,6}(?:所有|全部|必填|必要|已收集|已确认|已获).*?(?:应该|需要|现在|接下来|下一步).{0,30}(?:调用|提交|使用|执行|触发).{0,50}(?:submit_fault_intent|classify_intent|kubectl|activate_skill|blade).{0,30}$",
-    # "用户提供了节点名称 cms-node-1"
-    # The LLM narrating the user's actions (meta-reasoning, NOT user-facing)
-    r"^.{0,6}(?:用户|user).{0,30}(?:提供|给出|说|输入|mentioned|provided).{0,40}(?:节点|namespace|pod|参数|标签|label|target).{0,30}$",
-)
-
-
-def _strip_reasoning_from_content(content: str) -> str:
-    """Remove reasoning/metacognition paragraphs from LLM content.
-
-    When Qwen enable_thinking puts reasoning in content (not
-    reasoning_content), the text typically starts with self-referential
-    planning statements like "所有必填项已收集完毕，现在应该调用...".
-    These paragraphs precede the actual user-facing reply.
-
-    Strategy: split content into paragraphs, strip any that match
-    reasoning patterns, return the remaining text. If ALL paragraphs
-    are reasoning, return "" (triggers fallback in _ensure_visible_content).
-    """
-    if not content or not content.strip():
-        return content
-
-    import re
-    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-    clean = []
-    for para in paragraphs:
-        # Check first line of each paragraph against reasoning patterns
-        first_line = para.split("\n")[0].strip()
-        is_reasoning = False
-        for pattern in _REASONING_STRIP_PATTERNS:
-            if re.match(pattern, first_line, re.IGNORECASE):
-                is_reasoning = True
-                break
-        if not is_reasoning:
-            clean.append(para)
-
-    result = "\n\n".join(clean)
-    return result
-
-
-def _ensure_visible_content(response, intent: str = "") -> str:
-    """Return a non-empty, *user-friendly* reply.
-
-    Resolution order:
-
-    1. ``response.content`` if non-empty — the LLM gave a normal answer.
-       But strip reasoning/metacognition paragraphs first (Qwen
-       enable_thinking sometimes leaks them into content).
-    2. Templated fallback keyed by the classified intent.
-
-    No reasoning_content fallback — reasoning is internal LLM thinking
-    that should never be exposed to the user. The session file captures
-    it separately via _filter_internal_tools_raw for auditability, but
-    the TUI channel always uses content or a clean template.
-    """
-    content = getattr(response, "content", "") or ""
-    if isinstance(content, str) and content.strip():
-        stripped = _strip_reasoning_from_content(content)
-        if stripped.strip():
-            return stripped
-        # All paragraphs were reasoning — fall through to template
-    return _INTENT_CONTENT_FALLBACKS.get(
-        intent, "好的，请继续告诉我你的需求。"
-    )
-
-
 # ---------------------------------------------------------------------------
 # Execution keywords for forced-submit guard
 # ---------------------------------------------------------------------------
@@ -709,56 +596,23 @@ _EXECUTION_KEYWORDS = frozenset({
 })
 
 
-def _filter_internal_tools_from_response(response, intent: str = "") -> AIMessage:
-    """Remove classify_intent from AIMessage.
-
-    classify_intent is parsed by the node; ToolNode processes all real tools
-    (kubectl, activate_skill, submit_fault_intent, etc.).
-    Also guarantees a non-empty content so the user always sees a reply.
-    Used for the LangGraph state (ToolNode routing) and TUI display.
-    """
-    filtered_tc = [
-        tc for tc in (getattr(response, "tool_calls", None) or [])
-        if tc.get("name") not in ("classify_intent",)
-    ]
-    kwargs = {}
-    original_id = getattr(response, "id", None)
-    if original_id:
-        kwargs["id"] = original_id
-    return AIMessage(
-        content=_ensure_visible_content(response, intent=intent),
-        tool_calls=filtered_tc,
-        response_metadata=getattr(response, "response_metadata", {}) or {},
-        **kwargs,
-    )
-
-
 def _filter_internal_tools_raw(response) -> AIMessage:
-    """Remove only classify_intent, preserving raw content.
+    """Create a clean AIMessage for session file persistence.
 
-    Unlike _filter_internal_tools_from_response, this keeps the original
-    content and reasoning_content intact — no fallback substitution.
-    Used for session file persistence where we want the complete LLM
-    output (including kubectl/submit_fault_intent tool_calls and original
-    text/reasoning).
+    Preserves the original content and all tool_calls (kubectl,
+    submit_fault_intent, recover_task, etc.) for auditability.
     """
-    filtered_tc = [
-        tc for tc in (getattr(response, "tool_calls", None) or [])
-        if tc.get("name") not in ("classify_intent",)
-    ]
     kwargs = {}
     original_id = getattr(response, "id", None)
     if original_id:
         kwargs["id"] = original_id
-    # Preserve original content — session file should capture what the LLM
-    # actually said, not a sanitized fallback
     content = getattr(response, "content", "") or ""
     additional_kwargs = getattr(response, "additional_kwargs", None) or {}
     if additional_kwargs:
         kwargs["additional_kwargs"] = additional_kwargs
     return AIMessage(
         content=content,
-        tool_calls=filtered_tc,
+        tool_calls=getattr(response, "tool_calls", None) or [],
         response_metadata=getattr(response, "response_metadata", {}) or {},
         **kwargs,
     )
@@ -1096,10 +950,8 @@ def _build_dialogue_persist_list(
     - AIMessage (raw — internal schema tools removed, but kubectl tool_calls
       and original content/reasoning_content preserved)
 
-    This is different from _filter_internal_tools_from_response which also
-    substitutes empty content with fallback text. The session file gets the
-    raw version for completeness; the TUI/LangGraph state gets the filtered
-    version for user readability.
+    The session file captures the raw LLM output for completeness;
+    the TUI handles display formatting independently.
 
     ToolMessages from previous ReAct iterations are extracted from state.messages.
     The session store's dedup (ID-based) handles already-written messages.
@@ -1431,6 +1283,44 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                     "task_id": op_task_id,
                 }, hook_updates)
 
+        # ── recover_task (recover flow) ──
+        # Same pattern as submit_fault_intent: LLM calls recover_task,
+        # ToolNode processes it, we detect the ToolMessage here and
+        # route to recover_handler.
+        has_recover_tool_msg = False
+        if messages:
+            for msg in reversed(messages):
+                msg_type = getattr(msg, "type", "")
+                if msg_type == "tool":
+                    if getattr(msg, "name", "") == "recover_task":
+                        has_recover_tool_msg = True
+                        break
+                else:
+                    break
+        if has_recover_tool_msg:
+            recover_task_id = _extract_recover_task_id(messages)
+            if tracker:
+                tracker.complete(f"恢复意图确认: {recover_task_id}")
+            persist_list = _build_dialogue_persist_list(
+                messages, system_msg=None,
+                human_msg=current_human_msg,
+                dialogue_round=dialogue_round,
+            )
+            _persist_dialogue(tui_session_id, persist_list)
+            op_task_id = _allocate_operation_task_id(state.get("task_id", ""))
+            bootstrap_task_session(
+                op_task_id,
+                operation="recover",
+                tui_session_id=tui_session_id,
+                handoff_message=None,
+            )
+            return merge_hook_updates({
+                "confirmed_intent": "recover",
+                "recover_task_id": recover_task_id,
+                "task_id": op_task_id,
+                "dialogue_round": dialogue_round + 1,
+            }, hook_updates)
+
         system_msg = SystemMessage(
             content=build_system_prompt(
                 PromptMode.INTENT,
@@ -1464,8 +1354,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
             tools, stagnant_tool, preserve={"submit_fault_intent"},
         )
 
-        function_schemas = [CLASSIFY_INTENT_TOOL]
-        llm_bound = llm.bind_tools(function_schemas + tools_this_iter)
+        llm_bound = llm.bind_tools(tools_this_iter)
 
         llm_messages = [system_msg] + messages[-20:]
         if loop_hint:
@@ -1488,95 +1377,10 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
 
         tool_calls = getattr(response, "tool_calls", None) or []
 
-        # --- Priority 1: classify_intent ---
-        classification = _extract_classify_intent(tool_calls)
-        if classification:
-            intent = classification["intent"]
-
-            if intent == "chat":
-                # Multi-invocation model: classify_intent(chat) = user says goodbye
-                if tracker:
-                    tracker.complete("用户结束对话")
-                filtered = _filter_internal_tools_from_response(response, intent="chat")
-                persist_list = _build_dialogue_persist_list(
-                    messages, response=response,
-                    system_msg=system_msg,
-                    human_msg=current_human_msg,
-                    dialogue_round=dialogue_round,
-                )
-                _persist_dialogue(tui_session_id, persist_list)
-                return merge_hook_updates({
-                    "confirmed_intent": "chat",
-                    "intent_confidence": classification["confidence"],
-                    "messages": [filtered],
-                }, hook_updates)
-            elif intent == "batch_inject":
-                # Fallback: LLM called classify_intent instead of submit_batch_intent.
-                # Do NOT set confirmed_intent — reply with guidance to use the right tool.
-                if tracker:
-                    tracker.complete("批量意图 → 引导使用 submit_batch_intent")
-                return merge_hook_updates({
-                    "messages": [AIMessage(
-                        content="检测到批量注入意图。请使用 kubectl_ro 查询目标资源，"
-                                "然后调用 submit_batch_intent(faults=[...]) 提交所有故障意图。"
-                    )],
-                    "dialogue_round": dialogue_round + 1,
-                }, hook_updates)
-            else:
-                # recover
-                if tracker:
-                    tracker.complete(f"意图路由: {intent}")
-                filtered = _filter_internal_tools_from_response(response, intent=intent)
-                # Dispatch only when LLM produced no text (fallback was used).
-                # When the LLM DID produce text, on_chat_model_stream already
-                # streamed those tokens — dispatching again would duplicate.
-                raw_content = getattr(response, "content", "") or ""
-                if not raw_content.strip():
-                    try:
-                        from chaos_agent.agent.dispatch import dispatch_node_message
-                        await dispatch_node_message("intent_clarification", filtered.content)
-                    except Exception:
-                        pass
-                persist_list = _build_dialogue_persist_list(
-                    messages, response=response,
-                    system_msg=system_msg,
-                    human_msg=current_human_msg,
-                    dialogue_round=dialogue_round,
-                )
-                _persist_dialogue(tui_session_id, persist_list)
-                # Birth the operational task_id here — recover takes
-                # over from clarification at this point.
-                op_task_id = _allocate_operation_task_id(state.get("task_id", ""))
-                # Register with the global SessionStore for the recover
-                # pipeline's task file. Unlike inject there is no
-                # ``IntentClarificationSummary`` SystemMessage to use
-                # as the handoff boundary (recover doesn't carry the
-                # same fault-intent fields), so the task file starts
-                # empty — recover_handler / recover_verifier_loop
-                # populate it via the standard append_messages path.
-                bootstrap_task_session(
-                    op_task_id,
-                    operation="recover",
-                    tui_session_id=tui_session_id,
-                    handoff_message=None,
-                )
-                return merge_hook_updates({
-                    "confirmed_intent": intent,
-                    "intent_confidence": classification["confidence"],
-                    "recover_task_id": classification.get("recover_task_id", ""),
-                    "messages": [filtered],
-                    "task_id": op_task_id,
-                }, hook_updates)
-
-        # --- Priority 2: has tool calls (kubectl, submit_fault_intent, etc.) ---
-        has_tool_calls = any(
-            tc.get("name") not in ("classify_intent",)
-            for tc in tool_calls
-        )
-        if has_tool_calls:
+        # --- Priority 1: has tool calls (kubectl, submit_fault_intent, etc.) ---
+        if tool_calls:
             if tracker:
                 tracker.complete("等待工具执行")
-            filtered = _filter_internal_tools_from_response(response)
             updated_intent = _merge_known_params_into_fault_intent(
                 messages, fault_intent_existing
             )
@@ -1591,13 +1395,13 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                 updated_intent, existing=existing_spec,
             )
             return merge_hook_updates({
-                "messages": [filtered],
+                "messages": [response],
                 "fault_spec": mid_spec.to_dict(),
                 "clarification_round": clarification_round + 1,
                 "dialogue_round": dialogue_round + 1,
             }, hook_updates)
 
-        # --- Priority 3: pure text response (no tool calls at all) ---
+        # --- Priority 2: pure text response (no tool calls at all) ---
         # Multi-invocation model: pure text = conversation turn done.
         # Router will see no confirmed_intent + no tool_calls → END.
         updated_intent = _merge_known_params_into_fault_intent(
@@ -1605,7 +1409,6 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
         )
         if tracker:
             tracker.complete("对话回复完成")
-        safe_response = _filter_internal_tools_from_response(response)
         persist_list = _build_dialogue_persist_list(
             messages, response=response,
             system_msg=system_msg,
@@ -1617,7 +1420,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
             updated_intent, existing=existing_spec,
         )
         return merge_hook_updates({
-            "messages": [safe_response],
+            "messages": [response],
             "fault_spec": mid_spec.to_dict(),
             "dialogue_round": dialogue_round + 1,
         }, hook_updates)

@@ -453,12 +453,12 @@ async def _finalize_session_store(
             result_summary: str | dict = ""
             try:
                 from chaos_agent.agent.operation_result import build_inject_data_from_state
-                from chaos_agent.models.schemas import build_inject_envelope
+                from chaos_agent.memory.session_finalizer import (
+                    build_inject_session_summary,
+                )
 
                 _data = build_inject_data_from_state(merged, task_id)
-                result_summary = build_inject_envelope(
-                    _data, _data["task_state"], _data.get("error", ""),
-                )
+                result_summary = build_inject_session_summary(_data)
             except Exception:
                 logger.debug(
                     "build result_summary failed for task=%s",

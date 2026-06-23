@@ -37,11 +37,9 @@ def _extract_db_fields(merged: dict) -> tuple[dict, dict]:
     as a *reference* — we store the skill_name instead of the full content,
     because the full content can be rebuilt from the skills/ directory.
 
-    ``fault_spec`` is projected to the existing DB columns the audit
-    surface still consumes (``target`` / ``params`` / ``scope`` /
-    ``target_name`` / ``action`` / ``duration``). Keeps the DB schema
-    stable while state-side single-source-of-truth lives on
-    ``state.fault_spec``.
+    ``fault_spec`` is stored as the canonical task detail and also
+    projected to the legacy DB columns the audit/recovery surfaces still
+    consume (``target`` / ``params`` / ``namespace`` / ``target_name``).
     """
     # Project fault_spec into the DB columns that the schema actually
     # defines (see ``task_store_backend._TASK_COLUMNS`` /
@@ -65,12 +63,6 @@ def _extract_db_fields(merged: dict) -> tuple[dict, dict]:
     task_fields: dict[str, Any] = {}
     detail_fields: dict[str, Any] = {}
     for key, value in merged.items():
-        # ``fault_spec`` itself is not a DB column; it's the state-side
-        # source of truth. The projection above already pushed its
-        # fields into target/params/scope/etc. Skip the raw fault_spec
-        # dict so we don't try to write it to a non-existent column.
-        if key == "fault_spec":
-            continue
         db_key = _STATE_TO_DB_MAP.get(key, key)
         if db_key == "task_id":
             continue

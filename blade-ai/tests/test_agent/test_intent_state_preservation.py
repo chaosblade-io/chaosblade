@@ -9,10 +9,6 @@ carry-forward ("unset").
 
 from langchain_core.messages import AIMessage
 
-from chaos_agent.agent.nodes.intent_clarification import (
-    _ensure_visible_content,
-    _INTENT_CONTENT_FALLBACKS,
-)
 from chaos_agent.agent.prompts.sections.intent import (
     get_intent_completeness_section,
 )
@@ -86,35 +82,6 @@ class TestRouterUnsetFallThrough:
         state = {"confirmed_intent": None, "messages": []}
         result = route_after_intent_clarification(state)
         assert result == "intent_clarification"
-
-
-class TestEnsureVisibleContentFallback:
-    """_ensure_visible_content should return intent-specific fallbacks,
-    not the generic template that causes repeated identical responses."""
-
-    def test_inject_fallback_is_specific(self):
-        response = AIMessage(content="")
-        result = _ensure_visible_content(response, intent="inject")
-        assert result == _INTENT_CONTENT_FALLBACKS["inject"]
-        assert result != "好的,我在听,请继续告诉我你想做什么。"
-
-    def test_unset_fallback_is_specific(self):
-        response = AIMessage(content="")
-        result = _ensure_visible_content(response, intent="unset")
-        assert result == _INTENT_CONTENT_FALLBACKS["unset"]
-        assert "继续帮你确认参数" in result
-
-    def test_default_fallback_is_not_repetitive(self):
-        """Default fallback changed from the old generic template."""
-        response = AIMessage(content="")
-        result = _ensure_visible_content(response, intent="")
-        assert result == "好的，请继续告诉我你的需求。"
-
-    def test_non_empty_content_returns_directly(self):
-        """If content is non-empty, it's returned directly regardless of intent."""
-        response = AIMessage(content="好的，我需要知道节点名称。")
-        result = _ensure_visible_content(response, intent="unset")
-        assert result == "好的，我需要知道节点名称。"
 
 
 class TestIntentPrefixInjection:

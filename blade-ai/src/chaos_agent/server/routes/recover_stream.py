@@ -11,6 +11,10 @@ from fastapi.responses import StreamingResponse
 
 from chaos_agent.agent.streaming import SSEBatcher, StreamEvent, parse_stream_event
 from chaos_agent.config.settings import settings
+from chaos_agent.memory.session_finalizer import (
+    RESULT_SUMMARY_RECOVER_PAYLOAD,
+    finalize_recover_session,
+)
 from chaos_agent.server.routes import recover_router
 from chaos_agent.server.routes.recover_common import (
     RecoverSetupError,
@@ -81,6 +85,8 @@ async def recover_stream(request: RecoverRequest, req: Request):
         )
         session_store = None
         state_values = {}
+        recover_config = None
+        recover_graph = None
         started_monotonic = time.monotonic()
 
         try:
@@ -148,15 +154,6 @@ async def recover_stream(request: RecoverRequest, req: Request):
             # 4. Extract final result
             final_state = await recover_graph.aget_state(recover_config)
             if final_state and final_state.values:
-                result = final_state.values
-                remaining_messages = result.get("messages", [])
-
-                is_recovered = False
-                from chaos_agent.agent.operation_outcome import read_operation_outcome
-                result_dict = read_operation_outcome(result).result
-                if isinstance(result_dict, dict):
-                    is_recovered = result_dict.get("recovered", False)
-
                 result_payload = await build_recover_result_payload(
                     recover_graph,
                     recover_config,
@@ -219,28 +216,16 @@ async def recover_stream(request: RecoverRequest, req: Request):
                         exc_info=True,
                     )
 
-                if is_recovered:
-                    if session_store:
-                        try:
-                            session_store.finalize_session(
-                                record_task_id,
-                                remaining_messages=remaining_messages,
-                                result_summary=result_payload,
-                                status="completed",
-                            )
-                        except Exception:
-                            logger.warning(f"Failed to finalize recover session {record_task_id}")
-                else:
-                    if session_store:
-                        try:
-                            session_store.finalize_session(
-                                record_task_id,
-                                remaining_messages=remaining_messages,
-                                result_summary=result_payload,
-                                status="failed",
-                            )
-                        except Exception:
-                            logger.warning(f"Failed to finalize recover session {record_task_id}")
+                await finalize_recover_session(
+                    session_store,
+                    recover_graph,
+                    recover_config,
+                    record_task_id,
+                    inject_task_id,
+                    state_values,
+                    result_payload=result_payload,
+                    result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+                )
 
                 yield StreamEvent(
                     type="result",
@@ -267,12 +252,17 @@ async def recover_stream(request: RecoverRequest, req: Request):
         finally:
             _tsm.end_task_span(record_task_id)
             if session_store and session_store.has_active(record_task_id):
-                try:
-                    session_store.finalize_session(
-                        record_task_id, remaining_messages=[], status="failed",
-                    )
-                except Exception:
-                    pass
+                await finalize_recover_session(
+                    session_store,
+                    recover_graph,
+                    recover_config,
+                    record_task_id,
+                    inject_task_id,
+                    state_values,
+                    result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+                    default_status="failed",
+                    error_log_level="debug",
+                )
             task_tracker.unregister(record_task_id)
 
     return StreamingResponse(

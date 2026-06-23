@@ -16,7 +16,8 @@ from chaos_agent.utils.time import now_iso
 
 # Columns stored as JSON strings in the DB
 _JSON_COLUMNS: frozenset[str] = frozenset(
-    {"target", "params", "verification", "recover_verification", "result",
+    {"fault_spec", "target", "params", "verification",
+     "recover_verification", "result",
      "baseline_data",
      # R18 — postmortem dict (path/markdown/summary) JSON-serialised.
      "postmortem",
@@ -32,9 +33,9 @@ _TASK_COLUMNS: list[str] = [
     "gmt_create", "gmt_modified",
 ]
 
-# task_details table — wide, cold path (25 columns)
+# task_details table — wide, cold path
 _DETAIL_COLUMNS: list[str] = [
-    "id", "task_id", "target", "params", "input",
+    "id", "task_id", "fault_spec", "target", "params", "input",
     "safety_status", "safety_reason", "needs_confirm",
     "plan_summary", "kubeconfig", "kube_context",
     "verification", "recover_verification", "result",
@@ -55,22 +56,36 @@ _DETAIL_COLUMNS: list[str] = [
 # ---------------------------------------------------------------------------
 
 
+def _decode_json_mapping(value: object) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            value = None
+    return value if isinstance(value, dict) else {}
+
+
 def _extract_index_fields(fields: dict) -> dict:
-    """Extract *namespace* and *target_name* from the ``target`` JSON field
-    into independent, indexable columns.
+    """Extract *namespace* and *target_name* from task target fields into
+    independent, indexable columns.
 
     This enables SQL-level filtering in ``query_active()`` without scanning
-    and parsing JSON at the Python layer.
+    and parsing JSON at the Python layer. ``target`` is the legacy detail
+    shape; ``fault_spec`` is the canonical shape and is used as a fallback
+    when no legacy target has been projected yet.
     """
-    target = fields.get("target")
-    if isinstance(target, str):
-        try:
-            target = json.loads(target)
-        except (json.JSONDecodeError, TypeError):
-            target = None
-    if isinstance(target, dict):
+    target = _decode_json_mapping(fields.get("target"))
+    if target:
         fields.setdefault("namespace", target.get("namespace", ""))
         names = target.get("names", [])
+        if names:
+            fields.setdefault("target_name", names[0])
+        return fields
+
+    fault_spec = _decode_json_mapping(fields.get("fault_spec"))
+    if fault_spec:
+        fields.setdefault("namespace", fault_spec.get("namespace", ""))
+        names = fault_spec.get("names", [])
         if names:
             fields.setdefault("target_name", names[0])
     return fields

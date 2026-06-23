@@ -49,6 +49,7 @@ _DETAILS_DDL = """\
 CREATE TABLE IF NOT EXISTS task_details (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id             TEXT NOT NULL,
+    fault_spec          TEXT,
     target              TEXT,
     params              TEXT,
     input               TEXT,
@@ -187,6 +188,10 @@ class SQLiteBackend:
         """Execute DDL on a given connection (avoids recursion with _get_conn)."""
         await conn.executescript(_SCHEMA_DDL)
         # Migrations: add columns introduced after initial schema
+        try:
+            await conn.execute("ALTER TABLE task_details ADD COLUMN fault_spec TEXT")
+        except Exception:
+            pass
         try:
             await conn.execute("ALTER TABLE task_details ADD COLUMN failure_reason TEXT")
         except Exception:

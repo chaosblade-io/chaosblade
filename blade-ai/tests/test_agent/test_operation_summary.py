@@ -116,6 +116,44 @@ def test_recover_summary_falls_back_to_inject_state_fault_type():
     assert "若要复用这些目标，必须重新 kubectl 验证当前存在性" in text
 
 
+def test_recover_summary_falls_back_to_inject_state_target_only():
+    spec = FaultSpec(
+        namespace="arms-prom",
+        scope="pod",
+        names=("pod-a",),
+        blade_target="cpu",
+        blade_action="fullload",
+    )
+    text = build_recover_summary_text(
+        {
+            "data": {
+                "task_id": "task-recover",
+                "task_state": "recovered",
+                "fault_type": "pod-cpu-fullload",
+                "blade_uid": "uid-1",
+                "verification": {
+                    "level": "recovered",
+                    "layer1": {"status": "passed"},
+                    "layer2": {"status": "passed"},
+                },
+            },
+        },
+        "task-inject",
+        {
+            "fault_spec": spec.to_dict(),
+            "verification": {
+                "level": "inject-verified",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "passed"},
+            },
+        },
+    )
+
+    assert "类型: pod-cpu-fullload | 目标: arms-prom/pod-a" in text
+    assert "恢复验证: recovered (L1=passed, L2=passed)" in text
+    assert "inject-verified" not in text
+
+
 def test_recover_summary_keeps_empty_verification_compatibility_line():
     text = build_recover_summary_text(
         {

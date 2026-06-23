@@ -652,6 +652,10 @@ class L4ResilienceAgent:
             "configurable": {"thread_id": record_task_id},
             "recursion_limit": 150,
         }
+        from chaos_agent.memory.session_finalizer import (
+            RESULT_SUMMARY_RECOVER_PAYLOAD,
+            finalize_recover_session,
+        )
 
         # --- Bootstrap session_store for task file persistence ---
         _session_store = None
@@ -687,7 +691,17 @@ class L4ResilienceAgent:
                 )
         except Exception as e:
             logger.exception("Explicit recover failed for inject_task_id=%s", inject_task_id)
-            self._finalize_recover_session(_session_store, record_task_id, None, "failed")
+            await finalize_recover_session(
+                _session_store,
+                pool.recover_graph,
+                recover_config,
+                record_task_id,
+                inject_task_id,
+                source_values,
+                result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+                default_status="failed",
+                error_log_level="debug",
+            )
             return L4TaskResult(
                 task_id=task.task_id,
                 status="failed",
@@ -697,7 +711,17 @@ class L4ResilienceAgent:
 
         # Interpret result
         if not recover_result:
-            self._finalize_recover_session(_session_store, record_task_id, None, "failed")
+            await finalize_recover_session(
+                _session_store,
+                pool.recover_graph,
+                recover_config,
+                record_task_id,
+                inject_task_id,
+                source_values,
+                result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+                default_status="failed",
+                error_log_level="debug",
+            )
             return L4TaskResult(
                 task_id=task.task_id,
                 status="failed",
@@ -711,15 +735,25 @@ class L4ResilienceAgent:
         elif recover_task_state == "partial_recovered":
             status = "degraded"
 
+        from chaos_agent.agent.operation_outcome import read_recover_verification
+
         # Finalize session_store with recover result
-        self._finalize_recover_session(
-            _session_store, record_task_id, recover_result,
-            "completed" if status != "failed" else "failed",
+        await finalize_recover_session(
+            _session_store,
+            pool.recover_graph,
+            recover_config,
+            record_task_id,
+            inject_task_id,
+            source_values,
+            result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+            default_status="completed" if status != "failed" else "failed",
+            error_log_level="debug",
+            precomputed_values=recover_result,
         )
 
         extras: dict = {
             "recovery_level": recover_task_state,
-            "recover_verification": recover_result.get("recover_verification"),
+            "recover_verification": read_recover_verification(recover_result),
             "inject_task_id": inject_task_id,
             "blade_uid": recover_initial.get("blade_uid", ""),
         }
@@ -761,25 +795,6 @@ class L4ResilienceAgent:
         except Exception:
             pass
         return None
-
-    @staticmethod
-    def _finalize_recover_session(
-        session_store, record_task_id: str, result: dict | None, status: str,
-    ) -> None:
-        """Finalize session_store for a recover task (best-effort)."""
-        if session_store is None:
-            return
-        try:
-            remaining_messages = []
-            if isinstance(result, dict):
-                remaining_messages = result.get("messages", [])
-            session_store.finalize_session(
-                record_task_id,
-                remaining_messages=remaining_messages,
-                status=status,
-            )
-        except Exception:
-            logger.debug("Failed to finalize recover session %s", record_task_id)
 
     def cleanup(self, runtime, task) -> None:
         """Clean up per-task state."""
@@ -1276,6 +1291,7 @@ class L4ResilienceAgent:
             )
 
         if recover_result:
+            from chaos_agent.agent.operation_outcome import read_recover_verification
             from chaos_agent.agent.state import infer_task_state
 
             recover_task_state = infer_task_state(recover_result)
@@ -1284,8 +1300,8 @@ class L4ResilienceAgent:
                     "passed" if recover_task_state == "recovered" else "degraded"
                 )
                 inject_result.extras["recovery_level"] = recover_task_state
-                inject_result.extras["recover_verification"] = recover_result.get(
-                    "recover_verification"
+                inject_result.extras["recover_verification"] = (
+                    read_recover_verification(recover_result)
                 )
 
             # Emit recover conclusion event.

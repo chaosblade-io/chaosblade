@@ -548,19 +548,19 @@ async def create_agent(
     _execute_skill_script = _skill_tools_by_name["execute_skill_script"]
 
     # Clarification tools: only available in intent_clarification node (TUI mode).
-    # classify_intent is the only function calling schema bound to the LLM
-    # directly — NOT a ToolNode tool. submit_fault_intent is now a real @tool
-    # processed by ToolNode (produces ToolMessage feedback for the model).
-    # Multi-invocation model: ask_human removed; conversation turns are handled
-    # by graph termination + TUI REPL loop. ToolNode processes: kubectl_ro
-    # (read-only target verification), activate_skill + read_skill_resource
-    # (browse fault types), submit_fault_intent (signal intent convergence).
+    # All tools are real @tool functions processed by ToolNode. The LLM's
+    # action IS the intent — no separate classification tool needed:
+    #   - Pure text response = chat/Q&A (graph ends, TUI waits for next input)
+    #   - submit_fault_intent = inject flow
+    #   - submit_batch_intent = batch inject flow
+    #   - recover_task = recover flow
+    #   - kubectl_ro / activate_skill / read_skill_resource = ReAct within turn
     #
     # ``kubectl_ro`` (NOT full ``kubectl``) — same rationale as phase1_tools:
     # intent_clarification is a pre-planning stage; only read-only inspection
     # is appropriate. Full kubectl was the bypass vector in sess_1e39e8f4dcce
     # where the LLM called `kubectl scale` to directly mutate kube-system.
-    from chaos_agent.agent.nodes.intent_clarification import submit_fault_intent, submit_batch_intent, query_active_experiments
+    from chaos_agent.agent.nodes.intent_clarification import submit_fault_intent, submit_batch_intent, query_active_experiments, recover_task
 
     clarification_tools = [
         kubectl_ro,
@@ -569,6 +569,7 @@ async def create_agent(
         submit_fault_intent,
         submit_batch_intent,
         query_active_experiments,
+        recover_task,
     ]
     if mcp_manager is not None:
         clarification_tools = clarification_tools + mcp_manager.tools_for_phase("clarification")

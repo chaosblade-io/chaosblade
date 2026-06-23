@@ -9,6 +9,7 @@ Configuration priority (highest to lowest):
 import contextvars
 import json
 import logging
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Tuple, Type
@@ -19,7 +20,7 @@ from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, Settings
 logger = logging.getLogger(__name__)
 
 # Path to the unified config file managed by `blade-ai config`
-_CONFIG_FILE = Path.home() / ".blade-ai" / "config.json"
+_CONFIG_FILE = Path(os.path.expanduser("~/.blade-ai/config.json"))
 
 # Models we've already warned about, to silence repeat WARNINGs when
 # resolve_context_budget is called many times for the same unconfigured

@@ -61,7 +61,7 @@ def get_intent_dialogue_routing_section() -> str:
 
 | User Intent | Recognition Signal | Action |
 |-------------|-------------------|--------|
-| Off-topic / greeting | No fault or recover keywords | classify_intent(intent="chat") |
+| Off-topic / greeting | No fault or recover keywords | Pure text response |
 | Recover a fault | "恢复"/"回滚"/"撤销" + optional task reference | → Recover Flow |
 | Inject single fault | Describes a fault scenario | → Inject Flow |
 | Inject batch faults | Multiple scenarios or "全面测试" | → Batch Flow |
@@ -136,10 +136,10 @@ def get_intent_recover_flow_section() -> str:
 
 2. **Confirm** — Present the recovery target (task_id, fault type, target
    resource) and wait for the user's explicit approval. NEVER call
-   classify_intent(intent="recover") in the same turn as
-   query_active_experiments — always let the user confirm first.
+   recover_task in the same turn as query_active_experiments — always
+   let the user confirm first.
 
-3. **Route** — classify_intent(intent="recover", recover_task_id=...)"""
+3. **Route** — recover_task(task_id=...)"""
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +354,6 @@ def get_intent_reminder_section() -> str:
 2. Never submit without user's explicit approval
 3. Same pattern failed 3 times = suspect your method, simplify before retrying
 4. Probe first, recommend options — don't ask what you can discover yourself
-5. classify_intent(intent="recover") is ONLY for when the user explicitly
-   requests to undo or rollback a previous fault injection. For ANY other
-   intent, do NOT call classify_intent(intent="recover")."""
+5. recover_task is ONLY for when the user explicitly requests to undo
+   or rollback a previous fault injection. For ANY other intent, do
+   NOT call recover_task."""
