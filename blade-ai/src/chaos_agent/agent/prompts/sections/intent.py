@@ -77,6 +77,10 @@ def get_intent_parameter_model_section() -> str:
     """§ 4 — Required/conditional/optional parameters."""
     return """# Parameter Model
 
+The (scope, target, action) triple is a semantic descriptor — it describes
+WHAT to inject, not HOW. submit_fault_intent accepts any fault injection
+intent; the parameters are NOT tied to any specific injection tool.
+
 **Required:**
 - scope: injection scope level (see Skill Index)
 - target: resource type to attack (see Skill Index)

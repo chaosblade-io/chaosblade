@@ -102,7 +102,13 @@ class JsonConfigSettingsSource(PydanticBaseSettingsSource):
         except (json.JSONDecodeError, OSError):
             return None, field_name, False
         if field_name in data and not self._is_unset(data[field_name]):
-            return data[field_name], field_name, True
+            value = data[field_name]
+            # Coerce numeric JSON values to str when the field expects str.
+            # Users often write e.g. "kubewiz_profile": 526255 without
+            # quotes — valid JSON but pydantic rejects int→str.
+            if isinstance(value, (int, float)) and field.annotation is str:
+                value = str(int(value)) if isinstance(value, float) and value == int(value) else str(value)
+            return value, field_name, True
         return None, field_name, False
 
     def __call__(self) -> dict[str, Any]:
@@ -115,7 +121,11 @@ class JsonConfigSettingsSource(PydanticBaseSettingsSource):
             return data
         for field_name in self.settings_cls.model_fields:
             if field_name in file_data and not self._is_unset(file_data[field_name]):
-                data[field_name] = file_data[field_name]
+                value = file_data[field_name]
+                field_info = self.settings_cls.model_fields[field_name]
+                if isinstance(value, (int, float)) and field_info.annotation is str:
+                    value = str(int(value)) if isinstance(value, float) and value == int(value) else str(value)
+                data[field_name] = value
         return data
 
 

@@ -195,13 +195,27 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
         // Ask the server whether the wizard should run. Server-side
         // check keeps the gating rules (which keys are essential)
         // out of the TS layer. Network failures fail-open (server
-        // returns false on transport error), matching the legacy
-        // configGate behaviour of "fail open and let the user reach
-        // the TUI even when validators can't run".
+        // returns ``{needsSetup:false, configError:null}`` on transport
+        // error), matching the legacy configGate behaviour of "fail
+        // open and let the user reach the TUI even when validators
+        // can't run".
+        //
+        // ``configError`` (non-null) means config.json exists but is
+        // syntactically broken (e.g. unquoted JSON). The server
+        // refuses to enter the wizard in that case (would clobber the
+        // user's file) — we abort boot and surface the message via
+        // the same ``onFailed`` path used for /health timeout etc.
         const wizardClient = new WizardClient(spawnedServer.url);
-        const needsSetup = await wizardClient.needsWizardSetup();
+        const { needsSetup, configError } =
+          await wizardClient.needsWizardSetup();
         if (cancelledRef.current) {
           spawnedServer.shutdown().catch(() => undefined);
+          return;
+        }
+        if (configError) {
+          spawnedServer.shutdown().catch(() => undefined);
+          dispatch({ type: "BOOT_PROGRESS_HIDE" });
+          onFailed(configError);
           return;
         }
         if (needsSetup) {

@@ -340,35 +340,29 @@ def submit_fault_intent(
     structured args you submit here are the source of truth that drives
     the downstream confirmation card and the inject pipeline.
 
-    The (scope, target, action) triple mirrors the ChaosBlade command
-    model ``blade create <scope> <target> <action> --<flag>=<value>``.
-    Treat the values listed below as *common* examples, NOT a closed
-    enum — ChaosBlade supports many more (e.g. action="drop" / "fill" /
-    "occupy"; target="dns" / "file" / "jvm" / "kubelet").
-    The authoritative set of legal triples and their required ``params``
-    flags is published by ``read_skill_resource``; consult it BEFORE
-    calling this tool whenever you're unsure about the fault you're
-    about to submit.
+    The (scope, target, action) triple is a SEMANTIC descriptor of the
+    fault — it describes WHAT to inject, not HOW. This tool accepts any
+    fault injection intent; the parameters are NOT tied to any specific
+    injection tool or command syntax. Consult ``read_skill_resource``
+    for the authoritative set of supported scenarios and required params.
 
     Args:
         fault_type: Composite identifier — by convention the dash-joined
                     triple ``"<scope>-<target>-<action>"``, e.g.
-                    ``"node-cpu-fullload"`` / ``"pod-network-drop"``.
-                    Acts as the human-readable label on the confirm
-                    card. Required.
+                    ``"node-cpu-fullload"`` / ``"pod-network-drop"`` /
+                    ``"pod-finalizer-patch"``. Acts as the human-readable
+                    label on the confirm card. Required.
         scope: K8s resource family the fault attaches to. Common values:
-               ``"pod"``, ``"node"``, ``"container"``. ChaosBlade also
-               supports workload kinds (deployment / statefulset / ...)
-               via skills. Required.
+               ``"pod"``, ``"node"``, ``"container"``, ``"deployment"``.
+               Required.
         target: Subsystem under attack. Common values: ``"cpu"`` /
-                ``"mem"`` / ``"network"`` / ``"disk"`` / ``"process"``;
-                skill catalogue may expose more (``"dns"`` /
-                ``"file"`` / ``"jvm"`` / ...). Required.
-        action: Concrete fault action. Common values vary per target:
-                cpu→``"fullload"``; mem→``"load"``; network→``"drop"``
-                / ``"dns"`` / ``"occupy"`` (v1.8.0 only supports these three);
-                disk→``"burn"`` / ``"fill"``;
-                process→``"kill"`` / ``"stop"``. Required.
+                ``"mem"`` / ``"network"`` / ``"disk"`` / ``"process"`` /
+                ``"finalizer"`` / ``"replicas"`` / ``"schedule"`` / ``"pvc"``.
+                Required.
+        action: Concrete fault action. Common values: ``"fullload"`` /
+                ``"load"`` / ``"drop"`` / ``"fill"`` / ``"kill"`` /
+                ``"scale"`` / ``"patch"`` / ``"cordon"`` / ``"taint"`` /
+                ``"delete"`` / ``"drain"``. Required.
         namespace: K8s namespace. Defaults to ``"default"`` — node-scope
                    faults conventionally use ``"default"`` and the user
                    rarely says so explicitly.
@@ -378,13 +372,12 @@ def submit_fault_intent(
         params: Fault-type-specific flags. The keys depend on the
                 ``(scope, target, action)`` triple — read the skill
                 spec for the canonical set. Common shapes:
-                  - cpu-fullload: ``{"percent": "80",
-                    "timeout": "600"}``
+                  - cpu-fullload: ``{"percent": "80", "timeout": "600"}``
                   - network-drop: ``{"interface": "eth0"}``
-                    (drops all packets; no --percent support)
                   - disk-fill: ``{"path": "/data", "size": "10000"}``
-                  - process-kill: ``{"process": "nginx",
-                    "signal": "9"}``
+                  - process-kill: ``{"process": "nginx", "signal": "9"}``
+                  - scale: ``{"replicas": "0"}``
+                  - patch: ``{"patch_type": "merge", "patch": "{...}"}``
                 Values must be strings.
         user_description: User's original natural-language request.
 

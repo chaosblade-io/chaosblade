@@ -102,30 +102,45 @@ export class WizardClient {
   ) {}
 
   /**
-   * GET /api/v1/wizard/needs-setup — true when essential config keys
-   * are missing and the wizard should be presented before the rest of
-   * the boot continues. Server-side check (lives next to ConfigStore)
-   * so the TS layer doesn't need to know the gating rules.
+   * GET /api/v1/wizard/needs-setup — determines whether the wizard
+   * should run, or whether a config-file parse error should be surfaced.
    *
-   * Returns false on any transport failure — fail-open so a one-off
-   * network glitch doesn't loop the user into the wizard. The Python
-   * server can always emit the gate on the next boot.
+   * Returns ``{ needsSetup, configError }``:
+   *   - ``configError`` non-null  → config.json exists but is corrupt;
+   *     caller should abort boot and show the error.
+   *   - ``needsSetup`` true       → essential keys missing; show wizard.
+   *   - both false/null           → config is fine; proceed to session.
+   *
+   * On any transport failure → fail-open: ``{ needsSetup: false,
+   * configError: null }`` so a network glitch doesn't block the user.
    */
-  async needsWizardSetup(): Promise<boolean> {
+  async needsWizardSetup(): Promise<{
+    needsSetup: boolean;
+    configError: string | null;
+  }> {
+    const FAIL_OPEN = { needsSetup: false, configError: null };
     try {
       const r = await fetchWithTimeout(
         `${this.baseUrl}/api/v1/wizard/needs-setup`,
         { method: "GET" },
         this.timeoutMs,
       );
-      if (!r.ok) return false;
+      if (!r.ok) return FAIL_OPEN;
       const env = (await r.json()) as Record<string, unknown>;
-      if (env["status"] !== "success") return false;
+      if (env["status"] !== "success") return FAIL_OPEN;
       const data = env["data"];
-      if (!data || typeof data !== "object") return false;
-      return (data as Record<string, unknown>)["needs_setup"] === true;
+      if (!data || typeof data !== "object") return FAIL_OPEN;
+      const d = data as Record<string, unknown>;
+      const configError =
+        typeof d["config_error"] === "string"
+          ? (d["config_error"] as string)
+          : null;
+      return {
+        needsSetup: d["needs_setup"] === true,
+        configError,
+      };
     } catch {
-      return false;
+      return FAIL_OPEN;
     }
   }
 

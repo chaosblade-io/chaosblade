@@ -69,24 +69,35 @@ def _store() -> ConfigStore:
 
 @wizard_router.get("/needs-setup")
 async def needs_setup(req: Request):
-    """True when any essential config key is missing → BootRunner
-    should pause and render the wizard.
+    """Determine whether the onboarding wizard should fire.
 
-    Checks the canonical 3-field set (``llm_api_key``, ``model_name``,
-    ``api_base_url``) against ENV + ``~/.blade-ai/config.json``
-    **without going through ``settings``** — settings has built-in
-    defaults for model_name / api_base_url that would always mask
-    "user hasn't picked one yet" and short-circuit the wizard.
+    Three possible outcomes:
 
-    Returns ``{needs_setup: bool, missing: [...]}`` so the UI can
-    optionally show which fields triggered the gate. Liveness (does
-    the URL actually answer?) is intentionally NOT checked here —
-    that's the runtime self-check's job and the wizard's per-step
-    validators. Boot stays fast.
+    1. **File absent** (first-time user) → ``needs_setup=true``,
+       ``missing=[...]``, ``config_error=null`` → wizard fires.
+    2. **File present & valid JSON but missing essential keys** →
+       ``needs_setup=true``, ``missing=[...]``, ``config_error=null``
+       → wizard fires.
+    3. **File present but corrupt / unparseable** →
+       ``needs_setup=false``, ``missing=[]``, ``config_error="..."``
+       → front-end shows a startup-failure page with the parse error.
+       We return ``needs_setup=false`` so the UI neither enters the
+       wizard nor starts a session; instead it renders the config_error
+       to the user.
+
+    Liveness (does the URL actually answer?) is intentionally NOT
+    checked here — that's the runtime self-check's job and the wizard's
+    per-step validators. Boot stays fast.
     """
+    config_error = wizard_validators.check_config_file_health()
+    if config_error:
+        return JSONEnvelope.ok(
+            data={"needs_setup": False, "missing": [], "config_error": config_error},
+            request_id=getattr(req.state, "request_id", ""),
+        )
     missing = wizard_validators.missing_essential_config()
     return JSONEnvelope.ok(
-        data={"needs_setup": len(missing) > 0, "missing": missing},
+        data={"needs_setup": len(missing) > 0, "missing": missing, "config_error": None},
         request_id=getattr(req.state, "request_id", ""),
     )
 

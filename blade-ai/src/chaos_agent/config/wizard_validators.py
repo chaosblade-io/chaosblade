@@ -113,6 +113,44 @@ def get_model_presets() -> list[dict]:
     return [dict(p) for p in MODEL_PRESETS]
 
 
+# ── Config file health check ──────────────────────────────────────────
+
+
+def check_config_file_health() -> str | None:
+    """Detect a corrupt config file BEFORE the wizard fires.
+
+    Returns a human-readable error message describing the problem if
+    ``~/.blade-ai/config.json`` exists but cannot be parsed; ``None``
+    when the file is absent (first-time user, wizard should fire) or
+    valid.
+
+    Surfacing this distinction matters because every JSON read in the
+    codebase currently swallows ``json.JSONDecodeError`` and falls back
+    to an empty dict — so a malformed config silently degrades into
+    "looks like the user never configured anything", trapping the user
+    in a wizard loop or producing downstream 401/403 errors with no
+    pointer to the real cause.
+    """
+    path = Path(os.path.expanduser("~/.blade-ai/config.json"))
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        return f"无法读取 ~/.blade-ai/config.json：{e}"
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        return (
+            f"~/.blade-ai/config.json 不是合法的 JSON："
+            f"{e.msg}（第 {e.lineno} 行第 {e.colno} 列）。"
+            f"常见原因：字符串字段忘记加双引号（例如 kubewiz_token、kubewiz_profile 等）。"
+        )
+    if not isinstance(data, dict):
+        return "~/.blade-ai/config.json 顶层必须是 JSON 对象 {...}"
+    return None
+
+
 # ── Essential-config completeness check ───────────────────────────────
 
 
