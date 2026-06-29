@@ -25,7 +25,6 @@ import (
 	"github.com/spf13/pflag"
 
 	"github.com/chaosblade-io/chaosblade-exec-cri/exec"
-	"github.com/chaosblade-io/chaosblade-operator/exec/model"
 	"github.com/chaosblade-io/chaosblade-spec-go/channel"
 	"github.com/chaosblade-io/chaosblade-spec-go/log"
 	"github.com/chaosblade-io/chaosblade-spec-go/spec"
@@ -251,10 +250,10 @@ func (ec *baseExpCommandService) registerDockerExpCommands() []*modelCommand {
 }
 
 func GetResourceFlags() []spec.ExpFlagSpec {
-	coverageFlags := model.GetResourceCoverageFlags()
-	commonFlags := model.GetResourceCommonFlags()
-	containerFlags := model.GetContainerFlags()
-	chaosbladeFlags := model.GetChaosBladeFlags()
+	coverageFlags := getResourceCoverageFlags()
+	commonFlags := getResourceCommonFlags()
+	containerFlags := getContainerFlags()
+	chaosbladeFlags := getChaosBladeFlags()
 	return append(append(append(coverageFlags, commonFlags...), containerFlags...), chaosbladeFlags...)
 }
 
