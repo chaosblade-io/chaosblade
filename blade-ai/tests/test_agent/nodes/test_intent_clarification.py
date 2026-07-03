@@ -149,8 +149,8 @@ class TestSubmitFaultIntentTool:
         assert "已提交" in result
 
     def test_submit_fault_intent_namespace_defaults(self):
-        # namespace omitted → default "default" applies via signature
-        # default. node-scope conventionally uses default namespace.
+        # namespace omitted → empty string default. The function just
+        # returns an ack; downstream merge logic handles defaulting.
         result = submit_fault_intent.invoke({
             "fault_type": "node-cpu-fullload",
             "scope": "node",

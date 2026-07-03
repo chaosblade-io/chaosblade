@@ -40,6 +40,7 @@ def build_inject_initial_state(
     messages: list | None = None,
     batch_submit_args: dict | None = None,
     created_at: str | None = None,
+    tenant_id: str = "",
 ) -> dict[str, Any]:
     """Build the initial AgentState for an inject Pipeline Graph run."""
 
@@ -47,6 +48,7 @@ def build_inject_initial_state(
         "task_id": task_id,
         "tui_session_id": tui_session_id or "",
         "operation": "inject",
+        "tenant_id": tenant_id or "",
         "fault_spec": _fault_spec_to_dict(fault_spec),
         "needs_confirmation": bool(needs_confirmation),
         "safety_status": "pending",

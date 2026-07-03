@@ -39,6 +39,7 @@ def test_build_recover_initial_from_checkpoint_copies_durable_facts_and_resets_r
 
     assert initial["task_id"] == "task-recover"
     assert initial["parent_task_id"] == "task-inject"
+    assert initial["recover_task_id"] == "task-inject"
     assert initial["operation"] == "recover"
     assert initial["blade_uid"] == "uid-123"
     assert initial["skill_name"] == "pod-cpu-fullload"

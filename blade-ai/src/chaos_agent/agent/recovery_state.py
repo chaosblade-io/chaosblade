@@ -41,9 +41,11 @@ def build_recover_initial_from_checkpoint(
             else inject_values.get("tui_session_id", "")
         ) or "",
         "parent_task_id": inject_task_id,
+        "recover_task_id": inject_task_id,
         "operation": "recover",
         "blade_uid": inject_values.get("blade_uid", "") or "",
         "skill_name": read_active_skill_name(inject_values),
+        "fault_type": inject_values.get("fault_type", "") or "",
         "skill_case_content": inject_values.get("skill_case_content", "") or "",
         "blast_radius_detail": inject_values.get("blast_radius_detail", "") or "",
         "blade_parsed_flags": inject_values.get("blade_parsed_flags") or {},
@@ -64,6 +66,7 @@ def build_recover_initial_from_checkpoint(
         "injection_method": inject_values.get("injection_method"),
         "kubectl_exec_pod_name": inject_values.get("kubectl_exec_pod_name"),
         "created_at": str(inject_values.get("created_at") or inject_values.get("gmt_create") or ""),
+        "tenant_id": inject_values.get("tenant_id", "") or "",
     })
     return initial
 

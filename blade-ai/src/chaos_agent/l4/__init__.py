@@ -131,6 +131,12 @@ def get_agent_card() -> dict:
             "pod",
             "node",
             "namespace",
+            # 恢复/销毁相关
+            "recover",
+            "恢复",
+            "回滚",
+            "destroy",
+            "撤销",
         ],
         test_types=["resilience"],
         input_schema=FAULT_PAYLOAD_SCHEMA,

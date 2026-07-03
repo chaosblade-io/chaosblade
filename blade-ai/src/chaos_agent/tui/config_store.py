@@ -50,6 +50,7 @@ _INT_KEYS = {
     "loop_detection_threshold",
     "idle_turn_threshold",
     "max_replan_count",
+    "max_verify_replan_count",
     "retry_max_retries",
     "context_max_tokens",
     "kubectl_max_output_bytes",

@@ -49,6 +49,7 @@ from chaos_agent.agent.nodes._verifier_shared import (
 )
 from chaos_agent.agent.nodes._verifier_submit import SUBMIT_VERIFICATION_TOOL_NAME
 from chaos_agent.agent.skill_identity import read_active_skill_name
+from chaos_agent.config.settings import settings
 from chaos_agent.memory.session_store import get_global_session_store
 
 # Backward-compat aliases
@@ -216,6 +217,109 @@ def _format_verification_detail(verification: dict, layer1) -> str:
             lines.append(f"  ⚠ {w}")
 
     return "\n".join(lines)
+
+
+async def _cleanup_residuals(state: AgentState, kubeconfig: str) -> list[dict]:
+    """Clean up residual side effects from the previous injection attempt.
+
+    Checks state for known residual types and cleans them up deterministically.
+    Returns a list of cleaned-up artifacts for replan context.
+
+    Tool coupling: ``blade_uid`` cleanup is ChaosBlade-specific. For
+    ``kubectl_native`` injections, the revert command is injection-specific
+    (e.g. ``kubectl scale`` back, ``kubectl untaint``) and not tracked in
+    state, so no deterministic cleanup is performed — the replan is expected
+    to produce a different injection method that overwrites the residual.
+    Users can manually recover via ``blade-ai recover`` if needed.
+    """
+    cleaned = []
+
+    blade_uid = state.get("blade_uid", "")
+    if blade_uid:
+        try:
+            from chaos_agent.tools.blade import blade_destroy as _blade_destroy
+            _destroy_out = await _blade_destroy.ainvoke(
+                {"uid": blade_uid, "kubeconfig": kubeconfig}
+            )
+            cleaned.append({
+                "type": "running_experiment",
+                "id": blade_uid,
+                "cleanup_result": str(_destroy_out)[:200],
+            })
+            logger.info(
+                "Verify-replan cleanup: destroyed experiment %s", blade_uid,
+            )
+        except Exception as e:
+            cleaned.append({
+                "type": "running_experiment",
+                "id": blade_uid,
+                "cleanup_result": f"failed: {e}",
+            })
+            logger.warning(
+                "Verify-replan cleanup: failed for %s: %s", blade_uid, e,
+            )
+
+    return cleaned
+
+
+def _build_verify_replan_context(
+    verification: dict,
+    residuals_cleaned: list[dict],
+    verify_replan_count: int,
+    skill_name: str,
+) -> dict:
+    """Build replan context for verifier-triggered replan."""
+    l1 = verification.get("layer1", {})
+    l2 = verification.get("layer2", {})
+    checklist = verification.get("checklist", {})
+    items = checklist.get("items", []) if isinstance(checklist, dict) else []
+
+    # Collect evidence from failed checklist items
+    failed_evidence = []
+    for item in items:
+        if isinstance(item, dict) and item.get("status") == "failed":
+            failed_evidence.append(
+                f"Step {item.get('step', '?')}: {item.get('evidence', '')}"
+            )
+
+    # Build residuals description for Phase 1
+    residuals_desc = []
+    for r in residuals_cleaned:
+        residuals_desc.append(
+            f"- {r['type']} (id={r['id']}): {r['cleanup_result']}"
+        )
+
+    return {
+        "error_summary": (
+            f"Injection executed successfully (L1={l1.get('status', 'unknown')}) "
+            f"but verification found the fault effect was NOT observed "
+            f"(L2={l2.get('status', 'unknown')}). "
+            f"The injection method did not produce the expected fault effect."
+        ),
+        "iteration_at_failure": verify_replan_count + 1,
+        "failed_tool_calls": [],  # No tool failure — tool succeeded but effect absent
+        "rejected_params": [],
+        "failed_tool_names": [],
+        "trigger": "verify_replan",
+        "verifier_findings": {
+            "level": verification.get("level", ""),
+            "layer1_status": l1.get("status", ""),
+            "layer1_details": l1.get("details", ""),
+            "layer2_status": l2.get("status", ""),
+            "layer2_details": l2.get("details", ""),
+            "failed_evidence": failed_evidence,
+            "warnings": verification.get("warnings", []),
+        },
+        "residuals_cleaned": residuals_cleaned,
+        "residuals_description": "\n".join(residuals_desc) if residuals_desc else "None",
+        "skill_name": skill_name,
+        "suggestion": (
+            "The previous injection method executed successfully but the fault "
+            "effect was not observed. Try an alternative injection method from "
+            "the skill case. Residual side effects from the previous attempt "
+            "have been cleaned up."
+        ),
+    }
 
 
 def make_finalize_verification(registry=None):
@@ -533,6 +637,92 @@ def make_finalize_verification(registry=None):
                 f"baseline was available (confidence={_bl_conf}) but LLM declared "
                 f"BaselineUsed={_bl_used_orig}."
             )
+
+        # ---- Verify-Replan: unverified + L2 failed → replan to Phase 1 ----
+        _level = verification.get("level", "")
+        _l2_status = verification.get("layer2", {}).get("status", "unknown")
+
+        if _level == "unverified" and _l2_status == "failed":
+            verify_replan_count = state.get("verify_replan_count", 0)
+            try:
+                _max_verify_replan = int(settings.max_verify_replan_count)
+            except (TypeError, ValueError):
+                _max_verify_replan = 3
+
+            if verify_replan_count < _max_verify_replan:
+                # 1. Deterministic residual cleanup — based on what's actually in state
+                residuals_cleaned = await _cleanup_residuals(state, kubeconfig)
+
+                # 2. Build replan context with verifier findings
+                _replan_ctx = _build_verify_replan_context(
+                    verification, residuals_cleaned, verify_replan_count, skill_name,
+                )
+
+                # 3. Set state for replan
+                result_update["replan_requested"] = True
+                result_update["replan_context"] = _replan_ctx
+                result_update["verify_replan_count"] = verify_replan_count + 1
+                result_update["execute_loop_count"] = 0
+                result_update["verifier_loop_count"] = 0
+                result_update["reverify_count"] = 0
+                result_update["verification"] = None
+                result_update["approved_target"] = None
+                result_update["blade_uid"] = None
+                result_update["reverify_gaps"] = None
+                result_update["error"] = None
+
+                # 4. Append replan history (with compact verification snapshot for auditing)
+                _vf = _replan_ctx.get("verifier_findings", {})
+                _history = list(state.get("replan_history") or [])
+                _history.append({
+                    "attempt": verify_replan_count + 1,
+                    "original_error": f"Verification unverified: L2={_l2_status}",
+                    "action_taken": "(pending Phase 1 analysis)",
+                    "trigger": "verify_replan",
+                    "verification_snapshot": {
+                        "level": _level,
+                        "layer1_status": _vf.get("layer1_status", ""),
+                        "layer2_status": _l2_status,
+                        "layer2_details": (_vf.get("layer2_details", "") or "")[:500],
+                        "failed_evidence": _vf.get("failed_evidence", [])[:5],
+                    },
+                })
+                result_update["replan_history"] = _history
+
+                # 5. Record attempt for tracking/auditing
+                from chaos_agent.agent.attempt_tracker import (
+                    REASON_GRAPH_REPLAN,
+                    begin_attempt,
+                )
+                _attempt_delta = begin_attempt(
+                    {**state, **result_update},
+                    target=state.get("fault_spec"),
+                    reason=REASON_GRAPH_REPLAN,
+                    notes=_replan_ctx.get("error_summary", "")[:200],
+                )
+                result_update.update(_attempt_delta)
+
+                # 6. Log + status
+                logger.info(
+                    "Verify-replan triggered: level=unverified, L2=failed, "
+                    "attempt %d/%d, residuals cleaned: %s",
+                    verify_replan_count + 1, _max_verify_replan, residuals_cleaned,
+                )
+                sync_node_status_to_session(
+                    state, FINALIZE_VERIFICATION,
+                    f"Verify-replan triggered (attempt {verify_replan_count + 1}/{_max_verify_replan}): "
+                    f"verification unverified, L2 failed",
+                    detail={"residuals_cleaned": residuals_cleaned,
+                            "verify_replan_count": verify_replan_count + 1},
+                )
+                tracker.complete(
+                    f"Verify-replan triggered: level=unverified, L2=failed"
+                )
+                # Clean up debug pods created by the verifier (same as
+                # the normal finalize path — early return would skip it).
+                await _cleanup_debug_pods(state, kubeconfig, task_id, result_update)
+                await sync_to_store(state, result_update)
+                return result_update
 
         result = {
             "task_id": task_id,

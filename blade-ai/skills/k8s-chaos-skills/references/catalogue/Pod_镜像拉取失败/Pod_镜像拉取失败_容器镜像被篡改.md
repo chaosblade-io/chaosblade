@@ -75,3 +75,28 @@ ChaosBlade 会将容器镜像恢复为原始版本。
 
 - 根因：ChaosBlade `pod-pod fail` 通过修改 Pod 容器镜像为不存在的版本来模拟 Pod 故障
 - 必现现象：容器镜像含 `-fault-injection` 后缀；Pod 状态为 ImagePullBackOff 或 CrashLoopBackOff；Events 显示镜像拉取失败；Endpoints 被移除
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效镜像篡改故障注入。
+
+前提条件：无特殊要求，仅需 kubectl 可访问集群
+
+注入命令：
+```bash
+# 修改 Deployment 镜像为不存在的版本
+kubectl set image deployment/<deployment-name> -n <namespace> <container-name>=<原始镜像>:non-existent-tag
+```
+
+恢复命令：
+```bash
+# 恢复为原始镜像版本
+kubectl set image deployment/<deployment-name> -n <namespace> <container-name>=<原始镜像>:<原始标签>
+```
+
+注意事项：
+- ChaosBlade `pod-pod fail` 直接修改 Pod spec 中的镜像，kubectl-native 方式通过 Deployment 触发滚动更新
+- 恢复时需记住原始镜像地址和标签
+- 无自动超时恢复机制，必须手动还原镜像

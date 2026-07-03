@@ -137,6 +137,22 @@ def make_finalize_recover_verification(registry=None):
             raw_output=cache.get("raw_output", ""),
         )
 
+        # Defense-in-depth: if the cache is still ``in_progress`` (should
+        # not happen — Layer 1 filters out submit_recover_verification so
+        # the LLM must output text to complete Layer 1), default to
+        # ``unknown`` rather than crashing.
+        if layer1.is_in_progress():
+            logger.warning(
+                "finalize_recover_verification: Layer 1 cache is in_progress "
+                "for task %s — this should not happen (submit_recover_verification "
+                "is filtered during Layer 1). Defaulting to unknown.",
+                task_id,
+            )
+            layer1 = RecoverLayer1Result(
+                status="unknown",
+                details="Layer 1 was in progress when finalize was triggered",
+            )
+
         # ---- Source the verdict: submit args > text fallback ----
         submit_args = _extract_recover_submit_args(messages)
         if submit_args is not None:
@@ -261,6 +277,40 @@ def make_finalize_recover_verification(registry=None):
         await _cleanup_debug_pods(state, kubeconfig, task_id, result_update)
 
         await sync_to_store(state, result_update)
+
+        # ---- Mark the ORIGINAL inject task as recovered in TaskStore ----
+        # The recover flow operates under a new task_id (the recover task).
+        # The original inject task is referenced via ``recover_task_id``.
+        # Without this update, ``query_active_experiments`` would keep
+        # returning the original task because its ``task_state`` is still
+        # ``injected``.
+        #
+        # We directly set ``task_state`` without going through ``upsert``
+        # (which would infer state and overwrite ``operation`` / ``result``).
+        inject_task_id = state.get("recover_task_id", "")
+        if inject_task_id and inject_task_id != task_id:
+            inject_state = (
+                "recovered"
+                if result["recovered"] and result.get("recovery_level") != "partial"
+                else "partial_recovered"
+                if result["recovered"]
+                else "failed"
+            )
+            try:
+                from chaos_agent.persistence.task_store import get_task_store
+                _store = await get_task_store()
+                await _store.update_task_state(inject_task_id, inject_state)
+                logger.info(
+                    "finalize_recover_verification: marked original inject task %s "
+                    "as %s (recover task %s)",
+                    inject_task_id, inject_state, task_id,
+                )
+            except Exception:
+                logger.exception(
+                    "finalize_recover_verification: failed to mark original "
+                    "inject task %s as recovered", inject_task_id,
+                )
+
         return result_update
 
     return finalize_recover_verification

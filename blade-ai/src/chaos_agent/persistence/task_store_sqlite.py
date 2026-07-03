@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     blade_uid       TEXT,
     namespace       TEXT,
     target_name     TEXT,
+    tenant_id       TEXT DEFAULT '',
     error           TEXT,
     finished_at     TEXT,
     duration_ms     INTEGER DEFAULT 0,
@@ -232,6 +233,11 @@ class SQLiteBackend:
             await conn.execute("ALTER TABLE task_details ADD COLUMN kubectl_exec_pod_name TEXT")
         except Exception:
             pass
+        # Migration: add tenant_id column to tasks table for multi-tenant isolation
+        try:
+            await conn.execute("ALTER TABLE tasks ADD COLUMN tenant_id TEXT DEFAULT ''")
+        except Exception:
+            pass
         await conn.commit()
 
     async def ensure_schema(self) -> None:
@@ -272,9 +278,12 @@ class SQLiteBackend:
         rows = await cursor.fetchall()
         return [_row_to_dict(r) for r in rows]
 
-    async def select_active_tasks(self, namespace: str = "", target_name: str = "") -> list[dict]:
+    async def select_active_tasks(self, namespace: str = "", target_name: str = "", tenant_id: str = "") -> list[dict]:
         sql = "SELECT * FROM tasks WHERE task_state IN ('injecting', 'injected')"
         params: list = []
+        if tenant_id:
+            sql += " AND tenant_id = ?"
+            params.append(tenant_id)
         if namespace:
             sql += " AND namespace = ?"
             params.append(namespace)

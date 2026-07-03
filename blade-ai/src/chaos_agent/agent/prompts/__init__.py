@@ -20,7 +20,7 @@ from chaos_agent.agent.prompts.builders import (
 from chaos_agent.agent.prompts.constants import (
     REPLAN_MARKER,
     CACHE_BOUNDARY,
-    MAX_AGENT_MD_BYTES,
+    MAX_EXPERIENCE_MD_BYTES,
     MAX_KNOWLEDGE_SUMMARY_BYTES,
     MAX_SYSTEM_PROMPT_CHARS,
 )
@@ -91,7 +91,7 @@ from chaos_agent.agent.prompts.sections import (
 __all__ = [
     # Constants
     "REPLAN_MARKER", "CACHE_BOUNDARY",
-    "MAX_AGENT_MD_BYTES", "MAX_KNOWLEDGE_SUMMARY_BYTES", "MAX_SYSTEM_PROMPT_CHARS",
+    "MAX_EXPERIENCE_MD_BYTES", "MAX_KNOWLEDGE_SUMMARY_BYTES", "MAX_SYSTEM_PROMPT_CHARS",
     # Modes
     "PromptMode",
     # Section functions — core

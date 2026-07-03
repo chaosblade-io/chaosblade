@@ -57,3 +57,33 @@
 **基准事实**：
 - **根因**：Pod 出方向网络流量被 iptables DROP 规则丢弃，导致对指定端口/地址的所有请求无响应
 - **必现现象**：目标端口的 TCP/UDP 请求超时；应用日志出现 connection timed out；依赖该连接的业务功能不可用
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效网络丢包注入。
+
+前提条件：容器需有 NET_ADMIN capability 或以 root 运行，容器内需有 `iptables` 工具
+
+注入命令：
+```bash
+# 全量丢包（所有出站流量）：
+kubectl exec <pod-name> -n <namespace> -- iptables -A OUTPUT -j DROP
+# 或基于端口的精确丢包：
+kubectl exec <pod-name> -n <namespace> -- iptables -A OUTPUT -p tcp --dport <port> -j DROP
+```
+
+恢复命令：
+```bash
+# 精确删除注入的规则（与注入命令对应）：
+kubectl exec <pod-name> -n <namespace> -- iptables -D OUTPUT -j DROP
+# 如果注入的是端口级丢包：
+kubectl exec <pod-name> -n <namespace> -- iptables -D OUTPUT -p tcp --dport <port> -j DROP
+```
+
+注意事项：
+- 全量丢包会影响所有流量包括监控和健康检查，建议使用端口级丢包
+- 需要容器具备 NET_ADMIN capability，否则 iptables 命令会报权限错误
+- 无自动超时恢复机制，必须手动执行 `iptables -D` 删除规则
+- 恢复时使用 `iptables -D` 精确删除注入的规则，避免 `iptables -F` 清除容器原有的其他规则

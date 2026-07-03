@@ -1,4 +1,4 @@
-"""Tests for AGENT.md experience accumulation."""
+"""Tests for EXPERIENCE.md experience accumulation."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from __future__ import annotations
 def test_append_experience_uses_fault_spec_fault_type(tmp_path, monkeypatch):
     from chaos_agent.agent import experience
 
-    monkeypatch.setattr(experience, "AGENT_MD_PATH", tmp_path / "AGENT.md")
+    monkeypatch.setattr(experience, "EXPERIENCE_MD_PATH", tmp_path / "EXPERIENCE.md")
 
     result = experience.append_experience(
         "",
@@ -29,7 +29,7 @@ def test_append_experience_uses_fault_spec_fault_type(tmp_path, monkeypatch):
         },
     )
 
-    text = (tmp_path / "AGENT.md").read_text(encoding="utf-8")
+    text = (tmp_path / "EXPERIENCE.md").read_text(encoding="utf-8")
     assert result["status"] == "appended"
     assert result["category"] == "Fault Injection"
     assert "Issue with pod-network-loss" in text

@@ -102,6 +102,19 @@ class TaskStore:
 
     # -- read ----------------------------------------------------------------
 
+    async def update_task_state(self, task_id: str, task_state: str) -> None:
+        """Directly update ``task_state`` on a task **without** inference.
+
+        Unlike ``upsert``, this method writes the ``task_state`` column
+        as-is, bypassing ``infer_task_state``.  Used by the recover flow
+        to mark the ORIGINAL inject task as ``recovered`` /
+        ``partial_recovered`` / ``failed`` without overwriting its
+        ``operation``, ``result``, or ``verification`` fields.
+        """
+        if not task_id or task_id.startswith("turn-"):
+            return
+        await self._backend.upsert_task(task_id, ["task_state"], [task_state])
+
     async def get(self, task_id: str) -> Optional[dict]:
         """Return the full task data (tasks + task_details merged).
 
@@ -126,30 +139,28 @@ class TaskStore:
             rows = await self._backend.select_tasks_ordered(limit, offset)
         return [self._row_to_dict(r) for r in rows]
 
-    async def query_active(self, namespace: str = "", target_name: str = "") -> list[dict]:
+    async def query_active(self, namespace: str = "", target_name: str = "", tenant_id: str = "") -> list[dict]:
         """Return active tasks (``injecting`` / ``injected``) as
         ExperimentStore-compatible dicts.
 
         Filtering is done at the SQL level using the ``namespace`` /
-        ``target_name`` indexed columns (no Python-side JSON filtering).
+        ``target_name`` / ``tenant_id`` indexed columns (no Python-side
+        JSON filtering).
         """
-        rows = await self._backend.select_active_tasks(namespace, target_name)
+        rows = await self._backend.select_active_tasks(namespace, target_name, tenant_id)
         results = []
         for d in (self._row_to_dict(r) for r in rows):
             # Need target JSON from task_details for compatibility
-            detail = await self._backend.select_details(d["task_id"])
-            target = (detail or {}).get("target") or {}
-            if isinstance(target, str):
-                try:
-                    target = json.loads(target)
-                except (json.JSONDecodeError, TypeError):
-                    target = {}
+            detail = self._row_to_dict(await self._backend.select_details(d["task_id"]) or {})
+            target = detail.get("target") or {}
+            fault_type = self._compute_fault_type({**detail, **d})
             results.append({
                 "task_id": d["task_id"],
                 "operation": d.get("operation", "inject"),
                 "skill": d.get("skill_name", ""),
+                "fault_type": fault_type,
                 "target": target,
-                "params": (detail or {}).get("params") or {},
+                "params": detail.get("params") or {},
                 "blade_uid": d.get("blade_uid", ""),
                 "status": "success" if not d.get("error") else "failed",
                 "error": d.get("error"),
@@ -307,7 +318,7 @@ class TaskStore:
         from chaos_agent.agent.state import infer_status
         task_list = []
         for task in tasks:
-            detail = details_map.get(task["task_id"], {})
+            detail = self._row_to_dict(details_map.get(task["task_id"], {}))
             summary = {k: detail.get(k, 0) for k in (
                 "total_token_input", "total_token_output",
                 "total_llm_calls", "total_tool_calls", "total_duration_ms",
@@ -316,15 +327,8 @@ class TaskStore:
             _op = task.get("operation", "")
             _stage = task.get("stage", "injection")
 
-            # Fix: target is stored in task_details, not tasks table
-            target_raw = detail.get("target")
-            if isinstance(target_raw, str) and target_raw:
-                try:
-                    target = json.loads(target_raw)
-                except (json.JSONDecodeError, TypeError):
-                    target = None
-            else:
-                target = target_raw
+            target = detail.get("target")
+            fault_type = self._compute_fault_type({**detail, **task})
 
             # Merge failure_reason into error
             merged_error = detail.get("failure_reason") or task.get("error") or ""
@@ -347,6 +351,7 @@ class TaskStore:
                 "stage": _stage,
                 "status": infer_status(_stage, _ts, _op),
                 "phase": task.get("phase", "planning"),
+                "fault_type": fault_type,
                 "skill_name": task.get("skill_name", ""),
                 "blade_uid": task.get("blade_uid", ""),
                 "target": target,
@@ -498,20 +503,42 @@ class TaskStore:
 # ---------------------------------------------------------------------------
 
 _store: Optional[TaskStore] = None
+_store_key: str = ""  # "sqlite:<path>" or "postgresql:<dsn>"
+
+
+def _current_store_key() -> str:
+    """Return the cache key derived from current settings."""
+    backend_type = getattr(settings, "tasks_db_backend", "sqlite")
+    if backend_type == "postgresql":
+        dsn = getattr(settings, "tasks_pg_dsn", "")
+        return f"postgresql:{dsn}"
+    return f"sqlite:{settings.resolved_tasks_db_path}"
 
 
 async def get_task_store() -> TaskStore:
-    """Get or create the global async TaskStore instance.
+    """Get or create the TaskStore for the current backend configuration.
 
     Backend selection is driven by ``settings.tasks_db_backend``
-    (``"sqlite"`` or ``"postgresql"``).
+    (``"sqlite"`` or ``"postgresql"``).  If the configuration changes
+    (e.g. ``blade_ai_context(tasks_db_backend=\"postgresql\")``), the
+    cached store is closed and recreated so that reads and writes always
+    go to the same data source.
     """
-    global _store
-    if _store is not None:
+    global _store, _store_key
+
+    key = _current_store_key()
+    if _store is not None and _store_key == key:
         return _store
 
-    backend_type = getattr(settings, "tasks_db_backend", "sqlite")
+    # Backend changed (or first call) — close old store if any
+    if _store is not None:
+        try:
+            await _store._backend.close()
+        except Exception:
+            pass
+        _store = None
 
+    backend_type = getattr(settings, "tasks_db_backend", "sqlite")
     backend: StorageBackend
     try:
         if backend_type == "postgresql":
@@ -524,7 +551,6 @@ async def get_task_store() -> TaskStore:
             from chaos_agent.persistence.task_store_sqlite import SQLiteBackend
             backend = await SQLiteBackend.create(db_path=settings.resolved_tasks_db_path)
     except Exception:
-        # Backend created a connection but schema init failed — close to avoid leak
         try:
             await backend.close()  # type: ignore[possibly-undefined]
         except Exception:
@@ -532,18 +558,20 @@ async def get_task_store() -> TaskStore:
         raise
 
     _store = TaskStore(backend=backend)
+    _store_key = key
     return _store
 
 
 async def reset_task_store() -> None:
     """Close and reset the global TaskStore instance."""
-    global _store
+    global _store, _store_key
     if _store is not None:
         try:
             await _store._backend.close()
         except Exception:
             pass
     _store = None
+    _store_key = ""
 
 
 def _sync_close_store() -> None:
@@ -560,7 +588,6 @@ def _sync_close_store() -> None:
     global _store
     if _store is not None and _store._backend is not None:
         try:
-            # SQLite: close the underlying sqlite3 connection synchronously
             if hasattr(_store._backend, "_conn") and _store._backend._conn is not None:
                 raw_conn = getattr(_store._backend._conn, "_conn", None)
                 if raw_conn is not None:

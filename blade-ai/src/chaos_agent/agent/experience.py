@@ -1,6 +1,6 @@
-"""AGENT.md experience accumulation system.
+"""EXPERIENCE.md experience accumulation system.
 
-Provides load/append/truncate functions for ~/.blade-ai/AGENT.md,
+Provides load/append/truncate functions for ~/.blade-ai/EXPERIENCE.md,
 enabling the Agent to learn from past operations.
 
 Borrowed from Claude Code's CLAUDE.md and OpenClaw's context file budgeting.
@@ -12,40 +12,40 @@ from pathlib import Path
 
 from chaos_agent.agent.fault_spec import fault_type_from_state
 from chaos_agent.agent.operation_outcome import read_inject_verification, read_operation_outcome
-from chaos_agent.agent.prompts.constants import MAX_AGENT_MD_BYTES
+from chaos_agent.agent.prompts.constants import MAX_EXPERIENCE_MD_BYTES
 
-AGENT_MD_PATH = Path(os.path.expanduser("~/.blade-ai/AGENT.md"))
-MAX_AGENT_MD_LINES = 200
+EXPERIENCE_MD_PATH = Path(os.path.expanduser("~/.blade-ai/EXPERIENCE.md"))
+MAX_EXPERIENCE_MD_LINES = 200
 
 
 def load_agent_experience() -> str:
-    """Load ~/.blade-ai/AGENT.md if exists, with size budgeting.
+    """Load ~/.blade-ai/EXPERIENCE.md if exists, with size budgeting.
 
-    - If file exceeds MAX_AGENT_MD_BYTES, truncate preserving head (75%) and tail (25%)
+    - If file exceeds MAX_EXPERIENCE_MD_BYTES, truncate preserving head (75%) and tail (25%)
       (borrowed from OpenClaw's context file budgeting pattern)
     - Returns empty string if file doesn't exist (no warning for missing file)
     """
-    if not AGENT_MD_PATH.is_file():
+    if not EXPERIENCE_MD_PATH.is_file():
         return ""
 
     try:
-        content = AGENT_MD_PATH.read_text(encoding="utf-8").strip()
+        content = EXPERIENCE_MD_PATH.read_text(encoding="utf-8").strip()
     except Exception as exc:
-        warnings.warn(f"Failed to read AGENT.md: {exc}", RuntimeWarning, stacklevel=2)
+        warnings.warn(f"Failed to read EXPERIENCE.md: {exc}", RuntimeWarning, stacklevel=2)
         return ""
 
     if not content:
         return ""
 
     # Size budgeting
-    if len(content.encode("utf-8")) > MAX_AGENT_MD_BYTES:
+    if len(content.encode("utf-8")) > MAX_EXPERIENCE_MD_BYTES:
         content = _truncate_with_budget(content)
 
     lines = content.split("\n")
-    if len(lines) > MAX_AGENT_MD_LINES:
+    if len(lines) > MAX_EXPERIENCE_MD_LINES:
         # Keep head (75%) and tail (25%)
-        head_count = int(MAX_AGENT_MD_LINES * 0.75)
-        tail_count = MAX_AGENT_MD_LINES - head_count
+        head_count = int(MAX_EXPERIENCE_MD_LINES * 0.75)
+        tail_count = MAX_EXPERIENCE_MD_LINES - head_count
         content = "\n".join(lines[:head_count] + ["\n... (truncated) ...\n"] + lines[-tail_count:])
 
     return content
@@ -54,24 +54,24 @@ def load_agent_experience() -> str:
 def _truncate_with_budget(content: str) -> str:
     """Truncate content to fit byte budget, preserving head 75% and tail 25%."""
     encoded = content.encode("utf-8")
-    if len(encoded) <= MAX_AGENT_MD_BYTES:
+    if len(encoded) <= MAX_EXPERIENCE_MD_BYTES:
         return content
 
-    head_bytes = int(MAX_AGENT_MD_BYTES * 0.75)
-    tail_bytes = MAX_AGENT_MD_BYTES - head_bytes - 30  # 30 bytes for truncation marker
+    head_bytes = int(MAX_EXPERIENCE_MD_BYTES * 0.75)
+    tail_bytes = MAX_EXPERIENCE_MD_BYTES - head_bytes - 30  # 30 bytes for truncation marker
 
     head = encoded[:head_bytes].decode("utf-8", errors="ignore")
     tail = encoded[-tail_bytes:].decode("utf-8", errors="ignore")
     return head + "\n\n... (truncated for size budget) ...\n\n" + tail
 
 
-def ensure_agent_md_dir() -> None:
+def ensure_experience_md_dir() -> None:
     """Ensure ~/.blade-ai/ directory exists."""
-    AGENT_MD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    EXPERIENCE_MD_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def append_experience(task_summary: str, state: dict) -> dict:
-    """Append a learned experience to AGENT.md (called when self_evolution=True).
+    """Append a learned experience to EXPERIENCE.md (called when self_evolution=True).
 
     Uses LLM to extract a structured Rule+Why+How entry from the task outcome.
     Only appends if the task produced non-trivial learnings (failures, workarounds, etc.).
@@ -84,7 +84,7 @@ def append_experience(task_summary: str, state: dict) -> dict:
         dict with keys:
           - status: "appended" | "skipped" — whether an entry was written
           - reason: human-readable explanation for the status
-          - category: the AGENT.md section targeted (e.g. "Verification")
+          - category: the EXPERIENCE.md section targeted (e.g. "Verification")
           - entry_preview: first 120 chars of the appended entry (empty if skipped)
 
     Content filtering rules — only record:
@@ -138,11 +138,11 @@ def append_experience(task_summary: str, state: dict) -> dict:
         f"  How: {how_text}\n"
     )
 
-    # 4. 追加到 AGENT.md 对应分类下
-    ensure_agent_md_dir()
+    # 4. 追加到 EXPERIENCE.md 对应分类下
+    ensure_experience_md_dir()
 
-    if AGENT_MD_PATH.is_file():
-        content = AGENT_MD_PATH.read_text(encoding="utf-8")
+    if EXPERIENCE_MD_PATH.is_file():
+        content = EXPERIENCE_MD_PATH.read_text(encoding="utf-8")
     else:
         content = _default_agent_md_template()
 
@@ -163,10 +163,10 @@ def append_experience(task_summary: str, state: dict) -> dict:
         content = content.rstrip() + f"\n\n{category_header}\n{entry}"
 
     # 5. Check budget and truncate if needed
-    if len(content.encode("utf-8")) > MAX_AGENT_MD_BYTES:
+    if len(content.encode("utf-8")) > MAX_EXPERIENCE_MD_BYTES:
         content = _truncate_with_budget(content)
 
-    AGENT_MD_PATH.write_text(content, encoding="utf-8")
+    EXPERIENCE_MD_PATH.write_text(content, encoding="utf-8")
 
     return {
         "status": "appended",
@@ -177,7 +177,7 @@ def append_experience(task_summary: str, state: dict) -> dict:
 
 
 def _default_agent_md_template() -> str:
-    """Default template for a new AGENT.md file."""
+    """Default template for a new EXPERIENCE.md file."""
     return """# Blade AI Experience Log
 
 ## Safety Rules

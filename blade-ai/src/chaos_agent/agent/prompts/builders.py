@@ -85,7 +85,7 @@ def _enforce_prompt_budget(prompt: str, mode: PromptMode) -> str:
     """Truncate prompt if it exceeds the global character budget.
 
     Truncation priority (largest dynamic section first):
-    1. Experience section (AGENT.md content)
+    1. Experience section (EXPERIENCE.md content)
     2. Knowledge summary section
     3. Skill catalog (if excessively long)
     """

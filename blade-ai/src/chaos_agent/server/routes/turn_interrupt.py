@@ -6,6 +6,7 @@ import asyncio
 import json
 
 _CONFIRM_KEEPALIVE_INTERVAL_S = 25
+_KEEPALIVE_FRAME = ": keepalive\n\n"
 
 
 def extract_pending_interrupt(graph_state) -> tuple[str, dict] | None:
@@ -122,26 +123,33 @@ async def wait_for_confirmation(
     timeout: float,
     keepalive_interval: float = _CONFIRM_KEEPALIVE_INTERVAL_S,
 ):
-    """Wait for a user confirmation with periodic keepalive frames.
+    """Async generator: yields keepalive SSE comments in real-time,
+    then yields the user answer as the final frame.
 
-    Returns ``(answer, keepalive_frames)`` where *keepalive_frames* is a
-    list of ``": keepalive\\n\\n"`` strings emitted during the wait.
-    Raises ``ConfirmTimeout`` if the deadline expires.
+    Yields:
+        str: Either _KEEPALIVE_FRAME (SSE comment) or the user's answer (final).
+    Raises:
+        ConfirmTimeout: if deadline expires before user responds.
     """
     fut = store.register_interrupt(turn_id)
     deadline = asyncio.get_event_loop().time() + timeout
-    keepalives: list[str] = []
-    while True:
-        remaining = deadline - asyncio.get_event_loop().time()
-        if remaining <= 0:
+    try:
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise ConfirmTimeout(
+                    f"Confirmation timed out ({int(timeout // 60)} min)"
+                )
+            slice_s = min(keepalive_interval, remaining)
+            try:
+                answer = await asyncio.wait_for(
+                    asyncio.shield(fut), timeout=slice_s,
+                )
+                yield answer  # final frame: user's answer
+                return
+            except asyncio.TimeoutError:
+                yield _KEEPALIVE_FRAME  # real-time keepalive
+    finally:
+        # Unified cleanup: timeout / disconnect / normal completion
+        if not fut.done():
             store.cancel_interrupt(turn_id)
-            raise ConfirmTimeout(f"Confirmation timed out ({int(timeout // 60)} min)")
-        slice_s = min(keepalive_interval, remaining)
-        try:
-            answer = await asyncio.wait_for(
-                asyncio.shield(fut), timeout=slice_s,
-            )
-            return answer, keepalives
-        except asyncio.TimeoutError:
-            keepalives.append(": keepalive\n\n")
-            continue

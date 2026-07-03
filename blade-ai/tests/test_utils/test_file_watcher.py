@@ -1,8 +1,7 @@
 """Tests for the generic FileSystemWatcher (utils/file_watcher.py).
 
 These tests do NOT spin up real watchdog Observers. Instead they:
-1. Test the no-op paths (missing watchdog / missing path) by
-   monkey-patching the import / filesystem.
+1. Test the no-op path (missing directory) by pointing at a non-existent path.
 2. Test debounce + reload + filter + error-handling by directly
    exercising the public ``_schedule_reload`` / ``_reload`` plumbing.
 
@@ -45,32 +44,6 @@ def _make_spec(
 
 class TestStartNoOpPaths:
     """start() must be silent + safe when its preconditions don't hold."""
-
-    def test_missing_watchdog_logs_warning_and_no_ops(
-        self, tmp_path, caplog, monkeypatch,
-    ):
-        # Pretend watchdog isn't installed by stuffing a sentinel into
-        # sys.modules that raises ImportError on submodule access.
-        class _Blocker:
-            def __getattr__(self, name):
-                raise ImportError("simulated missing watchdog")
-
-        monkeypatch.setitem(sys.modules, "watchdog", _Blocker())
-        monkeypatch.setitem(sys.modules, "watchdog.observers", _Blocker())
-        monkeypatch.setitem(sys.modules, "watchdog.events", _Blocker())
-
-        spec = _make_spec(tmp_path, label="WD-Missing")
-        watcher = FileSystemWatcher(spec)
-        with caplog.at_level(logging.WARNING, logger="chaos_agent.utils.file_watcher"):
-            watcher.start()
-
-        assert watcher._observer is None
-        assert any(
-            "watchdog not installed" in r.message and "WD-Missing" in r.message
-            for r in caplog.records
-        )
-        # stop on a never-started watcher must not blow up
-        watcher.stop()
 
     def test_missing_path_logs_warning_and_no_ops(self, tmp_path, caplog):
         ghost = tmp_path / "does-not-exist"

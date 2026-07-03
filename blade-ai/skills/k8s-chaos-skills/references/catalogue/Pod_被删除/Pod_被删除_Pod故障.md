@@ -49,3 +49,30 @@
 **基准事实**：
 - **根因**：ChaosBlade `pod-pod delete` 直接删除目标 Pod（等同于 kubectl delete pod），Pod 被立即终止；在 timeout 时间窗口内，控制器每次重建的 Pod 都会被再次删除
 - **必现现象**：旧 Pod 名称消失，新 Pod 被创建（名称不同、AGE 极短）；Events 中有 Killing 事件；timeout 窗口内 Pod 反复重建-删除；Service Endpoints 短暂波动
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效 Pod 删除注入。
+
+前提条件：无特殊要求，仅需 kubectl 可访问集群
+
+注入命令：
+```bash
+# 单次删除 Pod：
+kubectl delete pod <pod-name> -n <namespace>
+# 持续删除（模拟 ChaosBlade timeout 窗口内反复删除）：
+while true; do kubectl delete pod -l <label-selector> -n <namespace> --wait=false; sleep 5; done
+```
+
+恢复命令：
+```bash
+# 单次删除无需恢复，控制器自动重建 Pod
+# 持续删除循环：Ctrl+C 终止循环即可，控制器会自动重建 Pod
+```
+
+注意事项：
+- 单次 `kubectl delete pod` 与 ChaosBlade 单次删除效果完全等价
+- 持续删除需配合 shell 循环，无自动超时停止机制
+- 确保目标 Pod 由 Deployment/ReplicaSet 管理，否则删除后不会自动重建

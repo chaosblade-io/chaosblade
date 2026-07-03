@@ -116,8 +116,9 @@ def save_postmortem(
     contained even when shared out of context.
 
     ``header_meta`` (optional) populates the metadata line. Recognised
-    keys: skill_name, namespace, status, duration, generated_at. Missing
-    keys collapse silently — header just omits the unknown bits.
+    keys: fault_type (preferred), skill_name (legacy), namespace, status,
+    duration, generated_at. Missing keys collapse silently — header just
+    omits the unknown bits.
     """
     path = _path_for(task_id, root)
     # R1 — directory locked down to owner-only.
@@ -131,7 +132,7 @@ def save_postmortem(
         pass  # best-effort; failure on shared FS is non-fatal
 
     meta = header_meta or {}
-    skill = meta.get("skill_name", "") or "unknown"
+    skill = meta.get("fault_type") or meta.get("skill_name", "") or "unknown"
     namespace = meta.get("namespace", "") or "unknown"
     status = meta.get("status", "") or "unknown"
     duration = meta.get("duration", "") or "unknown"

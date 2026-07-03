@@ -191,13 +191,13 @@ jobs:
             target: darwin_amd64
             node_arch: darwin-x64
             node_ext: tar.gz
-            runner: macos-latest
+            runner: macos-15
           - os: darwin
             arch: arm64
             target: darwin_arm64
             node_arch: darwin-arm64
             node_ext: tar.gz
-            runner: macos-latest
+            runner: macos-15
 
     runs-on: ${{ matrix.runner }}
     steps:

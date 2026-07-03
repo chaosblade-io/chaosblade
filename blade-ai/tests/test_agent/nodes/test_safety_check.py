@@ -75,8 +75,14 @@ class TestSafetyCheck:
         state["target"] = {"namespace": "default"}
 
         result = await safety_check(state)
-        assert result["safety_status"] == "rejected"
-        assert "no skill" in result["safety_reason"].lower()
+        assert result["safety_status"] == "retry"
+        assert "skill" in result["safety_reason"].lower()
+        # Verify a HumanMessage was appended for LLM feedback
+        msgs = result.get("messages", [])
+        assert msgs
+        last_msg = msgs[-1]
+        assert hasattr(last_msg, "content")
+        assert "activate_skill" in last_msg.content
 
     @pytest.mark.asyncio
     async def test_skill_name_none(self, sample_agent_state):
@@ -85,7 +91,7 @@ class TestSafetyCheck:
         state["target"] = {"namespace": "default"}
 
         result = await safety_check(state)
-        assert result["safety_status"] == "rejected"
+        assert result["safety_status"] == "retry"
 
     @pytest.mark.asyncio
     async def test_no_target(self, sample_agent_state):
@@ -127,6 +133,8 @@ class TestSafetyCheck:
         state["target"] = None
 
         result = await safety_check(state)
+        # no_skill is now recoverable (retry), checked before no_target
+        assert result["safety_status"] == "retry"
         assert "skill" in result["safety_reason"].lower()
 
     @pytest.mark.asyncio

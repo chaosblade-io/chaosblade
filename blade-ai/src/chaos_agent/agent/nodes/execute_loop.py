@@ -84,6 +84,47 @@ def _parse_blade_uid_from_content(content) -> str | None:
     return extract_blade_uid(content)
 
 
+def _parse_uid_from_status_content(content) -> str | None:
+    """Extract experiment UID from blade_status or blade_query_k8s output.
+
+    blade_status / blade_query_k8s return:
+        {"code":200,"success":true,"result":{"uid":"<hex>","phase":"Running",...}}
+
+    Unlike blade_create (where ``result`` is a string UID), these tools
+    return ``result`` as a **dict** containing a ``uid`` field. The
+    standard ``extract_blade_uid`` does not handle this case because its
+    strategy 1 only accepts string results, and its regex strategy expects
+    UUID format (8-4-4-4-12) while ChaosBlade UIDs are short hex strings.
+    """
+    if not isinstance(content, str) or not content:
+        return None
+
+    # First try the standard extractor (handles blade_create format
+    # where result is a string, and chaosblade-<hex> resource names)
+    uid = extract_blade_uid(content)
+    if uid:
+        return uid
+
+    # Handle blade_status/blade_query_k8s format where result is a dict
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    # ChaosBlade success response with dict result
+    if data.get("success") is True and data.get("code") == 200:
+        result = data.get("result")
+        if isinstance(result, dict):
+            uid = result.get("uid")
+            if isinstance(uid, str) and uid:
+                return uid
+
+    return None
+
+
 def _extract_blade_uid_from_messages(messages: list) -> str | None:
     """Scan messages for blade_create or kubectl exec blade output and extract uid.
 
@@ -95,13 +136,19 @@ def _extract_blade_uid_from_messages(messages: list) -> str | None:
     In that case, the ChaosBlade success JSON appears in a kubectl
     ToolMessage instead of a blade_create ToolMessage.
 
-    Priority: blade_create result > kubectl exec blade result.
+    When blade_create times out but the experiment was actually created,
+    the LLM may call blade_status / blade_query_k8s to discover the UID.
+    In that case, the UID appears inside a dict ``result`` field.
+
+    Priority: blade_create result > kubectl exec blade result >
+              blade_status / blade_query_k8s result.
     Only kubectl exec calls whose v_args contain "blade create" are
     considered — other kubectl outputs (get -o json, describe, etc.)
     are NOT scanned to prevent false-positive extraction from K8s
     resource metadata.uid fields.
     """
     kubectl_uid = None  # fallback uid from kubectl exec
+    status_uid = None   # fallback uid from blade_status / blade_query_k8s
 
     # Build a set of tool_call_ids that correspond to "kubectl exec ... blade create"
     blade_exec_call_ids: set[str] = set()
@@ -116,6 +163,14 @@ def _extract_blade_uid_from_messages(messages: list) -> str | None:
                 v_args = args.get("v_args", "")
                 if "blade" in v_args and "create" in v_args:
                     blade_exec_call_ids.add(tc_id)
+
+    # Check if blade_create was attempted (even if it failed/timed out).
+    # blade_status UID extraction is only relevant when blade_create was
+    # called — otherwise the status check might pick up unrelated experiments.
+    _has_blade_create = any(
+        isinstance(msg, ToolMessage) and getattr(msg, "name", "") == "blade_create"
+        for msg in messages
+    )
 
     for msg in reversed(messages):
         if not isinstance(msg, ToolMessage):
@@ -135,7 +190,14 @@ def _extract_blade_uid_from_messages(messages: list) -> str | None:
             if tool_call_id in blade_exec_call_ids:
                 kubectl_uid = _parse_blade_uid_from_content(content)
 
-    return kubectl_uid
+        # Priority 3: blade_status / blade_query_k8s ToolMessage
+        # Relevant when blade_create timed out but experiment was created.
+        if msg_name in ("blade_status", "blade_query_k8s") and not status_uid:
+            if _has_blade_create:
+                status_uid = _parse_uid_from_status_content(content)
+
+    # Return by priority: blade_create > kubectl exec > blade_status
+    return kubectl_uid or status_uid
 
 
 # Regex for: blade create k8s <scope>-<target> <action>

@@ -164,6 +164,17 @@ def test_legacy_target_and_params_are_compatibility_only():
         }
 
 
+def test_legacy_fault_type_is_recover_boundary_compatibility_only():
+    contract = STATE_FIELD_CONTRACTS["fault_type"]
+
+    assert contract.source_of_truth == "fault_spec"
+    assert set(contract.direct_read_paths) == {
+        "src/chaos_agent/agent/fault_spec.py",
+        "src/chaos_agent/agent/recovery_state.py",
+        "src/chaos_agent/agent/task_snapshot.py",
+    }
+
+
 def test_operation_outcome_fields_are_helper_owned():
     """Outcome fields should be consumed through OperationOutcome."""
 

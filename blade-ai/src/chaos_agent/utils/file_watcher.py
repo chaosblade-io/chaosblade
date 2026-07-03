@@ -2,10 +2,6 @@
 
 One ``FileSystemWatcher`` instance + one ``WatchSpec`` = one watch target.
 Used by skill / knowledge hot-reload subsystems.
-
-watchdog is the only optional dependency: if it's not installed the watcher
-becomes a no-op (start logs a warning, stop is harmless). This keeps
-hot-reload from being a hard requirement for minimal-install CI.
 """
 from __future__ import annotations
 
@@ -14,6 +10,9 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
+
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +62,7 @@ class FileSystemWatcher:
         self._lock = threading.Lock()
 
     def start(self) -> None:
-        """Begin watching. No-op + warning if watchdog is unavailable or
-        the target directory does not exist."""
-        try:
-            from watchdog.observers import Observer
-            from watchdog.events import FileSystemEventHandler
-        except ImportError:
-            logger.warning(
-                "watchdog not installed, %s hot-reload disabled",
-                self.spec.label,
-            )
-            return
-
+        """Begin watching. No-op + warning if the target directory does not exist."""
         if not self.spec.path.is_dir():
             logger.warning(
                 "%s watch path does not exist or is not a directory: %s",

@@ -28,7 +28,15 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import tool as lc_tool
 from pydantic import BeforeValidator
 
-from chaos_agent.agent.fault_spec import FaultSpec, read_fault_spec
+from chaos_agent.agent.fault_spec import (
+    INTENT_ACTION_DESCRIPTION,
+    INTENT_ACTIONS,
+    INTENT_SCOPES,
+    INTENT_TARGET_DESCRIPTION,
+    INTENT_TARGETS,
+    FaultSpec,
+    read_fault_spec,
+)
 from chaos_agent.agent.nodes.llm_step_helpers import (
     build_stagnation_hint,
     filter_stagnant_tool,
@@ -322,7 +330,7 @@ def submit_fault_intent(
     scope: str,
     target: str,
     action: str,
-    namespace: str = "default",
+    namespace: str = "",
     names: Annotated[Optional[list[str]], BeforeValidator(_validate_names)] = None,
     labels: Annotated[Optional[dict[str, str]], BeforeValidator(_validate_labels)] = None,
     params: Annotated[Optional[dict[str, str]], BeforeValidator(_validate_params)] = None,
@@ -352,20 +360,15 @@ def submit_fault_intent(
                     ``"node-cpu-fullload"`` / ``"pod-network-drop"`` /
                     ``"pod-finalizer-patch"``. Acts as the human-readable
                     label on the confirm card. Required.
-        scope: K8s resource family the fault attaches to. Common values:
-               ``"pod"``, ``"node"``, ``"container"``, ``"deployment"``.
-               Required.
-        target: Subsystem under attack. Common values: ``"cpu"`` /
-                ``"mem"`` / ``"network"`` / ``"disk"`` / ``"process"`` /
-                ``"finalizer"`` / ``"replicas"`` / ``"schedule"`` / ``"pvc"``.
+        scope: K8s resource family the fault attaches to. Required.
+        target: Subsystem under attack (NOT a resource instance name).
                 Required.
-        action: Concrete fault action. Common values: ``"fullload"`` /
-                ``"load"`` / ``"drop"`` / ``"fill"`` / ``"kill"`` /
-                ``"scale"`` / ``"patch"`` / ``"cordon"`` / ``"taint"`` /
-                ``"delete"`` / ``"drain"``. Required.
-        namespace: K8s namespace. Defaults to ``"default"`` — node-scope
-                   faults conventionally use ``"default"`` and the user
-                   rarely says so explicitly.
+        action: Concrete fault action verb. Required.
+        namespace: K8s namespace. Leave empty when the user didn't specify
+                   one — the system will extract it from dialogue context
+                   or default to ``"default"`` for node-scope faults. Do NOT
+                   rely on this default for pod/deployment scope; always pass
+                   the user-specified namespace explicitly.
         names: Specific resource names (pods/nodes). Pass when the user
                named a target.
         labels: Label selector dict like ``{"app": "nginx"}``.
@@ -385,6 +388,22 @@ def submit_fault_intent(
         Acknowledgment string consumed by the dialogue gateway.
     """
     return "✓ 故障注入意图已提交，正在进入执行确认阶段。"
+
+
+# ---------------------------------------------------------------------------
+# Patch tool description with canonical values from fault_spec.INTENT_*
+# so TUI/CLI/SDK all reference the SAME schema definitions.
+# ---------------------------------------------------------------------------
+submit_fault_intent.description = (
+    submit_fault_intent.description
+    + "\n\n    Valid scope values: "
+    + ", ".join(f'"{s}"' for s in INTENT_SCOPES)
+    + ".\n    Valid target values: "
+    + ", ".join(f'"{t}"' for t in INTENT_TARGETS)
+    + ".\n    Valid action values: "
+    + ", ".join(f'"{a}"' for a in INTENT_ACTIONS)
+    + "."
+)
 
 
 @lc_tool
@@ -482,9 +501,12 @@ async def query_active_experiments() -> str:
     and namespace. Use the task_id from the results when calling
     recover_task(task_id="task-xxx").
     """
+    from chaos_agent.config.settings import settings
     from chaos_agent.persistence.task_store import get_task_store
     store = await get_task_store()
-    active = await store.query_active()
+    # 多租户隔离：仅查询当前租户的活跃实验
+    tenant_id = getattr(settings, "tenant_id", "") or ""
+    active = await store.query_active(tenant_id=tenant_id)
     if not active:
         return "当前没有活跃的故障注入实验，无需恢复。"
     lines = [f"当前有 {len(active)} 个可恢复的活跃实验:"]

@@ -299,12 +299,14 @@ class TestQueryActive:
             "blade_action": "loss",
             "params": {"percent": "100"},
         }
-        await store.upsert("t1", fault_spec=fault_spec, skill_name="pod-network-loss")
+        await store.upsert("t1", fault_spec=fault_spec, skill_name="stale-active-skill")
 
         active = await store.query_active(namespace="prod", target_name="pod1")
 
         assert len(active) == 1
         assert active[0]["task_id"] == "t1"
+        assert active[0]["fault_type"] == "pod-network-loss"
+        assert active[0]["skill"] == "stale-active-skill"
 
     @pytest.mark.asyncio
     async def test_compatible_format(self, store):
@@ -314,6 +316,7 @@ class TestQueryActive:
         assert "task_id" in record
         assert "operation" in record
         assert "skill" in record
+        assert "fault_type" in record
         assert "target" in record
         assert "params" in record
         assert "blade_uid" in record
@@ -493,6 +496,29 @@ class TestMetricMethods:
             assert "inject_status" not in task
             assert "recover_status" not in task
             assert "status" in task
+            assert "fault_type" in task
+
+    @pytest.mark.asyncio
+    async def test_get_all_metrics_fault_type_prefers_fault_spec(self, store):
+        fault_spec = {
+            "namespace": "default",
+            "scope": "pod",
+            "names": ["pod-a"],
+            "labels": {},
+            "blade_target": "network",
+            "blade_action": "loss",
+            "params": {"percent": "100"},
+        }
+        await store.upsert(
+            "t1",
+            skill_name="stale-active-skill",
+            fault_spec=fault_spec,
+        )
+
+        result = await store.get_all_metrics()
+
+        assert result["tasks"][0]["fault_type"] == "pod-network-loss"
+        assert result["tasks"][0]["skill_name"] == "stale-active-skill"
 
     @pytest.mark.asyncio
     async def test_get_all_metrics_with_state_filter(self, store):

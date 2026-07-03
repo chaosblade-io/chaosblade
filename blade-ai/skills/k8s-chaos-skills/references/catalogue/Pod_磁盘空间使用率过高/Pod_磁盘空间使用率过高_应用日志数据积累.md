@@ -35,3 +35,27 @@
 - **必现现象**：Pod 磁盘使用率超过设定阈值，应用出现写入失败
 
 ---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效磁盘填充。
+
+前提条件：容器内需有 `fallocate` 或 `dd` 工具
+
+注入命令：
+```bash
+# 使用 fallocate 快速填充磁盘
+kubectl exec <pod-name> -n <namespace> -- fallocate -l <size>G <目标目录>/fill_file
+# 或使用 dd：
+kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=<目标目录>/fill_file bs=1M count=<MB>
+```
+
+恢复命令：
+```bash
+kubectl exec <pod-name> -n <namespace> -- rm -f <目标目录>/fill_file
+```
+
+注意事项：
+- `fallocate` 分配速度快（仅分配元数据），`dd` 实际写入数据速度较慢但更真实
+- 无自动超时恢复机制，必须手动删除填充文件
+- 需计算填充大小以确保磁盘使用率达到预期值（先用 `df -h` 查看剩余空间）

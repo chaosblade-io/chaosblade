@@ -11,6 +11,7 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
+from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ async def reject(state: AgentState) -> dict:
         {"reason": reason},
     )
     tracker.fail(f"Rejected: {error_val}")
+    await dispatch_node_message("reject", f"Rejected: {error_val}")
 
     # Trust upstream-set failure_detail if present; otherwise infer as fallback.
     if outcome.failure_detail:

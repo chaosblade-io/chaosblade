@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import os
+import signal
 import time
+from pathlib import Path
 from typing import Optional
 
 from chaos_agent.config.settings import settings
@@ -17,6 +20,20 @@ from chaos_agent.observability.status_tracker import (
 from chaos_agent.tools.guard import CommandResult, ToolGuard
 
 logger = logging.getLogger(__name__)
+
+# Max output limit for communicate() — prevents runaway memory on huge output.
+# Not currently enforced (communicate reads until EOF), but kept as reference
+# for future output-capping if needed.
+_MAX_PIPE_READ = 1024 * 1024  # 1 MB
+
+
+def _kill_process_group(pgid: int) -> None:
+    """Kill an entire process group. No-op if group already exited."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
 
 # Module-level ToolGuard instance
 _tool_guard: Optional[ToolGuard] = None
@@ -111,8 +128,11 @@ async def run_command(
     # start()/complete()/fail() to avoid polluting the parent node's
     # _current_source and _start_time.  run_command is a sub-step — it
     # should not override the caller's tracker context.)
-    cmd_str = " ".join(cmd)
-    source_name = source or (cmd[0] if cmd else "unknown")
+    # Use bare binary name for display; absolute paths leak implementation
+    # detail (e.g. bundled blade path) and clutter logs/status events.
+    display_cmd = ([Path(cmd[0]).name] + cmd[1:]) if cmd else cmd
+    cmd_str = " ".join(display_cmd)
+    source_name = source or (Path(cmd[0]).name if cmd else "unknown")
     tracker = get_tracker(task_id) if task_id else None
     if tracker:
         tracker.emit(StatusEvent(
@@ -127,29 +147,66 @@ async def run_command(
     cmd_timeout = timeout or settings.timeout_default
     start_time = time.monotonic()
 
+    proc = None
+    reap_task = None
     try:
-        import os
+        from chaos_agent.utils.blade_paths import resolve_exec_path
+
         sub_env = None
         if env_override:
             sub_env = {**os.environ, **env_override}
+
+        # Resolve cmd[0] to absolute path so that subprocess.Popen uses
+        # posix_spawn instead of fork() on Linux — fork() triggers APM
+        # native pthread_atfork callbacks (uniagent) which crash the worker.
+        exec_cmd = ([resolve_exec_path(cmd[0])] + cmd[1:]) if cmd else cmd
+
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *exec_cmd,
             stdin=asyncio.subprocess.PIPE if stdin_data else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=sub_env,
+            start_new_session=True,  # setsid(): new session+process group for killpg cleanup (uvloop rejects process_group kwarg)
         )
+
+        # Background reaper: once the main process exits, kill its entire
+        # process group. This reaps children (e.g. ChaosBlade's background
+        # "sleep N; blade destroy" timer) whose inherited pipe FDs would
+        # prevent communicate() from seeing EOF.
+        async def _reap_children_on_exit():
+            await proc.wait()
+            _kill_process_group(proc.pid)
+
+        reap_task = asyncio.ensure_future(_reap_children_on_exit())
+
+        # Use communicate() for pipe reading — it correctly handles the
+        # pipe/process lifecycle in uvloop. The manual pattern (read tasks
+        # + proc.wait + kill_process_group + drain) loses pipe data under
+        # uvloop because uvloop may close pipe transports on process exit
+        # before StreamReader can consume buffered data.
+        #
+        # The reap_task above ensures that once blade exits, any timer
+        # children holding the pipe are killed immediately, so
+        # communicate() gets EOF without waiting for cmd_timeout.
+        input_bytes = stdin_data.encode("utf-8") if stdin_data else None
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(
-                input=stdin_data.encode("utf-8") if stdin_data else None,
-            ),
+            proc.communicate(input=input_bytes),
             timeout=cmd_timeout,
         )
+
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        # Kill entire process group (main process + children)
+        if proc:
+            _kill_process_group(proc.pid)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await proc.wait()
+            except Exception:
+                pass
         if tracker:
             tracker.emit(StatusEvent(
                 task_id=tracker.task_id,
@@ -170,8 +227,11 @@ async def run_command(
             stderr=f"Command timed out after {cmd_timeout}s",
         )
         raise ToolTimeoutError(
-            f"Command timed out after {cmd_timeout}s: {' '.join(cmd)}"
+            f"Command timed out after {cmd_timeout}s: {cmd_str}"
         )
+    finally:
+        if reap_task and not reap_task.done():
+            reap_task.cancel()
 
     duration_ms = (time.monotonic() - start_time) * 1000
     stdout = stdout_bytes.decode("utf-8", errors="replace")

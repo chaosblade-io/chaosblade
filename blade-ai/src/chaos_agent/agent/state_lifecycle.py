@@ -162,6 +162,7 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("pipeline_attempts_history", "loop_control", batch=None, recover=None),
     _p("replan_requested", "loop_control", batch=False, recover=False),
     _p("replan_count", "loop_control", batch=0, recover=0),
+    _p("verify_replan_count", "loop_control", batch=0, recover=0),
     _p("replan_context", "loop_control", batch=None, recover=None),
     _p("replan_history", "loop_control", batch=None, recover=None),
     _p("_replan_loop_reset", "loop_control", batch=None, recover=None),

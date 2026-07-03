@@ -9,6 +9,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from chaos_agent.agent.fault_spec import (
+    INTENT_ACTION_DESCRIPTION,
+    INTENT_SCOPES,
+    INTENT_TARGET_DESCRIPTION,
+)
 
 @dataclass
 class L4TestTask:
@@ -112,7 +117,8 @@ class ClarifyResult:
     fault_intent:
         当前累计的故障意图字典（可能尚未完全收敛）。
     confirmed_intent:
-        ``"inject"`` 表示用户已批准开打；``"discuss"`` 表示对话继续；
+        ``"inject"`` 表示用户已批准开打；``"recover"`` 表示恢复意图已确认；
+        ``"discuss"`` 表示对话继续；
         ``None`` 表示尚未到 intent_confirm 节点（仍在 clarification 多轮）。
     pending_card:
         若图驱动到 ``intent_confirm`` interrupt，会带回 ``PendingCard``；
@@ -121,6 +127,9 @@ class ClarifyResult:
         本轮 clarify 中所有 LLM 调用的 token 消耗汇总。
         格式: ``{"prompt_tokens": int, "completion_tokens": int,
         "total_tokens": int}``。无数据时为 ``None``。
+    recover_task_id:
+        当 ``confirmed_intent == "recover"`` 时携带目标注入任务 ID，
+        供平台直接调用 ``run_chaos_recover(inject_task_id=...)``。
     """
 
     thread_id: str
@@ -129,6 +138,7 @@ class ClarifyResult:
     confirmed_intent: str | None = None
     pending_card: "PendingCard | None" = None
     token_usage: dict | None = None
+    recover_task_id: str = ""
 
 
 @dataclass
@@ -149,9 +159,8 @@ class StepResult:
 
 # JSON Schema for TestTask.payload (AgentCard.input_schema).
 #
-# Single canonical shape: payload.fault_intent, matching
-# FaultSpec.to_intent_dict() produced by the platform's
-# run_chaos_inject tool.
+# Valid values come from fault_spec.INTENT_* — the single source of truth
+# shared by TUI (submit_fault_intent), CLI, and SDK paths.
 _FAULT_INTENT_SCHEMA: dict = {
     "type": "object",
     "description": (
@@ -160,14 +169,17 @@ _FAULT_INTENT_SCHEMA: dict = {
     ),
     "required": ["scope", "target", "action", "namespace"],
     "properties": {
-        "scope": {"type": "string", "enum": ["pod", "node", "container"]},
+        "scope": {
+            "type": "string",
+            "enum": list(INTENT_SCOPES),
+        },
         "target": {
             "type": "string",
-            "description": "cpu|mem|network|disk|process",
+            "description": INTENT_TARGET_DESCRIPTION,
         },
         "action": {
             "type": "string",
-            "description": "fullload|load|delay|loss|fill|kill|burn",
+            "description": INTENT_ACTION_DESCRIPTION,
         },
         "namespace": {"type": "string"},
         "names": {"type": "array", "items": {"type": "string"}},

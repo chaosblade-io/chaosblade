@@ -31,3 +31,31 @@
 **基准事实**：
 - **根因**：容器 limits.cpu 设置过低，实际 CPU 需求超过 limit，内核对容器 CPU 时间片进行 throttle，导致应用性能下降
 - **必现现象**：cpu.stat 中 nr_throttled 持续增长；应用延迟飙升；CPU 使用率接近 limits 上限
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效 CPU 负载注入。
+
+前提条件：容器内需有 `stress-ng` 工具，或可使用 shell 循环作为替代
+
+注入命令：
+```bash
+# 使用 stress-ng 注入 CPU 压力
+kubectl exec <pod-name> -n <namespace> -- stress-ng --cpu 0 --cpu-load <percent> --timeout <duration>s
+# 如果容器无 stress-ng，使用 shell 循环：
+kubectl exec <pod-name> -n <namespace> -- sh -c 'while true; do :; done &'
+```
+
+恢复命令：
+```bash
+kubectl exec <pod-name> -n <namespace> -- pkill -f stress-ng
+# 或 kill shell 循环：
+kubectl exec <pod-name> -n <namespace> -- pkill -f 'while true'
+```
+
+注意事项：
+- shell 循环方式只能打满单核，无法精确控制 CPU 使用百分比
+- stress-ng 方式需容器镜像中预装该工具，精度优于 shell 循环但仍不如 ChaosBlade 的 cgroup 级控制
+- 无自动超时恢复机制，需手动 kill 进程

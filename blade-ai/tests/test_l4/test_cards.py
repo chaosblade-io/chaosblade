@@ -61,6 +61,7 @@ class TestPlanConfirmAdapter:
         assert "request_modify" not in card.decision_options
         assert card.decision_options == ["approved", "rejected"]
         assert card.details["skill_name"] == "cpu-fullload-by-pod"
+        assert card.details["fault_type"] == "cpu-fullload"
         assert card.details["safety_status"] == "safe"
 
 

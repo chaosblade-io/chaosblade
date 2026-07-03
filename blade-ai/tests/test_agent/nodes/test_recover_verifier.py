@@ -71,6 +71,13 @@ class TestRecoverLayer1Result:
         assert not RecoverLayer1Result(status="passed").is_terminal()
         assert not RecoverLayer1Result(status="unknown").is_terminal()
 
+    def test_is_in_progress(self):
+        assert RecoverLayer1Result(status="in_progress").is_in_progress()
+        assert not RecoverLayer1Result(status="passed").is_in_progress()
+        assert not RecoverLayer1Result(status="unknown").is_in_progress()
+        # IN_PROGRESS is NOT terminal — Layer 1 is still running
+        assert not RecoverLayer1Result(status="in_progress").is_terminal()
+
 
 # ---------------------------------------------------------------------------
 # _parse_blade_destroy_output
@@ -2456,3 +2463,212 @@ class TestBuildRecoverVerifierSystemPrompt:
         assert "recovered" in prompt
         assert "unrecovered" in prompt
         assert "partial" in prompt
+
+
+# ---------------------------------------------------------------------------
+# finalize_recover_verification: IN_PROGRESS defense-in-depth
+# ---------------------------------------------------------------------------
+
+class TestFinalizeInProgressDefense:
+    """Tests for the defense-in-depth handling of ``in_progress`` cache.
+
+    After the root-cause fix (Layer 1 filters out submit_recover_verification),
+    the cache should never be ``in_progress`` when finalize runs.  But if it
+    does happen (e.g. routing bug), finalize should default to ``unknown``
+    instead of crashing with a Pydantic ValidationError.
+    """
+
+    @pytest.mark.asyncio
+    async def test_in_progress_cache_defaults_to_unknown(self):
+        """When cache is in_progress, finalize should default to unknown,
+        not crash with ValidationError."""
+        from chaos_agent.agent.nodes._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+
+        # Simulate: Layer 1 cache is in_progress (should not happen after fix,
+        # but defense-in-depth must handle it).
+        submit_msg = AIMessage(
+            content="Some recovery text without RECOVERY_EXECUTION_RESULT",
+            tool_calls=[{
+                "name": SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+                "args": {
+                    "overall": "recovered",
+                    "layer2_status": "passed",
+                    "layer2_details": "Pod is no longer stuck",
+                },
+                "id": "tc_submit",
+                "type": "tool_call",
+            }],
+        )
+        tool_msg = ToolMessage(
+            content="Recovery verdict recorded.",
+            tool_call_id="tc_submit",
+            name=SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+        )
+
+        state = {
+            "task_id": "task-test",
+            "blade_uid": "",
+            "skill_name": "pod-terminating",
+            "kubeconfig": "",
+            "verifier_loop_count": 3,
+            "messages": [submit_msg, tool_msg],
+            "recover_layer1_cache": {
+                "status": "in_progress",
+                "details": "",
+                "raw_output": "",
+                "system_prompt": "test prompt",
+            },
+            "recover_layer2_first": False,
+            "layer2_context_added": True,
+        }
+
+        fin = await _drive_finalize(state, {})
+
+        # finalize should succeed (no ValidationError)
+        assert "recover_verification" in fin
+        # Layer 1 should be unknown (defense-in-depth), not in_progress
+        assert fin["recover_verification"]["layer1"]["status"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# finalize_recover_verification: mark original inject task as recovered
+# ---------------------------------------------------------------------------
+
+class TestFinalizeMarksInjectTask:
+    """Tests that finalize_recover_verification marks the ORIGINAL inject task
+    (recover_task_id) as recovered in the TaskStore, so it disappears from
+    query_active_experiments.
+    """
+
+    @pytest.mark.asyncio
+    async def test_marks_inject_task_recovered_on_success(self):
+        """On successful recovery, the original inject task should be updated
+        with operation='recover' and recover_verification so infer_task_state
+        returns 'recovered'."""
+        from chaos_agent.agent.nodes._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+
+        submit_msg = AIMessage(
+            content="Recovery verified.",
+            tool_calls=[{
+                "name": SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+                "args": {
+                    "overall": "recovered",
+                    "layer2_status": "passed",
+                    "layer2_details": "All clear",
+                },
+                "id": "tc_submit",
+                "type": "tool_call",
+            }],
+        )
+        tool_msg = ToolMessage(
+            content="Recovery verdict recorded.",
+            tool_call_id="tc_submit",
+            name=SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+        )
+
+        inject_task_id = "task-inject-aaa"
+        recover_task_id = "task-recover-bbb"
+
+        state = {
+            "task_id": recover_task_id,
+            "recover_task_id": inject_task_id,
+            "blade_uid": "uid-123",
+            "skill_name": "pod-cpu-fullload",
+            "kubeconfig": "",
+            "verifier_loop_count": 3,
+            "messages": [submit_msg, tool_msg],
+            "recover_layer1_cache": {
+                "status": "passed",
+                "details": "blade_destroy succeeded",
+                "raw_output": "success",
+                "system_prompt": "test",
+            },
+            "recover_layer2_first": False,
+            "layer2_context_added": True,
+        }
+
+        upsert_calls = []
+        update_state_calls = []
+
+        class _FakeStore:
+            async def upsert(self, task_id, **fields):
+                upsert_calls.append((task_id, fields))
+
+            async def update_task_state(self, task_id, task_state):
+                update_state_calls.append((task_id, task_state))
+
+        with patch(
+            "chaos_agent.persistence.task_store.get_task_store",
+            new_callable=AsyncMock,
+            return_value=_FakeStore(),
+        ):
+            fin = await _drive_finalize(state, {})
+
+        # The original inject task should be marked via update_task_state
+        inject_updates = [c for c in update_state_calls if c[0] == inject_task_id]
+        assert len(inject_updates) == 1, f"Expected 1 update_task_state for inject task, got {len(inject_updates)}"
+        assert inject_updates[0][1] == "recovered"
+
+    @pytest.mark.asyncio
+    async def test_no_inject_task_update_when_recover_task_id_missing(self):
+        """When recover_task_id is not set (e.g. direct API call without
+        intent_clarification), finalize should not crash."""
+        from chaos_agent.agent.nodes._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+
+        submit_msg = AIMessage(
+            content="Recovery verified.",
+            tool_calls=[{
+                "name": SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+                "args": {
+                    "overall": "recovered",
+                    "layer2_status": "passed",
+                    "layer2_details": "All clear",
+                },
+                "id": "tc_submit",
+                "type": "tool_call",
+            }],
+        )
+        tool_msg = ToolMessage(
+            content="Recovery verdict recorded.",
+            tool_call_id="tc_submit",
+            name=SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+        )
+
+        recover_task_id = "task-recover-bbb"
+        state = {
+            "task_id": recover_task_id,
+            # NO recover_task_id — simulate direct API recover
+            "blade_uid": "uid-123",
+            "skill_name": "pod-cpu-fullload",
+            "kubeconfig": "",
+            "verifier_loop_count": 3,
+            "messages": [submit_msg, tool_msg],
+            "recover_layer1_cache": {
+                "status": "passed",
+                "details": "blade_destroy succeeded",
+                "raw_output": "success",
+                "system_prompt": "test",
+            },
+            "recover_layer2_first": False,
+            "layer2_context_added": True,
+        }
+
+        update_state_calls = []
+
+        class _FakeStore:
+            async def upsert(self, task_id, **fields):
+                pass
+
+            async def update_task_state(self, task_id, task_state):
+                update_state_calls.append((task_id, task_state))
+
+        with patch(
+            "chaos_agent.persistence.task_store.get_task_store",
+            new_callable=AsyncMock,
+            return_value=_FakeStore(),
+        ):
+            # Should not crash
+            fin = await _drive_finalize(state, {})
+
+        # No update_task_state should happen (recover_task_id is empty)
+        assert len(update_state_calls) == 0, f"Expected no state update, got {update_state_calls}"

@@ -114,9 +114,12 @@ def build_postmortem_context(state: dict, *, max_messages: int = 30) -> dict[str
     messages_tail = messages_raw[-max_messages:] if elided else list(messages_raw)
     messages_summary = [_summarise_message(m) for m in messages_tail]
 
+    fault_type = fault_type_from_state(state)
+
     return {
         "task_id": state.get("task_id", ""),
-        "skill_name": fault_type_from_state(state),
+        "fault_type": fault_type,
+        "skill_name": fault_type,
         "fault_spec": fault_spec_dict,
         "blade_uid": state.get("blade_uid", "") or "",
         "result": {
@@ -135,6 +138,7 @@ def build_postmortem_context(state: dict, *, max_messages: int = 30) -> dict[str
         "safety_score": safety_score,
         "failure_detail": failure_detail,
         "replan_count": state.get("replan_count", 0),
+        "verify_replan_count": state.get("verify_replan_count", 0),
         "replan_context": state.get("replan_context") or "",
         "user_input": state.get("input", "") or (spec.user_description if spec else ""),
         "messages_elided": elided,

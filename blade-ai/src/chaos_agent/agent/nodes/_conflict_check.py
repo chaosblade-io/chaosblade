@@ -15,6 +15,7 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
+from chaos_agent.agent.dispatch import dispatch_node_message
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +202,7 @@ async def check_blade_conflicts(
                     "Pre-injection conflict check: no tool pods found (skipped)",
                     {"step": "conflict_check", "status": "skipped", "reason": "no_tool_pods"},
                 )
+            await dispatch_node_message("conflict-check", "Pre-injection conflict check: no tool pods found (skipped)")
             return ([], [])
 
         # Step 2: Run blade status --type create in the first available pod.
@@ -303,15 +305,18 @@ async def check_blade_conflicts(
         if tracker:
             if uids:
                 overlap_hint = f" ({len(overlapping)} with target overlap)" if overlapping else ""
+                _msg = f"Pre-injection conflict check: {len(uids)} active experiment(s) found{overlap_hint}: {', '.join(uids[:5])}"
                 tracker.complete(
-                    f"Pre-injection conflict check: {len(uids)} active experiment(s) found{overlap_hint}: {', '.join(uids[:5])}",
+                    _msg,
                     {"step": "conflict_check", "status": "conflicts_found", "conflict_count": len(uids), "uids": uids[:5], "overlap_count": len(overlapping)},
                 )
+                await dispatch_node_message("conflict-check", _msg)
             else:
                 tracker.complete(
                     "Pre-injection conflict check: no active experiments",
                     {"step": "conflict_check", "status": "clear"},
                 )
+                await dispatch_node_message("conflict-check", "Pre-injection conflict check: no active experiments")
         return (uids, conflict_details)
     except Exception:
         logger.debug(f"Blade conflict check failed for task {task_id}", exc_info=True)
@@ -320,6 +325,7 @@ async def check_blade_conflicts(
                 "Pre-injection conflict check: failed (soft, non-blocking)",
                 {"step": "conflict_check", "status": "failed"},
             )
+        await dispatch_node_message("conflict-check", "Pre-injection conflict check: failed (soft, non-blocking)")
         return ([], [])
     finally:
         # Restore parent tracker state so the caller's subsequent

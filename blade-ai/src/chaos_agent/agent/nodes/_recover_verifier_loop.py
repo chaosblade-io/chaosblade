@@ -59,6 +59,7 @@ from chaos_agent.agent.nodes.react_helpers import (
     summarize_llm_response,
 )
 from chaos_agent.agent.operation_outcome import write_recover_verification
+from chaos_agent.agent.nodes._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
 from chaos_agent.agent.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
@@ -376,7 +377,16 @@ async def _run_layer1_recovery(
                         "If you cannot determine the result, set Status to \"failed\" and explain why in Details."
                     )))
 
-                llm_to_call = llm if is_last_l1 else (llm.bind_tools(tools) if tools else llm)
+                # Layer 1 must NOT bind submit_recover_verification — it is a
+                # Layer 2 tool for submitting the verification verdict.  If
+                # bound during Layer 1, the LLM can call it to bypass the
+                # Layer 1 text output path (RECOVERY_EXECUTION_RESULT),
+                # leaving the cache stuck at ``in_progress``.
+                _layer1_tools = [
+                    t for t in (tools or [])
+                    if getattr(t, "name", "") != SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+                ]
+                llm_to_call = llm if is_last_l1 else (llm.bind_tools(_layer1_tools) if _layer1_tools else llm)
 
                 try:
                     response = await llm_to_call.ainvoke(
@@ -573,7 +583,12 @@ async def _run_layer1_recovery(
             )))
 
         is_last_l1 = layer1_iteration >= max_l1
-        llm_to_call = llm if is_last_l1 else (llm.bind_tools(tools) if tools else llm)
+        # Same filter as first iteration — see comment above.
+        _layer1_tools = [
+            t for t in (tools or [])
+            if getattr(t, "name", "") != SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+        ]
+        llm_to_call = llm if is_last_l1 else (llm.bind_tools(_layer1_tools) if _layer1_tools else llm)
 
         try:
             response = await llm_to_call.ainvoke(

@@ -119,6 +119,18 @@ def _with_overrides(
         notes="Frozen user-approved target snapshot for tool-call drift checks.",
         high_risk=True,
     )
+    contracts["fault_type"] = replace(
+        contracts["fault_type"],
+        direct_read_paths=(
+            "src/chaos_agent/agent/fault_spec.py",
+            "src/chaos_agent/agent/recovery_state.py",
+            "src/chaos_agent/agent/task_snapshot.py",
+        ),
+        notes=(
+            "Legacy fault type projection. New reporting code should derive "
+            "it from FaultSpec through fault_type_from_state()."
+        ),
+    )
 
     for field in ("verification", "recover_verification"):
         contracts[field] = replace(

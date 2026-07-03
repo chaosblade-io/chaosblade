@@ -8,7 +8,7 @@ name = "blade-ai"
 # src/chaos_agent/__init__.py, and src/chaos_agent/server/schemas.py.
 # The M11 release.yml guards enforce tag↔file equality before
 # publishing — bump all four in one commit.
-version = "0.5.1"
+version = "0.5.2"
 description = "Chaos Engineering Agent for Kubernetes fault injection"
 
 authors = [
@@ -52,7 +52,12 @@ dev = [
     # and `uv build --no-build-isolation` work.
     "hatchling>=1.0",
 ]
-postgres = ["asyncpg>=0.29"]
+postgres = [
+    "asyncpg>=0.29",
+    "psycopg[binary]>=3.1",
+    "psycopg-pool>=3.1",
+    "langgraph-checkpoint-postgres>=2.0",
+]
 
 [project.scripts]
 blade-ai = "chaos_agent.cli.main:app"

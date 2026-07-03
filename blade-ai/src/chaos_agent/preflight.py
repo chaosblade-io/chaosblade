@@ -128,7 +128,7 @@ def check_kubectl() -> CheckResult:
     """Check that kubectl (or wiz in kubewiz mode) is executable."""
     from chaos_agent.utils.blade_paths import is_executable
     if settings.kube_connection_mode == "kubewiz":
-        if is_executable(settings.wiz_path):
+        if is_executable(settings._resolve_wiz_path()):
             return CheckResult(name="kubectl", severity="blocking", passed=True)
         return CheckResult(
             name="kubectl",
@@ -289,7 +289,7 @@ def _kubectl_base_cmd() -> tuple[list[str], Optional[str]]:
     Returns (cmd_prefix, kubeconfig_or_none). kubeconfig is returned for
     error-message display when the path turns out to be invalid.
     """
-    cmd: list[str] = [settings.kubectl_path]
+    cmd: list[str] = [settings._resolve_kubectl_path()]
     kubeconfig = expand_kubeconfig_path(settings.kubeconfig_path)
     if kubeconfig:
         cmd.extend(["--kubeconfig", kubeconfig])
@@ -538,7 +538,7 @@ async def _check_wiz_version() -> CheckResult:
     import json as _json
     try:
         proc = await asyncio.create_subprocess_exec(
-            settings.wiz_path, "version",
+            settings._resolve_wiz_path(), "version",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

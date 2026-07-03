@@ -121,3 +121,27 @@ def is_executable(cmd: str) -> bool:
         return os.path.isfile(cmd)
     # Bare command name → PATH lookup (no directory component, Windows-safe).
     return shutil.which(cmd) is not None
+
+
+def resolve_exec_path(cmd_name: str) -> str:
+    """Resolve a command name to an absolute path for posix_spawn.
+
+    If *cmd_name* already has a directory component (absolute or relative
+    path), return it unchanged — posix_spawn will use it directly.
+
+    Otherwise resolve via PATH lookup (``shutil.which``). If the binary
+    cannot be found, return the original bare name so the caller still
+    gets a meaningful error (FileNotFoundError) rather than passing
+    ``None`` to ``create_subprocess_exec``.
+
+    Purpose: ensure ``asyncio.create_subprocess_exec`` uses
+    ``posix_spawn`` instead of ``fork()`` on Linux. ``fork()`` triggers
+    APM native ``pthread_atfork`` callbacks (uniagent) which crash the
+    worker.
+    """
+    if not cmd_name:
+        return cmd_name
+    if os.path.dirname(cmd_name):
+        return cmd_name  # Already has path component
+    resolved = shutil.which(cmd_name)
+    return resolved or cmd_name

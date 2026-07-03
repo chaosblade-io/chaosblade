@@ -36,6 +36,7 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
+from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,9 @@ async def load_memory(state: AgentState) -> dict:
         from chaos_agent.persistence.task_store import get_task_store
         store = await get_task_store()
         namespace = _spec.namespace if _spec else ""
-        active = await store.query_active(namespace=namespace)
+        # 多租户隔离：仅查询当前租户的活跃实验
+        _tenant_id = state.get("tenant_id", "") or ""
+        active = await store.query_active(namespace=namespace, tenant_id=_tenant_id)
         updates["experiment_history"] = active
     except Exception as e:
         logger.warning(f"Failed to load experiment history: {e}")
@@ -160,7 +163,9 @@ async def pipeline_init(state: AgentState) -> dict:
         from chaos_agent.persistence.task_store import get_task_store
         store = await get_task_store()
         namespace = _spec.namespace if _spec else ""
-        updates["experiment_history"] = await store.query_active(namespace=namespace)
+        # 多租户隔离：仅查询当前租户的活跃实验
+        _tenant_id = state.get("tenant_id", "") or ""
+        updates["experiment_history"] = await store.query_active(namespace=namespace, tenant_id=_tenant_id)
     except Exception as e:
         logger.warning(f"Failed to load experiment history: {e}")
         updates["experiment_history"] = []
@@ -199,7 +204,7 @@ async def pipeline_init(state: AgentState) -> dict:
 
 
 async def _run_self_evolution(state: AgentState, task_id: str, tracker) -> None:
-    """Auto-append experience to AGENT.md when self_evolution is enabled."""
+    """Auto-append experience to EXPERIENCE.md when self_evolution is enabled."""
     _evolution_span = None
     try:
         from chaos_agent.observability.tracer import get_trace
@@ -290,6 +295,7 @@ async def _generate_postmortem(
                 StatusCategory.NODE, "postmortem",
                 "Generating postmortem (LLM)...",
             )
+            await dispatch_node_message("postmortem", "Generating postmortem (LLM)...")
             # R10 — wire the SAME tracing / OTel callbacks as the main
             # graph LLM so postmortem's token usage flows into
             # ``TaskTrace.total_token_input/output`` + OTel GenAI export.
@@ -332,7 +338,7 @@ async def _generate_postmortem(
                 verification = read_inject_verification(state) or {}
                 outcome = read_operation_outcome(state)
                 header_meta = {
-                    "skill_name": fault_type_from_state(state) or "unknown",
+                    "fault_type": fault_type_from_state(state) or "unknown",
                     "namespace": (_spec.namespace if _spec else "") or "unknown",
                     "status": verification.get("level", "unknown"),
                     "duration": _format_duration_ms(
@@ -382,15 +388,17 @@ def _infer_failure_detail(state: AgentState) -> dict:
     error = outcome.error
     verification = read_inject_verification(state)
     replan_count = state.get("replan_count", 0)
+    verify_replan_count = state.get("verify_replan_count", 0)
     replan_context = state.get("replan_context")
+    _any_replan = replan_count > 0 or verify_replan_count > 0
     msgs = state.get("messages", [])
     planning_alternatives = state.get("_planning_alternatives", "")
 
     if error:
-        if replan_count > 0 and replan_context:
+        if _any_replan and replan_context:
             return fail_state(
                 FailureCategory.REPLAN_EXHAUSTED,
-                f"attempts={replan_count}, last_error={error[:200]}",
+                f"attempts={replan_count + verify_replan_count}, last_error={error[:200]}",
                 msgs,
                 alternatives=planning_alternatives,
             )
@@ -413,10 +421,10 @@ def _infer_failure_detail(state: AgentState) -> dict:
                 msgs,
                 alternatives=planning_alternatives,
             )
-    if replan_count > 0 and replan_context and not state.get("blade_uid") and not verification:
+    if _any_replan and replan_context and not state.get("blade_uid") and not verification:
         return fail_state(
             FailureCategory.REPLAN_EXHAUSTED,
-            f"attempts={replan_count}, injection never succeeded",
+            f"attempts={replan_count + verify_replan_count}, injection never succeeded",
             msgs,
             alternatives=planning_alternatives,
         )
@@ -513,7 +521,7 @@ async def save_memory(state: AgentState) -> dict:
         return updates
 
     if settings.self_evolution:
-        tracker.update("Auto-appending experience to AGENT.md (self_evolution)")
+        tracker.update("Auto-appending experience to EXPERIENCE.md (self_evolution)")
         await _run_self_evolution(state, task_id, tracker)
 
     tracker.complete("Experiment saved to TaskStore")

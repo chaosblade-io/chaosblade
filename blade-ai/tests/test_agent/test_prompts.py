@@ -238,7 +238,7 @@ class TestIntentClarificationSectionFunctions:
     def test_output_section(self):
         section = get_intent_output_section()
         assert "Chinese" in section
-        assert "structured plain text" in section
+        assert "NEVER" in section
         assert "emoji" in section
 
     def test_completeness_section_all_filled(self):

@@ -67,6 +67,7 @@ _WRITABLE_KEYS: frozenset[str] = frozenset(
         "recursion_limit",
         # Replan tuning.
         "max_replan_count",
+        "max_verify_replan_count",
         "replan_auto_trigger",
         "replan_reset_execute_count",
         # Loop detection.

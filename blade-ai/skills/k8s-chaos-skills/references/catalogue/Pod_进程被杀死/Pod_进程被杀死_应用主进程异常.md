@@ -56,3 +56,31 @@
 **基准事实**：
 - **根因**：容器内应用主进程被外部信号（SIGTERM/SIGKILL）杀死，导致容器退出并被 kubelet 重启
 - **必现现象**：Pod RestartCount 增长；容器 Last State 为 terminated（Exit Code 非 0）；进程 PID 在重启后变化；Events 显示容器重启记录
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效进程杀死注入。
+
+前提条件：容器内需有 `kill` 和 `pgrep` 工具
+
+注入命令：
+```bash
+# 杀死目标进程（SIGTERM）
+kubectl exec <pod-name> -n <namespace> -- kill -15 $(pgrep -f <process-name>)
+# 强制杀死（SIGKILL）：
+kubectl exec <pod-name> -n <namespace> -- kill -9 $(pgrep -f <process-name>)
+```
+
+恢复命令：
+```bash
+# 进程由容器编排自动重启（K8s restartPolicy）
+# 无需手动恢复，容器 entrypoint 会自动拉起主进程
+```
+
+注意事项：
+- 必须确认实际进程名（通过 `ps aux` 确认），不可凭服务名猜测
+- 单次执行只 kill 一次，不像 ChaosBlade 可在 timeout 窗口内持续 kill
+- 若需模拟持续 kill（触发 CrashLoopBackOff），需配合 `watch` 或循环脚本反复执行
+- 效果与 ChaosBlade 单次 kill 等价，但缺少持续 kill 和自动超时停止的能力

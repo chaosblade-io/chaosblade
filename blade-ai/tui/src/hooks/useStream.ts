@@ -199,11 +199,10 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
       //     so the per-token MainContent re-render walks only the
       //     pending area; Composer subscribes narrowly to its slice
       //     of AppStore so the chrome no longer re-renders per
-      //     dispatch. With those guards, 60ms (~16Hz) is the new
-      //     sweet spot — close to qwen-code / Claude Code (60–80ms),
-      //     short enough that prose streams letter-fluid without
-      //     bunching, and the small bounded redraw payload doesn't
-      //     reintroduce flicker.
+      //     dispatch. With those guards, 60ms (~16Hz) is the sweet spot
+      //     — close to qwen-code / Claude Code (60–80ms end-to-end).
+      //     Backend SSEBatcher is disabled (0ms), so this is the sole
+      //     throttle layer controlling total perceived latency.
       //
       //     If a future change removes the AgentMessage cap or the
       //     memo wrappers, raise this back to ~180 — without them
@@ -243,6 +242,9 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
       // halves the spinner-row dispatch frequency under Terminal.app
       // (no GPU accel, sensitive to high-frequency dynamic frame
       // updates), eliminating the perceived spinner jitter.
+      //
+      // Backend SSEBatcher is disabled (0ms); this is the sole throttle
+      // layer controlling total perceived latency (~60ms end-to-end).
       const TOKEN_THROTTLE_MS = 60;
       const THINKING_THROTTLE_MS = 100;
 
@@ -292,6 +294,15 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
         flushTokens();
         flushThinking();
       };
+
+      // Track whether the server explicitly sent a ``done`` event.
+      // If the SSE stream ends without it (connection dropped, server
+      // raised ClientDisconnected, network timeout, etc.), we must
+      // NOT dispatch TURN_DONE — that would prematurely commit the
+      // in-flight phase stepper + pending items to history while the
+      // backend pipeline may still be executing. Instead we dispatch
+      // TURN_ABORTED so the UI honestly reflects the abnormal end.
+      let receivedDone = false;
 
       try {
         for await (const evt of client.streamTurn(
@@ -361,7 +372,10 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
           // takes the dynamic area in a different direction.
           flushStreamBuffers();
           applyEvent(dispatch, evt);
-          if (evt.type === "done") break;
+          if (evt.type === "done") {
+            receivedDone = true;
+            break;
+          }
         }
         // Drain anything still buffered before ``done`` (or before
         // the iterator ended naturally). Worst case = TOKEN_THROTTLE_MS
@@ -369,7 +383,23 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
         // timers and dispatches synchronously so the final reply chunk
         // is visible before TURN_DONE flips the UI to idle.
         flushStreamBuffers();
-        dispatch({ type: "TURN_DONE" });
+        if (receivedDone) {
+          dispatch({ type: "TURN_DONE" });
+        } else {
+          // Stream ended without a ``done`` event. The server closed
+          // the connection prematurely — common causes:
+          //   - Starlette ``req.is_disconnected()`` false positive
+          //     (raises ClientDisconnected, generator returns w/o done)
+          //   - Network idle timeout on long-running operations
+          //   - Server-side exception during pipeline execution
+          // Dispatch TURN_ABORTED so the phase stepper shows the
+          // active step as failed and pending items are NOT
+          // committed as if the turn completed successfully.
+          dispatch({
+            type: "TURN_ABORTED",
+            reason: "连接意外断开，服务端未发送完成信号",
+          });
+        }
       } catch (err) {
         if (controller.signal.aborted) {
           // Was this abort triggered by a graceful supersede (e.g.
@@ -456,6 +486,7 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
       dispatch({ type: "TURN_STARTED", input: displayInput?.trim() || `/recover ${trimmed}` });
       resetStreamingCounters();
 
+      // Backend SSEBatcher is disabled; sole throttle layer.
       const TOKEN_THROTTLE_MS = 60;
       const THINKING_THROTTLE_MS = 100;
 
@@ -503,6 +534,8 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
         flushThinking();
       };
 
+      let receivedDone = false;
+
       try {
         for await (const evt of client.streamRecover(trimmed, controller.signal)) {
           if (evt.type === "token") {
@@ -530,10 +563,20 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
           }
           flushStreamBuffers();
           applyEvent(dispatch, evt);
-          if (evt.type === "done") break;
+          if (evt.type === "done") {
+            receivedDone = true;
+            break;
+          }
         }
         flushStreamBuffers();
-        dispatch({ type: "TURN_DONE" });
+        if (receivedDone) {
+          dispatch({ type: "TURN_DONE" });
+        } else {
+          dispatch({
+            type: "TURN_ABORTED",
+            reason: "连接意外断开，服务端未发送完成信号",
+          });
+        }
       } catch (err) {
         if (controller.signal.aborted) {
           dispatch({ type: "TURN_ABORTED", reason: "Cancelled by user" });

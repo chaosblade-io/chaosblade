@@ -403,6 +403,7 @@ class TaskSnapshot:
     stored_fault_spec: dict = field(default_factory=dict)
     blade_uid: str = ""
     skill_name: str = ""
+    fault_type: str = ""
     verification: dict | None = None
     inject_context: str = ""
     tui_session_id: str = ""
@@ -445,17 +446,19 @@ class TaskSnapshot:
             session,
             prefer_messages=has_increment_log,
         )
-        record_skill_name = (
+        record_skill_name = str(record.get("skill_name") or "")
+        record_fault_type = (
             _fault_type_from_fault_spec(record_fault_spec)
-            or record.get("skill_name")
             or record.get("fault_type")
+            or record_skill_name
             or ""
         )
-        session_skill_name = (
+        session_fault_type = (
             _fault_type_from_fault_spec(session_fault_spec)
             or result_data.get("fault_type")
             or ""
         )
+        session_skill_name = str(result_data.get("skill_name") or "")
         session_inject_context = _build_inject_context_from_session(session)
 
         resolved_tui_session_id = tui_session_id
@@ -469,6 +472,7 @@ class TaskSnapshot:
             params = session_params or record_params
             blade_uid = session_blade_uid or record.get("blade_uid") or ""
             skill_name = session_skill_name or record_skill_name
+            fault_type = session_fault_type or record_fault_type
             verification = result_data.get("verification") or record.get("verification")
             inject_context = session_inject_context or record.get("inject_context") or ""
             stored_fault_spec = session_fault_spec or record_fault_spec
@@ -477,6 +481,7 @@ class TaskSnapshot:
             params = record_params or session_params
             blade_uid = record.get("blade_uid") or session_blade_uid or ""
             skill_name = record_skill_name or session_skill_name
+            fault_type = record_fault_type or session_fault_type
             verification = record.get("verification") or result_data.get("verification")
             inject_context = record.get("inject_context") or session_inject_context or ""
             stored_fault_spec = record_fault_spec or session_fault_spec
@@ -492,6 +497,7 @@ class TaskSnapshot:
             stored_fault_spec=stored_fault_spec,
             blade_uid=blade_uid,
             skill_name=skill_name,
+            fault_type=fault_type,
             verification=verification if isinstance(verification, dict) else None,
             inject_context=inject_context,
             tui_session_id=resolved_tui_session_id,
@@ -500,12 +506,14 @@ class TaskSnapshot:
     @property
     def has_recover_context(self) -> bool:
         """Whether this snapshot has enough information to attempt recovery."""
-        return bool(self.blade_uid) or (bool(self.skill_name) and bool(self.target))
+        return bool(self.blade_uid) or (
+            bool(self.fault_type or self.skill_name) and bool(self.target)
+        )
 
     def fault_spec(self) -> dict:
         if self.stored_fault_spec:
             merged = dict(self.stored_fault_spec)
-            scope, blade_target, blade_action = fault_parts_from_name(self.skill_name)
+            scope, blade_target, blade_action = fault_parts_from_name(self.fault_type)
             if self.target:
                 merged["namespace"] = self.target.get("namespace", "") or ""
                 merged["scope"] = (
@@ -538,6 +546,7 @@ class TaskSnapshot:
             {
                 "target": self.target,
                 "params": self.params,
+                "fault_type": self.fault_type,
                 "skill_name": self.skill_name,
             },
             source="task_snapshot_rebuild",
@@ -552,6 +561,7 @@ class TaskSnapshot:
             "target": dict(self.target or {}),
             "blade_uid": self.blade_uid,
             "skill_name": self.skill_name,
+            "fault_type": self.fault_type,
         }
 
 
@@ -630,6 +640,7 @@ async def build_recover_initial_from_task_snapshot(
         "tui_session_id": snapshot.tui_session_id or checkpoint_values.get("tui_session_id", ""),
         "blade_uid": snapshot.blade_uid or checkpoint_values.get("blade_uid", "") or "",
         "skill_name": skill_name,
+        "fault_type": snapshot.fault_type or checkpoint_values.get("fault_type", ""),
         "skill_case_content": skill_case_content,
         "inject_verification_summary": inject_verification_summary,
         "baseline_data": snapshot.record.get("baseline_data") or checkpoint_values.get("baseline_data"),
@@ -666,6 +677,7 @@ async def build_recover_initial_from_task_snapshot(
             or checkpoint_values.get("gmt_create")
             or ""
         ),
+        "tenant_id": checkpoint_values.get("tenant_id", "") or "",
         "messages": list(checkpoint_values.get("messages") or []),
     }
     return build_recover_initial_from_checkpoint(
@@ -765,7 +777,7 @@ def _merge_snapshot_checkpoint_fault_spec(
     if snapshot.stored_fault_spec:
         merged.update(snapshot.stored_fault_spec)
 
-    scope, blade_target, blade_action = fault_parts_from_name(snapshot.skill_name)
+    scope, blade_target, blade_action = fault_parts_from_name(snapshot.fault_type)
     if snapshot.target:
         merged["namespace"] = snapshot.target.get("namespace", "") or ""
         merged["scope"] = snapshot.target.get("resource_type", "") or scope or merged.get("scope", "")
@@ -816,6 +828,10 @@ def _source_values_from_initial(
         "tui_session_id": initial.get("tui_session_id", "") or "",
         "blade_uid": initial.get("blade_uid", "") or "",
         "skill_name": read_active_skill_name(initial),
+        "fault_type": (
+            _fault_type_from_fault_spec(fault_spec)
+            or checkpoint_values.get("fault_type", "")
+        ),
         "fault_spec": fault_spec,
         "target": target,
         "params": dict(fault_spec.get("params") or {}),

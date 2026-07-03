@@ -122,7 +122,7 @@ class TestBuildContext:
         assert ctx["side_effects"] == {"evicted_pods": ["p1"]}
         assert ctx["verification"]["level"] == "verified"
 
-    def test_skill_name_projects_canonical_fault_type_from_fault_spec(self):
+    def test_fault_type_projects_canonical_fault_type_from_fault_spec(self):
         ctx = build_postmortem_context({
             "skill_name": "stale-skill",
             "fault_spec": {
@@ -140,6 +140,7 @@ class TestBuildContext:
             },
         })
 
+        assert ctx["fault_type"] == "pod-network-loss"
         assert ctx["skill_name"] == "pod-network-loss"
 
 
@@ -260,11 +261,15 @@ class TestStore:
         save_postmortem(
             "task-abc12345", "## Summary\n", root=tmp_path,
             header_meta={
-                "skill_name": "cpu", "namespace": "cms",
+                "fault_type": "pod-cpu-fullload",
+                "skill_name": "stale-skill",
+                "namespace": "cms",
                 "status": "verified", "duration": "47s",
             },
         )
         text = read_postmortem("task-abc12345", root=tmp_path)
+        assert "# Postmortem: pod-cpu-fullload on cms" in text
+        assert "stale-skill" not in text
         assert "**Status**: verified" in text
         assert "**Duration**: 47s" in text
 

@@ -42,12 +42,14 @@ def _run_help(blade_path: str, *args: str) -> str:
 
     Safety: asserts the last argument is "-h" (help-only, never injects).
     """
+    from chaos_agent.utils.blade_paths import resolve_exec_path
+
     cmd_args = list(args)
     if not cmd_args or cmd_args[-1] != "-h":
         cmd_args.append("-h")
     assert cmd_args[-1] == "-h", "probe MUST be help-only, never inject"
 
-    full_cmd = [blade_path, "create", "k8s"] + cmd_args
+    full_cmd = [resolve_exec_path(blade_path), "create", "k8s"] + cmd_args
     try:
         r = subprocess.run(
             full_cmd,
@@ -114,9 +116,11 @@ def _parse_examples(text: str) -> list[str]:
 
 def _get_version(blade_path: str) -> str:
     """Get blade version string."""
+    from chaos_agent.utils.blade_paths import resolve_exec_path
+
     try:
         r = subprocess.run(
-            [blade_path, "version"],
+            [resolve_exec_path(blade_path), "version"],
             capture_output=True,
             text=True,
             timeout=5,

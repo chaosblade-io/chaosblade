@@ -33,6 +33,7 @@ from chaos_agent.agent.baseline_extractors import (
     Extractor,
     extract_pod_top_metrics,
 )
+from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.node_names import BASELINE_CAPTURE
 from chaos_agent.agent.nodes._debug_pod import (
     create_and_wait_debug_pod,
@@ -632,6 +633,10 @@ async def _execute_observations(
                     )
                 continue
 
+            await dispatch_node_message(
+                "baseline_capture",
+                f"[{idx}/{len(commands)}] 正在采集: {cmd_info['description']}\n\n",
+            )
             try:
                 if cmd_info["mode"] == "debug_two_step":
                     node_name = cmd_info.get("_node_name", "")
@@ -679,6 +684,10 @@ async def _execute_observations(
                         {"step": idx, "description": obs["description"],
                          "exit_code": obs.get("exit_code"), "status": _status},
                     )
+                await dispatch_node_message(
+                    "baseline_capture",
+                    f"[{idx}/{len(commands)}] {obs['description']}: {_status}\n\n",
+                )
             except Exception as e:
                 obs = {
                     "description": cmd_info["description"],
@@ -695,6 +704,10 @@ async def _execute_observations(
                         {"step": idx, "description": obs["description"],
                          "exit_code": -1, "status": "error"},
                     )
+                await dispatch_node_message(
+                    "baseline_capture",
+                    f"[{idx}/{len(commands)}] {obs['description']}: error\n\n",
+                )
     finally:
         # ── Cleanup all debug pods ──
         for pod_name, ns in debug_pods.values():
@@ -1460,6 +1473,9 @@ def make_baseline_capture(llm=None, registry=None):
                     "Strategy: LLM-driven baseline derivation...",
                     {"step": "strategy", "strategy": "llm"},
                 )
+                await dispatch_node_message(
+                    "baseline_capture", "正在通过 LLM 推导基线采集命令...\n\n",
+                )
                 try:
                     return await asyncio.wait_for(
                         _llm_derive_baseline_commands(
@@ -1530,6 +1546,10 @@ def make_baseline_capture(llm=None, registry=None):
                         {"step": "strategy", "source": strategy_name,
                          "viable": viable_count, "total": total_count},
                     )
+                    await dispatch_node_message(
+                        "baseline_capture",
+                        f"策略 {strategy_name} 命中（{viable_count}/{total_count} 条命令可用）\n\n",
+                    )
                     break
 
                 # Partial: keep first partial as fallback, but continue trying
@@ -1567,6 +1587,10 @@ def make_baseline_capture(llm=None, registry=None):
                     {"step": "strategy", "source": partial_source,
                      "viable": partial_viable, "total": partial_total,
                      "partial_fallback": True},
+                )
+                await dispatch_node_message(
+                    "baseline_capture",
+                    f"策略 {partial_source} 命中（部分可用，{partial_viable}/{partial_total} 条命令）\n\n",
                 )
 
             # P3: FCAT baseline_supplement — enrich with dimensions from knowledge docs
@@ -1624,6 +1648,10 @@ def make_baseline_capture(llm=None, registry=None):
                 f"Executing {len(resolved)} baseline command(s)...",
                 {"step": "execute", "command_count": len(resolved)},
             )
+            await dispatch_node_message(
+                "baseline_capture",
+                f"正在执行 {len(resolved)} 条基线采集命令...\n\n",
+            )
             observations = await _execute_observations(resolved, kubeconfig, task_id)
 
             # 4.0.5 LLM self-correcting retry: when LLM-generated commands
@@ -1652,6 +1680,11 @@ def make_baseline_capture(llm=None, registry=None):
                         {"step": "llm_retry", "attempt": retry_num,
                          "failed_count": len(failed_obs)},
                     )
+                    await dispatch_node_message(
+                        "baseline_capture",
+                        f"LLM 自纠错重试 {retry_num}/{_LLM_BASELINE_MAX_RETRIES}: "
+                        f"{len(failed_obs)} 条命令失败，正在重新生成...\n\n",
+                    )
 
                     try:
                         retry_commands = await asyncio.wait_for(
@@ -1669,11 +1702,19 @@ def make_baseline_capture(llm=None, registry=None):
                             "LLM baseline retry %d timed out after %ds",
                             retry_num, settings.timeout_baseline_llm,
                         )
+                        await dispatch_node_message(
+                            "baseline_capture",
+                            f"LLM 自纠错重试 {retry_num} 超时，放弃重试\n\n",
+                        )
                         break
                     if not retry_commands:
                         logger.info(
                             "LLM retry %d: no corrected commands returned",
                             retry_num,
+                        )
+                        await dispatch_node_message(
+                            "baseline_capture",
+                            f"LLM 自纠错重试 {retry_num} 未返回有效命令，放弃重试\n\n",
                         )
                         break
 
@@ -1766,6 +1807,10 @@ def make_baseline_capture(llm=None, registry=None):
                         {"step": "strategy_fallback",
                          "from": source, "to": _fb_name,
                          "from_total": len(observations)},
+                    )
+                    await dispatch_node_message(
+                        "baseline_capture",
+                        f"策略 {source} 全部失败，回退到 {_fb_name}...\n\n",
                     )
 
                     commands = list(_fb_commands)

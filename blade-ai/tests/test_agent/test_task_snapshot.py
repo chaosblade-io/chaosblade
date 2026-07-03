@@ -51,6 +51,7 @@ def test_task_snapshot_prefers_task_store_when_no_increment_log():
     assert snapshot is not None
     assert snapshot.blade_uid == "uid-from-store"
     assert snapshot.skill_name == "pod-cpu-fullload"
+    assert snapshot.fault_type == "pod-cpu-fullload"
     assert snapshot.target["names"] == ["store-pod"]
     assert snapshot.params == {"cpu-percent": "80"}
     assert snapshot.inject_context == "store context"
@@ -88,7 +89,8 @@ def test_task_snapshot_prefers_session_when_increment_log_exists():
 
     assert snapshot is not None
     assert snapshot.blade_uid == "uid-from-session"
-    assert snapshot.skill_name == "pod-network-loss"
+    assert snapshot.skill_name == "pod-cpu-fullload"
+    assert snapshot.fault_type == "pod-network-loss"
     assert snapshot.target["names"] == ["session-pod"]
     assert snapshot.params == {"percent": "100"}
     assert snapshot.inject_context == "store context"
@@ -183,7 +185,7 @@ def test_task_snapshot_prefers_record_fault_spec_over_stale_legacy_fields():
     snapshot = TaskSnapshot.from_sources(
         task_id="task-inject",
         record={
-            "skill_name": "pod-cpu-fullload",
+            "skill_name": "active-chaos-skill",
             "target": _target("stale-pod"),
             "params": {"cpu-percent": "80"},
             "fault_spec": {
@@ -205,7 +207,8 @@ def test_task_snapshot_prefers_record_fault_spec_over_stale_legacy_fields():
     )
 
     assert snapshot is not None
-    assert snapshot.skill_name == "pod-network-loss"
+    assert snapshot.skill_name == "active-chaos-skill"
+    assert snapshot.fault_type == "pod-network-loss"
     assert snapshot.target == {
         "namespace": "prod",
         "names": ["fresh-pod"],
@@ -221,7 +224,7 @@ def test_task_snapshot_increment_log_can_override_record_fault_spec():
     snapshot = TaskSnapshot.from_sources(
         task_id="task-inject",
         record={
-            "skill_name": "pod-network-loss",
+            "skill_name": "active-chaos-skill",
             "fault_spec": {
                 "namespace": "prod",
                 "scope": "pod",
@@ -250,7 +253,8 @@ def test_task_snapshot_increment_log_can_override_record_fault_spec():
     )
 
     assert snapshot is not None
-    assert snapshot.skill_name == "pod-cpu-fullload"
+    assert snapshot.skill_name == "active-chaos-skill"
+    assert snapshot.fault_type == "pod-cpu-fullload"
     assert snapshot.target["names"] == ["session-pod"]
     assert snapshot.params == {"cpu-percent": "80"}
     assert snapshot.fault_spec()["blade_target"] == "cpu"
@@ -315,6 +319,7 @@ async def test_recover_initial_from_task_snapshot_uses_snapshot_fields():
     assert initial["tui_session_id"] == "sid-1"
     assert initial["blade_uid"] == "uid-from-store"
     assert initial["skill_name"] == "pod-cpu-fullload"
+    assert initial["fault_type"] == "pod-cpu-fullload"
     assert initial["skill_case_content"] == "skill case text"
     assert initial["inject_verification_summary"] == (
         "Layer2=passed, Details=verified"

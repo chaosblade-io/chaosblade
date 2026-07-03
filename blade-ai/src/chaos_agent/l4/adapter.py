@@ -81,6 +81,7 @@ def test_task_to_initial_state(task: L4TestTask) -> dict:
         kubeconfig=payload.get("kubeconfig", ""),
         kube_context=payload.get("kube_context", ""),
         messages=[],
+        tenant_id=payload.get("tenant_id", ""),
     )
 
 

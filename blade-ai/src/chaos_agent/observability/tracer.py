@@ -193,14 +193,14 @@ _traces: dict[str, TaskTrace] = {}
 
 
 async def init_tracer() -> None:
-    """Initialize the tracer with TaskStore-backed persistence."""
-    # Ensure TaskStore is initialized (creates DB if needed)
-    try:
-        from chaos_agent.persistence.task_store import get_task_store
-        await get_task_store()
-    except Exception as e:
-        logger.warning(f"TaskStore init via init_tracer failed: {e}")
-    logger.info("Trace persistence initialized (TaskStore)")
+    """Initialize the tracer.
+
+    TaskStore is NOT pre-created here — it will be lazily initialised on
+    first actual use, at which point the correct backend configuration
+    (SQLite for CLI/TUI, PostgreSQL for SDK platform mode) is already
+    available via ``blade_ai_context`` ContextVar.
+    """
+    logger.info("Trace persistence ready (TaskStore will init on first use)")
 
 
 # -- persistence helpers --------------------------------------------------------

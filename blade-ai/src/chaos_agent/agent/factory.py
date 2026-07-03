@@ -194,7 +194,12 @@ def _build_skill_tools(registry: SkillRegistry):
 
     @lc_tool
     def read_skill_resource(skill_name: str, resource_path: str) -> str:
-        """Phase 1 / Phase 2 read-only. Read a resource file from an activated skill.
+        """Phase 1 / Phase 2 read-only. Read a resource file from a skill.
+
+        **PREREQUISITE**: You MUST call `activate_skill` first. This tool
+        only works on an already-activated skill. If you haven't activated
+        a skill yet, call `activate_skill` now — do NOT call this tool
+        before activation.
 
         Templates inside (blade/kubectl command snippets) are EXECUTION
         templates Phase 2 runs automatically — do NOT execute them yourself
@@ -683,43 +688,93 @@ async def create_agent(
         recover_verifier_tools = recover_verifier_tools + mcp_manager.tools_for_phase("verifier")
 
     # Set up checkpointer
-    conn = None  # aiosqlite connection ref for cleanup
+    conn = None  # connection/pool ref for cleanup
     if checkpointer is None:
-        conn = None
-        try:
-            import aiosqlite
-            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+        from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+        serde = JsonPlusSerializer(
+            allowed_msgpack_modules=[
+                ("chaos_agent.agent.verdict", "Layer1Status"),
+                ("chaos_agent.agent.verdict", "FailureCategory"),
+            ],
+        )
 
-            checkpoint_path = settings.resolved_checkpoint_db_path
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            # Use aiosqlite.connect() directly for a persistent connection.
-            # AsyncSqliteSaver.from_conn_string() returns an async context manager
-            # that closes the connection on __aexit__, making it unsuitable for
-            # long-lived checkpointer instances. Direct aiosqlite connection stays
-            # open as long as we hold the reference.
-            from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-            serde = JsonPlusSerializer(
-                allowed_msgpack_modules=[
-                    ("chaos_agent.agent.verdict", "Layer1Status"),
-                    ("chaos_agent.agent.verdict", "FailureCategory"),
-                ],
-            )
-            conn = await aiosqlite.connect(str(checkpoint_path))
-            checkpointer = AsyncSqliteSaver(conn=conn, serde=serde)
-            await checkpointer.setup()
-            logger.info(f"Checkpointer initialized at {checkpoint_path}")
-        except ImportError:
-            logger.warning("langgraph-checkpoint-sqlite not available, running without checkpointer")
-            checkpointer = None
-        except Exception as e:
-            # Close aiosqlite connection if it was opened but setup failed
-            if conn is not None:
-                try:
-                    await conn.close()
-                except Exception:
-                    pass
-            logger.warning(f"Failed to initialize checkpointer: {e}")
-            checkpointer = None
+        backend = settings.checkpoint_backend
+        if backend == "postgresql":
+            try:
+                from psycopg_pool import AsyncConnectionPool
+                from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+                if not settings.checkpoint_pg_dsn:
+                    raise ValueError(
+                        "checkpoint_pg_dsn must be set when checkpoint_backend=postgresql"
+                    )
+
+                pool = AsyncConnectionPool(
+                    settings.checkpoint_pg_dsn,
+                    open=False,
+                    min_size=1,
+                    max_size=5,
+                    timeout=30,
+                    max_idle=300,
+                    max_lifetime=1800,
+                    check=AsyncConnectionPool.check_connection,
+                    kwargs={
+                        "autocommit": True,
+                        "prepare_threshold": 0,
+                        "connect_timeout": 10,
+                        "options": "-c statement_timeout=30000",
+                        "keepalives": 1,
+                        "keepalives_idle": 10,
+                        "keepalives_interval": 5,
+                        "keepalives_count": 3,
+                    },
+                )
+                await pool.open()
+                checkpointer = AsyncPostgresSaver(pool, serde=serde)
+                await checkpointer.setup()
+                conn = pool  # shutdown 时调 pool.close()
+                logger.info("Checkpointer initialized (PostgreSQL)")
+            except ImportError:
+                logger.warning(
+                    "langgraph-checkpoint-postgres not available, falling back to SQLite"
+                )
+                backend = "sqlite"  # fall through to SQLite below
+            except Exception as e:
+                if conn is not None:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                logger.warning(f"Failed to initialize PostgreSQL checkpointer: {e}")
+                checkpointer = None
+
+        if backend != "postgresql" and checkpointer is None:
+            # SQLite path (original logic)
+            try:
+                import aiosqlite
+                from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+                checkpoint_path = settings.resolved_checkpoint_db_path
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                conn = await aiosqlite.connect(str(checkpoint_path))
+                checkpointer = AsyncSqliteSaver(conn=conn, serde=serde)
+                await checkpointer.setup()
+                logger.info(f"Checkpointer initialized (SQLite: {checkpoint_path})")
+            except ImportError:
+                logger.warning(
+                    "langgraph-checkpoint-sqlite not available, running without checkpointer"
+                )
+                checkpointer = None
+            except Exception as e:
+                if conn is not None:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
+                    conn = None
+                logger.warning(f"Failed to initialize checkpointer: {e}")
+                checkpointer = None
 
     # Set up LLM with tracing callback for token usage tracking
     from chaos_agent.observability.tracer import TracingCallback, TaskTrace, _traces

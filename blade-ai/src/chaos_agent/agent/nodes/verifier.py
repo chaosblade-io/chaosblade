@@ -89,6 +89,7 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
+from chaos_agent.agent.dispatch import dispatch_node_message
 
 logger = logging.getLogger(__name__)
 
@@ -236,8 +237,10 @@ async def verifier(state: AgentState) -> dict:
 
     if _verified:
         tracker.complete(f"Verification result: {layer1.status} (uid={blade_uid or 'N/A'})")
+        await dispatch_node_message("verifier", f"Verification result: {layer1.status} (uid={blade_uid or 'N/A'})")
     else:
         tracker.complete(f"Verification result: {layer1.status}")
+        await dispatch_node_message("verifier", f"Verification result: {layer1.status}")
 
     result_dict = write_inject_verification(result=result, verification=verification)
     if not _verified:
@@ -288,6 +291,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         if count > settings.max_verifier_loop:
             logger.warning(f"Verifier loop exceeded max iterations ({settings.max_verifier_loop})")
             tracker.fail(f"Verifier loop exceeded max iterations ({settings.max_verifier_loop})")
+            await dispatch_node_message("verifier", f"Verifier loop exceeded max iterations ({settings.max_verifier_loop})")
             verification = {
                 "level": "partial",
                 "layer1": {"status": "passed", "details": "Confirmed in earlier iterations"},
@@ -358,6 +362,7 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 "verified": False,
             }
             tracker.complete(f"Verification failed at Layer 1: {layer1.status}")
+            await dispatch_node_message("verifier", f"Verification failed at Layer 1: {layer1.status}")
             result_dict = write_inject_verification(
                 fail_state(
                     FailureCategory.VERIFICATION_FAILED,

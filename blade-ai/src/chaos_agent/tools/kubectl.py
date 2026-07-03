@@ -178,12 +178,18 @@ async def exec_kubectl_raw(
     For LLM-driven tool calls, use _kubectl_impl() which adds audit/guard.
     """
     import asyncio as _asyncio
+    from chaos_agent.utils.blade_paths import resolve_exec_path
 
     cmd = build_kubectl_cmd(subcommand, v_args, kubeconfig, context, cluster)
 
+    # Resolve cmd[0] to absolute path so that subprocess.Popen uses
+    # posix_spawn instead of fork() on Linux — fork() triggers APM
+    # native pthread_atfork callbacks (uniagent) which crash the worker.
+    exec_cmd = ([resolve_exec_path(cmd[0])] + cmd[1:]) if cmd else cmd
+
     try:
         proc = await _asyncio.create_subprocess_exec(
-            *cmd,
+            *exec_cmd,
             stdout=_asyncio.subprocess.PIPE,
             stderr=_asyncio.subprocess.PIPE,
         )

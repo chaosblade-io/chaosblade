@@ -233,8 +233,8 @@ class Settings(BaseSettings):
     command_timeout: int = 60                # BLADE_AI_COMMAND_TIMEOUT
 
     # 分工具超时配置(秒)
-    timeout_blade: int = 30                  # BLADE_AI_TIMEOUT_BLADE
-    timeout_kubectl: int = 30                # BLADE_AI_TIMEOUT_KUBECTL
+    timeout_blade: int = 60                  # BLADE_AI_TIMEOUT_BLADE
+    timeout_kubectl: int = 60                # BLADE_AI_TIMEOUT_KUBECTL
     timeout_kubectl_exec: int = 180          # BLADE_AI_TIMEOUT_KUBECTL_EXEC
     # LLM timeout split into connect vs read (httpx.Timeout semantics).
     # ``llm_connect_timeout`` bounds TCP/TLS connection establishment —
@@ -258,7 +258,7 @@ class Settings(BaseSettings):
 
     # Confirm gate 等待用户决策的最大秒数 — 超过则服务端礼貌中断 turn，避免用户离开后未回收 future
     # 默认 1800s (30 分钟) 对绝大多数排查场景够用；遇到复杂研判可调长，例如 7200 (2h)
-    confirm_wait_timeout: int = 1800         # BLADE_AI_CONFIRM_WAIT_TIMEOUT
+    confirm_wait_timeout: int = 3600         # BLADE_AI_CONFIRM_WAIT_TIMEOUT
 
     # OpenTelemetry GenAI export (parallel to built-in tracing)
     otel_enabled: bool = False              # BLADE_AI_OTEL_ENABLED
@@ -322,7 +322,8 @@ class Settings(BaseSettings):
     idle_turn_threshold: int = 3             # BLADE_AI_IDLE_TURN_THRESHOLD，连续 N 轮无工具调用触发收敛提示
 
     # Replan配置 (Phase 2 → Phase 1 错误回退)
-    max_replan_count: int = 3                    # BLADE_AI_MAX_REPLAN_COUNT
+    max_replan_count: int = 3                    # BLADE_AI_MAX_REPLAN_COUNT (execute_loop replan budget)
+    max_verify_replan_count: int = 3             # BLADE_AI_MAX_VERIFY_REPLAN_COUNT (verify-replan budget, independent)
     replan_auto_trigger: bool = True             # BLADE_AI_REPLAN_AUTO_TRIGGER, 自动检测可replan的错误模式
     replan_reset_execute_count: bool = True      # BLADE_AI_REPLAN_RESET_EXECUTE_COUNT, replan后重置execute_loop_count
 
@@ -364,11 +365,14 @@ class Settings(BaseSettings):
 
     # Checkpoint持久化 (默认存放在 memory_dir 下)
     checkpoint_db_path: Path = Path("")   # BLADE_AI_CHECKPOINT_DB_PATH, 空值则使用 memory_dir/checkpoints.db
+    checkpoint_backend: str = "sqlite"    # BLADE_AI_CHECKPOINT_BACKEND, "sqlite" 或 "postgresql"
+    checkpoint_pg_dsn: str = ""           # BLADE_AI_CHECKPOINT_PG_DSN, PostgreSQL conninfo (仅 postgresql 后端需要)
 
     # TaskStore持久化 (默认存放在 memory_dir 下)
     tasks_db_path: Path = Path("")       # BLADE_AI_TASKS_DB_PATH, 空值则使用 memory_dir/tasks.db
     tasks_db_backend: str = "sqlite"     # BLADE_AI_TASKS_DB_BACKEND, "sqlite" 或 "postgresql"
     tasks_pg_dsn: str = ""              # BLADE_AI_TASKS_PG_DSN, PostgreSQL DSN (仅 postgresql 后端需要)
+    tenant_id: str = ""                # BLADE_AI_TENANT_ID, 多租户隔离标识 (SDK 模式由平台注入)
 
     # 存储目录
     memory_dir: Path = Path("~/.blade-ai/memory")  # BLADE_AI_MEMORY_DIR，与 config.json 同级
@@ -390,9 +394,13 @@ class Settings(BaseSettings):
     model_budgets: dict[str, dict[str, float | int]] = Field(default_factory=dict)
 
     # SSE token batching — server-side coalescing of token/thinking events.
-    # 0 = disabled (each event yields immediately, legacy behaviour).
-    sse_batch_interval_ms: int = 30  # BLADE_AI_SSE_BATCH_INTERVAL_MS
-    sse_batch_chars: int = 30        # BLADE_AI_SSE_BATCH_CHARS
+    # SSE token batching: accumulates token/thinking chunks before yield.
+    # 0 = disabled (each event yields immediately). Default disabled because
+    # at typical LLM token rates (10-100 tokens/sec) the per-yield asyncio
+    # overhead is negligible, and batching adds unnecessary latency. Can be
+    # re-enabled via env var for high-concurrency proxy scenarios.
+    sse_batch_interval_ms: int = 0  # BLADE_AI_SSE_BATCH_INTERVAL_MS
+    sse_batch_chars: int = 0        # BLADE_AI_SSE_BATCH_CHARS
 
     # Skill 脚本执行配置
     skill_script_max_output: int = 4000  # BLADE_AI_SKILL_SCRIPT_MAX_OUTPUT，返回给 LLM 的 stdout 最大字符数
@@ -424,6 +432,16 @@ class Settings(BaseSettings):
             return self.blade_path
         from chaos_agent.utils.blade_paths import get_bundled_blade_path
         return get_bundled_blade_path()
+
+    def _resolve_wiz_path(self) -> str:
+        """Resolve wiz path to absolute path for posix_spawn."""
+        from chaos_agent.utils.blade_paths import resolve_exec_path
+        return resolve_exec_path(self.wiz_path or "wiz")
+
+    def _resolve_kubectl_path(self) -> str:
+        """Resolve kubectl path to absolute path for posix_spawn."""
+        from chaos_agent.utils.blade_paths import resolve_exec_path
+        return resolve_exec_path(self.kubectl_path or "kubectl")
 
     @property
     def blacklist_namespaces(self) -> list[str]:

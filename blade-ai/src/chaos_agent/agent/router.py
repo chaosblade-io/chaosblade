@@ -212,12 +212,14 @@ def should_continue_execute_loop(state: AgentState) -> str:
     if _should_replan(state):
         return "replan"
 
-    # Error with auto-replan detection
+    # Error from execute_loop — the injection action may have issues,
+    # but the verifier MUST still check whether the fault actually took
+    # effect. Error is a signal, not a verdict; only replan short-circuits.
     outcome = read_operation_outcome(state)
     if outcome.error:
         if _should_replan(state, outcome.error):
             return "replan"
-        return "end"
+        return "verifier"
 
     # Check the last message for tool_calls (LLM ReAct pattern)
     # blade_uid alone does NOT mean execution is complete — hybrid injections
@@ -252,8 +254,13 @@ def route_after_safety(state: AgentState) -> str:
         "confirmation_gate" - needs confirmation before execution
         "baseline_capture" - safe (all modes), collect baseline metrics then execute
         "reject" - unsafe, reject the request
+        "agent_loop" - recoverable issue (e.g. no skill activated),
+                       feed back to planner for self-correction
     """
     safety_status = state.get("safety_status", "pending")
+
+    if safety_status == "retry":
+        return "agent_loop"
 
     if safety_status == "rejected":
         return "reject"
@@ -392,7 +399,13 @@ def route_after_finalize(state: AgentState) -> str:
     instead found verification gaps with budget remaining, it leaves
     ``verification`` unset and appends a re-verify prompt → loop back to
     verifier_loop. Otherwise → se_detect.
+
+    When finalize detects an unverified + L2-failed verdict with replan
+    budget remaining, it sets ``replan_requested`` → route to agent_loop
+    for re-planning with verifier feedback as context.
     """
+    if state.get("replan_requested"):
+        return "replan"
     if read_inject_verification(state):
         return "se_detect"
     return "verifier_loop"

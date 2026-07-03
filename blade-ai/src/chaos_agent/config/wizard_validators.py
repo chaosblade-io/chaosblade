@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -407,11 +406,13 @@ async def discover_kube_contexts(kubeconfig_path: str) -> list[str]:
     non-zero exit all collapse to an empty list. The caller (validate or
     a UI radio-options builder) decides what to do with it.
     """
-    if not shutil.which("kubectl"):
+    from chaos_agent.utils.blade_paths import resolve_exec_path
+    kubectl_bin = resolve_exec_path("kubectl")
+    if not os.path.dirname(kubectl_bin):
         return []
     try:
         proc = await asyncio.create_subprocess_exec(
-            "kubectl",
+            kubectl_bin,
             f"--kubeconfig={kubeconfig_path}",
             "config",
             "get-contexts",

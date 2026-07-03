@@ -81,6 +81,53 @@ SOURCE_TUI = "tui"
 SOURCE_DIRECT = "direct"
 
 
+# ---------------------------------------------------------------------------
+# Fault Intent Schema — SINGLE SOURCE OF TRUTH
+#
+# TUI (submit_fault_intent), CLI, and SDK (_FAULT_INTENT_SCHEMA) all describe
+# the same interface. Valid values are defined HERE; entry-point modules import
+# these constants instead of maintaining separate copies.
+# ---------------------------------------------------------------------------
+
+INTENT_SCOPES: tuple[str, ...] = (
+    "pod", "node", "container",
+    "deployment", "statefulset", "daemonset",
+    "service",
+)
+"""K8s resource family the fault attaches to."""
+
+INTENT_TARGETS: tuple[str, ...] = (
+    # ChaosBlade subsystems
+    "cpu", "mem", "network", "disk", "process",
+    # kubectl-native resource/subsystem types
+    "pod", "finalizer", "replicas", "schedule", "pvc",
+    "dns", "image", "probe", "volume", "cni", "endpoint",
+)
+"""Subsystem under attack — MUST be fault target TYPE, never a resource name."""
+
+INTENT_ACTIONS: tuple[str, ...] = (
+    # ChaosBlade
+    "fullload", "load", "delay", "loss", "drop", "fill", "kill", "burn",
+    "stop",
+    # kubectl-native
+    "patch", "cordon", "taint", "delete", "drain", "scale",
+    "corrupt", "duplicate",
+)
+"""Concrete fault action verb."""
+
+INTENT_TARGET_DESCRIPTION: str = (
+    "Subsystem under attack (NOT the resource instance name). "
+    f"Common values: {'|'.join(INTENT_TARGETS)}. "
+    "MUST be the fault target TYPE, never a pod/node name."
+)
+
+INTENT_ACTION_DESCRIPTION: str = (
+    "Concrete fault action verb. "
+    "ChaosBlade: fullload|load|delay|loss|drop|fill|kill|burn|stop. "
+    "kubectl-native: patch|cordon|taint|delete|drain|scale|corrupt|duplicate."
+)
+
+
 @dataclass(frozen=True, eq=True)
 class FaultSpec:
     """Single source of truth for 'what fault to inject where'.

@@ -128,10 +128,12 @@ class TestShouldContinueExecuteLoop:
         assert should_continue_execute_loop(state) == "verifier"
 
     @patch("chaos_agent.agent.router.settings")
-    def test_has_error_goes_to_end(self, mock_settings):
+    def test_has_error_goes_to_verifier(self, mock_settings):
+        """Error from execute_loop must not skip verifier — the verifier
+        checks whether the fault actually took effect."""
         mock_settings.max_execute_loop = 15
         state = {"execute_loop_count": 1, "blade_uid": None, "error": "failed"}
-        assert should_continue_execute_loop(state) == "end"
+        assert should_continue_execute_loop(state) == "verifier"
 
     @patch("chaos_agent.agent.router.settings")
     def test_max_iterations_goes_to_end(self, mock_settings):
@@ -146,15 +148,11 @@ class TestShouldContinueExecuteLoop:
         assert should_continue_execute_loop(state) == "continue"
 
     @patch("chaos_agent.agent.router.settings")
-    def test_replan_exhausted_with_terminal_error_goes_to_end(self, mock_settings):
-        # Regression: when ``execute_loop`` converts a post-max [REPLAN]
-        # request into a terminal failure (sets ``error`` but keeps
-        # ``replan_requested=False``), the router MUST take the "end"
-        # branch via the ``state.error`` check. Before the fix the
-        # router would fall through to "continue" because the side-
-        # effect block in execute_loop cleared ``error`` whenever
-        # [REPLAN] fired, regardless of ``replan_count`` — letting the
-        # LLM keep emitting [REPLAN] indefinitely.
+    def test_replan_exhausted_with_error_goes_to_verifier(self, mock_settings):
+        # When replan is exhausted and error is set, the router must still
+        # route to verifier — error means the injection action may have
+        # issues, but the verifier must check whether the fault actually
+        # took effect. Replan is not triggered because replan_count >= max.
         mock_settings.max_execute_loop = 15
         mock_settings.max_replan_count = 3
         mock_settings.replan_auto_trigger = False
@@ -165,7 +163,7 @@ class TestShouldContinueExecuteLoop:
             "replan_requested": False,
             "replan_count": 3,
         }
-        assert should_continue_execute_loop(state) == "end"
+        assert should_continue_execute_loop(state) == "verifier"
 
     @patch("chaos_agent.agent.router.settings")
     def test_injection_method_without_blade_uid_continues_if_tool_calls(self, mock_settings):
@@ -221,6 +219,10 @@ class TestRouteAfterSafety:
     def test_rejected_goes_to_reject(self):
         state = {"safety_status": "rejected"}
         assert route_after_safety(state) == "reject"
+
+    def test_retry_goes_to_agent_loop(self):
+        state = {"safety_status": "retry"}
+        assert route_after_safety(state) == "agent_loop"
 
     def test_safe_with_confirmation(self):
         state = {"safety_status": "safe", "needs_confirmation": True}
@@ -458,6 +460,15 @@ class TestSchemeBVerifierRouting:
 
     def test_route_after_finalize_no_verification_loops(self):
         assert route_after_finalize({"verification": None}) == "verifier_loop"
+
+    def test_route_after_finalize_replan_requested(self):
+        assert route_after_finalize({"replan_requested": True}) == "replan"
+
+    def test_route_after_finalize_replan_takes_priority_over_verification(self):
+        # replan_requested must be checked BEFORE verification
+        assert route_after_finalize(
+            {"replan_requested": True, "verification": {"level": "verified"}}
+        ) == "replan"
 
     # ---- recover variants ----
     def test_recover_count_at_max_in_layer2_finalizes(self):

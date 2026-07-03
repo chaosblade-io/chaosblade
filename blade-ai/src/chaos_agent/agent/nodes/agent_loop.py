@@ -246,14 +246,17 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         # --- Replan entry detection ---
         replan_context = state.get("replan_context")
         replan_history = state.get("replan_history")
-        is_replan = replan_context is not None and state.get("replan_count", 0) > 0
+        # is_replan is True when replan_context exists AND at least one replan
+        # counter (execute_loop or verify) has been incremented.
+        _total_replan = state.get("replan_count", 0) + state.get("verify_replan_count", 0)
+        is_replan = replan_context is not None and _total_replan > 0
 
-        if is_replan and count > 1 and state.get("_replan_loop_reset") != state.get("replan_count"):
+        if is_replan and count > 1 and state.get("_replan_loop_reset") != _total_replan:
             # Reset agent_loop_count once on first entry after replan.
             # Subsequent iterations must NOT reset (otherwise MAX_AGENT_LOOP
             # safety check can never trigger — unbounded loop risk).
             # We detect "first entry" by checking if _replan_loop_reset
-            # hasn't been set to current replan_count yet.
+            # hasn't been set to current total replan count yet.
             count = 1
 
         tracker = get_tracker(task_id)
@@ -325,21 +328,35 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             _validated_labels = _extract_validated_labels_from_history(messages)
             _pending_label_spec: dict | None = None
             if _validated_labels:
-                _spec_for_labels = read_fault_spec(state)
-                if _spec_for_labels and dict(_spec_for_labels.labels) != _validated_labels:
-                    _pending_label_spec = _spec_for_labels.replace(
-                        labels=_validated_labels
-                    ).to_dict()
+                _raw_spec = state.get("fault_spec")
+                if isinstance(_raw_spec, dict):
+                    _current_labels = _raw_spec.get("labels") or {}
+                    if isinstance(_current_labels, dict) and _current_labels != _validated_labels:
+                        # Surgical update: only modify labels, preserve all
+                        # other fields (especially namespace) exactly as-is.
+                        # Previous impl used FaultSpec round-trip which could
+                        # propagate corrupted state on full overwrite.
+                        _pending_label_spec = {**_raw_spec, "labels": _validated_labels}
 
             # Inject replan error context as HumanMessage
             if is_replan:
-                error_msg = HumanMessage(content=(
-                    f"[REPLAN CONTEXT] Phase 2 execution failed. Please analyze the error "
-                    f"and generate a corrected plan.\n\n"
-                    f"Error: {replan_context.get('error_summary', 'Unknown')}\n"
-                    f"Failed tool calls: {json.dumps(replan_context.get('failed_tool_calls', []), ensure_ascii=False)}\n"
-                    f"Existing blade UIDs: {replan_context.get('existing_blade_uids', [])}\n"
-                ))
+                _trigger = replan_context.get("trigger", "execute_loop")
+                if _trigger == "verify_replan":
+                    error_msg = HumanMessage(content=(
+                        f"[REPLAN CONTEXT] Verification found the fault did NOT take effect "
+                        f"after injection. Please analyze the verifier findings and generate "
+                        f"a corrected plan using an alternative injection method.\n\n"
+                        f"Summary: {replan_context.get('error_summary', 'Unknown')}\n"
+                        f"Residuals cleaned: {replan_context.get('residuals_description', 'None')}\n"
+                    ))
+                else:
+                    error_msg = HumanMessage(content=(
+                        f"[REPLAN CONTEXT] Phase 2 execution failed. Please analyze the error "
+                        f"and generate a corrected plan.\n\n"
+                        f"Error: {replan_context.get('error_summary', 'Unknown')}\n"
+                        f"Failed tool calls: {json.dumps(replan_context.get('failed_tool_calls', []), ensure_ascii=False)}\n"
+                        f"Existing blade UIDs: {replan_context.get('existing_blade_uids', [])}\n"
+                    ))
                 messages = messages + [error_msg]
 
             # Collect env info (cached per task_id)
@@ -512,7 +529,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         # Mark that the replan loop counter has been reset for this replan
         # attempt, so subsequent iterations don't reset again.
         if is_replan and count == 1:
-            result["_replan_loop_reset"] = state.get("replan_count")
+            result["_replan_loop_reset"] = state.get("replan_count", 0) + state.get("verify_replan_count", 0)
 
         # Apply deferred validated label update (computed pre-LLM)
         if _pending_label_spec:

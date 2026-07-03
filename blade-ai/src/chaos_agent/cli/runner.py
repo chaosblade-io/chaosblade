@@ -1249,12 +1249,15 @@ class AgentRunner:
             skill_name = read_active_skill_name(initial_state)
             inject_tui_session_id = initial_state.get("tui_session_id", "") or ""
 
-            # Write recover initial state to TaskStore (keyed by inject_task_id —
-            # the drill-level identifier; recover outcome updates the same row).
+            # Mark the inject task as "recovering" in TaskStore so that
+            # query_active_experiments no longer returns it.  We use
+            # update_task_state (direct column write) instead of upsert to
+            # avoid overwriting the inject task's operation / result / verification.
+            # finalize_recover_verification will later set it to "recovered".
             try:
                 from chaos_agent.persistence.task_store import get_task_store
                 store = await get_task_store()
-                await store.upsert(inject_task_id, operation="recover", blade_uid=blade_uid, skill_name=skill_name)
+                await store.update_task_state(inject_task_id, "recovering")
             except Exception:
                 logger.warning(f"Failed to write recover state to TaskStore for {inject_task_id}")
 

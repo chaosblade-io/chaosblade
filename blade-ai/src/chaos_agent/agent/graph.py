@@ -381,9 +381,11 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
         {"agent_loop": "agent_loop", "safety_check": "safety_check", "reject": "reject"},
     )
 
-    # safety_check → confirmation_gate or baseline_capture or reject
+    # safety_check → confirmation_gate or baseline_capture or reject or agent_loop
     # (execute_loop is no longer a direct destination from safety_check;
     #  all modes go through baseline_capture first)
+    # "agent_loop" is the retry path for recoverable issues (e.g. no skill
+    #  activated) — safety_check appends a HumanMessage and routes back.
     graph.add_conditional_edges(
         "safety_check",
         route_after_safety,
@@ -391,6 +393,7 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
             "confirmation_gate": "confirmation_gate",
             "baseline_capture": "baseline_capture",
             "reject": "reject",
+            "agent_loop": "agent_loop",
         },
     )
 
@@ -498,13 +501,15 @@ def build_inject_graph(phase1_tools: list, phase2_tools: list, verifier_tools: l
                 "done": "se_detect",
             },
         )
-    # finalize_verification → se_detect (done) or back to verifier_loop (reverify).
+    # finalize_verification → se_detect (done), back to verifier_loop (reverify),
+    # or replan to agent_loop (verification failed — unverified + L2 failed).
     graph.add_conditional_edges(
         "finalize_verification",
         route_after_finalize,
         {
             "verifier_loop": "verifier_loop",
             "se_detect": "se_detect",
+            "replan": "agent_loop",
         },
     )
 

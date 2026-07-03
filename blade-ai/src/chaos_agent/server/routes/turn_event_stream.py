@@ -32,6 +32,7 @@ from chaos_agent.memory.session_finalizer import (
 )
 from chaos_agent.server.routes.turn_interrupt import (
     ConfirmTimeout,
+    _KEEPALIVE_FRAME,
     content_from_interrupt_payload,
     extract_pending_interrupt,
     format_auto_approve_info,
@@ -120,9 +121,24 @@ def _convert_postmortem_status(status_evt, turn_id: str) -> StreamEvent | None:
 # Merged graph + status stream
 # ---------------------------------------------------------------------------
 
+# Heartbeat interval for the main SSE stream (seconds). During long-running
+# operations (LLM thinking, tool execution), if no graph/status events arrive
+# within this window, a heartbeat sentinel is pushed to the unified queue.
+# The downstream ``_drain_merged`` converts it to a ``: keepalive\n\n`` SSE
+# comment that:
+#   - Keeps the TCP connection alive (prevents OS/proxy idle timeout)
+#   - Prevents Starlette ``req.is_disconnected()`` false positives
+#   - Tells the client the server is still working
+_STREAM_HEARTBEAT_INTERVAL_S = 15
+
+
 async def _merged_stream(graph_iter, tracker_queue: asyncio.Queue):
     """Yield ``("graph", event)`` / ``("status", event)`` tuples from two
-    concurrent sources (LangGraph astream_events + status tracker queue)."""
+    concurrent sources (LangGraph astream_events + status tracker queue).
+
+    Also yields ``("heartbeat", None)`` every ``_STREAM_HEARTBEAT_INTERVAL_S``
+    seconds when no real events arrive, keeping the SSE connection alive.
+    """
     unified: asyncio.Queue = asyncio.Queue()
     graph_done = object()
 
@@ -141,15 +157,33 @@ async def _merged_stream(graph_iter, tracker_queue: asyncio.Queue):
         except asyncio.CancelledError:
             pass
 
+    async def _heartbeat_pump():
+        """Periodically push heartbeat sentinels when no real events flow."""
+        try:
+            while True:
+                await asyncio.sleep(_STREAM_HEARTBEAT_INTERVAL_S)
+                await unified.put(("heartbeat", None))
+        except asyncio.CancelledError:
+            pass
+
     g_task = asyncio.create_task(_graph_pump())
     s_task = asyncio.create_task(_status_pump())
+    h_task = asyncio.create_task(_heartbeat_pump())
     try:
         while True:
             kind, payload = await unified.get()
+            if kind == "heartbeat":
+                yield kind, payload
+                continue
             if kind == "graph_done":
                 s_task.cancel()
+                h_task.cancel()
                 try:
                     await s_task
+                except asyncio.CancelledError:
+                    pass
+                try:
+                    await h_task
                 except asyncio.CancelledError:
                     pass
                 while True:
@@ -157,7 +191,7 @@ async def _merged_stream(graph_iter, tracker_queue: asyncio.Queue):
                         nk, np = unified.get_nowait()
                     except asyncio.QueueEmpty:
                         break
-                    if nk == "graph_done":
+                    if nk in ("graph_done", "heartbeat"):
                         continue
                     yield nk, np
                 while True:
@@ -183,6 +217,12 @@ async def _merged_stream(graph_iter, tracker_queue: asyncio.Queue):
             g_task.cancel()
             try:
                 await g_task
+            except asyncio.CancelledError:
+                pass
+        if not h_task.done():
+            h_task.cancel()
+            try:
+                await h_task
             except asyncio.CancelledError:
                 pass
 
@@ -228,9 +268,21 @@ class ClientDisconnected(Exception):
 async def _drain_merged(merged_iter, turn_id, batcher, sidewrite, converters, req, *, source="pipeline"):
     """Consume a merged stream, yielding SSE frames.
 
+    Handles three kinds from ``_merged_stream``:
+      - ``"graph"`` — LangGraph streaming events → parsed, batched, yielded
+      - ``"status"`` — status tracker events → converted, yielded
+      - ``"heartbeat"`` — keepalive sentinel → yields SSE comment to keep
+        the TCP connection alive and prevent ``is_disconnected()`` false
+        positives during long-running operations (LLM thinking, tool exec).
+
     Raises ``ClientDisconnected`` if the client drops the connection.
     """
     async for kind, payload in merged_iter:
+        if kind == "heartbeat":
+            # Yield SSE comment (invisible to the JSON parser on the client
+            # but keeps the TCP socket active).
+            yield _KEEPALIVE_FRAME
+            continue
         if await req.is_disconnected():
             raise ClientDisconnected()
         if kind == "graph":
@@ -287,11 +339,14 @@ async def _drain_interrupts(graph, config, ctx, batcher, sidewrite, converters):
             sidewrite(confirm_evt)
             yield confirm_evt.to_sse()
 
-            answer, keepalives = await wait_for_confirmation(
+            answer = None
+            async for frame in wait_for_confirmation(
                 ctx.store, ctx.turn_id, settings.confirm_wait_timeout,
-            )
-            for ka in keepalives:
-                yield ka
+            ):
+                if frame == _KEEPALIVE_FRAME:
+                    yield frame  # real-time keepalive to client
+                else:
+                    answer = frame  # user's answer
 
             normalised = answer if node == "plan_builder" else normalise_answer(answer)
 

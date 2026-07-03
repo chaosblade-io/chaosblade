@@ -244,7 +244,8 @@ def get_intent_output_section() -> str:
     return """# Output
 
 - Language: Chinese
-- Format: structured plain text (no horizontal lines, no dividers, no repeated dashes)
+- Format: structured plain text
+- NEVER output horizontal rules, repeated dashes (---), or any visual dividers
 - No emoji"""
 
 

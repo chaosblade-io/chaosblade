@@ -56,7 +56,9 @@ async def recover_handler(state: AgentState) -> dict:
     # Query active (injecting/injected) experiments from task_store
     try:
         store = await get_task_store()
-        active_tasks = await store.query_active()
+        # 多租户隔离：仅查询当前租户的活跃实验
+        _tenant_id = state.get("tenant_id", "") or ""
+        active_tasks = await store.query_active(tenant_id=_tenant_id)
 
         if not active_tasks:
             msg = "当前没有活跃的故障注入实验，无需恢复。"

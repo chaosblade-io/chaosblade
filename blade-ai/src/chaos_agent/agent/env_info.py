@@ -65,6 +65,8 @@ async def _get_blade_version() -> str:
     blade = settings._resolve_blade_path()
     if not blade:
         return "not installed"
+    from chaos_agent.utils.blade_paths import resolve_exec_path
+    blade = resolve_exec_path(blade)
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(

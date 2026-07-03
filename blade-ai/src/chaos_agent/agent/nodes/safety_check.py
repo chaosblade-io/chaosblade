@@ -2,9 +2,12 @@
 
 import logging
 
+from langchain_core.messages import HumanMessage
+
 from chaos_agent.agent.nodes._conflict_check import check_blade_conflicts
 from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig, sync_kubewiz_runtime
 from chaos_agent.agent.nodes._store_sync import sync_to_store, sync_node_status_to_session
+from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.safety_score import (
     compute_safety_score,
     maybe_escalate_status,
@@ -175,19 +178,31 @@ async def safety_check(state: AgentState) -> dict:
         await sync_to_store(state, result)
         return result
 
-    # 2. Skill existence
+    # 2. Skill existence — recoverable: feed back to agent_loop
     if not skill_name:
-        tracker.fail("No skill activated")
+        tracker.start(
+            StatusCategory.NODE,
+            "safety_check",
+            "No skill activated — routing back to agent_loop for activation",
+            {"reason": "no_skill", "action": "retry"},
+        )
         sync_node_status_to_session(state, "safety_check",
-            "Safety check rejected: no skill activated",
-            detail={"safety_status": "rejected", "reason": "no_skill"})
+            "Safety check: no skill activated — returning to planner",
+            detail={"safety_status": "retry", "reason": "no_skill"})
+        retry_msg = HumanMessage(content=(
+            "No skill activated. Select the most appropriate skill from "
+            "the Skill Index in your system prompt and call `activate_skill` now."
+        ))
+        messages = list(state.get("messages", []))
+        messages.append(retry_msg)
         result = {
-            "safety_status": "rejected",
-            "safety_reason": "No skill activated",
-            **fail_state(FailureCategory.PREREQUISITE_FAILED, "no skill activated"),
+            "safety_status": "retry",
+            "safety_reason": "No skill activated — returned to planner for activation",
+            "messages": messages,
         }
         result = _attach_safety_score(result, spec, state)
         await sync_to_store(state, result)
+        tracker.complete("Routed back to agent_loop for skill activation")
         return result
 
     # 3. Basic target validation — spec must at least carry a scope
@@ -218,6 +233,7 @@ async def safety_check(state: AgentState) -> dict:
     # query fails — never blocks safety_check.
     deep_signal: tuple[int, str] | None = None
     if settings.safety_score_topology_deep:
+        await dispatch_node_message("safety_check", "正在获取拓扑信号（副本数）...\n\n")
         deep_signal = await _get_topology_deep_signal(spec, kubeconfig or "")
 
     # 4. Blade conflict detection — record result, do NOT early-return.
@@ -229,6 +245,7 @@ async def safety_check(state: AgentState) -> dict:
     conflict_extra: dict = {}
     _can_reach_cluster = bool(kubeconfig) or settings.kube_connection_mode == "kubewiz"
     if _can_reach_cluster:
+        await dispatch_node_message("safety_check", "正在检查集群冲突实验...\n\n")
         namespace = spec.namespace
         labels = ",".join(f"{k}={v}" for k, v in spec.labels.items())
         target_names = ",".join(spec.names)
@@ -298,6 +315,7 @@ async def safety_check(state: AgentState) -> dict:
     health_rejected = False
     if settings.target_health_check_enabled:
         try:
+            await dispatch_node_message("safety_check", "正在检查目标健康状态...\n\n")
             from chaos_agent.agent.target_health import assess_target_health
 
             target_payload = {
@@ -330,6 +348,7 @@ async def safety_check(state: AgentState) -> dict:
     feas_rejected = False
     if settings.feasibility_check_enabled:
         try:
+            await dispatch_node_message("safety_check", "正在评估注入可行性...\n\n")
             from chaos_agent.agent.feasibility import assess_feasibility, FeasibilitySeverity
 
             feas = await assess_feasibility(spec, kubeconfig or "")
@@ -439,6 +458,7 @@ async def safety_check(state: AgentState) -> dict:
 
     # Freeze approved_target for screener comparison (mirrors confirmation_gate).
     kubeconfig = state.get("kubeconfig", "")
+    await dispatch_node_message("safety_check", "正在发现目标 Pod 所有者...\n\n")
     owner_names = await discover_owner_names(
         spec.scope, spec.namespace, dict(spec.labels), kubeconfig,
     )

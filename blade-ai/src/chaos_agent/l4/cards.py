@@ -75,12 +75,17 @@ def _adapt_plan_confirm(payload: dict, thread_id: str) -> PendingCard:
     """
     skill = payload.get("skill_name") or "unknown"
     fault_intent = payload.get("fault_intent") or {}
+    fault_type = (
+        fault_intent.get("fault_type")
+        if isinstance(fault_intent, dict)
+        else ""
+    ) or payload.get("fault_type") or ""
     target = payload.get("target") or ""
     safety_status = payload.get("safety_status") or "unknown"
 
     title = f"执行前确认：{skill}"
-    if isinstance(fault_intent, dict) and fault_intent.get("fault_type"):
-        title = f"执行前确认：{fault_intent['fault_type']}"
+    if fault_type:
+        title = f"执行前确认：{fault_type}"
     summary_lines = [
         f"目标: {target}" if target else "",
         f"安全检查: {safety_status}",
@@ -91,6 +96,7 @@ def _adapt_plan_confirm(payload: dict, thread_id: str) -> PendingCard:
 
     details = {
         "skill_name": skill,
+        "fault_type": fault_type,
         "fault_intent": fault_intent,
         "target": target,
         "plan_summary": payload.get("plan_summary") or "",

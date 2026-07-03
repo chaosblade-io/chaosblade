@@ -49,7 +49,7 @@ injection tool. Pass a custom value only if the user specifies one.
 - Do NOT make dependent calls in parallel
 
 ### Avoid Redundancy
-- Do not re-activate a skill that is already active (check conversation history)
+- Do not call `activate_skill` more than once in the same Phase 1 session
 - Do not repeat cluster queries that were just answered in a previous tool result"""
 
 
@@ -144,15 +144,20 @@ def get_execution_directives_section(
         "Do NOT improvise methods not listed in the skill case.",
         "",
         "### Multi-Step Execution",
-        "A fault injection may consist of multiple atomic steps. When the skill case defines multiple steps:",
-        "- Execute each step IN ORDER — call the tool for each step, do NOT just describe what you will do",
+        "A fault injection may consist of multiple atomic INJECTION steps (the '## Execution Steps' section of the plan).",
+        "- Execute each injection step IN ORDER — call the tool for each step, do NOT just describe what you will do",
         "- Check result before proceeding to next step",
         "- A single step's success is progress, not completion — immediately call the next tool",
-        "- When ALL steps are done, output a brief conclusion (the verifier will handle verification)",
+        "- When ALL injection steps are done, output a brief conclusion and STOP",
+        "- Do NOT execute verification, observation, or recovery steps — those are handled by separate phases",
         "",
         "### Parameter Priority",
-        "When the skill case template uses a default value and the user specified",
-        "a different value, the USER'S value takes priority.",
+        "When conflicting sources specify a parameter value, follow this hierarchy",
+        "(highest → lowest):",
+        "1. Tool runtime behavior — if a tool rejects a value, adapt to its actual interface",
+        "2. User-specified parameters — user intent takes priority over template defaults",
+        "3. Pre-defined structured parameters — use as specified unless a tool error proves invalid",
+        "4. Skill case template defaults",
     ]
 
     if skill_name:
@@ -163,7 +168,9 @@ def get_execution_directives_section(
         parts.append("### STRUCTURED FAULT PARAMETERS (pre-defined)")
         parts.append("The user has pre-defined the fault parameters. Use these EXACT values:")
         parts.append(f"  {structured_params_hint}")
-        parts.append("Do NOT override these values.")
+        parts.append("Do NOT override these values — UNLESS the tool returns an error")
+        parts.append("proving a value is invalid for the current tool version.")
+        parts.append("In that case, adapt to the tool's actual interface (see Parameter Priority).")
 
     if user_params_hint:
         parts.append("")
@@ -176,7 +183,7 @@ def get_execution_directives_section(
         plan_ref = f" (saved at {plan_path})" if plan_path else ""
         parts.append("")
         parts.append(f"### EXECUTION PLAN{plan_ref}")
-        parts.append("This task was assessed as complex. Execute step by step:")
+        parts.append("This task was assessed as complex. Execute ONLY the '## Execution Steps' section from the plan below. Sections labeled 'Verification Methods', 'Rollback and Recovery', and 'Expected Impact' are for other phases — do NOT execute them.")
         parts.append(f"---\n{plan}\n---")
 
     return "\n".join(parts)

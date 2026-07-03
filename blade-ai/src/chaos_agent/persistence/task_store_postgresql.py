@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     blade_uid       TEXT,
     namespace       TEXT,
     target_name     TEXT,
+    tenant_id       TEXT DEFAULT '',
     error           TEXT,
     finished_at     TEXT,
     duration_ms     INTEGER DEFAULT 0,
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE UNIQUE INDEX IF NOT EXISTS uk_tasks_task_id ON tasks(task_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_task_state ON tasks(task_state);
 CREATE INDEX IF NOT EXISTS idx_tasks_namespace ON tasks(namespace);
+CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_gmt_create ON tasks(gmt_create);
 """
 
@@ -144,8 +146,40 @@ def _build_upsert_sql(table: str, columns: list[str], conflict_col: str = "task_
 
 
 def _record_to_dict(record) -> dict:
-    """Convert an asyncpg Record to a plain dict."""
-    return dict(record)
+    """Convert an asyncpg Record to a plain dict.
+
+    TIMESTAMPTZ columns are returned as datetime objects by asyncpg;
+    convert them back to ISO strings for consistency with the SQLite
+    backend and upstream code that expects string timestamps.
+    """
+    from datetime import datetime as _dt
+
+    d = dict(record)
+    for col in _TIMESTAMP_COLUMNS:
+        val = d.get(col)
+        if isinstance(val, _dt):
+            d[col] = val.isoformat()
+    return d
+
+
+# Columns declared as TIMESTAMPTZ in the DDL — asyncpg requires datetime objects.
+_TIMESTAMP_COLUMNS: frozenset[str] = frozenset(
+    {"gmt_create", "gmt_modified", "started_at", "finished_at"}
+)
+
+
+def _coerce_timestamps(columns: list[str], values: list) -> list:
+    """Convert ISO-string timestamps to datetime objects for asyncpg TIMESTAMPTZ."""
+    from datetime import datetime as _dt
+
+    result = list(values)
+    for i, col in enumerate(columns):
+        if col in _TIMESTAMP_COLUMNS and isinstance(result[i], str) and result[i]:
+            try:
+                result[i] = _dt.fromisoformat(result[i])
+            except (ValueError, TypeError):
+                pass
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +203,15 @@ class PostgreSQLBackend:
         """
         import asyncpg  # lazy import
 
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
+        pool = await asyncpg.create_pool(
+            dsn,
+            min_size=1,
+            max_size=5,
+            command_timeout=30,
+            server_settings={
+                "statement_timeout": "30000",
+            },
+        )
         backend = cls(pool)
         try:
             await backend.ensure_schema()
@@ -183,6 +225,14 @@ class PostgreSQLBackend:
 
     async def ensure_schema(self) -> None:
         async with self._pool.acquire() as conn:
+            # Pre-migration: add tenant_id column BEFORE running DDL, because
+            # DDL includes CREATE INDEX idx_tasks_tenant which requires the
+            # column to exist. Without this, ensure_schema() crashes on the
+            # index creation and the ALTER TABLE below never runs (chicken-and-egg).
+            try:
+                await conn.execute("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id TEXT DEFAULT ''")
+            except Exception:
+                pass
             # asyncpg does not support executescript; run statements individually
             # Split by semicolons, filter empty lines
             statements = [s.strip() for s in _SCHEMA_DDL.split(";") if s.strip()]
@@ -230,6 +280,7 @@ class PostgreSQLBackend:
                 await conn.execute("ALTER TABLE task_details ADD COLUMN kubectl_exec_pod_name TEXT")
             except Exception:
                 pass
+            # tenant_id migration already done above (pre-DDL)
 
     # -- tasks (narrow, hot) -------------------------------------------------
 
@@ -242,8 +293,9 @@ class PostgreSQLBackend:
 
     async def upsert_task(self, task_id: str, columns: list[str], values: list) -> None:
         sql, _ = _build_upsert_sql("tasks", columns)
+        coerced = _coerce_timestamps(columns, values)
         async with self._pool.acquire() as conn:
-            await conn.execute(sql, *values)
+            await conn.execute(sql, *coerced)
 
     async def select_tasks_ordered(self, limit: int, offset: int) -> list[dict]:
         async with self._pool.acquire() as conn:
@@ -261,10 +313,14 @@ class PostgreSQLBackend:
             )
             return [_record_to_dict(r) for r in rows]
 
-    async def select_active_tasks(self, namespace: str = "", target_name: str = "") -> list[dict]:
+    async def select_active_tasks(self, namespace: str = "", target_name: str = "", tenant_id: str = "") -> list[dict]:
         conditions = ["task_state IN ('injecting', 'injected')"]
         params: list = []
         idx = 0
+        if tenant_id:
+            idx += 1
+            conditions.append(f"tenant_id = ${idx}")
+            params.append(tenant_id)
         if namespace:
             idx += 1
             conditions.append(f"namespace = ${idx}")
@@ -308,8 +364,9 @@ class PostgreSQLBackend:
 
     async def upsert_details(self, task_id: str, columns: list[str], values: list) -> None:
         sql, _ = _build_upsert_sql("task_details", columns)
+        coerced = _coerce_timestamps(columns, values)
         async with self._pool.acquire() as conn:
-            await conn.execute(sql, *values)
+            await conn.execute(sql, *coerced)
 
     async def select_details_batch(self, task_ids: list[str]) -> list[dict]:
         if not task_ids:
@@ -350,6 +407,18 @@ class PostgreSQLBackend:
         gmt_create: str,
         gmt_modified: str,
     ) -> None:
+        from datetime import datetime as _dt
+
+        # Convert timestamp strings to datetime for TIMESTAMPTZ columns
+        try:
+            gmt_create_dt = _dt.fromisoformat(gmt_create) if isinstance(gmt_create, str) else gmt_create
+        except (ValueError, TypeError):
+            gmt_create_dt = gmt_create
+        try:
+            gmt_modified_dt = _dt.fromisoformat(gmt_modified) if isinstance(gmt_modified, str) else gmt_modified
+        except (ValueError, TypeError):
+            gmt_modified_dt = gmt_modified
+
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO task_spans "
@@ -358,7 +427,7 @@ class PostgreSQLBackend:
                 "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 task_id, node_name, start_time, end_time, duration_ms,
                 token_input, token_output, tool_calls_json, error,
-                gmt_create, gmt_modified,
+                gmt_create_dt, gmt_modified_dt,
             )
 
     async def update_task_summary(
@@ -371,6 +440,13 @@ class PostgreSQLBackend:
         llm_calls: int,
         gmt_modified: str,
     ) -> None:
+        from datetime import datetime as _dt
+
+        try:
+            gmt_modified_dt = _dt.fromisoformat(gmt_modified) if isinstance(gmt_modified, str) else gmt_modified
+        except (ValueError, TypeError):
+            gmt_modified_dt = gmt_modified
+
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE task_details SET "
@@ -382,7 +458,7 @@ class PostgreSQLBackend:
                 "  gmt_modified = $6 "
                 "WHERE task_id = $7",
                 token_input, token_output, duration_ms,
-                tool_calls, llm_calls, gmt_modified, task_id,
+                tool_calls, llm_calls, gmt_modified_dt, task_id,
             )
 
     async def select_spans(self, task_id: str) -> list[dict]:
@@ -397,8 +473,9 @@ class PostgreSQLBackend:
 
     async def upsert_session(self, session_id: str, columns: list[str], values: list) -> None:
         sql, _ = _build_upsert_sql("sessions", columns, conflict_col="session_id")
+        coerced = _coerce_timestamps(columns, values)
         async with self._pool.acquire() as conn:
-            await conn.execute(sql, *values)
+            await conn.execute(sql, *coerced)
 
     async def select_session(self, session_id: str) -> Optional[dict]:
         async with self._pool.acquire() as conn:

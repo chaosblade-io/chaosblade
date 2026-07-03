@@ -54,37 +54,6 @@ _DIR_PREFIX_SCOPE_MAP: dict[str, str] = {
     "节点容器运行时": "node",
 }
 
-# ── Scope prefix map (for path-based case validation) ──
-# Maps FaultSpec.scope → directory name prefixes that belong to that scope.
-_SCOPE_PREFIX_MAP: dict[str, tuple[str, ...]] = {
-    "node": ("Node_", "节点"),
-    "pod": ("Pod_",),
-    "service": ("Service_",),
-    "workload": ("workload_", "HPA_", "DaemonSet_"),
-}
-
-# ── Action keyword map (for path-based case validation) ──
-# Maps FaultSpec.blade_action → keywords expected in the directory name.
-_ACTION_KEYWORD_MAP: dict[str, tuple[str, ...]] = {
-    "fill": ("填充", "fill", "使用率", "空间"),
-    "fullload": ("fullload", "满载", "使用率"),
-    "burn": ("burn", "IO", "读写"),
-    "load": ("load", "加载", "压力"),
-    "drop": ("drop", "丢包", "丢弃"),
-    "loss": ("loss", "丢包", "丢失"),
-    "kill": ("kill", "杀死"),
-    "delete": ("delete", "删除"),
-    "fail": ("fail", "失败", "篡改"),
-    "delay": ("delay", "延迟"),
-    "dns": ("dns", "DNS", "域名"),
-}
-
-# Related scopes: a pod-scope fault may legitimately use a workload/service case.
-_RELATED_SCOPES: dict[str, list[str]] = {
-    "pod": ["workload", "service"],
-    "node": [],
-}
-
 
 _CASE_NAME_RE = re.compile(r"\*\*用例名称\*\*\s*(.+?)\s*$", re.MULTILINE)
 
@@ -138,37 +107,6 @@ def _extract_catalogue_dir_name(case_path: str) -> str:
     if catalogue_idx + 1 < len(parts):
         return parts[catalogue_idx + 1]
     return ""
-
-
-def _validate_case_path_against_spec(case_path: str, spec) -> bool:
-    """Validate skill case path directory matches FaultSpec using keyword maps.
-
-    Returns True if valid (or cannot determine), False if definite mismatch.
-    """
-    dir_name = _extract_catalogue_dir_name(case_path)
-    if not dir_name:
-        return True  # Cannot determine, assume valid
-
-    # 1. Scope check: directory prefix must match spec.scope
-    if spec.scope:
-        valid_prefixes = _SCOPE_PREFIX_MAP.get(spec.scope, ())
-        if valid_prefixes and not any(dir_name.startswith(p) for p in valid_prefixes):
-            # Check related scopes (pod case may be under workload directory)
-            related = _RELATED_SCOPES.get(spec.scope, [])
-            all_prefixes = list(valid_prefixes)
-            for rs in related:
-                all_prefixes.extend(_SCOPE_PREFIX_MAP.get(rs, ()))
-            if not any(dir_name.startswith(p) for p in all_prefixes):
-                return False  # Scope mismatch
-
-    # 2. Action check: if FaultSpec.blade_action has keywords, dir_name should contain them
-    if spec.blade_action:
-        action_keywords = _ACTION_KEYWORD_MAP.get(spec.blade_action)
-        if action_keywords:
-            if not any(kw in dir_name for kw in action_keywords):
-                return False  # Action mismatch
-
-    return True
 
 
 def _find_skill_case_by_path(messages: list, resource_path: str) -> str:
@@ -461,35 +399,11 @@ async def extract_planning_metadata(state: AgentState) -> dict:
                 "from messages (%d chars)", len(skill_case),
             )
 
-    # 1a. Guard: validate that the chosen skill_case matches the fault_spec.
-    # After plan_change, the LLM may pick an unrelated case from the catalogue
-    # (e.g. DiskPressure case for a pod-kill fault). Detect the mismatch and
-    # clear the content so the verifier falls back to Free mode.
-    #
-    # Validation strategy: use the case's resource PATH (directory name) for
-    # universal validation that works for both ChaosBlade and kubectl-native
-    # cases. Directory names carry scope + target + action semantics
-    # (e.g. "Pod_被删除", "Node_CPU满载") validated via _SCOPE_PREFIX_MAP
-    # and _ACTION_KEYWORD_MAP.
+    # NOTE: Guard 1a (path-based case validation) removed.
+    # LLM explicitly chooses the skill case via finish_planning — trust that decision.
+    # Static keyword matching is strictly less capable than model reasoning and
+    # produces false negatives (e.g. "Pod_OOM内存异常" vs blade_action="load").
     _case_content = result.get("skill_case_content") or state.get("skill_case_content") or ""
-    if _case_content:
-        _cur_spec = read_fault_spec(state)
-        if _cur_spec and _cur_spec.scope:
-            # Get case path from finish_planning args or message history
-            _case_path = _extract_chosen_skill_case_path(messages)
-            if not _case_path:
-                _case_path = _extract_last_skill_resource_path(messages)
-
-            if _case_path and not _validate_case_path_against_spec(_case_path, _cur_spec):
-                logger.warning(
-                    "extract_planning_metadata: skill_case path mismatch — "
-                    "spec=(scope=%s, action=%s) but case path=%s. "
-                    "Clearing skill_case_content to avoid wrong "
-                    "verification steps.",
-                    _cur_spec.scope, _cur_spec.blade_action, _case_path,
-                )
-                result["skill_case_content"] = None
-                _case_content = ""
 
     # 1b. Guard: reject planning if no catalogue use-case was loaded.
     # Only enforce when messages exist (agent_loop has run). Empty messages

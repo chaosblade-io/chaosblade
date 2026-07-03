@@ -38,6 +38,7 @@ class Layer1Status(str, Enum):
     ERROR = "error"
     SKIPPED = "skipped"
     UNKNOWN = "unknown"
+    IN_PROGRESS = "in_progress"
 
 
 class Layer2Status(str, Enum):
@@ -154,6 +155,17 @@ class Layer1Result(BaseModel):
         if self.expired:
             return False
         return self.status in (Layer1Status.FAILED, Layer1Status.ERROR)
+
+    def is_in_progress(self) -> bool:
+        """True when Layer 1 ReAct loop is still executing recovery actions.
+
+        Used by ``finalize_recover_verification`` to detect that the LLM
+        bypassed the Layer 1 text output (e.g. called
+        ``submit_recover_verification`` directly while still in the
+        Layer 1 ReAct loop).  In that case the finalize node should
+        attempt to recover the Layer 1 result from message history.
+        """
+        return self.status == Layer1Status.IN_PROGRESS
 
 
 class Layer2Result(BaseModel):

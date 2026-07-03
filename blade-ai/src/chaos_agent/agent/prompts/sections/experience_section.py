@@ -1,10 +1,10 @@
-"""Experience section: AGENT.md experience accumulation."""
+"""Experience section: EXPERIENCE.md experience accumulation."""
 
 
 def get_experience_section() -> str:
-    """Accumulated experience from past operations (loaded from ~/.blade-ai/AGENT.md).
+    """Accumulated experience from past operations (loaded from ~/.blade-ai/EXPERIENCE.md).
 
-    Returns empty string if no AGENT.md exists, so the section is simply
+    Returns empty string if no EXPERIENCE.md exists, so the section is simply
     omitted from the assembled prompt.
     """
     from chaos_agent.agent.experience import load_agent_experience

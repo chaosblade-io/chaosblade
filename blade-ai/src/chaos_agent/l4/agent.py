@@ -29,8 +29,6 @@ from chaos_agent.l4.adapter import (
 )
 from chaos_agent.l4.cards import interrupt_to_card
 from chaos_agent.l4.error_mapping import (
-    _build_step_result_from_error,
-    map_error_class,
     map_to_agent_error,
 )
 from chaos_agent.l4.schemas import (
@@ -358,28 +356,37 @@ _PHASE_STEP_MAP: dict[str, str] = {
     "verifier_loop": "verification",
     "finalize_verification": "verification",
     "save_memory": "postmortem",
+    # Recover graph phases
+    "recover_verifier_loop": "recovery",
+    "finalize_recover_verification": "recovery",
 }
 
 
 _logging_configured = False
+_log_dir: "Path | None" = None
 
 
 def _setup_logging() -> None:
-    """Configure file-based logging for L4 SDK mode (idempotent)."""
-    global _logging_configured
+    """Configure file-based logging for L4 SDK mode (idempotent).
+
+    The handler is set up once per process, but the log directory is
+    re-created on every call via ``ensure_log_dir()`` so that deleting
+    the folder at runtime does not permanently silence file logging.
+    """
+    global _logging_configured, _log_dir
     if _logging_configured:
         return
     _logging_configured = True
 
     from chaos_agent.config.settings import settings
 
-    log_dir = settings.resolved_memory_dir / "logs"
+    _log_dir = settings.resolved_memory_dir / "logs"
     try:
-        log_dir.mkdir(parents=True, exist_ok=True)
+        _log_dir.mkdir(parents=True, exist_ok=True)
     except Exception:
         return
 
-    log_path = log_dir / "l4.log"
+    log_path = _log_dir / "l4.log"
     try:
         handler = RotatingFileHandler(
             log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
@@ -403,6 +410,15 @@ def _setup_logging() -> None:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+def ensure_log_dir() -> None:
+    """Re-create the log directory if it was removed at runtime."""
+    if _log_dir is not None:
+        try:
+            _log_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+
 class _CancelRequested(Exception):
     """Internal: break out of event loop into try/finally cleanup."""
 
@@ -410,9 +426,11 @@ class _CancelRequested(Exception):
 class _ChaosAgentPool:
     """Holds compiled inject/recover graphs.
 
-    Uses MemorySaver: pure-dict, no IO/loop binding. Works for both
-    sync entry (CLI — each ``asyncio.run()`` creates a fresh loop) and
-    async entry (platform — stays in main loop across calls).
+    Sync entry (CLI): uses MemorySaver (pure-dict, no IO/loop binding;
+    safe for ``asyncio.run()`` which creates a fresh loop each call).
+
+    Async entry (platform): passes ``checkpointer=None`` so factory
+    uses AsyncSqliteSaver — persistent across service restarts.
     """
 
     inject_graph = None
@@ -460,14 +478,12 @@ class _ChaosAgentPool:
         with self._init_lock:
             if self._initialized:
                 return
-            from langgraph.checkpoint.memory import MemorySaver
-
             from chaos_agent.agent.factory import create_agent
 
             ctx = self._build_graphs_sync()
             registry = ctx["registry"]
-            checkpointer = MemorySaver()
-            agents = asyncio.run(create_agent(registry, checkpointer=checkpointer))
+            # None → factory uses AsyncSqliteSaver (persistent).
+            agents = asyncio.run(create_agent(registry, checkpointer=None))
             self._commit(agents, registry)
 
     async def async_ensure_initialized(self) -> None:
@@ -485,14 +501,14 @@ class _ChaosAgentPool:
         async with cls._async_init_lock:
             if self._initialized:
                 return
-            from langgraph.checkpoint.memory import MemorySaver
-
             from chaos_agent.agent.factory import create_agent
 
             ctx = self._build_graphs_sync()
             registry = ctx["registry"]
-            checkpointer = MemorySaver()
-            agents = await create_agent(registry, checkpointer=checkpointer)
+            # Pass None → factory uses AsyncSqliteSaver (persistent across restarts).
+            # MemorySaver was previously used here but caused thread state loss on
+            # service restart, breaking multi-turn clarify conversations.
+            agents = await create_agent(registry, checkpointer=None)
             self._commit(agents, registry)
 
 
@@ -674,22 +690,135 @@ class L4ResilienceAgent:
         except Exception:
             logger.debug("Failed to bootstrap session_store for recover %s", record_task_id)
 
-        # Run recover graph
+        # Run recover graph with streaming events (aligned with inject flow)
+        # Uses astream_events so phase transitions, tool calls, and LLM
+        # reasoning are emitted to the platform in real time — same as
+        # _run_inject_with_runtime.
         recover_result = None
-        try:
-            if runtime:
-                with runtime.step(
-                    "explicit_recover", attrs={"trajectory_id": trajectory_id}
-                ) as sr:
-                    recover_result = await pool.recover_graph.ainvoke(
-                        recover_initial, recover_config
+        current_step = None
+        current_step_cm = None
+        step_attrs_accumulator: dict = {}
+
+        async def _process_recover_event(event: dict) -> None:
+            nonlocal current_step, current_step_cm, step_attrs_accumulator
+            kind = event.get("event", "")
+
+            if kind == "on_custom_event":
+                name = event.get("name")
+                data = event.get("data", {})
+                if name == "phase_started" and runtime:
+                    node = data.get("node", "")
+                    phase = data.get("phase", "")
+                    target_step = _PHASE_STEP_MAP.get(node, node)
+                    current_step_name = (
+                        getattr(current_step, "name", None)
+                        if current_step
+                        else None
                     )
-                    sr.attrs["recovery_status"] = "completed"
-            else:
-                recover_result = await pool.recover_graph.ainvoke(
-                    recover_initial, recover_config
-                )
+                    if current_step_cm and current_step_name == target_step:
+                        # Reuse same step container
+                        pass
+                    else:
+                        if current_step_cm:
+                            for k, v in step_attrs_accumulator.items():
+                                current_step.attrs[k] = v
+                            current_step_cm.__exit__(None, None, None)
+                        cm = runtime.step(
+                            target_step,
+                            attrs={
+                                "phase": phase,
+                                "trajectory_id": trajectory_id,
+                            },
+                        )
+                        current_step = cm.__enter__()
+                        current_step_cm = cm
+                        step_attrs_accumulator = {}
+
+            elif kind == "on_tool_start":
+                tool_name = event.get("name", "")
+                tool_input = event.get("data", {}).get("input", {})
+                step_attrs_accumulator[f"tool.{tool_name}.input"] = str(tool_input)[
+                    :500
+                ]
+
+            elif kind == "on_tool_end":
+                tool_name = event.get("name", "")
+                output = event.get("data", {}).get("output", "")
+                step_attrs_accumulator[f"tool.{tool_name}.status"] = "ok"
+                if (
+                    tool_name in ("blade_destroy", "blade_status", "kubectl")
+                    and runtime
+                ):
+                    try:
+                        runtime.tool.execute(
+                            "sls_write_logs",
+                            {
+                                "task_id": task.task_id,
+                                "tool": tool_name,
+                                "phase": "recover",
+                                "output_preview": str(output)[:1000],
+                            },
+                        )
+                    except Exception:
+                        pass
+
+            elif kind == "on_chat_model_end" and runtime and current_step:
+                msg = _extract_aimessage(event.get("data", {}).get("output"))
+                if msg and hasattr(msg, "additional_kwargs"):
+                    rc = msg.additional_kwargs.get("reasoning_content", "")
+                    if (
+                        rc
+                        and hasattr(runtime, "trajectory")
+                        and runtime.trajectory
+                        and hasattr(runtime.trajectory, "thought_trace")
+                    ):
+                        runtime.trajectory.thought_trace.append(
+                            type(
+                                "ThoughtStep",
+                                (),
+                                {
+                                    "seq": len(runtime.trajectory.thought_trace) + 1,
+                                    "thought": rc[:500],
+                                    "action": "recover",
+                                },
+                            )()
+                        )
+
+            # Unified progress emission (same as inject)
+            if runtime and hasattr(runtime, "emit_event"):
+                for ev in _normalize_langgraph_event(event):
+                    runtime.emit_event(ev["kind"], ev)
+
+            if self._cancel_event.is_set():
+                raise _CancelRequested()
+
+        try:
+            async for event in pool.recover_graph.astream_events(
+                recover_initial, recover_config, version="v2"
+            ):
+                await _process_recover_event(event)
+
+            # Close last step container
+            if current_step_cm:
+                for k, v in step_attrs_accumulator.items():
+                    current_step.attrs[k] = v
+                current_step_cm.__exit__(None, None, None)
+                current_step_cm = None
+
+            # Get final state after streaming completes
+            recover_state = await pool.recover_graph.aget_state(recover_config)
+            recover_result = (
+                recover_state.values
+                if recover_state and recover_state.values
+                else {}
+            )
         except Exception as e:
+            # Close step container on error
+            if current_step_cm:
+                try:
+                    current_step_cm.__exit__(None, None, None)
+                except Exception:
+                    pass
             logger.exception("Explicit recover failed for inject_task_id=%s", inject_task_id)
             await finalize_recover_session(
                 _session_store,
@@ -814,6 +943,8 @@ class L4ResilienceAgent:
         if self._pool is None:
             _setup_logging()
             self._pool = _ChaosAgentPool()
+        else:
+            ensure_log_dir()
         self._pool.ensure_initialized()
         return self._pool
 
@@ -822,6 +953,8 @@ class L4ResilienceAgent:
         if self._pool is None:
             _setup_logging()
             self._pool = _ChaosAgentPool()
+        else:
+            ensure_log_dir()
         await self._pool.async_ensure_initialized()
         return self._pool
 
@@ -830,18 +963,15 @@ class L4ResilienceAgent:
         pool: _ChaosAgentPool,
         runtime,
         task,
-        healed: bool = False,
     ) -> L4TaskResult:
         """Full execution: inject → [interrupt] → [auto recover] → result.
 
         pool is passed from execute() to avoid nested asyncio.run().
 
-        runtime.finish() is called exactly once in the finally block of the
-        outermost call (healed=False), with the FINAL status (post-recovery).
-        This prevents the trajectory from being persisted with stale inject-phase
-        status when recovery downgrades the result to "degraded".
-
-        healed: marks self-heal recursion to avoid double finish and double heal.
+        runtime.finish() is called in the finally block with the FINAL status
+        (post-recovery). This prevents the trajectory from being persisted with
+        stale inject-phase status when recovery downgrades the result to
+        "degraded".
         """
         trajectory_id = make_trajectory_id(task.task_id)
         initial_state = test_task_to_initial_state(task)
@@ -870,15 +1000,6 @@ class L4ResilienceAgent:
             return final_result
 
         except Exception as e:
-            # C3 self-heal: single retry only
-            if runtime and hasattr(runtime, "heal") and not healed:
-                step_result = _build_step_result_from_error(e)
-                heal_result = runtime.heal(step_result, error_class=map_error_class(e))
-                if heal_result and getattr(heal_result, "healed", False):
-                    final_result = await self._async_execute(
-                        pool, runtime, task, healed=True
-                    )
-                    return final_result
             final_result = L4TaskResult(
                 task_id=task.task_id,
                 status="failed",
@@ -888,12 +1009,8 @@ class L4ResilienceAgent:
             return final_result
 
         finally:
-            # Only the outermost call (healed=False) is responsible for finish().
-            # Recursive heal calls return their result up; the outer finally
-            # then persists the trajectory with the final status.
             if (
-                not healed
-                and runtime is not None
+                runtime is not None
                 and hasattr(runtime, "finish")
                 and final_result is not None
             ):
@@ -1083,57 +1200,6 @@ class L4ResilienceAgent:
         except Exception:
             pass
 
-        # --- StatusTracker → runtime bridge ---
-        # Subscribe to blade-ai's internal tracker events and forward
-        # them as user-facing progress messages to the platform runtime.
-        # Only COMPLETED/FAILED events are forwarded (skip high-frequency
-        # STARTED/RUNNING updates and debug-only events).
-        _tracker_task: asyncio.Task | None = None
-        _tracker_queue = None
-        if runtime and hasattr(runtime, "emit_event"):
-            try:
-                from chaos_agent.observability.status_tracker import subscribe
-
-                _tracker_queue = subscribe(task.task_id)
-
-                async def _drain_tracker():
-                    while True:
-                        try:
-                            ev = await _tracker_queue.get()
-                        except asyncio.CancelledError:
-                            return
-                        if ev is None:
-                            return
-                        phase = ev.phase
-                        msg = ev.message or ""
-                        source = ev.source or ""
-                        detail = ev.detail or {}
-                        # Skip: no message, debug-only events, high-freq updates
-                        if not msg:
-                            continue
-                        if detail.get("debug"):
-                            continue
-                        if phase not in ("completed", "failed", "started"):
-                            continue
-                        # started 仅允许 postmortem 源穿透（避免高频 noise）
-                        if phase == "started" and source != "postmortem":
-                            continue
-                        level = {"completed": "ok", "failed": "error", "started": "info"}.get(phase, "info")
-                        try:
-                            runtime.emit_event("agent_progress", {
-                                "message": f"[{source}] {msg}",
-                                "source": source,
-                                "phase": phase,
-                                "level": level,
-                                "duration_ms": ev.duration_ms,
-                            })
-                        except Exception:
-                            pass
-
-                _tracker_task = asyncio.create_task(_drain_tracker())
-            except Exception:
-                _tracker_queue = None
-
         # --- Main execution flow ---
         try:
             async for event in pool.inject_graph.astream_events(
@@ -1178,18 +1244,6 @@ class L4ResilienceAgent:
                 trajectory_id=trajectory_id,
             )
         finally:
-            if _tracker_task and not _tracker_task.done():
-                _tracker_task.cancel()
-                try:
-                    await _tracker_task
-                except asyncio.CancelledError:
-                    pass
-            if _tracker_queue is not None:
-                try:
-                    from chaos_agent.observability.status_tracker import unsubscribe
-                    unsubscribe(task.task_id, _tracker_queue)
-                except Exception:
-                    pass
             if current_step_cm:
                 current_step_cm.__exit__(None, None, None)
                 current_step = None
@@ -1394,6 +1448,7 @@ class L4ResilienceAgent:
         task_state = infer_task_state(values)
         verification = read_inject_verification(values) or {}
         replan_count = values.get("replan_count", 0)
+        verify_replan_count = values.get("verify_replan_count", 0)
 
         ver_level = (
             verification.get("level", "unknown")
@@ -1423,7 +1478,7 @@ class L4ResilienceAgent:
         return {
             "success_rate": (1.0 if task_state in ("injected", "recovered") else 0.0),
             "coverage": 1.0 if fault_type_from_state(values) else 0.5,
-            "flake_score": min(1.0, replan_count / 3.0),
+            "flake_score": min(1.0, (replan_count + verify_replan_count) / 3.0),
             "assert_confidence": level_confidence.get(ver_level, 0.3),
             "tool_success_rate": (1.0 if not read_operation_outcome(values).error else 0.5),
             "avg_duration_ms": duration_ms,
@@ -1805,6 +1860,12 @@ class L4ResilienceAgent:
         on_event: "Callable[[dict], None] | None" = None,
     ) -> ClarifyResult:
         from langchain_core.messages import HumanMessage
+        from chaos_agent.config.settings import settings as _settings
+
+        # Read tenant_id from ContextVar (set by blade_ai_context in platform
+        # tools_chaos.py) so it propagates into LangGraph state for
+        # load_memory / recover_handler tenant-scoped queries.
+        _tenant_id = getattr(_settings, "tenant_id", "") or ""
 
         config = {
             "configurable": {"thread_id": thread_id},
@@ -1852,6 +1913,7 @@ class L4ResilienceAgent:
                 "fault_spec": None,
                 "dry_run": False,
                 "interaction_mode": "tui",
+                "tenant_id": _tenant_id,
                 "kubeconfig": conn.get("kubeconfig", "") or "",
                 "kube_context": conn.get("kube_context", "") or "",
                 "kubewiz_cluster_uuid": conn.get("kubewiz_cluster_uuid", "") or "",
@@ -1872,6 +1934,7 @@ class L4ResilienceAgent:
                 "fault_spec": None,
                 "dry_run": False,
                 "interaction_mode": "tui",
+                "tenant_id": _tenant_id,
                 "kubeconfig": conn.get("kubeconfig", "") or "",
                 "kube_context": conn.get("kube_context", "") or "",
                 "kubewiz_cluster_uuid": conn.get("kubewiz_cluster_uuid", "") or "",
@@ -1887,6 +1950,7 @@ class L4ResilienceAgent:
                 "fault_spec": None,
                 "dry_run": False,
                 "interaction_mode": "tui",
+                "tenant_id": _tenant_id,
                 "kubeconfig": conn.get("kubeconfig", "") or "",
                 "kube_context": conn.get("kube_context", "") or "",
                 "kubewiz_cluster_uuid": conn.get("kubewiz_cluster_uuid", "") or "",
@@ -1917,6 +1981,7 @@ class L4ResilienceAgent:
             confirmed_intent=values.get("confirmed_intent"),
             pending_card=pending_card,
             token_usage=token_usage,
+            recover_task_id=values.get("recover_task_id", "") or "",
         )
 
     def update_connection(

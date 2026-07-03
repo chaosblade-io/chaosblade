@@ -31,4 +31,32 @@
 **基准事实**：
 - **根因**：应用存在死循环、高并发计算或资源泄漏等性能问题，导致 CPU 使用率持续过高
 - **必现现象**：Pod CPU 使用率持续超过阈值，应用响应变慢或超时
+
 ---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效 CPU 压力注入。
+
+前提条件：容器内需有 `stress-ng` 工具，或可使用 shell 循环作为替代
+
+注入命令：
+```bash
+# 使用 stress-ng 注入 CPU 压力
+kubectl exec <pod-name> -n <namespace> -- stress-ng --cpu 0 --cpu-load <percent> --timeout <duration>s
+# 如果容器无 stress-ng，使用 shell 循环：
+kubectl exec <pod-name> -n <namespace> -- sh -c 'while true; do :; done &'
+```
+
+恢复命令：
+```bash
+kubectl exec <pod-name> -n <namespace> -- pkill -f stress-ng
+# 或 kill shell 循环：
+kubectl exec <pod-name> -n <namespace> -- pkill -f 'while true'
+```
+
+注意事项：
+- shell 循环方式只能打满单核，无法精确控制 CPU 使用百分比
+- stress-ng 方式需容器镜像中预装该工具
+- 无自动超时恢复机制，需手动 kill 进程
+- 精度不如 ChaosBlade 的 cgroup 级 CPU 控制

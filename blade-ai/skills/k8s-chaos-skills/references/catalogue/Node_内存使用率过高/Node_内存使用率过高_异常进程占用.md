@@ -36,3 +36,31 @@ blade create k8s node-mem load --mode ram --mem-percent 90 --names <节点名> -
 **基准事实**：
 - **根因**：节点上存在异常进程大量占用内存，导致节点内存使用率过高，触发 MemoryPressure，Pod 被 OOMKilled 或驱逐
 - **必现现象**：节点内存使用率持续超过 90%；MemoryPressure 条件为 True；Pod 出现 OOMKilled 或被驱逐
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效故障注入。
+
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；debug 镜像需包含 `stress-ng`
+
+注入命令：
+```bash
+# 使用 kubectl debug node 注入内存压力
+kubectl debug node/<node-name> -it --image=alpine -- sh -c 'stress-ng --vm 1 --vm-bytes <size> --timeout <duration>s'
+# 示例：占用 4G 内存，持续 600 秒
+kubectl debug node/<node-name> -it --image=alpine -- sh -c 'stress-ng --vm 1 --vm-bytes 4G --timeout 600s'
+```
+
+恢复命令：
+```bash
+# 退出 debug Pod（Ctrl+D），或直接删除 debug Pod：
+kubectl delete pod <debug-pod-name> --force --grace-period=0
+# stress-ng 会在 --timeout 到期后自动释放内存
+```
+
+注意事项：
+- 必须使用 `--vm-bytes` 指定具体内存大小，而非百分比，需根据节点总内存计算
+- 与 ChaosBlade `--mode ram` 相比，stress-ng 默认会不断分配/释放内存（malloc/free 循环），效果等价
+- debug Pod 在节点 MemoryPressure 时可能被 OOM killer 终止，这本身就是预期行为

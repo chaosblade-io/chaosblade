@@ -62,3 +62,33 @@
 - **fill 与 burn 的验证方法差异**：
   - fill（空间填充）：df -h 是主要验证手段（填充产生持久数据，磁盘使用量增加）
   - burn（IO 压力）：/proc/diskstats 是主要验证手段（burn 产生 IO 压力，不产生持久数据）
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效故障注入。
+
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；目标路径需存在且可写
+
+注入命令：
+```bash
+# 使用 kubectl debug node + dd 注入磁盘 IO 压力（持续写入）
+kubectl debug node/<node-name> -it --image=alpine -- sh -c 'while true; do chroot /host dd if=/dev/zero of=<path>/burn_test bs=1M count=512 oflag=direct; done'
+# 同时注入读压力：
+kubectl debug node/<node-name> -it --image=alpine -- sh -c 'while true; do chroot /host dd if=<path>/burn_test of=/dev/null bs=1M count=512 iflag=direct; done'
+```
+
+恢复命令：
+```bash
+# 退出 debug Pod（Ctrl+D），或直接删除 debug Pod：
+kubectl delete pod <debug-pod-name> --force --grace-period=0
+# 清理临时文件：
+kubectl debug node/<node-name> -it --image=alpine -- sh -c 'chroot /host rm -f <path>/burn_test'
+```
+
+注意事项：
+- `oflag=direct` 绕过页缓存直接写磁盘，确保产生真实 IO 压力
+- 注入前必须校验目标路径存在且可写，否则 dd 会静默失败
+- 与 ChaosBlade 相比，kubectl debug node + dd 方式需手动管理 debug Pod 生命周期和临时文件清理
+- dd 写入会产生实际文件，需确保目标分区有足够空间

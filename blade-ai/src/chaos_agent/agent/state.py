@@ -60,15 +60,21 @@ def infer_task_state(values: dict) -> str:
     if safety_status == "rejected":
         return "rejected"
 
-    # Error — but replan in progress is not a failure
+    # Error — but replan in progress is not a failure, and if the
+    # verifier already checked the actual fault state, defer to its
+    # verdict instead of short-circuiting to "failed".
     if error:
-        if values.get("replan_count", 0) > 0 and values.get("replan_context"):
+        if (values.get("replan_count", 0) > 0 or values.get("verify_replan_count", 0) > 0) and values.get("replan_context"):
             pass  # Replan in progress, continue to normal state inference
+        elif verification:
+            # Error from execute_loop, but verifier checked the actual
+            # state — fall through to verification-based logic below.
+            pass
         else:
             return "failed"
 
     # Replan exhaustion: replan was attempted but graph completed without success.
-    if values.get("replan_count", 0) > 0 and values.get("replan_context"):
+    if (values.get("replan_count", 0) > 0 or values.get("verify_replan_count", 0) > 0) and values.get("replan_context"):
         if not blade_uid and not verification:
             return "failed"
 
@@ -203,7 +209,7 @@ def infer_phase(values: dict) -> str:
         return "dry_run_planned"
 
     # Replan in progress (Phase 2 errored, routed back to Phase 1)
-    if values.get("replan_context") and values.get("replan_count", 0) > 0:
+    if values.get("replan_context") and (values.get("replan_count", 0) > 0 or values.get("verify_replan_count", 0) > 0):
         if not blade_uid:
             return "replanning"
 
@@ -270,6 +276,19 @@ def infer_phase(values: dict) -> str:
     if l1_pass and l2_status == "recovered_before_observation":
         side_effects = verification.get("side_effects") if isinstance(verification, dict) else None
         if side_effects and side_effects.get("container_restarts"):
+            return "verification_passed"
+        return "verification_failed"
+    # L1 Warning (e.g., CLI timeout but CRD may exist): L2 is the deciding factor
+    if l1_status == "warning" and l2_status == "passed":
+        return "verification_passed"
+    if l1_status == "warning" and l2_status == "unknown":
+        level = verification.get("level", "unknown") if isinstance(verification, dict) else "unknown"
+        if level == "unverified":
+            return "verification_failed"
+        return "verification_passed"
+    if l1_status == "warning" and l2_status == "partial":
+        level = verification.get("level", "unknown") if isinstance(verification, dict) else "unknown"
+        if level in ("verified", "partial"):
             return "verification_passed"
         return "verification_failed"
     return "verification_failed"
@@ -415,6 +434,7 @@ def extract_ui_diagnostics(values: dict) -> dict:
         "failure_reason": failure_reason,
         "failure_detail": failure_detail,
         "replan_count": int(values.get("replan_count") or 0),
+        "verify_replan_count": int(values.get("verify_replan_count") or 0),
         "replan_history": list(values.get("replan_history") or []),
         "side_effects": _extract_side_effects(verification),
         "side_effects_summary": _build_side_effects_summary(verification),
@@ -488,6 +508,7 @@ def build_status_data(task_id: str, values: dict) -> dict:
         "failure_detail": failure_detail,
         "intent_confidence": float(values.get("intent_confidence") or 0.0),
         "replan_count": int(values.get("replan_count") or 0),
+        "verify_replan_count": int(values.get("verify_replan_count") or 0),
         "replan_history": list(values.get("replan_history") or []),
         "created_at": created_at,
         "updated_at": now_iso(),
@@ -514,6 +535,7 @@ class AgentState(MessagesState):
     tui_session_id: str = ""             # Owning TUI session (empty for non-TUI callers)
     parent_task_id: str = ""             # For recover: the inject task_id being recovered
     operation: str = ""                  # inject / recover / chat
+    tenant_id: str = ""                  # Multi-tenant isolation key (SDK platform mode)
 
     # ── Intent & Input ─────────────────────────────────────────────
     input: Optional[str] = None          # NL description (entry-point routing only)
@@ -545,7 +567,7 @@ class AgentState(MessagesState):
     plan_confirmed: bool = False         # submit_plan completed; /run routes to safety_check
 
     # ── Safety ─────────────────────────────────────────────────────
-    safety_status: str = "pending"       # pending / safe / unsafe / warning / rejected
+    safety_status: str = "pending"       # pending / safe / unsafe / warning / rejected / retry
     safety_reason: Optional[str] = None
     safety_checked_detail: Optional[str] = None
     conflict_uids: Optional[list[str]] = None    # UIDs of existing active experiments
@@ -617,7 +639,8 @@ class AgentState(MessagesState):
     replan_count: int = 0
     replan_context: Optional[dict] = None
     replan_history: Optional[list] = None
-    _replan_loop_reset: Optional[int] = None  # Tracks which replan_count has been loop-reset
+    _replan_loop_reset: Optional[int] = None  # Tracks total replan count (execute + verify) that has been loop-reset
+    verify_replan_count: int = 0              # Independent counter for verify-triggered replan
 
     # ── Results ────────────────────────────────────────────────────
     result: Optional[dict] = None

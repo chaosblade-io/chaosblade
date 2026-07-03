@@ -189,10 +189,10 @@ def get_executor_core_principles_section() -> str:
     during failure (adapt), after completion (stop).
 
     The 'stop' rule is step-aware: a fault injection may consist of
-    multiple atomic steps (e.g., kubectl patch → kubectl delete → observe).
+    multiple atomic INJECTION steps (e.g., kubectl patch → kubectl delete).
     A single step's success is progress, not completion. The LLM must
-    continue calling tools until ALL steps are done, then STOP and let
-    the verifier handle verification.
+    continue calling tools until ALL injection steps are done, then STOP.
+    Verification and recovery are handled by separate phases.
     """
     return """# Core Principles
 - Tool interface knowledge from docs is UNVERIFIED — discover the actual interface from the tool itself
@@ -243,7 +243,10 @@ actually does.
 ### Steps
 1. **Analyze** the FAULT INTENT → fault type, target (namespace / resource /
    names), parameters. Note: these are UNVERIFIED — do not trust them yet.
-2. **Activate** the matching skill ONCE via `activate_skill` (do NOT re-activate).
+2. **Activate** the matching skill via `activate_skill` — this is MANDATORY.
+   The skill is NOT auto-activated by dialogue or intent clarification; you
+   MUST call `activate_skill` yourself in Phase 1. Call it exactly once;
+   if you already called it in this phase, do not call it again.
 3. **Verify** the target exists with read-only cluster query tools — THE
    critical step for plan reliability:
    - Query the target by the provided identifier (labels, names, etc.)
@@ -259,9 +262,15 @@ actually does.
    - Simple (single target, single fault, trivial rollback): skip plan,
      go to step 6.
    - Complex (multi-target, multi-step, cascading, large blast radius):
-     call `save_fault_plan` with a markdown plan (Task Summary /
-     Execution Steps / Expected Impact / Rollback and Recovery /
-     Verification Methods). Pass the `task_id` from the user's conversation.
+     call `save_fault_plan` with a markdown plan using these EXACT
+     `##` section headers (Phase 2 executes only "Execution Steps";
+     Verifier executes only "Verification Methods"):
+     - `## Task Summary` — brief overview
+     - `## Execution Steps` — injection actions ONLY
+     - `## Expected Impact` — what will happen
+     - `## Verification Methods` — how to verify
+     - `## Rollback and Recovery` — recovery steps
+     Pass the `task_id` from the user's conversation.
    - When writing Verification Methods: fault effects are NOT instantaneous
      (may take 5-30s to propagate). Plan for multi-iteration verification
      (2+ checks before concluding "no effect").
@@ -294,10 +303,69 @@ Guidelines for available tools."""
 
 
 
+def _get_verify_replan_section(replan_context: dict, replan_history: list | None = None) -> str:
+    """Replan section for verifier-triggered replan (unverified → replan)."""
+    findings = replan_context.get("verifier_findings", {})
+    parts = [
+        "## Replan Mode — Verification Failed",
+        "You are re-entering Phase 1 because Phase 2 injection executed successfully",
+        "but verification found the fault did NOT take effect.",
+        "",
+        f"**Verification Result**: {findings.get('level', 'unverified')}",
+        f"**Layer 1 (experiment status)**: {findings.get('layer1_status', 'unknown')} — {findings.get('layer1_details', '')}",
+        f"**Layer 2 (fault-specific)**: {findings.get('layer2_status', 'unknown')} — {findings.get('layer2_details', '')}",
+    ]
+
+    failed_evidence = findings.get("failed_evidence", [])
+    if failed_evidence:
+        parts.append("\n### Failed Verification Evidence")
+        for ev in failed_evidence:
+            parts.append(f"- {ev}")
+
+    residuals_desc = replan_context.get("residuals_description", "")
+    if residuals_desc and residuals_desc != "None":
+        parts.append("\n### Residual Side Effects (already cleaned up)")
+        parts.append(residuals_desc)
+        parts.append("These residuals have been automatically cleaned. Do NOT attempt to clean them up again.")
+    else:
+        parts.append("\nNo residual side effects were detected from the previous attempt.")
+
+    if replan_history:
+        parts.append("\n### Previous Attempts (DO NOT repeat these approaches)")
+        for entry in replan_history:
+            parts.append(
+                f"- Attempt {entry.get('attempt', '?')}: "
+                f"{entry.get('action_taken', '?')} — {entry.get('original_error', '?')}"
+            )
+
+    parts.extend([
+        "\n### Replan Instructions",
+        "1. The previous injection method was executed but the fault effect was NOT observed.",
+        "2. Re-read the skill case to find ALTERNATIVE injection methods.",
+        "3. Do NOT retry the same method that already failed verification.",
+        "4. If the previous attempt left any uncleaned side effects (not listed above),",
+        "   include cleanup steps in your new plan before the injection.",
+        "5. Generate a corrected plan using the alternative method.",
+        "6. When ready, call `finish_planning`. The system routes to safety check",
+        "   and user confirmation before execution.",
+        "7. If no viable alternative exists, call `finish_planning(rejected=True,",
+        '   rejection_reason="...")`.',
+    ])
+
+    return "\n".join(parts)
+
+
 def get_replan_section(replan_context: dict | None = None, replan_history: list | None = None) -> str:
     """Replan mode section — injected when Phase 2 error triggers replan."""
     if not replan_context:
         return ""
+
+    # Detect trigger type
+    _trigger = replan_context.get("trigger", "execute_loop")
+
+    if _trigger == "verify_replan":
+        return _get_verify_replan_section(replan_context, replan_history)
+
     parts = [
         "## Replan Mode — Phase 2 Execution Failed",
         "You are re-entering Phase 1 because Phase 2 execution encountered an error.",
