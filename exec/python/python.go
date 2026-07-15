@@ -39,9 +39,7 @@ const (
 	MsgHookInstalled       = "python agent hook installed, restart target app to activate"
 )
 
-var (
-	pythonLibPath = path.Join(util.GetLibHome(), "python")
-)
+var pythonLibPath = path.Join(util.GetLibHome(), "python")
 
 // Prepare installs the python agent hook into the target script directory.
 // The python agent runs in-process, so this only generates sitecustomize.py
