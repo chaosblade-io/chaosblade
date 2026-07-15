@@ -109,11 +109,11 @@ func (e *Executor) getPortFromDB(ctx context.Context, uid string, model *spec.Ex
 		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("query", err))
 		return "", spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
-	
+
 	if len(records) == 0 {
 		log.Errorf(ctx, "%s", spec.ParameterInvalid.Sprintf("port", "", "no running python preparation record found"))
 		return "", spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", "", "no running python preparation record found")
 	}
-	
+
 	return records[0].Port, nil
 }
