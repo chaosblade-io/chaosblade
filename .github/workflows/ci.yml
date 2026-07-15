@@ -16,9 +16,9 @@ name: CI
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, "feature/blade-ai" ]
   pull_request:
-    branches: [ master, main ]
+    branches: [ master, main, "feature/blade-ai" ]
 
 env:
   GO_VERSION: '1.25'
