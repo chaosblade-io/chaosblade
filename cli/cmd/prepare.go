@@ -30,9 +30,10 @@ import (
 )
 
 const (
-	PrepareJvmType   = "jvm"
-	PrepareK8sType   = "k8s"
-	PrepareCPlusType = "cplus"
+	PrepareJvmType    = "jvm"
+	PrepareK8sType    = "k8s"
+	PrepareCPlusType  = "cplus"
+	PreparePythonType = "python"
 )
 
 // PrepareCommand defines attach command

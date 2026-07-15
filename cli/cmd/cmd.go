@@ -32,6 +32,7 @@ func CmdInit() *baseCommand {
 	baseCmd.AddCommand(prepareCommand)
 	prepareCommand.AddCommand(&PrepareJvmCommand{})
 	prepareCommand.AddCommand(&PrepareCPlusCommand{})
+	prepareCommand.AddCommand(&PreparePythonCommand{})
 
 	// add revoke command
 	baseCmd.AddCommand(&RevokeCommand{})
@@ -54,6 +55,7 @@ func CmdInit() *baseCommand {
 	queryCommand.AddCommand(&QueryNetworkCommand{})
 	queryCommand.AddCommand(&QueryJvmCommand{})
 	queryCommand.AddCommand(&QueryK8sCommand{})
+	queryCommand.AddCommand(&QueryPythonCommand{})
 
 	// UPDATE 2023-12-30 Disable server command mode.
 

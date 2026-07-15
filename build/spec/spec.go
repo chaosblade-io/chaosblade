@@ -27,6 +27,7 @@ import (
 	"github.com/chaosblade-io/chaosblade-spec-go/util"
 
 	"github.com/chaosblade-io/chaosblade/cli/cmd"
+	"github.com/chaosblade-io/chaosblade/exec/python"
 )
 
 var version = "1.7.4"
@@ -43,16 +44,18 @@ func main() {
 	k8sSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-k8s-spec-%s.yaml", version))
 	criSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cri-spec-%s.yaml", version))
 	cplusSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-cplus-spec-%s.yaml", version))
+	pythonSpecFile := path.Join(filePath, fmt.Sprintf("chaosblade-python-spec-%s.yaml", version))
 	chaosSpecFile := path.Join(targetPath, "chaosblade.spec.yaml")
 
 	osModels := getOsModels(osSpecFile)
 	cloudModels := getCloudModels(cloudSpecFile)
 	jvmModels := getJvmModels(jvmSpecFile)
 	cplusModels := getCplusModels(cplusSpecFile)
+	pythonModels := getPythonModels(pythonSpecFile)
 	criModels := getCriModels(criSpecFile, jvmSpecFile)
 	k8sModels := getKubernetesModels(k8sSpecFile, jvmSpecFile)
 
-	models := mergeModels(osModels, cloudModels, jvmModels, cplusModels, criModels, k8sModels)
+	models := mergeModels(osModels, cloudModels, jvmModels, cplusModels, pythonModels, criModels, k8sModels)
 
 	file, err := os.OpenFile(chaosSpecFile, os.O_CREATE|os.O_TRUNC|os.O_RDWR, 0o755)
 	if err != nil {
@@ -90,6 +93,14 @@ func getCplusModels(cplusSpecFile string) *spec.Models {
 	models, err := util.ParseSpecsToModel(cplusSpecFile, nil)
 	if err != nil {
 		log.Fatalf("parse cplus spec failed, %s", err)
+	}
+	return models
+}
+
+func getPythonModels(pythonSpecFile string) *spec.Models {
+	models, err := util.ParseSpecsToModel(pythonSpecFile, python.NewExecutor())
+	if err != nil {
+		log.Fatalf("parse python spec failed, %s", err)
 	}
 	return models
 }

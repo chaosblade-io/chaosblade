@@ -39,6 +39,7 @@ import (
 	"github.com/chaosblade-io/chaosblade/exec/kubernetes"
 	"github.com/chaosblade-io/chaosblade/exec/middleware"
 	"github.com/chaosblade-io/chaosblade/exec/os"
+	"github.com/chaosblade-io/chaosblade/exec/python"
 	"github.com/chaosblade-io/chaosblade/version"
 )
 
@@ -127,6 +128,8 @@ func (ec *baseExpCommandService) registerSubCommands() {
 	ec.registerJvmExpCommands()
 	// register cplus
 	ec.registerCplusExpCommands()
+	// register python
+	ec.registerPythonExpCommands()
 	// register docker command
 	ec.registerDockerExpCommands()
 	// register cri command
@@ -213,6 +216,22 @@ func (ec *baseExpCommandService) registerCplusExpCommands() []*modelCommand {
 		cplusCommands = append(cplusCommands, command)
 	}
 	return cplusCommands
+}
+
+// registerPythonExpCommands
+func (ec *baseExpCommandService) registerPythonExpCommands() []*modelCommand {
+	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-python-spec-%s.yaml", version.Ver))
+	models, err := specutil.ParseSpecsToModel(file, python.NewExecutor())
+	if err != nil {
+		return nil
+	}
+	pythonCommands := make([]*modelCommand, 0)
+	for idx := range models.Models {
+		model := &models.Models[idx]
+		command := ec.registerExpCommand(model, "")
+		pythonCommands = append(pythonCommands, command)
+	}
+	return pythonCommands
 }
 
 // registerDockerExpCommands

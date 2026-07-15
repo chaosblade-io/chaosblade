@@ -114,6 +114,10 @@ BLADE_EXEC_JVM_BRANCH=v1.8.0
 BLADE_EXEC_CPLUS_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-cplus.git
 BLADE_EXEC_CPLUS_BRANCH=master
 
+# chaosblade-exec-python
+BLADE_EXEC_PYTHON_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-python.git
+BLADE_EXEC_PYTHON_BRANCH=master
+
 # chaosblade-spec-go
 BLADE_SPEC_GO_PROJECT=https://github.com/chaosblade-io/chaosblade-spec-go.git
 BLADE_SPEC_GO_BRANCH=v1.8.0
@@ -419,6 +423,23 @@ endif
 	fi
 	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
 	@cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-cplus/target/$(call get_platform_dir_name,$(GOOS),$(GOARCH))/* $(OUTPUT_DIR)/
+
+
+python-agent: ## Build python experimental scenarios.
+ifneq ($(BUILD_TARGET_CACHE)/chaosblade-exec-python, $(wildcard $(BUILD_TARGET_CACHE)/chaosblade-exec-python))
+	git clone -b $(BLADE_EXEC_PYTHON_BRANCH) $(BLADE_EXEC_PYTHON_PROJECT) $(BUILD_TARGET_CACHE)/chaosblade-exec-python
+else
+ifdef ALERTMSG
+	$(error $(ALERTMSG))
+endif
+	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-python pull origin $(BLADE_EXEC_PYTHON_BRANCH)
+endif
+	@echo "Building Python agent..."
+	@mkdir -p $(BUILD_TARGET_LIB)/python
+	@if [ -d "$(BUILD_TARGET_CACHE)/chaosblade-exec-python" ]; then \
+		cd $(BUILD_TARGET_CACHE)/chaosblade-exec-python && python setup.py bdist_wheel; \
+		cp $(BUILD_TARGET_CACHE)/chaosblade-exec-python/dist/*.whl $(BUILD_TARGET_LIB)/python/; \
+	fi
 
 
 cri: ## Build cri experimental scenarios.
