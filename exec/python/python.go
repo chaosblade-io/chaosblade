@@ -84,18 +84,17 @@ func preCheck(ctx context.Context, port, pythonPath, targetScript string) *spec.
 	}
 	// Check if Python agent is already running (idempotent behavior like CPlus)
 	statusResponse := Status(ctx, port)
-	if statusResponse.Success && statusResponse.Result != nil {
-		if result, ok := statusResponse.Result.(string); ok && !strings.Contains(result, "not started") {
-			return spec.ReturnSuccess("python agent has been started")
-		}
+	if statusResponse.Success {
+		// Agent is reachable and responding — already prepared
+		return spec.ReturnSuccess("python agent has been started")
 	}
-	// Check if port is used by other program
-	portInUse := util.CheckPortInUse(port)
-	if portInUse {
-		log.Errorf(ctx, "%s", spec.ParameterInvalid.Sprintf("port", port, "the port has been used by other program"))
-		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", port, "the port has been used by other program")
+	// If connection refused, agent is not running — safe to proceed
+	if statusResponse.Err != nil && strings.Contains(statusResponse.Err.Error(), "connection refused") {
+		return spec.ReturnSuccess("success")
 	}
-	return spec.ReturnSuccess("success")
+	// Other error (e.g. port used by non-agent process)
+	log.Errorf(ctx, "port %s check failed: %v", port, statusResponse.Err)
+	return spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", port, "the port has been used by other program")
 }
 
 func generateSiteCustomize(ctx context.Context, port, pythonPath, targetDir string) *spec.Response {
@@ -163,12 +162,13 @@ func Revoke(ctx context.Context, port string) *spec.Response {
 }
 
 // Status checks whether the python agent HTTP endpoint is reachable.
+// Returns success only when the agent is actually running and responding.
 func Status(ctx context.Context, port string) *spec.Response {
 	url := getServiceUrl(port, "status")
 	result, err, code := util.Curl(ctx, url)
 	if err != nil {
 		if strings.Contains(err.Error(), "connection refused") {
-			return spec.ReturnSuccess("python agent is not started, hook installed")
+			return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, "python agent is not running")
 		}
 		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, err))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, err)
