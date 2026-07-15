@@ -28,6 +28,7 @@ import (
 
 	"github.com/chaosblade-io/chaosblade/exec/cplus"
 	"github.com/chaosblade-io/chaosblade/exec/jvm"
+	"github.com/chaosblade-io/chaosblade/exec/python"
 )
 
 type RevokeCommand struct {
@@ -69,6 +70,8 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		response = jvm.Detach(ctx, record.Port)
 	case PrepareCPlusType:
 		response = cplus.Revoke(ctx, record.Port)
+	case python.PreparePythonType:
+		response = python.Revoke(ctx, record.Pid)
 	case PrepareK8sType:
 		args := fmt.Sprintf("delete ns chaosblade")
 		response = channel.Run(ctx, "kubectl", args)
