@@ -102,18 +102,18 @@ func (e *Executor) destroyUrl(port, uid string) string {
 var db = data.GetSource()
 
 func (e *Executor) getPortFromDB(ctx context.Context, uid string, model *spec.ExpModel) (string, *spec.Response) {
-	port := model.ActionFlags["port"]
-	if port == "" {
-		port = "9526" // default port, matching prepare command default
-	}
-	record, err := db.QueryRunningPreByTypeAndProcess(PreparePythonType, port, "")
+	// Query all running Python preparations
+	// Since there's typically only one Python agent per instance, use the first running record
+	records, err := db.QueryPreparationRecords(PreparePythonType, "Running", "", "", "1", true)
 	if err != nil {
 		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("query", err))
 		return "", spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
-	if record == nil {
-		log.Errorf(ctx, "%s", spec.ParameterInvalid.Sprintf("port", port, "no running python preparation record found"))
-		return "", spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", port, "no running python preparation record found")
+	
+	if len(records) == 0 {
+		log.Errorf(ctx, "%s", spec.ParameterInvalid.Sprintf("port", "", "no running python preparation record found"))
+		return "", spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", "", "no running python preparation record found")
 	}
-	return record.Port, nil
+	
+	return records[0].Port, nil
 }

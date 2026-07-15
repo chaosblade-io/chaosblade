@@ -33,6 +33,10 @@ import (
 const (
 	PreparePythonType = "python"
 	ApplicationName   = "chaosblade-exec-python"
+	
+	// Response messages
+	MsgAgentAlreadyStarted = "python agent has been started"
+	MsgHookInstalled       = "python agent hook installed, restart target app to activate"
 )
 
 var (
@@ -50,7 +54,7 @@ func Prepare(ctx context.Context, port, pythonPath, targetScript string) *spec.R
 
 	// If agent is already running, return success (idempotent)
 	if response.Result != nil {
-		if result, ok := response.Result.(string); ok && result == "python agent has been started" {
+		if result, ok := response.Result.(string); ok && result == MsgAgentAlreadyStarted {
 			return response
 		}
 	}
@@ -71,7 +75,7 @@ func Prepare(ctx context.Context, port, pythonPath, targetScript string) *spec.R
 		return response
 	}
 
-	return spec.ReturnSuccess("python agent hook installed, restart target app to activate")
+	return spec.ReturnSuccess(MsgHookInstalled)
 }
 
 func preCheck(ctx context.Context, port, pythonPath, targetScript string) *spec.Response {
@@ -93,7 +97,7 @@ func preCheck(ctx context.Context, port, pythonPath, targetScript string) *spec.
 	statusResponse := Status(ctx, port)
 	if statusResponse.Success {
 		// Agent is reachable and responding — already prepared
-		return spec.ReturnSuccess("python agent has been started")
+		return spec.ReturnSuccess(MsgAgentAlreadyStarted)
 	}
 	// Check if port is used by another process
 	portInUse := util.CheckPortInUse(port)
@@ -141,17 +145,12 @@ func generatePythonPathEnv(targetDir string) *spec.Response {
 
 // Revoke removes the python agent hook. The agent itself lives in the target
 // python process and will be removed on the next process restart.
-func Revoke(ctx context.Context, port string) *spec.Response {
-	record, err := db.QueryRunningPreByTypeAndProcess(PreparePythonType, port, "")
-	if err != nil {
-		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("query", err))
-		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
-	}
-	if record == nil || record.Pid == "" {
+func Revoke(ctx context.Context, targetScript string) *spec.Response {
+	if targetScript == "" {
 		return spec.ReturnSuccess("no hook installed")
 	}
 
-	targetDir := path.Dir(record.Pid)
+	targetDir := path.Dir(targetScript)
 	siteCustomizePath := path.Join(targetDir, "sitecustomize.py")
 	envFile := path.Join(targetDir, "chaosblade_python_env.sh")
 

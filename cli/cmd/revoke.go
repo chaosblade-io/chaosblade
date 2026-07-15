@@ -71,7 +71,7 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 	case PrepareCPlusType:
 		response = cplus.Revoke(ctx, record.Port)
 	case python.PreparePythonType:
-		response = python.Revoke(ctx, record.Port)
+		response = python.Revoke(ctx, record.Pid)
 	case PrepareK8sType:
 		args := fmt.Sprintf("delete ns chaosblade")
 		response = channel.Run(ctx, "kubectl", args)

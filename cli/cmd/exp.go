@@ -223,6 +223,7 @@ func (ec *baseExpCommandService) registerPythonExpCommands() []*modelCommand {
 	file := path.Join(specutil.GetYamlHome(), fmt.Sprintf("chaosblade-python-spec-%s.yaml", version.Ver))
 	models, err := specutil.ParseSpecsToModel(file, python.NewExecutor())
 	if err != nil {
+		log.Warnf(context.Background(), "failed to load python spec file %s: %v. Python commands will not be available.", file, err)
 		return nil
 	}
 	pythonCommands := make([]*modelCommand, 0)
