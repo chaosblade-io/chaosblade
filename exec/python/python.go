@@ -82,10 +82,18 @@ func preCheck(ctx context.Context, port, pythonPath, targetScript string) *spec.
 		log.Errorf(ctx, "python agent library not found: %s. Please run 'make python-agent' first", pythonLibPath)
 		return spec.ResponseFailWithFlags(spec.ChaosbladeFileNotFound, pythonLibPath)
 	}
+	// Check if Python agent is already running (idempotent behavior like CPlus)
+	statusResponse := Status(ctx, port)
+	if statusResponse.Success && statusResponse.Result != nil {
+		if result, ok := statusResponse.Result.(string); ok && !strings.Contains(result, "not started") {
+			return spec.ReturnSuccess("python agent has been started")
+		}
+	}
+	// Check if port is used by other program
 	portInUse := util.CheckPortInUse(port)
 	if portInUse {
-		log.Errorf(ctx, "%s", spec.ParameterInvalid.Sprintf("port", port, "the port has been used"))
-		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", port, "the port has been used")
+		log.Errorf(ctx, "%s", spec.ParameterInvalid.Sprintf("port", port, "the port has been used by other program"))
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", port, "the port has been used by other program")
 	}
 	return spec.ReturnSuccess("success")
 }
