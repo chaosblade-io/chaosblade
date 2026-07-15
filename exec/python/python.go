@@ -95,12 +95,10 @@ agent_path = "%s"
 if agent_path not in sys.path:
     sys.path.insert(0, agent_path)
 
-# Configure agent port
-os.environ["CHAOSBLADE_PYTHON_AGENT_PORT"] = "%s"
-
 try:
-    import chaosblade
-    chaosblade.start()
+    from chaosblade import ChaosBladeAgent
+    _port = int(os.environ.get("CHAOSBLADE_PYTHON_AGENT_PORT", "%s"))
+    ChaosBladeAgent(port=_port).start()
 except Exception as e:
     print("[chaosblade] failed to start python agent: {}".format(e), file=sys.stderr)
 `, pythonLibPath, port)
@@ -130,11 +128,11 @@ func Revoke(ctx context.Context, port string) *spec.Response {
 		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
-	if record == nil || record.Process == "" {
+	if record == nil || record.Pid == "" {
 		return spec.ReturnSuccess("no hook installed")
 	}
 
-	targetDir := path.Dir(record.Process)
+	targetDir := path.Dir(record.Pid)
 	siteCustomizePath := path.Join(targetDir, "sitecustomize.py")
 	envFile := path.Join(targetDir, "chaosblade_python_env.sh")
 

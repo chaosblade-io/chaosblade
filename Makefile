@@ -437,8 +437,8 @@ endif
 	@echo "Building Python agent..."
 	@mkdir -p $(BUILD_TARGET_LIB)/python
 	@if [ -d "$(BUILD_TARGET_CACHE)/chaosblade-exec-python" ]; then \
-		cd $(BUILD_TARGET_CACHE)/chaosblade-exec-python && python setup.py bdist_wheel; \
-		cp $(BUILD_TARGET_CACHE)/chaosblade-exec-python/dist/*.whl $(BUILD_TARGET_LIB)/python/; \
+		cd $(BUILD_TARGET_CACHE)/chaosblade-exec-python && \
+		pip install --target $(BUILD_TARGET_LIB)/python . ; \
 	fi
 
 

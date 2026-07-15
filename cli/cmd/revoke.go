@@ -70,7 +70,7 @@ func (rc *RevokeCommand) runRevoke(args []string) error {
 		response = jvm.Detach(ctx, record.Port)
 	case PrepareCPlusType:
 		response = cplus.Revoke(ctx, record.Port)
-	case PreparePythonType:
+	case python.PreparePythonType:
 		response = python.Revoke(ctx, record.Port)
 	case PrepareK8sType:
 		args := fmt.Sprintf("delete ns chaosblade")
