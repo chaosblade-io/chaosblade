@@ -48,6 +48,13 @@ func Prepare(ctx context.Context, port, pythonPath, targetScript string) *spec.R
 		return response
 	}
 
+	// If agent is already running, return success (idempotent)
+	if response.Result != nil {
+		if result, ok := response.Result.(string); ok && result == "python agent has been started" {
+			return response
+		}
+	}
+
 	targetDir := path.Dir(targetScript)
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		log.Errorf(ctx, "create target script directory %s failed, %v", targetDir, err)
@@ -64,7 +71,7 @@ func Prepare(ctx context.Context, port, pythonPath, targetScript string) *spec.R
 		return response
 	}
 
-	return Status(ctx, port)
+	return spec.ReturnSuccess("python agent hook installed, restart target app to activate")
 }
 
 func preCheck(ctx context.Context, port, pythonPath, targetScript string) *spec.Response {
@@ -88,13 +95,13 @@ func preCheck(ctx context.Context, port, pythonPath, targetScript string) *spec.
 		// Agent is reachable and responding — already prepared
 		return spec.ReturnSuccess("python agent has been started")
 	}
-	// If connection refused, agent is not running — safe to proceed
-	if statusResponse.Err != nil && strings.Contains(statusResponse.Err.Error(), "connection refused") {
-		return spec.ReturnSuccess("success")
+	// Check if port is used by another process
+	portInUse := util.CheckPortInUse(port)
+	if portInUse {
+		log.Errorf(ctx, "%s", spec.ParameterInvalid.Sprintf("port", port, "the port has been used by other program"))
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", port, "the port has been used by other program")
 	}
-	// Other error (e.g. port used by non-agent process)
-	log.Errorf(ctx, "port %s check failed: %v", port, statusResponse.Err)
-	return spec.ResponseFailWithFlags(spec.ParameterInvalid, "port", port, "the port has been used by other program")
+	return spec.ReturnSuccess("success")
 }
 
 func generateSiteCustomize(ctx context.Context, port, pythonPath, targetDir string) *spec.Response {
