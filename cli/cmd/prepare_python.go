@@ -18,6 +18,7 @@ package cmd
 
 import (
 	"context"
+	"path/filepath"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -39,8 +40,8 @@ type PreparePythonCommand struct {
 func (pc *PreparePythonCommand) Init() {
 	pc.command = &cobra.Command{
 		Use:   "python",
-		Short: "Active python agent.",
-		Long:  "Active python agent.",
+		Short: "Activate python agent.",
+		Long:  "Activate python agent.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return pc.preparePython()
 		},
@@ -60,19 +61,28 @@ func (pc *PreparePythonCommand) prepareExample() string {
 func (pc *PreparePythonCommand) preparePython() error {
 	ctx := context.Background()
 	portStr := strconv.Itoa(pc.port)
+
+	// Convert target-script to absolute path to ensure revoke works correctly
+	// regardless of the current working directory
+	absTargetScript, err := filepath.Abs(pc.targetScript)
+	if err != nil {
+		log.Errorf(ctx, "failed to resolve absolute path for %s: %v", pc.targetScript, err)
+		return spec.ResponseFailWithFlags(spec.ParameterInvalid, "target-script", pc.targetScript, "cannot resolve absolute path")
+	}
+
 	record, err := GetDS().QueryRunningPreByTypeAndProcess(python.PreparePythonType, portStr, "")
 	if err != nil {
 		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("query", err))
 		return spec.ResponseFailWithFlags(spec.DatabaseError, "query", err)
 	}
 	if record == nil || record.Status != Running {
-		record, err = insertPrepareRecord(python.PreparePythonType, portStr, portStr, pc.targetScript)
+		record, err = insertPrepareRecord(python.PreparePythonType, portStr, portStr, absTargetScript)
 		if err != nil {
 			log.Errorf(ctx, util.GetRunFuncName(), spec.DatabaseError.Sprintf("insert", err))
 			return spec.ResponseFailWithFlags(spec.DatabaseError, "insert", err)
 		}
 	}
 	ctx = context.WithValue(ctx, spec.Uid, record.Uid)
-	response := python.Prepare(ctx, portStr, pc.pythonPath, pc.targetScript)
+	response := python.Prepare(ctx, portStr, pc.pythonPath, absTargetScript)
 	return handlePrepareResponse(ctx, pc.command, response)
 }
