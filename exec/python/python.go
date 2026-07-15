@@ -18,6 +18,7 @@ package python
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -76,6 +77,10 @@ func preCheck(ctx context.Context, port, pythonPath, targetScript string) *spec.
 	if !util.IsExist(pythonPath) {
 		log.Errorf(ctx, "%s", spec.ChaosbladeFileNotFound.Sprintf(pythonPath))
 		return spec.ResponseFailWithFlags(spec.ChaosbladeFileNotFound, pythonPath)
+	}
+	if !util.IsExist(pythonLibPath) {
+		log.Errorf(ctx, "python agent library not found: %s. Please run 'make python-agent' first", pythonLibPath)
+		return spec.ResponseFailWithFlags(spec.ChaosbladeFileNotFound, pythonLibPath)
 	}
 	portInUse := util.CheckPortInUse(port)
 	if portInUse {
@@ -164,7 +169,12 @@ func Status(ctx context.Context, port string) *spec.Response {
 		log.Errorf(ctx, "%s", spec.HttpExecFailed.Sprintf(url, result))
 		return spec.ResponseFailWithFlags(spec.HttpExecFailed, url, result)
 	}
-	return spec.ReturnSuccess(result)
+	var resp spec.Response
+	if err := json.Unmarshal([]byte(result), &resp); err != nil {
+		log.Errorf(ctx, "%s", spec.ResultUnmarshalFailed.Sprintf(result, err))
+		return spec.ResponseFailWithFlags(spec.ResultUnmarshalFailed, result, err)
+	}
+	return &resp
 }
 
 func getServiceUrl(port, action string) string {

@@ -34,8 +34,8 @@ type QueryPythonCommand struct {
 func (qpc *QueryPythonCommand) Init() {
 	qpc.command = &cobra.Command{
 		Use:   "python <UID>",
-		Short: "Query status of the specify python preparation",
-		Long:  "Query status of the specify python preparation",
+		Short: "Query status of the specified python preparation",
+		Long:  "Query status of the specified python preparation",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.WithValue(context.Background(), spec.Uid, args[0])

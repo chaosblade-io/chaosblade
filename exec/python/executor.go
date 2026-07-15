@@ -103,6 +103,9 @@ var db = data.GetSource()
 
 func (e *Executor) getPortFromDB(ctx context.Context, uid string, model *spec.ExpModel) (string, *spec.Response) {
 	port := model.ActionFlags["port"]
+	if port == "" {
+		port = "9526" // default port, matching prepare command default
+	}
 	record, err := db.QueryRunningPreByTypeAndProcess(PreparePythonType, port, "")
 	if err != nil {
 		log.Errorf(ctx, "%s", spec.DatabaseError.Sprintf("query", err))
