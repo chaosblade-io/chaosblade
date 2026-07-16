@@ -37,7 +37,7 @@ dependencies = [
     "opentelemetry-sdk>=1.25",
     "opentelemetry-exporter-otlp-proto-grpc>=1.25",
     "opentelemetry-exporter-prometheus>=0.46b0",
-    "mcp>=1.0,<2.0",
+    "mcp>=1.28.1,<2.0",
 ]
 
 [project.optional-dependencies]
