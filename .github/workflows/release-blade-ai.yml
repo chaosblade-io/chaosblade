@@ -457,6 +457,42 @@ jobs:
           sha256sum *.tar.gz > checksums.txt
           cat checksums.txt
 
+      # Mirror the release artifacts to Alibaba Cloud OSS so users in
+      # mainland China can install via BLADE_AI_MIRROR (see scripts/install.sh).
+      # Layout mirrors the GitHub release path: <TAG>/blade-ai-<platform>.tar.gz
+      - name: Setup OSSUTIL environment
+        uses: yizhoumo/setup-ossutil@v1.1.3
+        with:
+          endpoint: ${{ secrets.OSS_ENDPOINT }}
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          ossutil-version: '1.7.14'
+
+      - name: Upload packages to OSS
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.verify-versions.outputs.tag }}
+        run: |
+          echo "Uploading blade-ai packages to OSS..."
+          for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            package_file="artifacts/blade-ai-${platform}.tar.gz"
+            if [[ -f "$package_file" ]]; then
+              echo "Uploading $platform package..."
+              ossutil cp -f "$package_file" "oss://chaosblade/blade-ai/github/${RELEASE_TAG}/blade-ai-${platform}.tar.gz"
+              echo "✅ $platform package uploaded successfully"
+            else
+              echo "❌ $platform package not found: $package_file"
+            fi
+          done
+          if [[ -f "artifacts/checksums.txt" ]]; then
+            echo "Uploading checksums file..."
+            ossutil cp -f "artifacts/checksums.txt" "oss://chaosblade/blade-ai/github/${RELEASE_TAG}/checksums.txt"
+            echo "✅ Checksums file uploaded successfully"
+          else
+            echo "❌ Checksums file not found"
+          fi
+          echo "All blade-ai packages uploaded to OSS successfully"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -480,6 +516,22 @@ jobs:
             **Specify version:**
             ```bash
             curl -fsSL https://chaosblade.io/install-agent.sh | bash -s -- --version ${{ needs.verify-versions.outputs.version }}
+            ```
+
+            ### 🌐 OSS Download Links
+            Alternative download links from Alibaba Cloud OSS (faster in mainland China):
+
+            - [blade-ai-linux-amd64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/blade-ai/github/${{ needs.verify-versions.outputs.tag }}/blade-ai-linux-amd64.tar.gz)
+            - [blade-ai-linux-arm64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/blade-ai/github/${{ needs.verify-versions.outputs.tag }}/blade-ai-linux-arm64.tar.gz)
+            - [blade-ai-darwin-amd64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/blade-ai/github/${{ needs.verify-versions.outputs.tag }}/blade-ai-darwin-amd64.tar.gz)
+            - [blade-ai-darwin-arm64.tar.gz](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/blade-ai/github/${{ needs.verify-versions.outputs.tag }}/blade-ai-darwin-arm64.tar.gz)
+            - [checksums.txt](https://chaosblade.oss-cn-hangzhou.aliyuncs.com/blade-ai/github/${{ needs.verify-versions.outputs.tag }}/checksums.txt) - SHA256 checksums
+
+            **Install from the OSS mirror:**
+            ```bash
+            curl -fsSL https://chaosblade.io/install-agent.sh | \
+              BLADE_AI_MIRROR=https://chaosblade.oss-cn-hangzhou.aliyuncs.com/blade-ai/github \
+              bash -s -- --version ${{ needs.verify-versions.outputs.version }}
             ```
 
             Verify the download via `checksums.txt` before extracting.
