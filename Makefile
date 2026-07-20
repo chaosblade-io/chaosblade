@@ -116,7 +116,7 @@ BLADE_EXEC_CPLUS_BRANCH=master
 
 # chaosblade-exec-python
 BLADE_EXEC_PYTHON_PROJECT=https://github.com/chaosblade-io/chaosblade-exec-python.git
-BLADE_EXEC_PYTHON_BRANCH=master
+BLADE_EXEC_PYTHON_BRANCH=v1.8.0
 
 # chaosblade-spec-go
 BLADE_SPEC_GO_PROJECT=https://github.com/chaosblade-io/chaosblade-spec-go.git
@@ -181,7 +181,7 @@ sync_go_mod: ## Sync go.mod dependencies with Makefile branch configuration
 	@chmod +x scripts/sync_go_mod.sh
 	@./scripts/sync_go_mod.sh
 
-build_all: pre_build nsexec os cloud middleware java cplus cri kubernetes cli upx package check_yaml  ## Build all components for current platform
+build_all: pre_build nsexec os cloud middleware java cplus python-agent cri kubernetes cli upx package check_yaml  ## Build all components for current platform
 	@echo "Build all components for current platform completed"
 
 pre_build: generate_version sync_go_mod ## Prepare build environment
@@ -224,7 +224,7 @@ _build_platform:
 	@mkdir -p $(OUTPUT_DIR)/bin $(OUTPUT_DIR)/lib $(OUTPUT_DIR)/yaml
 	@if [ -n "$(COMPONENTS)" ]; then \
 		if [ "$(COMPONENTS)" = "all" ]; then \
-			components="os cloud middleware java cri kubernetes cli nsexec upx check_yaml"; \
+			components="os cloud middleware java python-agent cri kubernetes cli nsexec upx check_yaml"; \
 		else \
 			components=`echo "$(COMPONENTS)" | tr ',' ' '`; \
 		fi; \
@@ -236,6 +236,7 @@ _build_platform:
 				"middleware") $(MAKE) middleware GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"java") $(MAKE) java GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"cplus") $(MAKE) cplus GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
+				"python-agent") $(MAKE) python-agent GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"cri") $(MAKE) cri GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"kubernetes") $(MAKE) kubernetes GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
 				"nsexec") $(MAKE) nsexec GOOS=$(GOOS) GOARCH=$(GOARCH); ;; \
@@ -435,12 +436,9 @@ endif
 	git -C $(BUILD_TARGET_CACHE)/chaosblade-exec-python pull origin $(BLADE_EXEC_PYTHON_BRANCH)
 endif
 	@echo "Building Python agent..."
-	@mkdir -p $(BUILD_TARGET_LIB)/python
-	@rm -rf $(BUILD_TARGET_LIB)/python/*
-	@if [ -d "$(BUILD_TARGET_CACHE)/chaosblade-exec-python" ]; then \
-		cd $(BUILD_TARGET_CACHE)/chaosblade-exec-python && \
-		python3 -m pip install --target $(BUILD_TARGET_LIB)/python . ; \
-	fi
+	make -C $(BUILD_TARGET_CACHE)/chaosblade-exec-python build BLADE_VERSION=$(BLADE_VERSION)
+	@$(eval OUTPUT_DIR := $(call get_build_output_dir))
+	cp -R $(BUILD_TARGET_CACHE)/chaosblade-exec-python/build-target/chaosblade-$(BLADE_VERSION)/* $(OUTPUT_DIR)/
 
 
 cri: ## Build cri experimental scenarios.
