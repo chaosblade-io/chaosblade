@@ -226,13 +226,19 @@ func (ec *baseExpCommandService) registerPythonExpCommands() []*modelCommand {
 		log.Warnf(context.Background(), "failed to load python spec file %s: %v. Python commands will not be available.", file, err)
 		return nil
 	}
-	pythonCommands := make([]*modelCommand, 0)
+	pythonSpec := python.NewCommandModelSpec()
+	modelCommands := make([]*modelCommand, 0)
 	for idx := range models.Models {
 		model := &models.Models[idx]
-		command := ec.registerExpCommand(model, "")
-		pythonCommands = append(pythonCommands, command)
+		command := ec.registerExpCommand(model, pythonSpec.Name())
+		modelCommands = append(modelCommands, command)
 	}
-	return pythonCommands
+	pythonCmd := ec.registerExpCommand(pythonSpec, "")
+	cobraCmd := pythonCmd.CobraCmd()
+	for _, child := range modelCommands {
+		copyAndAddCommand(cobraCmd, child.command)
+	}
+	return modelCommands
 }
 
 // registerDockerExpCommands
