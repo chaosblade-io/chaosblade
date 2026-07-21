@@ -26,6 +26,11 @@ _DENIED_SUFFIXES = (
     ".pem", ".key", ".p12", ".pfx", ".jks",
 )
 
+# Maximum number of bytes to read from a single file.  Larger files are
+# truncated to avoid overwhelming the LLM context / inflating token cost,
+# mirroring the MAX_RESULTS cap in file_search.py.
+MAX_FILE_BYTES = 256 * 1024  # 256 KB
+
 
 def _is_denylisted(path: Path) -> tuple[bool, str]:
     """Check if a path is in the deny-list of sensitive locations."""
@@ -86,5 +91,15 @@ def safe_read_file(file_path: str) -> str:
             return header + "\n" + "\n".join(f"  - {i}" for i in items)
         return f"{header} (empty)"
 
-    # File: read content
+    # File: read content, capped to avoid overwhelming the LLM context
+    size = p.stat().st_size
+    if size > MAX_FILE_BYTES:
+        # Read only the byte prefix from disk; errors="ignore" drops a
+        # trailing multibyte char that may be split at the cut point.
+        with p.open("rb") as f:
+            head = f.read(MAX_FILE_BYTES).decode("utf-8", errors="ignore")
+        return (
+            head
+            + f"\n\n[truncated: showing first {MAX_FILE_BYTES} of {size} bytes]"
+        )
     return p.read_text(encoding="utf-8")
