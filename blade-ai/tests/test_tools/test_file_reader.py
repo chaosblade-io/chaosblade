@@ -2,7 +2,11 @@
 
 import pytest
 
-from chaos_agent.tools.file_reader import safe_read_file, _is_denylisted
+from chaos_agent.tools.file_reader import (
+    MAX_FILE_BYTES,
+    safe_read_file,
+    _is_denylisted,
+)
 
 
 class TestSafeReadFile:
@@ -82,6 +86,30 @@ class TestSafeReadFile:
 
         result = safe_read_file("~/test.txt")
         assert result == "home content"
+
+    def test_file_at_cap_not_truncated(self, tmp_path):
+        """A file exactly at the cap is returned in full, no notice."""
+        f = tmp_path / "exact.txt"
+        f.write_bytes(b"A" * MAX_FILE_BYTES)
+        result = safe_read_file(str(f))
+        assert result == "A" * MAX_FILE_BYTES
+        assert "truncated" not in result
+
+    def test_large_file_truncated(self, tmp_path):
+        """A file over the cap is truncated to the cap plus a notice."""
+        f = tmp_path / "big.txt"
+        f.write_bytes(b"A" * (MAX_FILE_BYTES + 5000))
+        result = safe_read_file(str(f))
+        assert result.count("A") == MAX_FILE_BYTES
+        assert f"[truncated: showing first {MAX_FILE_BYTES} of {MAX_FILE_BYTES + 5000} bytes]" in result
+
+    def test_truncation_multibyte_boundary(self, tmp_path):
+        """A multibyte char split at the cut point does not crash."""
+        f = tmp_path / "mb.txt"
+        # Emoji is 4 bytes; fill past the cap so the cut lands mid-char.
+        f.write_bytes("😀".encode("utf-8") * (MAX_FILE_BYTES // 4 + 100))
+        result = safe_read_file(str(f))
+        assert "[truncated" in result
 
 
 class TestIsDenylisted:
