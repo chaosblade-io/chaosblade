@@ -41,3 +41,39 @@
 **基准事实**：
 - **根因**：容器运行时（containerd/docker）进程异常、hang 或状态不一致，无法响应 kubelet 的容器创建请求
 - **必现现象**：Pod ContainerCreating；Events 显示 runtime 相关 rpc error；节点可能 NotReady（RuntimeNotReady）
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现容器运行时挂起。
+
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；恢复需 SSH 访问权限
+
+注入命令：
+```bash
+# 通过 kubectl debug node 挂起 containerd 进程（SIGSTOP），并先武装定时自恢复
+# ⚠️ 关键顺序：必须先用 systemd-run 武装 kill -CONT 定时恢复，再执行 kill -STOP。
+#    STOP containerd 会冻结依赖 CRI 的 exec 会话本身，若恢复排在 STOP 之后，
+#    恢复进程可能来不及登记 → containerd 永久挂起、节点无法自恢复。
+#    systemd-run 的 transient timer 由宿主机 systemd(PID 1) 管理，debug Pod 删除也不影响。
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c '
+  systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-containerd sh -c "kill -CONT $(pidof containerd)" &&
+  kill -STOP $(pidof containerd)
+'
+```
+
+恢复命令：
+
+主恢复路径是注入时登记的 systemd 定时器（`--on-active=<recovery-seconds>s`），到期自动 `kill -CONT`，Agent 无需干预。
+
+**提前恢复必须人工带外执行 —— Agent 不执行下面的命令。** containerd 已停止，`kubectl debug node` 需要新建容器，此刻物理上无法完成；SSH 是唯一通道：
+
+```text
+ssh root@<node-ip> 'kill -CONT $(pidof containerd)'
+```
+
+注意事项：
+- 挂起 containerd 后节点上所有容器操作均失效（包括 kubectl debug/exec/logs），恢复只能通过 SSH 或等待超时自恢复
+- 建议超时设置 30-120 秒
+- 若节点使用 docker 而非 containerd，将 `pidof containerd` 替换为 `pidof dockerd`

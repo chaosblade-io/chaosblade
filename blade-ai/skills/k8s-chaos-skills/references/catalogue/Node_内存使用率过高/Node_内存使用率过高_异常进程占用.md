@@ -43,14 +43,14 @@ blade create k8s node-mem load --mode ram --mem-percent 90 --names <节点名> -
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效故障注入。
 
-前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；debug 镜像需包含 `stress-ng`
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；选择当前集群已验证可拉取且**包含 `stress-ng`** 的镜像（如 `ghcr.io/colinianking/stress-ng`）；切勿使用不含 stress-ng 的 alpine/busybox 基础镜像（会报 `stress-ng: not found`）。
 
 注入命令：
 ```bash
-# 使用 kubectl debug node 注入内存压力
-kubectl debug node/<node-name> -it --image=alpine -- sh -c 'stress-ng --vm 1 --vm-bytes <size> --timeout <duration>s'
+# 使用 kubectl debug node 注入内存压力（非交互；镜像须含 stress-ng）
+kubectl debug node/<node-name> --profile=sysadmin --image=<stress-ng-image> -- sh -c 'stress-ng --vm 1 --vm-bytes <size> --timeout <duration>s'
 # 示例：占用 4G 内存，持续 600 秒
-kubectl debug node/<node-name> -it --image=alpine -- sh -c 'stress-ng --vm 1 --vm-bytes 4G --timeout 600s'
+kubectl debug node/<node-name> --profile=sysadmin --image=<stress-ng-image> -- sh -c 'stress-ng --vm 1 --vm-bytes 4G --timeout 600s'
 ```
 
 恢复命令：
@@ -62,5 +62,6 @@ kubectl delete pod <debug-pod-name> --force --grace-period=0
 
 注意事项：
 - 必须使用 `--vm-bytes` 指定具体内存大小，而非百分比，需根据节点总内存计算
+- debug 命令客户端会阻塞到 --timeout 到期或断连，但 debug Pod 服务端持续运行，客户端超时不代表注入失败（--timeout 到期后自动释放=自动恢复）
 - 与 ChaosBlade `--mode ram` 相比，stress-ng 默认会不断分配/释放内存（malloc/free 循环），效果等价
 - debug Pod 在节点 MemoryPressure 时可能被 OOM killer 终止，这本身就是预期行为

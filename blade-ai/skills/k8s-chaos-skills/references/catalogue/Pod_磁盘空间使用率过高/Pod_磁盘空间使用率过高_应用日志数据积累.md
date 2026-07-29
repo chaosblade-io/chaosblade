@@ -10,24 +10,57 @@
 2. 确认应用配置了日志输出（如输出到 /tmp 或挂载目录）
 
 **演练步骤**：
-1. 定位应用 A 的 Pod
-2. 使用 chaosblade 向应用 A 的 Pod 注入磁盘填充故障，模拟大量日志写入
-3. 持续向 Pod 写入大文件，填充磁盘空间至接近容量上限
-4. 观察 Pod 磁盘使用率变化及应用响应情况
+1. 定位应用 A 的 Pod，确认根文件系统可写：
+   ```bash
+   kubectl get pods -n <namespace> -l <label-selector> -o wide
+   kubectl exec <pod-name> -n <namespace> -- df -h /
+   ```
+2. 使用 ChaosBlade 向应用 A 的 Pod 注入磁盘填充故障：
+   ```bash
+   blade create k8s pod-disk fill \
+     --namespace <namespace> \
+     --labels "<label-key>=<label-value>" \
+     --path / \
+     --percent 90 \
+     --timeout 300 \
+     --kubeconfig <kubeconfig-path>
+   ```
+   - `--path`：填充目标路径，使用 `/` 填充容器根文件系统
+   - `--percent`：磁盘使用率目标百分比（优先级高于 `--size`）
+   - `--size`：填充大小（MB），与 `--percent` 二选一
+   - `--retain-handle`：是否保留文件句柄（保留时 rm 文件后空间不释放，更真实模拟日志占用）
+3. 记录返回的 blade_uid，用于后续恢复
 
 **注入验证**：
-1. 进入应用 A 的 Pod，使用 df -h 查看磁盘使用率，确认超过设定阈值
-2. 查看 Pod 状态，确认是否有磁盘相关异常事件
-3. 观察应用是否出现写入失败等异常表现
+1. 进入应用 A 的 Pod，确认磁盘使用率已达目标：
+   ```bash
+   kubectl exec <pod-name> -n <namespace> -- df -h /
+   ```
+   确认使用率达到注入的百分比
+2. 在 Pod 内尝试写入文件，确认空间不足：
+   ```bash
+   kubectl exec <pod-name> -n <namespace> -- sh -c 'echo test > /tmp/write_test'
+   ```
+3. 查看 Pod 事件，确认是否有磁盘相关异常：
+   ```bash
+   kubectl get events -n <namespace> --field-selector involvedObject.name=<pod-name>
+   ```
+4. 查看应用日志确认出现写入失败错误
 
 **注入恢复**：
-1. 销毁 chaosblade 磁盘填充实验
-2. 删除 Pod 中产生的大文件，释放磁盘空间
-3. 或删除异常 Pod，触发重新调度创建新 Pod
+1. 销毁 ChaosBlade 磁盘填充实验：
+   ```bash
+   blade destroy <blade_uid>
+   ```
+2. 填充文件会随实验销毁自动清理
+3. 若使用 `--retain-handle` 且空间未释放，可重启 Pod
 
 **恢复验证**：
-1. 查看 Pod 磁盘使用率，确认恢复到正常水平
-2. 查看应用是否恢复正常写入操作
+1. 查看 Pod 磁盘使用率，确认恢复到正常水平：
+   ```bash
+   kubectl exec <pod-name> -n <namespace> -- df -h /
+   ```
+2. 在 Pod 内验证写入操作恢复正常
 3. 确认 Pod 状态为 Running，无磁盘相关异常事件
 
 **基准事实**：

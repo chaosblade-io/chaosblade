@@ -46,20 +46,30 @@ blade create k8s pod-mem load --mode ram --mem-percent 80 --names <Pod名> --nam
 
 注入命令：
 ```bash
-# 方案1：指定绝对大小（推荐，精确控制）
-kubectl exec <pod-name> -n <namespace> -- stress-ng --vm 1 --vm-bytes <size，如 512M 或 2G> --timeout <duration>s
+# 方案1：指定绝对大小（推荐，精确控制；后台+重定向让 exec 立即返回，--timeout 自带自动恢复）
+kubectl exec <pod-name> -n <namespace> -- \
+  sh -c 'stress-ng --vm 1 --vm-bytes <size，如 512M 或 2G> --timeout <duration>s >/dev/null 2>&1 &'
 # 方案2：按系统总内存百分比（注意：是节点总内存，非 Pod limit）
-kubectl exec <pod-name> -n <namespace> -- stress-ng --vm 1 --vm-bytes 80% --timeout <duration>s
-# 如果无 stress-ng，使用 dd 分配内存：
-kubectl exec <pod-name> -n <namespace> -- sh -c 'dd if=/dev/zero bs=1M count=<MB> | tail'
+kubectl exec <pod-name> -n <namespace> -- \
+  sh -c 'stress-ng --vm 1 --vm-bytes 80% --timeout <duration>s >/dev/null 2>&1 &'
+# 如果无 stress-ng，用 dd 分配内存（PID 落盘 + 定时释放）：
+kubectl exec <pod-name> -n <namespace> -- sh -c '
+  ( dd if=/dev/zero bs=1M count=<MB> 2>/dev/null | tail ) >/dev/null 2>&1 &
+  echo $! > /tmp/chaos_mem.pid
+  ( sleep <duration>; kill $(cat /tmp/chaos_mem.pid) 2>/dev/null; rm -f /tmp/chaos_mem.pid ) >/dev/null 2>&1 &
+'
 ```
 
-恢复命令：
+恢复命令（从精确到兜底）：
 ```bash
-# stress-ng 超时后自动释放，或手动 kill：
-kubectl exec <pod-name> -n <namespace> -- pkill -f stress-ng
-# dd 方式 kill 进程：
-kubectl exec <pod-name> -n <namespace> -- pkill -f 'dd if=/dev/zero'
+# stress-ng：kill 进程
+kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f stress-ng 2>/dev/null'
+# dd 首选：按落盘 PID kill
+kubectl exec <pod-name> -n <namespace> -- \
+  sh -c 'kill $(cat /tmp/chaos_mem.pid) 2>/dev/null; rm -f /tmp/chaos_mem.pid'
+# 兜底：ps+kill（比 pkill 通用）
+kubectl exec <pod-name> -n <namespace> -- \
+  sh -c "ps -o pid,args 2>/dev/null | grep -E '[s]tress-ng|[d]d if=/dev/zero' | awk '{print \$1}' | xargs -r kill -9"
 ```
 
 注意事项：

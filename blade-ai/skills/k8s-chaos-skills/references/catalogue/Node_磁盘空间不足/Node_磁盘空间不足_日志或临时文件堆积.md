@@ -1,4 +1,4 @@
-**用例名称** 日志或临时文件堆积 导致 节点容器运行时磁盘使用率过高
+**用例名称** 日志或临时文件堆积 导致 Node_磁盘空间不足
 
 **故障现象**：
 1. 节点磁盘使用率告警（大于85%）
@@ -65,3 +65,35 @@
 **基准事实**：
 - **根因**：容器日志或临时文件未清理，导致磁盘空间被占满
 - **必现现象**：节点磁盘使用率大于85%，`/var/log` 或 `/tmp` 目录占用空间大
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效节点磁盘填充。
+
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；选择已验证可拉取且含 `chroot`/`sh` 的镜像；宿主机变更必须 `--profile=sysadmin`；禁用 `-it`
+
+注入命令：
+```bash
+# 通过 kubectl debug node 在 /var/log 或 /tmp 目录填充数据
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'dd if=/dev/zero of=/var/log/chaos_fill bs=1M count=<size_mb>'
+# 或使用 fallocate（更快）：
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'fallocate -l <size>G /tmp/chaos_fill'
+```
+
+恢复命令：
+```bash
+# 删除填充文件
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'rm -f /var/log/chaos_fill /tmp/chaos_fill'
+# 删除 debug Pod
+kubectl delete pod <debug-pod-name> --force --grace-period=0
+```
+
+注意事项：
+- 填充路径对应的分区取决于节点配置，需参考上方「CRD 模式路径→分区映射表」
+- 与 ChaosBlade `--percent` 不同，此方式需手动计算填充字节数
+- 无自动超时恢复，必须手动删除填充文件

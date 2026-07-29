@@ -68,9 +68,9 @@
 注入命令：
 ```bash
 # 杀死目标进程（SIGTERM）
-kubectl exec <pod-name> -n <namespace> -- kill -15 $(pgrep -f <process-name>)
+kubectl exec <pod-name> -n <namespace> -- sh -c 'kill -15 $(pgrep -f <process-name>)'
 # 强制杀死（SIGKILL）：
-kubectl exec <pod-name> -n <namespace> -- kill -9 $(pgrep -f <process-name>)
+kubectl exec <pod-name> -n <namespace> -- sh -c 'kill -9 $(pgrep -f <process-name>)'
 ```
 
 恢复命令：

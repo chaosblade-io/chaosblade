@@ -43,3 +43,37 @@
 **基准事实**：
 - **根因**：容器运行时目录磁盘使用超过 kubelet 驱逐阈值（DiskPressure），kubelet 按优先级驱逐 Pod 以释放磁盘空间
 - **必现现象**：节点 DiskPressure=True；Pod 被 Evicted；reason 为 ephemeral-storage 不足
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效磁盘填充触发驱逐。
+
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；选择已验证可拉取且含 `chroot`/`sh` 的镜像；宿主机变更必须 `--profile=sysadmin`；禁用 `-it`
+
+注入命令：
+```bash
+# 通过 kubectl debug node 在容器运行时目录填充数据
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'dd if=/dev/zero of=/var/lib/containerd/chaos_fill bs=1M count=<size_mb>'
+# 或使用 fallocate（更快）：
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'fallocate -l <size>G /var/lib/containerd/chaos_fill'
+```
+
+恢复命令：
+```bash
+# 删除填充文件
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'rm -f /var/lib/containerd/chaos_fill'
+# 删除 debug Pod
+kubectl delete pod <debug-pod-name> --force --grace-period=0
+# 清理 Evicted Pod
+kubectl delete pods --field-selector=status.phase=Failed
+```
+
+注意事项：
+- 填充大小需根据节点实际磁盘容量和当前使用率计算，确保超过驱逐阈值（默认 imagefs.available < 15%）
+- 与 ChaosBlade `--percent 90` 不同，此方式需手动计算填充字节数
+- 无自动超时恢复，必须手动删除填充文件

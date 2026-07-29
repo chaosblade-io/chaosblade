@@ -1,4 +1,4 @@
-**⚠️ 注意：此场景为 kubectl-native 方案。blade v1.9.0 不支持文件系统级 IO 错误注入（无 pod-IO target），需通过 kubectl exec + dmsetup（device-mapper）在特权容器中实现。**
+**⚠️ 注意：此场景为 kubectl-native 方案。选用前提是 ChaosBlade 没有 pod-IO target（以 `blade create k8s --help` 实测为准；若本地版本提供 `pod-IO errno`，优先用它），需通过 kubectl exec + dmsetup（device-mapper）在特权容器中实现。**
 
 **用例名称** 文件系统IO返回错误 导致 Pod_磁盘IO异常
 
@@ -83,57 +83,4 @@ blade create k8s pod-disk burn \
 **基准事实**：
 - **根因**：文件系统 IO 操作返回错误码（EIO），模拟磁盘硬件故障或文件系统损坏场景，导致应用读写操作失败
 - **必现现象**：Pod 内文件写入返回 Input/output error；应用日志出现 errno 5 相关错误；数据写入请求失败率上升
-- **方案说明**：此为 kubectl-native 方案（blade v1.9.0 无 pod-IO target）。精确 IO 错误注入需要特权容器 + dmsetup；非特权环境可使用 `blade create k8s pod-disk burn` 作为近似替代（效果为 IO 饱和而非精确 errno）
-**用例名称** 文件系统IO返回错误 导致 Pod_磁盘IO异常
-
-**故障现象**：
-1. 应用写入数据失败，日志出现 I/O error 或 errno 5（EIO）
-2. 数据库/缓存持久化操作异常，数据丢失风险
-3. 文件系统读写操作间歇性返回错误码
-4. 应用功能降级或部分请求失败
-
-**资源准备**：
-1. 确认应用 A 已正常运行，且有活跃的磁盘读写操作
-2. 确认目标 Pod 内的文件路径存在且有读写活动
-3. 确认监控系统可观测应用错误率和日志
-
-**演练步骤**：
-1. 定位应用 A 的 Pod，确认目标文件路径：`kubectl exec <pod> -n <namespace> -- ls -ld <目录>`
-2. 使用 chaosblade 对目标 Pod 注入文件系统 IO 错误：
-   ```bash
-   blade create k8s pod-IO errno \
-     --namespace <namespace> \
-     --labels "<label-key>=<label-value>" \
-     --errno 5 \
-     --path <目录> \
-     --methods read,write \
-     --percent 50 \
-     --timeout 600 \
-     --kubeconfig <kubeconfig-path>
-   ```
-3. 记录返回的 blade_uid，用于后续恢复
-
-**注入验证**：
-1. 在 Pod 内尝试写入文件，确认返回 IO error：
-   ```bash
-   kubectl exec <pod> -n <namespace> -- dd if=/dev/zero of=<目录>/test bs=1M count=1
-   ```
-2. 查看应用日志，确认出现 `Input/output error` 或 errno 5 相关错误
-3. 确认应用数据写入请求失败率上升（部分请求因 --percent 50 仍可成功）
-4. 查看 Pod Events：`kubectl get events -n <namespace> --field-selector involvedObject.name=<pod>`
-
-**注入恢复**：
-1. 销毁 chaosblade 实验：`blade destroy <blade_uid>`
-2. 若应用未自动恢复，可重启 Pod 清除残留影响
-
-**恢复验证**：
-1. 在 Pod 内重新写入文件，确认成功无报错：
-   ```bash
-   kubectl exec <pod> -n <namespace> -- dd if=/dev/zero of=<目录>/test bs=1M count=1
-   ```
-2. 查看应用日志，确认 IO error 不再出现
-3. 确认应用数据写入功能恢复正常，错误率回落基线
-
-**基准事实**：
-- **根因**：文件系统 IO 操作返回错误码（EIO），模拟磁盘硬件故障或文件系统损坏场景，导致应用读写操作间歇性失败
-- **必现现象**：Pod 内文件写入返回 Input/output error；应用日志出现 errno 5 相关错误；数据写入请求失败率上升
+- **方案说明**：此为 kubectl-native 方案（选用前提：无 pod-IO target，以 `--help` 实测为准）。精确 IO 错误注入需要特权容器 + dmsetup；非特权环境可使用 `blade create k8s pod-disk burn` 作为近似替代（效果为 IO 饱和而非精确 errno）

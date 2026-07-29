@@ -53,3 +53,38 @@
 **基准事实**：
 - **根因**：kube-proxy Pod 异常或进程被杀，无法维护节点上的 iptables/ipvs 转发规则，导致 Service ClusterIP 流量无法被正确转发
 - **必现现象**：Service ClusterIP 访问超时；kube-proxy 不可用；节点 iptables/ipvs 规则缺失
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效 kube-proxy 异常。
+
+前提条件：具备修改 kube-proxy DaemonSet 的权限
+
+注入命令：
+```bash
+# 方式A：通过标签排除目标节点上的 kube-proxy 调度
+kubectl label node <目标节点> chaos-no-proxy=true
+kubectl patch ds kube-proxy -n kube-system \
+  -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"chaos-no-proxy","operator":"DoesNotExist"}]}]}}}}}}'
+# 方式B：通过 kubectl debug node 挂起 kube-proxy 进程
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'kill -STOP $(pidof kube-proxy)'
+```
+
+恢复命令：
+```bash
+# 方式A：移除标签并恢复 DaemonSet
+kubectl label node <目标节点> chaos-no-proxy-
+kubectl patch ds kube-proxy -n kube-system --type=json \
+  -p='[{"op":"remove","path":"/spec/template/spec/affinity"}]'
+# 方式B：恢复 kube-proxy 进程
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'kill -CONT $(pidof kube-proxy)'
+```
+
+注意事项：
+- 方式A 效果更彻底（kube-proxy Pod 被完全移除），但修改了 DaemonSet 配置，需注意恢复
+- 方式B 更轻量，但 kube-proxy 被 systemd 或 kubelet 管理时可能自动重启
+- 与 ChaosBlade 不同，此方式无自动超时恢复

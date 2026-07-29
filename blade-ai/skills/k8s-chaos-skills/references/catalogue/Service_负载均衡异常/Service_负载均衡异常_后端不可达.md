@@ -43,3 +43,56 @@
 **基准事实**：
 - **根因**：Service 后端 Pod 异常或网络不通，导致负载均衡无法将请求转发到健康的后端，服务可用性下降
 - **必现现象**：Endpoints 列表部分为空或全部为空；请求出现 5xx 或超时；Ingress 后端健康检查失败
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效后端不可达。
+
+前提条件：方式A 只需容器内有 `kill`（BusyBox 也提供，基本总是可用）；方式C 只用控制面 kubectl，
+不依赖容器内任何东西 —— **这两条是最可靠的**。方式B 额外要求容器内真有 `iptables` 且有
+NET_ADMIN，精简镜像通常两者都不满足，选它之前先验证。
+
+注入命令：
+```bash
+# 方式A：杀死后端 Pod 主进程（推荐，导致 Pod 重启/CrashLoopBackOff）
+kubectl exec <pod-name> -n <namespace> -- sh -c 'kill 1'
+# 方式B：注入网络丢包（需容器内真有 iptables 且有 NET_ADMIN，先验证：
+#         kubectl exec <pod-name> -n <namespace> -- sh -c 'command -v iptables || echo NO_IPTABLES'）
+kubectl exec <pod-name> -n <namespace> -- iptables -A OUTPUT -j DROP
+# 方式B'：容器内无 iptables 时，用临时容器 + tc（临时容器与目标容器共享网络命名空间，
+#         工具来自调试镜像，--profile=netadmin 提供 NET_ADMIN）
+# ── 路径 B'：容器内无可用工具（精简镜像的常态）。
+#    先建【长驻】临时容器作为载体 —— 必须 sleep 保活；若把 tc 直接交给 kubectl debug，
+#    命令跑完容器即终止，后续 `kubectl exec -c <debugger>` 会报 container not found，
+#    故障将无法恢复（已实测）。
+kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
+  --target=<container-name> --profile=netadmin --quiet -- sleep <duration>
+
+# 取载体名，等它进入 running
+kubectl get pod <pod-name> -n <namespace> \
+  -o jsonpath='{range .status.ephemeralContainerStatuses[*]}{.name}{"="}{.state}{"\n"}{end}'
+
+# 经载体注入：载体与目标容器共享网络命名空间，操作 eth0 即操作目标 Pod 的网卡
+kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev eth0 root netem loss 100%
+# 方式C：直接删除后端 Pod
+kubectl delete pod <pod-name> -n <namespace>
+```
+
+恢复命令：
+```bash
+# 方式A/C：Pod 由 Deployment 控制器自动重建，无需手动操作
+# 方式B：删除 iptables 规则（与注入逐字对应，不要用 iptables -F）
+kubectl exec <pod-name> -n <namespace> -- iptables -D OUTPUT -j DROP
+# 方式B'：复用注入时那个临时容器，不要新建
+kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc del dev eth0 root
+```
+
+注意事项：
+- 方式A（kill 1）效果最直接，但应用会立即重启，故障窗口可能较短
+- 方式B（iptables）持续效果更好，但需容器有 NET_ADMIN 权限
+- 与 ChaosBlade 不同，方式A/C 无法精确控制故障持续时间
+- 方式B 依赖容器内有 `iptables`，精简镜像（BusyBox/distroless）通常没有；此时用方式B'，
+  但要先确认集群能拉取含 iproute2 的镜像。**临时容器无法从运行中的 Pod 移除**，
+  只能随 Pod 重建消失；`tc qdisc del` 成功即代表故障已恢复

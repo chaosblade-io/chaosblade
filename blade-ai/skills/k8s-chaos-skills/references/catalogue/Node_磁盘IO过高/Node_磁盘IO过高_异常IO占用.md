@@ -69,26 +69,30 @@
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效故障注入。
 
-前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；目标路径需存在且可写
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；选择已验证可拉取且含 `chroot`/`sh` 的镜像；宿主机变更必须 `--profile=sysadmin`；禁用 `-it`；目标路径需存在且可写
 
 注入命令：
 ```bash
-# 使用 kubectl debug node + dd 注入磁盘 IO 压力（持续写入）
-kubectl debug node/<node-name> -it --image=alpine -- sh -c 'while true; do chroot /host dd if=/dev/zero of=<path>/burn_test bs=1M count=512 oflag=direct; done'
+# 使用 kubectl debug node + dd 注入磁盘 IO 压力；用 timeout 让循环到点自停（自动恢复）
+# 写压力：
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- sh -c \
+  'timeout <duration> sh -c "while true; do chroot /host dd if=/dev/zero of=<path>/burn_test bs=1M count=512 oflag=direct; done"'
 # 同时注入读压力：
-kubectl debug node/<node-name> -it --image=alpine -- sh -c 'while true; do chroot /host dd if=<path>/burn_test of=/dev/null bs=1M count=512 iflag=direct; done'
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- sh -c \
+  'timeout <duration> sh -c "while true; do chroot /host dd if=<path>/burn_test of=/dev/null bs=1M count=512 iflag=direct; done"'
 ```
 
 恢复命令：
 ```bash
-# 退出 debug Pod（Ctrl+D），或直接删除 debug Pod：
-kubectl delete pod <debug-pod-name> --force --grace-period=0
+# 循环会在 <duration> 到期后自动停止（debug Pod 进入 Completed）
 # 清理临时文件：
-kubectl debug node/<node-name> -it --image=alpine -- sh -c 'chroot /host rm -f <path>/burn_test'
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- sh -c 'chroot /host rm -f <path>/burn_test'
+# 清理 Completed 的 debug Pod：
+kubectl delete pod <debug-pod-name> --force --grace-period=0
 ```
 
 注意事项：
 - `oflag=direct` 绕过页缓存直接写磁盘，确保产生真实 IO 压力
-- 注入前必须校验目标路径存在且可写，否则 dd 会静默失败
-- 与 ChaosBlade 相比，kubectl debug node + dd 方式需手动管理 debug Pod 生命周期和临时文件清理
-- dd 写入会产生实际文件，需确保目标分区有足够空间
+- 用 `timeout <duration>` 让 dd 循环到点自终止（自动恢复），无需依赖手动 kill
+- debug 命令客户端会阻塞到 <duration> 或断连，但 debug Pod 服务端持续运行，客户端超时不代表注入失败
+- 注入前必须校验目标路径存在且可写，否则 dd 会静默失败；dd 写入会产生实际文件，需确保分区有足够空间

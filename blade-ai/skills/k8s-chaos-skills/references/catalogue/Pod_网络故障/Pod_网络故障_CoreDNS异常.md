@@ -1,4 +1,4 @@
-**用例名称** CoreDNS异常 导致 DNS_解析失败
+**用例名称** CoreDNS异常 导致 Pod_网络故障
 
 **故障现象**：
 1. Pod 内 DNS 解析失败，应用报 `Name or service not known` 或 `NXDOMAIN` 错误

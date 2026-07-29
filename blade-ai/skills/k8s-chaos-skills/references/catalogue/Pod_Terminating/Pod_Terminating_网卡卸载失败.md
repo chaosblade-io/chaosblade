@@ -43,3 +43,37 @@
 **基准事实**：
 - **根因**：CNI 插件异常或不可用，导致 Pod 删除时网卡/ENI 资源无法正常释放，sandbox 清理失败，Pod 卡在 Terminating
 - **必现现象**：Pod Terminating 持续；kubelet 日志显示 CNI DEL 失败；网络资源未释放
+
+---
+
+**降级方案（kubectl-native）**
+
+> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令模拟 CNI 插件异常。
+
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+），或可操作 CNI DaemonSet
+
+注入命令：
+```bash
+# 方式A：通过 kubectl debug node 挂起 CNI 插件进程
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'kill -STOP $(pidof terway-daemon || pidof cilium-agent || pidof calico-node)'
+# 方式B：删除节点上的 CNI Pod（先 cordon 防止重建）
+kubectl cordon <node-name>
+kubectl delete pod -n kube-system -l app=terway --field-selector spec.nodeName=<node-name>
+```
+
+恢复命令：
+```bash
+# 方式A：恢复 CNI 插件进程
+kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
+  'kill -CONT $(pidof terway-daemon || pidof cilium-agent || pidof calico-node)'
+# 方式B：uncordon 节点，等待 DaemonSet 重建 CNI Pod
+kubectl uncordon <node-name>
+# 删除 debug Pod
+kubectl delete pod <debug-pod-name> --force --grace-period=0
+```
+
+注意事项：
+- CNI 插件名称因集群而异：Terway（阿里云）、Cilium、Calico 等，需根据实际环境确认进程名
+- 方式B 删除 CNI Pod 后，如未 cordon 节点，DaemonSet 会立即重建，故障窗口极短
+- 与 ChaosBlade 不同，此方式无自动超时恢复，必须手动恢复进程或 uncordon 节点

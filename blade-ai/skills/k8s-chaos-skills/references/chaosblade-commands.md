@@ -2,6 +2,20 @@
 
 本文件提供 Chaosblade 在 Kubernetes 环境下常用故障注入命令的速查，减少执行过程中反复 `-h` 查看帮助。
 
+> **⚠️ 可用 action 随版本变化，本表不是权威**
+>
+> 本表的 action 集合整理自 blade v1.8.0，**你的环境可能不同**。ChaosBlade 在版本间增删过
+> action（例如 `pod-network` 的 `delay`/`loss` 在某些版本中不存在，只有 `dns`/`drop`/`occupy`）。
+>
+> 因此：**表里写「有」不代表你能用，写「没有」也不代表你不能用。** 注入前若对某个
+> action 是否存在有疑问，用一条命令定论：
+>
+> ```bash
+> blade create k8s <scope>-<target> --help
+> ```
+>
+> 以该输出的 `Available Commands` 为准。本文件后续标注「可用性以实测为准」的地方，都是指这件事。
+
 ---
 
 ## 通用语法
@@ -20,18 +34,18 @@ blade create k8s <scope>-<target> <action> [flags]
 |---|---|---|
 | pod-cpu | `fullload` | CPU 满载 |
 | pod-mem | `load` | 内存占用 |
-| pod-network | `dns`, `drop`, `occupy` | 网络故障 (v1.8.0) |
+| pod-network | `dns`, `drop`, `occupy` | 网络故障（是否另有 `delay`/`loss`，以 `--help` 实测为准） |
 | pod-disk | `fill`, `burn` | 磁盘填充 / IO 负载 |
 | pod-process | `kill`, `stop` | 进程操作 |
 | pod-pod | `delete` | Pod 删除 |
-| pod-IO | `delay`, `errno` | 文件系统 IO 故障 |
+| pod-IO | `delay`, `errno` | 文件系统 IO 故障（部分版本无此 target，以 `--help` 实测为准） |
 | node-cpu | `fullload` | CPU 满载 |
 | node-mem | `load` | 内存占用 |
-| node-network | `drop` | 网络故障 (v1.8.0: `delay`/`loss` → `drop`) |
+| node-network | `drop` | 网络故障（`delay`/`loss` 在部分版本中不存在，以 `--help` 实测为准） |
 | node-disk | `fill`, `burn` | 磁盘填充 / IO 负载 (**无 fullload**) |
 | node-process | `kill`, `stop` | 进程操作 |
 | container-cpu | `fullload` | CPU 满载 |
-| container-network | `drop` | 网络故障 (v1.8.0: `delay`/`loss` → `drop`) |
+| container-network | `drop` | 网络故障（`delay`/`loss` 在部分版本中不存在，以 `--help` 实测为准） |
 | container-process | `kill`, `stop` | 进程操作 |
 | container-container | `remove` | 容器删除 |
 
@@ -100,7 +114,9 @@ blade create k8s pod-mem load \
 
 ### 3. Pod 网络延迟
 
-> **⚠️ v1.8.0 不可用**：`pod-network delay` 在 blade v1.8.0 中不存在（仅 `dns`/`drop`/`occupy`）。如需延迟效果，使用 Tier 2 kubectl-native 方案（tc qdisc）。以下为旧版参考：
+> **⚠️ 可用性以实测为准**：部分版本的 `pod-network` 只提供 `dns`/`drop`/`occupy`，没有 `delay`。
+> 先用 `blade create k8s pod-network --help` 确认；确实没有时改走 Tier 2 kubectl-native 方案（tc qdisc）。
+> 以下命令供提供该 action 的版本使用：
 
 ```bash
 blade create k8s pod-network delay \
@@ -311,7 +327,8 @@ Flags 与 Pod 内存压力一致（`--mode`、`--mem-percent`、`--reserve`、`-
 
 ### 3. 节点网络延迟
 
-> **⚠️ v1.8.0 不可用**：`node-network delay` 在 blade v1.8.0 中不存在。以下为旧版参考：
+> **⚠️ 可用性以实测为准**：部分版本的 `node-network` 没有 `delay`。先用
+> `blade create k8s node-network --help` 确认。以下命令供提供该 action 的版本使用：
 
 ```bash
 blade create k8s node-network delay \
@@ -406,7 +423,8 @@ blade create k8s container-cpu fullload \
 
 ### 2. 容器网络延迟
 
-> **⚠️ v1.8.0 不可用**：`container-network delay` 在 blade v1.8.0 中不存在。以下为旧版参考：
+> **⚠️ 可用性以实测为准**：部分版本的 `container-network` 没有 `delay`。先用
+> `blade create k8s container-network --help` 确认。以下命令供提供该 action 的版本使用：
 
 ```bash
 blade create k8s container-network delay \

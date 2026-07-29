@@ -63,7 +63,8 @@
 # 单次删除 Pod：
 kubectl delete pod <pod-name> -n <namespace>
 # 持续删除（模拟 ChaosBlade timeout 窗口内反复删除）：
-while true; do kubectl delete pod -l <label-selector> -n <namespace> --wait=false; sleep 5; done
+# 反复执行下面这一条即可（每轮之间等 5 秒，重复到观察到目标现象）：
+kubectl delete pod -l <label-selector> -n <namespace> --wait=false
 ```
 
 恢复命令：

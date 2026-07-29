@@ -36,24 +36,27 @@
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效故障注入。
 
-前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；debug 镜像需包含 `stress-ng` 或有基本 shell
+前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；stress-ng 方式需选择**包含 `stress-ng`** 的已验证镜像（如 `ghcr.io/colinianking/stress-ng`）；busybox 方式仅需基本 shell。
 
 注入命令：
 ```bash
-# 使用 kubectl debug node 注入 CPU 压力
-kubectl debug node/<node-name> -it --image=alpine -- sh -c 'stress-ng --cpu 0 --cpu-load <percent> --timeout <duration>s'
-# 如果无 stress-ng 镜像，使用 busybox 模拟：
-kubectl debug node/<node-name> -it --image=busybox -- sh -c 'while true; do :; done &'
+# 使用 kubectl debug node 注入 CPU 压力（非交互；镜像须含 stress-ng，--timeout 自带自动恢复）
+kubectl debug node/<node-name> --profile=sysadmin --image=<stress-ng-image> -- sh -c 'stress-ng --cpu 0 --cpu-load <percent> --timeout <duration>s'
+# 如无 stress-ng 镜像，用 busybox 模拟：每个循环用 timeout 到点自杀（前台 wait 保活容器）
+# N=目标核数；到期后 debug Pod 自动进入 Completed，故障自动停止
+kubectl debug node/<node-name> --profile=sysadmin --image=busybox -- sh -c \
+  'for i in $(seq 1 <N>); do timeout <duration> sh -c "while :; do :; done" & done; wait'
 ```
 
 恢复命令：
 ```bash
-# 退出 debug Pod（Ctrl+D），或直接删除 debug Pod：
+# stress-ng/busybox 循环均会在 <duration> 到期后自动停止（debug Pod 进入 Completed）
+# 如需立即停止或清理 Completed Pod，删除 debug Pod：
 kubectl delete pod <debug-pod-name> --force --grace-period=0
-# stress-ng 会在 --timeout 到期后自动退出
 ```
 
 注意事项：
 - debug Pod 运行在宿主机 PID namespace 中，CPU 压力会直接影响节点
-- busybox 循环方式只能实现单核满载，多核场景需启动多个后台进程
-- 与 ChaosBlade 相比，kubectl debug node 方式需手动管理 debug Pod 生命周期
+- busybox `timeout` 让循环到点自终止（自动恢复），无需依赖手动 kill；多核用 `seq 1 N` 起 N 个
+- debug 命令客户端会阻塞到 <duration> 或断连，但 debug Pod 服务端持续运行，客户端超时不代表注入失败
+- 与 ChaosBlade 相比，kubectl debug node 方式需手动清理 Completed 的 debug Pod

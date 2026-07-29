@@ -63,27 +63,78 @@
 
 **降级方案（kubectl-native）**
 
-> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效故障注入。
+> 当 ChaosBlade 不可用时，用以下 kubectl 原生命令实现等效故障注入。
 
-> ⚠️ 前提条件：目标容器需具有 `NET_ADMIN` capability（SecurityContext.capabilities.add: ["NET_ADMIN"]），否则 iptables 命令将因权限不足失败。
+前提条件：需要 `iptables` 或 **iproute2** `tc` 之一。**两者在精简镜像里通常都没有** ——
+先判定，再选路径：
+
+```bash
+kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- sh -c \
+  'command -v iptables || echo NO_IPTABLES; tc -Version'
+```
+- 有 `iptables` 且容器有 `NET_ADMIN` → 路径 A
+- `tc -Version` 输出 `tc utility, iproute2-<版本>` 且有 `NET_ADMIN` → 路径 B
+- 两者都没有，或 `tc -Version` 输出 `BusyBox v...`（BusyBox applet 不支持 netem），
+  或容器 `CapEff` 全零 → 路径 C
 
 注入命令：
 ```bash
-# 对指定容器丢弃所有出站网络流量
+# ── 路径 A：容器内有真 iptables + NET_ADMIN
 kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- iptables -A OUTPUT -j DROP
-# 如需仅丢弃特定端口流量：
+# 仅丢弃特定端口流量：
 kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- iptables -A OUTPUT -p tcp --sport <port> -j DROP
+
+# ── 路径 B：容器内有真 tc + NET_ADMIN（100% 丢包等效于网络中断）
+kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- tc qdisc add dev eth0 root netem loss 100%
+
+# ── 路径 C：容器内两者都不可用（精简镜像的常态）。临时容器与 Pod 内各容器共享同一个网络
+#    命名空间，所以在临时容器里操作 eth0 就等于操作这个 Pod 的网络栈；工具来自调试镜像
+# ── 路径 C：容器内无可用工具（精简镜像的常态）。
+#    先建【长驻】临时容器作为载体 —— 必须 sleep 保活；若把 tc 直接交给 kubectl debug，
+#    命令跑完容器即终止，后续 `kubectl exec -c <debugger>` 会报 container not found，
+#    故障将无法恢复（已实测）。
+kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
+  --target=<container-name> --profile=netadmin --quiet -- sleep <duration>
+
+# 取载体名，等它进入 running
+kubectl get pod <pod-name> -n <namespace> \
+  -o jsonpath='{range .status.ephemeralContainerStatuses[*]}{.name}{"="}{.state}{"\n"}{end}'
+
+# 经载体注入：载体与目标容器共享网络命名空间，操作 eth0 即操作目标 Pod 的网卡
+kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev eth0 root netem loss 100%
 ```
+- `<verified-cluster-image>`：必须是当前集群**已验证可拉取**且含 **iproute2**（非 BusyBox）的镜像。
+  可靠找法：看集群里已经在跑的镜像，它们必然可拉取 ——
+  `kubectl get pods -A -o jsonpath='{..image}'`。CNI / 网络组件（terway、calico、cilium 等）
+  通常自带 iproute2，因为它们本身就要做流量整形。选定后用
+  `kubectl debug ... -- tc -Version` 确认输出是 `tc utility, iproute2-...` 而非 `BusyBox v...`；
+  拉不动时 Pod 事件会出现 `ErrImagePull` / `ImagePullBackOff`
+- `--quiet`：不进入交互附着；**不要加 `-it`**
+- 载体名形如 `debugger-xxxxx`，注入/验证/恢复三步都要用同一个
 
 恢复命令：
 ```bash
-# 精确删除注入的规则（与注入命令对应）：
+# ── 路径 A：与注入命令逐字对应删除
 kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- iptables -D OUTPUT -j DROP
-# 如果注入的是端口级丢包：
 kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- iptables -D OUTPUT -p tcp --sport <port> -j DROP
+
+# ── 路径 B
+kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- tc qdisc del dev eth0 root
+
+# ── 路径 C：复用注入时那个临时容器，不要新建
+kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc del dev eth0 root
 ```
+临时容器名遗失时用
+`kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.status.ephemeralContainerStatuses[*].name}'`
+取回。
 
 注意事项：
-- Container 共享 Pod 网络 namespace，iptables 规则影响整个 Pod 的网络栈，需通过 `--sport`/`--dport` 精确限定影响范围
-- 如容器无 `NET_ADMIN` capability，此降级方案不可用，需考虑重建 Pod 并添加权限
-- 与 ChaosBlade 相比，kubectl exec + iptables 无法自动超时恢复，需手动执行 `iptables -D` 精确删除注入的规则
+- **Pod 内所有容器共享同一个网络 namespace**，所以无论从哪个容器（含临时容器）下手，
+  iptables/tc 规则都作用于整个 Pod 的网络栈。要限定影响范围只能靠 `--sport`/`--dport`
+  或 netem 的作用方向，而不是靠 `-c` 选容器
+- 全量中断会切断监控和健康检查，可能触发 Pod 重启
+- 无自动超时恢复，必须手动删除规则；Pod 重启会让规则自动消失（不持久化）
+- 恢复 iptables 用 `-D` 逐字对应删除，不要用 `iptables -F`——那会清掉 Pod 原有的其他规则
+- 走过路径 C 的话：**临时容器无法从运行中的 Pod 移除**（Kubernetes 既定行为），只能随 Pod 重建消失。
+  `tc qdisc del` 成功即代表故障已恢复；如需立即清理须删除该 Pod 让上层控制器重建 ——
+  这是额外的变更动作，须经确认后再做

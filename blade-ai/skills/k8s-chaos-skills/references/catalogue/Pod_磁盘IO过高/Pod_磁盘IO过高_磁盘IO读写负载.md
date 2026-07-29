@@ -61,19 +61,34 @@
 
 注入命令：
 ```bash
-# 读压力：
-kubectl exec <pod-name> -n <namespace> -- sh -c 'while true; do dd if=/chaos_burnio.read of=/dev/null bs=1M count=100 2>/dev/null; done &'
+# 关键点：循环用子 shell 后台 + 重定向（否则 exec 挂到 10s 超时）；PID 落盘 + 定时自动 kill。
+# 读压力（先造 500MB 源文件再循环读）：
+kubectl exec <pod-name> -n <namespace> -- sh -c '
+  dd if=/dev/zero of=/chaos_burnio.read bs=1M count=500 2>/dev/null
+  ( while :; do dd if=/chaos_burnio.read of=/dev/null bs=1M count=100 2>/dev/null; done ) >/dev/null 2>&1 &
+  echo $! > /tmp/chaos_ioread.pid
+  ( sleep <duration>; kill $(cat /tmp/chaos_ioread.pid) 2>/dev/null; rm -f /tmp/chaos_ioread.pid /chaos_burnio.read ) >/dev/null 2>&1 &
+'
 # 写压力：
-kubectl exec <pod-name> -n <namespace> -- sh -c 'while true; do dd if=/dev/zero of=/chaos_burnio.write bs=1M count=100 2>/dev/null && rm -f /chaos_burnio.write; done &'
+kubectl exec <pod-name> -n <namespace> -- sh -c '
+  ( while :; do dd if=/dev/zero of=/chaos_burnio.write bs=1M count=100 2>/dev/null && rm -f /chaos_burnio.write; done ) >/dev/null 2>&1 &
+  echo $! > /tmp/chaos_iowrite.pid
+  ( sleep <duration>; kill $(cat /tmp/chaos_iowrite.pid) 2>/dev/null; rm -f /tmp/chaos_iowrite.pid /chaos_burnio.write ) >/dev/null 2>&1 &
+'
 ```
 
-恢复命令：
+恢复命令（从精确到兜底）：
 ```bash
-kubectl exec <pod-name> -n <namespace> -- pkill -f 'dd if='
-kubectl exec <pod-name> -n <namespace> -- rm -f /chaos_burnio.write /chaos_burnio.read
+# 首选：按落盘 PID 精确 kill 并清理文件
+kubectl exec <pod-name> -n <namespace> -- sh -c \
+  'kill $(cat /tmp/chaos_ioread.pid /tmp/chaos_iowrite.pid) 2>/dev/null; rm -f /tmp/chaos_ioread.pid /tmp/chaos_iowrite.pid /chaos_burnio.read /chaos_burnio.write'
+# 兜底：ps+kill（比 pkill 通用）
+kubectl exec <pod-name> -n <namespace> -- sh -c \
+  "ps -o pid,args 2>/dev/null | grep '[d]d if=' | awk '{print \$1}' | xargs -r kill -9"
 ```
 
 注意事项：
 - 无法精确控制 IO 带宽比例，只能尽量打满 IO
-- 无自动超时恢复机制，需手动 kill dd 进程
-- 写压力循环会反复创建和删除文件，确保不会打满磁盘
+- 循环命令必须用子 shell 后台 + 重定向 `>/dev/null 2>&1`，否则占住 exec 输出管道导致 `kubectl exec` 挂起到 10s 超时
+- 自动恢复基于 PID 文件 + 定时 kill，可靠；切勿用 `$(jobs -p)` 定时自杀（脱离子 shell 取不到 PID）
+- 写压力循环会反复创建和删除文件，读压力会预置 500MB 源文件，注意确保分区有足够空间

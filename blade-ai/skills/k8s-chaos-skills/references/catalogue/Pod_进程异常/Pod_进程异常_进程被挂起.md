@@ -87,13 +87,13 @@
 注入命令：
 ```bash
 # 挂起目标进程（发送 SIGSTOP）
-kubectl exec <pod-name> -n <namespace> -- kill -STOP $(pgrep -f <process-name>)
+kubectl exec <pod-name> -n <namespace> -- sh -c 'kill -STOP $(pgrep -f <process-name>)'
 ```
 
 恢复命令：
 ```bash
 # 恢复目标进程（发送 SIGCONT）
-kubectl exec <pod-name> -n <namespace> -- kill -CONT $(pgrep -f <process-name>)
+kubectl exec <pod-name> -n <namespace> -- sh -c 'kill -CONT $(pgrep -f <process-name>)'
 ```
 
 注意事项：

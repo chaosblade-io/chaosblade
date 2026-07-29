@@ -62,28 +62,76 @@
 
 **降级方案（kubectl-native）**
 
-> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效网络丢包注入。
+> 当 ChaosBlade 不可用时，用以下 kubectl 原生命令实现等效网络丢包注入。
+> **工具选择很关键**：`tc netem loss <percent>%` 是唯一能做出「按百分比丢包」的手段；
+> `iptables -j DROP` 只能全丢或按端口全丢（二元），做不出 30% 这类比例。所以主路径用 tc。
 
-前提条件：容器需有 NET_ADMIN capability 或以 root 运行，容器内需有 `iptables` 工具
+前提条件：需要一份可用的 **iproute2** `tc`。它可能来自目标容器，也可能来自临时容器 —— 先判定：
+
+```bash
+kubectl exec <pod-name> -n <namespace> -- tc -Version
+```
+- 输出 `tc utility, iproute2-<版本>` → 真 tc，可走路径 A
+- 输出 `BusyBox v<版本> ...` 或命令不存在 → 走路径 B。**注意 `which tc` / `command -v tc` 会误判**：
+  精简镜像里 `/bin/tc` 常与 `/bin/sh` 是同一个 BusyBox 二进制，名字在但不支持 netem，
+  执行时报 `invalid argument 'root' to 'command'`
 
 注入命令：
+
 ```bash
-# 全量丢包（所有出站流量）：
-kubectl exec <pod-name> -n <namespace> -- iptables -A OUTPUT -j DROP
-# 或基于端口的精确丢包：
+# ── 路径 A：容器内确认是 iproute2 tc，且有 NET_ADMIN（CapEff 全零的容器会报 EPERM）
+kubectl exec <pod-name> -n <namespace> -- tc qdisc add dev eth0 root netem loss <percent>%
+
+# ── 路径 B：容器内无可用 tc（精简镜像的常态）。临时容器与目标容器共享网络命名空间，
+#    对 eth0 操作等价于操作目标 Pod 的网卡；tc 来自调试镜像，--profile=netadmin 给 NET_ADMIN
+# ── 路径 B：容器内无可用工具（精简镜像的常态）。
+#    先建【长驻】临时容器作为载体 —— 必须 sleep 保活；若把 tc 直接交给 kubectl debug，
+#    命令跑完容器即终止，后续 `kubectl exec -c <debugger>` 会报 container not found，
+#    故障将无法恢复（已实测）。
+kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
+  --target=<container-name> --profile=netadmin --quiet -- sleep <duration>
+
+# 取载体名，等它进入 running
+kubectl get pod <pod-name> -n <namespace> \
+  -o jsonpath='{range .status.ephemeralContainerStatuses[*]}{.name}{"="}{.state}{"\n"}{end}'
+
+# 经载体注入：载体与目标容器共享网络命名空间，操作 eth0 即操作目标 Pod 的网卡
+kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev eth0 root netem loss <percent>%
+```
+- `<verified-cluster-image>`：当前集群**已验证可拉取**且含 iproute2 的镜像。先看集群在用哪些仓库
+  （`kubectl get pods -A -o jsonpath='{..image}'`）并从同仓库取；拉不动时 Pod 事件里会出现
+  `ErrImagePull` / `ImagePullBackOff`
+- `--quiet`：不进入交互附着；**不要加 `-it`**
+- 载体名形如 `debugger-xxxxx`，注入/验证/恢复三步都要用同一个
+
+只需要「完全断开某个依赖」而非按比例丢包时，可用 iptables（需容器内真有 `iptables`，
+精简镜像通常没有；节点上一般有，但那要走 node 级用例）：
+```bash
 kubectl exec <pod-name> -n <namespace> -- iptables -A OUTPUT -p tcp --dport <port> -j DROP
 ```
 
 恢复命令：
+
 ```bash
-# 精确删除注入的规则（与注入命令对应）：
-kubectl exec <pod-name> -n <namespace> -- iptables -D OUTPUT -j DROP
-# 如果注入的是端口级丢包：
+# 与注入同一条路径 —— tc qdisc del 同样需要真 tc
+# 路径 A
+kubectl exec <pod-name> -n <namespace> -- tc qdisc del dev eth0 root
+# 路径 B（复用注入时那个临时容器，不要新建）
+kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc del dev eth0 root
+
+# 若注入用的是 iptables，按注入命令逐字对应删除
 kubectl exec <pod-name> -n <namespace> -- iptables -D OUTPUT -p tcp --dport <port> -j DROP
 ```
+临时容器名遗失时用
+`kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.status.ephemeralContainerStatuses[*].name}'`
+取回。
 
 注意事项：
-- 全量丢包会影响所有流量包括监控和健康检查，建议使用端口级丢包
-- 需要容器具备 NET_ADMIN capability，否则 iptables 命令会报权限错误
-- 无自动超时恢复机制，必须手动执行 `iptables -D` 删除规则
-- 恢复时使用 `iptables -D` 精确删除注入的规则，避免 `iptables -F` 清除容器原有的其他规则
+- 按百分比丢包只有 `tc netem loss` 能做，`iptables -j DROP` 是二元的，两者不可互相替代
+- 全量丢包（`iptables -A OUTPUT -j DROP` 或 `netem loss 100%`）会切断监控和健康检查，
+  可能触发 Pod 重启，建议用端口级或较低百分比
+- 无自动超时恢复，必须手动删除规则；Pod 重启会让 tc 规则自动消失（不持久化）
+- 恢复 iptables 用 `-D` 逐字对应删除，不要用 `iptables -F`——那会清掉容器原有的其他规则
+- 走过路径 B 的话：**临时容器无法从运行中的 Pod 移除**（Kubernetes 既定行为），只能随 Pod 重建消失。
+  `tc qdisc del` 成功即代表故障已恢复，残留容器不影响业务容器；如需立即清理须删除该 Pod
+  让上层控制器重建 —— 这是额外的变更动作，须经确认后再做
