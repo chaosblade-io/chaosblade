@@ -4,8 +4,8 @@ from datetime import datetime
 
 import pytest
 
-from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.safety_score import (
+from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.spec.safety_score import (
     DEFAULT_WEIGHTS,
     DimensionScore,
     SafetyScore,
@@ -168,7 +168,7 @@ class TestTime:
         # module-level datetime.now to return this instant when called
         # with the BEIJING_TZ argument, mimicking what runtime does.
         fixed_utc = datetime(2026, 5, 26, 8, 0, tzinfo=timezone.utc)
-        from chaos_agent.agent import safety_score as mod
+        from chaos_agent.agent.spec import safety_score as mod
 
         class _Clock(datetime):
             @classmethod

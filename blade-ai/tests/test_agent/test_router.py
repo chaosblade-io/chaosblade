@@ -7,7 +7,6 @@ from langchain_core.messages import AIMessage, ToolMessage
 from chaos_agent.agent.router import (
     route_after_confirmation,
     route_after_direct_execute,
-    route_after_load_memory,
     route_after_phase1_tools,
     route_after_safety,
     route_after_baseline,
@@ -136,10 +135,35 @@ class TestShouldContinueExecuteLoop:
         assert should_continue_execute_loop(state) == "verifier"
 
     @patch("chaos_agent.agent.router.settings")
-    def test_max_iterations_goes_to_end(self, mock_settings):
+    def test_max_iterations_goes_to_verifier(self, mock_settings):
+        """Budget exhaustion must not skip the verifier either.
+
+        This asserted ``"end"`` until task-ff057e7f, where it sent a run that
+        burned 100/100 iterations straight to save_memory: verifier never ran,
+        ``verification=null``, and the envelope reported success while the
+        postmortem in the same payload said the experiment stalled.
+
+        The policy directly above — "error must not skip verifier, the verifier
+        checks whether the fault actually took effect" — applies with MORE force
+        here: on exhaustion the model never concluded anything at all, so there
+        is even less basis for a verdict without checking.
+        """
         mock_settings.max_execute_loop = 15
         state = {"execute_loop_count": 15, "blade_uid": None, "error": None}
-        assert should_continue_execute_loop(state) == "end"
+        assert should_continue_execute_loop(state) == "verifier"
+
+    @patch("chaos_agent.agent.router.settings")
+    def test_max_iterations_still_prefers_replan_when_eligible(self, mock_settings):
+        """Replan short-circuits exhaustion, as it did before."""
+        mock_settings.max_execute_loop = 15
+        mock_settings.max_replan_count = 2
+        state = {
+            "execute_loop_count": 15,
+            "replan_requested": True,
+            "replan_count": 0,
+            "error": None,
+        }
+        assert should_continue_execute_loop(state) in ("replan", "verifier")
 
     @patch("chaos_agent.agent.router.settings")
     def test_normal_continues(self, mock_settings):
@@ -265,22 +289,6 @@ class TestRouteAfterConfirmation:
         assert route_after_confirmation(state) == "baseline_capture"
 
 
-class TestRouteAfterLoadMemory:
-    """Test route_after_load_memory routing."""
-
-    def test_direct_goes_to_direct_setup(self):
-        state = {"direct": True}
-        assert route_after_load_memory(state) == "direct_setup"
-
-    def test_llm_goes_to_agent_loop(self):
-        state = {"direct": False}
-        assert route_after_load_memory(state) == "agent_loop"
-
-    def test_default_goes_to_agent_loop(self):
-        state = {}
-        assert route_after_load_memory(state) == "agent_loop"
-
-
 class TestRouteAfterDirectExecute:
     """Test route_after_direct_execute routing."""
 
@@ -328,34 +336,45 @@ class TestRouteAfterPhase1Tools:
         assert route_after_phase1_tools({}) == "agent_loop"
 
     def test_finish_planning_routes_to_extract(self):
+        spec = self._fault_spec()
         msgs = [
-            AIMessage(content="", tool_calls=[{"name": "finish_planning", "id": "tc_1", "args": {}}]),
+            AIMessage(content="", tool_calls=[{"name": "finish_planning", "id": "tc_1", "args": {
+                "summary": "ready to inject",
+            }}]),
             ToolMessage(content="ok", name="finish_planning", tool_call_id="tc_1"),
         ]
-        assert route_after_phase1_tools({"messages": msgs}) == "extract_planning_metadata"
+        assert route_after_phase1_tools({"messages": msgs, "fault_spec": spec}) == "extract_planning_metadata"
 
-    def test_save_fault_plan_routes_to_extract(self):
+    def test_save_fault_plan_returns_to_agent_loop(self):
         msgs = [
             AIMessage(content="", tool_calls=[{"name": "save_fault_plan", "id": "tc_1", "args": {}}]),
             ToolMessage(content="ok", name="save_fault_plan", tool_call_id="tc_1"),
         ]
-        assert route_after_phase1_tools({"messages": msgs}) == "extract_planning_metadata"
+        assert route_after_phase1_tools({"messages": msgs}) == "agent_loop"
 
     def test_propose_plan_change_with_replan_context_routes_to_confirm(self):
+        spec = self._fault_spec()
+        proposed = {**self._planned_fault(spec), "action": "delay"}
         msgs = [
-            AIMessage(content="", tool_calls=[{"name": "propose_plan_change", "id": "tc_1", "args": {}}]),
+            AIMessage(content="", tool_calls=[{"name": "propose_plan_change", "id": "tc_1", "args": {
+                "fault_revision": 4, "proposed_fault": proposed,
+            }}]),
             ToolMessage(content="ok", name="propose_plan_change", tool_call_id="tc_1"),
         ]
-        state = {"messages": msgs, "replan_context": {"error_summary": "blade failed"}}
+        state = {"messages": msgs, "fault_spec": spec, "replan_context": {"error_summary": "blade failed"}}
         assert route_after_phase1_tools(state) == "plan_change_confirm"
 
-    def test_propose_plan_change_without_replan_context_returns_agent_loop(self):
-        """Initial planning: propose_plan_change should NOT route to confirm."""
+    def test_propose_plan_change_without_replan_context_routes_to_confirm(self):
+        """Initial planning changes need the same user confirmation gate."""
+        spec = self._fault_spec()
+        proposed = {**self._planned_fault(spec), "action": "delay"}
         msgs = [
-            AIMessage(content="", tool_calls=[{"name": "propose_plan_change", "id": "tc_1", "args": {}}]),
+            AIMessage(content="", tool_calls=[{"name": "propose_plan_change", "id": "tc_1", "args": {
+                "fault_revision": 4, "proposed_fault": proposed,
+            }}]),
             ToolMessage(content="ok", name="propose_plan_change", tool_call_id="tc_1"),
         ]
-        assert route_after_phase1_tools({"messages": msgs}) == "agent_loop"
+        assert route_after_phase1_tools({"messages": msgs, "fault_spec": spec}) == "plan_change_confirm"
 
     def test_regular_tool_returns_agent_loop(self):
         msgs = [
@@ -372,17 +391,32 @@ class TestRouteAfterPhase1Tools:
         ]
         assert route_after_phase1_tools({"messages": msgs}) == "agent_loop"
 
+    def test_error_text_finish_planning_returns_to_agent_loop(self):
+        """Alignment refusal is a tool result, but must not end planning."""
+        msgs = [
+            AIMessage(content="", tool_calls=[{"name": "finish_planning", "id": "tc_1", "args": {}}]),
+            ToolMessage(
+                content="Error: the plan does not preserve the approved semantic contract.",
+                name="finish_planning",
+                tool_call_id="tc_1",
+            ),
+        ]
+        assert route_after_phase1_tools({"messages": msgs}) == "agent_loop"
+
     def test_mixed_batch_finish_planning_wins(self):
         """When multiple ToolMessages exist, first match (reversed) wins."""
+        spec = self._fault_spec()
         msgs = [
             AIMessage(content="", tool_calls=[
                 {"name": "read_file", "id": "tc_1", "args": {}},
-                {"name": "finish_planning", "id": "tc_2", "args": {}},
+                {"name": "finish_planning", "id": "tc_2", "args": {
+                    "summary": "ready to inject",
+                }},
             ]),
             ToolMessage(content="ok", name="read_file", tool_call_id="tc_1"),
             ToolMessage(content="ok", name="finish_planning", tool_call_id="tc_2"),
         ]
-        assert route_after_phase1_tools({"messages": msgs}) == "extract_planning_metadata"
+        assert route_after_phase1_tools({"messages": msgs, "fault_spec": spec}) == "extract_planning_metadata"
 
     def test_error_finish_planning_plus_normal_read_file(self):
         """Error finish_planning skipped; normal read_file doesn't match → agent_loop."""
@@ -395,6 +429,119 @@ class TestRouteAfterPhase1Tools:
             ToolMessage(content="ok", name="read_file", tool_call_id="tc_2"),
         ]
         assert route_after_phase1_tools({"messages": msgs}) == "agent_loop"
+
+    @staticmethod
+    def _fault_spec() -> dict:
+        return {
+            "revision": 4,
+            "objective": "inject packet loss",
+            "scope": "pod",
+            "blade_target": "network",
+            "blade_action": "drop",
+            "namespace": "default",
+            "names": ["nginx"],
+            "labels": {"app": "web"},
+            "params": {"percent": "100"},
+            "params_flags": [],
+            "duration_seconds": 0,
+            "boundaries": ["staging only"],
+            "constraints": ["one logical experiment"],
+            "assumptions": [],
+        }
+
+    @staticmethod
+    def _planned_fault(spec: dict) -> dict:
+        return {
+            "objective": spec["objective"], "scope": spec["scope"],
+            "target": spec["blade_target"], "action": spec["blade_action"],
+            "namespace": spec["namespace"], "names": spec["names"],
+            "labels": spec["labels"], "params": spec["params"],
+            "params_flags": spec["params_flags"],
+            "duration_seconds": spec["duration_seconds"],
+            "boundaries": spec["boundaries"], "constraints": spec["constraints"],
+            "assumptions": spec["assumptions"],
+        }
+
+    @staticmethod
+    def _finish_messages(args: dict) -> list:
+        return [
+            AIMessage(content="", tool_calls=[{
+                "name": "finish_planning", "id": "finish-1", "args": args,
+            }]),
+            ToolMessage(
+                content="Planning finalized",
+                name="finish_planning",
+                tool_call_id="finish-1",
+            ),
+        ]
+
+    def test_faultspec_finish_proceeds_as_pure_signal(self):
+        """finish_planning is a pure 'planning complete' signal — it proceeds
+        without re-declaring any contract. The reviewed FaultSpec in state is
+        the sole authority; drift is handled only by propose_plan_change."""
+        spec = self._fault_spec()
+        state = {"messages": self._finish_messages({"summary": "ready"}), "fault_spec": spec}
+        assert route_after_phase1_tools(state) == "extract_planning_metadata"
+
+    def test_faultspec_finish_ignores_differing_self_report(self):
+        """A finish_planning self-report that differs from the reviewed spec
+        still proceeds — execution binds to state.fault_spec, not the report.
+        A real change must go through propose_plan_change."""
+        spec = self._fault_spec()
+        args = {"summary": "drop is not feasible", "planned_fault": {**self._planned_fault(spec), "action": "delay"}}
+        state = {"messages": self._finish_messages(args), "fault_spec": spec}
+        assert route_after_phase1_tools(state) == "extract_planning_metadata"
+
+    def test_faultspec_proposal_requires_current_revision_and_routes_to_confirm(self):
+        spec = self._fault_spec()
+        proposed = {**self._planned_fault(spec), "action": "delay"}
+        args = {
+            "reason": "drop is not feasible",
+            "fault_revision": 4,
+            "proposed_fault": proposed,
+        }
+        messages = [
+            AIMessage(content="", tool_calls=[{
+                "name": "propose_plan_change", "id": "change-1", "args": args,
+            }]),
+            ToolMessage(
+                content="Plan change proposed",
+                name="propose_plan_change",
+                tool_call_id="change-1",
+            ),
+        ]
+        assert route_after_phase1_tools({
+            "messages": messages, "fault_spec": spec,
+        }) == "plan_change_confirm"
+
+        stale_args = {**args, "fault_revision": 3}
+        stale_messages = [
+            AIMessage(content="", tool_calls=[{
+                "name": "propose_plan_change", "id": "change-2", "args": stale_args,
+            }]),
+            ToolMessage(
+                content="Plan change proposed",
+                name="propose_plan_change",
+                tool_call_id="change-2",
+            ),
+        ]
+        assert route_after_phase1_tools({
+            "messages": stale_messages, "fault_spec": spec,
+        }) == "agent_loop"
+
+    @patch("chaos_agent.agent.router.settings")
+    def test_faultspec_plain_text_exits_planning(self, mock_settings):
+        """With a complete reviewed FaultSpec, plain text + active skill exits
+        Phase 1 normally — the reviewed spec is the authority, so there is no
+        contract to re-declare (the old requires_explicit_finish gate is gone)."""
+        mock_settings.max_agent_loop = 10
+        state = {
+            "agent_loop_count": 1,
+            "skill_name": "network-drop",
+            "fault_spec": self._fault_spec(),
+            "messages": [AIMessage(content="planning is ready")],
+        }
+        assert should_continue_agent_loop(state) == "extract_planning_metadata"
 
     def test_stops_at_non_tool_message(self):
         """Iteration stops at the first non-ToolMessage (e.g. AIMessage boundary)."""
@@ -516,7 +663,7 @@ class TestShouldContinuePlanBuilder:
     """Test should_continue_plan_builder routing."""
 
     def test_tool_calls_continues(self):
-        state = {"messages": [AIMessage(content="", tool_calls=[{"name": "kubectl_ro", "args": {}, "id": "1"}])]}
+        state = {"messages": [AIMessage(content="", tool_calls=[{"name": "kubectl_read", "args": {}, "id": "1"}])]}
         assert should_continue_plan_builder(state) == "continue"
 
     def test_no_tool_calls_ends(self):

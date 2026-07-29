@@ -74,6 +74,10 @@ class SessionStore:
             "namespace": body.namespace or "default",
             "model_name": body.model_name or settings.model_name or "",
             "kubeconfig": expand_kubeconfig_path(settings.kubeconfig_path) or "",
+            # Persisted permission preference so the TS TUI can seed its
+            # runtime permission mode at boot (False → auto, True → confirm)
+            # instead of always defaulting to confirm.
+            "confirmation_required": bool(settings.confirmation_required),
             "created_at": now_iso(),
             "task_ids": [],
             # One session ↔ one LangGraph thread. Allocated up-front
@@ -309,8 +313,12 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
 
     from chaos_agent.agent.streaming import StreamEvent
     from chaos_agent.config.settings import settings as s
-    from chaos_agent.memory.tokens import count_tokens_messages
+    from chaos_agent.memory.tokens import (
+        count_tokens_messages,
+        estimate_context_tokens,
+    )
     from chaos_agent.observability.status_tracker import (
+        COMPACT_TRACKER_PREFIX,
         subscribe as _status_subscribe,
         unsubscribe as _status_unsubscribe,
     )
@@ -389,7 +397,7 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
     # Fresh per-call task id keeps our tracker isolated from the
     # thread's main task id (which carries ambient auto-compaction
     # events we don't want to mix in).
-    compact_task_id = f"compact-{uuid4().hex[:12]}"
+    compact_task_id = f"{COMPACT_TRACKER_PREFIX}{uuid4().hex[:12]}"
 
     def _convert(status_evt) -> StreamEvent | None:
         """Translate a hook-emitted ``StatusEvent`` (source=
@@ -453,12 +461,19 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
 
             state_values = snapshot.values or {}
             messages = list(state_values.get("messages") or [])
-            # /compact streaming surface — report the headline number to
-            # the user (the "you were at N tokens, compressed to M"). Use
-            # raw .count for display; safe_count would inflate by margin
-            # and confuse users comparing against their own kubectl/blade
-            # cost dashboards.
-            before = count_tokens_messages(messages).count
+            # /compact streaming surface — report the headline number to the user
+            # (the "you were at N tokens, compressed to M").
+            #
+            # Anchored on what the provider actually billed. The previous reading
+            # counted message text only, justified as matching "their own
+            # kubectl/blade cost dashboards" — but a dashboard reports the
+            # provider's ``input_tokens``, which also covers the system prompt and
+            # every tool schema (13K-17K absent from ``messages``), so the bare
+            # count was the figure that did NOT match. Raw ``.tokens``, not
+            # ``safe_tokens``: a threshold margin must not inflate what a user
+            # reads.
+            usage_before = estimate_context_tokens(messages)
+            before = usage_before.tokens
             if before == 0:
                 # Nothing to compact at all — short-circuit with a
                 # result frame so the client can render "noop".
@@ -581,11 +596,18 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
                 yield StreamEvent(type="done", task_id=compact_task_id).to_sse()
                 return
 
-            # Pair with the `before` reading above — same accounting
-            # (raw .count) so the saved-tokens math is consistent.
-            after = count_tokens_messages(
-                (snapshot_after.values or {}).get("messages") or [],
-            ).count
+            # Pair with the `before` reading above via ``project``, NOT a fresh
+            # anchor: the newest usage report in the post-compaction state can be
+            # one that survived the compaction, so it still describes the
+            # conversation as it was before. Re-anchoring on it makes before ==
+            # after and every compaction looks like it freed nothing (verified:
+            # saved 1,005 -> 0). Reusing the pre-compaction overhead keeps both
+            # ends on one ruler.
+            after = usage_before.project(
+                count_tokens_messages(
+                    (snapshot_after.values or {}).get("messages") or [],
+                ).count
+            )
             saved = max(0, before - after)
             compacted = saved > 0 and after < before
             duration_ms = (time.monotonic() - t0) * 1000.0

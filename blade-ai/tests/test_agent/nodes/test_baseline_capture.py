@@ -5,22 +5,26 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chaos_agent.agent.nodes.baseline_capture import (
+from chaos_agent.agent.nodes.baseline.baseline_capture import (
     BaselineCommand,
     BASELINE_COMMANDS,
-    _BASELINE_SYSTEM_PROMPT,
     _LLM_BASELINE_MAX_RETRIES,
     _TOOL_POD_NAMESPACE,
-    _build_scope_specific_examples,
     _llm_retry_failed_commands,
     _lookup_baseline_commands,
     _resolve_templates,
     _parse_debug_pod_name,
     _parse_llm_json_output,
+    _target_coverage,
     _validate_and_filter_commands,
     _normalize_debug_namespace,
+    _evidence_supplement_commands,
     make_baseline_capture,
 )
+from chaos_agent.agent.nodes.baseline._baseline_profiles import (
+    build_baseline_system_prompt,
+)
+from chaos_agent.agent.spec.fault_spec import FaultSpec
 
 
 # ---------------------------------------------------------------------------
@@ -32,25 +36,35 @@ class TestRegistryLookup:
     """Test _lookup_baseline_commands three-level fallback."""
 
     def test_exact_match(self):
-        result = _lookup_baseline_commands("node", "disk", "fill")
+        result = _lookup_baseline_commands("k8s", "node", "disk", "fill")
         assert len(result) == 2
         assert result[0].description == "Node DiskPressure"
         assert result[1].mode == "debug_two_step"
 
     def test_target_fallback(self):
-        result = _lookup_baseline_commands("node", "disk", "nonexistent_action")
+        result = _lookup_baseline_commands("k8s", "node", "disk", "nonexistent_action")
         assert len(result) == 2
         assert result[0].description == "Node DiskPressure"
 
     def test_scope_fallback_returns_empty_for_unknown_target(self):
         """_lookup_baseline_commands only searches BASELINE_COMMANDS; scope-level
         fallback is handled by _SCOPE_FALLBACK in the node function."""
-        result = _lookup_baseline_commands("node", "nonexistent", "action")
+        result = _lookup_baseline_commands("k8s", "node", "nonexistent", "action")
         assert result == []
 
     def test_no_match(self):
-        result = _lookup_baseline_commands("container", "nonexistent", "action")
+        result = _lookup_baseline_commands("k8s", "container", "nonexistent", "action")
         assert result == []
+
+    def test_host_lookup_by_target(self):
+        """host profile keys the registry by blade target only."""
+        result = _lookup_baseline_commands("host", "node", "cpu", "fullload")
+        assert [c.command for c in result] == ["top -bn1"]
+        disk = _lookup_baseline_commands("host", "node", "disk", "burn")
+        assert [c.command for c in disk] == ["df -h", "iostat -xd 1 2"]
+
+    def test_host_lookup_unknown_target_empty(self):
+        assert _lookup_baseline_commands("host", "node", "nonexistent", "x") == []
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +83,7 @@ class TestTemplateResolution:
                 "labels": {"app": "accounting"},
             },
         }
-        cmds = [BaselineCommand("Node DiskPressure", "describe", "node {node_name}")]
+        cmds = [BaselineCommand("Node DiskPressure", "kubectl describe node {node_name}")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
         assert result[0]["v_args"] == "node cn-hongkong.10.0.2.69"
@@ -77,7 +91,7 @@ class TestTemplateResolution:
 
     def test_unresolved_namespace(self):
         state = {"target": {"names": ["my-pod"]}}
-        cmds = [BaselineCommand("Pod info", "get", "pod {pod_name} -n {namespace}")]
+        cmds = [BaselineCommand("Pod info", "kubectl get pod {pod_name} -n {namespace}")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
         assert result[0]["_unresolved"] is True
@@ -91,11 +105,101 @@ class TestTemplateResolution:
             },
         }
         # ``{label_selector}`` 渲染时已含 ``-l `` 前缀，模板里不再叠 ``-l``。
-        cmds = [BaselineCommand("Pod CPU", "top", "pod -n {namespace} {label_selector}")]
+        cmds = [BaselineCommand("Pod CPU", "kubectl top pod -n {namespace} {label_selector}")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
         assert result[0]["v_args"] == "pod -n default -l app=nginx,tier=frontend"
         assert result[0]["_unresolved"] is False
+
+    def test_multi_target_expansion_marks_sampled_target_entries(self):
+        state = {
+            "blade_scope": "node",
+            "target": {"names": [f"node-{index}" for index in range(12)]},
+        }
+        result = _resolve_templates(
+            [BaselineCommand("Node status", "kubectl describe node {node_name}")],
+            state,
+        )
+
+        assert len(result) == 10
+        assert all(entry["_target_sampled"] for entry in result)
+        assert {entry["_target_name"] for entry in result} <= {
+            f"node-{index}" for index in range(12)
+        }
+
+
+class TestTargetCoverage:
+    def test_aggregate_baseline_reports_partial_coverage_for_az_wide_target(self):
+        spec = FaultSpec(
+            scope="node",
+            names=tuple(f"node-{index}" for index in range(4)),
+            blade_target="network",
+        )
+        coverage = _target_coverage(
+            spec,
+            [{"description": "Nodes", "command": "kubectl get nodes node-0 node-2"}],
+            [{"command": "kubectl get nodes node-0 node-2", "stdout": "node-0\nnode-2"}],
+        )
+
+        assert coverage["collection_mode"] == "aggregate_or_llm"
+        assert coverage["observed_names"] == ["node-0", "node-2"]
+        assert coverage["missing_count"] == 2
+        assert coverage["complete"] is False
+
+    def test_target_name_is_not_matched_as_a_prefix_of_another_name(self):
+        spec = FaultSpec(
+            scope="node", names=("node-1", "node-10"), blade_target="network",
+        )
+        coverage = _target_coverage(
+            spec, [], [{"stdout": "node-10 Ready"}],
+        )
+
+        assert coverage["observed_names"] == ["node-10"]
+        assert coverage["missing_names"] == ["node-1"]
+
+
+class TestEvidenceSupplements:
+    def test_host_identity_and_cross_metric_are_added_for_incomplete_baseline(self):
+        supplements = _evidence_supplement_commands(
+            "host",
+            FaultSpec(scope="node", blade_target="mem"),
+            [{"description": "Host memory", "command": "free -m"}],
+        )
+
+        # A single ``free`` observation cannot count as both primary and
+        # independent cross evidence.
+        assert [command.command for command in supplements] == [
+            "hostname",
+            "vmstat -s",
+        ]
+
+    def test_k8s_cross_metric_is_added_without_guessing_a_new_target(self):
+        supplements = _evidence_supplement_commands(
+            "k8s",
+            FaultSpec(scope="node", names=("node-a",), blade_target="cpu"),
+            [{"description": "Node CPU", "command": "kubectl top node node-a"}],
+        )
+
+        assert [command.command for command in supplements] == [
+            "kubectl describe node {node_name}",
+        ]
+
+    def test_container_scope_collects_identity_from_its_owning_pod(self):
+        supplements = _evidence_supplement_commands(
+            "k8s",
+            FaultSpec(
+                scope="container",
+                namespace="prod",
+                names=("api-0",),
+                blade_target="cpu",
+            ),
+            [],
+        )
+
+        assert [command.command for command in supplements] == [
+            "kubectl get pod {pod_name} -n {namespace}",
+            "kubectl describe pod {pod_name} -n {namespace}",
+        ]
 
 
 class TestTemplateResolutionNodeScope:
@@ -116,7 +220,7 @@ class TestTemplateResolutionNodeScope:
                 "names": ["cn-hongkong.10.0.1.120"],
             },
         }
-        cmds = [BaselineCommand("Pod info", "exec", "{pod_name} -n {namespace} -- df -h")]
+        cmds = [BaselineCommand("Pod info", "kubectl exec {pod_name} -n {namespace} -- df -h")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
         # pod_name should NOT be resolved (node name is not a pod name)
@@ -132,7 +236,7 @@ class TestTemplateResolutionNodeScope:
                 "names": ["accounting-abc"],
             },
         }
-        cmds = [BaselineCommand("Pod info", "exec", "{pod_name} -n {namespace} -- df -h")]
+        cmds = [BaselineCommand("Pod info", "kubectl exec {pod_name} -n {namespace} -- df -h")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
         assert result[0]["_unresolved"] is False
@@ -147,7 +251,7 @@ class TestTemplateResolutionNodeScope:
                 "names": ["cn-hongkong.10.0.1.120"],
             },
         }
-        cmds = [BaselineCommand("Node info", "describe", "node {node_name}")]
+        cmds = [BaselineCommand("Node info", "kubectl describe node {node_name}")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
         assert result[0]["_unresolved"] is False
@@ -162,7 +266,7 @@ class TestTemplateResolutionNodeScope:
                 "names": ["my-pod"],
             },
         }
-        cmds = [BaselineCommand("Pod info", "exec", "{pod_name} -n {namespace} -- df -h")]
+        cmds = [BaselineCommand("Pod info", "kubectl exec {pod_name} -n {namespace} -- df -h")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
         assert result[0]["_unresolved"] is False
@@ -178,13 +282,13 @@ class TestLLMJsonParsing:
     """Test _parse_llm_json_output robustness."""
 
     def test_pure_json(self):
-        raw = '[{"description":"test","subcommand":"get","v_args_template":"nodes","mode":"simple"}]'
+        raw = '[{"description":"test","command":"kubectl get nodes","mode":"simple"}]'
         result = _parse_llm_json_output(raw)
         assert len(result) == 1
         assert result[0]["description"] == "test"
 
     def test_json_in_markdown_code_block(self):
-        raw = '```json\n[{"description":"test","subcommand":"top","v_args_template":"nodes","mode":"simple"}]\n```'
+        raw = '```json\n[{"description":"test","command":"kubectl top nodes","mode":"simple"}]\n```'
         result = _parse_llm_json_output(raw)
         assert len(result) == 1
 
@@ -196,7 +300,7 @@ class TestLLMJsonParsing:
         assert _parse_llm_json_output("not json at all") == []
 
     def test_trailing_text(self):
-        raw = '[{"description":"test","subcommand":"get","v_args_template":"nodes","mode":"simple"}] and some trailing text'
+        raw = '[{"description":"test","command":"kubectl get nodes","mode":"simple"}] and some trailing text'
         result = _parse_llm_json_output(raw)
         assert len(result) == 1
 
@@ -207,41 +311,64 @@ class TestLLMJsonParsing:
 
 
 class TestCommandValidation:
-    """Test _validate_and_filter_commands whitelist enforcement."""
+    """Test _validate_and_filter_commands whitelist enforcement (k8s + host)."""
 
-    def test_allowed_subcommands(self):
+    def test_allowed_commands(self):
         cmds = [
-            {"description": "test", "subcommand": "get", "v_args_template": "nodes", "mode": "simple"},
-            {"description": "test2", "subcommand": "top", "v_args_template": "nodes", "mode": "simple"},
+            {"description": "test", "command": "kubectl get nodes", "mode": "simple"},
+            {"description": "test2", "command": "kubectl top nodes", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds)
+        result = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 2
 
     def test_rejected_subcommand(self):
         cmds = [
-            {"description": "hack", "subcommand": "delete", "v_args_template": "pod x", "mode": "simple"},
+            {"description": "hack", "command": "kubectl delete pod x", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds)
+        result = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 0
 
     def test_exec_with_allowed_command(self):
         cmds = [
-            {"description": "disk", "subcommand": "exec", "v_args_template": "pod x -- df -h", "mode": "simple"},
+            {"description": "disk", "command": "kubectl exec pod-x -n ns -- df -h", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds)
+        result = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 1
 
     def test_exec_with_disallowed_command(self):
         cmds = [
-            {"description": "hack", "subcommand": "exec", "v_args_template": "pod x -- rm -rf /", "mode": "simple"},
+            {"description": "hack", "command": "kubectl exec pod-x -n ns -- rm -rf /", "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds)
+        result = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 0
 
     def test_non_dict_input_skipped(self):
         cmds = ["not a dict", 42]
-        result = _validate_and_filter_commands(cmds)
+        result = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 0
+
+    def test_host_allowed_commands(self):
+        cmds = [
+            {"description": "cpu", "command": "top -bn1", "mode": "simple"},
+            {"description": "mem", "command": "free -m", "mode": "simple"},
+        ]
+        result = _validate_and_filter_commands(cmds, "host")
+        assert len(result) == 2
+        assert all(c.mode == "simple" for c in result)
+
+    def test_host_rejects_kubectl(self):
+        cmds = [{"description": "x", "command": "kubectl get pods", "mode": "simple"}]
+        assert _validate_and_filter_commands(cmds, "host") == []
+
+    def test_host_rejects_pipe(self):
+        cmds = [{"description": "x", "command": "ps aux | grep java", "mode": "simple"}]
+        assert _validate_and_filter_commands(cmds, "host") == []
+
+    def test_host_mode_forced_simple(self):
+        cmds = [{"description": "x", "command": "top -bn1", "mode": "debug_two_step"}]
+        result = _validate_and_filter_commands(cmds, "host")
+        assert len(result) == 1
+        assert result[0].mode == "simple"
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +418,7 @@ class TestFallbackChain:
             },
             "kubeconfig": "/path/to/kubeconfig",
         }
-        with patch("chaos_agent.agent.nodes.baseline_capture._execute_observations",
+        with patch("chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
                     new_callable=AsyncMock, return_value=[]):
             result = await node(state)
         assert result["baseline_data"]["source"] == "registry"
@@ -312,7 +439,7 @@ class TestFallbackChain:
             },
             "kubeconfig": "/path/to/kubeconfig",
         }
-        with patch("chaos_agent.agent.nodes.baseline_capture._execute_observations",
+        with patch("chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
                     new_callable=AsyncMock, return_value=[]):
             result = await node(state)
         # ("node","nonexistent","nonexistent") → no exact, ("node","nonexistent") → no match
@@ -335,7 +462,7 @@ class TestFallbackChain:
             },
             "kubeconfig": "/path/to/kubeconfig",
         }
-        with patch("chaos_agent.agent.nodes.baseline_capture._execute_observations",
+        with patch("chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
                     new_callable=AsyncMock, return_value=[]):
             result = await node(state)
         # No match in BASELINE_COMMANDS, _SCOPE_FALLBACK has no "container"
@@ -346,7 +473,7 @@ class TestFallbackChain:
         """When LLM returns valid commands, should use 'llm' source."""
         mock_llm = AsyncMock()
         mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
-            {"description": "Node disk", "subcommand": "top", "v_args_template": "node {node_name}", "mode": "simple"},
+            {"description": "Node disk", "command": "kubectl top node {node_name}", "mode": "simple"},
         ])))
         node = make_baseline_capture(llm=mock_llm, registry=None)
         state = {
@@ -362,9 +489,9 @@ class TestFallbackChain:
             },
             "kubeconfig": "/path/to/kubeconfig",
         }
-        with patch("chaos_agent.agent.nodes.baseline_capture._execute_observations",
+        with patch("chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
                     new_callable=AsyncMock, return_value=[]), \
-             patch("chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+             patch("chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
                    return_value=[]):
             result = await node(state)
         assert result["baseline_data"]["source"] == "llm"
@@ -400,7 +527,7 @@ class TestExceptionSafety:
         # The strategy chain should catch it and try scope_fallback next.
         # scope_fallback returns `kubectl top node {node_name}` but with no
         # node_name it's 0 viable, so source becomes "none" (not "error").
-        with patch("chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+        with patch("chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
                     side_effect=RuntimeError("unexpected")):
             result = await node(state)
         # Source is "none" because all strategies either failed or produced
@@ -434,15 +561,15 @@ class TestObservability:
             },
             "kubeconfig": "/path/to/kubeconfig",
         }
-        with patch("chaos_agent.agent.nodes.baseline_capture._execute_observations",
+        with patch("chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
                     new_callable=AsyncMock, return_value=[
                         {"description": "test", "command": "kubectl top node test-node",
                          "exit_code": 0, "stdout": "OK", "stderr": ""},
                     ]), \
-             patch("chaos_agent.agent.nodes.baseline_capture.sync_to_store",
+             patch("chaos_agent.agent.nodes.baseline.baseline_capture.sync_to_store",
                     new_callable=AsyncMock) as mock_sync, \
-             patch("chaos_agent.agent.nodes.baseline_capture.sync_node_status_to_session") as mock_session, \
-             patch("chaos_agent.agent.nodes.baseline_capture.get_tracker") as mock_tracker:
+             patch("chaos_agent.agent.nodes.baseline.baseline_capture.sync_node_status_to_session") as mock_session, \
+             patch("chaos_agent.agent.nodes.baseline.baseline_capture.get_tracker") as mock_tracker:
             mock_tracker_instance = MagicMock()
             mock_tracker.return_value = mock_tracker_instance
             result = await node(state)
@@ -457,7 +584,8 @@ class TestObservability:
         # Verify session status was recorded
         mock_session.assert_called_once()
 
-        # Verify result structure
+        # The mocked executor deliberately returns one observation regardless
+        # of the resolved command count.
         assert result["baseline_data"]["success_count"] == 1
         assert result["baseline_data"]["source"] == "registry"
 
@@ -469,73 +597,29 @@ class TestObservability:
 
 
 class TestModeAutoCorrection:
-    """Test that {debug_pod} in v_args_template forces mode=debug_two_step."""
+    """Test that {debug_pod} in a k8s command forces mode=debug_two_step."""
 
     def test_debug_pod_forces_debug_two_step_mode(self):
         """LLM generates {debug_pod} with mode=simple -> auto-corrected."""
         cmds = [
-            {"description": "Node disk IO", "subcommand": "exec",
-             "v_args_template": "{debug_pod} -n chaosblade -- iostat -xd 1 3",
+            {"description": "Node disk IO",
+             "command": "kubectl exec {debug_pod} -n chaosblade -- iostat -xd 1 3",
              "mode": "simple"},
         ]
-        result = _validate_and_filter_commands(cmds)
+        result = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 1
         assert result[0].mode == "debug_two_step"
 
     def test_debug_pod_with_correct_mode_passes(self):
         """LLM generates {debug_pod} with mode=debug_two_step -> passes unchanged."""
         cmds = [
-            {"description": "Node disk IO", "subcommand": "exec",
-             "v_args_template": "{debug_pod} -n chaosblade -- iostat -xd 1 3",
+            {"description": "Node disk IO",
+             "command": "kubectl exec {debug_pod} -n chaosblade -- iostat -xd 1 3",
              "mode": "debug_two_step"},
         ]
-        result = _validate_and_filter_commands(cmds)
+        result = _validate_and_filter_commands(cmds, "k8s")
         assert len(result) == 1
         assert result[0].mode == "debug_two_step"
-
-
-class TestDebugSmartConversion:
-    """Test smart conversion of subcommand='debug' commands."""
-
-    def test_debug_subcommand_with_exec_pod_dropped(self):
-        """When exec {debug_pod} already exists, debug command is redundant."""
-        cmds = [
-            {"description": "Node disk IO", "subcommand": "exec",
-             "v_args_template": "{debug_pod} -n chaosblade -- iostat -xd 1 3",
-             "mode": "debug_two_step"},
-            {"description": "Create debug pod", "subcommand": "debug",
-             "v_args_template": "node/{node_name} --image=busybox -- sleep 3600",
-             "mode": "simple"},
-        ]
-        result = _validate_and_filter_commands(cmds)
-        assert len(result) == 1
-        assert result[0].subcommand == "exec"
-        assert result[0].mode == "debug_two_step"
-
-    def test_debug_subcommand_converted_when_no_exec(self):
-        """When no exec {debug_pod} exists, debug with diagnostic command is converted."""
-        cmds = [
-            {"description": "Debug and check disk", "subcommand": "debug",
-             "v_args_template": "node/{node_name} --image=busybox -- df -h",
-             "mode": "simple"},
-        ]
-        result = _validate_and_filter_commands(cmds)
-        assert len(result) == 1
-        assert result[0].subcommand == "exec"
-        assert result[0].mode == "debug_two_step"
-        assert "{debug_pod}" in result[0].v_args_template
-        assert "df -h" in result[0].v_args_template
-        assert f"-n {_TOOL_POD_NAMESPACE}" in result[0].v_args_template
-
-    def test_debug_subcommand_dropped_when_sleep_only(self):
-        """When debug only has 'sleep', it's dropped (no diagnostic intent)."""
-        cmds = [
-            {"description": "Create debug pod", "subcommand": "debug",
-             "v_args_template": "node/{node_name} --image=busybox -- sleep 3600",
-             "mode": "simple"},
-        ]
-        result = _validate_and_filter_commands(cmds)
-        assert len(result) == 0
 
 
 class TestNamespaceNormalization:
@@ -579,8 +663,8 @@ class TestResolveTemplatesNamespaceAndMode:
             "blade_scope": "node",
             "target": {"namespace": "", "names": ["test-node"], "labels": {}},
         }
-        cmds = [BaselineCommand("Node disk", "exec",
-                                "{debug_pod} -n chaosblade -- df -h",
+        cmds = [BaselineCommand("Node disk",
+                                "kubectl exec {debug_pod} -n chaosblade -- df -h",
                                 mode="simple")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
@@ -592,8 +676,8 @@ class TestResolveTemplatesNamespaceAndMode:
             "blade_scope": "node",
             "target": {"namespace": "", "names": ["test-node"], "labels": {}},
         }
-        cmds = [BaselineCommand("Node disk", "exec",
-                                "{debug_pod} -n some-ns -- iostat -xd 1 3",
+        cmds = [BaselineCommand("Node disk",
+                                "kubectl exec {debug_pod} -n some-ns -- iostat -xd 1 3",
                                 mode="debug_two_step")]
         result = _resolve_templates(cmds, state)
         assert len(result) == 1
@@ -630,21 +714,21 @@ class TestRegistryUsesChaosbladeNamespace:
         cmds = BASELINE_COMMANDS[("node", "disk", "fill")]
         debug_cmds = [c for c in cmds if c.mode == "debug_two_step"]
         assert len(debug_cmds) == 1
-        assert f"-n {_TOOL_POD_NAMESPACE}" in debug_cmds[0].v_args_template
-        assert "-n default" not in debug_cmds[0].v_args_template
+        assert f"-n {_TOOL_POD_NAMESPACE}" in debug_cmds[0].command
+        assert "-n default" not in debug_cmds[0].command
 
     def test_node_disk_burn_uses_chaosblade_ns(self):
         cmds = BASELINE_COMMANDS[("node", "disk", "burn")]
         debug_cmds = [c for c in cmds if c.mode == "debug_two_step"]
         assert len(debug_cmds) == 1
-        assert f"-n {_TOOL_POD_NAMESPACE}" in debug_cmds[0].v_args_template
-        assert "-n default" not in debug_cmds[0].v_args_template
+        assert f"-n {_TOOL_POD_NAMESPACE}" in debug_cmds[0].command
+        assert "-n default" not in debug_cmds[0].command
 
     def test_node_disk_fallback_uses_chaosblade_ns(self):
         cmds = BASELINE_COMMANDS[("node", "disk")]
         debug_cmds = [c for c in cmds if c.mode == "debug_two_step"]
         assert len(debug_cmds) == 1
-        assert f"-n {_TOOL_POD_NAMESPACE}" in debug_cmds[0].v_args_template
+        assert f"-n {_TOOL_POD_NAMESPACE}" in debug_cmds[0].command
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +737,8 @@ class TestRegistryUsesChaosbladeNamespace:
 
 
 class TestLLMDeriveBaselinePrompt:
-    """Validate _BASELINE_SYSTEM_PROMPT structure and _llm_derive_baseline_commands prompt composition.
+    """Validate build_baseline_system_prompt structure and
+    _llm_derive_baseline_commands prompt composition.
 
     These tests verify structural/semantic constraints, not exact text —
     prompt wording may evolve, but the architecture guarantees must hold.
@@ -661,71 +746,53 @@ class TestLLMDeriveBaselinePrompt:
 
     # -- SystemMessage content tests --
 
-    def test_system_prompt_contains_critical_rules(self):
-        """Critical rules must appear in _BASELINE_SYSTEM_PROMPT."""
-        assert "Scope→Variables mapping" in _BASELINE_SYSTEM_PROMPT
-        assert "{debug_pod} → debug_two_step" in _BASELINE_SYSTEM_PROMPT
-        assert "exec command whitelist" in _BASELINE_SYSTEM_PROMPT
-        # Verify exec whitelist includes key diagnostic commands
-        assert "df" in _BASELINE_SYSTEM_PROMPT
-        assert "iostat" in _BASELINE_SYSTEM_PROMPT
+    def test_k8s_prompt_contains_core_and_kubectl_fragment(self):
+        """k8s channel prompt = universal core + kubectl capability fragment."""
+        prompt = build_baseline_system_prompt("kubeconfig")
+        # Universal core mission (channel-agnostic).
+        assert "Core Principle" in prompt
+        assert "causation attribution" in prompt
+        assert "SAME metric" in prompt
+        # k8s capability fragment.
+        assert "kubectl" in prompt
+        assert "debug_two_step" in prompt
 
-    def test_system_prompt_u_shape_primacy(self):
-        """Core Principle must appear in the primacy zone (first 600 chars).
-        CRITICAL RULES is in the middle zone (syntax), not primacy."""
-        primacy_zone = _BASELINE_SYSTEM_PROMPT[:750]
-        assert "Core Principle" in primacy_zone
-        assert "causation attribution" in primacy_zone
-        assert "SAME metric" in primacy_zone
+    def test_host_prompt_contains_core_and_host_fragment(self):
+        """host channel prompt = same core + host-shell fragment, no k8s fragment."""
+        prompt = build_baseline_system_prompt("ssh")
+        assert "Core Principle" in prompt
+        assert "causation attribution" in prompt
+        # host capability fragment present; k8s fragment absent.
+        assert "Capability: Host shell diagnostics" in prompt
+        assert "Capability: Kubernetes" not in prompt
 
-    def test_system_prompt_u_shape_recency(self):
-        """REMINDER must appear in the recency zone (last 400 chars)."""
-        recency_zone = _BASELINE_SYSTEM_PROMPT[-400:]
-        assert "REMINDER" in recency_zone
-        assert "SAME metric" in recency_zone
-        assert "Scope→variables" in recency_zone
-
-    def test_system_prompt_no_debug_prohibition_rule(self):
-        """Rule 6 (subcommand='debug' prohibition) was removed from the prompt
-        because _validate_and_filter_commands() Phase 2 provides full programmatic
-        coverage. The prompt should not contain the old rule text."""
-        assert "Avoid using subcommand 'debug'" not in _BASELINE_SYSTEM_PROMPT
-
-    # -- Scope-specific examples tests --
-
-    def test_node_scope_examples(self):
-        """Node-scope examples must show debug_two_step mode and {debug_pod} variable."""
-        examples = _build_scope_specific_examples("node")
-        assert "debug_two_step" in examples
-        assert "{debug_pod}" in examples
-        assert "{node_name}" in examples
-
-    def test_pod_scope_examples(self):
-        """Pod-scope examples must show {pod_name} and {namespace} variables."""
-        examples = _build_scope_specific_examples("pod")
-        assert "{pod_name}" in examples
-        assert "{namespace}" in examples
-        assert "{label_selector}" in examples
+    def test_kubewiz_channels_map_to_expected_profiles(self):
+        """kubewiz_k8s -> k8s fragment; kubewiz_host -> host fragment."""
+        assert "Capability: Kubernetes" in build_baseline_system_prompt("kubewiz_k8s")
+        assert (
+            "Capability: Host shell diagnostics"
+            in build_baseline_system_prompt("kubewiz_host")
+        )
 
     # -- LLM invocation pattern tests --
 
     @pytest.mark.asyncio
     async def test_llm_invoke_uses_system_and_human_messages(self):
-        """_llm_derive_baseline_commands must invoke LLM with [SystemMessage, HumanMessage],
-        not [HumanMessage] alone — aligning with project convention."""
+        """_llm_derive_baseline_commands must invoke LLM with
+        [SystemMessage, HumanMessage], the SystemMessage being the
+        channel-assembled prompt."""
         from langchain_core.messages import SystemMessage, HumanMessage
 
         mock_llm = AsyncMock()
         mock_response = MagicMock()
         mock_response.content = json.dumps([
-            {"description": "Pod CPU", "subcommand": "top",
-             "v_args_template": "pod -n {namespace} {label_selector}",
-             "mode": "simple"},
+            {"description": "Pod CPU",
+             "command": "kubectl top pod -n prod -l app=x", "mode": "simple"},
         ])
         mock_llm.ainvoke.return_value = mock_response
 
-        from chaos_agent.agent.nodes.baseline_capture import _llm_derive_baseline_commands
-        result = await _llm_derive_baseline_commands(
+        from chaos_agent.agent.nodes.baseline.baseline_capture import _llm_derive_baseline_commands
+        await _llm_derive_baseline_commands(
             mock_llm, "test skill content", "pod", "cpu", "fullload",
         )
 
@@ -735,8 +802,8 @@ class TestLLMDeriveBaselinePrompt:
         assert len(messages) == 2
         assert isinstance(messages[0], SystemMessage)
         assert isinstance(messages[1], HumanMessage)
-        # SystemMessage uses the U-shaped prompt constant
-        assert messages[0].content == _BASELINE_SYSTEM_PROMPT
+        # SystemMessage uses the channel-assembled prompt (default kubeconfig).
+        assert messages[0].content == build_baseline_system_prompt("kubeconfig")
 
     @pytest.mark.asyncio
     async def test_human_prompt_focus_guidance(self):
@@ -746,7 +813,7 @@ class TestLLMDeriveBaselinePrompt:
         mock_response.content = "[]"
         mock_llm.ainvoke.return_value = mock_response
 
-        from chaos_agent.agent.nodes.baseline_capture import _llm_derive_baseline_commands
+        from chaos_agent.agent.nodes.baseline.baseline_capture import _llm_derive_baseline_commands
         await _llm_derive_baseline_commands(
             mock_llm, "test skill content", "pod", "cpu", "fullload",
         )
@@ -754,12 +821,11 @@ class TestLLMDeriveBaselinePrompt:
         call_args = mock_llm.ainvoke.call_args
         messages = call_args[0][0]
         human_content = messages[1].content
-        # Should guide fault-impact reasoning, not old "Based on ALL content above"
+        # Should guide fault-impact reasoning.
         assert "reason about what states" in human_content
-        assert "Based on ALL content above" not in human_content
-        # Should contain fault type info
+        # Should contain fault type info.
         assert "Fault type: pod-cpu-fullload" in human_content
-        # Should contain skill-case tag
+        # Should contain skill-case tag.
         assert "<skill-case>" in human_content
 
 
@@ -775,14 +841,14 @@ class TestExtractorFramework:
         # Backward-compat: existing call sites that don't pass
         # ``extractors=`` must still produce a valid BaselineCommand
         # with no extractors attached.
-        cmd = BaselineCommand("desc", "top", "node {node_name}")
+        cmd = BaselineCommand("desc", "kubectl top node {node_name}")
         assert cmd.extractors == []
 
     def test_baseline_command_extractors_round_trip(self):
         def _noop(_stdout, _state):
             return {}
         cmd = BaselineCommand(
-            "desc", "top", "node {node_name}", extractors=[_noop],
+            "desc", "kubectl top node {node_name}", extractors=[_noop],
         )
         assert cmd.extractors == [_noop]
 
@@ -796,7 +862,7 @@ class TestExtractorFramework:
         }
         cmds = [
             BaselineCommand(
-                "Pod top", "top", "pod {pod_name} -n {namespace}",
+                "Pod top", "kubectl top pod {pod_name} -n {namespace}",
                 extractors=[_extr],
             ),
         ]
@@ -812,7 +878,7 @@ class TestExtractorFramework:
 
         for key in (("pod", "cpu"), ("pod", "mem")):
             cmds = BASELINE_COMMANDS[key]
-            top_cmd = next(c for c in cmds if c.subcommand == "top")
+            top_cmd = next(c for c in cmds if c.command.startswith("kubectl top"))
             assert extract_pod_top_metrics in top_cmd.extractors
 
     @pytest.mark.asyncio
@@ -821,8 +887,6 @@ class TestExtractorFramework:
         # execution to return a known ``top pod`` table, verify the
         # extractor parses it and the parsed fields land in the
         # returned state update's ``target_metadata``.
-        from chaos_agent.agent.baseline_extractors import extract_pod_top_metrics
-
         fake_top_output = (
             "NAME                              CPU(cores)   MEMORY(bytes)\n"
             "target-pod-xyz                    50m          120Mi\n"
@@ -870,7 +934,7 @@ class TestExtractorFramework:
             "skill_case_content": "",
         }
         with patch(
-            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
             new=fake_exec,
         ):
             result = await node(state)
@@ -907,7 +971,7 @@ class TestExtractorFramework:
         # returns our crafted command with the booming extractor.
         crafted = [
             BaselineCommand(
-                "boom test", "top", "pod {pod_name} -n {namespace}",
+                "boom test", "kubectl top pod {pod_name} -n {namespace}",
                 extractors=[_boom],
             ),
         ]
@@ -923,11 +987,11 @@ class TestExtractorFramework:
         }
         with (
             patch(
-                "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+                "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
                 return_value=crafted,
             ),
             patch(
-                "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+                "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
                 new=fake_exec,
             ),
         ):
@@ -966,7 +1030,7 @@ class TestExtractorFramework:
 
         crafted = [
             BaselineCommand(
-                "spy cmd", "top", "pod {pod_name} -n {namespace}",
+                "spy cmd", "kubectl top pod {pod_name} -n {namespace}",
                 extractors=[_spy],
             ),
         ]
@@ -980,11 +1044,11 @@ class TestExtractorFramework:
         }
         with (
             patch(
-                "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+                "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
                 return_value=crafted,
             ),
             patch(
-                "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+                "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
                 new=fake_exec,
             ),
         ):
@@ -1012,7 +1076,7 @@ class TestExtractorFramework:
 
         crafted = [
             BaselineCommand(
-                "bad contract cmd", "top", "pod {pod_name} -n {namespace}",
+                "bad contract cmd", "kubectl top pod {pod_name} -n {namespace}",
                 extractors=[_bad_contract],
             ),
         ]
@@ -1026,11 +1090,11 @@ class TestExtractorFramework:
         }
         with (
             patch(
-                "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+                "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
                 return_value=crafted,
             ),
             patch(
-                "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+                "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
                 new=fake_exec,
             ),
         ):
@@ -1051,7 +1115,7 @@ class TestPodProcessKillRegistryEntry:
     """Verify (pod, process, kill) exact match returns endpoints + pod status."""
 
     def test_exact_match_exists(self):
-        result = _lookup_baseline_commands("pod", "process", "kill")
+        result = _lookup_baseline_commands("k8s", "pod", "process", "kill")
         assert len(result) == 3
         descriptions = [c.description for c in result]
         assert "Service endpoints" in descriptions
@@ -1059,18 +1123,18 @@ class TestPodProcessKillRegistryEntry:
         assert "Pod events" in descriptions
 
     def test_endpoints_uses_label_selector(self):
-        result = _lookup_baseline_commands("pod", "process", "kill")
+        result = _lookup_baseline_commands("k8s", "pod", "process", "kill")
         ep_cmd = next(c for c in result if c.description == "Service endpoints")
-        assert "{label_selector}" in ep_cmd.v_args_template
+        assert "{label_selector}" in ep_cmd.command
 
     def test_pod_status_uses_wide_output(self):
-        result = _lookup_baseline_commands("pod", "process", "kill")
+        result = _lookup_baseline_commands("k8s", "pod", "process", "kill")
         status_cmd = next(c for c in result if c.description == "Pod status/restarts")
-        assert "-o wide" in status_cmd.v_args_template
+        assert "-o wide" in status_cmd.command
 
     def test_target_fallback_still_works_for_other_actions(self):
         """(pod, process, <other>) should still fall back to the (pod, process) entry."""
-        result = _lookup_baseline_commands("pod", "process", "stop")
+        result = _lookup_baseline_commands("k8s", "pod", "process", "stop")
         assert len(result) == 2
         descriptions = [c.description for c in result]
         assert "Pod status" in descriptions
@@ -1090,8 +1154,8 @@ class TestLLMRetryFailedCommands:
         """LLM retry prompt must contain the failed command and its error."""
         mock_llm = AsyncMock()
         mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
-            {"description": "Fixed endpoints", "subcommand": "get",
-             "v_args_template": "endpoints -n {namespace} {label_selector}",
+            {"description": "Fixed endpoints",
+             "command": "kubectl get endpoints -n {namespace} {label_selector}",
              "mode": "simple"},
         ])))
 
@@ -1134,7 +1198,7 @@ class TestLLMRetryFailedCommands:
         assert result == []
 
     def test_max_retries_constant(self):
-        assert _LLM_BASELINE_MAX_RETRIES == 2
+        assert _LLM_BASELINE_MAX_RETRIES == 3
 
 
 class TestBaselineCaptureRetryIntegration:
@@ -1158,14 +1222,14 @@ class TestBaselineCaptureRetryIntegration:
             call_count["n"] += 1
             if call_count["n"] == 1:
                 return make_response(json.dumps([
-                    {"description": "Endpoints", "subcommand": "get",
-                     "v_args_template": "endpoints -n {namespace} {label_selector}",
+                    {"description": "Endpoints",
+                     "command": "kubectl get endpoints -n {namespace} {label_selector}",
                      "mode": "simple"},
                 ]))
             else:
                 return make_response(json.dumps([
-                    {"description": "Fixed endpoints", "subcommand": "get",
-                     "v_args_template": "endpoints -n {namespace} {label_selector}",
+                    {"description": "Fixed endpoints",
+                     "command": "kubectl get endpoints -n {namespace} {label_selector}",
                      "mode": "simple"},
                 ]))
 
@@ -1212,10 +1276,10 @@ class TestBaselineCaptureRetryIntegration:
             "kubeconfig": "/path/to/kubeconfig",
         }
         with patch(
-            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
             new=fake_exec,
         ), patch(
-            "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+            "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
             return_value=[],
         ):
             result = await node(state)
@@ -1232,8 +1296,8 @@ class TestBaselineCaptureRetryIntegration:
         """When all LLM commands succeed, no retry is attempted."""
         mock_llm = AsyncMock()
         mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
-            {"description": "Pod status", "subcommand": "get",
-             "v_args_template": "pods -n {namespace} {label_selector}",
+            {"description": "Pod status",
+             "command": "kubectl get pods -n {namespace} {label_selector}",
              "mode": "simple"},
         ])))
 
@@ -1261,10 +1325,10 @@ class TestBaselineCaptureRetryIntegration:
             "kubeconfig": "/path/to/kubeconfig",
         }
         with patch(
-            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
             new=fake_exec,
         ), patch(
-            "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+            "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
             return_value=[],
         ):
             result = await node(state)
@@ -1290,18 +1354,18 @@ class TestBaselineCaptureRetryIntegration:
             if call_count["n"] == 1:
                 # Initial: 2 commands
                 return make_response(json.dumps([
-                    {"description": "Pod status", "subcommand": "get",
-                     "v_args_template": "pods -n {namespace} {label_selector}",
+                    {"description": "Pod status",
+                     "command": "kubectl get pods -n {namespace} {label_selector}",
                      "mode": "simple"},
-                    {"description": "Endpoints", "subcommand": "get",
-                     "v_args_template": "endpoints -n {namespace} {label_selector}",
+                    {"description": "Endpoints",
+                     "command": "kubectl get endpoints -n {namespace} {label_selector}",
                      "mode": "simple"},
                 ]))
             else:
                 # Retry: corrected command for the failed one
                 return make_response(json.dumps([
-                    {"description": "Fixed endpoints", "subcommand": "get",
-                     "v_args_template": "endpoints -n {namespace}",
+                    {"description": "Fixed endpoints",
+                     "command": "kubectl get endpoints -n {namespace}",
                      "mode": "simple"},
                 ]))
 
@@ -1357,15 +1421,15 @@ class TestBaselineCaptureRetryIntegration:
             "kubeconfig": "/path/to/kubeconfig",
         }
         with patch(
-            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
             new=fake_exec,
         ), patch(
-            "chaos_agent.agent.nodes.baseline_capture._lookup_baseline_commands",
+            "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
             return_value=[],
         ):
             result = await node(state)
 
-        # Original success (1) + retry success (1) = 2
+        # Original success (1) + retry success (1) = 2.
         assert result["baseline_data"]["success_count"] == 2
 
     @pytest.mark.asyncio
@@ -1402,7 +1466,7 @@ class TestBaselineCaptureRetryIntegration:
             "kubeconfig": "/path/to/kubeconfig",
         }
         with patch(
-            "chaos_agent.agent.nodes.baseline_capture._execute_observations",
+            "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
             new=fake_exec,
         ):
             result = await node(state)
@@ -1411,3 +1475,280 @@ class TestBaselineCaptureRetryIntegration:
         assert result["baseline_data"]["source"] == "scope_fallback"
         # 两次执行：1 次 registry + 1 次 scope_fallback（LLM 不可用，链路到此为止）
         assert exec_call_count["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Host profile: same strategy chain, host-shell execution (no debug pod)
+# ---------------------------------------------------------------------------
+
+
+def _fake_result(exit_code=0, stdout="", stderr=""):
+    r = MagicMock()
+    r.exit_code = exit_code
+    r.stdout = stdout
+    r.stderr = stderr
+    return r
+
+
+class TestHostProfileBaseline:
+    """Host baseline (ssh / kubewiz_host) runs the SAME LLM→registry→fallback
+    chain as k8s, but executes plain shell diagnostics via the transport with
+    ``skip_guard=True`` and NEVER creates a debug pod / discovers a tool pod.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel", ["ssh", "kubewiz_host"])
+    async def test_host_registry_runs_shell_diagnostic(self, channel):
+        calls = []
+
+        async def fake_transport(cmd, target, **kwargs):
+            calls.append((cmd, kwargs))
+            return _fake_result(0, "load average: 0.1", "")
+
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "task_id": "host-1",
+            "blade_scope": "node",
+            "blade_target": "cpu",
+            "blade_action": "fullload",
+            "target": {"namespace": "", "names": ["10.0.0.9"], "labels": {}},
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture.resolve_channel_name",
+            return_value=channel,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
+            new=fake_transport,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors._create_and_wait_debug_pod",
+            new_callable=AsyncMock,
+        ) as mock_debug, patch(
+            "chaos_agent.agent.nodes.baseline._executors.discover_tool_pod_on_node",
+            new_callable=AsyncMock,
+        ) as mock_tool:
+            result = await node(state)
+
+        assert result["baseline_data"]["source"] == "registry"
+        # CPU primary evidence plus hostname and an independent uptime check.
+        assert result["baseline_data"]["success_count"] == 3
+        # A host shell diagnostic was executed (top -bn1), not kubectl.
+        assert calls, "execute_via_transport was not called"
+        argv, kwargs = calls[0]
+        assert argv == ["top", "-bn1"]
+        assert kwargs.get("skip_guard") is True
+        assert kwargs.get("source") == "baseline-host"
+        # Host path never touches the k8s debug-pod machinery.
+        mock_debug.assert_not_called()
+        mock_tool.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_host_iostat_degrades_to_proc(self):
+        """When a host binary is missing, degrade to a /proc read."""
+        seq = []
+
+        async def fake_transport(cmd, target, **kwargs):
+            seq.append(cmd)
+            if cmd == ["iostat", "-xd", "1", "2"]:
+                return _fake_result(127, "", "iostat: command not found")
+            return _fake_result(0, "ok", "")
+
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "task_id": "host-io",
+            "blade_scope": "node",
+            "blade_target": "disk",
+            "blade_action": "burn",
+            "target": {"namespace": "", "names": ["h"], "labels": {}},
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture.resolve_channel_name",
+            return_value="ssh",
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
+            new=fake_transport,
+        ):
+            result = await node(state)
+
+        # disk registry = [df -h, iostat -xd 1 2]; iostat degrades to /proc.
+        assert ["df", "-h"] in seq
+        assert ["iostat", "-xd", "1", "2"] in seq
+        assert ["cat", "/proc/diskstats"] in seq
+        # Both dimensions plus deterministic host identity succeed.
+        assert result["baseline_data"]["success_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_host_llm_strategy_with_validation(self):
+        """Host LLM strategy: only whitelisted host diagnostics survive
+        validation; a kubectl command from the LLM is rejected."""
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
+            {"description": "Host CPU", "command": "top -bn1", "mode": "simple"},
+            {"description": "Bad", "command": "kubectl get pods", "mode": "simple"},
+        ])))
+
+        async def fake_transport(cmd, target, **kwargs):
+            return _fake_result(0, "ok", "")
+
+        node = make_baseline_capture(llm=mock_llm, registry=None)
+        state = {
+            "task_id": "host-llm",
+            "blade_scope": "node",
+            "blade_target": "cpu",
+            "blade_action": "fullload",
+            "skill_case_content": "some skill content",
+            "target": {"namespace": "", "names": ["h"], "labels": {}},
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture.resolve_channel_name",
+            return_value="ssh",
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
+            new=fake_transport,
+        ):
+            result = await node(state)
+
+        assert result["baseline_data"]["source"] == "llm"
+        # The whitelisted diagnostic ran; evidence supplementation adds only
+        # host identity and an independent load cross-check.
+        assert result["baseline_data"]["success_count"] == 3
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "blade_target,expected_argv",
+        [
+            ("mem", ["free", "-m"]),
+            ("network", ["ss", "-s"]),
+            ("process", ["ps", "aux"]),
+        ],
+    )
+    async def test_host_registry_table_wiring(self, blade_target, expected_argv):
+        """Each host blade_target maps to its shell diagnostic table entry and
+        is executed verbatim via the transport (no kubectl, no debug pod)."""
+        calls = []
+
+        async def fake_transport(cmd, target, **kwargs):
+            calls.append(cmd)
+            return _fake_result(0, "ok", "")
+
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "task_id": f"host-{blade_target}",
+            "blade_scope": "node",
+            "blade_target": blade_target,
+            "blade_action": "fullload",
+            "target": {"namespace": "", "names": ["h"], "labels": {}},
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture.resolve_channel_name",
+            return_value="ssh",
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
+            new=fake_transport,
+        ):
+            result = await node(state)
+
+        assert result["baseline_data"]["source"] == "registry"
+        assert expected_argv in calls
+        # Nothing kubectl-flavored leaked into the host path.
+        assert all(argv and argv[0] != "kubectl" for argv in calls)
+
+    @pytest.mark.asyncio
+    async def test_host_scope_fallback_when_registry_empty(self):
+        """An unknown host target has no registry entry, so the chain falls
+        through to the host scope fallback (_HOST_FALLBACK: uptime, top)."""
+        calls = []
+
+        async def fake_transport(cmd, target, **kwargs):
+            calls.append(cmd)
+            return _fake_result(0, "ok", "")
+
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "task_id": "host-fb",
+            "blade_scope": "node",
+            "blade_target": "unknown-target",  # not in _HOST_BASELINE_COMMANDS
+            "blade_action": "fullload",
+            "target": {"namespace": "", "names": ["h"], "labels": {}},
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture.resolve_channel_name",
+            return_value="ssh",
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
+            new=fake_transport,
+        ):
+            result = await node(state)
+
+        assert result["baseline_data"]["source"] == "scope_fallback"
+        # _HOST_FALLBACK runs uptime + top -bn1.
+        assert ["uptime"] in calls
+        assert ["top", "-bn1"] in calls
+        assert result["baseline_data"]["success_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_host_all_commands_fail_best_effort(self):
+        """When every host diagnostic (and its /proc degrade) fails, baseline
+        still completes with success_count=0 rather than raising."""
+
+        async def fake_transport(cmd, target, **kwargs):
+            return _fake_result(1, "", "boom")
+
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "task_id": "host-fail",
+            "blade_scope": "node",
+            "blade_target": "process",  # ps aux + uptime, no /proc fallback
+            "blade_action": "kill",
+            "target": {"namespace": "", "names": ["h"], "labels": {}},
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture.resolve_channel_name",
+            return_value="ssh",
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
+            new=fake_transport,
+        ):
+            result = await node(state)
+
+        assert "baseline_data" in result
+        assert result["baseline_data"]["success_count"] == 0
+
+
+class TestK8sProfileBaseline:
+    """k8s baseline still assembles the kubectl prompt, injects global kubectl
+    parameters, and builds a debug pod for {debug_pod} + debug_two_step."""
+
+    @pytest.mark.asyncio
+    async def test_debug_two_step_creates_debug_pod(self):
+        async def fake_transport(cmd, target, **kwargs):
+            return _fake_result(0, "Filesystem  Size", "")
+
+        node = make_baseline_capture(llm=None, registry=None)
+        state = {
+            "task_id": "k8s-dbg",
+            "blade_scope": "node",
+            "blade_target": "disk",
+            "blade_action": "fill",
+            "target": {"namespace": "", "names": ["cn-node-1"], "labels": {}},
+            "kubeconfig": "/kc",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture.resolve_channel_name",
+            return_value="kubeconfig",
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors.execute_via_transport",
+            new=fake_transport,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline._executors._create_and_wait_debug_pod",
+            new_callable=AsyncMock,
+            return_value=("dbg-pod", _TOOL_POD_NAMESPACE),
+        ) as mock_create, patch(
+            "chaos_agent.agent.nodes.baseline._executors._delete_debug_pod",
+            new_callable=AsyncMock,
+        ) as mock_delete:
+            result = await node(state)
+
+        # node/disk/fill has a debug_two_step command → pod created + cleaned.
+        mock_create.assert_awaited_once()
+        mock_delete.assert_awaited_once()
+        assert result["baseline_data"]["source"] == "registry"

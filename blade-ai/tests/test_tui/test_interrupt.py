@@ -45,6 +45,44 @@ class TestInterruptHandler:
             result = await handler.handle_interrupt(info)
             assert result == "rejected"
 
+    async def test_plan_change_uses_confirmation_renderer(self):
+        console = MagicMock()
+        handler = InterruptHandler(console=console)
+        info = {
+            "type": "plan_change",
+            "reason": "当前方案不可行",
+            "original": {
+                "fault_type": "node-network-drop",
+                "fault_spec": {
+                    "objective": "网络不可达", "namespace": "default",
+                    "names": ["node-a"], "params": {"percent": "100"},
+                },
+            },
+            "proposed": {
+                "fault_type": "node-network-delay",
+                "fault_spec": {
+                    "objective": "网络延迟", "namespace": "default",
+                    "names": ["node-a"], "params": {"time": "3000"},
+                },
+            },
+        }
+
+        with patch(
+            "chaos_agent.tui.renderers.confirm.run",
+            new_callable=AsyncMock,
+            return_value="approved",
+        ) as mock_run:
+            result = await handler.handle_interrupt(info)
+
+        confirm_info = mock_run.await_args.args[1]
+        assert confirm_info["plan_fields"]["当前故障"] == "node-network-drop"
+        assert confirm_info["plan_fields"]["建议故障"] == "node-network-delay"
+        assert confirm_info["plan_fields"]["当前边界"] == "-"
+        assert confirm_info["plan_fields"]["建议约束"] == "-"
+        assert confirm_info["plan_fields"]["当前目标"] == "default/node-a"
+        assert confirm_info["plan_fields"]["建议参数"] == "time=3000"
+        assert result == "approved"
+
     async def test_question_interrupt(self):
         """Question interrupt calls question renderer and returns user text."""
         console = MagicMock()

@@ -6,11 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
-from chaos_agent.agent.nodes._injection_detection import (
+from chaos_agent.agent.nodes.execute._injection_detection import (
     _was_kubectl_blade_injection_successful,
     _was_blade_create_attempted,
 )
-from chaos_agent.agent.nodes.recover_verifier import (
+from chaos_agent.agent.nodes.recover.recover_verifier import (
     RecoverLayer1Result,
     _parse_blade_destroy_output,
     _parse_blade_status_destroyed,
@@ -45,7 +45,7 @@ async def _drive_finalize(state: dict, loop_result: dict) -> dict:
     state (messages append, other keys overwrite), then invoke the finalize
     node.
     """
-    from chaos_agent.agent.nodes._recover_finalize import (
+    from chaos_agent.agent.nodes.recover._recover_finalize import (
         make_finalize_recover_verification,
     )
     merged = {**state, **{k: v for k, v in loop_result.items() if k != "messages"}}
@@ -276,7 +276,9 @@ class TestRecoverVerifierNoLLM:
 
     @pytest.mark.asyncio
     async def test_successful_recovery(self):
-        with patch("chaos_agent.agent.nodes._recover_verifier_loop._run_recover_layer1") as mock_l1:
+        # No-LLM path now delegates to ChaosbladeProvider.recover, which imports
+        # _run_recover_layer1 from its canonical module at call time — patch there.
+        with patch("chaos_agent.agent.nodes.recover._recover_layer1._run_recover_layer1") as mock_l1:
             mock_l1.return_value = RecoverLayer1Result(
                 status="passed",
                 details="blade_destroy: success, blade_status confirms: Destroyed",
@@ -296,7 +298,8 @@ class TestRecoverVerifierNoLLM:
 
     @pytest.mark.asyncio
     async def test_failed_recovery(self):
-        with patch("chaos_agent.agent.nodes._recover_verifier_loop._run_recover_layer1") as mock_l1:
+        # No-LLM path delegates to ChaosbladeProvider.recover — patch the canonical module.
+        with patch("chaos_agent.agent.nodes.recover._recover_layer1._run_recover_layer1") as mock_l1:
             mock_l1.return_value = RecoverLayer1Result(
                 status="failed",
                 details="blade_destroy failed",
@@ -327,7 +330,7 @@ class TestMakeRecoverVerifier:
         mock_llm = MagicMock()
         node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
 
-        with patch("chaos_agent.agent.nodes._recover_verifier_loop._run_recover_layer1") as mock_l1:
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._run_recover_layer1") as mock_l1:
             mock_l1.return_value = RecoverLayer1Result(
                 status="failed",
                 details="blade still running",
@@ -370,7 +373,7 @@ class TestMakeRecoverVerifier:
 
         node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
 
-        with patch("chaos_agent.agent.nodes._recover_verifier_loop._run_recover_layer1") as mock_l1:
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._run_recover_layer1") as mock_l1:
             mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok", raw_output="ok")
             state = {
                 "task_id": "t1",
@@ -416,7 +419,7 @@ class TestMakeRecoverVerifier:
 
         node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
 
-        with patch("chaos_agent.agent.nodes._recover_verifier_loop._run_recover_layer1") as mock_l1:
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._run_recover_layer1") as mock_l1:
             mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok", raw_output="ok")
             state = {
                 "task_id": "t1",
@@ -447,7 +450,7 @@ class TestMakeRecoverVerifier:
 
         node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
 
-        with patch("chaos_agent.agent.nodes._recover_verifier_loop._run_recover_layer1") as mock_l1:
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._run_recover_layer1") as mock_l1:
             mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
             state = {
                 "task_id": "t1",
@@ -483,7 +486,7 @@ class TestMakeRecoverVerifier:
 class TestRunRecoverLayer1:
     @pytest.mark.asyncio
     async def test_no_blade_uid_skipped(self):
-        from chaos_agent.agent.nodes.recover_verifier import _run_recover_layer1
+        from chaos_agent.agent.nodes.recover.recover_verifier import _run_recover_layer1
         result = await _run_recover_layer1("", "")
         assert result.status == "skipped"
 
@@ -535,14 +538,14 @@ class TestParseLayer1RecoveryResult:
 
 class TestBuildRecoverVerifierPrompt:
     def test_chaosblade_label(self):
-        prompt = _build_recover_verifier_prompt(is_chaosblade=True)
+        prompt = _build_recover_verifier_prompt(layer1_label="blade_destroy")
         # Scheme B: verdict submitted via submit_recover_verification; the
         # blade_destroy label still appears in the text fallback block.
         assert "blade_destroy" in prompt
         assert "submit_recover_verification" in prompt
 
     def test_non_chaosblade_label(self):
-        prompt = _build_recover_verifier_prompt(is_chaosblade=False)
+        prompt = _build_recover_verifier_prompt(layer1_label="recovery execution")
         assert "recovery execution" in prompt
         assert "submit_recover_verification" in prompt
 
@@ -554,15 +557,16 @@ class TestBuildRecoverVerifierPrompt:
 class TestBuildLayer1RecoveryPrompt:
     def test_contains_constraints(self):
         prompt = _build_layer1_recovery_prompt()
-        assert "DO NOT check for ChaosBlade" in prompt
-        assert "DO NOT use interactive commands" in prompt
-        assert "DO NOT use `blade_destroy`" in prompt
+        # Generic (non-ChaosBlade) recovery: Layer 2 owns verification, no
+        # ChaosBlade experiment here, and no TTY-bound interactive commands.
+        assert "Do NOT verify the fault has been removed" in prompt
+        assert "Do NOT use interactive commands" in prompt
+        assert "there is no ChaosBlade" in prompt
 
     def test_contains_programmatic_patterns(self):
         prompt = _build_layer1_recovery_prompt()
-        # P2-2: Programmatic Recovery Patterns moved to kubectl docstring;
-        # prompt now references tool docstring instead of inline patterns
-        assert "see tool docstring" in prompt or "recovery patterns" in prompt
+        # Interactive commands must be translated into programmatic equivalents.
+        assert "programmatic equivalents" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -803,7 +807,7 @@ class TestMakeRecoverVerifierNonChaosBlade:
 
         node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
 
-        with patch("chaos_agent.agent.nodes._recover_verifier_loop._run_recover_layer1") as mock_l1:
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._run_recover_layer1") as mock_l1:
             mock_l1.return_value = RecoverLayer1Result(
                 status="passed",
                 details="blade_destroy: success",
@@ -1009,7 +1013,7 @@ class TestRunRecoverLayer1KubectlRouting:
     async def test_blade_destroy_failed_but_experiment_gone_passes(self):
         """When blade_destroy fails but experiment CRD is already gone (not found),
         Layer 1 passes — the experiment was auto-recovered (timeout expiry)."""
-        from chaos_agent.agent.nodes.recover_verifier import _run_recover_layer1
+        from chaos_agent.agent.nodes.recover.recover_verifier import _run_recover_layer1
 
         destroy_output = json.dumps({
             "code": 500, "success": False,
@@ -1034,7 +1038,7 @@ class TestRunRecoverLayer1KubectlRouting:
     async def test_blade_destroy_failed_experiment_still_running(self):
         """When blade_destroy fails and experiment is still Running,
         Layer 1 stays 'failed'."""
-        from chaos_agent.agent.nodes.recover_verifier import _run_recover_layer1
+        from chaos_agent.agent.nodes.recover.recover_verifier import _run_recover_layer1
 
         destroy_output = json.dumps({
             "code": 500, "success": False,
@@ -1059,7 +1063,7 @@ class TestRunRecoverLayer1KubectlRouting:
     @pytest.mark.asyncio
     async def test_blade_destroy_succeeds_normally(self):
         """Normal blade_destroy succeeds."""
-        from chaos_agent.agent.nodes.recover_verifier import _run_recover_layer1
+        from chaos_agent.agent.nodes.recover.recover_verifier import _run_recover_layer1
 
         destroy_output = json.dumps({"code": 200, "success": True, "result": "uid-abc"})
 
@@ -1076,7 +1080,7 @@ class TestRunRecoverLayer1KubectlRouting:
     @pytest.mark.asyncio
     async def test_blade_tools_exception_stays_error(self):
         """When blade tools throw exceptions, stays 'error'."""
-        from chaos_agent.agent.nodes.recover_verifier import _run_recover_layer1
+        from chaos_agent.agent.nodes.recover.recover_verifier import _run_recover_layer1
 
         with patch("chaos_agent.tools.blade.blade_destroy") as mock_destroy:
             mock_destroy.ainvoke = AsyncMock(side_effect=Exception("blade binary not found"))
@@ -1094,16 +1098,16 @@ class TestRunRecoverLayer1KubectlRouting:
 
 class TestBuildRecoverVerifierPromptSignature:
     def test_chaosblade_prompt(self):
-        prompt = _build_recover_verifier_prompt(is_chaosblade=True)
+        prompt = _build_recover_verifier_prompt(layer1_label="blade_destroy")
         assert "blade_destroy" in prompt
 
     def test_non_chaosblade_prompt(self):
-        prompt = _build_recover_verifier_prompt(is_chaosblade=False)
+        prompt = _build_recover_verifier_prompt(layer1_label="recovery execution")
         assert "recovery execution" in prompt
 
     def test_prompt_contains_format_constraint(self):
         """Recover verifier prompt must use submit_recover_verification, not RECOVERY_EXECUTION_RESULT."""
-        prompt = _build_recover_verifier_prompt(is_chaosblade=False)
+        prompt = _build_recover_verifier_prompt(layer1_label="recovery execution")
         assert "submit_recover_verification" in prompt
         assert "RECOVERY_VERIFICATION_RESULT" in prompt
         assert "successfully recovered" in prompt
@@ -1157,7 +1161,9 @@ class TestRecoverVerifierNoLLMKubectlRouting:
     @pytest.mark.asyncio
     async def test_normal_chaosblade_still_uses_blade_destroy(self):
         """Normal ChaosBlade injection (host blade_create) still calls _run_recover_layer1."""
-        with patch("chaos_agent.agent.nodes._recover_verifier_loop._run_recover_layer1") as mock_l1:
+        # No-LLM path delegates to ChaosbladeProvider.recover, which imports
+        # _run_recover_layer1 from its canonical module at call time — patch there.
+        with patch("chaos_agent.agent.nodes.recover._recover_layer1._run_recover_layer1") as mock_l1:
             mock_l1.return_value = RecoverLayer1Result(
                 status="passed",
                 details="blade_destroy: success",
@@ -2397,7 +2403,7 @@ class TestBuildRecoverVerifierSystemPrompt:
 
     def test_u_shape_primacy_zone(self):
         """Core Principles appear at the BEGINNING of the prompt (primacy effect)."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         # Core Principles must appear before the middle-zone sections
         # (knowledge summary, tools, skill priority, kubeconfig)
         rules_pos = prompt.index("Core Principles")
@@ -2407,7 +2413,7 @@ class TestBuildRecoverVerifierSystemPrompt:
 
     def test_u_shape_recency_zone(self):
         """REMEMBER section appears at the END of the prompt (recency effect)."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         # REMEMBER section must appear AFTER all middle-zone sections
         remember_pos = prompt.index("REMEMBER")
         output_format_pos = prompt.index("RECOVERY_VERIFICATION_RESULT")
@@ -2418,17 +2424,17 @@ class TestBuildRecoverVerifierSystemPrompt:
 
     def test_chaosblade_label(self):
         """is_chaosblade=True → Layer1 label is 'blade_destroy'."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         assert "blade_destroy" in prompt
 
     def test_non_chaosblade_label(self):
         """is_chaosblade=False → Layer1 label is 'recovery execution'."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=False)
+        prompt = build_recover_verifier_system_prompt(layer1_label="recovery execution")
         assert "recovery execution" in prompt
 
     def test_all_sections_present(self):
         """All section functions are composed in the prompt."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         assert "successfully recovered" in prompt
         assert "Core Principles" in prompt
         assert "Domain Knowledge" in prompt or "Knowledge" in prompt
@@ -2439,27 +2445,27 @@ class TestBuildRecoverVerifierSystemPrompt:
 
     def test_baseline_integrity_compact(self):
         """Compact baseline integrity rules (4 rules + 1 example) are present."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         assert "Baseline Comparison Rules" in prompt
         assert "SAME resource only" in prompt
         assert "imagefs /dev/vdb" in prompt
 
     def test_no_full_baseline_integrity(self):
         """Full BASELINE_INTEGRITY_PROMPT content should NOT appear in the compact version."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         # The compact version has 4 concise rules; the full version has verbose
         # "FORMAT REQUIREMENT" text — ensure compact doesn't include it
         assert "FORMAT REQUIREMENT" not in prompt
 
     def test_three_level_degradation_in_principles(self):
         """Core Principles mention healthy-state comparison as middle degradation level."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         assert "healthy state" in prompt.lower() or "healthy-state" in prompt.lower()
         assert "cross-validate" in prompt.lower() or "cross-validation" in prompt.lower()
 
     def test_output_format_has_status_definitions(self):
         """Output Format defines Overall and per-step status values."""
-        prompt = build_recover_verifier_system_prompt(is_chaosblade=True)
+        prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         assert "recovered" in prompt
         assert "unrecovered" in prompt
         assert "partial" in prompt
@@ -2482,7 +2488,7 @@ class TestFinalizeInProgressDefense:
     async def test_in_progress_cache_defaults_to_unknown(self):
         """When cache is in_progress, finalize should default to unknown,
         not crash with ValidationError."""
-        from chaos_agent.agent.nodes._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+        from chaos_agent.agent.nodes.verify._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
 
         # Simulate: Layer 1 cache is in_progress (should not happen after fix,
         # but defense-in-depth must handle it).
@@ -2545,7 +2551,7 @@ class TestFinalizeMarksInjectTask:
         """On successful recovery, the original inject task should be updated
         with operation='recover' and recover_verification so infer_task_state
         returns 'recovered'."""
-        from chaos_agent.agent.nodes._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+        from chaos_agent.agent.nodes.verify._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
 
         submit_msg = AIMessage(
             content="Recovery verified.",
@@ -2613,7 +2619,7 @@ class TestFinalizeMarksInjectTask:
     async def test_no_inject_task_update_when_recover_task_id_missing(self):
         """When recover_task_id is not set (e.g. direct API call without
         intent_clarification), finalize should not crash."""
-        from chaos_agent.agent.nodes._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
+        from chaos_agent.agent.nodes.verify._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
 
         submit_msg = AIMessage(
             content="Recovery verified.",

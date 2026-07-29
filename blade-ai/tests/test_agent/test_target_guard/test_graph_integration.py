@@ -1,7 +1,7 @@
 """Graph-level integration tests for the target_guard screener.
 
 Unit tests in test_screener.py exercise the node in isolation; these
-tests verify it is correctly wired into the inject graph and that the
+tests verify it is correctly wired into the pipeline graph and that the
 edges go where the spec says they should.
 
 Scope:
@@ -12,19 +12,19 @@ Scope:
 
 from __future__ import annotations
 
-from chaos_agent.agent.graph import build_inject_graph
+from chaos_agent.agent.graph import build_pipeline_graph
 
 
 class TestScreenerWiring:
     def test_tool_screener_node_present(self):
-        graph = build_inject_graph(phase1_tools=[], phase2_tools=[])
+        graph = build_pipeline_graph(phase1_tools=[], phase2_tools=[])
         assert "tool_screener" in graph.nodes
 
     def test_graph_compiles(self):
         # Catches mismatches between conditional-edge targets and
         # declared nodes — LangGraph rejects on compile when an edge
         # references an unknown node.
-        graph = build_inject_graph(phase1_tools=[], phase2_tools=[])
+        graph = build_pipeline_graph(phase1_tools=[], phase2_tools=[])
         compiled = graph.compile()
         assert compiled is not None
 
@@ -33,7 +33,7 @@ class TestScreenerWiring:
         # tool_screener now, not straight to phase2_tools. If anyone
         # restores the old direct edge by accident, the screener
         # becomes dead code and the drift bug returns.
-        graph = build_inject_graph(phase1_tools=[], phase2_tools=[])
+        graph = build_pipeline_graph(phase1_tools=[], phase2_tools=[])
         # Inspect the graph's adjacency. LangGraph exposes branches
         # via graph.branches and edges via graph.edges; conditional
         # edges land in branches keyed by source node.
@@ -50,7 +50,7 @@ class TestScreenerWiring:
                 )
 
     def test_screener_has_three_outbound_routes(self):
-        graph = build_inject_graph(phase1_tools=[], phase2_tools=[])
+        graph = build_pipeline_graph(phase1_tools=[], phase2_tools=[])
         branches = graph.branches.get("tool_screener") or {}
         assert branches, "tool_screener must have conditional edges"
         for branch in branches.values():

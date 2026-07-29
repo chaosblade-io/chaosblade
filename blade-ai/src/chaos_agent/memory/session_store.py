@@ -13,6 +13,7 @@ import logging
 import tempfile
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from langchain_core.messages import RemoveMessage, SystemMessage
 
@@ -183,7 +184,7 @@ def build_result_summary(verification: dict) -> str:
 
 def build_verification_simple(verification: dict) -> dict | None:
     """Flatten verification dict into a compact format for API responses."""
-    from chaos_agent.agent.operation_outcome import (
+    from chaos_agent.agent.result.operation_outcome import (
         build_verification_simple as _build_verification_simple,
     )
 
@@ -316,6 +317,9 @@ class SessionStore:
             "status": "active",
             "messages": [],
             "result_summary": None,
+            # Frozen at finalize from settings.model_name; declared here so the
+            # field exists from creation and analysis code can read it uniformly.
+            "model_name": "",
         }
         baseline_keys = set()
         if baseline_messages:
@@ -478,6 +482,69 @@ class SessionStore:
         if self._needs_compaction(task_id):
             self._compact(task_id)
 
+    def record_aux_llm_call(
+        self,
+        task_id: str,
+        *,
+        purpose: str,
+        request: str,
+        response: str,
+        reasoning: str = "",
+        duration_ms: int | None = None,
+    ) -> None:
+        """Archive an auxiliary (off-main-graph) LLM call for audit.
+
+        Baseline derivation and postmortem generation each make an LLM call that
+        is deliberately kept OUT of ``messages`` — they are side computations,
+        and folding them into the main conversation would pollute the context the
+        primary ReAct loop reasons over. But "not in the conversation" became "not
+        recorded anywhere", so an audit could see the RESULT (the baseline metrics,
+        the postmortem markdown) without the call that produced it. When one of
+        these takes 73s, or produces a wrong result, there was no way to inspect
+        the request/response after the fact.
+
+        This writes to a separate ``aux_llm_calls`` list, not ``messages`` — the
+        audit trail is preserved without changing what any node sees. Persisted to
+        the JSONL immediately (same durability path as messages) so a crash before
+        finalize does not lose it.
+        """
+        session = self._active_sessions.get(task_id)
+        if session is None:
+            logger.warning(
+                "Task %s not found, skipping aux LLM call record (%s)",
+                task_id, purpose,
+            )
+            return
+        entry = {
+            "kind": "aux_llm_call",
+            "id": f"aux:{uuid4()}",
+            "purpose": purpose,
+            "request": request,
+            "response": response,
+            "reasoning": reasoning,
+            "duration_ms": duration_ms,
+            "time": now_iso(),
+        }
+        session.setdefault("aux_llm_calls", []).append(entry)
+        # Mirror to the JSONL with a discriminator so read_session can route it
+        # back to aux_llm_calls instead of messages on reconstruction.
+        try:
+            self._append_to_jsonl(task_id, [{"__aux_llm_call__": entry}])
+        except OSError as e:
+            # Archival path — never crash the calling node over an audit write.
+            logger.warning(
+                "Failed to persist aux LLM call for task %s (%s): %s",
+                task_id, purpose, e,
+            )
+            return
+        # Same compaction trigger as append_messages / append_raw_message: the
+        # aux entry counts toward the JSONL size, so honour the threshold here or
+        # a run that records many aux calls would grow the JSONL unbounded. Also
+        # keeps the compact-then-snapshot rotation timely, which the read-path
+        # dedup relies on.
+        if self._needs_compaction(task_id):
+            self._compact(task_id)
+
     def finalize_session(
         self,
         task_id: str,
@@ -525,6 +592,27 @@ class SessionStore:
         session["finished_at"] = now_iso()
         session["status"] = status
         session["result_summary"] = result_summary or None
+
+        # Freeze the model name into the record. Post-hoc analysis otherwise has
+        # to guess it from the CURRENT config.json — which may have been changed
+        # since the run (config was edited mid-investigation more than once), so
+        # the guess can name the wrong model entirely. The task file is the only
+        # place this fact survives. Prefer a value the result already carries
+        # (batch / multi-model runs set their own) over the global default.
+        if not session.get("model_name"):
+            model_name = ""
+            if isinstance(result_summary, dict):
+                data = result_summary.get("data")
+                if isinstance(data, dict):
+                    model_name = str(data.get("model_name") or "")
+                model_name = model_name or str(result_summary.get("model_name") or "")
+            if not model_name:
+                try:
+                    from chaos_agent.config.settings import settings
+                    model_name = str(getattr(settings, "model_name", "") or "")
+                except Exception:
+                    model_name = ""
+            session["model_name"] = model_name
 
         # Round-3: _atomic_write_json now raises on disk failure.
         # finalize is called from graph nodes via fire-and-forget /
@@ -603,6 +691,36 @@ class SessionStore:
         # Replay live JSONL increments.
         if jsonl_path.exists():
             all_messages.extend(self._replay_jsonl_file(jsonl_path, task_id))
+
+        # Aux LLM-call records share the JSONL with messages (one append path)
+        # but are NOT messages — split them back out before the message dedup so
+        # they never surface in ``messages``. Their own list is rebuilt from the
+        # snapshot plus any replayed increments.
+        aux_from_jsonl = [
+            m["__aux_llm_call__"] for m in all_messages
+            if isinstance(m, dict) and "__aux_llm_call__" in m
+        ]
+        all_messages = [
+            m for m in all_messages
+            if not (isinstance(m, dict) and "__aux_llm_call__" in m)
+        ]
+        if aux_from_jsonl:
+            merged_aux = list(data.get("aux_llm_calls", [])) + aux_from_jsonl
+            # Dedup by the per-entry ``id`` (uuid assigned at record time), the
+            # same id-first strategy the message dedup uses. Keying on
+            # (time, purpose) instead would collapse two same-purpose calls that
+            # land in the same instant — e.g. a baseline derive plus its retry —
+            # and relies on now_iso() sub-second precision the docstring does not
+            # even promise.
+            seen_aux: set = set()
+            deduped_aux: list[dict] = []
+            for a in merged_aux:
+                k = a.get("id") or (a.get("time"), a.get("purpose"))
+                if k in seen_aux:
+                    continue
+                seen_aux.add(k)
+                deduped_aux.append(a)
+            data["aux_llm_calls"] = deduped_aux
 
         # Bug 2 — id-based dedup, preserving first-seen order. Saves us
         # from Bug 1 / Bug 3 crash duplicates, also defends against any

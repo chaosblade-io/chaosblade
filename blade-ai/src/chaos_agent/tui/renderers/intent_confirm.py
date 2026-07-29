@@ -268,6 +268,15 @@ def build_body(
         params_str = ", ".join(f"{k}={v}" for k, v in fault_intent["params"].items())
         fields.append(("Params", params_str))
 
+    if fault_intent.get("objective"):
+        fields.append(("Goal", fault_intent["objective"]))
+    if fault_intent.get("boundaries"):
+        fields.append(("Boundaries", "; ".join(fault_intent["boundaries"])))
+    if fault_intent.get("constraints"):
+        fields.append(("Constraints", "; ".join(fault_intent["constraints"])))
+    if fault_intent.get("assumptions"):
+        fields.append(("Assumptions", "; ".join(fault_intent["assumptions"])))
+
     pre = Text()
     pre.append("\n")
     pre.append(

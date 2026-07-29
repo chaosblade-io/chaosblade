@@ -15,15 +15,21 @@ from chaos_agent.agent.intent_handoff import (
     clear_dispatched_operation_payload_update,
     detect_dispatchable_operation,
 )
-from chaos_agent.agent.operation_summary import (
+from chaos_agent.agent.result.operation_summary import (
     build_batch_summary_text,
     build_recover_summary_text,
     build_task_summary_text,
 )
-from chaos_agent.agent.state_builders import build_inject_initial_state
-from chaos_agent.agent.streaming import SSEBatcher, StreamEvent, parse_stream_events
-from chaos_agent.agent.task_snapshot import resolve_recover_initial_state
-from chaos_agent.agent.skill_identity import has_active_skill
+from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
+from chaos_agent.agent.spec.fault_spec import FAULT_PROPOSAL_OPEN
+from chaos_agent.agent.streaming import (
+    ProtocolSuffixFilter,
+    SSEBatcher,
+    StreamEvent,
+    parse_stream_events,
+)
+from chaos_agent.agent.result.task_snapshot import resolve_recover_initial_state
+from chaos_agent.agent.spec.skill_identity import has_active_skill
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.operation_summary_writer import write_operation_summary
 from chaos_agent.memory.session_finalizer import (
@@ -277,6 +283,7 @@ async def _drain_merged(merged_iter, turn_id, batcher, sidewrite, converters, re
 
     Raises ``ClientDisconnected`` if the client drops the connection.
     """
+    intent_protocol_filter = ProtocolSuffixFilter(FAULT_PROPOSAL_OPEN)
     async for kind, payload in merged_iter:
         if kind == "heartbeat":
             # Yield SSE comment (invisible to the JSON parser on the client
@@ -287,6 +294,11 @@ async def _drain_merged(merged_iter, turn_id, batcher, sidewrite, converters, re
             raise ClientDisconnected()
         if kind == "graph":
             for evt in parse_stream_events(payload):
+                if evt.type == "token" and evt.node == "intent_clarification":
+                    public_content = intent_protocol_filter.feed(evt.content)
+                    if not public_content:
+                        continue
+                    evt.content = public_content
                 evt.task_id = turn_id
                 sidewrite(evt, source=source)
                 for sse in batcher.feed(evt):
@@ -299,6 +311,17 @@ async def _drain_merged(merged_iter, turn_id, batcher, sidewrite, converters, re
                 if converted is not None:
                     sidewrite(converted, source=source)
                     yield converted.to_sse()
+    remaining_public_content = intent_protocol_filter.flush()
+    if remaining_public_content:
+        remaining_evt = StreamEvent(
+            type="token",
+            content=remaining_public_content,
+            node="intent_clarification",
+            task_id=turn_id,
+        )
+        sidewrite(remaining_evt, source=source)
+        for sse in batcher.feed(remaining_evt):
+            yield sse
     for sse in batcher.flush():
         yield sse
 
@@ -322,10 +345,17 @@ async def _drain_interrupts(graph, config, ctx, batcher, sidewrite, converters):
         is_auto = ctx.permission_mode != "confirm"
 
         if is_auto and node in ("confirmation_gate", "plan_change_confirm", "tool_screener"):
+            # Emit a structured ``auto_approved`` event carrying the full
+            # interrupt payload so the TS TUI renders the SAME read-only card
+            # as a manual confirm (ConfirmContextRenderer) — just without the
+            # interactive prompt. ``content`` keeps the plain-text summary as a
+            # graceful fallback for clients that don't render the card.
             info_evt = StreamEvent(
-                type="token",
-                content=f"\n{format_auto_approve_info(node, payload)}\n",
+                type="auto_approved",
+                content=format_auto_approve_info(node, payload),
+                node=node,
                 task_id=ctx.turn_id,
+                payload=payload,
             )
             sidewrite(info_evt)
             yield info_evt.to_sse()
@@ -375,7 +405,9 @@ async def _drain_interrupts(graph, config, ctx, batcher, sidewrite, converters):
 # Defensive finalize
 # ---------------------------------------------------------------------------
 
-async def _finalize_task_session(graph, config, turn_id, store_cancel_fn):
+async def _finalize_task_session(
+    graph, config, turn_id, store_cancel_fn, *, cancelled: bool = False,
+):
     """Flush messages and finalize the task session on the clean-exit path."""
     try:
         from chaos_agent.memory.session_store import get_global_session_store
@@ -388,29 +420,62 @@ async def _finalize_task_session(graph, config, turn_id, store_cancel_fn):
             _final = None
         _op_tid = ""
         _state_msgs: list = []
+        _state_values: dict = {}
         if _final and getattr(_final, "values", None):
-            _candidate = _final.values.get("task_id", "")
+            _state_values = _final.values
+            _candidate = _state_values.get("task_id", "")
             if isinstance(_candidate, str) and _candidate.startswith(("task-", "recover-")):
                 _op_tid = _candidate
-            _state_msgs = list(_final.values.get("messages") or [])
+            _state_msgs = list(_state_values.get("messages") or [])
         paused_at_interrupt = bool(_final and getattr(_final, "next", None))
+        is_inject_task = bool(
+            _op_tid.startswith("task-")
+            and _state_values.get("operation") != "recover"
+        )
         if _op_tid and _store.has_active(_op_tid):
-            if _state_msgs:
+            if _state_msgs and (paused_at_interrupt or not is_inject_task):
                 try:
                     _store.append_messages(_op_tid, _state_msgs)
                     logger.info("Flushed %d state messages to task=%s", len(_state_msgs), _op_tid)
                 except Exception:
                     logger.warning("Pre-finalize flush failed for task=%s", _op_tid, exc_info=True)
             if not paused_at_interrupt:
-                _vals = _final.values if _final else {}
-                from chaos_agent.agent.operation_outcome import read_operation_outcome
+                _vals = _state_values
+                if is_inject_task:
+                    from chaos_agent.memory.session_finalizer import (
+                        finalize_inject_session,
+                    )
 
-                if _vals.get("blade_uid") and not read_operation_outcome(_vals).error:
-                    _final_status = "completed"
+                    await finalize_inject_session(
+                        _store,
+                        graph,
+                        config,
+                        _op_tid,
+                        precomputed_values=_vals,
+                        status_override="cancelled" if cancelled else None,
+                    )
+                    logger.info(
+                        "Defensive inject finalize for task=%s from graph state",
+                        _op_tid,
+                    )
                 else:
-                    _final_status = "cancelled"
-                _store.finalize_session(_op_tid, remaining_messages=[], status=_final_status)
-                logger.info("Defensive finalize for task=%s status=%s", _op_tid, _final_status)
+                    from chaos_agent.agent.state import infer_task_state
+
+                    _task_state = infer_task_state(_vals)
+                    _final_status = (
+                        "completed"
+                        if _task_state in ("recovered", "partial_recovered", "completed")
+                        else "failed"
+                    )
+                    _store.finalize_session(
+                        _op_tid,
+                        remaining_messages=[],
+                        status=_final_status,
+                    )
+                    logger.info(
+                        "Defensive finalize for task=%s status=%s",
+                        _op_tid, _final_status,
+                    )
             else:
                 logger.info(
                     "Paused at interrupt for task=%s (next=%s); kept session active",
@@ -427,7 +492,7 @@ async def _finalize_task_session(graph, config, turn_id, store_cancel_fn):
 async def _run_inject_pipeline(ctx, iv, batcher, sidewrite, converters):
     """Launch and stream the single-inject Pipeline Graph."""
     from langchain_core.messages import SystemMessage as _SM
-    from chaos_agent.agent.nodes.intent_clarification import bootstrap_task_session
+    from chaos_agent.agent.nodes.planning.intent_clarification import bootstrap_task_session
 
     _handoff_data = build_pipeline_handoff_from_intent_state(
         iv,
@@ -461,8 +526,15 @@ async def _run_inject_pipeline(ctx, iv, batcher, sidewrite, converters):
         kube_context=settings.kube_context,
         kubewiz_cluster_uuid=settings.kubewiz_cluster_uuid,
         kubewiz_profile=settings.kubewiz_profile,
+        kube_connection_mode=settings.kube_connection_mode,
+        host_name=getattr(settings, "host_name", ""),
+        ssh_host=getattr(settings, "ssh_host", ""),
+        ssh_user=getattr(settings, "ssh_user", ""),
+        ssh_key_path=getattr(settings, "ssh_key_path", ""),
+        ssh_port=getattr(settings, "ssh_port", None),
         messages=[_SM(content=_handoff)] if _handoff else [],
         dry_run=ctx.dry_run,
+        planning_mode=iv.get("planning_mode"),
     )
 
     try:
@@ -563,6 +635,12 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
         kube_context=settings.kube_context,
         kubewiz_cluster_uuid=settings.kubewiz_cluster_uuid,
         kubewiz_profile=settings.kubewiz_profile,
+        kube_connection_mode=settings.kube_connection_mode,
+        host_name=getattr(settings, "host_name", ""),
+        ssh_host=getattr(settings, "ssh_host", ""),
+        ssh_user=getattr(settings, "ssh_user", ""),
+        ssh_key_path=getattr(settings, "ssh_key_path", ""),
+        ssh_port=getattr(settings, "ssh_port", None),
         batch_submit_args=_handoff_data.batch_submit_args,
         messages=[_SM(content=_handoff)] if _handoff else [],
         dry_run=False,
@@ -606,7 +684,7 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
             try:
                 _pm_dir = Path(settings.resolved_memory_dir).parent / "postmortems"
                 _pm_sections = [
-                    f"# 批量故障注入分析报告\n",
+                    "# 批量故障注入分析报告\n",
                     f"共 {len(_batch_results)} 个故障\n",
                 ]
                 for _bi, _br in enumerate(_batch_results):
@@ -631,8 +709,9 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
                 _batch_pm_path_str = str(_batch_pm_file)
 
                 _pm_evt = StreamEvent(
-                    type="token",
+                    type="node_message",
                     content=f"\n📝 批量分析报告: {_batch_pm_path_str}\n",
+                    node="batch_postmortem",
                     task_id=ctx.turn_id,
                 )
                 sidewrite(_pm_evt)
@@ -730,7 +809,7 @@ async def _run_recover(ctx, graph, config, turn_started_monotonic, batcher, side
     }
 
     # Bootstrap SessionStore so recover messages persist to memory/tasks/
-    from chaos_agent.agent.nodes.intent_clarification import bootstrap_task_session
+    from chaos_agent.agent.nodes.planning.intent_clarification import bootstrap_task_session
     _rec_tui_sid = recover_initial.get("tui_session_id", "") or ctx.sid
     bootstrap_task_session(_rec_task_id, operation="recover", tui_session_id=_rec_tui_sid, handoff_message=None)
 
@@ -875,6 +954,58 @@ async def _rollback_intent_checkpoint(
         )
 
 
+async def _cleanup_cancelled_execution_artifacts(ctx: TurnContext) -> None:
+    """Clean helper resources from a pipeline interrupted by the TS TUI.
+
+    Cancellation can occur between ``kubectl debug`` and verifier finalization,
+    so the graph's normal cleanup node may never run. Only registered helper
+    artifacts are removed here; real fault recovery remains the recover graph's
+    responsibility.
+    """
+    graph = ctx.result_graph or ctx.pipeline_graph
+    config = ctx.result_config or ctx.graph_config
+    try:
+        snapshot = await graph.aget_state(config)
+        values = snapshot.values if snapshot and snapshot.values else {}
+        from chaos_agent.agent.execution_artifacts import (
+            cleanup_debug_pod_artifacts,
+            collect_execution_artifacts,
+        )
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        spec = read_fault_spec(values)
+        artifacts = collect_execution_artifacts(
+            list(values.get("messages") or []),
+            list(values.get("execution_artifacts") or []),
+            task_id=str(values.get("task_id") or ctx.turn_id),
+            operation_family=(spec.blade_target if spec else ""),
+        )
+        if not artifacts:
+            return
+        from chaos_agent.agent.nodes.store._store_sync import sync_to_store
+
+        cleaned, names = await cleanup_debug_pod_artifacts(
+            artifacts,
+            kubeconfig=str(values.get("kubeconfig") or ""),
+            task_id=str(values.get("task_id") or ctx.turn_id),
+        )
+        if cleaned != artifacts:
+            await sync_to_store(values, {"execution_artifacts": cleaned})
+        if names:
+            logger.info(
+                "Cancelled turn %s cleaned debug artifacts: %s",
+                ctx.turn_id, names,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "Failed to clean execution artifacts for cancelled turn %s",
+            ctx.turn_id,
+            exc_info=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Main event generator
 # ---------------------------------------------------------------------------
@@ -907,6 +1038,7 @@ async def event_generator(ctx: TurnContext):
     # have been checkpointed. We fork from the pre-turn checkpoint to restore
     # a clean state for the next turn.
     _pre_turn_checkpoint_id: str | None = None
+    _turn_cancelled = False
     try:
         _pre_turn_snap = await ctx.intent_graph.aget_state(ctx.graph_config)
         if _pre_turn_snap and _pre_turn_snap.created_at:
@@ -958,7 +1090,6 @@ async def event_generator(ctx: TurnContext):
         elif _dispatch_operation == "inject":
             async for sse in _run_inject_pipeline(ctx, _iv, batcher, sidewrite, converters):
                 yield sse
-
         # 2.6 Auto-recover
         _result_graph = ctx.result_graph or ctx.intent_graph
         _result_config = ctx.result_config or ctx.graph_config
@@ -1010,7 +1141,9 @@ async def event_generator(ctx: TurnContext):
         yield _timeout_evt.to_sse()
         yield StreamEvent(type="done", task_id=ctx.turn_id).to_sse()
     except asyncio.CancelledError:
+        _turn_cancelled = True
         logger.info(f"Turn {ctx.turn_id} cancelled by client")
+        await asyncio.shield(_cleanup_cancelled_execution_artifacts(ctx))
         # Rollback intent graph checkpoint to pre-turn state so the next
         # turn doesn't resume from a dirty checkpoint with incomplete AIMessage.
         await _rollback_intent_checkpoint(
@@ -1038,4 +1171,10 @@ async def event_generator(ctx: TurnContext):
 
         _result_graph = ctx.result_graph or ctx.intent_graph
         _result_config = ctx.result_config or ctx.graph_config
-        await _finalize_task_session(_result_graph, _result_config, ctx.turn_id, ctx.store.cancel_interrupt)
+        await _finalize_task_session(
+            _result_graph,
+            _result_config,
+            ctx.turn_id,
+            ctx.store.cancel_interrupt,
+            cancelled=_turn_cancelled,
+        )

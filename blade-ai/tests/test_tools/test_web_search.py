@@ -87,5 +87,5 @@ class TestWebSearchTool:
     def test_tool_has_capability_boundary_docstring(self):
         """The docstring should describe capability boundaries, not usage timing."""
         doc = web_search.description
-        assert "NOT available through" in doc
-        assert "does NOT replace local tools" in doc
+        assert "Do NOT use for things local tools answer" in doc
+        assert "NEVER live cluster/experiment state" in doc

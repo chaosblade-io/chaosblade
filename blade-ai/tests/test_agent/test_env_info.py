@@ -68,6 +68,31 @@ class TestComputeEnvInfo:
             result = await compute_env_info()
             assert result["k8s_available"] is True
 
+    @pytest.mark.asyncio
+    async def test_kube_connection_mode_uses_resolved_channel(self):
+        """kube_connection_mode reflects the resolved transport channel name."""
+        with patch("chaos_agent.transports.TransportRegistry.resolve") as mock_resolve:
+            mock_resolve.return_value.name = "kubewiz_k8s"
+            result = await compute_env_info()
+        assert result["kube_connection_mode"] == "kubewiz_k8s"
+        # kubewiz channels mask the local kubeconfig fields.
+        assert result["kubeconfig_path"] == "(kubewiz)"
+        assert result["kube_context"] == "(kubewiz)"
+
+    @pytest.mark.asyncio
+    async def test_resolve_valueerror_degrades_to_unknown(self):
+        """An invalid override / under-specified scope raises ValueError in
+        resolve(); env_info must degrade to 'unknown' instead of crashing or
+        misrepresenting the misconfiguration as a working kubeconfig cluster."""
+        with patch(
+            "chaos_agent.transports.TransportRegistry.resolve",
+            side_effect=ValueError("host scope requires host_name or ssh_host"),
+        ):
+            result = await compute_env_info()
+        assert result["kube_connection_mode"] == "unknown"
+        # 'unknown' is not a kubewiz channel, so kubeconfig fields are not masked.
+        assert result["kubeconfig_path"] != "(kubewiz)"
+
 
 class TestEnvCache:
     """Test environment info caching behavior."""

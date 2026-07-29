@@ -26,6 +26,8 @@ from typing import Optional
 
 from langchain_core.callbacks import BaseCallbackHandler
 
+from chaos_agent.persistence.task_identity import is_real_task_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -210,8 +212,15 @@ async def _persist_span(task_id: str, span: NodeSpan) -> None:
 
     Also ensures the task row exists in the DB so that
     ``update_task_summary`` can find a row to update.
+
+    Only real ``task-`` identities are persisted (see
+    ``persistence.task_identity``).  Dialogue-level ids describe a
+    conversation, not a task; persisting them would both fabricate a
+    ``tasks`` row and leave orphan spans behind (``task_spans`` is
+    indexed by ``task_id`` but has no foreign key, so bad rows fail
+    silently rather than loudly).
     """
-    if not task_id or task_id.startswith("turn-"):
+    if not is_real_task_id(task_id):
         return
     try:
         from chaos_agent.persistence.task_store import get_task_store
@@ -234,8 +243,11 @@ async def _persist_span(task_id: str, span: NodeSpan) -> None:
 
 
 async def _persist_summary(task_id: str, trace: TaskTrace) -> None:
-    """Update the summary fields on the task_details row in TaskStore."""
-    if not task_id or task_id.startswith("turn-"):
+    """Update the summary fields on the task_details row in TaskStore.
+
+    Same identity guard as :func:`_persist_span`.
+    """
+    if not is_real_task_id(task_id):
         return
     try:
         from chaos_agent.persistence.task_store import get_task_store

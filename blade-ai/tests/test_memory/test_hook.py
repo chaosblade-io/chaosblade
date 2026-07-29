@@ -2,7 +2,7 @@
 
 from unittest.mock import MagicMock
 
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from chaos_agent.memory.context_manager import (
     MAX_CONSECUTIVE_COMPACT_FAILURES,
@@ -382,17 +382,26 @@ class TestPreReasoningHookCircuitBreaker:
 
     async def test_success_resets_consecutive_failures(self, mock_llm):
         cm = MagicMock()
-        cm.check_context.return_value = (["old"], ["recent"], True)
+        # Real messages with a real size difference: the reset only applies to a
+        # compaction that actually freed room. String placeholders count as 0
+        # tokens on both sides, which reads as "freed nothing" and correctly
+        # counts against the breaker instead.
+        bulky = [
+            HumanMessage(content="演练请求" * 500, id="h0"),
+            AIMessage(content="执行注入" * 500, id="a0"),
+        ]
+        slim = [HumanMessage(content="摘要后保留", id="h1")]
+        cm.check_context.return_value = (bulky, slim, True)
         cm.compact_threshold = 0
         tc = MagicMock()
-        tc.compact.return_value = ["old", "recent"]
+        tc.compact.return_value = bulky + slim
 
         hook = PreReasoningHook(cm, tc, MagicMock(), mock_llm)
         # Pre-load a failure count to confirm success clears it.
         hook._tracking["task-Y"] = CompactTrackingState(consecutive_failures=2)
 
         await hook({
-            "messages": ["old", "recent"],
+            "messages": bulky + slim,
             "task_id": "task-Y",
             "compressed_summary": "",
         })

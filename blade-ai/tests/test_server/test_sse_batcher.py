@@ -2,7 +2,66 @@
 
 import time
 
-from chaos_agent.agent.streaming import SSEBatcher, StreamEvent
+import pytest
+
+from chaos_agent.agent.streaming import ProtocolSuffixFilter, SSEBatcher, StreamEvent
+from chaos_agent.server.routes.turn_event_stream import _drain_merged
+
+
+class TestProtocolSuffixFilter:
+    def test_streams_public_reply_and_hides_private_suffix(self):
+        filter_ = ProtocolSuffixFilter("<blade-fault-proposal>")
+
+        assert filter_.feed("请确认目标节点。\n<blade-fault-pro") == "请确认目标节点。\n"
+        assert filter_.feed("posal>{\"faults\":[]}") == ""
+        assert filter_.feed("</blade-fault-proposal>") == ""
+        assert filter_.flush() == ""
+
+    def test_preserves_plain_text_and_incomplete_marker(self):
+        filter_ = ProtocolSuffixFilter("<blade-fault-proposal>")
+
+        assert filter_.feed("你是谁") == "你是谁"
+        assert filter_.feed("\n<blade-f") == "\n"
+        assert filter_.flush() == "<blade-f"
+
+
+@pytest.mark.asyncio
+async def test_intent_reply_is_emitted_as_live_public_sse_tokens():
+    class FakeChunk:
+        def __init__(self, content: str):
+            self.content = content
+
+    class FakeRequest:
+        async def is_disconnected(self) -> bool:
+            return False
+
+    async def merged_events():
+        for content in (
+            "请确认目标节点。\n<blade-fault-pro",
+            'posal>{"faults":[]}</blade-fault-proposal>',
+        ):
+            yield "graph", {
+                "event": "on_chat_model_stream",
+                "data": {"chunk": FakeChunk(content)},
+                "tags": ["langsmith:nodes:intent_clarification"],
+                "metadata": {},
+            }
+
+    frames = [
+        frame
+        async for frame in _drain_merged(
+            merged_events(),
+            "turn-1",
+            SSEBatcher(flush_interval_ms=0),
+            lambda *_args, **_kwargs: None,
+            [],
+            FakeRequest(),
+        )
+    ]
+
+    output = "".join(frames)
+    assert "请确认目标节点。" in output
+    assert "blade-fault-proposal" not in output
 
 
 class TestSSEBatcherDisabled:

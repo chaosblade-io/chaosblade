@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.operation_result import (
+from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.result.operation_result import (
     build_inject_data_from_state,
     build_inject_status_data_from_state,
     build_recover_cli_data_from_state,
@@ -82,6 +82,7 @@ def test_build_recover_data_uses_inject_state_for_fault_and_target():
         "task_state": "partial_recovered",
         "fault_type": "pod-cpu-fullload",
         "blade_uid": "uid-1",
+        "recovery_handle": {"kind": "blade_uid", "value": "uid-1"},
         "duration_ms": 456,
         "fault_spec": _inject_state()["fault_spec"],
         "target": {
@@ -221,6 +222,7 @@ def test_unknown_inject_data_uses_complete_result_card_shape():
         "fault_spec": {},
         "target": {},
         "params": {},
+        "execution_artifacts": [],
         "verification": None,
         "side_effects": None,
         "postmortem": None,
@@ -305,7 +307,7 @@ def test_agent_cli_memory_layers_do_not_depend_on_turn_result_route():
 def test_recover_result_builders_keep_recover_and_inject_lanes_separate():
     """Recover result builders should not project inject facts from recover state."""
 
-    text = (PROJECT_ROOT / "src/chaos_agent/agent/operation_result.py").read_text(
+    text = (PROJECT_ROOT / "src/chaos_agent/agent/result/operation_result.py").read_text(
         encoding="utf-8"
     )
     forbidden_snippets = [

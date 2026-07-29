@@ -280,6 +280,14 @@ class ErrorClass(Enum):
     Examples: ``invalid parameter``, ``invalid argument``, regex mismatch.
     """
 
+    DEPENDENCY_MISSING = "dependency_missing"
+    """A required executable or runtime dependency is unavailable.
+
+    Examples: ``iptables: command not found`` or an executor binary missing
+    from its image.  The target still exists; Phase 1 may select a different
+    execution method, image, or transport.
+    """
+
     TARGET_GONE = "target_gone"
     """Target object disappeared since planning; replan w/ new target.
 
@@ -333,6 +341,7 @@ class ErrorAction(Enum):
 _CLASS_TO_ACTION: dict[ErrorClass, ErrorAction] = {
     ErrorClass.INTERFACE_MISMATCH: ErrorAction.REPLAN,
     ErrorClass.USER_CONFIG: ErrorAction.REPLAN,
+    ErrorClass.DEPENDENCY_MISSING: ErrorAction.REPLAN,
     ErrorClass.TARGET_GONE: ErrorAction.REPLAN,
     ErrorClass.INFRA_TRANSIENT: ErrorAction.SHORT_RETRY,
     ErrorClass.INFRA_PERSISTENT: ErrorAction.END_FAILED,
@@ -366,6 +375,15 @@ _CLASSIFY_RULES: list[tuple[ErrorClass, list[str]]] = [
             "resourcequota",
             "limit exceeded",
             "exceeded the resource limit",
+        ],
+    ),
+    (
+        ErrorClass.DEPENDENCY_MISSING,
+        [
+            "command not found",
+            "executable file not found",
+            "executable not found",
+            "binary not found",
         ],
     ),
     (

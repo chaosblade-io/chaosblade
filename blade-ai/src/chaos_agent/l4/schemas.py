@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from chaos_agent.agent.fault_spec import (
+from chaos_agent.agent.spec.fault_spec import (
     INTENT_ACTION_DESCRIPTION,
     INTENT_SCOPES,
     INTENT_TARGET_DESCRIPTION,
@@ -201,18 +201,17 @@ FAULT_PAYLOAD_SCHEMA: dict = {
         "fault_intent": _FAULT_INTENT_SCHEMA,
         "kubeconfig": {"type": "string"},
         "kube_context": {"type": "string"},
-        # Connection mode for K8s — kubeconfig text OR KubeWiz HTTP gateway.
-        # Not in `required`: blade-ai falls back to settings defaults when
-        # absent. The platform layer (ai-testing-platform) gates completeness
-        # before dispatch.
+        # Explicit channel override — empty means field-based auto inference;
+        # non-empty forces the exact channel. Not in `required`: blade-ai
+        # falls back to settings defaults when absent.
         "kube_connection_mode": {
             "type": "string",
-            "enum": ["kubeconfig", "kubewiz"],
-            "description": "K8s 连接模式：kubeconfig 文本 或 KubeWiz HTTP 网关。",
+            "enum": ["", "kubeconfig", "kubewiz_k8s", "kubewiz_host", "ssh"],
+            "description": "显式通道覆盖：空=按字段自动推断；非空=强制指定通道（kubeconfig/kubewiz_k8s/kubewiz_host/ssh）。",
         },
         "kubewiz_url": {
             "type": "string",
-            "description": "KubeWiz 网关地址（kube_connection_mode=kubewiz 时使用）。",
+            "description": "KubeWiz 网关地址（kubewiz 通道使用）。",
         },
         "kubewiz_cluster_uuid": {
             "type": "string",
@@ -225,6 +224,30 @@ FAULT_PAYLOAD_SCHEMA: dict = {
         "kubewiz_token": {
             "type": "string",
             "description": "KubeWiz 永久 token。",
+        },
+        # Host transport parameters (for host-scope fault injection)
+        "host_name": {
+            "type": "string",
+            "description": "主机名/IP（kubewiz-host 通道用）。",
+        },
+        "ssh_host": {
+            "type": "string",
+            "description": "SSH 主机地址（SSH 通道用）。",
+        },
+        "ssh_user": {
+            "type": "string",
+            "description": "SSH 登录用户。",
+        },
+        "ssh_key_path": {
+            "type": "string",
+            "description": "SSH 私钥路径。",
+        },
+        "ssh_port": {
+            "type": "integer",
+            "default": 22,
+            "minimum": 1,
+            "maximum": 65535,
+            "description": "SSH 端口。",
         },
         "direct": {"type": "boolean", "default": True},
         "auto_recover": {"type": "boolean", "default": True},

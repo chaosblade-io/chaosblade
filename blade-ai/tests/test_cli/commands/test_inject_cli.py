@@ -1,5 +1,7 @@
 """Tests for CLI inject command — Fix E: node-scope namespace validation."""
 
+from unittest.mock import patch
+
 import pytest
 from typer.testing import CliRunner
 
@@ -15,18 +17,23 @@ class TestInjectNodeScopeNamespace:
         """Node-scope inject should succeed without --namespace."""
         # We only validate the CLI parsing — the actual injection will fail
         # without kubeconfig, but the validation should NOT reject it for
-        # missing --namespace.
-        result = runner.invoke(app, [
-            "inject",
-            "--scope", "node",
-            "--target", "disk",
-            "--action", "burn",
-            "-n", "cn-hongkong.10.0.1.120",
-            "-p", "path=/tmp,read,write",
-            "-d", "120",
-            "--direct",
-            "--kubeconfig", "/nonexistent/kubeconfig",
-        ])
+        # missing --namespace. Mock run_command so we don't hit real
+        # preflight network probes (which would hang on a nonexistent cluster).
+        with patch(
+            "chaos_agent.cli.commands.inject.run_command",
+            return_value={"code": 1, "message": "injection skipped in test", "data": {}},
+        ):
+            result = runner.invoke(app, [
+                "inject",
+                "--scope", "node",
+                "--target", "disk",
+                "--action", "burn",
+                "-n", "cn-hongkong.10.0.1.120",
+                "-p", "path=/tmp,read,write",
+                "-d", "120",
+                "--direct",
+                "--kubeconfig", "/nonexistent/kubeconfig",
+            ])
         # The CLI should NOT error with "namespace" requirement for node scope.
         # It may fail later for other reasons (missing kubeconfig, etc.)
         # but should NOT produce the "Provide ... --namespace" error.
@@ -49,17 +56,23 @@ class TestInjectNodeScopeNamespace:
 
     def test_node_scope_direct_without_namespace(self):
         """--direct with node-scope should not require --namespace."""
-        result = runner.invoke(app, [
-            "inject",
-            "--scope", "node",
-            "--target", "cpu",
-            "--action", "fullload",
-            "-n", "node-1",
-            "-p", "cpu-percent=90",
-            "-d", "120",
-            "--direct",
-            "--kubeconfig", "/nonexistent/kubeconfig",
-        ])
+        # Mock run_command to avoid real preflight network probes hanging
+        # on a nonexistent cluster (same rationale as the test above).
+        with patch(
+            "chaos_agent.cli.commands.inject.run_command",
+            return_value={"code": 1, "message": "injection skipped in test", "data": {}},
+        ):
+            result = runner.invoke(app, [
+                "inject",
+                "--scope", "node",
+                "--target", "cpu",
+                "--action", "fullload",
+                "-n", "node-1",
+                "-p", "cpu-percent=90",
+                "-d", "120",
+                "--direct",
+                "--kubeconfig", "/nonexistent/kubeconfig",
+            ])
         # Should NOT complain about missing --namespace
         output = result.output
         if "Error" in output and "--namespace" in output:

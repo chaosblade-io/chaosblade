@@ -2,7 +2,9 @@
 
 import json
 
-from chaos_agent.cli.output import format_output
+import pytest
+
+from chaos_agent.cli.output import format_output, OutputFormat
 
 
 class TestFormatOutput:
@@ -24,10 +26,9 @@ class TestFormatOutput:
         assert "\n" in result
 
     def test_yaml_format(self):
-        """yaml format should produce valid output (yaml if available, else json)."""
+        """yaml format should produce valid YAML output when PyYAML is available."""
         data = {"code": 0, "message": "success"}
         result = format_output(data, "yaml")
-        # Either yaml or json - both should contain the key
         assert "code" in result
         assert "success" in result
 
@@ -49,3 +50,48 @@ class TestFormatOutput:
         # Default should be json
         parsed = json.loads(result)
         assert parsed == data
+
+
+class TestOutputFormatValidation:
+    """Tests for invalid format handling and enum support."""
+
+    def test_invalid_format_raises_valueerror(self):
+        """Unknown format strings raise ValueError instead of silently returning JSON."""
+        with pytest.raises(ValueError, match="Unsupported output format"):
+            format_output({"key": "value"}, "xml")
+
+    def test_typo_format_raises_valueerror(self):
+        """Common typos like 'ymal' raise ValueError."""
+        with pytest.raises(ValueError, match="Unsupported output format"):
+            format_output({"key": "value"}, "ymal")
+
+    def test_yaml_without_pyyaml_raises_valueerror(self):
+        """When PyYAML is unavailable, requesting yaml raises a clear error."""
+        import chaos_agent.cli.output as out_mod
+
+        original = out_mod.HAS_YAML
+        out_mod.HAS_YAML = False
+        try:
+            with pytest.raises(ValueError, match="PyYAML"):
+                format_output({"key": "value"}, "yaml")
+        finally:
+            out_mod.HAS_YAML = original
+
+    def test_output_format_enum_json(self):
+        """OutputFormat.json enum value works with format_output."""
+        data = {"key": "value"}
+        result = format_output(data, OutputFormat.json)
+        parsed = json.loads(result)
+        assert parsed == data
+
+    def test_output_format_enum_yaml(self):
+        """OutputFormat.yaml enum value works with format_output."""
+        data = {"code": 0, "message": "success"}
+        result = format_output(data, OutputFormat.yaml)
+        assert "code" in result
+        assert "success" in result
+
+    def test_output_format_enum_values(self):
+        """OutputFormat enum has correct string values."""
+        assert OutputFormat.json.value == "json"
+        assert OutputFormat.yaml.value == "yaml"

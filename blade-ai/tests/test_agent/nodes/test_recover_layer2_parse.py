@@ -2,7 +2,7 @@
 
 import pytest
 
-from chaos_agent.agent.nodes._recover_layer2_parse import (
+from chaos_agent.agent.nodes.recover._recover_layer2_parse import (
     _detect_recovery_contradiction,
     _detect_recovery_checklist_inconsistency,
     _parse_recovery_verification_result,

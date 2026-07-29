@@ -3,17 +3,18 @@
 import json
 from unittest.mock import AsyncMock, patch
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 
 import pytest
 
-from chaos_agent.agent.nodes.agent_loop import agent_loop
-from chaos_agent.agent.nodes.execute_loop import execute_loop
-from chaos_agent.agent.nodes.memory_nodes import load_memory, save_memory
-from chaos_agent.agent.nodes.reject import reject
-from chaos_agent.agent.nodes.safety_check import safety_check
-from chaos_agent.agent.nodes.verifier import verifier
+from chaos_agent.agent.nodes.execute.agent_loop import agent_loop
+from chaos_agent.agent.nodes.execute.execute_loop import execute_loop
+from chaos_agent.agent.nodes.store.memory_nodes import load_memory, save_memory
+from chaos_agent.agent.nodes.gates.reject import reject
+from chaos_agent.agent.nodes.gates.safety_check import safety_check
+from chaos_agent.agent.nodes.verify.verifier import verifier
 from chaos_agent.agent.router import (
+    route_after_phase1_tools,
     should_continue_agent_loop,
     should_continue_execute_loop,
     route_after_safety,
@@ -21,6 +22,21 @@ from chaos_agent.agent.router import (
     route_after_baseline,
 )
 from chaos_agent.config.settings import settings
+
+
+def _finish_planning_messages(spec_dict: dict) -> list:
+    """Build a Phase 1 completion signal. finish_planning is a pure 'planning
+    complete' marker — the reviewed FaultSpec in state is the sole authority,
+    so no contract is re-declared here."""
+    call = {
+        "name": "finish_planning",
+        "id": "finish-1",
+        "args": {"summary": "planning complete"},
+    }
+    return [
+        AIMessage(content="", tool_calls=[call]),
+        ToolMessage(content="Planning finalized", name="finish_planning", tool_call_id="finish-1"),
+    ]
 
 
 class TestInjectGraphFlow:
@@ -36,8 +52,8 @@ class TestInjectGraphFlow:
         monkeypatch.setattr(settings, "max_execute_loop", 15)
         monkeypatch.setattr(settings, "safety_blacklist_namespaces", "kube-system,kube-public")
 
-        import chaos_agent.agent.nodes.agent_loop as al_mod
-        import chaos_agent.agent.nodes.execute_loop as el_mod
+        import chaos_agent.agent.nodes.execute.agent_loop as al_mod
+        import chaos_agent.agent.nodes.execute.execute_loop as el_mod
         monkeypatch.setattr(al_mod, "MAX_AGENT_LOOP", 10)
         monkeypatch.setattr(el_mod, "MAX_EXECUTE_LOOP", 15)
 
@@ -58,8 +74,9 @@ class TestInjectGraphFlow:
         state["plan"] = "Delete pod my-pod using pod-delete skill"
         state["skill_name"] = "pod-delete"
 
-        # Step 3: Route after agent_loop → extract_planning_metadata
-        route = should_continue_agent_loop(state)
+        # Step 3: an explicit FaultSpec declaration completes Phase 1.
+        state["messages"] = _finish_planning_messages(state["fault_spec"])
+        route = route_after_phase1_tools(state)
         assert route == "extract_planning_metadata"
 
         # Step 4: safety_check
@@ -92,9 +109,9 @@ class TestInjectGraphFlow:
         assert route == "verifier"
 
         # Step 9: verifier (with mocked blade_status returning Running)
-        with patch("chaos_agent.tools.blade.run_command", new_callable=AsyncMock) as mock_run:
+        with patch("chaos_agent.tools.blade.execute_via_transport", new_callable=AsyncMock) as mock_exec:
             from chaos_agent.tools.shell import CommandResult
-            mock_run.return_value = CommandResult(
+            mock_exec.return_value = CommandResult(
                 exit_code=0,
                 stdout=json.dumps({
                     "code": 200, "success": True,
@@ -120,14 +137,14 @@ class TestInjectGraphFlow:
         monkeypatch.setattr(settings, "max_agent_loop", 10)
         monkeypatch.setattr(settings, "safety_blacklist_namespaces", "kube-system,kube-public")
 
-        import chaos_agent.agent.nodes.agent_loop as al_mod
+        import chaos_agent.agent.nodes.execute.agent_loop as al_mod
         monkeypatch.setattr(al_mod, "MAX_AGENT_LOOP", 10)
 
         state = sample_agent_state.copy()
         # Override fault_spec to target the blacklisted namespace —
         # the fixture's default spec is in "default" namespace which
         # would pass the blacklist check.
-        from chaos_agent.agent.fault_spec import FaultSpec
+        from chaos_agent.agent.spec.fault_spec import FaultSpec
         state["fault_spec"] = FaultSpec.from_cli_structured({
             "scope": "pod", "target": "kill", "action": "delete",
             "namespace": "kube-system", "target_name": "coredns",
@@ -140,8 +157,9 @@ class TestInjectGraphFlow:
         result = await agent_loop(state)
         state.update(result)
 
-        # Route → extract_planning_metadata
-        route = should_continue_agent_loop(state)
+        # The structured FaultSpec declaration completes Phase 1.
+        state["messages"] = _finish_planning_messages(state["fault_spec"])
+        route = route_after_phase1_tools(state)
         assert route == "extract_planning_metadata"
 
         # safety_check should reject
@@ -166,7 +184,7 @@ class TestInjectGraphFlow:
         monkeypatch.setattr(settings, "max_agent_loop", 10)
         monkeypatch.setattr(settings, "safety_blacklist_namespaces", "kube-system")
 
-        import chaos_agent.agent.nodes.agent_loop as al_mod
+        import chaos_agent.agent.nodes.execute.agent_loop as al_mod
         monkeypatch.setattr(al_mod, "MAX_AGENT_LOOP", 10)
 
         state = sample_agent_state.copy()
@@ -184,8 +202,8 @@ class TestInjectGraphFlow:
         assert route == "confirmation_gate"
 
         # Simulate user approval
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved"):
-            from chaos_agent.agent.nodes.confirmation_gate import confirmation_gate
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved"):
+            from chaos_agent.agent.nodes.gates.confirmation_gate import confirmation_gate
             result = await confirmation_gate(state)
             state.update(result)
 
@@ -212,8 +230,8 @@ class TestInjectGraphFlow:
         state["safety_status"] = "safe"
 
         # Simulate user rejection
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="rejected"):
-            from chaos_agent.agent.nodes.confirmation_gate import confirmation_gate
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="rejected"):
+            from chaos_agent.agent.nodes.gates.confirmation_gate import confirmation_gate
             result = await confirmation_gate(state)
             state.update(result)
 
@@ -231,7 +249,7 @@ class TestInjectGraphFlow:
     async def test_max_loop_exceeded_flow(self, sample_agent_state, monkeypatch):
         """Test inject flow when agent_loop exceeds max iterations with a skill active."""
         monkeypatch.setattr(settings, "max_agent_loop", 2)
-        import chaos_agent.agent.nodes.agent_loop as al_mod
+        import chaos_agent.agent.nodes.execute.agent_loop as al_mod
         monkeypatch.setattr(al_mod, "MAX_AGENT_LOOP", 2)
 
         state = sample_agent_state.copy()

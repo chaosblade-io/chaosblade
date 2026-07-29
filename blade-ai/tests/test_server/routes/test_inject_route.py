@@ -1,6 +1,6 @@
 """Tests for inject route: POST /api/v1/inject."""
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -227,3 +227,98 @@ class TestInjectRoute:
             },
         )
         assert response.status_code == 422
+
+
+class TestInjectRouteTransportForwarding:
+    """Guard the route→state_builder wiring for transport/kubewiz fields.
+
+    Without this, a future refactor could silently drop a field (e.g. profile
+    or ssh_host) from build_inject_initial_state and no test would catch it.
+    """
+
+    def test_transport_fields_forwarded_to_state_builder(self, test_client):
+        with patch(
+            "chaos_agent.server.routes.inject.build_inject_initial_state",
+            return_value={},
+        ) as mock_builder:
+            response = test_client.post(
+                "/api/v1/inject",
+                json={
+                    "scope": "node",
+                    "target": "disk",
+                    "action": "fill",
+                    "target_name": "node-a",
+                    "namespace": "default",
+                    "kube_connection_mode": "ssh",
+                    "cluster_uuid": "uuid-xyz",
+                    "profile": "prof-1",
+                    "host_name": "node-a",
+                    "ssh_host": "10.0.0.9",
+                    "ssh_user": "root",
+                    "ssh_key_path": "/keys/id",
+                    "ssh_port": 2222,
+                },
+            )
+        assert response.status_code == 200
+        assert mock_builder.called
+        kwargs = mock_builder.call_args.kwargs
+        # cluster_uuid/profile map to the kubewiz_* builder params.
+        assert kwargs["kubewiz_cluster_uuid"] == "uuid-xyz"
+        assert kwargs["kubewiz_profile"] == "prof-1"
+        assert kwargs["kube_connection_mode"] == "ssh"
+        assert kwargs["host_name"] == "node-a"
+        assert kwargs["ssh_host"] == "10.0.0.9"
+        assert kwargs["ssh_user"] == "root"
+        assert kwargs["ssh_key_path"] == "/keys/id"
+        assert kwargs["ssh_port"] == 2222
+
+    def test_transport_fields_forwarded_stream_route(self):
+        """/inject-stream shares the identical wiring; guard it too.
+
+        The SSE generator downstream is hard to mock deterministically, so we
+        short-circuit via build_inject_initial_state side_effect right after it
+        captures its kwargs — the wiring (request -> builder) is what we assert.
+        """
+        from fastapi import FastAPI
+
+        app = FastAPI()
+        app.state.agents = {"pipeline": AsyncMock()}
+        app.state.task_tracker = TaskTracker()
+        # Importing the module registers POST /inject-stream on inject_router.
+        import chaos_agent.server.routes.inject_stream  # noqa: F401
+        from chaos_agent.server.routes.inject import inject_router
+        app.include_router(inject_router)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        with patch(
+            "chaos_agent.server.routes.inject_stream.build_inject_initial_state",
+            side_effect=RuntimeError("stop-after-capture"),
+        ) as mock_builder:
+            client.post(
+                "/api/v1/inject-stream",
+                json={
+                    "scope": "node",
+                    "target": "disk",
+                    "action": "fill",
+                    "target_name": "node-a",
+                    "namespace": "default",
+                    "kube_connection_mode": "ssh",
+                    "cluster_uuid": "uuid-xyz",
+                    "profile": "prof-1",
+                    "host_name": "node-a",
+                    "ssh_host": "10.0.0.9",
+                    "ssh_user": "root",
+                    "ssh_key_path": "/keys/id",
+                    "ssh_port": 2222,
+                },
+            )
+        assert mock_builder.called
+        kwargs = mock_builder.call_args.kwargs
+        assert kwargs["kubewiz_cluster_uuid"] == "uuid-xyz"
+        assert kwargs["kubewiz_profile"] == "prof-1"
+        assert kwargs["kube_connection_mode"] == "ssh"
+        assert kwargs["host_name"] == "node-a"
+        assert kwargs["ssh_host"] == "10.0.0.9"
+        assert kwargs["ssh_user"] == "root"
+        assert kwargs["ssh_key_path"] == "/keys/id"
+        assert kwargs["ssh_port"] == 2222

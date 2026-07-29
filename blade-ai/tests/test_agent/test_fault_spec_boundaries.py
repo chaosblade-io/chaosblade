@@ -14,7 +14,7 @@ def test_result_and_finalize_paths_do_not_read_legacy_target_params_directly():
             'values_fin.get("target")',
             'values_fin.get("params")',
         ],
-        "src/chaos_agent/agent/operation_result.py": [
+        "src/chaos_agent/agent/result/operation_result.py": [
             'values.get("target")',
             'values.get("params")',
         ],
@@ -26,7 +26,7 @@ def test_result_and_finalize_paths_do_not_read_legacy_target_params_directly():
             'values_fin.get("target")',
             'values_fin.get("params")',
         ],
-        "src/chaos_agent/agent/nodes/memory_nodes.py": [
+        "src/chaos_agent/agent/nodes/store/memory_nodes.py": [
             'state.get("target")',
             'state.get("params")',
         ],
@@ -47,9 +47,9 @@ def test_result_reporting_paths_use_fault_type_projection_helper():
 
     checked_files = [
         "src/chaos_agent/agent/state.py",
-        "src/chaos_agent/agent/operation_summary.py",
-        "src/chaos_agent/agent/operation_result.py",
-        "src/chaos_agent/agent/nodes/batch_next.py",
+        "src/chaos_agent/agent/result/operation_summary.py",
+        "src/chaos_agent/agent/result/operation_result.py",
+        "src/chaos_agent/agent/nodes/batch/batch_next.py",
         "src/chaos_agent/agent/postmortem/builder.py",
         "src/chaos_agent/agent/experience.py",
     ]
@@ -75,7 +75,7 @@ def test_cli_recover_display_projects_params_from_fault_spec_helper():
     """CLI recover display should not read legacy params as source of truth."""
 
     runner_text = (PROJECT_ROOT / "src/chaos_agent/cli/runner.py").read_text(encoding="utf-8")
-    result_text = (PROJECT_ROOT / "src/chaos_agent/agent/operation_result.py").read_text(encoding="utf-8")
+    result_text = (PROJECT_ROOT / "src/chaos_agent/agent/result/operation_result.py").read_text(encoding="utf-8")
 
     assert 'state_values.get("params")' not in runner_text
     assert "build_recover_cli_data_from_state" in runner_text
@@ -86,8 +86,8 @@ def test_recover_snapshot_paths_share_fault_name_parser():
     """Recover rebuild paths should not keep private fault name parsers."""
 
     checked_files = [
-        "src/chaos_agent/agent/recovery_state.py",
-        "src/chaos_agent/agent/task_snapshot.py",
+        "src/chaos_agent/agent/state_mgmt/recovery_state.py",
+        "src/chaos_agent/agent/result/task_snapshot.py",
     ]
 
     violations = []
@@ -105,9 +105,9 @@ def test_approved_target_writers_freeze_from_fault_spec():
     """Nodes that write approved_target should not hand-roll legacy pieces."""
 
     checked_files = [
-        "src/chaos_agent/agent/nodes/confirmation_gate.py",
-        "src/chaos_agent/agent/nodes/safety_check.py",
-        "src/chaos_agent/agent/nodes/tool_screener.py",
+        "src/chaos_agent/agent/nodes/gates/confirmation_gate.py",
+        "src/chaos_agent/agent/nodes/gates/safety_check.py",
+        "src/chaos_agent/agent/nodes/planning/tool_screener.py",
     ]
 
     violations = []
@@ -137,7 +137,7 @@ def test_explanation_layers_read_outcome_through_helpers():
             'state.get("result"',
             'state.get("skill_name"',
         ],
-        "src/chaos_agent/agent/nodes/memory_nodes.py": [
+        "src/chaos_agent/agent/nodes/store/memory_nodes.py": [
             'state.get("error"',
             'state.get("failure_detail"',
             'state.get("result"',

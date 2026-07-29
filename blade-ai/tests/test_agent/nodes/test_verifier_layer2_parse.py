@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from chaos_agent.agent.nodes._verifier_layer2_parse import (
+from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
     _parse_numeric,
     _metric_alias,
     _pick_metric_by_context,

@@ -13,13 +13,19 @@ from langchain_core.messages import SystemMessage, RemoveMessage
 from chaos_agent.agent.node_names import MEMORY_HOOK, TOOL_RESULT
 from chaos_agent.memory.compactor import compact_memory
 from chaos_agent.memory.context_manager import (
+    COMPRESSED_HISTORY_PREFIX,
+    INEFFECTIVE_COMPACTION_RATIO,
     MAX_CONSECUTIVE_COMPACT_FAILURES,
     CompactTrackingState,
     ContextManager,
     strip_large_outputs,
 )
 from chaos_agent.memory.session_store import SessionStore
-from chaos_agent.memory.tokens import count_tokens, count_tokens_messages
+from chaos_agent.memory.tokens import (
+    count_tokens,
+    count_tokens_messages,
+    estimate_context_tokens,
+)
 from chaos_agent.memory.tool_compactor import ToolResultCompactor
 from chaos_agent.utils.time import now_iso
 
@@ -147,7 +153,7 @@ def _extract_tool_metrics(messages: list) -> None:
     # Lazy import to avoid a circular import (hook is imported by graph
     # construction; the extractor lives under agent.nodes which itself
     # transitively pulls in fault_spec and other graph-adjacent modules).
-    from chaos_agent.agent.nodes._metric_extractor import extract_metrics
+    from chaos_agent.agent.nodes.verify._metric_extractor import extract_metrics
 
     parent_index: dict[str, object] | None = None  # built lazily on first need
 
@@ -338,6 +344,7 @@ class PreReasoningHook:
         visibly drop in real time when that happens."""
         try:
             from chaos_agent.observability.status_tracker import (
+                TUI_TRACKER_PREFIX,
                 get_tracker,
                 StatusEvent,
             )
@@ -369,7 +376,7 @@ class PreReasoningHook:
                     tracker.emit(event)
             tui_sid = self._state_tui_session_id or ""
             if tui_sid:
-                tui_tracker = get_tracker(f"tui-{tui_sid}")
+                tui_tracker = get_tracker(f"{TUI_TRACKER_PREFIX}{tui_sid}")
                 if tui_tracker:
                     tui_tracker.emit(event)
         except Exception:
@@ -464,11 +471,10 @@ class PreReasoningHook:
             # Tool compaction modifies messages in-place (same IDs, changed content).
             # No state update needed — the message objects in state are already modified.
             # Write memory status to session file (always), but do NOT show in CLI.
-            # safe_count = raw × per-quality margin (1.0/1.05/1.20).
-            # Replaces the global ``× 1.2`` fudge; the multiplier now
-            # tracks how accurate the underlying tokenizer actually is
-            # for the configured model.
-            total_tokens = count_tokens_messages(messages).safe_count
+            # Anchored on provider usage so the reported figure includes the
+            # system prompt and tool schemas, which a message-list count cannot
+            # see (measured 6,936 vs 11 tokens on a drill's first call).
+            total_tokens = estimate_context_tokens(messages).safe_tokens
             self._persist_to_session(
                 task_id,
                 f"Memory OK: {len(messages)} messages, ~{total_tokens} tokens",
@@ -488,7 +494,19 @@ class PreReasoningHook:
         # input = cheaper call), then fall through to compact_memory.
         if not force:
             combined = stripped + to_keep
-            combined_tokens = count_tokens_messages(combined).safe_count
+            # Same ruler as the trigger. ``combined`` is hypothetical — the
+            # provider never received it — so its usage anchors say nothing about
+            # its size, but the invisible overhead (system prompt, tool schemas)
+            # will still be there when it IS sent. Measuring bare text here while
+            # the trigger measures provider-anchored totals would understate this
+            # side by 13K+, so strip could look sufficient to a check the trigger
+            # then keeps rejecting. Stripping is idempotent, so that pair is a
+            # loop — and this cheap path reports no failure for the circuit
+            # breaker to act on.
+            usage = estimate_context_tokens(messages)
+            combined_tokens = usage.project(
+                count_tokens_messages(combined).safe_count
+            )
             if combined_tokens < self.context_manager.compact_threshold:
                 logger.info(
                     f"Aggressive tool truncation sufficient: {combined_tokens} tokens "
@@ -521,6 +539,14 @@ class PreReasoningHook:
             for msg in to_compact
             if isinstance(getattr(msg, "content", ""), str)
         )
+        # Separate figure for the circuit breaker, because the one above measures
+        # only ``to_compact`` — the slice being summarised. Comparing that against
+        # a post-compaction total (``to_keep`` + summary) pits two different
+        # message sets against each other: with a small ``to_compact`` and a large
+        # ``to_keep``, a genuine 2,146-vs-2,670 reduction reads as 2,146-vs-500
+        # and is scored a failure. The breaker needs the same set before and
+        # after, i.e. the whole context.
+        context_before = estimate_context_tokens(messages).safe_tokens
 
         logger.info(
             f"Compacting {len(to_compact)} messages for task {task_id}"
@@ -559,27 +585,102 @@ class PreReasoningHook:
             )
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            # Post-compaction view used by circuit breaker logic — safe_count
-            # so a still-too-large kept slice errs toward "didn't make
-            # progress" rather than masking a failed compaction.
-            tokens_after = count_tokens_messages(to_keep).safe_count
-            # Circuit breaker bookkeeping: a successful compaction
-            # resets the consecutive-failure counter (so a transient
-            # LLM outage doesn't permanently trip the breaker once the
-            # provider recovers) and marks this turn as compacted.
-            tracking.consecutive_failures = 0
+            # The circuit-breaker question is "is the context smaller than
+            # before?", so the measurement has to be the context that will
+            # actually exist afterwards: the kept slice PLUS the summary being
+            # appended. Measuring ``to_keep`` alone hides the summary's own cost,
+            # and the summary is not small — with a 4.5K summary against a 10.2K
+            # history, the kept-only view reads 5.1K ("effective") while the real
+            # post-compaction context is 12.6K, i.e. LARGER than what it
+            # replaced. That is exactly the runaway this check exists to catch,
+            # so it must not be the one case the check misses.
+            # The prefix comes from the constant, not a literal: it is what
+            # ``_is_compressed_history`` matches on, and every summary-aware
+            # decision (which summaries to retain, which to recycle) keys off
+            # that match. A literal here would let the two drift apart, and the
+            # failure would be silent — summaries simply stop being recognised
+            # as summaries and all of that logic quietly stops applying.
+            summary_message = SystemMessage(
+                content=f"{COMPRESSED_HISTORY_PREFIX}\n{summary}"
+            )
+            # Projected through the same overhead as ``context_before``, so
+            # the before/after comparison is between two like quantities. Using
+            # bare text here against a provider-anchored "before" would make
+            # every compaction look like it freed the entire invisible overhead.
+            tokens_after = estimate_context_tokens(messages).project(
+                count_tokens_messages(list(to_keep) + [summary_message]).safe_count
+            )
+            # Circuit breaker bookkeeping. "Succeeded" is not the same as
+            # "helped": an LLM call that returns a summary while freeing almost
+            # nothing leaves the context just as full, and the next turn will
+            # try again — each attempt burning a call and appending another
+            # summary. Treating that as a failure is what lets the breaker stop
+            # the loop; unconditionally resetting the counter here is precisely
+            # what kept it from ever engaging.
+            ineffective = tokens_after >= context_before * INEFFECTIVE_COMPACTION_RATIO
+            if ineffective and not force:
+                tracking.consecutive_failures += 1
+                logger.warning(
+                    f"Compaction freed almost nothing for task {task_id}: "
+                    f"{context_before} → {tokens_after} tokens "
+                    f"(failures: {tracking.consecutive_failures}/"
+                    f"{MAX_CONSECUTIVE_COMPACT_FAILURES}). Context is dominated "
+                    f"by content that cannot be compacted; further attempts "
+                    f"will keep spending LLM calls without reducing usage."
+                )
+            elif ineffective:
+                # Manual /compact does NOT feed the breaker. ``check_context``
+                # already exempts force from it ("the breaker exists to protect
+                # the auto-trigger loop... a user pressing /compact wants a
+                # retry"), and letting manual runs increment the counter would be
+                # worse than ignoring it: three deliberate /compact presses on a
+                # context dominated by incompressible content would trip the
+                # breaker and silently disable AUTOMATIC compaction for the rest
+                # of the session. Still reported, so the user learns it did not
+                # help.
+                logger.warning(
+                    f"Manual compaction freed almost nothing for task {task_id}: "
+                    f"{context_before} → {tokens_after} tokens. Context is "
+                    f"dominated by content that cannot be compacted. Not counted "
+                    f"against the auto-compaction circuit breaker."
+                )
+            else:
+                # A genuinely effective compaction clears the counter, so a
+                # transient LLM outage doesn't permanently trip the breaker
+                # once the provider recovers.
+                tracking.consecutive_failures = 0
             tracking.compacted = True
             tracking.turn_count += 1
+            if not ineffective:
+                event_message = (
+                    f"Compression done: {len(to_compact)} messages compressed "
+                    f"({duration_ms:.0f}ms)"
+                )
+            elif force:
+                # No breaker count to quote here — manual runs do not increment
+                # it, and printing the counter would show a stale figure left by
+                # the automatic path, reading as if this press had contributed.
+                event_message = (
+                    f"Compression freed almost nothing: {context_before} → "
+                    f"{tokens_after} tokens (not counted against auto-compaction)"
+                )
+            else:
+                event_message = (
+                    f"Compression freed almost nothing: {context_before} → "
+                    f"{tokens_after} tokens ({tracking.consecutive_failures}/"
+                    f"{MAX_CONSECUTIVE_COMPACT_FAILURES})"
+                )
             self._emit_compaction_event(
                 task_id,
-                "completed",
-                f"Compression done: {len(to_compact)} messages compressed ({duration_ms:.0f}ms)",
+                "failed" if ineffective else "completed",
+                event_message,
                 category="node",
                 duration_ms=duration_ms,
                 detail={
                     "messages_compacted": len(to_compact),
-                    "tokens_before": total_tokens_before,
+                    "tokens_before": context_before,
                     "tokens_after": tokens_after,
+                    "ineffective": ineffective,
                 },
             )
         except Exception as e:
@@ -601,10 +702,14 @@ class PreReasoningHook:
             return obs_update
 
         # 5. Build LangGraph-compatible state update:
-        #    Remove compacted messages + add incremental summary message
-        #    Incremental: each summary is a separate [Compressed History] entry,
-        #    never re-compresses previous summaries (they are in to_keep).
-        summary_message = SystemMessage(content=f"[Compressed History]\n{summary}")
+        #    Remove compacted messages + add the new summary message.
+        #    ``summary_message`` was built above (inside the try) so the circuit
+        #    breaker could weigh it; the except branch returns early, so reaching
+        #    here means it exists.
+        #    Older [Compressed History] entries are NOT preserved indefinitely —
+        #    ``check_context`` keeps only the newest ``SUMMARIES_KEPT_VERBATIM``
+        #    and routes the rest into ``to_compact``, where this summary absorbs
+        #    them. Retaining them all is what made context grow monotonically.
 
         remove_messages = []
         for msg in to_compact:
@@ -612,18 +717,14 @@ class PreReasoningHook:
             if msg_id:
                 remove_messages.append(RemoveMessage(id=msg_id))
 
-        # Append new summary (don't replace previous summaries)
-        # The previous [Compressed History] messages are in to_keep and untouched.
-        # Emit the post-compaction state size so the Footer indicator
-        # visibly drops in real time when the summary lands. safe_count
-        # keeps Footer / circuit-breaker math consistent with the same
-        # threshold semantics used at the entry check above.
+        # Emit the post-compaction state size so the Footer indicator visibly
+        # drops in real time when the summary lands. This is the same figure the
+        # circuit breaker weighed (``tokens_after``) — one measurement, so the
+        # UI and the breaker can never tell different stories about whether
+        # compaction helped.
         post_compaction_messages = list(to_keep) + [summary_message]
-        post_compaction_tokens = count_tokens_messages(
-            post_compaction_messages,
-        ).safe_count
         self._emit_context_size_snapshot(
-            task_id, post_compaction_tokens, len(post_compaction_messages),
+            task_id, tokens_after, len(post_compaction_messages),
         )
         return {
             **obs_update,
@@ -704,6 +805,7 @@ class PreReasoningHook:
         # 1. Emit to status tracker (real-time CLI observability)
         try:
             from chaos_agent.observability.status_tracker import (
+                TUI_TRACKER_PREFIX,
                 get_tracker,
                 StatusEvent,
             )
@@ -736,7 +838,7 @@ class PreReasoningHook:
             # intent_clarification.
             tui_sid = self._state_tui_session_id or ""
             if tui_sid:
-                tui_tracker = get_tracker(f"tui-{tui_sid}")
+                tui_tracker = get_tracker(f"{TUI_TRACKER_PREFIX}{tui_sid}")
                 if tui_tracker:
                     tui_tracker.emit(event)
         except Exception:

@@ -7,7 +7,7 @@ Architecture:
     needs over HTTP, with all logic delegated to
     ``chaos_agent.config.wizard_validators`` (single source of truth
     shared with the legacy Python Rich wizard) and
-    ``chaos_agent.tui.config_store.ConfigStore`` (existing canonical
+    ``chaos_agent.config.config_store.ConfigStore`` (existing canonical
     config writer).
 
 Endpoints:
@@ -36,7 +36,7 @@ from fastapi import Body, Request
 from chaos_agent.config import wizard_validators
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode
 from chaos_agent.server.routes import wizard_router
-from chaos_agent.tui.config_store import ConfigStore
+from chaos_agent.config.config_store import ConfigStore
 
 logger = logging.getLogger(__name__)
 

@@ -53,8 +53,8 @@ async def test_recover_initial_state_uses_checkpoint_when_available():
 
 @pytest.mark.asyncio
 async def test_recover_initial_state_uses_resolver_without_checkpoint(monkeypatch):
-    from chaos_agent.agent.task_snapshot import RecoverInitialResolution
-    from chaos_agent.agent import task_snapshot
+    from chaos_agent.agent.result.task_snapshot import RecoverInitialResolution
+    from chaos_agent.agent.result import task_snapshot
 
     async def fake_resolve(task_id, *, record_task_id, agents, checkpoint_values, **kwargs):
         assert task_id == "task-inject"
@@ -105,7 +105,7 @@ async def test_recover_initial_state_uses_resolver_without_checkpoint(monkeypatc
 
 @pytest.mark.asyncio
 async def test_recover_initial_state_raises_when_resolver_misses(monkeypatch):
-    from chaos_agent.agent import task_snapshot
+    from chaos_agent.agent.result import task_snapshot
 
     async def fake_resolve(*args, **kwargs):
         return None

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import typer
 
-from chaos_agent.cli.output import format_output
+from chaos_agent.cli.output import OutputFormat, format_output
 from chaos_agent.config.settings import settings
 from chaos_agent.preflight import LIST_CHECKS, check_blade, run_command
 
@@ -18,7 +18,7 @@ def _get_output_path() -> Path:
 
 
 def capabilities_sync(
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json|yaml"),
+    output: OutputFormat = typer.Option(OutputFormat.json, "--output", "-o", help="Output format: json|yaml"),
 ):
     """Sync skill capabilities: probe blade + LLM generate commands for each case.
 

@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from chaos_agent.agent.nodes.plan_builder import (
+from chaos_agent.agent.nodes.planning.plan_builder import (
     MAX_PLAN_BUILDER_ROUNDS,
     PRESENT_OPTIONS_TOOL,
     SUBMIT_PLAN_TOOL,
@@ -13,6 +13,7 @@ from chaos_agent.agent.nodes.plan_builder import (
     _extract_submit_plan,
     _filter_internal_from_response,
     _get_tool_call_id,
+    _validate_submit_plan,
     make_plan_builder,
 )
 
@@ -57,10 +58,10 @@ def _submit_plan_tc(faults=None, call_id="call_sub1"):
     }
 
 
-def _kubectl_ro_tc(call_id="call_kube1"):
-    """Build a kubectl_ro tool_call dict."""
+def _kubectl_read_tc(call_id="call_kube1"):
+    """Build a kubectl_read tool_call dict."""
     return {
-        "name": "kubectl_ro",
+        "name": "kubectl_read",
         "id": call_id,
         "args": {"command": "get namespaces"},
     }
@@ -102,7 +103,7 @@ class TestExtractionHelpers:
         assert "faults" in result
 
     def test_extract_submit_plan_not_found(self):
-        tcs = [_kubectl_ro_tc()]
+        tcs = [_kubectl_read_tc()]
         assert _extract_submit_plan(tcs) is None
 
     def test_extract_present_options_found(self):
@@ -113,7 +114,7 @@ class TestExtractionHelpers:
         assert len(result["options"]) == 2
 
     def test_extract_present_options_not_found(self):
-        tcs = [_kubectl_ro_tc()]
+        tcs = [_kubectl_read_tc()]
         assert _extract_present_options(tcs) is None
 
     def test_get_tool_call_id_found(self):
@@ -121,29 +122,29 @@ class TestExtractionHelpers:
         assert _get_tool_call_id(tcs, "present_options") == "abc123"
 
     def test_get_tool_call_id_fallback(self):
-        tcs = [_kubectl_ro_tc()]
+        tcs = [_kubectl_read_tc()]
         result = _get_tool_call_id(tcs, "present_options")
         assert result.startswith("call_")
 
     def test_filter_internal_strips_present_options(self):
         response = AIMessage(
             content="some text",
-            tool_calls=[_present_options_tc(), _kubectl_ro_tc()],
+            tool_calls=[_present_options_tc(), _kubectl_read_tc()],
         )
         filtered = _filter_internal_from_response(response)
         assert len(filtered.tool_calls) == 1
-        assert filtered.tool_calls[0]["name"] == "kubectl_ro"
+        assert filtered.tool_calls[0]["name"] == "kubectl_read"
         assert filtered.content == "some text"
 
     def test_filter_internal_strips_submit_plan(self):
         response = AIMessage(
             content="",
-            tool_calls=[_submit_plan_tc(), _kubectl_ro_tc()],
+            tool_calls=[_submit_plan_tc(), _kubectl_read_tc()],
         )
         filtered = _filter_internal_from_response(response)
         names = [tc["name"] for tc in filtered.tool_calls]
         assert "submit_plan" not in names
-        assert "kubectl_ro" in names
+        assert "kubectl_read" in names
 
 
 # ── Node behavior ────────────────────────────────────────────────────────────
@@ -168,12 +169,49 @@ class TestPlanBuilderNode:
         llm = _make_mock_llm(response)
         node = make_plan_builder(llm=llm)
 
-        with patch("chaos_agent.agent.nodes.plan_builder.interrupt"):
+        with patch("chaos_agent.agent.nodes.planning.plan_builder.interrupt"):
             result = await node(_make_state())
 
         assert result["plan_confirmed"] is True
         assert result["fault_spec"] is not None
         assert result["fault_spec"]["namespace"] == "cms-demo"
+
+    @pytest.mark.asyncio
+    async def test_expert_mode_does_not_bind_option_card_tool(self):
+        """Expert mode is a separate transition contract, not prompt prose."""
+        response = _make_ai_response(tool_calls=[_submit_plan_tc()])
+        bound = AsyncMock()
+        bound.ainvoke = AsyncMock(return_value=response)
+        llm = AsyncMock()
+        captured = []
+
+        def bind_tools(schemas):
+            captured.extend(schemas)
+            return bound
+
+        llm.bind_tools = bind_tools
+        result = await make_plan_builder(llm=llm)(
+            _make_state(planning_mode="expert")
+        )
+
+        schema_names = [item["name"] for item in captured if isinstance(item, dict)]
+        assert "submit_plan" in schema_names
+        assert "present_options" not in schema_names
+        assert result["planning_mode"] == "expert"
+
+    @pytest.mark.asyncio
+    async def test_expert_mode_repairs_stale_option_call_without_interrupt(self):
+        options_response = _make_ai_response(tool_calls=[_present_options_tc()])
+        submit_response = _make_ai_response(tool_calls=[_submit_plan_tc()])
+        llm = _make_mock_llm(options_response, submit_response)
+
+        with patch("chaos_agent.agent.nodes.planning.plan_builder.interrupt") as interrupt:
+            result = await make_plan_builder(llm=llm)(
+                _make_state(planning_mode="expert")
+            )
+
+        interrupt.assert_not_called()
+        assert result["plan_confirmed"] is True
 
     @pytest.mark.asyncio
     async def test_present_options_calls_interrupt(self):
@@ -185,7 +223,7 @@ class TestPlanBuilderNode:
         node = make_plan_builder(llm=llm)
 
         with patch(
-            "chaos_agent.agent.nodes.plan_builder.interrupt",
+            "chaos_agent.agent.nodes.planning.plan_builder.interrupt",
             return_value="A",
         ) as mock_interrupt:
             result = await node(_make_state())
@@ -206,7 +244,7 @@ class TestPlanBuilderNode:
         node = make_plan_builder(llm=llm)
 
         with patch(
-            "chaos_agent.agent.nodes.plan_builder.interrupt",
+            "chaos_agent.agent.nodes.planning.plan_builder.interrupt",
             return_value="rejected",
         ):
             result = await node(_make_state())
@@ -217,22 +255,22 @@ class TestPlanBuilderNode:
 
     @pytest.mark.asyncio
     async def test_real_tools_return_to_toolnode(self):
-        """Priority 3: kubectl_ro → return for ToolNode execution."""
+        """Priority 3: kubectl_read → return for ToolNode execution."""
         response = _make_ai_response(
             content="Let me check namespaces",
-            tool_calls=[_kubectl_ro_tc()],
+            tool_calls=[_kubectl_read_tc()],
         )
         llm = _make_mock_llm(response)
         node = make_plan_builder(llm=llm)
 
-        with patch("chaos_agent.agent.nodes.plan_builder.interrupt"):
+        with patch("chaos_agent.agent.nodes.planning.plan_builder.interrupt"):
             result = await node(_make_state())
 
         msgs = result["messages"]
-        # Should contain the filtered AI response with kubectl_ro tool_call
+        # Should contain the filtered AI response with kubectl_read tool_call
         last_msg = msgs[-1]
         assert isinstance(last_msg, AIMessage)
-        assert any(tc["name"] == "kubectl_ro" for tc in last_msg.tool_calls)
+        assert any(tc["name"] == "kubectl_read" for tc in last_msg.tool_calls)
         # plan_confirmed NOT set (still in progress)
         assert result.get("plan_confirmed") is not True
 
@@ -245,7 +283,7 @@ class TestPlanBuilderNode:
         node = make_plan_builder(llm=llm)
 
         with patch(
-            "chaos_agent.agent.nodes.plan_builder.interrupt",
+            "chaos_agent.agent.nodes.planning.plan_builder.interrupt",
             return_value="some user text",
         ) as mock_interrupt:
             result = await node(_make_state())
@@ -264,7 +302,7 @@ class TestPlanBuilderNode:
         node = make_plan_builder(llm=llm)
 
         with patch(
-            "chaos_agent.agent.nodes.plan_builder.interrupt",
+            "chaos_agent.agent.nodes.planning.plan_builder.interrupt",
             return_value="rejected",
         ):
             result = await node(_make_state())
@@ -274,27 +312,27 @@ class TestPlanBuilderNode:
 
     @pytest.mark.asyncio
     async def test_mixed_tools_priority2_strips_real(self):
-        """present_options + kubectl_ro in same response → only present_options kept."""
+        """present_options + kubectl_read in same response → only present_options kept."""
         mixed_response = _make_ai_response(
             content="checking",
-            tool_calls=[_present_options_tc(call_id="opt1"), _kubectl_ro_tc(call_id="kube1")],
+            tool_calls=[_present_options_tc(call_id="opt1"), _kubectl_read_tc(call_id="kube1")],
         )
         submit_response = _make_ai_response(tool_calls=[_submit_plan_tc()])
         llm = _make_mock_llm(mixed_response, submit_response)
         node = make_plan_builder(llm=llm)
 
         with patch(
-            "chaos_agent.agent.nodes.plan_builder.interrupt",
+            "chaos_agent.agent.nodes.planning.plan_builder.interrupt",
             return_value="A",
         ):
             result = await node(_make_state())
 
-        # Verify accumulated messages don't have orphan kubectl_ro tool_call
+        # Verify accumulated messages don't have orphan kubectl_read tool_call
         msgs = result["messages"]
         for msg in msgs:
             if isinstance(msg, AIMessage) and msg.tool_calls:
                 names = [tc["name"] for tc in msg.tool_calls]
-                assert "kubectl_ro" not in names
+                assert "kubectl_read" not in names
 
     @pytest.mark.asyncio
     async def test_max_rounds_exceeded(self):
@@ -306,7 +344,7 @@ class TestPlanBuilderNode:
         state = _make_state(plan_builder_round=MAX_PLAN_BUILDER_ROUNDS - 1)
 
         with patch(
-            "chaos_agent.agent.nodes.plan_builder.interrupt",
+            "chaos_agent.agent.nodes.planning.plan_builder.interrupt",
             return_value="keep going",
         ):
             result = await node(state)
@@ -323,7 +361,7 @@ class TestPlanBuilderNode:
         llm.bind_tools = lambda *a, **kw: bound
         node = make_plan_builder(llm=llm)
 
-        with patch("chaos_agent.agent.nodes.plan_builder.interrupt"):
+        with patch("chaos_agent.agent.nodes.planning.plan_builder.interrupt"):
             result = await node(_make_state())
 
         msgs = result["messages"]
@@ -340,7 +378,7 @@ class TestPlanBuilderNode:
         llm = _make_mock_llm(response)
         node = make_plan_builder(llm=llm)
 
-        with patch("chaos_agent.agent.nodes.plan_builder.interrupt"):
+        with patch("chaos_agent.agent.nodes.planning.plan_builder.interrupt"):
             result = await node(_make_state())
 
         assert result["skill_name"] == "pod-cpu-fullload"
@@ -357,7 +395,7 @@ class TestPlanBuilderNode:
         node = make_plan_builder(llm=llm)
 
         with patch(
-            "chaos_agent.agent.nodes.plan_builder.interrupt",
+            "chaos_agent.agent.nodes.planning.plan_builder.interrupt",
             return_value="B",
         ):
             result = await node(_make_state())
@@ -370,7 +408,7 @@ class TestPlanBuilderNode:
         ai_msgs = [m for m in msgs if isinstance(m, AIMessage) and m.tool_calls]
         for ai in ai_msgs:
             for tc in ai.tool_calls:
-                assert tc["name"] != "kubectl_ro"
+                assert tc["name"] != "kubectl_read"
 
 
 # ── Schema validation ────────────────────────────────────────────────────────
@@ -402,3 +440,11 @@ class TestToolSchemas:
         assert "scope" in fault_props
         assert "target" in fault_props
         assert "action" in fault_props
+        assert props["execution_order"]["enum"] == ["serial"]
+
+    def test_submit_plan_forces_serial_execution(self):
+        args = _validate_submit_plan({
+            "faults": [{"scope": "pod", "target": "cpu", "action": "fullload"}],
+            "execution_order": "parallel",
+        })
+        assert args["execution_order"] == "serial"

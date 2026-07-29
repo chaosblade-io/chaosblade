@@ -62,6 +62,54 @@ class TestTestTaskToInitialState:
         assert fs["source"] == "l4_sdk"
         assert fs["user_description"] == "inject pod cpu fault"
 
+    def test_transport_fields_forwarded(self):
+        """L4 payload transport fields (channel override + kubewiz + ssh/host)
+        must reach initial_state — regression for the gap where the schema
+        declared them but the adapter dropped everything except kubeconfig."""
+        task = L4TestTask(
+            task_id="t-transport",
+            intent="inject via ssh",
+            payload=_valid_payload(
+                kube_connection_mode="ssh",
+                kubewiz_cluster_uuid="cluster-xyz",
+                kubewiz_profile="prof-1",
+                host_name="10.0.0.9",
+                ssh_host="10.0.0.10",
+                ssh_user="root",
+                ssh_key_path="/tmp/id_rsa",
+                ssh_port=2222,
+            ),
+        )
+        state = _to_initial_state(task)
+        assert state["kube_connection_mode"] == "ssh"
+        assert state["kubewiz_cluster_uuid"] == "cluster-xyz"
+        assert state["kubewiz_profile"] == "prof-1"
+        assert state["host_name"] == "10.0.0.9"
+        assert state["ssh_host"] == "10.0.0.10"
+        assert state["ssh_user"] == "root"
+        assert state["ssh_key_path"] == "/tmp/id_rsa"
+        assert state["ssh_port"] == 2222
+
+    def test_transport_fields_default_empty(self):
+        """Absent transport fields default to empty / port 22."""
+        task = L4TestTask(task_id="t-td", intent="x", payload=_valid_payload())
+        state = _to_initial_state(task)
+        assert state["kube_connection_mode"] == ""
+        assert state["ssh_host"] == ""
+        assert state["ssh_port"] == 22
+
+    def test_invalid_kube_connection_mode_fails_closed(self):
+        """A bad kube_connection_mode must raise a clear ValueError at the
+        adapter (fail-closed), not crash deep inside resolve(). Guards the gap
+        where the L4 schema enum was declarative-only (never enforced)."""
+        task = L4TestTask(
+            task_id="t-badmode",
+            intent="x",
+            payload=_valid_payload(kube_connection_mode="kubewiz"),  # deprecated
+        )
+        with pytest.raises(ValueError, match="invalid kube_connection_mode"):
+            _to_initial_state(task)
+
     def test_flat_payload_without_fault_intent_fails_closed(self):
         """Flat fields (fault_scope etc) are no longer accepted — must use fault_intent."""
         task = L4TestTask(

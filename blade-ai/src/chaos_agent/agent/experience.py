@@ -10,8 +10,8 @@ import os
 import warnings
 from pathlib import Path
 
-from chaos_agent.agent.fault_spec import fault_type_from_state
-from chaos_agent.agent.operation_outcome import read_inject_verification, read_operation_outcome
+from chaos_agent.agent.spec.fault_spec import fault_type_from_state
+from chaos_agent.agent.result.operation_outcome import read_inject_verification, read_operation_outcome
 from chaos_agent.agent.prompts.constants import MAX_EXPERIENCE_MD_BYTES
 
 EXPERIENCE_MD_PATH = Path(os.path.expanduser("~/.blade-ai/EXPERIENCE.md"))
@@ -125,7 +125,10 @@ def append_experience(task_summary: str, state: dict) -> dict:
     elif has_verification_issue:
         category = "Verification"
     else:
-        category = "K8s Cluster"
+        # Environment-specific pitfalls are filed under the active profile:
+        # host faults land in "Host", cluster faults in "K8s Cluster".
+        from chaos_agent.transports.registry import is_host_scope_channel
+        category = "Host" if is_host_scope_channel(state) else "K8s Cluster"
 
     # Build the experience entry
     rule_text = task_summary[:200] if task_summary else f"Issue with {fault_type}"
@@ -194,4 +197,7 @@ def _default_agent_md_template() -> str:
 
 ## K8s Cluster
 <!-- 集群特定经验：集群配置差异、权限问题、网络策略 -->
+
+## Host
+<!-- 主机特定经验：主机连接、原生命令载体、反向恢复陷阱 -->
 """

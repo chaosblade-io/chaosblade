@@ -16,27 +16,33 @@ def get_tools_section(phase: int = 1) -> str:
 ### Tool Selection Priority
 1. **Skill case in conversation history**: The active skill's instructions were read
    in Phase 1 — they are in your conversation history as tool results. Re-read them
-   as a STARTING POINT for injection commands. Do NOT call skill-reading tools (not bound here).
-2. **Knowledge docs for domain context**: When you need supplementary domain knowledge, use `read_knowledge_resource`. Do NOT guess or improvise blade commands.
-3. **Pre-injection checks only**: Use `kubectl(subcommand="get"/"describe")` ONLY to confirm the target exists before injection. Do NOT use kubectl to verify injection effects — that is handled automatically after execution.
-4. **Injection tools**: Use the injection tool specified by the skill case (`blade_create`,
-   `kubectl`, etc.). Call `blade_help` first to verify available flags when using blade —
-   skill docs may be outdated. Only call tools that are bound to you in this phase —
-   recovery is framework-controlled.
+   as the STARTING POINT for injection commands. Do NOT call skill-reading tools (not bound here).
+2. **Supplementary domain knowledge**: When the skill case is insufficient, read the
+   relevant knowledge document for domain context. Do NOT guess or improvise injection commands.
+3. **Read-only context when useful**: Use read-only queries when they are needed
+   to establish information for safe execution. The system owns the post-execution
+   verification and recovery lifecycle; do not treat a single command result as the
+   final verdict on the real-world effect.
+4. **Injection tools**: Use the injection tool specified by the skill case. Before invoking
+   any tool, inspect its own help/usage output to confirm the flags and parameters it
+   actually supports (runtime interface wins — see Runtime Feedback Priority). If an
+   injection attempt reports it already created a residual experiment before failing,
+   account for THAT residue before choosing a subsequent action. This is partial-failure
+   cleanup; normal post-injection recovery remains framework-controlled.
 
 ### Parallel Calls
-- You MAY make multiple independent kubectl calls in a single turn (e.g., check pods AND nodes simultaneously)
+- You MAY make multiple independent read-only queries in a single turn (e.g., inspect two independent targets simultaneously)
 - Do NOT make dependent calls in parallel
 
 ### Avoid Redundancy
-- Do not repeat kubectl queries that were just answered in a previous tool result"""
+- Do not repeat read-only queries that were just answered in a previous tool result"""
 
     return """## Tool Usage Guidelines
 
 ### Tool Selection Priority
 1. **Skill references first (after skill activation)**: Use `read_skill_resource` to read skill reference files for accurate, up-to-date injection command syntax and parameters
 2. **Knowledge docs for domain context**: Especially BEFORE skill activation or when no skill is active, use `read_knowledge_resource` to read knowledge documents — do NOT guess or improvise injection commands
-3. **Read before write**: Use cluster query tools for verification — mutation tools are Phase 2 only
+3. **Read before write**: Use read-only query tools for verification — mutation tools are Phase 2 only
 4. **Plan, don't execute**: Your output is the input to `confirmation_gate`. Capture the intended injection parameters in your plan (via `save_fault_plan`); the executor (Phase 2) will issue the actual call.
 
 ### Timeout Protection
@@ -45,12 +51,12 @@ indefinite residue. The default timeout is applied automatically by the
 injection tool. Pass a custom value only if the user specifies one.
 
 ### Parallel Calls
-- You MAY make multiple independent cluster query calls in a single turn (e.g., check pods AND nodes simultaneously)
+- You MAY make multiple independent read-only query calls in a single turn (e.g., inspect two independent targets simultaneously)
 - Do NOT make dependent calls in parallel
 
 ### Avoid Redundancy
 - Do not call `activate_skill` more than once in the same Phase 1 session
-- Do not repeat cluster queries that were just answered in a previous tool result"""
+- Do not repeat read-only queries that were just answered in a previous tool result"""
 
 
 def get_guidelines_section(
@@ -71,18 +77,12 @@ def get_guidelines_section(
             errors directly).
     """
     runtime_feedback = """### Runtime Feedback Priority
-Your knowledge about tool interfaces comes from documentation, which may be
-outdated or wrong. The tool's actual behavior at runtime is always the ground truth.
-
-When ANY tool returns an error or unexpected result:
-1. DO NOT assume the documentation is correct and the tool is wrong
-2. The tool is RIGHT — adapt your approach to match what the tool actually does
-3. Before retrying a failed command, verify the tool's actual interface
-   (e.g. run the tool's help/usage command) to see what it really supports
-4. If a parameter/flag/subcommand was rejected, it does NOT exist in the
-   current tool version — do NOT retry it, regardless of what documentation says
-5. If the tool's output contradicts skill instructions or knowledge docs,
-   trust the tool output and adapt your approach"""
+Tool-interface knowledge from documentation may be outdated; the tool's actual
+runtime behavior is the ground truth. Treat an error, unexpected result, or an
+explicit rejection of a parameter/flag/subcommand as evidence that the invocation
+is not accepted here — ground any later action in a changed hypothesis or a
+different supported capability, and give runtime behavior precedence over
+documentation."""
 
     lines = [
         "## Important Guidelines",
@@ -135,21 +135,22 @@ def get_execution_directives_section(
         "## EXECUTION PHASE DIRECTIVES",
         "The plan has been approved.",
         "",
-        "### Injection Failure Escalation",
-        "1. Try the standard injection tool based on skill case instructions",
-        "2. If it fails, READ the error — the error tells you what's actually wrong",
-        "3. Adapt parameters based on the error and retry",
-        "4. If adaptation fails, try alternative methods from the skill case",
-        "5. If all methods fail, output `[REPLAN]`",
-        "Do NOT improvise methods not listed in the skill case.",
+        "### Execution Orchestration",
+        "Treat the approved plan as the current hypothesis, not a script: preserve",
+        "its target and safety constraints, but select each next action from actual",
+        "tool capabilities and accumulated evidence (see Core Principles for how to",
+        "read tool output and avoid unchanged repetition). Use only capabilities",
+        "grounded in runtime evidence and within the approved scope — do not fabricate",
+        "tool interfaces or expand the approved target or safety boundaries. When the",
+        "plan itself needs a different assumption, capability, target, or safety",
+        "decision, use the Replan Mechanism below rather than improvising.",
         "",
         "### Multi-Step Execution",
-        "A fault injection may consist of multiple atomic INJECTION steps (the '## Execution Steps' section of the plan).",
-        "- Execute each injection step IN ORDER — call the tool for each step, do NOT just describe what you will do",
-        "- Check result before proceeding to next step",
-        "- A single step's success is progress, not completion — immediately call the next tool",
-        "- When ALL injection steps are done, output a brief conclusion and STOP",
-        "- Do NOT execute verification, observation, or recovery steps — those are handled by separate phases",
+        "The approved mutation steps live in the plan's '## Execution Steps' section.",
+        "Run them through tool calls (never prose), using each result to decide whether",
+        "the next step still applies; a completed step is progress, not necessarily",
+        "completion. When the mutation work is done, output a brief evidence-based",
+        "conclusion and STOP — the system owns post-execution verification and recovery.",
         "",
         "### Parameter Priority",
         "When conflicting sources specify a parameter value, follow this hierarchy",

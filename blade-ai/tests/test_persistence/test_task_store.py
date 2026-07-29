@@ -90,8 +90,8 @@ class TestSchema:
 class TestUpsert:
     @pytest.mark.asyncio
     async def test_insert_new_task(self, store):
-        await store.upsert("t1", skill_name="pod-kill", operation="inject")
-        data = await store.get("t1")
+        await store.upsert("task-t1", skill_name="pod-kill", operation="inject")
+        data = await store.get("task-t1")
         assert data is not None
         assert data["skill_name"] == "pod-kill"
         assert data["operation"] == "inject"
@@ -99,35 +99,35 @@ class TestUpsert:
 
     @pytest.mark.asyncio
     async def test_update_existing_task(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        await store.upsert("t1", blade_uid="abc123")
-        data = await store.get("t1")
+        await store.upsert("task-t1", skill_name="pod-kill")
+        await store.upsert("task-t1", blade_uid="abc123")
+        data = await store.get("task-t1")
         assert data["skill_name"] == "pod-kill"
         assert data["blade_uid"] == "abc123"
 
     @pytest.mark.asyncio
     async def test_partial_update_preserves_other_fields(self, store):
-        await store.upsert("t1", skill_name="pod-kill", blade_uid="abc")
-        await store.upsert("t1", safety_status="safe")
-        data = await store.get("t1")
+        await store.upsert("task-t1", skill_name="pod-kill", blade_uid="abc")
+        await store.upsert("task-t1", safety_status="safe")
+        data = await store.get("task-t1")
         assert data["skill_name"] == "pod-kill"
         assert data["blade_uid"] == "abc"
         assert data["safety_status"] == "safe"
 
     @pytest.mark.asyncio
     async def test_gmt_modified_is_set(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        data = await store.get("t1")
+        await store.upsert("task-t1", skill_name="pod-kill")
+        data = await store.get("task-t1")
         assert data["gmt_modified"] is not None
         assert data["gmt_modified"] != ""
 
     @pytest.mark.asyncio
     async def test_gmt_create_preserved_on_update(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        data1 = await store.get("t1")
+        await store.upsert("task-t1", skill_name="pod-kill")
+        data1 = await store.get("task-t1")
         gmt_create_1 = data1["gmt_create"]
-        await store.upsert("t1", blade_uid="abc")
-        data2 = await store.get("t1")
+        await store.upsert("task-t1", blade_uid="abc")
+        data2 = await store.get("task-t1")
         assert data2["gmt_create"] == gmt_create_1
 
     @pytest.mark.asyncio
@@ -138,8 +138,8 @@ class TestUpsert:
     @pytest.mark.asyncio
     async def test_json_fields_serialized(self, store):
         target = {"namespace": "default", "names": ["pod1"], "resource_type": "pod"}
-        await store.upsert("t1", target=target)
-        data = await store.get("t1")
+        await store.upsert("task-t1", target=target)
+        data = await store.get("task-t1")
         assert data["target"] == target
 
     @pytest.mark.asyncio
@@ -149,16 +149,16 @@ class TestUpsert:
             "layer1": {"status": "passed"},
             "layer2": {"status": "passed"},
         }
-        await store.upsert("t1", verification=verification, blade_uid="abc")
-        data = await store.get("t1")
+        await store.upsert("task-t1", verification=verification, blade_uid="abc")
+        data = await store.get("task-t1")
         assert data["verification"] == verification
         assert data["task_state"] == "injected"
 
     @pytest.mark.asyncio
     async def test_namespace_target_name_extracted(self, store):
         target = {"namespace": "prod", "names": ["pod1"], "resource_type": "pod"}
-        await store.upsert("t1", target=target)
-        data = await store.get("t1")
+        await store.upsert("task-t1", target=target)
+        data = await store.get("task-t1")
         assert data["namespace"] == "prod"
         assert data["target_name"] == "pod1"
 
@@ -170,8 +170,8 @@ class TestUpsert:
 class TestInferFields:
     @pytest.mark.asyncio
     async def test_injecting_state_inferred(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        data = await store.get("t1")
+        await store.upsert("task-t1", skill_name="pod-kill")
+        data = await store.get("task-t1")
         assert data["task_state"] == "injecting"
         assert data["stage"] == "injection"
         assert data["phase"] == "planning"
@@ -179,30 +179,30 @@ class TestInferFields:
     @pytest.mark.asyncio
     async def test_injected_state_inferred(self, store):
         verification = {"layer1": {"status": "passed"}, "layer2": {"status": "passed"}}
-        await store.upsert("t1", skill_name="pod-kill", blade_uid="abc", verification=verification)
-        data = await store.get("t1")
+        await store.upsert("task-t1", skill_name="pod-kill", blade_uid="abc", verification=verification)
+        data = await store.get("task-t1")
         assert data["task_state"] == "injected"
         assert data["phase"] == "verification_passed"
 
     @pytest.mark.asyncio
     async def test_rejected_state_inferred(self, store):
-        await store.upsert("t1", safety_status="rejected", safety_reason="unsafe")
-        data = await store.get("t1")
+        await store.upsert("task-t1", safety_status="rejected", safety_reason="unsafe")
+        data = await store.get("task-t1")
         assert data["task_state"] == "rejected"
 
     @pytest.mark.asyncio
     async def test_failed_state_inferred(self, store):
-        await store.upsert("t1", error="something went wrong")
-        data = await store.get("t1")
+        await store.upsert("task-t1", error="something went wrong")
+        data = await store.get("task-t1")
         assert data["task_state"] == "failed"
 
     @pytest.mark.asyncio
     async def test_recovered_state_inferred(self, store):
         recover_verification = {"layer1": {"status": "passed"}, "layer2": {"status": "passed"}}
-        await store.upsert("t1", operation="recover",
+        await store.upsert("task-t1", operation="recover",
                            recover_verification=recover_verification,
                            result={"recovered": True})
-        data = await store.get("t1")
+        data = await store.get("task-t1")
         assert data["task_state"] == "recovered"
         assert data["stage"] == "recovery"
 
@@ -218,38 +218,38 @@ class TestGetListCount:
 
     @pytest.mark.asyncio
     async def test_list_returns_ordered_by_gmt_create_desc(self, store):
-        await store.upsert("t1", gmt_create="2026-01-01T00:00:00Z")
-        await store.upsert("t2", gmt_create="2026-01-02T00:00:00Z")
-        await store.upsert("t3", gmt_create="2026-01-03T00:00:00Z")
+        await store.upsert("task-t1", gmt_create="2026-01-01T00:00:00Z")
+        await store.upsert("task-t2", gmt_create="2026-01-02T00:00:00Z")
+        await store.upsert("task-t3", gmt_create="2026-01-03T00:00:00Z")
         result = await store.list_tasks()
-        assert [d["task_id"] for d in result] == ["t3", "t2", "t1"]
+        assert [d["task_id"] for d in result] == ["task-t3", "task-t2", "task-t1"]
 
     @pytest.mark.asyncio
     async def test_list_with_state_filter(self, store):
-        await store.upsert("t1", skill_name="pod-kill", blade_uid="a",
+        await store.upsert("task-t1", skill_name="pod-kill", blade_uid="a",
                            verification={"layer1": {"status": "passed"}, "layer2": {"status": "passed"}})
-        await store.upsert("t2", skill_name="pod-kill")
+        await store.upsert("task-t2", skill_name="pod-kill")
         injected = await store.list_tasks(task_state="injected")
         assert len(injected) == 1
-        assert injected[0]["task_id"] == "t1"
+        assert injected[0]["task_id"] == "task-t1"
 
     @pytest.mark.asyncio
     async def test_list_with_limit_offset(self, store):
         for i in range(5):
-            await store.upsert(f"t{i}", gmt_create=f"2026-01-0{i+1}T00:00:00Z")
+            await store.upsert(f"task-t{i}", gmt_create=f"2026-01-0{i+1}T00:00:00Z")
         result = await store.list_tasks(limit=2, offset=1)
         assert len(result) == 2
 
     @pytest.mark.asyncio
     async def test_count_all(self, store):
-        await store.upsert("t1")
-        await store.upsert("t2")
+        await store.upsert("task-t1")
+        await store.upsert("task-t2")
         assert await store.count() == 2
 
     @pytest.mark.asyncio
     async def test_count_by_state(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        await store.upsert("t2", error="fail")
+        await store.upsert("task-t1", skill_name="pod-kill")
+        await store.upsert("task-t2", error="fail")
         assert await store.count(task_state="injecting") == 1
         assert await store.count(task_state="failed") == 1
 
@@ -259,34 +259,122 @@ class TestGetListCount:
 # ---------------------------------------------------------------------------
 
 class TestQueryActive:
+    """``query_active`` 只返回**可恢复**的实验 —— 判据两层，缺一不可：
+
+    1. 落过注入意图：``target``（遗留形态）或 ``fault_spec``（规范形态）非空；
+    2. 命令确已发出：``injection_start_time`` 非空。
+
+    因此本类中每个"应可见"的行都必须同时给出这两者。下方
+    ``_ISSUED`` 代表"注入命令已发出"这个事实，集中一处以免逐个用例遗漏。
+    """
+
+    # 「注入命令已发出」的时刻。真实流程由 execute_loop / direct_execute 在
+    # 命令发出瞬间写入（写一次、永不清零）。
+    _ISSUED = "2026-07-27T10:00:00+08:00"
+
     @pytest.mark.asyncio
     async def test_returns_injecting_and_injected(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        await store.upsert("t2", skill_name="pod-kill", blade_uid="a",
+        # 只写 skill_name 的空行按设计就该被排除 —— 它没有任何东西可回滚。
+        await store.upsert("task-t1", skill_name="pod-kill",
+                           target={"namespace": "default", "names": ["pod1"]},
+                           injection_start_time=self._ISSUED)
+        await store.upsert("task-t2", skill_name="pod-kill", blade_uid="a",
+                           target={"namespace": "default", "names": ["pod2"]},
+                           injection_start_time=self._ISSUED,
                            verification={"layer1": {"status": "passed"}, "layer2": {"status": "passed"}})
-        await store.upsert("t3", error="fail")
+        await store.upsert("task-t3", error="fail")
         active = await store.query_active()
         assert len(active) == 2
         task_ids = {r["task_id"] for r in active}
-        assert "t1" in task_ids
-        assert "t2" in task_ids
+        assert "task-t1" in task_ids
+        assert "task-t2" in task_ids
+
+    @pytest.mark.asyncio
+    async def test_excludes_rows_without_injection_intent(self, store):
+        """没有注入意图的行不算可恢复实验（既无 target 也无 fault_spec）。
+
+        这类行出现在「任务身份已分配但还没提交故障意图」的窗口里，
+        没有任何副作用可回滚；若进入可恢复列表会被恢复流程误选，
+        报「找不到该任务的注入状态记录」。
+        """
+        await store.upsert("task-empty", skill_name="pod-kill")
+        assert await store.query_active() == []
+
+    @pytest.mark.asyncio
+    async def test_excludes_intent_without_issued_command(self, store):
+        """有完整注入意图、但命令**从未发出**的行必须被排除。
+
+        场景：用户确认了故障方案（于是分配 task_id、落了 target/fault_spec），
+        但注入命令还没发出就中断了（安全门未过 / 超时 / 取消）。这类行没有
+        任何副作用可回滚，进入可恢复列表就会报「找不到该任务的注入状态记录」。
+
+        ``injection_start_time`` 是唯一可靠的"已发出"信号：
+        ``blade_uid`` 对 native 类天然为空、``injection_method`` 会被
+        execute_loop 的多步自检分支置回 None、``safety_status`` 的 schema
+        默认值就是 'pending'（"真卡住"与"没写过"同形）。
+        """
+        await store.upsert(
+            "task-not-issued", skill_name="pod-kill",
+            target={"namespace": "default", "names": ["pod1"]},
+            fault_spec={"namespace": "default", "scope": "pod", "names": ["pod1"],
+                        "blade_target": "network", "blade_action": "loss"},
+        )
+        assert await store.query_active() == []
+
+    @pytest.mark.asyncio
+    async def test_native_injection_without_blade_uid_is_recoverable(self, store):
+        """kubectl_native / host_native 天然无 blade_uid，但必须可恢复。
+
+        它们的"发出即注入"由 injection_start_time 承载（execute_loop 在
+        issue time 就写入）。判据若依赖 blade_uid 就会漏掉这类真实注入。
+        """
+        await store.upsert(
+            "task-native", skill_name="k8s-chaos-skills",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_method="kubectl_native",
+            injection_start_time=self._ISSUED,
+        )
+        active = await store.query_active()
+        assert [r["task_id"] for r in active] == ["task-native"]
+
+    @pytest.mark.asyncio
+    async def test_canonical_fault_spec_alone_is_recoverable(self, store):
+        """只写规范形态 fault_spec（未投影出遗留 target）也必须可恢复。
+
+        cli/runner.py 的两处直接 upsert 绕过了 _store_sync 的
+        fault_spec → target 投影，落库后只有 fault_spec。判据若只认
+        ``target`` 就会把这类真实注入误藏成幽灵。
+        """
+        await store.upsert(
+            "task-canonical",
+            fault_spec={"namespace": "prod", "scope": "pod", "names": ["pod1"],
+                        "blade_target": "network", "blade_action": "loss"},
+            skill_name="pod-network-loss",
+            injection_start_time=self._ISSUED,
+        )
+        active = await store.query_active()
+        assert [r["task_id"] for r in active] == ["task-canonical"]
 
     @pytest.mark.asyncio
     async def test_filter_by_namespace(self, store):
-        await store.upsert("t1", target={"namespace": "prod", "names": ["pod1"]}, skill_name="pod-kill")
-        await store.upsert("t2", target={"namespace": "staging", "names": ["pod2"]}, skill_name="pod-kill")
+        await store.upsert("task-t1", target={"namespace": "prod", "names": ["pod1"]},
+                           skill_name="pod-kill", injection_start_time=self._ISSUED)
+        await store.upsert("task-t2", target={"namespace": "staging", "names": ["pod2"]},
+                           skill_name="pod-kill", injection_start_time=self._ISSUED)
         active = await store.query_active(namespace="prod")
         assert len(active) == 1
-        assert active[0]["task_id"] == "t1"
+        assert active[0]["task_id"] == "task-t1"
 
     @pytest.mark.asyncio
     async def test_filter_by_target_name(self, store):
         """target_name column stores names[0] from the target JSON."""
-        await store.upsert("t1", target={"namespace": "prod", "names": ["pod1"]}, skill_name="pod-kill")
-        await store.upsert("t2", target={"namespace": "prod", "names": ["pod2"]}, skill_name="pod-kill")
+        await store.upsert("task-t1", target={"namespace": "prod", "names": ["pod1"]},
+                           skill_name="pod-kill", injection_start_time=self._ISSUED)
+        await store.upsert("task-t2", target={"namespace": "prod", "names": ["pod2"]},
+                           skill_name="pod-kill", injection_start_time=self._ISSUED)
         active = await store.query_active(target_name="pod1")
         assert len(active) == 1
-        assert active[0]["task_id"] == "t1"
+        assert active[0]["task_id"] == "task-t1"
 
     @pytest.mark.asyncio
     async def test_filter_by_fault_spec_projection(self, store):
@@ -299,18 +387,20 @@ class TestQueryActive:
             "blade_action": "loss",
             "params": {"percent": "100"},
         }
-        await store.upsert("t1", fault_spec=fault_spec, skill_name="stale-active-skill")
+        await store.upsert("task-t1", fault_spec=fault_spec, skill_name="stale-active-skill",
+                           injection_start_time=self._ISSUED)
 
         active = await store.query_active(namespace="prod", target_name="pod1")
 
         assert len(active) == 1
-        assert active[0]["task_id"] == "t1"
+        assert active[0]["task_id"] == "task-t1"
         assert active[0]["fault_type"] == "pod-network-loss"
         assert active[0]["skill"] == "stale-active-skill"
 
     @pytest.mark.asyncio
     async def test_compatible_format(self, store):
-        await store.upsert("t1", skill_name="pod-kill", target={"namespace": "default"}, blade_uid="abc")
+        await store.upsert("task-t1", skill_name="pod-kill", target={"namespace": "default"},
+                           blade_uid="abc", injection_start_time=self._ISSUED)
         active = await store.query_active()
         record = active[0]
         assert "task_id" in record
@@ -322,6 +412,23 @@ class TestQueryActive:
         assert "blade_uid" in record
         assert "status" in record
 
+    @pytest.mark.asyncio
+    async def test_active_includes_discriminators(self, store):
+        """query_active surfaces the fields needed to tell experiments apart:
+        gmt_create (time), target_name (resource), plan_summary (description)."""
+        await store.upsert(
+            "task-t1",
+            skill_name="k8s-chaos-skills",
+            target={"namespace": "reg-center", "names": ["registry-sts"]},
+            plan_summary="将 StatefulSet registry-sts 镜像改为无效值",
+            injection_start_time=self._ISSUED,
+        )
+        active = await store.query_active()
+        record = active[0]
+        assert "gmt_create" in record and record["gmt_create"]
+        assert record["target_name"] == "registry-sts"
+        assert record["plan_summary"] == "将 StatefulSet registry-sts 镜像改为无效值"
+
 
 # ---------------------------------------------------------------------------
 # Delete
@@ -330,9 +437,9 @@ class TestQueryActive:
 class TestDelete:
     @pytest.mark.asyncio
     async def test_delete_removes_task(self, store):
-        await store.upsert("t1")
-        assert await store.delete("t1") is True
-        assert await store.get("t1") is None
+        await store.upsert("task-t1")
+        assert await store.delete("task-t1") is True
+        assert await store.get("task-t1") is None
 
     @pytest.mark.asyncio
     async def test_delete_nonexistent_returns_false(self, store):
@@ -340,17 +447,17 @@ class TestDelete:
 
     @pytest.mark.asyncio
     async def test_delete_removes_associated_spans(self, store):
-        await store.upsert("t1")
-        await store.append_span("t1", "agent_loop", 0, 1, 1000)
-        assert len(await store.get_spans("t1")) == 1
-        await store.delete("t1")
-        assert len(await store.get_spans("t1")) == 0
+        await store.upsert("task-t1")
+        await store.append_span("task-t1", "agent_loop", 0, 1, 1000)
+        assert len(await store.get_spans("task-t1")) == 1
+        await store.delete("task-t1")
+        assert len(await store.get_spans("task-t1")) == 0
 
     @pytest.mark.asyncio
     async def test_delete_removes_details(self, store):
-        await store.upsert("t1", target={"namespace": "default"}, blade_uid="abc")
-        await store.delete("t1")
-        assert await store.get("t1") is None
+        await store.upsert("task-t1", target={"namespace": "default"}, blade_uid="abc")
+        await store.delete("task-t1")
+        assert await store.get("task-t1") is None
 
 
 # ---------------------------------------------------------------------------
@@ -360,20 +467,20 @@ class TestDelete:
 class TestSpans:
     @pytest.mark.asyncio
     async def test_append_span(self, store):
-        await store.upsert("t1")
-        await store.append_span("t1", "agent_loop", 0.0, 1.5, 1500.0, token_input=100, token_output=50)
-        spans = await store.get_spans("t1")
+        await store.upsert("task-t1")
+        await store.append_span("task-t1", "agent_loop", 0.0, 1.5, 1500.0, token_input=100, token_output=50)
+        spans = await store.get_spans("task-t1")
         assert len(spans) == 1
         assert spans[0]["node_name"] == "agent_loop"
         assert spans[0]["duration_ms"] == 1500.0
 
     @pytest.mark.asyncio
     async def test_append_span_updates_summary(self, store):
-        await store.upsert("t1")
-        await store.append_span("t1", "agent_loop", 0.0, 1.0, 1000.0,
+        await store.upsert("task-t1")
+        await store.append_span("task-t1", "agent_loop", 0.0, 1.0, 1000.0,
                                 token_input=100, token_output=50,
                                 tool_calls=["blade_create"])
-        summary = await store.get_summary("t1")
+        summary = await store.get_summary("task-t1")
         assert summary["total_token_input"] == 100
         assert summary["total_token_output"] == 50
         assert summary["total_tool_calls"] == 1
@@ -381,32 +488,32 @@ class TestSpans:
 
     @pytest.mark.asyncio
     async def test_multiple_spans_accumulate(self, store):
-        await store.upsert("t1")
-        await store.append_span("t1", "agent_loop", 0.0, 1.0, 1000.0, token_input=100)
-        await store.append_span("t1", "execute_loop", 1.0, 2.0, 1000.0, token_input=200)
-        summary = await store.get_summary("t1")
+        await store.upsert("task-t1")
+        await store.append_span("task-t1", "agent_loop", 0.0, 1.0, 1000.0, token_input=100)
+        await store.append_span("task-t1", "execute_loop", 1.0, 2.0, 1000.0, token_input=200)
+        summary = await store.get_summary("task-t1")
         assert summary["total_token_input"] == 300
         assert summary["total_duration_ms"] == 2000
 
     @pytest.mark.asyncio
     async def test_span_tool_calls_roundtrip(self, store):
-        await store.upsert("t1")
-        await store.append_span("t1", "agent_loop", 0.0, 1.0, 1000.0,
+        await store.upsert("task-t1")
+        await store.append_span("task-t1", "agent_loop", 0.0, 1.0, 1000.0,
                                 tool_calls=["blade_create", "kubectl"])
-        spans = await store.get_spans("t1")
+        spans = await store.get_spans("task-t1")
         assert spans[0]["tool_calls"] == ["blade_create", "kubectl"]
 
     @pytest.mark.asyncio
     async def test_span_error(self, store):
-        await store.upsert("t1")
-        await store.append_span("t1", "agent_loop", 0.0, 1.0, 1000.0, error="timeout")
-        spans = await store.get_spans("t1")
+        await store.upsert("task-t1")
+        await store.append_span("task-t1", "agent_loop", 0.0, 1.0, 1000.0, error="timeout")
+        spans = await store.get_spans("task-t1")
         assert spans[0]["error"] == "timeout"
 
     @pytest.mark.asyncio
     async def test_get_spans_empty(self, store):
-        await store.upsert("t1")
-        assert await store.get_spans("t1") == []
+        await store.upsert("task-t1")
+        assert await store.get_spans("task-t1") == []
 
 
 # ---------------------------------------------------------------------------
@@ -416,10 +523,10 @@ class TestSpans:
 class TestMetricMethods:
     @pytest.mark.asyncio
     async def test_get_metric_single_task(self, store):
-        await store.upsert("t1", skill_name="pod-kill", blade_uid="abc",
+        await store.upsert("task-t1", skill_name="pod-kill", blade_uid="abc",
                            verification={"layer1": {"status": "passed"}, "layer2": {"status": "passed"}})
-        await store.append_span("t1", "agent_loop", 0.0, 1.0, 1000.0, token_input=100)
-        metric = await store.get_metric("t1")
+        await store.append_span("task-t1", "agent_loop", 0.0, 1.0, 1000.0, token_input=100)
+        metric = await store.get_metric("task-t1")
         assert metric is not None
         # Both raw lifecycle (``task_state``) and derived rollup
         # (``status``) are exposed: clients that need to gate on
@@ -448,8 +555,8 @@ class TestMetricMethods:
 
     @pytest.mark.asyncio
     async def test_get_metric_computes_fault_type(self, store):
-        await store.upsert("t1", params={"scope": "pod", "target": "cpu", "action": "fullload"})
-        metric = await store.get_metric("t1")
+        await store.upsert("task-t1", params={"scope": "pod", "target": "cpu", "action": "fullload"})
+        metric = await store.get_metric("task-t1")
         assert metric["fault_type"] == "pod-cpu-fullload"
 
     @pytest.mark.asyncio
@@ -465,27 +572,27 @@ class TestMetricMethods:
             "source": "test",
         }
         await store.upsert(
-            "t1",
+            "task-t1",
             skill_name="stale-active-skill",
             fault_spec=fault_spec,
         )
 
-        metric = await store.get_metric("t1")
-        data = await store.get("t1")
+        metric = await store.get_metric("task-t1")
+        data = await store.get("task-t1")
 
         assert metric["fault_type"] == "pod-network-loss"
         assert data["fault_spec"] == fault_spec
 
     @pytest.mark.asyncio
     async def test_get_metric_computes_duration_ms(self, store):
-        await store.upsert("t1", gmt_create="2026-01-01T00:00:00+00:00", finished_at="2026-01-01T00:00:05+00:00")
-        metric = await store.get_metric("t1")
+        await store.upsert("task-t1", gmt_create="2026-01-01T00:00:00+00:00", finished_at="2026-01-01T00:00:05+00:00")
+        metric = await store.get_metric("task-t1")
         assert metric["duration_ms"] == 5000
 
     @pytest.mark.asyncio
     async def test_get_all_metrics(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        await store.upsert("t2", skill_name="pod-kill", blade_uid="a",
+        await store.upsert("task-t1", skill_name="pod-kill")
+        await store.upsert("task-t2", skill_name="pod-kill", blade_uid="a",
                            verification={"layer1": {"status": "passed"}, "layer2": {"status": "passed"}})
         result = await store.get_all_metrics()
         assert result["total"] == 2
@@ -510,7 +617,7 @@ class TestMetricMethods:
             "params": {"percent": "100"},
         }
         await store.upsert(
-            "t1",
+            "task-t1",
             skill_name="stale-active-skill",
             fault_spec=fault_spec,
         )
@@ -522,8 +629,8 @@ class TestMetricMethods:
 
     @pytest.mark.asyncio
     async def test_get_all_metrics_with_state_filter(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        await store.upsert("t2", error="fail")
+        await store.upsert("task-t1", skill_name="pod-kill")
+        await store.upsert("task-t2", error="fail")
         result = await store.get_all_metrics(task_state="failed")
         assert result["total"] == 1
         # Raw ``task_state`` is now part of the wire shape (this used
@@ -533,49 +640,49 @@ class TestMetricMethods:
 
     @pytest.mark.asyncio
     async def test_get_metric_with_failure_reason(self, store):
-        await store.upsert("t1", error="timeout", failure_reason="execution_failed: timeout")
-        metric = await store.get_metric("t1")
+        await store.upsert("task-t1", error="timeout", failure_reason="execution_failed: timeout")
+        metric = await store.get_metric("task-t1")
         assert "failure_reason" not in metric
         assert metric["error"] == "execution_failed: timeout"
 
     @pytest.mark.asyncio
     async def test_get_all_metrics_with_failure_reason(self, store):
-        await store.upsert("t1", error="fail", failure_reason="execution_failed")
-        await store.upsert("t2", skill_name="pod-kill")
+        await store.upsert("task-t1", error="fail", failure_reason="execution_failed")
+        await store.upsert("task-t2", skill_name="pod-kill")
         result = await store.get_all_metrics()
-        failed_task = next(t for t in result["tasks"] if t["task_id"] == "t1")
-        success_task = next(t for t in result["tasks"] if t["task_id"] == "t2")
+        failed_task = next(t for t in result["tasks"] if t["task_id"] == "task-t1")
+        success_task = next(t for t in result["tasks"] if t["task_id"] == "task-t2")
         assert "failure_reason" not in failed_task
         assert failed_task["error"] == "execution_failed"
         assert success_task["error"] == ""
 
     @pytest.mark.asyncio
     async def test_inject_status_in_progress(self, store):
-        await store.upsert("t1", skill_name="pod-kill")
-        metric = await store.get_metric("t1")
+        await store.upsert("task-t1", skill_name="pod-kill")
+        metric = await store.get_metric("task-t1")
         assert metric["stage"] == "injection"
         assert metric["status"] == "in_progress"
 
     @pytest.mark.asyncio
     async def test_inject_status_failed(self, store):
-        await store.upsert("t1", error="something went wrong")
-        metric = await store.get_metric("t1")
+        await store.upsert("task-t1", error="something went wrong")
+        metric = await store.get_metric("task-t1")
         assert metric["stage"] == "injection"
         assert metric["status"] == "failed"
 
     @pytest.mark.asyncio
     async def test_recover_status_success(self, store):
-        await store.upsert("t1", operation="recover",
+        await store.upsert("task-t1", operation="recover",
                            recover_verification={"layer1": {"status": "passed"}, "layer2": {"status": "passed"}},
                            result={"recovered": True})
-        metric = await store.get_metric("t1")
+        metric = await store.get_metric("task-t1")
         assert metric["stage"] == "recovery"
         assert metric["status"] == "success"
 
     @pytest.mark.asyncio
     async def test_recover_status_failed(self, store):
-        await store.upsert("t1", operation="recover", error="recovery failed")
-        metric = await store.get_metric("t1")
+        await store.upsert("task-t1", operation="recover", error="recovery failed")
+        metric = await store.get_metric("task-t1")
         assert metric["stage"] == "recovery"
         assert metric["status"] == "failed"
 
@@ -589,18 +696,18 @@ class TestMetricMethods:
         status="in_progress" because task_state was stale.
         """
         # Step 1: initial inject → DB stores task_state="injecting"
-        await store.upsert("t1", skill_name="pod-kill", blade_uid="abc123",
+        await store.upsert("task-t1", skill_name="pod-kill", blade_uid="abc123",
                            operation="inject")
-        metric = await store.get_metric("t1")
+        metric = await store.get_metric("task-t1")
         assert metric["stage"] == "injection"
         assert metric["status"] == "in_progress"  # still injecting
 
         # Step 2: verification arrives → should transition to "injected"
-        await store.upsert("t1", verification={
+        await store.upsert("task-t1", verification={
             "layer1": {"status": "passed"},
             "layer2": {"status": "passed"},
         })
-        metric = await store.get_metric("t1")
+        metric = await store.get_metric("task-t1")
         assert metric["stage"] == "injection"
         assert metric["status"] == "success"
         assert metric["phase"] == "verification_passed"
@@ -611,17 +718,17 @@ class TestMetricMethods:
         when recover_verification arrives, even though DB had "recovering".
         """
         # Step 1: start recovery
-        await store.upsert("t1", operation="recover")
-        metric = await store.get_metric("t1")
+        await store.upsert("task-t1", operation="recover")
+        metric = await store.get_metric("task-t1")
         assert metric["stage"] == "recovery"
         assert metric["status"] == "in_progress"
 
         # Step 2: recovery verification arrives
-        await store.upsert("t1", recover_verification={
+        await store.upsert("task-t1", recover_verification={
             "layer1": {"status": "passed"},
             "layer2": {"status": "passed"},
         }, result={"recovered": True})
-        metric = await store.get_metric("t1")
+        metric = await store.get_metric("task-t1")
         assert metric["stage"] == "recovery"
         assert metric["status"] == "success"
         assert metric["phase"] == "recovered"

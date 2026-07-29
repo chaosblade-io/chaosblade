@@ -118,6 +118,134 @@ class TestFinalize:
         # should still serve the persisted file though.
         assert store.read_session("task-fin") is not None
 
+    def test_finalize_freezes_the_model_name(self, store, task_dir, monkeypatch):
+        """The record must name the model it ran on, not the current config.
+
+        Post-hoc analysis otherwise reads the model from the LIVE config.json,
+        which may have changed since the run — so a stuck-qwen3-max task can be
+        mis-attributed to whatever model is configured at read time. The task
+        file is the only place this survives.
+        """
+        from chaos_agent.config import settings as settings_mod
+
+        monkeypatch.setattr(settings_mod.settings, "model_name", "qwen3-max")
+        store.create_session("task-model", operation="inject")
+        store.finalize_session("task-model", status="completed")
+        data = json.loads((task_dir / "task-model.json").read_text())
+        assert data["model_name"] == "qwen3-max"
+
+    def test_result_summary_model_overrides_the_default(self, store, task_dir, monkeypatch):
+        """A run that recorded its own model wins over the global default.
+
+        Batch / multi-model runs set ``result_summary.data.model_name``; the
+        global ``settings.model_name`` is only the fallback.
+        """
+        from chaos_agent.config import settings as settings_mod
+
+        monkeypatch.setattr(settings_mod.settings, "model_name", "qwen3.6-plus")
+        store.create_session("task-ov", operation="inject")
+        store.finalize_session(
+            "task-ov", status="completed",
+            result_summary={"data": {"model_name": "claude-4.6"}},
+        )
+        data = json.loads((task_dir / "task-ov.json").read_text())
+        assert data["model_name"] == "claude-4.6"
+
+    def test_created_record_declares_the_field(self, store, task_dir):
+        """The key exists from creation so readers never KeyError on it."""
+        store.create_session("task-decl", operation="inject")
+        data = json.loads((task_dir / "task-decl.json").read_text())
+        assert "model_name" in data
+
+
+class TestAuxLlmCallAudit:
+    """Off-graph LLM calls (baseline derive, postmortem) are archived, not lost.
+
+    They are kept OUT of ``messages`` on purpose — folding a side computation
+    into the main conversation would pollute the ReAct context. But "not in the
+    conversation" had become "not recorded anywhere": task-61915e37's baseline
+    derivation took 73s and there was no way to inspect the call afterward. These
+    land in a separate ``aux_llm_calls`` list so the audit trail exists without
+    changing what any node sees.
+    """
+
+    def test_aux_call_recorded_separately_from_messages(self, store, task_dir):
+        store.create_session("task-aux", operation="inject")
+        store.record_aux_llm_call(
+            "task-aux", purpose="baseline_derive",
+            request="SYS\n\nHUMAN", response="[commands]",
+            reasoning="thinking", duration_ms=73000,
+        )
+        store.finalize_session("task-aux", status="completed")
+        data = json.loads((task_dir / "task-aux.json").read_text())
+        # Must NOT surface in the conversation the main loop reasons over.
+        assert data["messages"] == []
+        assert len(data["aux_llm_calls"]) == 1
+        rec = data["aux_llm_calls"][0]
+        assert rec["purpose"] == "baseline_derive"
+        assert rec["duration_ms"] == 73000
+        assert rec["request"] == "SYS\n\nHUMAN"
+        assert rec["response"] == "[commands]"
+
+    def test_survives_reconstruction_from_jsonl(self, store, task_dir):
+        """The record must come back through the snapshot+JSONL replay path."""
+        store.create_session("task-aux2", operation="inject")
+        store.record_aux_llm_call(
+            "task-aux2", purpose="postmortem",
+            request="context", response="## Summary",
+        )
+        # read_session BEFORE finalize forces the JSONL-replay reconstruction.
+        data = store.read_session("task-aux2")
+        assert len(data["aux_llm_calls"]) == 1
+        assert data["aux_llm_calls"][0]["purpose"] == "postmortem"
+        # And it did not leak into messages during replay routing.
+        assert all(
+            "__aux_llm_call__" not in (m if isinstance(m, dict) else {})
+            for m in data["messages"]
+        )
+
+    def test_multiple_calls_preserve_order_and_purpose(self, store, task_dir):
+        store.create_session("task-aux3", operation="inject")
+        store.record_aux_llm_call("task-aux3", purpose="baseline_derive",
+                                  request="a", response="b")
+        store.record_aux_llm_call("task-aux3", purpose="postmortem",
+                                  request="c", response="d")
+        store.finalize_session("task-aux3", status="completed")
+        data = json.loads((task_dir / "task-aux3.json").read_text())
+        purposes = [a["purpose"] for a in data["aux_llm_calls"]]
+        assert purposes == ["baseline_derive", "postmortem"]
+
+    def test_unknown_task_does_not_raise(self, store):
+        # Audit is best-effort; a missing task must not crash the caller.
+        store.record_aux_llm_call(
+            "never-created", purpose="baseline_derive", request="x", response="y",
+        )
+
+    def test_same_purpose_calls_are_not_merged(self, store, task_dir):
+        """A derive and its retry share a purpose family and can land in the same
+        instant — dedup keys on the per-entry id, not (time, purpose), so both
+        survive. Keying on (time, purpose) silently dropped the second when
+        now_iso() resolution did not separate them.
+        """
+        store.create_session("task-dup", operation="inject")
+        store.record_aux_llm_call("task-dup", purpose="baseline_derive",
+                                  request="primary", response="r1")
+        store.record_aux_llm_call("task-dup", purpose="baseline_derive",
+                                  request="retry", response="r2")
+        data = store.read_session("task-dup")  # forces JSONL-replay dedup
+        assert len(data["aux_llm_calls"]) == 2
+        assert {a["request"] for a in data["aux_llm_calls"]} == {"primary", "retry"}
+
+    def test_each_record_gets_a_unique_id(self, store):
+        store.create_session("task-id", operation="inject")
+        store.record_aux_llm_call("task-id", purpose="p", request="a", response="b")
+        store.record_aux_llm_call("task-id", purpose="p", request="c", response="d")
+        data = store.read_session("task-id")
+        ids = [a.get("id") for a in data["aux_llm_calls"]]
+        assert all(ids) and len(set(ids)) == len(ids)
+
+
+
 
 class TestHasActive:
     """``has_active`` is the public read of the in-memory active set.

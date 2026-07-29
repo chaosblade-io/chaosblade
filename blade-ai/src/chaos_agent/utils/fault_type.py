@@ -105,13 +105,60 @@ def parse_blade_flags(flags_str: str) -> dict[str, str]:
     while i < len(tokens):
         token = tokens[i]
         if token.startswith("--"):
-            key = token[2:]
+            key, separator, inline_value = token[2:].partition("=")
+            if key in KEY_PARAMS and separator:
+                result[key] = inline_value
+                i += 1
+                continue
             if key in KEY_PARAMS and i + 1 < len(tokens):
                 result[key] = tokens[i + 1]
                 i += 2
                 continue
         i += 1
     return result
+
+
+def normalize_timeout_flag(argv: list[str]) -> str | None:
+    """Normalize one ``--timeout`` argument in-place and return its value.
+
+    ChaosBlade accepts both ``--timeout 2700`` and ``--timeout=2700``.  The
+    latter used to evade the duration guard, which then appended a second
+    timeout and let the CLI decide which value won.  Keep a single canonical
+    ``--timeout <seconds>`` pair before callers apply the minimum-duration
+    policy.  A malformed empty timeout is removed and treated as unspecified.
+    """
+    occurrences: list[tuple[int, int, str]] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--timeout":
+            if (
+                index + 1 < len(argv)
+                and argv[index + 1]
+                and not argv[index + 1].startswith("--")
+            ):
+                occurrences.append((index, 2, argv[index + 1].rstrip("sS")))
+                index += 2
+                continue
+            occurrences.append((index, 1, ""))
+        elif token.startswith("--timeout="):
+            occurrences.append((index, 1, token.split("=", 1)[1].rstrip("sS")))
+        index += 1
+
+    valid = [occurrence for occurrence in occurrences if occurrence[2]]
+    if not valid:
+        for index, width, _ in reversed(occurrences):
+            del argv[index:index + width]
+        return None
+
+    # Retain the last explicit value, matching normal CLI option precedence,
+    # while removing all duplicate spellings before dispatch.
+    insert_at = occurrences[0][0]
+    value = valid[-1][2]
+    for index, width, _ in reversed(occurrences):
+        del argv[index:index + width]
+    argv[insert_at:insert_at] = ["--timeout", value]
+    return value
 
 
 # Minimum recommended duration per fault type (scope, target, action)

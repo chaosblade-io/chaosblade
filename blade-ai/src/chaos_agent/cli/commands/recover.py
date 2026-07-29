@@ -4,7 +4,7 @@ from typing import Optional
 
 import typer
 
-from chaos_agent.cli.output import format_output
+from chaos_agent.cli.output import OutputFormat, format_output
 from chaos_agent.preflight import RECOVER_CHECKS, run_command
 
 
@@ -12,7 +12,7 @@ def recover_command(
     task_id: str = typer.Option(..., "--task-id", help="Task ID to recover"),
     target_name: Optional[str] = typer.Option(None, "--target-name", "-n", help="Specific target"),
     force: bool = typer.Option(False, "--force", help="Force recovery"),
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json|yaml"),
+    output: OutputFormat = typer.Option(OutputFormat.json, "--output", "-o", help="Output format: json|yaml"),
 ):
     """Recover a fault injection by task ID."""
 

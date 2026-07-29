@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from chaos_agent.agent.verdict import (
+from chaos_agent.agent.result.verdict import (
     ChecklistItem,
     ChecklistItemStatus,
     Checklist,
@@ -152,6 +152,7 @@ class TestFailureDetail:
             "category": "wall_clock_timeout",
             "context": "budget=300s",
             "llm_analysis": "",
+            "alternatives": "",
         }
 
 
@@ -340,7 +341,7 @@ class TestIntegration:
 
 class TestDictToVerificationResult:
     def test_basic_roundtrip(self):
-        from chaos_agent.agent.nodes._verifier_layer2_parse import (
+        from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
             _parse_verification_result,
             dict_to_verification_result,
         )
@@ -365,7 +366,7 @@ class TestDictToVerificationResult:
         assert vr.baseline_used is True
 
     def test_warnings_classified(self):
-        from chaos_agent.agent.nodes._verifier_layer2_parse import (
+        from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
             dict_to_verification_result,
         )
 
@@ -383,7 +384,7 @@ class TestDictToVerificationResult:
         assert vr.has_warning(WarningCode.NO_CHECKLIST_DETECTED)
 
     def test_empty_dict(self):
-        from chaos_agent.agent.nodes._verifier_layer2_parse import (
+        from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
             dict_to_verification_result,
         )
 
@@ -393,7 +394,7 @@ class TestDictToVerificationResult:
         assert vr.warnings == []
 
     def test_model_dump_produces_state_compatible_dict(self):
-        from chaos_agent.agent.nodes._verifier_layer2_parse import (
+        from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
             _parse_verification_result,
             dict_to_verification_result,
         )

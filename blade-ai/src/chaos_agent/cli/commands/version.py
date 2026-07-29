@@ -6,11 +6,11 @@ import typer
 
 from chaos_agent import __version__
 from chaos_agent.cli.config_manager import get_backend, get_mode
-from chaos_agent.cli.output import format_output
+from chaos_agent.cli.output import OutputFormat, format_output
 
 
 def version_command(
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json|yaml"),
+    output: OutputFormat = typer.Option(OutputFormat.json, "--output", "-o", help="Output format: json|yaml"),
 ):
     """Show version information."""
     backend = get_backend()

@@ -14,7 +14,7 @@ from chaos_agent.agent.target_guard import (
     freeze_approved_target,
     freeze_approved_target_from_spec,
 )
-from chaos_agent.agent.fault_spec import FaultSpec
+from chaos_agent.agent.spec.fault_spec import FaultSpec
 
 
 class TestFreezeApprovedTarget:
@@ -36,8 +36,10 @@ class TestFreezeApprovedTarget:
             "blade_target": "cpu", "blade_action": "fullload",
             "lock_fault_type": True,
             "owner_names": [],
+            "resolved_names": [],
             "secondary_scopes": ["pvc", "persistentvolumeclaim", "pv", "persistentvolume", "configmap", "secret", "pod", "node"],
             "secondary_namespace": "prod",
+            "host_name": "",
         }
 
     def test_container_scope_normalised_to_pod(self):

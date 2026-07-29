@@ -90,8 +90,8 @@ class TestL4ResilienceAgentRecover:
 
     @pytest.mark.asyncio
     async def test_explicit_recover_uses_snapshot_resolver_without_checkpoint(self, monkeypatch):
-        from chaos_agent.agent import task_snapshot
-        from chaos_agent.agent.task_snapshot import RecoverInitialResolution
+        from chaos_agent.agent.result import task_snapshot
+        from chaos_agent.agent.result.task_snapshot import RecoverInitialResolution
 
         class _MissingInjectGraph:
             async def aget_state(self, config):
@@ -102,15 +102,19 @@ class TestL4ResilienceAgentRecover:
                 self.initial = None
                 self.config = None
 
-            async def ainvoke(self, initial, config):
+            async def astream_events(self, initial, config, version="v2"):
                 self.initial = initial
                 self.config = config
-                return {
+                if False:  # pragma: no cover - async generator with no events
+                    yield
+
+            async def aget_state(self, config):
+                return type("_State", (), {"values": {
                     "operation": "recover",
                     "result": {"recovered": True, "recovery_level": "recovered"},
                     "recover_verification": {"layer1": {"status": "passed"}},
                     "messages": ["recover-msg"],
-                }
+                }})()
 
         class _SessionStore:
             def __init__(self):

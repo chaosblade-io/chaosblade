@@ -1,6 +1,6 @@
 from unittest.mock import patch
 
-from chaos_agent.agent.recovery_state import (
+from chaos_agent.agent.state_mgmt.recovery_state import (
     build_recover_initial_from_checkpoint,
     ensure_recover_runtime_defaults,
 )
@@ -22,6 +22,7 @@ def test_build_recover_initial_from_checkpoint_copies_durable_facts_and_resets_r
         "kubewiz_cluster_uuid": "cluster-a",
         "kubewiz_profile": "profile-a",
         "injection_method": "kubectl_exec",
+        "execution_artifacts": [{"artifact_id": "uid-debug", "type": "debug_pod"}],
         "kubectl_exec_pod_name": "tool-pod-a",
         "created_at": "2026-06-18T10:00:00+08:00",
         "verification": {"level": "verified"},
@@ -48,6 +49,7 @@ def test_build_recover_initial_from_checkpoint_copies_durable_facts_and_resets_r
     assert initial["kubeconfig"] == "/new/kubeconfig"
     assert initial["kube_context"] == "ctx-a"
     assert initial["injection_method"] == "kubectl_exec"
+    assert initial["execution_artifacts"] == inject_values["execution_artifacts"]
     assert initial["kubectl_exec_pod_name"] == "tool-pod-a"
 
     assert initial["verification"] is None
@@ -87,6 +89,11 @@ def test_build_recover_initial_from_checkpoint_rebuilds_fault_spec_from_legacy_t
         "duration_seconds": 0,
         "source": "recover_checkpoint",
         "user_description": "",
+        "revision": 0,
+        "objective": "",
+        "boundaries": [],
+        "constraints": [],
+        "assumptions": [],
     }
 
 

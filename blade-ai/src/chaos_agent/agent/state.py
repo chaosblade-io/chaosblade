@@ -5,13 +5,13 @@ from typing import Annotated, Optional
 from langgraph.graph import MessagesState
 from langgraph.graph.message import add_messages
 
-from chaos_agent.agent.operation_outcome import (
+from chaos_agent.agent.result.operation_outcome import (
     read_failure_reason,
     read_inject_verification,
     read_operation_outcome,
     read_recover_verification,
 )
-from chaos_agent.agent.skill_identity import read_active_skill_name
+from chaos_agent.agent.spec.skill_identity import read_active_skill_name
 from chaos_agent.utils.time import now_iso, parse_iso_timestamp
 
 
@@ -142,6 +142,20 @@ def infer_task_state(values: dict) -> str:
         if level in ("verified", "partial"):
             return "injected"
         return "failed"
+    # L1 Warning (e.g., CLI timeout but fault may have taken effect):
+    # L2 is the deciding factor — mirrors infer_phase() logic.
+    if l1_status == "warning" and l2_status == "passed":
+        return "injected"
+    if l1_status == "warning" and l2_status == "unknown":
+        level = verification.get("level", "unknown") if isinstance(verification, dict) else "unknown"
+        if level == "unverified":
+            return "failed"
+        return "injected"
+    if l1_status == "warning" and l2_status == "partial":
+        level = verification.get("level", "unknown") if isinstance(verification, dict) else "unknown"
+        if level in ("verified", "partial"):
+            return "injected"
+        return "failed"
     # Side-effect confirmation: L1 passed + evidence destroyed by side-effect
     # → not a failure, but a valid drill finding (e.g., burn → OOMKill → restart)
     if l1_pass and l2_status == "recovered_before_observation":
@@ -150,6 +164,29 @@ def infer_task_state(values: dict) -> str:
             return "injected"
         return "failed"
     return "failed"
+
+
+def terminal_task_state(values: dict) -> str:
+    """``infer_task_state`` for a run that has ENDED — unverified means failed.
+
+    ``infer_task_state`` answers "where is this run", so with no verification on
+    record it answers ``injecting``: still in progress. At a terminal point that
+    answer is not available — the run stopped, and what it describes is a run
+    that ended without a verdict.
+
+    The policy is that task state comes from verification: without one there is
+    no basis to call the fault injected, no matter what handles exist. A
+    ``blade_uid`` proves a creation request was accepted, not that the fault took
+    effect. task-ff057e7f shipped ``status=success / task_state=injected`` with
+    ``verification=null`` on a run whose own postmortem said it stalled without
+    injecting.
+
+    Shared by every terminal consumer (single-injection result builder, batch
+    per-fault record) so the rule cannot be applied in one place and forgotten in
+    the other — which is exactly how those two drifted apart.
+    """
+    state = infer_task_state(values)
+    return "failed" if state == "injecting" else state
 
 
 def infer_stage(values: dict) -> Optional[str]:
@@ -373,15 +410,21 @@ def _extract_side_effects(verification: dict | None) -> dict:
     return dict(raw)
 
 
-def _build_side_effects_summary(verification: dict | None) -> str:
-    """Build a one-line summary of all side-effect detection results.
+def _build_side_effects_summary(verification: dict | None, profile: str | None = None) -> str:
+    """Build a one-line summary of the run's side-effect detection results.
 
     Enumerates every detector category with its count so the TUI can
     display "what was checked" regardless of whether issues were found.
     The summary is assembled here (backend) so new detectors automatically
     appear without a TUI release.
+
+    Scoped to the run's ``profile`` (k8s/host): only that profile's detectors
+    actually run (see ``run_all_detectors``), so listing the cross-profile
+    union would pad the breakdown with foreign categories stuck at ``: 0``
+    (host labels on a k8s run and vice versa). ``profile=None`` falls back to
+    the k8s group.
     """
-    from chaos_agent.agent.nodes._side_effect_detectors import _DETECTORS
+    from chaos_agent.agent.nodes.side_effect._side_effect_detectors import detectors_for
 
     if not isinstance(verification, dict):
         return ""
@@ -397,10 +440,14 @@ def _build_side_effects_summary(verification: dict | None) -> str:
         "hpa_scaling": "HPA扩缩",
         "probe_failures": "探针失败",
         "dependency_errors": "依赖异常",
+        "process_deaths": "进程消失",
+        "filesystem_full": "磁盘写满",
+        "dmesg_oom": "内核OOM",
+        "service_down": "服务下线",
     }
 
     parts = []
-    for d in _DETECTORS:
+    for d in detectors_for(profile):
         items = detected.get(d.key, [])
         count = len(items) if isinstance(items, list) else 0
         label = _KEY_LABELS.get(d.key, d.key)
@@ -430,6 +477,13 @@ def extract_ui_diagnostics(values: dict) -> dict:
     failure_reason = outcome.failure_reason
 
     verification = read_inject_verification(values)
+    # Capability profile of the run (k8s/host) — mirrors se_detect's derivation
+    # so the side-effect summary lists only the profile that actually ran.
+    from chaos_agent.agent.spec.fault_spec import read_fault_spec
+    from chaos_agent.agent.spec.feasibility import profile_for_spec
+
+    spec = read_fault_spec(values)
+    profile = profile_for_spec(spec) if spec else None
     return {
         "failure_reason": failure_reason,
         "failure_detail": failure_detail,
@@ -437,7 +491,7 @@ def extract_ui_diagnostics(values: dict) -> dict:
         "verify_replan_count": int(values.get("verify_replan_count") or 0),
         "replan_history": list(values.get("replan_history") or []),
         "side_effects": _extract_side_effects(verification),
-        "side_effects_summary": _build_side_effects_summary(verification),
+        "side_effects_summary": _build_side_effects_summary(verification, profile),
     }
 
 
@@ -447,7 +501,7 @@ def build_status_data(task_id: str, values: dict) -> dict:
     Used by both CLI AgentRunner.status() and Server status route.
     """
 
-    from chaos_agent.agent.fault_spec import (
+    from chaos_agent.agent.spec.fault_spec import (
         fault_type_from_state,
         legacy_params_dict,
         legacy_target_dict,
@@ -552,9 +606,8 @@ class AgentState(MessagesState):
 
     # ── Planning ───────────────────────────────────────────────────
     skill_name: Optional[str] = None
-    fault_spec: Optional[dict] = None    # FaultSpec dict (see chaos_agent.agent.fault_spec)
+    fault_spec: Optional[dict] = None    # FaultSpec dict (see chaos_agent.agent.spec.fault_spec)
     skill_case_content: Optional[str] = None     # Full content of the matched skill use-case file
-    matched_use_case_path: Optional[str] = None  # Catalogue path resolved by match_use_case()
     plan: Optional[str] = None
     plan_summary: str = ""               # Human-facing execution preview / dry-run summary
     plan_path: Optional[str] = None      # saved plan file path (memory/plan/{task_id}.md)
@@ -563,7 +616,10 @@ class AgentState(MessagesState):
     _planning_rejection_reason: Optional[str] = None  # LLM rejection_reason for fail diagnosis
     _planning_alternatives: str = ""     # LLM-proposed alternatives after planning rejection
     _catalogue_rejection_nudged: bool = False  # Guard: nudge only once before accepting rejection
+    _plan_text_stall_count: int = 0      # Guard: consecutive Phase-1 text-only stalls (no tool/skill); reset on progress, fail at max_plan_text_stalls
     plan_builder_round: int = 0          # Dialogue round counter within plan_builder
+    planning_mode: Optional[str] = None  # None=auto; "guided" (options) | "expert" (direct structured plan)
+    plan_builder_prefetch_done: bool = False  # Guided orchestration read-only discovery sent
     plan_confirmed: bool = False         # submit_plan completed; /run routes to safety_check
 
     # ── Safety ─────────────────────────────────────────────────────
@@ -575,7 +631,7 @@ class AgentState(MessagesState):
     blast_radius_scope: Optional[str] = None     # "target-only" | "namespace-wide" | "cluster-wide"
     blast_radius_detail: Optional[str] = None
     target_health_report: Optional[dict] = None  # HealthReport dict (see chaos_agent.agent.target_health)
-    feasibility_report: Optional[dict] = None    # FeasibilityReport dict (see chaos_agent.agent.feasibility)
+    feasibility_report: Optional[dict] = None    # FeasibilityReport dict (see chaos_agent.agent.spec.feasibility)
 
     # ── Confirmation ───────────────────────────────────────────────
     needs_confirmation: bool = False
@@ -583,10 +639,16 @@ class AgentState(MessagesState):
     drift_reject_count: int = 0          # Target-change rejection counter
     plan_change_reject_count: int = 0    # Replan fault type switch rejection counter
     screener_route: Optional[str] = None # Transient routing hint: "pass" / "retry" / "replan"
+    # Set by agent_loop / execute_loop when the LLM response was cut off by the
+    # output token limit: its tool calls were answered with synthetic errors and
+    # must NOT reach the ToolNode (truncated args can parse yet be incomplete).
+    # The screener consumes and clears it, routing back to the loop instead.
+    truncated_tool_calls: bool = False
 
     # ── Execution ──────────────────────────────────────────────────
     blade_uid: Optional[str] = None      # ChaosBlade experiment UID
-    injection_method: Optional[str] = None   # "host_blade" | "kubectl_exec" | "kubectl_native"
+    injection_method: Optional[str] = None   # "host_blade" | "kubectl_exec" | "kubectl_native" | "host_native" | "python_agent"
+    execution_artifacts: Optional[list[dict]] = None  # Durable created/modified resources for guard/recover
     kubectl_exec_pod_name: Optional[str] = None  # Tool pod used during kubectl exec injection
     blade_parsed_flags: Optional[dict] = None    # {"path": "/tmp", "percent": "85", ...}
     direct: bool = False                 # True: skip LLM, go direct path
@@ -595,6 +657,14 @@ class AgentState(MessagesState):
     kube_context: Optional[str] = None
     kubewiz_cluster_uuid: Optional[str] = None
     kubewiz_profile: Optional[str] = None
+    # Explicit channel override (per-session); empty = field-based inference.
+    kube_connection_mode: Optional[str] = None
+    # Host transport parameters (per-session override)
+    host_name: Optional[str] = None
+    ssh_host: Optional[str] = None
+    ssh_user: Optional[str] = None
+    ssh_key_path: Optional[str] = None
+    ssh_port: Optional[int] = None
     inject_context: Optional[str] = None     # Inject-phase context for recover LLM
     baseline_data: Optional[dict] = None     # Pre-injection baseline (from baseline_capture node)
     target_metadata: Optional[dict] = None   # {pod_memory_limit_mb, active_same_action_experiments, ...}
@@ -603,8 +673,8 @@ class AgentState(MessagesState):
     disk_fill_post_check: Optional[dict] = None   # Post-injection fill file verification
     se_snapshot: Optional[dict] = None       # Pre-injection side-effect snapshot
     force_override: bool = False             # CLI --force-override flag
-    _execute_text_nudged: bool = False       # Guard: nudge execute_loop only once for text-only exit
-    _kubectl_step_nudged: bool = False       # Guard: nudge kubectl-native incomplete steps only once
+    _execute_text_stall_count: int = 0       # Guard: consecutive text-only stalls (no tool/injection/replan); reset on any tool call, fail at max_execute_text_stalls
+    _injection_selfcheck_nudged: bool = False  # Guard: emit multi-step injection step self-check only once
     batch_submit_args: Optional[dict] = None     # Multi-fault submit_plan args
     current_fault_index: int = 0
     batch_results: Optional[list] = None
@@ -631,14 +701,25 @@ class AgentState(MessagesState):
     agent_loop_count: int = 0
     execute_loop_count: int = 0
     verifier_loop_count: int = 0
+    # How many times each corrective hint has been issued, keyed by
+    # ``"<kind>:<key>"``. Lives on state rather than being counted from the hint
+    # MESSAGES because compaction rewrites ``messages`` and leaves other fields
+    # alone: a hint is recorded at its first occurrence, which is early in the
+    # history, so once the drill outgrows ``reserve_tokens`` that message lands in
+    # the summarised half and is removed. Counting from messages then resets to
+    # zero and the model is told "reminder #1" after twenty real occurrences —
+    # exactly the amnesia the persistence was added to fix.
+    hint_repeat_counts: dict[str, int] = {}
     pipeline_started_at: float = 0.0     # Wall-clock guard (0.0 = not yet stamped)
     transient_retry_count: int = 0       # INFRA_TRANSIENT short-retry budget
     pipeline_attempt: int = 0            # Attempt tracking (incremented by begin_attempt)
     pipeline_attempts_history: Optional[list] = None
     replan_requested: bool = False
     replan_count: int = 0
+    replan_request: Optional[dict] = None       # Structured Phase 2 -> Phase 1 request
     replan_context: Optional[dict] = None
     replan_history: Optional[list] = None
+    replan_context_injected_attempt: Optional[int] = None  # One persisted handoff per replan attempt
     _replan_loop_reset: Optional[int] = None  # Tracks total replan count (execute + verify) that has been loop-reset
     verify_replan_count: int = 0              # Independent counter for verify-triggered replan
 
@@ -671,6 +752,9 @@ class IntentState(MessagesState):
     tui_session_id: str = ""
     interaction_mode: str = "tui"
 
+    # Corrective-hint repeat counts; see AgentState.hint_repeat_counts.
+    hint_repeat_counts: dict[str, int] = {}
+
     # Intent recognition
     confirmed_intent: Optional[str] = None
     intent_confidence: float = 0.0
@@ -699,6 +783,14 @@ class IntentState(MessagesState):
     kube_context: Optional[str] = None
     kubewiz_cluster_uuid: Optional[str] = None
     kubewiz_profile: Optional[str] = None
+    # Explicit channel override (per-session); empty = field-based inference.
+    kube_connection_mode: Optional[str] = None
+    # Host transport parameters (per-session override)
+    host_name: Optional[str] = None
+    ssh_host: Optional[str] = None
+    ssh_user: Optional[str] = None
+    ssh_key_path: Optional[str] = None
+    ssh_port: Optional[int] = None
     needs_confirmation: bool = False
     dry_run: bool = False
     compressed_summary: Optional[str] = None

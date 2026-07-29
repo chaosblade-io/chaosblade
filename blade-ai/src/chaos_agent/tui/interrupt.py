@@ -106,9 +106,36 @@ class InterruptHandler:
                         display_mode=display_mode,
                         state=self._state,
                     )
-            elif interrupt_type == "confirmation":
+            elif interrupt_type in ("confirmation", "plan_change"):
                 from chaos_agent.tui.renderers import confirm as confirm_renderer
-                answer = await confirm_renderer.run(self._console, interrupt_info)
+                if interrupt_type == "plan_change":
+                    original = interrupt_info.get("original") or {}
+                    proposed = interrupt_info.get("proposed") or {}
+                    reason = interrupt_info.get("reason") or ""
+                    original_fault = original.get("fault_spec") or {}
+                    proposed_fault = proposed.get("fault_spec") or {}
+                    confirm_info = {
+                        **interrupt_info,
+                        "plan_summary": "确认采用调整后的故障方案。",
+                        "plan_fields": {
+                            "当前故障": original.get("fault_type") or "-",
+                            "建议故障": proposed.get("fault_type") or "-",
+                            "当前意图": original_fault.get("objective") or "-",
+                            "建议意图": proposed_fault.get("objective") or "-",
+                            "当前目标": _format_plan_target(original_fault),
+                            "建议目标": _format_plan_target(proposed_fault),
+                            "当前参数": _format_plan_params(original_fault),
+                            "建议参数": _format_plan_params(proposed_fault),
+                            "当前边界": "；".join(original.get("boundaries") or []) or "-",
+                            "建议边界": "；".join(proposed.get("boundaries") or []) or "-",
+                            "当前约束": "；".join(original.get("constraints") or []) or "-",
+                            "建议约束": "；".join(proposed.get("constraints") or []) or "-",
+                            "调整原因": reason or "-",
+                        },
+                    }
+                    answer = await confirm_renderer.run(self._console, confirm_info)
+                else:
+                    answer = await confirm_renderer.run(self._console, interrupt_info)
             else:
                 from chaos_agent.tui.renderers import question as question_renderer
                 answer = await question_renderer.run(self._console, interrupt_info)
@@ -127,3 +154,20 @@ class InterruptHandler:
             self._console.print("")
 
         return answer
+
+
+def _format_plan_target(intent: dict) -> str:
+    """Render the generic target selector in a compact confirmation row."""
+
+    namespace = str(intent.get("namespace") or "-")
+    names = ", ".join(str(name) for name in intent.get("names") or []) or "*"
+    labels = intent.get("labels") or {}
+    label_text = ", ".join(
+        f"{key}={value}" for key, value in labels.items()
+    )
+    return f"{namespace}/{names}" + (f" ({label_text})" if label_text else "")
+
+
+def _format_plan_params(intent: dict) -> str:
+    params = intent.get("params") or {}
+    return ", ".join(f"{key}={value}" for key, value in params.items()) or "-"

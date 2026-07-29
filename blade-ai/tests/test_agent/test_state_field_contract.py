@@ -7,13 +7,13 @@ from dataclasses import fields
 from pathlib import Path
 
 from chaos_agent.agent.state import AgentState
-from chaos_agent.agent.state_contract import (
+from chaos_agent.agent.state_mgmt.state_contract import (
     STATE_FIELD_CONTRACTS,
     STATE_HIGH_RISK_FIELDS,
     STATE_LEGACY_COMPAT_FIELDS,
     StateFieldContract,
 )
-from chaos_agent.agent.state_lifecycle import iter_state_fields
+from chaos_agent.agent.state_mgmt.state_lifecycle import iter_state_fields
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -159,8 +159,8 @@ def test_legacy_target_and_params_are_compatibility_only():
         contract = STATE_FIELD_CONTRACTS[field]
         assert contract.source_of_truth == "fault_spec"
         assert set(contract.direct_read_paths) == {
-            "src/chaos_agent/agent/fault_spec.py",
-            "src/chaos_agent/agent/task_snapshot.py",
+            "src/chaos_agent/agent/spec/fault_spec.py",
+            "src/chaos_agent/agent/result/task_snapshot.py",
         }
 
 
@@ -169,9 +169,9 @@ def test_legacy_fault_type_is_recover_boundary_compatibility_only():
 
     assert contract.source_of_truth == "fault_spec"
     assert set(contract.direct_read_paths) == {
-        "src/chaos_agent/agent/fault_spec.py",
-        "src/chaos_agent/agent/recovery_state.py",
-        "src/chaos_agent/agent/task_snapshot.py",
+        "src/chaos_agent/agent/spec/fault_spec.py",
+        "src/chaos_agent/agent/state_mgmt/recovery_state.py",
+        "src/chaos_agent/agent/result/task_snapshot.py",
     }
 
 
@@ -183,7 +183,7 @@ def test_operation_outcome_fields_are_helper_owned():
         assert contract.source_of_truth == "operation_outcome"
         assert contract.canonical_reader == "read_operation_outcome"
         assert contract.direct_read_paths == (
-            "src/chaos_agent/agent/operation_outcome.py",
+            "src/chaos_agent/agent/result/operation_outcome.py",
         )
 
 
@@ -196,6 +196,6 @@ def test_skill_name_is_active_skill_not_reported_fault_type():
     assert "read_active_skill_name" in contract.canonical_reader
     assert "fault_type_from_state" in contract.canonical_reader
     assert set(contract.direct_read_paths) == {
-        "src/chaos_agent/agent/fault_spec.py",
-        "src/chaos_agent/agent/skill_identity.py",
+        "src/chaos_agent/agent/spec/fault_spec.py",
+        "src/chaos_agent/agent/spec/skill_identity.py",
     }

@@ -6,11 +6,11 @@ import uuid
 
 from fastapi import Request
 
-from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.operation_result import (
+from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.result.operation_result import (
     build_inject_status_data_from_state,
 )
-from chaos_agent.agent.state_builders import build_inject_initial_state
+from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.session_finalizer import (
     RESULT_SUMMARY_STATUS_ENVELOPE,
@@ -62,6 +62,12 @@ async def inject_fault(request: InjectRequest, req: Request):
         kube_context=request.context or settings.kube_context,
         kubewiz_cluster_uuid=getattr(request, "cluster_uuid", "") or settings.kubewiz_cluster_uuid,
         kubewiz_profile=getattr(request, "profile", "") or settings.kubewiz_profile,
+        kube_connection_mode=getattr(request, "kube_connection_mode", "") or settings.kube_connection_mode,
+        host_name=getattr(request, "host_name", "") or getattr(settings, "host_name", ""),
+        ssh_host=getattr(request, "ssh_host", "") or getattr(settings, "ssh_host", ""),
+        ssh_user=getattr(request, "ssh_user", "") or getattr(settings, "ssh_user", ""),
+        ssh_key_path=getattr(request, "ssh_key_path", "") or getattr(settings, "ssh_key_path", ""),
+        ssh_port=getattr(request, "ssh_port", None) or getattr(settings, "ssh_port", None),
     )
 
     # Execute inject graph asynchronously

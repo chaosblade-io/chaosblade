@@ -22,18 +22,18 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from chaos_agent.agent.fault_spec import (
+from chaos_agent.agent.spec.fault_spec import (
     SOURCE_TUI,
     FaultSpec,
     read_fault_spec,
 )
-from chaos_agent.agent.nodes.baseline_capture import (
+from chaos_agent.agent.nodes.baseline.baseline_capture import (
     BaselineCommand,
     _resolve_templates,
 )
-from chaos_agent.agent.nodes.confirmation_gate import _freeze_from_state
-from chaos_agent.agent.nodes.memory_nodes import load_memory
-from chaos_agent.agent.nodes.safety_check import safety_check
+from chaos_agent.agent.nodes.gates.confirmation_gate import _freeze_from_state
+from chaos_agent.agent.nodes.store.memory_nodes import load_memory
+from chaos_agent.agent.nodes.gates.safety_check import safety_check
 from chaos_agent.config.settings import settings
 
 
@@ -75,8 +75,8 @@ class TestNlPathFaultSpecFlow:
         # Stage 2: load_memory runs. spec is still placeholder.
         with patch("chaos_agent.persistence.task_store.get_task_store",
                    new=AsyncMock()), \
-             patch("chaos_agent.agent.nodes.memory_nodes.OperationalMemory") as MockMem, \
-             patch("chaos_agent.agent.nodes.memory_nodes.sync_to_store",
+             patch("chaos_agent.agent.nodes.store.memory_nodes.OperationalMemory") as MockMem, \
+             patch("chaos_agent.agent.nodes.store.memory_nodes.sync_to_store",
                    new=AsyncMock()):
             MockMem.return_value.read.return_value = ""
             updates = await load_memory(state)
@@ -105,7 +105,7 @@ class TestNlPathFaultSpecFlow:
         state["confirmed_intent"] = "inject"
 
         # Stage 4: safety_check reads spec, should NOT reject.
-        with patch("chaos_agent.agent.nodes.safety_check.sync_to_store",
+        with patch("chaos_agent.agent.nodes.gates.safety_check.sync_to_store",
                    new=AsyncMock()):
             sc_result = await safety_check(state)
             state.update(sc_result)
@@ -125,7 +125,7 @@ class TestNlPathFaultSpecFlow:
         # Stage 6 — THE KEY ASSERTION: baseline_capture's template
         # resolution sees the right node name.
         cmds = [BaselineCommand(
-            "Node CPU info", "describe", "node {node_name}",
+            "Node CPU info", "kubectl describe node {node_name}",
         )]
         resolved = _resolve_templates(cmds, state)
         assert len(resolved) == 1
@@ -162,7 +162,7 @@ class TestNlPathFaultSpecFlow:
             "safety_status": "pending",
         }
 
-        with patch("chaos_agent.agent.nodes.safety_check.sync_to_store",
+        with patch("chaos_agent.agent.nodes.gates.safety_check.sync_to_store",
                    new=AsyncMock()):
             sc_result = await safety_check(state)
             state.update(sc_result)
@@ -213,7 +213,7 @@ class TestCliStructuredSpecPersistence:
         }
 
         # Each node reads the spec; afterwards it must be unchanged.
-        with patch("chaos_agent.agent.nodes.safety_check.sync_to_store",
+        with patch("chaos_agent.agent.nodes.gates.safety_check.sync_to_store",
                    new=AsyncMock()):
             sc_result = await safety_check(state)
             state.update(sc_result)
@@ -233,7 +233,7 @@ class TestCliStructuredSpecPersistence:
 
         # baseline_capture's template resolution
         cmds = [BaselineCommand(
-            "Pod inspect", "describe", "pod {pod_name} -n {namespace}",
+            "Pod inspect", "kubectl describe pod {pod_name} -n {namespace}",
         )]
         resolved = _resolve_templates(cmds, state)
         assert resolved[0]["_unresolved"] is False
@@ -290,7 +290,7 @@ class TestApprovalCycleFromSpec:
 @pytest.mark.asyncio
 class TestCliNlPathSpecDerivation:
     """CLI NL (``blade-ai inject --input "..."``) skips intent_clarification
-    (route_after_load_memory checks interaction_mode). The placeholder
+    (route_pipeline_start checks interaction_mode). The placeholder
     spec written at entry has empty scope/blade_target/blade_action/names.
 
     For the inject to actually proceed, the spec must get populated
@@ -310,10 +310,10 @@ class TestCliNlPathSpecDerivation:
         + agent_loop derives namespace/names → safety_check sees a
         complete spec and accepts."""
         from langchain_core.messages import AIMessage, ToolMessage
-        from chaos_agent.agent.nodes.extract_planning_metadata import (
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
             extract_planning_metadata,
         )
-        from chaos_agent.agent.nodes.agent_loop import (
+        from chaos_agent.agent.nodes.execute.agent_loop import (
             _derive_spec_fields_from_kubectl_get,
         )
 
@@ -384,7 +384,7 @@ class TestCliNlPathSpecDerivation:
             state["fault_spec"] = spec_after_ep.replace(**updates).to_dict()
 
         # Stage 3: safety_check must now accept (spec is_complete)
-        with patch("chaos_agent.agent.nodes.safety_check.sync_to_store",
+        with patch("chaos_agent.agent.nodes.gates.safety_check.sync_to_store",
                    new=AsyncMock()):
             sc_result = await safety_check(state)
         assert sc_result["safety_status"] != "rejected", (

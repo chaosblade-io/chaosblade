@@ -106,7 +106,7 @@ async def write_model(req: Request, payload: dict = Body(...)):
     so ``settings.reload()`` runs identically and any future cold-key
     classification change picks this up automatically.
     """
-    from chaos_agent.tui.config_store import ConfigStore
+    from chaos_agent.config.config_store import ConfigStore
 
     raw = payload.get("model_name")
     if not isinstance(raw, str) or not raw.strip():

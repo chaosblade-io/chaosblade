@@ -30,9 +30,9 @@ from langchain_core.messages import (
     SystemMessage,
 )
 
-from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.nodes import intent_confirm as ic_mod
-from chaos_agent.agent.nodes.intent_confirm import intent_confirm
+from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.nodes.planning import intent_confirm as ic_mod
+from chaos_agent.agent.nodes.planning.intent_confirm import intent_confirm
 
 
 def _spec(
@@ -74,6 +74,15 @@ class TestIntentConfirmInterruptPayload:
     captures its argument; we read the dict the node tried to send."""
 
     @pytest.mark.asyncio
+    async def test_unknown_scope_is_rejected_before_interrupt(self):
+        state = _state(fault_spec=_spec(scope="typo_scope"))
+
+        result = await intent_confirm(state)
+
+        assert result["confirmed_intent"] is None
+        assert "不支持的 scope" in result["messages"][0].content
+
+    @pytest.mark.asyncio
     async def test_payload_carries_intent_confidence(self):
         captured: dict = {}
 
@@ -81,7 +90,7 @@ class TestIntentConfirmInterruptPayload:
             captured.update(info)
             raise RuntimeError("interrupt-stub")
 
-        with patch("chaos_agent.agent.nodes.intent_confirm.interrupt", fake_interrupt):
+        with patch("chaos_agent.agent.nodes.planning.intent_confirm.interrupt", fake_interrupt):
             with pytest.raises(RuntimeError, match="interrupt-stub"):
                 await intent_confirm(_state())
 
@@ -108,7 +117,7 @@ class TestIntentConfirmInterruptPayload:
 
         state = _state()
         state.pop("intent_confidence")
-        with patch("chaos_agent.agent.nodes.intent_confirm.interrupt", fake_interrupt):
+        with patch("chaos_agent.agent.nodes.planning.intent_confirm.interrupt", fake_interrupt):
             with pytest.raises(RuntimeError, match="interrupt-stub"):
                 await intent_confirm(state)
 
@@ -129,30 +138,14 @@ class TestIntentConfirmDecisionRouting:
         assert summary.startswith("[Intent Clarification Summary]")
 
     @pytest.mark.asyncio
-    async def test_rejected_clears_confirmed_intent_only(self):
-        """Rejection must reset only ``confirmed_intent`` so the router
-        takes the END path. The ``fault_spec`` written by the upstream
-        ``intent_clarification`` is intentionally preserved — the user
-        typically wants to refine the same intent in the next turn
-        (change namespace, add a label selector, …), and clearing it
-        would force ``intent_clarification`` to re-collect every fact
-        from scratch. Pinning this asymmetry stops a future "tidy-up"
-        refactor from re-introducing the regression where rejection
-        wipes the partial intent state.
-        """
+    async def test_rejected_keeps_reviewed_fault_spec_for_refinement(self):
+        """Rejection keeps the sole reviewed contract for the next dialogue turn."""
         with patch(
-            "chaos_agent.agent.nodes.intent_confirm.interrupt",
+            "chaos_agent.agent.nodes.planning.intent_confirm.interrupt",
             return_value="rejected",
         ):
             result = await intent_confirm(_state())
         assert result == {"confirmed_intent": None}
-        # Defensive: explicitly assert the spec key is NOT in the delta
-        # (so LangGraph's add_messages reducer leaves state.fault_spec
-        # untouched). A future regression that adds ``"fault_spec":
-        # None`` to the delta would silently nuke the spec — this
-        # second assertion catches it independently of dict equality.
-        assert "fault_spec" not in result
-        assert "fault_intent" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +238,10 @@ class TestIntentConfirmRejectedPreservesDialogue:
             "so the next turn iterates on established context"
         )
         assert result.get("confirmed_intent") is None
-        # The whole point of Option A: rejection MUST also preserve
-        # the spec so the next ``intent_clarification`` round can
-        # merge on top of what was already captured rather than
-        # re-collecting every fact. A future regression that wipes
-        # ``fault_spec`` on reject would re-introduce the "agent
-        # forgot the last 5 rounds" UX bug this change fixed.
+        # FaultSpec is the sole continuation state. Rejection must not clear
+        # it, because the next turn may refine this reviewed contract.
         assert "fault_spec" not in result
+        assert "batch_submit_args" not in result
 
 
 class TestIntentConfirmDryRunHandoff:

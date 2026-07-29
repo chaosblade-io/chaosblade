@@ -49,6 +49,12 @@
    # 1) 先建一个【长驻】临时容器作为执行载体。必须用 `sleep` 保活 ——
    #    若直接把 tc 命令交给 kubectl debug，命令跑完容器立即终止，
    #    后续 `kubectl exec -c <debugger>` 会报 `container not found`，故障就没法恢复了。
+   # 0) 前置安全检查：确认目标 Pod 不是 hostNetwork。hostNetwork=true 的 Pod
+   #    其网络命名空间【就是宿主机】，临时容器里的 tc 会打穿整个节点，
+   #    爆炸半径从单 Pod 扩大到整台机器。为 true 时禁止此路径，改用 node 级用例。
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.hostNetwork}'
+   # 期望输出为空或 false；输出 true 则停止。
+
    kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
      --target=<container-name> --profile=netadmin --quiet -- sleep <duration>
 

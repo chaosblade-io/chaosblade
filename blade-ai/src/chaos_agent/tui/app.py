@@ -14,7 +14,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from chaos_agent.tui import strings
-from chaos_agent.tui.config_store import ConfigStore
+from chaos_agent.config.config_store import ConfigStore
 from chaos_agent.tui.console import ChaosConsole
 from chaos_agent.tui.controllers.commands import CommandDispatcher
 from chaos_agent.tui.controllers.conversation import ConversationController
@@ -31,7 +31,7 @@ from chaos_agent.tui.renderers import goodbye as goodbye_renderer
 from chaos_agent.tui.renderers import onboarding as onboarding_renderer
 from chaos_agent.tui.renderers import preflight as preflight_renderer
 from chaos_agent.tui.renderers import welcome as welcome_renderer
-from chaos_agent.tui.state import SessionState
+from chaos_agent.tui.state import PermissionMode, SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +146,15 @@ async def run_tui_async() -> None:
     config_store = ConfigStore()
 
     from chaos_agent.config.settings import settings
+
+    # Wire the persisted "权限模式" preference (config.json / onboarding
+    # ``confirmation_required``) into the runtime permission mode so the choice
+    # actually takes effect at startup: False → boot into ✻ 自动模式, True
+    # (default) → 🔒 确认模式. Shift+Tab still cycles the mode at runtime.
+    state.permission_mode = (
+        PermissionMode.CONFIRM if settings.confirmation_required
+        else PermissionMode.AUTO
+    )
 
     # PR-E1 — every dispatched TUIEvent is appended to a per-task JSONL
     # under <memory_dir>/recordings/. The recorder is best-effort; it

@@ -7,7 +7,49 @@ import pytest
 
 from chaos_agent.errors import ToolGuardError, ToolTimeoutError
 from chaos_agent.tools.guard import CommandResult
-from chaos_agent.tools.shell import get_tool_guard, run_command
+from chaos_agent.tools import shell as shell_module
+from chaos_agent.tools.shell import (
+    _prepare_spawn_command,
+    get_tool_guard,
+    run_command,
+)
+
+
+class TestPrepareSpawnCommand:
+    """Test the platform-specific subprocess launch contract."""
+
+    def test_linux_forces_posix_spawn_compatible_options(self, monkeypatch):
+        monkeypatch.setattr(shell_module.sys, "platform", "linux")
+        monkeypatch.setattr(shell_module.shutil, "which", lambda name: "/usr/bin/setsid")
+
+        command, kwargs = _prepare_spawn_command(["/usr/bin/kubectl", "get", "pods"])
+
+        assert command == [
+            "/usr/bin/setsid",
+            "/usr/bin/kubectl",
+            "get",
+            "pods",
+        ]
+        assert kwargs == {
+            "close_fds": False,
+            "start_new_session": False,
+        }
+
+    def test_linux_requires_setsid(self, monkeypatch):
+        monkeypatch.setattr(shell_module.sys, "platform", "linux")
+        monkeypatch.setattr(shell_module.shutil, "which", lambda name: None)
+        monkeypatch.setattr(shell_module.os.path, "isfile", lambda path: False)
+
+        with pytest.raises(RuntimeError, match="requires the 'setsid' executable"):
+            _prepare_spawn_command(["/usr/bin/kubectl", "get", "pods"])
+
+    def test_non_linux_keeps_native_session_creation(self, monkeypatch):
+        monkeypatch.setattr(shell_module.sys, "platform", "darwin")
+
+        command, kwargs = _prepare_spawn_command(["/usr/bin/kubectl", "get", "pods"])
+
+        assert command == ["/usr/bin/kubectl", "get", "pods"]
+        assert kwargs == {"start_new_session": True}
 
 
 class TestRunCommandSuccess:
@@ -123,7 +165,7 @@ class TestRunCommandAuditLog:
         mock_guard.audit_log = MagicMock()
         mocker.patch("chaos_agent.tools.shell.get_tool_guard", return_value=mock_guard)
 
-        result = await run_command(["blade", "status"], task_id="task-1")
+        await run_command(["blade", "status"], task_id="task-1")
         mock_guard.audit_log.assert_called_once()
 
     async def test_skip_guard_no_audit(self, mocker):

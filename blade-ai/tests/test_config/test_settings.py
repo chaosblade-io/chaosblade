@@ -1,8 +1,40 @@
 """Tests for pydantic-settings configuration."""
 
+import pytest
+
+
+class TestSettingsSshPortValidation:
+    """ssh_port must be a valid TCP port at config-load time."""
+
+    @pytest.mark.parametrize("port", [1, 22, 2222, 65535])
+    def test_valid_ssh_port_accepted(self, port):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test", ssh_port=port)
+        assert s.ssh_port == port
+
+    @pytest.mark.parametrize("port", [0, -1, 65536, 99999])
+    def test_out_of_range_ssh_port_raises(self, port):
+        from chaos_agent.config.settings import Settings
+
+        with pytest.raises(ValueError):
+            Settings(llm_api_key="test", ssh_port=port)
+
 
 class TestSettingsDefaults:
     """Test default values for Settings."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self, monkeypatch, tmp_path):
+        # Point the config file at a nonexistent path so these default
+        # assertions never read the developer's real ~/.blade-ai/config.json
+        # (which may set e.g. confirmation_required=false and flip an
+        # otherwise-default assertion). Mirrors the per-test isolation
+        # TestSettingsPriority already applies.
+        monkeypatch.setattr(
+            "chaos_agent.config.settings._CONFIG_FILE",
+            tmp_path / "nonexistent.json",
+        )
 
     def test_default_model_name(self):
         from chaos_agent.config.settings import Settings
@@ -40,8 +72,8 @@ class TestSettingsDefaults:
         from chaos_agent.config.settings import Settings
 
         s = Settings(llm_api_key="test")
-        assert s.timeout_blade == 30
-        assert s.timeout_kubectl == 30
+        assert s.timeout_blade == 60
+        assert s.timeout_kubectl == 60
         assert s.timeout_kubectl_exec == 180
         # LLM timeout split into connect (fast-fail on bad URL/DNS) vs
         # read (generous so thinking models aren't cut off mid-inference).
@@ -64,7 +96,7 @@ class TestSettingsDefaults:
         from chaos_agent.config.settings import Settings
 
         s = Settings(llm_api_key="test")
-        assert s.retry_max_retries == 3
+        assert s.retry_max_retries == 2
         assert s.retry_base_delay == 1.0
         assert s.retry_max_delay == 30.0
         assert s.retry_exponential_base == 2.0
@@ -209,7 +241,7 @@ class TestEmptyStringFallback:
         assert s.api_base_url == (
             "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
-        assert s.model_name == "qwen3.6-max-preview"
+        assert s.model_name == "qwen3.7-plus"
 
     def test_whitespace_only_string_in_config_treated_as_unset(
         self, monkeypatch, tmp_path,
@@ -227,7 +259,7 @@ class TestEmptyStringFallback:
         monkeypatch.delenv("BLADE_AI_MODEL_NAME", raising=False)
 
         s = Settings()
-        assert s.model_name == "qwen3.6-max-preview"
+        assert s.model_name == "qwen3.7-plus"
 
     def test_explicit_non_empty_string_in_config_still_overrides_env(
         self, monkeypatch, tmp_path,
@@ -270,13 +302,78 @@ class TestResolveContextBudget:
 
         # 同时匹配 "qwen3.6-max" 和 "qwen3"，最长前缀（更精确）胜出
         s = Settings(llm_api_key="test", model_name="qwen3.6-max-preview")
-        assert s.resolve_context_budget("qwen3.6-max-preview") == (131_072, 0.80)
+        assert s.resolve_context_budget("qwen3.6-max-preview") == (262_144, 0.80)
+
+    def test_qwen37_generation_1m_window(self):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test")
+        # 3.7 全系 1M；注意 "qwen3.7" 必须胜过 "qwen-plus"(32K)
+        assert s.resolve_context_budget("qwen3.7-max") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("qwen3.7-plus") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("qwen3.7-flash") == (1_000_000, 0.80)
+        # 旧代际不受影响
+        assert s.resolve_context_budget("qwen3.6-max-x") == (262_144, 0.80)
+        assert s.resolve_context_budget("qwen-plus-2024") == (32_768, 0.80)
+
+    def test_qwen_coder_variant_windows(self):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test")
+        # coder-plus/flash 为 1M；coder-next 等其余 coder 落到 256k 下界
+        assert s.resolve_context_budget("qwen3-coder-plus") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("qwen3-coder-flash") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("qwen3-coder-next") == (262_144, 0.80)
 
     def test_qwen_plus_smaller_window(self):
         from chaos_agent.config.settings import Settings
 
         s = Settings(llm_api_key="test")
         assert s.resolve_context_budget("qwen-plus-2024") == (32_768, 0.80)
+
+    def test_openai_gpt5_and_gpt41_prefixes(self):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test")
+        assert s.resolve_context_budget("gpt-5.2") == (400_000, 0.80)
+        # "gpt-4.1" 比 "gpt-4" 更长，精确前缀胜出（1M 窗口）
+        assert s.resolve_context_budget("gpt-4.1-mini") == (1_047_576, 0.80)
+        assert s.resolve_context_budget("gpt-4o-2024") == (128_000, 0.85)
+        assert s.resolve_context_budget("o3-mini") == (200_000, 0.85)
+
+    def test_deepseek_endpoint_prefix_beats_generic(self):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test")
+        # 官方端点名（V4 起 1M）优先于保守的泛化 "deepseek" 64K 兜底
+        assert s.resolve_context_budget("deepseek-chat") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("deepseek-reasoner") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("deepseek-v4") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("deepseek-v2") == (64_000, 0.80)
+
+    def test_anthropic_1m_generation_beats_legacy_prefix(self):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test")
+        # 4.6 起 1M GA；4.5 及更早代际回落到泛化前缀的 200K
+        assert s.resolve_context_budget("claude-opus-4-6") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("claude-sonnet-4-6") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("claude-sonnet-5") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("claude-opus-4-5") == (200_000, 0.85)
+
+    def test_new_vendor_entries(self):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test")
+        assert s.resolve_context_budget("gemini-2.5-flash") == (1_048_576, 0.80)
+        assert s.resolve_context_budget("glm-5.2") == (1_000_000, 0.80)
+        assert s.resolve_context_budget("glm-5") == (200_000, 0.85)
+        assert s.resolve_context_budget("glm-4.6") == (200_000, 0.85)
+        assert s.resolve_context_budget("glm-4-plus") == (128_000, 0.85)
+        assert s.resolve_context_budget("kimi-k3") == (1_048_576, 0.80)
+        assert s.resolve_context_budget("kimi-k2-thinking") == (262_144, 0.80)
+        assert s.resolve_context_budget("grok-4-fast") == (2_000_000, 0.80)
+        assert s.resolve_context_budget("grok-4-0709") == (256_000, 0.80)
 
     def test_case_insensitive_match(self):
         from chaos_agent.config.settings import Settings
@@ -430,3 +527,61 @@ class TestResolveContextBudget:
 
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 2
+
+
+class TestKubeConnectionModeValidator:
+    """Validate the explicit channel override at config-load time."""
+
+    def test_empty_mode_ok(self):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test", kube_connection_mode="")
+        assert s.kube_connection_mode == ""
+
+    def test_valid_modes_ok(self):
+        from chaos_agent.config.settings import Settings
+
+        for mode in ("kubeconfig", "kubewiz_k8s", "kubewiz_host", "ssh"):
+            s = Settings(llm_api_key="test", kube_connection_mode=mode)
+            assert s.kube_connection_mode == mode
+
+    def test_invalid_mode_raises(self):
+        import pytest
+        from pydantic import ValidationError
+        from chaos_agent.config.settings import Settings
+
+        with pytest.raises(ValidationError, match="kube_connection_mode"):
+            Settings(llm_api_key="test", kube_connection_mode="aaa")
+
+    def test_legacy_kubewiz_value_rejected(self):
+        """The old literal 'kubewiz' is no longer a valid value."""
+        import pytest
+        from pydantic import ValidationError
+        from chaos_agent.config.settings import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(llm_api_key="test", kube_connection_mode="kubewiz")
+
+
+class TestSettingsSshStrictHostKeyChecking:
+    """ssh_strict_host_key_checking must be one of accept-new/yes/no."""
+
+    def test_valid_values_ok(self):
+        from chaos_agent.config.settings import Settings
+
+        for v in ("accept-new", "yes", "no"):
+            s = Settings(llm_api_key="test", ssh_strict_host_key_checking=v)
+            assert s.ssh_strict_host_key_checking == v
+
+    def test_default_is_accept_new(self):
+        from chaos_agent.config.settings import Settings
+
+        assert Settings(llm_api_key="test").ssh_strict_host_key_checking == "accept-new"
+
+    def test_invalid_value_raises(self):
+        import pytest
+        from pydantic import ValidationError
+        from chaos_agent.config.settings import Settings
+
+        with pytest.raises(ValidationError):
+            Settings(llm_api_key="test", ssh_strict_host_key_checking="true")

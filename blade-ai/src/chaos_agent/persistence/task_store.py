@@ -27,6 +27,7 @@ import logging
 from typing import Optional
 
 from chaos_agent.config.settings import settings
+from chaos_agent.persistence.task_identity import is_real_task_id
 from chaos_agent.persistence.task_store_backend import (
     StorageBackend,
     _DETAIL_COLUMNS,
@@ -64,8 +65,15 @@ class TaskStore:
         3. Infers ``task_state`` / ``stage`` / ``phase``.
         4. Sets ``gmt_create`` (preserved on update) / ``gmt_modified``.
         5. Splits merged fields into tasks + task_details and writes both.
+
+        Non-task callers are rejected up front: only a real ``task-``
+        identity may create or mutate a row (see
+        ``persistence.task_identity``).  Conversation thread ids
+        (``chaos-<session>``), per-turn ids (``turn-<hex>``) and
+        placeholders (``"unknown"``) describe a *dialogue*, not a task,
+        and previously leaked in as "ghost" experiments.
         """
-        if not task_id or task_id.startswith("turn-"):
+        if not is_real_task_id(task_id):
             return
 
         # 1. Read current tasks row
@@ -110,8 +118,11 @@ class TaskStore:
         to mark the ORIGINAL inject task as ``recovered`` /
         ``partial_recovered`` / ``failed`` without overwriting its
         ``operation``, ``result``, or ``verification`` fields.
+
+        Same identity guard as :meth:`upsert` — only a real ``task-``
+        id may be written.
         """
-        if not task_id or task_id.startswith("turn-"):
+        if not is_real_task_id(task_id):
             return
         await self._backend.upsert_task(task_id, ["task_state"], [task_state])
 
@@ -160,8 +171,11 @@ class TaskStore:
                 "skill": d.get("skill_name", ""),
                 "fault_type": fault_type,
                 "target": target,
+                "target_name": d.get("target_name", ""),
                 "params": detail.get("params") or {},
                 "blade_uid": d.get("blade_uid", ""),
+                "plan_summary": detail.get("plan_summary") or "",
+                "gmt_create": d.get("gmt_create", ""),
                 "status": "success" if not d.get("error") else "failed",
                 "error": d.get("error"),
             })
@@ -446,7 +460,7 @@ class TaskStore:
     @staticmethod
     def _compute_fault_type(task: dict) -> str:
         """Infer fault_type through the shared FaultSpec projection."""
-        from chaos_agent.agent.fault_spec import FaultSpec, fault_type_from_state
+        from chaos_agent.agent.spec.fault_spec import FaultSpec, fault_type_from_state
 
         state = dict(task or {})
         params = task.get("params") or {}

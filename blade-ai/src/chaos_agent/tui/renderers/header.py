@@ -25,9 +25,24 @@ def print_banner(console: ChaosConsole, state: SessionState) -> None:
     text.append(f"✻ {strings.BRAND_NAME}", style=f"bold {Theme.gradient_bright}")
     text.append(f"  v{version}", style=f"italic {Theme.gradient_dim}")
     text.append("  │  ", style=Theme.gradient_dim)
-    text.append(f"cluster: {state.cluster_name or '(auto)'}", style=Theme.gradient_mid)
-    text.append("  │  ", style=Theme.gradient_dim)
-    text.append(f"ns: {state.namespace}", style=Theme.gradient_mid)
+    # Locator segment follows the active profile: a host-scope channel targets a
+    # bare host (show its name), a k8s channel targets a cluster (show cluster/ns).
+    if _is_host_profile():
+        from chaos_agent.config.settings import settings
+        text.append(f"host: {settings.host_name or '(auto)'}", style=Theme.gradient_mid)
+    else:
+        text.append(f"cluster: {state.cluster_name or '(auto)'}", style=Theme.gradient_mid)
+        text.append("  │  ", style=Theme.gradient_dim)
+        text.append(f"ns: {state.namespace}", style=Theme.gradient_mid)
     text.append("  │  ", style=Theme.gradient_dim)
     text.append(f"mode: {icon} {label}", style=Theme.gradient_mid)
     console.print(text)
+
+
+def _is_host_profile() -> bool:
+    """True when the configured transport channel targets a bare host."""
+    try:
+        from chaos_agent.transports.registry import is_host_scope_channel
+        return is_host_scope_channel()
+    except Exception:
+        return False

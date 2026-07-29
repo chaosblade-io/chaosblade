@@ -246,6 +246,15 @@ def infer_scope(category: str) -> str:
     if ft in ("Node", "Pod", "Service", "Workload"):
         return ft.lower()
     cat_lower = category.lower()
+    # In-process application fault catalogues (``Python_*``). Registry-derived so
+    # the scope name is never duplicated here; without this branch these fall to
+    # the ``pod`` default and the generated example command would tell the reader
+    # to pass a namespace / kubeconfig that an in-process fault has no use for.
+    from chaos_agent.agent.spec.fault_registry import python_scopes
+
+    for _py_scope in sorted(python_scopes()):
+        if cat_lower.startswith(f"{_py_scope}_"):
+            return _py_scope
     if "dns" in cat_lower:
         return "pod"
     return "pod"
@@ -305,6 +314,16 @@ def build_nl_cmd(display: str, category: str, scope: str) -> str:
             f'blade-ai inject -i "帮我注入{desc}，'
             f'目标为<node-name>，'
             f'kubeconfig路径为<kubeconfig>"'
+        )
+    # In-process application faults carry no namespace and no kubeconfig: the
+    # injection is delivered to an agent inside the application process on the
+    # host that runs it, so the only identity is that host / application.
+    from chaos_agent.agent.spec.fault_registry import is_python_scope
+
+    if is_python_scope(scope):
+        return (
+            f'blade-ai inject -i "帮我注入{desc}，'
+            f'目标应用所在主机为<app-host>"'
         )
     return (
         f'blade-ai inject -i "帮我注入{desc}，'

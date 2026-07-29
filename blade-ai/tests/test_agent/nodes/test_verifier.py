@@ -1,22 +1,23 @@
 """Tests for verifier node."""
 
 import json
+from contextlib import contextmanager
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from chaos_agent.agent.nodes._injection_detection import (
+from chaos_agent.agent.nodes.execute._injection_detection import (
     _was_kubectl_blade_injection_successful,
     _was_blade_create_attempted,
     _was_kubectl_injection_attempted,
 )
-from chaos_agent.agent.nodes.verifier import (
+from chaos_agent.agent.nodes.verify.verifier import (
     verifier,
-    _run_layer1_verification,
+    _run_host_blade_layer1,
     _cleanup_debug_pods,
 )
-from chaos_agent.agent.verdict import Layer1Result
+from chaos_agent.agent.result.verdict import Layer1Result
 from chaos_agent.agent.state import infer_task_state
 
 
@@ -44,6 +45,17 @@ def _mock_blade_failed():
     ))
 
 
+@contextmanager
+def _patch_blade_cmd(mock_async):
+    """Patch execute_via_transport on blade module.
+
+    After the transport-layer migration, blade_status/blade_query_k8s
+    call ``execute_via_transport`` instead of ``run_command`` directly.
+    """
+    with patch("chaos_agent.tools.blade.execute_via_transport", mock_async):
+        yield
+
+
 class TestVerifier:
     """Tests for the verifier node function."""
 
@@ -54,7 +66,7 @@ class TestVerifier:
         state["skill_name"] = "pod-delete"
         state["blade_uid"] = "abc123xyz"
 
-        with patch("chaos_agent.tools.blade.run_command", _mock_blade_running()):
+        with _patch_blade_cmd(_mock_blade_running()):
             result = await verifier(state)
         # Layer 1 passed (blade_status=Running) but no LLM for Layer 2,
         # so verification level is "partial" and verified=False (cannot confirm fault effect)
@@ -99,7 +111,7 @@ class TestVerifier:
         state["skill_name"] = "cpu-burn"
         state["blade_uid"] = "uid-999"
 
-        with patch("chaos_agent.tools.blade.run_command", _mock_blade_running("uid-999")):
+        with _patch_blade_cmd(_mock_blade_running("uid-999")):
             result = await verifier(state)
         r = result["result"]
         assert "task_id" in r
@@ -115,7 +127,7 @@ class TestVerifier:
         state["skill_name"] = "cpu-burn"
         state["blade_uid"] = "uid-v1"
 
-        with patch("chaos_agent.tools.blade.run_command", _mock_blade_running("uid-v1")):
+        with _patch_blade_cmd(_mock_blade_running("uid-v1")):
             result = await verifier(state)
         assert "verification" in result
         v = result["verification"]
@@ -133,7 +145,7 @@ class TestVerifier:
         state["skill_name"] = "cpu-burn"
         state["blade_uid"] = "uid-l2"
 
-        with patch("chaos_agent.tools.blade.run_command", _mock_blade_running("uid-l2")):
+        with _patch_blade_cmd(_mock_blade_running("uid-l2")):
             result = await verifier(state)
         v = result["verification"]
         assert v["layer2"]["status"] == "skipped"
@@ -146,7 +158,7 @@ class TestVerifier:
         state["skill_name"] = "pod-delete"
         state["blade_uid"] = "uid-1"
 
-        with patch("chaos_agent.tools.blade.run_command", _mock_blade_running("uid-1")):
+        with _patch_blade_cmd(_mock_blade_running("uid-1")):
             result = await verifier(state)
         assert result["result"]["task_id"] == ""
 
@@ -169,7 +181,7 @@ class TestVerifier:
         state["skill_name"] = "pod-delete"
         state["blade_uid"] = "uid-fail"
 
-        with patch("chaos_agent.tools.blade.run_command", _mock_blade_failed()):
+        with _patch_blade_cmd(_mock_blade_failed()):
             result = await verifier(state)
         assert result["result"]["verified"] is False
         assert result["verification"]["layer1"]["status"] == "failed"
@@ -205,7 +217,7 @@ class TestRunLayer1Verification:
     @pytest.mark.asyncio
     async def test_no_blade_uid_no_blade_create_skipped(self):
         """No blade_uid + no blade_create in messages → non-ChaosBlade → skipped."""
-        result = await _run_layer1_verification("", "", task_id="t1", messages=[])
+        result = await _run_host_blade_layer1("", "", task_id="t1", messages=[])
         assert result.status == "skipped"
         assert "Non-ChaosBlade" in result.details
         assert not result.is_terminal()
@@ -214,7 +226,7 @@ class TestRunLayer1Verification:
     async def test_no_blade_uid_with_blade_create_failed(self):
         """No blade_uid + blade_create in messages → ChaosBlade injection failed → failed."""
         msg = ToolMessage(content='{"code": 500, "success": false}', name="blade_create", tool_call_id="tc1")
-        result = await _run_layer1_verification("", "", task_id="t2", messages=[msg])
+        result = await _run_host_blade_layer1("", "", task_id="t2", messages=[msg])
         assert result.status == "warning"
         assert "blade_create" in result.details
         assert not result.is_terminal()
@@ -222,8 +234,29 @@ class TestRunLayer1Verification:
     @pytest.mark.asyncio
     async def test_no_blade_uid_no_messages_arg(self):
         """No blade_uid + messages=None → defaults to skipped (backward compatible)."""
-        result = await _run_layer1_verification("", "", task_id="t3")
+        result = await _run_host_blade_layer1("", "", task_id="t3")
         assert result.status == "skipped"
+
+    @pytest.mark.asyncio
+    async def test_host_scope_skips_blade_query_k8s(self, monkeypatch):
+        """Host Layer 1 = pure blade_status; the k8s-only blade_query_k8s step is
+        skipped (host has no cluster CRD to query)."""
+        from chaos_agent.config.settings import settings as _settings
+        monkeypatch.setattr(_settings, "kube_connection_mode", "kubewiz_host")
+        monkeypatch.setattr(_settings, "host_name", "10.0.2.8")
+
+        # Replace the k8s-only query tool so we can assert it is never invoked.
+        query_mock = AsyncMock()
+        monkeypatch.setattr("chaos_agent.tools.blade.blade_query_k8s", query_mock)
+
+        with _patch_blade_cmd(_mock_blade_running("abc123xyz")):
+            result = await _run_host_blade_layer1(
+                "abc123xyz", "", task_id="t-host", messages=[]
+            )
+        # blade_status alone determines the host verdict.
+        assert result.status == "passed"
+        # blade_query_k8s (k8s-only) must NOT be invoked for host scope.
+        query_mock.ainvoke.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_layer1_result_is_terminal_skipped(self):
@@ -510,7 +543,7 @@ class TestWasBladeCreateAttemptedKubectlOverride:
 
 class TestFindBladeQueryInMessages:
     def test_find_matching_query(self):
-        from chaos_agent.agent.nodes._verifier_layer1 import _find_blade_query_in_messages
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import _find_blade_query_in_messages
         query_output = json.dumps({
             "code": 200,
             "success": True,
@@ -528,7 +561,7 @@ class TestFindBladeQueryInMessages:
         assert result == query_output
 
     def test_no_matching_uid(self):
-        from chaos_agent.agent.nodes._verifier_layer1 import _find_blade_query_in_messages
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import _find_blade_query_in_messages
         msg = ToolMessage(
             content='{"code":200,"success":true,"result":{"uid":"other-uid"}}',
             name="kubectl",
@@ -538,7 +571,7 @@ class TestFindBladeQueryInMessages:
         assert result == ""
 
     def test_no_kubectl_messages(self):
-        from chaos_agent.agent.nodes._verifier_layer1 import _find_blade_query_in_messages
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import _find_blade_query_in_messages
         msg = ToolMessage(content="some output", name="blade_create", tool_call_id="tc1")
         result = _find_blade_query_in_messages([msg], "a0f2357a939a9bb8")
         assert result == ""
@@ -580,7 +613,7 @@ class TestKubectlExecInjectionScenario:
 
         # When blade_uid is empty but kubectl injection succeeded,
         # _was_blade_create_attempted should return False → Layer 1 skipped
-        result = await _run_layer1_verification("", "", task_id="t-kubectl", messages=messages)
+        result = await _run_host_blade_layer1("", "", task_id="t-kubectl", messages=messages)
         assert result.status == "skipped"
         assert not result.is_terminal()
 
@@ -610,8 +643,8 @@ class TestKubectlExecInjectionScenario:
             stdout="Error: unknown flag: --namespace",
             stderr="",
         ))
-        with patch("chaos_agent.tools.blade.run_command", mock_error):
-            result = await _run_layer1_verification(
+        with _patch_blade_cmd(mock_error):
+            result = await _run_host_blade_layer1(
                 "a0f2357a939a9bb8", "", task_id="t-kubectl-uid", messages=messages
             )
         assert result.status == "skipped"
@@ -645,7 +678,7 @@ class TestKubectlExecInjectionScenario:
         )
         kubectl_inject_msgs = _make_kubectl_tool_call_pair(
             "tc-inject", "exec",
-            f"otel-c-tool -n chaosblade -- blade create k8s pod-cpu fullload --cpu-percent 80",
+            "otel-c-tool -n chaosblade -- blade create k8s pod-cpu fullload --cpu-percent 80",
             f'{{"code":200,"success":true,"result":"{blade_uid}"}}',
         )
         kubectl_query_msgs = _make_kubectl_tool_call_pair(
@@ -661,8 +694,8 @@ class TestKubectlExecInjectionScenario:
             stdout="Error: unknown flag: --namespace",
             stderr="",
         ))
-        with patch("chaos_agent.tools.blade.run_command", mock_error):
-            result = await _run_layer1_verification(
+        with _patch_blade_cmd(mock_error):
+            result = await _run_host_blade_layer1(
                 blade_uid, "", task_id="t-kubectl-query", messages=messages
             )
         assert result.status == "passed"
@@ -782,7 +815,7 @@ class TestKubectlNativeInjectionLayer1:
         )
         messages = [msg1] + kubectl_msgs
 
-        result = await _run_layer1_verification("", "", task_id="t-scale", messages=messages)
+        result = await _run_host_blade_layer1("", "", task_id="t-scale", messages=messages)
         assert result.status == "skipped"
         assert not result.is_terminal()
 
@@ -801,7 +834,7 @@ class TestKubectlNativeInjectionLayer1:
         )
         messages = [msg1] + kubectl_msgs
 
-        result = await _run_layer1_verification("", "", task_id="t-cordon", messages=messages)
+        result = await _run_host_blade_layer1("", "", task_id="t-cordon", messages=messages)
         assert result.status == "skipped"
         assert not result.is_terminal()
 
@@ -821,7 +854,7 @@ class TestKubectlNativeInjectionLayer1:
         )
         messages = [msg1] + kubectl_msgs
 
-        result = await _run_layer1_verification("", "", task_id="t-no-alt", messages=messages)
+        result = await _run_host_blade_layer1("", "", task_id="t-no-alt", messages=messages)
         assert result.status == "warning"
         assert not result.is_terminal()
 
@@ -831,7 +864,7 @@ class TestExtractKubectlExecPodName:
 
     def test_kubectl_exec_blade_create_extracts_pod_name(self):
         """kubectl exec with blade create → pod name extracted from v_args."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         msgs = _make_kubectl_tool_call_pair(
             "tc1", "exec",
             "otel-c-tool-abc123 -n chaosblade -- blade create k8s pod-cpu fullload",
@@ -841,7 +874,7 @@ class TestExtractKubectlExecPodName:
 
     def test_kubectl_get_not_extracted(self):
         """kubectl get (not exec blade create) → None."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         msgs = _make_kubectl_tool_call_pair(
             "tc2", "get",
             "pods -n default",
@@ -851,7 +884,7 @@ class TestExtractKubectlExecPodName:
 
     def test_kubectl_exec_without_blade_not_extracted(self):
         """kubectl exec without blade create → None."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         msgs = _make_kubectl_tool_call_pair(
             "tc3", "exec",
             "otel-c-tool -n chaosblade -- ls /tmp",
@@ -861,12 +894,12 @@ class TestExtractKubectlExecPodName:
 
     def test_empty_messages_returns_none(self):
         """Empty messages list → None."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         assert _extract_kubectl_exec_pod_name([]) is None
 
     def test_non_chaosblade_json_returns_none(self):
         """kubectl exec with non-ChaosBlade JSON response → None."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         msgs = _make_kubectl_tool_call_pair(
             "tc4", "exec",
             "otel-c-tool -n chaosblade -- blade create k8s pod-cpu fullload",
@@ -876,7 +909,7 @@ class TestExtractKubectlExecPodName:
 
     def test_multiple_blade_creates_returns_most_recent(self):
         """Multiple kubectl exec blade creates → returns the most recent pod name."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         msgs1 = _make_kubectl_tool_call_pair(
             "tc1", "exec",
             "otel-c-tool-old -n chaosblade -- blade create k8s pod-cpu fullload",
@@ -892,7 +925,7 @@ class TestExtractKubectlExecPodName:
 
     def test_v_args_with_leading_whitespace(self):
         """v_args with leading whitespace → still extracts pod name correctly."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         msgs = _make_kubectl_tool_call_pair(
             "tc5", "exec",
             "  otel-c-tool-ws  -n chaosblade -- blade create k8s pod-cpu fullload",
@@ -902,7 +935,7 @@ class TestExtractKubectlExecPodName:
 
     def test_v_args_starting_with_flag_returns_none(self):
         """v_args starting with a flag → None (not a valid pod name)."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         msgs = _make_kubectl_tool_call_pair(
             "tc6", "exec",
             "-n chaosblade otel-c-tool -- blade create k8s pod-cpu fullload",
@@ -913,7 +946,7 @@ class TestExtractKubectlExecPodName:
 
     def test_legacy_session_without_tool_call_id(self):
         """ToolMessage without tool_call_id → fallback to AIMessage scan."""
-        from chaos_agent.agent.nodes._injection_detection import _extract_kubectl_exec_pod_name
+        from chaos_agent.agent.nodes.execute._injection_detection import _extract_kubectl_exec_pod_name
         ai_msg = AIMessage(
             content="",
             tool_calls=[{
@@ -943,7 +976,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
     @pytest.mark.asyncio
     async def test_original_pod_succeeds(self):
         """Original pod is available → uses blade query k8s directly, no discovery needed."""
-        from chaos_agent.agent.nodes._verifier_layer1 import _run_layer1_via_kubectl_exec
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import _run_layer1_via_kubectl_exec
         from chaos_agent.tools.shell import CommandResult
 
         # blade query k8s returns success for a running experiment
@@ -958,7 +991,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
             }),
             stderr="",
         )
-        with patch("chaos_agent.tools.shell.run_command", new_callable=AsyncMock) as mock_run:
+        with patch("chaos_agent.transports.execute_via_transport", new_callable=AsyncMock) as mock_run:
             mock_run.return_value = blade_query_result
             result = await _run_layer1_via_kubectl_exec(
                 "exp-test", "/path/to/kc", task_id="t1",
@@ -973,7 +1006,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
     @pytest.mark.asyncio
     async def test_original_pod_not_found_falls_back(self):
         """Original pod blade query k8s returns error → falls back to blade status → discovery."""
-        from chaos_agent.agent.nodes._verifier_layer1 import _run_layer1_via_kubectl_exec
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import _run_layer1_via_kubectl_exec
         from chaos_agent.tools.shell import CommandResult
 
         # blade query k8s returns error on original pod (unavailable)
@@ -1005,7 +1038,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
             }),
             stderr="",
         )
-        with patch("chaos_agent.tools.shell.run_command", new_callable=AsyncMock) as mock_run:
+        with patch("chaos_agent.transports.execute_via_transport", new_callable=AsyncMock) as mock_run:
             mock_run.side_effect = [query_k8s_error, blade_status_error, discover_result, blade_query_result]
             result = await _run_layer1_via_kubectl_exec(
                 "exp-test", "/path/to/kc", task_id="t2",
@@ -1018,7 +1051,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
     @pytest.mark.asyncio
     async def test_no_original_pod_discovers_normally(self):
         """No original pod name → falls through to discovery, uses blade query k8s."""
-        from chaos_agent.agent.nodes._verifier_layer1 import _run_layer1_via_kubectl_exec
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import _run_layer1_via_kubectl_exec
         from chaos_agent.tools.shell import CommandResult
 
         discover_result = CommandResult(
@@ -1038,7 +1071,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
             }),
             stderr="",
         )
-        with patch("chaos_agent.tools.shell.run_command", new_callable=AsyncMock) as mock_run:
+        with patch("chaos_agent.transports.execute_via_transport", new_callable=AsyncMock) as mock_run:
             mock_run.side_effect = [discover_result, blade_query_result]
             result = await _run_layer1_via_kubectl_exec(
                 "exp-test", "/path/to/kc", task_id="t3",
@@ -1054,7 +1087,7 @@ class TestRunLayer1ViaKubectlExecWithOriginalPod:
 # Tests for checklist parsing and automatic level downgrade
 # ---------------------------------------------------------------------------
 
-from chaos_agent.agent.nodes._verifier_layer2_parse import (
+from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (  # noqa: E402
     _parse_checklist_items,
     _has_checklist,
     _parse_verification_result,
@@ -1837,105 +1870,16 @@ class TestFormatGuard:
 
 
 # ---------------------------------------------------------------------------
-# _disk_fill_param_hints / _PARAM_HINT_GENERATORS
+# _disk_fill_param_hints (VerificationProfile disk slot helper)
 # ---------------------------------------------------------------------------
 
-from chaos_agent.agent.nodes._verifier_hints import (
-    _disk_fill_param_hints,
-    _PARAM_HINT_GENERATORS,
+from chaos_agent.agent.nodes.verify._verifier_shared import (  # noqa: E402
     _IMAGEFS_PATHS,
     _NODEFS_PATHS,
+)
+from chaos_agent.agent.nodes.verify._verifier_hints import (  # noqa: E402
     _BASELINE_INTEGRITY_PROMPT,
 )
-
-
-class TestDiskFillParamHints:
-    """Tests for _disk_fill_param_hints() — parameter-dependent hint generation."""
-
-    def test_imagefs_path_var_log(self):
-        """--path /var/log → imagefs partition hint."""
-        hint = _disk_fill_param_hints({"path": "/var/log"})
-        assert hint is not None
-        assert "imagefs" in hint.lower()
-        assert "df -h" in hint  # correct verification command
-        assert "df -h /host" not in hint or "FALSE_NEGATIVE" in hint or "false negative" in hint.lower()
-
-    def test_imagefs_path_tmp(self):
-        """--path /tmp → imagefs partition hint."""
-        hint = _disk_fill_param_hints({"path": "/tmp"})
-        assert hint is not None
-        assert "imagefs" in hint.lower()
-
-    def test_imagefs_path_trailing_slash(self):
-        """--path /var/log/ (trailing slash) → still imagefs."""
-        hint = _disk_fill_param_hints({"path": "/var/log/"})
-        assert hint is not None
-        assert "imagefs" in hint.lower()
-
-    def test_imagefs_subpath(self):
-        """--path /var/log/app (subpath of imagefs path) → imagefs."""
-        hint = _disk_fill_param_hints({"path": "/var/log/app"})
-        assert hint is not None
-        assert "imagefs" in hint.lower()
-
-    def test_nodefs_path_docker(self):
-        """--path /var/lib/docker → nodefs partition hint."""
-        hint = _disk_fill_param_hints({"path": "/var/lib/docker"})
-        assert hint is not None
-        assert "nodefs" in hint.lower()
-        assert "df -h /host" in hint
-
-    def test_nodefs_path_kubelet(self):
-        """--path /var/lib/kubelet → nodefs partition hint."""
-        hint = _disk_fill_param_hints({"path": "/var/lib/kubelet"})
-        assert hint is not None
-        assert "nodefs" in hint.lower()
-
-    def test_nodefs_path_etc(self):
-        """--path /etc → nodefs partition hint."""
-        hint = _disk_fill_param_hints({"path": "/etc"})
-        assert hint is not None
-        assert "nodefs" in hint.lower()
-
-    def test_unknown_path(self):
-        """--path /data (unknown) → fallback hint listing all filesystems."""
-        hint = _disk_fill_param_hints({"path": "/data"})
-        assert hint is not None
-        assert "unable to determine" in hint.lower() or "all mounted" in hint.lower()
-
-    def test_empty_path(self):
-        """No path parameter → None (no hint)."""
-        hint = _disk_fill_param_hints({"percent": "95"})
-        assert hint is None
-
-    def test_no_flags(self):
-        """Empty flags → None."""
-        hint = _disk_fill_param_hints({})
-        assert hint is None
-
-
-class TestParamHintGenerators:
-    """Tests for _PARAM_HINT_GENERATORS registry."""
-
-    def test_disk_fill_registered(self):
-        """(disk, fill) key is registered in _PARAM_HINT_GENERATORS."""
-        assert ("disk", "fill") in _PARAM_HINT_GENERATORS
-
-    def test_disk_fill_callable(self):
-        """Registered generator is callable."""
-        gen = _PARAM_HINT_GENERATORS.get(("disk", "fill"))
-        assert callable(gen)
-
-    def test_disk_fill_produces_hint(self):
-        """Calling the generator with path flag produces a non-None hint."""
-        gen = _PARAM_HINT_GENERATORS[("disk", "fill")]
-        hint = gen({"path": "/var/log", "percent": "95"})
-        assert hint is not None
-        assert "imagefs" in hint.lower()
-
-    def test_unregistered_key_returns_none(self):
-        """Unregistered key returns None from dict.get()."""
-        assert _PARAM_HINT_GENERATORS.get(("cpu", "fullload")) is None
 
 
 class TestImagefsNodefsConstants:
@@ -2072,124 +2016,6 @@ class TestBaselineIntegrityPrompt:
                "first-check shows" in _BASELINE_INTEGRITY_PROMPT
 
 
-class TestDiskFillParamHintsBaselineIntegrity:
-    """Tests for baseline integrity rules in _disk_fill_param_hints()."""
-
-    def test_imagefs_path_includes_baseline_integrity(self):
-        """imagefs hint includes BASELINE INTEGRITY and same partition rule."""
-        hint = _disk_fill_param_hints({"path": "/var/log"})
-        assert hint is not None
-        assert "BASELINE INTEGRITY" in hint
-        assert "same partition" in hint.lower() or "SAME partition" in hint
-
-    def test_imagefs_path_includes_first_check_as_baseline(self):
-        """imagefs hint includes FIRST-CHECK-AS-BASELINE rule."""
-        hint = _disk_fill_param_hints({"path": "/var/log"})
-        assert hint is not None
-        assert "FIRST-CHECK-AS-BASELINE" in hint
-
-    def test_imagefs_path_baseline_hint_matches_expected_fill(self):
-        """imagefs hint mentions that first-check near expected fill % is evidence of fault."""
-        hint = _disk_fill_param_hints({"path": "/var/log"})
-        assert hint is not None
-        assert "84%" in hint or "expected" in hint.lower() or "fill has completed" in hint
-
-    def test_nodefs_path_includes_baseline_integrity(self):
-        """nodefs hint also includes baseline integrity rules."""
-        hint = _disk_fill_param_hints({"path": "/var/lib/docker"})
-        assert hint is not None
-        assert "BASELINE INTEGRITY" in hint
-        assert "same partition" in hint.lower() or "SAME partition" in hint
-
-    def test_nodefs_path_includes_first_check_as_baseline(self):
-        """nodefs hint includes FIRST-CHECK-AS-BASELINE rule."""
-        hint = _disk_fill_param_hints({"path": "/var/lib/docker"})
-        assert hint is not None
-        assert "FIRST-CHECK-AS-BASELINE" in hint
-
-    def test_unknown_path_includes_baseline_warning(self):
-        """unknown path fallback includes baseline integrity rule."""
-        hint = _disk_fill_param_hints({"path": "/data"})
-        assert hint is not None
-        assert "BASELINE INTEGRITY" in hint
-
-
-# ---------------------------------------------------------------------------
-# TestDeriveDiskFillPartition
-# ---------------------------------------------------------------------------
-
-from chaos_agent.agent.nodes._verifier_hints import (
-    _derive_disk_fill_partition,
-    _COMMAND_PRIORITY_HINT,
-)
-
-
-class TestDeriveDiskFillPartition:
-    """Tests for _derive_disk_fill_partition() — heuristic partition derivation."""
-
-    def test_imagefs_path_tmp(self):
-        assert _derive_disk_fill_partition({"path": "/tmp"}) == "imagefs"
-
-    def test_imagefs_path_var_log(self):
-        assert _derive_disk_fill_partition({"path": "/var/log"}) == "imagefs"
-
-    def test_imagefs_path_subpath(self):
-        assert _derive_disk_fill_partition({"path": "/var/log/app"}) == "imagefs"
-
-    def test_imagefs_path_trailing_slash(self):
-        assert _derive_disk_fill_partition({"path": "/tmp/"}) == "imagefs"
-
-    def test_nodefs_path_var_lib_docker(self):
-        assert _derive_disk_fill_partition({"path": "/var/lib/docker"}) == "nodefs"
-
-    def test_nodefs_path_var_lib_kubelet(self):
-        assert _derive_disk_fill_partition({"path": "/var/lib/kubelet"}) == "nodefs"
-
-    def test_nodefs_path_subpath(self):
-        assert _derive_disk_fill_partition({"path": "/var/lib/docker/overlay2"}) == "nodefs"
-
-    def test_nodefs_path_etc(self):
-        assert _derive_disk_fill_partition({"path": "/etc"}) == "nodefs"
-
-    def test_unknown_path(self):
-        assert _derive_disk_fill_partition({"path": "/data"}) is None
-
-    def test_empty_path(self):
-        assert _derive_disk_fill_partition({"path": ""}) is None
-
-    def test_no_path_key(self):
-        assert _derive_disk_fill_partition({}) is None
-
-
-class TestDiskFillParamHintsCommandPriority:
-    """Tests for COMMAND PRIORITY in _disk_fill_param_hints() output."""
-
-    def test_imagefs_path_includes_command_priority(self):
-        hint = _disk_fill_param_hints({"path": "/tmp"})
-        assert hint is not None
-        assert "COMMAND PRIORITY" in hint
-
-    def test_nodefs_path_includes_command_priority(self):
-        hint = _disk_fill_param_hints({"path": "/var/lib/docker"})
-        assert hint is not None
-        assert "COMMAND PRIORITY" in hint
-
-    def test_unknown_path_includes_command_priority(self):
-        hint = _disk_fill_param_hints({"path": "/data"})
-        assert hint is not None
-        assert "COMMAND PRIORITY" in hint
-
-    def test_imagefs_uses_heuristic_language(self):
-        hint = _disk_fill_param_hints({"path": "/tmp"})
-        assert hint is not None
-        assert "Likely target partition" in hint or "typically" in hint.lower()
-
-    def test_nodefs_uses_heuristic_language(self):
-        hint = _disk_fill_param_hints({"path": "/var/lib/docker"})
-        assert hint is not None
-        assert "Likely target partition" in hint or "typically" in hint.lower()
-
-
 class TestExpectedStatus:
     """Tests for 'expected' status in checklist parsing and inconsistency detection."""
 
@@ -2301,7 +2127,7 @@ class TestBaselineComparisonInLayer2Context:
 
     def test_baseline_in_context_when_available(self):
         """When baseline_data with success_count > 0, baseline is injected as synthetic ToolMessage."""
-        from chaos_agent.agent.nodes._verifier_messages import (
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
             _build_baseline_tool_messages,
         )
         state = self._build_direct_state_with_baseline(baseline_success=True)
@@ -2326,10 +2152,10 @@ class TestBaselineComparisonInLayer2Context:
 
     def test_baseline_not_in_humanmessage_when_available(self):
         """When baseline_data is available, it should NOT be in the HumanMessage content."""
-        from chaos_agent.agent.nodes._verifier_messages import _build_layer2_messages
+        from chaos_agent.agent.nodes.verify._verifier_messages import _build_layer2_messages
         state = self._build_direct_state_with_baseline(baseline_success=True)
         # Build Layer 2 messages and check HumanMessage does NOT contain baseline section
-        from chaos_agent.agent.verdict import Layer1Result
+        from chaos_agent.agent.result.verdict import Layer1Result
         layer1 = Layer1Result(
             status="passed",
             affected_count=1,
@@ -2370,7 +2196,6 @@ class TestFillFileCheck:
 
         # Simulate the context generation logic
         fill_path = blade_parsed.get("path", "/tmp")
-        size_param = blade_parsed.get("size")
         context = ""
         if blade_target == "disk" and blade_action == "fill" and blade_scope == "node":
             if tool_pod_name:
@@ -2461,11 +2286,11 @@ class TestSyntheticMessagePersistence:
     def test_extract_synthetic_for_state_on_count1(self, baseline_state):
         """On count==1, _build_layer2_messages injects synthetic messages,
         and _synthetic_for_state extraction picks them up."""
-        from chaos_agent.agent.nodes._verifier_messages import (
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
             _build_layer2_messages,
             _SYNTHETIC_TOOL_CALL_IDS,
         )
-        from chaos_agent.agent.verdict import Layer1Result
+        from chaos_agent.agent.result.verdict import Layer1Result
 
         layer1 = Layer1Result(status="passed", affected_count=1, raw_output="Success")
         msgs = _build_layer2_messages(
@@ -2498,12 +2323,12 @@ class TestSyntheticMessagePersistence:
         """On count>1, when baseline ToolMessages are already in
         state['messages'], _build_layer2_messages should NOT re-inject them."""
 
-        from chaos_agent.agent.nodes._verifier_messages import (
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
             _build_baseline_tool_messages,
             _build_layer2_messages,
             _BASELINE_TOOL_CALL_ID,
         )
-        from chaos_agent.agent.verdict import Layer1Result
+        from chaos_agent.agent.result.verdict import Layer1Result
 
         # Build synthetic messages as if they were persisted from count==1
         baseline = baseline_state["baseline_data"]
@@ -2531,11 +2356,11 @@ class TestSyntheticMessagePersistence:
         """On count>1, when baseline ToolMessages are NOT in
         state['messages'], _build_layer2_messages should inject them."""
 
-        from chaos_agent.agent.nodes._verifier_messages import (
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
             _build_layer2_messages,
             _BASELINE_TOOL_CALL_ID,
         )
-        from chaos_agent.agent.verdict import Layer1Result
+        from chaos_agent.agent.result.verdict import Layer1Result
 
         # State has messages but WITHOUT synthetic baseline messages
         baseline_state["messages"] = [
@@ -2559,7 +2384,7 @@ class TestSyntheticMessagePersistence:
         """When _synthetic_for_state is prepended BEFORE response,
         the last message in result_update is response (routing-safe)."""
 
-        from chaos_agent.agent.nodes._verifier_messages import (
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
             _build_baseline_tool_messages,
         )
 
@@ -2581,7 +2406,7 @@ class TestSyntheticMessagePersistence:
 
     def test_metrics_tool_call_id_constant(self):
         """Verify _METRICS_TOOL_CALL_ID is defined and equals 'baseline_collector_metrics'."""
-        from chaos_agent.agent.nodes._verifier_messages import (
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
             _METRICS_TOOL_CALL_ID,
             _SYNTHETIC_TOOL_CALL_IDS,
         )
@@ -2637,7 +2462,7 @@ class TestCleanupDebugPodsDedup:
             deleted.append(pod_name)
 
         with patch(
-            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            "chaos_agent.agent.nodes.verify._verifier_finalize._delete_debug_pod",
             new=_fake_delete,
         ):
             await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
@@ -2676,7 +2501,7 @@ class TestCleanupDebugPodsDedup:
             deleted.append(pod_name)
 
         with patch(
-            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            "chaos_agent.agent.nodes.verify._verifier_finalize._delete_debug_pod",
             new=_fake_delete,
         ):
             await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
@@ -2714,7 +2539,7 @@ class TestCleanupDebugPodsDedup:
             deleted.append(pod_name)
 
         with patch(
-            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            "chaos_agent.agent.nodes.verify._verifier_finalize._delete_debug_pod",
             new=_fake_delete,
         ):
             await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
@@ -2747,7 +2572,7 @@ class TestCleanupDebugPodsDedup:
             return None
 
         with patch(
-            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            "chaos_agent.agent.nodes.verify._verifier_finalize._delete_debug_pod",
             new=_failing_delete,
         ):
             await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
@@ -2778,7 +2603,7 @@ class TestCleanupDebugPodsDedup:
             deleted.append(pod_name)
 
         with patch(
-            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            "chaos_agent.agent.nodes.verify._verifier_finalize._delete_debug_pod",
             new=_fake_delete,
         ):
             await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
@@ -2812,12 +2637,44 @@ class TestCleanupDebugPodsDedup:
             deleted.append(pod_name)
 
         with patch(
-            "chaos_agent.agent.nodes._verifier_finalize._delete_debug_pod",
+            "chaos_agent.agent.nodes.verify._verifier_finalize._delete_debug_pod",
             new=_fake_delete,
         ):
             await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
 
         assert deleted == []
+
+    @pytest.mark.asyncio
+    async def test_legacy_scan_does_not_delete_recovery_armed_artifact(self):
+        pod_name = "node-debugger-cn-test-timer"
+        artifact = {
+            "artifact_id": "uid-timer",
+            "type": "debug_pod",
+            "status": "recovery_armed",
+            "name": pod_name,
+            "namespace": "default",
+            "uid": "uid-timer",
+            "target": {"scope": "node", "name": "cn-test.10.0.1.1"},
+            "recovery_deadline_epoch": 9999999999,
+        }
+        state = {
+            "messages": [self._debug_tm(pod_name)],
+            "execution_artifacts": [artifact],
+        }
+        deleted: list[str] = []
+
+        async def _fake_delete(name, _kc, _tid, namespace=""):
+            deleted.append(name)
+
+        with patch(
+            "chaos_agent.agent.nodes.verify._verifier_finalize._delete_debug_pod",
+            new=_fake_delete,
+        ):
+            result_update: dict = {}
+            await _cleanup_debug_pods(state, "/kc", "task-1", result_update)
+
+        assert deleted == []
+        assert "cleaned_debug_pods" not in result_update
 
 
 # ---------------------------------------------------------------------------

@@ -185,7 +185,7 @@ class TestSaveMemoryEndsAttempt:
 
     @pytest.mark.asyncio
     async def test_save_memory_chat_path_ends_attempt(self, monkeypatch):
-        from chaos_agent.agent.nodes import memory_nodes as mn
+        from chaos_agent.agent.nodes.store import memory_nodes as mn
 
         # Stub out persistence-side I/O — we only care about the
         # state delta semantics here.

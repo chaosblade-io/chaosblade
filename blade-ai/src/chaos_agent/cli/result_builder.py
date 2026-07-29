@@ -58,7 +58,7 @@ def _build_inject_result_events(
 
     if interaction_mode == "tui" and not blade_uid:
         events: list[StreamEvent] = []
-        from chaos_agent.agent.operation_outcome import read_operation_outcome
+        from chaos_agent.agent.result.operation_outcome import read_operation_outcome
         error_msg = read_operation_outcome(values).error
         safety_rejected = values.get("safety_status") == "rejected"
 
@@ -83,7 +83,7 @@ def _build_inject_result_events(
         ))
         return events, True
 
-    from chaos_agent.agent.operation_result import build_inject_data_from_state
+    from chaos_agent.agent.result.operation_result import build_inject_data_from_state
     result_data = build_inject_data_from_state(values, task_id)
 
     return [StreamEvent(

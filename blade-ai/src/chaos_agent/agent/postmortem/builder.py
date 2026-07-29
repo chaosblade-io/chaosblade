@@ -13,9 +13,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from chaos_agent.agent.fault_spec import fault_type_from_state, read_fault_spec
-from chaos_agent.agent.operation_outcome import read_inject_verification, read_operation_outcome
-from chaos_agent.agent.verdict import FailureCategory
+from chaos_agent.agent.spec.fault_spec import fault_type_from_state, read_fault_spec
+from chaos_agent.agent.result.operation_outcome import read_inject_verification, read_operation_outcome
+from chaos_agent.agent.result.verdict import FailureCategory
 
 # Failure categories worth a postmortem. The rest (USER_REJECTED,
 # SAFETY_REJECTED, PLANNING_TIMEOUT) ran no actual experiment — no

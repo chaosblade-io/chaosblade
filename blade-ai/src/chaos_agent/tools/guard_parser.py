@@ -26,6 +26,7 @@ Design constraints:
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -347,9 +348,90 @@ def _parse_generic(cmd: list[str]) -> ParsedCommand:
     )
 
 
+def _parse_wiz(cmd: list[str]) -> ParsedCommand:
+    """Transparent unwrap for ``wiz task exec --command "<inner cmd>" ...``.
+
+    After the transport-layer migration, ``build_kubectl_cmd`` no longer
+    wraps with wiz — wrapping is done by ``KubewizK8sChannel.wrap_command()``.
+    However, ``_parse_wiz`` is still needed for defense-in-depth: if a
+    wiz-wrapped command reaches the guard (e.g. via ``run_command``
+    without ``skip_guard=True``), this parser unwraps ``--command`` and
+    re-parses the inner command with its OWN parser (kubectl/blade),
+    lifting the inner structure up to the wiz level:
+      - inner host-relevant tokens (the ``--``-prefix segment: binary,
+        subcommand, positional args, flag names/values) stay CHECKED;
+      - inner ``container_command`` (after ``--`` for exec/run/attach/debug)
+        stays EXEMPT.
+    This makes kubewiz-wrapped commands behave IDENTICALLY to raw commands.
+
+    The wiz shell itself (``task``/``exec``/``--cluster-uuid``/``--profile``)
+    is builder-controlled (not LLM-controlled) and carries no shell payload,
+    so it is not re-checked here. If ``--command`` is absent or its inner
+    binary is unrecognized, falls back to ``_parse_generic`` (whole-cmd
+    checks — safe default).
+    """
+    inner_str: str | None = None
+    i = 1
+    n = len(cmd)
+    while i < n:
+        tok = cmd[i]
+        if tok == "--command" and i + 1 < n:
+            inner_str = cmd[i + 1]
+            break
+        if tok.startswith("--command="):
+            inner_str = tok.split("=", 1)[1]
+            break
+        i += 1
+
+    if not inner_str:
+        return _parse_generic(cmd)
+
+    try:
+        inner_tokens = shlex.split(inner_str)
+    except ValueError:
+        inner_tokens = inner_str.split()
+
+    if not inner_tokens:
+        return _parse_generic(cmd)
+
+    inner_binary = Path(inner_tokens[0]).name
+    inner_parser = _PARSERS.get(inner_binary)
+    if inner_parser is None:
+        # Unrecognized inner binary — keep the whole cmd under host checks.
+        return _parse_generic(cmd)
+
+    inner = inner_parser(inner_tokens)
+
+    lifted = inner.host_relevant_tokens()
+    # A semicolon glued INSIDE a lifted token (``pods;``) means the ORIGINAL
+    # string carried shell-chaining syntax. After shlex.split, the per-token
+    # blacklist patterns (``;\s*rm``, ``rm\s+-rf`` …) can no longer see across
+    # the boundary, and the wiz transport re-parses the string through a remote
+    # shell. Fall back to whole-command checks on the raw --command string
+    # token, where those patterns still match. A legit wrapped command never
+    # produces one: resource names cannot contain ';', and data payloads are
+    # excluded from the lifted tokens.
+    if any(";" in token for token in lifted):
+        return _parse_generic(cmd)
+
+    # Lift inner structure to the wiz level. ``inner.host_relevant_tokens()``
+    # already excludes the inner container_command and data payloads, so
+    # placing it in positional_args re-checks exactly what kubeconfig mode
+    # would check — no more, no less.
+    return ParsedCommand(
+        binary="wiz",
+        subcommand=None,
+        positional_args=lifted,
+        flags=(),
+        data_payload_values=inner.data_payload_values,
+        container_command=inner.container_command,
+    )
+
+
 _PARSERS: dict[str, Callable[[list[str]], ParsedCommand]] = {
     "kubectl": _parse_kubectl,
     "blade": _parse_blade,
+    "wiz": _parse_wiz,
 }
 
 

@@ -1,4 +1,4 @@
-"""Tests for ``chaos_agent.agent.nodes._metric_extractor`` (E2 Phase 1).
+"""Tests for ``chaos_agent.agent.nodes.verify._metric_extractor`` (E2 Phase 1).
 
 The extractor is the shared kernel for three call sites — baseline
 collection, Layer 2 verification, and verdict cross-check. These tests
@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from chaos_agent.agent.nodes._metric_extractor import (
+from chaos_agent.agent.nodes.verify._metric_extractor import (
     extract_baseline_metrics,
     extract_metrics,
 )

@@ -14,6 +14,9 @@ from chaos_agent.agent.prompts import (
     get_guidelines_section,
     get_env_section,
 )
+from chaos_agent.agent.prompts.sections.workflow import (
+    get_verification_heuristics_compact_section,
+)
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.prompts.sections.intent import (
     get_intent_role_section,
@@ -44,9 +47,50 @@ class TestSectionFunctions:
         assert "Phase 2" in section
         assert "activate_skill" in section
 
+    def test_workflow_section_grounds_target_before_planning(self):
+        # Single profile-agnostic text: target grounding is enforced for every
+        # environment via bound read-only tools, not a per-profile branch.
+        section = get_workflow_section()
+        assert "target authority" in section
+        assert "read-only tools" in section
+        assert "finish_planning" in section
+
+    def test_verification_heuristics_encodes_timeout_discipline(self):
+        # Postmortem lesson (task-e951696f) generalized: a timeout/failed
+        # observation is never proof of success, and partial coverage must not
+        # be generalized to the whole. Lives as a GENERAL heuristic (not a
+        # blade_scope branch), so it applies to every fault type.
+        section = get_verification_heuristics_compact_section()
+        assert "Timeout ≠ signal" in section
+        assert "Count & coverage" in section
+        assert "never tally timeouts" in section
+        assert "partial N/total" in section
+
+    def test_verification_heuristics_encodes_method_not_target(self):
+        # Aligns the verifier with intent's `# Reflection`: after repeated
+        # identical failures, suspect your own method (not the target) and
+        # broaden-then-narrow rather than re-running the same command. Lives as
+        # a GENERAL heuristic, not a per-fault branch.
+        section = get_verification_heuristics_compact_section()
+        assert "Method, not target" in section
+        assert "broaden" in section
+
+    def test_recover_core_principles_encodes_method_switch(self):
+        # Recovery verifier previously lacked the "switch method, don't retry
+        # the same command" discipline that the inject verifier already has.
+        # This closes that gap using the same wording family.
+        from chaos_agent.agent.prompts.sections.recovery import (
+            build_recover_verifier_system_prompt,
+        )
+
+        prompt = build_recover_verifier_system_prompt()
+        assert "suspect your METHOD" in prompt
+        assert "switch to structured status" in prompt
+        assert "never silently omit" in prompt
+
     def test_safety_section_contains_rules(self):
         section = get_safety_section()
-        assert "namespace blacklist" in section
+        assert "target blacklist" in section
         assert "NEVER" in section
         assert "ALWAYS" in section
 
@@ -94,16 +138,23 @@ class TestSectionFunctions:
         section = get_executor_core_principles_section()
         assert "# Core Principles" in section
         assert "UNVERIFIED" in section
-        assert "TOOL is right" in section
+        assert "runtime evidence" in section
+        assert "adaptively" in section
+        assert "do not retry or re-plan" not in section
         assert "STOP" in section
 
     def test_executor_remember_section_content(self):
         section = get_executor_remember_section()
         assert "# REMEMBER" in section
         assert "UNVERIFIED" in section
-        assert "TOOL is right" in section
+        assert "runtime evidence" in section
+        assert "adaptively" in section
         assert "STOP" in section
-        assert "[REPLAN]" in section
+        # request_replan must be presented as a normal tool call, never a
+        # printed JSON/text marker (the text form induced verbalized
+        # "[Tool call: request_replan]" output that matched no channel).
+        assert "request_replan" in section
+        assert "<replan_request>" not in section
 
     def test_executor_core_principles_and_remember_are_aligned(self):
         """REMEMBER must reinforce the same rules as executor Core Principles."""
@@ -200,7 +251,7 @@ class TestIntentClarificationSectionFunctions:
         assert "scope" in section
         assert "target" in section
         assert "action" in section
-        assert "namespace" in section
+        assert "target identity fields" in section
 
     def test_inject_flow_section(self):
         section = get_intent_inject_flow_section()
@@ -217,9 +268,10 @@ class TestIntentClarificationSectionFunctions:
 
     def test_batch_flow_section(self):
         section = get_intent_batch_flow_section()
-        assert "Batch Flow" in section
-        assert "Diversity Principle" in section
-        assert "fault type diversity" in section
+        assert "Batch Boundary" in section
+        assert "independent" in section
+        assert 'execution_order="serial"' in section
+        assert "Do not manufacture a batch" in section
         assert "submit_batch_intent" in section
 
     def test_operation_freshness_section(self):
@@ -238,29 +290,33 @@ class TestIntentClarificationSectionFunctions:
     def test_output_section(self):
         section = get_intent_output_section()
         assert "Chinese" in section
-        assert "NEVER" in section
-        assert "emoji" in section
+        assert "blade-fault-proposal" in section
+        assert "FaultSpec" in section
+        assert "revision" in section
 
-    def test_completeness_section_all_filled(self):
+    def test_fault_contract_includes_current_fault_spec(self):
         section = get_intent_completeness_section({
-            "scope": "pod", "target": "cpu", "action": "fullload",
-            "namespace": "default", "labels": "app=test",
+            "revision": 1,
+            "objective": "test",
+            "scope": "pod", "blade_target": "network", "blade_action": "drop",
+            "namespace": "default", "names": [], "labels": {}, "params": {},
+            "boundaries": [], "constraints": [], "assumptions": [],
         })
-        assert "⚠️ ALL REQUIRED" in section
-        assert "Confirmed Parameters" in section
+        assert "Reviewed FaultSpec" in section
+        assert '"objective": "test"' in section
 
-    def test_completeness_section_missing(self):
+    def test_fault_contract_shows_partial_collection_state(self):
         section = get_intent_completeness_section({"scope": "pod"})
-        assert "Still missing" in section
+        assert '"scope": "pod"' in section
 
-    def test_completeness_section_none(self):
+    def test_fault_contract_is_present_without_previous_state(self):
         section = get_intent_completeness_section(None)
-        assert section == ""
+        assert "No FaultSpec has been collected yet" in section
 
     def test_reminder_section_recaps_rules(self):
         section = get_intent_reminder_section()
         assert "REMEMBER" in section
-        assert "kubectl_ro" in section
+        assert "target authority" in section
         assert "submit" in section
         assert "Probe" in section
 
@@ -292,20 +348,24 @@ class TestBuildIntentClarificationPrompt:
         prompt = build_intent_clarification_prompt()
         assert "BLADE_AI_CACHE_BOUNDARY" in prompt
 
-    def test_with_fault_intent(self):
-        """Dynamic section (confirmed parameters) injected below cache boundary."""
+    def test_with_fault_spec(self):
+        """The reviewed FaultSpec is injected below the cache boundary."""
         prompt = build_intent_clarification_prompt(
-            fault_intent={"scope": "pod", "target": "cpu", "action": "fullload", "namespace": "default"},
+            fault_spec={
+                "revision": 1,
+                "objective": "network isolation",
+                "scope": "pod", "blade_target": "network", "blade_action": "drop",
+                "namespace": "default", "names": [], "labels": {}, "params": {},
+                "boundaries": [], "constraints": [], "assumptions": [],
+            },
         )
-        assert "Confirmed Parameters" in prompt
-        assert "scope: pod" in prompt
+        assert "Reviewed FaultSpec" in prompt
+        assert '"objective": "network isolation"' in prompt
 
-    def test_without_fault_intent_no_confirmed_block(self):
-        """No fault_intent → no dynamic Confirmed Parameters section (## header)."""
+    def test_without_fault_spec_uses_empty_contract(self):
+        """The protocol always exposes the current contract state to the model."""
         prompt = build_intent_clarification_prompt()
-        # "Confirmed Parameters" appears in CRITICAL RULES text,
-        # but the ## header section should NOT be present without fault_intent.
-        assert "## Confirmed Parameters" not in prompt
+        assert "No FaultSpec has been collected yet" in prompt
 
     def test_inject_flow_in_assembled_prompt(self):
         prompt = build_intent_clarification_prompt()
@@ -319,3 +379,15 @@ class TestBuildIntentClarificationPrompt:
         prompt = build_system_prompt(PromptMode.INTENT)
         assert "Blade AI" in prompt
         assert "Three Priorities" in prompt
+
+    def test_semantic_intent_prompt_uses_full_catalog_without_transport_profile(self):
+        prompt = build_intent_clarification_prompt(
+            skill_catalog="- k8s: pod cpu pressure\n- host: cpu pressure",
+            semantic_only=True,
+        )
+
+        assert "`k8s`: pod cpu pressure" in prompt
+        assert "`host`: cpu pressure" in prompt
+        assert "Capability Profile" not in prompt
+        assert "kubectl_read" not in prompt
+        assert "full fault catalog" in prompt

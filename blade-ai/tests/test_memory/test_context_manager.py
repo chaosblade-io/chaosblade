@@ -23,6 +23,7 @@ from chaos_agent.memory.context_manager import (
     ensure_pair_integrity,
     group_messages_by_round,
     post_compact_cleanup,
+    resolve_auto_compact_threshold,
     strip_large_outputs,
 )
 
@@ -83,10 +84,44 @@ class TestContextManager:
         # The recent message should be in to_keep
         assert recent_msg in to_keep
 
-    def test_compact_threshold_calculation(self):
-        cm = ContextManager(max_tokens=1000, compact_ratio=0.7)
-        expected = int(1000 * 0.7)
-        assert cm.compact_threshold == expected
+    def test_compact_threshold_matches_the_trigger_judgement(self):
+        """``compact_threshold`` must equal the auto-compact trigger point.
+
+        Previously it was a bare ``max_tokens * compact_ratio`` while
+        ``calculate_token_warning_state`` applied a buffer ceiling and a 50%
+        floor on top. The two agreed at the default ratio, so the split stayed
+        invisible — but the hook compares its post-strip total against
+        ``compact_threshold``, so any drift lets it accept a context the trigger
+        has already rejected. Asserting equality (rather than restating a
+        formula) is what keeps them from separating again.
+        """
+        for max_tokens, ratio in (
+            (1000, 0.7),        # tiny window: the 50% floor decides
+            (131_072, 0.8),     # production default
+            (131_072, 0.95),    # ratio above the buffer ceiling
+            (32_768, 0.5),
+        ):
+            cm = ContextManager(max_tokens=max_tokens, compact_ratio=ratio)
+            assert cm.compact_threshold == resolve_auto_compact_threshold(
+                max_tokens, ratio
+            ), f"threshold drifted at max_tokens={max_tokens}, ratio={ratio}"
+            # And the trigger really does fire at exactly that count.
+            state = calculate_token_warning_state(
+                cm.compact_threshold, max_tokens, compact_ratio=ratio
+            )
+            assert state.is_above_auto_compact, (
+                f"compact_threshold={cm.compact_threshold} is not yet a trigger "
+                f"point at max_tokens={max_tokens}, ratio={ratio}"
+            )
+
+    def test_operator_ratio_can_only_trigger_earlier(self):
+        """A higher ratio must never delay compaction past the buffer ceiling."""
+        max_tokens = 131_072
+        ceiling = resolve_auto_compact_threshold(max_tokens, 1.0)
+        for ratio in (0.8, 0.9, 0.95, 1.0):
+            assert (
+                resolve_auto_compact_threshold(max_tokens, ratio) <= ceiling
+            ), f"ratio={ratio} pushed the threshold past the buffer ceiling"
 
     def test_compact_ratio_stored_on_instance(self):
         # Bug 4 setup: the manager must KEEP the raw ratio so

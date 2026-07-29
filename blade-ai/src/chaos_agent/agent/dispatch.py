@@ -42,8 +42,16 @@ async def dispatch_node_message(node: str, content: str) -> None:
     """Emit a node_message event for programmatic text not produced by an LLM call.
 
     parse_stream_event converts this to a token StreamEvent so the TUI displays it.
+
+    Custom-event dispatch is cosmetic (TUI streaming) and requires a parent run
+    context. When a node is invoked directly (e.g. unit tests) there is no run,
+    and ``adispatch_custom_event`` raises ``RuntimeError``. Swallow it so node
+    business logic is never broken by a missing streaming context.
     """
-    await adispatch_custom_event("node_message", {"node": node, "content": content})
+    try:
+        await adispatch_custom_event("node_message", {"node": node, "content": content})
+    except RuntimeError:
+        logger.debug("dispatch_node_message skipped for %s (no run context)", node)
 
 
 def with_phase_events(

@@ -11,9 +11,11 @@ import pytest
 def _force_kubeconfig_mode(monkeypatch):
     """Force kubeconfig connection mode for deterministic command assertions.
 
-    Without this, tests break when the developer's config.json sets
-    kube_connection_mode=kubewiz (higher priority than env vars in
-    pydantic-settings source chain).
+    kube_connection_mode is now an explicit channel override; leaving it
+    empty ("") plus clearing the kubewiz selector fields makes field-based
+    inference deterministically resolve to the kubeconfig channel, immune
+    to the developer's config.json.
     """
     from chaos_agent.config.settings import settings as _s
-    monkeypatch.setattr(_s, "kube_connection_mode", "kubeconfig")
+    monkeypatch.setattr(_s, "kube_connection_mode", "")
+    monkeypatch.setattr(_s, "kubewiz_cluster_uuid", "")

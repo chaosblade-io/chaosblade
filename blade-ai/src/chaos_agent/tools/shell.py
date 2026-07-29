@@ -3,7 +3,9 @@
 import asyncio
 import logging
 import os
+import shutil
 import signal
+import sys
 import time
 from pathlib import Path
 from typing import Optional
@@ -18,6 +20,17 @@ from chaos_agent.observability.status_tracker import (
     StatusPhase,
 )
 from chaos_agent.tools.guard import CommandResult, ToolGuard
+from chaos_agent.tools.guard_gateway import get_guard_gateway
+
+# ARMS GenAI registers fork callbacks that emit debug records before exec().
+# Production stacks have stalled in RotatingFileHandler on that path. Linux
+# subprocesses below avoid fork; this remains defense in depth for third-party
+# code that still forks.
+for _arms_fork_logger_name in (
+    "aliyun.opentelemetry.util.genai._multimodal_processing",
+    "aliyun.opentelemetry.util.genai._multimodal_upload.pre_uploader",
+):
+    logging.getLogger(_arms_fork_logger_name).setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +46,36 @@ def _kill_process_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
         pass
+
+
+def _prepare_spawn_command(exec_cmd: list[str]) -> tuple[list[str], dict[str, bool]]:
+    """Build a subprocess command that avoids ``fork()`` on Linux.
+
+    CPython 3.12 only selects ``posix_spawn`` when the executable is absolute,
+    ``close_fds`` is false, and ``start_new_session`` is false. ``setsid``
+    creates the session/process group externally so timeout cleanup can still
+    terminate the command and all of its descendants with ``killpg``.
+    """
+    if not sys.platform.startswith("linux"):
+        return exec_cmd, {"start_new_session": True}
+
+    setsid_path = shutil.which("setsid")
+    if not setsid_path:
+        for candidate in ("/usr/bin/setsid", "/bin/setsid"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                setsid_path = candidate
+                break
+    if not setsid_path:
+        raise RuntimeError(
+            "Linux safe subprocess execution requires the 'setsid' executable"
+        )
+
+    # Python-created descriptors are non-inheritable by default (PEP 446).
+    # close_fds=False is required for CPython 3.12's posix_spawn fast path.
+    return [str(Path(setsid_path).resolve()), *exec_cmd], {
+        "close_fds": False,
+        "start_new_session": False,
+    }
 
 
 # Module-level ToolGuard instance
@@ -94,6 +137,7 @@ async def run_command(
     env_override: Optional[dict[str, str]] = None,
     source: Optional[str] = None,
     stdin_data: str = "",
+    channel: str = "",
 ) -> CommandResult:
     """Execute a command safely via async subprocess.
 
@@ -110,6 +154,9 @@ async def run_command(
                 pre-checks to distinguish them from LLM-initiated tool calls.
         stdin_data: If non-empty, piped to the subprocess stdin. Used by
                     kubectl apply/create -f - to pass YAML manifests.
+        channel: Resolved transport channel name, recorded on status events so
+                 the destination of a command is visible even when ``source``
+                 carries a semantic label instead of the executed binary.
 
     Returns:
         CommandResult with exit_code, stdout, stderr, duration_ms.
@@ -119,10 +166,12 @@ async def run_command(
         ToolTimeoutError: If the command times out.
     """
     if not skip_guard:
-        guard = get_tool_guard()
-        allowed, reason = guard.check(cmd)
-        if not allowed:
-            raise ToolGuardError(reason)
+        # Single funnel: command safety → unified GuardFeedback. The rendered
+        # text carries the specific rule that fired + the offending token, not
+        # an opaque catch-all, so the model can self-correct.
+        feedback = get_guard_gateway().check_command(cmd)
+        if not feedback.allowed:
+            raise ToolGuardError(feedback.render_for_llm())
 
     # Emit status event for command execution (use emit() instead of
     # start()/complete()/fail() to avoid polluting the parent node's
@@ -133,6 +182,18 @@ async def run_command(
     display_cmd = ([Path(cmd[0]).name] + cmd[1:]) if cmd else cmd
     cmd_str = " ".join(display_cmd)
     source_name = source or (Path(cmd[0]).name if cmd else "unknown")
+    # ``source`` is a SEMANTIC label the caller chooses ("host-read",
+    # "verifier-L1", …) and the TUI renders it, so it must stay as-is. But it
+    # then hides the execution facts: task-46317228's ``host_read`` events said
+    # "host-read" while ``wiz`` was the binary actually run, against a cluster
+    # channel. Carry both facts alongside so the destination is never invisible.
+    executed_binary = Path(cmd[0]).name if cmd else ""
+    # Carried on the completion / failure / timeout events too, not just the
+    # start one: diagnosing a bad run means looking at the FAILURE event, and
+    # the destination is exactly what was missing there.
+    exec_detail = {"command": cmd_str, "executed_binary": executed_binary}
+    if channel:
+        exec_detail["channel"] = channel
     tracker = get_tracker(task_id) if task_id else None
     if tracker:
         tracker.emit(StatusEvent(
@@ -141,7 +202,7 @@ async def run_command(
             category=StatusCategory.TOOL,
             source=source_name,
             message=f"Executing shell: {cmd_str}",
-            detail={"command": cmd_str},
+            detail=dict(exec_detail),
         ))
 
     cmd_timeout = timeout or settings.timeout_default
@@ -156,18 +217,19 @@ async def run_command(
         if env_override:
             sub_env = {**os.environ, **env_override}
 
-        # Resolve cmd[0] to absolute path so that subprocess.Popen uses
-        # posix_spawn instead of fork() on Linux — fork() triggers APM
-        # native pthread_atfork callbacks (uniagent) which crash the worker.
+        # Resolve cmd[0] to an absolute path, then construct a Linux spawn
+        # command that satisfies CPython 3.12's posix_spawn conditions. fork()
+        # triggers unsafe APM at-fork callbacks in the production worker.
         exec_cmd = ([resolve_exec_path(cmd[0])] + cmd[1:]) if cmd else cmd
+        spawn_cmd, spawn_kwargs = _prepare_spawn_command(exec_cmd)
 
         proc = await asyncio.create_subprocess_exec(
-            *exec_cmd,
+            *spawn_cmd,
             stdin=asyncio.subprocess.PIPE if stdin_data else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=sub_env,
-            start_new_session=True,  # setsid(): new session+process group for killpg cleanup (uvloop rejects process_group kwarg)
+            **spawn_kwargs,
         )
 
         # Background reaper: once the main process exits, kill its entire
@@ -215,7 +277,7 @@ async def run_command(
                 source=source_name,
                 message=f"Command timed out after {cmd_timeout}s: {cmd_str}",
                 duration_ms=(time.monotonic() - start_time) * 1000,
-                detail={"exit_code": -1, "timeout": cmd_timeout},
+                detail={**exec_detail, "exit_code": -1, "timeout": cmd_timeout},
             ))
         _persist_to_session(
             task_id=task_id,
@@ -232,6 +294,17 @@ async def run_command(
     finally:
         if reap_task and not reap_task.done():
             reap_task.cancel()
+            # Await the cancelled task to ensure it completes before
+            # the caller returns. Without this, the task lingers as
+            # "pending cancelled" on the event loop. On Python 3.11 +
+            # pytest-asyncio the loop-cleanup phase may hang if the
+            # task's coroutine raises a non-CancelledError (e.g.
+            # TypeError from ``await MagicMock()`` in unit tests where
+            # ``proc`` is a MagicMock, not a real Process).
+            try:
+                await reap_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     duration_ms = (time.monotonic() - start_time) * 1000
     stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -255,7 +328,7 @@ async def run_command(
                 source=source_name,
                 message=f"Shell completed: {cmd_str} ({duration_ms:.0f}ms)",
                 duration_ms=duration_ms,
-                detail={"exit_code": result.exit_code, "duration_ms": duration_ms, "stdout_preview": stdout_preview},
+                detail={**exec_detail, "exit_code": result.exit_code, "duration_ms": duration_ms, "stdout_preview": stdout_preview},
             ))
         else:
             tracker.emit(StatusEvent(
@@ -265,7 +338,7 @@ async def run_command(
                 source=source_name,
                 message=f"Shell failed: {cmd_str} (exit={result.exit_code})",
                 duration_ms=duration_ms,
-                detail={"exit_code": result.exit_code, "stderr": stderr[:200], "stdout_preview": stdout_preview},
+                detail={**exec_detail, "exit_code": result.exit_code, "stderr": stderr[:200], "stdout_preview": stdout_preview},
             ))
 
     # Persist command execution to SessionStore (CLI → session JSON observability bridge)

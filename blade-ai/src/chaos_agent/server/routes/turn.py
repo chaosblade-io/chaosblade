@@ -22,7 +22,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from chaos_agent.agent.fault_spec import SOURCE_TUI, FaultSpec
+from chaos_agent.agent.spec.fault_spec import SOURCE_TUI, FaultSpec
 from chaos_agent.agent.streaming import StreamEvent
 from chaos_agent.config.settings import settings
 from chaos_agent.server.routes.sessions import SessionStore, get_store, sessions_router
@@ -42,6 +42,7 @@ class TurnRequest(BaseModel):
     permission_mode: str = "confirm"
     display_mode: str | None = "calm"
     dry_run: bool = False
+    planning_mode: str | None = None
 
 
 @sessions_router.post("/{sid}/turn")
@@ -95,6 +96,7 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             "kubewiz_cluster_uuid": settings.kubewiz_cluster_uuid,
             "kubewiz_profile": settings.kubewiz_profile,
             "dry_run": body.dry_run,
+            "planning_mode": body.planning_mode,
         }
     else:
         initial_state = {
@@ -102,7 +104,13 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             "input": body.input,
             "confirmed_intent": "unset",
             "intent_confidence": 0.0,
+            # Clear stale intent payload from checkpoint to prevent
+            # intent_clarification fast-path from re-confirming an
+            # abandoned/rejected batch intent on the next turn.
+            "fault_spec": None,
+            "batch_submit_args": None,
             "dry_run": body.dry_run,
+            "planning_mode": body.planning_mode,
         }
 
     config = {
@@ -110,8 +118,11 @@ async def turn(sid: str, body: TurnRequest, req: Request):
         "recursion_limit": settings.recursion_limit,
     }
 
-    from chaos_agent.observability.status_tracker import subscribe as _status_subscribe
-    tracker_key = f"tui-{sid}"
+    from chaos_agent.observability.status_tracker import (
+        TUI_TRACKER_PREFIX,
+        subscribe as _status_subscribe,
+    )
+    tracker_key = f"{TUI_TRACKER_PREFIX}{sid}"
     tracker_queue = _status_subscribe(tracker_key)
 
     ctx = TurnContext(

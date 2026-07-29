@@ -26,10 +26,12 @@ from enum import Enum
 from typing import Optional
 
 from chaos_agent.memory.tokens import (
+    ContextUsage,
     TokenCount,
     TokenCountQuality,
     count_tokens,
     count_tokens_messages,
+    estimate_context_tokens,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,8 +41,10 @@ logger = logging.getLogger(__name__)
 # code should call ``count_tokens(...)`` / ``count_tokens_messages(...)``
 # directly to get quality tags.
 __all__ = [
+    "ContextUsage",
     "count_tokens",
     "count_tokens_messages",
+    "estimate_context_tokens",
     "TokenCount",
     "TokenCountQuality",
     "CompactLevel",
@@ -89,6 +93,20 @@ BLOCKING_BUFFER_TOKENS = 3_000
 # Circuit breaker: stop retrying after consecutive failures
 MAX_CONSECUTIVE_COMPACT_FAILURES = 3
 
+# A compaction that leaves this share of the tokens behind did not accomplish
+# anything. It counts against the circuit breaker exactly like an exception
+# would: the breaker exists to stop futile retries, and "succeeded but freed
+# nothing" is futile in the same way — worse, actually, because each attempt
+# also spends an LLM call and appends another summary.
+#
+# The failure mode this catches was measured, not hypothesised: with every
+# ``[Compressed History]`` retained, a 30-summary history sat 40K past the
+# window while ``to_compact`` held 42 tokens, so each pass freed 42 and appended
+# ~4,600. The bookkeeping made it invisible — the success branch reset
+# ``consecutive_failures`` to 0 every time, so the breaker never engaged and the
+# session ran until the provider rejected the request.
+INEFFECTIVE_COMPACTION_RATIO = 0.95
+
 
 @dataclass
 class CompactTrackingState:
@@ -107,6 +125,36 @@ class CompactTrackingState:
 # ---------------------------------------------------------------------------
 # Token warning calculation
 # ---------------------------------------------------------------------------
+
+
+def resolve_auto_compact_threshold(max_tokens: int, compact_ratio: float) -> int:
+    """The token count at which auto-compaction fires.
+
+    Single source of truth for BOTH consumers — ``calculate_token_warning_state``
+    (which decides the warning level) and ``ContextManager.compact_threshold``
+    (which the hook compares against after stripping, and reports as
+    ``trigger_tokens`` in the UI). They used to compute it separately: the
+    former as ``min(max_tokens - buffer, max_tokens * ratio)``, the latter as a
+    bare ``max_tokens * ratio``. Identical at the default ratio, so the split
+    stayed invisible — but at ``ratio >= 0.93`` on a 131,072 window the bare
+    form returned 124,518 against the guarded 118,072, letting the post-strip
+    check accept a context the trigger had already rejected. The constructor
+    comment already declared "Both must agree on intent"; this makes it
+    structural instead of a convention.
+
+    The buffer ceiling keeps context from getting within
+    ``AUTOCOMPACT_BUFFER_TOKENS`` of the hard maximum, so the next user message
+    cannot push past the provider limit before compaction gets a chance to run.
+    The ratio lets an operator trigger EARLIER, never later. The 50% floor
+    protects against a typo'd tiny ratio (below it the system would try to
+    compact every message) and also keeps the result positive on the small
+    windows used in tests, where the absolute buffer alone would go negative.
+    """
+    threshold = min(
+        max_tokens - AUTOCOMPACT_BUFFER_TOKENS,
+        int(max_tokens * compact_ratio),
+    )
+    return max(threshold, int(max_tokens * 0.5))
 
 
 def calculate_token_warning_state(
@@ -134,40 +182,13 @@ def calculate_token_warning_state(
     """
     effective_window = max_tokens
     if auto_compact_enabled:
-        # Threshold = the EARLIER of two triggers (min, not max):
-        #
-        #   1. ``max_tokens - AUTOCOMPACT_BUFFER_TOKENS``  — buffer ceiling.
-        #      Never let context get within 13K of the absolute max,
-        #      otherwise the next user message could push past the
-        #      provider's hard limit before compaction has a chance to
-        #      run.
-        #
-        #   2. ``max_tokens * compact_ratio``  — user setting. Lets
-        #      the operator pull the trigger earlier (e.g. 0.5 ratio
-        #      on a 128K window = 64K trigger) for tighter sessions
-        #      or when testing the compaction path.
-        #
-        # Take the SMALLER → "whichever fires first". With defaults
-        # (0.85 × 128K = 108_800 vs 128K - 13K = 115_000), the ratio
-        # wins and we trigger at 108_800. Bumping ratio to 0.95 would
-        # let the buffer floor (115_000) win — the ratio can never
-        # delay compaction past the buffer's safety ceiling.
-        #
-        # PREVIOUS BUG: this was ``max()``, which made the buffer
-        # ALWAYS win because subtracting 13K is almost always more
-        # restrictive than ratio multiplication. The ``compact_ratio``
-        # setting was effectively dead — operators changing it saw
-        # no behavior change at the trigger threshold.
-        auto_compact_threshold = min(
-            max_tokens - AUTOCOMPACT_BUFFER_TOKENS,
-            int(max_tokens * compact_ratio),
-        )
-        # Defensive floor: never go below 50% of the window even if
-        # the user typo'd a tiny ratio. Below this the system would
-        # spin trying to compact every message.
-        auto_compact_threshold = max(
-            auto_compact_threshold,
-            int(max_tokens * 0.5),
+        # Threshold = the EARLIER of two triggers (buffer ceiling vs the
+        # operator's ratio), with a 50% floor. See
+        # ``resolve_auto_compact_threshold`` for the full rationale, including
+        # the PREVIOUS BUG where this was ``max()`` — that made the buffer
+        # always win and left ``compact_ratio`` effectively dead.
+        auto_compact_threshold = resolve_auto_compact_threshold(
+            max_tokens, compact_ratio
         )
     else:
         auto_compact_threshold = max_tokens
@@ -286,6 +307,39 @@ def group_messages_by_round(messages: list) -> list[list]:
 
 COMPRESSED_HISTORY_PREFIX = "[Compressed History]"
 
+# How many of the newest [Compressed History] summaries are kept verbatim
+# instead of being folded into the next compaction.
+#
+# 1, not 0: the newest summary is the safety net for the one thing this design
+# cannot verify statically — whether the model actually honoured "build upon the
+# previous summary". If it silently drops earlier facts, the latest checkpoint
+# still survives untouched. Keeping it costs one summary's worth of tokens.
+#
+# 1, not more: every extra retained summary restores the monotonic growth this
+# limit exists to stop, only slower. Older summaries are already represented
+# twice in the compaction request (cumulative ``previous_summary`` + the
+# messages themselves), so retaining them verbatim buys no additional safety.
+SUMMARIES_KEPT_VERBATIM = 1
+
+# Largest share of ``reserve_tokens`` the retained summary may occupy.
+#
+# Retaining a summary is only worthwhile if recent context still fits beside it.
+# The second reservation pass stops as soon as ``kept_tokens`` exceeds
+# ``reserve_tokens``, so an oversized summary does not merely crowd recent
+# messages out — it leaves ZERO of them, handing the model a stale checkpoint
+# with no idea what just happened.
+#
+# This is reachable today, not a hypothetical: ``compact_memory`` prepends the
+# recovered critical context to the summary text, and its skill-content budget
+# alone (``POST_COMPACT_SKILLS_TOKEN_BUDGET`` = 25,000) already exceeds the
+# 20,000-token reservation, with plan/target/summary prose on top and no cap of
+# their own.
+#
+# When a summary breaches this share it is recycled like the older ones: it goes
+# into ``to_compact``, so its content is re-summarised (smaller) rather than
+# dropped. 0.5 keeps at least half the reservation for actual recent turns.
+MAX_SUMMARY_SHARE_OF_RESERVE = 0.5
+
 
 def _is_compressed_history(msg) -> bool:
     """Check if a message is a compressed history summary."""
@@ -308,15 +362,17 @@ class ContextManager:
         self.max_tokens = max_tokens
         # Keep the raw ratio AND the precomputed threshold:
         # - ratio is what we hand to calculate_token_warning_state so
-        #   the user setting actually shapes the trigger (see the
-        #   ``min()`` formula in that function).
-        # - threshold is the legacy "rough" budget some callers still
-        #   compare against directly (e.g. the hook's post-strip
-        #   "still over budget?" check). Both must agree on intent so
-        #   the operator's BLADE_AI_CONTEXT_COMPACT_RATIO knob behaves
-        #   consistently across all consumers.
+        #   the user setting actually shapes the trigger.
+        # - threshold is what callers compare against directly (the hook's
+        #   post-strip "still over budget?" check, and the ``trigger_tokens``
+        #   reported to the UI).
+        # Both now come from ``resolve_auto_compact_threshold``, so they cannot
+        # disagree — previously this line was a bare ``max_tokens * ratio``,
+        # which drifted above the guarded trigger once the ratio passed ~0.93.
         self.compact_ratio = compact_ratio
-        self.compact_threshold = int(max_tokens * compact_ratio)
+        self.compact_threshold = resolve_auto_compact_threshold(
+            max_tokens, compact_ratio
+        )
         self.reserve_tokens = 20000
 
     def check_context(
@@ -346,13 +402,20 @@ class ContextManager:
             is_valid=False means context is blocked (circuit breaker tripped
             or at blocking level).
         """
-        # safe_count = count × per-quality safety margin (1.0 for tiktoken
-        # native, 1.05 for cross-family BPE, 1.20 for legacy heuristic).
-        # The threshold check thus auto-widens when the underlying tokenizer
-        # is less accurate, replacing the old global SAFETY_MARGIN=1.2.
-        # No ``model=`` arg needed — count_tokens_messages reads
-        # ``settings.model_name`` by default (see _resolve_model in tokens.py).
-        total_tokens = count_tokens_messages(messages).safe_count
+        # "How full is the window?" is not "how big is this message list?".
+        # A request also carries the system prompt (assembled skills, knowledge)
+        # and every tool's JSON schema, none of which appear in ``messages``. On
+        # real checkpoint data from this project the first call of a drill
+        # reported ``input_tokens=6,936`` against a message list worth 11 tokens,
+        # and the gap grows as skills load. Measured over nine consecutive calls,
+        # anchoring on provider usage cut the mean absolute error from 77% to 8%,
+        # and the old figure was low EVERY time (-67% to -95%) — the direction
+        # that delays compaction.
+        #
+        # ``safe_tokens`` applies the tokenizer's margin to the estimated tail
+        # only; the provider's own number needs no padding.
+        usage = estimate_context_tokens(messages)
+        total_tokens = usage.safe_tokens
         # Pass the instance's configured ratio so the operator's
         # ``BLADE_AI_CONTEXT_COMPACT_RATIO`` setting actually influences
         # the trigger. Before this fix the function silently used its
@@ -400,29 +463,80 @@ class ContextManager:
         )
 
         # Reserve recent messages
-        # Incremental compaction: always keep [Compressed History] summaries
-        # so they are never re-compressed, preventing information loss.
         messages_to_keep = []
         kept_tokens = 0
 
-        # First pass: pull out all [Compressed History] summaries into to_keep
-        # This ensures previous compression results are never re-compressed.
-        # Use raw ``count`` here (not ``safe_count``) — we're accumulating
-        # toward ``reserve_tokens`` to decide how much room is left for
-        # tail-keeping, not making a threshold decision; over-counting at
-        # this step would under-keep useful recent context.
-        summary_indices = set()
-        for i, msg in enumerate(messages):
-            if _is_compressed_history(msg):
-                messages_to_keep.append(msg)
-                kept_tokens += count_tokens_messages([msg]).count
-                summary_indices.add(i)
+        # First pass: decide which [Compressed History] summaries survive.
+        #
+        # Keeping ALL of them (the previous behaviour) made context grow
+        # monotonically and eventually INVERTED compaction. Measured on the
+        # real 131,072-token window: at 30 summaries the history was 145K —
+        # past both the threshold and the window — yet everything but 42
+        # tokens sat in to_keep, so a "compaction" removed 42 tokens and
+        # appended a fresh ~4.6K summary. Each pass grew the context.
+        #
+        # Recycling the older ones is lossless because their content reaches
+        # the summarising LLM through TWO independent paths:
+        #   1. ``state["compressed_summary"]`` → ``previous_summary`` in the
+        #      prompt ("Previous summary to build upon"), which is itself
+        #      cumulative — each summary was built on its predecessor;
+        #   2. the summary messages themselves land in ``to_compact`` and are
+        #      passed to ``llm.ainvoke`` as part of the conversation.
+        # The newest summary is still KEPT verbatim as a safety net: if the
+        # model ever fails to carry forward what it was told to preserve, the
+        # most recent checkpoint survives untouched rather than being replaced
+        # by a lossy re-summary.
+        #
+        # Summaries are SystemMessages with no tool_calls, so moving them
+        # between the two lists cannot split a tool_call/tool_result pair.
+        summary_indices = [
+            i for i, msg in enumerate(messages) if _is_compressed_history(msg)
+        ]
+        # An oversized summary is worse than no summary: it consumes the whole
+        # reservation and leaves no room for the recent turns the model needs to
+        # know where it is. Recycle it instead — it lands in ``to_compact`` and
+        # gets re-summarised, so the content survives in a smaller form.
+        #
+        # Walk NEWEST-first. The share is consumed in visit order, so iterating
+        # oldest-first would let an older summary claim the budget and push the
+        # newest one out — inverting the very priority
+        # ``SUMMARIES_KEPT_VERBATIM`` exists to express. Unreachable while it is
+        # 1, but its own comment weighs raising it, and a config change must not
+        # silently reverse which checkpoint survives.
+        summary_budget = int(self.reserve_tokens * MAX_SUMMARY_SHARE_OF_RESERVE)
+        for i in reversed(summary_indices[-SUMMARIES_KEPT_VERBATIM:]):
+            # Use raw ``count`` here (not ``safe_count``) — we're accumulating
+            # toward ``reserve_tokens`` to decide how much room is left for
+            # tail-keeping, not making a threshold decision; over-counting at
+            # this step would under-keep useful recent context.
+            summary_tokens = count_tokens_messages([messages[i]]).count
+            if kept_tokens + summary_tokens > summary_budget:
+                logger.info(
+                    f"Recycling the newest [Compressed History] too: it needs "
+                    f"{summary_tokens} tokens against a {summary_budget}-token "
+                    f"share of the {self.reserve_tokens}-token reservation, "
+                    f"which would leave no room for recent messages"
+                )
+                continue
+            messages_to_keep.append(messages[i])
+            kept_tokens += summary_tokens
+        recycled_summaries = len(summary_indices) - sum(
+            1 for m in messages_to_keep if _is_compressed_history(m)
+        )
+        if recycled_summaries:
+            logger.info(
+                f"Recycling {recycled_summaries} older [Compressed History] "
+                f"summaries into this compaction "
+                f"(keeping the newest {SUMMARIES_KEPT_VERBATIM})"
+            )
 
-        # Second pass: reserve recent messages (skipping summaries already kept)
+        # Second pass: reserve recent messages (skipping summaries entirely —
+        # the kept ones are already in, the recycled ones must fall through to
+        # to_compact even though they sit late in the list).
         recent_keep = []
         for msg in reversed(messages):
             if _is_compressed_history(msg):
-                continue  # Already added above
+                continue
             msg_tokens = count_tokens_messages([msg]).count
             if kept_tokens + msg_tokens > self.reserve_tokens:
                 break

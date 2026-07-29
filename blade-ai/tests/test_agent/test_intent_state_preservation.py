@@ -84,31 +84,35 @@ class TestRouterUnsetFallThrough:
         assert result == "intent_clarification"
 
 
-class TestIntentPrefixInjection:
-    """Verify that fault_intent fields are injected into the system
-    prompt dynamic section (Confirmed Parameters + completeness signal)
-    so the LLM won't re-ask for already-confirmed parameters."""
+class TestReviewedFaultSpec:
+    """Verify the one FaultSpec contract is injected without a snapshot."""
 
-    def test_empty_fault_intent_no_dynamic_section(self):
-        """None fault_intent → no dynamic section."""
+    def test_empty_fault_spec_describes_the_contract(self):
         section = get_intent_completeness_section(None)
-        assert section == ""
+        assert "Reviewed FaultSpec" in section
+        assert "No FaultSpec has been collected yet" in section
 
-    def test_partial_fault_intent_generates_confirmed_block(self):
-        """fault_intent with scope+target → section includes those keys."""
+    def test_partial_fault_spec_remains_visible_during_collection(self):
         section = get_intent_completeness_section({
             "scope": "node", "target": "cpu", "namespace": "default",
         })
-        assert "Confirmed Parameters" in section
-        assert "scope: node" in section
-        assert "target: cpu" in section
-        assert "namespace: default" in section
+        assert '"scope": "node"' in section
 
-    def test_prefix_format(self):
-        """Section format matches expected structure."""
+    def test_complete_fault_spec_is_rendered_as_json(self):
         section = get_intent_completeness_section({
-            "scope": "pod", "target": "cpu",
+            "revision": 1,
+            "objective": "节点 CPU 满载",
+            "scope": "node",
+            "blade_target": "cpu",
+            "blade_action": "fullload",
+            "namespace": "",
+            "names": ["node-a"],
+            "labels": {},
+            "params": {"percent": "80"},
+            "boundaries": [],
+            "constraints": [],
+            "assumptions": [],
         })
-        assert "Confirmed Parameters" in section
-        assert "missing" in section.lower() or "ambiguous" in section.lower()
-        assert "scope: pod" in section
+        assert "Reviewed FaultSpec" in section
+        assert '"scope": "node"' in section
+        assert '"objective": "节点 CPU 满载"' in section

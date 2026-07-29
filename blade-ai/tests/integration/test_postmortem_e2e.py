@@ -188,7 +188,7 @@ class TestPostmortemE2E:
         monkeypatch.setattr(s_mod.settings, "postmortem_max_messages", 30)
         monkeypatch.setattr(s_mod.settings, "memory_dir", tmp_path / "memory")
 
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(
             memory_nodes, "sync_node_status_to_session", lambda *a, **k: None,
@@ -231,7 +231,7 @@ class TestPostmortemE2E:
         monkeypatch.setattr(s_mod.settings, "postmortem_timeout_seconds", 1)
         monkeypatch.setattr(s_mod.settings, "memory_dir", tmp_path / "memory")
 
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(
             memory_nodes, "sync_node_status_to_session", lambda *a, **k: None,
@@ -262,7 +262,7 @@ class TestPostmortemE2E:
         monkeypatch.setattr(s_mod.settings, "postmortem_enabled", True)
         monkeypatch.setattr(s_mod.settings, "memory_dir", tmp_path / "memory")
 
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(
             memory_nodes, "sync_node_status_to_session", lambda *a, **k: None,
@@ -302,7 +302,7 @@ class TestPostmortemE2E:
         monkeypatch.setattr(s_mod.settings, "postmortem_enabled", True)
         monkeypatch.setattr(s_mod.settings, "memory_dir", tmp_path / "memory")
 
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(
             memory_nodes, "sync_node_status_to_session", lambda *a, **k: None,
@@ -346,7 +346,7 @@ class TestPostmortemE2E:
         monkeypatch.setattr(s_mod.settings, "postmortem_enabled", True)
         monkeypatch.setattr(s_mod.settings, "memory_dir", tmp_path / "memory")
 
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(
             memory_nodes, "sync_node_status_to_session", lambda *a, **k: None,
@@ -393,7 +393,7 @@ class TestPostmortemE2E:
         monkeypatch.setattr(s_mod.settings, "postmortem_enabled", True)
         monkeypatch.setattr(s_mod.settings, "memory_dir", tmp_path / "memory")
 
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(
             memory_nodes, "sync_node_status_to_session", lambda *a, **k: None,
@@ -441,7 +441,7 @@ class TestPostmortemE2E:
         monkeypatch.setattr(s_mod.settings, "postmortem_enabled", True)
         monkeypatch.setattr(s_mod.settings, "memory_dir", tmp_path / "memory")
 
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(
             memory_nodes, "sync_node_status_to_session", lambda *a, **k: None,
@@ -728,7 +728,7 @@ class TestLangGraphStateMerge:
         monkeypatch.setattr(s_mod.settings, "postmortem_timeout_seconds", 10)
         monkeypatch.setattr(s_mod.settings, "memory_dir", tmp_path / "memory")
 
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(
             memory_nodes, "sync_node_status_to_session", lambda *a, **k: None,

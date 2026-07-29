@@ -85,8 +85,18 @@ class TestAgentRunnerListSkills:
                 "resource_path": "references/catalogue/Pod_cpu使用率过高/Pod_cpu使用率过高_CPU满载.md",
                 "example_cmd": 'blade-ai inject -i "帮我注入CPU故障..."',
             }]
-            # Mock ChatOpenAI to avoid real LLM call
-            with patch("langchain_openai.ChatOpenAI"):
+            # Stub ``factory.make_llm`` (its definition site — runner
+            # imports it locally), NOT ``langchain_openai.ChatOpenAI``.
+            #
+            # ``make_llm`` lazily imports ``resilient_llm``, whose module body
+            # runs ``class ResilientChatOpenAI(ChatOpenAI)``. Patching
+            # ``langchain_openai.ChatOpenAI`` while that first import happens
+            # makes the subclass inherit from a MagicMock — and because a
+            # module body executes only once, the poisoned class stays in
+            # ``sys.modules`` after the patch exits, so every later
+            # ``make_llm()`` in the session returns a mock whose auto-built
+            # side_effect iterator eventually raises StopIteration.
+            with patch("chaos_agent.agent.factory.make_llm"):
                 result = await runner.list_skills()
 
         assert result["code"] == 0
@@ -117,7 +127,10 @@ class TestAgentRunnerListSkills:
 
         with patch("chaos_agent.cli.runner.generate_skill_catalog", new_callable=AsyncMock) as mock_gen:
             mock_gen.return_value = []
-            with patch("langchain_openai.ChatOpenAI"):
+            # See the note in test_list_skills_returns_categories: patching
+            # ``langchain_openai.ChatOpenAI`` here would permanently poison
+            # ``resilient_llm`` in ``sys.modules``.
+            with patch("chaos_agent.agent.factory.make_llm"):
                 result = await runner.list_skills(category="network")
 
         assert result["code"] == 0

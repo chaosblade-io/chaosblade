@@ -23,7 +23,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from chaos_agent.agent.fault_spec import FaultSpec
+from chaos_agent.agent.spec.fault_registry import is_host_scope, is_workload_scope
+from chaos_agent.agent.spec.fault_spec import FaultSpec
 from .guard import CLUSTER_SCOPED_KINDS, OWNER_SCOPES
 from .types import ApprovedTarget
 
@@ -34,6 +35,7 @@ def freeze_approved_target_from_spec(
     *,
     lock_fault_type: bool = True,
     owner_names: tuple[str, ...] = (),
+    resolved_names: tuple[str, ...] = (),
 ) -> Optional[dict]:
     """Build the ``approved_target`` snapshot from a FaultSpec.
 
@@ -64,6 +66,7 @@ def freeze_approved_target_from_spec(
         blade_action=spec_obj.blade_action,
         lock_fault_type=lock_fault_type,
         owner_names=owner_names,
+        resolved_names=resolved_names,
     )
 
 
@@ -76,6 +79,7 @@ def freeze_approved_target(
     *,
     lock_fault_type: bool = True,
     owner_names: tuple[str, ...] = (),
+    resolved_names: tuple[str, ...] = (),
 ) -> Optional[dict]:
     """Build the ``approved_target`` dict to store in AgentState.
 
@@ -122,7 +126,7 @@ def freeze_approved_target(
 
     # ---- Namespace (default-normalise for namespace-scoped scopes) --------
     namespace = str(target.get("namespace") or "").strip()
-    if not namespace and scope not in CLUSTER_SCOPED_KINDS:
+    if not namespace and scope not in CLUSTER_SCOPED_KINDS and scope != "host":
         namespace = "default"
     # Cross-scope: secondary scopes for operations that need resources
     # beyond the primary scope (e.g. node faults needing pod delete,
@@ -136,7 +140,7 @@ def freeze_approved_target(
         # Cluster-scoped resources never carry a namespace; null it
         # to keep the snapshot tidy.
         namespace = ""
-    elif scope in ("pod", "deployment", "statefulset", "daemonset"):
+    elif is_workload_scope(scope):
         # Workload faults may need to:
         # - Create dependency resources (PVC, ConfigMap, Secret)
         # - Delete/patch pods belonging to the workload
@@ -167,6 +171,11 @@ def freeze_approved_target(
     bt = str(blade_target or params.get("target") or "").strip().lower()
     ba = str(blade_action or params.get("action") or "").strip().lower()
 
+    # ---- Host identity (bare-metal / VM faults) --------------------------
+    # Host scope is anchored by the host name (first name), not by a k8s
+    # namespace/selector. The guard's host branch compares this directly.
+    host_name = names[0] if is_host_scope(scope) and names else ""
+
     return {
         "scope": scope,
         "namespace": namespace,
@@ -177,8 +186,10 @@ def freeze_approved_target(
         "blade_action": ba,
         "lock_fault_type": bool(lock_fault_type),
         "owner_names": list(owner_names),
+        "resolved_names": list(resolved_names),
         "secondary_scopes": list(secondary_scopes),
         "secondary_namespace": secondary_namespace,
+        "host_name": host_name,
     }
 
 
@@ -205,8 +216,10 @@ def approved_from_dict(d: Optional[dict]) -> Optional[ApprovedTarget]:
         blade_action=str(d.get("blade_action") or ""),
         lock_fault_type=bool(d.get("lock_fault_type", True)),
         owner_names=tuple(str(n) for n in (d.get("owner_names") or [])),
+        resolved_names=tuple(str(n) for n in (d.get("resolved_names") or [])),
         secondary_scopes=tuple(str(s) for s in (d.get("secondary_scopes") or [])),
         secondary_namespace=str(d.get("secondary_namespace") or ""),
+        host_name=str(d.get("host_name") or ""),
     )
 
 
@@ -230,12 +243,17 @@ async def discover_owner_names(
         return ()
 
     from chaos_agent.config.settings import settings
-    from chaos_agent.tools.kubectl import build_kubectl_cmd, _adapt_kubewiz_result
-    from chaos_agent.tools.shell import run_command
+    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.transports import (
+        PROFILE_K8S,
+        TransportTarget,
+        execute_via_transport,
+    )
 
     label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
     owner_kinds = OWNER_SCOPES[scope]
     found: list[str] = []
+    _target = TransportTarget.from_state({})
 
     for kind in sorted(owner_kinds):
         cmd = build_kubectl_cmd("get", [
@@ -244,8 +262,11 @@ async def discover_owner_names(
             "-o", "jsonpath={.items[*].metadata.name}",
         ], kubeconfig=kubeconfig)
         try:
-            result = await run_command(cmd, timeout=settings.timeout_kubectl)
-            result = _adapt_kubewiz_result(result)
+            result = await execute_via_transport(
+                cmd, _target, timeout=settings.timeout_kubectl,
+                # kubectl-shaped (build_kubectl_cmd): needs cluster access.
+                expect_profile=PROFILE_K8S,
+            )
             if result.exit_code == 0 and result.stdout.strip():
                 found.extend(result.stdout.strip().split())
         except Exception as e:
@@ -257,9 +278,76 @@ async def discover_owner_names(
     return tuple(found)
 
 
+async def discover_names_by_labels(
+    scope: str,
+    namespace: str,
+    labels: dict[str, str],
+    kubeconfig: str = "",
+) -> tuple[str, ...]:
+    """Resolve a LABEL selector to the concrete resource names it matches.
+
+    For a label-approved fault (e.g. an availability-zone node partition
+    approved by ``labels={topology.kubernetes.io/zone: ...}``, or a pod fault
+    approved by ``labels={app: ...}``), execution legitimately fans out per
+    resource name (kubectl-native needs one debug Pod per node; batched name
+    targeting for pods). Freezing the resolved name set lets the drift guard
+    validate ``effective.names ⊆ resolved_names`` instead of rejecting the
+    labels↔names cross as spurious drift — while still catching a genuinely
+    out-of-selector name.
+
+    Supported scopes: ``node`` (cluster-scoped) and ``pod`` (``container``
+    normalises to ``pod``; requires a namespace). Other scopes return an empty
+    tuple (owner-scope workloads are already anchored by ``owner_names``).
+    Best-effort: returns an empty tuple on any failure (guard falls back to the
+    previous labels-only behaviour).
+    """
+    scope_l = (scope or "").strip().lower()
+    if scope_l == "container":
+        scope_l = "pod"
+    kind = {"node": "nodes", "pod": "pods"}.get(scope_l)
+    if kind is None or not labels:
+        return ()
+    # Namespaced kinds need a namespace to scope the query; cluster-scoped
+    # (nodes) must NOT carry one.
+    if kind == "pods" and not namespace:
+        return ()
+
+    from chaos_agent.config.settings import settings
+    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.transports import (
+        PROFILE_K8S,
+        TransportTarget,
+        execute_via_transport,
+    )
+
+    label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
+    args = [kind]
+    if kind == "pods":
+        args += ["-n", namespace]
+    args += ["-l", label_selector, "-o", "jsonpath={.items[*].metadata.name}"]
+    _target = TransportTarget.from_state({})
+    cmd = build_kubectl_cmd("get", args, kubeconfig=kubeconfig)
+    try:
+        result = await execute_via_transport(
+            cmd, _target, timeout=settings.timeout_kubectl,
+            expect_profile=PROFILE_K8S,
+        )
+    except Exception as e:
+        logger.debug("discover_names_by_labels: %s query failed: %s", kind, e)
+        return ()
+    if result.exit_code != 0 or not result.stdout.strip():
+        return ()
+    found = tuple(result.stdout.strip().split())
+    if found:
+        logger.info("discover_names_by_labels: %s labels=%s resolved to %d name(s)",
+                     kind, labels, len(found))
+    return found
+
+
 __all__ = [
     "approved_from_dict",
     "discover_owner_names",
+    "discover_names_by_labels",
     "freeze_approved_target",
     "freeze_approved_target_from_spec",
 ]

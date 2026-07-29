@@ -70,6 +70,10 @@ def get_skill_index_section(skill_catalog: str) -> str:
 def get_knowledge_summary_section() -> str:
     """Compact knowledge index — high-density reference table.
 
+    Profile-agnostic: the registry list is a generic on-demand index, not a
+    k8s-specific artifact; both profiles see the same index and load only the
+    documents applicable to the current environment via read_knowledge_resource.
+
     Metadata is auto-discovered from YAML frontmatter in knowledge/*.md files.
     LLM can call ``read_knowledge_resource(filename, section)`` for full or
     section-level content on demand.

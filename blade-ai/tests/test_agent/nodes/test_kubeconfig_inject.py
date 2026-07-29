@@ -16,7 +16,7 @@ class TestResolveKubeconfig:
     """Tests for _resolve_kubeconfig."""
 
     def test_state_kubeconfig_first_priority(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig
 
         state = {
             "kubeconfig": "/path/from/state",
@@ -25,8 +25,8 @@ class TestResolveKubeconfig:
         assert _resolve_kubeconfig(state) == "/path/from/state"
 
     def test_params_kubeconfig_second_priority(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
-        from chaos_agent.agent.fault_spec import FaultSpec
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig
+        from chaos_agent.agent.spec.fault_spec import FaultSpec
 
         # Now params live on FaultSpec, not state.params — the fallback
         # path checks spec.params.kubeconfig.
@@ -38,7 +38,7 @@ class TestResolveKubeconfig:
         assert _resolve_kubeconfig(state) == "/path/from/params"
 
     def test_settings_fallback(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig
 
         state = {"kubeconfig": "", "params": {}}
         # Should fall back to settings.kubeconfig_path (may be empty in test env)
@@ -46,7 +46,7 @@ class TestResolveKubeconfig:
         assert isinstance(result, str)
 
     def test_empty_state(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import _resolve_kubeconfig
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig
 
         state = {}
         result = _resolve_kubeconfig(state)
@@ -57,7 +57,7 @@ class TestInjectKubeconfigIntoToolCalls:
     """Tests for inject_kubeconfig_into_tool_calls."""
 
     def test_inject_into_kubectl_missing_kubeconfig(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([{
             "name": "kubectl",
@@ -69,7 +69,7 @@ class TestInjectKubeconfigIntoToolCalls:
         assert msg.tool_calls[0]["args"]["kubeconfig"] == "/path/to/kubeconfig"
 
     def test_inject_into_blade_missing_kubeconfig(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([{
             "name": "blade_status",
@@ -81,7 +81,7 @@ class TestInjectKubeconfigIntoToolCalls:
         assert msg.tool_calls[0]["args"]["kubeconfig"] == "/path/to/kubeconfig"
 
     def test_do_not_override_existing_kubeconfig(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([{
             "name": "kubectl",
@@ -94,7 +94,7 @@ class TestInjectKubeconfigIntoToolCalls:
         assert msg.tool_calls[0]["args"]["kubeconfig"] == "/other/path"
 
     def test_skip_non_kubectl_blade_tools(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([{
             "name": "web_search",
@@ -107,7 +107,7 @@ class TestInjectKubeconfigIntoToolCalls:
         assert "kubeconfig" not in msg.tool_calls[0]["args"]
 
     def test_skip_when_kubeconfig_empty(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([{
             "name": "kubectl",
@@ -120,21 +120,21 @@ class TestInjectKubeconfigIntoToolCalls:
         assert "kubeconfig" not in msg.tool_calls[0]["args"]
 
     def test_skip_when_no_tool_calls(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([])
         # Should not raise any error
         inject_kubeconfig_into_tool_calls(msg, "/path/to/kubeconfig")
 
     def test_skip_when_tool_calls_none(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = AIMessage(content="final text", id="test-id")
         # tool_calls is None for a text-only response
         inject_kubeconfig_into_tool_calls(msg, "/path/to/kubeconfig")
 
     def test_mixed_tool_calls_only_inject_kubectl_blade(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([
             {
@@ -162,7 +162,7 @@ class TestInjectKubeconfigIntoToolCalls:
         assert msg.tool_calls[2]["args"]["kubeconfig"] == "/path/to/kubeconfig"
 
     def test_inject_into_kubectl_describe(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([{
             "name": "kubectl",
@@ -174,7 +174,7 @@ class TestInjectKubeconfigIntoToolCalls:
         assert msg.tool_calls[0]["args"]["kubeconfig"] == "/path/to/kubeconfig"
 
     def test_inject_into_kubectl_get(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([{
             "name": "kubectl",
@@ -186,7 +186,7 @@ class TestInjectKubeconfigIntoToolCalls:
         assert msg.tool_calls[0]["args"]["kubeconfig"] == "/path/to/kubeconfig"
 
     def test_inject_into_kubectl_exec(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([{
             "name": "kubectl",
@@ -198,7 +198,7 @@ class TestInjectKubeconfigIntoToolCalls:
         assert msg.tool_calls[0]["args"]["kubeconfig"] == "/path/to/kubeconfig"
 
     def test_multiple_kubectl_calls_all_injected(self):
-        from chaos_agent.agent.nodes._kubeconfig_inject import inject_kubeconfig_into_tool_calls
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import inject_kubeconfig_into_tool_calls
 
         msg = _make_ai_message([
             {
@@ -217,3 +217,92 @@ class TestInjectKubeconfigIntoToolCalls:
         inject_kubeconfig_into_tool_calls(msg, "/path/to/kubeconfig")
         assert msg.tool_calls[0]["args"]["kubeconfig"] == "/path/to/kubeconfig"
         assert msg.tool_calls[1]["args"]["kubeconfig"] == "/path/to/kubeconfig"
+
+
+class TestInjectTaskIdIntoToolCalls:
+    def test_overrides_llm_supplied_task_id_for_execution_tool(self):
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
+            inject_task_id_into_tool_calls,
+        )
+
+        msg = _make_ai_message([{
+            "name": "blade_create",
+            "args": {"scope": "node", "task_id": "llm-plan-id"},
+            "id": "call-task-1",
+            "type": "tool_call",
+        }])
+
+        inject_task_id_into_tool_calls(msg, "task-from-state")
+
+        assert msg.tool_calls[0]["args"]["task_id"] == "task-from-state"
+
+    def test_does_not_add_task_id_to_tools_without_that_argument(self):
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
+            inject_task_id_into_tool_calls,
+        )
+
+        msg = _make_ai_message([{
+            "name": "kubectl",
+            "args": {"subcommand": "get", "v_args": "nodes"},
+            "id": "call-task-2",
+            "type": "tool_call",
+        }])
+
+        inject_task_id_into_tool_calls(msg, "task-from-state")
+
+        assert "task_id" not in msg.tool_calls[0]["args"]
+
+
+class TestSyncKubewizRuntime:
+    """Tests for sync_kubewiz_runtime guard behavior.
+
+    The guard must check *settings* (not state) to determine whether
+    the session is in kubewiz mode.  This prevents a stale
+    ``kubewiz_cluster_uuid`` in state from switching the channel.
+    """
+
+    def test_kubeconfig_mode_does_not_sync(self, monkeypatch):
+        """When settings says kubeconfig, state kubewiz params must NOT be synced."""
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import sync_kubewiz_runtime
+        from chaos_agent.config.settings import settings as _settings
+
+        # Settings: kubeconfig mode (no kubewiz_cluster_uuid)
+        monkeypatch.setattr(_settings, "kube_connection_mode", "kubeconfig")
+        monkeypatch.setattr(_settings, "kubewiz_cluster_uuid", "")
+        monkeypatch.setattr(_settings, "kubewiz_profile", "")
+
+        # State: has stale kubewiz params (should be ignored)
+        state = {"kubewiz_cluster_uuid": "stale-uuid", "kubewiz_profile": "stale-profile"}
+        sync_kubewiz_runtime(state)
+
+        # Settings must NOT be modified
+        assert _settings.kubewiz_cluster_uuid == ""
+        assert _settings.kubewiz_profile == ""
+
+    def test_kubewiz_mode_syncs_from_state(self, monkeypatch):
+        """When settings says kubewiz, state params should be synced to settings."""
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import sync_kubewiz_runtime
+        from chaos_agent.config.settings import settings as _settings
+
+        # Settings: kubewiz mode (has kubewiz_cluster_uuid already)
+        monkeypatch.setattr(_settings, "kube_connection_mode", "")
+        monkeypatch.setattr(_settings, "kubewiz_cluster_uuid", "old-uuid")
+        monkeypatch.setattr(_settings, "kubewiz_profile", "old-profile")
+
+        # State: has new kubewiz params (should be synced)
+        state = {"kubewiz_cluster_uuid": "new-uuid", "kubewiz_profile": "new-profile"}
+        sync_kubewiz_runtime(state)
+
+        # Settings should be updated from state
+        assert _settings.kubewiz_cluster_uuid == "new-uuid"
+        assert _settings.kubewiz_profile == "new-profile"
+
+    def test_empty_state_does_not_crash(self, monkeypatch):
+        """Empty state should not crash, regardless of mode."""
+        from chaos_agent.agent.nodes.execute._kubeconfig_inject import sync_kubewiz_runtime
+        from chaos_agent.config.settings import settings as _settings
+
+        monkeypatch.setattr(_settings, "kube_connection_mode", "kubeconfig")
+        monkeypatch.setattr(_settings, "kubewiz_cluster_uuid", "")
+
+        sync_kubewiz_runtime({})  # Should not raise

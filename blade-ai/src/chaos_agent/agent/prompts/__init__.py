@@ -18,7 +18,6 @@ from chaos_agent.agent.prompts.builders import (
 )
 # Constants
 from chaos_agent.agent.prompts.constants import (
-    REPLAN_MARKER,
     CACHE_BOUNDARY,
     MAX_EXPERIENCE_MD_BYTES,
     MAX_KNOWLEDGE_SUMMARY_BYTES,
@@ -28,20 +27,15 @@ from chaos_agent.agent.prompts.constants import (
 from chaos_agent.agent.prompts.knowledge_registry import get_knowledge_registry, rebuild_registry
 # Modes
 from chaos_agent.agent.prompts.modes import PromptMode
-# Section functions — verification sub-sections (shared)
-from chaos_agent.agent.prompts.sections import (
-    get_fault_effect_delay_section, get_multi_iteration_section,
-    get_minimal_container_section, get_verification_method_priority_section,
-    get_verification_method_reasoning_section, get_evidence_sufficiency_section,
-    get_handling_ambiguous_results_section,
-)
+from chaos_agent.agent.prompts.assembly import PromptSegment, assemble_prompt
 # Section functions — intent clarification
 from chaos_agent.agent.prompts.sections import (
     get_intent_role_section, get_intent_priorities_section,
     get_intent_dialogue_routing_section, get_intent_parameter_model_section,
     get_intent_inject_flow_section, get_intent_recover_flow_section,
     get_intent_batch_flow_section, get_intent_operation_freshness_section,
-    get_intent_tools_section, get_intent_reflection_section, get_intent_output_section,
+    get_intent_tools_section, get_intent_reflection_section,
+    get_intent_capability_boundary_section, get_intent_output_section,
     get_intent_completeness_section, get_intent_reminder_section,
 )
 # Section functions — recovery verifier
@@ -85,15 +79,14 @@ from chaos_agent.agent.prompts.sections import (
     get_remember_section,
     get_executor_core_principles_section,
     get_executor_remember_section,
-    get_verification_strategy_section,
 )
 
 __all__ = [
     # Constants
-    "REPLAN_MARKER", "CACHE_BOUNDARY",
+    "CACHE_BOUNDARY",
     "MAX_EXPERIENCE_MD_BYTES", "MAX_KNOWLEDGE_SUMMARY_BYTES", "MAX_SYSTEM_PROMPT_CHARS",
     # Modes
-    "PromptMode",
+    "PromptMode", "PromptSegment", "assemble_prompt",
     # Section functions — core
     "get_role_section", "get_env_section",
     "get_knowledge_summary_section", "get_domain_knowledge_section", "get_skill_index_section",
@@ -101,12 +94,6 @@ __all__ = [
     "get_workflow_section",
     "get_core_principles_section", "get_remember_section",
     "get_executor_core_principles_section", "get_executor_remember_section",
-    "get_verification_strategy_section",
-    # Section functions — verification sub-sections (shared)
-    "get_fault_effect_delay_section", "get_multi_iteration_section",
-    "get_minimal_container_section", "get_verification_method_priority_section",
-    "get_verification_method_reasoning_section", "get_evidence_sufficiency_section",
-    "get_handling_ambiguous_results_section",
     # Section functions — safety
     "get_safety_section",
     # Section functions — execution
@@ -130,7 +117,8 @@ __all__ = [
     "get_intent_dialogue_routing_section", "get_intent_parameter_model_section",
     "get_intent_inject_flow_section", "get_intent_recover_flow_section",
     "get_intent_batch_flow_section", "get_intent_operation_freshness_section",
-    "get_intent_tools_section", "get_intent_reflection_section", "get_intent_output_section",
+    "get_intent_tools_section", "get_intent_reflection_section",
+    "get_intent_capability_boundary_section", "get_intent_output_section",
     "get_intent_completeness_section", "get_intent_reminder_section",
     # Builders
     "build_inject_system_prompt", "build_execute_system_prompt",

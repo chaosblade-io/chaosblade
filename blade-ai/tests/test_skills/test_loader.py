@@ -134,6 +134,42 @@ class TestLoadSkillResource:
         with pytest.raises(FileNotFoundError):
             load_skill_resource(skill_dir, "nonexistent.txt")
 
+    def test_parent_traversal_is_blocked(self, tmp_skills_dir):
+        """read_skill_resource is LLM-callable, so resource_path is untrusted.
+
+        A ``..`` sequence that escapes the skill directory must be rejected
+        before any file read — verified this actually leaked the repo's
+        pyproject.toml prior to the containment guard.
+        """
+        skill_dir = tmp_skills_dir / "test-skill"
+        # Plant a secret OUTSIDE the skill dir, then try to reach it.
+        secret = tmp_skills_dir / "secret.txt"
+        secret.write_text("TOP SECRET", encoding="utf-8")
+        with pytest.raises(ValueError, match="escapes skill directory"):
+            load_skill_resource(skill_dir, "../secret.txt")
+
+    def test_absolute_path_escape_is_blocked(self, tmp_skills_dir):
+        """``skill_dir / "/etc/hosts"`` collapses to ``/etc/hosts`` in pathlib,
+        so an absolute path is an escape vector distinct from ``..``."""
+        skill_dir = tmp_skills_dir / "test-skill"
+        with pytest.raises(ValueError, match="escapes skill directory"):
+            load_skill_resource(skill_dir, "/etc/hosts")
+
+    def test_symlink_escape_is_blocked(self, tmp_skills_dir):
+        """A symlink inside the skill dir pointing outside must not be a
+        read primitive: .resolve() collapses it and the containment check
+        rejects the real target."""
+        skill_dir = tmp_skills_dir / "test-skill"
+        outside = tmp_skills_dir / "outside.txt"
+        outside.write_text("OUTSIDE", encoding="utf-8")
+        link = skill_dir / "references" / "escape.md"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this platform")
+        with pytest.raises(ValueError, match="escapes skill directory"):
+            load_skill_resource(skill_dir, "references/escape.md")
+
 
 class TestListSkillResources:
     """Test resource file enumeration."""

@@ -34,28 +34,28 @@ class TestStatusStreamFunction:
         """status_stream should return a StreamingResponse."""
         from fastapi.responses import StreamingResponse
 
-        tracker = get_tracker("sse-func-1")
+        tracker = get_tracker("task-sse-func-1")
         tracker.start(StatusCategory.NODE, "test_node", "Test event")
         tracker.complete("Done")
 
         request = MockRequest()
-        response = await status_stream("sse-func-1", request)
+        response = await status_stream("task-sse-func-1", request)
 
         assert isinstance(response, StreamingResponse)
         assert response.media_type == "text/event-stream"
         assert "no-cache" in response.headers.get("Cache-Control", "")
 
-        remove_tracker("sse-func-1")
+        remove_tracker("task-sse-func-1")
 
     @pytest.mark.asyncio
     async def test_event_generator_yields_historical_events(self):
         """The event generator should yield historical events as SSE data."""
-        tracker = get_tracker("sse-func-2")
+        tracker = get_tracker("task-sse-func-2")
         tracker.start(StatusCategory.NODE, "agent_loop", "Thinking...")
         tracker.complete("Done thinking")
 
         request = MockRequest()
-        response = await status_stream("sse-func-2", request)
+        response = await status_stream("task-sse-func-2", request)
 
         # Read first few chunks from the generator
         chunks = []
@@ -72,12 +72,12 @@ class TestStatusStreamFunction:
         assert parsed["source"] == "agent_loop"
         assert parsed["phase"] == "started"
 
-        remove_tracker("sse-func-2")
+        remove_tracker("task-sse-func-2")
 
     @pytest.mark.asyncio
     async def test_event_generator_includes_tool_events(self):
         """Tool events with detail fields should be streamed correctly."""
-        tracker = get_tracker("sse-func-3")
+        tracker = get_tracker("task-sse-func-3")
         tracker.start(
             StatusCategory.TOOL,
             "blade_create",
@@ -87,7 +87,7 @@ class TestStatusStreamFunction:
         tracker.complete("Created", detail={"exit_code": 0})
 
         request = MockRequest()
-        response = await status_stream("sse-func-3", request)
+        response = await status_stream("task-sse-func-3", request)
 
         chunks = []
         async for chunk in response.body_iterator:
@@ -101,17 +101,17 @@ class TestStatusStreamFunction:
         assert parsed["category"] == "tool"
         assert parsed["detail"]["command"] == "blade create pod network delay"
 
-        remove_tracker("sse-func-3")
+        remove_tracker("task-sse-func-3")
 
     @pytest.mark.asyncio
     async def test_stream_headers(self):
         """Response should have proper SSE headers."""
-        tracker = get_tracker("sse-func-4")
+        tracker = get_tracker("task-sse-func-4")
         tracker.start(StatusCategory.NODE, "test", "x")
         tracker.complete("y")
 
         request = MockRequest()
-        response = await status_stream("sse-func-4", request)
+        response = await status_stream("task-sse-func-4", request)
 
         assert response.headers.get("Cache-Control") == "no-cache"
         assert response.headers.get("Connection") == "keep-alive"
@@ -122,4 +122,4 @@ class TestStatusStreamFunction:
         async for _ in response.body_iterator:
             break
 
-        remove_tracker("sse-func-4")
+        remove_tracker("task-sse-func-4")

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from chaos_agent.agent.fault_spec import FaultSpec
+from chaos_agent.agent.spec.fault_spec import FaultSpec
 from chaos_agent.memory.session_finalizer import (
     RESULT_SUMMARY_DATA_ENVELOPE,
     RESULT_SUMMARY_INJECT_ENVELOPE,
@@ -205,6 +205,48 @@ async def test_finalize_inject_session_reads_graph_and_flushes_summary():
 
 
 @pytest.mark.asyncio
+async def test_finalize_failed_inject_persists_failed_status_and_summary():
+    store = _SessionStore()
+    values = {
+        **_inject_values(),
+        "blade_uid": "",
+        "verification": None,
+        "error": "execution_failed: iptables not found",
+        "failure_reason": "execution_failed: iptables not found",
+    }
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-failed",
+        precomputed_values=values,
+    )
+
+    assert store.finalized["status"] == "failed"
+    assert store.finalized["result_summary"]["data"]["task_state"] == "failed"
+    assert "iptables not found" in store.finalized["result_summary"]["data"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_cancelled_inject_keeps_summary_but_marks_cancelled():
+    store = _SessionStore()
+    values = {**_inject_values(), "blade_uid": "", "verification": None}
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-cancelled",
+        precomputed_values=values,
+        status_override="cancelled",
+    )
+
+    assert store.finalized["status"] == "cancelled"
+    assert store.finalized["result_summary"] is not None
+
+
+@pytest.mark.asyncio
 async def test_finalize_recover_session_uses_payload_status_for_server_mode():
     store = _SessionStore()
     payload = {
@@ -347,7 +389,9 @@ def test_server_inject_routes_use_shared_session_finalizer():
 def test_recover_paths_use_shared_session_finalizer():
     checked_files = [
         PROJECT_ROOT / "src/chaos_agent/cli/runner.py",
-        PROJECT_ROOT / "src/chaos_agent/l4/agent.py",
+        # L4 SDK recover finalization moved from agent.py to recovery.py
+        # (_L4RecoveryMixin) in the baseline refactor (b78c82c).
+        PROJECT_ROOT / "src/chaos_agent/l4/recovery.py",
         PROJECT_ROOT / "src/chaos_agent/server/routes/recover_stream.py",
         PROJECT_ROOT / "src/chaos_agent/server/routes/turn_event_stream.py",
     ]
@@ -370,7 +414,7 @@ def test_task_session_direct_finalize_calls_are_intentional():
     """Direct SessionStore finalization should remain limited to terminal/abort paths."""
 
     allowed = {
-        "src/chaos_agent/agent/nodes/memory_nodes.py",
+        "src/chaos_agent/agent/nodes/store/memory_nodes.py",
         "src/chaos_agent/memory/session_finalizer.py",
         "src/chaos_agent/server/app.py",
         "src/chaos_agent/server/routes/turn_event_stream.py",
@@ -387,7 +431,7 @@ def test_task_session_direct_finalize_calls_are_intentional():
 
 def test_memory_node_result_summary_uses_session_finalizer_projection():
     text = (
-        PROJECT_ROOT / "src/chaos_agent/agent/nodes/memory_nodes.py"
+        PROJECT_ROOT / "src/chaos_agent/agent/nodes/store/memory_nodes.py"
     ).read_text(encoding="utf-8")
 
     assert "build_inject_session_summary" in text

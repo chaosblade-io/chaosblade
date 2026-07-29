@@ -33,7 +33,17 @@ def _isolate_task_store(tmp_path, monkeypatch):
     monkeypatch.setattr(_settings_mod.settings, "memory_dir", tmp_path)
     # Force kubeconfig mode so tests are deterministic regardless of
     # the developer's ~/.blade-ai/config.json (which may set kubewiz).
-    monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "kubeconfig")
+    # NOTE: kube_connection_mode is now an explicit channel override; leave
+    # it empty ("") so resolution falls back to field-based inference, and
+    # clear all selector fields below so inference deterministically yields
+    # the kubeconfig channel.
+    monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "")
+    monkeypatch.setattr(_settings_mod.settings, "kubewiz_cluster_uuid", "")
+    monkeypatch.setattr(_settings_mod.settings, "kubewiz_url", "")
+    monkeypatch.setattr(_settings_mod.settings, "kubewiz_token", "")
+    # Also clear host transport fields so scope stays "k8s" by default
+    monkeypatch.setattr(_settings_mod.settings, "host_name", "", raising=False)
+    monkeypatch.setattr(_settings_mod.settings, "ssh_host", "", raising=False)
 
     yield
 
@@ -131,12 +141,14 @@ No useful content.
 
 @pytest.fixture
 def mock_run_command(mocker):
-    """Mock chaos_agent.tools.shell.run_command to avoid real subprocess calls.
+    """Mock run_command and execute_via_transport to avoid real subprocess calls.
 
-    Also patches the already-imported references in blade and kubectl modules,
-    and stubs _get_blade_path to return "blade" for deterministic assertions.
+    Patches both the shell-level ``run_command`` and the transport-level
+    ``execute_via_transport`` in modules that have already migrated.
+    The same mock object is used for both so that ``call_args`` tracking
+    works regardless of which function the code under test calls.
     """
-    async def _mock_run(cmd, timeout=None, task_id="", skip_guard=False):
+    async def _mock_run(cmd, *args, **kwargs):
         return CommandResult(
             exit_code=0,
             stdout='{"code": 200, "success": true, "result": "abc123"}',
@@ -157,8 +169,11 @@ def mock_run_command(mocker):
     import sys
     import chaos_agent.tools.blade as blade_mod
     kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
-    mocker.patch.object(blade_mod, "run_command", shell_mock)
-    mocker.patch.object(kubectl_mod, "run_command", shell_mock)
+
+    # Patch execute_via_transport in migrated modules — same mock object
+    # so call_args tracks calls from either entry point.
+    mocker.patch.object(kubectl_mod, "execute_via_transport", shell_mock)
+    mocker.patch.object(blade_mod, "execute_via_transport", shell_mock)
 
     # Stub _get_blade_path so tests see "blade" instead of the real binary path
     mocker.patch.object(blade_mod, "_get_blade_path", return_value="blade")
@@ -168,8 +183,8 @@ def mock_run_command(mocker):
 
 @pytest.fixture
 def mock_run_command_fail(mocker):
-    """Mock run_command that returns a non-zero exit code."""
-    async def _mock_run(cmd, timeout=None, task_id="", skip_guard=False):
+    """Mock run_command/execute_via_transport that returns a non-zero exit code."""
+    async def _mock_run(cmd, *args, **kwargs):
         return CommandResult(
             exit_code=1,
             stdout="",
@@ -185,8 +200,10 @@ def mock_run_command_fail(mocker):
     import sys
     import chaos_agent.tools.blade as blade_mod
     kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
-    mocker.patch.object(blade_mod, "run_command", shell_mock)
-    mocker.patch.object(kubectl_mod, "run_command", shell_mock)
+
+    # Patch execute_via_transport in migrated modules
+    mocker.patch.object(kubectl_mod, "execute_via_transport", shell_mock)
+    mocker.patch.object(blade_mod, "execute_via_transport", shell_mock)
 
     # Stub _get_blade_path for consistency with mock_run_command
     mocker.patch.object(blade_mod, "_get_blade_path", return_value="blade")
@@ -209,7 +226,7 @@ def replace_fault_spec(state: dict, **field_updates) -> None:
         replace_fault_spec(state, namespace="kube-system", names=("coredns",))
         replace_fault_spec(state, scope="node", blade_target="cpu")
     """
-    from chaos_agent.agent.fault_spec import FaultSpec
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
     existing = FaultSpec.from_dict(state.get("fault_spec")) or FaultSpec()
     state["fault_spec"] = existing.replace(**field_updates).to_dict()
 
@@ -217,7 +234,7 @@ def replace_fault_spec(state: dict, **field_updates) -> None:
 @pytest.fixture
 def sample_agent_state():
     """Build a minimal AgentState dict for testing."""
-    from chaos_agent.agent.fault_spec import FaultSpec
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
     _spec = FaultSpec.from_cli_structured({
         "scope": "pod",
         "target": "kill",

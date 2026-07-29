@@ -5,11 +5,8 @@ following the Claude Code pattern of queryContext.ts + envDynamic.ts.
 """
 
 import asyncio
-import logging
 
 from chaos_agent.config.settings import settings
-
-logger = logging.getLogger(__name__)
 
 # Cache: per task_id, only collect once (avoid repeated blade_version calls)
 _env_cache: dict[str, dict] = {}
@@ -37,9 +34,21 @@ async def compute_env_info(task_id: str = "") -> dict:
     # K8s availability
     env["k8s_available"] = await _check_k8s_available()
 
-    # Static info from settings
-    env["kube_connection_mode"] = settings.kube_connection_mode
-    if settings.kube_connection_mode == "kubewiz":
+    # Static info from settings — channel name replaces kube_connection_mode.
+    # resolve_channel_name returns an explicit "unknown" channel for an invalid
+    # override or under-specified target. This keeps environment information
+    # available without representing a misconfiguration as the default cluster.
+    #
+    # NOTE: this reflects the *default* channel from settings — not a per-task
+    # override carried in the graph state. It is an informational field for the
+    # System Prompt; the authoritative channel is resolved per-task at execution.
+    #
+    # Local import: avoid a module-level circular import
+    # (transports -> config.settings -> ... -> agent.env_info).
+    from chaos_agent.transports import KUBEWIZ_CHANNELS, resolve_channel_name
+    _channel_name = resolve_channel_name()
+    env["kube_connection_mode"] = _channel_name
+    if _channel_name in KUBEWIZ_CHANNELS:
         env["kubeconfig_path"] = "(kubewiz)"
         env["kube_context"] = "(kubewiz)"
     else:

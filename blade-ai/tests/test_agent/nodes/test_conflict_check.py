@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from chaos_agent.agent.nodes._conflict_check import (
+from chaos_agent.agent.nodes.side_effect._conflict_check import (
     ConflictInfo,
     _extract_param_from_flag,
     _analyze_overlap,
@@ -148,11 +148,11 @@ class TestDestroyedStatusFilter:
     """Tests that Destroyed/Revoked experiments are excluded from conflict detection."""
 
     def _make_blade_status_mock(self, monkeypatch, blade_output: str):
-        """Patch run_command inside the function's local import."""
+        """Patch execute_via_transport inside the function's local import."""
         from chaos_agent.config.settings import settings as _s
         monkeypatch.setattr(_s, "kube_connection_mode", "kubeconfig")
 
-        async def fake_run_command(cmd, **kwargs):
+        async def fake_execute(cmd, target, **kwargs):
             from chaos_agent.tools.shell import CommandResult
             cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
             if "get" in cmd_str and "pods" in cmd_str:
@@ -164,9 +164,9 @@ class TestDestroyedStatusFilter:
                 stdout=blade_output,
                 stderr="", exit_code=0, duration_ms=200.0,
             )
-        # run_command is imported dynamically inside the function,
+        # execute_via_transport is imported dynamically inside the function,
         # so we must patch it at the source module.
-        monkeypatch.setattr("chaos_agent.tools.shell.run_command", fake_run_command)
+        monkeypatch.setattr("chaos_agent.transports.execute_via_transport", fake_execute)
 
     @pytest.mark.asyncio
     async def test_destroyed_experiments_excluded(self, monkeypatch):

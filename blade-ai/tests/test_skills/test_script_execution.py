@@ -327,7 +327,7 @@ class TestExecuteScriptExecution:
         assert mock_run.call_args[1]["skip_guard"] is True
 
     @pytest.mark.asyncio
-    async def test_kubeconfig_env_injected(self, registry_with_scripts, mocker):
+    async def test_kubeconfig_env_injected(self, registry_with_scripts, mocker, monkeypatch):
         """KUBECONFIG should be injected when skill requires kubectl."""
         mock_result = CommandResult(
             exit_code=0, stdout="ok", stderr="", duration_ms=50.0
@@ -338,19 +338,19 @@ class TestExecuteScriptExecution:
             return_value=mock_result,
         )
 
-        # Set a kubeconfig path via settings
+        # Set a kubeconfig path via settings. NOTE: ``settings`` is a
+        # _SettingsProxy — never touch ``settings.__dict__`` directly (that
+        # bakes a shadowing instance attr onto the proxy and leaks across
+        # tests). monkeypatch routes through the proxy's __setattr__ and
+        # restores cleanly on teardown.
         from chaos_agent.config.settings import settings
-        original = settings.kubeconfig_path
-        try:
-            settings.__dict__["kubeconfig_path"] = "/tmp/test-kubeconfig"
-            await registry_with_scripts.execute_script(
-                "test-skill", "list_items.py"
-            )
-            env_override = mock_run.call_args[1]["env_override"]
-            assert env_override is not None
-            assert "KUBECONFIG" in env_override
-        finally:
-            settings.__dict__["kubeconfig_path"] = original
+        monkeypatch.setattr(settings, "kubeconfig_path", "/tmp/test-kubeconfig")
+        await registry_with_scripts.execute_script(
+            "test-skill", "list_items.py"
+        )
+        env_override = mock_run.call_args[1]["env_override"]
+        assert env_override is not None
+        assert "KUBECONFIG" in env_override
 
     @pytest.mark.asyncio
     async def test_timeout_uses_settings_default(self, registry_with_scripts, mocker):

@@ -118,14 +118,21 @@ class TestExecuteSlimmedSections:
         prompt = build_execute_system_prompt(skill_catalog="x")
         # Executor still bound by Hard Rules + Caution Compliance.
         assert "### Hard Rules" in prompt
-        assert "namespace blacklist" in prompt
+        assert "target blacklist" in prompt
 
     def test_keeps_failure_handling_block(self):
         prompt = build_execute_system_prompt(skill_catalog="x")
-        # Executor needs failure handling guidance — abstracted as
-        # Injection Failure Escalation (tool-agnostic principle).
-        assert "Injection Failure Escalation" in prompt
-        assert "[REPLAN]" in prompt
+        # Executor needs general orchestration guidance, without a fixed
+        # failure playbook that would pre-empt ReAct's own decisions.
+        assert "Execution Orchestration" in prompt
+        assert "Treat tool output as runtime evidence" in prompt
+        assert "do not retry or re-plan" not in prompt
+        assert "plan itself needs to be" in prompt
+        assert "genuinely exhausted Phase 2 capabilities" not in prompt
+        # Replan is presented purely as the request_replan tool — no printed
+        # text marker (which induced verbalized tool-call output).
+        assert "request_replan" in prompt
+        assert "<replan_request>" not in prompt
 
     def test_keeps_execution_directives(self):
         prompt = build_execute_system_prompt(skill_catalog="x")

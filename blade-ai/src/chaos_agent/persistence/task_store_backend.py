@@ -18,7 +18,7 @@ from chaos_agent.utils.time import now_iso
 _JSON_COLUMNS: frozenset[str] = frozenset(
     {"fault_spec", "target", "params", "verification",
      "recover_verification", "result",
-     "baseline_data",
+     "baseline_data", "execution_artifacts",
      # R18 — postmortem dict (path/markdown/summary) JSON-serialised.
      "postmortem",
      # E18 — safety pre-check report dicts.
@@ -42,7 +42,8 @@ _DETAIL_COLUMNS: list[str] = [
     "verification", "recover_verification", "result",
     "failure_reason",
     "baseline_data", "inject_context", "skill_use_case",
-    "injection_method", "kubectl_exec_pod_name",
+    "injection_method", "execution_artifacts", "kubectl_exec_pod_name",
+    "injection_start_time",
     # R18 — postmortem dict (JSON-serialised), see save_memory.
     "postmortem",
     # E18 — safety pre-check reports (JSON-serialised).

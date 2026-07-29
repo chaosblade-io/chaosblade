@@ -1,6 +1,5 @@
 """Prompt constants and budgets."""
 
-REPLAN_MARKER = "[REPLAN]"
 CACHE_BOUNDARY = "\n<!-- BLADE_AI_CACHE_BOUNDARY -->\n"
 
 # --- Single resource budgets ---

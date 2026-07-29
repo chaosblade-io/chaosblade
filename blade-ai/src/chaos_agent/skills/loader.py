@@ -235,13 +235,34 @@ def load_skill_instructions(skill_dir: Path) -> str:
     return parts[2].strip()
 
 
+def _resolve_within(base: Path, relative_path: str) -> Path:
+    """Resolve ``base / relative_path`` and assert it stays inside ``base``.
+
+    ``relative_path`` is attacker-influenced input: ``read_skill_resource`` is
+    an LLM-callable tool whose path argument comes straight from a model tool
+    call. Both ``..`` traversal and absolute-path escapes (``Path(base) /
+    "/etc/hosts"`` == ``Path("/etc/hosts")``) must be rejected. ``.resolve()``
+    also collapses symlinks, so a symlink inside the skill dir that points out
+    of it is rejected too — the safe default for a read-any-file tool.
+    """
+    root = base.resolve()
+    target = (base / relative_path).resolve()
+    if target != root and not target.is_relative_to(root):
+        raise ValueError(
+            f"Resource path escapes skill directory: {relative_path!r}. "
+            "Use a path relative to the skill root (e.g. 'references/...', "
+            "'scripts/...'); '..' segments and absolute paths are not allowed."
+        )
+    return target
+
+
 def load_skill_resource(skill_dir: Path, resource_path: str) -> str:
     """Tier 3: Load a resource file from scripts/references/assets.
 
     If the path is a directory, returns a listing of files within it
     instead of raising an error.
     """
-    full_path = skill_dir / resource_path
+    full_path = _resolve_within(skill_dir, resource_path)
     if not full_path.exists():
         raise FileNotFoundError(f"Resource not found: {full_path}")
     if full_path.is_dir():

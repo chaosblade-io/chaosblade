@@ -29,6 +29,10 @@ async def build_recover_initial_state(
     Raises:
         RecoverSetupError with a JSONEnvelope if state cannot be resolved.
     """
+    # Reset module-level time_wait state for the new recover task.
+    from chaos_agent.tools.wait import reset_wait_state
+    reset_wait_state()
+
     config = {
         "configurable": {"thread_id": inject_task_id},
         "recursion_limit": settings.recursion_limit,
@@ -37,7 +41,7 @@ async def build_recover_initial_state(
     current_state = await agents["pipeline"].aget_state(config)
     checkpoint_values = current_state.values if current_state and current_state.values else {}
 
-    from chaos_agent.agent.task_snapshot import resolve_recover_initial_state
+    from chaos_agent.agent.result.task_snapshot import resolve_recover_initial_state
 
     resolution = await resolve_recover_initial_state(
         inject_task_id,

@@ -53,6 +53,14 @@ def build_inject_session_summary(
     raise ValueError(f"Unsupported inject session summary mode: {mode}")
 
 
+def inject_session_status(data: dict[str, Any]) -> str:
+    """Map the canonical result projection to the persisted session status."""
+    task_state = str(data.get("task_state") or "unknown")
+    if task_state in {"failed", "rejected"} or data.get("error"):
+        return "failed"
+    return "completed"
+
+
 def _recover_status_from_payload(
     result_payload: dict[str, Any] | None,
     *,
@@ -86,8 +94,8 @@ def build_recover_session_summary(
         return ""
 
     if mode == RESULT_SUMMARY_RECOVER_CLI_ENVELOPE:
-        from chaos_agent.agent.operation_outcome import read_operation_outcome
-        from chaos_agent.agent.operation_result import build_recover_cli_data_from_state
+        from chaos_agent.agent.result.operation_outcome import read_operation_outcome
+        from chaos_agent.agent.result.operation_result import build_recover_cli_data_from_state
         from chaos_agent.agent.state import infer_task_state
 
         inferred_state = infer_task_state(recover_values) if recover_values else "recovered"
@@ -118,6 +126,7 @@ async def finalize_inject_session(
     precomputed_values: dict | None = None,
     tui_session_store=None,
     result_summary_mode: str = RESULT_SUMMARY_INJECT_ENVELOPE,
+    status_override: str | None = None,
 ) -> None:
     """Finalize an inject-type session by reading final graph state.
 
@@ -160,7 +169,7 @@ async def finalize_inject_session(
                 )
             return
 
-        from chaos_agent.agent.operation_result import (
+        from chaos_agent.agent.result.operation_result import (
             build_inject_data_from_state,
             build_unknown_inject_data,
         )
@@ -177,7 +186,7 @@ async def finalize_inject_session(
                 data,
                 mode=result_summary_mode,
             ),
-            status="completed",
+            status=status_override or inject_session_status(data),
         )
     except Exception:
         log = logger.warning if error_log_level == "warning" else logger.debug

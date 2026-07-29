@@ -23,6 +23,7 @@ class StreamEvent:
         tool_end   - Tool invocation completed (content = result string)
         node_start - Graph node started
         node_end   - Graph node completed
+        node_message - Programmatic status text from a node (not LLM output)
         confirm    - Graph paused at confirmation_gate or intent_confirm
         result     - Final result envelope
         error      - Error during execution
@@ -32,7 +33,7 @@ class StreamEvent:
         conversation_turn - Conversation turn completed (multi-invocation model)
     """
 
-    type: str  # token | thinking | llm_start | tool_start | tool_end | node_start | node_end | confirm | result | error | usage | memory_compaction | context_size
+    type: str  # token | thinking | llm_start | tool_start | tool_end | node_start | node_end | node_message | confirm | result | error | usage | memory_compaction | context_size
     content: str = ""
     node: str = ""
     tool_name: str = ""
@@ -46,10 +47,12 @@ class StreamEvent:
     # TUI uses this to drive the spinner ("started") → final history
     # row ("completed"/"failed") transition.
     compaction_phase: str = ""
-    # Approximate token counts straddling the compaction. ``before`` is
-    # ``count_tokens_messages(...).safe_count`` over the messages
-    # slated for compaction; ``after`` is the same metric over the
-    # post-compaction tail. Both are best-effort estimates that carry
+    # Token counts straddling the compaction, both measured over the WHOLE
+    # context so the pair is comparable: ``before`` is
+    # ``estimate_context_tokens(...).safe_tokens`` (anchored on the provider's
+    # reported ``input_tokens``, so it includes the system prompt and tool
+    # schemas that never appear in ``messages``); ``after`` projects the
+    # post-compaction messages through the same overhead. Both carry
     # an internal quality tag (EXACT / APPROXIMATE / HEURISTIC, see
     # ``chaos_agent.memory.tokens``) — the LLM's actual token cost
     # lands on ``usage`` events. The user just needs a relative
@@ -77,6 +80,18 @@ class StreamEvent:
     # agent invokes the same tool multiple times in parallel within
     # one turn. Empty for non-tool events.
     call_id: str = ""
+    # Set True on a ``tool_end`` event synthesised from LangChain's
+    # ``on_tool_error`` (a tool raised — most often an arg-schema
+    # ValidationError because the LLM mis-formatted the call, but also
+    # any exception during execution). LangChain fires ``on_tool_error``
+    # (NOT ``on_tool_end``) in that case, so without a terminal event the
+    # TUI would receive a ``tool_start`` with no matching ``tool_end``
+    # and leave the tool card stuck ``⊶ running`` forever — which jams
+    # the TUI's leading-stable flush and grows the dynamic frame past
+    # the viewport (Ink fullscreen-redraw → duplicated output). Falsy-
+    # stripped from the wire frame by ``to_dict`` so normal ``tool_end``
+    # frames and older clients are unaffected.
+    is_error: bool = False
     # Stepper phase the event belongs to ("intent" | "safety" | "inject"
     # | "verify" | "recovery"), populated for ``node_start`` / ``node_end``
     # events emitted via ``dispatch_phase_started`` / ``dispatch_phase_completed``.
@@ -103,9 +118,10 @@ class StreamEvent:
     # ``type=context_size`` events. Emitted by PreReasoningHook after
     # every reasoning step so the TS TUI Footer can render a live
     # "state size / window" indicator. ``current_tokens`` is the
-    # post-hook ``count_tokens_messages(...).safe_count`` (the exact
-    # same number the trigger compares against — per-quality margin,
-    # 1.0/1.05/1.20, see ``chaos_agent.memory.tokens``), so the
+    # post-hook ``estimate_context_tokens(...).safe_tokens`` (the exact
+    # same number the trigger compares against — provider-anchored, with the
+    # per-quality margin 1.0/1.05/1.20 applied to the estimated tail only, see
+    # ``chaos_agent.memory.tokens``), so the
     # displayed percent corresponds 1:1 to compaction firing. All
     # default 0 so the wire-format stripper drops them on every other
     # event type.
@@ -170,7 +186,9 @@ class StreamEvent:
 # same content twice — once as agent text, once as the card.
 # ``on_chat_model_end`` (→ usage event) is NOT gated, so token accounting
 # stays accurate for the per-turn footer.
-_SILENT_TOKEN_NODES: frozenset[str] = frozenset({"save_memory"})
+_SILENT_TOKEN_NODES: frozenset[str] = frozenset({
+    "save_memory",
+})
 
 
 def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEvent]]:
@@ -256,6 +274,36 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
             call_id=run_id,
         )
 
+    elif event_name == "on_tool_error":
+        # A tool raised — most commonly an arg-schema ValidationError
+        # (the LLM mis-formatted the call, e.g. passing arrays as JSON
+        # strings to ``request_replan``'s list fields), but also any
+        # exception thrown mid-execution. LangChain fires ``on_tool_error``
+        # here, NOT ``on_tool_end`` — so we MUST still emit a terminal
+        # ``tool_end`` carrying the SAME ``run_id`` as the preceding
+        # ``on_tool_start``, or the TUI's tool card stays ``⊶ running``
+        # forever (jamming its leading-stable flush and tripping Ink's
+        # fullscreen-redraw → duplicated output). ToolNode's
+        # ``handle_tool_errors`` separately feeds the error back to the
+        # LLM as a ToolMessage; that is graph state, not a stream event.
+        tool_name = raw_event.get("name", "")
+        node = _extract_node_name(raw_event)
+        run_id = str(raw_event.get("run_id") or "")
+        err = raw_event.get("data", {}).get("error")
+        content = (str(err).strip() if err is not None else "") or "tool error"
+        # Cap so a verbose pydantic ValidationError can't bloat the frame;
+        # the TUI truncates for display anyway.
+        if len(content) > 2000:
+            content = content[:2000] + "\u2026"
+        return StreamEvent(
+            type="tool_end",
+            content=content,
+            node=node,
+            tool_name=tool_name,
+            call_id=run_id,
+            is_error=True,
+        )
+
     elif event_name in ("on_chat_model_end", "on_llm_end"):
         # Authoritative LLM token usage. LangChain emits this once per
         # LLM call (after all chunks for that call have streamed). We
@@ -339,8 +387,19 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
         elif custom_name == "node_message":
             content = data.get("content", "")
             if content:
+                # Emit as a dedicated ``node_message`` type (NOT ``token``)
+                # so the TUI commits it directly to Static history as a
+                # discrete log line.  When this was ``type="token"``, the
+                # TUI treated the content as LLM agent text and accumulated
+                # it in the pending area.  Because every message ends with
+                # ``\n\n``, ``findLastSafeSplitPoint`` returned
+                # ``content.length`` and the mid-stream split never fired —
+                # the entire baseline-capture run (~65 s of progress
+                # messages) piled into a single growing agent item in
+                # pending, and each append triggered an Ink re-render of
+                # the dynamic frame, causing visible flicker.
                 return StreamEvent(
-                    type="token",
+                    type="node_message",
                     content=content,
                     node=data.get("node", ""),
                 )
@@ -402,6 +461,59 @@ def parse_stream_events(raw_event: dict) -> list[StreamEvent]:
     if isinstance(parsed, list):
         return parsed
     return [parsed]
+
+
+class ProtocolSuffixFilter:
+    """Pass public text through while withholding a private protocol suffix.
+
+    A model response can contain an ordinary, user-facing reply followed by a
+    machine-only trailer. Chunks do not align with the trailer delimiter, so
+    the filter retains only a possible delimiter prefix until the next chunk
+    arrives. It is deliberately protocol-agnostic: the caller supplies the
+    delimiter and decides which stream it applies to.
+    """
+
+    __slots__ = ("_marker", "_pending", "_discarding")
+
+    def __init__(self, marker: str):
+        if not marker:
+            raise ValueError("marker must not be empty")
+        self._marker = marker
+        self._pending = ""
+        self._discarding = False
+
+    def feed(self, content: str) -> str:
+        """Return public text from one chunk and retain a possible marker."""
+        if self._discarding or not content:
+            return ""
+
+        combined = self._pending + content
+        marker_index = combined.find(self._marker)
+        if marker_index >= 0:
+            self._discarding = True
+            self._pending = ""
+            return combined[:marker_index]
+
+        # Keep the longest suffix that could become the marker in the next
+        # chunk. Everything before it is known to be public text.
+        prefix_length = 0
+        for length in range(min(len(combined), len(self._marker) - 1), 0, -1):
+            if combined.endswith(self._marker[:length]):
+                prefix_length = length
+                break
+        if prefix_length:
+            self._pending = combined[-prefix_length:]
+            return combined[:-prefix_length]
+
+        self._pending = ""
+        return combined
+
+    def flush(self) -> str:
+        """Return an incomplete marker literally when no private suffix formed."""
+        if self._discarding:
+            return ""
+        content, self._pending = self._pending, ""
+        return content
 
 
 def _extract_tool_output_content(output) -> str:

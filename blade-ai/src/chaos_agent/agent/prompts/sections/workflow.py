@@ -1,77 +1,5 @@
 """Workflow sections: two-phase workflow, NL mode, verification strategy, replan."""
 
-from chaos_agent.agent.prompts.constants import REPLAN_MARKER
-
-
-# ---------------------------------------------------------------------------
-# Reusable verification sub-sections (shared with verification.py)
-# ---------------------------------------------------------------------------
-
-
-def get_fault_effect_delay_section() -> str:
-    """Fault effect delay awareness — shared by inject and verifier prompts."""
-    return """### Fault Effect Delay
-Fault injection is NOT instantaneous. After the injection command reports Success:
-- The actual fault effect may take **5-30 seconds** to become observable
-- The injection tool needs to deploy and start the fault process on the target
-- Kubernetes metrics-server has its own sampling interval (typically 15-30s)"""
-
-
-def get_multi_iteration_section() -> str:
-    """Multi-iteration verification pattern — shared by inject and verifier prompts."""
-    return """### Multi-Iteration Verification Pattern
-1. **Iteration 1**: Run initial checks (kubectl top, kubectl describe)
-2. **Iteration 2**: If iteration 1 showed no effect, re-check key indicators
-3. **Iteration 3+**: Consolidate findings. Only conclude "not in effect" after 2+ checks"""
-
-
-def get_minimal_container_section() -> str:
-    """Minimal container handling guidance — shared by inject and verifier prompts."""
-    return """### Minimal Container Handling
-Some container images lack common utilities (top, ps, netstat, etc.):
-- If `kubectl exec` returns "command not found", do NOT retry similar commands
-- Switch to `kubectl describe` for Pod-level signals (restart count, conditions, events)
-- Use `kubectl get -o json` for structured data when exec is unavailable"""
-
-
-def get_verification_method_priority_section() -> str:
-    """Verification method priority — shared by inject and verifier prompts."""
-    return """### Verification Method Priority
-1. Skill-provided injection verification instructions (highest confidence)
-2. Fault-specific patterns from domain knowledge (e.g., CPU stress → kubectl top)
-3. General health checks (kubectl describe, events, conditions)"""
-
-
-def get_handling_ambiguous_results_section() -> str:
-    """Decision heuristic for handling ambiguous verification results."""
-    return """### Handling Ambiguous Results
-When tool output contradicts expectations:
-1. Consider timing — metrics may not reflect the fault yet (wait 15-30s and re-check)
-2. Cross-validate with a different command — if kubectl top shows no change, check kubectl describe for condition changes
-3. Never infer from absence — "no signal" is not "no fault" until timing is accounted for"""
-
-
-def get_verification_method_reasoning_section() -> str:
-    """Decision heuristic for choosing verification method based on fault type."""
-    return """### Verification Method Selection Reasoning
-Beyond the priority order, choose your verification method based on the fault type:
-- CPU/Memory stress → kubectl top (quantitative metrics) + kubectl describe (conditions)
-- Network delay/loss → kubectl exec connectivity test (application impact) + kubectl describe (events)
-- Pod kill/crash → kubectl get pods (restart count) + kubectl describe (events/OOMKilled)
-- Disk fill → kubectl exec df -h (filesystem) + kubectl describe node (DiskPressure condition)
-- Node-level faults → kubectl describe node (conditions) + cross-namespace pod status check
-If the skill provides specific verification instructions, they OVERRIDE these general patterns"""
-
-
-def get_evidence_sufficiency_section() -> str:
-    """Decision heuristic for evidence sufficiency in verification."""
-    return """### Evidence Sufficiency
-Sufficient evidence requires:
-1. At least 2 independent data points confirming the same conclusion
-2. Data from different verification layers (e.g., metrics + events, not just two metrics calls)
-3. Timing accounted for — if all evidence is from a single point in time, wait and re-check
-A single positive data point is a hint, not a conclusion"""
-
 
 def get_verification_heuristics_compact_section() -> str:
     """Compact merged section — replaces 5 separate sections for verifier prompt.
@@ -90,61 +18,15 @@ def get_verification_heuristics_compact_section() -> str:
     return """## Verification Heuristics (compact — see knowledge docs for details)
 
 - **Delay**: Fault effects take 5-30s to appear. Do NOT conclude "not in effect" from a single observation — re-check after delay.
-- **Minimal container**: If `kubectl exec` returns "command not found", switch to `kubectl describe` or `kubectl get -o json`. Do NOT retry similar commands.
-- **Method priority**: Skill instructions > knowledge patterns > general health checks. CPU/Memory → kubectl top + describe; Network → connectivity test; Disk → df -h + describe node; Pod kill → get pods + describe.
+- **Missing tooling**: If an observation command is unavailable in the target (e.g. "command not found"), switch to inspecting structured status (conditions, events, resource state) instead of retrying similar commands.
+- **Method priority**: Skill instructions > knowledge patterns > general health checks. For the fault-type → observation-method mapping, read `verification-heuristics.md`.
 - **Evidence**: Need 2+ independent data points from different verification layers. Single data point = hint, not conclusion.
-- **Ambiguous**: Cross-validate with different commands. "No signal" ≠ "no fault" until timing is accounted for.
+- **Ambiguous**: Cross-validate with a different observation method. "No signal" ≠ "no fault" until timing is accounted for.
 - **Transient faults**: Some faults produce cyclic/short-lived effects. If ANY observation shows a clear change from baseline, mark 'passed', NOT 'recovered_before_observation'. Only use 'recovered_before_observation' when NO observation at ANY point showed fault effects.
-- **RestartCount**: Compare current restartCount with pre-injection baseline. Only a NEW restart (count > baseline) indicates restart during injection window."""
-
-
-# ---------------------------------------------------------------------------
-# Composite section (backward compatible)
-# ---------------------------------------------------------------------------
-
-
-def get_verification_strategy_section(brief: bool = False) -> str:
-    """Verification strategy and delay awareness section.
-
-    Composes from reusable sub-sections so that both inject and verifier
-    prompts can share the same content without copy-paste duplication.
-
-    Args:
-        brief: When True, return a compact ≤10-line principle version that
-            keeps the ``"verification"`` keyword. The verifier prompt should
-            still pass ``brief=False`` to receive full heuristics; inject
-            Phase 1 only needs the principles to draft a plan's Verification
-            Methods section. Full heuristics are sourced on demand from the
-            ``verification-heuristics`` knowledge doc.
-    """
-    if brief:
-        return """## Verification Strategy (Principles)
-- Fault effects are NOT instantaneous — wait 5-30 s after blade Success before observing.
-- Use multi-iteration verification: 2+ checks before concluding "no effect".
-- Cross-validate across layers (metrics + events), not two reads of the same metric.
-- If a tool is unavailable inside the container (top/ps missing), switch method (kubectl describe / get -o json) — do NOT retry the same command.
-- Skill-provided verification overrides general heuristics.
-
-For the full heuristic catalogue (method-by-fault-type mapping, evidence sufficiency, ambiguous-result handling), call ``read_knowledge_resource('verification-heuristics.md')``."""
-
-    parts = [
-        "## Verification Strategy",
-        "",
-        get_fault_effect_delay_section(),
-        "",
-        get_multi_iteration_section(),
-        "",
-        get_minimal_container_section(),
-        "",
-        get_verification_method_priority_section(),
-        "",
-        get_verification_method_reasoning_section(),
-        "",
-        get_evidence_sufficiency_section(),
-        "",
-        get_handling_ambiguous_results_section(),
-    ]
-    return "\n".join(parts)
+- **Counter signals**: For restart/count-type status, compare the current value with the pre-injection baseline. Only a NEW increase (count > baseline) indicates an event during the injection window.
+- **Timeout ≠ signal**: A timed-out / failed / empty observation is NOT proof the fault succeeded AND NOT proof the target is fully down — the channel may just be intermittently flaky. Retry a flaky query a few times; a run of timeouts means "unobserved / indeterminate", never "affected".
+- **Count & coverage**: Count "affected" ONLY from your latest SUCCESSFUL observation — never tally timeouts. Claim "all targets affected" only when a successful observation covers EVERY target; if any target is still healthy or simply unobserved, report partial N/total, never generalize a subset to the whole.
+- **Method, not target**: If the same observation fails or looks wrong ~3 times, suspect your own method (filter/syntax/assumption); broaden to get some result first, then narrow — do NOT re-run the identical command."""
 
 
 def get_core_principles_section() -> str:
@@ -156,9 +38,11 @@ def get_core_principles_section() -> str:
     these same rules (recency zone).
     """
     return """# Core Principles
+- You plan inside a hard safety envelope the system enforces (read-only Phase 1, safety_check, timeout, target lock) — within it, use your judgment freely and commit once the target is grounded
 - FAULT INTENT parameters are UNVERIFIED — verify with tools before trusting them
 - When tool output contradicts FAULT INTENT or documentation, the TOOL is correct
-- Before calling finish_planning, you MUST cite tool output that proves the target exists"""
+- Verify the TARGET exists before finish_planning: if confirmed absent, reject; if a method precondition CANNOT be verified read-only (e.g. host binaries/kernel capabilities), proceed and let Phase 2 verify — do NOT loop
+- An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target; investigate persistently, but once the target is grounded, converge to finish_planning instead of over-verifying"""
 
 
 def get_remember_section() -> str:
@@ -169,10 +53,12 @@ def get_remember_section() -> str:
     and rejection when environment blocks all injection methods.
     """
     return """# REMEMBER
+- You plan inside a hard safety envelope the system enforces (read-only Phase 1, safety_check, timeout, target lock) — within it, use your judgment freely and commit once the target is grounded
 - FAULT INTENT parameters are UNVERIFIED — verify with tools before trusting them
 - When tool output contradicts FAULT INTENT or documentation, the TOOL is correct
-- Before calling finish_planning, you MUST cite tool output that proves the target exists
-- Do NOT use propose_plan_change for parameter fixes — only for fault TYPE changes
+- Verify the TARGET exists before finish_planning: if confirmed absent, reject; if a method precondition CANNOT be verified read-only (e.g. host binaries/kernel capabilities), proceed and let Phase 2 verify — do NOT loop
+- An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target; investigate persistently, but once the target is grounded, converge to finish_planning instead of over-verifying
+- Preserve the reviewed FaultSpec; the only way to change it is `propose_plan_change`, otherwise `finish_planning` as-is
 - If no viable injection path remains after exhausting alternatives, call finish_planning(rejected=True) — do NOT loop indefinitely"""
 
 
@@ -185,8 +71,9 @@ def get_executor_core_principles_section() -> str:
 
     Mirrors Phase 1's get_core_principles_section() pattern: same root
     principle (tool is ground truth), applied to the execution context.
-    Three rules form a complete loop — before calling (discover),
-    during failure (adapt), after completion (stop).
+    The rules define an execution reasoning frame, rather than a fixed
+    recovery playbook. The model remains responsible for choosing the next
+    safe, meaningful action from the evidence available at runtime.
 
     The 'stop' rule is step-aware: a fault injection may consist of
     multiple atomic INJECTION steps (e.g., kubectl patch → kubectl delete).
@@ -195,27 +82,36 @@ def get_executor_core_principles_section() -> str:
     Verification and recovery are handled by separate phases.
     """
     return """# Core Principles
+- The plan is approved and the safety envelope is enforced for you — act decisively through tool calls and keep going until every approved injection step is done
 - Tool interface knowledge from docs is UNVERIFIED — discover the actual interface from the tool itself
-- When a tool returns error, the TOOL is right — adapt immediately, do not retry or re-plan
-- When ALL injection steps are complete, STOP — do not verify or recover (verification is automatic)"""
+- Treat tool output as runtime evidence, not final judgment; draw conclusions only at its supported scope, and resolve uncertainty with a safe discriminating action before abandoning a viable path
+- Choose the next safe, meaningful action adaptively — avoid unchanged repetition unless new evidence or a new hypothesis justifies it
+- When ALL injection steps are complete, STOP — do not verify or recover (verification is automatic)
+- A failed partial injection is not a completed injection: if it left a residual experiment, clean up that residue before switching methods. If the skill documents an alternative injection method that reaches the same effect on the same target, switch to it here and keep executing — do NOT call request_replan just because the method changed"""
 
 
 def get_executor_remember_section() -> str:
     """REMEMBER segment — recency zone anchor for Phase 2 U-shaped attention.
 
-    Reinforces the same three rules from executor Core Principles, plus
+    Reinforces the same rules from executor Core Principles, plus
     one replan escape rule. Must stay verbatim aligned with Core Principles
     for U-shaped attention integrity.
     """
-    return """# REMEMBER
+    return f"""# REMEMBER
+- The plan is approved and the safety envelope is enforced for you — act decisively through tool calls and keep going until every approved injection step is done
 - Tool interface knowledge from docs is UNVERIFIED — discover the actual interface from the tool itself
-- When a tool returns error, the TOOL is right — adapt immediately, do not retry or re-plan
+- Treat tool output as runtime evidence, not final judgment; draw conclusions only at its supported scope, and resolve uncertainty with a safe discriminating action before abandoning a viable path
+- Choose the next safe, meaningful action adaptively — avoid unchanged repetition unless new evidence or a new hypothesis justifies it
 - When ALL injection steps are complete, STOP — do not verify or recover (verification is automatic)
-- If all injection methods fail, output [REPLAN] — do not retry exhausted approaches"""
+- A failed partial injection is not a completed injection: if it left a residual experiment, clean up that residue before switching methods. If the skill documents an alternative injection method that reaches the same effect on the same target, switch to it here and keep executing — do NOT call request_replan just because the method changed
+- If the approved plan's assumptions, feasibility, capabilities, or safety conditions need to change, call the `request_replan` tool with the evidence and decision — issue an actual tool call, never describe it in prose or paste its arguments as text"""
 
 
 def get_workflow_section() -> str:
     """Workflow phases section — tool-agnostic, verification as structural backbone.
+
+    Single profile-agnostic text: k8s / host differences come ONLY from the
+    environment_profile target-authority fragment, never from this section.
 
     Design principles:
     1. Ground Truth at top — establishes fact priority (tool > FAULT INTENT > docs).
@@ -234,72 +130,76 @@ You operate in TWO phases — the system transitions automatically.
 ### Phase 1 (current): Planning — read-only by enforcement
 
 ### Ground Truth
-FAULT INTENT parameters are UNVERIFIED. When tool output contradicts them,
-the TOOL is correct — use verified values, not original ones.
-The same applies to documentation: when a tool's runtime behavior contradicts
-skill docs or knowledge docs, the tool is right. Adapt to what the tool
-actually does.
+Your runtime evidence is current tool output and the environment's
+target authority: ground every target and parameter in them, adapt to what the
+tool actually does, and keep the approved target and safety boundaries intact.
+(Core Principles above governs how to resolve conflicts.)
 
 ### Steps
-1. **Analyze** the FAULT INTENT → fault type, target (namespace / resource /
-   names), parameters. Note: these are UNVERIFIED — do not trust them yet.
-2. **Activate** the matching skill via `activate_skill` — this is MANDATORY.
-   The skill is NOT auto-activated by dialogue or intent clarification; you
-   MUST call `activate_skill` yourself in Phase 1. Call it exactly once;
-   if you already called it in this phase, do not call it again.
-3. **Verify** the target exists with read-only cluster query tools — THE
-   critical step for plan reliability:
-   - Query the target by the provided identifier (labels, names, etc.)
-   - If the query returns empty → the identifier is WRONG. List resources
-     by name, inspect their metadata to discover the correct identifier.
-   - Before proceeding, state: "Verified: N resources match <key>=<value>"
-   - You MUST be able to cite the specific tool output that proves the
-     target exists. If you cannot cite evidence, do NOT proceed.
-4. **Read** skill resources / knowledge docs to determine the correct
-   injection command and parameters. Treat templates as RECIPES for
-   Phase 2 — do not execute them here.
+1. **Analyze** the FAULT INTENT → fault type, target identity, parameters.
+   These are UNVERIFIED hypotheses — confirm them with tools before you rely on them.
+2. **Activate** the matching skill via `activate_skill` — MANDATORY. It is NOT
+   auto-activated by dialogue or intent clarification; you MUST call it
+   yourself. Call it exactly once per phase; if already called, do not repeat.
+3. **Verify** the target exists with bound read-only tools — THE critical step
+   for plan reliability:
+   - Ground the target against runtime evidence; do NOT assume it. Query by the
+     provided identifier; if the query returns empty, the identifier is WRONG —
+     discover the correct one from listed resources and their metadata.
+   - Before proceeding, cite tool output proving the TARGET exists.
+   - If the verified target identity differs from the reviewed FaultSpec, call
+     `propose_plan_change` with a complete replacement FaultSpec and the current
+     revision. The user must approve it before planning continues.
+   - This applies ONLY to target existence. Method runtime preconditions that
+     cannot be observed read-only (host binaries, kernel/container
+     capabilities) belong to Phase 2 — do NOT block on them. Target confirmed to
+     exist + a documented injection method = enough to finish_planning; do NOT
+     loop waiting for evidence you cannot obtain here.
+   - Stuck on target discovery, or unsure whether an unverifiable precondition
+     should block? Read `planning-worked-examples.md` for worked traces of both.
+4. **Read** skill resources / knowledge docs to determine the correct injection
+   method and parameters. Treat templates as RECIPES for Phase 2 — do not
+   execute them here.
 5. **Assess complexity** (optional `save_fault_plan`):
-   - Simple (single target, single fault, trivial rollback): skip plan,
-     go to step 6.
-   - Complex (multi-target, multi-step, cascading, large blast radius):
-     call `save_fault_plan` with a markdown plan using these EXACT
-     `##` section headers (Phase 2 executes only "Execution Steps";
-     Verifier executes only "Verification Methods"):
-     - `## Task Summary` — brief overview
-     - `## Execution Steps` — injection actions ONLY
-     - `## Expected Impact` — what will happen
-     - `## Verification Methods` — how to verify
-     - `## Rollback and Recovery` — recovery steps
-     Pass the `task_id` from the user's conversation.
-   - When writing Verification Methods: fault effects are NOT instantaneous
-     (may take 5-30s to propagate). Plan for multi-iteration verification
-     (2+ checks before concluding "no effect").
-5b. **Reject when technically impossible**: Call
-   `finish_planning(rejected=True, ...)` when the request **cannot be done**:
-   target does not exist after verification, no matching use-case after
-   browsing the catalogue, OR no viable injection path remains after
-   exhausting alternatives in the skill case.
-   In ALL other cases — including safety concerns or blast-radius warnings
-   — you MUST complete planning normally (`rejected=False`) and include
-   your concerns in the `summary`. The system handles risk decisions via
-   `safety_check` → `confirmation_gate`.
-   When rejecting, provide 2-4 actionable alternatives against the same target
-   (numbered list, each with fault type + brief description + risk level).
+   - Simple (single target, single fault, trivial rollback): skip the plan, go
+     to step 6.
+   - Complex (multi-target, multi-step, cascading, large blast radius): call
+     `save_fault_plan` with a markdown plan using these EXACT `##` section
+     headers (Phase 2 executes only "Execution Steps"; Verifier executes only
+     "Verification Methods"): `## Task Summary`, `## Execution Steps`,
+     `## Expected Impact`, `## Verification Methods`, `## Rollback and Recovery`.
+     Pass the `task_id` from the user's conversation. Fault effects are
+     NOT instantaneous (may take 5-30s to propagate) — plan multi-iteration
+     verification (2+ checks before concluding "no effect").
+5b. **Reject only when technically impossible**: call
+   `finish_planning(rejected=True, ...)` when the request cannot be done — target
+   absent after verification, no matching use-case in the catalogue, the tool's own
+   help enumerates its capabilities and the one the request needs is not among them,
+   or no viable path after exhausting alternatives — with 2-4 actionable alternatives
+   against the same target (fault type + brief description + risk level). An
+   enumerated capability list is a complete answer: re-reading it, or reading it at a
+   wider scope, is not one of the alternatives to exhaust. Do NOT reject for an
+   unverifiable runtime precondition (Phase 2's job; unverifiable ≠ infeasible) or
+   for safety / blast-radius concerns — finish those with `rejected=False`, put the
+   concern in `summary`, and let `safety_check` → `confirmation_gate` handle risk.
 6. **End Phase 1** by calling `finish_planning` with VERIFIED parameters:
    - `finish_planning(summary="...")` → proceed to safety check and execution.
    - `finish_planning(summary="...", rejected=True, rejection_reason="...")` →
      reject the request (the system ends cleanly).
    When proceeding, you MUST include:
-   - `blast_radius_scope`: `"target-only"` | `"namespace-wide"` |
-     `"cluster-wide"` (cluster-wide triggers elevated safety review)
+   - `blast_radius_scope`: impact breadth, from `"target-only"` (only the
+     approved target) up to `"cluster-wide"` (environment-wide; triggers
+     elevated safety review). Use the value matching the `finish_planning`
+     tool schema.
    - `blast_radius_detail`: specific resources affected
    - `skill_case_resource`: resource_path of chosen case (if multiple were read)
    Do NOT end Phase 1 without calling `finish_planning`.
 
 ### Phase 2 (automatic): Execution — mutation tools bound after approval.
-Phase 1 is read-only. Mutation tools are bound automatically in Phase 2
-after `finish_planning` → safety_check → user approval. See Tool Usage
-Guidelines for available tools."""
+Phase 1 is read-only. Mutation tools are bound automatically in Phase 2 after
+`finish_planning` → safety_check → user approval. The system owns confirmation,
+target enforcement, recovery and audit. See Tool Usage Guidelines for available
+tools."""
 
 
 
@@ -340,16 +240,13 @@ def _get_verify_replan_section(replan_context: dict, replan_history: list | None
 
     parts.extend([
         "\n### Replan Instructions",
-        "1. The previous injection method was executed but the fault effect was NOT observed.",
-        "2. Re-read the skill case to find ALTERNATIVE injection methods.",
-        "3. Do NOT retry the same method that already failed verification.",
-        "4. If the previous attempt left any uncleaned side effects (not listed above),",
-        "   include cleanup steps in your new plan before the injection.",
-        "5. Generate a corrected plan using the alternative method.",
-        "6. When ready, call `finish_planning`. The system routes to safety check",
-        "   and user confirmation before execution.",
-        "7. If no viable alternative exists, call `finish_planning(rejected=True,",
-        '   rejection_reason="...")`.',
+        "Treat the previous plan as a hypothesis whose expected effect was not observed.",
+        "Identify the assumption that failed, distinguish observation gaps from method failure,",
+        "and choose the next planning action supported by the current evidence.",
+        "A different method is appropriate only when the evidence or capability warrants it.",
+        "When ready, call `finish_planning`; changes to target or risk are reviewed by the system.",
+        "If no viable path remains after evidence-based investigation, call",
+        '`finish_planning(rejected=True, rejection_reason="...")`.',
     ])
 
     return "\n".join(parts)
@@ -396,18 +293,14 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
 
     parts.extend([
         "\n### Replan Instructions",
-        "1. Re-verify the target using available read-only tools",
-        "2. Re-read the skill case to confirm correct injection parameters",
-        "3. **Runtime overrides documentation**: If the error indicates a rejected "
-        "parameter/command/syntax, do NOT include it in your corrected plan. "
-        "Plan a verification step: run the tool's help/usage command to discover "
-        "its actual interface before calling it.",
-        "4. Generate a CORRECTED plan — do NOT repeat the approach that failed",
-        "5. When ready, call `finish_planning`. The system routes to safety check before execution.",
-        "6. If no viable path forward remains (all alternatives exhausted, plan",
-        "   change rejected, or environment blocks all methods), call",
-        "   `finish_planning(rejected=True, rejection_reason=\"...\")` — do NOT",
-        "   continue observing.",
+        "Use the failure chain as evidence, not as an automatic verdict on the plan.",
+        "State which plan assumption, capability, target fact, or safety condition was invalidated.",
+        "Choose a next investigation or corrected method that addresses that evidence.",
+        "Do not repeat an unchanged action without a new hypothesis, changed input, or",
+        "expected propagation delay. Runtime tool behavior overrides documentation.",
+        "When ready, call `finish_planning`. If no viable path remains after",
+        "evidence-based investigation, call `finish_planning(rejected=True,",
+        'rejection_reason="...")`.',
     ])
 
     # Inject rejected params prohibition
@@ -418,65 +311,32 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
         parts.append("These do NOT exist in the current tool version.")
         parts.append("Your corrected plan MUST NOT include any of them.")
 
-    # Inject tool-specific verification suggestions
-    ctx_failed_tools = replan_context.get("failed_tool_names", [])
-    if ctx_failed_tools:
-        from chaos_agent.agent.nodes.react_helpers import suggest_verify_command
-        parts.append("\n### VERIFY BEFORE RETRY")
-        for t in ctx_failed_tools:
-            parts.append(f"- `{t}`: {suggest_verify_command(t)}")
-
-    # Error classification decision tree — tool-agnostic
-    if ctx_failed_tools:
-        parts.extend([
-            "",
-            "### Analyzing the Failure",
-            "Before deciding your approach, analyze WHY the failure occurred:",
-            "",
-            "- **Parameter error** (target not found, identifier mismatch):",
-            "  Fix the parameters and retry with the SAME fault type.",
-            "  Do NOT use propose_plan_change.",
-            "",
-            "- **Environment error** (tool not available, dependency missing, command blocked):",
-            "  Consider alternative injection methods from the skill case.",
-            "  You MAY use propose_plan_change if the fault type is",
-            "  fundamentally not viable on this target.",
-            "  If all alternatives are also blocked, call `finish_planning(rejected=True)` to end cleanly.",
-            "",
-            "- **Execution error** (tool ran but injection failed):",
-            "  Re-read the skill case, verify parameters, and retry.",
-            "  Only escalate to plan change if repeated attempts fail.",
-            "",
-            "Check the failure chain above to determine which category applies.",
-        ])
+    parts.extend([
+        "",
+        "### Evidence-Based Decision",
+        "Classify the observed issue only after reading the full chain: target identity,",
+        "tool interface, environment capability, propagation timing, or a genuinely",
+        "invalid fault strategy. The classification informs your next action; it does",
+        "not prescribe a fixed retry or replacement method.",
+    ])
 
     parts.extend([
         "",
-        "### Plan Change (fault type switch)",
-        "If after analyzing the failure you determine the original fault type "
-        "is fundamentally not viable on this target, you may propose an "
-        "alternative fault type using `propose_plan_change`. The user will see "
-        "a comparison card and approve or reject the change.",
-        "",
-        "Do NOT use propose_plan_change for parameter adjustments — those can "
-        "be handled within the same fault type. Only use it when the fault TYPE "
-        "(scope/target/action) must change.",
+        "### Plan Change",
+        "If the approved target or fault type must change, use `propose_plan_change`; "
+        "otherwise adapt within the approved outcome and finish_planning.",
     ])
 
     return "\n".join(parts)
 
 
 def get_replan_directive_for_execution() -> str:
-    """Replan directive for Phase 2's prompt — tells LLM about [REPLAN] mechanism.
-
-    This section is tool-agnostic — it describes the replan mechanism
-    (output [REPLAN] marker) without listing specific tool names. The
-    concrete Phase 2 tools are listed in the Tools section and execution
-    directives, not here.
-    """
+    """Replan directive for Phase 2 using an explicit typed wire contract."""
     return f"""### Replan Mechanism
-If you encounter an error that you CANNOT resolve with the available Phase 2 tools:
-1. Output `{REPLAN_MARKER}` followed by a detailed description of the problem
-2. Include what you tried, what failed, and what information or approach might help
-3. The system will route back to Phase 1, which has richer read-only tools for investigation and re-planning
-4. Only use {REPLAN_MARKER} when you have genuinely exhausted Phase 2 capabilities — do NOT use it for transient errors that can be retried"""
+Keep executing while ANY alternative approach can still advance the approved
+goal within the approved boundary — a single failed tool call is not grounds to
+replan. Request a replan (return to Phase 1) ONLY when the plan itself needs to be
+reconsidered because the approved goal cannot be reached this way. Record it
+by calling the `request_replan` tool (an actual tool call, never prose); its
+description covers `needs_investigation` vs `plan_invalid` and the target/risk
+flag. The system returns to Phase 1 only for `plan_invalid`."""

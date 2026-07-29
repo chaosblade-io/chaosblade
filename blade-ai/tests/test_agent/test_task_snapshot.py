@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 
-from chaos_agent.agent.task_snapshot import (
+from chaos_agent.agent.result.task_snapshot import (
     TaskSnapshot,
     build_recover_initial_from_task_snapshot,
     resolve_recover_initial_state,
@@ -101,7 +101,7 @@ def test_task_snapshot_prefers_session_when_increment_log_exists():
 def test_task_snapshot_reads_jsonl_even_when_json_snapshot_missing(tmp_path):
     from langchain_core.messages import AIMessage, ToolMessage
 
-    from chaos_agent.agent.task_snapshot import _read_task_session
+    from chaos_agent.agent.result.task_snapshot import _read_task_session
     from chaos_agent.memory.session_store import SessionStore, set_global_session_store
 
     session_store = SessionStore(tmp_path / "tasks")
@@ -178,6 +178,11 @@ def test_task_snapshot_builds_fault_spec_from_merged_context():
         "duration_seconds": 0,
         "source": "task_snapshot_rebuild",
         "user_description": "",
+        "revision": 0,
+        "objective": "",
+        "boundaries": [],
+        "constraints": [],
+        "assumptions": [],
     }
 
 
@@ -296,6 +301,7 @@ async def test_recover_initial_from_task_snapshot_uses_snapshot_fields():
             "kubeconfig": "/old/kubeconfig",
             "kube_context": "ctx-a",
             "injection_method": "kubectl_exec",
+            "execution_artifacts": [{"artifact_id": "uid-debug", "type": "debug_pod"}],
             "kubectl_exec_pod_name": "tool-pod-a",
             "gmt_create": "2026-06-18T10:00:00+08:00",
             "verification": {
@@ -327,6 +333,9 @@ async def test_recover_initial_from_task_snapshot_uses_snapshot_fields():
     assert initial["kubeconfig"] == "/new/kubeconfig"
     assert initial["kube_context"] == "ctx-a"
     assert initial["injection_method"] == "kubectl_exec"
+    assert initial["execution_artifacts"] == [
+        {"artifact_id": "uid-debug", "type": "debug_pod"}
+    ]
     assert initial["kubectl_exec_pod_name"] == "tool-pod-a"
 
 
@@ -338,11 +347,15 @@ def test_runtime_recover_entrypoints_use_task_snapshot_resolver():
         "src/chaos_agent/server/routes/recover_common.py",
         "src/chaos_agent/server/routes/turn_event_stream.py",
         "src/chaos_agent/server/routes/turn_result.py",
-        "src/chaos_agent/l4/agent.py",
+        # L4 SDK recover entrypoints: agent.py was split into mixins in the
+        # baseline refactor (b78c82c); the recover path now lives in
+        # recovery.py (_L4RecoveryMixin) and execution.py (_L4ExecutionMixin).
+        "src/chaos_agent/l4/recovery.py",
+        "src/chaos_agent/l4/execution.py",
     }
     allowed_checkpoint_builder_paths = {
-        "src/chaos_agent/agent/recovery_state.py",
-        "src/chaos_agent/agent/task_snapshot.py",
+        "src/chaos_agent/agent/state_mgmt/recovery_state.py",
+        "src/chaos_agent/agent/result/task_snapshot.py",
         # Compatibility helper used by adapter unit tests and older SDK callers;
         # runtime L4 recover paths are guarded above through l4/agent.py.
         "src/chaos_agent/l4/adapter.py",
@@ -370,7 +383,7 @@ def test_runtime_recover_entrypoints_use_task_snapshot_resolver():
 async def test_resolver_source_values_preserve_snapshot_verification(monkeypatch):
     """Recover graph stays clean while result/reporting source values keep inject facts."""
 
-    from chaos_agent.agent import task_snapshot
+    from chaos_agent.agent.result import task_snapshot
 
     snapshot = TaskSnapshot.from_sources(
         task_id="task-inject",

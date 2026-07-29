@@ -2,7 +2,7 @@
 
 Operation summaries are durable dialogue-memory records.  This module owns the
 side effects of appending those records to the Intent Graph and the TUI session
-store; summary text construction lives in ``chaos_agent.agent.operation_summary``.
+store; summary text construction lives in ``chaos_agent.agent.result.operation_summary``.
 """
 
 from __future__ import annotations

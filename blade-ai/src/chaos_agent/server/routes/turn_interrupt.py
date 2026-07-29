@@ -39,6 +39,24 @@ def content_from_interrupt_payload(payload: dict) -> str:
     )
 
 
+def _fmt_target(ns: str, names: list, *, max_shown: int = 4) -> str:
+    """Render a target for the auto-approve token.
+
+    - Drops the leading slash when the namespace is empty (node / cluster
+      scope) so it reads ``node-a, node-b`` instead of ``/node-a, node-b``.
+    - Summarizes long name lists as ``N 个: a, b, c …(+M)`` so a 40-node
+      batch doesn't dump every name onto one line.
+    """
+    if not names:
+        return f"{ns}/*" if ns else "*"
+    total = len(names)
+    if total > max_shown:
+        body = f"{total} 个: {', '.join(names[:max_shown])} …(+{total - max_shown})"
+    else:
+        body = ", ".join(names)
+    return f"{ns}/{body}" if ns else body
+
+
 def format_auto_approve_info(node: str, payload: dict) -> str:
     """Format interrupt payload for auto-mode display (token, not card)."""
     lines = [f"[Auto-approved: {node}]"]
@@ -52,7 +70,7 @@ def format_auto_approve_info(node: str, payload: dict) -> str:
         ns = target.get("namespace", "")
         names = target.get("names", [])
         if ns or names:
-            lines.append(f"目标: {ns}/{', '.join(names) if names else '*'}")
+            lines.append(f"目标: {_fmt_target(ns, names)}")
         params = payload.get("params") or {}
         if params:
             lines.append(f"参数: {', '.join(f'{k}={v}' for k, v in params.items() if v)}")
@@ -87,13 +105,13 @@ def format_auto_approve_info(node: str, payload: dict) -> str:
         if original:
             ns = original.get("namespace", "")
             names = original.get("names", [])
-            lines.append(f"批准目标: {ns}/{', '.join(names) if names else '*'}")
+            lines.append(f"批准目标: {_fmt_target(ns, names)}")
         if proposed:
             ns = proposed.get("namespace", "")
             names = proposed.get("names", [])
-            lines.append(f"实际目标: {ns}/{', '.join(names) if names else '*'}")
+            lines.append(f"实际目标: {_fmt_target(ns, names)}")
         if reason:
-            lines.append(f"偏移原因: {reason}")
+            lines.append(f"偏移原因: {reason if len(reason) <= 160 else reason[:159] + '…'}")
         if agent_reason:
             lines.append(f"Agent 解释: {agent_reason}")
     else:

@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS task_details (
     postmortem          TEXT,
     target_health_report TEXT,
     feasibility_report  TEXT,
+    execution_artifacts TEXT,
     total_token_input   INTEGER NOT NULL DEFAULT 0,
     total_token_output  INTEGER NOT NULL DEFAULT 0,
     total_llm_calls     INTEGER NOT NULL DEFAULT 0,
@@ -277,7 +278,54 @@ class PostgreSQLBackend:
             except Exception:
                 pass
             try:
+                await conn.execute("ALTER TABLE task_details ADD COLUMN execution_artifacts TEXT")
+            except Exception:
+                pass
+            try:
                 await conn.execute("ALTER TABLE task_details ADD COLUMN kubectl_exec_pod_name TEXT")
+            except Exception:
+                pass
+            try:
+                # ``injection_start_time`` — the only field written exactly when
+                # an injection command is *issued* (execute_loop /
+                # direct_execute set it write-once and never clear it, unlike
+                # ``injection_method``). ``select_active_tasks`` needs it to tell
+                # "confirmed but never executed" apart from "really injected".
+                #
+                # ALTER + backfill are wrapped in ONE explicit transaction:
+                # asyncpg auto-commits each ``execute`` outside a transaction,
+                # so without this the process could die between them and leave
+                # the column added but never backfilled. Because the backfill is
+                # one-shot (see below), that middle state would be permanent.
+                async with conn.transaction():
+                    await conn.execute(
+                        "ALTER TABLE task_details ADD COLUMN injection_start_time TEXT"
+                    )
+                    # One-shot backfill, deliberately INSIDE this try: it runs
+                    # only on the migration that adds the column (on later
+                    # startups the ALTER raises and we skip).
+                    #
+                    # ❗ 不要把它拆成独立的 try / 让它每次启动都跑：回填条件
+                    # （injection_start_time IS NULL 且有意图）恰好也匹配
+                    # 「方案已确认但命令从未发出」的**新行**，每次启动重跑会给
+                    # 它们盖上时间戳，永久废掉 select_active_tasks 的"已发出"
+                    # 判据。一次性回填失败最多让存量行暂时不可恢复（一次性
+                    # 窗口），而重复回填是永久性失效。上面的显式事务已消除
+                    # "列加上了但回填没跑"这个中间态。
+                    #
+                    # Pre-existing rows have no recorded issue time, so assume
+                    # they were issued and stamp ``tasks.gmt_create`` — that
+                    # keeps their current recoverable status. Excluding them
+                    # instead would hide real in-flight injections, i.e.
+                    # re-create the "注入了却恢复不了" bug this column exists
+                    # to avoid.
+                    await conn.execute(
+                        "UPDATE task_details d SET injection_start_time = COALESCE("
+                        "  (SELECT t.gmt_create FROM tasks t WHERE t.task_id = d.task_id),"
+                        "  d.gmt_create)"
+                        " WHERE d.injection_start_time IS NULL"
+                        "   AND (d.target IS NOT NULL OR d.fault_spec IS NOT NULL)"
+                    )
             except Exception:
                 pass
             # tenant_id migration already done above (pre-DDL)
@@ -314,23 +362,77 @@ class PostgreSQLBackend:
             return [_record_to_dict(r) for r in rows]
 
     async def select_active_tasks(self, namespace: str = "", target_name: str = "", tenant_id: str = "") -> list[dict]:
-        conditions = ["task_state IN ('injecting', 'injected')"]
+        # 「可恢复实验」判据：**是否落过注入意图**。
+        #
+        # ``fault_spec`` 是规范形态，``target`` 是遗留形态（见
+        # task_store_backend._extract_index_fields 的 docstring 与其两级回退
+        # 逻辑）。生产主路径两者都写 —— _store_sync 在写库前用 setdefault 从
+        # fault_spec 投影出 target/params/namespace/target_name。
+        #
+        # 但全 SDK 共有 4 处**直接** store.upsert()、绕过该投影：
+        #   • cli/runner.py:264 / :568 —— pipeline 启动前写初始状态，只带
+        #     fault_spec（规范形态），无 target。只认 ``target`` 会把这类
+        #     真实注入误判为幽灵，这正是本判据要修的；
+        #   • observability/tracer.py:229 / :255 —— 仅为让 span/summary 有行
+        #     可挂而建裸行，不带任何意图字段，落库后 target 与 fault_spec
+        #     双 NULL，**新旧判据都排除**，不影响正确性。
+        #
+        # ❗ 历史踩坑，不要重蹈（每一条都曾造成「注入了却恢复不了」）：
+        #   • skill_name IS NOT NULL  —— 误藏不激活 skill 的真实注入；
+        #   • target_name <> ''       —— 误藏 host 类与按 labels 选目标的注入；
+        #   • 仅 target IS NOT NULL   —— 误藏只写规范形态的注入；
+        #   • blade_uid IS NOT NULL   —— 误藏 kubectl_native / host_native
+        #     （它们天然无 uid，"attempt IS the injection"）；
+        #   • injection_method IS NOT NULL —— execute_loop 的多步自检分支会把
+        #     已发出命令的 method 置回 None，无法区分"已执行但 method 为空"；
+        #   • safety_status <> 'pending' —— schema 默认值就是 'pending'
+        #     (NOT NULL DEFAULT)，"真的卡在安全门"与"从未写过"在库里同形。
+        #
+        # 「已发出命令」判据用 ``d.injection_start_time IS NOT NULL``：它是唯一
+        # 恰在注入命令发出那一刻置位、且**写一次不清零**的字段
+        # （execute_loop:674/1313/1355、direct_execute 三处均为
+        # ``if not state.get("injection_start_time")`` 守卫），因此不会像
+        # ``injection_method`` 那样被后续分支抹掉。少了这条，"方案已确认但卡在
+        # 安全门、从未发出命令"的行会进可恢复列表，被恢复流程误选后报「找不到该
+        # 任务的注入状态记录」。
+        #
+        # ⚠️ 存量兼容：该列是后加的，存量行没有值。迁移时做了**一次性回填**
+        # （见 _ensure_schema：仅在 ADD COLUMN 成功那次执行），把有意图的存量行
+        # 的 injection_start_time 置为 tasks.gmt_create，保持它们原有的可恢复
+        # 状态。若不回填而直接按新判据过滤，存量在途注入会全部变成不可恢复 ——
+        # 那正是本列要避免的失败模式。
+        #
+        # ⚠️ 判据的两个条件都不要单独回滚。可用下述 SQL 在任意库上复核不变量
+        # （规范形态未被误藏），结果应为 0：
+        #   SELECT COUNT(*) FROM tasks t
+        #     LEFT JOIN task_details d ON d.task_id = t.task_id
+        #    WHERE t.task_state IN ('injecting','injected')
+        #      AND d.target IS NULL AND d.fault_spec IS NOT NULL;
+        conditions = [
+            "t.task_state IN ('injecting', 'injected')",
+            "(d.target IS NOT NULL OR d.fault_spec IS NOT NULL)",
+            "d.injection_start_time IS NOT NULL",
+        ]
         params: list = []
         idx = 0
         if tenant_id:
             idx += 1
-            conditions.append(f"tenant_id = ${idx}")
+            conditions.append(f"t.tenant_id = ${idx}")
             params.append(tenant_id)
         if namespace:
             idx += 1
-            conditions.append(f"namespace = ${idx}")
+            conditions.append(f"t.namespace = ${idx}")
             params.append(namespace)
         if target_name:
             idx += 1
-            conditions.append(f"target_name = ${idx}")
+            conditions.append(f"t.target_name = ${idx}")
             params.append(target_name)
         where = " AND ".join(conditions)
-        sql = f"SELECT * FROM tasks WHERE {where} ORDER BY gmt_create DESC"
+        sql = (
+            "SELECT t.* FROM tasks t "
+            "LEFT JOIN task_details d ON d.task_id = t.task_id "
+            f"WHERE {where} ORDER BY t.gmt_create DESC"
+        )
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(sql, *params)
             return [_record_to_dict(r) for r in rows]

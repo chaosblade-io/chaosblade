@@ -1,7 +1,7 @@
 """``/api/v1/config`` — TS TUI configuration read/write endpoints.
 
 The Python TUI manipulates ``~/.blade-ai/config.json`` directly via
-``ConfigStore`` (``chaos_agent/tui/config_store.py``). The TS TUI runs
+``ConfigStore`` (``chaos_agent/config/config_store.py``). The TS TUI runs
 out-of-process and has no filesystem access to the user's home, so the
 server proxies the same operations.
 
@@ -27,7 +27,7 @@ from fastapi import Body, Request
 
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode
 from chaos_agent.server.routes import config_router
-from chaos_agent.tui.config_store import ConfigStore
+from chaos_agent.config.config_store import ConfigStore
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,7 @@ _WRITABLE_KEYS: frozenset[str] = frozenset(
         "replan_reset_execute_count",
         # Loop detection.
         "loop_detection_window",
+        "loop_detection_turns",
         "loop_detection_threshold",
         "idle_turn_threshold",
     }
@@ -87,16 +88,28 @@ def _store() -> ConfigStore:
 
 @config_router.get("")
 async def read_config(req: Request):
-    """Return the masked display config + the resolved file path.
+    """Return the FULL config (every config.json key) + the resolved path.
 
-    ``api_key`` is asterisked by ``get_display_dict``; any new field
-    added there inherits the same masking. The path is included so
-    ``/config path`` on the TS side renders without a second call.
+    Historically returned only ``get_display_dict`` — a curated 9-key subset
+    with the api key masked — which hid ``kube_connection_mode`` / ``kubewiz_*``
+    and blanked the key. Operators asked for the complete file content, api key
+    included, so we overlay the raw ``config.json`` (``read_all``) over the
+    curated defaults and surface ``llm_api_key`` as-is.
+
+    NOTE: this exposes secrets (``llm_api_key`` / ``kubewiz_token``) in plaintext
+    to the caller. Acceptable for the local single-user TUI server this endpoint
+    serves; do NOT bind this server to a non-loopback interface.
     """
+    from chaos_agent.config.settings import settings as s
+
     store = _store()
+    view = dict(store.get_display_dict())
+    view.update(store.read_all())
+    if s.llm_api_key:
+        view["llm_api_key"] = s.llm_api_key
     return JSONEnvelope.ok(
         data={
-            "config": store.get_display_dict(),
+            "config": view,
             "config_path": store.path,
         },
         request_id=getattr(req.state, "request_id", ""),

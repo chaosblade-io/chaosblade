@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from chaos_agent.tui.config_store import ConfigStore
+from chaos_agent.config.config_store import ConfigStore
 
 
 @pytest.fixture

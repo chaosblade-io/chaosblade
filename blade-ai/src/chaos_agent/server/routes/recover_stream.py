@@ -172,7 +172,7 @@ async def recover_stream(request: RecoverRequest, req: Request):
                     return
 
                 try:
-                    from chaos_agent.agent.operation_summary import build_recover_summary_text
+                    from chaos_agent.agent.result.operation_summary import build_recover_summary_text
                     from chaos_agent.memory.operation_summary_writer import write_operation_summary
                     from chaos_agent.server.routes.sessions import get_store as get_tui_session_store
 

@@ -5,25 +5,52 @@ import logging
 from chaos_agent.agent.graph import build_recover_graph
 from chaos_agent.config.settings import settings
 from chaos_agent.skills.registry import SkillRegistry
+from chaos_agent.utils.reasoning_replay import (
+    reasoning_model_key,
+    replayed_reasoning,
+)
 from chaos_agent.tools import (
-    blade_create,
-    blade_help,
-    blade_status,
-    blade_query_k8s,
-    kubectl,
-    kubectl_ro,
     safe_read_file,
     safe_write_file,
     read_knowledge_resource,
 )
 
-# blade_destroy intentionally not imported here. Phase 1 must not see
-# it (post-task-ce9647931ce1 mutation lockdown) and Phase 2 also
-# doesn't bind it (destruction is framework-controlled by the recover
-# graph or by inject/inject_stream auto-cleanup paths, which import
-# blade_destroy directly from chaos_agent.tools.blade).
+# Backend execution tools (blade_* / kubectl / kubectl_read) are no longer
+# hardcoded here — each is contributed by its FaultProvider via
+# ``_append_provider_tools`` (see chaosblade.py / k8s_native.py / host_shell.py
+# ``tools(phase)``). Environment discovery belongs to the provider-backed
+# planning phase, not to semantic intent clarification.
 
 logger = logging.getLogger(__name__)
+
+
+def _append_provider_tools(base: list, phase: str) -> list:
+    """Union the built-in FaultProviders' phase tools onto a static base list.
+
+    Tools bind at graph-*build* time — the factory unions every provider's
+    ``tools(phase)`` onto the phase's static base (see
+    :meth:`FaultProvider.tools`). This is the seam that lets a new execution
+    backend surface its LLM tools by *registering a provider* instead of
+    editing these five hardcoded lists.
+
+    Dedup by tool name so a provider that re-declares a statically-listed tool
+    (e.g. ``kubectl``) never double-binds it. Self-bootstraps the built-ins on
+    an empty registry, mirroring ``FaultProviderRegistry.detect_method``; an
+    already-populated registry (test fixtures) is respected as-is.
+    """
+    from chaos_agent.agent.providers import FaultProviderRegistry
+
+    if not FaultProviderRegistry.all_providers():
+        FaultProviderRegistry.register_builtins()
+    seen = {getattr(t, "name", None) for t in base}
+    out = list(base)
+    for provider in FaultProviderRegistry.all_providers():
+        for tool in provider.tools(phase):
+            name = getattr(tool, "name", None)
+            if name not in seen:
+                seen.add(name)
+                out.append(tool)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -31,14 +58,49 @@ logger = logging.getLogger(__name__)
 # (e.g., Qwen enable_thinking). ChatOpenAI explicitly does NOT extract
 # reasoning_content — this patch adds it to additional_kwargs so that
 # downstream code can access it via message.additional_kwargs["reasoning_content"].
+#
+# It must also travel back OUT. A thinking model writes "why I'm doing this /
+# what I already did" into reasoning_content and often leaves ``content``
+# empty; ``_convert_message_to_dict`` only emits content/role/tool_calls/name,
+# so history degenerates into bare tool calls with no rationale and the model
+# re-derives its intent from the original input every turn. Re-derivation
+# always yields step 1 — harmless for single-step work (step 1 *is* the whole
+# job), non-convergent for multi-step work.
 # ---------------------------------------------------------------------------
 _REASONING_PATCH_APPLIED = False
+
+# Labels of patches that could not be applied. Non-empty means reasoning replay
+# is degraded — surfaced via the WARNING logs emitted at patch time, and asserted
+# by tests/test_agent/test_reasoning_patch_resilience.py.
+_REASONING_PATCH_FAILURES: list[str] = []
+
+# Model provenance and the replay decision itself live in
+# ``utils.reasoning_replay`` because the TOKEN COUNTER has to reach the same
+# verdict: every context decision (auto-compact, strip-vs-compress, keep/drop)
+# is computed from ``count_tokens_messages``, and text that goes on the wire
+# unaccounted made a 10-turn history measure 83 tokens against a real 7,547.
+# Re-implementing the conditions here would let the two sides drift silently.
+# The private alias below is a forwarder kept for existing call sites here and
+# in the reasoning-replay tests; new code should import from the utils module.
+_reasoning_model_key = reasoning_model_key
 
 
 def _patch_langchain_for_reasoning_content() -> None:
     """Monkey-patch langchain-openai message conversion to preserve reasoning_content.
 
     Idempotent: safe to call multiple times — only patches once.
+
+    Every patch is applied under its own guard. The targets are PRIVATE
+    langchain functions and ``pyproject.toml`` pins only ``langchain-openai>=1.0``
+    (no upper bound), so a routine ``uv sync`` can rename or reshape them. This
+    used to raise at import time, which takes the whole Agent down — a
+    reasoning-replay optimisation must never do that. On failure the Agent keeps
+    running with replay disabled (degraded: multi-step drills fall back to the
+    slow path) and logs a WARNING naming the patch that failed.
+
+    Wrappers forward ``*args/**kwargs`` rather than restating the upstream
+    signature, so adding or removing a parameter (e.g. Patch 3's ``api``, which
+    only exists in newer versions) does not break the call either.
     """
     global _REASONING_PATCH_APPLIED
     if _REASONING_PATCH_APPLIED:
@@ -48,31 +110,92 @@ def _patch_langchain_for_reasoning_content() -> None:
     from langchain_openai.chat_models import base as _lc_base
     from langchain_core.messages import AIMessage, AIMessageChunk
 
-    # --- Patch 1: non-streaming _convert_dict_to_message ---
-    _orig_convert_dict = _lc_base._convert_dict_to_message
+    def _apply(label: str, attr: str, make_wrapper) -> bool:
+        """Patch one target, degrading to a WARNING if it cannot be applied."""
+        try:
+            original = getattr(_lc_base, attr)
+            setattr(_lc_base, attr, make_wrapper(original))
+            return True
+        except Exception as e:
+            _REASONING_PATCH_FAILURES.append(label)
+            logger.warning(
+                "reasoning_content %s could not be applied (%s: %s). "
+                "The Agent continues to run, but thinking-channel intent is "
+                "%s. Check the installed langchain-openai version.",
+                label, type(e).__name__, e,
+                "not replayed to the model — multi-step tasks may re-derive "
+                "their plan every turn" if attr == "_convert_message_to_dict"
+                else "not captured for logs/TUI",
+            )
+            return False
 
-    def _patched_convert_dict_to_message(_dict):
-        msg = _orig_convert_dict(_dict)
-        # For assistant messages, extract reasoning_content into additional_kwargs
-        if isinstance(msg, AIMessage) and _dict.get("reasoning_content"):
-            msg.additional_kwargs["reasoning_content"] = _dict["reasoning_content"]
-        return msg
+    # --- Patch 1: non-streaming _convert_dict_to_message (inbound) ---
+    def _make_convert_dict(orig):
+        def _patched(*args, **kwargs):
+            msg = orig(*args, **kwargs)
+            _dict = args[0] if args else kwargs.get("_dict") or {}
+            # For assistant messages, extract reasoning_content into additional_kwargs
+            if isinstance(msg, AIMessage) and _dict.get("reasoning_content"):
+                msg.additional_kwargs["reasoning_content"] = _dict["reasoning_content"]
+                msg.additional_kwargs[_reasoning_model_key(settings.model_name)] = True
+            return msg
+        return _patched
 
-    _lc_base._convert_dict_to_message = _patched_convert_dict_to_message
+    _apply("inbound patch (non-streaming)", "_convert_dict_to_message", _make_convert_dict)
 
-    # --- Patch 2: streaming _convert_delta_to_message_chunk ---
-    _orig_convert_delta = _lc_base._convert_delta_to_message_chunk
+    # --- Patch 2: streaming _convert_delta_to_message_chunk (inbound) ---
+    def _make_convert_delta(orig):
+        def _patched(*args, **kwargs):
+            msg = orig(*args, **kwargs)
+            _dict = args[0] if args else kwargs.get("_dict") or {}
+            # For assistant chunks, extract reasoning_content into additional_kwargs
+            if isinstance(msg, AIMessageChunk) and _dict.get("reasoning_content"):
+                msg.additional_kwargs["reasoning_content"] = _dict["reasoning_content"]
+                msg.additional_kwargs[_reasoning_model_key(settings.model_name)] = True
+            return msg
+        return _patched
 
-    def _patched_convert_delta_to_message_chunk(_dict, default_class):
-        msg = _orig_convert_delta(_dict, default_class)
-        # For assistant chunks, extract reasoning_content into additional_kwargs
-        if isinstance(msg, AIMessageChunk) and _dict.get("reasoning_content"):
-            msg.additional_kwargs["reasoning_content"] = _dict["reasoning_content"]
-        return msg
+    _apply("inbound patch (streaming)", "_convert_delta_to_message_chunk", _make_convert_delta)
 
-    _lc_base._convert_delta_to_message_chunk = _patched_convert_delta_to_message_chunk
+    # --- Patch 3: outbound _convert_message_to_dict — replay reasoning_content ---
+    def _make_message_to_dict(orig):
+        def _patched(message, *args, **kwargs):
+            d = orig(message, *args, **kwargs)
+            api = kwargs.get("api", args[0] if args else "chat/completions")
+            # Only the Chat Completions shape is verified to accept the field.
+            # The Responses API uses a different reasoning representation
+            # entirely. This is the one condition NOT delegated below, because
+            # it is a property of the call, not of the message.
+            if api != "chat/completions":
+                return d
+            # Everything else — assistant-only, non-blank trace, model
+            # provenance, tail truncation — comes from the shared decision so
+            # ``count_tokens_messages`` accounts for exactly this text.
+            reasoning = replayed_reasoning(message)
+            if reasoning:
+                d["reasoning_content"] = reasoning
+            return d
+        return _patched
 
-    logger.debug("Patched langchain-openai to preserve reasoning_content")
+    _apply("outbound replay patch", "_convert_message_to_dict", _make_message_to_dict)
+
+    if _REASONING_PATCH_FAILURES:
+        logger.warning(
+            "reasoning_content patching incomplete: %d of 3 failed (%s)",
+            len(_REASONING_PATCH_FAILURES), ", ".join(_REASONING_PATCH_FAILURES),
+        )
+    else:
+        logger.debug("Patched langchain-openai to preserve and replay reasoning_content")
+
+
+def reasoning_patch_failures() -> tuple[str, ...]:
+    """Patches that could not be applied.
+
+    Empty means thinking-channel intent continuity is fully active. Failures are
+    already reported as WARNING logs at patch time; this accessor exists so the
+    degraded state stays inspectable and testable rather than log-only.
+    """
+    return tuple(_REASONING_PATCH_FAILURES)
 
 
 # Apply the patch at import time so all ChatOpenAI instances benefit
@@ -118,7 +241,8 @@ def make_llm(
         LangChain callbacks list (e.g. tracing).  Defaults to ``None``.
     """
     import httpx
-    from langchain_openai import ChatOpenAI
+
+    from chaos_agent.agent.resilient_llm import ResilientChatOpenAI
 
     _connect = connect_timeout if connect_timeout is not None else settings.llm_connect_timeout
     _read = read_timeout if read_timeout is not None else settings.llm_read_timeout
@@ -153,7 +277,11 @@ def make_llm(
     _thinking = enable_thinking if enable_thinking is not None else settings.llm_enable_thinking
     if _thinking:
         llm_kwargs["extra_body"] = {"enable_thinking": True}
-    return ChatOpenAI(**llm_kwargs)
+    # ResilientChatOpenAI adds application-level retry for transient transport
+    # failures (mid-stream ReadError / RemoteProtocolError from sleep, network
+    # handoff, gateway reset) that the OpenAI SDK's own max_retries can't cover
+    # once streaming has begun. See resilient_llm.py.
+    return ResilientChatOpenAI(**llm_kwargs)
 
 
 def _build_skill_tools(registry: SkillRegistry):
@@ -325,7 +453,11 @@ def _build_skill_tools(registry: SkillRegistry):
             return f"Error writing file '{file_path}': {e}"
 
     @lc_tool
-    def save_fault_plan(plan_content: str, task_id: str, skill_case_resource: str = "") -> str:
+    def save_fault_plan(
+        plan_content: str,
+        task_id: str,
+        skill_case_resource: str = "",
+    ) -> str:
         """Phase 1 ONLY. Save a fault injection plan as `<task_id>.md` in the plan directory.
 
         Writes to the local plan dir (does NOT touch the cluster). After
@@ -412,29 +544,55 @@ def _build_skill_tools(registry: SkillRegistry):
         return f"Planning finalized. Summary: {summary}"
 
     @lc_tool
-    def propose_plan_change(reason: str, scope: str, target: str, action: str) -> str:
-        """Replan ONLY. Propose changing the fault type when the current approach failed.
+    def propose_plan_change(
+        reason: str,
+        proposed_fault: dict,
+        fault_revision: int | None = None,
+    ) -> str:
+        """Propose a change to the semantic fault identity for user confirmation.
+
+        A plan change is a change to WHAT is attacked. The system diffs the
+        proposed FaultSpec against the reviewed one and asks the user to approve
+        or reject before the contract is replaced.
 
         When to use:
-          - During replan (after Phase 2 failure), when you have determined the
-            original fault type cannot be injected but an alternative exists.
-          - Do NOT use during initial planning — complete your plan with
-            finish_planning instead.
+          - The TARGET identity must change (e.g. target A does not exist or
+            cannot be injected, and a different resource C must be used).
+          - The FAULT TYPE must change (scope / target / action — e.g. switching
+            from a network fault to a similar but different fault).
 
         Inputs:
-          - reason: why the original fault type failed and why the alternative
-            should work (1-2 sentences).
-          - scope: proposed ChaosBlade scope (pod/node/container).
-          - target: proposed ChaosBlade target (cpu/mem/network/disk/...).
-          - action: proposed ChaosBlade action (fullload/burn/drop/delay/...).
+          - reason: why the target or fault type cannot be preserved and why the
+            alternative should work (1-2 sentences).
+          - proposed_fault: complete FaultSpec object. Include objective,
+            scope, target, action, namespace, names, labels, params,
+            boundaries, constraints, and assumptions as applicable; do not
+            submit a partial fault identity.
+          - fault_revision: copy the revision of the Reviewed FaultSpec that
+            this proposal replaces.
 
-        Output: confirmation of proposal submission. The user will be asked
-                to approve or reject the change.
+        Output: confirmation of proposal submission, or "Error:" prefix.
+
+        Side effects: None (proposal only — the contract changes only after the
+        user approves).
+
+        Constraints (MUST READ before calling):
+          - Do NOT use this to switch the injection METHOD / CHANNEL / TOOL while
+            keeping the same target and fault type (e.g. ChaosBlade DaemonSet →
+            kubectl-native). That is HOW to attack, not what — just re-plan and
+            call finish_planning.
+          - Do NOT use it for method-specific parameter differences. FaultSpec
+            captures the semantic intent, not one tool's flags.
         """
-        return (
-            f"Plan change proposed: {scope}-{target}-{action}. "
-            f"Reason: {reason}"
-        )
+        if not isinstance(proposed_fault, dict) or not all(
+            proposed_fault.get(field)
+            for field in ("scope", "target", "action")
+        ):
+            return (
+                "Error: proposed_fault must include the complete "
+                "fault identity: scope, target, and action."
+            )
+        return f"Plan change proposed. Reason: {reason}"
 
     def _fuzzy_match_script(requested: str, available: list[str]) -> str | None:
         """Suggest a similar script name using simple prefix/suffix matching."""
@@ -559,16 +717,15 @@ async def create_agent(
     #   - submit_fault_intent = inject flow
     #   - submit_batch_intent = batch inject flow
     #   - recover_task = recover flow
-    #   - kubectl_ro / activate_skill / read_skill_resource = ReAct within turn
+    #   - activate_skill / read_skill_resource = semantic catalog lookup
+    #   - provider PLAN tools = read-only discovery of the current environment
     #
-    # ``kubectl_ro`` (NOT full ``kubectl``) — same rationale as phase1_tools:
-    # intent_clarification is a pre-planning stage; only read-only inspection
-    # is appropriate. Full kubectl was the bypass vector in sess_1e39e8f4dcce
-    # where the LLM called `kubectl scale` to directly mutate kube-system.
-    from chaos_agent.agent.nodes.intent_clarification import submit_fault_intent, submit_batch_intent, query_active_experiments, recover_task
+    # Intent always receives the complete skill catalog. Its discovery tool
+    # binding is selected from the active transport only, so it can inspect
+    # targets without making the supported fault vocabulary transport-dependent.
+    from chaos_agent.agent.nodes.planning.intent_clarification import submit_fault_intent, submit_batch_intent, query_active_experiments, recover_task
 
     clarification_tools = [
-        kubectl_ro,
         _activate_skill,
         _read_skill_resource,
         submit_fault_intent,
@@ -576,50 +733,32 @@ async def create_agent(
         query_active_experiments,
         recover_task,
     ]
+    from chaos_agent.agent.providers import EXECUTE, PLAN, RECOVER_VERIFY, VERIFY
+    clarification_tools = _append_provider_tools(clarification_tools, PLAN)
     if mcp_manager is not None:
         clarification_tools = clarification_tools + mcp_manager.tools_for_phase("clarification")
 
     # P1-1: Phase 1 (planning / agent_loop) — tightened tool surface.
-    # Phase 1 (agent_loop / planning) tool surface.
     #
-    # ``blade_create`` is REMOVED from this list — that was the original
-    # safety bug. ChaosBlade has no dry-run mode, so any call to
-    # ``blade_create`` with real parameters performs the actual fault
-    # injection. The whole point of the
-    # ``agent_loop → safety_check → confirmation_gate → execute_loop``
-    # pipeline is that the user sees the final plan + safety_status
-    # BEFORE any destructive action. Binding ``blade_create`` to the
-    # planner handed it a direct path past Layer 2 — caught in session
-    # sess_dd91ed7271b2 where the planner attempted ``blade_create``
-    # four times during ``agent_loop``, before ``confirmation_gate``
-    # fired; only a transient K8s API connection error prevented an
-    # unauthorised injection.
+    # The backend planning tools (ChaosBlade ``blade_help`` / ``blade_status``,
+    # kubectl-native ``kubectl_read``) are contributed by the PLAN-phase provider
+    # union below, NOT hardcoded here — see ChaosbladeProvider.tools /
+    # K8sNativeProvider.tools for the per-tool safety rationale. The critical
+    # Phase-1 invariants those docstrings enforce:
+    #   - ``blade_create`` ABSENT from planning — ChaosBlade has no dry-run mode,
+    #     so binding it here handed the planner a path past the confirmation gate
+    #     (caught in sess_dd91ed7271b2: four ``blade_create`` attempts during
+    #     ``agent_loop`` before ``confirmation_gate`` fired).
+    #   - ``blade_destroy`` ABSENT — it mutates cluster state; partial-create
+    #     cleanup belongs to Phase 2 ReAct (UID-provenance guarded).
+    #   - ``kubectl_read`` (NOT full ``kubectl``) — full kubectl was the bypass
+    #     vector in task-ce9647931ce1 (``kubectl exec <pod> -- blade create``);
+    #     ``kubectl_read``'s ``Literal`` subcommand constraint + read-only exec
+    #     gating block it.
     #
-    # ``blade_destroy`` REMOVED from phase1_tools (post-task-ce9647931ce1):
-    # it mutates cluster state, so leaving it in the schema only to let
-    # the phase1_screener reject it at runtime would burn LLM turns on a
-    # tool the LLM "sees" but can't actually use. Per the user goal of
-    # "have the LLM go right on the first try, not via error-recovery",
-    # the only consistent choice is to hide it from Phase 1 entirely.
-    # Orphan cleanup is deferred to a future ``pre_execute_cleanup`` node
-    # that runs deterministically (no LLM dispatch) between
-    # confirmation_gate and execute_loop.
-    #
-    # ``blade_status`` STAYS — read-only: lists current experiments,
-    # confirms ChaosBlade is installed.
-    # ``kubectl_ro`` (NOT full ``kubectl``) — read-only target inspection
-    # only (get / describe / top / logs / version / cluster-info /
-    # api-resources / explain / auth). The full ``kubectl`` was the
-    # bypass vector in task-ce9647931ce1: with full kubectl bound here,
-    # the LLM that撞 the blade_create blacklist pivoted to
-    # ``kubectl exec <chaosblade-controller-pod> -- blade create ...``
-    # and injected anyway. ``kubectl_ro``'s ``Literal`` type
-    # constraint on ``subcommand`` makes that bypass impossible at the
-    # tool-schema level.
-    #
-    # Excludes ``write_file`` / ``search_files`` /
-    # ``execute_skill_script`` for the same "planning is read-only +
-    # save_fault_plan" reason.
+    # This static base excludes ``write_file`` / ``search_files`` /
+    # ``execute_skill_script`` for the "planning is read-only + save_fault_plan"
+    # reason.
     phase1_tools = [
         _activate_skill,
         _read_skill_resource,
@@ -627,42 +766,46 @@ async def create_agent(
         _save_fault_plan,
         _finish_planning,
         _propose_plan_change,
-        blade_help,
-        blade_status,
-        # blade_destroy intentionally absent — see comment above
-        kubectl_ro,                # ← was: kubectl (full surface)
         read_knowledge_resource,
     ]
     if mcp_manager is not None:
         phase1_tools = phase1_tools + mcp_manager.tools_for_phase("phase1")
+    # Provider tool union (plan phase). Contributes the read-only backend
+    # planning tools: ChaosBlade's ``blade_help`` / ``blade_status`` and
+    # kubectl-native's ``kubectl_read`` (NOT full kubectl — see K8sNativeProvider.
+    # tools docstring). ``blade_create`` / ``blade_destroy`` / full ``kubectl``
+    # are execute-only and never surface here.
+    phase1_tools = _append_provider_tools(phase1_tools, PLAN)
 
     # P1-1: Phase 2 (execution / execute_loop) — tightened tool surface.
-    # Excludes blade_destroy and read_skill_resource:
-    #   - blade_destroy: destruction is framework-controlled (recover graph
-    #     or replan), the executor must not abort experiments mid-run.
-    #   - read_skill_resource: skill content was loaded in Phase 1 and is
-    #     already embedded in the execution prompt; re-reading wastes tokens.
+    # Excludes read_skill_resource. ``blade_destroy`` is available for ReAct
+    # cleanup of a partial/failed create, but the screener only permits UIDs
+    # observed in this task's own blade_create ToolMessages.
+    #   - read_skill_resource: NOT bound here. Phase 2 executes the APPROVED PLAN
+    #     produced in Phase 1 (injected into the execute prompt via ``plan`` /
+    #     ``plan_path``); planning already distilled the skill use-case into that
+    #     plan, so re-reading the raw case during execution is unnecessary.
     from chaos_agent.tools.wait import time_wait
+    from chaos_agent.agent.replan import request_replan
     phase2_tools = [
-        blade_create,
-        blade_help,
-        blade_status,
-        blade_query_k8s,
-        kubectl,
         _execute_skill_script,
         read_knowledge_resource,
         time_wait,
+        request_replan,
     ]
     if mcp_manager is not None:
         phase2_tools = phase2_tools + mcp_manager.tools_for_phase("phase2")
+    # Provider tool union (execute phase). Contributes the injection carriers:
+    # ChaosBlade's ``blade_create`` / ``blade_destroy`` / ``blade_help`` /
+    # ``blade_status`` / ``blade_query_k8s``, kubectl-native's full ``kubectl``,
+    # and host-shell's ``host_inject`` (superset of ``host_read``).
+    phase2_tools = _append_provider_tools(phase2_tools, EXECUTE)
 
     # submit_verification (Scheme B): control-signal tool the verifier LLM
     # calls to submit a structured verdict and end verification.
     # route_after_verifier_tools routes its execution to finalize_verification.
-    from chaos_agent.agent.nodes._verifier_submit import submit_verification
-    from chaos_agent.tools.kubectl import kubectl_verify
+    from chaos_agent.agent.nodes.verify._verifier_submit import submit_verification
     verifier_tools = [
-        kubectl_verify,
         _read_skill_resource,
         _execute_skill_script,
         read_knowledge_resource,
@@ -671,11 +814,12 @@ async def create_agent(
     ]
     if mcp_manager is not None:
         verifier_tools = verifier_tools + mcp_manager.tools_for_phase("verifier")
+    # Provider tool union (verify phase). Contributes kubectl-native's read-only
+    # ``kubectl_read`` and host-shell's read-only ``host_read``.
+    verifier_tools = _append_provider_tools(verifier_tools, VERIFY)
 
-    from chaos_agent.agent.nodes._verifier_submit import submit_recover_verification
+    from chaos_agent.agent.nodes.verify._verifier_submit import submit_recover_verification
     recover_verifier_tools = [
-        kubectl,
-        kubectl_verify,
         _read_skill_resource,
         _execute_skill_script,
         read_knowledge_resource,
@@ -686,6 +830,10 @@ async def create_agent(
         # Recover verifier shares the same MCP attach_to as the inject
         # verifier phase — both are read-only verification work.
         recover_verifier_tools = recover_verifier_tools + mcp_manager.tools_for_phase("verifier")
+    # Provider tool union (recover-verify phase). Contributes kubectl-native's
+    # full ``kubectl`` (run the reverse op; superset of ``kubectl_read``) and
+    # host-shell's ``host_inject`` (superset of ``host_read``).
+    recover_verifier_tools = _append_provider_tools(recover_verifier_tools, RECOVER_VERIFY)
 
     # Set up checkpointer
     conn = None  # connection/pool ref for cleanup
@@ -693,8 +841,8 @@ async def create_agent(
         from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
         serde = JsonPlusSerializer(
             allowed_msgpack_modules=[
-                ("chaos_agent.agent.verdict", "Layer1Status"),
-                ("chaos_agent.agent.verdict", "FailureCategory"),
+                ("chaos_agent.agent.result.verdict", "Layer1Status"),
+                ("chaos_agent.agent.result.verdict", "FailureCategory"),
             ],
         )
 

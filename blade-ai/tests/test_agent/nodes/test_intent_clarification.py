@@ -1,15 +1,15 @@
 """Tests for intent_clarification node — dialogue, routing, and fault convergence."""
 
 from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from tests._helpers import intent_dict_from_result
-from chaos_agent.agent.nodes.intent_clarification import (
+from chaos_agent.agent.nodes.planning.intent_clarification import (
     _allocate_operation_task_id,
     _extract_recover_task_id,
-    _merge_known_params_into_fault_intent,
     submit_fault_intent,
     recover_task,
     MAX_DIALOGUE_ROUNDS,
@@ -129,6 +129,7 @@ class TestSubmitFaultIntentTool:
             "scope": "node",
             "target": "cpu",
             "action": "fullload",
+            "fault_revision": 0,
             "namespace": "default",
         })
         assert "已提交" in result
@@ -141,6 +142,7 @@ class TestSubmitFaultIntentTool:
             "scope": "pod",
             "target": "network",
             "action": "drop",
+            "fault_revision": 0,
             "namespace": "cms-demo",
             "labels": {"app": "nginx"},
             "params": {"interface": "eth0", "timeout": "600"},
@@ -156,6 +158,7 @@ class TestSubmitFaultIntentTool:
             "scope": "node",
             "target": "cpu",
             "action": "fullload",
+            "fault_revision": 0,
         })
         assert "已提交" in result
 
@@ -197,6 +200,7 @@ class TestSubmitFaultIntentTool:
             "scope": "node",
             "target": "disk",
             "action": "fill",
+            "fault_revision": 0,
             "namespace": "cms-demo",
             "names": '["cn-hongkong.10.0.1.101"]',
         })
@@ -210,6 +214,7 @@ class TestSubmitFaultIntentTool:
             "scope": "node",
             "target": "disk",
             "action": "fill",
+            "fault_revision": 0,
             "namespace": "cms-demo",
             "names": '["cn-hongkong.10.0.1.101"]',
             "labels": '{"app": "nginx"}',
@@ -227,6 +232,7 @@ class TestSubmitFaultIntentTool:
             "scope": "pod",
             "target": "network",
             "action": "drop",
+            "fault_revision": 0,
             "namespace": "cms-demo",
             "names": '["pod-a", "pod-b"]',
             "labels": '{"app": "nginx", "tier": "frontend"}',
@@ -244,6 +250,7 @@ class TestSubmitFaultIntentTool:
             "scope": "pod",
             "target": "cpu",
             "action": "fullload",
+            "fault_revision": 0,
             "namespace": "cms-demo",
             "names": ["accounting-7d4f"],
             "params": {"percent": "80", "timeout": "300"},
@@ -264,6 +271,7 @@ class TestSubmitFaultIntentTool:
         # validation (and breaks the resilience promise) is caught.
         validated = submit_fault_intent.args_schema.model_validate({
             "fault_type": "x", "scope": "x", "target": "x", "action": "x",
+            "fault_revision": 0,
             "params": ["this", "is", "a", "list"],   # dict expected
             "labels": "not-a-json-object",
         })
@@ -278,6 +286,7 @@ class TestSubmitFaultIntentTool:
         # always emitting JSON arrays, losing a degree of robustness.
         validated = submit_fault_intent.args_schema.model_validate({
             "fault_type": "x", "scope": "pod", "target": "x", "action": "x",
+            "fault_revision": 0,
             "names": "single-pod-name",
         })
         assert validated.names == ["single-pod-name"]
@@ -439,6 +448,91 @@ class TestIntentClarificationNode:
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_host_intent_fast_path_does_not_require_namespace(self):
+        """Semantic host intents converge before transport-aware feasibility."""
+        mock_llm = AsyncMock()
+        messages = [
+            HumanMessage(content="对主机 host-1 注入 CPU 压力", id="human_host"),
+            AIMessage(
+                content="",
+                tool_calls=[_submit_fault_tc(
+                    fault_type="host-cpu-fullload",
+                    scope="host",
+                    target="cpu",
+                    action="fullload",
+                    namespace="",
+                    names=["host-1"],
+                )],
+                id="ai_host_submit",
+            ),
+            ToolMessage(
+                content="✓ 故障注入意图已提交",
+                name="submit_fault_intent",
+                tool_call_id="call_submit_1",
+            ),
+        ]
+
+        result = await make_intent_clarification(llm=mock_llm)({
+            "confirmed_intent": None,
+            "messages": messages,
+            "clarification_round": 0,
+            "dialogue_round": 1,
+            "fault_intent": {},
+        })
+
+        assert result["confirmed_intent"] == "inject"
+        assert intent_dict_from_result(result)["scope"] == "host"
+        assert intent_dict_from_result(result)["namespace"] == ""
+        mock_llm.bind_tools.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_intent_binding_keeps_semantics_global_and_discovery_transport_aware(self):
+        """Transport selects read-only probes, not the fault catalog or semantic tools."""
+        response = _make_llm_response(content="请补充故障强度。")
+        bound_llm = MagicMock()
+        bound_llm.ainvoke = AsyncMock(return_value=response)
+        llm = MagicMock()
+        llm.bind_tools = MagicMock(return_value=bound_llm)
+        tools = [
+            SimpleNamespace(name="kubectl_read"),
+            SimpleNamespace(name="host_read"),
+            SimpleNamespace(name="activate_skill"),
+            SimpleNamespace(name="read_skill_resource"),
+            SimpleNamespace(name="submit_fault_intent"),
+        ]
+        node = make_intent_clarification(llm=llm, tools=tools)
+
+        for state in (
+            {"kube_connection_mode": "ssh", "ssh_host": "host-1"},
+            {"kube_connection_mode": "kubeconfig"},
+        ):
+            await node({
+                **state,
+                "confirmed_intent": None,
+                "messages": [HumanMessage(content="注入 CPU 故障")],
+                "clarification_round": 0,
+                "dialogue_round": 0,
+            })
+
+        bound_names = [
+            {tool.name for tool in call.args[0]}
+            for call in llm.bind_tools.call_args_list
+        ]
+        semantic_tools = {"activate_skill", "read_skill_resource", "submit_fault_intent"}
+        assert semantic_tools <= bound_names[0]
+        assert semantic_tools <= bound_names[1]
+        assert "host_read" in bound_names[0]
+        assert "kubectl_read" not in bound_names[0]
+        assert "kubectl_read" in bound_names[1]
+        assert "host_read" not in bound_names[1]
+
+        prompts = [
+            call.args[0][0].content
+            for call in bound_llm.ainvoke.call_args_list
+        ]
+        assert prompts[0] == prompts[1]
+
+    @pytest.mark.asyncio
     async def test_fast_path_detects_submit_in_tool_batch(self):
         """Fast-path works even if submit_fault_intent is not the last
         ToolMessage in a batch (e.g. model called both kubectl and
@@ -580,6 +674,7 @@ class TestIntentClarificationNode:
             "scope": "pod",
             "target": "cpu",
             "action": "fullload",
+            "fault_revision": 0,
             "namespace": "default",
         })
         assert "已提交" in result
@@ -850,15 +945,16 @@ class TestExtractSubmitArgsCoercion:
 
 
 class TestFastPathLLMArgsPriority:
-    """Cover the LLM-args-first / programmatic-fallback merge logic.
+    """Pin the fast-path bootstrap contract for structured submits.
 
-    The fast-path now reads structured args directly from the most
-    recent submit_fault_intent tool_call, with the regex-based
-    ``_merge_known_params_into_fault_intent`` reduced to a safety net
-    for legacy LLM builds that pass partial / no args. These four
-    cases pin the priority ordering:
-
-      existing fault_intent  <  programmatic fallback  <  LLM args (when non-empty)
+    The 089212f refactor removed the regex-based
+    ``_merge_known_params_into_fault_intent`` prose fallback entirely.
+    When no reviewed ``fault_spec`` exists in state, the fast-path
+    bootstraps a contract strictly from the ``submit_fault_intent``
+    tool_call args (``_bootstrap_submitted_spec``) — natural-language
+    history is never mined. A bootstrap succeeds only if the resulting
+    spec ``is_complete``; otherwise the node returns a clarification
+    message rather than advancing to ``inject``.
     """
 
     @pytest.mark.asyncio
@@ -909,21 +1005,15 @@ class TestFastPathLLMArgsPriority:
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_llm_partial_args_fallback_fills_gap(self):
-        """LLM omits namespace; regex fallback recovers it from the
-        AI summary's ``**命名空间**：default`` line."""
+    async def test_node_scope_omitted_namespace_still_bootstraps(self):
+        """node scope is cluster-scoped, so ``is_complete`` does not
+        require a namespace. A structured submit that omits it still
+        bootstraps a complete contract and advances to inject — the
+        namespace simply stays empty (no regex recovery, no default
+        fill). This replaces the old ``partial_args_fallback`` test
+        whose premise (regex mining the AI summary for
+        ``**命名空间**：default``) no longer exists post-089212f."""
         mock_llm = AsyncMock()
-        ai_summary = AIMessage(
-            content=(
-                "故障注入意图摘要：\n"
-                "* **故障类型**：CPU 满载\n"
-                "* **作用范围**：Node\n"
-                "* **目标节点**：cn-hongkong.10.0.1.101\n"
-                "* **命名空间**：default (节点级故障默认)"
-            ),
-            id="ai_summary_1",
-        )
-        # Now the LLM sends submit_fault_intent but forgets namespace.
         ai_submit = AIMessage(
             content="",
             tool_calls=[_submit_fault_tc(
@@ -931,7 +1021,7 @@ class TestFastPathLLMArgsPriority:
                 scope="node",
                 target="cpu",
                 action="fullload",
-                namespace="",  # ← forgotten
+                namespace="",  # ← omitted; node scope doesn't require it
                 names=["cn-hongkong.10.0.1.101"],
             )],
             id="ai_submit_1",
@@ -943,8 +1033,6 @@ class TestFastPathLLMArgsPriority:
         )
         messages = [
             HumanMessage(content="注入cpu故障", id="h1"),
-            ai_summary,
-            HumanMessage(content="确认", id="h2"),
             ai_submit,
             tool_msg,
         ]
@@ -954,26 +1042,27 @@ class TestFastPathLLMArgsPriority:
             "messages": messages,
             "clarification_round": 0,
             "dialogue_round": 3,
-            "fault_intent": {},
+            "fault_spec": None,  # no reviewed contract → bootstrap path
         })
         assert result["confirmed_intent"] == "inject"
-        # Namespace recovered by either: (a) regex fallback parsing the
-        # AI summary, or (b) node-scope default. Either is acceptable
-        # — both produce ``default`` for this case.
-        assert intent_dict_from_result(result)["namespace"] == "default"
-        # LLM-supplied fields still win where present.
-        assert intent_dict_from_result(result)["fault_type"] == "node-cpu-fullload"
-        assert intent_dict_from_result(result)["names"] == ["cn-hongkong.10.0.1.101"]
+        fi = intent_dict_from_result(result)
+        assert fi["scope"] == "node"
+        assert fi["target"] == "cpu"
+        assert fi["action"] == "fullload"
+        # No prose mining and no default fill — namespace stays empty.
+        assert fi["namespace"] == ""
+        assert fi["names"] == ["cn-hongkong.10.0.1.101"]
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_llm_no_args_fallback_does_everything(self):
-        """Older qwen builds may emit submit_fault_intent with empty args.
-        The fallback regex extractor must still produce a complete
-        intent — behaviour identical to the pre-fix code path."""
+    async def test_empty_args_cannot_bootstrap(self):
+        """Older qwen builds that emit ``submit_fault_intent`` with empty
+        args used to be rescued by the regex fallback. That fallback is
+        gone: an empty-args submit yields an incomplete bootstrap spec,
+        so the node refuses to advance and asks the user to re-confirm
+        against the reviewed contract instead of inventing one from
+        dialogue prose."""
         mock_llm = AsyncMock()
-        # Simulated old qwen: tool_call with no recognisable structured
-        # args. ``_extract_submit_args`` returns {} → fallback runs.
         ai_submit = AIMessage(
             content="",
             tool_calls=[{
@@ -988,10 +1077,8 @@ class TestFastPathLLMArgsPriority:
             name="submit_fault_intent",
             tool_call_id="call_submit_1",
         )
-        # Conversation history packed with regex-extractable signals so
-        # the fallback can still complete the intent. The AI summary
-        # uses the markdown-bold ``**命名空间**：cms-demo`` shape that
-        # the production-shaped regex (post-bug-fix) recognises.
+        # History still packed with the signals the old regex would
+        # have mined — proving they are NO LONGER consulted.
         messages = [
             HumanMessage(content="对 pod 注入 cpu 故障", id="h1"),
             AIMessage(
@@ -1014,32 +1101,33 @@ class TestFastPathLLMArgsPriority:
             "messages": messages,
             "clarification_round": 0,
             "dialogue_round": 2,
-            "fault_intent": {},
+            "fault_spec": None,
         })
-        assert result["confirmed_intent"] == "inject"
-        fi = intent_dict_from_result(result)
-        # Regex fallback recovers all four required fields.
-        assert fi["scope"] == "pod"
-        assert fi["target"] == "cpu"
-        assert fi["action"] == "fullload"
-        assert fi["namespace"] == "cms-demo"
+        # No bootstrap possible → not advanced to inject.
+        assert result.get("confirmed_intent") != "inject"
+        assert result["dialogue_round"] == 3
+        # A clarification AIMessage is returned rather than a contract.
+        assert intent_dict_from_result(result) == {}
+        ai_msgs = [m for m in result.get("messages", []) if isinstance(m, AIMessage)]
+        assert len(ai_msgs) == 1
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_node_scope_default_namespace_when_omitted(self):
-        """LLM passes scope='node' but omits namespace and the dialogue
-        contains no namespace hint anywhere — node-scope convention
-        default ``"default"`` applies so the required check still passes."""
+    async def test_pod_scope_missing_namespace_cannot_bootstrap(self):
+        """pod scope requires a namespace for ``is_complete``. A submit
+        that omits it (and no reviewed spec exists to inherit from)
+        bootstraps an incomplete spec, so the fast-path declines to
+        advance — the mirror image of the node-scope case above."""
         mock_llm = AsyncMock()
         ai_submit = AIMessage(
             content="",
             tool_calls=[_submit_fault_tc(
-                fault_type="node-cpu-fullload",
-                scope="node",
+                fault_type="pod-cpu-fullload",
+                scope="pod",
                 target="cpu",
                 action="fullload",
-                namespace="",  # ← omitted, no dialogue hint either
-                names=["cn-hongkong.10.0.1.101"],
+                namespace="",  # ← pod scope MUST have one
+                names=["nginx-1"],
             )],
             id="ai_submit_1",
         )
@@ -1048,12 +1136,8 @@ class TestFastPathLLMArgsPriority:
             name="submit_fault_intent",
             tool_call_id="call_submit_1",
         )
-        # Deliberately sparse history — no namespace mentions anywhere
-        # so neither LLM nor regex can produce one. Only the node-scope
-        # default kicks in.
         messages = [
-            HumanMessage(content="对节点注入 CPU 故障", id="h1"),
-            HumanMessage(content="cn-hongkong.10.0.1.101", id="h2"),
+            HumanMessage(content="对 pod 注入 cpu 故障", id="h1"),
             ai_submit,
             tool_msg,
         ]
@@ -1063,11 +1147,10 @@ class TestFastPathLLMArgsPriority:
             "messages": messages,
             "clarification_round": 0,
             "dialogue_round": 2,
-            "fault_intent": {},
+            "fault_spec": None,
         })
-        assert result["confirmed_intent"] == "inject"
-        assert intent_dict_from_result(result)["scope"] == "node"
-        assert intent_dict_from_result(result)["namespace"] == "default"
+        assert result.get("confirmed_intent") != "inject"
+        assert intent_dict_from_result(result) == {}
         mock_llm.bind_tools.assert_not_called()
 
 
@@ -1138,11 +1221,24 @@ class TestHookIntegration:
 
         mock_llm = AsyncMock()
 
-        # Simulate 6 messages in state + final ToolMessage from submit_fault_intent
+        # Simulate 5 prior messages + the submit AIMessage/ToolMessage pair.
+        # The submit tool_call must replay the reviewed spec exactly
+        # (revision + every executable field), otherwise the fast-path
+        # rejects the submission instead of advancing to inject.
         old_messages = [
             HumanMessage(content=f"msg-{i}", id=f"msg_id_{i}")
             for i in range(5)
         ]
+        ai_submit = AIMessage(
+            content="",
+            tool_calls=[_submit_fault_tc(
+                scope="pod", target="cpu", action="fullload",
+                namespace="default", labels={"app": "myapp"},
+                fault_revision=0,
+            )],
+            id="ai_submit_trim",
+        )
+        old_messages.append(ai_submit)
         tool_msg = ToolMessage(
             content="✓ 故障注入意图已提交",
             name="submit_fault_intent",
@@ -1152,7 +1248,7 @@ class TestHookIntegration:
         old_messages.append(tool_msg)
 
         node = make_intent_clarification(llm=mock_llm)
-        from chaos_agent.agent.fault_spec import FaultSpec
+        from chaos_agent.agent.spec.fault_spec import FaultSpec
         _spec = FaultSpec(
             scope="pod", blade_target="cpu", blade_action="fullload",
             namespace="default", labels={"app": "myapp"},
@@ -1210,6 +1306,16 @@ class TestHookIntegration:
             HumanMessage(content=f"msg-{i}", id=f"msg_id_{i}")
             for i in range(5)
         ]
+        ai_submit = AIMessage(
+            content="",
+            tool_calls=[_submit_fault_tc(
+                scope="pod", target="cpu", action="fullload",
+                namespace="default", labels={"app": "myapp"},
+                fault_revision=0,
+            )],
+            id="ai_submit_hook",
+        )
+        old_messages.append(ai_submit)
         tool_msg = ToolMessage(
             content="✓ 故障注入意图已提交",
             name="submit_fault_intent",
@@ -1219,7 +1325,7 @@ class TestHookIntegration:
         old_messages.append(tool_msg)
 
         node = make_intent_clarification(llm=mock_llm, hook=mock_hook)
-        from chaos_agent.agent.fault_spec import FaultSpec
+        from chaos_agent.agent.spec.fault_spec import FaultSpec
         _spec_hook = FaultSpec(
             scope="pod", blade_target="cpu", blade_action="fullload",
             namespace="default", labels={"app": "myapp"},
@@ -1241,209 +1347,60 @@ class TestHookIntegration:
         assert remove_msgs[0].id == "hook_remove_1"
 
 
-class TestMergeKnownParams:
-    """Tests for _merge_known_params_into_fault_intent — programmatic
-    parameter extraction from HumanMessage text."""
+class TestReviewedFaultSpecSection:
+    """``get_intent_completeness_section`` now injects the reviewed FaultSpec
+    contract (JSON) rather than a completeness/still-missing checklist.
 
-    def test_scope_extraction(self):
-        msgs = [HumanMessage(content="给 pod 注入 CPU 故障")]
-        merged = _merge_known_params_into_fault_intent(msgs, {})
-        assert merged["scope"] == "pod"
-        assert merged["target"] == "cpu"
-
-    def test_target_extraction_from_chinese(self):
-        msgs = [HumanMessage(content="压测一下内存")]
-        merged = _merge_known_params_into_fault_intent(msgs, {})
-        assert merged["target"] == "mem"
-
-    def test_write_once_prevents_overwrite(self):
-        msgs = [HumanMessage(content="pod CPU 故障")]
-        merged = _merge_known_params_into_fault_intent(msgs, {"scope": "node"})
-        # Already set to "node" — should not overwrite to "pod"
-        assert merged["scope"] == "node"
-
-    def test_override_signal_allows_update(self):
-        msgs = [HumanMessage(content="改成 pod scope")]
-        merged = _merge_known_params_into_fault_intent(msgs, {"scope": "node"})
-        # Override mode — "改成" allows updating
-        assert merged["scope"] == "pod"
-
-    def test_action_derived_from_target(self):
-        msgs = [HumanMessage(content="给 pod 注入网络故障")]
-        merged = _merge_known_params_into_fault_intent(msgs, {})
-        assert merged["target"] == "network"
-        assert merged["action"] == "drop"
-
-    def test_existing_action_not_overwritten(self):
-        msgs = [HumanMessage(content="pod 网络")]
-        merged = _merge_known_params_into_fault_intent(msgs, {"action": "drop"})
-        # action already set — derivation shouldn't overwrite
-        assert merged["action"] == "drop"
-
-    def test_percent_extraction(self):
-        msgs = [HumanMessage(content="CPU 占用 80%")]
-        merged = _merge_known_params_into_fault_intent(msgs, {})
-        assert merged.get("params", {}).get("percent") == "80"
-
-    def test_timeout_extraction(self):
-        msgs = [HumanMessage(content="时间 600秒")]
-        merged = _merge_known_params_into_fault_intent(msgs, {})
-        assert merged.get("params", {}).get("timeout") == "600"
-
-    def test_empty_messages_no_change(self):
-        merged = _merge_known_params_into_fault_intent([], {"scope": "pod"})
-        assert merged == {"scope": "pod"}
-
-    def test_multiple_messages_latest_wins(self):
-        msgs = [
-            HumanMessage(content="给 node 注入故障"),
-            HumanMessage(content="pod CPU 80%"),
-        ]
-        merged = _merge_known_params_into_fault_intent(msgs, {})
-        # Reversed iteration: latest message first → "pod" wins
-        assert merged["scope"] == "pod"
-
-
-class TestExtractNamesSourceContract:
-    """Pin the ``source`` contract on ``_extract_names``.
-
-    Production crash this defends against: in session sess_94082a67c656
-    the agent ran ``kubectl get nodes`` and listed every returned node
-    back to the user as "以下是集群中的节点列表：- X - Y - Z" (12
-    bare node names in a markdown bullet block). Greedy bare-name
-    regex on that AIMessage harvested ALL 12 names into
-    ``fault_intent.names``, which the Confirmed Parameters prompt
-    section then surfaced as "names already confirmed (12 nodes)".
-    The user had picked exactly one — the LLM's reasoning_content
-    ended up debating "do I trust the user or the prompt?". We
-    suppress the bare-name path on AI source so list dumps cannot
-    poison the merged intent.
+    ``FaultSpec.from_dict`` reads the state-persistence shape
+    (``blade_target`` / ``blade_action``), and the section renders
+    ``to_intent_dict`` (``target`` / ``action``) inside a ``faults`` array.
     """
 
-    def test_ai_listing_does_not_harvest_bare_names(self):
-        # The exact AIMessage shape from the failing session.
-        from chaos_agent.agent.nodes.intent_clarification import (
-            _extract_names,
+    def _spec(self, **overrides):
+        base = {
+            "scope": "pod",
+            "blade_target": "cpu",
+            "blade_action": "fullload",
+            "namespace": "default",
+            "names": ["nginx"],
+            "revision": 2,
+        }
+        base.update(overrides)
+        return base
+
+    def test_no_spec_reports_none_collected(self):
+        for section in (
+            get_intent_completeness_section(),
+            get_intent_completeness_section(None),
+            get_intent_completeness_section({}),  # empty dict → from_dict None
+        ):
+            assert "# Reviewed FaultSpec" in section
+            assert "No FaultSpec has been collected yet." in section
+
+    def test_single_spec_rendered_as_contract_json(self):
+        section = get_intent_completeness_section(self._spec())
+        assert "# Reviewed FaultSpec" in section
+        assert "Current contract:" in section
+        assert '"faults"' in section
+        assert '"scope": "pod"' in section
+        assert '"target": "cpu"' in section
+        assert '"action": "fullload"' in section
+
+    def test_server_owned_revision_is_surfaced(self):
+        section = get_intent_completeness_section(self._spec(revision=7))
+        assert '"revision": 7' in section
+        # The guidance must instruct the LLM to preserve the revision.
+        assert "revision" in section
+
+    def test_batch_faults_render_multiple(self):
+        section = get_intent_completeness_section(
+            batch_faults=[
+                self._spec(scope="pod", blade_target="cpu"),
+                self._spec(scope="node", blade_target="disk",
+                           blade_action="fill", names=["node-a"]),
+            ],
         )
-        text = (
-            "以下是集群中的节点列表：\n\n"
-            "- cn-hongkong.10.0.1.101\n"
-            "- cn-hongkong.10.0.1.120\n"
-            "- cn-hongkong.10.0.1.154\n"
-            "- cn-hongkong.10.0.1.38\n"
-            "- cn-hongkong.10.0.1.51\n"
-            "- cn-hongkong.10.0.1.60\n"
-            "- cn-hongkong.10.0.1.61\n"
-            "- cn-hongkong.10.0.1.62\n"
-            "- cn-hongkong.10.0.1.63\n"
-            "- cn-hongkong.10.0.1.79\n"
-            "- cn-hongkong.10.0.16.55\n"
-            "- cn-hongkong.10.0.16.56\n"
-        )
-        # Source ``ai`` must reject the greedy match.
-        assert _extract_names(text, source="ai") == []
+        assert '"scope": "pod"' in section
+        assert '"scope": "node"' in section
+        assert '"target": "disk"' in section
 
-    def test_ai_ack_pattern_still_yields_single_name(self):
-        # The bounded ack pattern is still honoured for AI source —
-        # it can only produce one name, so it cannot poison the merge.
-        from chaos_agent.agent.nodes.intent_clarification import (
-            _extract_names,
-        )
-        text = "好的，**目标节点**已确认为 cn-hongkong.10.0.1.63。"
-        assert _extract_names(text, source="ai") == ["cn-hongkong.10.0.1.63"]
-
-    def test_human_source_keeps_greedy_multi_match(self):
-        # User typing two nodes in one message is legitimate; the
-        # human path must keep the greedy behaviour.
-        from chaos_agent.agent.nodes.intent_clarification import (
-            _extract_names,
-        )
-        text = "对 cn-hongkong.10.0.1.63 和 cn-hongkong.10.0.1.79 注入"
-        names = _extract_names(text, source="human")
-        assert "cn-hongkong.10.0.1.63" in names
-        assert "cn-hongkong.10.0.1.79" in names
-
-    def test_default_source_any_back_compat(self):
-        # Direct callers without the source kwarg keep the pre-fix
-        # greedy behaviour to avoid breaking unrelated code paths.
-        from chaos_agent.agent.nodes.intent_clarification import (
-            _extract_names,
-        )
-        text = "对 cn-hongkong.10.0.1.63 和 cn-hongkong.10.0.1.79"
-        names = _extract_names(text)
-        assert len(names) == 2
-
-    def test_merge_does_not_poison_names_from_ai_listing(self):
-        # End-to-end: the bug-shape conversation. AI lists 12 nodes;
-        # user picks 1; ``_merge_known_params_into_fault_intent``
-        # must end up with [.63] only, not [.63, .101, .120, ...].
-        msgs = [
-            HumanMessage(content="列出来", id="h1"),
-            AIMessage(
-                content=(
-                    "以下是集群中的节点列表：\n"
-                    "- cn-hongkong.10.0.1.101\n"
-                    "- cn-hongkong.10.0.1.120\n"
-                    "- cn-hongkong.10.0.1.63\n"
-                    "- cn-hongkong.10.0.1.79\n"
-                ),
-                id="ai_list",
-            ),
-            HumanMessage(content="cn-hongkong.10.0.1.63", id="h2"),
-        ]
-        merged = _merge_known_params_into_fault_intent(msgs, {})
-        assert merged.get("names") == ["cn-hongkong.10.0.1.63"]
-
-
-class TestCompletenessSignal:
-
-    def test_all_required_filled_emits_critical(self):
-        section = get_intent_completeness_section({
-            "scope": "pod", "target": "cpu", "action": "fullload",
-            "namespace": "default", "labels": "app=myapp",
-        })
-        assert "⚠️ ALL REQUIRED" in section
-        assert "submit_fault_intent" in section
-
-    def test_missing_fields_lists_them(self):
-        section = get_intent_completeness_section({"scope": "pod"})
-        assert "Still missing" in section
-        assert "target" in section
-        assert "namespace" in section
-
-    def test_pod_scope_requires_resource(self):
-        section = get_intent_completeness_section({
-            "scope": "pod", "target": "cpu", "action": "fullload", "namespace": "default",
-        })
-        # pod scope without names/labels → still missing target_resource
-        assert "target_resource" in section
-
-    def test_node_scope_requires_names(self):
-        section = get_intent_completeness_section({
-            "scope": "node", "target": "cpu", "action": "fullload", "namespace": "default",
-        })
-        assert "target_node" in section
-
-    def test_pod_with_labels_is_complete(self):
-        section = get_intent_completeness_section({
-            "scope": "pod", "target": "cpu", "action": "fullload",
-            "namespace": "default", "labels": "app=myapp",
-        })
-        assert "⚠️ ALL REQUIRED" in section
-
-    def test_empty_intent_lists_all_required(self):
-        section = get_intent_completeness_section({})
-        assert "scope" in section
-        assert "target" in section
-
-    def test_empty_fault_intent_returns_empty_string(self):
-        # None fault_intent → no dynamic section
-        section = get_intent_completeness_section(None)
-        assert section == ""
-
-    def test_confirmed_parameters_block_present(self):
-        section = get_intent_completeness_section({
-            "scope": "pod", "target": "cpu",
-        })
-        assert "Confirmed Parameters" in section
-        assert "missing" in section.lower() or "ambiguous" in section.lower()

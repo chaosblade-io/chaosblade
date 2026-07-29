@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS task_details (
     postmortem          TEXT,
     target_health_report TEXT,
     feasibility_report  TEXT,
+    execution_artifacts TEXT,
     total_token_input   INTEGER NOT NULL DEFAULT 0,
     total_token_output  INTEGER NOT NULL DEFAULT 0,
     total_llm_calls     INTEGER NOT NULL DEFAULT 0,
@@ -230,7 +231,46 @@ class SQLiteBackend:
         except Exception:
             pass
         try:
+            await conn.execute("ALTER TABLE task_details ADD COLUMN execution_artifacts TEXT")
+        except Exception:
+            pass
+        try:
             await conn.execute("ALTER TABLE task_details ADD COLUMN kubectl_exec_pod_name TEXT")
+        except Exception:
+            pass
+        try:
+            # ``injection_start_time`` — the only field written exactly when an
+            # injection command is *issued* (execute_loop / direct_execute set
+            # it write-once and never clear it, unlike ``injection_method``).
+            # ``select_active_tasks`` needs it to tell "confirmed but never
+            # executed" apart from "really injected".
+            await conn.execute("ALTER TABLE task_details ADD COLUMN injection_start_time TEXT")
+            # One-shot backfill, deliberately INSIDE this try: it runs only on
+            # the migration that adds the column (on later startups the ALTER
+            # raises and we skip).
+            #
+            # ❗ 不要把它拆成独立的 try / 让它每次启动都跑：回填条件
+            # （injection_start_time IS NULL 且有意图）恰好也匹配「方案已确认
+            # 但命令从未发出」的**新行**，每次启动重跑会给它们盖上时间戳，
+            # 永久废掉 select_active_tasks 的"已发出"判据。一次性回填失败最多
+            # 让存量行暂时不可恢复（一次性窗口），而重复回填是永久性失效。
+            #
+            # 原子性：本方法所有语句共享末尾的单次 ``conn.commit()``，因此
+            # ALTER 与 UPDATE 要么同时生效、要么都不生效 —— 不存在"列加上了
+            # 但回填没跑"的中间态。
+            #
+            # Pre-existing rows have no recorded issue time, so assume they were
+            # issued and stamp ``tasks.gmt_create`` — that keeps their current
+            # recoverable status. Excluding them instead would hide real
+            # in-flight injections, i.e. re-create the "注入了却恢复不了" bug
+            # this column exists to avoid.
+            await conn.execute(
+                "UPDATE task_details SET injection_start_time = COALESCE("
+                "  (SELECT t.gmt_create FROM tasks t WHERE t.task_id = task_details.task_id),"
+                "  gmt_create)"
+                " WHERE injection_start_time IS NULL"
+                "   AND (target IS NOT NULL OR fault_spec IS NOT NULL)"
+            )
         except Exception:
             pass
         # Migration: add tenant_id column to tasks table for multi-tenant isolation
@@ -279,18 +319,41 @@ class SQLiteBackend:
         return [_row_to_dict(r) for r in rows]
 
     async def select_active_tasks(self, namespace: str = "", target_name: str = "", tenant_id: str = "") -> list[dict]:
-        sql = "SELECT * FROM tasks WHERE task_state IN ('injecting', 'injected')"
+        # 与 PG 后端**逐字一致**的「可恢复实验」判据：落过注入意图 **且** 命令
+        # 确已发出。两处必须同改 —— 历史上只改一处，结果在下一道关卡又报同样的错。
+        #
+        # fault_spec 是规范形态、target 是遗留形态。_store_sync 会从 fault_spec
+        # 投影出 target，但全 SDK 有 4 处直接 upsert 绕过投影：
+        # cli/runner.py:264/:568（只写 fault_spec，本判据正是为它们而改）、
+        # tracer.py:229/:255（只建裸行、无意图字段，两种判据都排除）。
+        #
+        # injection_start_time 非空 = 注入命令确已发出。它是唯一写一次且**不会
+        # 被清零**的"已发出"信号（详见 PG 后端注释）。少了这条，"方案已确认但
+        # 卡在安全门、从未发出命令"的行会进可恢复列表，被恢复流程误选后报
+        # 「找不到该任务的注入状态记录」。
+        #
+        # ❗ 不得换成 skill_name / target_name / blade_uid / injection_method /
+        #    safety_status 任一判据 —— 每一条都曾（或经验证会）造成
+        #    「注入了却恢复不了」，完整踩坑记录见
+        #    task_store_postgresql.select_active_tasks。
+        sql = (
+            "SELECT t.* FROM tasks t"
+            " LEFT JOIN task_details d ON d.task_id = t.task_id"
+            " WHERE t.task_state IN ('injecting', 'injected')"
+            " AND (d.target IS NOT NULL OR d.fault_spec IS NOT NULL)"
+            " AND d.injection_start_time IS NOT NULL"
+        )
         params: list = []
         if tenant_id:
-            sql += " AND tenant_id = ?"
+            sql += " AND t.tenant_id = ?"
             params.append(tenant_id)
         if namespace:
-            sql += " AND namespace = ?"
+            sql += " AND t.namespace = ?"
             params.append(namespace)
         if target_name:
-            sql += " AND target_name = ?"
+            sql += " AND t.target_name = ?"
             params.append(target_name)
-        sql += " ORDER BY gmt_create DESC"
+        sql += " ORDER BY t.gmt_create DESC"
         conn = await self._get_conn()
         cursor = await conn.execute(sql, params)
         rows = await cursor.fetchall()

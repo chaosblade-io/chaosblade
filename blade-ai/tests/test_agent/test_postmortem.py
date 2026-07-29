@@ -393,7 +393,7 @@ class TestSaveMemoryIntegration:
 
         # Stub sync_to_store + session store + finalize so save_memory
         # only exercises the postmortem branch we care about.
-        from chaos_agent.agent.nodes import memory_nodes
+        from chaos_agent.agent.nodes.store import memory_nodes
         monkeypatch.setattr(memory_nodes, "sync_to_store", AsyncMock())
         monkeypatch.setattr(memory_nodes, "sync_node_status_to_session", lambda *a, **k: None)
 

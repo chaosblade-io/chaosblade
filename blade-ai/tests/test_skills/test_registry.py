@@ -393,7 +393,7 @@ class TestRegistryMatchUseCase:
     def test_node_disk_fill_no_regression(self, registry):
         result = registry.match_use_case("node", "disk", "fill")
         assert result is not None
-        assert "磁盘使用率" in result or "容器运行时" in result
+        assert "磁盘空间不足" in result
 
     def test_node_disk_burn_no_regression(self, registry):
         result = registry.match_use_case("node", "disk", "burn")
@@ -426,3 +426,92 @@ class TestRegistryMatchUseCase:
         result = registry.match_use_case("node", "cpu", "fullload")
         assert result is not None
         assert "CPU使用率过高" in result
+
+
+class TestRegistryMatchUseCaseHost:
+    """Host-scope selection uses the SAME matcher as k8s (``match_use_cases``
+    keyed off ``_SCOPE_PREFIX_MAP['host']`` → ``Host_``). This pins that a host
+    fault reaches the host-chaos-skills catalogue exactly like a k8s fault
+    reaches the k8s catalogue, and guards the host-only target keywords against
+    the over-match regression (see ``_TARGET_KEYWORD_MAP``)."""
+
+    @pytest.fixture
+    def registry(self):
+        registry = SkillRegistry()
+        skills_dir = Path(__file__).resolve().parents[2] / "skills"
+        if not (skills_dir / "host-chaos-skills" / "SKILL.md").exists():
+            pytest.skip("host-chaos-skills not found in project skills directory")
+        registry.load_from_directory(skills_dir)
+        return registry
+
+    # --- shared targets (cpu/mem/disk/network/process): parity with k8s ---
+
+    def test_host_cpu_fullload(self, registry):
+        result = registry.match_use_case("host", "cpu", "fullload")
+        assert result is not None
+        assert "Host_CPU使用率过高" in result
+
+    def test_host_mem_load(self, registry):
+        result = registry.match_use_case("host", "mem", "load")
+        assert result is not None
+        assert "Host_内存使用率过高" in result
+
+    def test_host_disk_fill(self, registry):
+        result = registry.match_use_case("host", "disk", "fill")
+        assert result is not None
+        assert "Host_磁盘空间不足" in result
+
+    def test_host_disk_burn(self, registry):
+        result = registry.match_use_case("host", "disk", "burn")
+        assert result is not None
+        assert "Host_磁盘IO过高" in result
+
+    def test_host_network_loss(self, registry):
+        result = registry.match_use_case("host", "network", "loss")
+        assert result is not None
+        assert "Host_网络故障" in result
+
+    def test_host_process_kill(self, registry):
+        result = registry.match_use_case("host", "process", "kill")
+        assert result is not None
+        assert "Host_进程异常" in result
+
+    def test_host_selection_stays_within_host_catalogue(self, registry):
+        """A host query must not leak k8s catalogue paths: every match resolves
+        under host-chaos-skills / a Host_ directory."""
+        for target, action in [
+            ("cpu", "fullload"), ("mem", "load"), ("disk", "fill"),
+            ("network", "loss"), ("process", "kill"),
+        ]:
+            for rel in registry.match_use_cases("host", target, action):
+                assert "Host_" in rel
+                assert "/Pod_" not in rel and "/Node_" not in rel
+
+    # --- host-only targets: over-match regression guard ---
+
+    def test_host_file_precise_not_overmatch(self, registry):
+        """host/file must narrow to Host_文件系统异常 only. Before the target
+        keyword was added it fell through and returned EVERY Host_ dir."""
+        matches = registry.match_use_cases("host", "file", "append")
+        assert matches
+        assert all("Host_文件系统异常" in m for m in matches)
+
+    def test_host_time_precise_not_overmatch(self, registry):
+        matches = registry.match_use_cases("host", "time", "offset")
+        assert matches
+        assert all("Host_时间偏移" in m for m in matches)
+
+    def test_host_systemd_precise_not_overmatch(self, registry):
+        matches = registry.match_use_cases("host", "systemd", "stop")
+        assert matches
+        assert all("Host_系统服务异常" in m for m in matches)
+
+    def test_host_syscall_precise_not_overmatch(self, registry):
+        matches = registry.match_use_cases("host", "syscall", "delay")
+        assert matches
+        assert all("Host_系统调用异常" in m for m in matches)
+
+    def test_syscall_keyword_no_cross_scope_leak(self, registry):
+        """The 系统调用 keyword must not spill into the k8s Service_调用失败 dir
+        (which is why the map uses "系统调用", not bare "调用")."""
+        assert registry.match_use_cases("service", "syscall", "delay") == []

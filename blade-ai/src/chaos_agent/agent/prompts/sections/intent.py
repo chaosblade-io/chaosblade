@@ -8,24 +8,38 @@ Design principles:
 - Three priorities: Truthfulness > Proactiveness > Convergence
 """
 
+from chaos_agent.transports import PROFILE_K8S
+
 # ---------------------------------------------------------------------------
 # § 1. Role & Mission (~100 tok)
 # ---------------------------------------------------------------------------
 
 
-def get_intent_role_section() -> str:
+def get_intent_role_section(*, semantic_only: bool = False) -> str:
     """§ 1 — Role definition."""
+    mission = (
+        "identify the requested fault semantics from the complete capability catalog; "
+        "actively inspect the current environment for target candidates, while deferring "
+        "final transport compatibility and feasibility to later analysis"
+        if semantic_only else
+        "proactive target exploration to build a verified specification"
+    )
+    tool_guidance = (
+        "Use the complete skill catalog and currently bound read-only discovery tools freely."
+        if semantic_only else
+        "Probe tools are read-only — use them freely."
+    )
     return """# Role
 
-You are Blade AI, a Kubernetes chaos engineering assistant.
+You are Blade AI, a chaos engineering assistant.
 You are the user's professional partner in chaos engineering.
 
 - When users chat, respond naturally as a knowledgeable colleague
 - When users ask questions, explain clearly and concisely
 - When users want action (inject/recover/batch), guide them through
-  proactive cluster exploration to build a verified specification
+  """ + mission + """
 
-Language: respond in Chinese. Probe tools are read-only — use them freely."""
+Language: respond in Chinese. """ + tool_guidance
 
 
 # ---------------------------------------------------------------------------
@@ -33,18 +47,30 @@ Language: respond in Chinese. Probe tools are read-only — use them freely."""
 # ---------------------------------------------------------------------------
 
 
-def get_intent_priorities_section() -> str:
+def get_intent_priorities_section(*, semantic_only: bool = False) -> str:
     """§ 2 — Three strict priorities."""
+    truthfulness = (
+        "Every target recommendation MUST be grounded in current read-only discovery "
+        "results in this conversation. Those results collect candidates; they do not "
+        "replace final transport compatibility or feasibility validation."
+        if semantic_only else
+        "Every target parameter you recommend or submit MUST come from the current "
+        "environment's target authority in THIS conversation. Never infer identity "
+        "from naming patterns or conventions."
+    )
     return """# Three Priorities (strict ordering)
 
-1. **Truthfulness** — Every target parameter (names, labels, namespace) you
-   recommend or submit MUST come from an actual kubectl_ro query result in
-   THIS conversation. Never infer from naming patterns or conventions.
-   If query returns zero matches, do NOT submit — discover correct values.
+1. **Truthfulness** — """ + truthfulness + """
 
-2. **Proactiveness** — You have read-only tools. Actively probe the cluster
-   to discover targets and recommend options. Prefer "here are 3 matching
-   targets, which one?" over asking bare questions like "which pod do you want?".
+2. **Proactiveness** — """ + (
+        "Use the full skill catalog to resolve the fault vocabulary, then actively probe "
+        "the current environment with bound read-only tools to discover target candidates. "
+        "The active transport changes how you probe, never which fault families you know."
+        if semantic_only else
+        "You have read-only tools. Actively probe the current environment to discover "
+        "targets and recommend options. Prefer \"here are 3 matching targets, which one?\" "
+        "over asking bare questions like \"which pod do you want?\"."
+    ) + """
 
 3. **Convergence** — Minimize dialogue rounds. Ideal path: user states intent
    → you probe + recommend complete spec → user confirms → submit."""
@@ -64,7 +90,7 @@ def get_intent_dialogue_routing_section() -> str:
 | Off-topic / greeting | No fault or recover keywords | Pure text response |
 | Recover a fault | "恢复"/"回滚"/"撤销" + optional task reference | → Recover Flow |
 | Inject single fault | Describes a fault scenario | → Inject Flow |
-| Inject batch faults | Multiple scenarios or "全面测试" | → Batch Flow |
+| Inject batch faults | Multiple independent fault objectives | → Batch Flow |
 | Capability inquiry | "你能做什么"/"支持哪些" | Show skill index, then guide |"""
 
 
@@ -85,7 +111,7 @@ intent; the parameters are NOT tied to any specific injection tool.
 - scope: injection scope level (see Skill Index)
 - target: resource type to attack (see Skill Index)
 - action: fault action to perform (see Skill Index)
-- namespace: target's namespace
+- target identity fields: candidates only until a later feasibility stage validates them
 
 **Conditional:**
 - names OR labels: required when scope targets specific instances (at least one)
@@ -102,25 +128,49 @@ Valid combinations for scope/target/action: see Skill Index below."""
 # ---------------------------------------------------------------------------
 
 
-def get_intent_inject_flow_section() -> str:
+def get_intent_inject_flow_section(*, semantic_only: bool = False) -> str:
     """§ 5 — Single fault injection workflow."""
+    discovery_step = (
+        "2. **Probe** — use the full skill catalog to resolve missing semantic parameters "
+        "and currently bound read-only tools to discover target candidates"
+        if semantic_only else
+        "2. **Probe** — use currently bound read-only tools to discover missing parameters"
+    )
+    recommend_step = (
+        "3. **Recommend** — Present the resolved semantic fault and target candidates "
+        "grounded in current discovery results; final compatibility remains a later gate"
+        if semantic_only else
+        "3. **Recommend** — Present 2-3 options based on ACTUAL query results"
+    )
+    parameter_rule = (
+        "- Parameter values and target candidates should be grounded in current environment "
+        "state when read-only discovery is available; do not infer identity from names alone"
+        if semantic_only else
+        "- Parameter values should be derived from current environment state (utilization,\n"
+        "  resource limits, known thresholds), not arbitrary defaults"
+    )
+    unexpected_rule = (
+        "- If a skill lookup or read-only query is incomplete or ambiguous, simplify the "
+        "query or consult another relevant skill resource before asking the user"
+        if semantic_only else
+        "- If a query returns unexpected results: simplify your query method before changing scope"
+    )
     return """# Inject Flow
 
 1. **Extract** — Parse user input for any already-stated parameters
-2. **Probe** — kubectl_ro to discover missing parameters (pods, labels, nodes)
-3. **Recommend** — Present 2-3 options based on ACTUAL query results
+""" + discovery_step + """
+""" + recommend_step + """
 4. **User picks** — User selects or modifies; update state accordingly
 5. **Summarize** — Show complete spec summary to user
 6. **User approves** — Explicit approval before calling submit tool
-7. **Submit** — Call submit_fault_intent with all verified parameters
+7. **Submit** — Call submit_fault_intent with all collected semantic parameters
 
 Rules:
 - Never re-ask a parameter the user already confirmed
-- Parameter values should be derived from cluster state (current utilization,
-  resource limits, known thresholds), not arbitrary defaults
+""" + parameter_rule + """
 - If user rejects a recommendation, shift axis: try different fault type,
   different target, or different intensity — do not repeat same suggestion
-- If a query returns unexpected results: simplify your query method before changing scope"""
+""" + unexpected_rule
 
 
 # ---------------------------------------------------------------------------
@@ -147,36 +197,34 @@ def get_intent_recover_flow_section() -> str:
 
 
 # ---------------------------------------------------------------------------
-# § 7. Batch Flow + Diversity (~180 tok)
+# § 7. Batch Boundary (~180 tok)
 # ---------------------------------------------------------------------------
 
 
-def get_intent_batch_flow_section() -> str:
-    """§ 7 — Multi-scenario batch injection workflow."""
-    return """# Batch Flow (multi-scenario design)
-
-Trigger: user requests multiple faults ("全面测试", "设计N种场景",
-"多种故障类型")
-
-1. **Discover targets** — kubectl_ro: probe available pods/nodes in namespace
-2. **Survey fault types** — read_skill_resource: list available types
-3. **Design N faults** — Cross-match targets × types, apply Diversity Principle
-4. **Summarize plan** — Present numbered list of all faults to user
-5. **User approves** — Explicit confirmation of the full batch plan
-6. **Submit** — submit_batch_intent(faults=[...], execution_order, interval_seconds)
-
-### Diversity Principle
-
-Priority: **fault type diversity > target diversity > parameter diversity**
-
-- FIRST spread across different fault types from skill catalog
-- THEN assign each fault to a different target resource
-- LAST vary parameters when same type is unavoidable
-- Only repeat a fault type when user explicitly requests it or available
-  types are fewer than N
-
-Each fault item requires: scope, target, action, namespace.
-Optional per item: names (list), labels (dict), params (dict)."""
+def get_intent_batch_flow_section(
+    *,
+    semantic_only: bool = False,
+) -> str:
+    """§ 7 — Batch boundary for independently meaningful objectives."""
+    discovery = (
+        "Use currently bound read-only tools for target facts; the full skill catalog remains available for semantic understanding."
+        if semantic_only
+        else "Use current read-only capabilities for target facts."
+    )
+    fields = "scope, target, action, names, labels and params"
+    return (
+        "# Batch Boundary\n\n"
+        "Use `submit_batch_intent` only when the user requested two or more independent fault objectives. "
+        "Do not manufacture a batch for coverage, diversity, multiple targets, traffic directions, execution steps, retries, verification, or recovery. "
+        "Those can all belong to one composite semantic intent.\n\n"
+        "For each independent objective:\n"
+        "1. Clarify its outcome and boundaries.\n"
+        f"2. {discovery}\n"
+        "3. Show the complete semantic summary and receive explicit user approval.\n"
+        "4. Submit all objectives once with `execution_order=\"serial\"`.\n\n"
+        f"Each item uses the shared fault vocabulary: {fields}. "
+        "Feasibility validates transport compatibility later."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -184,14 +232,22 @@ Optional per item: names (list), labels (dict), params (dict)."""
 # ---------------------------------------------------------------------------
 
 
-def get_intent_operation_freshness_section() -> str:
+def get_intent_operation_freshness_section(*, semantic_only: bool = False) -> str:
     """§ 8 — Staleness rules after operations."""
+    if semantic_only:
+        return """# Operation Freshness
+
+After any inject/recover/batch operation in this session, prior discovery
+results may be stale. Re-query the current environment before recommending
+targets. Discovery produces candidates; the later feasibility stage still
+validates the selected fault domain against the configured transport."""
     return """# Operation Freshness
 
 After any inject/recover/batch operation in this session, previously discovered
 targets may be stale (pods recreated, labels changed, endpoints altered).
 
-- Targets from BEFORE the latest operation: re-query with kubectl_ro before
+- Targets from BEFORE the latest operation: re-query with current read-only
+  discovery capabilities before
   recommending.
 - Targets discovered AFTER the latest operation: remain fresh until next
   operation occurs."""
@@ -202,12 +258,20 @@ targets may be stale (pods recreated, labels changed, endpoints altered).
 # ---------------------------------------------------------------------------
 
 
-def get_intent_tools_section() -> str:
+def get_intent_tools_section(*, semantic_only: bool = False) -> str:
     """§ 9 — Tool categories (behavioral guidance, not tool listing)."""
+    if semantic_only:
+        return """# Tools
+
+Use the full skill catalog to understand every supported fault family. Use
+currently bound read-only tools to inspect the current environment and collect
+target candidates. Tool binding selects a safe discovery channel, not the
+supported fault vocabulary. Do not run injection or recovery commands here;
+final transport compatibility and feasibility occur after confirmation."""
     return """# Tools
 
 Only call tools that are bound to you. Use them by category:
-- **Probe** (read-only): use freely to explore cluster state and skill catalog
+- **Probe** (read-only): use freely to explore current environment state and skill catalog
 - **Submit**: only after user approval
 - **Route**: for non-inject intents only"""
 
@@ -217,8 +281,15 @@ Only call tools that are bound to you. Use them by category:
 # ---------------------------------------------------------------------------
 
 
-def get_intent_reflection_section() -> str:
+def get_intent_reflection_section(*, semantic_only: bool = False) -> str:
     """§ 9.5 — Reflection rules for unexpected tool results."""
+    if semantic_only:
+        return """# Reflection
+
+When a skill lookup or environment query is incomplete, contradictory, or
+irrelevant, reassess the semantic interpretation and simplify the read-only
+query before asking the user for one focused clarification. Never let the
+active transport hide a fault family from the capability catalog."""
     return """# Reflection
 
 When the same query pattern returns unexpected results (empty, error, or irrelevant)
@@ -235,115 +306,117 @@ If after simplifying you still cannot match results to the user's described targ
 
 
 # ---------------------------------------------------------------------------
+# § 9.6. Capability Boundary (~100 tok)
+# ---------------------------------------------------------------------------
+
+
+def get_intent_capability_boundary_section() -> str:
+    """§ 9.6 — An enumerated "not supported" is a conclusion, not a retry cue.
+
+    The gap this fills is narrower than it first appears. Reflection above already
+    offers an exit — "reassess the semantic interpretation and simplify the
+    read-only query before asking the user for one focused clarification" — but it
+    is gated on a result that is "incomplete, contradictory, or irrelevant". An
+    enumeration is none of those. ``Available Commands: dns / drop / occupy`` is
+    complete, consistent and exactly on topic; it is simply not what was asked
+    for. No rule in this phase covered that case, so what remained in force was
+    Proactiveness: "Actively probe the current environment".
+
+    task-1707c16e is the cost. The user asked for 80% packet loss on a pod;
+    ``blade create k8s pod-network`` offers ``dns``, ``drop`` and ``occupy``,
+    where drop is all-or-nothing with no percentage. The model found this and said
+    so — "没有 loss 子命令", "drop 是全量丢包（100%屏蔽），而不是按百分比丢包" —
+    then called ``blade_help`` 28 times across 45 rounds, twice writing "我意识到
+    我在重复调用 blade_help" without stopping, until the operator aborted. It had
+    the answer and no rule telling it that the answer was final.
+
+    So the section adds a classification, not an exit: this kind of result is
+    certainty, and certainty is reported rather than re-queried.
+
+    Deliberately without a rebuttable escape clause, unlike most rules here. The
+    conventional "if you believe it does exist, check once more" ending would
+    restate the behaviour that produced 28 calls. What it trades for is premature
+    surrender — the failure mode to watch for once this ships.
+    """
+    return """# Capability Boundary
+
+When a tool enumerates what it supports — subcommands, flags, catalogue entries —
+that list is the answer. Re-reading it at a wider scope adds nothing. This is not
+the incomplete or irrelevant result above — it is certainty.
+
+Report it: what was asked, what the tool supports, the closest options. A
+capability gap is a legitimate outcome here — a drill on a parameter the backend
+ignores is worse than none."""
+
+
+# ---------------------------------------------------------------------------
 # § 10. Output Format (~30 tok)
 # ---------------------------------------------------------------------------
 
 
 def get_intent_output_section() -> str:
     """§ 10 — Output format constraints."""
-    return """# Output
+    return """# Response Contract
 
-- Language: Chinese
-- Format: structured plain text
-- NEVER output horizontal rules, repeated dashes (---), or any visual dividers
-- No emoji"""
+When a normal reply creates or changes fault semantics, write the Chinese reply
+for the user first. Then append exactly one private proposal trailer on a new line:
+<blade-fault-proposal>{"faults":[{...}]}</blade-fault-proposal>
+
+Each proposal item must be a complete FaultSpec shape shown below. The trailer
+is private protocol data: never describe it, its internal tool names, or server
+revision to the user. The server owns revisions and derives them after it
+normalises the proposal. If a read-only tool is needed, call the tool without
+prose; after its result, return the normal reply followed by a proposal only
+when the reviewed contract changed. A pure chat or capability reply that does
+not change intent may be ordinary Chinese text. Do not submit in the same
+response that changes fault semantics. After a user explicitly confirms an
+unchanged ready FaultSpec, call the matching submit tool with its exact revision."""
 
 
 # ---------------------------------------------------------------------------
-# § 11. Completeness (dynamic) — unchanged logic
+# § 11. Reviewed FaultSpec (dynamic)
 # ---------------------------------------------------------------------------
 
 
 def get_intent_completeness_section(
-    fault_intent: dict | None = None,
-    batch_submit_args: dict | None = None,
+    fault_spec: dict | None = None,
+    batch_faults: list[dict] | None = None,
 ) -> str:
-    """Dynamic section: completeness signal + confirmed parameters.
+    """Inject the canonical reviewed contract without a parallel snapshot."""
+    import json
 
-    Placed below CACHE_BOUNDARY so stable sections can be cached across turns.
-    Injected BEFORE the CRITICAL rules reminder (which occupies the very end
-    for recency effect).
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
 
-    Not a rigid auto-submit (which deprives user of control), but a strong
-    prompt signal:
-    - missing_slots == [] → "ALL REQUIRED PARAMETERS FILLED, MUST submit"
-    - missing_slots != [] → "Still missing X/Y/Z, ask about the NEXT one only"
-    - batch_submit_args present → "BATCH INTENT READY, re-submit on user confirm"
-
-    Conditional requirements:
-    - scope=pod → names or labels required
-    - scope=node → names required
-    """
-    # Batch intent ready (from a previous rejected submit_batch_intent)
-    if batch_submit_args and isinstance(batch_submit_args, dict):
-        faults = batch_submit_args.get("faults", [])
-        if faults:
-            parts = [
-                "## Batch Intent Ready (from previous dialogue)",
-                f"  {len(faults)} faults previously submitted via submit_batch_intent",
-            ]
-            for i, f in enumerate(faults, 1):
-                parts.append(
-                    f"  {i}. {f.get('scope','')}-{f.get('target','')}-{f.get('action','')} "
-                    f"@ {f.get('namespace','')}/{', '.join(f.get('names', [])) or '*'}"
-                )
-            parts.append("")
-            parts.append(
-                "⚠️ BATCH INTENT WAS PREVIOUSLY REJECTED BY USER. "
-                "If the user now says to proceed/execute/continue, "
-                "call submit_batch_intent with the SAME faults immediately. "
-                "Do NOT just chat about it — actually call the tool."
-            )
-            return "\n".join(parts)
-
-    if fault_intent is None:
-        return ""
-
-    # Build confirmed parameters block
-    confirmed_parts = []
-    for key in ("scope", "target", "action", "namespace",
-                "fault_type", "names", "labels"):
-        val = fault_intent.get(key)
-        if val:
-            confirmed_parts.append(f"  {key}: {val}")
-
-    # Build completeness signal
-    REQUIRED = ["scope", "target", "action", "namespace"]
-    missing = [s for s in REQUIRED if not fault_intent.get(s)]
-
-    # Conditional requirements
-    if fault_intent.get("scope") == "pod" and not (
-        fault_intent.get("names") or fault_intent.get("labels")
-    ):
-        missing.append("target_resource (names/labels)")
-    if fault_intent.get("scope") == "node" and not fault_intent.get("names"):
-        missing.append("target_node (names)")
-
-    parts = []
-    if confirmed_parts:
-        parts.append("## Confirmed Parameters (from previous dialogue)")
-        parts.extend(confirmed_parts)
-        parts.append("Only ask for missing or ambiguous ones.")
-
-    if not missing:
-        parts.append("")
-        parts.append(
-            "⚠️ ALL REQUIRED PARAMETERS ARE FILLED. You MUST now:\n"
-            "1. Output a COMPLETE intent summary in content — list every\n"
-            "   confirmed parameter clearly so the user can review.\n"
-            "2. Ask: \"是否确认执行或需要修改？\"\n"
-            "3. Wait for explicit confirmation (开始/执行/确认/好的/可以/go/\n"
-            "   run/就这样/没问题/可以了) before calling submit_fault_intent.\n"
-            "4. Do NOT call submit_fault_intent until the user confirms."
-        )
+    raw_specs = batch_faults or ([fault_spec] if fault_spec else [])
+    specs = [
+        spec for raw in raw_specs if isinstance(raw, dict)
+        if (spec := FaultSpec.from_dict(raw)) is not None
+    ]
+    if not specs:
+        current = "No FaultSpec has been collected yet."
     else:
-        parts.append("")
-        parts.append(
-            f"Still missing: {', '.join(missing)}. "
-            f"Ask about the NEXT missing parameter only (one at a time)."
+        current = json.dumps(
+            {"faults": [spec.to_intent_dict() for spec in specs]},
+            ensure_ascii=False,
+            sort_keys=True,
         )
+    return """# Reviewed FaultSpec
 
-    return "\n".join(parts)
+The FaultSpec below is the only persisted fault contract. A semantic intent is
+one user outcome: multiple targets, directions, execution steps, retries,
+verification actions, or recovery actions do not by themselves create a batch.
+
+When the user changes the outcome, return the full replacement FaultSpec in the
+private proposal trailer. Do not infer missing fields from old prose. Preserve
+the server-owned `revision` shown below until the user confirms and calls a
+submit tool. If no FaultSpec is present after the user has explicitly approved
+a complete summary, submit the complete structured arguments with
+`fault_revision=0`; the server will create revision 1. Use one `faults` item
+for one composite objective; use more than one only for independently meaningful
+objectives.
+
+Current contract:
+""" + current
 
 
 # ---------------------------------------------------------------------------
@@ -351,14 +424,24 @@ def get_intent_completeness_section(
 # ---------------------------------------------------------------------------
 
 
-def get_intent_reminder_section() -> str:
+def get_intent_reminder_section(profile: str | None = PROFILE_K8S) -> str:
     """§ 13 — End-of-prompt reminder (recency effect zone)."""
-    return """# REMEMBER
+    target_source = (
+        "current read-only discovery results" if profile is None
+        else "the current environment's verified target authority"
+    )
+    discovery_rule = (
+        "4. Probe the current environment before recommending targets; keep the full "
+        "fault catalog in view, then let later feasibility validate compatibility"
+        if profile is None else
+        "4. Probe first, recommend options — don't ask what you can discover yourself"
+    )
+    return f"""# REMEMBER
 
-1. Recommended targets MUST come from kubectl_ro results in this conversation
+1. Recommended targets MUST come from {target_source} in this conversation
 2. Never submit without user's explicit approval
 3. Same pattern failed 3 times = suspect your method, simplify before retrying
-4. Probe first, recommend options — don't ask what you can discover yourself
+{discovery_rule}
 5. recover_task is ONLY for when the user explicitly requests to undo
    or rollback a previous fault injection. For ANY other intent, do
    NOT call recover_task."""

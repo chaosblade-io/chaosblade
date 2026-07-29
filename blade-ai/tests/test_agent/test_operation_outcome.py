@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from chaos_agent.agent.operation_outcome import (
+from chaos_agent.agent.result.operation_outcome import (
     build_verification_simple,
     read_inject_verification,
     read_merged_error,
@@ -177,19 +177,19 @@ def test_raw_verification_field_reads_are_limited_to_boundaries_and_payloads():
 
     allowed = {
         (
-            "src/chaos_agent/agent/operation_outcome.py",
+            "src/chaos_agent/agent/result/operation_outcome.py",
             'return _copy_dict(state.get("verification"))',
         ),
         (
-            "src/chaos_agent/agent/operation_outcome.py",
+            "src/chaos_agent/agent/result/operation_outcome.py",
             'return _copy_dict(state.get("recover_verification"))',
         ),
         (
-            "src/chaos_agent/agent/task_snapshot.py",
+            "src/chaos_agent/agent/result/task_snapshot.py",
             'verification = result_data.get("verification") or record.get("verification")',
         ),
         (
-            "src/chaos_agent/agent/task_snapshot.py",
+            "src/chaos_agent/agent/result/task_snapshot.py",
             'verification = record.get("verification") or result_data.get("verification")',
         ),
         (
@@ -197,7 +197,7 @@ def test_raw_verification_field_reads_are_limited_to_boundaries_and_payloads():
             'verification = data.get("verification")',
         ),
         (
-            "src/chaos_agent/agent/operation_summary.py",
+            "src/chaos_agent/agent/result/operation_summary.py",
             'verification = data.get("verification")',
         ),
         (
@@ -233,7 +233,7 @@ def test_verification_projection_owner_is_operation_outcome():
     """Agent/CLI code should not depend on memory.session_store for projection."""
 
     checked_files = [
-        "src/chaos_agent/agent/operation_summary.py",
+        "src/chaos_agent/agent/result/operation_summary.py",
         "src/chaos_agent/cli/runner.py",
     ]
     violations = []

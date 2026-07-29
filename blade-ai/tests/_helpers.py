@@ -19,7 +19,7 @@ def intent_dict_from_result(result: dict) -> dict:
     ["scope"]`` style accesses translate to ``result_intent(result)
     .get("scope")`` cleanly.
     """
-    from chaos_agent.agent.fault_spec import FaultSpec
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
     spec = FaultSpec.from_dict(result.get("fault_spec"))
     return spec.to_intent_dict() if spec else {}
 
@@ -37,6 +37,6 @@ def replace_fault_spec(state: dict, **field_updates) -> None:
         replace_fault_spec(state, namespace="kube-system", names=("coredns",))
         replace_fault_spec(state, scope="node", blade_target="cpu")
     """
-    from chaos_agent.agent.fault_spec import FaultSpec
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
     existing = FaultSpec.from_dict(state.get("fault_spec")) or FaultSpec()
     state["fault_spec"] = existing.replace(**field_updates).to_dict()

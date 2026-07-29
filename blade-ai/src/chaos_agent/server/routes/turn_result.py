@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 
-from chaos_agent.agent.operation_result import (
+from chaos_agent.agent.result.operation_result import (
     build_inject_data_from_state,
     build_recover_data_from_state,
 )
@@ -24,7 +24,7 @@ async def build_recover_initial_from_store(
     Used for cross-session TUI recovery where the checkpoint is stored
     under conversation_thread_id (not task_id) and can't be looked up.
     """
-    from chaos_agent.agent.task_snapshot import resolve_recover_initial_state
+    from chaos_agent.agent.result.task_snapshot import resolve_recover_initial_state
 
     resolution = await resolve_recover_initial_state(
         task_id,

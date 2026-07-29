@@ -14,7 +14,7 @@ from chaos_agent.agent.router import (
     should_continue_recover_verifier,
     should_continue_verifier,
 )
-from chaos_agent.agent.verdict import FailureCategory
+from chaos_agent.agent.result.verdict import FailureCategory
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +81,21 @@ class TestRouterGatesRespectWallClock:
         state = _expired_state({"agent_loop_count": 0, "messages": []})
         assert should_continue_agent_loop(state) == "reject"
 
-    def test_execute_loop_returns_end(self):
+    def test_execute_loop_returns_verifier(self):
+        """Wall-clock expiry routes to the verifier, not straight to the end.
+
+        The trade-off is real — the budget is already spent, and the verifier
+        costs more time. It still wins, for two reasons:
+
+        * an unverified result is worse than a late one. Skipping verification
+          produced task-ff057e7f, where the envelope claimed success with
+          ``verification=null`` while the postmortem said the run stalled;
+        * the verifier has its OWN wall-clock gate (``test_verifier_returns_done``
+          right below asserts it), so this cannot run away — expiry makes the
+          verifier finalise on the evidence it already has rather than loop.
+        """
         state = _expired_state({"execute_loop_count": 0, "messages": []})
-        assert should_continue_execute_loop(state) == "end"
+        assert should_continue_execute_loop(state) == "verifier"
 
     def test_verifier_returns_done(self):
         state = _expired_state({"verifier_loop_count": 0, "messages": []})

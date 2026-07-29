@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from chaos_agent.tui.config_store import ConfigStore
+from chaos_agent.config.config_store import ConfigStore
 from chaos_agent.tui.console import ChaosConsole
 from chaos_agent.tui.renderers import onboarding
 

@@ -1,5 +1,5 @@
-from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.state_builders import build_inject_initial_state
+from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 
 
 def test_build_inject_initial_state_from_fault_spec_object():

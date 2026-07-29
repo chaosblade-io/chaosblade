@@ -8,17 +8,15 @@ import asyncio
 import json
 import logging
 import sys
-import time
 import uuid
 from collections import defaultdict
 from typing import Optional
 
 from chaos_agent import __version__
 from chaos_agent.agent.factory import create_agent
-from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.operation_summary import build_task_summary_text
-from chaos_agent.agent.skill_identity import read_active_skill_name
-from chaos_agent.agent.state_builders import build_inject_initial_state
+from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.result.operation_summary import build_task_summary_text
+from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.agent.streaming import StreamEvent, parse_stream_events
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.operation_summary_writer import write_operation_summary
@@ -40,10 +38,6 @@ from chaos_agent.skills.prerequisites import PrerequisitesChecker
 from chaos_agent.skills.registry import SkillRegistry
 from chaos_agent.utils.fault_type import extract_fault_type
 from chaos_agent.utils.time import now_iso
-
-logger = logging.getLogger(__name__)
-
-
 from chaos_agent.cli.result_builder import (
     _build_inject_result_events,
     _extract_visible_reply,
@@ -54,6 +48,8 @@ from chaos_agent.cli.session_finalize import (
     auto_rollback,
 )
 from chaos_agent.cli.status_display import _status_printer
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRunner:
@@ -202,6 +198,7 @@ class AgentRunner:
                 kube_context=kwargs.get("context", ""),
                 needs_confirmation=kwargs.get("confirm", False),
                 dry_run=kwargs.get("dry_run", False),
+                planning_mode=kwargs.get("planning_mode", ""),
             ):
                 yield evt
             return
@@ -236,12 +233,24 @@ class AgentRunner:
             needs_confirmation=kwargs.get("confirm", False),
             kubeconfig=kwargs.get("kubeconfig", ""),
             kube_context=kwargs.get("context", ""),
+            # Transport/channel fields are config-driven for the CLI surface
+            # (AGENTS.md CLI syntax exposes no --ssh-host/--kube-connection-mode
+            # flags), so these kwargs are normally absent and fall back to
+            # settings via TransportTarget.from_state. They are read here only to
+            # honor a programmatic caller that does supply them.
             kubewiz_cluster_uuid=kwargs.get("cluster_uuid", ""),
             kubewiz_profile=kwargs.get("profile", ""),
+            kube_connection_mode=kwargs.get("kube_connection_mode", ""),
+            host_name=kwargs.get("host_name", ""),
+            ssh_host=kwargs.get("ssh_host", ""),
+            ssh_user=kwargs.get("ssh_user", ""),
+            ssh_key_path=kwargs.get("ssh_key_path", ""),
+            ssh_port=kwargs.get("ssh_port"),
             created_at=_ts,
             direct=kwargs.get("direct", False) if not kwargs.get("input") else False,
             interaction_mode=_interaction_mode,
             dry_run=_dry_run,
+            planning_mode=kwargs.get("planning_mode", ""),
         )
 
         config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
@@ -327,11 +336,9 @@ class AgentRunner:
                         interrupt_info = task.interrupts[0].value
                         break
 
-                # Determine interrupt type
-                interrupt_type = "confirmation"
+                # Determine interrupt content
                 interrupt_content = ""
                 if interrupt_info and isinstance(interrupt_info, dict):
-                    interrupt_type = interrupt_info.get("type", "confirmation")
                     interrupt_content = interrupt_info
                 elif interrupt_info and isinstance(interrupt_info, str):
                     interrupt_content = {"type": "confirmation", "plan_summary": interrupt_info}
@@ -341,7 +348,6 @@ class AgentRunner:
                     interrupt_content = {"type": "confirmation", "plan_summary": plan_summary}
 
                 # Resume the graph based on callback availability
-                resume_value = None
                 if interrupt_callback:
                     # Self-contained callback: renders UI and returns answer directly.
                     # No need to yield "confirm" event — the callback handles everything.
@@ -435,7 +441,7 @@ class AgentRunner:
                 content=f"Inject failed: {msg}{rollback_info}",
                 task_id=task_id,
             )
-            from chaos_agent.agent.operation_result import build_inject_status_data_from_state
+            from chaos_agent.agent.result.operation_result import build_inject_status_data_from_state
 
             yield StreamEvent(
                 type="result",
@@ -466,7 +472,7 @@ class AgentRunner:
                 try:
                     _fgs = await graph.aget_state(config)
                     _vals = _fgs.values if _fgs and _fgs.values else {}
-                    from chaos_agent.agent.operation_outcome import (
+                    from chaos_agent.agent.result.operation_outcome import (
                         read_operation_outcome,
                     )
 
@@ -534,8 +540,19 @@ class AgentRunner:
             needs_confirmation=kwargs.get("confirm", False),
             kubeconfig=kwargs.get("kubeconfig", ""),
             kube_context=kwargs.get("context", ""),
+            # Transport/channel fields are config-driven for the CLI surface
+            # (AGENTS.md CLI syntax exposes no --ssh-host/--kube-connection-mode
+            # flags), so these kwargs are normally absent and fall back to
+            # settings via TransportTarget.from_state. They are read here only to
+            # honor a programmatic caller that does supply them.
             kubewiz_cluster_uuid=kwargs.get("cluster_uuid", ""),
             kubewiz_profile=kwargs.get("profile", ""),
+            kube_connection_mode=kwargs.get("kube_connection_mode", ""),
+            host_name=kwargs.get("host_name", ""),
+            ssh_host=kwargs.get("ssh_host", ""),
+            ssh_user=kwargs.get("ssh_user", ""),
+            ssh_key_path=kwargs.get("ssh_key_path", ""),
+            ssh_port=kwargs.get("ssh_port"),
             created_at=_ts2,
             direct=kwargs.get("direct", False) if not kwargs.get("input") else False,
             interaction_mode="cli",
@@ -608,7 +625,7 @@ class AgentRunner:
                     },
                 )
 
-            from chaos_agent.agent.operation_result import build_inject_data_from_state
+            from chaos_agent.agent.result.operation_result import build_inject_data_from_state
             inject_data = build_inject_data_from_state(
                 result if isinstance(result, dict) else {}, task_id,
             )
@@ -622,7 +639,7 @@ class AgentRunner:
 
             rollback_status = await auto_rollback(self._agents["pipeline"], config)
 
-            from chaos_agent.agent.operation_result import build_inject_status_data_from_state
+            from chaos_agent.agent.result.operation_result import build_inject_status_data_from_state
 
             return JSONEnvelope.fail(
                 code=code,
@@ -717,6 +734,7 @@ class AgentRunner:
             "tui_session_id", "interaction_mode", "kubeconfig",
             "kube_context", "kubewiz_cluster_uuid", "kubewiz_profile",
             "needs_confirmation", "dry_run",
+            "planning_mode",
         )
         for k in _session_keys:
             if k in kwargs:
@@ -776,9 +794,24 @@ class AgentRunner:
                 tui_sid = iv.get("tui_session_id", "") or session_id
 
                 # Bootstrap task session (moved from intent_confirm)
-                from chaos_agent.agent.nodes.intent_clarification import bootstrap_task_session
+                from chaos_agent.agent.nodes.planning.intent_clarification import bootstrap_task_session
+                # ONE object with an explicit id, reused for both the task-file
+                # write below and the graph input further down. Without an id the
+                # two writes land in the task file as separate entries:
+                # ``_message_dedup_key`` keys on ``id`` when present, and the jsonl
+                # copy is written before ``add_messages`` assigns a UUID — so one
+                # copy was keyed on its id and the other on its content, and
+                # read_session kept both. Same fix as 1c21325 for HumanMessage in
+                # memory_nodes. ``add_messages`` preserves an existing id rather
+                # than replacing it, which is what makes the two keys match.
+                #
+                # Built outside the ``if task_id`` block because the graph input
+                # needs it either way.
+                handoff_msg = (
+                    SystemMessage(content=handoff, id=str(uuid.uuid4()))
+                    if handoff else None
+                )
                 if task_id:
-                    handoff_msg = SystemMessage(content=handoff) if handoff else None
                     bootstrap_task_session(
                         task_id, operation="inject",
                         tui_session_id=tui_sid,
@@ -796,9 +829,10 @@ class AgentRunner:
                     "interaction_mode": "tui",
                     "kubeconfig": iv.get("kubeconfig", ""),
                     "kube_context": iv.get("kube_context", ""),
-                    "messages": [SystemMessage(content=handoff)] if handoff else [],
+                    "messages": [handoff_msg] if handoff_msg else [],
                     "safety_status": "pending",
                     "created_at": now_iso(),
+                    "planning_mode": iv.get("planning_mode", kwargs.get("planning_mode")),
                 }
 
                 # Stream Pipeline Graph
@@ -856,7 +890,7 @@ class AgentRunner:
 
                 if blade_uid:
                     from chaos_agent.models.schemas import build_inject_envelope
-                    from chaos_agent.agent.operation_result import build_inject_data_from_state
+                    from chaos_agent.agent.result.operation_result import build_inject_data_from_state
 
                     _data = build_inject_data_from_state(pv, task_id)
                     yield StreamEvent(
@@ -868,7 +902,7 @@ class AgentRunner:
                     )
                 else:
                     # Pipeline ran but no blade_uid (error / rejection)
-                    from chaos_agent.agent.operation_outcome import read_operation_outcome
+                    from chaos_agent.agent.result.operation_outcome import read_operation_outcome
                     error_msg = read_operation_outcome(pv).error
                     if error_msg or pv.get("safety_status") == "rejected":
                         yield StreamEvent(
@@ -1117,7 +1151,7 @@ class AgentRunner:
                 blade_uid = values.get("blade_uid", "")
                 if blade_uid:
                     from chaos_agent.models.schemas import build_inject_envelope
-                    from chaos_agent.agent.operation_result import build_inject_data_from_state
+                    from chaos_agent.agent.result.operation_result import build_inject_data_from_state
 
                     _data = build_inject_data_from_state(values, thread_id)
                     yield StreamEvent(
@@ -1206,6 +1240,10 @@ class AgentRunner:
         """
         await self._ensure_initialized()
 
+        # Reset module-level time_wait state for the new recover task.
+        from chaos_agent.tools.wait import reset_wait_state
+        reset_wait_state()
+
         inject_task_id = task_id
         # Recover gets its own task record file, cross-referenced back to inject
         # via parent_task_id. The langgraph thread_id stays = inject_task_id so
@@ -1220,7 +1258,6 @@ class AgentRunner:
 
         # Pre-declare in case fallback path is taken or an early exception fires.
         blade_uid = ""
-        target: dict = {}
         state_values: dict = {}
 
         try:
@@ -1228,7 +1265,7 @@ class AgentRunner:
             current_state = await self._agents["pipeline"].aget_state(config)
             checkpoint_values = current_state.values if current_state and current_state.values else {}
 
-            from chaos_agent.agent.task_snapshot import resolve_recover_initial_state
+            from chaos_agent.agent.result.task_snapshot import resolve_recover_initial_state
 
             resolution = await resolve_recover_initial_state(
                 inject_task_id,
@@ -1246,7 +1283,6 @@ class AgentRunner:
             initial_state = resolution.initial_state
             state_values = resolution.source_values
             blade_uid = initial_state.get("blade_uid", "") or ""
-            skill_name = read_active_skill_name(initial_state)
             inject_tui_session_id = initial_state.get("tui_session_id", "") or ""
 
             # Mark the inject task as "recovering" in TaskStore so that
@@ -1280,7 +1316,7 @@ class AgentRunner:
                 sys.stderr.flush()
             result = await self._agents["recover"].ainvoke(initial_state, config)
 
-            from chaos_agent.agent.operation_result import (
+            from chaos_agent.agent.result.operation_result import (
                 build_recover_cli_data_from_state,
             )
 
@@ -1303,7 +1339,7 @@ class AgentRunner:
         except Exception as e:
             code, msg = _format_error(e)
             logger.exception(f"Local recover failed for task {inject_task_id}")
-            from chaos_agent.agent.operation_result import (
+            from chaos_agent.agent.result.operation_result import (
                 build_recover_cli_failure_data_from_state,
             )
 
@@ -1485,8 +1521,6 @@ class AgentRunner:
 
             resume_value = "approved" if action == "approve" else "rejected"
             await self._agents["pipeline"].ainvoke(Command(resume=resume_value), config)
-
-            new_state = "injecting" if action == "approve" else "cancelled"
 
             return JSONEnvelope.ok(
                 data={

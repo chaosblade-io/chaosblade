@@ -5,17 +5,22 @@ from unittest.mock import MagicMock
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from chaos_agent.agent.nodes.react_helpers import (
+from chaos_agent.agent.nodes.execute.react_helpers import (
+    _should_trigger_introspection,
     detect_action_stagnation,
+    detect_tool_error_hint,
     emit_debug_tool_messages,
     extract_persistent_hm,
+    extract_rejected_params,
     extract_synthetic_messages,
     extract_tool_call_fields,
     log_reasoning_content,
     record_ai_message,
     record_system_prompt,
+    suggest_verify_command,
     summarize_llm_response,
 )
+from chaos_agent.errors import ErrorClass
 
 
 # ---------------------------------------------------------------------------
@@ -455,14 +460,75 @@ class TestDetectActionStagnation:
         assert tool is None
 
     def test_stagnation_at_threshold(self):
+        """6 consecutive turns on one tool with unchanged results → stagnation.
+
+        Tool outputs are required: the detector now only reports a streak when
+        it can see that the results are not progressing.
+        """
+        messages = []
+        for i in range(6):
+            messages.append(
+                AIMessage(content="", tool_calls=[{"name": "save_fault_plan", "args": {"plan_content": f"v{i}"}, "id": f"tc_{i}"}])
+            )
+            messages.append(ToolMessage(content="validation failed", tool_call_id=f"tc_{i}"))
+        hint, tool = detect_action_stagnation(messages, threshold=5)
+        assert hint is not None
+        assert tool == "save_fault_plan"
+        assert "ACTION_STAGNATION" in hint
+
+    def test_no_outputs_stays_silent(self):
+        """Same streak but no ToolMessages → silent, cannot confirm a stall."""
         messages = [
             AIMessage(content="", tool_calls=[{"name": "save_fault_plan", "args": {"plan_content": f"v{i}"}, "id": f"tc_{i}"}])
             for i in range(6)
         ]
         hint, tool = detect_action_stagnation(messages, threshold=5)
+        assert hint is None
+        assert tool is None
+
+    def test_changing_outputs_suppress_stagnation(self):
+        """Streak reached but outputs progress → legitimate polling, stay silent."""
+        messages = []
+        for i in range(6):
+            messages.append(
+                AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {"subcommand": "get"}, "id": f"tc_{i}"}])
+            )
+            messages.append(ToolMessage(content=f"pod-0 Running {i}s", tool_call_id=f"tc_{i}"))
+        hint, tool = detect_action_stagnation(messages, threshold=5)
+        assert hint is None
+        assert tool is None
+
+    def test_batched_calls_are_counted(self):
+        """Batches of 3 calls per turn still accumulate a streak.
+
+        The old ``len(tool_calls) != 1`` guard aborted on the first batch, which
+        is exactly the shape a real stall takes (3-4 calls per turn).
+        """
+        messages = []
+        for i in range(5):
+            messages.append(AIMessage(content="", tool_calls=[
+                {"name": "kubectl", "args": {"subcommand": "get", "v_args": "node n1"}, "id": f"a_{i}"},
+                {"name": "kubectl", "args": {"subcommand": "get", "v_args": "sts s1"}, "id": f"b_{i}"},
+                {"name": "kubectl", "args": {"subcommand": "get", "v_args": "pods"}, "id": f"c_{i}"},
+            ]))
+            for prefix in ("a", "b", "c"):
+                messages.append(ToolMessage(content="unchanged", tool_call_id=f"{prefix}_{i}"))
+        hint, tool = detect_action_stagnation(messages, threshold=5)
         assert hint is not None
-        assert tool == "save_fault_plan"
-        assert "ACTION_STAGNATION" in hint
+        assert tool == "kubectl:get"
+
+    def test_hint_has_no_hard_prohibition(self):
+        """The hint must be rebuttable, not an order — detection can be wrong."""
+        messages = []
+        for i in range(5):
+            messages.append(
+                AIMessage(content="", tool_calls=[{"name": "kubectl", "args": {"subcommand": "get"}, "id": f"tc_{i}"}])
+            )
+            messages.append(ToolMessage(content="same", tool_call_id=f"tc_{i}"))
+        hint, _ = detect_action_stagnation(messages, threshold=5)
+        assert hint is not None
+        assert "Do NOT call" not in hint
+        assert "say why and continue" in hint
 
     def test_different_tools_no_stagnation(self):
         messages = [
@@ -500,14 +566,6 @@ class TestDetectActionStagnation:
 # ---------------------------------------------------------------------------
 # Tool error introspection (runtime feedback > static docs)
 # ---------------------------------------------------------------------------
-
-from chaos_agent.agent.nodes.react_helpers import (
-    _should_trigger_introspection,
-    suggest_verify_command,
-    detect_tool_error_hint,
-    extract_rejected_params,
-)
-from chaos_agent.errors import ErrorClass
 
 
 class TestShouldTriggerIntrospection:
@@ -589,8 +647,8 @@ class TestSuggestVerifyCommand:
         assert "kubectl" in s
         assert "--help" in s
 
-    def test_kubectl_ro(self):
-        s = suggest_verify_command("kubectl_ro")
+    def test_kubectl_read(self):
+        s = suggest_verify_command("kubectl_read")
         assert "kubectl" in s
 
     def test_unknown_tool_generic(self):
@@ -610,9 +668,11 @@ class TestDetectToolErrorHint:
         ]
         hint = detect_tool_error_hint(msgs)
         assert hint is not None
-        assert "TOOL ERROR" in hint
+        assert "RUNTIME EVIDENCE" in hint
         assert "`--percent`" in hint
         assert "blade" in hint
+        assert "real-world outcome: unknown" in hint
+        assert "Before retrying" not in hint
 
     def test_blade_generic_error(self):
         msgs = [
@@ -624,7 +684,8 @@ class TestDetectToolErrorHint:
         ]
         hint = detect_tool_error_hint(msgs)
         assert hint is not None
-        assert "TOOL ERROR" in hint
+        assert "RUNTIME EVIDENCE" in hint
+        assert "tool observation" in hint
 
     def test_kubectl_error(self):
         msgs = [
@@ -680,7 +741,7 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc1",
             ),
             HumanMessage(
-                content="**TOOL ERROR — VERIFY BEFORE RETRY**: `blade_create` returned an error."
+                content="**RUNTIME EVIDENCE**: `blade_create` returned an error."
             ),
             ToolMessage(
                 content="Error: unknown flag: --percent",
@@ -699,7 +760,7 @@ class TestDetectToolErrorHint:
                 tool_call_id="tc1",
             ),
             HumanMessage(
-                content="**TOOL ERROR — VERIFY BEFORE RETRY**: `blade_create` returned an error."
+                content="**RUNTIME EVIDENCE**: `blade_create` returned an error."
             ),
             ToolMessage(
                 content="Error: unknown flag: --foo",
@@ -746,15 +807,15 @@ class TestClassifyErrorInterfaceMismatch:
 
 class TestPhaseSpecificLoopHints:
     def test_build_loop_hint_intent(self):
-        from chaos_agent.agent.nodes.react_helpers import _build_loop_hint
-        hint = _build_loop_hint("kubectl_ro(subcommand=get)", 3, "intent")
+        from chaos_agent.agent.nodes.execute.react_helpers import _build_loop_hint
+        hint = _build_loop_hint("kubectl_read(subcommand=get)", 3, "intent")
         assert "LOOP DETECTED" in hint
         assert "REFLECT" in hint
         assert "Simplify" in hint
         assert "Escalate" in hint
 
     def test_build_loop_hint_unknown_phase_falls_back_to_intent(self):
-        from chaos_agent.agent.nodes.react_helpers import _build_loop_hint
+        from chaos_agent.agent.nodes.execute.react_helpers import _build_loop_hint
         hint = _build_loop_hint("some_tool()", 3, "unknown_phase")
         assert "REFLECT" in hint
         assert "discovery method" in hint

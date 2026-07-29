@@ -252,6 +252,8 @@ class SkillRegistry:
         "pod": ("Pod_",),
         "service": ("Service_",),
         "workload": ("workload_", "HPA_", "DaemonSet_"),
+        "host": ("Host_", "主机"),
+        "python": ("Python_",),
     }
 
     # Target keyword to catalogue directory keyword mapping
@@ -261,6 +263,25 @@ class SkillRegistry:
         "disk": ("磁盘",),
         "network": ("网络", "network"),
         "process": ("进程", "process"),
+        # Host-only targets (no k8s analogue). Each keyword is the distinguishing
+        # Chinese fragment of its Host_ catalogue dir, chosen to avoid cross-scope
+        # collisions — e.g. "系统调用" (not bare "调用", which would also hit the
+        # k8s Service_调用失败 dir) and "系统服务" (not bare "服务"). Without these,
+        # a host/file|time|systemd|syscall query falls through the target filter
+        # and over-matches EVERY Host_ dir (see match_use_cases Step 2 fallback).
+        "file": ("文件", "file"),
+        "time": ("时间", "time"),
+        "systemd": ("系统服务", "systemd"),
+        "syscall": ("系统调用", "syscall", "strace"),
+        # Python application-layer clients (chaosblade_python carrier). Keyword
+        # is the middleware name, matched against the Python_ catalogue dirs.
+        "redis": ("Redis", "redis"),
+        "mysql": ("MySQL", "mysql", "MySql"),
+        "sqlalchemy": ("SQLAlchemy", "sqlalchemy"),
+        "http": ("HTTP", "http"),
+        "httpx": ("HTTPX", "httpx"),
+        "grpc": ("gRPC", "grpc", "GRPC"),
+        "kafka": ("Kafka", "kafka"),
     }
 
     # Action keyword to catalogue file/directory name keyword mapping
@@ -279,6 +300,9 @@ class SkillRegistry:
         "fail": ("fail", "失败", "篡改"),                  # pod-pod fail → Pod_镜像拉取失败
         "delay": ("delay", "延迟"),                         # pod-network delay → 网络延迟
         "dns": ("dns", "DNS", "域名"),
+        # Python application-layer fault verbs (chaosblade_python).
+        "throwCustomException": ("异常", "exception", "throw"),
+        "returnValue": ("返回值", "return", "篡改"),
     }
 
     def match_use_cases(self, scope: str, target: str, action: str) -> list[str]:
@@ -521,9 +545,11 @@ class SkillRegistry:
         skill_dir = self._skill_dirs[skill_name]
         scripts_dir = (skill_dir / "scripts").resolve()
 
-        # 2. Resolve and validate path containment
+        # 2. Resolve and validate path containment. is_relative_to is a true
+        #    ancestor test; a str startswith check would let a sibling like
+        #    scripts_evil/ pass the scripts/ prefix.
         script_path = (skill_dir / "scripts" / script_name).resolve()
-        if not str(script_path).startswith(str(scripts_dir)):
+        if script_path != scripts_dir and not script_path.is_relative_to(scripts_dir):
             raise ScriptExecutionError(
                 f"Path traversal blocked: '{script_name}' resolves outside scripts/ directory"
             )
@@ -546,7 +572,7 @@ class SkillRegistry:
             for pattern in self._PARAM_BLACKLIST_PATTERNS:
                 if pattern.search(params):
                     raise ScriptExecutionError(
-                        f"Dangerous pattern detected in script parameters"
+                        "Dangerous pattern detected in script parameters"
                     )
 
         # 6. Select interpreter

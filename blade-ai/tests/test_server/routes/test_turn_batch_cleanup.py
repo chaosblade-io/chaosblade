@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from chaos_agent.agent.operation_summary import (
+from chaos_agent.agent.result.operation_summary import (
     build_batch_summary_text,
     build_recover_summary_text,
 )
@@ -219,7 +219,7 @@ def test_recover_summary_contains_parent_task_and_verification():
 
 
 def test_intent_trim_preserves_batch_and_recover_summaries():
-    from chaos_agent.agent.nodes.intent_confirm import _build_trim_remove_list
+    from chaos_agent.agent.nodes.planning.intent_confirm import _build_trim_remove_list
 
     batch = SystemMessage(content="[Batch Summary] 1 faults", id="batch")
     recover = SystemMessage(content="[Recover Summary] task_id=task-r", id="recover")
@@ -242,7 +242,7 @@ async def test_single_inject_pipeline_clears_intent_state_before_cancel(monkeypa
         if False:
             yield ""
 
-    from chaos_agent.agent.nodes import intent_clarification
+    from chaos_agent.agent.nodes.planning import intent_clarification
 
     monkeypatch.setattr(
         intent_clarification,

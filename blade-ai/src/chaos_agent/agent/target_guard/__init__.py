@@ -33,6 +33,7 @@ from .classifier import (
 )
 from .freeze import (
     approved_from_dict,
+    discover_names_by_labels,
     discover_owner_names,
     freeze_approved_target,
     freeze_approved_target_from_spec,
@@ -59,6 +60,7 @@ __all__ = [
     "SCOPE_UNKNOWN",
     "approved_from_dict",
     "canonicalise_kind",
+    "discover_names_by_labels",
     "discover_owner_names",
     "freeze_approved_target",
     "freeze_approved_target_from_spec",

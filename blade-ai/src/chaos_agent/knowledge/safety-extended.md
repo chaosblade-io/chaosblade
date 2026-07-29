@@ -62,7 +62,7 @@ before proceeding — even if the technical request is valid.
 | --- | --- |
 | **ABORT** (stop immediately) | Safety violation detected, cascading impact observed, target resource does not exist, user explicitly requests stop. |
 | **CONTINUE** (proceed with caution) | Transient error that may resolve on retry, fault effect delay not yet elapsed, partial success where successful experiments can still be recovered. |
-| **ESCALATE** (ask user) | Cannot resolve with available tools, unexpected error pattern that doesn't match known failure modes, potential data loss risk, all injection methods exhausted without success — output `[REPLAN]` to route back to Phase 1. |
+| **ESCALATE** (ask user) | Cannot resolve with available tools, unexpected error pattern that doesn't match known failure modes, potential data loss risk, all injection methods exhausted without success — emit the structured replan request to return to Phase 1. |
 
 The default tie-breaker is **ABORT** when scope is ambiguous and **ESCALATE**
 when intent is ambiguous. CONTINUE is only correct when both scope and

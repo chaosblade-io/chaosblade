@@ -32,10 +32,14 @@ the policy alone, not of classifier quirks.
 
 from __future__ import annotations
 
+import pytest
+
 from chaos_agent.agent.target_guard.classifier import (
     SCOPE_BANNED,
+    SCOPE_ESCAPE,
     SCOPE_READONLY,
     SCOPE_UNKNOWN,
+    infer_effective_target,
 )
 from chaos_agent.agent.target_guard.guard import target_drift_guard
 from chaos_agent.agent.target_guard.types import (
@@ -44,6 +48,116 @@ from chaos_agent.agent.target_guard.types import (
     EffectiveTarget,
     GuardVerdict,
 )
+
+
+class TestEscapeReasonPassthrough:
+    """Reject scopes relay the classifier/screener's PRECISE cause, not a
+    generic template.
+
+    Regression for task-40c934fb: a batch-2 exec through a non-approved pod was
+    rejected with an ambiguous OR-template that hid which condition tripped, and
+    banned calls reported only "tool is in the banned list". The guard must
+    surface the specific ``reject_detail`` its origin recorded; when absent, it
+    falls back to the generic wording (no regression).
+
+    Scope note (task-866648cc): these tests cover the guard's TRANSPORT only —
+    that whatever detail it is handed reaches the model intact. They hand-build
+    ``EffectiveTarget`` and therefore say nothing about whether the detail is
+    TRUE. That gap is why a screener that guessed "pod not registered" for every
+    carrier gate passed CI for six days. The truthfulness of each gate's cause is
+    asserted where the cause is produced —
+    ``test_screener.TestCarrierRejectReasonIsTruthful``.
+    """
+
+    _DETAIL = "carrier pod 'debugger-1' is not a privileged container"
+
+    def test_escape_detail_surfaced_verbatim(self):
+        eff = EffectiveTarget(
+            scope=SCOPE_ESCAPE, namespace="",
+            confidence=ConfidenceLevel.UNKNOWN,
+            raw_command="kubectl(exec chaosblade-tool-x -- chroot /host iptables)",
+            reject_detail=self._DETAIL,
+        )
+        d = target_drift_guard(eff, ApprovedTarget(scope="node", namespace=""))
+        assert d.verdict == GuardVerdict.REJECT_BANNED
+        assert self._DETAIL in d.reason
+        # The generic OR-template must not be appended alongside a known cause.
+        # This guards the ``or`` short-circuit: concatenating both halves would
+        # put two different explanations in one reason, and the model would have
+        # to pick. (The earlier version of this assertion was sound; what was
+        # wrong was the fixture it was paired with — ``_DETAIL`` used to hold the
+        # misattributed wording, which made a lie look like the expected value.)
+        assert "OR the host mutation is not self-recovering" not in d.reason
+
+    def test_escape_suggestion_surfaced_verbatim(self):
+        """The gate's own fix reaches the model, not the generic catch-all.
+
+        Cause and fix must describe the SAME condition: task-866648cc's
+        rejection paired a "your pod is unapproved" reason with a suggestion
+        stating the command form was already acceptable, so the two halves
+        contradicted each other and the model believed the half that was wrong.
+        """
+        suggestion = (
+            "Keep this command and pair it with its own reversal so the fault "
+            "expires on its own"
+        )
+        eff = EffectiveTarget(
+            scope=SCOPE_ESCAPE, namespace="",
+            confidence=ConfidenceLevel.UNKNOWN,
+            raw_command="kubectl(exec debugger-1 -- chroot /host tc qdisc add)",
+            reject_detail="the host mutation carries no paired reversal",
+            reject_suggestion=suggestion,
+        )
+        d = target_drift_guard(eff, ApprovedTarget(scope="node", namespace=""))
+        assert suggestion in d.suggestion
+        # The catch-all must not be appended alongside a gate-specific fix: it
+        # is what told the model "<host-entry> is ANY accepted primitive" while
+        # the real gate was the missing reversal.
+        assert "ANY accepted primitive" not in d.suggestion
+
+    def test_escape_fallback_generic_reason_when_no_detail(self):
+        """With no gate recorded, the OR-form is the honest answer.
+
+        Naming a single condition here would be a guess. The generic template is
+        vague but true, and vague-but-true beats specific-but-wrong: the latter
+        actively steers the model at the wrong subsystem.
+        """
+        eff = EffectiveTarget(
+            scope=SCOPE_ESCAPE, namespace="",
+            confidence=ConfidenceLevel.UNKNOWN,
+            raw_command="chroot /host iptables",
+        )
+        d = target_drift_guard(eff, ApprovedTarget(scope="node", namespace=""))
+        assert d.verdict == GuardVerdict.REJECT_BANNED
+        assert "OR the host mutation is not self-recovering" in d.reason
+        # Both halves fall back together, so the pair stays self-consistent.
+        assert "ANY accepted primitive" in d.suggestion
+
+    def test_banned_detail_surfaced_verbatim(self):
+        detail = "kubectl subcommand 'delete' is explicitly banned (too dangerous to classify)"
+        eff = EffectiveTarget(
+            scope=SCOPE_BANNED, namespace="",
+            confidence=ConfidenceLevel.HIGH,
+            raw_command="kubectl(delete pods --all)",
+            reject_detail=detail,
+        )
+        d = target_drift_guard(eff, ApprovedTarget(scope="pod", namespace="ns"))
+        assert d.verdict == GuardVerdict.REJECT_BANNED
+        assert d.reason == detail
+        assert d.reason != "tool is in the banned list"
+
+    def test_banned_fallback_generic_reason_when_no_detail(self):
+        eff = EffectiveTarget(
+            scope=SCOPE_BANNED, namespace="",
+            confidence=ConfidenceLevel.HIGH,
+            raw_command="kubectl(proxy)",
+        )
+        d = target_drift_guard(eff, ApprovedTarget(scope="pod", namespace="ns"))
+        assert d.verdict == GuardVerdict.REJECT_BANNED
+        # No precise cause recorded: still not fully masked — the raw command
+        # is echoed alongside the generic wording.
+        assert d.reason.startswith("tool is in the banned list")
+        assert "kubectl(proxy)" in d.reason
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +218,110 @@ class TestApprovedNoneDefence:
         )
         d = target_drift_guard(effective, approved=None)
         assert d.verdict == GuardVerdict.REJECT_UNKNOWN
+
+
+class TestZoneLabelNameBatchDrift:
+    """AZ label-approved node fault, executed per node name in batches.
+
+    Regression for task-40c934fb: the guard used to reject the labels↔names
+    cross as 'resource selection drift'. With the zone label resolved to
+    concrete node names at freeze time (``approved.resolved_names``), an
+    in-zone name batch must pass while an out-of-zone name is still rejected.
+    """
+
+    _ZONE = {"topology.kubernetes.io/zone": "az-b"}
+
+    def _approved(self):
+        return ApprovedTarget(
+            scope="node", namespace="",
+            labels=dict(self._ZONE),
+            resolved_names=("node-1", "node-2", "node-3"),
+            blade_target="network", blade_action="drop",
+            lock_fault_type=False,
+        )
+
+    def test_in_zone_name_batch_not_drift(self):
+        effective = EffectiveTarget(
+            scope="node", namespace="",
+            names=("node-1", "node-2"),
+            raw_command="kubectl(debug node/node-1)",
+        )
+        d = target_drift_guard(effective, self._approved())
+        assert d.verdict != GuardVerdict.REJECT_DRIFT
+
+    def test_out_of_zone_name_rejected(self):
+        effective = EffectiveTarget(
+            scope="node", namespace="",
+            names=("node-99",),
+            raw_command="kubectl(debug node/node-99)",
+        )
+        d = target_drift_guard(effective, self._approved())
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+
+    def test_labels_only_without_resolved_still_cross_rejected(self):
+        # No resolved_names frozen (e.g. resolution failed) → the labels↔names
+        # cross is still rejected, preserving the pre-fix safe default.
+        approved = ApprovedTarget(
+            scope="node", namespace="",
+            labels=dict(self._ZONE),
+            blade_target="network", blade_action="drop",
+            lock_fault_type=False,
+        )
+        effective = EffectiveTarget(
+            scope="node", namespace="",
+            names=("node-1",),
+            raw_command="kubectl(debug node/node-1)",
+        )
+        d = target_drift_guard(effective, approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+
+    def test_unit_names_subset_uses_resolved_names(self):
+        from chaos_agent.agent.target_guard.drift_policy import _check_names_subset
+        approved = self._approved()
+        assert _check_names_subset(
+            approved,
+            EffectiveTarget(scope="node", namespace="", names=("node-2",)),
+        ) is True
+        assert _check_names_subset(
+            approved,
+            EffectiveTarget(scope="node", namespace="", names=("node-2", "node-99")),
+        ) is False
+
+
+class TestPodLabelNameBatchDrift:
+    """Pod fault approved by app labels, executed by pod names.
+
+    Same label↔name cross as the AZ node case, generalised to pod scope: the
+    pod labels are resolved to concrete pod names at freeze time, so an
+    in-selector pod-name batch passes while an out-of-selector pod is rejected.
+    """
+
+    def _approved(self):
+        return ApprovedTarget(
+            scope="pod", namespace="prod",
+            labels={"app": "checkout"},
+            resolved_names=("checkout-abc", "checkout-def", "checkout-ghi"),
+            blade_target="network", blade_action="loss",
+            lock_fault_type=False,
+        )
+
+    def test_in_selector_pod_batch_not_drift(self):
+        effective = EffectiveTarget(
+            scope="pod", namespace="prod",
+            names=("checkout-abc", "checkout-def"),
+            raw_command="kubectl(delete pod checkout-abc -n prod)",
+        )
+        d = target_drift_guard(effective, self._approved())
+        assert d.verdict != GuardVerdict.REJECT_DRIFT
+
+    def test_out_of_selector_pod_rejected(self):
+        effective = EffectiveTarget(
+            scope="pod", namespace="prod",
+            names=("other-app-xyz",),
+            raw_command="kubectl(delete pod other-app-xyz -n prod)",
+        )
+        d = target_drift_guard(effective, self._approved())
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +699,194 @@ class TestSuggestionFormatting:
         assert "ns=<cluster>" in d.suggestion
 
 
+class TestBannedRejectionSeparatesCauseFromWayForward:
+    """A BANNED verdict must answer both questions, in their own fields.
+
+    ``reason`` says why it was refused, ``suggestion`` says what to do instead.
+    Before this split, six of the seven bans said only WHY ("outside the
+    target-scoped operation model") and the seventh folded its way forward into
+    the prose of ``reject_detail``. Two of them additionally referred to a
+    whitelist the classifier owns without naming it — the same shape of failure
+    that made a ``kubectl label`` rejection unactionable in task-c758cdbd.
+
+    Only the classifier can supply the alternative: which ban fired, and what
+    the whitelist holds, is its knowledge. The guard sees a ``__banned__``
+    sentinel and forwards.
+    """
+
+    APPROVED = ApprovedTarget(scope="pod", namespace="ns", names=("p",))
+
+    def _decide(self, tool, args):
+        return target_drift_guard(infer_effective_target(tool, args), self.APPROVED)
+
+    @pytest.mark.parametrize("tool,args,expected", [
+        # kubeconfig write → per-call flags (same answer the ToolGuard layer gives)
+        ("kubectl", {"subcommand": "config", "v_args": "use-context other"},
+         "--context / --kubeconfig"),
+        # proxy → the subcommands already carry the connection
+        ("kubectl", {"subcommand": "proxy", "v_args": "--port=8080"},
+         "No tunnel is needed"),
+        # -f file → stdin_data
+        ("kubectl", {"subcommand": "apply", "v_args": "-f /tmp/x.yaml"},
+         "stdin_data"),
+        # manifest without kind → declare one
+        ("kubectl", {"subcommand": "apply", "v_args": "-f -", "stdin_data": "foo: bar"},
+         "Declare an explicit 'kind:'"),
+        # non-whitelisted kind → why workloads are refused
+        ("kubectl", {"subcommand": "apply", "v_args": "-f -",
+                     "stdin_data": "kind: Deployment"},
+         "blast radius"),
+        # skill script → use the classifiable tools
+        ("_execute_skill_script", {"script": "x.sh"}, "kubectl / blade tools"),
+    ])
+    def test_ban_with_an_alternative_states_it(self, tool, args, expected):
+        d = self._decide(tool, args)
+        assert d.verdict == GuardVerdict.REJECT_BANNED
+        assert expected in d.suggestion, d.suggestion
+        # The cause stays in reason and does NOT absorb the alternative.
+        assert d.reason
+        assert expected not in d.reason
+
+    @pytest.mark.parametrize("tool,args", [
+        ("kubectl", {"subcommand": "apply", "v_args": "-f /tmp/x.yaml"}),
+        ("kubectl", {"subcommand": "apply", "v_args": "-f -", "stdin_data": "foo: bar"}),
+        ("kubectl", {"subcommand": "apply", "v_args": "-f -",
+                     "stdin_data": "kind: Deployment"}),
+    ])
+    def test_manifest_bans_name_the_accepted_kinds(self, tool, args):
+        """Never say "only whitelisted kinds" without listing them.
+
+        The list is rendered from ``ALLOWED_MANIFEST_KINDS`` so it cannot go
+        stale relative to the check that enforces it.
+        """
+        from chaos_agent.agent.target_guard.classifier import ALLOWED_MANIFEST_KINDS
+
+        d = self._decide(tool, args)
+        for kind in ALLOWED_MANIFEST_KINDS:
+            assert kind in d.suggestion, kind
+
+    def test_certificate_ban_stays_a_dead_end(self):
+        """An empty suggestion is a STATEMENT: no drill form exists.
+
+        ``guard_gateway`` derives ``is_hard_floor`` from it, so filling this in
+        with a placeholder would downgrade a real boundary to "reshape and
+        retry" and send the model looking for a way around CSR approval.
+        """
+        from chaos_agent.tools.guard_gateway import decision_to_feedback
+
+        d = self._decide("kubectl", {"subcommand": "certificate", "v_args": "approve c"})
+        assert d.verdict == GuardVerdict.REJECT_BANNED
+        assert d.suggestion == ""
+        assert decision_to_feedback(d).is_hard_floor is True
+
+    @pytest.mark.parametrize("tool,args", [
+        ("kubectl", {"subcommand": "config", "v_args": "use-context other"}),
+        ("kubectl", {"subcommand": "proxy", "v_args": "--port=8080"}),
+        ("kubectl", {"subcommand": "apply", "v_args": "-f /tmp/x.yaml"}),
+        ("_execute_skill_script", {"script": "x.sh"}),
+    ])
+    def test_ban_with_an_alternative_is_not_a_dead_end(self, tool, args):
+        """The mirror of the case above: a stated alternative must reach the
+        model as "reshapeable", or the suggestion contradicts the verdict."""
+        from chaos_agent.tools.guard_gateway import decision_to_feedback
+
+        fb = decision_to_feedback(self._decide(tool, args))
+        assert fb.is_hard_floor is False
+        assert fb.compliant_form
+
+
+class TestUnparseableCallNamesTheMissingArgument:
+    """``confidence=unknown`` must say WHICH argument was missing.
+
+    The verdict alone ("classifier confidence=unknown for <cmd>") tells the
+    model that something could not be parsed but not what, and this branch —
+    unlike the ``approved is None`` one, which the screener's renderer annotates
+    — gets no compensating note downstream. So it used to reach the model as a
+    dead end with no lead, while the SCOPE_UNKNOWN branch right above it already
+    forwarded the classifier's ``reject_detail`` and offered a way forward.
+
+    The cause is available at the source: the python-app classifier knows which
+    of ``target``/``action`` is absent, and the host classifier knows the
+    ``command`` was empty.
+    """
+
+    APPROVED = ApprovedTarget(
+        scope="host", namespace="", names=("h1",), blade_target="network",
+    )
+
+    @pytest.mark.parametrize("tool,args,expected", [
+        ("host_inject", {"command": ""}, "empty 'command'"),
+        ("blade_python_create", {"target": "redis"}, "missing action"),
+        ("blade_python_create", {"action": "delay"}, "missing target"),
+        ("blade_python_create", {}, "missing target and action"),
+    ])
+    def test_reason_names_the_missing_argument(self, tool, args, expected):
+        effective = infer_effective_target(tool, args)
+        d = target_drift_guard(effective, self.APPROVED)
+        assert d.verdict == GuardVerdict.REJECT_UNKNOWN
+        assert expected in d.reason, d.reason
+        # And a form issue must offer the way forward, not just the diagnosis.
+        assert d.suggestion
+        assert "form issue" in d.suggestion
+
+    @pytest.mark.parametrize("tool,args", [
+        ("host_inject", {"command": "iptables -A INPUT -j DROP"}),
+        ("blade_python_create", {"target": "redis", "action": "delay"}),
+    ])
+    def test_complete_call_still_classifies_high(self, tool, args):
+        """The added detail must not leak into a successful classification."""
+        effective = infer_effective_target(tool, args)
+        assert effective.confidence == ConfidenceLevel.HIGH
+        assert effective.reject_detail == ""
+
+
+class TestEveryRejectionOffersAWayForward:
+    """A rejection the model can act on must say HOW.
+
+    ``suggestion`` is the only field carrying that, and the screener renders it
+    verbatim. A rejection with neither a suggestion nor a downstream annotation
+    reads as an unexplained wall — the failure mode this module's own
+    ``SCOPE_ESCAPE`` comment warns about ("deliberately worded to make the model
+    conclude this path is unviable — the exact opposite of restoring its
+    perception").
+
+    The one deliberate exception is ``approved is None``: the screener's
+    renderer annotates that verdict itself (it is passed
+    ``approved_missing=approved is None``), so the guidance reaches the model
+    from there instead.
+
+    A BANNED verdict with NO suggestion is also legitimate, but only when no
+    compliant form exists at all — see
+    ``TestBannedRejectionSeparatesCauseFromWayForward``, which pins both halves
+    (``kubectl certificate`` stays empty; the other six must state theirs).
+    """
+
+    @pytest.mark.parametrize("effective,approved", [
+        # scope drift across profiles
+        (EffectiveTarget(scope="pod", namespace="ns", names=("p",)),
+         ApprovedTarget(scope="host", namespace="", names=("h",))),
+        # same-profile name drift
+        (EffectiveTarget(scope="pod", namespace="ns", names=("other",)),
+         ApprovedTarget(scope="pod", namespace="ns", names=("p",))),
+        # namespace drift
+        (EffectiveTarget(scope="pod", namespace="other", names=("p",)),
+         ApprovedTarget(scope="pod", namespace="ns", names=("p",))),
+        # unclassifiable call
+        (EffectiveTarget(scope=SCOPE_UNKNOWN, namespace="", raw_command="mystery"),
+         ApprovedTarget(scope="pod", namespace="ns", names=("p",))),
+        # unknown confidence on a real scope
+        (EffectiveTarget(scope="host", namespace="", raw_command="host_inject()",
+                         confidence=ConfidenceLevel.UNKNOWN),
+         ApprovedTarget(scope="host", namespace="", names=("h",))),
+    ])
+    def test_rejection_carries_a_suggestion(self, effective, approved):
+        d = target_drift_guard(effective, approved)
+        assert d.is_reject, d.verdict
+        assert d.suggestion, (
+            f"{d.verdict.value} ({d.reason}) gives the model nothing to act on"
+        )
+
+
 # ---------------------------------------------------------------------------
 # is_reject / is_allow predicates
 # ---------------------------------------------------------------------------
@@ -646,3 +1052,131 @@ class TestTier1ToolPodExec:
         )
         d = target_drift_guard(effective, approved)
         assert d.verdict == GuardVerdict.REJECT_DRIFT
+
+
+class TestHostScope:
+    """Host-scope faults (host_inject) are anchored by host_name + fault
+    family, bypassing the k8s namespace/names/labels checks (steps 5-6)."""
+
+    def _approved(self, **kw):
+        base = dict(
+            scope="host", namespace="", names=("node-1",),
+            host_name="node-1", blade_target="network",
+            blade_action="loss", lock_fault_type=True,
+        )
+        base.update(kw)
+        return ApprovedTarget(**base)
+
+    def _effective(self, **kw):
+        base = dict(
+            scope="host", namespace="", host_name="",
+            blade_target="network", confidence=ConfidenceLevel.HIGH,
+            raw_command="host_inject(...)",
+        )
+        base.update(kw)
+        return EffectiveTarget(**base)
+
+    def test_matching_host_family_allows(self):
+        d = target_drift_guard(self._effective(), self._approved())
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_fault_family_drift_rejected(self):
+        # approved=network, effective=process → blade_target lock trips.
+        d = target_drift_guard(
+            self._effective(blade_target="process"), self._approved(),
+        )
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "blade_target drift" in d.reason
+
+    def test_host_name_drift_rejected(self):
+        d = target_drift_guard(
+            self._effective(host_name="node-2"), self._approved(),
+        )
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "host drift" in d.reason
+
+    def test_empty_effective_names_not_rejected_by_k8s_selector(self):
+        # Regression: host_inject carries no k8s names; the old step-6
+        # names/labels check would REJECT_DRIFT. Host branch bypasses it.
+        d = target_drift_guard(self._effective(names=()), self._approved())
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_host_effective_under_k8s_approval_is_scope_drift(self):
+        approved = ApprovedTarget(scope="pod", namespace="prod", names=("p1",))
+        d = target_drift_guard(self._effective(), approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "scope drift" in d.reason
+
+    def test_k8s_effective_under_host_approval_is_scope_drift(self):
+        # Reverse cross-profile direction: a host approval must never
+        # legitimise a k8s-resource call. Dispatched before either
+        # per-carrier DriftPolicy sees the pair.
+        effective = EffectiveTarget(
+            scope="pod", namespace="prod", names=("p1",),
+            confidence=ConfidenceLevel.HIGH, raw_command="kubectl(...)",
+        )
+        d = target_drift_guard(effective, self._approved())
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "scope drift" in d.reason
+
+
+class TestCrossFamilyScopeChange:
+    """``host`` and ``python`` share the host profile, so a swap between them
+    survives the profile comparison (step 4) and carries no comparable host
+    identity (step 5). The fault TYPE is the only discriminator left.
+
+    Concretely: approving "iptables DROP on h1" and executing "delay every Redis
+    GET inside a python process" — or the reverse, where an in-process delay
+    becomes a host-wide firewall rule — are different experiments with different
+    blast radii. When the fault type cannot be compared, the guard must refuse
+    rather than allow a match it cannot prove.
+    """
+
+    def _python_call(self) -> EffectiveTarget:
+        return infer_effective_target(
+            "blade_python_create",
+            {"target": "redis", "action": "delay", "flags": "--time 500"},
+        )
+
+    def _host_call(self) -> EffectiveTarget:
+        return infer_effective_target(
+            "host_inject", {"command": "iptables -A INPUT -j DROP"},
+        )
+
+    def test_host_approval_rejects_python_call_without_fault_type(self):
+        approved = ApprovedTarget(scope="host", namespace="", names=("h1",))
+        d = target_drift_guard(self._python_call(), approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "fault family changed" in d.reason
+
+    def test_python_approval_rejects_host_call_without_fault_type(self):
+        approved = ApprovedTarget(scope="python", namespace="", names=())
+        d = target_drift_guard(self._host_call(), approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "fault family changed" in d.reason
+
+    def test_comparable_fault_types_still_reported_as_type_drift(self):
+        """When both sides carry a blade_target the existing lock renders the
+        verdict — the new check must not shadow its clearer message."""
+        approved = ApprovedTarget(
+            scope="host", namespace="", names=("h1",),
+            blade_target="network", blade_action="loss",
+        )
+        d = target_drift_guard(self._python_call(), approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "blade_target drift" in d.reason
+
+    def test_same_scope_is_untouched_even_without_fault_type(self):
+        """The check must key on a scope CHANGE, not on a missing blade_target:
+        a normal host drill that never recorded one stays allowed."""
+        approved = ApprovedTarget(scope="host", namespace="", names=("h1",))
+        d = target_drift_guard(self._host_call(), approved)
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_matching_python_drill_is_allowed(self):
+        approved = ApprovedTarget(
+            scope="python", namespace="", names=(),
+            blade_target="redis", blade_action="delay",
+        )
+        d = target_drift_guard(self._python_call(), approved)
+        assert d.verdict == GuardVerdict.ALLOW

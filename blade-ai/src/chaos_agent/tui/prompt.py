@@ -110,6 +110,15 @@ def _format_tokens(count: int) -> str:
     return str(count)
 
 
+def _is_host_profile() -> bool:
+    """True when the configured transport channel targets a bare host."""
+    try:
+        from chaos_agent.transports.registry import is_host_scope_channel
+        return is_host_scope_channel()
+    except Exception:
+        return False
+
+
 def _display_width(s: str) -> int:
     """Terminal display width, treating unknown chars as width 1."""
     w = wcswidth(s)
@@ -400,8 +409,14 @@ def _render_status_bar(state: SessionState) -> list[tuple[str, str]]:
             parts.extend(_render_progress_bar(percent, 8))
             parts.append(("class:toolbar.dim", f" {percent:.0f}%"))
 
-    parts.append(("class:toolbar.dim", " \u00b7 "))
-    parts.append(("class:toolbar.dim", f"ns:{state.namespace}"))
+    parts.append(("class:toolbar.dim", " · "))
+    # Locator segment follows the active profile: host channels show the host
+    # name, k8s channels show the namespace.
+    if _is_host_profile():
+        from chaos_agent.config.settings import settings
+        parts.append(("class:toolbar.dim", f"host:{settings.host_name or '(auto)'}"))
+    else:
+        parts.append(("class:toolbar.dim", f"ns:{state.namespace}"))
 
     # PR-D1 §17.1 — surface the active density mode. calm hides
     # the experiment card / risk meter etc., so making the mode visible

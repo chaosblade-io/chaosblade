@@ -5,15 +5,18 @@ at least one other tool (e.g., kubectl) between two time_wait calls.
 This prevents idle spinning.
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 
+from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 
 logger = logging.getLogger(__name__)
 
-MAX_WAIT_SECONDS = 30
-MAX_CALLS_PER_TASK = 3
+MAX_WAIT_SECONDS = 180
+MAX_CALLS_PER_TASK = 50
 
 # Track state to enforce no-consecutive rule and max call limit.
 # Module-level state, reset per task via reset_wait_state().
@@ -34,6 +37,32 @@ def mark_other_tool_called():
     _last_tool_was_wait = False
 
 
+def check_and_reset_wait_guard(messages: list) -> None:
+    """Scan the most recent batch of ToolMessages and reset the wait guard.
+
+    A "batch" is the contiguous block of ToolMessages at the tail of
+    *messages* (all produced by the same AIMessage's tool_calls).  If
+    **any** ToolMessage in that batch is not ``time_wait``, the
+    consecutive-call flag is cleared so the LLM may call ``time_wait``
+    again.
+
+    This replaces the earlier logic that only inspected the single most
+    recent ToolMessage.  When the LLM emits parallel tool calls (e.g.
+    ``kubectl`` + ``time_wait``) the old check would see ``time_wait``
+    as the last message and fail to reset, causing a false-positive
+    "consecutive call" rejection on the next iteration.
+    """
+    found_non_wait = False
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            break  # exited the contiguous ToolMessage batch
+        name = getattr(msg, "name", "") or ""
+        if name != "time_wait":
+            found_non_wait = True
+    if found_non_wait:
+        mark_other_tool_called()
+
+
 @tool
 async def time_wait(seconds: int = 10) -> str:
     """Pause execution for a specified number of seconds.
@@ -49,7 +78,7 @@ async def time_wait(seconds: int = 10) -> str:
       - If you call time_wait consecutively, it will be rejected.
 
     Inputs:
-      - seconds: How long to wait (1-30, default 10). Clamped to max 30s.
+      - seconds: How long to wait (1-180, default 10). Clamped to max 180s.
 
     Output: Confirmation of how long was waited.
 

@@ -20,6 +20,7 @@ class SkillValidator:
         "target",
         "required_tools",
         "tags",
+        "skill_type",
         "parameters",
         "scripts",
     ]

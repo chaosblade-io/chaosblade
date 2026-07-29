@@ -37,8 +37,45 @@ import typer
 from chaos_agent.cli.config_manager import get_backend, get_mode
 from chaos_agent.config.settings import settings
 from chaos_agent.skills.loader import get_skills_dir
+from chaos_agent.transports import (
+    PROFILE_HOST,
+    TransportRegistry,
+    TransportTarget,
+    execute_via_transport,
+    is_host_scope_channel,
+    is_kubewiz_channel,
+    resolve_channel_name,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _is_kubewiz_channel() -> bool:
+    """Check if a kubewiz connection mode is active.
+
+    Thin wrapper over :func:`chaos_agent.transports.is_kubewiz_channel` —
+    resolves the active channel (honouring the ``kube_connection_mode``
+    override and field-based inference) and returns ``True`` for
+    ``kubewiz_k8s`` / ``kubewiz_host``.  Retained as a module-local name
+    because it is referenced throughout this module's checks.
+    """
+    return is_kubewiz_channel()
+
+
+def _is_host_scope_channel() -> bool:
+    """True for host-scope channels (ssh / kubewiz_host).
+
+    Host-scope drills target a machine directly, not a K8s cluster, so the
+    K8s-oriented live checks (cluster connectivity, ChaosBlade Operator) do
+    not apply.  Each connection mode should only validate its own config
+    surface — running a kubectl/wiz cluster probe in ssh/kubewiz_host mode
+    would spuriously fail (or hang) at TUI boot.
+
+    Thin wrapper over :func:`chaos_agent.transports.is_host_scope_channel`,
+    retained as a module-local name because it is referenced throughout
+    this module's checks.
+    """
+    return is_host_scope_channel()
 
 
 @dataclass
@@ -81,7 +118,11 @@ def expand_kubeconfig_path(path: str) -> str:
 
 def check_kubeconfig() -> CheckResult:
     """Check that a readable kubeconfig exists."""
-    if settings.kube_connection_mode == "kubewiz":
+    # Host-scope channels (ssh / kubewiz_host) don't use kubeconfig; their
+    # required fields are validated by check_transport_config instead.
+    if is_host_scope_channel():
+        return CheckResult(name="kubeconfig", severity="blocking", passed=True)
+    if _is_kubewiz_channel():
         missing = []
         if not settings.kubewiz_cluster_uuid:
             missing.append("BLADE_AI_KUBEWIZ_CLUSTER_UUID")
@@ -127,7 +168,10 @@ def check_kubeconfig() -> CheckResult:
 def check_kubectl() -> CheckResult:
     """Check that kubectl (or wiz in kubewiz mode) is executable."""
     from chaos_agent.utils.blade_paths import is_executable
-    if settings.kube_connection_mode == "kubewiz":
+    # SSH channel executes on the remote host; local kubectl is irrelevant.
+    if resolve_channel_name() == "ssh":
+        return CheckResult(name="kubectl", severity="blocking", passed=True)
+    if _is_kubewiz_channel():
         if is_executable(settings._resolve_wiz_path()):
             return CheckResult(name="kubectl", severity="blocking", passed=True)
         return CheckResult(
@@ -175,13 +219,64 @@ def check_blade() -> CheckResult:
     )
 
 
+def check_transport_config() -> CheckResult:
+    """Validate host-scope transport fields (ssh / kubewiz_host).
+
+    K8s-scope config (kubeconfig file / kubewiz_k8s uuid+profile) is covered
+    by check_kubeconfig.  This fills the gap for host-scope channels by
+    delegating to the channel's own ``preflight`` — so a user who selects
+    ssh/kubewiz_host but forgets a required field is told at boot time,
+    not deep inside execution.
+    """
+    target = TransportTarget.from_state({})
+    try:
+        channel = TransportRegistry.resolve(target)
+    except ValueError as exc:
+        # Invalid channel override / under-specified scope — surface as a clean
+        # boot-time failure instead of crashing with a traceback.
+        return CheckResult(
+            name="transport_config",
+            severity="blocking",
+            passed=False,
+            message=f"传输通道配置无效: {exc}",
+            fix="检查 kube_connection_mode 及对应通道所需字段（host_name / ssh_host 等）",
+        )
+    if channel.name not in ("ssh", "kubewiz_host"):
+        # k8s-scope channels are validated by check_kubeconfig.
+        return CheckResult(name="transport_config", severity="blocking", passed=True)
+    errors = channel.preflight(target)
+    if errors:
+        return CheckResult(
+            name="transport_config",
+            severity="blocking",
+            passed=False,
+            message=f"{channel.name} 通道配置缺失: {'; '.join(errors)}",
+            fix="通过 blade-ai config set 或环境变量补齐上述字段",
+        )
+    return CheckResult(name="transport_config", severity="blocking", passed=True)
+
+
+# NOTE (Python-application faults): there is deliberately NO preflight check for
+# the ChaosBlade Python agent. Two reasons, both structural:
+#   1. The preflight signature carries no fault scope, so any check registered in
+#      INJECT_CHECKS runs for EVERY drill and ``display`` would print its fix
+#      guidance every time — telling k8s / host operators to attach an in-process
+#      agent they do not need.
+#   2. A local probe would check the WRONG machine: python-scope faults run over a
+#      host channel (ssh / kubewiz_host), so the agent lives on the target
+#      application's host, not on the machine running blade-ai.
+# The precondition is surfaced where the scope IS known and the transport IS
+# resolved: ``tools.blade_python.blade_python_create`` maps the CLI's
+# "port not found" error to the prepare/attach guidance.
+
+
 # ── Check lists per command ─────────────────────────────────────────
 
 INJECT_CHECKS: list[Callable[[], CheckResult]] = [
-    check_llm_api_key, check_kubeconfig, check_kubectl, check_blade,
+    check_llm_api_key, check_kubeconfig, check_kubectl, check_transport_config, check_blade,
 ]
 RECOVER_CHECKS: list[Callable[[], CheckResult]] = [
-    check_llm_api_key, check_kubeconfig, check_kubectl, check_blade,
+    check_llm_api_key, check_kubeconfig, check_kubectl, check_transport_config, check_blade,
 ]
 LIST_CHECKS: list[Callable[[], CheckResult]] = [check_llm_api_key]
 CONFIRM_CHECKS: list[Callable[[], CheckResult]] = [check_llm_api_key]
@@ -225,7 +320,7 @@ def _get_preflight_openai_client(
     to the constructor; settings is read live below. By keying on the
     live settings fingerprint, an in-process config change (TUI
     ``/config set`` writes the file then calls ``settings.reload()``
-    — see ``tui/config_store.py``) produces a cache miss and rebuilds
+    — see ``config/config_store.py``) produces a cache miss and rebuilds
     the client with the new credentials. Without this, ``/doctor``
     after rotating an API key would still probe with the stale instance.
 
@@ -441,7 +536,13 @@ async def check_kubeconfig_live() -> CheckResult:
     runtime). Bonus: catches inter-field invariants (missing user, bad
     auth-info ref) that a pure YAML structure check would miss.
     """
-    if settings.kube_connection_mode == "kubewiz":
+    if resolve_channel_name() == "ssh":
+        # Host-scope ssh channel needs no local kubeconfig — mirror the sync
+        # check_kubeconfig exemption so ssh mode doesn't emit a spurious
+        # blocking failure at TUI boot.
+        return CheckResult(name="kubeconfig", severity="blocking", passed=True,
+                           message="ssh mode (no kubeconfig needed)")
+    if _is_kubewiz_channel():
         return CheckResult(name="kubeconfig", severity="blocking", passed=True,
                            message="kubewiz mode (no kubeconfig needed)")
     path_raw = settings.kubeconfig_path
@@ -512,7 +613,6 @@ async def check_kubeconfig_live() -> CheckResult:
 
     summary = stdout.decode(errors="replace").strip()
     cluster_part = summary.split("|", 1)
-    cluster_name = cluster_part[0] if cluster_part else ""
     server = cluster_part[1] if len(cluster_part) > 1 else ""
     if not server:
         return CheckResult(
@@ -580,7 +680,12 @@ async def _check_wiz_version() -> CheckResult:
 
 async def check_kubectl_version() -> CheckResult:
     """Run the same kubectl the agent uses, ask for its version."""
-    if settings.kube_connection_mode == "kubewiz":
+    if resolve_channel_name() == "ssh":
+        # ssh channel executes on the remote host; local kubectl is
+        # irrelevant (mirrors sync check_kubectl).
+        return CheckResult(name="kubectl", severity="blocking", passed=True,
+                           message="ssh mode (remote kubectl)")
+    if _is_kubewiz_channel():
         return await _check_wiz_version()
     base_cmd, _ = _kubectl_base_cmd()
     try:
@@ -760,8 +865,64 @@ def check_skills() -> CheckResult:
     return CheckResult(name="skills", severity="warning", passed=True, message=message)
 
 
+async def _check_host_connectivity() -> CheckResult:
+    """Probe host reachability for host-scope channels (ssh / kubewiz_host).
+
+    Runs a trivial no-op command (``echo``) through the resolved host
+    channel — ``SSHChannel`` wraps it in ``ssh … -- echo``,
+    ``KubewizHostChannel`` in ``wiz task exec --command "echo" --name
+    <host>``.  Exit 0 proves the host is reachable and the auth/tunnel
+    works, without touching any K8s API.  ``skip_guard=True`` because this
+    is an internal probe (``echo`` isn't in the ToolGuard allowlist).
+
+    A missing required field (e.g. ssh without ``ssh_host``) surfaces as a
+    channel preflight failure inside ``execute_via_transport`` — exit code
+    ``-1`` with the error in stderr — which we render as "not reachable".
+    """
+    target = TransportTarget.from_state({})
+    chan = resolve_channel_name()
+    timeout = _self_check_timeout()
+    try:
+        result = await execute_via_transport(
+            ["echo", "blade-ai-preflight"],
+            target,
+            timeout=timeout,
+            source="preflight-host-connectivity",
+            skip_guard=True,
+            # This check ASSERTS host reachability. Reached only from the
+            # host-scope branch, so normally a tautology — but if the scope
+            # says host while the resolved channel addresses a cluster, the
+            # platform executor would answer ``echo`` successfully and
+            # preflight would report the host as reachable. A false PASS
+            # here is worse than no check.
+            expect_profile=PROFILE_HOST,
+        )
+    except Exception as e:
+        return CheckResult(
+            name="host_connectivity", severity="blocking", passed=False,
+            message=f"主机连通性探测异常: {str(e)[:120]}",
+            fix="检查 host_name / ssh_host / ssh_user / ssh_key_path 配置及主机可达性",
+        )
+    if result.exit_code == 0:
+        label = "ssh" if chan == "ssh" else "kubewiz-host"
+        return CheckResult(
+            name="host_connectivity", severity="blocking", passed=True,
+            message=f"connected ({label})",
+        )
+    err = (result.stderr or result.stdout or "").strip()[:200]
+    return CheckResult(
+        name="host_connectivity", severity="blocking", passed=False,
+        message=f"主机不可达: {err or ('exit ' + str(result.exit_code))}",
+        fix="检查主机地址/端口/SSH 凭据，或 kubewiz host_name 与 profile 配置",
+    )
+
+
 async def check_k8s_connectivity() -> CheckResult:
     """Probe K8s cluster reachability AND fetch its server version."""
+    if _is_host_scope_channel():
+        # host-scope drill: no K8s cluster — probe the HOST instead
+        # (mode-scoped check).  The row renders as ``host_connectivity``.
+        return await _check_host_connectivity()
     from chaos_agent.tools.kubectl import exec_kubectl_raw
 
     timeout = _self_check_timeout()
@@ -905,9 +1066,16 @@ def _extract_operator_image_version(images: list[str]) -> str:
 
 async def check_chaosblade_operator() -> CheckResult:
     """Check if ChaosBlade Operator is deployed and capture its image tag."""
+    if _is_host_scope_channel():
+        # host-scope drill: the ChaosBlade Operator is a K8s component and
+        # is irrelevant here — skip (mode-scoped check).
+        return CheckResult(
+            name="chaosblade_operator", severity="warning", passed=True,
+            message="host mode (Operator 检查已跳过)",
+        )
     from chaos_agent.tools.kubectl import exec_kubectl_raw
 
-    if settings.kube_connection_mode == "kubewiz":
+    if _is_kubewiz_channel():
         v_args = ["deploy", "-A", "-o", "json"]
     else:
         _jsonpath = "jsonpath={range .items[*]}{.metadata.name}|{.status.availableReplicas}|{range .spec.template.spec.containers[*]}{.image},{end}{'\\n'}{end}"
@@ -933,7 +1101,7 @@ async def check_chaosblade_operator() -> CheckResult:
 
     if result.exit_code == 0:
         stdout_text = result.stdout.strip()
-        if settings.kube_connection_mode == "kubewiz":
+        if _is_kubewiz_channel():
             replica_tokens, image_tokens = _parse_operator_json(stdout_text)
         else:
             replica_tokens, image_tokens = _parse_operator_jsonpath(stdout_text)
@@ -958,31 +1126,47 @@ async def check_chaosblade_operator() -> CheckResult:
 
 
 async def run_tui_checks() -> list[CheckResult]:
-    """Run all TUI live preflight checks in parallel and return ordered results.
+    """Run the TUI live preflight checks in parallel and return ordered results.
 
-    All seven checks are live. ``asyncio.gather`` runs them concurrently;
-    per-check timeouts bound individual checks and the endpoint's outer
+    The check set is **mode-scoped**: a K8s-scope channel (kubeconfig /
+    kubewiz_k8s) validates the cluster surface (kubeconfig, kubectl,
+    cluster connectivity, ChaosBlade Operator), while a host-scope channel
+    (ssh / kubewiz_host) targets a bare machine — so it validates the host
+    transport config and reachability instead, and drops the K8s-only rows
+    that would otherwise render as meaningless green placeholders.
+
+    ``asyncio.gather`` runs the selected checks concurrently; per-check
+    timeouts bound individual checks and the endpoint's outer
     ``wait_for(15s)`` (see ``server/routes/preflight.py``) bounds the whole
-    panel. The order here is the display order the boot card uses.
+    panel. Each spec's name is the fallback row name (used when a check
+    raises) and the list order is the display order the boot card uses.
     """
+    if _is_host_scope_channel():
+        # Host-scope: no K8s cluster. Validate the host transport config
+        # (ssh_host / host_name etc.) and probe host reachability. ``blade``
+        # / ``skills`` stay because they are transport-agnostic capability
+        # checks. ``check_transport_config`` is sync — run it off the loop.
+        specs = [
+            ("llm_api_key", check_llm_api_key_live()),
+            ("transport_config", asyncio.to_thread(check_transport_config)),
+            ("host_connectivity", _check_host_connectivity()),
+            ("blade", check_blade_version()),
+            ("skills", asyncio.to_thread(check_skills)),
+        ]
+    else:
+        specs = [
+            ("llm_api_key", check_llm_api_key_live()),
+            ("kubeconfig", check_kubeconfig_live()),
+            ("kubectl", check_kubectl_version()),
+            ("blade", check_blade_version()),
+            ("skills", asyncio.to_thread(check_skills)),
+            ("k8s_connectivity", check_k8s_connectivity()),
+            ("chaosblade_operator", check_chaosblade_operator()),
+        ]
+    fallback_names = tuple(name for name, _ in specs)
     raw = await asyncio.gather(
-        check_llm_api_key_live(),
-        check_kubeconfig_live(),
-        check_kubectl_version(),
-        check_blade_version(),
-        asyncio.to_thread(check_skills),
-        check_k8s_connectivity(),
-        check_chaosblade_operator(),
+        *(coro for _, coro in specs),
         return_exceptions=True,
-    )
-    fallback_names = (
-        "llm_api_key",
-        "kubeconfig",
-        "kubectl",
-        "blade",
-        "skills",
-        "k8s_connectivity",
-        "chaosblade_operator",
     )
     results: list[CheckResult] = []
     for name, r in zip(fallback_names, raw):

@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.operation_summary import (
+from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.result.operation_summary import (
     build_batch_summary_text,
     build_recover_summary_text,
     build_task_summary_text,
@@ -175,8 +175,8 @@ def test_operation_summary_markers_stay_in_builder_and_trim_preserve_rule():
     """Production code should not hand-roll operation summary marker strings."""
 
     allowed = {
-        "src/chaos_agent/agent/operation_summary.py",
-        "src/chaos_agent/agent/nodes/intent_confirm.py",
+        "src/chaos_agent/agent/result/operation_summary.py",
+        "src/chaos_agent/agent/nodes/planning/intent_confirm.py",
     }
     markers = ("[Task Summary]", "[Batch Summary]", "[Recover Summary]")
 

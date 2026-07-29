@@ -6,7 +6,7 @@ from typing import Optional
 
 import typer
 
-from chaos_agent.cli.output import format_output
+from chaos_agent.cli.output import OutputFormat, format_output
 from chaos_agent.config.settings import settings
 from chaos_agent.preflight import INJECT_CHECKS, run_command
 
@@ -27,7 +27,7 @@ def inject_command(
     context: Optional[str] = typer.Option(None, "--context", help="Kubeconfig context name"),
     force_override: bool = typer.Option(False, "--force-override", help="Force proceed when confirm_required (P1: same-action overlay)"),
     stream: bool = typer.Option(False, "--stream", help="Stream output in real-time (NL mode only)"),
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json|yaml"),
+    output: OutputFormat = typer.Option(OutputFormat.json, "--output", "-o", help="Output format: json|yaml"),
 ):
     """Inject a fault into a Kubernetes target.
 
@@ -56,13 +56,17 @@ def inject_command(
             duration = effective
     # Validate: NL mode or structured mode, not both missing
     has_input = bool(input)
-    # Node-scope does not require --namespace (ChaosBlade ignores it for node scope)
+    # Cluster-scoped faults (node / host …) are namespace-less — derive from the
+    # fault registry so new namespace-less scopes don't need to touch the CLI.
+    from chaos_agent.agent.spec.fault_registry import aggregate_cluster_scoped
+
+    _namespace_optional = scope in aggregate_cluster_scoped()
     _required_fields = [scope, target, action]
-    if scope != "node":
+    if not _namespace_optional:
         _required_fields.append(namespace)
     has_structured = all(_required_fields) and (target_name or labels)
     if not has_input and not has_structured:
-        _ns_hint = ", --namespace" if scope != "node" else ""
+        _ns_hint = "" if _namespace_optional else ", --namespace"
         typer.echo(
             f"Error: Provide either --input/-i or all of --scope, --target, --action, "
             f"(--target-name or --labels){_ns_hint}",
@@ -77,7 +81,7 @@ def inject_command(
 
     # Validate: --direct requires complete structured params
     if direct and not has_structured:
-        _ns_hint = ", --namespace" if scope != "node" else ""
+        _ns_hint = "" if _namespace_optional else ", --namespace"
         typer.echo(
             f"Error: --direct requires all of --scope, --target, --action, "
             f"(--target-name or --labels){_ns_hint}",
@@ -90,10 +94,17 @@ def inject_command(
         typer.echo("Error: --stream requires --input/-i (natural language mode)", err=True)
         raise typer.Exit(code=1)
 
-    # Validate: scope must be valid if provided
-    if scope and scope not in {"node", "pod", "container"}:
-        typer.echo(f"Error: Invalid scope '{scope}', must be node/pod/container", err=True)
-        raise typer.Exit(code=1)
+    # Validate: scope must be valid if provided (derived from the fault registry)
+    if scope:
+        from chaos_agent.agent.spec.fault_registry import aggregate_scopes
+
+        valid_scopes = aggregate_scopes()
+        if scope not in valid_scopes:
+            typer.echo(
+                f"Error: Invalid scope '{scope}', must be one of: {', '.join(valid_scopes)}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
 
     # Parse params (supports bare keys for boolean flags)
     params_dict = {}
@@ -163,6 +174,12 @@ def inject_command(
                 elif event.type == "token":
                     sys.stdout.write(event.content)
                     sys.stdout.flush()
+                elif event.type == "node_message":
+                    # Programmatic status text from graph nodes (baseline
+                    # capture progress, safety-check steps, verifier results).
+                    # Write to stderr so stdout stays clean for LLM token output.
+                    sys.stderr.write(event.content)
+                    sys.stderr.flush()
                 elif event.type == "tool_start":
                     typer.echo(f"\n  ⏳ Calling tool: {event.tool_name}", err=True)
                 elif event.type == "tool_end":

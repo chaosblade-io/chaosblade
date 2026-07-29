@@ -2,7 +2,7 @@
 
 import pytest
 
-from chaos_agent.agent.nodes.memory_nodes import load_memory, save_memory
+from chaos_agent.agent.nodes.store.memory_nodes import load_memory, pipeline_init, save_memory
 from chaos_agent.config.settings import settings
 
 
@@ -74,6 +74,44 @@ class TestLoadMemory:
         state["target"] = {"namespace": "default"}
         result = await load_memory(state)
         assert "experiment_history" in result
+
+    @pytest.mark.asyncio
+    async def test_seeded_human_message_has_explicit_id(
+        self, sample_agent_state, tmp_memory_dir, monkeypatch,
+    ):
+        """Seeded HumanMessages must carry an explicit id.
+
+        The node appends the message to the session store BEFORE the
+        LangGraph ``add_messages`` reducer runs. If the message had no id
+        at that point, the store's dedup key fell back to type+content,
+        while the post-reducer copy (recorded later by the memory hook)
+        carried a reducer-assigned UUID — the key mismatch defeated dedup
+        and the same human message was written twice to the task JSONL.
+        """
+        monkeypatch.setattr(settings, "memory_dir", tmp_memory_dir)
+
+        state = dict(sample_agent_state)
+        state["input"] = "注入 CPU 故障"
+        for node in (load_memory, pipeline_init):
+            result = await node(dict(state))
+            msgs = result.get("messages") or []
+            assert msgs, f"{node.__name__} should seed a HumanMessage"
+            assert msgs[0].id, f"{node.__name__} message must have explicit id"
+
+    @pytest.mark.asyncio
+    async def test_direct_mode_message_has_explicit_id(
+        self, sample_agent_state, tmp_memory_dir, monkeypatch,
+    ):
+        """Direct-mode synthesised HumanMessages also need an explicit id."""
+        monkeypatch.setattr(settings, "memory_dir", tmp_memory_dir)
+
+        state = dict(sample_agent_state)
+        state["input"] = ""
+        for node in (load_memory, pipeline_init):
+            result = await node(dict(state))
+            msgs = result.get("messages") or []
+            if msgs:  # only asserted when the spec is complete enough to seed
+                assert msgs[0].id, f"{node.__name__} message must have explicit id"
 
 
 class TestSaveMemory:

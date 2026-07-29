@@ -7,8 +7,8 @@ import os
 
 from chaos_agent.tui import strings
 from chaos_agent.tui.commands import SlashCommandRegistry
-from chaos_agent.tui.config_store import ConfigStore
-from chaos_agent.tui.state import DisplayMode, SessionState
+from chaos_agent.config.config_store import ConfigStore
+from chaos_agent.tui.state import DisplayMode, PermissionMode, SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -858,8 +858,18 @@ class CommandDispatcher:
         )
 
     async def _cmd_config_list(self, args: str = "") -> None:
-        display = self._config_store.get_display_dict()
-        lines = [f"  {k}: {v}" for k, v in display.items()]
+        # Full view: overlay every key actually present in config.json (covers
+        # kube_connection_mode / kubewiz_* / host_* etc.) on the curated
+        # effective defaults, so stable settings (skills_dir / memory_dir /
+        # log_level) still show even when absent from the file. No hardcoded
+        # key list to drift. llm_api_key is printed as-is (operator's own local
+        # config) rather than masked.
+        from chaos_agent.config.settings import settings as s
+        view = dict(self._config_store.get_display_dict())
+        view.update(self._config_store.read_all())
+        if s.llm_api_key:
+            view["llm_api_key"] = s.llm_api_key
+        lines = [f"  {k}: {v}" for k, v in sorted(view.items())]
         self._renderer.system("Configuration:\n" + "\n".join(lines))
 
     async def _cmd_config_get(self, args: str = "") -> None:
@@ -883,6 +893,24 @@ class CommandDispatcher:
             is_hot = self._config_store.set(key, value)
         except Exception as e:
             self._renderer.system(f"Failed to set config: {e}")
+            return
+        # confirmation_required drives the runtime permission mode, which each
+        # turn reads from state.permission_mode (NOT settings). settings.reload()
+        # inside set() alone would leave the live mode stale until restart, so
+        # sync it here — this makes the “已热加载” claim true for this key and
+        # refreshes the header immediately (set_permission_mode notifies).
+        if key == "confirmation_required":
+            from chaos_agent.config.settings import settings
+            self._state.set_permission_mode(
+                PermissionMode.CONFIRM if settings.confirmation_required
+                else PermissionMode.AUTO
+            )
+            mode_label = (
+                "🔒 确认模式" if settings.confirmation_required else "✻ 自动模式"
+            )
+            self._renderer.system(
+                f"已写入 {key} = {value}（已热加载，当前 {mode_label}）"
+            )
             return
         if is_hot:
             self._renderer.system(f"已写入 {key} = {value}（已热加载）")
@@ -1052,9 +1080,13 @@ class CommandDispatcher:
         import asyncio
         from uuid import uuid4
 
-        from chaos_agent.memory.tokens import count_tokens_messages
+        from chaos_agent.memory.tokens import (
+            count_tokens_messages,
+            estimate_context_tokens,
+        )
         from chaos_agent.config.settings import settings as s
         from chaos_agent.observability.status_tracker import (
+            COMPACT_TRACKER_PREFIX,
             subscribe as _status_subscribe,
             unsubscribe as _status_unsubscribe,
         )
@@ -1081,9 +1113,15 @@ class CommandDispatcher:
         snapshot = await graph.aget_state(config)
         state_values = snapshot.values or {}
         messages = state_values.get("messages") or []
-        # /compact reports raw token counts to the user — match the server
-        # path semantics (sessions.py uses .count, not safe_count).
-        before = count_tokens_messages(messages).count
+        # Anchored on what the provider actually billed, not on the message text.
+        # The old ``count_tokens_messages`` reading was chosen "so users can
+        # compare against their own cost dashboards", but it achieved the
+        # opposite: a dashboard shows the provider's ``input_tokens``, which also
+        # covers the system prompt and every tool schema — 13K-17K that never
+        # appears in ``messages``. Raw ``.tokens`` (not ``safe_tokens``) because a
+        # threshold margin has no business inflating a figure shown to a person.
+        usage_before = estimate_context_tokens(messages)
+        before = usage_before.tokens
         if before == 0:
             self._renderer.system("会话尚无消息可压缩。")
             return
@@ -1095,7 +1133,7 @@ class CommandDispatcher:
         # emits to ``state["task_id"]``, so we override it with a
         # fresh id and subscribe to that — isolating us from any
         # ambient auto-compaction events on the long-running task id.
-        compact_task_id = f"compact-{uuid4().hex[:12]}"
+        compact_task_id = f"{COMPACT_TRACKER_PREFIX}{uuid4().hex[:12]}"
         queue = _status_subscribe(compact_task_id)
 
         async def _render_events() -> None:
@@ -1148,9 +1186,17 @@ class CommandDispatcher:
         # may have emitted both RemoveMessages and the summary, and
         # the reducer's actual result is what the next turn will see.
         snapshot_after = await graph.aget_state(config)
-        after = count_tokens_messages(
-            (snapshot_after.values or {}).get("messages") or [],
-        ).count
+        # ``project`` rather than a fresh anchor. The newest usage report in the
+        # post-compaction state can be one that SURVIVED the compaction, so it
+        # describes the conversation as it was BEFORE — re-anchoring on it yields
+        # before == after and reports every compaction as having freed nothing
+        # (verified: saved 1,005 -> 0). Reusing the pre-compaction overhead keeps
+        # both ends on one ruler, so the difference is the real saving.
+        after = usage_before.project(
+            count_tokens_messages(
+                (snapshot_after.values or {}).get("messages") or [],
+            ).count
+        )
         if after >= before:
             self._renderer.system(
                 f"上下文 {before} tokens → {after} tokens，未实际缩减。"
@@ -1159,9 +1205,17 @@ class CommandDispatcher:
 
         saved = before - after
         pct = saved * 100 // before
+        # The overhead is named explicitly: it is the bulk of ``before`` and it is
+        # NOT compressible, so a bare percentage would read as "compaction barely
+        # worked" when in fact it removed most of what it could.
+        fixed_note = (
+            f"，其中固定开销（系统提示 + 工具定义）约 {usage_before.overhead_tokens} tokens 不可压缩"
+            if usage_before.overhead_tokens
+            else ""
+        )
         self._renderer.system(
             f"上下文已压缩（LLM 摘要）: {before} → {after} tokens "
-            f"(节省 {saved} / {pct}%)"
+            f"(节省 {saved} / {pct}%){fixed_note}"
         )
 
     # ── /memory ──────────────────────────────────────────────────

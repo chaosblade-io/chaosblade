@@ -59,6 +59,13 @@ class TestClassifyError:
         r = classify_error("dial tcp: lookup foo.bar: no such host")
         assert r.error_class == ErrorClass.INFRA_TRANSIENT
 
+    # ── DEPENDENCY_MISSING ──────────────────────────────────────────────
+    def test_command_not_found_is_dependency_missing_not_target_gone(self):
+        r = classify_error('statuses=[{"error":"`iptables`: command not found"}]')
+        assert r.error_class == ErrorClass.DEPENDENCY_MISSING
+        assert r.action == ErrorAction.REPLAN
+        assert r.matched_pattern == "command not found"
+
     # ── INFRA_PERSISTENT ────────────────────────────────────────────────
     def test_diskpressure_is_persistent(self):
         msg = "0/3 nodes are available: 1 node(s) had untolerated taint DiskPressure"
@@ -139,6 +146,9 @@ class TestShouldAutoReplanLegacy:
     def test_user_config_returns_true(self):
         assert should_auto_replan("unknown flag: --foo") is True
         assert should_auto_replan("invalid parameter") is True
+
+    def test_dependency_missing_returns_true(self):
+        assert should_auto_replan("iptables: command not found") is True
 
     def test_auth_returns_false(self):
         assert should_auto_replan("permission denied") is False

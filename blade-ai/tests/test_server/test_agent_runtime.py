@@ -168,7 +168,7 @@ def test_llm_bound_keys_are_subset_of_cold_keys():
     the user contract); the other direction (key is cold but not
     LLM-bound) is just suboptimal, not broken.
     """
-    from chaos_agent.tui.config_store import _COLD_KEYS
+    from chaos_agent.config.config_store import _COLD_KEYS
 
     missing = LLM_BOUND_KEYS - _COLD_KEYS
     assert not missing, (

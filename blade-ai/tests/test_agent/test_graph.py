@@ -3,24 +3,10 @@
 from langgraph.graph import StateGraph
 
 from chaos_agent.agent.graph import (
-    build_inject_graph,
     build_intent_graph,
     build_pipeline_graph,
     build_recover_graph,
 )
-
-
-class TestBuildInjectGraph:
-    """Tests for build_inject_graph (legacy, kept for compatibility)."""
-
-    def test_returns_state_graph(self):
-        graph = build_inject_graph(phase1_tools=[], phase2_tools=[])
-        assert isinstance(graph, StateGraph)
-
-    def test_compiled_graph_runnable(self):
-        graph = build_inject_graph(phase1_tools=[], phase2_tools=[])
-        compiled = graph.compile()
-        assert compiled is not None
 
 
 class TestBuildIntentGraph:
@@ -90,6 +76,21 @@ class TestBuildPipelineGraph:
         compiled = graph.compile()
         assert compiled is not None
 
+    def test_safety_retry_branch_returns_to_agent_loop(self):
+        """A recoverable safety failure must not become an unmapped branch."""
+        graph = build_pipeline_graph(phase1_tools=[], phase2_tools=[])
+        branch = graph.branches["safety_check"]["route_after_safety"]
+        assert branch.ends["agent_loop"] == "agent_loop"
+
+    def test_finalize_verification_has_replan_branch(self):
+        # Regression for KeyError: 'replan' (task-edfed134): build_pipeline_graph
+        # is the builder used at runtime (factory.build_pipeline_graph). A
+        # verify-replan makes route_after_finalize return "replan"; the edge map
+        # MUST include it or LangGraph raises KeyError.
+        graph = build_pipeline_graph(phase1_tools=[], phase2_tools=[])
+        branch = graph.branches["finalize_verification"]["route_after_finalize"]
+        assert branch.ends["replan"] == "agent_loop"
+
     def test_pipeline_graph_with_tools(self):
         """Pipeline graph should accept non-empty tool lists."""
         from langchain_core.tools import tool as lc_tool
@@ -146,13 +147,13 @@ class TestPhase1ToolErrorHandler:
     def test_recognizes_invocation_error(self):
         from chaos_agent.agent.graph import _phase1_handle_tool_error
         err = ValueError(
-            "Error invoking tool 'kubectl_ro' with kwargs "
+            "Error invoking tool 'kubectl_read' with kwargs "
             "{'subcommand': 'exec'} with error:\n "
-            "1 validation error for kubectl_ro\nsubcommand\n  "
+            "1 validation error for kubectl_read\nsubcommand\n  "
             "Input should be 'get', 'describe', ..."
         )
         msg = _phase1_handle_tool_error(err)
-        assert "kubectl_ro" in msg
+        assert "kubectl_read" in msg
         assert "Phase 1" in msg
 
     def test_recognizes_execution_error(self):

@@ -25,8 +25,8 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command, interrupt
 
-from chaos_agent.agent.nodes.batch_next import batch_next
-from chaos_agent.agent.nodes.batch_setup import batch_setup
+from chaos_agent.agent.nodes.batch.batch_next import batch_next
+from chaos_agent.agent.nodes.batch.batch_setup import batch_setup
 from chaos_agent.agent.router import (
     route_after_batch_next,
     route_after_save_memory,
@@ -92,8 +92,8 @@ async def stub_execute(state: AgentState) -> dict:
     }
     if idx == 0:
         result.update({
-            "_execute_text_nudged": True,
-            "_kubectl_step_nudged": True,
+            "_execute_text_stall_count": 2,
+            "_injection_selfcheck_nudged": True,
             "recover_verification": {"level": "recovered"},
             "inject_layer1_cache": {"status": "passed"},
             "metric_observations": [{"name": "stale metric"}],
@@ -215,7 +215,14 @@ class TestBatchFlow:
         assert len(results) == 3
         for i, r in enumerate(results):
             assert r["blade_uid"] == f"blade-uid-{i}"
-            assert r["task_state"] == "injecting"  # stub doesn't set verification
+            # The stub never runs a verifier, so no verdict is recorded — and a
+            # terminal record without a verdict is FAILED, not "injecting".
+            # ``batch_next`` shares ``terminal_task_state`` with the
+            # single-injection result builder precisely so both report this the
+            # same way; before that, batch said "injecting" (in progress, at a
+            # point where nothing is in progress) while the single path said
+            # "injected" (a success claim with no evidence).
+            assert r["task_state"] == "failed"
             assert r["task_id"].startswith("task-")
 
     @pytest.mark.asyncio
@@ -367,6 +374,6 @@ class TestBatchFlow:
         assert values.get("plan_summary") == ""
         assert values.get("_planning_alternatives") == ""
         assert values.get("_catalogue_rejection_nudged") is False
-        assert values.get("_execute_text_nudged") is False
-        assert values.get("_kubectl_step_nudged") is False
+        assert values.get("_execute_text_stall_count") == 0
+        assert values.get("_injection_selfcheck_nudged") is False
         assert values.get("agent_loop_count") == 1

@@ -46,7 +46,7 @@ blade create k8s <scope>-<target> <action> [flags]
 | `pod-cpu fullload` | `--cpu-percent 80` (single CPU) ; `--cpu-count 2 --cpu-percent 100` (pin 2 cores) |
 | `pod-memory load` | `--mem-percent 70` ; `--mem-size 512` (MB) ; `--mode cache` (cache vs ram) |
 | ~~`pod-network delay`~~ | **v1.8.0 不可用** — 旧版参数: `--time 3000 --offset 1000 --interface eth0 --local-port 8080`。需 Tier 2 tc qdisc 替代 |
-| `pod-network drop` | `--interface eth0` ; `--destination-ip 10.1.2.3` for outbound-only. **全量丢包，不支持 `--percent`**（iptables DROP） |
+| `pod-network drop` | `--destination-ip 10.1.2.3` ; `--source-port 3306` ; `--network-traffic out` for direction. **不支持 `--percent` 和 `--interface`**（iptables DROP 语义，全量丢包） |
 | ~~`pod-network corrupt` / `duplicate` / `reorder`~~ | **不适用 v1.8.0** — 仅 `dns`、`drop`、`occupy` 可用 |
 | `pod-disk fill` | `--path /tmp --size 1024` (MB). Path is inside the container; check writable mounts first |
 | `pod-disk burn` | `--read --write --size 50` for IO contention |
@@ -170,10 +170,10 @@ Check `blade create k8s <scenario> -h` (run inside the tool pod) for
 supported flags in your version. Older blade versions reject
 `--namespace` on some k8s subcommands — retry without it.
 
-## When to Output `[REPLAN]`
+## When to Request Replan
 
 If all three tiers above are exhausted without success, output
-`[REPLAN]` rather than improvising a method that the skill case did not
+the structured replan request rather than improvising a method that the skill case did not
 list. Improvising untested methods violates the safety contract.
 
 <a id="dns-fault-note"></a>

@@ -9,7 +9,7 @@ source="none" in NL mode.
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from chaos_agent.agent.nodes.extract_planning_metadata import (
+from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
     _extract_skill_case_from_messages,
     _derive_scope_target_action,
     _derive_scope_from_resource_path,
@@ -435,7 +435,6 @@ class TestExtractPlanningMetadataNode:
         assert result.get("planning_rejected") is not True
         assert result.get("skill_case_content") == SAMPLE_SKILL_CASE
 
-
 # ---------------------------------------------------------------------------
 # _has_browsed_catalogue — catalogue browse detection
 # ---------------------------------------------------------------------------
@@ -464,7 +463,7 @@ class TestHasBrowsedCatalogue:
     def test_not_browsed(self):
         msgs = [
             AIMessage(content="", tool_calls=[{
-                "name": "kubectl_ro", "id": "c1", "type": "tool_call",
+                "name": "kubectl_read", "id": "c1", "type": "tool_call",
                 "args": {"subcommand": "get", "v_args": "pods"},
             }]),
         ]

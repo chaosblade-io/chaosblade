@@ -228,7 +228,10 @@ class TestCompactSessionSSE:
 
         class _Snapshot:
             def __init__(self, msgs):
-                self.values = {"messages": msgs, "task_id": "old-task"}
+                # ``task-`` prefix required: ``get_tracker`` hands any other
+                # id the NullTracker, which swallows the hook's events and
+                # would leave this SSE stream with nothing to relay.
+                self.values = {"messages": msgs, "task_id": "task-old"}
 
         call_count = {"n": 0}
 
@@ -477,7 +480,7 @@ class TestConfigColdKeyClassification:
         ],
     )
     def test_llm_bound_key_is_cold(self, key):
-        from chaos_agent.tui.config_store import ConfigStore
+        from chaos_agent.config.config_store import ConfigStore
 
         assert ConfigStore.is_cold_key(key), (
             f"{key!r} should be classified cold — make_llm() reads it at "
@@ -497,7 +500,7 @@ class TestConfigColdKeyClassification:
     def test_runtime_keys_stay_hot(self, key):
         # These are read fresh on every kubectl call / replan check /
         # logging config init, so settings.reload() is enough.
-        from chaos_agent.tui.config_store import ConfigStore
+        from chaos_agent.config.config_store import ConfigStore
 
         assert not ConfigStore.is_cold_key(key), (
             f"{key!r} should NOT be cold — it's read fresh from settings "
@@ -725,7 +728,7 @@ class TestModelSet:
         #  - ``restart_required`` is True (model_name is cold, see
         #    Phase 3a's _COLD_KEYS expansion).
         #  - ``active`` echoes back the trimmed input.
-        from chaos_agent.tui.config_store import ConfigStore
+        from chaos_agent.config.config_store import ConfigStore
 
         cfg_path = str(tmp_path / "config.json")
         monkeypatch.setattr(
@@ -794,7 +797,7 @@ class TestIntentConfirmDryRunSkip:
 
     @pytest.mark.asyncio
     async def test_dry_run_short_circuits(self, monkeypatch):
-        from chaos_agent.agent.nodes import intent_confirm as ic_mod
+        from chaos_agent.agent.nodes.planning import intent_confirm as ic_mod
 
         called = {"interrupt": False}
 
@@ -809,12 +812,14 @@ class TestIntentConfirmDryRunSkip:
 
         state = {
             "task_id": "task-test",
-            "fault_intent": {
-                "fault_type": "node-cpu-fullload",
+            "fault_spec": {
                 "scope": "node",
-                "target": "cpu",
-                "action": "fullload",
-                "namespace": "default",
+                "blade_target": "cpu",
+                "blade_action": "fullload",
+                "namespace": "",
+                "names": [],
+                "labels": {},
+                "params": {},
             },
             "intent_confidence": 1.0,
             "dry_run": True,
@@ -836,7 +841,7 @@ class TestIntentConfirmDryRunSkip:
         # Inverse: when dry_run is False / absent, the gate must
         # still fire interrupt() — otherwise we'd silently skip
         # Layer-1 confirmation for everyone.
-        from chaos_agent.agent.nodes import intent_confirm as ic_mod
+        from chaos_agent.agent.nodes.planning import intent_confirm as ic_mod
 
         called = {"interrupt": False}
 
@@ -847,12 +852,14 @@ class TestIntentConfirmDryRunSkip:
         monkeypatch.setattr(ic_mod, "interrupt", fake_interrupt)
         state = {
             "task_id": "task-test",
-            "fault_intent": {
-                "fault_type": "node-cpu-fullload",
+            "fault_spec": {
                 "scope": "node",
-                "target": "cpu",
-                "action": "fullload",
-                "namespace": "default",
+                "blade_target": "cpu",
+                "blade_action": "fullload",
+                "namespace": "",
+                "names": [],
+                "labels": {},
+                "params": {},
             },
             "intent_confidence": 1.0,
             # dry_run absent → defaults to falsy
@@ -911,7 +918,7 @@ class TestConfigSetGetIntegration:
         # the settings module's source. The shape contract (write
         # path → file + hot_reload flag) is what /config users
         # actually depend on.
-        from chaos_agent.tui.config_store import ConfigStore
+        from chaos_agent.config.config_store import ConfigStore
         import json
 
         cfg_path = str(tmp_path / "config.json")
@@ -938,34 +945,30 @@ class TestConfigSetGetIntegration:
             stored = json.load(f)
         assert stored["kube_context"] == "test-cluster"
 
-    def test_get_returns_masked_config_shape(self, test_client):
-        # ``GET /api/v1/config`` returns the masked display dict +
-        # the resolved config_path. The dict is whatever
-        # ``ConfigStore.get_display_dict`` produces — we just pin
-        # the contract that the keys ``llm_api_key`` and
-        # ``model_name`` exist (so a refactor that removes the API
-        # key masking surfaces here).
+    def test_get_returns_full_config_shape(self, test_client):
+        # ``GET /api/v1/config`` returns the FULL config view (every
+        # config.json key overlaid on the curated defaults) + the resolved
+        # config_path. Per operator request the api key is surfaced as-is
+        # (this endpoint serves the local single-user TUI), so we pin that
+        # ``llm_api_key`` / ``model_name`` exist and that the key is NOT
+        # asterisk-masked anymore.
         r = test_client.get("/api/v1/config")
         body = r.json()
         assert body["status"] == "success"
         cfg = body["data"]["config"]
         assert "llm_api_key" in cfg
-        # Either the API key is configured (asterisks) or unset
-        # ("(未配置)" / similar). Either way it must NOT leak the
-        # actual key. ``in`` checks the renderer didn't accidentally
-        # ship the raw value.
-        assert "*" in cfg["llm_api_key"] or cfg["llm_api_key"] in (
-            "(未配置)",
-            "(unset)",
-            "",
-        )
+        assert "model_name" in cfg
+        # Deliberate: the api key is returned verbatim (no ``*`` masking).
+        # When configured it is the raw value; when unset it is a
+        # placeholder / empty string.
+        assert "*" not in cfg["llm_api_key"]
         # config_path is always populated (ConfigStore.path always
         # resolves to a string).
         assert isinstance(body["data"]["config_path"], str)
         assert body["data"]["config_path"]
 
     def test_set_then_unset_clears(self, test_client, tmp_path, monkeypatch):
-        from chaos_agent.tui.config_store import ConfigStore
+        from chaos_agent.config.config_store import ConfigStore
         import json
 
         cfg_path = str(tmp_path / "config.json")
@@ -1398,7 +1401,7 @@ class TestModelSetVsConfigSetParity:
     def test_writes_same_file_with_same_value(
         self, test_client, tmp_path, monkeypatch,
     ):
-        from chaos_agent.tui.config_store import ConfigStore
+        from chaos_agent.config.config_store import ConfigStore
         import json
 
         cfg_path = str(tmp_path / "config.json")

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -13,6 +12,8 @@ from chaos_agent.preflight import (
     _operator_replicas_ready,
     check_chaosblade_operator,
     check_k8s_connectivity,
+    check_kubeconfig_live,
+    check_kubectl_version,
     check_skills,
     needs_operator_install,
     run_tui_checks,
@@ -135,6 +136,9 @@ class TestCheckK8sConnectivity:
         with patch(
             "asyncio.create_subprocess_exec",
             AsyncMock(return_value=proc_version),
+        ), patch(
+            "chaos_agent.transports.channels.KubeconfigChannel.preflight",
+            return_value=[],
         ):
             r = await check_k8s_connectivity()
 
@@ -149,15 +153,19 @@ class TestCheckK8sConnectivity:
         monkeypatch.setattr(_settings_mod.settings, "kubeconfig_path", "")
         monkeypatch.setattr(_settings_mod.settings, "kube_context", "")
 
+        res = MagicMock()
+        res.exit_code = -1
+        res.stderr = "kubectl not found"
+        res.stdout = ""
         with patch(
-            "asyncio.create_subprocess_exec",
-            AsyncMock(side_effect=FileNotFoundError()),
+            "chaos_agent.tools.kubectl.exec_kubectl_raw",
+            AsyncMock(return_value=res),
         ):
             r = await check_k8s_connectivity()
 
         assert r.passed is False
         assert r.severity == "blocking"
-        assert "kubectl not found" in r.message
+        assert "not found" in r.message
 
     async def test_timeout_reports_blocking(self, monkeypatch):
         from chaos_agent.config import settings as _settings_mod
@@ -165,14 +173,15 @@ class TestCheckK8sConnectivity:
         monkeypatch.setattr(_settings_mod.settings, "kubeconfig_path", "")
         monkeypatch.setattr(_settings_mod.settings, "kube_context", "")
 
-        async def _hang(*a, **kw):
-            await asyncio.sleep(10)
-        proc = MagicMock()
-        proc.communicate = AsyncMock(side_effect=_hang)
-        proc.returncode = 0
-        with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
-            with patch("chaos_agent.preflight._self_check_timeout", lambda: 0):
-                r = await check_k8s_connectivity()
+        res = MagicMock()
+        res.exit_code = -1
+        res.stderr = "kubectl version timed out"
+        res.stdout = ""
+        with patch(
+            "chaos_agent.tools.kubectl.exec_kubectl_raw",
+            AsyncMock(return_value=res),
+        ):
+            r = await check_k8s_connectivity()
 
         assert r.passed is False
         assert "timed out" in r.message
@@ -189,7 +198,8 @@ class TestCheckK8sConnectivity:
             captured.append(args)
             return _make_proc(0, stdout=b"running at https://x\n")
 
-        with patch("asyncio.create_subprocess_exec", AsyncMock(side_effect=fake_exec)):
+        with patch("asyncio.create_subprocess_exec", AsyncMock(side_effect=fake_exec)), \
+             patch("chaos_agent.transports.channels.KubeconfigChannel.preflight", return_value=[]):
             await check_k8s_connectivity()
 
         assert captured, "create_subprocess_exec was never invoked"
@@ -212,7 +222,8 @@ class TestCheckK8sConnectivity:
             captured.append(args)
             return _make_proc(0, stdout=b"running at https://x\n")
 
-        with patch("asyncio.create_subprocess_exec", AsyncMock(side_effect=fake_exec)):
+        with patch("asyncio.create_subprocess_exec", AsyncMock(side_effect=fake_exec)), \
+             patch("chaos_agent.transports.channels.KubeconfigChannel.preflight", return_value=[]):
             await check_k8s_connectivity()
 
         first_call_args = captured[0]
@@ -252,6 +263,9 @@ class TestCheckChaosbladeOperator:
         with patch(
             "asyncio.create_subprocess_exec",
             AsyncMock(return_value=_make_proc(0, stdout=b"chaosblade-operator|3|ghcr.io/chaosblade-io/chaosblade-operator:1.7.4\n")),
+        ), patch(
+            "chaos_agent.transports.channels.KubeconfigChannel.preflight",
+            return_value=[],
         ):
             r = await check_chaosblade_operator()
 
@@ -269,6 +283,9 @@ class TestCheckChaosbladeOperator:
         with patch(
             "asyncio.create_subprocess_exec",
             AsyncMock(return_value=_make_proc(0, stdout=b"chaosblade-operator|0|img:v1\nchaosblade-tool|1|img:v1\n")),
+        ), patch(
+            "chaos_agent.transports.channels.KubeconfigChannel.preflight",
+            return_value=[],
         ):
             r = await check_chaosblade_operator()
 
@@ -284,6 +301,9 @@ class TestCheckChaosbladeOperator:
         with patch(
             "asyncio.create_subprocess_exec",
             AsyncMock(side_effect=FileNotFoundError()),
+        ), patch(
+            "chaos_agent.transports.channels.KubeconfigChannel.preflight",
+            return_value=[],
         ):
             r = await check_chaosblade_operator()
 
@@ -301,6 +321,9 @@ class TestCheckChaosbladeOperator:
         with patch(
             "asyncio.create_subprocess_exec",
             AsyncMock(return_value=_make_proc(1, stderr=b'namespaces "chaosblade" not found')),
+        ), patch(
+            "chaos_agent.transports.channels.KubeconfigChannel.preflight",
+            return_value=[],
         ):
             r = await check_chaosblade_operator()
 
@@ -312,11 +335,105 @@ class TestCheckChaosbladeOperator:
 # ── run_tui_checks ──────────────────────────────────────────────────
 
 
+class TestSshModeLiveExemption:
+    """ssh mode: the live kubeconfig/kubectl checks must pass without
+    touching a local kubeconfig or kubectl — mirrors the sync check
+    exemptions (check_kubeconfig / check_kubectl) so ssh mode doesn't emit
+    a spurious blocking failure at TUI boot."""
+
+    async def test_kubeconfig_live_skipped_for_ssh(self, monkeypatch):
+        from chaos_agent.config import settings as _settings_mod
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "ssh")
+        spawn = AsyncMock()
+        with patch("asyncio.create_subprocess_exec", spawn):
+            r = await check_kubeconfig_live()
+        assert r.passed is True
+        assert r.severity == "blocking"
+        assert "ssh" in r.message
+        spawn.assert_not_called()  # no kubectl subprocess spawned
+
+    async def test_kubectl_version_skipped_for_ssh(self, monkeypatch):
+        from chaos_agent.config import settings as _settings_mod
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "ssh")
+        spawn = AsyncMock()
+        with patch("asyncio.create_subprocess_exec", spawn):
+            r = await check_kubectl_version()
+        assert r.passed is True
+        assert r.severity == "blocking"
+        assert "ssh" in r.message
+        spawn.assert_not_called()
+
+    async def test_host_connectivity_probed_for_ssh(self, monkeypatch):
+        """host-scope ssh: the connectivity row becomes a HOST probe
+        (name=host_connectivity) via the transport layer, NOT a kubectl
+        cluster probe."""
+        from chaos_agent.config import settings as _settings_mod
+        from chaos_agent.models.command_result import CommandResult
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "ssh")
+        k8s_probe = AsyncMock()
+        host_probe = AsyncMock(return_value=CommandResult(0, "blade-ai-preflight", ""))
+        with patch("chaos_agent.tools.kubectl.exec_kubectl_raw", k8s_probe), \
+             patch("chaos_agent.preflight.execute_via_transport", host_probe):
+            r = await check_k8s_connectivity()
+        assert r.name == "host_connectivity"
+        assert r.passed is True
+        assert "connected" in r.message and "ssh" in r.message
+        k8s_probe.assert_not_called()  # no K8s API touched
+        host_probe.assert_awaited_once()
+        # probe ran a harmless echo with guard bypassed
+        _args, _kwargs = host_probe.await_args
+        assert _args[0][0] == "echo"
+        assert _kwargs.get("skip_guard") is True
+
+    async def test_host_connectivity_failure_for_ssh(self, monkeypatch):
+        """A non-zero / preflight-failed probe → blocking not-reachable result."""
+        from chaos_agent.config import settings as _settings_mod
+        from chaos_agent.models.command_result import CommandResult
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "ssh")
+        host_probe = AsyncMock(return_value=CommandResult(-1, "", "ssh: host required"))
+        with patch("chaos_agent.preflight.execute_via_transport", host_probe):
+            r = await check_k8s_connectivity()
+        assert r.name == "host_connectivity"
+        assert r.passed is False
+        assert "不可达" in r.message
+
+    async def test_operator_skipped_for_ssh(self, monkeypatch):
+        from chaos_agent.config import settings as _settings_mod
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "ssh")
+        probe = AsyncMock()
+        with patch("chaos_agent.tools.kubectl.exec_kubectl_raw", probe):
+            r = await check_chaosblade_operator()
+        assert r.passed is True
+        assert "host mode" in r.message
+        probe.assert_not_called()
+
+    async def test_host_connectivity_probed_for_kubewiz_host(self, monkeypatch):
+        """kubewiz_host is also host-scope — host connectivity probe applies,
+        labelled kubewiz-host."""
+        from chaos_agent.config import settings as _settings_mod
+        from chaos_agent.models.command_result import CommandResult
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "kubewiz_host")
+        k8s_probe = AsyncMock()
+        host_probe = AsyncMock(return_value=CommandResult(0, "ok", ""))
+        with patch("chaos_agent.tools.kubectl.exec_kubectl_raw", k8s_probe), \
+             patch("chaos_agent.preflight.execute_via_transport", host_probe):
+            r = await check_k8s_connectivity()
+        assert r.name == "host_connectivity"
+        assert r.passed is True
+        assert "kubewiz-host" in r.message
+        k8s_probe.assert_not_called()
+
+
 class TestRunTuiChecks:
     async def test_panel_returns_seven_rows_in_canonical_order(self, monkeypatch):
-        """run_tui_checks must always emit exactly the seven canonical rows
-        in the same order — the boot card relies on this ordering."""
+        """In K8s-scope mode run_tui_checks emits exactly the seven canonical
+        rows in the same order — the boot card relies on this ordering."""
         from chaos_agent import preflight as tui_preflight
+
+        # Pin K8s-scope so the branch is deterministic regardless of env.
+        monkeypatch.setattr(
+            tui_preflight, "_is_host_scope_channel", lambda: False
+        )
 
         async def _ok(name):
             async def inner():
@@ -399,6 +516,95 @@ class TestRunTuiChecks:
         kubectl_row = next(r for r in results if r.name == "kubectl")
         assert kubectl_row.passed is False
         assert "Check failed" in kubectl_row.message
+
+    async def test_panel_returns_host_rows_in_host_mode(self, monkeypatch):
+        """Host-scope channels emit a host-oriented set: the K8s cluster rows
+        (kubeconfig / kubectl / k8s_connectivity / chaosblade_operator) are
+        dropped and replaced by transport_config + host_connectivity, which
+        are the things a bare-host drill actually depends on."""
+        from chaos_agent import preflight as tui_preflight
+
+        monkeypatch.setattr(
+            tui_preflight, "_is_host_scope_channel", lambda: True
+        )
+
+        async def _ok(name):
+            async def inner():
+                return CheckResult(name=name, severity="warning", passed=True)
+            return inner
+
+        monkeypatch.setattr(
+            tui_preflight, "check_llm_api_key_live", await _ok("llm_api_key")
+        )
+        monkeypatch.setattr(
+            tui_preflight, "check_transport_config",
+            lambda: CheckResult(
+                name="transport_config", severity="blocking", passed=True
+            ),
+        )
+        monkeypatch.setattr(
+            tui_preflight, "_check_host_connectivity",
+            await _ok("host_connectivity"),
+        )
+        monkeypatch.setattr(
+            tui_preflight, "check_blade_version", await _ok("blade")
+        )
+        monkeypatch.setattr(
+            tui_preflight, "check_skills",
+            lambda: CheckResult(name="skills", severity="warning", passed=True),
+        )
+
+        results = await run_tui_checks()
+        assert [r.name for r in results] == [
+            "llm_api_key",
+            "transport_config",
+            "host_connectivity",
+            "blade",
+            "skills",
+        ]
+
+    async def test_host_mode_surfaces_transport_config_failure(self, monkeypatch):
+        """The host set actually RUNS check_transport_config — a missing host
+        field surfaces as a blocking row at boot, closing the gap where
+        host-config errors previously only appeared deep inside execution."""
+        from chaos_agent import preflight as tui_preflight
+
+        monkeypatch.setattr(
+            tui_preflight, "_is_host_scope_channel", lambda: True
+        )
+
+        async def _ok(name):
+            async def inner():
+                return CheckResult(name=name, severity="warning", passed=True)
+            return inner
+
+        monkeypatch.setattr(
+            tui_preflight, "check_llm_api_key_live", await _ok("llm_api_key")
+        )
+        monkeypatch.setattr(
+            tui_preflight, "check_transport_config",
+            lambda: CheckResult(
+                name="transport_config", severity="blocking", passed=False,
+                message="ssh 通道配置缺失: ssh_host",
+            ),
+        )
+        monkeypatch.setattr(
+            tui_preflight, "_check_host_connectivity",
+            await _ok("host_connectivity"),
+        )
+        monkeypatch.setattr(
+            tui_preflight, "check_blade_version", await _ok("blade")
+        )
+        monkeypatch.setattr(
+            tui_preflight, "check_skills",
+            lambda: CheckResult(name="skills", severity="warning", passed=True),
+        )
+
+        results = await run_tui_checks()
+        tc = next(r for r in results if r.name == "transport_config")
+        assert tc.passed is False
+        assert tc.severity == "blocking"
+        assert "ssh_host" in tc.message
 
 
 # ── needs_operator_install ──────────────────────────────────────────

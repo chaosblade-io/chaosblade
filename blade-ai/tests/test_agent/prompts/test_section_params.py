@@ -12,7 +12,6 @@ These guard the contract that:
 from chaos_agent.agent.prompts.sections.execution import get_guidelines_section
 from chaos_agent.agent.prompts.sections.safety import get_safety_section
 from chaos_agent.agent.prompts.sections.workflow import (
-    get_verification_strategy_section,
     get_workflow_section,
 )
 
@@ -21,7 +20,7 @@ class TestSafetySectionLevel:
     def test_hard_only_keeps_header_and_namespace_blacklist(self):
         s = get_safety_section(level="hard_only")
         assert "Safety Rules" in s
-        assert "namespace blacklist" in s
+        assert "target blacklist" in s
 
     def test_hard_only_keeps_caution_compliance(self):
         s = get_safety_section(level="hard_only")
@@ -46,30 +45,10 @@ class TestSafetySectionLevel:
     def test_default_full_keeps_all_subsections(self):
         s = get_safety_section()
         assert "Advisory Rules" in s
+        # Blast Radius Assessment Framework + Abort/Continue/Escalate decision
+        # framework now live in safety-extended.md, referenced on demand.
         assert "Blast Radius Assessment Framework" in s
-        assert "Decision Framework" in s
-
-
-class TestVerificationStrategyBrief:
-    def test_brief_under_10_lines(self):
-        # Plan target: 5-line principle version; allow a small ceiling for the
-        # heading + on-demand pointer.
-        s = get_verification_strategy_section(brief=True)
-        assert len(s.splitlines()) <= 12
-
-    def test_brief_keeps_verification_keyword(self):
-        assert "verification" in get_verification_strategy_section(brief=True).lower()
-
-    def test_brief_is_shorter_than_full(self):
-        assert len(get_verification_strategy_section(brief=True)) < len(
-            get_verification_strategy_section()
-        )
-
-    def test_default_full_keeps_all_subsections(self):
-        s = get_verification_strategy_section()
-        assert "Fault Effect Delay" in s
-        assert "Multi-Iteration Verification Pattern" in s
-        assert "Verification Method Priority" in s
+        assert "safety-extended" in s
 
 
 class TestWorkflowSectionTokens:

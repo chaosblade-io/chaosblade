@@ -18,6 +18,7 @@ from chaos_agent.preflight import (
     check_kubeconfig,
     check_kubectl,
     check_llm_api_key,
+    check_transport_config,
     display,
     map_error,
     run,
@@ -139,6 +140,122 @@ class TestCheckKubeconfig:
 
         result = check_kubeconfig()
         assert result.passed is True
+
+
+class TestIsKubewizChannel:
+    """Tests for _is_kubewiz_channel() — field inference + explicit override."""
+
+    def test_primary_path_uuid_present(self, monkeypatch):
+        """When kubewiz_cluster_uuid is set, field inference resolves to kubewiz_k8s."""
+        from chaos_agent.config import settings as _settings_mod
+
+        monkeypatch.setattr(_settings_mod.settings, "kubewiz_cluster_uuid", "uuid-1")
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "")
+        from chaos_agent.preflight import _is_kubewiz_channel
+
+        assert _is_kubewiz_channel() is True
+
+    def test_override_forces_kubewiz_no_uuid(self, monkeypatch):
+        """Explicit kube_connection_mode='kubewiz_k8s' selects the kubewiz
+        channel even when kubewiz_cluster_uuid is not yet configured.
+
+        This is the explicit channel override path — it replaces the old
+        implicit fallback and lets preflight report missing kubewiz config
+        before first use.
+        """
+        from chaos_agent.config import settings as _settings_mod
+
+        monkeypatch.setattr(_settings_mod.settings, "kubewiz_cluster_uuid", "")
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "kubewiz_k8s")
+        from chaos_agent.preflight import _is_kubewiz_channel
+
+        assert _is_kubewiz_channel() is True
+
+    def test_returns_false_in_kubeconfig_mode(self, monkeypatch):
+        """When neither uuid nor override indicates kubewiz, returns False."""
+        from chaos_agent.config import settings as _settings_mod
+
+        monkeypatch.setattr(_settings_mod.settings, "kubewiz_cluster_uuid", "")
+        monkeypatch.setattr(_settings_mod.settings, "kube_connection_mode", "")
+        from chaos_agent.preflight import _is_kubewiz_channel
+
+        assert _is_kubewiz_channel() is False
+
+
+class TestCheckTransportConfig:
+    """check_transport_config validates host-scope channel fields (ssh / kubewiz_host)."""
+
+    def _clear(self, m, s):
+        for f in ("host_name", "ssh_host", "ssh_user", "ssh_key_path"):
+            m.setattr(s, f, "", raising=False)
+        m.setattr(s, "ssh_port", 22, raising=False)
+        m.setattr(s, "kubewiz_cluster_uuid", "")
+        m.setattr(s, "kubewiz_profile", "")
+        m.setattr(s, "kube_connection_mode", "")
+
+    def test_k8s_channel_not_covered_here(self, monkeypatch):
+        """k8s-scope channels pass (validated by check_kubeconfig instead)."""
+        from chaos_agent.config import settings as _sm
+        from chaos_agent.preflight import check_transport_config
+
+        self._clear(monkeypatch, _sm.settings)
+        assert check_transport_config().passed is True
+
+    def test_ssh_missing_host_fails(self, monkeypatch):
+        """Override to ssh without ssh_host → blocking failure at boot."""
+        from chaos_agent.config import settings as _sm
+        from chaos_agent.preflight import check_transport_config
+
+        self._clear(monkeypatch, _sm.settings)
+        monkeypatch.setattr(_sm.settings, "kube_connection_mode", "ssh")
+        r = check_transport_config()
+        assert r.passed is False
+        assert "ssh_host" in r.message
+
+    def test_ssh_with_host_passes(self, monkeypatch):
+        from chaos_agent.config import settings as _sm
+        from chaos_agent.preflight import check_transport_config
+
+        self._clear(monkeypatch, _sm.settings)
+        monkeypatch.setattr(_sm.settings, "ssh_host", "10.0.0.2")
+        assert check_transport_config().passed is True
+
+    def test_kubewiz_host_missing_profile_fails(self, monkeypatch):
+        from chaos_agent.config import settings as _sm
+        from chaos_agent.preflight import check_transport_config
+
+        self._clear(monkeypatch, _sm.settings)
+        monkeypatch.setattr(_sm.settings, "host_name", "10.0.0.1")
+        r = check_transport_config()
+        assert r.passed is False
+        assert "kubewiz_profile" in r.message
+
+    def test_kubewiz_host_complete_passes(self, monkeypatch):
+        from chaos_agent.config import settings as _sm
+        from chaos_agent.preflight import check_transport_config
+
+        self._clear(monkeypatch, _sm.settings)
+        monkeypatch.setattr(_sm.settings, "host_name", "10.0.0.1")
+        monkeypatch.setattr(_sm.settings, "kubewiz_profile", "526255")
+        assert check_transport_config().passed is True
+
+    def test_kubeconfig_skipped_for_host_channel(self, monkeypatch):
+        """check_kubeconfig passes for host channels (no kubeconfig needed)."""
+        from chaos_agent.config import settings as _sm
+        from chaos_agent.preflight import check_kubeconfig
+
+        self._clear(monkeypatch, _sm.settings)
+        monkeypatch.setattr(_sm.settings, "ssh_host", "10.0.0.2")
+        assert check_kubeconfig().passed is True
+
+    def test_kubectl_skipped_for_ssh_channel(self, monkeypatch):
+        """check_kubectl passes for ssh channel (executes on remote host)."""
+        from chaos_agent.config import settings as _sm
+        from chaos_agent.preflight import check_kubectl
+
+        self._clear(monkeypatch, _sm.settings)
+        monkeypatch.setattr(_sm.settings, "ssh_host", "10.0.0.2")
+        assert check_kubectl().passed is True
 
 
 class TestCheckKubectl:
@@ -424,11 +541,12 @@ class TestMapError:
 
 
 class TestCheckLists:
-    def test_inject_has_four_checks(self):
-        assert len(INJECT_CHECKS) == 4
+    def test_inject_has_five_checks(self):
+        assert len(INJECT_CHECKS) == 5
         assert check_llm_api_key in INJECT_CHECKS
         assert check_kubeconfig in INJECT_CHECKS
         assert check_kubectl in INJECT_CHECKS
+        assert check_transport_config in INJECT_CHECKS
         assert check_blade in INJECT_CHECKS
 
     def test_recover_matches_inject(self):
@@ -508,13 +626,24 @@ class TestVerificationScenario4:
 class TestCheckMatrices:
     """Guard against CLI / TUI preflight panels drifting apart.
 
-    INJECT_CHECKS lists the four foundational concepts the CLI gates
-    every injection run on (llm_api_key, kubeconfig, kubectl, blade).
-    The TUI panel runs *live* equivalents for those concepts plus
-    skills / k8s_connectivity / chaosblade_operator — assert by name
+    INJECT_CHECKS lists the foundational concepts the CLI gates every
+    injection run on. The TUI panel runs *live* equivalents for the
+    connectivity-oriented ones (llm_api_key, kubeconfig, kubectl, blade)
+    plus skills / k8s_connectivity / chaosblade_operator — assert by name
     so the matrices don't drift when the TUI replaces a sync check
     with a stronger async one.
+
+    ``transport_config`` is now covered too: ``run_tui_checks`` is
+    mode-scoped, and its host-scope branch runs ``check_transport_config``
+    so ssh/kubewiz_host users get host-field validation at boot. It stays
+    out of the default k8s branch (where it is a no-op green row), but the
+    concept token is present in the function source, so no exclusion is
+    needed to keep the matrix in sync.
     """
+
+    # All INJECT_CHECKS concepts now surface in run_tui_checks (k8s branch
+    # or host branch). Nothing is excluded from the drift guard.
+    _NON_LIVE_CONCEPTS: set[str] = set()
 
     def test_tui_panel_covers_all_cli_inject_concepts(self):
         # We can't run live checks here (no cluster, no LLM), so we
@@ -528,6 +657,8 @@ class TestCheckMatrices:
         # prefix and looking for the concept token in the source.
         for cli_check in INJECT_CHECKS:
             concept = cli_check.__name__.removeprefix("check_")
+            if concept in self._NON_LIVE_CONCEPTS:
+                continue
             assert concept in src, (
                 f"INJECT_CHECKS ↔ TUI panel drift: {cli_check.__name__} "
                 f"(concept '{concept}') not referenced in run_tui_checks"

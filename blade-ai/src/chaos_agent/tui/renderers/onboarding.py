@@ -43,7 +43,7 @@ from rich.text import Text
 
 from chaos_agent.config import wizard_validators
 from chaos_agent.tui import strings
-from chaos_agent.tui.config_store import ConfigStore
+from chaos_agent.config.config_store import ConfigStore
 from chaos_agent.tui.console import ChaosConsole
 from chaos_agent.tui.theme import BREATHING_DOTS, Theme
 

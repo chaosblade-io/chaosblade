@@ -36,7 +36,15 @@ Agent 拥有 1 个统一的 `kubectl` 工具，通过 `subcommand` 参数选择�
 | `cordon` | 标记节点为不可调度 | `"<node>"` |
 | `uncordon` | 恢复节点可调度 | `"<node>"` |
 | `taint` | 管理节点污点 | `"nodes <node> key=value:NoSchedule"` |
-| `debug` | 在节点上创建临时调试容器，访问宿主机 /host 文件系统（两步法，必须含 `-- sleep 3600` 保活） | `"node/<node> --image=busybox -- sleep 3600"` |
+| `label` | 增删改资源标签（`--overwrite` 覆盖已有；`key-` 删除） | `"node <node> chaos-target=<app> --overwrite"` |
+| `annotate` | 增删改资源注解 | `"node <node> <key>=<value> --overwrite"` |
+| `drain` | 驱逐节点上的 Pod（节点维护演练），恢复用 `uncordon` | `"<node> --ignore-daemonsets --delete-emptydir-data --grace-period=30"` |
+| `debug` | 在节点上创建临时调试容器，访问宿主机 /host 文件系统（两步法，必须含 `-- sleep 3600`） | `"node/<node> --image=busybox -- sleep 3600"` |
+
+> ⚠️ **`drain` 的两个禁用参数**：`--force`（删除无控制器管理的裸 Pod，`uncordon` 和任何控制器都不会重建，Pod 本身永久消失）和 `--disable-eviction`（绕过 eviction API 即绕过 PodDisruptionBudget，而 PDB 正是演练要验证的保障）会被守卫拒绝。若 drain 因裸 Pod 而失败，**此时没有驱逐任何 Pod**（原子失败），应把该节点视为不适合 drain 的目标，而不是加 `--force` 强推。
+> `--delete-emptydir-data` **允许使用**：emptyDir 的生命周期本就与 Pod 绑定，驱逐 Pod 必然丢弃它，这是 Pod 删除的固有语义；真实集群中大量 Pod 挂载 emptyDir，不加此参数 drain 会直接拒绝驱逐。
+
+> ⚠️ **`edit` / `replace` 不可用**：`edit` 需要交互式编辑器，`replace` 是整对象覆盖，二者都不在允许的子命令列表中——把改动表达为 `patch`，或用 `label` / `annotate` 这类专用动词。
 
 > ⚠️ **kubectl debug 版本偏差注意**: `kubectl debug node/` 依赖 EphemeralContainers API，该 API 在不同 K8s 版本间存在 breaking changes。当本地 kubectl 版本与集群 API Server 版本差异超过 ±1 个 minor 版本时，`kubectl debug` 可能返回 "NotFound" 错误。此时无法通过 kubectl 工具获取宿主机文件系统访问，只能依赖 API 层面检查（`kubectl describe node` 看 DiskPressure、`kubectl get events` 看磁盘压力事件）。**注意**：`kubectl run` 不在允许的子命令列表中，不可用作备选。
 

@@ -8,7 +8,7 @@ shows none.
 """
 from __future__ import annotations
 
-from chaos_agent.agent.nodes._verifier_layer2_parse import (
+from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
     _build_truth_deltas,
     _collect_evidence_text,
     _metric_alias,

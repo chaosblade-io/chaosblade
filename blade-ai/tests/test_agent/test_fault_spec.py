@@ -1,4 +1,4 @@
-"""Tests for ``chaos_agent.agent.fault_spec.FaultSpec``.
+"""Tests for ``chaos_agent.agent.spec.fault_spec.FaultSpec``.
 
 Coverage:
   - Each constructor (placeholder / cli_structured / cli_nl / http_request /
@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from chaos_agent.agent.fault_spec import (
+from chaos_agent.agent.spec.fault_spec import (
     FaultSpec,
     fault_parts_from_name,
     fault_spec_from_legacy_state,
@@ -57,6 +57,17 @@ class TestPlaceholderNl:
     def test_user_description_none_safe(self):
         spec = FaultSpec.placeholder_nl(user_description=None, source="tui")  # type: ignore
         assert spec.user_description == ""
+
+
+def test_unregistered_scope_is_not_complete():
+    spec = FaultSpec(
+        scope="typo_scope",
+        blade_target="cpu",
+        blade_action="fullload",
+        namespace="default",
+    )
+
+    assert spec.is_complete is False
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +661,14 @@ class TestToIntentDict:
             "names": ["p1", "p2"],
             "labels": {"app": "demo"},
             "params": {"percent": "80"},
+            "params_flags": [],
+            "duration_seconds": 0,
             "user_description": "",
+            "revision": 0,
+            "objective": "",
+            "boundaries": [],
+            "constraints": [],
+            "assumptions": [],
         }
 
     def test_placeholder(self):
@@ -753,6 +771,11 @@ class TestLegacyFaultSpecProjection:
             "duration_seconds": 60,
             "source": "test_legacy",
             "user_description": "",
+            "revision": 0,
+            "objective": "",
+            "boundaries": [],
+            "constraints": [],
+            "assumptions": [],
         }
 
     def test_returns_none_when_no_fault_context_exists(self):
@@ -795,3 +818,98 @@ class TestDefensiveNormalisation:
             "params": {"percent": 80, "verbose": True, "name": None},
         })
         assert spec.params == {"percent": "80", "verbose": "True", "name": ""}
+
+
+# ---------------------------------------------------------------------------
+# INTENT_* derivation snapshot — refactor guard
+#
+# The intent vocabulary is now DERIVED from per-carrier provider declarations
+# (``supported_targets`` / ``supported_actions``) aggregated through each
+# FaultFamily's ``carrier_types``, instead of a flat tuple on the family. These
+# assertions pin the derived values to the exact pre-refactor snapshot so a
+# silent drift (reordering, a dropped word, a duplicated carrier changing the
+# dedup outcome) fails loudly. Vocabulary changes are intentional edits to a
+# provider's declaration + this snapshot together.
+# ---------------------------------------------------------------------------
+
+
+class TestIntentVocabularySnapshot:
+    _EXPECTED_SCOPES = (
+        "pod", "node", "container", "deployment", "statefulset",
+        "daemonset", "service", "host", "python",
+    )
+    _EXPECTED_TARGETS = (
+        "cpu", "mem", "network", "disk", "process",
+        "pod", "finalizer", "replicas", "schedule", "pvc",
+        "dns", "image", "probe", "volume", "cni", "endpoint",
+        # chaosblade_python carrier (python_app family): middleware clients the
+        # in-process agent intercepts.
+        "redis", "mysql", "http", "httpx", "grpc", "kafka", "sqlalchemy",
+    )
+    _EXPECTED_ACTIONS = (
+        "fullload", "load", "delay", "loss", "drop", "fill", "kill", "burn",
+        "stop", "patch", "cordon", "taint", "delete", "drain", "scale",
+        "corrupt", "duplicate",
+        # chaosblade_python carrier method-level verbs (``delay`` already listed).
+        "throwCustomException", "returnValue",
+    )
+    _EXPECTED_ACTION_DESCRIPTION = (
+        "Concrete fault action verb. "
+        "ChaosBlade: fullload|load|delay|loss|drop|fill|kill|burn|stop. "
+        "kubectl-native: patch|cordon|taint|delete|drain|scale|corrupt|duplicate. "
+        "Python application (in-process): "
+        "delay|throwCustomException|returnValue."
+    )
+
+    def test_intent_scopes_snapshot(self):
+        from chaos_agent.agent.spec.fault_spec import INTENT_SCOPES
+
+        assert INTENT_SCOPES == self._EXPECTED_SCOPES
+
+    def test_intent_targets_snapshot(self):
+        from chaos_agent.agent.spec.fault_spec import INTENT_TARGETS
+
+        assert INTENT_TARGETS == self._EXPECTED_TARGETS
+
+    def test_intent_actions_snapshot(self):
+        from chaos_agent.agent.spec.fault_spec import INTENT_ACTIONS
+
+        assert INTENT_ACTIONS == self._EXPECTED_ACTIONS
+
+    def test_intent_action_description_snapshot(self):
+        from chaos_agent.agent.spec.fault_spec import INTENT_ACTION_DESCRIPTION
+
+        assert INTENT_ACTION_DESCRIPTION == self._EXPECTED_ACTION_DESCRIPTION
+
+    def test_targets_derive_from_carriers(self):
+        # The aggregate must equal the concatenation of the family carriers'
+        # provider-declared vocabulary (dedup, registration + precedence order).
+        from chaos_agent.agent.spec.fault_registry import (
+            aggregate_actions,
+            aggregate_targets,
+            carrier_actions,
+            carrier_targets,
+        )
+
+        assert carrier_targets("chaosblade") == (
+            "cpu", "mem", "network", "disk", "process",
+        )
+        assert carrier_targets("k8s_native") == (
+            "pod", "finalizer", "replicas", "schedule", "pvc",
+            "dns", "image", "probe", "volume", "cni", "endpoint",
+        )
+        assert carrier_actions("k8s_native") == (
+            "patch", "cordon", "taint", "delete", "drain", "scale",
+            "corrupt", "duplicate",
+        )
+        assert aggregate_targets() == self._EXPECTED_TARGETS
+        assert aggregate_actions() == self._EXPECTED_ACTIONS
+
+    def test_unknown_carrier_yields_empty_vocab(self):
+        from chaos_agent.agent.spec.fault_registry import (
+            carrier_actions,
+            carrier_targets,
+        )
+
+        assert carrier_targets("does_not_exist") == ()
+        assert carrier_actions("does_not_exist") == ()

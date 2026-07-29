@@ -5,7 +5,7 @@ import json
 import pytest
 from langchain_core.messages import ToolMessage
 
-from chaos_agent.agent.nodes._verifier_layer1 import (
+from chaos_agent.agent.nodes.verify._verifier_layer1 import (
     _parse_blade_status_output,
     _parse_blade_query_k8s_output,
     _find_blade_query_in_messages,
@@ -74,6 +74,27 @@ class TestParseBladeStatusOutput:
         status, details, expired = _parse_blade_status_output(raw)
         assert status == "failed"
         assert not expired
+
+    def test_wrapped_record_not_found_is_failed(self):
+        # Regression: a destroyed/absent experiment returns a `success:false`
+        # JSON body wrapped by a shell "command terminated" trailer, which makes
+        # a naive json.loads fail. It must be FAILED — never misread as passed
+        # via the "success" substring inside `"success":false`.
+        raw = (
+            '{"code":67002,"success":false,'
+            '"error":"2ef5 record not found, please add --target k8s flag"}\n'
+            "command terminated with exit code 1\n"
+        )
+        status, details, expired = _parse_blade_status_output(raw)
+        assert status == "failed"
+        assert not expired
+
+    def test_non_json_success_false_not_running(self):
+        # Non-JSON fallback must not treat the "success" substring (inside
+        # `"success":false`) or a "record not found" tail as a Running signal.
+        raw = 'garbage "success":false record not found'
+        status, details, expired = _parse_blade_status_output(raw)
+        assert status == "failed"
 
 
 class TestParseBladeQueryK8sOutput:
@@ -183,3 +204,35 @@ class TestMapQueryK8sToLayer1:
         r = _map_query_k8s_to_layer1(q, "{}", "pod-1", "original")
         assert r.status == "failed"
         assert r.expired is False
+
+
+class TestHostNativeLayer1Skip:
+    """P1.4: host_native injection has no blade experiment, so Layer 1 must be
+    skipped explicitly rather than polling blade_status (which false-reports).
+    The skip is now owned by ``HostShellProvider.layer1_verify`` and reached via
+    the ``run_layer1_for_state`` seam keyed on ``injection_method``."""
+
+    @pytest.mark.asyncio
+    async def test_host_native_skips_layer1(self):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import run_layer1_for_state
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+        state = {"injection_method": "host_native", "messages": []}
+        r = await run_layer1_for_state(state, "", "/tmp/kubeconfig", task_id="t")
+        assert r.status == "skipped"
+        assert "host-native" in r.details
+
+    @pytest.mark.asyncio
+    async def test_kubectl_exec_empty_uid_skips_without_polling(self):
+        # Q2#3 (task-76c59364): the kubectl_exec Layer-1 path must NOT issue
+        # `blade status ''` when there is no UID — that returns ChaosBlade code
+        # 45000 which reads as a genuine FAILURE. An absent UID is skipped
+        # (not applicable), letting Layer 2 verify the actual cluster state.
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            _run_layer1_via_kubectl_exec,
+        )
+
+        r = await _run_layer1_via_kubectl_exec("", "/tmp/kubeconfig", task_id="t")
+        assert r.status == "skipped"
+        assert "no blade_uid" in r.details

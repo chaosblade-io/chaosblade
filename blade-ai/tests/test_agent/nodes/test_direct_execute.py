@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chaos_agent.agent.nodes.direct_execute import (
+from chaos_agent.agent.nodes.execute.direct_execute import (
     _parse_blade_uid_from_content,
     _build_blade_command_for_exec,
 )
@@ -88,7 +88,7 @@ class TestPreflightNodeScopeCheck:
     async def test_preflight_missing_node_returns_prerequisite_failed(self):
         """When target node has no DaemonSet pod, injection should fail with
         PREREQUISITE_FAILED."""
-        from chaos_agent.agent.nodes.direct_execute import direct_execute
+        from chaos_agent.agent.nodes.execute.direct_execute import direct_execute
 
         state = {
             "blade_scope": "node", "blade_target": "disk",
@@ -105,23 +105,23 @@ class TestPreflightNodeScopeCheck:
         mock_result.exit_code = 0
 
         with patch(
-            "chaos_agent.agent.nodes.direct_execute.run_command",
+            "chaos_agent.agent.nodes.execute.direct_execute.execute_via_transport",
             new_callable=AsyncMock, return_value=mock_result,
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.blade_create",
+            "chaos_agent.agent.nodes.execute.direct_execute.blade_create",
             _make_blade_create_mock('{"code":200,"success":true,"result":"uid"}'),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.get_tracker",
+            "chaos_agent.agent.nodes.execute.direct_execute.get_tracker",
             return_value=MagicMock(),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.get_global_session_store",
+            "chaos_agent.agent.nodes.execute.direct_execute.get_global_session_store",
             return_value=MagicMock(),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.sync_node_status_to_session",
+            "chaos_agent.agent.nodes.execute.direct_execute.sync_node_status_to_session",
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.sync_to_store",
+            "chaos_agent.agent.nodes.execute.direct_execute.sync_to_store",
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.build_blade_create_args",
+            "chaos_agent.agent.nodes.execute.direct_execute.build_blade_create_args",
             return_value={"flags": "--path /tmp --timeout 120"},
         ):
             result = await direct_execute(state)
@@ -133,7 +133,7 @@ class TestPreflightNodeScopeCheck:
     async def test_preflight_available_node_proceeds(self):
         """When target node has a DaemonSet pod, injection should proceed
         to blade_create and extract the uid."""
-        from chaos_agent.agent.nodes.direct_execute import direct_execute
+        from chaos_agent.agent.nodes.execute.direct_execute import direct_execute
 
         state = {
             "blade_scope": "node", "blade_target": "disk",
@@ -150,23 +150,27 @@ class TestPreflightNodeScopeCheck:
         mock_kubectl.exit_code = 0
 
         with patch(
-            "chaos_agent.agent.nodes.direct_execute.run_command",
+            "chaos_agent.agent.nodes.execute.direct_execute.execute_via_transport",
             new_callable=AsyncMock, return_value=mock_kubectl,
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.blade_create",
+            "chaos_agent.agent.nodes.execute._injection_detection.discover_tool_pods_cluster_wide_with_nodes",
+            new_callable=AsyncMock,
+            return_value=[("otel-c-tool-abc", "chaosblade", "cn-hongkong.10.0.1.120")],
+        ), patch(
+            "chaos_agent.agent.nodes.execute.direct_execute.blade_create",
             _make_blade_create_mock('{"code":200,"success":true,"result":"uid-123"}'),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.get_tracker",
+            "chaos_agent.agent.nodes.execute.direct_execute.get_tracker",
             return_value=MagicMock(),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.get_global_session_store",
+            "chaos_agent.agent.nodes.execute.direct_execute.get_global_session_store",
             return_value=MagicMock(),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.sync_node_status_to_session",
+            "chaos_agent.agent.nodes.execute.direct_execute.sync_node_status_to_session",
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.sync_to_store",
+            "chaos_agent.agent.nodes.execute.direct_execute.sync_to_store",
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.build_blade_create_args",
+            "chaos_agent.agent.nodes.execute.direct_execute.build_blade_create_args",
             return_value={"flags": "--path /tmp --timeout 120"},
         ):
             result = await direct_execute(state)
@@ -180,7 +184,7 @@ class TestPreflightNodeScopeCheck:
     async def test_preflight_check_failure_does_not_block(self):
         """If kubectl get pods throws (network error), injection should still
         proceed (fail-open) — NOT return PREREQUISITE_FAILED."""
-        from chaos_agent.agent.nodes.direct_execute import direct_execute
+        from chaos_agent.agent.nodes.execute.direct_execute import direct_execute
 
         state = {
             "blade_scope": "node", "blade_target": "disk",
@@ -204,31 +208,34 @@ class TestPreflightNodeScopeCheck:
             return r
 
         with patch(
-            "chaos_agent.agent.nodes.direct_execute.run_command",
+            "chaos_agent.agent.nodes.execute.direct_execute.execute_via_transport",
             new_callable=AsyncMock, side_effect=_run_cmd_side_effect,
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.blade_create",
+            "chaos_agent.agent.nodes.execute._injection_detection.discover_tool_pods_cluster_wide_with_nodes",
+            new_callable=AsyncMock, side_effect=Exception("network error"),
+        ), patch(
+            "chaos_agent.agent.nodes.execute.direct_execute.blade_create",
             _make_blade_create_mock('{"code":200,"success":true,"result":"uid-456"}'),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.get_tracker",
+            "chaos_agent.agent.nodes.execute.direct_execute.get_tracker",
             return_value=MagicMock(),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.get_global_session_store",
+            "chaos_agent.agent.nodes.execute.direct_execute.get_global_session_store",
             return_value=MagicMock(),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.sync_node_status_to_session",
+            "chaos_agent.agent.nodes.execute.direct_execute.sync_node_status_to_session",
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.sync_to_store",
+            "chaos_agent.agent.nodes.execute.direct_execute.sync_to_store",
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.build_blade_create_args",
+            "chaos_agent.agent.nodes.execute.direct_execute.build_blade_create_args",
             return_value={"flags": "--path /tmp --timeout 120"},
         ):
             result = await direct_execute(state)
 
         # Fail-open: pre-flight exception must NOT produce PREREQUISITE_FAILED
         assert result.get("failure_detail", {}).get("category") != "prerequisite_failed", (
-            f"Fail-open violated: got PREREQUISITE_FAILED "
-            f"but pre-flight exception should not block injection"
+            "Fail-open violated: got PREREQUISITE_FAILED "
+            "but pre-flight exception should not block injection"
         )
         assert result.get("blade_uid") == "uid-456", (
             f"Expected blade_uid=uid-456, got: {result}"
@@ -238,7 +245,7 @@ class TestPreflightNodeScopeCheck:
     async def test_pod_scope_no_preflight(self):
         """Pod-scope should not trigger the node DaemonSet pre-flight check
         (distinguished by `kubectl get pods ... -o wide`)."""
-        from chaos_agent.agent.nodes.direct_execute import direct_execute
+        from chaos_agent.agent.nodes.execute.direct_execute import direct_execute
 
         state = {
             "blade_scope": "pod", "blade_target": "cpu",
@@ -253,7 +260,7 @@ class TestPreflightNodeScopeCheck:
 
         run_command_calls = []
 
-        async def mock_run_cmd(cmd, **kwargs):
+        async def mock_run_cmd(cmd, target, **kwargs):
             run_command_calls.append(cmd)
             r = MagicMock()
             r.stdout = ""
@@ -262,26 +269,26 @@ class TestPreflightNodeScopeCheck:
             return r
 
         with patch(
-            "chaos_agent.agent.nodes.direct_execute.run_command",
+            "chaos_agent.agent.nodes.execute.direct_execute.execute_via_transport",
             new_callable=AsyncMock, side_effect=mock_run_cmd,
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.blade_create",
+            "chaos_agent.agent.nodes.execute.direct_execute.blade_create",
             _make_blade_create_mock('{"code":200,"success":true,"result":"uid-pod"}'),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.get_tracker",
+            "chaos_agent.agent.nodes.execute.direct_execute.get_tracker",
             return_value=MagicMock(),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.get_global_session_store",
+            "chaos_agent.agent.nodes.execute.direct_execute.get_global_session_store",
             return_value=MagicMock(),
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.sync_node_status_to_session",
+            "chaos_agent.agent.nodes.execute.direct_execute.sync_node_status_to_session",
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.sync_to_store",
+            "chaos_agent.agent.nodes.execute.direct_execute.sync_to_store",
         ), patch(
-            "chaos_agent.agent.nodes.direct_execute.build_blade_create_args",
+            "chaos_agent.agent.nodes.execute.direct_execute.build_blade_create_args",
             return_value={"flags": "--cpu-percent 80 --timeout 120"},
         ):
-            result = await direct_execute(state)
+            await direct_execute(state)
 
         # Pre-flight check uses `kubectl get pods -l app=otel-c-tool -o wide`
         # Pod scope should NOT issue this command
@@ -319,3 +326,13 @@ class TestBuildBladeCommandForExecNodeScope:
         )
         assert "--namespace" in cmd
         assert "--labels" in cmd
+
+    def test_equals_timeout_is_normalized_without_a_second_timeout(self):
+        cmd = _build_blade_command_for_exec(
+            scope="node", target="network", action="drop",
+            names="node-1", flags="--timeout=2700 --interface eth0",
+        )
+
+        parts = cmd.split()
+        assert parts.count("--timeout") == 1
+        assert parts[parts.index("--timeout") + 1] == "2700"

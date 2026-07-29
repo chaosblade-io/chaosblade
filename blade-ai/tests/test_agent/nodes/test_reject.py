@@ -2,7 +2,7 @@
 
 import pytest
 
-from chaos_agent.agent.nodes.reject import reject
+from chaos_agent.agent.nodes.gates.reject import reject
 
 
 class TestReject:

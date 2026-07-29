@@ -68,7 +68,7 @@ REASON_INITIAL = "initial"
 
 REASON_GRAPH_REPLAN = "graph_replan"
 """Graph-level replan kicked in (settings.replan_auto_trigger or
-LLM emitted ``[REPLAN]``)."""
+LLM emitted a structured replan request)."""
 
 REASON_LLM_TARGET_SWITCH = "llm_target_switch"
 """LLM autonomously picked a different target inside execute_loop."""

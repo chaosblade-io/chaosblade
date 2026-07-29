@@ -8,7 +8,63 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from chaos_agent.agent.nodes.recover_handler import recover_handler
+from chaos_agent.agent.nodes.recover.recover_handler import recover_handler
+
+
+class TestQueryActiveExperimentsTool:
+    """query_active_experiments renders discriminating fields, newest first."""
+
+    @pytest.mark.asyncio
+    async def test_rich_render_and_ordering(self):
+        rows = [
+            {
+                "task_id": "task-old",
+                "skill": "k8s-chaos-skills",
+                "fault_type": "pod-cpu-fullload",
+                "target": {"namespace": "taokeeper", "names": ["tk-0"]},
+                "gmt_create": "2026-06-20T09:00:00+08:00",
+                "plan_summary": "",
+            },
+            {
+                "task_id": "task-new",
+                "skill": "k8s-chaos-skills",
+                "fault_type": "pod-image-error",
+                "target": {"namespace": "reg-center", "names": ["registry-sts"]},
+                "gmt_create": "2026-06-23T15:02:00+08:00",
+                "plan_summary": "将 StatefulSet registry-sts 镜像改为无效值",
+            },
+        ]
+        mock_store = AsyncMock()
+        mock_store.query_active = AsyncMock(return_value=rows)
+
+        with patch("chaos_agent.persistence.task_store.get_task_store",
+                   return_value=mock_store):
+            from chaos_agent.agent.nodes.planning.intent_clarification import (
+                query_active_experiments,
+            )
+            out = await query_active_experiments.ainvoke({})
+
+        # Real fault types shown, not the generic skill package name.
+        assert "pod-image-error" in out
+        assert "pod-cpu-fullload" in out
+        assert "fault_type=k8s-chaos-skills" not in out
+        # Target resource + description surfaced.
+        assert "reg-center/registry-sts" in out
+        assert "将 StatefulSet registry-sts 镜像改为无效值" in out
+        # Newest first: task-new appears before task-old.
+        assert out.index("task-new") < out.index("task-old")
+
+    @pytest.mark.asyncio
+    async def test_no_active(self):
+        mock_store = AsyncMock()
+        mock_store.query_active = AsyncMock(return_value=[])
+        with patch("chaos_agent.persistence.task_store.get_task_store",
+                   return_value=mock_store):
+            from chaos_agent.agent.nodes.planning.intent_clarification import (
+                query_active_experiments,
+            )
+            out = await query_active_experiments.ainvoke({})
+        assert "没有活跃" in out
 
 
 class TestRecoverHandler:
@@ -20,7 +76,7 @@ class TestRecoverHandler:
         mock_store = AsyncMock()
         mock_store.query_active = AsyncMock(return_value=[])
 
-        with patch("chaos_agent.agent.nodes.recover_handler.get_task_store", return_value=mock_store):
+        with patch("chaos_agent.agent.nodes.recover.recover_handler.get_task_store", return_value=mock_store):
             result = await recover_handler(sample_agent_state)
 
         assert result["operation"] == "recover"
@@ -41,7 +97,7 @@ class TestRecoverHandler:
             "target": {"namespace": "cms-demo"},
         })
 
-        with patch("chaos_agent.agent.nodes.recover_handler.get_task_store", return_value=mock_store):
+        with patch("chaos_agent.agent.nodes.recover.recover_handler.get_task_store", return_value=mock_store):
             result = await recover_handler(sample_agent_state)
 
         assert result["operation"] == "recover"
@@ -63,7 +119,7 @@ class TestRecoverHandler:
             {"task_id": "task-002", "fault_type": "pod-mem-load", "target": {"namespace": "default"}, "blade_uid": "exp-2"},
         ])
 
-        with patch("chaos_agent.agent.nodes.recover_handler.get_task_store", return_value=mock_store):
+        with patch("chaos_agent.agent.nodes.recover.recover_handler.get_task_store", return_value=mock_store):
             result = await recover_handler(sample_agent_state)
 
         assert result["operation"] == "recover"
@@ -77,7 +133,7 @@ class TestRecoverHandler:
         mock_store = AsyncMock()
         mock_store.query_active = AsyncMock(side_effect=Exception("DB error"))
 
-        with patch("chaos_agent.agent.nodes.recover_handler.get_task_store", return_value=mock_store):
+        with patch("chaos_agent.agent.nodes.recover.recover_handler.get_task_store", return_value=mock_store):
             result = await recover_handler(sample_agent_state)
 
         assert result["operation"] == "recover"
@@ -104,7 +160,7 @@ class TestRecoverHandler:
         ])
         mock_store.get = AsyncMock(return_value=None)  # get fails → fallback to raw
 
-        with patch("chaos_agent.agent.nodes.recover_handler.get_task_store", return_value=mock_store):
+        with patch("chaos_agent.agent.nodes.recover.recover_handler.get_task_store", return_value=mock_store):
             result = await recover_handler(sample_agent_state)
 
         assert result["operation"] == "recover"

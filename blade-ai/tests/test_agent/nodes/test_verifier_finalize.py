@@ -4,14 +4,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from chaos_agent.agent.nodes._verifier_finalize import (
+from chaos_agent.agent.nodes.verify._verifier_finalize import (
     _overall_to_level,
     _verification_from_submit_args,
     _format_verification_detail,
     _build_verify_replan_context,
     _cleanup_residuals,
 )
-from chaos_agent.agent.verdict import Layer1Result
+from chaos_agent.agent.result.verdict import Layer1Result
 
 
 class TestOverallToLevel:
@@ -158,6 +158,9 @@ class TestBuildVerifyReplanContext:
             "warnings": ["test warning"],
         }
         ctx = _build_verify_replan_context(verification, [], 0, "k8s-disk-fill")
+        assert ctx["affected_step"] == "post-injection verification"
+        assert ctx["decision"] == "plan_invalid"
+        assert ctx["unresolved_questions"]
         assert ctx["trigger"] == "verify_replan"
         assert ctx["skill_name"] == "k8s-disk-fill"
         assert ctx["iteration_at_failure"] == 1

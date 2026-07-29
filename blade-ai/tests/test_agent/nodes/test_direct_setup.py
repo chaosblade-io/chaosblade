@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from chaos_agent.agent.nodes.direct_setup import _collect_context
+from chaos_agent.agent.nodes.execute.direct_setup import _collect_context
 
 
 class TestCollectContextMemoryLimitGate:
@@ -27,7 +27,7 @@ class TestCollectContextMemoryLimitGate:
             "task_id": "t-cpu",
         }
         with patch(
-            "chaos_agent.agent.nodes.direct_execute._fetch_pod_memory_limit_mb",
+            "chaos_agent.agent.nodes.execute.direct_execute._fetch_pod_memory_limit_mb",
             new=AsyncMock(side_effect=AssertionError("must not be called for cpu")),
         ):
             metadata = await _collect_context(state)
@@ -44,7 +44,7 @@ class TestCollectContextMemoryLimitGate:
             "task_id": "t-net",
         }
         with patch(
-            "chaos_agent.agent.nodes.direct_execute._fetch_pod_memory_limit_mb",
+            "chaos_agent.agent.nodes.execute.direct_execute._fetch_pod_memory_limit_mb",
             new=AsyncMock(side_effect=AssertionError("must not be called for network")),
         ):
             metadata = await _collect_context(state)
@@ -64,7 +64,7 @@ class TestCollectContextMemoryLimitGate:
             "task_id": "t-mem",
         }
         with patch(
-            "chaos_agent.agent.nodes.direct_execute._fetch_pod_memory_limit_mb",
+            "chaos_agent.agent.nodes.execute.direct_execute._fetch_pod_memory_limit_mb",
             new=AsyncMock(return_value=512),
         ):
             metadata = await _collect_context(state)
@@ -83,7 +83,7 @@ class TestCollectContextMemoryLimitGate:
             "task_id": "t-node",
         }
         with patch(
-            "chaos_agent.agent.nodes.direct_execute._fetch_pod_memory_limit_mb",
+            "chaos_agent.agent.nodes.execute.direct_execute._fetch_pod_memory_limit_mb",
             new=AsyncMock(side_effect=AssertionError("must not be called for node scope")),
         ):
             metadata = await _collect_context(state)
@@ -102,7 +102,7 @@ class TestCollectContextMemoryLimitGate:
             "task_id": "t-no-kube",
         }
         with patch(
-            "chaos_agent.agent.nodes.direct_execute._fetch_pod_memory_limit_mb",
+            "chaos_agent.agent.nodes.execute.direct_execute._fetch_pod_memory_limit_mb",
             new=AsyncMock(side_effect=AssertionError("must not be called without kubeconfig")),
         ):
             metadata = await _collect_context(state)

@@ -88,6 +88,13 @@ class EventBridge:
                 message=f"Completed {event.node}",
             )
 
+        elif event_type == "node_message":
+            # Programmatic status text from graph nodes. The legacy Python
+            # TUI renders these as streaming text (same as LLM tokens) via
+            # TokenReceived — preserving the pre-node_message-type behaviour.
+            # The TS TUI handles node_message differently (LogItem in Static).
+            return TokenReceived(content=event.content, node=event.node)
+
         return None
 
     async def consume_status(

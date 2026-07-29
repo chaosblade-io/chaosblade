@@ -4,7 +4,7 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from chaos_agent.utils.time import now_iso, parse_iso_timestamp
+from chaos_agent.utils.time import now_iso, parse_iso_timestamp, format_relative_time, BEIJING_TZ
 
 
 class TestNowIso:
@@ -150,3 +150,43 @@ class TestParseIsoTimestamp:
 
         # Injection at UTC 11:51:47 May 12, OOMKill at UTC 17:14:52 May 11
         assert kill_utc < inject_utc
+
+
+class TestFormatRelativeTime:
+    """format_relative_time() renders compact Chinese relative labels."""
+
+    _NOW = datetime(2026, 6, 24, 10, 0, tzinfo=BEIJING_TZ)
+
+    def test_today(self):
+        ts = "2026-06-24T09:10:00+08:00"
+        assert format_relative_time(ts, now=self._NOW) == "今天 09:10"
+
+    def test_yesterday(self):
+        ts = "2026-06-23T15:02:00+08:00"
+        assert format_relative_time(ts, now=self._NOW) == "昨天 15:02"
+
+    def test_n_days_ago(self):
+        ts = "2026-06-21T14:23:00+08:00"
+        assert format_relative_time(ts, now=self._NOW) == "3天前 14:23"
+
+    def test_beyond_seven_days_absolute(self):
+        ts = "2026-06-10T14:23:00+08:00"
+        assert format_relative_time(ts, now=self._NOW) == "2026-06-10 14:23"
+
+    def test_calendar_date_bucket_not_hours(self):
+        """A 23:30 injection viewed at 01:00 next morning reads as 昨天."""
+        now = datetime(2026, 6, 24, 1, 0, tzinfo=BEIJING_TZ)
+        ts = "2026-06-23T23:30:00+08:00"
+        assert format_relative_time(ts, now=now) == "昨天 23:30"
+
+    def test_k8s_utc_timestamp_converted_to_beijing(self):
+        """A UTC (Z) timestamp is shown in Beijing time (+8)."""
+        # 2026-06-23T08:00:00Z == 2026-06-23 16:00 Beijing
+        ts = "2026-06-23T08:00:00Z"
+        assert format_relative_time(ts, now=self._NOW) == "昨天 16:00"
+
+    def test_empty_returns_blank(self):
+        assert format_relative_time("", now=self._NOW) == ""
+
+    def test_unparseable_returns_blank(self):
+        assert format_relative_time("not-a-timestamp", now=self._NOW) == ""

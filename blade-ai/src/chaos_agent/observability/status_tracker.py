@@ -25,11 +25,22 @@ Usage in CLI:
 import asyncio
 import logging
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
+from chaos_agent.persistence.task_identity import is_real_task_id
+
 logger = logging.getLogger(__name__)
+
+# Per-tracker event history cap. History exists only to replay recent
+# context to a late SSE subscriber, so events older than the cap have no
+# consumer. Bounding it keeps a long-lived server process from growing
+# without limit: ``tui-<sid>`` trackers (see ``is_event_channel_id``) are
+# never explicitly removed — ``remove_tracker`` is only called on CLI
+# paths — so an unbounded list would leak for the process lifetime.
+_HISTORY_MAXLEN = 1000
 
 
 class StatusPhase(str, Enum):
@@ -82,7 +93,7 @@ class StatusTracker:
     def __init__(self, task_id: str):
         self.task_id = task_id
         self._subscribers: list[asyncio.Queue[StatusEvent]] = []
-        self._history: list[StatusEvent] = []
+        self._history: deque[StatusEvent] = deque(maxlen=_HISTORY_MAXLEN)
         self._current_source: str = ""
         self._start_time: float = 0.0
 
@@ -187,17 +198,118 @@ class StatusTracker:
         self._current_source, self._start_time = saved
 
 
+# ---- Null tracker (no task → no state, no events, no growth) ----
+
+
+class NullTracker(StatusTracker):
+    """No-op tracker used when there is no real task to track.
+
+    Intent clarification / chat turns run the same graph nodes as the
+    inject pipeline, but they own no task identity (see
+    ``persistence.task_identity``).  Handing those callers a normal
+    :class:`StatusTracker` was harmful in two ways:
+
+    * its events flowed into the tracer, which then fabricated ``tasks``
+      rows for dialogue-level ids ("ghost" experiments), and
+    * a single shared placeholder key (``""`` / ``"unknown"``) kept one
+      global tracker alive whose ``_history`` list only ever grows — an
+      unbounded leak in the long-lived server process.
+
+    Subclassing :class:`StatusTracker` (rather than duck-typing) means
+    the full method surface stays in sync automatically; only the
+    side-effecting members are neutralised.  ``_history`` is kept
+    permanently empty so nothing accumulates.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(task_id="")
+
+    def subscribe(self, maxsize: int = 100) -> "asyncio.Queue[StatusEvent]":
+        # Detached queue: never registered, so it stays empty and GC-able.
+        return asyncio.Queue(maxsize=maxsize)
+
+    def unsubscribe(self, queue: "asyncio.Queue[StatusEvent]") -> None:
+        return None
+
+    def emit(self, event: StatusEvent) -> None:
+        # Swallow the event: no history, no subscribers, no persistence.
+        return None
+
+    def start(self, category: str, source: str, message: str, detail: dict = None) -> None:
+        # Keep ``current_source`` meaningful for callers that read it back,
+        # but record nothing and emit nothing.
+        self._current_source = source
+
+    def update(self, message: str, detail: dict = None) -> None:
+        return None
+
+    def complete(self, message: str = "", detail: dict = None) -> None:
+        return None
+
+    def fail(self, error: str, detail: dict = None) -> None:
+        return None
+
+
 # ---- Global registry ----
 
 _trackers: dict[str, StatusTracker] = {}
+
+# Single shared no-op instance — intentionally NOT stored in ``_trackers``
+# so dialogue turns leave no residue in the registry.
+_NULL_TRACKER = NullTracker()
+
+# Ephemeral event-channel key prefixes: ids that are NOT persistable tasks
+# but DO need a live tracker, because a consumer subscribes to them:
+#   ``tui-<sid>``      — the TS TUI's main /turn stream (``routes/turn.py``);
+#                        ``PreReasoningHook`` fans compaction events here.
+#   ``compact-<uuid>`` — the /compact progress stream (``routes/sessions.py``
+#                        and ``tui/controllers/commands.py``), which mints the
+#                        id and overrides ``state.task_id`` with it.
+# Each prefix is a contract between producer, consumer and the gate below —
+# keep these as the single literals and build keys from them.
+TUI_TRACKER_PREFIX = "tui-"
+COMPACT_TRACKER_PREFIX = "compact-"
+_EVENT_CHANNEL_PREFIXES = (TUI_TRACKER_PREFIX, COMPACT_TRACKER_PREFIX)
 
 # Shared tracing callback reference (set by factory.py during init)
 _tracing_callback = None
 _otel_callback = None
 
 
+def is_event_channel_id(task_id: object) -> bool:
+    """True for ids that deserve a real, in-memory tracker.
+
+    Two distinct concepts must not be conflated:
+
+    * **persistable task identity** — :func:`is_real_task_id`; gates the
+      ``tasks`` / ``task_details`` / ``task_spans`` writes. Enforced
+      independently by ``tracer`` / ``task_store`` / ``_store_sync``.
+    * **live event channel** — this function; gates whether a caller gets
+      a working in-memory tracker (history + subscriber queues).
+
+    Every real task is also an event channel. An ephemeral id
+    (:data:`_EVENT_CHANNEL_PREFIXES`) is an event channel WITHOUT being a
+    task: it has a bounded lifetime and must never reach the ``tasks``
+    tables — which it cannot, because those writes gate on
+    :func:`is_real_task_id` separately. Everything else (dialogue turns,
+    ``""``, ``"unknown"``) is neither, and gets the :class:`NullTracker`.
+    """
+    if is_real_task_id(task_id):
+        return True
+    return isinstance(task_id, str) and task_id.startswith(_EVENT_CHANNEL_PREFIXES)
+
+
 def get_tracker(task_id: str) -> StatusTracker:
-    """Get or create a StatusTracker for a task."""
+    """Get or create a StatusTracker for a real task or TUI event channel.
+
+    Callers with neither (intent clarification, chat, capability Q&A — or
+    any code path that never received an id) get the shared
+    :class:`NullTracker`, so ``tracker.start(...)`` and friends remain safe
+    to call unconditionally without fabricating task state. See
+    :func:`is_event_channel_id` for the two-concept split.
+    """
+    if not is_event_channel_id(task_id):
+        return _NULL_TRACKER
     if task_id not in _trackers:
         _trackers[task_id] = StatusTracker(task_id)
     return _trackers[task_id]

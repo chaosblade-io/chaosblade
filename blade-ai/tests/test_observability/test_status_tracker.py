@@ -166,35 +166,88 @@ class TestGlobalRegistry:
 
     def setup_method(self):
         # Clean up any leftover trackers
-        remove_tracker("test-global")
+        remove_tracker("task-test-global")
 
     def test_get_tracker_creates_new(self):
-        tracker = get_tracker("test-global")
+        tracker = get_tracker("task-test-global")
         assert isinstance(tracker, StatusTracker)
-        assert tracker.task_id == "test-global"
+        assert tracker.task_id == "task-test-global"
 
     def test_get_tracker_returns_same(self):
-        t1 = get_tracker("test-global")
-        t2 = get_tracker("test-global")
+        t1 = get_tracker("task-test-global")
+        t2 = get_tracker("task-test-global")
         assert t1 is t2
 
     def test_remove_tracker(self):
-        get_tracker("test-global")
-        remove_tracker("test-global")
+        get_tracker("task-test-global")
+        remove_tracker("task-test-global")
         # After removal, a new tracker should be created
-        new_tracker = get_tracker("test-global")
+        new_tracker = get_tracker("task-test-global")
         assert new_tracker is not None
 
     def test_subscribe_convenience(self):
-        q = subscribe("test-global")
+        q = subscribe("task-test-global")
         assert isinstance(q, asyncio.Queue)
-        unsubscribe("test-global", q)
+        unsubscribe("task-test-global", q)
 
     def test_unsubscribe_convenience(self):
-        q = subscribe("test-global")
-        unsubscribe("test-global", q)
-        tracker = get_tracker("test-global")
+        q = subscribe("task-test-global")
+        unsubscribe("task-test-global", q)
+        tracker = get_tracker("task-test-global")
         assert q not in tracker._subscribers
+
+
+class TestTrackerEligibilityContract:
+    """Pin the two-concept split enforced by ``is_event_channel_id``.
+
+    ``task-*`` is a persistable task identity; ``tui-*`` is a live UI event
+    channel that must ALSO get a working tracker (the TS TUI's /turn stream
+    subscribes to it and PreReasoningHook fans compaction events out to it).
+    Everything else gets the NullTracker so dialogue turns can call
+    ``tracker.start(...)`` without fabricating task state. Regression guard:
+    tightening the gate to ``is_real_task_id`` alone silently killed the TUI
+    fan-out while every assertion below still looked plausible.
+    """
+
+    def test_task_prefix_gets_real_tracker(self):
+        tracker = get_tracker("task-eligible")
+        tracker.start(StatusCategory.NODE, "n", "m")
+        assert tracker.task_id == "task-eligible"
+        assert len(tracker.get_history()) == 1
+        remove_tracker("task-eligible")
+
+    @pytest.mark.parametrize("channel_id", ["tui-sess-abc", "compact-deadbeef1234"])
+    def test_ephemeral_channel_prefixes_get_real_tracker(self, channel_id):
+        """``tui-``/``compact-`` are event channels, not tasks — still real.
+
+        ``tui-<sid>`` backs the TS TUI's /turn stream; ``compact-<uuid>``
+        backs the /compact progress stream (the route mints the id and
+        overrides ``state.task_id`` with it). A NullTracker here means the
+        consumer's SSE receives nothing but keepalives.
+        """
+        tracker = get_tracker(channel_id)
+        tracker.start(StatusCategory.NODE, "n", "m")
+        assert tracker.task_id == channel_id
+        assert len(tracker.get_history()) == 1
+        remove_tracker(channel_id)
+
+    @pytest.mark.parametrize("bad_id", ["", "unknown", "turn-abc", "chaos-thread", None])
+    def test_other_ids_get_null_tracker(self, bad_id):
+        tracker = get_tracker(bad_id)
+        tracker.start(StatusCategory.NODE, "n", "m")
+        tracker.complete("done")
+        assert tracker.get_history() == [], "NullTracker must record nothing"
+        assert tracker.task_id == ""
+
+    def test_history_is_bounded(self):
+        """History is capped so never-removed ``tui-*`` trackers can't leak."""
+        from chaos_agent.observability.status_tracker import _HISTORY_MAXLEN
+
+        tracker = get_tracker("task-bounded")
+        for i in range(_HISTORY_MAXLEN + 50):
+            tracker.update(f"tick {i}")
+        assert len(tracker.get_history()) == _HISTORY_MAXLEN
+        remove_tracker("task-bounded")
 
 
 class TestTrackStatusContextManager:
@@ -202,10 +255,10 @@ class TestTrackStatusContextManager:
 
     @pytest.mark.asyncio
     async def test_emits_start_and_complete(self):
-        remove_tracker("ctx-test")
-        q = subscribe("ctx-test")
+        remove_tracker("task-ctx-test")
+        q = subscribe("task-ctx-test")
 
-        async with track_status("ctx-test", "test_node", "Working...") as tracker:
+        async with track_status("task-ctx-test", "test_node", "Working...") as tracker:
             pass
 
         start_event = q.get_nowait()
@@ -215,16 +268,16 @@ class TestTrackStatusContextManager:
         complete_event = q.get_nowait()
         assert complete_event.phase == StatusPhase.COMPLETED
 
-        unsubscribe("ctx-test", q)
-        remove_tracker("ctx-test")
+        unsubscribe("task-ctx-test", q)
+        remove_tracker("task-ctx-test")
 
     @pytest.mark.asyncio
     async def test_emits_failed_on_exception(self):
-        remove_tracker("ctx-test-fail")
-        q = subscribe("ctx-test-fail")
+        remove_tracker("task-ctx-test-fail")
+        q = subscribe("task-ctx-test-fail")
 
         with pytest.raises(ValueError, match="boom"):
-            async with track_status("ctx-test-fail", "failing_node", "Will fail"):
+            async with track_status("task-ctx-test-fail", "failing_node", "Will fail"):
                 raise ValueError("boom")
 
         q.get_nowait()  # skip started
@@ -232,15 +285,15 @@ class TestTrackStatusContextManager:
         assert fail_event.phase == StatusPhase.FAILED
         assert "boom" in fail_event.message
 
-        unsubscribe("ctx-test-fail", q)
-        remove_tracker("ctx-test-fail")
+        unsubscribe("task-ctx-test-fail", q)
+        remove_tracker("task-ctx-test-fail")
 
     @pytest.mark.asyncio
     async def test_update_within_context(self):
-        remove_tracker("ctx-test-update")
-        q = subscribe("ctx-test-update")
+        remove_tracker("task-ctx-test-update")
+        q = subscribe("task-ctx-test-update")
 
-        async with track_status("ctx-test-update", "node", "Starting") as tracker:
+        async with track_status("task-ctx-test-update", "node", "Starting") as tracker:
             tracker.update("Midway update")
 
         q.get_nowait()  # skip started
@@ -250,8 +303,8 @@ class TestTrackStatusContextManager:
 
         q.get_nowait()  # complete event
 
-        unsubscribe("ctx-test-update", q)
-        remove_tracker("ctx-test-update")
+        unsubscribe("task-ctx-test-update", q)
+        remove_tracker("task-ctx-test-update")
 
 
 class TestStatusCategories:

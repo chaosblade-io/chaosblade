@@ -20,28 +20,32 @@ _MAX_RESULTS = 5
 
 @tool
 async def web_search(query: str, max_results: Optional[int] = None) -> str:
-    """Search the internet for information.
+    """Read-only. Search the public internet for external knowledge NOT
+    available from local tools or skill/knowledge files.
 
-    This tool accesses external knowledge that is NOT available through local
-    tools (kubectl, blade_status, read_skill_resource, etc.) or skill files.
+    Last-resort lookup: prefer kubectl / blade_* / read_skill_resource /
+    read_knowledge_resource FIRST; reach for web search only when the answer
+    genuinely lives outside the cluster and local docs.
 
-    Valid use-cases (external knowledge required):
-    - Unfamiliar ChaosBlade/kubectl error not explained by local skill files
-    - Verifying whether a specific CLI flag or parameter is correct when
-      skill references do not cover it
-    - Any information that cannot be obtained from the cluster or skill files
+    When to use:
+      - Decode an unfamiliar ChaosBlade / kubectl error the skill and knowledge
+        files don't explain.
+      - Confirm a CLI flag / parameter / API field that local references don't cover.
+      - Any general external fact not obtainable from the cluster or local files.
+      - Do NOT use for things local tools answer: pod/node state (use kubectl),
+        skill instructions (read_skill_resource), experiment state (blade_status).
+        It returns web pages, NEVER live cluster/experiment state.
 
-    This tool does NOT replace local tools. It cannot:
-    - Check pod/node status (use kubectl)
-    - Read skill instructions (use read_skill_resource)
-    - Query experiment state (use blade_status)
+    Inputs:
+      - query: the search query string (be specific: include the exact error
+        text, tool name, and version when relevant).
+      - max_results: number of results, 1-10 (default 5; clamped to 10).
 
-    Args:
-        query: The search query string.
-        max_results: Maximum number of results to return (1-10, default 5).
+    Output: numbered results, each with title / URL / snippet; a
+      "No search results found" line when nothing matched.
 
-    Returns:
-        Formatted search results with titles, URLs, and snippets.
+    Side effects: None (read-only network fetch). Sends the query to a public
+      search engine — do not include secrets/kubeconfig contents in ``query``.
     """
     n = min(max_results or _MAX_RESULTS, 10)
 

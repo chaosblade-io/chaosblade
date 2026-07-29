@@ -5,12 +5,12 @@ import asyncio
 import typer
 
 from chaos_agent.cli.config_manager import get_backend
-from chaos_agent.cli.output import format_output
+from chaos_agent.cli.output import OutputFormat, format_output
 
 
 def metric_command(
     task_id: str = typer.Option("", "--task-id", help="Task ID (omit to list all tasks)"),
-    output: str = typer.Option("json", "--output", "-o", help="Output format: json|yaml"),
+    output: OutputFormat = typer.Option(OutputFormat.json, "--output", "-o", help="Output format: json|yaml"),
 ):
     """Query task status and execution metrics.
 

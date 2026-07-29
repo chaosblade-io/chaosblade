@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chaos_agent.agent.nodes.memory_nodes import load_memory
+from chaos_agent.agent.nodes.store.memory_nodes import load_memory
 
 
 @pytest.mark.asyncio
@@ -38,12 +38,12 @@ async def test_load_memory_clears_stale_approved_target():
         "screener_route": "pass",  # stale from previous turn
         "target": {},
     }
-    with patch("chaos_agent.agent.nodes.memory_nodes.OperationalMemory") as MockMem, \
+    with patch("chaos_agent.agent.nodes.store.memory_nodes.OperationalMemory") as MockMem, \
          patch("chaos_agent.persistence.task_store.get_task_store",
                new=AsyncMock(return_value=MagicMock(
                    query_active=AsyncMock(return_value=[]),
                ))), \
-         patch("chaos_agent.agent.nodes.memory_nodes.sync_to_store",
+         patch("chaos_agent.agent.nodes.store.memory_nodes.sync_to_store",
                new=AsyncMock()):
         MockMem.return_value.read.return_value = ""
         updates = await load_memory(state)
@@ -61,12 +61,12 @@ async def test_load_memory_clear_preserves_other_state():
         "experiment_history": ["should-not-leak-here"],  # caller-supplied
         "target": {},
     }
-    with patch("chaos_agent.agent.nodes.memory_nodes.OperationalMemory") as MockMem, \
+    with patch("chaos_agent.agent.nodes.store.memory_nodes.OperationalMemory") as MockMem, \
          patch("chaos_agent.persistence.task_store.get_task_store",
                new=AsyncMock(return_value=MagicMock(
                    query_active=AsyncMock(return_value=[]),
                ))), \
-         patch("chaos_agent.agent.nodes.memory_nodes.sync_to_store",
+         patch("chaos_agent.agent.nodes.store.memory_nodes.sync_to_store",
                new=AsyncMock()):
         MockMem.return_value.read.return_value = "some notes"
         updates = await load_memory(state)

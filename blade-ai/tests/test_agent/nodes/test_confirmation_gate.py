@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from chaos_agent.agent.nodes.confirmation_gate import confirmation_gate
+from chaos_agent.agent.nodes.gates.confirmation_gate import confirmation_gate
 
 
 class TestConfirmationGate:
@@ -18,7 +18,7 @@ class TestConfirmationGate:
         state["plan"] = "Delete pod my-pod in namespace default"
         state["safety_status"] = "safe"
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved"):
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved"):
             result = await confirmation_gate(state)
 
         assert result["needs_confirmation"] is False
@@ -32,7 +32,7 @@ class TestConfirmationGate:
         state["plan"] = "Delete pod my-pod"
         state["safety_status"] = "safe"
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="rejected"):
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="rejected"):
             result = await confirmation_gate(state)
 
         assert result["safety_status"] == "rejected"
@@ -48,7 +48,7 @@ class TestConfirmationGate:
         state["safety_status"] = "safe"
         state["safety_reason"] = None
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
             await confirmation_gate(state)
 
         call_args = mock_interrupt.call_args[0][0]
@@ -70,7 +70,7 @@ class TestConfirmationGate:
         state["plan"] = long_plan
         state["safety_status"] = "safe"
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
             await confirmation_gate(state)
 
         call_args = mock_interrupt.call_args[0][0]
@@ -84,7 +84,7 @@ class TestConfirmationGate:
         state["plan"] = ""
         state["safety_status"] = "safe"
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
             await confirmation_gate(state)
 
         call_args = mock_interrupt.call_args[0][0]
@@ -98,7 +98,7 @@ class TestConfirmationGate:
         state["plan"] = None
         state["safety_status"] = "safe"
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
             await confirmation_gate(state)
 
         call_args = mock_interrupt.call_args[0][0]
@@ -113,7 +113,7 @@ class TestConfirmationGate:
         state["safety_status"] = "warning"
         state["safety_reason"] = "High blast radius"
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
             await confirmation_gate(state)
 
         call_args = mock_interrupt.call_args[0][0]
@@ -128,7 +128,7 @@ class TestConfirmationGate:
             "plan": "Plan",
         }
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
             await confirmation_gate(state)
 
         call_args = mock_interrupt.call_args[0][0]
@@ -143,7 +143,7 @@ class TestConfirmationGate:
         state["fault_spec"] = None
         state["plan"] = "Plan"
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="approved") as mock_interrupt:
             await confirmation_gate(state)
 
         call_args = mock_interrupt.call_args[0][0]
@@ -160,7 +160,7 @@ class TestConfirmationGate:
         state["plan"] = "Plan"
         state["safety_status"] = "safe"
 
-        with patch("chaos_agent.agent.nodes.confirmation_gate.interrupt", return_value="maybe"):
+        with patch("chaos_agent.agent.nodes.gates.confirmation_gate.interrupt", return_value="maybe"):
             result = await confirmation_gate(state)
 
         assert result["safety_status"] == "rejected"
@@ -183,7 +183,7 @@ class TestConfirmationGate:
         state["safety_status"] = "safe"
 
         with patch(
-            "chaos_agent.agent.nodes.confirmation_gate.interrupt",
+            "chaos_agent.agent.nodes.gates.confirmation_gate.interrupt",
             return_value="approved",
         ) as mock_interrupt:
             await confirmation_gate(state)
@@ -212,7 +212,7 @@ class TestConfirmationGate:
         state["safety_status"] = "safe"
 
         with patch(
-            "chaos_agent.agent.nodes.confirmation_gate.interrupt",
+            "chaos_agent.agent.nodes.gates.confirmation_gate.interrupt",
             return_value="approved",
         ) as mock_interrupt:
             await confirmation_gate(state)

@@ -20,6 +20,7 @@ import pytest
 from chaos_agent.agent.target_guard.classifier import (
     BLADE_TARGET_TO_SCOPE,
     SCOPE_BANNED,
+    SCOPE_ESCAPE,
     SCOPE_READONLY,
     SCOPE_UNKNOWN,
     canonicalise_kind,
@@ -150,7 +151,7 @@ class TestKnownReadOnlyTools:
             "blade_status", "blade_query_k8s",
             "read_knowledge_resource", "read_skill_resource",
             "activate_skill", "submit_fault_intent",
-            "kubectl_ro", "read_file", "save_fault_plan",
+            "host_read", "read_file", "save_fault_plan",
             "finish_planning",
         ],
     )
@@ -431,7 +432,15 @@ class TestKubectlNodeOps:
 
 
 class TestKubectlPatchSetDelete:
-    @pytest.mark.parametrize("sub", ["patch", "set", "delete", "edit", "label", "annotate"])
+    # ``set`` is deliberately NOT in this list. Every other verb here takes the
+    # resource as its first positional, but ``kubectl set`` takes the FIELD
+    # (``set image deploy/x c=img``) — ``kubectl set deploy/x`` is not an
+    # operation at all, it is the bare command group. Verified against the
+    # cluster: ``kubectl set deployment/<d> -n <ns> --dry-run=client`` exits 1
+    # with ``error: unknown flag: --dry-run``, while ``kubectl set image
+    # deployment/<d> <c>=<img> --dry-run=client`` exits 0. ``set`` has its own
+    # coverage in ``test_kubectl_arg_shapes.py::TestKubectlSet``.
+    @pytest.mark.parametrize("sub", ["patch", "delete", "edit", "label", "annotate"])
     def test_basic_resource_op(self, sub):
         et = infer_effective_target("kubectl", [
             sub, "deploy/x", "-n", "prod",
@@ -509,12 +518,26 @@ class TestKubectlDebug:
 
 class TestKubectlExec:
     def test_exec_plain_shell_acts_on_pod(self):
+        # A MUTATING plain shell command inside the pod acts on the pod itself.
         et = infer_effective_target("kubectl", [
-            "exec", "pod-a", "-n", "ns", "--", "ls", "-la",
+            "exec", "pod-a", "-n", "ns", "--", "rm", "-rf", "/data/x",
         ])
         assert et.scope == "pod"
         assert et.names == ("pod-a",)
         assert et.namespace == "ns"
+
+    def test_exec_readonly_shell_is_readonly(self):
+        # A read-only probe inside the pod is READONLY (no target comparison).
+        et = infer_effective_target("kubectl", [
+            "exec", "pod-a", "-n", "ns", "--", "cat", "/proc/diskstats",
+        ])
+        assert et.scope == SCOPE_READONLY
+
+    def test_exec_iptables_list_is_readonly(self):
+        et = infer_effective_target("kubectl", [
+            "exec", "pod-a", "-n", "ns", "--", "iptables", "-L",
+        ])
+        assert et.scope == SCOPE_READONLY
 
     def test_exec_no_inner_cmd_still_pod(self):
         # Pure stdio attach (no `-- cmd`) still acts on the pod
@@ -572,13 +595,14 @@ class TestKubectlExec:
         assert et.confidence == ConfidenceLevel.LOW
 
     @pytest.mark.parametrize("escape_cmd", ["nsenter", "chroot", "unshare"])
-    def test_exec_escape_attempts_are_unknown(self, escape_cmd):
-        # nsenter / chroot / unshare break out of container — we can't
-        # tell what host or path they'd land on. Default-deny.
+    def test_exec_escape_attempts_are_escape_scope(self, escape_cmd):
+        # nsenter / chroot / unshare break out of container — default-deny
+        # via dedicated SCOPE_ESCAPE so the guard can give the LLM the
+        # truthful reason (security policy, not "unrecognised command").
         et = infer_effective_target("kubectl", [
             "exec", "pod-a", "--", escape_cmd, "-t", "1", "-m", "bash",
         ])
-        assert et.scope == SCOPE_UNKNOWN
+        assert et.scope == SCOPE_ESCAPE
         assert et.confidence == ConfidenceLevel.UNKNOWN
 
     def test_exec_no_pod_name_unknown(self):
@@ -994,3 +1018,30 @@ class TestProductionKubectlShape:
         })
         # cordon with no node name is malformed, returns UNKNOWN.
         assert et.scope == SCOPE_UNKNOWN
+
+
+class TestHostInject:
+    """``host_inject`` classifies to scope=host with a command-derived family."""
+
+    def test_network_command_classifies_host_scope_and_family(self):
+        et = infer_effective_target("host_inject", {
+            "command": "iptables -A INPUT -p tcp --dport 80 -j DROP",
+        })
+        assert et.scope == "host"
+        assert et.namespace == ""
+        assert et.blade_target == "network"
+        assert et.confidence.value == "high"
+
+    def test_process_command_classifies_process_family(self):
+        et = infer_effective_target("host_inject", {"command": "kill -9 1234"})
+        assert et.scope == "host"
+        assert et.blade_target == "process"
+
+    def test_empty_command_is_unknown_confidence(self):
+        et = infer_effective_target("host_inject", {"command": ""})
+        assert et.scope == "host"
+        assert et.confidence.value == "unknown"
+
+    def test_host_read_is_readonly(self):
+        et = infer_effective_target("host_read", {"command": "df -h"})
+        assert et.scope == SCOPE_READONLY

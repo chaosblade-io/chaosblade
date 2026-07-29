@@ -249,8 +249,8 @@ class TestTracePersistence:
     """
 
     def setup_method(self):
-        clear_trace("persist-test")
-        clear_trace("persist-test-2")
+        clear_trace("task-persist-test")
+        clear_trace("task-persist-test-2")
 
     async def _setup_store(self, tmp_path, monkeypatch):
         """Helper: reset singleton + point settings to a temp DB."""
@@ -279,18 +279,18 @@ class TestTracePersistence:
         await self._setup_store(tmp_path, monkeypatch)
         try:
             await init_tracer()
-            trace = await get_trace("persist-test")
+            trace = await get_trace("task-persist-test")
             span = trace.start_span("agent_loop")
             await trace.end_span(span)
 
             import chaos_agent.persistence.task_store as store_mod
             store = await store_mod.get_task_store()
-            spans = await store.get_spans("persist-test")
+            spans = await store.get_spans("task-persist-test")
             assert len(spans) == 1
             assert spans[0]["node_name"] == "agent_loop"
         finally:
             await self._teardown_store()
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")
 
     @pytest.mark.asyncio
     async def test_load_trace_from_taskstore(self, tmp_path, monkeypatch):
@@ -299,21 +299,21 @@ class TestTracePersistence:
         try:
             await init_tracer()
 
-            trace = await get_trace("persist-test")
+            trace = await get_trace("task-persist-test")
             trace.total_llm_calls = 3
             trace.total_token_input = 100
             span = trace.start_span("verifier")
             await trace.end_span(span)
 
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")
 
-            loaded = await get_trace("persist-test")
-            assert loaded.task_id == "persist-test"
+            loaded = await get_trace("task-persist-test")
+            assert loaded.task_id == "task-persist-test"
             assert len(loaded.spans) == 1
             assert loaded.spans[0].node_name == "verifier"
         finally:
             await self._teardown_store()
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")
 
     @pytest.mark.asyncio
     async def test_get_all_metrics_merges_store_and_memory(self, tmp_path, monkeypatch):
@@ -322,24 +322,24 @@ class TestTracePersistence:
         try:
             await init_tracer()
 
-            trace1 = await get_trace("persist-test")
+            trace1 = await get_trace("task-persist-test")
             trace1.total_llm_calls = 2
             span = trace1.start_span("node1")
             await trace1.end_span(span)
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")
 
-            trace2 = await get_trace("persist-test-2")
+            trace2 = await get_trace("task-persist-test-2")
             trace2.total_llm_calls = 1
 
             metrics = await get_all_metrics()
             assert metrics["total"] >= 2
             task_ids = [t["task_id"] for t in metrics["tasks"]]
-            assert "persist-test" in task_ids
-            assert "persist-test-2" in task_ids
+            assert "task-persist-test" in task_ids
+            assert "task-persist-test-2" in task_ids
         finally:
             await self._teardown_store()
-            clear_trace("persist-test")
-            clear_trace("persist-test-2")
+            clear_trace("task-persist-test")
+            clear_trace("task-persist-test-2")
 
     @pytest.mark.asyncio
     async def test_get_all_trace_ids_includes_store(self, tmp_path, monkeypatch):
@@ -348,16 +348,16 @@ class TestTracePersistence:
         try:
             await init_tracer()
 
-            trace = await get_trace("persist-test")
+            trace = await get_trace("task-persist-test")
             span = trace.start_span("node1")
             await trace.end_span(span)
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")
 
             ids = await get_all_trace_ids()
-            assert "persist-test" in ids
+            assert "task-persist-test" in ids
         finally:
             await self._teardown_store()
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")
 
     @pytest.mark.asyncio
     async def test_flush_trace(self, tmp_path, monkeypatch):
@@ -366,18 +366,18 @@ class TestTracePersistence:
         try:
             await init_tracer()
 
-            trace = await get_trace("persist-test")
+            trace = await get_trace("task-persist-test")
             trace.total_llm_calls = 5
-            await flush_trace("persist-test")
+            await flush_trace("task-persist-test")
 
             import chaos_agent.persistence.task_store as store_mod
             store = await store_mod.get_task_store()
-            summary = await store.get_summary("persist-test")
+            summary = await store.get_summary("task-persist-test")
             assert summary is not None
             assert summary["total_llm_calls"] == 5
         finally:
             await self._teardown_store()
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")
 
     @pytest.mark.asyncio
     async def test_no_init_tracer_graceful_degradation(self):
@@ -404,19 +404,19 @@ class TestTracePersistence:
         try:
             await init_tracer()
 
-            trace = await get_trace("persist-test")
+            trace = await get_trace("task-persist-test")
             span = trace.start_span("node1")
             await trace.end_span(span)
 
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")
 
             import chaos_agent.persistence.task_store as store_mod
             store = await store_mod.get_task_store()
-            spans = await store.get_spans("persist-test")
+            spans = await store.get_spans("task-persist-test")
             assert len(spans) == 1
 
-            loaded = await get_trace("persist-test")
-            assert loaded.task_id == "persist-test"
+            loaded = await get_trace("task-persist-test")
+            assert loaded.task_id == "task-persist-test"
         finally:
             await self._teardown_store()
-            clear_trace("persist-test")
+            clear_trace("task-persist-test")

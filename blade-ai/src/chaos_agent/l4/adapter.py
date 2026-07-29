@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 
-from chaos_agent.agent.state_builders import build_inject_initial_state
+from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.l4.error_mapping import _extract_error
 from chaos_agent.l4.schemas import L4TaskResult, L4TestTask
 
@@ -41,20 +41,42 @@ def test_task_to_initial_state(task: L4TestTask) -> dict:
     scope = fi.get("scope", "")
     namespace = fi.get("namespace", "")
 
-    _missing = [
-        name for name, val in (
-            ("target", blade_target),
-            ("action", blade_action),
-            ("scope", scope),
-            ("namespace", namespace),
-        ) if not val
+    # namespace 仅对 **namespace-scoped** 故障必填。cluster-scoped（host / node /
+    # python / pv / …）天然没有 namespace，无条件必填会把正常的主机故障
+    # 直接 fail-closed 拦下（实测：host-cpu-fullload 报
+    # "missing required field(s): ['namespace']"）。此前未暴露，是因为平台
+    # 协调器 LLM 会自己瞎填 namespace="default" 去满足校验。
+    # 判据复用 fault_registry 的单一真源（CLI / REST 层已在用同一个），
+    # 新增无 namespace 的 scope 时无需再改这里。
+    from chaos_agent.agent.spec.fault_registry import aggregate_cluster_scoped
+
+    _required = [
+        ("target", blade_target),
+        ("action", blade_action),
+        ("scope", scope),
     ]
+    if scope not in aggregate_cluster_scoped():
+        _required.append(("namespace", namespace))
+
+    _missing = [name for name, val in _required if not val]
     if _missing:
         raise ValueError(
             "L4 adapter: fault_intent missing required field(s): "
             f"{_missing}. Got fault_intent keys={list(fi.keys())}. "
             "Required = target / action / scope / namespace (per "
             "FaultSpec.to_intent_dict())."
+        )
+
+    # Validate the explicit transport channel override (mirrors the REST
+    # InjectRequest validator).  The L4 AgentCard advertises this enum in
+    # FAULT_PAYLOAD_SCHEMA, but jsonschema is never enforced programmatically,
+    # so validate here — fail-closed with a clear error rather than letting a
+    # bad value crash deep inside execute_via_transport → resolve().
+    _conn_mode = payload.get("kube_connection_mode", "")
+    if _conn_mode not in ("", "kubeconfig", "kubewiz_k8s", "kubewiz_host", "ssh"):
+        raise ValueError(
+            f"L4 adapter: invalid kube_connection_mode {_conn_mode!r}; "
+            "allowed = '' / kubeconfig / kubewiz_k8s / kubewiz_host / ssh."
         )
 
     fault_spec_dict = {
@@ -80,6 +102,14 @@ def test_task_to_initial_state(task: L4TestTask) -> dict:
         interaction_mode="l4",  # Avoid CLI auto-reject in confirmation_gate
         kubeconfig=payload.get("kubeconfig", ""),
         kube_context=payload.get("kube_context", ""),
+        kubewiz_cluster_uuid=payload.get("kubewiz_cluster_uuid", ""),
+        kubewiz_profile=payload.get("kubewiz_profile", ""),
+        kube_connection_mode=_conn_mode,
+        host_name=payload.get("host_name", ""),
+        ssh_host=payload.get("ssh_host", ""),
+        ssh_user=payload.get("ssh_user", ""),
+        ssh_key_path=payload.get("ssh_key_path", ""),
+        ssh_port=payload.get("ssh_port"),
         messages=[],
         tenant_id=payload.get("tenant_id", ""),
     )
@@ -134,7 +164,7 @@ def state_to_task_result(
     if status == "failed":
         error = _extract_error(values, task_state)
 
-    from chaos_agent.agent.operation_outcome import (
+    from chaos_agent.agent.result.operation_outcome import (
         read_inject_verification,
         read_operation_outcome,
     )
@@ -178,7 +208,7 @@ def build_recover_initial_state(inject_values: dict, inject_task_id: str) -> dic
     Mirrors server/routes/recover.py: reads inject checkpoint
     but does NOT copy full state (prevents causal chain illusion).
     """
-    from chaos_agent.agent.recovery_state import build_recover_initial_from_checkpoint
+    from chaos_agent.agent.state_mgmt.recovery_state import build_recover_initial_from_checkpoint
 
     return build_recover_initial_from_checkpoint(
         inject_values,

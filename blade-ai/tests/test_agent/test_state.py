@@ -6,7 +6,7 @@ from chaos_agent.agent.state import (
     infer_phase,
     infer_task_state,
 )
-from chaos_agent.agent.state_lifecycle import (
+from chaos_agent.agent.state_mgmt.state_lifecycle import (
     STATE_DURABLE_FACT_FIELDS,
     STATE_FIELD_GROUPS,
     STATE_FIELD_POLICIES,
@@ -67,8 +67,8 @@ class TestAgentStateDefaults:
             "plan_summary",
             "_planning_alternatives",
             "_catalogue_rejection_nudged",
-            "_execute_text_nudged",
-            "_kubectl_step_nudged",
+            "_execute_text_stall_count",
+            "_injection_selfcheck_nudged",
         ):
             assert field in annotations
 

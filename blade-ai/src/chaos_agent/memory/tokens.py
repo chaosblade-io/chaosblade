@@ -56,6 +56,8 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any, Optional
 
+from chaos_agent.utils.reasoning_replay import replayed_reasoning
+
 logger = logging.getLogger(__name__)
 
 
@@ -437,12 +439,24 @@ def _layer3_or_4(text: str, resolved_model: str) -> TokenCount:
 def count_tokens_messages(messages: list[Any], *, model: str = "") -> TokenCount:
     """Sum tokens across a list of messages.
 
+    Counts two kinds of text per message: its ``content``, and any thinking
+    trace that will be REPLAYED to the model (see
+    ``utils.reasoning_replay.replayed_reasoning``). The trace matters because a
+    thinking model routinely returns empty ``content`` with the entire rationale
+    in ``reasoning_content`` — counting ``content`` alone measured a 10-turn
+    history at 83 tokens against a 7,547-token request. Thinking that will NOT
+    be replayed (wrong model provenance, blank, non-assistant role) is excluded,
+    so this figure tracks the wire payload rather than everything stored in
+    ``additional_kwargs``.
+
     Follows the OpenAI cookbook overhead approximation: each message
-    that carries content contributes ~4 tokens of envelope (role +
+    that carries text contributes ~4 tokens of envelope (role +
     delimiters) plus 2 tokens of priming for the whole batch. The +4
     is per-MESSAGE — not per-text-block — so a multi-modal message
-    with three text segments still gets one envelope, matching the
-    on-wire framing the model actually sees.
+    with three text segments, or a message carrying both content and a
+    replayed trace, still gets one envelope, matching the on-wire framing
+    the model actually sees. A message with neither content nor a replayed
+    trace gets no envelope at all.
 
     The aggregated ``quality`` is the WEAKEST tier across all counted
     segments: any single HEURISTIC poisons the aggregate to HEURISTIC.
@@ -464,7 +478,8 @@ def count_tokens_messages(messages: list[Any], *, model: str = "") -> TokenCount
     def _absorb(text: str) -> int:
         """Count one text segment, update the worst-quality tracker,
         and return the raw token count so the caller can decide whether
-        the parent message had content (and thus owes an envelope)."""
+        the parent message carried any text at all (and thus owes an
+        envelope). Segments include ``content`` and replayed thinking."""
         nonlocal worst_rank, worst_encoding, worst_margin
         if not text:
             return 0
@@ -499,6 +514,18 @@ def count_tokens_messages(messages: list[Any], *, model: str = "") -> TokenCount
             for item in content:
                 if isinstance(item, dict) and "text" in item:
                     msg_tokens += _absorb(item.get("text", "") or "")
+        # Thinking traces that get REPLAYED are on the wire just like content,
+        # and for a thinking model they are usually the bulk of the payload:
+        # ``content`` comes back empty while the whole rationale sits in
+        # ``reasoning_content``. Counting only ``content`` measured a 10-turn
+        # history at 83 tokens against a real 7,547 — so compaction never fired
+        # and the first symptom was a context-length error from the API.
+        #
+        # ``replayed_reasoning`` is the SAME decision the outbound patch makes
+        # (assistant-only, provenance-matched, tail-truncated), which is what
+        # keeps this count equal to the bytes actually sent rather than to
+        # everything stored in ``additional_kwargs``.
+        msg_tokens += _absorb(replayed_reasoning(msg))
         # +4 envelope ONCE per message that actually carried text.
         # Empty / None content (e.g. mid-stream AIMessageChunk) skips
         # the envelope entirely — matches the historical behaviour the
@@ -516,9 +543,150 @@ def count_tokens_messages(messages: list[Any], *, model: str = "") -> TokenCount
     )
 
 
+@dataclass(frozen=True)
+class ContextUsage:
+    """How full the context window actually is, for compaction decisions.
+
+    ``count_tokens_messages`` answers a different question — how many tokens a
+    list of messages is worth as TEXT. That is the right tool for sizing a
+    payload we are about to build, but it is the wrong basis for "is the window
+    nearly full?", because a request carries far more than the message list:
+
+      * the system prompt (assembled skills, knowledge, baselines),
+      * every tool's JSON schema,
+      * provider-side framing.
+
+    Measured against real checkpoint data from this project: on the FIRST call of
+    a drill the provider reported ``input_tokens=6,936`` while the message list
+    was worth 11 tokens — a 630x gap that is invisible to any local count. It is
+    also not a constant offset; it grows as skills load.
+
+    So when the provider has told us what it actually received, that number is
+    the truth. Only the turns AFTER that report need estimating.
+
+    Attributes:
+        tokens: Best available total — ``usage_tokens + trailing_tokens``.
+        safe_tokens: ``tokens`` with the tokenizer's safety margin applied to the
+            ESTIMATED part only. A provider figure needs no margin — it is what
+            the provider counted — while the trailing estimate does, exactly as
+            ``TokenCount.safe_count`` does elsewhere. Threshold checks should use
+            this so an inaccurate tokenizer still errs toward compacting.
+        usage_tokens: Authoritative input size from the newest assistant message
+            that carried ``usage_metadata``. 0 when none is available.
+        trailing_tokens: Locally estimated text of everything after that message
+            (plus the whole list when there is no usage at all).
+        overhead_tokens: What the provider counted that the message text does not
+            explain — system prompt, tool schemas, framing. Derived from the
+            newest report only, never averaged: on real data it climbed from
+            6,925 to 16,157 within one drill as skills loaded, so it is a moving
+            baseline rather than a constant. 0 when there is no usage to derive
+            it from.
+        last_usage_index: Index of the message that supplied ``usage_tokens``, or
+            None when falling back to a pure estimate.
+        exact: True when a provider figure anchored the result. False means this
+            is a pure local estimate and therefore blind to the system prompt and
+            tool schemas — it will UNDER-report.
+    """
+
+    tokens: int
+    safe_tokens: int
+    usage_tokens: int
+    trailing_tokens: int
+    overhead_tokens: int
+    last_usage_index: Optional[int]
+    exact: bool
+
+    def project(self, text_tokens: int) -> int:
+        """Size of a request built from ``text_tokens`` worth of messages.
+
+        For weighing a HYPOTHETICAL message set — "if I kept only these, would it
+        fit?" — where a usage anchor cannot be used directly because the provider
+        never saw that set.
+
+        This exists to keep one ruler across the whole decision. The trigger check
+        reads provider-anchored totals; if a follow-up check measured bare message
+        text instead, the two would disagree by ``overhead_tokens`` (13K+ in
+        practice). A cheap path chosen on the smaller figure that the trigger then
+        keeps rejecting is a loop, and the cheap paths are the ones no circuit
+        breaker watches.
+        """
+        return text_tokens + self.overhead_tokens
+
+
+def _provider_input_tokens(msg: Any) -> Optional[int]:
+    """Input-token count this assistant message reported, if any.
+
+    ``usage_metadata`` is langchain's normalised shape and is populated on both
+    the streaming and non-streaming paths. ``input_tokens`` covers the ENTIRE
+    request — system prompt, tool schemas, prior turns, thinking that was replayed
+    — which is exactly why it is preferred over any local sum.
+    """
+    if getattr(msg, "type", "") != "ai":
+        return None
+    usage = getattr(msg, "usage_metadata", None)
+    if not isinstance(usage, dict):
+        return None
+    value = usage.get("input_tokens")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def estimate_context_tokens(
+    messages: list[Any], *, model: str = ""
+) -> ContextUsage:
+    """Estimate how full the context window is, anchored on provider usage.
+
+    Scans backwards for the newest assistant message carrying provider usage,
+    takes its ``input_tokens`` as the size of everything up to and including that
+    exchange, then adds a local estimate for the messages after it. Without any
+    usage the whole list is estimated locally and ``exact`` is False.
+
+    The anchor covers what preceded it, so the anchor message's own text is NOT
+    added again — only messages strictly after it are estimated.
+    """
+    if not messages:
+        return ContextUsage(0, 0, 0, 0, 0, None, False)
+
+    for i in range(len(messages) - 1, -1, -1):
+        reported = _provider_input_tokens(messages[i])
+        if reported is None:
+            continue
+        # The anchor's own output is part of the conversation the next request
+        # will carry, so it is counted with the trailing slice.
+        trailing = count_tokens_messages(messages[i:], model=model)
+        # What the report covered minus the text we can see in it. Clamped at 0:
+        # after a compaction the anchor can predate messages that have since been
+        # removed, which makes the difference negative and meaningless.
+        visible_before = count_tokens_messages(messages[:i], model=model).count
+        overhead = max(0, reported - visible_before)
+        return ContextUsage(
+            tokens=reported + trailing.count,
+            safe_tokens=reported + trailing.safe_count,
+            usage_tokens=reported,
+            trailing_tokens=trailing.count,
+            overhead_tokens=overhead,
+            last_usage_index=i,
+            exact=True,
+        )
+
+    estimated = count_tokens_messages(messages, model=model)
+    return ContextUsage(
+        tokens=estimated.count,
+        safe_tokens=estimated.safe_count,
+        usage_tokens=0,
+        trailing_tokens=estimated.count,
+        overhead_tokens=0,
+        last_usage_index=None,
+        exact=False,
+    )
+
+
 __all__ = [
+    "ContextUsage",
     "TokenCount",
     "TokenCountQuality",
     "count_tokens",
     "count_tokens_messages",
+    "estimate_context_tokens",
 ]

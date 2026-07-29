@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 
 # Re-export public types for backward compatibility
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode, ResponseStatus  # noqa: F401
+from chaos_agent.agent.spec.fault_registry import aggregate_cluster_scoped, aggregate_scopes
 
 
 # --- Request Models ---
@@ -33,13 +34,28 @@ class InjectRequest(BaseModel):
     direct: bool = Field(False, description="Skip LLM, execute blade command directly")
     kubeconfig: Optional[str] = Field(None, description="Path to kubeconfig file (overrides BLADE_AI_KUBECONFIG_PATH and KUBECONFIG env)")
     context: Optional[str] = Field(None, description="Kubeconfig context name (overrides BLADE_AI_KUBE_CONTEXT)")
+    # KubeWiz gateway targeting (overrides BLADE_AI_KUBEWIZ_* settings per-request)
+    cluster_uuid: Optional[str] = Field(None, description="KubeWiz target cluster UUID (for kubewiz_k8s channel)")
+    profile: Optional[str] = Field(None, description="KubeWiz wiz-task-exec profile")
+    # Explicit channel override — empty = field-based auto inference.
+    kube_connection_mode: Optional[str] = Field(None, description="Explicit transport channel: '' (auto) / kubeconfig / kubewiz_k8s / kubewiz_host / ssh")
+    # Host transport parameters (for host-scope fault injection)
+    host_name: Optional[str] = Field(None, description="Host name/IP for kubewiz-host channel")
+    ssh_host: Optional[str] = Field(None, description="SSH host address for SSH channel")
+    ssh_user: Optional[str] = Field(None, description="SSH login user")
+    ssh_key_path: Optional[str] = Field(None, description="SSH private key path")
+    ssh_port: Optional[int] = Field(None, ge=1, le=65535, description="SSH port (default: 22)")
 
     @model_validator(mode="after")
     def validate_mode(self):
         """Either input is provided, or all structured params are provided."""
         has_input = bool(self.input)
         has_target = bool(self.target_name or self.labels)
-        has_structured = all([self.scope, self.target, self.action, has_target, self.namespace])
+        # Cluster-scoped faults (node / host …) are namespace-less by nature, so
+        # namespace is only required for namespace-scoped faults (pod / container …).
+        namespace_optional = self.scope in aggregate_cluster_scoped()
+        has_core = all([self.scope, self.target, self.action, has_target])
+        has_structured = has_core and (bool(self.namespace) or namespace_optional)
         if not has_input and not has_structured:
             raise ValueError(
                 "Provide either 'input' or all of: scope, target, action, (target_name or labels), namespace"
@@ -50,8 +66,15 @@ class InjectRequest(BaseModel):
             raise ValueError(
                 "'direct' requires all structured params: scope, target, action, (target_name or labels), namespace"
             )
-        if has_structured and self.scope not in {"node", "pod", "container"}:
-            raise ValueError(f"Invalid scope '{self.scope}', must be node/pod/container")
+        if has_structured and self.scope not in aggregate_scopes():
+            raise ValueError(
+                f"Invalid scope '{self.scope}', must be one of: {', '.join(aggregate_scopes())}"
+            )
+        if self.kube_connection_mode not in (None, "", "kubeconfig", "kubewiz_k8s", "kubewiz_host", "ssh"):
+            raise ValueError(
+                f"Invalid kube_connection_mode '{self.kube_connection_mode}'; "
+                "must be '' / kubeconfig / kubewiz_k8s / kubewiz_host / ssh"
+            )
         return self
 
 
@@ -78,6 +101,7 @@ class TargetInfo(BaseModel):
 
     name: str = ""
     namespace: str = ""
+    host_name: str = ""
 
 
 class InjectResponse(BaseModel):
@@ -87,6 +111,7 @@ class InjectResponse(BaseModel):
     result: str = "pending"
     fault_type: str = ""
     blade_uid: str = ""
+    recovery_handle: Optional[dict] = None
     targets: list[TargetInfo] = []
     verification: Optional[dict] = None
     error: str = ""
@@ -98,6 +123,7 @@ class RecoverResponse(BaseModel):
     task_id: str
     result: str = "pending"
     blade_uid: str = ""
+    recovery_handle: Optional[dict] = None
     targets: list[TargetInfo] = []
     verification: Optional[dict] = None
     error: str = ""

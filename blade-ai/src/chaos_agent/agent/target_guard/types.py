@@ -55,6 +55,15 @@ class GuardVerdict(str, Enum):
     # kubectl subcommand). Default-deny posture — block + log so the
     # operator notices and adds explicit classification.
     REJECT_UNKNOWN = "reject_unknown"
+    # Call is legitimate but was refused because it kept repeating with no
+    # progress. Distinct from the verdicts above ON PURPOSE: those say the call
+    # is not permitted in this shape at all, this one says the shape is fine and
+    # only the repetition is not. Sharing REJECT_UNKNOWN taught the model the
+    # wrong lesson — that the tool was unavailable — and additionally attracted
+    # the "no approved target on record" note, which has nothing to do with
+    # stagnation. The refusal also ALTERNATES, so unlike the others it is not a
+    # statement about the call's admissibility.
+    REJECT_STAGNANT = "reject_stagnant"
 
 
 class ConfidenceLevel(str, Enum):
@@ -133,6 +142,18 @@ class ApprovedTarget:
     # whose selector matches the approved labels. Used by the guard to
     # validate owner-scope operations at the instance level.
     owner_names: tuple[str, ...] = ()
+    # Concrete resource names the approved LABEL selector resolves to at
+    # freeze time (cluster query). For a label-approved scope (e.g. an
+    # availability-zone node fault approved by
+    # ``labels={topology.kubernetes.io/zone: ...}``), execution legitimately
+    # fans out per-name (kubectl-native needs one debug Pod per node, and the
+    # skill batches by node name). Without this, the guard would compare a
+    # labels-only approval against name-based execution — a label↔name cross
+    # it rejects as "resource selection drift" (false positive). The guard
+    # validates ``effective.names ⊆ resolved_names`` so in-zone name batches
+    # pass while out-of-zone names are still rejected. Empty when the approval
+    # was name-based or the label could not be resolved.
+    resolved_names: tuple[str, ...] = ()
     # Cross-scope operations: kubectl-native faults (cordon + delete pod)
     # may need to operate on a different scope than the primary one.
     # When scope=node, secondary_scopes=("pod",) allows pod-level
@@ -142,6 +163,33 @@ class ApprovedTarget:
     # scoped (namespace=""), but secondary pod operations need a namespace.
     # Preserved from FaultSpec.namespace before cluster-scope clearing.
     secondary_namespace: str = ""
+    # Carrier-agnostic host identity. Populated when ``scope == "host"``
+    # (bare-metal / VM faults). Empty for Kubernetes targets, which keep
+    # using namespace/names/labels. See ``as_target()``.
+    host_name: str = ""
+
+    def as_target(self):
+        """Return the carrier-agnostic :class:`TargetProtocol` view.
+
+        Delegates identity / describe to ``target_protocol`` so callers
+        needing a carrier-neutral handle don't hardcode K8s field access.
+        The guard's existing K8s comparison logic is unaffected.
+        """
+        from chaos_agent.agent.target_guard.target_protocol import (
+            HostTarget,
+            K8sTarget,
+        )
+        if self.scope == "host":
+            return HostTarget(
+                scope="host",
+                host_name=self.host_name or (self.names[0] if self.names else ""),
+            )
+        return K8sTarget(
+            scope=self.scope,
+            namespace=self.namespace,
+            names=self.names,
+            labels=dict(self.labels),
+        )
 
 
 @dataclass(frozen=True)
@@ -186,6 +234,53 @@ class EffectiveTarget:
     # Guard skips namespace check; names/labels check still validates
     # target identity.
     is_tier1_exec: bool = False
+    # Carrier-agnostic host identity — populated when ``scope == "host"``.
+    # Empty for Kubernetes targets. See ``as_target()``.
+    host_name: str = ""
+    # Precise, non-editorialized cause for a REJECT scope (``__banned__`` /
+    # ``__escape__`` / ``__unknown__``), set by whoever classified it (the
+    # classifier for banned/unknown subcommands, the screener for an
+    # unresolved host-escape carrier). Surfaced verbatim in the guard's reason
+    # so the model gets the ACTUAL cause instead of a generic template
+    # ("tool is in the banned list" / a chroot OR-template). Empty when the
+    # origin did not record a specific cause — the guard then falls back to its
+    # generic wording.
+    reject_detail: str = ""
+    # The compliant alternative for that same REJECT, kept SEPARATE from the
+    # cause. The two answer different questions ("why was this refused" vs
+    # "what should I do instead") and land in different GuardDecision fields
+    # (``reason`` vs ``suggestion``), which the screener renders distinctly.
+    #
+    # Only the origin can supply it: whether a way forward exists, and what it
+    # is, depends on WHICH ban fired — the classifier knows the subcommand and
+    # the whitelist, the guard sees only a ``__banned__`` sentinel. Folding it
+    # into ``reject_detail`` (as ``kubectl apply -f`` once did) hides it inside
+    # prose for one case while six others said nothing at all.
+    #
+    # EMPTY IS MEANINGFUL: it declares "no compliant form exists" — a genuine
+    # dead-end such as ``kubectl certificate``. ``guard_gateway`` derives
+    # ``is_hard_floor`` from exactly this ("a suggestion means the guard knows a
+    # compliant path exists, so this is a form issue"), so never fill it just to
+    # avoid an empty field.
+    reject_suggestion: str = ""
+
+    def as_target(self):
+        """Return the carrier-agnostic :class:`TargetProtocol` view."""
+        from chaos_agent.agent.target_guard.target_protocol import (
+            HostTarget,
+            K8sTarget,
+        )
+        if self.scope == "host":
+            return HostTarget(
+                scope="host",
+                host_name=self.host_name or (self.names[0] if self.names else ""),
+            )
+        return K8sTarget(
+            scope=self.scope,
+            namespace=self.namespace,
+            names=self.names,
+            labels=dict(self.labels),
+        )
 
 
 @dataclass

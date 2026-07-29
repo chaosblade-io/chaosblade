@@ -289,7 +289,7 @@ def _write_disabled_list(updated: list[str]) -> None:
     """Persist via ConfigStore.set_many — the same path the Python TUI
     uses (``tui/controllers/commands.py:1324``). Triggers
     settings.reload() automatically."""
-    from chaos_agent.tui.config_store import ConfigStore
+    from chaos_agent.config.config_store import ConfigStore
 
     ConfigStore().set_many({"disabled_skills": updated})
 

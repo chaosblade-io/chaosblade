@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 
-from chaos_agent.agent.operation_outcome import read_operation_outcome
+from chaos_agent.agent.result.operation_outcome import read_operation_outcome
 from chaos_agent.l4.schemas import L4AgentError
 
 # Ordered patterns: first match wins

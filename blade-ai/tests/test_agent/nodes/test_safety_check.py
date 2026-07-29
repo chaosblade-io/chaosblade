@@ -2,7 +2,7 @@
 
 import pytest
 
-from chaos_agent.agent.nodes.safety_check import safety_check
+from chaos_agent.agent.nodes.gates.safety_check import safety_check
 from chaos_agent.config.settings import settings
 
 
@@ -31,13 +31,40 @@ class TestSafetyCheck:
         state["target"] = {"namespace": "default", "names": ["my-pod"]}
 
         with patch(
-            "chaos_agent.agent.nodes.safety_check.check_blade_conflicts",
+            "chaos_agent.agent.nodes.gates.safety_check.check_blade_conflicts",
             new_callable=AsyncMock,
             return_value=([], []),
         ):
             result = await safety_check(state)
         assert result["safety_status"] == "safe"
         assert result["safety_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_host_injection_skips_conflict_check(self, sample_agent_state, monkeypatch):
+        # Host-scope injection targets a bare host (no cluster CRD), so the
+        # cluster conflict check must NOT run and the result must be "safe"
+        # (not a "no cluster access" warning). Regression for kubewiz_host
+        # being mis-treated as a k8s channel (positive PROFILE_K8S whitelist).
+        from unittest.mock import AsyncMock, patch
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubewiz_host")
+        monkeypatch.setattr(settings, "host_name", "10.0.2.8")
+        state = sample_agent_state
+        state["skill_name"] = "host-cpu-fullload"
+        from tests._helpers import replace_fault_spec
+        replace_fault_spec(
+            state, scope="host", blade_target="cpu", blade_action="fullload",
+            namespace="", names=(),
+        )
+
+        with patch(
+            "chaos_agent.agent.nodes.gates.safety_check.check_blade_conflicts",
+            new_callable=AsyncMock,
+            return_value=([], []),
+        ) as mock_conflicts:
+            result = await safety_check(state)
+        mock_conflicts.assert_not_called()
+        assert result["safety_status"] == "safe"
 
     @pytest.mark.asyncio
     async def test_blacklisted_namespace(self, sample_agent_state, monkeypatch):
@@ -240,7 +267,7 @@ class TestSafetyCheck:
     async def test_feasibility_block_rejects_when_enabled(self, sample_agent_state, monkeypatch):
         """G1 — feasibility_check_block_on_impossible=True rejects the inject."""
         from unittest.mock import AsyncMock, patch
-        from chaos_agent.agent.feasibility import FeasibilityReport, FeasibilitySeverity
+        from chaos_agent.agent.spec.feasibility import FeasibilityReport, FeasibilitySeverity
 
         monkeypatch.setattr(settings, "kubeconfig_path", "")
         monkeypatch.setattr(settings, "feasibility_check_enabled", True)
@@ -254,7 +281,7 @@ class TestSafetyCheck:
                            blade_target="mem", blade_action="load")
 
         with patch(
-            "chaos_agent.agent.feasibility.assess_feasibility",
+            "chaos_agent.agent.spec.feasibility.assess_feasibility",
             new_callable=AsyncMock,
             return_value=FeasibilityReport(
                 severity=FeasibilitySeverity.IMPOSSIBLE,
@@ -278,7 +305,7 @@ class TestSafetyCheck:
         """G2 — both health blocker + feasibility impossible produce combined rejection."""
         from unittest.mock import AsyncMock, patch
         from chaos_agent.agent.target_health import HealthReport, HealthSeverity, HealthIssue
-        from chaos_agent.agent.feasibility import FeasibilityReport, FeasibilitySeverity
+        from chaos_agent.agent.spec.feasibility import FeasibilityReport, FeasibilitySeverity
 
         monkeypatch.setattr(settings, "kubeconfig_path", "/fake/kubeconfig")
         monkeypatch.setattr(settings, "target_health_check_enabled", True)
@@ -293,7 +320,7 @@ class TestSafetyCheck:
                            blade_target="mem", blade_action="load")
 
         with patch(
-            "chaos_agent.agent.nodes.safety_check.check_blade_conflicts",
+            "chaos_agent.agent.nodes.gates.safety_check.check_blade_conflicts",
             new_callable=AsyncMock,
             return_value=([], []),
         ), patch(
@@ -310,7 +337,7 @@ class TestSafetyCheck:
                 )],
             ),
         ), patch(
-            "chaos_agent.agent.feasibility.assess_feasibility",
+            "chaos_agent.agent.spec.feasibility.assess_feasibility",
             new_callable=AsyncMock,
             return_value=FeasibilityReport(
                 severity=FeasibilitySeverity.IMPOSSIBLE,
@@ -351,7 +378,7 @@ class TestSafetyCheck:
 
         # Mock conflicts → returns uids
         with patch(
-            "chaos_agent.agent.nodes.safety_check.check_blade_conflicts",
+            "chaos_agent.agent.nodes.gates.safety_check.check_blade_conflicts",
             new_callable=AsyncMock,
             return_value=(["uid-1"], []),
         ), patch(

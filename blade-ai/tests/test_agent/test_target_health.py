@@ -319,7 +319,7 @@ class TestSafetyCheckIntegration:
         self, monkeypatch
     ):
         from chaos_agent.agent import target_health
-        from chaos_agent.agent.nodes import safety_check as safety_check_module
+        from chaos_agent.agent.nodes.gates import safety_check as safety_check_module
         from chaos_agent.config.settings import settings
 
         # Make sure block_on_blocker is OFF (default) — even a BLOCK
@@ -382,7 +382,7 @@ class TestSafetyCheckIntegration:
     @pytest.mark.asyncio
     async def test_safety_check_blocks_when_opted_in(self, monkeypatch):
         from chaos_agent.agent import target_health
-        from chaos_agent.agent.nodes import safety_check as safety_check_module
+        from chaos_agent.agent.nodes.gates import safety_check as safety_check_module
         from chaos_agent.config.settings import settings
 
         monkeypatch.setattr(
@@ -437,7 +437,7 @@ class TestSafetyCheckIntegration:
     ):
         """A bug in the health checker must NOT take down inject."""
         from chaos_agent.agent import target_health
-        from chaos_agent.agent.nodes import safety_check as safety_check_module
+        from chaos_agent.agent.nodes.gates import safety_check as safety_check_module
         from chaos_agent.config.settings import settings
 
         monkeypatch.setattr(settings, "target_health_check_enabled", True)

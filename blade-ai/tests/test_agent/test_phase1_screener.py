@@ -1,10 +1,10 @@
-"""Tests for ``chaos_agent.agent.nodes.phase1_screener``.
+"""Tests for ``chaos_agent.agent.nodes.planning.phase1_screener``.
 
 Covers the Phase 1 (planning) tool-call guard introduced after the
 task-ce9647931ce1 incident. Scenarios:
 
   - No messages / non-AIMessage / no tool_calls → pass
-  - Pure read-only batch (kubectl_ro, activate_skill, blade_status, ...) → pass
+  - Pure read-only batch (kubectl_read, activate_skill, blade_status, ...) → pass
   - Direct mutation tool (blade_create, blade_destroy) → retry + rejection
   - kubectl exec ... blade create bypass → retry (recursive classifier)
   - kubectl create -f chaosblade.yaml → retry
@@ -19,7 +19,7 @@ from __future__ import annotations
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from chaos_agent.agent.nodes.phase1_screener import (
+from chaos_agent.agent.nodes.planning.phase1_screener import (
     PHASE1_SCREENER_ROUTE_PASS,
     PHASE1_SCREENER_ROUTE_RETRY,
     phase1_screener,
@@ -80,7 +80,7 @@ class TestPassThrough:
             }, "tc-2"),
             ("read_knowledge_resource", {"filename": "chaosblade-cli.md"}, "tc-3"),
             ("blade_status", {"uid": ""}, "tc-4"),
-            ("kubectl_ro", {
+            ("kubectl_read", {
                 "subcommand": "get",
                 "v_args": "pods -n cms-demo",
             }, "tc-5"),
@@ -93,6 +93,54 @@ class TestPassThrough:
         result = await phase1_screener({"messages": [msg]})
         assert result["screener_route"] == PHASE1_SCREENER_ROUTE_PASS
         assert "messages" not in result  # no fabricated rejections
+
+
+# ---------------------------------------------------------------------------
+# Capability-probe exception — kubectl_read debug (creates an ephemeral probe
+# pod, classified node/pod, but allowed in Phase 1 as a read-only probe)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDebugProbeException:
+    async def test_kubectl_read_debug_keepalive_probe_passes(self):
+        """kubectl_read debug (keep-alive probe pod) is allowed in Phase 1 as a
+        capability probe, though the classifier scopes it node."""
+        msg = _ai("kubectl_read", {
+            "subcommand": "debug",
+            "v_args": "node/n1 --image=busybox -- sleep 60",
+        })
+        result = await phase1_screener({"messages": [msg]})
+        assert result["screener_route"] == PHASE1_SCREENER_ROUTE_PASS
+        assert "messages" not in result
+
+    async def test_kubectl_read_debug_readonly_exec_probe_passes(self):
+        msg = _ai("kubectl_read", {
+            "subcommand": "debug",
+            "v_args": "node/n1 --image=busybox -- which sh chroot",
+        })
+        result = await phase1_screener({"messages": [msg]})
+        assert result["screener_route"] == PHASE1_SCREENER_ROUTE_PASS
+
+    async def test_exception_does_not_leak_to_exec_mutating_rejected(self):
+        """The debug exception must NOT leak to exec: a mutating exec inner is
+        still rejected in Phase 1."""
+        msg = _ai("kubectl_read", {
+            "subcommand": "exec",
+            "v_args": "pod-x -n ns -- iptables -A INPUT -j DROP",
+        })
+        result = await phase1_screener({"messages": [msg]})
+        assert result["screener_route"] == PHASE1_SCREENER_ROUTE_RETRY
+
+    async def test_exception_is_narrow_full_kubectl_debug_rejected(self):
+        """The exception applies ONLY to kubectl_read; the full kubectl tool's
+        debug still classifies as a node mutation and is rejected."""
+        msg = _ai("kubectl", {
+            "subcommand": "debug",
+            "v_args": "node/n1 --image=busybox -- sleep 60",
+        })
+        result = await phase1_screener({"messages": [msg]})
+        assert result["screener_route"] == PHASE1_SCREENER_ROUTE_RETRY
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +171,18 @@ class TestDirectMutationRejection:
         msg = _ai("blade_destroy", {"uid": "abc123"})
         result = await phase1_screener({"messages": [msg]})
         assert result["screener_route"] == PHASE1_SCREENER_ROUTE_RETRY
+
+    async def test_unknown_profile_rejects_even_when_log_only(self):
+        settings.phase1_screener_enforcing = False
+        msg = _ai("kubectl_read", {"subcommand": "get", "v_args": "pods"})
+
+        result = await phase1_screener({
+            "messages": [msg],
+            "fault_spec": {"scope": "typo_scope"},
+        })
+
+        assert result["screener_route"] == PHASE1_SCREENER_ROUTE_RETRY
+        assert "environment capability profile" in result["messages"][0].content
         assert "phase1_readonly_violation" in result["messages"][0].content
 
 
@@ -175,7 +235,7 @@ class TestKubectlBypassRejection:
 class TestMixedBatch:
     async def test_one_mutation_one_read_yields_two_tool_messages(self):
         msg = _ai_multi([
-            ("kubectl_ro", {"subcommand": "get", "v_args": "pods"}, "tc-1"),
+            ("kubectl_read", {"subcommand": "get", "v_args": "pods"}, "tc-1"),
             ("blade_create", {
                 "scope": "pod", "target": "cpu", "action": "fullload",
                 "namespace": "ns", "names": "pod",
@@ -203,13 +263,13 @@ class TestResilience:
         """If the classifier itself raises, the call passes through with
         a WARNING. Fail-closing here would create unrecoverable loops."""
         import logging
-        from chaos_agent.agent.nodes import phase1_screener as mod
+        from chaos_agent.agent.nodes.planning import phase1_screener as mod
 
         def _raise(*args, **kwargs):
             raise ValueError("simulated classifier bug")
 
         monkeypatch.setattr(mod, "infer_effective_target", _raise)
-        msg = _ai("kubectl_ro", {"subcommand": "get", "v_args": "pods"})
+        msg = _ai("kubectl_read", {"subcommand": "get", "v_args": "pods"})
         with caplog.at_level(logging.WARNING):
             result = await phase1_screener({"messages": [msg]})
         assert result["screener_route"] == PHASE1_SCREENER_ROUTE_PASS

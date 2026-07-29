@@ -140,6 +140,22 @@ class TestParseStreamEvent:
         }
         assert parse_stream_event(raw) is None
 
+    def test_parse_intent_reply_token_is_streamed(self):
+        """Intent replies remain on the live token stream for the TUI."""
+        class FakeChunk:
+            content = "请确认目标节点。"
+
+        raw = {
+            "event": "on_chat_model_stream",
+            "data": {"chunk": FakeChunk()},
+            "tags": ["langsmith:nodes:intent_clarification"],
+            "metadata": {},
+        }
+        evt = parse_stream_event(raw)
+        assert evt is not None
+        assert evt.type == "token"
+        assert evt.content == "请确认目标节点。"
+
     def test_parse_on_chat_model_start(self):
         """on_chat_model_start → llm_start event for thinking-duration tracking."""
         raw = {
@@ -222,6 +238,74 @@ class TestParseStreamEvent:
         assert evt is not None
         assert evt.type == "tool_end"
         assert evt.content == ""
+
+    def test_parse_on_tool_error_emits_terminal_tool_end(self):
+        """``on_tool_error`` must become a terminal ``tool_end`` (is_error).
+
+        LangChain fires ``on_tool_error`` — NOT ``on_tool_end`` — when a
+        tool raises (verified empirically: an arg-schema ValidationError
+        emits ``on_tool_start`` then ``on_tool_error`` with the SAME
+        run_id, and no ``on_tool_end``). Without converting it, the TUI
+        gets a ``tool_start`` with no matching ``tool_end`` and the tool
+        card stays ``⊶ running`` forever — jamming the leading-stable
+        flush and tripping Ink's fullscreen-redraw (duplicated output).
+        The synthesised ``tool_end`` MUST carry the same ``call_id`` as
+        the start so the TUI can correlate and close the card.
+        """
+        raw = {
+            "event": "on_tool_error",
+            "name": "request_replan",
+            "run_id": "run-abc-123",
+            "data": {"error": "1 validation error for request_replan\nitems\n  Input should be a valid list"},
+            "tags": ["langsmith:nodes:phase2_tools"],
+            "metadata": {},
+        }
+        evt = parse_stream_event(raw)
+        assert evt is not None
+        assert evt.type == "tool_end"
+        assert evt.tool_name == "request_replan"
+        assert evt.node == "phase2_tools"
+        assert evt.call_id == "run-abc-123"
+        assert evt.is_error is True
+        assert "validation error" in evt.content
+        # is_error survives serialization so the TUI can render ✗.
+        assert evt.to_dict().get("is_error") is True
+
+    def test_parse_on_tool_error_missing_error_payload(self):
+        """A tool error with no ``data.error`` still yields a terminal event."""
+        raw = {
+            "event": "on_tool_error",
+            "name": "kubectl",
+            "run_id": "run-xyz",
+            "data": {},
+            "tags": [],
+            "metadata": {},
+        }
+        evt = parse_stream_event(raw)
+        assert evt is not None
+        assert evt.type == "tool_end"
+        assert evt.call_id == "run-xyz"
+        assert evt.is_error is True
+        assert evt.content == "tool error"
+
+    def test_tool_end_success_omits_is_error_from_wire(self):
+        """A normal (non-error) ``tool_end`` frame must not carry is_error.
+
+        ``to_dict`` falsy-strips ``is_error=False`` so normal frames and
+        older clients are unaffected by the new field.
+        """
+        raw = {
+            "event": "on_tool_end",
+            "name": "kubectl",
+            "data": {"output": "ok"},
+            "tags": [],
+            "metadata": {},
+        }
+        evt = parse_stream_event(raw)
+        assert evt is not None
+        assert evt.is_error is False
+        assert "is_error" not in evt.to_dict()
+
 
     def test_parse_on_tool_end_with_tool_message_object(self):
         """LangChain emits ``ToolMessage`` instances, not raw strings.

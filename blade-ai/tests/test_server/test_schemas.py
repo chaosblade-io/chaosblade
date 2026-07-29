@@ -73,6 +73,75 @@ class TestInjectRequest:
         with pytest.raises(Exception):
             InjectRequest(scope="pod")
 
+    def test_kube_connection_mode_valid_values(self):
+        """All four channel names plus '' / None must be accepted."""
+        for mode in (None, "", "kubeconfig", "kubewiz_k8s", "kubewiz_host", "ssh"):
+            req = InjectRequest(
+                scope="pod",
+                target="pod",
+                action="delete",
+                target_name="my-pod",
+                namespace="default",
+                kube_connection_mode=mode,
+            )
+            assert req.kube_connection_mode == mode
+
+    def test_kube_connection_mode_invalid_value_raises(self):
+        """Legacy/invalid values (e.g. 'kubewiz') must be rejected fail-fast."""
+        with pytest.raises(Exception):
+            InjectRequest(
+                scope="pod",
+                target="pod",
+                action="delete",
+                target_name="my-pod",
+                namespace="default",
+                kube_connection_mode="kubewiz",
+            )
+
+    def test_kubewiz_targeting_fields_accepted(self):
+        """cluster_uuid / profile must be settable per-request for kubewiz_k8s."""
+        req = InjectRequest(
+            scope="pod",
+            target="pod",
+            action="delete",
+            target_name="my-pod",
+            namespace="default",
+            kube_connection_mode="kubewiz_k8s",
+            cluster_uuid="uuid-abc",
+            profile="prof-1",
+        )
+        assert req.cluster_uuid == "uuid-abc"
+        assert req.profile == "prof-1"
+        assert req.kube_connection_mode == "kubewiz_k8s"
+
+    @pytest.mark.parametrize("port", [1, 22, 2222, 65535])
+    def test_ssh_port_valid_range_accepted(self, port):
+        req = InjectRequest(
+            scope="node",
+            target="disk",
+            action="fill",
+            target_name="node-1",
+            namespace="default",
+            kube_connection_mode="ssh",
+            ssh_host="10.0.0.1",
+            ssh_port=port,
+        )
+        assert req.ssh_port == port
+
+    @pytest.mark.parametrize("port", [0, -1, 65536, 99999])
+    def test_ssh_port_out_of_range_raises(self, port):
+        with pytest.raises(ValueError):
+            InjectRequest(
+                scope="node",
+                target="disk",
+                action="fill",
+                target_name="node-1",
+                namespace="default",
+                kube_connection_mode="ssh",
+                ssh_host="10.0.0.1",
+                ssh_port=port,
+            )
+
     def test_input_only_mode(self):
         """NL mode: only input field, no structured params required."""
         req = InjectRequest(input="给 default 命名空间的 my-pod 注入 pod-kill 故障")

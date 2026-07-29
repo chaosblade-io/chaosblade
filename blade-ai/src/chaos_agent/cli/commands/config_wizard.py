@@ -31,7 +31,7 @@ def config_wizard_command() -> None:
     spawning us before its own server is up).
     """
     try:
-        from chaos_agent.tui.config_store import ConfigStore
+        from chaos_agent.config.config_store import ConfigStore
         from chaos_agent.tui.console import ChaosConsole
         from chaos_agent.tui.renderers import onboarding as onboarding_renderer
     except ImportError as e:

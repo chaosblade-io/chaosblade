@@ -193,29 +193,28 @@ class TestPhaseToolSurface:
                          "blade_status", "blade_destroy", "kubectl", "save_fault_plan"):
             assert required in names, f"phase1 missing {required}"
 
-    def test_phase2_tools_exclude_destroy_and_skill_resource(self, mock_registry):
-        """Phase 2 must NOT bind blade_destroy / activate_skill / read_skill_resource."""
+    def test_phase2_tools_include_guarded_destroy_and_exclude_skill_resource(self, mock_registry):
+        """Phase 2 exposes guarded cleanup but not planning-only tools."""
         from chaos_agent.agent.factory import _build_skill_tools
         from chaos_agent.tools import (
-            blade_create, blade_status, blade_query_k8s,
+            blade_create, blade_destroy, blade_status, blade_query_k8s,
             kubectl, read_knowledge_resource,
         )
 
         skill_tools = _build_skill_tools(mock_registry)
         by_name = {t.name: t for t in skill_tools}
         phase2 = [
-            blade_create, blade_status, blade_query_k8s,
+            blade_create, blade_destroy, blade_status, blade_query_k8s,
             kubectl, by_name["execute_skill_script"], read_knowledge_resource,
         ]
         names = {t.name for t in phase2}
 
         # Removed
-        assert "blade_destroy" not in names
         assert "activate_skill" not in names
         assert "read_skill_resource" not in names
 
         # Required for execution
-        for required in ("blade_create", "blade_status", "kubectl", "execute_skill_script"):
+        for required in ("blade_create", "blade_destroy", "blade_status", "kubectl", "execute_skill_script"):
             assert required in names, f"phase2 missing {required}"
 
     def test_phase1_prompt_omits_disallowed_tools(self):
@@ -294,9 +293,6 @@ class TestPhaseToolSurface:
             "Use `read_skill_resource`",
             "Use read_skill_resource",
             "call `read_skill_resource`",
-            "Use `blade_destroy`",
-            "Use blade_destroy",
-            "call `blade_destroy`",
             "Use `activate_skill`",
             "Use activate_skill",
             "call `activate_skill`",
@@ -304,4 +300,185 @@ class TestPhaseToolSurface:
         for phrase in forbidden_promotions:
             assert phrase not in prompt, (
                 f"Phase 2 prompt actively promotes a tool that is not bound: {phrase!r}"
+            )
+
+        # Phase 2 must still carry partial-failure cleanup guidance
+        # (wording evolved away from naming blade_create/UID explicitly).
+        assert "residue before switching methods" in prompt
+
+
+class TestAppendProviderTools:
+    """The build-time provider-tool union seam (_append_provider_tools).
+
+    This is the mechanism that lets a new execution backend surface its LLM
+    tools by registering a FaultProvider instead of editing the factory's five
+    static tool lists.
+    """
+
+    class _Named:
+        def __init__(self, name):
+            self.name = name
+
+    class _FakeToolProvider:
+        carrier = "fake_carrier"
+        injection_methods = ("fake_method",)
+
+        def __init__(self, phase, tools):
+            self._phase = phase
+            self._tools = tools
+
+        def tools(self, phase):
+            return list(self._tools) if phase == self._phase else []
+
+    def test_builtin_host_provider_surfaces_host_tools_on_execute(self):
+        # The built-in HostShellProvider contributes host_inject to the EXECUTE
+        # phase via the union seam (no factory edit). host_inject is the
+        # superset of host_read, so no separate read tool is bound.
+        from chaos_agent.agent.factory import _append_provider_tools
+        from chaos_agent.agent.providers import EXECUTE
+
+        base = [self._Named("blade_create"), self._Named("kubectl")]
+        out = _append_provider_tools(base, EXECUTE)
+        names = [t.name for t in out]
+        assert names[:2] == ["blade_create", "kubectl"]
+        assert "host_inject" in names
+        assert "host_read" not in names
+
+    def test_builtin_host_provider_contributes_only_diagnostics_on_plan(self):
+        # Host planning discovers the current environment through host_read,
+        # but must never surface the mutating host_inject tool.
+        from chaos_agent.agent.factory import _append_provider_tools
+        from chaos_agent.agent.providers import PLAN
+
+        base = [self._Named("blade_create"), self._Named("kubectl")]
+        out = _append_provider_tools(base, PLAN)
+        names = [t.name for t in out]
+        # Base preserved verbatim at the front.
+        assert names[:2] == ["blade_create", "kubectl"]
+        assert "host_inject" not in names
+        assert "host_read" in names
+        # No full-kubectl / blade_create surfaces beyond the caller-supplied
+        # base (planning stays read-only).
+        assert names.count("kubectl") == 1
+        assert names.count("blade_create") == 1
+
+    def test_unions_provider_tools_and_dedups_by_name(self):
+        from chaos_agent.agent.factory import _append_provider_tools
+        from chaos_agent.agent.providers import EXECUTE, PLAN, FaultProviderRegistry
+
+        prov = self._FakeToolProvider(
+            EXECUTE, [self._Named("host_inject"), self._Named("kubectl")]
+        )
+        FaultProviderRegistry.clear()
+        FaultProviderRegistry.register(prov)
+        try:
+            base = [self._Named("kubectl")]
+            out = _append_provider_tools(base, EXECUTE)
+            # kubectl is NOT double-bound; host_inject is appended.
+            assert [t.name for t in out] == ["kubectl", "host_inject"]
+            # A provider contributes only to its declared phase.
+            assert [t.name for t in _append_provider_tools(base, PLAN)] == ["kubectl"]
+        finally:
+            FaultProviderRegistry.clear()
+
+
+class TestPhaseToolUnionGuard:
+    """Behaviour-preservation guard for the factory → provider tool migration.
+
+    The backend execution tools (blade_* / kubectl / kubectl_read)
+    moved out of factory.py's four static lists and into each
+    FaultProvider's ``tools(phase)``. This guard reconstructs each phase's tool
+    list exactly as ``create_agent`` now does (post-migration static base +
+    provider union) and asserts the resulting tool *set* equals the documented
+    pre-migration set — so a dropped or double-bound tool fails loudly.
+    """
+
+    # Pre-migration bound-tool name sets, per phase (source of truth: the
+    # factory static lists + host union, as they stood before this change).
+    _PLAN = {
+        "activate_skill", "read_skill_resource", "read_file", "save_fault_plan",
+        "finish_planning", "propose_plan_change",
+        "read_knowledge_resource",
+        "blade_help", "blade_status", "kubectl_read", "host_read",
+    }
+    _EXECUTE = {
+        "execute_skill_script", "read_knowledge_resource", "time_wait",
+        "blade_create", "blade_destroy", "blade_help", "blade_status",
+        "blade_query_k8s", "kubectl", "host_inject",
+        # chaosblade_python provider (EXECUTE phase)
+        "blade_python_create", "blade_python_prepare", "blade_python_revoke",
+    }
+    _VERIFY = {
+        "read_skill_resource", "execute_skill_script", "read_knowledge_resource",
+        "submit_verification", "time_wait",
+        "kubectl_read", "host_read",
+    }
+    _RECOVER_VERIFY = {
+        "read_skill_resource", "execute_skill_script", "read_knowledge_resource",
+        "submit_recover_verification", "time_wait",
+        "kubectl", "host_inject",
+    }
+
+    def _build_phase_sets(self, mock_registry):
+        """Reconstruct the four phase tool lists the way the factory does."""
+        from chaos_agent.agent.factory import _append_provider_tools, _build_skill_tools
+        from chaos_agent.agent.providers import (
+            EXECUTE, PLAN, RECOVER_VERIFY, VERIFY, FaultProviderRegistry,
+        )
+        from chaos_agent.agent.nodes.verify._verifier_submit import (
+            submit_recover_verification, submit_verification,
+        )
+        from chaos_agent.tools import read_knowledge_resource
+        from chaos_agent.tools.wait import time_wait
+
+        FaultProviderRegistry.clear()  # force self-bootstrap of built-ins
+        try:
+            skill = {t.name: t for t in _build_skill_tools(mock_registry)}
+
+            phase1 = [
+                skill["activate_skill"], skill["read_skill_resource"],
+                skill["read_file"], skill["save_fault_plan"],
+                skill["finish_planning"], skill["propose_plan_change"],
+                read_knowledge_resource,
+            ]
+            phase1 = _append_provider_tools(phase1, PLAN)
+
+            phase2 = [
+                skill["execute_skill_script"], read_knowledge_resource, time_wait,
+            ]
+            phase2 = _append_provider_tools(phase2, EXECUTE)
+
+            verifier = [
+                skill["read_skill_resource"], skill["execute_skill_script"],
+                read_knowledge_resource, submit_verification, time_wait,
+            ]
+            verifier = _append_provider_tools(verifier, VERIFY)
+
+            recover_verifier = [
+                skill["read_skill_resource"], skill["execute_skill_script"],
+                read_knowledge_resource, submit_recover_verification, time_wait,
+            ]
+            recover_verifier = _append_provider_tools(recover_verifier, RECOVER_VERIFY)
+
+            return {
+                "plan": [t.name for t in phase1],
+                "execute": [t.name for t in phase2],
+                "verify": [t.name for t in verifier],
+                "recover_verify": [t.name for t in recover_verifier],
+            }
+        finally:
+            FaultProviderRegistry.clear()
+
+    def test_each_phase_binds_expected_tool_set(self, mock_registry):
+        sets = self._build_phase_sets(mock_registry)
+        assert set(sets["plan"]) == self._PLAN
+        assert set(sets["execute"]) == self._EXECUTE
+        assert set(sets["verify"]) == self._VERIFY
+        assert set(sets["recover_verify"]) == self._RECOVER_VERIFY
+
+    def test_no_tool_double_bound_within_a_phase(self, mock_registry):
+        sets = self._build_phase_sets(mock_registry)
+        for phase, names in sets.items():
+            assert len(names) == len(set(names)), (
+                f"phase {phase!r} double-binds a tool: {names}"
             )

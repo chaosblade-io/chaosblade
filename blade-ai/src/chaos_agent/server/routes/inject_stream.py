@@ -8,8 +8,8 @@ import uuid
 from fastapi import Request
 from fastapi.responses import StreamingResponse
 
-from chaos_agent.agent.fault_spec import FaultSpec
-from chaos_agent.agent.state_builders import build_inject_initial_state
+from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.agent.streaming import SSEBatcher, StreamEvent, parse_stream_event
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.session_finalizer import (
@@ -75,6 +75,12 @@ async def inject_stream(request: InjectRequest, req: Request):
         kube_context=request.context or settings.kube_context,
         kubewiz_cluster_uuid=getattr(request, "cluster_uuid", "") or settings.kubewiz_cluster_uuid,
         kubewiz_profile=getattr(request, "profile", "") or settings.kubewiz_profile,
+        kube_connection_mode=getattr(request, "kube_connection_mode", "") or settings.kube_connection_mode,
+        host_name=getattr(request, "host_name", "") or getattr(settings, "host_name", ""),
+        ssh_host=getattr(request, "ssh_host", "") or getattr(settings, "ssh_host", ""),
+        ssh_user=getattr(request, "ssh_user", "") or getattr(settings, "ssh_user", ""),
+        ssh_key_path=getattr(request, "ssh_key_path", "") or getattr(settings, "ssh_key_path", ""),
+        ssh_port=getattr(request, "ssh_port", None) or getattr(settings, "ssh_port", None),
         direct=request.direct,
     )
 
@@ -172,7 +178,7 @@ async def inject_stream(request: InjectRequest, req: Request):
                     return
 
                 # Fault injection result
-                from chaos_agent.agent.operation_result import build_inject_data_from_state
+                from chaos_agent.agent.result.operation_result import build_inject_data_from_state
                 _data = build_inject_data_from_state(values, task_id)
                 _data["plan_summary"] = values.get("plan_summary", "")
                 _data["needs_confirm"] = request.confirm
@@ -196,13 +202,18 @@ async def inject_stream(request: InjectRequest, req: Request):
         except Exception as e:
             logger.exception(f"Stream inject failed for task {task_id}")
 
-            # Auto-rollback
+            # Auto-rollback: a ChaosBlade experiment is torn down by its UID via
+            # blade_destroy. Host-native carriers have no UID and no code-side
+            # reverse — their safety net is the injection's own
+            # ``--timeout``/``--runtime`` self-termination plus the explicit
+            # recover graph (LLM reads the skill-case reverse command).
             rollback_info = ""
             try:
                 current_state = await graph.aget_state(config)
                 if current_state and current_state.values:
-                    blade_uid = current_state.values.get("blade_uid", "")
-                    kubeconfig = current_state.values.get("kubeconfig", "")
+                    _values = current_state.values
+                    blade_uid = _values.get("blade_uid", "")
+                    kubeconfig = _values.get("kubeconfig", "")
                     if blade_uid:
                         from chaos_agent.tools.blade import blade_destroy
                         await blade_destroy.ainvoke(

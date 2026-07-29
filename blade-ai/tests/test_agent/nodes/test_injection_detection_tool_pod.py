@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from chaos_agent.agent.nodes._injection_detection import (
+from chaos_agent.agent.nodes.execute._injection_detection import (
     _parse_all_ns_pods_wide,
     discover_tool_pod_on_node,
 )
@@ -82,7 +82,7 @@ class TestDiscoverToolPodOnNode:
             stdout=output, stderr="", exit_code=0,
         ))
         with patch(
-            "chaos_agent.tools.shell.run_command", run_command_mock,
+            "chaos_agent.transports.execute_via_transport", run_command_mock,
         ), patch(
             "chaos_agent.tools.kubectl.build_kubectl_cmd",
             return_value=["kubectl", "get", "pods"],
@@ -104,7 +104,7 @@ class TestDiscoverToolPodOnNode:
         )
         run_command_mock = AsyncMock(side_effect=[empty, wide])
         with patch(
-            "chaos_agent.tools.shell.run_command", run_command_mock,
+            "chaos_agent.transports.execute_via_transport", run_command_mock,
         ), patch(
             "chaos_agent.tools.kubectl.build_kubectl_cmd",
             return_value=["kubectl", "get", "pods"],
@@ -123,7 +123,7 @@ class TestDiscoverToolPodOnNode:
             stdout=output, stderr="", exit_code=0,
         ))
         with patch(
-            "chaos_agent.tools.shell.run_command", run_command_mock,
+            "chaos_agent.transports.execute_via_transport", run_command_mock,
         ), patch(
             "chaos_agent.tools.kubectl.build_kubectl_cmd",
             return_value=["kubectl", "get", "pods"],
@@ -137,7 +137,7 @@ class TestDiscoverToolPodOnNode:
         empty = SimpleNamespace(stdout="", stderr="", exit_code=0)
         run_command_mock = AsyncMock(return_value=empty)
         with patch(
-            "chaos_agent.tools.shell.run_command", run_command_mock,
+            "chaos_agent.transports.execute_via_transport", run_command_mock,
         ), patch(
             "chaos_agent.tools.kubectl.build_kubectl_cmd",
             return_value=["kubectl", "get", "pods"],
