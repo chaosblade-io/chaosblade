@@ -361,9 +361,9 @@ function makeDisplayModeHandler(
 /** Factory for the per-mode ``/permission <mode>`` subcommand
  *  handlers. Same direct-set pattern as ``makeDisplayModeHandler``
  *  above. Mode change writes through to ``state.config.permissionMode``
- *  immediately; takes effect on the NEXT ``/turn`` because the
- *  current request (if any) was already started with its own value
- *  baked into the server-side initial_state. */
+ *  immediately (takes effect on the NEXT ``/turn``) AND persists to
+ *  config.json via ``confirmation_required`` (auto → false, confirm →
+ *  true) so the choice survives a restart — not just this session. */
 function makePermissionModeHandler(
   target: AppState["config"]["permissionMode"],
 ): (ctx: SlashCommandContext, args: string[]) => Promise<void> {
@@ -374,7 +374,19 @@ function makePermissionModeHandler(
       return;
     }
     ctx.dispatch({ type: "MODE_TOGGLED", mode: target });
-    pushLog(ctx, t("mode.changed", { mode: target }), "ok");
+    // Persist so the mode survives restart. Runtime state is already set
+    // above, so a failed write still leaves the session in the chosen
+    // mode — we just warn that it wasn't saved.
+    try {
+      await ctx.client.setConfig(
+        "confirmation_required",
+        target === "auto" ? "false" : "true",
+      );
+      pushLog(ctx, t("mode.changed", { mode: target }), "ok");
+    } catch (e) {
+      pushLog(ctx, t("mode.changed", { mode: target }), "ok");
+      pushLog(ctx, t("mode.persist_failed", { reason: String(e) }), "warn");
+    }
   };
 }
 
@@ -858,6 +870,11 @@ function buildBuiltInCommands(): SlashCommand[] {
         // so we wait on the slowest. Acceptable: the user invoked
         // ``/doctor`` precisely to inspect the current state, a couple
         // of seconds for a definitive answer is fine.
+        //
+        // Loading log up front so the user sees immediate feedback
+        // while the probes run (1-3s typical). Mirrors the pattern
+        // used by ``/experiments``.
+        pushLog(ctx, t("doctor.loading"), "info");
         const [reachable, sessionState, serverVersion, preflight] =
           await Promise.all([
             ctx.client.health().catch(() => false),
@@ -1718,6 +1735,25 @@ function buildBuiltInCommands(): SlashCommand[] {
                 t("config.set_ok", { key, value: coerced, tail }),
                 "ok",
               );
+              // ``confirmation_required`` drives the runtime permission mode,
+              // which each /turn reads from client state (not settings). The
+              // write above persists it; flip the live mode too so the current
+              // session takes effect immediately — parity with /permission
+              // instead of waiting for a restart. Fall back to parsing the
+              // input when the server omits the coerced value (older server).
+              if (key === "confirmation_required") {
+                const raw = data["value"];
+                const required =
+                  typeof raw === "boolean"
+                    ? raw
+                    : ["true", "1", "yes", "on"].includes(
+                        value.toLowerCase(),
+                      );
+                const mode = required ? "confirm" : "auto";
+                if (ctx.state.config.permissionMode !== mode) {
+                  ctx.dispatch({ type: "MODE_TOGGLED", mode });
+                }
+              }
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
               pushLog(ctx, t("config.set_failed", { key, err: msg }), "warn");

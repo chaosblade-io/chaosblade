@@ -175,6 +175,7 @@ export const en: Dict = {
   "help.card.tip": "Tip: type / then TAB to autocomplete",
 
   // -- /doctor output -----------------------------------------------
+  "doctor.loading": "running diagnostics …",
   "doctor.head": "Diagnostics",
   "doctor.server": "server",
   "doctor.server_unreachable": "(unreachable)",
@@ -198,7 +199,8 @@ export const en: Dict = {
   "mode.usage_unknown": "unknown mode '{value}' — expected 'auto' or 'confirm'",
   "mode.usage_missing": "/permission needs an arg — try 'auto' / 'confirm' (current: {mode})",
   "mode.already": "permission mode already {mode}",
-  "mode.changed": "permission mode → **{mode}** (takes effect on the next /turn)",
+  "mode.changed": "permission mode → **{mode}** (saved to config, applies on the next /turn)",
+  "mode.persist_failed": "mode set for this session, but saving to config failed: {reason}",
 
   // -- /mode (display density: calm / working / dense) --------------
   "display.usage_unknown": "unknown density '{value}' — expected 'calm' / 'working' / 'dense'",
@@ -691,26 +693,6 @@ export const en: Dict = {
   "common.none": "(none)",
   "common.unset": "(unset)",
   "common.unknown": "(unknown)",
-
-  // -- Phase Stepper (5-step todo list shown during inject turns) --
-  // ``recovery`` is intentionally absent — recover is a separate flow
-  // (its own graph + task_id space), already covered by the boot-time
-  // PendingTasksCard, and bounded by ``blade --timeout`` auto-cleanup.
-  // A future recover-mode stepper will be added separately.
-  //
-  // The five steps mirror the actual graph node sequence in
-  // ``src/chaos_agent/agent/graph.py``:
-  //   intent      → intent_clarification (incl. Layer-1 confirm)
-  //   agent_loop  → agent_loop (planning, phase1 tools)
-  //   safety      → safety_check / confirmation_gate (Layer-2 confirm)
-  //   execute     → baseline_capture / execute_loop / direct_execute
-  //   verify      → verifier_loop
-  "phase.stepper.title": "Inject todos",
-  "phase.label.intent": "Intent",
-  "phase.label.agent_loop": "Plan",
-  "phase.label.safety": "Safety check",
-  "phase.label.execute": "Inject",
-  "phase.label.verify": "Verify",
 
   // -- ToolMessage card chrome --------------------------------------
   "tool.running": "running…",

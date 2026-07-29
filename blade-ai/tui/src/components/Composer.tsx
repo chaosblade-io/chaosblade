@@ -64,7 +64,7 @@
  *     owns Esc (translates to "rejected"); Composer doesn't react.
  *   - while busy (responding) → cancel the turn
  *   - while idle with text  → clear the text
- *   - while idle empty → onExit (closes the app)
+ *   - while idle empty → no-op (use /exit or Ctrl+D to quit)
  *
  * Cross-component pubsub:
  *   - ConfirmMessage's Select dispatches CONFIRM_USER_DECIDED on
@@ -98,13 +98,11 @@ import { InputPrompt } from "./InputPrompt.js";
 import { LoadingIndicator } from "./LoadingIndicator.js";
 import { ManualCompactIndicator } from "./ManualCompactIndicator.js";
 import { MemoryCompactingIndicator } from "./MemoryCompactingIndicator.js";
-import { PhaseStepperCard } from "./PhaseStepperCard.js";
 import {
   setProbeControlsRef,
   setProbeFooterRef,
   setProbeInputRef,
   setProbeLoadingRef,
-  setProbeStepperRef,
 } from "../utils/overflowProbe.js";
 import { setChromeMeasureRef } from "../state/chromeMeasureRef.js";
 import type { DOMElement } from "ink";
@@ -144,17 +142,6 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
   const dispatch = useAppDispatch();
   const app = useApp();
   const pendingDecision = useAppSelector((s) => s.pendingDecision);
-  // Sticky stepper. Lives in its own state slot (``currentPhaseStepper``)
-  // — NOT in ``pending`` — so its mid-turn mutation doesn't block the
-  // leading-stable flush in TOKEN_APPENDED. With the stepper at
-  // pending[0] (its old home) every thinking / tool_group sat behind
-  // it stayed pending all the way to TURN_DONE, growing the dynamic
-  // area past stdout.rows and tripping Ink's fullscreen-redraw
-  // branch on every frame — the visible flicker + scroll-position
-  // thrash users saw during inject. Reading from a dedicated slot
-  // here keeps the flush window open while still rendering the
-  // strip pinned above the InputPrompt.
-  const activeStepper = useAppSelector((s) => s.currentPhaseStepper);
   // Phase 4 — narrow selector so the indicator only re-renders on
   // the slot's own transitions (null ↔ object), not on every token /
   // phase event during streaming. The selector returns a primitive
@@ -582,9 +569,6 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
        *  Ink would do anyway for any ref-bearing element. */}
       <Box flexDirection="column" ref={setProbeLoadingRef}>
         <LoadingIndicator />
-      </Box>
-      <Box flexDirection="column" ref={setProbeStepperRef}>
-        {activeStepper && <PhaseStepperCard item={activeStepper} />}
       </Box>
       <Box flexDirection="column" ref={setProbeInputRef}>
         <InputPrompt

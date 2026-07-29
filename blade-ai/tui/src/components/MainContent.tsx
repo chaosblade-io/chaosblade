@@ -222,9 +222,6 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
   // after Ink commits each transition. Without these deps the
   // effect would only re-fire on resize.
   const streamStateForChrome = useAppSelector((s) => s.streamState);
-  const hasStepperForChrome = useAppSelector(
-    (s) => s.currentPhaseStepper !== null,
-  );
   const compactionInFlightForChrome = useAppSelector(
     (s) => s.currentCompaction !== null,
   );
@@ -238,8 +235,8 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
   // next unrelated transition.
   const { columns, rows } = useTerminalSize();
 
-  // Phase 3.2 — measured chrome height (LoadingIndicator + optional
-  // PhaseStepperCard + InputPrompt + Footer + outer margins). Initial
+  // Phase 3.2 — measured chrome height (LoadingIndicator +
+  // InputPrompt + Footer + outer margins). Initial
   // state is the historical ``CHROME_ROWS_RESERVE`` constant; it acts
   // as the first-paint fallback before Composer has mounted and as
   // the safety value if ``measureElement`` ever fails. After the
@@ -316,7 +313,6 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
     rows,
     columns,
     streamStateForChrome,
-    hasStepperForChrome,
     compactionInFlightForChrome,
     // ``constrainHeight`` flips on Ctrl+O and changes ``bodyMax`` in
     // useLoadingIndicator (used by the LoadingIndicator's padded body
@@ -350,8 +346,37 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
   // outside the measured Box) and gives the pending block a one-row
   // breathing space above InputPrompt so the next tick can grow the
   // pending body without immediately overflowing.
+  //
+  // Streaming-aware chrome floor (Phase 3.4):
+  //   When ``streamState`` transitions from "idle" to "responding",
+  //   LoadingIndicator mounts and adds ~5-8 rows of chrome. However,
+  //   ``chromeHeight`` (from useLayoutEffect measurement) lags by one
+  //   render frame — its value still reflects the idle layout (~5 rows
+  //   for InputPrompt + Footer). During that transitional frame the
+  //   budget is over-generous, pending content renders at full height,
+  //   and the total dynamic frame exceeds viewport — triggering Ink's
+  //   scrollback-pollution burn-in (the user sees a "ghost" duplicate
+  //   of InputPrompt + Footer stuck in scrollback).
+  //
+  //   Fix: apply a FLOOR on chrome height during streaming. Even if
+  //   measureElement hasn't caught up, the budget stays conservative
+  //   enough to prevent overflow. The floor value (12) accounts for:
+  //     LoadingIndicator header+separator+body ≈ 5
+  //     InputPrompt (3 fences) ................ 3
+  //     Footer ................................. 1
+  //     Composer marginTop .................... 1
+  //     Safety ................................. 2
+  //                                             = 12
+  //   This is intentionally lower than CHROME_ROWS_RESERVE (26) to
+  //   avoid over-penalising the budget on large terminals where the
+  //   stepper isn't active (non-inject clarification turns).
+  const STREAMING_CHROME_FLOOR = 12;
+  const effectiveChromeHeight =
+    streamStateForChrome === "responding"
+      ? Math.max(chromeHeight, STREAMING_CHROME_FLOOR)
+      : chromeHeight;
   const availableTerminalHeight = constrainHeight
-    ? Math.max(MIN_PENDING_BUDGET, rows - chromeHeight - 2)
+    ? Math.max(MIN_PENDING_BUDGET, rows - effectiveChromeHeight - 2)
     : undefined;
 
   // Static items: header + every committed history item.
@@ -481,7 +506,11 @@ export const MainContent: React.FC<Props> = ({ version, serverUrl }) => {
         URL step). Captured via ``BLADE_AI_WIZARD_DEBUG=1``: at that
         transition Ink's ``renderInteractiveFrame`` started taking its
         ``hasStaticOutput`` branch, which writes ``staticOutput`` (here
-        a ghostly ``\n\n\n\n`` for the leftover empty Static's yoga
+        a ghostly ``
+
+
+
+`` for the leftover empty Static's yoga
         height=4) between ``log.clear()`` and the new frame. Each
         subsequent re-render did the same — 4 extra blank rows per
         render, pushing the frame down.

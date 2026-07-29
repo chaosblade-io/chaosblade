@@ -1,9 +1,11 @@
 /**
  * Live preflight check list — shared by {@link BootDoctorCard} (the
  * one-shot snapshot rendered at startup) and {@link RuntimeDoctorCard}
- * (the on-demand ``/doctor`` re-probe). Both surface the same seven
- * ``CheckResult`` rows from ``server/routes/preflight.py``, so the row
- * grammar lives here once.
+ * (the on-demand ``/doctor`` re-probe). Both surface the
+ * ``CheckResult`` rows from ``server/routes/preflight.py``. The row set
+ * is mode-scoped server-side (K8s-scope emits seven rows, host-scope
+ * emits a smaller host-oriented set), so this component stays purely
+ * presentational — it renders whatever rows arrive, in order.
  *
  * Visual contract:
  *   - One row per check, with status glyph + name + message

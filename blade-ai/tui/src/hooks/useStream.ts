@@ -737,7 +737,11 @@ function applyEvent(
         type: "TOOL_ENDED",
         callId: pickCallId(evt.call_id, evt.task_id, evt.tool_name),
         name: evt.tool_name,
-        status: "success",
+        // ``is_error`` is set when the server converted an
+        // ``on_tool_error`` (tool raised) into this terminal event. It
+        // still closes the card (unblocking the leading-stable flush);
+        // the status just flips ✓ → ✗ so the failure is visible.
+        status: evt.is_error ? "error" : "success",
         content: evt.content,
       });
       return;
@@ -747,9 +751,26 @@ function applyEvent(
     case "node_end":
       dispatch({ type: "NODE_ENDED", node: evt.node });
       return;
+    case "node_message":
+      dispatch({
+        type: "NODE_MESSAGE",
+        content: evt.content,
+        node: evt.node ?? "",
+      });
+      return;
     case "confirm":
       dispatch({
         type: "CONFIRM_RECEIVED",
+        content: evt.content,
+        taskId: evt.task_id,
+        node: evt.node,
+        payload: evt.payload,
+      });
+      return;
+    case "auto_approved":
+      // Auto mode: render the read-only card, no interaction / no wait.
+      dispatch({
+        type: "AUTO_APPROVED",
         content: evt.content,
         taskId: evt.task_id,
         node: evt.node,

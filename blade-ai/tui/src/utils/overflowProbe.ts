@@ -13,16 +13,16 @@
  *
  *   _kind="frame"    One per render's useLayoutEffect commit. Carries:
  *     - pendingH / controlsH / bootRow / frameH / overflow
- *     - loadingH / stepperH / inputH / footerH  (sub-control breakdown
+ *     - loadingH / inputH / footerH  (sub-control breakdown
  *       so we can tell which strip's mount/unmount caused a controlsH
- *       swing — typically PhaseStepperCard's 8-row appearance/disappearance)
- *     - pending/controls/loading/stepper/input/footer ``MeasureUs``
+ *       swing)
+ *     - pending/controls/loading/input/footer ``MeasureUs``
  *       (per-strip Yoga measurement time in microseconds — proves out
  *       whether layout itself is the bottleneck)
  *     - tsDelta (inter-render gap, ms) + actionsBatched (dispatches
  *       coalesced into this single render) — together expose React 18
  *       automatic batching effectiveness during streaming
- *     - pendingLen / tailKind / tailAgentTextLen / hasStepper /
+ *     - pendingLen / tailKind / tailAgentTextLen /
  *       thinkingLen / streamState / pendingKinds / historyLen
  *     - lastWriteSeq  (correlates back to the most recent stdout record)
  *     - lastActionSeq (correlates back to the most recent action record)
@@ -69,7 +69,7 @@
  *   jq -s 'group_by(.streamState) | map({state: .[0].streamState, max: ([.[].overflow] | max), n: length})' …
  *
  * Refs are wired by ``setProbePendingRef`` / ``setProbeControlsRef`` /
- * ``setProbeLoadingRef`` / ``setProbeStepperRef`` /
+ * ``setProbeLoadingRef`` /
  * ``setProbeInputRef`` / ``setProbeFooterRef`` (callback refs on the
  * relevant <Box> elements). The hook ``useOverflowProbe`` is called
  * once at the top of <App>; it subscribes to the store fields that
@@ -109,7 +109,7 @@ import type { HistoryItem } from "../state/types.js";
  *   error             → "err"
  *   memory_compaction → "mc"
  *   turn_usage        → "tu"
- *   phase_stepper     → "ps"
+ *   <other>           → "?<kind>"
  *   <other>           → "?<kind>"
  *
  * The ``flushLeadingStable`` stability rules right now:
@@ -151,8 +151,6 @@ function summarizePending(pending: HistoryItem[]): string {
           return "mc";
         case "turn_usage":
           return "tu";
-        case "phase_stepper":
-          return "ps";
         default:
           return `?${it.kind}`;
       }
@@ -185,23 +183,16 @@ function ensureLogDir(): void {
 // from a behavioral standpoint — the values are written but never
 // read. The probe hook is the only consumer.
 //
-// Sub-control refs (loading / stepper / input / footer) let us
-// decompose ``controlsH`` so we can tell which strip moved when the
-// total swings — typically PhaseStepperCard mount/unmount accounts
-// for the +9 spikes, but without a per-strip breakdown the log just
-// records "controls grew by 9" with no attribution.
 const probeRefs: {
   pending: DOMElement | null;
   controls: DOMElement | null;
   loading: DOMElement | null;
-  stepper: DOMElement | null;
   input: DOMElement | null;
   footer: DOMElement | null;
 } = {
   pending: null,
   controls: null,
   loading: null,
-  stepper: null,
   input: null,
   footer: null,
 };
@@ -216,10 +207,6 @@ export function setProbeControlsRef(el: DOMElement | null): void {
 
 export function setProbeLoadingRef(el: DOMElement | null): void {
   probeRefs.loading = el;
-}
-
-export function setProbeStepperRef(el: DOMElement | null): void {
-  probeRefs.stepper = el;
 }
 
 export function setProbeInputRef(el: DOMElement | null): void {
@@ -478,6 +465,11 @@ function summariseAction(action: unknown): Record<string, unknown> {
       break;
     case "NODE_ENDED":
       out["node"] = a["node"];
+      break;
+    case "NODE_MESSAGE":
+      out["node"] = a["node"];
+      out["contentLen"] =
+        typeof a["content"] === "string" ? (a["content"] as string).length : 0;
       break;
     case "USAGE_RECEIVED":
       out["inputTokens"] = a["inputTokens"];
@@ -769,7 +761,6 @@ export function useOverflowProbe(): void {
     const last = s.pending[s.pending.length - 1];
     return last?.kind === "agent" ? last.text.length : 0;
   });
-  const hasStepper = useAppSelector((s) => s.currentPhaseStepper !== null);
   // 2026-05-26 perf — was ``s.thoughtBuffer.length`` (changes per token,
   // forcing the App re-render cascade on every thinking chunk even when
   // ``ENABLED === false``). Switched to the edge-triggered boolean so we
@@ -849,7 +840,7 @@ export function useOverflowProbe(): void {
     }
 
     // Sub-control breakdown — measured ONLY when refs attached. A
-    // missing strip (e.g. stepper on chat-only turns) reports as 0.
+    // missing strip reports as 0.
     // Returns [height, microseconds].
     const measureTimed = (el: DOMElement | null): [number, number] => {
       if (!el) return [0, 0];
@@ -862,7 +853,6 @@ export function useOverflowProbe(): void {
       }
     };
     const [loadingH, loadingMeasureUs] = measureTimed(probeRefs.loading);
-    const [stepperH, stepperMeasureUs] = measureTimed(probeRefs.stepper);
     const [inputH, inputMeasureUs] = measureTimed(probeRefs.input);
     const [footerH, footerMeasureUs] = measureTimed(probeRefs.footer);
 
@@ -911,7 +901,6 @@ export function useOverflowProbe(): void {
       pendingLen,
       tailKind,
       tailAgentTextLen,
-      hasStepper,
       thinkingLen,
       streamState,
       pendingKinds,
@@ -920,18 +909,16 @@ export function useOverflowProbe(): void {
       // Composer's outer Box) should equal controlsH; if it doesn't,
       // Yoga is rounding somewhere we should investigate.
       loadingH,
-      stepperH,
       inputH,
       footerH,
       // measureElement timing in microseconds. Total layout-time
       // budget per render = pendingMeasureUs + controlsMeasureUs +
-      // loadingMeasureUs + stepperMeasureUs + inputMeasureUs +
+      // loadingMeasureUs + inputMeasureUs +
       // footerMeasureUs. If this approaches ms-scale we have a Yoga
       // perf problem to chase down.
       pendingMeasureUs,
       controlsMeasureUs,
       loadingMeasureUs,
-      stepperMeasureUs,
       inputMeasureUs,
       footerMeasureUs,
       // Last associated stdout write seq so we can quickly grep

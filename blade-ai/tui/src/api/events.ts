@@ -15,7 +15,9 @@ export type StreamEventType =
   | "tool_end"
   | "node_start"
   | "node_end"
+  | "node_message"
   | "confirm"
+  | "auto_approved"
   | "result"
   | "error"
   | "usage"
@@ -66,6 +68,12 @@ export interface ToolEndEvent extends StreamEventBase {
   content: string;
   node?: string;
   call_id?: string;
+  /** True when this terminal event was synthesised from LangChain's
+   * ``on_tool_error`` (the tool raised — usually an arg-schema
+   * ValidationError). The server still emits a ``tool_end`` so the card
+   * can close; this flag flips it to the ✗ error status instead of ✓.
+   * Absent (falsy-stripped) on normal successful completions. */
+  is_error?: boolean;
 }
 
 export interface NodeStartEvent extends StreamEventBase {
@@ -85,6 +93,18 @@ export interface NodeEndEvent extends StreamEventBase {
   phase?: string;
 }
 
+/** Programmatic status text emitted by a graph node via
+ *  ``dispatch_node_message`` (e.g. baseline-capture progress lines,
+ *  safety-check step announcements, verifier results).  Distinct from
+ *  ``TokenEvent`` so the TUI can commit each message directly to Static
+ *  history as a discrete log line instead of accumulating them as a
+ *  growing agent-text block in pending. */
+export interface NodeMessageEvent extends StreamEventBase {
+  type: "node_message";
+  content: string;
+  node?: string;
+}
+
 export interface ConfirmEvent extends StreamEventBase {
   type: "confirm";
   content: string;
@@ -98,6 +118,17 @@ export interface ConfirmEvent extends StreamEventBase {
    *    confirmation_gate: { skill_name, target, plan_summary, safety_status, safety_reason }
    *  Older servers (pre-fix) omit this; renderers must fall back to
    *  ``content`` when absent. */
+  payload?: Record<string, unknown>;
+}
+
+/** Auto-mode counterpart of ``ConfirmEvent``: the server already approved
+ *  the gate (permission mode = auto), so this carries the same ``node`` +
+ *  ``payload`` for the read-only card but implies NO user interaction and
+ *  does NOT pause the stream. ``content`` is a plain-text fallback. */
+export interface AutoApprovedEvent extends StreamEventBase {
+  type: "auto_approved";
+  content: string;
+  node?: string;
   payload?: Record<string, unknown>;
 }
 
@@ -226,7 +257,9 @@ export type StreamEvent =
   | ToolEndEvent
   | NodeStartEvent
   | NodeEndEvent
+  | NodeMessageEvent
   | ConfirmEvent
+  | AutoApprovedEvent
   | ResultEvent
   | ErrorEvent
   | UsageEvent
@@ -246,7 +279,9 @@ export function isStreamEvent(value: unknown): value is StreamEvent {
     t === "tool_end" ||
     t === "node_start" ||
     t === "node_end" ||
+    t === "node_message" ||
     t === "confirm" ||
+    t === "auto_approved" ||
     t === "result" ||
     t === "error" ||
     t === "usage" ||

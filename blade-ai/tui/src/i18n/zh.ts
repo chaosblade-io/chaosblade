@@ -161,6 +161,7 @@ export const zh: Dict = {
   "help.card.tip": "提示：输入 / 后按 TAB 自动补全",
 
   // -- /doctor 输出 --------------------------------------------------
+  "doctor.loading": "正在诊断 …",
   "doctor.head": "诊断",
   "doctor.server": "server",
   "doctor.server_unreachable": "（不可达）",
@@ -184,7 +185,8 @@ export const zh: Dict = {
   "mode.usage_unknown": "未知模式 '{value}' — 应为 'auto' 或 'confirm'",
   "mode.usage_missing": "/permission 需要参数 — 请加 'auto' / 'confirm'（当前：{mode}）",
   "mode.already": "权限模式已是 {mode}",
-  "mode.changed": "权限模式 → **{mode}**（下一次 /turn 生效）",
+  "mode.changed": "权限模式 → **{mode}**（已写入配置，下一次 /turn 生效）",
+  "mode.persist_failed": "本次会话已切换，但写入配置失败：{reason}",
 
   // -- /mode（显示密度，calm/working/dense）---------------------------
   "display.usage_unknown": "未知密度 '{value}' — 应为 'calm' / 'working' / 'dense'",
@@ -668,26 +670,6 @@ export const zh: Dict = {
   "common.none": "（无）",
   "common.unset": "（未设置）",
   "common.unknown": "（未知）",
-
-  // -- Phase Stepper（5 步 todo list，inject turn 期间显示） --------
-  // recovery 不在这里——恢复是独立流程，不会自动接续注入：
-  //   * 注入 task_id 与恢复 task_id 不一定相同（用户可恢复任意任务）
-  //   * 启动屏 PendingTasksCard 已经列出未完成任务
-  //   * blade --timeout 提供时间兜底
-  // 未来若加 recover 流程的 stepper，会作为 mode="recover" 单独维护。
-  //
-  // 五步对应真实 graph 节点（src/chaos_agent/agent/graph.py）：
-  //   intent       → intent_clarification（澄清意图，含 Layer-1 confirm）
-  //   agent_loop   → agent_loop（计划编排，phase1 工具）
-  //   safety       → safety_check / confirmation_gate（Layer-2 confirm）
-  //   execute      → baseline_capture / execute_loop / direct_execute
-  //   verify       → verifier_loop
-  "phase.stepper.title": "故障注入待办",
-  "phase.label.intent": "意图识别",
-  "phase.label.agent_loop": "计划编排",
-  "phase.label.safety": "安全检查",
-  "phase.label.execute": "故障注入",
-  "phase.label.verify": "注入验证",
 
   // -- ToolMessage 卡片 chrome ---------------------------------------
   "tool.running": "执行中…",

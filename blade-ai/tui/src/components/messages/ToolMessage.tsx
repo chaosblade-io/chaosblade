@@ -101,19 +101,19 @@ import {
 /** How many output lines to keep on the card before the
  *  ``… +N more lines`` footer kicks in. ``kubectl get pods`` /
  *  ``kubectl describe`` / log dumps routinely have 8–15 useful rows
- *  worth seeing at a glance — 12 fits a typical phase-1 inspection
+ *  worth seeing at a glance — 10 fits a typical phase-1 inspection
  *  without dwarfing surrounding agent text. The body lives in
  *  ``<Static>`` history once committed, so this cap only affects
  *  visual density, not render performance. */
-const MAX_OUTPUT_LINES = 12;
+const MAX_OUTPUT_LINES = 10;
 /** Tighter cap used while the tool is still rendering in the dynamic
  *  area (``isPending=true``). Multiple in-flight tool cards at the
- *  full 12-line cap could push the dynamic frame past ``stdout.rows``;
+ *  full 10-line cap could push the dynamic frame past ``stdout.rows``;
  *  with ``maxFps: 4`` capping write rate the visual cost of an
  *  occasional overflow is now a barely-noticeable blink rather than
  *  continuous flicker, so we can comfortably show 5 lines per
  *  in-flight tool (matching the pre-isPending default). Once the
- *  group is committed the tighter cap is dropped and the full 12
+ *  group is committed the tighter cap is dropped and the full 10
  *  lines render in history. */
 const MAX_OUTPUT_LINES_PENDING = 5;
 
@@ -344,9 +344,9 @@ const ToolMessageInternal: React.FC<{
   //
   // Body line-cap pick:
   //   * Static history (``isPending`` falsy):
-  //       use ``MAX_OUTPUT_LINES`` (12) — full preview burns once.
+  //       use ``MAX_OUTPUT_LINES`` (10) — full preview burns once.
   //   * Pending without budget (e.g., constrainHeight=false, Ctrl+O):
-  //       use ``MAX_OUTPUT_LINES`` (12) so the user sees the long
+  //       use ``MAX_OUTPUT_LINES`` (10) so the user sees the long
   //       output they asked for.
   //   * Pending with budget: pick the tighter of
   //       ``MAX_OUTPUT_LINES_PENDING`` (5) and ``budget - chrome``

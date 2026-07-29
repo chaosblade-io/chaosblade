@@ -178,6 +178,10 @@ export interface ConfirmContextItem {
   /** Structured payload from the server — see ConfirmEvent.payload
    *  in ``api/events.ts``. */
   payload?: Record<string, unknown>;
+  /** True when this context was produced by an AUTO-mode auto-approval
+   *  (``auto_approved`` event) rather than a manual confirm. The renderer
+   *  prepends a ``✓ 自动批准`` badge and no interactive prompt accompanies it. */
+  autoApproved?: boolean;
 }
 
 /** Modes the prompt cycles through:
@@ -622,93 +626,6 @@ export interface ModelCardRow {
   note?: string;
 }
 
-/**
- * Inject-flow stepper rendered above the input prompt during an inject
- * turn. Each step represents one bucket of the real graph node
- * sequence — the server emits coarse phase strings via
- * ``dispatch_phase_started`` and the reducer's ``mapNodeToStep``
- * helper translates ``(node, phase)`` pairs into the finer-grained
- * 5-row layout. ``intent`` is the entry step — present in the strip
- * but already-completed by the time the stepper materialises (chat-
- * only turns that never leave intent never show a stepper at all).
- *
- * Lifecycle:
- *   - Created the first time a NODE_STARTED event maps to a
- *     non-intent step (so chat-only turns and Layer-1 confirm waits
- *     never show a stepper — see ``mapNodeToStep`` for the mapping
- *     rules, in particular the ``intent_confirm`` demotion).
- *   - Updated on every NODE_STARTED that introduces a new step:
- *     monotonic forward only — already-completed steps never roll
- *     back, replayed earlier-step events become no-ops.
- *   - On TURN_DONE the active step flips to ``completed`` and the
- *     stepper sinks into history alongside other turn artefacts.
- *   - On TURN_ABORTED the active step flips to ``failed``; later
- *     pending steps stay ``pending`` (they never ran), so the
- *     scrollback strip honestly records "got this far, then broke".
- */
-export type PhaseStatus = "pending" | "in_progress" | "completed" | "failed";
-
-/** Single source of truth for inject-stepper phase order.
- *
- *  Defined as a ``readonly`` tuple so:
- *    - ``PhaseName`` below derives from it via ``[number]`` indexing —
- *      adding a phase here automatically widens the union, no parallel
- *      declaration to forget.
- *    - ``reducer.ts`` re-uses the array verbatim for ``indexOf`` /
- *      ``includes`` checks (no second copy with structural drift).
- *
- *  Phase order mirrors the actual graph execution sequence in
- *  ``src/chaos_agent/agent/graph.py``:
- *
- *      intent_clarification (intent)
- *        → agent_loop ⇄ phase1_tools (inject — gather context)
- *        → safety_check / confirmation_gate (safety)
- *        → baseline_capture → execute_loop ⇄ phase2_tools (inject — run)
- *        → verifier_loop ⇄ verifier_tools (verify)
- *
- *  The graph's ``inject`` phase fires twice — once at agent_loop
- *  (BEFORE safety) and once at execute_loop (AFTER safety). Using a
- *  single ``inject`` bucket would let the monotonic ratchet skip past
- *  ``safety`` the moment agent_loop fires, painting safety as
- *  completed before it actually runs. We split into ``agent_loop``
- *  (planning, pre-safety) and ``execute`` (post-safety, blade calls)
- *  so the strip honestly tracks the real graph progression.
- *
- *  ``recovery`` is intentionally absent: a fault injection never
- *  auto-recovers — the user must invoke ``/recover`` (a separate graph
- *  whose task_id may or may not match the original injection's).
- *  PendingTasksCard at boot covers unfinished tasks; ``blade
- *  --timeout`` provides time-bounded auto-cleanup. A future recover-
- *  flow stepper will live as ``mode: "recover"`` with its own phase
- *  list. */
-export const INJECT_PHASE_ORDER = [
-  "intent",
-  "agent_loop",
-  "safety",
-  "execute",
-  "verify",
-] as const;
-
-export type PhaseName = (typeof INJECT_PHASE_ORDER)[number];
-
-export interface PhaseStep {
-  phase: PhaseName;
-  status: PhaseStatus;
-}
-
-export interface PhaseStepperItem {
-  kind: "phase_stepper";
-  id: string;
-  /** ``"inject"`` is the only mode rendered today. The field exists so
-   *  a future recover-flow stepper can share this discriminated union
-   *  without breaking the existing reducer state machine. */
-  mode: "inject";
-  /** Always 4 entries (matching the inject-mode order). The reducer
-   *  never re-orders or splices the array — it only mutates ``status``
-   *  in place. */
-  steps: PhaseStep[];
-}
-
 export type HistoryItem =
   | UserItem
   | AgentItem
@@ -731,8 +648,7 @@ export type HistoryItem =
   | HelpCardItem
   | SessionCardItem
   | ExperimentsCardItem
-  | ModelCardItem
-  | PhaseStepperItem;
+  | ModelCardItem;
 
 export interface SessionInfo {
   id: string;
@@ -1021,31 +937,6 @@ export interface AppState {
       }
     | null;
   /**
-   * Live phase-stepper for the current turn. Lives outside ``pending``
-   * specifically to keep the leading-stable flush in TOKEN_APPENDED
-   * working: while a turn is in flight the stepper keeps mutating
-   * (phases transition forward), and putting it at the head of
-   * ``pending`` would block every subsequent ``thinking`` /
-   * ``tool_group`` from being flushed to history. With pending blocked,
-   * the dynamic-area output height grows past ``stdout.rows`` and Ink
-   * falls into its fullscreen-redraw branch on every frame —
-   * the visible flicker + scroll-position thrash users see during
-   * inject.
-   *
-   * Lifecycle: created on the first non-intent step of the turn
-   * (mapped from ``(node, phase)`` via ``mapNodeToStep``), updated
-   * in place on subsequent step transitions, finalised + appended
-   * to ``pending`` inside ``commitPending`` (so it lands in
-   * scrollback as a phase-progress snapshot near the END of the
-   * turn block — before the optional ``turn_usage`` summary, after
-   * tool/agent items that already flushed mid-turn), then cleared
-   * back to ``null``. Strict chronological "stepper right after
-   * user echo" placement is unattainable with Ink's append-only
-   * Static — the leading-stable flush in TOKEN_APPENDED has already
-   * sent downstream items to history before commitPending runs.
-   */
-  currentPhaseStepper: PhaseStepperItem | null;
-  /**
    * Phase 4 — live memory-compaction state.
    *
    * Set when the server emits ``memory_compaction`` event with phase
@@ -1135,7 +1026,6 @@ export const initialAppState: AppState = {
   },
   bootProgress: null,
   pendingDecision: null,
-  currentPhaseStepper: null,
   currentCompaction: null,
   idlePhrase: "",
   config: {

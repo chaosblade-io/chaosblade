@@ -20,7 +20,6 @@ import type { HistoryItem } from "../state/types.js";
 import { BootDoctorCard } from "./boot/BootDoctorCard.js";
 import { PendingTasksCard } from "./boot/PendingTasksCard.js";
 import { WelcomeCard } from "./boot/WelcomeCard.js";
-import { PhaseStepperCard } from "./PhaseStepperCard.js";
 import { ResultCard } from "./result/ResultCard.js";
 import { ExperimentsCard } from "./ExperimentsCard.js";
 import { HelpCard } from "./HelpCard.js";
@@ -129,8 +128,6 @@ const HistoryItemDisplayInternal: React.FC<{
       return <ExperimentsCard item={item} />;
     case "model_card":
       return <ModelCard item={item} />;
-    case "phase_stepper":
-      return <PhaseStepperCard item={item} />;
   }
 };
 

@@ -101,16 +101,35 @@ export function findLastSafeSplitPoint(content: string): number {
 
   // Rule 2-3: walk back over ``\n\n`` candidates and pick the last
   // one not inside a code block.
+  //
+  // Trailing-\n\n skip: if the ``\n\n`` sits at the very end of
+  // content (``candidate === content.length``), splitting there would
+  // produce an empty tail — nothing left to stream. The caller's
+  // ``splitPoint < newText.length`` guard would reject it anyway, but
+  // returning here forces the caller to wait for the NEXT token before
+  // trying again, leaving the full text in pending for an extra render
+  // cycle. When the LLM emits ``\n\n`` as a paragraph terminator,
+  // EVERY token batch ends with ``\n\n``, so the split NEVER fires and
+  // the entire reply accumulates in pending — each append triggers
+  // ``renderMarkdown`` on the full growing text, causing visible
+  // flicker. Skipping the trailing ``\n\n`` and continuing backward
+  // to find an earlier boundary lets completed paragraphs commit to
+  // Static immediately, keeping the pending tail short.
   let searchFrom = content.length;
   while (searchFrom >= 0) {
     const dnlIndex = content.lastIndexOf("\n\n", searchFrom);
     if (dnlIndex === -1) break;
     const candidate = dnlIndex + 2;
     if (!isIndexInsideCodeBlock(content, candidate)) {
-      return candidate;
+      if (candidate < content.length) {
+        return candidate;
+      }
+      // candidate === content.length: ``\n\n`` is at the very end.
+      // Splitting here yields an empty tail — keep searching backward
+      // for an earlier boundary that leaves a non-empty tail.
     }
-    // Candidate was inside a code block — keep searching backward
-    // from BEFORE the matched ``\n\n`` so we make progress.
+    // Candidate was inside a code block OR at the end of content —
+    // keep searching backward from BEFORE the matched ``\n\n``.
     searchFrom = dnlIndex - 1;
   }
 

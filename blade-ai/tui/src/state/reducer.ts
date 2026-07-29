@@ -12,174 +12,17 @@ import { findLastSafeSplitPoint } from "../utils/markdownSplit.js";
 import { perfMark } from "../utils/perfTrace.js";
 import { parseResultEnvelope } from "../utils/result.js";
 import {
-  INJECT_PHASE_ORDER,
   type AgentItem,
   type AppState,
   type ConfirmContextItem,
   type ConfirmPromptItem,
   type HistoryItem,
-  type PhaseName,
-  type PhaseStatus,
-  type PhaseStep,
-  type PhaseStepperItem,
   type ResultItem,
   type ThinkingItem,
   type ToolItem,
   type ToolStatus,
   type TurnUsageItem,
 } from "./types.js";
-
-// ---------------------------------------------------------------------------
-// Phase stepper helpers
-// ---------------------------------------------------------------------------
-
-/** Map a server-emitted ``(node, phase)`` pair to the todo-list step
- *  that should be marked active. Returns ``null`` when the event is
- *  outside the inject pipeline (older servers, future custom events,
- *  recovery-graph events the strip doesn't model).
- *
- *  Why node-aware: the graph emits ``phase=inject`` from BOTH
- *  agent_loop (planning, pre-safety) and execute_loop / baseline_capture
- *  / direct_execute (post-safety, blade calls). Mapping naively on
- *  ``phase`` alone would let the monotonic ratchet jump past
- *  ``safety`` the instant agent_loop fires, painting safety as
- *  completed before safety_check has run. We split inject into two
- *  todo-list steps and disambiguate by node name here.
- *
- *  ``node=intent_confirm`` is graph-tagged ``phase=safety`` so the
- *  Layer-1 confirm wait paints a stepper indicator while the user
- *  reads the confirm card. Conceptually it's still part of "intent"
- *  (the user is confirming the intent they just expressed in NL),
- *  not a safety check on a derived plan. We re-tag it to the
- *  ``intent`` step here so the strip doesn't light "safety" before
- *  agent_loop runs. */
-function mapNodeToStep(
-  node: string,
-  phase: string,
-): PhaseName | null {
-  if (node === "batch_setup") return null;
-  if (phase === "intent") return "intent";
-  if (phase === "verify") return "verify";
-  if (phase === "safety") {
-    if (node === "intent_confirm") return "intent";
-    return "safety";
-  }
-  if (phase === "inject") {
-    if (node === "agent_loop") return "agent_loop";
-    return "execute";
-  }
-  return null;
-}
-
-/** Build a fresh PhaseStepperItem snapshot.
- *
- *  Earlier phases (lower index than ``activeIndex``) are marked
- *  ``completed``; the active phase is ``in_progress``; later phases
- *  ``pending``. Used by NODE_STARTED to materialise the stepper the
- *  first time a non-intent phase fires for a turn. */
-function buildPhaseStepper(
-  id: string,
-  activeIndex: number,
-): PhaseStepperItem {
-  const steps: PhaseStep[] = INJECT_PHASE_ORDER.map((phase, idx) => ({
-    phase,
-    status:
-      idx < activeIndex
-        ? "completed"
-        : idx === activeIndex
-          ? "in_progress"
-          : "pending",
-  }));
-  return { kind: "phase_stepper", id, mode: "inject", steps };
-}
-
-/** Advance a PhaseStepperItem so ``activeIndex`` is the in-progress
- *  step — but **monotonically forward only**. Steps already at a more
- *  advanced status never roll back to a less-advanced one.
- *
- *  Why monotonic matters: LangGraph's astream_events replays earlier
- *  phase events when resuming after an interrupt
- *  (``Command(resume=...)``). Without this guard a replayed
- *  ``phase_started safety`` event arriving after we've already
- *  progressed to ``inject`` would naively rewrite ``inject`` back to
- *  ``pending``, producing a visible regress / re-progress flicker
- *  in the stepper card. The same root cause we fixed in the
- *  TOOL_STARTED replay-guard, applied to phase transitions.
- *
- *  Rules:
- *    - ``idx < activeIndex``  → ratchet up to ``completed`` (never down)
- *    - ``idx === activeIndex`` → if pending, become in_progress; if
- *                                already completed, stay completed
- *                                (don't regress)
- *    - ``idx > activeIndex``  → leave alone (replay event for an
- *                                earlier phase must NOT touch later
- *                                steps)
- */
-function applyActivePhase(
-  stepper: PhaseStepperItem,
-  activeIndex: number,
-): PhaseStepperItem {
-  let mutated = false;
-  const steps = stepper.steps.map((step, idx) => {
-    let next = step.status;
-    if (idx < activeIndex) {
-      if (step.status !== "completed") next = "completed";
-    } else if (idx === activeIndex) {
-      if (step.status === "pending") next = "in_progress";
-    }
-    // idx > activeIndex: untouched. A replay of an earlier phase
-    // must never rewind ``inject`` / ``verify`` to pending.
-    if (next !== step.status) {
-      mutated = true;
-      return { ...step, status: next };
-    }
-    return step;
-  });
-  return mutated ? { ...stepper, steps } : stepper;
-}
-
-/** Freeze the stepper into history at the end of a turn.
- *
- *  Two modes, driven by whether the turn ended cleanly or aborted:
- *
- *    failed=false (TURN_DONE) — the pipeline reached a terminal node
- *      under its own steam. Anything not yet completed (the trailing
- *      in_progress step plus any pending later steps that the graph
- *      may have skipped) is rounded up to ``completed``: by definition
- *      the run finished, so the strip honestly says "all done".
- *
- *    failed=true  (TURN_ABORTED) — the run was interrupted: Esc /
- *      network drop / unhandled exception. The active in_progress
- *      step flips to ``failed`` (red ✗); already-completed prefix
- *      stays completed (those steps did run); later pending steps
- *      stay pending (they never ran). This produces an honest
- *      record like ``[✓ ✓ ✗ ○]`` instead of the misleading "all ✓"
- *      that the previous TURN_DONE-shape finalisation produced.
- */
-function finalisePhaseStepper(
-  stepper: PhaseStepperItem,
-  options: { failed?: boolean } = {},
-): PhaseStepperItem {
-  const failed = options.failed ?? false;
-  let mutated = false;
-  const steps = stepper.steps.map((step) => {
-    let next: PhaseStatus = step.status;
-    if (failed) {
-      // Failed turn: only the active step transitions; everything
-      // else holds (completed prefix, untouched pending tail).
-      if (step.status === "in_progress") next = "failed";
-    } else {
-      // Successful turn: round up everything to completed.
-      if (step.status !== "completed") next = "completed";
-    }
-    if (next !== step.status) {
-      mutated = true;
-      return { ...step, status: next };
-    }
-    return step;
-  });
-  return mutated ? { ...stepper, steps } : stepper;
-}
 
 /**
  * Pull the next monotonic item id from the state and return both the
@@ -487,8 +330,16 @@ export type Action =
     }
   | { type: "NODE_STARTED"; node: string; phase?: string }
   | { type: "NODE_ENDED"; node: string }
+  | { type: "NODE_MESSAGE"; content: string; node: string }
   | {
       type: "CONFIRM_RECEIVED";
+      content: string;
+      taskId?: string;
+      node?: string;
+      payload?: Record<string, unknown>;
+    }
+  | {
+      type: "AUTO_APPROVED";
       content: string;
       taskId?: string;
       node?: string;
@@ -742,7 +593,6 @@ export function reducer(state: AppState, action: Action): AppState {
         suppressMidContentThinking: false,
         turnInputTokens: 0,
         turnOutputTokens: 0,
-        currentPhaseStepper: null,
         // Phase 4 — defensive reset. A compaction whose COMPLETED
         // event somehow never arrived (server crash mid-turn, network
         // drop) would otherwise leave the spinner stuck across into
@@ -1311,77 +1161,73 @@ export function reducer(state: AppState, action: Action): AppState {
       // thought yet. Avoids stomping over a more specific phrase.
       const nextSubject = state.thoughtSubject || action.node;
 
-      // PhaseStepperCard state machine.
-      //
-      // The server tags every node with a coarse phase
-      // ("intent" / "safety" / "inject" / "verify" / "recovery").
-      // ``mapNodeToStep`` translates that ``(node, phase)`` pair into
-      // the finer-grained todo-list step — splitting the overloaded
-      // ``inject`` phase into ``agent_loop`` and ``execute``, and
-      // demoting the ``intent_confirm`` Layer-1 wait back into the
-      // ``intent`` bucket. See the helper for the full mapping
-      // rationale.
-      //
-      // The stepper lives in ``state.currentPhaseStepper`` — NOT in
-      // pending — so its perpetual mutation during the turn doesn't
-      // block the leading-stable flush in TOKEN_APPENDED. With the
-      // stepper at pending[0] (its old home) every thinking /
-      // tool_group sat behind it stayed pending all the way to
-      // TURN_DONE, growing the dynamic area past ``stdout.rows`` and
-      // tripping Ink's fullscreen-redraw branch on every frame —
-      // the visible flicker + scroll-position thrash users see during
-      // inject.
-      //
-      // Rules:
-      //   - Skip events that don't map to a known step (older servers,
-      //     unrelated nodes, recovery-graph events).
-      //   - The ``intent`` step NEVER materialises the stepper —
-      //     chat-only turns end at intent_clarification, a "1 of 5
-      //     done" panel for a one-line greeting would be misleading.
-      //   - First non-intent step creates the stepper.
-      //   - Subsequent step transitions update it in place
-      //     (monotonically forward — see ``applyActivePhase``).
-      //   - The stepper is finalised + appended to pending inside
-      //     ``commitPending`` so it lands in scrollback at the end of
-      //     the turn block as a phase-progress snapshot.
-      // Batch loop-back: when batch_setup fires, the pipeline is
-      // starting a new fault iteration. Clear the stepper so the
-      // subsequent safety_check NODE_STARTED creates a fresh one
-      // starting from the "safety" phase — otherwise the monotonic
-      // ratchet would keep it stuck at "verify" from the previous fault.
-      let nextStepper = state.currentPhaseStepper;
-      let stepperCounter = state.nextItemId;
-      if (action.node === "batch_setup" && nextStepper !== null) {
-        nextStepper = null;
-      }
-
-      const stepName = mapNodeToStep(action.node, action.phase ?? "");
-      if (stepName !== null) {
-        const activeIndex = INJECT_PHASE_ORDER.indexOf(stepName);
-        if (nextStepper) {
-          const repainted = applyActivePhase(nextStepper, activeIndex);
-          if (repainted !== nextStepper) {
-            nextStepper = repainted;
-          }
-        } else if (stepName !== "intent") {
-          const alloc = nextId(state, "ps");
-          nextStepper = buildPhaseStepper(alloc.id, activeIndex);
-          stepperCounter = alloc.counter;
-        }
-      }
-
       return {
         ...state,
         thoughtSubject: nextSubject,
         currentTurnIsInjection: nextIsInjection,
-        currentPhaseStepper: nextStepper,
-        nextItemId: stepperCounter,
         suppressMidContentThinking: false,
       };
     }
 
     case "NODE_ENDED":
       return state;
+
+    // ---------------------------------------------------------------
+    case "NODE_MESSAGE": {
+      // Programmatic status text from a graph node (e.g. baseline-
+      // capture progress, safety-check step announcements, verifier
+      // results).  These are discrete log lines — NOT LLM tokens — so
+      // commit each one directly to history (Static) as a ``LogItem``.
+      //
+      // When this content arrived as ``type="token"`` (the old path),
+      // the TUI accumulated every message into a single growing agent
+      // item in pending.  Because each message ends with ``\n\n``,
+      // ``findLastSafeSplitPoint`` returned ``content.length`` and the
+      // mid-stream split never fired — the entire baseline-capture
+      // run (~65 s of progress messages) piled into one agent item,
+      // and each append triggered an Ink re-render of the dynamic
+      // frame, causing visible flicker.
+      //
+      // Before committing the log line, force-flush any pending items
+      // to preserve chronological order (agent text / tool cards that
+      // preceded this node message must land ABOVE it in scrollback).
+      // Mirrors the CONFIRM_RECEIVED force-flush pattern, preserving
+      // unresolved ``confirm_prompt`` widgets in pending.
+      let s = state;
+      s = { ...s, suppressMidContentThinking: false };
+      s = commitThinking(s);
+      s = flushLeadingStable(s);
+      if (s.pending.length > 0) {
+        const toFlush: HistoryItem[] = [];
+        const toKeep: HistoryItem[] = [];
+        for (const item of s.pending) {
+          if (item.kind === "confirm_prompt" && !item.resolved) {
+            toKeep.push(item);
+          } else {
+            toFlush.push(item);
+          }
+        }
+        if (toFlush.length > 0) {
+          s = {
+            ...s,
+            history: [...s.history, ...toFlush],
+            pending: toKeep,
+          };
+        }
+      }
+      // Trim trailing newlines — dispatch_node_message always appends
+      // ``\n\n`` which would create extra blank lines in a log item.
+      const trimmed = action.content.replace(/\n+$/, "");
+      const { id, counter } = nextId(s, "nm");
+      return {
+        ...s,
+        history: [
+          ...s.history,
+          { kind: "log", id, level: "info" as const, text: trimmed },
+        ],
+        nextItemId: counter,
+      };
+    }
 
     // ---------------------------------------------------------------
     case "CONFIRM_RECEIVED": {
@@ -1509,6 +1355,50 @@ export function reducer(state: AppState, action: Action): AppState {
         streamState: "waiting_confirmation",
         taskId: action.taskId ?? s.taskId,
         nextItemId: counterAfterCtx + 1,
+      };
+    }
+
+    // ---------------------------------------------------------------
+    case "AUTO_APPROVED": {
+      // Auto-mode counterpart of CONFIRM_RECEIVED. Renders the SAME
+      // read-only context card (ConfirmContextRenderer dispatches by
+      // node), but appends ONLY a confirm_context — no confirm_prompt,
+      // since the server already approved the gate. The stream keeps
+      // flowing (no ``waiting_confirmation``). Same flush prelude so the
+      // card lands after in-flight leftovers in chronological order.
+      const sanitizedAA = sanitizeStuckTools(state.pending);
+      let s = sanitizedAA === state.pending ? state : { ...state, pending: sanitizedAA };
+      s = { ...s, suppressMidContentThinking: false };
+      s = commitThinking(s);
+      s = flushLeadingStable(s);
+      if (s.pending.length > 0) {
+        const toFlush: HistoryItem[] = [];
+        const toKeep: HistoryItem[] = [];
+        for (const item of s.pending) {
+          if (item.kind === "confirm_prompt" && !item.resolved) {
+            toKeep.push(item);
+          } else {
+            toFlush.push(item);
+          }
+        }
+        if (toFlush.length > 0) {
+          s = { ...s, history: [...s.history, ...toFlush], pending: toKeep };
+        }
+      }
+      const { id: aaId, counter: aaCounter } = nextId(s, "c-ctx");
+      const aaContext: ConfirmContextItem = {
+        kind: "confirm_context",
+        id: aaId,
+        taskId: action.taskId ?? s.taskId ?? "",
+        content: action.content,
+        node: action.node,
+        payload: action.payload,
+        autoApproved: true,
+      };
+      return {
+        ...s,
+        history: [...s.history, aaContext],
+        nextItemId: aaCounter + 1,
       };
     }
 
@@ -1871,7 +1761,6 @@ export function reducer(state: AppState, action: Action): AppState {
         hasActiveThinking: false,
         turnInputTokens: 0,
         turnOutputTokens: 0,
-        currentPhaseStepper: null,
         turnStartedAt: Date.now(),
         taskId: action.taskId,
         isReceiving: true,
@@ -2019,12 +1908,10 @@ function commitPending(
   // stepper-append to AFTER the usage-append meant a stepper-only
   // turn would bail before the stepper got a chance to flush.
   // Hoisting the bail up keeps both orderings safe.
-  const hasStepper = !!state.currentPhaseStepper;
   const hasUsage = state.turnInputTokens > 0 || state.turnOutputTokens > 0;
   if (
     state.pending.length === 0 &&
     state.streamState === "idle" &&
-    !hasStepper &&
     !hasUsage
   ) {
     perfMark("commitPending", {
@@ -2054,21 +1941,6 @@ function commitPending(
     };
   }
 
-  // Append the finalised stepper LAST so the todo strip is the row
-  // immediately above the InputPrompt. See the long comment above
-  // for why this anchors the user's mental model better than the
-  // previous stepper-then-usage order.
-  if (state.currentPhaseStepper) {
-    const finalisedStepper = finalisePhaseStepper(
-      state.currentPhaseStepper,
-      { failed },
-    );
-    state = {
-      ...state,
-      pending: [...state.pending, finalisedStepper],
-      currentPhaseStepper: null,
-    };
-  }
   const result = {
     ...state,
     history: [...state.history, ...state.pending],
@@ -2093,7 +1965,6 @@ function commitPending(
     pendingBefore: __pendingBefore,
     pendingAtCommit: state.pending.length,
     historyAfter: result.history.length,
-    hasStepper,
     hasUsage,
     failed,
   });

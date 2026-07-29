@@ -1528,48 +1528,61 @@ function usePlanBuilderSelect(
 const ConfirmContextMessageInternal: React.FC<{
   item: import("../../state/types.js").ConfirmContextItem;
 }> = ({ item }) => {
-  if (item.payload && item.node === "plan_builder") {
-    return <PlanSelectionCard payload={item.payload} taskId={item.taskId} />;
-  }
-  if (
-    item.payload &&
-    item.node === "intent_confirm" &&
-    hasIntentContent(item.payload)
-  ) {
-    return <IntentConfirmCard payload={item.payload} taskId={item.taskId} />;
-  }
-  if (
-    item.payload &&
-    item.node === "confirmation_gate" &&
-    hasExecutionContent(item.payload)
-  ) {
-    const planMarkdown = item.payload.plan_preview_markdown as string | undefined;
-    return (
-      <Box flexDirection="column">
-        {planMarkdown && (
-          <Box paddingLeft={2}>
-            <PlanPreviewSection markdown={planMarkdown} />
-          </Box>
-        )}
-        <ExecutionConfirmCard payload={item.payload} taskId={item.taskId} />
-      </Box>
-    );
-  }
-  if (
-    item.payload &&
-    item.node === "tool_screener" &&
-    asString(item.payload["type"]) === "target_change"
-  ) {
-    return <TargetChangeCard payload={item.payload} taskId={item.taskId} />;
-  }
-  if (
-    item.payload &&
-    item.node === "plan_change_confirm" &&
-    asString(item.payload["type"]) === "plan_change"
-  ) {
-    return <PlanChangeCard payload={item.payload} taskId={item.taskId} />;
-  }
-  return <GenericConfirmCard content={item.content} taskId={item.taskId} />;
+  const body = ((): React.ReactNode => {
+    if (item.payload && item.node === "plan_builder") {
+      return <PlanSelectionCard payload={item.payload} taskId={item.taskId} />;
+    }
+    if (
+      item.payload &&
+      item.node === "intent_confirm" &&
+      hasIntentContent(item.payload)
+    ) {
+      return <IntentConfirmCard payload={item.payload} taskId={item.taskId} />;
+    }
+    if (
+      item.payload &&
+      item.node === "confirmation_gate" &&
+      hasExecutionContent(item.payload)
+    ) {
+      const planMarkdown = item.payload.plan_preview_markdown as string | undefined;
+      return (
+        <Box flexDirection="column">
+          {planMarkdown && (
+            <Box paddingLeft={2}>
+              <PlanPreviewSection markdown={planMarkdown} />
+            </Box>
+          )}
+          <ExecutionConfirmCard payload={item.payload} taskId={item.taskId} />
+        </Box>
+      );
+    }
+    if (
+      item.payload &&
+      item.node === "tool_screener" &&
+      asString(item.payload["type"]) === "target_change"
+    ) {
+      return <TargetChangeCard payload={item.payload} taskId={item.taskId} />;
+    }
+    if (
+      item.payload &&
+      item.node === "plan_change_confirm" &&
+      asString(item.payload["type"]) === "plan_change"
+    ) {
+      return <PlanChangeCard payload={item.payload} taskId={item.taskId} />;
+    }
+    return <GenericConfirmCard content={item.content} taskId={item.taskId} />;
+  })();
+  if (!item.autoApproved) return body;
+  // Auto-approved: same card body, followed by a read-only badge BELOW it so it
+  // reads as "already approved by auto mode" — no interactive prompt follows.
+  return (
+    <Box flexDirection="column">
+      {body}
+      <Text color={Theme.status.ok} bold>
+        {`✓ 自动批准${item.node ? `：${item.node}` : ""}`}
+      </Text>
+    </Box>
+  );
 };
 
 // React.memo: ConfirmContextMessage carries the heaviest layout

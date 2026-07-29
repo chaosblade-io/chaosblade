@@ -1,9 +1,13 @@
-/** Server-side default for ``settings.context_max_tokens`` — used
- *  as the baked-in window size before any ``context_size`` event has
- *  landed so the Footer always renders proper numbers at boot
- *  instead of a placeholder. The real value (whatever the operator
- *  set in ``BLADE_AI_CONTEXT_MAX_TOKENS``) overrides this as soon
- *  as the first hook fires. */
+/** Mirror of Python's GLOBAL FALLBACK ``settings.context_max_tokens`` — the
+ *  window assumed when the model cannot be resolved. NOT the configured
+ *  model's real window (qwen3-max is 131,072); that arrives from the server,
+ *  twice over: ``GET /preflight``'s ``context_max_tokens`` seeds the Footer at
+ *  boot (see BootOrchestrator), and every ``context_size`` event carries it
+ *  afterwards. This constant is only what renders if preflight is unavailable.
+ *
+ *  Kept in step with the Python default by
+ *  ``tests/test_tui/test_context_window_placeholder_parity.py`` — nothing else
+ *  links the two, so changing one silently diverges from the other. */
 export const DEFAULT_CONTEXT_MAX_TOKENS = 128_000;
 
 /**

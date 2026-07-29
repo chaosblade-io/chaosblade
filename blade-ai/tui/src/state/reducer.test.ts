@@ -849,6 +849,55 @@ describe("reducer / TOOL_STARTED + TOOL_ENDED matching", () => {
     }
   });
 
+  it("closes a stuck running tool via an errored TOOL_ENDED (⊶ → ✗)", () => {
+    // Regression for the ⊶-stuck-forever bug (sess_d861cd2510a7): a tool
+    // that raised emitted LangChain's ``on_tool_error`` — NOT
+    // ``on_tool_end`` — so the server (pre-fix) sent no terminal event
+    // and the tool card stayed "running" at the head of pending. That
+    // blocked flushLeadingStable, so the rest of the turn piled up in
+    // the dynamic frame until it exceeded stdout.rows and tripped Ink's
+    // fullscreen-redraw (duplicated output). The server fix converts
+    // on_tool_error → tool_end(status:"error"); useStream maps it to a
+    // TOOL_ENDED carrying status "error". This proves that terminal
+    // event finalises the card to ✗ with no tool left spinning.
+    const running = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "TOOL_STARTED", callId: "c1", name: "request_replan", node: "n" },
+      { type: "TOKEN_APPENDED", content: "After the tool.\n\n", node: "n" },
+    ]);
+    // Baseline: while the tool is running it stays at the head of pending
+    // (a running group can't drain — the head-blocking condition).
+    const runningGroup = running.pending.find((i) => i.kind === "tool_group");
+    expect(runningGroup?.kind).toBe("tool_group");
+    if (runningGroup?.kind === "tool_group") {
+      expect(runningGroup.tools[0]?.status).toBe("running");
+    }
+
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "TOOL_STARTED", callId: "c1", name: "request_replan", node: "n" },
+      { type: "TOKEN_APPENDED", content: "After the tool.\n\n", node: "n" },
+      {
+        type: "TOOL_ENDED",
+        callId: "c1",
+        name: "request_replan",
+        status: "error",
+        content: "1 validation error for request_replan",
+      },
+    ]);
+    const group = [...s.history, ...s.pending].find(
+      (i) => i.kind === "tool_group",
+    );
+    expect(group).toBeDefined();
+    if (group && group.kind === "tool_group") {
+      // (a) finalised to the error status → renders ✗, not a stuck ⊶.
+      expect(group.tools[0]?.status).toBe("error");
+      expect(group.tools[0]?.raw).toContain("validation error");
+      // (b) nothing is left spinning — the head no longer blocks flush.
+      expect(group.tools.some((t) => t.status === "running")).toBe(false);
+    }
+  });
+
   it("falls back to name match when callId mismatches (tool followed by interrupt)", () => {
     // Reproduces the ``submit_fault_intent`` ghosting:
     // LangGraph's astream_events can emit ``on_tool_end`` with a
@@ -939,488 +988,11 @@ describe("reducer / TOOL_STARTED + TOOL_ENDED matching", () => {
   });
 });
 
-describe("reducer / PhaseStepper", () => {
-  it("does NOT materialise the stepper for an intent-only turn", () => {
-    // Chat / capability Q&A turns never leave intent_clarification —
-    // showing a 5-step progress strip would mislead the user about
-    // the scope of the turn.
-    const s = fold([
-      { type: "TURN_STARTED", input: "你好" },
-      { type: "NODE_STARTED", node: "intent_clarification", phase: "intent" },
-      { type: "TOKEN_APPENDED", content: "你好！", node: "intent_clarification" },
-    ]);
-    // Stepper now lives in its own slot, not in pending. Verify both:
-    // mid-turn lookup is null, and pending stays clean of any
-    // ``phase_stepper`` items.
-    expect(s.currentPhaseStepper).toBeNull();
-    expect(s.pending.find((p) => p.kind === "phase_stepper")).toBeUndefined();
-  });
-
-  it("materialises the stepper on the first non-intent step", () => {
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject cpu" },
-      { type: "NODE_STARTED", node: "intent_clarification", phase: "intent" },
-      // Layer-1 confirm wait — graph tags ``intent_confirm`` with
-      // ``phase=safety`` so the strip can paint while the user reads
-      // the confirm card, but mapNodeToStep demotes it back to
-      // ``intent`` (it's confirming intent, not running a safety
-      // check). So this step does NOT materialise the stepper.
-      { type: "NODE_STARTED", node: "intent_confirm", phase: "safety" },
-    ]);
-    expect(s.currentPhaseStepper).toBeNull();
-
-    // The first non-intent step (agent_loop) finally materialises it.
-    const after = fold(
-      [{ type: "NODE_STARTED", node: "agent_loop", phase: "inject" }],
-      s,
-    );
-    const stepper = after.currentPhaseStepper;
-    expect(stepper).not.toBeNull();
-    // Mid-turn stepper lives in its own slot, never in pending —
-    // see ``currentPhaseStepper`` JSDoc for the leading-stable-flush
-    // rationale.
-    expect(after.pending.find((p) => p.kind === "phase_stepper")).toBeUndefined();
-    if (stepper && stepper.kind === "phase_stepper") {
-      expect(stepper.mode).toBe("inject");
-      expect(stepper.steps).toHaveLength(5);
-      expect(stepper.steps.map((x) => x.phase)).toEqual([
-        "intent",
-        "agent_loop",
-        "safety",
-        "execute",
-        "verify",
-      ]);
-      // intent → completed (the run already moved past intent), the
-      // active step (agent_loop) → in_progress, downstream pending.
-      expect(stepper.steps.map((x) => x.status)).toEqual([
-        "completed",
-        "in_progress",
-        "pending",
-        "pending",
-        "pending",
-      ]);
-    }
-  });
-
-  it("repaints the same stepper instance on subsequent step transitions", () => {
-    // Walks the full real-graph sequence (matching ``graph.py``):
-    // agent_loop → safety_check → confirmation_gate → execute_loop →
-    // verifier_loop. Each transition should advance the strip by
-    // exactly one row.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject" },
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "NODE_STARTED", node: "safety_check", phase: "safety" },
-      { type: "NODE_STARTED", node: "execute_loop", phase: "inject" },
-      { type: "NODE_STARTED", node: "verifier_loop", phase: "verify" },
-    ]);
-    const stepper = s.currentPhaseStepper;
-    expect(stepper).not.toBeNull();
-    if (stepper) {
-      expect(stepper.steps.map((x) => x.status)).toEqual([
-        "completed", // intent
-        "completed", // agent_loop
-        "completed", // safety
-        "completed", // execute
-        "in_progress", // verify
-      ]);
-    }
-  });
-
-  it("does NOT regress already-progressed steps when an earlier step replays", () => {
-    // LangGraph re-emits earlier phase events on Command(resume=...)
-    // after an interrupt (the same replay channel that produced
-    // duplicate ToolGroup cards before the TOOL_STARTED guard). When
-    // a replayed ``agent_loop`` event arrives after the stepper has
-    // already advanced to ``safety``, the active row must NOT roll
-    // back — otherwise the user sees the strip flicker back and
-    // re-progress.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject" },
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "NODE_STARTED", node: "safety_check", phase: "safety" },
-      // Replay frame after a confirmation-gate resume:
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-    ]);
-    const stepper = s.currentPhaseStepper;
-    expect(stepper).not.toBeNull();
-    if (stepper) {
-      // agent_loop stays completed (NOT regressed to in_progress);
-      // safety stays in_progress (NOT regressed to pending).
-      expect(stepper.steps.map((x) => x.status)).toEqual([
-        "completed", // intent
-        "completed", // agent_loop
-        "in_progress", // safety
-        "pending", // execute
-        "pending", // verify
-      ]);
-    }
-  });
-
-  it("does NOT create a stepper for the recovery phase", () => {
-    // Recover invocations are a separate graph and a separate task_id
-    // space from the original injection. PendingTasksCard at boot
-    // already surfaces unfinished tasks; ``blade --timeout`` provides
-    // time-bounded auto-cleanup. Showing a stepper here would imply
-    // the inject pipeline is "still running" — false. Future recover-
-    // mode stepper is reserved for ``mode: "recover"``.
-    const s = fold([
-      { type: "TURN_STARTED", input: "/recover task-abc" },
-      { type: "NODE_STARTED", node: "recover_verifier_loop", phase: "recovery" },
-    ]);
-    expect(s.currentPhaseStepper).toBeNull();
-    expect(s.pending.find((p) => p.kind === "phase_stepper")).toBeUndefined();
-  });
-
-  it("ignores re-entry into the same step (no churn)", () => {
-    // The ``execute`` step covers multiple nodes — baseline_capture,
-    // execute_loop, direct_execute. Each emits its own NODE_STARTED
-    // but the strip should stay parked on the same row.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject" },
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "NODE_STARTED", node: "safety_check", phase: "safety" },
-      { type: "NODE_STARTED", node: "baseline_capture", phase: "inject" },
-      // Same ``execute`` step, different node — must NOT advance.
-      { type: "NODE_STARTED", node: "execute_loop", phase: "inject" },
-    ]);
-    const stepper = s.currentPhaseStepper;
-    expect(stepper).not.toBeNull();
-    if (stepper) {
-      // Strip parked on ``execute`` (index 3). agent_loop / safety
-      // already completed; verify still pending.
-      expect(stepper.steps.map((x) => x.status)).toEqual([
-        "completed", // intent
-        "completed", // agent_loop
-        "completed", // safety
-        "in_progress", // execute
-        "pending", // verify
-      ]);
-    }
-  });
-
-  it("rounds every step up to completed on TURN_DONE", () => {
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject" },
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "NODE_STARTED", node: "verifier_loop", phase: "verify" },
-      { type: "TURN_DONE" },
-    ]);
-    const stepper = s.history.find((p) => p.kind === "phase_stepper");
-    expect(stepper).toBeDefined();
-    if (stepper && stepper.kind === "phase_stepper") {
-      // Successful turn: ``in_progress`` and any later ``pending`` are
-      // both rounded up to ``completed``. The pipeline reached its
-      // terminal node by definition. Skipped intermediate steps
-      // (safety / execute were never explicitly fired in this stub
-      // trajectory) also flip to completed under the round-up rule.
-      expect(stepper.steps.every((x) => x.status === "completed")).toBe(true);
-      expect(stepper.steps).toHaveLength(5);
-    }
-  });
-
-  it("marks the active step failed and leaves later pending steps untouched on TURN_ABORTED", () => {
-    // Aborted mid-inject: Esc / network drop / unhandled exception.
-    // The strip must NOT optimistically round everything up — that
-    // contradicts the ResultCard's ``Injection failed`` and hides
-    // *where* the pipeline actually broke.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject cpu" },
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "TURN_ABORTED", reason: "Cancelled by user" },
-    ]);
-    const stepper = s.history.find((p) => p.kind === "phase_stepper");
-    expect(stepper).toBeDefined();
-    if (stepper && stepper.kind === "phase_stepper") {
-      // Honest record: intent completed, agent_loop failed (where
-      // the abort caught us), the rest never ran.
-      expect(stepper.steps.map((x) => [x.phase, x.status])).toEqual([
-        ["intent", "completed"],
-        ["agent_loop", "failed"],
-        ["safety", "pending"],
-        ["execute", "pending"],
-        ["verify", "pending"],
-      ]);
-    }
-  });
-
-  it("flushes thinking/tool_group from pending even while the stepper is active mid-turn", () => {
-    // Regression for the ink-fullscreen-redraw flicker. The stepper
-    // used to live at pending[0]; while it was there, the
-    // leading-stable flush in TOKEN_APPENDED couldn't peel anything
-    // off because the stepper itself is never stable until TURN_DONE.
-    // The fix moves the stepper into ``state.currentPhaseStepper``
-    // so pending starts with stable items that DO flush — keeping
-    // the dynamic-area output height under ``stdout.rows`` and
-    // dodging Ink's fullscreen redraw branch.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject cpu" },
-      // Stepper materialises (lives outside pending now). agent_loop
-      // is the first step that actually creates the strip — Layer-1
-      // ``intent_confirm`` is mapped back to the ``intent`` step and
-      // never materialises on its own.
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      // A thinking session + a tool call land in pending.
-      { type: "THINKING_APPENDED", content: "decomposing…", node: "n" },
-      { type: "TOOL_STARTED", callId: "c1", name: "kubectl", node: "n" },
-      {
-        type: "TOOL_ENDED",
-        callId: "c1",
-        name: "kubectl",
-        status: "success",
-        content: "ok",
-      },
-      // First agent token triggers the leading-stable flush.
-      { type: "TOKEN_APPENDED", content: "Here", node: "n" },
-    ]);
-    // Stepper is still live in its own slot — not flushed yet.
-    expect(s.currentPhaseStepper).not.toBeNull();
-    // Thinking + completed tool_group flushed past it into history.
-    expect(s.history.filter((i) => i.kind === "thinking")).toHaveLength(1);
-    expect(s.history.filter((i) => i.kind === "tool_group")).toHaveLength(1);
-    // Pending is now small (just the streaming agent item) — well
-    // under any plausible stdout.rows, so Ink's fullscreen branch
-    // doesn't trip per frame.
-    expect(s.pending.filter((i) => i.kind === "thinking")).toHaveLength(0);
-    expect(s.pending.filter((i) => i.kind === "tool_group")).toHaveLength(0);
-    expect(s.pending.filter((i) => i.kind === "agent")).toHaveLength(1);
-  });
-
-  it("flushes pending built up across multiple phase transitions on first TOKEN_APPENDED", () => {
-    // Realistic inject-turn shape: tool calls accumulate across
-    // several phases (safety → inject → verify), with NO token text
-    // until the very end. The dedicated ``currentPhaseStepper`` slot
-    // must absorb every phase transition without ever pushing into
-    // pending — so that when the FIRST token finally arrives,
-    // pending starts with a stable item (thinking_0) and the
-    // leading-stable flush peels every accumulated round into
-    // history in one sweep.
-    //
-    // Failure mode this guards against: a future "helpful" change
-    // that re-injects the stepper into pending on phase transition
-    // (e.g. for ordering convenience) would land it at the front,
-    // blocking the flush exactly the way the original bug did and
-    // re-introducing the Ink fullscreen-redraw flicker.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject cpu" },
-      // Step 1: agent_loop — stepper materialises in slot.
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "THINKING_APPENDED", content: "planning…", node: "n" },
-      { type: "TOOL_STARTED", callId: "c1", name: "kubectl", node: "n" },
-      {
-        type: "TOOL_ENDED",
-        callId: "c1",
-        name: "kubectl",
-        status: "success",
-        content: "ok",
-      },
-      // Step 2: safety_check — strip advances to ``safety``.
-      { type: "NODE_STARTED", node: "safety_check", phase: "safety" },
-      { type: "THINKING_APPENDED", content: "checking…", node: "n" },
-      { type: "TOOL_STARTED", callId: "c2", name: "kubectl", node: "n" },
-      {
-        type: "TOOL_ENDED",
-        callId: "c2",
-        name: "kubectl",
-        status: "success",
-        content: "ok",
-      },
-      // Step 3: execute_loop — strip advances to ``execute``.
-      { type: "NODE_STARTED", node: "execute_loop", phase: "inject" },
-      { type: "THINKING_APPENDED", content: "executing…", node: "n" },
-      { type: "TOOL_STARTED", callId: "c3", name: "blade_create", node: "n" },
-      {
-        type: "TOOL_ENDED",
-        callId: "c3",
-        name: "blade_create",
-        status: "success",
-        content: "ok",
-      },
-      // Step 4: verifier_loop — strip advances to ``verify``.
-      { type: "NODE_STARTED", node: "verifier_loop", phase: "verify" },
-      { type: "THINKING_APPENDED", content: "verifying…", node: "n" },
-      { type: "TOOL_STARTED", callId: "c4", name: "kubectl", node: "n" },
-      {
-        type: "TOOL_ENDED",
-        callId: "c4",
-        name: "kubectl",
-        status: "success",
-        content: "ok",
-      },
-      // First token arrives — should drain everything stable from
-      // pending in a single leading-stable sweep.
-      { type: "TOKEN_APPENDED", content: "All done.", node: "n" },
-    ]);
-    // Strip remained in its slot through every transition; index 4
-    // in INJECT_PHASE_ORDER ([intent, agent_loop, safety, execute,
-    // verify]) is the ``verify`` step.
-    expect(s.currentPhaseStepper).not.toBeNull();
-    expect(s.currentPhaseStepper?.steps[4]?.status).toBe("in_progress");
-    // All four thinking sessions + all four tool_groups peeled out
-    // of pending and into history on that first flush.
-    expect(s.history.filter((i) => i.kind === "thinking")).toHaveLength(4);
-    expect(s.history.filter((i) => i.kind === "tool_group")).toHaveLength(4);
-    // Pending shrunk down to just the trailing streamed agent
-    // block; no stable item left behind, no phase_stepper either.
-    expect(s.pending.filter((i) => i.kind === "thinking")).toHaveLength(0);
-    expect(s.pending.filter((i) => i.kind === "tool_group")).toHaveLength(0);
-    expect(s.pending.filter((i) => i.kind === "phase_stepper")).toHaveLength(0);
-    expect(s.pending.filter((i) => i.kind === "agent")).toHaveLength(1);
-  });
-
-  it("does not move pending into history on phase transition alone", () => {
-    // NODE_STARTED is purely a stepper-slot mutation — it must NEVER
-    // itself trigger the leading-stable flush. The flush triggers
-    // changed over time; today they are TOKEN_APPENDED, TOOL_STARTED,
-    // and TOOL_ENDED. NODE_STARTED is verified by the dispatch order
-    // below: the TOOL_ENDED at index 5 has already flushed everything,
-    // so the two NODE_STARTED actions that follow operate on an empty
-    // pending and produce no further flushes — exactly the invariant.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject cpu" },
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "THINKING_APPENDED", content: "thinking", node: "n" },
-      { type: "TOOL_STARTED", callId: "c1", name: "kubectl", node: "n" },
-      {
-        type: "TOOL_ENDED",
-        callId: "c1",
-        name: "kubectl",
-        status: "success",
-        content: "ok",
-      },
-      // After TOOL_ENDED's flush: history has [user, Thinking, ToolGroup].
-      // Two step transitions follow — pending stays empty, history
-      // unchanged.
-      { type: "NODE_STARTED", node: "execute_loop", phase: "inject" },
-      { type: "NODE_STARTED", node: "verifier_loop", phase: "verify" },
-    ]);
-    // Strip rolled forward to verify (index 4 in the 5-step layout).
-    expect(s.currentPhaseStepper?.steps[4]?.status).toBe("in_progress");
-    // Stable items already flushed by TOOL_ENDED — pending empty.
-    expect(s.pending).toHaveLength(0);
-    // History has the flushed pair plus the user echo.
-    expect(s.history.filter((i) => i.kind === "thinking")).toHaveLength(1);
-    expect(s.history.filter((i) => i.kind === "tool_group")).toHaveLength(1);
-  });
-
-  it("appends the finalised stepper as the LAST item of the turn block at TURN_DONE", () => {
-    // Placement invariant: stepper lands AFTER tool/thinking/agent
-    // items (which already flushed mid-turn via the leading-stable
-    // path) AND AFTER the optional ``turn_usage`` summary — i.e.
-    // the strip is the last item before the next prompt. The
-    // user-facing rule: "the todo strip is always glued to the
-    // input box". An older revision sandwiched the token tally
-    // between the strip and the input, which read as "the strip
-    // belongs to the previous turn". Strict
-    // chronological ordering (stepper right after user echo) is
-    // unattainable with Ink's append-only Static — the
-    // leading-stable flush has already deposited downstream items
-    // into history before commitPending sees the stepper.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject cpu" },
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "TOOL_STARTED", callId: "c1", name: "kubectl", node: "n" },
-      {
-        type: "TOOL_ENDED",
-        callId: "c1",
-        name: "kubectl",
-        status: "success",
-        content: "ok",
-      },
-      { type: "TOKEN_APPENDED", content: "Done.", node: "n" },
-      { type: "USAGE_RECEIVED", inputTokens: 100, outputTokens: 50 },
-      { type: "TURN_DONE" },
-    ]);
-    const userIdx = s.history.findIndex((i) => i.kind === "user");
-    const toolIdx = s.history.findIndex((i) => i.kind === "tool_group");
-    const agentIdx = s.history.findIndex((i) => i.kind === "agent");
-    const stepperIdx = s.history.findIndex((i) => i.kind === "phase_stepper");
-    const usageIdx = s.history.findIndex((i) => i.kind === "turn_usage");
-    expect(userIdx).toBeGreaterThanOrEqual(0);
-    expect(toolIdx).toBeGreaterThan(userIdx);
-    expect(agentIdx).toBeGreaterThan(toolIdx);
-    // Token tally is BEFORE the stepper now — the stepper is the
-    // last row, sitting directly above the InputPrompt.
-    expect(usageIdx).toBeGreaterThan(agentIdx);
-    expect(stepperIdx).toBeGreaterThan(usageIdx);
-    // Stepper is the very last entry of the turn block (no other
-    // items appear after it; agent-loop / tool / usage all precede
-    // it, and the next user echo opens a fresh turn).
-    expect(stepperIdx).toBe(s.history.length - 1);
-    // Slot cleared after commit.
-    expect(s.currentPhaseStepper).toBeNull();
-  });
-
-  it("preserves a clean prefix on TURN_ABORTED when no step is active", () => {
-    // Edge case: turn aborts BEFORE any non-intent phase fires (user
-    // hits Esc during the very first kubectl call). The stepper never
-    // materialises in the first place, so the failed-finalise path
-    // doesn't run — verify the assertion holds.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject" },
-      { type: "NODE_STARTED", node: "intent_clarification", phase: "intent" },
-      { type: "TURN_ABORTED", reason: "Cancelled" },
-    ]);
-    expect(s.history.find((p) => p.kind === "phase_stepper")).toBeUndefined();
-  });
-
-  it("marks active step failed on TURN_DONE when user rejected at a confirm card", () => {
-    // Regression: when the user clicks "reject" on Layer-2
-    // ``confirmation_gate``, the server graph routes through the
-    // ``reject`` node to END — which the TS side observes as a
-    // *clean* ``done`` event → TURN_DONE. Before this fix, the
-    // stepper finalised with ``failed=false`` and rounded EVERY
-    // step up to ``completed``, painting a misleading "all green
-    // ✓" strip even though execute / verify never ran. Users
-    // (correctly) complained: "我拒绝了为什么 todos 还是全勾".
-    //
-    // Tracking the rejection in ``state.currentTurnRejected`` and
-    // OR-ing it into the ``failed`` flag passed to
-    // ``finalisePhaseStepper`` produces the honest scrollback:
-    // ``[✓ ✓ ✗ ○ ○]`` — intent + agent_loop completed, safety
-    // marked failed (where the user said no), execute + verify
-    // stay pending (they truly never ran).
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject cpu" },
-      // Layer-1 approved.
-      { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
-      { type: "NODE_STARTED", node: "safety_check", phase: "safety" },
-      // Layer-2 confirm card displayed.
-      {
-        type: "CONFIRM_RECEIVED",
-        content: "Confirm execution plan",
-        node: "confirmation_gate",
-      },
-      // User rejects Layer 2.
-      {
-        type: "CONFIRM_USER_DECIDED",
-        taskId: "task-x",
-        answer: "rejected",
-      },
-      { type: "CONFIRM_RESOLVED", taskId: "task-x", answer: "rejected" },
-      // Server's reject → END → ``done`` event → TURN_DONE.
-      { type: "TURN_DONE" },
-    ]);
-    const stepper = s.history.find((p) => p.kind === "phase_stepper");
-    expect(stepper).toBeDefined();
-    if (stepper && stepper.kind === "phase_stepper") {
-      expect(stepper.steps.map((x) => [x.phase, x.status])).toEqual([
-        ["intent", "completed"],
-        ["agent_loop", "completed"],
-        ["safety", "failed"],
-        ["execute", "pending"],
-        ["verify", "pending"],
-      ]);
-    }
-  });
-
-  it("does NOT mark stepper failed when user approved every confirm card", () => {
+describe("reducer / currentTurnRejected", () => {
+  it("does NOT mark failed when user approved every confirm card", () => {
     // Sanity counter-test: ``currentTurnRejected`` MUST flip back
     // to false on a subsequent ``approved`` decision so an
-    // approved-then-approved sequence ends clean. Without the
-    // latest-decision-wins semantics a Layer-1 reject followed by
-    // a Layer-2 approve would erroneously paint the stepper as
-    // failed.
+    // approved-then-approved sequence ends clean.
     const s = fold([
       { type: "TURN_STARTED", input: "inject" },
       { type: "NODE_STARTED", node: "agent_loop", phase: "inject" },
@@ -1453,21 +1025,6 @@ describe("reducer / PhaseStepper", () => {
       { type: "TURN_STARTED", input: "another inject" },
     ]);
     expect(s.currentTurnRejected).toBe(false);
-  });
-
-  it("ignores unknown phase strings", () => {
-    // Older servers / future custom events may emit phases the TS
-    // side doesn't model. We must not crash or pollute pending with
-    // an unknown stepper.
-    const s = fold([
-      { type: "TURN_STARTED", input: "inject" },
-      // ``phase`` typing is intentionally ``string`` on the action so
-      // legacy servers / new custom events compile without forcing a
-      // schema bump; the reducer's ``isKnownPhase`` guard rejects
-      // strings outside PHASE_ORDER at runtime.
-      { type: "NODE_STARTED", node: "future_node", phase: "exotic" },
-    ]);
-    expect(s.pending.find((p) => p.kind === "phase_stepper")).toBeUndefined();
   });
 });
 

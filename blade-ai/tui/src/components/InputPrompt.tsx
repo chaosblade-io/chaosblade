@@ -287,8 +287,12 @@ export const InputPrompt: React.FC<Props> = ({
       // When ``enterLocked``, Composer's parallel useInput owns
       // these keys (cancel the running turn). Returning early here
       // prevents the local cascade from also clearing the buffer
-      // or — far worse — calling ``onExit`` on an empty buffer
-      // (which would close the app mid-turn).
+      // mid-turn.
+      //
+      // Esc cascade: close slash menu → clear text → no-op.
+      // Intentionally NOT calling onExit() on an empty buffer —
+      // too easy to误触 and accidentally close the app. Use
+      // ``/exit`` or ``Ctrl+D`` to quit.
       if (key.escape || (key.ctrl && input === "c")) {
         if (enterLocked) return;
         if (slash.active) {
@@ -297,8 +301,6 @@ export const InputPrompt: React.FC<Props> = ({
         } else if (value.length > 0) {
           replaceValue("");
           history.reset();
-        } else {
-          onExit();
         }
         return;
       }

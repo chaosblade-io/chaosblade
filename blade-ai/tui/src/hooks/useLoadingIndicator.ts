@@ -95,20 +95,24 @@ export interface LoadingIndicatorProps {
 
 export function useLoadingIndicator(): LoadingIndicatorProps {
   const streamState = useAppSelector((s) => s.streamState);
-  // 2026-05-26 perf — was ``s.thoughtBuffer`` (changes per token,
-  // 10-20Hz under streaming, forcing this hook + LoadingIndicator
-  // to re-render at every chunk). Switched to ``s.hasActiveThinking``
-  // (edge-triggered boolean — only changes on the 0→N / N→0
-  // session-boundary transitions). The LoadingIndicator only needs
-  // to know IF thinking is happening to swap the header label —
-  // not WHAT, since thinking content isn't displayed in the spinner
-  // row (only in the eventual "▸ Thought for Ns" collapse).
-  const hasActiveThinking = useAppSelector((s) => s.hasActiveThinking);
-  const thoughtSubject = useAppSelector((s) => s.thoughtSubject);
-  const isReceiving = useAppSelector((s) => s.isReceiving);
   const turnStartedAt = useAppSelector((s) => s.turnStartedAt);
-  const idlePhrase = useAppSelector((s) => s.idlePhrase);
   const { columns } = useTerminalSize();
+
+  // Combined headerLabel selector — returns the SAME string value
+  // when the label branch hasn't changed, even if underlying slices
+  // (e.g. ``idlePhrase``) were updated by PHRASE_TICK. This is
+  // critical because ``useAppSelector`` uses ``Object.is`` to decide
+  // whether to re-render: when ``hasActiveThinking`` is true the
+  // selector always returns ``t("loading.thinking_label")``
+  // ("思考中"), so a PHRASE_TICK that changes ``idlePhrase`` does
+  // NOT trigger a re-render here. Previously three separate
+  // ``useAppSelector`` calls (``hasActiveThinking``,
+  // ``thoughtSubject``, ``idlePhrase``) each triggered re-renders
+  // independently — ``idlePhrase`` changing every 8s caused a full
+  // LoadingIndicator re-render (→ Ink dynamic-frame repaint →
+  // pending area erased + rewritten) even while the label was
+  // firmly in the "思考中" branch and the visible text didn't
+  // change at all.
 
   const isStreaming =
     streamState === "responding" || streamState === "waiting_confirmation";
@@ -143,16 +147,26 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
 
   // Phase 2.2 — smooth animated token counter. The hook polls the
   // module-level char counter (written per-token in ``useStream``
-  // with zero React work) at 100ms while visible and tweens the
+  // with zero React work) at 200ms while visible and tweens the
   // displayed value upward so the counter feels alive even when
   // raw token arrivals are bursty. Polling pauses (``null`` interval)
   // when the indicator is hidden so we don't burn intervals during
   // ``waiting_confirmation`` / idle. The /4 divisor is the standard
   // chars→tokens rough conversion; for the after-the-fact exact
   // figure the committed TurnUsageItem uses server ``usage`` events.
+  //
+  // 2026-07 perf — was 100ms (10Hz). Each ``setDisplay`` call here
+  // causes LoadingIndicator to re-render, which in Ink causes the
+  // ENTIRE dynamic frame to be erased + rewritten (including the
+  // pending area). At 10Hz this added 10 extra repaints/s on top of
+  // the 16.7Hz TOKEN_APPENDED dispatch rate and the 12.5Hz InkSpinner
+  // animation — totalling ~39Hz of dynamic-frame repaints, which the
+  // user perceived as "shimmer when the label changes". Dropping to
+  // 200ms (5Hz) halves the extra repaints while still feeling smooth
+  // for a numeric counter.
   const animatedChars = useAnimationFrame(
     streamingResponseCharsRef,
-    visible ? 100 : null,
+    visible ? 200 : null,
   );
   const turnTokens = Math.round(animatedChars / 4);
 
@@ -176,34 +190,21 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
     return () => clearInterval(id);
   }, [visible, turnStartedAt]);
 
-  // Header label resolution order:
-  //   1. live thinking session   → localized "thinking"
-  //   2. thoughtSubject set      → use it directly (tool name set by
-  //      TOOL_STARTED, "resuming…"/"stopping…" set by
-  //      CONFIRM_RESOLVED, "replaying ..." set by REPLAY_STARTED).
-  //      This keeps the header informative during tool execution
-  //      and confirm-gate transitions — a regression we'd otherwise
-  //      ship by collapsing every non-thinking phase to a generic
-  //      cycling phrase.
-  //   3. else                    → ``idlePhrase`` from state, ticked
-  //      by Composer's PHRASE_TICK driver every 8s so a long agent
-  //      reply / long-running node still has rotating header text
-  //      (the static "responding" branch the previous design carried
-  //      gave the user no liveness signal during such windows).
+  // Header label resolution order (same priority as before, now
+  // computed inside a single ``useAppSelector`` so that ``Object.is``
+  // comparison prevents re-renders when the label value hasn't
+  // changed even though underlying state slices did):
+  //   1. live thinking session   → localized "思考中"
+  //   2. thoughtSubject set      → use directly (tool name, etc.)
+  //   3. else                    → ``idlePhrase`` (PHRASE_TICK cycler)
   //
   // Pool fallback: if the cycler hasn't ticked yet (``idlePhrase ===
-  // ""`` — e.g. fresh ``waiting_confirmation`` -> ``responding``
-  // transition before the first interval boundary), use the first
-  // pool entry so the header is never blank.
-  const fallbackPhrase = idlePhrase || getPool()[0] || "thinking";
-  let headerLabel: string;
-  if (hasActiveThinking) {
-    headerLabel = t("loading.thinking_label");
-  } else if (thoughtSubject) {
-    headerLabel = thoughtSubject;
-  } else {
-    headerLabel = fallbackPhrase;
-  }
+  // ""``), use the first pool entry so the header is never blank.
+  const headerLabel = useAppSelector((s) => {
+    if (s.hasActiveThinking) return t("loading.thinking_label");
+    if (s.thoughtSubject) return s.thoughtSubject;
+    return s.idlePhrase || getPool()[0] || "thinking";
+  });
 
   const narrow = isNarrow(columns);
 
@@ -211,7 +212,11 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
     visible,
     headerLabel,
     elapsedSec,
-    isReceiving,
+    // ``isReceiving`` is no longer subscribed — it was returned but
+    // never consumed by LoadingIndicator. Keeping it in the interface
+    // for API stability; always ``false`` is safe because no caller
+    // reads this field.
+    isReceiving: false,
     isStreaming,
     turnTokens,
     narrow,

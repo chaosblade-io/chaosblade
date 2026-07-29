@@ -282,6 +282,17 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
         }
         if (cancelledRef.current) return;
 
+        // Seed the runtime permission mode from the persisted
+        // ``confirmation_required`` config (false → auto, true → confirm) so
+        // the welcome card + first turn honour config.json instead of always
+        // booting into ``confirm``. Shift+Tab / /permission still toggle it.
+        // Undefined (older server) falls back to ``confirm`` — safety-first.
+        const bootMode =
+          sessionState["confirmation_required"] === false ? "auto" : "confirm";
+        if (bootMode !== permissionMode) {
+          dispatch({ type: "MODE_TOGGLED", mode: bootMode });
+        }
+
         // -- Phase 4: dispatch session + welcome card -------------
         const namespace = asString(sessionState["namespace"]) || "default";
         dispatch({
@@ -298,7 +309,7 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
           kind: "welcome_card",
           id: "boot-welcome",
           modelName: asString(sessionState["model_name"]),
-          permissionMode,
+          permissionMode: bootMode,
           kubeconfig: asString(sessionState["kubeconfig"]),
           namespace,
           version,

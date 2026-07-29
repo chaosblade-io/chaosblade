@@ -34,6 +34,24 @@ describe("findLastSafeSplitPoint / paragraph boundaries", () => {
     const text = "All one paragraph, no breaks yet";
     expect(findLastSafeSplitPoint(text)).toBe(text.length);
   });
+
+  it("skips a trailing \\n\\n and splits at the earlier boundary", () => {
+    // LLM emits \n\n as a paragraph terminator, so every token
+    // batch ends with \n\n. Without the trailing-skip fix the
+    // split point would be content.length (empty tail), canSplit
+    // would be false, and the full text would accumulate in pending.
+    const text = "Para one.\n\nPara two.\n\n";
+    const point = findLastSafeSplitPoint(text);
+    expect(text.slice(0, point)).toBe("Para one.\n\n");
+    expect(text.slice(point)).toBe("Para two.\n\n");
+  });
+
+  it("returns content.length when the only \\n\\n is at the end", () => {
+    // Single paragraph terminated by \n\n — no earlier boundary
+    // to fall back to, so no split this round.
+    const text = "Single paragraph.\n\n";
+    expect(findLastSafeSplitPoint(text)).toBe(text.length);
+  });
 });
 
 describe("findLastSafeSplitPoint / code blocks", () => {
