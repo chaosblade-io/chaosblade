@@ -15,566 +15,568 @@ fault_types:
   - pod-oom
   - node-cpu-stress
   - node-network-delay
-summary: "K8s architecture and chaos engineering context: Pod lifecycle, health checks, resource model, networking, fault propagation paths, verification layer overview. Terminology dictionary included."
+summary: "K8s architecture and chaos engineering context: Pod lifecycle, health checks, resource model, networking, fault propagation paths, verification layer overview. Resource abbreviation table included."
 ---
 
-# Kubernetes 基础知识问答（故障演练专用）
+# Kubernetes Fundamentals Q&A (for fault drills)
 
-本文件以问答形式梳理 Kubernetes 核心概念，帮助故障演练 Agent 理解 K8s 资源模型、状态语义和故障传播机制，从而设计出更精准的注入方案和验证方案。
-
----
-
-## 一、核心资源与架构
-
-### Q1: Kubernetes 的基本架构是什么样的？控制平面和工作节点各自负责什么？
-
-**A1**: Kubernetes 采用主从（Master-Worker）架构：
-
-- **控制平面（Control Plane）**：负责集群的全局决策和状态管理，包含：
-  - **kube-apiserver**：所有组件通信的唯一入口，暴露 REST API
-  - **etcd**：分布式键值存储，保存集群所有状态数据
-  - **kube-scheduler**：负责将新 Pod 调度到合适的 Node
-  - **kube-controller-manager**：运行各种控制器（Deployment Controller、Node Controller、Endpoint Controller 等），维持期望状态
-  - **cloud-controller-manager**（可选）：对接云厂商 API
-
-- **工作节点（Worker Node）**：运行实际负载，包含：
-  - **kubelet**：接收 apiserver 指令，管理本节点 Pod 生命周期
-  - **kube-proxy**：维护节点上的网络规则，实现 Service 负载均衡
-  - **容器运行时（containerd/CRI-O）**：真正运行容器
-
-**故障演练意义**：
-- 控制平面组件（尤其是 etcd、kube-apiserver）是集群的"大脑"，**严禁对其注入故障**（安全红线 — 详见 chaos-engineering-principles Q9.1）。
-- Node 级故障本质上影响的是该节点上的 kubelet 和容器运行时，进而影响该节点上的所有 Pod。
-- Pod 状态变化由 kubelet 上报给 apiserver，存在一定的上报延迟（通常几秒）。
+This document walks through core Kubernetes concepts in Q&A form, to help the fault-drill Agent understand the K8s resource model, state semantics and fault-propagation mechanics — and therefore design more precise injection and verification plans.
 
 ---
 
-### Q2: 什么是 Pod？为什么 Pod 是 Kubernetes 的最小调度单位？
+## 1. Core resources and architecture
 
-**A2**: Pod 是 Kubernetes 中最小的可部署单元，封装了一个或多个容器（通常是一个主容器 + 若干 sidecar 容器）。
+### Q1: What does the basic Kubernetes architecture look like? What are the control plane and worker nodes each responsible for?
 
-Pod 的核心特征：
-- **共享网络命名空间**：同一个 Pod 内的所有容器共享 IP 地址和端口空间，通过 `localhost` 互相通信
-- **共享存储卷（Volumes）**：Pod 内的容器可以挂载同一个 Volume 实现文件共享
-- **生命周期由 Pod 管理**：容器可以重启，但 Pod 的 IP 通常在重建后改变（除非使用 StatefulSet）
-- **一次性调度**：Pod 被调度到某个 Node 后不会自动迁移到其他 Node（除非被删除重建）
+**A1**: Kubernetes uses a master-worker architecture:
 
-**故障演练意义**：
-- 注入 Pod 级故障时，故障影响范围被限制在该 Pod 内部（网络、磁盘、CPU、内存）
-- 如果 Pod 被删除或崩溃，其所属的 Deployment/ReplicaSet 会根据 `spec.replicas` 自动创建新 Pod 来替代
-- 多容器 Pod 中，需要确认故障注入到正确的容器（ChaosBlade 的 `--container-names` 参数）
+- **Control plane**: responsible for cluster-wide decisions and state management. It contains:
+  - **kube-apiserver**: the single entry point for all component communication; exposes the REST API
+  - **etcd**: distributed key-value store holding all cluster state
+  - **kube-scheduler**: assigns new Pods to suitable Nodes
+  - **kube-controller-manager**: runs the various controllers (Deployment Controller, Node Controller, Endpoint Controller, ...) that drive actual state toward desired state
+  - **cloud-controller-manager** (optional): integrates with the cloud provider's API
+
+- **Worker node**: runs the actual workloads. It contains:
+  - **kubelet**: takes instructions from the apiserver and manages the Pod lifecycle on its node
+  - **kube-proxy**: maintains the node's network rules, implementing Service load balancing
+  - **container runtime (containerd/CRI-O)**: actually runs the containers
+
+**Relevance to fault drills**:
+- Control-plane components (especially etcd and kube-apiserver) are the cluster's "brain"; **injecting faults into them is strictly forbidden** (safety red line — see chaos-engineering-principles Q9.1).
+- A node-level fault fundamentally affects that node's kubelet and container runtime, and through them every Pod on that node.
+- Pod state changes are reported by kubelet to the apiserver, so there is a reporting delay (usually a few seconds).
 
 ---
 
-### Q3: Deployment、ReplicaSet、Pod 三者之间的关系是什么？
+### Q2: What is a Pod, and why is the Pod the smallest schedulable unit in Kubernetes?
 
-**A3**: 三者是层级控制关系：
+**A2**: A Pod is the smallest deployable unit in Kubernetes, wrapping one or more containers (typically one main container plus some sidecars).
+
+A Pod's core characteristics:
+- **Shared network namespace**: every container in the same Pod shares the IP address and port space, and they talk to each other over `localhost`
+- **Shared volumes**: containers in a Pod can mount the same Volume to share files
+- **Lifecycle managed by the Pod**: containers can restart, but a Pod's IP usually changes after recreation (unless a StatefulSet is used)
+- **Scheduled once**: after a Pod is scheduled onto a Node it is never migrated to another Node automatically (only by being deleted and recreated)
+
+**Relevance to fault drills**:
+- When injecting a Pod-level fault, the blast radius is confined inside that Pod (network, disk, CPU, memory)
+- If a Pod is deleted or crashes, its owning Deployment/ReplicaSet automatically creates a replacement according to `spec.replicas`
+- In a multi-container Pod you must confirm the fault is injected into the right container (ChaosBlade's `--container-names` flag)
+
+---
+
+### Q3: What is the relationship between Deployment, ReplicaSet and Pod?
+
+**A3**: The three form a hierarchy of control:
 
 ```
-Deployment (期望状态: replicas=3, image=nginx:v2)
-    └── ReplicaSet (由 Deployment 创建和管理，维护 3 个 Pod 副本)
+Deployment (desired state: replicas=3, image=nginx:v2)
+    └── ReplicaSet (created and managed by the Deployment; maintains 3 Pod replicas)
             ├── Pod-1
             ├── Pod-2
             └── Pod-3
 ```
 
-- **Deployment**：用户直接操作的资源，定义了应用的期望状态（镜像版本、副本数、更新策略）。它通过管理 ReplicaSet 来实现滚动更新和回滚。
-- **ReplicaSet**：确保指定数量的 Pod 副本始终运行。当 Pod 被删除或节点故障导致 Pod 丢失时，ReplicaSet 会自动创建新 Pod。
-- **Pod**：实际运行容器的载体。
+- **Deployment**: the resource the user operates on directly; it declares the application's desired state (image version, replica count, update strategy). It achieves rolling updates and rollbacks by managing ReplicaSets.
+- **ReplicaSet**: guarantees that the specified number of Pod replicas is always running. When a Pod is deleted, or a node failure loses a Pod, the ReplicaSet creates a new one automatically.
+- **Pod**: the carrier that actually runs containers.
 
-**故障演练意义**：
-- 删除一个 Pod 不会导致服务不可用，因为 ReplicaSet 会立即创建新 Pod（除非同时设置了 `terminationGracePeriod=0` 和强制删除）
-- 验证 Pod 删除故障时，应观察 Deployment 的 `availableReplicas` 是否短暂下降后恢复
-- 如果注入导致 Pod 持续 CrashLoopBackOff，ReplicaSet 会不断尝试重建 Pod，但 Deployment 的 `readyReplicas` 会持续低于 `replicas`
+**Relevance to fault drills**:
+- Deleting one Pod does not make the service unavailable, because the ReplicaSet immediately creates a new Pod (unless `terminationGracePeriod=0` plus a force delete are used together)
+- When verifying a Pod-deletion fault, watch whether the Deployment's `availableReplicas` dips briefly and then recovers
+- If the injection drives a Pod into persistent CrashLoopBackOff, the ReplicaSet keeps trying to rebuild it, but the Deployment's `readyReplicas` stays below `replicas`
 
 ---
 
-### Q4: StatefulSet 和 Deployment 有什么区别？为什么 StatefulSet 的故障演练需要更谨慎？
+### Q4: How do StatefulSet and Deployment differ, and why do StatefulSet fault drills need more caution?
 
-**A4**: StatefulSet 用于管理有状态应用（如数据库、消息队列），与 Deployment 的关键区别：
+**A4**: StatefulSet manages stateful applications (databases, message queues). The key differences from Deployment:
 
-| 特性 | Deployment | StatefulSet |
+| Aspect | Deployment | StatefulSet |
 |------|-----------|-------------|
-| Pod 命名 | 随机哈希后缀 | 有序序号（如 web-0, web-1, web-2） |
-| 网络身份 | 每次重建 IP 变化 | 通过 Headless Service 保持稳定的网络标识 |
-| 存储 | 通常使用临时存储或共享存储 | 每个 Pod 绑定独立的 PVC，Pod 重建后重新挂载原 PVC |
-| 创建/删除顺序 | 并行 | 严格有序（创建按 0→N，删除按 N→0） |
-| 扩缩容 | 并行 | 按序号逐个进行 |
+| Pod naming | random hash suffix | ordered index (e.g. web-0, web-1, web-2) |
+| Network identity | IP changes on every recreation | stable network identity via a Headless Service |
+| Storage | usually ephemeral or shared storage | each Pod is bound to its own PVC and remounts the original PVC after recreation |
+| Create/delete order | parallel | strictly ordered (create 0→N, delete N→0) |
+| Scaling | parallel | one ordinal at a time |
 
-**故障演练意义**：
-- StatefulSet 的 PVC 在 Pod 删除后不会删除，数据会保留。但如果故障注入导致数据损坏，恢复后可能影响数据一致性。
-- **安全红线**："无备份不对 StatefulSet 做破坏性实验" — 详见 chaos-engineering-principles Q9.2
-- StatefulSet Pod 重建后仍挂载原 PVC，所以磁盘填充类故障在恢复后，如果填充的文件未被清理，问题可能持续存在。
-
----
-
-### Q5: DaemonSet 的作用是什么？它的故障特点是什么？
-
-**A5**: DaemonSet 确保集群中每个（或指定的一批）Node 上都运行一个 Pod 副本。典型用途：日志收集（Fluentd/Fluent Bit）、监控采集（Prometheus Node Exporter）、网络代理（Calico、Cilium）。
-
-**故障演练意义**：
-- DaemonSet 的调度逻辑与 Deployment 不同：它按节点调度，而不是按副本数调度
-- 验证 DaemonSet 故障时，应检查 `status.desiredNumberScheduled` 是否等于 `status.numberReady`
-- 如果某 Node 上的 DaemonSet Pod 故障，该节点会失去日志采集或监控能力，但业务 Pod 通常不受影响（除非网络类 DaemonSet）
-- DaemonSet Pod 通常需要特殊权限（hostNetwork、hostPath），注入时需确认安全边界
+**Relevance to fault drills**:
+- A StatefulSet's PVC is not deleted when the Pod is, so data is retained. But if the injection corrupts data, consistency may be affected even after recovery.
+- **Safety red line**: "no destructive experiments on a StatefulSet without a backup" — see chaos-engineering-principles Q9.2
+- A StatefulSet Pod remounts its original PVC after recreation, so for disk-filling faults, if the filler files were not cleaned up, the problem can persist past recovery.
 
 ---
 
-### Q6: Service 和 Endpoints 是如何工作的？负载均衡异常通常发生在哪里？
+### Q5: What is a DaemonSet for, and what are its fault characteristics?
 
-**A6**: Service 是 Kubernetes 的抽象层，为一组 Pod 提供统一的访问入口：
+**A5**: A DaemonSet ensures one Pod replica runs on every Node (or on a specified subset). Typical uses: log collection (Fluentd/Fluent Bit), monitoring agents (Prometheus Node Exporter), network agents (Calico, Cilium).
 
-- **Service**：定义了访问策略（ClusterIP、NodePort、LoadBalancer、ExternalName）和选择器（selector）
-- **Endpoints**：由 Endpoint Controller 自动维护，包含了所有匹配 Service selector 且处于 Ready 状态的 Pod 的 IP:Port 列表
-- **kube-proxy**：在每个 Node 上监听 Endpoints 变化，更新 iptables/IPVS 规则，实现流量转发
-
-**故障演练意义**：
-- Service 负载均衡异常通常表现为：Endpoints 的 `addresses` 列表为空或缺少某些 Pod IP
-- 造成 Endpoints 为空的原因：
-  1. Pod 未通过 Readiness Probe（`ready=False`）
-  2. Pod 标签与 Service selector 不匹配
-  3. Pod 被删除或处于 Terminating 状态
-  4. 网络故障导致 Pod IP 不可达
-- 验证负载均衡异常时，应同时检查 `kubectl get svc`（selector 是否正确）、`kubectl get endpoints`（后端列表）、`kubectl get pods -l <selector>`（Pod 状态）
+**Relevance to fault drills**:
+- A DaemonSet's scheduling logic differs from a Deployment's: it schedules per node, not per replica count
+- When verifying a DaemonSet fault, check whether `status.desiredNumberScheduled` equals `status.numberReady`
+- If the DaemonSet Pod on some Node fails, that node loses log collection or monitoring, but business Pods are usually unaffected (unless it is a networking DaemonSet)
+- DaemonSet Pods usually need special privileges (hostNetwork, hostPath), so confirm the safety boundary before injecting
 
 ---
 
-### Q7: HPA（Horizontal Pod Autoscaler）的工作原理是什么？如何验证 HPA 达到上限？
+### Q6: How do Service and Endpoints work, and where do load-balancing anomalies usually occur?
 
-**A7**: HPA 根据指标自动调整 Deployment/StatefulSet 的副本数：
+**A6**: Service is Kubernetes's abstraction layer providing a single access point for a group of Pods:
+
+- **Service**: defines the access policy (ClusterIP, NodePort, LoadBalancer, ExternalName) and the selector
+- **Endpoints**: maintained automatically by the Endpoint Controller; contains the IP:Port list of every Pod that matches the Service selector AND is Ready
+- **kube-proxy**: watches Endpoints changes on every Node and updates iptables/IPVS rules to forward traffic
+
+**Relevance to fault drills**:
+- A Service load-balancing anomaly usually shows up as: the Endpoints `addresses` list is empty or missing some Pod IPs
+- Reasons Endpoints can be empty:
+  1. The Pod fails its Readiness Probe (`ready=False`)
+  2. The Pod's labels do not match the Service selector
+  3. The Pod was deleted or is Terminating
+  4. A network fault makes the Pod IP unreachable
+- When verifying a load-balancing anomaly, check all of `kubectl get svc` (is the selector right), `kubectl get endpoints` (the backend list) and `kubectl get pods -l <selector>` (Pod state)
+
+---
+
+### Q7: How does HPA (Horizontal Pod Autoscaler) work, and how do you verify that HPA hit its ceiling?
+
+**A7**: HPA adjusts a Deployment's/StatefulSet's replica count automatically based on metrics:
 
 ```
-metrics-server 采集指标 → HPA Controller 计算期望副本数 → 修改 Deployment replicas
+metrics-server collects metrics → HPA Controller computes the desired replica count → updates Deployment replicas
 ```
 
-HPA 支持五种指标类型（`autoscaling/v2` API）：
+HPA supports five metric types (`autoscaling/v2` API):
 
-| 类型 | 数据来源 API 组 | 说明 | 数据提供者 |
+| Type | Source API group | Description | Data provider |
 |------|----------------|------|-----------|
-| **Resource** | metrics.k8s.io | Pod 的 CPU/Memory 利用率 | metrics-server |
-| **ContainerResource** | metrics.k8s.io | 特定容器的资源指标（v1.30 stable） | metrics-server |
-| **Pods** | custom.metrics.k8s.io | 每个 Pod 的自定义指标平均值 | Prometheus Adapter 等 |
-| **Object** | custom.metrics.k8s.io | 描述其他 K8s 对象的指标 | Prometheus Adapter 等 |
-| **External** | external.metrics.k8s.io | 与 K8s 无关的外部指标（如消息队列长度） | Prometheus Adapter 等 |
+| **Resource** | metrics.k8s.io | Pod CPU/Memory utilisation | metrics-server |
+| **ContainerResource** | metrics.k8s.io | resource metrics for a specific container (stable in v1.30) | metrics-server |
+| **Pods** | custom.metrics.k8s.io | average of a custom metric across Pods | Prometheus Adapter, etc. |
+| **Object** | custom.metrics.k8s.io | a metric describing some other K8s object | Prometheus Adapter, etc. |
+| **External** | external.metrics.k8s.io | external metrics unrelated to K8s (e.g. queue depth) | Prometheus Adapter, etc. |
 
-> 故障演练中最常见的是 Resource 类型的 CPU/Memory 指标（由 metrics-server 提供）。但如果集群部署了 Prometheus Adapter，HPA 也可能基于自定义指标（如 QPS、延迟）触发扩缩容。
+> In fault drills the Resource type (CPU/Memory, provided by metrics-server) is by far the most common. But if the cluster runs Prometheus Adapter, HPA may also scale on custom metrics such as QPS or latency.
 
-HPA 的关键字段：
-- `spec.minReplicas` / `spec.maxReplicas`：副本数上下限
-- `spec.metrics`：触发扩缩容的指标（Resource CPU/Memory、Pods、Object、External）
-- `status.currentReplicas`：当前副本数
-- `status.desiredReplicas`：期望副本数
+HPA's key fields:
+- `spec.minReplicas` / `spec.maxReplicas`: replica-count floor and ceiling
+- `spec.metrics`: the metrics that trigger scaling (Resource CPU/Memory, Pods, Object, External)
+- `status.currentReplicas`: current replica count
+- `status.desiredReplicas`: desired replica count
 
-**故障演练意义**：
-- 注入 CPU 满载故障后，如果 HPA 已配置，Pod CPU 升高会触发 HPA 扩容
-- 当 `currentReplicas == maxReplicas` 且 CPU 仍然超过阈值时，表示 HPA 已达上限，无法继续扩容
-- 验证 HPA 上限故障时：
-  1. `kubectl get hpa -o json` 确认 `currentReplicas == spec.maxReplicas`
-  2. `kubectl top pod` 确认 CPU 仍高于目标值
-  3. `kubectl get deployment` 确认副本数不再增加
-
----
-
-### Q8: Namespace 的作用是什么？为什么故障演练要在隔离 Namespace 中进行？
-
-**A8**: Namespace 是 Kubernetes 中的逻辑隔离边界：
-
-- 同一 Namespace 内的资源名称必须唯一，不同 Namespace 可以重名
-- RBAC（基于角色的访问控制）通常按 Namespace 划分权限
-- 资源配额（ResourceQuota）和限制范围（LimitRange）在 Namespace 级别生效
-- 网络策略（NetworkPolicy）通常按 Namespace 定义
-
-**故障演练意义**：
-- **隔离原则**：必须在隔离的测试 Namespace 中演练，严禁在 `kube-system`、`kube-public` 等系统 Namespace 中注入 — 详见 chaos-engineering-principles Q9.1
-- Namespace 级别的故障（如删除 Namespace 内所有 Pod）影响范围可控
-- 验证时通过 `-n <ns>` 限定查询范围，避免被其他 Namespace 的噪声干扰
+**Relevance to fault drills**:
+- After injecting a CPU-fullload fault, if HPA is configured, the rising Pod CPU triggers a scale-up
+- When `currentReplicas == maxReplicas` and CPU is still above the threshold, HPA has hit its ceiling and cannot scale further
+- To verify an HPA-ceiling fault:
+  1. `kubectl get hpa -o json` confirms `currentReplicas == spec.maxReplicas`
+  2. `kubectl top pod` confirms CPU is still above target
+  3. `kubectl get deployment` confirms the replica count stops growing
 
 ---
 
-### Q9: ConfigMap 和 Secret 是什么？它们的故障场景有哪些？
+### Q8: What is a Namespace for, and why must fault drills run in an isolated Namespace?
 
-**A9**: ConfigMap 和 Secret 用于将配置数据注入到 Pod 中：
+**A8**: A Namespace is a logical isolation boundary in Kubernetes:
 
-- **ConfigMap**：存储非敏感的配置数据（配置文件、环境变量值、命令行参数）
-- **Secret**：存储敏感数据（密码、Token、TLS 证书），数据在 etcd 中 base64 编码存储
+- Resource names must be unique within a Namespace; different Namespaces may reuse names
+- RBAC permissions are usually partitioned per Namespace
+- ResourceQuota and LimitRange take effect at Namespace level
+- NetworkPolicy is usually defined per Namespace
 
-注入方式：
-- 环境变量：`envFrom` / `env.valueFrom`
-- 文件挂载：`volumeMounts` 挂载为文件
-- 命令行参数：`$(ENV_NAME)` 引用
-
-**故障演练意义**：
-- 当前技能目录主要关注运行时资源故障（CPU、内存、网络、磁盘），ConfigMap/Secret 故障属于配置层故障
-- 如果未来扩展配置故障场景，可能的验证方式：
-  - 修改 ConfigMap 后观察应用是否热加载（大多数应用不会自动重载 ConfigMap 挂载的配置）
-  - 删除 Secret 后观察依赖该 Secret 的 Pod 启动失败（`FailedMount` Event）
-- ConfigMap/Secret 更新后，已运行的 Pod 不会自动感知变化，需要滚动更新或重启 Pod
+**Relevance to fault drills**:
+- **Isolation principle**: drills MUST run in an isolated test Namespace; injecting into system Namespaces such as `kube-system` or `kube-public` is strictly forbidden — see chaos-engineering-principles Q9.1
+- A Namespace-level fault (e.g. deleting every Pod in the Namespace) has a controllable blast radius
+- Scope queries with `-n <ns>` during verification so noise from other Namespaces does not interfere
 
 ---
 
-### Q10: PersistentVolume（PV）和 PersistentVolumeClaim（PVC）的关系是什么？
+### Q9: What are ConfigMap and Secret, and what are their fault scenarios?
 
-**A10**: PV 和 PVC 解耦了存储的供给和使用：
+**A9**: ConfigMap and Secret inject configuration data into Pods:
 
-- **PV**：集群中的存储资源（由管理员或 StorageClass 动态供给），代表一块实际的存储（NFS、云盘、本地盘等）
-- **PVC**：用户（Pod）对存储的申请，声明需要的容量和访问模式
-- **StorageClass**：定义动态供给的存储模板（如 SSD、HDD、网络存储）
+- **ConfigMap**: stores non-sensitive configuration data (config files, environment-variable values, command-line arguments)
+- **Secret**: stores sensitive data (passwords, tokens, TLS certificates), base64-encoded in etcd
 
-绑定流程：
+How they are consumed:
+- Environment variables: `envFrom` / `env.valueFrom`
+- File mounts: mounted as files via `volumeMounts`
+- Command-line arguments: referenced as `$(ENV_NAME)`
+
+**Relevance to fault drills**:
+- The current skill catalogue focuses on runtime resource faults (CPU, memory, network, disk); ConfigMap/Secret faults belong to the configuration layer
+- If configuration-fault scenarios are added later, possible verification approaches:
+  - Modify a ConfigMap and observe whether the application hot-reloads (most applications do NOT reload mounted ConfigMap config automatically)
+  - Delete a Secret and observe that Pods depending on it fail to start (`FailedMount` Event)
+- After a ConfigMap/Secret update, already-running Pods do not notice the change; a rolling update or Pod restart is required
+
+---
+
+### Q10: What is the relationship between PersistentVolume (PV) and PersistentVolumeClaim (PVC)?
+
+**A10**: PV and PVC decouple storage provisioning from storage consumption:
+
+- **PV**: a storage resource in the cluster (provisioned by an administrator or dynamically by a StorageClass), representing a real piece of storage (NFS, cloud disk, local disk, ...)
+- **PVC**: a Pod's request for storage, declaring the capacity and access mode it needs
+- **StorageClass**: the template for dynamic provisioning (SSD, HDD, network storage, ...)
+
+Binding flow:
 ```
-Pod 引用 PVC → PVC 匹配/创建 PV → PV 绑定到 PVC → 存储挂载到 Pod
+Pod references a PVC → PVC matches/creates a PV → PV binds to the PVC → storage is mounted into the Pod
 ```
 
-**故障演练意义**：
-- PVC Pending 是最常见的存储故障：可能原因包括没有匹配的 PV、StorageClass 不存在、配额不足
-- 验证 PVC Pending：`kubectl get pvc -o json` 查看 `status.phase == "Pending"`
-- 节点磁盘故障可能影响本地 PV 的可用性
-- Storage 相关的 Events（`FailedMount`、`FailedAttachVolume`）是诊断存储故障的关键
+**Relevance to fault drills**:
+- PVC Pending is the most common storage fault: possible causes include no matching PV, a missing StorageClass, or insufficient quota
+- Verify PVC Pending with `kubectl get pvc -o json` and check `status.phase == "Pending"`
+- A node disk failure can affect the availability of a local PV
+- Storage-related Events (`FailedMount`, `FailedAttachVolume`) are key to diagnosing storage faults
 
 ---
 
-## 二、Pod 生命周期与状态语义
+## 2. Pod lifecycle and state semantics
 
-### Q11: Pod 的完整生命周期阶段（phase）有哪些？每个阶段代表什么？
+### Q11: What are the Pod lifecycle phases, and what does each mean?
 
-**A11**: Pod 的 `status.phase` 有五个值：
+**A11**: A Pod's `status.phase` has five values:
 
-| Phase | 含义 | 故障演练关联 |
+| Phase | Meaning | Relevance to fault drills |
 |-------|------|-------------|
-| **Pending** | Pod 已被 K8s 接受，但有一个或多个容器尚未创建。通常是因为镜像拉取中、卷挂载中、或调度失败（资源不足、污点不匹配） | Pending 故障的核心验证点 |
-| **Running** | Pod 已绑定到 Node，至少一个容器正在运行，或正在启动/重启 | 正常运行状态，但 Running 不代表 Ready |
-| **Succeeded** | 所有容器正常终止（exitCode=0），且不会重启（如 Job） | 通常不用于长期运行的服务 |
-| **Failed** | 所有容器终止，且至少一个容器非正常退出（exitCode≠0） | 进程被杀、应用崩溃后的状态 |
-| **Unknown** | 无法获取 Pod 状态（通常是节点与 apiserver 通信中断） | Node 故障的间接表现 |
+| **Pending** | The Pod has been accepted by K8s but one or more containers have not been created yet. Usually because an image is being pulled, a volume is being mounted, or scheduling failed (insufficient resources, taint mismatch) | The central assertion point for Pending faults |
+| **Running** | The Pod is bound to a Node and at least one container is running, starting or restarting | The normal running state — but Running does NOT mean Ready |
+| **Succeeded** | All containers terminated normally (exitCode=0) and will not restart (e.g. a Job) | Rarely relevant to long-running services |
+| **Failed** | All containers terminated and at least one exited abnormally (exitCode≠0) | The state after a process kill or application crash |
+| **Unknown** | The Pod's state cannot be obtained (usually the node lost contact with the apiserver) | An indirect symptom of a Node fault |
 
-**重要区分**：
-- `phase=Running` 只表示容器在运行，不代表应用健康
-- 应用是否可用要看 `status.conditions` 中的 `Ready=True` 和 Readiness Probe 结果
+**Important distinction**:
+- `phase=Running` only means the container is running; it does NOT mean the application is healthy
+- Whether the application is usable depends on `Ready=True` in `status.conditions` and the Readiness Probe result
 
 ---
 
-### Q12: Container 的状态（Container State）有哪几种？如何解读？
+### Q12: What container states exist, and how do you read them?
 
-**A12**: 每个容器有三种可能的状态：
+**A12**: Every container has three possible states:
 
-| State | 含义 | 典型原因 |
+| State | Meaning | Typical causes |
 |-------|------|----------|
-| **Waiting** | 容器尚未运行 | `ContainerCreating`（正在创建）、`ImagePullBackOff`（镜像拉取失败）、`CrashLoopBackOff`（反复崩溃）、`PodInitializing`（init 容器执行中） |
-| **Running** | 容器正在运行 | 正常运行 |
-| **Terminated** | 容器已终止 | `Completed`（正常完成）、`OOMKilled`（被 OOM 杀死，exitCode=137）、`Error`（异常退出）、`ContainerCannotRun`（容器无法运行） |
+| **Waiting** | The container is not running yet | `ContainerCreating` (being created), `ImagePullBackOff` (image pull failed), `CrashLoopBackOff` (crashing repeatedly), `PodInitializing` (init containers still running) |
+| **Running** | The container is running | normal operation |
+| **Terminated** | The container has terminated | `Completed` (finished normally), `OOMKilled` (killed by OOM, exitCode=137), `Error` (abnormal exit), `ContainerCannotRun` (the container cannot run) |
 
-> **注意**: `Evicted` 不是 Container 级别状态，而是 **Pod 级别状态**(`status.reason=Evicted`)。Evicted Pod 的 `status.phase=Failed`，但其容器级 `terminated.reason` 通常为 `Error` 或 `OOMKilled`，而不是 `Evicted`。
+> **Note**: `Evicted` is NOT a container-level state; it is a **Pod-level** state (`status.reason=Evicted`). An evicted Pod has `status.phase=Failed`, but its container-level `terminated.reason` is usually `Error` or `OOMKilled`, not `Evicted`.
 
-**关键字段**：
-- `restartCount`：容器重启次数。故障注入导致容器崩溃时，该值会增加
-- `lastState.terminated`：上次终止的原因和退出码
-- `ready`：容器是否通过了 Readiness Probe
+**Key fields**:
+- `restartCount`: how many times the container restarted. It increases when an injection crashes the container
+- `lastState.terminated`: the reason and exit code of the previous termination
+- `ready`: whether the container passed its Readiness Probe
 
-**退出码速查**：
-- 0：正常退出
-- 1：通用错误
-- 137 (128+9)：收到 SIGKILL（通常是 OOMKilled 或强制终止）
-- 143 (128+15)：收到 SIGTERM（优雅终止）
+**Exit-code cheat sheet**:
+- 0: normal exit
+- 1: generic error
+- 137 (128+9): received SIGKILL (usually OOMKilled or a force termination)
+- 143 (128+15): received SIGTERM (graceful termination)
 
 ---
 
-### Q13: Pod 的 Conditions 有哪些？它们与 Pod 可用性的关系是什么？
+### Q13: What Pod Conditions are there, and how do they relate to Pod availability?
 
-**A13**: Pod 的 `status.conditions` 包含四个条件：
+**A13**: A Pod's `status.conditions` contains four conditions:
 
-| Condition | 含义 |
+| Condition | Meaning |
 |-----------|------|
-| **PodScheduled** | Pod 已被调度到某个 Node |
-| **Initialized** | 所有 init 容器已执行完毕 |
-| **ContainersReady** | 所有容器已通过 Readiness Probe（或没有配置 Probe） |
-| **Ready** | Pod 可以接收 Service 流量（等于 ContainersReady + 没有删除中） |
+| **PodScheduled** | The Pod has been scheduled onto a Node |
+| **Initialized** | All init containers have completed |
+| **ContainersReady** | All containers passed their Readiness Probe (or have no Probe configured) |
+| **Ready** | The Pod can receive Service traffic (equals ContainersReady AND not being deleted) |
 
-**故障演练意义**：
-- 注入故障后，如果容器健康检查失败，`ContainersReady` 和 `Ready` 会变为 `False`
-- `Ready=False` 的 Pod 会从 Service Endpoints 中被移除，导致流量不再发送到该 Pod
-- 验证网络/进程类故障时，应同时检查 `Ready` 条件和 Endpoints 变化
-
----
-
-### Q14: 什么是 Terminating 状态？Pod 为什么会卡在 Terminating？
-
-**A14**: 当 Pod 被删除（`kubectl delete pod` 或 Deployment 缩容）时，Pod 进入 Terminating 状态：
-
-1. apiserver 将 Pod 的 `deletionTimestamp` 设置为当前时间 + `terminationGracePeriodSeconds`（默认 30 秒）
-2. kubelet 向容器发送 SIGTERM（信号 15）
-3. 容器在宽限期内优雅退出
-4. 如果容器未退出，kubelet 发送 SIGKILL（信号 9）强制终止
-5. 清理资源（网络、存储卷）
-
-**卡在 Terminating 的常见原因**：
-- Pod 内有进程未响应 SIGTERM（如没有正确处理信号的应用）
-- Finalizer 未完成（某些控制器在 Pod 删除前需要执行清理逻辑）
-- 存储卷无法卸载（如 NFS 服务器不可达、挂载点被占用）
-- kubelet 或容器运行时故障，无法执行删除操作
-
-**故障演练意义**：
-- Terminating 卡住是一个独立的故障场景
-- 验证时检查：`metadata.deletionTimestamp` 非空且已过去较长时间，但 Pod 仍然存在
-- 强制删除：`kubectl delete pod <pod> --force --grace-period=0`（绕过优雅终止，直接删除 etcd 记录）
+**Relevance to fault drills**:
+- After injection, if the container health check fails, `ContainersReady` and `Ready` flip to `False`
+- A Pod with `Ready=False` is removed from the Service Endpoints, so traffic stops going to it
+- When verifying network/process faults, check both the `Ready` condition and the Endpoints change
 
 ---
 
-## 三、健康检查与自愈机制
+### Q14: What is the Terminating state, and why do Pods get stuck in it?
 
-### Q15: Liveness Probe、Readiness Probe、Startup Probe 的区别是什么？
+**A14**: When a Pod is deleted (`kubectl delete pod`, or a Deployment scale-down) it enters Terminating:
 
-**A15**: 三种探针分别用于不同的健康检查目的：
+1. The apiserver sets the Pod's `deletionTimestamp` to now + `terminationGracePeriodSeconds` (30s by default)
+2. kubelet sends SIGTERM (signal 15) to the containers
+3. The containers exit gracefully within the grace period
+4. If a container has not exited, kubelet sends SIGKILL (signal 9) to force it
+5. Resources (network, volumes) are cleaned up
 
-| 探针 | 用途 | 失败后果 | 适用场景 |
+**Common reasons for getting stuck in Terminating**:
+- A process in the Pod does not respond to SIGTERM (an application that does not handle the signal properly)
+- A Finalizer has not completed (some controllers must run cleanup logic before the Pod is deleted)
+- A volume cannot be unmounted (NFS server unreachable, mount point busy)
+- kubelet or the container runtime is faulty and cannot perform the deletion
+
+**Relevance to fault drills**:
+- Being stuck in Terminating is a fault scenario in its own right
+- To verify: `metadata.deletionTimestamp` is non-empty and well in the past, yet the Pod still exists
+- Force delete: `kubectl delete pod <pod> --force --grace-period=0` (bypasses graceful termination and removes the etcd record directly)
+
+---
+
+## 3. Health checks and self-healing
+
+### Q15: How do Liveness Probe, Readiness Probe and Startup Probe differ?
+
+**A15**: The three probes serve different health-check purposes:
+
+| Probe | Purpose | Consequence of failure | Where it applies |
 |------|------|----------|----------|
-| **Liveness Probe** | 检查容器是否还活着 | kubelet 杀死容器并重启 | 检测死锁、无限循环等应用僵死状态 |
-| **Readiness Probe** | 检查容器是否已准备好接收流量 | Pod 从 Service Endpoints 中移除 | 检测应用启动中、依赖服务未就绪 |
-| **Startup Probe** | 检查应用是否已完成启动 | 禁用其他探针，防止启动阶段被误杀 | 启动时间很长的应用（如 JVM） |
+| **Liveness Probe** | Is the container still alive? | kubelet kills and restarts the container | Detecting deadlocks, infinite loops and other hung-application states |
+| **Readiness Probe** | Is the container ready to receive traffic? | The Pod is removed from the Service Endpoints | Detecting "still starting up" or "a dependency is not ready" |
+| **Startup Probe** | Has the application finished starting? | Disables the other probes so the startup phase is not killed by mistake | Applications with long startup times (e.g. JVM) |
 
-**探针类型**：
-- `httpGet`：发送 HTTP 请求，检查状态码
-- `tcpSocket`：尝试 TCP 连接
-- `exec`：在容器内执行命令，检查退出码
-- `grpc`：gRPC 健康检查（较新）
+**Probe types**:
+- `httpGet`: send an HTTP request and check the status code
+- `tcpSocket`: attempt a TCP connection
+- `exec`: run a command inside the container and check its exit code
+- `grpc`: gRPC health check (newer)
 
-**故障演练意义**：
-- 网络延迟/丢包故障可能导致 Liveness Probe 失败，触发容器重启（`restartCount` 增加）
-- CPU 满载可能导致探针超时（如果 `timeoutSeconds` 设置较短），引发不必要的重启
-- 验证故障时，应检查 `describe pod` 中的探针失败 Events（`Unhealthy`）
-- 如果探针配置不合理（如 `periodSeconds` 太短、`failureThreshold` 太小），故障的影响会被放大
+**Relevance to fault drills**:
+- Network delay/loss faults can make the Liveness Probe fail and trigger a container restart (`restartCount` increases)
+- CPU fullload can make a probe time out (if `timeoutSeconds` is short), causing unnecessary restarts
+- When verifying, check the probe-failure Events (`Unhealthy`) in `describe pod`
+- If the probe configuration is unreasonable (`periodSeconds` too short, `failureThreshold` too small), the fault's impact is amplified
 
 ---
 
-### Q16: Kubernetes 的自愈机制有哪些？它们如何影响故障演练的观察？
+### Q16: What self-healing mechanisms does Kubernetes have, and how do they affect what a drill observes?
 
-**A16**: Kubernetes 内置了多种自愈机制：
+**A16**: Kubernetes has several built-in self-healing mechanisms:
 
-| 机制 | 触发条件 | 行为 | 对故障演练的影响 |
+| Mechanism | Trigger | Behaviour | Impact on fault drills |
 |------|----------|------|-----------------|
-| **容器重启** | Liveness Probe 失败或容器异常退出 | kubelet 根据 `restartPolicy`（Always/OnFailure/Never）决定是否重启容器 | Pod 级故障可能导致容器反复重启，观察 `restartCount` |
-| **Pod 重建** | Deployment/ReplicaSet 检测到 Pod 数量不足 | 创建新 Pod 替代丢失的 Pod | Node 故障或 Pod 删除后，新 Pod 会在其他 Node 上重建 |
-| **重新调度** | Pod 处于 Pending 状态 | scheduler 尝试将 Pod 调度到可用 Node | 资源不足导致的 Pending 故障，释放资源后会自动恢复 |
-| **Node 驱逐** | Node 进入 NotReady 或资源压力状态 | Controller 将该节点上的 Pod 标记为删除，在其他节点重建 | Node 故障后，Pod 会自动漂移 |
-| **Endpoint 更新** | Pod Ready 状态变化 | Endpoint Controller 更新 Service 后端列表 | Ready=False 的 Pod 自动从流量中摘除 |
+| **Container restart** | Liveness Probe failure or abnormal container exit | kubelet decides whether to restart based on `restartPolicy` (Always/OnFailure/Never) | A Pod-level fault may cause repeated restarts — watch `restartCount` |
+| **Pod recreation** | The Deployment/ReplicaSet notices too few Pods | Creates a new Pod to replace the lost one | After a Node fault or Pod deletion, the new Pod is rebuilt on another Node |
+| **Rescheduling** | A Pod is Pending | The scheduler tries to place it on an available Node | A Pending fault caused by insufficient resources recovers automatically once resources free up |
+| **Node eviction** | A Node goes NotReady or under resource pressure | The controller marks that node's Pods for deletion and rebuilds them elsewhere | After a Node fault, Pods drift automatically |
+| **Endpoint update** | A Pod's Ready status changes | The Endpoint Controller updates the Service backend list | A Pod with Ready=False is pulled out of traffic automatically |
 
-**故障演练意义**：
-- 设计验证方案时，必须考虑自愈机制的时间窗口。例如 Pod 删除后 5-10 秒内新 Pod 就会启动，验证要抓住这个窗口
-- 某些故障（如 CPU 满载）如果触发了 Liveness Probe 失败，容器会不断重启，这时观察到的现象是 "反复重启" 而不是 "CPU 高"
-- 自愈可能掩盖故障的真实影响，Agent 需要通过 Events、日志、指标等多维度穿透自愈层看到底层问题
+**Relevance to fault drills**:
+- A verification plan MUST account for the self-healing time window. For example, a new Pod starts within 5-10s of a Pod deletion, so verification has to catch that window
+- Some faults (e.g. CPU fullload) that trigger Liveness Probe failures cause the container to restart repeatedly — the observed symptom is then "repeated restarts", not "high CPU"
+- Self-healing can mask a fault's real impact; the Agent must see through the self-healing layer to the underlying problem via Events, logs and metrics together
 
 ---
 
-## 四、资源模型与调度
+## 4. Resource model and scheduling
 
-### Q17: Request 和 Limit 的区别是什么？它们在故障演练中起什么作用？
+### Q17: What is the difference between Request and Limit, and what role do they play in fault drills?
 
-**A17**: Request 和 Limit 是容器资源声明的两个维度：
+**A17**: Request and Limit are the two dimensions of a container's resource declaration:
 
-| 维度 | 含义 | 作用 |
+| Dimension | Meaning | Effect |
 |------|------|------|
-| **Request** | 容器保证能获得的资源量 | scheduler 根据 Request 决定 Pod 调度到哪个 Node（Node 的 Allocatable 必须 >= 所有 Pod 的 Request 之和） |
-| **Limit** | 容器最多能使用的资源量 | 如果容器使用超过 Limit，CPU 会被节流（throttle），内存会被 OOMKilled |
+| **Request** | The amount of resource the container is guaranteed to get | The scheduler uses Request to decide which Node the Pod lands on (a Node's Allocatable must be >= the sum of all its Pods' Requests) |
+| **Limit** | The maximum amount the container may use | If the container exceeds the Limit, CPU is throttled and memory triggers OOMKilled |
 
-**示例**：
+**Example**:
 ```yaml
 resources:
   requests:
-    cpu: "100m"      # 0.1 核
+    cpu: "100m"      # 0.1 core
     memory: "128Mi"  # 128 MB
   limits:
-    cpu: "500m"      # 0.5 核
+    cpu: "500m"      # 0.5 core
     memory: "256Mi"  # 256 MB
 ```
 
-**故障演练意义**：
-- **Pod CPU 满载验证**：`top pod` 中 CPU 使用量接近 Limit（而不是 Request）。ChaosBlade 的 `pod-cpu fullload` 会让 Pod 的 CPU 使用接近 Limit。
-- **Pod 内存压力验证**：当内存使用接近 Limit 时，容器会被 OOMKilled（exitCode 137）。如果没有设置 Limit，Pod 可能使用到节点内存耗尽。
-- **Pending 故障（资源不足）**：当节点上所有 Pod 的 CPU/Memory Request 之和超过节点的 Allocatable 时，新 Pod 会处于 Pending 状态。
+**Relevance to fault drills**:
+- **Verifying Pod CPU fullload**: in `top pod`, CPU usage approaches the Limit (not the Request). ChaosBlade's `pod-cpu fullload` drives the Pod's CPU toward its Limit.
+- **Verifying Pod memory pressure**: when memory usage nears the Limit, the container is OOMKilled (exitCode 137). With no Limit set, the Pod can consume memory until the node runs out.
+- **Pending fault (insufficient resources)**: when the sum of all Pods' CPU/Memory Requests on a node exceeds the node's Allocatable, a new Pod stays Pending.
 
 ---
 
-### Q18: 什么是节点污点（Taint）和容忍（Toleration）？它们如何影响调度？
+### Q18: What are node Taints and Tolerations, and how do they affect scheduling?
 
-**A18**: Taint 是节点上的"排斥标签"，Toleration 是 Pod 上的"容忍声明"：
+**A18**: A Taint is a "repelling label" on a node; a Toleration is a Pod's declaration that it can tolerate one:
 
-- 如果节点有 Taint，而 Pod 没有对应的 Toleration，Pod 不能被调度到该节点
-- 即使 Pod 已运行在该节点，某些 Taint（如 `NoExecute`）也会导致 Pod 被驱逐
+- If a node has a Taint and a Pod has no matching Toleration, the Pod cannot be scheduled there
+- Even for a Pod already running on the node, certain Taints (e.g. `NoExecute`) cause it to be evicted
 
-常见系统 Taint：
-- `node.kubernetes.io/not-ready`：节点未就绪
-- `node.kubernetes.io/unreachable`：节点不可达
-- `node.kubernetes.io/disk-pressure`：磁盘压力
-- `node.kubernetes.io/memory-pressure`：内存压力
-- `node.kubernetes.io/pid-pressure`：PID 压力
-- `node.kubernetes.io/network-unavailable`：网络不可用
+Common system Taints:
+- `node.kubernetes.io/not-ready`: node not ready
+- `node.kubernetes.io/unreachable`: node unreachable
+- `node.kubernetes.io/disk-pressure`: disk pressure
+- `node.kubernetes.io/memory-pressure`: memory pressure
+- `node.kubernetes.io/pid-pressure`: PID pressure
+- `node.kubernetes.io/network-unavailable`: network unavailable
 
-**故障演练意义**：
-- Node 级故障（如磁盘满、内存高）会导致 kubelet 自动给节点添加对应 Taint，进而驱逐节点上的 Pod
-- 验证 Node 故障时，应观察节点 Taint 变化和 Pod 驱逐 Events
-- 某些 DaemonSet（如监控采集器）会带有这些 Taint 的 Toleration，确保即使节点故障也能继续运行
-
----
-
-### Q19: 什么是亲和性（Affinity）和反亲和性（Anti-Affinity）？
-
-**A19**: 亲和性控制 Pod 倾向于调度到哪些节点或与哪些 Pod 共存：
-
-- **NodeAffinity**：Pod 倾向于调度到满足特定标签的节点（如 `disktype=ssd`）
-- **PodAffinity**：Pod 倾向于与满足特定标签的 Pod 调度到同一节点
-- **PodAntiAffinity**：Pod 倾向于与满足特定标签的 Pod 分散到不同节点（如 "同一个 Deployment 的 Pod 不要调度到同一节点"）
-
-**故障演练意义**：
-- 反亲和性配置会影响 Pod 重建时的调度位置。例如 Node 故障后，如果其他节点因反亲和性限制无法接受重建的 Pod，Pod 会处于 Pending 状态
-- 验证高可用场景时，应检查反亲和性是否生效（同一故障域内的 Pod 数量）
+**Relevance to fault drills**:
+- Node-level faults (disk full, high memory) make kubelet add the corresponding Taint automatically, which then evicts the node's Pods
+- When verifying a Node fault, watch the node's Taint changes and the Pod eviction Events
+- Some DaemonSets (e.g. monitoring agents) carry Tolerations for these Taints so they keep running even on a faulted node
 
 ---
 
-## 五、网络模型
+### Q19: What are Affinity and Anti-Affinity?
 
-### Q20: Kubernetes 的网络模型核心原则是什么？
+**A19**: Affinity controls which nodes a Pod prefers, or which Pods it prefers to sit with:
 
-**A20**: Kubernetes 网络模型要求：
+- **NodeAffinity**: the Pod prefers nodes carrying specific labels (e.g. `disktype=ssd`)
+- **PodAffinity**: the Pod prefers to be scheduled onto the same node as Pods carrying specific labels
+- **PodAntiAffinity**: the Pod prefers to be spread away from Pods carrying specific labels (e.g. "Pods of the same Deployment should not land on the same node")
 
-1. **每个 Pod 有独立的 IP 地址**（Pod IP 在集群内可路由）
-2. **Pod 之间可以直接通信**，无需 NAT（无论是否在同一 Node）
-3. **Node 上的 Agent（kubelet、kube-proxy）可以与所有 Pod 通信**
-
-实现方式由 CNI 插件负责（Calico、Cilium、Flannel、Weave 等），不同 CNI 的网络拓扑和故障表现不同。
-
-**故障演练意义**：
-- Pod 网络故障（延迟、丢包、DNS）由 CNI 实现，但 ChaosBlade 的网络注入是在 Pod 的网络命名空间内操作，与底层 CNI 无关
-- Service 的 ClusterIP 是虚拟 IP，其可达性取决于 kube-proxy 模式：
-  - **iptables 模式**：ClusterIP 不绑定任何网络接口，仅存在于 iptables NAT 规则中，**Pod 内无法 ping 通 ClusterIP**（ICMP 不命中 NAT 规则），但可通过 `ClusterIP:Port` TCP/UDP 连接访问服务
-  - **IPVS 模式**：ClusterIP 绑定到 `kube-ipvs0` dummy 接口，**Pod 内可以 ping 通 ClusterIP**（但 ping 回显来自节点本机，不转发到后端 Pod），TCP/UDP 连接仍经 IPVS 负载均衡
-  - **验证建议**：无论哪种模式，都应通过 `curl ClusterIP:Port` 或 Pod DNS 名称验证服务可用性，而非 ping ClusterIP
-- 验证网络故障时，应在 Pod 内测试对具体 Pod IP 的连通性，而不是测试对 ClusterIP 的连通性
+**Relevance to fault drills**:
+- Anti-affinity affects where a Pod is rescheduled on recreation. For example, after a Node fault, if anti-affinity prevents other nodes from accepting the rebuilt Pod, the Pod stays Pending
+- When verifying high-availability scenarios, check whether anti-affinity is in effect (the Pod count within a single failure domain)
 
 ---
 
-### Q21: DNS 在 Kubernetes 中是如何工作的？
+## 5. Networking model
 
-**A21**: Kubernetes 集群 DNS（通常是 CoreDNS）提供集群内的服务发现：
+### Q20: What are the core principles of the Kubernetes networking model?
 
-- **Service DNS**：`<service>.<namespace>.svc.cluster.local` → ClusterIP
-- **Pod DNS**（需开启）：`<pod-ip>.<namespace>.pod.cluster.local`
-- **Headless Service**：DNS 直接返回后端 Pod IP 列表（用于 StatefulSet）
+**A20**: The Kubernetes networking model requires:
 
-CoreDNS 以 Deployment/DaemonSet 形式运行在集群中，通常位于 `kube-system` 命名空间。
+1. **Every Pod has its own IP address** (Pod IPs are routable within the cluster)
+2. **Pods can communicate directly** with no NAT (whether or not they are on the same Node)
+3. **Node agents (kubelet, kube-proxy) can reach every Pod**
 
-**故障演练意义**：
-- DNS 故障注入（ChaosBlade `pod-network dns`）会修改 Pod 内的 `/etc/hosts` 文件（添加 `#chaosblade` 注释的域名-IP 条目），而非修改 `/etc/resolv.conf`
-- 验证 DNS 故障时，应使用 `cat /etc/hosts`（确认 #chaosblade 条目）和 `ping <domain>`（确认解析到伪造 IP；glibc 镜像也可用 `getent hosts <domain>`，但 Alpine/musl 镜像不含 `getent`），**不要用 `nslookup`/`dig`**（它们绕过 /etc/hosts，无法检测 ChaosBlade DNS 劫持）
-- CoreDNS 本身位于 `kube-system`，**严禁对其注入故障**（安全红线）
+The implementation is the CNI plugin's job (Calico, Cilium, Flannel, Weave, ...); different CNIs have different network topologies and fault behaviour.
 
----
-
-## 六、Events 与日志
-
-### Q22: Kubernetes Events 的生命周期和可靠性如何？
-
-**A22**: Events 是 Kubernetes 中重要的诊断信息源，但有以下特点：
-
-- Events 存储在 etcd 中，默认保留 **1 小时**（由事件聚合器控制，可通过 `--event-ttl` 调整）
-- 同一类型的事件会被聚合（`count` 字段表示发生次数）
-- Events 的 `type` 分为 `Normal`（正常）和 `Warning`（警告）
-- Events 的 `source.component` 表明事件来源（如 `default-scheduler`、`kubelet`、`replicaset-controller`）
-
-**故障演练意义**：
-- 验证时应优先查看注入时间点附近的新事件，旧事件可能已被清理
-- `kubectl get events --field-selector type!=Normal` 是快速发现异常的有效手段
-- 某些故障（如 OOMKilled）会在 Pod Events、Node Events 和系统日志中同时留下痕迹，多源交叉验证更可靠
+**Relevance to fault drills**:
+- Pod network faults (delay, loss, DNS) are realised by the CNI, but ChaosBlade's network injection operates inside the Pod's network namespace, independent of the underlying CNI
+- A Service's ClusterIP is a virtual IP; whether it is reachable depends on the kube-proxy mode:
+  - **iptables mode**: the ClusterIP is not bound to any network interface and exists only in iptables NAT rules, so **a Pod cannot ping the ClusterIP** (ICMP does not hit the NAT rules) — but the service is reachable over TCP/UDP via `ClusterIP:Port`
+  - **IPVS mode**: the ClusterIP is bound to the `kube-ipvs0` dummy interface, so **a Pod CAN ping the ClusterIP** (though the echo comes from the local node and is not forwarded to a backend Pod); TCP/UDP connections still go through IPVS load balancing
+  - **Recommendation**: in either mode, verify service availability with `curl ClusterIP:Port` or the Pod DNS name, not by pinging the ClusterIP
+- When verifying a network fault, test connectivity to a concrete Pod IP from inside a Pod, not connectivity to a ClusterIP
 
 ---
 
-### Q23: 容器日志是如何存储和获取的？
+### Q21: How does DNS work in Kubernetes?
 
-**A23**: 容器日志由容器运行时（containerd/CRI-O）管理：
+**A21**: Cluster DNS (usually CoreDNS) provides in-cluster service discovery:
 
-- 默认情况下，容器的 stdout/stderr 被写入节点的文件系统（通常位于 `/var/log/containers/` 或 `/var/log/pods/`）
-- `kubectl logs` 实际上是通过 kubelet 从节点上读取这些日志文件
-- 日志默认不会自动清理，但节点磁盘满时可能被清理
-- 生产环境通常部署日志采集 DaemonSet（Fluentd/Fluent Bit）将日志发送到集中存储（ELK、Loki）
+- **Service DNS**: `<service>.<namespace>.svc.cluster.local` → ClusterIP
+- **Pod DNS** (must be enabled): `<pod-ip>.<namespace>.pod.cluster.local`
+- **Headless Service**: DNS returns the backend Pod IP list directly (used by StatefulSet)
 
-**故障演练意义**：
-- `kubectl logs --previous` 可以获取已崩溃容器的最后日志，这对诊断 OOM、CrashLoopBackOff 至关重要
-- 如果节点磁盘满，容器日志可能无法写入，此时 `kubectl logs` 返回空或报错
-- 多容器 Pod 中需要通过 `-c <container>` 指定容器名获取对应日志
+CoreDNS runs in the cluster as a Deployment/DaemonSet, usually in the `kube-system` namespace.
+
+**Relevance to fault drills**:
+- DNS fault injection (ChaosBlade `pod-network dns`) modifies the Pod's `/etc/hosts` file (adding domain-IP entries marked with a `#chaosblade` comment), NOT `/etc/resolv.conf`
+- To verify a DNS fault, use `cat /etc/hosts` (confirm the #chaosblade entry) and `ping <domain>` (confirm it resolves to the forged IP; on glibc images `getent hosts <domain>` also works, but Alpine/musl images have no `getent`). **Do NOT use `nslookup`/`dig`** — they bypass /etc/hosts and cannot detect ChaosBlade DNS hijacking
+- CoreDNS itself lives in `kube-system`, so **injecting faults into it is strictly forbidden** (safety red line)
 
 ---
 
-## 七、故障传播与影响分析
+## 6. Events and logs
 
-### Q24: 一个 Pod 故障通常会如何传播到整个系统？
+### Q22: What is the lifecycle and reliability of Kubernetes Events?
 
-**A24**: Pod 故障的传播路径（K8s 视角）：
+**A22**: Events are an important diagnostic source in Kubernetes, with these characteristics:
+
+- Events are stored in etcd and retained for **1 hour** by default (governed by the event aggregator; tunable via `--event-ttl`)
+- Events of the same kind are aggregated (the `count` field is the number of occurrences)
+- An Event's `type` is either `Normal` or `Warning`
+- An Event's `source.component` indicates its origin (e.g. `default-scheduler`, `kubelet`, `replicaset-controller`)
+
+**Relevance to fault drills**:
+- During verification, look first at new events around the injection timestamp; older events may already have been purged
+- `kubectl get events --field-selector type!=Normal` is an effective way to surface anomalies quickly
+- Some faults (e.g. OOMKilled) leave traces in Pod Events, Node Events AND system logs simultaneously; cross-checking multiple sources is more reliable
+
+---
+
+### Q23: How are container logs stored and retrieved?
+
+**A23**: Container logs are managed by the container runtime (containerd/CRI-O):
+
+- By default a container's stdout/stderr is written to the node's filesystem (usually under `/var/log/containers/` or `/var/log/pods/`)
+- `kubectl logs` actually reads those log files from the node via kubelet
+- Logs are not auto-purged by default, but may be cleaned up when the node's disk fills
+- Production clusters usually run a log-collection DaemonSet (Fluentd/Fluent Bit) shipping logs to central storage (ELK, Loki)
+
+**Relevance to fault drills**:
+- `kubectl logs --previous` retrieves the final logs of an already-crashed container, which is essential for diagnosing OOM and CrashLoopBackOff
+- If the node's disk is full, container logs may fail to be written, so `kubectl logs` returns empty or errors
+- In a multi-container Pod, name the container with `-c <container>` to get its logs
+
+---
+
+## 7. Fault propagation and impact analysis
+
+### Q24: How does a single Pod fault typically propagate through the whole system?
+
+**A24**: The propagation path of a Pod fault (from the K8s point of view):
 
 ```
-Pod 故障
-    ├── 容器退出 / 健康检查失败
+Pod fault
+    ├── container exits / health check fails
     │       └── Pod Ready=False
-    │               └── 从 Service Endpoints 移除
-    │                       └── 流量不再发送到该 Pod
-    │                               └── 如果剩余 Pod 不足以承载流量 → 服务降级/超时
-    ├── Pod 被删除 / 节点故障
-    │       └── ReplicaSet 创建新 Pod
-    │               └── 新 Pod 启动需要时间（冷启动延迟）
-    │                       └── 启动期间服务容量下降
-    ├── CPU/内存资源压力
-    │       └── 同节点其他 Pod 受影响（CPU throttle、内存竞争、甚至 OOMKill）
-    │               └── 级联故障
-    └── 网络故障（延迟/丢包/DNS）
-            └── 应用层超时、重试、熔断触发
-                    └── 依赖服务受影响（故障扩散）
+    │               └── removed from the Service Endpoints
+    │                       └── traffic stops going to that Pod
+    │                               └── if the remaining Pods cannot carry the load → service degradation / timeouts
+    ├── Pod deleted / node failure
+    │       └── ReplicaSet creates a new Pod
+    │               └── the new Pod takes time to start (cold-start latency)
+    │                       └── service capacity is reduced during startup
+    ├── CPU/memory resource pressure
+    │       └── other Pods on the same node are affected (CPU throttling, memory contention, even OOMKill)
+    │               └── cascading failure
+    └── network fault (delay / loss / DNS)
+            └── application-layer timeouts, retries, circuit breakers trip
+                    └── dependent services are affected (the fault spreads)
 ```
 
-**故障演练意义**：
-- Agent 设计验证方案时，不应只验证"故障是否生效"，还应验证"故障的影响是否符合预期"
-- 例如注入 Pod CPU 满载后，除了验证 CPU 指标，还应验证该 Pod 的响应延迟、健康检查状态、是否从 Endpoints 移除、同应用其他 Pod 的负载变化
+**Relevance to fault drills**:
+- When designing a verification plan, the Agent should not only verify "did the fault take effect" but also "is the fault's impact as expected"
+- For example, after injecting Pod CPU fullload, beyond the CPU metric also verify that Pod's response latency, its health-check status, whether it was removed from Endpoints, and the load shift on the application's other Pods
 
 ---
 
-### Q25: 如何区分"故障注入生效"和"故障造成了预期影响"？
+### Q25: How do you distinguish "the injection took effect" from "the fault caused the expected impact"?
 
-**A25**: 这是 Layer 2 验证的核心问题，详见 `chaos-engineering-principles.md` Q7-Q8 中三层验证模型的完整阐述。
+**A25**: This is the core question of Layer 2 verification; see the full three-layer verification model in `chaos-engineering-principles.md` Q7-Q8.
 
-简要对照：
+A brief comparison:
 
-| 验证层次 | 含义 | 示例 |
+| Verification layer | Meaning | Example |
 |----------|------|------|
-| **故障是否生效** | ChaosBlade 实验是否成功创建，目标资源是否被修改 | `blade_status` 返回成功；Pod 内出现 chaos 进程 |
-| **是否出现预期现象** | 系统状态是否出现了故障场景描述中的现象 | Pod 内存接近 Limit；应用响应变慢 |
-| **影响是否符合预期** | 故障的影响范围是否在可控范围内，没有意外扩散 | 只有目标 Pod 受影响，同节点其他 Pod 正常 |
+| **Did the fault take effect** | Was the ChaosBlade experiment created successfully, and was the target resource modified | `blade_status` returns success; a chaos process appears inside the Pod |
+| **Did the expected symptom appear** | Did the system state exhibit the symptom described in the fault scenario | Pod memory approaches its Limit; the application slows down |
+| **Is the impact as expected** | Is the fault's blast radius within the controllable range, with no unintended spread | Only the target Pod is affected; other Pods on the same node are healthy |
 
 ---
 
-## 八、常用术语中英对照
+## 8. Resource abbreviations
 
-| 英文 | 中文 | 缩写 |
-|------|------|------|
-| Pod |  Pod（最小调度单元） | po |
-| Node | 节点 | no |
-| Namespace | 命名空间 | ns |
-| Deployment | 部署 | deploy |
-| ReplicaSet | 副本集 | rs |
-| DaemonSet | 守护进程集 | ds |
-| StatefulSet | 有状态集 | sts |
-| Service | 服务 | svc |
-| Endpoints | 端点 | ep |
-| ConfigMap | 配置映射 | cm |
-| Secret | 密钥 | - |
-| PersistentVolume | 持久卷 | pv |
-| PersistentVolumeClaim | 持久卷声明 | pvc |
-| HorizontalPodAutoscaler | 水平 Pod 自动扩缩容器 | hpa |
-| Event | 事件 | ev |
-| Container | 容器 | - |
-| Image | 镜像 | - |
-| Label | 标签 | - |
-| Selector | 选择器 | - |
-| Taint | 污点 | - |
-| Toleration | 容忍 | - |
-| Affinity | 亲和性 | - |
-| Probe | 探针 | - |
-| ResourceQuota | 资源配额 | quota |
-| LimitRange | 限制范围 | limits |
-| Ingress | 入口（七层路由） | ing |
-| NetworkPolicy | 网络策略 | netpol |
+The short names accepted by `kubectl` for the resources referenced throughout this document:
+
+| Resource | Short name |
+|------|------|
+| Pod (the smallest schedulable unit) | po |
+| Node | no |
+| Namespace | ns |
+| Deployment | deploy |
+| ReplicaSet | rs |
+| DaemonSet | ds |
+| StatefulSet | sts |
+| Service | svc |
+| Endpoints | ep |
+| ConfigMap | cm |
+| Secret | - |
+| PersistentVolume | pv |
+| PersistentVolumeClaim | pvc |
+| HorizontalPodAutoscaler | hpa |
+| Event | ev |
+| Container | - |
+| Image | - |
+| Label | - |
+| Selector | - |
+| Taint | - |
+| Toleration | - |
+| Affinity | - |
+| Probe | - |
+| ResourceQuota | quota |
+| LimitRange | limits |
+| Ingress (L7 routing) | ing |
+| NetworkPolicy | netpol |

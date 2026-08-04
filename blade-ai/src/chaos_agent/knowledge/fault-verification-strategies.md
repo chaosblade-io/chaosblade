@@ -24,521 +24,521 @@ fault_types:
 summary: "Fault-specific verification methodology, kubectl verification mapping by fault type, data interpretation pitfalls, coverage/anomaly/application-impact verification. Includes verification command design principles."
 ---
 
-# 故障验证策略与方法论(Agent 专用)
+# Fault Verification Strategies and Methodology (for the Agent)
 
-> **文件用途**: 本文件系统阐述故障验证的分层模型、验证方法设计原则、常见故障场景的验证方案,以及 Agent 在 Layer 2 验证阶段的决策逻辑。帮助 Agent 理解"如何验证故障生效",设计出精确、可执行的验证方案。
+> **Purpose**: This document systematically lays out the layered verification model, the design principles for verification methods, verification plans for common fault scenarios, and the Agent's decision logic during the Layer 2 phase. It helps the Agent understand "how to verify a fault took effect" and design precise, executable verification plans.
 
-> **Agent 快速检索索引**:
-> - **验证模型**: 三层验证模型 → [Q1](#q1-为什么需要三层验证模型单层验证不够吗); 设计原则 → [Q2](#q2-如何设计一个有效的-layer-2-验证方案)
-> - **Pod 级验证**: CPU 满载 → [Q3](#q3-pod-cpu-满载的验证方案是什么); 内存/OOM → [Q4](#q4-pod-内存压力oom-的验证方案是什么); 网络延迟 → [Q5](#q5-pod-网络延迟的验证方案是什么); 网络丢包 → [Q6](#q6-pod-网络丢包的验证方案是什么); DNS 故障 → [Q7](#q7-pod-dns-故障的验证方案是什么); 磁盘填充 → [Q8](#q8-pod-磁盘填充的验证方案是什么)
-> - **Node 级验证**: CPU 满载 → [Q9](#q9-node-cpu-满载的验证方案是什么); 磁盘满 → [Q10](#q10-node-磁盘满的验证方案是什么); 磁盘IO过高 → [Q11](#q11-node-磁盘-io-过高的验证方案是什么)
-> - **失败处理**: 验证失败处理 → [Q12](#q12-如果-layer-2-验证失败agent-应该如何处理); 超时区分 → [Q13](#q13-如何区分验证失败和验证超时)
-> - **Skill 规范**: 验证方法编写 → [Q14](#q14-skill-的验证方法章节应该包含哪些内容)
-> - **数据陷阱**: 数据解读常见陷阱 → [Q15](#q15-layer-2-验证中常见的数据解读陷阱有哪些)
-> - **覆盖验证**: 覆盖率验证 → [Q16](#q16-如何验证故障注入的覆盖率是否完整); 异常指标检测 → [Q17](#q17-如何检测和调查非预期指标变化); 应用影响验证 → [Q18](#q18-如何验证应用层面的故障影响)
-
----
-
-## 一、验证的分层模型回顾
-
-### Q1: 为什么需要三层验证模型?单层验证不够吗?
-
-**A1**: 三层验证模型是故障验证的核心框架，详见 `chaos-engineering-principles.md` Q7-Q8 的完整阐述。
-
-简要对照：
-- **Layer 1（注入动作验证）**: 确认 ChaosBlade 实验创建成功 → 快速过滤无效注入
-- **Layer 2（现象验证）**: 通过 kubectl 确认故障现象确实出现 → 穿透 blade 状态抽象，看到真实系统状态
-- **Layer 3（影响验证）**: 横向对比，确认影响范围可控 → 验证爆炸半径
-
-Agent 验证策略：必须执行 Layer 1 + Layer 2；Layer 3 可选（取决于 Skill 定义）。验证失败时触发回滚（blade destroy）。
+> **Agent quick-reference index**:
+> - **Verification model**: the three-layer model → [Q1](#q1-why-do-we-need-a-three-layer-verification-model-is-one-layer-not-enough); design principles → [Q2](#q2-how-do-you-design-an-effective-layer-2-verification-plan)
+> - **Pod-level verification**: CPU fullload → [Q3](#q3-what-is-the-verification-plan-for-pod-cpu-fullload); memory/OOM → [Q4](#q4-what-is-the-verification-plan-for-pod-memory-pressure--oom); network delay → [Q5](#q5-what-is-the-verification-plan-for-pod-network-delay); packet loss → [Q6](#q6-what-is-the-verification-plan-for-pod-packet-loss); DNS fault → [Q7](#q7-what-is-the-verification-plan-for-a-pod-dns-fault); disk filling → [Q8](#q8-what-is-the-verification-plan-for-pod-disk-filling)
+> - **Node-level verification**: CPU fullload → [Q9](#q9-what-is-the-verification-plan-for-node-cpu-fullload); disk full → [Q10](#q10-what-is-the-verification-plan-for-a-full-node-disk); high disk IO → [Q11](#q11-what-is-the-verification-plan-for-high-node-disk-io)
+> - **Failure handling**: handling verification failure → [Q12](#q12-if-layer-2-verification-fails-what-should-the-agent-do); distinguishing timeouts → [Q13](#q13-how-do-you-tell-verification-failure-apart-from-verification-timeout)
+> - **Skill conventions**: writing the verification method → [Q14](#q14-what-should-a-skills-verification-method-section-contain)
+> - **Data pitfalls**: common data-interpretation pitfalls → [Q15](#q15-what-are-the-common-data-interpretation-pitfalls-in-layer-2-verification)
+> - **Coverage verification**: coverage → [Q16](#q16-how-do-you-verify-that-the-injections-coverage-is-complete); anomalous-metric detection → [Q17](#q17-how-do-you-detect-and-investigate-unexpected-metric-changes); application-impact verification → [Q18](#q18-how-do-you-verify-the-faults-impact-at-the-application-level)
 
 ---
 
-## 二、Layer 2 验证的设计原则
+## 1. Recap of the layered verification model
 
-### Q2: 如何设计一个有效的 Layer 2 验证方案?
+### Q1: Why do we need a three-layer verification model? Is one layer not enough?
 
-**A2**: 有效的 Layer 2 验证方案应遵循以下五个原则:
+**A1**: The three-layer model is the core framework of fault verification; see the full treatment in `chaos-engineering-principles.md` Q7-Q8.
 
-#### 2.1 针对性原则
+A brief comparison:
+- **Layer 1 (injection-action verification)**: confirms the ChaosBlade experiment was created → filters out ineffective injections fast
+- **Layer 2 (symptom verification)**: uses kubectl to confirm the fault symptom really appeared → sees through blade's status abstraction to the real system state
+- **Layer 3 (impact verification)**: lateral comparison to confirm the blast radius is contained → verifies the blast radius
 
-验证方法必须针对具体的故障类型,而不是通用的"检查系统是否正常"。
-
-**示例对比**:
-- ❌ **通用验证**:`kubectl get pods -n default`(只检查 Pod 是否存在)
-- ✅ **针对性验证**(Pod CPU 满载):`kubectl top pod my-pod -n default`,断言 CPU 使用率 > 80%
-
-> **🤖 Agent 的实现**:
-> - Skill 的 SKILL.md 中应包含"验证方法"章节,明确列出推荐的 kubectl 命令和预期输出
-> - Agent 在 Layer 2 验证阶段,读取该章节,生成验证计划
-> - 不同故障类型的验证方法差异很大,不能套用统一模板
+The Agent's strategy: Layer 1 + Layer 2 are mandatory; Layer 3 is optional (depends on the Skill's definition). On verification failure, trigger a rollback (blade destroy).
 
 ---
 
-#### 2.2 可量化原则
+## 2. Design principles for Layer 2 verification
 
-验证结果应该是可量化的指标,而不是主观判断。
+### Q2: How do you design an effective Layer 2 verification plan?
 
-**示例对比**:
-- ❌ **主观判断**:"应用响应变慢了"
-- ✅ **可量化**:"P99 延迟从 100ms 增加到 3000ms"、"CPU 使用率从 10% 增加到 95%"
+**A2**: An effective Layer 2 plan follows these five principles:
 
-> **🤖 Agent 的实现**:
-> - 优先使用 `kubectl top`、`kubectl get -o json` 等返回数值型输出的命令
-> - 解析 JSON 或表格输出,提取关键指标(如 CPU 百分比、内存字节数、延迟毫秒数)
-> - 将提取的指标与阈值比较,做出通过/失败的判断
+#### 2.1 Be targeted
 
----
+The verification method MUST target the specific fault type, not a generic "check whether the system is healthy".
 
-#### 2.3 多源交叉验证原则
+**Comparison**:
+- ❌ **Generic**: `kubectl get pods -n default` (only checks the Pod exists)
+- ✅ **Targeted** (Pod CPU fullload): `kubectl top pod my-pod -n default`, asserting CPU utilisation > 80%
 
-单一数据源可能不可靠,应结合多个数据源交叉验证。
-
-**示例**:Pod OOM 验证
-- **数据源 1**:`kubectl get pod -o json` → 检查 `exitCode=137`、`reason=OOMKilled`
-- **数据源 2**:`kubectl describe pod` → 检查 Events 中是否有 OOMKilling 事件
-- **数据源 3**:`kubectl top pod` → 检查内存是否接近 limit
-- **数据源 4**:`kubectl logs --previous` → 检查容器崩溃前的日志,是否有 out of memory 记录
-
-> **🤖 Agent 的实现**:
-> - Skill 中应提供多个验证命令,形成验证链条
-> - Agent 依次执行这些命令,综合判断
-> - 如果某个数据源不可用(如精简镜像没有 top 命令),尝试备选方案
+> **🤖 How the Agent implements this**:
+> - A Skill's SKILL.md should contain a "verification method" section listing the recommended kubectl commands and expected output explicitly
+> - In the Layer 2 phase, the Agent reads that section and produces a verification plan
+> - Verification methods differ widely between fault types; a single template cannot be reused
 
 ---
 
-#### 2.4 时序性原则
+#### 2.2 Be quantifiable
 
-验证应在注入后的合理时间窗口内执行,过早或过晚都可能得到错误结论。
+The verification result should be a quantifiable metric, not a subjective judgement.
 
-**示例**:
-- **过早验证**:注入后立即检查,但 chaos 进程可能还在启动中,CPU 尚未升高
-- **过晚验证**:注入后等待太久,Pod 可能已被 HPA 扩容或自愈机制重建,故障现象消失
+**Comparison**:
+- ❌ **Subjective**: "the application got slower"
+- ✅ **Quantifiable**: "P99 latency went from 100ms to 3000ms", "CPU utilisation went from 10% to 95%"
 
-> **🤖 Agent 的实现**:
-> - 注入成功后,等待短暂的时间(如 **2-5 秒**),让故障生效
-> - 然后执行 Layer 2 验证
-> - 如果验证失败,可以重试 **1-2 次**(每次间隔 3-5 秒),排除时序问题
-> - 如果多次重试仍失败,判定为验证失败,触发回滚
-
----
-
-#### 2.5 可回滚原则
-
-验证过程中不应引入新的副作用,确保验证失败时可以安全回滚。
-
-**示例**:
-- ❌ **有副作用的验证**:`kubectl exec my-pod -- rm -rf /data/*`(删除了数据,无法恢复)
-- ✅ **无副作用的验证**:`kubectl exec my-pod -- df -h`(只读操作,不影响系统状态)
-
-> **🤖 Agent 的实现**:
-> - Layer 2 验证应只使用**只读命令**(get、describe、top、logs、exec 中的查询类命令)
-> - 如果需要执行有副作用的命令(如清理磁盘填充文件),应在**恢复阶段**执行,而不是验证阶段
-> - 验证失败时,**立即调用** `blade destroy`,不执行额外的清理操作
+> **🤖 How the Agent implements this**:
+> - Prefer commands that return numeric output, such as `kubectl top` and `kubectl get -o json`
+> - Parse the JSON or table output and extract the key metrics (CPU percentage, memory bytes, latency in ms)
+> - Compare the extracted metric against a threshold to decide pass/fail
 
 ---
 
-## 三、常见故障场景的验证方案
+#### 2.3 Cross-check multiple sources
 
-> **注**: 以下各故障场景仅提供验证方法论（方法名称、验证目标、判定标准、失败原因），具体验证命令见对应技能用例的「注入验证」章节。若无技能用例，使用 `kubectl(subcommand="top"/"exec"/"logs")` 并参考 kubectl-guide.md。
+A single data source may be unreliable; combine several and cross-check.
 
-### Q3: Pod CPU 满载的验证方案是什么?
+**Example**: verifying Pod OOM
+- **Source 1**: `kubectl get pod -o json` → check `exitCode=137`, `reason=OOMKilled`
+- **Source 2**: `kubectl describe pod` → check for an OOMKilling event in Events
+- **Source 3**: `kubectl top pod` → check whether memory is near the limit
+- **Source 4**: `kubectl logs --previous` → check the pre-crash logs for an out-of-memory record
+
+> **🤖 How the Agent implements this**:
+> - A Skill should provide several verification commands that form a verification chain
+> - The Agent runs them in turn and judges holistically
+> - If one source is unavailable (a minimal image with no top command), try the fallback
+
+---
+
+#### 2.4 Respect timing
+
+Verification should run within a reasonable time window after injection; too early or too late both yield wrong conclusions.
+
+**Examples**:
+- **Too early**: checking immediately after injection, while the chaos process may still be starting and CPU has not risen yet
+- **Too late**: waiting too long, by which point HPA may have scaled out or self-healing rebuilt the Pod, so the symptom is gone
+
+> **🤖 How the Agent implements this**:
+> - After a successful injection, wait briefly (**2-5 seconds**) for the fault to take effect
+> - Then run Layer 2 verification
+> - On failure, retry **1-2 times** (3-5 seconds apart) to rule out a timing issue
+> - If it still fails after the retries, declare verification failed and trigger a rollback
+
+---
+
+#### 2.5 Stay rollback-safe
+
+Verification must not introduce new side effects, so a failed verification can always roll back safely.
+
+**Comparison**:
+- ❌ **With side effects**: `kubectl exec my-pod -- rm -rf /data/*` (deletes data irrecoverably)
+- ✅ **Side-effect free**: `kubectl exec my-pod -- df -h` (read-only; does not change system state)
+
+> **🤖 How the Agent implements this**:
+> - Layer 2 verification must use **read-only commands** only (get, describe, top, logs, and query-style commands under exec)
+> - If a command with side effects is needed (e.g. cleaning up disk-filler files), run it in the **recovery phase**, not during verification
+> - On verification failure, **call** `blade destroy` **immediately** without performing extra cleanup
+
+---
+
+## 3. Verification plans for common fault scenarios
+
+> **Note**: each scenario below provides only the verification methodology (method name, verification goal, pass criteria, failure causes); the concrete commands live in the corresponding skill case's 「注入验证」 section. When there is no skill case, use `kubectl(subcommand="top"/"exec"/"logs")` and consult kubectl-guide.md.
+
+### Q3: What is the verification plan for Pod CPU fullload?
 
 **A3**:
 
-**Layer 2 验证**:
+**Layer 2 verification**:
 
-**方法 1:通过 kubectl top 验证 CPU 使用率**
-预期:CPU 使用率接近 limit(如 limit=500m,实际使用 450-500m)
+**Method 1: verify CPU utilisation with kubectl top**
+Expected: CPU usage close to the limit (e.g. limit=500m, actual 450-500m)
 
-**JSONPath 断言**:
-获取 CPU limit,然后与 top 输出比较
+**JSONPath assertion**:
+Read the CPU limit, then compare it with the top output
 
-**方法 2:通过 kubectl exec 验证 chaos 进程存在**
-预期:输出中包含 chaos_cpu 进程,且 CPU 占用高
+**Method 2: verify the chaos process exists via kubectl exec**
+Expected: the output contains a chaos_cpu process with high CPU usage
 
-**方法 3:通过应用日志验证延迟增加**
-预期:日志中出现 timeout、slow request、high latency 等关键词
+**Method 3: verify increased latency from application logs**
+Expected: the logs contain keywords such as timeout, slow request, high latency
 
-**Layer 3 验证**(可选):
-- 横向对比:同 Deployment 的其他 Pod CPU 是否正常。预期:只有目标 Pod CPU 高,其他 Pod CPU 正常(< 20%)
-- 验证 HPA 是否扩容。预期:如果 currentReplicas < maxReplicas 且 CPU 持续高,currentReplicas 应增加
+**Layer 3 verification** (optional):
+- Lateral comparison: is CPU normal on the Deployment's other Pods? Expected: only the target Pod has high CPU; the others are normal (< 20%)
+- Verify whether HPA scaled out. Expected: if currentReplicas < maxReplicas and CPU stays high, currentReplicas should increase
 
-**验证失败的可能原因**:
-- Pod 的 CPU limit 设置过大(如 4 核),chaos 进程无法占满
-- Pod 所在节点资源紧张,chaos 进程被节流
-- 应用本身是 CPU 密集型,已经占用了大部分 CPU,chaos 进程无法进一步提升
+**Possible reasons verification fails**:
+- The Pod's CPU limit is too large (e.g. 4 cores) for the chaos process to saturate
+- The Pod's node is resource-constrained and the chaos process is throttled
+- The application is itself CPU-intensive and already consumes most of the CPU, leaving the chaos process no headroom
 
-> **🤖 Agent 的决策逻辑**:
-> - 如果 `top pod` 显示 CPU < 50% limit,判定为验证失败
-> - 重试 1-2 次,排除时序问题
-> - 如果仍失败,调用 `blade destroy` 回滚,记录失败原因到实验历史
+> **🤖 The Agent's decision logic**:
+> - If `top pod` shows CPU < 50% of the limit, declare verification failed
+> - Retry 1-2 times to rule out a timing issue
+> - If it still fails, call `blade destroy` to roll back and record the failure reason in the experiment history
 
 ---
 
-### Q4: Pod 内存压力/OOM 的验证方案是什么?
+### Q4: What is the verification plan for Pod memory pressure / OOM?
 
 **A4**:
 
-**Layer 2 验证**:
+**Layer 2 verification**:
 
-**方法 1:通过 kubectl top 验证内存使用率**
-预期:内存使用接近 limit(如 limit=512Mi,实际使用 480-512Mi)
+**Method 1: verify memory utilisation with kubectl top**
+Expected: memory usage close to the limit (e.g. limit=512Mi, actual 480-512Mi)
 
-**方法 2:通过 kubectl get pod -o json 验证 OOMKilled**
-预期:返回 "OOMKilled"；返回 137(128+9,SIGKILL)；restartCount > 0(表示容器已重启)
+**Method 2: verify OOMKilled via kubectl get pod -o json**
+Expected: returns "OOMKilled"; returns 137 (128+9, SIGKILL); restartCount > 0 (the container restarted)
 
-**方法 3:通过 kubectl describe 验证 Events**
-预期:Events 中出现 "OOMKilling" 或 "Memory cgroup out of memory"
+**Method 3: verify Events via kubectl describe**
+Expected: Events contain "OOMKilling" or "Memory cgroup out of memory"
 
-**方法 4:通过 kubectl logs --previous 验证崩溃前日志**
-预期:日志中出现 "out of memory"、"Killed"、"signal 9" 等关键词
+**Method 4: verify the pre-crash logs via kubectl logs --previous**
+Expected: the logs contain keywords such as "out of memory", "Killed", "signal 9"
 
-**Layer 3 验证**(可选):
-- 验证 Deployment 是否自动重建 Pod。预期:availableReplicas 短暂下降后恢复
-- 验证新 Pod 是否正常启动。预期:新 Pod 处于 Running 状态,READY=1/1
+**Layer 3 verification** (optional):
+- Verify the Deployment recreates the Pod automatically. Expected: availableReplicas dips briefly, then recovers
+- Verify the new Pod starts healthily. Expected: the new Pod is Running with READY=1/1
 
-**验证失败的可能原因**:
-- `--mem-size` 参数设置过小,未达到 memory limit
-- Pod 没有设置 memory limit,导致可以无限使用内存,不会触发 OOMKill
-- 应用在内存压力下主动降级(如减少缓存),避免了 OOM
+**Possible reasons verification fails**:
+- `--mem-size` is set too low to reach the memory limit
+- The Pod has no memory limit, so it can consume memory without bound and never triggers OOMKill
+- The application degrades gracefully under memory pressure (e.g. shrinking its cache), avoiding OOM
 
-> **🤖 Agent 的决策逻辑**:
-> - 如果目标是验证 OOM,应检查 `lastState.terminated.reason == "OOMKilled"`
-> - 如果目标是验证内存压力(不一定要 OOM),应检查 `top pod` 中内存接近 limit
-> - 根据 Skill 中的验证要求,选择合适的断言条件
+> **🤖 The Agent's decision logic**:
+> - If the goal is to verify OOM, check `lastState.terminated.reason == "OOMKilled"`
+> - If the goal is to verify memory pressure (OOM not required), check that memory in `top pod` is near the limit
+> - Pick the right assertion based on the Skill's stated verification requirement
 
 ---
 
-> **⚠️ 网络故障通用注意事项**（Q5 网络延迟、Q6 网络丢包均适用）:
-> - **localhost 不受 tc 规则影响**: ChaosBlade 网络故障注入底层使用 Linux `tc`(traffic control)，`tc` 规则作用于网络接口(如 eth0)但不影响 localhost(127.0.0.1)回环流量。验证时必须使用 Pod 的 ClusterIP 或 Service DNS 名称，严禁使用 localhost 测试连通性
-> - **Readiness Probe 兼容性**: pod-network 故障是否导致 Endpoints 移除取决于目标 Pod 的 Readiness Probe 类型:
->   - `exec` 类型探针: 在容器内通过 localhost 执行，**不受** tc 规则影响 → Pod 保持 Ready → Endpoints **不会**移除
->   - `httpGet`/`tcpSocket` 类型探针(端口在受影响范围内): **可能**因网络故障而失败 → Pod 变为 NotReady → Endpoints 被移除
->   - 验证前必须通过 `kubectl describe pod <pod>` 确认探针类型，据此调整验证预期
+> **⚠️ General notes for network faults** (apply to both Q5 network delay and Q6 packet loss):
+> - **localhost is NOT affected by tc rules**: ChaosBlade network injection uses Linux `tc` (traffic control) underneath; `tc` rules act on a network interface (e.g. eth0) but do not affect localhost (127.0.0.1) loopback traffic. Verification MUST use the Pod's ClusterIP or the Service DNS name; testing connectivity via localhost is strictly forbidden
+> - **Readiness Probe compatibility**: whether a pod-network fault causes Endpoints removal depends on the target Pod's Readiness Probe type:
+>   - `exec` probes: run inside the container over localhost, so they are **unaffected** by tc rules → the Pod stays Ready → Endpoints is **not** removed
+>   - `httpGet`/`tcpSocket` probes (on a port within the affected range): **may** fail because of the network fault → the Pod becomes NotReady → Endpoints is removed
+>   - Before verifying, confirm the probe type via `kubectl describe pod <pod>` and adjust the expectation accordingly
 
-### Q5: Pod 网络延迟的验证方案是什么?
+### Q5: What is the verification plan for Pod network delay?
 
 **A5**:
 
-**Layer 2 验证**:
+**Layer 2 verification**:
 
-**方法 1:通过 kubectl exec ping 验证延迟**
-预期:rtt min/avg/max/mdev 中的 avg 接近注入的延迟值(如 3000ms)
+**Method 1: verify latency with kubectl exec ping**
+Expected: the avg in rtt min/avg/max/mdev is close to the injected delay (e.g. 3000ms)
 
-**注意事项**:
-- `<target-ip>` 应是集群内的另一个 Pod IP 或 Service ClusterIP
-- 不要 ping 外部地址(如 8.8.8.8),因为延迟可能受外部网络影响
-- 如果目标 Pod 使用 distroless 镜像,可能没有 ping 命令,需换用其他方法
+**Caveats**:
+- `<target-ip>` should be another in-cluster Pod IP or a Service ClusterIP
+- Do NOT ping an external address (e.g. 8.8.8.8), since external network conditions distort the latency
+- If the target Pod uses a distroless image it may have no ping command, so another method is needed
 
-**方法 2:通过 kubectl exec curl 验证 HTTP 延迟**
-预期:time_total 接近注入的延迟值
+**Method 2: verify HTTP latency with kubectl exec curl**
+Expected: time_total close to the injected delay
 
-**方法 3:通过应用日志验证超时**
-预期:日志中出现 "timeout"、"i/o timeout"、"deadline exceeded"、"connection timed out" 等关键词
+**Method 3: verify timeouts from application logs**
+Expected: the logs contain keywords such as "timeout", "i/o timeout", "deadline exceeded", "connection timed out"
 
-**方法 4:通过 kubectl exec ss/netstat 验证连接状态**
-预期:可以看到连接处于 ESTABLISHED 状态,但可能有大量重传
+**Method 4: verify connection state with kubectl exec ss/netstat**
+Expected: connections are visible in ESTABLISHED state, but there may be many retransmissions
 
-**Layer 3 验证**(可选):
-- 验证调用链下游是否受影响。预期:上游服务的日志中出现 retry、fallback、circuit breaker open 等记录
-- 验证 Service 整体错误率。预期:Endpoints 非空(网络延迟不会导致 Pod 从 Endpoints 移除,除非健康检查失败)
+**Layer 3 verification** (optional):
+- Verify whether downstream calls are affected. Expected: the upstream service's logs show retry, fallback, circuit breaker open records
+- Verify the Service's overall error rate. Expected: Endpoints is non-empty (network delay alone does not remove a Pod from Endpoints unless the health check fails)
 
-**验证失败的可能原因**:
-- 注入的延迟值过小(如 10ms),被网络抖动掩盖
-- **(见上方网络故障通用注意事项)** localhost 不受 tc 规则影响 + Readiness Probe 兼容性问题
+**Possible reasons verification fails**:
+- The injected delay is too small (e.g. 10ms) and is masked by network jitter
+- **(see the general network-fault notes above)** localhost is unaffected by tc rules + Readiness Probe compatibility
 
-> **🤖 Agent 的决策逻辑**:
-> - 解析 ping 或 curl 的输出,提取延迟值(单位 ms)
-> - 如果延迟值 < 注入值的 50%,判定为验证失败(允许一定误差)
-> - 重试 1-2 次,排除网络抖动
-> - 如果仍失败,调用 `blade destroy` 回滚
+> **🤖 The Agent's decision logic**:
+> - Parse the ping or curl output and extract the latency (in ms)
+> - If the latency is < 50% of the injected value, declare verification failed (some error margin is allowed)
+> - Retry 1-2 times to rule out network jitter
+> - If it still fails, call `blade destroy` to roll back
 
 ---
 
-### Q6: Pod 网络丢包的验证方案是什么?
+### Q6: What is the verification plan for Pod packet loss?
 
 **A6**:
 
-**Layer 2 验证**:
+**Layer 2 verification**:
 
-**方法 1:通过 kubectl exec ping 验证丢包率**
-预期:输出中包含 "X% packet loss",X 接近注入的丢包率(如 50%)
+**Method 1: verify the loss rate with kubectl exec ping**
+Expected: the output contains "X% packet loss" where X is close to the injected rate (e.g. 50%)
 
-**解析示例**:
-- 提取 "50% packet loss",与注入的 `--percent 50` 比较
+**Parsing example**:
+- Extract "50% packet loss" and compare it with the injected `--percent 50`
 
-**方法 2:通过 kubectl exec curl 验证连接失败**
-预期:部分请求失败,返回 "Connection reset by peer"、"Operation timed out" 等错误
+**Method 2: verify connection failures with kubectl exec curl**
+Expected: some requests fail with errors such as "Connection reset by peer", "Operation timed out"
 
-**方法 3:通过应用日志验证连接重置**
-预期:日志中出现 "connection reset"、"broken pipe"、"no route to host"、"retry" 等关键词
+**Method 3: verify connection resets from application logs**
+Expected: the logs contain keywords such as "connection reset", "broken pipe", "no route to host", "retry"
 
-**Layer 3 验证**(可选):
-- 验证重试机制是否生效。预期:上游服务日志中出现 "retrying request"、"attempt 2/3" 等记录
-- 验证熔断器是否触发。预期:如果丢包率高且持续时间长,熔断器可能打开,日志中出现 "circuit breaker open"
+**Layer 3 verification** (optional):
+- Verify the retry mechanism works. Expected: the upstream service's logs show "retrying request", "attempt 2/3" records
+- Verify whether the circuit breaker trips. Expected: with a high loss rate over a long period, the breaker may open and the logs show "circuit breaker open"
 
-**验证失败的可能原因**:
-- 丢包率设置过低(如 5%),被 TCP 重传掩盖,应用层感知不到
-- **(见上方网络故障通用注意事项)** localhost 不受 tc 规则影响 + Readiness Probe 兼容性问题
-- 应用层有强大的重试机制,自动恢复了丢包导致的失败
+**Possible reasons verification fails**:
+- The loss rate is too low (e.g. 5%) and is masked by TCP retransmission, so the application layer never notices
+- **(see the general network-fault notes above)** localhost is unaffected by tc rules + Readiness Probe compatibility
+- The application has a robust retry mechanism that recovered from the loss automatically
 
-> **🤖 Agent 的决策逻辑**:
-> - 解析 ping 输出,提取丢包率百分比
-> - 如果丢包率 < 注入值的 50%,判定为验证失败
-> - 重试 1-2 次,排除偶然性
-> - 如果仍失败,调用 `blade destroy` 回滚
+> **🤖 The Agent's decision logic**:
+> - Parse the ping output and extract the loss percentage
+> - If the loss rate is < 50% of the injected value, declare verification failed
+> - Retry 1-2 times to rule out randomness
+> - If it still fails, call `blade destroy` to roll back
 
 ---
 
-### Q7: Pod DNS 故障的验证方案是什么?
+### Q7: What is the verification plan for a Pod DNS fault?
 
 **A7**:
 
-**Layer 2 验证**:
+**Layer 2 verification**:
 
-**ChaosBlade pod-network dns 的实现机制**:修改目标 Pod 的 /etc/hosts 文件,添加 `<forged-ip> <domain> #chaosblade` 条目。这意味着故障效果只在使用系统解析器(getaddrinfo/gethostbyname)时才会生效。
+**How ChaosBlade pod-network dns works**: it edits the target Pod's /etc/hosts file, adding a `<forged-ip> <domain> #chaosblade` entry. This means the fault only takes effect when the system resolver (getaddrinfo/gethostbyname) is used.
 
-**方法 1(首选):通过 kubectl exec cat /etc/hosts 验证劫持条目**
-预期:/etc/hosts 中包含 `#chaosblade` 标记的条目,如 `1.1.1.1 example.com #chaosblade`
+**Method 1 (preferred): verify the hijack entry via kubectl exec cat /etc/hosts**
+Expected: /etc/hosts contains an entry tagged `#chaosblade`, e.g. `1.1.1.1 example.com #chaosblade`
 
-**方法 2(效果验证):通过 kubectl exec ping/wget/curl 验证域名解析到伪造 IP**
-预期:ping 输出 `PING example.com (1.1.1.1)`;wget 连接到伪造 IP(可能返回 403/连接拒绝)
+**Method 2 (effect verification): verify the domain resolves to the forged IP via kubectl exec ping/wget/curl**
+Expected: ping prints `PING example.com (1.1.1.1)`; wget connects to the forged IP (may return 403 / connection refused)
 
-**方法 3:通过应用日志验证解析异常**
-预期:日志中出现 "Connection refused"、"Unknown host"、"连接超时" 等关键词
-注意:仅当目标应用实际使用被劫持域名时,此方法才有效
+**Method 3: verify resolution errors from application logs**
+Expected: the logs contain keywords such as "Connection refused", "Unknown host", "connection timed out"
+Note: this method only works when the target application actually uses the hijacked domain
 
-**方法 4:验证其他域名不受影响**
-预期:ping <其他域名> 解析到正常 IP,证明劫持仅针对特定域名
+**Method 4: verify other domains are unaffected**
+Expected: `ping <another domain>` resolves to its normal IP, proving the hijack targets only the specified domain
 
-**nslookup/dig 不适用于此故障类型**:
-nslookup 和 dig 直接查询 DNS 服务器,完全绕过 /etc/hosts 文件。因此它们返回的始终是真实 DNS 记录,而非 /etc/hosts 中的劫持条目。使用 nslookup/dig 验证此类型 DNS 劫持会得到"故障未生效"的错误结论。
+**nslookup/dig do NOT apply to this fault type**:
+nslookup and dig query the DNS server directly and bypass /etc/hosts entirely. They therefore always return the real DNS record rather than the hijack entry in /etc/hosts. Using nslookup/dig to verify this kind of DNS hijack yields the WRONG conclusion that "the fault did not take effect".
 
-**Layer 3 验证**(可选):
-- 验证 DNS 缓存是否生效。预期:如果应用有 DNS 缓存,第二次查询可能仍然成功(缓存未过期)
-- 验证 CoreDNS 本身是否正常(不应受到影响)。预期:CoreDNS Pod 处于 Running 状态(验证故障只影响目标 Pod,不影响集群 DNS)
+**Layer 3 verification** (optional):
+- Verify DNS caching behaviour. Expected: if the application caches DNS, a second lookup may still succeed (cache not yet expired)
+- Verify CoreDNS itself is healthy (it must NOT be affected). Expected: the CoreDNS Pod is Running (proving the fault only affects the target Pod, not cluster DNS)
 
-**验证失败的可能原因**:
-- 应用使用了 IP 直连而非域名,DNS 故障不影响应用
-- 应用有 DNS 缓存,缓存未过期前仍然可以解析
-- 注入的 `--domain` 参数与应用实际使用的域名不匹配
-- 使用了 nslookup/dig 验证(这两种工具绕过 /etc/hosts,无法检测此类型 DNS 劫持)
+**Possible reasons verification fails**:
+- The application connects by IP rather than by domain, so the DNS fault does not affect it
+- The application caches DNS and can still resolve until the cache expires
+- The injected `--domain` does not match the domain the application actually uses
+- nslookup/dig were used for verification (both bypass /etc/hosts and cannot detect this kind of DNS hijack)
 
-> **Agent 的决策逻辑**:
-> - 首选 `cat /etc/hosts` 确认劫持条目(直接证据),再用 `ping` 或 `wget` 确认效果(应用层证据)
-> - 如果目标应用不依赖被劫持域名,标记应用影响验证为 skipped 并建议用户选择应用实际使用的域名
-> - 不要使用 `nslookup` 或 `dig` 验证 ChaosBlade DNS 故障
+> **The Agent's decision logic**:
+> - Prefer `cat /etc/hosts` to confirm the hijack entry (direct evidence), then use `ping` or `wget` to confirm the effect (application-level evidence)
+> - If the target application does not depend on the hijacked domain, mark application-impact verification as skipped and advise the user to pick a domain the application actually uses
+> - Do NOT use `nslookup` or `dig` to verify a ChaosBlade DNS fault
 
 ---
 
-### Q8: Pod 磁盘填充的验证方案是什么?
+### Q8: What is the verification plan for Pod disk filling?
 
 **A8**:
 
-**Layer 2 验证**:
+**Layer 2 verification**:
 
-**方法 1:通过 kubectl exec df 验证磁盘使用率**
-预期:Use% 接近 100%(如 95-100%)
+**Method 1: verify disk utilisation via kubectl exec df**
+Expected: Use% close to 100% (e.g. 95-100%)
 
-**解析示例**:
-- 提取 "98%",与预期(接近 100%)比较
+**Parsing example**:
+- Extract "98%" and compare it with the expectation (close to 100%)
 
-**方法 2:通过 kubectl exec ls 验证填充文件存在**
-预期:输出中包含大文件(如 1G 大小的 chaos_fill_xxx)
+**Method 2: verify the filler file exists via kubectl exec ls**
+Expected: the output contains a large file (e.g. a 1G chaos_fill_xxx)
 
-**方法 3:通过应用日志验证写入失败**
-预期:日志中出现 "no space left on device"、"write error"、"disk full"、"ENOSPC" 等关键词
+**Method 3: verify write failures from application logs**
+Expected: the logs contain keywords such as "no space left on device", "write error", "disk full", "ENOSPC"
 
-**方法 4:通过 kubectl exec touch 验证无法创建新文件**
-预期:返回错误 "No space left on device"
+**Method 4: verify new files cannot be created via kubectl exec touch**
+Expected: returns the error "No space left on device"
 
-**Layer 3 验证**(可选):
-- 验证同节点其他 Pod 是否受影响。预期:只有目标 Pod 的挂载卷被填充,其他 Pod 不受影响(除非共享同一 PV)
-- 验证日志轮转机制是否生效。预期:如果应用有日志轮转,旧日志文件应被清理,释放部分空间
+**Layer 3 verification** (optional):
+- Verify whether other Pods on the same node are affected. Expected: only the target Pod's mounted volume is filled; other Pods are unaffected (unless they share the same PV)
+- Verify log rotation works. Expected: if the application rotates logs, old log files should be cleaned up, freeing some space
 
-**验证失败的可能原因**:
-- `--size` 参数设置过小,未达到磁盘容量上限
-- 目标路径 `/data` 不是 Pod 挂载的 Volume,而是容器根文件系统,填充可能影响容器运行时
-- 应用有自动清理机制(如日志轮转、临时文件清理),抵消了填充效果
+**Possible reasons verification fails**:
+- `--size` is set too small to reach the disk's capacity ceiling
+- The target path `/data` is not a Volume mounted by the Pod but the container's root filesystem, so filling it may affect the container runtime
+- The application has automatic cleanup (log rotation, temp-file cleanup) that offsets the filling
 
-> **🤖 Agent 的决策逻辑**:
-> - 解析 `df -h` 输出,提取 Use% 字段
-> - 如果 Use% < 90%,判定为验证失败
-> - 重试 1-2 次,排除文件系统统计延迟
-> - 如果仍失败,调用 `blade destroy` 回滚
-> - **重要**:如果 `--retain=true`(默认),恢复后需提醒用户手动清理填充文件
+> **🤖 The Agent's decision logic**:
+> - Parse the `df -h` output and extract the Use% field
+> - If Use% < 90%, declare verification failed
+> - Retry 1-2 times to rule out filesystem-statistics lag
+> - If it still fails, call `blade destroy` to roll back
+> - **Important**: when `--retain=true` (the default), remind the user to clean up the filler files manually after recovery
 
 ---
 
-### Q9: Node CPU 满载的验证方案是什么?
+### Q9: What is the verification plan for Node CPU fullload?
 
 **A9**:
 
-**Layer 2 验证**:
+**Layer 2 verification**:
 
-**方法 1:通过 kubectl top node 验证 CPU 使用率**
-预期:CPU 使用率接近注入值(如 90%)
+**Method 1: verify CPU utilisation via kubectl top node**
+Expected: CPU utilisation close to the injected value (e.g. 90%)
 
-**解析示例**:
-- 提取 "90%",与注入的 `--cpu-percent 90` 比较
+**Parsing example**:
+- Extract "90%" and compare it with the injected `--cpu-percent 90`
 
-**方法 2:通过 kubectl describe node 验证 Conditions**
-预期:Conditions 中 Ready=True(除非 CPU 高到影响 kubelet)
+**Method 2: verify Conditions via kubectl describe node**
+Expected: Ready=True in Conditions (unless CPU is high enough to affect kubelet)
 
-**方法 3:通过 kubectl top pod 验证同节点 Pod 受影响**
-预期:同节点上的 Pod CPU 使用率可能升高(因为 CPU 竞争)
+**Method 3: verify Pods on the same node are affected via kubectl top pod**
+Expected: CPU usage of Pods on the same node may rise (because of CPU contention)
 
-**Layer 3 验证**(可选):
-- 验证调度器是否避开该节点。预期:新 Pod 不被调度到 worker-1(如果其他节点有空闲资源)
-- 验证 HPA 是否因节点 CPU 高而扩容。预期:如果 Pod CPU 因节点竞争而升高,HPA 可能触发扩容
+**Layer 3 verification** (optional):
+- Verify the scheduler avoids that node. Expected: new Pods are not scheduled onto worker-1 (provided other nodes have free capacity)
+- Verify whether HPA scales out because of the node's high CPU. Expected: if Pod CPU rises through node contention, HPA may trigger a scale-out
 
-**验证失败的可能原因**:
-- 节点 CPU 核心数过多(如 32 核),`--cpu-count` 未指定,导致只影响了部分核心
-- 节点上运行的负载很轻,即使注入 CPU 满载,整体 CPU% 仍然不高
-- 注入的 `--cpu-percent` 参数与实际测量方式不一致(如 blade 按单核计算,kubectl top 按总核计算)
+**Possible reasons verification fails**:
+- The node has too many CPU cores (e.g. 32) and `--cpu-count` was not specified, so only some cores were affected
+- The node's workload is very light, so overall CPU% stays low even with CPU fullload injected
+- The injected `--cpu-percent` does not match how it is measured (blade may compute per-core while kubectl top computes across all cores)
 
-> **🤖 Agent 的决策逻辑**:
-> - 解析 `top node` 输出,提取 CPU% 字段
-> - 如果 CPU% < 注入值的 70%,判定为验证失败(节点级验证允许更大误差)
-> - 重试 1-2 次,排除瞬时波动
-> - 如果仍失败,调用 `blade destroy` 回滚
+> **🤖 The Agent's decision logic**:
+> - Parse the `top node` output and extract the CPU% field
+> - If CPU% < 70% of the injected value, declare verification failed (node-level verification allows a wider margin)
+> - Retry 1-2 times to rule out transient fluctuation
+> - If it still fails, call `blade destroy` to roll back
 
 ---
 
-### Q10: Node 磁盘满的验证方案是什么?
+### Q10: What is the verification plan for a full node disk?
 
 **A10**:
 
-**Layer 2 验证**:
+**Layer 2 verification**:
 
-**方法 1:通过 kubectl describe node 验证 DiskPressure**
-预期:Conditions 中 DiskPressure=True
+**Method 1: verify DiskPressure via kubectl describe node**
+Expected: DiskPressure=True in Conditions
 
-**解析示例**:
-- 关键指标:DiskPressure=True
+**Parsing example**:
+- Key indicator: DiskPressure=True
 
-**方法 2:通过 kubectl get events 验证磁盘压力事件**
-预期:Events 中出现 "NodeHasDiskPressure"、"insufficient disk" 等记录
+**Method 2: verify disk-pressure events via kubectl get events**
+Expected: Events contain records such as "NodeHasDiskPressure", "insufficient disk"
 
-**方法 3:通过 kubectl top node 验证磁盘使用率(如果 metrics-server 支持)**
-注意:kubectl top 通常只显示 CPU/内存,不显示磁盘。需用 describe 或 df
+**Method 3: verify disk utilisation via kubectl top node (if metrics-server supports it)**
+Note: kubectl top usually shows only CPU/memory, not disk. Use describe or df instead
 
-**替代方法:通过 SSH 登录节点执行 df**(如果 Agent 有节点访问权限)
-预期:Use% 接近 100%
+**Alternative: SSH onto the node and run df** (if the Agent has node access)
+Expected: Use% close to 100%
 
-**方法 4:通过集群工具 Pod 验证**
-- 查找集群内的工具 Pod（如 otel-c-tool）用于执行 ChaosBlade 命令和 kubectl API 检查
-- **注意**：otel-c-tool 不挂载 /host，`df -h` 显示的是 overlay 文件系统，不能用于宿主机磁盘验证
-- 工具 Pod 可用于：ChaosBlade 命令（blade status/destroy）、kubectl API 检查（describe node、top node）
+**Method 4: verify via an in-cluster tool Pod**
+- Find an in-cluster tool Pod (e.g. otel-c-tool) to run ChaosBlade commands and kubectl API checks
+- **Note**: otel-c-tool does NOT mount /host, so its `df -h` shows the overlay filesystem and cannot be used to verify host disk usage
+- The tool Pod is usable for: ChaosBlade commands (blade status/destroy) and kubectl API checks (describe node, top node)
 
-**方法 5:通过 kubectl debug node/ 验证（宿主机文件系统检查的正确方法）**
-- `kubectl debug node/<node> --image=busybox -- sleep 3600` 创建临时调试容器，节点的根文件系统自动挂载到 `/host/` 目录
-- **两步法（必须）**：先创建 debug pod（含 `-- sleep 3600` 保活），再 kubectl exec 进去执行命令。裸 busybox 会立即退出（Succeeded phase）
-- 所有宿主机路径必须加 `/host/` 前缀（如 `/host/tmp`、`/host/var/log`）
-- 不要使用 `-it` 标志（Agent 执行环境为非交互式）
-- 调试容器使用后应清理
-- **宿主机磁盘/IO/进程验证应使用此方法**：otel-c-tool 不挂载 /host，无法执行 `df -h /host`、`iostat` 等命令
-- **版本偏差注意**：如果 `kubectl debug node/` 返回 "NotFound" 错误，可能是 kubectl 客户端与服务端版本差异超过 ±1 minor 版本。此时无法通过 kubectl 工具获取宿主机文件系统访问，需回退到 API 层面检查（Method 1: `kubectl describe node` 看 DiskPressure + Method 2: `kubectl get events` 看磁盘压力事件）。**注意**：`kubectl run` 不在允许的子命令列表中，不可用作备选
+**Method 5: verify via kubectl debug node/ (the correct way to inspect the host filesystem)**
+- `kubectl debug node/<node> --image=busybox -- sleep 3600` creates a temporary debug container with the node's root filesystem mounted automatically at `/host/`
+- **Two-step approach (mandatory)**: first create the debug pod (with `-- sleep 3600` to keep it alive), then kubectl exec into it to run commands. A bare busybox exits immediately (Succeeded phase)
+- Every host path MUST be prefixed with `/host/` (e.g. `/host/tmp`, `/host/var/log`)
+- Do NOT use the `-it` flag (the Agent's execution environment is non-interactive)
+- Clean up the debug container after use
+- **Host disk / IO / process verification MUST use this method**: otel-c-tool does not mount /host and cannot run `df -h /host`, `iostat` and similar commands
+- **Beware version skew**: if `kubectl debug node/` returns a "NotFound" error, the kubectl client and server versions may differ by more than ±1 minor version. Host-filesystem access is then unobtainable through the kubectl tool, so fall back to API-level checks (Method 1: `kubectl describe node` for DiskPressure + Method 2: `kubectl get events` for disk-pressure events). **Note**: `kubectl run` is NOT in the allowed sub-command list and cannot be used as a fallback
 
-**⚠️ Overlay 文件系统陷阱**:
-- `kubectl exec <任意Pod> -- df -h` 查看的是**容器 overlay 文件系统**，而非宿主机文件系统
-- **otel-c-tool 也受此限制**：它不挂载 /host，`df -h` 显示的仍是 overlay
-- 只有 kubectl debug node/ 提供 /host 挂载，能查看宿主机真实磁盘使用情况
+**⚠️ The overlay-filesystem trap**:
+- `kubectl exec <any Pod> -- df -h` inspects the **container's overlay filesystem**, not the host's
+- **otel-c-tool is subject to this too**: it does not mount /host, so its `df -h` still shows the overlay
+- Only kubectl debug node/ provides the /host mount and can show real host disk usage
 
-**⚠️ 多磁盘分区陷阱 (Multi-Disk Topology)**:
-- K8s 区分 **nodefs**（根分区，kubelet/配置文件所在）和 **imagefs**（容器运行时存储：镜像、容器可写层、日志）。它们可能在不同的物理磁盘上
-- 当 `kubectl describe node` 的 allocatable 中同时出现 `nodefs` 和 `imagefs` 字段时，说明两者分离
-- DiskPressure 可由**任一**文件系统触发。`df -h /host` 只检查 nodefs
-- 当 `--path` 指向容器 overlay 路径（如 `/tmp`、`/var/log`），填充写入 imagefs。通过 `df -h /host` 验证将显示无变化
-- 正确验证：使用 `df -h`（无路径参数）列出所有挂载的文件系统，识别使用率上升的分区，与注入 `--path` 对应
+**⚠️ The multi-disk topology trap**:
+- K8s distinguishes **nodefs** (the root partition, where kubelet and config files live) from **imagefs** (container-runtime storage: images, container writable layers, logs). They may sit on different physical disks
+- When `kubectl describe node`'s allocatable shows BOTH `nodefs` and `imagefs` fields, the two are separate
+- DiskPressure can be triggered by **either** filesystem. `df -h /host` only checks nodefs
+- When `--path` points at a container overlay path (e.g. `/tmp`, `/var/log`), the filling writes to imagefs. Verifying via `df -h /host` will show no change
+- Correct verification: run `df -h` (no path argument) to list every mounted filesystem, identify the partition whose utilisation rose, and match it to the injected `--path`
 
-**`--path` 参数语义**:
-- **CRD 模式**（默认，`blade create k8s`）：`--path` 是容器文件系统内的相对路径。`/tmp`、`/var/log` 在容器 overlay 内，由 imagefs 支持；`/var/lib/docker`、`/var/lib/containerd` 如存在于宿主机根分区则由 nodefs 支持
-- **exec-os 模式**（宿主机上直接运行 `blade`）：`--path` 是宿主机字面路径。`/tmp` 填充宿主机的 `/tmp`，由 nodefs 支持
-- 验证时需根据注入模式和 `--path` 值推理填充作用在哪个分区
+**Semantics of the `--path` parameter**:
+- **CRD mode** (the default, `blade create k8s`): `--path` is a path relative to the container filesystem. `/tmp` and `/var/log` live inside the container overlay and are backed by imagefs; `/var/lib/docker` and `/var/lib/containerd`, if they exist on the host root partition, are backed by nodefs
+- **exec-os mode** (running `blade` directly on the host): `--path` is a literal host path. `/tmp` fills the host's `/tmp`, backed by nodefs
+- When verifying, reason about which partition the filling acts on from the injection mode and the `--path` value
 
-**Layer 3 验证**(可选):
-- 验证节点上的 Pod 是否受影响。预期:部分 Pod 可能处于 Pending 或 FailedMount 状态
-- 验证 kubelet 日志。预期:日志中出现 "disk pressure"、"evicting pods" 等记录
+**Layer 3 verification** (optional):
+- Verify whether Pods on the node are affected. Expected: some Pods may be Pending or FailedMount
+- Verify the kubelet log. Expected: the log contains records such as "disk pressure", "evicting pods"
 
-**验证失败的可能原因**:
-- `--size` 参数设置过小,未达到磁盘容量上限
-- 填充的路径不是节点根文件系统,而是某个挂载卷,不影响节点级别的 DiskPressure
-- 节点有大容量磁盘(如 1TB),填充 10GB 不足以触发 DiskPressure
-- 填充路径（via `--path`）对应的是 imagefs 分区，但 `df -h /host` 只检查 nodefs 分区，导致误判为填充无效
-- kubectl debug 因版本偏差失败，未能获取宿主机文件系统信息
+**Possible reasons verification fails**:
+- `--size` is set too small to reach the disk's capacity ceiling
+- The filled path is not the node's root filesystem but some mounted volume, so it does not affect node-level DiskPressure
+- The node has a large disk (e.g. 1TB) and filling 10GB is not enough to trigger DiskPressure
+- The path filled (via `--path`) corresponds to the imagefs partition, but `df -h /host` only checks nodefs, leading to the wrong conclusion that the filling failed
+- kubectl debug failed due to version skew, so host filesystem information could not be obtained
 
-> **🤖 Agent 的决策逻辑**:
-> - 优先检查 `describe node` 中的 DiskPressure 条件
-> - 如果 DiskPressure=False,但 `df -h` 显示 Use% > 90%,说明填充生效但未触发 kubelet 的压力阈值
-> - 如果 `df -h /host` 显示使用率无变化，执行 `df -h`（无路径参数）查看所有分区，确认填充是否作用在 imagefs 上
-> - 根据 Skill 中的验证要求,选择合适的断言条件(是要求 DiskPressure=True,还是只要求磁盘使用率高)
+> **🤖 The Agent's decision logic**:
+> - Check the DiskPressure condition in `describe node` first
+> - If DiskPressure=False but `df -h` shows Use% > 90%, the filling took effect without crossing kubelet's pressure threshold
+> - If `df -h /host` shows no change in utilisation, run `df -h` (no path argument) to inspect every partition and confirm whether the filling acted on imagefs
+> - Pick the right assertion based on the Skill's stated verification requirement (does it require DiskPressure=True, or merely high disk utilisation)
 
-### Q11: Node 磁盘 IO 过高的验证方案是什么?
+### Q11: What is the verification plan for high node disk IO?
 
-**A11**: Node 磁盘 IO 过高的验证分三层指标:
+**A11**: Verifying high node disk IO spans three metric levels:
 
-**节点级指标（必须验证）**:
+**Node-level metrics (mandatory)**:
 
-| 指标 | 标准命令 | BusyBox 备选 | 判定标准 |
+| Metric | Standard command | BusyBox alternative | Pass criteria |
 |------|---------|-------------|---------|
-| %util | `iostat -xd 1 3` | 不支持 | 接近 100% |
-| tps / 吞吐量 | 同上 | `iostat -d -k 1 3` | 显著高于基线 |
-| %iowait | `iostat -c 1 3` | 同上（支持） | 显著升高（如 >10%）|
-| dd 进程 | `ps aux \| grep dd` | `ps \| grep dd` | ChaosBlade dd 进程存在 |
+| %util | `iostat -xd 1 3` | not supported | close to 100% |
+| tps / throughput | as above | `iostat -d -k 1 3` | significantly above baseline |
+| %iowait | `iostat -c 1 3` | as above (supported) | significantly elevated (e.g. >10%) |
+| dd process | `ps aux \| grep dd` | `ps \| grep dd` | the ChaosBlade dd process exists |
 
-**Pod 级指标（应验证）**:
+**Pod-level metrics (should verify)**:
 
-| 指标 | 命令 | 判定标准 |
+| Metric | Command | Pass criteria |
 |------|------|---------|
-| 写入延迟 | `kubectl exec <pod> -- dd if=/dev/zero of=/tmp/test bs=1M count=100` | 耗时显著增加 |
-| 磁盘 Events | `kubectl describe pod <pod>` | 出现 IO 相关事件 |
+| Write latency | `kubectl exec <pod> -- dd if=/dev/zero of=/tmp/test bs=1M count=100` | duration increases significantly |
+| Disk Events | `kubectl describe pod <pod>` | IO-related events appear |
 
-**验证优先级**:
-1. `iostat -c 1 3` 确认 %iowait 升高（最通用，BusyBox 也支持）
-2. `ps | grep dd` 确认 dd 进程运行（直接证据）
-3. `iostat -d -k 1 3` 确认 tps/吞吐量变化（增量数据）
-4. Pod 级 dd 测试确认读写延迟影响
+**Verification priority**:
+1. `iostat -c 1 3` to confirm %iowait rose (most portable; BusyBox supports it)
+2. `ps | grep dd` to confirm the dd process is running (direct evidence)
+3. `iostat -d -k 1 3` to confirm the tps/throughput change (incremental data)
+4. A Pod-level dd test to confirm the read/write latency impact
 
-**注意事项**:
-- BusyBox `iostat` 不支持 `-x` 标志，无法直接获取 %util
-- `iostat -d` 的累积行可能出现整数溢出（如 922337203685...），应只关注增量间隔（第 2 行起）
-- `iostat` 必须指定间隔和次数（如 `-k 1 3`），否则只输出开机以来的累积平均
+**Caveats**:
+- BusyBox `iostat` does not support the `-x` flag, so %util cannot be obtained directly
+- `iostat -d`'s cumulative row can overflow into integers like 922337203685...; only look at the incremental intervals (from the 2nd row on)
+- `iostat` MUST be given an interval and a count (e.g. `-k 1 3`); otherwise it prints only the since-boot cumulative average
 
-> **🤖 Agent 的决策逻辑**:
-> - 优先尝试 `iostat -c 1 3`（BusyBox 兼容），确认 %iowait 升高
-> - 如果 `iostat -x` 报 "unrecognized option"，立即切换到 BusyBox 备选方案，不要重复尝试 `-x`
-> - `ps | grep dd` 发现 ChaosBlade 的 dd 进程是故障生效的直击证据
-> - Pod 级验证应选择同节点上的 Running Pod 执行 dd 写入测试
+> **🤖 The Agent's decision logic**:
+> - Try `iostat -c 1 3` first (BusyBox-compatible) to confirm %iowait rose
+> - If `iostat -x` reports "unrecognized option", switch to the BusyBox alternative immediately — do not retry `-x`
+> - Finding ChaosBlade's dd process via `ps | grep dd` is direct evidence the fault took effect
+> - For Pod-level verification, pick a Running Pod on the same node to run the dd write test
 
 ---
 
-## 三-B、blade_status 与 blade_query_k8s 选用规则
+## 3-B. When to use blade_status vs blade_query_k8s
 
-blade-ai 有两个查询实验状态的工具，用途不同：
+blade-ai has two tools for querying experiment state, with different purposes:
 
-| 工具 | 数据来源 | 返回值 | 用途 |
+| Tool | Data source | Return value | Purpose |
 |------|---------|--------|------|
-| `blade_status` | 本地 CLI 侧 | `Status="Running"/"Destroyed"/"Error"` | 确认实验创建/销毁是否成功 |
-| `blade_query_k8s` | K8s 集群侧 CRD | `statuses[]` 数组（per-resource 详情、affected_count） | 确认影响了哪些资源、覆盖率检查 |
+| `blade_status` | local CLI side | `Status="Running"/"Destroyed"/"Error"` | confirm the experiment was created/destroyed successfully |
+| `blade_query_k8s` | the K8s cluster's CRD | a `statuses[]` array (per-resource detail, affected_count) | confirm which resources were affected; coverage checks |
 
-**选用规则**：
+**Selection rules**:
 
-| 场景 | 用哪个 | 原因 |
+| Situation | Use | Why |
 |------|--------|------|
-| 注入后确认实验创建成功 | `blade_status` | 本地查询即可，无需集群侧详情 |
-| 销毁后确认实验已清除 | `blade_status` | 同上 |
-| 验证覆盖率（受影响资源数） | `blade_query_k8s` | 返回 `statuses[]` 数组，可统计 `affected_count` |
-| 诊断部分注入失败 | `blade_query_k8s` | 可查看每个 target 的 status 是 success/fail |
-| 获取受影响资源的具体列表 | `blade_query_k8s` | `blade_status` 不返回 per-resource 信息 |
+| Confirm the experiment was created after injection | `blade_status` | a local query suffices; no cluster-side detail needed |
+| Confirm the experiment was cleared after destroy | `blade_status` | as above |
+| Verify coverage (number of affected resources) | `blade_query_k8s` | returns a `statuses[]` array so `affected_count` can be tallied |
+| Diagnose a partial injection failure | `blade_query_k8s` | shows whether each target's status is success/fail |
+| Get the concrete list of affected resources | `blade_query_k8s` | `blade_status` returns no per-resource information |
 
-> **💡 Agent 使用提示**：
-> - Layer 1 验证优先用 `blade_status` 做快速检查
-> - 需要覆盖率数据或诊断注入问题时，切换到 `blade_query_k8s`
-> - `blade_query_k8s` 的结果包含了 `blade_status` 的全部信息，但响应体积更大、耗时更长
+> **💡 Agent usage tips**:
+> - Prefer `blade_status` for a fast Layer 1 check
+> - Switch to `blade_query_k8s` when coverage data is needed or an injection problem must be diagnosed
+> - `blade_query_k8s`'s result contains everything `blade_status` returns, but the response is larger and slower
 
-### blade_query_k8s 输出格式示例
+### Example blade_query_k8s output
 
 ```json
 {
@@ -562,407 +562,407 @@ blade-ai 有两个查询实验状态的工具，用途不同：
 }
 ```
 
-**关键字段解读**：
-- `result.statuses[].state`：每个受影响资源的状态（`Success` / `Error`）。部分注入失败时，部分条目为 `Error`
-- `result.statuses[].kind`：资源类型（`pod` / `node`）
-- `result.statuses[].identifier`：格式为 `namespace/node/pod/container/runtime`，可定位具体受影响资源
-- `statuses` 数组为空或不存在：CRD 可能尚未就绪，等待几秒后重新查询
+**Reading the key fields**:
+- `result.statuses[].state`: each affected resource's state (`Success` / `Error`). On a partial injection failure, some entries are `Error`
+- `result.statuses[].kind`: the resource type (`pod` / `node`)
+- `result.statuses[].identifier`: formatted as `namespace/node/pod/container/runtime`, which pinpoints the affected resource
+- An empty or missing `statuses` array: the CRD may not be ready yet — wait a few seconds and query again
 
 ---
 
-## 四、验证失败的处理策略
+## 4. Handling verification failure
 
-### Q12: 如果 Layer 2 验证失败,Agent 应该如何处理?
+### Q12: If Layer 2 verification fails, what should the Agent do?
 
-**A12**: Layer 2 验证失败的处理流程:
+**A12**: The flow for handling a Layer 2 failure:
 
-> **分析+决策**: 失败原因分类和重试/回滚决策逻辑详见 `failure-modes.md` Mode 3（Verification Failure）和 `verification-heuristics.md`。以下仅补充**执行层面的操作规程**。
+> **Analysis + decision**: the failure-cause taxonomy and the retry/rollback decision logic are in `failure-modes.md` Mode 3 (Verification Failure) and `verification-heuristics.md`. What follows covers only the **execution-level procedure**.
 
-**回滚执行**:
+**Executing the rollback**:
 
 ```bash
 blade destroy <uid>
 ```
 
-- 确认 `blade status --uid <uid>` 返回 Status="Destroyed"（`blade status` 不支持 `--kubeconfig` flag，Agent 内部通过环境变量传递）
-- 记录失败原因到实验历史(Operational Memory)
-- 返回明确的错误提示给用户,包括:
-  - 注入的故障类型和目标
-  - 验证失败的详细信息(如"CPU 使用率仅为 15%,预期 > 80%")
-  - 建议的排查步骤(如"检查 Pod 的 CPU limit 设置是否过大")
+- Confirm `blade status --uid <uid>` returns Status="Destroyed" (`blade status` does not support the `--kubeconfig` flag; the Agent passes credentials via an environment variable internally)
+- Record the failure reason in the experiment history (Operational Memory)
+- Return a clear error message to the user, including:
+  - The injected fault type and target
+  - The verification-failure detail (e.g. "CPU utilisation was only 15%, expected > 80%")
+  - Suggested troubleshooting steps (e.g. "check whether the Pod's CPU limit is set too high")
 
-**知识库更新**:
+**Updating the knowledge base**:
 
-- 如果发现了新的失败模式(如某种镜像不支持 chaos 进程),记录到 MEMORY.md
-- 如果 Skill 中的验证方法有误,标记该 Skill 需要修订
+- If a new failure mode was discovered (e.g. an image that does not support the chaos process), record it in MEMORY.md
+- If the Skill's verification method turned out to be wrong, flag that Skill as needing revision
 
 ---
 
-### Q13: 如何区分"验证失败"和"验证超时"?
+### Q13: How do you tell verification failure apart from verification timeout?
 
 **A13**: 
 
-**验证失败**:
-- 验证命令执行成功,但输出不符合预期
-- 例如:`kubectl top pod` 返回 CPU=10%,预期 > 80%
-- **处理**:立即回滚,记录失败原因
+**Verification failure**:
+- The verification command ran successfully, but the output does not match expectations
+- Example: `kubectl top pod` returns CPU=10% where > 80% was expected
+- **Handling**: roll back immediately and record the failure reason
 
-**验证超时**:
-- 验证命令执行超时(如 `kubectl exec` 超过 60 秒无响应)
-- 可能原因:目标 Pod 无响应、网络中断、kubelet 故障
-- **处理**:
-  - 首先检查 `blade status --uid <uid>`,确认实验状态
-  - 如果 Status="Running",可能是验证命令本身的问题,尝试备选验证方法
-  - 如果 Status="Error" 或查询超时,可能是 chaosblade-operator 异常,强制回滚
-  - 记录超时信息,作为诊断线索
+**Verification timeout**:
+- The verification command timed out (e.g. `kubectl exec` unresponsive for over 60 seconds)
+- Possible causes: the target Pod is unresponsive, the network is down, kubelet is faulty
+- **Handling**:
+  - First check `blade status --uid <uid>` to confirm the experiment's state
+  - If Status="Running", the problem is likely the verification command itself — try the fallback verification method
+  - If Status="Error" or the query times out, chaosblade-operator may be malfunctioning — force a rollback
+  - Record the timeout as a diagnostic clue
 
-> **🤖 Agent 的实现**:
-> - 每个验证命令设置合理的超时时间(如 kubectl exec 超时 60 秒)
-> - 超时时捕获异常,区分是命令超时还是实验异常
-> - 如果是命令超时,尝试简化的验证方法(如用 `kubectl get` 替代 `kubectl exec`)
-> - 如果所有验证方法都超时,判定为严重异常,强制回滚并告警
+> **🤖 How the Agent implements this**:
+> - Give every verification command a reasonable timeout (e.g. 60 seconds for kubectl exec)
+> - Catch the timeout exception and distinguish a command timeout from an experiment anomaly
+> - On a command timeout, try a simpler verification method (e.g. `kubectl get` instead of `kubectl exec`)
+> - If every verification method times out, treat it as a serious anomaly: force a rollback and raise an alert
 
 ---
 
-## 五、Skill 中的验证方法编写规范
+## 5. Conventions for writing a Skill's verification method
 
-### Q14: Skill 的"验证方法"章节应该包含哪些内容?
+### Q14: What should a Skill's "verification method" section contain?
 
-**A14**: 一个完整的"验证方法"章节应包含以下内容:
+**A14**: A complete "verification method" section should contain the following:
 
-**1. Layer 1 验证指令**
+**1. Layer 1 verification instruction**
 ```markdown
-### Layer 1 验证
+### Layer 1 verification
 
-执行 `blade status --uid <uid>`,确认 Status="Running"。
+Run `blade status --uid <uid>` and confirm Status="Running".
 ```
 
-**2. Layer 2 验证命令列表**
+**2. The Layer 2 verification command list**
 ```markdown
-### Layer 2 验证
+### Layer 2 verification
 
-按顺序执行以下命令,至少有一项通过即视为验证成功:
+Run the following in order; verification succeeds when at least one of them passes:
 
-**方法 1: 通过 kubectl top 验证 CPU 使用率**
+**Method 1: verify CPU utilisation via kubectl top**
 ```bash
 kubectl top pod {{target_name}} -n {{namespace}}
 ```
-预期输出:CPU 使用率 > 80% 的 limit 值。
+Expected output: CPU utilisation > 80% of the limit.
 
-**方法 2: 通过 kubectl exec 验证 chaos 进程**
+**Method 2: verify the chaos process via kubectl exec**
 ```bash
 kubectl exec {{target_name}} -n {{namespace}} -- ps aux | grep chaos
 ```
-预期输出:包含 chaos_cpu 进程。
+Expected output: contains a chaos_cpu process.
 
-**方法 3: 通过应用日志验证延迟**
+**Method 3: verify latency from application logs**
 ```bash
 kubectl logs {{target_name}} -n {{namespace}} --tail=50
 ```
-预期输出:日志中出现 "timeout"、"slow"、"latency" 等关键词。
+Expected output: the logs contain keywords such as "timeout", "slow", "latency".
 ```
 
-**3. 验证失败的可能原因**
+**3. Possible reasons verification fails**
 ```markdown
-### 验证失败排查
+### Verification troubleshooting
 
-如果验证失败,检查以下可能原因:
-1. Pod 的 CPU limit 设置过大(如 4 核),chaos 进程无法占满
-2. Pod 所在节点资源紧张,chaos 进程被节流
-3. 注入后等待时间不足,chaos 进程尚未完全启动
+If verification fails, check these possible causes:
+1. The Pod's CPU limit is too large (e.g. 4 cores) for the chaos process to saturate
+2. The Pod's node is resource-constrained and the chaos process is throttled
+3. Not enough time was allowed after injection, so the chaos process has not fully started
 ```
 
-**4. Layer 3 验证(可选)**
+**4. Layer 3 verification (optional)**
 ```markdown
-### Layer 3 验证(可选)
+### Layer 3 verification (optional)
 
-如果需要验证影响范围,执行:
+To verify the blast radius, run:
 ```bash
 kubectl top pod -l app={{app_label}} -n {{namespace}}
 ```
-预期输出:只有目标 Pod CPU 高,其他副本 CPU 正常。
+Expected output: only the target Pod has high CPU; the other replicas are normal.
 ```
 
-**5. 恢复后的清理步骤**
+**5. Post-recovery cleanup steps**
 ```markdown
-### 恢复后清理
+### Post-recovery cleanup
 
-实验销毁后,无需额外清理。如果使用 `--retain=true` 填充磁盘,需手动删除填充文件:
+No extra cleanup is needed after the experiment is destroyed. If the disk was filled with `--retain=true`, delete the filler files manually:
 ```bash
 kubectl exec {{target_name}} -n {{namespace}} -- rm -f /data/chaos_fill_*
 ```
 ```
 
-> **🤖 Agent 的使用方式**:
-> - LLM 读取"验证方法"章节,解析出验证命令列表
-> - 依次执行这些命令,解析输出,判断是否符合预期
-> - 如果所有方法都失败,判定为验证失败,触发回滚
-> - 如果至少有一种方法通过,判定为验证成功,继续后续流程
+> **🤖 How the Agent uses this**:
+> - The LLM reads the "verification method" section and parses out the command list
+> - It runs them in turn, parses the output, and judges whether it matches expectations
+> - If every method fails, verification is declared failed and a rollback is triggered
+> - If at least one method passes, verification is declared successful and the flow continues
 
-### Q15: Layer 2 验证中常见的数据解读陷阱有哪些？
+### Q15: What are the common data-interpretation pitfalls in Layer 2 verification?
 
-**A15**: Layer 2 验证依赖 kubectl exec 获取的指标数据，以下陷阱可能导致误判：
+**A15**: Layer 2 verification relies on metric data obtained via kubectl exec. The following pitfalls can cause a wrong verdict:
 
-**1. 累积计数器溢出**
+**1. Cumulative-counter overflow**
 
-BusyBox iostat、/proc/diskstats 等数据源可能因整数溢出出现异常大值（如 tps > 10^8）。
-判断标准：数值明显超出物理设备能力 → 标记为溢出，不作为正证。
-正确做法：关注增量间隔数据（跳过第1行累积值），仅用增量判断当前状态。
+Data sources such as BusyBox iostat and /proc/diskstats can show absurdly large values from integer overflow (e.g. tps > 10^8).
+Criterion: the value clearly exceeds the physical device's capability → mark it as overflow and do NOT use it as positive evidence.
+Correct approach: focus on the incremental intervals (skip the 1st cumulative row) and judge the current state from the increments only.
 
-**2. 预期为非零但实际为零**
+**2. Expected non-zero, measured zero**
 
-当 skill case 预期某指标应升高（如 iowait 升高、CPU 使用率升高、进程数增加），
-但实际测量值接近零或为零时，这是故障未生效的强反证。
-常见错误：用推测性解释（如"异步IO"、"内核缓冲"、"调度优化"）合理化零值。
-正确做法：除非有直接证据支持该解释（如独立的日志输出证明异步IO模式），
-否则应接受零值作为反证，而非合理化。
+When the skill case expects a metric to rise (iowait rising, CPU utilisation rising, process count increasing)
+but the measured value is at or near zero, that is strong counter-evidence that the fault did NOT take effect.
+A common mistake: rationalising the zero with speculative explanations ("async IO", "kernel buffering", "scheduler optimisation").
+Correct approach: unless there is direct evidence supporting such an explanation (e.g. independent log output proving async IO mode),
+accept the zero as counter-evidence rather than rationalising it.
 
-**3. 进程缺失**
+**3. Missing process**
 
-当故障类型依赖特定进程（如 dd、stress-ng、chaos_*）产生效果时，
-ps/grep 未找到该进程是故障未生效的直接证据。
-注意：ps 输出可能截断长命令，用 `ps aux` 或 grep 完整命令名。
+When the fault type depends on a specific process (dd, stress-ng, chaos_*) to produce its effect,
+ps/grep not finding that process is direct evidence the fault did not take effect.
+Note: ps output may truncate long commands — use `ps aux` or grep the full command name.
 
-**4. 采样间隔不一致**
+**4. Inconsistent sampling interval**
 
-iostat、top 等工具的第一次输出通常是开机以来的累积值，不代表当前状态。
-正确做法：至少采集 2-3 个间隔，跳过第一个，用后续间隔做判断。
+The first output of tools like iostat and top is usually the since-boot cumulative value, which does not represent the current state.
+Correct approach: collect at least 2-3 intervals, skip the first, and judge from the later intervals.
 
-> **🤖 Agent 的使用方式**:
-> - 读取命令输出时，先判断数据是否属于上述陷阱场景
-> - 对异常数据标记 `[ANOMALY]`，不作为正证使用
-> - 对零值/缺失型反证，不使用推测性解释合理化，除非有直接佐证
+> **🤖 How the Agent uses this**:
+> - When reading command output, first decide whether the data falls into one of the pitfalls above
+> - Mark anomalous data `[ANOMALY]` and do not use it as positive evidence
+> - Do not rationalise zero-value / missing-process counter-evidence with speculation unless there is direct corroboration
 
 ---
 
-## 五-B、验证覆盖与完整性
+## 5-B. Verification coverage and completeness
 
-### Q16: 如何验证故障注入的覆盖率是否完整?
+### Q16: How do you verify that the injection's coverage is complete?
 
-**A16**: 覆盖率 = 实际受影响资源数 / 期望目标资源数。覆盖率不完整意味着故障注入未覆盖所有预期目标。
+**A16**: Coverage = actually affected resources / expected target resources. Incomplete coverage means the injection did not reach every intended target.
 
-**数据来源**:
-- Layer 1 的 `blade_query_k8s` 返回 `statuses[]` 数组，包含每个受影响资源的状态
-- `affected_count` = `statuses[]` 的长度，表示实际受影响的资源数
-- 期望目标数 = 标签选择器匹配的 Pod/Node 总数
+**Data sources**:
+- Layer 1's `blade_query_k8s` returns a `statuses[]` array containing each affected resource's state
+- `affected_count` = the length of `statuses[]`, i.e. how many resources were actually affected
+- Expected target count = the total number of Pods/Nodes matched by the label selector
 
-**如何确定期望目标数**:
+**How to determine the expected target count**:
 ```bash
-# Pod 级别
+# Pod level
 kubectl get pods -l <label> -n <ns> --no-headers | wc -l
-# 或从故障上下文中获取 target.names 的长度
+# or read the length of target.names from the fault context
 ```
 
-**常见覆盖率不足原因**:
-1. **ChaosBlade 默认单目标**: `blade create k8s pod-* --labels <label>` 默认只选择 **1 个**匹配资源。若要覆盖所有匹配资源，需指定 `--effect-count` 参数
-2. **Node 级别故障**: `blade create k8s node-*` 通常只影响指定节点，不受此限制
-3. **CRD 尚未就绪**: `blade_query_k8s` 返回的 `statuses[]` 可能在注入后短时间内为空
+**Common reasons coverage falls short**:
+1. **ChaosBlade defaults to a single target**: `blade create k8s pod-* --labels <label>` selects only **1** matching resource by default. To cover every match, pass `--effect-count`
+2. **Node-level faults**: `blade create k8s node-*` usually affects only the named node and is not subject to this limit
+3. **The CRD is not ready yet**: `blade_query_k8s`'s `statuses[]` may be empty for a short window after injection
 
-**决策规则**:
-- 覆盖率 = 100% → 正常，无需额外处理
-- 覆盖率 < 100% → 在 VERIFICATION_RESULT → Warnings 中报告覆盖率比例（如 "Coverage: 1/3 pods affected"）
-- 覆盖率 < 100% 但已知 ChaosBlade 默认行为 → 作为 Warning 报告，不降级 Layer2 状态
+**Decision rules**:
+- Coverage = 100% → normal, nothing extra to do
+- Coverage < 100% → report the ratio under VERIFICATION_RESULT → Warnings (e.g. "Coverage: 1/3 pods affected")
+- Coverage < 100% but explained by ChaosBlade's known default → report as a Warning; do NOT downgrade the Layer 2 status
 
-**示例**:
+**Example**:
 ```
 affected_count=1, target.names=["pod-a", "pod-b", "pod-c"]
 → Warning: "Coverage: 1/3 pods affected. ChaosBlade defaults to single-target unless --effect-count is specified."
 ```
 
-### Q17: 如何检测和调查非预期指标变化?
+### Q17: How do you detect and investigate unexpected metric changes?
 
-**A17**: 非预期指标变化 = 不符合故障注入预期效果的指标变化。例如：内存压力注入后，非目标 Pod 的内存反而下降；CPU 压力注入后，目标 Pod 的 CPU 未升高但磁盘 IO 异常。
+**A17**: An unexpected metric change is one that does not match the injection's expected effect. For example: after injecting memory pressure, a non-target Pod's memory DROPS; after injecting CPU pressure, the target Pod's CPU does not rise but its disk IO becomes anomalous.
 
-**检测方法**:
-1. 对比 **所有** 匹配标签的目标资源指标，而非仅关注显示预期效果的资源
-2. 记录每个资源的注入前基线和注入后指标
-3. 识别与预期方向相反的变化（如预期内存升高但实际下降）
+**Detection method**:
+1. Compare metrics across **every** target resource matching the label, not just the ones showing the expected effect
+2. Record each resource's pre-injection baseline and post-injection metric
+3. Identify changes in the opposite direction to expectations (memory expected to rise but actually falling)
 
-**调查路径**:
+**Investigation path**:
 ```bash
-# 1. 检查 Pod 是否重启（重启后 metrics 重置）
+# 1. Check whether the Pod restarted (metrics reset after a restart)
 kubectl describe pod <name> -n <ns> | grep -A5 "Restart Count"
 
-# 2. 检查近期事件
+# 2. Check recent events
 kubectl get events -n <ns> --sort-by='.lastTimestamp' | tail -20
 
-# 3. 检查 HPA 是否触发扩容（新 Pod 有基线指标）
+# 3. Check whether HPA scaled out (new Pods carry baseline metrics)
 kubectl get hpa -n <ns>
 
-# 4. 确认 metrics-server 采样间隔（多数集群 15s，二进制默认 60s）
-kubectl top pod <name> -n <ns>  # 连续两次执行，观察数值是否波动
+# 4. Confirm the metrics-server sampling interval (15s on most clusters; the binary defaults to 60s)
+kubectl top pod <name> -n <ns>  # run twice in a row and see whether the values fluctuate
 ```
 
-**常见原因**:
-| 异常现象 | 可能原因 | 验证方式 |
+**Common causes**:
+| Anomaly | Possible cause | How to verify |
 |---------|---------|---------|
-| 内存反而下降 | Pod 重启（metrics 重置为基线） | `kubectl describe pod` 检查 restartCount |
-| CPU 未升高 | 进程未启动或已退出 | `kubectl exec -- ps aux \| grep stress` |
-| 指标上下波动 | metrics-server 采样间隔（多数集群 15s） | 连续检查 2-3 次确认趋势 |
-| 新 Pod 出现 | HPA 自动扩容 | `kubectl get hpa` |
+| Memory DROPS instead | The Pod restarted (metrics reset to baseline) | check restartCount via `kubectl describe pod` |
+| CPU did not rise | The process never started, or already exited | `kubectl exec -- ps aux \| grep stress` |
+| Metrics fluctuate up and down | metrics-server sampling interval (15s on most clusters) | check 2-3 times in a row to confirm the trend |
+| New Pods appeared | HPA scaled out | `kubectl get hpa` |
 
-**决策规则**:
-- 异常必须记入 Negative Evidence 段，不可用推测性解释合理化
-- 如果异常可被证实为无关因素（如 Pod 重启与故障注入无关），在 Negative Evidence 中说明原因
-- 如果异常无法解释，这削弱了验证结论的可信度
+**Decision rules**:
+- An anomaly MUST be recorded in the Negative Evidence section and must not be rationalised with speculation
+- If the anomaly can be proven irrelevant (e.g. the Pod restart is unrelated to the injection), explain why in Negative Evidence
+- If the anomaly cannot be explained, it weakens the credibility of the verification conclusion
 
-### Q18: 如何验证应用层面的故障影响?
+### Q18: How do you verify the fault's impact at the application level?
 
-**A18**: 应用影响 = 故障注入导致的应用行为可观测退化（延迟增大、错误率上升、可用性下降）。这是验证的最终目标——确认故障的"爆炸半径"确实到达了应用层。
+**A18**: Application impact means observable degradation of application behaviour caused by the injection (higher latency, higher error rate, lower availability). This is verification's ultimate goal — confirming the fault's "blast radius" really reached the application layer.
 
-**验证方法**（仅使用 kubectl 工具）:
+**Verification methods** (using the kubectl tool only):
 
-**方法 1: kubectl logs 搜索异常关键字**
+**Method 1: search application logs for anomaly keywords with kubectl logs**
 ```bash
-# 搜索超时/错误/延迟关键字
+# search for timeout / error / latency keywords
 kubectl logs <pod> -n <ns> --tail=100 | grep -iE "timeout|error|latency|slow|retry|refused"
 
-# 对比注入前后的错误率
+# compare the error rate before and after injection
 kubectl logs <pod> -n <ns> --since=5m | grep -ci "error"
 ```
 
-**方法 2: kubectl exec 发起请求测试**
+**Method 2: issue a test request with kubectl exec**
 ```bash
-# 从集群内测试 Service 可达性和响应时间
+# test Service reachability and response time from inside the cluster
 kubectl exec <test-pod> -n <ns> -- curl -s -o /dev/null -w "HTTP %{http_code} Time: %{time_total}s\n" http://<service>:<port>/health
 
-# 如果无 curl，尝试 wget
+# if curl is unavailable, try wget
 kubectl exec <test-pod> -n <ns> -- wget -q -O /dev/null --timeout=5 http://<service>:<port>/health
 ```
 
-**方法 3: kubectl get events 检查应用级事件**
+**Method 3: check application-level events with kubectl get events**
 ```bash
 kubectl get events -n <ns> --field-selector reason=Unhealthy --sort-by='.lastTimestamp'
 ```
 
-**方法 4: kubectl get endpoints 检查服务端点变化**
+**Method 4: check Service endpoint changes with kubectl get endpoints**
 ```bash
-# 网络故障可能导致 Endpoints 变化
+# a network fault may change Endpoints
 kubectl get endpoints <service> -n <ns>
 ```
 
-**容器缺少工具时的备选方案**:
-- 如果容器内无 `curl`/`wget`：使用 `kubectl describe pod` 查看 Events 中的探针失败记录
-- 如果无法从 Pod 内发起请求：通过 `kubectl logs` 间接观察应用行为变化
-- 如果 Service 无外部端点：检查 `kubectl get endpoints` 变化
+**Fallbacks when the container lacks tooling**:
+- No `curl`/`wget` in the container: use `kubectl describe pod` to inspect probe-failure records in Events
+- Cannot issue a request from inside the Pod: observe the application's behaviour change indirectly via `kubectl logs`
+- The Service has no external endpoint: check for changes via `kubectl get endpoints`
 
-**决策规则**:
-- Skill 用例要求的应用影响验证步骤**不可省略**，无法执行时标记 `[SKIPPED]` 并说明原因
-- 应用影响验证通过 → 加强 Layer2 结论可信度
-- 应用影响验证失败（如延迟未增大）→ 需要调查原因（故障效果是否真的传导到应用层）
-- 应用影响验证跳过（无可用工具）→ 在 Warning 中说明，不降级 Layer2 状态
-
----
-
-## 六-A、故障场景→kubectl验证映射
-
-> 迁移自 kubectl-guide.md 第六、七节，与各故障类型的验证方案(Q3-Q11)互补。
-
-### Pod 级故障验证命令组合
-
-| 故障场景 | 推荐验证命令组合 |
-|----------|-----------------|
-| Pod OOM | `get pod -o json`（exitCode=137, reason=OOMKilled）+ `describe pod`（Events 中 OOMKilling）+ `top pod`（内存接近 limit） |
-| Pod CPU 高 | `top pod`（CPU 飙升）+ `exec -- ps aux`（chaos 进程存在）+ `get pod -o wide`（确认节点） |
-| Pod 磁盘满 | `exec -- df -h`（磁盘使用率接近 100%）+ `describe pod`（Events 中磁盘相关） |
-| Pod 网络延迟 | `exec -- ping`（延迟增大）+ `exec -- ss -tlnp`（连接状态）+ 应用日志 timeout |
-| Pod 网络丢包 | `exec -- ping`（丢包率）+ 应用日志 connection reset |
-| Pod DNS 故障 | `exec -- cat /etc/hosts`（确认 #chaosblade 劫持条目）+ `exec -- ping <domain>`（解析到伪造 IP；glibc 镜像可用 `getent hosts`）+ 应用日志 resolve failed。**⚠️ 不要用 nslookup/dig——它们绕过 /etc/hosts** |
-| Pod 镜像拉取失败 | `get pod -o json`（waiting.reason=ImagePullBackOff）+ `describe pod`（Events 中 ErrImagePull） |
-| Pod Terminating 卡住 | `get pod -o json`（deletionTimestamp 非空，phase 不为 Terminated）+ `describe pod`（finalizers / 删除原因） |
-| Pod 被删除 | `get pod -o json`（返回 NotFound）或 `get pods -l`（Pod 列表变化） |
-
-### Node 级故障验证命令组合
-
-| 故障场景 | 推荐验证命令组合 |
-|----------|-----------------|
-| Node CPU 高 | `top node`（CPU 飙升）+ `describe node`（Conditions 正常） |
-| Node 内存高 | `top node`（内存飙升）+ `describe node`（MemoryPressure=True）+ `get events`（NodeHasInsufficientMemory） |
-| Node 磁盘高 | `describe node`（DiskPressure=True）+ `get events`（NodeHasDiskPressure） |
-| Node 不可用 | `get node -o json`（Ready=False）+ `describe node`（Events 中 Kubelet 停止上报）+ 该节点上 Pod 状态 |
-| Node 磁盘 IO 高 | `exec` 到 Node 上（如 DaemonSet）查看 io stat，或观察 Pod 启动延迟 |
-
-### Workload / Service 级故障验证命令组合
-
-| 故障场景 | 推荐验证命令组合 |
-|----------|-----------------|
-| Deployment 副本不一致 | `get deployment -o json`（readyReplicas < replicas）+ `get pods -l`（部分 Pod 异常） |
-| HPA 达到上限 | `get hpa -o json`（currentReplicas == maxReplicas）+ `top pod`（CPU/内存触发扩容） |
-| DaemonSet 未完全调度 | `get ds -o json`（desiredNumberScheduled != numberReady）+ `get pods -l`（部分 Pending） |
-| Service 负载均衡异常 | `get endpoints -o json`（addresses 为空）+ `get svc -o json`（selector 正确）+ `get pods -l`（匹配 selector 的 Pod 状态） |
-| Workload 被缩容 | `get deployment -o json`（replicas 减少）+ `get events`（ScaledDown） |
-
-### Service 目标发现规范
-当故障目标为 Service 时，必须通过 Service 的 selector 发现匹配的 Pod，禁止猜测 label selector：
-- 获取 selector: `kubectl get svc <name> -n <ns> -o jsonpath='{.spec.selector}'`
-- 用 selector 查找 Pod: `kubectl get pods -n <ns> -l '<selector-key>=<selector-value>'`
-- 禁止凭 Service 名称推断 label（如假设 svc=mysql → app=mysql）
-
-### 验证命令设计原则
-
-1. **先观测再断言**：先通过 `get -o json` 或 `describe` 获取当前状态，再在 LLM 推理中做断言，不要假设输出格式。
-2. **多维度交叉验证**：单一指标可能误导，应组合使用状态字段 + Events + 资源指标 + 应用日志。
-3. **对比基准状态**：注入前记录 Pod 状态、Events 列表、资源指标作为基准，注入后和基准对比。
-4. **关注状态变化而非绝对值**：某些指标本身就在波动，验证时应看"是否出现了预期变化"（如 restartCount 增加、新 Event 产生、CPU 从 10% 涨到 90%）。
-5. **优先 JSON 结构化输出**：做程序化断言时优先用 `-o json`；需要人类可读的事件描述时用 `describe`。
-6. **善用 label selector**：通过 `-l app=<app>` 批量获取同应用的多个 Pod 状态，而不是逐个查询。
-7. **注意时间窗口**：Events 和日志都有时效性，验证时应关注注入时间点附近的新事件，用 `--since=5m` 或按 `lastTimestamp` 排序。
-8. **区分容器内和宿主机视角**：`kubectl exec` 看到的是容器内部；`kubectl top` 和 `kubectl get` 看到的是宿主机/集群视角。
+**Decision rules**:
+- Application-impact verification steps required by the Skill case **must NOT be skipped**; when they cannot be run, mark them `[SKIPPED]` and state why
+- Application-impact verification passes → strengthens the credibility of the Layer 2 conclusion
+- Application-impact verification fails (e.g. latency did not rise) → investigate why (did the fault's effect really propagate to the application layer?)
+- Application-impact verification skipped (no tooling available) → note it in a Warning; do NOT downgrade the Layer 2 status
 
 ---
 
-## 六-B、恢复验证策略
+## 6-A. Fault scenario → kubectl verification mapping
 
-恢复（`blade destroy`）后必须验证故障效果已完全消除，否则可能存在残余影响（如残留进程、未清理的 /etc/hosts 条目、未恢复的 iptables 规则）。
+> Migrated from kubectl-guide.md sections 6 and 7; complements the per-fault-type verification plans (Q3-Q11).
 
-### 恢复验证通用原则
+### Command combinations for Pod-level faults
 
-1. **恢复验证 ≠ 反向断言** — 不是简单地把注入验证的断言条件取反，而是确认系统恢复到了**注入前的基线状态**
-2. **必须对比基线** — 恢复验证前应记录注入前的关键指标（CPU%、内存%、磁盘使用率、网络延迟等），恢复后对比确认回到基线
-3. **等待恢复窗口** — `blade destroy` 执行后，故障效果可能需要 5-30s 才能完全消除（metrics-server 采样间隔多数集群为 15s），不要立即验证
-4. **残留检查** — 恢复后必须检查是否有残留：进程残留（stress 进程未退出）、文件残留（/etc/hosts 未清理）、规则残留（iptables/tc 规则未删除）
+| Fault scenario | Recommended command combination |
+|----------|-----------------|
+| Pod OOM | `get pod -o json` (exitCode=137, reason=OOMKilled) + `describe pod` (OOMKilling in Events) + `top pod` (memory near the limit) |
+| High Pod CPU | `top pod` (CPU spike) + `exec -- ps aux` (chaos process present) + `get pod -o wide` (confirm the node) |
+| Pod disk full | `exec -- df -h` (disk utilisation near 100%) + `describe pod` (disk-related Events) |
+| Pod network delay | `exec -- ping` (latency rose) + `exec -- ss -tlnp` (connection state) + application-log timeouts |
+| Pod packet loss | `exec -- ping` (loss rate) + application-log connection resets |
+| Pod DNS fault | `exec -- cat /etc/hosts` (confirm the #chaosblade hijack entry) + `exec -- ping <domain>` (resolves to the forged IP; `getent hosts` works on glibc images) + application-log resolve failures. **⚠️ Do NOT use nslookup/dig — they bypass /etc/hosts** |
+| Pod image-pull failure | `get pod -o json` (waiting.reason=ImagePullBackOff) + `describe pod` (ErrImagePull in Events) |
+| Pod stuck Terminating | `get pod -o json` (deletionTimestamp non-empty, phase not Terminated) + `describe pod` (finalizers / deletion reason) |
+| Pod deleted | `get pod -o json` (returns NotFound) or `get pods -l` (the Pod list changed) |
 
-### 各故障类型的恢复验证方法
+### Command combinations for Node-level faults
 
-| 故障类型 | 恢复验证方法 | 残留检查 |
+| Fault scenario | Recommended command combination |
+|----------|-----------------|
+| High Node CPU | `top node` (CPU spike) + `describe node` (Conditions normal) |
+| High Node memory | `top node` (memory spike) + `describe node` (MemoryPressure=True) + `get events` (NodeHasInsufficientMemory) |
+| High Node disk | `describe node` (DiskPressure=True) + `get events` (NodeHasDiskPressure) |
+| Node unavailable | `get node -o json` (Ready=False) + `describe node` (kubelet stopped posting, in Events) + the state of that node's Pods |
+| High Node disk IO | `exec` onto the node (e.g. via a DaemonSet) to read io stat, or observe Pod startup latency |
+
+### Command combinations for Workload / Service-level faults
+
+| Fault scenario | Recommended command combination |
+|----------|-----------------|
+| Deployment replica mismatch | `get deployment -o json` (readyReplicas < replicas) + `get pods -l` (some Pods unhealthy) |
+| HPA at its ceiling | `get hpa -o json` (currentReplicas == maxReplicas) + `top pod` (CPU/memory triggering the scale-out) |
+| DaemonSet not fully scheduled | `get ds -o json` (desiredNumberScheduled != numberReady) + `get pods -l` (some Pending) |
+| Service load-balancing anomaly | `get endpoints -o json` (addresses empty) + `get svc -o json` (selector correct) + `get pods -l` (state of the Pods matching the selector) |
+| Workload scaled down | `get deployment -o json` (replicas reduced) + `get events` (ScaledDown) |
+
+### Conventions for discovering a Service's targets
+When the fault target is a Service, the matching Pods MUST be discovered through the Service's selector; guessing the label selector is forbidden:
+- Read the selector: `kubectl get svc <name> -n <ns> -o jsonpath='{.spec.selector}'`
+- Find Pods with that selector: `kubectl get pods -n <ns> -l '<selector-key>=<selector-value>'`
+- Do NOT infer the label from the Service name (e.g. assuming svc=mysql → app=mysql)
+
+### Design principles for verification commands
+
+1. **Observe before asserting**: read the current state via `get -o json` or `describe` first, then assert in LLM reasoning — never assume the output format.
+2. **Cross-check multiple dimensions**: a single metric can mislead; combine status fields + Events + resource metrics + application logs.
+3. **Compare against a baseline**: record Pod state, the Events list and resource metrics before injection as the baseline, then compare after injection.
+4. **Watch for change, not absolute values**: some metrics fluctuate naturally, so verification should ask "did the expected change occur" (restartCount increased, a new Event appeared, CPU went from 10% to 90%).
+5. **Prefer structured JSON output**: use `-o json` for programmatic assertions; use `describe` when a human-readable event description is needed.
+6. **Make good use of label selectors**: fetch the state of several Pods of the same application in bulk via `-l app=<app>` rather than querying one at a time.
+7. **Mind the time window**: Events and logs both age out, so focus on new events near the injection timestamp using `--since=5m` or sorting by `lastTimestamp`.
+8. **Distinguish the container's view from the host's**: `kubectl exec` shows the inside of the container; `kubectl top` and `kubectl get` show the host/cluster view.
+
+---
+
+## 6-B. Recovery-verification strategy
+
+After recovery (`blade destroy`), the fault's effect MUST be verified as fully gone; otherwise residual impact can remain (leftover processes, uncleaned /etc/hosts entries, iptables rules that were never reverted).
+
+### General principles for recovery verification
+
+1. **Recovery verification ≠ inverting the assertion** — it is not simply negating the injection assertions, but confirming the system returned to its **pre-injection baseline**
+2. **A baseline comparison is mandatory** — record the key pre-injection metrics (CPU%, memory%, disk utilisation, network latency, ...) and compare after recovery to confirm the return to baseline
+3. **Allow a recovery window** — after `blade destroy` runs, the fault's effect can take 5-30s to disappear entirely (metrics-server's sampling interval is 15s on most clusters), so do not verify immediately
+4. **Check for residue** — after recovery, always check for leftovers: processes (a stress process that never exited), files (/etc/hosts not cleaned), rules (iptables/tc rules not deleted)
+
+### Recovery-verification method per fault type
+
+| Fault type | Recovery-verification method | Residue check |
 |---------|------------|---------|
-| Pod CPU 满载 | `kubectl top pod` CPU 回到基线 + `exec -- ps aux` 无 stress 进程 | stress-ng/stress 进程是否存在 |
-| Pod 内存压力 | `kubectl top pod` 内存回到基线 + Pod 非 OOMKilled 状态 | `/proc/meminfo` 是否恢复正常 |
-| Pod 网络延迟 | `exec -- ping -c 3 <target>` 延迟回到基线 | `tc qdisc show` 无 ChaosBlade tc 规则 |
-| Pod 网络丢包 | `exec -- ping -c 10 <target>` 丢包率回到 0% | `tc qdisc show` 无 ChaosBlade tc 规则 |
-| Pod DNS 故障 | `exec -- cat /etc/hosts` 无 `#chaosblade` 条目 + `ping <domain>` 解析到真实 IP | /etc/hosts 中 `#chaosblade` 条目是否已删除 |
-| Pod 磁盘填充 | `exec -- df -h` 使用率回到基线 | 临时填充文件是否已删除 |
-| Node CPU 满载 | `kubectl top node` CPU 回到基线 + Node Conditions 无异常 | Node 上 stress 进程是否存在 |
-| Node 网络故障 | 节点间 ping 延迟/丢包回到基线 | iptables/tc 规则是否已清理 |
-| Node 磁盘填充 | `kubectl describe node` DiskPressure=False + `df -h` 使用率回到基线 | 填充文件是否已删除 |
-| Pod 被删除 | `kubectl get pod <name>` Pod 存在且 Running | — |
-| Process 被杀 | `exec -- ps aux \| grep <process>` 进程恢复运行 | — |
+| Pod CPU fullload | `kubectl top pod` CPU back to baseline + `exec -- ps aux` shows no stress process | does a stress-ng/stress process remain? |
+| Pod memory pressure | `kubectl top pod` memory back to baseline + the Pod is not OOMKilled | has `/proc/meminfo` returned to normal? |
+| Pod network delay | `exec -- ping -c 3 <target>` latency back to baseline | `tc qdisc show` shows no ChaosBlade tc rule |
+| Pod packet loss | `exec -- ping -c 10 <target>` loss rate back to 0% | `tc qdisc show` shows no ChaosBlade tc rule |
+| Pod DNS fault | `exec -- cat /etc/hosts` has no `#chaosblade` entry + `ping <domain>` resolves to the real IP | has the `#chaosblade` entry been removed from /etc/hosts? |
+| Pod disk filling | `exec -- df -h` utilisation back to baseline | have the temporary filler files been deleted? |
+| Node CPU fullload | `kubectl top node` CPU back to baseline + no abnormal Node Conditions | does a stress process remain on the node? |
+| Node network fault | inter-node ping latency/loss back to baseline | have the iptables/tc rules been cleaned up? |
+| Node disk filling | `kubectl describe node` DiskPressure=False + `df -h` utilisation back to baseline | have the filler files been deleted? |
+| Pod deleted | `kubectl get pod <name>` the Pod exists and is Running | — |
+| Process killed | `exec -- ps aux \| grep <process>` the process is running again | — |
 
-### 恢复验证失败处理
+### Handling recovery-verification failure
 
-当恢复验证发现残余影响时：
+When recovery verification finds residual impact:
 
-| 异常现象 | 可能原因 | 处理方式 |
+| Anomaly | Possible cause | How to handle |
 |---------|---------|---------|
-| CPU 未回落 | stress 进程残留 | `exec -- kill <pid>` 手动终止残留进程 |
-| /etc/hosts 未清理 | blade destroy 未成功移除条目 | `exec -- grep -v '#chaosblade' /etc/hosts > /tmp/hosts && mv /tmp/hosts /etc/hosts`（跨平台；⚠️ Alpine/BusyBox 的 `sed -i` 不兼容 GNU sed，不要用 `sed -i`） |
-| tc 规则残留 | ChaosBlade 未成功删除 tc 规则 | `exec -- tc qdisc del dev eth0 root` 手动删除 |
-| 磁盘未释放 | 填充文件残留 | `exec -- rm <path>` 手动删除填充文件 |
-| Pod 仍处 Evicted 状态 | 节点资源压力未完全消除 | 等待节点资源恢复，或手动删除 Pod 让其重建 |
+| CPU has not come down | a stress process remains | `exec -- kill <pid>` to terminate the leftover process manually |
+| /etc/hosts not cleaned | blade destroy failed to remove the entry | `exec -- grep -v '#chaosblade' /etc/hosts > /tmp/hosts && mv /tmp/hosts /etc/hosts` (portable; ⚠️ Alpine/BusyBox `sed -i` is not GNU-sed compatible, so do NOT use `sed -i`) |
+| tc rules remain | ChaosBlade failed to delete the tc rule | `exec -- tc qdisc del dev eth0 root` to delete it manually |
+| Disk not freed | filler files remain | `exec -- rm <path>` to delete the filler files manually |
+| The Pod is still Evicted | node resource pressure has not fully cleared | wait for the node's resources to recover, or delete the Pod manually so it is rebuilt |
 
-> **安全底线**: 如果手动清理后残余仍未消除，必须**上报人类操作者**（而不是继续尝试更多破坏性操作），并记录到 Negative Evidence 中。
+> **Safety floor**: if the residue persists after manual cleanup, you MUST **escalate to a human operator** (rather than attempting more destructive operations) and record it in Negative Evidence.
 
 ---
 
-## 六、术语表
+## 6. Glossary
 
-| 术语 | 解释 |
+| Term | Definition |
 |------|------|
-| Layer 1 验证 | 通过 `blade status` 确认实验状态 |
-| Layer 2 验证 | 通过 kubectl 验证故障现象是否出现 |
-| Layer 3 验证 | 横向对比,验证影响范围是否可控 |
-| 验证失败 | 验证命令执行成功,但输出不符合预期 |
-| 验证超时 | 验证命令执行超时,无法获得结果 |
-| 回滚 | 调用 `blade destroy` 停止故障注入 |
-| 重试 | 验证失败后,等待片刻再次尝试验证 |
-| 自愈 | Kubernetes 自动修复故障的机制,可能掩盖故障现象 |
+| Layer 1 verification | Confirming the experiment's state via `blade status` |
+| Layer 2 verification | Using kubectl to verify the fault symptom appeared |
+| Layer 3 verification | Lateral comparison to verify the blast radius is contained |
+| Verification failure | The verification command ran successfully, but the output does not match expectations |
+| Verification timeout | The verification command timed out, so no result could be obtained |
+| Rollback | Calling `blade destroy` to stop the injection |
+| Retry | Waiting a moment after a failure and verifying again |
+| Self-healing | Kubernetes's automatic fault-repair mechanisms, which may mask the fault symptom |

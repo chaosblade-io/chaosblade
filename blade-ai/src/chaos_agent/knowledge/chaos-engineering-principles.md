@@ -13,741 +13,741 @@ fault_types:
 summary: "Authoritative source for chaos engineering principles: steady state hypothesis, blast radius control, experiment lifecycle, safety red lines, three-layer verification model. Q&A format."
 ---
 
-# 混沌工程原理与故障注入基础(Agent 专用)
+# Chaos Engineering Principles and Fault Injection Fundamentals (for the Agent)
 
-> **文件用途**: 本文件系统阐述混沌工程的核心理念、故障注入的基本原则、为什么要做故障演练,以及 Agent 在设计注入方案和验证方案时应遵循的方法论。帮助 Agent 理解"做什么"背后的"为什么",从而做出更合理的决策。
+> **Purpose**: This document systematically lays out the core ideas of chaos engineering, the basic principles of fault injection, why fault drills matter, and the methodology the Agent should follow when designing injection and verification plans. It helps the Agent understand the "why" behind the "what", so it can make sounder decisions.
 
-> **Agent 快速检索索引**:
-> - **核心概念**: 什么是混沌工程 → [Q1](#q1-什么是混沌工程它与传统的测试有什么区别); 为什么要做故障注入 → [Q2](#q2-为什么要做故障注入它的核心价值是什么)
-> - **设计原则**: 七大原则 → [Q3](#q3-混沌工程的七大原则是什么); 爆炸半径控制 → [Q5](#q5-什么是爆炸半径blast-radius如何控制它)
-> - **故障分类**: 基础设施层/Pod 层/应用层 → [Q4](#q4-故障注入可以分为哪些类型每种类型的典型场景是什么)
-> - **实验流程**: 生命周期五阶段 → [Q6](#q6-一次完整的故障注入实验包含哪些阶段); 三层验证模型 → [Q7](#q7-什么是-layer-1--layer-2--layer-3-验证它们的关系是什么)
-> - **安全红线**: 禁止操作清单 → [Q9](#q9-哪些操作是绝对禁止的为什么)
-> - **应用场景**: 典型用例 → [Q10](#q10-故障注入在实际工作中有哪些典型应用场景)
-> - **Agent 角色**: 优势与局限 → [Q11](#q11-agent-与传统故障注入工具如直接使用-chaosblade-相比有什么优势) / [Q12](#q12-agent-的局限性是什么什么情况下不应该使用-agent)
+> **Agent quick-reference index**:
+> - **Core concepts**: what chaos engineering is → [Q1](#q1-what-is-chaos-engineering-how-does-it-differ-from-traditional-testing); why do fault injection → [Q2](#q2-why-do-fault-injection-what-is-its-core-value)
+> - **Design principles**: the seven principles → [Q3](#q3-what-are-the-seven-principles-of-chaos-engineering); blast-radius control → [Q5](#q5-what-is-blast-radius-and-how-do-you-control-it)
+> - **Fault taxonomy**: infrastructure / Pod / application layer → [Q4](#q4-what-types-of-fault-injection-are-there-and-what-are-the-typical-scenarios-for-each)
+> - **Experiment flow**: the five lifecycle phases → [Q6](#q6-what-phases-does-a-complete-fault-injection-experiment-contain); the three-layer verification model → [Q7](#q7-authoritative-source-what-are-layer-1--layer-2--layer-3-verification-and-how-do-they-relate)
+> - **Safety red lines**: the forbidden-operations list → [Q9](#q9-safety-red-lines-which-operations-are-absolutely-forbidden-and-why)
+> - **Use cases**: typical applications → [Q10](#q10-what-are-the-typical-real-world-applications-of-fault-injection)
+> - **The Agent's role**: strengths and limits → [Q11](#q11-what-advantages-does-the-agent-have-over-traditional-fault-injection-tools-such-as-using-chaosblade-directly) / [Q12](#q12-what-are-the-agents-limitations-when-should-the-agent-not-be-used)
 
 ---
 
-## 一、混沌工程的本质与目标
+## 1. The nature and goals of chaos engineering
 
-### Q1: 什么是混沌工程?它与传统的测试有什么区别?
+### Q1: What is chaos engineering? How does it differ from traditional testing?
 
-**A1**: 混沌工程(Chaos Engineering)是在分布式系统上进行实验的学科,通过主动注入故障来建立对系统抵御动荡条件的信心。
+**A1**: Chaos engineering is the discipline of experimenting on a distributed system in order to build confidence in the system's ability to withstand turbulent conditions, by deliberately injecting faults.
 
-**核心区别**:
+**The core differences**:
 
-| 维度 | 传统测试 | 混沌工程 |
+| Dimension | Traditional testing | Chaos engineering |
 |------|---------|---------|
-| **目标** | 验证系统是否按预期工作 | 发现系统在异常条件下的未知弱点 |
-| **方法** | 确定性输入 → 确定性输出 | 随机/可控扰动 → 观察系统行为 |
-| **范围** | 单元测试、集成测试、端到端测试 | 生产环境或准生产环境的真实流量 |
-| **假设** | "我们知道所有可能的失败模式" | "我们不知道系统会如何失败" |
-| **心态** | 证明系统正确 | 证伪系统的韧性假设 |
+| **Goal** | Verify the system works as specified | Discover unknown weaknesses under abnormal conditions |
+| **Method** | deterministic input → deterministic output | random/controlled perturbation → observe system behaviour |
+| **Scope** | unit, integration and end-to-end tests | real traffic in production or near-production |
+| **Assumption** | "we know every possible failure mode" | "we do not know how the system will fail" |
+| **Mindset** | prove the system is correct | falsify the system's resilience assumptions |
 
-> **💡 Agent 使用提示**: 
-> - 当用户询问"为什么要做混沌工程"或"混沌工程和测试的区别"时,引用本章节
-> - 关键认知:**混沌工程不是"破坏系统",而是"通过受控实验提升系统韧性"**。每一次实验都应该有明确的假设、可控的范围、可观测的指标和可回滚的计划。
-
----
-
-### Q2: 为什么要做故障注入?它的核心价值是什么?
-
-**A2**: 故障注入的核心价值体现在四个层面:
-
-**1. 验证高可用设计的真实性**
-- 很多系统声称"支持自动故障转移"、"具备弹性伸缩能力",但从未在真实故障条件下验证过
-- 故障注入可以暴露配置错误、依赖缺失、超时设置不合理等隐藏问题
-- **示例**: Deployment 设置了 `replicas=3`,但如果反亲和性配置错误,三个 Pod 可能都在同一节点上,节点故障时服务完全不可用
-
-**2. 发现级联故障的传播路径**
-- 分布式系统中,一个组件的故障可能通过重试、超时、连接池耗尽等机制扩散到其他组件
-- 故障注入可以帮助绘制"故障传播图谱",识别系统中的单点故障和脆弱链路
-- **示例**: 数据库延迟增加 → 应用层查询超时 → 连接池耗尽 → 新请求被拒绝 → 上游服务熔断 → 用户体验降级
-
-**3. 训练团队的应急响应能力**
-- 故障演练是"消防演习",让 SRE 和开发团队在低压力环境下练习故障诊断和恢复流程
-- 通过反复演练,团队可以建立肌肉记忆,缩短 MTTR(Mean Time To Recovery)
-- **示例**: Pod OOMKilled 后,团队是否能快速通过 `kubectl logs --previous` 定位问题?是否有自动化告警?
-
-**4. 建立对系统的信心**
-- 经过充分故障演练的系统,团队对其在生产环境的表现更有信心
-- 这种信心不是盲目的,而是基于大量实验数据的理性判断
-- **示例**: "我们对这个服务的网络延迟容忍度是 500ms,已经通过 100+ 次网络延迟注入实验验证过"
-
-> **💡 Agent 使用提示**:
-> - 当用户质疑"为什么要做故障演练"时,从这四个层面解释价值
-> - 在设计实验计划时,明确说明本次实验对应哪个价值层面(例如:"本次实验旨在验证 HPA 自动扩缩容的真实性")
+> **💡 Agent usage tips**:
+> - Cite this section when the user asks "why do chaos engineering" or "how does chaos engineering differ from testing"
+> - Key insight: **chaos engineering is not about "breaking the system", it is about "improving resilience through controlled experiments"**. Every experiment should have an explicit hypothesis, a bounded scope, observable metrics and a rollback plan.
 
 ---
 
-### Q3: 混沌工程的七大原则是什么?
+### Q2: Why do fault injection? What is its core value?
 
-**A3**: 根据《混沌工程》一书,混沌工程遵循以下原则:
+**A2**: The core value of fault injection shows up at four levels:
 
-**1. 建立围绕稳定状态行为的假说**
-- 在注入故障前,明确定义系统的"正常状态"是什么样的
-- **示例**: "在正常情况下,API 服务的 P99 延迟 < 200ms,错误率 < 0.1%"
-- **Agent 行动**: 设计实验时,必须先确定要监控的稳定状态指标
+**1. Verifying that high-availability design is real**
+- Many systems claim to "support automatic failover" or to "have elastic scaling", yet have never been verified under real fault conditions
+- Fault injection exposes hidden problems: misconfiguration, missing dependencies, unreasonable timeout settings
+- **Example**: a Deployment sets `replicas=3`, but if anti-affinity is misconfigured all three Pods may sit on one node, so a node failure takes the service down completely
 
-**2. 多样化真实世界的事件**
-- 故障应该模拟真实环境中可能发生的问题,而不是虚构的场景
-- 常见故障类型:服务器宕机、网络延迟、磁盘满、依赖服务不可用、配置错误
-- **Agent 行动**: 优先选择高频、高影响的故障类型进行演练
+**2. Discovering how cascading failures propagate**
+- In a distributed system, one component's failure can spread to others through retries, timeouts, connection-pool exhaustion and similar mechanisms
+- Fault injection helps map the "fault propagation graph", identifying single points of failure and fragile links
+- **Example**: database latency rises → application query timeouts → connection pool exhausted → new requests rejected → upstream service trips its circuit breaker → degraded user experience
 
-**3. 在生产环境中运行实验**
-- 只有生产环境才有真实的流量、真实的负载、真实的依赖关系
-- 如果无法直接在生产环境演练,至少要在与生产环境高度相似的准生产环境(Staging)中进行
-- **Agent 行动**: 严格遵守安全边界,禁止在系统命名空间或关键业务中注入
+**3. Training the team's incident response**
+- A fault drill is a fire drill: it lets SRE and development teams practise diagnosis and recovery in a low-pressure setting
+- Repeated drills build muscle memory and shorten MTTR (Mean Time To Recovery)
+- **Example**: after a Pod is OOMKilled, can the team locate the problem quickly with `kubectl logs --previous`? Is there an automated alert?
 
-**4. 持续自动化运行实验**
-- 手工执行故障演练效率低、易出错,应该将实验自动化
-- 自动化实验可以频繁执行,及时发现回归问题
-- **Agent 行动**: Agent 本身就是自动化的载体,应该能够自主设计、执行、验证实验
+**4. Building confidence in the system**
+- After thorough fault drills, the team is more confident about how the system will behave in production
+- That confidence is not blind; it is a rational judgement grounded in a large body of experimental data
+- **Example**: "our latency tolerance for this service is 500ms, verified across 100+ network-delay injection experiments"
 
-**5. 最小化爆炸半径**
-- 实验的影响范围应该尽可能小,从单个 Pod 开始,逐步扩大
-- 使用灰度策略:先在少量实例上注入,确认安全后再扩大范围
-- **Agent 行动**: 在执行注入前必须进行安全检查(命名空间黑名单、冲突检测、爆炸半径评估)
-
-**6. 实时监控系统状态**
-- 实验过程中必须实时监控关键指标,一旦检测到异常影响立即停止
-- 监控指标应包括:业务指标(QPS、错误率)、系统指标(CPU、内存、网络)、应用指标(延迟、吞吐量)
-- **Agent 行动**: 在注入后应立即进入验证阶段,确认故障是否按预期生效
-
-**7. 分析实验结果并改进系统**
-- 每次实验后都应总结:假设是否成立?发现了什么问题?如何改进?
-- 将实验结果文档化,形成组织的知识库
-- **Agent 行动**: 将实验历史保存到 Operational Memory,供后续任务参考
-
-> **💡 Agent 使用提示**:
-> - 这七大原则是 Agent 设计实验的**最高指导原则**
-> - 在生成实验计划时,逐项检查是否符合这些原则(特别是原则 5"最小化爆炸半径"和原则 6"实时监控")
-> - 如果用户要求违反原则的操作(如在 kube-system 注入),必须拒绝并解释原因
+> **💡 Agent usage tips**:
+> - When the user questions "why run fault drills", explain the value along these four levels
+> - When designing an experiment plan, state which value level this experiment addresses (e.g. "this experiment verifies that HPA autoscaling actually works")
 
 ---
 
-## 二、故障注入的分类与适用场景
+### Q3: What are the seven principles of chaos engineering?
 
-### Q4: 故障注入可以分为哪些类型?每种类型的典型场景是什么?
+**A3**: Per the book *Chaos Engineering*, the discipline follows these principles:
 
-**A4**: 按故障发生的层级,可分为以下几类:
+**1. Build a hypothesis around steady-state behaviour**
+- Before injecting, define explicitly what the system's "normal state" looks like
+- **Example**: "under normal conditions the API service's P99 latency is < 200ms and its error rate < 0.1%"
+- **Agent action**: when designing an experiment, first determine which steady-state metrics to monitor
 
-#### 4.1 基础设施层故障(Node 级)
+**2. Vary real-world events**
+- Faults should simulate problems that can actually happen in the real environment, not invented scenarios
+- Common fault types: server crash, network delay, disk full, dependency unavailable, misconfiguration
+- **Agent action**: prioritise high-frequency, high-impact fault types for drills
 
-| 故障类型 | 描述 | 典型场景 | 验证重点 |
+**3. Run experiments in production**
+- Only production has real traffic, real load and real dependencies
+- If drilling directly in production is impossible, at least use a staging environment that closely mirrors production
+- **Agent action**: respect the safety boundary strictly; never inject into system namespaces or business-critical paths
+
+**4. Automate experiments to run continuously**
+- Running drills by hand is slow and error-prone; experiments should be automated
+- Automated experiments can run frequently and catch regressions early
+- **Agent action**: the Agent IS the automation vehicle — it should be able to design, execute and verify experiments autonomously
+
+**5. Minimise blast radius**
+- An experiment's impact should be as small as possible: start from a single Pod and expand gradually
+- Use a canary strategy: inject into a few instances first, confirm safety, then widen the scope
+- **Agent action**: safety checks (namespace blacklist, conflict detection, blast-radius assessment) MUST run before executing an injection
+
+**6. Monitor system state in real time**
+- Key metrics must be monitored live during the experiment, and it must be stopped the moment abnormal impact is detected
+- Metrics should cover business (QPS, error rate), system (CPU, memory, network) and application (latency, throughput) dimensions
+- **Agent action**: enter the verification phase immediately after injection to confirm the fault took effect as expected
+
+**7. Analyse the results and improve the system**
+- After every experiment, summarise: did the hypothesis hold? what problems were found? how do we improve?
+- Document the results to build the organisation's knowledge base
+- **Agent action**: persist experiment history to Operational Memory for later tasks to reference
+
+> **💡 Agent usage tips**:
+> - These seven principles are the Agent's **highest-order guidance** for designing experiments
+> - When generating an experiment plan, check each principle in turn (especially #5 "minimise blast radius" and #6 "monitor in real time")
+> - If the user asks for something that violates a principle (e.g. injecting into kube-system), refuse and explain why
+
+---
+
+## 2. Fault taxonomy and where each type applies
+
+### Q4: What types of fault injection are there, and what are the typical scenarios for each?
+
+**A4**: Grouped by the layer at which the fault occurs:
+
+#### 4.1 Infrastructure-layer faults (Node level)
+
+| Fault type | Description | Typical scenario | Verification focus |
 |----------|------|---------|---------|
-| **Node CPU 满载** | 节点 CPU 使用率达到 100% | 验证调度器是否会避开高负载节点;验证同节点其他 Pod 是否受影响 | `top node` 显示 CPU 飙升;新 Pod 不被调度到该节点 |
-| **Node 内存压力** | 节点内存使用率接近上限 | 验证 kubelet 是否会触发 Pod 驱逐;验证节点是否进入 MemoryPressure 状态 | `describe node` 中 MemoryPressure=True;部分 Pod 被 Evicted |
-| **Node 磁盘满** | 节点磁盘使用率达到 100% | 验证日志写入失败、容器启动失败、镜像拉取失败等场景 | `describe node` 中 DiskPressure=True;Pod 处于 Pending 或 FailedMount |
-| **Node 网络中断** | 节点与集群网络断开 | 验证 Node NotReady 状态;验证 Pod 漂移机制 | `get nodes` 中节点状态为 NotReady;Pod 被重新调度 |
-| **Node 宕机** | 节点完全不可用 | 验证控制平面如何检测节点故障;验证工作负载如何迁移 | 节点从 `get nodes` 消失;Pod 在其他节点重建 |
+| **Node CPU fullload** | The node's CPU utilisation reaches 100% | Verify the scheduler avoids heavily loaded nodes; verify whether other Pods on the node are affected | `top node` shows the CPU spike; new Pods are not scheduled onto that node |
+| **Node memory pressure** | The node's memory utilisation nears its ceiling | Verify kubelet triggers Pod eviction; verify the node enters MemoryPressure | `describe node` shows MemoryPressure=True; some Pods are Evicted |
+| **Node disk full** | The node's disk utilisation reaches 100% | Verify log-write failures, container start failures, image-pull failures | `describe node` shows DiskPressure=True; Pods are Pending or FailedMount |
+| **Node network cut** | The node loses cluster network connectivity | Verify the Node NotReady state; verify the Pod drift mechanism | `get nodes` shows the node as NotReady; Pods are rescheduled |
+| **Node down** | The node is completely unavailable | Verify how the control plane detects the node failure; verify how workloads migrate | The node disappears from `get nodes`; Pods are rebuilt on other nodes |
 
-#### 4.2 容器/Pod 层故障
+#### 4.2 Container / Pod-layer faults
 
-| 故障类型 | 描述 | 典型场景 | 验证重点 |
+| Fault type | Description | Typical scenario | Verification focus |
 |----------|------|---------|---------|
-| **Pod CPU 满载** | Pod 内进程占用大量 CPU | 验证 HPA 是否扩容;验证应用响应延迟是否增加 | `top pod` 显示 CPU 接近 limit;应用 P99 延迟升高 |
-| **Pod 内存泄漏/OOM** | Pod 内存持续增长直至被 OOMKill | 验证内存 limit 设置是否合理;验证重启后数据是否丢失 | `get pod -o json` 中 exitCode=137;`restartCount` 增加 |
-| **Pod 杀死** | 强制删除 Pod | 验证 Deployment 是否自动重建;验证服务是否短暂不可用 | Pod 被删除后 5-10 秒内新 Pod 启动;Endpoints 短暂为空 |
-| **Pod 网络延迟** | Pod 出入流量增加固定延迟 | 验证应用超时设置是否合理;验证调用链下游是否受影响 | `exec -- ping` 延迟增大;应用日志出现 timeout |
-| **Pod 网络丢包** | Pod 网络数据包随机丢弃 | 验证重试机制是否生效;验证连接重置处理逻辑 | `exec -- ping` 丢包率升高;应用日志出现 connection reset |
-| **Pod DNS 故障** | Pod 内域名解析被劫持 | 验证服务发现是否受影响;验证 DNS 缓存机制 | `cat /etc/hosts` 显示 #chaosblade 条目;`ping <domain>` 解析到伪造 IP;应用日志 resolve failed（⚠️ 不要用 nslookup/dig） |
-| **Pod 磁盘填充** | Pod 挂载的卷被填满 | 验证应用写入失败处理逻辑;验证日志轮转机制 | `exec -- df -h` 显示磁盘满;应用日志出现 no space left |
-| **Pod 进程杀死** | 杀死 Pod 内特定进程 | 验证进程守护机制;验证应用重启逻辑 | `exec -- ps aux` 中目标进程消失;进程被重启 |
+| **Pod CPU fullload** | A process in the Pod consumes a lot of CPU | Verify HPA scales up; verify the application's response latency increases | `top pod` shows CPU near the limit; the application's P99 latency rises |
+| **Pod memory leak / OOM** | The Pod's memory grows until it is OOMKilled | Verify the memory limit is set sensibly; verify whether data is lost after the restart | `get pod -o json` shows exitCode=137; `restartCount` increases |
+| **Pod kill** | Force-delete the Pod | Verify the Deployment rebuilds it automatically; verify the service is only briefly unavailable | A new Pod starts within 5-10s of the deletion; Endpoints is briefly empty |
+| **Pod network delay** | A fixed delay is added to the Pod's ingress/egress traffic | Verify the application's timeout settings are sensible; verify whether downstream calls are affected | `exec -- ping` latency rises; the application log shows timeouts |
+| **Pod packet loss** | The Pod's network packets are dropped at random | Verify the retry mechanism works; verify connection-reset handling | `exec -- ping` loss rate rises; the application log shows connection reset |
+| **Pod DNS fault** | Name resolution inside the Pod is hijacked | Verify whether service discovery is affected; verify the DNS caching behaviour | `cat /etc/hosts` shows the #chaosblade entry; `ping <domain>` resolves to the forged IP; the application log shows resolve failed (⚠️ do NOT use nslookup/dig) |
+| **Pod disk fill** | The volume mounted by the Pod is filled up | Verify the application's write-failure handling; verify log rotation | `exec -- df -h` shows the disk full; the application log shows no space left |
+| **Pod process kill** | Kill a specific process inside the Pod | Verify the process supervision mechanism; verify the application's restart logic | The target process disappears from `exec -- ps aux`; the process is restarted |
 
-#### 4.3 应用层故障
+#### 4.3 Application-layer faults
 
-| 故障类型 | 描述 | 典型场景 | 验证重点 |
+| Fault type | Description | Typical scenario | Verification focus |
 |----------|------|---------|---------|
-| **HTTP 延迟/错误注入** | 在应用层拦截 HTTP 请求,注入延迟或返回错误码 | 验证熔断器是否触发;验证降级策略是否生效 | 客户端收到 5xx 错误或延迟增加;熔断器打开 |
-| **JVM GC 停顿** | 触发 Java 应用 Full GC,造成 STW(Stop-The-World) | 验证 JVM 应用的响应抖动;验证超时设置 | 应用暂停响应数十秒;P99 延迟飙升 |
-| **数据库连接池耗尽** | 模拟数据库慢查询导致连接池占满 | 验证新请求是否被拒绝;验证连接池监控告警 | 应用日志出现 connection pool exhausted |
+| **HTTP delay / error injection** | Intercept HTTP requests at the application layer and inject a delay or return an error code | Verify the circuit breaker trips; verify the fallback strategy works | The client receives 5xx errors or increased latency; the circuit breaker opens |
+| **JVM GC pause** | Trigger a Full GC in a Java application, causing a STW (Stop-The-World) | Verify the JVM application's response jitter; verify the timeout settings | The application stops responding for tens of seconds; P99 latency spikes |
+| **DB connection-pool exhaustion** | Simulate slow database queries filling the connection pool | Verify new requests are rejected; verify connection-pool monitoring alerts | The application log shows connection pool exhausted |
 
-#### 4.4 ChaosBlade Action 映射参考
+#### 4.4 ChaosBlade action reference
 
-Agent 构造 ChaosBlade 命令时，`action` 决定了故障行为类型。以下是常用 action 与故障场景的对应关系：
+When the Agent builds a ChaosBlade command, `action` determines the fault behaviour. Common actions and the scenarios they map to:
 
-| Action | 含义 | 适用 Target | 典型参数 |
+| Action | Meaning | Applicable target | Typical parameters |
 |--------|------|------------|---------|
-| `fullload` | CPU 满载 | cpu | `--cpu-percent`（默认 100） |
-| `load` | 按比例加载（内存） | mem | `--mode ram`, `--mem-percent` |
-| `delay` | 网络延迟注入 | network | `--time`(ms), `--offset`(ms) |
-| `loss` | 网络丢包 | network | `--percent` |
-| `duplicate` | 网络包重复 | network | `--percent` |
-| `corrupt` | 网络包损坏 | network | `--percent` |
-| `fill` | 磁盘填充 | disk | `--path`, `--size`/`--percent` |
-| `burn` | 磁盘 IO 烧写 | disk | `--read`/`--write` |
-| `kill` | 进程杀死 | process | `--process`, `--signal` |
-| `stop` | 进程暂停 | process | `--process` |
+| `fullload` | CPU fullload | cpu | `--cpu-percent` (default 100) |
+| `load` | proportional load (memory) | mem | `--mode ram`, `--mem-percent` |
+| `delay` | network delay injection | network | `--time` (ms), `--offset` (ms) |
+| `loss` | packet loss | network | `--percent` |
+| `duplicate` | packet duplication | network | `--percent` |
+| `corrupt` | packet corruption | network | `--percent` |
+| `fill` | disk filling | disk | `--path`, `--size`/`--percent` |
+| `burn` | disk IO burn | disk | `--read`/`--write` |
+| `kill` | process kill | process | `--process`, `--signal` |
+| `stop` | process suspend | process | `--process` |
 
-> **💡 Agent 使用提示**:
-> - **当前技能目录覆盖范围**: 主要支持**基础设施层**和**Pod 层**故障(通过 ChaosBlade 实现)
-> - **不支持的故障类型**: 应用层故障通常需要侵入式修改代码或使用 Service Mesh(如 Istio Fault Injection),暂不支持
-> - **选择原则**: 根据用户意图和目标资源类型选择合适的故障类型
->   - 如果用户说"让这个 Pod 变慢" → 选择 `pod-network-delay`
->   - 如果用户说"测试 HPA" → 选择 `pod-cpu-fullload`
->   - 如果用户说"验证 Pod 自愈" → 选择 `pod-kill`
+> **💡 Agent usage tips**:
+> - **What the current skill catalogue covers**: mainly **infrastructure-layer** and **Pod-layer** faults (realised via ChaosBlade)
+> - **Unsupported fault types**: application-layer faults usually require intrusive code changes or a service mesh (e.g. Istio Fault Injection) and are not supported yet
+> - **Selection principle**: choose the fault type based on the user's intent and the target resource type
+>   - If the user says "make this Pod slow" → choose `pod-network-delay`
+>   - If the user says "test HPA" → choose `pod-cpu-fullload`
+>   - If the user says "verify Pod self-healing" → choose `pod-kill`
 
 ---
 
-### Q5: 什么是"爆炸半径"(Blast Radius)?如何控制它?
+### Q5: What is blast radius, and how do you control it?
 
-**A5**: 爆炸半径指故障注入影响的范围大小。**控制爆炸半径是混沌工程安全性的核心**。
+**A5**: Blast radius is the size of the area a fault injection affects. **Controlling blast radius is the core of chaos-engineering safety.**
 
-**爆炸半径的四个维度**:
+**The four dimensions of blast radius**:
 
-| 维度 | 从小到大的顺序 | 控制手段 |
+| Dimension | Order from smallest to largest | How to control it |
 |------|--------------|---------|
-| **资源粒度** | Container → Pod → ReplicaSet → Deployment → Namespace → Cluster | 从单个 Pod 开始,逐步扩大 |
-| **端口粒度** | 指定端口(--local-port) → 全端口 | 对 network 故障使用 --local-port 限制影响范围,避免影响 DNS、监控等非目标流量 |
-| **流量比例** | 1% → 5% → 10% → 50% → 100% | 通过标签选择器限制目标数量 |
-| **持续时间** | 10s → 30s → 60s → 600s | 设置较短的 duration,确认安全后再延长 |
-| **故障强度** | 轻微延迟(100ms)→ 中等延迟(1s)→ 严重延迟(5s)→ 完全中断 | 通过 params 调整故障参数 |
+| **Resource granularity** | Container → Pod → ReplicaSet → Deployment → Namespace → Cluster | Start from a single Pod and widen gradually |
+| **Port granularity** | specific port (--local-port) → all ports | For network faults, use --local-port to bound the impact so non-target traffic such as DNS and monitoring is unaffected |
+| **Traffic share** | 1% → 5% → 10% → 50% → 100% | Bound the number of targets with a label selector |
+| **Duration** | 10s → 30s → 60s → 600s | Set a short duration first and extend once it is confirmed safe |
+| **Fault intensity** | mild delay (100ms) → moderate (1s) → severe (5s) → total outage | Tune the fault parameters via params |
 
-**Agent 的安全检查流程**(必须按顺序执行):
+**The Agent's safety-check flow** (MUST run in this order):
 
 ```
-1. 命名空间黑名单检查
-   ↓ 如果 namespace in [kube-system, kube-public, istio-system, ...] → 拒绝
-   
-2. 目标存在性验证
+1. Namespace blacklist check
+   ↓ if namespace in [kube-system, kube-public, istio-system, ...] → reject
+
+2. Target existence verification
    ↓ kubectl get <resource> <name> -n <namespace>
-   ↓ 如果不存在或状态 != Running → 拒绝
-   
-3. 冲突检测
-   ↓ blade status 检查是否有活跃实验
-   ↓ 如果有冲突 → 警告并要求用户确认
-   
-4. 爆炸半径评估
-   ↓ 计算匹配的目标数量
-   ↓ 如果 > 阈值(如 10 个 Pod) → 标记 warning 并要求人工确认
-   
-5. 人工确认门(如果用户指定 --confirm)
-   ↓ 生成实验计划,暂停等待用户 approve/reject
+   ↓ if it does not exist or its status != Running → reject
+
+3. Conflict detection
+   ↓ blade status checks for active experiments
+   ↓ if there is a conflict → warn and require user confirmation
+
+4. Blast-radius assessment
+   ↓ count the matching targets
+   ↓ if > threshold (e.g. 10 Pods) → mark as warning and require manual confirmation
+
+5. Manual confirmation gate (when the user passed --confirm)
+   ↓ generate the experiment plan, then pause for the user to approve/reject
 ```
 
-**最佳实践**:
-- 首次对某个服务做故障演练时,**选择单个 Pod**,duration 设为 **30-60 秒**
-- 观察期间监控关键指标(错误率、延迟、CPU/内存),确认无异常影响后再扩大范围
-- 对于关键业务,**始终启用人工确认门**(`--confirm`)
+**Best practice**:
+- For a service's first fault drill, **pick a single Pod** and set duration to **30-60 seconds**
+- Monitor the key metrics (error rate, latency, CPU/memory) during the observation window, and only widen the scope after confirming there is no abnormal impact
+- For business-critical targets, **always enable the manual confirmation gate** (`--confirm`)
 
-> **💡 Agent 使用提示**:
-> - 在生成实验计划时,必须明确说明爆炸半径(例如:"本次实验影响范围:1 个 Pod,持续时间 60 秒")
-> - 如果用户要求大规模注入(如"对所有 Pod 注入"),必须警告风险并建议从小规模开始
-> - 爆炸半径评估公式:`匹配目标数 = kubectl get pods -l <selector> -n <namespace> --no-headers | wc -l`
+> **💡 Agent usage tips**:
+> - When generating an experiment plan, state the blast radius explicitly (e.g. "blast radius of this experiment: 1 Pod, duration 60 seconds")
+> - If the user asks for a large-scale injection ("inject into every Pod"), warn about the risk and recommend starting small
+> - Blast-radius formula: `matching targets = kubectl get pods -l <selector> -n <namespace> --no-headers | wc -l`
 
 ---
 
-## 三、故障注入的生命周期
+## 3. The fault-injection lifecycle
 
-### Q6: 一次完整的故障注入实验包含哪些阶段?
+### Q6: What phases does a complete fault-injection experiment contain?
 
-**A6**: 标准的故障注入实验包含五个阶段:
+**A6**: A standard fault-injection experiment has five phases:
 
 ```
-准备阶段 → 注入阶段 → 观察阶段 → 恢复阶段 → 总结阶段
+Preparation → Injection → Observation → Recovery → Analysis
 ```
 
-#### 6.1 准备阶段(Preparation)
+#### 6.1 Preparation
 
-**目标**: 确保实验环境就绪,定义实验假设和成功标准。
+**Goal**: make sure the experiment environment is ready, and define the hypothesis and success criteria.
 
-**关键活动**:
-- 确定实验目标:要验证什么假设?(例如:"当 Pod CPU 满载时,HPA 应在 2 分钟内扩容")
-- 选择目标资源:哪个 Deployment/Pod/Node?
-- 定义稳定状态基线:实验前的正常指标是什么?(例如:P99 延迟 100ms,错误率 0.01%)
-- 设置监控告警:配置关键指标的告警阈值,一旦超出立即停止实验
-- 制定回滚计划:如果实验失控,如何快速恢复?
+**Key activities**:
+- Determine the experiment's goal: which hypothesis is being tested? (e.g. "when Pod CPU is at fullload, HPA should scale up within 2 minutes")
+- Pick the target resource: which Deployment/Pod/Node?
+- Define the steady-state baseline: what are the normal metrics before the experiment? (e.g. P99 latency 100ms, error rate 0.01%)
+- Set up monitoring alerts: configure alert thresholds on the key metrics so the experiment is stopped the moment they are breached
+- Prepare a rollback plan: if the experiment gets out of hand, how do we recover quickly?
 
-> **🤖 Agent 的职责**:
-> 1. 加载 Operational Memory,检查是否有历史冲突实验
-> 2. 通过 `kubectl get` 验证目标资源存在且状态正常
-> 3. 生成实验计划,包括故障类型、目标、参数、预计持续时间
-> 4. 如果需要,触发人工确认门(`ask_human`)
+> **🤖 The Agent's responsibilities**:
+> 1. Load Operational Memory and check for historical conflicting experiments
+> 2. Verify via `kubectl get` that the target resource exists and is healthy
+> 3. Generate the experiment plan: fault type, target, parameters, expected duration
+> 4. Trigger the manual confirmation gate (`ask_human`) when required
 
 ---
 
-#### 6.2 注入阶段(Injection)
+#### 6.2 Injection
 
-**目标**: 执行故障注入,确认注入动作成功。
+**Goal**: execute the injection and confirm the action succeeded.
 
-**关键活动**:
-- 调用 ChaosBlade 执行注入命令(如 `blade create pod cpu fullload`)
-- 获取实验 UID(用于后续恢复)
-- 通过 `blade status` 确认实验状态为 Running
-- 记录注入时间戳,用于后续指标分析
+**Key activities**:
+- Call ChaosBlade to run the injection command (e.g. `blade create pod cpu fullload`)
+- Capture the experiment UID (needed for recovery later)
+- Confirm via `blade status` that the experiment status is Running
+- Record the injection timestamp for later metric analysis
 
-> **🤖 Agent 的职责**:
-> 1. 激活对应的 Skill,读取注入指令
-> 2. 构造 blade 命令并执行(通过 `blade_create` 工具)
-> 3. **Layer 1 验证**: 通过 `blade_status` 确认实验创建成功
-> 4. 保存 `task_id` 和 `blade_uid` 到 AgentState,供后续恢复使用
+> **🤖 The Agent's responsibilities**:
+> 1. Activate the corresponding Skill and read its injection instructions
+> 2. Build and run the blade command (via the `blade_create` tool)
+> 3. **Layer 1 verification**: confirm the experiment was created via `blade_status`
+> 4. Save `task_id` and `blade_uid` into AgentState for later recovery
 
 ---
 
-#### 6.3 观察阶段(Observation)
+#### 6.3 Observation
 
-**目标**: 验证故障是否按预期生效,观察系统行为是否符合假设。
+**Goal**: verify the fault took effect as expected, and observe whether the system behaves per the hypothesis.
 
-**关键活动**:
-- **Layer 1 验证**: 确认 ChaosBlade 实验正在运行
+**Key activities**:
+- **Layer 1 verification**: confirm the ChaosBlade experiment is running
   ```bash
   blade status --uid <uid>
-  # 预期: { "code": 200, "result": { "status": "Running", "uid": "<uid>" } }
+  # expected: { "code": 200, "result": { "status": "Running", "uid": "<uid>" } }
   ```
-  
-> **注意**：`blade status` v1.8.0 不支持 `--kubeconfig` flag，Agent 内部通过 `KUBECONFIG` 环境变量传递集群凭证。
 
-- **Layer 2 验证**: 通过 kubectl 验证故障现象是否出现
-  - Pod CPU 满载 → `kubectl top pod my-pod -n default` 显示 CPU 接近 limit
-  - Pod 网络延迟 → `kubectl exec my-pod -n default -- ping -c 3 <target>` 显示延迟增加
-  
-- **Layer 3 验证**(可选): 横向对比,确认影响范围可控
-  - 只有目标 Pod 受影响,同 Deployment 的其他 Pod 正常
-  - Service 整体错误率未显著上升
+> **Note**: `blade status` in v1.8.0 does NOT support the `--kubeconfig` flag; the Agent passes cluster credentials internally via the `KUBECONFIG` environment variable.
 
-> **🤖 Agent 的职责**:
-> 1. 读取 Skill 中的"验证方法"章节,获取推荐的 kubectl 验证命令
-> 2. 执行验证命令,解析输出,判断是否符合预期
-> 3. 如果验证失败(例如注入后 CPU 没有升高),**自动触发回滚**并记录失败原因
-> 4. 如果验证通过,标记实验状态为 active,进入等待期(duration 倒计时)
+- **Layer 2 verification**: use kubectl to verify the fault symptom appeared
+  - Pod CPU fullload → `kubectl top pod my-pod -n default` shows CPU near the limit
+  - Pod network delay → `kubectl exec my-pod -n default -- ping -c 3 <target>` shows increased latency
+
+- **Layer 3 verification** (optional): compare laterally to confirm the blast radius is contained
+  - Only the target Pod is affected; the Deployment's other Pods are healthy
+  - The Service's overall error rate has not risen significantly
+
+> **🤖 The Agent's responsibilities**:
+> 1. Read the "verification method" section of the Skill to get the recommended kubectl verification commands
+> 2. Run the verification commands, parse the output and judge whether it matches expectations
+> 3. If verification fails (e.g. CPU did not rise after injection), **trigger a rollback automatically** and record the failure reason
+> 4. If verification passes, mark the experiment as active and enter the waiting period (duration countdown)
 
 ---
 
-#### 6.4 恢复阶段(Recovery)
+#### 6.4 Recovery
 
-**目标**: 停止故障注入,确认系统恢复正常。
+**Goal**: stop the injection and confirm the system returned to normal.
 
-**关键活动**:
-- 调用 `blade destroy <uid>` 销毁实验
-- 通过 `blade status --uid <uid>` 确认实验状态变为 Destroyed
-- 通过 kubectl 验证故障现象已消除
-  - `kubectl top pod` 显示 CPU 回落到正常水平
-  - `kubectl exec -- ping` 显示延迟恢复正常
-- 确认系统稳定状态已恢复(Pod Ready=True,Endpoints 非空)
+**Key activities**:
+- Call `blade destroy <uid>` to destroy the experiment
+- Confirm via `blade status --uid <uid>` that the status became Destroyed
+- Use kubectl to verify the fault symptom is gone
+  - `kubectl top pod` shows CPU back to normal levels
+  - `kubectl exec -- ping` shows latency back to normal
+- Confirm the steady state is restored (Pod Ready=True, Endpoints non-empty)
 
-> **🤖 Agent 的职责**:
-> 1. 接收用户的 recover 请求(task_id 或 force 模式)
-> 2. 从 Checkpointer 恢复 AgentState,获取 blade_uid
-> 3. **Layer 1 恢复验证**: 确认实验仍在 Running 状态(防止重复恢复)
-> 4. 调用 `blade destroy` 执行恢复
-> 5. **Layer 2 恢复验证**: 确认故障现象已消除
-> 6. 更新任务状态为 recovered,保存实验历史到 Operational Memory
+> **🤖 The Agent's responsibilities**:
+> 1. Accept the user's recover request (by task_id, or in force mode)
+> 2. Restore AgentState from the Checkpointer and get blade_uid
+> 3. **Layer 1 recovery verification**: confirm the experiment is still Running (guards against double recovery)
+> 4. Call `blade destroy` to perform the recovery
+> 5. **Layer 2 recovery verification**: confirm the fault symptom is gone
+> 6. Update the task state to recovered and persist the experiment history to Operational Memory
 
-**标准化恢复命令**:
+**Standard recovery commands**:
 ```bash
-# 销毁实验
+# destroy the experiment
 blade destroy <uid>
 
-# 确认实验已销毁
+# confirm the experiment is destroyed
 blade status --uid <uid>
-# 预期: { "code": 200, "result": { "status": "Destroyed", "uid": "<uid>" } }
+# expected: { "code": 200, "result": { "status": "Destroyed", "uid": "<uid>" } }
 ```
 
-> **非 ChaosBlade 故障的恢复**：以下故障类型不通过 `blade destroy` 恢复，需用 kubectl 反向操作：
+> **Recovering non-ChaosBlade faults**: the following fault types are NOT recovered by `blade destroy`; they need the inverse kubectl operation:
 >
-> | 注入方式 | 恢复命令 |
+> | How it was injected | Recovery command |
 > |---------|---------|
-> | `kubectl scale --replicas=0` | `kubectl scale --replicas=<原始值>` |
+> | `kubectl scale --replicas=0` | `kubectl scale --replicas=<original value>` |
 > | `kubectl cordon <node>` | `kubectl uncordon <node>` |
-> | `kubectl patch pvc`（错误 SC） | `kubectl patch pvc` 改回正确 storageClassName |
+> | `kubectl patch pvc` (wrong SC) | `kubectl patch pvc` back to the correct storageClassName |
 > | `kubectl taint` | `kubectl taint <node> <key>-` |
 
 ---
 
-#### 6.5 总结阶段(Analysis)
+#### 6.5 Analysis
 
-**目标**: 分析实验结果,提炼经验教训,更新知识库。
+**Goal**: analyse the results, distil the lessons learned, and update the knowledge base.
 
-**关键活动**:
-- 收集实验期间的指标数据(timeline、durations、execution stats)
-- 对比实验前后的系统状态,评估影响
-- 回答实验假设:假设是否成立?发现了什么问题?
-- 记录实验结果到 Operational Memory,供后续任务参考
-- 如果发现了新的故障模式或验证方法,更新 MEMORY.md
+**Key activities**:
+- Collect the metric data from the experiment window (timeline, durations, execution stats)
+- Compare system state before and after to assess the impact
+- Answer the hypothesis: did it hold? what problems were found?
+- Record the results in Operational Memory for later tasks to reference
+- If a new fault mode or verification method was discovered, update MEMORY.md
 
-> **🤖 Agent 的职责**:
-> 1. 通过 `blade-ai metric --task-id <id>` 输出四维指标
-> 2. 将实验摘要(目标、约束、进度、决策、下一步)保存到 Session Memory
-> 3. 将实验历史记录(task_id、fault_type、targets、state、timestamps)保存到 `experiments.jsonl`
-> 4. 如果实验中出现了意外情况(例如验证失败、安全拦截),记录到 MEMORY.md 作为运维经验
+> **🤖 The Agent's responsibilities**:
+> 1. Emit the four metric dimensions via `blade-ai metric --task-id <id>`
+> 2. Save the experiment digest (goal, constraints, progress, decisions, next steps) to Session Memory
+> 3. Save the experiment history record (task_id, fault_type, targets, state, timestamps) to `experiments.jsonl`
+> 4. If anything unexpected happened during the experiment (verification failure, safety interception), record it in MEMORY.md as operational experience
 
 ---
 
-## 四、故障验证的分层模型
+## 4. The layered fault-verification model
 
-### Q7: 【权威来源】什么是 Layer 1 / Layer 2 / Layer 3 验证?它们的关系是什么?
+### Q7: [AUTHORITATIVE SOURCE] What are Layer 1 / Layer 2 / Layer 3 verification, and how do they relate?
 
-**A7**: 故障验证采用三层模型,逐层深入:
+**A7**: Fault verification uses a three-layer model, going deeper layer by layer:
 
-| 层次 | 名称 | 验证内容 | 验证方法 | 可靠性 |
+| Layer | Name | What it verifies | Method | Reliability |
 |------|------|---------|---------|--------|
-| **Layer 1** | 注入动作验证 | ChaosBlade 实验是否成功创建/销毁 | `blade status --uid <uid>` | 高(直接查询实验状态) |
-| **Layer 2** | 现象验证 | 系统是否出现了预期的故障现象 | `kubectl top/exec/describe/logs` + 指标断言 | 中高(依赖 kubectl 输出解析) |
-| **Layer 3** | 影响验证 | 故障的影响范围是否可控,是否符合预期 | 横向对比 + 业务指标监控 | 中(需要多维度数据交叉验证) |
+| **Layer 1** | Injection-action verification | Was the ChaosBlade experiment created/destroyed successfully | `blade status --uid <uid>` | High (queries the experiment status directly) |
+| **Layer 2** | Symptom verification | Did the system exhibit the expected fault symptom | `kubectl top/exec/describe/logs` + metric assertions | Medium-high (depends on parsing kubectl output) |
+| **Layer 3** | Impact verification | Is the fault's blast radius contained and as expected | Lateral comparison + business-metric monitoring | Medium (needs cross-checking across dimensions) |
 
-**关系说明**:
-- **Layer 1 是必要条件**: 如果 Layer 1 验证失败(实验未创建成功),Layer 2/3 无需执行,直接回滚
-- **Layer 2 是充分条件**: Layer 2 验证通过表示故障确实生效,但不代表影响符合预期
-- **Layer 3 是增强验证**: Layer 3 用于复杂场景,例如验证级联故障、评估业务影响
+**How they relate**:
+- **Layer 1 is a necessary condition**: if Layer 1 fails (the experiment was not created), skip Layer 2/3 and roll back immediately
+- **Layer 2 is a sufficient condition**: passing Layer 2 means the fault really took effect, but not that the impact is as expected
+- **Layer 3 is enhanced verification**: used for complex scenarios, e.g. verifying cascading failures or assessing business impact
 
-**Agent 的验证策略**:
-- **注入验证**: 必须执行 Layer 1 + Layer 2。Layer 3 可选,取决于 Skill 中是否定义了横向对比规则
-- **恢复验证**: 必须执行 Layer 1(确认实验已销毁)+ Layer 2(确认现象已消除)
-- **验证失败处理**: 如果 Layer 2 验证失败(例如注入后 CPU 没有升高),Agent 应**自动触发** `blade destroy` 回滚,并记录失败原因到实验历史
+**The Agent's verification strategy**:
+- **Injection verification**: Layer 1 + Layer 2 are mandatory. Layer 3 is optional, depending on whether the Skill defines lateral-comparison rules
+- **Recovery verification**: Layer 1 (confirm the experiment was destroyed) + Layer 2 (confirm the symptom is gone) are mandatory
+- **Handling verification failure**: if Layer 2 fails (e.g. CPU did not rise after injection), the Agent MUST **automatically trigger** `blade destroy` to roll back, and record the failure reason in the experiment history
 
-**完整验证示例(Pod CPU 满载)**:
+**A complete verification example (Pod CPU fullload)**:
 
 ```
 ┌─────────────────────────────────────────────┐
-│ Layer 1: 注入动作验证                        │
+│ Layer 1: injection-action verification      │
 ├─────────────────────────────────────────────┤
-│ 命令: blade status --uid abc123              │
-│ 输出: { "code": 200, "result": {             │
+│ command: blade status --uid abc123          │
+│ output:  { "code": 200, "result": {         │
 │           "status": "Running",               │
 │           "uid": "abc123"                    │
 │         } }                                  │
-│ 结论: 实验创建成功 ✓                         │
+│ verdict: experiment created ✓               │
 └─────────────────────────────────────────────┘
                     ↓
 ┌─────────────────────────────────────────────┐
-│ Layer 2: 现象验证                            │
+│ Layer 2: symptom verification               │
 ├─────────────────────────────────────────────┤
-│ 命令: kubectl top pod my-pod -n default      │
-│ 输出: NAME     CPU(cores)   MEMORY(bytes)    │
-│         my-pod 480m         256Mi            │
-│ 断言: CPU 使用率 480m / Limit 500m = 96%    │
-│       96% > 80% 阈值 → 通过 ✓                │
+│ command: kubectl top pod my-pod -n default  │
+│ output:  NAME    CPU(cores)  MEMORY(bytes)  │
+│          my-pod  480m        256Mi          │
+│ assert:  CPU 480m / Limit 500m = 96%        │
+│          96% > 80% threshold → pass ✓       │
 └─────────────────────────────────────────────┘
                     ↓
 ┌─────────────────────────────────────────────┐
-│ Layer 3: 影响验证(可选)                      │
+│ Layer 3: impact verification (optional)     │
 ├─────────────────────────────────────────────┤
-│ 命令: kubectl top pod -l app=my-app -n def   │
-│ 输出: my-pod-1: 480m (96%)                   │
-│         my-pod-2: 50m  (10%)                 │
-│         my-pod-3: 60m  (12%)                 │
-│ 结论: 只有目标 Pod 受影响,其他副本正常 ✓      │
+│ command: kubectl top pod -l app=my-app -n d │
+│ output:  my-pod-1: 480m (96%)               │
+│          my-pod-2: 50m  (10%)               │
+│          my-pod-3: 60m  (12%)               │
+│ verdict: only the target Pod is affected    │
 └─────────────────────────────────────────────┘
 ```
 
-> **💡 Agent 使用提示**:
-> - Layer 1 验证必须使用 `blade_status` 工具,不要手动拼接命令
-> - Layer 2 验证的命令和断言逻辑应从 Skill 的"验证方法"章节读取
-> - 如果 Layer 2 验证失败,先重试 1-2 次(间隔 3-5 秒),排除时序问题;如果仍失败,触发回滚
+> **💡 Agent usage tips**:
+> - Layer 1 verification MUST use the `blade_status` tool — do not hand-assemble the command
+> - Layer 2's commands and assertion logic should be read from the Skill's "verification method" section
+> - If Layer 2 fails, retry 1-2 times first (3-5s apart) to rule out a timing issue; if it still fails, trigger a rollback
 
 ---
 
-### Q8: 为什么 Layer 2 验证需要 LLM 参与?不能直接用规则引擎吗?
+### Q8: Why does Layer 2 verification need an LLM? Why not just a rule engine?
 
-**A8**: Layer 2 验证需要 LLM 参与的四个原因:
+**A8**: Four reasons Layer 2 verification needs an LLM:
 
-**1. 验证逻辑的多样性**
-- 不同故障类型的验证方法差异很大:
-  - Pod CPU 满载: 检查 `top pod` 输出
-  - Pod OOM: 检查 `get pod -o json` 中的 exitCode 和 reason
-  - Pod 网络延迟: 需要在 Pod 内执行 `ping` 并解析延迟值
-  - Node 磁盘满: 需要检查 `describe node` 中的 Conditions
-- 规则引擎需要为每种故障类型硬编码验证逻辑,扩展性差
-- **LLM 优势**: 可以读取 Skill 中的"验证方法"章节,动态生成验证步骤
+**1. The diversity of verification logic**
+- Verification methods differ widely between fault types:
+  - Pod CPU fullload: inspect `top pod` output
+  - Pod OOM: inspect exitCode and reason in `get pod -o json`
+  - Pod network delay: run `ping` inside the Pod and parse the latency
+  - Node disk full: inspect the Conditions in `describe node`
+- A rule engine would need hard-coded verification logic per fault type, which does not scale
+- **LLM advantage**: it can read the Skill's "verification method" section and generate the verification steps dynamically
 
-**2. 输出的不确定性**
-- kubectl 的输出格式虽然结构化(JSON),但字段含义需要语义理解
-- **示例**: `status.containerStatuses[0].state.waiting.reason` 的值可能是 `ImagePullBackOff`、`CrashLoopBackOff`、`ContainerCreating`,每种值的含义不同
-- **LLM 优势**: 可以根据上下文判断当前状态是否符合预期
+**2. Output is not deterministic**
+- kubectl output is structured (JSON), but the field meanings require semantic understanding
+- **Example**: `status.containerStatuses[0].state.waiting.reason` may be `ImagePullBackOff`, `CrashLoopBackOff` or `ContainerCreating`, each meaning something different
+- **LLM advantage**: it can judge from context whether the current state matches expectations
 
-**3. 多源数据融合**
-- 完整的验证可能需要结合多个数据源:
-  - `kubectl top` 的实时指标
-  - `kubectl describe` 的 Events
-  - `kubectl logs` 的应用日志
-  - `kubectl exec` 的容器内状态
-- **LLM 优势**: 可以综合这些信息,做出更准确的判断
+**3. Fusing multiple data sources**
+- Complete verification may require combining several sources:
+  - live metrics from `kubectl top`
+  - Events from `kubectl describe`
+  - application logs from `kubectl logs`
+  - in-container state from `kubectl exec`
+- **LLM advantage**: it can synthesise all of this into a more accurate judgement
 
-**4. 异常情况的处理**
-- 如果验证结果不符合预期,LLM 可以分析可能原因:
-  - 注入参数错误?
-  - 目标资源不存在?
-  - 故障被自愈机制掩盖?
-  - 验证命令执行失败?
-- **规则引擎局限**: 很难覆盖所有异常情况
+**4. Handling abnormal situations**
+- When the result does not match expectations, the LLM can analyse the possible causes:
+  - wrong injection parameters?
+  - target resource missing?
+  - fault masked by a self-healing mechanism?
+  - verification command itself failed?
+- **Rule-engine limitation**: covering every abnormal case is very hard
 
-> **🤖 Agent 的实现方式**:
-> 1. Skill 的 SKILL.md 中包含"验证方法"章节,描述了推荐的 kubectl 验证命令和预期输出
-> 2. Agent 在 Layer 2 验证阶段,LLM 读取该章节,生成验证计划
-> 3. LLM 调用 kubectl 工具执行验证命令,解析输出,判断是否通过
-> 4. 如果验证失败,LLM 决定是重试、调整参数还是回滚
+> **🤖 How the Agent implements this**:
+> 1. A Skill's SKILL.md contains a "verification method" section describing the recommended kubectl commands and expected output
+> 2. In the Layer 2 phase, the LLM reads that section and produces a verification plan
+> 3. The LLM calls the kubectl tool, runs the commands, parses the output and judges pass/fail
+> 4. On failure, the LLM decides whether to retry, adjust parameters, or roll back
 
 ---
 
-## 五、故障注入的安全红线
+## 5. Fault-injection safety red lines
 
-### Q9: 【安全红线】哪些操作是绝对禁止的?为什么?
+### Q9: [SAFETY RED LINES] Which operations are absolutely forbidden, and why?
 
-> **定位说明**：`skills/k8s-chaos-skills/SKILL.md` 是安全红线的**权威来源**（用户维护，Agent 每次会话通过 `activate_skill` 加载，包含可执行的操作规程）。本文档提供安全红线的**设计原理补充**（开发者维护，解释每个红线背后的工程考量），帮助 Agent 理解"为什么"而非仅是"是什么"。当两者内容冲突时，以 SKILL.md 为准。
+> **Positioning note**: `skills/k8s-chaos-skills/SKILL.md` is the **authoritative source** for the safety red lines (user-maintained, loaded by the Agent every session via `activate_skill`, and containing executable operating procedures). This document provides the **design rationale behind** those red lines (developer-maintained, explaining the engineering considerations behind each one), helping the Agent understand the "why" and not just the "what". When the two conflict, SKILL.md wins.
 
-**A9**: 以下是故障注入的**安全红线**,Agent 必须严格遵守:
+**A9**: The following are the **safety red lines** of fault injection; the Agent MUST obey them strictly:
 
-#### 9.1 禁止注入的命名空间(黑名单)
+#### 9.1 Namespaces that must never be injected into (blacklist)
 
-| 命名空间 | 原因 | 后果 |
+| Namespace | Reason | Consequence |
 |----------|------|------|
-| `kube-system` | 包含控制平面组件(etcd、apiserver、scheduler、controller-manager、CoreDNS) | 可能导致集群完全不可用,无法恢复 |
-| `kube-public` | 系统保留命名空间 | 可能影响集群全局配置 |
-| `istio-system` / `linkerd` 等服务网格命名空间 | 包含服务网格控制平面 | 可能导致整个集群的服务间通信中断 |
-| `monitoring` / `logging` 等可观测性命名空间 | 包含 Prometheus、Grafana、ELK 等监控组件 | 可能导致监控失效,无法观察故障影响 |
+| `kube-system` | Contains control-plane components (etcd, apiserver, scheduler, controller-manager, CoreDNS) | The cluster may become completely unusable and unrecoverable |
+| `kube-public` | System-reserved namespace | Cluster-wide configuration may be affected |
+| `istio-system` / `linkerd` and other service-mesh namespaces | Contains the service-mesh control plane | Inter-service communication across the whole cluster may break |
+| `monitoring` / `logging` and other observability namespaces | Contains Prometheus, Grafana, ELK and similar monitoring components | Monitoring may fail, leaving the fault's impact unobservable |
 
-> **🤖 Agent 的实现**:
-> - ToolGuard 在执行任何 blade/kubectl 命令前,检查目标资源的 namespace
-> - 如果 namespace 在黑名单中,**直接拒绝执行**,返回安全拦截错误
-> - 黑名单可通过环境变量 `BLADE_AI_SAFETY_BLACKLIST_NS` 配置
-
----
-
-#### 9.2 禁止对 StatefulSet 做破坏性实验(无备份时)
-
-**原因**:
-- StatefulSet 通常用于运行有状态应用(数据库、消息队列、缓存)
-- 破坏性实验(如 Pod 杀死、磁盘填充)可能导致数据丢失或损坏
-- 即使 PVC 保留,数据一致性也可能被破坏
-
-**例外情况**:
-- 如果用户明确确认已有备份,且实验目的是验证备份恢复流程,可以执行
-- **Agent 行动**: 应在确认时要求用户提供备份存在的证据(例如备份任务的状态)
+> **🤖 How the Agent implements this**:
+> - Before running any blade/kubectl command, ToolGuard checks the target resource's namespace
+> - If the namespace is on the blacklist, it **refuses to execute** and returns a safety-interception error
+> - The blacklist is configurable via the `BLADE_AI_SAFETY_BLACKLIST_NS` environment variable
 
 ---
 
-#### 9.3 禁止在生产高峰期执行大规模故障注入
+#### 9.2 No destructive experiments on a StatefulSet (when there is no backup)
 
-**原因**:
-- 生产高峰期的流量压力大,系统余量小,故障注入可能导致雪崩
-- 即使设计了小爆炸半径,也可能因为级联效应影响大范围服务
+**Reason**:
+- A StatefulSet usually runs stateful applications (databases, message queues, caches)
+- Destructive experiments (Pod kill, disk filling) can lose or corrupt data
+- Even when the PVC is retained, data consistency may still be broken
 
-**最佳实践**:
-- 选择业务低峰期(如凌晨 2-4 点)执行实验
-- 首次对某个服务做实验时,**选择单个 Pod**,duration ≤ 60 秒
-- 全程监控关键业务指标,一旦异常立即停止
-
----
-
-#### 9.4 禁止同时注入多个相互依赖的故障
-
-**原因**:
-- 例如同时对数据库和应用注入故障,可能导致问题难以定位
-- 多个故障叠加可能产生不可预测的级联效应
-
-**最佳实践**:
-- **一次实验只注入一种故障类型**
-- 如果要验证复合故障场景,分多次实验,每次记录结果
+**Exception**:
+- If the user explicitly confirms a backup exists AND the experiment's purpose is to verify the backup-restore procedure, it may proceed
+- **Agent action**: during confirmation, require evidence that the backup exists (e.g. the backup job's status)
 
 ---
 
-#### 9.5 禁止在未配置监控告警的情况下执行实验
+#### 9.3 No large-scale injection during production peak hours
 
-**原因**:
-- 如果没有监控告警,实验失控时无法及时发现
-- 可能导致故障影响扩大,甚至影响生产业务
+**Reason**:
+- Traffic pressure is high at peak and the system's headroom is small, so an injection can trigger an avalanche
+- Even with a small blast radius by design, cascading effects can still reach a wide range of services
 
-**最佳实践**:
-- 实验前确认关键指标(QPS、错误率、延迟、CPU、内存)的告警已配置
-- 设置比正常阈值更严格的实验期告警(例如正常错误率 < 0.1%,实验期告警阈值设为 0.5%)
-
-> **💡 Agent 使用提示**:
-> - 在生成实验计划时,必须检查以上五条安全红线
-> - 如果用户要求违反红线的操作,**必须拒绝**并解释原因
-> - 安全拦截的错误消息应清晰说明违反了哪条红线,以及如何修正
+**Best practice**:
+- Run experiments during off-peak hours (e.g. 02:00-04:00)
+- For a service's first experiment, **pick a single Pod** with duration ≤ 60 seconds
+- Monitor the key business metrics throughout, and stop immediately on any anomaly
 
 ---
 
-## 六、故障注入的典型应用场景
+#### 9.4 Never inject multiple interdependent faults at once
 
-### Q10: 故障注入在实际工作中有哪些典型应用场景?
+**Reason**:
+- Injecting into the database and the application at the same time, for example, makes the problem hard to localise
+- Stacked faults can produce unpredictable cascading effects
+
+**Best practice**:
+- **One experiment injects exactly one fault type**
+- To verify a compound-fault scenario, split it into several experiments and record the result of each
+
+---
+
+#### 9.5 Never run an experiment without monitoring alerts configured
+
+**Reason**:
+- Without monitoring alerts, an experiment going out of control cannot be detected in time
+- The fault's impact may widen and even reach production business traffic
+
+**Best practice**:
+- Before the experiment, confirm alerts are configured on the key metrics (QPS, error rate, latency, CPU, memory)
+- Set stricter experiment-window alerts than the normal thresholds (e.g. if the normal error rate is < 0.1%, set the experiment-window alert threshold to 0.5%)
+
+> **💡 Agent usage tips**:
+> - When generating an experiment plan, check all five safety red lines above
+> - If the user asks for something that violates a red line, **refuse** and explain why
+> - A safety-interception error message should state clearly which red line was violated and how to fix it
+
+---
+
+## 6. Typical applications of fault injection
+
+### Q10: What are the typical real-world applications of fault injection?
 
 **A10**: 
 
-#### 10.1 验证高可用架构
+#### 10.1 Verifying a high-availability architecture
 
-**场景**: 某微服务部署了 3 个副本,声称"单 Pod 故障不影响服务可用性"。
+**Scenario**: a microservice runs 3 replicas and claims "a single Pod failure does not affect service availability".
 
-**实验设计**:
-- **注入**: 随机杀死一个 Pod(`blade create pod kill`)
-- **验证**:
-  - Layer 1: 确认实验创建成功
-  - Layer 2: 确认 Pod 被删除,Deployment 自动创建新 Pod
-  - Layer 3: 确认 Service Endpoints 在 Pod 删除期间短暂为空,但在 5 秒内恢复;服务整体错误率 < 0.1%
+**Experiment design**:
+- **Injection**: kill one Pod at random (`blade create pod kill`)
+- **Verification**:
+  - Layer 1: confirm the experiment was created
+  - Layer 2: confirm the Pod was deleted and the Deployment created a replacement automatically
+  - Layer 3: confirm the Service Endpoints is briefly empty during the deletion but recovers within 5 seconds; the service's overall error rate stays < 0.1%
 
-**预期结果**: 服务短暂抖动(< 5 秒),但整体可用
+**Expected result**: a brief wobble (< 5 seconds), but the service stays available overall
 
-**可能发现的问题**:
-- 如果 Endpoints 恢复时间 > 30 秒,说明健康检查配置不合理(periodSeconds 太长)
-- 如果错误率 > 1%,说明客户端重试机制未生效或超时设置太短
-
----
-
-#### 10.2 验证 HPA 自动扩缩容
-
-**场景**: 某服务配置了 HPA,期望在 CPU > 70% 时自动扩容。
-
-**实验设计**:
-- **注入**: 对其中一个 Pod 注入 CPU 满载故障(`blade create pod cpu fullload`)
-- **验证**:
-  - Layer 1: 确认实验创建成功
-  - Layer 2: `kubectl top pod` 显示目标 Pod CPU 接近 limit
-  - Layer 3: `kubectl get hpa` 显示 currentReplicas 增加;`kubectl get deployment` 显示 replicas 增加
-
-**预期结果**: HPA 在 2-5 分钟内扩容,新增 Pod 分担负载
-
-**可能发现的问题**:
-- 如果 HPA 未扩容,可能是因为 metrics-server 未安装或配置错误
-- 如果扩容后 CPU 仍然高,可能是因为 maxReplicas 设置太小
+**Problems this may uncover**:
+- If Endpoints takes > 30 seconds to recover, the health-check configuration is unreasonable (periodSeconds too long)
+- If the error rate exceeds 1%, the client's retry mechanism is not working or the timeout is too short
 
 ---
 
-#### 10.3 验证超时和重试机制
+#### 10.2 Verifying HPA autoscaling
 
-**场景**: 服务 A 调用服务 B,配置了 3 秒超时和 3 次重试。
+**Scenario**: a service has HPA configured and is expected to scale out when CPU > 70%.
 
-**实验设计**:
-- **注入**: 对服务 B 的 Pod 注入 5 秒网络延迟(`blade create pod network delay --time 5000`)
-- **验证**:
-  - Layer 1: 确认实验创建成功
-  - Layer 2: 在服务 B 的 Pod 内执行 `ping`,确认延迟增加到 ~5 秒
-  - Layer 3: 服务 A 的日志中出现 timeout 和 retry 记录;服务 A 的整体错误率 < 1%(因为重试成功)
+**Experiment design**:
+- **Injection**: inject CPU fullload into one of its Pods (`blade create pod cpu fullload`)
+- **Verification**:
+  - Layer 1: confirm the experiment was created
+  - Layer 2: `kubectl top pod` shows the target Pod's CPU near its limit
+  - Layer 3: `kubectl get hpa` shows currentReplicas increasing; `kubectl get deployment` shows replicas increasing
 
-**预期结果**: 服务 A 的部分请求超时,但通过重试最终成功,整体错误率可控
+**Expected result**: HPA scales out within 2-5 minutes and the new Pods share the load
 
-**可能发现的问题**:
-- 如果错误率 > 10%,说明重试次数不够或超时设置太短
-- 如果服务 A 的连接池耗尽,说明需要调整连接池大小或增加熔断器
-
----
-
-#### 10.4 验证监控告警的有效性
-
-**场景**: 配置了 Pod OOMKilled 告警,但从未验证过告警是否真正触发。
-
-**实验设计**:
-- **注入**: 对某个 Pod 注入内存压力故障(`blade create pod mem load`),使其内存使用接近 limit
-- **验证**:
-  - Layer 1: 确认实验创建成功
-  - Layer 2: `kubectl top pod` 显示内存接近 limit;`kubectl get pod -o json` 显示容器被 OOMKilled(exitCode 137)
-  - Layer 3: 确认告警系统在 1 分钟内发出通知;SRE 收到告警并介入
-
-**预期结果**: 告警及时触发,SRE 能够快速定位问题
-
-**可能发现的问题**:
-- 如果告警未触发,说明告警规则配置错误或监控数据采集有问题
-- 如果告警延迟 > 5 分钟,说明需要优化告警评估窗口
+**Problems this may uncover**:
+- If HPA does not scale out, metrics-server may be missing or misconfigured
+- If CPU stays high after scaling out, maxReplicas may be set too low
 
 ---
 
-#### 10.5 验证灾难恢复流程
+#### 10.3 Verifying timeout and retry behaviour
 
-**场景**: 数据库主节点故障后,备节点应自动接管。
+**Scenario**: service A calls service B with a 3-second timeout and 3 retries configured.
 
-**实验设计**:
-- **注入**: 杀死数据库主节点的 Pod(`blade create pod kill`)
-- **验证**:
-  - Layer 1: 确认实验创建成功
-  - Layer 2: 确认主节点 Pod 被删除;StatefulSet 创建新 Pod
-  - Layer 3: 确认备节点晋升为主节点;应用层连接自动切换到新主节点;数据一致性未受损
+**Experiment design**:
+- **Injection**: inject a 5-second network delay into service B's Pod (`blade create pod network delay --time 5000`)
+- **Verification**:
+  - Layer 1: confirm the experiment was created
+  - Layer 2: run `ping` inside service B's Pod and confirm latency rose to ~5 seconds
+  - Layer 3: service A's logs show timeout and retry records; service A's overall error rate stays < 1% (because the retries succeed)
 
-**预期结果**: 数据库在 30-60 秒内完成主备切换,应用层短暂报错后恢复
+**Expected result**: some of service A's requests time out but eventually succeed via retries, keeping the overall error rate contained
 
-**可能发现的问题**:
-- 如果切换时间 > 5 分钟,说明需要优化选举算法或心跳检测
-- 如果数据不一致,说明需要加强同步机制或增加备份频率
+**Problems this may uncover**:
+- If the error rate exceeds 10%, there are too few retries or the timeout is too short
+- If service A's connection pool is exhausted, the pool size needs tuning or a circuit breaker is needed
 
 ---
 
-## 七、Agent 在故障注入中的角色
+#### 10.4 Verifying that monitoring alerts actually work
 
-### Q11: Agent 与传统故障注入工具(如直接使用 ChaosBlade)相比,有什么优势?
+**Scenario**: a Pod OOMKilled alert is configured, but has never been verified to actually fire.
+
+**Experiment design**:
+- **Injection**: inject memory pressure into a Pod (`blade create pod mem load`) so its memory usage approaches the limit
+- **Verification**:
+  - Layer 1: confirm the experiment was created
+  - Layer 2: `kubectl top pod` shows memory near the limit; `kubectl get pod -o json` shows the container was OOMKilled (exitCode 137)
+  - Layer 3: confirm the alerting system sent a notification within 1 minute, and that the SRE received it and responded
+
+**Expected result**: the alert fires promptly and the SRE can locate the problem quickly
+
+**Problems this may uncover**:
+- If the alert never fires, the alert rule is misconfigured or metric collection is broken
+- If the alert is > 5 minutes late, the alert evaluation window needs tuning
+
+---
+
+#### 10.5 Verifying the disaster-recovery procedure
+
+**Scenario**: after the database primary fails, the standby should take over automatically.
+
+**Experiment design**:
+- **Injection**: kill the database primary's Pod (`blade create pod kill`)
+- **Verification**:
+  - Layer 1: confirm the experiment was created
+  - Layer 2: confirm the primary's Pod was deleted and the StatefulSet created a new Pod
+  - Layer 3: confirm the standby was promoted to primary, application connections switched to the new primary automatically, and data consistency was not compromised
+
+**Expected result**: the database completes failover within 30-60 seconds; the application errors briefly, then recovers
+
+**Problems this may uncover**:
+- If failover takes > 5 minutes, the election algorithm or heartbeat detection needs tuning
+- If data is inconsistent, the replication mechanism needs strengthening or backups need to be more frequent
+
+---
+
+## 7. The Agent's role in fault injection
+
+### Q11: What advantages does the Agent have over traditional fault-injection tools (such as using ChaosBlade directly)?
 
 **A11**: 
 
-**1. 智能化的故障设计**
-- 传统工具:用户需要手动选择故障类型、目标、参数,容易选错
-- Agent:通过自然语言理解用户意图,自动选择合适的故障类型和参数
-  - **示例**:用户说"让这个 Pod 的网络变慢",Agent 自动选择 `pod-network-delay`,并根据上下文推断合理的延迟值
+**1. Intelligent fault design**
+- Traditional tools: the user must pick the fault type, target and parameters by hand, and it is easy to get wrong
+- Agent: understands the user's intent from natural language and picks a suitable fault type and parameters automatically
+  - **Example**: the user says "make this Pod's network slow"; the Agent picks `pod-network-delay` and infers a reasonable delay from context
 
-**2. 自动化的验证流程**
-- 传统工具:用户需要手动执行 kubectl 命令验证故障是否生效
-- Agent:自动读取 Skill 中的验证方法,执行 Layer 1 + Layer 2 验证,判断是否通过
+**2. Automated verification flow**
+- Traditional tools: the user must run kubectl commands by hand to check whether the fault took effect
+- Agent: reads the verification method from the Skill automatically, runs Layer 1 + Layer 2 verification, and judges pass/fail
 
-**3. 安全防护内置**
-- 传统工具:用户可能误操作,在系统命名空间注入或重复注入
-- Agent:内置安全检查(命名空间黑名单、冲突检测、爆炸半径评估),自动拦截危险操作
+**3. Built-in safety protection**
+- Traditional tools: the user may make a mistake and inject into a system namespace, or inject twice
+- Agent: built-in safety checks (namespace blacklist, conflict detection, blast-radius assessment) intercept dangerous operations automatically
 
-**4. 实验历史的积累与复用**
-- 传统工具:每次实验都是孤立的,经验无法沉淀
-- Agent:将实验历史保存到 Operational Memory,后续任务可以参考历史经验,避免重复犯错
+**4. Accumulating and reusing experiment history**
+- Traditional tools: every experiment is isolated and the experience is never captured
+- Agent: persists experiment history to Operational Memory, so later tasks can draw on past experience and avoid repeating mistakes
 
-**5. 自然语言的交互界面**
-- 传统工具:需要记忆复杂的 blade 命令参数
-- Agent:支持自然语言描述(`--nl` 参数),降低使用门槛
+**5. A natural-language interface**
+- Traditional tools: require memorising complex blade command parameters
+- Agent: supports natural-language descriptions (the `--nl` parameter), lowering the barrier to entry
 
-**6. 实时的状态追踪**
-- 传统工具:用户需要手动查询实验状态
-- Agent:通过 SSE 或 stderr 实时推送执行状态,用户可以随时了解进度
+**6. Real-time status tracking**
+- Traditional tools: the user has to query the experiment status manually
+- Agent: pushes execution status live via SSE or stderr, so the user always knows the progress
 
 ---
 
-### Q12: Agent 的局限性是什么?什么情况下不应该使用 Agent?
+### Q12: What are the Agent's limitations? When should the Agent NOT be used?
 
 **A12**: 
 
-**局限性**:
+**Limitations**:
 
-1. **依赖 LLM 的推理能力**
-   - 如果 LLM 理解错误用户意图,可能选择不合适的故障类型
-   - **缓解措施**:提供结构化参数模式(`--fault-type` 等),绕过 LLM 推理
+1. **Dependent on the LLM's reasoning ability**
+   - If the LLM misreads the user's intent, it may pick an unsuitable fault type
+   - **Mitigation**: offer a structured-parameter mode (`--fault-type` etc.) that bypasses LLM reasoning
 
-2. **验证逻辑依赖 Skill 质量**
-   - 如果 Skill 中的"验证方法"章节描述不准确,Layer 2 验证可能失败
-   - **缓解措施**:定期审查和优化 Skill 内容
+2. **Verification logic depends on Skill quality**
+   - If a Skill's "verification method" section is inaccurate, Layer 2 verification may fail
+   - **Mitigation**: review and refine Skill content regularly
 
-3. **无法处理复杂的跨服务故障场景**
-   - 当前 Agent 主要针对单资源(Pod/Node)级别的故障注入
-   - 对于涉及多个服务的级联故障验证,需要人工设计实验流程
-   - **未来扩展**:支持多步骤实验编排
+3. **Cannot handle complex cross-service fault scenarios**
+   - The Agent currently targets single-resource (Pod/Node) fault injection
+   - Verifying cascading failures across several services still needs a human-designed experiment flow
+   - **Future extension**: support multi-step experiment orchestration
 
-4. **对精简镜像的支持有限**
-   - 如果目标 Pod 使用 distroless 或 scratch 镜像,`kubectl exec` 可能无法执行验证命令
-   - **缓解措施**:Skill 中提供备选验证方案(如通过 `kubectl top` 或应用日志验证)
+4. **Limited support for minimal images**
+   - If the target Pod uses a distroless or scratch image, `kubectl exec` may not be able to run verification commands
+   - **Mitigation**: have the Skill provide fallback verification (e.g. via `kubectl top` or application logs)
 
-**不建议使用 Agent 的场景**:
+**When NOT to use the Agent**:
 
-1. **紧急故障恢复**
-   - 如果生产环境已经出现故障,需要立即恢复,直接使用 `blade destroy` 更快
-   - Agent 的 ReAct 循环和验证流程会引入额外延迟
+1. **Emergency fault recovery**
+   - If production is already broken and needs immediate recovery, calling `blade destroy` directly is faster
+   - The Agent's ReAct loop and verification flow add latency
 
-2. **高度定制化的故障场景**
-   - 如果需要注入自定义故障(如修改应用代码、注入特定 HTTP 错误码),当前 Agent 不支持
-   - 建议使用专门的故障注入框架(如 Chaos Mesh、LitmusChaos)
+2. **Highly customised fault scenarios**
+   - Injecting a custom fault (modifying application code, returning a specific HTTP error code) is not supported today
+   - Use a purpose-built fault-injection framework instead (Chaos Mesh, LitmusChaos)
 
-3. **大规模并行实验**
-   - 如果需要对数百个 Pod 同时注入故障,Agent 的串行执行模式效率低
-   - 建议使用批量脚本或专用的混沌工程平台
+3. **Large-scale parallel experiments**
+   - Injecting into hundreds of Pods at once is inefficient with the Agent's serial execution model
+   - Use a batch script or a dedicated chaos-engineering platform instead
 
 ---
 
-## 八、术语表
+## 8. Glossary
 
-| 术语 | 英文 | 解释 |
-|------|------|------|
-| 混沌工程 | Chaos Engineering | 在分布式系统上进行实验,通过主动注入故障来建立对系统抵御动荡条件的信心的学科 |
-| 故障注入 | Fault Injection | 主动向系统中引入故障的行为,用于验证系统的韧性和容错能力 |
-| 爆炸半径 | Blast Radius | 故障注入影响的范围大小,应尽量控制在最小范围内 |
-| 稳定状态 | Steady State | 系统在正常条件下的行为表现,是故障实验的对照基线 |
-| 假设 | Hypothesis | 对系统在故障条件下行为的预测,例如"当 Pod CPU 满载时,HPA 会扩容" |
-| 自愈 | Self-healing | Kubernetes 自动修复故障的能力,如 Pod 重建、节点驱逐、Endpoint 更新 |
-| 级联故障 | Cascading Failure | 一个组件的故障通过依赖关系传播到其他组件,导致大范围故障 |
-| MTTR | Mean Time To Recovery | 平均恢复时间,衡量系统从故障中恢复的速度 |
-| RTO | Recovery Time Objective | 恢复时间目标,业务允许的最大停机时间 |
-| RPO | Recovery Point Objective | 恢复点目标,业务允许的最大数据丢失量 |
-| Layer 1 验证 | Injection Verification | 验证 ChaosBlade 实验是否成功创建/销毁 |
-| Layer 2 验证 | Phenomenon Verification | 验证系统是否出现了预期的故障现象 |
-| Layer 3 验证 | Impact Verification | 验证故障的影响范围是否可控 |
-| Skill | Skill | Agent 的技能模块,定义了某种故障类型的注入指令、验证方法和前置条件 |
-| Operational Memory | Operational Memory | Agent 的运维记忆,存储实验历史和运维经验 |
+| Term | Definition |
+|------|------|
+| Chaos Engineering | The discipline of experimenting on a distributed system, deliberately injecting faults to build confidence in its ability to withstand turbulent conditions |
+| Fault Injection | The act of deliberately introducing a fault into a system to verify its resilience and fault tolerance |
+| Blast Radius | The size of the area a fault injection affects; should be kept as small as possible |
+| Steady State | The system's behaviour under normal conditions; the control baseline for a fault experiment |
+| Hypothesis | A prediction of how the system will behave under the fault, e.g. "when Pod CPU is at fullload, HPA will scale out" |
+| Self-healing | Kubernetes's ability to repair faults automatically: Pod recreation, node eviction, Endpoint updates |
+| Cascading Failure | One component's failure propagating through dependencies to others, causing widespread failure |
+| MTTR | Mean Time To Recovery — how fast the system recovers from a fault |
+| RTO | Recovery Time Objective — the maximum downtime the business tolerates |
+| RPO | Recovery Point Objective — the maximum data loss the business tolerates |
+| Layer 1 verification | Injection verification — confirms the ChaosBlade experiment was created/destroyed successfully |
+| Layer 2 verification | Phenomenon verification — confirms the system exhibited the expected fault symptom |
+| Layer 3 verification | Impact verification — confirms the fault's blast radius is contained |
+| Skill | The Agent's skill module, defining a fault type's injection instructions, verification method and preconditions |
+| Operational Memory | The Agent's operational memory, storing experiment history and operational experience |

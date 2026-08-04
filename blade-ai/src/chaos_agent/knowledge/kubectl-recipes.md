@@ -98,6 +98,12 @@ exit immediately. Never pass `-it` (the runner is non-interactive).
 Inside the debug pod, host paths live under `/host/...` — e.g. inspect
 host disk usage with `chroot /host df -h /var/lib/kubelet`.
 
+A debug pod used for HOST MUTATION must be created with
+`--profile=sysadmin` — e.g.
+`kubectl debug node/<node> --profile=sysadmin --image=<cluster-image> -- sleep 3600`.
+Use an image already verified as pullable in the current cluster; do not
+assume a public image is reachable.
+
 When done, clean up:
 `kubectl delete pod <debug-pod-name> -n <ns>`. The debug pod name
 typically starts with the target node/pod name and ends with `-debug`.
@@ -114,6 +120,16 @@ typically starts with the target node/pod name and ends with `-debug`.
 | Uncordon | `kubectl uncordon <node>` |
 | Add taint | `nodes <node> key=value:NoSchedule` |
 | Remove taint | `nodes <node> key-` |
+| Annotate a node | `node <node> <key>=<value> --overwrite` |
+| Drain a node (evict workloads) | `<node> --ignore-daemonsets --delete-emptydir-data --grace-period=30 --timeout=120s` |
+
+`drain` refuses `--force` / `--disable-eviction`: they delete pods no
+controller recreates, or bypass PodDisruptionBudgets. Recover with
+`uncordon`.
+
+`edit` → express the change as `patch` with the matching `--type`
+(strategic merge / json merge / json patch). "Manually delete
+finalizers" → `patch --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'`.
 
 `apply`, `create`, `replace`, `edit`, `expose`, `run`, `autoscale`, and
 `rollout` are blocked by ToolGuard — they create or mutate workloads

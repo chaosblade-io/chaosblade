@@ -45,19 +45,19 @@ blade create k8s <scope>-<target> <action> [flags]
 | --- | --- |
 | `pod-cpu fullload` | `--cpu-percent 80` (single CPU) ; `--cpu-count 2 --cpu-percent 100` (pin 2 cores) |
 | `pod-memory load` | `--mem-percent 70` ; `--mem-size 512` (MB) ; `--mode cache` (cache vs ram) |
-| ~~`pod-network delay`~~ | **v1.8.0 不可用** — 旧版参数: `--time 3000 --offset 1000 --interface eth0 --local-port 8080`。需 Tier 2 tc qdisc 替代 |
-| `pod-network drop` | `--destination-ip 10.1.2.3` ; `--source-port 3306` ; `--network-traffic out` for direction. **不支持 `--percent` 和 `--interface`**（iptables DROP 语义，全量丢包） |
-| ~~`pod-network corrupt` / `duplicate` / `reorder`~~ | **不适用 v1.8.0** — 仅 `dns`、`drop`、`occupy` 可用 |
+| ~~`pod-network delay`~~ | **Unavailable in v1.8.0** — legacy flags: `--time 3000 --offset 1000 --interface eth0 --local-port 8080`. Requires the Tier 2 tc qdisc substitute |
+| `pod-network drop` | `--destination-ip 10.1.2.3` ; `--source-port 3306` ; `--network-traffic out` for direction. **Does NOT support `--percent` or `--interface`** (iptables DROP semantics: all matching traffic is dropped) |
+| ~~`pod-network corrupt` / `duplicate` / `reorder`~~ | **Not applicable to v1.8.0** — only `dns`, `drop` and `occupy` are available |
 | `pod-disk fill` | `--path /tmp --size 1024` (MB). Path is inside the container; check writable mounts first |
 | `pod-disk burn` | `--read --write --size 50` for IO contention |
 | `pod-process kill` | `--process java` ; `--process-cmd "java -jar"` |
 | `pod-pod fail` | drops the pod via the pod controller — verify with restart count |
 | `pod-network dns` | `--domain www.example.com --ip 10.0.0.0` (both **required**). Modifies `/etc/hosts` — see [DNS note](#dns-fault-note) below |
-| `pod-network occupy` | `--port 8080` — 占用指定端口 |
+| `pod-network occupy` | `--port 8080` — occupies the given port |
 
-> **⚠️ blade v1.8.0 网络子命令变更**：`pod-network` 仅支持 `dns` / `drop` / `occupy`。
-> 旧版 `loss`（tc netem, 支持 --percent）→ 新版 `drop`（iptables DROP, **不支持 --percent**, 全量丢包）；旧版 `delay` / `corrupt` / `duplicate` / `reorder` 在 v1.8.0 中不可用。
-> 如需 delay 效果，请使用 Tier 2 kubectl-native 方案（tc qdisc）或升级 blade 版本。
+> **⚠️ blade v1.8.0 network sub-command changes**: `pod-network` supports only `dns` / `drop` / `occupy`.
+> The legacy `loss` (tc netem, supported --percent) became `drop` (iptables DROP, **does NOT support --percent**, drops all matching traffic); the legacy `delay` / `corrupt` / `duplicate` / `reorder` are unavailable in v1.8.0.
+> For a delay effect, use the Tier 2 kubectl-native approach (tc qdisc) or upgrade the blade version.
 
 ### Container Scope
 
@@ -79,7 +79,7 @@ ChaosBlade rejects `--namespace` and `--labels` for node scope — the
 | `node-cpu fullload` | `--cpu-percent 80` |
 | `node-memory load` | `--mem-percent 70` (node scope accepts ONLY `--mem-percent`, not `--mem-size`) |
 | `node-disk fill` | `--path /tmp --size 1024`. Path resolution depends on mount layout — see "Resource Mapping" below. |
-| `node-network drop` | `--interface` flags same as pod scope, applied at node interface. **不支持 `--percent`**（全量丢包）。(v1.8.0: `delay`/`loss` 不可用) |
+| `node-network drop` | `--interface` flags same as pod scope, applied at node interface. **Does NOT support `--percent`** (drops all matching traffic). (v1.8.0: `delay`/`loss` unavailable) |
 | `node-process kill` | targets host processes — exercise extreme caution |
 
 ### Resource Mapping for `node-disk fill`
@@ -190,3 +190,32 @@ ChaosBlade `pod-network dns` modifies `/etc/hosts` (adds `#chaosblade` annotated
 | Most business apps (Java/Python/Go) | ✅ Yes | Resolve via C library or equivalent |
 
 **Verification**: Use `cat /etc/hosts` (confirm `#chaosblade` entry) + `ping <domain>` (confirm resolution to forged IP). On glibc images (Debian/Ubuntu/CentOS), `getent hosts <domain>` is also reliable. **Never use `nslookup`/`dig`** — they bypass /etc/hosts and will return the real DNS record, misleading the verifier.
+
+<a id="python-app-faults"></a>
+
+## Python Application Faults: Matcher & Flag Reference
+
+Reference for `blade_python_create` (`blade create python <target>
+<action> [matchers] [flags]`). The tool docstring keeps the hard
+constraints; this section carries the full syntax.
+
+### Matchers (which calls to affect; omit = ALL calls of that client)
+
+| target | matcher flags |
+|---|---|
+| `redis` | `cmd` (e.g. GET), `key` |
+| `mysql` / `sqlalchemy` | `sql`, `sqltype` (e.g. select), `database` |
+| `http` | `url`, `method`, `host` |
+| `httpx` | `url`, `method`, `host`, `path` |
+| `grpc` | `service`, `method` |
+| `kafka` | `topic`, `operation` |
+
+Matchers not valid for the chosen target are ignored by the tool.
+
+### Action flags
+
+| action | flags |
+|---|---|
+| `delay` | `--time 500` (REQUIRED, ms); optional `--offset 100` adds random 0..offset ms jitter |
+| `throwCustomException` | `--exception ConnectionError --exception-message 'chaos test'`. Accepts a builtin name or a qualified path (`redis.exceptions.ConnectionError`). **An unresolvable name SILENTLY degrades to RuntimeError** — verify the exception TYPE the app actually saw, not just that it failed. |
+| `returnValue` | `--return-value null`. Conversion: `"null"`/`"none"` → None, `"true"`/`"false"` → bool, digits → int/float, leading `{` or `[` → parsed JSON, anything else → literal string. **There is NO `"nil"` keyword** — it returns the 3-char string `"nil"`. |
