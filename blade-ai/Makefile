@@ -11,7 +11,8 @@ NODE_VERSION ?= 24.16.0
 # without a manual step. build-tui is a prerequisite — blade-ai.spec
 # force-bundles tui/dist/cli.js and fails loud at Analysis time if absent.
 build: build-tui download-node
-	@HOST=$$(uv run python -c "from chaos_agent.chaosblade_installer import _detect_platform; print(_detect_platform())"); \
+	@set -e; \
+	HOST=$$(uv run python -c "from chaos_agent.chaosblade_installer import _detect_platform; print(_detect_platform())"); \
 	CUR=$$(cat vendor/chaosblade/.arch 2>/dev/null || echo none); \
 	if [ "$$CUR" != "$$HOST" ]; then \
 		echo "vendor blade arch=$$CUR != host=$$HOST — (re)downloading host ChaosBlade..."; \
@@ -74,7 +75,8 @@ wheel: build-tui
 # keys of _CHECKSUMS: darwin_arm64 / darwin_amd64 / linux_amd64 / linux_arm64.
 # The arch→tag map lives in chaosblade_installer (single source of truth).
 wheel-platform: build-tui
-	@TARGET="$(TARGET)"; \
+	@set -e; \
+	TARGET="$(TARGET)"; \
 	if [ -z "$$TARGET" ]; then \
 		TARGET=$$(uv run python -c "from chaos_agent.chaosblade_installer import _detect_platform; print(_detect_platform())"); \
 	fi; \
