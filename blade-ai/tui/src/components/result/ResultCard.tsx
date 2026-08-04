@@ -199,7 +199,6 @@ const ResultCardInternal: React.FC<{ item: ResultItem }> = ({ item }) => {
     else if (namesStr) targetStr = namesStr;
   }
   const hasSideEffects = !!item.sideEffects && item.sideEffects.length > 0;
-  const hasSideEffectsSummary = !!item.sideEffectsSummary;
   const showSideEffects = item.status === "success" || item.status === "partial";
   const replanCount = item.replanCount ?? 0;
   // Guard: skip the Outcome section entirely when no metadata field

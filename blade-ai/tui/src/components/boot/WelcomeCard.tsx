@@ -50,7 +50,7 @@ const VERSION_COLOR = Theme.text.secondary;
 function prettyPath(p: string, maxLen = 40): string {
   if (!p) return "(default)";
   const home = process.env["HOME"] ?? "";
-  let s = home && p.startsWith(home) ? "~" + p.slice(home.length) : p;
+  const s = home && p.startsWith(home) ? "~" + p.slice(home.length) : p;
   if (s.length <= maxLen) return s;
   const base = s.split("/").pop() ?? s;
   return ".../" + base;

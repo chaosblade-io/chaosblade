@@ -283,6 +283,13 @@ export const zh: Dict = {
   "memory.clear_ok": "已删除当前会话的快照文件",
   "memory.clear_noop": "当前会话没有快照可删（可能尚未持久化）",
   "memory.clear_failed": "删除会话快照失败：{err}",
+  // MemoryCard 占位文案 — 字段缺失时显示。
+  "memory.card.title": "会话记忆",
+  "memory.card.unknown": "(未知)",
+  "memory.card.unset": "(未设置)",
+  "memory.card.no_recent_tasks": "(无最近任务)",
+  // 流传输 — 作为 TURN_ABORTED 的原因展示。
+  "stream.disconnected": "连接意外断开，服务端未发送完成信号",
 
   // -- /compact -------------------------------------------------------
   "command.compact.desc": "强制压缩当前会话上下文（节省 LLM 上下文 tokens）",
@@ -502,6 +509,11 @@ export const zh: Dict = {
 
   // -- ConfirmMessage 前言 / 说明行 --------------------------------
   "confirm.intent.preamble": "已识别如下故障注入意图：",
+  "confirm.intent.batch_preamble": "已识别如下批量故障注入意图（串行执行）：",
+  "confirm.intent.batch_count": "{n} 个故障",
+  "confirm.intent.fault_index": "故障 {n}",
+  "confirm.auto_approved": "自动批准",
+  "confirm.auto_approved_node": "自动批准：{node}",
   "confirm.execution.preamble": "请确认执行计划：",
   "confirm.generic.preamble": "请确认：",
 
@@ -558,6 +570,7 @@ export const zh: Dict = {
   "confirm.health.not_run": "未执行检查",
   "confirm.field.feasibility": "可行性",
   "confirm.feasibility.all_clear": "注入可行",
+  "confirm.feasibility.headroom_detail": "headroom {headroom}，当前 {current}，目标 {target}",
   "confirm.feasibility.not_run": "未执行检查",
   "confirm.intent.low_conf_audit": "为何识别为此意图：",
 
@@ -731,6 +744,8 @@ export const zh: Dict = {
   "wizard.summary.saved_keys": "写入字段",
   "wizard.summary.save_error": "保存失败",
   "wizard.validation.in_progress": "校验中…",
+  "wizard.save.ok": "已保存",
+  "wizard.save.failed": "保存失败",
   "wizard.returned_hint": "已返回此步骤，可重新校验或编辑",
   "wizard.hint.welcome": "Enter 开始  ·  Esc 取消",
   "wizard.hint.radio_with_back": "A-Z 选择  ·  ↑↓ 移动  ·  Enter 确认  ·  ← 上一步  ·  Esc 取消",

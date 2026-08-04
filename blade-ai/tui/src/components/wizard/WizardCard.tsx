@@ -35,11 +35,8 @@ import { Theme } from "../../theme/colors.js";
 import { t } from "../../i18n/index.js";
 import {
   STEP_ORDER,
-  canAdvanceFrom,
-  emptyValues,
   initialWizardState,
   stepIndex,
-  stepNumber,
   wizardReducer,
   type StepKey,
   type WizardState,
@@ -49,7 +46,6 @@ import { useBootCardWidth } from "../boot/BootCardFrame.js";
 // ── Layout constants (mirror ConfirmMessage v3) ──────────────────────
 const FIELD_LABEL_WIDTH = 14;
 const LIST_GLYPH_WIDTH = 3;
-const LIST_NAME_WIDTH = FIELD_LABEL_WIDTH - LIST_GLYPH_WIDTH;
 const TOTAL_STEPS = STEP_ORDER.length;
 
 // ── Shared widgets (private to wizard) ────────────────────────────────

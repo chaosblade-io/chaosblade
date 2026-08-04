@@ -246,8 +246,6 @@ function safetyBadge(status: string): SafetyBadge | null {
 // align inside the card.
 // ---------------------------------------------------------------------------
 const FIELD_LABEL_WIDTH = 14;
-const LIST_GLYPH_WIDTH = 3;
-const LIST_NAME_WIDTH = FIELD_LABEL_WIDTH - LIST_GLYPH_WIDTH;
 
 // ---------------------------------------------------------------------------
 // Shared sub-components
@@ -528,12 +526,17 @@ const ConfirmFrameHard: React.FC<FrameProps> = ({
 // Select wiring (unchanged from previous design)
 // ---------------------------------------------------------------------------
 
-function useConfirmSelect(
-  taskId: string,
-  yesLabel: string,
-  noLabel: string,
-  isFocused: boolean,
-): React.JSX.Element {
+// A component, not a hook: it renders the yes/no/feedback select and the
+// only hook it touches is ``useAppDispatch``. Naming it ``use*`` and
+// calling it from inside a branch made React's hook-order contract
+// unverifiable (and tripped ``react-hooks/rules-of-hooks``); as a
+// component each instance owns its own hook slot.
+const ConfirmSelect: React.FC<{
+  taskId: string;
+  yesLabel: string;
+  noLabel: string;
+  isFocused: boolean;
+}> = ({ taskId, yesLabel, noLabel, isFocused }) => {
   const dispatch = useAppDispatch();
   const handleConfirm = (
     answer: YesNoFeedbackAnswer,
@@ -567,7 +570,7 @@ function useConfirmSelect(
       onCancel={handleCancel}
     />
   );
-}
+};
 
 // ---------------------------------------------------------------------------
 // Layer 1 — intent_confirm (soft tier)
@@ -717,8 +720,8 @@ const IntentConfirmCard: React.FC<{
       glyph={Icons.thinking}
       glyphColor={Theme.forge.fire}
       chipLabel={t("confirm.intent.chip")}
-      title={isBatch ? `${t("confirm.intent.title")}  ·  ${batchFaults.length} 个故障` : t("confirm.intent.title")}
-      preamble={isBatch ? "已识别如下批量故障注入意图（串行执行）：" : t("confirm.intent.preamble")}
+      title={isBatch ? `${t("confirm.intent.title")}  ·  ${t("confirm.intent.batch_count", { n: batchFaults.length })}` : t("confirm.intent.title")}
+      preamble={isBatch ? t("confirm.intent.batch_preamble") : t("confirm.intent.preamble")}
       taskId={taskId}
     >
       {isBatch ? (
@@ -735,7 +738,7 @@ const IntentConfirmCard: React.FC<{
             return (
               <Box key={i}>
                 <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1}>
-                  <Text color={Theme.gray[500]}>{`故障 ${i + 1}`}</Text>
+                  <Text color={Theme.gray[500]}>{t("confirm.intent.fault_index", { n: i + 1 })}</Text>
                 </Box>
                 <Box flexGrow={1}>
                   <Text color={Theme.text.primary} bold>
@@ -892,7 +895,6 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   //   { target, overall, issues: [{severity, code, message, duration_hint}], summary }
   const healthReport = asRecord(payload?.["target_health_report"]);
   const healthOverall = asString(healthReport?.["overall"]);
-  const healthSummary = asString(healthReport?.["summary"]);
   const healthCheckedDetail = asString(healthReport?.["checked_detail"]);
   const healthIssuesRaw = healthReport?.["issues"];
   const healthIssues = Array.isArray(healthIssuesRaw)
@@ -911,7 +913,6 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   const feasRecommendation = asString(feasibilityReport?.["recommendation"]);
   const feasHeadroom = feasibilityReport?.["headroom"];
   const feasCurrentValue = asString(feasibilityReport?.["current_value"]);
-  const feasLimitValue = asString(feasibilityReport?.["limit_value"]);
   const feasTargetValue = asString(feasibilityReport?.["target_value"]);
   const hasFeasibilityIssue = feasibilityReport != null && feasSeverity !== "" && feasSeverity !== "ok";
 
@@ -1178,7 +1179,11 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
             glyph={Icons.success}
             color={Theme.status.ok}
             label={t("confirm.field.feasibility")}
-            detail={`${t("confirm.feasibility.all_clear")} (headroom ${typeof feasHeadroom === "number" ? `${Math.round(feasHeadroom * 100)}%` : "—"}, 当前 ${feasCurrentValue || "—"}, 目标 ${feasTargetValue || "—"})`}
+            detail={t("confirm.feasibility.all_clear") + " (" + t("confirm.feasibility.headroom_detail", {
+              headroom: typeof feasHeadroom === "number" ? `${Math.round(feasHeadroom * 100)}%` : "—",
+              current: feasCurrentValue || "—",
+              target: feasTargetValue || "—",
+            }) + ")"}
           />
         )}
       </Box>
@@ -1473,11 +1478,12 @@ const PlanSelectionCard: React.FC<{ payload: Payload; taskId?: string }> = ({
   );
 };
 
-function usePlanBuilderSelect(
-  taskId: string,
-  payload: Record<string, unknown> | undefined,
-  isFocused: boolean,
-): React.JSX.Element {
+// A component, not a hook — same reasoning as ``ConfirmSelect`` above.
+const PlanBuilderSelect: React.FC<{
+  taskId: string;
+  payload: Record<string, unknown> | undefined;
+  isFocused: boolean;
+}> = ({ taskId, payload, isFocused }) => {
   const dispatch = useAppDispatch();
   const rawOptions = (payload?.["options"] ?? []) as Array<{
     key: string;
@@ -1519,7 +1525,7 @@ function usePlanBuilderSelect(
       onCancel={handleCancel}
     />
   );
-}
+};
 
 // ---------------------------------------------------------------------------
 // Top-level dispatchers — Context (Static) + Prompt (pending)
@@ -1579,7 +1585,7 @@ const ConfirmContextMessageInternal: React.FC<{
     <Box flexDirection="column">
       {body}
       <Text color={Theme.status.ok} bold>
-        {`✓ 自动批准${item.node ? `：${item.node}` : ""}`}
+        {`${Icons.success} ${item.node ? t("confirm.auto_approved_node", { node: item.node }) : t("confirm.auto_approved")}`}
       </Text>
     </Box>
   );
@@ -1642,7 +1648,6 @@ const ConfirmPromptMessageInternal: React.FC<{
 
   // Plan builder: dynamic options select
   if (item.node === "plan_builder") {
-    const planSelect = usePlanBuilderSelect(item.taskId, item.payload, isFocused);
     return (
       <Box paddingLeft={2} marginTop={1} flexDirection="column">
         <Box
@@ -1653,7 +1658,11 @@ const ConfirmPromptMessageInternal: React.FC<{
           paddingY={0}
           width={cardWidth}
         >
-          {planSelect}
+          <PlanBuilderSelect
+            taskId={item.taskId}
+            payload={item.payload}
+            isFocused={isFocused}
+          />
         </Box>
       </Box>
     );
@@ -1678,7 +1687,14 @@ const ConfirmPromptMessageInternal: React.FC<{
     yesLabel = t("confirm.proceed");
     noLabel = t("confirm.refine");
   }
-  const select = useConfirmSelect(item.taskId, yesLabel, noLabel, isFocused);
+  const select = (
+    <ConfirmSelect
+      taskId={item.taskId}
+      yesLabel={yesLabel}
+      noLabel={noLabel}
+      isFocused={isFocused}
+    />
+  );
 
   const isHard = item.node === "confirmation_gate" || item.node === "tool_screener" || item.node === "plan_change_confirm";
   const tierColor = (item.node === "tool_screener" || item.node === "plan_change_confirm") ? Theme.status.warn : Theme.gray[700];

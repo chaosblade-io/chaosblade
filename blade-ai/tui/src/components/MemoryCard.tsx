@@ -27,6 +27,7 @@ import { Box, Text } from "ink";
 import type { MemoryCardItem } from "../state/types.js";
 import { Theme } from "../theme/colors.js";
 import { Icons } from "../theme/icons.js";
+import { t } from "../i18n/index.js";
 
 /** Width of the leading glyph cell (1 cell glyph + 2 cells gap). */
 const GLYPH_COL_WIDTH = 3;
@@ -98,7 +99,7 @@ function buildRows(data: MemoryCardItem): MemoryRow[] {
   rows.push({
     status: "info",
     name: "Session",
-    body: <Text>{data.sessionId || "(未知)"}</Text>,
+    body: <Text>{data.sessionId || t("memory.card.unknown")}</Text>,
   });
   rows.push({
     status: data.status === "active" ? "ok" : "info",
@@ -120,7 +121,7 @@ function buildRows(data: MemoryCardItem): MemoryRow[] {
     body: data.cluster ? (
       <Text>{data.cluster}</Text>
     ) : (
-      <Text color={Theme.text.secondary}>(未设置)</Text>
+      <Text color={Theme.text.secondary}>{t("memory.card.unset")}</Text>
     ),
   });
   rows.push({
@@ -129,7 +130,7 @@ function buildRows(data: MemoryCardItem): MemoryRow[] {
     body: (
       <Text>
         {data.namespace || (
-          <Text color={Theme.text.secondary}>(未设置)</Text>
+          <Text color={Theme.text.secondary}>{t("memory.card.unset")}</Text>
         )}
       </Text>
     ),
@@ -146,7 +147,7 @@ function buildRows(data: MemoryCardItem): MemoryRow[] {
     name: `Tasks (${shown}/${data.totalTasks})`,
     body:
       shown === 0 ? (
-        <Text color={Theme.text.secondary}>(无最近任务)</Text>
+        <Text color={Theme.text.secondary}>{t("memory.card.no_recent_tasks")}</Text>
       ) : (
         <Text>{data.recentTasks[shown - 1]}</Text>
       ),
@@ -244,7 +245,7 @@ export const MemoryCard: React.FC<{ item: MemoryCardItem }> = ({ item }) => {
       >
         <Box marginBottom={1}>
           <Text color={Theme.border.diagnostic} bold>
-            ◈ 会话记忆
+            ◈ {t("memory.card.title")}
           </Text>
           {time && (
             <Text color={Theme.text.secondary}>

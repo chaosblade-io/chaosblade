@@ -1457,7 +1457,7 @@ export function reducer(state: AppState, action: Action): AppState {
       // and stepper. Instead we do a minimal manual flush: commit
       // any in-flight thinking session, dump pending to history,
       // append result, leave streamState / stepper untouched.
-      let s = commitThinking(state);
+      const s = commitThinking(state);
       const { id, counter } = nextId(s, "r");
       const parsed = parseResultEnvelope(
         action.content,

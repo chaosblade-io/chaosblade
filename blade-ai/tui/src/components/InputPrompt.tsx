@@ -207,7 +207,11 @@ export const InputPrompt: React.FC<Props> = ({
   enterLocked = false,
   registry,
   onSubmit,
-  onExit,
+  // Deliberately not invoked: the Esc / Ctrl+C cascade below stops at
+  // "clear the buffer" rather than quitting (see the comment there). The
+  // prop stays in the interface because callers legitimately supply an
+  // exit handler and a future key path may want it.
+  onExit: _onExit,
   placeholder,
 }) => {
   // The streaming placeholder is preferred over the caller's
@@ -532,7 +536,7 @@ export const InputPrompt: React.FC<Props> = ({
         // land in the buffer as garbled characters. ``\t`` (HT) is
         // intentionally allowed — pasted tab characters are real
         // text. ``\n`` is also allowed (multi-line paste path).
-        const filtered = input.replace(/[ --]/g, "");
+        const filtered = input.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
         if (filtered.length === 0) return;
         const insertCps = Array.from(filtered);
         const next =

@@ -73,7 +73,6 @@ export function truncateOutput(
   // erase line — common in spinners). Conservative: only the
   // ``ESC[…m``  / ``ESC[…K`` / ``ESC[…A`` shapes; anything else
   // is left for downstream Text wrap to handle.
-  // eslint-disable-next-line no-control-regex
   const cleaned = raw.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 
   // Per-line normalisation: rstrip + drop fully-empty trailing rows.

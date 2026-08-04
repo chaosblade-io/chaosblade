@@ -297,6 +297,13 @@ export const en: Dict = {
   "memory.clear_ok": "deleted the current session snapshot file",
   "memory.clear_noop": "no snapshot file to delete (session may not have persisted yet)",
   "memory.clear_failed": "failed to delete session snapshot: {err}",
+  // MemoryCard placeholders — shown when a field is absent.
+  "memory.card.title": "Session memory",
+  "memory.card.unknown": "(unknown)",
+  "memory.card.unset": "(unset)",
+  "memory.card.no_recent_tasks": "(no recent tasks)",
+  // Stream transport — surfaced as the TURN_ABORTED reason.
+  "stream.disconnected": "Connection dropped unexpectedly; the server never sent a completion signal",
 
   // -- /compact -------------------------------------------------------
   "command.compact.desc": "Force-compact the current session's context (saves LLM tokens)",
@@ -518,6 +525,11 @@ export const en: Dict = {
 
   // -- ConfirmMessage preamble / subtitle ---------------------------
   "confirm.intent.preamble": "Identified the following fault injection intent:",
+  "confirm.intent.batch_preamble": "Identified the following batch fault injection intent (run serially):",
+  "confirm.intent.batch_count": "{n} faults",
+  "confirm.intent.fault_index": "Fault {n}",
+  "confirm.auto_approved": "Auto-approved",
+  "confirm.auto_approved_node": "Auto-approved: {node}",
   "confirm.execution.preamble": "Confirm the execution plan:",
   "confirm.generic.preamble": "Please confirm:",
 
@@ -580,6 +592,7 @@ export const en: Dict = {
   "confirm.health.not_run": "check not run",
   "confirm.field.feasibility": "feasibility",
   "confirm.feasibility.all_clear": "injection feasible",
+  "confirm.feasibility.headroom_detail": "headroom {headroom}, current {current}, target {target}",
   "confirm.feasibility.not_run": "check not run",
   "confirm.intent.low_conf_audit": "Why this intent:",
 
@@ -754,6 +767,8 @@ export const en: Dict = {
   "wizard.summary.saved_keys": "Written keys",
   "wizard.summary.save_error": "Save failed",
   "wizard.validation.in_progress": "Validating…",
+  "wizard.save.ok": "Saved",
+  "wizard.save.failed": "Save failed",
   "wizard.returned_hint": "Returned to this step — re-validate or edit",
   "wizard.hint.welcome": "Enter to start  ·  Esc to cancel",
   "wizard.hint.radio_with_back": "A-Z select  ·  ↑↓ move  ·  Enter confirm  ·  ← back  ·  Esc cancel",

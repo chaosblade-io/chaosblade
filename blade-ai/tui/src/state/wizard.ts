@@ -14,6 +14,7 @@
  */
 
 import type { ValidationResult, ModelPreset, SaveResult } from "../api/wizard.js";
+import { t } from "../i18n/index.js";
 
 // ── Step model ─────────────────────────────────────────────────────────
 
@@ -203,7 +204,7 @@ export function wizardReducer(
           ...state.validations,
           [action.step]: {
             status: "busy",
-            message: "校验中…",
+            message: t("wizard.validation.in_progress"),
             metadata: {},
           },
         },

@@ -1,6 +1,6 @@
 {
   "name": "@blade-ai/tui",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Blade-AI Terminal UI (TypeScript + Ink) — talks to Python backend over HTTP+SSE.",
   "keywords": [
     "blade-ai",
@@ -49,13 +49,17 @@
     "react": "^19.2.4"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@types/node": "^22.10.0",
     "@types/react": "^19.2.0",
+    "eslint": "^9.39.5",
+    "eslint-plugin-react-hooks": "^5.2.0",
     "ink-testing-library": "^4.0.0",
     "patch-package": "^8.0.1",
     "tsup": "^8.3.5",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
+    "typescript-eslint": "^8.65.0",
     "vitest": "^2.1.8"
   },
   "engines": {

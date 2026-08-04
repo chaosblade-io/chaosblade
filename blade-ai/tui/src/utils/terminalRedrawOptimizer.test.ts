@@ -65,8 +65,8 @@ describe("optimizeMultilineEraseLines", () => {
     // 5 eraseLines + 4 cursorDown interleaved (one DOWN after each
     // eraseLine except the last).
     const middle = out.slice(`${ESC}[4A`.length, -`${ESC}[4A${LEFT}`.length);
-    expect((middle.match(/\[2K/g) ?? []).length).toBe(5);
-    expect((middle.match(/\[1B/g) ?? []).length).toBe(4);
+    expect((middle.match(/\x1b\[2K/g) ?? []).length).toBe(5);
+    expect((middle.match(/\x1b\[1B/g) ?? []).length).toBe(4);
   });
 
   it("folds multiple independent occurrences in one chunk", () => {
@@ -75,7 +75,7 @@ describe("optimizeMultilineEraseLines", () => {
     const input = `prefix\n${oneFolded}middle\n${oneFolded}suffix`;
     const out = optimizeMultilineEraseLines(input);
     // Both occurrences fold → 2 bounded-jump openers.
-    expect((out.match(/\[2A/g) ?? []).length).toBe(4); // open + close × 2
+    expect((out.match(/\x1b\[2A/g) ?? []).length).toBe(4); // open + close × 2
     expect(out.startsWith("prefix\n")).toBe(true);
     expect(out.endsWith("suffix")).toBe(true);
   });

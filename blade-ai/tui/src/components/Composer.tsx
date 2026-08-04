@@ -517,20 +517,26 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
     // change on every reducer dispatch and rebuilt this callback
     // each time. ``handleExit`` is also useCallback'd → stable.
     //
-    // ``app`` stays in deps because it's still referenced inside the
-    // closure transitively (handleExit captures it). Keeping it here
-    // makes the lint-friendly "all referenced bindings are deps"
-    // contract visible even though removing it wouldn't actually
-    // break anything.
+    // ``app`` is deliberately absent: the only thing this closure does
+    // with it is call ``handleExit``, which is itself
+    // ``useCallback(() => app.exit(), [app])``. Listing ``handleExit``
+    // therefore already rebuilds this callback whenever ``app`` changes —
+    // naming ``app`` again only duplicated that edge.
+    //
+    // ``submitRecover`` / ``beginReplay`` / ``beginManualCompact`` come
+    // from ``useStream`` already wrapped in ``useCallback``, so listing
+    // them costs no churn.
     [
       submitTurn,
-      app,
       client,
       sessionId,
       getAppState,
       dispatch,
       registry,
       handleExit,
+      submitRecover,
+      beginReplay,
+      beginManualCompact,
     ],
   );
 

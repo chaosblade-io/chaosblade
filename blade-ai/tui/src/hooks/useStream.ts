@@ -25,6 +25,7 @@ import {
   streamingResponseCharsRef,
 } from "../state/streamingRefs.js";
 import { perfFlush, perfMark } from "../utils/perfTrace.js";
+import { t } from "../i18n/index.js";
 
 export interface SubmitTurnOpts {
   /**
@@ -397,7 +398,7 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
           // committed as if the turn completed successfully.
           dispatch({
             type: "TURN_ABORTED",
-            reason: "连接意外断开，服务端未发送完成信号",
+            reason: t("stream.disconnected"),
           });
         }
       } catch (err) {
@@ -574,7 +575,7 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
         } else {
           dispatch({
             type: "TURN_ABORTED",
-            reason: "连接意外断开，服务端未发送完成信号",
+            reason: t("stream.disconnected"),
           });
         }
       } catch (err) {

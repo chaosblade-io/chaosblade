@@ -19,6 +19,8 @@
  *     the wizard hung indefinitely.
  */
 
+import { t } from "../i18n/index.js";
+
 export interface ValidationResult {
   status: "ok" | "warn" | "error";
   message: string;
@@ -226,8 +228,8 @@ export class WizardClient {
           typeof env["message"] === "string"
             ? (env["message"] as string)
             : status === "success"
-              ? "已保存"
-              : "保存失败",
+              ? t("wizard.save.ok")
+              : t("wizard.save.failed"),
         savedKeys: Array.isArray(savedKeysRaw)
           ? (savedKeysRaw.filter((k) => typeof k === "string") as string[])
           : [],
