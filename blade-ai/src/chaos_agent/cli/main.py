@@ -305,14 +305,14 @@ app.command(name="confirm", help="Confirm or reject a pending task")(confirm_com
 app.command(name="version", help="Show version information")(version_command)
 app.command(name="update", help="Update blade-ai to the latest version")(update_command)
 app.command(name="uninstall", help="Uninstall blade-ai from the system")(uninstall_command)
-app.command(name="serve", help="Start the blade-ai HTTP API server")(serve_command)
+app.command(name="server", help="Start the blade-ai HTTP API server")(serve_command)
 
 
 # Hidden subcommand: started by the TS TUI in PyInstaller mode to host
 # the embedded FastAPI server. Mirrors the ``python -m chaos_agent.server.app``
 # argparse contract (``_cli`` in server/app.py) but routed through the
 # bundled blade-ai binary so curl-bash installs don't need an external
-# Python on PATH. Kept separate from the public ``serve`` above because the
+# Python on PATH. Kept separate from the public ``server`` above because the
 # TUI bridge needs different defaults (loopback host, OS-allocated port).
 # The double underscores keep it visually distinct from user-facing
 # commands; ``hidden=True`` keeps it out of ``--help``.

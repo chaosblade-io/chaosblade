@@ -43,10 +43,10 @@ _DOWNLOAD_URL_TEMPLATE = (
 )
 
 _CHECKSUMS: dict[str, str] = {
-    "darwin_amd64": "70c06b465f9d8cf40106ce9d88e960ae64a7db1577bc0b79147ee019e311851d",
-    "darwin_arm64": "2f41dc14b22fe18840cca0a12931fd73e2eef10e41ebd01d5fe7279c34cce213",
-    "linux_amd64": "dc6ab90244015af34cb4f4722653c1506a428aab9f0b18435aca64f8866316fd",
-    "linux_arm64": "5a496e8f377aac9a9eef80ffd0073d7cc90ccba060604aa245990cc3ee8b7bcc",
+    "darwin_amd64": "25db8c604e7ac37d7b3e87bf5e0aaaee7a3ee0bcea4f64d1e89bbc2e429608ac",
+    "darwin_arm64": "809c4cf641ba542ee33a2c80c85ab96fd972385c65d894283a239bcd6576dd0a",
+    "linux_amd64": "080ba5bf8af1c841f991fd610b2a0f007701408b417579dc8cca04c75517ff0e",
+    "linux_arm64": "485ca1c27827feeed50ed47aea544859d28f78f487abf52ecdfca9336512e3c4",
 }
 
 # Canonical map: ChaosBlade release arch → pip wheel platform tag. Used by

@@ -15,7 +15,7 @@ from typing import Optional
 from chaos_agent import __version__
 from chaos_agent.agent.factory import create_agent
 from chaos_agent.agent.spec.fault_spec import FaultSpec
-from chaos_agent.agent.result.operation_summary import build_task_summary_text
+from chaos_agent.agent.result.operation_summary import build_operation_record
 from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.agent.streaming import StreamEvent, parse_stream_events
 from chaos_agent.config.settings import settings
@@ -301,7 +301,7 @@ class AgentRunner:
         try:
             # Print a notice so the user knows the process is running
             if not _suppress_stderr and not settings.is_debug:
-                sys.stderr.write("  ⏳ 故障注入进行中，AI 正在分析并规划，请耐心等待...\n")
+                sys.stderr.write("  ⏳ Fault injection in progress — the AI is analysing and planning, please wait...\n")
                 sys.stderr.flush()
 
             # Phase 1: Stream the first invoke (runs until confirmation_gate or completion)
@@ -596,7 +596,7 @@ class AgentRunner:
         try:
             # Print a notice so the user knows the process is running
             if not settings.is_debug:
-                sys.stderr.write("  ⏳ 故障注入进行中，AI 正在分析并规划，请耐心等待...\n")
+                sys.stderr.write("  ⏳ Fault injection in progress — the AI is analysing and planning, please wait...\n")
                 sys.stderr.flush()
 
             # First invoke - will pause at confirmation_gate (or complete if chat)
@@ -730,9 +730,24 @@ class AgentRunner:
         }
         # Merge session-level kwargs (tui_session_id, kubeconfig,
         # needs_confirmation, dry_run, interaction_mode, etc.)
+        #
+        # The transport/channel fields matter beyond command dispatch: the
+        # intent prompt states the resolved capability profile as a fact so the
+        # model can tell a host environment from a K8s one, and that section is
+        # rendered from ``state["kube_connection_mode"]``. Omitting the field
+        # here left it unset, the profile resolved to "unknown", the section was
+        # skipped — and the Inject Flow rule that tells the model to check the
+        # `Capability Profile` section then pointed at something absent, so a
+        # host fault on a k8s channel was submitted with no warning.
+        #
+        # Same omission as the three ``graph_input`` branches in
+        # ``l4/interaction.py`` (fixed separately): both hand-offs carried only
+        # the four Kubernetes fields.
         _session_keys = (
             "tui_session_id", "interaction_mode", "kubeconfig",
             "kube_context", "kubewiz_cluster_uuid", "kubewiz_profile",
+            "kube_connection_mode", "host_name",
+            "ssh_host", "ssh_user", "ssh_key_path", "ssh_port",
             "needs_confirmation", "dry_run",
             "planning_mode",
         )
@@ -740,9 +755,81 @@ class AgentRunner:
             if k in kwargs:
                 intent_input[k] = kwargs[k]
 
+        # Channel fields fall back to settings when the caller omits them.
+        #
+        # Necessary because the TUI calls this with only session_id /
+        # user_message / interrupt_callback — no transport kwargs at all — while
+        # the channel itself comes from ``~/.blade-ai/config.json``. Command
+        # dispatch never noticed: ``TransportTarget.from_state`` applies the same
+        # settings fallback on its own.
+        #
+        # The intent prompt does not. It renders the `Capability Profile` section
+        # from ``state["kube_connection_mode"]`` directly, so an unset field made
+        # the profile "unknown" and dropped the section — leaving the Inject Flow
+        # rule pointing at a section that was not there, and a host fault on a
+        # k8s channel was submitted with no warning.
+        for _k in (
+            "kube_connection_mode", "host_name",
+            "ssh_host", "ssh_user", "ssh_key_path",
+        ):
+            if not intent_input.get(_k):
+                _v = getattr(settings, _k, "") or ""
+                if _v:
+                    intent_input[_k] = _v
+        if not intent_input.get("ssh_port"):
+            _port = getattr(settings, "ssh_port", None)
+            if _port:
+                intent_input["ssh_port"] = _port
+
         turn_tokens_seen = False
         pipeline_started = False
         pipeline_task_id = ""
+        # One record per turn: a failure after the outcome record landed must not
+        # append a contradicting interruption note on top of it.
+        record_written = False
+
+        async def _write_turn_interrupted(cause: str, error_detail: str = "") -> None:
+            """Mirror an interruption record to the Intent Graph (Python TUI path).
+
+            The TUI's own cancel (Esc / Ctrl+C) raises ``CancelledError``, which
+            derives from BaseException and so was never caught here — leaving the
+            context-isolated intent graph with no record that the turn happened,
+            nor that a fault may still be live. Reads whatever the executor had
+            recorded in its progress ledger when it stopped.
+            """
+            if record_written:
+                return
+            try:
+                from chaos_agent.agent.result.operation_summary import (
+                    build_interrupted_record,
+                )
+                if pipeline_started and pipeline_task_id:
+                    snapshot = await pipeline_graph.aget_state(
+                        {"configurable": {"thread_id": pipeline_task_id}}
+                    )
+                    record_task_id = pipeline_task_id
+                else:
+                    snapshot = await intent_graph.aget_state(intent_config)
+                    record_task_id = session_id
+                values = snapshot.values if snapshot and snapshot.values else {}
+                await write_operation_summary(
+                    build_interrupted_record(
+                        values, record_task_id, cause=cause, error_detail=error_detail,
+                    ),
+                    intent_graph=intent_graph,
+                    thread_id=session_id,
+                    tui_session_id=session_id,
+                    tui_session_store=self._tui_session_store,
+                    recursion_limit=settings.recursion_limit,
+                    raise_graph_error=False,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Failed to write interruption record for session %s (cause=%s)",
+                    session_id, cause, exc_info=True,
+                )
 
         try:
             # ── Phase 1: Intent Graph ──────────────────────────────
@@ -917,7 +1004,8 @@ class AgentRunner:
 
                 # Write task summary back to Intent Graph + session file
                 try:
-                    summary = build_task_summary_text(pv, task_id)
+                    # ONE combined record: summary headline + ledger process detail.
+                    summary = build_operation_record(pv, task_id)
                     await write_operation_summary(
                         summary,
                         intent_graph=intent_graph,
@@ -927,6 +1015,7 @@ class AgentRunner:
                         tui_session_store=self._tui_session_store,
                         recursion_limit=settings.recursion_limit,
                     )
+                    record_written = True
                 except Exception:
                     logger.debug("Failed to write task summary to Intent Graph", exc_info=True)
 
@@ -938,8 +1027,15 @@ class AgentRunner:
                         yield StreamEvent(type="token", content=synthetic, task_id=session_id)
                 yield StreamEvent(type="conversation_turn", content="", task_id=session_id)
 
+        except asyncio.CancelledError:
+            # The TUI cancel path — ``CancelledError`` derives from BaseException
+            # so the handler below never saw it, leaving no record of the turn.
+            # Shielded as this runs under cancellation.
+            await asyncio.shield(_write_turn_interrupted("user_cancel"))
+            raise
         except Exception as e:
             logger.exception(f"converse_stream failed for session {session_id}")
+            await _write_turn_interrupted("internal_error", f"{type(e).__name__}: {e}")
             yield StreamEvent(type="error", content=f"Conversation failed: {e}", task_id=session_id)
         finally:
             if pipeline_started and pipeline_task_id:
@@ -1087,7 +1183,7 @@ class AgentRunner:
         if not snapshot.values.get("dry_run"):
             yield StreamEvent(
                 type="error",
-                content="当前会话不在 Dry-Run 状态，无法直接落地。请使用 /run <描述> 起新任务。",
+                content="This session is not in Dry-Run state, so it cannot be applied directly. Use /run <description> to start a new task.",
                 task_id=thread_id,
             )
             return
@@ -1166,7 +1262,7 @@ class AgentRunner:
             logger.exception(f"lift_dry_run_and_run failed for {thread_id}")
             yield StreamEvent(
                 type="error",
-                content=f"Dry-Run 落地失败: {e}",
+                content=f"Dry-Run apply failed: {e}",
                 task_id=thread_id,
             )
         finally:
@@ -1312,7 +1408,7 @@ class AgentRunner:
 
             # Execute recover graph (includes two-layer verification)
             if not settings.is_debug:
-                sys.stderr.write("  ⏳ 故障恢复进行中，AI 正在执行恢复并验证，请耐心等待...\n")
+                sys.stderr.write("  ⏳ Fault recovery in progress — the AI is recovering and verifying, please wait...\n")
                 sys.stderr.flush()
             result = await self._agents["recover"].ainvoke(initial_state, config)
 
@@ -1447,7 +1543,7 @@ class AgentRunner:
                 for uc in use_cases:
                     uc_cat = uc.get("category") or cat
                     categories_dict[uc_cat]["category"] = uc_cat
-                    categories_dict[uc_cat]["description"] = f"{uc_cat} 故障注入用例"
+                    categories_dict[uc_cat]["description"] = f"{uc_cat} fault-injection use cases"
                     categories_dict[uc_cat]["faults"].append({
                         "fault_type": extract_fault_type(uc_cat),
                         "use_case_name": uc["use_case_name"],

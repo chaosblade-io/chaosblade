@@ -39,7 +39,7 @@ class TestCheckResult:
             name="llm_api_key",
             severity="blocking",
             passed=False,
-            message="llm_api_key 未配置",
+            message="llm_api_key is not configured",
             fix="blade-ai config set llm_api_key <your-key>",
         )
         assert r.passed is False
@@ -95,7 +95,7 @@ class TestCheckKubeconfig:
         result = check_kubeconfig()
         assert result.passed is False
         assert result.severity == "blocking"
-        assert "不存在" in result.message
+        assert "does not exist" in result.message
 
     def test_passes_with_default_kubeconfig(self, monkeypatch):
         """When no explicit kubeconfig_path, falls back to ~/.kube/config."""
@@ -110,7 +110,7 @@ class TestCheckKubeconfig:
             # No default on CI — just verify it returns a failed result
             result = check_kubeconfig()
             assert result.passed is False
-            assert "默认" in result.message or "未配置" in result.message
+            assert "default" in result.message or "not configured" in result.message
 
     def test_fails_when_no_explicit_and_no_default(self, monkeypatch):
         from chaos_agent.config import settings as _settings_mod
@@ -119,7 +119,7 @@ class TestCheckKubeconfig:
         with patch("os.path.isfile", return_value=False):
             result = check_kubeconfig()
         assert result.passed is False
-        assert "默认" in result.message or "未配置" in result.message
+        assert "default" in result.message or "not configured" in result.message
 
     def test_passes_when_path_has_tilde(self, monkeypatch, tmp_path):
         """Tilde in kubeconfig_path is expanded before checking the file."""
@@ -317,7 +317,7 @@ class TestCheckBlade:
         # check_blade is now pure detection (no download). It communicates
         # both the auto-download-on-first-inject path and the kubectl exec
         # fallback via message; the fix line points at manual override.
-        assert "降级" in result.message
+        assert "falls back" in result.message
         assert "blade_path" in result.fix
 
     def test_blade_is_warning_not_blocking(self, monkeypatch):
@@ -365,7 +365,7 @@ class TestRun:
         assert len(results) == 1
         assert results[0].passed is False
         assert results[0].severity == "warning"
-        assert "异常" in results[0].message
+        assert "raised an error" in results[0].message
 
     def test_empty_checks_returns_empty(self):
         results = run([])
@@ -392,14 +392,14 @@ class TestDisplay:
                 name="llm_api_key",
                 severity="blocking",
                 passed=False,
-                message="llm_api_key 未配置",
+                message="llm_api_key is not configured",
                 fix="blade-ai config set llm_api_key <key>",
             )
         ]
         assert display(results) is True
         captured = capsys.readouterr()
         assert "❌" in captured.err
-        assert "阻塞性" in captured.err
+        assert "blocking" in captured.err
 
     def test_warning_failure_returns_false(self, capsys):
         """Warning-only failures should NOT trigger exit."""
@@ -408,14 +408,14 @@ class TestDisplay:
                 name="blade",
                 severity="warning",
                 passed=False,
-                message="blade 不可用",
-                fix="建议安装 ChaosBlade",
+                message="blade is unavailable",
+                fix="Install ChaosBlade",
             )
         ]
         assert display(results) is False
         captured = capsys.readouterr()
         assert "⚠️" in captured.err
-        assert "警告" in captured.err
+        assert "warning" in captured.err
 
     def test_mixed_blocking_and_warning(self, capsys):
         results = [
@@ -423,23 +423,23 @@ class TestDisplay:
                 name="llm_api_key",
                 severity="blocking",
                 passed=False,
-                message="llm_api_key 未配置",
+                message="llm_api_key is not configured",
                 fix="config set",
             ),
             CheckResult(
                 name="blade",
                 severity="warning",
                 passed=False,
-                message="blade 不可用",
-                fix="建议安装",
+                message="blade is unavailable",
+                fix="Install it",
             ),
         ]
         assert display(results) is True
         captured = capsys.readouterr()
         assert "❌" in captured.err
         assert "⚠️" in captured.err
-        assert "1 个阻塞性" in captured.err
-        assert "1 个警告" in captured.err
+        assert "1 blocking" in captured.err
+        assert "1 warning" in captured.err
 
     def test_output_goes_to_stderr(self, capsys):
         results = [

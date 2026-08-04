@@ -1,4 +1,4 @@
-"""CLI command: blade-ai serve
+"""CLI command: blade-ai server
 
 Public counterpart to the ``blade-ai-server`` console script. Both call the
 same ``run_server``, but only this one is reachable from the single
@@ -35,7 +35,7 @@ def serve_command(
     ``host`` / ``port`` default to ``None`` so the existing
     ``BLADE_AI_SERVER_HOST`` / ``BLADE_AI_SERVER_PORT`` settings stay
     authoritative; a flag only overrides them when explicitly passed. This
-    keeps ``blade-ai serve`` and ``blade-ai-server`` behaviourally identical.
+    keeps ``blade-ai server`` and ``blade-ai-server`` behaviourally identical.
     """
     from chaos_agent.server.app import run_server
 

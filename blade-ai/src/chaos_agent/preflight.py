@@ -99,9 +99,9 @@ def check_llm_api_key() -> CheckResult:
         name="llm_api_key",
         severity="blocking",
         passed=False,
-        message="llm_api_key 未配置",
+        message="llm_api_key is not configured",
         fix="blade-ai config set llm_api_key <your-key>\n"
-            "或设置环境变量 BLADE_AI_LLM_API_KEY=<your-key>",
+            "or set the environment variable BLADE_AI_LLM_API_KEY=<your-key>",
     )
 
 
@@ -147,9 +147,9 @@ def check_kubeconfig() -> CheckResult:
             name="kubeconfig",
             severity="blocking",
             passed=False,
-            message="kubeconfig 未配置（默认 ~/.kube/config 也不存在）",
+            message="kubeconfig is not configured (the default ~/.kube/config does not exist either)",
             fix="blade-ai config set kubeconfig_path <path>\n"
-                "或设置环境变量 KUBECONFIG=<path>",
+                "or set the environment variable KUBECONFIG=<path>",
         )
 
     if not os.path.isfile(path):
@@ -157,9 +157,9 @@ def check_kubeconfig() -> CheckResult:
             name="kubeconfig",
             severity="blocking",
             passed=False,
-            message=f"kubeconfig 文件不存在: {path}",
+            message=f"kubeconfig file does not exist: {path}",
             fix="blade-ai config set kubeconfig_path <path>\n"
-                "或设置环境变量 KUBECONFIG=<path>",
+                "or set the environment variable KUBECONFIG=<path>",
         )
 
     return CheckResult(name="kubeconfig", severity="blocking", passed=True)
@@ -178,8 +178,8 @@ def check_kubectl() -> CheckResult:
             name="kubectl",
             severity="blocking",
             passed=False,
-            message=f"wiz 不可用 (path={settings.wiz_path})",
-            fix="安装 wiz CLI，或 blade-ai config set wiz_path <path>",
+            message=f"wiz is unavailable (path={settings.wiz_path})",
+            fix="Install the wiz CLI, or run blade-ai config set wiz_path <path>",
         )
     # is_executable (not bare shutil.which): kubectl_path may be configured
     # as a full path, and shutil.which mishandles a path-shaped cmd on
@@ -191,8 +191,8 @@ def check_kubectl() -> CheckResult:
         name="kubectl",
         severity="blocking",
         passed=False,
-        message="kubectl 不可用",
-        fix="请安装 kubectl，或通过 blade-ai config set kubectl_path <path> 指定路径",
+        message="kubectl is unavailable",
+        fix="Install kubectl, or set its path via blade-ai config set kubectl_path <path>",
     )
 
 
@@ -213,9 +213,9 @@ def check_blade() -> CheckResult:
         name="blade",
         severity="warning",
         passed=False,
-        message="blade 未安装（首次注入时自动下载，或降级为 kubectl exec）",
-        fix="首次注入会自动下载 ChaosBlade（约 51MB）；\n"
-            "如需手动指定: blade-ai config set blade_path <path>",
+        message="blade is not installed (downloaded automatically on first injection, or falls back to kubectl exec)",
+        fix="The first injection downloads ChaosBlade automatically (about 51MB);\n"
+            "to set it manually: blade-ai config set blade_path <path>",
     )
 
 
@@ -238,8 +238,8 @@ def check_transport_config() -> CheckResult:
             name="transport_config",
             severity="blocking",
             passed=False,
-            message=f"传输通道配置无效: {exc}",
-            fix="检查 kube_connection_mode 及对应通道所需字段（host_name / ssh_host 等）",
+            message=f"Invalid transport channel configuration: {exc}",
+            fix="Check kube_connection_mode and the fields its channel requires (host_name / ssh_host, etc.)",
         )
     if channel.name not in ("ssh", "kubewiz_host"):
         # k8s-scope channels are validated by check_kubeconfig.
@@ -250,8 +250,8 @@ def check_transport_config() -> CheckResult:
             name="transport_config",
             severity="blocking",
             passed=False,
-            message=f"{channel.name} 通道配置缺失: {'; '.join(errors)}",
-            fix="通过 blade-ai config set 或环境变量补齐上述字段",
+            message=f"{channel.name} channel configuration is incomplete: {'; '.join(errors)}",
+            fix="Fill in the fields above via blade-ai config set or environment variables",
         )
     return CheckResult(name="transport_config", severity="blocking", passed=True)
 
@@ -393,22 +393,6 @@ def _kubectl_base_cmd() -> tuple[list[str], Optional[str]]:
     return cmd, kubeconfig or None
 
 
-async def _kubectl_current_context(base_cmd: list[str]) -> str:
-    """Return the active context name, or '' on any failure."""
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *base_cmd, "config", "current-context",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0:
-            return stdout.decode(errors="replace").strip()
-    except Exception:
-        return ""
-    return ""
-
-
 async def _safe_kill(proc) -> None:
     """Reap a subprocess that timed out so we don't leak fds + zombie.
 
@@ -449,16 +433,16 @@ async def check_llm_api_key_live() -> CheckResult:
             name="llm_api_key",
             severity="blocking",
             passed=False,
-            message="llm_api_key 未配置",
+            message="llm_api_key is not configured",
             fix="blade-ai config set llm_api_key <your-key>\n"
-                "或设置环境变量 BLADE_AI_LLM_API_KEY=<your-key>",
+                "or set the environment variable BLADE_AI_LLM_API_KEY=<your-key>",
         )
     if not (settings.api_base_url or "").strip():
         return CheckResult(
             name="llm_api_key",
             severity="blocking",
             passed=False,
-            message="api_base_url 未配置",
+            message="api_base_url is not configured",
             fix="blade-ai config set api_base_url <url>",
         )
 
@@ -473,8 +457,8 @@ async def check_llm_api_key_live() -> CheckResult:
             name="llm_api_key",
             severity="blocking",
             passed=False,
-            message=f"openai client init 失败: {e}",
-            fix="检查 api_base_url / llm_api_key 配置",
+            message=f"openai client init failed: {e}",
+            fix="Check the api_base_url / llm_api_key configuration",
         )
 
     try:
@@ -491,8 +475,8 @@ async def check_llm_api_key_live() -> CheckResult:
             name="llm_api_key",
             severity="warning",
             passed=False,
-            message=f"LLM API 在 {_LLM_KEY_TIMEOUT_S:.0f}s 内未响应（key 可能仍然有效）",
-            fix="检查网络连通性，或重试 /doctor",
+            message=f"The LLM API did not respond within {_LLM_KEY_TIMEOUT_S:.0f}s (the key may still be valid)",
+            fix="Check network connectivity, or retry /doctor",
         )
     except Exception as e:
         # Reuse map_error so the same exception → CheckResult mapping
@@ -554,7 +538,7 @@ async def check_kubeconfig_live() -> CheckResult:
                 name="kubeconfig",
                 severity="blocking",
                 passed=False,
-                message="kubeconfig 未配置（默认 ~/.kube/config 也不存在）",
+                message="kubeconfig is not configured (the default ~/.kube/config does not exist either)",
                 fix="blade-ai config set kubeconfig_path <path>",
             )
         path = default
@@ -563,7 +547,7 @@ async def check_kubeconfig_live() -> CheckResult:
             name="kubeconfig",
             severity="blocking",
             passed=False,
-            message=f"kubeconfig 文件不存在: {path}",
+            message=f"kubeconfig file does not exist: {path}",
             fix="blade-ai config set kubeconfig_path <path>",
         )
 
@@ -582,8 +566,8 @@ async def check_kubeconfig_live() -> CheckResult:
             name="kubeconfig",
             severity="blocking",
             passed=False,
-            message="kubectl 不可用，无法验证 kubeconfig",
-            fix="先确保 kubectl 已安装",
+            message="kubectl is unavailable, so the kubeconfig cannot be validated",
+            fix="Make sure kubectl is installed first",
         )
     except asyncio.TimeoutError:
         await _safe_kill(proc)
@@ -591,14 +575,14 @@ async def check_kubeconfig_live() -> CheckResult:
             name="kubeconfig",
             severity="blocking",
             passed=False,
-            message=f"kubectl config view 在 {timeout}s 内未返回",
+            message=f"kubectl config view did not return within {timeout}s",
         )
     except Exception as e:
         return CheckResult(
             name="kubeconfig",
             severity="blocking",
             passed=False,
-            message=f"kubeconfig 检查异常: {e}",
+            message=f"kubeconfig check raised an error: {e}",
         )
 
     if proc.returncode != 0:
@@ -607,8 +591,8 @@ async def check_kubeconfig_live() -> CheckResult:
             name="kubeconfig",
             severity="blocking",
             passed=False,
-            message=f"kubectl 拒绝 kubeconfig: {err}",
-            fix="检查 kubeconfig 内容、active context 和 user 引用",
+            message=f"kubectl rejected the kubeconfig: {err}",
+            fix="Check the kubeconfig contents, its active context, and the user reference",
         )
 
     summary = stdout.decode(errors="replace").strip()
@@ -619,7 +603,7 @@ async def check_kubeconfig_live() -> CheckResult:
             name="kubeconfig",
             severity="blocking",
             passed=False,
-            message=f"kubeconfig active context 未解析到 server URL: {summary or '(empty)'}",
+            message=f"No server URL resolved from the kubeconfig active context: {summary or '(empty)'}",
         )
 
     return CheckResult(
@@ -646,26 +630,26 @@ async def _check_wiz_version() -> CheckResult:
     except FileNotFoundError:
         return CheckResult(
             name="kubectl", severity="blocking", passed=False,
-            message=f"wiz 不可用 (path={settings.wiz_path})",
-            fix="安装 wiz CLI，或 blade-ai config set wiz_path <path>",
+            message=f"wiz is unavailable (path={settings.wiz_path})",
+            fix="Install the wiz CLI, or run blade-ai config set wiz_path <path>",
         )
     except asyncio.TimeoutError:
         await _safe_kill(proc)
         return CheckResult(
             name="kubectl", severity="blocking", passed=False,
-            message="wiz version 超时",
+            message="wiz version timed out",
         )
     except Exception as e:
         return CheckResult(
             name="kubectl", severity="blocking", passed=False,
-            message=f"wiz version 调用异常: {e}",
+            message=f"wiz version call raised an error: {e}",
         )
 
     if proc.returncode != 0:
         return CheckResult(
             name="kubectl", severity="blocking", passed=False,
-            message="wiz version 退出码非零",
-            fix="检查 wiz CLI 安装及登录状态",
+            message="wiz version exited with a non-zero code",
+            fix="Check the wiz CLI installation and login state",
         )
 
     try:
@@ -702,8 +686,8 @@ async def check_kubectl_version() -> CheckResult:
             name="kubectl",
             severity="blocking",
             passed=False,
-            message=f"kubectl 不可用 (path={settings.kubectl_path})",
-            fix="安装 kubectl，或 blade-ai config set kubectl_path <path>",
+            message=f"kubectl is unavailable (path={settings.kubectl_path})",
+            fix="Install kubectl, or run blade-ai config set kubectl_path <path>",
         )
     except asyncio.TimeoutError:
         await _safe_kill(proc)
@@ -711,15 +695,15 @@ async def check_kubectl_version() -> CheckResult:
             name="kubectl",
             severity="blocking",
             passed=False,
-            message=f"kubectl version 在 {_KUBECTL_VERSION_TIMEOUT_S:.0f}s 内未返回",
-            fix="检查 kubectl 安装",
+            message=f"kubectl version did not return within {_KUBECTL_VERSION_TIMEOUT_S:.0f}s",
+            fix="Check the kubectl installation",
         )
     except Exception as e:
         return CheckResult(
             name="kubectl",
             severity="blocking",
             passed=False,
-            message=f"kubectl 调用异常: {e}",
+            message=f"kubectl call raised an error: {e}",
         )
 
     if proc.returncode != 0:
@@ -728,8 +712,8 @@ async def check_kubectl_version() -> CheckResult:
             name="kubectl",
             severity="blocking",
             passed=False,
-            message=f"kubectl version 退出码 {proc.returncode}: {err}",
-            fix="安装或修复 kubectl",
+            message=f"kubectl version exited with code {proc.returncode}: {err}",
+            fix="Install or repair kubectl",
         )
 
     # Resolve the absolute kubectl path so the success line shows
@@ -793,7 +777,7 @@ async def check_blade_version() -> CheckResult:
             name="blade",
             severity="warning",
             passed=False,
-            message=f"blade 调用异常: {e}",
+            message=f"blade call raised an error: {e}",
         )
 
     if not raw or raw == "not installed":
@@ -801,9 +785,9 @@ async def check_blade_version() -> CheckResult:
             name="blade",
             severity="warning",
             passed=False,
-            message="blade 未安装（首次注入时自动下载，或降级为 kubectl exec）",
-            fix="首次注入会自动下载 ChaosBlade（约 51MB）；\n"
-                "如需手动指定: blade-ai config set blade_path <path>",
+            message="blade is not installed (downloaded automatically on first injection, or falls back to kubectl exec)",
+            fix="The first injection downloads ChaosBlade automatically (about 51MB);\n"
+                "to set it manually: blade-ai config set blade_path <path>",
         )
 
     # Show the resolved blade binary path so users can confirm which
@@ -900,8 +884,8 @@ async def _check_host_connectivity() -> CheckResult:
     except Exception as e:
         return CheckResult(
             name="host_connectivity", severity="blocking", passed=False,
-            message=f"主机连通性探测异常: {str(e)[:120]}",
-            fix="检查 host_name / ssh_host / ssh_user / ssh_key_path 配置及主机可达性",
+            message=f"Host reachability probe raised an error: {str(e)[:120]}",
+            fix="Check the host_name / ssh_host / ssh_user / ssh_key_path configuration and host reachability",
         )
     if result.exit_code == 0:
         label = "ssh" if chan == "ssh" else "kubewiz-host"
@@ -912,8 +896,8 @@ async def _check_host_connectivity() -> CheckResult:
     err = (result.stderr or result.stdout or "").strip()[:200]
     return CheckResult(
         name="host_connectivity", severity="blocking", passed=False,
-        message=f"主机不可达: {err or ('exit ' + str(result.exit_code))}",
-        fix="检查主机地址/端口/SSH 凭据，或 kubewiz host_name 与 profile 配置",
+        message=f"Host is unreachable: {err or ('exit ' + str(result.exit_code))}",
+        fix="Check the host address/port/SSH credentials, or the kubewiz host_name and profile configuration",
     )
 
 
@@ -1071,7 +1055,7 @@ async def check_chaosblade_operator() -> CheckResult:
         # is irrelevant here — skip (mode-scoped check).
         return CheckResult(
             name="chaosblade_operator", severity="warning", passed=True,
-            message="host mode (Operator 检查已跳过)",
+            message="host mode (Operator check skipped)",
         )
     from chaos_agent.tools.kubectl import exec_kubectl_raw
 
@@ -1212,7 +1196,7 @@ def run(checks: list[Callable[[], CheckResult]]) -> list[CheckResult]:
                 name=check.__name__,
                 severity="warning",
                 passed=False,
-                message=f"检查异常: {e}",
+                message=f"Check raised an error: {e}",
                 fix="",
             ))
     return results
@@ -1242,10 +1226,10 @@ def display(results: list[CheckResult]) -> bool:
 
     parts = []
     if blocking_count:
-        parts.append(f"{blocking_count} 个阻塞性")
+        parts.append(f"{blocking_count} blocking")
     if warning_count:
-        parts.append(f"{warning_count} 个警告")
-    print(f"\n发现 {'、'.join(parts)}问题，请修复后重试。", file=sys.stderr)
+        parts.append(f"{warning_count} warning")
+    print(f"\nFound {' and '.join(parts)} issue(s); fix them and retry.", file=sys.stderr)
 
     return blocking_count > 0
 
@@ -1278,8 +1262,8 @@ def map_error(exc: Exception) -> Optional[CheckResult]:
             name="llm_api_key",
             severity="blocking",
             passed=False,
-            message="LLM API key 无效 (401 Unauthorized)",
-            fix="请检查 key 是否正确: blade-ai config set llm_api_key <correct-key>",
+            message="LLM API key is invalid (401 Unauthorized)",
+            fix="Check that the key is correct: blade-ai config set llm_api_key <correct-key>",
         )
 
     # openai.APIConnectionError — network / DNS failure
@@ -1288,7 +1272,7 @@ def map_error(exc: Exception) -> Optional[CheckResult]:
             name="api_base_url",
             severity="blocking",
             passed=False,
-            message="无法连接 LLM API，请检查网络和 api_base_url 配置",
+            message="Cannot reach the LLM API; check the network and the api_base_url configuration",
             fix="blade-ai config set api_base_url <url>",
         )
 
@@ -1298,7 +1282,7 @@ def map_error(exc: Exception) -> Optional[CheckResult]:
             name="api_base_url",
             severity="blocking",
             passed=False,
-            message="LLM API 端点不存在 (404)，请检查 api_base_url 配置",
+            message="The LLM API endpoint does not exist (404); check the api_base_url configuration",
             fix="blade-ai config set api_base_url <url>",
         )
 
@@ -1308,8 +1292,8 @@ def map_error(exc: Exception) -> Optional[CheckResult]:
             name="llm_api_key",
             severity="blocking",
             passed=False,
-            message=f"LLM API key 无效: {exc_msg}",
-            fix="请检查 key 是否正确: blade-ai config set llm_api_key <correct-key>",
+            message=f"LLM API key is invalid: {exc_msg}",
+            fix="Check that the key is correct: blade-ai config set llm_api_key <correct-key>",
         )
 
     return None
@@ -1345,19 +1329,19 @@ def _ensure_blade_for_cli() -> None:
         if pct != last_pct[0]:
             last_pct[0] = pct
             sys.stderr.write(
-                f"\r  ⏳ 下载 ChaosBlade v{CHAOSBLADE_VERSION}: "
+                f"\r  ⏳ Downloading ChaosBlade v{CHAOSBLADE_VERSION}: "
                 f"{pct}% ({done / 1048576:.1f}/{total / 1048576:.1f} MB)"
             )
             sys.stderr.flush()
 
-    sys.stderr.write("ChaosBlade 未安装，正在为首次使用下载...\n")
+    sys.stderr.write("ChaosBlade is not installed; downloading it for first use...\n")
     sys.stderr.flush()
     try:
         ensure_chaosblade(on_progress=_progress)
-        sys.stderr.write("\n  ✓ ChaosBlade 就绪\n")
+        sys.stderr.write("\n  ✓ ChaosBlade ready\n")
     except Exception as e:
         sys.stderr.write(
-            f"\n  ⚠ ChaosBlade 下载失败 ({e})；将尝试 kubectl exec 降级执行。\n"
+            f"\n  ⚠ ChaosBlade download failed ({e}); will fall back to kubectl exec.\n"
         )
     sys.stderr.flush()
 
