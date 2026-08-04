@@ -64,8 +64,19 @@
 **降级方案（kubectl-native）**
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效故障注入。
+> 两条路径按 sidecar 容器内是否有 `kill`/`pgrep` 二选一。
 
-前提条件：目标容器内需有 `kill` 命令和 `pgrep` 工具可用
+---
+
+**路径 A —— sidecar 容器内有 `kill` 和 `pgrep`**
+
+前提条件：目标容器内需有 `kill` 命令和 `pgrep` 工具可用。先确认：
+```bash
+kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> \
+  -- sh -c 'command -v kill; command -v pgrep'
+```
+两者都有输出才走本路径。sidecar 常是 distroless 的极简镜像（istio-proxy、各类
+driver-registrar 等），缺失时走路径 B。
 
 注入命令：
 ```bash
@@ -88,3 +99,86 @@ kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- sh -c 'kil
 - 必须通过 `ps aux` 或 `pgrep` 确认实际进程名，不可猜测
 - 与 ChaosBlade 相比，kubectl exec 方式缺少自动超时恢复机制，需手动发送 SIGCONT
 - 如容器内无 `pgrep`，可用 `ps aux | grep <process-name>` 替代获取 PID
+
+---
+
+**路径 B —— sidecar 容器内没有 `kill`：节点侧 cgroup freezer**
+
+从节点侧冻结**该 sidecar 容器**的 cgroup，不需要容器内有任何二进制。同 Pod 内的
+其它容器（含主容器）**不受影响** —— 每个容器有独立的 `.scope` cgroup，这正是
+本用例「只挂起 sidecar」语义所要求的。
+
+> **仅适用 cgroup v1。** 先判定版本，v2 的路径与写法不同（`cgroup.freeze`，写 `1`/`0`），
+> 本用例未覆盖 v2，判定为 v2 时应停止并报告不支持：
+> ```bash
+> kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+>   -- chroot /host stat -fc %T /sys/fs/cgroup
+> ```
+> 输出 `tmpfs` → v1，继续；输出 `cgroup2fs` → v2，**停止**。
+
+1. 定位目标节点，并取 sidecar 容器的 containerID。**多容器 Pod 必须按容器名精确取**
+   （`containerStatuses[0]` 是不确定的那一个，取错会冻错容器）：
+   ```bash
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath={.spec.nodeName}
+   # 列出全部容器名与 ID，从中挑 sidecar 那一条
+   kubectl get pod <pod-name> -n <namespace> \
+     -o jsonpath={range.status.containerStatuses[*]}{.name}{.containerID}{end}
+   ```
+
+2. 取该容器的 freezer cgroup 路径。**推荐用 crictl 按容器名反查，不要手工拼路径**
+   —— 路径含 QoS 层（`kubepods-burstable.slice` / `kubepods-besteffort.slice`，
+   Guaranteed 则无此层）和 Pod UID 的下划线化，手工拼极易错：
+   ```bash
+   kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+     -- chroot /host sh -c 'CID=$(crictl ps -q --name <sidecar-container-name> | head -1); \
+        find /sys/fs/cgroup/freezer -type d -name "*$CID*"'
+   ```
+   输出形如（实测样例，Burstable QoS）：
+   ```
+   /sys/fs/cgroup/freezer/kubepods.slice/kubepods-burstable.slice/\
+   kubepods-burstable-pod<UID_下划线>.slice/cri-containerd-<containerID>.scope
+   ```
+   **同名容器跨 Pod 时 `--name` 会命中多个** —— 用 `crictl ps --pod <podSandboxId>
+   --name <容器名> -q` 限定到目标 Pod，或核对上一步拿到的 containerID 前缀。
+
+3. 注入 —— **必须先武装定时解冻，再冻结**：
+   ```bash
+   # ⚠️ 顺序不可颠倒：冻结后无法 exec 进该容器，且 debug pod 可能先于解冻被删除。
+   #    定时器由宿主机 systemd(PID 1) 管理，不受 debug pod 生命周期影响。
+   kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+     -- chroot /host sh -c '
+       P=<步骤2得到的路径>/freezer.state
+       systemd-run --on-active=<recovery-seconds>s --unit=blade-thaw-<containerID前12位> \
+         sh -c "echo THAWED > $P" &&
+       echo FROZEN > $P
+     '
+   ```
+
+验证：
+```bash
+kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+  -- chroot /host cat <步骤2得到的路径>/freezer.state
+```
+应输出 `FROZEN`。再确认**主容器未受影响**（这是本用例与「整个 Pod 挂起」的分界）：
+```bash
+kubectl exec <pod-name> -c <主容器名> -n <namespace> -- echo alive
+```
+应正常返回 `alive`。sidecar 侧的业务影响按其职责验证（如 istio-proxy 被冻则出入流量中断、
+driver-registrar 被冻则插件注册失效）。
+
+恢复：
+```bash
+kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+  -- chroot /host sh -c 'echo THAWED > <步骤2得到的路径>/freezer.state'
+```
+
+注意事项：
+- **冻结的是该容器的全部进程**，不是路径 A 的单个进程；差异要在演练报告里说明
+- **sidecar 的 liveness 探针会失败** → 该容器被 kubelet 单独重启 → cgroup 目录消失、
+  故障自动结束。此时记录为「故障导致容器重启」，且**不要再写 THAWED**（路径已不存在）
+- 冻结期间 `kubectl exec -c <sidecar>` 会挂住；主容器仍可正常 exec
+- `freezer.state` 权限实测为 `-rw-r--r-- root root`，`chroot /host` 后可写
+- 路径依赖 **systemd cgroup driver**（`.slice`/`.scope` 命名）；cgroupfs driver 的路径形如
+  `/sys/fs/cgroup/freezer/kubepods/burstable/pod<UID>/<containerID>/`，
+  本用例未覆盖 —— 用步骤 2 的 `find` 实测确认后再操作
+

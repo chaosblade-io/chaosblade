@@ -57,12 +57,12 @@ kubectl get pod <pod-name> -n <namespace> \
 
 # ② 注入：起 N 个循环，PID 落盘，<duration> 秒后按 PID 文件自动 kill
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c '
-  : > /tmp/chaos_cpu.pids
+  : > /tmp/loadgen-worker.pids
   for i in $(seq 1 <N>); do
     ( while :; do :; done ) >/dev/null 2>&1 &
-    echo $! >> /tmp/chaos_cpu.pids
+    echo $! >> /tmp/loadgen-worker.pids
   done
-  ( sleep <duration>; kill $(cat /tmp/chaos_cpu.pids) 2>/dev/null; rm -f /tmp/chaos_cpu.pids ) >/dev/null 2>&1 &
+  ( sleep <duration>; kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids ) >/dev/null 2>&1 &
   echo "started <N> loops, auto-stop after <duration>s"
 '
 ```
@@ -75,7 +75,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- pkill -f stress-ng
 # shell 循环方式的恢复
 # 首选：按注入时落盘的 PID 精确 kill
 kubectl exec <pod-name> -n <namespace> -c <container> -- \
-  sh -c 'kill $(cat /tmp/chaos_cpu.pids) 2>/dev/null; rm -f /tmp/chaos_cpu.pids'
+  sh -c 'kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids'
 # 兜底1：按命令特征 kill（用 ps+kill，比 pkill 通用，精简镜像常无 pkill）
 kubectl exec <pod-name> -n <namespace> -c <container> -- \
   sh -c "ps -o pid,args 2>/dev/null | grep '[w]hile :' | awk '{print \$1}' | xargs -r kill -9"
@@ -86,6 +86,6 @@ kubectl delete pod <pod-name> -n <namespace>
 注意事项：
 - shell 循环单个只能打满单核，需按 CPU 上限计算循环数 N 才能逼近目标百分比；不足单核的精细百分比无法通过循环实现（此时应优先 stress-ng）
 - shell 循环命令必须重定向 `>/dev/null 2>&1`，否则会占住 exec 输出管道，导致 `kubectl exec` 挂起到 10s 超时（进程其实已在后台启动）
-- 自动恢复基于 PID 文件（`/tmp/chaos_cpu.pids`）+ 定时 kill，可靠；切勿用 `$(jobs -p)` 定时自杀——后台循环是父 shell 的 job，exec 会话退出后脱离子 shell 取不到这些 PID，会导致定时器失效
+- 自动恢复基于 PID 文件（`/tmp/loadgen-worker.pids`）+ 定时 kill，可靠；切勿用 `$(jobs -p)` 定时自杀——后台循环是父 shell 的 job，exec 会话退出后脱离子 shell 取不到这些 PID，会导致定时器失效
 - stress-ng 方式需容器镜像中预装该工具
 - 精度不如 ChaosBlade 的 cgroup 级 CPU 控制

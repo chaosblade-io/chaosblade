@@ -12,19 +12,19 @@
 **演练步骤**：
 1. 选取一个运行 DaemonSet Pod 的节点
 2. 使用 kubectl 将该节点标记为不可调度（cordon）：`kubectl cordon <node>`
-3. 给该节点添加一个 DaemonSet 未配置容忍的自定义污点：`kubectl taint nodes <node> chaos-drill/unschedulable=true:NoSchedule`
+3. 给该节点添加一个 DaemonSet 未配置容忍的自定义污点：`kubectl taint nodes <node> node.ops/maintenance=true:NoSchedule`
 4. 删除该节点上的 DaemonSet Pod，观察 Pod 是否被重建
 5. 观察 DaemonSet 副本数变化
 
 **注入验证**：
 1. 执行 `kubectl get nodes`，确认目标节点标记为 SchedulingDisabled
-2. 执行 `kubectl describe node <node>`，确认自定义污点 `chaos-drill/unschedulable=true:NoSchedule` 存在
+2. 执行 `kubectl describe node <node>`，确认自定义污点 `node.ops/maintenance=true:NoSchedule` 存在
 3. 执行 `kubectl get daemonset`，确认 DESIRED 与 READY 数量不一致
 4. 确认目标节点上的 DaemonSet Pod 删除后无法被重建
 
 **注入恢复**：
 1. 使用 kubectl 取消节点不可调度标记（uncordon）：`kubectl uncordon <node>`
-2. 移除自定义污点：`kubectl taint nodes <node> chaos-drill/unschedulable=true:NoSchedule-`
+2. 移除自定义污点：`kubectl taint nodes <node> node.ops/maintenance=true:NoSchedule-`
 3. 等待 DaemonSet Pod 在该节点重建
 
 **恢复验证**：

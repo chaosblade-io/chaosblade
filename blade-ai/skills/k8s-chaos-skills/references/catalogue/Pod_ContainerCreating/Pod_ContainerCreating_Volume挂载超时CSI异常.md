@@ -23,7 +23,7 @@
    apiVersion: v1
    kind: PersistentVolume
    metadata:
-     name: chaos-az-mismatch-pv
+     name: archive-vol-cn-hz-b
    spec:
      capacity:
        storage: 20Gi
@@ -44,14 +44,14 @@
    apiVersion: v1
    kind: PersistentVolumeClaim
    metadata:
-     name: chaos-csi-mismatch-pvc
+     name: archive-vol-claim
      namespace: <namespace>
    spec:
      accessModes: ["ReadWriteOnce"]
      resources:
        requests:
          storage: 20Gi
-     volumeName: chaos-az-mismatch-pv
+     volumeName: archive-vol-cn-hz-b
    ```
 3. 修改应用 A 的 Deployment，添加引用该 PVC 的 volume，并确保 Pod 调度到不同可用区的节点
 4. 等待 Pod 滚动更新完成，确认所有旧 Pod 已被替换
@@ -67,8 +67,8 @@
 **注入恢复**：
 1. 恢复应用 A 的 Deployment，移除注入时添加的 volumes 和 volumeMounts（两者都需移除，只移除其中一个会导致 Deployment 配置错误）
 2. 等待 Pod 滚动更新完成，确认 Pod 恢复 Running
-3. 清理测试 PVC：`kubectl delete pvc chaos-csi-mismatch-pvc -n <namespace>`
-4. 清理测试 PV：`kubectl delete pv chaos-az-mismatch-pv`
+3. 清理测试 PVC：`kubectl delete pvc archive-vol-claim -n <namespace>`
+4. 清理测试 PV：`kubectl delete pv archive-vol-cn-hz-b`
 
 **恢复验证**：
 1. 执行 `kubectl get pods`，确认 Pod 状态恢复为 Running

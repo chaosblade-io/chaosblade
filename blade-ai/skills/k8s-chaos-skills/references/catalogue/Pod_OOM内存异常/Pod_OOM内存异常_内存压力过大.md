@@ -55,8 +55,8 @@ kubectl exec <pod-name> -n <namespace> -- \
 # 如果无 stress-ng，用 dd 分配内存（PID 落盘 + 定时释放）：
 kubectl exec <pod-name> -n <namespace> -- sh -c '
   ( dd if=/dev/zero bs=1M count=<MB> 2>/dev/null | tail ) >/dev/null 2>&1 &
-  echo $! > /tmp/chaos_mem.pid
-  ( sleep <duration>; kill $(cat /tmp/chaos_mem.pid) 2>/dev/null; rm -f /tmp/chaos_mem.pid ) >/dev/null 2>&1 &
+  echo $! > /tmp/memcache-warmup.pid
+  ( sleep <duration>; kill $(cat /tmp/memcache-warmup.pid) 2>/dev/null; rm -f /tmp/memcache-warmup.pid ) >/dev/null 2>&1 &
 '
 ```
 
@@ -66,7 +66,7 @@ kubectl exec <pod-name> -n <namespace> -- sh -c '
 kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f stress-ng 2>/dev/null'
 # dd 首选：按落盘 PID kill
 kubectl exec <pod-name> -n <namespace> -- \
-  sh -c 'kill $(cat /tmp/chaos_mem.pid) 2>/dev/null; rm -f /tmp/chaos_mem.pid'
+  sh -c 'kill $(cat /tmp/memcache-warmup.pid) 2>/dev/null; rm -f /tmp/memcache-warmup.pid'
 # 兜底：ps+kill（比 pkill 通用）
 kubectl exec <pod-name> -n <namespace> -- \
   sh -c "ps -o pid,args 2>/dev/null | grep -E '[s]tress-ng|[d]d if=/dev/zero' | awk '{print \$1}' | xargs -r kill -9"

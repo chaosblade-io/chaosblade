@@ -23,7 +23,7 @@
 **演练步骤**：
 1. 定位目标 Pod
 2. 使用 kubectl patch 给 Pod 添加自定义 finalizer：
-   `kubectl patch pod <pod-name> -n <namespace> -p '{"metadata":{"finalizers":["example.com/block-deletion"]}}'`
+   `kubectl patch pod <pod-name> -n <namespace> -p '{"metadata":{"finalizers":["vol.ops/detach-pending"]}}'`
 3. 使用 `--wait=false` 删除 Pod，触发终止流程：
    `kubectl delete pod <pod-name> -n <namespace> --wait=false`
    > 不加 `--wait=false` 会导致 kubectl 等待删除完成，因 finalizer 阻塞而超时。
@@ -33,7 +33,7 @@
 1. 执行 `kubectl get pod <pod-name>`，确认 Pod 对象仍存在（显示 Terminating 或 Error）
 2. 执行 `kubectl get pod <pod-name> -o jsonpath='{.metadata.deletionTimestamp}'`，确认已设置
 3. 执行 `kubectl get pod <pod-name> -o jsonpath='{.metadata.finalizers}'`，确认包含注入的 finalizer
-4. 确认没有控制器在处理该 finalizer（`example.com/block-deletion` 是注入的假标识）
+4. 确认没有控制器在处理该 finalizer（`vol.ops/detach-pending` 无对应控制器，因此不会被自动清理）
 
 **注入恢复**：
 1. 移除 Pod 上的 finalizer：

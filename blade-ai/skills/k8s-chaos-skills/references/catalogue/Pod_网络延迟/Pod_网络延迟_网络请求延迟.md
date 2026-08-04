@@ -11,6 +11,7 @@
    BusyBox applet，它不支持 netem；若无可用 tc，走演练步骤 2 的路径 B）
 2. 确认目标 Pod 有对外网络调用（上下游服务、数据库等）
 3. 确认目标 Pod 名称和命名空间
+4. 确认目标节点内核支持 netem（**内核级依赖，路径 A/B 都绕不开**）：netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换 Pod / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`（临时容器载体同样可用）——有输出说明已加载；无输出**不能**判定不可行（注入时内核可能自动加载模块），记为待 Phase 2 验证的假设。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported` 即为内核不支持 netem 的确证，见演练步骤 2
 
 **演练步骤**：
 1. 确认目标 Pod 运行状态，并判定容器内的 `tc` 是不是真的能用 —— **`which tc` / `command -v tc`
@@ -67,6 +68,10 @@
    - `delay 1000ms`：固定延迟 1000 毫秒
    - 可附加抖动：`delay 1000ms 200ms`（1000±200ms）
    - `dev eth0`：通常为 Pod 主网卡，部分环境为 `eth0` 以外名称
+   - **内核级依赖（两条路径相同）**：netem 需要宿主机内核支持 sch_netem。若注入报
+     `RTNETLINK answers: Operation not supported`，即内核不支持 netem 的确证 —— 立即停止，
+     **不要重试、不要换 Pod 或重建临时容器**（内核是同一个，重试只是空转），发起 replan
+     并附上该报错证据，由 Phase 1 改选其他可行方案或判定不可行
 3. 观察应用响应时间变化
 
 **注入验证**：
@@ -88,11 +93,17 @@
    ```
    注入生效的判据：该命令由「正常返回」变为「超时失败」。放宽到 `--timeout=5` 应仍能成功，
    以此区分「延迟」和「完全不通」。
-3. 验证 HTTP 请求延迟：
+3. 量化延迟毫秒数（比步骤 2 的超时翻转更精确）：
    ```bash
-   kubectl exec <pod-name> -n <namespace> -- \
-     wget -qO- --timeout=10 -S <依赖服务地址> 2>&1 | head -5
+   # 输出丢进 /dev/null 只取耗时；两条命令按容器内可用的那个选
+   kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- \
+     curl -s -o /dev/null -w '%{time_total}' --max-time 10 <依赖服务地址>
+   kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- \
+     wget -O /dev/null --timeout=10 <依赖服务地址>
    ```
+   `time_total` 应比基线高出约注入的延迟值。**不要接管道或重定向**
+   （`| head`、`2>&1`）——只读探针会拒绝 shell 操作符，且 exec-form 下它们会被
+   当成字面参数传给命令。响应头用 `wget -S` 直接看即可，无需 `2>&1`。
 4. 检查应用日志是否出现 timeout 或 slow response 相关错误
 
 **注入恢复**：

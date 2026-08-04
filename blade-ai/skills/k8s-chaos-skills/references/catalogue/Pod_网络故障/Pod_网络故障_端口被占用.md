@@ -86,22 +86,22 @@
 kubectl exec <pod-name> -n <namespace> -- sh -c '
   kill $(fuser <port>/tcp 2>/dev/null) 2>/dev/null
   ( nc -l -p <port> -k ) >/dev/null 2>&1 &
-  echo $! > /tmp/chaos_port.pid
-  ( sleep <duration>; kill $(cat /tmp/chaos_port.pid) 2>/dev/null; rm -f /tmp/chaos_port.pid ) >/dev/null 2>&1 &
+  echo $! > /tmp/portbind-agent.pid
+  ( sleep <duration>; kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid ) >/dev/null 2>&1 &
 '
 # 如容器无 nc，可用 socat（同样重定向 + PID 落盘 + 定时自恢复）：
 kubectl exec <pod-name> -n <namespace> -- sh -c '
   kill $(fuser <port>/tcp 2>/dev/null) 2>/dev/null
   ( socat TCP-LISTEN:<port>,fork,reuseaddr /dev/null ) >/dev/null 2>&1 &
-  echo $! > /tmp/chaos_port.pid
-  ( sleep <duration>; kill $(cat /tmp/chaos_port.pid) 2>/dev/null; rm -f /tmp/chaos_port.pid ) >/dev/null 2>&1 &
+  echo $! > /tmp/portbind-agent.pid
+  ( sleep <duration>; kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid ) >/dev/null 2>&1 &
 '
 ```
 
 恢复命令：
 ```bash
 # 首选：按 PID 文件精确终止占用进程
-kubectl exec <pod-name> -n <namespace> -- sh -c 'kill $(cat /tmp/chaos_port.pid) 2>/dev/null; rm -f /tmp/chaos_port.pid'
+kubectl exec <pod-name> -n <namespace> -- sh -c 'kill $(cat /tmp/portbind-agent.pid) 2>/dev/null; rm -f /tmp/portbind-agent.pid'
 # 兜底：按命令特征 kill（用 ps+kill，比 fuser/pkill 通用，精简镜像常无 fuser）
 kubectl exec <pod-name> -n <namespace> -- sh -c \
   "ps -o pid,args 2>/dev/null | grep -E '[n]c -l|[s]ocat TCP-LISTEN' | awk '{print \$1}' | xargs -r kill -9"
@@ -112,5 +112,5 @@ kubectl delete pod <pod-name> -n <namespace>
 注意事项：
 - 大多数精简容器镜像不包含 nc/socat，可能需使用 shell 内置的重定向：`( sh -c 'exec 3<>/dev/tcp/0.0.0.0/<port>; while true; do read line <&3; done' ) >/dev/null 2>&1 &`（同样必须重定向后台化）
 - 后台占用进程必须 `>/dev/null 2>&1 &`，否则继承 exec 管道会导致 `kubectl exec` 挂起到超时（进程其实已启动）
-- 自动恢复基于 PID 文件（`/tmp/chaos_port.pid`）+ 定时 kill 补齐了 ChaosBlade `--timeout` 的自恢复能力；恢复兜底优先 `ps+kill` 而非 `fuser -k`（精简镜像常无 fuser）
+- 自动恢复基于 PID 文件（`/tmp/portbind-agent.pid`）+ 定时 kill 补齐了 ChaosBlade `--timeout` 的自恢复能力；恢复兜底优先 `ps+kill` 而非 `fuser -k`（精简镜像常无 fuser）
 - `--force` 效果通过先 `kill $(fuser <port>/tcp)` 实现，会杀死当前监听该端口的进程

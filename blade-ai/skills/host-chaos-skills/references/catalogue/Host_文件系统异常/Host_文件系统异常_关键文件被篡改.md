@@ -73,7 +73,7 @@ cp <filepath> <filepath>.bak
 truncate -s 0 <filepath>
 
 # 方式三：文件移走（同目录，避免跨文件系统）
-mv <filepath> <filepath>.chaos_bak
+mv <filepath> <filepath>.orig
 ```
 
 恢复命令：
@@ -85,7 +85,7 @@ chmod <original-mode> <filepath>
 cp <filepath>.bak <filepath>
 
 # 方式三恢复：
-mv <filepath>.chaos_bak <filepath>
+mv <filepath>.orig <filepath>
 ```
 
 注意事项：

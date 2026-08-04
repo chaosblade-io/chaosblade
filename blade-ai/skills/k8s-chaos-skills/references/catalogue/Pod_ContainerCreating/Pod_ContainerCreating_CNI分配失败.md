@@ -13,9 +13,9 @@
 1. 查看目标节点的 ENI 和 IP 分配情况，确认目标应用 Pod 所在节点（记为 `<目标节点>`）
 2. 给目标节点添加标签，并给应用 A 的 Deployment 添加 nodeSelector，确保新 Pod 只能调度到目标节点（防止调度器规避耗尽节点）：
    ```bash
-   kubectl label node <目标节点> chaos-cni-target=true
+   kubectl label node <目标节点> net.ops/ipam-audit=true
    kubectl patch deployment <deployment-name> -n <namespace> --type='merge' \
-     -p='{"spec":{"template":{"spec":{"nodeSelector":{"chaos-cni-target":"true"}}}}}'
+     -p='{"spec":{"template":{"spec":{"nodeSelector":{"net.ops/ipam-audit":"true"}}}}}'
    ```
    等待 rollout 完成（Pod 仍在原节点运行，因为目标节点已有此标签）。
    记录原始 nodeSelector 值，恢复时还原。
@@ -27,7 +27,7 @@
      params="--namespace <namespace> --node <目标节点> --kubeconfig <kubeconfig路径>"
    )
    ```
-   脚本会创建 `chaos-ip-exhaust` Deployment 并绑定到目标节点。
+   脚本会创建 `ipam-pressure-probe` Deployment 并绑定到目标节点。
 4. 删除应用 A 在目标节点上的 Pod，触发重建。由于 nodeSelector 约束，新 Pod 只能调度到已耗尽的目标节点，将进入 ContainerCreating 状态
 5. 观察新 Pod 的 ContainerCreating 状态
 
@@ -37,9 +37,9 @@
 3. 查看节点 ENI/IP 使用情况，确认资源已耗尽
 
 **注入恢复**：
-1. 删除批量创建的 Deployment：`kubectl delete deployment chaos-ip-exhaust -n <namespace>`
+1. 删除批量创建的 Deployment：`kubectl delete deployment ipam-pressure-probe -n <namespace>`
 2. 移除应用 A 的 Deployment 上添加的 nodeSelector（还原为原始值，若原本无 nodeSelector 则移除整个 nodeSelector）
-3. 移除目标节点上添加的标签：`kubectl label node <目标节点> chaos-cni-target-`
+3. 移除目标节点上添加的标签：`kubectl label node <目标节点> net.ops/ipam-audit-`
 4. 等待 IP/ENI 资源释放和 Pod 滚动更新完成
 
 **恢复验证**：

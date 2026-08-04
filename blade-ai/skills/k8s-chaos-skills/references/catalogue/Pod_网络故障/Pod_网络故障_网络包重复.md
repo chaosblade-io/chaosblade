@@ -15,6 +15,7 @@
 3. 确认监控系统可观测网络流量和包计数指标
 4. 确认有可用的 **iproute2** `tc`（见演练步骤 3 —— 精简镜像里常有同名的 BusyBox applet，它不支持 netem）
 5. 若需走临时容器路径：先确认当前集群**能拉取**一个含 iproute2 的镜像。不要假定公网镜像可用 —— 内网/离线集群常拉不到 Docker Hub，需换成集群已在使用的仓库地址
+6. 确认目标节点内核支持 netem（**内核级依赖，路径 A/B 都绕不开**）：netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换 Pod / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`（临时容器载体同样可用）——有输出说明已加载；无输出**不能**判定不可行（注入时内核可能自动加载模块），记为待 Phase 2 验证的假设。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported` 即为内核不支持 netem 的确证，见演练步骤 4
 
 **演练步骤**：
 1. 确认目标 Pod 的标签选择器和命名空间：
@@ -77,6 +78,10 @@
    - `duplicate 30%`：约 30% 的出站数据包会被复制一份重新发送
    - `eth0`：网络接口名称，根据实际情况调整（可通过 `ip link show` 确认）
    - 原理：tc netem 的 duplicate 选项对出站包进行复制，接收端会收到重复数据包
+   - **内核级依赖（两条路径相同）**：netem 需要宿主机内核支持 sch_netem。若注入报
+     `RTNETLINK answers: Operation not supported`，即内核不支持 netem 的确证 —— 立即停止，
+     **不要重试、不要换 Pod 或重建临时容器**（内核是同一个，重试只是空转），发起 replan
+     并附上该报错证据，由 Phase 1 改选其他可行方案或判定不可行
 
 5. 确认 tc 规则已生效（**用注入时同一条路径查**，因为查询也需要真 tc）：
    ```bash

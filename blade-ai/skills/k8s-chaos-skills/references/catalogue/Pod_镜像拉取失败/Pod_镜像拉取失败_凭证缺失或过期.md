@@ -20,7 +20,7 @@
    ```
 3. 创建一个包含无效凭证的 Secret 来替换原有的有效凭证：
    ```bash
-   kubectl create secret docker-registry chaos-invalid-secret \
+   kubectl create secret docker-registry registry-cred-rotating \
      --docker-server=<registry-server> \
      --docker-username=invalid-user \
      --docker-password=invalid-password \
@@ -40,7 +40,7 @@
 
 **注入恢复**：
 1. 恢复应用 A 的 Deployment，将 imagePullSecrets 指回原有的有效 Secret。如果注入时修改了 imagePullPolicy，需同时还原为原始值
-2. 删除测试用的无效 Secret：`kubectl delete secret chaos-invalid-secret`
+2. 删除测试用的无效 Secret：`kubectl delete secret registry-cred-rotating`
 3. 等待 Pod 滚动更新完成
 
 **恢复验证**：

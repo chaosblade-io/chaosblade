@@ -30,7 +30,7 @@
 3. 确认应用 A 的磁盘读写延迟增大（见下方 Pod 级验证方法）
 
 **Pod 级磁盘 IO 验证方法**：
-- 方法 1（推荐）：在目标节点上选一个 Running Pod，`kubectl exec <pod> -- dd if=/dev/zero of=/tmp/disk-io-test bs=1M count=100`，对比注入前后写入耗时
+- 方法 1（推荐）：在目标节点上选一个 Running Pod，`kubectl exec <pod> -- dd if=/dev/zero of=/tmp/.iobench.probe bs=1M count=100`，对比注入前后写入耗时
 - 方法 2：`kubectl exec <pod> -- df -h` 确认 Pod 所在容器的磁盘使用率（注意：显示的是 overlay 文件系统，非宿主机），`kubectl describe pod <pod>` 检查 Events 中是否有磁盘相关告警
 - 方法 3（容器无 dd 时）：`kubectl get events -n <ns> --field-selector involvedObject.name=<pod>` 观察是否有 IO 相关事件
 

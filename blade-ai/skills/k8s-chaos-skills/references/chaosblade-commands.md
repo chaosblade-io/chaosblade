@@ -515,7 +515,7 @@ blade create k8s pod-network drop -h
 |---------|------|
 | Pod 网络丢包(全量) | `blade create k8s pod-network drop --namespace <ns> --labels "app=<app>"` |
 | Pod 网络丢包(指定端口) | `blade create k8s pod-network drop --source-port 3306 --namespace <ns> --labels "app=<app>"` |
-| Pod DNS 故障 | `blade create k8s pod-network dns --domain example.com --ip 1.1.1.1 --namespace <ns> --labels "app=<app>"` |
+| Pod DNS 故障 | `blade create k8s pod-network dns --domain payment-api.svc.internal --ip 10.96.0.253 --namespace <ns> --labels "app=<app>"` |
 | 节点网络丢包 | `blade create k8s node-network drop --names <node>` |
 
 ### 磁盘故障类

@@ -81,8 +81,17 @@
 **降级方案（kubectl-native）**
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效进程挂起注入。
+> 两条路径按容器内是否有 `kill`/`pgrep` 二选一。
 
-前提条件：容器内需有 `kill` 和 `pgrep` 工具
+---
+
+**路径 A —— 容器内有 `kill` 和 `pgrep`**
+
+前提条件：容器内需有 `kill` 和 `pgrep` 工具。先确认：
+```bash
+kubectl exec <pod-name> -n <namespace> -- sh -c 'command -v kill; command -v pgrep'
+```
+两者都有输出才走本路径；任一缺失（distroless / scratch 等极简镜像的常态）走路径 B。
 
 注入命令：
 ```bash
@@ -101,3 +110,96 @@ kubectl exec <pod-name> -n <namespace> -- sh -c 'kill -CONT $(pgrep -f <process-
 - 无自动超时恢复机制，必须手动发送 SIGCONT 恢复
 - 若 Liveness 探针已触发容器重启，进程会自动恢复（新容器中进程正常启动）
 - 效果与 ChaosBlade 完全等价，ChaosBlade 内部也是发送 SIGSTOP/SIGCONT
+
+---
+
+**路径 B —— 容器内没有 `kill`（极简镜像）：节点侧 cgroup freezer**
+
+从节点侧冻结容器的整个 cgroup，**不需要容器内有任何二进制**。冻结范围是该容器的
+**全部进程**（而非路径 A 的单个进程），语义上更彻底。
+
+> **仅适用 cgroup v1。** 先判定版本，v2 的路径与写法完全不同（`cgroup.freeze`，写 `1`/`0`），
+> 本用例未覆盖 v2，判定为 v2 时应停止并报告不支持：
+> ```bash
+> kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+>   -- chroot /host stat -fc %T /sys/fs/cgroup
+> ```
+> 输出 `tmpfs` → cgroup v1，继续；输出 `cgroup2fs` → v2，**停止**。
+
+1. 取目标容器的 Pod UID、containerID 与 QoS class（三者都是拼路径的必需项）：
+   ```bash
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath={.metadata.uid}
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath={.status.containerStatuses[0].containerID}
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath={.status.qosClass}
+   ```
+
+2. 拼出 cgroup 路径。**三处转换必须做对，否则路径不存在**：
+   - Pod UID 里的 `-` 全部换成 `_`（`314aae5f-2566-…` → `pod314aae5f_2566_…`）
+   - containerID 去掉 `containerd://` 前缀，包成 `cri-containerd-<id>.scope`
+   - **按 QoS 插入中间层**（这是最容易漏的一层）：
+
+   | qosClass | 路径形态 |
+   | --- | --- |
+   | `BestEffort` | `kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod<UID>.slice/` |
+   | `Burstable` | `kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<UID>.slice/` |
+   | `Guaranteed` | `kubepods.slice/kubepods-pod<UID>.slice/` — **没有中间层** |
+
+   完整形态（BestEffort 示例）：
+   ```
+   /sys/fs/cgroup/freezer/kubepods.slice/kubepods-besteffort.slice/\
+   kubepods-besteffort-pod<UID_下划线>.slice/cri-containerd-<containerID>.scope/freezer.state
+   ```
+
+   拼不出来时用 containerID 直接搜（更稳，推荐先用这个拿到真实路径）：
+   ```bash
+   kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+     -- chroot /host find /sys/fs/cgroup/freezer -type d -name *<containerID前12位>*
+   ```
+
+3. 注入 —— **必须先武装定时解冻，再冻结**。顺序错了会导致容器永久冻结：
+   ```bash
+   # ⚠️ 关键顺序：先用 systemd-run 登记定时 THAWED，再写 FROZEN。
+   #    冻结后该容器无法 exec 进入（进程被冻结无法响应），且 debug pod 可能先于
+   #    解冻被删除 —— 定时器由宿主机 systemd(PID 1) 管理，不受 debug pod 生命周期影响。
+   kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+     -- chroot /host sh -c '
+       systemd-run --on-active=<recovery-seconds>s --unit=blade-thaw-<containerID前12位> \
+         sh -c "echo THAWED > <freezer.state 路径>" &&
+       echo FROZEN > <freezer.state 路径>
+     '
+   ```
+
+验证（读 `freezer.state`，不要试图 exec 进被冻结的容器）：
+```bash
+kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+  -- chroot /host cat <freezer.state 路径>
+```
+应输出 `FROZEN`。服务不可用要从**旁路**验证 —— 被冻结的容器无法 `exec` 进入，
+所以借同节点上另一个正常 Pod 去访问目标 Pod IP：
+```bash
+# 先取目标 Pod IP，再挑一个同集群的正常 Pod 作为探测源
+kubectl get pod <pod-name> -n <namespace> -o jsonpath={.status.podIP}
+kubectl exec <另一个正常Pod> -n <namespace> -- wget -qO- --timeout=5 http://<目标PodIP>:<port>
+```
+应超时或连接失败。另可从 Endpoints 侧确认它已被摘除：
+```bash
+kubectl get endpoints <service-name> -n <namespace> -o wide
+```
+
+恢复：
+```bash
+kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+  -- chroot /host sh -c 'echo THAWED > <freezer.state 路径>'
+```
+
+注意事项：
+- **冻结的是整个容器的所有进程**（实测一个容器的 cgroup 内有 3 个进程），不是单个进程；
+  这与路径 A 的语义差异要在演练报告里说明
+- **Liveness/Readiness 探针会失败** → 容器可能被 kubelet 重启 → cgroup 目录消失、故障自动结束。
+  此时应记录为「故障导致重启」，且**不要再写 THAWED**（路径已不存在，写入会报错）
+- 冻结期间 `kubectl exec <pod>` 会挂住 —— 所有验证都从节点侧或外部 Pod 做
+- `freezer.state` 权限实测为 `-rw-r--r-- root root`，`chroot /host` 后可写
+- 路径依赖 **systemd cgroup driver**（`.slice`/`.scope` 命名）。若节点用 cgroupfs driver，
+  路径形如 `/sys/fs/cgroup/freezer/kubepods/besteffort/pod<UID>/<containerID>/`，
+  本用例未覆盖 —— 用上面的 `find` 命令实测确认后再操作
+

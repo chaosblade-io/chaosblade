@@ -14,7 +14,7 @@
 2. 使用 ChaosBlade 注入 DNS 劫持
 
 ```bash
-blade create network dns --domain <target-domain> --ip <fake-ip> --timeout <duration>
+blade create network dns --domain <target-domain> --ip <redirect-ip> --timeout <duration>
 ```
 
 参数说明：
@@ -54,15 +54,15 @@ blade destroy <experiment-uid>
 ```bash
 # 在网络层把本机发出的 DNS 查询重定向到伪造的解析器。
 # 比改 /etc/hosts 覆盖面更广：绕过 hosts 的应用（自带 DNS 缓存/直连解析器的）同样受影响。
-iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination <fake-dns-ip>:53
-iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination <fake-dns-ip>:53
+iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination <redirect-dns-ip>:53
+iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination <redirect-dns-ip>:53
 ```
 
 恢复命令：
 ```bash
 # -D 与注入的 -A 参数逐字对应，是精确逆操作
-iptables -t nat -D OUTPUT -p udp --dport 53 -j DNAT --to-destination <fake-dns-ip>:53
-iptables -t nat -D OUTPUT -p tcp --dport 53 -j DNAT --to-destination <fake-dns-ip>:53
+iptables -t nat -D OUTPUT -p udp --dport 53 -j DNAT --to-destination <redirect-dns-ip>:53
+iptables -t nat -D OUTPUT -p tcp --dport 53 -j DNAT --to-destination <redirect-dns-ip>:53
 ```
 
 > 若确实要走 /etc/hosts 路线：`cp /etc/hosts /etc/hosts.bak` 备份可以执行，但追加记录需要

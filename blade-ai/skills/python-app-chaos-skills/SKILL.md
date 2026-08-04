@@ -1,7 +1,7 @@
 ---
 name: python-app-chaos-skills
 description: |
-  Python 应用层故障演练专家。当用户需要对 Python 应用做「方法级 / 依赖调用级」故障注入时使用此 skill：让应用内某个中间件调用变慢、抛异常或返回被篡改的值，用于验证应用自身的超时、重试、降级、熔断逻辑是否生效。
+  Python 应用层故障演练专家。当用户需要对 Python 应用做「方法级 / 依赖调用级」故障注入时使用此 skill：让应用内某个中间件调用变慢、抛异常或返回被篡改的值，用于验证应用自身的超时、重试、降级、熔断逻辑是否生效。适用环境：注入命令要落在目标应用所在的那台机器上，因此与主机故障一样只能在主机环境（本地或 SSH 远程的机器）执行，Kubernetes 集群环境下无法注入；此外目标应用必须已经加载了 ChaosBlade Python 探针（需要重启应用才能装上，演练过程中补不了）。这两个前提任一不满足时，应先向用户说明、不要承诺注入成功。
 
   支持的依赖:Redis、MySQL / SQLAlchemy、HTTP 客户端 requests / httpx、gRPC、Kafka;支持的故障动作:delay(延迟)、throwCustomException(抛异常)、returnValue(返回值篡改)。当前 catalogue 内置 7 个完整演练用例:Redis 延迟 / 异常 / 返回值篡改、MySQL 延迟 / 异常、HTTP 延迟 / 异常、gRPC 延迟、Kafka 异常;未覆盖的组合(如 httpx、SQLAlchemy)命令形态与之一致(只换 target / action / matcher),可参照同 action 的最接近用例执行。
 

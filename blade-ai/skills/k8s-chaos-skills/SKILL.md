@@ -5,7 +5,9 @@ description: |
 
   内置多个标准化故障注入用例，覆盖 Pod（Pending、CrashLoopBackOff、OOM、CPU 满载、内存接近 Limit、磁盘满、Terminating 卡住、镜像拉取失败等）、Workload（副本不一致、HPA 副本达到上限、DaemonSet 未完全调度）、Service（状态异常、负载均衡异常）、Node（宕机、磁盘使用率过高、磁盘 IO 过高、CPU 使用率过高、内存使用率过高）、存储（PVC 挂载 Pending）五个层级。
 
-  通过「意图识别 → 用例选择 → 意图提交」的决策树流程，精确匹配用户需求。即使用户只是笼统地说「帮我做个故障演练」或「测试下应用的容错能力」，也应该触发此 skill 引导用户完成完整流程。集群连接（kubeconfig / kubewiz 等）由运行时配置自动决定，无需在对话中向用户索要。
+  通过「意图识别 → 用例选择 → 意图提交」的决策树流程，精确匹配用户需求。集群连接（kubeconfig / kubewiz 等）由运行时配置自动决定，无需在对话中向用户索要。
+
+  适用环境：本 skill 只能在 Kubernetes 集群环境上真正注入；如果当前连接的是主机（本地或 SSH 远程的机器）而不是集群，则无法执行，应先提示用户当前环境不匹配、再引导切换到集群环境。
 
 skill_type: fault-injection
 scripts:

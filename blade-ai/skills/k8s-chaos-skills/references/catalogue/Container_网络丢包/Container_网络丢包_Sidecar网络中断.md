@@ -10,6 +10,7 @@
 1. 确认目标 Pod 包含多个容器，明确 Sidecar 容器名称
 2. 确认 Sidecar 容器监听的端口（如 istio-proxy 的 15001/15006）
 3. 确认目标 Pod 所在 namespace 和 labels
+4. 若走路径 C（tc netem）：确认目标节点内核支持 netem（**内核级依赖**）。netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换容器 / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`——有输出说明已加载；无输出**不能**判定不可行（注入时内核可能自动加载模块），记为待执行验证的假设。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported` 即为内核不支持 netem 的确证
 
 **演练步骤**：
 1. 确认 Pod 内容器列表，获取 Sidecar 容器名称：
@@ -117,6 +118,10 @@ kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev et
   拉不动时 Pod 事件会出现 `ErrImagePull` / `ImagePullBackOff`
 - `--quiet`：不进入交互附着；**不要加 `-it`**
 - 载体名形如 `debugger-xxxxx`，注入/验证/恢复三步都要用同一个
+- **内核级依赖（仅路径 C）**：netem 需要宿主机内核支持 sch_netem。若注入报
+  `RTNETLINK answers: Operation not supported`，即内核不支持 netem 的确证 —— 立即停止，
+  **不要重试、不要换容器或重建临时容器**（内核是同一个，重试只是空转），发起 replan
+  并附上该报错证据，改选 iptables 路径或判定不可行
 
 恢复命令：
 ```bash

@@ -47,12 +47,12 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- \
   sh -c 'stress-ng --cpu 0 --cpu-load <percent> --timeout <duration>s >/dev/null 2>&1 &'
 # 方式二：容器无 stress-ng，用 shell 循环（重定向避免 exec 挂起；PID 落盘定时自动 kill）
 kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c '
-  : > /tmp/chaos_cpu.pids
+  : > /tmp/loadgen-worker.pids
   for i in $(seq 1 <N>); do
     ( while :; do :; done ) >/dev/null 2>&1 &
-    echo $! >> /tmp/chaos_cpu.pids
+    echo $! >> /tmp/loadgen-worker.pids
   done
-  ( sleep <duration>; kill $(cat /tmp/chaos_cpu.pids) 2>/dev/null; rm -f /tmp/chaos_cpu.pids ) >/dev/null 2>&1 &
+  ( sleep <duration>; kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids ) >/dev/null 2>&1 &
 '
 ```
 
@@ -62,7 +62,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c '
 kubectl exec <pod-name> -n <namespace> -c <container> -- pkill -f stress-ng
 # shell 循环 首选：按注入落盘的 PID 精确 kill
 kubectl exec <pod-name> -n <namespace> -c <container> -- \
-  sh -c 'kill $(cat /tmp/chaos_cpu.pids) 2>/dev/null; rm -f /tmp/chaos_cpu.pids'
+  sh -c 'kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids'
 # 兜底：ps+kill（比 pkill 通用，精简镜像常无 pkill）
 kubectl exec <pod-name> -n <namespace> -c <container> -- \
   sh -c "ps -o pid,args 2>/dev/null | grep '[w]hile :' | awk '{print \$1}' | xargs -r kill -9"

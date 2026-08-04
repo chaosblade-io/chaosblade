@@ -17,7 +17,7 @@
 **演练步骤**：
 1. 定位应用 A 的 Pod，确认根文件系统可写：
    ```bash
-   kubectl exec <pod-name> -n <namespace> -- touch /chaos_burnio_test && rm -f /chaos_burnio_test
+   kubectl exec <pod-name> -n <namespace> -- touch /.iobench.tmp && rm -f /.iobench.tmp
    ```
 2. 使用 `blade create k8s pod-disk burn` 对目标 Pod 注入持续高 IO 负载，间接制造 IO 延迟：
    ```bash
@@ -39,7 +39,7 @@
 **注入验证**：
 1. 在 Pod 内执行写入操作，确认耗时明显增加：
    ```bash
-   kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=/chaos_iodelay_test bs=1M count=10 oflag=dsync
+   kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=/.iolatency.tmp bs=1M count=10 oflag=dsync
    ```
 2. 对比注入前后写入耗时（注入后因 IO 队列饱和，写入吞吐显著下降）
 3. 查看应用日志，确认出现 slow query 或 timeout 相关告警
@@ -57,7 +57,7 @@
 **恢复验证**：
 1. 在 Pod 内重新执行写入操作，确认耗时恢复正常：
    ```bash
-   kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=/chaos_iodelay_test bs=1M count=10 oflag=dsync
+   kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=/.iolatency.tmp bs=1M count=10 oflag=dsync
    ```
 2. 查看应用日志，确认 slow query 和 timeout 告警消失
 3. 确认应用请求延迟 P99 恢复到基线水平
@@ -80,9 +80,9 @@
 # 通过 kubectl exec 在 Pod 内持续制造 IO 负载（读写同时）
 # 关键点：子 shell 后台 + 重定向（否则 exec 挂到 10s 超时）；PID 落盘 + 定时自动 kill。
 kubectl exec <pod-name> -n <namespace> -- sh -c '
-  ( while :; do dd if=/dev/zero of=/chaos_io_load bs=1M count=100 oflag=direct 2>/dev/null; dd if=/chaos_io_load of=/dev/null bs=1M 2>/dev/null; done ) >/dev/null 2>&1 &
-  echo $! > /tmp/chaos_io.pid
-  ( sleep <duration>; kill $(cat /tmp/chaos_io.pid) 2>/dev/null; rm -f /tmp/chaos_io.pid /chaos_io_load ) >/dev/null 2>&1 &
+  ( while :; do dd if=/dev/zero of=/.iocache.dat bs=1M count=100 oflag=direct 2>/dev/null; dd if=/.iocache.dat of=/dev/null bs=1M 2>/dev/null; done ) >/dev/null 2>&1 &
+  echo $! > /tmp/iostat-sampler.pid
+  ( sleep <duration>; kill $(cat /tmp/iostat-sampler.pid) 2>/dev/null; rm -f /tmp/iostat-sampler.pid /.iocache.dat ) >/dev/null 2>&1 &
 '
 ```
 
@@ -90,14 +90,14 @@ kubectl exec <pod-name> -n <namespace> -- sh -c '
 ```bash
 # 首选：按落盘 PID 精确 kill 并清理文件
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  'kill $(cat /tmp/chaos_io.pid) 2>/dev/null; rm -f /tmp/chaos_io.pid /chaos_io_load'
+  'kill $(cat /tmp/iostat-sampler.pid) 2>/dev/null; rm -f /tmp/iostat-sampler.pid /.iocache.dat'
 # 兜底：ps+kill（比 pkill 通用）
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  "ps -o pid,args 2>/dev/null | grep '[c]haos_io_load' | awk '{print \$1}' | xargs -r kill -9; rm -f /chaos_io_load"
+  "ps -o pid,args 2>/dev/null | grep '[i]ocache.dat' | awk '{print \$1}' | xargs -r kill -9; rm -f /.iocache.dat"
 ```
 
 注意事项：
 - `oflag=direct` 绕过页缓存，确保 IO 负载直接作用于磁盘
 - 循环命令必须用子 shell 后台 + 重定向 `>/dev/null 2>&1`，否则占住 exec 输出管道导致 `kubectl exec` 挂起到 10s 超时
 - 自动恢复基于 PID 文件 + 定时 kill，可靠；切勿用 `$(jobs -p)` 定时自杀（脱离子 shell 取不到 PID）
-- 如容器无 dd 工具，可用 `cat /dev/urandom > /chaos_io` 替代（但无法控制块大小）
+- 如容器无 dd 工具，可用 `cat /dev/urandom > /.iocache.dat` 替代（但无法控制块大小）

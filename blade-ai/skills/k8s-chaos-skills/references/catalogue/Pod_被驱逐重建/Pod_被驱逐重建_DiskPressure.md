@@ -56,17 +56,17 @@
 ```bash
 # 通过 kubectl debug node 在容器运行时目录填充数据
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'dd if=/dev/zero of=/var/lib/containerd/chaos_fill bs=1M count=<size_mb>'
+  'dd if=/dev/zero of=/var/lib/containerd/app-archive.log bs=1M count=<size_mb>'
 # 或使用 fallocate（更快）：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'fallocate -l <size>G /var/lib/containerd/chaos_fill'
+  'fallocate -l <size>G /var/lib/containerd/app-archive.log'
 ```
 
 恢复命令：
 ```bash
 # 删除填充文件
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'rm -f /var/lib/containerd/chaos_fill'
+  'rm -f /var/lib/containerd/app-archive.log'
 # 删除 debug Pod
 kubectl delete pod <debug-pod-name> --force --grace-period=0
 # 清理 Evicted Pod

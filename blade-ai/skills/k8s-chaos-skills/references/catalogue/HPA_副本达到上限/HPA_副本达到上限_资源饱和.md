@@ -55,14 +55,14 @@ kubectl exec <pod-name> -n <namespace> -- sh -c 'stress-ng --cpu 0 --cpu-load 80
 # ② PID 落盘 + 按文件定时 kill 实现可靠自动恢复；③ 单核循环，多核需起多个（N）。
 # 同样对每个 Pod 各执行一次。sh -c 的载荷整体是一个参数，内部的 for/while/&
 # 由容器内的 sh 解释，不需要外层 shell。
-kubectl exec <pod-name> -n <namespace> -- sh -c ': > /tmp/chaos_cpu.pids; for i in $(seq 1 <N>); do ( while :; do :; done ) >/dev/null 2>&1 & echo $! >> /tmp/chaos_cpu.pids; done; ( sleep <duration>; kill $(cat /tmp/chaos_cpu.pids) 2>/dev/null; rm -f /tmp/chaos_cpu.pids ) >/dev/null 2>&1 &'
+kubectl exec <pod-name> -n <namespace> -- sh -c ': > /tmp/loadgen-worker.pids; for i in $(seq 1 <N>); do ( while :; do :; done ) >/dev/null 2>&1 & echo $! >> /tmp/loadgen-worker.pids; done; ( sleep <duration>; kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids ) >/dev/null 2>&1 &'
 ```
 
 恢复命令（从精确到兜底）：
 ```bash
 # 对每个 Pod 各执行一次。
 # 首选：kill stress-ng + 按 PID 文件 kill shell 循环（只杀 stress-ng 会漏掉循环）
-kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill stress-ng 2>/dev/null; kill $(cat /tmp/chaos_cpu.pids) 2>/dev/null; rm -f /tmp/chaos_cpu.pids'
+kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill stress-ng 2>/dev/null; kill $(cat /tmp/loadgen-worker.pids) 2>/dev/null; rm -f /tmp/loadgen-worker.pids'
 
 # 兜底：按命令特征 kill（ps+kill 比 pkill 通用，精简镜像常无 pkill）
 kubectl exec <pod-name> -n <namespace> -- sh -c "ps -o pid,args 2>/dev/null | grep -E '[w]hile :|[s]tress-ng' | awk '{print \$1}' | xargs -r kill -9"

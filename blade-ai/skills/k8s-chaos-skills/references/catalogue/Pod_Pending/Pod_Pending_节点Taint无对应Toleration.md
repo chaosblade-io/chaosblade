@@ -2,7 +2,7 @@
 
 **故障现象**：
 1. Pod 状态为 Pending，无法被调度到任何节点
-2. Pod Events 中显示 `N node(s) had untolerated taint {chaos-test: true}`
+2. Pod Events 中显示 `N node(s) had untolerated taint {node.ops/pending-reboot: true}`
 3. 目标 Pod 可调度的所有节点均带有 Pod 无法容忍的污点
 
 **RCA症状**：
@@ -29,24 +29,24 @@
    kubectl patch deployment <deployment-name> -n <namespace> --type='json' \
      -p='[{"op":"replace","path":"/spec/strategy/rollingUpdate/maxUnavailable","value":"100%"}]'
    ```
-3. 给目标节点添加标签：`kubectl label node <node> chaos-target=<app-name>`（仅目标 Pod 所在节点）
+3. 给目标节点添加标签：`kubectl label node <node> workload-affinity=<app-name>`（仅目标 Pod 所在节点）
 4. 给应用 A 的 Deployment 添加 nodeSelector，约束 Pod 只能调度到目标节点：
-   `kubectl patch deployment <name> -n <ns> -p '{"spec":{"template":{"spec":{"nodeSelector":{"chaos-target":"<app-name>"}}}}}'`
+   `kubectl patch deployment <name> -n <ns> -p '{"spec":{"template":{"spec":{"nodeSelector":{"workload-affinity":"<app-name>"}}}}}'`
 5. 等待 rollout 完成（Pod 仍在原节点上运行，因为只有目标节点有此标签）
 6. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段）
-7. 给目标节点添加污点：`kubectl taint node <node> chaos-test=true:NoSchedule`（仅目标节点）
+7. 给目标节点添加污点：`kubectl taint node <node> node.ops/pending-reboot=true:NoSchedule`（仅目标节点）
 8. 删除应用 A 的一个 Pod，触发重建调度
 9. 观察新 Pod 的调度状态
 
 **注入验证**：
 1. 执行 `kubectl get pods`，确认新 Pod 状态为 Pending
-2. 执行 `kubectl describe pod <pod-name>`，确认 Events 中显示 `had untolerated taint {chaos-test: true}`
-3. 确认目标节点均有 chaos-test taint
+2. 执行 `kubectl describe pod <pod-name>`，确认 Events 中显示 `had untolerated taint {node.ops/pending-reboot: true}`
+3. 确认目标节点均有 node.ops/pending-reboot taint
 
 **注入恢复**：
-1. 移除目标节点上添加的污点：`kubectl taint node <node> chaos-test=true:NoSchedule-`
-2. 移除 Deployment 的 nodeSelector 中添加的 chaos-target 键（若原 Deployment 无 nodeSelector，则移除整个 nodeSelector）
-3. 移除目标节点上添加的标签：`kubectl label node <node> chaos-target-`
+1. 移除目标节点上添加的污点：`kubectl taint node <node> node.ops/pending-reboot=true:NoSchedule-`
+2. 移除 Deployment 的 nodeSelector 中添加的 workload-affinity 键（若原 Deployment 无 nodeSelector，则移除整个 nodeSelector）
+3. 移除目标节点上添加的标签：`kubectl label node <node> workload-affinity-`
 4. 等待 Pod 滚动更新完成
 
 **恢复验证**：

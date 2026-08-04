@@ -15,9 +15,9 @@
 2. 选择目标节点，删除该节点上的 kube-proxy Pod 并临时阻止重建（通过 cordon 节点或修改 DaemonSet nodeSelector）：
    ```bash
    # 方式A：给目标节点添加标签排除 kube-proxy 调度
-   kubectl label node <目标节点> chaos-no-proxy=true
+   kubectl label node <目标节点> net.ops/proxy-degraded=true
    kubectl patch ds kube-proxy -n kube-system \
-     -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"chaos-no-proxy","operator":"DoesNotExist"}]}]}}}}}}}'
+     -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"net.ops/proxy-degraded","operator":"DoesNotExist"}]}]}}}}}}}'
    ```
    或者直接使用 chaosblade 杀掉 kube-proxy 进程：
    ```bash
@@ -38,7 +38,7 @@
 **注入恢复**：
 1. 若使用标签方式：移除节点标签并恢复 DaemonSet 配置：
    ```bash
-   kubectl label node <目标节点> chaos-no-proxy-
+   kubectl label node <目标节点> net.ops/proxy-degraded-
    kubectl patch ds kube-proxy -n kube-system --type=json \
      -p='[{"op":"remove","path":"/spec/template/spec/affinity"}]'
    ```
@@ -65,9 +65,9 @@
 注入命令：
 ```bash
 # 方式A：通过标签排除目标节点上的 kube-proxy 调度
-kubectl label node <目标节点> chaos-no-proxy=true
+kubectl label node <目标节点> net.ops/proxy-degraded=true
 kubectl patch ds kube-proxy -n kube-system \
-  -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"chaos-no-proxy","operator":"DoesNotExist"}]}]}}}}}}'
+  -p '{"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"net.ops/proxy-degraded","operator":"DoesNotExist"}]}]}}}}}}'
 # 方式B：通过 kubectl debug node 挂起 kube-proxy 进程
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
   'kill -STOP $(pidof kube-proxy)'
@@ -76,7 +76,7 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-imag
 恢复命令：
 ```bash
 # 方式A：移除标签并恢复 DaemonSet
-kubectl label node <目标节点> chaos-no-proxy-
+kubectl label node <目标节点> net.ops/proxy-degraded-
 kubectl patch ds kube-proxy -n kube-system --type=json \
   -p='[{"op":"remove","path":"/spec/template/spec/affinity"}]'
 # 方式B：恢复 kube-proxy 进程

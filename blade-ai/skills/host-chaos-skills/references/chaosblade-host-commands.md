@@ -114,7 +114,7 @@ DNS 劫持实验。
 
 示例：
 ```bash
-blade create network dns --domain api.example.com --ip 10.0.0.1 --timeout 60
+blade create network dns --domain payment-api.svc.internal --ip 10.96.0.253 --timeout 60
 ```
 
 ### `blade create network drop`
@@ -134,7 +134,7 @@ blade create network dns --domain api.example.com --ip 10.0.0.1 --timeout 60
 ```bash
 blade create network drop --destination-ip 10.0.0.5 --network-traffic out --timeout 60
 blade create network drop --destination-port 3306 --network-traffic out --timeout 120
-blade create network drop --string-pattern "mysql.example.com" --network-traffic out --timeout 60
+blade create network drop --string-pattern "mysql-primary.db.internal" --network-traffic out --timeout 60
 ```
 
 ### `blade create network occupy`

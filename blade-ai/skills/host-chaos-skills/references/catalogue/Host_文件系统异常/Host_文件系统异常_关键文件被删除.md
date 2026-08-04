@@ -56,13 +56,13 @@ blade destroy <experiment-uid>
 ```bash
 # 移走而非删除：原文件即备份，同文件系统内为原子操作，不存在
 # 「备份成功但删除失败」或「备份失败却已删除」的中间态
-mv <filepath> <filepath>.chaos_bak
+mv <filepath> <filepath>.orig
 ```
 
 恢复命令：
 ```bash
 # 移回原路径，不留残留备份文件
-mv <filepath>.chaos_bak <filepath>
+mv <filepath>.orig <filepath>
 ```
 
 注意事项：

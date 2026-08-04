@@ -16,7 +16,7 @@
    apiVersion: v1
    kind: Pod
    metadata:
-     name: chaos-volume-holder
+     name: vol-attach-checker
      namespace: <namespace>
    spec:
      nodeName: <另一节点>
@@ -41,7 +41,7 @@
 3. 确认 PV 仍 attach 在占用它的节点上
 
 **注入恢复**：
-1. 删除临时 Pod：`kubectl delete pod chaos-volume-holder --force --grace-period=0`
+1. 删除临时 Pod：`kubectl delete pod vol-attach-checker --force --grace-period=0`
 2. 等待云盘从原节点 detach
 3. 等待应用 A 的 Pod 自动完成 volume attach
 

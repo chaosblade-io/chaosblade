@@ -22,11 +22,11 @@
    apiVersion: v1
    kind: PersistentVolumeClaim
    metadata:
-     name: chaos-test-pvc
+     name: app-data-claim
      namespace: <namespace>
    spec:
      accessModes: ["ReadWriteOnce"]
-     storageClassName: "non-existent-sc"
+     storageClassName: "ssd-retain-zone-c"
      resources:
        requests:
          storage: 10Gi
@@ -41,16 +41,16 @@
 2. 执行 `kubectl get pvc`，确认 PVC 状态为 Pending
 3. 执行 `kubectl get pods`，确认**所有**目标 Pod 状态为 Pending（不是仅一个新 Pod，而是全部副本）
 4. 执行 `kubectl describe pod <pod-name>`，确认 Events 显示 unbound PVC 相关信息
-5. 执行 `kubectl describe pvc chaos-test-pvc`，确认 StorageClass 不存在或 Provisioner 异常
+5. 执行 `kubectl describe pvc app-data-claim`，确认 StorageClass 不存在或 Provisioner 异常
 
 **注入恢复**：
-1. 恢复应用 A 的 Deployment 定义，移除引用 chaos-test-pvc 的 volume
-2. 删除测试用 PVC：`kubectl delete pvc chaos-test-pvc`
+1. 恢复应用 A 的 Deployment 定义，移除引用 app-data-claim 的 volume
+2. 删除注入时创建的 PVC：`kubectl delete pvc app-data-claim`
 3. 等待 Pod 滚动更新完成
 
 **恢复验证**：
 1. 执行 `kubectl get pods`，确认 Pod 状态恢复为 Running
-2. 确认测试 PVC 已被清理
+2. 确认注入时创建的 PVC 已被清理
 
 **基准事实**：
 - **根因**：Pod 引用的 PVC 无法绑定，原因为 StorageClass 不存在或 Provisioner 异常，导致 Pod 无法挂载所需存储卷而 Pending

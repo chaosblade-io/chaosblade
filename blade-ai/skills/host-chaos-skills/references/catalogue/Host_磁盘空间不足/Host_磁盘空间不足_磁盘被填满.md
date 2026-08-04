@@ -57,15 +57,15 @@ blade destroy <experiment-uid>
 注入命令：
 ```bash
 # 使用 fallocate 快速创建大文件（推荐，速度快）
-fallocate -l <size>G <path>/chaos_fill_file
+fallocate -l <size>G <path>/app-archive.dat
 
 # 或使用 dd（较慢但兼容性好）
-dd if=/dev/zero of=<path>/chaos_fill_file bs=1M count=<size_in_MB>
+dd if=/dev/zero of=<path>/app-archive.dat bs=1M count=<size_in_MB>
 ```
 
 恢复命令：
 ```bash
-truncate -s 0 <path>/chaos_fill_file
+truncate -s 0 <path>/app-archive.dat
 ```
 
 注意事项：

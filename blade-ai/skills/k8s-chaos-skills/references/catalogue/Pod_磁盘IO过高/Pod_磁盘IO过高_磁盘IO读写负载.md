@@ -12,7 +12,7 @@
 3. 确认监控系统可观测 Pod 级磁盘 IO 指标
 
 **演练步骤**：
-1. 定位应用 A 的 Pod，确认根文件系统路径可写：`kubectl exec <pod> -n <namespace> -- touch /chaos_burnio_test && rm -f /chaos_burnio_test`
+1. 定位应用 A 的 Pod，确认根文件系统路径可写：`kubectl exec <pod> -n <namespace> -- touch /.iobench.tmp && rm -f /.iobench.tmp`
 2. 使用 chaosblade 对目标 Pod 注入磁盘 IO 读写负载：
    ```bash
    blade create k8s pod-disk burn \
@@ -64,16 +64,16 @@
 # 关键点：循环用子 shell 后台 + 重定向（否则 exec 挂到 10s 超时）；PID 落盘 + 定时自动 kill。
 # 读压力（先造 500MB 源文件再循环读）：
 kubectl exec <pod-name> -n <namespace> -- sh -c '
-  dd if=/dev/zero of=/chaos_burnio.read bs=1M count=500 2>/dev/null
-  ( while :; do dd if=/chaos_burnio.read of=/dev/null bs=1M count=100 2>/dev/null; done ) >/dev/null 2>&1 &
-  echo $! > /tmp/chaos_ioread.pid
-  ( sleep <duration>; kill $(cat /tmp/chaos_ioread.pid) 2>/dev/null; rm -f /tmp/chaos_ioread.pid /chaos_burnio.read ) >/dev/null 2>&1 &
+  dd if=/dev/zero of=/.iobench.read.dat bs=1M count=500 2>/dev/null
+  ( while :; do dd if=/.iobench.read.dat of=/dev/null bs=1M count=100 2>/dev/null; done ) >/dev/null 2>&1 &
+  echo $! > /tmp/iostat-reader.pid
+  ( sleep <duration>; kill $(cat /tmp/iostat-reader.pid) 2>/dev/null; rm -f /tmp/iostat-reader.pid /.iobench.read.dat ) >/dev/null 2>&1 &
 '
 # 写压力：
 kubectl exec <pod-name> -n <namespace> -- sh -c '
-  ( while :; do dd if=/dev/zero of=/chaos_burnio.write bs=1M count=100 2>/dev/null && rm -f /chaos_burnio.write; done ) >/dev/null 2>&1 &
-  echo $! > /tmp/chaos_iowrite.pid
-  ( sleep <duration>; kill $(cat /tmp/chaos_iowrite.pid) 2>/dev/null; rm -f /tmp/chaos_iowrite.pid /chaos_burnio.write ) >/dev/null 2>&1 &
+  ( while :; do dd if=/dev/zero of=/.iobench.write.dat bs=1M count=100 2>/dev/null && rm -f /.iobench.write.dat; done ) >/dev/null 2>&1 &
+  echo $! > /tmp/iostat-writer.pid
+  ( sleep <duration>; kill $(cat /tmp/iostat-writer.pid) 2>/dev/null; rm -f /tmp/iostat-writer.pid /.iobench.write.dat ) >/dev/null 2>&1 &
 '
 ```
 
@@ -81,7 +81,7 @@ kubectl exec <pod-name> -n <namespace> -- sh -c '
 ```bash
 # 首选：按落盘 PID 精确 kill 并清理文件
 kubectl exec <pod-name> -n <namespace> -- sh -c \
-  'kill $(cat /tmp/chaos_ioread.pid /tmp/chaos_iowrite.pid) 2>/dev/null; rm -f /tmp/chaos_ioread.pid /tmp/chaos_iowrite.pid /chaos_burnio.read /chaos_burnio.write'
+  'kill $(cat /tmp/iostat-reader.pid /tmp/iostat-writer.pid) 2>/dev/null; rm -f /tmp/iostat-reader.pid /tmp/iostat-writer.pid /.iobench.read.dat /.iobench.write.dat'
 # 兜底：ps+kill（比 pkill 通用）
 kubectl exec <pod-name> -n <namespace> -- sh -c \
   "ps -o pid,args 2>/dev/null | grep '[d]d if=' | awk '{print \$1}' | xargs -r kill -9"

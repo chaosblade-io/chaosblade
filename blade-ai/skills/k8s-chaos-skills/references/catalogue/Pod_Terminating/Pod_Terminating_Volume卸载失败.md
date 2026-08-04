@@ -65,14 +65,14 @@ kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-imag
   chroot /host timeout <duration> tail -f <volume-mount-path>/some-file
 # 方式二：持续读写占用磁盘 IO（用 timeout 让循环到点自停）：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'timeout <duration> sh -c "while true; do dd if=/dev/urandom of=<volume-mount-path>/chaos_busy bs=1M count=10; done"'
+  'timeout <duration> sh -c "while true; do dd if=/dev/urandom of=<volume-mount-path>/.mountlock.dat bs=1M count=10; done"'
 ```
 
 恢复命令：
 ```bash
 # 占用进程会在 <duration> 到期后自动结束；如需立即释放：
 kubectl debug node/<node-name> --profile=sysadmin --image=<verified-cluster-image> -- chroot /host sh -c \
-  'fuser -k <volume-mount-path>; rm -f <volume-mount-path>/chaos_busy'
+  'fuser -k <volume-mount-path>; rm -f <volume-mount-path>/.mountlock.dat'
 # 清理 debug Pod
 kubectl delete pod <debug-pod-name> --force --grace-period=0
 # 等待 kubelet 自动重试 unmount
