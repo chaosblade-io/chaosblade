@@ -86,7 +86,7 @@ def test_includes_plan_summary_first_line():
         "target": {"namespace": "reg-center", "names": ["registry-sts"]},
         "plan_summary": "将 StatefulSet registry-sts 镜像改为无效值\n第二行应被忽略",
     })
-    assert "描述: 将 StatefulSet registry-sts 镜像改为无效值" in line
+    assert "description: 将 StatefulSet registry-sts 镜像改为无效值" in line
     assert "第二行应被忽略" not in line
 
 

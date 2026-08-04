@@ -7,6 +7,28 @@ import pytest
 from chaos_agent.server.app import TaskTracker, create_app
 
 
+def _all_route_paths(routes) -> list[str]:
+    """Collect every route path, flattening included routers / mounts.
+
+    ``app.routes`` differs across FastAPI/Starlette versions: older builds
+    flatten ``include_router`` into ``APIRoute`` objects that each carry a
+    ``.path``; newer builds keep an ``_IncludedRouter`` (or ``Mount``) wrapper
+    that has NO ``.path`` and nests the real routes under ``.routes``. Iterating
+    ``route.path`` directly then raises ``AttributeError`` on the wrapper. Walk
+    recursively so both shapes yield the same flat list of paths — this keeps
+    the test green whether or not CI pins deps via ``uv sync --frozen``.
+    """
+    paths: list[str] = []
+    for route in routes:
+        path = getattr(route, "path", None)
+        if path is not None:
+            paths.append(path)
+        sub = getattr(route, "routes", None)
+        if sub:
+            paths.extend(_all_route_paths(sub))
+    return paths
+
+
 class TestTaskTracker:
     """Tests for TaskTracker."""
 
@@ -87,17 +109,17 @@ class TestCreateApp:
 
     def test_app_has_routes(self):
         app = create_app()
-        routes = [route.path for route in app.routes]
+        routes = _all_route_paths(app.routes)
         assert any("/api/v1" in r for r in routes)
 
     def test_health_endpoint_exists(self):
         app = create_app()
-        routes = [route.path for route in app.routes]
+        routes = _all_route_paths(app.routes)
         assert "/api/v1/health" in routes
 
     def test_version_endpoint_exists(self):
         app = create_app()
-        routes = [route.path for route in app.routes]
+        routes = _all_route_paths(app.routes)
         assert "/api/v1/version" in routes
 
 

@@ -58,6 +58,54 @@ def test_host_execute_hides_k8s_provider_tools():
     assert "kubectl" not in context.prompt_fragment().lower()
 
 
+def _execute_visible(state: dict, names: list[str]) -> set[str]:
+    FaultProviderRegistry.register_builtins()
+    tools = [_tool(n) for n in names]
+    context = build_capability_context(state, "execute", tools)
+    return {t.name for t in filter_tools_for_context(tools, context)}
+
+
+_BLADE_EXECUTE_TOOLS = [
+    "blade_create", "blade_destroy", "blade_help", "blade_status", "blade_query_k8s",
+]
+
+
+def test_host_execute_hides_blade_query_k8s():
+    """``blade_query_k8s`` queries a cluster CRD that host scope does not have.
+
+    Its owner (ChaosbladeProvider) legitimately accepts host — ``blade create cpu
+    load`` runs on a bare machine — so provider-level matching alone let this
+    k8s-only tool onto the host tool surface. The tool itself refuses there and
+    host Layer 1 skips it, so binding it to a host turn only spends context and
+    invites a round wasted on a refusal.
+    """
+    visible = _execute_visible(
+        {"fault_spec": {"scope": "host"}, "kube_connection_mode": "ssh",
+         "ssh_host": "host.example"},
+        _BLADE_EXECUTE_TOOLS,
+    )
+    assert "blade_query_k8s" not in visible
+    # The rest of the blade family stays: those DO work on a bare host.
+    assert {"blade_create", "blade_destroy", "blade_help", "blade_status"} <= visible
+
+
+def test_k8s_execute_still_shows_blade_query_k8s():
+    visible = _execute_visible({"fault_spec": {"scope": "pod"}}, _BLADE_EXECUTE_TOOLS)
+    assert "blade_query_k8s" in visible
+
+
+def test_k8s_only_gate_also_applies_to_runtime_screening():
+    """Visibility and the screener must agree, or a restored checkpoint's call
+    would be executed for a tool the current turn was never shown."""
+    host_state = {"fault_spec": {"scope": "host"}, "kube_connection_mode": "ssh",
+                  "ssh_host": "host.example"}
+    assert is_tool_name_allowed_for_context("blade_query_k8s", host_state, "execute") is False
+    assert is_tool_name_allowed_for_context("blade_status", host_state, "execute") is True
+    assert is_tool_name_allowed_for_context(
+        "blade_query_k8s", {"fault_spec": {"scope": "pod"}}, "execute",
+    ) is True
+
+
 def test_k8s_execute_hides_host_shell_tools():
     FaultProviderRegistry.register_builtins()
     tools = [

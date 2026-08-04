@@ -20,10 +20,34 @@ import logging
 from langchain_core.messages import AIMessage
 
 from chaos_agent.agent.state import AgentState
+from chaos_agent.memory.tui_session_store import persist_node_dialogue
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
 from chaos_agent.persistence.task_store import get_task_store
 
 logger = logging.getLogger(__name__)
+
+
+async def _announce(state: AgentState, msg: str) -> AIMessage:
+    """Show *msg* in the TUI, record it on disk, and return it for graph state.
+
+    This node speaks to the user directly instead of through an LLM reply, so it
+    owns all three outlets. Persistence is its own job: the next
+    ``intent_clarification`` turn rebuilds its persist list from scratch and only
+    back-fills ToolMessages from history, and the turn-level fallback in
+    ``session_finalizer`` reaches the session file only for the CLI runner (the
+    server route passes no ``tui_session_store`` and is gated on an operational
+    ``task_id`` that a recovery lookup turn does not have).
+
+    Display failures stay non-fatal — the verdict is already decided.
+    """
+    try:
+        from chaos_agent.agent.dispatch import dispatch_node_message
+        await dispatch_node_message("recover_handler", msg)
+    except Exception:  # noqa: BLE001
+        pass
+    message = AIMessage(content=msg)
+    persist_node_dialogue(state.get("tui_session_id", ""), [message])
+    return message
 
 
 async def recover_handler(state: AgentState) -> dict:
@@ -41,7 +65,7 @@ async def recover_handler(state: AgentState) -> dict:
     if existing_recover_tid:
         tracker = get_tracker(task_id) if task_id else None
         if tracker:
-            tracker.start(StatusCategory.NODE, "recover_handler", "已有恢复目标")
+            tracker.start(StatusCategory.NODE, "recover_handler", "Recovery target already set")
             tracker.complete(f"pass-through → {existing_recover_tid}")
         return {
             "operation": "recover",
@@ -51,28 +75,23 @@ async def recover_handler(state: AgentState) -> dict:
     # Manual tracker for observability
     tracker = get_tracker(task_id) if task_id else None
     if tracker:
-        tracker.start(StatusCategory.NODE, "recover_handler", "查询活跃实验...")
+        tracker.start(StatusCategory.NODE, "recover_handler", "Querying active experiments...")
 
     # Query active (injecting/injected) experiments from task_store
     try:
         store = await get_task_store()
-        # 多租户隔离：仅查询当前租户的活跃实验
+        # Multi-tenant isolation: only query the current tenant's active experiments
         _tenant_id = state.get("tenant_id", "") or ""
         active_tasks = await store.query_active(tenant_id=_tenant_id)
 
         if not active_tasks:
-            msg = "当前没有活跃的故障注入实验，无需恢复。"
+            msg = "There are no active fault-injection experiments, so there is nothing to recover."
             if tracker:
-                tracker.update("无活跃实验")
+                tracker.update("No active experiments")
                 tracker.complete()
-            try:
-                from chaos_agent.agent.dispatch import dispatch_node_message
-                await dispatch_node_message("recover_handler", msg)
-            except Exception:
-                pass
             return {
                 "operation": "recover",
-                "messages": [AIMessage(content=msg)],
+                "messages": [await _announce(state, msg)],
                 "result": {"status": "completed", "message": msg},
             }
 
@@ -94,52 +113,42 @@ async def recover_handler(state: AgentState) -> dict:
             tid = selected.get("task_id", "?")
             fault = selected.get("fault_type", "unknown")
             ns = (selected.get("target") or {}).get("namespace", "unknown")
-            msg = f"检测到 1 个活跃实验 ({tid}，故障类型: {fault}，命名空间: {ns})，已自动选择恢复。"
+            msg = f"Found 1 active experiment ({tid}, fault type: {fault}, namespace: {ns}); selected it for recovery automatically."
             if tracker:
-                tracker.update(f"自动选择实验 {tid}")
+                tracker.update(f"Auto-selected experiment {tid}")
                 tracker.complete()
-            try:
-                from chaos_agent.agent.dispatch import dispatch_node_message
-                await dispatch_node_message("recover_handler", msg)
-            except Exception:
-                pass
             return {
                 "operation": "recover",
                 "recover_task_id": tid,
                 "blade_uid": selected.get("blade_uid"),
-                "messages": [AIMessage(content=msg)],
+                "messages": [await _announce(state, msg)],
                 "result": {"status": "completed", "message": msg, "recover_task_id": tid},
             }
 
         # Multiple active experiments — list them for user selection
         if tracker:
-            tracker.update(f"检测到 {len(enriched)} 个活跃实验，等待用户选择")
+            tracker.update(f"Found {len(enriched)} active experiments, waiting for the user to choose")
             tracker.complete()
-        lines = ["检测到多个活跃实验，请选择要恢复的实验：\n"]
+        lines = ["Found multiple active experiments. Choose which one to recover:\n"]
         from chaos_agent.agent.experiment_display import format_experiment_line
         for i, t in enumerate(enriched[:10], 1):
             lines.append(format_experiment_line(i, t))
-        lines.append("\n请回复编号或 task_id 来选择要恢复的实验。")
+        lines.append("\nReply with the number or the task_id of the experiment to recover.")
         msg = "\n".join(lines)
 
-        try:
-            from chaos_agent.agent.dispatch import dispatch_node_message
-            await dispatch_node_message("recover_handler", msg)
-        except Exception:
-            pass
         return {
             "operation": "recover",
             "needs_task_selection": True,
-            "messages": [AIMessage(content=msg)],
+            "messages": [await _announce(state, msg)],
         }
 
     except Exception as e:
         logger.error(f"recover_handler failed: {e}")
         if tracker:
-            tracker.fail(f"查询活跃实验失败: {e}")
-        msg = f"查询活跃实验失败: {e}"
+            tracker.fail(f"Failed to query active experiments: {e}")
+        msg = f"Failed to query active experiments: {e}"
         return {
             "operation": "recover",
-            "messages": [AIMessage(content=msg)],
+            "messages": [await _announce(state, msg)],
             "result": {"status": "failed", "message": msg},
         }

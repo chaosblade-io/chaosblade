@@ -53,7 +53,7 @@ async def se_detect_node(state: AgentState) -> dict:
 
     tracker = get_tracker(task_id)
     tracker.start(StatusCategory.NODE, "se_detect", "Detecting post-injection side effects")
-    await dispatch_node_message("se_detect", "正在检测注入副作用...\n\n")
+    await dispatch_node_message("se_detect", "Detecting injection side effects...\n\n")
 
     snapshot_dict = state.get("se_snapshot")
     snapshot = SideEffectSnapshot.from_dict(snapshot_dict) if snapshot_dict else None
@@ -68,12 +68,12 @@ async def se_detect_node(state: AgentState) -> dict:
     except asyncio.TimeoutError:
         logger.warning("se_detect: fetch_post_inject_state timed out after %.0fs", _DETECT_TIMEOUT)
         tracker.complete("Side-effect detection timed out")
-        await dispatch_node_message("se_detect", "副作用检测超时\n\n")
+        await dispatch_node_message("se_detect", "Side-effect detection timed out\n\n")
         return {}
     except Exception as e:
         logger.warning("se_detect: fetch failed: %s", e)
         tracker.complete(f"Side-effect detection fetch failed: {e}")
-        await dispatch_node_message("se_detect", f"副作用检测失败: {e}\n\n")
+        await dispatch_node_message("se_detect", f"Side-effect detection failed: {e}\n\n")
         return {}
 
     ctx = DetectionContext(
@@ -97,7 +97,7 @@ async def se_detect_node(state: AgentState) -> dict:
     if not detected:
         logger.info("se_detect: no incremental side-effects detected")
         tracker.complete("No incremental side-effects detected")
-        await dispatch_node_message("se_detect", "未检测到增量副作用\n\n")
+        await dispatch_node_message("se_detect", "No incremental side effects detected\n\n")
         sync_node_status_to_session(
             state, "se_detect", "No side-effects detected",
         )
@@ -115,7 +115,7 @@ async def se_detect_node(state: AgentState) -> dict:
         f"Detected {total_items} side-effect(s): {', '.join(categories)}",
         {"total": total_items, "categories": categories, "details": detected},
     )
-    await dispatch_node_message("se_detect", f"检测到 {total_items} 个副作用: {', '.join(categories)}\n\n")
+    await dispatch_node_message("se_detect", f"{total_items} side effect(s) detected: {', '.join(categories)}\n\n")
     sync_node_status_to_session(
         state, "se_detect",
         f"Detected {total_items} side-effect(s) in {len(categories)} categories: {categories}",

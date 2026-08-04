@@ -12,6 +12,7 @@ from chaos_agent.agent.nodes.verify._verifier_layer1 import (
     _map_query_k8s_to_layer1,
     _QueryK8sResult,
 )
+from chaos_agent.agent.result.verdict import Layer1Result, Layer1Status
 
 
 class TestParseBladeStatusOutput:
@@ -45,6 +46,44 @@ class TestParseBladeStatusOutput:
         assert status == "failed"
         assert not expired
 
+    def test_initialized_is_a_setup_phase_not_a_verdict(self):
+        """``Initialized`` means the Operator has not reconciled the CRD yet.
+
+        The exact payload from task-fc64c982: the CRD exists, ``success`` is
+        true, and ``statuses`` is empty because reconciliation has not started.
+        Reading that as ``failed`` reported a drill that had already stopped
+        containerd (node went Ready→NotReady, confirmed in the same run) as a
+        failure — and because ``failed`` is terminal, Layer 2 never ran to say
+        otherwise.
+        """
+        raw = json.dumps({
+            "code": 200, "success": True,
+            "result": {"error": "", "phase": "Initialized", "statuses": [],
+                       "success": True, "uid": "dea3008a9cc9f817"},
+        })
+        status, details, expired = _parse_blade_status_output(raw)
+        assert status == "warning"
+        assert not expired
+        assert "Layer 2" in details
+
+    def test_creating_is_also_a_setup_phase(self):
+        raw = json.dumps({"code": 200, "success": True, "result": {"phase": "Creating"}})
+        status, _, expired = _parse_blade_status_output(raw)
+        assert status == "warning"
+        assert not expired
+
+    def test_a_setup_phase_keeps_layer2_in_play(self):
+        """The point of ``warning`` over ``failed``: it is not terminal."""
+        raw = json.dumps({"code": 200, "success": True, "result": {"phase": "Initialized"}})
+        status, _, _ = _parse_blade_status_output(raw)
+        assert Layer1Result(status=Layer1Status(status)).is_terminal() is False
+
+    def test_an_unknown_phase_still_fails_closed(self):
+        """Only the enumerated setup phases are exempt."""
+        raw = json.dumps({"code": 200, "success": True, "result": {"phase": "WhatIsThis"}})
+        status, _, _ = _parse_blade_status_output(raw)
+        assert status == "failed"
+
     def test_non_dict_result_means_success(self):
         raw = json.dumps({"code": 200, "success": True, "result": "abc123uid"})
         status, details, expired = _parse_blade_status_output(raw)
@@ -61,9 +100,27 @@ class TestParseBladeStatusOutput:
         assert status == "failed"
 
     def test_transient_please_wait(self):
+        """Both transient signals present — either branch must reach ``warning``.
+
+        This fixture carries ``Status: Initialized`` AND ``Error: please wait``,
+        so the setup-phase check now answers first. The verdict is what matters;
+        asserting the exact wording tied the test to whichever branch happened to
+        run, which is why adding the setup-phase check broke it.
+        """
         raw = json.dumps({
             "code": 200, "success": True,
             "result": {"Status": "Initialized", "Error": "please wait, preparing"},
+        })
+        status, details, expired = _parse_blade_status_output(raw)
+        assert status == "warning"
+        assert not expired
+        assert "Layer 2" in details
+
+    def test_please_wait_alone_is_transient(self):
+        """``please wait`` without a setup phase still defers to Layer 2."""
+        raw = json.dumps({
+            "code": 200, "success": True,
+            "result": {"Status": "Whatever", "Error": "please wait, preparing"},
         })
         status, details, expired = _parse_blade_status_output(raw)
         assert status == "warning"

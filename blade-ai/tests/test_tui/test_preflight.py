@@ -395,7 +395,7 @@ class TestSshModeLiveExemption:
             r = await check_k8s_connectivity()
         assert r.name == "host_connectivity"
         assert r.passed is False
-        assert "不可达" in r.message
+        assert "unreachable" in r.message
 
     async def test_operator_skipped_for_ssh(self, monkeypatch):
         from chaos_agent.config import settings as _settings_mod
@@ -585,7 +585,7 @@ class TestRunTuiChecks:
             tui_preflight, "check_transport_config",
             lambda: CheckResult(
                 name="transport_config", severity="blocking", passed=False,
-                message="ssh 通道配置缺失: ssh_host",
+                message="ssh channel configuration is incomplete: ssh_host",
             ),
         )
         monkeypatch.setattr(

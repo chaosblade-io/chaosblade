@@ -179,7 +179,7 @@ class _L4RecoveryMixin:
                         "kind": "phase_completed",
                         "node": node,
                         "phase": phase_name,
-                        "message": f"阶段完成: {phase_name or node}",
+                        "message": f"Phase complete: {phase_name or node}",
                     }
 
             elif kind == "on_tool_start":

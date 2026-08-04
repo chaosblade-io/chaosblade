@@ -252,8 +252,8 @@ async def _run_layer1_recovery(
                 pod_hint = ""
                 if original_pod:
                     pod_hint = (
-                        f"原始注入 Pod: `{original_pod}`，优先使用该 Pod 执行 blade destroy。\n"
-                        f"若该 Pod 已不存在，通过 kubectl get pods 发现当前 running 的 tool pod。\n"
+                        f"Original injection Pod: `{original_pod}` — prefer this Pod to run blade destroy.\n"
+                        f"If that Pod no longer exists, find a currently running tool pod via kubectl get pods.\n"
                     )
                 inject_context += (
                     f"\n\n## ChaosBlade Experiment Recovery (kubectl exec)\n"
@@ -1075,9 +1075,11 @@ async def _run_layer2_verification(
     # Extract the main recover context HumanMessage for state persistence.
     _main_hm_for_state = extract_persistent_hm(messages, state, _RECOVER_CONTEXT_KWARGS_KEY)
 
+    from chaos_agent.agent.progress_ledger import build_ledger_prompt_section
     system_prompt = _build_recover_verifier_prompt(
         layer1_label="blade_destroy" if _layer1_is_deterministic else "recovery execution",
         profile=capability_context.profile,
+        ledger_section=build_ledger_prompt_section(state.get("progress_ledger")),
     )
 
     # Record system prompt to session store (dedup handles repeated prompts)

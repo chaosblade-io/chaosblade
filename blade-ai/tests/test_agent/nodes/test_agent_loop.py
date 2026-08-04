@@ -119,7 +119,13 @@ class TestAgentLoop:
 
         assert result["safety_status"] == "rejected"
         assert result["failure_detail"]["category"] == FailureCategory.PLANNING_REJECTED.value
-        assert "configured execution transport" in result["error"]
+        # The message now names BOTH sides. It used to say intent recognition
+        # finished "without choosing a transport", which was wrong here — a
+        # transport (kubeconfig) WAS resolved and simply cannot run a host fault.
+        assert "cannot run through the" in result["error"]
+        assert "host" in result["error"]
+        assert "kubeconfig" in result["error"]
+        assert "without choosing a transport" not in result["error"]
         llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio

@@ -426,6 +426,56 @@ class TestKubectlDebugLifecycle:
         assert "cleaned up automatically" in result
 
     @pytest.mark.asyncio
+    async def test_copy_mode_debug_is_tracked_as_a_created_pod(self, monkeypatch):
+        # ``--copy-to`` is documented as "Create a copy of the target Pod with
+        # this name": it produces a NEW tool-owned pod and prints its name, so it
+        # must keep the created-pod lifecycle (wait for Ready, register, allow
+        # cleanup). Routing it through the ephemeral-container path would hunt
+        # for containers that never appear and leave the copy untracked —
+        # a leaked pod, and with ``--replace`` the original is deleted too.
+        async def fake_run(cmd, *args, **kwargs):
+            command = " ".join(cmd)
+            if " config " in f" {command} ":
+                return CommandResult(0, "ns", "", 1.0)
+            if " debug " in f" {command} ":
+                return CommandResult(
+                    0,
+                    "Creating debugging pod p0-dbg with container debugger "
+                    "on pod p0.",
+                    "", 1.0,
+                )
+            if " wait " in f" {command} ":
+                return CommandResult(0, "pod/p0-dbg condition met", "", 1.0)
+            return CommandResult(0, json.dumps({
+                "metadata": {"name": "p0-dbg", "namespace": "ns", "uid": "uid-c"},
+                "spec": {
+                    "nodeName": "node-a",
+                    "containers": [{"securityContext": {"privileged": True}}],
+                },
+                "status": {
+                    "phase": "Running",
+                    "containerStatuses": [{"ready": True, "state": {}}],
+                },
+            }), "", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+
+        result = await kubectl.ainvoke({
+            "subcommand": "debug",
+            "v_args": "p0 -n ns --image=img --copy-to=p0-dbg -- sleep 3600",
+            "kubeconfig": "", "context": "", "cluster": "",
+        })
+
+        # The copy is tracked as a created pod, with a cleanup handle.
+        assert '"name":"p0-dbg"' in result
+        assert '"ready":true' in result
+        assert "subcommand='delete'" in result
+        # Not mistaken for an ephemeral container attachment.
+        assert "ephemeral_container" not in result
+        assert "attached no ephemeral container" not in result
+
+    @pytest.mark.asyncio
     async def test_pod_scoped_debug_resolves_ephemeral_container(self, monkeypatch):
         # Pod-scoped ``kubectl debug <pod> --target=`` attaches an ephemeral
         # container; kubectl prints no name (only "Targeting container ...").
@@ -530,6 +580,197 @@ class TestKubectlDebugLifecycle:
         assert "debugger-xy12" in result
         assert "ImagePullBackOff" in result
         assert "Do NOT delete the target pod" in result
+
+
+class TestKubectlDebugOneshot:
+    """One-shot COMMAND mode (``debug ... -- CMD``) polls the terminal phase.
+
+    The pod runs CMD once and terminates; condition=Ready is never true
+    there, so the Ready-wait path would be a guaranteed false negative
+    (task-29848471 k3 false alarm).
+    """
+
+    @staticmethod
+    def _pod_json(phase: str, exit_code=None, reason: str = "") -> str:
+        terminated = {}
+        if exit_code is not None:
+            terminated = {"exitCode": exit_code, "reason": reason or "Completed"}
+        return json.dumps({
+            "metadata": {
+                "name": "node-debugger-node-a-x1",
+                "namespace": "test-ns",
+                "uid": "uid-debug-x1",
+            },
+            "spec": {"nodeName": "node-a"},
+            "status": {
+                "phase": phase,
+                "containerStatuses": [
+                    {"ready": False, "state": {"terminated": terminated} or {}}
+                ],
+            },
+        })
+
+    @pytest.mark.asyncio
+    async def test_oneshot_succeeded_reports_exit_code_and_logs(self, monkeypatch):
+        calls = []
+
+        async def fake_run(cmd, *args, **kwargs):
+            calls.append(cmd)
+            command = " ".join(cmd)
+            if " debug " in f" {command} ":
+                return CommandResult(
+                    0,
+                    "Creating debugging pod node-debugger-node-a-x1 "
+                    "with container debugger on node node-a.",
+                    "", 1.0,
+                )
+            if " logs " in f" {command} ":
+                return CommandResult(0, "Filesystem  Size  Used\n/dev/vda1  40G  38G", "", 1.0)
+            if " delete " in f" {command} ":
+                return CommandResult(0, "pod deleted", "", 1.0)
+            return CommandResult(0, self._pod_json("Succeeded", exit_code=0), "", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+
+        result = await kubectl.ainvoke({
+            "subcommand": "debug",
+            "v_args": "node/node-a -n test-ns --image=busybox -- df -h /host",
+            "kubeconfig": "", "context": "", "cluster": "",
+        })
+
+        # No Ready wait in command mode — terminal polling only.
+        assert not any("wait" in cmd for cmd in calls)
+        assert not result.startswith("Error:")
+        assert "exit_code=0" in result
+        assert '"oneshot":true' in result
+        assert '"cleaned":true' in result
+        assert "Filesystem" in result  # logs tail surfaced
+        assert "NOTHING to clean up" in result
+
+    @pytest.mark.asyncio
+    async def test_oneshot_failed_command_reports_exit_code(self, monkeypatch):
+        async def fake_run(cmd, *args, **kwargs):
+            command = " ".join(cmd)
+            if " debug " in f" {command} ":
+                return CommandResult(
+                    0,
+                    "Creating debugging pod node-debugger-node-a-x1 "
+                    "with container debugger on node node-a.",
+                    "", 1.0,
+                )
+            if " logs " in f" {command} ":
+                return CommandResult(0, "df: /host/missing: No such file", "", 1.0)
+            if " delete " in f" {command} ":
+                return CommandResult(0, "pod deleted", "", 1.0)
+            return CommandResult(0, self._pod_json("Failed", exit_code=1), "", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+
+        result = await kubectl.ainvoke({
+            "subcommand": "debug",
+            "v_args": "node/node-a -n test-ns --image=busybox -- df -h /host/missing",
+            "kubeconfig": "", "context": "", "cluster": "",
+        })
+
+        assert result.startswith("Error:")
+        assert "exit_code=1" in result
+        assert "No such file" in result  # logs tail explains the failure
+        assert '"cleaned":true' in result
+
+    def test_sleep_placeholder_stays_interactive(self):
+        """``-- sleep N`` is the documented keep-alive convention: the pod
+        must go through the Ready wait, never the terminal poll."""
+        from chaos_agent.tools.kubectl import _debug_has_oneshot_command
+        assert _debug_has_oneshot_command(
+            ["node/node-a", "--image=busybox", "--", "sleep", "3600"]
+        ) is False
+        assert _debug_has_oneshot_command(
+            ["node/node-a", "--image=busybox", "--", "df", "-h"]
+        ) is True
+        # Interactive flags and bare/missing ``--`` stay interactive too.
+        assert _debug_has_oneshot_command(
+            ["-it", "node/node-a", "--", "df"]
+        ) is False
+        assert _debug_has_oneshot_command(["node/node-a", "--"]) is False
+        assert _debug_has_oneshot_command(["node/node-a"]) is False
+
+    @pytest.mark.asyncio
+    async def test_unparseable_output_warns_against_blind_retry(self, monkeypatch):
+        """Exit 0 + no identifiable pod: the create may never have executed.
+        The text must NOT invite retrying the same command (k3 burned three
+        rounds doing exactly that)."""
+        async def fake_run(cmd, *args, **kwargs):
+            command = " ".join(cmd)
+            if " config " in f" {command} ":
+                return CommandResult(0, "test-ns", "", 1.0)
+            return CommandResult(0, 'Warning: some unusual output', "", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+        # Discovery fallback also hits _debug_pod's own transport binding;
+        # make it return non-JSON so discovery misses deterministically.
+        import chaos_agent.agent.nodes.execute._debug_pod as debug_pod_mod
+        monkeypatch.setattr(debug_pod_mod, "execute_via_transport", fake_run)
+
+        result = await kubectl.ainvoke({
+            "subcommand": "debug",
+            "v_args": "node/node-a --image=busybox -- df -h /host",
+            "kubeconfig": "", "context": "", "cluster": "",
+        })
+
+        assert result.startswith("Error:")
+        assert "may never have executed" in result
+        assert "Do NOT retry" in result
+        assert "Warning: some unusual output" in result
+
+    @pytest.mark.asyncio
+    async def test_parse_failure_discovery_hit_continues_flow(self, monkeypatch):
+        """Warning-only stdout (no pod name) + live discovery hit: the tool
+        must continue with the discovered pod instead of erroring out."""
+        now_iso = __import__("datetime").datetime.now(
+            tz=__import__("datetime").timezone.utc,
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        async def fake_run(cmd, *args, **kwargs):
+            command = " ".join(cmd)
+            if " debug " in f" {command} ":
+                return CommandResult(0, "Warning: unusual output, no pod name", "", 1.0)
+            if " get " in f" {command} " and "pods" in command and "-o json" in command:
+                # Discovery list: only the fresh node-debugger pod qualifies.
+                return CommandResult(0, json.dumps({"items": [
+                    {
+                        "metadata": {
+                            "name": "node-debugger-node-a-x1",
+                            "creationTimestamp": now_iso,
+                        },
+                        "spec": {"nodeName": "node-a"},
+                    },
+                ]}), "", 1.0)
+            if " logs " in f" {command} ":
+                return CommandResult(0, "disk usage 92%", "", 1.0)
+            if " delete " in f" {command} ":
+                return CommandResult(0, "pod deleted", "", 1.0)
+            return CommandResult(0, self._pod_json("Succeeded", exit_code=0), "", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+        # Discovery runs inside _debug_pod, which holds its own import of
+        # execute_via_transport — patch that binding too.
+        import chaos_agent.agent.nodes.execute._debug_pod as debug_pod_mod
+        monkeypatch.setattr(debug_pod_mod, "execute_via_transport", fake_run)
+
+        result = await kubectl.ainvoke({
+            "subcommand": "debug",
+            "v_args": "node/node-a -n test-ns --image=busybox -- df -h /host",
+            "kubeconfig": "", "context": "", "cluster": "",
+        })
+
+        assert not result.startswith("Error:")
+        assert "discovered" in result  # discovery hit is surfaced
+        assert "exit_code=0" in result
+        assert '"cleaned":true' in result
 
 
 class TestKubectlPatch:
@@ -1169,3 +1410,85 @@ class TestGuardRejectionReachesTheModelIntact:
         })
         assert "only allows read-only 'view'" in out
         assert "--context/--kubeconfig" in out
+
+
+class TestReviewFindings:
+    """Reproduction tests for post-implementation review findings.
+
+    Each test pins a suspected bug BEFORE the fix; it must fail on the
+    buggy code and pass after the fix.
+    """
+
+    # ---- Suspect 1: _debug_target_node_name breaks when a value-flag
+    # (-n/--namespace/--image space form) precedes the node token. The
+    # flag's VALUE is misread as the first positional -> discovery
+    # fallback silently disabled for such calls.
+    @pytest.mark.parametrize("args, expected", [
+        (["node/node-a"], "node-a"),
+        (["node/node-a", "-n", "default"], "node-a"),
+        (["-n", "default", "node/node-a"], "node-a"),
+        (["--namespace", "default", "node/node-a"], "node-a"),
+        (["--image", "busybox", "node/node-a"], "node-a"),
+        (["--profile=sysadmin", "-n", "ns1", "node", "node-a"], "node-a"),
+        (["some-workload-pod", "-n", "default"], ""),  # pod-scoped
+    ])
+    def test_debug_target_node_name_with_value_flags(self, args, expected):
+        from chaos_agent.tools.kubectl import _debug_target_node_name
+        assert _debug_target_node_name(args) == expected
+
+    # ---- Suspect 2: a Succeeded one-shot pod whose containerStatuses
+    # are not (yet) populated yields exit_code=None and lands in the
+    # ERROR branch ("failed with exit_code=None") instead of success.
+    @pytest.mark.asyncio
+    async def test_oneshot_succeeded_without_container_statuses(self, monkeypatch):
+        pod_json = json.dumps({
+            "metadata": {
+                "name": "node-debugger-node-a-x1",
+                "namespace": "test-ns",
+                "uid": "uid-debug-x1",
+            },
+            "spec": {"nodeName": "node-a"},
+            "status": {"phase": "Succeeded", "containerStatuses": []},
+        })
+
+        async def fake_run(cmd, *args, **kwargs):
+            command = " ".join(cmd)
+            if " debug " in f" {command} ":
+                return CommandResult(
+                    0,
+                    "Creating debugging pod node-debugger-node-a-x1 "
+                    "with container debugger on node node-a.",
+                    "", 1.0,
+                )
+            if " logs " in f" {command} ":
+                return CommandResult(0, "done", "", 1.0)
+            if " delete " in f" {command} ":
+                return CommandResult(0, "pod deleted", "", 1.0)
+            return CommandResult(0, pod_json, "", 1.0)
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+
+        result = await kubectl.ainvoke({
+            "subcommand": "debug",
+            "v_args": "node/node-a -n test-ns --image=busybox -- df -h",
+            "kubeconfig": "", "context": "", "cluster": "",
+        })
+        assert not result.startswith("Error:"), result
+        assert "exit_code=0" in result
+
+    # ---- Suspect 3: documented keep-alive variants wrapped in a shell
+    # (`sh -c 'sleep 3600'`) or absolute-path sleep (`/bin/sleep`) are
+    # misclassified as one-shot -> the carrier pod gets killed after a
+    # 120s wait even though the caller expects to exec into it.
+    @pytest.mark.parametrize("args, expected", [
+        (["node/a", "--", "sleep", "3600"], False),          # documented
+        (["node/a", "--", "/bin/sleep", "3600"], False),      # abs path
+        (["node/a", "--", "sh", "-c", "sleep 3600"], False),  # wrapped
+        (["node/a", "--", "bash", "-c", "sleep 60"], False),  # wrapped
+        (["node/a", "--", "sh", "-c", "sleep 30 && df -h"], True),  # composite
+        (["node/a", "--", "chroot", "/host", "crictl", "stop"], True),
+    ])
+    def test_sleep_keepalive_variants_stay_interactive(self, args, expected):
+        from chaos_agent.tools.kubectl import _debug_has_oneshot_command
+        assert _debug_has_oneshot_command(args) is expected

@@ -32,29 +32,25 @@ def submit_verification(
 
     Call this as your LAST action once you have gathered enough evidence.
     Do NOT also emit a free-text VERIFICATION_RESULT — this structured call
-    IS the verdict. Cleanup of debug pods is handled automatically; you do
-    not need to delete them yourself.
+    IS the verdict. Debug-pod cleanup is automatic.
 
     Inputs:
-      - overall: "verified" | "partial" | "unverified"
-          verified = fault effect directly confirmed against baseline;
-          partial = injected but effect only partially/indirectly confirmed;
-          unverified = could not confirm the fault effect.
+      - overall: "verified" (effect directly confirmed against baseline) |
+          "partial" (injected, effect only partially/indirectly confirmed) |
+          "unverified" (could not confirm the fault effect).
       - layer2_status: "passed" | "failed" | "partial" | "skipped" |
-          "recovered_before_observation"  (fault-specific effect observable?)
+          "recovered_before_observation" (fault-specific effect observable?).
       - layer2_details: one-line evidence summary.
       - primary_evidence_observed: true ONLY if you directly observed the
-          fault's PRIMARY effect (not just a side effect). "verified"
-          requires this to be true.
-      - baseline_used: true if you compared observations against the
-          pre-injection baseline provided in the context.
+          fault's PRIMARY effect (not just a side effect); "verified"
+          requires this true.
+      - baseline_used: true if compared against the pre-injection baseline.
       - checklist: list of {"step": int, "status":
-          "passed|failed|skipped|recovered_before_observation", "evidence": str},
-          one entry per verification step from the skill case.
-      - warnings: optional list of warning strings.
-      - chosen_candidate: when multiple skill case candidates were
-          provided, set this to the candidate number you chose (e.g. 2
-          for Candidate 2). Leave 0 for single-candidate cases.
+          "passed|failed|skipped|recovered_before_observation", "evidence":
+          str}, one entry per skill-case verification step.
+      - warnings: optional warning strings.
+      - chosen_candidate: chosen candidate number when multiple skill-case
+          candidates were provided; 0 for single-candidate cases.
 
     Output: confirmation string (the verdict is taken from these args).
     """

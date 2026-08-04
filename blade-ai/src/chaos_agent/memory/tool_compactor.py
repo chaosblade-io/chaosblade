@@ -395,16 +395,17 @@ def build_truncation_notice(
 
     if is_recent:
         notice = (
-            f"\n\n⚠️ OUTPUT_TRUNCATED: 输出已精简或截断（原始 {original_kb}KB），仅保留关键字段。"
+            f"\n\n⚠️ OUTPUT_TRUNCATED: output was reduced or truncated "
+            f"(original {original_kb}KB); only key fields are kept."
         )
         if cache_path:
-            notice += f"\n完整输出缓存于: {cache_path}"
+            notice += f"\nFull output cached at: {cache_path}"
         notice += (
-            "\n不要重复相同查询！如需完整数据，请使用以下策略："
-            "\n- 使用 --field-selector 缩小范围（如 kubectl subcommand=\"get\" --field-selector spec.nodeName=<node>）"
-            "\n- 使用 -o name 获取精简列表"
-            "\n- 使用 kubectl 工具的 -o jsonpath 提取特定字段"
-            "\n- 按名称查询单个资源而非列出全部"
+            "\nDo NOT repeat the same query! If you need the full data, use one of these strategies:"
+            "\n- Narrow the scope with --field-selector (e.g. kubectl subcommand=\"get\" --field-selector spec.nodeName=<node>)"
+            "\n- Use -o name for a compact list"
+            "\n- Extract specific fields with the kubectl tool's -o jsonpath"
+            "\n- Query a single resource by name instead of listing them all"
         )
     else:
         notice = "\n⚠️ TRUNCATED. Use field_selector or output_format='name'."

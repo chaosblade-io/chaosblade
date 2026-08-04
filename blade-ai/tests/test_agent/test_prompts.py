@@ -134,6 +134,21 @@ class TestSectionFunctions:
                     f"Core Principles rule not found in REMEMBER: {line!r}"
                 )
 
+    def test_feasibility_probing_covers_host_level_dependencies(self):
+        """Viability probing must name the host-level substrate the fault
+        mechanism runs on (kernel modules/features, operators/controllers).
+        Regression for task-5193538b: every container-side precondition
+        passed, but the node kernel lacked netem support — the plan's
+        feasibility was built on documentation, not runtime evidence.
+        """
+        for section in (
+            get_core_principles_section(),
+            get_remember_section(),
+            get_workflow_section(),
+        ):
+            assert "kernel modules" in section
+            assert "operators/controllers" in section
+
     def test_executor_core_principles_section_content(self):
         section = get_executor_core_principles_section()
         assert "# Core Principles" in section
@@ -260,6 +275,33 @@ class TestIntentClarificationSectionFunctions:
         assert "Probe" in section
         assert "Recommend" in section
 
+    def test_inject_flow_warns_on_channel_mismatch_but_never_blocks(self):
+        """One-line heads-up only — enforcement lives in the submit gate.
+
+        The prompt must not ask the model to withhold submit_fault_intent on its
+        own reading of the profile: that judgement can be wrong (incomplete skill
+        descriptions, hallucination) and would leave the user no override. The
+        code-side gate in ``intent_clarification`` decides, using
+        ``family_for_scope`` + ``profile_of``.
+        """
+        section = get_intent_inject_flow_section(semantic_only=True)
+        assert "Capability Profile" in section
+        assert "submit tool enforces this" in section
+        # must NOT instruct the model to refuse on its own
+        assert "Never withhold" not in section
+        assert "do not submit" not in section.lower()
+
+    def test_inject_flow_refers_to_profile_by_name_not_position(self):
+        """The Capability Profile section is assembled AFTER Inject Flow.
+
+        So the rule must not say "above" — that would point the model at
+        something not yet in the prompt.
+        """
+        section = get_intent_inject_flow_section(semantic_only=True)
+        idx = section.index("Capability Profile")
+        window = section[max(0, idx - 60):idx + 60]
+        assert "above" not in window, "profile referenced by position, not name"
+
     def test_recover_flow_section(self):
         section = get_intent_recover_flow_section()
         assert "Recover Flow" in section
@@ -380,7 +422,15 @@ class TestBuildIntentClarificationPrompt:
         assert "Blade AI" in prompt
         assert "Three Priorities" in prompt
 
-    def test_semantic_intent_prompt_uses_full_catalog_without_transport_profile(self):
+    def test_semantic_intent_prompt_without_profile_omits_capability_section(self):
+        # Previously named ``..._without_transport_profile``. The semantic
+        # intent stage no longer *always* hides the capability profile — it
+        # now states a KNOWN channel as a fact so a host-channel environment
+        # stops loading k8s-chaos-skills. What stays invariant is that the
+        # full skill catalog is always shown (nothing is filtered), and when
+        # no profile is resolvable the section is omitted (degrades to the
+        # original behaviour). See the two tests below for the profile-aware
+        # and unknown-channel paths.
         prompt = build_intent_clarification_prompt(
             skill_catalog="- k8s: pod cpu pressure\n- host: cpu pressure",
             semantic_only=True,
@@ -388,6 +438,46 @@ class TestBuildIntentClarificationPrompt:
 
         assert "`k8s`: pod cpu pressure" in prompt
         assert "`host`: cpu pressure" in prompt
-        assert "Capability Profile" not in prompt
+        # Judge by the fragment's own body, not by the words "Capability
+        # Profile" — the Inject Flow self-check rule refers to that section by
+        # name, so the bare title appears even when no fragment is emitted.
+        assert "## Capability Profile" not in prompt
+        assert "You are operating" not in prompt
         assert "kubectl_read" not in prompt
         assert "full fault catalog" in prompt
+
+    def test_semantic_intent_prompt_states_known_profile_without_filtering(self):
+        # A resolved profile is stated as a fact, but the catalog is NOT
+        # filtered — both skills remain visible. This is "inform, don't
+        # restrict": it fixes skill mis-selection without reintroducing the
+        # rejected hard-routing.
+        prompt = build_intent_clarification_prompt(
+            skill_catalog="- k8s: pod cpu pressure\n- host: cpu pressure",
+            semantic_only=True,
+            profile="host",
+        )
+
+        assert "Capability Profile" in prompt
+        assert "configured host" in prompt
+        # catalog still complete
+        assert "`k8s`: pod cpu pressure" in prompt
+        assert "`host`: cpu pressure" in prompt
+
+    def test_semantic_intent_prompt_unknown_profile_omits_discouraging_wording(self):
+        # An unresolvable channel must NOT surface the "environment is
+        # unsupported, do not attempt injection" fragment — that would be
+        # strictly worse than the pre-fix behaviour. It degrades to no
+        # capability section instead.
+        prompt = build_intent_clarification_prompt(
+            skill_catalog="- k8s: pod cpu pressure\n- host: cpu pressure",
+            semantic_only=True,
+            profile="unknown",
+        )
+
+        assert "## Capability Profile" not in prompt
+        assert "You are operating" not in prompt
+        assert "unsupported" not in prompt
+        assert "Do not attempt injection" not in prompt
+        # catalog still complete
+        assert "`k8s`: pod cpu pressure" in prompt
+        assert "`host`: cpu pressure" in prompt

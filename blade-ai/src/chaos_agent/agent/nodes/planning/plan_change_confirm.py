@@ -14,8 +14,10 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import interrupt
 
+from chaos_agent.agent.nodes.execute.execute_loop import reset_attribution_state
 from chaos_agent.agent.nodes.store._store_sync import sync_node_status_to_session, sync_to_store
 from chaos_agent.agent.result.verdict import FailureCategory
+from chaos_agent.config.settings import settings
 from chaos_agent.agent.spec.fault_spec import (
     FaultSpec,
     is_full_fault_spec_proposal,
@@ -193,12 +195,31 @@ async def plan_change_confirm(state: AgentState) -> dict:
         "baseline_data": None,
         "inject_layer1_cache": None,
         "verification": None,
+        # Contract seam: a new contract starts with fresh loop budgets.
+        # Inheriting the OLD contract's replan debt lets one unlucky round
+        # exhaust the new contract's budget before it has executed anything
+        # (task-71fa78b6: rev3 entered with 2/3 spent and died on its first
+        # replan). New contract == new budget, same as the message promises.
+        "replan_count": 0,
+        "verify_replan_count": 0,
         "messages": [HumanMessage(content=(
             f"[PLAN CHANGE APPROVED] FaultSpec revision {approved.revision} is now authoritative: "
             f"{approved.fault_type}. Re-evaluate feasibility, choose a matching skill, and build "
-            "a fresh plan. Do not reuse evidence or execution assumptions from the old contract."
+            "a fresh plan. Do not reuse evidence or execution assumptions from the old contract. "
+            "Execution budgets and injection attribution have been reset for this new contract."
         ))],
     }
+    if settings.replan_reset_execute_count:
+        result["execute_loop_count"] = 0
+    # Same canonical seam reset the execute-time replan applies: attribution
+    # (method / carrier pod / caches / epoch boundary) must not leak across
+    # contracts. keep_blade_uid preserves a recovery handle when an experiment
+    # may still be live, mirroring the replan seam's rationale.
+    reset_attribution_state(
+        result,
+        keep_blade_uid=bool(state.get("blade_uid")),
+        message_count=len(state.get("messages") or []) + len(result.get("messages") or []),
+    )
     if batch is not None:
         result["batch_submit_args"] = batch
     sync_node_status_to_session(

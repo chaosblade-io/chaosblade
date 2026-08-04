@@ -9,8 +9,6 @@ import json
 import logging
 import re
 
-from langchain_core.messages import HumanMessage
-
 from chaos_agent.agent.nodes.verify._verifier_shared import (
     _parse_status_keyword,
     has_checklist,
@@ -628,15 +626,6 @@ def _try_parse_json(content: str) -> dict | None:
         result["level"] = "partial"
 
     return result
-
-
-def _has_format_reminder(messages: list) -> bool:
-    """Check if a VERIFICATION_RESULT format reminder has already been injected."""
-    return any(
-        isinstance(msg, HumanMessage)
-        and "缺少要求的 VERIFICATION_RESULT 格式" in (msg.content or "")
-        for msg in messages
-    )
 
 
 def _parse_verification_result(text: str) -> dict:

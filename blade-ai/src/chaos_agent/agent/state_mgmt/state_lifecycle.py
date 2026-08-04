@@ -117,9 +117,21 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
 
     # ── Execution ──────────────────────────────────────────────────
     _p("blade_uid", "execution", durable=True, batch=None),
+    # Retired (successfully destroyed) experiment UIDs. Not inherited by the
+    # recover graph — the recovered experiment may well be one of them.
+    _p("retired_blade_uids", "execution", durable=True, batch=None, recover=False),
     _p("injection_method", "execution", durable=True, batch=None),
+    # Attribution epoch boundary — an index into ``messages`` (durable=True,
+    # never reset: it must stay aligned with the message list it indexes).
+    _p("attribution_epoch_index", "execution", durable=True, batch=None),
+    _p("_replan_review_rejection", "execution", batch=None),
     _p("execution_artifacts", "execution", durable=True, batch=None),
     _p("kubectl_exec_pod_name", "execution", durable=True, batch=None),
+    # Screener vehicle caches: live-discovery positives and the bounded
+    # negative list. Cluster facts for THIS task only — never durable (tool
+    # pods rotate between tasks) and not inherited by recover graphs.
+    _p("known_vehicle_pods", "execution", batch=None, recover=False),
+    _p("vehicle_probe_misses", "execution", batch=None, recover=False),
     _p("blade_parsed_flags", "execution", durable=True, batch=None),
     _p("direct", "execution", batch=False, recover=False),
     _p("original_replicas", "execution", durable=True, batch=None),
@@ -200,6 +212,10 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("compressed_summary", "memory", durable=True, batch=None),
     _p("experiment_history", "memory", durable=True),
     _p("operational_notes", "memory", durable=True),
+    # Progress ledger is durable within an operation but each batch fault and
+    # each recover is a distinct operation that freezes its own anchor, so both
+    # boundaries reset it to None for a fresh ledger.
+    _p("progress_ledger", "memory", durable=True, batch=None, recover=None),
 )
 
 

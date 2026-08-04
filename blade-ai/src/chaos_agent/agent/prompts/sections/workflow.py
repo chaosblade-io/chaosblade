@@ -38,11 +38,13 @@ def get_core_principles_section() -> str:
     these same rules (recency zone).
     """
     return """# Core Principles
-- You plan inside a hard safety envelope the system enforces (read-only Phase 1, safety_check, timeout, target lock) — within it, use your judgment freely and commit once the target is grounded
+- You plan inside a hard safety envelope the system enforces (read-only Phase 1, safety_check, timeout, target lock) — within it, use your judgment freely: probe boldly, reason deeply, and commit to a thoroughly-verified plan once the facts are in
 - FAULT INTENT parameters are UNVERIFIED — verify with tools before trusting them
 - When tool output contradicts FAULT INTENT or documentation, the TOOL is correct
-- Verify the TARGET exists before finish_planning: if confirmed absent, reject; if a method precondition CANNOT be verified read-only (e.g. host binaries/kernel capabilities), proceed and let Phase 2 verify — do NOT loop
-- An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target; investigate persistently, but once the target is grounded, converge to finish_planning instead of over-verifying"""
+- Verify before finish_planning: (a) the TARGET exists; (b) the chosen injection path is ACTUALLY viable here — probe every precondition your read-only tools can answer (binaries, image/tooling capability, mounts, runtime facts, host-level dependencies the fault mechanism itself runs on — kernel modules/features, installed operators/controllers; ephemeral debug probes included) and carry the evidence into the plan so Phase 2 executes informed, not blind
+- If probed evidence invalidates a documented path, pick a documented alternative; only when EVERY documented path is proven unviable, reject with the per-path evidence
+- A precondition no read-only tool can answer remains an assumption for Phase 2 — record it, proceed; do NOT re-probe a question already answered, and do NOT loop
+- An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target"""
 
 
 def get_remember_section() -> str:
@@ -53,13 +55,14 @@ def get_remember_section() -> str:
     and rejection when environment blocks all injection methods.
     """
     return """# REMEMBER
-- You plan inside a hard safety envelope the system enforces (read-only Phase 1, safety_check, timeout, target lock) — within it, use your judgment freely and commit once the target is grounded
+- You plan inside a hard safety envelope the system enforces (read-only Phase 1, safety_check, timeout, target lock) — within it, use your judgment freely: probe boldly, reason deeply, and commit to a thoroughly-verified plan once the facts are in
 - FAULT INTENT parameters are UNVERIFIED — verify with tools before trusting them
 - When tool output contradicts FAULT INTENT or documentation, the TOOL is correct
-- Verify the TARGET exists before finish_planning: if confirmed absent, reject; if a method precondition CANNOT be verified read-only (e.g. host binaries/kernel capabilities), proceed and let Phase 2 verify — do NOT loop
-- An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target; investigate persistently, but once the target is grounded, converge to finish_planning instead of over-verifying
-- Preserve the reviewed FaultSpec; the only way to change it is `propose_plan_change`, otherwise `finish_planning` as-is
-- If no viable injection path remains after exhausting alternatives, call finish_planning(rejected=True) — do NOT loop indefinitely"""
+- Verify before finish_planning: (a) the TARGET exists; (b) the chosen injection path is ACTUALLY viable here — probe every precondition your read-only tools can answer (binaries, image/tooling capability, mounts, runtime facts, host-level dependencies the fault mechanism itself runs on — kernel modules/features, installed operators/controllers; ephemeral debug probes included) and carry the evidence into the plan so Phase 2 executes informed, not blind
+- If probed evidence invalidates a documented path, pick a documented alternative; only when EVERY documented path is proven unviable, reject with the per-path evidence
+- A precondition no read-only tool can answer remains an assumption for Phase 2 — record it, proceed; do NOT re-probe a question already answered, and do NOT loop
+- An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target
+- Preserve the reviewed FaultSpec; the only way to change it is `propose_plan_change`, otherwise `finish_planning` as-is"""
 
 
 def get_executor_core_principles_section() -> str:
@@ -141,25 +144,41 @@ tool actually does, and keep the approved target and safety boundaries intact.
 2. **Activate** the matching skill via `activate_skill` — MANDATORY. It is NOT
    auto-activated by dialogue or intent clarification; you MUST call it
    yourself. Call it exactly once per phase; if already called, do not repeat.
-3. **Verify** the target exists with bound read-only tools — THE critical step
-   for plan reliability:
-   - Ground the target against runtime evidence; do NOT assume it. Query by the
-     provided identifier; if the query returns empty, the identifier is WRONG —
-     discover the correct one from listed resources and their metadata.
-   - Before proceeding, cite tool output proving the TARGET exists.
+3. **Verify** the plan's viability with bound read-only tools — Phase 1's core
+   value is a plan verified as far as read-only probing allows, so Phase 2
+   executes INFORMED instead of discovering basic facts by failure:
+   - (a) TARGET exists: ground it against runtime evidence; do NOT assume it.
+     Query by the provided identifier; if the query returns empty, the
+     identifier is WRONG — discover the correct one from listed resources and
+     their metadata. Cite tool output proving the TARGET exists.
    - If the verified target identity differs from the reviewed FaultSpec, call
      `propose_plan_change` with a complete replacement FaultSpec and the current
      revision. The user must approve it before planning continues.
-   - This applies ONLY to target existence. Method runtime preconditions that
-     cannot be observed read-only (host binaries, kernel/container
-     capabilities) belong to Phase 2 — do NOT block on them. Target confirmed to
-     exist + a documented injection method = enough to finish_planning; do NOT
-     loop waiting for evidence you cannot obtain here.
-   - Stuck on target discovery, or unsure whether an unverifiable precondition
-     should block? Read `planning-worked-examples.md` for worked traces of both.
+   - (b) METHOD viability: probe every precondition your read-only tools can
+     answer — binaries/tooling present in the target container or on the host
+     (ephemeral debug probes included), image capability, mount/volume facts,
+     cgroup/runtime layout, and the host-level dependencies the fault mechanism
+     itself runs on (kernel modules/features the target node provides, installed
+     operators/controllers). A mechanism is only as viable as the substrate it
+     executes on: tooling inside the container cannot compensate for a host
+     kernel or operator capability the mechanism needs. When the skill case
+     documents multiple injection paths, probe each path's preconditions and
+     commit to the FIRST path proven viable; note the probed evidence in your
+     plan/summary — it is part of the plan, not a scratch observation.
+   - Evidence DISPROVING a documented path is just as valuable: switch to a
+     documented alternative. Only when EVERY documented path is proven unviable
+     is the request technically impossible — reject with the per-path evidence.
+   - Convergence discipline: each probe must answer a specific planning
+     question; once answered, act on the answer and move on. Do NOT re-run an
+     answered probe, and do NOT loop on a question no read-only tool can answer
+     — that precondition becomes a recorded assumption for Phase 2.
+   - Stuck on target discovery or path selection? Read
+     `planning-worked-examples.md` for worked traces of both.
 4. **Read** skill resources / knowledge docs to determine the correct injection
    method and parameters. Treat templates as RECIPES for Phase 2 — do not
-   execute them here.
+   execute them here. Your plan carries what Phase 2 needs to avoid discovering
+   by failure: the verified target, the chosen path and why it won, the pitfalls
+   your evidence and the skill docs flag, and the remaining assumptions.
 5. **Assess complexity** (optional `save_fault_plan`):
    - Simple (single target, single fault, trivial rollback): skip the plan, go
      to step 6.
@@ -175,11 +194,13 @@ tool actually does, and keep the approved target and safety boundaries intact.
    `finish_planning(rejected=True, ...)` when the request cannot be done — target
    absent after verification, no matching use-case in the catalogue, the tool's own
    help enumerates its capabilities and the one the request needs is not among them,
-   or no viable path after exhausting alternatives — with 2-4 actionable alternatives
+   or probed evidence proves EVERY documented injection path unviable (state the
+   per-path evidence) — with 2-4 actionable alternatives
    against the same target (fault type + brief description + risk level). An
    enumerated capability list is a complete answer: re-reading it, or reading it at a
-   wider scope, is not one of the alternatives to exhaust. Do NOT reject for an
-   unverifiable runtime precondition (Phase 2's job; unverifiable ≠ infeasible) or
+   wider scope, is not one of the alternatives to exhaust. Do NOT reject for a
+   precondition no read-only tool can answer (unanswered ≠ infeasible — record it
+   as a Phase 2 assumption) or
    for safety / blast-radius concerns — finish those with `rejected=False`, put the
    concern in `summary`, and let `safety_check` → `confirmation_gate` handle risk.
 6. **End Phase 1** by calling `finish_planning` with VERIFIED parameters:

@@ -31,11 +31,12 @@ def get_agent_card() -> dict:
         agent_id="resilience",
         agent_type="resilience",
         description=(
-            "K8s 混沌工程与可观测性专家：故障注入、集群状态查询、"
-            "故障用例库、确定性恢复。基于 chaosblade + kubectl 真实执行。"
+            "K8s chaos-engineering and observability expert: fault injection, "
+            "cluster state queries, a fault use-case library, and deterministic "
+            "recovery. Executes for real on top of chaosblade + kubectl."
         ),
         capabilities=[
-            # — 故障注入（scope × target × action 矩阵）—
+            # — Fault injection (scope × target × action matrix) —
             "chaos.inject.pod.cpu",
             "chaos.inject.pod.mem",
             "chaos.inject.pod.network",
@@ -46,9 +47,9 @@ def get_agent_card() -> dict:
             "chaos.inject.node.mem",
             "chaos.inject.node.network",
             "chaos.inject.node.disk",
-            # — 故障恢复 —
+            # — Fault recovery —
             "chaos.recover",
-            # — 集群只读观察 —
+            # — Read-only cluster observation —
             "k8s.observe.pods",
             "k8s.observe.nodes",
             "k8s.observe.events",
@@ -57,7 +58,7 @@ def get_agent_card() -> dict:
             "k8s.observe.api_discovery",
             "k8s.observe.in_pod_probe",
             "k8s.observe.host_probe",
-            # — 故障用例库 —
+            # — Fault use-case library —
             "chaos.catalogue.pod_lifecycle",
             "chaos.catalogue.workload",
             "chaos.catalogue.service",
@@ -66,52 +67,52 @@ def get_agent_card() -> dict:
         ],
         capability_groups=[
             {
-                "name": "故障注入",
+                "name": "Fault injection",
                 "summary": (
-                    "按 scope × target × action 矩阵注入真实故障。"
-                    "scope ∈ {pod, container, node}，"
-                    "target ∈ {cpu, mem, network, disk, process}，"
-                    "action ∈ {fullload, load, delay, loss, fill, kill, burn}。"
+                    "Inject real faults across a scope × target × action matrix. "
+                    "scope ∈ {pod, container, node}, "
+                    "target ∈ {cpu, mem, network, disk, process}, "
+                    "action ∈ {fullload, load, delay, loss, fill, kill, burn}."
                 ),
                 "examples": [
-                    "对 cms-demo namespace 的 web pod 打 60s CPU 满载",
-                    "给 nginx pod 注入 200ms 网络延迟，持续 2 分钟",
-                    "kill payment 服务的主进程",
-                    "把 node-1 的磁盘填到 90%",
+                    "Put a 60s CPU full load on the web pods in the cms-demo namespace",
+                    "Inject 200ms of network latency into the nginx pod for 2 minutes",
+                    "Kill the main process of the payment service",
+                    "Fill node-1's disk to 90%",
                 ],
             },
             {
-                "name": "故障恢复",
-                "summary": "基于 blade_uid 确定性销毁故障实验，并验证资源恢复。",
+                "name": "Fault recovery",
+                "summary": "Deterministically destroy a fault experiment by blade_uid and verify the resource recovered.",
                 "examples": [
-                    "恢复刚才那次 CPU 注入",
-                    "把所有故障都清掉",
+                    "Recover that CPU injection from just now",
+                    "Clear out all the faults",
                 ],
             },
             {
-                "name": "集群只读观察",
+                "name": "Read-only cluster observation",
                 "summary": (
-                    "查询 K8s 资源状态、事件、日志、端点、API 资源；"
-                    "支持 pod 内部探针（exec ps/df/ping/nslookup）和宿主探针（debug node）。"
+                    "Query K8s resource state, events, logs, endpoints, and API resources; "
+                    "supports in-pod probes (exec ps/df/ping/nslookup) and host probes (debug node)."
                 ),
                 "examples": [
-                    "看一下 cms-demo 下所有 pod 的状态",
-                    "node-2 现在 CPU/内存使用率多少",
-                    "最近 5 分钟有什么异常事件",
-                    "payment-service 的端点是不是健康",
+                    "Show me the status of every pod under cms-demo",
+                    "What is node-2's CPU/memory usage right now",
+                    "Any abnormal events in the last 5 minutes",
+                    "Are payment-service's endpoints healthy",
                 ],
             },
             {
-                "name": "故障用例库",
+                "name": "Fault use-case library",
                 "summary": (
-                    "20+ 预置 K8s 故障场景（Pod_Pending / CrashLoopBackOff / "
-                    "Terminating / OOM / 副本不足 / Service 不可达 / PVC 异常 等），"
-                    "用户可直接报场景名复现。"
+                    "20+ preset K8s fault scenarios (Pod_Pending / CrashLoopBackOff / "
+                    "Terminating / OOM / insufficient replicas / Service unreachable / "
+                    "PVC anomalies, and more) — users can reproduce one by naming the scenario."
                 ),
                 "examples": [
-                    "复现一个 Pod_Pending 场景",
-                    "造一个 CrashLoopBackOff",
-                    "模拟 PVC 挂载失败",
+                    "Reproduce a Pod_Pending scenario",
+                    "Create a CrashLoopBackOff",
+                    "Simulate a PVC mount failure",
                 ],
             },
         ],
@@ -131,7 +132,7 @@ def get_agent_card() -> dict:
             "pod",
             "node",
             "namespace",
-            # 恢复/销毁相关
+            # Recovery / destroy related
             "recover",
             "恢复",
             "回滚",

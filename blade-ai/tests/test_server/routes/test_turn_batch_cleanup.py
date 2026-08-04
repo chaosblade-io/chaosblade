@@ -183,12 +183,12 @@ def test_batch_summary_contains_targets_and_freshness_note():
     )
 
     assert text.startswith("[Batch Summary] 2 faults")
-    assert "操作: batch_inject" in text
+    assert "Operation: batch_inject" in text
     assert "target=arms-prom/pod-a" in text
-    assert "失败原因: pod not found" in text
-    assert "批量分析报告: /tmp/batch.md" in text
-    assert "本概要及更早历史中的资源名仅作历史上下文" in text
-    assert "若要复用这些目标，必须重新 kubectl 验证当前存在性" in text
+    assert "Failure reason: pod not found" in text
+    assert "Batch analysis report: /tmp/batch.md" in text
+    assert "resource names in this summary and in earlier" in text
+    assert "current existence MUST be re-verified with kubectl" in text
 
 
 def test_recover_summary_contains_parent_task_and_verification():
@@ -213,9 +213,9 @@ def test_recover_summary_contains_parent_task_and_verification():
 
     assert text.startswith("[Recover Summary] task_id=task-recover")
     assert "parent_task_id: task-inject" in text
-    assert "类型: pod-pod-delete | 目标: arms-prom/pod-a" in text
-    assert "结果: recovered | blade_uid: uid-1" in text
-    assert "恢复验证: recovered (L1=passed, L2=passed)" in text
+    assert "Type: pod-pod-delete | Target: arms-prom/pod-a" in text
+    assert "Result: recovered | blade_uid: uid-1" in text
+    assert "Recovery verification: recovered (L1=passed, L2=passed)" in text
 
 
 def test_intent_trim_preserves_batch_and_recover_summaries():

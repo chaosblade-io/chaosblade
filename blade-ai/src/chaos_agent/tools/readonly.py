@@ -162,6 +162,14 @@ _IPTABLES_READONLY_FIRST = (
 )
 _NFT_READONLY_FIRST = ("list", "--version", "-v", "--help", "-h")
 _TC_MUTATING = ("add", "del", "delete", "change", "replace", "mod")
+# ChaosBlade CLI — read-only only for its experiment-inspection verbs.
+# ``create`` starts an experiment, ``destroy`` ends one (both mutate),
+# ``prepare``/``revoke`` install/remove the injection agent. ``status`` /
+# ``query`` inspect an experiment UID — the standard post-injection probe
+# inside a tool-pod exec. Task-5193538b: ``blade status --uid ...`` was
+# recorded as a kubectl-native INJECTION because ``blade`` was in neither
+# vocabulary and the fail-safe below judged it mutating.
+_BLADE_READONLY_VERBS = frozenset({"status", "query", "version", "-h", "--help"})
 # ``ip`` mutating verbs across objects (link/addr/route/neigh/rule/...).
 # ``exec`` (``ip netns exec ns1 <cmd>``) runs an ARBITRARY command inside a
 # namespace; it appears in no read-only ip invocation, so keying on the bare
@@ -257,6 +265,25 @@ _CURL_MUTATING_LONG_PREFIXES = (
     "--cookie-jar", "--dump-header", "--trace",
 )
 _CURL_MUTATING_SHORT_CHARS = frozenset("oOdFTKcD")
+#: Discard sinks. ``-o /dev/null`` (curl) and ``-O /dev/null`` (wget) throw the
+#: body away rather than writing a file, which is how a latency probe asks for
+#: timing without the payload: ``curl -s -o /dev/null -w '%{time_total}'``. Both
+#: forms were refused as "writes local files", so a drill measuring injected
+#: network delay had no way to read the actual millisecond figure and fell back
+#: to a coarse timeout flip (observed on task-15543b7b, which tried ``-o
+#: /dev/null`` and ``-O /dev/null`` in succession and got neither).
+#:
+#: Only these exact paths. A discard sink is recognised by its path, so anything
+#: else — including ``/dev/stdout`` or a writable device — stays refused.
+_DISCARD_SINKS = frozenset({"/dev/null"})
+#: dd operands that keep a discard-sink read from being read-only. ``seek``
+#: positions the OUTPUT, which is meaningless for /dev/null but signals intent
+#: to write at an offset; ``conv`` / ``oflag`` change how the sink is opened
+#: (``conv=notrunc``, ``oflag=append``) and ``status`` is the only other operand
+#: worth allowing. Anything that is not a pure read parameter is refused so a
+#: discard sink cannot be used to smuggle a write form past the check.
+_DD_MUTATING_OPERANDS = ("seek", "conv", "oflag")
+
 # wget — its DEFAULT is to write the response into a cwd file, so the verdict
 # is inverted: read-only only for ``--spider`` or output explicitly redirected
 # to stdout (``-O -`` / ``--output-document=-`` / bundled ``-qO-``).
@@ -408,6 +435,58 @@ def _reachable_cluster(token: str, valueless: frozenset[str]) -> str:
     return "".join(out)
 
 
+def _drop_discard_output(
+    args: list[str], flags: tuple[str, ...], *, cluster_of: frozenset[str]
+) -> list[str]:
+    """Remove ``<flag> /dev/null`` pairs so the mutating scan does not see them.
+
+    Writing to a discard sink is not a write (see :data:`_DISCARD_SINKS`), but
+    the scans that follow judge a token by its flag alone and cannot look at the
+    value. Consuming the pair here keeps those scans untouched: every other
+    write or upload flag still reaches them, and a non-discard value leaves the
+    flag in place so it is refused exactly as before.
+
+    Handles the three spellings a caller may use: separate (``-o /dev/null``),
+    attached long (``--output=/dev/null``), and bundled short (``-so
+    /dev/null``) — for the bundle only the output character is dropped, the rest
+    of the cluster is preserved so a co-bundled write flag is still caught.
+    """
+    short = tuple(f for f in flags if not f.startswith("--"))
+    long_ = tuple(f for f in flags if f.startswith("--"))
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        nxt = args[i + 1] if i + 1 < len(args) else None
+
+        # ``--output=/dev/null``
+        if tok.startswith(long_) and "=" in tok:
+            name, value = tok.split("=", 1)
+            if name in long_ and value in _DISCARD_SINKS:
+                i += 1
+                continue
+
+        # ``-o /dev/null`` / ``--output /dev/null``
+        if tok in flags and nxt in _DISCARD_SINKS:
+            i += 2
+            continue
+
+        # ``-so /dev/null`` — drop only the output char from the cluster.
+        if nxt in _DISCARD_SINKS and tok.startswith("-") and not tok.startswith("--"):
+            cluster = _reachable_cluster(tok, cluster_of)
+            chars = {f.lstrip("-") for f in short}
+            if cluster and cluster[-1] in chars:
+                kept = "-" + cluster[:-1]
+                if len(kept) > 1:
+                    out.append(kept)
+                i += 2
+                continue
+
+        out.append(tok)
+        i += 1
+    return out
+
+
 def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None]:
     """Classify a single command (one pipeline stage). Returns (ok, reason)."""
     if not tokens:
@@ -424,11 +503,11 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         # No wrapped command: ``env`` alone dumps the environment (read-only);
         # a bare wrapper otherwise does nothing observable.
         return (True, None) if binary in _READONLY_BINARIES else (
-            False, f"'{binary}' 未包裹任何命令,无法判定只读性"
+            False, f"'{binary}' wraps no command, so read-only status cannot be determined"
         )
 
     if binary in _ESCAPE_PRIMITIVES or binary.startswith("/host"):
-        return False, f"'{binary}' 触及宿主机/容器逃逸,不属只读探测"
+        return False, f"'{binary}' reaches the host / escapes the container, not a read-only probe"
 
     # Netfilter tooling — read-only only in list/version forms.
     if binary in ("iptables", "ip6tables"):
@@ -436,26 +515,35 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         if ok:
             return True, None
         return False, (
-            f"'{binary}' 仅 -L/-S/--list/--version 为只读"
-            f"(收到 '{args[0] if args else '无参数'}';-A/-D/-I/-F 等为变更)"
+            f"'{binary}' is read-only only with -L/-S/--list/--version "
+            f"(got '{args[0] if args else 'no arguments'}'; -A/-D/-I/-F etc. mutate)"
         )
     if binary == "nft":
         ok = bool(args) and args[0] in _NFT_READONLY_FIRST
         if ok:
             return True, None
-        return False, "'nft' 仅 list/--version 为只读(add/delete/flush 为变更)"
+        return False, "'nft' is read-only only with list/--version (add/delete/flush mutate)"
     if binary == "tc":
         mutating = any(a in _TC_MUTATING for a in args)
         if not mutating:
             return True, None
-        return False, "'tc' add/del/change/replace 为变更(仅 show/qdisc 查询只读)"
+        return False, "'tc' add/del/change/replace mutate (only show/qdisc queries are read-only)"
+
+    # blade — read-only only for experiment inspection (see _BLADE_READONLY_VERBS).
+    if binary == "blade":
+        if args and args[0] in _BLADE_READONLY_VERBS:
+            return True, None
+        return False, (
+            "'blade' is read-only only for status/query/version "
+            f"(got '{args[0] if args else 'no arguments'}'; create/destroy/prepare/revoke mutate)"
+        )
 
     # ip — read-only unless a mutating verb (set/add/del/...) is present.
     if binary == "ip":
         mutating = any(a in _IP_MUTATING for a in args)
         if not mutating:
             return True, None
-        return False, "'ip' 仅 show/list/get 为只读(set/add/del/flush 为变更)"
+        return False, "'ip' is read-only only with show/list/get (set/add/del/flush mutate)"
 
     # systemctl — read-only only for its status/show verbs.
     if binary == "systemctl":
@@ -463,8 +551,8 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         if verb in _SYSTEMCTL_READONLY_VERBS:
             return True, None
         return False, (
-            "'systemctl' 仅 status/is-active/is-enabled/show/list-units 等只读动词"
-            f"(收到 '{verb or '无动词'}';start/stop/restart 为变更)"
+            "'systemctl' is read-only only for verbs like status/is-active/is-enabled/show/list-units "
+            f"(got '{verb or 'no verb'}'; start/stop/restart mutate)"
         )
 
     # mount — read-only only when listing (no target device/dir, no remount).
@@ -479,7 +567,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
         if not mutating:
             return True, None
-        return False, "'mount' 仅无参/-l 列表为只读(挂载/-o/-a/remount 为变更)"
+        return False, "'mount' is read-only only with no arguments or -l (mounting/-o/-a/remount mutate)"
 
     # dmesg — read-only unless clearing the ring buffer.
     if binary == "dmesg":
@@ -489,7 +577,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
                    for ch in _reachable_cluster(a, _DMESG_VALUELESS_SHORT))
             for a in args
         ):
-            return False, "'dmesg' -C/-c 清空内核环缓冲为变更(只读仅读取)"
+            return False, "'dmesg' -C/-c clears the kernel ring buffer, which mutates (read-only only reads)"
         return True, None
 
     # journalctl — reading the journal is read-only; maintenance verbs are not.
@@ -500,8 +588,8 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
         if bad:
             return False, (
-                f"'journalctl' {bad} 会写入/清理日志存储为变更"
-                "(只读仅查询,如 -u/-n/--since)"
+                f"'journalctl' {bad} writes to / cleans up the journal store, which mutates"
+                " (read-only only queries, e.g. -u/-n/--since)"
             )
         return True, None
 
@@ -511,8 +599,8 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
             "=" in a and not a.startswith("-") for a in args
         ):
             return False, (
-                "'sysctl' 仅读取形式为只读(如 -a / -n key / key)"
-                ";-w、key=value、-p 为写入内核参数"
+                "'sysctl' is read-only only in read form (e.g. -a / -n key / key)"
+                "; -w, key=value and -p write kernel parameters"
             )
         return True, None
 
@@ -524,14 +612,14 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
              if a in _DATE_MUTATING_FLAGS or a.startswith("--set=")), None,
         )
         if bad is not None:
-            return False, f"'date' {bad} 设置系统时间为变更(时钟漂移故障,非探测)"
+            return False, f"'date' {bad} sets the system clock, which mutates (that IS the clock-skew fault, not a probe)"
         return True, None
 
     # route — printing the table is read-only; add/del/flush edit it.
     if binary == "route":
         bad = next((a for a in args if a in _ROUTE_MUTATING_VERBS), None)
         if bad is not None:
-            return False, f"'route' {bad} 修改路由表为变更(仅无参/-n 列表为只读)"
+            return False, f"'route' {bad} edits the routing table, which mutates (only no arguments or -n listing is read-only)"
         return True, None
 
     # ethtool — inspects by default; setter flags change the NIC.
@@ -539,8 +627,8 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         bad = next((a for a in args if a in _ETHTOOL_MUTATING_FLAGS), None)
         if bad is not None:
             return False, (
-                f"'ethtool' {bad} 修改网卡配置为变更"
-                "(仅无参/-i/-S/-k/-g/-a/-c 查询为只读)"
+                f"'ethtool' {bad} changes the NIC configuration, which mutates"
+                " (only no arguments or -i/-S/-k/-g/-a/-c queries are read-only)"
             )
         return True, None
 
@@ -549,7 +637,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         bad = next((a for a in args if a in _CONNTRACK_MUTATING_FLAGS), None)
         if bad is not None:
             return False, (
-                f"'conntrack' {bad} 删除/刷新连接跟踪表为变更(仅 -L/-S/-G 只读)"
+                f"'conntrack' {bad} deletes / flushes the connection-tracking table, which mutates (only -L/-S/-G are read-only)"
             )
         return True, None
 
@@ -557,13 +645,13 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     if binary == "swapon":
         if any(a in _SWAPON_READONLY_FLAGS for a in args):
             return True, None
-        return False, "'swapon' 默认启用交换分区为变更(仅 -s/--show 列表为只读)"
+        return False, "'swapon' enables swap by default, which mutates (only the -s/--show listing is read-only)"
 
     # arp — prints the cache unless -d (delete) / -s (add static) edit it.
     if binary == "arp":
         bad = next((a for a in args if a in _ARP_MUTATING_FLAGS), None)
         if bad is not None:
-            return False, f"'arp' {bad} 修改 ARP 缓存为变更(仅无参/-a/-n 查询为只读)"
+            return False, f"'arp' {bad} edits the ARP cache, which mutates (only no arguments or -a/-n queries are read-only)"
         return True, None
 
     # numactl — ``-H``/``--hardware`` / ``-s``/``--show`` inspect; any other form
@@ -576,9 +664,9 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
             # No wrapped command: read-only only if every flag is an inspect flag.
             if args and all(a in _RO for a in args):
                 return True, None
-            return False, "'numactl' 仅 -H/--hardware/-s/--show 查询为只读"
+            return False, "'numactl' is read-only only for -H/--hardware/-s/--show queries"
         if _depth >= 3:
-            return False, "'numactl' 嵌套层数过深,无法可靠判定只读性"
+            return False, "'numactl' nesting is too deep to determine read-only status reliably"
         # First non-option token onward is the wrapped command it runs.
         return _classify_argv(args[args.index(non_opt[0]):], _depth + 1)
 
@@ -595,9 +683,9 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         if verb in _RUNTIME_READONLY_VERBS:
             return True, None
         return False, (
-            f"'{binary}' 仅 ps/images/inspect/logs/stats/version 等查询动词为只读"
-            f"(收到 '{verb or '无动词'}';exec/rm/kill/stop/run、"
-            "以及 image/config 等带子动词的分组动词均为变更)"
+            f"'{binary}' is read-only only for query verbs like ps/images/inspect/logs/stats/version "
+            f"(got '{verb or 'no verb'}'; exec/rm/kill/stop/run, "
+            "and grouped verbs with sub-verbs such as image/config, all mutate)"
         )
 
     # find — read-only only WITHOUT its action primitives. ``-exec``/``-ok``
@@ -608,7 +696,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         bad = next((a for a in args if a in _FIND_MUTATING_FLAGS), None)
         if bad is not None:
             return False, (
-                f"'find' 仅遍历/打印为只读;{bad} 会执行命令/删除/写文件"
+                f"'find' is read-only only for traversal/printing; {bad} runs commands / deletes / writes files"
             )
         return True, None
 
@@ -628,8 +716,8 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
         if bad is not None:
             return False, (
-                f"'awk' 仅过滤/打印为只读;{bad} 可执行命令或加载程序文件"
-                "(system()/@load/-f)"
+                f"'awk' is read-only only for filtering/printing; {bad} can run commands or load program files"
+                " (system()/@load/-f)"
             )
         return True, None
 
@@ -637,7 +725,13 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
     # Output/upload forms write local files or move host data off-box. Short
     # forms are read through ``_reachable_cluster`` so a bundled ``-so file``
     # is caught while a value-carrying ``-XGET`` is not mistaken for flags.
+    #
+    # ``-o /dev/null`` is the exception: it discards the body instead of writing
+    # a file, which is the standard way to time a request without its payload.
+    # Recognised before the mutating scan, and only for that flag — an upload or
+    # a config read stays refused however its own value is spelled.
     if binary == "curl":
+        args = _drop_discard_output(args, ("-o", "--output"), cluster_of=_CURL_VALUELESS_SHORT)
         bad = next(
             (a for a in args
              if a.startswith(_CURL_MUTATING_LONG_PREFIXES)
@@ -647,15 +741,23 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
         if bad is not None:
             return False, (
-                f"'curl' 仅 GET/HEAD 输出到标准输出为只读;{bad} 会写本地文件"
-                "或上传数据"
+                f"'curl' is read-only only when GET/HEAD output goes to stdout; {bad} writes local files"
+                " or uploads data"
             )
         return True, None
 
     # wget — DEFAULT is to write the response into a cwd file, so the verdict
     # is inverted: read-only only for ``--spider`` or output explicitly sent
     # to stdout (``-O -`` / ``--output-document=-`` / bundled ``-qO-``).
+    #
+    # ``-o``/``-a``/``--output-file`` redirect the LOG, a sink separate from the
+    # document, so they are dropped here on the same discard rule: ``wget -o
+    # /dev/null -qO- <url>`` keeps both sinks off disk. The document check below
+    # is untouched and still decides on its own.
     if binary == "wget":
+        args = _drop_discard_output(
+            args, ("-o", "-a", "--output-file"), cluster_of=_WGET_VALUELESS_SHORT
+        )
         bad = next(
             (a for a in args
              if a.startswith(_WGET_MUTATING_LONG_PREFIXES)
@@ -664,17 +766,21 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         )
         if bad is not None:
             return False, (
-                f"'wget' 仅 --spider 或输出到标准输出为只读;{bad} 会写本地文件"
-                "或上传数据"
+                f"'wget' is read-only only with --spider or output to stdout; {bad} writes local files"
+                " or uploads data"
             )
         if "--spider" in args:
             return True, None
         stdout_out = False
         for i, a in enumerate(args):
             if a in ("-O", "--output-document"):
-                stdout_out = i + 1 < len(args) and args[i + 1] == "-"
+                # ``-`` is stdout; ``/dev/null`` discards. Both leave nothing on
+                # disk, which is what this check is actually asking about.
+                nxt = args[i + 1] if i + 1 < len(args) else None
+                stdout_out = nxt == "-" or nxt in _DISCARD_SINKS
             elif a.startswith("--output-document="):
-                stdout_out = a.split("=", 1)[1] == "-"
+                value = a.split("=", 1)[1]
+                stdout_out = value == "-" or value in _DISCARD_SINKS
             else:
                 # Bundled cluster (``-O-`` / ``-qO-``): only when ``O`` is the
                 # LAST reachable option character is the tail its value. A
@@ -684,12 +790,18 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
                 # read-only.
                 cluster = _reachable_cluster(a, _WGET_VALUELESS_SHORT)
                 if cluster.endswith("O"):
-                    stdout_out = a.split("O", 1)[1] == "-"
+                    tail = a.split("O", 1)[1]
+                    # ``-qO /dev/null`` puts the sink in the NEXT token.
+                    if tail == "":
+                        nxt = args[i + 1] if i + 1 < len(args) else None
+                        stdout_out = nxt == "-" or nxt in _DISCARD_SINKS
+                    else:
+                        stdout_out = tail == "-" or tail in _DISCARD_SINKS
         if stdout_out:
             return True, None
         return False, (
-            "'wget' 默认把响应写入当前目录文件;仅 --spider 或 -O- (标准输出)"
-            "为只读"
+            "'wget' writes the response into a file in the current directory by default; only --spider,"
+            " -O- (stdout) or -O /dev/null (discard) is read-only"
         )
 
     # command — ``command -v X`` resolves a path and runs nothing (the probe
@@ -711,11 +823,11 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
         if not wrapped:
             return True, None  # bare ``command`` does nothing observable
         if _depth >= 3:
-            return False, "'command' 嵌套层数过深,无法可靠判定只读性"
+            return False, "'command' nesting is too deep to determine read-only status reliably"
         ok, reason = _classify_argv(wrapped, _depth + 1)
         if ok:
             return True, None
-        return False, f"'command' 执行的不是只读命令:{reason}"
+        return False, f"'command' does not execute a read-only command: {reason}"
 
     # sort / sar — ``-o`` writes (and truncates) an arbitrary path. The short
     # form is matched as a PREFIX because GNU getopt accepts an attached value
@@ -728,14 +840,14 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
             None,
         )
         if bad is not None:
-            return False, f"'sort' {bad} 会写入(覆盖)文件,不属只读诊断"
+            return False, f"'sort' {bad} writes (and truncates) a file, not a read-only diagnostic"
         return True, None
     if binary == "sar":
         bad = next(
             (a for a in args if a.startswith(_SAR_MUTATING_SHORT_PREFIXES)), None,
         )
         if bad is not None:
-            return False, f"'sar' {bad} 会写入数据文件,不属只读诊断"
+            return False, f"'sar' {bad} writes a data file, not a read-only diagnostic"
         return True, None
 
     # ss — ``-K``/``--kill`` force-closes every matching socket. That is a
@@ -748,7 +860,7 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
             None,
         )
         if bad is not None:
-            return False, f"'ss' {bad} 会强制关闭匹配的 socket,属故障注入"
+            return False, f"'ss' {bad} force-closes every matching socket, which is fault injection"
         return True, None
 
     # uniq — ``uniq INPUT OUTPUT``: the second positional is an output file.
@@ -765,15 +877,39 @@ def _classify_argv(tokens: list[str], _depth: int = 0) -> tuple[bool, str | None
             i += 1
         if len(positionals) > 1:
             return False, (
-                f"'uniq' 第二个位置参数是输出文件({positionals[1]}),会写入文件"
+                f"'uniq' treats the second positional argument as an output file ({positionals[1]}), which writes to a file"
             )
         return True, None
 
+    # dd — a writer by default, and that is why it sits in
+    # ``_MUTATING_BINARIES``. But ``of=/dev/null`` makes it a pure reader, and
+    # that form is how disk-IO verification measures read throughput: the skill
+    # cases themselves run ``dd if=<file> of=/dev/null bs=1M count=100`` to show
+    # a latency injection slowed reads down. Refusing it left no standard way to
+    # time a read at all.
+    #
+    # Requires an explicit discard ``of=`` AND a source ``if=``. Without ``if=``
+    # dd reads stdin, which no probe surface supplies — the form is either a
+    # no-op or half of a pipeline, so it earns no exemption. Bare ``dd`` and any
+    # real output path stay refused, as do the conversion operands that change
+    # what is written even when the sink is discarded.
+    if binary == "dd":
+        operands = {
+            k: v for k, _, v in (a.partition("=") for a in args) if _
+        }
+        if operands.get("of") in _DISCARD_SINKS and operands.get("if"):
+            bad = next((f for f in _DD_MUTATING_OPERANDS if f in operands), None)
+            if bad is None:
+                return True, None
+            return False, (
+                f"'dd' reading into a discard sink is read-only, but {bad}= changes what is written"
+            )
+
     if binary in _MUTATING_BINARIES:
-        return False, f"'{binary}' 是写入/负载型命令,不属只读诊断"
+        return False, f"'{binary}' is a write/load-generating command, not a read-only diagnostic"
     if binary in _READONLY_BINARIES:
         return True, None
-    return False, f"'{binary}' 非已知只读诊断命令"
+    return False, f"'{binary}' is not a known read-only diagnostic command"
 
 
 def _classify_inner(inner: list[str], _depth: int = 0) -> tuple[bool, str | None]:
@@ -793,7 +929,7 @@ def _classify_inner(inner: list[str], _depth: int = 0) -> tuple[bool, str | None
         return True, None  # bare exec (interactive/attach) → read-only
     inner = _host_entry_tokens(inner)
     if not inner:
-        return False, "sh -c 内容为空或无法解析"
+        return False, "sh -c body is empty or cannot be parsed"
 
     # Escape prefix: judge the wrapped command. Wrappers are stripped first so
     # ``timeout 5 chroot /host df -h`` is recognised as an escape probe rather
@@ -804,24 +940,24 @@ def _classify_inner(inner: list[str], _depth: int = 0) -> tuple[bool, str | None
     entry = inner[0].rsplit("/", 1)[-1] if inner else ""
     if entry in _ESCAPE_PRIMITIVES:
         if _depth >= 2:
-            return False, f"'{entry}' 嵌套层数过深,无法可靠判定只读性"
+            return False, f"'{entry}' nesting is too deep to determine read-only status reliably"
         unwrapped = _unwrap_escape(inner)
         if not unwrapped:
             return False, (
-                f"'{entry}' 后未能解析出要执行的命令,按不安全处理"
-                "(只读探测需形如 chroot /host <只读命令>)"
+                f"'{entry}' is followed by no parseable command, so it is treated as unsafe"
+                " (a read-only probe must look like: chroot /host <read-only command>)"
             )
         ok, reason = _classify_inner(unwrapped, _depth + 1)
         if ok:
             return True, None
-        return False, f"'{entry}' 进入宿主机后执行的不是只读命令:{reason}"
+        return False, f"'{entry}' does not run a read-only command once on the host: {reason}"
 
     inner_str = " ".join(inner)
     for op in _SHELL_CONTROL_OPS:
         if op in inner_str:
             return False, (
-                f"包含 shell 控制符 '{op.strip() or op!r}'"
-                "(重定向/命令链/后台/替换),只读探测不允许"
+                f"contains the shell control operator '{op.strip() or op!r}'"
+                " (redirect/command chain/background/substitution), which a read-only probe does not allow"
             )
     if "|" in inner:
         stages: list[list[str]] = []
@@ -838,7 +974,7 @@ def _classify_inner(inner: list[str], _depth: int = 0) -> tuple[bool, str | None
                 continue
             ok, reason = _classify_argv(stage)
             if not ok:
-                return False, f"管道中某段非只读:{reason}"
+                return False, f"a pipeline stage is not read-only: {reason}"
         return True, None
     return _classify_argv(inner)
 
@@ -852,7 +988,7 @@ def _parse_exec_inner(v_args: str) -> tuple[bool, list[str] | None, str | None]:
     try:
         tokens = shlex.split(v_args)
     except ValueError:
-        return True, None, "命令无法解析(shell 引号不匹配)"
+        return True, None, "command cannot be parsed (unbalanced shell quotes)"
     if "--" not in tokens:
         return False, None, None  # no inner command (pure entry) → read-only
     inner = tokens[tokens.index("--") + 1:]
@@ -926,19 +1062,19 @@ def host_command_rejection_reason(command: str) -> str | None:
     """Specific reason a bare host command is NOT an allowed read-only
     diagnostic, or ``None`` when it is."""
     if not command or not command.strip():
-        return "空命令"
+        return "empty command"
     for bad in _HOST_METACHARS:
         if bad in command:
             return (
-                f"包含 shell 元字符 '{bad}'"
-                "(host_read 只运行单条无管道/重定向的只读诊断)"
+                f"contains the shell metacharacter '{bad}'"
+                " (host_read only runs a single read-only diagnostic with no pipe/redirect)"
             )
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return "命令无法解析(shell 引号不匹配)"
+        return "command cannot be parsed (unbalanced shell quotes)"
     if not tokens:
-        return "空命令"
+        return "empty command"
     ok, reason = _classify_argv(tokens)
     return None if ok else reason
 

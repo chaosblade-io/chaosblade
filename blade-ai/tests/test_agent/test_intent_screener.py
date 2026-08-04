@@ -24,6 +24,29 @@ def test_rejects_host_probe_on_k8s_transport_without_rejecting_host_semantics():
     assert result["messages"][0].name == "host_read"
 
 
+def test_refusal_names_the_transport_in_force():
+    # The refusal used to be one fixed sentence ("unavailable for the current
+    # environment") for every tool in every profile — it never said WHICH
+    # environment was connected, leaving the model to retry variations. The
+    # capability gate already holds the resolved profile (the same rule the
+    # execute-phase screener follows), so the message must name it.
+    result = intent_screener({
+        "kube_connection_mode": "kubeconfig",
+        "fault_spec": {"scope": "host", "blade_target": "cpu", "blade_action": "fullload"},
+        "messages": [_tool_call("host_read")],
+    })
+
+    content = result["messages"][0].content
+    assert content.startswith("Error:")
+    # Names the tool, the profile it belongs to, and the transport in force.
+    assert "host_read" in content
+    assert "k8s" in content, f"transport in force not named: {content}"
+    # Keeps the standing instruction so the cause is paired with a move.
+    assert "Select a tool bound to the active transport." in content
+    # Not the old profile-agnostic template.
+    assert "unavailable for the current environment" not in content
+
+
 def test_allows_k8s_probe_even_when_semantic_intent_is_host():
     result = intent_screener({
         "kube_connection_mode": "kubeconfig",

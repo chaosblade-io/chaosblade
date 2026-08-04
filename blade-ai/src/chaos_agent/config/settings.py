@@ -221,8 +221,8 @@ class Settings(BaseSettings):
         valid = {"", "kubeconfig", "kubewiz_k8s", "kubewiz_host", "ssh"}
         if v not in valid:
             raise ValueError(
-                f"kube_connection_mode 无效: {v!r}；允许值: "
-                f"'' (空=自动推断) / kubeconfig / kubewiz_k8s / kubewiz_host / ssh"
+                f"Invalid kube_connection_mode: {v!r}; allowed values: "
+                f"'' (empty = auto-infer) / kubeconfig / kubewiz_k8s / kubewiz_host / ssh"
             )
         return v
 
@@ -236,7 +236,7 @@ class Settings(BaseSettings):
         fail deep inside ``ssh`` at execution.
         """
         if not (1 <= v <= 65535):
-            raise ValueError(f"ssh_port 超出范围 (1-65535): {v}")
+            raise ValueError(f"ssh_port out of range (1-65535): {v}")
         return v
 
     @field_validator("ssh_strict_host_key_checking")
@@ -250,7 +250,7 @@ class Settings(BaseSettings):
         valid = {"accept-new", "yes", "no"}
         if v not in valid:
             raise ValueError(
-                f"ssh_strict_host_key_checking 无效: {v!r}；允许值: accept-new / yes / no"
+                f"Invalid ssh_strict_host_key_checking: {v!r}; allowed values: accept-new / yes / no"
             )
         return v
 
@@ -268,10 +268,13 @@ class Settings(BaseSettings):
         """
         if v < 1:
             raise ValueError(
-                f"hint_escalate_after 无效: {v}；必须 >= 1。\n"
-                f"它是纠错提示从'覆盖单条'升级为'逐条累积'的触发次数，"
-                f"<= 0 会让第 1 次提示就开始堆积，历史每轮多一条。\n"
-                f"修复: 设为 >= 1（默认 3；越小越早开始堆积，代价是上下文）。"
+                f"Invalid hint_escalate_after: {v}; must be >= 1.\n"
+                f"It is the occurrence count at which a corrective hint escalates from "
+                f"'overwrite a single entry' to 'accumulate one per occurrence'; "
+                f"<= 0 makes the very first hint start piling up, adding one history "
+                f"entry every turn.\n"
+                f"Fix: set it to >= 1 (default 3; smaller starts piling up sooner, "
+                f"at the cost of context)."
             )
         return v
 
@@ -345,16 +348,17 @@ class Settings(BaseSettings):
         min_messages = turns_to_fit * _TYPICAL_MESSAGES_PER_TURN
         if self.loop_detection_window < min_messages:
             raise ValueError(
-                f"loop_detection_window ({self.loop_detection_window}) 是消息数上限，"
-                f"位于轮次窗口之外，过小会盖住轮次窗口使循环检测器永久静默失效"
-                f"（不报错、不触发）。\n"
-                f"需要 >= {min_messages}（= 待容纳 {turns_to_fit} 轮 × 每轮典型 "
-                f"{_TYPICAL_MESSAGES_PER_TURN} 条消息）；当前 loop_detection_turns="
-                f"{self.loop_detection_turns}, loop_detection_threshold="
+                f"loop_detection_window ({self.loop_detection_window}) is the message cap "
+                f"that sits outside the turn window; too small a value masks the turn "
+                f"window and leaves the loop detectors permanently silent "
+                f"(no error, never fires).\n"
+                f"Needs >= {min_messages} (= {turns_to_fit} turn(s) to fit × "
+                f"{_TYPICAL_MESSAGES_PER_TURN} typical messages per turn); current "
+                f"loop_detection_turns={self.loop_detection_turns}, loop_detection_threshold="
                 f"{self.loop_detection_threshold}, stagnation_threshold="
                 f"{self.stagnation_threshold}\n"
-                f"修复: 把 loop_detection_window 调到 >= {min_messages}，"
-                f"或调低 loop_detection_turns / 阈值。"
+                f"Fix: raise loop_detection_window to >= {min_messages}, "
+                f"or lower loop_detection_turns / the thresholds."
             )
 
         if self.loop_detection_turns <= 0:
@@ -364,13 +368,14 @@ class Settings(BaseSettings):
 
         if self.loop_detection_turns < widest:
             raise ValueError(
-                f"loop_detection_turns ({self.loop_detection_turns}) 小于检测阈值 "
-                f"({widest})，两个循环检测器将永久静默失效（不报错、不触发）。\n"
-                f"当前: loop_detection_turns={self.loop_detection_turns}, "
+                f"loop_detection_turns ({self.loop_detection_turns}) is below the detection "
+                f"threshold ({widest}), which leaves both loop detectors permanently silent "
+                f"(no error, never fires).\n"
+                f"Current: loop_detection_turns={self.loop_detection_turns}, "
                 f"loop_detection_threshold={self.loop_detection_threshold}, "
                 f"stagnation_threshold={self.stagnation_threshold}\n"
-                f"修复: 把 loop_detection_turns 调到 >= {widest}，"
-                f"或调低阈值；设为 0 可显式关闭轮次窗口（改用消息数上限）。"
+                f"Fix: raise loop_detection_turns to >= {widest}, or lower the thresholds; "
+                f"set it to 0 to explicitly disable the turn window (using the message cap instead)."
             )
         return self
 
@@ -518,8 +523,10 @@ class Settings(BaseSettings):
     experiment_timeout: int = 600            # BLADE_AI_EXPERIMENT_TIMEOUT
 
     # Confirm gate 等待用户决策的最大秒数 — 超过则服务端礼貌中断 turn，避免用户离开后未回收 future
-    # 默认 1800s (30 分钟) 对绝大多数排查场景够用；遇到复杂研判可调长，例如 7200 (2h)
-    confirm_wait_timeout: int = 3600         # BLADE_AI_CONFIRM_WAIT_TIMEOUT
+    # 默认 21600s (6 小时)：确认卡片弹出后用户常被别的事打断，1 小时的窗口实测太短
+    # ——回来时 turn 已被回收，只能从头再来。这个超时的目的是回收资源，不是催促决策，
+    # 所以宁可给足时间。需要更严格的窗口时调小，例如 3600 (1h)。
+    confirm_wait_timeout: int = 21600        # BLADE_AI_CONFIRM_WAIT_TIMEOUT
 
     # OpenTelemetry GenAI export (parallel to built-in tracing)
     otel_enabled: bool = False              # BLADE_AI_OTEL_ENABLED
@@ -629,9 +636,11 @@ class Settings(BaseSettings):
     max_inject_seconds: int = 0                  # BLADE_AI_MAX_INJECT_SECONDS
 
     # Patch B — INFRA_TRANSIENT 类错误的额外短重试预算
-    # 当 ``classify_error`` 判定 ErrorAction.SHORT_RETRY 时，router
-    # 允许 LLM 再发起最多 N 次同样的 tool 调用；超出后转 "end"。3
-    # 是经验上不会让用户感到卡顿的合理上限。
+    # 当 ``classify_error`` 判定 ErrorAction.SHORT_RETRY 时，允许 LLM 再发起
+    # 最多 N 次同样的 tool 调用；超出后由
+    # ``react_helpers.detect_transient_retry_exhaustion`` 在 execute 阶段
+    # 注入升级提示（要求停止重试、replan 或判定失败）。0 = 关闭。
+    # 3 是经验上不会让用户感到卡顿的合理上限。
     max_transient_retry: int = 3                 # BLADE_AI_MAX_TRANSIENT_RETRY
 
     # Patch D — Target health pre-check

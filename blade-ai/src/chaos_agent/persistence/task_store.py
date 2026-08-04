@@ -21,6 +21,7 @@ Usage::
     metrics = await store.get_metric("task-1")
 """
 
+import asyncio
 import atexit
 import json
 import logging
@@ -589,26 +590,50 @@ async def reset_task_store() -> None:
 
 
 def _sync_close_store() -> None:
-    """atexit callback: synchronously close the TaskStore.
+    """atexit / per-test callback: close the TaskStore, stopping its worker thread.
 
-    For aiosqlite: the underlying ``sqlite3.Connection`` (``_conn._conn``)
-    can be closed synchronously and safely.  Calling ``_conn.close()``
-    directly would produce an unawaited-coroutine warning because
-    aiosqlite's ``Connection.close()`` is async.
+    A previous version closed only the underlying ``sqlite3.Connection``
+    (``_conn._conn``) and left aiosqlite's background worker thread running.
+    That thread keeps a reference to the event loop the connection was created
+    on; once that loop closes (e.g. pytest-asyncio's per-test loop), the
+    thread's next ``call_soon_threadsafe`` raises ``RuntimeError: Event loop is
+    closed``. Across a large suite the leaked threads accumulate and surface as
+    flaky, non-deterministic failures and hangs on CI.
 
-    For asyncpg: ``pool.close()`` is a coroutine that atexit cannot await,
-    but asyncpg's ``__del__`` handles cleanup.
+    The reliable stop is a real async ``close()`` — but it must run on a *live*
+    loop. We drive it on a fresh, throwaway loop: aiosqlite resolves the close
+    future via ``future.get_loop()`` (the fresh loop), so the worker completes
+    and exits cleanly regardless of whether the original loop is already gone.
+
+    For asyncpg: ``pool.close()`` is likewise awaited on the fresh loop.
     """
     global _store
-    if _store is not None and _store._backend is not None:
-        try:
-            if hasattr(_store._backend, "_conn") and _store._backend._conn is not None:
-                raw_conn = getattr(_store._backend._conn, "_conn", None)
-                if raw_conn is not None:
-                    raw_conn.close()  # sqlite3.Connection.close() is sync
-        except Exception:
-            pass
+    store = _store
     _store = None
+    if store is None or getattr(store, "_backend", None) is None:
+        return
+    backend = store._backend
+
+    # Preferred path: a clean async close that also stops the worker thread.
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(backend.close())
+        finally:
+            loop.close()
+        return
+    except Exception:
+        pass
+
+    # Best-effort fallback: close the raw sqlite3 connection directly. Leaves
+    # the worker thread if the async close was unavailable, but never raises.
+    try:
+        if hasattr(backend, "_conn") and backend._conn is not None:
+            raw_conn = getattr(backend._conn, "_conn", None)
+            if raw_conn is not None:
+                raw_conn.close()  # sqlite3.Connection.close() is sync
+    except Exception:
+        pass
 
 
 atexit.register(_sync_close_store)

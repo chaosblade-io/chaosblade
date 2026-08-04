@@ -144,34 +144,34 @@ async def host_inject(command: str, timeout: int = 60, task_id: str = "") -> str
     """Phase 2 ONLY. Execute ONE host-native fault command on the target host.
 
     Runs on the machine addressed by the CONFIGURED transport channel
-    (ssh / kubewiz_host). It CANNOT be pointed at a different machine per call —
-    there is no node/host/pod parameter, and passing one is refused rather than
-    ignored.
+    (ssh / kubewiz_host) — it CANNOT be pointed at a different machine per
+    call (no node/host/pod parameter; passing one is refused).
 
     Mutating: runs a real fault command (iptables / tc / stress-ng / dd /
-    fallocate / fio …) directly on the configured bare-metal / VM host, bypassing
-    ChaosBlade and kubectl. Use this only when the approved target is a host
-    (``scope=host``) and the skill case prescribes a native command; for K8s
-    faults use blade_create / kubectl instead.
+    fallocate / fio …) directly on the configured host, bypassing
+    ChaosBlade and kubectl. Use ONLY when the approved target is a host
+    (``scope=host``) and the skill case prescribes a native command; K8s
+    faults → blade_create / kubectl.
 
-    Safety: the command binary is checked against the host fault whitelist by the
-    tool guard — non-fault binaries (rm, curl, systemctl, …) are rejected. The
-    call is also drift-guarded against the approved host target. Recovery is
-    LLM-driven — the recover graph later runs the skill-case reverse command
-    through this same tool (there is no artifact-based auto-reversal).
+    When to use:
+      - Phase 2 host-scope injection prescribed by the skill case.
+
+    Safety: the binary is checked against the host fault whitelist by the
+    tool guard — non-fault binaries (rm, curl, systemctl, …) rejected. The
+    call is drift-guarded against the approved host target. Recovery is
+    LLM-driven: the recover graph later runs the skill-case reverse command
+    through this same tool (no artifact-based auto-reversal).
 
     Inputs:
-      - command: the full host command, e.g.
-          "iptables -A INPUT -p tcp --dport 80 -j DROP"
-          "tc qdisc add dev eth0 root netem delay 200ms"
-          "stress-ng --cpu 4 --timeout 600s"
-          "fallocate -l 5G /var/lib/chaos_fill.img"
+      - command: the full host command, e.g. "tc qdisc add dev eth0 root
+        netem delay 200ms", "stress-ng --cpu 4 --timeout 600s".
       - timeout: max seconds to wait for the command (default 60).
 
-    Output: command stdout on success; a string starting with "Error:" on
-            failure (guard rejection, non-zero exit, or transport error).
+    Output: command stdout on success; "Error:" on failure (guard
+            rejection, non-zero exit, or transport error).
 
-    Side effects: injects a real fault on the host until reversed / recovered.
+    Side effects: injects a real fault on the host until reversed /
+                  recovered.
     """
     target = TransportTarget.from_state({})
     try:
@@ -224,34 +224,33 @@ async def host_read(command: str, timeout: int = 30, task_id: str = "") -> str:
     """READ-ONLY host diagnostics. Run ONE read-only diagnostic on the target host.
 
     Runs on the machine addressed by the CONFIGURED transport channel
-    (ssh / kubewiz_host). It CANNOT be pointed at a different machine per call —
-    there is no node/host/pod parameter, and passing one is refused rather than
-    ignored. To observe a specific Kubernetes node, use ``kubectl_read``.
+    (ssh / kubewiz_host) — it CANNOT be pointed at a different machine per
+    call (no node/host/pod parameter; passing one is refused). To observe a
+    specific Kubernetes node, use ``kubectl_read``.
 
-    Read-only counterpart to host_inject and the host equivalent of
-    ``kubectl_read``: inspects host state (disk usage, load, process list,
-    network rules) directly on the configured host. Use it to verify a host
-    fault's effect or its recovery. It is READ-ONLY BY ENFORCEMENT — a mutating
-    command (``ip link set``, ``mount -o remount``, ``dmesg -C``, ``systemctl
-    stop``, ``iptables -A``, ``dd`` …) is REJECTED with the specific reason.
+    Host equivalent of ``kubectl_read``: inspects host state (disk usage,
+    load, process list, network rules) to verify a host fault's effect or
+    its recovery. READ-ONLY BY ENFORCEMENT — mutating commands
+    (``ip link set``, ``systemctl stop``, ``iptables -A``, ``dd`` …) are
+    REJECTED with the specific reason.
 
-    Safety: the command is validated by the shared read-only classifier — the
-    leading binary must be a read-only diagnostic
-    (df / ps / ls / cat / top / iostat / free / ss / netstat / ip show /
-    systemctl status / …) and dual-use tools are checked at the argument level;
-    shell metacharacters (pipe / redirect / chain / substitution) are rejected.
-    Anything else returns the specific reason without executing.
+    Safety: validated by the shared read-only classifier — the leading
+    binary must be a read-only diagnostic (df / ps / ls / cat / top /
+    iostat / free / ss / netstat / ip show / systemctl status / …),
+    dual-use tools are checked at argument level, shell metacharacters
+    (pipe / redirect / chain / substitution) rejected; anything else
+    returns the specific reason without executing.
+
+    When to use:
+      - Verifying a host fault's effect or its recovery.
 
     Inputs:
-      - command: the full diagnostic command, e.g.
-          "df -h /var/lib"
-          "iostat -xd 1 2"
-          "cat /proc/diskstats"
-          "iptables -L -n"
-          "ss -tnp"
+      - command: the full diagnostic command, e.g. "df -h /var/lib",
+        "iostat -xd 1 2", "iptables -L -n".
       - timeout: max seconds to wait (default 30).
 
-    Output: command stdout (or stderr) on success; "Error:" on rejection/failure.
+    Output: command stdout (or stderr) on success; "Error:" on
+            rejection/failure.
 
     Side effects: none (read-only).
     """

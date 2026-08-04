@@ -207,47 +207,47 @@ FAULT_PAYLOAD_SCHEMA: dict = {
         "kube_connection_mode": {
             "type": "string",
             "enum": ["", "kubeconfig", "kubewiz_k8s", "kubewiz_host", "ssh"],
-            "description": "显式通道覆盖：空=按字段自动推断；非空=强制指定通道（kubeconfig/kubewiz_k8s/kubewiz_host/ssh）。",
+            "description": "Explicit channel override: empty = infer from the other fields; non-empty = force this channel (kubeconfig/kubewiz_k8s/kubewiz_host/ssh).",
         },
         "kubewiz_url": {
             "type": "string",
-            "description": "KubeWiz 网关地址（kubewiz 通道使用）。",
+            "description": "KubeWiz gateway address (used by the kubewiz channels).",
         },
         "kubewiz_cluster_uuid": {
             "type": "string",
-            "description": "KubeWiz 目标集群 UUID。",
+            "description": "UUID of the target KubeWiz cluster.",
         },
         "kubewiz_profile": {
             "type": "string",
-            "description": "KubeWiz wiz task exec --profile 登录工号。",
+            "description": "Login employee ID for KubeWiz `wiz task exec --profile`.",
         },
         "kubewiz_token": {
             "type": "string",
-            "description": "KubeWiz 永久 token。",
+            "description": "KubeWiz permanent token.",
         },
         # Host transport parameters (for host-scope fault injection)
         "host_name": {
             "type": "string",
-            "description": "主机名/IP（kubewiz-host 通道用）。",
+            "description": "Host name or IP (used by the kubewiz-host channel).",
         },
         "ssh_host": {
             "type": "string",
-            "description": "SSH 主机地址（SSH 通道用）。",
+            "description": "SSH host address (used by the SSH channel).",
         },
         "ssh_user": {
             "type": "string",
-            "description": "SSH 登录用户。",
+            "description": "SSH login user.",
         },
         "ssh_key_path": {
             "type": "string",
-            "description": "SSH 私钥路径。",
+            "description": "Path to the SSH private key.",
         },
         "ssh_port": {
             "type": "integer",
             "default": 22,
             "minimum": 1,
             "maximum": 65535,
-            "description": "SSH 端口。",
+            "description": "SSH port.",
         },
         "direct": {"type": "boolean", "default": True},
         "auto_recover": {"type": "boolean", "default": True},

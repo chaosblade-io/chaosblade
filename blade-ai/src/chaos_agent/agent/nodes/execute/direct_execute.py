@@ -1261,9 +1261,9 @@ async def direct_execute(state: AgentState) -> dict:
             if _missing_nodes:
                 _preflight_blocked = True
                 _preflight_msg = (
-                    f"目标节点 {', '.join(_missing_nodes)} 上无 Running 的 ChaosBlade "
-                    f"DaemonSet Pod，节点级故障注入不可行。"
-                    f"请检查节点 DiskPressure/MemoryPressure 状态及 DaemonSet 运行情况。"
+                    f"No Running ChaosBlade DaemonSet pod on target node(s) "
+                    f"{', '.join(_missing_nodes)}, so node-level fault injection is not viable. "
+                    f"Check the node's DiskPressure/MemoryPressure conditions and whether the DaemonSet is running."
                 )
                 logger.error("Pre-flight check FAILED: %s", _preflight_msg)
                 tracker.complete(

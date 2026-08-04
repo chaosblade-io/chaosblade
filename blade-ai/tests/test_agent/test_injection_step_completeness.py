@@ -402,7 +402,40 @@ class TestDetectTerminalConclusionWiring:
         _detect_terminal_conclusion(self._text(), state, result)
         assert result.get("_injection_selfcheck_nudged") is True
 
-    def test_blade_uid_exits_without_selfcheck(self):
+    def test_blade_uid_alone_never_licenses_text_exit(self):
+        """A blade_uid without an injection_method attribution must NOT permit
+        a text-only exit: after an execute-time replan the UID survives the
+        seam (keep_blade_uid) as a recovery handle, and licensing the exit on
+        it alone re-opens the task-5193538b empty spin under the new
+        contract. The stall nudge must fire instead."""
+        state = {
+            "blade_uid": "abc123",
+            "skill_case_content": DAEMONSET_SKILL_CASE,
+            "messages": [],
+        }
+        result: dict = {}
+        _detect_terminal_conclusion(self._text(), state, result)
+        assert result.get("_execute_text_stall_count") == 1
+        assert "EXECUTION REQUIRED" in self._last_human(result)
+
+    def test_blade_uid_with_attributed_method_exits_without_selfcheck(self):
+        """The exit ticket is the method attribution: a single-step experiment
+        backend (host_blade) exits cleanly — the UID's evidence reached the
+        gate via the RESUME attribution, not as a standalone pass."""
+        state = {
+            "blade_uid": "abc123",
+            "injection_method": "host_blade",
+            "skill_case_content": DAEMONSET_SKILL_CASE,
+            "messages": [],
+        }
+        result: dict = {}
+        _detect_terminal_conclusion(self._text(), state, result)
+        assert "_injection_selfcheck_nudged" not in result
+        assert not result.get("messages")
+
+    def test_blade_uid_with_provisional_multistep_method_gets_selfcheck(self):
+        """uid + still-provisional kubectl_native (the pre-UPGRADE transition
+        state) no longer bypasses the one-shot step self-check."""
         state = {
             "blade_uid": "abc123",
             "injection_method": "kubectl_native",
@@ -411,8 +444,7 @@ class TestDetectTerminalConclusionWiring:
         }
         result: dict = {}
         _detect_terminal_conclusion(self._text(), state, result)
-        assert "_injection_selfcheck_nudged" not in result
-        assert not result.get("messages")
+        assert result.get("_injection_selfcheck_nudged") is True
 
     def test_selfcheck_is_one_shot(self):
         state = {

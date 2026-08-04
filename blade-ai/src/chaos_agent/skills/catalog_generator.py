@@ -59,24 +59,36 @@ def _content_fingerprint(content: str) -> str:
 def _dir_fingerprint(skill_dir: Path) -> str:
     """MD5 fingerprint from all files under skill_dir.
 
-    Based on relative paths + modification times so that any addition,
-    deletion, or content change invalidates the cache.
+    Based on relative paths + file *contents* so that any addition, deletion,
+    or content change invalidates the cache.
+
+    Content — not mtime — because mtime resolution varies across filesystems:
+    two same-size edits within one clock tick share an mtime on Linux/tmpfs
+    (so a stale cache would be reused), while a plain ``git checkout`` bumps
+    mtime without changing content (which would needlessly invalidate it).
+    Skill dirs are a handful of small markdown files, so hashing content is
+    cheap and makes the fingerprint deterministic across platforms.
     """
     if not skill_dir.exists() or not skill_dir.is_dir():
         return ""
-    parts: list[str] = []
+    h = hashlib.md5()
+    saw_file = False
     for f in sorted(skill_dir.rglob("*")):
-        if f.is_file():
-            try:
-                rel = f.relative_to(skill_dir)
-                mtime = f.stat().st_mtime
-                parts.append(f"{rel}:{mtime}")
-            except OSError:
-                continue
-    if not parts:
+        if not f.is_file():
+            continue
+        try:
+            rel = f.relative_to(skill_dir)
+            data = f.read_bytes()
+        except OSError:
+            continue
+        saw_file = True
+        h.update(str(rel).encode())
+        h.update(b"\0")
+        h.update(data)
+        h.update(b"\0")
+    if not saw_file:
         return ""
-    raw = "|".join(parts)
-    return hashlib.md5(raw.encode()).hexdigest()
+    return h.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -84,16 +96,18 @@ def _dir_fingerprint(skill_dir: Path) -> str:
 # ---------------------------------------------------------------------------
 
 _CATALOG_SYSTEM_PROMPT = """\
-根据 skill 目录结构，为每个故障用例生成标准化的列表条目，输出 JSON 数组。
+Given a skill directory structure, produce one standardized list entry per
+fault use case and output them as a JSON array.
 
-每个条目包含：
-- category: 故障分类（目录名），如"Pod_Pending""Pod_OOM内存异常"
-- use_case_name: 格式"根因 导致 分类"，如"节点资源不足 导致 Pod_Pending"
-- fault_symptom: 故障现象一句话
-- resource_path: 参考文件相对路径
-- example_cmd: 可直接执行的blade-ai inject命令
+Each entry contains:
+- category: the fault category (the directory name), e.g. "Pod_Pending", "Pod_OOM内存异常"
+- use_case_name: formatted as "<root cause> 导致 <category>", e.g. "节点资源不足 导致 Pod_Pending".
+  Keep the " 导致 " separator verbatim — downstream parsing splits on it.
+- fault_symptom: the fault symptom in one sentence
+- resource_path: the reference file's relative path
+- example_cmd: a directly executable blade-ai inject command
 
-只输出JSON数组，无其他内容。"""
+Output the JSON array only, with no other content."""
 
 
 def _scan_skill_structure(skill_dir: Path) -> str:
@@ -115,7 +129,7 @@ def _scan_skill_structure(skill_dir: Path) -> str:
                 stem = mf[:-3] if mf.endswith(".md") else mf
                 prefix = cat_dir.name + "_"
                 root_cause = stem[len(prefix):] if stem.startswith(prefix) else stem
-                lines.append(f"  - {mf}  (根因: {root_cause})")
+                lines.append(f"  - {mf}  (root cause: {root_cause})")
     return "\n".join(lines)
 
 

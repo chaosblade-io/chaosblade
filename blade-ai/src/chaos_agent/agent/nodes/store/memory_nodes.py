@@ -92,7 +92,7 @@ async def load_memory(state: AgentState) -> dict:
         from chaos_agent.persistence.task_store import get_task_store
         store = await get_task_store()
         namespace = _spec.namespace if _spec else ""
-        # 多租户隔离：仅查询当前租户的活跃实验
+        # Multi-tenant isolation: only query the current tenant's active experiments
         _tenant_id = state.get("tenant_id", "") or ""
         active = await store.query_active(namespace=namespace, tenant_id=_tenant_id)
         updates["experiment_history"] = active
@@ -120,15 +120,15 @@ async def load_memory(state: AgentState) -> dict:
     elif _spec and _spec.is_complete:
         # Direct mode (no NL input, structured spec) — synthesise a
         # HumanMessage from the spec so the agent has a clear request.
-        parts = [f"执行故障注入：{_spec.scope}-{_spec.blade_target}-{_spec.blade_action}"]
+        parts = [f"Execute fault injection: {_spec.scope}-{_spec.blade_target}-{_spec.blade_action}"]
         if _spec.namespace:
-            parts.append(f"目标命名空间: {_spec.namespace}")
+            parts.append(f"Target namespace: {_spec.namespace}")
         if _spec.names:
-            parts.append(f"目标名称: {', '.join(_spec.names)}")
+            parts.append(f"Target names: {', '.join(_spec.names)}")
         if _spec.params:
             param_str = ", ".join(f"{k}={v}" for k, v in _spec.params.items() if v)
             if param_str:
-                parts.append(f"参数: {param_str}")
+                parts.append(f"Parameters: {param_str}")
         kubeconfig = state.get("kubeconfig") or ""
         if kubeconfig:
             parts.append(f"kubeconfig: {kubeconfig}")
@@ -181,7 +181,7 @@ async def pipeline_init(state: AgentState) -> dict:
         from chaos_agent.persistence.task_store import get_task_store
         store = await get_task_store()
         namespace = _spec.namespace if _spec else ""
-        # 多租户隔离：仅查询当前租户的活跃实验
+        # Multi-tenant isolation: only query the current tenant's active experiments
         _tenant_id = state.get("tenant_id", "") or ""
         updates["experiment_history"] = await store.query_active(namespace=namespace, tenant_id=_tenant_id)
     except Exception as e:
@@ -193,15 +193,15 @@ async def pipeline_init(state: AgentState) -> dict:
         # Explicit id — same dedup-key rationale as load_memory above.
         updates["messages"] = [HumanMessage(content=nl_description, id=str(uuid4()))]
     elif _spec and _spec.is_complete:
-        parts = [f"执行故障注入：{_spec.scope}-{_spec.blade_target}-{_spec.blade_action}"]
+        parts = [f"Execute fault injection: {_spec.scope}-{_spec.blade_target}-{_spec.blade_action}"]
         if _spec.namespace:
-            parts.append(f"目标命名空间: {_spec.namespace}")
+            parts.append(f"Target namespace: {_spec.namespace}")
         if _spec.names:
-            parts.append(f"目标名称: {', '.join(_spec.names)}")
+            parts.append(f"Target names: {', '.join(_spec.names)}")
         if _spec.params:
             param_str = ", ".join(f"{k}={v}" for k, v in _spec.params.items() if v)
             if param_str:
-                parts.append(f"参数: {param_str}")
+                parts.append(f"Parameters: {param_str}")
         kubeconfig = state.get("kubeconfig") or ""
         if kubeconfig:
             parts.append(f"kubeconfig: {kubeconfig}")

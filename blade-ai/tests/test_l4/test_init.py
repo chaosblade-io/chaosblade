@@ -39,8 +39,8 @@ class TestGetAgentCard:
         groups = card["capability_groups"]
         assert isinstance(groups, list) and len(groups) >= 4
         names = [g["name"] for g in groups]
-        assert "故障注入" in names
-        assert "集群只读观察" in names
+        assert "Fault injection" in names
+        assert "Read-only cluster observation" in names
         # 每组都有 summary + 至少一个 example
         for g in groups:
             assert g.get("summary")

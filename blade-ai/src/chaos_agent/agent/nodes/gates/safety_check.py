@@ -122,7 +122,7 @@ def _attach_safety_score(
             )
             existing_detail = result.get("safety_checked_detail") or ""
             result["safety_checked_detail"] = (
-                f"{existing_detail}, 爆炸半径: cluster-wide"
+                f"{existing_detail}, blast radius: cluster-wide"
             )
             logger.info(
                 "blast_radius escalation: safe → warning (scope=%s)", br_scope,
@@ -237,7 +237,7 @@ async def safety_check(state: AgentState) -> dict:
     # query fails — never blocks safety_check.
     deep_signal: tuple[int, str] | None = None
     if settings.safety_score_topology_deep:
-        await dispatch_node_message("safety_check", "正在获取拓扑信号（副本数）...\n\n")
+        await dispatch_node_message("safety_check", "Collecting topology signals (replica count)...\n\n")
         deep_signal = await _get_topology_deep_signal(spec, kubeconfig or "")
 
     # 4. Blade conflict detection — record result, do NOT early-return.
@@ -268,7 +268,7 @@ async def safety_check(state: AgentState) -> dict:
     # semantics): explicit kubeconfig or a kubewiz gateway channel.
     _cluster_reachable = bool(kubeconfig) or is_kubewiz_channel()
     if _is_k8s_injection and _cluster_reachable:
-        await dispatch_node_message("safety_check", "正在检查集群冲突实验...\n\n")
+        await dispatch_node_message("safety_check", "Checking for conflicting experiments on the cluster...\n\n")
         namespace = spec.namespace
         labels = ",".join(f"{k}={v}" for k, v in spec.labels.items())
         target_names = ",".join(spec.names)
@@ -338,7 +338,7 @@ async def safety_check(state: AgentState) -> dict:
     health_rejected = False
     if settings.target_health_check_enabled:
         try:
-            await dispatch_node_message("safety_check", "正在检查目标健康状态...\n\n")
+            await dispatch_node_message("safety_check", "Checking target health...\n\n")
             from chaos_agent.agent.target_health import assess_target_health
 
             target_payload = {
@@ -371,7 +371,7 @@ async def safety_check(state: AgentState) -> dict:
     feas_rejected = False
     if settings.feasibility_check_enabled:
         try:
-            await dispatch_node_message("safety_check", "正在评估注入可行性...\n\n")
+            await dispatch_node_message("safety_check", "Assessing injection feasibility...\n\n")
             from chaos_agent.agent.spec.feasibility import assess_feasibility, FeasibilitySeverity
 
             feas = await assess_feasibility(spec, kubeconfig or "")
@@ -432,7 +432,7 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "confirm_required",
             "safety_reason": conflict_reason,
-            "safety_checked_detail": f"namespace={namespace} 合规, {len(conflict_uids)} 冲突实验 (同目标同动作)",
+            "safety_checked_detail": f"namespace={namespace} compliant, {len(conflict_uids)} conflicting experiment(s) (same target, same action)",
             "conflict_uids": conflict_uids,
             **conflict_extra,
         }
@@ -448,7 +448,7 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "warning",
             "safety_reason": conflict_reason,
-            "safety_checked_detail": f"namespace={namespace} 合规, {len(conflict_uids)} 活跃实验 (非同动作)",
+            "safety_checked_detail": f"namespace={namespace} compliant, {len(conflict_uids)} active experiment(s) (different action)",
             "conflict_uids": conflict_uids,
         }
     elif _is_k8s_injection and not _cluster_reachable:
@@ -458,8 +458,8 @@ async def safety_check(state: AgentState) -> dict:
             detail={"safety_status": "warning"})
         result = {
             "safety_status": "warning",
-            "safety_reason": "冲突检测跳过 (无集群连接)，无法确认集群上是否存在活跃实验",
-            "safety_checked_detail": f"namespace={namespace} 合规, 冲突检测跳过 (无集群连接)",
+            "safety_reason": "Conflict check skipped (no cluster access); cannot confirm whether active experiments exist on the cluster",
+            "safety_checked_detail": f"namespace={namespace} compliant, conflict check skipped (no cluster access)",
             "conflict_uids": [],
         }
     else:
@@ -469,7 +469,7 @@ async def safety_check(state: AgentState) -> dict:
         result = {
             "safety_status": "safe",
             "safety_reason": None,
-            "safety_checked_detail": f"namespace={namespace} 合规, 无冲突实验",
+            "safety_checked_detail": f"namespace={namespace} compliant, no conflicting experiments",
             "conflict_uids": [],
         }
 
@@ -481,7 +481,7 @@ async def safety_check(state: AgentState) -> dict:
 
     # Freeze approved_target for screener comparison (mirrors confirmation_gate).
     kubeconfig = state.get("kubeconfig", "")
-    await dispatch_node_message("safety_check", "正在发现目标 Pod 所有者...\n\n")
+    await dispatch_node_message("safety_check", "Discovering the target Pod's owner...\n\n")
     owner_names = await discover_owner_names(
         spec.scope, spec.namespace, dict(spec.labels), kubeconfig,
     )

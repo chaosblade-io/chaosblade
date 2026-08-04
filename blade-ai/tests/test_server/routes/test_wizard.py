@@ -273,7 +273,7 @@ def test_validate_kubeconfig_nonexistent_path_warns(test_client):
     )
     body = resp.json()
     assert body["data"]["status"] == "warn"
-    assert "不存在" in body["data"]["message"]
+    assert "does not exist" in body["data"]["message"]
 
 
 def test_validate_kubeconfig_real_file_returns_contexts_metadata(

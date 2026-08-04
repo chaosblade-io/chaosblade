@@ -47,9 +47,12 @@ from chaos_agent.agent.nodes.execute.react_helpers import (
     detect_repeated_tool_calls,
 )
 from chaos_agent.agent.capabilities import (
+    build_capability_context,
     build_intent_discovery_context,
     filter_tools_for_context,
 )
+from chaos_agent.agent.dispatch import dispatch_node_message
+from chaos_agent.agent.spec.fault_registry import family_for_scope
 from chaos_agent.agent.prompts.builders import build_system_prompt
 from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.persistence.task_identity import is_real_task_id, new_task_id
@@ -58,6 +61,10 @@ from chaos_agent.config.settings import settings
 from chaos_agent.memory.hook import merge_hook_updates
 from chaos_agent.memory.session_store import NO_SESSION_MARKER
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
+from chaos_agent.transports.registry import (
+    profile_of,
+    resolve_channel_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -473,64 +480,25 @@ def submit_fault_intent(
     params: Annotated[Optional[dict[str, str]], BeforeValidator(_validate_params)] = None,
     user_description: str = "",
 ) -> str:
-    """Submit the collected fault injection intent for execution (planning
-    ONLY — the structured handoff from dialogue to execution confirmation).
+    """Submit the collected fault injection intent (planning ONLY —
+    structured handoff to execution confirmation).
 
-    The (scope, target, action) triple is a SEMANTIC descriptor of the fault —
-    it describes WHAT to inject, not HOW, and is NOT tied to any specific
-    injection tool or command syntax. Consult ``read_skill_resource`` for the
-    authoritative set of supported scenarios and required params.
+    The triple is SEMANTIC — WHAT to inject, not HOW; NOT tied to any
+    tool/command syntax (scenarios/params: ``read_skill_resource``).
 
-    When to use:
-      - Call ONLY after ALL of: (1) every required parameter is confirmed with
-        the user, (2) you showed a complete intent summary in your last reply,
-        (3) the user explicitly approved ("执行" / "确认" / "开始" / "go").
-      - Pass every field from the reviewed FaultSpec EXACTLY; never complete a
-        field from dialogue history.
-      - For MULTIPLE independent objectives, use ``submit_batch_intent`` instead.
+    When to use: ONLY after every required parameter confirmed, an intent
+    summary shown, and explicit user approval ("执行"/"确认"/"开始"/"go").
+    Pass every reviewed-FaultSpec field EXACTLY; never complete a field
+    from dialogue history. Multiple objectives → ``submit_batch_intent``.
 
-    Inputs:
-        fault_type: Composite identifier — by convention the dash-joined
-                    triple ``"<scope>-<target>-<action>"``, e.g.
-                    ``"node-cpu-fullload"`` / ``"pod-network-drop"`` /
-                    ``"pod-finalizer-patch"``. Acts as the human-readable
-                    label on the confirm card. Required.
-        scope: Registered fault-domain family the fault attaches to, such as
-               a K8s resource family or ``host``. Required. This identifies
-               the semantic domain; compatibility with the configured
-               execution transport is validated later.
-        target: Subsystem under attack (NOT a resource instance name).
-                Required.
-        action: Concrete fault action verb. Required.
-        fault_revision: Server-owned revision shown in the reviewed FaultSpec.
-                        Replay it exactly when a FaultSpec is present. When no
-                        FaultSpec is present yet, use 0; the server creates
-                        revision 1 from this structured submission.
-        namespace: Candidate K8s namespace when the selected scope requires
-                   one. Leave empty for host and cluster-scoped faults. The
-                   feasibility stage validates it against the active transport.
-        names: Candidate resource or host names. Pass when the user named a
-               target; the feasibility stage resolves and validates them.
-        labels: Label selector dict like ``{"app": "nginx"}``.
-        params: Fault-type-specific flags. The keys depend on the
-                ``(scope, target, action)`` triple — read the skill
-                spec for the canonical set. Common shapes:
-                  - cpu-fullload: ``{"percent": "80", "timeout": "600"}``
-                  - network-drop: ``{"interface": "eth0"}``
-                  - disk-fill: ``{"path": "/data", "size": "10000"}``
-                  - process-kill: ``{"process": "nginx", "signal": "9"}``
-                  - scale: ``{"replicas": "0"}``
-                  - patch: ``{"patch_type": "merge", "patch": "{...}"}``
-                Values must be strings.
-        user_description: User's original natural-language request.
+    Inputs: fault_type "<scope>-<target>-<action>"; target = subsystem,
+    NOT a resource instance name; fault_revision replayed exactly
+    (0 = none yet); namespace empty for host/cluster-scoped;
+    names/labels/params per the reviewed spec.
 
-    Output: acknowledgment string consumed by the dialogue gateway; the server
-        then advances to the execution-confirmation stage.
-
-    Side effects: none directly (NO injection here) — records the intent and
-        transitions the session to execution confirmation.
+    Output: acknowledgment. Side effects: none (NO injection here).
     """
-    return "✓ 故障注入意图已提交，正在进入执行确认阶段。"
+    return "✓ Fault-injection intent submitted; moving on to the execution-confirmation stage."
 
 
 # ---------------------------------------------------------------------------
@@ -540,11 +508,11 @@ def submit_fault_intent(
 submit_fault_intent.description = (
     submit_fault_intent.description
     + "\n\n    Valid scope values: "
-    + ", ".join(f'"{s}"' for s in INTENT_SCOPES)
+    + "|".join(INTENT_SCOPES)
     + ".\n    Valid target values: "
-    + ", ".join(f'"{t}"' for t in INTENT_TARGETS)
+    + "|".join(INTENT_TARGETS)
     + ".\n    Valid action values: "
-    + ", ".join(f'"{a}"' for a in INTENT_ACTIONS)
+    + "|".join(INTENT_ACTIONS)
     + "."
 )
 
@@ -581,7 +549,7 @@ def submit_batch_intent(
     Side effects: none directly (records the batch intent and transitions to
         execution confirmation; no injection here).
     """
-    return "✓ 批量故障注入意图已提交，正在进入执行确认阶段。"
+    return "✓ Batch fault-injection intent submitted; moving on to the execution-confirmation stage."
 
 
 def _extract_submit_batch_intent(messages: list) -> dict | None:
@@ -664,16 +632,16 @@ async def query_active_experiments() -> str:
     tenant_id = getattr(settings, "tenant_id", "") or ""
     active = await store.query_active(tenant_id=tenant_id)
     if not active:
-        return "当前没有活跃的故障注入实验，无需恢复。"
+        return "There are no active fault-injection experiments, so there is nothing to recover."
     from chaos_agent.agent.experiment_display import format_experiment_line
     # Newest first so "刚才 / 昨天" maps to the top rows.
     active = sorted(active, key=lambda t: t.get("gmt_create", ""), reverse=True)
-    lines = [f"当前有 {len(active)} 个可恢复的活跃实验（按注入时间倒序）:"]
+    lines = [f"There are {len(active)} recoverable active experiment(s) (most recently injected first):"]
     for i, t in enumerate(active[:10], 1):
         lines.append(format_experiment_line(i, t))
     lines.append(
-        "\n请根据故障类型 / 目标资源 / 注入时间确认要恢复哪一个，"
-        '然后调用 recover_task(task_id="...")。'
+        "\nUse the fault type / target resource / injection time to decide which one to recover, "
+        'then call recover_task(task_id="...").'
     )
     return "\n".join(lines)
 
@@ -877,6 +845,143 @@ def _persist_dialogue(tui_session_id: str, messages: list) -> None:
         logger.debug(f"Dialogue persistence skipped: {e}")
 
 
+def _capability_reject_message(state: dict, scope: str, tools) -> Optional[str]:
+    """Return a rejection message when *scope* cannot run on this transport.
+
+    ``None`` means "go ahead". Single home for the verdict so the single-fault
+    and batch submit paths cannot drift apart.
+
+    The verdict is ``build_capability_context(state, "plan", tools)`` — literally
+    the call ``agent_loop`` makes before planning. Sharing the call rather than
+    re-deriving the rule is deliberate: a hand-rolled predicate would be a second
+    source of truth, and a submit that passes here only to be refused at planning
+    is the exact round-trip this gate exists to remove.
+
+    ``state`` is probed with the submitted scope so a batch can be checked one
+    fault at a time — each entry may target a different domain.
+
+    Errors are swallowed by the caller's guard: never block on a failed verdict.
+    """
+    probe = dict(state)
+    # ``state["fault_spec"]`` is declared ``Optional[dict]`` and every writer in
+    # the tree passes a dict (``to_dict()`` and friends). Guarded anyway: a
+    # checkpoint restored from an older shape would otherwise raise inside the
+    # caller's try/except and silently skip the gate — a gate that fails open
+    # without a trace is worse than one that never ran.
+    _existing = state.get("fault_spec")
+    probe["fault_spec"] = {
+        **(_existing if isinstance(_existing, dict) else {}),
+        "scope": scope,
+    }
+    if build_capability_context(probe, "plan", tools or ()).supported:
+        return None
+
+    family = family_for_scope(scope or "")
+    scope_profile = family.profile if family else ""
+    scope_note = f" (capability profile {scope_profile})" if scope_profile else ""
+
+    # With no connection field anywhere, the resolved channel is a process-wide
+    # ``settings`` default the user never chose — naming it would only confuse.
+    # Measured on the real platform DB: 39 of 45 environment records carry no
+    # connection field at all.
+    has_conn_field = bool(
+        state.get("kube_connection_mode")
+        or state.get("host_name")
+        or state.get("ssh_host")
+        or state.get("kubeconfig")
+        or state.get("kubewiz_cluster_uuid")
+    )
+    if not has_conn_field:
+        return (
+            "The current drill environment has no usable connection configured, "
+            "so this fault injection cannot be submitted.\n\n"
+            f"- Fault domain: `{scope}`{scope_note}\n"
+            "- Environment connection: not configured\n\n"
+            "Fill in a connection method in the environment configuration first "
+            "(K8s: a kubeconfig or a KubeWiz cluster; "
+            "host: a KubeWiz host name or an SSH address), "
+            "or rebind to a drill environment that is already configured."
+        )
+
+    channel = resolve_channel_name(state)
+    channel_profile = profile_of(channel)
+    channel_note = f" (capability profile {channel_profile})" if channel_profile else ""
+    return (
+        "The intent does not match the current drill environment, so it cannot be submitted.\n\n"
+        f"- Fault domain: `{scope}`{scope_note}\n"
+        f"- Environment channel: `{channel}`{channel_note}\n\n"
+        "Switch to a drill environment that matches this fault domain, "
+        "or choose a fault type the current environment supports."
+    )
+
+
+async def _reject_turn(
+    content: str,
+    *,
+    messages: list,
+    human_msg,
+    dialogue_round: int,
+    tui_session_id: str,
+    hook_updates,
+) -> dict:
+    """Return a node-authored rejection so all three consumers see it.
+
+    A rejection produced inside the node — not by an LLM call — has three
+    audiences, and returning only the ``AIMessage`` reaches just one of them:
+
+    - ``dispatch_node_message`` → the TUI. Its stream only renders
+      ``on_chat_model_stream`` / ``on_tool_*`` / ``on_custom_event``; a message
+      merely appended to state produces no event at all, so the turn ended with
+      the tool marked ✓ and nothing shown (observed: submit ran, no intent card,
+      no reason, session silently over). ``node_message`` is the channel built
+      for exactly this ("programmatic text not produced by an LLM call") and is
+      already understood by both the TUI and the platform's event normaliser.
+    - ``_persist_dialogue`` → the session file. Every terminal path persists;
+      the early returns did not, which is why the rejection could not be found
+      in the transcript afterwards either. The rejection must be passed as
+      ``response``: without it ``_build_dialogue_persist_list`` writes only the
+      human turn and the trailing ToolMessages, so a drill's transcript showed
+      ``submit_fault_intent`` succeeding and then jumped straight to the next
+      round's prompt — the reason for stopping was nowhere on disk (observed on
+      sess_5f082a560921, whose ``ic-system-round-5`` is missing entirely).
+    - the returned ``AIMessage`` → the platform (read out as ``summary``) and
+      the next turn's model context.
+
+    The same message object goes to state and to disk. Building two would give
+    them different ids, and the session store dedups by id — a re-persist of the
+    same turn would then append a second copy.
+
+    Dispatch is cosmetic and must never break the rejection itself: failures are
+    logged and swallowed. ``dispatch_node_message`` only catches ``RuntimeError``
+    (missing run context, e.g. unit tests), so the broader guard stays here.
+    """
+    rejection = AIMessage(content=content)
+    try:
+        await dispatch_node_message("intent_clarification", content)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "dispatch_node_message failed for a rejection (message still "
+            "returned in state)", exc_info=True,
+        )
+    try:
+        _persist_dialogue(
+            tui_session_id,
+            _build_dialogue_persist_list(
+                messages, response=rejection,
+                system_msg=None,
+                human_msg=human_msg,
+                dialogue_round=dialogue_round,
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("persisting a rejection turn failed", exc_info=True)
+
+    return merge_hook_updates({
+        "messages": [rejection],
+        "dialogue_round": dialogue_round + 1,
+    }, hook_updates)
+
+
 def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=None):
     """Create the intent_clarification node function.
 
@@ -912,14 +1017,14 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
         tracker = get_tracker(task_id) if task_id else None
         if tracker:
             tracker.start(StatusCategory.NODE, "intent_clarification",
-                          "正在与用户对话...")
+                          "Talking with the user...")
 
         # Already confirmed → pass through to the router, which will
         # direct to the appropriate downstream node (agent_loop for
         # inject, save_memory for chat, recover_handler for recover).
         if confirmed_intent in ("inject", "chat", "recover"):
             if tracker:
-                tracker.complete(f"意图已确认: {confirmed_intent}")
+                tracker.complete(f"Intent confirmed: {confirmed_intent}")
             return {}
 
         # "unset" means the caller has entered a fresh dialogue turn. The
@@ -930,7 +1035,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
 
         if llm is None:
             if tracker:
-                tracker.complete("LLM 不可用，默认 chat")
+                tracker.complete("LLM unavailable, defaulting to chat")
             return {"confirmed_intent": "chat"}
 
         # Safety net: overall dialogue limit
@@ -938,11 +1043,22 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
             logger.warning("Dialogue round %d >= %d, forcing exit",
                            dialogue_round, MAX_DIALOGUE_ROUNDS)
             if tracker:
-                tracker.complete("对话轮数超限")
+                tracker.complete("Conversation turn limit exceeded")
+            goodbye = AIMessage(content="Thanks for using Blade AI! Come back any time — goodbye!")
+            # Both this exit and the LLM-failure one below set
+            # ``confirmed_intent="chat"``, which routes past the mid-conversation
+            # append and into the full finalize path. That path reaches the
+            # session file only for the CLI runner: the server route gates its
+            # flush on an operational ``task_id``, and ``chat`` turns never
+            # allocate one (``_allocate_operation_task_id`` runs for inject,
+            # batch and recover only — the real session sess_5f082a560921 ended
+            # with ``task_ids: []``). Write it here so the last thing the user
+            # was told survives on both transports.
+            _persist_dialogue(tui_session_id, [goodbye])
             return {
                 "confirmed_intent": "chat",
                 "dialogue_round": dialogue_round + 1,
-                "messages": [AIMessage(content="感谢使用 Blade AI！如有需要随时回来，再见！")],
+                "messages": [goodbye],
             }
 
         # Memory compaction
@@ -991,18 +1107,51 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                     and not _submission_matches_spec(llm_args, existing_spec)
                 )
             ):
-                return merge_hook_updates({
-                    "messages": [AIMessage(content=(
-                        "提交内容与当前已审阅的故障方案不一致，或方案尚未完整。"
-                        "请先确认当前方案，再按其准确字段重新提交。"
-                    ))],
-                    "dialogue_round": dialogue_round + 1,
-                }, hook_updates)
+                return await _reject_turn(
+                    "The submitted content does not match the fault plan currently under review, "
+                    "or the plan is not yet complete. "
+                    "Confirm the current plan first, then resubmit using its exact fields.",
+                    messages=messages,
+                    human_msg=current_human_msg,
+                    dialogue_round=dialogue_round,
+                    tui_session_id=tui_session_id,
+                    hook_updates=hook_updates,
+                )
+
+            # --- Channel compatibility gate -----------------------------------
+            # Same verdict as ``agent_loop``'s capability gate, a planning round
+            # earlier. See ``_capability_reject_message`` for why the call is
+            # shared rather than re-derived.
+            #
+            # Guarded: if the verdict cannot be computed, let the submit through
+            # and leave it to agent_loop — never block on an error.
+            _reject = None
+            try:
+                _reject = _capability_reject_message(
+                    state, existing_spec.scope or "", tools,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "capability gate check failed scope=%s; "
+                    "letting the submit through",
+                    getattr(existing_spec, "scope", "?"),
+                    exc_info=True,
+                )
+
+            if _reject:
+                return await _reject_turn(
+                    _reject,
+                    messages=messages,
+                    human_msg=current_human_msg,
+                    dialogue_round=dialogue_round,
+                    tui_session_id=tui_session_id,
+                    hook_updates=hook_updates,
+                )
 
             if existing_spec.is_complete:
                 if tracker:
                     tracker.complete(
-                        f"故障意图收敛: {existing_spec.scope}-{existing_spec.blade_target} "
+                        f"Fault intent converged: {existing_spec.scope}-{existing_spec.blade_target} "
                         f"{existing_spec.blade_action} @ {existing_spec.namespace}"
                     )
                 # Persist dialogue (audit log on disk; happens regardless
@@ -1047,12 +1196,15 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                     "dialogue_round": dialogue_round + 1,
                     "task_id": op_task_id,
                 }, hook_updates)
-            return merge_hook_updates({
-                "messages": [AIMessage(content=(
-                    "提交的执行参数不完整或不受支持；请基于当前意图摘要重新确认。"
-                ))],
-                "dialogue_round": dialogue_round + 1,
-            }, hook_updates)
+            return await _reject_turn(
+                "The submitted execution parameters are incomplete or unsupported; "
+                "re-confirm based on the current intent summary.",
+                messages=messages,
+                human_msg=current_human_msg,
+                dialogue_round=dialogue_round,
+                tui_session_id=tui_session_id,
+                hook_updates=hook_updates,
+            )
 
         # ── submit_batch_intent (batch injection) ──
         # Outside has_submit_tool_msg block: submit_batch_intent ToolMessage
@@ -1064,15 +1216,53 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
             batch_args = _extract_submit_batch_intent(messages)
             if batch_args:
                 if not _submission_matches_batch(batch_args, existing_batch):
-                    return merge_hook_updates({
-                        "messages": [AIMessage(content=(
-                            "批量提交内容与当前已审阅的故障方案不一致。"
-                            "请先确认当前方案，再按其准确字段重新提交。"
-                        ))],
-                        "dialogue_round": dialogue_round + 1,
-                    }, hook_updates)
+                    return await _reject_turn(
+                        "The batch submission does not match the fault plan currently under review. "
+                        "Confirm the current plan first, then resubmit using its exact fields.",
+                        messages=messages,
+                        human_msg=current_human_msg,
+                        dialogue_round=dialogue_round,
+                        tui_session_id=tui_session_id,
+                        hook_updates=hook_updates,
+                    )
+                # --- Channel compatibility gate (per fault) -------------------
+                # Same verdict as the single-fault path, applied to every entry:
+                # a batch may mix domains, and ``agent_loop`` plans them one at a
+                # time — so one incompatible entry would fail mid-batch, after
+                # earlier faults were already injected. Refusing the whole batch
+                # up front is both cheaper and safer than a partial run.
+                #
+                # Guarded like the single path: never block on a failed verdict.
+                _batch_reject = None
+                try:
+                    for _idx, _spec in enumerate(existing_batch, 1):
+                        _msg = _capability_reject_message(
+                            state, _spec.scope or "", tools,
+                        )
+                        if _msg:
+                            _batch_reject = (
+                                f"Fault #{_idx} in this batch cannot run in the current environment, "
+                                f"so the whole batch submission was cancelled.\n\n{_msg}"
+                            )
+                            break
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "capability gate check failed for batch; "
+                        "letting the submit through", exc_info=True,
+                    )
+
+                if _batch_reject:
+                    return await _reject_turn(
+                        _batch_reject,
+                        messages=messages,
+                        human_msg=current_human_msg,
+                        dialogue_round=dialogue_round,
+                        tui_session_id=tui_session_id,
+                        hook_updates=hook_updates,
+                    )
+
                 if tracker:
-                    tracker.complete(f"批量意图收敛: {len(existing_batch)} faults")
+                    tracker.complete(f"Batch intent converged: {len(existing_batch)} faults")
                 persist_list = _build_dialogue_persist_list(
                     messages, system_msg=None,
                     human_msg=current_human_msg,
@@ -1112,7 +1302,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
         if has_recover_tool_msg:
             recover_task_id = _extract_recover_task_id(messages)
             if tracker:
-                tracker.complete(f"恢复意图确认: {recover_task_id}")
+                tracker.complete(f"Recovery intent confirmed: {recover_task_id}")
             persist_list = _build_dialogue_persist_list(
                 messages, system_msg=None,
                 human_msg=current_human_msg,
@@ -1133,6 +1323,21 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                 "dialogue_round": dialogue_round + 1,
             }, hook_updates)
 
+        # Resolve the configured channel into a capability profile so the model
+        # knows *as a fact* whether it is drilling a host or a Kubernetes
+        # environment. Without it the only signal was the user's wording, and a
+        # host-channel environment would load ``k8s-chaos-skills``.
+        #
+        # ``profile_of`` is the single source of truth for channel → profile;
+        # do not re-derive the mapping here. Unresolvable channels come back as
+        # ``unknown`` and are passed through as such — ``build_system_prompt``
+        # deliberately omits the section in that case rather than emitting the
+        # "environment is unsupported, do not attempt injection" wording.
+        #
+        # The skill catalog stays unfiltered either way: this informs, it does
+        # not restrict.
+        _profile = profile_of(state.get("kube_connection_mode") or "")
+
         system_msg = SystemMessage(
             content=build_system_prompt(
                 PromptMode.INTENT,
@@ -1140,6 +1345,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                 batch_faults=[spec.to_dict() for spec in existing_batch],
                 skill_catalog=registry.build_catalog_prompt() if registry else "",
                 semantic_only=True,
+                profile=_profile,
             )
         )
 
@@ -1223,15 +1429,19 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
 
         try:
             if tracker:
-                tracker.update("调用 LLM...")
+                tracker.update("Calling the LLM...")
             response = await llm_bound.ainvoke(llm_messages)
         except Exception as e:
             logger.error("Intent clarification LLM failed: %s", e)
             if tracker:
-                tracker.fail(f"LLM 调用失败: {e}")
+                tracker.fail(f"LLM call failed: {e}")
+            apology = AIMessage(content="Sorry, I ran into a problem. Please try again shortly.")
+            # See the dialogue-limit exit above for why a ``chat`` turn has to
+            # persist its own closing message.
+            _persist_dialogue(tui_session_id, [apology])
             return merge_hook_updates({
                 "confirmed_intent": "chat",
-                "messages": [AIMessage(content="抱歉，我遇到了一些问题。请稍后再试。")],
+                "messages": [apology],
             }, hook_updates)
 
         tool_calls = getattr(response, "tool_calls", None) or []
@@ -1240,7 +1450,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
         # --- Priority 1: has tool calls (kubectl, submit_fault_intent, etc.) ---
         if tool_calls:
             if tracker:
-                tracker.complete("等待工具执行")
+                tracker.complete("Waiting for tool execution")
             proposal_update = {}
             if parsed_response is not None:
                 reply, raw_faults = parsed_response
@@ -1271,7 +1481,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
         # deriving executable fields from prose.
         if parsed_response is None:
             if tracker:
-                tracker.complete("对话回复完成（未改变意图）")
+                tracker.complete("Chat reply finished (intent unchanged)")
             persist_list = _build_dialogue_persist_list(
                 messages, response=response,
                 system_msg=system_msg,
@@ -1291,7 +1501,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
             _advance_proposed_specs(existing_spec, existing_batch, raw_faults)
         )
         if tracker:
-            tracker.complete("对话回复完成")
+            tracker.complete("Chat reply finished")
         persist_list = _build_dialogue_persist_list(
             messages, response=public_response,
             system_msg=system_msg,

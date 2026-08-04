@@ -514,7 +514,18 @@ class TestRouteAfterPhase1Tools:
             "messages": messages, "fault_spec": spec,
         }) == "plan_change_confirm"
 
-        stale_args = {**args, "fault_revision": 3}
+    def test_faultspec_stale_revision_delegates_to_confirm(self):
+        """Behaviour change (task-5193538b): a stale-revision proposal used to
+        vanish into the agent loop — the model was told "Plan change
+        proposed." and nothing ever happened. plan_change_confirm now
+        answers it with an actionable [PLAN CHANGE RETRY] HumanMessage."""
+        spec = self._fault_spec()
+        proposed = {**self._planned_fault(spec), "action": "delay"}
+        stale_args = {
+            "reason": "drop is not feasible",
+            "fault_revision": 3,
+            "proposed_fault": proposed,
+        }
         stale_messages = [
             AIMessage(content="", tool_calls=[{
                 "name": "propose_plan_change", "id": "change-2", "args": stale_args,
@@ -527,7 +538,7 @@ class TestRouteAfterPhase1Tools:
         ]
         assert route_after_phase1_tools({
             "messages": stale_messages, "fault_spec": spec,
-        }) == "agent_loop"
+        }) == "plan_change_confirm"
 
     @patch("chaos_agent.agent.router.settings")
     def test_faultspec_plain_text_exits_planning(self, mock_settings):

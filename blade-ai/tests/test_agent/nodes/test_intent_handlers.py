@@ -64,7 +64,7 @@ class TestQueryActiveExperimentsTool:
                 query_active_experiments,
             )
             out = await query_active_experiments.ainvoke({})
-        assert "没有活跃" in out
+        assert "no active fault-injection experiments" in out
 
 
 class TestRecoverHandler:
@@ -81,7 +81,7 @@ class TestRecoverHandler:
 
         assert result["operation"] == "recover"
         assert result["result"]["status"] == "completed"
-        assert "没有活跃" in result["messages"][0].content
+        assert "no active fault-injection experiments" in result["messages"][0].content
 
     @pytest.mark.asyncio
     async def test_single_active_experiment_auto_select(self, sample_agent_state):
@@ -103,7 +103,7 @@ class TestRecoverHandler:
         assert result["operation"] == "recover"
         assert result["recover_task_id"] == "task-001"
         assert result["blade_uid"] == "exp-abc"
-        assert "1 个活跃" in result["messages"][0].content
+        assert "Found 1 active experiment" in result["messages"][0].content
         assert "pod-cpu-fullload" in result["messages"][0].content  # enriched fault_type
 
     @pytest.mark.asyncio
@@ -124,7 +124,7 @@ class TestRecoverHandler:
 
         assert result["operation"] == "recover"
         assert result["needs_task_selection"] is True
-        assert "多个" in result["messages"][0].content
+        assert "Found multiple active experiments" in result["messages"][0].content
         assert "pod-cpu-fullload" in result["messages"][0].content  # enriched
 
     @pytest.mark.asyncio
@@ -138,7 +138,7 @@ class TestRecoverHandler:
 
         assert result["operation"] == "recover"
         assert result["result"]["status"] == "failed"
-        assert "失败" in result["messages"][0].content
+        assert "Failed to query active experiments" in result["messages"][0].content
 
     @pytest.mark.asyncio
     async def test_pass_through_when_recover_task_id_set(self, sample_agent_state):

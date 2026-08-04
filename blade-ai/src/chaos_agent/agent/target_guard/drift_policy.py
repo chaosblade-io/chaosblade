@@ -204,6 +204,20 @@ class K8sDriftPolicy:
     def check_identity_drift(
         self, approved: ApprovedTarget, effective: EffectiveTarget,
     ) -> Optional[GuardDecision]:
+        # ---- 3.5 Infrastructure-vehicle exemption ---------------------------
+        # An exec into an injection vehicle is access to the injection
+        # MACHINERY, not an operation on the fault target: the exec'd pod
+        # can never match the approved target's identity, so every
+        # comparison below can only produce a false drift. Vehicle identity
+        # is established DATA-side by the screener (task-registered
+        # artifacts, the task's exec tool pod, or live label-selector
+        # discovery against the cluster) and arrives here only as this
+        # flag — the policy itself never guesses from pod names. Banned /
+        # escape / readonly screening of the inner command already happened
+        # in the classifier before this point.
+        if effective.is_vehicle_exec:
+            return None
+
         # ---- 4. Scope (kind) check ------------------------------------------
         approved_scope = canonicalise_kind(approved.scope)
         effective_scope = canonicalise_kind(effective.scope)

@@ -38,7 +38,6 @@ from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (  # noqa: F40
     _count_verification_steps_in_skill_case,  # noqa: F401
     _validate_step_number_coverage,  # noqa: F401
     _try_parse_json,  # noqa: F401
-    _has_format_reminder,  # noqa: F401
     _parse_verification_result,  # noqa: F401
     _parse_checklist_items,  # noqa: F401
     _has_checklist,  # noqa: F401
@@ -129,10 +128,14 @@ async def verifier(state: AgentState) -> dict:
 
     # Defense-in-depth: if blade_uid is empty in state, try to recover it
     # from message history (e.g. when injection was done via kubectl exec).
+    # Retired UIDs (framework-side replan cleanup) must stay dead here too,
+    # or a destroyed experiment's UID re-enters Layer-1 (task-29848471).
     if not blade_uid:
         from chaos_agent.agent.nodes.execute.execute_loop import _extract_blade_uid_from_messages
         messages = state.get("messages", [])
-        blade_uid = _extract_blade_uid_from_messages(messages) or ""
+        blade_uid = _extract_blade_uid_from_messages(
+            messages, retired=state.get("retired_blade_uids"),
+        ) or ""
         if blade_uid:
             logger.info(f"verifier: recovered blade_uid={blade_uid} from message history")
 
@@ -525,9 +528,11 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
 
         # Record system prompt to session store (dedup handles repeated prompts)
         capability_context = build_capability_context(state, "verify", tools)
+        from chaos_agent.agent.progress_ledger import build_ledger_prompt_section
         verifier_prompt = build_system_prompt(
             PromptMode.VERIFICATION,
             profile=capability_context.profile,
+            progress_ledger_section=build_ledger_prompt_section(state.get("progress_ledger")),
         )
         record_system_prompt(hook, state, verifier_prompt, node_name=VERIFIER)
 

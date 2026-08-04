@@ -47,10 +47,10 @@ def test_task_summary_uses_fault_spec_not_active_skill_name():
     )
 
     assert text.startswith("[Task Summary] task_id=task-inject")
-    assert "类型: pod-network-delay | 目标: arms-prom/pod-a" in text
-    assert "结果: injected | blade_uid: uid-1" in text
-    assert "验证: strong (L1=passed, L2=passed)" in text
-    assert "若要复用这些目标，必须重新 kubectl 验证当前存在性" in text
+    assert "Type: pod-network-delay | Target: arms-prom/pod-a" in text
+    assert "Result: injected | blade_uid: uid-1" in text
+    assert "Verification: strong (L1=passed, L2=passed)" in text
+    assert "current existence MUST be re-verified with kubectl" in text
 
 
 def test_batch_summary_contains_targets_failures_and_freshness_note():
@@ -74,12 +74,12 @@ def test_batch_summary_contains_targets_failures_and_freshness_note():
     )
 
     assert text.startswith("[Batch Summary] 2 faults")
-    assert "操作: batch_inject" in text
+    assert "Operation: batch_inject" in text
     assert "target=arms-prom/pod-a" in text
     assert "target=arms-prom/app=api" in text
-    assert "失败原因: pod not found" in text
-    assert "批量分析报告: /tmp/batch.md" in text
-    assert "本概要及更早历史中的资源名仅作历史上下文" in text
+    assert "Failure reason: pod not found" in text
+    assert "Batch analysis report: /tmp/batch.md" in text
+    assert "resource names in this summary and in earlier" in text
 
 
 def test_recover_summary_falls_back_to_inject_state_fault_type():
@@ -110,10 +110,10 @@ def test_recover_summary_falls_back_to_inject_state_fault_type():
 
     assert text.startswith("[Recover Summary] task_id=task-recover")
     assert "parent_task_id: task-inject" in text
-    assert "类型: pod-cpu-fullload | 目标: arms-prom/pod-a" in text
-    assert "结果: recovered | blade_uid: uid-1" in text
-    assert "恢复验证: recovered (L1=passed, L2=passed)" in text
-    assert "若要复用这些目标，必须重新 kubectl 验证当前存在性" in text
+    assert "Type: pod-cpu-fullload | Target: arms-prom/pod-a" in text
+    assert "Result: recovered | blade_uid: uid-1" in text
+    assert "Recovery verification: recovered (L1=passed, L2=passed)" in text
+    assert "current existence MUST be re-verified with kubectl" in text
 
 
 def test_recover_summary_falls_back_to_inject_state_target_only():
@@ -149,8 +149,8 @@ def test_recover_summary_falls_back_to_inject_state_target_only():
         },
     )
 
-    assert "类型: pod-cpu-fullload | 目标: arms-prom/pod-a" in text
-    assert "恢复验证: recovered (L1=passed, L2=passed)" in text
+    assert "Type: pod-cpu-fullload | Target: arms-prom/pod-a" in text
+    assert "Recovery verification: recovered (L1=passed, L2=passed)" in text
     assert "inject-verified" not in text
 
 
@@ -168,7 +168,7 @@ def test_recover_summary_keeps_empty_verification_compatibility_line():
         {},
     )
 
-    assert "恢复验证: ? (L1=?, L2=?)" in text
+    assert "Recovery verification: ? (L1=?, L2=?)" in text
 
 
 def test_operation_summary_markers_stay_in_builder_and_trim_preserve_rule():

@@ -27,10 +27,10 @@ def _extract_pending_interrupt_payload(graph_state) -> object | None:
 
 # Tool names to surface as progress events (user-facing).
 _TOOL_DISPLAY_NAMES: dict[str, str] = {
-    "kubectl_read": "查询集群资源",
-    "host_read": "查询主机状态",
-    "read_skill_resource": "读取故障场景",
-    "activate_skill": "激活故障技能",
+    "kubectl_read": "Querying cluster resources",
+    "host_read": "Querying host state",
+    "read_skill_resource": "Reading a fault scenario",
+    "activate_skill": "Activating a fault skill",
 }
 
 
@@ -96,7 +96,7 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
         ev: dict = {
             "kind": "tool_start",
             "tool_name": name,
-            "message": f"正在调用: {display}",
+            "message": f"Calling: {display}",
             # astream_events 中同一次工具调用的 on_tool_start / on_tool_end
             # 共享同一 run_id，作为前端精确配对并发同名工具的唯一键。
             "call_id": event.get("run_id", "") or "",
@@ -111,7 +111,7 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
         ev = {
             "kind": "tool_end",
             "tool_name": name,
-            "message": f"完成: {display}",
+            "message": f"Finished: {display}",
             "level": "ok",
             "call_id": event.get("run_id", "") or "",
         }
@@ -127,13 +127,39 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
             ev["output"] = content
         return [ev]
 
+    if kind == "on_tool_error":
+        # A tool raised — most often an arg-schema ValidationError (the LLM
+        # sent a dict/list field as a JSON string, e.g. update_progress's
+        # ``state_update``), but also any exception mid-execution. LangChain
+        # fires ``on_tool_error`` here, NOT ``on_tool_end``. Without a terminal
+        # event carrying the SAME ``run_id`` as the preceding ``on_tool_start``,
+        # the platform timeline pairs by ``call_id`` and leaves the tool card
+        # stuck on 正在调用 forever. The TUI path (streaming.py) already
+        # synthesises this; this channel was missing it. ToolNode's
+        # ``handle_tool_errors`` separately feeds the error back to the LLM as a
+        # ToolMessage — that is graph state, not a stream event.
+        display = _TOOL_DISPLAY_NAMES.get(name, name)
+        err = data.get("error")
+        content = (str(err).strip() if err is not None else "") or "tool error"
+        if len(content) > 2000:
+            content = content[:2000] + "...(truncated)"
+        return [{
+            "kind": "tool_end",
+            "tool_name": name,
+            "message": f"Failed: {display}",
+            "level": "error",
+            "is_error": True,
+            "call_id": event.get("run_id", "") or "",
+            "output": content,
+        }]
+
     if kind == "on_chain_start" and name in (
         "load_memory", "intent_confirm", "save_memory",
     ):
         return [{
             "kind": "node_start",
             "node_name": name,
-            "message": f"进入节点: {name}",
+            "message": f"Entering node: {name}",
         }]
 
     if kind == "on_chat_model_start":
@@ -194,7 +220,7 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
         # message 统一前缀 ``💭 模型思考：``，让前端 timeline 一眼分辨
         # 这是模型推理而非工具调用 / 节点提示。完整内容仍在 ``content``
         # 字段（截 3000 字），前端可基于 content 做展开式展示。
-        _THOUGHT_PREFIX = "💭 模型思考："
+        _THOUGHT_PREFIX = "💭 Model reasoning: "
         if content:
             ev: dict = {
                 "kind": "llm_thought",
@@ -244,7 +270,7 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
             # phase_completed 导致前端提前关闭容器、后续工具事件逃逸到顶层。
             if name == "phase_completed":
                 return []
-            label = "阶段开始"
+            label = "Phase started"
             return [{
                 "kind": name,
                 "node": data.get("node", ""),
@@ -263,7 +289,7 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
         if name == "batch_fault_result":
             return [{
                 "kind": "batch_fault_result",
-                "message": "批量故障结果",
+                "message": "Batch fault results",
                 "detail": data,
             }]
         return []

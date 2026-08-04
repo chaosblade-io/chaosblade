@@ -38,7 +38,7 @@ async def se_snapshot_node(state: AgentState) -> dict:
 
     tracker = get_tracker(task_id)
     tracker.start(StatusCategory.NODE, "se_snapshot", "Capturing pre-injection side-effect snapshot")
-    await dispatch_node_message("se_snapshot", "正在采集注入前副作用快照...\n\n")
+    await dispatch_node_message("se_snapshot", "Capturing the pre-injection side-effect snapshot...\n\n")
 
     try:
         snapshot = await observer.capture_base_snapshot(spec, kubeconfig, task_id=task_id)
@@ -53,7 +53,7 @@ async def se_snapshot_node(state: AgentState) -> dict:
 
     phrase, metrics = observer.summarize(snapshot)
     logger.info("se_snapshot: captured %s (profile=%s)", phrase, profile)
-    await dispatch_node_message("se_snapshot", f"副作用快照: {phrase}\n\n")
+    await dispatch_node_message("se_snapshot", f"Side-effect snapshot: {phrase}\n\n")
     # ``namespace`` is spec-level context (not profile semantics), so it is
     # surfaced alongside the profile-specific metrics whenever present — this
     # keeps the k8s tracker/session detail on par with the pre-seam behaviour

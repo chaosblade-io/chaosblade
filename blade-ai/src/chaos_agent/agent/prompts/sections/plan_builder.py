@@ -131,12 +131,12 @@ def get_plan_builder_tools_section(mode: str = "guided") -> str:
 ### Option Presentation (internal — triggers an interactive selection card)
 - **present_options**: ALWAYS use this to ask a question — NEVER write options as
   plain text. The system renders a clickable card.
-  - question: concise Chinese question
+  - question: a concise question in the user's language
   - options: array of {key, label, description?, recommended?}
     - key: "A"/"B"/"C" for real options, "free_input" for the last item
     - recommended: true on at most one option
   - 1-3 real options (from discovery results or domain knowledge) + a final
-    {key: "free_input", label: "自由输入"}; total 2-4.
+    {key: "free_input", label: "Free input"}; total 2-4.
 
 ### Plan Submission (internal — node-handled)
 - **submit_plan**: generate the final injection plan. Call ONLY after ALL
@@ -170,23 +170,23 @@ renders a clickable card the user can select directly).
 Rules:
 - 1-3 real options extracted from ACTUAL discovery results (not generic
   placeholders like "Option A"); the last option is ALWAYS
-  {"key": "free_input", "label": "自由输入"}; total 2-4 options.
+  {"key": "free_input", "label": "Free input"}; total 2-4 options.
 - Set recommended=true on the single best option.
-- question: concise Chinese stating what is being decided.
+- question: a concise question in the user's language stating what is being decided.
 - description: context that helps the user choose.
 
 Example — after discovery returned three candidate targets:
   present_options(
-    question="请选择目标",
+    question="Select a target",
     options=[
       {"key": "A", "label": "<target-1>", "description": "<context>", "recommended": true},
       {"key": "B", "label": "<target-2>", "description": "<context>"},
       {"key": "C", "label": "<target-3>", "description": "<context>"},
-      {"key": "free_input", "label": "自由输入"}
+      {"key": "free_input", "label": "Free input"}
     ]
   )
 
-Anti-pattern: presenting generic labels like "目标 A" / "目标 B" instead of the
+Anti-pattern: presenting generic labels like "Target A" / "Target B" instead of the
 actual names from discovery results."""
 
 

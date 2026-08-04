@@ -4,7 +4,7 @@ import json
 import logging
 import re
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from chaos_agent.agent.node_names import EXECUTE_LOOP
 from chaos_agent.agent.execution_artifacts import (
@@ -34,6 +34,7 @@ from chaos_agent.agent.nodes.execute.react_helpers import (
     detect_action_stagnation,
     detect_repeated_tool_calls,
     detect_tool_error_hint,
+    detect_transient_retry_exhaustion,
     emit_debug_tool_messages,
     extract_rejected_params,
     extract_tool_call_fields,
@@ -166,7 +167,10 @@ def _collect_destroyed_uids(messages: list) -> set[str]:
     return destroyed
 
 
-def _extract_blade_uid_from_messages(messages: list) -> str | None:
+def _extract_blade_uid_from_messages(
+    messages: list,
+    retired: "list[str] | set[str] | None" = None,
+) -> str | None:
     """Scan messages for an experiment uid from a blade-family tool's output.
 
     ChaosBlade `blade create` returns JSON like:
@@ -185,6 +189,11 @@ def _extract_blade_uid_from_messages(messages: list) -> str | None:
     Only kubectl exec calls whose v_args contain "blade create" are considered —
     other kubectl outputs (get -o json, describe, ...) are NOT scanned, to
     prevent false-positive extraction from K8s resource ``metadata.uid`` fields.
+
+    ``retired``: UIDs destroyed by FRAMEWORK-side cleanup (verify-replan
+    residual destroy). They leave no ``blade_destroy`` ToolMessage, so the
+    message scan alone would resurrect them; callers holding
+    ``state.retired_blade_uids`` must pass it here (task-29848471).
     """
     kubectl_uid = None  # fallback uid from kubectl exec
     status_uid = None   # fallback uid from blade_status / blade_query_k8s
@@ -192,6 +201,8 @@ def _extract_blade_uid_from_messages(messages: list) -> str | None:
     # UIDs already sent to blade_destroy are cleaned-up / residual — never
     # treat them as the current active injection (root-cause guard).
     destroyed = _collect_destroyed_uids(messages)
+    if retired:
+        destroyed |= set(retired)
 
     # Build a set of tool_call_ids that correspond to "kubectl exec ... blade create"
     blade_exec_call_ids: set[str] = set()
@@ -471,7 +482,10 @@ def _should_redetect_injection_method(
 
     - RESUME: recover attribution when nothing is recorded yet (``current`` is
       empty) — e.g. after a restart where the injection lives in history, or on
-      the first injection turn before channel A commits it.
+      the first injection turn before channel A commits it. The caller bounds
+      this scan to the CURRENT attribution epoch
+      (:func:`_epoch_bounded_messages`), so after a replan seam the scan cannot
+      resurrect PRE-seam attempts (task-5193538b).
     - UPGRADE: promote the provisional multi-step ``kubectl_native`` to the
       experiment backend once a ``blade_uid`` appears (the UID lives in the tool
       RESULT, which channel A cannot see).
@@ -487,6 +501,78 @@ def _should_redetect_injection_method(
 
     provider = FaultProviderRegistry.resolve_by_method(current_injection_method)
     return provider is not None and provider.is_multi_step
+
+
+def _epoch_bounded_messages(messages: list, state: AgentState) -> list:
+    """Messages belonging to the CURRENT attribution epoch.
+
+    ``reset_attribution_state`` records ``attribution_epoch_index`` at every
+    replan seam — the message count at the moment the seam landed in state.
+    The RESUME re-detection scan must read only messages AFTER that boundary:
+    pre-seam attempts belong to the fault contract the replan just invalidated,
+    and re-attributing them is exactly how a stale diagnostic exec surfaced as
+    the new fault's injection, letting the executor conclude "already
+    injected" and exit Phase 2 without issuing anything (task-5193538b).
+
+    No boundary (first epoch, or a task restored without one) → full history,
+    preserving restart-recovery semantics. If trimming shifted the list so the
+    boundary exceeds its length, fall back to full history too — an over-scan
+    keeps the pre-fix attribution behaviour instead of fabricating a smaller
+    window that hides the real current-epoch attempt (never under-attribute).
+    """
+    boundary = state.get("attribution_epoch_index")
+    if not boundary:
+        return messages
+    try:
+        start = int(boundary)
+    except (TypeError, ValueError):
+        return messages
+    if start > len(messages):
+        return messages
+    return messages[start:]
+
+
+def reset_attribution_state(
+    result: dict,
+    *,
+    keep_blade_uid: bool = False,
+    message_count: int | None = None,
+) -> None:
+    """Reset injection-attribution fields at a replan seam.
+
+    Every replan invalidates "who injected the current fault": the next
+    execution round may switch carriers (blade -> kubectl-native fallback),
+    so the recorded method / carrier pod / Layer-1 cache / start time must
+    not leak into the next attempt. Clearing ``injection_method`` re-arms
+    ``_should_redetect_injection_method`` (empty current -> RESUME), letting
+    the registry re-attribute by RECENCY on the new messages — without this
+    reset the narrow gate never re-opens and a stale attribution survives
+    the method switch (task-29848471).
+
+    ``keep_blade_uid``: an execute-time replan may fire while an experiment
+    is STILL ACTIVE (``existing_blade_uids`` non-empty) — dropping that UID
+    would orphan a live experiment for recovery. Verify-replan destroys its
+    residue first (and retires the UID separately), so it always passes the
+    default ``keep_blade_uid=False``.
+
+    ``message_count``: total messages once this node's result lands in state
+    (``len(state messages) + len(result messages)``). Recorded as the
+    attribution epoch boundary so the RESUME re-detection scan only reads
+    CURRENT-epoch messages: clearing ``injection_method`` re-arms the scan, and
+    an unbounded scan would re-derive the PRE-replan attribution — counting
+    stale diagnostic execs as the new fault's injection and letting the
+    executor conclude "already injected" without issuing anything
+    (task-5193538b).
+    """
+    if not keep_blade_uid:
+        result["blade_uid"] = None
+    result["injection_method"] = None
+    result["kubectl_exec_pod_name"] = None
+    result["inject_layer1_cache"] = None
+    result["injection_start_time"] = None
+    if message_count is not None:
+        result["attribution_epoch_index"] = message_count
+
 
 def _build_execution_hints(
     messages: list,
@@ -546,6 +632,13 @@ def _build_execution_hints(
     if error_hint:
         hints.append(persist_corrective_hint(
             _persist, _history, "tool_error", "execute", error_hint,
+            counts=_counts, counts_out=_counts,
+        ))
+
+    transient_hint = detect_transient_retry_exhaustion(messages)
+    if transient_hint:
+        hints.append(persist_corrective_hint(
+            _persist, _history, "transient_exhaustion", "execute", transient_hint,
             counts=_counts, counts_out=_counts,
         ))
 
@@ -724,11 +817,17 @@ def _detect_terminal_conclusion(
     """Detect when LLM gives a text-only terminal conclusion in Phase 2.
 
     The executor's job is ONLY injection. When the LLM outputs text (no
-    tool_calls), we check whether it has actually performed an injection
-    action. If an injection method has been detected (blade_uid set or
-    injection_method detected), the text conclusion is the natural exit
-    signal — do NOT nudge it back. Only nudge when NO injection action
-    has been taken at all.
+    tool_calls), the exit is permitted ONLY on an attributed
+    ``injection_method`` — the system's record of who injected the CURRENT
+    fault. ``blade_uid`` alone is deliberately NOT an exit ticket: after an
+    execute-time replan the UID may survive the seam
+    (``keep_blade_uid=True``, kept so recovery still reaches the live
+    experiment), and letting it license a text-only exit re-opens the
+    task-5193538b empty spin under the NEW contract — the executor would
+    conclude "already injected" having issued nothing. The UID is not lost:
+    the same-iteration RESUME scan turns current-epoch blade evidence into
+    the method attribution that licenses the exit, and a bare UID kept for
+    recovery continues to serve recover graphs regardless.
 
     EXCEPTION: multi-step injections (kubectl_native / host_shell) often span
     several actions (e.g., ``patch`` to add a finalizer, then ``delete`` to
@@ -738,13 +837,8 @@ def _detect_terminal_conclusion(
     via ``build_injection_step_selfcheck`` (LLM decides completeness).
     """
     _has_tool_calls = bool(getattr(response, "tool_calls", None))
-    _has_uid = bool(result.get("blade_uid") or state.get("blade_uid"))
     _injection_method = result.get("injection_method") or state.get("injection_method")
     _resp_content = (getattr(response, "content", "") or "").strip()
-
-    # Blade injection (uid set) → single-step, text conclusion is correct.
-    if _has_uid:
-        return
 
     # A multi-step backend (kubectl_native / host_shell) may span several
     # injection steps. Before allowing a text-only exit, offer a SOFT one-shot
@@ -951,7 +1045,7 @@ def _handle_replan(
 
     review_reason = _review_replan_request(state, replan_request)
     if review_reason:
-        # needs_investigation: keep executing, do NOT fire a Phase-1 replan.
+        # Reviewed rejection: keep executing, do NOT fire a Phase-1 replan.
         if replan_tool_calls:
             # Tool channel: leave the request_replan tool_call UNANSWERED here so
             # it flows once through phase2_tools (routing is "continue" ->
@@ -963,6 +1057,11 @@ def _handle_replan(
             # The tool's own "Replan request recorded." result + the tool
             # docstring ("needs_investigation ... does NOT replan") carry the
             # semantics; the ReAct loop continues naturally.
+            if replan_request.decision == "plan_invalid":
+                # Deferred LIFECYCLE REVIEW: the rejection reason cannot be
+                # appended now (adjacency above); the next execute_loop
+                # iteration emits it once, then clears the flag.
+                result["_replan_review_rejection"] = review_reason
             return
         result.setdefault("messages", []).append(HumanMessage(content=(
             f"[LIFECYCLE REVIEW] Continue execution: {review_reason} A tool result "
@@ -997,8 +1096,16 @@ def _handle_replan(
             # planning alone is insufficient; the new boundary must be shown
             # to the user even if later discovery happens to look similar.
             result["needs_confirmation"] = True
-        if not replan_context.get("existing_blade_uids"):
-            result["blade_uid"] = None
+        # Attribution reset at the replan seam: the next attempt may switch
+        # carriers, so method/carrier-pod/cache must not leak across.
+        # blade_uid survives ONLY while an experiment is still active
+        # (existing_blade_uids), so recovery keeps a handle on it.
+        reset_attribution_state(
+            result,
+            keep_blade_uid=bool(replan_context.get("existing_blade_uids")),
+            message_count=len(state.get("messages") or [])
+            + len(result.get("messages") or []),
+        )
         history = list(state.get("replan_history") or [])
         history.append({
             "attempt": result["replan_count"],
@@ -1038,13 +1145,64 @@ def _handle_replan(
         )
 
 
+def _injection_attempted_this_contract(state: AgentState) -> bool:
+    """Structural proof that the CURRENT contract attempted an injection.
+
+    The review rule must rest on state facts the model cannot talk around,
+    never on the free text of a replan request (task-71fa78b6 hallucinated
+    its evidence wholesale). Two proofs, strongest first:
+
+    1. Attribution present (``injection_method`` / ``blade_uid``) — an
+       injection was recorded under this contract.
+    2. An injection tool call was ISSUED in the current attribution epoch —
+       attempts count even when they failed; a failed attempt is exactly the
+       evidence a legitimate replan is built on. WHAT counts as an injection
+       call is judged by ``classify_issue_time_method`` — the SAME canonical
+       issue-time classifier the attribution path commits to, so every carrier
+       (blade, python-agent, kubectl object-write / exec-blade / command-mode
+       mutation, host-native shell) is covered by one vocabulary and this rule
+       can never drift away from attribution.
+    """
+    if state.get("injection_method") or state.get("blade_uid"):
+        return True
+    epoch_msgs = _epoch_bounded_messages(state.get("messages") or [], state)
+    if not epoch_msgs:
+        return False
+    from chaos_agent.agent.nodes.execute._injection_detection import (
+        classify_issue_time_method,
+    )
+    from chaos_agent.transports.registry import is_host_scope_channel
+    _is_host = is_host_scope_channel(state)
+    for msg in epoch_msgs:
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            name, args = extract_tool_call_fields(tc)
+            if classify_issue_time_method(name, args, is_host=_is_host):
+                return True
+    return False
+
+
 def _review_replan_request(
     state: AgentState,
     request: ReplanRequest,
 ) -> str | None:
-    """Keep explicit investigation in ReAct; plan-invalid requests replan."""
+    """Keep explicit investigation in ReAct; plan-invalid requests replan.
+
+    Structural review rule: a contract that has not attempted its injection
+    cannot be declared infeasible. Infeasibility is proven by a real attempt
+    (or its recorded attribution), never by anticipation — so the check keys
+    on state facts only (see :func:`_injection_attempted_this_contract`) and
+    ignores the request's free text entirely.
+    """
     if request.decision == "needs_investigation":
         return "The request says more investigation is needed."
+    if not _injection_attempted_this_contract(state):
+        return (
+            "No injection attempt is recorded under the current contract. "
+            "A plan is proven infeasible by attempting it, not by "
+            "anticipation — issue the injection call first."
+        )
     return None
 
 
@@ -1226,16 +1384,18 @@ def _build_convergence_hints(
 
 async def _build_execute_system_prompt(
     state: AgentState, task_id: str, skill_name: str, tools,
-    skill_catalog: str, env_info, registry,
+    skill_catalog: str, env_info, registry, ledger=None,
 ) -> tuple[str, object]:
     """Phase 3: build the execute-phase system prompt + capability context.
 
-    Returns ``(execute_prompt, capability_context)``. Pure extraction from
-    ``_execute_loop_with_llm`` — behaviour unchanged.
+    Returns ``(execute_prompt, capability_context)``. ``ledger`` is the current
+    progress ledger; when non-empty its rendered section is re-injected so the
+    executor re-reads the anchor each round.
     """
     from chaos_agent.agent.prompts import build_system_prompt, PromptMode
     from chaos_agent.agent.env_info import compute_env_info
     from chaos_agent.agent.spec.fault_spec import read_fault_spec
+    from chaos_agent.agent.progress_ledger import build_ledger_prompt_section
     plan = state.get("plan")
     plan_path = state.get("plan_path")
     # Build structured_params_hint from FaultSpec
@@ -1266,6 +1426,7 @@ async def _build_execute_system_prompt(
         user_params_hint=user_params_hint,
         env_info=resolved_env_info,
         profile=capability_context.profile,
+        progress_ledger_section=build_ledger_prompt_section(ledger),
     )
     return execute_prompt, capability_context
 
@@ -1307,6 +1468,22 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         if early_exit is not None:
             return early_exit
 
+        # Freeze the progress-ledger anchor on the first execute iteration.
+        # Lazy (execute_loop runs AFTER confirmation_gate, so fault_spec here is
+        # the APPROVED goal, not a pre-confirmation draft) and idempotent (only
+        # when absent, so the tool-maintained ledger on later turns is never
+        # clobbered). ``_ledger_seeded`` persists the fresh anchor in ``result``.
+        from chaos_agent.agent.progress_ledger import freeze_anchor
+        _ledger = state.get("progress_ledger")
+        _ledger_seeded = False
+        if not _ledger:
+            _spec_for_anchor = read_fault_spec(state)
+            _ledger = freeze_anchor(
+                _spec_for_anchor.to_dict() if _spec_for_anchor else None,
+                goal=str(state.get("input") or ""),
+            )
+            _ledger_seeded = True
+
         # 2. Call pre_reason_hook (memory compaction)
         hook_updates = {}
         if hook:
@@ -1323,6 +1500,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         # unreachable — which is true today but is not a property this line
         # should depend on.
         _hints_for_state: list = []
+        _rejection_consumed = False
         if llm is not None:
             messages = list(state.get("messages", []))
 
@@ -1334,6 +1512,20 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             )
             messages.extend(hints)
 
+            # --- Deferred replan-review rejection (tool-channel adjacency) ---
+            # A plan_invalid replan rejected by _review_replan_request reaches
+            # the model one iteration later: by now phase2_tools has created
+            # the ToolMessage, so this review no longer breaks tool-response
+            # adjacency. Emitted once, then the flag is cleared below.
+            if state.get("_replan_review_rejection"):
+                _rejection_msg = HumanMessage(content=(
+                    f"[LIFECYCLE REVIEW] Replan rejected: {state['_replan_review_rejection']} "
+                    "The approved plan remains authoritative — continue executing it."
+                ))
+                messages.append(_rejection_msg)
+                _hints_for_state.append(_rejection_msg)
+                _rejection_consumed = True
+
             # --- Convergence hints (last-iteration conclusion prompts) ---
             messages.extend(_build_convergence_hints(
                 count, persist_into=_hints_for_state,
@@ -1343,6 +1535,7 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             # prompt build extracted to _build_execute_system_prompt).
             execute_prompt, capability_context = await _build_execute_system_prompt(
                 state, task_id, skill_name, tools, skill_catalog, env_info, registry,
+                ledger=_ledger,
             )
             # On last iteration, unbind tools to force text conclusion
             if count >= MAX_EXECUTE_LOOP:
@@ -1378,6 +1571,14 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
 
         # 4. Build result
         result = {"execute_loop_count": count}
+        if _rejection_consumed:
+            result["_replan_review_rejection"] = None
+
+        # Persist the freshly-frozen ledger anchor (first iteration only). Later
+        # turns leave progress_ledger to the update_progress tool, so this never
+        # clobbers model-recorded content.
+        if _ledger_seeded:
+            result["progress_ledger"] = _ledger
 
         # Extract blade_uid from ToolMessages (blade_create results)
         messages = state.get("messages", [])
@@ -1391,7 +1592,9 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         if artifacts != (state.get("execution_artifacts") or []):
             result["execution_artifacts"] = artifacts
 
-        blade_uid = _extract_blade_uid_from_messages(messages)
+        blade_uid = _extract_blade_uid_from_messages(
+            messages, retired=state.get("retired_blade_uids"),
+        )
         if blade_uid and blade_uid != state.get("blade_uid"):
             result["blade_uid"] = blade_uid
             logger.info(f"Extracted blade_uid from ToolMessage: {blade_uid}")
@@ -1419,7 +1622,9 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         _cur_provider = FaultProviderRegistry.resolve_by_method(current_injection_method)
         if _should_redetect_injection_method(current_injection_method, blade_uid):
             detected_method = _detect_injection_method(
-                messages, blade_uid, is_host=is_host_scope_channel(state)
+                _epoch_bounded_messages(messages, state),
+                blade_uid,
+                is_host=is_host_scope_channel(state),
             )
             if detected_method and detected_method != current_injection_method:
                 _new_provider = FaultProviderRegistry.resolve_by_method(detected_method)

@@ -2332,7 +2332,7 @@ class TestExtractRecoveryVerificationSection:
         )
         result = _extract_recovery_verification_section(content)
         assert "同注入验证" in result
-        assert "**注入验证参考**" in result
+        assert "**Injection-verification reference**" in result
         assert "CPU usage should exceed 80%" in result
 
     def test_cross_reference_pod_level_method(self):
@@ -2346,7 +2346,7 @@ class TestExtractRecoveryVerificationSection:
             "Remove network policy\n"
         )
         result = _extract_recovery_verification_section(content)
-        assert "**注入验证参考**" in result
+        assert "**Injection-verification reference**" in result
         assert "curl endpoint" in result
 
     def test_cross_reference_inject_verification_within(self):
@@ -2360,7 +2360,7 @@ class TestExtractRecoveryVerificationSection:
             "blade destroy\n"
         )
         result = _extract_recovery_verification_section(content)
-        assert "**注入验证参考**" in result
+        assert "**Injection-verification reference**" in result
         assert "df -h" in result
 
     def test_no_cross_reference(self):
@@ -2373,7 +2373,7 @@ class TestExtractRecoveryVerificationSection:
             "blade destroy\n"
         )
         result = _extract_recovery_verification_section(content)
-        assert "**注入验证参考**" not in result
+        assert "**Injection-verification reference**" not in result
         assert "kubectl top node" in result
         assert "**恢复说明**：" not in result
 

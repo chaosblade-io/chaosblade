@@ -41,7 +41,18 @@ _MAX_PIPE_READ = 1024 * 1024  # 1 MB
 
 
 def _kill_process_group(pgid: int) -> None:
-    """Kill an entire process group. No-op if group already exited."""
+    """Kill an entire process group. No-op if group already exited.
+
+    Refuses ``pgid <= 1``: pgid 0 targets the *caller's own* process group and
+    pgid 1 targets init/PID-1's group — SIGKILL to either would take down the
+    agent itself, or (as root in a container) the whole session. A legitimately
+    spawned child always has pgid > 1 (setsid / ``start_new_session`` makes its
+    pgid equal to its own pid), so this guard only ever blocks a bogus value —
+    e.g. a mock whose ``.pid`` coerces to 1 in tests, which as root would
+    otherwise ``killpg(1, SIGKILL)`` and hang the whole run.
+    """
+    if pgid <= 1:
+        return
     try:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):

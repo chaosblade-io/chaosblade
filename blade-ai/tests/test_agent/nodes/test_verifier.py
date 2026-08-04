@@ -1098,7 +1098,6 @@ from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (  # noqa: E40
     _split_candidates,
     _validate_step_number_coverage,
     _try_parse_json,
-    _has_format_reminder,
 )
 
 
@@ -1843,30 +1842,6 @@ class TestTryParseJson:
 
     def test_not_a_dict(self):
         assert _try_parse_json(json.dumps(["not a dict"])) is None
-
-
-# ---------------------------------------------------------------------------
-# _has_format_reminder
-# ---------------------------------------------------------------------------
-
-class TestFormatGuard:
-    """Tests for _has_format_reminder()."""
-
-    def test_detects_format_reminder(self):
-        msgs = [
-            HumanMessage(content="上一轮输出缺少要求的 VERIFICATION_RESULT 格式。请重新输出。")
-        ]
-        assert _has_format_reminder(msgs) is True
-
-    def test_ignores_normal_messages(self):
-        msgs = [
-            AIMessage(content="Some verification text"),
-            HumanMessage(content="kubeconfig reminder"),
-        ]
-        assert _has_format_reminder(msgs) is False
-
-    def test_empty_messages(self):
-        assert _has_format_reminder([]) is False
 
 
 # ---------------------------------------------------------------------------

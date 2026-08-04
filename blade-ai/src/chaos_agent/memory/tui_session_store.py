@@ -52,6 +52,30 @@ def get_global_tui_session_store() -> Optional["TuiSessionStore"]:
     return _global_tui_session_store
 
 
+def persist_node_dialogue(tui_session_id: str, messages: list) -> None:
+    """Append node-authored messages to the TUI session file, best-effort.
+
+    Nodes that end a conversational turn with their own text — rather than a
+    streamed LLM reply — have to write it themselves. The turn-level fallback in
+    ``session_finalizer`` only reaches the session file when the caller passes a
+    ``tui_session_store``, which the CLI runner does and the server route does
+    not; the server path is additionally gated on an operational ``task_id`` that
+    a pure dialogue turn never has. So on the server a node's text lands in graph
+    state and on the TUI, and nowhere on disk.
+
+    Never raises: an audit write must not fail a turn that already decided what
+    to do. Silent when there is no session (non-TUI callers) or no store.
+    """
+    if not tui_session_id or not messages:
+        return
+    try:
+        store = get_global_tui_session_store()
+        if store is not None:
+            store.append_dialogue(tui_session_id, list(messages))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Node dialogue persistence skipped: {e}")
+
+
 class TuiSessionStore:
     # Maximum number of sessions to keep in memory. When exceeded, the oldest
     # sessions (by started_at) are evicted from in-memory buffers. Disk files

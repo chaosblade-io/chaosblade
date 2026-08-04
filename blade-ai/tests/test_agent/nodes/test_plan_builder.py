@@ -31,7 +31,7 @@ def _present_options_tc(question="选择 namespace", options=None, call_id="call
     if options is None:
         options = [
             {"key": "A", "label": "cms-demo", "description": "3 Deployments", "recommended": True},
-            {"key": "free_input", "label": "自由输入"},
+            {"key": "free_input", "label": "Free input"},
         ]
     return {
         "name": "present_options",
@@ -160,7 +160,7 @@ class TestPlanBuilderNode:
         result = await node(_make_state())
         msgs = result["messages"]
         assert len(msgs) == 1
-        assert "LLM 不可用" in msgs[0].content
+        assert "the LLM is unavailable" in msgs[0].content
 
     @pytest.mark.asyncio
     async def test_submit_plan_finalizes(self):
@@ -250,7 +250,7 @@ class TestPlanBuilderNode:
             result = await node(_make_state())
 
         msgs = result["messages"]
-        assert any("已取消" in m.content for m in msgs)
+        assert any("Plan building cancelled" in m.content for m in msgs)
         assert result.get("plan_confirmed") is not True
 
     @pytest.mark.asyncio
@@ -308,7 +308,7 @@ class TestPlanBuilderNode:
             result = await node(_make_state())
 
         msgs = result["messages"]
-        assert any("已取消" in m.content for m in msgs)
+        assert any("Plan building cancelled" in m.content for m in msgs)
 
     @pytest.mark.asyncio
     async def test_mixed_tools_priority2_strips_real(self):
@@ -350,7 +350,7 @@ class TestPlanBuilderNode:
             result = await node(state)
 
         msgs = result["messages"]
-        assert any("轮数已达上限" in m.content for m in msgs if isinstance(m, AIMessage))
+        assert any("turn limit" in m.content for m in msgs if isinstance(m, AIMessage))
 
     @pytest.mark.asyncio
     async def test_llm_exception_returns_error(self):
@@ -365,7 +365,7 @@ class TestPlanBuilderNode:
             result = await node(_make_state())
 
         msgs = result["messages"]
-        assert any("遇到了一些问题" in m.content for m in msgs)
+        assert any("ran into a problem" in m.content for m in msgs)
 
     @pytest.mark.asyncio
     async def test_activate_skill_extracts_skill_name(self):
@@ -403,7 +403,7 @@ class TestPlanBuilderNode:
         msgs = result["messages"]
         # Find the ToolMessage responding to present_options
         tool_msgs = [m for m in msgs if isinstance(m, ToolMessage)]
-        assert any("用户选择: B" in m.content for m in tool_msgs)
+        assert any("User selected: B" in m.content for m in tool_msgs)
         # The AI message before it should have only present_options call
         ai_msgs = [m for m in msgs if isinstance(m, AIMessage) and m.tool_calls]
         for ai in ai_msgs:

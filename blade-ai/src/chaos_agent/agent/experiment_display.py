@@ -38,8 +38,8 @@ def format_experiment_line(idx: int, experiment: dict) -> str:
 
     Example::
 
-        1. [昨天 15:02] task_id=task-787124d0  故障: pod-image-error  目标: reg-center/registry-sts
-            描述: 将 StatefulSet registry-sts 的镜像改为无效值 nginx:doesnotexist
+        1. [yesterday 15:02] task_id=task-787124d0  fault: pod-image-error  target: reg-center/registry-sts
+            description: point StatefulSet registry-sts at the invalid image nginx:doesnotexist
 
     ``fault_type`` (the derived ``{scope}-{target}-{action}`` projection) is
     preferred over ``skill`` so the line isn't the generic skill package name
@@ -54,12 +54,12 @@ def format_experiment_line(idx: int, experiment: dict) -> str:
 
     head = (
         f"  {idx}. {time_prefix}task_id={tid}  "
-        f"故障: {fault}  目标: {target}"
+        f"fault: {fault}  target: {target}"
     )
 
     summary = (experiment.get("plan_summary") or "").strip()
     if summary:
         first_line = summary.splitlines()[0][:80]
         if first_line:
-            head += f"\n      描述: {first_line}"
+            head += f"\n      description: {first_line}"
     return head

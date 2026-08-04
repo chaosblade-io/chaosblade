@@ -245,7 +245,7 @@ class _L4ExecutionMixin:
                         "kind": "phase_completed",
                         "node": node,
                         "phase": phase_name,
-                        "message": f"阶段完成: {phase_name or node}",
+                        "message": f"Phase complete: {phase_name or node}",
                     }
                     self._state_transitions_buffer.append(
                         {
@@ -393,15 +393,15 @@ class _L4ExecutionMixin:
             level = verification.get("level", "unknown") if isinstance(verification, dict) else "unknown"
             blade_uid = state.values.get("blade_uid", "")
             _status_text_map = {
-                "passed": "成功",
-                "degraded": "成功（降级）",
-                "failed": "失败",
+                "passed": "succeeded",
+                "degraded": "succeeded (degraded)",
+                "failed": "failed",
             }
-            status_text = _status_text_map.get(result.status, "失败")
+            status_text = _status_text_map.get(result.status, "failed")
             runtime.emit_event("conclusion", {
                 "message": (
-                    f"故障注入{status_text}"
-                    f" | 验证级别: {level}"
+                    f"Fault injection {status_text}"
+                    f" | verification level: {level}"
                     f"{f' | blade_uid: {blade_uid}' if blade_uid else ''}"
                 ),
                 "status": result.status,
@@ -486,19 +486,19 @@ class _L4ExecutionMixin:
             # Emit recover conclusion event.
             if runtime and hasattr(runtime, "emit_event"):
                 _recover_status_map = {
-                    "recovered": "成功",
-                    "partial_recovered": "成功（部分恢复）",
-                    "failed": "失败",
+                    "recovered": "succeeded",
+                    "partial_recovered": "succeeded (partial recovery)",
+                    "failed": "failed",
                 }
-                recover_text = _recover_status_map.get(recover_task_state, "完成")
+                recover_text = _recover_status_map.get(recover_task_state, "completed")
                 recover_level = "ok" if recover_task_state == "recovered" else (
                     "warn" if recover_task_state == "partial_recovered" else "error"
                 )
                 blade_uid = inject_result.extras.get("blade_uid", "")
                 runtime.emit_event("conclusion", {
                     "message": (
-                        f"故障恢复{recover_text}"
-                        f" | 恢复级别: {recover_task_state}"
+                        f"Fault recovery {recover_text}"
+                        f" | recovery level: {recover_task_state}"
                         f"{f' | blade_uid: {blade_uid}' if blade_uid else ''}"
                     ),
                     "status": inject_result.status,

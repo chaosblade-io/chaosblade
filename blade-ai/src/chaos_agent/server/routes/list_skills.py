@@ -46,7 +46,7 @@ async def list_skills(req: Request):
     cats: dict = {}
     for c in cases:
         cat = c.get("category", "unknown")
-        cats.setdefault(cat, {"category": cat, "description": f"{cat} 故障注入用例", "faults": []})
+        cats.setdefault(cat, {"category": cat, "description": f"{cat} fault-injection use cases", "faults": []})
         cats[cat]["faults"].append(c)
 
     return JSONEnvelope.ok(

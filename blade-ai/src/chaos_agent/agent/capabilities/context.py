@@ -17,6 +17,7 @@ from chaos_agent.agent.providers import FaultProviderRegistry
 from chaos_agent.agent.providers.base import EXECUTE, PLAN, RECOVER_VERIFY, VERIFY
 from chaos_agent.agent.spec.fault_registry import family_for_scope
 from chaos_agent.transports import (
+    PROFILE_K8S,
     PROFILE_UNKNOWN,
     profile_of,
     resolve_channel_name,
@@ -74,8 +75,36 @@ def provider_tool_owners() -> dict[str, tuple]:
     return {name: tuple(providers) for name, providers in owners.items()}
 
 
-def _tool_allowed_for_profile(owners: tuple, profile: str) -> bool:
-    """True when ANY owning provider can operate on *profile*."""
+#: Tools whose OWNING provider spans several profiles but which are themselves
+#: meaningful in only one. Provider-level ``matches_channel`` is too coarse for
+#: these: ``ChaosbladeProvider`` legitimately accepts host (``blade create cpu
+#: load`` runs on a bare machine), so every tool it declares was reaching the
+#: host tool surface — including ``blade_query_k8s``, which queries a cluster CRD
+#: that host scope does not have. The tool itself already refuses there
+#: (``tools/blade.py``: "does not apply to host-scope experiments") and host
+#: Layer 1 deliberately skips it (``verify/_verifier_layer1.py``: "blade_query_k8s
+#: is k8s-only"), so binding it to a host turn only spends context and invites a
+#: round wasted on a refusal.
+#:
+#: This gate is about VISIBILITY (what enters the LLM's context), which is
+#: separate from ``tools/_tool_profiles.TOOL_PROFILE`` — that table asserts a
+#: transport profile at EXECUTION time and deliberately excludes the blade family
+#: so a legitimate host-channel blade injection is never refused.
+_TOOL_ONLY_PROFILE: dict[str, str] = {
+    "blade_query_k8s": PROFILE_K8S,
+}
+
+
+def _tool_allowed_for_profile(owners: tuple, profile: str, name: str = "") -> bool:
+    """True when *profile* may see this tool.
+
+    A tool declared for exactly one profile (see :data:`_TOOL_ONLY_PROFILE`)
+    answers on its own; otherwise reachability is the UNION over owning
+    providers — a tool is reachable wherever any provider offering it operates.
+    """
+    only = _TOOL_ONLY_PROFILE.get(name)
+    if only is not None:
+        return profile == only
     return any(provider.matches_channel(profile) for provider in owners)
 
 
@@ -87,7 +116,7 @@ def _split_by_ownership(
     owned = {name for name in names if name in owners}
     allowed = {
         name for name in owned
-        if _tool_allowed_for_profile(owners[name], profile)
+        if _tool_allowed_for_profile(owners[name], profile, name)
     }
     return owned, allowed
 
@@ -272,7 +301,7 @@ def is_tool_name_allowed_for_context(
     # Not provider-owned (graph control tools, MCP tools) → not profile-bound.
     if not tool_owners:
         return True
-    return _tool_allowed_for_profile(tool_owners, profile)
+    return _tool_allowed_for_profile(tool_owners, profile, tool_name)
 
 
 def tool_call_field(call: object, field: str, default: str = "") -> str:
@@ -326,6 +355,7 @@ def tool_call_allowed(
 
 def explain_tool_refusal(
     tool_name: str, state: dict | None, phase: str = "",
+    *, discovery: bool = False,
 ) -> tuple[str, str]:
     """Return ``(reason, suggestion)`` naming WHY this tool is not available.
 
@@ -338,6 +368,14 @@ def explain_tool_refusal(
     instead. That is a template, not a cause, and a model given it has nothing
     to act on except retrying the same call.
 
+    ``discovery`` must mirror the flag the VERDICT was made with (see
+    :func:`is_tool_name_allowed_for_intent_discovery`): that rule resolves the
+    profile from the transport alone and deliberately ignores a provisional
+    ``fault_spec.scope``. Explaining such a refusal through the scope-agreement
+    rule instead would report "environment not registered" for a perfectly
+    healthy environment — a host-scoped intent on a k8s transport is normal in
+    that phase, not a misconfiguration.
+
     Best-effort: any failure degrades to the generic pair rather than raising,
     since this runs on a rejection path that must not itself fail.
     """
@@ -346,7 +384,10 @@ def explain_tool_refusal(
         "Use only tools bound for the current environment.",
     )
     try:
-        profile = resolve_profile_for_state(state)
+        profile = (
+            profile_of(resolve_channel_name(state)) if discovery
+            else resolve_profile_for_state(state)
+        )
         if get_environment_profile(profile) is None:
             return (
                 f"the environment profile in force ({profile or '<unresolved>'}) "
@@ -382,7 +423,7 @@ def explain_tool_refusal(
         })
         available = sorted(
             name for name, owns in owners.items()
-            if _tool_allowed_for_profile(owns, profile)
+            if _tool_allowed_for_profile(owns, profile, name)
         )
         reason = (
             f"'{tool_name}' is provided for the "
@@ -464,7 +505,7 @@ def is_tool_name_allowed_for_intent_discovery(
     owner = provider_tool_owners().get(tool_name)
     if not owner:
         return True
-    return _tool_allowed_for_profile(owner, profile)
+    return _tool_allowed_for_profile(owner, profile, tool_name)
 
 
 __all__ = [

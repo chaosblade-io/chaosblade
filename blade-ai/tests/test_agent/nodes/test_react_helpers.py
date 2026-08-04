@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from chaos_agent.agent.nodes.execute.react_helpers import (
+    _build_introspection_hint,
+    _elide_middle,
     _should_trigger_introspection,
     detect_action_stagnation,
     detect_tool_error_hint,
@@ -657,6 +659,48 @@ class TestSuggestVerifyCommand:
         assert "error message" in s
 
 
+class TestErrorHintKeepsTheReason:
+    """A schema error states its reason at the END, after the echoed arguments.
+
+    LangChain prefixes ``Error invoking tool 'x' with kwargs {...}`` and echoes
+    every argument in full, so a head-only cut can be entirely echo. On
+    task-fc64c982 the hint for ``update_progress`` carried only the echoed
+    kwargs; the executor resubmitted the identical payload, was rejected again,
+    and gave up with an empty ledger.
+    """
+
+    SCHEMA_ERROR = (
+        "Error: Error invoking tool 'update_progress' with kwargs "
+        "{'state_update': '{\"phase\": \"execution\", \"current_step\": \"injection_complete\", "
+        "\"established_facts\": [\"Node cn-shanghai-cloudspe.25.209.69.252 status changed to "
+        "NotReady\", \"Experiment UID: dea3008a9cc9f817\", \"containerd stopped\"]}', "
+        "'log_append': '[{\"event\": \"blade_create node-process stop\", \"status\": \"verified\"}]'} "
+        "2 validation errors for update_progress\n"
+        "state_update\n  Input should be a valid dictionary [type=dict_type]\n"
+        "log_append\n  Input should be a valid list [type=list_type]"
+    )
+
+    def test_the_reason_survives_elision(self):
+        hint = _build_introspection_hint("update_progress", self.SCHEMA_ERROR, [])
+        assert "Input should be a valid dictionary" in hint
+        assert "Input should be a valid list" in hint
+
+    def test_the_head_survives_too(self):
+        """The tool name and the offending argument names still identify the call."""
+        hint = _build_introspection_hint("update_progress", self.SCHEMA_ERROR, [])
+        assert "update_progress" in hint
+        assert "state_update" in hint
+
+    def test_elision_is_marked(self):
+        out = _elide_middle(self.SCHEMA_ERROR)
+        assert "elided" in out
+        assert len(out) < len(self.SCHEMA_ERROR)
+
+    def test_short_errors_pass_through_untouched(self):
+        short = "Error: kubectl get (exit 1): pods 'x' not found"
+        assert _elide_middle(short) == short
+
+
 class TestDetectToolErrorHint:
     def test_blade_unknown_flag(self):
         msgs = [
@@ -819,3 +863,94 @@ class TestPhaseSpecificLoopHints:
         hint = _build_loop_hint("some_tool()", 3, "unknown_phase")
         assert "REFLECT" in hint
         assert "discovery method" in hint
+
+
+class TestTransientRetryExhaustion:
+    """Guard contract: the INFRA_TRANSIENT short-retry budget is enforced.
+
+    task-71fa78b6: the same 63061 kubewiz-timeout was retried six times
+    because nothing enforced ``max_transient_retry``. The guard must fire on
+    the (budget + 1)-th transient failure of one tool, stay generic over
+    error TEXT (classification only), and reset on success.
+    """
+
+    def _transient_error(self, name: str, text: str = "Error: i/o timeout") -> ToolMessage:
+        return ToolMessage(content=text, name=name, tool_call_id=f"{name}-id")
+
+    def test_silent_below_budget(self):
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            detect_transient_retry_exhaustion,
+        )
+        msgs = [self._transient_error("blade_create") for _ in range(3)]
+        assert detect_transient_retry_exhaustion(msgs) is None
+
+    def test_fires_on_budget_plus_one(self):
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            detect_transient_retry_exhaustion,
+        )
+        msgs = [self._transient_error("blade_create") for _ in range(4)]
+        hint = detect_transient_retry_exhaustion(msgs)
+        assert hint is not None
+        assert "TRANSIENT RETRY BUDGET EXHAUSTED" in hint
+        assert "blade_create" in hint
+        assert "4" in hint
+
+    def test_success_resets_budget(self):
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            detect_transient_retry_exhaustion,
+        )
+        msgs = [
+            self._transient_error("blade_create"),
+            self._transient_error("blade_create"),
+            ToolMessage(content='{"code":200}', name="blade_create", tool_call_id="ok"),
+            self._transient_error("blade_create"),
+            self._transient_error("blade_create"),
+        ]
+        assert detect_transient_retry_exhaustion(msgs) is None
+
+    def test_per_tool_isolation(self):
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            detect_transient_retry_exhaustion,
+        )
+        msgs = [
+            self._transient_error("blade_create"),
+            self._transient_error("blade_create"),
+            self._transient_error("kubectl"),
+            self._transient_error("kubectl"),
+        ]
+        assert detect_transient_retry_exhaustion(msgs) is None
+
+    def test_non_transient_errors_not_counted(self):
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            detect_transient_retry_exhaustion,
+        )
+        msgs = [
+            self._transient_error("blade_create", "Error: permission denied"),
+            self._transient_error("blade_create", "Error: permission denied"),
+            self._transient_error("blade_create", "Error: permission denied"),
+            self._transient_error("blade_create", "Error: permission denied"),
+        ]
+        assert detect_transient_retry_exhaustion(msgs) is None
+
+    def test_disabled_when_budget_zero(self, monkeypatch):
+        from chaos_agent.agent.nodes.execute import react_helpers
+        from chaos_agent.config.settings import settings
+        monkeypatch.setattr(settings, "max_transient_retry", 0)
+        msgs = [self._transient_error("blade_create") for _ in range(10)]
+        assert react_helpers.detect_transient_retry_exhaustion(msgs) is None
+
+    def test_generic_over_error_text(self):
+        """Different transient signatures share one budget — the guard keys on
+        ErrorClass, never on a specific error string."""
+        from chaos_agent.agent.nodes.execute.react_helpers import (
+            detect_transient_retry_exhaustion,
+        )
+        msgs = [
+            self._transient_error("blade_create", "Error: i/o timeout"),
+            self._transient_error("blade_create", "Error: connection refused"),
+            self._transient_error("blade_create", "Error: connection reset"),
+            self._transient_error("blade_create", "Error: deadline exceeded"),
+        ]
+        hint = detect_transient_retry_exhaustion(msgs)
+        assert hint is not None
+        assert "TRANSIENT RETRY BUDGET EXHAUSTED" in hint

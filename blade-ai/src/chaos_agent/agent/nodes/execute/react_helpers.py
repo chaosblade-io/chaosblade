@@ -838,12 +838,31 @@ def extract_rejected_params(error_text: str) -> list[str]:
     return found
 
 
+def _elide_middle(text: str, head: int = 200, tail: int = 220) -> str:
+    """Keep both ends of an error, dropping the middle.
+
+    A head-only cut assumes the reason comes first. Schema errors are the other
+    way round: LangChain prefixes ``Error invoking tool 'x' with kwargs {...}``
+    and the offending arguments are echoed back in full, so the first 200
+    characters can be entirely echo while the reason — pydantic's ``Input should
+    be a valid dictionary`` — sits at the end and was cut away.
+
+    task-fc64c982: ``update_progress`` was rejected for JSON-stringified
+    arguments, the hint carried only the echoed kwargs, and the executor
+    resubmitted the identical payload and was rejected again. The verdict it
+    needed was in the part that got dropped.
+    """
+    if len(text) <= head + tail:
+        return text
+    return f"{text[:head]} … [{len(text) - head - tail} chars elided] … {text[-tail:]}"
+
+
 def _build_introspection_hint(
     tool_name: str, error_content: str, rejected_params: list[str],
 ) -> str:
     parts = [
         f"**{_HINT_MARKER}**: `{tool_name}` returned an error.",
-        f"- tool observation: {error_content[:200]}",
+        f"- tool observation: {_elide_middle(error_content)}",
         "- real-world outcome: unknown from this tool result alone",
         "",
         "Runtime behavior takes precedence over documentation for this environment.",
@@ -893,4 +912,80 @@ def detect_tool_error_hint(messages: list) -> str | None:
         rejected = extract_rejected_params(content)
         return _build_introspection_hint(tool_name, content, rejected)
 
+    return None
+
+
+def detect_transient_retry_exhaustion(messages: list) -> str | None:
+    """Escalate when one tool keeps failing with INFRA_TRANSIENT errors.
+
+    Executes the short-retry budget promised by ``settings.max_transient_retry``
+    (Patch B). Its design intent: an infra blip may heal seconds later, so a
+    SHORT_RETRY error earns a bounded number of retries — but recurring
+    transient failures are not a blip; they are the environment saying this
+    path cannot work. Without enforcement the same transient error can be
+    retried indefinitely (task-71fa78b6: the same 63061 kubewiz-timeout was
+    retried six times, burning most of the task's wall clock).
+
+    Layering note: this is the ERROR-CLASS frequency layer. It deliberately
+    does NOT touch ``detect_repeated_tool_calls`` (whose contract is
+    "identical call + identical result") or ``detect_action_stagnation``
+    (whose contract is consecutive-turn frequency): both stay silent by design
+    when results differ or other tools interleave, which is exactly the shape
+    a retry storm has. Classification comes from ``errors.classify_error`` —
+    this function matches no error text of its own.
+
+    Semantics:
+    * Per tool, transient errors are counted chronologically within the
+      detection window; ``budget`` counts RETRIES after the first failure, so
+      the hint fires on the (budget + 1)-th transient failure.
+    * A SUCCESSFUL result (non-``Error`` ToolMessage) resets that tool's
+      count — a healed blip earns a fresh budget.
+    * ``budget <= 0`` disables the guard (same convention as the other
+      budget settings).
+    """
+    try:
+        budget = int(settings.max_transient_retry or 0)
+    except (TypeError, ValueError):
+        budget = 0
+    if budget <= 0:
+        return None
+
+    counts: dict[str, int] = {}
+    last_pattern: dict[str, str] = {}
+    for msg in _recent_window(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        name = getattr(msg, "name", "") or "tool"
+        content = msg.content if isinstance(msg.content, str) else ""
+        if not content.startswith("Error"):
+            # A successful result proves the blip healed — fresh budget.
+            counts.pop(name, None)
+            continue
+        result = classify_error(content)
+        if result.error_class is not ErrorClass.INFRA_TRANSIENT:
+            continue
+        counts[name] = counts.get(name, 0) + 1
+        last_pattern[name] = result.matched_pattern or "transient error"
+
+    for name, n in counts.items():
+        if n > budget:
+            return (
+                f"**TRANSIENT RETRY BUDGET EXHAUSTED**: `{name}` has failed "
+                f"{n} times with transient infrastructure errors (latest "
+                f"signature: \"{last_pattern[name]}\").\n\n"
+                "REFLECT: A short retry budget exists because a blip may "
+                "heal — but recurring failures of the same shape increasingly "
+                "suggest the environment, not the call.\n\n"
+                "NEXT:\n"
+                "1. Reconsider — a different path (another method, carrier, "
+                "or angle) may bypass whatever is failing here.\n"
+                "2. Escalate — a structured replan can hand the recurring "
+                "blocker to Phase 1 with fresh context.\n"
+                "3. Conclude — if no alternative remains within the approved "
+                "boundary, reporting this step as failed is a valid outcome.\n\n"
+                f"If retrying `{name}` is genuinely warranted here (you have "
+                "evidence the environment is healing), say why and continue. "
+                "Otherwise change approach — more attempts of the same call "
+                "will not add information."
+            )
     return None

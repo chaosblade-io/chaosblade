@@ -65,7 +65,18 @@ def get_intent_priorities_section(*, semantic_only: bool = False) -> str:
 2. **Proactiveness** — """ + (
         "Use the full skill catalog to resolve the fault vocabulary, then actively probe "
         "the current environment with bound read-only tools to discover target candidates. "
-        "The active transport changes how you probe, never which fault families you know."
+        # The earlier wording ended "…changes how you probe, never which fault
+        # families you know", which read as licence to ignore the channel when
+        # deciding what is injectable: in a 10-sample A/B the model kept
+        # offering host-only and python-agent families on a Kubernetes channel,
+        # and with this sentence left intact no other prompt change moved skill
+        # selection (0/10). The catalog stays complete — what changes is that a
+        # family needing a different environment is named as such instead of
+        # being proposed.
+        "The active transport changes how you probe, and equally which fault families "
+        "can actually run here: a fault family whose required environment differs from "
+        "the bound environment cannot be injected, and you must say so instead of "
+        "proposing it."
         if semantic_only else
         "You have read-only tools. Actively probe the current environment to discover "
         "targets and recommend options. Prefer \"here are 3 matching targets, which one?\" "
@@ -155,22 +166,35 @@ def get_intent_inject_flow_section(*, semantic_only: bool = False) -> str:
         if semantic_only else
         "- If a query returns unexpected results: simplify your query method before changing scope"
     )
+    # Insurance only — ``submit_fault_intent`` enforces this with the real
+    # config (``family_for_scope`` + ``profile_of``), so the rule stays one line
+    # and never asks the model to withhold the submit on its own judgement.
+    mismatch_rule = (
+        "- If the fault domain does not match the `Capability Profile` section, "
+        "tell the user before submitting — the submit tool enforces this and "
+        "will reject a mismatch with the reason"
+    )
     return """# Inject Flow
 
 1. **Extract** — Parse user input for any already-stated parameters
 """ + discovery_step + """
 """ + recommend_step + """
 4. **User picks** — User selects or modifies; update state accordingly
-5. **Summarize** — Show complete spec summary to user
-6. **User approves** — Explicit approval before calling submit tool
-7. **Submit** — Call submit_fault_intent with all collected semantic parameters
+5. **Summarize & Submit** — In one turn: state the complete spec together with
+   what the user needs in order to judge it (expected symptoms, how it gets
+   reverted, blast radius), then call submit_fault_intent immediately. Do not stop
+   for approval in chat — submitting raises a confirmation card that collects the
+   decision, so an extra text round only asks the same question twice. If the user
+   declines on the card, the dialogue and the reviewed spec both survive, so the
+   next turn refines them instead of restarting.
 
 Rules:
 - Never re-ask a parameter the user already confirmed
 """ + parameter_rule + """
 - If user rejects a recommendation, shift axis: try different fault type,
   different target, or different intensity — do not repeat same suggestion
-""" + unexpected_rule
+""" + unexpected_rule + """
+""" + mismatch_rule
 
 
 # ---------------------------------------------------------------------------
@@ -220,8 +244,10 @@ def get_intent_batch_flow_section(
         "For each independent objective:\n"
         "1. Clarify its outcome and boundaries.\n"
         f"2. {discovery}\n"
-        "3. Show the complete semantic summary and receive explicit user approval.\n"
-        "4. Submit all objectives once with `execution_order=\"serial\"`.\n\n"
+        "3. State the complete set of objectives with expected symptoms and how "
+        "each gets reverted, then submit all of them once with "
+        "`execution_order=\"serial\"`. The submit path raises one confirmation "
+        "card listing every fault, so do not stop for approval in chat.\n\n"
         f"Each item uses the shared fault vocabulary: {fields}. "
         "Feasibility validates transport compatibility later."
     )
@@ -439,7 +465,9 @@ def get_intent_reminder_section(profile: str | None = PROFILE_K8S) -> str:
     return f"""# REMEMBER
 
 1. Recommended targets MUST come from {target_source} in this conversation
-2. Never submit without user's explicit approval
+2. Injection is never silent: state the spec and its consequences, then submit —
+   the confirmation card raised by submitting is where the user approves, so do
+   not also ask in chat. (Recovery has no such card; there, confirm in chat.)
 3. Same pattern failed 3 times = suspect your method, simplify before retrying
 {discovery_rule}
 5. recover_task is ONLY for when the user explicitly requests to undo

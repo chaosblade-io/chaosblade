@@ -21,6 +21,7 @@ from langgraph.types import interrupt
 
 from chaos_agent.agent.spec.fault_spec import read_fault_spec
 from chaos_agent.agent.state import AgentState
+from chaos_agent.memory.tui_session_store import persist_node_dialogue
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
 
 logger = logging.getLogger(__name__)
@@ -36,20 +37,20 @@ _TRIM_TAIL_KEEP = 4
 def _format_intent_summary(fault_intent: dict) -> str:
     """Format fault_intent dict into a human-readable summary."""
     parts = []
-    parts.append(f"故障类型: {fault_intent.get('fault_type', '未知')}")
-    parts.append(f"范围: {fault_intent.get('scope', '未知')}")
-    parts.append(f"目标: {fault_intent.get('target', '未知')}")
-    parts.append(f"动作: {fault_intent.get('action', '未知')}")
-    parts.append(f"命名空间: {fault_intent.get('namespace', '未知')}")
+    parts.append(f"Fault type: {fault_intent.get('fault_type', 'unknown')}")
+    parts.append(f"Scope: {fault_intent.get('scope', 'unknown')}")
+    parts.append(f"Target: {fault_intent.get('target', 'unknown')}")
+    parts.append(f"Action: {fault_intent.get('action', 'unknown')}")
+    parts.append(f"Namespace: {fault_intent.get('namespace', 'unknown')}")
     if fault_intent.get("labels"):
-        parts.append(f"标签选择器: {fault_intent['labels']}")
+        parts.append(f"Label selector: {fault_intent['labels']}")
     if fault_intent.get("names"):
-        parts.append(f"目标资源: {', '.join(fault_intent['names'])}")
+        parts.append(f"Target resources: {', '.join(fault_intent['names'])}")
     if fault_intent.get("params"):
         params_str = ", ".join(f"{k}={v}" for k, v in fault_intent["params"].items())
-        parts.append(f"参数: {params_str}")
+        parts.append(f"Parameters: {params_str}")
     if fault_intent.get("user_description"):
-        parts.append(f"用户描述: {fault_intent['user_description']}")
+        parts.append(f"User description: {fault_intent['user_description']}")
     return "\n".join(parts)
 
 
@@ -84,11 +85,16 @@ def _build_trim_remove_list(messages: list) -> list[RemoveMessage]:
     multiple tasks in the same session. Compressed history summaries are
     the output of PreReasoningHook's LLM compaction and must survive
     trimming for the same reason.
+
+    Interruption records are preserved for a stronger reason still: they are the
+    only place the dialogue learns that an operation stopped part-way and that a
+    fault may still be live. Dropping one would silently lose that warning.
     """
     if len(messages) <= _TRIM_TAIL_KEEP:
         return []
     _PRESERVE_PREFIXES = (
         "[Task Summary]",
+        "[Task Interrupted]",
         "[Batch Summary]",
         "[Recover Summary]",
         "[Compressed History]",
@@ -144,12 +150,17 @@ async def intent_confirm(state: AgentState) -> dict:
     # render an approval gate for an incomplete or unregistered fault domain.
     if spec is None or not spec.is_complete:
         logger.warning("Rejecting incomplete fault intent before confirmation: %r", fault_intent)
+        refusal = AIMessage(
+            content="The fault intent has a missing or unsupported scope, so it did not enter execution confirmation; fix it and resubmit."
+        )
+        # Write it ourselves: the next ``intent_clarification`` turn rebuilds the
+        # persist list from scratch and only back-fills ToolMessages from history,
+        # so an AIMessage another node left in state is never picked up.
+        persist_node_dialogue(state.get("tui_session_id", ""), [refusal])
         return {
             "confirmed_intent": None,
             "intent_reasoning": "fault intent is incomplete or uses an unsupported scope",
-            "messages": [AIMessage(
-                content="故障意图包含缺失或不支持的 scope，未进入执行确认；请修正后重新提交。"
-            )],
+            "messages": [refusal],
         }
 
     tracker = get_tracker(task_id) if task_id else None
@@ -168,7 +179,7 @@ async def intent_confirm(state: AgentState) -> dict:
             tracker.start(
                 StatusCategory.NODE,
                 "intent_confirm",
-                "Dry-Run: 跳过意图确认，进入计划生成",
+                "Dry-Run: skipping intent confirmation, moving to plan generation",
                 {"dry_run": True, "fault_intent": fault_intent},
             )
             tracker.complete("Dry-Run: bypassed Layer-1 confirm")
@@ -187,7 +198,7 @@ async def intent_confirm(state: AgentState) -> dict:
         tracker.start(
             StatusCategory.NODE,
             "intent_confirm",
-            "等待用户确认故障注入意图",
+            "Waiting for the user to confirm the fault-injection intent",
             {"fault_intent": fault_intent, "intent_confidence": intent_confidence},
         )
 
@@ -207,7 +218,7 @@ async def intent_confirm(state: AgentState) -> dict:
     batch_args = state.get("batch_submit_args")
     if batch_args and isinstance(batch_args, dict) and batch_args.get("faults"):
         batch_faults = batch_args["faults"]
-        batch_lines = [f"批量故障注入: {len(batch_faults)} 个故障 (串行执行)"]
+        batch_lines = [f"Batch fault injection: {len(batch_faults)} fault(s) (serial execution)"]
         for i, f in enumerate(batch_faults, 1):
             item_spec = read_fault_spec({"fault_spec": f}) if isinstance(f, dict) else None
             if item_spec is not None and not item_spec.blade_target:
@@ -240,7 +251,7 @@ async def intent_confirm(state: AgentState) -> dict:
 
     if decision == "approved":
         if tracker:
-            tracker.complete("用户确认意图，进入执行阶段")
+            tracker.complete("User confirmed the intent, moving to the execution stage")
         logger.info("Intent confirmed by user: %s", fault_intent.get("fault_type"))
         # Option A handoff: the trim + bootstrap side effects used to
         # fire from ``intent_clarification`` the moment intent
@@ -263,7 +274,7 @@ async def intent_confirm(state: AgentState) -> dict:
         # subsequent approval reuses the same id without re-creating
         # the on-disk file.
         if tracker:
-            tracker.complete("用户拒绝意图，返回对话")
+            tracker.complete("User rejected the intent, returning to conversation")
         logger.info("Intent rejected by user, returning to conversation")
         # The reviewed FaultSpec remains available for the next turn. It is
         # replaced only by a new explicit proposal, never merged from prose.

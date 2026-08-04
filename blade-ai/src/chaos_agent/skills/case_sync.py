@@ -148,13 +148,13 @@ def _self_check_direct(direct_cmd: str, caps: dict) -> list[str]:
     target = target_m.group(1) if target_m else ""
     action = action_m.group(1) if action_m else ""
     if not all([scope, target, action]):
-        errs.append("无法解析 scope/target/action")
+        errs.append("Cannot parse scope/target/action")
         return errs
 
     res = f"{scope}-{target}"
     legal_actions = caps.get("resources", {}).get(res, [])
     if action not in legal_actions:
-        errs.append(f"{res} 无 action '{action}' (合法: {legal_actions})")
+        errs.append(f"{res} has no action '{action}' (legal: {legal_actions})")
 
     # Check params flags (skip infra/global flags like timeout/namespace — they're always valid)
     m = _PARAMS_RE.search(direct_cmd)
@@ -165,7 +165,7 @@ def _self_check_direct(direct_cmd: str, caps: dict) -> list[str]:
         for part in params_str.split(","):
             flag_name = part.split("=")[0].strip()
             if flag_name and flag_name not in legal_flags and flag_name not in _INFRA_FLAGS:
-                errs.append(f"{res} {action} 无 flag '--{flag_name}' (合法: {sorted(legal_flags)})")
+                errs.append(f"{res} {action} has no flag '--{flag_name}' (legal: {sorted(legal_flags)})")
     return errs
 
 
@@ -386,7 +386,7 @@ async def sync_capabilities(
         if direct_cmd:
             errs = _self_check_direct(direct_cmd, caps)
             if errs:
-                direct_hint = f"自检未通过({'; '.join(errs)})，已清空 direct_cmd；请用 structured_cmd 或 nl_cmd"
+                direct_hint = f"Self-check failed ({'; '.join(errs)}); direct_cmd was cleared — use structured_cmd or nl_cmd"
                 direct_cmd = ""
                 self_check_fail = True
 

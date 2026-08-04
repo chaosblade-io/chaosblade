@@ -186,7 +186,8 @@ def get_recover_remember_section() -> str:
 # ---------------------------------------------------------------------------
 
 def build_recover_verifier_system_prompt(
-    *, layer1_label: str = "blade_destroy", profile: str = PROFILE_K8S
+    *, layer1_label: str = "blade_destroy", profile: str = PROFILE_K8S,
+    ledger_section: str = "",
 ) -> str:
     """Build the recovery verifier system prompt using U-shaped composition.
 
@@ -226,6 +227,9 @@ def build_recover_verifier_system_prompt(
         environment_fragment,
         get_recover_skill_priority_section(),
         get_recover_output_format_section(layer1_label=layer1_label),
+        # Progress ledger: re-injected so recovery stays anchored and records
+        # what it establishes (empty until something is recorded).
+        ledger_section or "",
         # U-shaped attention: REMEMBER at END (recency)
         get_recover_remember_section(),
     ]

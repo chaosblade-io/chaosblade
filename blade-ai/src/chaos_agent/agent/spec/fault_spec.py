@@ -835,6 +835,24 @@ def is_full_fault_spec_proposal(value: object) -> bool:
     return bool(value.get("scope") and value.get("target") and value.get("action"))
 
 
+def missing_full_proposal_fields(value: object) -> list[str]:
+    """Fields a full-contract proposal lacks, in the shape
+    ``is_full_fault_spec_proposal`` demands (empty list = complete).
+
+    Lets ``propose_plan_change`` reject partial proposals AT THE TOOL
+    SURFACE with the exact missing list instead of returning a success the
+    router later discards silently (task-5193538b question 3: the proposal
+    said "submitted" but no confirmation card ever appeared).
+    """
+    if not isinstance(value, dict):
+        return sorted(_FULL_PROPOSAL_FIELDS)
+    missing = [f for f in sorted(_FULL_PROPOSAL_FIELDS) if f not in value]
+    for key in ("scope", "target", "action"):
+        if key in value and not value.get(key) and key not in missing:
+            missing.append(key)
+    return missing
+
+
 __all__ = [
     "FaultSpec",
     "FAULT_PROPOSAL_CLOSE",
@@ -845,6 +863,7 @@ __all__ = [
     "is_full_fault_spec_proposal",
     "legacy_params_dict",
     "legacy_target_dict",
+    "missing_full_proposal_fields",
     "read_fault_spec",
     "parse_fault_proposal",
     "SOURCE_CLI_STRUCTURED",

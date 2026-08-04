@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, ToolMessage
 
-from chaos_agent.agent.capabilities import screen_tool_calls, tool_call_field
+from chaos_agent.agent.capabilities import (
+    explain_tool_refusal,
+    screen_tool_calls,
+    tool_call_field,
+)
 
 INTENT_SCREENER_PASS = "pass"
 INTENT_SCREENER_RETRY = "retry"
@@ -49,17 +53,33 @@ def intent_screener(state: dict) -> dict:
 
     return {
         "messages": [
-            ToolMessage(
-                content=(
-                    "Error: this read-only discovery tool is unavailable for the "
-                    "current environment. Select a tool bound to the active "
-                    "transport."
-                ),
-                name=tool_call_field(call, "name"),
-                tool_call_id=tool_call_field(call, "id"),
-                status="error",
-            )
+            _refusal_message(call, state)
             for call in rejected_calls
         ],
         "intent_screener_route": INTENT_SCREENER_RETRY,
     }
+
+
+def _refusal_message(call: object, state: dict) -> ToolMessage:
+    """Name the transport in force, then say what to do about it.
+
+    The previous wording ("unavailable for the current environment") was the
+    same sentence for every tool in every profile: it never said WHICH
+    environment was connected, so the model could only retry variations of the
+    same call. ``explain_tool_refusal`` is the one place that holds the resolved
+    profile, so the cause comes from there. Its ``suggestion`` half is NOT used —
+    that half enumerates the reachable tool names, which the model already sees
+    in its own bound tool list; the standing instruction below is enough.
+    """
+    tool_name = tool_call_field(call, "name")
+    # ``discovery=True`` mirrors the flag the verdict was made with above, so the
+    # explanation resolves the profile the same way (transport only). Without it
+    # a host-scoped intent on a k8s transport — normal in this phase — would be
+    # explained as an unregistered environment.
+    reason, _suggestion = explain_tool_refusal(tool_name, state, discovery=True)
+    return ToolMessage(
+        content=f"Error: {reason}. Select a tool bound to the active transport.",
+        name=tool_name,
+        tool_call_id=tool_call_field(call, "id"),
+        status="error",
+    )

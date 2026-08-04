@@ -58,17 +58,17 @@ def _build_agent_prompt(spec: FaultSpec, idx: int, total: int) -> str:
     """Build a HumanMessage guiding agent_loop to plan this specific fault."""
     parts = []
     if total > 1:
-        parts.append(f"批量故障注入 ({idx + 1}/{total})")
-    parts.append(f"请为以下故障制定注入计划并执行：")
-    parts.append(f"- 故障类型: {spec.scope}-{spec.blade_target}-{spec.blade_action}")
+        parts.append(f"Batch fault injection ({idx + 1}/{total})")
+    parts.append("Plan and execute the injection for the following fault:")
+    parts.append(f"- Fault type: {spec.scope}-{spec.blade_target}-{spec.blade_action}")
     if spec.namespace:
-        parts.append(f"- 命名空间: {spec.namespace}")
+        parts.append(f"- Namespace: {spec.namespace}")
     if spec.names:
-        parts.append(f"- 目标: {', '.join(spec.names)}")
+        parts.append(f"- Target: {', '.join(spec.names)}")
     if spec.params:
         param_str = ", ".join(f"{k}={v}" for k, v in spec.params.items() if v)
         if param_str:
-            parts.append(f"- 参数: {param_str}")
+            parts.append(f"- Parameters: {param_str}")
     return "\n".join(parts)
 
 
@@ -109,7 +109,7 @@ async def batch_setup(state: AgentState) -> dict:
         from chaos_agent.agent.nodes.planning.intent_clarification import bootstrap_task_session
         from langchain_core.messages import SystemMessage
         desc = f"{spec.scope}-{spec.blade_target} {spec.blade_action}"
-        label = f"批量故障 {idx + 1}/{len(faults)}: {desc}" if len(faults) > 1 else desc
+        label = f"Batch fault {idx + 1}/{len(faults)}: {desc}" if len(faults) > 1 else desc
         bootstrap_task_session(new_task_id, "inject", tui_sid, SystemMessage(content=label))
     except Exception:
         logger.warning("batch_setup: bootstrap_task_session failed for %s",

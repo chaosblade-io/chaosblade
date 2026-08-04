@@ -115,8 +115,8 @@ class HealthReport:
     """Scope-specific one-liner describing what was verified.
 
     Set by each checker. Examples:
-      - node: "Ready, 无压力, agent 在线"
-      - pod: "Running, 容器正常"
+      - node: "Node Ready, no DiskPressure/MemoryPressure/PIDPressure/NetworkUnavailable"
+      - pod: "1 pod(s) checked, no Evicted/CrashLoopBackOff/ImagePullBackOff"
     Used by confirm card to show what the check actually covered.
     """
 
@@ -208,7 +208,7 @@ class NodeHealthChecker:
                 target=target,
                 overall=HealthSeverity.OK,
                 issues=[],
-                checked_detail="node 无目标",
+                checked_detail="node: no target",
             )
 
         conditions = await _query_node_conditions(names[0], kubeconfig)
@@ -230,9 +230,9 @@ class NodeHealthChecker:
                 report.overall = HealthSeverity.BLOCK
 
         if report.overall == HealthSeverity.OK:
-            detail = "Node Ready, 无 DiskPressure/MemoryPressure/PIDPressure/NetworkUnavailable"
+            detail = "Node Ready, no DiskPressure/MemoryPressure/PIDPressure/NetworkUnavailable"
             if tool_checked:
-                detail += ", chaosblade-tool 在线"
+                detail += ", chaosblade-tool online"
             report.checked_detail = detail
 
         return report
@@ -263,7 +263,7 @@ class PodHealthChecker:
                 target=target,
                 overall=HealthSeverity.OK,
                 issues=[],
-                checked_detail="pod 无可解析目标",
+                checked_detail="pod: no resolvable target",
             )
 
         _SEV_ORDER = {HealthSeverity.OK: 0, HealthSeverity.WARN: 1, HealthSeverity.BLOCK: 2}
@@ -283,7 +283,7 @@ class PodHealthChecker:
         if worst == HealthSeverity.OK:
             detail = (
                 f"{len(checked_pods)} pod(s) checked, "
-                f"无 Evicted/CrashLoopBackOff/ImagePullBackOff"
+                f"no Evicted/CrashLoopBackOff/ImagePullBackOff"
             )
         else:
             detail = f"{len(all_issues)} issue(s) across {len(checked_pods)} pod(s)"

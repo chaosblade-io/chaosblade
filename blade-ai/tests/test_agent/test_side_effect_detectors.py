@@ -690,15 +690,15 @@ class TestProfileScopedSummary:
         from chaos_agent.agent.state import _build_side_effects_summary
 
         summary = _build_side_effects_summary({"side_effects": {}}, "k8s")
-        assert "容器重启" in summary
-        assert "进程消失" not in summary  # host label must not leak in
+        assert "ContainerRestarts" in summary
+        assert "ProcessDeaths" not in summary  # host label must not leak in
 
     def test_host_summary_omits_k8s_labels(self):
         from chaos_agent.agent.state import _build_side_effects_summary
 
         summary = _build_side_effects_summary({"side_effects": {}}, "host")
-        assert "进程消失" in summary
-        assert "容器重启" not in summary  # k8s label must not leak in
+        assert "ProcessDeaths" in summary
+        assert "ContainerRestarts" not in summary  # k8s label must not leak in
 
     def test_summary_counts_only_run_profile_detections(self):
         from chaos_agent.agent.state import _build_side_effects_summary
@@ -708,6 +708,6 @@ class TestProfileScopedSummary:
         summary = _build_side_effects_summary(
             {"side_effects": {"container_restarts": [{"pod": "p1"}]}}, "k8s",
         )
-        assert "检测到 1 项连带影响" in summary
-        assert "容器重启: 1" in summary
-        assert "进程消失" not in summary
+        assert "1 collateral impact(s) detected" in summary
+        assert "ContainerRestarts: 1" in summary
+        assert "ProcessDeaths" not in summary

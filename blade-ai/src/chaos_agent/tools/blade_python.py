@@ -120,72 +120,32 @@ async def blade_python_create(
     flags: str = "",
     task_id: str = "",
 ) -> str:
-    """Phase 2 ONLY. Inject an in-process method fault into a Python application.
-
-    Mutating: makes a real library call inside the target application misbehave.
-    NOT available in Phase 1 (planning). Returns the experiment UID for tracking
-    and later destroy.
-
-    Generates `blade create python <target> <action> [matchers] [flags]`, run on
-    the host that runs the target application.
-
-    When to use:
-      - Phase 2 execution, for application-layer faults (a Redis command, a SQL
-        query, an HTTP call misbehaving) — NOT for CPU/memory/disk/network
-        resource faults, which belong to blade_create.
+    """Phase 2 ONLY. Inject an in-process method fault into a Python app
+    (a real library call misbehaves). NOT Phase 1; NOT resource faults
+    (→ blade_create). Builds `blade create python <target> <action>
+    [matchers] [flags]` on the app host.
 
     Inputs:
-      - target: "redis" | "mysql" | "sqlalchemy" | "http" | "httpx" | "grpc" | "kafka".
-      - action: "delay" | "throwCustomException" | "returnValue".
-      - matchers (which calls to affect; omit to affect ALL calls of that client):
-          redis            → cmd (e.g. GET), key
-          mysql/sqlalchemy → sql, sqltype (e.g. select), database
-          http             → url, method, host
-          httpx            → url, method, host, path
-          grpc             → service, method
-          kafka            → topic, operation
-        Matchers not valid for the chosen target are ignored.
-      - flags: action parameters as a CLI string:
-          delay                → "--time 500" (REQUIRED, milliseconds), optional
-                                 "--offset 100" (adds a random 0..offset ms on top
-                                 of --time, so the delay is time..time+offset)
-          throwCustomException → "--exception ConnectionError --exception-message 'chaos test'"
-                                 (accepts a builtin name such as ConnectionError /
-                                 TimeoutError / RuntimeError, or a qualified path
-                                 such as redis.exceptions.ConnectionError. A name
-                                 that cannot be resolved SILENTLY degrades to
-                                 RuntimeError — so verify the exception TYPE the
-                                 application actually saw, not just that it failed)
-          returnValue          → "--return-value null" ("null"/"none" → None,
-                                 "true"/"false" → bool, digits → int/float, a value
-                                 starting with { or [ → parsed JSON, anything else
-                                 → that literal string. There is NO "nil" keyword:
-                                 it would return the 3-character string "nil")
+      - target: redis|mysql|sqlalchemy|http|httpx|grpc|kafka.
+      - action: delay|throwCustomException|returnValue.
+      - matchers/flags: `chaosblade-cli.md` §python-app-faults. No
+        matchers = EVERY call of that client (wide blast); invalid ones
+        ignored. Pitfalls: delay REQUIRES --time (ms); unresolvable
+        --exception SILENTLY degrades to RuntimeError; --return-value has
+        NO "nil" keyword (literal 3-char string).
 
-    Output: JSON from the blade CLI. Success carries `result.uid` (use it for
-            blade_destroy / blade_status). Failure starts with "Error:".
+    Output: blade CLI JSON; success carries `result.uid`; failure starts
+    "Error:". Side effects: patches the intercepted method inside the
+    RUNNING app process; no OS/container/K8s changes.
 
-    Side effects: patches the intercepted method inside the RUNNING application
-                  process. No OS, container or Kubernetes state is modified.
-
-    Constraints (MUST READ before calling):
-      - PRECONDITION: an in-process ChaosBlade Python agent must already be
-        LISTENING inside the target application, and a RUNNING prepare record must
-        exist on this host. Getting there needs two steps that both happen before
-        the drill: `blade prepare python` writes the hook file, and the
-        application is restarted with that hook directory on PYTHONPATH. A
-        missing prepare record can be fixed mid-drill (call
-        blade_python_prepare); a missing agent CANNOT — it needs an application
-        restart. Distinguish the two by the CLI error, see below.
-      - action="delay" REQUIRES --time in `flags`; without it the CLI rejects
-        the command.
-      - Only calls matching the matchers are affected. Omitting all matchers
-        affects EVERY call of that client — a much wider blast radius.
-      - Verification is application-level (call latency / raised exception /
-        returned value). System metrics and cluster objects stay normal by
-        design; that is NOT a failed injection.
-      - --timeout is auto-injected / auto-boosted to the recommended minimum.
-        You may lengthen it, not shorten it.
+    Constraints:
+      - PRECONDITION: agent LISTENING inside the app AND a RUNNING
+        prepare record. Missing record → fixable (blade_python_prepare);
+        missing agent → NOT (needs app restart) — tell by the CLI error.
+      - Verification is application-level (latency/exception/return
+        value); system metrics stay normal by design — NOT a failed
+        injection.
+      - --timeout auto-injected/boosted; may lengthen, not shorten.
     """
     argv = [_get_host_blade_path(), "create", "python", target, action]
     argv.extend(_build_matcher_args(target, {
@@ -310,45 +270,40 @@ async def blade_python_prepare(
     python_path: str = "",
     task_id: str = "",
 ) -> str:
-    """Write the ChaosBlade Python agent startup hook for a target application.
+    """Write the ChaosBlade Python agent startup hook for a target app.
+    Runs `blade prepare python --port <port> --target-script <script>` on
+    the target host. PRECONDITION step, not a fault.
 
-    Runs `blade prepare python --port <port> --target-script <script>` on the
-    target host. This is a PRECONDITION step, not a fault.
-
-    What it actually does (verified, do not assume otherwise): it writes a
-    `sitecustomize.py` into the DIRECTORY OF `target_script`. That file adds
-    blade's own bundled agent library to sys.path and starts the agent on
-    `port`. It does NOT start an agent by itself and does NOT touch the running
-    application.
+    What it does (verified): writes `sitecustomize.py` into the DIRECTORY
+    OF `target_script` (adds blade's agent library to sys.path, starts
+    the agent on `port`). Does NOT start an agent itself or touch the
+    running application.
 
     When to use:
-      - When an injection fails with "no running python preparation record
-        found". After this succeeds, retry the injection.
+      - An injection fails with "no running python preparation record
+        found"; retry the injection after this succeeds.
 
     Inputs:
-      - target_script: REQUIRED path of the target application's entry script.
-        The CLI rejects the command without it. Its directory is where the hook
-        file lands, so it must be a directory the application has on PYTHONPATH.
-      - port: agent port (default 9526). Must be FREE — prepare refuses a port
-        that is already in use.
-      - python_path: optional path of the interpreter that runs the application.
+      - target_script: REQUIRED app entry-script path (CLI rejects
+        without it). The hook lands in its directory, which must be on
+        the app's PYTHONPATH.
+      - port: agent port (default 9526); must be FREE (in-use refused).
+      - python_path: optional interpreter path running the app.
 
-    Output: JSON from the blade CLI carrying the prepare UID (needed only for a
-            later blade_python_revoke). Failure starts with "Error:".
+    Output: JSON carrying the prepare UID (only for blade_python_revoke).
+    Failure starts "Error:". Side effects: writes a file next to the
+    target script + host state shared by every drill on that host.
 
-    Side effects: writes a file next to the target script and records host-level
-                  state shared by every drill on that host. Injects no fault.
-
-    Constraints (MUST READ before calling):
-      - Success here does NOT mean an agent is running. The hook only executes
-        when the application is (re)started with its directory on PYTHONPATH.
-        `blade status --type prepare` showing "Running" is bookkeeping, not
-        liveness. If the application cannot be restarted, report a prerequisite
-        failure — no amount of prepare calls will make the injection work.
-      - If injections still fail with "connection refused" after this succeeds,
-        the agent is not in the process: stop and report, do not retry.
-      - Because this writes shared host state, do NOT revoke it as part of
-        recovery — a concurrent drill may still be using it.
+    Constraints:
+      - Success does NOT mean an agent is running: the hook executes only
+        when the app (re)starts with its directory on PYTHONPATH.
+        `blade status --type prepare` "Running" is bookkeeping, not
+        liveness. If the app cannot restart, report prerequisite failure
+        — more prepare calls won't fix it.
+      - Still "connection refused" after success → the agent is not in
+        the process: stop and report, do not retry.
+      - Writes shared host state: do NOT revoke during recovery — a
+        concurrent drill may still use it.
     """
     if not (target_script or "").strip():
         return (
@@ -409,7 +364,7 @@ async def blade_python_revoke(uid: str, task_id: str = "") -> str:
     Side effects: deletes the hook file and removes host-level state shared by
                   every drill on that host.
 
-    Constraints (MUST READ before calling):
+    Constraints:
       - Do NOT call this during recovery. It does not stop any fault, and it
         deletes shared setup a concurrent drill may still depend on. Destroying
         the experiment (blade_destroy) is what removes the fault.

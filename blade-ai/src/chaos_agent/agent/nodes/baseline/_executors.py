@@ -121,7 +121,7 @@ async def _execute_observations(
 
             await dispatch_node_message(
                 "baseline_capture",
-                f"[{idx}/{len(commands)}] 正在采集: {cmd_info['description']}\n\n",
+                f"[{idx}/{len(commands)}] Capturing: {cmd_info['description']}\n\n",
             )
             try:
                 if cmd_info.get("profile") == "host":
@@ -144,7 +144,13 @@ async def _execute_observations(
                     else:
                         obs = {
                             "description": cmd_info["description"],
-                            "command": "",
+                            # Echo the command even though it never ran: the LLM
+                            # retry prompt shows this back as "what you tried",
+                            # and an empty string left it unable to see its own
+                            # previous attempt. On task-fc64c982 that produced
+                            # two consecutive retries generating the same
+                            # ``kubectl exec {debug_pod} -- pidof containerd``.
+                            "command": cmd_info.get("command", ""),
                             "exit_code": -1,
                             "stdout": "",
                             "stderr": (
@@ -178,7 +184,7 @@ async def _execute_observations(
                 _cmd_display = obs.get('command', '') or ''
                 _msg_parts = [f"[{idx}/{len(commands)}] {obs['description']}: {_status}"]
                 if _cmd_display:
-                    _msg_parts.append(f"  命令: `{_cmd_display}`")
+                    _msg_parts.append(f"  command: `{_cmd_display}`")
                 if _status != "ok" and obs.get('stderr'):
                     _stderr_short = (obs['stderr'] or '')[:200]
                     _msg_parts.append(f"  stderr: {_stderr_short}")

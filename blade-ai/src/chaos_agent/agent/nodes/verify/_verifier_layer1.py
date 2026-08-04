@@ -36,6 +36,16 @@ _EXPIRED_STATES = frozenset({"Destroyed", "destroyed", "Revoked", "revoked", "Co
 
 _RUNNING_STATES = frozenset({"Running", "running", "Success", "success"})
 
+# Phases the Operator reports while it is still setting the experiment up. Not a
+# verdict: ``Initialized`` means the CRD exists and the controller has not
+# finished reconciling it, so ``statuses`` is still empty and there is nothing
+# for Layer 1 to read. The fault itself may already be in effect — task-fc64c982
+# stopped containerd, saw the node go Ready→NotReady, and was still reported
+# ``failed`` because the CRD had not left ``Initialized`` by the time Layer 1
+# polled. A setup phase is therefore a warning, which keeps Layer 2 in play to
+# judge the actual cluster state.
+_TRANSIENT_STATES = frozenset({"Initialized", "initialized", "Creating", "creating"})
+
 # Substrings that unambiguously signal a FAILED / absent experiment. Checked in
 # the non-JSON fallback path BEFORE the permissive _RUNNING_STATES match, so a
 # wrapped `{"success":false,...}` (whose JSON was unparseable due to a shell
@@ -113,11 +123,20 @@ def _parse_blade_status_output(raw: str) -> tuple[str, str, bool]:
             f"because they have already dissipated. Recommend increasing --duration to >= 60s.",
             True,
         )
-    # Transient state: blade reports "please wait" when the experiment
-    # is mid-transition (e.g. Initialized→Running during setup, or
-    # Running→Destroyed during teardown). The fault may already be
-    # in effect — let Layer 2 verify the actual cluster state.
+    # Transient state: the experiment is mid-transition, either because the
+    # Operator is still reconciling a freshly created CRD (``Initialized``) or
+    # because blade reports "please wait" during setup/teardown. Neither is a
+    # verdict — the fault may already be in effect, so Layer 2 decides on the
+    # actual cluster state rather than on the controller's bookkeeping.
     error_msg = res.get("Error", "")
+    if exp_status in _TRANSIENT_STATES:
+        return (
+            "warning",
+            f"Experiment status: {exp_status} — the Operator is still setting the "
+            f"experiment up, so no per-resource status is available yet. "
+            f"Layer 2 will verify actual cluster state.",
+            False,
+        )
     if "please wait" in error_msg.lower():
         return (
             "warning",

@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def _build_recover_verifier_prompt(
-    *, layer1_label: str = "blade_destroy", profile: str = PROFILE_K8S
+    *, layer1_label: str = "blade_destroy", profile: str = PROFILE_K8S,
+    ledger_section: str = "",
 ) -> str:
     """Build the recover verifier system prompt using U-shaped composition.
 
@@ -42,7 +43,7 @@ def _build_recover_verifier_prompt(
     from chaos_agent.agent.prompts.sections.recovery import build_recover_verifier_system_prompt
 
     return build_recover_verifier_system_prompt(
-        layer1_label=layer1_label, profile=profile
+        layer1_label=layer1_label, profile=profile, ledger_section=ledger_section
     )
 
 
@@ -183,7 +184,10 @@ def _extract_recovery_verification_section(content: str) -> str:
                     inject_section = content[inject_start:inject_start + inject_end.start()].strip()
                 else:
                     inject_section = content[inject_start:].strip()
-                referenced_steps = f"\n\n**注入验证参考**（恢复验证中引用了此段落):\n{inject_section}"
+                referenced_steps = (
+                    "\n\n**Injection-verification reference** "
+                    f"(the 恢复验证 section cross-references this block):\n{inject_section}"
+                )
                 break  # Only add once, even if multiple keywords match
 
     return f"**恢复验证**：\n{section}{referenced_steps}"

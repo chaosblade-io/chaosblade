@@ -132,7 +132,7 @@ class TestSubmitFaultIntentTool:
             "fault_revision": 0,
             "namespace": "default",
         })
-        assert "已提交" in result
+        assert "intent submitted" in result
 
     def test_submit_fault_intent_with_optional_args(self):
         # Full structured submission with every optional field — what
@@ -148,7 +148,7 @@ class TestSubmitFaultIntentTool:
             "params": {"interface": "eth0", "timeout": "600"},
             "user_description": "给 nginx 注入网络丢包",
         })
-        assert "已提交" in result
+        assert "intent submitted" in result
 
     def test_submit_fault_intent_namespace_defaults(self):
         # namespace omitted → empty string default. The function just
@@ -160,7 +160,7 @@ class TestSubmitFaultIntentTool:
             "action": "fullload",
             "fault_revision": 0,
         })
-        assert "已提交" in result
+        assert "intent submitted" in result
 
     def test_submit_fault_intent_args_schema_has_required_fields(self):
         # Schema dump sanity: the @lc_tool decorator must surface the
@@ -204,7 +204,7 @@ class TestSubmitFaultIntentTool:
             "namespace": "cms-demo",
             "names": '["cn-hongkong.10.0.1.101"]',
         })
-        assert "已提交" in result
+        assert "intent submitted" in result
 
     def test_submit_fault_intent_accepts_json_stringified_dicts(self):
         # Companion to the names case: ``params`` and ``labels`` are
@@ -220,7 +220,7 @@ class TestSubmitFaultIntentTool:
             "labels": '{"app": "nginx"}',
             "params": '{"path": "/var/lib/containerd", "percent": "90", "timeout": "300"}',
         })
-        assert "已提交" in result
+        assert "intent submitted" in result
 
     def test_submit_fault_intent_extracts_json_strings_into_real_types(self):
         # Belt-and-braces: confirm the BeforeValidator actually parsed
@@ -313,7 +313,7 @@ class TestIntentClarificationNode:
                  "clarification_round": 0, "dialogue_round": MAX_DIALOGUE_ROUNDS}
         result = await node(state)
         assert result["confirmed_intent"] == "chat"
-        assert "再见" in result["messages"][0].content
+        assert "goodbye" in result["messages"][0].content
 
     @pytest.mark.asyncio
     async def test_submit_fault_intent_fast_path_does_not_bootstrap_session_store(
@@ -478,6 +478,14 @@ class TestIntentClarificationNode:
             "clarification_round": 0,
             "dialogue_round": 1,
             "fault_intent": {},
+            # A host drill needs a host transport. Without any connection field
+            # the channel resolves to the process-wide ``settings`` default
+            # (typically a k8s one), which the submit-time capability gate now
+            # refuses — the same verdict ``agent_loop`` has always produced for
+            # this state. Real sessions always carry a channel, so the omission
+            # was a fixture gap rather than intended coverage.
+            "kube_connection_mode": "kubewiz_host",
+            "host_name": "host-1",
         })
 
         assert result["confirmed_intent"] == "inject"
@@ -530,7 +538,16 @@ class TestIntentClarificationNode:
             call.args[0][0].content
             for call in bound_llm.ainvoke.call_args_list
         ]
-        assert prompts[0] == prompts[1]
+        # The semantic core (role, priorities, full skill catalog) is shared,
+        # but the prompts are no longer byte-identical: each now states the
+        # KNOWN capability profile as a fact so a host-channel environment
+        # stops loading k8s-chaos-skills. This informs, it does not filter —
+        # the catalog stays complete either way.
+        assert "configured host" in prompts[0]
+        assert "Kubernetes environment" in prompts[1]
+        # neither path leaks the "unsupported / do not attempt" wording
+        for p in prompts:
+            assert "Do not attempt injection" not in p
 
     @pytest.mark.asyncio
     async def test_fast_path_detects_submit_in_tool_batch(self):
@@ -677,7 +694,7 @@ class TestIntentClarificationNode:
             "fault_revision": 0,
             "namespace": "default",
         })
-        assert "已提交" in result
+        assert "intent submitted" in result
 
     @pytest.mark.asyncio
     async def test_submit_fault_intent_tool_call_goes_to_toolnode(self):

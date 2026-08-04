@@ -432,18 +432,18 @@ def _build_side_effects_summary(verification: dict | None, profile: str | None =
     detected = dict(raw) if isinstance(raw, dict) else {}
 
     _KEY_LABELS = {
-        "container_restarts": "容器重启",
-        "evicted_pods": "Pod驱逐",
+        "container_restarts": "ContainerRestarts",
+        "evicted_pods": "EvictedPods",
         "oom_killed_pods": "OOMKill",
         "crash_loop_pods": "CrashLoop",
-        "endpoint_removals": "Endpoint移除",
-        "hpa_scaling": "HPA扩缩",
-        "probe_failures": "探针失败",
-        "dependency_errors": "依赖异常",
-        "process_deaths": "进程消失",
-        "filesystem_full": "磁盘写满",
-        "dmesg_oom": "内核OOM",
-        "service_down": "服务下线",
+        "endpoint_removals": "EndpointRemovals",
+        "hpa_scaling": "HPAScaling",
+        "probe_failures": "ProbeFailures",
+        "dependency_errors": "DependencyErrors",
+        "process_deaths": "ProcessDeaths",
+        "filesystem_full": "FilesystemFull",
+        "dmesg_oom": "KernelOOM",
+        "service_down": "ServiceDown",
     }
 
     parts = []
@@ -455,8 +455,8 @@ def _build_side_effects_summary(verification: dict | None, profile: str | None =
 
     total = sum(len(v) for v in detected.values() if isinstance(v, list))
     if total == 0:
-        return f"未检测到连带影响 ({', '.join(parts)})"
-    return f"检测到 {total} 项连带影响 ({', '.join(parts)})"
+        return f"No collateral impact detected ({', '.join(parts)})"
+    return f"{total} collateral impact(s) detected ({', '.join(parts)})"
 
 
 def _derive_failure_reason(values: dict) -> str:
@@ -647,9 +647,34 @@ class AgentState(MessagesState):
 
     # ── Execution ──────────────────────────────────────────────────
     blade_uid: Optional[str] = None      # ChaosBlade experiment UID
+    # UIDs retired by FRAMEWORK-side cleanup (verify-replan residual destroy).
+    # Such destroys run in code, so they leave NO blade_destroy ToolMessage in
+    # history and _collect_destroyed_uids cannot see them; without this list a
+    # stale UID gets re-extracted into blade_uid and misroutes the verifier
+    # Layer-1 onto a destroyed experiment (task-29848471). Append-only; never
+    # cleared within a task. Recover graphs have their own state and never
+    # inherit it — the retired experiment is exactly what they recover.
+    retired_blade_uids: Optional[list[str]] = None
     injection_method: Optional[str] = None   # "host_blade" | "kubectl_exec" | "kubectl_native" | "host_native" | "python_agent"
+    # Attribution epoch boundary: message count recorded at each replan seam
+    # (``reset_attribution_state``). The RESUME injection re-detection scan
+    # reads only messages after this index, so pre-seam attempts of the
+    # invalidated contract cannot be re-attributed as the new fault's
+    # injection (task-5193538b). None = first epoch → scan full history.
+    attribution_epoch_index: Optional[int] = None
     execution_artifacts: Optional[list[dict]] = None  # Durable created/modified resources for guard/recover
     kubectl_exec_pod_name: Optional[str] = None  # Tool pod used during kubectl exec injection
+    # Injection vehicles confirmed by LIVE cluster discovery (label-selector
+    # tool-pod lookup, same mechanism baseline/conflict checks use). The
+    # screener consults it — alongside task-registered artifacts — before
+    # reading an exec into such a pod as identity drift. Cluster fact, not
+    # a naming convention.
+    known_vehicle_pods: Optional[tuple[str, ...]] = None
+    # Pod names probed by that same discovery and proven NOT vehicles. A
+    # bounded negative cache: without it a genuine drift would re-probe the
+    # cluster on every screener iteration — in-band kubectl on the very API
+    # path a network fault may be severing (self-poisoning).
+    vehicle_probe_misses: Optional[tuple[str, ...]] = None
     blade_parsed_flags: Optional[dict] = None    # {"path": "/tmp", "percent": "85", ...}
     direct: bool = False                 # True: skip LLM, go direct path
     original_replicas: Optional[dict] = None     # kubectl scale-based faults: {resource -> count}
@@ -712,6 +737,13 @@ class AgentState(MessagesState):
     hint_repeat_counts: dict[str, int] = {}
     pipeline_started_at: float = 0.0     # Wall-clock guard (0.0 = not yet stamped)
     transient_retry_count: int = 0       # INFRA_TRANSIENT short-retry budget
+    # Deferred LIFECYCLE REVIEW text for a REJECTED plan_invalid replan arriving
+    # over the tool channel. It cannot be appended at rejection time: the
+    # request_replan ToolMessage does not exist yet (phase2_tools produces it),
+    # and a HumanMessage between the AIMessage and its ToolMessage would break
+    # tool-response adjacency. The next execute_loop iteration emits it once,
+    # then clears the flag.
+    _replan_review_rejection: str | None = None
     pipeline_attempt: int = 0            # Attempt tracking (incremented by begin_attempt)
     pipeline_attempts_history: Optional[list] = None
     replan_requested: bool = False
@@ -737,6 +769,14 @@ class AgentState(MessagesState):
     compressed_summary: Optional[str] = None
     experiment_history: Optional[list] = None
     operational_notes: Optional[str] = None
+
+    # ── Progress ledger ────────────────────────────────────────────
+    # Model-maintained three-layer working note (anchor / state / log), written
+    # via the ``update_progress`` tool and re-injected into the system prompt
+    # each round. Lives OUTSIDE ``messages`` so it survives compaction untouched,
+    # and is mirrored to the intent graph at any turn exit. See
+    # ``chaos_agent.agent.progress_ledger``.
+    progress_ledger: Optional[dict] = None
 
 
 class IntentState(MessagesState):

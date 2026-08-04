@@ -154,54 +154,34 @@ def request_replan(
     unresolved_questions: list | str | None = None,
     changes_target_or_risk: bool = False,
 ) -> str:
-    """Declare that the APPROVED GOAL cannot be reached and execution must
-    return to planning (Phase 1). Executor ONLY.
+    """Declare the APPROVED GOAL unreachable; execution returns to
+    planning (Phase 1). Executor ONLY.
 
-    The approved goal is the fault EFFECT on the approved TARGET within the
-    approved SAFETY boundary. Replan ONLY when that goal is unreachable — no
-    action still available to you could advance it. While ANY alternative
-    approach remains within the approved boundary, take it and keep executing;
-    do NOT replan. A single tool or command failing is evidence about that one
-    attempt, never by itself a verdict that the goal is infeasible. Planning
-    re-derives the plan; the confirmed target and fault type are preserved
-    unless you explicitly flag a boundary change.
-
-    When to use:
-      - You have exhausted the alternatives available to you and the approved
-        goal cannot be reached as planned.
-      - Runtime evidence requires a genuinely different planning decision.
+    Goal = the fault EFFECT on the approved TARGET within the SAFETY
+    boundary. Replan ONLY when no action you can take still advances it;
+    while ANY alternative remains within the boundary, take it.
+    Target/fault type preserved unless you flag a change.
 
     Inputs:
-      - kind: "feasibility" | "target" | "safety" | "verification".
-      - decision: "plan_invalid" (return to planning now — goal unreachable) |
-          "needs_investigation" (keep executing; an alternative is still
-          available — does NOT replan).
-      - invalidated_assumption: the plan assumption the evidence contradicts.
-      - affected_step: the plan step that can no longer proceed as written.
-      - observed_evidence: evidence strings supporting the decision.
-      - evidence_refs: optional semantic hints; do NOT reproduce opaque
-          framework tool-call IDs.
+      - kind: feasibility|target|safety|verification.
+      - decision: plan_invalid (replan — goal unreachable) |
+        needs_investigation (keep executing — does NOT replan).
+      - invalidated_assumption/affected_step/observed_evidence.
+      - evidence_refs: semantic hints; never opaque tool-call IDs.
       - unresolved_questions: what the next plan must answer.
-      - changes_target_or_risk: true ONLY if the next plan must change WHAT is
-          attacked (target / fault type) or the safety boundary — forces user
-          re-confirmation.
+      - changes_target_or_risk: true ONLY if WHAT is attacked or the
+        safety boundary must change — forces user re-confirmation.
 
-    Output: confirmation of the request, or "Error:" prefix.
+    Output: confirmation, or "Error:" prefix. Side effects: none; Phase 1
+    re-entry only for plan_invalid; FaultSpec unchanged.
 
-    Side effects: None directly — the system returns to Phase 1 only for
-    decision=plan_invalid; the FaultSpec contract is unchanged.
-
-    Constraints (MUST READ before calling):
-      - A single tool/command error is NOT sufficient grounds: try another
-        approach within the approved boundary first.
-      - Use ``needs_investigation``, not ``plan_invalid``, whenever any
-        alternative that could still advance the approved goal remains available
-        in this loop.
-      - A documented alternative injection METHOD that achieves the same fault
-        effect on the same target is an alternative WITHIN the approved boundary
-        — switch to it and keep executing (clean up any residue first); do NOT
-        replan. The tool/method is NOT part of the approved boundary — only the
-        fault effect, target, and safety limits are. "A fundamentally different
-        method" is therefore NOT grounds for ``plan_invalid``.
+    Constraints:
+      - One tool/command error is NOT grounds — try another approach
+        within the boundary first.
+      - Any remaining alternative that could advance the goal →
+        needs_investigation, NOT plan_invalid.
+      - An alternative METHOD for the same fault effect on the same
+        target is WITHIN the boundary — switch (clean residue first);
+        method is NOT part of the boundary.
     """
     return "Replan request recorded."

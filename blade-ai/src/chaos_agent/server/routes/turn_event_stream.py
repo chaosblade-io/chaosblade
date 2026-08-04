@@ -17,8 +17,8 @@ from chaos_agent.agent.intent_handoff import (
 )
 from chaos_agent.agent.result.operation_summary import (
     build_batch_summary_text,
+    build_operation_record,
     build_recover_summary_text,
-    build_task_summary_text,
 )
 from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.agent.spec.fault_spec import FAULT_PROPOSAL_OPEN
@@ -76,6 +76,19 @@ class TurnContext:
     # Mutable — event_generator may reassign for result extraction
     result_graph: Any = field(default=None, init=False)
     result_config: dict = field(default_factory=dict, init=False)
+    # Pipeline coordinates, recorded AT DISPATCH (not at the successful end) so
+    # an interruption can still locate the pipeline thread and mirror its
+    # progress ledger back to the intent graph.
+    pipeline_task_id: str = field(default="", init=False)
+    pipeline_config: dict = field(default_factory=dict, init=False)
+    # Recover runs on its OWN graph and thread, so an interrupted recovery must be
+    # read from here rather than from the pipeline coordinates above — otherwise
+    # the record would carry the wrong task and miss the recover ledger entirely.
+    recover_task_id: str = field(default="", init=False)
+    recover_config: dict = field(default_factory=dict, init=False)
+    # True once this turn has already written an operation record, so a failure
+    # afterwards cannot append a contradicting interruption record on top.
+    operation_record_written: bool = field(default=False, init=False)
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +528,10 @@ async def _run_inject_pipeline(ctx, iv, batcher, sidewrite, converters):
         "configurable": {"thread_id": _p_task_id},
         "recursion_limit": settings.recursion_limit,
     }
+    # Record at dispatch so an interruption anywhere below can still read this
+    # pipeline's ledger (the success path's ctx.result_* assignment is too late).
+    ctx.pipeline_task_id = _p_task_id
+    ctx.pipeline_config = _p_config
     _p_input = build_inject_initial_state(
         task_id=_p_task_id,
         tui_session_id=_tui_sid,
@@ -561,7 +578,11 @@ async def _run_inject_pipeline(ctx, iv, batcher, sidewrite, converters):
         try:
             _pfinal = await ctx.pipeline_graph.aget_state(_p_config)
             _psv = _pfinal.values if _pfinal else {}
-            _summary_text = build_task_summary_text(_psv, _p_task_id)
+            # ONE combined record: task summary headline + the ledger's process
+            # detail (established facts + milestone log), so the context-isolated
+            # intent graph sees how the operation went in a single coherent
+            # message — not a separate, possibly-contradicting ledger blob.
+            _summary_text = build_operation_record(_psv, _p_task_id)
             await write_operation_summary(
                 _summary_text,
                 intent_graph=ctx.intent_graph,
@@ -570,6 +591,9 @@ async def _run_inject_pipeline(ctx, iv, batcher, sidewrite, converters):
                 tui_session_id=ctx.sid,
                 recursion_limit=settings.recursion_limit,
             )
+            # This turn now has its record; a later failure must not append a
+            # contradicting interruption note on top of a completed operation.
+            ctx.operation_record_written = True
         except Exception:
             logger.debug("Failed to write task summary to Intent Graph", exc_info=True)
     finally:
@@ -625,6 +649,9 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
         "configurable": {"thread_id": _p_task_id},
         "recursion_limit": settings.recursion_limit,
     }
+    # Record at dispatch (same reason as the single-inject path above).
+    ctx.pipeline_task_id = _p_task_id
+    ctx.pipeline_config = _p_config
     _p_input = build_inject_initial_state(
         task_id=_p_task_id,
         tui_session_id=_tui_sid,
@@ -684,15 +711,15 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
             try:
                 _pm_dir = Path(settings.resolved_memory_dir).parent / "postmortems"
                 _pm_sections = [
-                    "# 批量故障注入分析报告\n",
-                    f"共 {len(_batch_results)} 个故障\n",
+                    "# Batch Fault Injection Analysis Report\n",
+                    f"{len(_batch_results)} fault(s) in total\n",
                 ]
                 for _bi, _br in enumerate(_batch_results):
                     _br_tid = _br.get("task_id", "")
                     _br_ft = _br.get("fault_type", "unknown")
                     _br_ts = _br.get("task_state", "unknown")
                     _pm = _br.get("postmortem")
-                    _pm_sections.append(f"---\n\n## 故障 {_bi+1}: {_br_ft} → {_br_ts}\n")
+                    _pm_sections.append(f"---\n\n## Fault {_bi+1}: {_br_ft} → {_br_ts}\n")
                     _pm_sections.append(f"task_id: `{_br_tid}`\n")
                     if _pm and isinstance(_pm, dict) and _pm.get("markdown"):
                         _pm_sections.append(_pm["markdown"])
@@ -701,7 +728,7 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
                         if _pm_path and _pm_path.exists():
                             _pm_sections.append(_pm_path.read_text(encoding="utf-8"))
                         else:
-                            _pm_sections.append("*事后分析未生成*\n")
+                            _pm_sections.append("*No post-mortem analysis was generated*\n")
 
                 _batch_pm_file = _pm_dir / f"batch-{ctx.turn_id}.md"
                 _pm_dir.mkdir(parents=True, exist_ok=True)
@@ -710,7 +737,7 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
 
                 _pm_evt = StreamEvent(
                     type="node_message",
-                    content=f"\n📝 批量分析报告: {_batch_pm_path_str}\n",
+                    content=f"\n📝 Batch analysis report: {_batch_pm_path_str}\n",
                     node="batch_postmortem",
                     task_id=ctx.turn_id,
                 )
@@ -733,6 +760,7 @@ async def _run_batch_pipeline(ctx, iv, batcher, sidewrite, converters):
                     tui_session_id=ctx.sid,
                     recursion_limit=settings.recursion_limit,
                 )
+                ctx.operation_record_written = True
             except Exception:
                 logger.warning("Failed to write batch summary to Intent Graph", exc_info=True)
 
@@ -796,7 +824,7 @@ async def _run_recover(ctx, graph, config, turn_started_monotonic, batcher, side
         logger.warning("Auto-recover: no inject state found for %s", _recover_inject_tid)
         _no_state_evt = StreamEvent(
             type="error",
-            content=f"无法找到实验 {_recover_inject_tid} 的注入状态，恢复已跳过。",
+            content=f"Could not find the injection state for experiment {_recover_inject_tid}; recovery was skipped.",
             task_id=ctx.turn_id,
         )
         sidewrite(_no_state_evt)
@@ -807,6 +835,10 @@ async def _run_recover(ctx, graph, config, turn_started_monotonic, batcher, side
         "configurable": {"thread_id": _rec_task_id},
         "recursion_limit": settings.recursion_limit,
     }
+    # Recorded at dispatch so an interrupted recovery is reported against the
+    # recover thread (and its ledger), not the inject pipeline's.
+    ctx.recover_task_id = _rec_task_id
+    ctx.recover_config = recover_config
 
     # Bootstrap SessionStore so recover messages persist to memory/tasks/
     from chaos_agent.agent.nodes.planning.intent_clarification import bootstrap_task_session
@@ -842,6 +874,11 @@ async def _run_recover(ctx, graph, config, turn_started_monotonic, batcher, side
                 _recover_inject_tid,
                 sv,
             )
+            # ONE combined record: append the recover ledger's process detail.
+            from chaos_agent.agent.result.operation_summary import (
+                append_ledger_process_detail as _append_ledger,
+            )
+            _recover_summary_text = _append_ledger(_recover_summary_text, sv)
             await write_operation_summary(
                 _recover_summary_text,
                 intent_graph=ctx.intent_graph,
@@ -854,6 +891,7 @@ async def _run_recover(ctx, graph, config, turn_started_monotonic, batcher, side
                 tui_session_id=ctx.sid,
                 recursion_limit=settings.recursion_limit,
             )
+            ctx.operation_record_written = True
         except Exception:
             logger.warning("Failed to write recover summary to Intent Graph", exc_info=True)
         _rec_evt = StreamEvent(
@@ -886,6 +924,60 @@ async def _run_recover(ctx, graph, config, turn_started_monotonic, batcher, side
 # ---------------------------------------------------------------------------
 # Checkpoint rollback on cancellation
 # ---------------------------------------------------------------------------
+
+async def _write_interrupted_record(ctx, *, cause: str, error_detail: str = "") -> None:
+    """Mirror an interruption record to the intent graph.
+
+    The intent graph is context-isolated from execution: without this it cannot
+    tell the next dialogue turn that anything happened at all, and after an
+    interruption mid-execution it would not know a fault may still be live. The
+    progress ledger read here is whatever the executor had recorded when it
+    stopped, so this works from ANY interruption point.
+
+    Best-effort and idempotent per turn: it runs while an abort unwinds and must
+    never mask the original exception, and it is skipped once this turn already
+    wrote a record (so a completed operation is never contradicted).
+    """
+    if ctx.operation_record_written:
+        return
+    try:
+        from chaos_agent.agent.result.operation_summary import build_interrupted_record
+
+        if ctx.recover_task_id and ctx.recover_config:
+            # Recovery is its own graph/thread and takes precedence: if a recovery
+            # was in flight, THAT is the operation the user interrupted.
+            _rec_graph = ctx.agents.get("recover") if isinstance(ctx.agents, dict) else None
+            snapshot = await _rec_graph.aget_state(ctx.recover_config) if _rec_graph else None
+            record_task_id = ctx.recover_task_id
+        elif ctx.pipeline_task_id and ctx.pipeline_config:
+            snapshot = await ctx.pipeline_graph.aget_state(ctx.pipeline_config)
+            record_task_id = ctx.pipeline_task_id
+        else:
+            # Interrupted before any pipeline was dispatched (still clarifying):
+            # the intent thread itself is the only place with context.
+            snapshot = await ctx.intent_graph.aget_state(ctx.graph_config)
+            record_task_id = ctx.turn_id
+        values = snapshot.values if snapshot and snapshot.values else {}
+
+        await write_operation_summary(
+            build_interrupted_record(
+                values, record_task_id, cause=cause, error_detail=error_detail,
+            ),
+            intent_graph=ctx.intent_graph,
+            thread_id=ctx.thread_id,
+            tui_session_id=ctx.sid,
+            recursion_limit=settings.recursion_limit,
+            raise_graph_error=False,
+        )
+        ctx.operation_record_written = True
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.debug(
+            "Failed to write interruption record for turn %s (cause=%s)",
+            ctx.turn_id, cause, exc_info=True,
+        )
+
 
 async def _rollback_intent_checkpoint(
     intent_graph,
@@ -1134,8 +1226,14 @@ async def event_generator(ctx: TurnContext):
         await _rollback_intent_checkpoint(
             ctx.intent_graph, ctx.thread_id, _pre_turn_checkpoint_id,
         )
+        # After the rollback, for the same reason as the cancel path below.
+        await _write_interrupted_record(ctx, cause="disconnected")
         return
     except ConfirmTimeout as cte:
+        # Written BEFORE the terminating events: once the consumer sees ``done``
+        # it stops iterating, the generator is closed, and anything after the
+        # final ``yield`` would never run.
+        await _write_interrupted_record(ctx, cause="confirm_timeout")
         _timeout_evt = StreamEvent(type="error", content=str(cte), task_id=ctx.turn_id)
         sidewrite(_timeout_evt)
         yield _timeout_evt.to_sse()
@@ -1149,6 +1247,10 @@ async def event_generator(ctx: TurnContext):
         await _rollback_intent_checkpoint(
             ctx.intent_graph, ctx.thread_id, _pre_turn_checkpoint_id,
         )
+        # AFTER the rollback: the rollback discards this turn's intent messages,
+        # so a record written before it would be thrown away with them. Shielded
+        # to match the artifact cleanup above, since both run under cancellation.
+        await asyncio.shield(_write_interrupted_record(ctx, cause="user_cancel"))
         _cancel_evt = StreamEvent(type="error", content="Turn cancelled", task_id=ctx.turn_id)
         sidewrite(_cancel_evt)
         yield _cancel_evt.to_sse()
@@ -1156,6 +1258,9 @@ async def event_generator(ctx: TurnContext):
         raise
     except Exception as e:
         logger.exception(f"Turn failed for {ctx.turn_id}")
+        await _write_interrupted_record(
+            ctx, cause="internal_error", error_detail=f"{type(e).__name__}: {e}",
+        )
         _exc_evt = StreamEvent(type="error", content=f"{type(e).__name__}: {e}", task_id=ctx.turn_id)
         sidewrite(_exc_evt)
         yield _exc_evt.to_sse()

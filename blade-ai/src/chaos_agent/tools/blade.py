@@ -113,56 +113,34 @@ async def blade_create(
     flags: str = "",
     task_id: str = "",
 ) -> str:
-    """Phase 2 ONLY. Create a ChaosBlade K8s fault injection experiment.
-
-    Mutating: triggers actual chaos against the target. NOT available in
-    Phase 1 (planning). Returns the experiment UID for tracking and
-    later destroy.
-
-    Generates `blade create k8s <scope>-<target> <action> [flags]` for
-    Kubernetes scopes, or `blade create <target> <action> [flags]` for the
-    host (bare-metal / VM) scope.
-
-    When to use:
-      - Phase 2 execution, after the plan is approved.
-      - Do NOT use during planning to "test" — Phase 1 must only inspect with
-        kubectl/blade_status; injection is execution-only.
+    """Phase 2 ONLY — mutating: create a ChaosBlade K8s/host fault
+    experiment (real chaos on the target). NOT Phase 1 (inspect via
+    kubectl_read/blade_status). Builds `blade create k8s <scope>-<target>
+    <action> [flags]` (host: `blade create <target> <action> [flags]`).
 
     Inputs:
-      - scope: "pod" | "container" | "node" | "host".
-      - target: fault target — "cpu" | "memory" | "network" | "disk" | "process" | "pod".
-      - action: "fullload" | "drop" | "dns" | "occupy" | "fill" | "burn" | "kill" | "delete".
-      - namespace / names / labels / kubeconfig / evict_count / evict_percent: passthrough.
-      - flags: scenario-specific CLI string. Examples:
-          pod-cpu fullload    → "--cpu-percent 80"
-          pod-network drop    → "--interface eth0" (drops all packets, no --percent)
-          node-disk fill      → "--path /tmp --size 1024"
-          host cpu fullload   → "--cpu-percent 80" (host scope, no k8s domain)
-        See knowledge resource `chaosblade-cli.md` for the full flag catalog.
+      - scope: pod|container|node|host. target: cpu|memory|network|disk|
+        process|pod. action: fullload|drop|dns|occupy|fill|burn|kill|delete.
+      - namespace/names/labels/kubeconfig/evict_*: passthrough.
+      - flags: scenario flags (catalog: `chaosblade-cli.md`); drop →
+        "--interface eth0" (drops ALL packets; no --percent).
 
-    Output: JSON from blade CLI. Success carries `result.uid` (use it for
-            blade_destroy / blade_status). Failure starts with "Error:".
+    Output: blade CLI JSON; success carries `result.uid` (for
+    blade_destroy/blade_status); failure starts "Error:".
 
-    Side effects: Creates a CRD in the target namespace; injects real fault
-                  into the target pod/container/node.
+    Side effects: creates a CRD; injects the real fault.
 
-    Constraints (MUST READ before calling):
-      - scope="pod": targets the whole Pod; do NOT pass --container-names.
-      - scope="container": requires --container-ids or --container-names in flags.
-      - scope="node": ChaosBlade rejects --namespace and --labels for node scope —
-        this tool auto-omits them. Use --names to identify the node.
-      - scope="host": bare-metal / VM faults run via ChaosBlade's OS executor —
-        NO k8s domain, namespace, labels or kubeconfig. The command targets the
-        host reached by the configured host transport; put fault parameters in
-        `flags` (e.g. host cpu fullload → "--cpu-percent 80").
-      - Memory flags: pod scope accepts --mem-percent or --mem-size; node scope
-        accepts --mem-percent ONLY (--mem-size is rejected on node).
-      - --namespace compatibility: host-installed blade binaries may reject
-        --namespace on k8s subcommands. If you see "unknown flag: --namespace",
-        retry without it (this is a version issue, not a syntax error).
-      - --timeout is auto-injected / auto-boosted to the recommended minimum for
-        the fault type (≥ 600s). You only need to set --timeout if you want a
-        longer duration; you cannot make it shorter.
+    Constraints:
+      - scope="pod" = whole Pod (never --container-names);
+        scope="container" REQUIRES --container-ids/--container-names.
+      - scope="node": --namespace/--labels rejected, auto-omitted; select
+        via --names. scope="host": OS-executor; no namespace/labels/
+        kubeconfig; params in `flags`.
+      - Memory: pod: --mem-percent|--mem-size; node: --mem-percent ONLY.
+      - "unknown flag: --namespace" (host blade) = version issue — retry
+        without it.
+      - --timeout auto-injected/boosted to ≥600s; may lengthen, not
+        shorten.
     """
     # Universal first-use trigger: pip-install users get a pure-Python wheel
     # with no blade binary. Ensure it exists before the first mutating
@@ -365,7 +343,7 @@ async def blade_destroy(uid: str, kubeconfig: str = "") -> str:
 
     Side effects: Removes the CRD; the target should return to normal.
 
-    Constraints (MUST READ before calling):
+    Constraints:
       - Always re-verify with blade_status — Status should flip to "Destroyed".
         See knowledge resource `failure-modes.md` (recovery failure) for the
         rare case where destroy returns success but the stress process lingers.
@@ -437,7 +415,7 @@ async def blade_status(uid: str = "", kubeconfig: str = "") -> str:
 
     Side effects: None (read-only).
 
-    Constraints (MUST READ before calling):
+    Constraints:
       - blade_status v1.8.0 ignores the --kubeconfig CLI flag; this tool passes
         kubeconfig via the KUBECONFIG env var instead. No action required from
         the caller.
@@ -560,7 +538,7 @@ async def blade_query_k8s(uid: str = "", kubeconfig: str = "") -> str:
 
     Side effects: None (read-only).
 
-    Constraints (MUST READ before calling):
+    Constraints:
       - This tool only handles `blade query k8s`. For host-side queries
         (disk / network interface / jvm) use the kubectl tool to invoke
         them inside a debug pod.

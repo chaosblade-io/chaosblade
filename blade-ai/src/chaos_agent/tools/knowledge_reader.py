@@ -174,44 +174,39 @@ def _build_outline(content: str) -> str:
 
 @tool
 async def read_knowledge_resource(filename: str, section: str = "") -> str:
-    """Phase 1 / Phase 2 read-only. Read a knowledge document by filename for domain expertise.
+    """Phase 1 / Phase 2 read-only. Read a knowledge document by filename.
 
     When to use:
       - You need K8s syntax / JSONPath / verification heuristics / chaos
-        safety background that is not already in the active skill case.
-      - You hit unexpected verifier output and want a known-failure-mode
-        catalogue.
+        safety background not already in the active skill case, or a
+        known-failure-mode catalogue for unexpected verifier output.
       - Do NOT call when the active skill case already explains the
         specific task — skill content is canonical.
 
     Inputs:
-      - filename: a name listed in the Domain Knowledge Index section of
-        your system prompt. Pick the entry whose summary / fault_types
-        match your scenario. Each entry shows ``(~XKc)`` size hint —
-        for large documents, prefer ``section='outline'`` first rather
-        than loading the full document.
+      - filename: a name listed in the Domain Knowledge Index of your
+        system prompt; pick the entry whose summary / fault_types match
+        your scenario. Entries show ``(~XKc)`` size hints — for large
+        documents prefer ``section='outline'`` first.
       - section: optional heading filter to reduce context overhead.
-        - "" (default): return the full document.
-        - "outline": return headings list with size hints (~100 tokens).
-          Each heading shows ``(~Nc)`` or ``(~XKc)`` so you can judge
-          context cost before loading. ``##`` groups show ``[N subsections]``.
-          Then call again with the specific heading name.
-        - "Q9" / "安全红线" / "Pod CPU": return only content under the
-          matching heading (case-insensitive substring match).
-          Example: section="Q9" matches "### Q9: 【安全红线】...",
-          section="Pod CPU" matches "### Pod CPU 验证...".
+        - "" (default): full document.
+        - "outline": headings list with size hints (~100 tokens); each
+          heading shows ``(~Nc)``/``(~XKc)``, ``##`` groups show
+          ``[N subsections]``. Then call again with the heading name.
+        - "Q9" / "Pod CPU": only content under the matching heading
+          (case-insensitive substring match).
 
     Output: markdown content (full, section, or outline), or "Error:" if
             the filename is not in the registry / not on disk / section
             not found.
 
-    Side effects: None (read-only).
+    Side effects: none (read-only).
 
-    Constraints (MUST READ before calling):
-      - Only filenames present in the auto-discovered registry are
-        accepted; arbitrary paths are rejected for path-traversal safety.
-      - When section is specified but not found, available headings are
-        returned so you can retry with the correct heading name.
+    Constraints:
+      - Only filenames in the auto-discovered registry are accepted;
+        arbitrary paths are rejected (path-traversal safety).
+      - A section not found returns the available headings so you can
+        retry with the correct name.
     """
     # Security: validate against auto-discovered registry (frontmatter-based)
     allowed_files = _get_allowed_files()

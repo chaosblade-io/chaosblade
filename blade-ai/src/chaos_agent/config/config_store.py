@@ -150,11 +150,11 @@ class ConfigStore:
         from chaos_agent.config.settings import settings as s
 
         return {
-            "llm_api_key": "*" * 8 if s.llm_api_key else "(未配置)",
+            "llm_api_key": "*" * 8 if s.llm_api_key else "(not configured)",
             "model_name": s.model_name,
             "api_base_url": s.api_base_url,
-            "kubeconfig_path": s.kubeconfig_path or "(默认)",
-            "kube_context": s.kube_context or "(自动检测)",
+            "kubeconfig_path": s.kubeconfig_path or "(default)",
+            "kube_context": s.kube_context or "(auto-detected)",
             "confirmation_required": str(s.confirmation_required),
             "skills_dir": str(s.skills_dir),
             "memory_dir": str(s.memory_dir),

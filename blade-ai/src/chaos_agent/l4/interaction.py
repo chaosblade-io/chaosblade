@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING
 
 from chaos_agent.l4.adapter import state_to_task_result
@@ -17,6 +18,39 @@ from chaos_agent.l4.schemas import ClarifyResult, L4TaskResult, StepResult
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+logger = logging.getLogger(__name__)
+
+
+def _conn_state_fields(conn: dict) -> dict:
+    """Map the L4 ``conn`` dict onto the graph state's connection fields.
+
+    Single source for **all** connection fields so the three ``graph_input``
+    branches below cannot drift apart. They previously carried a copy-pasted
+    list of only the four Kubernetes fields, which silently dropped every
+    host-channel field — the intent graph then had ``kube_connection_mode =
+    None`` and the model could not tell a host environment from a K8s one,
+    so it loaded ``k8s-chaos-skills`` for SSH/KubeWiz-host environments.
+
+    Both ends were already correct: the caller sends these fields (see the
+    platform's ``env_to_conn_dict``) and ``AgentState`` declares them — only
+    this hand-off was incomplete.
+
+    ``ssh_port`` is numeric, so it degrades to ``None`` rather than ``""``.
+    """
+    return {
+        "kubeconfig": conn.get("kubeconfig", "") or "",
+        "kube_context": conn.get("kube_context", "") or "",
+        "kubewiz_cluster_uuid": conn.get("kubewiz_cluster_uuid", "") or "",
+        "kubewiz_profile": conn.get("kubewiz_profile", "") or "",
+        # Host channel (kubewiz_host / ssh). ``kube_connection_mode`` is the
+        # authoritative channel marker used to resolve the capability profile.
+        "kube_connection_mode": conn.get("kube_connection_mode", "") or "",
+        "host_name": conn.get("host_name", "") or "",
+        "ssh_host": conn.get("ssh_host", "") or "",
+        "ssh_user": conn.get("ssh_user", "") or "",
+        "ssh_port": conn.get("ssh_port") or None,
+    }
 
 
 class _L4InteractionMixin:
@@ -166,7 +200,22 @@ class _L4InteractionMixin:
         intent_graph = pool.intent_graph
         try:
             existing = await intent_graph.aget_state(config)
+        except ValueError:
+            # "No checkpointer set"：图根本没有持久化。此时降级为全新会话
+            # = 多轮对话必然失忆（2026-08-04 平台线上事故），fail-closed
+            # 把配置错误暴露给调用方，而不是伪装成新会话。
+            logger.error(
+                "clarify: intent_graph has no checkpointer — refusing to "
+                "start a stateless session thread_id=%s", thread_id,
+            )
+            raise
         except Exception:
+            # 瞬时读失败（如 PG 抖动）：记录后降级。注意这会让本轮丢失
+            # 历史上下文，若频繁出现必须排查 checkpointer/连接池。
+            logger.error(
+                "clarify: aget_state failed, degrading to fresh session "
+                "thread_id=%s", thread_id, exc_info=True,
+            )
             existing = None
 
         has_existing = bool(existing and existing.values)
@@ -202,10 +251,7 @@ class _L4InteractionMixin:
                 "dry_run": False,
                 "interaction_mode": "tui",
                 "tenant_id": _tenant_id,
-                "kubeconfig": conn.get("kubeconfig", "") or "",
-                "kube_context": conn.get("kube_context", "") or "",
-                "kubewiz_cluster_uuid": conn.get("kubewiz_cluster_uuid", "") or "",
-                "kubewiz_profile": conn.get("kubewiz_profile", "") or "",
+                **_conn_state_fields(conn),
                 "messages": prev_messages,
             }
         elif has_existing and not existing.next:
@@ -224,10 +270,7 @@ class _L4InteractionMixin:
                 "dry_run": False,
                 "interaction_mode": "tui",
                 "tenant_id": _tenant_id,
-                "kubeconfig": conn.get("kubeconfig", "") or "",
-                "kube_context": conn.get("kube_context", "") or "",
-                "kubewiz_cluster_uuid": conn.get("kubewiz_cluster_uuid", "") or "",
-                "kubewiz_profile": conn.get("kubewiz_profile", "") or "",
+                **_conn_state_fields(conn),
                 "messages": prev_messages,
             }
         else:
@@ -241,10 +284,7 @@ class _L4InteractionMixin:
                 "dry_run": False,
                 "interaction_mode": "tui",
                 "tenant_id": _tenant_id,
-                "kubeconfig": conn.get("kubeconfig", "") or "",
-                "kube_context": conn.get("kube_context", "") or "",
-                "kubewiz_cluster_uuid": conn.get("kubewiz_cluster_uuid", "") or "",
-                "kubewiz_profile": conn.get("kubewiz_profile", "") or "",
+                **_conn_state_fields(conn),
                 "messages": [HumanMessage(content=user_message)],
             }
 

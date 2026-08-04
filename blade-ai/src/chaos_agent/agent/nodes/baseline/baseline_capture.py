@@ -366,7 +366,7 @@ def _build_strategy_chain(ctx: _BaselineCtx) -> list:
             {"step": "strategy", "strategy": "llm"},
         )
         await dispatch_node_message(
-            "baseline_capture", "正在通过 LLM 推导基线采集命令...\n\n",
+            "baseline_capture", "Deriving baseline-capture commands via the LLM...\n\n",
         )
         try:
             return await asyncio.wait_for(
@@ -473,7 +473,7 @@ async def _select_baseline_strategy(
             )
             await dispatch_node_message(
                 "baseline_capture",
-                f"策略 {strategy_name} 命中（{viable_count}/{total_count} 条命令可用）\n\n",
+                f"Strategy {strategy_name} matched ({viable_count}/{total_count} commands usable)\n\n",
             )
             break
 
@@ -515,7 +515,7 @@ async def _select_baseline_strategy(
         )
         await dispatch_node_message(
             "baseline_capture",
-            f"策略 {partial_source} 命中（部分可用，{partial_viable}/{partial_total} 条命令）\n\n",
+            f"Strategy {partial_source} matched (partially usable, {partial_viable}/{partial_total} commands)\n\n",
         )
 
     # P3: FCAT baseline_supplement — enrich with dimensions from knowledge docs
@@ -601,7 +601,7 @@ async def _collect_observations(
     )
     await dispatch_node_message(
         "baseline_capture",
-        f"正在执行 {len(resolved)} 条基线采集命令...\n\n",
+        f"Running {len(resolved)} baseline-capture command(s)...\n\n",
     )
     observations = await _execute_observations(resolved, kubeconfig, task_id)
 
@@ -613,6 +613,12 @@ async def _collect_observations(
     # primary strategy and reach for registry / scope_fallback.
     if source == "llm" and llm:
         all_pairs = list(zip(resolved, observations))
+        # Commands earlier retries already produced and that still failed. Each
+        # retry is a fresh LLM call with no memory of the last one, so without
+        # this the prompt is byte-identical every round and the model can only
+        # resample — task-fc64c982 spent two of its three retries re-emitting
+        # the same debug-pod command against a node that had none.
+        tried_commands: list[str] = []
 
         for retry_num in range(1, _LLM_BASELINE_MAX_RETRIES + 1):
             failed_obs = [o for _, o in all_pairs
@@ -633,8 +639,8 @@ async def _collect_observations(
             )
             await dispatch_node_message(
                 "baseline_capture",
-                f"LLM 自纠错重试 {retry_num}/{_LLM_BASELINE_MAX_RETRIES}: "
-                f"{len(failed_obs)} 条命令失败，正在重新生成...\n\n",
+                f"LLM self-correction retry {retry_num}/{_LLM_BASELINE_MAX_RETRIES}: "
+                f"{len(failed_obs)} command(s) failed, regenerating...\n\n",
             )
 
             try:
@@ -647,6 +653,7 @@ async def _collect_observations(
                         names=spec.names if spec else (),
                         labels=dict(spec.labels) if spec and spec.labels else None,
                         task_id=task_id,
+                        already_tried=tuple(tried_commands),
                     ),
                     timeout=settings.timeout_baseline_llm,
                 )
@@ -657,7 +664,7 @@ async def _collect_observations(
                 )
                 await dispatch_node_message(
                     "baseline_capture",
-                    f"LLM 自纠错重试 {retry_num} 超时，放弃重试\n\n",
+                    f"LLM self-correction retry {retry_num} timed out, giving up\n\n",
                 )
                 break
             if not retry_commands:
@@ -667,9 +674,19 @@ async def _collect_observations(
                 )
                 await dispatch_node_message(
                     "baseline_capture",
-                    f"LLM 自纠错重试 {retry_num} 未返回有效命令，放弃重试\n\n",
+                    f"LLM self-correction retry {retry_num} returned no valid command, giving up\n\n",
                 )
                 break
+
+            # Record what this retry produced BEFORE judging it: an unresolved
+            # template never runs, so it would otherwise leave no trace and the
+            # next round could emit it again. ``retry_commands`` holds the LLM's
+            # own text (``{debug_pod}`` still in place) — that is the form worth
+            # showing back, not the resolved one.
+            for _c in retry_commands:
+                _text = (getattr(_c, "command", "") or "").strip()
+                if _text and _text not in tried_commands:
+                    tried_commands.append(_text)
 
             retry_resolved = _resolve_templates(retry_commands, state, profile)
             retry_viable = [
@@ -763,7 +780,7 @@ async def _collect_observations(
             )
             await dispatch_node_message(
                 "baseline_capture",
-                f"策略 {source} 全部失败，回退到 {_fb_name}...\n\n",
+                f"Strategy {source} failed entirely, falling back to {_fb_name}...\n\n",
             )
 
             commands = list(_fb_commands)

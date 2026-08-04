@@ -97,7 +97,7 @@ PRESENT_OPTIONS_TOOL = {
         "properties": {
             "question": {
                 "type": "string",
-                "description": "简洁的中文问题",
+                "description": "A concise question, phrased in the user's language",
             },
             "options": {
                 "type": "array",
@@ -143,12 +143,12 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
 
         tracker = get_tracker(task_id) if task_id else None
         if tracker:
-            tracker.start(StatusCategory.NODE, "plan_builder", "方案设计对话中...")
+            tracker.start(StatusCategory.NODE, "plan_builder", "Plan-design conversation in progress...")
 
         if llm is None:
             if tracker:
-                tracker.complete("LLM 不可用")
-            return {"messages": [AIMessage(content="抱歉，LLM 不可用，无法构建方案。")]}
+                tracker.complete("LLM unavailable")
+            return {"messages": [AIMessage(content="Sorry, the LLM is unavailable, so a plan cannot be built.")]}
 
         hook_updates = {}
         if hook:
@@ -208,7 +208,7 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
 
         while plan_builder_round + rounds_this_invoke < MAX_PLAN_BUILDER_ROUNDS:
             if tracker:
-                tracker.update("调用 LLM...")
+                tracker.update("Calling the LLM...")
             try:
                 # Full history, same as the main chain. This was
                 # ``messages[-30:]``, a fixed message count that is blind to
@@ -224,9 +224,9 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
             except Exception as e:
                 logger.error("Plan builder LLM failed: %s", e)
                 if tracker:
-                    tracker.fail(f"LLM 调用失败: {e}")
+                    tracker.fail(f"LLM call failed: {e}")
                 return merge_hook_updates({
-                    "messages": accumulated + [AIMessage(content="抱歉，遇到了一些问题，请稍后再试。")],
+                    "messages": accumulated + [AIMessage(content="Sorry, I ran into a problem. Please try again shortly.")],
                     "plan_builder_round": plan_builder_round + rounds_this_invoke + 1,
                 }, hook_updates)
 
@@ -236,10 +236,10 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
             submit_args = _extract_submit_plan(tool_calls)
             if submit_args:
                 submit_args = _validate_submit_plan(submit_args)
-                new_spec = _build_spec_from_submit(submit_args, existing_spec)
+                new_spec = _build_spec_from_submit(submit_args, existing_spec, state)
                 plan_text = _format_final_plan(submit_args, state, new_spec)
                 if tracker:
-                    tracker.complete("方案设计完成")
+                    tracker.complete("Plan design finished")
                 _persist_dialogue(tui_session_id, _build_dialogue_persist_list(
                     messages, accumulated, response, system_msg, plan_builder_round,
                 ))
@@ -268,13 +268,14 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
                     # bindings.  If a stale/mocked model emits it anyway,
                     # repair in-band without creating an orphan tool call.
                     accumulated.append(HumanMessage(content=(
-                        "专家模式不使用选项卡。请直接调用 submit_plan；仅当风险或歧义"
-                        "确实需要用户确认时，使用简洁文本提出该确认。"
+                        "Expert mode does not use option cards. Call submit_plan directly; "
+                        "only when a risk or ambiguity genuinely needs the user's confirmation, "
+                        "raise that one confirmation as concise text."
                     )))
                     rounds_this_invoke += 1
                     continue
                 if tracker:
-                    tracker.complete("等待用户选择")
+                    tracker.complete("Waiting for the user's selection")
                 _persist_dialogue(tui_session_id, _build_dialogue_persist_list(
                     messages, accumulated, response, system_msg, plan_builder_round,
                 ))
@@ -288,9 +289,9 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
                 # User cancelled (Esc) — exit plan_builder cleanly.
                 if answer == "rejected":
                     if tracker:
-                        tracker.complete("用户取消")
+                        tracker.complete("User cancelled")
                     return merge_hook_updates({
-                        "messages": accumulated + [AIMessage(content="已取消方案构建。")],
+                        "messages": accumulated + [AIMessage(content="Plan building cancelled.")],
                         "plan_builder_round": plan_builder_round + rounds_this_invoke + 1,
                     }, hook_updates)
 
@@ -305,12 +306,12 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
                     id=f"pb-opt-{uuid.uuid4().hex[:8]}",
                 ))
                 accumulated.append(ToolMessage(
-                    content=f"用户选择: {answer}",
+                    content=f"User selected: {answer}",
                     tool_call_id=tc_id,
                 ))
                 rounds_this_invoke += 1
                 if tracker:
-                    tracker.start(StatusCategory.NODE, "plan_builder", "方案设计对话中...")
+                    tracker.start(StatusCategory.NODE, "plan_builder", "Plan-design conversation in progress...")
                 continue
 
             # ── Priority 3: real tool_calls (kubectl_read etc.) → return to ToolNode ──
@@ -319,7 +320,7 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
             )
             if has_real_tools:
                 if tracker:
-                    tracker.complete("等待工具执行")
+                    tracker.complete("Waiting for tool execution")
                 filtered = _filter_internal_from_response(response)
                 _persist_dialogue(tui_session_id, _build_dialogue_persist_list(
                     messages, accumulated, response, system_msg, plan_builder_round,
@@ -338,7 +339,7 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
 
             # ── Priority 4: pure text fallback → confirmation / clarification ──
             if tracker:
-                tracker.complete("等待用户输入")
+                tracker.complete("Waiting for user input")
             _persist_dialogue(tui_session_id, _build_dialogue_persist_list(
                 messages, accumulated, response, system_msg, plan_builder_round,
             ))
@@ -352,9 +353,9 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
             # User cancelled (Esc) — exit plan_builder cleanly.
             if answer == "rejected":
                 if tracker:
-                    tracker.complete("用户取消")
+                    tracker.complete("User cancelled")
                 return merge_hook_updates({
-                    "messages": accumulated + [AIMessage(content="已取消方案构建。")],
+                    "messages": accumulated + [AIMessage(content="Plan building cancelled.")],
                     "plan_builder_round": plan_builder_round + rounds_this_invoke + 1,
                 }, hook_updates)
 
@@ -362,14 +363,14 @@ def make_plan_builder(llm=None, tools: list = None, hook=None, registry=None):
             accumulated.append(HumanMessage(content=answer))
             rounds_this_invoke += 1
             if tracker:
-                tracker.start(StatusCategory.NODE, "plan_builder", "方案设计对话中...")
+                tracker.start(StatusCategory.NODE, "plan_builder", "Plan-design conversation in progress...")
             continue
 
         # Max rounds exceeded
         if tracker:
-            tracker.complete("方案构建轮数超限")
+            tracker.complete("Plan-building turn limit exceeded")
         return merge_hook_updates({
-            "messages": accumulated + [AIMessage(content="方案构建对话轮数已达上限，请使用 /plan 重新开始。")],
+            "messages": accumulated + [AIMessage(content="The plan-building conversation has hit its turn limit. Use /plan to start over.")],
             "plan_builder_round": plan_builder_round + rounds_this_invoke,
         }, hook_updates)
 
@@ -477,17 +478,41 @@ def _filter_internal_from_response(response) -> AIMessage:
     )
 
 
-def _build_spec_from_submit(submit_args: dict, existing_spec: FaultSpec | None) -> FaultSpec:
+def _build_spec_from_submit(
+    submit_args: dict,
+    existing_spec: FaultSpec | None,
+    state: dict | None = None,
+) -> FaultSpec:
     faults = submit_args.get("faults", [])
     if not faults:
         return existing_spec or FaultSpec()
 
+    from chaos_agent.agent.execution_artifacts import is_vehicle_name
+
     first = faults[0]
     spec = existing_spec or FaultSpec()
+    names = tuple(first.get("names") or list(spec.names))
+    vehicle_hits = [n for n in names if n not in spec.names and is_vehicle_name(n, state)]
+    if vehicle_hits:
+        # task-29848471: the LLM quoted a transient debug/tool pod as the
+        # fault target. Refuse to persist it — keep the prior names so the
+        # confirmation gate and verifier anchor stay on the real target.
+        logger.warning(
+            "spec-write blocked: writer=plan_builder._build_spec_from_submit "
+            "vehicle name(s) %s rejected, keeping names %s",
+            vehicle_hits, list(spec.names),
+        )
+        names = spec.names
+    elif names != spec.names:
+        logger.debug(
+            "spec-write: writer=plan_builder._build_spec_from_submit "
+            "names %s -> %s basis=submit_plan faults[0]['names']",
+            list(spec.names), list(names),
+        )
     return FaultSpec(
         namespace=first.get("namespace") or spec.namespace,
         scope=first.get("scope") or spec.scope,
-        names=tuple(first.get("names") or list(spec.names)),
+        names=names,
         labels=dict(first.get("labels") or dict(spec.labels)),
         blade_target=first.get("target") or spec.blade_target,
         blade_action=first.get("action") or spec.blade_action,
@@ -507,9 +532,9 @@ def _format_final_plan(submit_args: dict, state: dict, spec: FaultSpec) -> str:
     except Exception as e:
         logger.warning("plan_generator failed, using fallback: %s", e)
         faults = submit_args.get("faults", [])
-        lines = ["# 故障注入计划\n"]
+        lines = ["# Fault Injection Plan\n"]
         for i, f in enumerate(faults, 1):
-            lines.append(f"## 故障 {i}: {f.get('scope')}-{f.get('target')} {f.get('action')}")
+            lines.append(f"## Fault {i}: {f.get('scope')}-{f.get('target')} {f.get('action')}")
             if f.get("namespace"):
                 lines.append(f"- Namespace: `{f['namespace']}`")
             if f.get("names"):
@@ -517,7 +542,7 @@ def _format_final_plan(submit_args: dict, state: dict, spec: FaultSpec) -> str:
             if f.get("params"):
                 lines.append(f"- Params: {f['params']}")
             lines.append("")
-        lines.append("---\n确认执行: `/run` | 调整: `/plan <修改建议>`")
+        lines.append("---\nConfirm and run: `/run` | Adjust: `/plan <change request>`")
         return "\n".join(lines)
 
 

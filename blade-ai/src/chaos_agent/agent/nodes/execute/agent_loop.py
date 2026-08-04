@@ -60,6 +60,20 @@ _WORKLOAD_SCOPES = frozenset({
 _INFRA_SCOPES = frozenset({"node"})
 
 
+def _ledger_section_for_planning(state) -> str:
+    """Render the progress-ledger section for the planning phase (b-plan).
+
+    Planning does NOT freeze an anchor: the fault_spec is still converging here,
+    so anchoring it would anchor a moving target. The ledger is simply whatever
+    the model has recorded so far (state + log, empty anchor) — it exists to show
+    established facts and progress, and ``render_ledger`` skips the anchor block
+    while it is empty. The anchor is frozen later, once execute_loop runs on the
+    approved spec.
+    """
+    from chaos_agent.agent.progress_ledger import build_ledger_prompt_section
+    return build_ledger_prompt_section(state.get("progress_ledger"))
+
+
 def _build_replan_context_message(
     replan_context: dict,
     replan_history: list | None,
@@ -205,6 +219,29 @@ def _derive_spec_fields_from_kubectl_get(
     return updates
 
 
+def _drop_vehicle_names(updates: dict, state: dict, v_args: str) -> None:
+    """Strip vehicle names from lazy-derived spec updates in place.
+
+    task-29848471: an exploratory ``kubectl get`` against a debug/tool pod
+    must never promote that transient vehicle into the fault target. When
+    any derived name is a known injection vehicle the whole ``names``
+    update is dropped (other derived fields are kept) and a warning is
+    logged for post-mortem attribution.
+    """
+    if "names" not in updates:
+        return
+    from chaos_agent.agent.execution_artifacts import is_vehicle_name
+
+    vehicle_hits = [n for n in updates["names"] if is_vehicle_name(n, state)]
+    if vehicle_hits:
+        logger.warning(
+            "spec-write blocked: writer=agent_loop lazy derivation "
+            "vehicle name(s) %s rejected (v_args=%r)",
+            vehicle_hits, v_args,
+        )
+        del updates["names"]
+
+
 def _split_args(args: str) -> list[str]:
     """Split args string respecting shell quoting.
 
@@ -284,9 +321,10 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             alternatives = state.get("_planning_alternatives", "") if rejection_reason else ""
             category = FailureCategory.PLANNING_REJECTED if rejection_reason else FailureCategory.PLANNING_TIMEOUT
             analysis = rejection_reason or (
-                f"Agent 在 {MAX_AGENT_LOOP} 轮迭代内未能完成规划，"
-                "可能原因：目标资源不存在、参数不合法或 LLM 无法收敛到有效方案。"
-                "建议检查目标资源状态后重试。"
+                f"The agent could not finish planning within {MAX_AGENT_LOOP} iterations. "
+                "Likely causes: the target resource does not exist, a parameter is invalid, "
+                "or the LLM could not converge on a viable plan. "
+                "Check the target resource's state and retry."
             )
             result = {
                 "safety_status": "rejected",
@@ -343,12 +381,56 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
             if not capability_context.supported:
                 spec = read_fault_spec(state)
                 selected_domain = spec.scope if spec and spec.scope else "unknown"
-                message = (
-                    "The requested fault domain cannot run through the configured "
-                    "execution transport. Intent recognition completed without "
-                    "choosing a transport; select a compatible environment or revise "
-                    f"the intent before planning. Selected domain: {selected_domain}."
+                # Two distinct causes, previously reported with one sentence that
+                # named neither: the old wording said intent recognition finished
+                # "without choosing a transport", which is wrong for the common
+                # case — a transport WAS resolved, it just cannot run this domain.
+                # That sent readers looking for a missing selection instead of an
+                # incompatible pair.
+                #
+                # A session with no connection field at all is the other cause. Its
+                # resolved channel is a process-wide ``settings`` default the user
+                # never chose, so naming that channel would mislead just as badly;
+                # say the environment has no transport configured instead.
+                #
+                # Reached mainly by paths that skip the earlier submit-time gate in
+                # ``intent_clarification`` (batch replans, checkpoint resumes), so
+                # the message still has to stand on its own.
+                _has_conn_field = any(
+                    state.get(k)
+                    for k in (
+                        "kube_connection_mode", "host_name", "ssh_host",
+                        "kubeconfig", "kubewiz_cluster_uuid",
+                    )
                 )
+                if _has_conn_field:
+                    from chaos_agent.agent.spec.fault_registry import (
+                        family_for_scope,
+                    )
+                    from chaos_agent.transports.registry import (
+                        profile_of,
+                        resolve_channel_name,
+                    )
+
+                    _family = family_for_scope(selected_domain or "")
+                    _domain_profile = _family.profile if _family else "unknown"
+                    _channel = resolve_channel_name(state)
+                    message = (
+                        f"The requested fault domain '{selected_domain}' "
+                        f"(profile: {_domain_profile}) cannot run through the "
+                        f"configured transport '{_channel}' "
+                        f"(profile: {profile_of(_channel)}). Select an "
+                        f"environment matching this domain, or revise the intent "
+                        f"to a fault type this environment supports."
+                    )
+                else:
+                    message = (
+                        "The drill environment has no usable transport "
+                        "configured (no kubeconfig, KubeWiz cluster, KubeWiz host "
+                        "or SSH target). Configure a connection method on the "
+                        "environment, or bind an environment that already has "
+                        f"one. Selected domain: {selected_domain}."
+                    )
                 result = {
                     "agent_loop_count": count,
                     "safety_status": "rejected",
@@ -374,6 +456,7 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 replan_history=replan_history if is_replan_entry else None,
                 profile=capability_context.profile,
                 fault_spec=state.get("fault_spec"),
+                progress_ledger_section=_ledger_section_for_planning(state),
             )
 
             # --- Inject structured fault context from FaultSpec ---
@@ -700,9 +783,21 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                             current = getattr(_spec_now, k, None)
                             if not current:
                                 updates[k] = v
+                        if "names" in updates:
+                            _drop_vehicle_names(updates, state, tc_args.get("v_args", ""))
                         if updates:
                             new_spec = _spec_now.replace(**updates)
                             result["fault_spec"] = new_spec.to_dict()
+                            if "names" in updates:
+                                logger.debug(
+                                    "spec-write: writer=agent_loop lazy "
+                                    "derivation names %s -> %s "
+                                    "basis=kubectl %s v_args=%r",
+                                    list(_spec_now.names),
+                                    list(updates["names"]),
+                                    tc_args.get("subcommand"),
+                                    tc_args.get("v_args", ""),
+                                )
                             logger.info(
                                 "agent_loop: derived spec fields from "
                                 "LLM kubectl get: %s", updates,

@@ -141,6 +141,7 @@ async def _llm_retry_failed_commands(
     names: tuple[str, ...] = (),
     labels: dict[str, str] | None = None,
     task_id: str = "",
+    already_tried: tuple[str, ...] = (),
 ) -> list[BaselineCommand]:
     """Re-derive baseline commands with execution error feedback.
 
@@ -148,6 +149,13 @@ async def _llm_retry_failed_commands(
     wrong resource type). Feeds the error output back to the LLM so it
     can self-correct. Uses the same channel-assembled System Prompt and
     per-profile validation as the initial derivation.
+
+    ``already_tried`` carries the commands earlier retries produced. Each retry
+    is an independent call with no memory of the previous one, so without this
+    the prompt for retry 2 is byte-identical to retry 1 and the model can only
+    resample. task-fc64c982: three retries, the first two both emitting
+    ``kubectl exec {debug_pod} -- pidof containerd`` against a node that had no
+    debug pod, 71s spent before the third happened to try something else.
     """
     if not llm or not failed_observations:
         return []
@@ -174,13 +182,23 @@ async def _llm_retry_failed_commands(
     target_context = "\n".join(target_lines)
 
     _failed_n = len(failed_observations)
+    _tried_block = ""
+    if already_tried:
+        _tried_lines = "\n".join(f"- `{c}`" for c in already_tried)
+        _tried_block = (
+            "\nAlready attempted in earlier retries and FAILED — do not emit "
+            "these again, nor a variant that would fail the same way. If every "
+            "approach of one kind has failed (e.g. every command needing a debug "
+            f"pod), change approach:\n{_tried_lines}\n"
+        )
     human_prompt = (
         f"{target_context}\n\n"
         f"<skill-case>\n{skill_case_content}\n</skill-case>\n\n"
         f"Exactly {_failed_n} baseline command(s) FAILED during execution. "
         "All OTHER baseline commands SUCCEEDED and are already kept — "
         "do NOT regenerate them.\n\n"
-        f"{error_feedback}\n\n"
+        f"{error_feedback}\n"
+        f"{_tried_block}\n"
         "For EACH failed command above, generate ONE corrected replacement "
         "that collects the SAME metric/state (see its Purpose), using the "
         "ACTUAL resource values above. Rules:\n"

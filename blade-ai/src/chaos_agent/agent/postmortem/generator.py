@@ -83,7 +83,7 @@ Section guidance:
 - Background: user request, fault type, target, parameters.
 - Timeline: bullet list of key moments. Each message in the context
   has a `time` field (Beijing time HH:MM:SS). Use these real timestamps
-  in the output (e.g. "- **20:17:34** blade create 发起注入").
+  in the output (e.g. "- **20:17:34** blade create issued the injection").
 - Key Metrics: before/after numbers from baseline_capture. Skip the
   section entirely if no baseline data.
 - Verifier Findings: layer 1 + layer 2 verdicts, safety_score four

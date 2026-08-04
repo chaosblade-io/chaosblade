@@ -84,7 +84,7 @@ class TestInvariantRejectsSilentlyBrokenConfigs:
         msg = str(exc.value)
         assert "loop_detection_threshold" in msg
         assert "stagnation_threshold" in msg
-        assert "静默" in msg
+        assert "permanently silent" in msg
 
     def test_equal_window_and_threshold_is_allowed(self):
         """The boundary is inclusive: a streak of exactly N fits an N-turn window."""

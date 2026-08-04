@@ -77,32 +77,32 @@ MODEL_PRESETS: list[dict] = [
     {
         "id": "qwen3-max-preview",
         "label": "qwen3-max-preview",
-        "vendor": "阿里",
-        "hint": "中文最佳 · 最强推理",
+        "vendor": "Alibaba",
+        "hint": "Best for Chinese · strongest reasoning",
     },
     {
         "id": "deepseek-v4-pro",
         "label": "deepseek-v4-pro",
-        "vendor": "深度求索",
-        "hint": "高性价比 · 推理强",
+        "vendor": "DeepSeek",
+        "hint": "Great value · strong reasoning",
     },
     {
         "id": "glm-5.1",
         "label": "glm-5.1",
-        "vendor": "智谱 AI",
-        "hint": "中文均衡",
+        "vendor": "Zhipu AI",
+        "hint": "Balanced for Chinese",
     },
     {
         "id": "qwen3.6-plus",
         "label": "qwen3.6-plus",
-        "vendor": "阿里",
-        "hint": "快 · 性价比",
+        "vendor": "Alibaba",
+        "hint": "Fast · good value",
     },
     {
         "id": "claude-opus-4-7",
         "label": "claude-opus-4-7",
         "vendor": "Anthropic",
-        "hint": "海外旗舰",
+        "hint": "Global flagship",
     },
 ]
 
@@ -136,17 +136,18 @@ def check_config_file_health() -> str | None:
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as e:
-        return f"无法读取 ~/.blade-ai/config.json：{e}"
+        return f"Cannot read ~/.blade-ai/config.json: {e}"
     try:
         data = json.loads(text)
     except json.JSONDecodeError as e:
         return (
-            f"~/.blade-ai/config.json 不是合法的 JSON："
-            f"{e.msg}（第 {e.lineno} 行第 {e.colno} 列）。"
-            f"常见原因：字符串字段忘记加双引号（例如 kubewiz_token、kubewiz_profile 等）。"
+            f"~/.blade-ai/config.json is not valid JSON: "
+            f"{e.msg} (line {e.lineno}, column {e.colno}). "
+            f"Common cause: a string field is missing its double quotes "
+            f"(e.g. kubewiz_token, kubewiz_profile)."
         )
     if not isinstance(data, dict):
-        return "~/.blade-ai/config.json 顶层必须是 JSON 对象 {...}"
+        return "The top level of ~/.blade-ai/config.json must be a JSON object {...}"
     return None
 
 
@@ -235,15 +236,15 @@ async def validate_api_url(url: Optional[str]) -> ValidationResult:
     url = (url or "").strip()
     if not url:
         return ValidationResult(
-            status="error", message="URL 不能为空", block=True,
+            status="error", message="URL cannot be empty", block=True,
         )
     if not (url.startswith("http://") or url.startswith("https://")):
         return ValidationResult(
             status="error",
-            message="URL 必须以 http:// 或 https:// 开头",
+            message="URL must start with http:// or https://",
             block=True,
         )
-    return ValidationResult(status="ok", message="格式正确")
+    return ValidationResult(status="ok", message="Format is valid")
 
 
 # ── API key validation (live call) ─────────────────────────────────────
@@ -267,14 +268,14 @@ async def validate_api_key(
     key = (api_key or "").strip()
     if not key:
         return ValidationResult(
-            status="error", message="API key 不能为空", block=True,
+            status="error", message="API key cannot be empty", block=True,
         )
     base = (base_url or "").strip()
     if not base:
         # Without a base URL we can't even pick the right SDK endpoint.
         return ValidationResult(
             status="error",
-            message="缺少 API Base URL（请先填上一步）",
+            message="Missing the API base URL (fill in the previous step first)",
             block=True,
         )
 
@@ -283,7 +284,7 @@ async def validate_api_key(
     except ImportError:
         return ValidationResult(
             status="warn",
-            message="未安装 openai 包，无法实时校验（已接受）",
+            message="The openai package is not installed, so live validation is unavailable (accepted)",
             block=False,
         )
 
@@ -293,7 +294,7 @@ async def validate_api_key(
     except asyncio.TimeoutError:
         return ValidationResult(
             status="warn",
-            message="校验超时，可能是网络问题；已接受（首次 /run 时再确认）",
+            message="Validation timed out, possibly a network issue; accepted (will be confirmed on the first /run)",
             block=False,
         )
     except Exception as e:
@@ -307,20 +308,21 @@ async def validate_api_key(
             return ValidationResult(
                 status="error",
                 message=(
-                    f"401 拒绝：端点 {base} 不接受此 key。"
-                    "请确认 key 与上一步 API Base URL 来自同一供应商。"
+                    f"401 rejected: endpoint {base} does not accept this key. "
+                    "Check that the key and the API base URL from the previous step "
+                    "come from the same provider."
                 ),
                 block=True,
             )
         if "404" in msg:
             return ValidationResult(
                 status="warn",
-                message=f"端点缺少 /models（{type(e).__name__}），已接受",
+                message=f"The endpoint has no /models ({type(e).__name__}); accepted",
                 block=False,
             )
         return ValidationResult(
             status="warn",
-            message=f"校验异常: {type(e).__name__}（已接受）",
+            message=f"Validation error: {type(e).__name__} (accepted)",
             block=False,
         )
 
@@ -350,11 +352,11 @@ async def validate_api_key(
         metadata["has_target"] = has_target
         metadata["target_model"] = model
 
-    message_parts = [f"校验通过 · 返回 {len(model_ids)} 个模型"]
+    message_parts = [f"Validation passed · {len(model_ids)} model(s) returned"]
     if has_target is True:
-        message_parts.append(f"含目标 {model} ✓")
+        message_parts.append(f"includes the target {model} ✓")
     elif has_target is False:
-        message_parts.append(f"⚠ 未包含 {model}")
+        message_parts.append(f"⚠ does not include {model}")
     return ValidationResult(
         status="ok" if has_target is not False else "warn",
         message=" · ".join(message_parts),
@@ -378,7 +380,7 @@ async def validate_kubeconfig(path: Optional[str]) -> ValidationResult:
     if not path:
         return ValidationResult(
             status="warn",
-            message="未指定，将使用 kubectl 默认行为",
+            message="Not specified; kubectl default behaviour will be used",
             block=False,
             metadata={"contexts": []},
         )
@@ -386,14 +388,14 @@ async def validate_kubeconfig(path: Optional[str]) -> ValidationResult:
     if not os.path.isfile(expanded):
         return ValidationResult(
             status="warn",
-            message=f"文件不存在: {expanded}（已接受，启动后可再调整）",
+            message=f"File does not exist: {expanded} (accepted; adjustable after startup)",
             block=False,
             metadata={"contexts": [], "expanded_path": expanded},
         )
     contexts = await discover_kube_contexts(expanded)
     return ValidationResult(
         status="ok",
-        message=f"找到 {len(contexts)} 个上下文",
+        message=f"Found {len(contexts)} context(s)",
         block=False,
         metadata={"contexts": contexts, "expanded_path": expanded},
     )

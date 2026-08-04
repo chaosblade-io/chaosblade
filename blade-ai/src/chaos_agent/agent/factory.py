@@ -308,7 +308,7 @@ def _build_skill_tools(registry: SkillRegistry):
 
         Side effects: marks the skill as the current active context for this task.
 
-        Constraints (MUST READ before calling):
+        Constraints:
           - Unknown names return an error listing the available choices.
             Do NOT guess — use a name from that list or from the system
             prompt's Skill Index (when present).
@@ -351,7 +351,7 @@ def _build_skill_tools(registry: SkillRegistry):
 
         Side effects: None (read-only).
 
-        Constraints (MUST READ before calling):
+        Constraints:
           - Skill must be activated first (activate_skill); otherwise returns
             "Skill not found" error.
         """
@@ -408,7 +408,7 @@ def _build_skill_tools(registry: SkillRegistry):
 
         Side effects: None (read-only).
 
-        Constraints (MUST READ before calling):
+        Constraints:
           - Sensitive paths (SSH keys, private keys, system credentials)
             are blocked by safe_read_file.
         """
@@ -439,7 +439,7 @@ def _build_skill_tools(registry: SkillRegistry):
 
         Side effects: writes to disk; overwrites existing content.
 
-        Constraints (MUST READ before calling):
+        Constraints:
           - System directories and sensitive paths are blocked by
             safe_write_file.
         """
@@ -564,10 +564,12 @@ def _build_skill_tools(registry: SkillRegistry):
         Inputs:
           - reason: why the target or fault type cannot be preserved and why the
             alternative should work (1-2 sentences).
-          - proposed_fault: complete FaultSpec object. Include objective,
-            scope, target, action, namespace, names, labels, params,
-            boundaries, constraints, and assumptions as applicable; do not
-            submit a partial fault identity.
+          - proposed_fault: the COMPLETE FaultSpec object — ALL 13 fields are
+            mandatory: scope, target, action, namespace, names, labels, params,
+            params_flags, duration_seconds, objective, boundaries, constraints,
+            assumptions. The proposal REPLACES the reviewed contract wholesale;
+            a partial submission is refused with the list of missing fields
+            (resource name lists go in "names", not "name").
           - fault_revision: copy the revision of the Reviewed FaultSpec that
             this proposal replaces.
 
@@ -576,7 +578,7 @@ def _build_skill_tools(registry: SkillRegistry):
         Side effects: None (proposal only — the contract changes only after the
         user approves).
 
-        Constraints (MUST READ before calling):
+        Constraints:
           - Do NOT use this to switch the injection METHOD / CHANNEL / TOOL while
             keeping the same target and fault type (e.g. ChaosBlade DaemonSet →
             kubectl-native). That is HOW to attack, not what — just re-plan and
@@ -584,13 +586,28 @@ def _build_skill_tools(registry: SkillRegistry):
           - Do NOT use it for method-specific parameter differences. FaultSpec
             captures the semantic intent, not one tool's flags.
         """
-        if not isinstance(proposed_fault, dict) or not all(
-            proposed_fault.get(field)
-            for field in ("scope", "target", "action")
-        ):
+        # Task-5193538b (question 3): validate the full contract HERE, at the
+        # tool surface. The old check only required scope/target/action and
+        # returned "Plan change proposed." for anything else — the router then
+        # dropped the partial proposal silently (no card, no error), so the
+        # model believed the change was submitted. Failing loudly with the
+        # exact missing fields gives the model one actionable retry.
+        from chaos_agent.agent.spec.fault_spec import missing_full_proposal_fields
+
+        missing = missing_full_proposal_fields(proposed_fault)
+        if missing:
+            hint = ""
+            if (
+                isinstance(proposed_fault, dict)
+                and "name" in proposed_fault
+                and "names" not in proposed_fault
+            ):
+                hint = " Note: the resource name list goes in 'names', not 'name'."
             return (
-                "Error: proposed_fault must include the complete "
-                "fault identity: scope, target, and action."
+                "Error: proposed_fault is a partial contract; a plan change "
+                "replaces the reviewed FaultSpec wholesale and must carry "
+                "every field. Missing or empty: "
+                f"{', '.join(missing)}.{hint}"
             )
         return f"Plan change proposed. Reason: {reason}"
 
@@ -643,7 +660,7 @@ def _build_skill_tools(registry: SkillRegistry):
 
         Side effects: runs the script under the skill's working dir.
 
-        Constraints (MUST READ before calling):
+        Constraints:
           - Only .py and .sh are supported.
           - Unknown script names return an error listing available scripts;
             do not retry until you choose one from that list.
@@ -759,6 +776,7 @@ async def create_agent(
     # This static base excludes ``write_file`` / ``search_files`` /
     # ``execute_skill_script`` for the "planning is read-only + save_fault_plan"
     # reason.
+    from chaos_agent.tools.progress import update_progress  # progress ledger (all ReAct phases)
     phase1_tools = [
         _activate_skill,
         _read_skill_resource,
@@ -767,6 +785,7 @@ async def create_agent(
         _finish_planning,
         _propose_plan_change,
         read_knowledge_resource,
+        update_progress,
     ]
     if mcp_manager is not None:
         phase1_tools = phase1_tools + mcp_manager.tools_for_phase("phase1")
@@ -792,6 +811,7 @@ async def create_agent(
         read_knowledge_resource,
         time_wait,
         request_replan,
+        update_progress,
     ]
     if mcp_manager is not None:
         phase2_tools = phase2_tools + mcp_manager.tools_for_phase("phase2")
@@ -811,6 +831,7 @@ async def create_agent(
         read_knowledge_resource,
         submit_verification,
         time_wait,
+        update_progress,
     ]
     if mcp_manager is not None:
         verifier_tools = verifier_tools + mcp_manager.tools_for_phase("verifier")
@@ -825,6 +846,7 @@ async def create_agent(
         read_knowledge_resource,
         submit_recover_verification,
         time_wait,
+        update_progress,
     ]
     if mcp_manager is not None:
         # Recover verifier shares the same MCP attach_to as the inject
@@ -894,8 +916,20 @@ async def create_agent(
                     except Exception:
                         pass
                     conn = None
-                logger.warning(f"Failed to initialize PostgreSQL checkpointer: {e}")
-                checkpointer = None
+                # fail-fast：调用方显式要求 postgresql 后端时，初始化失败绝不
+                # 能静默降级。chaos pool 是进程级单例，checkpointer 在首次
+                # create_agent 时定型、之后永不改变；若此处静默置 None，图会
+                # 零持久化运行：aget_state 抛 "No checkpointer set" 被
+                # interaction 层吞掉 → 多轮会话退化为失忆开场白（2026-08-04
+                # 平台线上事故）。让异常传播到调用方，暴露真实故障。
+                logger.error(
+                    "Failed to initialize PostgreSQL checkpointer "
+                    "(checkpoint_backend=postgresql): %s", e,
+                )
+                raise RuntimeError(
+                    "checkpoint_backend=postgresql but checkpointer "
+                    f"initialization failed: {e}"
+                ) from e
 
         if backend != "postgresql" and checkpointer is None:
             # SQLite path (original logic)

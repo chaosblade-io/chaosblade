@@ -166,7 +166,7 @@ _NON_REPLANABLE_PATTERNS = [
 # LLM diagnosis extraction (used by state_helpers.fail_state)
 # ---------------------------------------------------------------------------
 
-_DIAGNOSIS_FALLBACK = "未能从 Agent 推理记录中提取失败根因分析"
+_DIAGNOSIS_FALLBACK = "Could not extract a failure root-cause analysis from the agent's reasoning trace"
 
 
 def extract_llm_diagnosis(messages: list, max_length: int = 500) -> str:

@@ -222,7 +222,7 @@ class TestExtractRecoveryVerificationSection:
             "**其他**：\n"
         )
         result = _extract_recovery_verification_section(content)
-        assert "注入验证参考" in result
+        assert "Injection-verification reference" in result
         assert "检查 CPU" in result
 
     def test_no_section(self):

@@ -286,6 +286,24 @@ async def _cleanup_residuals(state: AgentState, kubeconfig: str) -> list[dict]:
     return cleaned
 
 
+def _retired_uids_from_residuals(residuals_cleaned: list[dict]) -> list[str]:
+    """UIDs that verify-replan cleanup actually destroyed.
+
+    Only successfully-destroyed UIDs are retired: a failed destroy (exception
+    -> ``failed: ...``, or a soft tool failure -> ``Error: ...`` — the tool
+    returns the error string instead of raising) may leave a live experiment
+    that we must keep tracking, not hide behind retirement.
+    """
+    return [
+        r["id"] for r in residuals_cleaned
+        if r.get("type") == "running_experiment"
+        and r.get("id")
+        and not str(r.get("cleanup_result", "")).startswith(
+            ("failed", "Error:")
+        )
+    ]
+
+
 def _build_verify_replan_context(
     verification: dict,
     residuals_cleaned: list[dict],
@@ -854,6 +872,16 @@ def make_finalize_verification(registry=None):
                 # 1. Deterministic residual cleanup — based on what's actually in state
                 residuals_cleaned = await _cleanup_residuals(state, kubeconfig)
 
+                # 1b. Retire the UIDs the framework just destroyed. The destroy
+                # ran in CODE (no blade_destroy ToolMessage in history), so the
+                # message scan would resurrect the stale UID into blade_uid and
+                # misroute the next verification's Layer-1 (task-29848471).
+                _retired_new = _retired_uids_from_residuals(residuals_cleaned)
+                if _retired_new:
+                    result_update["retired_blade_uids"] = list(
+                        state.get("retired_blade_uids") or []
+                    ) + _retired_new
+
                 # 2. Build replan context with verifier findings
                 _replan_ctx = _build_verify_replan_context(
                     verification, residuals_cleaned, verify_replan_count, skill_name,
@@ -877,9 +905,23 @@ def make_finalize_verification(registry=None):
                 result_update["reverify_count"] = 0
                 result_update["verification"] = None
                 result_update["approved_target"] = None
-                result_update["blade_uid"] = None
                 result_update["reverify_gaps"] = None
                 result_update["error"] = None
+                # Shared attribution reset (blade_uid included — the residue
+                # was just destroyed and retired above): re-arms injection
+                # method re-detection so the registry can re-attribute by
+                # RECENCY if the replanned attempt switches carriers. The
+                # message_count records the attribution epoch boundary so the
+                # re-detection scan cannot resurrect pre-seam attempts
+                # (task-5193538b).
+                from chaos_agent.agent.nodes.execute.execute_loop import (
+                    reset_attribution_state,
+                )
+                reset_attribution_state(
+                    result_update,
+                    message_count=len(state.get("messages") or [])
+                    + len(result_update.get("messages") or []),
+                )
 
                 # 4. Append replan history (with compact verification snapshot for auditing)
                 _vf = _replan_ctx.get("verifier_findings", {})

@@ -51,7 +51,7 @@ def _fmt_target(ns: str, names: list, *, max_shown: int = 4) -> str:
         return f"{ns}/*" if ns else "*"
     total = len(names)
     if total > max_shown:
-        body = f"{total} 个: {', '.join(names[:max_shown])} …(+{total - max_shown})"
+        body = f"{total}: {', '.join(names[:max_shown])} …(+{total - max_shown})"
     else:
         body = ", ".join(names)
     return f"{ns}/{body}" if ns else body
@@ -65,38 +65,38 @@ def format_auto_approve_info(node: str, payload: dict) -> str:
         fi = payload.get("fault_intent") or {}
         ft = fi.get("fault_type", "")
         if ft:
-            lines.append(f"故障: {ft}")
+            lines.append(f"Fault: {ft}")
         target = payload.get("target") or {}
         ns = target.get("namespace", "")
         names = target.get("names", [])
         if ns or names:
-            lines.append(f"目标: {_fmt_target(ns, names)}")
+            lines.append(f"Target: {_fmt_target(ns, names)}")
         params = payload.get("params") or {}
         if params:
-            lines.append(f"参数: {', '.join(f'{k}={v}' for k, v in params.items() if v)}")
+            lines.append(f"Params: {', '.join(f'{k}={v}' for k, v in params.items() if v)}")
         safety = payload.get("safety_status", "")
         if safety:
             reason = payload.get("safety_checked_detail") or payload.get("safety_reason") or ""
-            lines.append(f"安全: {safety}" + (f" ({reason})" if reason else ""))
+            lines.append(f"Safety: {safety}" + (f" ({reason})" if reason else ""))
         health = payload.get("target_health_report") or {}
         if health:
-            lines.append(f"健康: {health.get('overall', '?')} ({health.get('summary', '')})")
+            lines.append(f"Health: {health.get('overall', '?')} ({health.get('summary', '')})")
         feas = payload.get("feasibility_report") or {}
         if feas and feas.get("severity"):
-            lines.append(f"可行性: {feas.get('severity')} ({feas.get('message', '')})")
+            lines.append(f"Feasibility: {feas.get('severity')} ({feas.get('message', '')})")
         score = payload.get("safety_score") or {}
         if score:
-            lines.append(f"安全评分: {score.get('overall', '?')}/100 ({score.get('level', '')})")
+            lines.append(f"Safety score: {score.get('overall', '?')}/100 ({score.get('level', '')})")
     elif node == "plan_change_confirm":
         reason = payload.get("reason", "")
         original = payload.get("original") or {}
         proposed = payload.get("proposed") or {}
         if original.get("fault_type"):
-            lines.append(f"原方案: {original['fault_type']}")
+            lines.append(f"Original plan: {original['fault_type']}")
         if proposed.get("fault_type"):
-            lines.append(f"新方案: {proposed['fault_type']}")
+            lines.append(f"New plan: {proposed['fault_type']}")
         if reason:
-            lines.append(f"原因: {reason}")
+            lines.append(f"Reason: {reason}")
     elif node == "tool_screener":
         reason = payload.get("reason", "")
         agent_reason = payload.get("agent_reason", "")
@@ -105,15 +105,15 @@ def format_auto_approve_info(node: str, payload: dict) -> str:
         if original:
             ns = original.get("namespace", "")
             names = original.get("names", [])
-            lines.append(f"批准目标: {_fmt_target(ns, names)}")
+            lines.append(f"Approved target: {_fmt_target(ns, names)}")
         if proposed:
             ns = proposed.get("namespace", "")
             names = proposed.get("names", [])
-            lines.append(f"实际目标: {_fmt_target(ns, names)}")
+            lines.append(f"Actual target: {_fmt_target(ns, names)}")
         if reason:
-            lines.append(f"偏移原因: {reason if len(reason) <= 160 else reason[:159] + '…'}")
+            lines.append(f"Drift reason: {reason if len(reason) <= 160 else reason[:159] + '…'}")
         if agent_reason:
-            lines.append(f"Agent 解释: {agent_reason}")
+            lines.append(f"Agent explanation: {agent_reason}")
     else:
         content = content_from_interrupt_payload(payload)
         if content:
@@ -155,9 +155,11 @@ async def wait_for_confirmation(
         while True:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
-                raise ConfirmTimeout(
-                    f"Confirmation timed out ({int(timeout // 60)} min)"
-                )
+                # Render hours once the window is measured in them: the default
+                # is 6h, and "360 min" reads like a bug rather than a setting.
+                mins = int(abs(timeout) // 60)
+                span = f"{mins // 60}h" if mins >= 120 else f"{mins} min"
+                raise ConfirmTimeout(f"Confirmation timed out ({span})")
             slice_s = min(keepalive_interval, remaining)
             try:
                 answer = await asyncio.wait_for(

@@ -39,16 +39,16 @@ def _adapt_intent_confirm(payload: dict, thread_id: str) -> PendingCard:
     confidence = payload.get("intent_confidence")
     round_n = int(payload.get("clarification_round") or 0)
 
-    title_parts = [f"故障意图确认：{fault_type}"]
+    title_parts = [f"Confirm fault intent: {fault_type}"]
     if namespace:
         title_parts.append(f"@ {namespace}")
     title = " ".join(title_parts)
 
     summary = payload.get("summary") or ""
     if confidence is not None:
-        summary = f"{summary}\n（识别置信度: {confidence}）" if summary else f"识别置信度: {confidence}"
+        summary = f"{summary}\n(recognition confidence: {confidence})" if summary else f"Recognition confidence: {confidence}"
     if round_n > 0:
-        summary = f"{summary}\n（已澄清 {round_n} 轮）" if summary else f"已澄清 {round_n} 轮"
+        summary = f"{summary}\n(clarified over {round_n} round(s))" if summary else f"Clarified over {round_n} round(s)"
 
     details = {
         "fault_intent": fault_intent,
@@ -70,8 +70,8 @@ def _adapt_intent_confirm(payload: dict, thread_id: str) -> PendingCard:
 
 
 def _adapt_plan_confirm(payload: dict, thread_id: str) -> PendingCard:
-    """payload 形态见 ``confirmation_gate.py:142``——无 ``type`` 字段，靠
-    ``safety_status`` + ``plan_summary`` 识别。
+    """For the payload shape see ``confirmation_gate.py:142`` — it has no ``type``
+    field, so it is recognised via ``safety_status`` + ``plan_summary``.
     """
     skill = payload.get("skill_name") or "unknown"
     fault_intent = payload.get("fault_intent") or {}
@@ -83,15 +83,15 @@ def _adapt_plan_confirm(payload: dict, thread_id: str) -> PendingCard:
     target = payload.get("target") or ""
     safety_status = payload.get("safety_status") or "unknown"
 
-    title = f"执行前确认：{skill}"
+    title = f"Confirm before execution: {skill}"
     if fault_type:
-        title = f"执行前确认：{fault_type}"
+        title = f"Confirm before execution: {fault_type}"
     summary_lines = [
-        f"目标: {target}" if target else "",
-        f"安全检查: {safety_status}",
+        f"Target: {target}" if target else "",
+        f"Safety check: {safety_status}",
     ]
     if payload.get("safety_reason"):
-        summary_lines.append(f"原因: {payload['safety_reason']}")
+        summary_lines.append(f"Reason: {payload['safety_reason']}")
     summary = "\n".join(line for line in summary_lines if line)
 
     details = {
@@ -125,14 +125,14 @@ def _adapt_plan_confirm(payload: dict, thread_id: str) -> PendingCard:
 
 
 def _adapt_plan_change(payload: dict, thread_id: str) -> PendingCard:
-    """payload 形态见 ``plan_change_confirm.py:69``。"""
+    """For the payload shape see ``plan_change_confirm.py:69``."""
     original = payload.get("original") or {}
     proposed = payload.get("proposed") or {}
     title = (
-        f"计划变更确认：{original.get('fault_type') or '?'} "
+        f"Confirm plan change: {original.get('fault_type') or '?'} "
         f"→ {proposed.get('fault_type') or '?'}"
     )
-    summary = payload.get("reason") or "Agent 提议变更故障类型，请确认。"
+    summary = payload.get("reason") or "The agent proposes changing the fault type — please confirm."
 
     details = {
         "reason": payload.get("reason") or "",
@@ -152,9 +152,9 @@ def _adapt_plan_change(payload: dict, thread_id: str) -> PendingCard:
 
 
 def _adapt_tool_drift(payload: dict, thread_id: str) -> PendingCard:
-    """payload 形态见 ``tool_screener.py:221``（``type=target_change``）。"""
-    summary = payload.get("summary") or "Agent 工具调用偏离原批准目标。"
-    title = "工具调用偏移确认"
+    """For the payload shape see ``tool_screener.py:221`` (``type=target_change``)."""
+    summary = payload.get("summary") or "A tool call from the agent drifts from the originally approved target."
+    title = "Confirm tool-call drift"
 
     details = {
         "reason": payload.get("reason") or "",
@@ -176,9 +176,11 @@ def _adapt_tool_drift(payload: dict, thread_id: str) -> PendingCard:
 
 
 def _adapt_unknown(payload: dict, thread_id: str) -> PendingCard:
-    """Fallback：未知 interrupt payload 形态，原样透传 details 供上层兜底。"""
-    title = "未知人工确认请求"
-    summary = "SDK 收到未识别的 interrupt payload，已透传详情。"
+    """Fallback: unknown interrupt payload shape — pass ``details`` through verbatim
+    so the caller can handle it.
+    """
+    title = "Unknown manual-confirmation request"
+    summary = "The SDK received an unrecognised interrupt payload; details passed through."
     return PendingCard(
         card_type="unknown",
         card_id=_make_card_id(thread_id, "unknown"),

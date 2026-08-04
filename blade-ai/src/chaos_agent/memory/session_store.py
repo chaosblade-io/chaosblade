@@ -320,6 +320,11 @@ class SessionStore:
             # Frozen at finalize from settings.model_name; declared here so the
             # field exists from creation and analysis code can read it uniformly.
             "model_name": "",
+            # Progress ledger snapshot, set at finalize from pipeline state.
+            # A snapshot (latest-wins) field, so it rides the normal .json
+            # snapshot flush — it is NOT a message and must not go into the
+            # append-only .jsonl increment stream.
+            "progress_ledger": None,
         }
         baseline_keys = set()
         if baseline_messages:
@@ -551,6 +556,7 @@ class SessionStore:
         remaining_messages: Optional[list] = None,
         result_summary: str | dict = "",
         status: str = "completed",
+        progress_ledger: Optional[dict] = None,
     ) -> None:
         """Finalize a task record: append remaining messages, set timestamps, flush atomically.
 
@@ -592,6 +598,10 @@ class SessionStore:
         session["finished_at"] = now_iso()
         session["status"] = status
         session["result_summary"] = result_summary or None
+        # Snapshot the progress ledger if the caller supplied one (only overwrite
+        # on a real value, so a finalize without it does not wipe an earlier one).
+        if progress_ledger is not None:
+            session["progress_ledger"] = progress_ledger
 
         # Freeze the model name into the record. Post-hoc analysis otherwise has
         # to guess it from the CURRENT config.json — which may have been changed

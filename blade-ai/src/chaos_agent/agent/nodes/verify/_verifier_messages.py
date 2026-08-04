@@ -463,6 +463,33 @@ def _build_first_iteration_context(
         f"Blade params: {params}\n"
         f"Kubeconfig: {'(kubewiz)' if _is_kubewiz else (kubeconfig or '(default)')}\n"
     )
+    # task-29848471: if the target names contain a transient injection
+    # vehicle (debug/tool pod), the L2 model must be told explicitly not
+    # to verify against it — the write-side defenses stop NEW vehicles
+    # from entering the spec, but a polluted name already in state still
+    # reaches this prompt. Point the model at the approved anchor instead.
+    from chaos_agent.agent.execution_artifacts import is_vehicle_name
+    _vehicle_hits = [
+        n for n in (target.get("names") or []) if is_vehicle_name(n, state)
+    ]
+    if _vehicle_hits:
+        _anchor = state.get("approved_target") or {}
+        _anchor_names = list(_anchor.get("resolved_names") or _anchor.get("names") or [])
+        _anchor_labels = _anchor.get("labels") or {}
+        _anchor_desc = (
+            f"names {_anchor_names}" if _anchor_names
+            else (f"labels {_anchor_labels}" if _anchor_labels else "the approved target")
+        )
+        logger.warning(
+            "verifier Fault Context contains vehicle name(s) %s; "
+            "emitting anchor warning (anchor=%s)", _vehicle_hits, _anchor_desc,
+        )
+        context += (
+            f"⚠ VEHICLE WARNING: {_vehicle_hits} in the target names above "
+            "are TRANSIENT injection vehicles (debug/tool pods created to "
+            "carry commands), NOT fault targets. Do NOT verify fault effects "
+            f"against them. Verify ONLY the approved anchor: {_anchor_desc}.\n"
+        )
     # Structured key parameters from parsed flags (e.g. path, percent, size)
     blade_parsed = state.get("blade_parsed_flags") or {}
     if blade_parsed:

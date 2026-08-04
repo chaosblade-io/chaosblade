@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timedelta, timezone
 
 from chaos_agent.config.settings import settings
 from chaos_agent.errors import ToolGuardError, ToolTimeoutError
@@ -36,30 +37,115 @@ DEBUG_CONTAINER_NAME = "debugger"
 # Default namespace for debug pods — always exists in any K8s cluster.
 _DEFAULT_DEBUG_NS = "default"
 
+# Project convention: `kubectl debug node/<node>` names the pod
+# ``node-debugger-<node>-<suffix>``. Used ONLY as a discovery filter (data
+# sources take priority elsewhere); not a creation rule.
+DEBUG_POD_NAME_PREFIX = "node-debugger-"
+
 
 def parse_debug_pod_name(output: str) -> str:
     """Extract debug pod name from kubectl debug output.
 
-    Handles formats like:
+    THE single parsing source for every consumer (baseline, verifier, recover,
+    and the kubectl tool wrapper itself — task-29848471: the wrapper's old
+    private copy had weaker patterns and produced false "no pod created"
+    reports). Handles formats like:
       - "Creating debugging pod node-debugger-xxx with container debugger on node yyy."
-      - "pod/node-name-debug-xxxxx created"
       - "Starting debugging pod node-name-debug-xxxxx..."
+      - "pod/node-name-debug-xxxxx created"
     """
     if not output:
         return ""
-    # K8s 1.25+ format: "Creating debugging pod node-debugger-xxx ..."
-    m = re.search(r'pod\s+(node-debugger-\S+)', output)
-    if m:
-        return m.group(1).rstrip(".,;:")
-    # Match pod name after "pod/" or "pod " in the output
-    m = re.search(r'pod[/\s]+(\S+?-debug-\S+)', output)
-    if m:
-        return m.group(1)
-    # Alternative: match any valid pod name followed by "created"
-    m = re.search(r'(\S+-debug-\S+)\s+created', output)
-    if m:
-        return m.group(1)
+    # Most specific first: kubectl's own creation banner (K8s 1.25+), then the
+    # generic ``pod/<name> created`` form, then convention/pattern fallbacks.
+    for pattern in (
+        r"Creating debugging pod\s+(\S+)",
+        r"Starting debugging pod\s+(\S+)",
+        r"pod/(\S+)\s+created",
+        r"pod\s+(node-debugger-\S+)",
+        r"(\S+-debug-\S+)\s+created",
+    ):
+        m = re.search(pattern, output)
+        if m:
+            return m.group(1).rstrip(".,;:")
     return ""
+
+
+async def discover_created_debug_pod(
+    node_name: str,
+    namespace: str,
+    created_after_ts: float,
+    kubeconfig: str = "",
+    context: str = "",
+    cluster: str = "",
+) -> str:
+    """Live fallback discovery for a debug pod whose name failed to parse.
+
+    Per the project convention for debug timeouts/parse failures, run ONE
+    ``kubectl get pods`` and match by ``spec.nodeName`` + the
+    ``node-debugger-`` prefix. A recency filter
+    (``creationTimestamp >= created_after_ts - 60s``, clock-skew margin) is
+    added because the same node can host several stale debug pods at once —
+    without it discovery could return a leftover from an earlier attempt
+    (task-29848471 k3 had two such pods coexisting).
+
+    Returns the NEWEST matching pod name, or ``""`` if none. Only invoked on
+    the parse-failure path — the normal path pays zero extra cost.
+    """
+    ns = namespace or _DEFAULT_DEBUG_NS
+    cmd = build_kubectl_cmd(
+        "get", ["pods", "-n", ns, "-o", "json"],
+        kubeconfig, context, cluster,
+    )
+    try:
+        result = await execute_via_transport(
+            cmd, TransportTarget.from_state({}),
+            timeout=settings.timeout_kubectl, expect_profile=PROFILE_K8S,
+        )
+    except Exception:
+        logger.debug(
+            "Debug pod discovery failed for node %s in %s", node_name, ns,
+            exc_info=True,
+        )
+        return ""
+    if result.exit_code != 0:
+        return ""
+    try:
+        data = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        return ""
+
+    cutoff = datetime.fromtimestamp(
+        created_after_ts, tz=timezone.utc,
+    ) - timedelta(seconds=60)
+    best_name = ""
+    best_created: datetime | None = None
+    for item in data.get("items") or []:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") or {}
+        name = metadata.get("name") or ""
+        if not name.startswith(DEBUG_POD_NAME_PREFIX):
+            continue
+        spec = item.get("spec") or {}
+        if node_name and spec.get("nodeName") != node_name:
+            continue
+        raw_ts = metadata.get("creationTimestamp") or ""
+        try:
+            created = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if created < cutoff:
+            continue
+        if best_created is None or created > best_created:
+            best_name = name
+            best_created = created
+    if best_name:
+        logger.info(
+            "Debug pod discovery hit: %s on node %s (ns=%s)",
+            best_name, node_name, ns,
+        )
+    return best_name
 
 
 def parse_debug_pod_info(tool_message_content: str) -> tuple[str, str]:
@@ -80,6 +166,17 @@ def parse_debug_pod_info(tool_message_content: str) -> tuple[str, str]:
             metadata = json.loads(meta_match.group(1))
         except (TypeError, json.JSONDecodeError):
             metadata = {}
+        # Task-5193538b: a POD-scoped ``kubectl debug`` attaches an
+        # EPHEMERAL container to the TARGET pod — no debug pod is created,
+        # yet the meta tag still carries the target pod's name/namespace.
+        # Treating it as a probe pod made both cleanup paths
+        # (planning cleanup + verifier finalize) delete the FAULT TARGET.
+        # Mirrors the ephemeral skip in ``execution_artifacts``
+        # (artifact collection). Returning empty here is safe: the
+        # name-pattern fallback below cannot match (ephemeral debug emits no
+        # "Creating debugging pod" banner).
+        if metadata.get("ephemeral_container"):
+            return ("", "")
         pod_name = str(metadata.get("name") or "")
         namespace = str(metadata.get("namespace") or "")
         if pod_name and namespace:

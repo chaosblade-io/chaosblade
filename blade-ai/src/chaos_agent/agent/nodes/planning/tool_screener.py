@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import replace
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -50,6 +51,7 @@ from langgraph.types import interrupt
 
 from chaos_agent.agent.spec.fault_spec import read_fault_spec
 from chaos_agent.agent.capabilities import explain_tool_refusal, tool_call_allowed
+from chaos_agent.agent.execution_artifacts import is_vehicle_name
 from chaos_agent.agent.nodes.execute.llm_step_helpers import hint_count_key
 from chaos_agent.agent.nodes.execute.react_helpers import _stagnation_key
 from chaos_agent.agent.state import AgentState
@@ -107,6 +109,76 @@ def _blade_uids_created_by_current_task(messages: list) -> set[str]:
         # extract_blade_uid, but their CRDs still need cleanup.
         uids.update(match.group(1) for match in _FAILED_CREATE_UID_RE.finditer(content))
     return uids
+
+
+async def _discover_vehicle_pods(
+    state: AgentState, candidates: list[str],
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Live-discover which ``candidates`` are injection tool pods.
+
+    Reuses the SAME label-selector discovery the baseline / conflict checks
+    use (``discover_tool_pods_cluster_wide``): an all-namespace lookup of
+    the ChaosBlade tooling labels, verified against the LIVE cluster. Pod
+    identity is thus a cluster fact, not a naming convention — deployments
+    that rename or relocate the tool DaemonSet are still recognised as long
+    as they carry the tooling labels, and site-specific tool pods are
+    covered by task-side registration (``kubectl_exec_pod_name``).
+
+    Returns ``(positives, misses)``. A failed probe caches its candidates
+    as misses: re-probing every screener iteration under an active network
+    fault would ride the very API path the fault is severing; the fail-
+    closed outcome (the call still reaches drift review) is safe.
+    """
+    from chaos_agent.agent.nodes.execute._injection_detection import (
+        discover_tool_pods_cluster_wide,
+    )
+
+    kubeconfig = str(state.get("kubeconfig") or "")
+    try:
+        pods = await discover_tool_pods_cluster_wide(
+            kubeconfig, str(state.get("task_id") or ""),
+        )
+    except Exception:
+        logger.warning(
+            "target_guard: vehicle live-discovery failed; candidates %s "
+            "keep identity review (fail closed)", candidates,
+        )
+        return frozenset(), frozenset(candidates)
+    discovered = {name for name, _ns in pods}
+    positives = frozenset(n for n in candidates if n in discovered)
+    misses = frozenset(n for n in candidates if n not in discovered)
+    if positives:
+        logger.info(
+            "target_guard: live discovery confirmed injection vehicle(s) %s",
+            sorted(positives),
+        )
+    return positives, misses
+
+
+def _identity_matches_approved(
+    effective: EffectiveTarget, approved: ApprovedTarget | None,
+) -> bool:
+    """Cheap structural match between an effective target and the approval.
+
+    True means identity drift cannot fire for this call, so the vehicle
+    block (probe + exemption) may be skipped entirely. That matters beyond
+    efficiency: the discovery probe rides the in-band API path, which an
+    injected network fault may already be severing — no probe may fire for
+    an exec into the approved target itself. False negatives are harmless:
+    at worst one extra fail-closed, cached probe.
+    """
+    if approved is None or not effective.names:
+        return False
+    if (effective.namespace or "default") != (approved.namespace or "default"):
+        return False
+    if approved.is_namespace_wide:
+        return True
+    known = (
+        set(approved.names)
+        | set(approved.resolved_names)
+        | set(approved.owner_names)
+    )
+    return bool(known) and all(n in known for n in effective.names)
 
 
 def _screen_blade_destroy(tool_args: Any, messages: list) -> tuple[EffectiveTarget, GuardDecision]:
@@ -319,6 +391,16 @@ async def tool_screener(state: AgentState) -> dict:
     has_other_reject = False
     has_provenance_reject = False
     has_context_reject = False
+    # Vehicle live-discovery cache for this screening round + the state
+    # delta persisting its outcome (positive and negative alike).
+    cluster_vehicles: frozenset[str] = frozenset(
+        state.get("known_vehicle_pods") or (),
+    )
+    probe_misses: frozenset[str] = frozenset(
+        state.get("vehicle_probe_misses") or (),
+    )
+    probed_this_round = False
+    vehicle_cache: dict[str, Any] = {}
     for tc in last_msg.tool_calls:
         tool_name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "")
         tool_args = tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", None)
@@ -531,6 +613,63 @@ async def tool_screener(state: AgentState) -> dict:
                         reject_detail=carrier_resolution.detail,
                         reject_suggestion=carrier_resolution.suggestion,
                     )
+            if (
+                tool_name != "blade_destroy"
+                and effective.scope == "pod"
+                and not effective.is_vehicle_exec
+                and effective.names
+                and not _identity_matches_approved(effective, approved)
+            ):
+                # An exec into an injection VEHICLE is machinery access, not
+                # an operation on the fault target — exempt it from identity
+                # drift. Vehicle identity is DATA-driven, never name-based:
+                #   1. task-registered vehicles (``is_vehicle_name``: debug
+                #      pod artifacts, kubectl_exec_pod_name, meta tags);
+                #   2. LIVE cluster discovery for pods this task never
+                #      registered (e.g. the ChaosBlade tool DaemonSet), one
+                #      bounded probe per screening round, outcome persisted.
+                # The probe runs on the fault-binary branch too: a drift
+                # verdict that SURVIVES there can still be human-approved,
+                # and ``_apply_drift_correction`` needs the discovered
+                # identity to refuse rewriting the contract toward
+                # machinery. Only the exemption FLAG is withheld from that
+                # branch — a fault binary inside a privileged / hostNetwork
+                # tool pod shapes the HOST and keeps identity review.
+                unregistered = [
+                    n for n in effective.names
+                    if not is_vehicle_name(n, state)
+                    and n not in cluster_vehicles
+                    and n not in probe_misses
+                ]
+                if unregistered and not probed_this_round:
+                    probed_this_round = True
+                    positives, misses = await _discover_vehicle_pods(
+                        state, unregistered,
+                    )
+                    cluster_vehicles = cluster_vehicles | positives
+                    probe_misses = probe_misses | misses
+                    new_known = positives - frozenset(
+                        state.get("known_vehicle_pods") or (),
+                    )
+                    if new_known:
+                        vehicle_cache["known_vehicle_pods"] = tuple(
+                            (state.get("known_vehicle_pods") or ())
+                            + tuple(sorted(new_known)),
+                        )
+                    if misses:
+                        vehicle_cache["vehicle_probe_misses"] = tuple(
+                            sorted(
+                                frozenset(
+                                    state.get("vehicle_probe_misses") or (),
+                                ) | misses,
+                            ),
+                        )
+                if not effective.fault_binary_mutation and all(
+                    is_vehicle_name(n, state) or n in cluster_vehicles
+                    for n in effective.names
+                ):
+                    # EffectiveTarget is frozen, so rebuild instead of mutating.
+                    effective = replace(effective, is_vehicle_exec=True)
             if tool_name != "blade_destroy":
                 # Single funnel: identity / recoverability verdict via the
                 # gateway. ``decision`` drives routing (drift interrupt /
@@ -618,7 +757,7 @@ async def tool_screener(state: AgentState) -> dict:
         and not has_provenance_reject
         and not has_context_reject
     ) or not any_reject:
-        return {"screener_route": SCREENER_ROUTE_PASS}
+        return {"screener_route": SCREENER_ROUTE_PASS, **vehicle_cache}
 
     # Enforcing mode + at least one reject — fabricate ToolMessages so
     # the LangChain conversation stays well-formed (every tool_call
@@ -648,6 +787,7 @@ async def tool_screener(state: AgentState) -> dict:
                     FailureCategory.USER_REJECTED,
                     "Target drift persists after user rejection; terminating.",
                 ),
+                **vehicle_cache,
             }
 
         # CLI mode: no interactive human to confirm drift — reject and
@@ -662,6 +802,7 @@ async def tool_screener(state: AgentState) -> dict:
                 "messages": rejection_msgs,
                 "screener_route": SCREENER_ROUTE_RETRY,
                 "drift_reject_count": drift_reject_count + 1,
+                **vehicle_cache,
             }
 
         _reason = drifted[0]["reason"] if drifted else ""
@@ -682,23 +823,28 @@ async def tool_screener(state: AgentState) -> dict:
         user_decision = interrupt(drift_info)
 
         if user_decision == "approved":
-            spec_delta = _apply_drift_correction(state, first_eff)
+            spec_delta = _apply_drift_correction(
+                state, first_eff, cluster_vehicles,
+            )
             return {
                 "screener_route": SCREENER_ROUTE_PASS,
                 "drift_reject_count": 0,
                 **spec_delta,
+                **vehicle_cache,
             }
         else:
             return {
                 "messages": rejection_msgs,
                 "screener_route": SCREENER_ROUTE_RETRY,
                 "drift_reject_count": drift_reject_count + 1,
+                **vehicle_cache,
             }
 
     # --- Non-drift reject (BANNED / UNKNOWN): retry in place ---
     return {
         "messages": rejection_msgs,
         "screener_route": SCREENER_ROUTE_RETRY,
+        **vehicle_cache,
     }
 
 
@@ -827,12 +973,38 @@ def _extract_agent_reason(msg: AIMessage) -> str:
     return ""
 
 
-def _apply_drift_correction(state: AgentState, eff: EffectiveTarget | None) -> dict:
+def _apply_drift_correction(
+    state: AgentState,
+    eff: EffectiveTarget | None,
+    discovered_vehicles: frozenset[str] = frozenset(),
+) -> dict:
     """Correct fault_spec + refreeze approved_target after user approves drift."""
     from chaos_agent.config.settings import settings as _settings
 
     spec = read_fault_spec(state)
     if not spec or not eff:
+        return {}
+
+    # Never rewrite fault_spec toward an injection vehicle. Even if a
+    # vehicle exec still produced a drift verdict (a residual path that
+    # keeps identity review, e.g. the fault-binary branch) and a human
+    # approved it, the correction must not point the spec at injection
+    # machinery — that is how a drift loop ends its run "targeting" the
+    # tool pod instead of the workload. Same DATA-driven oracle as the
+    # screener: task-registered vehicles, previously persisted discoveries,
+    # and vehicles discovered in THIS screening round (an interrupt resumes
+    # before the round's cache reaches state, so the caller passes it in).
+    if eff.names and all(
+        is_vehicle_name(n, state)
+        or n in frozenset(state.get("known_vehicle_pods") or ())
+        or n in discovered_vehicles
+        for n in eff.names
+    ):
+        logger.warning(
+            "target_guard: drift correction toward vehicle pod(s) %s skipped "
+            "(fault_spec must never point at injection machinery)",
+            list(eff.names),
+        )
         return {}
 
     corrections: dict = {}
@@ -846,6 +1018,12 @@ def _apply_drift_correction(state: AgentState, eff: EffectiveTarget | None) -> d
 
     if corrections:
         new_spec = spec.replace(**corrections)
+        if "names" in corrections:
+            logger.debug(
+                "spec-write: writer=tool_screener._apply_drift_correction "
+                "names %s -> %s basis=user-approved drift EffectiveTarget",
+                list(spec.names), list(corrections["names"]),
+            )
     else:
         new_spec = spec
 

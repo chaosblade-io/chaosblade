@@ -65,15 +65,15 @@ def parse_iso_timestamp(ts: str) -> datetime:
 
 
 def format_relative_time(ts: str, *, now: datetime | None = None) -> str:
-    """Render an ISO timestamp as a compact Chinese relative label.
+    """Render an ISO timestamp as a compact relative label.
 
-    Examples: ``今天 09:10`` / ``昨天 15:02`` / ``3天前 14:23``. Beyond 7 days
-    it falls back to an absolute ``2026-06-20 14:23``. Empty or unparseable
+    Examples: ``today 09:10`` / ``yesterday 15:02`` / ``3d ago 14:23``. Beyond 7
+    days it falls back to an absolute ``2026-06-20 14:23``. Empty or unparseable
     input returns ``""`` so callers can simply omit the prefix — this never
     raises.
 
     The day bucket is computed on the *calendar date* in Beijing time (so a
-    22:00 injection and a 01:00 query the next morning read as "昨天", not
+    22:00 injection and a 01:00 query the next morning read as "yesterday", not
     "3 hours ago"); ``HH:MM`` is likewise shown in Beijing time.
     """
     if not ts:
@@ -87,9 +87,9 @@ def format_relative_time(ts: str, *, now: datetime | None = None) -> str:
     hhmm = dt_local.strftime("%H:%M")
     day_diff = (now_local.date() - dt_local.date()).days
     if day_diff <= 0:
-        return f"今天 {hhmm}"
+        return f"today {hhmm}"
     if day_diff == 1:
-        return f"昨天 {hhmm}"
+        return f"yesterday {hhmm}"
     if day_diff <= 6:
-        return f"{day_diff}天前 {hhmm}"
+        return f"{day_diff}d ago {hhmm}"
     return dt_local.strftime("%Y-%m-%d %H:%M")

@@ -108,6 +108,11 @@ class TestRunCommandTimeout:
     async def test_timeout_raises_error(self, mocker):
         mock_proc = MagicMock()
         mock_proc.kill = MagicMock()
+        # Explicit non-existent pgid: MagicMock().pid coerces to 1 via
+        # __index__, and killpg(1, SIGKILL) as root (CI containers) would
+        # signal init's group and hang the run. A large fake pid makes
+        # _kill_process_group's killpg a harmless ProcessLookupError.
+        mock_proc.pid = 999999
         mocker.patch("asyncio.create_subprocess_exec", return_value=mock_proc)
         mocker.patch(
             "asyncio.wait_for",
@@ -120,6 +125,11 @@ class TestRunCommandTimeout:
     async def test_timeout_error_message_includes_timeout(self, mocker):
         mock_proc = MagicMock()
         mock_proc.kill = MagicMock()
+        # Explicit non-existent pgid: MagicMock().pid coerces to 1 via
+        # __index__, and killpg(1, SIGKILL) as root (CI containers) would
+        # signal init's group and hang the run. A large fake pid makes
+        # _kill_process_group's killpg a harmless ProcessLookupError.
+        mock_proc.pid = 999999
         mocker.patch("asyncio.create_subprocess_exec", return_value=mock_proc)
         mocker.patch(
             "asyncio.wait_for",
@@ -267,6 +277,11 @@ class TestPersistToSession:
         """Timed-out command is recorded with exit_code=-1 before raising."""
         mock_proc = MagicMock()
         mock_proc.kill = MagicMock()
+        # Explicit non-existent pgid: MagicMock().pid coerces to 1 via
+        # __index__, and killpg(1, SIGKILL) as root (CI containers) would
+        # signal init's group and hang the run. A large fake pid makes
+        # _kill_process_group's killpg a harmless ProcessLookupError.
+        mock_proc.pid = 999999
         mocker.patch("asyncio.create_subprocess_exec", return_value=mock_proc)
         mocker.patch("asyncio.wait_for", side_effect=asyncio.TimeoutError())
 

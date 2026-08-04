@@ -234,6 +234,25 @@ class EffectiveTarget:
     # Guard skips namespace check; names/labels check still validates
     # target identity.
     is_tier1_exec: bool = False
+    # Infrastructure-vehicle exec: ``kubectl exec`` into an injection
+    # vehicle — a pod this task registered as its own machinery (debug_pod
+    # artifact, ``kubectl_exec_pod_name``, debug-pod-meta tags) or one the
+    # screener live-discovered as ChaosBlade tooling via the shared
+    # label-selector discovery. Set by the screener, which has state and
+    # cluster access; the classifier stays stateless and never guesses
+    # vehicles from pod names. The exec'd pod is machinery for reaching the
+    # fault target, NOT the fault target itself, so identity drift
+    # comparison does not apply. Inner-command classification (banned /
+    # escape / readonly) still runs in full.
+    is_vehicle_exec: bool = False
+    # Fault-binary mutation inside a kubectl exec (tc/iptables/stress/...).
+    # A pod-scoped mutation whose namespace containment the static
+    # classifier cannot prove for privileged / hostNetwork pods. Identity
+    # review is deliberately RETAINED even when the exec'd pod is a known
+    # vehicle — the screener's vehicle exemption must not swallow this
+    # shape, and ``_apply_drift_correction`` still refuses to rewrite the
+    # spec toward a vehicle if such a drift is human-approved.
+    fault_binary_mutation: bool = False
     # Carrier-agnostic host identity — populated when ``scope == "host"``.
     # Empty for Kubernetes targets. See ``as_target()``.
     host_name: str = ""

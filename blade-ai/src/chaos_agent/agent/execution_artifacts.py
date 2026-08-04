@@ -51,6 +51,41 @@ def parse_debug_pod_metadata(content: str) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def is_vehicle_name(name: str, state: dict | None) -> bool:
+    """True if ``name`` is a transient injection vehicle, not a fault target.
+
+    Task-29848471: a k3-class replan once quoted the ``kubectl debug`` pod
+    name as the fault target and the verifier validated against the vehicle.
+    Data sources first, naming-convention heuristic last:
+
+      1. ``execution_artifacts`` — any registered ``debug_pod`` artifact name
+         (durable fact; survives message trimming).
+      2. ``kubectl_exec_pod_name`` — the tool pod used for exec-injection.
+      3. ``debug-pod-meta`` tags in message history (covers artifacts not yet
+         collected this iteration).
+      4. Heuristic: the ``node-debugger-`` creation prefix.
+    """
+    if not name or not isinstance(state, dict):
+        return bool(name) and str(name).startswith("node-debugger-")
+    for artifact in state.get("execution_artifacts") or []:
+        if (
+            isinstance(artifact, dict)
+            and artifact.get("type") == "debug_pod"
+            and artifact.get("name") == name
+        ):
+            return True
+    if state.get("kubectl_exec_pod_name") == name:
+        return True
+    for message in state.get("messages") or []:
+        content = getattr(message, "content", None)
+        if not isinstance(content, str) or "debug-pod-meta" not in content:
+            continue
+        if parse_debug_pod_metadata(content).get("name") == name:
+            return True
+    from chaos_agent.agent.nodes.execute._debug_pod import DEBUG_POD_NAME_PREFIX
+    return str(name).startswith(DEBUG_POD_NAME_PREFIX)
+
+
 def collect_execution_artifacts(
     messages: list,
     existing: list[dict] | None = None,
@@ -436,5 +471,6 @@ __all__ = [
     "cleanup_debug_pod_artifacts",
     "collect_execution_artifacts",
     "find_active_debug_pod",
+    "is_vehicle_name",
     "parse_debug_pod_metadata",
 ]

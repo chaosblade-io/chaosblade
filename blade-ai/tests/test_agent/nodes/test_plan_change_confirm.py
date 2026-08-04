@@ -99,6 +99,50 @@ async def test_approval_updates_current_batch_item_as_fault_spec():
 
 
 @pytest.mark.asyncio
+async def test_approval_resets_loop_budgets_and_attribution_for_new_contract():
+    """New contract == new budget (task-71fa78b6: rev3 inherited 2/3 replan
+    debt from the old contract and died on its first replan)."""
+    state = _state()
+    state["replan_count"] = 2
+    state["verify_replan_count"] = 1
+    state["execute_loop_count"] = 17
+    state["injection_method"] = "host_blade"
+    state["kubectl_exec_pod_name"] = "old-carrier"
+    state["injection_start_time"] = "2026-01-01T00:00:00"
+    with patch("chaos_agent.agent.nodes.planning.plan_change_confirm.interrupt", return_value="approved"):
+        result = await plan_change_confirm(state)
+
+    assert result["replan_count"] == 0
+    assert result["verify_replan_count"] == 0
+    assert result["execute_loop_count"] == 0
+    assert result["injection_method"] is None
+    assert result["kubectl_exec_pod_name"] is None
+    assert result["injection_start_time"] is None
+    # Epoch boundary lands at the seam so RESUME scans only new-contract messages.
+    expected_epoch = len(state["messages"]) + len(result["messages"])
+    assert result["attribution_epoch_index"] == expected_epoch
+    # No live experiment in the old contract -> no UID handle carried over.
+    assert result["blade_uid"] is None
+
+
+@pytest.mark.asyncio
+async def test_approval_keeps_blade_uid_when_experiment_may_be_live():
+    """Same keep-handle semantics as the replan seam: an experiment that may
+    still be live keeps its UID so recovery can reach it."""
+    state = _state()
+    state["blade_uid"] = "d6eaa95514305543"
+    with patch("chaos_agent.agent.nodes.planning.plan_change_confirm.interrupt", return_value="approved"):
+        result = await plan_change_confirm(state)
+
+    # keep_blade_uid=True means the reset does NOT touch the UID: the key is
+    # absent from the result, so LangGraph keeps the state value — same
+    # keep-handle semantics as the replan seam.
+    assert "blade_uid" not in result
+    assert result["replan_count"] == 0
+    assert result["injection_method"] is None
+
+
+@pytest.mark.asyncio
 async def test_stale_or_noop_proposal_returns_to_react_without_interrupting():
     stale = _state(call=_proposal_call(revision=2))
     result = await plan_change_confirm(stale)

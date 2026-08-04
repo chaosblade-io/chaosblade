@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import shlex
+import time
 from typing import Literal
 
 from langchain_core.tools import tool
@@ -70,18 +71,37 @@ def _namespace_from_args(args: list[str]) -> str:
     return ""
 
 
-def _parse_debug_pod_name(output: str) -> str:
-    """Extract the pod created by ``kubectl debug`` across kubectl versions."""
-    if not output:
-        return ""
-    for pattern in (
-        r"Creating debugging pod\s+(\S+)",
-        r"pod/(\S+)\s+created",
-        r"Starting debugging pod\s+(\S+)",
-    ):
-        match = re.search(pattern, output)
-        if match:
-            return match.group(1).rstrip(".,;:")
+def _debug_target_node_name(processed_args: list[str]) -> str:
+    """The target node for a node-scoped ``kubectl debug`` call, else ``""``.
+
+    Only node-scope calls create a discoverable ``node-debugger-*`` pod, so
+    the parse-failure discovery fallback needs the node name to filter by
+    ``spec.nodeName`` (project convention). Handles both ``node/<name>`` and
+    the two-token ``node <name>`` forms. Flags that take a separate value
+    (``-n default``, ``--image busybox``) must skip BOTH tokens — otherwise
+    the flag's value is misread as the first positional and the discovery
+    fallback is silently disabled for calls like ``-n default node/a``.
+    """
+    _VALUE_FLAGS = {
+        "-n", "--namespace", "--image", "--profile",
+        "-c", "--container", "--subresource",
+    }
+    i = 0
+    while i < len(processed_args):
+        tok = processed_args[i]
+        if tok == "--":
+            break
+        if tok in _VALUE_FLAGS:
+            i += 2  # skip flag AND its value
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        if tok.startswith("node/"):
+            return tok[len("node/"):]
+        if tok == "node" and i + 1 < len(processed_args):
+            return processed_args[i + 1]
+        return ""  # first positional is a pod → pod-scoped debug
     return ""
 
 
@@ -96,6 +116,12 @@ def _debug_target_pod_name(processed_args: list[str]) -> str:
     is the user's workload and must NEVER be deleted during cleanup, unlike a
     node-debugger pod which the tool creates and owns.
 
+    ``--copy-to`` also returns ``""``: kubectl documents it as "Create a copy of
+    the target Pod with this name", so it produces a NEW tool-owned pod (whose
+    name kubectl does print) rather than an ephemeral container. Routing it here
+    would look for ephemeral containers that never appear and leave the copy
+    running with nothing tracking it.
+
     Value-consuming flags in SPACE form (``--image busybox``, ``-n ns``) must
     have their VALUE skipped — otherwise the value is mistaken for the pod name
     (e.g. ``--image busybox p0`` would return ``busybox``, or ``-n ns p0`` would
@@ -105,8 +131,15 @@ def _debug_target_pod_name(processed_args: list[str]) -> str:
     # debug flags that take a SEPARATE value token (space form).
     value_flags = {
         "-n", "--namespace", "--image", "--target", "-c", "--container",
-        "--profile", "--image-pull-policy", "--env", "--custom",
+        "--profile", "--image-pull-policy", "--env", "--custom", "--copy-to",
+        "--set-image",
     }
+    # Copy mode creates a pod, not an ephemeral container (see docstring).
+    for tok in processed_args:
+        if tok == "--":
+            break
+        if tok == "--copy-to" or tok.startswith("--copy-to="):
+            return ""
     i = 0
     while i < len(processed_args):
         tok = processed_args[i]
@@ -226,10 +259,20 @@ async def _debug_pod_metadata(
     containers = spec.get("containers") or []
     container_statuses = status.get("containerStatuses") or []
     waiting_reasons = []
+    # One-shot ``kubectl debug ... -- CMD`` pods end in Succeeded/Failed; the
+    # command's exit code / termination reason live in the first container's
+    # ``terminated`` state. ``None`` = container has not terminated yet.
+    exit_code = None
+    terminated_reason = ""
     for container_status in container_statuses:
-        waiting = ((container_status.get("state") or {}).get("waiting") or {})
+        state_obj = container_status.get("state") or {}
+        waiting = state_obj.get("waiting") or {}
         if waiting.get("reason"):
             waiting_reasons.append(waiting["reason"])
+        terminated = state_obj.get("terminated") or {}
+        if exit_code is None and terminated:
+            exit_code = terminated.get("exitCode")
+            terminated_reason = terminated.get("reason") or ""
     return {
         "name": metadata.get("name") or pod_name,
         "namespace": metadata.get("namespace") or namespace,
@@ -246,6 +289,8 @@ async def _debug_pod_metadata(
             for container_status in container_statuses
         ),
         "waiting_reasons": waiting_reasons,
+        "exit_code": exit_code,
+        "terminated_reason": terminated_reason,
     }, ""
 
 
@@ -299,6 +344,123 @@ async def _wait_for_created_debug_pod(
     reasons = ", ".join(metadata.get("waiting_reasons") or [])
     detail = reasons or metadata.get("phase") or wait_error or "not ready"
     return False, metadata, f"debug pod did not become Ready: {detail}"
+
+
+def _debug_has_oneshot_command(processed_args: list[str]) -> bool:
+    """Whether a debug call is ONE-SHOT COMMAND mode (``... -- CMD ...``).
+
+    Command mode runs CMD once and the pod terminates (Succeeded/Failed) — the
+    ``condition=Ready`` gate used by interactive mode NEVER becomes true there,
+    so waiting for it is a guaranteed false negative (task-29848471 k3 false
+    alarm). Two forms stay INTERACTIVE despite having tokens after ``--``:
+
+      - ``-- sleep <N>`` — the project's documented convention for node debug
+        (``MUST append -- sleep 3600``): a keep-alive placeholder so the
+        caller can ``kubectl exec`` afterwards. The pod stays Running/Ready.
+        Equivalent keep-alive spellings stay interactive too: an absolute
+        path sleep (``/bin/sleep 3600``) and a PURE sleep wrapped in a shell
+        (``sh -c 'sleep 3600'``). A composite script (``sh -c 'sleep 5 &&
+        df -h'``) is still one-shot — it terminates on its own.
+      - ``-it`` / ``-i`` / ``-t`` flags — interactive attach by intent.
+
+    A trailing bare ``--`` (no tokens) is interactive too.
+    """
+    interactive_flags = {"-it", "-i", "-t", "--stdin", "--tty"}
+    for tok in processed_args:
+        if tok == "--":
+            break
+        if tok in interactive_flags:
+            return False
+    if "--" not in processed_args:
+        return False
+    command = processed_args[processed_args.index("--") + 1:]
+    if not command:
+        return False  # trailing bare `--` — interactive
+    return not _is_keepalive_sleep(command)
+
+
+def _is_keepalive_sleep(command: list[str]) -> bool:
+    """Whether the debug CMD is a pure keep-alive sleep placeholder.
+
+    Covers the documented bare form (``sleep 3600``), the absolute-path
+    variant (``/bin/sleep``), and a shell wrapping NOTHING BUT a sleep
+    (``sh -c 'sleep 3600'`` / ``bash -c "sleep 60"``). Anything composite
+    (``sleep 30 && df -h``) returns False — it terminates on its own and
+    belongs to one-shot mode. Misclassifying a keep-alive as one-shot
+    kills the carrier pod the caller is about to exec into.
+    """
+    if not command:
+        return False
+    base = command[0].rsplit("/", 1)[-1]
+    if base == "sleep":
+        return True
+    if base in ("sh", "bash") and "-c" in command:
+        script = command[command.index("-c") + 1] if command.index("-c") + 1 < len(command) else ""
+        return bool(re.fullmatch(r"\s*sleep\s+\d+\s*", script or ""))
+    return False
+
+
+async def _wait_for_debug_pod_terminal(
+    pod_name: str,
+    namespace: str,
+    kubeconfig: str,
+    context: str,
+    cluster: str,
+) -> tuple[bool, dict, str]:
+    """Poll a one-shot debug pod until its phase is terminal.
+
+    Returns ``(terminal, metadata, error)``. Terminal means ``Succeeded`` or
+    ``Failed`` (the CMD ran to completion — success/failure of the COMMAND is
+    in ``metadata['exit_code']``, not here); a still-running pod at the budget
+    limit returns ``(False, last_metadata, ...)``. Budget is capped at 120s —
+    debug one-shots are probes, not long jobs.
+    """
+    wait_seconds = min(120, max(1, int(settings.timeout_kubectl_exec)))
+    deadline = asyncio.get_running_loop().time() + wait_seconds
+    last_error = ""
+    metadata: dict = {}
+    while True:
+        metadata, meta_error = await _debug_pod_metadata(
+            pod_name, namespace, kubeconfig, context, cluster,
+        )
+        if meta_error:
+            return False, {}, meta_error
+        phase = metadata.get("phase") or "Unknown"
+        if phase in ("Succeeded", "Failed"):
+            return True, metadata, ""
+        last_error = f"still in phase {phase}"
+        if asyncio.get_running_loop().time() >= deadline:
+            return False, metadata, (
+                f"one-shot debug pod did not terminate within {wait_seconds}s "
+                f"({last_error})"
+            )
+        await asyncio.sleep(2)
+
+
+async def _debug_pod_logs_tail(
+    pod_name: str,
+    namespace: str,
+    kubeconfig: str,
+    context: str,
+    cluster: str,
+    tail: int = 20,
+) -> str:
+    """Best-effort last ``tail`` log lines of a terminated debug pod."""
+    cmd = build_kubectl_cmd(
+        "logs", [pod_name, "-n", namespace, f"--tail={tail}"],
+        kubeconfig, context, cluster,
+    )
+    try:
+        target = TransportTarget.from_state({})
+        result = await execute_via_transport(
+            cmd, target, timeout=settings.timeout_kubectl, expect_profile=PROFILE_K8S,
+        )
+    except Exception:
+        logger.debug("Failed to fetch debug pod logs %s/%s", namespace, pod_name, exc_info=True)
+        return ""
+    if result.exit_code != 0:
+        return ""
+    return (result.stdout or "").strip()
 
 
 async def _wait_for_ephemeral_container(
@@ -530,106 +692,40 @@ async def kubectl(
     context: str = "",
     cluster: str = "",
 ) -> str:
-    """Phase 2 (execution) tool. Full kubectl with mutation subcommands bound.
-
-    Mutating: supports exec / delete / patch / label / annotate / apply /
-    scale / set / taint / cordon / uncordon / drain / rollout / debug and more.
-    ``edit`` and ``replace`` are NOT available (interactive / whole-object
-    overwrite) — express the change as ``patch``. ChaosBlade-aware:
-    auto-injects ``--timeout`` for ``exec ... blade create``.
-
-    NOT available in Phase 1 (planning); use ``kubectl_read`` there for
-    read-only inspection.
-
-    Single entry point covering all kubectl subcommands. Pick `subcommand` and
-    pass the rest of the CLI args as `v_args`.
+    """Phase 2 (execution): full kubectl incl. mutation. Pick `subcommand`,
+    pass remaining CLI args as `v_args`. NOT Phase 1 — use ``kubectl_read``.
 
     When to use:
-      - Cluster inspection in any phase (get / describe / top / logs).
-      - Phase 2 mutation (delete / patch / set / scale / cordon / uncordon /
-        taint / label / annotate / drain).
-      - Verification probing inside containers or on nodes (exec / debug).
-      - Creating non-workload resources (PV / PVC / Secret / ConfigMap):
-        use ``subcommand="apply"`` with ``v_args="-f -"`` and pass the
-        YAML via ``stdin_data``. Workload resources (Deployment, Pod, Job,
-        etc.) are blocked.
-      - Do NOT use ``exec ... | kubectl apply`` or ``exec ... kubectl create``
-        to create resources — this causes namespace drift and will be rejected.
+      - Any inspection/mutation; probing inside containers/on nodes.
+      - Non-workload resources (PV/PVC/Secret/ConfigMap) via ``apply`` +
+        YAML in ``stdin_data``; workload creation blocked.
 
     Inputs:
-      - subcommand: one of {get, describe, top, logs, exec, delete, patch, set,
-                            scale, cordon, uncordon, taint, label, annotate,
-                            drain, debug, apply}.
-      - v_args: subcommand arguments as a single shell-quoted string. Examples:
-          get      → "pods -n <ns> -o json"
-                     "pods -n <ns> -l app=nginx --field-selector=status.phase=Pending"
-                     "events -n <ns> --sort-by=.lastTimestamp"
-          describe → "pod <pod> -n <ns>"   |   "node <node>"
-          top      → "pod -n <ns> --sort-by=cpu"   |   "node <node>"
-          logs     → "<pod> -n <ns> --tail=50 --previous -c <container>"
-          exec     → "<pod> -n <ns> -- <cmd>"
-                     "<pod> -n chaosblade -- blade create k8s pod-cpu fullload --cpu-percent 80"
-          debug    → "node/<node> --profile=sysadmin --image=<cluster-image> -- sleep 3600"
-                     (then exec into the returned debug pod)
-          delete   → "pod <pod> -n <ns> --force --grace-period=0"
-          patch    → "pod <pod> -n <ns> --type=json -p '[{\\"op\\":\\"add\\",\\"path\\":\\"/metadata/labels/x\\",\\"value\\":\\"y\\"}]'"
-          label    → "node <node> chaos-target=<app> --overwrite"   |   "node <node> chaos-target-"
-          annotate → "node <node> <key>=<value> --overwrite"
-          scale    → "deployment <name> -n <ns> --replicas=0"
-          taint    → "nodes <node> key=value:NoSchedule"   |   "nodes <node> key-"
-          drain    → "<node> --ignore-daemonsets --delete-emptydir-data
-                      --grace-period=30 --timeout=120s"
-                     (``--force`` / ``--disable-eviction`` are refused: they
-                      delete pods no controller recreates, or bypass
-                      PodDisruptionBudgets. Recover with ``uncordon``.)
-          apply    → "-f -" (with stdin_data containing PV/PVC/Secret/ConfigMap YAML)
-        See knowledge resource `kubectl-recipes.md` for the long-tail catalogue.
-      - stdin_data: YAML content for ``apply -f -``. Pass the full YAML here
-        instead of embedding it in v_args or using exec heredoc.
-      - kubeconfig / context / cluster: optional overrides
-        (do NOT embed --kubeconfig in v_args — it is auto-stripped).
+      - subcommand: get|describe|top|logs|exec|delete|patch|set|scale|
+        cordon|uncordon|taint|label|annotate|drain|debug|apply;
+        ``edit``/``replace`` unavailable — use ``patch``.
+      - v_args: shell-quoted args (recipes: `kubectl-recipes.md`).
+      - stdin_data: YAML for ``apply -f -`` (not via v_args/exec heredoc).
+      - kubeconfig/context/cluster: overrides; never --kubeconfig in
+        v_args (auto-stripped).
 
-    Output: stdout from kubectl, or an "Error: ..." string on non-zero exit.
-            Large `get -o json` output gets a "⚠️ LARGE_OUTPUT" hint footer.
-            Empty `get -l ...` output gets a label-discovery hint footer.
+    Output: stdout, or "Error: ..." on non-zero exit.
 
-    Side effects:
-      - get / describe / top / logs / exec (read-only commands inside containers): none.
-      - delete / patch / set / scale / cordon / uncordon / taint / label /
-        annotate / drain / debug: mutate cluster state. Treat as Phase 2
-        actions and verify aftermath.
+    Side effects: read verbs none; all else mutates cluster state.
 
-    Self-help (IMPORTANT — use this instead of guessing from memory):
-      - Pass `--help` or `-h` in v_args to see the real usage of any subcommand.
-        Example: kubectl(subcommand="get", v_args="--help")
-      - This returns the live kubectl help text, which is ALWAYS more accurate
-        than documentation, skill instructions, or knowledge resources.
-      - When a command fails with an unknown flag or argument error, call
-        `--help` BEFORE retrying — do NOT guess from prior context.
-
-    Constraints (MUST READ before calling):
-      - No shell features: `|`, `;`, `&&`, `>`, `$()` are NOT supported. Use
-        `-l/--selector`, `--field-selector`, `-o jsonpath` instead of pipelines.
-      - `kubectl exec` rejects `-l/--selector` — first run `kubectl get` to
-        resolve a concrete pod name, then exec on that name. The flag is
-        auto-stripped with a warning if you forget.
-      - `kubectl debug node/<node> --image=busybox` MUST include `-- sleep 3600`
-        (or another keep-alive) — bare invocations exit immediately. Never pass
-        `-it` (verifier is non-interactive). Host paths inside the debug pod
-        live under `/host/...`.
-      - A debug pod used for host mutation MUST include `--profile=sysadmin`.
-        Use an image already verified as pullable in the current cluster; do
-        not assume a public image is reachable. Wait for this tool's structured
-        debug-pod result before exec and use the returned name/namespace.
-      - `exec ... blade create` auto-injects / auto-boosts `--timeout` to the
-        recommended minimum, mirroring blade_create's behavior. You can pass a
-        longer --timeout but cannot make it shorter.
-
-    Recovery patterns (translating manual operations to programmatic kubectl):
-      - "kubectl edit Pod" → patch with --type flag (strategic merge / json merge / json patch)
-      - "manually delete finalizers" → patch with --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
-      - "force delete a stuck Pod" → delete with --force --grace-period=0
-      - "remove a taint" → taint with the taint key followed by '-' (e.g., "nodes <node> key-")
+    Constraints:
+      - No shell features (`|`, `;`, `&&`, `>`, `$()`) — use
+        `-l/--selector`, `--field-selector`, `-o jsonpath`.
+      - `exec` rejects `-l/--selector` (auto-stripped) — resolve the pod
+        via `get` first.
+      - `debug node/<node>`: MUST append `-- sleep 3600`; never `-it`;
+        host paths under `/host/...`; host mutation needs
+        `--profile=sysadmin` + pullable image (recipes).
+      - `exec ... blade create` auto-injects/boosts `--timeout` (may
+        lengthen, not shorten).
+      - `drain` refuses `--force`/`--disable-eviction`; recover via
+        `uncordon`.
+      - Unknown-flag error → `--help`; do NOT guess and retry.
     """
     return await _kubectl_impl(subcommand, v_args, kubeconfig, context, cluster, stdin_data=stdin_data)
 
@@ -680,7 +776,11 @@ async def _kubectl_impl(
         processed_args = _split_args(v_args)
 
     debug_namespace = ""
+    _debug_start_ts = 0.0
     if subcommand == "debug":
+        # Wall-clock anchor BEFORE dispatch: the parse-failure discovery
+        # fallback filters candidates by creationTimestamp recency.
+        _debug_start_ts = time.time()
         debug_namespace = _namespace_from_args(processed_args)
         if not debug_namespace:
             debug_namespace = await _resolve_effective_namespace(
@@ -843,12 +943,118 @@ async def _kubectl_impl(
             )
             return output
 
-        _debug_pod = _parse_debug_pod_name(output)
+        # Single parsing source — shared with baseline/verifier/recover
+        # (lazy import: _debug_pod imports build_kubectl_cmd from here).
+        from chaos_agent.agent.nodes.execute._debug_pod import (
+            discover_created_debug_pod,
+            parse_debug_pod_name,
+        )
+        _debug_pod = parse_debug_pod_name(output)
         if not _debug_pod:
+            # Discovery fallback (node scope only): one live get-pods filtered
+            # by spec.nodeName + node-debugger- prefix + recency. Only runs on
+            # the parse-failure path; the normal path pays zero extra cost.
+            _node = _debug_target_node_name(processed_args)
+            if _node:
+                _debug_pod = await discover_created_debug_pod(
+                    _node, _debug_ns, _debug_start_ts,
+                    kubeconfig, context, cluster,
+                )
+                if _debug_pod:
+                    output += (
+                        f"\n(kubectl printed no pod name; discovered "
+                        f"'{_debug_pod}' on node '{_node}' via live lookup.)"
+                    )
+        if not _debug_pod:
+            # Parse AND discovery both failed. Exit 0 + no pod name means the
+            # create may never have executed at all (transport drop,
+            # API-server reject without event). Telling the model to retry
+            # the SAME command is what burned the k3 budget three rounds in
+            # a row (task-29848471).
             return (
-                "Error: kubectl debug created no identifiable pod. "
+                "Error: kubectl debug returned exit 0 but no debug pod name "
+                "could be identified. The create may never have executed — "
+                "this is NOT evidence the command is wrong. Do NOT retry the "
+                "same command blindly; first verify the current cluster state "
+                "or use a different path to reach the target. "
                 f"Raw output: {output}"
             )
+        _profile = _extract_debug_profile(v_args)
+
+        # ---- One-shot COMMAND mode (`debug ... -- CMD`): the pod runs CMD
+        # once and terminates. condition=Ready is never true there, so waiting
+        # for it is a guaranteed false negative — poll the terminal phase and
+        # report the COMMAND's exit code instead (task-29848471 false alarm).
+        if _debug_has_oneshot_command(processed_args):
+            terminal, metadata, terminal_error = await _wait_for_debug_pod_terminal(
+                _debug_pod, _debug_ns, kubeconfig, context, cluster,
+            )
+            if metadata.get("namespace"):
+                _debug_ns = metadata["namespace"]
+            logs_tail = await _debug_pod_logs_tail(
+                _debug_pod, _debug_ns, kubeconfig, context, cluster,
+            )
+            # A finished one-shot has served its purpose — remove it whether
+            # the command succeeded or not; task-level cleanup remains the
+            # second safety net.
+            cleaned = await _delete_created_debug_pod(
+                _debug_pod, _debug_ns, kubeconfig, context, cluster,
+            )
+            if terminal:
+                _exit = metadata.get("exit_code")
+                if _exit is None and metadata.get("phase") == "Failed":
+                    _exit = 1  # Failed pod without an exitCode — non-zero by definition
+                elif _exit is None and metadata.get("phase") == "Succeeded":
+                    # containerStatuses can lag behind the phase; a Succeeded
+                    # pod is exit 0 by definition (else it would be Failed).
+                    _exit = 0
+                meta_payload = {
+                    **metadata,
+                    "name": metadata.get("name") or _debug_pod,
+                    "namespace": _debug_ns,
+                    "ready": _exit == 0,
+                    "cleaned": cleaned,
+                    "debug_profile": _profile,
+                    "oneshot": True,
+                }
+                meta_tag = json.dumps(meta_payload, ensure_ascii=True, separators=(",", ":"))
+                _logs_section = f"\nCommand output (logs tail):\n{logs_tail}" if logs_tail else ""
+                if _exit == 0:
+                    return (
+                        f"{output}\n\n[debug-pod-meta: {meta_tag}]"
+                        f"\n[debug-pod-ns: {_debug_ns}]"
+                        f"\nOne-shot debug command completed with exit_code=0."
+                        f"{_logs_section}\n"
+                        "The debug pod has been removed; there is NOTHING to clean up."
+                    )
+                return (
+                    f"Error: one-shot debug command failed with exit_code={_exit}.\n"
+                    f"[debug-pod-meta: {meta_tag}]\n"
+                    f"The debug pod has been removed.{_logs_section}"
+                )
+            # Budget expired before termination — leave the pod for follow-up.
+            meta_payload = {
+                **metadata,
+                "name": metadata.get("name") or _debug_pod,
+                "namespace": _debug_ns,
+                "ready": False,
+                "cleaned": cleaned,
+                "debug_profile": _profile,
+                "oneshot": True,
+            }
+            meta_tag = json.dumps(meta_payload, ensure_ascii=True, separators=(",", ":"))
+            return (
+                f"Error: {terminal_error}.\n"
+                f"[debug-pod-meta: {meta_tag}]\n"
+                + (
+                    "The still-running pod was cleaned up automatically."
+                    if cleaned
+                    else f"Cleanup failed; delete pod {_debug_pod} -n {_debug_ns} when done."
+                )
+            )
+
+        # ---- INTERACTIVE mode (`debug ... -- sleep N` style, or no `--`):
+        # the pod must become Ready so the caller can exec into it.
         ready, metadata, ready_error = await _wait_for_created_debug_pod(
             _debug_pod, _debug_ns, kubeconfig, context, cluster,
         )
@@ -859,10 +1065,8 @@ async def _kubectl_impl(
             cleaned = await _delete_created_debug_pod(
                 _debug_pod, _debug_ns, kubeconfig, context, cluster,
             )
-        # Extract --profile value from v_args so debug-pod-meta carries
-        # the profile the Agent requested (needed by carrier resolution
-        # and useful for debugging).
-        _profile = _extract_debug_profile(v_args)
+        # _profile was extracted above the oneshot branch; debug-pod-meta
+        # carries it for carrier resolution and diagnostics.
         meta_payload = {
             **metadata,
             "name": metadata.get("name") or _debug_pod,
@@ -946,51 +1150,39 @@ async def kubectl_read(
     context: str = "",
     cluster: str = "",
 ) -> str:
-    """READ-ONLY kubectl — the single observation tool for every read-only
-    phase (intent / planning / verification).
+    """READ-ONLY kubectl — the observation tool for every read-only phase
+    (intent/planning/verification).
 
-    Read-only BY ENFORCEMENT: read verbs (get/describe/top/logs/version/
-    cluster-info/api-resources/explain/auth) always; ``exec``/``debug`` only when
-    the inner command is a read-only probe. A mutating inner command
-    (``iptables -A``, ``ip link set``, ``systemctl stop``, ``dd``, ``dmesg -C``,
-    redirection/chaining, ``chroot``/``nsenter`` escapes) is REJECTED with the
-    specific reason — fault INJECTION is Phase 2 (full ``kubectl``, after the
-    plan is approved).
+    Read-only BY ENFORCEMENT: read verbs always; ``exec``/``debug`` only
+    for read-only probes; mutating inner commands are REJECTED — fault
+    INJECTION is Phase 2.
 
     When to use:
-      - Confirm a target exists / inspect state, labels, events (`get`, `describe`).
-      - Capture / compare metrics (`top`); read logs (`logs`).
-      - Discover the API (`api-resources`, `explain`); check perms (`auth can-i`).
-      - Probe INSIDE a pod, read-only (`exec`):
-          binary/file exists → ``exec <pod> -n <ns> -- ls /usr/bin/stress-ng``
-          dns / http / procs → ``-- nslookup <svc>`` · ``-- wget -qO- <url>`` · ``-- ps aux``
-          netfilter rules    → ``-- iptables -L``
-          pipe / filter      → ``-- sh -c "ps aux | grep java"`` (every stage read-only)
-      - Probe a node's host fs / kernel / image CAPABILITY via a debug pod
-        (`debug` — allowed in EVERY read-only phase, INCLUDING planning/intent,
-        as a capability probe; it creates an ephemeral Pod that is auto-cleaned
-        when the phase ends):
-          ``debug node/<node> --image=<cluster-image> -- sleep 60`` then
-          ``exec <debug-pod> -n default -- which sh chroot`` or
-          ``exec <debug-pod> -n default -- cat /host/proc/loadavg`` (host paths
-          under ``/host/...``). Use a SHORT keep-alive (``-- sleep 60``) for
-          probes; never ``-it``. Use this in PLANNING to verify a candidate
-          debug image actually carries the binaries your plan needs
-          (e.g. ``sh``/``chroot``) BEFORE committing to it.
+      - Read-only inspection: `get`/`describe`/`top`/`logs`/
+        `api-resources`/`explain`/`auth can-i`.
+      - Read-only probes inside a pod (`exec`); pipes via read-only
+        ``sh -c``.
+      - Node host fs/kernel: ``debug node/<node> --image=<cluster-image>
+        -- sleep 60`` then exec into it (paths ``/host/...``); allowed in
+        EVERY read-only phase, auto-cleaned at phase end. In PLANNING,
+        verify the image carries your plan's binaries BEFORE committing.
 
-    exec/debug constraints:
-      - Bare shell operators between args don't work (exec is shell=False); to
-        pipe/filter, wrap in ``sh -c "..."`` and keep EVERY stage read-only.
-        Redirection ``>``, chaining ``;`` / ``&&``, backgrounding ``&`` are rejected.
-      - No ``-l/--selector`` (resolve the pod name via `get` first); no ``-it``.
+    Inputs:
+      - subcommand: Literal-enforced (see signature).
+      - v_args: same shape as the full ``kubectl`` tool.
+      - kubeconfig/context/cluster: optional overrides.
 
-    Self-help: pass ``--help`` / ``-h`` in v_args for the live usage of any
-    subcommand — ALWAYS more accurate than memory; call it BEFORE retrying an
-    unknown-flag/argument error rather than guessing.
+    Output: same as the full ``kubectl`` tool (stdout / "Error: ...").
 
-    Inputs / Output: same shape as the full ``kubectl`` tool. Thin wrapper that
-    re-uses ``kubectl``'s execution logic with the subcommand domain
-    constrained and ``exec``/``debug`` inner commands gated to read-only.
+    Side effects: none on cluster state; `debug` creates an ephemeral
+        probe Pod, auto-cleaned at phase end.
+
+    Constraints:
+      - No bare shell operators (shell=False); ``>``, ``;``, ``&&``, ``&``
+        rejected.
+      - exec: no ``-l/--selector`` (resolve the pod via `get`); no
+        ``-it``; SHORT keep-alive for debug (``-- sleep 60``).
+      - Unknown-flag error → ``--help`` in v_args rather than guessing.
     """
     # Belt-and-braces: even if Literal validation is bypassed, reject any
     # subcommand outside the read-only set at runtime.

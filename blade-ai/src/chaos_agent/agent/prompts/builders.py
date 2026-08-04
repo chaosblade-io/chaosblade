@@ -27,7 +27,7 @@ from chaos_agent.agent.prompts.assembly import (
     PromptSegment,
     assemble_prompt,
 )
-from chaos_agent.transports import PROFILE_K8S
+from chaos_agent.transports import PROFILE_K8S, PROFILE_UNKNOWN
 from chaos_agent.agent.prompts.sections import (
     get_role_section,
     get_executor_role_section,
@@ -251,6 +251,14 @@ def build_inject_system_prompt(
             "contract",
         ))
 
+    # Progress ledger (planning phase). Empty until the model records something;
+    # during planning it carries no anchor (b-plan) — just state/log. "contract"
+    # rather than "context": a dropped ledger would silently remove the model's
+    # own anti-drift anchor and the only record an interrupted turn can report.
+    _ledger_section = kwargs.get("progress_ledger_section") or ""
+    if _ledger_section:
+        sections.append(("progress_ledger", _ledger_section, "contract"))
+
     return _assemble(PromptMode.FULL, sections)
 
 
@@ -305,8 +313,16 @@ def build_execute_system_prompt(
             plan_path=plan_path,
         ), "invariant"),
         ("replan_contract", get_replan_directive_for_execution(), "contract"),
-        ("remember", get_executor_remember_section(), "invariant"),
     ])
+    # Progress ledger: re-injected each round as the drift anchor. "contract"
+    # priority so a tight budget can never drop it (see the planning builder);
+    # placed late for recency. Empty until the executor first records something.
+    _ledger_section = kwargs.get("progress_ledger_section") or ""
+    if _ledger_section:
+        sections.append(("progress_ledger", _ledger_section, "contract"))
+    sections.append(
+        ("remember", get_executor_remember_section(), "invariant"),
+    )
     return _assemble(PromptMode.MINIMAL, sections)
 
 
@@ -322,7 +338,6 @@ def build_verifier_prompt(profile: str = PROFILE_K8S, **kwargs) -> str:
 
     MUST preserve 'JSON' keyword for Bailian API response_format compatibility.
     """
-    _ = kwargs
     experience = get_experience_section()
 
     sections: list[tuple[str, str, PromptPriority]] = [
@@ -335,8 +350,14 @@ def build_verifier_prompt(profile: str = PROFILE_K8S, **kwargs) -> str:
         ("environment_profile", _environment_prompt_fragment(profile, "verify"), "context"),
         ("verification_heuristics", get_verification_heuristics_compact_section(), "context"),
         ("output_contract", get_verifier_output_format_section(), "contract"),
-        ("remember", get_verifier_remember_section(), "invariant"),
     ]
+    # Progress ledger: re-injected so the verifier stays anchored to the frozen
+    # goal and can record what it establishes (empty until something is recorded).
+    # "contract" so a tight budget cannot drop it.
+    _ledger_section = kwargs.get("progress_ledger_section") or ""
+    if _ledger_section:
+        sections.append(("progress_ledger", _ledger_section, "contract"))
+    sections.append(("remember", get_verifier_remember_section(), "invariant"))
     return _assemble(PromptMode.VERIFICATION, sections)
 
 
@@ -362,15 +383,39 @@ def build_intent_clarification_prompt(
     Returns:
         Assembled system prompt string.
     """
-    # Intent recognition is deliberately independent of the configured
-    # transport.  In semantic mode it sees the complete skill catalog; the
-    # later feasibility stage validates the selected fault family against the
-    # actual environment profile.
+    # Intent recognition stays independent of the configured transport in the
+    # sense that matters: the full skill catalog is always shown and no fault
+    # family is filtered out — feasibility is still validated later.
+    #
+    # What it does get is the *fact* of which channel is configured, when that
+    # fact is known. Without it the model had no objective signal at all and
+    # had to infer the environment from the user's wording; a host-channel
+    # environment then loaded ``k8s-chaos-skills`` because that skill's
+    # description claimed the generic fallback. Stating a known profile is
+    # information, not a restriction.
+    #
+    # ``unknown`` is deliberately treated as "not known" rather than passed
+    # through: its fragment reads "environment profile is unsupported. Do not
+    # attempt injection…", which would tell users their environment cannot be
+    # drilled at all — strictly worse than the previous behaviour. So an
+    # unresolvable channel yields ``None`` and the section is simply omitted.
     semantic_only = bool(kwargs.get("semantic_only"))
-    profile = None if semantic_only else kwargs.get("profile", PROFILE_K8S)
+    profile = kwargs.get("profile", None if semantic_only else PROFILE_K8S)
+    if profile == PROFILE_UNKNOWN:
+        profile = None
 
     sections: list[tuple[str, str, PromptPriority]] = [
         ("role", get_intent_role_section(semantic_only=semantic_only), "invariant"),
+        # Second, ahead of the sections that drive behaviour. It used to sit
+        # thirteenth (~68% into the prompt) between the output contract and the
+        # skill index, and there it read as trivia: across 10-sample A/B runs the
+        # model offered the user a menu of Kubernetes / host / python-agent
+        # faults on a Kubernetes-only channel and never stated the bound
+        # environment unprompted. Moving it here, with the intent-phase wording
+        # that adds the consequence and the next move, took "offers families this
+        # channel cannot run" to 0/10 and "states the environment itself" to
+        # 8/10.
+        ("environment_profile", _environment_prompt_fragment(profile, "intent"), "context"),
         ("priorities", get_intent_priorities_section(semantic_only=semantic_only), "invariant"),
         ("dialogue_routing", get_intent_dialogue_routing_section(), "context"),
         ("parameter_model", get_intent_parameter_model_section(), "context"),
@@ -384,7 +429,6 @@ def build_intent_clarification_prompt(
         ("reflection", get_intent_reflection_section(semantic_only=semantic_only), "context"),
         ("capability_boundary", get_intent_capability_boundary_section(), "context"),
         ("output_contract", get_intent_output_section(), "contract"),
-        ("environment_profile", _environment_prompt_fragment(profile, "intent"), "context"),
         ("skill_catalog", get_skill_index_section(skill_catalog), "optional"),
         ("cache_boundary", CACHE_BOUNDARY.strip(), "contract"),
     ]

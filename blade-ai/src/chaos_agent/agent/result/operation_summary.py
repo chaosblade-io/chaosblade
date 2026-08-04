@@ -20,8 +20,9 @@ from chaos_agent.agent.state import extract_ui_diagnostics, infer_task_state
 
 
 POST_OPERATION_FRESHNESS_NOTE = (
-    "后续目标建议: 本概要及更早历史中的资源名仅作历史上下文；"
-    "若要复用这些目标，必须重新 kubectl 验证当前存在性。"
+    "Advice for follow-up targets: resource names in this summary and in earlier "
+    "history are historical context only; to reuse any of these targets, their "
+    "current existence MUST be re-verified with kubectl."
 )
 
 
@@ -100,22 +101,122 @@ def build_task_summary(state_values: Mapping[str, Any] | None, task_id: str) -> 
 
     parts = [
         f"[Task Summary] task_id={task_id}",
-        f"类型: {fault_type} | 目标: {target_text}",
-        f"结果: {task_state} | blade_uid: {blade_uid}",
+        f"Type: {fault_type} | Target: {target_text}",
+        f"Result: {task_state} | blade_uid: {blade_uid}",
     ]
-    verification_line = _format_verification_line("验证", verification)
+    verification_line = _format_verification_line("Verification", verification)
     if verification_line:
         parts.append(verification_line)
     if diagnostics.get("side_effects_summary"):
-        parts.append(f"副作用: {diagnostics['side_effects_summary']}")
+        parts.append(f"Side effects: {diagnostics['side_effects_summary']}")
     if diagnostics.get("failure_reason"):
-        parts.append(f"失败原因: {diagnostics['failure_reason']}")
+        parts.append(f"Failure reason: {diagnostics['failure_reason']}")
     parts.append(POST_OPERATION_FRESHNESS_NOTE)
     return OperationSummary(kind="inject", text="\n".join(parts))
 
 
 def build_task_summary_text(state_values: Mapping[str, Any] | None, task_id: str) -> str:
     return build_task_summary(state_values, task_id).text
+
+
+def append_ledger_process_detail(
+    summary_text: str, state_values: Mapping[str, Any] | None,
+) -> str:
+    """Append the progress ledger's process detail below a summary headline.
+
+    One coherent record, not two overlapping ones: the ledger's established
+    facts + milestone log are appended after the (deterministic) summary. The
+    ledger's anchor is omitted because the goal is already in the summary, so
+    nothing is repeated. Degrades to the plain summary when the ledger is empty.
+    Shared by the inject and recover mirror paths.
+    """
+    from chaos_agent.agent.progress_ledger import render_ledger
+    ledger = dict(state_values or {}).get("progress_ledger")
+    process_detail = render_ledger(ledger, include_anchor=False)
+    if not process_detail:
+        return summary_text
+    return f"{summary_text}\n\nProgress detail (executor's own record):\n{process_detail}"
+
+
+def build_operation_record(state_values: Mapping[str, Any] | None, task_id: str) -> str:
+    """Compose the SINGLE record mirrored to the intent graph on inject success.
+
+    The deterministic task summary is the authoritative headline (type / target
+    / result / verification), and the progress ledger's process detail is
+    appended below it via :func:`append_ledger_process_detail`.
+    """
+    return append_ledger_process_detail(
+        build_task_summary_text(state_values, task_id), state_values,
+    )
+
+
+#: Why a turn ended without completing, in the wording shown to the intent graph.
+INTERRUPT_CAUSES = {
+    "user_cancel": "cancelled by the user mid-operation",
+    "confirm_timeout": "confirmation card timed out with no response",
+    "disconnected": "client connection dropped",
+    "internal_error": "an internal error interrupted this turn",
+}
+_INTERRUPT_DETAIL_LIMIT = 200
+
+
+def build_interrupted_record(
+    state_values: Mapping[str, Any] | None,
+    task_id: str,
+    *,
+    cause: str,
+    error_detail: str = "",
+) -> str:
+    """Compose the SINGLE record mirrored to intent when a turn is INTERRUPTED.
+
+    Symmetric to :func:`build_operation_record`, but there is no completed
+    outcome to summarise — so the progress ledger IS the record: what the
+    executor had established and how far it got, plus why it stopped. The
+    ledger's own ``status`` markers are preserved, so a finding the executor
+    never verified is not presented to the next dialogue turn as fact.
+
+    The closing line is advisory, never imperative: it tells the user what may
+    still be live and suggests checking, it does not order a recovery.
+    """
+    cause_text = INTERRUPT_CAUSES.get(cause, cause or "unknown reason")
+    parts = [f"[Task Interrupted] task_id={task_id}", f"Cause: {cause_text}"]
+
+    values = dict(state_values or {})
+    # Identify WHAT was interrupted, from state rather than from the ledger. The
+    # ledger has no anchor during planning (the FaultSpec is still converging) and
+    # the model may not have recorded anything at all — without this the dialogue
+    # would learn only that "something was cancelled", and a follow-up like "try
+    # again" would have no referent.
+    _fault_type = fault_type_from_state(values) if values else ""
+    _target = _format_state_target(values) if values else ""
+    if _fault_type or _target:
+        parts.append(f"Type: {_fault_type} | Target: {_target}")
+
+    if error_detail:
+        parts.append(f"Error detail: {error_detail[:_INTERRUPT_DETAIL_LIMIT]}")
+
+    from chaos_agent.agent.progress_ledger import render_ledger
+    ledger_text = render_ledger(values.get("progress_ledger"))
+    if ledger_text:
+        parts.append("")
+        parts.append("Progress before the interruption (executor's own record):")
+        parts.append(ledger_text)
+    else:
+        parts.append(
+            "The executor left no progress record, so how far it got cannot be "
+            "determined."
+        )
+
+    # Advisory, not a command: state what may be live and suggest a check.
+    if values.get("blade_uid") or values.get("execution_artifacts"):
+        parts.append(
+            "Note: this operation already made real changes and was not fully "
+            "verified, so the target may still be in a faulted state. Checking "
+            "its live status first is advisable; if the fault is confirmed to be "
+            "still in effect, a recovery can be run."
+        )
+    parts.append(POST_OPERATION_FRESHNESS_NOTE)
+    return "\n".join(parts)
 
 
 def build_batch_summary(
@@ -130,7 +231,7 @@ def build_batch_summary(
 
     parts = [
         f"[Batch Summary] {len(results)} faults",
-        "操作: batch_inject",
+        "Operation: batch_inject",
     ]
     for idx, result in enumerate(results):
         if not isinstance(result, Mapping):
@@ -148,10 +249,10 @@ def build_batch_summary(
         )
         failure_reason = result.get("failure_reason") or result.get("error")
         if failure_reason:
-            parts.append(f"     失败原因: {failure_reason}")
+            parts.append(f"     Failure reason: {failure_reason}")
 
     if batch_pm_path:
-        parts.append(f"批量分析报告: {batch_pm_path}")
+        parts.append(f"Batch analysis report: {batch_pm_path}")
     parts.append(POST_OPERATION_FRESHNESS_NOTE)
     return OperationSummary(kind="batch_inject", text="\n".join(parts))
 
@@ -190,16 +291,16 @@ def build_recover_summary(
     parts = [
         f"[Recover Summary] task_id={task_id}",
         f"parent_task_id: {parent_task_id}",
-        f"类型: {fault_type} | 目标: {target_text}",
-        f"结果: {task_state} | blade_uid: {blade_uid}",
+        f"Type: {fault_type} | Target: {target_text}",
+        f"Result: {task_state} | blade_uid: {blade_uid}",
     ]
     verification_line = _format_verification_line(
-        "恢复验证",
+        "Recovery verification",
         verification if isinstance(verification, Mapping) else None,
     )
     if not verification_line and isinstance(verification, Mapping):
         verification_line = (
-            "恢复验证: "
+            "Recovery verification: "
             f"{verification.get('level', '?')} "
             f"(L1={verification.get('layer1', {}).get('status', '?')}, "
             f"L2={verification.get('layer2', {}).get('status', '?')})"
@@ -207,7 +308,7 @@ def build_recover_summary(
     if verification_line:
         parts.append(verification_line)
     if data.get("error"):
-        parts.append(f"失败原因: {data['error']}")
+        parts.append(f"Failure reason: {data['error']}")
     parts.append(POST_OPERATION_FRESHNESS_NOTE)
     return OperationSummary(kind="recover", text="\n".join(parts))
 

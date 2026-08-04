@@ -1752,3 +1752,74 @@ class TestK8sProfileBaseline:
         mock_create.assert_awaited_once()
         mock_delete.assert_awaited_once()
         assert result["baseline_data"]["source"] == "registry"
+
+# ---------------------------------------------------------------------------
+# Retry memory
+# ---------------------------------------------------------------------------
+
+
+class TestRetryRemembersWhatItTried:
+    """Each retry is a fresh LLM call with no memory of the previous one.
+
+    Without the tried-command list the prompt is byte-identical every round, so
+    the model can only resample. task-fc64c982: the node had no debug pod, and
+    two of the three retries both emitted ``kubectl exec {debug_pod} -- pidof
+    containerd`` — 71s spent before the third happened to change approach.
+    """
+
+    FAILED = [{
+        "description": "containerd process status",
+        "command": "kubectl exec {debug_pod} -n chaosblade -- pgrep containerd",
+        "exit_code": -1,
+        "stdout": "",
+        "stderr": "No debug pod or tool pod available for node node-1",
+    }]
+
+    def _llm(self, captured: list):
+        class _Resp:
+            content = ('[{"description": "containerd process status", '
+                       '"command": "kubectl describe node node-1", "mode": "simple"}]')
+            additional_kwargs: dict = {}
+
+        class _LLM:
+            async def ainvoke(_self, messages):
+                captured.append(messages[-1].content)
+                return _Resp()
+
+        return _LLM()
+
+    async def _retry(self, captured, already_tried):
+        return await _llm_retry_failed_commands(
+            self._llm(captured), "skill case body", "node", "process", "stop",
+            self.FAILED, names=("node-1",), already_tried=already_tried,
+        )
+
+    async def test_history_changes_the_prompt(self):
+        captured: list[str] = []
+        await self._retry(captured, ())
+        await self._retry(captured, ("kubectl exec {debug_pod} -- pidof containerd",))
+        assert captured[0] != captured[1]
+
+    async def test_the_first_retry_has_no_history_section(self):
+        captured: list[str] = []
+        await self._retry(captured, ())
+        assert "Already attempted" not in captured[0]
+
+    async def test_tried_commands_are_listed_verbatim(self):
+        """The LLM's own text, template placeholder intact — that is what it
+        must recognise as "mine"."""
+        captured: list[str] = []
+        tried = (
+            "kubectl exec {debug_pod} -n chaosblade -- pidof containerd",
+            "kubectl exec {debug_pod} -n chaosblade -- ps aux",
+        )
+        await self._retry(captured, tried)
+        for cmd in tried:
+            assert cmd in captured[0]
+
+    async def test_the_instruction_rules_out_equivalent_variants(self):
+        """Re-emitting ``pgrep`` after ``pidof`` failed is the actual failure
+        mode, so forbidding the exact string is not enough."""
+        captured: list[str] = []
+        await self._retry(captured, ("kubectl exec {debug_pod} -- pidof containerd",))
+        assert "variant that would fail the same way" in captured[0]

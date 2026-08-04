@@ -187,6 +187,7 @@ async def finalize_inject_session(
                 mode=result_summary_mode,
             ),
             status=status_override or inject_session_status(data),
+            progress_ledger=values_fin.get("progress_ledger") if values_fin else None,
         )
     except Exception:
         log = logger.warning if error_log_level == "warning" else logger.debug
@@ -248,6 +249,7 @@ async def finalize_recover_session(
                 mode=result_summary_mode,
             ),
             status=status,
+            progress_ledger=values_fin.get("progress_ledger") if values_fin else None,
         )
     except Exception:
         log = logger.warning if error_log_level == "warning" else logger.debug

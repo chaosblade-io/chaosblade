@@ -10,6 +10,7 @@ from chaos_agent.agent.nodes.verify._verifier_finalize import (
     _format_verification_detail,
     _build_verify_replan_context,
     _cleanup_residuals,
+    _retired_uids_from_residuals,
 )
 from chaos_agent.agent.result.verdict import Layer1Result
 
@@ -265,3 +266,54 @@ class TestCleanupResiduals:
             assert cleaned[0]["type"] == "running_experiment"
             assert "failed" in cleaned[0]["cleanup_result"]
             assert "connection refused" in cleaned[0]["cleanup_result"]
+
+
+class TestRetiredUidsFromResiduals:
+    """Tests for _retired_uids_from_residuals (verify-replan UID retirement).
+
+    Only UIDs whose destroy genuinely succeeded may be retired; a failed
+    destroy may leave a live experiment that must stay visible to recovery.
+    """
+
+    def test_successful_destroy_retired(self):
+        residuals = [
+            {"type": "running_experiment", "id": "uid-1",
+             "cleanup_result": '{"code":200,"success":true}'},
+        ]
+        assert _retired_uids_from_residuals(residuals) == ["uid-1"]
+
+    def test_exception_failure_not_retired(self):
+        residuals = [
+            {"type": "running_experiment", "id": "uid-1",
+             "cleanup_result": "failed: connection refused"},
+        ]
+        assert _retired_uids_from_residuals(residuals) == []
+
+    def test_soft_error_not_retired(self):
+        """blade_destroy returns 'Error: ...' on exit-code failure without
+        raising — such a UID may still be live and must NOT be retired."""
+        residuals = [
+            {"type": "running_experiment", "id": "uid-1",
+             "cleanup_result": "Error: blade destroy failed (exit 1): not found"},
+        ]
+        assert _retired_uids_from_residuals(residuals) == []
+
+    def test_non_experiment_types_ignored(self):
+        residuals = [
+            {"type": "debug_pod", "id": "pod-1", "cleanup_result": "deleted"},
+            {"type": "running_experiment", "id": "", "cleanup_result": "ok"},
+            {"type": "running_experiment", "cleanup_result": "ok"},
+        ]
+        assert _retired_uids_from_residuals(residuals) == []
+
+    def test_empty_residuals(self):
+        assert _retired_uids_from_residuals([]) == []
+
+    def test_mixed_residuals(self):
+        residuals = [
+            {"type": "running_experiment", "id": "uid-ok",
+             "cleanup_result": '{"code":200,"success":true}'},
+            {"type": "running_experiment", "id": "uid-err",
+             "cleanup_result": "Error: blade destroy failed"},
+        ]
+        assert _retired_uids_from_residuals(residuals) == ["uid-ok"]

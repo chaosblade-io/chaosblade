@@ -20,7 +20,7 @@ class TestSafetyCheck:
         result = await safety_check(state)
         # No kubeconfig + kubeconfig mode → conflict check skipped → warning
         assert result["safety_status"] == "warning"
-        assert "集群连接" in result["safety_reason"]
+        assert "cluster access" in result["safety_reason"]
 
     @pytest.mark.asyncio
     async def test_all_checks_pass_with_kubeconfig(self, sample_agent_state, monkeypatch):

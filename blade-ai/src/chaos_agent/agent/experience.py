@@ -184,20 +184,20 @@ def _default_agent_md_template() -> str:
     return """# Blade AI Experience Log
 
 ## Safety Rules
-<!-- 安全相关经验：哪些操作需要格外谨慎 -->
+<!-- Safety lessons: which operations demand extra caution -->
 
 ## Fault Injection
-<!-- 故障注入相关经验：命令构造、参数选择、常见陷阱 -->
+<!-- Injection lessons: command construction, parameter choice, common traps -->
 
 ## Verification
-<!-- 验证相关经验：验证策略、常见误判、最小化容器环境处理 -->
+<!-- Verification lessons: strategies, common misjudgements, minimal container environments -->
 
 ## Recovery
-<!-- 恢复相关经验：恢复失败处理、级联故障、残留清理 -->
+<!-- Recovery lessons: handling failed recovery, cascading faults, leftover cleanup -->
 
 ## K8s Cluster
-<!-- 集群特定经验：集群配置差异、权限问题、网络策略 -->
+<!-- Cluster-specific lessons: config differences, permission issues, network policies -->
 
 ## Host
-<!-- 主机特定经验：主机连接、原生命令载体、反向恢复陷阱 -->
+<!-- Host-specific lessons: host connectivity, native command carriers, reverse-recovery traps -->
 """

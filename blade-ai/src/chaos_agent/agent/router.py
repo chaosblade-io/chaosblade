@@ -1,5 +1,6 @@
 """Router functions: conditional edges for the inject graph."""
 
+import logging
 import time
 
 from langchain_core.messages import AIMessage, ToolMessage
@@ -43,6 +44,8 @@ from chaos_agent.agent.spec.fault_spec import (
 )
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _wall_clock_exceeded(state: AgentState) -> bool:
@@ -302,6 +305,10 @@ def _planning_contract_route(
 
     expected = read_fault_spec(state)
     if expected is None:
+        logger.warning(
+            "planning route: propose_plan_change without a reviewed "
+            "FaultSpec in state; staying in the agent loop",
+        )
         return AGENT_LOOP
 
     args = _tool_call_args_for_result(
@@ -310,20 +317,57 @@ def _planning_contract_route(
         tool_call_id=tool_call_id,
     )
     if args is None:
+        logger.warning(
+            "planning route: propose_plan_change ToolMessage has no owning "
+            "tool_call; staying in the agent loop",
+        )
         return AGENT_LOOP
 
     try:
         revision = int(args.get("fault_revision"))
     except (TypeError, ValueError):
+        logger.warning(
+            "planning route: propose_plan_change without a parseable "
+            "fault_revision; staying in the agent loop",
+        )
         return AGENT_LOOP
     raw_fault = args.get("proposed_fault")
-    if not is_full_fault_spec_proposal(raw_fault) or revision != expected.revision:
+    if not is_full_fault_spec_proposal(raw_fault):
+        # Task-5193538b: no silent discard. The tool surface now refuses
+        # partial contracts with the missing-field list (its "Error:" reply
+        # keeps this branch unreachable in normal flow); if a partial
+        # proposal still arrives, log it instead of dropping it quietly.
+        logger.warning(
+            "planning route: propose_plan_change carried a partial "
+            "FaultSpec proposal; staying in the agent loop "
+            "(the tool reply should have listed the missing fields)",
+        )
         return AGENT_LOOP
     actual = FaultSpec.from_intent_args(raw_fault, existing=expected)
     if not actual.is_complete:
+        logger.warning(
+            "planning route: propose_plan_change proposal failed FaultSpec "
+            "completion checks; staying in the agent loop",
+        )
         return AGENT_LOOP
-    if actual.contract_dict() == expected.contract_dict():
-        return AGENT_LOOP
+    if revision != expected.revision or actual.contract_dict() == expected.contract_dict():
+        # Task-5193538b: used to return AGENT_LOOP silently — the model was
+        # told "Plan change proposed." and nothing ever happened. Both
+        # conditions are RECOVERABLE mistakes, and plan_change_confirm
+        # already answers them with an actionable [PLAN CHANGE RETRY]
+        # HumanMessage (stale revision / unchanged contract). Route there
+        # instead of discarding.
+        logger.info(
+            "planning route: propose_plan_change %s; delegating to "
+            "plan_change_confirm for the retry message",
+            (
+                f"referenced stale revision {revision} "
+                f"(current {expected.revision})"
+                if revision != expected.revision
+                else "does not change the reviewed contract"
+            ),
+        )
+        return PLAN_CHANGE_CONFIRM
     return PLAN_CHANGE_CONFIRM
 
 

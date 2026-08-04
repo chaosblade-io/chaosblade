@@ -36,13 +36,30 @@ def test_parse_replan_request_requires_complete_typed_payload():
     assert parse_replan_request("[REPLAN] retry another method") is None
 
 
+def _attempted_contract(*tail_messages) -> list:
+    """Messages for a contract that has ATTEMPTED its injection.
+
+    The lifecycle review rejects a plan_invalid replan unless the current
+    contract attempted an injection (see _review_replan_request), so every
+    plan_invalid scenario here must start from a real attempt — a failed
+    attempt is exactly the evidence a legitimate replan is built on.
+    """
+    attempt = AIMessage(content="", tool_calls=[{
+        "name": "blade_create",
+        "args": {"target": "cpu", "action": "fullload"},
+        "id": "call-attempt-1",
+        "type": "tool_call",
+    }])
+    return [attempt, *tail_messages]
+
+
 def test_execute_loop_records_structured_replan_request():
     from chaos_agent.agent.nodes.execute.execute_loop import _handle_replan
 
     result: dict = {}
     _handle_replan(
         AIMessage(content=_content()),
-        {"messages": [], "replan_count": 0, "execute_loop_count": 1},
+        {"messages": _attempted_contract(), "replan_count": 0, "execute_loop_count": 1},
         result,
     )
 
@@ -63,14 +80,23 @@ def test_plan_invalid_replan_uses_runtime_evidence_not_model_tool_call_ids():
             "kubectl exec chroot /host returned REJECT_BANNED",
         ])),
         {
-            "messages": [
+            "messages": _attempted_contract(
+                AIMessage(content="", tool_calls=[{
+                    "name": "kubectl",
+                    "args": {
+                        "subcommand": "exec",
+                        "v_args": "exec -it pod/x -- chroot /host blade create cpu fullload",
+                    },
+                    "id": "call-runtime-failure",
+                    "type": "tool_call",
+                }]),
                 ToolMessage(
                     content="[target_guard] REJECT_BANNED - host mutation denied",
                     name="kubectl",
                     tool_call_id="call-runtime-failure",
                     status="error",
                 ),
-            ],
+            ),
             "replan_count": 0,
             "execute_loop_count": 1,
         },
@@ -91,14 +117,14 @@ def test_plan_invalid_replan_records_blade_failure_call_id():
     _handle_replan(
         AIMessage(content=_content(evidence_refs=[])),
         {
-            "messages": [
+            "messages": _attempted_contract(
                 ToolMessage(
                     content="Error: injection failed permanently",
                     name="blade_create",
-                    tool_call_id="call-blade-failure",
+                    tool_call_id="call-attempt-1",
                     status="error",
                 ),
-            ],
+            ),
             "replan_count": 0,
             "execute_loop_count": 1,
         },
@@ -106,7 +132,7 @@ def test_plan_invalid_replan_records_blade_failure_call_id():
     )
 
     assert result["replan_requested"] is True
-    assert result["replan_context"]["evidence_refs"] == ["call-blade-failure"]
+    assert result["replan_context"]["evidence_refs"] == ["call-attempt-1"]
 
 
 def test_target_or_risk_replan_requires_a_new_confirmation_gate():
@@ -115,7 +141,7 @@ def test_target_or_risk_replan_requires_a_new_confirmation_gate():
     result: dict = {}
     _handle_replan(
         AIMessage(content=_content(changes_target_or_risk=True)),
-        {"messages": [], "replan_count": 0, "execute_loop_count": 1},
+        {"messages": _attempted_contract(), "replan_count": 0, "execute_loop_count": 1},
         result,
     )
 
@@ -160,7 +186,7 @@ def test_request_replan_tool_call_fires_replan_and_answers_tool_call():
     result: dict = {"messages": [_ai_with_request_replan([_request_replan_tool_call()])]}
     _handle_replan(
         result["messages"][0],
-        {"messages": [], "replan_count": 0, "execute_loop_count": 1},
+        {"messages": _attempted_contract(), "replan_count": 0, "execute_loop_count": 1},
         result,
     )
 
@@ -186,7 +212,7 @@ def test_request_replan_tool_call_with_null_optional_lists_still_fires():
     result: dict = {"messages": [_ai_with_request_replan([tc])]}
     _handle_replan(
         result["messages"][0],
-        {"messages": [], "replan_count": 0, "execute_loop_count": 1},
+        {"messages": _attempted_contract(), "replan_count": 0, "execute_loop_count": 1},
         result,
     )
 
@@ -204,7 +230,7 @@ def test_request_replan_tool_call_answers_sibling_tool_calls():
     result: dict = {"messages": [response]}
     _handle_replan(
         response,
-        {"messages": [], "replan_count": 0, "execute_loop_count": 1},
+        {"messages": _attempted_contract(), "replan_count": 0, "execute_loop_count": 1},
         result,
     )
 
@@ -336,7 +362,7 @@ def test_request_replan_tool_call_coerces_json_string_lists():
     result: dict = {"messages": [_ai_with_request_replan([tc])]}
     _handle_replan(
         result["messages"][0],
-        {"messages": [], "replan_count": 0, "execute_loop_count": 1},
+        {"messages": _attempted_contract(), "replan_count": 0, "execute_loop_count": 1},
         result,
     )
     assert result["replan_requested"] is True

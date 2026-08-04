@@ -15,7 +15,7 @@ from chaos_agent.utils.fault_type import build_blade_create_args, ensure_min_dur
 
 
 def generate_injection_plan(state: AgentState) -> str:
-    """从 agent_loop 填充后的 state 生成完整故障注入计划 markdown。"""
+    """Build the full fault-injection plan markdown from agent_loop-filled state."""
     spec = read_fault_spec(state) or FaultSpec()
     sections = [
         _section_target(spec),
@@ -28,11 +28,11 @@ def generate_injection_plan(state: AgentState) -> str:
         _section_reasoning(state),
     ]
     body = "\n\n".join(s for s in sections if s)
-    return f"# 故障注入计划\n\n{body}\n\n---\n确认执行: `/run` | 调整: `/plan <修改建议>`"
+    return f"# Fault Injection Plan\n\n{body}\n\n---\nConfirm and run: `/run` | Adjust: `/plan <change request>`"
 
 
 def _section_target(spec: FaultSpec) -> str:
-    lines = ["## 目标"]
+    lines = ["## Target"]
     if spec.namespace:
         lines.append(f"- Namespace: `{spec.namespace}`")
     if spec.names:
@@ -46,7 +46,7 @@ def _section_target(spec: FaultSpec) -> str:
             f"- Fault: {spec.scope}-{spec.blade_target} {spec.blade_action}"
         )
     if not any(x for x in [spec.namespace, spec.names, spec.labels, spec.scope]):
-        lines.append("- (目标信息未完整收集)")
+        lines.append("- (target information is incomplete)")
     return "\n".join(lines)
 
 
@@ -89,7 +89,7 @@ def _section_inject_command(spec: FaultSpec, state: AgentState) -> str:
         parts.append(f"  --kubeconfig {kubeconfig}")
 
     cmd_str = " \\\n".join(parts)
-    return f"## 注入命令\n\n```bash\n{cmd_str}\n```"
+    return f"## Injection Command\n\n```bash\n{cmd_str}\n```"
 
 
 def _section_baseline_preview(spec: FaultSpec) -> str:
@@ -106,9 +106,12 @@ def _section_baseline_preview(spec: FaultSpec) -> str:
         profile, spec.scope, spec.blade_target, spec.blade_action,
     )
     if not commands:
-        return "## 基线采集\n\n注入前无预定义基线采集命令（将使用 LLM 动态策略）。"
+        return (
+            "## Baseline Capture\n\nNo predefined baseline-capture commands for this fault "
+            "(an LLM-driven dynamic strategy will be used)."
+        )
 
-    lines = ["## 基线采集（注入前自动执行）"]
+    lines = ["## Baseline Capture (runs automatically before injection)"]
     for i, cmd in enumerate(commands, 1):
         rendered = _resolve_baseline_template(cmd.command, spec)
         lines.append(f"{i}. `{rendered}` — {cmd.description}")
@@ -117,30 +120,33 @@ def _section_baseline_preview(spec: FaultSpec) -> str:
 
 def _section_verification_strategy(state: AgentState) -> str:
     lines = [
-        "## 验证策略",
+        "## Verification Strategy",
         "",
-        "**Layer 1（自动）**：`blade status <uid>` 确认实验状态为 Success",
+        "**Layer 1 (automatic)**: `blade status <uid>` confirms the experiment status is Success",
     ]
 
     skill_case = state.get("skill_case_content") or ""
     l2_content = _extract_section(skill_case, "注入验证")
     if l2_content:
         lines.append("")
-        lines.append("**Layer 2（观测验证）**：")
+        lines.append("**Layer 2 (observed verification)**:")
         for item in l2_content:
             lines.append(f"- {item}")
     else:
         lines.append("")
-        lines.append("**Layer 2（观测验证）**：LLM 将基于基线对比自动验证注入效果")
+        lines.append(
+            "**Layer 2 (observed verification)**: the LLM will verify the injection's "
+            "effect automatically by comparing against the baseline"
+        )
 
     return "\n".join(lines)
 
 
 def _section_recovery_strategy(state: AgentState) -> str:
     lines = [
-        "## 恢复策略",
+        "## Recovery Strategy",
         "",
-        "1. `blade destroy <uid>` — 销毁实验，移除故障注入",
+        "1. `blade destroy <uid>` — destroy the experiment and remove the injected fault",
     ]
 
     skill_case = state.get("skill_case_content") or ""
@@ -152,7 +158,7 @@ def _section_recovery_strategy(state: AgentState) -> str:
     verify = _extract_section(skill_case, "恢复验证")
     if verify:
         lines.append("")
-        lines.append("**恢复验证**：")
+        lines.append("**Recovery verification**:")
         for item in verify:
             lines.append(f"- {item}")
 
@@ -166,22 +172,22 @@ def _section_safety_assessment(state: AgentState) -> str:
     conflicts = state.get("conflict_uids") or []
     safety_score = state.get("safety_score") or {}
 
-    lines = ["## 安全评估"]
-    lines.append(f"- 状态: **{safety_status}**")
+    lines = ["## Safety Assessment"]
+    lines.append(f"- Status: **{safety_status}**")
     if safety_reason:
-        lines.append(f"- 说明: {safety_reason}")
+        lines.append(f"- Note: {safety_reason}")
     if conflicts:
-        lines.append(f"- 冲突实验: {', '.join(conflicts)}")
+        lines.append(f"- Conflicting experiments: {', '.join(conflicts)}")
     else:
-        lines.append("- 冲突实验: 无")
+        lines.append("- Conflicting experiments: none")
     if health_report:
-        lines.append(f"- 健康预检: {health_report}")
+        lines.append(f"- Health pre-check: {health_report}")
 
     # E10 — render multi-dimensional safety score when present.
     if safety_score:
         overall = safety_score.get("overall", 0)
         level = safety_score.get("level", "")
-        lines.append(f"- 风险评分: **{overall}/100** ({level})")
+        lines.append(f"- Risk score: **{overall}/100** ({level})")
         for dim in ("blast_radius", "frequency", "time", "topology"):
             d = safety_score.get(dim) or {}
             if d:
@@ -206,14 +212,14 @@ def _section_timing(spec: FaultSpec) -> str:
     try:
         timeout_s = int(timeout_str)
     except (ValueError, TypeError):
-        return f"## 时间\n\n- 注入持续: {timeout_str}"
+        return f"## Timing\n\n- Injection duration: {timeout_str}"
 
     minutes = timeout_s // 60
     total_est = minutes + 2  # baseline + verification overhead
     return (
-        f"## 时间\n\n"
-        f"- 注入持续: {timeout_s}s ({minutes}min)\n"
-        f"- 预计总耗时: ~{total_est}min（含基线采集 + 验证）"
+        f"## Timing\n\n"
+        f"- Injection duration: {timeout_s}s ({minutes}min)\n"
+        f"- Estimated total: ~{total_est}min (including baseline capture + verification)"
     )
 
 
@@ -226,7 +232,7 @@ def _section_reasoning(state: AgentState) -> str:
             continue
         content = getattr(msg, "content", "") or ""
         if content.strip():
-            return f"## 规划推理\n\n{content.strip()}"
+            return f"## Planning Rationale\n\n{content.strip()}"
     return ""
 
 
@@ -234,7 +240,11 @@ def _section_reasoning(state: AgentState) -> str:
 
 
 def _extract_section(skill_case: str, section_name: str) -> list[str]:
-    """从 skill_case_content 提取指定 section 的条目列表。"""
+    """Extract the item list of a named section from ``skill_case_content``.
+
+    ``section_name`` is a heading in the (Chinese) skill-case markdown, so it
+    is passed through verbatim as a literal to match against.
+    """
     if not skill_case:
         return []
     pattern = rf"\*\*{re.escape(section_name)}\*\*[：:]\s*\n(.*?)(?=\n\*\*|\n---|\Z)"
@@ -264,9 +274,10 @@ def _resolve_baseline_template(template: str, spec: FaultSpec) -> str:
     names = list(spec.names)
     node_name = names[0] if names else ""
     pod_name = "" if spec.scope == "node" else (names[0] if names else "")
-    # 与 ``baseline_capture._resolve_templates`` 保持一致：``{label_selector}``
-    # 必须渲染成 ``-l key=value``，否则 plan 预览展示的命令直接复制粘贴
-    # 也是错的（kubectl 会把裸 ``key=value`` 当 pod name）。
+    # Stay consistent with ``baseline_capture._resolve_templates``:
+    # ``{label_selector}`` MUST render as ``-l key=value``, otherwise the command
+    # shown in the plan preview is wrong when copy-pasted (kubectl would treat a
+    # bare ``key=value`` as a pod name).
     label_selector = (
         "-l " + ",".join(f"{k}={v}" for k, v in spec.labels.items())
         if spec.labels else ""
@@ -286,7 +297,7 @@ def _resolve_baseline_template(template: str, spec: FaultSpec) -> str:
 
 
 def _split_flags(flags_str: str) -> list[str]:
-    """将 flags 字符串拆分为 --key value 对。"""
+    """Split a flags string into ``--key value`` pairs."""
     if not flags_str:
         return []
     parts = flags_str.split()

@@ -122,7 +122,7 @@ class FailureDetail(BaseModel):
         if self.llm_analysis:
             base = f"{base} | llm_analysis: {self.llm_analysis}"
         if self.alternatives:
-            base = f"{base}\n\n可行替代方案:\n{self.alternatives}"
+            base = f"{base}\n\nViable alternatives:\n{self.alternatives}"
         return base
 
 

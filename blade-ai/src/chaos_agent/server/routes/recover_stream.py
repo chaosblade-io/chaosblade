@@ -87,7 +87,65 @@ async def recover_stream(request: RecoverRequest, req: Request):
         state_values = {}
         recover_config = None
         recover_graph = None
+        # Declared up front: an interruption can happen before the assignment
+        # below, and the interruption record needs it to find the TUI session.
+        inject_tui_session_id = ""
+        # One record per recovery: a failure after the outcome record landed must
+        # not append a contradicting interruption note on top of it.
+        record_written = False
         started_monotonic = time.monotonic()
+
+        async def _write_recover_interrupted(cause: str, error_detail: str = "") -> None:
+            """Mirror an interruption record for this recovery to the intent graph.
+
+            Recovery is the operation whose interruption matters most: the fault
+            is still live by definition until recovery finishes, and the
+            context-isolated intent graph would otherwise learn nothing. Reads
+            the recover graph's ledger, so it reflects however far recovery got.
+            """
+            if record_written:
+                return
+            try:
+                from chaos_agent.agent.result.operation_summary import (
+                    build_interrupted_record,
+                )
+                from chaos_agent.memory.operation_summary_writer import (
+                    write_operation_summary,
+                )
+                from chaos_agent.server.routes.sessions import (
+                    get_store as get_tui_session_store,
+                )
+
+                values = {}
+                if recover_graph is not None and recover_config is not None:
+                    snapshot = await recover_graph.aget_state(recover_config)
+                    if snapshot and snapshot.values:
+                        values = snapshot.values
+
+                index_store = get_tui_session_store()
+                meta = index_store.get(inject_tui_session_id) if inject_tui_session_id else None
+                thread_id = (
+                    meta.get("conversation_thread_id") if isinstance(meta, dict) else ""
+                )
+                await write_operation_summary(
+                    build_interrupted_record(
+                        values, record_task_id, cause=cause, error_detail=error_detail,
+                    ),
+                    intent_graph=agents.get("intent") if isinstance(agents, dict) else None,
+                    thread_id=thread_id,
+                    tui_session_id=inject_tui_session_id,
+                    session_index_store=index_store,
+                    task_id=record_task_id,
+                    recursion_limit=settings.recursion_limit,
+                    raise_graph_error=False,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug(
+                    "Failed to write recover interruption record for %s (cause=%s)",
+                    record_task_id, cause, exc_info=True,
+                )
 
         try:
             # 1. Build initial state from inject checkpoint
@@ -172,7 +230,10 @@ async def recover_stream(request: RecoverRequest, req: Request):
                     return
 
                 try:
-                    from chaos_agent.agent.result.operation_summary import build_recover_summary_text
+                    from chaos_agent.agent.result.operation_summary import (
+                        append_ledger_process_detail,
+                        build_recover_summary_text,
+                    )
                     from chaos_agent.memory.operation_summary_writer import write_operation_summary
                     from chaos_agent.server.routes.sessions import get_store as get_tui_session_store
 
@@ -180,6 +241,13 @@ async def recover_stream(request: RecoverRequest, req: Request):
                         result_payload,
                         inject_task_id,
                         state_values,
+                    )
+                    # ONE combined record: append the recover ledger's process
+                    # detail (what recovery established / did) below the summary,
+                    # from the recover graph's final state.
+                    summary_text = append_ledger_process_detail(
+                        summary_text,
+                        final_state.values if final_state else None,
                     )
                     if summary_text:
                         tui_session_index_store = get_tui_session_store()
@@ -209,6 +277,7 @@ async def recover_stream(request: RecoverRequest, req: Request):
                             recursion_limit=settings.recursion_limit,
                             raise_graph_error=False,
                         )
+                        record_written = True
                 except Exception:
                     logger.warning(
                         "Failed to persist recover-stream summary for %s",
@@ -241,8 +310,21 @@ async def recover_stream(request: RecoverRequest, req: Request):
 
             yield StreamEvent(type="done", task_id=record_task_id).to_sse()
 
+        except asyncio.CancelledError:
+            # ``CancelledError`` derives from BaseException, so the handler below
+            # never saw it and a cancelled recovery left no record at all — the
+            # worst case, since the fault is live by definition until recovery
+            # completes. Shielded as this runs under cancellation.
+            logger.info(f"Recover stream cancelled for task {inject_task_id}")
+            await asyncio.shield(_write_recover_interrupted("user_cancel"))
+            raise
         except Exception as e:
             logger.exception(f"Recover stream failed for task {inject_task_id}")
+            # Before the terminating events: the consumer stops iterating at
+            # ``done`` and anything after the final yield would never run.
+            await _write_recover_interrupted(
+                "internal_error", f"{type(e).__name__}: {e}",
+            )
             yield StreamEvent(
                 type="error",
                 content=f"Recovery failed: {type(e).__name__}: {e}",

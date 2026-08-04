@@ -488,6 +488,10 @@ def infer_effective_target(
                      "host_read",
                      "request_replan",
                      "time_wait",
+                     # Progress ledger write: a pure control-signal note with no
+                     # cluster side effect (touches no fault target), same class
+                     # as request_replan / time_wait.
+                     "update_progress",
                      # ChaosBlade Python agent PRECONDITION management. Neither
                      # touches a fault target: ``prepare`` only registers the
                      # in-process agent's port with the blade CLI and ``revoke``
@@ -1182,7 +1186,9 @@ def _classify_kubectl_exec(args: list[str], raw_command: str) -> EffectiveTarget
 
     inner = _extract_after_double_dash(args)
     if not inner:
-        # Pure stdio attach — acts on the pod.
+        # Pure stdio attach — acts on the pod. Vehicle identity is decided
+        # DATA-side by the screener (state + live discovery), never from
+        # the pod name here.
         return EffectiveTarget(
             scope="pod", namespace=ns, names=(pod_name,),
             raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
@@ -1303,10 +1309,15 @@ def _classify_kubectl_exec(args: list[str], raw_command: str) -> EffectiveTarget
             # A pod-scoped mutation: same shape the guard already accepts for
             # any other pod-level fault, so identity/blast-radius comparison
             # applies normally instead of the escape path's carrier
-            # requirement.
+            # requirement. ``fault_binary_mutation`` marks the shape so the
+            # screener's vehicle exemption does NOT swallow it: inside a
+            # privileged / hostNetwork tool pod the same binary shapes the
+            # HOST, which the static classifier cannot rule out — keep the
+            # identity review.
             return EffectiveTarget(
                 scope="pod", namespace=ns, names=(pod_name,),
                 raw_command=raw_command, confidence=ConfidenceLevel.HIGH,
+                fault_binary_mutation=True,
             )
 
     # Read-only probe (cat/ls/df/ps, iptables -L, ip addr show, ...) — a
@@ -1324,6 +1335,13 @@ def _classify_kubectl_exec(args: list[str], raw_command: str) -> EffectiveTarget
 
     # Plain shell command (rm/kill/etc) — acts on the pod's own
     # filesystem/process space. scope=pod is correct.
+    #
+    # Vehicle identity (exec into the task's own injection machinery) is
+    # resolved DATA-side by the screener — task-registered artifacts and
+    # live label-selector discovery — not from the pod name here. The
+    # fault-binary mutation branch above deliberately keeps identity review
+    # via ``fault_binary_mutation``; inner commands here were already
+    # screened by the escape/banned/readonly checks above.
     return EffectiveTarget(
         scope="pod", namespace=ns, names=(pod_name,),
         raw_command=raw_command, confidence=ConfidenceLevel.HIGH,

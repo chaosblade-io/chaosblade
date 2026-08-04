@@ -80,7 +80,7 @@ class TestIntentConfirmInterruptPayload:
         result = await intent_confirm(state)
 
         assert result["confirmed_intent"] is None
-        assert "不支持的 scope" in result["messages"][0].content
+        assert "unsupported scope" in result["messages"][0].content
 
     @pytest.mark.asyncio
     async def test_payload_carries_intent_confidence(self):

@@ -45,6 +45,17 @@ def _isolate_task_store(tmp_path, monkeypatch):
     monkeypatch.setattr(_settings_mod.settings, "host_name", "", raising=False)
     monkeypatch.setattr(_settings_mod.settings, "ssh_host", "", raising=False)
 
+    # Hermetic LLM credential: tests must NOT depend on the developer's
+    # ~/.blade-ai/config.json for a key, and must NOT require one in CI.
+    # Newer OpenAI SDKs enforce credentials at *client construction* (not at
+    # first call), so a factory that builds a ChatOpenAI with an empty key —
+    # e.g. create_agent() in test_factory — raises OpenAIError immediately on
+    # a fresh CI checkout with no key configured. A non-empty dummy lets the
+    # client construct; no real request is ever made (tests mock the LLM).
+    # Tests that specifically exercise the missing-key path set "" themselves,
+    # which overrides this because their monkeypatch runs after the fixture.
+    monkeypatch.setattr(_settings_mod.settings, "llm_api_key", "sk-test-dummy", raising=False)
+
     yield
 
     _ts_mod._sync_close_store()

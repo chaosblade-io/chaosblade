@@ -281,6 +281,224 @@ class TestExtractBladeUidKubectlExec:
         assert _extract_blade_uid_from_messages([msg]) is None
 
 
+class TestExtractBladeUidRetired:
+    """Tests for the ``retired`` filter of _extract_blade_uid_from_messages.
+
+    Framework-side verify-replan cleanup destroys experiments in CODE (no
+    blade_destroy ToolMessage), so retired_blade_uids is the only record that
+    a UID is dead. Extraction must treat retired UIDs exactly like destroyed
+    ones (task-29848471).
+    """
+
+    def test_retired_uid_not_returned(self):
+        msg = ToolMessage(
+            content='{"code":200,"success":true,"result":"dead-uid"}',
+            tool_call_id="tc1",
+            name="blade_create",
+        )
+        messages = [msg]
+        # Without retired filter the UID is live; with it, it must vanish.
+        assert _extract_blade_uid_from_messages(messages) == "dead-uid"
+        assert _extract_blade_uid_from_messages(messages, retired=["dead-uid"]) is None
+        assert _extract_blade_uid_from_messages(messages, retired={"dead-uid"}) is None
+
+    def test_retired_does_not_mask_live_uid(self):
+        msg1 = ToolMessage(
+            content='{"code":200,"success":true,"result":"old-uid"}',
+            tool_call_id="tc1", name="blade_create",
+        )
+        msg2 = ToolMessage(
+            content='{"code":200,"success":true,"result":"new-uid"}',
+            tool_call_id="tc2", name="blade_create",
+        )
+        messages = [msg1, msg2]
+        # Only the old UID was retired by cleanup; the re-injected UID stays.
+        assert _extract_blade_uid_from_messages(
+            messages, retired=["old-uid"],
+        ) == "new-uid"
+
+    def test_retired_skips_over_dead_uid_to_live_one(self):
+        """Retired latest UID → fall through to the older live UID."""
+        msg1 = ToolMessage(
+            content='{"code":200,"success":true,"result":"live-uid"}',
+            tool_call_id="tc1", name="blade_create",
+        )
+        msg2 = ToolMessage(
+            content='{"code":200,"success":true,"result":"dead-uid"}',
+            tool_call_id="tc2", name="blade_create",
+        )
+        messages = [msg1, msg2]
+        assert _extract_blade_uid_from_messages(
+            messages, retired=["dead-uid"],
+        ) == "live-uid"
+
+    def test_retired_empty_is_noop(self):
+        msg = ToolMessage(
+            content='{"code":200,"success":true,"result":"uid-1"}',
+            tool_call_id="tc1", name="blade_create",
+        )
+        assert _extract_blade_uid_from_messages([msg], retired=None) == "uid-1"
+        assert _extract_blade_uid_from_messages([msg], retired=[]) == "uid-1"
+
+
+class TestResetAttributionState:
+    """Tests for reset_attribution_state (shared replan-seam reset)."""
+
+    def _populated(self) -> dict:
+        return {
+            "blade_uid": "uid-123",
+            "injection_method": "kubectl_exec",
+            "kubectl_exec_pod_name": "tool-pod",
+            "inject_layer1_cache": {"status": "passed"},
+            "injection_start_time": 12345.0,
+            "unrelated_field": "keep-me",
+        }
+
+    def test_default_clears_all_attribution(self):
+        result = self._populated()
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            reset_attribution_state,
+        )
+        reset_attribution_state(result)
+        assert result["blade_uid"] is None
+        assert result["injection_method"] is None
+        assert result["kubectl_exec_pod_name"] is None
+        assert result["inject_layer1_cache"] is None
+        assert result["injection_start_time"] is None
+        assert result["unrelated_field"] == "keep-me"
+
+    def test_keep_blade_uid_preserves_live_experiment(self):
+        """Execute-replan with existing_blade_uids keeps the UID (recover must
+        still reach it) while re-arming method re-detection."""
+        result = self._populated()
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            reset_attribution_state,
+        )
+        reset_attribution_state(result, keep_blade_uid=True)
+        assert result["blade_uid"] == "uid-123"
+        assert result["injection_method"] is None
+        assert result["kubectl_exec_pod_name"] is None
+
+    def test_accepts_partial_dict(self):
+        """Verify-replan result_update starts sparse; missing keys are fine."""
+        result: dict = {"replan_requested": True}
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            reset_attribution_state,
+        )
+        reset_attribution_state(result)
+        assert result["blade_uid"] is None
+        assert result["injection_method"] is None
+
+    def test_message_count_records_epoch_boundary(self):
+        """The replan seam records the attribution epoch boundary so the
+        RESUME re-detection scan cannot resurrect pre-seam attempts
+        (task-5193538b)."""
+        result = self._populated()
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            reset_attribution_state,
+        )
+        reset_attribution_state(result, message_count=7)
+        assert result["attribution_epoch_index"] == 7
+
+    def test_no_message_count_leaves_boundary_unset(self):
+        """Callers that pass no message_count keep the pre-fix behaviour
+        (full-history scan)."""
+        result = self._populated()
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            reset_attribution_state,
+        )
+        reset_attribution_state(result)
+        assert "attribution_epoch_index" not in result
+
+
+class TestEpochBoundedAttribution:
+    """RESUME re-detection must read only the CURRENT attribution epoch.
+
+    Regression for task-5193538b: after a replan seam the executor re-entered
+    Phase 2, the history re-scan re-derived the PRE-replan attribution (stale
+    diagnostic execs counted as the injection), and the node exited with a
+    text-only conclusion without issuing anything.
+    """
+
+    @staticmethod
+    def _mutating_exec_msg(pod: str) -> AIMessage:
+        return AIMessage(content="", tool_calls=[{
+            "name": "kubectl",
+            "args": {
+                "subcommand": "exec",
+                "v_args": f"{pod} -n chaosblade -- sh -c 'echo x >> /etc/hosts'",
+            },
+            "id": "call-1",
+        }])
+
+    def test_no_boundary_scans_full_history(self):
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _epoch_bounded_messages,
+        )
+        from langchain_core.messages import HumanMessage
+
+        msgs = [HumanMessage(content="hi"), self._mutating_exec_msg("tool-pod")]
+        assert _epoch_bounded_messages(msgs, {}) == msgs
+        assert _epoch_bounded_messages(msgs, {"attribution_epoch_index": None}) == msgs
+
+    def test_boundary_excludes_pre_seam_attempts(self):
+        """With the seam recorded AFTER the stale attempt, detection finds
+        nothing — the executor cannot conclude 'already injected'."""
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _detect_injection_method,
+            _epoch_bounded_messages,
+        )
+        from langchain_core.messages import HumanMessage
+
+        msgs = [
+            self._mutating_exec_msg("otel-c-tool"),   # pre-seam (old contract)
+            HumanMessage(content="replan approved"),  # the seam message
+        ]
+        state = {"attribution_epoch_index": 1}
+        # Unbounded (pre-fix) scan attributes the stale attempt…
+        assert _detect_injection_method(msgs, None, is_host=False) == "kubectl_native"
+        # …the epoch-bounded scan does not.
+        bounded = _epoch_bounded_messages(msgs, state)
+        assert bounded == msgs[1:]
+        assert _detect_injection_method(bounded, None, is_host=False) is None
+
+    def test_current_epoch_attempt_still_attributed(self):
+        """The boundary must never hide an injection issued AFTER the seam."""
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _detect_injection_method,
+            _epoch_bounded_messages,
+        )
+        from langchain_core.messages import HumanMessage
+
+        msgs = [
+            HumanMessage(content="replan approved"),  # the seam message
+            self._mutating_exec_msg("target-pod"),    # current-epoch injection
+        ]
+        state = {"attribution_epoch_index": 1}
+        bounded = _epoch_bounded_messages(msgs, state)
+        assert _detect_injection_method(bounded, None, is_host=False) == "kubectl_native"
+
+    def test_boundary_beyond_length_falls_back_to_full_scan(self):
+        """Trimming may shift the list under a stored index; over-scan keeps
+        pre-fix attribution instead of fabricating a window that hides the
+        real attempt (never under-attribute)."""
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _epoch_bounded_messages,
+        )
+
+        msgs = [self._mutating_exec_msg("tool-pod")]
+        state = {"attribution_epoch_index": 99}
+        assert _epoch_bounded_messages(msgs, state) == msgs
+
+    def test_invalid_boundary_falls_back_to_full_scan(self):
+        from chaos_agent.agent.nodes.execute.execute_loop import (
+            _epoch_bounded_messages,
+        )
+
+        msgs = [self._mutating_exec_msg("tool-pod")]
+        assert _epoch_bounded_messages(msgs, {"attribution_epoch_index": "x"}) == msgs
+
+
 class TestParseBladeUidFromContent:
     """Tests for _parse_blade_uid_from_content helper."""
 

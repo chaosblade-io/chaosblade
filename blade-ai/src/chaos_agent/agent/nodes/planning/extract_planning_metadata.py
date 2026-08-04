@@ -489,6 +489,12 @@ async def extract_planning_metadata(state: AgentState) -> dict:
         if updates:
             new_spec = spec.replace(**updates)
             result["fault_spec"] = new_spec.to_dict()
+            logger.debug(
+                "spec-write: writer=extract_planning_metadata "
+                "names %s -> %s basis=skill-case fault_type derivation "
+                "(names never modified here)",
+                list(spec.names), list(new_spec.names),
+            )
             logger.info(
                 "extract_planning_metadata: derived spec fields %s "
                 "(CLI NL or initially incomplete spec path)",
