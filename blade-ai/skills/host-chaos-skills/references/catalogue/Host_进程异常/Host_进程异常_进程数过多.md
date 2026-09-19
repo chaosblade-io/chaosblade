@@ -61,7 +61,7 @@ stress-ng --fork <count> --timeout <duration>s
 恢复命令：
 ```bash
 # --timeout 到期后 stress-ng 自行退出，正常路径无需干预。
-# 如需提前终止：fork stressor 的 worker 随主进程一同退出（实测 kill 主 PID
+# 如需提前终止：fork stressor 的 worker 随主进程一同退出（kill 主 PID
 # 后 worker 全清、fork 活动停止），杀主进程即可。
 # 必须用 -x 精确匹配进程名，不要用 -f（见下方注意事项）。
 pkill -x stress-ng
@@ -71,5 +71,5 @@ pkill -x stress-ng
 - 创建过多进程可能导致当前 SSH 会话无法创建新进程，建议提前设置 ulimit -u
 - 原生方式无法精确控制，过量可能导致系统完全不可用
 - 演练前建议确认可通过 out-of-band 方式（如 IPMI/iDRAC）恢复主机
-- **「进程数显著增加」判据的命中强度依赖 worker 规模（实测）**：fork stressor 的每个 worker 持续 fork 短命子进程，瞬时进程数增量 ≈ N+1——N=4 时实测仅 +7（约 3%，不显著），N=64 时 +72（约 30%，显著）。判读时结合 fork 速率类证据更稳：`vmstat 1 2` 的 cs 列激增（实测 28822/s→基线 5313/s）、sy CPU 升高（实测 31%）、r 运行队列变长（实测 r=4）
-- **不要用 `pgrep -f stress-ng` 取 PID**：`-f` 匹配完整命令行，会把携带该字符串的执行 shell 自身一并匹配（实测自匹配 PID 1974739），拿输出去 kill 会杀掉执行 shell；`-x` 按进程名精确匹配，只命中 stress-ng 主进程
+- **「进程数显著增加」判据的命中强度依赖 worker 规模**：fork stressor 的每个 worker 持续 fork 短命子进程，瞬时进程数增量 ≈ N+1——N=4 时仅 +7（约 3%，不显著），N=64 时 +72（约 30%，显著）。判读时结合 fork 速率类证据更稳：`vmstat 1 2` 的 cs 列激增（如 28822/s→基线 5313/s）、sy CPU 升高（如 31%）、r 运行队列变长（如 r=4）
+- **不要用 `pgrep -f stress-ng` 取 PID**：`-f` 匹配完整命令行，会把携带该字符串的执行 shell 自身一并匹配，拿输出去 kill 会杀掉执行 shell；`-x` 按进程名精确匹配，只命中 stress-ng 主进程

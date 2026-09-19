@@ -21,6 +21,7 @@ _MODULE = "chaos_agent.agent.nodes.gates.preplan_probe"
 _ALL_PROBES = (
     "_probe_operator",
     "_probe_metrics_server",
+    "_probe_carrier_images",
 )
 
 
@@ -303,3 +304,256 @@ class TestTargetNodePlumbing:
             for p in patches:
                 p.stop()
         assert mocks["_probe_operator"].await_args.kwargs["target_node"] == ""
+
+
+class TestCarrierImageDiscovery:
+    """_probe_carrier_images: healthy-DS images → settings.discovered."""
+
+    @staticmethod
+    def _ds(name, ns, desired, ready, images):
+        return {
+            "metadata": {"name": name, "namespace": ns},
+            "spec": {"template": {"spec": {
+                "containers": [{"image": i} for i in images],
+            }}},
+            "status": {
+                "desiredNumberScheduled": desired,
+                "numberReady": ready,
+            },
+        }
+
+    @staticmethod
+    def _raw_result(items):
+        import json as _json
+
+        class _R:
+            exit_code = 0
+            stdout = _json.dumps({"items": items})
+
+        return _R()
+
+    async def _run(self, items, monkeypatch):
+        raw = self._raw_result(items)
+        monkeypatch.setattr(settings, "recovery_carrier_discovered_images", "")
+
+        async def _fake_exec(*_a, **_k):
+            return raw
+
+        # ``import chaos_agent.tools.kubectl as m`` binds the StructuredTool
+        # shadowing the submodule in the package namespace — patch the real
+        # module from sys.modules (what the in-function ``from … import``
+        # resolves against).
+        import sys
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+
+        with patch.object(
+            kubectl_mod, "exec_kubectl_raw", new=AsyncMock(side_effect=_fake_exec),
+        ):
+            return await pp._probe_carrier_images("/fake/kubeconfig")
+
+    @pytest.mark.asyncio
+    async def test_healthy_ds_images_added_to_discovered(self, monkeypatch):
+        items = [
+            self._ds("terway-eniip", "kube-system", 41, 41,
+                     ["registry.local/acs/terway:v1"]),
+            # Unhealthy DS: coverage unproven — must NOT be discovered.
+            self._ds("broken", "kube-system", 10, 7, ["registry.local/bad:v1"]),
+            # Zero-scale DS: desired 0 — skip.
+            self._ds("idle", "default", 0, 0, ["registry.local/idle:v1"]),
+        ]
+        status, summary, detail = await self._run(items, monkeypatch)
+        assert status == "ok"
+        assert settings.recovery_carrier_discovered_images == (
+            "registry.local/acs/terway:v1"
+        )
+        assert detail["images"] == ["registry.local/acs/terway:v1"]
+        assert "terway" in summary
+        assert "registry.local/bad:v1" not in summary
+
+    @pytest.mark.asyncio
+    async def test_summary_lists_all_candidates_no_truncation(
+        self, monkeypatch,
+    ):
+        """#36 retest evidence: the [:6] alphabetical cap buried terway
+        (the empirically preferred carrier image, alphabetically last)
+        behind "…and 3 more" — the planner's ONLY channel is the summary
+        (detail stays tracker-side), so a hidden candidate forces in-loop
+        re-discovery. Every candidate must be listed."""
+        items = [
+            self._ds(f"ds{i}", "kube-system", 3, 3, [f"reg/img{i}:v1"])
+            for i in range(8)
+        ]
+        items.append(self._ds(
+            "terway-eniip", "kube-system", 48, 48, ["reg/zz-terway:v1"],
+        ))
+        status, summary, detail = await self._run(items, monkeypatch)
+        assert status == "ok"
+        for i in range(8):
+            assert f"reg/img{i}:v1" in summary
+        # The alphabetically LAST candidate — exactly what the old cap hid.
+        assert "reg/zz-terway:v1" in summary
+        assert "…" not in summary
+        assert " more" not in summary
+        assert detail["images"] == sorted(
+            [f"reg/img{i}:v1" for i in range(8)] + ["reg/zz-terway:v1"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_configured_allowlist_not_duplicated(self, monkeypatch):
+        monkeypatch.setattr(
+            settings, "recovery_carrier_allowed_images", "busybox:1.36",
+        )
+        items = [self._ds("bb", "x", 3, 3, ["busybox:1.36", "reg/x:v9"])]
+        status, _, detail = await self._run(items, monkeypatch)
+        assert status == "ok"
+        # busybox stays out of discovered (already configured); reg/x:v9 in.
+        assert settings.recovery_carrier_discovered_images == "reg/x:v9"
+
+    @pytest.mark.asyncio
+    async def test_reentry_merge_is_idempotent(self, monkeypatch):
+        monkeypatch.setattr(
+            settings, "recovery_carrier_discovered_images", "reg/x:v9",
+        )
+        items = [self._ds("x", "x", 3, 3, ["reg/x:v9"])]
+        await self._run(items, monkeypatch)
+        # Same set re-probed — no duplication, order stable.
+        assert settings.recovery_carrier_discovered_images == "reg/x:v9"
+
+    @pytest.mark.asyncio
+    async def test_no_healthy_ds_reports_warning(self, monkeypatch):
+        items = [self._ds("broken", "kube-system", 10, 7, ["reg/bad:v1"])]
+        status, summary, _ = await self._run(items, monkeypatch)
+        assert status == "warning"
+        assert "no healthy DaemonSet images" in summary
+        assert settings.recovery_carrier_discovered_images == ""
+
+    @pytest.mark.asyncio
+    async def test_kubectl_failure_degrades_to_unknown(self, monkeypatch):
+        class _Bad:
+            exit_code = 1
+            stdout = ""
+
+        import sys
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+
+        with patch.object(
+            kubectl_mod, "exec_kubectl_raw",
+            new=AsyncMock(return_value=_Bad()),
+        ):
+            status, summary, _ = await pp._probe_carrier_images("/fake")
+        assert status == "unknown"
+        assert "auto-discovery failed" in summary
+
+
+# ---------------------------------------------------------------------------
+# FaultDrill CRD installability probe (openspec faultdrill-cr-channel D3
+# source 2 — the planning-route signal the Workflow routing guide points
+# the planner at)
+# ---------------------------------------------------------------------------
+
+
+class _Raw:
+    """Minimal exec_kubectl_raw stand-in (exit_code / stdout)."""
+
+    def __init__(self, exit_code: int = 0, stdout: str = ""):
+        self.exit_code = exit_code
+        self.stdout = stdout
+
+
+class TestFaultdrillCrdProbe:
+    """_probe_faultdrill_crd: read-only two-step installability verdict."""
+
+    @pytest.mark.asyncio
+    async def test_crd_exists_reports_ok_single_call(self):
+        with patch(
+            "chaos_agent.tools.kubectl.exec_kubectl_raw",
+            new=AsyncMock(return_value=_Raw(0)),
+        ) as m:
+            status, summary, _ = await pp._probe_faultdrill_crd("/fake")
+        assert status == "ok"
+        assert "already installed" in summary
+        # The exists branch short-circuits: no can-i round-trip is spent.
+        assert m.await_count == 1
+        assert m.await_args_list[0].args[1] == [
+            "crd", f"faultdrills.{settings.faultdrill_crd_group}",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_missing_crd_authorized_reports_installable(self):
+        with patch(
+            "chaos_agent.tools.kubectl.exec_kubectl_raw",
+            new=AsyncMock(side_effect=[_Raw(1), _Raw(0, "yes\n")]),
+        ) as m:
+            status, summary, _ = await pp._probe_faultdrill_crd("/fake")
+        assert status == "ok"
+        assert "installable" in summary
+        assert m.await_count == 2
+        assert m.await_args_list[1].args[:2] == ("auth", ["can-i", "create", "customresourcedefinitions"])
+
+    @pytest.mark.asyncio
+    async def test_denied_can_i_reports_warning_with_sop_guidance(self):
+        # ``can-i`` reports a DENIAL as exit 0 + "no" — a denial is an
+        # answer, not an error: the route-unavailable line (not unknown).
+        with patch(
+            "chaos_agent.tools.kubectl.exec_kubectl_raw",
+            new=AsyncMock(side_effect=[_Raw(1), _Raw(0, "no\n")]),
+        ):
+            status, summary, _ = await pp._probe_faultdrill_crd("/fake")
+        assert status == "warning"
+        assert "NOT installable" in summary
+        assert "recovery-carrier SOP" in summary
+
+    @pytest.mark.asyncio
+    async def test_can_i_error_degrades_to_unknown(self):
+        with patch(
+            "chaos_agent.tools.kubectl.exec_kubectl_raw",
+            new=AsyncMock(side_effect=[_Raw(1), _Raw(1, "boom")]),
+        ):
+            status, summary, _ = await pp._probe_faultdrill_crd("/fake")
+        assert status == "unknown"
+        assert "unverified" in summary
+
+
+class TestFaultdrillCrdWiring:
+    """The probe is scheduled only while the channel is enabled — dark
+    launch keeps the observation message identical to pre-change (no
+    faultdrill line, no extra kubectl round-trip)."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_channel_skips_the_probe(self, k8s_state, monkeypatch):
+        # Explicitly OFF (symmetric with the enabled test below): the
+        # post-flip default is True, and this tooth pins the CHANNEL-OFF
+        # behaviour, not the default.
+        monkeypatch.setattr(settings, "faultdrill_enabled", False)
+        fd = AsyncMock(return_value=("ok", "should not run", {}))
+        with patch(f"{_MODULE}._probe_faultdrill_crd", new=fd):
+            mocks, patches = _run_probes(k8s_state)
+            try:
+                result = await preplan_probe(k8s_state)
+            finally:
+                for p in patches:
+                    p.stop()
+        fd.assert_not_awaited()
+        assert "faultdrill_crd" not in result["messages"][0].content
+
+    @pytest.mark.asyncio
+    async def test_enabled_channel_appends_the_crd_line(
+        self, k8s_state, monkeypatch,
+    ):
+        monkeypatch.setattr(settings, "faultdrill_enabled", True)
+        fd = AsyncMock(return_value=("ok", "_probe_faultdrill_crd fine", {}))
+        with patch(f"{_MODULE}._probe_faultdrill_crd", new=fd):
+            mocks, patches = _run_probes(k8s_state)
+            try:
+                result = await preplan_probe(k8s_state)
+            finally:
+                for p in patches:
+                    p.stop()
+        fd.assert_awaited_once()
+        assert fd.await_args.args[0] == "/fake/kubeconfig"
+        assert (
+            "- faultdrill_crd [ok]: _probe_faultdrill_crd fine"
+            in result["messages"][0].content
+        )

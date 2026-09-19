@@ -73,6 +73,11 @@ interface Props {
   /** Active visual + typing accepted, but Enter / Esc / Ctrl+C
    *  are no-ops. Composer owns those keys during ``responding``. */
   enterLocked?: boolean;
+  /** True while the fault-window hold owns the spinner slot — swaps
+   *  the locked placeholder's copy ("Enter 在恢复完成后发送") so the
+   *  user knows which wait they are drafting through. Implies
+   *  ``enterLocked`` is true; standalone use is meaningless. */
+  faultWindowHold?: boolean;
   registry: SlashCommandRegistry;
   onSubmit: (text: string) => void;
   onExit: () => void;
@@ -205,6 +210,7 @@ function clamp(idx: number, length: number): number {
 export const InputPrompt: React.FC<Props> = ({
   disabled,
   enterLocked = false,
+  faultWindowHold = false,
   registry,
   onSubmit,
   // Deliberately not invoked: the Esc / Ctrl+C cascade below stops at
@@ -220,7 +226,12 @@ export const InputPrompt: React.FC<Props> = ({
   // "Type your message …" hint. With the buffer non-empty the user is
   // looking at their own draft; the placeholder isn't shown anyway.
   const idlePlaceholder = placeholder ?? t("input.placeholder");
-  const lockedPlaceholder = t("input.placeholder_streaming");
+  // Fault-window hold: same enterLocked semantics (draft allowed, Enter
+  // deferred), but the unlock event is window expiry / ctrl+r recovery —
+  // the copy must tell the user WHICH wait they are in.
+  const lockedPlaceholder = faultWindowHold
+    ? t("input.placeholder_fault_window")
+    : t("input.placeholder_streaming");
   const resolvedPlaceholder = enterLocked ? lockedPlaceholder : idlePlaceholder;
   const [value, setValue] = useState("");
   // Cursor is a *codepoint* index into ``value`` — not a UTF-16 unit

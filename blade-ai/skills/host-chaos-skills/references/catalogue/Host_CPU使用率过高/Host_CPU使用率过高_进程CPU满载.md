@@ -26,7 +26,7 @@ blade create cpu fullload --cpu-percent <percent> --timeout <duration>
 3. 观察 CPU 使用率及应用性能变化
 
 **注入验证**：
-1. `top` 或 `mpstat -P ALL 1` 确认 CPU 使用率持续超过目标百分比
+1. `top` 或 `mpstat -P ALL 1` 确认 CPU 使用率高于目标百分比——单次采样读数高于目标即满载已发生；「持续保持」由机制存活保证（fullload 压测进程在运行即持续满载由构造成立），无需反复采样验证持续
 2. `uptime` 确认 Load Average 显著升高
 3. （可选，仅当演练方提供了应用访问入口时）确认请求延迟增大；无入口时上述 CPU 与 Load 证据成立即可判定
 

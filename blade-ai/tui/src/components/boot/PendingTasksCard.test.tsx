@@ -9,8 +9,12 @@
 
 import { render } from "ink-testing-library";
 import { describe, expect, it } from "vitest";
+import { configureI18n, getActiveLang } from "@blade-ai/core";
 import { PendingTasksCard } from "./PendingTasksCard.js";
-import type { PendingTasksCardItem } from "@blade-ai/core";
+import type {
+  PendingTaskRow,
+  PendingTasksCardItem,
+} from "@blade-ai/core";
 
 const EMPTY: PendingTasksCardItem = {
   kind: "pending_tasks_card",
@@ -214,5 +218,178 @@ describe("PendingTasksCard / populated", () => {
     // zh string should be absent.
     expect(frame).not.toContain("unknown fault type");
     expect(frame).not.toContain("未知故障类型");
+  });
+});
+
+// ────────────────────────────────────────────────────────────────
+// Round-32b — the three-group split (in_flight / needs_recovery /
+// uncleared): the card buckets its liability-live rows by the
+// server-legislated ``group`` field and renders one header per
+// non-empty bucket, in GROUP_ORDER. Group membership arrives on the
+// row (state.py's ``liability_group_for``); rows WITHOUT a group
+// (pre-round-32b history payloads) keep the flat legacy layout.
+// Language is pinned to en so the header-text assertions are also
+// i18n-key-existence assertions (a missing key renders the raw key
+// text, failing the assertion).
+// ────────────────────────────────────────────────────────────────
+describe("PendingTasksCard / three-group split (round-32b)", () => {
+  const grouped: PendingTasksCardItem = {
+    kind: "pending_tasks_card",
+    id: "boot-pending",
+    tasks: [
+      {
+        taskId: "task-flight-1",
+        faultType: "cpu_fullload",
+        state: "injecting",
+        createdAt: "2026-05-18T09:00:00Z",
+        group: "in_flight",
+      },
+      {
+        taskId: "task-recover-1",
+        faultType: "network_delay",
+        state: "failed",
+        createdAt: "2026-05-18T09:05:00Z",
+        group: "needs_recovery",
+      },
+      {
+        taskId: "task-ghost-1",
+        faultType: "disk_fill",
+        state: "completed",
+        createdAt: "2026-05-18T09:10:00Z",
+        group: "uncleared",
+      },
+    ],
+  };
+
+  it("renders one header per non-empty bucket, in GROUP_ORDER", () => {
+    const before = getActiveLang();
+    configureI18n("en");
+    try {
+      const { lastFrame } = render(<PendingTasksCard item={grouped} />);
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("In flight");
+      expect(frame).toContain("Awaiting recovery");
+      expect(frame).toContain("Completed but uncleared");
+      // Display order legislated by GROUP_ORDER: quiet traffic first,
+      // the ghost family last (loudest).
+      const inflight = frame.indexOf("In flight");
+      const recover = frame.indexOf("Awaiting recovery");
+      const uncleared = frame.indexOf("Completed but uncleared");
+      expect(inflight).toBeGreaterThanOrEqual(0);
+      expect(recover).toBeGreaterThan(inflight);
+      expect(uncleared).toBeGreaterThan(recover);
+    } finally {
+      configureI18n(before);
+    }
+  });
+
+  it("buckets each row under its own group's header", () => {
+    const before = getActiveLang();
+    configureI18n("en");
+    try {
+      const { lastFrame } = render(<PendingTasksCard item={grouped} />);
+      const lines = (lastFrame() ?? "").split("\n");
+      const flightIdx = lines.findIndex((l) => l.includes("In flight"));
+      const recoverIdx = lines.findIndex((l) => l.includes("Awaiting recovery"));
+      const unclearedIdx = lines.findIndex((l) =>
+        l.includes("Completed but uncleared"),
+      );
+      const rowIdx = (id: string) =>
+        lines.findIndex((l) => l.includes(id));
+      expect(rowIdx("task-flight-1")).toBeGreaterThan(flightIdx);
+      expect(rowIdx("task-flight-1")).toBeLessThan(recoverIdx);
+      expect(rowIdx("task-recover-1")).toBeGreaterThan(recoverIdx);
+      expect(rowIdx("task-recover-1")).toBeLessThan(unclearedIdx);
+      expect(rowIdx("task-ghost-1")).toBeGreaterThan(unclearedIdx);
+    } finally {
+      configureI18n(before);
+    }
+  });
+
+  it("omits headers for empty buckets", () => {
+    const before = getActiveLang();
+    configureI18n("en");
+    try {
+      const item: PendingTasksCardItem = {
+        ...grouped,
+        tasks: grouped.tasks.slice(0, 1),
+      };
+      const { lastFrame } = render(<PendingTasksCard item={item} />);
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("In flight");
+      expect(frame).not.toContain("Awaiting recovery");
+      expect(frame).not.toContain("Completed but uncleared");
+    } finally {
+      configureI18n(before);
+    }
+  });
+
+  it("renders group-less rows flat (legacy payloads), no headers", () => {
+    // Pre-round-32b history items carry no group — the card must NOT
+    // force-bucket them (an unknown group is not "in flight").
+    const before = getActiveLang();
+    configureI18n("en");
+    try {
+      const { lastFrame } = render(<PendingTasksCard item={POPULATED} />);
+      const frame = lastFrame() ?? "";
+      // POPULATED's two rows have no group: flat rows, zero headers.
+      expect(frame).toContain("task-abc-12345");
+      expect(frame).toContain("task-def-67890");
+      expect(frame).not.toContain("In flight");
+      expect(frame).not.toContain("Awaiting recovery");
+      expect(frame).not.toContain("Completed but uncleared");
+    } finally {
+      configureI18n(before);
+    }
+  });
+
+  it("degrades an unknown group word to the flat layout (fail-safe, no crash)", () => {
+    // F-1 (round-32b self-review): the TS literal union is a
+    // compile-time claim; the wire field is RUNTIME data. A server
+    // that legislated a FOURTH group word (or a newer server paired
+    // with an older TUI binary in the independent-distribution
+    // upgrade window) delivers a word this build never knew — the
+    // card must degrade that row to the flat legacy layout, never
+    // throw (the boot-card "never worth failing a boot over" contract,
+    // extended to the render face). Before the isGroupKey guard this
+    // shape crashed the whole card on ``buckets[unknown].push``.
+    const before = getActiveLang();
+    configureI18n("en");
+    try {
+      const tasks: PendingTaskRow[] = [
+        {
+          taskId: "task-known",
+          faultType: "cpu_fullload",
+          state: "failed",
+          createdAt: "2026-05-18T09:00:00Z",
+          group: "needs_recovery",
+        },
+        {
+          taskId: "task-unknown-group",
+          faultType: "disk_fill",
+          state: "completed",
+          createdAt: "2026-05-18T09:05:00Z",
+          // Deliberately outside the legislated union — the runtime
+          // shape a vocabulary drift actually delivers.
+          group: "fourth_epoch" as unknown as PendingTaskRow["group"],
+        },
+      ];
+      const item: PendingTasksCardItem = {
+        kind: "pending_tasks_card",
+        id: "boot-pending",
+        tasks,
+      };
+      const { lastFrame } = render(<PendingTasksCard item={item} />);
+      const frame = lastFrame() ?? "";
+      // The known bucket still renders with its header…
+      expect(frame).toContain("Awaiting recovery");
+      expect(frame).toContain("task-known");
+      // …the unknown word degrades to a flat row (rendered, no throw)…
+      expect(frame).toContain("task-unknown-group");
+      // …and no phantom header for a group this build never legislated.
+      expect(frame).not.toContain("fourth_epoch");
+    } finally {
+      configureI18n(before);
+    }
   });
 });

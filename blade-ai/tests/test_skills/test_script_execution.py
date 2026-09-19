@@ -456,8 +456,10 @@ class TestOutputFormatting:
         assert "import error" in output
 
     @pytest.mark.asyncio
-    async def test_output_truncation(self, registry_with_scripts, mocker):
-        """Long stdout should be truncated."""
+    async def test_moderate_output_near_complete(self, registry_with_scripts, mocker):
+        """Long-but-reasonable stdout (10K chars, well under the 64KB
+        safety valve) returns NEAR-COMPLETE: no truncation markers —
+        governance is the compactor's job, not the tool layer's."""
         long_output = "x" * 10000
         mock_result = CommandResult(
             exit_code=0, stdout=long_output, stderr="", duration_ms=50.0
@@ -472,9 +474,94 @@ class TestOutputFormatting:
             "test-skill", "list_items.py"
         )
 
-        assert "truncated" in output
-        # Output should be shorter than the original
-        assert len(output) < len(long_output)
+        assert "truncated" not in output.lower()
+        assert "elided" not in output
+        assert long_output in output  # full body present
+
+    @pytest.mark.asyncio
+    async def test_long_traceback_near_complete_tail_kept(self, registry_with_scripts, mocker):
+        """Failure stderr is a Python traceback: the exception type+message
+        lives at the TAIL. The old [:1000] head cut hid exactly that — now
+        a 5K-char traceback returns near-complete (valve does not fire)."""
+        traceback_head = "Traceback (most recent call last):\n" + '  File "script.py", line 1\n' * 150
+        exception_tail = "ValueError: kubeconfig path is required for k8s scope"
+        stderr = traceback_head + exception_tail
+        assert len(stderr) > 1000  # would have been head-cut under the old regime
+        mock_result = CommandResult(
+            exit_code=1, stdout="", stderr=stderr, duration_ms=50.0
+        )
+        mocker.patch(
+            "chaos_agent.skills.registry.run_command",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        )
+
+        output = await registry_with_scripts.execute_script(
+            "test-skill", "list_items.py"
+        )
+
+        assert "[ERROR]" in output
+        assert exception_tail in output   # tail verdict survives
+        assert traceback_head in output   # head frames survive too
+        assert "truncated" not in output.lower()
+
+    @pytest.mark.asyncio
+    async def test_runaway_output_hits_safety_valve(self, registry_with_scripts, mocker):
+        """>64KB runaway script output: shared safety valve middle-cut —
+        both ends kept, quantified elision, shared notice (kind by outcome)."""
+        blob = "D" * (70 * 1024)
+        mock_result = CommandResult(
+            exit_code=0, stdout=blob, stderr="", duration_ms=50.0
+        )
+        mocker.patch(
+            "chaos_agent.skills.registry.run_command",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        )
+
+        output = await registry_with_scripts.execute_script(
+            "test-skill", "list_items.py"
+        )
+
+        assert "Exit code: 0" in output
+        assert "bytes elided" in output
+        assert "⚠️ OUTPUT_TRUNCATED" in output
+        # Script-appropriate guidance, NOT the shared notice's default
+        # kubectl narrowing strategies (--field-selector/jsonpath advice
+        # on a script's stdout would be actively misleading).
+        assert "narrow the script's output" in output
+        assert "Do NOT repeat the same query!" in output
+        assert "--field-selector" not in output
+        assert "jsonpath" not in output
+        # valve ceiling is honest — the notice counts against the body's
+        # budget; the [Script: ...] header is valve-OUTSIDE metadata (it
+        # always survives untouched, never participates in the middle
+        # cut), bounded here by 128B of header/join prefix bytes.
+        assert len(output.encode("utf-8")) <= 64 * 1024 + 128
+
+    @pytest.mark.asyncio
+    async def test_runaway_failure_valve_keeps_stderr_tail(self, registry_with_scripts, mocker):
+        """>64K failure: the stderr tail (exception message) must survive
+        the valve's middle cut — verdicts live at the tail."""
+        blob = "T" * (70 * 1024)
+        exception_tail = "RuntimeError: cluster unreachable after 3 attempts"
+        mock_result = CommandResult(
+            exit_code=1, stdout=blob, stderr=exception_tail, duration_ms=50.0
+        )
+        mocker.patch(
+            "chaos_agent.skills.registry.run_command",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        )
+
+        output = await registry_with_scripts.execute_script(
+            "test-skill", "list_items.py"
+        )
+
+        assert "[ERROR]" in output
+        assert exception_tail in output        # stderr tail survives the cut
+        assert "bytes elided" in output
+        assert "TAIL" in output                 # kind=error guidance
 
     @pytest.mark.asyncio
     async def test_stderr_omitted_when_empty(self, registry_with_scripts, mocker):

@@ -19,6 +19,7 @@ from chaos_agent.agent.result.verdict import (
     Layer2Status,
     RecoverVerdict,
     RecoverVerificationResult,
+    ResidualAttribution,
     StructuredWarning,
     VerificationResult,
     WarningCode,
@@ -35,7 +36,13 @@ class TestEnumValues:
         assert set(v.value for v in InjectVerdict) == {"verified", "partial", "unverified"}
 
     def test_recover_verdict_values(self):
-        assert set(v.value for v in RecoverVerdict) == {"recovered", "partial", "failed"}
+        # B76 round-14 F1: the closure is the four words the pipeline
+        # actually produces ("failed" was unreachable; the clamp maps it
+        # to "unrecovered"). See test_verdict_vocabulary_single_source.py
+        # for the enum==clamp==prompt==regex reconciliation pins.
+        assert set(v.value for v in RecoverVerdict) == {
+            "recovered", "partial", "unverified", "unrecovered"
+        }
 
     def test_layer1_status_values(self):
         assert set(v.value for v in Layer1Status) == {"passed", "failed", "error", "skipped", "unknown", "warning", "in_progress"}
@@ -64,6 +71,9 @@ class TestEnumValues:
             "replan_exhausted", "verification_failed", "recovery_failed",
             "recovery_verification_timeout", "internal_error",
             "wall_clock_timeout",
+            # write-set-approval-contract: the unattended widened-contract
+            # early exit and the honest CLI drift termination (B12).
+            "write_set_boundary", "drift_terminated",
         }
         assert set(v.value for v in FailureCategory) == expected
 
@@ -86,6 +96,72 @@ class TestStrEnumMixin:
 
     def test_layer2_status_from_string(self):
         assert Layer2Status("passed") == Layer2Status.PASSED
+
+
+# ---------------------------------------------------------------------------
+# Rendering form (B76 round-13 Q1) — the display half of the str-Enum trap
+# ---------------------------------------------------------------------------
+
+
+class TestEnumRenderingForm:
+    """Every rendering channel must yield the VALUE, never the class name.
+
+    Under the legacy ``(str, Enum)`` base on Python 3.11+, f-strings
+    rendered ``Layer1Status.FAILED`` (not ``failed``) into 38 sites —
+    including the failure_reason contract field — while every equality
+    check kept passing, which is exactly how the defect survived six
+    ledger-focused review rounds. The verdict enums are now ``StrEnum``;
+    these pins hold the line against any regression of that base.
+    """
+
+    ENUM_FAMILIES = (
+        InjectVerdict,
+        RecoverVerdict,
+        Layer1Status,
+        Layer2Status,
+        ChecklistItemStatus,
+        WarningCode,
+        ResidualAttribution,
+        FailureCategory,
+    )
+
+    def test_every_member_renders_value_on_all_channels(self):
+        """All 8 families × all members × f-string/str()/format()."""
+        for family in self.ENUM_FAMILIES:
+            for member in family:
+                assert f"{member}" == member.value, (
+                    f"{family.__name__}.{member.name}: f-string renders class name"
+                )
+                assert str(member) == member.value
+                assert format(member) == member.value
+
+    def test_equality_with_plain_str_survives(self):
+        """The fix is display-only: comparison semantics unchanged."""
+        assert Layer1Status.FAILED == "failed"
+        assert FailureCategory.VERIFICATION_FAILED == "verification_failed"
+        assert Layer1Status("warning") is Layer1Status.WARNING
+
+    def test_contract_field_rendering_end_to_end(self):
+        """The verifier.py L288 shape: a Layer1Result object interpolated
+        into the failure-detail f-string must read ``Layer1=failed`` —
+        this exact expression is what flows into the failure_reason
+        task-JSON contract field (pre-fix: ``Layer1=Layer1Status.FAILED``)."""
+        layer1 = Layer1Result(status=Layer1Status.FAILED, details="mock")
+        detail = f"Layer1={layer1.status}, Layer2=skipped, details={layer1.details[:200]}"
+        assert detail == "Layer1=failed, Layer2=skipped, details=mock"
+
+    def test_recovery_status_message_rendering(self):
+        """The _recover_finalize.py L406 shape: the user-visible status
+        message renders the cache-restored (pydantic-coerced) enum member
+        as its plain value."""
+        restored = Layer1Result.model_validate(
+            {"status": "failed", "details": "from cache", "raw_output": ""}
+        )
+        assert isinstance(restored.status, Layer1Status)  # coerced back to enum
+        msg = f"Recovery verification: recovered (Layer1: {restored.status}, Layer2: passed)"
+        assert msg == (
+            "Recovery verification: recovered (Layer1: failed, Layer2: passed)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -270,9 +346,11 @@ class TestVerificationResult:
 
 
 class TestRecoverVerificationResult:
-    def test_default_level_is_failed(self):
+    def test_default_level_is_unrecovered(self):
+        # B76 round-14: fail-closed default mirroring the pipeline clamp
+        # (a result with no verdict is not a confirmed recovery).
         rvr = RecoverVerificationResult()
-        assert rvr.level == RecoverVerdict.FAILED
+        assert rvr.level == RecoverVerdict.UNRECOVERED
 
     def test_recovered_construction(self):
         rvr = RecoverVerificationResult(

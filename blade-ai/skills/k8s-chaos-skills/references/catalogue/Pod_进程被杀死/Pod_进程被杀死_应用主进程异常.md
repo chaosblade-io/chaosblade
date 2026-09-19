@@ -1,63 +1,111 @@
 **用例名称** 应用主进程异常 导致 Pod_进程被杀死
 
+**故障定位**：持续型故障——故障窗口内容器反复被终止重建，Pod RestartCount 持续增长；
+超过 kubelet 退避阈值后进入 CrashLoopBackOff。**本用例不提供一次性注入**：单次杀死
+随 kubelet 重建收敛（15-90s）即自愈，不构成有效演练窗口；`duration_seconds` 是必填的
+故障窗口契约，未给定时先向用户确认，不得默认成一次性操作。
+上游取证（chaosblade-exec-os `exec/process/process_kill.go`）：`pod-process kill` 仅在
+实验创建时发送**一次**信号，`--timeout` 只控制实验记录何时销毁，**不存在**窗口内持续
+杀进程的机制——任何声称 "timeout 窗口内持续杀" 的写法都是错误的，ChaosBlade kill 类
+action 的一次性形态已被本用例废除。
+
 **故障现象**：
-1. 容器内应用主进程被杀死，容器因主进程退出而重启
-2. Pod RestartCount 持续增长
-3. 若持续杀进程超过退避阈值，Pod 状态可能进入 CrashLoopBackOff
+1. 容器内应用主进程反复被杀死，容器因主进程退出而被 kubelet 重建
+2. Pod RestartCount 在故障窗口内持续增长
+3. 持续杀进程超过退避阈值后，Pod 状态进入 CrashLoopBackOff
 4. Pod Events 中显示 `Back-off restarting failed container`
 
 **资源准备**：
-1. 确认应用 A 已正常运行
+1. 确认应用 A 已正常运行，确认 `duration_seconds`（故障窗口）已明确
 2. 确认目标 Pod 所在 namespace 和 labels
-3. 确认容器内实际进程名（不可凭服务名猜测）
+3. 确认目标容器名（循环里 `crictl ps --name` 依赖它；多容器 Pod 必须核对归属，
+   跨 Pod 同名容器会命中多个）
+4. 确认 `restartPolicy`：`kubectl get pod <pod-name> -n <namespace> -o jsonpath={.spec.restartPolicy}`——`Never` 的 Pod 被杀后不会重建，故障变成永久停机而非反复重启，需先与用户确认
 
 **演练步骤**：
 1. 记录应用 A 当前 Pod 状态和 RestartCount：
    ```bash
    kubectl get pods -l <labels> -n <namespace> -o wide
    ```
-2. **验证实际进程名（必须）** — 进入容器确认目标进程的二进制名称：
+2. 探测可行性（必须先探测再下结论，不得未探测即否决）：确认节点侧 `crictl` 可用
+   （位于 `/usr/bin/crictl`，已连通 containerd；docker/CRI-O 运行时 CLI 不同，
+   先 `chroot /host crictl version` 确认）与 debug pod 镜像可用
+   （`<verified-cluster-image>`）。确实不可用时如实报告"持续注入不可行"并请用户
+   确认，不得静默降级成其他形态。
+3. 注入 —— 节点侧武装**双 systemd-run 的定时自停 stop 循环**（唯一形态，持续注入；
+   循环本体与终止 timer 均为宿主机 transient unit——武装命令秒回即返，不依赖
+   debug pod 存续、不撞 one-shot debug 命令的硬时限；恢复先于自断，与网络隔离类
+   用例一致）：
    ```bash
-   kubectl exec <pod-name> -n <namespace> -- ps aux
+   kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
+     -- chroot /host sh -c '
+     systemd-run --unit=blade-stoploop-<pod-name> sh -c "for i in \$(seq 1 <rounds>); do SID=\$(crictl pods --namespace <namespace> --name <pod-name> -q | head -1); CID=\$(crictl ps --pod \$SID --name <container-name> -q | head -1); [ -n \"\$CID\"] && crictl stop -t 0 \$CID; sleep <interval>; done" &&
+     systemd-run --on-active=<duration>s --unit=blade-stoploop-term-<pod-name> sh -c "pkill -f \"crictl st[o]p -t 0\"; pkill -x crictl; true"
+   '
    ```
-   注意：实际进程名可能与服务名不同（如 prometheus 服务的实际二进制为 `prometheus-agent-linux`），必须以 ps 输出为准
-3. 使用 ChaosBlade 注入进程杀死故障：
-   ```bash
-   blade create k8s pod-process kill \
-     --process <实际进程名> \
-     --signal 15 \
-     --namespace <namespace> \
-     --labels <labels> \
-     --timeout <秒> \
-     --kubeconfig <路径>
-   ```
-   说明：`--signal 15` 发送 SIGTERM，如需强制杀死可用 `--signal 9`（SIGKILL）
+   参数说明：
+   - `<duration>`：故障窗口总时长（秒），取 `duration_seconds`；终止 timer 到期
+     自动终止循环，**无需 destroy**；应 ≥ `<rounds> × <interval>` 并留余量
+   - `<interval>`：两轮 stop 的间隔（秒），建议 ≥ 15，给 kubelet 留出重建与退避爬坡空间
+   - `<rounds>`：循环轮数上限，是终止 timer 之外的第二重保险
+   - 循环本体是 transient unit `blade-stoploop-<pod-name>.service`（`--unit=` 不带
+     `--on-active`：武装即启动、后台运行，宿主机 PID 1 托管）；终止 timer 是
+     `blade-stoploop-term-<pod-name>.timer`，到期执行 pkill 载荷——正则
+     `crictl st[o]p -t 0` 命中循环 sh 的 cmdline 中的字面 `crictl stop -t 0`，
+     循环 unit 主进程被杀、systemd 清收 cgroup 内残余 crictl（终止器自身 cmdline
+     含 `st[o]p` 而非 `stop` 字面，不自匹配）
+   - **循环体里的 `$(...)` 与 `$VAR` 必须整体转义**（`\$(...)`、`\$CID`）——外层
+     `sh -c '...'` 的双引号载荷里，未转义的 `$(...)`/`$CID` 会在**武装时刻**被外层
+     shell 提前展开：彼时变量未定义，`[ -n "" ]` 固化进命令文本恒假短路，
+     循环每轮空转零注入（静默失败）
+   - **systemd-run 的 timer 载荷必须写成单行**（双引号内不得换行）——载荷含换行时
+     systemd 组装 transient unit 的 ExecStart 解析失败（journal 报
+     `/run/systemd/transient/<unit>.service:4: Missing '='`，终止器形同虚设，复现）
+   - `[ -n \"\$CID\" ]` 的 `]` 前必须有空格——POSIX test 语法要求，缺空格时 sh 报
+     `[ missing ']'` 且循环每轮短路，crictl stop 从不执行（零注入静默失败，复现；
+     守卫与 corpus 测试不执行 shell 语义，此类错误只能现场执行才能发现）
+   - **每轮必须重新解析容器 ID**——kubelet 每轮重建容器后
+     ID 会变化，把 ID 固化进循环（无论武装时刻还是第 1 轮），第 2 轮起就会空转；
+     解析必须用 `--pod <podSandboxId>` 限定（先用 `crictl pods --namespace <namespace> --name <pod-name>` 按 Pod 名解析 sandbox）——同名容器遍布集群多个 Pod，不限定会停错 Pod 的容器
+   - timer 载荷里的 `st[o]p` 是防自匹配技巧（括号法）：若直接写 `stop`，pkill -f 的
+     正则命中不了目标却可能误伤自身命令行；写成 `st[o]p` 后模式文本不含字面 `stop`
+     （自身 cmdline 不自匹配），而正则字符类 `[o]` 仍匹配 `o`（目标 `crictl stop`
+     照常命中）。**不要用 `sto$((0+0))p` 算术拆开法**——timer 触发时第二层展开把
+     `$((0+0))` 求值为 `0`，模式变 `sto0p` 永不匹配，终止器形同虚设
+   - 循环与终止 timer 均由宿主机 PID 1 管理（双 transient unit），kubectl debug
+     仅作一次性武装通道（命令秒回即返）——debug pod 删除后循环与自停恢复均不受
+     影响。**不要把循环写成 debug 命令的前台载荷**（`... && sh -c "for ..."` 形态）：
+     one-shot debug 命令有硬时限（120s 自动清理），前台循环会被掐断，批准的故障
+     窗口无法兑现——工具运行时约束优先于任何文档形态
 4. 观察 Pod 重启行为
+
+> **语义（必须写进演练报告）**：`crictl stop` 停的是**整个容器**（该容器内所有进程
+> 一起终止），不是容器内某个进程；它绕过 kubelet 直接操作容器运行时，kubelet 事后
+> 按 restartPolicy 重建。exit code 由 `-t` 决定：`-t 0` 立即 SIGKILL（exit code 137，
+> `Reason: Error`）；省略 `-t` 或给正值则先 SIGTERM、超时后才 SIGKILL（可能显示
+> `Reason: Completed` 或 `Error`）。若演练目的包含**精确验证 OOM/崩溃告警的
+> exit code 匹配规则**，按需选择 `-t` 取值并在报告中注明。
 
 **注入验证**：
 1. 执行 `kubectl get pods -l <labels> -n <namespace>`，确认 RESTARTS 数相比注入前增加
 2. 确认容器发生过重建：优先从 `kubectl get pod <pod-name> -n <namespace> -o json` 读取 containerID 变化与 Last State（terminated 时间戳）——**故障生效期间容器正在崩溃，exec 大概率失败（unable to upgrade connection），不要把 exec 作为首选**；exec `ps aux` 看 PID 变化仅作容器已稳定时的补充手段
-3. 执行 `kubectl describe pod <pod-name> -n <namespace>`，确认 Events 中有 `Back-off restarting failed container` 或 Last State 显示 terminated 且 reason 为 Error/Signal（第 1、3 步相互独立，应同批并行执行）
-4. 若 timeout 期间持续杀进程，确认 Pod 状态是否进入 CrashLoopBackOff
-5. **持续性检查（"反复重启"意图必须做）**——判据是"无外部干预下杀进程仍在继续"，按证据强度分层：
-   - **白盒主证（首选，即时）**：故障机制本身仍存活——blade 实验状态 Running，或路径 B 的 `systemctl is-active <unit>` 为 active 且守卫 timer pending。机制存活且循环指向目标容器时，"持续在杀"由构造成立
-   - **有界佐证（≤60 秒）**：静观一个短窗口后再次执行 `kubectl get pods`，RESTARTS 无干预递增即强确认。注意 CrashLoopBackOff 深期 kubelet 退避可达 60-90 秒，窗口内未见递增不等于机制已停——以白盒主证为准，佐证缺失如实记录即可
-   - **黑盒回退（仅当机制状态完全不可查时）**：停止一切操作、静观 1-2 分钟后再查 RESTARTS
-   - 若机制已终止且计数不再增长，说明达成的是**离散重启**（每次重启都靠外部触发），不是持续的"反复重启"状态，验证结论必须如实写"离散重启 N 次"，不得报"反复重启已达成"
+3. 执行 `kubectl describe pod <pod-name> -n <namespace>`，确认 Events 中有 `Back-off restarting failed container` 或 Last State 显示 terminated 且 reason 为 Error/Signal（第 1、3 步相互独立，应同批并行执行；只读探针一律单命令直发，不做 `sh -c 'a && b'` 串联——串联形态下一条失败会连坐整链）
+4. CrashLoopBackOff 由构造成立：RESTARTS 持续递增（第 1 步）+ 第 3 步**任一分支**（Back-off 事件，或 Last State terminated/Error）即证明已越过退避阈值、kubelet 已进入退避控制——状态标签是这些量的渲染，不等其文本出现；首检已观测到标签时如实记录即可
+5. **持续性检查（必做）**——判据是"无外部干预下杀进程仍在继续"。本步证明的是持续性（机制将运转到窗口结束），不是效果存在——效果已由第 1-3 步证明；对持续性命题，机制状态就是直接证据。三层按可得性取用，**任一层成立即完成本步，下层仅为上层不可查时的回退**：
+   - **白盒主证（即时，单独充分）**：故障机制本身仍存活——`systemctl is-active blade-stoploop-<pod-name>` 为 active（循环 unit）且终止 timer pending（`systemctl list-timers` 含 `blade-stoploop-term-<pod-name>.timer`；经 debug pod `chroot /host` 查询）。机制存活且循环指向目标容器时，"持续在杀"由构造成立——本步即完成，无需佐证窗口
+   - **有界佐证（仅当白盒不可查时）**：静观一个短窗口（≤60 秒）后再次执行 `kubectl get pods`，RESTARTS 无干预递增即完成。CrashLoopBackOff 深期 kubelet 退避可达 60-90 秒，窗口内未见递增不等于机制已停——此情形如实记录退避歧义即可
+   - **黑盒回退（仅当以上均不可查时）**：停止一切操作、静观 1-2 分钟后再查 RESTARTS
+   - 若机制在窗口内提前终止，说明故障窗口契约未达成，必须如实报告实际持续时长，不得报"持续注入已达成"
 
 **注入恢复**：
-1. 销毁 ChaosBlade 实验：
-   ```bash
-   blade destroy <实验UID>
-   ```
-2. 或等待 `--timeout` 到期后 ChaosBlade 自动停止杀进程
-3. 说明：进程被杀后容器 entrypoint 会自动拉起主进程，ChaosBlade 的 timeout 控制的是"持续杀进程"的时长，超时后不再杀进程，容器自行恢复
-4. 路径 B 持续模式（见降级方案）：等待 `systemd-run` timer 到期后循环自动终止；
-   如需提前终止，经 debug pod 依次执行两条命令——停掉 timer + 手动执行与 timer
-   载荷同款的终止 pkill（两条独立命令，不要串联；括号写法防 pkill 自匹配）：
+1. 等待终止 timer 到期后循环自动终止（主保险）：pkill 载荷杀循环 sh，systemd
+   清收 cgroup，循环 unit 随之 inactive
+2. 如需提前终止，经 debug pod 依次执行两条命令——停掉终止 timer + 手动执行与
+   timer 载荷同款的终止 pkill（pkill 命中的正是循环 sh——其 cmdline 含字面
+   `crictl stop -t 0`；两条独立命令，不要串联；括号写法防 pkill 自匹配）：
    ```bash
    kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
-     -- chroot /host systemctl stop <unit-name>.timer
+     -- chroot /host systemctl stop blade-stoploop-term-<pod-name>.timer
    kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
      -- chroot /host pkill -f 'crictl st[o]p -t 0'
    ```
@@ -68,164 +116,25 @@
 3. 确认应用 A 服务正常响应
 
 **基准事实**：
-- **根因**：容器内应用主进程被外部信号（SIGTERM/SIGKILL）杀死，导致容器退出并被 kubelet 重启
-- **必现现象**：Pod RestartCount 增长；容器 Last State 为 terminated（Exit Code 非 0）；进程 PID 在重启后变化；Events 显示容器重启记录
+- **根因**：容器内应用主进程被外部信号（SIGTERM/SIGKILL）反复杀死，容器退出并被 kubelet 重建，形成有界的自主重启风暴
+- **必现现象**：Pod RestartCount 在窗口内持续增长；容器 Last State 为 terminated（Exit Code 非 0）；进程 PID 在重启后变化；Events 显示容器重启记录
 
 ---
 
-**降级方案（kubectl-native）**
+**手段2（kubectl-native）**
 
-> 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效进程杀死注入。
-> 两条路径按容器内是否有 `kill`/`pgrep` 二选一。
-
----
-
-**路径 A —— 容器内有 `kill` 和 `pgrep`**
-
-前提条件：容器内需有 `kill` 和 `pgrep` 工具。先确认：
-```bash
-kubectl exec <pod-name> -n <namespace> -- sh -c 'command -v kill; command -v pgrep'
-```
-两者都有输出才走本路径；任一缺失（distroless / scratch 极简镜像的常态）走路径 B。
-
-注入命令：
-```bash
-# 杀死目标进程（SIGTERM）
-kubectl exec <pod-name> -n <namespace> -- sh -c 'kill -15 $(pgrep -x <process-name>)'
-# 强制杀死（SIGKILL）：
-kubectl exec <pod-name> -n <namespace> -- sh -c 'kill -9 $(pgrep -x <process-name>)'
-```
-**必须用 `pgrep -x`（按进程名精确匹配），严禁 `pgrep -f`（按 cmdline 匹配）**——exec shell 自身的 cmdline 含进程名字面量，会被 -f 误匹配，kill 把 exec shell 一起杀掉（kubectl exec 报 `command terminated with exit code 143/137`，rc 判读混乱，实测复现）；理由同 Pod_进程异常_进程被挂起 路径 A 注记。
-
-恢复命令：
-```bash
-# 进程由容器编排自动重启（K8s restartPolicy）
-# 无需手动恢复，容器 entrypoint 会自动拉起主进程
-```
+> 上方演练步骤的节点侧 `systemd-run` 有界循环即唯一注入形态，**不存在独立的手段2**。
+> 一次性形态已被本用例废除：单次容器内 kill、单次 `crictl stop` 只换来一次重启、随
+> kubelet 重建即自愈；ChaosBlade `pod-process kill` 经上游源码取证为一次性信号投递
+> （`--timeout` 只销毁实验记录），三者均不构成持续故障窗口，没有演练价值。
 
 注意事项：
-- 必须确认实际进程名（通过 `ps aux` 确认），不可凭服务名猜测；确认的进程名同时就是 `pgrep -x` 的匹配词
-- **验证"已杀死"不能用 pgrep/ps 存在性**：容器 PID 1 为非 init 程序（如 `sleep`、单二进制前台进程——单进程容器常态）时不收割子进程，被杀进程变僵尸（`/proc/<pid>/status` 的 State 为 `Z (zombie)`），pgrep/ps 仍列出它、`kill -9` 也"无效"（实测 busybox sleep 作 PID 1 复现，三个被杀 httpd 全部变 Z）。判死用 `/proc/<pid>/status` State（Z=已杀死未收割）或服务端口无响应；判活用 State 为 S/R
-- **目标进程是容器 PID 1 时本路径无效（实测确证）**：内核 PID namespace 对容器内
-  init 有信号保护——未注册 handler 的 PID 1 会忽略 SIGTERM，连 SIGKILL 也投递不进去
-  （实测 busybox `sleep` 作 PID 1，`kill -15 1` / `kill -9 1` 均无任何效果）。
-  单进程容器（entrypoint 即主进程）属常态，注入前先 `ps` 确认目标 PID 是否为 1，
-  是则直接走路径 B（节点侧 `crictl stop` 实测有效，kubelet 会自动重启容器）
-- 单次执行只 kill 一次，不像 ChaosBlade 可在 timeout 窗口内持续 kill
-- "反复重启/持续崩溃"意图不要用 `watch`/循环脚本在容器内堆次数——应改用
-  路径 B 第 3 步的**持续模式**（节点侧 systemd-run 有界循环），它有定时自停兜底；
-  主方案 ChaosBlade `--timeout` 持续 kill 可用时优先用主方案
-- 效果与 ChaosBlade 单次 kill 等价，但缺少持续 kill 和自动超时停止的能力
-
----
-
-**路径 B —— 容器内没有 `kill`（极简镜像）：节点侧 `crictl stop`**
-
-从节点侧直接停掉容器，不需要容器内有任何二进制。
-
-> **语义差异（必须写进演练报告）**：`crictl stop` 停的是**整个容器**，不是容器内某个进程。
-> 它绕过 kubelet 直接操作容器运行时，kubelet 事后发现容器已终止并按 restartPolicy 重建，
-> 因此 Events 与 exit code 的表现和路径 A 的 `kill -9` **不完全一致**：
-> - 路径 A：主进程被杀 → 容器 exit code 137（128+9）→ `Reason: Error`
-> - 路径 B：容器被运行时停止 → exit code 由 `-t` 决定（`-t 0` 为 137，优雅停止为 0/143）
->   → 可能显示 `Reason: Completed` 或 `Error`
-> 若演练目的是**精确验证 OOM/崩溃告警的 exit code 匹配规则**，优先用路径 A。
->
-> **故障模式差异（同样必须写进演练报告）**：
-> - **离散重启**（单次或 N 轮手动 stop）：每次重启都由外部操作触发，操作一停重启即停——
->   故障效果随操作结束而消失，不构成持续故障状态
-> - **持续模式**（下方 systemd-run 有界循环）：timer 窗口内容器**自主**反复终止重建，
->   不依赖外部持续操作，才是"反复重启"的持续状态
-> 用户意图为"反复重启/持续崩溃"时，必须使用持续模式；若只做了离散多轮，
-> 报告必须如实写"离散重启 N 次"，不得报"反复重启已达成"。
-
-1. 定位目标节点与容器 ID：
-   ```bash
-   kubectl get pod <pod-name> -n <namespace> -o jsonpath={.spec.nodeName}
-   # 单容器 Pod 可直接取；多容器 Pod 必须按容器名挑，不要用 [0]
-   kubectl get pod <pod-name> -n <namespace> \
-     -o jsonpath={range.status.containerStatuses[*]}{.name}{.containerID}{end}
-   ```
-   containerID 形如 `containerd://<64位十六进制>`，**去掉 `containerd://` 前缀**后使用。
-
-2. 注入 —— 停掉容器：
-   ```bash
-   # -t 0 立即 SIGKILL，等价于路径 A 的 kill -9；
-   # 省略 -t 或给正值则先 SIGTERM、超时后才 SIGKILL（模拟优雅关闭失败场景）
-   kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
-     -- chroot /host crictl stop -t 0 <containerID去前缀>
-   ```
-   也可用容器名反查 ID（跨 Pod 同名会命中多个，需核对上一步的 ID 前缀）：
-   ```bash
-   kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
-     -- chroot /host sh -c 'crictl stop -t 0 $(crictl ps -q --name <container-name> | head -1)'
-   ```
-
-3. 注入（**持续模式**——"反复重启/持续崩溃"意图必须用本模式）：
-   单次 `crictl stop` 只换来一次重启，操作停止后故障即消失。要形成有界的自主重启风暴，
-   用 `systemd-run` 在宿主机武装一个**定时自停的 stop 循环**（恢复先于自断，
-   与网络隔离类用例一致）：
-   ```bash
-   kubectl debug node/<node-name> --image=<verified-cluster-image> --profile=sysadmin --quiet \
-     -- chroot /host sh -c '
-     systemd-run --on-active=<duration>s --unit=blade-stoploop-<pod-name> sh -c "pkill -f \"crictl st[o]p -t 0\"; pkill -x crictl; true" &&
-     sh -c "for i in \$(seq 1 <rounds>); do
-       CID=\$(crictl ps -q --name <container-name> | head -1)
-       [ -n \"\$CID\" ] && crictl stop -t 0 \$CID
-       sleep <interval>
-     done"
-   '
-   ```
-   参数说明：
-   - `<duration>`：故障窗口总时长（秒），timer 到期自动终止循环，**无需 destroy**；
-     应 ≥ `<rounds> × <interval>` 并留余量
-   - `<interval>`：两轮 stop 的间隔（秒），建议 ≥ 15，给 kubelet 留出重建与退避爬坡空间
-   - `<rounds>`：循环轮数上限，是 timer 之外的第二重保险
-   - **循环体里的 `$(...)` 与 `$VAR` 必须整体转义**（`\$(...)`、`\$CID`）——外层
-     `sh -c '...'` 的双引号载荷里，未转义的 `$(...)`/`$CID` 会在**武装时刻**被外层
-     shell 提前展开：彼时变量未定义，`[ -n "" ]` 固化进命令文本恒假短路，
-     循环每轮空转零注入（静默失败，实测教训）
-   - **systemd-run 的 timer 载荷必须写成单行**（双引号内不得换行）——载荷含换行时
-     systemd 组装 transient unit 的 ExecStart 解析失败（journal 报
-     `/run/systemd/transient/<unit>.service:4: Missing '='`，终止器形同虚设，实测复现）
-   - `[ -n \"\$CID\" ]` 的 `]` 前必须有空格——POSIX test 语法要求，缺空格时 sh 报
-     `[ missing ']'` 且循环每轮短路，crictl stop 从不执行（零注入静默失败，实测复现；
-     守卫与 corpus 测试不执行 shell 语义，此类错误只能实测发现）
-   - **每轮必须用 `crictl ps -q --name` 重新解析容器 ID**——kubelet 每轮重建容器后
-     ID 会变化，把 ID 固化进循环（无论武装时刻还是第 1 轮），第 2 轮起就会空转（实测教训）
-   - timer 载荷里的 `st[o]p` 是防自匹配技巧（括号法）：若直接写 `stop`，pkill -f 的
-     正则会先命中 timer 自己的 shell 命令行把它杀了，根本轮不到杀循环；写成 `st[o]p`
-     后模式文本不含字面 `stop`（自身 cmdline 不自匹配），而正则字符类 `[o]` 仍匹配
-     `o`（目标 `crictl stop` 照常命中）。**不要用 `sto$((0+0))p` 算术拆开法**——timer
-     触发时第二层展开把 `$((0+0))` 求值为 `0`，模式变 `sto0p` 永不匹配，终止器形同虚设
-   - timer 由宿主机 PID 1 管理，debug pod 删除后循环与自停恢复均不受影响
-   - 提前终止见上方"注入恢复"第 4 条
-
-验证：
-```bash
-# 容器重启次数 +1，且 lastState 显示上次终止原因
-kubectl get pod <pod-name> -n <namespace>
-kubectl describe pod <pod-name> -n <namespace>
-```
-`RESTARTS` 应递增；`Last State: Terminated` 的 `Exit Code` 与上面语义差异说明一致。
-
-恢复：
-```bash
-# 无需手动恢复 —— kubelet 按 restartPolicy 自动重建容器。
-# 确认新容器已 Ready：
-kubectl get pod <pod-name> -n <namespace> -o wide
-```
-持续模式的恢复：等 `<duration>` 到期 timer 自动终止循环（或按上方"注入恢复"第 4 条
-提前终止——停 `<unit-name>.timer` 并手动执行终止器 pkill），之后 kubelet 完成最后一次重建即稳定。
-恢复验证以"RESTARTS 停止增长 + Pod 1/1 Running"为准。
-
-注意事项：
+- 同名 transient unit 重复武装会报 `Unit ... was already loaded`（上次武装失败时
+  unit 以 failed 状态残留所致）；重武装前先清理残留（经 debug pod `chroot /host`
+  执行）：`systemctl stop <unit>; systemctl reset-failed <unit>`——循环 unit 用
+  `blade-stoploop-<pod-name>.service`、终止 timer 用
+  `blade-stoploop-term-<pod-name>.timer`
 - **不需要也不应该手动重启 Pod** —— kubelet 会自动重建；手动 delete 会掩盖真实的自愈行为
-- `restartPolicy: Never` 的 Pod **不会重建**，容器停了就一直停着。注入前先确认：
-  `kubectl get pod <pod-name> -n <namespace> -o jsonpath={.spec.restartPolicy}`
-- 停的是整个容器 → **该容器内所有进程都终止**，不是路径 A 的单个进程
-- 单次执行只停一次；"反复重启/持续崩溃"意图**必须用上方第 3 步的持续模式**
-  （systemd-run 有界循环），不要靠手动反复执行单轮 stop 堆次数——那只是离散重启，
-  操作一停故障即消失
-- `crictl` 实测在节点上位于 `/usr/bin/crictl`，已连通 containerd；其它运行时（docker/CRI-O）
-  的 CLI 不同，先用 `chroot /host crictl version` 确认可用
+- `restartPolicy: Never` 的 Pod **不会重建**，容器停了就一直停着，不构成反复重启故障，注入前必须确认（见资源准备第 4 条）
+- 停的是整个容器 → **该容器内所有进程都终止**，若演练目的精确到"只杀某个非 init 进程而容器不重启"，本用例不适用（该语义没有持续形态——进程级单次 kill 属一次性，已废除），如实报告并请用户确认
+- 不得用 `watch`/手动反复执行单轮 stop 堆次数——那依赖外部持续操作，操作一停故障即消失，不是本用例定义的自主持续故障

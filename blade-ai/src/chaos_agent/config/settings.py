@@ -378,9 +378,18 @@ class Settings(BaseSettings):
     # content 常为空。若不回传该字段，历史里只剩无理由的裸工具调用，模型每轮都要
     # 从原始输入重新推导意图 —— 单步任务下"重推导"恰好等于正确的下一步所以无害，
     # 多步任务下永远推导出第 1 步，形成不收敛循环。上限只是防单条异常膨胀的安全
-    # 阈值，不是常规裁剪手段（正常 thinking 在 100~2500 字符区间），上下文预算由
-    # PreReasoningHook 压缩系统统一管理。
-    reasoning_replay_max_chars: int = 8000    # BLADE_AI_REASONING_REPLAY_MAX_CHARS，回传 reasoning_content 的单条长度上限（超出保留尾部，结论在思考末尾）
+    # 阈值，不是常规裁剪手段，上下文预算由 PreReasoningHook 压缩系统统一管理。
+    # 8000→65536 (2026-09-18, #13-R 三测复盘)：旧值假设"正常 thinking 在 100~2500
+    # 字符区间"已被深思考模式淘汰——实测同一任务 32 条 AI 消息中 5 条超旧限（规划
+    # 三巨轮 9k/27k/34k 字符），旧限把"永不触发的防御阈值"变成了"每个深思考 case
+    # 必触发的常规裁剪"：巨轮 thinking 头部被截，下一轮看不见自己 60s 前的推演，
+    # 只能重推（admission 链在 I6/I7 逐句重演实证）——decode 重推远贵于 prefill
+    # 回传。65536 (实测最大值 34232 的 ~2×) → 327680 (2026-09-19 用户调宽)：防御带
+    # 放宽到 ~10×，常态巨轮与深失控轮全量回传，仅拦截 >320k 字符的极端爆炸轮；
+    # 代价可控——失控轮单条 input 上限从 ~20k tokens 放大到 ~100k tokens，仍在
+    # 1M context 预算内且由压缩系统按真实计数接手；预算一致性由 tokens.py 用
+    # replayed_reasoning 计数保证（压缩系统看到的载荷 = 线上载荷，不会失控）。
+    reasoning_replay_max_chars: int = 327680   # BLADE_AI_REASONING_REPLAY_MAX_CHARS，回传 reasoning_content 的单条长度上限（超出保留尾部，结论在思考末尾）
 
     # Verifier配置
     verifier_json_mode: bool = True            # BLADE_AI_VERIFIER_JSON_MODE，最终迭代启用 response_format JSON 模式强制结构化输出
@@ -406,6 +415,17 @@ class Settings(BaseSettings):
 
     # 确认开关
     confirmation_required: bool = False       # BLADE_AI_CONFIRMATION_REQUIRED，默认 auto（自动模式）
+
+    # 故障窗口持有开关（turn 通道专属，默认关）
+    # 开启后：TUI/HTTP turn 在注入 verify 完成后不立即终结，而是持有到
+    # 注入契约窗口结束（injection_start_time + duration_seconds），期间向
+    # SSE 流推送 fault_window 事件（enter/tick/exit），到点或 Ctrl+R 提前
+    # 触发后在同一 turn 内派发 recover graph 主线（销毁+恢复验证+结果
+    # 报告全程直播）。默认 False：CLI/SDK/TUI 行为字节不变；评测副本通
+    # 过 POST /api/v1/config/turn_hold_fault_window 按实例开启。
+    # 断流安全边界：持有期客户端断开（ESC）只终止直播，故障恢复仍由
+    # 既有的 blade --timeout / 载体定时器兜底，不新增泄漏面。
+    turn_hold_fault_window: bool = False      # BLADE_AI_TURN_HOLD_FAULT_WINDOW
 
     # 经验自进化开关
     self_evolution: bool = False              # BLADE_AI_SELF_EVOLUTION
@@ -511,9 +531,9 @@ class Settings(BaseSettings):
     timeout_skill_script: int = 60           # BLADE_AI_TIMEOUT_SKILL_SCRIPT，skill 脚本执行超时
 
     # 实验级默认时长(秒) — blade create 无 --timeout 时作为默认时长注入
-    # 已接线 fault_type.ensure_min_duration：低于 _DEFAULT_MIN_DURATION(600)
-    # 的值在运行时被钳位到 600（经验验证时延下限永远优先）
-    experiment_timeout: int = 600            # BLADE_AI_EXPERIMENT_TIMEOUT
+    # 已接线 fault_type.ensure_min_duration：未指定时取本配置与
+    # _DEFAULT_MIN_DURATION(300) 的较大者；显式声明的值 verbatim 执行
+    experiment_timeout: int = 300            # BLADE_AI_EXPERIMENT_TIMEOUT
 
     # Confirm gate 等待用户决策的最大秒数 — 超过则服务端礼貌中断 turn，避免用户离开后未回收 future
     # 默认 21600s (6 小时)：确认卡片弹出后用户常被别的事打断，1 小时的窗口实测太短
@@ -619,6 +639,10 @@ class Settings(BaseSettings):
     max_verify_replan_count: int = 3             # BLADE_AI_MAX_VERIFY_REPLAN_COUNT (verify-replan budget, independent)
     replan_auto_trigger: bool = True             # BLADE_AI_REPLAN_AUTO_TRIGGER, 自动检测可replan的错误模式
     replan_reset_execute_count: bool = True      # BLADE_AI_REPLAN_RESET_EXECUTE_COUNT, replan后重置execute_loop_count
+    # Task-lifetime budget of CLI auto-approved plan changes (B76 review E1):
+    # each approval also resets replan/execute budgets, so an unbounded approval
+    # loop would disarm the MAX_AGENT_LOOP unbounded-loop defence.
+    max_plan_change_auto_approvals: int = 3      # BLADE_AI_MAX_PLAN_CHANGE_AUTO_APPROVALS
 
     # Patch C — Wall-clock timeout 兜底
     # 单次 inject turn 的硬性墙钟上限。0 = 关闭（保留历史行为）；>0
@@ -668,6 +692,16 @@ class Settings(BaseSettings):
     retry_exponential_base: float = 2.0      # BLADE_AI_RETRY_EXPONENTIAL_BASE
     retry_jitter: bool = True                # BLADE_AI_RETRY_JITTER
 
+    # Transport层瞬态重试（wiz 派发层「No executor available / heartbeat is stale」
+    # ——命令未到执行层，重试语义安全；下沉 transport 层免掉 LLM 轮重试成本）
+    transport_transient_retry_max: int = 2          # BLADE_AI_TRANSPORT_TRANSIENT_RETRY_MAX (重试次数；0=禁用)
+    transport_transient_retry_base_delay: float = 30.0  # BLADE_AI_TRANSPORT_TRANSIENT_RETRY_BASE_DELAY (首次退避秒，翻倍逃升)
+
+    # 幂等调用点瞬态重试（B35：recover 判定类调用撞 API 瞬时故障；
+    # 只装饰幂等调用——纯读判定/GET/replace/delete 类，见 utils/retry_transient.py 契约）
+    retry_transient_max_attempts: int = 3           # BLADE_AI_RETRY_TRANSIENT_MAX_ATTEMPTS (含首次的总尝试次数；1=禁用)
+    retry_transient_base_delay: float = 2.0         # BLADE_AI_RETRY_TRANSIENT_BASE_DELAY (首次退避秒，翻倍逃升)
+
     # Checkpoint持久化 (默认存放在 memory_dir 下)
     checkpoint_db_path: Path = Path("")   # BLADE_AI_CHECKPOINT_DB_PATH, 空值则使用 memory_dir/checkpoints.db
     checkpoint_backend: str = "sqlite"    # BLADE_AI_CHECKPOINT_BACKEND, "sqlite" 或 "postgresql"
@@ -678,6 +712,7 @@ class Settings(BaseSettings):
     tasks_db_backend: str = "sqlite"     # BLADE_AI_TASKS_DB_BACKEND, "sqlite" 或 "postgresql"
     tasks_pg_dsn: str = ""              # BLADE_AI_TASKS_PG_DSN, PostgreSQL DSN (仅 postgresql 后端需要)
     tenant_id: str = ""                # BLADE_AI_TENANT_ID, 多租户隔离标识 (SDK 模式由平台注入)
+    workspace_id: str = ""             # BLADE_AI_WORKSPACE_ID, 空间隔离标识 (SDK 模式由平台注入; 本地 CLI 恒空 = 不过滤)
 
     # 存储目录
     memory_dir: Path = Path("~/.blade-ai/memory")  # BLADE_AI_MEMORY_DIR，与 config.json 同级
@@ -708,7 +743,11 @@ class Settings(BaseSettings):
     sse_batch_chars: int = 0        # BLADE_AI_SSE_BATCH_CHARS
 
     # Skill 脚本执行配置
-    skill_script_max_output: int = 4000  # BLADE_AI_SKILL_SCRIPT_MAX_OUTPUT，返回给 LLM 的 stdout 最大字符数
+    # Deprecated: skill script stdout is no longer truncated at the tool
+    # layer (truncation-governance-consistency) — near-complete output
+    # with a shared 64KB safety valve; governance is the compactor's job.
+    # Key kept for config-compat (existing config.json entries keep loading).
+    skill_script_max_output: int = 4000  # BLADE_AI_SKILL_SCRIPT_MAX_OUTPUT
 
     # Target-drift guard 子系统 (chaos_agent.agent.target_guard).
     # 默认 False 是灰度开关——先在生产环境观察 screener 的 log-only
@@ -735,6 +774,52 @@ class Settings(BaseSettings):
     # 条 API 通道被拖垮,把"注入生效切断连接"误判成"carrier 不可用"而拒绝。
     # 设 0(或负值)禁用窗口:每次 exec 都实时复核,退回本优化前的行为。
     carrier_liveness_ttl_seconds: int = 120  # BLADE_AI_CARRIER_LIVENESS_TTL_SECONDS
+
+    # 恢复载体标准件 (recovery-carrier) — API 平面恢复类演练的自建定时器
+    # 宿主栈（Pod + SA/Role/RoleBinding，见 openspec recovery-carrier-standard）。
+    # 载体名前缀是 classifier 形态判定的辅助信号（安全边界是网内同 ns +
+    # 任务侧注册，不是命名）；镜像集限定可执行骨架的镜像白名单；sleep 上限
+    # 与 occupant 契约同量级（载体的存活骨架，非故障窗口契约）。
+    recovery_carrier_name_prefix: str = "drill-rc-"  # BLADE_AI_RECOVERY_CARRIER_NAME_PREFIX
+    recovery_carrier_allowed_images: str = "busybox:1.36,busybox:latest,curlimages/curl:8.8.0,curlimages/curl:latest"  # BLADE_AI_RECOVERY_CARRIER_ALLOWED_IMAGES，逗号分隔（人工兜底入口）
+    # 程序自动发现的载体镜像（健康 DaemonSet 镜像 = 节点已缓存），由 preplan_probe
+    # 在任务启动时填充（进程内一次性，不持久化、不从 env/config.json 读取——
+    # 每次任务重新探测，与「环境事实以当次探测为准」纪律一致）。classifier 将
+    # allowed ∪ discovered 合并判定。VPC/受限网络集群不再依赖人工配置。
+    recovery_carrier_discovered_images: str = ""  # 逗号分隔；运行时可写（preplan_probe）
+    recovery_carrier_max_sleep_seconds: int = 86400  # BLADE_AI_RECOVERY_CARRIER_MAX_SLEEP_SECONDS
+
+    # 框架自建 debug pod（baseline 采集 / verifier 探针，见 execute/_debug_pod.py）
+    # 用的容器镜像。受限网络集群（VPC 无 docker.io 出口）拉不到默认 busybox，
+    # debug pod 必 ImagePullBackOff → wait 60s 超时 → 基线采集整轮报废（#23/#28
+    # 三样本）。默认空 = 候选链轮试（create_and_wait_debug_pod 按序试建，
+    # 确定性失败秒级放弃换下一个）：``recovery_carrier_discovered_images`` 全部
+    # 候选（preplan_probe 探测的健康 DaemonSet 镜像 = 节点已缓存；注意发现序是
+    # 字母序且不验证镜像工具链——Go 单二进制镜像可能排最前却无法承载
+    # ``-- sleep N`` 骨架，轮试 + 快速失败是可靠性的来源）> busybox 兜底。
+    # 显式配置则完全覆盖候选链（单一候选，人工兜底入口）。
+    debug_pod_image: str = ""  # BLADE_AI_DEBUG_POD_IMAGE
+
+    # FaultDrill CR 通道（faultdrill-cr-channel）— 全工坊 case（恢复 = apiserver
+    # 写）的声明式注入通道：apply 一条 CR = 注入，调和 restorePatches = 恢复，
+    # status.injectedAt = TTL 时钟（集群状态非进程内存，Agent 死亡后恢复迟到
+    # 不丢失）。默认 True（2026-09-19 钦定翻默认，暗启动收口：M1/M2 落地期间
+    # 曾默认 False 全量走旧路径，M3 实弹前置双修复交付 + d83890d7 复演全绿后
+    # 翻正）；关闭时 register_builtins 跳过 provider
+    # 注册（通道结构性不存在，非运行时分支）。
+    faultdrill_enabled: bool = True  # BLADE_AI_FAULTDRILL_ENABLED
+    # CRD 组名。平淡组名降低 api-resources 扫读穿帮率；变更即铸造新 CRD
+    # （与存量不互通），切换前需确认旧 CRD 已清理。
+    faultdrill_crd_group: str = "drill.blade-ai.io"  # BLADE_AI_FAULTDRILL_CRD_GROUP
+    # CR 落位 namespace（空 = 默认 victim ns；stealth 场景可配 ops ns，
+    # 被测 RCA agent RBAC 收窄后结构性不可见）。
+    faultdrill_cr_namespace: str = ""  # BLADE_AI_FAULTDRILL_CR_NAMESPACE
+    # CR 实例名前缀。命名纪律不变量 = 任务标识派生 + 零演练签名词根 +
+    # 同任务可复现；前缀可配置，钉扎测试校验不变量而非固定拼写。
+    faultdrill_name_prefix: str = "fd-"  # BLADE_AI_FAULTDRILL_NAME_PREFIX
+    # CRD Established 等待窗口（秒）。超时判定通道不可用 → 降级 recovery-carrier
+    # SOP 路径（降级是路由分支，不是失败路径）。
+    faultdrill_crd_established_timeout_seconds: int = 60  # BLADE_AI_FAULTDRILL_CRD_ESTABLISHED_TIMEOUT_SECONDS
 
     # 日志级别 (DEBUG=显示LLM迭代详情, INFO=正常输出, WARNING=静默模式)
     log_level: str = "DEBUG"                  # BLADE_AI_LOG_LEVEL

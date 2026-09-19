@@ -33,10 +33,13 @@ from .classifier import (
     parse_namespace,
 )
 from .freeze import (
+    WORKLOAD_TEMPLATE_SCOPES,
     approved_from_dict,
     discover_names_by_labels,
     discover_owner_names,
     discover_pod_pvc_claims,
+    discover_statefulset_pvc_claims,
+    discover_workload_pvc_claims,
     freeze_approved_target,
     freeze_approved_target_from_spec,
 )
@@ -59,11 +62,14 @@ __all__ = [
     "SCOPE_BANNED",
     "SCOPE_READONLY",
     "SCOPE_UNKNOWN",
+    "WORKLOAD_TEMPLATE_SCOPES",
     "approved_from_dict",
     "canonicalise_kind",
     "discover_names_by_labels",
     "discover_owner_names",
     "discover_pod_pvc_claims",
+    "discover_statefulset_pvc_claims",
+    "discover_workload_pvc_claims",
     "freeze_approved_target",
     "freeze_approved_target_from_spec",
     "infer_effective_target",

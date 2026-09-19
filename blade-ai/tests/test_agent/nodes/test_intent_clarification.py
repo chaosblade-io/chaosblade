@@ -757,6 +757,82 @@ class TestIntentClarificationNode:
         mock_llm.bind_tools.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_recover_tool_message_dry_run_preview_does_not_bootstrap_or_confirm(
+        self, tmp_path
+    ):
+        """Round-64 R64-1: a dry-run turn (/plan preview) carrying a
+        recover tool message must NOT bootstrap a recover session nor
+        confirm the recover intent. Before the early return the preview
+        REALLY RAN the recovery: the branch bootstrapped and confirmed
+        unconditionally, and the turn stream's ``_run_recover`` gated
+        only on the confirmed intent — a /plan over a recovery request
+        executed a REAL recovery (the preview-safety defect the inject
+        preview's route_after_confirmation "end" already legislates for
+        its own side). The preview answers with an announcement instead;
+        ``recover_task_id`` is still recorded (a dialogue FACT that keeps
+        the previewed target on record — the next real turn re-derives it
+        from its own recover_task tool message, so the state field is a
+        fallback for recover_handler's pass-through), and the graph ends
+        the turn: no handler runs, no session exists, nothing to close or
+        leak.
+        """
+        from chaos_agent.memory.session_store import (
+            SessionStore,
+            set_global_session_store,
+        )
+        store = SessionStore(task_dir=tmp_path / "tasks")
+        set_global_session_store(store)
+        try:
+            mock_llm = AsyncMock()
+            mock_llm.bind_tools = MagicMock(
+                return_value=AsyncMock(
+                    ainvoke=AsyncMock(return_value=_make_llm_response())))
+
+            ai_msg = AIMessage(
+                content="好的，正在为您恢复实验。",
+                tool_calls=[_recover_tc("task-recover-001")],
+                id="ai_recover",
+            )
+            tool_msg = ToolMessage(
+                content="Recover request received for task: task-recover-001",
+                tool_call_id="call_recover_1",
+                name="recover_task",
+                id="tool_recover",
+            )
+
+            node = make_intent_clarification(llm=mock_llm)
+            state = {
+                "confirmed_intent": None,
+                "messages": [ai_msg, tool_msg],
+                "clarification_round": 0,
+                "dialogue_round": 0,
+                "task_id": "",
+                "tui_session_id": "",
+                "dry_run": True,
+            }
+            result = await node(state)
+
+            # No confirmation, no session id allocation — the graph ends
+            # this turn (should_continue_intent_clarification reads the
+            # unset confirmed_intent and routes to END).
+            assert result.get("confirmed_intent") is None
+            assert not result.get("task_id"), (
+                "the dry-run preview must not allocate an operation task id"
+            )
+            # The extracted FACT survives for the next real turn.
+            assert result["recover_task_id"] == "task-recover-001"
+            # The preview answers with the announcement, not silence.
+            assert "NOT executed" in result["messages"][0].content
+            # And NOTHING was bootstrapped: no active session, no task
+            # file on disk.
+            assert not store.has_active("task-recover-001")
+            assert list((tmp_path / "tasks").glob("*.json")) == [], (
+                "a dry-run preview must not bootstrap a recover session"
+            )
+        finally:
+            set_global_session_store(None)
+
+    @pytest.mark.asyncio
     async def test_ask_human_only_routes_to_tools(self):
         mock_llm = AsyncMock()
         response = _make_llm_response(
@@ -965,11 +1041,23 @@ class TestClarificationBumpHelper:
         assert _clarification_bump(False, 2, 1) == 1
 
     def test_refund_gives_back_the_confirmation_bump(self):
-        assert _confirmation_refund(2) == 1
+        assert _confirmation_refund(
+            2, reviewed_contract_existed=True,
+        ) == 1
 
     def test_refund_never_goes_negative(self):
         # A one-shot session can reach submission without any bump firing.
-        assert _confirmation_refund(0) == 0
+        assert _confirmation_refund(
+            0, reviewed_contract_existed=True,
+        ) == 0
+
+    def test_no_refund_without_a_reviewed_contract(self):
+        # sess_5bb60326518c: a submit that had to bootstrap the contract
+        # from its own args sat in the turn that made the decision —
+        # refunding it would erase a real clarification round.
+        assert _confirmation_refund(
+            1, reviewed_contract_existed=False,
+        ) == 1
 
 
 class TestClarificationRoundSemantics:
@@ -1683,6 +1771,129 @@ class TestFastPathPlaceholderBootstrap:
         assert "differ from the reviewed contract" in ai_msgs[0].content
         mock_llm.bind_tools.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_fast_path_keeps_round_when_contract_bootstrapped_from_submit(self):
+        """sess_5bb60326518c regression: the user's clarifying answer
+        (「你帮我选一个合适的」 — delegating the target choice) landed in the
+        SAME turn where the model decided and called submit_fault_intent,
+        with no reviewed FaultSpec in state (the TUI wipes fault_spec at
+        every turn entry, and the model omitted the proposal trailer). The
+        submit had to bootstrap the contract from its own args, so the turn
+        carried the substantive decision — its entry bump must NOT be
+        refunded, or the confirm card reports "无需澄清" (one-shot
+        convergence) for a session that actually took a Q&A round."""
+        mock_llm = AsyncMock()
+        ai_msg = AIMessage(
+            content="好，我来定。我选这个目标。",
+            tool_calls=[_submit_fault_tc(
+                fault_type="pod-cpu-fullload",
+                scope="pod",
+                target="cpu",
+                action="fullload",
+                namespace="arms-prom",
+                labels={"app": "kube-state-metrics"},
+            )],
+            id="ai_submit_boot",
+        )
+        tool_msg = ToolMessage(
+            content="✓ 故障注入意图已提交，正在进入执行确认阶段。",
+            name="submit_fault_intent",
+            tool_call_id="call_submit_1",
+        )
+        human_msg = HumanMessage(content="你帮我选一个合适的", id="human_delegate")
+        node = make_intent_clarification(llm=mock_llm)
+        state = {
+            "confirmed_intent": None,
+            "messages": [human_msg, ai_msg, tool_msg],
+            "clarification_round": 1,  # bumped at this turn's entry
+            "dialogue_round": 2,
+            "fault_intent": {},
+            # fault_spec deliberately absent: the TUI turn entry wipes it.
+        }
+        result = await node(state)
+        assert result["confirmed_intent"] == "inject"
+        # The bootstrapped submit turn WAS the clarification round.
+        assert result["clarification_round"] == 1
+
+    @pytest.mark.asyncio
+    async def test_fast_path_still_refunds_replay_of_reviewed_contract(self):
+        """The classic confirm turn — a COMPLETE reviewed contract sits in
+        state and the submission replays it exactly — still gets its entry
+        bump refunded: the turn added no clarification."""
+        mock_llm = AsyncMock()
+        submit_tc = _submit_fault_tc(
+            fault_type="pod-cpu-fullload",
+            scope="pod",
+            target="cpu",
+            action="fullload",
+            namespace="production",
+            labels={"app": "account"},
+        )
+        reviewed = FaultSpec.from_intent_args(submit_tc["args"])
+        # Guard: the fixture must be reviewable, i.e. reach the replay path.
+        assert reviewed.is_complete
+        ai_msg = AIMessage(
+            content="确认提交。",
+            tool_calls=[submit_tc],
+            id="ai_submit_replay",
+        )
+        tool_msg = ToolMessage(
+            content="✓ 故障注入意图已提交，正在进入执行确认阶段。",
+            name="submit_fault_intent",
+            tool_call_id="call_submit_1",
+        )
+        human_msg = HumanMessage(content="确认", id="human_confirm")
+        node = make_intent_clarification(llm=mock_llm)
+        state = {
+            "confirmed_intent": None,
+            "messages": [human_msg, ai_msg, tool_msg],
+            "clarification_round": 2,  # one substantive round + this confirm turn
+            "dialogue_round": 3,
+            "fault_intent": {},
+            "fault_spec": reviewed.to_dict(),
+        }
+        result = await node(state)
+        assert result["confirmed_intent"] == "inject"
+        # The pure-confirmation turn's bump is given back.
+        assert result["clarification_round"] == 1
+
+    @pytest.mark.asyncio
+    async def test_opening_turn_submit_stays_zero(self):
+        """One-shot convergence is unchanged: the opening turn never bumps,
+        and a bootstrapped submit there keeps the count at zero."""
+        mock_llm = AsyncMock()
+        ai_msg = AIMessage(
+            content="好的，直接注入。",
+            tool_calls=[_submit_fault_tc(
+                fault_type="pod-cpu-fullload",
+                scope="pod",
+                target="cpu",
+                action="fullload",
+                namespace="production",
+                labels={"app": "account"},
+            )],
+            id="ai_submit_oneshot",
+        )
+        tool_msg = ToolMessage(
+            content="✓ 故障注入意图已提交，正在进入执行确认阶段。",
+            name="submit_fault_intent",
+            tool_call_id="call_submit_1",
+        )
+        human_msg = HumanMessage(
+            content="对 production 的 account pod 注入 CPU 满载", id="human_open",
+        )
+        node = make_intent_clarification(llm=mock_llm)
+        state = {
+            "confirmed_intent": None,
+            "messages": [human_msg, ai_msg, tool_msg],
+            "clarification_round": 0,  # opening turn: no bump ever fired
+            "dialogue_round": 1,
+            "fault_intent": {},
+        }
+        result = await node(state)
+        assert result["confirmed_intent"] == "inject"
+        assert result["clarification_round"] == 0
+
 
 class TestHookIntegration:
     """Tests for PreReasoningHook integration (merge_hook_updates)."""
@@ -2067,4 +2278,198 @@ class TestBatchFastPathDurationContract:
         reason = result["messages"][0].content
         assert "incomplete" in reason
         assert "differs from the reviewed contract" not in reason
+
+
+class TestRealGraphDryRunRecoverPreview:
+    """Execution-level channel pinning for the dry-run × recover preview
+    (Round-64 R64-1).
+
+    Function-level tests construct the state dict directly and are blind
+    to LangGraph channel filtering (the 2026-09-01 planning_mode lesson:
+    an undeclared channel key silently vanishes from both input and node
+    updates, with no error). These tests run the real compiled
+    StateGraph(IntentState) with the real node factory, real router, real
+    ToolNode + recover_task tool, and a real SessionStore, so the
+    zero-side-effect guarantee is measured end-to-end: if ``dry_run`` ever
+    loses its IntentState channel, the graph takes the real bootstrap path
+    and these assertions fail loudly instead of regressing silently.
+
+    intent_screener / recover_handler / save_dialogue are recording stubs —
+    their internals are unit-test territory; everything on the channel-
+    verification path is real.
+    """
+
+    def _compile(self, llm, reached):
+        """Compile a real StateGraph(IntentState) mirroring graph.py's
+        intent sub-graph topology (graph.py:369-391)."""
+        from langgraph.graph import END, StateGraph
+        from langgraph.prebuilt import ToolNode
+
+        from chaos_agent.agent.nodes.planning.intent_screener import (
+            INTENT_SCREENER_PASS,
+        )
+        from chaos_agent.agent.router import (
+            should_continue_intent_clarification,
+        )
+        from chaos_agent.agent.state import IntentState
+
+        async def intent_screener_stub(state):
+            return {}
+
+        async def recover_handler_stub(state):
+            reached["recover_handler"] = True
+            return {"operation": "recover"}
+
+        async def save_dialogue_stub(state):
+            reached["save_dialogue"] = True
+            return {}
+
+        async def unreachable_intent_confirm(state):
+            # Fail-closed: no scenario in this probe may route through
+            # intent_confirm (dry-run exits early; real recover routes via
+            # RECOVER_HANDLER). Mapping INTENT_CONFIRM to a raising node —
+            # instead of to a recording stub — keeps the B test honest if
+            # should_continue_intent_clarification ever regresses and
+            # returns INTENT_CONFIRM for a recover intent: the graph blows
+            # up loudly instead of silently reaching the recover stub.
+            raise AssertionError(
+                "unreachable: a recover-intent scenario routed through "
+                "intent_confirm"
+            )
+
+        def screener_route(state):
+            return state.get("intent_screener_route", INTENT_SCREENER_PASS)
+
+        tools = [recover_task]
+        graph = StateGraph(IntentState)
+        graph.add_node(
+            "intent_clarification",
+            make_intent_clarification(llm=llm, tools=tools),
+        )
+        graph.add_node("intent_screener", intent_screener_stub)
+        graph.add_node("clarification_tools", ToolNode(tools))
+        graph.add_node("recover_handler", recover_handler_stub)
+        graph.add_node("save_dialogue", save_dialogue_stub)
+        graph.add_node("unreachable_intent_confirm", unreachable_intent_confirm)
+        graph.set_entry_point("intent_clarification")
+        graph.add_conditional_edges(
+            "intent_clarification",
+            should_continue_intent_clarification,
+            {
+                "continue": "intent_screener",
+                "intent_confirm": "unreachable_intent_confirm",
+                "recover_handler": "recover_handler",
+                "save_memory": "save_dialogue",
+                END: END,
+            },
+        )
+        graph.add_conditional_edges(
+            "intent_screener",
+            screener_route,
+            {INTENT_SCREENER_PASS: "clarification_tools", "retry": "intent_clarification"},
+        )
+        graph.add_edge("clarification_tools", "intent_clarification")
+        graph.add_edge("recover_handler", END)
+        graph.add_edge("save_dialogue", END)
+        return graph.compile()
+
+    @staticmethod
+    def _fake_llm():
+        from langchain_core.language_models.fake_chat_models import (
+            FakeMessagesListChatModel,
+        )
+
+        class _ToolCapableFakeLLM(FakeMessagesListChatModel):
+            # BaseChatModel.bind_tools raises NotImplementedError; the real
+            # node does ``llm.bind_tools(tools_this_iter)``. Responses are
+            # pre-scripted, so ignoring the bound tools keeps the call shape
+            # real without a provider.
+            def bind_tools(self, tools, **kwargs):
+                return self
+
+        return _ToolCapableFakeLLM(responses=[AIMessage(
+            content="",
+            id="ai_1",
+            tool_calls=[{
+                "name": "recover_task",
+                "id": "call_recover_1",
+                "args": {"task_id": "task-abc123"},
+            }],
+        )])
+
+    @pytest.mark.asyncio
+    async def test_dry_run_recover_preview_zero_side_effects_on_real_graph(
+        self, tmp_path
+    ):
+        """dry_run=True + recover intent on the REAL compiled graph: the
+        preview answers with the announcement, reaches no handler, and
+        leaves the SessionStore untouched — and the round-trip proves the
+        ``dry_run`` channel (input) and ``recover_task_id`` channel (update)
+        both survive LangGraph filtering."""
+        from chaos_agent.memory.session_store import (
+            SessionStore,
+            set_global_session_store,
+        )
+
+        store = SessionStore(task_dir=tmp_path / "tasks")
+        set_global_session_store(store)
+        try:
+            reached = {"recover_handler": False, "save_dialogue": False}
+            app = self._compile(self._fake_llm(), reached)
+            result = await app.ainvoke({
+                "messages": [HumanMessage(content="恢复任务 task-abc123", id="h_1")],
+                "confirmed_intent": "unset",
+                "task_id": "",
+                "tui_session_id": "",
+                "dialogue_round": 0,
+                "dry_run": True,
+            })
+        finally:
+            set_global_session_store(None)  # type: ignore[arg-type]
+
+        assert reached["recover_handler"] is False
+        assert list((tmp_path / "tasks").glob("*.json")) == []
+        assert not store._active_sessions
+        assert result.get("confirmed_intent") != "recover"
+        # Channel round-trip: the early-exit update survives filtering.
+        assert result.get("recover_task_id") == "task-abc123"
+        last = result["messages"][-1]
+        assert isinstance(last, AIMessage)
+        assert "NOT executed" in last.content
+        assert not last.tool_calls
+
+    @pytest.mark.asyncio
+    async def test_non_dry_run_recover_bootstraps_and_reaches_handler(
+        self, tmp_path
+    ):
+        """Single-variable control (only dry_run flips to False): bootstrap
+        and recover_handler routing genuinely happen — so the zero-side-
+        effect assertions above fail for the right reason when the dry_run
+        leg regresses, not because the graph never took the recover path."""
+        from chaos_agent.memory.session_store import (
+            SessionStore,
+            set_global_session_store,
+        )
+
+        store = SessionStore(task_dir=tmp_path / "tasks")
+        set_global_session_store(store)
+        try:
+            reached = {"recover_handler": False, "save_dialogue": False}
+            app = self._compile(self._fake_llm(), reached)
+            result = await app.ainvoke({
+                "messages": [HumanMessage(content="恢复任务 task-abc123", id="h_1")],
+                "confirmed_intent": "unset",
+                "task_id": "",
+                "tui_session_id": "",
+                "dialogue_round": 0,
+                "dry_run": False,
+            })
+        finally:
+            set_global_session_store(None)  # type: ignore[arg-type]
+
+        assert reached["recover_handler"] is True
+        task_jsons = list((tmp_path / "tasks").glob("*.json"))
+        assert len(task_jsons) == 1
+        assert result.get("confirmed_intent") == "recover"
+        assert result.get("task_id")
 

@@ -11,7 +11,7 @@
    BusyBox applet，它不支持 netem；若无可用 tc，走演练步骤 2 的路径 B）
 2. 确认目标 Pod 有对外网络调用（上下游服务、数据库等）
 3. 确认目标 Pod 名称和命名空间
-4. 确认目标节点内核支持 netem（**内核级依赖，路径 A/B 都绕不开**）：netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换 Pod / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`（临时容器载体同样可用）——有输出说明已加载；无输出时可用更强的前置确证（实测）：经 node debug 载体执行 `chroot /host modprobe sch_netem` 试载，报 `FATAL: Module sch_netem not found` 即模块文件本身缺失（内核自动加载不可能成功），**注入前即可定案不可行**；实测 ACK/ASI al8 内核（5.10.134-13.1.al8）即为此形态——同一节点 netem 全家（loss/delay/corrupt）全部不可行，而 sch_tbf 存在（带宽受限场景可用，见 `Pod_网络带宽不足_带宽受限`）。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`（后者为节点上 sch_netem 模块文件本身缺失、内核自动加载失败）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一实测形态）即为内核不支持 netem 的确证，见演练步骤 2
+4. 确认目标节点内核支持 netem（**内核级依赖，路径 A/B 都绕不开**）：netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换 Pod / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`（临时容器载体同样可用）——有输出说明已加载；无输出时可用更强的前置确证：经 node debug 载体执行 `chroot /host modprobe sch_netem` 试载，报 `FATAL: Module sch_netem not found` 即模块文件本身缺失（内核自动加载不可能成功），**注入前即可定案不可行**；部分 ACK/ASI al8 内核（5.10.134-13.1.al8）即为此形态——同一节点 netem 全家（loss/delay/corrupt）全部不可行，而 sch_tbf 存在（带宽受限场景可用，见 `Pod_网络带宽不足_带宽受限`）。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`（后者为节点上 sch_netem 模块文件本身缺失、内核自动加载失败）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一种报错形态）即为内核不支持 netem 的确证，见演练步骤 2
 
 **演练步骤**：
 1. 确认目标 Pod 运行状态，并判定容器内的 `tc` 是不是真的能用 —— **`which tc` / `command -v tc`
@@ -24,7 +24,7 @@
    - 输出 `BusyBox v<版本> ...` 或命令不存在 → 走路径 B
      （BusyBox 版执行 `tc qdisc add ... root netem` 会报 `invalid argument 'root' to 'command'`）
 2. 注入网络延迟，按上一步结论二选一。本用例为 kubectl-native 方案，选用前提是 ChaosBlade 的
-   `pod-network` 没有 delay action；以 `blade create k8s pod-network --help` 实测为准，
+   `pod-network` 没有 delay action；以 `blade create k8s pod-network --help` 探测为准，
    若本地版本已提供则优先用 blade 方案。
 
    **路径 A —— 容器内确认是 iproute2 tc**（需 NET_ADMIN；`CapEff` 全零的容器会报 EPERM）。
@@ -38,6 +38,7 @@
    kubectl exec <pod-name> -n <namespace> -- \
      tc qdisc add dev eth0 root netem delay <delay>
    ```
+   倒计时从武装时刻起算：武装与注入两条命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f "qdisc de[l]"; true'` 停旧定时器再全额重武装；精简镜像无 pkill 时旧定时器无法停止，到期会提前恢复侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
 
    **路径 B —— 容器内没有可用 tc（精简镜像的常态）**：用临时容器注入。临时容器与目标容器
    **共享同一个网络命名空间**，对 `eth0` 操作等价于操作目标 Pod 的网卡；`tc` 来自调试镜像，
@@ -80,14 +81,14 @@
    - `dev eth0`：通常为 Pod 主网卡，部分环境为 `eth0` 以外名称
    - **内核级依赖（两条路径相同）**：netem 需要宿主机内核支持 sch_netem。若注入报
      `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`
-     （模块文件缺失）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一实测形态），
+     （模块文件缺失）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一实际形态），
      即内核不支持 netem 的确证 —— 立即停止，
      **不要重试、不要换 Pod 或重建临时容器**（内核是同一个，重试只是空转），发起 replan
      并附上该报错证据，由 Phase 1 改选其他可行方案或判定不可行
 3. 观察应用响应时间变化
 
 **注入验证**：
-1. 确认 tc 规则已生效（**用注入时同一条路径查**，`tc qdisc show` 同样需要真 tc）：
+1. （诊断，仅当下述延迟效果未出现时执行）确认 tc 规则已生效（**用注入时同一条路径查**，`tc qdisc show` 同样需要真 tc）——规则快照为机制代言不为结果代言，用于定位失败层（规则未挂载 vs 挂载未生效）：
    ```bash
    # 路径 A
    kubectl exec <pod-name> -n <namespace> -- tc qdisc show dev eth0
@@ -95,7 +96,7 @@
    kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc show dev eth0
    ```
    输出应包含 `netem delay <delay>`（即注入时配置的延迟规则）
-2. 在 Pod 内验证延迟效果。**不要用 `ping`** —— 它需要 `CAP_NET_RAW`，非 root 容器
+2. **（主证据，必做）** 在 Pod 内验证延迟效果。**不要用 `ping`** —— 它需要 `CAP_NET_RAW`，非 root 容器
    （`CapEff` 全零）执行会返回 `ping: permission denied (are you root?)`；更糟的是若接了管道
    （如 `| tail`），退出码来自管道末端，会**看起来成功**。改用 TCP 层的探测：
    ```bash

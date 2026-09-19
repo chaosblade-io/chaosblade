@@ -26,7 +26,7 @@ blade create network dns --domain <target-domain> --ip <redirect-ip> --timeout <
 3. 观察域名解析结果及应用连通性变化
 
 **注入验证**：
-1. `nslookup <domain>` 或 `ping <domain>` 确认解析到错误 IP
+1. `ping <domain>` 确认解析到错误 IP（ping 走完整 resolver、/etc/hosts 优先）。⚠️ 不要用 nslookup 作判据——ChaosBlade network dns 的注入层是 /etc/hosts（与 k8s pod-network dns 同源，`--replace` 即「已有本地解析记录是否覆盖」语义），nslookup 只查 DNS 服务器、不读 hosts，验不出劫持；仅降级方案（iptables DNAT 53 层，DNS 查询本身被重定向到伪造解析器）下 nslookup 才有效
 2. 观察应用访问该域名时是否超时或返回错误
 
 **注入恢复**：
@@ -35,7 +35,7 @@ blade destroy <experiment-uid>
 ```
 
 **恢复验证**：
-1. `nslookup <domain>` 确认解析恢复正常
+1. `ping <domain>` 确认解析回到注入前基线 IP（nslookup 不读 /etc/hosts，注入期间与恢复后返回相同结果，不能作恢复判据）
 2. 确认应用访问该域名恢复正常
 
 **基准事实**：

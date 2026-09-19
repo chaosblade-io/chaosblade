@@ -2,6 +2,9 @@
 
 Provides:
 - _resolve_kubeconfig: Multi-level fallback kubeconfig resolution from AgentState
+  (round-32: canonical home moved to chaos_agent.agent.kubeconfig — the
+  graph-wide single source the settlement primitives resolve through too;
+  this private name stays as the execute-side alias for its callers)
 - inject_kubeconfig_into_tool_calls: Programmatic kubeconfig injection into LLM tool calls
 - _resolve_kubewiz_cluster_uuid / _resolve_kubewiz_profile: kubewiz param resolution
 - resolve_transport_target: Construct TransportTarget from AgentState (replaces sync_kubewiz_runtime)
@@ -23,17 +26,16 @@ def _resolve_kubeconfig(state: AgentState) -> str:
     """Resolve kubeconfig from state with multi-level fallback.
 
     Priority: state.kubeconfig > spec.params.kubeconfig > settings.kubeconfig_path
+
+    Round-32: delegates to the canonical resolver
+    :func:`chaos_agent.agent.kubeconfig.resolve_kubeconfig` (promoted out
+    of this execute-private module so the settlement primitives — the
+    registry's sweep — can share the exact contract without a layering
+    inversion); this name remains so existing callers are untouched.
     """
-    kc = state.get("kubeconfig", "")
-    if kc:
-        return kc
-    from chaos_agent.agent.spec.fault_spec import read_fault_spec
-    spec = read_fault_spec(state)
-    if spec:
-        kc = spec.params.get("kubeconfig", "")
-        if kc:
-            return kc
-    return settings.kubeconfig_path
+    from chaos_agent.agent.kubeconfig import resolve_kubeconfig
+
+    return resolve_kubeconfig(state)
 
 
 def inject_kubeconfig_into_tool_calls(

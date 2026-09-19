@@ -14,6 +14,7 @@ from chaos_agent.config.settings import settings
 from chaos_agent.errors import ToolGuardError, ToolTimeoutError
 from chaos_agent.memory.session_store import get_global_session_store
 from chaos_agent.observability.status_tracker import (
+    elided_preview,
     get_tracker,
     StatusCategory,
     StatusEvent,
@@ -129,7 +130,7 @@ def _persist_to_session(
                 "source": source_name,
             }
             if exit_code != 0 and stderr:
-                detail["stderr"] = stderr[:500]
+                detail["stderr"] = elided_preview(stderr, 150, 350)
             _ss.append_raw_message(task_id, {
                 "type": "tool_execution",
                 "content": f"[shell] {cmd_str}",
@@ -330,8 +331,14 @@ async def run_command(
 
     # Emit completion status (emit() to avoid state pollution)
     if tracker:
-        stdout_preview = stdout[:500] if stdout else ""
+        # Failure previews keep BOTH ends (elided_preview): the causal line
+        # sits at different ends for different tools (kubectl's "Error from
+        # server ..." closes, a traceback's entrypoint opens), and the shell
+        # wrapper cats stderr into stdout on failure — any one-sided cut
+        # bets on output shape and the losing shape hides the root cause
+        # (#31). Success keeps the head (normal output leads with content).
         if result.exit_code == 0:
+            stdout_preview = stdout[:500] if stdout else ""
             tracker.emit(StatusEvent(
                 task_id=tracker.task_id,
                 phase=StatusPhase.COMPLETED,
@@ -342,6 +349,7 @@ async def run_command(
                 detail={**exec_detail, "exit_code": result.exit_code, "duration_ms": duration_ms, "stdout_preview": stdout_preview},
             ))
         else:
+            stdout_preview = elided_preview(stdout, 150, 350)
             tracker.emit(StatusEvent(
                 task_id=tracker.task_id,
                 phase=StatusPhase.FAILED,
@@ -349,17 +357,25 @@ async def run_command(
                 source=source_name,
                 message=f"Shell failed: {cmd_str} (exit={result.exit_code})",
                 duration_ms=duration_ms,
-                detail={**exec_detail, "exit_code": result.exit_code, "stderr": stderr[:200], "stdout_preview": stdout_preview},
+                detail={**exec_detail, "exit_code": result.exit_code, "stderr": elided_preview(stderr, 150, 350), "stdout_preview": stdout_preview},
             ))
 
-    # Persist command execution to SessionStore (CLI → session JSON observability bridge)
+    # Persist command execution to SessionStore (CLI → session JSON observability bridge).
+    # Failed commands persist a both-ends preview too: the session JSON is
+    # the durable post-hoc record — a head-only 2000-char cut has the same
+    # causal-line-hiding defect as the live preview (#31).
+    _persist_preview = (
+        stdout[:2000]
+        if result.exit_code == 0
+        else elided_preview(stdout, 1000, 1000)
+    )
     _persist_to_session(
         task_id=task_id,
         cmd_str=cmd_str,
         source_name=source_name,
         exit_code=result.exit_code,
         duration_ms=duration_ms,
-        stdout_preview=stdout[:2000] if stdout else "",
+        stdout_preview=_persist_preview,
         stderr=stderr,
     )
 

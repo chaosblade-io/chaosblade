@@ -10,6 +10,7 @@ from chaos_agent.agent.node_names import MEMORY_NODE
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.persistence.task_identity import is_real_task_id
 from chaos_agent.agent.result.operation_outcome import read_inject_verification, read_operation_outcome
+from chaos_agent.agent.result.verdict import INJECT_VETO_VALUES
 from chaos_agent.agent.state import AgentState, has_active_fault
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.operational_memory import OperationalMemory
@@ -72,7 +73,9 @@ async def load_memory(state: AgentState) -> dict:
         namespace = _spec.namespace if _spec else ""
         # Multi-tenant isolation: only query the current tenant's active experiments
         _tenant_id = state.get("tenant_id", "") or ""
-        active = await store.query_active(namespace=namespace, tenant_id=_tenant_id)
+        # Workspace axis (platform mode): empty locally = unfiltered, same contract.
+        _workspace_id = state.get("workspace_id", "") or ""
+        active = await store.query_active(namespace=namespace, tenant_id=_tenant_id, workspace_id=_workspace_id)
         updates["experiment_history"] = active
     except Exception as e:
         logger.warning(f"Failed to load experiment history: {e}")
@@ -160,7 +163,9 @@ async def pipeline_init(state: AgentState) -> dict:
         namespace = _spec.namespace if _spec else ""
         # Multi-tenant isolation: only query the current tenant's active experiments
         _tenant_id = state.get("tenant_id", "") or ""
-        updates["experiment_history"] = await store.query_active(namespace=namespace, tenant_id=_tenant_id)
+        # Workspace axis (platform mode): empty locally = unfiltered, same contract.
+        _workspace_id = state.get("workspace_id", "") or ""
+        updates["experiment_history"] = await store.query_active(namespace=namespace, tenant_id=_tenant_id, workspace_id=_workspace_id)
     except Exception as e:
         logger.warning(f"Failed to load experiment history: {e}")
         updates["experiment_history"] = []
@@ -319,7 +324,9 @@ def _infer_failure_detail(state: AgentState) -> dict:
             and level == "verified"
         )
         if (
-            level in ("unverified",)
+            # Honest ignorance is never success (round-15: the unverified
+            # veto was a bare single-word tuple hand copy).
+            level in INJECT_VETO_VALUES
             or (l1_status == "failed" and not layer1_expired_overridden)
             or l2_status == "failed"
         ):

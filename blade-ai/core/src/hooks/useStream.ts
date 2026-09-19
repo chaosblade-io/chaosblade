@@ -25,6 +25,7 @@ import {
   streamingResponseCharsRef,
 } from "../state/streamingRefs.js";
 import { perfFlush, perfMark } from "../utils/perf.js";
+import { streamEventToAction } from "../utils/sessionEvents.js";
 import { t } from "../i18n/index.js";
 
 export interface SubmitTurnOpts {
@@ -85,6 +86,16 @@ export interface UseStreamApi {
   /** Abort the in-flight manual /compact (called from Composer Esc
    *  handler when ``state.currentManualCompact`` is non-null). */
   cancelManualCompact: () => void;
+  /**
+   * Wake the server's fault-window hold loop (Ctrl+R). Returns true
+   * when the POST landed — the recover graph then streams down the
+   * SAME open SSE connection (no client-side state change needed).
+   * False means the wake did not land (no hold active / HTTP
+   * failure); the caller decides the fallback (disconnect via
+   * ``cancelTurn``, whose server-side abort cleanup + blade timeout
+   * carriers still guarantee recovery).
+   */
+  triggerEarlyRecover: () => Promise<boolean>;
   busy: boolean;
   /** Whether the agent is paused on a confirmation prompt. */
   awaitingConfirmation: boolean;
@@ -684,6 +695,19 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
     // beginManualCompact() replaces the ref on next call.
   }, []);
 
+  // Held turn id — string selector, so Object.is keeps the 30s
+  // FAULT_WINDOW_TICKED re-bases (new slot object, same turnId) from
+  // re-rendering this hook. Re-subscribes only when a new hold
+  // opens (one string swap per held turn).
+  const faultWindowTurnId = useAppSelector(
+    (s) => s.faultWindow?.turnId ?? "",
+  );
+
+  const triggerEarlyRecover = useCallback(async (): Promise<boolean> => {
+    if (!faultWindowTurnId) return false;
+    return client.earlyRecover(sessionId, faultWindowTurnId);
+  }, [client, sessionId, faultWindowTurnId]);
+
   return {
     submitTurn,
     submitRecover,
@@ -693,6 +717,7 @@ export function useStream(client: BladeClient, sessionId: string): UseStreamApi 
     cancelReplay,
     beginManualCompact,
     cancelManualCompact,
+    triggerEarlyRecover,
     busy:
       streamState === "responding" ||
       streamState === "waiting_confirmation",
@@ -704,208 +729,30 @@ function applyEvent(
   dispatch: (a: import("../state/reducer.js").Action) => void,
   evt: StreamEvent,
 ): void {
-  switch (evt.type) {
-    case "token":
-      dispatch({
-        type: "TOKEN_APPENDED",
-        content: evt.content,
-        node: evt.node ?? "",
-      });
-      return;
-    case "thinking":
-      dispatch({
-        type: "THINKING_APPENDED",
-        content: evt.content,
-        node: evt.node ?? "",
-      });
-      return;
-    case "llm_start":
-      dispatch({
-        type: "LLM_STARTED",
-        node: evt.node ?? "",
-      });
-      return;
-    case "tool_start":
-      dispatch({
-        type: "TOOL_STARTED",
-        callId: pickCallId(evt.call_id, evt.task_id, evt.tool_name),
-        name: evt.tool_name,
-        node: evt.node ?? "",
-      });
-      return;
-    case "tool_end":
-      dispatch({
-        type: "TOOL_ENDED",
-        callId: pickCallId(evt.call_id, evt.task_id, evt.tool_name),
-        name: evt.tool_name,
-        // ``is_error`` is set when the server converted an
-        // ``on_tool_error`` (tool raised) into this terminal event. It
-        // still closes the card (unblocking the leading-stable flush);
-        // the status just flips ✓ → ✗ so the failure is visible.
-        status: evt.is_error ? "error" : "success",
-        content: evt.content,
-      });
-      return;
-    case "node_start":
-      dispatch({ type: "NODE_STARTED", node: evt.node, phase: evt.phase });
-      return;
-    case "node_end":
-      dispatch({ type: "NODE_ENDED", node: evt.node });
-      return;
-    case "node_message": {
-      // Receipt time drives the web rail timeline's relative
-      // timestamps: prefer the server ``timestamp`` when the wire
-      // carries one, fall back to the client clock.
-      const wireTs = evt.timestamp ? Date.parse(evt.timestamp) : NaN;
-      dispatch({
-        type: "NODE_MESSAGE",
-        content: evt.content,
-        node: evt.node ?? "",
-        ts: Number.isNaN(wireTs) ? Date.now() : wireTs,
-      });
-      return;
-    }
-    case "confirm":
-      dispatch({
-        type: "CONFIRM_RECEIVED",
-        content: evt.content,
-        taskId: evt.task_id,
-        node: evt.node,
-        payload: evt.payload,
-      });
-      return;
-    case "auto_approved":
-      // Auto mode: render the read-only card, no interaction / no wait.
-      dispatch({
-        type: "AUTO_APPROVED",
-        content: evt.content,
-        taskId: evt.task_id,
-        node: evt.node,
-        payload: evt.payload,
-      });
-      return;
-    case "result":
-      dispatch({
-        type: "RESULT_RECEIVED",
-        // Legacy /turn results put the envelope in content as a
-        // JSON string. The newer /compact route uses payload as a
-        // typed dict and leaves content empty. Fall back to a
-        // JSON-stringified payload so RESULT_RECEIVED's reducer
-        // (which expects a string) sees the same shape either
-        // way. The /compact handler doesn't go through this
-        // dispatcher — it consumes its own stream directly — so
-        // this fallback is just defensive in case some future
-        // surface routes /compact-style events through useStream.
-        content: evt.content ?? JSON.stringify(evt.payload ?? {}),
-        taskId: evt.task_id,
-      });
-      return;
-    case "error":
-      dispatch({
-        type: "ERROR_RECEIVED",
-        message: evt.content,
-        taskId: evt.task_id,
-      });
-      return;
-    case "usage":
-      // Coerce undefined → 0 here so the action shape stays accurate
-      // (``inputTokens: number``, not ``number | undefined``). Older
-      // servers can drop a 0 field entirely from the wire frame; the
-      // reducer also defends against ``NaN`` in case any future caller
-      // forgets this nullish guard.
-      dispatch({
-        type: "USAGE_RECEIVED",
-        inputTokens: evt.input_tokens ?? 0,
-        outputTokens: evt.output_tokens ?? 0,
-      });
-      return;
-    case "memory_compaction": {
-      // Phase 4 — server emits started / completed / failed lifecycle
-      // events. The wire frame's falsy-strip drops 0 fields, so a
-      // ``started`` event arrives without ``tokens_after`` /
-      // ``messages_compacted`` / ``duration_ms`` (all unknown at
-      // start time); we defend with ``?? 0`` everywhere. The phase
-      // discriminator should always be present, but defaults to
-      // ``"started"`` to keep the spinner showing if the server
-      // forgets to populate it.
-      const phase = evt.compaction_phase ?? "started";
-      const layer = evt.layer ?? "llm_summary";
-      const tokensBefore = evt.tokens_before ?? 0;
-      if (phase === "started") {
-        dispatch({
-          type: "MEMORY_COMPACTION_STARTED",
-          tokensBefore,
-          layer,
-        });
-      } else if (phase === "completed") {
-        dispatch({
-          type: "MEMORY_COMPACTION_COMPLETED",
-          tokensBefore,
-          tokensAfter: evt.tokens_after ?? 0,
-          messagesCompacted: evt.messages_compacted ?? 0,
-          durationMs: evt.duration_ms ?? 0,
-          layer,
-        });
-      } else if (phase === "failed") {
-        dispatch({
-          type: "MEMORY_COMPACTION_FAILED",
-          tokensBefore,
-          durationMs: evt.duration_ms ?? 0,
-          layer,
-          // ``content`` carries the exception message on the wire
-          // (free-form). Preserve it so the user sees a real reason
-          // instead of "compaction failed".
-          errorMessage: evt.content ?? "",
-        });
-      } else {
-        // Unknown phase — protocol drift between server and client.
-        // Logged so dev-time mismatches surface; production noise
-        // is bounded since the only way to land here is a server
-        // change that bypassed the client update.
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[useStream] unknown memory_compaction phase: ${String(phase)}`,
-        );
-      }
-      return;
-    }
-    case "context_size":
-      // PreReasoningHook fired one of these AFTER deciding whether
-      // to compact. The post-hook ``current_tokens`` is what the
-      // NEXT LLM call will see, so dispatching it drives the
-      // Footer indicator to visibly drop on compaction and grow as
-      // tool messages stack up. All four fields are forced onto the
-      // wire by the server (see streaming.py to_dict exception), so
-      // ``Number(x) || 0`` is safe even when the actual value is 0.
-      dispatch({
-        type: "CONTEXT_SIZE_RECEIVED",
-        currentTokens: Number(evt.context_current_tokens) || 0,
-        triggerTokens: Number(evt.context_trigger_tokens) || 0,
-        maxTokens: Number(evt.context_max_tokens) || 0,
-        messagesCount: Number(evt.context_messages_count) || 0,
-      });
-      return;
-    case "done":
-      // Handled by the caller's loop — break + dispatch TURN_DONE.
-      return;
+  // Thin dispatch wrapper over the shared StreamEvent→Action mapping
+  // (utils/sessionEvents.ts). The mapping itself lives there so the
+  // live SSE path and the ``/resume`` events-jsonl fold can never
+  // drift apart — one source, two drivers. ``done`` maps to null here
+  // (the caller's read loop breaks on it and dispatches TURN_DONE
+  // itself); unknown memory_compaction phases log the same warning
+  // the old inline switch did.
+  const action = streamEventToAction(evt);
+  if (action !== null) {
+    dispatch(action);
+  } else if (
+    evt.type === "memory_compaction" &&
+    evt.compaction_phase !== undefined &&
+    evt.compaction_phase !== "started" &&
+    evt.compaction_phase !== "completed" &&
+    evt.compaction_phase !== "failed"
+  ) {
+    // Unknown phase — protocol drift between server and client.
+    // Logged so dev-time mismatches surface; production noise is
+    // bounded since the only way to land here is a server change that
+    // bypassed the client update.
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[useStream] unknown memory_compaction phase: ${String(evt.compaction_phase)}`,
+    );
   }
-}
-
-/**
- * Pick a stable per-tool-call key. M5+ backends emit a real
- * ``call_id`` (LangChain's ``run_id``); pre-M5 builds don't, so we
- * fall back to ``${task_id}/${tool_name}`` — unique only when the
- * agent doesn't invoke the same tool in parallel.
- *
- * The TS-side TOOL_ENDED matcher uses ``matched`` early-out so even
- * the fallback case at worst marks one wrong instance done — not the
- * end of the world, just a UI quirk on legacy servers.
- */
-function pickCallId(
-  callId: string | undefined,
-  taskId: string | undefined,
-  name: string,
-): string {
-  if (callId && callId.length > 0) return callId;
-  return `${taskId ?? "task"}/${name}`;
 }

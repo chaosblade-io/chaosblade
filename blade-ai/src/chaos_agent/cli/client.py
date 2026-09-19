@@ -6,6 +6,7 @@ from typing import Optional
 
 import httpx
 
+from chaos_agent.agent.state import TaskState
 from chaos_agent.config.settings import settings
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode
 
@@ -108,11 +109,13 @@ class AgentClient:
             for name in names
         ] if isinstance(names, list) else []
 
-        if task_state == "partial_recovered":
+        # Legacy CLI ``result`` label per recover task_state — words derive
+        # from the TaskState legislation (round-15).
+        if task_state == TaskState.PARTIAL_RECOVERED.value:
             result = "partial"
-        elif task_state == "recovered":
+        elif task_state == TaskState.RECOVERED.value:
             result = "recovered"
-        elif task_state == "failed":
+        elif task_state == TaskState.FAILED.value:
             result = "failed"
         else:
             result = task_state or "unknown"
@@ -203,6 +206,93 @@ class AgentClient:
             message=last_error or "Recover stream completed without result",
             data={"task_id": task_id},
         )
+
+    async def recover_stream(self, task_id: str, **kwargs):
+        """Stream /api/v1/recover-stream, forwarding intermediate events.
+
+        Unlike ``recover()`` (which discards every non-result event), this
+        yields token/tool/node events as StreamEvent objects so the CLI
+        renders recovery progress in real-time. The terminal ``result``
+        event goes through the same ``_recover_stream_payload_to_envelope``
+        mapping as ``recover()``, so ``--output`` formatting and exit codes
+        are identical between streaming and non-streaming calls.
+
+        Yields:
+            StreamEvent: token, thinking, tool_start, tool_end,
+            node_message, result, error
+        """
+        from chaos_agent.agent.streaming import StreamEvent
+
+        payload = {"task_id": task_id, **kwargs}
+        timeout = httpx.Timeout(self.timeout, read=None)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            try:
+                async with client.stream(
+                    "POST",
+                    self._url("/api/v1/recover-stream"),
+                    json=payload,
+                    headers={"accept": "text/event-stream", **self._auth_headers()},
+                ) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line.removeprefix("data:").strip()
+                        if not raw:
+                            continue
+                        try:
+                            event = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        event_type = event.get("type")
+                        if not event_type or event_type == "done":
+                            continue
+                        if event_type == "result":
+                            content = event.get("content")
+                            if isinstance(content, str):
+                                content = json.loads(content)
+                            if isinstance(content, dict):
+                                envelope = self._recover_stream_payload_to_envelope(
+                                    content, task_id,
+                                )
+                            else:
+                                envelope = JSONEnvelope.fail(
+                                    code=ResponseCode.RECOVERY_FAILED,
+                                    message="Invalid recover result event",
+                                    data={"task_id": task_id},
+                                )
+                            yield StreamEvent(
+                                type="result",
+                                content=json.dumps(envelope, ensure_ascii=False),
+                                task_id=task_id,
+                            )
+                            return
+                        # Intermediate event: forward as-is.
+                        yield StreamEvent(
+                            type=str(event_type),
+                            content=str(event.get("content") or ""),
+                            node=str(event.get("node") or ""),
+                            tool_name=str(event.get("tool_name") or ""),
+                            task_id=str(event.get("task_id") or task_id),
+                        )
+            except httpx.ConnectError:
+                yield StreamEvent(
+                    type="error",
+                    content=f"Cannot connect to agent server at {self.base_url}",
+                    task_id=task_id,
+                )
+            except httpx.TimeoutException:
+                yield StreamEvent(
+                    type="error",
+                    content=f"Connection to agent server at {self.base_url} timed out",
+                    task_id=task_id,
+                )
+            except Exception as e:
+                yield StreamEvent(
+                    type="error",
+                    content=str(e),
+                    task_id=task_id,
+                )
 
     async def metric(self, task_id: str = "") -> dict:
         if task_id:

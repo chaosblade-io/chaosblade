@@ -85,6 +85,26 @@ function asArray(v: unknown): unknown[] | null {
   return Array.isArray(v) ? v : null;
 }
 
+/** One widened-contract entry as a single line — the TS twin of
+ *  Python's ``format_mechanism_writes_for_display`` row: scope/ns +
+ *  names (long lists collapse to ``N: a, b …(+M)``) or a 'prefix'
+ *  (prefix) selector. Blank names fall back to ``*``. */
+function mechanismWriteLine(entry: Record<string, unknown>): string {
+  const scope = asString(entry["scope"]) || "?";
+  const ns = asString(entry["namespace"]) || "<cluster>";
+  const names = (asArray(entry["names"]) ?? []).map(asString).filter(Boolean);
+  let sel: string;
+  if (names.length > 4) {
+    sel = `${names.length}: ${names.slice(0, 4).join(", ")} …(+${names.length - 4})`;
+  } else if (names.length > 0) {
+    sel = names.join(", ");
+  } else {
+    const prefix = asString(entry["name_prefix"]);
+    sel = prefix ? `'${prefix}' (prefix)` : "*";
+  }
+  return `${scope}/${ns}: ${sel}`;
+}
+
 // ---------------------------------------------------------------------------
 // Risk meter
 // ---------------------------------------------------------------------------
@@ -972,6 +992,17 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
     ? conflictUidsRaw.map(asString).filter(Boolean)
     : [];
 
+  // Widened write-set contract (CASE manifest): entries the case
+  // legislated BEYOND the victim target. Danger-toned — approving
+  // authorizes these cluster writes, so they must be read before the
+  // buttons are touched.
+  const mechanismWritesRaw = payload?.["mechanism_writes"];
+  const mechanismWrites = Array.isArray(mechanismWritesRaw)
+    ? mechanismWritesRaw
+        .map((r) => (typeof r === "object" && r !== null ? (r as Record<string, unknown>) : null))
+        .filter((r): r is Record<string, unknown> => r !== null)
+    : [];
+
   // P2-8: pipeline_attempt / is_complex / plan_path.
   const pipelineAttemptRaw = payload?.["pipeline_attempt"];
   const pipelineAttempt =
@@ -1245,6 +1276,34 @@ const ExecutionConfirmCard: React.FC<{ payload: Payload; taskId?: string }> = ({
           />
         )}
       </Box>
+
+      {/* Widened write-set contract (CASE manifest) — the entries the
+       *  case legislated BEYOND the victim target. Same label-indent
+       *  layout as conflict_uids but danger-toned: approving
+       *  authorizes these cluster writes, so they outrank a mere
+       *  conflict warning and sit directly above it. */}
+      {mechanismWrites.length > 0 && (
+        <Box marginTop={1} flexDirection="column">
+          <Box>
+            <Box minWidth={FIELD_LABEL_WIDTH} paddingRight={1} flexShrink={0}>
+              <Text color={Theme.status.err}>{t("confirm.field.mechanism_writes")}</Text>
+            </Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text color={Theme.status.err}>{Icons.warning} </Text>
+            </Box>
+          </Box>
+          {mechanismWrites.map((entry, i) => (
+            <Box key={i} paddingLeft={FIELD_LABEL_WIDTH + 1}>
+              <Text wrap="wrap" color={Theme.gray[300]}>
+                {mechanismWriteLine(entry)}
+              </Text>
+            </Box>
+          ))}
+          <Box paddingLeft={FIELD_LABEL_WIDTH + 1}>
+            <Text color={Theme.gray[500]}>{t("confirm.mechanism_writes.hint")}</Text>
+          </Box>
+        </Box>
+      )}
 
       {/* P1-4: structured conflict_uids list. First row carries the
        *  field label aligned with other Field rows; subsequent UIDs
@@ -1527,6 +1586,11 @@ function hasExecutionContent(payload: Record<string, unknown>): boolean {
   if (asString(payload["safety_reason"])) return true;
   const target = asRecord(payload["target"]);
   if (target && Object.keys(target).length > 0) return true;
+  // A widened-contract card rides the structured execution body even
+  // when every other field is empty — the manifest entries are the
+  // one thing the approving human must not miss.
+  const writes = asArray(payload["mechanism_writes"]);
+  if (writes && writes.length > 0) return true;
   return false;
 }
 

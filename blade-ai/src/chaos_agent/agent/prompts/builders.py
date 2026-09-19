@@ -27,7 +27,7 @@ from chaos_agent.agent.prompts.assembly import (
     PromptSegment,
     assemble_prompt,
 )
-from chaos_agent.transports import PROFILE_K8S, PROFILE_UNKNOWN
+from chaos_agent.transports import PROFILE_HOST, PROFILE_K8S, PROFILE_UNKNOWN
 from chaos_agent.agent.prompts.sections import (
     get_role_section,
     get_executor_role_section,
@@ -176,6 +176,14 @@ def build_inject_system_prompt(
             env_info (dict): Runtime environment info to inject.
             replan_context (dict): Phase 2 → Phase 1 error feedback.
             replan_history (list): Prior replan attempts.
+            cr_channel_enabled (bool): The FaultDrill CR channel feature
+                flag as observed by the caller (settings.faultdrill_enabled).
+                Combined with the K8s profile here to gate the Workflow
+                recovery-channel routing guide (openspec
+                faultdrill-cr-channel, design D3 source 2) — dark launch
+                keeps the section byte-identical to pre-change. The prompts
+                layer reads no settings directly; the flag is a caller
+                capability fact, same as ``profile``.
 
     Returns:
         Assembled system prompt string.
@@ -206,7 +214,12 @@ def build_inject_system_prompt(
         ("experience", get_experience_section(), "optional"),
         ("knowledge_summary", get_knowledge_summary_section(phase="plan"), "optional"),
         ("skill_catalog", get_skill_index_section(skill_catalog), "optional"),
-        ("workflow", get_workflow_section(), "context"),
+        ("workflow", get_workflow_section(
+            include_cr_channel_routing=(
+                profile == PROFILE_K8S
+                and bool(kwargs.get("cr_channel_enabled"))
+            ),
+        ), "context"),
         ("safety", get_safety_section(level="hard_only"), "invariant"),
         ("tools", get_tools_section(phase=1), "contract"),
         ("guidelines", get_guidelines_section(include_method_switching=False, phase=1), "context"),
@@ -265,13 +278,14 @@ def build_inject_system_prompt(
             "contract",
         ))
 
-    # Progress ledger (planning phase). Empty until the model records something;
-    # during planning it carries no anchor (b-plan) — just state/log. "contract"
-    # rather than "context": a dropped ledger would silently remove the model's
-    # own anti-drift anchor and the only record an interrupted turn can report.
-    _ledger_section = kwargs.get("progress_ledger_section") or ""
-    if _ledger_section:
-        sections.append(("progress_ledger", _ledger_section, "contract"))
+    # The progress ledger NO LONGER rides this head (context-cache-prefix-
+    # stability Unit A task 2.6): the planning loop re-invokes the LLM every ReAct
+    # round, so a per-round ledger rewrite here was an early volatile byte that
+    # re-billed the whole cached suffix each round. It now rides the message tail
+    # (appended + persisted in agent_loop.py), which the budget assembler cannot
+    # squeeze — strictly stronger than the old "contract" priority. The
+    # ``progress_ledger_section`` kwarg is retained as accepted-but-ignored for
+    # in-flight callers.
 
     # U-shaped attention: REMEMBER last, AFTER every dynamic section. The
     # original section list carried it above cache_boundary, so the
@@ -338,12 +352,15 @@ def build_execute_system_prompt(
         ), "invariant"),
         ("replan_contract", get_replan_directive_for_execution(), "contract"),
     ])
-    # Progress ledger: re-injected each round as the drift anchor. "contract"
-    # priority so a tight budget can never drop it (see the planning builder);
-    # placed late for recency. Empty until the executor first records something.
-    _ledger_section = kwargs.get("progress_ledger_section") or ""
-    if _ledger_section:
-        sections.append(("progress_ledger", _ledger_section, "contract"))
+    # Progress ledger (context-cache-prefix-stability Unit A / task 2.1): the
+    # ledger NO LONGER rides the execute system prompt. It was re-injected here
+    # every round as the drift anchor, which rewrote the request HEAD each round
+    # and broke the provider cache prefix from the ledger's first changed byte.
+    # It now rides the message TAIL via execute_loop's append-only channel (see
+    # build_ledger_tail_content + the tail-append in _execute_loop_with_llm),
+    # keeping this [system][tools] head byte-stable across rounds. The
+    # ``progress_ledger_section`` kwarg is accepted-but-ignored for signature
+    # compatibility with callers still mid-migration.
     sections.append(
         ("remember", get_executor_remember_section(), "invariant"),
     )
@@ -374,12 +391,13 @@ def build_verifier_prompt(profile: str = PROFILE_K8S, **kwargs) -> str:
         ("verification_heuristics", get_verification_heuristics_compact_section(), "context"),
         ("output_contract", get_verifier_output_format_section(), "contract"),
     ]
-    # Progress ledger: re-injected so the verifier stays anchored to the frozen
-    # goal and can record what it establishes (empty until something is recorded).
-    # "contract" so a tight budget cannot drop it.
-    _ledger_section = kwargs.get("progress_ledger_section") or ""
-    if _ledger_section:
-        sections.append(("progress_ledger", _ledger_section, "contract"))
+    # Progress ledger (context-cache-prefix-stability Unit A / task 2.4): the
+    # ledger NO LONGER rides the verifier system prompt. It was re-injected here
+    # every round, rewriting the request HEAD and breaking the provider cache
+    # prefix. It now rides the message TAIL via verifier.py's append-only channel
+    # (see build_ledger_tail_content), keeping this head byte-stable across
+    # verify rounds. The ``progress_ledger_section`` kwarg is accepted-but-ignored
+    # for signature compatibility with callers still mid-migration.
     sections.append(("remember", get_verifier_remember_section(), "invariant"))
     return _assemble(PromptMode.VERIFICATION, sections)
 
@@ -452,6 +470,23 @@ def build_intent_clarification_prompt(
         ("reflection", get_intent_reflection_section(semantic_only=semantic_only), "context"),
         ("capability_boundary", get_intent_capability_boundary_section(), "context"),
         ("output_contract", get_intent_output_section(), "contract"),
+        # On-demand knowledge index, filtered to the plan phase. Without it
+        # the intent node saw ONLY the means-named skill-package index, so an
+        # outcome-stated request ("make the service down") had no methodology
+        # to translate with — the candidate set collapsed lexically onto the
+        # two catalogue entries whose names matched the outcome's wording
+        # (trace sess_4b696f566f23). The outcome-to-means.md entry point lives
+        # here; the phase filter keeps intent from paying index tokens for
+        # execute/verify/recover docs. Skipped for the host profile: the
+        # index lists k8s-titled docs (kubectl-guide, k8s-knowledge rows
+        # carry pod/kubectl vocabulary), and the host intent prompt is
+        # contractually free of cluster vocabulary
+        # (test_the_new_wording_leaks_no_k8s_vocabulary_into_host).
+        *(
+            [("knowledge_summary", get_knowledge_summary_section("plan"), "context")]
+            if profile != PROFILE_HOST
+            else []
+        ),
         ("skill_catalog", get_skill_index_section(skill_catalog), "optional"),
         ("cache_boundary", CACHE_BOUNDARY.strip(), "contract"),
     ]

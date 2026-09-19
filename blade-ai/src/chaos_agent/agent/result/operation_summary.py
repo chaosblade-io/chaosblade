@@ -243,13 +243,22 @@ def build_batch_summary(
         if not isinstance(result, Mapping):
             continue
         task_state = str(result.get("task_state") or "unknown")
-        ok = task_state in ("injected",)
+        # Three-way rendering: "unverified" is honest ignorance (verification
+        # ran, evidence unavailable) — rendering it as ✗ would translate
+        # "cannot tell" back into "failed", the very conflation this
+        # vocabulary exists to prevent. "?" keeps the claim truthful.
+        if task_state == "injected":
+            mark = "✓"
+        elif task_state == "unverified":
+            mark = "?"
+        else:
+            mark = "✗"
         target_text = format_summary_target(result.get("target"))
         target_suffix = f" target={target_text}" if target_text else ""
         parts.append(
             f"  {idx + 1}. {result.get('fault_type', '')} "
             f"→ {task_state} "
-            f"{'✓' if ok else '✗'} "
+            f"{mark} "
             f"(task={result.get('task_id', '')})"
             f"{target_suffix}"
         )

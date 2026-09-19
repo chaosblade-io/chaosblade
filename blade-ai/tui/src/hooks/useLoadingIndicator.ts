@@ -131,6 +131,14 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
   const compactionInFlight = useAppSelector(
     (s) => s.currentCompaction !== null,
   );
+  // Fault-window hold — third member of the single-spinner mutex.
+  // While the server holds the turn open through the injection
+  // contract window, FaultWindowIndicator owns the spinner slot
+  // (spinner keeps rotating, label switches to the countdown copy).
+  // The hold sits AFTER the pipeline finished (no token events), so
+  // the regular indicator's label resolution has nothing meaningful
+  // to show anyway — yielding the slot is pure gain.
+  const faultWindowInHold = useAppSelector((s) => s.faultWindow !== null);
 
   // Visibility is *narrower* than ``isStreaming``: the indicator only
   // renders while the agent is actively producing output. During
@@ -143,7 +151,8 @@ export function useLoadingIndicator(): LoadingIndicatorProps {
   // hijack while reading the confirm dialog. ``isStreaming`` keeps
   // its broader meaning for callers that gate on "turn in flight"
   // (Composer's Esc handling, InputPrompt disabled).
-  const visible = streamState === "responding" && !compactionInFlight;
+  const visible =
+    streamState === "responding" && !compactionInFlight && !faultWindowInHold;
 
   // Phase 2.2 — smooth animated token counter. The hook polls the
   // module-level char counter (written per-token in ``useStream``

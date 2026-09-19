@@ -32,7 +32,7 @@ from chaos_agent.agent.providers.k8s_native.provider import K8sNativeProvider
 from chaos_agent.agent.state import build_status_data
 from chaos_agent.agent.spec.fault_spec import FaultSpec
 from chaos_agent.agent.target_guard.freeze import approved_from_dict
-from chaos_agent.agent.target_guard.types import SCOPE_READONLY
+from chaos_agent.agent.target_guard.types import SCOPE_UNKNOWN
 from chaos_agent.memory.compactor import (
     build_post_compact_context_message,
     extract_critical_context,
@@ -194,14 +194,19 @@ class TestInlineBladeDelegationSnapshot:
         assert et.fault_target == "cpu"
         assert et.fault_action == "fullload"
 
-    def test_non_create_blade_is_readonly(self):
+    def test_inline_destroy_routes_to_unknown_with_uid(self):
+        # 第十二轮翻案：inline destroy 不再判 readonly（E3 溯源旁路）——
+        # 路由 SCOPE_UNKNOWN 携带 blade_destroy_uid，由 screener 溯源门验证。
+        # Round-16 形态翻案：hex16 是实验 UID 形态（非形态 token 按设计
+        # 走 form issue，见 TestInlineBladeDestroyProvenance 面）。
         et = classify_inline_blade(
-            ["blade", "destroy", "uid123"],
-            "kubectl exec p -- blade destroy uid123",
+            ["blade", "destroy", "aa11bb22cc33dd44"],
+            "kubectl exec p -- blade destroy aa11bb22cc33dd44",
             fallback_ns="demo",
             fallback_pod="p",
         )
-        assert et.scope == SCOPE_READONLY
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.blade_destroy_uid == "aa11bb22cc33dd44"
 
     def test_node_fixture(self):
         et = classify_inline_blade(
@@ -400,20 +405,27 @@ class TestCompactorDualKeyRegexSnapshot:
     """UID 提取双键正则现状钉扎（G5 降单键后旧键翻转）。"""
 
     def test_new_key_text_extracted(self):
-        # [行为等价] 新键文本命中（降单键后命中不变）
+        # [已翻转] round-22 Q4：存续上下文消息面委托 registry 接缝——
+        # 非工具载体（prose/_Msg 存根）的 experiment_uid 拼写不再回流
+        # （洗入通道废除：HumanMessage 提及/任意消息文本不能许可 UID）。
+        # 合法载体是真 blade_create ToolMessage（test_uid_shape_legislation
+        # .test_survival_context_delegates_uid_lifecycle_to_registry 钉扎）。
         ctx = extract_critical_context(
-            [_Msg('{"experiment_uid": "abc123-def"}')], {}
+            [_Msg('{"experiment_uid": "abc123def4560789"}')], {}
         )
-        assert ctx.get("active_experiment_uid") == "abc123-def"
+        assert ctx.get("active_experiment_uid") is None
 
     def test_legacy_key_text_not_extracted(self):
         # [已翻转] G5 单键化后：旧键拼写文本不再命中（fresh-database
         # 裁决，旧会话消息不回流）
-        ctx = extract_critical_context([_Msg('{"blade_uid": "abc123-def"}')], {})
+        ctx = extract_critical_context(
+            [_Msg('{"blade_uid": "abc123def4560789"}')], {}
+        )
         assert ctx.get("active_experiment_uid") is None
 
     def test_plain_text_new_key_extracted(self):
+        # [已翻转] round-22 Q4 同上：prose 面废除，非工具载体不回流
         ctx = extract_critical_context(
-            [_Msg("experiment_uid: ffedcba-4321")], {}
+            [_Msg("experiment_uid: ffedcba432107891")], {}
         )
-        assert ctx.get("active_experiment_uid") == "ffedcba-4321"
+        assert ctx.get("active_experiment_uid") is None

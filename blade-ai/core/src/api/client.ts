@@ -16,6 +16,7 @@
  */
 
 import { isStreamEvent, type StreamEvent } from "./events.js";
+import type { SessionEventRecord } from "../utils/sessionEvents.js";
 
 /**
  * Node-only SSE workaround flag. ``connection: close`` on the streaming
@@ -47,6 +48,48 @@ export interface SessionListItem {
   model_name: string;
   created_at: string;
   task_count: number;
+}
+
+/** One row of ``GET /api/v1/memory/resumable`` — sessions that carry
+ *  an events jsonl on disk, newest-first. All display-oriented
+ *  (no conversation internals). snake_case to match the wire. */
+export interface ResumableSessionItem {
+  tui_session_id: string;
+  size_bytes: number;
+  event_count: number;
+  started_at: string;
+  modified_at: number;
+  first_input: string;
+}
+
+/**
+ * ``chaos_agent/models/schemas.py::ResponseCode.TASK_NOT_FOUND`` —
+ * mirrored by hand (the wire carries only the number; schemas.py is
+ * the single source of truth server-side).
+ */
+export const RESPONSE_CODE_TASK_NOT_FOUND = 2001;
+
+/**
+ * Fail-envelope error carrying the server's numeric ``code``.
+ *
+ * The envelope protocol keeps HTTP at 200 and signals failure in the
+ * body (``{status: "fail", code, message}``). Callers that branch on
+ * the failure REASON — e.g. /resume's no-events path keys off
+ * TASK_NOT_FOUND — must match the code, not the message prose: the
+ * wording is user-facing and free to change, the code is the wire
+ * contract. Plain ``Error`` drops the code, which is how the /resume
+ * handler ended up fragile-matching the English message string.
+ */
+export class BladeApiError extends Error {
+  /** Numeric response code from the fail envelope. ``-1`` when the
+   *  body carried no usable ``code`` (malformed envelope). */
+  readonly code: number;
+
+  constructor(op: string, code: number, message: string) {
+    super(`${op}: ${message}`);
+    this.name = "BladeApiError";
+    this.code = code;
+  }
 }
 
 export interface TurnRequest {
@@ -370,6 +413,81 @@ export class BladeClient {
     const data = env["data"];
     if (data && typeof data === "object") return data as Record<string, unknown>;
     return env;
+  }
+
+  /**
+   * Full StreamEvent audit trail for a session — the ``/resume <sid>``
+   * visual-rebuild source (``GET /api/v1/memory/{sid}/events``).
+   *
+   * No fallback chain by design: when the events jsonl doesn't exist
+   * the server answers a fail envelope (TASK_NOT_FOUND) and this
+   * method throws ``BladeApiError`` with the numeric code attached —
+   * the /resume handler branches on ``code``, never on the message
+   * prose (which is user-facing and free to reword).
+   */
+  async getMemoryEvents(sid: string): Promise<SessionEventRecord[]> {
+    const r = await this._fetch(
+      `${this.baseUrl}/api/v1/memory/${encodeURIComponent(sid)}/events`,
+    );
+    if (!r.ok) throw new Error(`getMemoryEvents failed: HTTP ${r.status}`);
+    const env = (await r.json()) as Record<string, unknown>;
+    if (env["status"] === "fail") {
+      const msg = (env["message"] as string) ?? "server error";
+      const code = typeof env["code"] === "number" ? env["code"] : -1;
+      throw new BladeApiError("getMemoryEvents", code, msg);
+    }
+    const data = env["data"] as Record<string, unknown> | undefined;
+    const events = data?.["events"];
+    return Array.isArray(events) ? (events as SessionEventRecord[]) : [];
+  }
+
+  /**
+   * One row of ``GET /api/v1/memory/resumable`` — display-oriented
+   * session metadata for the ``/resume`` picker. snake_case to match
+   * the wire.
+   */
+  async listResumableSessions(): Promise<ResumableSessionItem[]> {
+    const r = await this._fetch(`${this.baseUrl}/api/v1/memory/resumable`);
+    if (!r.ok) throw new Error(`listResumableSessions failed: HTTP ${r.status}`);
+    const env = (await r.json()) as Record<string, unknown>;
+    if (env["status"] === "fail") {
+      const msg = (env["message"] as string) ?? "server error";
+      throw new Error(`listResumableSessions: ${msg}`);
+    }
+    const data = env["data"] as Record<string, unknown> | undefined;
+    const sessions = data?.["sessions"];
+    return Array.isArray(sessions)
+      ? (sessions as ResumableSessionItem[])
+      : [];
+  }
+
+  /**
+   * Rehydrate a previous session server-side (``POST
+   * /api/v1/sessions/{sid}/resume``): rebuild the in-memory store
+   * entry (conversation thread, task ids) so the NEXT turn continues
+   * the old dialogue instead of starting a blank one. Idempotent on
+   * the server — safe to call for an already-live session.
+   */
+  async resumeSession(
+    sid: string,
+  ): Promise<{ conversationThreadId: string }> {
+    const r = await this._fetch(
+      `${this.baseUrl}/api/v1/sessions/${encodeURIComponent(sid)}/resume`,
+      { method: "POST", headers: { "content-type": "application/json" } },
+    );
+    if (!r.ok) throw new Error(`resumeSession failed: HTTP ${r.status}`);
+    const env = (await r.json()) as Record<string, unknown>;
+    if (env["status"] === "fail") {
+      const msg = (env["message"] as string) ?? "server error";
+      throw new Error(`resumeSession: ${msg}`);
+    }
+    const data = (env["data"] ?? {}) as Record<string, unknown>;
+    return {
+      conversationThreadId:
+        typeof data["conversation_thread_id"] === "string"
+          ? data["conversation_thread_id"]
+          : "",
+    };
   }
 
   /**
@@ -987,6 +1105,30 @@ export class BladeClient {
     await this._fetch(`${this.baseUrl}/api/v1/sessions/${sid}/cancel`, {
       method: "POST",
     }).catch(() => undefined);
+  }
+
+  /**
+   * Break the fault-window hold of the CURRENT turn (Ctrl+R in the TUI).
+   *
+   * Unlike ``cancelTurn`` this does NOT swallow failures: the caller
+   * needs to know whether the in-band wake worked so it can fall
+   * back to the disconnect-and-let-server-recover path when it
+   * didn't. 404 (no hold active — the window just expired on its own)
+   * is reported as ``false`` rather than thrown: the recover graph
+   * is already on its way down the same stream, nothing to do.
+   */
+  async earlyRecover(sid: string, turnId: string): Promise<boolean> {
+    try {
+      const r = await this._fetch(
+        `${this.baseUrl}/api/v1/sessions/${sid}/turns/${encodeURIComponent(turnId)}/early-recover`,
+        { method: "POST" },
+      );
+      if (r.ok) return true;
+      if (r.status === 404) return false;
+      throw new Error(`earlyRecover failed: HTTP ${r.status}`);
+    } catch {
+      return false;
+    }
   }
 }
 

@@ -92,6 +92,16 @@ def _adapt_plan_confirm(payload: dict, thread_id: str) -> PendingCard:
     ]
     if payload.get("safety_reason"):
         summary_lines.append(f"Reason: {payload['safety_reason']}")
+    # Widened-contract entries render verbatim in the card summary — the
+    # deciding human must see what the CASE legislated, not plan prose.
+    mechanism_writes = payload.get("mechanism_writes")
+    if mechanism_writes:
+        from chaos_agent.agent.target_guard.mechanism_writes import (
+            format_mechanism_writes_for_display,
+        )
+        block = format_mechanism_writes_for_display(mechanism_writes)
+        if block:
+            summary_lines.append(block)
     summary = "\n".join(line for line in summary_lines if line)
 
     details = {
@@ -111,6 +121,7 @@ def _adapt_plan_confirm(payload: dict, thread_id: str) -> PendingCard:
         "pipeline_attempt": payload.get("pipeline_attempt"),
         "is_complex": payload.get("is_complex"),
         "plan_path": payload.get("plan_path"),
+        "mechanism_writes": mechanism_writes or [],
     }
 
     return PendingCard(

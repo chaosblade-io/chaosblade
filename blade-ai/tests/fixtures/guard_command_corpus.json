@@ -3,7 +3,7 @@
  "generated_at": "2026-08-17T09:13:26.357172+00:00",
  "source_counts": {
   "tests": 422,
-  "docs": 596,
+  "docs": 593,
   "tasks": 80,
   "adversarial": 22
  },
@@ -306,11 +306,6 @@
   {
    "cmd": "blade create k8s <scope>-<target> <action> [flags]",
    "src": "skills/k8s-chaos-skills/references/chaosblade-commands.md",
-   "category": "docs"
-  },
-  {
-   "cmd": "blade create k8s container-container remove \\",
-   "src": "skills/k8s-chaos-skills/references/catalogue/Container_被删除/Container_被删除_Sidecar容器被移除.md",
    "category": "docs"
   },
   {
@@ -3731,16 +3726,6 @@
   {
    "cmd": "kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.hostNetwork}'",
    "src": "skills/k8s-chaos-skills/references/catalogue/Container_网络丢包/Container_网络丢包_Sidecar网络中断.md",
-   "category": "docs"
-  },
-  {
-   "cmd": "kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.status.containerStatuses[*].restartCount}' --kubeconfig <kubeconfig-path>",
-   "src": "skills/k8s-chaos-skills/references/catalogue/Container_被删除/Container_被删除_Sidecar容器被移除.md",
-   "category": "docs"
-  },
-  {
-   "cmd": "kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.status.containerStatuses[?(@.name==\"<sidecar-container-name>\")].containerID}' --kubeconfig <kubeconfig-path>",
-   "src": "skills/k8s-chaos-skills/references/catalogue/Container_被删除/Container_被删除_Sidecar容器被移除.md",
    "category": "docs"
   },
   {

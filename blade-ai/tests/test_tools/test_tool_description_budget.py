@@ -76,15 +76,15 @@ def _schema_tokens(tool) -> int:
 # the only enumeration of valid values, none of which may be dropped
 # (slimming-plan hard constraint: "A 类一条不删").
 _CAPS: dict[str, tuple[object, int]] = {
-    "kubectl": (kubectl, 766),                      # class-A floor (~593 qwen); +shell-quoting MUST (task-190c94e8); +one-shot debug 120s cap / systemd-run carrier (inject-59b289a6: 300s loop hosted in a one-shot debug pod was killed at the 120s cap, fragmenting the fault window + ~150s re-arm); +two-layer v_args semantics (inject-17617837: old flat "No shell features" line contradicted skill recipes' sh -c heredocs and cost 90s model hesitation; the selector-strip regex it advertised silently amputated `ls -l /proc/$(cat ...)` inside quoted payloads)
-    "kubectl_read": (kubectl_read, 616),            # class-A floor (~552 qwen); +shell-quoting MUST (task-190c94e8); +exec single-command constraint (c157857 real-rejection-rework drift); +jsonpath whole-template quoting (inject-774ecd39: unquoted template word-split remotely, error invisible); +kubectl-layer selector rejection clarified (inject-17617837)
+    "kubectl": (kubectl, 890),                      # class-A floor (~593 qwen); +shell-quoting MUST (task-190c94e8); +one-shot debug 120s cap / systemd-run carrier (inject-59b289a6: 300s loop hosted in a one-shot debug pod was killed at the 120s cap, fragmenting the fault window + ~150s re-arm); +two-layer v_args semantics (inject-17617837: old flat "No shell features" line contradicted skill recipes' sh -c heredocs and cost 90s model hesitation; the selector-strip regex it advertised silently amputated `ls -l /proc/$(cat ...)` inside quoted payloads); +run admitted for the recovery-carrier shape only, flag whitelist (openspec recovery-carrier-standard: new refused-verb-class security contract; clean tree was already 772 over the old 766 cap, this raise covers both); +create admitted for the carrier RBAC stack, imperative-create routing (inject-cc2d5080: the subcommand list lacked `create` and the "Non-workload via apply" line steered the model into a manifest apply that the kind whitelist refuses — the carrier never stacked and the fault landed with no timer armed; measured 881, 890 keeps the same serialization-drift headroom rationale as kubectl_read)
+    "kubectl_read": (kubectl_read, 630),            # class-A floor (~552 qwen); +shell-quoting MUST (task-190c94e8); +exec single-command constraint (c157857 real-rejection-rework drift); +jsonpath whole-template quoting (inject-774ecd39: unquoted template word-split remotely, error invisible); +kubectl-layer selector rejection clarified (inject-17617837). Cap 616→630 is NOT content growth: the schema measures 616 on py3.14-system and 623 on .venv with identical source — the ±7 tok spread is json.dumps/convert_to_openai_tool serialization drift across library versions (within the o200k/Qwen ±1.4% caliber noted in the header). Zero-headroom at 616 made this pin flip red per-environment; 630 absorbs the drift while staying ~1000 tok below the 6318-char bloat era.
     "blade_python_create": (blade_python_create, 605),  # class-A floor (~592)
     "blade_python_prepare": (blade_python_prepare, 500),
     "blade_python_revoke": (blade_python_revoke, 375),
-    "submit_fault_intent": (submit_fault_intent, 750),  # class-A floor (~586) + dynamic INTENT_* enums; +case hint param (case_resource_path); +intent-accuracy provenance contract (probe trail / template-not-data); +one-line duration contract (duration_seconds channel)
+    "submit_fault_intent": (submit_fault_intent, 775),  # class-A floor (~586) + dynamic INTENT_* enums; +case hint param (case_resource_path); +intent-accuracy provenance contract (probe trail / template-not-data); +one-line duration contract (duration_seconds channel); +names-vs-labels disambiguation (names = scope-kind instances, workload/owner targets → labels — confusion caused real wrong-target submissions)
     "submit_batch_intent": (submit_batch_intent, 395),  # +one-line duration contract (duration_seconds channel)
     "submit_verification": (submit_verification, 495),
-    "submit_recover_verification": (submit_recover_verification, 400),
+    "submit_recover_verification": (submit_recover_verification, 455),  # +unverified verdict vocabulary (openspec unverified-verdict-semantics): overall 4-value domain + "unverified ≠ unrecovered" anti-conflation note + layer2 "unknown" — contract-mandated, not long-tail example bloat; +B76 round-14 root-cause fix: vocabulary lines now DERIVED from the verdict enums (full 6-word layer2 + 7-word item sets — class-A closed-set contract, cited incident: three contradictory hand-copied vocabularies found live)
     "blade_create": (blade_create, 610),            # class-A floor (~597)
     "blade_destroy": (blade_destroy, 365),
     "blade_status": (blade_status, 325),
@@ -97,7 +97,7 @@ _CAPS: dict[str, tuple[object, int]] = {
     "time_wait": (time_wait, 225),
     "query_active_experiments": (query_active_experiments, 220),
     "recover_task": (recover_task, 235),  # +task_id multi-format example (461398b)
-    "update_progress": (update_progress, 365),
+    "update_progress": (update_progress, 395),  # +reserved terminal-marker note (inject-ac45b369 #55 it12: model wrote phase=execution-complete via update_progress at finish; validator rejected the WHOLE call incl. log_append, one 15.1s retry round. Class-A refused-constraint taught at the only call-site-adjacent surface; measured 386 + drift headroom)
 }
 
 # The two flagship tools carry the full five-section structure; long-tail
@@ -111,14 +111,17 @@ _SECTIONS = (
     "Constraints",
 )
 
-# Total budget across all tracked schemas (current ~9867). If this trips,
+# Total budget across all tracked schemas (current ~9897). If this trips,
 # the growth is aggregate drift — find the culprit via the per-tool caps.
 # 9795 = 9750 + 45: single class-A raise for the kubectl one-shot debug
 # 120s cap constraint (inject-59b289a6), approved by budget owner.
 # 9867 = 9795 + 72: class-A raise for kubectl two-layer v_args semantics
 # + kubectl_read selector-rejection clarification (inject-17617837),
 # approved by budget owner.
-_TOTAL_CAP = 9867
+# 9897 = 9867 + 30: class-A raise for update_progress reserved
+# terminal-marker note (inject-ac45b369: #55 it12 phase=execution-complete
+# write rejected, one 15.1s retry round), approved by budget owner.
+_TOTAL_CAP = 9897
 
 
 class TestToolDescriptionBudget:

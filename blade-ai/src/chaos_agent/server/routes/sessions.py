@@ -24,7 +24,10 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from chaos_agent.memory.tui_session_store import get_global_tui_session_store
+from chaos_agent.memory.tui_session_store import (
+    SESSION_ID_PATTERN,
+    get_global_tui_session_store,
+)
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode
 from chaos_agent.utils.time import now_iso
 
@@ -200,16 +203,25 @@ async def create_session(body: CreateSessionRequest) -> dict[str, str]:
     sid = _GLOBAL_STORE.create(body)
     # Persist to disk via the shared TuiSessionStore so the TS TUI
     # session ends up under ``~/.blade-ai/memory/sessions/<sid>.json``
-    # — same schema/path the legacy Python TUI uses. Failure here is
-    # non-fatal: the agent still works, the user just won't get the
+    # — same schema/path the legacy Python TUI uses. The in-memory
+    # record's conversation_thread_id is passed through so the binding
+    # lands on disk AT CREATE TIME: without it the JSON keeps the
+    # empty-string default and a later restart + /resume would mint a
+    # FRESH thread (agent forgets the whole conversation) even though
+    # the checkpoints are still alive in checkpoints.db. Failure here
+    # is non-fatal: the agent still works, the user just won't get the
     # post-session audit trail.
     store = get_global_tui_session_store()
     if store is not None:
         try:
+            thread_id = (_GLOBAL_STORE.get(sid) or {}).get(
+                "conversation_thread_id", ""
+            )
             store.create(
                 sid,
                 cluster_name=body.cluster or "",
                 namespace=body.namespace or "default",
+                conversation_thread_id=thread_id,
             )
         except Exception as e:
             logger.warning(f"TuiSessionStore.create failed for {sid}: {e}")
@@ -253,6 +265,103 @@ async def delete_session(sid: str) -> dict[str, bool]:
         logger.warning(f"TaskStore.record_session(finalize) failed for {sid}: {e}")
     _GLOBAL_STORE.delete(sid)
     return {"ok": True}
+
+
+@sessions_router.post("/{sid}/resume")
+async def resume_session(sid: str, req: Request):
+    """Rehydrate an in-memory session record from its disk artefacts.
+
+    The resume-after-restart path: the server process died (or the TUI
+    reconnected to a fresh server), so ``SessionStore._items`` no
+    longer holds this sid, but ``~/.blade-ai/memory/`` still has the
+    session JSON + events jsonl. We rebuild the in-memory entry from
+    the JSON so subsequent ``/turn`` calls:
+
+      - reuse the persisted ``conversation_thread_id`` (dialogue
+        checkpoints continue — the agent remembers), or mint + persist
+        a fresh one when the JSON predates the field (legacy files);
+      - skip the first-turn placeholder state (``first_turn_done=True``)
+        — the session already had its lifecycle fields written.
+
+    The TUI-side visual rebuild happens from the events jsonl (see
+    memory.py ``/{sid}/events``); this endpoint only restores the
+    SERVER-side conversation binding. Call it before dispatching the
+    historical events.
+
+    Idempotent: an existing in-memory entry is overwritten from disk.
+    The current live session's entry is NOT auto-deleted — the caller
+    (TS TUI) is expected to keep using exactly one sid afterwards.
+    """
+    from chaos_agent.memory.tui_session_store import (
+        get_global_tui_session_store,
+    )
+
+    req_id = getattr(req.state, "request_id", "")
+    # Path-param whitelist, same rule as the memory routes (single
+    # source: ``tui_session_store.SESSION_ID_PATTERN``). The sid is
+    # composed into filesystem paths below (``tui_store.read`` →
+    # ``_file_path``; ``update_status``), so a traversal payload like
+    # ``../../x`` must bounce BEFORE any read — reading is disclosure,
+    # update_status/update_thread_id are WRITE primitives.
+    if not SESSION_ID_PATTERN.match(sid):
+        return JSONEnvelope.fail(
+            code=ResponseCode.INVALID_PARAMS,
+            message=(
+                f"invalid tui_session_id '{sid}' — must be 1–128 "
+                "characters of [A-Za-z0-9_-]"
+            ),
+            request_id=req_id,
+        )
+    tui_store = get_global_tui_session_store()
+    if tui_store is None:
+        return JSONEnvelope.fail(
+            code=ResponseCode.INTERNAL_ERROR,
+            message="TUI session store is not initialised",
+            request_id=req_id,
+        )
+    data = tui_store.read(sid) or {}
+    if not data:
+        return JSONEnvelope.fail(
+            code=ResponseCode.TASK_NOT_FOUND,
+            message=f"no session record on disk for '{sid}'",
+            request_id=req_id,
+        )
+    from chaos_agent.config.settings import settings
+    from chaos_agent.preflight import expand_kubeconfig_path
+
+    # Mark the disk record active again — a finalized/completed session
+    # file shouldn't keep advertising a terminal status while we resume
+    # appending turns to it.
+    if data.get("status") != "active":
+        data["status"] = "active"
+        try:
+            tui_store.update_status(sid, "active")
+        except Exception as e:  # pragma: no cover — best effort
+            logger.warning(f"status re-activation failed for {sid}: {e}")
+    # In-memory entry, mirroring create()'s shape. thread binding comes
+    # from disk ("" for legacy files → turn.py mints + backfills).
+    _GLOBAL_STORE._items[sid] = {
+        "id": sid,
+        "cluster": data.get("cluster_name") or "",
+        "namespace": data.get("namespace") or "default",
+        "model_name": settings.model_name or "",
+        "kubeconfig": expand_kubeconfig_path(settings.kubeconfig_path) or "",
+        "confirmation_required": bool(settings.confirmation_required),
+        "created_at": data.get("started_at") or now_iso(),
+        "task_ids": list(data.get("task_ids") or []),
+        "conversation_thread_id": data.get("conversation_thread_id") or "",
+        "first_turn_done": True,
+    }
+    return JSONEnvelope.ok(
+        data={
+            "tui_session_id": sid,
+            "conversation_thread_id": _GLOBAL_STORE._items[sid][
+                "conversation_thread_id"
+            ],
+            "resumed": True,
+        },
+        request_id=req_id,
+    )
 
 
 @sessions_router.get("/{sid}/state")
@@ -675,6 +784,7 @@ async def compact_session(sid: str, body: CompactRequest, req: Request):
             if hook_task is not None and not hook_task.done():
                 hook_task.cancel()
                 try:
+                    # abort-safe: see invariants allowlist
                     await hook_task
                 except (asyncio.CancelledError, Exception):
                     pass

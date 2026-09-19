@@ -6,7 +6,7 @@ import re
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
-from chaos_agent.agent.dispatch import with_phase_events
+from chaos_agent.agent.dispatch import with_phase_events, with_tool_span
 from chaos_agent.agent.nodes._phase_screener import make_phase_screener
 from chaos_agent.tools._strict_args import UNKNOWN_ARG_REFUSAL_MARKER
 from chaos_agent.agent.nodes.recover._recover_finalize import make_finalize_recover_verification
@@ -191,7 +191,12 @@ def _phase2_handle_tool_error(error: Exception) -> str:
         f"Use the tools already available to you — do not guess at other tool "
         f"names. If the action you wanted has no tool, say so in plain text "
         f"and explain what you would need; do not substitute a different tool "
-        f"to approximate it."
+        f"to approximate it.\n"
+        f"\n"
+        f"A tool name you have only seen in the conversation history may "
+        f"belong to an earlier phase's tool surface — each phase binds its "
+        f"own set. The tools currently bound to you are the authority on "
+        f"what exists here."
     )
 
 
@@ -252,7 +257,7 @@ def build_recover_graph(
         # Same unknown-tool rewrite as Phase 2: the LangGraph default lists
         # every bound tool ("try one of [...]"), which hands the model a menu
         # instead of the one fact it needs (task-ce9647931ce1 pattern).
-        graph.add_node("recover_verifier_tools", ToolNode(verifier_tools, handle_tool_errors=_phase2_handle_tool_error))
+        graph.add_node("recover_verifier_tools", with_tool_span("recover_verifier_tools", ToolNode(verifier_tools, handle_tool_errors=_phase2_handle_tool_error)))
 
     graph.set_entry_point("recover_verifier_loop")
 
@@ -351,7 +356,7 @@ def build_intent_graph(
         with_phase_events("intent_clarification", "intent", intent_clarification_node),
     )
     if clarification_tools:
-        graph.add_node("clarification_tools", ToolNode(clarification_tools))
+        graph.add_node("clarification_tools", with_tool_span("clarification_tools", ToolNode(clarification_tools)))
         graph.add_node("intent_screener", intent_screener)
     graph.add_node(
         "intent_confirm",
@@ -464,10 +469,10 @@ def build_pipeline_graph(
             stop_retry_hint=True,
         )
         graph.add_node("plan_builder_screener", _plan_builder_screener)
-        graph.add_node("plan_builder_tools", ToolNode(
+        graph.add_node("plan_builder_tools", with_tool_span("plan_builder_tools", ToolNode(
             clarification_tools,
             handle_tool_errors=_phase1_handle_tool_error,
-        ))
+        )))
 
     # Batch execution (loop-back)
     graph.add_node("batch_setup", with_phase_events("batch_setup", "inject", batch_setup))
@@ -476,10 +481,10 @@ def build_pipeline_graph(
     # Phase 1 (planning)
     graph.add_node("agent_loop", with_phase_events("agent_loop", "inject", agent_loop_node))
     graph.add_node("phase1_screener", phase1_screener)
-    graph.add_node("phase1_tools", ToolNode(
+    graph.add_node("phase1_tools", with_tool_span("phase1_tools", ToolNode(
         phase1_tools,
         handle_tool_errors=_phase1_handle_tool_error,
-    ))
+    )))
     graph.add_node("extract_planning_metadata", extract_planning_metadata)
     # Planning → execution handoff strip: the deterministic slimming point
     # on the edge every finalized plan crosses (first pass AND every replan
@@ -498,7 +503,7 @@ def build_pipeline_graph(
     # Phase 2 (execution)
     graph.add_node("execute_loop", with_phase_events("execute_loop", "inject", execute_loop_node))
     graph.add_node("tool_screener", tool_screener)
-    graph.add_node("phase2_tools", ToolNode(phase2_tools, handle_tool_errors=_phase2_handle_tool_error))
+    graph.add_node("phase2_tools", with_tool_span("phase2_tools", ToolNode(phase2_tools, handle_tool_errors=_phase2_handle_tool_error)))
 
     # Verification
     graph.add_node("verifier_loop", with_phase_events("verifier_loop", "verify", verifier_node))
@@ -527,7 +532,7 @@ def build_pipeline_graph(
         graph.add_node("verifier_screener", _verifier_screener)
         # Same unknown-tool rewrite as Phase 2 — the LangGraph default's
         # "try one of [...]" list is the anti-pattern Layer D removed.
-        graph.add_node("verifier_tools", ToolNode(verifier_tools, handle_tool_errors=_phase2_handle_tool_error))
+        graph.add_node("verifier_tools", with_tool_span("verifier_tools", ToolNode(verifier_tools, handle_tool_errors=_phase2_handle_tool_error)))
     graph.add_node("se_detect", with_phase_events("se_detect", "verify", se_detect_node))
 
     # End
@@ -642,7 +647,15 @@ def build_pipeline_graph(
     graph.add_conditional_edges(
         "tool_screener",
         route_after_screener,
-        {"pass": "phase2_tools", "replan": "agent_loop", "retry": "execute_loop"},
+        # "reject": the screener's hard-termination route (SCREENER_ROUTE_FAIL)
+        # ends at the terminal node — the W-56-5 fix; a hard stop that looped
+        # as "retry" kept the run alive and leaked stale fail state (#56).
+        {
+            "pass": "phase2_tools",
+            "replan": "agent_loop",
+            "retry": "execute_loop",
+            "reject": "reject",
+        },
     )
     graph.add_edge("phase2_tools", "execute_loop")
 

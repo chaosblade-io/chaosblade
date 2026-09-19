@@ -403,3 +403,133 @@ class TestSafetyCheck:
         # Health report is ALSO present (not hidden by conflict early-return)
         assert result.get("target_health_report") is not None
         assert result["target_health_report"]["overall"] == "block"
+
+
+class TestAnchorKindIntegrity:
+    """B76 review F (probe_b76_round6.py): the frozen identity must still
+    name the resource KIND the user anchored. The skill-selection channel
+    (extract scope override + lazy derivation rebuild) can silently swap a
+    node-anchored intent for a pod fault with no user touchpoint in CLI."""
+
+    NODE_INTENT = (
+        "模拟节点宕机：在节点 cn-shanghai-cloudspe.25.209.71.189 上切断该节点与 "
+        "API Server 的网络通信"
+    )
+
+    @pytest.mark.asyncio
+    async def test_anchored_node_intent_with_pod_spec_forces_confirmation(
+        self, sample_agent_state, monkeypatch,
+    ):
+        """F1-F3 shape: user anchors node X, the plan (after scope override
+        + lazy derivation) delivers pod-cpu-fullload on an unrelated pod —
+        the freeze must not pass silently."""
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
+        state = sample_agent_state
+        state["skill_name"] = "pod-cpu-fullload"
+        from tests._helpers import replace_fault_spec
+        replace_fault_spec(
+            state, scope="pod", fault_target="cpu", fault_action="fullload",
+            namespace="cms-demo", names=("my-app-pod-0",),
+            user_description=self.NODE_INTENT,
+        )
+
+        result = await safety_check(state)
+        assert result["safety_status"] == "confirm_required"
+        assert result["needs_confirmation"] is True
+        # The receipt names BOTH sides of the mismatch so the TUI card (or
+        # the CLI gate rejection) shows exactly what drifted.
+        assert "cn-shanghai-cloudspe.25.209.71.189" in result["safety_reason"]
+        assert "pod" in result["safety_reason"]
+        assert "my-app-pod-0" in result["safety_reason"]
+
+    @pytest.mark.asyncio
+    async def test_anchored_node_intent_with_node_spec_stays_unblocked(
+        self, sample_agent_state, monkeypatch,
+    ):
+        """The happy path (LLM picks a node-scope skill) must not pay for
+        the guard: same anchor, node scope → status unchanged."""
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
+        state = sample_agent_state
+        state["skill_name"] = "node-network-loss"
+        from tests._helpers import replace_fault_spec
+        replace_fault_spec(
+            state, scope="node", fault_target="network", fault_action="loss",
+            namespace="", names=("cn-shanghai-cloudspe.25.209.71.189",),
+            user_description=self.NODE_INTENT,
+        )
+
+        result = await safety_check(state)
+        # No kubeconfig → conflict check skipped → warning; the anchor
+        # check must NOT escalate it.
+        assert result["safety_status"] == "warning"
+        assert result.get("needs_confirmation") is not True
+
+    @pytest.mark.asyncio
+    async def test_anchored_node_intent_with_host_spec_stays_unblocked(
+        self, sample_agent_state, monkeypatch,
+    ):
+        """node and host are the same machine from two angles: a node-level
+        drill routinely lands on host scope (Node_CPU cases run systemd-run
+        payloads on the host). Anchored-node intent under host scope is a
+        correct domain mapping, not a retarget — must NOT force the gate
+        (this was a near-miss in the fix: canonicalise_kind("host") is
+        "host", a naive != "node" check would have broken every host-path
+        node drill)."""
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubewiz_host")
+        monkeypatch.setattr(settings, "host_name", "10.0.2.8")
+        state = sample_agent_state
+        state["skill_name"] = "host-cpu-fullload"
+        from tests._helpers import replace_fault_spec
+        replace_fault_spec(
+            state, scope="host", fault_target="cpu", fault_action="fullload",
+            namespace="", names=(),
+            user_description="在节点 cn-shanghai-cloudspe.25.209.71.189 上打满 CPU",
+        )
+
+        result = await safety_check(state)
+        assert result["safety_status"] == "safe"
+
+    @pytest.mark.asyncio
+    async def test_unanchored_intent_with_pod_spec_stays_unblocked(
+        self, sample_agent_state, monkeypatch,
+    ):
+        """Anchorless text (the legacy shape) never triggers — the check is
+        fail-open on the anchor vocabulary, same as ①'s prefill."""
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
+        state = sample_agent_state
+        state["skill_name"] = "pod-delete"
+        from tests._helpers import replace_fault_spec
+        replace_fault_spec(
+            state, scope="pod", fault_target="kill", fault_action="delete",
+            namespace="default", names=("my-pod",),
+            user_description="delete pod my-pod",
+        )
+
+        result = await safety_check(state)
+        assert result["safety_status"] == "warning"
+
+    @pytest.mark.asyncio
+    async def test_rejected_status_is_not_softened_by_anchor_check(
+        self, sample_agent_state, monkeypatch,
+    ):
+        """A blacklisted namespace is already terminal-rejected; the anchor
+        check must not rewrite the reason (the blacklist diagnosis is the
+        more specific one) nor soften the status."""
+        monkeypatch.setattr(settings, "safety_blacklist_namespaces", "kube-system,kube-public")
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+        monkeypatch.setattr(settings, "kube_connection_mode", "kubeconfig")
+        state = sample_agent_state
+        state["skill_name"] = "pod-delete"
+        from tests._helpers import replace_fault_spec
+        replace_fault_spec(
+            state, scope="pod", namespace="kube-system", names=("coredns",),
+            user_description=self.NODE_INTENT,
+        )
+
+        result = await safety_check(state)
+        assert result["safety_status"] == "rejected"
+        assert "kube-system" in result["safety_reason"]

@@ -63,6 +63,13 @@ def _kubectl_commands() -> list[tuple[str, str]]:
             if not cmd.startswith("kubectl "):
                 continue
             cmd = _PLACEHOLDER_RE.sub("PLACEHOLDER", cmd)
+            # The carrier skeleton prescribes ``--command -- sleep N`` where
+            # N is a real integer the agent must supply (guarded fail-closed
+            # on non-numeric sleep values). Substituting the bare token
+            # fabricates a command production would never send and trips that
+            # guard on the placeholder, not on the command's real shape — so
+            # normalise the sleep operand to a legal skeleton value.
+            cmd = re.sub(r"\bsleep PLACEHOLDER\b", "sleep 600", cmd)
             if any(m in cmd for m in _SHELL_METACHARS):
                 continue
             try:

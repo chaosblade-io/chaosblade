@@ -60,9 +60,19 @@ async def reject(state: AgentState) -> dict:
     safety checks fail, or the user rejects the confirmation.
     """
     task_id = state.get("task_id", "") or ""
-    reason = state.get("safety_reason", "Unknown reason")
     outcome = read_operation_outcome(state)
-    error_val = outcome.error or reason
+    # W-56-5 (defect c): single-source attribution. ``safety_reason`` is
+    # written by whichever gate routes here THIS time (safety_check, the
+    # drift hard-stop, planning rejection), so it is the freshest direct
+    # cause; ``outcome.error`` may be a PREVIOUS attempt's residue (#56
+    # rendered a stale "drift_terminated" from attempt 1 next to attempt 2's
+    # own blast-radius reason — two contradictory lines in one terminal
+    # event). Every rendering below shares ONE value.
+    reason = (
+        state.get("safety_reason")
+        or outcome.error
+        or "Unknown reason"
+    )
 
     tracker = get_tracker(task_id)
     tracker.start(
@@ -71,8 +81,8 @@ async def reject(state: AgentState) -> dict:
         f"Task rejected: {reason}",
         {"reason": reason},
     )
-    tracker.fail(f"Rejected: {error_val}")
-    await dispatch_node_message("reject", f"Rejected: {error_val}")
+    tracker.fail(f"Rejected: {reason}")
+    await dispatch_node_message("reject", f"Rejected: {reason}")
 
     # Trust upstream-set failure_detail if present; otherwise infer as fallback.
     if outcome.failure_detail:
@@ -83,9 +93,9 @@ async def reject(state: AgentState) -> dict:
     result = {
         "result": {
             "status": "rejected",
-            "reason": error_val,
+            "reason": reason,
         },
-        "error": error_val,
+        "error": reason,
         "failure_detail": fs.get("failure_detail"),
         "finished_at": now_iso(),
     }

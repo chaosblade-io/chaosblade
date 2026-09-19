@@ -16,8 +16,39 @@ from chaos_agent.observability.status_tracker import (
     StatusCategory,
 )
 from chaos_agent.agent.dispatch import dispatch_node_message
+from chaos_agent.agent.providers.uid_shapes import (
+    HEX16_UID_SHAPE,
+    HEX_HEAD_GUARD,
+    HEX_TAIL_GUARD,
+)
+from chaos_agent.tools.request_identity import (  # noqa: F401 — re-export
+    RequestFingerprint,
+    build_request_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# Raw-output UID fallback anchor (round-21; edges re-legislated same
+# round after the adversarial re-review; round-22 Q1 composed them from
+# the single source): when the blade status JSON cannot be parsed,
+# experiment existence is mined from the raw output by shape alone.
+# Composes the single-source hex16 legislation (``agent/providers/
+# uid_shapes.py`` — the arbitration layer this node is allowed to import)
+# with BOTH word boundaries, CASE-DOUBLE on each edge (the same r19-N3b
+# ruling as FAILED_CREATE_UID_RE's trailer lookahead, now single-sourced
+# as HEX_HEAD_GUARD / HEX_TAIL_GUARD): the first draft's lowercase-only
+# edges truncated a mixed-case token (16 lowercase hex + uppercase
+# trailer) into a 16-hex fake, and the pre-round-21 hand-copied
+# ``[0-9a-f]{16}`` (fixed 16, no edges) truncated a 40-hex sha256 shape
+# into TWO fake well-shaped UIDs and split a legal 32-hex UID into two
+# identical 16-char fakes, while never recognizing the 17-32 length range
+# the legislation admits. The lookarounds keep a resource-name suffix
+# (``chaosblade-<uid>``) capturable — the prefix is not a hex character —
+# while refusing any mid-string or case-adjacent partial match. A
+# hand-typed edge can drift casing silently while every shape-domain
+# check stays green — the guards are composed, never re-typed.
+FALLBACK_UID_RE = re.compile(HEX_HEAD_GUARD + HEX16_UID_SHAPE + HEX_TAIL_GUARD)
 
 
 def _persist_conclusion(task_id: str, message: str, detail: dict) -> None:
@@ -64,6 +95,16 @@ class ConflictInfo:
     # with the current target CANNOT be determined for these; they are
     # reported in details (weak note) but never treated as conflicts.
     undeterminable: bool = False
+
+
+# RequestFingerprint / build_request_fingerprint were PROMOTED to neutral
+# ground — chaos_agent/tools/request_identity.py, the create-reconcile
+# gate's cross-layer identity contract (same rationale as
+# tools/markers.py: the generic gate and the carrier-side judgment
+# material both consume it) — and are re-exported from the import block
+# above for historical import paths. The conflict QUERY itself
+# (check_blade_conflicts below) is carrier judgment material and stays
+# here.
 
 
 def _extract_param_from_flag(flag: str, param_name: str) -> str:
@@ -375,7 +416,7 @@ async def check_blade_conflicts(
         # UNDETERMINABLE tier: visible in details, never asserted as
         # conflicts (uids).
         if not json_parsed:
-            fallback_uids = re.findall(r"[0-9a-f]{16}", raw)
+            fallback_uids = FALLBACK_UID_RE.findall(raw)
             for uid in fallback_uids:
                 conflict_details.append(ConflictInfo(uid=uid, undeterminable=True))
         overlapping = [c for c in conflict_details if c.overlaps_target]

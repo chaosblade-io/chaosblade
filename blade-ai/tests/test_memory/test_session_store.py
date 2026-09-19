@@ -397,6 +397,111 @@ class TestSyncFlushBeforeFinalize:
         assert types.count("ai") == 1
 
 
+class TestB78IdentityAtFirstPersistence:
+    """B78: message identity must be established at FIRST persistence.
+
+    A hand-built state message (the Phase 2 kickoff in execute_loop is the
+    measured case) is immediate-written to the store BEFORE ``add_messages``
+    merges it into state, and the PreReasoningHook flush writes the same
+    object AFTER the merge. With no id at construction the two serializations
+    fell under two different dedup keys (composite vs ``id:``) — one logical
+    message recorded twice, timestamps drifting ~5s apart, misleading any
+    replay analysis.
+
+    The fix stamps a uuid IN PLACE on id-less state messages inside
+    ``append_messages`` (the choke point every state-message write passes
+    through), while deliberately EXCLUDING SystemMessage: per-loop prompt
+    records (``record_system_prompt``) are rebuilt from scratch every
+    iteration, never enter state, and rely on content-based dedup as their
+    design contract — a fresh uuid per rebuild would fork each round into a
+    new audit entry (measured: 3 prompt records would balloon to 23).
+    """
+
+    def test_idless_state_message_gets_uuid_stamped_in_place(self, store, task_dir):
+        # The stamp must land on the MESSAGE OBJECT, not just the serialized
+        # dict: the caller folds the same object reference into
+        # result["messages"], so the id must ride into the reducer for the
+        # later hook flush to compute the same dedup key.
+        store.create_session("task-b78a", operation="inject")
+        kickoff = HumanMessage(content="<system-reminder>PHASE 2</system-reminder>")
+        assert kickoff.id is None
+        store.append_messages("task-b78a", [kickoff])
+        assert kickoff.id is not None
+        assert len(kickoff.id) >= 32  # uuid-ish, not a bare marker
+
+    def test_b78_double_write_collapses_to_one_entry(self, store, task_dir):
+        # The measured lifecycle: immediate write (pre-merge, id-less) →
+        # LangGraph add_messages merges the SAME object into state → the
+        # next PreReasoningHook flush re-appends it (post-merge, now id-ful).
+        # The reducer is simulated with the REAL add_messages to pin its
+        # id-preservation behaviour, not a mock.
+        from langgraph.graph.message import add_messages
+
+        store.create_session("task-b78b", operation="inject")
+        kickoff = HumanMessage(content="<system-reminder>PHASE 2</system-reminder>")
+
+        # 1. Immediate archival write (execute_loop does this directly).
+        store.append_messages("task-b78b", [kickoff])
+        # 2. Node folds the same reference into result["messages"] → reducer.
+        state_msgs = add_messages([], [kickoff])
+        # 3. Next iteration: hook flush appends the state list again.
+        store.append_messages("task-b78b", state_msgs)
+        # 4. And once more for good measure (multiple flush rounds).
+        store.append_messages("task-b78b", state_msgs)
+
+        store.finalize_session(
+            "task-b78b", remaining_messages=[], status="completed",
+        )
+        data = json.loads((task_dir / "task-b78b.json").read_text())
+        contents = [m["content"] for m in data["messages"]]
+        assert contents.count("<system-reminder>PHASE 2</system-reminder>") == 1
+        assert len(data["messages"]) == 1
+        assert data["messages"][0]["id"] == state_msgs[0].id
+
+    def test_system_prompt_records_keep_content_dedup(self, store, task_dir):
+        # Regression guard for the exclusion: record_system_prompt builds a
+        # FRESH SystemMessage every loop iteration with identical content and
+        # relies on content-based dedup ("dedup handles repeated prompts").
+        # Stamping uuids there would fork every round into a new entry.
+        store.create_session("task-b78c", operation="inject")
+        for _ in range(5):  # five loop iterations, five fresh objects
+            store.append_messages(
+                "task-b78c", [SystemMessage(content="You are the injector. " * 8)],
+            )
+        store.finalize_session(
+            "task-b78c", remaining_messages=[], status="completed",
+        )
+        data = json.loads((task_dir / "task-b78c.json").read_text())
+        assert len(data["messages"]) == 1
+
+    def test_preexisting_id_is_never_overwritten(self, store, task_dir):
+        # Provider-issued ids (lc_run--*) and semantic ids (hint:*, synthetic:*)
+        # are the identity; the stamp must be additive-only.
+        store.create_session("task-b78d", operation="inject")
+        msg = HumanMessage(content="keep my id", id="hint:loop:app")
+        store.append_messages("task-b78d", [msg])
+        assert msg.id == "hint:loop:app"
+        store.finalize_session(
+            "task-b78d", remaining_messages=[], status="completed",
+        )
+        data = json.loads((task_dir / "task-b78d.json").read_text())
+        assert data["messages"][0]["id"] == "hint:loop:app"
+
+    def test_distinct_idless_messages_get_distinct_ids(self, store, task_dir):
+        # Two genuinely different hand-built messages must not collide —
+        # each gets its own uuid and its own audit entry.
+        store.create_session("task-b78e", operation="inject")
+        m1 = HumanMessage(content="first control message")
+        m2 = HumanMessage(content="second control message")
+        store.append_messages("task-b78e", [m1, m2])
+        assert m1.id and m2.id and m1.id != m2.id
+        store.finalize_session(
+            "task-b78e", remaining_messages=[], status="completed",
+        )
+        data = json.loads((task_dir / "task-b78e.json").read_text())
+        assert len(data["messages"]) == 2
+
+
 class TestListTasks:
     """list_tasks returns task_ids derived from filenames."""
 

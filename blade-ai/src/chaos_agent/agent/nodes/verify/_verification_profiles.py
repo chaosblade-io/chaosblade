@@ -29,6 +29,14 @@ from chaos_agent.agent.nodes.execute._effect_checks import (
     _verify_disk_burn_effect,
     _verify_disk_fill_effect,
 )
+from chaos_agent.agent.nodes.verify._deterministic_rules import (
+    CPU_FULLLOAD_RULE,
+    DISK_BURN_RULE,
+    DISK_FILL_RULE,
+    MEM_LOAD_RULE,
+    PROCESS_KILL_RULE,
+    DeterministicRule,
+)
 
 
 @dataclass
@@ -61,25 +69,36 @@ class PostCheckSpec:
 
 
 class VerificationProfile(Protocol):
-    """Per-fault-type profile. The only slot is the programmatic post-injection
-    effect check; all verification knowledge lives in the data layer (skill case
-    + knowledge docs), never here."""
+    """Per-fault-type profile. Two slots are programmatic runtime assets:
+    the post-injection effect check (execute-time measurement) and the
+    deterministic verdict rules (finalize-time adjudication of measured
+    numbers). All verification knowledge lives in the data layer (skill
+    case + knowledge docs), never here."""
 
     def post_injection_checks(self, ctx: VerificationContext) -> tuple[PostCheckSpec, ...]: ...
 
+    def deterministic_rules(self) -> tuple[DeterministicRule, ...]: ...
+
 
 class _DefaultProfile:
-    """Neutral profile: no programmatic post-injection check. Fault types whose
-    effect the verifier observes purely via the skill case / knowledge docs need
-    no entry in the registry and fall back to this."""
+    """Neutral profile: no programmatic post-injection check, no
+    deterministic rule. Fault types whose effect the verifier observes
+    purely via the skill case / knowledge docs need no entry in the
+    registry and fall back to this."""
 
     def post_injection_checks(self, ctx: VerificationContext) -> tuple[PostCheckSpec, ...]:
+        return ()
+
+    def deterministic_rules(self) -> tuple[DeterministicRule, ...]:
         return ()
 
 
 class _DiskProfile(_DefaultProfile):
     """Disk faults expose a deterministic fill / burn effect check that the
-    execute node runs and hands to the verifier as authoritative evidence."""
+    execute node runs and hands to the verifier as authoritative evidence.
+    Both families carry deterministic verdict rules: burn (measured I/O
+    ACTIVE → programmatic passed) and fill (measured usage reaches the
+    injected percent/size target)."""
 
     def post_injection_checks(self, ctx: VerificationContext) -> tuple[PostCheckSpec, ...]:
         # Effect-check functions live in the ``execute._effect_checks`` leaf
@@ -91,15 +110,50 @@ class _DiskProfile(_DefaultProfile):
             return (PostCheckSpec("disk_burn_post_check", _verify_disk_burn_effect),)
         return ()
 
+    def deterministic_rules(self) -> tuple[DeterministicRule, ...]:
+        return (DISK_BURN_RULE, DISK_FILL_RULE)
+
+
+class _ProcessProfile(_DefaultProfile):
+    """Process faults have no programmatic post-injection check — their
+    effect lands in pod-restart semantics, observable through the metric
+    timeline (RestartCount / Container ID). The kill family carries the
+    deterministic verdict rule calibrated on #25 / #25-R."""
+
+    def deterministic_rules(self) -> tuple[DeterministicRule, ...]:
+        return (PROCESS_KILL_RULE,)
+
+
+class _CpuProfile(_DefaultProfile):
+    """CPU family: the rule is DECLARED but not calibrated (extreme-shape-
+    only samples — see the rule's module docstring). evaluate is pinned to
+    unknown, so the declaration changes nothing at runtime; it marks the
+    typed extension point that calibration data will switch on."""
+
+    def deterministic_rules(self) -> tuple[DeterministicRule, ...]:
+        return (CPU_FULLLOAD_RULE,)
+
+
+class _MemProfile(_DefaultProfile):
+    """Memory family: same declared-but-uncalibrated state as CPU (zero
+    pod-scope samples; the one node-scope sample landed exactly on the
+    injected percent — an extreme shape, not a threshold calibration)."""
+
+    def deterministic_rules(self) -> tuple[DeterministicRule, ...]:
+        return (MEM_LOAD_RULE,)
+
 
 _DEFAULT_PROFILE = _DefaultProfile()
 
 # Registry keyed by fault target. Only fault types with a programmatic
-# post-injection effect check need an entry; everything else falls back to the
-# neutral default — their verification is driven entirely by the skill case and
-# knowledge docs.
+# post-injection effect check or a deterministic verdict rule need an
+# entry; everything else falls back to the neutral default — their
+# verification is driven entirely by the skill case and knowledge docs.
 _PROFILE_REGISTRY: dict[str, VerificationProfile] = {
     "disk": _DiskProfile(),
+    "process": _ProcessProfile(),
+    "cpu": _CpuProfile(),
+    "mem": _MemProfile(),
 }
 
 
@@ -109,9 +163,25 @@ def resolve_verification_profile(target: str | None) -> VerificationProfile:
     return _PROFILE_REGISTRY.get(target or "", _DEFAULT_PROFILE)
 
 
+def resolve_deterministic_rules(
+    target: str | None, action: str | None,
+) -> tuple[DeterministicRule, ...]:
+    """Deterministic rules whose ``(fault_target, fault_action)`` match key
+    equals the resolved fault identity.
+
+    Families without a declared rule return ``()`` — the finalize pipeline
+    then runs with zero rule interference (LLM verdict untouched, byte-
+    identical to the pre-rule-layer behaviour)."""
+    if not target or not action:
+        return ()
+    rules = resolve_verification_profile(target).deterministic_rules()
+    return tuple(r for r in rules if r.match == (target, action))
+
+
 __all__ = [
     "VerificationContext",
     "VerificationProfile",
     "PostCheckSpec",
     "resolve_verification_profile",
+    "resolve_deterministic_rules",
 ]

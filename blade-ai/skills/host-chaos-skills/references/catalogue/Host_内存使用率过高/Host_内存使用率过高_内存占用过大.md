@@ -76,4 +76,4 @@ pkill -x stress-ng
 注意事项：
 - stress-ng 方式无法精确控制百分比，需按**增量**手动计算内存量（分配量 = MemTotal × 目标百分比 − 已用量）
 - 无 `--avoid-being-killed` 等效保护，可能被 OOM Killer 杀死；若分配后进程消失且 `free -m` 无变化，先查 `dmesg | grep -i oom` 确认是否超量被杀，按增量重算后重试，不要直接换方法
-- **不要用 `pgrep -f stress-ng` 取 PID**：`-f` 匹配完整命令行，会把携带该字符串的执行 shell（如 `sh -c 'pgrep -f stress-ng'` 自身）一并匹配进来，拿输出去 kill 会杀掉执行 shell 导致命令链中断（实测自匹配 PID 1974739）；`-x` 按进程名精确匹配，只命中 stress-ng 主进程
+- **不要用 `pgrep -f stress-ng` 取 PID**：`-f` 匹配完整命令行，会把携带该字符串的执行 shell（如 `sh -c 'pgrep -f stress-ng'` 自身）一并匹配进来，拿输出去 kill 会杀掉执行 shell 导致命令链中断；`-x` 按进程名精确匹配，只命中 stress-ng 主进程

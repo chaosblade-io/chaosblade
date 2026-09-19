@@ -30,13 +30,29 @@ def extract_pending_interrupt(graph_state) -> tuple[str, dict] | None:
 
 
 def content_from_interrupt_payload(payload: dict) -> str:
-    """Pick a human-readable string for the ``content`` field of a confirm event."""
-    return (
+    """Pick a human-readable string for the ``content`` field of a confirm event.
+
+    When the gate card carries a widened write-set contract (the
+    ``mechanism_writes`` entries the case legislated), they are appended
+    verbatim so plain-text SSE clients (curl etc.) show the human what
+    they are actually approving — the structured ``payload`` field serves
+    card-rendering clients.
+    """
+    base = (
         payload.get("summary")
         or payload.get("plan_summary")
         or payload.get("question")
         or json.dumps(payload, ensure_ascii=False, indent=2)
     )
+    entries = payload.get("mechanism_writes")
+    if entries:
+        from chaos_agent.agent.target_guard.mechanism_writes import (
+            format_mechanism_writes_for_display,
+        )
+        block = format_mechanism_writes_for_display(entries)
+        if block:
+            base = f"{base}\n\n{block}"
+    return base
 
 
 def _fmt_target(ns: str, names: list, *, max_shown: int = 4) -> str:
@@ -87,6 +103,17 @@ def format_auto_approve_info(node: str, payload: dict) -> str:
         score = payload.get("safety_score") or {}
         if score:
             lines.append(f"Safety score: {score.get('overall', '?')}/100 ({score.get('level', '')})")
+        # Widened-contract audit: the auto-approve delegation covers the
+        # case manifest's mechanism writes — the entries ride the token so
+        # the approval stays auditable in the transcript.
+        entries = payload.get("mechanism_writes")
+        if entries:
+            from chaos_agent.agent.target_guard.mechanism_writes import (
+                format_mechanism_writes_for_display,
+            )
+            block = format_mechanism_writes_for_display(entries)
+            if block:
+                lines.append(block)
     elif node == "plan_change_confirm":
         reason = payload.get("reason", "")
         original = payload.get("original") or {}

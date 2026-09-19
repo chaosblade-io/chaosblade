@@ -32,10 +32,12 @@ from langchain_core.messages import ToolMessage
 
 from .declaration import (
     CARRIER_ID,
+    HOST_INJECT_TOOL_NAMES,
     SUPPORTED_ACTIONS,
     SUPPORTED_TARGETS,
 )
 from chaos_agent.agent.providers.base import (
+    DestroyOutcome,
     ProviderPrompts,
     RecoverResult,
     StepActionScan,
@@ -56,6 +58,7 @@ from chaos_agent.transports import PROFILE_HOST
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
 
+    from chaos_agent.tools.request_identity import RequestFingerprint
     from chaos_agent.agent.result.verdict import Layer1Result
 
     from chaos_agent.agent.target_guard.types import EffectiveTarget
@@ -80,10 +83,32 @@ def _classify_host_inject(args: dict, raw_command: str) -> EffectiveTarget:
     # from a provider module (see the NOTE near the top of this file).
     from chaos_agent.agent.target_guard.types import ConfidenceLevel, EffectiveTarget
 
-    from chaos_agent.agent.target_guard.carriers import classify_host_operation
+    from chaos_agent.agent.target_guard.carriers import (
+        classify_host_operation,
+        find_banned_host_verbs,
+    )
 
     command = str(args.get("command") or "")
     family = classify_host_operation(command)
+    reject_detail = ""
+    if not command:
+        reject_detail = (
+            "host_inject was called with an empty 'command', so there is "
+            "no host operation to classify"
+        )
+    elif not family:
+        # An empty family with a banned verb on board is NOT "no family
+        # verb" — say which verb voided it (same fix as the carrier gate;
+        # see carriers._resolve_carrier_from_artifact / inject-055c86cc).
+        banned = find_banned_host_verbs(command)
+        if banned:
+            verbs = ", ".join(f"'{verb}'" for verb in banned)
+            reject_detail = (
+                f"the command contains banned verb(s) {verbs} — a banned "
+                "verb never maps to a fault family, so the fault type "
+                "cannot be pinned; remove the banned verb and re-express "
+                "that step with the fault family's own binaries"
+            )
     return EffectiveTarget(
         scope="host",
         namespace="",
@@ -93,7 +118,7 @@ def _classify_host_inject(args: dict, raw_command: str) -> EffectiveTarget:
         raw_command=raw_command,
         # Say WHICH argument is missing — see the note in the python-app
         # classifier (chaosblade_python.py).
-        reject_detail=(
+        reject_detail=reject_detail or (
             ""
             if command
             else "host_inject was called with an empty 'command', so there is "
@@ -121,9 +146,12 @@ class HostShellProvider:
     # LLM-driven undo flow IS the Layer 1.
     has_deterministic_recover = False
     # Raw host commands that, when run successfully, mark a host-native
-    # injection. Single source of truth for the host-native carrier vocabulary;
-    # ``detect`` (below) scans these via ``scan_host_native_injection``.
-    inject_tool_names = frozenset({"host_inject", "exec_host_command", "shell"})
+    # injection. Single source of truth for the host-native carrier
+    # vocabulary (declaration.HOST_INJECT_TOOL_NAMES — R23/G-7: the
+    # machinery≠mutation HOST face consumes the SAME set through the
+    # declaration seam); ``detect`` (below) scans these via
+    # ``scan_host_native_injection``.
+    inject_tool_names = HOST_INJECT_TOOL_NAMES
     inject_kubectl_subcommands = frozenset()
     # Intent vocabulary this carrier contributes to the FaultFamily aggregate.
     # Host raw-shell faults cover the same OS subsystems / action verbs as the
@@ -209,6 +237,12 @@ class HostShellProvider:
     kubeconfig_scoped_tool_names = frozenset()
     audit_scoped_tool_names = frozenset({"host_inject", "host_read"})
     log_shipping_tool_names = frozenset()
+    # Create-reconcile gate (D6): raw-shell injection is a command with a
+    # deterministic exit — the uncertain-outcome marker never rides its
+    # returns, so the gate has nothing to arm on (the protocol defaults,
+    # made explicit).
+    reconcile_create_tool_names = frozenset()
+    reconcile_read_tool_names = frozenset()
 
     def matches_channel(self, profile: str) -> bool:
         # Raw-shell faults only make sense against a bare host.
@@ -243,12 +277,20 @@ class HostShellProvider:
             return [host_read]
         return []
 
-    def detect(self, messages: list, *, is_host: bool) -> Optional[str]:
+    def detect(
+        self, messages: list, *, is_host: bool, is_teardown=None,
+    ) -> Optional[str]:
         """Classify as ``host_native`` on a resolved host channel with a
         successful raw-command carrier. Does NOT bail on a non-empty
         ``experiment_uid``: a failed host blade attempt that fell back to a raw host
         command still leaves a stale UID, so ownership is decided by RECENCY at
-        the registry (:meth:`injection_recency`), not by UID presence."""
+        the registry (:meth:`injection_recency`), not by UID presence.
+
+        ``is_teardown`` threads the machinery≠mutation exemption into the
+        scan (P3, R23/G-7): an arm-first systemd-run timer is a recovery
+        registration, not native takeover evidence — the same matcher the
+        kubectl channel's scans consume.
+        """
         if not is_host:
             return None
         from chaos_agent.agent.providers.message_scanning import scan_host_native_index
@@ -258,12 +300,13 @@ class HostShellProvider:
             if scan_host_native_index(
                 messages,
                 self.inject_tool_names,
+                is_teardown=is_teardown,
             )
             >= 0
             else None
         )
 
-    def issue_disproven(self, messages: list) -> bool:
+    def issue_disproven(self, messages: list, *, is_teardown=None) -> bool:
         """Host-native results are untrustworthy by nature: the injected
         fault (a network drop, a killed daemon) routinely severs the very
         channel that would report it, so an ``Error:`` result is as likely
@@ -272,13 +315,22 @@ class HostShellProvider:
         issue-time attribution stands."""
         return False
 
-    def injection_recency(self, messages: list, *, is_host: bool) -> int:
-        """Message index of the latest host-native carrier, or ``-1``."""
+    def injection_recency(
+        self, messages: list, *, is_host: bool, is_teardown=None,
+    ) -> int:
+        """Message index of the latest host-native carrier, or ``-1``.
+
+        ``is_teardown`` is threaded (R23/G-7) — same exemption semantics
+        as :meth:`detect`, so recency arbitration never rescues an exempted
+        arm timer that the detection scan already skipped.
+        """
         if not is_host:
             return -1
         from chaos_agent.agent.providers.message_scanning import scan_host_native_index
 
-        return scan_host_native_index(messages, self.inject_tool_names)
+        return scan_host_native_index(
+            messages, self.inject_tool_names, is_teardown=is_teardown,
+        )
 
     def build_fault_handle(self, values: dict) -> Optional[dict]:
         """Claim a committed host-native injection: no experiment UID exists
@@ -303,6 +355,16 @@ class HostShellProvider:
         """UID-less carrier: no experiment ids exist to prove. A host-native
         fault is undone by reverse commands, never by a destroy call, so the
         provenance gate has nothing to admit here."""
+        return set()
+
+    def destroyed_experiment_ids(self, messages: list) -> set[str]:
+        """UID-less carrier: no destroy calls exist to attribute terminal
+        state to (the issued-scan seam's neutral empty contribution)."""
+        return set()
+
+    def destroyed_proven_experiment_ids(self, messages: list) -> set[str]:
+        """UID-less carrier: no destroy output exists to prove a death (the
+        retire ledger's neutral empty contribution)."""
         return set()
 
     def classify_tool_target(
@@ -352,6 +414,44 @@ class HostShellProvider:
             return "host_native"
         return None
 
+    def build_reconcile_fingerprint(
+        self, tool_name: str, tool_args: Any
+    ) -> Optional["RequestFingerprint"]:
+        """Create-reconcile seam (D6): this carrier declares no create
+        under the gate (``reconcile_create_tool_names`` is empty), so the
+        fingerprint hook never claims — pinned ``None``."""
+        return None
+
+    async def reconcile_hold_feedback(
+        self,
+        tool_name: str,
+        fp: "RequestFingerprint",
+        hold_count: int,
+        block_limit: int,
+        kubeconfig: str = "",
+        task_id: str = "",
+    ) -> Optional[tuple[str, bool]]:
+        """Create-reconcile seam (D6): no create under the gate — pinned
+        ``None`` (the registry scan continues past this carrier)."""
+        return None
+
+    def reconcile_batch_held_feedback(
+        self, tool_name: str, other_tool_name: str
+    ) -> Optional[str]:
+        """Create-reconcile seam (D6): no create under the gate — pinned
+        ``None``."""
+        return None
+
+    async def verify_landing_readback(
+        self, messages: list, state: dict, *, kubeconfig: str = ""
+    ) -> Optional[dict]:
+        """Landing readback guard (faultdrill-cr-channel task 2.1, design
+        D5): this carrier's landings carry no CR recipe-integrity contract
+        to verify — pinned ``None`` (the registry scan continues; the
+        faultdrill channel's D5 seam is the only owner of the post-apply
+        readback)."""
+        return None
+
     async def rollback_handle(self, handle: dict, **kwargs) -> str:
         """Host-native faults are undone by reverse commands in the recover
         graph, not by a synchronous failure-path rollback."""
@@ -361,6 +461,8 @@ class HostShellProvider:
         self,
         messages: list,
         injection_method: str | None = None,
+        *,
+        is_teardown=None,
     ) -> bool:
         """Always False, pinned explicitly: this UID-less carrier has no
         experiment record whose create could be "attempted but never
@@ -373,19 +475,21 @@ class HostShellProvider:
         return False
 
     def scan_step_actions(
-        self, steps: list[str], messages: list
+        self, steps: list[str], messages: list, *, is_teardown=None,
     ) -> Optional[StepActionScan]:
         """Form B hook (phase-8 T3): THIS backend's step vocabulary — host
         injection binaries (word-boundary matched so a short binary like
         ``dd`` / ``cp`` does not false-match inside another word) for the
         required side, attempted binaries in ``host_inject`` commands for
-        the executed side."""
+        the executed side. ``is_teardown`` is accepted for protocol
+        uniformity (P3) and ignored: a kubectl delete is never a host
+        step verb."""
         return StepActionScan(
             required=_required_host_binaries(steps),
             executed=_executed_host_binaries(messages),
         )
 
-    def was_injection_attempted(self, messages: list) -> bool:
+    def was_injection_attempted(self, messages: list, *, is_teardown=None) -> bool:
         """Explicitly not claimed (pinned False): the message back-scan
         hook consumed via the native resolve path is kubectl-native
         territory; THIS carrier's attempt state is carried by the
@@ -408,6 +512,12 @@ class HostShellProvider:
         """No bare destroy exists for a host-native fault (nothing to destroy
         programmatically); the finalize retry never routes here."""
         return ""
+
+    def classify_destroy_output(self, output: str) -> DestroyOutcome:
+        """UID-less carrier: no destroy output exists to classify — the
+        empty string this carrier returns is FAILED under the authority
+        anyway; pinned explicitly so the protocol stays satisfied."""
+        return DestroyOutcome.FAILED
 
     async def layer1_destroy(
         self,

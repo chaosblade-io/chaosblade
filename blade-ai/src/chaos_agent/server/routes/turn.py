@@ -26,7 +26,11 @@ from chaos_agent.agent.spec.fault_spec import SOURCE_TUI, FaultSpec
 from chaos_agent.agent.streaming import StreamEvent
 from chaos_agent.config.settings import settings
 from chaos_agent.server.routes.sessions import SessionStore, get_store, sessions_router
-from chaos_agent.server.routes.turn_event_stream import TurnContext, event_generator
+from chaos_agent.server.routes.turn_event_stream import (
+    TurnContext,
+    _acquire_turn_slot,
+    event_generator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +76,35 @@ async def turn(sid: str, body: TurnRequest, req: Request):
 
     turn_id = f"turn-{uuid4().hex[:12]}"
 
+    # Per-session in-flight guard (concurrent /turn serialization): a
+    # second turn on the same conversation thread would interleave
+    # graph writes with the running one. 409s a still-running previous
+    # turn; waits out a teardown within the grace window (the
+    # supersede race: the client aborts the old stream and posts the
+    # new turn in one synchronous sequence). Placed AFTER the cheap
+    # 404/error prechecks, BEFORE any state mutation below.
+    await _acquire_turn_slot(sid, turn_id)
+
     thread_id = sess.get("conversation_thread_id") or ""
     if not thread_id:
+        # Sessions whose stored binding is empty: legacy session files
+        # (pre-conversation_thread_id schema) and resumed sessions whose
+        # thread never landed on disk. Mint a fresh thread AND backfill
+        # it into the session JSON so the binding survives the next
+        # server restart. Best-effort: a failed write must not fail the
+        # turn — the thread still works for this process's lifetime.
         thread_id = f"conv-{uuid4().hex[:12]}"
         sess["conversation_thread_id"] = thread_id
+        try:
+            from chaos_agent.memory.tui_session_store import (
+                get_global_tui_session_store,
+            )
+
+            _tui_store = get_global_tui_session_store()
+            if _tui_store is not None:
+                _tui_store.update_thread_id(sid, thread_id)
+        except Exception as e:
+            logger.debug(f"thread-id backfill skipped for {sid}: {e}")
 
     is_first_turn = not sess.get("first_turn_done", False)
     sess["first_turn_done"] = True
@@ -85,6 +114,15 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             user_description=body.input or "",
             source=SOURCE_TUI,
         )
+        # Channel/transport fields: TurnRequest never carries them, so they
+        # resolve from settings — the same fallback the pipeline handoff in
+        # turn_event_stream.py and ``TransportTarget.from_state`` apply.
+        # The intent prompt renders its `Capability Profile` section from
+        # ``kube_connection_mode``; with the field unset the profile resolves
+        # to "unknown", the section is skipped, and the Inject Flow rule that
+        # tells the model to check it points at something absent — a host
+        # fault on a k8s channel was then submitted with no warning. First
+        # turn only: later turns inherit via checkpoint merge.
         initial_state = {
             "task_id": turn_id,
             "tui_session_id": sid,
@@ -95,6 +133,12 @@ async def turn(sid: str, body: TurnRequest, req: Request):
             "kube_context": settings.kube_context,
             "kubewiz_cluster_uuid": settings.kubewiz_cluster_uuid,
             "kubewiz_profile": settings.kubewiz_profile,
+            "kube_connection_mode": settings.kube_connection_mode,
+            "host_name": getattr(settings, "host_name", ""),
+            "ssh_host": getattr(settings, "ssh_host", ""),
+            "ssh_user": getattr(settings, "ssh_user", ""),
+            "ssh_key_path": getattr(settings, "ssh_key_path", ""),
+            "ssh_port": getattr(settings, "ssh_port", None),
             "dry_run": body.dry_run,
             "planning_mode": body.planning_mode,
         }
@@ -149,3 +193,26 @@ async def turn(sid: str, body: TurnRequest, req: Request):
         media_type="text/event-stream",
         headers=SSE_HEADERS,
     )
+
+
+@sessions_router.post("/{sid}/turns/{turn_id}/early-recover")
+async def early_recover(sid: str, turn_id: str, req: Request):
+    """Break the fault-window hold of an active turn; recovery follows on the stream.
+
+    Ctrl+R in the TS TUI during a hold posts here. The turn's SSE stream
+    stays open — the hold loop wakes, the recover graph is dispatched on
+    the SAME connection, so the recovery evidence stays in-band. Outside
+    a hold the registry lookup misses: no hold to break, nothing to do —
+    the turn recovers on its own schedule (window expiry or cancel).
+    """
+    from chaos_agent.server.routes.interrupt import _sanitize_id
+    from chaos_agent.server.routes.turn_event_stream import get_active_hold
+
+    _sanitize_id(sid, "sid")
+    _sanitize_id(turn_id, "turn_id")
+    ctx = get_active_hold(turn_id)
+    if ctx is None or ctx.sid != sid:
+        raise HTTPException(404, "No fault-window hold active for this turn")
+    ctx.hold_early_recover.set()
+    logger.info("early-recover sid=%s turn=%s", sid, turn_id)
+    return {"ok": True, "turn_id": turn_id, "early_recover": True}

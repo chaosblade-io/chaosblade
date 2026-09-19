@@ -438,6 +438,43 @@ class TestParseStreamEvent:
         assert evt.input_tokens == 198
         assert evt.output_tokens == 89
 
+    def test_parse_on_chat_model_end_carries_cached_tokens(self):
+        """cache_read in usage_metadata.input_token_details → cached_tokens
+        on the usage event (a subset of input_tokens), forced onto the wire
+        by to_dict even when 0 so the TS reducer never sees an absent field."""
+
+        class CacheHitMsg:
+            usage_metadata = {
+                "input_tokens": 2990,
+                "output_tokens": 120,
+                "input_token_details": {"cache_read": 2176},
+            }
+
+        evt = parse_stream_event({
+            "event": "on_chat_model_end",
+            "data": {"output": CacheHitMsg()},
+            "tags": [],
+            "metadata": {},
+        })
+        assert evt is not None
+        assert evt.type == "usage"
+        assert evt.cached_tokens == 2176
+        assert evt.to_dict()["cached_tokens"] == 2176
+
+        class ColdMsg:
+            usage_metadata = {"input_tokens": 2990, "output_tokens": 120}
+
+        cold = parse_stream_event({
+            "event": "on_chat_model_end",
+            "data": {"output": ColdMsg()},
+            "tags": [],
+            "metadata": {},
+        })
+        assert cold is not None
+        assert cold.cached_tokens == 0
+        # Cold first call: 0 is still forced onto the wire (not stripped).
+        assert cold.to_dict()["cached_tokens"] == 0
+
     def test_parse_on_chat_model_end_no_usage_returns_none(self):
         """Missing usage_metadata → returns None (no spurious usage event)."""
 
@@ -903,3 +940,47 @@ class TestWithPhaseEvents:
             clear_trace(task_id)
             await reset_task_store()
 
+
+
+class TestBatchFaultResultStatus:
+    """Three-way status for the batch result card: success / unknown / fail.
+
+    "unverified" (verification ran, no conclusion) must NOT render as "fail"
+    — that would claim counter-evidence the verifier never had. The TUI
+    reducer's value domain already includes "unknown" (smoke-reducer.mjs).
+    """
+
+    @staticmethod
+    def _event(task_state: str):
+        return {
+            "event": "on_custom_event",
+            "name": "batch_fault_result",
+            "data": {
+                "result": {
+                    "task_id": "t-1",
+                    "task_state": task_state,
+                    "fault_type": "pod-cpu",
+                    "experiment_uid": "uid-1",
+                },
+            },
+        }
+
+    def _status(self, task_state: str) -> str:
+        evt = parse_stream_event(self._event(task_state))
+        assert evt is not None and evt.type == "result"
+        return json.loads(evt.content)["status"]
+
+    def test_injected_is_success(self):
+        assert self._status("injected") == "success"
+
+    def test_unverified_is_unknown(self):
+        assert self._status("unverified") == "unknown"
+
+    def test_failed_is_fail(self):
+        assert self._status("failed") == "fail"
+
+    def test_task_state_passthrough_for_unverified(self):
+        """The fine-grained verdict rides along in data.task_state."""
+        evt = parse_stream_event(self._event("unverified"))
+        payload = json.loads(evt.content)
+        assert payload["data"]["task_state"] == "unverified"

@@ -294,12 +294,16 @@ class TestApprovalCycleFromSpec:
 class TestCliNlPathSpecDerivation:
     """CLI NL (``blade-ai inject --input "..."``) skips intent_clarification
     (route_pipeline_start checks interaction_mode). The placeholder
-    spec written at entry has empty scope/blade_target/blade_action/names.
+    spec written at entry has empty scope/blade_target/blade_action/names
+    (B76 lazy-derivation — from_cli_nl anchors nothing except the
+    prepositional node form; "对节点 X 注入" deliberately does not).
 
     For the inject to actually proceed, the spec must get populated
     DURING agent_loop's planning phase — either:
-      - extract_planning_metadata derives scope/target/action from
-        skill_case_content, OR
+      - extract_planning_metadata lands the planner's explicit identity
+        declaration (finish_planning fault_scope/target/action — after
+        the #49 hijack legislation NOTHING is mined from
+        skill_case_content; a case doc is a menu, not the contract), OR
       - agent_loop derives namespace/names from LLM's kubectl get probes.
 
     Without that, safety_check rejects with "No target specified".
@@ -309,7 +313,7 @@ class TestCliNlPathSpecDerivation:
         self, tmp_memory_dir, monkeypatch,
     ):
         """Full CLI NL flow: entry placeholder → LLM planning →
-        extract_planning_metadata derives scope/blade_target/blade_action
+        extract_planning_metadata lands the declared identity triple
         + agent_loop derives namespace/names → safety_check sees a
         complete spec and accepts."""
         from langchain_core.messages import AIMessage, ToolMessage
@@ -362,15 +366,39 @@ class TestCliNlPathSpecDerivation:
                     tool_call_id="tc_read",
                     name="read_skill_resource",
                 ),
+                # The planner's final round: the identity travels on the
+                # finish_planning call itself (the control-signal carrier
+                # the tool body never consumes). Post-#49 this declaration
+                # is the ONLY path the identity reaches the spec — the blade
+                # command in the case doc above is deliberately ignored.
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "finish_planning",
+                        "args": {
+                            "summary": "plan",
+                            "fault_scope": "node",
+                            "fault_target": "cpu",
+                            "fault_action": "fullload",
+                        },
+                        "id": "tc_fp",
+                    }],
+                ),
+                ToolMessage(
+                    content="Planning finalized. Summary: plan",
+                    tool_call_id="tc_fp",
+                    name="finish_planning",
+                ),
             ],
         }
 
-        # Stage 1: extract_planning_metadata derives scope/blade_target/blade_action
+        # Stage 1: extract_planning_metadata lands the DECLARED identity
         ep_result = await extract_planning_metadata(state)
         state.update(ep_result)
         spec_after_ep = read_fault_spec(state)
         assert spec_after_ep.scope == "node", (
-            "extract_planning_metadata should derive scope from blade command pattern"
+            "extract_planning_metadata should land the declared scope "
+            "(post-#49: never mined from the skill-case document)"
         )
         assert spec_after_ep.fault_target == "cpu"
         assert spec_after_ep.fault_action == "fullload"
@@ -399,6 +427,267 @@ class TestCliNlPathSpecDerivation:
         final_spec = read_fault_spec(state)
         assert final_spec.names == ("my-node",)
         assert final_spec.scope == "node"
+
+
+# ---------------------------------------------------------------------------
+# B14: duration contract backfill on the CLI NL planning exit
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestDurationContractBackfill:
+    """B14: the CLI NL path's duration contract must not stay empty.
+
+    from_cli_nl intentionally leaves duration_seconds=0 for an intent
+    node the pipeline route never visits (route_pipeline_start sends CLI
+    NL straight to agent_loop). Without the planning-exit backfill the
+    contract is empty end-to-end (audit snapshots show duration_seconds=0)
+    and kubectl-native sleep timers ran with no recorded window
+    (#8/#9 evidence: user-asked 300s executed as 300s, unrecorded).
+
+    The planner's finish_planning now carries an explicit duration_seconds
+    declaration; extract_planning_metadata combines it with any hard-pinned
+    entry value (CLI --duration) monotonically and applies
+    ensure_min_duration (unspecified → configured default; declared
+    values verbatim).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_experiment_timeout(self):
+        # Pin the operator default to the code floor so floor assertions
+        # do not depend on the host machine's ~/.blade-ai/config.json (a
+        # stale experiment_timeout there wins the unspecified-duration
+        # path via max(configured, floor)).
+        from chaos_agent.config.settings import blade_ai_context
+        from chaos_agent.utils.fault_type import _DEFAULT_MIN_DURATION
+
+        with blade_ai_context(experiment_timeout=_DEFAULT_MIN_DURATION):
+            yield
+
+    def _nl_state(self, messages: list, *, duration: int = 0) -> dict:
+        placeholder = FaultSpec.from_cli_nl(
+            input_text="对节点 my-node 注入 CPU 满载",
+            kwargs={"duration": duration},
+        )
+        return {
+            "task_id": "task-dur-backfill",
+            "operation": "inject",
+            "interaction_mode": "cli",
+            "fault_spec": placeholder.to_dict(),
+            "input": placeholder.user_description,
+            "skill_name": "k8s-chaos-skills",
+            "needs_confirmation": False,
+            "safety_status": "pending",
+            "messages": messages,
+        }
+
+    def _planning_messages(self, *finish_args_list: dict) -> list:
+        """Message history ending in one finish_planning round per args dict.
+
+        The LAST round is the planning exit the node reads; earlier rounds
+        model nudge/replan re-runs that the newest declaration supersedes.
+        Every round carries the fault-identity declaration
+        (fault_scope/fault_target/fault_action): the CLI NL entry point
+        leaves the spec's identity empty (B76 lazy-derivation — nothing is
+        mined at entry), and after the #49 hijack legislation the identity
+        lands on the spec ONLY from this planner declaration, never from
+        the skill-case document.
+        """
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        skill_case = (
+            "**故障现象**：节点 CPU 满载\n\n"
+            "**注入命令**：\n"
+            "```\n"
+            "blade create node-cpu fullload --cpu-percent 80\n"
+            "```\n"
+            "**注入验证**：node CPU usage > 90%\n"
+        )
+        messages: list = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "read_skill_resource",
+                    "args": {
+                        "skill_name": "k8s-chaos-skills",
+                        "resource_path": "references/catalogue/Node_CPU/cpu_fullload.md",
+                    },
+                    "id": "tc_read",
+                }],
+            ),
+            ToolMessage(
+                content=skill_case,
+                tool_call_id="tc_read",
+                name="read_skill_resource",
+            ),
+        ]
+        for i, extra_args in enumerate(finish_args_list):
+            tc_id = f"tc_fp_{i}"
+            messages.append(AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "finish_planning",
+                    "args": {
+                        "summary": "plan",
+                        "fault_scope": "node",
+                        "fault_target": "cpu",
+                        "fault_action": "fullload",
+                        **extra_args,
+                    },
+                    "id": tc_id,
+                }],
+            ))
+            messages.append(ToolMessage(
+                content="Planning finalized. Summary: plan",
+                tool_call_id=tc_id,
+                name="finish_planning",
+            ))
+        return messages
+
+    async def _run_extract(self, state: dict) -> dict:
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            extract_planning_metadata,
+        )
+        return await extract_planning_metadata(state)
+
+    async def test_declared_duration_below_floor_preserved(
+        self, tmp_memory_dir, monkeypatch,
+    ):
+        """finish_planning(duration_seconds=100) → the explicit 100s is
+        honoured verbatim (l4-contract-faithfulness: below-floor values
+        warn, never clamp upward); the identity declaration on the same
+        call still lands on the spec alongside."""
+        monkeypatch.setattr(settings, "working_dir", tmp_memory_dir.parent)
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+
+        state = self._nl_state(
+            self._planning_messages({"duration_seconds": 100}),
+        )
+        result = await self._run_extract(state)
+
+        spec = read_fault_spec({**state, **result})
+        assert spec is not None
+        assert spec.duration_seconds == 100, (
+            "declared 100s must pass through verbatim, not be clamped "
+            "up to the 300s floor"
+        )
+        assert spec.scope == "node"
+        assert spec.fault_target == "cpu"
+        assert spec.fault_action == "fullload"
+
+    async def test_undeclared_duration_gets_floor(
+        self, tmp_memory_dir, monkeypatch,
+    ):
+        """No declaration + no entry --duration → floor default (300)."""
+        monkeypatch.setattr(settings, "working_dir", tmp_memory_dir.parent)
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+
+        state = self._nl_state(self._planning_messages({}))
+        result = await self._run_extract(state)
+
+        spec = read_fault_spec({**state, **result})
+        assert spec is not None
+        assert spec.duration_seconds == 300, (
+            "undeclared duration must land on the floor default, not stay 0"
+        )
+
+    async def test_hard_pinned_duration_not_downgraded(
+        self, tmp_memory_dir, monkeypatch,
+    ):
+        """Entry --duration 900 (hard-pinned) + no declaration → stays 900;
+        the contract is monotonic — declarations and floors only raise it."""
+        monkeypatch.setattr(settings, "working_dir", tmp_memory_dir.parent)
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+
+        state = self._nl_state(
+            self._planning_messages({}), duration=900,
+        )
+        result = await self._run_extract(state)
+
+        spec = read_fault_spec({**state, **result})
+        assert spec is not None
+        assert spec.duration_seconds == 900
+
+    async def test_latest_declaration_wins(
+        self, tmp_memory_dir, monkeypatch,
+    ):
+        """A superseded finish_planning(900) round must NOT leak its
+        declaration after a newer undeclared round — the newest planning
+        exit governs, so the floor default (300) applies, not 900."""
+        monkeypatch.setattr(settings, "working_dir", tmp_memory_dir.parent)
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+
+        state = self._nl_state(
+            self._planning_messages(
+                {"duration_seconds": 900},   # superseded round
+                {},                           # newest planning exit
+            ),
+        )
+        result = await self._run_extract(state)
+
+        spec = read_fault_spec({**state, **result})
+        assert spec is not None
+        assert spec.duration_seconds == 300, (
+            "the newest finish_planning round governs; the superseded "
+            "900s declaration must not leak through"
+        )
+
+    async def test_complete_spec_duration_untouched(
+        self, tmp_memory_dir, monkeypatch,
+    ):
+        """TUI path: the spec is already complete (duration set at intent
+        convergence) and the newest finish_planning declares nothing →
+        the node is a no-op for the spec (idempotent, no rewrite)."""
+        monkeypatch.setattr(settings, "working_dir", tmp_memory_dir.parent)
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+
+        spec = FaultSpec(
+            scope="node", namespace="", names=("my-node",),
+            fault_target="cpu", fault_action="fullload",
+            duration_seconds=300,
+        )
+        state = {
+            "task_id": "task-dur-tui",
+            "operation": "inject",
+            "interaction_mode": "tui",
+            "fault_spec": spec.to_dict(),
+            "input": "",
+            "skill_name": "k8s-chaos-skills",
+            "needs_confirmation": False,
+            "safety_status": "pending",
+            "messages": self._planning_messages({}),
+        }
+        result = await self._run_extract(state)
+
+        assert result.get("fault_spec") is None, (
+            "a complete spec with an at-floor duration must not be rewritten"
+        )
+
+    async def test_case_resource_path_backfilled(
+        self, tmp_memory_dir, monkeypatch,
+    ):
+        """Same planning-exit spec-backfill family: the planner already
+        hands the chosen case path to finish_planning (skill_case_content
+        extraction reads it), but the spec's own case_resource_path
+        audit/hint field stayed empty (B-项观察项). Write-once — a
+        dialogue-settled path on the spec always wins."""
+        monkeypatch.setattr(settings, "working_dir", tmp_memory_dir.parent)
+        monkeypatch.setattr(settings, "kubeconfig_path", "")
+
+        state = self._nl_state(
+            self._planning_messages({
+                "skill_case_resource": "references/catalogue/Node_CPU/cpu_fullload.md",
+            }),
+        )
+        result = await self._run_extract(state)
+
+        spec = read_fault_spec({**state, **result})
+        assert spec is not None
+        assert spec.case_resource_path == (
+            "references/catalogue/Node_CPU/cpu_fullload.md"
+        )
+        # The duration floor backfill still applies alongside.
+        assert spec.duration_seconds == 300
 
 
 # ---------------------------------------------------------------------------

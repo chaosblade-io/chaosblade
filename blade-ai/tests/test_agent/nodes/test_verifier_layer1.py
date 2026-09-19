@@ -330,3 +330,301 @@ class TestHostNativeLayer1Skip:
         r = await _run_layer1_via_kubectl_exec("", "/tmp/kubeconfig", task_id="t")
         assert r.status == "skipped"
         assert "no experiment_uid" in r.details
+
+
+class TestPluralLayer1AnchorSelection:
+    """Round-28 K3 — composite-born tasks poll EVERY live experiment.
+
+    The dispatch anchor is last-write-wins: a composite double-create
+    whose first birth died leaves the slot naming the corpse while the
+    sibling keeps running, and polling the dead anchor returned
+    blade_status's "not found" FAILED as the TASK verdict. The plural
+    poll keys on the liability oracle (the same set the sweep and the
+    destroy whitelist consume): a live anchor keeps the single-poll
+    mainline byte-identical; a dead anchor hands the role to the first
+    survivor."""
+
+    UID_A = "aabbccdd00000001"
+    UID_B = "9988776600000001"
+
+    @staticmethod
+    def _install_fake_layer1(monkeypatch, polled: list):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            ChaosbladeProvider,
+        )
+
+        async def fake_layer1_verify(
+            self, state, *, experiment_uid, kubeconfig, task_id="",
+        ):
+            polled.append(experiment_uid)
+            return Layer1Result(
+                status="passed",
+                details=f"status of {experiment_uid}",
+                raw_output=f"raw of {experiment_uid}",
+            )
+
+        monkeypatch.setattr(
+            ChaosbladeProvider, "layer1_verify", fake_layer1_verify,
+        )
+
+    @pytest.mark.asyncio
+    async def test_dead_anchor_polls_the_live_sibling(self, monkeypatch):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            run_layer1_for_state,
+        )
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+        polled: list[str] = []
+        self._install_fake_layer1(monkeypatch, polled)
+
+        state = {
+            "experiment_uid": self.UID_A,  # dead slot, never cleared
+            "retired_experiment_uids": [self.UID_A],
+            "owned_experiment_uids": [self.UID_A, self.UID_B],
+            "messages": [],
+        }
+        result = await run_layer1_for_state(
+            state, self.UID_A, "/tmp/kubeconfig", task_id="t",
+        )
+        assert polled == [self.UID_B]  # the corpse is never polled
+        assert result.details == "status of " + self.UID_B
+
+    @pytest.mark.asyncio
+    async def test_live_anchor_keeps_mainline_single_poll(self, monkeypatch):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            run_layer1_for_state,
+        )
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+        polled: list[str] = []
+        self._install_fake_layer1(monkeypatch, polled)
+
+        state = {
+            "experiment_uid": self.UID_A,
+            "retired_experiment_uids": [],
+            "owned_experiment_uids": [self.UID_A],
+            "messages": [],
+        }
+        result = await run_layer1_for_state(
+            state, self.UID_A, "/tmp/kubeconfig", task_id="t",
+        )
+        # Single-experiment mainline: one poll, no sibling decoration.
+        assert polled == [self.UID_A]
+        assert result.details == "status of " + self.UID_A
+        assert result.raw_output == "raw of " + self.UID_A
+
+    @pytest.mark.asyncio
+    async def test_sibling_evidence_structured_for_multiple_live(self, monkeypatch):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            run_layer1_for_state,
+        )
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+        polled: list[str] = []
+        self._install_fake_layer1(monkeypatch, polled)
+
+        state = {
+            "experiment_uid": self.UID_A,
+            "retired_experiment_uids": [],
+            "owned_experiment_uids": [self.UID_A, self.UID_B],
+            "messages": [],
+        }
+        result = await run_layer1_for_state(
+            state, self.UID_A, "/tmp/kubeconfig", task_id="t",
+        )
+        # Round-29: anchor fields carry the anchor's machine verdict
+        # ALONE (the r28 string-append is retired); the plural face is
+        # structured — one ExperimentEvidence per polled experiment,
+        # anchor first, sibling after.
+        assert polled == [self.UID_A, self.UID_B]
+        assert result.details == "status of " + self.UID_A
+        assert result.raw_output == "raw of " + self.UID_A
+        assert [e.uid for e in result.experiments] == [self.UID_A, self.UID_B]
+        assert result.experiments[0].is_anchor is True
+        assert result.experiments[1].is_anchor is False
+        assert result.experiments[1].status == "passed"
+        assert result.experiments[1].details == "status of " + self.UID_B
+
+    @pytest.mark.asyncio
+    async def test_empty_ledger_keeps_pre_round28_path(self, monkeypatch):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            run_layer1_for_state,
+        )
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        FaultProviderRegistry.register_builtins()
+        polled: list[str] = []
+        self._install_fake_layer1(monkeypatch, polled)
+
+        # Legacy checkpoint / pre-registry state: no ownership ledger,
+        # the dispatch uid is the only knowledge — the exact pre-round-28
+        # single-poll path.
+        state = {"experiment_uid": self.UID_A, "messages": []}
+        result = await run_layer1_for_state(
+            state, self.UID_A, "/tmp/kubeconfig", task_id="t",
+        )
+        assert polled == [self.UID_A]
+        assert result.details == "status of " + self.UID_A
+
+
+class TestLiveAnchorSeam:
+    """Round-29 K2 — the anchor-selection seam shared by every verdict-side
+    renderer (the seventh private copy closed): a dead dispatch slot hands
+    the anchor role to the first surviving liability; a live dispatch uid,
+    an empty live set and a ledger failure all keep the dispatch uid."""
+
+    UID_A = "aabbccdd00000001"
+    UID_B = "9988776600000001"
+
+    def test_dead_anchor_hands_role_to_first_survivor(self):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            live_anchor_uid,
+        )
+
+        state = {
+            "experiment_uid": self.UID_A,
+            "retired_experiment_uids": [self.UID_A],
+            "owned_experiment_uids": [self.UID_A, self.UID_B],
+            "messages": [],
+        }
+        assert live_anchor_uid(state, self.UID_A) == self.UID_B
+
+    def test_live_anchor_keeps_dispatch_uid(self):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            live_anchor_uid,
+        )
+
+        state = {
+            "experiment_uid": self.UID_A,
+            "retired_experiment_uids": [],
+            "owned_experiment_uids": [self.UID_A, self.UID_B],
+            "messages": [],
+        }
+        assert live_anchor_uid(state, self.UID_A) == self.UID_A
+
+    def test_empty_live_set_keeps_dispatch_uid(self):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            live_anchor_uid,
+        )
+
+        # Ledger-less legacy checkpoint: the dispatch uid is the only
+        # knowledge — the pre-plural path verbatim.
+        state = {"experiment_uid": self.UID_A, "messages": []}
+        assert live_anchor_uid(state, self.UID_A) == self.UID_A
+
+    def test_empty_dispatch_uid_returns_empty(self):
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            live_anchor_uid,
+        )
+
+        # UID-less dispatch (native carrier): no anchor to choose.
+        assert live_anchor_uid({"messages": []}, "") == ""
+
+    @pytest.mark.asyncio
+    async def test_sibling_poll_failure_becomes_error_entry(self, monkeypatch):
+        # Round-29 K3: a failed sibling poll is an honest error ENTRY —
+        # the same honesty standard the anchor always had — never a
+        # swallowed exception.
+        from chaos_agent.agent.nodes.verify._verifier_layer1 import (
+            run_layer1_for_state,
+        )
+        from chaos_agent.agent.providers import FaultProviderRegistry
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            ChaosbladeProvider,
+        )
+
+        FaultProviderRegistry.register_builtins()
+        uid_b = self.UID_B
+
+        async def fake_layer1_verify(self, st, *, experiment_uid, kubeconfig, task_id=""):
+            if experiment_uid == uid_b:
+                raise RuntimeError("blade_status transport broke")
+            return Layer1Result(
+                status="passed",
+                details=f"status of {experiment_uid}",
+                raw_output=f"raw of {experiment_uid}",
+            )
+
+        monkeypatch.setattr(ChaosbladeProvider, "layer1_verify", fake_layer1_verify)
+        state = {
+            "experiment_uid": self.UID_A,
+            "retired_experiment_uids": [],
+            "owned_experiment_uids": [self.UID_A, self.UID_B],
+            "messages": [],
+        }
+        result = await run_layer1_for_state(
+            state, self.UID_A, "/tmp/kubeconfig", task_id="t",
+        )
+        # Anchor verdict UNDECORATED by the failure; the sibling's error
+        # is a structured entry Layer 2 can see and weigh.
+        assert result.details == "status of " + self.UID_A
+        assert len(result.experiments) == 2
+        err_entry = result.experiments[1]
+        assert err_entry.uid == self.UID_B
+        assert err_entry.status == "error"
+        assert "transport broke" in err_entry.details
+        assert not err_entry.is_anchor
+
+
+class TestLayer1ResultPluralSerialization:
+    """Round-29 — the plural face survives the canonical serialization
+    round-trip (layer1_to_dict → model_validate) and stays absent on
+    legacy caches without breaking validation."""
+
+    UID_A = "aabbccdd00000001"
+    UID_B = "9988776600000001"
+
+    def test_plural_roundtrip_through_layer1_to_dict(self):
+        from chaos_agent.agent.result.verdict import (
+            ExperimentEvidence, layer1_to_dict,
+        )
+
+        result = Layer1Result(
+            status="passed",
+            details="anchor details",
+            raw_output="anchor raw",
+            experiments=[
+                ExperimentEvidence(
+                    uid=self.UID_A, status="passed", is_anchor=True,
+                    details="anchor details", raw_output="anchor raw",
+                ),
+                ExperimentEvidence(
+                    uid=self.UID_B, status="warning", is_anchor=False,
+                    details="sibling details",
+                ),
+            ],
+        )
+        dumped = layer1_to_dict(result)
+        # Plain-string statuses (mode="json" guarantee) on every entry.
+        assert dumped["experiments"][0]["status"] == "passed"
+        assert type(dumped["experiments"][0]["status"]) is str
+        restored = Layer1Result.model_validate(dumped)
+        assert [e.uid for e in restored.experiments] == [self.UID_A, self.UID_B]
+        assert restored.experiments[0].is_anchor is True
+        assert restored.experiments[1].status == "warning"
+
+    def test_legacy_cache_without_experiments_key_validates(self):
+        # Pre-round-29 checkpoints carry no ``experiments`` key — the
+        # restore path (inject_layer1_cache) must keep working verbatim.
+        legacy = {
+            "status": "passed",
+            "details": "d",
+            "raw_output": "r",
+            "resource_statuses": [],
+            "affected_count": 0,
+            "expired": False,
+        }
+        restored = Layer1Result.model_validate(legacy)
+        assert restored.experiments == []
+        assert restored.status == "passed"
+
+    def test_single_experiment_mainline_keeps_empty_list(self):
+        # The mainline (no siblings) renders an empty plural face — the
+        # Layer-2 context and every legacy consumer see no change.
+        from chaos_agent.agent.result.verdict import layer1_to_dict
+
+        result = Layer1Result(status="passed", details="d", raw_output="r")
+        assert layer1_to_dict(result).get("experiments") == []

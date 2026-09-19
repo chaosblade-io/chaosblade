@@ -15,7 +15,7 @@ from typing import Any
 
 from chaos_agent.agent.spec.fault_spec import fault_type_from_state, read_fault_spec
 from chaos_agent.agent.result.operation_outcome import read_inject_verification, read_operation_outcome
-from chaos_agent.agent.result.verdict import FailureCategory
+from chaos_agent.agent.result.verdict import INJECT_VERDICT_VALUES, FailureCategory
 
 # Failure categories with NO experiment activity at all: the user or a
 # safety gate refused BEFORE any execution — no verifier data, no
@@ -59,9 +59,9 @@ def should_generate_postmortem(state: dict, settings) -> bool:
         return False
 
     verification = read_inject_verification(state)
-    if isinstance(verification, dict) and verification.get("level") in (
-        "verified", "unverified", "partial",
-    ):
+    # Full closed set (round-15: this was a hand copy of the entire
+    # InjectVerdict vocabulary — "the verifier concluded anything at all").
+    if isinstance(verification, dict) and verification.get("level") in INJECT_VERDICT_VALUES:
         return True
 
     outcome = read_operation_outcome(state)

@@ -476,6 +476,19 @@ def should_continue_execute_loop(state: AgentState) -> str:
         if hasattr(last_msg, "type") and last_msg.type == "ai":
             if has_active_fault(state):
                 return "verifier"
+            # Ledger-declared completion (#39 third-retest tail tension): a
+            # native injection with no fault-handle materialisation (the
+            # delete-and-recreate shapes) would otherwise fall into the
+            # "continue" fallback and spin the loop against a model that
+            # already recorded execution-complete. The ledger's terminal
+            # phase is the task's own fact about finished mutation work —
+            # route to the verifier, whose job is precisely to decide
+            # whether the fault took effect.
+            from chaos_agent.tools.progress import (
+                ledger_declares_execution_complete,
+            )
+            if ledger_declares_execution_complete(state):
+                return "verifier"
             # Text-only without experiment_uid: the execute_loop node's
             # terminal-conclusion detection normally sets error (caught
             # by the error check above → "end"). This "continue" is a

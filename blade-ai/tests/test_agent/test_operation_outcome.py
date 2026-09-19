@@ -176,13 +176,15 @@ def test_raw_verification_field_reads_are_limited_to_boundaries_and_payloads():
     """Graph state verification reads should pass through operation_outcome."""
 
     allowed = {
+        # Round-15 D5: the raw reads feed the read-side level gate — same
+        # boundary owner, refactored line shape (was a direct return).
         (
             "src/chaos_agent/agent/result/operation_outcome.py",
-            'return _copy_dict(state.get("verification"))',
+            'verification = _copy_dict(state.get("verification"))',
         ),
         (
             "src/chaos_agent/agent/result/operation_outcome.py",
-            'return _copy_dict(state.get("recover_verification"))',
+            'verification = _copy_dict(state.get("recover_verification"))',
         ),
         (
             "src/chaos_agent/agent/result/task_snapshot.py",

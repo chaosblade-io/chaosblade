@@ -6,9 +6,14 @@ verifier node entry points and orchestration code.
 """
 
 import logging
+import time
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from chaos_agent.agent.nodes.baseline._commands import (
+    _is_empty_observation,
+    _is_observation_success,
+)
 from chaos_agent.agent.nodes.verify._verifier_hints import (
     _extract_baseline_key_metrics,
     _BASELINE_INTEGRITY_PROMPT,
@@ -16,7 +21,7 @@ from chaos_agent.agent.nodes.verify._verifier_hints import (
 )
 # Phase-4 T6: verdict-direct (was a forward through the _verifier_layer1
 # shim pre-cleanup).
-from chaos_agent.agent.result.verdict import Layer1Result
+from chaos_agent.agent.result.verdict import ChecklistItemStatus, Layer1Result
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
 from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
     _extract_verification_step_descriptions,
@@ -24,8 +29,15 @@ from chaos_agent.agent.nodes.verify._verifier_layer2_parse import (
 )
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
+from chaos_agent.utils.message_integrity import apply_synthetic_pair_gate
+from chaos_agent.utils.truncation import build_truncation_notice
 
 logger = logging.getLogger(__name__)
+
+# Item-status teaching prose derives from the legislation enum (B76
+# round-14 root-cause fix): teaching, parsing and clamping share ONE
+# vocabulary — this line can never drift from the regex or the clamps.
+_ITEM_STATUS_PROSE = ", ".join(m.value for m in ChecklistItemStatus)
 _BASELINE_TOOL_CALL_ID = "baseline_collector"
 _METRICS_TOOL_CALL_ID = "baseline_collector_metrics"
 
@@ -35,10 +47,66 @@ _SYNTHETIC_TOOL_CALL_IDS = frozenset({
     _METRICS_TOOL_CALL_ID,
 })
 
+# STABLE langchain message ids for the synthetic pairs (not auto-generated
+# UUIDs). The dedup gate below rebuilds the pair set whenever state's copy is
+# damaged, and rebuilds reach state through ``extract_synthetic_messages`` →
+# ``add_messages``. That reducer REPLACES a message whose id already exists and
+# APPENDS one whose id is new — so with fresh UUIDs every rebuild would leave
+# the damaged copy in state, the gate would fire again next turn, and state
+# would grow by a full pair set per turn. Stable ids make the rebuild
+# idempotent: one copy per role, no matter how often it runs.
+_BASELINE_MSG_ID_CALLER = "synthetic:verifier:baseline:caller"
+_BASELINE_MSG_ID_RESULT = "synthetic:verifier:baseline:result"
+_METRICS_MSG_ID_CALLER = "synthetic:verifier:baseline_metrics:caller"
+_METRICS_MSG_ID_RESULT = "synthetic:verifier:baseline_metrics:result"
+
+# All four stable message ids of the synthetic baseline pair set, exported for
+# the replan-seam lifecycle cleanup (``reset_attribution_state`` removes these
+# messages at every replan seam so the next verification cycle rebuilds the
+# pair from the CURRENT ``baseline_data`` — see change
+# ``stale-baseline-pair-seam-cleanup``). Single construction source: the seam
+# imports this frozenset instead of copying string literals, so an id rename
+# cannot silently disarm the cleanup.
+BASELINE_PAIR_MESSAGE_IDS = frozenset({
+    _BASELINE_MSG_ID_CALLER,
+    _BASELINE_MSG_ID_RESULT,
+    _METRICS_MSG_ID_CALLER,
+    _METRICS_MSG_ID_RESULT,
+})
+
 # Marker for the main verifier context HumanMessage — used to identify
 # the ephemeral HumanMessage that should be persisted to AgentState on the
 # cycle's first turn so it remains visible on subsequent iterations.
 _VERIFIER_CONTEXT_KWARGS_KEY = "_verifier_main_context"
+
+# What each kind of observation MEANS for the verdict — evidence
+# semantics, not behavioural rules: the model derives how to judge from
+# what the evidence says, never from commanded procedures or count caps
+# (verifier-effect-decides; review rounds 2-3 fixed the register: v1 had
+# numeric budgets, v2 had imperative rules, v3 states semantics only).
+# Module-level so judgement tests can anchor the wording.
+_EVIDENCE_SEMANTICS_PROMPT = (
+    "**EVIDENCE SEMANTICS (CRITICAL)**: what each observation means.\n"
+    "- Qualitative faults (process gone / NotReady / unreachable): the "
+    "observation is binary — a clear one settles the step.\n"
+    "- Quantitative faults: the injected value (e.g. --mem-percent 80) is "
+    "a mechanism parameter, not a measurement promise. The effect "
+    "evidence is a significant change from baseline — or, with no "
+    "baseline, significant deviation from the expected healthy state; a "
+    "gap vs the injected value is magnitude information for Warnings.\n"
+    "- Mechanism evidence (experiment registration, tool receipts, rule "
+    "snapshots, unit liveness) speaks for the mechanism, not the "
+    "outcome — field-proven: tools have reported Success while "
+    "delivering no fault. When the effect is missing, it points to the "
+    "failed layer (command not issued / mechanism not alive / payload "
+    "spinning / effect not propagated).\n"
+    "- Derived status labels (e.g. CrashLoopBackOff) render underlying "
+    "quantities — restarts climbing, back-off events; the quantities are "
+    "the evidence, the label their display form.\n"
+    "- Fault effects propagate with physical delay (heartbeat grace, "
+    "probe periods, image pull); an observation that predates "
+    "propagation says nothing yet about the outcome.\n\n"
+)
 
 
 def _verification_cycle_needs_context(state: AgentState) -> bool:
@@ -112,7 +180,16 @@ def _build_baseline_tool_messages(
         List of [AIMessage, ToolMessage] pairs (2–4 messages total).
         Empty list if baseline has no usable data.
     """
-    if not baseline or baseline.get("success_count", 0) <= 0:
+    # Blob gate: usable when there are value-carrying successes OR any
+    # expected-absence observations (#31 residue pre-checks / #16 fix B
+    # planned creations — a pure pre-check baseline has success_count 0
+    # yet its absences are exactly what verify must compare against).
+    if not baseline or (
+        baseline.get("success_count", 0) <= 0
+        and not any(
+            o.get("expected_absence") for o in baseline.get("observations", [])
+        )
+    ):
         return []
 
     captured_at = baseline.get("captured_at", "unknown time")
@@ -122,15 +199,62 @@ def _build_baseline_tool_messages(
     # ── Pair 1: Raw baseline observations ──
     # Each successful observation (exit_code=0, has stdout) becomes part
     # of the tool result content, with causal narrative framing.
+    #
+    # Two-layer governance boundary (why a per-obs pre-cut lives here
+    # instead of leaving it all to the compactor):
+    # * this layer is the OBS-GRANULARITY GATE: N observations are fused
+    #   into ONE synthetic ToolMessage — the compactor's smart stripper
+    #   is structurally blind to fused markdown, so a full dump would be
+    #   head-cut to just the first obs's head; the per-obs budget keeps
+    #   every obs's head (the delta-comparison values) in the context;
+    # * the compactor is the BETWEEN-TURN rolling governor for whatever
+    #   this injection leaves in context.
+    # The truncation notice follows the shared contract (kind=
+    # baseline-evidence): marker + honest size + "full observation
+    # preserved in state.baseline_data" — the LLM knows the full evidence
+    # exists instead of hitting a zero-information dead end.
     obs_lines = []
     for obs in observations:
-        if obs.get("exit_code") != 0 or not obs.get("stdout"):
+        # Expected-absence observations (#16 fix B / #31): the absence IS
+        # the baseline value — pre-injection "ConfigMap not created yet"
+        # (machine-marked planned creation) or "residue file does not
+        # exist" (LLM-judged pre-check). They must NOT be filtered like
+        # failures: the post-injection comparison for these dimensions is
+        # "absent → present", and hiding the absence would leave the LLM
+        # comparing against nothing. Rendered as existence baselines with
+        # their reason, distinct from value-carrying observations.
+        if obs.get("expected_absence"):
+            desc = obs.get("description", "unknown metric")
+            cmd = obs.get("command", "")
+            _ev = (obs.get("stdout") or obs.get("stderr") or "").strip()
+            _ev_preview = _ev[:400] if _ev else "(no output — resource absent)"
+            obs_lines.append(
+                f"### {desc} — PRE-INJECTION ABSENCE (existence baseline)\n"
+                f"Command: `{cmd}`\n"
+                f"Note: {obs['expected_absence']}\n"
+                f"```\n{_ev_preview}\n```"
+            )
+            continue
+        # Empty observations (#16 fix C): exit 0 but nothing matched — "No
+        # resources found" or an empty items list is non-empty TEXT, so the
+        # old ``not obs.get("stdout")`` guard let it through and framed it
+        # as an authoritative comparison value. An empty observation is
+        # not a baseline; keep it out of the blob (the honest header count
+        # below still reports it, and B-side planned-creation notes live in
+        # the baseline receipt).
+        if (
+            obs.get("exit_code") != 0
+            or not obs.get("stdout")
+            or _is_empty_observation(obs)
+        ):
             continue
         desc = obs.get("description", "unknown metric")
         cmd = obs.get("command", "")
         output = obs["stdout"][:1500]
         if len(obs["stdout"]) > 1500:
-            output += "\n... (truncated)"
+            output += build_truncation_notice(
+                "baseline-evidence", len(obs["stdout"]), unit="characters",
+            )
         obs_lines.append(
             f"### {desc}\n"
             f"Command: `{cmd}`\n"
@@ -140,9 +264,44 @@ def _build_baseline_tool_messages(
     if not obs_lines:
         return []
 
+    # Honest quality header (#16 fix C): the raw "N/M succeeded" counts
+    # executions, not observations. When some of the successes are empty
+    # spins, the LLM must know that the usable comparison set is smaller —
+    # otherwise it anchors its delta comparisons on nothing. Legacy
+    # baselines (pre-fix) lack the split fields; recompute from the list.
+    _valid = baseline.get("valid_count")
+    _empty = baseline.get("empty_count")
+    if _valid is None or _empty is None:
+        _valid = sum(
+            1 for obs in observations
+            if (_is_observation_success(obs)
+                and not _is_empty_observation(obs))
+            or obs.get("expected_absence")
+        )
+        _empty = sum(
+            1 for obs in observations
+            if _is_observation_success(obs)
+            and _is_empty_observation(obs)
+            and not obs.get("expected_absence")
+        )
+    # total_count fallback mirrors _verifier_shared: the count in hand
+    # is the honest denominator for legacy baselines (pre-total_count
+    # persistence) — a 0 fallback rendered "N/0" receipts (#13/#10 audits).
+    _total = baseline.get("total_count", len(observations))
+    _quality = (
+        f"{baseline.get('success_count', 0)}/"
+        f"{_total} succeeded"
+        if _empty <= 0
+        else (
+            f"{baseline.get('success_count', 0)}/"
+            f"{_total} succeeded "
+            f"({_valid} valid + {_empty} empty — empty observations captured "
+            f"no value and are NOT usable as comparison baselines)"
+        )
+    )
     raw_content = (
         f"Pre-injection baseline collected at {captured_at} "
-        f"(strategy: {source}, {baseline.get('success_count', 0)}/{baseline.get('total_count', 0)} succeeded).\n\n"
+        f"(strategy: {source}, {_quality}).\n\n"
         f"These metrics were captured BEFORE fault injection using the same "
         f"kubectl commands you would use for verification. "
         f"This is your authoritative reference — compare every post-injection "
@@ -153,6 +312,7 @@ def _build_baseline_tool_messages(
 
     ai_msg_1 = AIMessage(
         content="",
+        id=_BASELINE_MSG_ID_CALLER,
         tool_calls=[{
             "name": "baseline_collector",
             "args": {"phase": "pre-injection", "target": "all_metrics"},
@@ -162,6 +322,7 @@ def _build_baseline_tool_messages(
     )
     tool_msg_1 = ToolMessage(
         content=raw_content,
+        id=_BASELINE_MSG_ID_RESULT,
         tool_call_id=_BASELINE_TOOL_CALL_ID,
         name="baseline_collector",
     )
@@ -202,7 +363,12 @@ def _build_baseline_tool_messages(
     metrics_parts.append(semantics)
 
     if not metrics_parts:
-        # No key metrics or partition info — the raw pair alone is sufficient
+        # UNREACHABLE today: ``semantics`` is appended unconditionally above, so
+        # ``metrics_parts`` is never empty. Kept as a guard, but note the
+        # contract it would break — the dedup gate in ``_build_layer2_messages``
+        # requires EVERY id in ``_SYNTHETIC_TOOL_CALL_IDS`` to be paired, so
+        # emitting only pair 1 would make the gate rebuild on every turn.
+        # Reviving this branch means narrowing the required-id set with it.
         return [ai_msg_1, tool_msg_1]
 
     metrics_content = "\n\n".join(metrics_parts)
@@ -210,6 +376,7 @@ def _build_baseline_tool_messages(
     # Second synthetic pair for structured metrics + semantics
     ai_msg_2 = AIMessage(
         content="",
+        id=_METRICS_MSG_ID_CALLER,
         tool_calls=[{
             "name": "baseline_collector",
             "args": {"phase": "pre-injection", "target": "key_metrics_summary"},
@@ -219,6 +386,7 @@ def _build_baseline_tool_messages(
     )
     tool_msg_2 = ToolMessage(
         content=metrics_content,
+        id=_METRICS_MSG_ID_RESULT,
         tool_call_id=_METRICS_TOOL_CALL_ID,
         name="baseline_collector",
     )
@@ -270,6 +438,74 @@ def _build_convergence_hint(count: int) -> str:
     return ""
 
 
+def build_recovery_timer_reminder(
+    state: AgentState,
+    *,
+    now: float | None = None,
+) -> str:
+    """Render the armed recovery timer's remaining time for the verifier.
+
+    The verifier's three context channels (message history, progress ledger,
+    system prompt) carry no timestamps, and the LLM has no wall clock of its
+    own — so a persistence check used to reverse-engineer the fire moment
+    from cluster-side pod ages (Case #46 R2: "roughly T+120s since arm",
+    derived through two unknown delays, while a persistence wait could
+    silently straddle the fire). The exact deadline already sits on the
+    recovery-carrier artifact (``recovery_deadline_epoch``, written at arming
+    time by ``_mark_bounded_host_recovery``); this renders REMAINING seconds
+    rather than the fire timestamp because a moment value would still force
+    the model to supply its own "now", which it does not have.
+
+    Returns ``""`` when no armed carrier carries a numeric deadline (the
+    ChaosBlade path times out inside the experiment, never here).
+    """
+    artifacts = state.get("execution_artifacts") or []
+    armed: list[tuple[float, dict]] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict) or artifact.get("status") != "recovery_armed":
+            continue
+        deadline = artifact.get("recovery_deadline_epoch")
+        if isinstance(deadline, (int, float)):
+            armed.append((float(deadline), artifact))
+    if not armed:
+        return ""
+    current = time.time() if now is None else float(now)
+
+    def _window_text(artifact: dict) -> str:
+        window = artifact.get("recovery_timeout_seconds")
+        return f" (window {window}s)" if isinstance(window, (int, float)) else ""
+
+    future = [(d, a) for d, a in armed if d > current]
+    if future:
+        # The NEXT fire is the planning anchor when several carriers are armed.
+        deadline, artifact = min(future, key=lambda pair: pair[0])
+        seconds = max(0, int(deadline - current))
+        return (
+            f"**RECOVERY TIMER (system-computed, authoritative)**: the recovery "
+            f"carrier's self-recovery timer{_window_text(artifact)} fires in "
+            f"~{seconds}s. Evidence semantics: any probe taken after that moment "
+            f"can no longer serve as persistence evidence; any wait longer "
+            f"than ~{seconds}s ends after the fire."
+        )
+    # No future fire left: report the most recent one. Post-fire wording must
+    # stay NEUTRAL about recovery outcome: fire proves the actions were
+    # TRIGGERED, never that they converged (Case #46 R1: fired on schedule,
+    # then hung 12 minutes on the OrderedReady wedge). A still-present fault
+    # signature after the fire is recovery-NOT-converged evidence — optimism
+    # like "recovery at or near completion" would launder exactly that
+    # finding, and the verdict must rest on pre-fire evidence.
+    deadline, artifact = max(armed, key=lambda pair: pair[0])
+    return (
+        f"**RECOVERY TIMER (system-computed, authoritative)**: the recovery "
+        f"carrier's self-recovery timer{_window_text(artifact)} fired "
+        f"~{int(current - deadline)}s ago — the recovery actions were TRIGGERED, "
+        f"not necessarily completed. Evidence semantics: fault signatures "
+        f"observed from now on are not persistence evidence; a still-present "
+        f"signature means recovery has NOT converged (record it); the verdict "
+        f"rests on pre-fire evidence."
+    )
+
+
 def _build_layer2_messages(
     state: AgentState,
     layer1: Layer1Result,
@@ -298,9 +534,10 @@ def _build_layer2_messages(
     # Inject on EVERY iteration, not just the cycle's first turn, because
     # they are NOT persisted in AgentState.messages by default
     # (result_update only contains the LLM's response). Without this, LLM
-    # loses baseline data on later turns. When already in state history
-    # (persisted from the cycle's first turn via result_update), skip to
-    # avoid duplication.
+    # loses baseline data on later turns. When state already holds a COMPLETE,
+    # correctly ordered pair set (persisted from the cycle's first turn via
+    # result_update), skip to avoid duplication; when any pair is missing,
+    # half-present or duplicated, rebuild the whole set (gate below).
     # State-derived variables needed by _build_baseline_tool_messages.
     from chaos_agent.agent.spec.fault_spec import read_fault_spec as _rfs_vm
     _spec_vm = _rfs_vm(state)
@@ -310,14 +547,35 @@ def _build_layer2_messages(
 
     _baseline = state.get("baseline_data")
     if _baseline and _baseline.get("success_count", 0) > 0:
-        _baseline_in_state = any(
-            getattr(m, "tool_call_id", "") == _BASELINE_TOOL_CALL_ID
-            for m in messages if isinstance(m, ToolMessage)
-        )
-        if not _baseline_in_state:
-            messages.extend(_build_baseline_tool_messages(
+        # PAIR-aware dedup over the whole synthetic id set — not a single-id
+        # ToolMessage probe. The old gate asked only "is a ToolMessage with
+        # ``baseline_collector`` already in history?", which is blind to:
+        #   * the AI caller gone but its ToolMessage surviving → the gate
+        #     reports "injected", no rebuild runs, so no caller is ever
+        #     supplied and the orphan ships with nothing to answer;
+        #   * damage confined to the METRICS pair → that id was never probed;
+        #   * a duplicated or reversed pair → both illegal, both invisible.
+        #
+        # The gate mechanics (diagnose → drop every stale fragment → rebuild →
+        # log at the level the cause deserves) are shared with recover_verify
+        # and documented on apply_synthetic_pair_gate. What stays here is the
+        # part specific to this node: two non-convergent flavours of damage are
+        # measured, tolerated and pinned by tests — a REVERSED pair, where the
+        # id-based merge pins the surviving result before its rebuilt caller
+        # forever (INFO), and a legacy DUPLICATE fragment whose message id
+        # predates the stable-id fix and can never be replaced in place
+        # (WARNING, and honest: state really does answer one tool_call twice).
+        # Neither leaks: the shipped sequence is intact and protocol-legal
+        # every turn. See message_integrity's CONTRACT BOUNDARY, plus
+        # TestSyntheticPairDedup and TestRecoverPairGate.
+        messages = apply_synthetic_pair_gate(
+            messages,
+            _SYNTHETIC_TOOL_CALL_IDS,
+            lambda: _build_baseline_tool_messages(
                 _baseline, _fault_target, _fault_action, _injection_parsed,
-            ))
+            ),
+            phase="verify",
+        )
     if new_cycle is None:
         new_cycle = _verification_cycle_needs_context(state)
     if new_cycle:
@@ -332,6 +590,18 @@ def _build_layer2_messages(
     elif convergence_hint:
         # Subsequent iterations approaching limit: inject convergence nudge
         messages.append(HumanMessage(content=wrap_system_reminder(convergence_hint)))
+
+    # Recovery-timer visibility (Case #46): the verifier LLM has no wall clock
+    # and its context channels carry no timestamps, so the armed self-recovery
+    # timer's fire moment had to be reverse-engineered from pod ages — a
+    # persistence-check wait could silently straddle the fire. Rendered fresh
+    # on EVERY iteration (this builder runs once per graph re-entry) and NOT
+    # persisted to state (extract_persistent_hm only takes the kwargs-tagged
+    # context message; extract_synthetic_messages only takes tool pairs), so
+    # the remaining seconds never go stale and never accumulate.
+    timer_reminder = build_recovery_timer_reminder(state)
+    if timer_reminder:
+        messages.append(HumanMessage(content=wrap_system_reminder(timer_reminder)))
 
     # Final-iteration conclusion prompt (tools will be unbound at this count).
     # Skipped when verifier_json_mode is on: verifier.py appends the JSON
@@ -435,11 +705,37 @@ def _build_first_iteration_context(
             "tools to verify the fault is actually in effect on the target.\n"
         )
     else:
+        # Round-29: the anchor line names the uid the poll ACTUALLY
+        # verified — ``layer1.experiments`` carries the anchor entry the
+        # plural poll chose (a dead dispatch slot handed the role to the
+        # first survivor); the caller's ``experiment_uid`` stays the
+        # fallback for the legacy single-value shape.
+        _anchor_uid = next(
+            (e.uid for e in layer1.experiments if e.is_anchor), experiment_uid,
+        )
         layer1_context = (
             f"## Layer 1 Result (already completed)\n"
-            f"Layer 1 for experiment {experiment_uid}: {layer1.status}\n"
+            f"Layer 1 for experiment {_anchor_uid}: {layer1.status}\n"
             f"Details: {layer1.raw_output[:500]}\n\n"
         )
+        # Round-29 K1: sibling evidence renders in its OWN bounded
+        # section — the anchor's 500-char window is never shared with
+        # the siblings (the r28 string-append starved past the window;
+        # each sibling now gets one bounded line, status first).
+        _sibling_entries = [e for e in layer1.experiments if not e.is_anchor]
+        if _sibling_entries:
+            _sib_lines = ["## Sibling Experiments (also live, Layer-1 polled)\n"]
+            for _se in _sibling_entries:
+                _se_det = (_se.details or "")[:200]
+                _sib_lines.append(
+                    f"- {_se.uid}: {_se.status}"
+                    + (f" - {_se_det}" if _se_det else "") + "\n"
+                )
+            _sib_lines.append(
+                "\nThese experiments are ALSO live for this task. Factor "
+                "their status into the task-level verification verdict.\n\n"
+            )
+            layer1_context += "".join(_sib_lines)
         if layer1.expired:
             layer2_instruction = (
                 "Layer 1 shows the experiment has EXPIRED (status: Destroyed/Revoked). "
@@ -542,12 +838,13 @@ def _build_first_iteration_context(
         context += f"Injection key parameters: {injection_parsed}\n"
     if fault_metadata:
         context += f"{fault_metadata}\n"
-    # Timeout info: duration is auto-boosted, only add informational note
+    # Timeout note: explicitly declared short timeouts run verbatim, so a
+    # sub-300s experiment may genuinely have timed out — informational note
     _timeout_val = injection_parsed.get("timeout")
     if _timeout_val:
         try:
             _timeout_sec = int(str(_timeout_val).strip())
-            if _timeout_sec < 600:
+            if _timeout_sec < 300:
                 context += (
                     f"ℹ Duration note: --timeout {_timeout_sec}s. "
                     f"If fault effects are not observable, consider that the fault "
@@ -675,7 +972,8 @@ def _build_first_iteration_context(
                 f"container overlay, not the host filesystem.\n"
                 f"DO NOT conclude \"failed\" based on /host/tmp/ having no burn files "
                 f"or nodefs (vda3) showing no I/O — the burn is on a DIFFERENT partition.\n"
-                f"You MUST mark the disk I/O verification step as 'passed' in your checklist.\n"
+                f"The measured write throughput above is the effect evidence "
+                f"for the disk I/O verification step.\n"
             )
         else:
             context += (
@@ -708,10 +1006,11 @@ def _build_first_iteration_context(
             "The Phase 1 planner probed THIS environment and adapted the "
             "verification strategy below. Where it conflicts with the skill "
             "case's generic steps, the planner's environment-specific "
-            "conclusions prevail (e.g. an anticipated negative result). The "
-            "skill case still defines which steps to verify; the adaptation "
-            "stays within the case's verification steps (no extra observation "
-            "rounds or repeat windows).\n\n"
+            "conclusions prevail on environment facts (e.g. an anticipated "
+            "negative result) — never by lengthening a wait or slowing a "
+            "criterion. The skill case still defines which steps to verify; "
+            "the adaptation stays within the case's verification steps "
+            "(no extra observation rounds or repeat windows).\n\n"
             f"<planner-verification>\n{plan_verification}\n</planner-verification>\n\n"
         )
     if skill_case:
@@ -740,8 +1039,7 @@ def _build_first_iteration_context(
                 f"5. Output a VERIFICATION_CHECKLIST section with each "
                 f"step and its result before VERIFICATION_RESULT\n\n"
                 f"Rules:\n"
-                f"1. Replace [status] with: passed, failed, skipped, "
-                f"recovered_before_observation, expected, or not_applicable\n"
+                f"1. Replace [status] with: {_ITEM_STATUS_PROSE}\n"
                 f"2. After [status], write \" — \" followed by brief "
                 f"evidence\n"
                 f"3. If a step cannot be executed, mark as skipped "
@@ -795,8 +1093,7 @@ def _build_first_iteration_context(
                 f"Rules:\n"
                 f"1. Line format: `Step N: <status> — <evidence>`,\n"
                 f"   keeping the case's step numbering.\n"
-                f"2. <status> ∈ passed, failed, skipped,\n"
-                f"   recovered_before_observation, expected, not_applicable.\n"
+                f"2. <status> ∈ {_ITEM_STATUS_PROSE}.\n"
                 f"3. Every status needs evidence; for injection-effect "
                 f"steps `expected` without an observation is invalid — \n"
                 f"   use `skipped` if unchecked.\n"
@@ -920,33 +1217,13 @@ def _build_first_iteration_context(
         "the conclusion that the fault is in effect. For each item, either:\n"
         "(a) Dismiss it with factual basis (not speculation), or\n"
         "(b) Accept it as valid counter-evidence.\n"
-        "If ANY criterion for the injection taking effect is demonstrably "
-        "NOT met, you MUST conclude Layer2 as 'partial' or 'failed' — NOT "
-        "'passed'. "
+        "If ANY element of the effect claim (a significant change observed, "
+        "attributable to the injection) is demonstrably NOT met, you MUST "
+        "conclude Layer2 as 'partial' or 'failed' — NOT 'passed'. "
         "(Absence of propagated effects (OOM, latency, business impact) is "
-        "NOT counter-evidence against the fault being in effect — record it "
-        "as 'expected'/'not_applicable', never wait or sample for it.)\n\n"
+        "NOT counter-evidence against the fault being in effect.)\n\n"
     )
-    context += (
-        "**EVIDENCE CONVERGENCE (CRITICAL)**: fault effects take time to propagate — "
-        "sample until evidence is DECISIVE; there is no fixed check count.\n"
-        "- Qualitative faults (process gone / NotReady / unreachable / error present): "
-        "one clear observation is decisive — conclude.\n"
-        "- Quantitative targets (declared magnitude, e.g. --mem-percent 80): a value "
-        "MOVING TOWARD the target proves the mechanism is active, NOT that the target "
-        "is reached — keep sampling while it trends; 'passed' needs convergence at or "
-        "near the declared value.\n"
-        "- Plateau BELOW the declared target across repeated samples: fault in effect "
-        "but capped → 'partial' with the plateau value as evidence.\n"
-        "- No effect evidence after repeated samples → Layer2 'failed', Overall "
-        "'unverified' (never 'partial' with zero evidence).\n\n"
-        "**STEP CONCLUSION RULE**:\n"
-        "You may conclude any step early if continued attempts are unlikely to yield new information.\n"
-        "When concluding early, you MUST provide:\n"
-        "1. What you tried (commands/methods)\n"
-        "2. What you observed (actual output)\n"
-        "3. Why further attempts would not change the outcome\n\n"
-    )
+    context += _EVIDENCE_SEMANTICS_PROMPT
     # Add fault-specific verification hints when metadata is available
     verification_hints = _get_fault_verification_hints(
         fault_scope, fault_target, fault_action,

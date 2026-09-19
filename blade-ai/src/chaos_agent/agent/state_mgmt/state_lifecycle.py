@@ -3,7 +3,8 @@
 The graph still exposes flat top-level fields for compatibility with
 TaskStore, CLI/TUI renderers, and existing checkpoints.  This module is the
 single place that decides which of those fields are per-fault runtime state
-and must be reset when a batch moves to the next fault.
+and must be reset when a batch moves to the next fault, which are per-recover
+state, and which are per-attempt (replan) state.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ class StateFieldPolicy:
     durable: bool = False
     batch_fault_default: Any = _NO_RESET
     recover_default: Any = _NO_RESET
+    replan_default: Any = _NO_RESET
 
     @property
     def reset_on_batch_fault(self) -> bool:
@@ -36,6 +38,10 @@ class StateFieldPolicy:
     def reset_on_recover(self) -> bool:
         return self.recover_default is not _NO_RESET
 
+    @property
+    def reset_on_replan(self) -> bool:
+        return self.replan_default is not _NO_RESET
+
 
 def _p(
     name: str,
@@ -44,6 +50,7 @@ def _p(
     durable: bool = False,
     batch: Any = _NO_RESET,
     recover: Any = _NO_RESET,
+    replan: Any = _NO_RESET,
 ) -> StateFieldPolicy:
     return StateFieldPolicy(
         name=name,
@@ -51,6 +58,7 @@ def _p(
         durable=durable,
         batch_fault_default=batch,
         recover_default=recover,
+        replan_default=replan,
     )
 
 
@@ -62,6 +70,7 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("parent_task_id", "core_identity", durable=True, batch=""),
     _p("operation", "core_identity", durable=True, batch="inject", recover="recover"),
     _p("tenant_id", "core_identity", durable=True),
+    _p("workspace_id", "core_identity", durable=True),
 
     # ── Intent & Input ─────────────────────────────────────────────
     _p("input", "intent_input", durable=True, batch=None),
@@ -89,6 +98,8 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("_planning_rejection_reason", "planning", batch=None),
     _p("_planning_alternatives", "planning", batch=""),
     _p("_catalogue_rejection_nudged", "planning", batch=False),
+    _p("_identity_declaration_nudged", "planning", batch=False),
+    _p("_identity_split_nudged", "planning", batch=False),
     _p("_plan_text_stall_count", "planning", batch=0),
     _p("plan_builder_round", "planning", batch=0),
     _p("planning_mode", "planning", durable=True),
@@ -96,25 +107,49 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("plan_confirmed", "planning", batch=False),
 
     # ── Safety ─────────────────────────────────────────────────────
-    _p("safety_status", "safety", batch="pending"),
-    _p("safety_reason", "safety", batch=None),
+    _p("safety_status", "safety", batch="pending", replan="pending"),
+    # W-56-5 (defect b): attempt-scoped residue. A safety_reason written by
+    # the PREVIOUS attempt's safety_check (e.g. its blast-radius warning)
+    # survived the replan boundary and was later rendered by the reject node
+    # as if it were THIS attempt's reason (#56: "Task rejected: Cluster-wide
+    # blast radius" stamped on an attempt 2 that never re-ran safety_check).
+    # The prior attempt's fail residue (error / failure_reason /
+    # failure_detail, declared in the outcome group) is equally stale here —
+    # a stale error makes should_continue_agent_loop reject the new attempt
+    # on its very first route. All of it is already captured in
+    # replan_history. This registry is the single source; the agent_loop
+    # replan seam consumes it via replan_reset_state().
+    _p("safety_reason", "safety", batch=None, replan=None),
     _p("safety_checked_detail", "safety", batch=None),
     _p("conflict_uids", "safety", batch=None),
+    # Outcome-uncertain create reconcile gate state (fingerprint +
+    # blocked_count + gate_reconciled). Same lifecycle as conflict_uids:
+    # per-fault reset, never durable — each task/fault has its own
+    # fingerprint domain.
+    _p("create_reconcile", "safety", batch=None),
     _p("safety_score", "safety", batch=None),
-    _p("blast_radius_scope", "safety", batch=None),
-    _p("blast_radius_detail", "safety", batch=None),
+    _p("blast_radius_scope", "safety", batch=None, replan=None),
+    _p("blast_radius_detail", "safety", batch=None, replan=None),
     _p("target_health_report", "safety", batch=None),
     _p("feasibility_report", "safety", batch=None),
 
     # ── Confirmation ───────────────────────────────────────────────
-    _p("needs_confirmation", "confirmation", batch=False, recover=False),
+    _p("needs_confirmation", "confirmation", batch=False, recover=False, replan=False),
     _p("approved_target", "confirmation", batch=None),
     _p("drift_reject_count", "confirmation", batch=0),
     _p("plan_change_reject_count", "confirmation", batch=0),
+    _p("plan_change_auto_approve_count", "confirmation", batch=0),
     _p("screener_route", "confirmation", batch=None),
     # Transient like screener_route: set by the loop, consumed and cleared by
     # the screener within the same iteration. Never durable.
     _p("truncated_tool_calls", "confirmation", batch=False, recover=False),
+    # Same transient lifecycle: set by execute_loop's create-reconcile gate
+    # (batch held), consumed and cleared by the screener. Never durable.
+    _p("_reconcile_gate_blocked", "confirmation", batch=False, recover=False),
+    # Unattended write-set boundary exit payload: written once by the
+    # confirmation_gate when an unattended run declines a widened case
+    # contract; terminal, consumed by the result envelope. Per-fault reset.
+    _p("write_set_boundary", "confirmation", batch=None),
 
     # ── Execution ──────────────────────────────────────────────────
     _p("experiment_uid", "execution", durable=True, batch=None),
@@ -123,9 +158,31 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     # batch advance), inherited by recover (no ``recover=`` → the reset
     # whitelist keeps it).
     _p("fault_handle", "execution", durable=True, batch=None),
-    # Retired (successfully destroyed) experiment UIDs. Not inherited by the
-    # recover graph — the recovered experiment may well be one of them.
-    _p("retired_experiment_uids", "execution", durable=True, batch=None, recover=False),
+    # Landing readback bookkeeping (faultdrill-cr-channel task 2.1): the
+    # handle value whose landing was integrity-verified. Same lifecycle as
+    # fault_handle — cleared with it at the replan seam and on batch
+    # advance, so a re-apply under the same name always re-verifies (a
+    # retry may carry a different recipe). Losing it to nothing is
+    # fail-safe anyway: the guard re-runs one extra readback, never skips
+    # one.
+    _p("fault_readback_verified", "execution", durable=True, batch=None),
+    # Liability ledger's death wing (B76 review G/H): UIDs PROVEN destroyed
+    # (framework-side destroys leave no ToolMessage, so this registry is their
+    # only death proof). Durable AND never reset on batch advance or recover
+    # entry — the mirror twin of owned_experiment_uids: the birth registry is
+    # append-only by birth, this one append-only by proven death, and BOTH
+    # must persist across fault/batch/contract/graph boundaries or the live
+    # view (live_liability_uids = owned − retired − message-proven destroys)
+    # resurrects a destroyed experiment and the next sweep repeat-destroys it
+    # (probe_b76_round8.py H4).
+    _p("retired_experiment_uids", "execution", durable=True),
+    # Birth registry (B76 review G): every UID this task ever created. Durable
+    # (survives compaction — the destroy whitelist's message evidence does
+    # not), NOT reset on batch advance and NOT reset on recover entry.
+    # Liability persists across fault/batch/contract boundaries, and the
+    # recover graph's final sweep is exactly the consumer that must see the
+    # full set; its death twin above must cross the same boundaries.
+    _p("owned_experiment_uids", "execution", durable=True),
     _p("injection_method", "execution", durable=True, batch=None),
     # Combo injection marker — must survive compaction AND be inherited by the
     # recover graph (it drives combo recovery routing there).
@@ -191,6 +248,9 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("layer1_iteration_count", "recovery", batch=0, recover=0),
     _p("layer2_context_added", "recovery", batch=False, recover=False),
     _p("recover_layer2_first", "recovery", batch=False, recover=False),
+    # B51: Layer-2-local iteration pin — reset with the other recovery fields
+    # so a stale pin can never outlive its Layer 2 run.
+    _p("layer2_start_count", "recovery", batch=0, recover=0),
 
     # ── Loop Control ───────────────────────────────────────────────
     _p("agent_loop_count", "loop_control", batch=0, recover=0),
@@ -204,7 +264,7 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("transient_retry_count", "loop_control", batch=0, recover=0),
     _p("pipeline_attempt", "loop_control", batch=0, recover=0),
     _p("pipeline_attempts_history", "loop_control", batch=None, recover=None),
-    _p("replan_requested", "loop_control", batch=False, recover=False),
+    _p("replan_requested", "loop_control", batch=False, recover=False, replan=False),
     _p("replan_count", "loop_control", batch=0, recover=0),
     _p("verify_replan_count", "loop_control", batch=0, recover=0),
     _p("replan_request", "loop_control", batch=None, recover=None),
@@ -215,14 +275,20 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
 
     # ── Results ────────────────────────────────────────────────────
     _p("result", "outcome", batch=None, recover=None),
-    _p("error", "outcome", batch=None, recover=None),
-    _p("failure_reason", "outcome", batch=None, recover=None),
-    _p("failure_detail", "outcome", batch=None, recover=None),
+    _p("error", "outcome", batch=None, recover=None, replan=None),
+    _p("failure_reason", "outcome", batch=None, recover=None, replan=None),
+    _p("failure_detail", "outcome", batch=None, recover=None, replan=None),
     _p("postmortem", "outcome", batch=None, recover=None),
     _p("issue_report", "outcome", batch=None, recover=None),
     _p("created_at", "outcome", durable=True),
     _p("finished_at", "outcome", durable=True, batch=None, recover=None),
     _p("injection_start_time", "outcome", durable=True, batch=None),
+    # Fault-window hold origin (verifier-entry stamp = execute-loop end).
+    # Same lifecycle as its attribution sibling: durable within an operation,
+    # reset per batch fault, cleared at replan seams by
+    # reset_attribution_state (NOT by these policies — the replan seam is
+    # the only re-arm channel).
+    _p("injection_window_start_time", "outcome", durable=True, batch=None),
 
     # ── Memory ─────────────────────────────────────────────────────
     _p("compressed_summary", "memory", durable=True, batch=None),
@@ -232,6 +298,10 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     # each recover is a distinct operation that freezes its own anchor, so both
     # boundaries reset it to None for a fresh ledger.
     _p("progress_ledger", "memory", durable=True, batch=None, recover=None),
+    # Probe snapshot is evidence for THIS intent's approval; the next batch
+    # fault and any recover operate on different evidence and must not inherit
+    # stale intent-time facts.
+    _p("probe_snapshot", "memory", durable=True, batch=None, recover=None),
 )
 
 
@@ -276,9 +346,13 @@ def state_field_group(field: str) -> str | None:
 
 
 def _build_reset_defaults(kind: str) -> dict[str, Any]:
-    if kind not in {"batch", "recover"}:
+    if kind not in {"batch", "recover", "replan"}:
         raise ValueError(f"Unsupported reset kind: {kind}")
-    attr = "batch_fault_default" if kind == "batch" else "recover_default"
+    attr = {
+        "batch": "batch_fault_default",
+        "recover": "recover_default",
+        "replan": "replan_default",
+    }[kind]
     return {
         policy.name: deepcopy(getattr(policy, attr))
         for policy in _STATE_FIELD_POLICY_LIST
@@ -288,6 +362,7 @@ def _build_reset_defaults(kind: str) -> dict[str, Any]:
 
 _PER_FAULT_RESET_DEFAULTS: dict[str, Any] = _build_reset_defaults("batch")
 _RECOVER_RESET_DEFAULTS: dict[str, Any] = _build_reset_defaults("recover")
+_REPLAN_RESET_DEFAULTS: dict[str, Any] = _build_reset_defaults("replan")
 
 
 def per_fault_reset_state() -> dict[str, Any]:
@@ -298,6 +373,17 @@ def per_fault_reset_state() -> dict[str, Any]:
 def recover_reset_state() -> dict[str, Any]:
     """Return a fresh reset delta for a recover attempt."""
     return deepcopy(_RECOVER_RESET_DEFAULTS)
+
+
+def replan_reset_state() -> dict[str, Any]:
+    """Return a fresh reset delta for a new replan attempt (W-56-5).
+
+    Attempt-scoped runtime state — the previous attempt's terminal residue
+    and safety verdicts must not leak across the replan seam. Consumed by
+    the agent_loop replan entry; adding an attempt-scoped key here makes it
+    reset on EVERY replan path instead of one hand-maintained list.
+    """
+    return deepcopy(_REPLAN_RESET_DEFAULTS)
 
 
 def ensure_recover_runtime_defaults(initial: dict) -> dict:
@@ -344,6 +430,7 @@ __all__ = [
     "iter_state_fields",
     "per_fault_reset_state",
     "recover_reset_state",
+    "replan_reset_state",
     "state_field_policy",
     "state_field_group",
 ]

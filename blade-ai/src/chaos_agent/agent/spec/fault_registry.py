@@ -385,6 +385,13 @@ def required_intent_params(scope: str | None) -> list[str]:
 # ``carrier_types`` (``chaosblade`` → OS subsystems + ChaosBlade verbs;
 # ``k8s_native`` → kubectl resource types + mutation verbs), preserving the
 # original concatenation order (chaosblade first, then k8s_native).
+#
+# ``faultdrill_cr`` (openspec faultdrill-cr-channel) sits LAST with an
+# intentionally EMPTY vocabulary declaration: routing into the CR channel
+# is metadata-driven (skill-case ``recovery_channel`` + planning + write-set
+# validation), never scope-bridged, so INTENT_TARGETS / INTENT_ACTIONS stay
+# byte-identical whether or not the channel is registered (dark launch:
+# ``resolve_by_scope`` skips carriers with no registered provider).
 register_family(
     FaultFamily(
         family_id="k8s_chaosblade",
@@ -393,7 +400,14 @@ register_family(
             "deployment", "statefulset", "daemonset",
             "service",
         ),
-        carrier_types=("chaosblade", "k8s_native"),
+        carrier_types=("chaosblade", "k8s_native", "faultdrill_cr"),
+        # NOTE (R21/G-5): this is a DELIBERATE parallel declaration, not a
+        # stale copy — the spec layer sits BELOW the agent layer and must
+        # not import up. The agent-tree single source of the same topology
+        # is ``agent.target_guard.classifier.CLUSTER_SCOPED_KINDS`` /
+        # ``is_cluster_scoped_kind``; the two are cross-referenced by this
+        # comment only. Add a cluster-scoped kind to BOTH (or lift the
+        # topology into a spec-level module both can import).
         cluster_scoped=(
             "node", "pv", "namespace", "clusterrole", "clusterrolebinding",
             "storageclass",

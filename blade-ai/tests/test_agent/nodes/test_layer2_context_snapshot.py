@@ -202,3 +202,126 @@ class TestLayer2ContextSnapshot:
         # baseline partition note also removed from the baseline entries
         bl_joined = json.dumps([v for (k, _), v in gmap.items() if k == "baseline"])
         assert "Baseline Partition Target" not in bl_joined
+
+
+def test_regenerate_golden_fixture():
+    """Explicit, opt-in golden regeneration (verifier-effect-decides, D5).
+
+    The golden file was previously hand-captured with no regen path — every
+    intentional prompt change forced byte archaeology. Run with
+    ``BLADE_AI_REGEN_GOLDEN=1`` to rebuild it after an intentional change to
+    the always-added verifier context text. The run prints a per-entry diff
+    summary (+added/-removed lines) so the change stays auditable, and guards
+    that baseline entries never drift. Without the env var this skips: in
+    normal runs the snapshot stays byte-frozen.
+    """
+    import difflib
+    import os
+
+    if os.environ.get("BLADE_AI_REGEN_GOLDEN") != "1":
+        pytest.skip("golden is frozen; set BLADE_AI_REGEN_GOLDEN=1 to regenerate")
+
+    old_map = _golden_map()
+
+    entries = []
+    for row in _MATRIX:
+        label, st, l1, uid, skill, kc, tp, ch = row
+        entries.append({
+            "kind": "context",
+            "label": label,
+            "out": _build_first_iteration_context(st, l1, uid, skill, kc, tp, ch),
+        })
+    for row in _BASELINE_MATRIX:
+        label, bl, tgt, act, parsed = row
+        msgs = _build_baseline_tool_messages(bl, tgt, act, injection_parsed=parsed)
+        entries.append({
+            "kind": "baseline",
+            "label": label,
+            "out": [{"type": type(m).__name__, "content": m.content} for m in msgs],
+        })
+
+    new_map = {(e["kind"], e["label"]): e["out"] for e in entries}
+    changed = [k for k, v in new_map.items() if old_map.get(k) != v]
+    baseline_changed = [k for k in changed if k[0] == "baseline"]
+    assert not baseline_changed, (
+        f"baseline entries must not drift: {baseline_changed}"
+    )
+
+    for kind, label in changed:
+        diff = list(difflib.unified_diff(
+            old_map[(kind, label)].splitlines(),
+            new_map[(kind, label)].splitlines(),
+            lineterm="", n=0,
+        ))
+        adds = sum(1 for ln in diff if ln.startswith("+") and not ln.startswith("+++"))
+        dels = sum(1 for ln in diff if ln.startswith("-") and not ln.startswith("---"))
+        print(f"[regen] {kind}/{label}: +{adds} -{dels} lines")
+
+    _GOLDEN.write_text(
+        json.dumps(entries, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    unchanged = len(new_map) - len(changed)
+    print(f"[regen] wrote {len(entries)} entries "
+          f"({len(changed)} changed, {unchanged} identical)")
+
+
+class TestSiblingEvidenceRendering:
+    """Round-29 K1 — sibling evidence renders in its OWN bounded section:
+    the anchor's 500-char window is never shared (the r28 string-append
+    starved past it), and the anchor line names the uid the poll actually
+    verified (the experiments[0] entry, not the caller's dead slot)."""
+
+    UID_A = "aabbccdd00000001"
+    UID_B = "9988776600000001"
+    LONG_ANCHOR_RAW = "x" * 600  # past the 500-char window on its own
+
+    def _layer1(self, *, with_siblings: bool, anchor_uid: str = UID_A):
+        from chaos_agent.agent.result.verdict import ExperimentEvidence
+
+        experiments = [ExperimentEvidence(
+            uid=anchor_uid, status="passed", is_anchor=True,
+            details="anchor details", raw_output=self.LONG_ANCHOR_RAW,
+        )]
+        if with_siblings:
+            experiments.append(ExperimentEvidence(
+                uid=self.UID_B, status="warning", is_anchor=False,
+                details="sibling details",
+            ))
+        return Layer1Result(
+            status="passed",
+            details="anchor details",
+            raw_output=self.LONG_ANCHOR_RAW,
+            experiments=experiments,
+        )
+
+    def _context(self, layer1, experiment_uid: str) -> str:
+        state = {"injection_method": "kubectl_exec", "messages": []}
+        return _build_first_iteration_context(
+            state, layer1, experiment_uid, "case-x", "/tmp/kc", None, "",
+        )
+
+    def test_long_anchor_raw_sibling_section_still_visible(self):
+        # K1's exact shape: a 600-byte anchor raw starves anything the
+        # window could carry — the sibling section renders AFTER the
+        # window, bounded per line, unconditionally visible.
+        ctx = self._context(self._layer1(with_siblings=True), self.UID_A)
+        assert "## Sibling Experiments (also live, Layer-1 polled)" in ctx
+        assert f"- {self.UID_B}: warning - sibling details" in ctx
+        assert "AALSO live for this task" not in ctx  # guard: no typos leak
+
+    def test_anchor_line_names_the_polled_anchor_uid(self):
+        # The caller's uid may be a DEAD dispatch slot; the poll's anchor
+        # entry (experiments[0]) carries the uid the verdict speaks for.
+        ctx = self._context(
+            self._layer1(with_siblings=False, anchor_uid=self.UID_B),
+            self.UID_A,  # dead slot
+        )
+        assert f"Layer 1 for experiment {self.UID_B}" in ctx
+        assert f"Layer 1 for experiment {self.UID_A}" not in ctx
+
+    def test_no_sibling_keeps_mainline_without_section(self):
+        # Mainline: no sibling section renders — the pre-round-29 shape.
+        ctx = self._context(self._layer1(with_siblings=False), self.UID_A)
+        assert "Sibling Experiments" not in ctx
+        assert f"Layer 1 for experiment {self.UID_A}: passed" in ctx

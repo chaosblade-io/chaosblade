@@ -19,12 +19,49 @@ from chaos_agent.agent.result.operation_outcome import (
     read_recover_verification,
     read_verification_side_effects,
 )
+from chaos_agent.agent.result.verdict import RecoverVerdict
 from chaos_agent.agent.state import (
+    TaskState,
     extract_ui_diagnostics,
     materialize_fault_handle,
+    recovery_task_state_from_level,
     strip_side_effects,
     terminal_task_state,
 )
+
+
+def pending_vehicle_teardown(values: Mapping[str, Any]) -> list[str]:
+    """Registered-but-uncleaned vehicle artifacts at task end (inject-dfee9d3d).
+
+    Single source for the task-end teardown fact: a long-window recovery
+    carrier (deadline after task end) is deadline-protected out of the
+    finalize sweep, so its RBAC members live on with no system-side
+    trigger after the timer fires. The recover graph's finalize node
+    re-runs the same sweep with the deadline passed, so ONE ``blade-ai
+    recover`` call collects the whole stack (idempotent,
+    ``--ignore-not-found``). Rendered by every terminal builder consumer
+    (CLI hint, SSE envelope field, task JSON audit) — implement a new
+    terminal display by reading this field, never by re-deriving the
+    pending list at another construction site.
+    """
+    # Lazy import — result layer stays free of agent-node imports at
+    # import time (build_inject_context / FaultProviderRegistry precedents).
+    from chaos_agent.agent.execution_artifacts import VEHICLE_ARTIFACT_TYPES
+
+    pending: list[str] = []
+    for artifact in values.get("execution_artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        if artifact.get("type") not in VEHICLE_ARTIFACT_TYPES:
+            continue
+        if artifact.get("status") == "cleaned":
+            continue
+        name = str(artifact.get("name") or "")
+        ns = str(artifact.get("namespace") or "")
+        pending.append(
+            f"{artifact.get('type')}:{ns}/{name}" if name else str(artifact.get("type"))
+        )
+    return pending
 
 
 def _fault_spec_dict(values: Mapping[str, Any]) -> dict[str, Any]:
@@ -125,6 +162,18 @@ def build_inject_data_from_state(
         "postmortem": outcome.postmortem,
         "issue_report": outcome.issue_report,
         "error": outcome.error,
+        # Task-end teardown fact, single-sourced (inject-dfee9d3d, R13-1):
+        # every terminal builder consumer (CLI hint, SSE envelope, task
+        # JSON audit) reads this field instead of re-deriving the pending
+        # list — "did this task leave uncollected vehicles" must have ONE
+        # answer, not per-construction-site copies.
+        "vehicle_teardown_pending": pending_vehicle_teardown(state_values),
+        # Write-set boundary exit payload (unattended widened contract):
+        # manifest entries verbatim + interactive re-run guidance,
+        # machine-readable for pipeline consumption. Absent for every
+        # other outcome.
+        **({"write_set_boundary": state_values["write_set_boundary"]}
+           if state_values.get("write_set_boundary") else {}),
         **diagnostics,
     }
 
@@ -204,35 +253,54 @@ def build_inject_status_data_from_state(
 
 
 def recover_task_state_from_values(values: Mapping[str, Any]) -> str:
-    """Return the recover lifecycle state from a recover graph state."""
+    """Return the recover lifecycle state from a recover graph state.
+
+    Single-sourced through :func:`recovery_task_state_from_level`
+    (round-15 D3): this used to be implementation B of three parallel
+    truth-table copies — it read only the result mirror and lost the
+    non-ChaosBlade L1-skipped override. The verification dict is
+    authoritative for the level (D4); the result mirror stays the
+    fallback for legacy states persisted before the verification dict.
+    """
 
     outcome = read_operation_outcome(values)
     result = outcome.result or {}
     if not isinstance(result, Mapping):
         result = {}
 
+    verification = read_recover_verification(values)
+    verification = verification if isinstance(verification, Mapping) else {}
+    layer1 = verification.get("layer1")
+    layer1_status = layer1.get("status", "") if isinstance(layer1, Mapping) else ""
     is_recovered = bool(result.get("recovered", False))
-    recovery_level = result.get(
+    level = verification.get("level") or result.get(
         "recovery_level",
         "recovered" if is_recovered else "failed",
     )
-    if not is_recovered:
-        return "failed"
-    if recovery_level == "partial":
-        return "partial_recovered"
-    return "recovered"
+    return recovery_task_state_from_level(
+        level,
+        recovered=is_recovered,
+        layer1_status=layer1_status,
+    )
+
+
+# Legacy CLI ``result`` label per terminal recover task_state. "failed" is
+# the legacy label word — round-14 removed it from the RecoverVerdict
+# domain (step-level failure lives in Layer1/Layer2 status); the CLI label
+# contract predates that and keeps the fossil word.
+_RECOVER_LABEL_BY_TASK_STATE = {
+    TaskState.RECOVERED.value: RecoverVerdict.RECOVERED.value,
+    TaskState.PARTIAL_RECOVERED.value: RecoverVerdict.PARTIAL.value,
+    TaskState.UNVERIFIED.value: RecoverVerdict.UNVERIFIED.value,
+    TaskState.FAILED.value: "failed",
+}
 
 
 def recover_result_label_from_values(values: Mapping[str, Any]) -> str:
     """Return the legacy CLI ``result`` label for a recover graph state."""
 
-    outcome = read_operation_outcome(values)
-    result = outcome.result or {}
-    if not isinstance(result, Mapping):
-        return "failed"
-    if not result.get("recovered", False):
-        return "failed"
-    return str(result.get("recovery_level") or "recovered")
+    task_state = recover_task_state_from_values(values)
+    return _RECOVER_LABEL_BY_TASK_STATE.get(task_state, "failed")
 
 
 def build_recover_data_from_state(

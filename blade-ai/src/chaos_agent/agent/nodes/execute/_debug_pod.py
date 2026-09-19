@@ -37,6 +37,52 @@ DEBUG_CONTAINER_NAME = "debugger"
 # Default namespace for debug pods — always exists in any K8s cluster.
 _DEFAULT_DEBUG_NS = "default"
 
+# Fallback image when neither settings nor discovery provides one.
+_DEFAULT_DEBUG_IMAGE = "busybox"
+
+# Container waiting reasons that make a debug pod deterministically dead —
+# no amount of further waiting helps (image cannot be pulled / entrypoint
+# cannot start). Detected during the readiness wait so a doomed candidate is
+# abandoned in seconds instead of burning the full timeout (#23/#28: every
+# doomed busybox pod cost a whole 60s wait).
+_DETERMINISTIC_FAILURE_REASONS = frozenset({
+    "ImagePullBackOff", "ErrImagePull", "InvalidImageName",
+    "CrashLoopBackOff", "CreateContainerConfigError", "CreateContainerError",
+})
+
+
+def _resolve_debug_pod_images() -> list[str]:
+    """Ordered candidate images for framework-created debug pods.
+
+    Priority: explicit ``settings.debug_pod_image`` (manual override — a
+    single candidate, honoured exactly as configured) > every entry of
+    ``settings.recovery_carrier_discovered_images`` in stored order >
+    ``busybox`` (historic default).
+
+    A HEALTHY DaemonSet proves its images are cached on every schedulable
+    node (same proof recovery-carrier relies on), so every discovered
+    candidate pulls without network. What it does NOT prove is that the
+    image can host the ``-- sleep N`` skeleton: discovery is alphabetical
+    (probe merges with ``sorted``) and probe deliberately skips toolchain
+    verification — a Go single-binary DaemonSet image (NPD/CSI/kube-proxy)
+    can rank first while lacking ``sleep`` or overriding the entrypoint so
+    ``--`` args crash on startup. The caller therefore tries candidates in
+    order with fast-fail readiness detection instead of trusting the first
+    (restricted-network reality: first candidate here is
+    ack-node-problem-detector, the known-good terway ranks last).
+    """
+    explicit = str(settings.debug_pod_image or "").strip()
+    if explicit:
+        return [explicit]
+    ordered: list[str] = []
+    for img in str(settings.recovery_carrier_discovered_images or "").split(","):
+        img = img.strip()
+        if img and img not in ordered:
+            ordered.append(img)
+    if _DEFAULT_DEBUG_IMAGE not in ordered:
+        ordered.append(_DEFAULT_DEBUG_IMAGE)
+    return ordered
+
 # Project convention: `kubectl debug node/<node>` names the pod
 # ``node-debugger-<node>-<suffix>``. Used ONLY as a discovery filter (data
 # sources take priority elsewhere); not a creation rule.
@@ -76,8 +122,6 @@ async def discover_created_debug_pod(
     namespace: str,
     created_after_ts: float,
     kubeconfig: str = "",
-    context: str = "",
-    cluster: str = "",
 ) -> str:
     """Live fallback discovery for a debug pod whose name failed to parse.
 
@@ -95,7 +139,7 @@ async def discover_created_debug_pod(
     ns = namespace or _DEFAULT_DEBUG_NS
     cmd = build_kubectl_cmd(
         "get", ["pods", "-n", ns, "-o", "json"],
-        kubeconfig, context, cluster,
+        kubeconfig,
     )
     try:
         result = await execute_via_transport(
@@ -148,8 +192,9 @@ async def discover_created_debug_pod(
     return best_name
 
 
-def parse_debug_pod_info(tool_message_content: str) -> tuple[str, str]:
-    """Extract debug pod name AND namespace from a ToolMessage content block.
+def parse_debug_pod_info(tool_message_content: str) -> tuple[str, str, bool]:
+    """Extract debug pod name, namespace AND tool-cleaned flag from a
+    ToolMessage content block.
 
     The ToolMessage typically contains the full kubectl command invocation
     (with ``-n <namespace>``) followed by the output (containing the pod name).
@@ -157,8 +202,15 @@ def parse_debug_pod_info(tool_message_content: str) -> tuple[str, str]:
     for reliable namespace extraction.
 
     Returns:
-        (pod_name, namespace) tuple. namespace defaults to "default"
-        if not found in the message text.
+        (pod_name, namespace, tool_cleaned) tuple. namespace defaults to
+        "default" if not found in the message text. ``tool_cleaned`` is True
+        ONLY when the ``[debug-pod-meta]`` tag explicitly declares the kubectl
+        tool already removed the pod (the one-shot branch auto-deletes its
+        probe pod and sets ``cleaned: true``) — cleanup scanners must skip
+        those pods or they fire redundant NotFound deletes against a pod
+        that no longer exists (#31: 18 such wasted deletes across inject
+        finalize + recover). The name-pattern fallback path has no meta, so
+        it conservatively returns False (unknown → still cleanable).
     """
     meta_match = re.search(r'\[debug-pod-meta:\s*(\{.*?\})\]', tool_message_content)
     if meta_match:
@@ -176,25 +228,25 @@ def parse_debug_pod_info(tool_message_content: str) -> tuple[str, str]:
         # name-pattern fallback below cannot match (ephemeral debug emits no
         # "Creating debugging pod" banner).
         if metadata.get("ephemeral_container"):
-            return ("", "")
+            return ("", "", False)
         pod_name = str(metadata.get("name") or "")
         namespace = str(metadata.get("namespace") or "")
         if pod_name and namespace:
-            return (pod_name, namespace)
+            return (pod_name, namespace, bool(metadata.get("cleaned")))
 
     pod_name = parse_debug_pod_name(tool_message_content)
     if not pod_name:
-        return ("", "")
+        return ("", "", False)
     # Priority 1: structured tag appended by kubectl tool
     ns_tag = re.search(r'\[debug-pod-ns:\s*(\S+)\]', tool_message_content)
     if ns_tag:
-        return (pod_name, ns_tag.group(1))
+        return (pod_name, ns_tag.group(1), False)
     # Priority 2: -n / --namespace flag in the message text
     ns_match = re.search(r'(?:-n\s+|--namespace[=\s])(\S+)', tool_message_content)
     if ns_match:
-        return (pod_name, ns_match.group(1))
+        return (pod_name, ns_match.group(1), False)
     # Fallback: kubectl default namespace
-    return (pod_name, "default")
+    return (pod_name, "default", False)
 
 
 async def wait_for_debug_pod_ready(
@@ -204,49 +256,101 @@ async def wait_for_debug_pod_ready(
     """Wait for debug pod container to be ready before exec.
 
     kubectl debug returns after creating the Pod object in etcd, NOT after
-    the container is running.  This wait bridges the gap.
-    Best-effort: returns False on timeout, caller still tries exec.
+    the container is running.  This wait bridges the gap.  Best-effort:
+    returns False on timeout.
+
+    The debug pod's command is ``sleep N`` (never exits on its own), so any
+    non-zero restart or a terminal waiting reason means the container is
+    deterministically dead — the image cannot host the skeleton.  That is
+    detected within the first polling window (seconds) instead of burning
+    the whole timeout, which is what lets ``create_and_wait_debug_pod``
+    abandon a doomed image candidate cheaply and try the next one.
     """
     ns = namespace or _DEFAULT_DEBUG_NS
     _target = TransportTarget.from_state({})
-    # Preferred: kubectl wait --for=condition=Ready
+
+    # Combined probe: ready flag | restart count | waiting reason.
+    # The `pod/` prefix is REQUIRED: debug pod names are
+    # `node-debugger-<node>-<suffix>` and kubectl parses a bare first token
+    # as `<resource-type>-...`, e.g. `get node-debugger-cn-sh.foo` -> resource
+    # type "node-debugger-cn-sh" -> "server doesn't have a resource type"
+    # (observed live in task inject-43173315: all Phase A probes returned
+    # empty and fast-fail never fired; only Phase B's prefixed `kubectl wait`
+    # saved the run).
+    status_cmd = build_kubectl_cmd("get", [
+        f"pod/{pod_name}", "-n", ns,
+        "-o", "jsonpath={.status.containerStatuses[0].ready}"
+              "|{.status.containerStatuses[0].restartCount}"
+              "|{.status.containerStatuses[0].state.waiting.reason}",
+    ], kubeconfig=kubeconfig)
+
+    async def _probe() -> list[str]:
+        try:
+            result = await execute_via_transport(
+                status_cmd, _target, timeout=settings.timeout_kubectl,
+                task_id=task_id, expect_profile=PROFILE_K8S,
+            )
+        except (ToolGuardError, ToolTimeoutError):
+            return ["", "", ""]
+        return (result.stdout or "").strip().split("|") + ["", "", ""]
+
+    def _dead(parts: list[str]) -> str | None:
+        if len(parts) > 2 and parts[2] in _DETERMINISTIC_FAILURE_REASONS:
+            return parts[2]
+        # sleep-only skeleton: a restart implies the container already died
+        # once (entrypoint crash) — waiting for the next backoff cycle buys
+        # nothing.
+        if len(parts) > 1 and parts[1].isdigit() and int(parts[1]) >= 1:
+            return f"restartCount={parts[1]}"
+        return None
+
+    # Phase A — fast-fail window: catch ready success and deterministic
+    # failures within seconds of creation (scheduling + image start).
+    for _ in range(4):
+        await asyncio.sleep(3)
+        parts = await _probe()
+        if parts and parts[0] == "true":
+            return True
+        reason = _dead(parts)
+        if reason:
+            logger.warning(
+                "Debug pod %s failed deterministically (%s), not waiting further",
+                pod_name, reason,
+            )
+            return False
+
+    # Phase B — still transiently Pending/ContainerCreating (no failure
+    # signal): delegate the remainder to one long kubectl wait (fewest API
+    # calls for the slow-scheduling case).
+    remaining = max(timeout - 12, 5)
     wait_cmd = build_kubectl_cmd("wait", [
         "--for=condition=Ready", f"pod/{pod_name}",
-        "-n", ns, f"--timeout={timeout}s",
+        "-n", ns, f"--timeout={remaining}s",
     ], kubeconfig=kubeconfig)
     try:
         result = await execute_via_transport(
-            wait_cmd, _target, timeout=timeout + 10, task_id=task_id,
+            wait_cmd, _target, timeout=remaining + 10, task_id=task_id,
             expect_profile=PROFILE_K8S,
         )
         if result.exit_code == 0:
             return True
     except (ToolGuardError, ToolTimeoutError):
         logger.info(
-            "kubectl wait blocked/timed out, falling back to polling for %s",
+            "kubectl wait blocked/timed out for %s, doing a final probe",
             pod_name,
         )
 
-    # Fallback: poll container ready status
-    for _ in range(6):
-        await asyncio.sleep(2)
-        check_cmd = build_kubectl_cmd("get", [
-            pod_name, "-n", ns,
-            "-o", "jsonpath={.status.containerStatuses[0].ready}",
-        ], kubeconfig=kubeconfig)
-        try:
-            check_result = await execute_via_transport(
-                check_cmd, _target, timeout=settings.timeout_kubectl, task_id=task_id,
-                expect_profile=PROFILE_K8S,
-            )
-            if check_result.stdout.strip() == "true":
-                return True
-        except (ToolGuardError, ToolTimeoutError):
-            continue
-
-    logger.warning(
-        "Debug pod %s not ready after wait, will try exec anyway", pod_name,
-    )
+    # Phase C — the long wait covers neither: a pod that flipped to a
+    # terminal state while we were waiting.
+    parts = await _probe()
+    if parts and parts[0] == "true":
+        return True
+    reason = _dead(parts)
+    if reason:
+        logger.warning(
+            "Debug pod %s failed deterministically after wait (%s)",
+            pod_name, reason,
+        )
     return False
 
 
@@ -312,51 +416,81 @@ async def create_and_wait_debug_pod(
         logger.warning("No accessible namespace found for debug pod creation")
         return None
 
-    debug_cmd = build_kubectl_cmd("debug", [
-        f"node/{node_name}", "-n", ns,
-        "--image=busybox", "--", "sleep", "3600",
-    ], kubeconfig=kubeconfig)
-    _target = TransportTarget.from_state({})
-    try:
-        debug_result = await execute_via_transport(
-            debug_cmd, _target, timeout=settings.timeout_kubectl_exec, task_id=task_id,
-            expect_profile=PROFILE_K8S,
-        )
-    except (ToolGuardError, ToolTimeoutError) as e:
-        logger.warning(
-            "Failed to create debug pod for node %s: %s", node_name, e,
-        )
-        return None
-    except Exception as e:
-        logger.warning(
-            "Failed to create debug pod for node %s: %s", node_name, e,
-        )
-        return None
+    # Try image candidates in order (explicit config > discovered > busybox)
+    # with fast-fail readiness detection: a candidate that cannot host the
+    # sleep skeleton (missing sleep binary / entrypoint crash / unpullable)
+    # is abandoned in seconds and cleaned up, then the next candidate runs.
+    # Deterministic-order discovery is alphabetical, so the known-good image
+    # may rank last — the retry loop is what makes the chain reliable.
+    #
+    # ``--profile=sysadmin`` (B49): the executor-phase LLM path already
+    # creates sysadmin debug pods, and read-only host-level probes (iptables
+    # reads, nsenter into host namespaces) REQUIRE that privilege level — a
+    # bare debug container fails them deterministically ("Permission denied
+    # (you must be root)", case #33 baseline). One "debug pod" concept, one
+    # capability level: probes are still content-gated by the readonly
+    # classifier; privilege only widens which read-only shapes CAN run.
+    for image in _resolve_debug_pod_images():
+        debug_cmd = build_kubectl_cmd("debug", [
+            f"node/{node_name}", "-n", ns,
+            f"--image={image}", "--profile=sysadmin", "--", "sleep", "3600",
+        ], kubeconfig=kubeconfig)
+        _target = TransportTarget.from_state({})
+        try:
+            debug_result = await execute_via_transport(
+                debug_cmd, _target, timeout=settings.timeout_kubectl_exec,
+                task_id=task_id, expect_profile=PROFILE_K8S,
+            )
+        except (ToolGuardError, ToolTimeoutError) as e:
+            logger.warning(
+                "Failed to create debug pod with image %s on node %s: %s",
+                image, node_name, e,
+            )
+            continue
+        except Exception as e:
+            logger.warning(
+                "Failed to create debug pod with image %s on node %s: %s",
+                image, node_name, e,
+            )
+            continue
 
-    if debug_result.exit_code != 0:
-        logger.warning(
-            "Failed to create debug pod for node %s: %s",
-            node_name, debug_result.stderr[:200],
-        )
-        return None
+        if debug_result.exit_code != 0:
+            logger.warning(
+                "Failed to create debug pod with image %s on node %s: %s",
+                image, node_name, debug_result.stderr[:200],
+            )
+            continue
 
-    pod_name = parse_debug_pod_name(debug_result.stdout)
-    if not pod_name:
-        logger.warning(
-            "Failed to parse debug pod name from: %s",
-            debug_result.stdout[:200],
-        )
-        return None
+        pod_name = parse_debug_pod_name(debug_result.stdout)
+        if not pod_name:
+            # Parse failure is image-INDEPENDENT (kubectl output shape), so
+            # retrying other candidates would only leak additional
+            # unparseable (hence uncleanable) pods — one per candidate.
+            # Bail out with the historic single-failure semantics instead.
+            logger.warning(
+                "Failed to parse debug pod name from: %s",
+                debug_result.stdout[:200],
+            )
+            break
 
-    # A created but unready pod is not an execution carrier. Clean it up now so
-    # callers cannot accidentally exec into an ImagePullBackOff artifact.
-    ready = await wait_for_debug_pod_ready(
-        pod_name, kubeconfig, task_id, namespace=ns,
-    )
-    if not ready:
+        # A created but unready pod is not an execution carrier. Clean it up
+        # so callers cannot accidentally exec into a dead artifact, then try
+        # the next image candidate.
+        ready = await wait_for_debug_pod_ready(
+            pod_name, kubeconfig, task_id, namespace=ns,
+        )
+        if ready:
+            return (pod_name, ns)
         await delete_debug_pod(pod_name, kubeconfig, task_id, namespace=ns)
-        return None
-    return (pod_name, ns)
+        logger.warning(
+            "Debug pod image %s not ready on node %s, trying next candidate",
+            image, node_name,
+        )
+    logger.warning(
+        "No debug pod image candidate could host the sleep skeleton on node %s",
+        node_name,
+    )
+    return None
 
 
 async def delete_debug_pod(

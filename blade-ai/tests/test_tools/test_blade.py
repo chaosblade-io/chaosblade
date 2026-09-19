@@ -50,6 +50,22 @@ class TestBuildKubeconfigArg:
 class TestBladeCreate:
     """Test blade_create tool function."""
 
+    def test_docstring_claims_no_timeout_boost(self):
+        # inject-aac02265 (#35 round audit): the blade_create docstring
+        # taught "--timeout auto-injected/boosted to ≥600s; may lengthen,
+        # not shorten" — false on both counts: the boost policy is gone
+        # (ensure_min_duration honours explicit values verbatim) and the
+        # floor was never 600s post-adjustment. The purge directive: no
+        # LLM-facing surface may teach raise-the-floor semantics.
+        from chaos_agent.agent.providers.chaosblade.cli_python import (
+            blade_python_create,
+        )
+
+        for doc in (blade_create.__doc__, blade_python_create.__doc__):
+            assert "boosted" not in doc
+            assert "≥600s" not in doc
+            assert "may lengthen" not in doc
+
     async def test_successful_create(self, mock_run_command):
         result = await blade_create.ainvoke({
             "scope": "pod",
@@ -614,3 +630,104 @@ class TestBladeQueryK8s:
         assert "blade_status" in out
         assert "host-scope" in out
         mock_run_command.assert_not_called()
+
+
+class TestBladeCreateUncertainMarker:
+    """Outcome-uncertainty marking — the create-reconcile gate contract.
+
+    Four return paths of blade_create split by outcome certainty:
+    transport exception / no-UID transient error → uncertain marker;
+    no-UID terminal error / success / uid-in-error → no marker.
+    """
+
+    def _patch_transport(self, mocker, side_effect=None, return_value=None):
+        import chaos_agent.agent.providers.chaosblade.cli as blade_mod
+        from chaos_agent.tools.guard import CommandResult
+        mocker.patch.object(blade_mod, "_get_blade_path", return_value="blade")
+
+        if side_effect is not None:
+            async def _raise(cmd, *a, **kw):
+                raise side_effect
+            mock = mocker.patch.object(blade_mod, "execute_via_transport", side_effect=_raise)
+        else:
+            async def _ret(cmd, *a, **kw):
+                return return_value
+            mock = mocker.patch.object(blade_mod, "execute_via_transport", side_effect=_ret)
+        return mock
+
+    async def test_transport_exception_marks_uncertain(self, mocker):
+        from chaos_agent.agent.providers.chaosblade.cli import UNCERTAIN_OUTCOME_MARKER
+        self._patch_transport(mocker, side_effect=RuntimeError("wiz channel timeout after 30s"))
+        result = await blade_create.ainvoke({
+            "scope": "pod", "target": "cpu", "action": "fullload",
+            "namespace": "cms-demo", "names": "app-1", "labels": "",
+            "kubeconfig": "", "evict_count": "", "evict_percent": "", "flags": "",
+        })
+        assert UNCERTAIN_OUTCOME_MARKER in result
+        # Guidance present, no bare Error (assert neither success nor failure)
+        assert "UNKNOWN" in result
+        assert "Reconcile FIRST" in result
+        assert "DUPLICATE" in result
+
+    async def test_no_uid_transient_error_marks_uncertain(self, mocker):
+        from chaos_agent.tools.guard import CommandResult
+        from chaos_agent.agent.providers.chaosblade.cli import UNCERTAIN_OUTCOME_MARKER
+        self._patch_transport(mocker, return_value=CommandResult(
+            exit_code=1, stdout="", stderr="dial tcp: connection refused",
+            duration_ms=50.0,
+        ))
+        result = await blade_create.ainvoke({
+            "scope": "pod", "target": "cpu", "action": "fullload",
+            "namespace": "", "names": "", "labels": "",
+            "kubeconfig": "", "evict_count": "", "evict_percent": "", "flags": "",
+        })
+        assert UNCERTAIN_OUTCOME_MARKER in result
+        # Original error line preserved before the marker block
+        assert "blade create failed (exit 1)" in result
+        assert "connection refused" in result
+
+    async def test_no_uid_terminal_error_has_no_marker(self, mocker):
+        from chaos_agent.tools.guard import CommandResult
+        from chaos_agent.agent.providers.chaosblade.cli import UNCERTAIN_OUTCOME_MARKER
+        self._patch_transport(mocker, return_value=CommandResult(
+            exit_code=1, stdout="", stderr="unknown flag: --no-such-flag",
+            duration_ms=50.0,
+        ))
+        result = await blade_create.ainvoke({
+            "scope": "pod", "target": "cpu", "action": "fullload",
+            "namespace": "", "names": "", "labels": "",
+            "kubeconfig": "", "evict_count": "", "evict_percent": "", "flags": "",
+        })
+        # Deterministic failure: plain error, zero gate interception later
+        assert UNCERTAIN_OUTCOME_MARKER not in result
+        assert result.startswith("Error: blade create failed (exit 1)")
+
+    async def test_uid_in_error_path_unchanged_no_marker(self, mocker):
+        from chaos_agent.tools.guard import CommandResult
+        from chaos_agent.agent.providers.chaosblade.cli import UNCERTAIN_OUTCOME_MARKER
+        uid = "aabbccddeeff0011"
+        self._patch_transport(mocker, return_value=CommandResult(
+            exit_code=1,
+            stdout=f'{{"code":63061,"success":false,"uid":"{uid}"}}',
+            stderr="", duration_ms=50.0,
+        ))
+        result = await blade_create.ainvoke({
+            "scope": "pod", "target": "cpu", "action": "fullload",
+            "namespace": "", "names": "", "labels": "",
+            "kubeconfig": "", "evict_count": "", "evict_percent": "", "flags": "",
+        })
+        # UID known → outcome NOT uncertain → existing POLL guidance only
+        assert UNCERTAIN_OUTCOME_MARKER not in result
+        assert uid in result
+        assert "POLL" in result or "REPLAN" in result
+
+    async def test_success_has_no_marker(self, mock_run_command):
+        from chaos_agent.agent.providers.chaosblade.cli import UNCERTAIN_OUTCOME_MARKER
+        result = await blade_create.ainvoke({
+            "scope": "pod", "target": "network", "action": "delay",
+            "namespace": "", "names": "", "labels": "",
+            "kubeconfig": "", "evict_count": "", "evict_percent": "",
+            "flags": "",
+        })
+        assert "abc123" in result
+        assert UNCERTAIN_OUTCOME_MARKER not in result

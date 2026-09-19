@@ -73,8 +73,9 @@ fio --name=iomix --filename=<path>/io_mix_file --rw=readwrite --bs=1M --size=1G 
 # --runtime 到期后 fio 自行退出，正常路径无需干预；只需回收测试文件占用的空间
 truncate -s 0 <path>/io_burn_file <path>/io_read_file <path>/io_mix_file
 
-# 如需提前终止：先取 PID 再杀
-pgrep -f fio
+# 如需提前终止：先取 PID 再杀（必须 -x 按进程名精确匹配；-f 会把携带 fio 字符串的
+# 执行 shell 一并匹配，拿输出去 kill 会误杀执行 shell，同款陷阱见「文件句柄耗尽」case）
+pgrep -x fio
 kill <pid>
 ```
 

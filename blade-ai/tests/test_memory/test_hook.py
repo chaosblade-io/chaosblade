@@ -36,6 +36,196 @@ class TestPreReasoningHookNoCompaction:
         assert result == {}
 
 
+class TestPreReasoningHookCompactionNeverBlocks:
+    """issue #1347 defence-in-depth: tool-output compaction is a
+    best-effort optimisation — its failure must never propagate out of
+    the hook (an unguarded exception at the ``await hook(state)`` graph
+    node aborts the whole session; the compactor's own smart-strip bug
+    used to ride exactly this path)."""
+
+    async def test_compaction_exception_swallowed_messages_preserved(self, caplog):
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["msg1"], True)  # no compaction needed
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.side_effect = RuntimeError("compactor exploded")
+
+        hook = PreReasoningHook(
+            context_manager=cm,
+            tool_compactor=tc,
+            session_store=MagicMock(),
+        )
+
+        state = {"messages": ["msg1"], "task_id": "t1"}
+        with caplog.at_level("WARNING", logger="chaos_agent.memory.hook"):
+            # The old code let the RuntimeError propagate: session dead.
+            result = await hook(state)
+
+        assert result == {}  # no-compaction branch reached — hook survived
+        assert any(
+            "compaction failed" in r.message for r in caplog.records
+        ), "the swallow must be observable, not silent"
+
+
+class TestPreReasoningHookPipelineNeverRaises:
+    """Round-35 C1-C3: every unguarded step of the memory pipeline
+    (context check, metric extraction, observation update — the steps
+    after the round-33 compaction guard) must not propagate out of
+    ``__call__``: nine bare ``await hook(state)`` graph call sites mean
+    any raise aborts the session. Class-level containment: the body
+    (``_manage``) still raises under direct invocation so unit tests
+    surface bugs."""
+
+    async def test_check_context_failure_contained(self):
+        cm = MagicMock()
+        cm.check_context.side_effect = RuntimeError("ctx boom")
+        tc = MagicMock()
+        tc.compact.side_effect = lambda msgs, **kw: msgs
+        hook = PreReasoningHook(context_manager=cm, tool_compactor=tc,
+                                session_store=MagicMock())
+        result = await hook({"messages": ["msg1"], "task_id": "t1"})
+        assert result == {}
+
+    async def test_metric_extraction_failure_contained(self, monkeypatch):
+        def _boom(messages):
+            raise RuntimeError("extract boom")
+
+        monkeypatch.setattr(
+            "chaos_agent.memory.hook._extract_tool_metrics", _boom
+        )
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["msg1"], True)
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.side_effect = lambda msgs, **kw: msgs
+        hook = PreReasoningHook(context_manager=cm, tool_compactor=tc,
+                                session_store=MagicMock())
+        result = await hook({"messages": ["msg1"], "task_id": "t1"})
+        assert result == {}
+
+    async def test_observation_update_failure_contained(self):
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["msg1"], True)
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.side_effect = lambda msgs, **kw: msgs
+        hook = PreReasoningHook(context_manager=cm, tool_compactor=tc,
+                                session_store=MagicMock())
+
+        def _boom(messages, state):
+            raise RuntimeError("obs boom")
+
+        hook._build_observation_update = _boom
+        result = await hook({"messages": ["msg1"], "task_id": "t1"})
+        assert result == {}
+
+    async def test_pipeline_body_still_raises_under_direct_call(self):
+        """The containment lives in ``__call__``, not the body: direct
+        ``_manage`` invocations (unit tests) still surface bugs instead
+        of swallowing them."""
+        import pytest
+
+        cm = MagicMock()
+        cm.check_context.side_effect = RuntimeError("ctx boom")
+        tc = MagicMock()
+        tc.compact.side_effect = lambda msgs, **kw: msgs
+        hook = PreReasoningHook(context_manager=cm, tool_compactor=tc,
+                                session_store=MagicMock())
+        with pytest.raises(RuntimeError):
+            await hook._manage({"messages": ["msg1"], "task_id": "t1"})
+
+
+class TestPreReasoningHookParseFamilyFallback:
+    """Round-37 hook-level anchor: a lone-surrogate payload (accepted
+    by json.loads, rejected by the strict encoder) must be HONESTLY
+    truncated through the fallback — the hook survives AND the message
+    is compacted (not skipped). The round-35 class-level containment
+    is the last line of defence, not the intended path for a known
+    input shape: pre-fix, this payload raised every turn and rode the
+    containment (repeat warnings, no truncation, context growth)."""
+
+    async def test_surrogate_payload_compacted_via_fallback(self):
+        from chaos_agent.memory.tool_compactor import ToolResultCompactor
+
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["m"], True)
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        hook = PreReasoningHook(
+            context_manager=cm,
+            tool_compactor=ToolResultCompactor(cache_dir=None),  # real
+            session_store=MagicMock(),
+        )
+        payload = ('{"kind":"PodList","pad":"' + "x" * 20000
+                   + '","items":[{"kind":"Pod","metadata":{"name":"\\ud800"}}]}')
+        tm = ToolMessage(content=payload, tool_call_id="c0", id="t0")
+        result = await hook({
+            "messages": [HumanMessage(content="hi", id="h0"), tm],
+            "task_id": "t1",
+        })
+        assert result == {}  # no-compaction branch reached normally
+        assert tm.content != payload  # fallback truncated it (not skipped)
+        assert "TRUNCATED" in tm.content
+        assert len(tm.content.encode("utf-8", errors="replace")) <= 16 * 1024
+
+
+class TestPreReasoningHookCacheBestEffort:
+    """Round-39 hook-level anchor: a RAW lone surrogate (the character
+    itself in message content, not the \\udXXX escape form) with the
+    disk cache ENABLED used to blow the strict cache write on
+    compact()'s mandatory path — the r33 guard kept the session alive
+    but the message was never truncated: retried every turn, repeat
+    warnings, orphaned cache files per attempt. With the cache
+    best-effort, the hook compacts honestly on the FIRST turn and no
+    containment layer fires at all — this is the intended path, not a
+    contained failure."""
+
+    async def test_raw_surrogate_with_cache_compacts_first_turn(
+        self, tmp_path, caplog
+    ):
+        from chaos_agent.memory.tool_compactor import ToolResultCompactor
+
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["m"], True)
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        hook = PreReasoningHook(
+            context_manager=cm,
+            tool_compactor=ToolResultCompactor(cache_dir=tmp_path / "cache"),
+            session_store=MagicMock(),
+        )
+        raw = "kubectl stdout with a raw byte [\ud800] then padding " + "x" * 20000
+        tm = ToolMessage(content=raw, tool_call_id="c0", id="t0")
+        with caplog.at_level("WARNING", logger="chaos_agent.memory.hook"):
+            result1 = await hook({
+                "messages": [HumanMessage(content="hi", id="h0"), tm],
+                "task_id": "t39",
+            })
+            result2 = await hook({
+                "messages": [HumanMessage(content="hi", id="h0"), tm],
+                "task_id": "t39",
+            })
+
+        # Both turns reach the normal no-compaction branch — alive.
+        assert result1 == {} and result2 == {}
+        # Compacted, not skipped: honest truncation, surrogate replaced.
+        assert "TRUNCATED" in tm.content
+        assert "\ud800" not in tm.content
+        assert len(tm.content.encode("utf-8", errors="replace")) <= 16 * 1024
+        # No containment fired — neither the r33 compact guard nor the
+        # round-35 class-level last line of defence.
+        assert not any(
+            "Tool output compaction failed" in r.message
+            or "Pre-reasoning memory pipeline failed" in r.message
+            for r in caplog.records
+        )
+        # Exactly one cache artifact — not one orphan per failed turn.
+        assert len(list((tmp_path / "cache").glob("*.txt"))) == 1
+
+
 class TestPreReasoningHookWithCompaction:
     """Test hook when compaction is triggered."""
 
@@ -260,7 +450,9 @@ class TestPreReasoningHookStrippedReturn:
         assert stripped.id == "big-tool"
         # Content was actually truncated (< original 4000 chars).
         assert len(stripped.content) < 4000
-        assert "[output truncated]" in stripped.content
+        # Quantified elision marker (shared dialect) replaces the old
+        # unquantified "[output truncated]" string.
+        assert "chars elided" in stripped.content
 
 
 class TestPreReasoningHookCircuitBreaker:
@@ -638,3 +830,253 @@ class TestBudgetWarning:
 
         msg_ids = [getattr(m, "id", None) for m in result["messages"]]
         assert "hint:context:budget" not in msg_ids
+
+
+HEX16 = "deadbeef00000001"
+
+
+def _create_pair(uid: str = HEX16, tc_id: str = "tc-death-c") -> list:
+    """A proven create: AIMessage tool_call + paired success receipt."""
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "blade_create",
+                    "args": {"command": "create k8s pod-cpu fullload"},
+                    "id": tc_id,
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content='{"code":200,"success":true,"result":"%s"}' % uid,
+            name="blade_create",
+            tool_call_id=tc_id,
+        ),
+    ]
+
+
+def _destroy_pair(uid: str = HEX16, tc_id: str = "tc-death-d") -> list:
+    """A proven destroy: AIMessage tool_call naming the uid + paired
+    success receipt — the ONLY death evidence an LLM-issued destroy
+    ever produces."""
+    return [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "blade_destroy",
+                    "args": {"uid": uid},
+                    "id": tc_id,
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content='{"code":200,"success":true,"result":"success"}',
+            name="blade_destroy",
+            tool_call_id=tc_id,
+        ),
+    ]
+
+
+class TestPreReasoningHookDeathAbsorption:
+    """K1/K2 root-cause fix: the hook durable-registers proven destroys
+    BEFORE compaction can summarise their only evidence away.
+
+    The execute loop's registration seam covers the execute graph only;
+    the recover graph's own LLM loops (in-cluster exec delivery routes
+    through the LLM-driven Layer 1) had no seam, so the ledger stayed
+    empty while the evidence lived on in messages — until the first
+    compaction boundary destroyed it and every later consumer asserted
+    the dead experiment ACTIVE forever. The hook is the one choke point
+    every LLM loop passes through pre-compaction; these lock the
+    absorption semantics, the full-view write convention and the
+    idempotence, not the log wording.
+    """
+
+    async def test_absorbs_proven_destroy_into_ledger(self, mock_llm):
+        # No-compaction route (the common steady-state turn): the death
+        # must still land — every return branch carries the absorption.
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["m"], True)
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.return_value = ["m"]
+
+        hook = PreReasoningHook(cm, tc, MagicMock(), mock_llm)
+        result = await hook({
+            "messages": _create_pair() + _destroy_pair(),
+            "task_id": "task-death",
+            "retired_experiment_uids": [],
+        })
+
+        assert result.get("retired_experiment_uids") == [HEX16]
+
+    async def test_full_view_merges_existing_ledger(self, mock_llm):
+        # last-write-wins field: the write must be the MERGED view, not
+        # the fresh scan alone — otherwise this hook would clobber deaths
+        # another seam already registered.
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["m"], True)
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.return_value = ["m"]
+
+        hook = PreReasoningHook(cm, tc, MagicMock(), mock_llm)
+        result = await hook({
+            "messages": _destroy_pair("feedbeef00000002", "tc-death-d2"),
+            "task_id": "task-death-merge",
+            "retired_experiment_uids": [HEX16],
+        })
+
+        assert result.get("retired_experiment_uids") == [
+            HEX16, "feedbeef00000002",
+        ]
+
+    async def test_idempotent_when_ledger_knows_everything(self, mock_llm):
+        # Steady state after one absorption: no state diff at all (the
+        # key must be absent, not an equal-value rewrite).
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["m"], True)
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.return_value = ["m"]
+
+        hook = PreReasoningHook(cm, tc, MagicMock(), mock_llm)
+        result = await hook({
+            "messages": _create_pair() + _destroy_pair(),
+            "task_id": "task-death-idem",
+            "retired_experiment_uids": [HEX16],
+        })
+
+        assert "retired_experiment_uids" not in result
+
+    async def test_no_destroy_evidence_writes_nothing(self, mock_llm):
+        # A live create receipt alone must NOT retire anything — doubt is
+        # not death (the fail-closed birth side of the ledger doctrine).
+        cm = MagicMock()
+        cm.check_context.return_value = ([], ["m"], True)
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.return_value = ["m"]
+
+        hook = PreReasoningHook(cm, tc, MagicMock(), mock_llm)
+        result = await hook({
+            "messages": _create_pair(),
+            "task_id": "task-death-live",
+        })
+
+        assert "retired_experiment_uids" not in result
+
+    async def test_scan_reads_kept_tail_not_just_doomed_slice(self, mock_llm):
+        # K2 window: the destroy output sits AFTER the doomed slice (the
+        # destroying iteration's own turn) — the compaction filters only
+        # ever saw the doomed slice's create receipt. The absorption must
+        # read the FULL message list, and must fire on the strip route
+        # too (its return branch carries the update like every other).
+        doomed = _create_pair()
+        kept = _destroy_pair()
+        messages = doomed + kept
+        cm = MagicMock()
+        cm.check_context.return_value = (list(doomed), list(kept), True)
+        cm.compact_threshold = 10_000_000  # strip result fits → strip route
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.return_value = messages
+
+        hook = PreReasoningHook(cm, tc, MagicMock(), mock_llm)
+        result = await hook({
+            "messages": messages,
+            "task_id": "task-death-k2",
+            "retired_experiment_uids": [],
+        })
+
+        assert result.get("retired_experiment_uids") == [HEX16]
+
+    def test_merge_hook_updates_passes_retired_through(self):
+        # The recover graph's Layer-2 timeout/error exits merge hook
+        # updates with plain key overwrite — the retired key must ride
+        # that exact path into the node result.
+        from chaos_agent.memory.hook import merge_hook_updates
+
+        result = {"verifier_loop_count": 3, "messages": ["resp"]}
+        merged = merge_hook_updates(
+            result,
+            {"retired_experiment_uids": [HEX16], "messages": ["strip"]},
+        )
+
+        assert merged["retired_experiment_uids"] == [HEX16]
+        # Non-retired merge semantics unchanged: hook messages precede
+        # the node's own (RemoveMessages first, then appends).
+        assert merged["messages"] == ["strip", "resp"]
+
+
+class TestBoundaryTurnSurvivalContext:
+    """Round-24 R1: the boundary turn's survival context must consume
+    the FRESH ledger — the absorption (retired_update) merges into the
+    hook's RETURN, but compact_memory runs INSIDE the hook, one merge
+    earlier; handing it the pre-absorption state resurrected the
+    proven-dead uid as "Active experiment_uid" in the recovery message
+    of the very turn the absorption was supposed to protect."""
+
+    async def test_boundary_turn_summary_carries_no_dead_uid(self, mock_llm):
+        # The K2 shape on the LLM-compaction route: create pair DOOMED
+        # (inside the window), destroy pair KEPT (in the tail), ledger
+        # empty at entry. The absorption retires the uid in THIS hook's
+        # return; the survival context built one step earlier must see
+        # the merged view and carry NO active uid.
+        doomed = _create_pair()
+        kept = _destroy_pair()
+        cm = MagicMock()
+        cm.check_context.return_value = (list(doomed), list(kept), True)
+        cm.compact_threshold = 0  # force the LLM compaction route
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.return_value = doomed + kept
+
+        hook = PreReasoningHook(cm, tc, MagicMock(), mock_llm)
+        result = await hook({
+            "messages": doomed + kept,
+            "task_id": "task-r24-boundary",
+            "experiment_uid": HEX16,  # never cleared on destroy
+            "retired_experiment_uids": [],  # pre-absorption ledger
+        })
+
+        assert "Active experiment_uid" not in (
+            result.get("compressed_summary") or ""
+        )
+        # The absorption itself still rides the return (the graph merge
+        # stays the authority — the fix only refreshed the LOCAL view).
+        assert result.get("retired_experiment_uids") == [HEX16]
+
+    async def test_live_experiment_summary_still_carries_uid(self, mock_llm):
+        # Control: a genuinely live experiment (no destroy anywhere) on
+        # the same route still surfaces the uid — the boundary fix must
+        # not over-fire.
+        doomed = _create_pair()
+        kept = [HumanMessage(content="checking status")]
+        cm = MagicMock()
+        cm.check_context.return_value = (list(doomed), list(kept), True)
+        cm.compact_threshold = 0
+        cm.max_tokens = 128_000
+        cm.compact_ratio = 0.8
+        tc = MagicMock()
+        tc.compact.return_value = doomed + kept
+
+        hook = PreReasoningHook(cm, tc, MagicMock(), mock_llm)
+        result = await hook({
+            "messages": doomed + kept,
+            "task_id": "task-r24-live",
+            "experiment_uid": HEX16,
+            "retired_experiment_uids": [],
+        })
+
+        assert "Active experiment_uid" in (result.get("compressed_summary") or "")

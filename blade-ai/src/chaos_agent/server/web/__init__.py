@@ -51,6 +51,7 @@ class SPAStaticFiles(StaticFiles):
                 and not scope_path.startswith("/api/")
                 and "." not in path.rsplit("/", 1)[-1]
             ):
+                # abort-safe: see invariants allowlist
                 return await super().get_response("index.html", scope)
             raise
 

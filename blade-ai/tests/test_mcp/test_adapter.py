@@ -180,3 +180,48 @@ class TestMakeLangchainTool:
         # asyncio.wait_for(..., timeout=0) raises immediately
         result = await tool.coroutine()
         assert "tool timeout" in result.lower()
+
+
+class TestEffectHintInDescription:
+    """Posture B: the resolved read/write label is appended to the tool
+    description so the LLM sees it. Advisory only — no gating."""
+
+    def _tool(self, effect=None, description="reads a file"):
+        client = MagicMock()
+        client.name = "fs"
+        client.call_tool = AsyncMock(return_value="ok")
+        desc = McpToolDescriptor(
+            name="read", description=description, input_schema={"type": "object"},
+        )
+        if effect is None:
+            return make_langchain_tool(client, desc, timeout_seconds=30)
+        return make_langchain_tool(client, desc, timeout_seconds=30, effect=effect)
+
+    def test_destructive_hint_appended(self):
+        tool = self._tool(effect="destructive")
+        assert tool.description.startswith("reads a file")
+        assert "DESTRUCTIVE" in tool.description
+        assert "not gated" in tool.description
+
+    def test_readonly_hint_appended(self):
+        tool = self._tool(effect="readonly")
+        assert "read-only" in tool.description
+        assert "DESTRUCTIVE" not in tool.description
+
+    def test_unspecified_hint_appended(self):
+        tool = self._tool(effect="unspecified")
+        assert "unspecified" in tool.description
+
+    def test_default_effect_is_unspecified(self):
+        # No effect passed → same as unspecified (backward-compatible call).
+        tool = self._tool(effect=None)
+        assert "unspecified" in tool.description
+
+    def test_unknown_effect_value_falls_back_to_unspecified(self):
+        tool = self._tool(effect="totally-bogus")
+        assert "unspecified" in tool.description
+
+    def test_empty_description_still_gets_hint(self):
+        tool = self._tool(effect="destructive", description="")
+        assert tool.description.startswith("MCP tool fs__read")
+        assert "DESTRUCTIVE" in tool.description

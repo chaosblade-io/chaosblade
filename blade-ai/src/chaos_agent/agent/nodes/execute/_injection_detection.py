@@ -149,6 +149,8 @@ def build_injection_step_selfcheck(
     skill_case: str,
     messages: list,
     injection_method: str | None,
+    *,
+    is_teardown=None,
 ) -> str | None:
     """HIGH-TOLERANCE step-skip detection → SOFT, one-shot reminder, or ``None``.
 
@@ -169,6 +171,13 @@ def build_injection_step_selfcheck(
     host injection binaries for host_native; experiment-UID carriers do not
     claim the hook (completion is judged by the experiment evidence chain,
     the UID — the D4 narrowing, pinned by golden tests).
+
+    Teardown≠step-credit (O-3, P3): thread the ``is_teardown`` matcher
+    (``execution_artifacts.make_teardown_matcher``) and a
+    registered-vehicle teardown delete's receipt credits NO step verb —
+    at call granularity, so a MIXED batch (teardown delete + read-only
+    call) no longer keeps the whole message's teardown credit. ``None``
+    (the default) is RAW credit (test fixtures).
     """
     if not skill_case:
         return None
@@ -195,7 +204,7 @@ def build_injection_step_selfcheck(
     scan_hook = getattr(provider, "scan_step_actions", None) if provider else None
     if scan_hook is None:
         return None
-    scan = scan_hook(action_steps, messages)
+    scan = scan_hook(action_steps, messages, is_teardown=is_teardown)
     if scan is None:
         return None
     required = scan.required

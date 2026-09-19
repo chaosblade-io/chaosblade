@@ -143,7 +143,7 @@ def _phase_specs(skill_tools) -> tuple[PhaseSpec, ...]:
     _execute_skill_script = _by_name["execute_skill_script"]
 
     from chaos_agent.agent.nodes.planning.intent_clarification import submit_fault_intent, submit_batch_intent, query_active_experiments, recover_task
-    from chaos_agent.tools.progress import update_progress  # progress ledger (all ReAct phases)
+    from chaos_agent.tools.progress import update_progress, finish_execution  # progress ledger (all ReAct phases)
     from chaos_agent.tools.wait import time_wait
     from chaos_agent.agent.replan import request_replan
     from chaos_agent.agent.nodes.verify._verifier_submit import submit_verification, submit_recover_verification
@@ -155,10 +155,26 @@ def _phase_specs(skill_tools) -> tuple[PhaseSpec, ...]:
             static_base=(
                 _activate_skill,
                 _read_skill_resource,
+                # Read access to the knowledge docs — the same tool every
+                # other ReAct phase binds. The intent prompt injects the
+                # plan-phase knowledge index whose key entry is
+                # outcome-to-means.md: without this binding the index row is
+                # a dead link and outcome-stated requests fall back to
+                # lexical catalogue matching (trace sess_4b696f566f23).
+                read_knowledge_resource,
                 submit_fault_intent,
                 submit_batch_intent,
                 query_active_experiments,
                 recover_task,
+                # Intent-time fact recording: when the model probes the target
+                # during clarification, update_progress is how it logs what it
+                # established (identity / node / process / restartPolicy /
+                # causal insight) at probe time. The intent prompt teaches
+                # calling it IN PARALLEL with the next probe, so it costs no
+                # extra LLM round-trip. The ledger it writes is carried to the
+                # planner by the existing ledger re-injection chain; the probe
+                # snapshot harvester reads the same tool_call args back later.
+                update_progress,
             ),
             provider_phase=PLAN,
             mcp_attach="clarification",
@@ -197,6 +213,16 @@ def _phase_specs(skill_tools) -> tuple[PhaseSpec, ...]:
                 time_wait,
                 request_replan,
                 update_progress,
+                # Clean terminal exit for a FINISHED execution (the #39
+                # third-retest tail-tension root fix): before this tool the
+                # model's only exits were a bare text turn (the stall guard
+                # answered with EXECUTION REQUIRED up to the budget) or
+                # request_replan (whose semantics are "goal unreachable" —
+                # a successful task using it would report a failure that
+                # never happened). finish_execution records the terminal
+                # phase in the ledger; the stall gate and the router both
+                # read it and route to the verifier without further nudges.
+                finish_execution,
             ),
             provider_phase=EXECUTE,
             mcp_attach="phase2",
@@ -735,9 +761,8 @@ def _build_skill_tools(registry: SkillRegistry):
     ) -> str:
         """Phase 1 ONLY. Save a fault injection plan as `<task_id>.md` in the plan directory.
 
-        Writes to the local plan dir (does NOT touch the cluster). After
-        calling this, your next message should be your final summary text
-        WITHOUT tool_calls — the system advances to Phase 2.
+        Writes to the local plan dir (does NOT touch the cluster). Saving
+        only persists the draft; Phase 1 continues until ``finish_planning``.
 
         When to use:
           - End of Phase 1, after the plan is finalized and before the
@@ -781,6 +806,10 @@ def _build_skill_tools(registry: SkillRegistry):
         blast_radius_scope: str = "",
         blast_radius_detail: str = "",
         skill_case_resource: str = "",
+        duration_seconds: int = 0,
+        fault_scope: str = "",
+        fault_target: str = "",
+        fault_action: str = "",
     ) -> str:
         """Signal that Phase 1 is complete — either proceed to execution or reject the request.
 
@@ -811,6 +840,20 @@ def _build_skill_tools(registry: SkillRegistry):
             (e.g. "references/catalogue/Pod_镜像拉取失败/Pod_镜像拉取失败_镜像不存在或标签错误.md").
             Required when multiple skill cases were read during planning —
             tells the system which one to use for verification.
+          - duration_seconds: The injection window in seconds this plan commits
+            to. The reviewed FaultSpec contract, auto-recovery timers, and the
+            audit snapshot derive from it. Default 0 = not declared.
+          - fault_scope / fault_target / fault_action: The fault-identity triple
+            of the plan's MAIN injection mechanism (e.g. pod / process / hold for
+            a file-descriptor hold, pod / cpu / fullload for a blade CPU fault).
+            This declares WHAT is attacked so the target guard can judge the
+            mechanism against the right fault family — the skill-case document
+            is a MENU (main path + backup means), so never copy a triple from it.
+            Fill every missing field of the FaultSpec; fields already settled
+            (structured flags, confirmed intent) are never rewritten by this —
+            if the declared triple CONFLICTS with a settled identity, use
+            propose_plan_change instead of silently diverging from it.
+            Default "" for each = not declared.
 
         Output: Confirmation message.
 
@@ -1147,9 +1190,10 @@ async def create_agent(
             trace = self.trace
             trace.total_llm_calls += 1
             from chaos_agent.observability.tracer import _extract_token_usage
-            prompt, completion = _extract_token_usage(response)
+            prompt, completion, cache_read = _extract_token_usage(response)
             trace.total_token_input += prompt
             trace.total_token_output += completion
+            trace.total_token_cached += cache_read
             # Diagnostic: log routing and extraction result
             is_dummy = self._current_task_id is None or self._current_task_id not in _traces
             if is_dummy or (not prompt and not completion):

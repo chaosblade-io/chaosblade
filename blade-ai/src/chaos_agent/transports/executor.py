@@ -20,6 +20,9 @@ This ensures:
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 from chaos_agent.errors import ToolGuardError
 from chaos_agent.models.command_result import CommandResult
 
@@ -30,6 +33,13 @@ from .registry import (
     TransportRegistry,
     profile_of,
 )
+from .transient import (
+    is_transient_transport_error,
+    transient_exhaustion_hint,
+    transient_retry_delays,
+)
+
+logger = logging.getLogger(__name__)
 
 # Sentinel exit code returned when a channel's preflight fails (i.e. the
 # transport itself is misconfigured, before the inner command ever runs).
@@ -222,31 +232,64 @@ async def execute_via_transport(
             wrapped = channel.wrap_command(cmd, target, timeout=timeout)
     else:
         wrapped = cmd
-    result = await run_command(
-        wrapped,
-        timeout=timeout,
-        task_id=task_id,
-        stdin_data=pipe_stdin,
-        skip_guard=True,
-        env_override=env_override,
-        source=source,
-        # Record WHERE this ran. ``source`` is a semantic label chosen by the
-        # caller, so without this the status event cannot say which machine
-        # answered — the fact task-46317228 turned on.
-        channel=channel.name if channel is not None else "local",
-    )
 
-    # 4. Parse transport output protocol (wiz / passthrough).  Native-bypass
-    # commands run unwrapped, so their output needs no protocol adaptation.
-    if channel is not None:
-        result = channel.adapt_result(result, target)
+    # 3b. Transient dispatch errors (``No executor available`` /
+    # ``heartbeat is stale``) are retried HERE, in the transport layer,
+    # instead of surfacing to the LLM loop — each surfaced transient used
+    # to cost a full inference round just for the model to re-issue the
+    # identical command (#49: ×23 in a 22-minute window; #51: ×11).
+    # Safe by construction: these failures happen BEFORE the command runs
+    # (dispatch level), so a retry cannot duplicate side effects. Signature
+    # matching filters non-wiz channels out — their stderr never carries
+    # the platform's dispatch wording. Guard/audit stay outside the loop:
+    # one guard pass, one audit record with the FINAL result.
+    retry_delays = transient_retry_delays()
+    attempt = 0
+    while True:
+        result = await run_command(
+            wrapped,
+            timeout=timeout,
+            task_id=task_id,
+            stdin_data=pipe_stdin,
+            skip_guard=True,
+            env_override=env_override,
+            source=source,
+            # Record WHERE this ran. ``source`` is a semantic label chosen by the
+            # caller, so without this the status event cannot say which machine
+            # answered — the fact task-46317228 turned on.
+            channel=channel.name if channel is not None else "local",
+        )
+        # 4. Parse transport output protocol (wiz / passthrough). Native-bypass
+        # commands run unwrapped, so their output needs no protocol adaptation.
+        if channel is not None:
+            result = channel.adapt_result(result, target)
+        if attempt >= len(retry_delays):
+            break
+        if result.exit_code == 0 or not is_transient_transport_error(result.stderr or ""):
+            break
+        delay = retry_delays[attempt]
+        attempt += 1
+        logger.warning(
+            "[transport] transient dispatch error, retry %d/%d in %.0fs: %s",
+            attempt, len(retry_delays), delay, (result.stderr or "")[:200],
+        )
+        await asyncio.sleep(delay)
+
+    if attempt and is_transient_transport_error(result.stderr or ""):
+        # Retries exhausted and STILL transient (zombie form — dead executor
+        # whose registration lingers). Annotate so the model knows this is not
+        # a first failure and unchanged retries are wasted: report the channel.
+        result.stderr = (result.stderr or "") + transient_exhaustion_hint()
 
     # 5. Audit log — record the raw semantic command (more useful for auditing).
     # Skipped for opted-out internal probes to avoid audit-trail pollution;
     # ``audit`` overrides that for guard-skipping LLM-facing tools.
+    # O1: the transient retry count rides the FINAL entry (no separate
+    # per-retry records) so channel-blip frequency stays groupable on the
+    # audit trail.
     should_audit = not skip_guard if audit is None else audit
     if should_audit:
-        guard.audit_log(cmd, result, task_id)
+        guard.audit_log(cmd, result, task_id, transient_retries=attempt)
 
     return result
 

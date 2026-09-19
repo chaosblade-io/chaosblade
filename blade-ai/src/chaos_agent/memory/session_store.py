@@ -385,6 +385,35 @@ class SessionStore:
                 if isinstance(_real_kwargs, dict):
                     _real_kwargs.setdefault("_node", node_name)
 
+            # B78: establish message identity at FIRST persistence, not at
+            # reducer merge. A hand-built state message (e.g. the Phase 2
+            # kickoff in execute_loop) is immediate-written here BEFORE
+            # ``add_messages`` assigns it an id, then the hook flush writes
+            # the same object AFTER the merge — two serializations under two
+            # different dedup keys (composite vs ``id:``), and the audit trail
+            # records one logical message twice with drifting timestamps.
+            # Stamping the id IN PLACE (on the message object, not the
+            # serialized dict) makes the shared reference carry the same
+            # identity into the reducer — which preserves existing ids — so
+            # the deliberate double write becomes idempotent by construction.
+            #
+            # SystemMessage is deliberately EXCLUDED: per-loop prompt records
+            # (``record_system_prompt``) are rebuilt from scratch every
+            # iteration, never enter state, and rely on content-based dedup
+            # ("dedup handles repeated prompts" is that helper's contract) —
+            # a fresh uuid per rebuild would fork each round into a new entry
+            # (measured: 3 prompt records would balloon to 23 across one task).
+            if (
+                not isinstance(msg, SystemMessage)
+                and getattr(msg, "id", None) is None
+            ):
+                try:
+                    msg.id = str(uuid4())
+                except Exception:
+                    # Exotic immutable message: leave key-less, the legacy
+                    # composite fallback in _message_dedup_key applies.
+                    pass
+
             entry = _serialize_message_full(msg)
             key = _message_dedup_key(entry)
 

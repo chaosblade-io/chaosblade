@@ -50,6 +50,8 @@ _WRITABLE_KEYS: frozenset[str] = frozenset(
         "confirmation_required",
         "self_evolution",
         "log_level",
+        # Turn-channel fault-window hold (evaluation protocol opt-in).
+        "turn_hold_fault_window",
         # K8s targeting.
         "kubeconfig_path",
         "kube_context",

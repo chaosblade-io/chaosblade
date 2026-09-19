@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from chaos_agent.agent.nodes.verify._metric_extractor import (
     extract_baseline_metrics,
     extract_metrics,
@@ -81,6 +79,51 @@ class TestDfH:
     def test_header_only_returns_empty(self):
         stdout = "Filesystem      Size  Used Avail Use% Mounted on\n"
         assert extract_metrics("kubectl", "df -h", stdout) == {}
+
+    def test_df_k_dispatch_and_kb_units(self):
+        """The disk cases' primary evidence is ``df -k`` (KB precision,
+        #9 quality bar) — dispatch must fire on any standalone ``df``
+        token, not just the -h literal. Same 6-column shape; the value
+        carries raw 1K-block numbers."""
+        stdout = (
+            "Filesystem      1K-blocks      Used Available Use% Mounted on\n"
+            "overlay         123456789  37384168  80888384  32% /tmp\n"
+        )
+        result = extract_metrics("kubectl", "exec mypod -- df -k /tmp", stdout)
+        assert result == {"Disk usage (overlay)": "32% (37384168/123456789)"}
+
+    def test_plain_df_token_fires(self):
+        stdout = (
+            "Filesystem      Size  Used Avail Use% Mounted on\n"
+            "overlay          50G   13G   38G  26% /\n"
+        )
+        assert extract_metrics("kubectl", "df /tmp", stdout) == {
+            "Disk usage (overlay)": "26% (13G/50G)"
+        }
+
+    def test_filename_like_token_does_not_fire(self):
+        # "df.txt" has no whitespace/end boundary after "df" — must not
+        # dispatch even when the payload itself looks like df output.
+        stdout = "overlay 50G 13G 38G 26% /\n"
+        assert extract_metrics("kubectl", "cat df.txt", stdout) == {}
+
+    def test_inode_mode_rejected(self):
+        # df -i: "IUse%" is inode usage, not disk usage — no signal
+        # beats a mislabeled one.
+        stdout = (
+            "Filesystem Inodes IUsed IFree IUse% Mounted on\n"
+            "overlay 6553600 103487 6450113 2% /\n"
+        )
+        assert extract_metrics("kubectl", "df -i /", stdout) == {}
+
+    def test_type_column_layout_rejected(self):
+        # df -Th: extra Type column shifts Use% off position 4 — the
+        # per-row "%"-suffix guard drops it rather than misparse.
+        stdout = (
+            "Filesystem Type Size Used Avail Use% Mounted on\n"
+            "overlay overlay 50G 13G 38G 26% /\n"
+        )
+        assert extract_metrics("kubectl", "df -Th /", stdout) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -230,17 +273,30 @@ class TestKubectlTop:
 
 
 class TestDiskstats:
-    def test_vdb_write_sectors(self):
-        # Field [9] is sectors written (Linux kernel iostats spec).
+    def test_all_physical_devices_reported(self):
+        """Every non-virtual device gets a counter — the landing device
+        depends on the case (root-disk overlay vs PVC data disk), so the
+        extractor must not guess (Case #10: burn landed on vda3 while the
+        old vdb/sdb hardcode pointed the baseline at the wrong disk)."""
         stdout = (
             " 252       0 vda 100 0 1000 200 50 0 500 100 0 300 300\n"
             " 252      16 vdb 200 0 2000 400 80 0 8888 200 0 600 600\n"
         )
         result = extract_metrics("kubectl", "exec x -- cat /proc/diskstats", stdout)
-        assert result == {"Disk writes (vdb)": "8888 sectors"}
+        assert result == {
+            "Disk writes (vda)": "500 sectors",
+            "Disk writes (vdb)": "8888 sectors",
+        }
 
-    def test_no_matching_device(self):
-        stdout = " 252  0 vda 100 0 1000 200 50 0 500 100 0 300 300\n"
+    def test_virtual_devices_excluded(self):
+        stdout = (
+            " 7       0 loop0 5 0 8 0 0 0 0 0 0 0 0 0\n"
+            " 1       0 ram0 5 0 8 0 0 0 0 0 0 0 0 0\n"
+            " 11      0 sr0 5 0 8 0 0 0 0 0 0 0 0 0\n"
+            " 253       2 zram0 5 0 8 0 999 0 888 0 0 0 0 0\n"
+        )
+        # loop/ram/sr are virtual; zram is RAM-backed swap — its writes
+        # are memory ops, not disk traffic.
         assert extract_metrics("kubectl", "cat /proc/diskstats", stdout) == {}
 
 
@@ -312,6 +368,98 @@ class TestKubectlLogs:
         # ground truth (the cross-check phase would mis-rule with a 0).
         stdout = "ts=2024 level=info msg=all systems nominal\n"
         assert extract_metrics("kubectl", "logs my-pod", stdout) == {}
+
+
+# ---------------------------------------------------------------------------
+# kubectl get <resource> — table row count (#13-R: the 92-pod listing
+# demoted to a 1018B head lost the count the plan was built around)
+# ---------------------------------------------------------------------------
+
+
+class TestGetTableRows:
+    def test_no_headers_listing_counts_data_rows(self):
+        # #13-R verbatim head: --no-headers pods listing, all-lowercase
+        # data rows (lowercase hashes / 0/1 / AGE suffixes) — no header
+        # to discount.
+        stdout = (
+            "chaosblade-operator-8564fd4f69-ck6pg   0/1   Init:ImagePullBackOff   0   23d\n"
+            "chaosblade-tool-26xlq                  0/1   ImagePullBackOff        0   107d\n"
+            "drill-mntopt-target-74f644bf8d-abcde   1/1   Running                  0   5d\n"
+        )
+        result = extract_metrics(
+            "kubectl", "get pods -n default --no-headers", stdout,
+        )
+        assert result == {"List rows": "3"}
+
+    def test_header_table_discounts_header_row(self):
+        stdout = (
+            "NAME               REFERENCE             TARGETS   MINPODS   MAXPODS   REPLICAS\n"
+            "drill-hpa-target   Deployment/drill      50%/80%   1         10        1\n"
+        )
+        result = extract_metrics("kubectl", "get hpa -n default", stdout)
+        assert result == {"List rows": "1"}
+
+    def test_output_name_counts_lines(self):
+        stdout = (
+            "pod/chaosblade-operator-8564fd4f69-ck6pg\n"
+            "pod/chaosblade-tool-26xlq\n"
+        )
+        result = extract_metrics("kubectl", "get pods -n default -o name", stdout)
+        assert result == {"List rows": "2"}
+
+    def test_no_resources_found_returns_empty(self):
+        stdout = "No resources found in default namespace.\n"
+        assert extract_metrics("kubectl", "get resourcequotas -n default", stdout) == {}
+
+    def test_no_resources_matched_hint_returns_empty(self):
+        # The kubectl tool-layer hint shape (#13-R msg[37]).
+        stdout = (
+            "\n\n💡 No resources matched the label selector. "
+            "Try running without -l to discover available resources."
+        )
+        assert extract_metrics(
+            "kubectl", "get sa,role,rolebinding -n default -l drill=rq", stdout,
+        ) == {}
+
+    def test_error_envelope_returns_empty(self):
+        # NotFound error wrappers must not count as one data row.
+        stdout = (
+            "Error: kubectl get (exit 1): Error from server (NotFound): "
+            "serviceaccounts \"drill-rc-rq300\" not found"
+        )
+        assert extract_metrics(
+            "kubectl", "get sa drill-rc-rq300 -n default -o name", stdout,
+        ) == {}
+
+    def test_json_output_not_row_counted(self):
+        stdout = '{"kind": "PodList", "items": []}'
+        assert extract_metrics("kubectl", "get pods -n default -o json", stdout) == {}
+
+    def test_jsonpath_output_not_row_counted(self):
+        stdout = (
+            "cn-shanghai.25.209.68.1: \n"
+            "cn-shanghai.25.209.68.10: \n"
+        )
+        assert extract_metrics(
+            "kubectl",
+            "get nodes -o jsonpath='{range .items[*]}{.metadata.name}{\": \"}{.spec.taints}{\"\\n\"}{end}'",
+            stdout,
+        ) == {}
+
+    def test_non_get_command_not_row_counted(self):
+        stdout = "NAME   READY   STATUS\np1     1/1    Running\n"
+        assert extract_metrics("kubectl", "can-i --list -n default", stdout) == {}
+        assert extract_metrics("kubectl", "describe pod p1", stdout) == {}
+
+    def test_single_resource_get_counts_one_row(self):
+        stdout = (
+            "NAME                  READY   UP-TO-DATE   AVAILABLE   AGE\n"
+            "drill-mntopt-target   1/1     1            1           5d\n"
+        )
+        result = extract_metrics(
+            "kubectl", "get deployment drill-mntopt-target -n default -o wide", stdout,
+        )
+        assert result == {"List rows": "1"}
 
 
 # ---------------------------------------------------------------------------

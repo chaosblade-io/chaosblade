@@ -4,11 +4,15 @@ import logging
 
 from langchain_core.messages import HumanMessage
 
-from chaos_agent.agent.nodes.side_effect._conflict_check import check_blade_conflicts
+from chaos_agent.agent.nodes.side_effect._conflict_check import (
+    check_blade_conflicts,
+)
+from chaos_agent.tools.request_identity import build_request_fingerprint
 from chaos_agent.agent.nodes.execute._kubeconfig_inject import _resolve_kubeconfig, sync_kubewiz_runtime
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store, sync_node_status_to_session
 from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
+from chaos_agent.agent.spec.intent_anchor import extract_explicit_node_anchor
 from chaos_agent.agent.spec.safety_score import (
     compute_safety_score,
     maybe_escalate_status,
@@ -17,11 +21,21 @@ from chaos_agent.agent.spec.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState
 from chaos_agent.agent.state_mgmt.state_helpers import fail_state
 from chaos_agent.agent.target_guard import (
+    canonicalise_kind,
     discover_names_by_labels,
     discover_owner_names,
     discover_pod_pvc_claims,
+    discover_statefulset_pvc_claims,
+    discover_workload_pvc_claims,
     freeze_approved_target_from_spec,
+    WORKLOAD_TEMPLATE_SCOPES,
 )
+from chaos_agent.agent.target_guard.mechanism_writes import (
+    derive_pvc_claims_from_writes,
+    entries_beyond_victim,
+    load_case_mechanism_writes,
+)
+from chaos_agent.agent.target_guard.freeze import approved_from_dict
 from chaos_agent.agent.result.verdict import FailureCategory
 from chaos_agent.config.settings import settings
 from chaos_agent.observability.status_tracker import (
@@ -275,20 +289,23 @@ async def safety_check(state: AgentState) -> dict:
     _cluster_reachable = bool(kubeconfig) or is_kubewiz_channel()
     if _is_k8s_injection and _cluster_reachable:
         await dispatch_node_message("safety_check", "Checking for conflicting experiments on the cluster...\n\n")
-        namespace = spec.namespace
-        labels = ",".join(f"{k}={v}" for k, v in spec.labels.items())
-        target_names = ",".join(spec.names)
-
         scope = spec.scope
         fault_target = spec.fault_target
         action = spec.fault_action
-        request_sta = f"{scope}-{fault_target}-{action}" if scope and fault_target and action else ""
-
+        # Shared four-dimension request fingerprint (RequestFingerprint):
+        # the same construction serves this pre-injection conflict query
+        # and the create-reconcile gate's registration/probe paths.
+        fingerprint = build_request_fingerprint(
+            namespace=spec.namespace,
+            labels=",".join(f"{k}={v}" for k, v in spec.labels.items()),
+            names=",".join(spec.names),
+            scope=scope,
+            target=fault_target,
+            action=action,
+        )
         uids, conflict_details = await check_blade_conflicts(
             kubeconfig, task_id,
-            namespace=namespace, labels=labels,
-            target_names=target_names,
-            request_scope_target_action=request_sta,
+            **fingerprint.as_query_kwargs(),
         )
         if uids:
             conflict_uids = uids
@@ -507,6 +524,10 @@ async def safety_check(state: AgentState) -> dict:
     await dispatch_node_message("safety_check", "Discovering the target Pod's owner...\n\n")
     owner_names = await discover_owner_names(
         spec.scope, spec.namespace, dict(spec.labels), kubeconfig,
+        # names channel (generation anchor, case #39): a name-based pod
+        # approval must also freeze the ownerReferences chain so the
+        # drift guard recognises deleted-and-recreated successors.
+        names=tuple(spec.names or ()),
     )
     # Resolve a LABEL selector (node AZ zone, or pod app labels) to its
     # concrete resource names so the drift guard can validate per-name batches
@@ -515,22 +536,158 @@ async def safety_check(state: AgentState) -> dict:
     resolved_names = await discover_names_by_labels(
         spec.scope, spec.namespace, dict(spec.labels), kubeconfig,
     )
-    # Freeze the PVC claim names the approved pod(s) reference — the anchor
+    # Freeze the PVC claim names the approved target references — the anchor
     # for the drill-occupancy-vehicle exception (a resource-occupancy drill
     # creates a behaviourless pod claiming the SAME PVC; the screener
     # validates the occupant's claims against this frozen set).
+    # B79 (case #39-R): claim discovery dispatches by scope. The LLM's
+    # scope extraction is a free variable (the same intent read as "pod"
+    # one run and "deployment" the next); the frozen anchor must not be.
     pvc_claims: tuple[str, ...] = ()
-    if (spec.scope or "").strip().lower() in ("pod", "container"):
+    _scope_l = (spec.scope or "").strip().lower()
+    if _scope_l in ("pod", "container"):
         pod_identities = tuple(spec.names) if spec.names else resolved_names
         pvc_claims = await discover_pod_pvc_claims(
             spec.namespace, pod_identities, kubeconfig,
         )
+    elif _scope_l in WORKLOAD_TEMPLATE_SCOPES:
+        # Template channel: the claimName authored in the pod template is
+        # the same string every replica mounts, so a workload approval
+        # freezes the same whitelist a pod approval of its pods would.
+        pvc_claims = await discover_workload_pvc_claims(
+            _scope_l, spec.namespace, tuple(spec.names or ()),
+            dict(spec.labels or {}), kubeconfig,
+        )
+    elif _scope_l == "statefulset":
+        # STS channel: claims are per-replica instances of
+        # volumeClaimTemplates, never the template names (a template name
+        # is not a PVC — whitelisting it would admit ghost entries). Ground
+        # truth is what the live pods mount; scaled-to-zero freezes empty
+        # and the occupant exception stays refused (fail closed).
+        pvc_claims = await discover_statefulset_pvc_claims(
+            spec.namespace, tuple(spec.names or ()),
+            dict(spec.labels or {}), kubeconfig,
+        )
+    # Case-manifest mechanism writes: deterministic load at case
+    # settlement. Code re-reads the SAME case file the Agent showed the
+    # user (skill_name + spec.case_resource_path), so the Agent's reading
+    # of the case prose — a ToolMessage the LLM produced — is never an
+    # authorization input. Empty for every case without a manifest
+    # (behaviour unchanged); parse failures also yield empty (fail closed
+    # at the guard, where the rejection carries manifest attribution).
+    mechanism_entries = load_case_mechanism_writes(
+        skill_name, getattr(spec, "case_resource_path", "") or "",
+    )
+    # #39 time-dimension gap: live claim discovery only finds PVCs that
+    # ALREADY exist; a #38-shaped case applies its PVC during execution.
+    # The in-band PVC is already legislated in mechanism_writes (an
+    # unlegislated PVC write is rejected by the guard itself), so the
+    # WRITE-set is the claim anchor's time-proof half — DERIVED, never
+    # re-declared: a hand-copied pvc_claims list could drift from the
+    # write it shadows and rode no confirmation card the human saw.
+    manifest_pvc_claims = derive_pvc_claims_from_writes(mechanism_entries)
+    if manifest_pvc_claims:
+        # Union, not replace: for a target that EXISTS the live channels
+        # are ground truth and the manifest adds nothing; for a target the
+        # drill creates, the manifest is the only source. Unioning keeps
+        # both worlds correct and costs nothing when the manifest is empty.
+        pvc_claims = tuple(sorted(set(pvc_claims) | set(manifest_pvc_claims)))
+        logger.info(
+            "derived in-band pvc_claims %s from mechanism writes → frozen anchor now %s",
+            list(manifest_pvc_claims), list(pvc_claims),
+        )
+    # D4 invariant, graph-side half: a manifest carrying entries beyond
+    # the victim coverage is a WIDENED contract. Freezing alone must NOT
+    # complete its authorization — stamp the snapshot pending until a
+    # knowing human clears it at the gate, AND force the confirm route so
+    # every channel (interactive and unattended alike) actually reaches
+    # the card/boundary decision instead of silently sliding past the
+    # gate via ``needs_confirmation=False`` auto-execute routing.
+    # Probe-freeze evaluates the coverage predicate on the exact shape
+    # the guard will later enforce (freeze is pure — no cluster I/O; the
+    # discovery queries above already ran).
+    _widening: tuple = ()
+    if mechanism_entries:
+        _probe = approved_from_dict(freeze_approved_target_from_spec(
+            spec,
+            owner_names=owner_names,
+            resolved_names=resolved_names,
+            pvc_claims=pvc_claims,
+            mechanism_entries=mechanism_entries,
+        ) or {})
+        if _probe is not None:
+            _widening = entries_beyond_victim(_probe)
     result["approved_target"] = freeze_approved_target_from_spec(
         spec,
         owner_names=owner_names,
         resolved_names=resolved_names,
         pvc_claims=pvc_claims,
+        mechanism_entries=mechanism_entries,
+        widening_pending_approval=bool(_widening),
     )
+    if _widening:
+        # Layer-2 pre-positioning: interactive channels were already
+        # True (no behaviour change); unattended channels now pause at
+        # the gate where the boundary decision runs. Without this the
+        # ``safe + needs_confirmation=False`` route skips the gate
+        # entirely and the execute_loop sentinel becomes the only guard.
+        result["needs_confirmation"] = True
+        logger.info(
+            "safety_check: write-set contract widened beyond victim coverage "
+            "(%d manifest entries) — forcing confirmation gate", len(_widening),
+        )
+
+    # B76 review F (probe_b76_round6.py) — anchor-kind integrity: the
+    # frozen identity must still name the resource KIND the user
+    # explicitly anchored in the entry-point text. The pre-filled anchor
+    # (intent_anchor → from_cli_nl / from_http_request NL) can be silently
+    # replaced downstream: extract_planning_metadata's scope override —
+    # anti-monster legislation that correctly clears names+labels when the
+    # blade skill declares a different scope — treats a pre-filled anchor
+    # as "old scope residue", after which agent_loop's lazy derivation
+    # rebuilds a consistent-but-DIFFERENT identity (user asked for node X
+    # down; the plan delivers pod-cpu-fullload on an unrelated pod, no
+    # user touchpoint in CLI mode — probe F1-F3). Guarding here, at the
+    # last identity consumer before the freeze, covers EVERY upstream
+    # writer channel (scope override, lazy derivation, future ones) —
+    # defense-in-depth with ④'s entry-point check.
+    #
+    # Routing: confirm_required (not rejected) — TUI renders the card
+    # where the human sees anchor vs plan; CLI without --force-override
+    # gets the gate's explicit rejection ("Add --force-override to
+    # proceed" = the user knowingly accepting the retarget). A status
+    # that is already rejected/confirm_required keeps its own reason
+    # untouched: those paths already reach the gate/terminal state and
+    # their reason is the more specific diagnosis.
+    if result.get("safety_status") not in ("rejected", "confirm_required"):
+        _anchors = extract_explicit_node_anchor(spec.user_description or "")
+        # node and host are the SAME machine seen from two angles — a
+        # node-level drill routinely lands on host scope (Node_CPU cases
+        # run systemd-run payloads on the host); an anchored-node intent
+        # under host scope is a correct domain mapping, not a retarget.
+        # Everything else (pod / deployment / service / ...) is a different
+        # KIND of resource — that is the F shape.
+        if _anchors and canonicalise_kind(spec.scope or "") not in ("node", "host"):
+            _anchor_reason = (
+                "Target does not match the user's request: the request explicitly "
+                f"names node(s) {list(_anchors)}, but the planned fault targets "
+                f"{spec.scope} {list(spec.names) or dict(spec.labels) or '<unresolved>'}. "
+                "Re-plan against the named node(s), or let the user decide "
+                "explicitly."
+            )
+            result["safety_status"] = "confirm_required"
+            result["needs_confirmation"] = True
+            if result.get("safety_reason"):
+                result["safety_reason"] = (
+                    f"{_anchor_reason} Also: {result['safety_reason']}"
+                )
+            else:
+                result["safety_reason"] = _anchor_reason
+            logger.info(
+                "safety_check: anchor-kind mismatch — user anchored node(s) %s "
+                "but plan targets %s %s; forcing confirmation gate",
+                list(_anchors), spec.scope, list(spec.names),
+            )
 
     result = _attach_safety_score(result, spec, state, deep_signal)
     await sync_to_store(state, result)

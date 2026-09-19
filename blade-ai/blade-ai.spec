@@ -28,11 +28,8 @@ on Linux). CI's ``release.yml`` downloads the correct tarball from
 ``github.com/chaosblade-io/chaosblade/releases`` for each matrix
 target and extracts it into ``vendor/chaosblade/`` BEFORE pyinstaller
 runs, so this spec just bundles whatever's there. Windows skips the
-vendor bundle entirely — chaosblade has no Windows release. Fault
-injection still works from a Windows client: all carriers execute on
-the REMOTE target (kubectl-native control-plane faults, ``kubectl
-exec`` into cluster tool pods, ssh/kubewiz host transports), so no
-local blade binary is required.
+vendor bundle entirely — chaosblade has no Windows release; the
+Windows binary is informational/TUI-only.
 """
 
 import os
@@ -62,12 +59,13 @@ PROJECT_ROOT = Path(SPECPATH)
 # arch via QEMU/buildx — never cross-compile).
 datas = [
     ('skills', 'skills'),
-    # The TS TUI bundle. CI's build-tui job produces this; for local
-    # builds run ``cd tui && npm install && npm run build`` once first.
+    # The TS TUI bundle — the ONLY interactive surface (the legacy
+    # Python TUI was removed, so there is no runtime fallback). CI's
+    # build-tui job produces this; for local builds run
+    # ``cd tui && npm install && npm run build`` once first.
     # Missing → PyInstaller errors at Analysis time, which is the
-    # right fail-loud behaviour (silently shipping without TUI
-    # would mean every binary user falls back to the legacy Python
-    # TUI that never shipped this version's behaviour).
+    # right fail-loud behaviour: shipping without the TUI would mean
+    # every binary user hits a hard error on launch.
     ('tui/dist/cli.js', 'chaos_agent/_tui_assets'),
     # Marker so Node parses cli.js as ESM without walking up the
     # directory tree (which can hit the user's home ``package.json``
@@ -81,6 +79,7 @@ datas = [
     # surface of the standalone binary. At runtime
     # chaos_agent.server.web.resolve_web_dist() resolves it from
     # ``sys._MEIPASS/chaos_agent/_web_assets`` and mounts it at "/".
+    # Kept in sync with the opensource blade-ai repo's spec (13787b9).
     ('web/dist', 'chaos_agent/_web_assets'),
 ]
 

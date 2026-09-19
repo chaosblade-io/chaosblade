@@ -177,3 +177,126 @@ def test_backscan_dispatch_vocabulary_pinned():
         )
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# B47: English verbs require COMMAND POSITION (``kubectl [--flags] <verb>``).
+# A bare prose mention of a verb is not an action-bearing form — task
+# inject-65a44501 (case #34) flagged ``uncordon`` from a REASONING CITATION
+# inside a step ("仅放行节点自操作（uncordon 族，#30 实测立法）"), nudging the
+# model toward an out-of-scope mutation it correctly refused, at the cost of
+# an execute iteration.
+# ---------------------------------------------------------------------------
+
+C34_REPRO_CASE = """**演练步骤**：
+1. 定位目标 Deployment 并记录副本数（基线快照）
+2. 恢复通道对称性定案：宿主 timer 通道仅放行节点自操作（uncordon 族，#30 实测立法），scale deployment 属跨资源写必拒；注入用 `kubectl scale deployment <name> -n <ns> --replicas=0`
+3. 观察 Pod 缩容过程和应用状态变化
+
+**注入验证**：
+1. 执行 `kubectl get pods`
+"""
+
+_MESSAGES_C34 = [
+    AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "kubectl",
+                "args": {
+                    "subcommand": "scale",
+                    "v_args": "deployment drill --replicas=0",
+                },
+                "id": "tc-s",
+            }
+        ],
+    ),
+    ToolMessage(
+        content="deployment.apps/drill scaled", name="kubectl", tool_call_id="tc-s"
+    ),
+]
+
+
+def test_b47_prose_verb_mention_is_not_required():
+    """B47 regression (the #34 specimen): a step's REASONING citation of
+    ``uncordon`` (bare prose, no kubectl invocation around it) must NOT
+    become a REQUIRED verb — scale (the real action, in command position)
+    executed → no missing action → no reminder. Pre-fix this fired a soft
+    nudge toward an out-of-scope ``kubectl uncordon``."""
+    out = build_injection_step_selfcheck(C34_REPRO_CASE, _MESSAGES_C34, "kubectl_native")
+    assert out is None
+
+
+def test_b47_command_position_verb_is_still_required():
+    """B47 counterpart: the verb in a real kubectl invocation's subcommand
+    position — the #21/#30 timer-payload shape with flags between ``kubectl``
+    and the verb — IS required, and flags out as missing when not executed."""
+    case = """**演练步骤**：
+1. 记录基线
+2. 武装恢复：chroot /host systemd-run --on-active=600s --unit=blade-restore kubectl --kubeconfig=/etc/kubernetes/kubelet.conf uncordon <node>
+3. cordon 目标节点：`kubectl cordon <node>`
+
+**注入验证**：
+1. 执行 `kubectl get nodes`
+"""
+    out = build_injection_step_selfcheck(case, [], "kubectl_native")
+    assert out is not None
+    # 标记为不可调度 → cordon (chinese map) + uncordon (command position):
+    # nothing was executed, both are missing.
+    assert "uncordon (" in out
+    assert "cordon (" in out
+
+
+def test_b47_quote_wrapped_payload_verb_is_still_required():
+    """B47 counterpart: the verb inside a quoted payload handed to sh -c
+    still counts (``sh -c 'kubectl ... <verb> ...'``) — the regex must see
+    through the quotes to the invocation, not just match bare tokens."""
+    case = """**演练步骤**：
+1. 记录基线
+2. 武装恢复：kubectl exec <pod> -- sh -c 'systemd-run --on-active=600s kubectl uncordon <node>'
+
+**注入验证**：
+1. 执行 `kubectl get nodes`
+"""
+    out = build_injection_step_selfcheck(case, [], "kubectl_native")
+    assert out is not None
+    assert "uncordon (" in out
+
+
+def test_b47_uppercase_prose_rbac_verbs_are_not_required():
+    """B47 (scan-driven): prose spellings of RBAC verbs (``PATCH deployment
+    摘卷 + DELETE PVC``) are mentions, not actions — lowered, they used to
+    match ``\\bpatch\\b`` / ``\\bdelete\\b`` and manufacture REQUIRED verbs.
+    Under command-position anchoring they are ignored."""
+    case = """**演练步骤**：
+1. 记录基线
+2. 验权说明（PATCH deployment 摘卷 + DELETE PVC，Role 按标准件第二节推导），注入用 `kubectl patch deployment <name> -p '<json>'`
+3. 观察结果
+
+**注入验证**：
+1. 执行 `kubectl get pods`
+"""
+    messages = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "kubectl",
+                    "args": {
+                        "subcommand": "patch",
+                        "v_args": "deployment drill -p {}",
+                    },
+                    "id": "tc-p",
+                }
+            ],
+        ),
+        ToolMessage(
+            content="deployment.apps/drill patched",
+            name="kubectl",
+            tool_call_id="tc-p",
+        ),
+    ]
+    out = build_injection_step_selfcheck(case, messages, "kubectl_native")
+    # patch was documented in command position AND executed → no missing
+    # verbs (the prose DELETE must not be required).
+    assert out is None

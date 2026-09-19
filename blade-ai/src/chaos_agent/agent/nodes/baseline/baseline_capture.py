@@ -21,8 +21,10 @@ Design principle: best-effort — any failure does NOT block injection.
 
 import asyncio
 import inspect
+import json
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 
 from langchain_core.messages import HumanMessage
 
@@ -33,13 +35,25 @@ from chaos_agent.tools.pod_discovery import (  # noqa: F401 — re-exported (imp
     TOOL_POD_NAMESPACE as _TOOL_POD_NAMESPACE,
 )
 from chaos_agent.agent.nodes.execute._kubeconfig_inject import sync_kubewiz_runtime
+from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+    _find_saved_plan,
+)
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store, sync_node_status_to_session
+from chaos_agent.agent.target_guard.classifier import canonicalise_kind
 from chaos_agent.agent.state import AgentState
 from chaos_agent.config.settings import settings
 from chaos_agent.memory.session_store import get_global_session_store
-from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
+from chaos_agent.observability.status_tracker import (
+    elided_preview,
+    get_tracker,
+    StatusCategory,
+)
+from chaos_agent.tools.kubectl import build_kubectl_cmd
 from chaos_agent.transports import (
     PROFILE_HOST,
+    PROFILE_K8S,
+    TransportTarget,
+    execute_via_transport,
     profile_of,
     resolve_channel_name,
 )
@@ -57,6 +71,7 @@ logger = logging.getLogger(__name__)
 from chaos_agent.agent.nodes.baseline._commands import (  # noqa: E402
     BASELINE_COMMANDS as BASELINE_COMMANDS,
     BaselineCommand as BaselineCommand,
+    _is_empty_observation as _is_empty_observation,
     _is_observation_success as _is_observation_success,
     _FCAT_DIMENSION_COMMANDS as _FCAT_DIMENSION_COMMANDS,
     _HOST_BASELINE_COMMANDS as _HOST_BASELINE_COMMANDS,
@@ -180,9 +195,40 @@ def _assemble_baseline_result(
         observation for observation in observations
         if _is_observation_success(observation)
     ]
-    evidence_coverage = evidence_profile.coverage(successful_observations)
+    # Validity split (#16 fix C — the Validity axiom): a successful
+    # execution is not necessarily a valid observation. An exit-0
+    # "No resources found" / empty-items observation anchored on nothing;
+    # counting it as coverage and quality is how a 1-valid + 3-empty
+    # baseline sailed through as "4/4 succeeded, high confidence" in the
+    # R10 live-cluster replay. Recompute via the predicate rather than
+    # trusting the executor stamp so legacy / hand-built observation
+    # lists (tests, hydrated old tasks) classify identically to live ones.
+    # ``expected_absence`` observations keep their #31 semantics: the
+    # absence IS the value, so they count as usable (valid) — but stay
+    # outside ``success_count`` exactly as before.
+    valid_observations = [
+        observation for observation in successful_observations
+        if not _is_empty_observation(observation)
+        and not observation.get("expected_absence")
+    ]
+    empty_observations = [
+        observation for observation in successful_observations
+        if _is_empty_observation(observation)
+        and not observation.get("expected_absence")
+    ]
+    absent_observations = [
+        observation for observation in observations
+        if observation.get("expected_absence")
+    ]
+    # Coverage measures what was OBSERVED, so only value-carrying
+    # observations count: an empty-spinning selector query does not cover
+    # the pod-status dimension no matter how cleanly it exited. Expected
+    # absences DO cover their dimension — the absence is the observed
+    # value — so coverage receives the usable set (valid + absent).
+    usable_observations = valid_observations + absent_observations
+    evidence_coverage = evidence_profile.coverage(usable_observations)
     target_coverage = _target_coverage(
-        spec, resolved, successful_observations,
+        spec, resolved, usable_observations,
     )
     result = {
         "baseline_data": {
@@ -190,6 +236,15 @@ def _assemble_baseline_result(
             "source": source,
             "observations": observations,
             "success_count": len(successful_observations),
+            "valid_count": len(usable_observations),
+            "empty_count": len(empty_observations),
+            # Denominator must ship WITH the counts: persistent-layer
+            # consumers render "N/M succeeded" from this dict alone
+            # (verify/_verifier_messages, recover/_recover_layer1).
+            # Without it they fall back and the receipt reads "N/0" —
+            # the cosmetic defect pinned in the #13/#10 case audits
+            # (inject-a19d3807 "4/0", inject-9c9f659b "5/0").
+            "total_count": len(observations),
             "evidence_coverage": evidence_coverage.as_dict(),
             "target_coverage": target_coverage,
         }
@@ -232,26 +287,47 @@ async def _emit_baseline_observability(
     Pure extraction from ``baseline_capture`` (behaviour unchanged).
     """
     _success = result["baseline_data"]["success_count"]
+    _valid = result["baseline_data"]["valid_count"]
+    _empty = result["baseline_data"]["empty_count"]
     _total = len(observations)
-    # Build output previews for detail dict (standard [:200] truncation)
+    # Build output previews for detail dict. Failure previews keep BOTH
+    # ends (elided_preview): kubectl puts the causal error LAST, and the
+    # transport wrapper merges stderr into stdout, so a head-only cut can
+    # hide the root cause (#31) — and a failure whose merged output sits in
+    # stdout used to yield an EMPTY preview here. Success keeps the head.
     _obs_previews = []
     for obs in observations:
         _preview = ""
         if obs.get("exit_code") == 0 and obs.get("stdout"):
             _preview = obs["stdout"][:200]
         elif obs.get("stderr"):
-            _preview = obs["stderr"][:200]
+            _preview = elided_preview(obs["stderr"], 60, 140)
+        elif obs.get("stdout"):
+            _preview = elided_preview(obs["stdout"], 60, 140)
         _obs_previews.append({
             "description": obs["description"],
             "exit_code": obs.get("exit_code", -1),
             "stdout_preview": _preview,
         })
+    # Honest counting (#16 fix C): "{_success}/{_total} succeeded" reads as a
+    # quality claim, but 4/4 with 3 of them empty-spinning is a degraded
+    # baseline, not a healthy one. Append the valid/empty split whenever
+    # unexplained empties exist so every consumer of the receipt (tracker,
+    # session status, message history) sees the same honest number.
+    _counts = (
+        f"{_success}/{_total} commands succeeded"
+        if _empty <= 0
+        else f"{_success}/{_total} commands succeeded "
+        f"({_valid} valid + {_empty} empty — empty observations captured "
+        f"no value and cannot serve as comparison baselines)"
+    )
     tracker.complete(
-        f"Baseline capture done: {source} strategy, "
-        f"{_success}/{_total} commands succeeded",
+        f"Baseline capture done: {source} strategy, {_counts}",
         detail={
             "source": source,
             "success_count": _success,
+            "valid_count": _valid,
+            "empty_count": _empty,
             "total_count": _total,
             "observations": _obs_previews,
         },
@@ -260,10 +336,12 @@ async def _emit_baseline_observability(
     # ── Observability: session status ──
     sync_node_status_to_session(
         state, BASELINE_CAPTURE,
-        f"Baseline collected ({source}): {_success}/{_total} succeeded",
+        f"Baseline collected ({source}): {_counts}",
         detail={
             "source": source,
             "success_count": _success,
+            "valid_count": _valid,
+            "empty_count": _empty,
             "total_count": _total,
         },
     )
@@ -278,7 +356,7 @@ async def _emit_baseline_observability(
         _session_msgs = [
             HumanMessage(content=(
                 f"[Baseline Capture] Collected pre-injection metrics "
-                f"({source} strategy, {_success}/{_total} succeeded)"
+                f"({source} strategy, {_counts})"
             )),
         ]
         for obs in observations:
@@ -288,6 +366,23 @@ async def _emit_baseline_observability(
             ]
             if obs.get("exit_code") is not None:
                 _obs_parts.append(f"Exit code: {obs['exit_code']}")
+            if obs.get("expected_absence"):
+                # Judged (LLM retry, #31) or machine-marked (planned
+                # creation, #16 fix B) pre-injection absence: the absence
+                # IS the baseline value — rendered as an existence
+                # baseline, distinct from an empty-spin observation.
+                _obs_parts.append(
+                    f"Note: expected pre-injection ABSENCE — "
+                    f"{obs['expected_absence']}"
+                )
+            elif obs.get("empty_observation") or (
+                _is_empty_observation(obs) and _is_observation_success(obs)
+            ):
+                _obs_parts.append(
+                    "Note: EMPTY observation — captured no value; nothing "
+                    "matched the query, so this is not a usable comparison "
+                    "baseline"
+                )
             if obs.get("stdout"):
                 _obs_parts.append(f"```\n{obs['stdout']}\n```")
             if obs.get("stderr"):
@@ -317,6 +412,14 @@ class _BaselineCtx:
     kubeconfig: str
     channel: str
     profile: str
+    # #16 fix A (Identity axiom): the authoritative pod selector discovered
+    # from the workload's own spec (None on every non-applicable route).
+    # Consumed by the LLM derive/retry target context; deliberately NOT
+    # written into ``spec.labels`` — that field's ~15 downstream consumers
+    # (safety_check conflict fingerprints, tool_screener drift correction,
+    # ...) all assume spec-scope identity, and a pod selector is cross-kind
+    # identity. Writing it there would pollute the whole chain.
+    pod_selector: dict[str, str] | None = None
 
 
 def _build_baseline_ctx(state: AgentState, llm, task_id: str, tracker) -> _BaselineCtx:
@@ -350,6 +453,100 @@ def _build_baseline_ctx(state: AgentState, llm, task_id: str, tracker) -> _Basel
     )
 
 
+# jsonpath for the pod-owning selector of each workload-kind scope. Service
+# selectors live at ``.spec.selector`` directly (no matchLabels wrapper);
+# workload selectors at ``.spec.selector.matchLabels``. A selectorless
+# service returns an empty/None jsonpath and discovery fail-opens to None.
+_POD_OWNER_SELECTOR_JSONPATH = {
+    "deployment": "{.spec.selector.matchLabels}",
+    "statefulset": "{.spec.selector.matchLabels}",
+    "daemonset": "{.spec.selector.matchLabels}",
+    "service": "{.spec.selector}",
+}
+
+
+async def _discover_pod_selector(ctx: _BaselineCtx) -> dict[str, str] | None:
+    """#16 fix A (Identity axiom): authoritative pod-identity discovery.
+
+    The baseline derive LLM emits cross-kind queries — pod-level state
+    under a workload-scope fault — and needs the target's pod selector.
+    On this route ``spec.labels`` is structurally empty (the B31
+    scope/name guards both reject a pod probe's labels under a
+    deployment-scope spec; R10 Part3 proved the CORRECT label was in the
+    message track and got dropped), so the LLM had nothing authoritative
+    to anchor on and invented one (``app=drill-pvc-target`` — the
+    deployment name as a label value).
+
+    Rather than widening the B31 write (mixing pod-selector identity into
+    ``spec.labels`` would pollute its ~15 downstream consumers), ask the
+    API server directly: ``kubectl get <kind> <name> -o jsonpath=<sel>``
+    returns the workload's own selector as a JSON object (verified live
+    in R10: ``{"app":"drill-pvc"}``). Fail-open: any error, non-zero
+    exit, unparseable or empty output → ``None`` and the derive context
+    simply lacks the selector line, exactly as before.
+    """
+    spec = ctx.spec
+    if (
+        ctx.profile != PROFILE_K8S
+        or spec is None
+        or ctx.scope not in _POD_OWNER_SELECTOR_JSONPATH
+        or not spec.names
+        or spec.labels
+        # Discovery only pays off when the LLM strategy can consume it;
+        # registry/scope_fallback templates read spec.labels, which stays
+        # untouched by design.
+        or not ctx.llm
+        or not ctx.skill_case
+    ):
+        return None
+    namespace = spec.namespace or ""
+    name = spec.names[0]
+    v_args = [ctx.scope, name]
+    if namespace:
+        v_args += ["-n", namespace]
+    v_args += ["-o", f"jsonpath={_POD_OWNER_SELECTOR_JSONPATH[ctx.scope]}"]
+    try:
+        cmd = build_kubectl_cmd("get", v_args, kubeconfig=ctx.kubeconfig)
+        result = await execute_via_transport(
+            cmd, TransportTarget.from_state({}),
+            timeout=settings.timeout_kubectl, task_id=ctx.task_id,
+            expect_profile=PROFILE_K8S,
+        )
+    except Exception as e:
+        logger.info(
+            "Pod selector discovery for %s %s failed: %s", ctx.scope, name, e,
+        )
+        return None
+    raw = (result.stdout or "").strip()
+    if result.exit_code != 0 or not raw:
+        return None
+    try:
+        selector = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(selector, dict):
+        return None
+    selector = {
+        str(k): str(v)
+        for k, v in selector.items()
+        if v is not None and str(v) != ""
+    }
+    if not selector:
+        return None
+    selector_str = ", ".join(f"{k}={v}" for k, v in selector.items())
+    logger.info(
+        "Discovered authoritative pod selector for %s %s: %s",
+        ctx.scope, name, selector_str,
+    )
+    ctx.tracker.update(
+        f"Pod identity: {ctx.scope} {name} selector {selector_str} "
+        "(authoritative, from workload spec)",
+        {"step": "pod_selector_discovery", "kind": ctx.scope,
+         "name": name, "selector": selector},
+    )
+    return selector
+
+
 def _build_strategy_chain(ctx: _BaselineCtx) -> list:
     """Phase 2a: build the lazy ``(name, factory)`` baseline strategy chain.
 
@@ -375,6 +572,7 @@ def _build_strategy_chain(ctx: _BaselineCtx) -> list:
                     namespace=ctx.spec.namespace if ctx.spec else "",
                     names=ctx.spec.names if ctx.spec else (),
                     labels=dict(ctx.spec.labels) if ctx.spec and ctx.spec.labels else None,
+                    pod_selector=ctx.pod_selector,
                     task_id=ctx.task_id,
                 ),
                 timeout=settings.timeout_baseline_llm,
@@ -568,6 +766,101 @@ async def _select_baseline_strategy(
     return commands, source
 
 
+# #16 fix B (Temporal axiom): assets the approved plan CREATES during execute.
+# The graph wires baseline_capture BEFORE execute_loop, yet the #16 plan's
+# own baseline section declares "(after step 3 completes, ...)" — the plan
+# already encodes the temporal contract; baseline_capture just never read
+# it. For such assets the pre-injection absence is not an error but the
+# ONLY POSSIBLE baseline at this point in the lifecycle, and the asset-level
+# baseline is established by the first post-creation observation instead.
+_PLANNED_CREATE_RE = re.compile(
+    r"kubectl\s+create\s+(?P<kind>[a-z][a-z0-9.-]*)\s+"
+    r"(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)",
+    re.IGNORECASE,
+)
+_PLANNED_RUN_RE = re.compile(
+    r"kubectl\s+run\s+(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)",
+    re.IGNORECASE,
+)
+
+
+def _extract_planned_creations(plan_content: str) -> dict[str, str]:
+    """Map ``name -> canonical kind`` for assets the plan creates during execute.
+
+    Scans the approved plan's command lines for ``kubectl create <kind>
+    <name>`` and ``kubectl run <name>`` (a run creates a pod). File-based
+    forms (``create -f``/``apply -f``) carry no extractable name and are
+    skipped — fail-open, they simply don't get machine marking (the retry
+    LLM can still judge them). Rollback/delete lines never match.
+    """
+    creations: dict[str, str] = {}
+    if not plan_content:
+        return creations
+    for line in plan_content.splitlines():
+        # Markdown plans wrap commands in backticks/emphasis; strip the
+        # wrappers so the regex anchors on the command text itself.
+        text = line.strip().strip("`*")
+        m = _PLANNED_CREATE_RE.search(text)
+        if m:
+            kind = canonicalise_kind(m.group("kind"))
+            name = m.group("name")
+            if kind and name:
+                creations[name] = kind
+            continue
+        m = _PLANNED_RUN_RE.search(text)
+        if m:
+            creations[m.group("name")] = "pod"
+    return creations
+
+
+def _mark_planned_creation_absence(
+    observations: list, plan_creations: dict[str, str], tracker,
+) -> int:
+    """Machine-mark absence-shaped observations on planned-creation assets.
+
+    An observation querying a planned-creation asset and finding nothing
+    (non-zero NotFound OR an empty success) gets ``expected_absence`` with
+    a reason quoting the plan — BEFORE the LLM retry loop, so the retry
+    never burns rounds on a command that can never converge (the asset is
+    created later, by design; #31's lesson generalized to the temporal
+    axis). Marked observations count as valid baseline values (the
+    absence IS the value) and stay out of ``empty_count``.
+
+    Matching is by asset NAME: planned-creation names are drill-scoped
+    and globally unique, and only absence-shaped observations qualify,
+    so a name collision with an unrelated query is not a real risk.
+    """
+    marked = 0
+    for obs in observations:
+        if obs.get("expected_absence"):
+            continue
+        cmd = obs.get("command", "") or ""
+        hit = next((n for n in plan_creations if n and n in cmd), None)
+        if not hit:
+            continue
+        if _is_observation_success(obs) and not _is_empty_observation(obs):
+            # The planned asset already exists with a value — temporal
+            # mismatch of the other kind; leave it unmarked.
+            continue
+        obs["expected_absence"] = (
+            f"planned creation: the approved plan creates "
+            f"{plan_creations[hit]} '{hit}' during execute, so its "
+            f"pre-injection absence IS the baseline value; the asset-level "
+            f"baseline is established by the first post-creation "
+            f"observation"
+        )
+        marked += 1
+    if marked and tracker:
+        tracker.update(
+            f"{marked} observation(s) match planned-creation assets — "
+            "marked expected pre-injection absence (asset-level baseline "
+            "is established after execute creates them)",
+            {"step": "planned_creation_absence", "marked": marked,
+             "assets": sorted(plan_creations)},
+        )
+    return marked
+
+
 async def _collect_observations(
     ctx: _BaselineCtx, commands: list, source: str, strategy_chain: list,
 ) -> tuple[list, list, str]:
@@ -604,12 +897,34 @@ async def _collect_observations(
     )
     observations = await _execute_observations(resolved, kubeconfig, task_id)
 
+    # 4.0.4 #16 fix B (Temporal axiom): read the approved plan's temporal
+    # contract and machine-mark absence observations on assets the plan
+    # itself creates during execute. Runs BEFORE the LLM retry loop so a
+    # planned-creation query never enters judgment — the retry can never
+    # converge on an asset that does not exist yet by design.
+    _plan_content, _ = _find_saved_plan(state.get("messages", []) or [])
+    _plan_creations = _extract_planned_creations(_plan_content)
+    if _plan_creations:
+        _mark_planned_creation_absence(observations, _plan_creations, tracker)
+
     # 4.0.5 LLM self-correcting retry: when LLM-generated commands
-    # fail execution, feed errors back to the LLM and let it
-    # self-correct (up to _LLM_BASELINE_MAX_RETRIES attempts).
-    # Runs BEFORE the strategy-level fallback (4.0.7) so that the
-    # LLM is given a chance to fix itself before we abandon the
-    # primary strategy and reach for registry / scope_fallback.
+    # exit non-zero, feed the evidence back to the LLM for a SEMANTIC
+    # verdict per command (expected pre-injection absence vs. true
+    # failure) and let it self-correct the true failures (up to
+    # _LLM_BASELINE_MAX_RETRIES attempts). Runs BEFORE the strategy-level
+    # fallback (4.0.7) so that the LLM is given a chance to fix itself
+    # before we abandon the primary strategy and reach for registry /
+    # scope_fallback.
+    #
+    # First principles (#31): a non-zero exit is channel signal, not a
+    # semantic verdict. `ls /etc/hosts.bak` exit 2 and `systemctl status
+    # blade-restore-hosts.timer` exit 4 were correct pre-checks whose
+    # non-zero exits ARE the baseline value — the old loop fed them back
+    # as "FAILED" and burned all 3 retries re-deriving byte-identical
+    # commands (~35s: retry cannot converge on an already-correct
+    # command). Observations the retry LLM judges "expected absence" get
+    # marked and excluded from this loop, and counted as valid baseline
+    # values by the strategy-fallback gate below.
     if source == "llm" and llm:
         all_pairs = list(zip(resolved, observations))
         # Commands earlier retries already produced and that still failed. Each
@@ -620,30 +935,42 @@ async def _collect_observations(
         tried_commands: list[str] = []
 
         for retry_num in range(1, _LLM_BASELINE_MAX_RETRIES + 1):
+            # Single source of truth for "needs retry judgment": the same
+            # predicate the final filtering uses (_is_observation_success),
+            # NOT the bare exit_code — and marked expected-absence
+            # observations are valid baseline values that must not re-enter
+            # judgment. #16 fix C extends the set with EMPTY successes
+            # (exit 0, nothing observed): emptiness is either a wrong
+            # identity (wrong selector / wrong name — repairable, the R10
+            # replay's core finding) or an expected pre-injection state
+            # only the retry LLM can confirm from the skill case (an asset
+            # the approved plan creates during execute).
             failed_obs = [o for _, o in all_pairs
-                          if o.get("exit_code") != 0]
+                          if (not _is_observation_success(o)
+                              or _is_empty_observation(o))
+                          and not o.get("expected_absence")]
             if not failed_obs:
                 break
 
             logger.info(
-                "LLM baseline retry %d/%d: %d command(s) failed",
+                "LLM baseline retry %d/%d: %d command(s) non-zero-or-empty",
                 retry_num, _LLM_BASELINE_MAX_RETRIES, len(failed_obs),
             )
             tracker.update(
                 f"LLM retry {retry_num}/{_LLM_BASELINE_MAX_RETRIES}: "
-                f"{len(failed_obs)} command(s) failed, "
-                f"regenerating with error feedback...",
+                f"{len(failed_obs)} command(s) non-zero or empty, "
+                f"judging semantics with error feedback...",
                 {"step": "llm_retry", "attempt": retry_num,
                  "failed_count": len(failed_obs)},
             )
             await dispatch_node_message(
                 "baseline_capture",
                 f"LLM self-correction retry {retry_num}/{_LLM_BASELINE_MAX_RETRIES}: "
-                f"{len(failed_obs)} command(s) failed, regenerating...\n\n",
+                f"{len(failed_obs)} command(s) non-zero or empty, judging semantics...\n\n",
             )
 
             try:
-                retry_commands = await asyncio.wait_for(
+                retry_decisions = await asyncio.wait_for(
                     _llm_retry_failed_commands(
                         llm, skill_case, scope, target, action,
                         failed_obs,
@@ -651,6 +978,7 @@ async def _collect_observations(
                         namespace=spec.namespace if spec else "",
                         names=spec.names if spec else (),
                         labels=dict(spec.labels) if spec and spec.labels else None,
+                        pod_selector=ctx.pod_selector,
                         task_id=task_id,
                         already_tried=tuple(tried_commands),
                     ),
@@ -666,16 +994,37 @@ async def _collect_observations(
                     f"LLM self-correction retry {retry_num} timed out, giving up\n\n",
                 )
                 break
-            if not retry_commands:
-                logger.info(
-                    "LLM retry %d: no corrected commands returned",
-                    retry_num,
+
+            # Semantic verdicts first: mark observations judged as the
+            # expected pre-injection absence form. Their non-zero exit IS
+            # the baseline value; the marks steer the loop condition above
+            # and the strategy-fallback gate below.
+            expected_pairs = retry_decisions.get("expected") or []
+            for _obs, _reason in expected_pairs:
+                _obs["expected_absence"] = _reason or (
+                    "judged expected pre-injection absence by baseline retry"
                 )
+            retry_commands = retry_decisions.get("replace") or []
+
+            if not retry_commands:
+                if not expected_pairs:
+                    logger.info(
+                        "LLM retry %d: no corrected commands returned",
+                        retry_num,
+                    )
+                    await dispatch_node_message(
+                        "baseline_capture",
+                        f"LLM self-correction retry {retry_num} returned no valid command, giving up\n\n",
+                    )
+                    break
+                # All judged expected-absence this round: nothing to re-run.
+                # The marks make the next loop check converge.
                 await dispatch_node_message(
                     "baseline_capture",
-                    f"LLM self-correction retry {retry_num} returned no valid command, giving up\n\n",
+                    f"LLM self-correction retry {retry_num}: non-zero command(s) "
+                    "judged expected pre-injection absence — kept as baseline values\n\n",
                 )
-                break
+                continue
 
             # Record what this retry produced BEFORE judging it: an unresolved
             # template never runs, so it would otherwise leave no trace and the
@@ -692,21 +1041,50 @@ async def _collect_observations(
                 c for c in retry_resolved if not c.get("_unresolved")
             ]
             if not retry_viable:
-                break
+                if not expected_pairs:
+                    break
+                # Only absence verdicts survived this round; marks already
+                # applied — continue so the loop check converges.
+                continue
 
             retry_obs = await _execute_observations(
                 retry_resolved, kubeconfig, task_id,
             )
 
-            # Keep original successes, replace failures with retry.
+            # Keep original VALID successes, keep judged-expected-absence
+            # pairs, replace true failures AND empty successes with retry
+            # results.
             # Use _is_observation_success so kubectl partial failures
             # (exit_code=0 + 'Error from server' in stdout) are treated
-            # as failures and properly retried.
+            # as failures and properly retried; exclude empty successes
+            # (#16 fix C) — they entered this retry round precisely so a
+            # replacement could anchor on the right identity, so keeping
+            # them here would double-count the dimension alongside the
+            # retry result.
             success_pairs = [
                 (r, o) for r, o in all_pairs
                 if _is_observation_success(o)
+                and not _is_empty_observation(o)
+                and not o.get("expected_absence")
             ]
-            all_pairs = success_pairs + list(
+            # Judged-expected-absence observations keep their ORIGINAL pair
+            # — the observation IS the baseline value the verifier
+            # compares against (e.g. "hosts.bak absent pre-injection" via a
+            # non-zero exit, or a planned-creation asset's empty query via
+            # exit 0), and the original resolved dict stays with it
+            # verbatim: downstream consumers read per-target bookkeeping
+            # fields off it (``_target_name``/``_target_sampled`` for
+            # coverage, ``_extractors`` for metadata merging — non-zero
+            # observations are skipped there, but coverage still needs the
+            # name). Rebuilding a minimal dict here would silently drop
+            # those fields and skew ``_target_coverage`` for multi-target
+            # drills. The MARK (not the exit code) is the retention signal:
+            # #16 fix C lets empty successes carry it too.
+            absence_pairs = [
+                (r, o) for r, o in all_pairs
+                if o.get("expected_absence")
+            ]
+            all_pairs = success_pairs + absence_pairs + list(
                 zip(retry_resolved, retry_obs)
             )
 
@@ -733,9 +1111,16 @@ async def _collect_observations(
     # LLM 最多 3 次 self-correcting retry，retry 仍救不回来才会走
     # 到这里。``_attempted = {source}`` 保证 LLM 不会被再调一次，
     # 也就杜绝了"LLM 已经退化失败 → 再调 LLM"的死循环风险。
+    #
+    # 判定 "全部跑挂" 时 expected_absence 观测计为有效采集值：
+    # 纯预检型 baseline（全部观测都是 "注入前不存在" 形态）不触发
+    # 策略回落，否则会白白重跑 registry/scope_fallback 链。
     if (
         observations
-        and not any(_is_observation_success(o) for o in observations)
+        and not any(
+            _is_observation_success(o) or o.get("expected_absence")
+            for o in observations
+        )
     ):
         _attempted = {source}
         for _fb_name, _fb_fn in strategy_chain:
@@ -821,6 +1206,12 @@ def make_baseline_capture(llm=None, registry=None):
         try:
             # Phases 1–2 extracted to _build_baseline_ctx / _build_strategy_chain.
             ctx = _build_baseline_ctx(state, llm, task_id, tracker)
+            # Phase 1.5 (#16 fix A — Identity axiom): discover the target's
+            # authoritative pod selector (workload-scope routes) so the
+            # derive/retry prompts never have to guess one.
+            ctx = replace(
+                ctx, pod_selector=await _discover_pod_selector(ctx),
+            )
             strategy_chain = _build_strategy_chain(ctx)
 
             # Phase 2b extracted to _select_baseline_strategy.

@@ -19,8 +19,8 @@
      --labels "app=<app>" \
      --path <PVC挂载路径> \
      --percent 99 \
-     --timeout <duration> \
-     --kubeconfig <路径>
+     --timeout <duration>
+
    ```
 3. 观察应用 A 的写入行为和错误日志
 
@@ -47,7 +47,7 @@
 
 ---
 
-**降级方案（kubectl-native）**
+**手段2（kubectl-native）**
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效磁盘填充。
 > 两条路径按容器内是否有 `fallocate`/`dd` 二选一。
@@ -79,23 +79,24 @@ kubectl exec <pod-name> -n <namespace> -- fallocate -l <算出的填充量>G <PV
 # 或使用 dd：
 kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=<PVC挂载路径>/fill_file bs=1M count=<填充量换算的MB数>
 ```
+倒计时从武装时刻起算：武装与填充命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f fill_fil[e]; true'` 停旧定时器再全额重武装；容器无 pkill 时旧定时器无法停止，到期会提前清理侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
 
 恢复命令（提前恢复）：
 ```bash
 # 先终止已武装的清理定时器（及仍在写入的 dd），再删除填充文件——已武装定时器不会随
-# 手动恢复取消，迟到的 rm 会误删后续轮次的填充文件（实测：第二轮 dd 写入中被上一轮
+# 手动恢复取消，迟到的 rm 会误删后续轮次的填充文件（第二轮 dd 写入中被上一轮
 # 300s 定时器的 rm 删掉文件名，dd 继续写 unlinked inode，空间占用持续到 dd 退出）
 kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f fill_file; rm -f <PVC挂载路径>/fill_file'
 ```
 
 注意事项：
-- `fallocate` 分配速度快（仅分配元数据），`dd` 实际写入数据速度较慢但更真实（实测 19.5G
-  PVC 以 ~430MB/s 写入约 45s，dd 需 nohup 后台跑防执行通道超时）
+- `fallocate` 分配速度快（仅分配元数据），`dd` 实际写入数据速度较慢但更真实（19.5G
+  PVC 以 ~430MB/s 写入约 45s，dd 需 nohup 后台跑防命令执行超时）
 - 自恢复基于注入前武装的容器内后台定时器（sleep <duration> + rm 填充文件），到期自动清理
-  （实测机制正常）；提前恢复用上方手动命令，**必须先 pkill 终止定时器**，否则跨轮次幽灵
+  （机制正常）；提前恢复用上方手动命令，**必须先 pkill 终止定时器**，否则跨轮次幽灵
   rm 会误删新一轮填充文件
 - 需按**增量**计算填充大小以确保磁盘使用率达到预期值（填充量 = 文件系统总容量 × 目标使用率 − 当前已用量，先用 `df -h <PVC挂载路径>` 查看）；盲目填一个大数可能越过云盘实际容量直接报 ENOSPC，也可能远达不到打满效果
-- ENOSPC 判据的触发量需超过剩余可用空间（实测：Use% 99%、Avail 112M 时，50MB 写入
+- ENOSPC 判据的触发量需超过剩余可用空间（Use% 99%、Avail 112M 时，50MB 写入
   仍成功、200MB 写入才报 `No space left on device`）
 
 ---
@@ -105,9 +106,9 @@ kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f fill_file; rm -f <PVC�
 PVC 在容器里是一个挂载点，它的真实存储在宿主机的 kubelet 目录下。从节点侧直接写，
 工具来自 debug 镜像，不需要业务容器内有任何二进制。
 
-> 本用例目标是 **PVC / 云盘**，实测这类卷挂在**独立块设备**上（如 `/dev/vdb`、`/dev/vde`，
+> 本用例目标是 **PVC / 云盘**，这类卷挂在**独立块设备**上（如 `/dev/vdb`、`/dev/vde`，
 > 与节点根盘 `/dev/vda3` 分离），填满只影响该 Pod —— 这正是本路径的安全适用场景。
-> 但**必须在步骤 2 实测确认设备独立**后再写：若目标路径其实落在节点根盘
+> 但**必须在步骤 2 现场确认设备独立**后再写：若目标路径其实落在节点根盘
 > （emptyDir 或容器 rootfs 的普通目录），填满会触发节点 `DiskPressure` 并驱逐其它 Pod，
 > 此时应改用 `Node_磁盘空间不足` 用例并按节点级爆炸半径评估。
 
@@ -117,7 +118,7 @@ PVC 在容器里是一个挂载点，它的真实存储在宿主机的 kubelet �
    kubectl get pod <pod-name> -n <namespace> -o jsonpath={.metadata.uid}
    ```
 
-2. 在节点上定位 PVC 的宿主机路径并**确认设备独立**。实测路径规律：
+2. 在节点上定位 PVC 的宿主机路径并**确认设备独立**。路径规律：
    ```
    /var/lib/kubelet/pods/<PodUID>/volumes/kubernetes.io~csi/<volumeHandle>/mount
    ```

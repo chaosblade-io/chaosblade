@@ -38,7 +38,15 @@ from typing import Callable
 # kubectl boolean flags — explicit list REQUIRED. The parser's fallback
 # treats an unknown flag as value-taking (consumes the next token), so
 # omitting a boolean here causes the next positional to be silently
-# swallowed. Covers global + frequently-used per-subcommand booleans.
+# swallowed — and when the flag precedes the verb, the SWALLOWED token is
+# the SUBCOMMAND itself (``guard.py``'s allowlist is keyed on the first
+# non-flag token), so the shape check then runs against the wrong verb.
+# Coverage is mechanical, never "frequently used": the table is diffed
+# against the synopsis of EVERY admitted subcommand plus ``kubectl
+# options`` (R47 — 42 members were missing and were added; R48 re-ran the
+# same diff at MEMBER level and added ``--interactive``, whose covered
+# shorthand ``-i`` had masked it from R47's set-level comparison. The diff
+# is re-runnable and pinned by the drift test in test_guard_parser.py).
 KUBECTL_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     # Global / output
     "-h", "--help", "--version",
@@ -52,21 +60,29 @@ KUBECTL_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     # get/delete/wait
     "--ignore-not-found",
     "--force",
-    "--cascade",          # technically takes value in newer kubectl; safer as bool
+    "--cascade",          # NoOptDefVal string — KUBECTL_NOOPT_DEFVAL_FLAGS
     "--prune",
-    "--validate",
-    "--dry-run",          # newer kubectl wants =client|server but bare form still parses
+    "--validate",         # NoOptDefVal string — KUBECTL_NOOPT_DEFVAL_FLAGS
+    "--dry-run",          # NoOptDefVal string — KUBECTL_NOOPT_DEFVAL_FLAGS
     # exec/run
     "-i", "--stdin",
     "-t", "--tty",
-    # logs — note: -f/--follow is subcommand-dependent (boolean in
-    # ``kubectl logs``, but ``kubectl get -f file.yaml`` uses -f as
-    # --filename). Defaulting to value-taking is the safer choice for
-    # the security guard: in the logs case, the next positional may be
-    # mis-classified as the -f value, but it still lands in
-    # host_relevant_tokens() and is checked. In the get/apply case,
-    # the filename correctly lands in data_payload_values and is
-    # skipped from regex checks.
+    # logs — ``--follow`` is a boolean here; its shorthands ``-f``/``-p``
+    # are the subcommand-dependent pair (``--filename``/``--patch``
+    # elsewhere) resolved by subcommand in the parser via
+    # KUBECTL_SUBCOMMAND_BOOLEAN_SHORTHANDS, not by this flat table. The
+    # reasoning that used to sit here — "reading -f as value-taking is safe
+    # because the swallowed token still lands in host_relevant_tokens() and
+    # is checked" — was FALSE: ``-f`` is ALSO a member of
+    # KUBECTL_DATA_PAYLOAD_FLAGS, so the swallowed token was
+    # payload-skipped and escaped every host check (R47, measured for
+    # ``-f``; R48 found the second member ``-p`` that R47's "the ONE"
+    # claim had missed, and closed the class mechanically).
+    "--follow",
+    "--all-containers",
+    "--all-pods",
+    "--ignore-errors",
+    "--insecure-skip-tls-verify-backend",
     "--previous",
     "--prefix",
     "--timestamps",
@@ -74,14 +90,87 @@ KUBECTL_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     "--show-events",
     # rollout etc.
     "--allow-missing-template-keys",
+    # run
+    "--privileged",
+    "--rm",
+    "--expose",
+    "--leave-stdin-open",
+    "--command",
+    "--attach",
+    # debug
+    "--arguments-only",
+    "--replace",
+    "--same-node",
+    "--share-processes",
+    "--keep-annotations",
+    "--keep-init-containers",
+    "--keep-labels",
+    "--keep-liveness",
+    "--keep-readiness",
+    "--keep-startup",
+    # drain
+    "--ignore-daemonsets",
+    "--disable-eviction",
+    "--delete-emptydir-data",
+    # delete / apply / create / replace / label / patch / taint
+    "--now",
+    "--wait",
+    "--interactive",      # delete ``-i`` — R48: masked from the set-level
+                          # diff because ``-i`` was already covered (as
+                          # exec's ``--stdin`` shorthand)
+    "--server-side",
+    "--force-conflicts",
+    "--openapi-patch",
+    "--edit",
+    "--windows-line-endings",
+    "--save-config",
+    "--list",
+    "--local",
+    "--overwrite",
+    # api-resources / version / get / global
+    "--cached",
+    "--namespaced",
+    "--client",
+    "--output-watch-events",
+    "--disable-compression",
+    "--match-server-version",
+    "--warnings-as-errors",
+})
+
+# String-typed flags that pflag declares with NoOptDefVal: they ACCEPT a
+# bare occurrence (``--dry-run`` == ``--dry-run=client``, deprecated but
+# still parsed) and — the pflag semantics that decides their table home —
+# in ``--flag value`` SPACE form they do NOT swallow the next token; the
+# value must be glued (``--flag=value``). Measured against kubectl v1.34.1
+# (R49, the round that audited the R45-R48 fixes themselves):
+#   delete pod x --dry-run             -> dry run executes (deprecation warn)
+#   delete pod x --cascade background  -> BOTH ``x`` and ``background`` are
+#                                         positional resource names
+#                                         (server NotFound twice)
+#   apply -f /dev/null --validate strict -> "Unexpected args: [strict]"
+# So the flat boolean table's valueless reading matches pflag in all three
+# forms: bare (no token to swallow), space (the would-be value stays a
+# positional and is host-scanned), and ``=`` (the parser's eq_val branch
+# takes it as a value). A help marker that is not ``false``/``true`` does
+# NOT make these wrong-present in the boolean table — the reverse-face
+# drift test keys on this whitelist, and any new member must be measured
+# the same way (bare + space + eq against the real binary) before being
+# added here.
+KUBECTL_NOOPT_DEFVAL_FLAGS: frozenset[str] = frozenset({
+    "--dry-run",     # help marker ='none'; bare form deprecated but parsed
+    "--cascade",     # help marker ='background'
+    "--validate",    # help marker ='strict'
 })
 
 # kubectl flags whose value is opaque data (JSON, label string, file
 # path, selector expression) — not a shell command. These get put in
 # data_payload_values and skipped by host_relevant_tokens().
 KUBECTL_DATA_PAYLOAD_FLAGS: frozenset[str] = frozenset({
-    "-p", "--patch",
-    "-f", "--filename",                  # also boolean for logs; resolved by subcommand context if needed
+    "-p", "--patch",                     # ``logs -p`` is ``--previous`` (boolean) —
+                                         # resolved by subcommand in the parser
+    "-f", "--filename",                  # --filename semantics (get/apply/exec…);
+                                         # ``logs -f`` is ``--follow`` (boolean) —
+                                         # resolved by subcommand in the parser
     "--from-literal", "--from-file", "--from-env-file",
     "--annotation", "--annotations",
     "--labels", "--label",
@@ -114,6 +203,36 @@ KUBECTL_DATA_PAYLOAD_FLAGS: frozenset[str] = frozenset({
 KUBECTL_DOUBLE_DASH_SUBCOMMANDS: frozenset[str] = frozenset({
     "exec", "run", "attach", "debug",
 })
+
+# Subcommand-dependent boolean SHORTHANDS — the one place the flat tables
+# cannot hold the truth. A shorthand that is a BOOLEAN under one subcommand
+# collides with a PAYLOAD-table shorthand elsewhere (``logs -f`` is
+# ``--follow`` while ``-f`` is ``--filename`` everywhere else; ``logs -p``
+# is ``--previous`` while ``-p`` is ``--patch``): the parser's flat-boolean
+# branch is subcommand-blind, the payload table is subcommand-blind, and a
+# shorthand read as value-taking SWALLOWS the next token AND payload-skips
+# it — the token then escapes every host check (R47 measured the ``-f``
+# escape; R48 found ``-p``).
+#
+# R47 resolved ``-f`` with a parser literal and declared it "the ONE
+# genuinely subcommand-dependent spelling". That claim was never
+# mechanically testable as written: R47's dependency scan compared LONG
+# names (``--follow`` vs ``--filename``), while the collision lives in the
+# SHORT ones — and R47's own drift test missed ``-p`` for the same reason
+# (its missing-check was set-level: the covered long twin ``--previous``
+# masked the uncovered shorthand).
+#
+# This table is the MECHANICAL result, re-derivable: for every subcommand
+# ``guard.py`` admits, intersect that subcommand's own boolean shorthands
+# (parsed from ``kubectl <sub> --help``) with the payload table's
+# shorthands. ``logs`` is the only subcommand that collides, and
+# ``-f``/``-p`` are its only members. The drift test in
+# test_guard_parser.py re-runs the scan at NAME level (every name of every
+# boolean declaration must be covered) and is skipped where kubectl is
+# absent.
+KUBECTL_SUBCOMMAND_BOOLEAN_SHORTHANDS: dict[str, frozenset[str]] = {
+    "logs": frozenset({"-f", "-p"}),
+}
 
 # blade boolean flags — same rationale as KUBECTL_BOOLEAN_FLAGS.
 BLADE_BOOLEAN_FLAGS: frozenset[str] = frozenset({
@@ -235,8 +354,20 @@ def _parse_kubectl(cmd: list[str]) -> ParsedCommand:
 
         if token.startswith("-") and len(token) > 1:
             name, eq_val = _split_flag_eq(token)
-            # Boolean flag — no value, no token consumption beyond self
-            if name in KUBECTL_BOOLEAN_FLAGS and eq_val is None:
+            # Boolean flag — no value, no token consumption beyond self.
+            # Shorthands that are boolean under THIS subcommand while the
+            # flat payload table classifies them as values are resolved by
+            # subcommand here: ``logs -f`` is ``--follow`` and ``logs -p``
+            # is ``--previous``, while ``-f``/``-p`` are ``--filename``/
+            # ``--patch`` everywhere else. Reading either as value-taking
+            # under ``logs`` swallowed the next token AND payload-skipped
+            # it, so the token escaped every host check (R47 measured the
+            # ``-f`` escape; R48 closed the class with ``-p``).
+            if (
+                name in KUBECTL_BOOLEAN_FLAGS
+                or name
+                in KUBECTL_SUBCOMMAND_BOOLEAN_SHORTHANDS.get(subcommand or "", ())
+            ) and eq_val is None:
                 flags.append((name, None))
                 i += 1
                 continue

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from chaos_agent.utils.truncation import elided_preview
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -96,7 +98,13 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
         display = _TOOL_DISPLAY_NAMES.get(name, name)
         ev: dict = {
             "kind": "tool_start",
-            "tool_name": name,
+            # Single generic tool key (l4-contract-faithfulness):
+            # external consumers (e.g. resiliencebenchmark's
+            # _normalize_bladeai_event) read payload.get("tool"). This L4
+            # SDK channel is separate from the TUI/server StreamEvent
+            # channel (agent/streaming.py), whose tool_name field is
+            # untouched.
+            "tool": name,
             "message": f"Calling: {display}",
             # astream_events 中同一次工具调用的 on_tool_start / on_tool_end
             # 共享同一 run_id，作为前端精确配对并发同名工具的唯一键。
@@ -111,7 +119,7 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
         display = _TOOL_DISPLAY_NAMES.get(name, name)
         ev = {
             "kind": "tool_end",
-            "tool_name": name,
+            "tool": name,
             "message": f"Finished: {display}",
             "level": "ok",
             "call_id": event.get("run_id", "") or "",
@@ -124,7 +132,10 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
             if content is None:
                 content = str(output)
             if isinstance(content, str) and len(content) > 2000:
-                content = content[:2000] + "...(truncated)"
+                # Both-ends preview, total budget 2000 unchanged: tool_end's
+                # table headers live at the head, the verdict at the tail —
+                # a head-only cut bets on output shape (#31 morphology).
+                content = elided_preview(content, 1500, 500)
             ev["output"] = content
         return [ev]
 
@@ -143,10 +154,12 @@ def _normalize_langgraph_event(event: dict) -> list[dict]:
         err = data.get("error")
         content = (str(err).strip() if err is not None else "") or "tool error"
         if len(content) > 2000:
-            content = content[:2000] + "...(truncated)"
+            # Same shared dialect as tool_end above: exception chains name
+            # the entrypoint at the head and the exception at the tail.
+            content = elided_preview(content, 1500, 500)
         return [{
             "kind": "tool_end",
-            "tool_name": name,
+            "tool": name,
             "message": f"Failed: {display}",
             "level": "error",
             "is_error": True,

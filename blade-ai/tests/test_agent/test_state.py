@@ -4,9 +4,12 @@ from chaos_agent.agent.state import (
     AgentState,
     build_status_data,
     has_active_fault,
+    infer_inject_status,
     infer_phase,
+    infer_recover_status,
     infer_task_state,
     materialize_fault_handle,
+    terminal_task_state,
 )
 from chaos_agent.agent.state_mgmt.state_lifecycle import (
     STATE_DURABLE_FACT_FIELDS,
@@ -16,6 +19,7 @@ from chaos_agent.agent.state_mgmt.state_lifecycle import (
     iter_state_fields,
     per_fault_reset_state,
     recover_reset_state,
+    replan_reset_state,
     state_field_policy,
     state_field_group,
 )
@@ -126,6 +130,11 @@ class TestAgentStateDefaults:
             for name, policy in STATE_FIELD_POLICIES.items()
             if policy.reset_on_recover
         }
+        assert set(replan_reset_state()) == {
+            name
+            for name, policy in STATE_FIELD_POLICIES.items()
+            if policy.reset_on_replan
+        }
 
         experiment_policy = state_field_policy("experiment_uid")
         assert experiment_policy is not None
@@ -139,6 +148,88 @@ class TestAgentStateDefaults:
         assert recover_policy.group == "verification"
         assert recover_policy.reset_on_batch_fault is True
         assert recover_policy.reset_on_recover is True
+
+        # B76 review G/H — the liability ledger's two wings. Both are
+        # append-only for the task lifetime and cross EVERY boundary
+        # (batch advance, recover entry): owned is the birth registry,
+        # retired is the only death proof for framework-side destroys
+        # (no ToolMessage) — a reset on either boundary resurrects a
+        # destroyed experiment in live_liability_uids and the next sweep
+        # repeat-destroys it (probe_b76_round8.py H4).
+        owned_policy = state_field_policy("owned_experiment_uids")
+        assert owned_policy is not None
+        assert owned_policy.group == "execution"
+        assert owned_policy.durable is True
+        assert owned_policy.reset_on_batch_fault is False
+        assert owned_policy.reset_on_recover is False
+
+        retired_policy = state_field_policy("retired_experiment_uids")
+        assert retired_policy is not None
+        assert retired_policy.group == "execution"
+        assert retired_policy.durable is True
+        assert retired_policy.reset_on_batch_fault is False
+        assert retired_policy.reset_on_recover is False
+
+    def test_replan_reset_state_pins_w56_5_attempt_scoped_keys(self):
+        """W-56-5 defect b — the replan seam reset is registry-driven.
+
+        The agent_loop replan entry once hand-maintained this list and
+        forgot safety_reason/error/failure_reason/failure_detail, letting
+        attempt 1's terminal residue strangle attempt 2 on its first route
+        (task #56). The exact key/value set is pinned here: shrinking it
+        resurrects the leak, growing it must be a deliberate lifecycle
+        decision (declare ``replan=`` on the policy, not a side list).
+        """
+        assert replan_reset_state() == {
+            # Safety verdict of the previous attempt — re-evaluated fresh.
+            "safety_status": "pending",
+            "safety_reason": None,
+            "blast_radius_scope": None,
+            "blast_radius_detail": None,
+            # Confirmation handshake — re-frozen for the corrected plan.
+            "needs_confirmation": False,
+            "replan_requested": False,
+            # Terminal residue — already captured in replan_history; a
+            # stale error short-circuits should_continue_agent_loop.
+            "error": None,
+            "failure_reason": None,
+            "failure_detail": None,
+        }
+        # Cross-boundary independence: the replan group is a distinct
+        # semantic slot — batch/recover membership does not imply replan
+        # membership (e.g. drift_reject_count resets per batch but
+        # deliberately accumulates across attempts).
+        assert "drift_reject_count" not in replan_reset_state()
+        assert "drift_reject_count" in per_fault_reset_state()
+        for policy in STATE_FIELD_POLICIES.values():
+            if policy.reset_on_replan:
+                assert policy.reset_on_batch_fault, (
+                    f"{policy.name}: attempt-scoped reset without "
+                    "batch-scoped reset is a lifecycle smell"
+                )
+
+    def test_liability_ledger_survives_batch_and_recover_resets(self):
+        """B76 review H — the death proof must outlive the batch boundary.
+
+        batch_setup wipes messages (REMOVE_ALL_MESSAGES), so after a batch
+        advance the retired registry is the ONLY evidence that a
+        framework-destroyed UID is dead; if the reset delta also cleared it,
+        the live view would resurrect the UID for the next fault's sweep.
+        """
+        from chaos_agent.agent.state import live_liability_uids
+
+        assert "owned_experiment_uids" not in per_fault_reset_state()
+        assert "retired_experiment_uids" not in per_fault_reset_state()
+        assert "owned_experiment_uids" not in recover_reset_state()
+        assert "retired_experiment_uids" not in recover_reset_state()
+
+        # Post-batch shape: both wings retained, message evidence wiped.
+        post_batch = {
+            "messages": [],
+            "owned_experiment_uids": ["uid-e1", "uid-e2"],
+            "retired_experiment_uids": ["uid-e1"],
+        }
+        assert live_liability_uids(post_batch) == ["uid-e2"]
 
     def test_recover_reset_fields_are_lifecycle_classified(self):
         reset_fields = set(recover_reset_state())
@@ -210,8 +301,13 @@ class TestInferTaskState:
         }
         assert infer_task_state(state) == "injected"
 
-    def test_l1_skipped_l2_unknown_returns_failed(self):
-        """Non-ChaosBlade: L1=skipped + L2=unknown → failed (core bug fix)."""
+    def test_l1_skipped_l2_unknown_returns_unverified(self):
+        """Non-CB: L1=skipped + L2=unknown + level=unverified → unverified.
+
+        Honest ignorance (verification ran, evidence unavailable) is a distinct
+        knowledge claim — not counter-evidence (failed), not success (injected).
+        Previously fell through to "failed".
+        """
         state = {
             "operation": "inject",
             "verification": {
@@ -220,7 +316,52 @@ class TestInferTaskState:
                 "layer2": {"status": "unknown"},
             },
         }
-        assert infer_task_state(state) == "failed"
+        assert infer_task_state(state) == "unverified"
+
+    def test_l1_passed_l2_unknown_unverified_returns_unverified(self):
+        """CB: L1=passed + L2=unknown + level=unverified → unverified.
+
+        L1 shows the experiment Running, but the verifier honestly reports it
+        could not observe the effect. Reporting "failed" would claim
+        counter-evidence that does not exist.
+        """
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "unverified",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "unknown"},
+            },
+        }
+        assert infer_task_state(state) == "unverified"
+
+    def test_l1_warning_l2_unknown_unverified_returns_unverified(self):
+        """CB warning path (e.g., CLI timeout): mirrors the passed path."""
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "unverified",
+                "layer1": {"status": "warning"},
+                "layer2": {"status": "unknown"},
+            },
+        }
+        assert infer_task_state(state) == "unverified"
+
+    def test_l2_unknown_level_unknown_returns_unverified(self):
+        """Verifier silence (level=unknown) no longer outranks honesty.
+
+        l2=unknown + level=unknown used to map to "injected" — silence scored
+        better than an honest "unverified". Both now land on "unverified".
+        """
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "unknown",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "unknown"},
+            },
+        }
+        assert infer_task_state(state) == "unverified"
 
     def test_l1_skipped_l2_passed_returns_injected(self):
         """Non-ChaosBlade: L1=skipped + L2=passed → injected (verified)."""
@@ -319,6 +460,73 @@ class TestInferTaskState:
             "confirmed_intent": "chat",
         }
         assert infer_task_state(state) == "completed"
+
+    def test_dry_run_preview_returns_completed(self):
+        """Round-61 R61-4/R61-4b: the /plan preview terminates at
+        route_after_confirmation ("end" for dry_run) with no verification
+        — its own deliverable IS the plan, so the terminal word is
+        'completed', not the 'injecting'→'failed' cascade. The pipeline
+        input carries ``dry_run`` straight from the TUI /plan context."""
+        state = {
+            "operation": "inject",
+            "confirmed_intent": "inject",
+            "dry_run": True,
+            "plan_summary": "## Plan\n- cpu fullload 80%",
+            "needs_confirmation": False,
+            "fault_spec": {"target": "app=x", "action": "cpu-fullload"},
+        }
+        assert infer_task_state(state) == "completed"
+
+    def test_real_run_plan_summary_shape_not_swallowed(self):
+        """Round-61 P7 collision guard: planning writes ``plan_summary``
+        for REAL runs too (extract_planning_metadata feeds the confirm
+        card), so once the gate closes needs_confirmation a real run
+        aborted before its verification carries the SAME plan_summary
+        shape — minus ``dry_run``. It must NOT infer 'completed': a run
+        that never reached its verdict is 'injecting' (terminal 'failed').
+        This is exactly what a shape-only gate (no dry_run discriminator)
+        would get wrong."""
+        state = {
+            "operation": "inject",
+            "confirmed_intent": "inject",
+            "plan_summary": "## Plan\n- cpu fullload 80%",
+            "needs_confirmation": False,
+            "fault_spec": {"target": "app=x", "action": "cpu-fullload"},
+        }
+        assert infer_task_state(state) == "injecting"
+
+    def test_dry_run_with_committed_fault_not_completed(self):
+        """The dry_run branch never outranks a committed fault: a
+        dry_run=True thread that somehow carries a fault handle stays on
+        the fault lifecycle (injecting without a verdict), so the branch
+        cannot mask a live injection behind the preview's completion."""
+        state = {
+            "operation": "inject",
+            "confirmed_intent": "inject",
+            "dry_run": True,
+            "plan_summary": "## Plan\n- cpu fullload 80%",
+            "needs_confirmation": False,
+            "experiment_uid": "exp-123",
+        }
+        assert infer_task_state(state) == "injecting"
+
+    def test_dry_run_with_verification_follows_verification(self):
+        """A dry_run thread that nonetheless carries a verification verdict
+        is governed by the verdict (injected), not by the preview branch —
+        the discriminator only completes runs with NOTHING else on record."""
+        state = {
+            "operation": "inject",
+            "confirmed_intent": "inject",
+            "dry_run": True,
+            "plan_summary": "## Plan\n- cpu fullload 80%",
+            "needs_confirmation": False,
+            "verification": {
+                "level": "verified",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "passed"},
+            },
+        }
+        assert infer_task_state(state) == "injected"
 
 
 class TestInferPhase:
@@ -429,6 +637,40 @@ class TestInferPhase:
         }
         assert infer_phase(failed) == "verification_failed"
 
+    def test_recover_phase_honors_verification_over_result_mirror(self):
+        """Round-16 S3: a mirror/verification divergence must not split
+        phase from task_state. Before the fix this branch read the result
+        mirror (the FOURTH parallel copy of the recover verdict mapping)
+        while every task_state reader honoured the verification dict
+        (D4) — mirror=partial + verification=recovered yielded
+        task_state="recovered" but phase="partial_recovered" for the
+        SAME state."""
+        diverged = {
+            "operation": "recover",
+            "result": {"recovered": True, "recovery_level": "partial"},
+            "recover_verification": {
+                "level": "recovered",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "passed"},
+            },
+        }
+        assert infer_phase(diverged) == "recovered"
+
+    def test_recover_phase_partial_verification_beats_mirror_claim(self):
+        """The mirror direction too: mirror claims full recovery, the
+        verification authority says partial — phase follows the
+        authority (single source), not the mirror."""
+        diverged = {
+            "operation": "recover",
+            "result": {"recovered": True, "recovery_level": "recovered"},
+            "recover_verification": {
+                "level": "partial",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "unknown"},
+            },
+        }
+        assert infer_phase(diverged) == "partial_recovered"
+
 
 class TestFaultHandlePredicate:
     """``materialize_fault_handle`` / ``has_active_fault`` — the carrier-neutral
@@ -481,6 +723,191 @@ class TestFaultHandlePredicate:
         assert materialize_fault_handle(state) == {
             "kind": "native", "method": "kubectl_native",
         }
+
+    def test_committed_semantics_survives_proven_destroy(self):
+        """Round-25 contract pin: the predicate is COMMITTED, not live. The
+        handle projection has no death axis (it mirrors the attribution
+        slots, which no destroy path clears), so the post-destroy steady
+        state — corpse slot + landed retired ledger + proven destroy pair
+        — keeps materializing a live-shaped handle. This is by design:
+        recovery targets, postmortems and summaries need the committed
+        identity long after the death. A consumer answering the LIVE
+        question must gate on live_liability_uids instead (the twins
+        verdict on this exact dict is the pin's other half)."""
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        from chaos_agent.agent.state import live_liability_uids
+
+        uid = "deadbeef00000001"
+        dead_state = {
+            "experiment_uid": uid,
+            "injection_method": "chaosblade",
+            "retired_experiment_uids": [uid],
+            "messages": [
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "blade_destroy",
+                        "args": {"uid": uid},
+                        "id": "tc-r25-pin",
+                        "type": "tool_call",
+                    }],
+                ),
+                ToolMessage(
+                    content='{"code":200,"success":true,"result":"success"}',
+                    name="blade_destroy",
+                    tool_call_id="tc-r25-pin",
+                ),
+            ],
+        }
+        # Committed half: the handle stays live-shaped after the destroy.
+        assert has_active_fault(dead_state) is True
+        assert materialize_fault_handle(dead_state) == {
+            "kind": "experiment_uid", "value": uid, "method": "chaosblade",
+        }
+        # Live half (the twins verdict): the liability primitive convicts
+        # the same dict — live-semantics consumers gate on THIS, never on
+        # the committed predicate alone.
+        assert live_liability_uids(dead_state) == []
+
+    def test_live_predicate_carrier_and_lifecycle_matrix(self):
+        """Round-28: ``has_live_fault`` — the LIVE twin, single-sourced.
+
+        The matrix the round-25 pin implied but never had a public
+        predicate for: never-injected False; a native carrier True (no
+        death oracle exists — the committed verdict, conservative); a live
+        experiment True; the post-destroy steady state False while the
+        committed twin stays True on the exact same dict (the split
+        round-25 legislated, now reachable without re-assembling the
+        gate inline at every consumer)."""
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        from chaos_agent.agent.state import has_live_fault
+
+        # Never-injected: no provider claims the facts.
+        assert has_live_fault({}) is False
+        assert has_live_fault({"messages": []}) is False
+
+        # Native carrier: UID-less, no death oracle — committed verdict.
+        native = {
+            "injection_method": "kubectl_native",
+            "fault_handle": {"kind": "native", "method": "kubectl_native"},
+            "messages": [],
+        }
+        assert has_live_fault(native) is True
+
+        uid = "deadbeef00000002"
+        create_pair = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "blade_create",
+                    "args": {"command": "create k8s pod-cpu fullload"},
+                    "id": "tc-r28-live",
+                    "type": "tool_call",
+                }],
+            ),
+            ToolMessage(
+                content='{"code":200,"success":true,"result":"%s"}' % uid,
+                name="blade_create",
+                tool_call_id="tc-r28-live",
+            ),
+        ]
+        # Live experiment: the create receipt proves the birth, nothing
+        # proves death.
+        live = {
+            "experiment_uid": uid,
+            "injection_method": "kubectl_exec",
+            "messages": create_pair,
+        }
+        assert has_live_fault(live) is True
+
+        # Post-destroy steady state: slot corpse + landed retired ledger
+        # + proven destroy pair. The twins split exactly here.
+        dead = {
+            **live,
+            "retired_experiment_uids": [uid],
+            "messages": create_pair + [
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "blade_destroy",
+                        "args": {"uid": uid},
+                        "id": "tc-r28-kill",
+                        "type": "tool_call",
+                    }],
+                ),
+                ToolMessage(
+                    content='{"code":200,"success":true,"result":"success"}',
+                    name="blade_destroy",
+                    tool_call_id="tc-r28-kill",
+                ),
+            ],
+        }
+        assert has_live_fault(dead) is False
+        assert has_active_fault(dead) is True
+
+    def test_live_predicate_hydrates_the_seam_aftermath_shapes(self):
+        """Round-28: the replan-seam aftermath reaches the oracle through
+        hydration.
+
+        The aftermath shapes carry NO stored handle and NO method (the
+        seam keeps the UID, clears the method for re-detection). The
+        predicate materializes FIRST, so the provider claims the bare UID
+        slot and the carrier split still reaches the liability oracle:
+        the PROTECTED shape (a live experiment that survived the seam —
+        the reason keep_experiment_uid exists) keeps its live verdict;
+        the corpse flavor reads False. This hydration lane is exactly
+        what the round-25 inline emergency gate missed — a
+        stored-handle-less corpse used to fall into the committed branch
+        (pinned in test_emergency_recover_gate.py)."""
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        from chaos_agent.agent.state import has_live_fault
+
+        uid = "deadbeef00000003"
+        create_pair = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "blade_create",
+                    "args": {"command": "create k8s pod-cpu fullload"},
+                    "id": "tc-r28-after",
+                    "type": "tool_call",
+                }],
+            ),
+            ToolMessage(
+                content='{"code":200,"success":true,"result":"%s"}' % uid,
+                name="blade_create",
+                tool_call_id="tc-r28-after",
+            ),
+        ]
+        # LIVE aftermath — keep=True exists to protect this shape.
+        live_aftermath = {"experiment_uid": uid, "messages": create_pair}
+        assert has_live_fault(live_aftermath) is True
+
+        # DEAD aftermath — same kept slot, proven death.
+        dead_aftermath = {
+            "experiment_uid": uid,
+            "retired_experiment_uids": [uid],
+            "messages": create_pair + [
+                AIMessage(
+                    content="",
+                    tool_calls=[{
+                        "name": "blade_destroy",
+                        "args": {"uid": uid},
+                        "id": "tc-r28-after-kill",
+                        "type": "tool_call",
+                    }],
+                ),
+                ToolMessage(
+                    content='{"code":200,"success":true,"result":"success"}',
+                    name="blade_destroy",
+                    tool_call_id="tc-r28-after-kill",
+                ),
+            ],
+        }
+        assert has_live_fault(dead_aftermath) is False
 
 
 class TestBuildStatusDataExposedFields:
@@ -592,3 +1019,71 @@ class TestBuildStatusDataExposedFields:
         without an extra null check."""
         data = build_status_data("t-se2", {})
         assert data["side_effects"] == {}
+
+
+class TestRecoverUnverified:
+    """Recovery-side three-way verdict: recovered / failed / unverified."""
+
+    def test_recover_unverified_level_returns_unverified(self):
+        """recovery_level=unverified (observation unavailable, no
+        counter-evidence) is not a recovery failure."""
+        state = {
+            "operation": "recover",
+            "recover_verification": {
+                "level": "unverified",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "unknown"},
+            },
+            "result": {"recovered": False, "recovery_level": "unverified"},
+        }
+        assert infer_task_state(state) == "unverified"
+
+    def test_recover_unrecovered_stays_failed(self):
+        """Counter-evidence (fault still active) keeps the failed verdict."""
+        state = {
+            "operation": "recover",
+            "recover_verification": {
+                "level": "unrecovered",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "failed"},
+            },
+            "result": {"recovered": False, "recovery_level": "unrecovered"},
+        }
+        assert infer_task_state(state) == "failed"
+
+    def test_recover_recovered_unchanged(self):
+        state = {
+            "operation": "recover",
+            "recover_verification": {
+                "level": "recovered",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "passed"},
+            },
+            "result": {"recovered": True, "recovery_level": "recovered"},
+        }
+        assert infer_task_state(state) == "recovered"
+
+    def test_terminal_task_state_passes_unverified_through(self):
+        """unverified is a terminal knowledge claim — no injecting fallback."""
+        state = {
+            "operation": "inject",
+            "verification": {
+                "level": "unverified",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "unknown"},
+            },
+        }
+        assert terminal_task_state(state) == "unverified"
+
+    def test_infer_inject_status_unverified_is_failed(self):
+        """Coarse four-value domain: an ENDED run must not read "pending"."""
+        assert infer_inject_status("unverified") == "failed"
+
+    def test_infer_recover_status_unverified_is_failed(self):
+        """Recovery-stage mirror: the run has ENDED, "pending" would mislead
+        (build_status_data feeds status queries / TUI from this)."""
+        assert infer_recover_status("unverified", "recover") == "failed"
+
+    def test_infer_recover_status_recovered_unchanged(self):
+        assert infer_recover_status("recovered", "recover") == "success"
+        assert infer_recover_status("partial_recovered", "recover") == "success"

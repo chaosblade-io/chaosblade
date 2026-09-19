@@ -27,11 +27,21 @@
      --names <节点名> \
      --path <volume挂载路径> \
      --read --write \
-     --timeout <duration> \
-     --kubeconfig <路径>
+     --timeout <duration>
+
    ```
+   倒计时从武装时刻起算：无论 timeout 限时占用还是 blade burn，武装后与后续的删 Pod 触发步骤必须是紧邻操作（≤60s）；武装后发生任何修复须先停旧定时（timeout 形态 kill 旧 tail 进程；blade 形态 `blade destroy <experiment_uid>`）再全额重武装，然后才触发删除（见 SKILL.md 安全红线「故障窗口完整」）
 3. 删除应用 A 的 Pod，触发 Terminating 流程
 4. 观察 Pod Terminating 状态持续时间
+
+> ⚠️ **判据可达性警示（见手段2适用边界）**：diskplugin 类 CSI（如阿里云 ACK）环境中，Pod
+> 对象删除与 volume unmount 异步分离——volume 清理不在 Pod 删除关键路径；且 EBUSY 是
+> 引用语义（文件被打开占用）而非 IO 繁忙语义，IO 负载不产生 umount EBUSY。这两个
+> 一般性结论同样约束本手段1（blade node-disk burn）：「Pod 卡 Terminating + Events
+> device busy」判据在 CSI 卷 + 现代 kubelet 环境可达性存疑。判读前先小步验证——删
+> Pod 后观察是否如期卡 Terminating；不可达时按手段2适用边界给出的替代观察点
+> （节点侧 globalmount 滞留 + NodeUnstage 失败重试；该观察点需独立 globalmount 层，
+> ACK 直挂形态下同样不可实例化）报告并调整判据，勿硬等不存在的现象。
 
 **注入验证**：
 1. 执行 `kubectl get pods`，确认 Pod 状态为 Terminating 且长时间未消失
@@ -55,24 +65,36 @@
 
 ---
 
-**降级方案（kubectl-native）**
+**手段2（kubectl-native）**
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令模拟 Volume 占用导致卸载失败。
 
 前提条件：集群需支持 `kubectl debug node` 功能（K8s 1.18+）；选择已验证可拉取且含 `chroot`/`sh` 的镜像；宿主机变更必须 `--profile=sysadmin`；禁用 `-it`
 
-> ⚠️ **适用边界（实测，限阿里云 ACK diskplugin CSI）**：本方案的机制链是「文件句柄占用 →
-> umount EBUSY → Pod 卡 Terminating」，但 ACK CSI（diskplugin.csi.alibabacloud.com）的
-> 卷卸载走 lazy umount（或等价语义）路径，**句柄占用无法阻塞卸载**——实测 tail -f 持续
-> 持有卷内文件 fd 期间，kubelet 日志显示 `UnmountVolume.TearDown succeeded` +
-> `UnmountDevice succeeded`（零失败零重试），Pod 52s 内完成删除重建，三判据（Pod 卡
-> Terminating / Events 显示 device busy / 挂载路径仍被占用）全部不可达。对照实验确认
-> 内核 EBUSY 语义正常（tmpfs 上 fd 占用时 umount 返回 32，lazy umount 返回 0）——
-> 归因在 CSI 侧卸载语义。另注：Pod 对象删除与 volume unmount 本就是异步分离的
+> ⚠️ **适用边界（卷卸载走 lazy umount 或等价语义的 CSI，如阿里云 ACK diskplugin CSI）**：
+> 本方案的机制链是「文件句柄占用 → umount EBUSY → Pod 卡 Terminating」，但此类 CSI
+> （如 diskplugin.csi.alibabacloud.com）的卷卸载走 lazy umount（或等价语义）路径，
+> **句柄占用无法阻塞卸载**——句柄持续占用期间，kubelet 日志仍显示
+> `UnmountVolume.TearDown succeeded` + `UnmountDevice succeeded`（零失败零重试），
+> Pod 数十秒内完成删除重建，三判据（Pod 卡 Terminating / Events 显示 device busy /
+> 挂载路径仍被占用）全部不可达。内核 EBUSY 语义本身正常（fd 占用时 umount 返回 32，
+> lazy umount 返回 0）——归因在 CSI 侧卸载语义。另注：Pod 对象删除与 volume unmount 本就是异步分离的
 > （volume 清理不在 Pod 删除关键路径）——「volume 卸载失败卡 Pod Terminating」的
 > 机制链在 CSI 卷 + 现代 kubelet 上不成立；如需验证卷清理异常，观察点是节点侧
 > globalmount 路径滞留 + NodeUnstage 失败重试，而非 Pod Terminating。本用例的
-> Pod_Terminating 判据在 CSI 环境下依赖主方案（blade node-disk burn，IO 负载形态）。
+> Pod_Terminating 判据在 CSI 环境下对手段1（blade node-disk burn，IO 负载形态）同样存疑
+> ——异步分离不因注入方式而异，IO 繁忙也不产生引用语义的 EBUSY；主路径注入验证前已加
+> 判据可达性警示，判读前先小步验证卡 Terminating 是否可达。
+>
+> 除 lazy umount 外的另一独立机制限制：`kubectl debug node` 注入 pod 的 `/host`
+> 可能为 private rbind（容器内 mountinfo 中该挂载无 shared/master 传播标记，而宿主机
+> 同挂载为 shared:N）。此时 chroot /host 后占用进程持有的 fd 落在容器私有 vfsmount
+> 副本上，不钉宿主机引用计数——方式一（chroot 持句柄）在该形态下机制性无效，与 CSI
+> 卸载语义无关、为独立根因。判定方法：注入前比对容器与宿主机 mountinfo 中 /host
+> 挂载的传播标记。上文替代观察点（globalmount 滞留 + NodeUnstage 失败重试）亦仅
+> 适用于有独立 globalmount 层的 CSI 形态；直挂形态（见下方注意事项）下结构性不可
+> 实例化。lazy umount 与 private rbind 两重限制叠加时，本 case 三判据均不可达，
+> 应改用同域其他手段（如 [Finalizers 未清理](Pod_Terminating_Finalizers未清理.md)）。
 
 注入命令：
 ```bash
@@ -95,13 +117,13 @@ kubectl delete pod <debug-pod-name> --force --grace-period=0
 ```
 
 注意事项：
-- 需先通过 `mount | grep <pv-name>` 确认 volume 实际挂载路径（实测 ACK 直挂形态：
+- 需先通过 `mount | grep <pv-name>` 确认 volume 实际挂载路径（ACK 直挂形态：
   `/dev/vdc on /var/lib/kubelet/pods/<PodUID>/volumes/kubernetes.io~csi/<pv-name>/mount`，
   无独立 globalmount 层）
 - 与 ChaosBlade node-disk burn 不同，此方式通过文件句柄占用而非 IO 负载来阻塞 unmount
   ——但在 lazy umount 语义的 CSI 上两者都无法阻塞卸载（见上方适用边界）
-- 用 `timeout <duration>` 让占用进程到点自动释放句柄（自动恢复，实测机制正常）；
-  debug 命令客户端会阻塞到 <duration> 或断连，但服务端持续运行（实测 kubectl debug 无
+- 用 `timeout <duration>` 让占用进程到点自动释放句柄（自动恢复，机制正常）；
+  debug 命令客户端会阻塞到 <duration> 或断连，但服务端持续运行（kubectl debug 无
   TTY 时立即返回不阻塞）
 - 占用文件写在卷的文件系统内部，Pod 重建后仍残留于 PVC——收尾时记得清理 lock 文件
   （挂载点目录会随 Pod 删除被 kubelet 回收，但文件系统内容不会）

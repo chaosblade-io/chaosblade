@@ -33,8 +33,31 @@ class TestReject:
         assert result["error"] == "Agent loop exceeded max iterations (10)"
 
     @pytest.mark.asyncio
-    async def test_error_takes_precedence_over_safety_reason(self):
-        state = {"safety_reason": "Blacklisted namespace", "error": "Loop exceeded"}
+    async def test_safety_reason_takes_precedence_over_stale_error(self):
+        # W-56-5 (defect c): safety_reason is written by the gate that routed
+        # here THIS time; outcome.error may be a PREVIOUS attempt's residue.
+        # #56 rendered a stale "drift_terminated" (attempt 1) next to attempt
+        # 2's own blast-radius reason — single-source attribution fixes that.
+        state = {
+            "safety_reason": (
+                "Cluster-wide blast radius: execution will mutate resources "
+                "beyond the target scope."
+            ),
+            "error": (
+                "drift_terminated: Repeated target drift terminated the run "
+                "without human confirmation"
+            ),
+        }
+
+        result = await reject(state)
+        assert result["result"]["reason"].startswith("Cluster-wide blast radius")
+        assert result["error"].startswith("Cluster-wide blast radius")
+
+    @pytest.mark.asyncio
+    async def test_error_fallback_when_no_safety_reason(self):
+        # No gate reason available → the error slot is still the honest
+        # fallback (e.g. agent-loop terminal conclusions).
+        state = {"safety_reason": None, "error": "Loop exceeded"}
 
         result = await reject(state)
         assert result["result"]["reason"] == "Loop exceeded"

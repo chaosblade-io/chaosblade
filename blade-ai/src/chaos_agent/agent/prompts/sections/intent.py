@@ -8,7 +8,10 @@ Design principles:
 - Three priorities: Truthfulness > Proactiveness > Convergence
 """
 
-from chaos_agent.agent.prompts.reminder import SYSTEM_REMINDER_DECLARATION
+from chaos_agent.agent.prompts.reminder import (
+    PARALLELIZE_PRINCIPLE,
+    SYSTEM_REMINDER_DECLARATION,
+)
 from chaos_agent.transports import PROFILE_K8S
 
 # ---------------------------------------------------------------------------
@@ -153,11 +156,15 @@ intent; the parameters are NOT tied to any specific injection tool.
 - target: resource type to attack (see Skill Index)
 - action: fault action to perform (see Skill Index)
 - target identity fields: candidates only until a later feasibility stage validates them
-- duration: state the user's value or the system recommended default in the
-  summary; pass it as duration_seconds, never as a params ``timeout`` key (rejected)
+- duration: a window the user never saw is one nobody approved — ask when
+  timing matters; otherwise the summary states the window that will run
+  (0 = system recommended default). Pass as duration_seconds, never a
+  params ``timeout`` key (rejected)
 
 **Conditional:**
-- names OR labels: required when scope targets specific instances (at least one)
+- names OR labels: required when scope targets specific instances (at least one).
+  ``names`` must be instance names of the scope kind — a target identified by
+  its workload/owner goes in ``labels`` (the runtime resolves labels→instances).
 
 **Optional:**
 - params: dict of action-specific semantic parameters (intensity,
@@ -175,7 +182,8 @@ Valid combinations for scope/target/action: see Skill Index below."""
 
 
 # ---------------------------------------------------------------------------
-# § 5. Inject Flow (~150 tok)
+# § 5. Inject Flow (~340 tok — includes the four outcome-translation rules
+# from intent-outcome-to-means)
 # ---------------------------------------------------------------------------
 
 
@@ -236,6 +244,31 @@ Rules:
   risk — must come from this conversation: a tool query result, skill/case
   text, or the user's own words. Without such a source, say it is not yet
   assessed instead of stating it as fact
+- **Outcome vs means** — when the user's words name an OUTCOME ("make the
+  component down", "make the disk full") rather than a fault form,
+  several catalogue entries may realize it. Start from the knowledge doc
+  `outcome-to-means.md` and walk its question chain — what the outcome
+  actually requires to be broken, which fault families could break it,
+  how the candidates differ on the four axes (time-to-effect, certainty
+  through the window, observable signature, recovery path).
+  Rank primarily by how likely each means is to occur in the real world,
+  then by how certainly it achieves the named outcome; recommend the
+  top-ranked form as the primary plan with a one-line rationale, and
+  list the other realizing forms with their observable differences so
+  the user can redirect in one word. Never silently single-pick a means.
+- **Means before carrier probe** — for an outcome-stated request, present
+  the candidate means and their differences BEFORE investing probe
+  budget in any one means' carrier feasibility; the detailed carrier
+  probe follows the user's pick.
+- **Compound state check** — before recommending a NEW injection, run
+  `query_active_experiments`: live experiments touching the same target
+  change what a new means produces (faults multiply, not add), and the
+  recommendation and the submit summary should surface that composition.
+- **Partial answers** — when the user answers only SOME of the asked
+  dimensions, either re-ask the unanswered ones or declare in the submit
+  summary the value you adopt for each unanswered dimension and why, so
+  every submitted value is traceable to the user's word or an explicit
+  declaration.
 - If user rejects a recommendation, shift axis: try different fault type,
   different target, or different intensity — do not repeat same suggestion
 """ + unexpected_rule + """
@@ -338,11 +371,22 @@ Use the full skill catalog to understand every supported fault family. Use
 currently bound read-only tools to inspect the current environment and collect
 target candidates. Tool binding selects a safe discovery channel, not the
 supported fault vocabulary. Do not run injection or recovery commands here;
-final transport compatibility and feasibility occur after confirmation."""
+final transport compatibility and feasibility occur after confirmation.
+
+When a probe establishes a durable fact about the target (identity, node,
+process, restartPolicy, or a causal insight), record it immediately with
+update_progress(state_update={"established_facts": [...]}) in the SAME
+turn as your next probe call.
+Record only real state changes, not every turn: what you log here reaches the
+planner as already-established evidence, so it must be accurate."""
     return """# Tools
 
 Only call tools that are bound to you. Use them by category:
 - **Probe** (read-only): use freely to explore current environment state and skill catalog
+- **Record**: update_progress — when a probe establishes a durable fact about
+  the target (identity, node, process, restartPolicy, or a causal insight),
+  log it in the SAME turn as your next probe call. Real state changes only.
+  What you record reaches the planner as already-established evidence.
 - **Submit**: once the reviewed spec is complete — the confirmation card collects approval
 - **Route**: for non-inject intents only"""
 
@@ -517,4 +561,5 @@ def get_intent_reminder_section(profile: str | None = PROFILE_K8S) -> str:
 {discovery_rule}
 5. recover_task is ONLY for when the user explicitly requests to undo
    or rollback a previous fault injection. For ANY other intent, do
-   NOT call recover_task."""
+   NOT call recover_task.
+6. {PARALLELIZE_PRINCIPLE}"""

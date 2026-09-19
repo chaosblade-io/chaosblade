@@ -43,7 +43,8 @@ _BASELINE_INTEGRITY_PROMPT: str = (
     '   "imagefs /dev/vdb", "node cn-hongkong.10.0.2.69 CPU", "pod accounting memory", '
     '"endpoint /api/health latency"\n'
     '   "disk" or "CPU" alone is ambiguous — always include the resource identity.\n'
-    "2. Your FIRST measurement is your BASELINE. Record the resource identity AND value together.\n"
+    "2. When no pre-injection baseline exists for a resource, your FIRST measurement of it is "
+    "your baseline for later re-checks — record the resource identity AND value together.\n"
     "3. ALL comparisons MUST be against the SAME resource. NEVER compare metrics from different resources:\n"
     '   ✅ "imagefs /dev/vdb: first-check 42% → re-check 84%" (same partition, valid delta)\n'
     '   ✅ "node X CPU: 12% → 89%" (same node, valid delta)\n'
@@ -56,11 +57,11 @@ _BASELINE_INTEGRITY_PROMPT: str = (
     "recent events, timestamp correlation with injection time).\n"
     "6. If your first-check value already matches the expected injection parameter "
     "(e.g., --percent 85 → first-check shows 84%), this IS evidence the fault is in effect — "
-    "do NOT conclude 'no change' just because re-check shows the same value. "
-    "A value moving TOWARD the target that has NOT arrived is a trend, not attainment "
-    "(see EVIDENCE CONVERGENCE).\n"
+    "do NOT conclude 'no change' just because re-check shows the same value; "
+    "a drift toward the target that is not yet significant is a trend, not attainment "
+    "(attainment is the significant change itself — see EVIDENCE SEMANTICS).\n"
     "7. EXPECTED NEGATIVE RESULTS: If the PRIMARY metric confirms the fault is in effect "
-    "(e.g., disk usage matches --percent), but a THRESHOLD-DEPENDENT condition is not met "
+    "(e.g., disk usage rose significantly from baseline), but a THRESHOLD-DEPENDENT condition is not met "
     "(e.g., DiskPressure=False because usage is 84% vs 85% threshold), mark that step as "
     "'expected' — the negative result is anticipated and does not indicate injection failure. "
     "Do NOT use 'expected' as a synonym for 'failed'."

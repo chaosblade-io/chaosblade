@@ -43,7 +43,9 @@ The Agent has ONE unified `kubectl` tool; the sub-command is selected via the `s
 | `label` | Add/remove/change resource labels (`--overwrite` overwrites an existing one; `key-` removes) | `"node <node> workload-affinity=<app> --overwrite"` |
 | `annotate` | Add/remove/change resource annotations | `"node <node> <key>=<value> --overwrite"` |
 | `drain` | Evict Pods off a node (node-maintenance drill); recover with `uncordon` | `"<node> --ignore-daemonsets --delete-emptydir-data --grace-period=30"` |
-| `debug` | Create a temporary debug container on a node to reach the host /host filesystem (two-step; MUST include `-- sleep 3600`) | `"node/<node> --image=busybox -- sleep 3600"` |
+| `debug` | Create a temporary debug container on a node to reach the host /host filesystem (two-step; MUST include `-- sleep 3600`) | `"node/<node> --image=<image> -- sleep 3600"` |
+
+> ⚠️ **`--image` must be a node-cached image on restricted-network clusters** (VPC without docker.io egress cannot pull `busybox`): prefer a healthy DaemonSet image from the pre-task probe's discovered candidates (e.g. the CNI DS image) — the skill case usually pins it. A pull miss means ImagePullBackOff and a wasted 60s readiness wait.
 
 > ⚠️ **Two forbidden `drain` flags**: `--force` (deletes bare Pods with no controller — neither `uncordon` nor any controller will recreate them, so the Pod is gone permanently) and `--disable-eviction` (bypasses the eviction API, which means bypassing PodDisruptionBudget — and PDB is exactly the guarantee the drill is meant to verify) are rejected by the guard. If drain fails because of a bare Pod, **no Pod has been evicted at that point** (atomic failure); treat that node as an unsuitable drain target instead of forcing it through with `--force`.
 > `--delete-emptydir-data` **IS allowed**: an emptyDir's lifecycle is already tied to its Pod, so evicting the Pod necessarily discards it — that is inherent to Pod deletion. In real clusters a great many Pods mount an emptyDir, and without this flag drain simply refuses to evict.

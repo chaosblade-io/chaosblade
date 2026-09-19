@@ -262,3 +262,70 @@ class TestAdvertisedDiagnosticsMatchEnforcement:
         for channel, binary in (("ssh", "lsof"), ("kubeconfig", "lsof")):
             prompt = build_baseline_system_prompt(channel)
             assert binary in prompt
+
+
+class TestNodeHostLevelChannelGuidance:
+    """B45: the K8s fragment must model the execution environment and teach
+    the four host-metric channels ordered by availability certainty.
+
+    Case 43173315 (task inject-43173315, baseline phase): the fragment's
+    NODE-metrics example taught ``kubectl exec {debug_pod} -- iostat ...`` —
+    a diagnostic BARE in the container. The debug pod is a privileged but
+    MINIMAL image (NPD carries no iostat), so six iostat variants failed
+    deterministically and the retry loop burned three rounds re-running the
+    same doomed shape on fresh pods (~60-90s + 4 pod lifecycles) before the
+    model found /proc/diskstats on its own. Meanwhile the verify phase
+    spontaneously used ``nsenter -t 1 ...`` and succeeded first try — the
+    knowledge existed in the model, the prompt taught the wrong channel.
+    """
+
+    def _k8s_prompt(self) -> str:
+        return build_baseline_system_prompt("kubeconfig")
+
+    def test_environment_model_present(self):
+        """The fragment states the environment fact the old example hid: a
+        debug pod is a jump board into the node, not a diagnostic toolbox."""
+        prompt = self._k8s_prompt()
+        assert "jump board" in prompt
+        assert "may carry no diagnostic binaries" in prompt
+
+    def test_four_channels_ordered_by_availability(self):
+        """API → /proc pseudo-files → nsenter host tools → bare-in-container,
+        in that order (each successive channel is less certain to exist)."""
+        prompt = self._k8s_prompt()
+        markers = [
+            "1. ``kubectl get/top/describe``",
+            "2. kernel pseudo-files",
+            "3. host tools via namespace entry",
+            "4. a diagnostic binary BARE in the container",
+        ]
+        positions = [prompt.index(m) for m in markers]  # raises if any gone
+        assert positions == sorted(positions)
+
+    def test_every_advertised_example_passes_the_validator(self):
+        """Invariant 1 (this module's own docstring): advertising a command
+        the validator rejects burns baseline attempts on guaranteed
+        failures. Both new exemplars must validate."""
+        from chaos_agent.tools.pod_discovery import TOOL_POD_NAMESPACE
+
+        for cmd in (
+            f"kubectl exec {{debug_pod}} -n {TOOL_POD_NAMESPACE} "
+            "-- cat /proc/diskstats",
+            f"kubectl exec {{debug_pod}} -n {TOOL_POD_NAMESPACE} "
+            "-- nsenter -t 1 -m -u -i -n -p -- iostat -xd 1 3",
+            "kubectl top pod my-pod -n prod",
+        ):
+            assert validate_command(cmd, "k8s"), cmd
+
+    def test_doomed_container_direct_exemplar_retired(self):
+        """The NODE-metrics example block no longer teaches the bare
+        in-container iostat form (the channel that failed deterministically
+        on minimal images). The bare form stays LEGAL (layer 4) — it just
+        stops being the exemplar the prompt leads with."""
+        prompt = self._k8s_prompt()
+        example_block = prompt[prompt.index("Examples:"):]
+        assert "nsenter -t 1" in example_block
+        assert "cat /proc/diskstats" in example_block
+        assert "-- iostat" not in example_block.replace(
+            "nsenter -t 1 -m -u -i -n -p -- iostat", ""
+        )

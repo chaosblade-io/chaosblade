@@ -148,7 +148,10 @@ _PIPELINE_ROUTE_KEYS = {
     # is per-node (execute_loop), never global.
     "confirmation_gate": ["baseline_capture", "end", "reject"],
     "execute_loop": ["continue", "replan", "verifier"],
-    "tool_screener": ["pass", "replan", "retry"],
+    # "reject": the W-56-5 hard-termination route (SCREENER_ROUTE_FAIL) —
+    # a hard stop ends at the terminal node instead of looping as retry.
+    # (keys come back sorted; order below is the sorted form.)
+    "tool_screener": ["pass", "reject", "replan", "retry"],
     "verifier_loop": ["continue", "done", "finalize"],
     "verifier_screener": ["pass", "retry"],
     "verifier_tools": ["finalize", "verifier_loop"],

@@ -16,6 +16,7 @@ from chaos_agent.agent.providers import (
     ProviderPrompts,
     RecoverResult,
 )
+from chaos_agent.agent.providers.base import DestroyOutcome
 from chaos_agent.agent.result.verdict import Layer1Result, Layer1Status
 
 
@@ -43,6 +44,10 @@ class _FakeProvider:
     # Phase-8 Form A: same conformance requirement for the Tier-1
     # tool-pod-namespace exemption set.
     tool_pod_namespaces: frozenset[str] = frozenset()
+    # Create-reconcile gate (D6): same conformance requirement for the
+    # gate's declaration pair — the fake stays outside the gate.
+    reconcile_create_tool_names: frozenset[str] = frozenset()
+    reconcile_read_tool_names: frozenset[str] = frozenset()
 
     # Phase-8 Form B: same conformance requirement for the optional
     # vocabulary hooks — the fake stays inert (a non-participating
@@ -52,6 +57,33 @@ class _FakeProvider:
 
     def was_injection_attempted(self, messages):
         return False
+
+    def build_reconcile_fingerprint(self, tool_name, tool_args):
+        # Create-reconcile seam (D6): default None pinned structurally
+        # (runtime_checkable conformance requires the method).
+        return None
+
+    async def reconcile_hold_feedback(
+        self,
+        tool_name,
+        fp,
+        hold_count,
+        block_limit,
+        kubeconfig="",
+        task_id="",
+    ):
+        # Create-reconcile seam (D6): default None pinned structurally.
+        return None
+
+    def reconcile_batch_held_feedback(self, tool_name, other_tool_name):
+        # Create-reconcile seam (D6): default None pinned structurally.
+        return None
+
+    async def verify_landing_readback(self, messages, state, *, kubeconfig=""):
+        # Landing readback seam (faultdrill-cr-channel task 2.1): default
+        # None pinned structurally (runtime_checkable conformance requires
+        # the coroutine method).
+        return None
 
     def __init__(
         self,
@@ -91,6 +123,16 @@ class _FakeProvider:
     def created_experiment_ids(self, messages, state):
         return set()
 
+    # Destroy three-table unification: the destroyed-* hooks pinned
+    # structurally (runtime_checkable conformance requires the methods) —
+    # the fake stays inert (a non-participating backend; the generic layer
+    # getattr-skips a missing hook).
+    def destroyed_experiment_ids(self, messages):
+        return set()
+
+    def destroyed_proven_experiment_ids(self, messages):
+        return set()
+
     def parse_injection_params(self, tool_name, tool_args):
         # Phase-7 T3: issue-time extraction hook — default None pinned
         # structurally (runtime_checkable conformance requires the method).
@@ -122,6 +164,12 @@ class _FakeProvider:
 
     async def layer1_raw_destroy(self, uid, kubeconfig="") -> str:
         return ""
+
+    def classify_destroy_output(self, output):
+        # Destroy three-table unification: default fail-closed FAILED pinned
+        # structurally (runtime_checkable conformance requires the method) —
+        # a hook-less carrier surfaces, never silently retires.
+        return DestroyOutcome.FAILED
 
     async def layer1_destroy(
         self, uid, kubeconfig="", *, messages=None, injection_method=None
@@ -262,6 +310,32 @@ def test_clear_empties_registry():
     assert FaultProviderRegistry.resolve_by_method("host_blade") is None
 
 
+@pytest.mark.asyncio
+async def test_ensure_crd_seam_dispatches_to_the_hooked_provider():
+    # Installability seam (faultdrill-cr-channel D2/D7): dispatch is
+    # getattr-optional — only a provider that OWNS the install question
+    # answers; the verdict passes through as a provider-neutral dict.
+    class _InstallableFake(_FakeProvider):
+        async def ensure_crd(self, kubeconfig=""):
+            self.seen_kubeconfig = kubeconfig
+            return {"usable": True, "status": "ready"}
+
+    fake = _InstallableFake("faultdrill_cr", ("kubectl_native",))
+    FaultProviderRegistry.register(fake)
+    verdict = await FaultProviderRegistry.ensure_crd(kubeconfig="/tmp/k")
+    assert verdict == {"usable": True, "status": "ready"}
+    assert fake.seen_kubeconfig == "/tmp/k"
+
+
+@pytest.mark.asyncio
+async def test_ensure_crd_seam_none_when_no_provider_claims_install():
+    # Every backend but the CR channel omits the hook — the seam's None
+    # means "nobody claims the install responsibility", which the route
+    # gate treats as pass-through (the apply's own error family governs).
+    FaultProviderRegistry.register(_FakeProvider("chaosblade", ("host_blade",)))
+    assert await FaultProviderRegistry.ensure_crd() is None
+
+
 # -- fault-handle orchestration (carrier-neutral entry points) ---------------
 
 
@@ -315,7 +389,7 @@ class TestHandleOrchestration:
         FaultProviderRegistry.register_builtins()
         msgs = [
             ToolMessage(
-                content='{"code":200,"success":true,"result":"uid-77"}',
+                content='{"code":200,"success":true,"result":"77a1b2c3d4e5f607"}',
                 name="blade_create",
                 tool_call_id="c1",
             ),
@@ -325,7 +399,7 @@ class TestHandleOrchestration:
                 msgs,
                 is_host=False,
             )
-            == "uid-77"
+            == "77a1b2c3d4e5f607"
         )
         # UID-less channel facts never produce an id.
         assert FaultProviderRegistry.extract_experiment_uid([], is_host=False) == ""
@@ -482,7 +556,7 @@ class TestRecoverDispatchMatrix:
         FaultProviderRegistry.register_builtins()
         msgs = [
             ToolMessage(
-                content='{"code":200,"success":true,"result":"uid-mh"}',
+                content='{"code":200,"success":true,"result":"aa1b2c3d4e5f6078"}',
                 name="blade_create",
                 tool_call_id="c1",
             ),
@@ -491,7 +565,11 @@ class TestRecoverDispatchMatrix:
             {"messages": msgs}
         )
         assert provider.carrier == "chaosblade"
-        assert identity == {"kind": "experiment_uid", "value": "uid-mh", "method": ""}
+        assert identity == {
+            "kind": "experiment_uid",
+            "value": "aa1b2c3d4e5f6078",
+            "method": "",
+        }
 
     def test_message_history_uid_outranks_native_attribution(self):
         """A native attribution with a message-history UID is combo evidence
@@ -502,7 +580,7 @@ class TestRecoverDispatchMatrix:
         FaultProviderRegistry.register_builtins()
         msgs = [
             ToolMessage(
-                content='{"code":200,"success":true,"result":"uid-mh"}',
+                content='{"code":200,"success":true,"result":"aa1b2c3d4e5f6078"}',
                 name="blade_create",
                 tool_call_id="c1",
             ),
@@ -515,7 +593,7 @@ class TestRecoverDispatchMatrix:
         # (combo evidence: experiment claim + native attribution).
         assert identity == {
             "kind": "experiment_uid",
-            "value": "uid-mh",
+            "value": "aa1b2c3d4e5f6078",
             "method": "kubectl_native",
         }
 
@@ -627,14 +705,14 @@ class TestDeriveHandleFromMessages:
         FaultProviderRegistry.register_builtins()
         msgs = [
             ToolMessage(
-                content='{"code":200,"success":true,"result":"uid-88"}',
+                content='{"code":200,"success":true,"result":"88a1b2c3d4e5f607"}',
                 name="blade_create",
                 tool_call_id="c1",
             ),
         ]
         assert FaultProviderRegistry.derive_handle_from_messages(msgs, {}) == {
             "kind": "experiment_uid",
-            "value": "uid-88",
+            "value": "88a1b2c3d4e5f607",
             "method": "",
         }
 
@@ -644,14 +722,18 @@ class TestDeriveHandleFromMessages:
         FaultProviderRegistry.register_builtins()
         msgs = [
             ToolMessage(
-                content='{"code":200,"success":true,"result":"uid-88"}',
+                content='{"code":200,"success":true,"result":"88a1b2c3d4e5f607"}',
                 name="blade_create",
                 tool_call_id="c1",
             ),
             AIMessage(
                 content="",
                 tool_calls=[
-                    {"name": "blade_destroy", "args": {"uid": "uid-88"}, "id": "c2"}
+                    {
+                        "name": "blade_destroy",
+                        "args": {"uid": "88a1b2c3d4e5f607"},
+                        "id": "c2",
+                    }
                 ],
             ),
         ]
@@ -713,9 +795,7 @@ def test_extract_kubectl_exec_pod_name_dispatches_to_the_delivery_owner():
         # A registry whose ``kubectl_exec`` owner does not implement the hook
         # (or no owner at all) yields None instead of raising.
         FaultProviderRegistry.clear()
-        FaultProviderRegistry.register(
-            _FakeProvider("chaosblade", ("kubectl_exec",))
-        )
+        FaultProviderRegistry.register(_FakeProvider("chaosblade", ("kubectl_exec",)))
         assert FaultProviderRegistry.extract_kubectl_exec_pod_name(msgs) is None
         FaultProviderRegistry.clear()
         assert FaultProviderRegistry.extract_kubectl_exec_pod_name(msgs) is None
@@ -831,12 +911,8 @@ class TestRecoverExperimentUidFromSessionSeam:
         """spec「session 恢复逐值相等」：混合 fixture 两方向（「最靠后者
         胜出」语义）+ dict-only fallback + 空输入——与 phase-13 T1 快照
         （tasks 1.2）钉扎值逐值相等，T4 改道的对照组。"""
-        os_create = '{{"code":200,"success":true,"result":"{}"}}'.format(
-            self._OS_UID
-        )
-        py_create = '{{"code":200,"success":true,"result":"{}"}}'.format(
-            self._PY_UID
-        )
+        os_create = '{{"code":200,"success":true,"result":"{}"}}'.format(self._OS_UID)
+        py_create = '{{"code":200,"success":true,"result":"{}"}}'.format(self._PY_UID)
 
         FaultProviderRegistry.register_builtins()
 
@@ -951,3 +1027,781 @@ class TestRecoverExperimentUidFromSessionSeam:
             }
         ]
         assert FaultProviderRegistry.recover_experiment_uid_from_session(session) == ""
+
+
+class TestClassifyDestroyOutput:
+    """B76 review G — the destroy-decision authority, now three-state.
+
+    A FALSE retire would hide a LIVE experiment from every future recovery
+    (retirement is excluded from all live-liability reads), which is strictly
+    worse than the orphan the sweep exists to prevent — so only a PROVEN
+    successful destroy may retire, and every ambiguous shape fails closed.
+    The classifier lives in the carrier's verify module: the single decision
+    source the registry sweep and the verify-replan retire filter both
+    consume (the seam's own prefix table was a THIRD table judging the same
+    output — deleted in the unification).
+    """
+
+    @staticmethod
+    def _classify(output):
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            classify_destroy_output,
+        )
+
+        return classify_destroy_output(output)
+
+    def test_empty_output_fails_closed(self):
+        assert self._classify("") is DestroyOutcome.FAILED
+        assert self._classify(None) is DestroyOutcome.FAILED
+        assert self._classify("   ") is DestroyOutcome.FAILED
+
+    def test_error_and_failed_prefixes_fail(self):
+        # The blade CLI surfaces failures this way (blade_destroy's output
+        # contract). "Error: record not found" is the convergence-valve
+        # signal — NOT_FOUND, still never a retire without a proof.
+        assert (
+            self._classify("Error: record not found") is DestroyOutcome.NOT_FOUND
+        )
+        assert self._classify("failed to destroy") is DestroyOutcome.FAILED
+
+    def test_json_success_false_fails(self):
+        assert (
+            self._classify('{"success": false, "error": "boom"}')
+            is DestroyOutcome.FAILED
+        )
+        assert self._classify('{"success": false}') is DestroyOutcome.FAILED
+
+    def test_success_shapes_pass(self):
+        assert (
+            self._classify('{"code": 200, "success": true, "result": "u"}')
+            is DestroyOutcome.SUCCESS
+        )
+        assert self._classify("destroyed uid-x") is DestroyOutcome.SUCCESS
+
+    def test_not_found_prose_inside_a_success_receipt_stays_success(self):
+        """SUCCESS is decided first: "not found" wording inside a SUCCESS
+        receipt is evidence prose, not a convergence-valve signal."""
+        assert (
+            self._classify('{"code": 200, "result": "record not found in db"}')
+            is DestroyOutcome.SUCCESS
+        )
+
+    def test_garbage_output_fails_closed(self):
+        """Behaviour pin (the unification's direction): a non-JSON
+        no-keyword output used to retire on the seam's old table while the
+        authority's predicate kept the UID live — both fail closed now."""
+        assert self._classify("random garbage") is DestroyOutcome.FAILED
+
+
+class _SweepFake(_FakeProvider):
+    """UID-bearing carrier with a recording destroy hook."""
+
+    has_experiment_uid = True
+
+    def __init__(
+        self,
+        *,
+        destroy_output='{"code":200,"success":true}',
+        blocks=False,
+        raise_on_destroy=None,
+        destroyed_verdict=False,
+    ):
+        super().__init__("sweep_fake", ("sweep_method",))
+        self.destroy_calls: list[str] = []
+        self.status_probes: list[str] = []
+        self._destroy_output = destroy_output
+        self._blocks = blocks
+        self._raise = raise_on_destroy
+        self._destroyed_verdict = destroyed_verdict
+
+    async def layer1_raw_destroy(self, uid, kubeconfig=""):
+        self.destroy_calls.append(uid)
+        if self._raise is not None:
+            raise self._raise
+        return self._destroy_output
+
+    def classify_destroy_output(self, output):
+        # Single-source verdict: the fake routes its destroy output through
+        # the REAL authority classifier so fixture semantics match the
+        # production wiring the sweep now consumes.
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            classify_destroy_output as _authority,
+        )
+
+        return _authority(output)
+
+    async def experiment_destroyed(self, uid, kubeconfig=""):
+        self.status_probes.append(uid)
+        return self._destroyed_verdict
+
+    def blocks_deterministic_destroy(self, state, messages=None):
+        return self._blocks
+
+
+def _sweep_state(owned, *, retired=None, method="sweep_method"):
+    return {
+        "messages": [],
+        "owned_experiment_uids": list(owned),
+        "retired_experiment_uids": retired,
+        "injection_method": method,
+    }
+
+
+class TestSweepLiveLiabilities:
+    """B76 review G — the liability-axis safety-net seam.
+
+    The single ``experiment_uid`` slot is last-write-wins (correct for
+    attribution), so a superseded experiment's recovery claim is erased the
+    moment a newer create lands; this sweep is the carrier-neutral seam
+    where the append-only birth registry turns back into real destroys.
+    """
+
+    @pytest.mark.asyncio
+    async def test_residuals_destroyed_and_retired(self):
+        fake = _SweepFake()
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1", "uid-2"])
+        )
+        assert retired == ["uid-1", "uid-2"]
+        assert failures == []
+        assert fake.destroy_calls == ["uid-1", "uid-2"]
+
+    @pytest.mark.asyncio
+    async def test_excluded_uid_belongs_to_the_main_flow(self):
+        """The recover finale excludes the identity UID the main Layer-1
+        flow (and the retry below it) already owns — the sweep must not
+        race it."""
+        fake = _SweepFake()
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-main", "uid-old"]), exclude_uid="uid-main"
+        )
+        assert retired == ["uid-old"]
+        assert failures == []
+        assert fake.destroy_calls == ["uid-old"]
+
+    @pytest.mark.asyncio
+    async def test_no_residuals_is_a_noop_and_idempotent(self):
+        """Normal single-experiment task: the live set minus the exclusion
+        is empty — zero destroy calls. And retired UIDs leave the live set,
+        so a second sweep after a retire record lands is again a no-op
+        (idempotence across finalize passes)."""
+        fake = _SweepFake()
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-main"]), exclude_uid="uid-main"
+        )
+        assert retired == []
+        assert failures == []
+        assert fake.destroy_calls == []
+
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-main", "uid-done"], retired=["uid-done"]),
+            exclude_uid="uid-main",
+        )
+        assert retired == []
+        assert failures == []
+        assert fake.destroy_calls == []
+
+    @pytest.mark.asyncio
+    async def test_failed_destroy_output_is_not_retired(self):
+        """False-retire guard: an Error:/failed destroy output keeps the UID
+        in the liability set (fail-open into the liability view) so the next
+        sweep / a re-run recover retries it."""
+        fake = _SweepFake(destroy_output="Error: record not found")
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"])
+        )
+        assert retired == []
+        assert failures == ["uid-1: Error: record not found"]
+
+    @pytest.mark.asyncio
+    async def test_destroy_exception_reported_not_raised(self):
+        fake = _SweepFake(raise_on_destroy=RuntimeError("blade missing"))
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"])
+        )
+        assert retired == []
+        assert failures == ["uid-1: blade missing"]
+
+    @pytest.mark.asyncio
+    async def test_in_cluster_delivery_degrades_to_guidance_without_destroy(self):
+        """kubectl-exec delivery: the host-side destroy cannot reach a
+        CRD-created experiment ("record not found" soft failure) — surfacing
+        the UIDs with the kubectl-exec vehicle beats a soft-failed destroy
+        that would falsely retire a LIVE experiment."""
+        fake = _SweepFake(blocks=True)
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"])
+        )
+        assert retired == []
+        assert fake.destroy_calls == []
+        assert len(failures) == 1
+        assert "uid-1" in failures[0]
+        assert "kubectl exec" in failures[0]
+
+    @pytest.mark.asyncio
+    async def test_no_experiment_carrier_dispatch_surfaces_every_residual(self):
+        """No UID-bearing carrier claims the facts: every residual is
+        surfaced as a failure (never silently dropped, never falsely
+        retired)."""
+        FaultProviderRegistry.register(_FakeProvider("native_only", ("native_method",)))
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"], method="native_method")
+        )
+        assert retired == []
+        assert failures == ["uid-1: no experiment carrier dispatched"]
+
+
+class TestCreatedExperimentIdsDurableSource:
+    """B76 review G — the whitelist's durable-source upgrade: the
+    append-only birth registry keeps proving provenance across compaction
+    and contract replacement (the legacy single slot only ever held the
+    NEWEST UID, so a superseded experiment lost even the authority to be
+    destroyed once compaction removed its create message).
+
+    Round-20 Q4 flip: the durable read-side now gates on the UID shape
+    (``_UID_SHAPE_RE``) at the trust-chain end, so the fixtures carry
+    legal hex16 shapes (the pre-r20 placeholders ``uid-new`` etc. were
+    non-shaped strings the gate now refuses)."""
+
+    def test_compacted_history_keeps_superseded_uid_whitelisted(self):
+        FaultProviderRegistry.register_builtins()
+        state = {
+            "experiment_uid": "a1b2c3d4e5f60718",
+            "owned_experiment_uids": ["deadbeef00000002", "a1b2c3d4e5f60718"],
+        }
+        # Compaction boundary: no create messages at all.
+        assert FaultProviderRegistry.created_experiment_ids([], state) == {
+            "deadbeef00000002",
+            "a1b2c3d4e5f60718",
+        }
+
+    def test_pre_g_shape_loses_the_superseded_uid(self):
+        """Counterfactual pin (the bug this fix closes): without the birth
+        registry the compacted whitelist holds only the newest UID."""
+        FaultProviderRegistry.register_builtins()
+        assert FaultProviderRegistry.created_experiment_ids(
+            [], {"experiment_uid": "a1b2c3d4e5f60718"}
+        ) == {"a1b2c3d4e5f60718"}
+
+    def test_python_agent_attribution_still_excluded_from_blade_slot(self):
+        """The single-slot durable source stays carrier-scoped: a
+        ``python_agent`` attribution owns its legacy field via its own
+        provider, so the blade carrier must not claim it (the owned registry
+        is carrier-neutral and unaffected)."""
+        FaultProviderRegistry.register_builtins()
+        state = {
+            "experiment_uid": "f00dface12345678",
+            "injection_method": "python_agent",
+            "owned_experiment_uids": ["f00dface12345678"],
+        }
+        assert FaultProviderRegistry.created_experiment_ids([], state) == {
+            "f00dface12345678",
+        }
+
+
+class TestDestroyedProvenExperimentIds:
+    """B76 review I1 — the death-registration scan: output-PROVEN kills in
+    BOTH delivery forms, fail-closed on doubt.
+
+    The issued-scan (``destroyed_experiment_ids``) treats a destroy CALL as
+    terminal — the right conservatism for attribution. The retire LEDGER
+    needs the higher bar: retirement excludes a UID from every live-
+    liability read, so only a paired successful output may register
+    (probe_b76_round9.py A1)."""
+
+    @staticmethod
+    def _pair(tool: str, args: dict, output: str, call_id: str = "call-d1"):
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        return [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": tool,
+                        "args": args,
+                        "id": call_id,
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(content=output, tool_call_id=call_id, name=tool),
+        ]
+
+    def test_host_blade_destroy_with_success_output_registers(self):
+        FaultProviderRegistry.register_builtins()
+        msgs = self._pair(
+            "blade_destroy",
+            {"uid": "uid-1"},
+            '{"code": 200, "success": true, "result": "success"}',
+        )
+        assert FaultProviderRegistry.destroyed_proven_experiment_ids(msgs) == {
+            "uid-1",
+        }
+
+    def test_kubectl_exec_vehicle_registers(self):
+        """I1c: the in-cluster destroy vehicle (kubectl tool_call carrying
+        ``blade destroy <uid>`` in v_args) used to be invisible to the
+        issued-scan; the proven-scan must see it. Round-14 F1 翻案：the
+        issued-scan now sees the inline face too — issued = terminal is
+        channel-neutral (a destroy sent through the vehicle the registry
+        itself instructs is just as terminal as one sent through the
+        blade_destroy tool)."""
+        FaultProviderRegistry.register_builtins()
+        msgs = self._pair(
+            "kubectl",
+            {
+                "subcommand": "exec",
+                "v_args": "pod-x -n chaosblade -- blade destroy bb00cc11dd22ee33",
+            },
+            '{"code": 200, "success": true}',
+        )
+        assert FaultProviderRegistry.destroyed_proven_experiment_ids(msgs) == {
+            "bb00cc11dd22ee33",
+        }
+        # …and the issued-scan sees the vehicle form too (round-14 F1).
+        assert FaultProviderRegistry.destroyed_experiment_ids(msgs) == {
+            "bb00cc11dd22ee33",
+        }
+
+    def test_failed_output_does_not_register(self):
+        """Fail-closed: a destroy whose paired output proves FAILURE keeps
+        the UID out of the ledger (a false retire hides a LIVE experiment
+        from every future recovery)."""
+        FaultProviderRegistry.register_builtins()
+        msgs = self._pair(
+            "blade_destroy",
+            {"uid": "uid-1"},
+            '{"code": 500, "success": false}',
+        )
+        assert FaultProviderRegistry.destroyed_proven_experiment_ids(msgs) == set()
+
+    def test_error_prefix_output_does_not_register(self):
+        FaultProviderRegistry.register_builtins()
+        msgs = self._pair(
+            "blade_destroy",
+            {"uid": "uid-1"},
+            "Error: destroy failed",
+        )
+        assert FaultProviderRegistry.destroyed_proven_experiment_ids(msgs) == set()
+
+    def test_unpaired_call_does_not_register(self):
+        """No ToolMessage behind the call (compaction split / synthetic
+        rebuild) → no proof → no registration."""
+        from langchain_core.messages import AIMessage
+
+        FaultProviderRegistry.register_builtins()
+        msgs = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "blade_destroy",
+                        "args": {"uid": "uid-1"},
+                        "id": "call-d1",
+                        "type": "tool_call",
+                    }
+                ],
+            )
+        ]
+        assert FaultProviderRegistry.destroyed_proven_experiment_ids(msgs) == set()
+
+
+class TestSweepKubeconfigResolution:
+    """Round-32 K1 — the sweep resolves its destroy's kubeconfig through
+    the graph-wide three-level fallback (state > spec > settings), the
+    SAME contract the injection chain's create runs under. The old bare
+    state read silently re-homed every settlement destroy onto blade's
+    own default cluster whenever the CLI entry seeded the state key
+    empty — a liability could never clear on the cluster that birthed
+    it."""
+
+    @pytest.mark.asyncio
+    async def test_empty_state_key_falls_through_to_settings(self, monkeypatch):
+        """The CLI entry shape (no --kubeconfig flag → state key empty,
+        real path in settings): the dispatched destroy must carry the
+        settings value, not the bare ""."""
+        monkeypatch.setattr(
+            "chaos_agent.config.settings.settings.kubeconfig_path",
+            "/tmp/r32-sweep-settings-kc",
+        )
+        fake = _SweepFake()
+        FaultProviderRegistry.register(fake)
+        captured: dict[str, str] = {}
+
+        async def _rec(uid, kubeconfig=""):
+            captured[uid] = kubeconfig
+            return '{"code":200,"success":true}'
+
+        fake.layer1_raw_destroy = _rec
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"])
+        )
+        assert retired == ["uid-1"]
+        assert failures == []
+        assert captured == {"uid-1": "/tmp/r32-sweep-settings-kc"}
+
+    @pytest.mark.asyncio
+    async def test_state_kubeconfig_key_passthrough(self):
+        """A state that carries the key verbatim (the merged-resolved
+        caller form, round-31's verify-replan): the resolver returns it
+        unchanged — the merge stays idempotent, no double resolution can
+        re-home it."""
+        fake = _SweepFake()
+        FaultProviderRegistry.register(fake)
+        captured: dict[str, str] = {}
+
+        async def _rec(uid, kubeconfig=""):
+            captured[uid] = kubeconfig
+            return '{"code":200,"success":true}'
+
+        fake.layer1_raw_destroy = _rec
+        state = {**_sweep_state(["uid-1"]), "kubeconfig": "/tmp/r32-state-kc"}
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            state
+        )
+        assert retired == ["uid-1"]
+        assert failures == []
+        assert captured == {"uid-1": "/tmp/r32-state-kc"}
+
+
+class TestSweepDeathRegistrationAbsorption:
+    """B76 review I1c (A3) — the sweep absorbs message-side PROVEN deaths
+    into its local retired view before computing residuals, covering
+    histories execute_loop's registration seam never saw (legacy sessions,
+    LLM destroys inside the recover graph's own Layer-1 flow)."""
+
+    @pytest.mark.asyncio
+    async def test_proven_death_in_messages_is_absorbed_without_destroy(self):
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        # Builtins supply the proven-death scan hooks (the fake carrier has
+        # none); the fake still owns the dispatch so any real destroy would
+        # be recorded — proving the absorption left nothing to destroy.
+        FaultProviderRegistry.register_builtins()
+        fake = _SweepFake()
+        FaultProviderRegistry.register(fake)
+        msgs = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "kubectl",
+                        "args": {
+                            "subcommand": "exec",
+                            "v_args": "pod-x -n chaosblade -- blade destroy aa11bb22cc33dd44",
+                        },
+                        "id": "call-k1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content='{"code": 200, "success": true}',
+                tool_call_id="call-k1",
+                name="kubectl",
+            ),
+        ]
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            {
+                "messages": msgs,
+                "owned_experiment_uids": ["aa11bb22cc33dd44"],
+                "retired_experiment_uids": [],
+                "injection_method": "sweep_method",
+            }
+        )
+        assert retired == []
+        assert failures == []
+        assert fake.destroy_calls == []
+
+    @pytest.mark.asyncio
+    async def test_unproven_destroy_in_messages_stays_live(self):
+        """Fail-closed control: a kubectl-exec destroy whose output FAILED
+        is not absorbed — and the vehicle is invisible to the issued-scan,
+        so the UID stays live and the sweep must retry the destroy itself.
+        (A host-channel blade_destroy would be excluded by the issued-scan
+        already — that is the SAME-graph conservatism, not the I1 gap.)"""
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        FaultProviderRegistry.register_builtins()
+        fake = _SweepFake()
+        FaultProviderRegistry.register(fake)
+        msgs = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "kubectl",
+                        "args": {
+                            "subcommand": "exec",
+                            "v_args": "pod-x -n chaosblade -- blade destroy uid-1",
+                        },
+                        "id": "call-k1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content='{"code": 500, "success": false}',
+                tool_call_id="call-k1",
+                name="kubectl",
+            ),
+        ]
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            {
+                "messages": msgs,
+                "owned_experiment_uids": ["uid-1"],
+                "retired_experiment_uids": [],
+                "injection_method": "sweep_method",
+            }
+        )
+        assert retired == ["uid-1"]
+        assert failures == []
+        assert fake.destroy_calls == ["uid-1"]
+
+
+class TestSweepConvergenceValve:
+    """B76 review I2/I2b (C) — the sweep's not-found convergence valve: a
+    repeat-destroy of an already-dead experiment surfaces record-not-found;
+    without an escape the UID never retires and every re-run recover
+    repeats the same destroy+failure forever."""
+
+    @pytest.mark.asyncio
+    async def test_not_found_failure_with_status_proof_retires(self):
+        fake = _SweepFake(
+            destroy_output="Error: record not found",
+            destroyed_verdict=True,
+        )
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"])
+        )
+        assert retired == ["uid-1"]
+        assert failures == []
+        assert fake.status_probes == ["uid-1"]
+
+    @pytest.mark.asyncio
+    async def test_not_found_failure_without_status_proof_stays_failed(self):
+        """Status says still Running (or the check fails) → fail-closed: the
+        failure is the honest verdict, no false retire."""
+        fake = _SweepFake(
+            destroy_output="Error: record not found",
+            destroyed_verdict=False,
+        )
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"])
+        )
+        assert retired == []
+        assert failures == ["uid-1: Error: record not found"]
+
+    @pytest.mark.asyncio
+    async def test_non_not_found_failure_never_consults_status(self):
+        """A hard failure (cluster unreachable) is not a death smell — the
+        valve must not even probe, let alone retire."""
+        fake = _SweepFake(
+            destroy_output='{"code": 500, "success": false, "error": "cluster unreachable"}',
+            destroyed_verdict=True,
+        )
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"])
+        )
+        assert retired == []
+        assert len(failures) == 1
+        assert fake.status_probes == []
+
+    @pytest.mark.asyncio
+    async def test_retire_after_valve_converges_the_rerun(self):
+        """End-to-end death-loop closure: after the valve retires, a re-run
+        sweep (the caller appended the retire) is a no-op."""
+        fake = _SweepFake()
+        FaultProviderRegistry.register(fake)
+        retired, failures = await FaultProviderRegistry.sweep_live_liabilities(
+            _sweep_state(["uid-1"], retired=["uid-1"])
+        )
+        assert retired == []
+        assert failures == []
+        assert fake.destroy_calls == []
+
+
+class TestDeathVerdictSingleSource:
+    """B76 review K2/L1 — the proven-death JSON verdict is single-source.
+
+    The verdict must apply the SAME predicate the project's authority
+    parser (``parse_blade_destroy_output``) applies: ``success`` truthy or
+    ``code == 200``. The pre-L1 table refused only ``success is False`` —
+    a key-less error JSON (``{"code": 500, "error": ...}``) was death
+    here and FAILED at the authority: a second, looser table drifts
+    exactly the way the readonly double-judge drifted.
+    """
+
+    def test_canonical_success_proves_death(self):
+        from chaos_agent.agent.providers.chaosblade.recover import (
+            parse_blade_destroy_output,
+        )
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            _destroy_output_proves_death,
+        )
+
+        proves = _destroy_output_proves_death(
+            '{"code": 200, "success": true, "result": "success"}',
+        )
+        assert proves
+        assert (
+            parse_blade_destroy_output(
+                '{"code": 200, "success": true}',
+            )[0]
+            == "passed"
+        )
+
+    def test_canonical_failure_refuses_death(self):
+        from chaos_agent.agent.providers.chaosblade.recover import (
+            parse_blade_destroy_output,
+        )
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            _destroy_output_proves_death,
+        )
+
+        output = '{"code": 500, "success": false, "error": "rpc timeout"}'
+        assert not _destroy_output_proves_death(output)
+        assert parse_blade_destroy_output(output)[0] == "failed"
+
+    def test_keyless_error_json_refuses_death(self):
+        """The K2 fork closed: authority says failed, so does the verdict."""
+        from chaos_agent.agent.providers.chaosblade.recover import (
+            parse_blade_destroy_output,
+        )
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            _destroy_output_proves_death,
+        )
+
+        output = '{"code": 500, "error": "rpc timeout"}'
+        assert not _destroy_output_proves_death(output)
+        assert parse_blade_destroy_output(output)[0] == "failed"
+
+    def test_code_200_without_success_key_proves_death(self):
+        """The authority's second acceptance arm (``code == 200``) is
+        honoured too — both arms aligned, not just the success arm."""
+        from chaos_agent.agent.providers.chaosblade.recover import (
+            parse_blade_destroy_output,
+        )
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            _destroy_output_proves_death,
+        )
+
+        output = '{"code": 200, "result": "ok"}'
+        assert _destroy_output_proves_death(output)
+        assert parse_blade_destroy_output(output)[0] == "passed"
+
+    def test_non_dict_json_is_fail_closed(self):
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            _destroy_output_proves_death,
+        )
+
+        assert not _destroy_output_proves_death('["success"]')
+        assert not _destroy_output_proves_death('"success"')
+        assert not _destroy_output_proves_death("42")
+
+    def test_non_json_vocabulary_fallback_preserved(self):
+        """The authority's non-JSON fallback arm (success/destroyed
+        wording) stays available for plain-text blade output."""
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            _destroy_output_proves_death,
+        )
+
+        assert _destroy_output_proves_death("destroy success")
+        assert _destroy_output_proves_death("experiment destroyed")
+        assert not _destroy_output_proves_death("ok")
+        assert not _destroy_output_proves_death("command queued")
+
+
+class TestDeathVerdictFrameworkReceipts:
+    """B76 review K4/L2 — framework-synthesized receipts are refused
+    STRUCTURALLY.
+
+    Four framework paths answer a tool_call that NEVER EXECUTED with a
+    synthesized ToolMessage (screener REJECTION/DEFERRED, replan ``Not
+    executed``). Pre-L2 these were excluded only by vocabulary coincidence;
+    the fix gates them by their contract PREFIXES — a reworded receipt body
+    can no longer forge a death certificate.
+    """
+
+    def _proves(self, output: str) -> bool:
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            _destroy_output_proves_death,
+        )
+
+        return _destroy_output_proves_death(output)
+
+    def test_replan_receipt_refused(self):
+        assert not self._proves(
+            "Not executed: a replan was requested in the same turn, so the "
+            "current plan is being abandoned before this call ran.",
+        )
+
+    def test_screener_deferred_receipt_refused(self):
+        assert not self._proves(
+            "[screener] DEFERRED — kubectl was NOT rejected; re-issue it.",
+        )
+
+    def test_screener_rejection_receipt_refused(self):
+        assert not self._proves(
+            "[target_guard] REJECT_UNKNOWN — blade_destroy UID was not "
+            "produced by this task's blade_create",
+        )
+
+    def test_mutated_receipt_body_still_refused(self):
+        """Mutation pin (has teeth): a future copy-edit adding success
+        wording to a deferred receipt must NOT flip the verdict — the
+        prefix gate is structural, not lexical."""
+        assert not self._proves(
+            "[screener] DEFERRED — re-issue this call and it will run successfully",
+        )
+
+    def test_mutated_replan_receipt_still_refused(self):
+        assert not self._proves(
+            "Not executed: the call succeeded on a previous turn and this "
+            "is a stale receipt",
+        )
+
+    def test_scan_ignores_framework_answered_destroy_calls(self):
+        """End-to-end: a kubectl destroy vehicle answered by the screener
+        (deferred) contributes NOTHING to the proven set."""
+        from langchain_core.messages import AIMessage, ToolMessage
+
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            scan_destroyed_proven_uids,
+        )
+
+        messages = [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "kubectl",
+                        "args": {
+                            "subcommand": "exec",
+                            "v_args": "pod-x -n chaosblade -- blade destroy uid-e1",
+                        },
+                        "id": "call-k1",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content=(
+                    "[screener] DEFERRED — re-issue this call and it will "
+                    "run successfully"
+                ),
+                tool_call_id="call-k1",
+                name="kubectl",
+            ),
+        ]
+        assert scan_destroyed_proven_uids(messages) == set()

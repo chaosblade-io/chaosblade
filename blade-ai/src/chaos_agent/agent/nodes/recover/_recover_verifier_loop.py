@@ -4,9 +4,10 @@ import asyncio
 import json
 import logging
 
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from chaos_agent.agent.node_names import RECOVER_VERIFIER
+from chaos_agent.agent.execution_artifacts import make_teardown_matcher
 from chaos_agent.transports import PROFILE_K8S
 from chaos_agent.agent.capabilities import (
     build_capability_context,
@@ -20,7 +21,6 @@ from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
 )
 from chaos_agent.agent.nodes.recover._recover_layer1 import (
     RecoverLayer1Result,
-    _RECOVER_BASELINE_TOOL_CALL_ID,
     _RECOVER_CONTEXT_KWARGS_KEY,
     _RECOVER_SYNTHETIC_TOOL_CALL_IDS,
     _build_layer1_recovery_prompt,
@@ -46,6 +46,7 @@ from chaos_agent.agent.nodes.verify._verifier_shared import (
     _compute_baseline_confidence,
 )
 from chaos_agent.agent.spec.fault_registry import is_host_scope
+from chaos_agent.utils.truncation import build_truncation_notice, elided_preview
 
 from chaos_agent.agent.nodes.execute.llm_step_helpers import post_invoke_debug
 from chaos_agent.agent.nodes.execute.react_helpers import (
@@ -55,6 +56,10 @@ from chaos_agent.agent.nodes.execute.react_helpers import (
     extract_tool_call_fields,
     record_system_prompt,
     summarize_llm_response,
+)
+from chaos_agent.agent.prompts.boundary import (
+    BOUNDARY_MARKER,
+    INJECT_TO_RECOVER_BOUNDARY_DECLARATION,
 )
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
 from chaos_agent.agent.result.operation_outcome import write_recover_verification
@@ -69,6 +74,8 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
+from chaos_agent.utils.message_integrity import apply_synthetic_pair_gate
+from chaos_agent.utils.retry_transient import call_with_transient_retry
 from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
@@ -110,6 +117,36 @@ def _resolve_recover_dispatch(state):
     from chaos_agent.agent.providers import FaultProviderRegistry
 
     return FaultProviderRegistry.resolve_fault_dispatch(state)
+
+
+def _deterministic_recover_identity(state) -> bool:
+    """D1 seam-compat gate: the task's recovery identity is a UID-LESS
+    deterministic-recover handle — a CR-reference carrier whose Layer-1
+    destroy is addressed by the handle (kind-matched to the dispatched
+    provider), not by an experiment UID.
+
+    The uid-keyed recover wiring predates that carrier family: every
+    ``experiment_uid and has_deterministic_recover`` single-key gate in
+    this flow would misroute a uid-less deterministic carrier into the
+    LLM-driven Layer 1 (the D1 self-check integration bug — dispatch
+    resolves the CR provider, yet the uid-only route falls through to the
+    native LLM branch). This predicate closes exactly that combination
+    (uid-less handle ∧ deterministic-recover provider ∧ handle-kind
+    match) WITHOUT naming any carrier module — the recover graph stays
+    carrier-agnostic, and a future uid-less deterministic carrier is
+    covered by its registration alone."""
+    from chaos_agent.agent.state import materialize_fault_handle
+
+    handle = materialize_fault_handle(state) or {}
+    if str(handle.get("value") or ""):
+        # A valued handle is an experiment identity — the uid gates own it
+        # (combo-safe: the experiment claim outranks this fallback).
+        return False
+    provider = _provider_for_recover(state)
+    if not getattr(provider, "has_deterministic_recover", False):
+        return False
+    kind = str(handle.get("kind") or "")
+    return bool(kind) and kind == str(getattr(provider, "handle_kind", "") or "")
 
 
 async def _layer1_destroy_via_provider(
@@ -212,13 +249,14 @@ async def recover_verifier(state: AgentState) -> dict:
     layer1_status = (result.layer1 or {}).get("status", "")
     # Materialize the Layer-1 type for this run's readers (the same field the
     # LLM flow writes at its layer transitions): when the dispatched carrier
-    # actually executed its deterministic destroy (live experiment UID, not
-    # the "skipped" not-applicable verdict), the type is "deterministic" by
-    # construction — readers no longer need to re-derive it from the None
-    # default. Their None fallback stays for legacy checkpoints. getattr:
-    # the Protocol declares the attribute but minimal test fakes may omit it.
+    # actually executed its deterministic destroy (live experiment UID or
+    # the uid-less CR-reference kind — anything but the "skipped"
+    # not-applicable verdict), the type is "deterministic" by construction —
+    # readers no longer need to re-derive it from the None default. Their
+    # None fallback stays for legacy checkpoints. getattr: the Protocol
+    # declares the attribute but minimal test fakes may omit it.
     if (
-        experiment_uid
+        (experiment_uid or _deterministic_recover_identity(state))
         and getattr(provider, "has_deterministic_recover", False)
         and layer1_status != "skipped"
     ):
@@ -318,9 +356,15 @@ async def _run_layer1_recovery(
                 f"(status={_blade_l1.status}); native part routed to LLM Layer 1"
             )
 
-        if experiment_uid and not _destroy_blocked and not _combo_native:
-            # Experiment carrier on host: deterministic destroy through the
-            # dispatched provider's own execution domain.
+        if (
+            experiment_uid or _deterministic_recover_identity(state)
+        ) and not _destroy_blocked and not _combo_native:
+            # Experiment carrier on host, or a UID-less deterministic
+            # carrier (the CR-reference kind — M2 task 2.3 / design D1): a
+            # deterministic destroy through the dispatched provider's own
+            # execution domain either way. For the latter the uid kwarg is
+            # deliberately empty — the provider hydrates its CR reference
+            # (``ns/name``) from the message history itself.
             layer1 = await _layer1_destroy_via_provider(
                 state, experiment_uid, kubeconfig,
                 messages=state.get("messages", []),
@@ -331,6 +375,13 @@ async def _run_layer1_recovery(
         ).was_fault_create_attempted(
             state.get("messages", []),
             injection_method=state.get("injection_method"),
+            # Teardown≠mutation at the recover terminal judgement (O-1,
+            # P3): a registered-vehicle cleanup delete must not read as a
+            # kubectl-native fallback that flips the attempted-and-failed
+            # branch to the LLM flow. Snapshot the CURRENT registry here.
+            is_teardown=make_teardown_matcher(
+                state.get("execution_artifacts") or []
+            ),
         ):
             # ChaosBlade injection was done but UID unavailable.
             # NEVER steals a combo case: a combo with experiment_uid present has
@@ -424,7 +475,24 @@ async def _run_layer1_recovery(
                     for _se_key, _se_val in _side_effects_rvl.items():
                         _se_text = json.dumps(_se_val, ensure_ascii=False)
                         if len(_se_text) > 500:
-                            _se_text = _se_text[:500] + "...(truncated)"
+                            # Shared truncation dialect: both-ends preview
+                            # keeps head/tail anchors; the state-evidence
+                            # notice points back to state.side_effects for
+                            # the full record.
+                            _se_len = len(_se_text)
+                            _se_notice = build_truncation_notice(
+                                "state-evidence",
+                                _se_len,
+                                state_hint=(
+                                    "Full side-effect records preserved in "
+                                    "state.side_effects — re-query its "
+                                    "CURRENT state before acting on any entry"
+                                ),
+                                unit="characters",
+                            )
+                            _se_text = (
+                                elided_preview(_se_text, 350, 150) + _se_notice
+                            )
                         layer1_human_content += f"- {_se_key}: {_se_text}\n"
                     layer1_human_content += (
                         "Before touching any resource mentioned above, re-query its CURRENT "
@@ -476,6 +544,28 @@ async def _run_layer1_recovery(
                     )
 
                 messages = list(state.get("messages", []))
+                # Phase boundary declaration for the graft seam. The grafted
+                # history arrives via the checkpointer: the CLI recover path
+                # reuses the inject task's thread_id, so state.messages IS
+                # the completed inject task's history (L4/HTTP recover start
+                # a fresh thread and carry none — the declaration is then
+                # vacuous but harmless; every baseline_messages bootstrap
+                # site is JSON-channel dedup, not model-context grafting).
+                # Without a seam marker the model learns tool usage and cites
+                # baseline readings as current evidence from the grafted
+                # stream (#29 first-run evidence: recover-98caf0cd
+                # msg[7]-[11], three kubectl_read calls rejected by ToolNode
+                # before self-correction). Reading order is past (grafted
+                # history) → boundary (declaration) → present (task
+                # context). Wrapped per the kickoff precedent: a phase
+                # transition directive, not bare task data. The
+                # expired-context note below labels the AGGREGATED
+                # inject_context text; this declaration labels the message
+                # history itself (tool_calls forms and baseline numbers
+                # live in the message stream, not that text).
+                messages.append(HumanMessage(content=wrap_system_reminder(
+                    INJECT_TO_RECOVER_BOUNDARY_DECLARATION
+                )))
                 if inject_msg:
                     messages.append(inject_msg)
                 messages.append(HumanMessage(content=layer1_human_content))
@@ -522,12 +612,23 @@ async def _run_layer1_recovery(
                     llm_to_call = llm if is_last_l1 else (llm.bind_tools(_layer1_tools) if _layer1_tools else llm)
 
                 try:
-                    response = await llm_to_call.ainvoke(
-                        [SystemMessage(content=layer1_system_prompt)] + messages
+                    # Same B35 guard as the Layer 2 verdict call below: an
+                    # idempotent pure-read judgement retried on transient
+                    # API failures; slow-model timeouts still pass through.
+                    response = await call_with_transient_retry(
+                        lambda: llm_to_call.ainvoke(
+                            [SystemMessage(content=layer1_system_prompt)] + messages
+                        ),
+                        log_name="recover Layer 1 verdict call (first iteration)",
                     )
                 except Exception as e:
-                    logger.error(f"Recover Layer 1 (non-ChaosBlade) LLM call failed: {e}")
-                    layer1 = RecoverLayer1Result(status="error", details=f"LLM call failed: {e}", raw_output=str(e))
+                    # Empty-str exceptions (asyncio.TimeoutError/CancelledError)
+                    # would leave "LLM call failed: " with a blank tail — backfill
+                    # the class name so the 29-min failure window is at least
+                    # attributable after the fact.
+                    err_detail = str(e) or type(e).__name__
+                    logger.error(f"Recover Layer 1 (non-ChaosBlade) LLM call failed: {err_detail}")
+                    layer1 = RecoverLayer1Result(status="error", details=f"LLM call failed: {err_detail}", raw_output=err_detail)
                     # Fall through to detail_msg update below
                 else:
                     # Ensure kubeconfig in tool calls
@@ -540,6 +641,20 @@ async def _run_layer1_recovery(
                     if tool_calls:
                         # LLM wants to call tools — continue Layer 1 ReAct loop
                         msg_list = []
+                        # Persist the graft boundary declaration with the
+                        # Layer 1 context: the local ``messages`` copy above
+                        # feeds only this iteration's LLM call, while THIS
+                        # list is what reaches state.messages — and from
+                        # there the session JSON (audit record: the
+                        # declaration's presence must be verifiable from
+                        # the task file, #29-style forensics) and the Layer 2
+                        # / later-iteration message streams (inheritance).
+                        # No NO_SESSION_MARKER: unlike the re-built
+                        # expired-context note, the declaration is a
+                        # one-shot seam marker and must persist exactly once.
+                        msg_list.append(HumanMessage(content=wrap_system_reminder(
+                            INJECT_TO_RECOVER_BOUNDARY_DECLARATION
+                        )))
                         if inject_msg:
                             msg_list.append(inject_msg)
                         msg_list.append(HumanMessage(content=layer1_human_content))
@@ -603,6 +718,12 @@ async def _run_layer1_recovery(
 
                         # Store Layer 1 output in state.messages for Layer 2 to see
                         msg_list = []
+                        # Same persistence contract as the tool-calls branch
+                        # above: the declaration rides the state write so it
+                        # reaches the task JSON and every later reader.
+                        msg_list.append(HumanMessage(content=wrap_system_reminder(
+                            INJECT_TO_RECOVER_BOUNDARY_DECLARATION
+                        )))
                         if inject_msg:
                             msg_list.append(inject_msg)
                         msg_list.append(HumanMessage(content=layer1_human_content))
@@ -771,12 +892,18 @@ async def _run_layer1_recovery(
             llm_to_call = llm if is_last_l1 else (llm.bind_tools(_layer1_tools) if _layer1_tools else llm)
 
         try:
-            response = await llm_to_call.ainvoke(
-                [SystemMessage(content=layer1_system_prompt)] + messages
+            # Same B35 guard as the first-iteration call above.
+            response = await call_with_transient_retry(
+                lambda: llm_to_call.ainvoke(
+                    [SystemMessage(content=layer1_system_prompt)] + messages
+                ),
+                log_name=f"recover Layer 1 verdict call (iteration {layer1_iteration})",
             )
         except Exception as e:
-            logger.error(f"Recover Layer 1 (non-ChaosBlade) LLM call failed at iteration {layer1_iteration}: {e}")
-            layer1 = RecoverLayer1Result(status="error", details=f"LLM call failed: {e}", raw_output=str(e))
+            # Same empty-str backfill as the first-iteration handler above.
+            err_detail = str(e) or type(e).__name__
+            logger.error(f"Recover Layer 1 (non-ChaosBlade) LLM call failed at iteration {layer1_iteration}: {err_detail}")
+            layer1 = RecoverLayer1Result(status="error", details=f"LLM call failed: {err_detail}", raw_output=err_detail)
             # Fall through to terminal check
         else:
             inject_kubeconfig_into_tool_calls(response, kubeconfig)
@@ -901,9 +1028,11 @@ def _layer1_success_lacks_landed_evidence(messages) -> bool:
     landed at the API layer. Mutating/readonly verdicts come from the
     target_guard classifier (no hand-rolled verb lists); classifier failures
     fail open per call so a classification bug cannot wedge recovery.
-    A blade-experiment destroy via ``kubectl exec ... blade destroy``
-    classifies READONLY, and a Layer 1 with no mutating call at all has
-    nothing to confirm — both pass.
+    A blade-experiment destroy via ``kubectl exec ... blade destroy`` now
+    classifies UNKNOWN (mutating cleanup, provenance-gated at the execute
+    screener — twelfth-round E3), so it counts as a mutating call whose
+    landing needs its own read-only confirmation; a Layer 1 with no
+    mutating call at all has nothing to confirm — both pass.
     """
     from chaos_agent.agent.target_guard import SCOPE_READONLY, infer_effective_target
 
@@ -973,26 +1102,67 @@ async def _run_layer2_verification(
     inject_context = state.get("inject_context", "")
 
     # Determine Layer 1 type: "deterministic" (programmatic destroy through
-    # the dispatched provider's execution domain) or "llm_driven" (UID-less
-    # or in-cluster exec delivery). Used by Layer 2 prompt and context.
-    # recover_layer1_type may be None (field default for fresh runs where
-    # the deterministic path didn't explicitly set it). Fall back to the
-    # dispatched provider's deterministic-recover capability in that case
-    # (a live experiment UID implies an experiment-carrier dispatch).
+    # the dispatched provider's execution domain) or "llm_driven" (uid-less
+    # non-deterministic carriers or in-cluster exec delivery). Used by Layer
+    # 2 prompt and context. recover_layer1_type may be None (field default
+    # for fresh runs where the deterministic path didn't explicitly set it).
+    # Fall back to the dispatched provider's deterministic-recover capability
+    # in that case (a live experiment UID implies an experiment-carrier
+    # dispatch; a UID-less deterministic handle implies the CR-reference
+    # carrier — D1, the seam-compat gate below).
     _rl1_type = state.get("recover_layer1_type")
     _rl1_type_inferred = _rl1_type is None
     if _rl1_type_inferred:
         _rl1_type = (
             "deterministic"
-            if experiment_uid and _provider_for_recover(state).has_deterministic_recover
+            if (
+                experiment_uid
+                or _deterministic_recover_identity(state)
+            )
+            and _provider_for_recover(state).has_deterministic_recover
             else "llm_driven"
         )
     _layer1_is_deterministic = _rl1_type == "deterministic"
+
+    # B51 (case #33): Layer-2-LOCAL iteration count. The shared
+    # ``verifier_loop_count`` spans Layer 1 too, so a task-level gate can
+    # fire on Layer 2's FIRST iteration — Layer 1's observation iterations
+    # satisfy it — and the convergence hint then collides head-on with the
+    # ``recover_layer2_first`` anti-laziness guard in the same turn (one
+    # reminder says "conclude now", the guard rejects first-turn
+    # conclusions). The convergence hint is Layer-2-scoped by its own
+    # wording ("THIS Layer 2 iteration"); the DEADLINE hint stays on the
+    # shared counter because the loop budget it describes IS shared.
+    _layer2_start = state.get("layer2_start_count")
+    _layer2_iterations = (
+        1 if is_first_layer2
+        else (count - _layer2_start + 1 if _layer2_start else count)
+    )
 
     # Build messages for LLM
     # inject_ctx_msg: for ChaosBlade faults, Layer 1 didn't add inject context to state.messages
     inject_ctx_msg = None
     messages = list(state.get("messages", []))
+
+    # Graft boundary declaration for the deterministic-Layer-1 shape:
+    # ``_layer1_destroy_via_provider`` never enters the LLM path, so the
+    # declaration the LLM-driven Layer 1 injects never lands in
+    # state.messages — this is the recovery's FIRST LLM loop, and the
+    # grafted inject history above it (thread-inherited checkpoint)
+    # needs the same three-axis seam marker (#29 evidence). Idempotent
+    # marker probe (kickoff precedent): when the LLM-driven Layer 1
+    # already persisted its declaration, the probe finds it and skips —
+    # exactly one declaration per recovery context.
+    _decl_msg = None
+    if not any(
+        isinstance(m, HumanMessage)
+        and BOUNDARY_MARKER in (m.content if isinstance(m.content, str) else "")
+        for m in messages
+    ):
+        _decl_msg = HumanMessage(content=wrap_system_reminder(
+            INJECT_TO_RECOVER_BOUNDARY_DECLARATION
+        ))
+        messages.append(_decl_msg)
 
     # ── Position-optimized baseline ToolMessage injection ──
     # Baseline ToolMessage before any HumanMessage (early placement
@@ -1003,12 +1173,27 @@ async def _run_layer2_verification(
     # count==1 via result_update) to avoid duplication.
     _baseline = state.get("baseline_data")
     if _baseline and _baseline.get("success_count", 0) > 0:
-        _baseline_in_state = any(
-            getattr(m, "tool_call_id", "") == _RECOVER_BASELINE_TOOL_CALL_ID
-            for m in messages if isinstance(m, ToolMessage)
+        # PAIR-aware dedup over the whole synthetic id set — not a single-id
+        # ToolMessage probe. The check this replaced asked only "is a
+        # ToolMessage carrying the baseline tool_call_id already in history?",
+        # which is blind to:
+        #   * the AI caller gone but its ToolMessage surviving → the probe
+        #     reports "injected", no rebuild runs, so no caller is ever
+        #     supplied and the orphan ships with nothing to answer;
+        #   * damage confined to the METRICS pair → that id was never probed;
+        #   * a duplicated or reversed pair → both illegal, both invisible.
+        #
+        # The gate mechanics (diagnose → drop every stale fragment → rebuild →
+        # log at the level the cause deserves) are shared with verify and
+        # documented on apply_synthetic_pair_gate; the longer note on the two
+        # measured non-convergent damage flavours lives at the verify call site
+        # in _verifier_messages.py.
+        messages = apply_synthetic_pair_gate(
+            messages,
+            _RECOVER_SYNTHETIC_TOOL_CALL_IDS,
+            lambda: _build_recover_baseline_tool_messages(_baseline),
+            phase="recover_verify",
         )
-        if not _baseline_in_state:
-            messages.extend(_build_recover_baseline_tool_messages(_baseline))
 
     if is_first_layer2:
         from chaos_agent.agent.spec.fault_spec import read_fault_spec as _rfs_rvl2
@@ -1209,7 +1394,22 @@ async def _run_layer2_verification(
             for _se_key_l2, _se_val_l2 in _side_effects_l2.items():
                 _se_text_l2 = json.dumps(_se_val_l2, ensure_ascii=False)
                 if len(_se_text_l2) > 500:
-                    _se_text_l2 = _se_text_l2[:500] + "...(truncated)"
+                    # Same shared dialect as the L1 side above: both-ends
+                    # preview + state-evidence notice → state.side_effects.
+                    _se_len_l2 = len(_se_text_l2)
+                    _se_notice_l2 = build_truncation_notice(
+                        "state-evidence",
+                        _se_len_l2,
+                        state_hint=(
+                            "Full side-effect records preserved in "
+                            "state.side_effects — re-query its "
+                            "CURRENT state before acting on any entry"
+                        ),
+                        unit="characters",
+                    )
+                    _se_text_l2 = (
+                        elided_preview(_se_text_l2, 350, 150) + _se_notice_l2
+                    )
                 context += f"- {_se_key_l2}: {_se_text_l2}\n"
             context += (
                 "Report each entry's post-recovery status in your checklist. If ANY entry "
@@ -1245,8 +1445,26 @@ async def _run_layer2_verification(
             additional_kwargs={_RECOVER_CONTEXT_KWARGS_KEY: True},
         ))
 
+    # --- Progress ledger (drift anchor) — TAIL append, not the head ---
+    # context-cache-prefix-stability Unit A (task 2.5, design D1/D2): the recover
+    # ledger moved OUT of _build_recover_verifier_prompt's head (its per-round
+    # rewrite broke the cache prefix) onto the message tail via the same
+    # append-only channel as execute/verify, and is persisted below alongside
+    # _main_hm_for_state so history accumulates one frozen snapshot per round.
+    # NO stable id: a stable id would make add_messages replace the copy IN
+    # PLACE, pinning it early (out of the recency tail) AND reintroducing an
+    # early volatile byte that re-bills the whole suffix every round. Placed
+    # before the convergence/deadline nudges below so those stay outermost.
+    from chaos_agent.agent.progress_ledger import build_ledger_tail_content
+    _ledger_tail = build_ledger_tail_content(state.get("progress_ledger"))
+    _ledger_msg = None
+    if _ledger_tail:
+        _ledger_msg = HumanMessage(content=wrap_system_reminder(_ledger_tail))
+        messages.append(_ledger_msg)
+
     # Convergence hint preserves model discretion while making remaining evidence explicit.
-    if count >= 4:
+    # B51: gated on the Layer-2-LOCAL count (see _layer2_iterations above).
+    if _layer2_iterations >= 4:
         messages.append(HumanMessage(content=wrap_system_reminder(
             "You have gathered sufficient CURRENT (post-recovery) evidence across multiple iterations. "
             "If your observations clearly show recovery, call submit_recover_verification now. "
@@ -1327,22 +1545,35 @@ async def _run_layer2_verification(
     # Extract the main recover context HumanMessage for state persistence.
     _main_hm_for_state = extract_persistent_hm(messages, state, _RECOVER_CONTEXT_KWARGS_KEY)
 
-    from chaos_agent.agent.progress_ledger import build_ledger_prompt_section
+    # The progress ledger NO LONGER rides this head (Unit A task 2.5): it rides
+    # the message tail (appended + persisted below) so the [system] head stays
+    # byte-stable across recover rounds.
     system_prompt = _build_recover_verifier_prompt(
         layer1_label="deterministic destroy" if _layer1_is_deterministic else "recovery execution",
         profile=capability_context.profile,
-        ledger_section=build_ledger_prompt_section(state.get("progress_ledger")),
     )
 
     # Record system prompt to session store (dedup handles repeated prompts)
     record_system_prompt(hook, state, system_prompt, node_name=RECOVER_VERIFIER)
 
     try:
-        response = await asyncio.wait_for(
-            llm_to_call.ainvoke(
-                [SystemMessage(content=system_prompt)] + messages
+        # B35: the verdict call is an idempotent pure-read judgement (messages
+        # in → verdict out, zero side effects), so a transient API failure
+        # (gateway blip / connection reset) is retried HERE instead of
+        # writing a terminal RECOVERY_FAILED with recovered=false while the
+        # cluster itself is already healthy (case #31). Slow-model timeouts
+        # do NOT trigger the retry — not the wait_for TimeoutError below, and
+        # not its SDK-wrapped forms (APITimeoutError/ReadTimeout, excluded by
+        # the classifier per resilient_llm's deliberate no-retry policy): a
+        # 600s slow verdict is something retrying can never heal.
+        response = await call_with_transient_retry(
+            lambda: asyncio.wait_for(
+                llm_to_call.ainvoke(
+                    [SystemMessage(content=system_prompt)] + messages
+                ),
+                timeout=settings.llm_read_timeout,
             ),
-            timeout=settings.llm_read_timeout,
+            log_name="recover Layer 2 verdict call",
         )
     except asyncio.TimeoutError:
         logger.error(
@@ -1417,6 +1648,15 @@ async def _run_layer2_verification(
         "verifier_loop_count": count,
         "recover_layer1_cache": layer1_to_dict(layer1),  # persist for subsequent iterations
         "layer2_context_added": True,  # mark Layer 2 context as built
+        # B51: pin the shared counter at Layer 2's first iteration so later
+        # iterations can derive the Layer-2-local count. Always (re-)pin on a
+        # fresh Layer 2 entry: a stale pin from an earlier Layer 2 run must
+        # not survive into a new one (it would inflate or, after a counter
+        # reset, negative-count the local gate into silence).
+        "layer2_start_count": (
+            count if is_first_layer2
+            else (_layer2_start if _layer2_start else count)
+        ),
     }
     # Materialize the inferred Layer-1 type (deterministic Layer-1 runs never
     # write the field at their transition — only the LLM-driven path does).
@@ -1432,9 +1672,16 @@ async def _run_layer2_verification(
     # a Layer 2 verdict text -> finalize_recover_verification. All Layer 2
     # finalization (guard + parse + baseline + retry + cleanup) now lives
     # in the finalize_recover_verification node.
+    # Declaration FIRST: it must stay at the head of the recover-written
+    # block (same shape as the L1 msg_list) so later iterations read
+    # [grafted history] → declaration → [current-recovery context] —
+    # "the history above" stays the completed inject task, never the
+    # current task's own context.
     result_update["messages"] = (
-        _main_hm_for_state + _synthetic_for_state
-        + ([inject_ctx_msg] if inject_ctx_msg else []) + [response]
+        ([_decl_msg] if _decl_msg else [])
+        + _main_hm_for_state + _synthetic_for_state
+        + ([inject_ctx_msg] if inject_ctx_msg else [])
+        + ([_ledger_msg] if _ledger_msg else []) + [response]
     )
     # Pass the first-Layer2 signal to finalize_recover_verification so its
     # anti-laziness guard fires exactly once (a conclusion produced before
@@ -1512,8 +1759,17 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
         # ---- Guard: max iterations exceeded ----
         if count > settings.max_recover_verifier_loop:
             logger.warning(f"Recover verifier loop exceeded max iterations ({settings.max_recover_verifier_loop})")
+            # Round-32 K2 — the word moves to its honest slot: the loop could
+            # not CONFIRM recovery, which is honest ignorance, not partial
+            # recovery. "partial" (the previous word) fed
+            # recovery_task_state_from_level the failed terminal branch
+            # (recovered=False + level=partial → "failed"), permanently
+            # closing the recovery entrance on a fault this very warning
+            # says may still be active. "unverified" keeps the row in the
+            # recoverable set (fail-closed: ignorance ≠ absence) and lets
+            # may_carry_live_fault keep the ledger verdict authoritative.
             verification = {
-                "level": "partial",
+                "level": "unverified",
                 "layer1": {"status": "passed", "details": "Confirmed in earlier iterations"},
                 "layer2": {"status": "skipped", "details": "Max iterations reached, could not confirm recovery"},
                 "baseline_confidence": _compute_baseline_confidence(state),

@@ -78,14 +78,6 @@ class _SessionStore:
         self.appended = {"task_id": task_id, "messages": messages}
 
 
-class _TuiStore:
-    def __init__(self):
-        self.dialogue = None
-
-    def append_dialogue(self, session_id, messages):
-        self.dialogue = {"session_id": session_id, "messages": messages}
-
-
 def test_status_summary_preserves_legacy_server_inject_shape():
     data = {
         "task_id": "task-1",
@@ -180,6 +172,26 @@ def test_recover_cli_summary_uses_recover_verification_not_inject_verification()
     assert summary["data"]["result"] == "recovered"
     assert summary["data"]["verification"]["level"] == "recovered"
     assert summary["data"]["verification"]["layer1"] == {"status": "passed"}
+
+
+def test_recover_cli_summary_empty_values_spells_unverified_not_recovered():
+    """Round-16 S2: empty recover values (aget_state failure — swallowed
+    by finalize_recover_session's ``except Exception: pass`` — or a
+    genuinely empty final state) must NOT fabricate "recovered".
+    "unverified" is the honest spelling of "no evidence" (D4/D5
+    honest-ignorance family): the session still closes with an ok
+    envelope, but the persisted result never claims a verdict it cannot
+    prove."""
+    summary = build_recover_session_summary(
+        {},
+        recover_task_id="task-recover",
+        inject_task_id="task-inject",
+        inject_state_values=_inject_values(),
+        mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+    )
+
+    assert summary["status"] == "success"
+    assert summary["data"]["result"] == "unverified"
 
 
 @pytest.mark.asyncio
@@ -301,7 +313,7 @@ async def test_finalize_recover_failed_fallback_does_not_write_success_summary()
 
     await finalize_recover_session(
         store,
-        _Graph(_recover_values()),
+        _Graph({"operation": "recover"}),
         {"configurable": {"thread_id": "task-recover"}},
         "task-recover",
         "task-inject",
@@ -312,6 +324,193 @@ async def test_finalize_recover_failed_fallback_does_not_write_success_summary()
 
     assert store.finalized["status"] == "failed"
     assert store.finalized["result_summary"] == ""
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_default_yields_to_reached_verdict():
+    """Round-63 P8': the recover-side counterpart of the inject surface's
+    round-62 P8 gate. The classified default_status classifies runs still
+    MID-FLIGHT only. A recover graph carrying its own verdict
+    (recover_verification on record) keeps it even when the caller passes
+    the abort word unconditionally — the G5 fallback and the
+    recover-stream disconnect arm both do, and an interrupt racing in
+    during result extraction used to rewrite "recovered" to
+    "cancelled"/"failed" while the row's skip_if_terminal kept the row's
+    verdict: the r55 F2 word split, recover edition."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph(_recover_values()),
+        {"configurable": {"thread_id": "task-recover-verdict"}},
+        "task-recover-verdict",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+        default_status="cancelled",
+    )
+
+    assert store.finalized["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_default_lands_when_run_is_midflight():
+    """The gate must not swallow the legitimate default: a mid-flight
+    recover ("recovering" — no verdict on record) keeps the abort word —
+    the interrupt is a KNOWN terminal fact, not something inference can
+    derive."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph({"operation": "recover"}),
+        {"configurable": {"thread_id": "task-recover-midflight"}},
+        "task-recover-midflight",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+        default_status="cancelled",
+    )
+
+    assert store.finalized["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_default_lands_on_empty_values():
+    """Empty values (aget_state failed) do NOT suppress the abort word:
+    the interrupt itself is a known terminal fact and with no state on
+    record there is no evidence any verdict was reached (round-53
+    ruling, mirrored from the inject surface's gate)."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph({}),
+        {"configurable": {"thread_id": "task-recover-empty"}},
+        "task-recover-empty",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+        default_status="cancelled",
+    )
+
+    assert store.finalized["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_default_verdict_polarity_matches_payload_path():
+    """The verdict-derived word follows the payload path's own polarity:
+    only "failed" lands failed; unverified and partial_recovered are
+    session-level completions (same mapping the turn stream's defensive
+    finalize applies). A verdict of "failed" wins over the abort word —
+    the run's own recorded failure is the stronger fact."""
+    unverified = {
+        "operation": "recover",
+        "recover_verification": {"level": "unverified"},
+    }
+    partial = {
+        "operation": "recover",
+        "result": {"recovered": True},
+        "recover_verification": {"level": "partial"},
+    }
+    failed = {
+        "operation": "recover",
+        "recover_verification": {
+            "level": "failed",
+            "layer1": {"status": "failed"},
+        },
+    }
+
+    for name, values, expected in (
+        ("unverified", unverified, "completed"),
+        ("partial", partial, "completed"),
+        ("failed", failed, "failed"),
+    ):
+        store = _SessionStore()
+        await finalize_recover_session(
+            store,
+            _Graph(values),
+            {"configurable": {"thread_id": f"task-recover-{name}"}},
+            f"task-recover-{name}",
+            "task-inject",
+            _inject_values(),
+            result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+            default_status="cancelled",
+        )
+        assert store.finalized["status"] == expected, name
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_cli_envelope_default_lands_on_midflight():
+    """Round-63 R63-1: the CLI envelope branch used to hard-code
+    "completed" regardless of the run's outcome — a recovery that FAILED
+    (RECOVERY_FAILED return or the except in cli/runner.py) recorded
+    "completed" on its session while the same record's data.result said
+    failed/unverified. The branch now consumes default_status, and the
+    verdict gate above spans EVERY result_summary_mode. The caller
+    classifies which exit ran (the runner passes "failed" from its
+    failure exits); a mid-flight state (no verdict on record) keeps the
+    caller's word."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph({"operation": "recover"}),
+        {"configurable": {"thread_id": "task-recover-cli-midflight"}},
+        "task-recover-cli-midflight",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+        default_status="failed",
+    )
+
+    assert store.finalized["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_cli_envelope_default_yields_to_reached_verdict():
+    """The CLI envelope is NOT exempt from the verdict gate: a verdict
+    reached before the crash keeps its derived word even when the
+    runner's failure exit passes "failed" — otherwise the gate's
+    guarantee would be mode-dependent and the CLI's exception exit
+    (which fires after the graph already recorded "recovered") would
+    rewrite it."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph(_recover_values()),
+        {"configurable": {"thread_id": "task-recover-cli-verdict"}},
+        "task-recover-cli-verdict",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+        default_status="failed",
+    )
+
+    assert store.finalized["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_cli_envelope_default_lands_on_empty_values():
+    """Empty values (aget_state failure swallowed by the finalize's
+    except) do NOT suppress the CLI caller's classified word — the
+    failure exit is a known terminal fact (round-53 ruling) and with no
+    state on record there is no evidence any verdict was reached."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph({}),
+        {"configurable": {"thread_id": "task-recover-cli-empty"}},
+        "task-recover-cli-empty",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+        default_status="failed",
+    )
+
+    assert store.finalized["status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -398,27 +597,6 @@ async def test_finalize_recover_session_prefers_state_parent_task_id():
     assert store.finalized["parent_task_id"] == "task-inject-durable"
 
 
-@pytest.mark.asyncio
-async def test_finalize_open_conversation_routes_dialogue_without_finalizing():
-    store = _SessionStore()
-    tui_store = _TuiStore()
-    message = object()
-
-    await finalize_inject_session(
-        store,
-        _Graph({}),
-        {"configurable": {"thread_id": "task-1"}},
-        "task-1",
-        is_open_conversation=True,
-        precomputed_values={"tui_session_id": "session-1", "messages": [message]},
-        tui_session_store=tui_store,
-    )
-
-    assert store.finalized is None
-    assert store.appended is None
-    assert tui_store.dialogue == {"session_id": "session-1", "messages": [message]}
-
-
 def test_server_inject_routes_use_shared_session_finalizer():
     checked_files = [
         PROJECT_ROOT / "src/chaos_agent/server/routes/inject.py",
@@ -485,3 +663,96 @@ def test_memory_node_result_summary_uses_session_finalizer_projection():
 
     assert "build_inject_session_summary" in text
     assert "build_inject_envelope" not in text
+
+
+class TestInjectSessionStatusUnknownIsNotCompleted:
+    """Round-53: ``task_state="unknown"`` must never map to a completed run.
+
+    ``unknown`` is the ABSENCE of a verdict (``build_unknown_inject_data``
+    — the graph state could not be read at finalize time, the exact shape
+    an interrupted inject leaves behind when its aget_state dies under the
+    scope-cancel path). Recording it as "completed" wrote the worst
+    unknown as the best known — an interrupted run archived as a
+    successful one. Fail-closed, the same rule ``terminal_task_state``
+    legislates ("without a verdict the run is failed") and memory_nodes'
+    own comment ("never upgrade a run without a verdict to 'completed'").
+    """
+
+    def test_unknown_maps_to_failed(self):
+        from chaos_agent.memory.session_finalizer import inject_session_status
+
+        assert inject_session_status({"task_state": "unknown"}) == "failed"
+
+    def test_absent_task_state_maps_to_failed(self):
+        from chaos_agent.memory.session_finalizer import inject_session_status
+
+        assert inject_session_status({}) == "failed"
+
+    def test_unknown_inject_data_end_to_end(self):
+        """The exact record an interrupted inject's empty-state finalize
+        builds — end to end through the real builder and mapper."""
+        from chaos_agent.agent.result.operation_result import (
+            build_unknown_inject_data,
+        )
+        from chaos_agent.memory.session_finalizer import inject_session_status
+
+        data = build_unknown_inject_data("t-interrupted")
+        assert inject_session_status(data) == "failed"
+
+    def test_verdict_states_keep_their_own_mappings(self):
+        """Only the no-verdict cell changed: real verdicts keep their
+        existing status semantics (injected/unverified → completed, the
+        failed family → failed)."""
+        from chaos_agent.memory.session_finalizer import inject_session_status
+
+        assert inject_session_status({"task_state": "injected"}) == "completed"
+        assert inject_session_status({"task_state": "unverified"}) == "completed"
+        assert inject_session_status({"task_state": "failed"}) == "failed"
+        assert inject_session_status({"task_state": "rejected"}) == "failed"
+        assert inject_session_status({"task_state": "recovered"}) == "completed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_override_yields_to_reached_verdict():
+    """Round-62 R62-1/P8: the abort override classifies runs still
+    MID-FLIGHT only. A graph state carrying its own verdict (verification
+    on record → infer_task_state != "injecting") keeps it, even when the
+    caller passes the interrupt word unconditionally — inject_stream's
+    flag arm does exactly that, and an interrupt racing in during result
+    extraction used to rewrite "injected" to "cancelled" on the session
+    while the row kept "injected" (skip_if_terminal): the r55 F2 word
+    split, session surface. This is the single-source G6 on the session
+    surface, the counterpart of the row's skip_if_terminal guard."""
+    store = _SessionStore()
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-verdict-kept",
+        precomputed_values=_inject_values(),
+        status_override="cancelled",
+    )
+
+    assert store.finalized["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_override_lands_when_run_is_midflight():
+    """The guard must not swallow the legitimate override: a mid-flight
+    run (no verdict on record) keeps the r54 semantics — the interrupt is
+    a KNOWN terminal fact, and "cancelled" is a known terminal state, not
+    an inference product."""
+    store = _SessionStore()
+    values = {**_inject_values(), "experiment_uid": "", "verification": None}
+
+    await finalize_inject_session(
+        store,
+        graph_or_agent=None,
+        config=None,
+        session_id="task-midflight",
+        precomputed_values=values,
+        status_override="cancelled",
+    )
+
+    assert store.finalized["status"] == "cancelled"

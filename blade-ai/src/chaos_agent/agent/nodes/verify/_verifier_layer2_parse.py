@@ -15,11 +15,19 @@ from chaos_agent.agent.nodes.verify._verifier_shared import (
     parse_checklist_items,
 )
 from chaos_agent.agent.result.verdict import (
+    CHECKLIST_BENIGN_STATUSES,
+    CHECKLIST_NON_PASSED_STATUSES,
+    CHECKLIST_STATUS_VALUES,
     Checklist,
     ChecklistItem,
+    ChecklistItemStatus,
     InjectVerdict,
+    INJECT_VERDICT_VALUES,
     Layer1Result,
+    LAYER1_STATUS_VALUES,
+    LAYER2_PARSE_KEYWORDS,
     Layer2Result,
+    LAYER2_STATUS_VALUES,
     StructuredWarning,
     VerificationResult,
     WarningCode,
@@ -49,9 +57,16 @@ logger = logging.getLogger(__name__)
 # The whitespace tolerance covers both "7 → 8" and "7→8". Unit suffix
 # groups are non-capturing — we only care about the numeric values for
 # delta computation; unit parsing happens later via _parse_numeric.
+#
+# Comma-grouped numbers ("78,505,306 → 78,697,402") are matched as whole
+# values. Without the grouped alternative the engine backtracks past the
+# commas and parses "306 → 78" — a fabricated delta with wrong numbers
+# landing in the contradiction warning, or a false-positive downgrade
+# when the LLM faithfully cited a comma-formatted change. The grouped
+# branch is listed first so "123456" still falls through to plain digits.
 _DELTA_PATTERN = re.compile(
-    r"(?P<base>\d+(?:\.\d+)?)\s*(?:%|m|Mi|Gi|Ki)?\s*(?:→|->|to|—>)\s*"
-    r"(?P<post>\d+(?:\.\d+)?)\s*(?:%|m|Mi|Gi|Ki)?",
+    r"(?P<base>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:%|m|Mi|Gi|Ki)?\s*(?:→|->|to|—>)\s*"
+    r"(?P<post>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:%|m|Mi|Gi|Ki)?",
     re.IGNORECASE,
 )
 
@@ -195,7 +210,11 @@ def _find_contradictions(
     for match in _DELTA_PATTERN.finditer(evidence):
         base_str, post_str = match.group("base"), match.group("post")
         try:
-            llm_base, llm_post = float(base_str), float(post_str)
+            # Strip comma grouping before float() — the pattern captures
+            # the literal LLM text (kept verbatim in the warning below),
+            # e.g. "78,505,306" → 78505306.0.
+            llm_base = float(base_str.replace(",", ""))
+            llm_post = float(post_str.replace(",", ""))
         except ValueError:
             continue
         llm_delta = llm_post - llm_base
@@ -322,6 +341,15 @@ _CONTRADICTION_INDICATORS = {
 # Checklist parsing: detect skipped verification steps for auto-downgrade
 # ---------------------------------------------------------------------------
 
+# The parseable item-status vocabulary derives from the legislation enum
+# (B76 round-14): sorted longest-first so a future member that prefixes an
+# existing one cannot shadow it in the alternation. Teaching (submit tool
+# docs + prompt rules) parses from the same enum — parse can never drift
+# from teach.
+_ITEM_STATUS_ALT = "|".join(
+    sorted((m.value for m in ChecklistItemStatus), key=len, reverse=True)
+)
+
 _CHECKLIST_PATTERNS = [
     # Primary: Step N: <status> [— evidence]
     # Captures step number, status, and optional evidence text after
@@ -329,9 +357,9 @@ _CHECKLIST_PATTERNS = [
     # tolerated via a non-capturing optional group.
     # Group layout: (1)=step, (2)=status, (3)=evidence.
     re.compile(
-        r"(?:step|check)\s*(\d+)\s*[:.)]\s*(?:\[?(?:core|impact)\]?\s*)?"
-        r"\[?(passed|failed|skipped|recovered_before_observation|expected|not_applicable)\]?"
-        r"(?:\s*[—–-]\s*(.+?))?\s*$",
+        rf"(?:step|check)\s*(\d+)\s*[:.)]\s*(?:\[?(?:core|impact)\]?\s*)?"
+        rf"\[?({_ITEM_STATUS_ALT})\]?"
+        rf"(?:\s*[—–-]\s*(.+?))?\s*$",
         re.IGNORECASE | re.MULTILINE,
     ),
     # Explicit skip marker from prompt instruction: [SKIPPED] Step N
@@ -340,9 +368,9 @@ _CHECKLIST_PATTERNS = [
     re.compile(r"(?<!\d[.:)]\s)\[SKIPPED\]\s*(?:step\s*)?(\d+)?", re.IGNORECASE),
     # Bare numbered list: 1. <status> [— evidence]
     re.compile(
-        r"^\s*(\d+)\s*[.:)]\s*(?:\[?(?:core|impact)\]?\s*)?"
-        r"\[?(passed|failed|skipped|recovered_before_observation|expected|not_applicable)\]?"
-        r"(?:\s*[—–-]\s*(.+?))?\s*$",
+        rf"^\s*(\d+)\s*[.:)]\s*(?:\[?(?:core|impact)\]?\s*)?"
+        rf"\[?({_ITEM_STATUS_ALT})\]?"
+        rf"(?:\s*[—–-]\s*(.+?))?\s*$",
         re.IGNORECASE | re.MULTILINE,
     ),
 ]
@@ -394,7 +422,7 @@ def _detect_checklist_conclusion_inconsistency(
     if l2_status != "passed" or not checklist_items:
         return None, False
 
-    _non_passed_statuses = ("failed", "partial", "recovered_before_observation")
+    _non_passed_statuses = CHECKLIST_NON_PASSED_STATUSES
     non_passed_items = [
         item for item in checklist_items
         if item.get("status") in _non_passed_statuses
@@ -591,11 +619,20 @@ def _try_parse_json(content: str) -> dict | None:
     if not isinstance(data, dict):
         return None
 
-    l2 = data.get("layer2", "unknown")
-    overall = data.get("overall", "unverified")
-    if l2 not in ("passed", "failed", "skipped", "partial", "recovered_before_observation"):
+    # Required-field presence and closed-set validity are separate gates:
+    # a missing layer2/overall is a schema violation (reject → fall through
+    # to the text parser), while an explicit in-set word — "unknown"
+    # included, matching what the JSON-mode reminder teaches — is accepted.
+    if "layer2" not in data or "overall" not in data:
         return None
-    if overall not in ("verified", "partial", "unverified"):
+    l2 = data["layer2"]
+    overall = data["overall"]
+    # Closed sets derive from the legislation enums (B76 round-14):
+    # out-of-set claims reject this JSON (fall through to the text
+    # parser) instead of flowing verbatim into the verification dict.
+    if l2 not in LAYER2_STATUS_VALUES:
+        return None
+    if overall not in INJECT_VERDICT_VALUES:
         return None
 
     result = {
@@ -610,15 +647,28 @@ def _try_parse_json(content: str) -> dict | None:
         result["checklist"] = {
             "items": checklist,
             "skipped_count": sum(1 for c in checklist if c.get("status") == "skipped"),
-            "non_passed_count": sum(1 for c in checklist if c.get("status") in ("failed", "partial", "recovered_before_observation")),
+            # Fail-closed counting (B76 round-14 F3): closed-set-outside
+            # words are not pass claims.
+            "non_passed_count": sum(
+                1 for c in checklist
+                if c.get("status") not in CHECKLIST_BENIGN_STATUSES
+            ),
             "total_count": len(checklist),
             "total_executed": len(checklist),
         }
+        _outside = sorted({
+            c.get("status") for c in checklist
+            if isinstance(c, dict) and c.get("status") not in CHECKLIST_STATUS_VALUES
+        })
+        if _outside:
+            result["warnings"].append(
+                f"Checklist item statuses outside the closed vocabulary: {_outside}."
+            )
         # Checklist-conclusion inconsistency check (same logic as text parser)
         if l2 == "passed":
             _non_passed_ev = " ".join(
                 c.get("evidence", "") for c in checklist
-                if c.get("status") in ("failed", "partial", "recovered_before_observation")
+                if c.get("status") in CHECKLIST_NON_PASSED_STATUSES
             )
             inconsistency_warning, should_downgrade = _detect_checklist_conclusion_inconsistency(
                 checklist, l2, _non_passed_ev,
@@ -660,8 +710,10 @@ def _parse_verification_result(text: str) -> dict:
         result["layer2"]["status"] = l2_status
         if l2_status == "skipped":
             result["warnings"].append("Layer 2 skipped: LLM could not design a verification plan")
-        # Extract details after the status keyword
-        for status_kw in ("recovered_before_observation", "passed", "failed", "partial", "skipped"):
+        # Extract details after the status keyword (same ordered keyword
+        # legislation the status parser above consumes — the two hand copies
+        # had drifted into different orders).
+        for status_kw in LAYER2_PARSE_KEYWORDS:
             kw_idx = l2_first_line.find(status_kw)
             if kw_idx >= 0:
                 after = l2_first_line[kw_idx + len(status_kw):].strip()
@@ -673,7 +725,10 @@ def _parse_verification_result(text: str) -> dict:
     # --- Checklist parsing ---
     checklist_items = _parse_checklist_items(text)
     skipped_count = sum(1 for item in checklist_items if item["status"] == "skipped")
-    non_passed_count = sum(1 for item in checklist_items if item["status"] in ("failed", "partial", "recovered_before_observation"))
+    non_passed_count = sum(
+        1 for item in checklist_items
+        if item["status"] not in CHECKLIST_BENIGN_STATUSES
+    )
 
     if checklist_items:
         result["checklist"] = {
@@ -741,7 +796,7 @@ def _parse_verification_result(text: str) -> dict:
         # Collect evidence text from non-passed items for absence-phrase detection
         _non_passed_evidence = " ".join(
             item.get("evidence", "") for item in checklist_items
-            if item.get("status") in ("failed", "partial", "recovered_before_observation")
+            if item.get("status") in CHECKLIST_NON_PASSED_STATUSES
         )
         inconsistency_warning, should_downgrade = _detect_checklist_conclusion_inconsistency(
             checklist_items, result["layer2"]["status"], _non_passed_evidence,
@@ -851,11 +906,20 @@ def dict_to_verification_result(raw: dict) -> VerificationResult:
 
     Keeps _parse_verification_result unchanged (battle-tested parsing) and
     adds a structured conversion layer at the boundary.
+
+    One failure philosophy throughout (B76 round-14 F4 — this function
+    previously mixed a bare raise, a silent drop, a fail-open default and
+    a correct clamp): coerce to the enum's fail-safe member where one
+    exists (layer1/layer2/level → unknown/unverified), drop-and-log
+    where none does (a checklist item's status has no "unknown"
+    member), and always recompute counts from the surviving items so
+    items/total can never decouple.
     """
-    # Layer 1
+    # Layer 1 — out-of-set claims coerce to UNKNOWN (fail-safe).
     l1_raw = raw.get("layer1") or {}
     layer1 = Layer1Result(
-        status=l1_raw.get("status", "unknown"),
+        status=l1_raw.get("status", "unknown")
+        if l1_raw.get("status", "unknown") in LAYER1_STATUS_VALUES else "unknown",
         details=l1_raw.get("details", ""),
         raw_output=l1_raw.get("raw_output", ""),
         resource_statuses=l1_raw.get("resource_statuses", []),
@@ -863,34 +927,57 @@ def dict_to_verification_result(raw: dict) -> VerificationResult:
         expired=l1_raw.get("expired", False),
     )
 
-    # Layer 2
+    # Layer 2 — out-of-set claims coerce to UNKNOWN (fail-safe).
     l2_raw = raw.get("layer2") or {}
     layer2 = Layer2Result(
-        status=l2_raw.get("status", "unknown"),
+        status=l2_raw.get("status", "unknown")
+        if l2_raw.get("status", "unknown") in LAYER2_STATUS_VALUES else "unknown",
         details=l2_raw.get("details", ""),
     )
 
-    # Checklist
+    # Checklist — items whose status is outside the closed set (or
+    # missing) cannot be represented in the model: dropped EXPLICITLY
+    # (logged, counted from survivors) instead of silently.
     checklist = None
     cl_raw = raw.get("checklist")
     if cl_raw and isinstance(cl_raw, dict):
         items = []
+        dropped = []
         for item in cl_raw.get("items", []):
-            if isinstance(item, dict):
-                try:
-                    items.append(ChecklistItem(
-                        step=item.get("step", 0),
-                        description=item.get("description", ""),
-                        status=item.get("status", "passed"),
-                        evidence=item.get("evidence", ""),
-                    ))
-                except (ValueError, KeyError):
-                    pass
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") not in CHECKLIST_STATUS_VALUES:
+                dropped.append(item.get("step"))
+                continue
+            try:
+                items.append(ChecklistItem(
+                    step=item.get("step", 0),
+                    description=item.get("description", ""),
+                    status=item.get("status"),
+                    evidence=item.get("evidence", ""),
+                ))
+            except (ValueError, KeyError):
+                dropped.append(item.get("step"))
+        if dropped:
+            logger.warning(
+                "dict_to_verification_result: dropped %d checklist item(s) "
+                "with status outside the closed vocabulary (steps: %s)",
+                len(dropped), dropped,
+            )
+        # Counts are recomputed from the surviving items — a stale
+        # raw-claimed total_count contradicts the items at this boundary.
+        # Fail-closed rule is single-sourced: benign complement of
+        # CHECKLIST_BENIGN_STATUSES (verdict.py legislation).
         checklist = Checklist(
             items=items,
-            total_count=cl_raw.get("total_count", len(items)),
-            skipped_count=cl_raw.get("skipped_count", 0),
-            non_passed_count=cl_raw.get("non_passed_count", 0),
+            total_count=len(items),
+            skipped_count=sum(
+                1 for it in items if it.status == ChecklistItemStatus.SKIPPED
+            ),
+            non_passed_count=sum(
+                1 for it in items
+                if it.status.value not in CHECKLIST_BENIGN_STATUSES
+            ),
         )
 
     # Warnings

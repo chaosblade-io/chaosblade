@@ -107,10 +107,23 @@ class TestReadOnlyExemptionsIntact:
         "iptables -S",
         "nft list",
         "cat /proc/net/dev",
+        # Rule-dump queries ride the SHARED judge (same ruling the tool
+        # layer enforces on kubectl_read exec inners) — the verify-phase
+        # screener must not refuse a white-box probe the tool layer would
+        # happily run (incident: netem verify fell back to indirect evidence
+        # because `tc qdisc show` classified as a pod mutation).
+        "tc qdisc show dev eth0",
+        "tc -s qdisc show dev eth0",
+        "iptables -t nat -L",
     ])
     def test_probes_stay_readonly(self, inner):
         eff = classify(f"demo-pod-0 -n arms-prom -- {inner}")
         assert eff.scope == SCOPE_READONLY, f"{inner} is a read, not a mutation"
+
+    def test_shell_operator_ride_along_stays_mutating(self):
+        """A read-only query glued to a mutation must not inherit the exemption."""
+        eff = classify("demo-pod-0 -n arms-prom -- tc qdisc show dev eth0 && rm -rf /")
+        assert eff.scope == "pod"
 
     def test_host_readonly_probe_through_chroot_still_allowed(self):
         """Phase 1 must be able to verify host preconditions."""

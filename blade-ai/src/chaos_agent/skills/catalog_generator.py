@@ -31,8 +31,16 @@ _CASE_NAME_RE = re.compile(r"\*\*用例名称\*\*\s*(.+?)\s*$", re.MULTILINE)
 
 
 def _cache_path(work_dir: Path) -> Path:
-    """Return the cache file path under the working directory."""
-    p = work_dir / "memory" / "tool_cache" / _CACHE_FILENAME
+    """Return the cache file path under the working directory.
+
+    "skill_catalog", NOT the compactor's "tool_cache": the two caches are
+    unrelated (LLM-distilled use-case lists vs oversized tool-output
+    artifacts) and must not share a directory spelling — a working_dir
+    pointed at ~/.blade-ai would otherwise co-locate them and leave the
+    catalog's survival dependent on the compactor's eviction glob never
+    broadening (round-42 O1).
+    """
+    p = work_dir / "memory" / "skill_catalog" / _CACHE_FILENAME
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 

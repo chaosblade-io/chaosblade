@@ -41,8 +41,9 @@ reaches the PROTOCOL layer (fabricated ToolMessage pairing + shared
 and ``tool_screener`` remain hand-written because they carry
 phase-specific duties this factory deliberately does not model:
 ``tool_screener`` runs the target-drift guard (``check_target``,
-execute-only) and can route ``replan``; ``phase1_screener`` has the
-``revise_fault_spec`` replan branch. Folding them in would require
+execute-only) and can route ``replan``; ``phase1_screener`` carries
+the capability-probe exemption (``kubectl_read debug``). Folding them
+in would require
 replan / drift-guard hooks whose complexity would exceed the payoff.
 Revisit only if those duties ever crystallise into pluggable hooks.
 """

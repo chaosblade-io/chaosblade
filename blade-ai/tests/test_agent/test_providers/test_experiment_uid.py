@@ -25,7 +25,13 @@ from chaos_agent.agent.providers.chaosblade.verify import extract_experiment_uid
 
 VALID_UID = "abcd1234-ef56-7890-abcd-1234567890ab"
 SECOND_UID = "11112222-3333-4444-5555-666677778888"
-RESOURCE_NAME = "chaosblade-1234abcd5678"
+# Round-20 Q2 flip: the resource-name fallback STRIPS the ``chaosblade-``
+# prefix (the suffix IS the experiment UID) and composes the single-source
+# hex16 shape — the expected value is the bare 16-hex suffix, and the
+# pre-r20 12-hex suffix moved to the reject list (below the legislated
+# 16 lower bound).
+RESOURCE_NAME = "chaosblade-a1b2c3d4e5f60718"
+RESOURCE_UID = "a1b2c3d4e5f60718"
 
 
 SAMPLES_SUCCESS: list[tuple[str, str, str]] = [
@@ -88,11 +94,12 @@ SAMPLES_SUCCESS: list[tuple[str, str, str]] = [
         VALID_UID,
     ),
     # 8. ChaosBlade resource-name fallback — blade emitted a resource
-    # ref (e.g. from `kubectl get chaosblades`) instead of a UID.
+    # ref (e.g. from `kubectl get chaosblades`) instead of a UID: the
+    # suffix is the UID, returned BARE (round-20 Q2).
     (
         "chaosblade_resource_fallback",
         f"NAME              AGE\n{RESOURCE_NAME}   2m",
-        RESOURCE_NAME,
+        RESOURCE_UID,
     ),
     # 9. Tab-separated kubectl output that embeds the success JSON
     # alongside other fields (mirrors `kubectl -o json` post-processing).
@@ -111,6 +118,13 @@ SAMPLES_REJECT: list[tuple[str, str]] = [
     (
         "code_54000_success_false",
         f'{{"code":54000,"success":false,"result":{{"uid":"{VALID_UID}"}},"error":"DaemonSet pod not Running"}}',
+    ),
+    # 11. Round-20 Q2: a resource-name suffix below the legislated 16-hex
+    # lower bound is not a UID shape — the fallback refuses it (the
+    # pre-r20 anchor asserted the verbatim PREFIXED string here).
+    (
+        "short_resource_suffix",
+        "NAME              AGE\nchaosblade-1234abcd5678   2m",
     ),
 ]
 

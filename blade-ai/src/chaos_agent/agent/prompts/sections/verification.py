@@ -5,7 +5,10 @@ These sections compose the verifier system prompt while sharing sub-sections
 eliminating copy-paste duplication per the P2 design principle.
 """
 
-from chaos_agent.agent.prompts.reminder import SYSTEM_REMINDER_DECLARATION
+from chaos_agent.agent.prompts.reminder import (
+    PARALLELIZE_PRINCIPLE,
+    SYSTEM_REMINDER_DECLARATION,
+)
 
 
 def get_verifier_role_section() -> str:
@@ -45,6 +48,7 @@ def get_verifier_core_principles_section() -> str:
 - Baseline comparison is the primary method to prove causation — compare the SAME metric on the SAME resource. When baseline is unavailable, degrade to healthy-state comparison, then cross-validation with BaselineUsed: false
 - When a tool returns error, the TOOL is right — verify its actual interface before retrying
 - Your product is an evidence chain for ONE claim: did the fault take effect on the approved target — effect present, attributable to the injection, coverage of the target set. When every element has evidence, the burden is discharged and you submit; re-sampling an element that already has evidence adds no proof. Only a MISSING element earns another observation — "another angle exists" is always true and is never a reason to continue, and being unable to observe is itself a conclusion — the conclusion is 'unobserved', never 'absent'
+- {PARALLELIZE_PRINCIPLE}
 - {SYSTEM_REMINDER_DECLARATION}"""
 
 
@@ -76,8 +80,15 @@ Evidence must be your own observations of what happened to the target AFTER inje
 - Invalid evidence: "pod received Killing event", "the injection action reported success"
 - Valid evidence: "Endpoints list is empty", "metrics show CPU at 95%"
 
-If an observation command fails, use the current environment's resource-level
-or alternative observation capability before concluding the evidence is unavailable.
+An observation failure's evidential weight depends on its cause:
+- **Auth-class failure** (401/403/Forbidden/unauthorized): the primary evidence
+  channel is unavailable for this run. Evidence gathered through alternative
+  channels (logs, events, indirect signals) directly observing the fault
+  mechanism is at most "partial" — it supports "verified" only when it itself
+  constitutes primary evidence (significant change from baseline).
+- **Transient failure** (timeout, connection reset): the failure carries no
+  evidential weight once a retry or an equivalent channel succeeds — evidence
+  obtained afterwards counts at full strength.
 
 You MAY add supplementary checks after covering required evidence, starting from the mechanism's most direct evidence.
 Supplementary checks are additions, NOT replacements.
@@ -148,10 +159,12 @@ def get_verifier_remember_section() -> str:
     (sampling a proven element over and over) happens LATE in the phase, when
     the primacy-zone copy is furthest away.
     """
-    return """# REMEMBER
+    return f"""# REMEMBER
 - Evidence from THIS phase only — prior phase results are NOT evidence
 - Baseline comparison proves causation — SAME metric on SAME resource; degrade to healthy-state comparison, then cross-validation when baseline unavailable
 - When a tool returns error, the TOOL is right
 - Every step uses the strongest available reference: baseline > healthy state > cross-validation
 - Submit once effect, attribution and coverage each have evidence — repeating a proven element adds no proof, and completeness of observation is not the goal
+- {PARALLELIZE_PRINCIPLE}
+- A significant change (vs baseline, or vs the expected healthy state) is the effect evidence; receipts and snapshots speak for the mechanism, not the outcome
 - Text responses = brief progress updates; tables and structured comparison go ONLY into submit_verification"""

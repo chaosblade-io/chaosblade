@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -38,7 +39,75 @@ from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
 
+# Whitelist for ``tui_session_id`` values, wherever one is composed
+# into a filesystem path (this store's ``_file_path`` /
+# ``_events_jsonl_path``, the server's memory/sessions routes).
+# Server-side ``createSession`` produces ``sess_<12 hex>``; we accept
+# the same shape plus a generous superset (alnum + dash + underscore,
+# max 128 chars) so a user-managed deployment can pick its own id
+# format. Anything else (slashes, dots, ``..``, percent-encoded path
+# separators after FastAPI decodes) must be rejected BEFORE the value
+# reaches a Path — routes import this single source so the memory and
+# sessions surfaces can never drift apart on the rule.
+SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
+
 _global_tui_session_store: Optional["TuiSessionStore"] = None
+
+
+# ── resumable-listing helpers ─────────────────────────────────────────
+#
+# Shared by ``TuiSessionStore.list_resumable_sessions`` (single source
+# for the /resume picker row shape). Moved here from the memory route so
+# the CLI's ``blade-ai resume`` picker uses the exact same assembly.
+
+# How much of the events jsonl ``_first_user_input`` reads while
+# hunting for the first ``user_input`` event. In practice user_input is
+# the FIRST event of every session (turn_event_stream sidewrites it
+# before the intent graph streams), so 64KB is several thousand lines
+# of headroom.
+_FIRST_INPUT_HEAD_BYTES = 64 * 1024
+
+# Rendering cap for the first-input snippet echoed in the picker row.
+_FIRST_INPUT_MAX_CHARS = 60
+
+
+def _count_events_file_lines(path: Path) -> int:
+    """Line count without JSON parsing — a resumable row only needs the
+    event total, not the parsed events. Binary mode: counting on bytes
+    avoids decode errors mid-file (corrupt tail lines still count)."""
+    n = 0
+    with open(path, "rb") as f:
+        for _ in f:
+            n += 1
+    return n
+
+
+def _first_user_input(path: Path) -> str:
+    """First ``user_input`` content from the head of the events file,
+    truncated for display. Empty string when the head window doesn't
+    contain one (session crashed before the first turn, or the first
+    input landed past the window — the latter doesn't happen today)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(_FIRST_INPUT_HEAD_BYTES)
+    except OSError:
+        return ""
+    for line in head.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("event_type") == "user_input":
+            content = (rec.get("data") or {}).get("content") or ""
+            if isinstance(content, str):
+                snippet = " ".join(content.split())
+                if len(snippet) > _FIRST_INPUT_MAX_CHARS:
+                    return snippet[: _FIRST_INPUT_MAX_CHARS - 1] + "…"
+                return snippet
+    return ""
 
 
 def set_global_tui_session_store(store: "TuiSessionStore") -> None:
@@ -155,8 +224,17 @@ class TuiSessionStore:
         tui_session_id: str,
         cluster_name: str = "",
         namespace: str = "",
+        conversation_thread_id: str = "",
     ) -> None:
-        """Initialize a new TUI session file."""
+        """Initialize a new TUI session file.
+
+        ``conversation_thread_id``: the LangGraph thread the session's
+        dialogue checkpoints under. Written at create time so a session
+        resume after a server restart can recover the thread binding
+        from disk (see ``update_thread_id`` for the later-rebind path —
+        empty here means the caller hasn't allocated a thread yet and
+        turn.py will mint + backfill one on the first turn).
+        """
         with self._lock:
             # Double-check inside lock to prevent duplicate create
             if tui_session_id in self._active_sessions:
@@ -170,6 +248,7 @@ class TuiSessionStore:
                 "status": "active",
                 "cluster_name": cluster_name,
                 "namespace": namespace,
+                "conversation_thread_id": conversation_thread_id,
                 "task_ids": [],
                 "messages": [],
                 "stats": {
@@ -184,6 +263,31 @@ class TuiSessionStore:
             self._active_sessions[tui_session_id] = data
             self._existing_keys[tui_session_id] = set()
             self._jsonl_counts[tui_session_id] = 0
+            self._write_json(tui_session_id)
+
+    def update_thread_id(self, tui_session_id: str, thread_id: str) -> None:
+        """Persist the session's LangGraph conversation thread binding.
+
+        Called when turn.py mints a thread for a session whose stored
+        binding is empty — the resume-after-restart path where the
+        in-memory SessionStore was rebuilt from disk without a thread
+        (legacy files predate the field). Not called for the normal
+        create flow: create() writes the binding up-front.
+
+        Follows update_stats' load-else-create pattern so a server that
+        never loaded this session into memory (fresh process, resume
+        request arrives) still persists the field.
+        """
+        with self._lock:
+            session = self._active_sessions.get(tui_session_id)
+            if session is None:
+                session = self._load_from_disk(tui_session_id)
+                if session is None:
+                    logger.warning(
+                        f"update_thread_id: session {tui_session_id} missing; skipping"
+                    )
+                    return
+            session["conversation_thread_id"] = thread_id
             self._write_json(tui_session_id)
 
     def add_task(self, tui_session_id: str, task_id: str) -> None:
@@ -336,6 +440,26 @@ class TuiSessionStore:
         self._active_sessions.pop(tui_session_id, None)
         self._existing_keys.pop(tui_session_id, None)
         self._jsonl_counts.pop(tui_session_id, None)
+
+    def update_status(self, tui_session_id: str, status: str) -> None:
+        """Patch ONLY the status field, keeping the session live.
+
+        The resume path uses this to flip a finalized/completed record
+        back to ``active`` — unlike finalize() it must NOT stamp
+        finished_at, drop the .jsonl increment log, or evict the
+        in-memory buffers (the session is about to keep appending).
+        """
+        with self._lock:
+            session = self._active_sessions.get(tui_session_id)
+            if session is None:
+                session = self._load_from_disk(tui_session_id)
+                if session is None:
+                    logger.warning(
+                        f"update_status: session {tui_session_id} missing; skipping"
+                    )
+                    return
+            session["status"] = status
+            self._write_json(tui_session_id)
 
     def read(self, tui_session_id: str) -> Optional[dict]:
         """Read a session from disk, reconstructing from snapshot + JSONL.
@@ -496,6 +620,70 @@ class TuiSessionStore:
                 f"Failed to read events for session {tui_session_id}: {e}"
             )
         return out
+
+    def has_events(self, tui_session_id: str) -> bool:
+        """Whether the session carries an events jsonl on disk — the
+        resume source of truth (the session JSON is decoration). Used
+        by the CLI's ``blade-ai resume -i <sid>`` to fail before the
+        TUI/server boot when the sid names nothing resumable."""
+        return self._events_jsonl_path(tui_session_id).exists()
+
+    def list_resumable_sessions(self, limit: int = 50) -> list[dict]:
+        """Sessions that carry an events jsonl on disk, newest first.
+
+        Single source for the ``/resume`` picker row shape — the
+        ``GET /api/v1/memory/resumable`` route (TUI's ``/resume`` list)
+        and the CLI's ``blade-ai resume`` bare listing both call
+        this, so the two surfaces cannot drift apart. Row shape (all
+        display-oriented; no conversation internals):
+
+          tui_session_id, size_bytes, event_count, started_at,
+          modified_at, first_input
+
+        Raises OSError when the events directory cannot be scanned —
+        callers decide whether that is a fail envelope (route) or a
+        stderr message (CLI).
+        """
+        candidates = sorted(
+            (
+                p
+                for p in self._events_dir.glob("*.events.jsonl")
+                if p.is_file()
+            ),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )[:limit]
+        rows: list[dict] = []
+        for path in candidates:
+            sid = path.name[: -len(".events.jsonl")]
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            # started_at from the session JSON when present; file mtime is
+            # the fallback for sessions whose JSON was deleted (the events
+            # file is the resume source of truth, the JSON is decoration).
+            started_at = ""
+            session_json = self.session_dir / f"{sid}.json"
+            if session_json.exists():
+                try:
+                    data = json.loads(
+                        session_json.read_text(encoding="utf-8")
+                    )
+                    started_at = data.get("started_at") or ""
+                except (OSError, ValueError):
+                    started_at = ""
+            rows.append(
+                {
+                    "tui_session_id": sid,
+                    "size_bytes": st.st_size,
+                    "event_count": _count_events_file_lines(path),
+                    "started_at": started_at,
+                    "modified_at": st.st_mtime,
+                    "first_input": _first_user_input(path),
+                }
+            )
+        return rows
 
     # ------------------------------------------------------------------
     # Private: JSONL incremental write

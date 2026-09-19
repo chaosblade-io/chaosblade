@@ -200,8 +200,10 @@ def build_blade_create_args(
         {scope, target, action, namespace, names, labels, kubeconfig,
          evict_count, evict_percent, flags}
     """
-    # Duration auto-boost: if params already has "timeout", override its value;
-    # otherwise append --timeout after params. Either way, only one --timeout.
+    # Duration contract precedence: the structured ``duration`` field is the
+    # single authority — if params already has a "timeout" key, override its
+    # value; otherwise append --timeout after params. Either way, only one
+    # --timeout. The value is written as declared (no floor adjustment).
     if duration > 0 and params and "timeout" in params:
         params["timeout"] = str(duration)
 

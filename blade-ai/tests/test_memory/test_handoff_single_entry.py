@@ -87,41 +87,55 @@ class TestDedupKeyContract:
         assert _key(SystemMessage(content="x")) != _key(HumanMessage(content="x"))
 
 
-class TestRunnerBuildsOneIdentifiedHandoff:
-    """Source-level, because reaching this line needs a live TUI dual-graph run."""
+class TestTurnStreamBuildsOneIdentifiedHandoff:
+    """Source-level, because reaching this line needs a live TUI dual-graph run.
+
+    The guard originally pointed at ``AgentRunner.converse_stream`` (the local
+    TUI twin). That twin was retired 2026-09-01 — and its retirement exposed
+    that the P0-7-6 fix had never reached the server ``/turn`` flow:
+    ``_run_inject_pipeline`` in ``server/routes/turn_event_stream.py`` was
+    still building TWO bare ``_SM(content=_handoff)`` objects (one for the
+    session-store jsonl first entry, one for the pipeline graph input), the
+    exact shape this file pins. The fix was ported the same day; this guard
+    now watches the server flow, the single TUI conversation entry point
+    that remains.
+    """
 
     @staticmethod
-    def _runner_source() -> str:
+    def _turn_stream_source() -> str:
         import inspect
 
-        from chaos_agent.cli import runner
+        from chaos_agent.server.routes import turn_event_stream
 
-        return inspect.getsource(runner)
+        return inspect.getsource(turn_event_stream)
 
     def test_the_handoff_is_constructed_with_an_id(self):
-        src = self._runner_source()
-        assert "SystemMessage(content=handoff, id=str(uuid.uuid4()))" in src
+        src = self._turn_stream_source()
+        assert "_SM(content=_handoff, id=str(uuid.uuid4()))" in src
 
     def test_no_second_bare_construction(self):
-        """The graph input must reuse the object, not build its own copy.
+        """Each write path must reuse the object, not build its own copy.
 
-        Two ``SystemMessage(content=handoff)`` calls produce two distinct ids,
-        which defeats the fix just as thoroughly as having none.
+        Two bare ``_SM(content=_handoff)`` calls produce two distinct ids,
+        which defeats the fix just as thoroughly as having none. The exact
+        substring (closing paren right after the content arg) matches only
+        the bare form, never the id-carrying one.
         """
-        src = self._runner_source()
-        assert "SystemMessage(content=handoff)" not in src
+        src = self._turn_stream_source()
+        assert "_SM(content=_handoff)" not in src
 
     def test_the_graph_input_reuses_the_same_object(self):
-        src = self._runner_source()
-        assert '"messages": [handoff_msg] if handoff_msg else []' in src
+        src = self._turn_stream_source()
+        assert "messages=[_handoff_msg] if _handoff_msg else []" in src
 
     def test_it_is_built_before_the_task_id_branch(self):
-        """The graph input needs it whether or not a task_id exists.
+        """The session bootstrap needs it whether or not a task id exists.
 
-        Building it inside ``if task_id:`` raised NameError on the other path;
-        this ordering is load-bearing, not cosmetic.
+        Building it inside ``if _p_task_id:`` would leave the graph input
+        with nothing on the other path; this ordering is load-bearing, not
+        cosmetic.
         """
-        src = self._runner_source()
-        build_at = src.index("SystemMessage(content=handoff, id=str(uuid.uuid4()))")
+        src = self._turn_stream_source()
+        build_at = src.index("_SM(content=_handoff, id=str(uuid.uuid4()))")
         branch_at = src.index("bootstrap_task_session(\n", build_at - 2000)
         assert build_at < branch_at

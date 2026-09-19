@@ -33,7 +33,7 @@ from .types import (
     GuardDecision,
     GuardVerdict,
 )
-from .classifier import canonicalise_kind
+from .classifier import CLUSTER_SCOPED_KINDS, canonicalise_kind
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +41,9 @@ logger = logging.getLogger(__name__)
 # Cluster-scoped kinds skip the namespace comparison — they live
 # outside any namespace, so ``approved.namespace`` and
 # ``effective.namespace`` are both expected to be empty.
-CLUSTER_SCOPED_KINDS: frozenset[str] = frozenset({
-    "node", "pv", "namespace", "clusterrole",
-    "clusterrolebinding", "storageclass",
-})
+# Single-sourced in the classifier since R21/G-5 (re-exported here for
+# the drift consumers; the classifier's ``is_cluster_scoped_kind`` is
+# the canonical predicate form).
 
 # K8s ownership: approved scope → set of resource kinds that OWN it.
 # When approved=pod and effective=deployment, the LLM is operating on
@@ -125,6 +124,35 @@ def _check_labels_superset(
         if effective.labels.get(k) != v:
             return False
     return True
+
+
+def _is_generation_successor(
+    approved: ApprovedTarget, effective: EffectiveTarget,
+) -> bool:
+    """Would every effective pod name be a controller-owned successor of
+    a frozen owner workload?
+
+    A controller-owned pod's name is DERIVED from its direct controller
+    (``<deployment>-<rs-hash>-<pod-hash>``, ``<statefulset>-<ordinal>``,
+    ``<job>-<hash>``) — that derivation is the API server's create
+    semantics, not a guess, so prefix-matching against the frozen owner
+    set is a deterministic identity check: the anchor comes from
+    freeze-time discovery (``discover_owner_names`` — both the labels
+    channel and the names→ownerReferences channel), the prefix contract
+    from the Kubernetes resource model. Consistent with the module's
+    discipline, the policy never guesses from pod names — it only ever
+    consults frozen anchors. The trailing ``-`` in the prefix keeps a
+    mere name-sharing workload (``web`` vs ``webapp-1``) from matching.
+    """
+    if not approved.owner_names or not effective.names:
+        return False
+    prefixes = tuple(f"{owner}-" for owner in approved.owner_names if owner)
+    if not prefixes:
+        return False
+    return all(
+        any(n.startswith(p) for p in prefixes)
+        for n in effective.names
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +250,53 @@ class K8sDriftPolicy:
         if effective.is_vehicle_exec:
             return None
 
+        # ---- 3.6 Case-manifest mechanism writes -----------------------------
+        # ONE additive branch ahead of the victim comparison. When the
+        # settled case carries a ``mechanism_writes`` manifest and approval
+        # froze it into ``mechanism_entries``, a call whose canonicalised
+        # scope+namespace matches an ACTIVE entry's domain is judged by that
+        # entry ALONE: names subset (or, for a prefix entry, every name
+        # starting with the prefix) passes — anything else is drift with
+        # manifest attribution. A call matching no entry's domain falls
+        # through to the existing rules below, byte-identically.
+        # Function-local import: ``mechanism_writes`` imports
+        # ``CLUSTER_SCOPED_KINDS`` from this module at load time, so a
+        # module-level back-import would cycle (same discipline as the
+        # providers import further down).
+        if approved.mechanism_entries:
+            from .mechanism_writes import (
+                match_mechanism_entries,
+                names_within_entries,
+            )
+
+            entries = match_mechanism_entries(approved, effective)
+            if entries:
+                # Entries sharing one domain are ALTERNATIVES with the
+                # OBJECT WRITE as the authorization unit: every effective
+                # name covered by some entry → in-contract; any foreign
+                # name → drift with manifest attribution (the rejection
+                # names every entry so the human can tell under-declaration
+                # from over-reach).
+                if names_within_entries(entries, effective):
+                    # In-contract mechanism write. Identity checking is
+                    # done for this call — the carrier-agnostic checks
+                    # (fault-type lock etc.) still run in the guard.
+                    return None
+                return GuardDecision(
+                    verdict=GuardVerdict.REJECT_DRIFT,
+                    reason=(
+                        f"mechanism write outside the case manifest: "
+                        f"effective names {list(effective.names)} not within "
+                        f"manifest entries "
+                        f"[{'; '.join(e.describe() for e in entries)}]; either "
+                        f"the case under-declares its mechanism (edit the "
+                        f"case's mechanism_writes frontmatter) or the plan "
+                        f"over-reached (re-plan within the declared write set)"
+                    ),
+                    effective=effective,
+                    suggestion=_build_suggestion(approved),
+                )
+
         # ---- 4. Scope (kind) check ------------------------------------------
         approved_scope = canonicalise_kind(approved.scope)
         effective_scope = canonicalise_kind(effective.scope)
@@ -277,9 +352,24 @@ class K8sDriftPolicy:
                     "tool_pod_namespaces"
                 )
                 if check_ns != effective_ns and not is_tool_ns:
+                    reason = (
+                        f"secondary namespace drift: approved={check_ns} "
+                        f"effective={effective_ns}"
+                    )
+                    if not approved.mechanism_entries:
+                        # Cross-domain mechanism write with no case manifest:
+                        # rejected exactly as today, plus the manifest-missing
+                        # attribution so the finding routes to the drill-loop
+                        # archive for backfill instead of being retried blind.
+                        reason += (
+                            "; cross-domain mechanism writes require a case "
+                            "manifest (mechanism_writes frontmatter) authored "
+                            "by the case and approved on the confirmation card "
+                            "— manifest missing for this case"
+                        )
                     return GuardDecision(
                         verdict=GuardVerdict.REJECT_DRIFT,
-                        reason=f"secondary namespace drift: approved={check_ns} effective={effective_ns}",
+                        reason=reason,
                         effective=effective,
                         suggestion=_build_suggestion(approved),
                     )
@@ -325,15 +415,64 @@ class K8sDriftPolicy:
                         effective.names, effective.namespace,
                     )
             else:
-                names_ok = _check_names_subset(approved, effective)
-                labels_ok = _check_labels_superset(approved, effective)
-                if not names_ok and not labels_ok:
-                    return GuardDecision(
-                        verdict=GuardVerdict.REJECT_DRIFT,
-                        reason=_format_name_drift_reason(approved, effective),
-                        effective=effective,
-                        suggestion=_build_suggestion(approved),
-                    )
+                if effective.is_recovery_carrier and not effective.fault_target:
+                    # Recovery-carrier pod under a SAME-scope approval (a
+                    # scope=pod victim): the carrier is a NEW pod whose
+                    # name can never equal the approved victim's, so the
+                    # names/labels comparison below is a structural false
+                    # drift. Scope already matched (same kind — not the
+                    # secondary/owner paths) and the namespace check above
+                    # anchored the carrier to the victim's namespace; the
+                    # carrier's security boundary is its SHAPE (the
+                    # five-condition fail-closed classifier check: name
+                    # prefix, --restart=Never, bounded sleep skeleton,
+                    # image whitelist, flag/overrides whitelist) plus
+                    # task-side registration — never the name alone
+                    # (design D7, recovery-carrier-standard). A
+                    # workload-scoped victim (deployment) already reaches
+                    # the same outcome via its pod secondary scope; this
+                    # branch gives a pod-scoped victim the same anchoring.
+                    pass
+                else:
+                    names_ok = _check_names_subset(approved, effective)
+                    labels_ok = _check_labels_superset(approved, effective)
+                    if not names_ok and not labels_ok:
+                        # Generation-successor exemption (case #39): a
+                        # pod-scope approval whose mechanism deletes the
+                        # pod and lets the controller recreate it ALWAYS
+                        # operates on a renamed successor — the names
+                        # subset can never match, and the plan itself
+                        # typically predicted the rename. This is the
+                        # exact mirror of the owner-scope branch above:
+                        # operating on the pod's OWNER (e.g. scale
+                        # deployment, which affects EVERY replica) has
+                        # always been legal, so "the workload's pods"
+                        # were already inside the approved blast radius —
+                        # accepting the owner's recreated (or sibling)
+                        # pod here adds no surface the owner-scope path
+                        # had not already granted. Scoped the same way:
+                        # same kind (validated above), same namespace
+                        # (validated above); the fault-type lock and the
+                        # duration anchor still apply after identity
+                        # clears. No owner anchor on record → the check
+                        # fails closed into the ordinary drift reject.
+                        if _is_generation_successor(approved, effective):
+                            logger.info(
+                                "target_guard: generation successor under "
+                                "frozen owners %s (effective names %s) — "
+                                "identity cleared",
+                                list(approved.owner_names),
+                                list(effective.names),
+                            )
+                        else:
+                            return GuardDecision(
+                                verdict=GuardVerdict.REJECT_DRIFT,
+                                reason=_format_name_drift_reason(
+                                    approved, effective,
+                                ),
+                                effective=effective,
+                                suggestion=_build_suggestion(approved),
+                            )
 
         return None
 

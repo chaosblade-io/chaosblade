@@ -82,3 +82,61 @@ class TestGenuineErrorsPassThrough:
         out = _phase2_handle_tool_error(err)
         assert "Input should be" in out
         assert "kubectl_read" in out
+
+
+class TestToolSurfaceAttribution:
+    """The history-inertia attribution sentence (openspec
+    phase-boundary-declaration; #29 first-run evidence recover-98caf0cd
+    msg[7]-[11]: three ``kubectl_read`` calls copied from the grafted
+    inject history were rejected — the model spent a full turn inferring
+    "the tool set changed" on its own because the feedback said "do not
+    guess" while the model was not guessing, it was reusing calls it had
+    seen).
+
+    Additive only: the pre-existing clauses (including the
+    task-ce9647931-driven "do not substitute" wording) are preserved
+    verbatim; the new sentence states the three semantic elements —
+    history provenance, phase ownership, current-binding authority.
+    """
+
+    def _rewrite(self, requested: str = "kubectl_read") -> str:
+        err = Exception(
+            f"Error: {requested} is not a valid tool, try one of [kubectl]."
+        )
+        return _phase2_handle_tool_error(err)
+
+    def test_existing_clauses_preserved_verbatim(self):
+        """The pre-existing safety clauses survive the addition untouched."""
+        out = self._rewrite()
+        assert "does not exist in this phase" in out
+        assert "No tool ran and nothing changed" in out
+        assert "do not guess at other tool names" in out
+        assert "say so in plain text" in out
+        assert "do not substitute a different tool" in out
+
+    def test_history_provenance_element_present(self):
+        """Element 1: the name may come from the conversation history."""
+        out = self._rewrite()
+        assert "conversation history" in out
+
+    def test_phase_ownership_element_present(self):
+        """Element 2: history tools belong to an earlier phase's surface."""
+        out = self._rewrite()
+        assert "earlier phase" in out
+        assert "tool surface" in out
+
+    def test_current_binding_authority_element_present(self):
+        """Element 3: the currently bound tools are the authority."""
+        out = self._rewrite()
+        assert "currently bound" in out
+        assert "authority" in out
+
+    def test_genuine_errors_still_pass_through(self):
+        """The attribution sentence must NOT leak into pass-through errors."""
+        err = Exception(
+            "Error executing tool 'kubectl' with kwargs {} "
+            "with error:\n node not found\n"
+        )
+        out = _phase2_handle_tool_error(err)
+        assert "conversation history" not in out
+        assert "node not found" in out

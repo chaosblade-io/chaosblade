@@ -12,6 +12,22 @@ from chaos_agent.models.schemas import build_inject_envelope
 logger = logging.getLogger(__name__)
 
 
+def _vehicle_teardown_hint(pending_vehicles: list[str], task_id: str) -> str:
+    """CLI hint text for uncollected task-built vehicles (inject-dfee9d3d).
+
+    Render layer only: the pending list itself is single-sourced in
+    ``operation_result.pending_vehicle_teardown`` and rides every result
+    envelope as ``vehicle_teardown_pending`` (R13-1) — this renderer reads
+    the field, never re-derives it.
+    """
+    return (
+        f"\nVehicle teardown outstanding ({len(pending_vehicles)}): "
+        f"{', '.join(pending_vehicles)}. Run `blade-ai recover "
+        f"--task-id {task_id}` to collect task-built carrier assets "
+        "(idempotent)."
+    )
+
+
 def _extract_visible_reply(values: dict) -> str:
     """Pick a user-visible reply from the latest AIMessage in graph state.
 
@@ -85,10 +101,25 @@ def _build_inject_result_events(
     from chaos_agent.agent.result.operation_result import build_inject_data_from_state
     result_data = build_inject_data_from_state(values, task_id)
 
-    return [StreamEvent(
+    events: list[StreamEvent] = [StreamEvent(
         type="result",
         content=json.dumps(build_inject_envelope(
             result_data, result_data["task_state"], result_data.get("error", ""),
         ), ensure_ascii=False),
         task_id=task_id,
-    )], False
+    )]
+    # Task-end teardown hint (inject-dfee9d3d): reads the single-sourced
+    # envelope field (R13-1) — the SSE / turn / persisted-JSON consumers
+    # carry the same fact automatically via build_inject_data_from_state,
+    # so every terminal surface answers this question identically.
+    # Non-stream inject returns a plain dict without this builder: its
+    # data dict still carries the field, and carrier-doc guidance covers
+    # the non-interactive follow-up.
+    pending_vehicles = result_data.get("vehicle_teardown_pending") or []
+    if pending_vehicles:
+        events.append(StreamEvent(
+            type="token",
+            content=_vehicle_teardown_hint(pending_vehicles, task_id),
+            task_id=task_id,
+        ))
+    return events, False

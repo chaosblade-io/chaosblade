@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from chaos_agent.l4.adapter import make_trajectory_id
+from chaos_agent.l4.adapter import _collect_observation_failures, make_trajectory_id
 from chaos_agent.l4.error_mapping import map_to_agent_error
 from chaos_agent.l4.events import (
     _PHASE_STEP_MAP,
@@ -19,6 +19,22 @@ from chaos_agent.l4.schemas import L4AgentError, L4TaskResult
 logger = logging.getLogger(__name__)
 
 
+# Recover is cluster-affine: the caller-carried connection snapshot wins over
+# the checkpoint-frozen injector credentials (see the ``recovery_state``
+# module docstring — connection credentials are runtime context, not durable
+# facts).  The platform resolves the session-bound environment into exactly
+# these payload keys before dispatching a recover task; callers that carry
+# none of them (bare CLI / HTTP / auto-recover) leave the frozen values in
+# place and behave exactly as before.
+_CONNECTION_PAYLOAD_KEYS = (
+    "kubeconfig",
+    "kube_context",
+    "kube_connection_mode",
+    "kubewiz_cluster_uuid",
+    "kubewiz_profile",
+)
+
+
 class _L4RecoveryMixin:
     async def _async_recover_explicit(
         self,
@@ -27,7 +43,7 @@ class _L4RecoveryMixin:
         task,
     ) -> L4TaskResult:
         """Explicit recover: read inject checkpoint → build recover state → run recover graph."""
-        from chaos_agent.agent.state import infer_task_state
+        from chaos_agent.agent.state import TaskState, infer_task_state
 
         # Attribute LLM token usage to this task
         try:
@@ -68,12 +84,23 @@ class _L4RecoveryMixin:
         record_task_id = new_recover_task_id()  # Same naming as CLI/HTTP recover
         from chaos_agent.agent.result.task_snapshot import resolve_recover_initial_state
 
+        # The recovering caller's runtime connection (session-bound
+        # environment snapshot) outranks the injector's frozen credentials —
+        # a cross-user recover must run as the recoverer, not the injector
+        # (incident 2026-09-15: profile '526255' auth wall).
+        payload = task.payload or {}
+        connection_override = {
+            key: payload[key]
+            for key in _CONNECTION_PAYLOAD_KEYS
+            if payload.get(key)
+        } or None
+
         resolution = await resolve_recover_initial_state(
             inject_task_id,
             record_task_id=record_task_id,
             agents={"skill_registry": pool.skill_registry},
             checkpoint_values=checkpoint_values,
-            kubeconfig_override=task.payload.get("kubeconfig") or None,
+            connection_override=connection_override,
         )
         if resolution is None:
             return L4TaskResult(
@@ -316,9 +343,16 @@ class _L4RecoveryMixin:
 
         recover_task_state = infer_task_state(recover_result)
         status = "failed"
-        if recover_task_state == "recovered":
+        if recover_task_state == TaskState.RECOVERED.value:
             status = "passed"
-        elif recover_task_state == "partial_recovered":
+        elif recover_task_state == TaskState.PARTIAL_RECOVERED.value:
+            status = "degraded"
+        elif recover_task_state == TaskState.UNVERIFIED.value:
+            # Honest ignorance maps to "degraded", not "failed": the destroy
+            # may well have succeeded — the observation channel was simply
+            # unavailable. Reporting "failed" would claim counter-evidence
+            # (fault still active) that nobody observed. Same mapping the
+            # post-inject auto-recovery path in execution.py applies.
             status = "degraded"
 
         from chaos_agent.agent.result.operation_outcome import read_recover_verification
@@ -338,9 +372,10 @@ class _L4RecoveryMixin:
         )
 
         experiment_uid_out = recover_initial.get("experiment_uid") or ""
+        recover_verification = read_recover_verification(recover_result)
         extras: dict = {
             "recovery_level": recover_task_state,
-            "recover_verification": read_recover_verification(recover_result),
+            "recover_verification": recover_verification,
             "inject_task_id": inject_task_id,
             "experiment_uid": experiment_uid_out,
         }
@@ -350,10 +385,17 @@ class _L4RecoveryMixin:
         if token_usage:
             extras["token_usage"] = token_usage
 
+        # First-class verification fields, same contract as inject results
+        # (adapter.state_to_task_result): a "degraded" status attributed to
+        # "unverified" must be machine-explainable — the verification payload
+        # and its observation-failure breakdown travel with the result, not
+        # buried in extras.
         return L4TaskResult(
             task_id=task.task_id,
             status=status,
             trajectory_id=trajectory_id,
+            verification=recover_verification,
+            observation_failures=_collect_observation_failures(recover_verification),
             extras=extras,
         )
 
@@ -362,8 +404,10 @@ class _L4RecoveryMixin:
         """Best-effort extract token usage from graph state messages."""
         try:
             from langchain_core.messages import AIMessage
+            from chaos_agent.observability.tracer import _cache_read_from_usage_metadata
             total_prompt = 0
             total_completion = 0
+            total_cached = 0
             call_count = 0
             for msg in state_values.get("messages", []):
                 if isinstance(msg, AIMessage):
@@ -371,12 +415,15 @@ class _L4RecoveryMixin:
                     if usage:
                         total_prompt += usage.get("input_tokens", 0)
                         total_completion += usage.get("output_tokens", 0)
+                        total_cached += _cache_read_from_usage_metadata(usage)[0]
                         call_count += 1
             if call_count > 0:
                 return {
                     "prompt_tokens": total_prompt,
                     "completion_tokens": total_completion,
                     "total_tokens": total_prompt + total_completion,
+                    # Cache-hit subset of prompt_tokens (0 when none reported).
+                    "cached_tokens": total_cached,
                     "call_count": call_count,
                 }
         except Exception:

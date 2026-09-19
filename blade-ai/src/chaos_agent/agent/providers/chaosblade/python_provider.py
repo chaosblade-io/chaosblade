@@ -67,6 +67,8 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
 
+    from chaos_agent.agent.providers.base import DestroyOutcome
+    from chaos_agent.tools.request_identity import RequestFingerprint
     from chaos_agent.agent.result.verdict import Layer1Result
 
     from chaos_agent.agent.target_guard.types import EffectiveTarget
@@ -187,6 +189,14 @@ class ChaosbladePythonProvider:
         }
     )
     log_shipping_tool_names = frozenset()
+    # Create-reconcile gate (D6): this carrier's creates are NOT yet under
+    # the gate — the python protocol's uncertain-outcome contract is not
+    # wired (cli_python has no UNCERTAIN_OUTCOME_MARKER path), so arming
+    # would be dead state. The declaration stays empty until that carrier
+    # grows the same uncertain-outcome discipline (the protocol defaults,
+    # made explicit).
+    reconcile_create_tool_names = frozenset()
+    reconcile_read_tool_names = frozenset()
 
     def matches_channel(self, profile: str) -> bool:
         # ``blade create python`` talks to the in-process agent over
@@ -269,13 +279,17 @@ class ChaosbladePythonProvider:
                 return i
         return -1
 
-    def detect(self, messages: list, *, is_host: bool) -> Optional[str]:
+    def detect(
+        self, messages: list, *, is_host: bool, is_teardown=None,
+    ) -> Optional[str]:
         """Return ``python_agent`` when a live Python-agent experiment is attested."""
         if not is_host:
             return None
         return "python_agent" if self._scan_index(messages) >= 0 else None
 
-    def injection_recency(self, messages: list, *, is_host: bool) -> int:
+    def injection_recency(
+        self, messages: list, *, is_host: bool, is_teardown=None,
+    ) -> int:
         """Message index of this backend's injection evidence, or ``-1``."""
         if not is_host:
             return -1
@@ -320,6 +334,34 @@ class ChaosbladePythonProvider:
                 return uid
         return ""
 
+    def extract_experiment_ids(self, messages: list, retired=None) -> set[str]:
+        """EVERY live Python-agent experiment UID born in ``messages`` — the
+        plural birth face the registry's ownership seam consumes (round-26).
+
+        Each inject tool call IS one birth, so the plural face is the same
+        walk as the singular with ``return``-first replaced by collect-all:
+        multiple injects in one task are multiple liabilities, and the
+        ownership ledger must see every one of them."""
+        from langchain_core.messages import ToolMessage
+
+        from .verify import (
+            extract_experiment_uid,
+            scan_destroyed_uids,
+        )
+
+        dead = set(scan_destroyed_uids(messages)) | set(retired or ())
+        born: set[str] = set()
+        for msg in messages:
+            if not isinstance(msg, ToolMessage):
+                continue
+            if getattr(msg, "name", "") not in self.inject_tool_names:
+                continue
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            uid = extract_experiment_uid(content)
+            if uid and uid not in dead:
+                born.add(uid)
+        return born
+
     def destroyed_experiment_ids(self, messages: list) -> set[str]:
         """UIDs this carrier family's ``blade_destroy`` tool calls have
         targeted — the destroy half of the experiment lifecycle scan,
@@ -329,6 +371,26 @@ class ChaosbladePythonProvider:
         from .verify import scan_destroyed_uids
 
         return scan_destroyed_uids(messages)
+
+    def destroyed_proven_experiment_ids(self, messages: list) -> set[str]:
+        """PROVEN deaths for the ledger's death registration (B76 review
+        I1) — same shared scan as the OS carrier: python experiments are
+        destroyed by the same ``blade destroy <uid>`` tool family, so the
+        output-proven judgement (paired ToolMessage confirms the kill) is
+        carrier-family-wide. Only output-proven deaths register — a false
+        retire hides a LIVE experiment from every future recovery."""
+        from .verify import scan_destroyed_proven_uids
+
+        return scan_destroyed_proven_uids(messages)
+
+    def classify_destroy_output(self, output: str) -> "DestroyOutcome":
+        """Three-state verdict on a raw destroy output — same shared
+        classifier as the OS carrier (python experiments die through the
+        same ``blade destroy`` tool family, so the decision source is
+        carrier-family-wide)."""
+        from .verify import classify_destroy_output
+
+        return classify_destroy_output(output)
 
     def build_handle_from_messages(
         self, messages: list, retired=None, values: Optional[dict] = None
@@ -357,7 +419,7 @@ class ChaosbladePythonProvider:
         otherwise)."""
         from langchain_core.messages import ToolMessage
 
-        from .verify import extract_experiment_uid
+        from .verify import _UID_SHAPE_RE, extract_experiment_uid
 
         state = state or {}
         uids: set[str] = set()
@@ -374,10 +436,23 @@ class ChaosbladePythonProvider:
             uid = extract_experiment_uid(content)
             if uid:
                 uids.add(uid)
+        # Durable read-side gate (round-20 Q4, mirrors the ChaosBlade
+        # provider): the durable sources trust the writer chain —
+        # belt-and-suspenders at the trust-chain END so a non-shaped value
+        # can never ride the whitelist whatever wrote it.
         if state.get("injection_method") == "python_agent":
             durable_uid = str(state.get("experiment_uid") or "").strip()
-            if durable_uid:
+            if durable_uid and _UID_SHAPE_RE.fullmatch(durable_uid):
                 uids.add(durable_uid)
+        # Birth registry (B76 review G): carrier-neutral append-only ownership
+        # record — keeps proving provenance across compaction and contract
+        # replacement after the last-write-wins slot has moved on (same gap
+        # as the ChaosBlade provider's durable source).
+        uids.update(
+            str(uid).strip()
+            for uid in (state.get("owned_experiment_uids") or [])
+            if str(uid).strip() and _UID_SHAPE_RE.fullmatch(str(uid).strip())
+        )
         return uids
 
     def classify_tool_target(
@@ -430,7 +505,46 @@ class ChaosbladePythonProvider:
             return "python_agent"
         return None
 
-    def issue_disproven(self, messages: list) -> bool:
+    def build_reconcile_fingerprint(
+        self, tool_name: str, tool_args: Any
+    ) -> Optional["RequestFingerprint"]:
+        """Create-reconcile seam (D6): this carrier declares no create
+        under the gate yet (``reconcile_create_tool_names`` is empty until
+        the python protocol grows an uncertain-outcome contract), so the
+        fingerprint hook never claims — pinned ``None``."""
+        return None
+
+    async def reconcile_hold_feedback(
+        self,
+        tool_name: str,
+        fp: "RequestFingerprint",
+        hold_count: int,
+        block_limit: int,
+        kubeconfig: str = "",
+        task_id: str = "",
+    ) -> Optional[tuple[str, bool]]:
+        """Create-reconcile seam (D6): no create under the gate — pinned
+        ``None`` (the registry scan continues past this carrier)."""
+        return None
+
+    def reconcile_batch_held_feedback(
+        self, tool_name: str, other_tool_name: str
+    ) -> Optional[str]:
+        """Create-reconcile seam (D6): no create under the gate — pinned
+        ``None``."""
+        return None
+
+    async def verify_landing_readback(
+        self, messages: list, state: dict, *, kubeconfig: str = ""
+    ) -> Optional[dict]:
+        """Landing readback guard (faultdrill-cr-channel task 2.1, design
+        D5): this carrier's landings carry no CR recipe-integrity contract
+        to verify — pinned ``None`` (the registry scan continues; the
+        faultdrill channel's D5 seam is the only owner of the post-apply
+        readback)."""
+        return None
+
+    def issue_disproven(self, messages: list, *, is_teardown=None) -> bool:
         """Experiment attribution is RESULT-born (committed only when the UID
         appears in a successful create result), so there is no issue-time
         guesswork to revoke."""
@@ -453,14 +567,16 @@ class ChaosbladePythonProvider:
         except Exception as rb_err:  # noqa: BLE001 — best-effort rollback
             return f" (rollback FAILED: {rb_err})"
 
-    def scan_step_actions(self, steps: list[str], messages: list):
+    def scan_step_actions(
+        self, steps: list[str], messages: list, *, is_teardown=None,
+    ):
         """Explicitly not claimed (pinned None, phase-8 D4): an
         experiment-UID carrier judges injection completion by the
         experiment evidence chain (the UID), not step-verb heuristics —
         the step self-check is native-carrier territory."""
         return None
 
-    def was_injection_attempted(self, messages: list) -> bool:
+    def was_injection_attempted(self, messages: list, *, is_teardown=None) -> bool:
         """Explicitly not claimed (pinned False): the native-fallback
         message back-scan is native-carrier territory; THIS backend's
         attempt state is carried by :meth:`was_fault_create_attempted`
@@ -471,6 +587,8 @@ class ChaosbladePythonProvider:
         self,
         messages: list,
         injection_method: str | None = None,
+        *,
+        is_teardown=None,
     ) -> bool:
         """Attempted-but-no-UID judgement — same blade-family combination
         semantics as :meth:`ChaosbladeProvider.was_fault_create_attempted`
@@ -482,7 +600,9 @@ class ChaosbladePythonProvider:
             was_blade_create_attempted,
         )
 
-        return was_blade_create_attempted(messages, injection_method)
+        return was_blade_create_attempted(
+            messages, injection_method, is_teardown=is_teardown,
+        )
 
     async def layer1_verify(self, state: dict, **kwargs) -> "Layer1Result":
         """Deterministic Layer-1 verification: poll ``blade_status`` for the UID.
@@ -494,6 +614,7 @@ class ChaosbladePythonProvider:
         from .verify import (
             _run_host_blade_layer1,
         )
+        from chaos_agent.agent.execution_artifacts import make_teardown_matcher
 
         return await _run_host_blade_layer1(
             # Identity comes from the caller-resolved dispatch identity
@@ -506,6 +627,11 @@ class ChaosbladePythonProvider:
             task_id=kwargs.get("task_id", ""),
             messages=state.get("messages", []),
             injection_method=state.get("injection_method"),
+            # Teardown≠mutation at the Layer-1 attempted judgement (O-1,
+            # P3) — same threading as ChaosBladeProvider.layer1_verify.
+            is_teardown=make_teardown_matcher(
+                state.get("execution_artifacts") or []
+            ),
         )
 
     async def layer1_raw_destroy(self, uid: str, kubeconfig: str = "") -> str:
@@ -515,6 +641,28 @@ class ChaosbladePythonProvider:
         from .recover import raw_destroy
 
         return await raw_destroy(uid, kubeconfig)
+
+    async def experiment_destroyed(self, uid: str, kubeconfig: str = "") -> bool:
+        """Status-only death check — the sweep's convergence valve (B76
+        review J2: the same valve was host-carrier-only, so a python
+        experiment's repeat-destroy not-found failure never converged).
+
+        A ``blade create python`` experiment is recorded in the SAME
+        host-local experiment DB (the argument :meth:`layer1_verify`
+        already relies on), so ``blade_status`` proves its death exactly
+        like the host carrier's. Mirrors
+        :meth:`ChaosbladeProvider.experiment_destroyed` — False on any
+        doubt, fail-closed (a false retire hides a LIVE experiment)."""
+        from chaos_agent.agent.providers.chaosblade.cli import blade_status
+        from .recover import parse_blade_status_destroyed
+
+        try:
+            out = await blade_status.ainvoke({"uid": uid, "kubeconfig": kubeconfig})
+        except Exception:  # noqa: BLE001
+            return False
+        raw = out if isinstance(out, str) else str(out)
+        verdict, _ = parse_blade_status_destroyed(raw)
+        return verdict == "passed"
 
     async def layer1_destroy(
         self,

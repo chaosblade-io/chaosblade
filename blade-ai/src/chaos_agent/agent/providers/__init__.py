@@ -25,6 +25,11 @@ from chaos_agent.agent.providers.chaosblade.declaration import (
     SUPPORTED_TARGETS as _CHAOSBLADE_SUPPORTED_TARGETS,
     build_command_preview as _build_blade_command_preview,
 )
+from chaos_agent.agent.providers.faultdrill.declaration import (
+    CARRIER_ID as _FAULTDRILL_CARRIER_ID,
+    SUPPORTED_ACTIONS as _FAULTDRILL_SUPPORTED_ACTIONS,
+    SUPPORTED_TARGETS as _FAULTDRILL_SUPPORTED_TARGETS,
+)
 from chaos_agent.agent.providers.host_shell.declaration import (
     CARRIER_ID as _HOST_SHELL_CARRIER_ID,
     SUPPORTED_ACTIONS as _HOST_SHELL_SUPPORTED_ACTIONS,
@@ -88,6 +93,11 @@ declare_carrier_vocabulary(
     _PYTHON_CARRIER_ID,
     _PYTHON_SUPPORTED_TARGETS,
     _PYTHON_SUPPORTED_ACTIONS,
+)
+declare_carrier_vocabulary(
+    _FAULTDRILL_CARRIER_ID,
+    _FAULTDRILL_SUPPORTED_TARGETS,
+    _FAULTDRILL_SUPPORTED_ACTIONS,
 )
 declare_command_preview(
     _CHAOSBLADE_CARRIER_ID, _build_blade_command_preview

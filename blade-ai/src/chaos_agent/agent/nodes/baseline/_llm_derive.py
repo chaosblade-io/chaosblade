@@ -20,8 +20,17 @@ from chaos_agent.agent.nodes.baseline._baseline_profiles import (
 )
 from chaos_agent.agent.nodes.baseline._commands import BaselineCommand
 from chaos_agent.transports import PROFILE_HOST
+from chaos_agent.utils.truncation import build_truncation_notice, elided_preview
 
 logger = logging.getLogger(__name__)
+
+# Off-graph retry-prompt preview budgets: the preview keeps both ends at
+# 400/600 chars, and the truncation notice fires exactly when the preview
+# elides (len > HEAD + TAIL). The three literals are ONE contract — a
+# notice firing without elision (or vice versa) would be a false alarm /
+# a silent cut — so they are derived, never independently re-typed.
+_RETRY_PREVIEW_HEAD_CHARS = 400
+_RETRY_PREVIEW_TAIL_CHARS = 600
 
 
 def _record_aux_llm_call(
@@ -47,6 +56,80 @@ def _record_aux_llm_call(
         logger.debug("aux LLM call record skipped (%s): %s", purpose, e)
 
 
+# Pod-owning workload kinds: a fault scoped to one of these targets a
+# workload OBJECT, but the runtime state lives in the pods it owns.
+_POD_OWNER_SCOPES = frozenset({"deployment", "statefulset", "daemonset", "service"})
+
+
+def _build_target_context(
+    scope: str,
+    target: str,
+    action: str,
+    namespace: str,
+    names: tuple[str, ...],
+    labels: dict[str, str] | None,
+    pod_selector: dict[str, str] | None,
+) -> str:
+    """Assemble the target-context block shared by the derive & retry prompts.
+
+    #16 fix A (Identity axiom): the lines carry kind semantics now.
+    ``Resource names (kind=...)`` states WHICH kind the names belong to —
+    a deployment name is a workload object, not a pod instance, and the
+    derive LLM used to treat the two as interchangeable (inventing the
+    label ``app=<deployment-name>`` for pod-level queries). The
+    authoritative ``Pod label selector`` line (discovered from the
+    workload's own ``spec.selector`` by baseline_capture) removes the
+    guess entirely.
+    """
+    lines = [f"Fault type: {scope}-{target}-{action}", f"Fault scope: {scope}"]
+    if namespace:
+        lines.append(f"Namespace: {namespace}")
+    if names:
+        lines.append(f"Resource names (kind={scope}): {', '.join(names[:5])}")
+    if labels:
+        lines.append(
+            "Label selector: " + ", ".join(f"{k}={v}" for k, v in labels.items())
+        )
+    if pod_selector:
+        lines.append(
+            "Pod label selector (authoritative, read from the "
+            f"{scope}'s own spec.selector): "
+            + ", ".join(f"{k}={v}" for k, v in pod_selector.items())
+        )
+    return "\n".join(lines)
+
+
+def _identity_rules_block(
+    scope: str, names: tuple[str, ...], pod_selector: dict[str, str] | None,
+) -> str:
+    """#16 fix A: identity anchoring rules appended to derive/retry prompts.
+
+    With a discovered selector: use it verbatim, never invent one. Without
+    one on a pod-owner scope: forbid guessing (a wrong selector yields an
+    empty, useless baseline — R10 replay: 3 of 4 "succeeded" observations
+    were exactly this form) and anchor on the workload object instead.
+    """
+    if pod_selector:
+        return (
+            "Identity rules: the Pod label selector above was read from the "
+            "target workload's own spec — it is the AUTHORITATIVE selector "
+            "for its pods. Use it verbatim (``-l k=v``) in every pod-level "
+            "query; NEVER invent or guess label keys or values for this "
+            "target.\n\n"
+        )
+    if names and scope in _POD_OWNER_SCOPES:
+        return (
+            "Identity rules: the resource names above are workload objects, "
+            "NOT pod names, and no pod label selector could be resolved for "
+            "them. Do NOT guess a label selector for pod-level queries — a "
+            "wrong selector yields an empty, useless baseline. Anchor "
+            "pod-level state on the workload object itself (describe/get "
+            "the named workload; its replica/event status is the valid "
+            "baseline) or on objects that name the workload explicitly.\n\n"
+        )
+    return ""
+
+
 async def _llm_derive_baseline_commands(
     llm,
     skill_case_content: str,
@@ -59,6 +142,7 @@ async def _llm_derive_baseline_commands(
     namespace: str = "",
     names: tuple[str, ...] = (),
     labels: dict[str, str] | None = None,
+    pod_selector: dict[str, str] | None = None,
     task_id: str = "",
 ) -> list[BaselineCommand]:
     """Let LLM derive baseline collection commands from full skill content.
@@ -82,19 +166,16 @@ async def _llm_derive_baseline_commands(
     llm = with_thinking_disabled(llm)
 
     # Build target context so the LLM embeds the correct resource
-    # names/namespace/labels directly into each command.
-    target_lines = [f"Fault type: {scope}-{target}-{action}", f"Fault scope: {scope}"]
-    if namespace:
-        target_lines.append(f"Namespace: {namespace}")
-    if names:
-        target_lines.append(f"Resource names: {', '.join(names[:5])}")
-    if labels:
-        label_str = ", ".join(f"{k}={v}" for k, v in labels.items())
-        target_lines.append(f"Label selector: {label_str}")
-    target_context = "\n".join(target_lines)
+    # names/namespace/labels directly into each command (#16 fix A: with
+    # kind semantics + the authoritative pod selector when discovered).
+    target_context = _build_target_context(
+        scope, target, action, namespace, names, labels, pod_selector,
+    )
+    _identity_rules = _identity_rules_block(scope, names, pod_selector)
 
     human_prompt = (
         f"{target_context}\n\n"
+        f"{_identity_rules}"
         f"<skill-case>\n{skill_case_content}\n</skill-case>\n\n"
         "Based on the skill-case content, reason about what states this fault "
         "will modify. The baseline_facts and symptoms sections describe expected "
@@ -147,15 +228,36 @@ async def _llm_retry_failed_commands(
     namespace: str = "",
     names: tuple[str, ...] = (),
     labels: dict[str, str] | None = None,
+    pod_selector: dict[str, str] | None = None,
     task_id: str = "",
     already_tried: tuple[str, ...] = (),
-) -> list[BaselineCommand]:
-    """Re-derive baseline commands with execution error feedback.
+) -> dict:
+    """Judge and re-derive failed or empty baseline commands with feedback.
 
-    Called when LLM-generated commands fail at runtime (e.g. bad flags,
-    wrong resource type). Feeds the error output back to the LLM so it
-    can self-correct. Uses the same channel-assembled System Prompt and
-    per-profile validation as the initial derivation.
+    Called when LLM-generated commands exit non-zero OR complete with
+    empty output (#16 fix C — an empty success anchored on nothing: wrong
+    selector, wrong name, or an asset the approved plan only creates
+    during execute). The core insight (first-principles, from #31): a
+    non-zero exit is channel signal, not a semantic verdict —
+    existence/residue pre-checks report absence THROUGH
+    non-zero exits, and for those the observation IS the baseline value.
+    So the retry contract is a per-command *semantic verdict*, not a
+    mandatory replacement:
+
+      * ``expected_absence`` — the command is correct and its non-zero
+        exit or empty output reports the expected pre-injection absence
+        (per the skill case, or because the approved plan creates the
+        asset during execute). The observation is kept as-is; retrying it
+        can never converge (#31: three identical retries burned ~35s on
+        exactly this).
+      * ``replace`` — a true failure (wrong flags/path/resource/label
+        selector); emit ONE corrected replacement per the same rules as
+        before.
+
+    Return contract: ``{"expected": [(obs, reason), ...],
+    "replace": [BaselineCommand, ...]}``. Entries without a ``verdict``
+    field default to ``replace`` (legacy LLM output shape, and the old
+    behavior of "every failure gets a corrected replacement").
 
     ``already_tried`` carries the commands earlier retries produced. Each retry
     is an independent call with no memory of the previous one, so without this
@@ -165,7 +267,7 @@ async def _llm_retry_failed_commands(
     debug pod, 71s spent before the third happened to try something else.
     """
     if not llm or not failed_observations:
-        return []
+        return {"expected": [], "replace": []}
 
     # Same latency rationale as the initial derivation: retries are
     # single-shot structured calls; the error feedback in the prompt does
@@ -175,24 +277,50 @@ async def _llm_retry_failed_commands(
 
     error_lines = []
     for obs in failed_observations:
-        stderr_preview = (obs.get("stderr") or "")[:1000]
+        # Complete evidence presentation: the kubewiz channel merges
+        # stderr into stdout (see _KUBECTL_ERROR_MARKERS), so the
+        # absence evidence ("(NotFound)", "No such file") may live in
+        # EITHER stream depending on the channel. Show both previews
+        # and let the model judge from full evidence — no machine-side
+        # pre-digestion of what the non-zero exit "means".
+        #
+        # Truncation contract (off-graph aux call): this prompt is NOT
+        # part of the main message history, so the context compactor
+        # never sees it — there is no cache safety net here. The preview
+        # keeps BOTH ends (the semantic evidence of an expected_absence
+        # verdict may live at either end), and a shared notice
+        # (kind=baseline-evidence) points at the full original in
+        # state.baseline_data: silent truncation would be the ONLY kind
+        # with no retrieval path at all.
+        stdout_raw = obs.get("stdout") or ""
+        stderr_raw = obs.get("stderr") or ""
+        stdout_preview = elided_preview(
+            stdout_raw, _RETRY_PREVIEW_HEAD_CHARS, _RETRY_PREVIEW_TAIL_CHARS,
+        )
+        stderr_preview = elided_preview(
+            stderr_raw, _RETRY_PREVIEW_HEAD_CHARS, _RETRY_PREVIEW_TAIL_CHARS,
+        )
+        if len(stdout_raw) > _RETRY_PREVIEW_HEAD_CHARS + _RETRY_PREVIEW_TAIL_CHARS:
+            stdout_preview += build_truncation_notice(
+                "baseline-evidence", len(stdout_raw), unit="characters",
+            )
+        if len(stderr_raw) > _RETRY_PREVIEW_HEAD_CHARS + _RETRY_PREVIEW_TAIL_CHARS:
+            stderr_preview += build_truncation_notice(
+                "baseline-evidence", len(stderr_raw), unit="characters",
+            )
         error_lines.append(
             f"- Purpose: {obs.get('description', '(unknown)')}\n"
             f"  Command: `{obs.get('command', '')}`\n"
             f"  exit_code={obs.get('exit_code')}\n"
-            f"  stderr: {stderr_preview}"
+            f"  stdout: {stdout_preview or '(empty)'}\n"
+            f"  stderr: {stderr_preview or '(empty)'}"
         )
     error_feedback = "\n".join(error_lines)
 
-    target_lines = [f"Fault type: {scope}-{target}-{action}", f"Fault scope: {scope}"]
-    if namespace:
-        target_lines.append(f"Namespace: {namespace}")
-    if names:
-        target_lines.append(f"Resource names: {', '.join(names[:5])}")
-    if labels:
-        label_str = ", ".join(f"{k}={v}" for k, v in labels.items())
-        target_lines.append(f"Label selector: {label_str}")
-    target_context = "\n".join(target_lines)
+    target_context = _build_target_context(
+        scope, target, action, namespace, names, labels, pod_selector,
+    )
+    _identity_rules = _identity_rules_block(scope, names, pod_selector)
 
     _failed_n = len(failed_observations)
     _tried_block = ""
@@ -206,21 +334,55 @@ async def _llm_retry_failed_commands(
         )
     human_prompt = (
         f"{target_context}\n\n"
+        f"{_identity_rules}"
         f"<skill-case>\n{skill_case_content}\n</skill-case>\n\n"
-        f"Exactly {_failed_n} baseline command(s) FAILED during execution. "
+        f"Exactly {_failed_n} baseline command(s) exited non-zero or "
+        "completed with EMPTY output. "
         "All OTHER baseline commands SUCCEEDED and are already kept — "
         "do NOT regenerate them.\n\n"
+        "IMPORTANT: a non-zero exit is NOT automatically a failure. "
+        "Existence and residue pre-checks report absence THROUGH non-zero "
+        "exits (\"No such file or directory\", \"Unit ... could not be "
+        "found\", kubectl \"Error from server (NotFound)\") — for those the "
+        "observation IS the baseline value: pre-injection absence is "
+        "exactly what the post-injection comparison needs, and re-running "
+        "the same check can never change it.\n\n"
+        "The same judgment applies to EMPTY output (exit 0, \"No resources "
+        "found\" or an empty items list): emptiness is EITHER the expected "
+        "pre-injection state — e.g. the approved plan creates the asset "
+        "during execute, so its pre-injection absence IS the baseline "
+        "value — OR a wrong identity (wrong label selector, wrong "
+        "resource name) that must be REPLACED with a command targeting "
+        "the actual fault target.\n\n"
         f"{error_feedback}\n"
         f"{_tried_block}\n"
-        "For EACH failed command above, generate ONE corrected replacement "
-        "that collects the SAME metric/state (see its Purpose), using the "
-        "ACTUAL resource values above. Rules:\n"
-        "- Fix ONLY the listed failures; do NOT add new observation dimensions.\n"
-        "- Do NOT regenerate commands that already succeeded.\n"
-        "- If a failed command cannot be corrected, omit it — prefer fewer "
-        "commands over inventing unrelated ones.\n"
-        f"- Output AT MOST {_failed_n} corrected command(s) as a JSON list, "
-        "no other text."
+        "For EACH failed-or-empty command above, output ONE JSON entry "
+        "judging its semantics against the skill case:\n"
+        "- {\"verdict\": \"expected_absence\", \"reason\": \"<why the non-zero "
+        "exit or empty output is the expected pre-injection form, citing "
+        "the skill case>\"} — "
+        "when the command is CORRECT and its failure-or-emptiness reports "
+        "expected absence (conflicts/target-state pre-checks and "
+        "planned-creation assets are the usual cases).\n"
+        "- {\"verdict\": \"replace\", \"reason\": \"<what was wrong>\", "
+        "\"command\": \"<corrected command>\", \"description\": \"<same "
+        "purpose>\"} — when it is a TRUE failure (wrong flags, wrong path, "
+        "wrong resource, wrong label selector), using the ACTUAL resource "
+        "values above.\n"
+        "Rules:\n"
+        "- Fix ONLY the listed non-zero/empty commands; do NOT add new "
+        "observation dimensions or regenerate succeeded ones.\n"
+        "- Pod names seen in failed commands or their error output may belong "
+        "to an ALREADY-DELETED carrier — between retries the runtime replaces "
+        "debug pods, so a literal pod name from earlier output is stale. Emit "
+        "the ``{debug_pod}`` placeholder (resolved at execution time); never "
+        "a literal debug pod name.\n"
+        "- Do NOT mark a true failure as expected_absence just because "
+        "retrying seems futile — if the command itself is wrong, replace "
+        "it.\n"
+        "- A wrong path also prints \"No such file\": judge from the skill "
+        "case's intent, not from the error text alone.\n"
+        f"- Output EXACTLY {_failed_n} entries as a JSON list, no other text."
     )
 
     try:
@@ -241,11 +403,45 @@ async def _llm_retry_failed_commands(
             reasoning=str(getattr(response, "reasoning_content", "") or ""),
             duration_ms=_dt_ms,
         )
-        commands = _parse_llm_json_output(raw)
-        return _validate_and_filter_commands(commands, profile)
+        return _split_retry_decisions(
+            _parse_llm_json_output(raw), failed_observations, profile,
+        )
     except Exception as e:
         logger.warning("LLM baseline retry failed: %s", e)
-        return []
+        return {"expected": [], "replace": []}
+
+
+def _split_retry_decisions(
+    decisions: list[dict],
+    failed_observations: list[dict],
+    profile: str,
+) -> dict:
+    """Split retry LLM output into semantic verdicts.
+
+    Entries pair positionally with ``failed_observations`` (the prompt asks
+    for exactly one entry per command). An entry without a ``verdict``
+    field defaults to ``replace`` — the legacy output shape where every
+    failure got a corrected replacement — so old-format LLM output still
+    behaves exactly like the pre-verdict retry.
+    """
+    expected: list[tuple[dict, str]] = []
+    replace_raw: list[dict] = []
+    for entry, obs in zip(decisions, failed_observations):
+        verdict = entry.get("verdict")
+        if verdict == "expected_absence":
+            expected.append((obs, str(entry.get("reason", ""))[:500]))
+        elif verdict == "replace" or verdict is None:
+            replace_raw.append({
+                "description": entry.get("description", ""),
+                "command": entry.get("command", ""),
+                "mode": entry.get("mode", ""),
+            })
+        # Unknown verdicts are dropped: the loop re-collects the unjudged
+        # observation next round (it is still non-zero and unmarked).
+    return {
+        "expected": expected,
+        "replace": _validate_and_filter_commands(replace_raw, profile),
+    }
 
 
 def _parse_llm_json_output(raw: str) -> list[dict]:

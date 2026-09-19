@@ -36,6 +36,8 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Sequence
 
+from chaos_agent.utils.truncation import build_truncation_notice, elided_preview
+
 
 #: Ledger layer keys.
 ANCHOR = "anchor"
@@ -93,6 +95,60 @@ def freeze_anchor(fault_spec: Mapping[str, Any] | None, goal: str = "") -> dict:
     if isinstance(fault_spec, Mapping) and fault_spec:
         anchor["fault_spec"] = dict(fault_spec)
     return {ANCHOR: anchor, STATE: {}, LOG: []}
+
+
+def reconcile_anchor_spec(
+    ledger: Mapping[str, Any] | None,
+    fault_spec: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    """Re-freeze the anchor's ``fault_spec`` side when it drifted.
+
+    The anchor's immutability contract is FIELD-SPLIT (cascade review O1/C2):
+    ``goal`` (the user's intent) is immutable across every seam;
+    ``fault_spec`` (the snapshot of the CURRENTLY-APPROVED contract) must
+    follow the contract. The spec's legitimate change channels are
+    structurally scattered — user-approved plan changes (plan_change_confirm),
+    human-approved drift corrections (tool_screener), lazy derivation after a
+    replan re-entry (agent_loop) — so patching each seam proved inexhaustible
+    (C2: O1 covered one of three). This function is the single convergence
+    point: ``execute_loop`` calls it on EVERY entry, so any spec change —
+    known or future — realigns the anchor before the ledger is rendered into
+    the execute/verify/recover prompts. A drifted anchor otherwise renders
+    the RETIRED spec as "Goal (ANCHOR, immutable)" while state.fault_spec
+    carries the approved one: two competing truth sources.
+
+    Semantics:
+
+      * Equal specs → ``None`` (no write — the healthy steady state; the
+        caller skips emitting the key, keeping the turn's result free of a
+        needless ledger override racing the model's own update_progress).
+      * Drifted → a NEW ledger dict with the anchor's ``fault_spec`` replaced
+        (field-level: every other anchor field is preserved verbatim — the
+        drift-correction lesson: a full rebuild silently drops what it
+        didn't know to carry, e.g. ``mechanism_anchors``); goal, state and
+        log ride through untouched.
+      * No anchor, absent/empty spec, or ill-shaped input → ``None``
+        (first-attempt shape: lazy seeding owns freezing; nothing to
+        reconcile).
+
+    Pure: never mutates ``ledger``.
+    """
+    if not isinstance(ledger, Mapping) or not isinstance(fault_spec, Mapping) or not fault_spec:
+        return None
+    anchor = ledger.get(ANCHOR)
+    if not isinstance(anchor, Mapping) or not anchor:
+        return None
+    frozen = anchor.get("fault_spec")
+    if not isinstance(frozen, Mapping):
+        # An anchor with only a goal (or a malformed spec) is the intent-stage
+        # shape — the lazy seeding, not reconciliation, owns freezing it.
+        return None
+    if frozen == fault_spec:
+        return None
+    return {
+        **ledger,
+        ANCHOR: {**anchor, "fault_spec": dict(fault_spec)},
+    }
 
 
 def _normalize_log_entry(entry: Any) -> dict | None:
@@ -278,6 +334,62 @@ def merge_progress_ledger(
     return {ANCHOR: anchor, STATE: new_state, LOG: new_log}
 
 
+def merge_ledger_channel(current: Any, update: Any) -> Any:
+    """LangGraph channel reducer for ``progress_ledger`` — two write forms.
+
+    Case #46 (task inject-357401b8): the executor model batched
+    ``update_progress`` + ``finish_execution`` in ONE turn. Both tools wrote
+    the channel via ``Command(update=...)``, and the bare LastValue channel
+    (state.py declared the field without a reducer) rejected the second write
+    in the same super-step — ``InvalidUpdateError: Can receive only one value
+    per step`` — the graph died mid-execute, and the auto-rollback failed the
+    same way, leaving the self-built target deployed with the cleanup chain
+    never run. This reducer makes concurrent ledger writes legal instead of
+    fatal, the same way ``add_messages`` already does for ``messages``.
+
+    Two write forms, told apart by key names:
+
+      * **Delta** — ``{"state_update": …, "log_append": …}`` (no
+        ``anchor``/``state``/``log`` keys). This is what the two tool writers
+        submit: the tool passes its ARGUMENTS through, and this reducer applies
+        them via :func:`merge_progress_ledger`. Concurrent tool writes in one
+        super-step then fold as sequential applications —
+        ``reduce(reduce(base, δ₁), δ₂)`` — which is exactly the semantics a
+        batched ``update_progress`` + ``finish_execution`` pair wants: both
+        patches land, the later write wins per state key, both log tails
+        append, the anchor rides through untouched. (An earlier design had
+        tools return full merged snapshots; key-level merging of two snapshots
+        derived from the same base cannot tell "the value this tool just
+        wrote" from "the stale base value carried through" — the later
+        snapshot silently reverted the earlier tool's patch. Deltas fix that.)
+      * **Snapshot** — a full ledger (``anchor``/``state``/``log`` keys) or
+        ``None``. This is what node returns (lazy seeding, replan seam,
+        plan_change_confirm, intent_confirm) and graph inputs
+        (state_builders, the L4 handoff) submit: they are authoritative
+        wholes and REPLACE the stored value. An explicit ``None`` write is a
+        reset/clear and clears.
+
+    Non-Mapping, non-None writes pass through unchanged (defensive — a
+    malformed write neither crashes the step nor erases a good ledger).
+    """
+    if update is None:
+        return None
+    if not isinstance(update, Mapping):
+        return update
+    if (
+        ("state_update" in update or "log_append" in update)
+        and ANCHOR not in update
+        and STATE not in update
+        and LOG not in update
+    ):
+        return merge_progress_ledger(
+            current if isinstance(current, Mapping) else None,
+            state_update=update.get("state_update"),
+            log_append=update.get("log_append"),
+        )
+    return dict(update)
+
+
 def render_ledger(
     ledger: Mapping[str, Any] | None, *, log_tail: int = 8, include_anchor: bool = True,
 ) -> str:
@@ -356,7 +468,24 @@ def render_ledger(
     # rendered ledger is re-injected EVERY round, so it must never blow past a
     # fixed ceiling. The per-value caps above make this unreachable in practice.
     if len(text) > RENDER_CHAR_CAP:
-        text = text[:RENDER_CHAR_CAP] + "\n…(ledger truncated)"
+        # truncation-debt-cleanup (3.3): the old head-only cut with a private
+        # "…(ledger truncated)" dialect hid the tail (recent log milestones)
+        # and named no way back. Shared dialect instead: both-ends preview
+        # (head 1800 / tail 600 — the 75/25 family ratio; the render's HEAD
+        # carries the immutable ANCHOR, its TAIL the most recent milestones,
+        # both are drift-critical) + a state-evidence notice pointing at the
+        # lossless source. With the elision marker and the notice the
+        # worst-case total is ~2600 chars ≈ 1300 CJK tokens — still inside
+        # the <1.5k-token design budget this cap exists to enforce.
+        text = (
+            elided_preview(text, 1800, 600)
+            + build_truncation_notice(
+                "state-evidence",
+                len(text),
+                state_hint="Full progress ledger preserved in state.progress_ledger",
+                unit="characters",
+            )
+        )
     return text
 
 
@@ -398,4 +527,38 @@ def build_ledger_prompt_section(ledger: Mapping[str, Any] | None) -> str:
     has_anchor = bool(isinstance(ledger, Mapping) and (ledger.get(ANCHOR) or {}))
     directive = _LEDGER_DIRECTIVE if has_anchor else _LEDGER_DIRECTIVE_NO_ANCHOR
     return f"{directive}\n\n{body}"
+
+
+#: Marker that makes the tail-appended ledger snapshot self-superseding. The
+#: ledger rides the message TAIL now (context-cache-prefix-stability D1/D2) via
+#: an append-only channel, so history accumulates one snapshot per round; each
+#: newer snapshot re-renders the WHOLE cumulative ledger, making every older one
+#: a stale subset. This line tells the model to trust only the latest copy, so a
+#: lingering earlier snapshot cannot mislead it (the anti-drift anchor stays
+#: single-valued). Mirrors deepseek's ``renderContextSnapshot`` ("This snapshot
+#: supersedes earlier runtime-context snapshots.").
+_LEDGER_SUPERSEDES = (
+    "This progress-ledger snapshot supersedes all earlier ledger snapshots in "
+    "this conversation; treat only this one as the current record."
+)
+
+
+def build_ledger_tail_content(ledger: Mapping[str, Any] | None) -> str:
+    """Render the ledger for TAIL injection, or ``""`` if empty.
+
+    Same directive + body as :func:`build_ledger_prompt_section`, prefixed with
+    the supersedes marker (design D2). This is the append-only-tail form used by
+    the execute / verify / recover_verifier / plan loops: the volatile ledger
+    rides the message tail (a fresh snapshot each round, never the system-prompt
+    head) so the cached ``[system][tools]`` prefix stays byte-stable across
+    rounds. Callers wrap the returned text in a ``<system-reminder>`` and append
+    it as a ``HumanMessage`` WITHOUT a stable id — a stable id would pin the copy
+    at its first position (``add_messages`` replaces in place), dragging it out
+    of the recency tail AND reintroducing an early volatile byte that re-bills
+    the whole suffix every round.
+    """
+    section = build_ledger_prompt_section(ledger)
+    if not section:
+        return ""
+    return f"{_LEDGER_SUPERSEDES}\n\n{section}"
 

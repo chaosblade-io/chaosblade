@@ -64,10 +64,12 @@ is the agent precondition — the error path below explains it.
 """
 
 import logging
+import re
 
 from langchain_core.tools import tool
 
 from chaos_agent.config.settings import settings
+from chaos_agent.agent.providers.chaosblade.verify import HEX16_UID_SHAPE
 from chaos_agent.tools._tool_profiles import profile_for_tool
 from chaos_agent.agent.providers.chaosblade.cli import (
     _get_host_blade_path,
@@ -76,6 +78,18 @@ from chaos_agent.agent.providers.chaosblade.cli import (
 from chaos_agent.transports import TransportTarget, execute_via_transport
 
 logger = logging.getLogger(__name__)
+
+# Failed-create UID anchor for the python-application face (round-19 N2b):
+# the blade CLI's raw failure JSON carries the registered experiment's id
+# under the ``uid`` (or legacy ``result``) key even when the CLI reported
+# failure; mining it lets the caller clean up rather than leak an active
+# interception. The shape composes from the module-family single source —
+# the pre-round-19 open ``{16,}`` bound admitted 40-hex sha256-shaped
+# garbage (same disease as verify.py's RAW_FAILED_CREATE_UID_RE, fixed in
+# the same round).
+PY_FAILED_CREATE_UID_RE = re.compile(
+    r'"(?:uid|result)"\s*:\s*"(' + HEX16_UID_SHAPE + r')"'
+)
 
 # Matcher flags accepted per fault target, mirroring the ChaosBlade Python
 # plugin spec. Single source for the tool's matcher mapping: only names present
@@ -150,7 +164,6 @@ async def blade_python_create(
       - Verification is application-level (latency/exception/return
         value); system metrics stay normal by design — NOT a failed
         injection.
-      - --timeout auto-injected/boosted; may lengthen, not shorten.
     """
     argv = [_get_host_blade_path(), "create", "python", target, action]
     argv.extend(_build_matcher_args(target, {
@@ -183,7 +196,7 @@ async def blade_python_create(
         if effective_timeout != current_int:
             argv[argv.index("--timeout") + 1] = str(effective_timeout)
             logger.info(
-                "Auto-boosted --timeout from %ss to %ss for python-%s-%s",
+                "Normalized --timeout from %ss to %ss for python-%s-%s",
                 timeout_value, effective_timeout, target, action,
             )
 
@@ -252,9 +265,7 @@ async def blade_python_create(
         # A UID in the output means the experiment WAS registered even though the
         # CLI reported failure — surface it so the caller can clean up rather
         # than leaking an active interception.
-        import re
-
-        uid_match = re.search(r'"(?:uid|result)"\s*:\s*"([a-f0-9]{16,})"', combined)
+        uid_match = PY_FAILED_CREATE_UID_RE.search(combined)
         if uid_match:
             return (
                 f"Error: blade create python failed (exit {result.exit_code}) but an "

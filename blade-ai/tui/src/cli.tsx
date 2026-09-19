@@ -49,6 +49,7 @@ import "./utils/perfTrace.js";
 import { installSynchronizedOutput } from "./utils/synchronizedOutput.js";
 import { detectTerminalBg } from "./utils/terminalBg.js";
 import { installTerminalRedrawOptimizer } from "./utils/terminalRedrawOptimizer.js";
+import { parseResumeArgv } from "./utils/parseResumeArgv.js";
 import { PKG_VERSION } from "./utils/version.js";
 
 async function main(): Promise<void> {
@@ -62,6 +63,22 @@ async function main(): Promise<void> {
       "stdin is not a TTY — blade-ai-tui needs an interactive terminal.\n" +
         "  Run `blade-ai-tui` directly in a terminal session.\n" +
         "  Background / pipe / redirected stdin is not supported.",
+    );
+    return;
+  }
+
+  // ``--resume <sid>`` — injected by the Python CLI's ``blade-ai
+  // resume -i <sid>`` subcommand (execvp hands the terminal over with
+  // the extra args). A malformed invocation (flag without a value)
+  // fails before Ink renders; a well-formed sid is handed to
+  // BootRunner, which takes over that session instead of creating a
+  // fresh one.
+  const resumeArg = parseResumeArgv(process.argv);
+  if (resumeArg === undefined) {
+    fail(
+      "--resume requires a session id.\n" +
+        "  Run `blade-ai resume` (no args) to list resumable sessions,\n" +
+        "  or `blade-ai resume -i <session_id>` to pick one.",
     );
     return;
   }
@@ -148,10 +165,19 @@ async function main(): Promise<void> {
     // Skip the session flush if BootRunner never reached the
     // createSession step — there's nothing on disk to PATCH/DELETE.
     if (client && sessionId) {
+      // ACTIVE session id, not the boot-time closure one: ``/resume
+      // <sid>`` switches ``state.session.id`` in the store, and the
+      // stats PATCH must land on the session the user was actually
+      // talking to. ``sessionStatsRef`` mirrors the latest AppState on
+      // every dispatch (state/store.tsx) and survives Ink's unmount,
+      // so it carries the post-resume id; the closure variable stays
+      // stale forever after a resume. Empty-string fallback covers
+      // the pre-SESSION_INITIALIZED window.
+      const activeSid = sessionStatsRef.current?.session.id || sessionId;
       const stats = sessionStatsRef.current;
       const patchCall = stats
         ? client
-            .patchSessionStats(sessionId, {
+            .patchSessionStats(activeSid, {
               message_count: stats.messageCount,
               injection_count: stats.injectionCount,
               injection_success: stats.injectionSuccess,
@@ -160,7 +186,22 @@ async function main(): Promise<void> {
             })
             .catch(() => undefined)
         : Promise.resolve();
-      const deleteCall = client.deleteSession(sessionId).catch(() => undefined);
+      // DELETE every session this process created or took over — the
+      // boot one AND the (possibly different) resumed one. In embedded
+      // mode the server shutdown below wipes both anyway; against a
+      // remote BLADE_AI_SERVER (no spawn, no shutdown) deleting only
+      // the active sid would leak the boot session's in-memory entry
+      // forever.
+      const sidsToDelete =
+        activeSid === sessionId ? [sessionId] : [sessionId, activeSid];
+      // Bind once: the ``client && sessionId`` narrowing above doesn't
+      // survive into the closure TS-wise (mutable outer variable).
+      const c = client;
+      const deleteCall = Promise.all(
+        sidsToDelete.map((sid) =>
+          c.deleteSession(sid).catch(() => undefined),
+        ),
+      ).then(() => undefined);
       await step(
         "session-flush",
         Promise.all([patchCall, deleteCall]).then(() => undefined),
@@ -268,6 +309,7 @@ async function main(): Promise<void> {
           version={PKG_VERSION}
           bootCapturedAt={capturedAt}
           debug={debug}
+          resumeSid={resumeArg ?? undefined}
           onResolved={(s, c, sid) => {
             server = s;
             client = c;

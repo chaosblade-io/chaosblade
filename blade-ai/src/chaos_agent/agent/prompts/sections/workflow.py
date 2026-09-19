@@ -1,6 +1,9 @@
 """Workflow sections: two-phase workflow, NL mode, verification strategy, replan."""
 
-from chaos_agent.agent.prompts.reminder import SYSTEM_REMINDER_DECLARATION
+from chaos_agent.agent.prompts.reminder import (
+    PARALLELIZE_PRINCIPLE,
+    SYSTEM_REMINDER_DECLARATION,
+)
 
 
 def get_verification_heuristics_compact_section() -> str:
@@ -47,6 +50,7 @@ def get_core_principles_section() -> str:
 - If probed evidence invalidates a documented path, pick a documented alternative; when every documented path is unviable but you can still devise an equivalent-effect path (same target, same fault effect, probe-grounded), plan it — the safety gate arbitrates risk. Reject only when no path, documented or devised, remains, with the per-path evidence
 - A precondition no read-only tool can answer remains an assumption for Phase 2 — record it, proceed; do NOT re-probe a question already answered, and do NOT loop
 - An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target
+- {PARALLELIZE_PRINCIPLE}
 - {SYSTEM_REMINDER_DECLARATION}"""
 
 
@@ -65,6 +69,7 @@ def get_remember_section() -> str:
 - If probed evidence invalidates a documented path, pick a documented alternative; when every documented path is unviable but you can still devise an equivalent-effect path (same target, same fault effect, probe-grounded), plan it — the safety gate arbitrates risk. Reject only when no path, documented or devised, remains, with the per-path evidence
 - A precondition no read-only tool can answer remains an assumption for Phase 2 — record it, proceed; do NOT re-probe a question already answered, and do NOT loop
 - An empty query or tool error is a clue, not a dead end: try another identifier or widen the search to locate the target
+- {PARALLELIZE_PRINCIPLE}
 - Preserve the reviewed FaultSpec; the only way to change it is `propose_plan_change`, otherwise `finish_planning` as-is
 - {SYSTEM_REMINDER_DECLARATION}"""
 
@@ -87,16 +92,30 @@ _EXECUTOR_PRINCIPLES: tuple[str, ...] = (
     # Mechanism attribution: a matching symptom from a different cause is
     # NOT the intended effect.
     "Effect counts only with mechanism attribution: if the symptom matches but the evidence shows a different cause, the injection has NOT achieved its intent — stop, do not declare completion, report the deviation with evidence via `request_replan`",
+    # Armed-before-inject (inject-cc2d5080): the un-armed injection a
+    # replan-review push produced when the refused call WAS the carrier.
+    # Accelerator only — the graph-level gate is the guarantee.
+    "Arm before you inject: an object-write fault carries no experiment handle and no self-timeout, so its only bounded recovery is the carrier timer the plan stacks — when that carrier is not yet built and armed, finish the arming FIRST. An un-armed injection is not execution progress; if the carrier cannot be built, report it via `request_replan` with kind=safety and let the task fail honestly",
     # Anti-loop: repetition needs new evidence or a new hypothesis.
     "Choose the next safe, meaningful action adaptively — no unchanged repetition without new evidence or hypothesis",
     # receipt/trace/effect triad: exit on receipt; effect observation
     # belongs to verification, a missing effect flows back via replan.
     # Wording frozen by tests/test_agent/test_prompts.py (receipt authority).
     "A step is complete when its mutation is ISSUED — the receipt (experiment handle or success status; lacking one, a single check that the mutated object is in place) is sufficient proof. When ALL steps are issued, STOP — do not wait for, sample, or stabilize the fault effect: verification is automatic, and a missing effect returns to you through replan",
+    # The STOP rule's ACTION (#39 third-retest tail tension): "STOP" alone
+    # read as "output a text conclusion", which the stall guard answered
+    # with EXECUTION REQUIRED — the model then burned rounds alternating
+    # text and redundant read-only probes, pressured toward out-of-authority
+    # actions. The clean exit is a TOOL CALL the harness recognises.
+    "When ALL steps are issued, declare it by calling `finish_execution` with a 1-3 sentence summary — that is the STOP action; a text-only conclusion is not an exit, and verification starts automatically after the call",
     # Residue cleanup before switching + method-switch discipline; the
     # safety guard, not the doc, arbitrates danger. Wording frozen by
     # tests/test_agent/test_factory.py (partial-failure cleanup guidance).
     "A failed partial injection is not a completed one: if it left a residual experiment, clean up that residue before switching methods. Prefer a documented alternative that reaches the same effect on the same target and keep executing; when none is documented, an equivalent-effect method you devise (same target, same effect, probe read-only first) is equally legitimate — the safety guard, not the doc, arbitrates danger. A method change alone never justifies request_replan",
+    # Turn economy, single-sourced with every other node (see
+    # reminder.PARALLELIZE_PRINCIPLE). The receipt-sequencing of mutation
+    # steps is the "safety requires ordering" arm of the principle.
+    PARALLELIZE_PRINCIPLE,
 )
 
 
@@ -136,7 +155,35 @@ def get_executor_remember_section() -> str:
     )
 
 
-def get_workflow_section() -> str:
+# Recovery-channel routing guide (openspec faultdrill-cr-channel, design
+# D3 source 2): rendered into the Workflow section ONLY when the builder
+# passes ``include_cr_channel_routing`` (faultdrill_enabled ∧ K8s profile)
+# — the dark-launch window keeps the section byte-identical to pre-change.
+# This is the planning-decision source of the three-source routing: the
+# case's ``recovery_channel`` declaration (M3 legislates it into the case
+# front matter) routes apiserver-write recovery onto the FaultDrill CR
+# channel, while the programmatic write-set gate (D3 source 3) remains the
+# fallback that does not trust this guidance. Tool-agnostic wording: the
+# FaultDrill CR is an object concept, not a CLI name — concrete verbs live
+# in the skill case templates and the Phase 2 Tools section.
+_CR_CHANNEL_ROUTING_GUIDE = """4b. **Recovery-channel routing**: when the activated skill case declares
+   `recovery_channel: apiserver-write`, route that case onto the FaultDrill CR
+   channel — Execution Steps carry the FaultDrill custom resource (the case's
+   CR template adapted to the verified target) instead of an SOP write
+   sequence, and recovery is the channel's own lifecycle (landing readback
+   and reconciler it arms itself): do NOT stack a recovery-carrier SOP on
+   top. Cases without the declaration keep their documented path unchanged.
+   Before committing to the CR form, check the pre-task environment probes
+   message for the FaultDrill CRD line: when it reports the channel not
+   installable (no permission or policy denial), plan the recovery-carrier
+   SOP form directly and record the probe evidence in the plan — the
+   degraded plan spends no CR attempt round. An execute-time channel
+   failure replans onto the SOP form the same way, once.
+
+"""
+
+
+def get_workflow_section(include_cr_channel_routing: bool = False) -> str:
     """Workflow phases section — tool-agnostic, verification as structural backbone.
 
     Single profile-agnostic text: k8s / host differences come ONLY from the
@@ -152,8 +199,22 @@ def get_workflow_section() -> str:
 
     Keeps the Analyze / Activate / Verify verbs frozen by
     ``tests/test_agent/test_prompts.py``.
+
+    ``include_cr_channel_routing`` gates the D3-source-2 recovery-channel
+    routing guide (openspec faultdrill-cr-channel): the builder passes it
+    only when the CR channel is enabled (faultdrill_enabled) on a K8s
+    profile — the dark-launch window keeps this section byte-identical to
+    pre-change, so no prompt snapshot moves until the channel is on. The
+    guide names the FaultDrill CR (an object/resource concept, not a CLI
+    tool name) and the skill-case ``recovery_channel`` declaration — M3
+    legislates the declaration into the case front matter; until a case
+    carries it, the guide's "no declaration → documented path" arm keeps
+    existing behaviour unchanged.
     """
-    return """## Workflow
+    cr_channel_routing = (
+        _CR_CHANNEL_ROUTING_GUIDE if include_cr_channel_routing else ""
+    )
+    return f"""## Workflow
 You operate in TWO phases — the system transitions automatically.
 
 ### Phase 1 (current): Planning — read-only by enforcement
@@ -201,7 +262,7 @@ tool actually does, and keep the approved target and safety boundaries intact.
    execute them here. Your plan carries what Phase 2 needs to avoid discovering
    by failure: the verified target, the chosen path and why it won, the pitfalls
    your evidence and the skill docs flag, and the remaining assumptions.
-5. **Assess complexity** (optional `save_fault_plan`):
+{cr_channel_routing}5. **Assess complexity** (optional `save_fault_plan`):
    - Simple (single target, single fault, trivial rollback): skip the plan, go
      to step 6.
    - Complex (multi-target, multi-step, cascading, large blast radius): call
@@ -219,6 +280,10 @@ tool actually does, and keep the approved target and safety boundaries intact.
      NOT instantaneous (may take 5-30s to propagate): re-checking serves
      only to rule an effect OUT, and confirming it PRESENT follows the
      case's verification steps — don't invent observation rounds beyond them.
+     Time annotations in "Verification Methods" are upper bounds, not quotas
+     — a criterion satisfied at any point inside its window holds.
+     Recovery-period waits and re-checks belong in "Rollback and Recovery":
+     the verifier does not wait for recovery.
 5b. **Reject only when technically impossible**: call
    `finish_planning(rejected=True, ...)` when the request cannot be done — target
    absent after verification, no matching use-case in the skill's resources, the tool's own
@@ -243,6 +308,14 @@ tool actually does, and keep the approved target and safety boundaries intact.
      tool schema.
    - `blast_radius_detail`: specific resources affected
    - `skill_case_resource`: resource_path of chosen case (if multiple were read)
+   - `duration_seconds`: the injection window in seconds this plan commits
+     to — the reviewed FaultSpec contract, auto-recovery timers, and the
+     audit snapshot derive from it. Declare the window the plan actually
+     uses.
+   - `fault_scope` / `fault_target` / `fault_action`: the fault-identity
+     triple of the plan's MAIN injection mechanism — declare it from what
+     the plan actually attacks, never from the skill-case document (a
+     menu). Full contract lives in the `finish_planning` tool schema.
    Do NOT end Phase 1 without calling `finish_planning`.
 
 ### Phase 2 (automatic): Execution — mutation tools bound after approval.
@@ -251,6 +324,38 @@ Phase 1 is read-only. Mutation tools are bound automatically in Phase 2 after
 target enforcement, recovery and audit. See Tool Usage Guidelines for available
 tools."""
 
+
+
+def _guard_rejection_lines(guard_rejections: list) -> list[str]:
+    """Render guard rejections as hard constraints — shared by BOTH replan
+    branches (execute-replan and verify-replan).
+
+    Same rendering, same semantics, one seam: a form-level guard rejection
+    is contract-relative and never-relaxing on either branch, so neither
+    renderer restates the wording (B76 review C1: verify-replan previously
+    had no such block at all, leaving the optimistic re-planning pathway
+    open exactly where the r4 deadlock happened).
+    """
+    if not guard_rejections:
+        return []
+    lines = [
+        "\n### GUARD REJECTIONS — HARD CONSTRAINTS (not evidence)",
+        "The target_guard rejections below are boundaries the guard will "
+        "NOT relax on retry. Unlike the failure chain above, they are NOT "
+        "evidence to re-weigh — a form the guard has rejected stays "
+        "rejected no matter how the new plan words it.",
+    ]
+    for gr in guard_rejections:
+        lines.append(f"- [{gr.get('verdict', '?')}] `{gr.get('tool', '?')}`: {gr.get('message', '')}")
+    lines.append(
+        "The new plan MUST NOT depend on any rejected addressing/selection "
+        "form. If the reviewed FaultSpec itself cannot be expressed without "
+        "a rejected form, the contract is unexecutable as approved: use "
+        "`propose_plan_change` to fix the contract, or "
+        "`finish_planning(rejected=True)` — do not re-submit a plan that "
+        "re-uses a rejected form."
+    )
+    return lines
 
 
 def _get_verify_replan_section(replan_context: dict, replan_history: list | None = None) -> str:
@@ -279,6 +384,10 @@ def _get_verify_replan_section(replan_context: dict, replan_history: list | None
         parts.append("These residuals have been automatically cleaned. Do NOT attempt to clean them up again.")
     else:
         parts.append("\nNo residual side effects were detected from the previous attempt.")
+
+    parts.extend(_guard_rejection_lines(
+        replan_context.get("guard_rejections", []),
+    ))
 
     if replan_history:
         parts.append("\n### Previous Attempts (DO NOT repeat these approaches)")
@@ -335,6 +444,10 @@ def get_replan_section(replan_context: dict | None = None, replan_history: list 
         parts.append("")
         parts.append("Look for the ROOT CAUSE at the beginning of the chain,")
         parts.append("not just the last error. The last error is often a symptom.")
+
+    guard_rejections = replan_context.get("guard_rejections", [])
+    if guard_rejections:
+        parts.extend(_guard_rejection_lines(guard_rejections))
 
     if replan_history:
         parts.append("\n### Previous Replan Attempts (DO NOT repeat these approaches)")

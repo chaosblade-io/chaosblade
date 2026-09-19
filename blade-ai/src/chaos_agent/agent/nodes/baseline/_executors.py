@@ -19,6 +19,7 @@ from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.nodes.baseline._commands import (
     _HOST_FALLBACK_CHAIN,
     _get_iostat_fallback_chain,
+    _is_empty_observation,
     _is_observation_success,
 )
 from chaos_agent.agent.nodes.execute._debug_pod import (
@@ -32,7 +33,7 @@ from chaos_agent.tools.pod_discovery import (
     discover_tool_pod_on_node,
 )
 from chaos_agent.config.settings import settings
-from chaos_agent.observability.status_tracker import get_tracker
+from chaos_agent.observability.status_tracker import elided_preview, get_tracker
 from chaos_agent.tools.kubectl import _split_args, build_kubectl_cmd, display_cmd
 from chaos_agent.transports import (
     PROFILE_HOST,
@@ -160,17 +161,46 @@ async def _execute_observations(
                         }
                 else:
                     obs = await _exec_simple(cmd_info, kubeconfig, task_id)
+                # Validity stamp (#16 fix C): this append is the single
+                # chokepoint every execution path (including retry
+                # re-execution) funnels through, so it is where "the command
+                # executed" stops implying "the observation anchored on
+                # something". A success-classified observation with nothing
+                # to show (empty output / "No resources found" / empty
+                # items List — wrong selector, wrong name, or an asset the
+                # approved plan only creates during execute) carries the
+                # explicit ``empty_observation`` flag from here on; assembly
+                # keeps valid vs empty counts separate and the retry loop
+                # feeds empties back for identity repair.
+                if _is_observation_success(obs) and _is_empty_observation(obs):
+                    obs["empty_observation"] = True
                 observations.append(obs)
 
                 # Emit per-command tracker update with output preview
                 if tracker:
-                    _preview = (
-                        obs.get("stdout", "")[:200]
-                        or obs.get("stderr", "")[:200]
-                        or "(empty)"
-                    )
+                    # Failure previews keep BOTH ends (elided_preview):
+                    # kubectl puts the causal error LAST (after its warning
+                    # banner) and the wiz wrapper merges stderr into stdout,
+                    # so a head-only cut can hide the root cause (#31).
+                    # Success keeps the head as before.
+                    if obs.get("exit_code") == 0:
+                        _preview = (
+                            obs.get("stdout", "")[:200]
+                            or obs.get("stderr", "")[:200]
+                            or "(empty)"
+                        )
+                    else:
+                        _preview = (
+                            elided_preview(
+                                obs.get("stdout", "") or obs.get("stderr", ""),
+                                60, 140,
+                            )
+                            or "(empty)"
+                        )
                     if _is_observation_success(obs):
-                        _status = "ok"
+                        _status = (
+                            "ok(empty)" if obs.get("empty_observation") else "ok"
+                        )
                     elif obs.get("exit_code") == 0:
                         _status = "exit=0(stderr_error)"
                     else:
@@ -352,8 +382,10 @@ async def _exec_debug_two_step(
             "stderr": "No node_name for debug_two_step",
         }
 
-    # Step 1: kubectl debug node/{node} -n {namespace} --image=busybox -- sleep 3600
-    # Auto-discover namespace via create_and_wait_debug_pod
+    # Step 1: kubectl debug node/{node} -n {namespace} --image={candidate} -- sleep 3600
+    # Image candidate chain (explicit config > discovered DS images > busybox)
+    # with per-candidate fast-fail retry, and namespace auto-discovery, live
+    # inside create_and_wait_debug_pod.
     create_result = await _create_and_wait_debug_pod(node_name, kubeconfig, task_id)
     if not create_result:
         return {

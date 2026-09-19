@@ -7,6 +7,23 @@ Two graph nodes use this module:
 Each detector is a pure synchronous function that receives the before/after
 state and returns incremental side-effects. All IO is done upfront by the
 runner, keeping detectors trivially testable.
+
+Capture-channel tri-state contract (B77, case #40):
+Every kubectl/diag channel a detector reads is in ONE of three states —
+  - Value:      capture succeeded, payload parsed (``*_json`` holds it)
+  - Empty:      capture succeeded and the source is genuinely empty
+               (``{"items": []}`` / empty log text)
+  - Unreadable: capture FAILED — recorded in ``PostInjectState.capture_errors``
+               keyed by channel name (pods/events/endpoints/target_logs on
+               the k8s path; processes/mounts/services/dmesg on the host path).
+A detector whose declared ``reads_channels`` include an Unreadable channel is
+SKIPPED by ``run_all_detectors`` — "not captured" must never be adjudicated as
+"captured and found empty". Callers surface the skipped channels via
+``unreadable_channels()`` so the evidence chain says "not captured (query
+failed)" instead of silently reading as a clean bill of health. New
+detectors MUST declare ``reads_channels``; an undeclared attribute defaults
+to no gating (legacy third-party shape), which keeps them on the OLD
+misreading-prone semantics — do not rely on it.
 """
 
 from __future__ import annotations
@@ -120,6 +137,14 @@ class SideEffectSnapshot:
     # primary-effect metrics for the fault dimension, captured by reusing the
     # feasibility ``(profile, target)`` probe. Empty when no probe applies.
     primary_metrics: dict = field(default_factory=dict)
+    # F2/B85 symmetry: WHY each BEFORE-side channel is empty — same
+    # tri-state contract as ``PostInjectState.capture_errors``. A key here
+    # marks the channel Unreadable at baseline; a detector whose declared
+    # ``reads_channels`` hits it is skipped (run_all_detectors), because a
+    # failed baseline capture is not "captured, found nothing". Without it
+    # a failed before-pods query reads as baseline_rc=0 and ContainerRestart
+    # reports every pre-existing restart as a fault side effect.
+    capture_errors: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -129,6 +154,7 @@ class SideEffectSnapshot:
             "endpoints": {k: v.to_dict() for k, v in self.endpoints.items()},
             "host": self.host.to_dict() if self.host else None,
             "primary_metrics": self.primary_metrics,
+            "capture_errors": self.capture_errors,
         }
 
     @classmethod
@@ -143,6 +169,7 @@ class SideEffectSnapshot:
             endpoints=endpoints,
             host=HostSnapshot.from_dict(host_d) if host_d else None,
             primary_metrics=d.get("primary_metrics", {}),
+            capture_errors=d.get("capture_errors", {}) or {},
         )
 
 
@@ -170,6 +197,24 @@ class PostInjectState:
     host: HostPostInjectState | None = None
     # primary-effect metrics for the fault dimension (see SideEffectSnapshot).
     primary_metrics: dict = field(default_factory=dict)
+    # B77/B81 family root fix: WHY each channel is empty. A channel key
+    # maps to its diagnosis ("exception: …" / "exit=1: …" / "bad json").
+    # Tri-state contract (see module docstring): presence of a key here
+    # marks the channel Unreadable — detectors reading it are skipped, so
+    # "query failed" can never be adjudicated as "captured, found nothing".
+    # Error and empty MUST stay distinguishable past the log layer too.
+    capture_errors: dict = field(default_factory=dict)
+
+
+def unreadable_channels(after: PostInjectState) -> dict[str, str]:
+    """Unreadable capture channels of ``after``: ``{channel: reason}``.
+
+    Single source for the tri-state's Unreadable leg. ``run_all_detectors``
+    gates on it; ``se_detect`` surfaces it into the report so a missing
+    observation is visible as "not captured (query failed)" — never as a
+    silently clean diff.
+    """
+    return dict(after.capture_errors or {})
 
 
 @dataclass
@@ -200,6 +245,13 @@ class SideEffectDetector(Protocol):
     # anomaly worth flagging regardless of fault). Non-empty = only runs when
     # ctx.target matches (e.g. OOMKilledSibling → ("mem",)).
     applies_to_targets: tuple[str, ...]
+    # capture channels this detector reads (B77 tri-state gate): a detector
+    # whose ANY declared channel is Unreadable (``capture_errors``) is skipped
+    # by run_all_detectors — "not captured" is not "captured, found empty".
+    # k8s channels: pods / events / endpoints / target_logs.
+    # host channels: processes / mounts / services / dmesg.
+    # Empty tuple (or missing attr on a legacy detector) = no gating.
+    reads_channels: tuple[str, ...]
 
     def detect(
         self,
@@ -243,11 +295,55 @@ def run_all_detectors(
 
     Pure synchronous — no IO here. Within the profile group, dimension-relevant
     detectors are filtered by ``ctx.target`` (see :func:`_detector_applies`).
+
+    B77 tri-state gate: a detector whose declared ``reads_channels`` include
+    an Unreadable channel (``after.capture_errors``) is skipped entirely —
+    its findings dict stays key-absent, identical to a peeled/empty result.
+    "Not captured" is a statement about the OBSERVATION, never about the
+    cluster: case #40 reported EndpointRemovals 2→0 off a failed endpoints
+    query, and ProcessDeath would report every baseline process dead off a
+    failed ``ps``. Use :func:`unreadable_channels` to surface what was skipped.
     """
     prof = profile or ctx.profile or PROFILE_K8S
+    unreadable = unreadable_channels(after)
+    # F2 symmetry: the BEFORE side carries the same tri-state. A channel
+    # that failed at baseline makes every diff over it meaningless in the
+    # OPPOSITE direction from an after-side miss (a failed before-pods
+    # query reads as baseline_rc=0 → ContainerRestart flags pre-existing
+    # restarts as fault effects; a failed before-endpoints reads as an
+    # empty baseline → EndpointRemoval misses every removal). Gate on
+    # either side's failure — same skip, same reserved-key visibility.
+    before_errors: dict[str, str] = (
+        dict(getattr(before, "capture_errors", None) or {})
+        if before is not None else {}
+    )
     results: dict[str, list[dict]] = {}
     for d in _DETECTORS.get(prof, []):
         if not _detector_applies(d, ctx.target):
+            continue
+        channels = getattr(d, "reads_channels", ()) or ()
+        blocked_after = [c for c in channels if c in unreadable]
+        blocked_before = [c for c in channels if c in before_errors]
+        blocked = blocked_after + [c for c in blocked_before if c not in blocked_after]
+        if blocked:
+            sources = []
+            if blocked_after:
+                sources.append(
+                    "after: " + "; ".join(
+                        f"{c} ({unreadable[c][:120]})" for c in blocked_after
+                    )
+                )
+            if blocked_before:
+                sources.append(
+                    "before: " + "; ".join(
+                        f"{c} ({before_errors[c][:120]})" for c in blocked_before
+                    )
+                )
+            logger.warning(
+                "side-effect detector %s skipped: unreadable capture "
+                "channel(s) %s (%s) — data missing, not empty",
+                d.key, ", ".join(blocked), " | ".join(sources),
+            )
             continue
         try:
             items = d.detect(before, after, ctx)
@@ -430,6 +526,7 @@ async def capture_snapshot(
     result_p = results[0]
     rc_p, stdout_p = result_p.exit_code, result_p.stdout
 
+    _capture_errors: dict[str, str] = {}
     pods: dict[str, PodSnapshot] = {}
     if rc_p == 0 and stdout_p:
         try:
@@ -441,8 +538,15 @@ async def capture_snapshot(
                 ps = _parse_pod_snapshot(item, ns)
                 if ps:
                     pods[_pod_key(ns, ps.name)] = ps
-        except (json.JSONDecodeError, KeyError):
-            pass
+        except (json.JSONDecodeError, KeyError) as e:
+            _capture_errors["pods"] = f"bad json: {e}"
+            logger.warning("baseline capture pods: unparseable json: %s", e)
+    elif rc_p != 0:
+        detail = (result_p.stderr or "").strip()[:200]
+        _capture_errors["pods"] = f"exit={rc_p}: {detail}"
+        logger.warning(
+            "baseline capture pods failed (exit=%s): %s", rc_p, detail,
+        )
 
     endpoints: dict[str, EndpointSnapshot] = {}
     if not node_name and len(results) > 1:
@@ -454,14 +558,23 @@ async def capture_snapshot(
                     es = _parse_endpoint_snapshot(item)
                     if es:
                         endpoints[es.service] = es
-            except (json.JSONDecodeError, KeyError):
-                pass
+            except (json.JSONDecodeError, KeyError) as e:
+                _capture_errors["endpoints"] = f"bad json: {e}"
+                logger.warning("baseline capture endpoints: unparseable json: %s", e)
+        elif result_e.exit_code != 0:
+            detail = (result_e.stderr or "").strip()[:200]
+            _capture_errors["endpoints"] = f"exit={result_e.exit_code}: {detail}"
+            logger.warning(
+                "baseline capture endpoints failed (exit=%s): %s",
+                result_e.exit_code, detail,
+            )
 
     return SideEffectSnapshot(
         captured_at=now_iso(),
         namespace=namespace,
         pods=pods,
         endpoints=endpoints,
+        capture_errors=_capture_errors,
     )
 
 
@@ -523,25 +636,55 @@ async def fetch_post_inject_state(
     except Exception:
         return PostInjectState(captured_at=now_iso())
 
-    def _safe_json(result) -> dict:
+    _capture_errors: dict[str, str] = {}
+
+    def _safe_json(result, *, tag: str = "") -> dict:
         if isinstance(result, Exception):
+            _capture_errors[tag] = f"exception: {result}"
+            logger.warning("post-inject capture %s failed: %s", tag, result)
             return {}
-        if result.exit_code != 0 or not result.stdout:
+        if result.exit_code != 0:
+            detail = (result.stderr or "").strip()[:200]
+            _capture_errors[tag] = f"exit={result.exit_code}: {detail}"
+            logger.warning(
+                "post-inject capture %s failed (exit=%s): %s",
+                tag, result.exit_code, detail,
+            )
+            return {}
+        if not result.stdout:
             return {}
         try:
             return json.loads(result.stdout)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError) as e:
+            _capture_errors[tag] = f"bad json: {e}"
+            logger.warning("post-inject capture %s: unparseable json: %s", tag, e)
             return {}
 
-    def _safe_text(result) -> str:
+    def _safe_text(result, *, tag: str = "") -> str:
         if isinstance(result, Exception):
+            _capture_errors[tag] = f"exception: {result}"
+            logger.warning("post-inject capture %s failed: %s", tag, result)
             return ""
-        return result.stdout if result.exit_code == 0 else ""
+        if result.exit_code != 0:
+            detail = (result.stderr or "").strip()[:200]
+            _capture_errors[tag] = f"exit={result.exit_code}: {detail}"
+            logger.warning(
+                "post-inject capture %s failed (exit=%s): %s",
+                tag, result.exit_code, detail,
+            )
+            return ""
+        return result.stdout
 
-    pods_json = _safe_json(results[0])
-    events_json = _safe_json(results[1])
-    endpoints_json = _safe_json(results[ep_index]) if ep_index >= 0 else {}
-    target_logs = _safe_text(results[logs_index]) if logs_index >= 0 else ""
+    pods_json = _safe_json(results[0], tag="pods")
+    events_json = _safe_json(results[1], tag="events")
+    endpoints_json = (
+        _safe_json(results[ep_index], tag="endpoints")
+        if ep_index >= 0 else {}
+    )
+    target_logs = (
+        _safe_text(results[logs_index], tag="target_logs")
+        if logs_index >= 0 else ""
+    )
 
     return PostInjectState(
         pods_json=pods_json,
@@ -549,6 +692,7 @@ async def fetch_post_inject_state(
         endpoints_json=endpoints_json,
         target_logs=target_logs,
         captured_at=now_iso(),
+        capture_errors=_capture_errors,
     )
 
 
@@ -640,6 +784,7 @@ def _is_after_injection(timestamp: str, injection_start: str) -> bool:
 class ContainerRestartDetector:
     key = "container_restarts"
     applies_to_targets: tuple[str, ...] = ()
+    reads_channels: tuple[str, ...] = ("pods",)
 
     def detect(
         self,
@@ -668,7 +813,59 @@ class ContainerRestartDetector:
                 last_terminated = (cs.get("lastState") or {}).get("terminated") or {}
                 reason = last_terminated.get("reason", "")
                 finished_at = last_terminated.get("finishedAt", "")
+                exit_code = last_terminated.get("exitCode")
 
+                # B7 (live incidents #2/#17/#34): a container whose last
+                # termination was a SUCCESSFUL lifecycle completion (exit 0 /
+                # reason "Completed") is a periodic workload renewing itself —
+                # `sleep 7200` keep-alive targets restart on their natural ~2h
+                # cadence and that renewal lands inside whatever window the
+                # run happens to occupy. A successful completion is not a
+                # fault signal regardless of timing: fault-shaped restarts
+                # exit non-zero (137 kill / OOMKilled / Error — see
+                # Pod_进程被杀死, exit 137). All three incidents needed an
+                # LLM verdict to peel the false positive off; AUTO mode has
+                # no such reviewer in front of weak verification. A missing
+                # exit code AND reason keeps the report (fail-closed: what
+                # cannot be proven a natural completion is not silently
+                # swallowed). Evidence hierarchy: exitCode is the K8s API's
+                # REQUIRED field and outranks the optional reason label — a
+                # NON-ZERO exit code keeps the report even when a stale or
+                # contradictory "Completed" label rides along (anomalous/
+                # hand-crafted payloads); the label only rescues the peel
+                # when the exit code itself is absent.
+                #
+                # KNOWN BLIND EDGE (honest, not hand-waved): lastState holds
+                # only the FINAL termination. A window that contained a fault
+                # restart FIRST and a natural completion LAST would lose the
+                # fault here — and NO sibling detector backstops it:
+                # OOMKilledSibling reads the same overwritten lastState, and
+                # the Back-off events a real crash loop emits are consumed by
+                # no detector in this module. The protection is structural,
+                # not detector-level: for the fault restart to be followed by
+                # a natural completion, the container must re-run its WHOLE
+                # period inside the observation window (drill targets run
+                # sleep 7200..2592000 vs a ~30min inject+verify window —
+                # impossible). Short-period workloads (sleep 300) inside a
+                # long window could hit this; if that class of target ever
+                # appears, the fix is an event-stream Back-off detector, not
+                # loosening this peel. The edge is AMPLIFIED when no baseline
+                # snapshot exists (before is None → baseline_rc=0 → delta
+                # spans the container's ENTIRE restart history): a
+                # #34-shaped keep-alive pod (9 days, 115 natural renewals)
+                # then peels its whole delta on the single visible lastState —
+                # pre-run history is not this diff's claim to adjudicate, and
+                # the remedy if that ever matters is the same event-stream
+                # detector, not a baseline here.
+                if exit_code == 0 or (exit_code is None and reason == "Completed"):
+                    logger.info(
+                        "side-effect container_restarts: %s/%s restart_delta=%d "
+                        "peeled as natural lifecycle completion (exit 0) — "
+                        "periodic workload renewal, not an injection side "
+                        "effect (B7)",
+                        pod_name, cname, delta,
+                    )
+                    continue
                 if finished_at and not _is_after_injection(finished_at, ctx.injection_start_time):
                     continue
 
@@ -687,6 +884,7 @@ class ContainerRestartDetector:
 class EvictedPodDetector:
     key = "evicted_pods"
     applies_to_targets: tuple[str, ...] = ()
+    reads_channels: tuple[str, ...] = ("pods",)
 
     def detect(
         self,
@@ -723,6 +921,7 @@ class EvictedPodDetector:
 class OOMKilledSiblingDetector:
     key = "oom_killed_pods"
     applies_to_targets: tuple[str, ...] = ("mem",)
+    reads_channels: tuple[str, ...] = ("pods",)
 
     def detect(
         self,
@@ -768,6 +967,7 @@ class OOMKilledSiblingDetector:
 class CrashLoopDetector:
     key = "crash_loop_pods"
     applies_to_targets: tuple[str, ...] = ()
+    reads_channels: tuple[str, ...] = ("pods",)
 
     def detect(
         self,
@@ -793,6 +993,39 @@ class CrashLoopDetector:
                 if base and cname in base.crash_loop_containers:
                     continue
 
+                # B7 sibling guard (same evidence as the container_restarts
+                # filter above): CrashLoopBackOff rendered on top of a
+                # SUCCESSFUL last termination (exit 0 / reason "Completed")
+                # is the back-off view of a periodic workload renewing
+                # itself, not a crash — a container that exited zero did not
+                # fail. The mechanism: kubelet's restart backoff counts
+                # restart FREQUENCY, not exit codes, so a short-period
+                # renewal loop lands in CrashLoopBackOff the same way a
+                # failing one does — the waiting state alone cannot tell
+                # them apart; the exit code can. Real crash loops exit
+                # non-zero (Pod_进程被杀死: exit 137;
+                # Node_网络故障_节点端口占用: bind-failure exit 1).
+                # Missing exit evidence keeps the report (fail-closed), and
+                # the exitCode-outranks-reason evidence hierarchy is the
+                # same as documented above (a non-zero exit code beats a
+                # contradictory "Completed" label). The known blind edge
+                # (fault-first, completion-last window) is documented on the
+                # container_restarts filter above and applies to this guard
+                # identically.
+                last_terminated = (cs.get("lastState") or {}).get("terminated") or {}
+                exit_code = last_terminated.get("exitCode")
+                if exit_code == 0 or (
+                    exit_code is None
+                    and last_terminated.get("reason") == "Completed"
+                ):
+                    logger.info(
+                        "side-effect crash_loop_pods: %s/%s peeled — "
+                        "CrashLoopBackOff over a natural lifecycle completion "
+                        "(exit 0), periodic workload renewal (B7)",
+                        pod_name, cname,
+                    )
+                    continue
+
                 current_rc = cs.get("restartCount", 0)
                 baseline_rc = base.restart_counts.get(cname, 0) if base else 0
                 delta = current_rc - baseline_rc
@@ -809,6 +1042,10 @@ class CrashLoopDetector:
 class EndpointRemovalDetector:
     key = "endpoint_removals"
     applies_to_targets: tuple[str, ...] = ()
+    # #40's false positive: a failed endpoints query yielded {} and every
+    # baseline service was "missing" from it (current=0 < ready_count →
+    # removal). The gate skips this detector when the channel is Unreadable.
+    reads_channels: tuple[str, ...] = ("endpoints",)
 
     def detect(
         self,
@@ -846,6 +1083,7 @@ class EndpointRemovalDetector:
 class HPAScaleDetector:
     key = "hpa_scaling"
     applies_to_targets: tuple[str, ...] = ("cpu", "mem")
+    reads_channels: tuple[str, ...] = ("events",)
 
     def detect(
         self,
@@ -878,6 +1116,7 @@ class HPAScaleDetector:
 class ProbeFailureDetector:
     key = "probe_failures"
     applies_to_targets: tuple[str, ...] = ()
+    reads_channels: tuple[str, ...] = ("events",)
 
     def detect(
         self,
@@ -936,6 +1175,7 @@ def _match_dependency_pattern(line: str, pattern: str) -> bool:
 class DependencyErrorDetector:
     key = "dependency_errors"
     applies_to_targets: tuple[str, ...] = ()
+    reads_channels: tuple[str, ...] = ("target_logs",)
 
     def detect(
         self,
@@ -1154,24 +1394,44 @@ class HostObserver:
         # is always "this host", so capture is always possible.
         return True
 
-    async def _capture_host(self) -> HostSnapshot:
+    async def _capture_host(self) -> tuple[HostSnapshot, dict[str, str]]:
         ps_out, df_out, svc_out, dmesg_out = await asyncio.gather(
             _run_host_diag(["ps", "-e", "-o", "comm="]),
             _run_host_diag(["df", "-P"]),
             _run_host_diag(["systemctl", "list-units", "--type=service", "--no-legend", "--plain"]),
             _run_host_diag(["dmesg"], timeout=8),
         )
+        # F2 symmetry: a None diag output is a FAILED baseline capture, not
+        # an empty host — record it exactly like the after side does, so a
+        # failed before-side ``ps`` cannot read as "every process was absent
+        # at baseline" (ProcessDeath would report the whole process table as
+        # killed by the fault).
+        _capture_errors: dict[str, str] = {}
+        for channel, out, probe in (
+            ("processes", ps_out, "ps -e -o comm="),
+            ("mounts", df_out, "df -P"),
+            ("services", svc_out, "systemctl list-units"),
+            ("dmesg", dmesg_out, "dmesg"),
+        ):
+            if out is None:
+                _capture_errors[channel] = (
+                    f"diag failed: {probe} returned nothing"
+                )
         dmesg_count = len(dmesg_out.splitlines()) if dmesg_out else 0
-        return HostSnapshot(
+        host = HostSnapshot(
             processes=_parse_process_comms(ps_out),
             mounts=_parse_df_mounts(df_out),
             services=_parse_systemctl_services(svc_out),
             dmesg_line_count=dmesg_count,
         )
+        return host, _capture_errors
 
     async def capture_base_snapshot(self, spec, kubeconfig: str, task_id: str = "") -> SideEffectSnapshot | None:
-        host = await self._capture_host()
-        snap = SideEffectSnapshot(captured_at=now_iso(), namespace="", host=host)
+        host, capture_errors = await self._capture_host()
+        snap = SideEffectSnapshot(
+            captured_at=now_iso(), namespace="", host=host,
+            capture_errors=capture_errors,
+        )
         snap.primary_metrics = await capture_primary_metrics(spec, kubeconfig)
         return snap
 
@@ -1187,6 +1447,18 @@ class HostObserver:
             _run_host_diag(["systemctl", "list-units", "--type=service", "--no-legend", "--plain"]),
             _run_host_diag(["dmesg"], timeout=8),
         )
+        # B77 tri-state: a None diag output is a FAILED capture, not an empty
+        # host — record it so the detectors reading that channel are gated
+        # (a failed `ps` must not read as "every baseline process died").
+        _capture_errors: dict[str, str] = {}
+        for channel, out, probe in (
+            ("processes", ps_out, "ps -e -o comm="),
+            ("mounts", df_out, "df -P"),
+            ("services", svc_out, "systemctl list-units"),
+            ("dmesg", dmesg_out, "dmesg"),
+        ):
+            if out is None:
+                _capture_errors[channel] = f"diag failed: {probe} returned nothing"
         dmesg_lines = dmesg_out.splitlines() if dmesg_out else []
         host = HostPostInjectState(
             processes=_parse_process_comms(ps_out),
@@ -1194,7 +1466,9 @@ class HostObserver:
             services=_parse_systemctl_services(svc_out),
             dmesg_lines=dmesg_lines,
         )
-        state = PostInjectState(captured_at=now_iso(), host=host)
+        state = PostInjectState(
+            captured_at=now_iso(), host=host, capture_errors=_capture_errors,
+        )
         state.primary_metrics = await capture_primary_metrics(spec, kubeconfig)
         return state
 
@@ -1225,6 +1499,9 @@ class ProcessDeathDetector:
     """
     key = "process_deaths"
     applies_to_targets: tuple[str, ...] = ()
+    # Symmetric #40 hazard: a failed `ps` yields an empty after-set and
+    # every baseline process reads as dead. Gate on the processes channel.
+    reads_channels: tuple[str, ...] = ("processes",)
 
     def detect(
         self,
@@ -1243,6 +1520,7 @@ class FilesystemFullDetector:
     """A mount crossed the full threshold after injection (disk faults)."""
     key = "filesystem_full"
     applies_to_targets: tuple[str, ...] = ("disk",)
+    reads_channels: tuple[str, ...] = ("mounts",)
 
     def detect(
         self,
@@ -1274,6 +1552,7 @@ class DmesgOOMDetector:
     """Kernel OOM-killer activity in post-inject dmesg lines (mem faults)."""
     key = "dmesg_oom"
     applies_to_targets: tuple[str, ...] = ("mem",)
+    reads_channels: tuple[str, ...] = ("dmesg",)
 
     def detect(
         self,
@@ -1300,6 +1579,7 @@ class ServiceDownDetector:
     """
     key = "service_down"
     applies_to_targets: tuple[str, ...] = ()
+    reads_channels: tuple[str, ...] = ("services",)
 
     def detect(
         self,

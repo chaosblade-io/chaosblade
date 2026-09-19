@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from chaos_agent.utils.time import now_iso
+from chaos_agent.agent.state import TaskState
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,11 @@ class StreamEvent:
     # keep working unchanged.
     input_tokens: int = 0
     output_tokens: int = 0
+    # Prompt-cache hits, a SUBSET of ``input_tokens`` (not additive); the
+    # TUI/Web derive cache hit rate as ``cached_tokens / input_tokens``.
+    # Populated only on ``type=usage`` events, defaults 0 so the wire
+    # stripper drops it on every other event type.
+    cached_tokens: int = 0
     # Context-size snapshot, populated only on
     # ``type=context_size`` events. Emitted by PreReasoningHook after
     # every reasoning step so the TS TUI Footer can render a live
@@ -160,6 +166,11 @@ class StreamEvent:
         if self.type == "usage":
             out["input_tokens"] = self.input_tokens
             out["output_tokens"] = self.output_tokens
+            # Same rationale: force cached_tokens onto the wire even when 0
+            # (cold first call legitimately has no cache hit) so the TS
+            # reducer's ``Number(x) || 0`` defence sees a genuine 0 rather
+            # than an absent field, keeping the per-turn cache rate honest.
+            out["cached_tokens"] = self.cached_tokens
         if self.type == "context_size":
             # Same rationale as ``usage`` above — defensively force
             # all four context_size fields onto the wire so the TS
@@ -349,7 +360,7 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
                             type="token", content=_rc, node=node,
                         )
 
-        prompt, completion = _extract_token_usage(output)
+        prompt, completion, cache_read = _extract_token_usage(output)
         if synthetic_token:
             events = [synthetic_token]
             if prompt or completion:
@@ -357,6 +368,7 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
                     type="usage",
                     input_tokens=int(prompt),
                     output_tokens=int(completion),
+                    cached_tokens=int(cache_read),
                 ))
             return events
         if not (prompt or completion):
@@ -365,6 +377,7 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
             type="usage",
             input_tokens=int(prompt),
             output_tokens=int(completion),
+            cached_tokens=int(cache_read),
         )
 
     # Custom domain events emitted by nodes via adispatch_custom_event.
@@ -424,7 +437,21 @@ def parse_stream_event(raw_event: dict) -> Optional[StreamEvent | list[StreamEve
             return StreamEvent(
                 type="result",
                 content=_json.dumps({
-                    "status": "success" if task_state in ("injected", "recovered", "partial_recovered") else "fail",
+                    # Three-way status for the TUI result card: success /
+                    # unknown (verification ran, no conclusion — an "unverified"
+                    # knowledge claim, the reducer value domain already has
+                    # "unknown") / fail.
+                    "status": (
+                        "success"
+                        if task_state in (
+                            TaskState.INJECTED.value,
+                            TaskState.RECOVERED.value,
+                            TaskState.PARTIAL_RECOVERED.value,
+                        )
+                        else "unknown"
+                        if task_state == TaskState.UNVERIFIED.value
+                        else "fail"
+                    ),
                     "data": envelope_data,
                 }, ensure_ascii=False),
             )

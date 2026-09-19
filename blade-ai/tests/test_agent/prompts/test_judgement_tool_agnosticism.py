@@ -16,6 +16,9 @@ comprehensively", after effect / attribution / coverage were all already proven.
 Completeness of observation has no end; an evidence burden does.
 """
 
+from chaos_agent.agent.nodes.verify._verifier_messages import (
+    _EVIDENCE_SEMANTICS_PROMPT,
+)
 from chaos_agent.agent.prompts.sections.recovery import (
     get_recover_delay_section,
     get_recover_output_format_section,
@@ -108,6 +111,83 @@ class TestVerifierConvergencePrinciple:
         """
         assert "adds no proof" in get_verifier_core_principles_section()
         assert "adds no proof" not in get_verification_heuristics_compact_section()
+
+
+class TestVerifierEffectDecides:
+    """E-decides, stated as evidence semantics — not behavioural rules.
+
+    Postmortem (inject-6001154d): the verifier held CrashLoopBackOff watch for
+    ~5 minutes after RESTARTS+1 and the back-off event were already in hand.
+    The old convergence text demanded convergence "at or near the declared
+    value" — contradicting Primary Evidence's "does NOT require reaching the
+    exact target value" — and the model followed the more concrete, slower
+    instruction. Effect decides, receipts only diagnose (three field-proven
+    false-positive receipts: tool Success with zero fault delivered).
+
+    Register history (user review rounds 2-3): v1 stated numeric budgets
+    ("at most ONE confirmation") and was rejected like the old "keep
+    sampling"; v2 dropped the numbers but kept imperative rules ("NEVER
+    passes ... alone") — programmatic thinking that caps the model; v3
+    states what each observation MEANS (injected value = mechanism
+    parameter, receipts speak for the mechanism, labels render quantities)
+    and lets the model derive the behaviour. Both branches of Primary
+    Evidence stay open: absolute values are legitimate evidence when no
+    baseline was captured.
+    """
+
+    def test_semantics_state_both_primary_evidence_branches(self):
+        # Baseline change OR healthy-state deviation — the OR branch is what
+        # keeps absolute-value judgement legal without a baseline.
+        assert "significant change from baseline" in _EVIDENCE_SEMANTICS_PROMPT
+        assert "with no baseline" in _EVIDENCE_SEMANTICS_PROMPT
+        assert "significant deviation from the expected healthy state" in _EVIDENCE_SEMANTICS_PROMPT
+
+    def test_injected_value_is_a_mechanism_parameter(self):
+        # The convergence-to-value demand is replaced by what the value IS.
+        assert "mechanism parameter, not a measurement promise" in _EVIDENCE_SEMANTICS_PROMPT
+        assert "magnitude information for Warnings" in _EVIDENCE_SEMANTICS_PROMPT
+
+    def test_old_convergence_wording_is_gone(self):
+        assert (
+            "convergence at or near the declared value"
+            not in _EVIDENCE_SEMANTICS_PROMPT
+        )
+        assert "keep sampling while it trends" not in _EVIDENCE_SEMANTICS_PROMPT
+
+    def test_prompt_stays_descriptive_not_imperative(self):
+        # Round-3 review: heuristic semantics, never commanded procedures —
+        # no MUST/NEVER emphasis, no count caps, no verdict mappings.
+        for gone in ("MUST", "NEVER", "do NOT", "at most ONE",
+                     "re-check ONCE", "more than twice", "one sampling window",
+                     "→ '"):
+            assert gone not in _EVIDENCE_SEMANTICS_PROMPT, gone
+
+    def test_receipts_speak_for_the_mechanism(self):
+        assert "speaks for the mechanism, not the outcome" in _EVIDENCE_SEMANTICS_PROMPT
+        assert "reported Success while delivering no fault" in _EVIDENCE_SEMANTICS_PROMPT
+        assert "points to the failed layer" in _EVIDENCE_SEMANTICS_PROMPT
+
+    def test_derived_labels_render_quantities(self):
+        assert "the quantities are the evidence" in _EVIDENCE_SEMANTICS_PROMPT
+        assert "display form" in _EVIDENCE_SEMANTICS_PROMPT
+
+    def test_propagation_predates_information(self):
+        # Physical delay explains early observations — an allowance, not a
+        # fixed retry count.
+        assert "predates propagation says nothing yet" in _EVIDENCE_SEMANTICS_PROMPT
+
+    def test_remember_mirrors_effect_decides(self):
+        text = get_verifier_remember_section()
+        assert "is the effect evidence" in text
+        assert "speak for the mechanism, not the outcome" in text
+
+    def test_effect_decides_prompt_stays_tool_agnostic(self):
+        # The CONCRETE_TOOLS guard extended to the new prompt: it conveys
+        # judgement (what counts as evidence), never which tool to call.
+        found = [t for t in CONCRETE_TOOLS if t in _EVIDENCE_SEMANTICS_PROMPT]
+        assert found == [], (
+            f"judgement prompts must not name tools: {found}"
+        )
 
 
 class TestRecoverAttributionContract:

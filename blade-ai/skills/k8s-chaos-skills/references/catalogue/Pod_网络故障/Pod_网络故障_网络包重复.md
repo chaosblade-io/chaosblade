@@ -1,7 +1,11 @@
-**⚠️ 注意：此场景为 kubectl-native 方案，通过 tc netem 实现。tc 从哪来有两条路径，见演练步骤 3-4 —— 目标容器自带的 `tc` 在精简镜像里通常是不支持 netem 的 BusyBox applet，此时必须走临时容器路径。**
-**选此方案的前提是 ChaosBlade 的 `pod-network` 没有 duplicate action —— 以 `blade create k8s pod-network --help` 的实际输出为准；若本地版本已提供，优先用 blade 方案并以 `blade destroy <UID>` 恢复。**
-
 **用例名称** 网络包重复 导致 Pod_网络故障
+
+**故障定位**：持续型故障——tc netem duplicate 规则是状态型故障，规则存活即故障存活，
+贯穿整个故障窗口；窗口结束实验销毁/定时删除即自动恢复。手段1（ChaosBlade）与
+手段2（kubectl-native）是**并列的注入手段**，底层效果完全等价（blade 内部也是下发
+同一条 netem duplicate 规则），按环境能力选用：集群装有 ChaosBlade 且 `pod-network`
+提供 duplicate action → 可用手段1（实验 UID 统一生命周期管理）；否则用手段2。
+`duration_seconds` 是必填的故障窗口契约，未给定时先向用户确认。
 
 **故障现象**：
 1. 网络带宽消耗异常增加，重复包占用额外带宽
@@ -11,148 +15,227 @@
 
 **资源准备**：
 1. 确认目标应用已正常运行，且有活跃的网络通信流量
-2. 确认目标 Pod 的标签选择器和命名空间
-3. 确认监控系统可观测网络流量和包计数指标
-4. 确认有可用的 **iproute2** `tc`（见演练步骤 3 —— 精简镜像里常有同名的 BusyBox applet，它不支持 netem）
-5. 若需走临时容器路径：先确认当前集群**能拉取**一个含 iproute2 的镜像。不要假定公网镜像可用 —— 内网/离线集群常拉不到 Docker Hub，需换成集群已在使用的仓库地址
-6. 确认目标节点内核支持 netem（**内核级依赖，路径 A/B 都绕不开**）：netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换 Pod / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`（临时容器载体同样可用）——有输出说明已加载；无输出时可用更强的前置确证（实测）：经 node debug 载体执行 `chroot /host modprobe sch_netem` 试载，报 `FATAL: Module sch_netem not found` 即模块文件本身缺失（内核自动加载不可能成功），**注入前即可定案不可行**；实测 ACK/ASI al8 内核（5.10.134-13.1.al8）即为此形态——同一节点 netem 全家（loss/delay/corrupt）全部不可行，而 sch_tbf 存在（带宽受限场景可用，见 `Pod_网络带宽不足_带宽受限`）。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`（后者为节点上 sch_netem 模块文件本身缺失、内核自动加载失败）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一实测形态）即为内核不支持 netem 的确证，见演练步骤 4
+2. 确认目标 Pod 的标签选择器、命名空间，以及**实际容器名**（临时容器 `--target` 必须填容器名，
+   填 Pod 名/服务名会被 API server 拒绝：`targetContainerName: Not found`）
+3. **能力探测（决定手段选择）**——确认 ChaosBlade 的 `pod-network` 是否提供 duplicate action，
+   **以 `-h` 实际输出为准**：
+   ```bash
+   blade create k8s pod-network -h
+   ```
+   - Available Commands 列出 `duplicate` → 手段1 可用
+   - 仅有 `dns/drop/occupy` → 该 blade 构建不提供 duplicate，用手段2
+4. 手段2 额外前提：
+   - 节点内核支持 netem——**权威判据是功能探测，不是 grep 模块列表**：
+     - grep 只能作辅证：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`。
+       **有输出 → 必可用；无输出 ≠ 不可用**（存在 sch_netem 未加载、/sys/module 无对应目录，
+       但持 NET_ADMIN 的载体内建 netem qdisc 成功的形态——模块可能内建或首次使用时被按需加载，
+       不得因 grep 无输出就放弃手段2）。例外：若经 node debug 载体探测
+       `chroot /host modprobe sch_netem` 报 `FATAL: Module sch_netem not found`，即模块文件本身
+       缺失（自动加载不可能成功），netem 全家不可行，注入前即可定案
+     - 功能探测（在持有 NET_ADMIN 的共享 netns 载体内对 dummy 接口试建 netem，不碰业务网卡）：
+       路径A 在目标容器内、路径B 用临时容器执行同一条命令：
+       ```bash
+       sh -c 'ip link add dtest0 type dummy && tc qdisc add dev dtest0 root netem delay 1ms \
+              && echo NETEM_AVAILABLE || echo NETEM_UNAVAILABLE; \
+              tc qdisc del dev dtest0 root 2>/dev/null; ip link del dtest0 2>/dev/null; true'
+       ```
+       输出 `NETEM_AVAILABLE` → 内核支持；`NETEM_UNAVAILABLE` 或注入时报
+       `RTNETLINK answers: Operation not supported` / `No such file or directory` /
+       `Error: Specified qdisc kind is unknown.` → 内核不支持，立即停止并 replan
+   - 路径A 还需目标容器有 NET_ADMIN capability（无则报 EPERM，转路径B）；路径B 需确认集群
+     **能拉取**一个含 iproute2 的镜像（CNI 镜像如 terway/calico/cilium 通常自带；
+     用 `kubectl get pods -A -o jsonpath='{{..image}}'` 找集群已在用的）
 
 **演练步骤**：
-1. 确认目标 Pod 的标签选择器和命名空间：
+1. 记录注入前基线：
    ```bash
    kubectl get pods -n <namespace> -l <label-selector> -o wide
-   ```
-2. 记录注入前的网络包统计基线：
-   ```bash
    kubectl exec <pod-name> -n <namespace> -- cat /proc/net/dev
    ```
-3. 判定容器内的 `tc` 是不是真的能用 —— **只看命令是否存在会误判**：
+
+**手段1（ChaosBlade）**
+
+2. 注入网络包重复：
    ```bash
-   kubectl exec <pod-name> -n <namespace> -- tc -Version
+   blade create k8s pod-network duplicate \
+     --namespace <namespace> \
+     --names <pod-name> \
+     --interface eth0 \
+     --percent 30 \
+     --timeout <duration>
    ```
-   - 输出 `tc utility, iproute2-<版本>` → 是真 tc，可走路径 A
-   - 输出 `BusyBox v<版本> ...` → 是 BusyBox applet，**不支持 netem**（执行 `tc qdisc add ... root netem` 会报
-     `tc: invalid argument 'root' to 'command'`）。精简镜像里 `/bin/tc` 常与 `/bin/sh` 是同一个 BusyBox
-     二进制，`command -v tc` 一样返回成功，所以必须看 `-Version` 的输出内容，走路径 B
-   - 命令不存在 → 走路径 B
+   参数含义（`--interface`、`--percent` 必填）：
+   - `--percent`：被复制重发的出站报文百分比（如 30，比例越高带宽浪费与去重开销越大）
+   - `--timeout`：到期自动恢复（秒）
+3. 记录返回的 experiment_uid，用于后续恢复
 
-4. 注入网络包重复故障，按上一步结论二选一。
+**手段2（kubectl-native）** —— 按容器内是否有可用的 iproute2 `tc` 二选一
 
-   **路径 A —— 容器内确认是 iproute2 tc**（需容器有 NET_ADMIN；`CapEff` 全零的容器会报 EPERM）。
-   **先武装定时自删，再注入规则**（后台进程与目标容器同 netns，到期自动移除规则；
-   必须重定向后台化，否则 exec 挂住）：
+**路径 A —— 容器内有 iproute2 tc 且有 NET_ADMIN**
+
+先判定容器内的 `tc` 是不是真的能用——**只看命令是否存在会误判**：
+```bash
+kubectl exec <pod-name> -n <namespace> -- tc -Version
+```
+- 输出 `tc utility, iproute2-<版本>` → 是真 tc，可走本路径（还需容器有 NET_ADMIN，`CapEff` 全零会报 EPERM）
+- 输出 `BusyBox v<版本> ...` 或命令不存在 → 走路径 B（精简镜像的常态：`/bin/tc` 与 `/bin/sh` 同为 BusyBox
+  二进制，`command -v tc` 一样返回成功，执行 netem 时报 `invalid argument ... to 'command'`）
+
+注入命令（**先武装定时自删，再注入规则**；两条命令分两次独立执行——不能用 && 串联：
+第二段 kubectl 会沦为第一条 exec 载荷（sh -c）的死参数，注入静默丢失；武装命令必须
+重定向后台化，否则 exec 挂住）：
+```bash
+kubectl exec <pod-name> -n <namespace> -- sh -c \
+  '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
+kubectl exec <pod-name> -n <namespace> -- tc qdisc add dev eth0 root netem duplicate <percent>%
+```
+
+**路径 B —— 容器内没有可用 tc（精简镜像的常态）：临时容器载体**
+
+临时容器与目标容器**共享同一个网络命名空间**，在其内对 `eth0` 操作等价于操作目标 Pod 的网卡；
+`tc` 来自调试镜像而非目标镜像，`--profile=netadmin` 提供 NET_ADMIN capability。
+
+```bash
+# 0) 前置安全检查：确认目标 Pod 不是 hostNetwork。hostNetwork=true 的 Pod
+#    其网络命名空间【就是宿主机】，临时容器里的 tc 会打穿整个节点。
+#    为 true 时禁止此路径，改用 node 级用例。
+kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.hostNetwork}'
+# 期望输出为空或 false；输出 true 则停止。
+
+# 1) 注入 + 内置定时自删（一条命令完成：注入成功后 sleep <duration> 到期自动删除规则）。
+#    --target 必须填实际容器名；--quiet 不进入交互附着，不要加 -it。
+kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
+  --target=<container-name> --profile=netadmin --quiet -- sh -c \
+  'tc qdisc add dev eth0 root netem duplicate <percent>% \
+   && tc qdisc show dev eth0 && echo INJECTED && sleep <duration> \
+   && tc qdisc del dev eth0 root && tc qdisc show dev eth0 && echo RECOVERED'
+```
+链条是**自证的**：`add` 后、`INJECTED` 前的 `tc qdisc show` 把生效规则原文写入容器日志，
+`del` 后、`RECOVERED` 前的 `tc qdisc show` 把回落后的默认 qdisc 写入同一日志——白盒主证
+在注入时刻即被捕获，验证阶段读日志即可取证，**不再受故障窗口是否已关闭的时序约束**
+（窗口短于验证启动延迟时，窗口内探针结构性不可达；链内快照消除此竞态）。两处 show 必须保留，
+不得为缩短命令而省略（注意 wiz 等通道 sh -c 载荷有 1024 字节上限，本链远低于上限）。
+倒计时从武装时刻起算：注入成功（INJECTED 回显）与倒计时起点在同一条命令链内严格串行，无侵蚀间隙；武装后发生任何修复需重武装时，先用下方提前恢复命令另起临时容器删规则（旧链到期后的重复删除是幂等空触发、无害），再重跑注入命令重新武装+注入（见 SKILL.md 安全红线「故障窗口完整」）
+- 该命令整体阻塞 `<duration>` 秒（命令自身就是保活载体，自恢复随命令完成而闭环）；
+  如需后台执行，将整条 kubectl debug 置于后台并轮询其输出/临时容器日志
+- 输出未直接回流时，从临时容器日志读取（`INJECTED`/`RECOVERED` 标记即注入/自恢复的确证；
+  标记之间的 `tc qdisc show` 输出即白盒主证原文）：
+  ```bash
+  kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.ephemeralContainers[-1].name}'
+  kubectl logs <pod-name> -n <namespace> -c <ephemeral-container-name>
+  ```
+
+手段2 参数含义（两条路径相同）：
+- `duplicate <percent>%`：指定比例的出站数据包被复制一份重新发送，接收端收到重复包
+  （与手段1 `--percent` 对应）；TCP 层会按序号自动去重，连接不中断，但带宽与 CPU 被额外消耗
+- `eth0`：网络接口名，按 `ip link show` 实际输出调整
+- **内核级依赖**：netem 需要宿主机内核的 sch_netem 模块（容器与宿主共享内核，换载体改变不了）。
+  可用性以资源准备第 4 条的 dummy 功能探测为权威判据（grep /proc/modules 无输出不构成否定证据）。
+  注入报 `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`
+  或 `Error: Specified qdisc kind is unknown.`（RC=2）即内核不支持的确证——立即停止，
+  **不要重试、不要换 Pod 或重建临时容器**，发起 replan 并附报错证据；
+  也**不要**试图去基础设施容器（如 CNI policy 容器）里 modprobe 加载模块——那是目标范围外的
+  变更，会被 target_guard 以 namespace 漂移拦截
+- **注入报 `File exists`**：网卡上已有残留 qdisc（典型成因：上一次演练的自删链未走完/被中断）。
+  处置：先 `tc qdisc show dev eth0` 取证残留规则，若正是同类 netem 规则且处于
+  有效故障窗口，改用 `tc qdisc replace dev eth0 root netem duplicate <percent>%`（replace 幂等，
+  替换而非叠加）；若是无关/过期残留，先 `tc qdisc del dev eth0 root` 清掉再重新武装注入。
+  **不要盲目重试 `add`**，它只会反复报同样的错
+
+**注入验证**（两种手段共用——底层是同一条 netem 规则）：
+1. 白盒确认 netem 规则已生效。**手段2 路径B 的首选证据是注入容器日志**——链内 `tc qdisc show`
+   快照在注入时刻已捕获，直接读日志取证（无窗口时序约束，验证阶段晚于窗口关闭也同样有效）：
    ```bash
-   # 两条命令分两次独立执行——不能用 && 串联：第二段 kubectl 会沦为第一条
-   # exec 载荷（sh -c）的死参数，注入静默丢失
-   kubectl exec <pod-name> -n <namespace> -- sh -c \
-     '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
-   kubectl exec <pod-name> -n <namespace> -- tc qdisc add dev eth0 root netem duplicate <percent>
+   kubectl logs <pod-name> -n <namespace> -c <注入 ephemeral 容器名>
    ```
-
-   **路径 B —— 容器内没有可用 tc（精简镜像的常态）**：用临时容器注入。临时容器与目标容器
-   **共享同一个网络命名空间**，所以在它里面对 `eth0` 操作等价于对目标 Pod 的网卡操作；
-   `tc` 来自调试镜像而非目标镜像，`--profile=netadmin` 提供 NET_ADMIN capability：
+   `INJECTED` 之前应显示 `qdisc netem ... duplicate <percent>%`，`RECOVERED` 之前应显示回落后的
+   默认 qdisc。路径A 或需要**当前**规则状态时，在与目标容器**共享网络命名空间**的载体内
+   执行 `tc qdisc show`。
+   目标容器自带的 `tc` 常是 BusyBox applet（`tc -Version` 输出 BusyBox 即不可用，报
+   `invalid argument ... to 'command'`），推荐用临时容器载体（镜像含 iproute2，`--profile=netadmin`
+   提供查询所需的能力；`--target` 必须填实际容器名）：
    ```bash
-   # 0) 前置安全检查：确认目标 Pod 不是 hostNetwork。hostNetwork=true 的 Pod
-   #    其网络命名空间【就是宿主机】，临时容器里的 tc 会打穿整个节点，
-   #    爆炸半径从单 Pod 扩大到整台机器。为 true 时禁止此路径，改用 node 级用例。
-   kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.hostNetwork}'
-   # 期望输出为空或 false；输出 true 则停止。
-
-   # 1) 先建一个【长驻】临时容器作为执行载体。必须用 `sleep` 保活 ——
-   #    若直接把 tc 命令交给 kubectl debug，命令跑完容器立即终止，
-   #    后续 `kubectl exec -c <debugger>` 会报 `container not found`，故障就没法恢复了。
    kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
-     --target=<container-name> --profile=netadmin --quiet -- sleep <duration>
-
-   # 2) 取载体名（等它进入 running 再继续）
-   kubectl get pod <pod-name> -n <namespace> \
-     -o jsonpath='{range .status.ephemeralContainerStatuses[*]}{.name}{"="}{.state}{"\n"}{end}'
-
-   # 3) 经载体注入。载体与目标容器共享同一个网络命名空间，操作 eth0 即操作目标 Pod 的网卡；
-   #    tc 来自调试镜像，--profile=netadmin 提供 NET_ADMIN capability。
-   #    同样先武装定时自删（在载体内后台运行；载体保活 sleep 必须 ≥ <duration>）。
-   #    两条命令分两次独立执行——不能用 && 串联（第二段会沦为第一条 exec 载荷的死参数）
-   kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- sh -c \
-     '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
-   kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev eth0 root netem duplicate <percent>
+     --target=<container-name> --profile=netadmin --quiet -- tc qdisc show dev eth0
    ```
-   - `<verified-cluster-image>`：必须是当前集群**已验证可拉取**且含 **iproute2**（非 BusyBox）的镜像。
-     可靠的找法是看集群里已经在跑的镜像 —— 它们必然可拉取：
-     `kubectl get pods -A -o jsonpath='{{..image}}'`。
-     CNI / 网络组件（terway、calico、cilium 等）通常自带 iproute2，因为它们本身就要做流量整形；
-     选定后用 `kubectl debug ... -- tc -Version` 确认输出是 `tc utility, iproute2-...`
-   - `--quiet`：不进入交互附着；**不要加 `-it`**
-
-   参数含义（两条路径相同）：
-   - `duplicate <percent>`：指定比例的出站数据包会被复制一份重新发送，比例按演练目标确定（如 30%）
-   - `eth0`：网络接口名称，根据实际情况调整（可通过 `ip link show` 确认）
-   - 原理：tc netem 的 duplicate 选项对出站包进行复制，接收端会收到重复数据包
-   - **内核级依赖（两条路径相同）**：netem 需要宿主机内核支持 sch_netem。若注入报
-     `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`
-     （模块文件缺失）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一实测形态），
-     即内核不支持 netem 的确证 —— 立即停止，
-     **不要重试、不要换 Pod 或重建临时容器**（内核是同一个，重试只是空转），发起 replan
-     并附上该报错证据，由 Phase 1 改选其他可行方案或判定不可行
-
-5. 确认 tc 规则已生效（**用注入时同一条路径查**，因为查询也需要真 tc）：
+   若输出未直接回流，从临时容器日志读取：
    ```bash
-   # 路径 A
-   kubectl exec <pod-name> -n <namespace> -- tc qdisc show dev eth0
-   # 路径 B（复用注入时创建的临时容器）
-   kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc show dev eth0
+   kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.spec.ephemeralContainers[-1].name}'
+   kubectl logs <pod-name> -n <namespace> -c <ephemeral-container-name>
    ```
-   应显示 `qdisc netem ... duplicate <percent>`（即注入时配置的重复比例）
-
-**注入验证**：
-1. 在目标 Pod 内查看网络接口统计，确认发送包数异常增高：
+   应显示 `qdisc netem ... duplicate <percent>%`
+2. 业务侧验证——duplicate 不打断连接（TCP 按序号去重），验证目标是"连通仍在 + 发送量异常"：
+   在目标 Pod 内发起对下游的重复请求确认仍全部成功（计数用 while 自增而非
+   `$(seq)`——busybox 无 seq applet，`$(seq 1 N)` 展开为空会使探测循环空转零输出）：
+   ```bash
+   kubectl exec <pod-name> -n <namespace> -- sh -c 'i=1; while [ $i -le 10 ]; do wget -qO- --timeout=3 <目标服务地址> && echo OK || echo FAIL; i=$((i+1)); done'
+   ```
+3. 发送包数增长率验证——再次采样 `/proc/net/dev`，与基线对比 eth0 的 TX packets 增长速率
+   应明显偏高（重复包由发送侧复制，TX 侧先涨）：
    ```bash
    kubectl exec <pod-name> -n <namespace> -- cat /proc/net/dev
    ```
-   与基线对比，TX packets 增长速率应明显高于正常水平
-2. 在目标 Pod 内验证网络连通性（TCP 层自动去重，连接仍可用）：
-   ```bash
-   kubectl exec <pod-name> -n <namespace> -- wget -qO- --timeout=5 <目标服务地址>
-   ```
-   确认请求仍可成功，但响应时间可能略有增加
-3. 查看应用日志确认是否出现重复消息处理记录：
+4. 查看应用日志确认是否出现重复消息处理记录（业务无幂等保护时此处最有说服力）：
    ```bash
    kubectl logs <pod-name> -n <namespace> --tail=30
    ```
-4. 确认网络监控显示出站流量按注入比例异常增加
+5. 确认 Pod 状态仍为 Running、无 RESTARTS（duplicate 不杀连接，只耗带宽与 CPU）
+6. **持续性检查（必做）**——netem 是状态型故障，规则存活即故障存活：白盒主证为
+   `tc qdisc show dev eth0` 仍显示 `netem ... duplicate` 规则（手段1 实验未 destroy 且未到
+   `--timeout`；手段2 路径A 武装定时器未走完）；路径B 以日志为准：`INJECTED` 已现而
+   `RECOVERED` 未现即窗口仍开（链条严格串行，两标记之间的规则快照即生效主证）。有界佐证
+   为静观短窗口后 TX packets 增长率仍偏高。若窗口内提前恢复，说明故障窗口契约未达成，
+   必须如实报告实际持续时长
 
 **注入恢复**：
-1. 等待 `<duration>` 到期后注入前武装的定时器自动删除规则；如需提前恢复，手动移除 tc netem 规则
-   —— **必须用注入时那条路径**，因为 `tc qdisc del` 同样需要真 tc：
-   ```bash
-   # 路径 A（注入时用的是容器自带 iproute2 tc）
-   kubectl exec <pod-name> -n <namespace> -- tc qdisc del dev eth0 root
-   # 路径 B（注入时用的是临时容器）—— 复用同一个临时容器，不要新建
-   kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc del dev eth0 root
-   ```
-   若临时容器名已丢失，用
-   `kubectl get pod <pod-name> -n <namespace> -o jsonpath='{.status.ephemeralContainerStatuses[*].name}'`
-   取回。
-2. 确认规则已移除：
-   ```bash
-   # 与上一步同一条路径
-   kubectl exec <pod-name> -n <namespace> [-c <debugger-name>] -- tc qdisc show dev eth0
-   ```
-   应恢复为默认 qdisc（如 `pfifo_fast` / `fq_codel` / `noqueue`），不再显示 netem
-3. **临时容器本身无法从运行中的 Pod 移除**（Kubernetes 的既定行为），只能随 Pod 重建消失。
-   `tc qdisc del` 成功即代表故障已恢复；残留的临时容器不影响业务容器，可留待 Pod 下次重建时清除。
-   如需立即清理，须删除该 Pod 让上层控制器重建 —— 这是额外的变更动作，须经确认后再做。
 
-**恢复验证**：
-1. 在目标 Pod 内确认网络包统计恢复正常增长速率：
+手段1（ChaosBlade）：
+1. 提前恢复：销毁实验（移除 netem 规则）`blade destroy <experiment_uid>`
+2. 或等待 `--timeout`（`<duration>`）到期后 ChaosBlade 自动恢复。
+   注意：到期后 `blade status <uid>` 可能仍显示 `Success` 不翻状态，**不要以 status 判断规则是否还在**，
+   以白盒 `tc qdisc show` 为准
+
+手段2（kubectl-native）：
+1. 主保险：路径A 武装的定时器 / 路径B 内置自删链到期自动移除规则
+2. 提前恢复：
+   - 路径A：`kubectl exec <pod-name> -n <namespace> -- tc qdisc del dev eth0 root`
+     （`tc qdisc del` 对已删除的规则报 `RTNETLINK answers: No such file or directory`，无害但需预期）
+   - 路径B：另起一个临时容器执行删除，与注入容器无关——netem 规则挂在共享 netns 的网卡上，
+     任何共享该 netns 的载体都能删：
+     ```bash
+     kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
+       --target=<container-name> --profile=netadmin --quiet -- sh -c \
+       'tc qdisc del dev eth0 root && echo EARLY_RECOVERED && tc qdisc show dev eth0'
+     ```
+     随后注入容器里的定时器到期再删一次，规则已不存在，删除静默失败无害
+
+**恢复验证**（两种手段共用）：
+1. 用注入验证第 1 条的同一路径确认规则已移除：
    ```bash
-   kubectl exec <pod-name> -n <namespace> -- cat /proc/net/dev
+   kubectl debug <pod-name> -n <namespace> --image=<verified-cluster-image> \
+     --target=<container-name> --profile=netadmin --quiet -- tc qdisc show dev eth0
    ```
-2. 确认出站流量恢复至基线水平
-3. 确认应用响应时间和吞吐量恢复正常
+   应恢复为默认 qdisc（形态如 `qdisc noqueue 0: root refcnt 2`，也可能是 `pfifo_fast`/`fq_codel`），
+   不再显示 netem
+2. 在目标 Pod 内重复请求确认全部成功：
+   ```bash
+   kubectl exec <pod-name> -n <namespace> -- sh -c 'i=1; while [ $i -le 5 ]; do wget -qO- --timeout=3 <目标服务地址> && echo OK || echo FAIL; i=$((i+1)); done'
+   ```
+3. 确认 Pod 无 RESTARTS、`/proc/net/dev` TX packets 增长率回落至基线水平
 
 **基准事实**：
-- **根因**：Pod 网络接口上按注入比例的出站数据包被 tc netem duplicate 复制重发，导致接收端收到重复包，占用额外带宽和处理资源
-- **必现现象**：出站 TX packets 增长率异常偏高（与注入比例对应）；网络带宽占用增加；TCP 层自动去重但消耗额外 CPU；应用层若无幂等保护可能处理重复业务消息
-- **方案说明**：此为 kubectl-native 方案（选用前提：`pod-network` 未提供 duplicate action，以 `--help` 实测为准）。恢复不使用 blade destroy，而是通过 `tc qdisc del dev eth0 root` 移除规则，且必须沿注入时那条路径执行
-- **tc 来源决定成败**：netem 只有 iproute2 的 tc 支持。目标容器里同名的 BusyBox applet 会以 `invalid argument 'root' to 'command'` 失败，而 `command -v tc` 检测不出这个差别 —— 判据是 `tc -Version` 的输出内容。临时容器与目标容器共享网络命名空间，因此用调试镜像的 tc 操作 `eth0` 等价于操作目标 Pod 的网卡，这条路径不依赖目标镜像里有什么，也不依赖集群安装 ChaosBlade
+- **根因**：Pod 网络接口上的 tc netem duplicate 规则按注入比例对出站数据包复制重发，接收端收到重复包，占用额外带宽与去重 CPU；TCP 按序号去重保证连接不中断
+- **必现现象**：`tc qdisc show` 出现 `netem ... duplicate <percent>%` 规则；eth0 TX packets 增长率按注入比例偏高；带宽占用增加；应用无幂等保护时可能处理重复业务消息；窗口结束规则移除后恢复
+- **blade 可用性因构建而异**：`pod-network duplicate` 并非所有 blade 发行版都提供（官方 v1.8.0 构建含 netem 全家桶 reorder/corrupt/duplicate/delay/loss，某定制发行 v1.8.5 仅 dns/drop/occupy）——以 `blade create k8s pod-network -h` 的 Available Commands 为准，没有 duplicate 就用手段2
+- **tc 来源决定成败**：netem 只有 iproute2 的 tc 支持。目标容器里同名的 BusyBox applet 会以 `invalid argument 'root' to 'command'` 失败，而 `command -v tc` 检测不出这个差别——判据是 `tc -Version` 的输出内容。临时容器与目标容器共享网络命名空间，用调试镜像的 tc 操作 `eth0` 等价于操作目标 Pod 的网卡
+- **netem 可用性以功能探测为准**：节点 `/proc/modules` 与 `/sys/module` 均无 sch_netem 痕迹时，持 NET_ADMIN 的临时容器内 dummy 接口功能探测仍可返回 `NETEM_AVAILABLE`，netem 注入成功（白盒规则生效、窗口到期自删回落 `noqueue`）——grep 无输出只说明模块未显式加载，不得作为放弃手段2 的依据
+
+**手段2 注意事项**：
+- **`--` 之后是裸 argv 直通，无 shell 解释**：多个命令、`;`、`&&` 不得直接拼在 `--` 后
+  （首 token 会被当成含 `;` 的可执行文件名，容器立即 exit 255）——整条链必须包进单个
+  `sh -c '<完整链>'` 作为 `--` 的单一参数
+- **临时容器本身无法从运行中的 Pod 移除**（Kubernetes 既定行为），只能随 Pod 重建消失；
+  `tc qdisc del` 成功即代表故障已恢复，残留临时容器不影响业务容器
+- 自恢复基于武装的定时删除（路径A）或注入命令内置的 `sleep <duration>` 自删链（路径B）；
+  提前恢复用上方手动删除命令
+- 效果与手段1 完全等价——blade 底层就是下发同一条 netem duplicate 规则

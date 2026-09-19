@@ -141,8 +141,8 @@ class TestFromCliStructured:
         assert spec.params == {}
         assert spec.params_flags == ()
         # Duration omitted by the user → constructor fills the recommended
-        # default (pod-cpu-fullload: 600s) so is_complete can demand >0.
-        assert spec.duration_seconds == 600
+        # default (pod-cpu-fullload: 300s) so is_complete can demand >0.
+        assert spec.duration_seconds == 300
         assert spec.labels == {}
 
     def test_params_timeout_rejected(self):
@@ -156,17 +156,17 @@ class TestFromCliStructured:
                 "params": {"percent": "80", "timeout": "600"},
             })
 
-    def test_explicit_duration_below_floor_lifted_at_contract(self):
-        # Floor policy: an explicit value under the fault type's
-        # recommended minimum is lifted AT CONSTRUCTION, so confirmation
-        # cards show the bound that will actually execute (no silent
-        # execution-time boost).
+    def test_explicit_duration_below_floor_preserved_at_contract(self):
+        # Contract faithfulness (l4-contract-faithfulness): an explicit
+        # value under the fault type's recommended minimum is honoured
+        # verbatim at construction — the card shows exactly what was
+        # asked and what will execute (no lift, no silent boost).
         spec = FaultSpec.from_cli_structured({
             "scope": "pod", "target": "cpu", "action": "fullload",
             "namespace": "default", "target_name": "pod-a",
             "duration": 120,
         })
-        assert spec.duration_seconds == 600
+        assert spec.duration_seconds == 120
 
     def test_explicit_duration_above_floor_untouched(self):
         spec = FaultSpec.from_cli_structured({
@@ -176,14 +176,15 @@ class TestFromCliStructured:
         })
         assert spec.duration_seconds == 1200
 
-    def test_intent_args_duration_below_floor_lifted(self):
+    def test_intent_args_duration_below_floor_preserved(self):
         # NL flow goes through the same constructor, so a "60 seconds"
-        # ask lands on the card (and executes) as the floored value.
+        # ask lands on the card (and executes) as the requested 60s —
+        # never lifted.
         spec = FaultSpec.from_intent_args({
             "scope": "pod", "target": "network", "action": "delay",
             "namespace": "default", "duration_seconds": 60,
         })
-        assert spec.duration_seconds == 600
+        assert spec.duration_seconds == 60
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +288,19 @@ class TestFromCliNl:
         assert spec.params == {}
         assert spec.params_flags == ()
 
+    def test_unset_duration_stays_zero(self):
+        # Regression: CLI ``-i`` mode without explicit ``--duration`` passes
+        # duration=None. That must coerce to 0 (system-recommended channel)
+        # so the intent node extracts the duration the user stated in natural
+        # language. A hardcoded upstream default (observed: 600) masquerades
+        # as a user-pinned hard-pin and contradicts the description
+        # ("持续 300 秒" arriving as duration_seconds=600).
+        spec = FaultSpec.from_cli_nl(
+            input_text="注入 DNS 劫持，持续 300 秒",
+            kwargs={"duration": None},
+        )
+        assert spec.duration_seconds == 0
+
 
 # ---------------------------------------------------------------------------
 # from_http_request
@@ -387,7 +401,7 @@ class TestFromHttpRequest:
             duration=0, input=None,
         )
         spec = FaultSpec.from_http_request(req)
-        assert spec.duration_seconds == 600
+        assert spec.duration_seconds == 300
         assert spec.is_complete
 
 
@@ -414,8 +428,9 @@ class TestFromIntentArgs:
         assert spec.scope == "node"
         assert spec.names == ("cn-hongkong.10.0.1.120",)
         assert spec.params == {"percent": "80", "timeout": "600"}
-        # timeout in params is hoisted to duration_seconds for convenience
-        assert spec.duration_seconds == 600
+        # params.timeout stays inert (duration travels only through
+        # duration_seconds); the constructor fills the recommended floor.
+        assert spec.duration_seconds == 300
         assert spec.is_complete
 
     def test_json_stringified_names(self):
@@ -519,7 +534,7 @@ class TestFromIntentArgs:
             "params": {"timeout": "1200"},
         })
         assert spec.params == {"timeout": "1200"}
-        assert spec.duration_seconds == 600  # recommended default, not hoisted
+        assert spec.duration_seconds == 300  # recommended default, not hoisted
 
     def test_missing_duration_gets_recommended_default(self):
         spec = FaultSpec.from_intent_args({
@@ -527,7 +542,7 @@ class TestFromIntentArgs:
             "namespace": "default", "names": ["p1"],
             "params": {"percent": "80"},
         })
-        assert spec.duration_seconds == 600
+        assert spec.duration_seconds == 300
 
     def test_explicit_duration_seconds_respected(self):
         spec = FaultSpec.from_intent_args({

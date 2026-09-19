@@ -12,7 +12,7 @@ name = "blade-ai"
 # Versions are coordinated across pyproject.toml, tui/package.json, and
 # src/chaos_agent/__init__.py. The M11 release.yml guards enforce
 # tag↔file equality before publishing — bump all three in one commit.
-version = "0.7.0"
+version = "0.7.1"
 description = "Chaos Engineering Agent for Kubernetes fault injection"
 
 authors = [
@@ -129,4 +129,5 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
     "golden: LLM-behaviour golden scenarios (T1.14 Phase 0, mock-LLM contract; corpus: tests/golden/scenarios/)",
+    "network: key-gated real-provider runs that hit the network (default skip without BLADE_AI_LLM_API_KEY; deselect with -m 'not network')",
 ]

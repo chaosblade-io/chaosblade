@@ -10,6 +10,12 @@ fault-type knowledge: duration policy, timeout normalization, category
 extraction, and K8s quantity parsing.
 """
 
+from __future__ import annotations
+
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 def normalize_timeout_flag(argv: list[str]) -> str | None:
     """Normalize one ``--timeout`` argument in-place and return its value.
@@ -55,32 +61,32 @@ def normalize_timeout_flag(argv: list[str]) -> str | None:
 
 
 # Minimum recommended duration per fault type (scope, target, action)
-# All values >= 600s per requirement. Based on empirical measurement of
+# All values >= 300s per requirement. Based on empirical measurement of
 # Layer1 + Layer2 verification latency + ChaosBlade scheduling delay.
 _FAULT_TYPE_MIN_DURATION: dict[tuple[str, str, str], int] = {
     # Node-level: high latency (kubectl debug + host-level commands)
-    ("node", "disk", "fill"): 600,
-    ("node", "network", "drop"): 600,
-    ("node", "cpu", "fullload"): 600,
-    ("node", "mem", "load"): 600,
-    ("node", "disk", "burn"): 600,
+    ("node", "disk", "fill"): 300,
+    ("node", "network", "drop"): 300,
+    ("node", "cpu", "fullload"): 300,
+    ("node", "mem", "load"): 300,
+    ("node", "disk", "burn"): 300,
     # Pod-level: medium latency (kubectl top/exec/describe)
-    ("pod", "cpu", "fullload"): 600,
-    ("pod", "mem", "load"): 600,
-    ("pod", "network", "drop"): 600,
-    ("pod", "disk", "fill"): 600,
-    ("pod", "disk", "burn"): 600,
-    ("pod", "process", "kill"): 600,
+    ("pod", "cpu", "fullload"): 300,
+    ("pod", "mem", "load"): 300,
+    ("pod", "network", "drop"): 300,
+    ("pod", "disk", "fill"): 300,
+    ("pod", "disk", "burn"): 300,
+    ("pod", "process", "kill"): 300,
     # Container-level
-    ("container", "cpu", "fullload"): 600,
-    ("container", "mem", "load"): 600,
-    ("container", "network", "drop"): 600,
+    ("container", "cpu", "fullload"): 300,
+    ("container", "mem", "load"): 300,
+    ("container", "network", "drop"): 300,
 }
 
 # Default minimum duration when fault type is not in the table
-# Must be >= 600s per requirement. This is the ABSOLUTE safety floor:
+# Must be >= 300s per requirement. This is the ABSOLUTE safety floor:
 # the operator-configured ``experiment_timeout`` is clamped up to it.
-_DEFAULT_MIN_DURATION = 600
+_DEFAULT_MIN_DURATION = 300
 
 
 def _configured_experiment_timeout() -> int:
@@ -113,15 +119,16 @@ def ensure_min_duration(
     target: str | None,
     action: str | None,
 ) -> int:
-    """Ensure timeout meets the minimum recommended duration for the fault type.
+    """Resolve the effective timeout for a fault type (single source of truth).
 
-    This is the SINGLE source of truth for duration auto-boost logic.
     Called from the blade_create tool and CLI.
 
     When no timeout is specified, the operator-configured
     ``experiment_timeout`` (see settings) is the injected default,
     never below the per-fault-type empirical floor. Explicit timeouts
-    above the floor pass through untouched.
+    pass through untouched — an explicitly requested duration below the
+    floor is honoured verbatim with a warning (the executor must not
+    unilaterally amend a contract-stated duration, in either direction).
 
     Args:
         timeout_value: Current --timeout value (0, None, or a positive int/string).
@@ -145,7 +152,16 @@ def ensure_min_duration(
         # Unspecified: inject the configured default, clamped to the floor.
         return max(_configured_experiment_timeout(), floor)
     if current < floor:
-        return floor
+        # Explicit but below floor: honour the caller's value verbatim and
+        # make the requested-vs-recommended gap visible. Raising it would
+        # be the same defect as downgrading one (DNS-hijack discipline);
+        # too-tight windows exit honestly as unverified/partial instead.
+        logger.warning(
+            "Explicit timeout %ss is below the recommended %ss floor for "
+            "fault type (%s, %s, %s); applying the requested %ss verbatim.",
+            current, floor, scope, target, action, current,
+        )
+        return current
     return current
 
 

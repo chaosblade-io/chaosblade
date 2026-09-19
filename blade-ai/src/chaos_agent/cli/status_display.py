@@ -7,6 +7,7 @@ import logging
 
 from chaos_agent.config.settings import settings
 from chaos_agent.observability.status_tracker import (
+    elided_preview,
     StatusCategory,
     StatusEvent,
     StatusPhase,
@@ -56,9 +57,23 @@ def format_status_event(event: StatusEvent) -> str:
 
     stdout_preview = event.detail.get("stdout_preview", "")
     if stdout_preview:
-        preview_text = stdout_preview[:200]
-        if len(stdout_preview) > 200:
-            preview_text += "..."
+        # Failure previews keep BOTH ends (elided_preview): the causal line
+        # sits at different ends for different tools, and the producer may
+        # itself have elided the middle — re-eliding the combined string
+        # still preserves its two anchors (head of the head, tail of the
+        # tail) while the marker makes every cut visible (#31: a head-only
+        # cut kept the kubectl warning banner and hid "Error from server
+        # (NotFound)"). Success previews keep the head.
+        _failed = (
+            event.phase == StatusPhase.FAILED
+            or event.detail.get("exit_code") not in (None, 0)
+        )
+        if _failed:
+            preview_text = elided_preview(stdout_preview, 100, 200)
+        else:
+            preview_text = stdout_preview[:200]
+            if len(stdout_preview) > 200:
+                preview_text += "..."
         indented_preview = preview_text.replace("\n", "\n      ")
         line += f"\n      → output: {indented_preview}"
 

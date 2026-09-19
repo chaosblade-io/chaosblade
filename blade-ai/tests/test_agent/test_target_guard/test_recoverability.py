@@ -477,3 +477,187 @@ class TestTimerArmedFreezerSuspend:
     def test_bare_freeze_without_timer_not_recoverable(self):
         cmd = f"echo FROZEN > {self._FREEZER_PATH}"
         assert assess(cmd, "process").recoverable is False
+
+
+class TestNetworkZeroMutationRouting:
+    """B34: a network-family command with NO mutation verb is not "missing
+    a paired inverse" — there is nothing to invert. The rejection keeps
+    failing closed, but its guidance points at the FORM (split into
+    single-statement probes), never at a phantom ``iptables -D``."""
+
+    def test_zero_mutation_compound_is_rejected_as_unproven(self):
+        # The B34 shape: compound read-only inspection that fell through
+        # the probe face (redirect here). Fail-closed, but honest cause.
+        cmd = "chroot /host sh -c 'iptables -S INPUT > /tmp/out'"
+        verdict = assess(cmd, "network")
+        assert verdict.recoverable is False
+        assert verdict.readonly_unproven is True
+        # The phantom-inverse guidance is gone.
+        assert not any("paired inverse" in m for m in verdict.missing)
+        assert any("single-statement" in m for m in verdict.missing)
+
+    def test_zero_mutation_even_with_a_timer_still_unproven(self):
+        # A timer cannot fix a form problem — the guidance must not
+        # collapse into "only the missing reversal blocks it".
+        cmd = "chroot /host sh -c 'sleep 60; iptables -S INPUT'"
+        verdict = assess(cmd, "network")
+        assert verdict.recoverable is False
+        assert verdict.readonly_unproven is True
+
+    def test_real_mutation_keeps_the_reversal_frame(self):
+        cmd = "chroot /host sh -c 'iptables -I INPUT -s 10.0.0.1 -j DROP'"
+        verdict = assess(cmd, "network")
+        assert verdict.recoverable is False
+        assert verdict.readonly_unproven is False
+        assert any("paired inverse" in m for m in verdict.missing)
+
+    def test_delete_only_cleanup_keeps_the_reversal_frame(self):
+        # ``-D`` is a mutation verb even though nothing was inserted —
+        # the reversal frame (timer + paired re-insert) is the honest one.
+        cmd = "chroot /host sh -c 'iptables -D INPUT 1'"
+        verdict = assess(cmd, "network")
+        assert verdict.readonly_unproven is False
+
+    def test_long_option_mutation_keeps_the_reversal_frame(self):
+        # ``--insert`` joined the detectable verbs at the B34 fix —
+        # previously invisible, it read as "zero mutations".
+        cmd = "chroot /host sh -c 'iptables --insert INPUT 1 -s 10.0.0.1 -j DROP'"
+        verdict = assess(cmd, "network")
+        assert verdict.recoverable is False
+        assert verdict.readonly_unproven is False
+
+    def test_long_option_insert_delete_pairing_is_recoverable(self):
+        cmd = (
+            "iptables --insert INPUT 1 -s 10.0.0.1 -j DROP && "
+            "systemd-run --on-active=60s sh -c "
+            "'iptables --delete INPUT 1 -s 10.0.0.1 -j DROP'"
+        )
+        assert assess(cmd, "network").recoverable is True
+
+    def test_mutation_verb_in_next_segment_does_not_pair_across_the_pipe(self):
+        # The detector's gap cannot cross a separator: ``grep -i`` in the
+        # next stage must not read as an ``-i`` insert verb next to the
+        # ``iptables`` in this stage (B34's exact compound shape).
+        from chaos_agent.agent.target_guard.recoverability import (
+            _network_has_mutation_verb,
+        )
+
+        assert not _network_has_mutation_verb("iptables -s input | grep -i drop")
+        assert _network_has_mutation_verb("iptables -i input 1 -j drop")
+
+    def test_readonly_listing_forms_are_not_mutations(self):
+        from chaos_agent.agent.target_guard.recoverability import (
+            _network_has_mutation_verb,
+        )
+
+        assert not _network_has_mutation_verb("iptables -s input")
+        assert not _network_has_mutation_verb("iptables -t nat -l -n")
+        assert not _network_has_mutation_verb("tc qdisc show dev eth0")
+        assert not _network_has_mutation_verb("nft list ruleset")
+
+
+class TestSocatPortListener:
+    """socat TCP-LISTEN as the port-occupation fault vocabulary (B32 guard gap).
+
+    Regression anchor: case-32 (Node_网络故障_节点端口占用). The skill case's
+    law settled on ``socat TCP-LISTEN`` because nc is absent on the cluster's
+    hosts — but the guard's family whitelist and the bounded-listener
+    recovery rule only knew ``nc -l``, so the documented shape was rejected
+    (family_mismatch) and the model paid a detour tax to find an alternate
+    form. Both layers now match the case law, with the shape boundary
+    fail-closed: EXEC:/SYSTEM:/SHELL: addresses turn a listener into
+    arbitrary command execution (the classic bind-shell) and stay
+    unclassified, and an unbounded listener stays unrecoverable.
+    """
+
+    def test_socat_listen_classifies_as_network(self):
+        # The exact case-32 carrier payload (minus the kill sibling):
+        assert classify_host_operation(
+            "nohup timeout 180 socat TCP-LISTEN:9100,reuseaddr,fork "
+            "OPEN:/dev/null"
+        ) == "network"
+
+    def test_kill_plus_socat_compound_classifies_as_network(self):
+        # The full case-32 payload: kill (process) + socat (network) —
+        # TWO families, so classify still fails closed by design (the
+        # compound must be split); a kill in ANOTHER segment does not
+        # void the socat family.
+        assert classify_host_operation("kill 2351338") == "process"
+        assert classify_host_operation(
+            "kill 2351338; sleep 1; nohup timeout 180 socat "
+            "TCP-LISTEN:9100,reuseaddr,fork OPEN:/dev/null"
+        ) == ""
+
+    def test_socat_exec_address_stays_unclassified(self):
+        # Bind-shell form: listener wired to a command-exec address —
+        # the port-occupation family must NOT adopt it.
+        assert classify_host_operation(
+            "timeout 180 socat TCP-LISTEN:9100 EXEC:/bin/sh"
+        ) == ""
+
+    def test_socat_system_and_shell_addresses_stay_unclassified(self):
+        assert classify_host_operation(
+            "timeout 180 socat TCP-LISTEN:9100 SYSTEM:'echo pwned'"
+        ) == ""
+        assert classify_host_operation(
+            "timeout 180 socat TCP-LISTEN:9100 SHELL"
+        ) == ""
+
+    def test_socat_danger_scan_has_no_character_cap(self):
+        # Regression anchor for the de-windowed danger scan: the former
+        # {0,200} window was an implementation seam — 200+ chars of
+        # option padding pushed EXEC:/SYSTEM:/SHELL past the scan while
+        # the LISTEN form still matched, so a timeout-bounded bind-shell
+        # sailed through BOTH the family gate and the recovery gate
+        # (2026-09-10 self-audit of the #32 socat extension). The
+        # segment bound — not a character count — is the boundary.
+        pad = "nodelay,keepalive,reuseaddr,linger=1," * 6  # 216 > 200
+        # Smuggled comma-address form: EXEC rides the LISTEN option run.
+        assert classify_host_operation(
+            f"nohup timeout 180 socat TCP-LISTEN:9100,{pad}EXEC:/bin/sh"
+        ) == ""
+        # Legal-address form: a second socat address after the padding.
+        assert classify_host_operation(
+            f"nohup timeout 180 socat TCP-LISTEN:9100,reuseaddr,fork,{pad} "
+            "EXEC:/bin/sh"
+        ) == ""
+        # The SYSTEM:/SHELL vocabularies ride the same seam.
+        assert classify_host_operation(
+            f"nohup timeout 180 socat TCP-LISTEN:9100,{pad}SYSTEM:/bin/sh"
+        ) == ""
+        assert classify_host_operation(
+            f"nohup timeout 180 socat TCP-LISTEN:9100,{pad}SHELL"
+        ) == ""
+
+    def test_socat_danger_scan_still_segment_bounded(self):
+        # De-windowing must NOT widen the scan across segments: EXEC: in
+        # a different ``;``-delimited segment does not void the socat
+        # family — the danger has to ride the socat segment itself.
+        assert classify_host_operation(
+            "echo EXEC:; nohup timeout 180 socat TCP-LISTEN:9100,"
+            "reuseaddr,fork OPEN:/dev/null"
+        ) == "network"
+
+    def test_client_mode_socat_is_not_a_fault(self):
+        # No LISTEN address → plain client, not an occupation.
+        assert classify_host_operation(
+            "timeout 10 socat - TCP:127.0.0.1:9100"
+        ) == ""
+
+    def test_bounded_socat_listener_is_recoverable(self):
+        assert assess(
+            "nohup timeout 180 socat TCP-LISTEN:9100,reuseaddr,fork "
+            "OPEN:/dev/null",
+            "network",
+        ).recoverable is True
+
+    def test_unbounded_socat_listener_not_recoverable(self):
+        verdict = assess(
+            "nohup socat TCP-LISTEN:9100,reuseaddr,fork OPEN:/dev/null",
+            "network",
+        )
+        assert verdict.recoverable is False
+
+    def test_bounded_nc_listener_still_recoverable(self):
+        # The nc vocabulary this rule generalises keeps working.
+        assert assess("timeout 180 nc -l -p 9100", "network").recoverable is True

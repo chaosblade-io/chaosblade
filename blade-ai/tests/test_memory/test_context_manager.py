@@ -10,6 +10,7 @@ new module, fully covered by ``TestLayer4HeuristicFallback`` and
 ``TestMessageAggregation`` over there.
 """
 
+import logging
 from unittest.mock import MagicMock
 
 from chaos_agent.memory.context_manager import (
@@ -17,7 +18,7 @@ from chaos_agent.memory.context_manager import (
     CompactTrackingState,
     ContextManager,
     MAX_CONSECUTIVE_COMPACT_FAILURES,
-    STRIP_MARKER,
+    MAX_SUMMARY_SHARE_OF_RESERVE,
     TokenWarningState,
     calculate_token_warning_state,
     ensure_pair_integrity,
@@ -473,7 +474,9 @@ class TestStripLargeOutputs:
         long_content = "x" * 3000
         msgs = [self._make_tool_msg(long_content)]
         result = strip_large_outputs(msgs)
-        assert STRIP_MARKER in result[0].content
+        # Quantified elision marker (shared dialect) — the hidden middle
+        # is visible, not silent.
+        assert "chars elided" in result[0].content
         assert len(result[0].content) < len(long_content)
 
     def test_head_and_tail_preserved(self):
@@ -495,10 +498,271 @@ class TestStripLargeOutputs:
         # Default threshold (2000) — should not strip
         result_default = strip_large_outputs(msgs)
         assert result_default[0].content == content
-        # Custom threshold (100) — should strip
-        result_custom = strip_large_outputs(msgs, threshold=100)
-        assert STRIP_MARKER in result_custom[0].content
+        # Custom threshold mirroring the hook's live path (1000): content
+        # above BOTH the threshold and elided_preview's own passthrough
+        # boundary (head+tail=1000) gets the quantified both-ends cut.
+        # Fresh mock — strip_large_outputs mutates plain mocks in place,
+        # so reusing one across calls would compare against the ALREADY
+        # stripped content.
+        long_content = "x" * 1500
+        result_custom = strip_large_outputs(
+            [self._make_tool_msg(long_content)], threshold=1000
+        )
+        assert "chars elided" in result_custom[0].content
+        # 1000 < len <= 2000 under the DEFAULT threshold: untouched (the
+        # threshold gate must run first — elided_preview alone would elide).
+        result_default_long = strip_large_outputs([self._make_tool_msg(long_content)])
+        assert result_default_long[0].content == long_content
 
     def test_empty_messages(self):
         result = strip_large_outputs([])
         assert result == []
+
+
+class TestCompactionBoundaryFailClosed:
+    """to_keep head orphan recycling must be fail-closed (issue #1344 sig #2).
+
+    Uses REAL langchain messages — the boundary loop checks ``msg.type ==
+    "tool"``, which a MagicMock attribute (itself a MagicMock) never equals.
+
+    Sizing discipline (a wrong size silently skips the code under test):
+    the head ToolMessages must FIT the reserve so pass 2 keeps them and the
+    BOUNDARY LOOP is what moves them; the filler must overflow the reserve so
+    the split lands before it. Sizes are verified with the production token
+    counter instead of guessed.
+    """
+
+    RESERVE = 80
+    CM_LOGGER = "chaos_agent.memory.context_manager"
+
+    def _cm(self):
+        cm = ContextManager(max_tokens=100)
+        cm.reserve_tokens = self.RESERVE
+        return cm
+
+    @staticmethod
+    def _tokens(msg) -> int:
+        from chaos_agent.memory.tokens import count_tokens_messages
+
+        return count_tokens_messages([msg]).count
+
+    def _assert_fits_reserve(self, kept_msgs):
+        total = sum(self._tokens(m) for m in kept_msgs)
+        assert total <= self.RESERVE, (
+            f"test sizing broken: head messages need {total} tokens > "
+            f"reserve {self.RESERVE}; they would never reach the boundary loop"
+        )
+
+    def _split(self, msgs):
+        to_compact, to_keep, _valid = self._cm().check_context(msgs)
+        return to_compact, to_keep
+
+    def test_head_tool_with_caller_in_compact_moves(self, caplog):
+        """Spec: caller 在 to_compact 中——配对移动 (no orphan warning)."""
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        caller = AIMessage(content="old " * 250, tool_calls=[
+            {"name": "t", "args": {}, "id": "c1", "type": "tool_call"},
+        ])
+        tool = ToolMessage(content="result " * 8, tool_call_id="c1")
+        tail = HumanMessage(content="recent " * 8)
+        self._assert_fits_reserve([tool, tail])
+        filler = HumanMessage(content="x " * 500)
+        with caplog.at_level(logging.WARNING, logger=self.CM_LOGGER):
+            to_compact, to_keep = self._split([filler, caller, tool, tail])
+        assert caller in to_compact
+        assert tool in to_compact  # boundary loop moved it back to pair
+        assert tail in to_keep
+        # caller found — paired move, so the orphan WARNING must not fire
+        assert "ORPHAN" not in caplog.text
+
+    def test_orphan_head_tool_still_moves_fail_closed(self, caplog):
+        """Spec: caller 查不到——仍移动（fail-closed）+ WARNING.
+
+        The old code did ``break`` here and left the orphan at the head of
+        to_keep, shipping it to the provider on the next call.
+        """
+        from langchain_core.messages import HumanMessage, ToolMessage
+
+        orphan = ToolMessage(content="stale " * 8, tool_call_id="gone")
+        tail = HumanMessage(content="recent " * 8)
+        self._assert_fits_reserve([orphan, tail])
+        filler = HumanMessage(content="x " * 500)
+        with caplog.at_level(logging.WARNING, logger=self.CM_LOGGER):
+            to_compact, to_keep = self._split([filler, orphan, tail])
+        assert orphan in to_compact  # fail-closed: moved despite missing caller
+        assert orphan not in to_keep
+        assert tail in to_keep
+        assert "ORPHAN ToolMessage" in caplog.text
+        assert "gone" in caplog.text
+
+    def test_consecutive_orphans_all_recycled(self):
+        """The loop continues through consecutive head ToolMessages."""
+        from langchain_core.messages import HumanMessage, ToolMessage
+
+        o1 = ToolMessage(content="r1 " * 8, tool_call_id="g1")
+        o2 = ToolMessage(content="r2 " * 8, tool_call_id="g2")
+        tail = HumanMessage(content="recent " * 8)
+        self._assert_fits_reserve([o1, o2, tail])
+        filler = HumanMessage(content="x " * 500)
+        to_compact, to_keep = self._split([filler, o1, o2, tail])
+        assert o1 in to_compact and o2 in to_compact
+        assert not any(getattr(m, "type", "") == "tool" for m in to_keep)
+
+    def test_non_tool_head_stops_loop_immediately(self):
+        """Spec: 头部之后不受影响——first non-summary non-tool message stops."""
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        # A paired round fully inside to_keep: the head is an AI message, so
+        # the boundary loop must stop and NOT touch the ToolMessage behind it.
+        caller = AIMessage(content="", tool_calls=[
+            {"name": "t", "args": {}, "id": "k1", "type": "tool_call"},
+        ])
+        tool = ToolMessage(content="kept result", tool_call_id="k1")
+        self._assert_fits_reserve([caller, tool])
+        filler = HumanMessage(content="x " * 500)
+        to_compact, to_keep = self._split([filler, caller, tool])
+        assert filler in to_compact
+        assert caller in to_keep and tool in to_keep  # pair stays in to_keep
+
+    def test_recycled_summary_does_not_reorder_to_compact(self):
+        """A moved message must land at its CHRONOLOGICAL position.
+
+        The boundary loop ``append``s, which is only the right home when
+        to_compact's tail is the message just before the moved one. The
+        recent-window pass SKIPS summaries without spending budget, so a
+        RECYCLED summary can sit in to_compact at a position LATER than a kept
+        message the loop then moves — measured ``[0, 2, 1]`` before the
+        re-sort. to_compact is the summariser's input, so that is a real (if
+        mild) quality regression rather than a cosmetic one.
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
+        from chaos_agent.memory.context_manager import COMPRESSED_HISTORY_PREFIX
+
+        orphan = ToolMessage(content="stale " * 8, tool_call_id="gone")
+        tail = HumanMessage(content="recent " * 8)
+        self._assert_fits_reserve([orphan, tail])
+        # Oversized so the summary share (reserve * 0.5) recycles it instead of
+        # keeping it verbatim — recycling is what puts it in to_compact at a
+        # position LATER than ``orphan``, which is the whole scenario.
+        summary = SystemMessage(
+            content=f"{COMPRESSED_HISTORY_PREFIX}\n" + "s " * 500
+        )
+        assert self._tokens(summary) > self.RESERVE * MAX_SUMMARY_SHARE_OF_RESERVE, (
+            "test sizing broken: the summary would be kept verbatim and never "
+            "reach to_compact, so nothing would sit out of order"
+        )
+        filler = HumanMessage(content="x " * 500)
+
+        msgs = [filler, orphan, summary, tail]
+        pos = {id(m): i for i, m in enumerate(msgs)}
+        to_compact, to_keep = self._split(msgs)
+
+        # Anti-vacuity: ``orphan`` was kept by the recent-window pass, so it is
+        # in to_compact ONLY if the boundary loop moved it. Without this the
+        # ordering assertion would pass on an unmoved (already sorted) list.
+        assert orphan in to_compact, "boundary loop did not move the orphan"
+        assert summary in to_compact
+        assert len(to_keep) == 1 and tail in to_keep
+
+        positions = [pos[id(m)] for m in to_compact]
+        assert positions == sorted(positions), (
+            f"to_compact is out of chronological order: {positions}"
+        )
+
+    def test_summary_interleaved_between_head_tools_does_not_skip_one(self):
+        """A summary sitting between two head tools must not STOP the scan.
+
+        Every other case here holds a run of CONSECUTIVE head ToolMessages, so
+        the ``continue`` that steps over a kept summary is never exercised —
+        no summary ever lands mid-scan. This one puts a verbatim-kept summary
+        between two tools, which is the only shape where treating it as a
+        boundary (``break`` instead of ``continue``) leaves the SECOND tool at
+        the head of to_keep to ship unpaired.
+
+        Both off-by-one mutations of this loop were measured, and they are
+        killed by different tests, so neither shape is redundant:
+
+        * ``continue`` → ``break`` at the summary: only THIS test fails.
+        * ``i += 1`` added after ``pop(i)``: this test still PASSES — popping
+          shifts the summary down to ``i``, so the increment lands on the
+          second tool anyway. That mutant is killed by the consecutive-orphan
+          cases instead, where the increment jumps straight to the tail and
+          breaks. An earlier draft of this docstring claimed the opposite
+          causality; it was wrong and is corrected here.
+
+        Measured shape: to_compact ``[filler, tool, tool]``, to_keep
+        ``[summary, tail]``.
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
+        from chaos_agent.memory.context_manager import COMPRESSED_HISTORY_PREFIX
+
+        # Small enough to be KEPT verbatim — a recycled summary lands in
+        # to_compact instead and never interleaves with the head tools.
+        summary = SystemMessage(
+            content=f"{COMPRESSED_HISTORY_PREFIX}\n" + "s " * 6
+        )
+        assert self._tokens(summary) <= self.RESERVE * MAX_SUMMARY_SHARE_OF_RESERVE, (
+            "test sizing broken: the summary would be recycled into to_compact, "
+            "so the two branches would never alternate"
+        )
+        t1 = ToolMessage(content="r1 " * 8, tool_call_id="g1")
+        t2 = ToolMessage(content="r2 " * 8, tool_call_id="g2")
+        tail = HumanMessage(content="recent " * 8)
+        self._assert_fits_reserve([t1, summary, t2, tail])
+        filler = HumanMessage(content="x " * 500)
+
+        to_compact, to_keep = self._split([filler, t1, summary, t2, tail])
+
+        assert t1 in to_compact and t2 in to_compact, \
+            "both head tools must be recycled, not just the one before the summary"
+        assert summary in to_keep, "a verbatim-kept summary is not the loop's business"
+        assert not any(getattr(m, "type", "") == "tool" for m in to_keep)
+
+    def test_to_keep_drained_entirely_exits_without_index_error(self):
+        """``while i < len(messages_to_keep)`` when the loop empties the list.
+
+        Every other case keeps a tail message behind, so the loop always exits
+        by hitting a non-tool head. With nothing behind the tools it exits by
+        draining instead, and ``messages_to_keep[i]`` is read at the TOP of each
+        iteration — an off-by-one there raises IndexError inside compaction, on
+        the hook path, which would take the whole turn down.
+        """
+        from langchain_core.messages import HumanMessage, ToolMessage
+
+        t1 = ToolMessage(content="r1 " * 8, tool_call_id="g1")
+        t2 = ToolMessage(content="r2 " * 8, tool_call_id="g2")
+        self._assert_fits_reserve([t1, t2])
+        filler = HumanMessage(content="x " * 500)
+
+        to_compact, to_keep = self._split([filler, t1, t2])
+
+        assert to_keep == [], "everything was recyclable, so nothing is kept"
+        assert t1 in to_compact and t2 in to_compact
+        assert filler in to_compact
+
+    def test_empty_to_compact_skips_the_scan_because_nothing_is_compacting(self):
+        """The guard's other half, pinned so it is not mistaken for fail-open.
+
+        ``if messages_to_keep and messages_to_compact`` also skips the scan when
+        to_compact is EMPTY, which leaves a head orphan in to_keep. That is not
+        the fail-open this class closes: ``check_context`` returns
+        ``is_valid=True`` here, meaning no compaction was warranted at all, so
+        there is no summary to recycle the orphan into and moving it would
+        destroy content for nothing. The messages ship as they are and the
+        send-side gate (utils/message_integrity.py) remains the defence — the
+        same layering the boundary loop's own comment relies on.
+        """
+        from langchain_core.messages import HumanMessage, ToolMessage
+
+        orphan = ToolMessage(content="stale", tool_call_id="gone")
+        tail = HumanMessage(content="hi")
+
+        to_compact, to_keep, valid = self._cm().check_context([orphan, tail])
+
+        assert to_compact == [], "nothing overflowed, so there is nothing to compact"
+        assert valid is True, "no compaction warranted — this is not the blocked path"
+        assert orphan in to_keep, \
+            "the scan is skipped, so the orphan stays; the send-side gate owns it"

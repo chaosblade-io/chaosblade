@@ -45,6 +45,12 @@ class _FullSeamFakeProvider:
     # Phase-8 Form A seam: namespaces hosting injection-infrastructure
     # pods — exempt from cross-namespace drift rejection (Tier 1).
     tool_pod_namespaces = frozenset({"my-tool-ns"})
+    # Create-reconcile gate (D6) declaration pair: the fake's create is
+    # non-idempotent (under the gate) and ``my_read`` is its reconciliation
+    # read — deliberately non-builtin vocabulary, so any gate pass here is
+    # by registration, never by hardcoding.
+    reconcile_create_tool_names = frozenset({"my_tool"})
+    reconcile_read_tool_names = frozenset({"my_read"})
 
     def matches_channel(self, profile: str) -> bool:
         return True
@@ -78,7 +84,7 @@ class _FullSeamFakeProvider:
     # ``was_injection_attempted`` stays False: the fake is an
     # experiment-UID carrier, and the native back-scan vocabulary is the
     # native carriers' own.
-    def scan_step_actions(self, steps, messages):
+    def scan_step_actions(self, steps, messages, *, is_teardown=None):
         required = {"my_verb": step for step in steps if "my_verb" in step}
         executed = {
             "my_verb"
@@ -88,8 +94,42 @@ class _FullSeamFakeProvider:
         }
         return StepActionScan(required=required, executed=executed)
 
-    def was_injection_attempted(self, messages):
+    def was_injection_attempted(self, messages, *, is_teardown=None):
         return False
+
+    # Create-reconcile seam (D6), with REAL hook logic — the same
+    # registration-extensibility proof as the Form B hooks above: the
+    # identity vocabulary (``ns-x`` / ``w1``) is the fake's own, so any
+    # fingerprint reaching the assertions below flowed through dispatch.
+    def build_reconcile_fingerprint(self, tool_name, tool_args):
+        if tool_name != "my_tool":
+            return None
+        from chaos_agent.tools.request_identity import RequestFingerprint
+
+        return RequestFingerprint(namespace="ns-x", target_names="w1")
+
+    async def reconcile_hold_feedback(
+        self, tool_name, fp, hold_count, block_limit,
+        kubeconfig="", task_id="",
+    ):
+        if tool_name != "my_tool":
+            return None
+        from chaos_agent.tools.markers import GATE_RECONCILE_BLOCKED_MARKER
+
+        return (
+            f"{GATE_RECONCILE_BLOCKED_MARKER} fake hold #{hold_count}/"
+            f"{block_limit} for {fp.target_names}",
+            True,
+        )
+
+    def reconcile_batch_held_feedback(self, tool_name, other_tool_name):
+        if tool_name != "my_tool":
+            return None
+        return (
+            f"Error: tool call `{other_tool_name}` was NOT executed — a "
+            f"my_tool in this same batch was held by the create-reconcile "
+            f"gate, so the whole batch was held back."
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -241,3 +281,64 @@ class TestRegistrationIsTheWholeFeature:
         et = infer_effective_target("no_such_tool", {"x": 1})
         assert et.scope == "__unknown__"
         assert FaultProviderRegistry.parse_injection_params("no_such_tool", {}) is None
+
+    # -- create-reconcile seam (blade-create-reconcile-before-retry D6) --
+
+    def test_reconcile_declaration_pair_aggregates(self):
+        """D6 declaration pair: the gate's create/read tool unions
+        aggregate the registered provider's declarations."""
+        assert FaultProviderRegistry.union_tool_names(
+            "reconcile_create_tool_names"
+        ) == frozenset({"my_tool"})
+        assert FaultProviderRegistry.union_tool_names(
+            "reconcile_read_tool_names"
+        ) == frozenset({"my_read"})
+
+    def test_reconcile_fingerprint_reaches_the_registered_provider(self):
+        """D6 fingerprint seam: the gate's request identity for ``my_tool``
+        is the fake's own (``ns-x`` / ``w1`` is registered vocabulary — a
+        builtin's material could never produce it), and an unclaimed tool
+        passes through as ``None`` so the registry scan continues."""
+        fp = FaultProviderRegistry.build_reconcile_fingerprint("my_tool", {"x": 1})
+        assert fp is not None
+        assert fp.namespace == "ns-x"
+        assert fp.target_names == "w1"
+        assert FaultProviderRegistry.build_reconcile_fingerprint("my_read", {}) is None
+
+    async def test_reconcile_hold_feedback_reaches_the_registered_provider(self):
+        """D6 hold-feedback seam: dispatch returns the fake's
+        marker-headed hold notice plus its reconciliation verdict, and an
+        unclaimed tool passes through as ``None`` (no probe side effects)."""
+        from chaos_agent.tools.markers import GATE_RECONCILE_BLOCKED_MARKER
+
+        fp = FaultProviderRegistry.build_reconcile_fingerprint("my_tool", {"x": 1})
+        outcome = await FaultProviderRegistry.reconcile_hold_feedback(
+            "my_tool", fp, 1, 2
+        )
+        assert outcome is not None
+        text, gate_reconciled = outcome
+        assert text.startswith(GATE_RECONCILE_BLOCKED_MARKER)
+        assert "fake hold #1/2" in text
+        assert "w1" in text
+        assert gate_reconciled is True
+        assert (
+            await FaultProviderRegistry.reconcile_hold_feedback("my_read", fp, 1, 2)
+            is None
+        )
+
+    def test_reconcile_batch_held_feedback_reaches_the_registered_provider(self):
+        """D6 batch-held seam: the fabricated notice for a batch-mate of a
+        held ``my_tool`` flows through dispatch (non-execution wording
+        naming the held call), and an unclaimed tool passes through."""
+        text = FaultProviderRegistry.reconcile_batch_held_feedback(
+            "my_tool", "my_read"
+        )
+        assert text is not None
+        assert "NOT executed" in text
+        assert "my_read" in text
+        assert (
+            FaultProviderRegistry.reconcile_batch_held_feedback(
+                "my_read", "my_tool"
+            )
+            is None
+        )

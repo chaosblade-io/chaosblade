@@ -34,21 +34,33 @@ from chaos_agent.agent.providers import (
     FaultProviderRegistry,
     ProviderPrompts,
 )
+# ChaosbladeProvider / HostShellProvider are imported for the two POINT-NAMED
+# tests (the minimal-registry resolution test / the blocks_deterministic_
+# destroy contrast) — NOT for the parametrization domain: that is derived
+# from the registry now (see BUILTIN_PROVIDERS below).
 from chaos_agent.agent.providers.chaosblade.provider import ChaosbladeProvider
-from chaos_agent.agent.providers.chaosblade.python_provider import ChaosbladePythonProvider
 from chaos_agent.agent.providers.host_shell.provider import HostShellProvider
-from chaos_agent.agent.providers.k8s_native.provider import K8sNativeProvider
+from chaos_agent.config.settings import settings
 from chaos_agent.agent.spec.fault_registry import (
     aggregate_cluster_scoped,
     all_families,
     family_for_scope,
 )
 
-# The built-in backends, in registration/precedence order. A new provider added
-# to ``register_builtins`` should be appended here so the whole suite covers it.
-BUILTIN_PROVIDERS = (
-    ChaosbladeProvider, K8sNativeProvider, HostShellProvider,
-    ChaosbladePythonProvider,
+# The built-in backends, in registration/precedence order — DERIVED, not
+# hand-enumerated (P-8R). The domain is snapshotted from the live registry at
+# collection time: importing ``chaos_agent.agent.providers`` (above) itself
+# runs the package's automatic ``register_builtins()`` bootstrap, and no
+# conftest in the chain registers anything at import time, so the snapshot is
+# exactly the pure builtin set; the autouse ``_isolate_registry`` fixture's
+# clear / re-register churn happens at RUN time, long after parametrization
+# was frozen. A provider added to ``register_builtins`` is therefore covered
+# by every parametrized tooth below with zero manual edits — the retired
+# hand-enumerated tuple + "append here" comment instead silently skipped the
+# whole suite for a forgotten provider (G-3, same lesson that drove F-14's
+# tree derivation).
+BUILTIN_PROVIDERS = tuple(
+    type(p) for p in FaultProviderRegistry.all_providers()
 )
 _ALL_PHASES = (PLAN, EXECUTE, VERIFY, RECOVER_VERIFY)
 _KNOWN_PROFILES = ("k8s", "host")
@@ -60,10 +72,43 @@ def _provider_id(cls) -> str:
 
 @pytest.fixture(autouse=True)
 def _isolate_registry():
+    # Explicit ON (the openspec faultdrill-cr-channel task-1.5 pinned
+    # intent, belatedly wired here): protocol conformance covers the CR
+    # channel too, and BUILTIN_PROVIDERS — snapshotted at collection
+    # time under the post-flip default — matches the runtime registration
+    # regardless of what an earlier test file left the flag at.
+    _orig = settings.faultdrill_enabled
+    settings.faultdrill_enabled = True
     FaultProviderRegistry.clear()
-    yield
-    FaultProviderRegistry.clear()
-    FaultProviderRegistry.register_builtins()
+    try:
+        yield
+    finally:
+        settings.faultdrill_enabled = _orig
+        FaultProviderRegistry.clear()
+        FaultProviderRegistry.register_builtins()
+
+
+def test_parametrization_domain_is_alive():
+    """Liveness anchor for the DERIVED parametrization domain (P-8R).
+
+    ``BUILTIN_PROVIDERS`` is snapshotted from the registry, so a broken
+    derivation (empty domain) fails loudly NOWHERE on its own — every
+    parametrized tooth in this suite would silently collect zero cases and
+    pass vacuously green. This is the one NON-parametrized tooth that reads
+    the domain: an empty or collapsed snapshot goes red here with a message
+    that names the failure mode. Anchor names are compared as STRINGS — no
+    concrete provider import for the domain, that duplication is exactly
+    what the derivation removed.
+    """
+    names = [cls.__name__ for cls in BUILTIN_PROVIDERS]
+    assert names, (
+        "BUILTIN_PROVIDERS is EMPTY — the registry snapshot derivation is "
+        "broken and every parametrized tooth in this suite is silently "
+        "passing vacuously green"
+    )
+    assert "K8sNativeProvider" in names, names  # derivation is real, not stub
+    # Today's builtin set: blade / k8s_native / host_shell / blade_python.
+    assert len(names) >= 4, names
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +163,33 @@ def test_tools_returns_a_list_for_every_phase(provider_cls):
 @pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
 def test_prompt_fragments_returns_provider_prompts(provider_cls):
     assert isinstance(provider_cls().prompt_fragments(), ProviderPrompts)
+
+
+@pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
+def test_six_scan_hooks_accept_is_teardown_matcher(provider_cls):
+    """P3 协议统一性牙（R17/G-2）：registry 的 detect_method 分发
+    （detect / injection_recency）与 agent seams（issue_disproven /
+    scan_step_actions / was_injection_attempted /
+    was_fault_create_attempted）都无条件传 ``is_teardown`` kwarg。
+    覆写钩子漏收参数 ⇒ 生产路径 runtime TypeError（刀3 实证：
+    K8sNativeProvider.was_fault_create_attempted 曾漏收，仅因 recover
+    测试恰好路过才当场抓到；其余四钩子按归因分发，新 provider 无
+    专属测试时签名漂移静默进生产）。本牙把炸点挪到测试期：六钩子
+    各以 matcher 实参空调用（全部纯消息扫描、无副作用），签名
+    漂移即红——兑现本套件「新增 backend 要么满足契约要么在此响亮
+    失败」的章程。"""
+    from chaos_agent.agent.execution_artifacts import make_teardown_matcher
+
+    prov = provider_cls()
+    matcher = make_teardown_matcher([])
+    prov.detect([], is_host=False, is_teardown=matcher)
+    prov.injection_recency([], is_host=False, is_teardown=matcher)
+    prov.issue_disproven([], is_teardown=matcher)
+    prov.scan_step_actions([], [], is_teardown=matcher)
+    prov.was_injection_attempted([], is_teardown=matcher)
+    prov.was_fault_create_attempted(
+        [], injection_method=None, is_teardown=matcher
+    )
 
 
 @pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
@@ -189,16 +261,29 @@ def test_method_index_covers_exactly_the_union_of_claimed_methods():
 
 def test_every_family_declares_aligned_carrier_types():
     """Each family's ``carrier_types`` is a non-empty tuple of real provider
-    carriers (name alignment invariant that makes the scope bridge resolvable)."""
+    carriers (name alignment invariant that makes the scope bridge resolvable).
+
+    "Real" accepts BOTH registration states: a carrier in the builtin
+    registry snapshot, OR a carrier with a REGISTERED DECLARATION whose
+    provider registration is flag-gated (dark launch —
+    ``faultdrill_cr`` while ``faultdrill_enabled`` is off: declaration
+    registered at the assembly point, provider structurally absent).
+    ``resolve_by_scope`` skips absent carriers by design (its own test
+    below), so the bridge stays resolvable; the declaration registry
+    keeps the typo protection (an entry in NEITHER set is still a
+    hard failure)."""
+    from chaos_agent.agent.spec import fault_registry
+
     families = all_families()
     assert families  # at least the built-in k8s + host families
     builtin_carriers = {cls().carrier for cls in BUILTIN_PROVIDERS}
+    declared_carriers = set(fault_registry._CARRIER_VOCAB)
     for family in families:
         assert isinstance(family.carrier_types, tuple)
         assert family.carrier_types
         for carrier in family.carrier_types:
             assert isinstance(carrier, str) and carrier.strip() == carrier and carrier
-            assert carrier in builtin_carriers
+            assert carrier in builtin_carriers or carrier in declared_carriers
 
 
 def test_resolve_by_scope_returns_registered_candidates_in_precedence_order():
@@ -260,6 +345,11 @@ _LEGACY_FACTS = {
     "chaosblade_python": (
         {"experiment_uid": "uid-py", "injection_method": "python_agent"},
     ),
+    # The CR channel's values-stage handle is kind-bearing and minimal
+    # (two-stage hydration: the ns/name ``value`` is the MESSAGES stage's
+    # job, fed by the applied manifest) — exactly the checkpoint shape
+    # ``build_fault_handle`` must hydrate from bare attribution facts.
+    "faultdrill_cr": ({"injection_method": "faultdrill_cr"},),
 }
 
 
@@ -319,12 +409,16 @@ def test_handle_roundtrip_through_materialize_resolve_and_dispatch(provider_cls)
 @pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
 def test_recover_hook_family_contract(provider_cls):
     """Structural contract of the recover hook family: the deterministic
-    capability flag agrees with the handle kind (only UID carriers own a
-    programmatic destroy), and every hook returns its declared shape on an
-    empty state (never raising, never naming a carrier)."""
+    capability flag agrees with the handle kind (UID carriers own a
+    programmatic destroy; the CR channel owns a deterministic handle
+    replay — recover reads the CR and re-applies restorePatches, the
+    intent durable in cluster state), and every hook returns its declared
+    shape on an empty state (never raising, never naming a carrier)."""
     prov = provider_cls()
     assert isinstance(prov.has_deterministic_recover, bool)
-    assert prov.has_deterministic_recover == (prov.handle_kind == "experiment_uid")
+    assert prov.has_deterministic_recover == (
+        prov.handle_kind in ("experiment_uid", "faultdrill_cr")
+    )
     assert isinstance(prov.blocks_deterministic_destroy({}), bool)
     assert prov.blocks_deterministic_destroy({}) is False
     # Bare retry destroy: declared for every backend, empty for carriers with
@@ -397,6 +491,74 @@ def test_fake_provider_satisfies_verify_hook_family():
     assert _inspect.iscoroutinefunction(fake.layer1_verify)
     assert callable(fake.was_fault_create_attempted)
     assert not _inspect.iscoroutinefunction(fake.was_fault_create_attempted)
+
+
+@pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
+def test_landing_readback_hook_family_contract(provider_cls):
+    """Structural contract of the landing readback hook family
+    (faultdrill-cr-channel task 2.1, design D5): the post-apply readback
+    guard is a coroutine function EVERY backend owns — the registry seam
+    AWAITS it, so a sync implementation would raise on the guard path.
+    Backends outside the faultdrill channel pin the ``None`` verdict (no
+    landing form to verify); only that channel's carrier computes
+    verdicts."""
+    import inspect as _inspect
+
+    prov = provider_cls()
+    assert isinstance(prov, FaultProvider)
+    assert callable(prov.verify_landing_readback)
+    assert _inspect.iscoroutinefunction(prov.verify_landing_readback)
+
+
+def test_fake_provider_satisfies_landing_readback_hook_family():
+    """The suite's test double satisfies the same landing readback hook
+    contract (the coroutine form the guard's await relies on)."""
+    import inspect as _inspect
+
+    from .test_registry import _FakeProvider
+
+    fake = _FakeProvider("chaosblade", ("host_blade",))
+    assert isinstance(fake, FaultProvider)
+    assert callable(fake.verify_landing_readback)
+    assert _inspect.iscoroutinefunction(fake.verify_landing_readback)
+
+
+@pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)
+def test_reconcile_hook_family_contract(provider_cls):
+    """Structural contract of the create-reconcile hook family
+    (blade-create-reconcile-before-retry D6): the hold-feedback hook is a
+    coroutine function every backend owns (the registry seam AWAITS it —
+    a sync implementation would raise on the intercept path), the
+    fingerprint/batch-held hooks are sync callables, and the declaration
+    pair is always a frozenset of tool names (possibly empty: backends
+    outside the gate pin it empty, which is the explicit default)."""
+    import inspect as _inspect
+
+    prov = provider_cls()
+    assert callable(prov.build_reconcile_fingerprint)
+    assert not _inspect.iscoroutinefunction(prov.build_reconcile_fingerprint)
+    assert callable(prov.reconcile_hold_feedback)
+    assert _inspect.iscoroutinefunction(prov.reconcile_hold_feedback)
+    assert callable(prov.reconcile_batch_held_feedback)
+    assert not _inspect.iscoroutinefunction(prov.reconcile_batch_held_feedback)
+    for attr in ("reconcile_create_tool_names", "reconcile_read_tool_names"):
+        decl = getattr(prov, attr)
+        assert isinstance(decl, frozenset)
+        assert all(isinstance(n, str) and n for n in decl)
+
+
+def test_fake_provider_satisfies_reconcile_hook_family():
+    """The suite's test double satisfies the same reconcile hook contract
+    (the coroutine form the registry seam's await relies on)."""
+    import inspect as _inspect
+
+    from .test_registry import _FakeProvider
+
+    fake = _FakeProvider("chaosblade", ("host_blade",))
+    assert isinstance(fake, FaultProvider)
+    assert _inspect.iscoroutinefunction(fake.reconcile_hold_feedback)
+    assert not _inspect.iscoroutinefunction(fake.build_reconcile_fingerprint)
+    assert not _inspect.iscoroutinefunction(fake.reconcile_batch_held_feedback)
 
 
 @pytest.mark.parametrize("provider_cls", BUILTIN_PROVIDERS, ids=_provider_id)

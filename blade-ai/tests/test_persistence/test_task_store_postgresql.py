@@ -100,32 +100,82 @@ class TestRecordToDict:
 # ---------------------------------------------------------------------------
 
 class TestSchema:
-    async def test_ensure_schema_is_pure_ddl(self, backend):
-        """[已翻转] phase-14 G6 后：迁移段整体退役——四表 DDL 齐全，
-        全程零 ALTER / 零回填（fresh-database 裁决，旧库不再原地升级）。"""
+    async def test_ensure_schema_runs_full_ddl_and_migrations(self, backend):
+        """[已翻转回 G6 前] 迁移段已恢复：四表 DDL + 全部一次性迁移
+        ALTER 都会发出（旧库原地升级；fresh 库上 ALTER 全部失败被吞）。"""
         await backend.ensure_schema()
         executed = "\n".join(backend._pool.db.executed)
         for table in ("tasks", "task_details", "task_spans", "sessions"):
             assert f"CREATE TABLE IF NOT EXISTS {table}" in executed
-        assert "ALTER TABLE" not in executed
+        # one-shot migration columns all attempted on first run
+        for col in ("fault_spec", "failure_reason", "baseline_data",
+                    "postmortem", "injection_start_time"):
+            assert f"ADD COLUMN {col}" in executed
+        assert "ADD COLUMN IF NOT EXISTS tenant_id" in executed
+        # phase-9 rename also attempted (fresh FakePool: raises, swallowed)
+        assert "RENAME COLUMN blade_uid TO experiment_uid" in executed
+        # prompt-cache aggregate column: idempotent migration ALTER is
+        # attempted (legacy DBs gain it; fresh FakePool raises, swallowed)
+        assert "ADD COLUMN total_token_cached" in executed
+
+    async def test_ensure_schema_carries_workspace_column_and_index(self, backend):
+        """方案 A：workspace_id 与 tenant_id 同构——前置 ALTER（鸡蛋
+        顺序：idx_tasks_workspace 在 DDL 里，列必须先存在）+ DDL 自带
+        列与索引。双后端逐字一致契约的 PG 侧锁。"""
+        await backend.ensure_schema()
+        executed = "\n".join(backend._pool.db.executed)
+        assert "ADD COLUMN IF NOT EXISTS workspace_id" in executed
+        from chaos_agent.persistence.task_store_postgresql import _SCHEMA_DDL
+        assert "workspace_id    TEXT DEFAULT ''" in _SCHEMA_DDL
+        assert "idx_tasks_workspace ON tasks(workspace_id)" in _SCHEMA_DDL
+
+    async def test_select_active_tasks_workspace_filter(self, backend):
+        """select_active_tasks(workspace_id=...) 在 fake pool 上行为级验证：
+        双轴过滤生效、空值不过滤（fetch 不进 executed 日志，只能
+        走行为断言——比 SQL 子串匹配更强）。"""
+        for tid, ws in (("task-a", "ws-lisi"), ("task-b", "ws-526255")):
+            await backend.upsert_task(
+                tid,
+                ["task_id", "task_state", "liability_live",
+                 "tenant_id", "workspace_id"],
+                [tid, "injected", 1, "t-org", ws],
+            )
+        rows = await backend.select_active_tasks(tenant_id="t-org", workspace_id="ws-lisi")
+        assert [r["task_id"] for r in rows] == ["task-a"]
+        rows = await backend.select_active_tasks(tenant_id="t-org", workspace_id="ws-526255")
+        assert [r["task_id"] for r in rows] == ["task-b"]
+        # 空值 → 不过滤：全量（本地 CLI / 裸 SDK 契约）
+        rows = await backend.select_active_tasks(tenant_id="t-org")
+        assert {r["task_id"] for r in rows} == {"task-a", "task-b"}
+        assert await backend.select_active_tasks() == await backend.select_active_tasks(
+            tenant_id="", workspace_id="")
 
     async def test_ensure_schema_is_idempotent(self, backend):
-        """DDL 幂等（IF NOT EXISTS）；二次运行不再有可炸的 ALTER。"""
+        """二次运行必须存活：ALTER ADD COLUMN 全部 raise（DuplicateColumn）
+        被吞，DDL 幂等（IF NOT EXISTS）。"""
         await backend.ensure_schema()
-        await backend.ensure_schema()
+        await backend.ensure_schema()  # ALTER ADD COLUMN raises → swallowed
 
     async def test_fresh_ddl_carries_all_migration_columns(self, backend):
-        """phase-14 G6 7.3：只存在于旧迁移段的六列已并入 _DETAILS_DDL
-        ——fresh 库由 DDL 直接建成终态列集。"""
+        """六列已并入 _DETAILS_DDL——fresh 库由 DDL 直接建成终态列集；
+        启动迁移段的 ALTER 只负责兑旧库（双保险，两者不冲突）。"""
         from chaos_agent.persistence.task_store_postgresql import _DETAILS_DDL
         for col in ("baseline_data", "inject_context", "skill_use_case",
                     "injection_method", "kubectl_exec_pod_name",
                     "injection_start_time"):
             assert f"{col}" in _DETAILS_DDL, col
+        # round-32: ledger wings + the verdict column ship in the DDL too
+        for col in ("owned_experiment_uids", "retired_experiment_uids"):
+            assert col in _DETAILS_DDL, col
+        from chaos_agent.persistence.task_store_postgresql import _TASKS_DDL
+        assert "liability_live" in _TASKS_DDL
+        # prompt-cache aggregate ships in the fresh DDL too (a SUBSET of
+        # total_token_input, not additive) — PG parity with SQLite
+        assert "total_token_cached" in _DETAILS_DDL
 
-    async def test_no_backfill_on_fresh_database(self, backend):
-        """[已翻转] 一次性回填迁移段 EOL：ensure_schema 不再触碰任何行
-        ——存量行不会被盖上时间戳，新行也不会被意外回填。"""
+    async def test_injection_start_time_backfill_is_one_shot(self, backend):
+        """[已翻转回 G6 前] 存量行回填一次；迁移后新插入的行永不被碰。"""
+        # pre-migration legacy row: has intent, no injection_start_time
         await backend.upsert_task(
             "task-legacy",
             ["task_id", "task_state", "gmt_create"],
@@ -138,7 +188,65 @@ class TestSchema:
         )
         await backend.ensure_schema()
         legacy = await backend.select_details("task-legacy")
-        assert legacy.get("injection_start_time") is None  # 不再回填
+        assert legacy["injection_start_time"] is not None  # backfilled
+
+        # new row inserted AFTER the migration ran once
+        await backend.upsert_details(
+            "task-new", ["task_id", "target"], ["task-new", "app=new"]
+        )
+        await backend.ensure_schema()  # ALTER raises → backfill skipped
+        new = await backend.select_details("task-new")
+        # real PG keeps the column with NULL; the fake omits the key — both
+        # mean "never backfilled"
+        assert new.get("injection_start_time") is None
+
+    async def test_round32_liability_migrations_attempted_on_first_run(self, backend):
+        """Round-32 一次性迁移全发出（fresh FakePool：ALTER 全 raise 被
+        各自的 try 吞）：双翼 ALTER + 负债列 ALTER + 索引（独立 try，
+        两种库形态都建）。"""
+        await backend.ensure_schema()
+        executed = "\n".join(backend._pool.db.executed)
+        for col in ("owned_experiment_uids", "retired_experiment_uids"):
+            assert f"ADD COLUMN {col}" in executed, col
+        assert "ADD COLUMN liability_live" in executed
+        # index in its own try — fresh DB lands here after the ALTER
+        # raised inside the transaction-wrapped block
+        assert "CREATE INDEX IF NOT EXISTS idx_tasks_liability_live" in executed
+
+    async def test_liability_backfill_is_one_shot(self, backend):
+        """Round-32 回填：存量「已发出但词未清算」的行一次性拿回
+        liability_live=1（K1/K2 已致盲的存量行正是在这里拿回恢复入口）；
+        清算词行不被碰；迁移后写入的行永不被碰。"""
+        # pre-migration legacy rows — direct backend writes, pre-column
+        await backend.upsert_task(
+            "task-legacy", ["task_id", "task_state", "gmt_create"],
+            ["task-legacy", "failed", "2026-08-01T00:00:00+00:00"],
+        )
+        await backend.upsert_task(
+            "task-cleared", ["task_id", "task_state", "gmt_create"],
+            ["task-cleared", "recovered", "2026-08-01T00:00:00+00:00"],
+        )
+        for tid in ("task-legacy", "task-cleared"):
+            await backend.upsert_details(
+                tid,
+                ["task_id", "target", "injection_start_time"],
+                [tid, "app=x", "2026-08-01T00:00:00+00:00"],
+            )
+        await backend.ensure_schema()
+        # 'failed' with an issued injection → re-admitted (the K2 shape);
+        # 'recovered' → stays cleared even with identical evidence
+        assert (await backend.select_task("task-legacy"))["liability_live"] == 1
+        assert (await backend.select_task("task-cleared"))["liability_live"] == 0
+
+        # row written AFTER the migration ran — an explicit verdict-0
+        # (what TaskStore.upsert materialises for a cleared row) must
+        # stay 0 across restarts: the backfill is one-shot
+        await backend.upsert_task(
+            "task-new", ["task_id", "task_state", "liability_live"],
+            ["task-new", "injected", 0],
+        )
+        await backend.ensure_schema()  # ALTER raises → backfill skipped
+        assert (await backend.select_task("task-new"))["liability_live"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -219,62 +327,53 @@ class TestTasks:
 # ---------------------------------------------------------------------------
 
 class TestSelectActiveTasks:
-    async def _seed(self, backend, task_id, *, state="injected", target=None,
-                    fault_spec=None, issue_time=None, **task_fields):
-        cols = ["task_id", "task_state"]
-        vals = [task_id, state]
+    """Round-32：后端谓词键在 tasks.liability_live（TaskStore.upsert /
+    update_task_state 经 may_carry_live_fault 写入的物化判决）。
+
+    词与负债的语义判断（never-issued 幽灵、无意图裸行、unverified
+    fail-closed、K1/K2 致盲词）上移一层，锚在
+    test_task_store.py::TestQueryActive；本类钉 SQL 契约：账本列说了
+    算，task_state 词说什么都不影响。"""
+
+    async def _seed(self, backend, task_id, *, liability_live=1,
+                    state="injected", **task_fields):
+        cols = ["task_id", "task_state", "liability_live"]
+        vals = [task_id, state, liability_live]
         for k, v in task_fields.items():
             cols.append(k)
             vals.append(v)
         await backend.upsert_task(task_id, cols, vals)
-        d_cols, d_vals = ["task_id"], [task_id]
-        if target is not None:
-            d_cols.append("target")
-            d_vals.append(target)
-        if fault_spec is not None:
-            d_cols.append("fault_spec")
-            d_vals.append(fault_spec)
-        if issue_time is not None:
-            d_cols.append("injection_start_time")
-            d_vals.append(issue_time)
-        await backend.upsert_details(task_id, d_cols, d_vals)
 
-    async def test_full_intent_row_is_active(self, backend):
-        await self._seed(backend, "task-ok", target="app=x",
-                         issue_time="2026-08-13T10:00:00+00:00",
-                         namespace="ns1", target_name="app")
+    async def test_liability_live_row_is_returned(self, backend):
+        """账本标活的行可恢复——谓词的唯一正向路径。"""
+        await self._seed(backend, "task-ok", namespace="ns1", target_name="app")
         rows = await backend.select_active_tasks()
         assert [r["task_id"] for r in rows] == ["task-ok"]
 
-    async def test_fault_spec_only_row_is_active(self, backend):
-        """cli/runner.py writes fault_spec without target — must not be hidden."""
-        await self._seed(backend, "task-spec", fault_spec='{"scope":"pod"}',
-                         issue_time="2026-08-13T10:00:00+00:00")
+    async def test_liability_cleared_row_is_excluded(self, backend):
+        """清算行离开可恢复集，即使词还读作 'injected'——判决列而非词
+        说了算（K1/K2 盲区的镜像面：陈旧的词永不能重新放行或重新
+        隐藏一行）。"""
+        await self._seed(backend, "task-done", liability_live=0, state="injected")
+        assert await backend.select_active_tasks() == []
+
+    async def test_state_word_does_not_override_ledger_verdict(self, backend):
+        """K1/K2 的 SQL 侧锚：'failed'-with-experiment、'recovering' 孤儿
+        行、'partial_recovered'、'unverified'——甚至清算词 'completed'
+        ——只要账本说活就返回。旧 IN 子句对恰恰这些词猜错过。"""
+        for word in ("failed", "recovering", "partial_recovered",
+                     "unverified", "completed"):
+            await self._seed(backend, f"task-{word}", state=word)
         rows = await backend.select_active_tasks()
-        assert [r["task_id"] for r in rows] == ["task-spec"]
-
-    async def test_never_issued_row_is_excluded(self, backend):
-        """Confirmed but never executed (no injection_start_time) → ghost."""
-        await self._seed(backend, "task-ghost", target="app=x")
-        assert await backend.select_active_tasks() == []
-
-    async def test_intentless_row_is_excluded(self, backend):
-        """tracer.py creates bare rows without target/fault_spec."""
-        await self._seed(backend, "task-bare",
-                         issue_time="2026-08-13T10:00:00+00:00")
-        assert await backend.select_active_tasks() == []
-
-    async def test_finished_states_are_excluded(self, backend):
-        await self._seed(backend, "task-done", state="recovered",
-                         target="app=x", issue_time="2026-08-13T10:00:00+00:00")
-        assert await backend.select_active_tasks() == []
+        assert sorted(r["task_id"] for r in rows) == [
+            "task-completed", "task-failed", "task-partial_recovered",
+            "task-recovering", "task-unverified",
+        ]
 
     async def test_filters_by_namespace_target_tenant(self, backend):
-        await self._seed(backend, "task-1", target="app=x",
-                         issue_time="2026-08-13T10:00:00+00:00",
+        await self._seed(backend, "task-1",
                          namespace="ns-a", target_name="app-a", tenant_id="t-1")
-        await self._seed(backend, "task-2", target="app=y",
-                         issue_time="2026-08-13T10:00:00+00:00",
+        await self._seed(backend, "task-2",
                          namespace="ns-b", target_name="app-b", tenant_id="t-2")
         rows = await backend.select_active_tasks(namespace="ns-a")
         assert [r["task_id"] for r in rows] == ["task-1"]
@@ -300,6 +399,18 @@ class TestDetails:
         row = await backend.select_details("task-1")
         assert row["safety_status"] == "safe"
         assert row["plan_summary"] == "kill one pod"
+
+    async def test_upsert_details_roundtrips_total_token_cached(self, backend):
+        """PG parity with SQLite: total_token_cached (a subset of input)
+        survives the upsert→select roundtrip through the PG backend."""
+        await backend.upsert_details(
+            "task-1",
+            ["task_id", "total_token_input", "total_token_cached"],
+            ["task-1", 2990, 2176],
+        )
+        row = await backend.select_details("task-1")
+        assert row["total_token_input"] == 2990
+        assert row["total_token_cached"] == 2176
 
     async def test_select_details_none_when_missing(self, backend):
         assert await backend.select_details("ghost") is None

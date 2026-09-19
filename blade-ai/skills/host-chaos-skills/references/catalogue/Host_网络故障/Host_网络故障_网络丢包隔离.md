@@ -31,12 +31,12 @@ blade create network drop --destination-ip <target-ip> --network-traffic out --t
 3. 观察网络连通性及应用状态
 
 **注入验证**：
-1. **（主证据，必做）** 确认实验已生效：
+1. （诊断，仅当下述效果证据未出现时执行）确认实验已生效：
    ```bash
    blade status --uid <experiment-uid>
    ```
-   状态为 Success/Running 即表示丢包规则已下到主机网络栈。
-2. **（只做与本次 `--network-traffic` 匹配的分支）** 另一方向的现象在本次注入下**不可能出现**，直接标记为 `expected` 并跳过：
+   状态为 Success/Running 即表示丢包规则已下到主机网络栈——这是机制回执，为机制代言不为结果代言，用于定位失败层（规则未下发 vs 下发未生效），不构成效果证据
+2. **（主证据，必做）**（只做与本次 `--network-traffic` 匹配的分支）另一方向的现象在本次注入下**不可能出现**，直接标记为 `expected` 并跳过：
    - **`out`（出站）**：从本机向目标验证不通
      ```bash
      ping -c 4 <target-ip>

@@ -146,6 +146,17 @@ def get_agent_card() -> dict:
             "properties": {
                 "experiment_uid": {"type": "string"},
                 "verification": {"type": "object"},
+                "observation_failures": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "channel": {"type": "string"},
+                            "error_class": {"type": "string"},
+                            "count": {"type": "integer"},
+                        },
+                    },
+                },
                 "task_state": {"type": "string"},
                 "recovery_level": {"type": "string"},
                 "recover_verification": {"type": "object"},

@@ -3,6 +3,7 @@
 import json
 import logging
 import shlex
+from datetime import datetime, timezone
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -12,6 +13,7 @@ from chaos_agent.agent.capabilities import (
     filter_tools_for_context,
 )
 from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
+from chaos_agent.agent.state_mgmt.state_lifecycle import replan_reset_state
 from chaos_agent.agent.node_names import AGENT_LOOP
 from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
     _resolve_kubeconfig,
@@ -52,6 +54,7 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
+from chaos_agent.utils.time import parse_iso_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -62,18 +65,105 @@ _WORKLOAD_SCOPES = frozenset({
 _INFRA_SCOPES = frozenset({"node"})
 
 
-def _ledger_section_for_planning(state) -> str:
-    """Render the progress-ledger section for the planning phase (b-plan).
+def _ledger_tail_for_planning(state) -> str:
+    """Render the progress-ledger TAIL content for the planning phase (b-plan).
 
     Planning does NOT freeze an anchor: the fault_spec is still converging here,
     so anchoring it would anchor a moving target. The ledger is simply whatever
     the model has recorded so far (state + log, empty anchor) — it exists to show
     established facts and progress, and ``render_ledger`` skips the anchor block
-    while it is empty. The anchor is frozen later, once execute_loop runs on the
-    approved spec.
+    while it is empty (so the no-anchor directive variant is what renders). The
+    anchor is frozen later, once execute_loop runs on the approved spec.
+
+    context-cache-prefix-stability Unit A (task 2.6): this returns the TAIL
+    rendering (``build_ledger_tail_content`` = supersedes marker + directive +
+    body) rather than a bare prompt section, because the planning ledger moved
+    OUT of the FULL system-prompt head onto the message tail. Empty ledger →
+    ``""`` (no tail message).
     """
-    from chaos_agent.agent.progress_ledger import build_ledger_prompt_section
-    return build_ledger_prompt_section(state.get("progress_ledger"))
+    from chaos_agent.agent.progress_ledger import build_ledger_tail_content
+    return build_ledger_tail_content(state.get("progress_ledger"))
+
+
+def _fmt_probe_age(seconds: float) -> str:
+    """Compact age label — fact form (``~23m``), no thresholds.
+
+    Returns a bare duration; the caller phrases it ("before planning") so
+    the label never carries a rotting "ago" tense (see
+    ``_render_probe_snapshot_section``).
+    """
+    if seconds < 60:
+        return f"~{int(seconds)}s"
+    if seconds < 3600:
+        return f"~{int(seconds // 60)}m"
+    return f"~{int(seconds // 3600)}h"
+
+
+def _render_probe_snapshot_section(snapshot) -> list:
+    """Render the intent-time probe snapshot as the tail section of the
+    ``[FAULT INTENT]`` anchored message (tier1-speedup).
+
+    The ledger section in the system prompt carries the same facts but no
+    timestamps, and its state layer is overwritten as execution proceeds.
+    This section is the per-fact timestamped record: appended to the one
+    message that survives every later trim (``CONTEXT_ANCHOR_FLAG``), the
+    intent-time evidence stays visible through execute/verify/recover with
+    its probe age.
+
+    Age is rendered as a fact ("probed ~23m before planning"), never as a
+    verdict — no STALE marker, no threshold, no programmatic re-verification
+    rule: whether a fact is still trustworthy is the reader's call. The age
+    is phrased relative to PLANNING START rather than "now": this message
+    is built once (first planning round) and then frozen by the anchor flag,
+    so a "~2m ago" tense would rot as the message survives into verify /
+    recover — under-stating the age exactly when drift risk is highest.
+    "before planning" states a fixed historical fact that stays true.
+    """
+    if not isinstance(snapshot, dict):
+        return []
+    facts = snapshot.get("facts")
+    if not isinstance(facts, list):
+        return []
+    now = datetime.now(timezone.utc)
+    body = []
+    for entry in facts:
+        if not isinstance(entry, dict):
+            continue
+        fact = str(entry.get("fact") or "").strip()
+        if not fact:
+            continue
+        src = str(entry.get("source_tool") or "probe").strip() or "probe"
+        try:
+            probed_at = parse_iso_timestamp(str(entry.get("probed_at") or ""))
+        except ValueError:
+            probed_at = None
+        if probed_at is not None:
+            age = _fmt_probe_age(max(0.0, (now - probed_at).total_seconds()))
+            tail = f"probed {age} before planning, via {src}"
+        else:
+            tail = f"via {src}"
+        body.append(f"- {fact} ({tail})")
+    if not body:
+        return []
+    return [
+        "",
+        "### Environment facts from intent dialogue",
+        "",
+        "Established while clarifying the intent. Same source as the progress",
+        "ledger section in your system prompt; the per-fact probe timestamps",
+        "here are the authoritative record (the ledger carries none).",
+        "",
+        *body,
+        "",
+        "How to use these facts: they are hints, not verdicts. Each carries its",
+        "probe age — the older a fact, the more likely the environment has",
+        "drifted, but age alone never proves a fact wrong. Whether to re-verify",
+        "is your call per fact: a fact your plan would fall apart without",
+        "deserves a re-check, and a fact that is cheap to re-check while you are",
+        "unsure about it should be re-checked; anything you accept, use directly",
+        "— do NOT re-probe accepted facts indiscriminately. If your own runtime",
+        "observation directly contradicts one, trust your observation.",
+    ]
 
 
 def _build_replan_context_message(
@@ -458,7 +548,12 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 replan_history=replan_history if is_replan_entry else None,
                 profile=capability_context.profile,
                 fault_spec=state.get("fault_spec"),
-                progress_ledger_section=_ledger_section_for_planning(state),
+                # FaultDrill CR channel routing guide gate (openspec
+                # faultdrill-cr-channel D3 source 2): the caller-side
+                # capability fact — the builder combines it with the K8s
+                # profile so host-channel prompts never see the guide, and
+                # the dark-launch window (flag off) stays byte-identical.
+                cr_channel_enabled=settings.faultdrill_enabled,
             )
 
             # --- Inject structured fault context from FaultSpec ---
@@ -545,6 +640,13 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                         "\nIf no match exists after discovery, inform the user "
                         "this scenario is not currently supported and STOP."
                     )
+                # Intent-time probe snapshot (tier1-speedup): the timestamped
+                # per-fact record rides the same anchored message so the
+                # evidence survives every later trim. Empty snapshot → no
+                # section at all (pre-change rendering).
+                fi_lines.extend(
+                    _render_probe_snapshot_section(state.get("probe_snapshot"))
+                )
                 fi_msg = HumanMessage(
                     content="\n".join(fi_lines),
                     # Handoff-retention anchor: planning/handoff_strip
@@ -589,6 +691,22 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                     "tool_error", "planning", error_hint,
                     counts=_hint_counts, counts_out=_hint_counts,
                 ))
+
+            # --- Progress ledger (drift anchor) — TAIL append, not the head ---
+            # context-cache-prefix-stability Unit A (task 2.6, design D1/D2): the
+            # planning ledger moved OUT of build_inject_system_prompt's head (its
+            # per-round rewrite broke the cache prefix) onto the message tail via
+            # the same append-only channel as execute/verify/recover. NO stable
+            # id: a stable id would make add_messages replace the copy IN PLACE,
+            # pinning it early (out of the recency tail) AND reintroducing an
+            # early volatile byte that re-bills the whole suffix every round.
+            # Placed before the convergence/budget nudges below so those stay
+            # outermost.
+            _ledger_tail = _ledger_tail_for_planning(state)
+            if _ledger_tail:
+                _ledger_msg = HumanMessage(content=wrap_system_reminder(_ledger_tail))
+                messages.append(_ledger_msg)
+                _injections_for_state.append(_ledger_msg)
 
             # --- Convergence hints (planning conclusion prompts) ---
             # Aligned with execute_loop's 3-tier convergence system.
@@ -675,14 +793,15 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         if is_replan_entry:
             result["replan_context_injected_attempt"] = _total_replan
 
-        # Reset safety_status for replan so safety_check re-evaluates the corrected plan
+        # Replan seam: clear the previous attempt's residue via the
+        # lifecycle registry (W-56-5 defect b — the hand-maintained list
+        # here once forgot safety_reason/error/failure_reason/failure_detail,
+        # letting attempt 1's terminal residue strangle attempt 2 on its
+        # first route). Attempt-scoped keys and their reset values are
+        # declared once in state_lifecycle (replan=...); see the
+        # W-56-5 note there.
         if is_replan:
-            result["safety_status"] = "pending"
-            result["needs_confirmation"] = False
-            # Clear replan_requested so Phase 2 doesn't immediately re-trigger
-            result["replan_requested"] = False
-            result["blast_radius_scope"] = None
-            result["blast_radius_detail"] = None
+            result.update(replan_reset_state())
 
         if response is not None:
             # Programmatic kubeconfig injection: ensure every kubectl/blade tool call
@@ -808,9 +927,56 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                         updates: dict = {}
                         for k, v in derived.items():
                             if k == "labels":
-                                continue  # labels written by validated extraction only
+                                # Name-kind-consistent labels (B31): CLI
+                                # NL flows have NO other labels writer
+                                # ("validated extraction" never runs on
+                                # this route), so the blanket skip left
+                                # label-declared targets with an
+                                # empty selector. Write labels ONLY when
+                                # the command's own scope matches the
+                                # locked spec scope AND neither names nor
+                                # labels are set yet — a ``kubectl get
+                                # pods -l app=x`` probe under a
+                                # pod-scope spec is declaring its
+                                # selector. Fail-closed on mismatch:
+                                # a wrong lock is rejected by the guard
+                                # downstream, never silently widened.
+                                if (
+                                    derived.get("scope")
+                                    and _spec_now.scope
+                                    and derived["scope"] == _spec_now.scope
+                                    and not _spec_now.names
+                                    and not _spec_now.labels
+                                ):
+                                    updates["labels"] = v
+                                continue
                             current = getattr(_spec_now, k, None)
                             if not current:
+                                if (
+                                    k == "names"
+                                    and derived.get("scope")
+                                    and _spec_now.scope
+                                    and derived["scope"] != _spec_now.scope
+                                ):
+                                    # Name-kind consistency (B31): the
+                                    # command names a resource of a
+                                    # DIFFERENT kind than the locked
+                                    # scope (e.g. ``get deploy X`` under
+                                    # a pod-scope spec) — X is a
+                                    # workload name, not a pod instance
+                                    # name. Writing it produced
+                                    # approved.names that no exec'd pod
+                                    # name can ever match (REJECT_DRIFT
+                                    # on every injection attempt).
+                                    logger.info(
+                                        "spec-write blocked: writer=agent_loop "
+                                        "lazy derivation names %s rejected — "
+                                        "kind mismatch (command scope=%s, "
+                                        "locked scope=%s)",
+                                        list(v), derived.get("scope"),
+                                        _spec_now.scope,
+                                    )
+                                    continue
                                 updates[k] = v
                         if "names" in updates:
                             _drop_vehicle_names(updates, state, tc_args.get("v_args", ""))

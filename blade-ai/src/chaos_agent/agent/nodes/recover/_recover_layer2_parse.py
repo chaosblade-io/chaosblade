@@ -15,6 +15,7 @@ from chaos_agent.agent.nodes.verify._verifier_shared import (
     has_checklist,
     parse_checklist_items,
 )
+from chaos_agent.agent.result.verdict import ChecklistItemStatus
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +53,27 @@ def _build_recover_verifier_prompt(
 # Recovery verification checklist parsing (mirrors verifier.py checklist logic)
 # ---------------------------------------------------------------------------
 
-# Recovery-specific checklist patterns — includes "partial" status not present
-# in injection verifier's _CHECKLIST_PATTERNS.
+# Recovery-specific checklist patterns — the status vocabulary derives
+# from the legislation enum (B76 round-14 root-cause fix): this regex
+# previously taught a 5-word set while the recover submit prompt taught a
+# different 4-word set and the inject regex a third 6-word set — three
+# hand-copies, three drifts. Longest-first ordering keeps a future member
+# that prefixes an existing one from shadowing it in the alternation.
+_RECOVERY_ITEM_STATUS_ALT = "|".join(
+    sorted((m.value for m in ChecklistItemStatus), key=len, reverse=True)
+)
+
 _RECOVERY_CHECKLIST_PATTERNS = [
     # Primary: Step N: <status> / Check N: <status>
     re.compile(
-        r"(?:step|check)\s*(\d+)\s*[:.)]\s*\[?(passed|failed|skipped|partial|expected)\]?",
+        rf"(?:step|check)\s*(\d+)\s*[:.)]\s*\[?({_RECOVERY_ITEM_STATUS_ALT})\]?",
         re.IGNORECASE,
     ),
     # Explicit skip marker: [SKIPPED] Step N
     re.compile(r"(?<!\d[.:)]\s)\[SKIPPED\]\s*(?:step\s*)?(\d+)?", re.IGNORECASE),
     # Bare numbered list: 1. <status>
     re.compile(
-        r"^\s*(\d+)\s*[.:)]\s*\[?(passed|failed|skipped|partial|expected)\]?",
+        rf"^\s*(\d+)\s*[.:)]\s*\[?({_RECOVERY_ITEM_STATUS_ALT})\]?",
         re.IGNORECASE | re.MULTILINE,
     ),
 ]
@@ -504,9 +513,13 @@ def _parse_recovery_verification_result(text: str, *, skill_name: str = "") -> d
     # Determine overall level
     if "overall:" in text_lower:
         overall = text_lower.split("overall:", 1)[1].split("\n")[0].strip()
+        # "unverified" must be checked FIRST: it contains "verified" as a
+        # substring, so the recovered branch below would otherwise swallow it.
+        if "unverified" in overall:
+            result["level"] = "unverified"
         # "verified" is a common synonym for "recovered" in LLM output
         # (inject verifier uses "verified", LLM may cross-contaminate)
-        if ("recovered" in overall or "verified" in overall) and not _has_negative_prefix(overall, "recovered") and "partial" not in overall and "unrecovered" not in overall:
+        elif ("recovered" in overall or "verified" in overall) and not _has_negative_prefix(overall, "recovered") and "partial" not in overall and "unrecovered" not in overall:
             result["level"] = "recovered"
         elif (_has_negative_prefix(overall, "recovered") or _has_negative_prefix(overall, "verified")) and "unrecovered" not in overall:
             # "not recovered" / "not verified" (without "unrecovered") → treat as unrecovered

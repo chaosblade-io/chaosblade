@@ -120,11 +120,52 @@ class ScriptTimeoutError(ChaosAgentError):
     error_code = 4005
 
 
+class LLMProviderRejectError(ChaosAgentError):
+    """LLM provider deterministically rejected the request (HTTP 4xx, not 429).
+
+    Wraps ``openai.APIStatusError`` at the point of raise (agent/resilient_llm.py)
+    with an actionable hint mapped from the provider's error signature — the raw
+    traceback bubbling to the CLI told users nothing they could act on
+    (chaosblade-io/chaosblade#1344, failure signature #1). The original exception
+    is preserved as ``__cause__`` (``raise ... from e``), so the full provider
+    body stays reachable for debugging and string-based consumers.
+
+    Permanent: the same request replayed against the same provider will be
+    rejected identically — retrying only burns the backoff budget.
+    """
+
+    severity = ErrorSeverity.PERMANENT
+    error_code = 4006
+
+
 # --- Recoverable Errors (降级后重试) ---
 
 
 class LLMContextOverflowError(ChaosAgentError):
-    """Context window overflow - recoverable by compaction."""
+    """Context window overflow - recoverable by compaction.
+
+    RESERVED AND UNWIRED: nothing in ``src/`` raises this, and nothing
+    consumes ``is_recoverable`` — the only retry helper
+    (``tools/retry.py::retry_if_transient``) explicitly refuses both
+    PERMANENT and RECOVERABLE. The "recoverable by compaction" above is
+    the intended design (see
+    ``.qoder/specs/chaos-agent-architecture.md`` on
+    ``LLMContextOverflowError`` triggering ``pre_reasoning_hook``), not
+    current behaviour: no error-triggered compaction path exists.
+
+    So a provider's context-length 400 does NOT become this. It is
+    classified at the raise point by ``agent/resilient_llm.py`` as
+    ``LLMProviderRejectError`` (PERMANENT / 4006) with a hint telling the
+    operator to compact or switch models. Do not "fix" that by routing
+    overflow here: the retry loop re-sends the identical oversized payload
+    (compaction lives in the node-level ``pre_reason_hook``, which has
+    already run and returned), so RECOVERABLE would claim a degradation
+    this layer cannot perform, and the CLI exit code would regress from
+    the specific 4006 to 4001 — a bucket already shared by
+    ``ToolGuardError`` and by ``session_finalize._format_error``'s own
+    catch-all. Rationale and the condition for revisiting it:
+    ``openspec/changes/llm-provider-compat-fixes/design.md`` D5a.
+    """
 
     severity = ErrorSeverity.RECOVERABLE
     error_code = 4001
@@ -392,6 +433,20 @@ _CLASSIFY_RULES: list[tuple[ErrorClass, list[str]]] = [
             "resource not found",
             "target not found",
             "not found",
+            # systemctl's wording inserts "be": "Unit xxx could not be
+            # found" (exit 4). A residue/existence pre-check's PASS form
+            # (#29/#30/#31 timer checks) — without this pattern it fell to
+            # UNKNOWN and lit the RUNTIME EVIDENCE introspection reminder
+            # on an expected-absence receipt (#30: two wasted rounds).
+            "could not be found",
+            # POSIX ls/cat/cp wording for a missing target: "ls: cannot
+            # access '...': No such file or directory". Same B41-family
+            # wording gap — the residue pre-check's PASS form (#29-R2:
+            # reminder lit on the planning-phase ls receipt; the recover
+            # phase hits the same wording on its absence re-check). Note
+            # the phrase contains no "not found" substring, so the broad
+            # pattern above never caught it.
+            "no such file or directory",
             "no matches for kind",
             "no resources found",
         ],
@@ -437,6 +492,11 @@ _CLASSIFY_RULES: list[tuple[ErrorClass, list[str]]] = [
         # here as they're observed in production logs.
         [
             "timeout",
+            # The harness/wiz wording splits the word: "task timed out
+            # after 30s". Same semantics as ``timeout`` — without it the
+            # 30s task-ceiling truncation receipt (#30 drain) fell to
+            # UNKNOWN and lit the introspection reminder.
+            "timed out",
             "deadline exceeded",
             "connection refused",
             "connection reset",

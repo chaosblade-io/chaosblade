@@ -36,14 +36,14 @@ skill_type: fault-injection
 blade create python ... ──HTTP──> Agent(应用进程内) ──MonkeyPatch──> 被拦截的库方法
 ```
 
-Agent 进入应用进程分两步,**顺序不能颠倒**(以下均已对 chaosblade 1.9.0-alpha 实测):
+Agent 进入应用进程分两步,**顺序不能颠倒**:
 
 1. **生成 hook 文件**:`blade prepare python --port <port> --python-path <解释器> --target-script <应用入口脚本>`
    - `--target-script` 与 `--python-path` 都是**必填**的,缺失时 CLI 直接报 `required flag(s) ... not set`。
    - 它把 `sitecustomize.py` 写到 **`--target-script` 所在目录**,内容是"把 blade 自带的 `<blade目录>/lib/python` 加入 sys.path 并启动 Agent"。因此**不需要额外 `pip install`**。
    - `--port` 必须**空闲**;端口已被监听时 prepare 会拒绝(`the port has been used by other program`)。
 2. **重启应用加载 hook**:应用以 `PYTHONPATH=<hook 目录>:$PYTHONPATH` 启动,Agent 才真正在应用进程内监听。
-   - 仅靠"hook 文件在应用当前目录"**不够**,实测必须在 `PYTHONPATH` 上。
+   - 仅靠"hook 文件在应用当前目录"**不够**,必须在 `PYTHONPATH` 上。
    - 该步骤**需要重启应用**,演练过程中无法补做。
    - 替代路径:应用代码内显式 `ChaosBladeAgent(port=...).start()`(同样需要重启)。
 
@@ -60,7 +60,7 @@ Agent 进入应用进程分两步,**顺序不能颠倒**(以下均已对 chaosbl
    - 本类故障的 profile 是 `host`,框架会在 scope 与通道 profile 不一致时**直接收走全部工具**(fail-closed)。所以对话/ReAct 路径下只有**主机寻址的通道**(ssh / kubewiz_host)能进行本类演练;`kubeconfig` 与 `kubewiz_k8s`(profile 均为 k8s)会在你看到注入工具之前就被拒。
    - 因此你能调到注入工具,就说明通道已经是主机寻址的。此时若仍注入不成功,原因在**agent 前置条件**,而不是通道选错。
    - 通道由运行时配置自动决定,无需向用户询问。
-4. **多条 prepare 记录会互相遮蔽**:实测存在多条 `Running` 记录时,`blade create python` 取到的是**最早**那条的端口,而不是最新的。若刚 prepare 了新端口却注入到旧端口,先 `blade status --type prepare --status Running` 检查并 revoke 陈旧记录。
+4. **多条 prepare 记录会互相遮蔽**:存在多条 `Running` 记录时,`blade create python` 取到的是**最早**那条的端口,而不是最新的。若刚 prepare 了新端口却注入到旧端口,先 `blade status --type prepare --status Running` 检查并 revoke 陈旧记录。
 
 ## 意图识别
 

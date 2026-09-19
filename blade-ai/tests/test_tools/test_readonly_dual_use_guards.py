@@ -753,6 +753,293 @@ class TestRemainingWriteCapableEntries:
         assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
 
 
+class TestPingFloodIsAFaultInjection:
+    """``ping``/``ping6`` were listed read-only with NO argument-level guard,
+    so every traffic-amplification primitive ran under the four read-only
+    fast paths: ``-f`` (flood: thousands of packets/s), ``-l`` (preload:
+    packets sent without waiting for replies), ``-i <0.1`` (zero/near-zero
+    interval == flood), ``-p`` (arbitrary payload bytes) and ``-s >1500``
+    (jumbo packets beyond the standard MTU). Same category as ``ss -K`` —
+    a fault injection the guard exists to refuse, not an observation.
+    Found by the R37 adversarial matrix: the only miss family in 30 forms
+    (every other dual-use binary already had a guard).
+
+    The guard follows the ss shape: a valueless-short table drives
+    ``_reachable_cluster`` so ``-fq`` reads as flood, and a value walk
+    pairs standalone/attached/``=``-joined values with their flag.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "ping -f -c 100000 10.0.0.1",
+        "ping6 -f -c 100000 ::1",
+        "ping -fq 10.0.0.1",                        # flood inside a bundle
+        "ping --flood 10.0.0.1",
+        "ping -l 100 10.0.0.1",                     # preload
+        "ping -l100 10.0.0.1",                      # attached value
+        "ping --preload 100 10.0.0.1",
+        "ping --preload=100 10.0.0.1",
+        "ping -i 0 -c 1000 10.0.0.1",               # zero interval == flood
+        "ping -i0 10.0.0.1",                        # attached value
+        "ping --interval=0 10.0.0.1",
+        "ping --interval 0 10.0.0.1",
+        "ping -qi0 10.0.0.1",                       # zero interval in a bundle
+        "ping -p 41414141 -c 10 10.0.0.1",          # arbitrary payload bytes
+        "ping -p41414141 10.0.0.1",
+        "ping --pattern=41414141 10.0.0.1",
+        "ping -s 65507 -c 100 10.0.0.1",            # jumbo beyond standard MTU
+        "ping -s65507 10.0.0.1",
+        "ping --packetsize=65507 10.0.0.1",
+    ])
+    def test_flood_family_rejected(self, cmd):
+        assert not is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        "ping -c 4 10.0.0.1",                       # the standard connectivity probe
+        "ping 10.0.0.1",
+        "ping -i 0.2 -c 4 10.0.0.1",                # legitimate interval
+        "ping -s 1472 10.0.0.1",                    # MTU probe (1472 + 28 == 1500)
+        "ping -qn -c 1 10.0.0.1",                   # valueless bundle stays fine
+        "ping -w 5 -c 4 10.0.0.1",                  # -w's value must be consumed
+        "ping6 -c 4 ::1",
+    ])
+    def test_probe_forms_still_readonly(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+
+class TestArpingSpoofAndDigBulkExfil:
+    """Two more send-packet/DNS members of the same word-list entry lacked
+    an argument-level guard (R38 matrix, same root cause as ping):
+
+    - ``arping -U``/``-A`` announce the TARGET ip as this host's MAC
+      (unsolicited/REPLY modes) — ``-U -S <victim-ip> <gw>`` poisons the
+      gateway's ARP cache and becomes a man-in-the-middle前提; ``-S``/``-s``
+      forge the sender ip/MAC of any request. ``arp`` itself was already
+      EXCLUDED from the word-list for exactly ``-d``/``-s`` (see the table
+      comment), but ``arping`` was admitted whole — the designer considered
+      ``arp``'s flags and missed arping's spoof family.
+    - ``dig -f <file>`` encodes every line of a local file into DNS
+      queries sent to a chosen server — the same "moves host data
+      off-box" class as ``curl -d @/etc/shadow``, which is already refused.
+
+    traceroute forms are deliberately NOT refused (same accepted class as a
+    curl GET probe: one-shot, RTT-bound, no sustained amplification) and
+    nslookup/host have no bulk or forge primitives.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "arping -U 10.0.0.254",                       # unsolicited announce
+        "arping -A 10.0.0.254",                       # REPLY announce
+        "arping -S 10.0.0.1 10.0.0.254",              # forged source ip
+        "arping -s aa:bb:cc:dd:ee:ff 10.0.0.254",     # forged source mac
+        "arping -U -S 10.0.0.1 10.0.0.254",           # gateway cache poisoning
+        "arping -qU 10.0.0.254",                      # bundled announce flag
+        "dig -f /etc/hosts example.com",              # bulk query exfil
+        "dig -f/etc/hosts example.com",               # attached value
+        "dig -4f /etc/hosts example.com",             # bundled with -4
+    ])
+    def test_spoof_and_bulk_forms_rejected(self, cmd):
+        assert not is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        "arping -c 4 10.0.0.254",                     # the standard MAC probe
+        "arping -I eth0 -c 2 10.0.0.254",
+        "arping -f -c 3 10.0.0.254",                  # -f: quit on first reply
+        "arping -D 10.0.0.254",                       # DAD probe (sender ip 0.0.0.0)
+        "arping -w 2 -c 4 10.0.0.254",                # -w's value must be consumed
+        "dig +short example.com",                     # plain query stays readonly
+        "dig @8.8.8.8 example.com",                   # + / @ forms are not options
+        "dig -4 example.com",                         # valueless short stays fine
+        "traceroute 10.0.0.1",                        # accepted probe class
+    ])
+    def test_probe_forms_still_readonly(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+
+class TestLegacyGuardBlindspotRegressions:
+    """R39: the EARLIER guards carried the same blind spots R37/R38 fixed
+    elsewhere — every form below was granted read-only by a guard that was
+    already standing (matrix: 13 leaks / 39 rows):
+
+    - ``sort``/``sar`` matched ``-o`` as a token PREFIX, so a BUNDLED
+      ``-mo``/``-Ao`` (the write flag inside a cluster) waved through; and
+      ``sort --compress-program`` executes an arbitrary compressor —
+      ``find -exec``-grade, missed entirely.
+    - ``hostname -F<file>`` (attached value) and ``--file=<file>`` missed the
+      exact-token ``-F``/``--file`` check — the positional backstop only
+      catches a value that occupies its OWN token.
+    - ``date`` checked only ``-s``/``--set``: the POSIX positional
+      ``date MMDDhhmm[[CC]YY][.ss]`` IS clock_settime (verified live: as
+      non-root it fails with ``clock_settime: Operation not permitted``) —
+      the same clock-skew fault, one spelling over.
+    - ``arp -f <file>`` batch-loads ARP entries (verified live: it OPENS the
+      file) — ``-f``/``--file`` were never in the mutating table.
+    - ``awk``: gawk ``-W exec=``/``-Wexec=`` executes a program FILE (the
+      ``-E``/``--exec`` spelling was legislated, its ``-W`` spelling was
+      not); in-program ``@include`` loads a program file but the merit scan
+      only knew ``@load``; ``-p``/``--profile`` writes a profiling file.
+    - ``mount --source=A --target=B`` is util-linux' long-form MOUNT — the
+      table check was exact-token so the ``=`` spelling waved through.
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "sort -mo /tmp/out /tmp/in",                  # write flag inside a bundle
+        "sort --compress-program=/tmp/x /tmp/in",     # arbitrary-execution primitive
+        "sar -Ao /tmp/out",                           # write flag inside a bundle
+        "hostname -F/etc/hn",                         # attached value beats the exact check
+        "hostname --file=/etc/hn",                    # long = spelling
+        "date 091712342025",                          # POSIX positional clock set
+        "arp -f /tmp/entries",                        # batch ARP-table load
+        "awk -W exec=/tmp/e.awk x",                   # gawk -W exec spelling
+        "awk -Wexec=/tmp/e.awk x",                    # attached spelling
+        "awk '@include \"/tmp/e.awk\" {print}'",      # in-program program-file load
+        "awk -p /tmp/prof '{print}'",                 # profiling file write
+        "awk --profile=/tmp/prof '{print}'",          # long = spelling
+        "mount --source=/dev/sda1 --target=/mnt",     # long-form mount
+    ])
+    def test_legacy_blindspots_rejected(self, cmd):
+        assert not is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        "sort -u /tmp/in",                            # the standard sort probe
+        "sort -k2,3n -r /tmp/in",                     # clustered read flags
+        "sort -T /tmp /tmp/in",                       # -T takes a value: must not scan past it
+        "sar -A",                                     # bare full-stats display
+        "sar -f /var/log/sa/sa01",                    # -f reads a data file
+        "hostname -f",                                # fqdn display (-F vs -f case matters)
+        "hostname --fqdn",
+        "date +%F",                                   # +FORMAT display
+        "date -d yesterday",                          # -d's value must be consumed
+        "date -I",                                    # optional-value ISO form
+        "arp -a",                                     # cache display
+        "arp -n",
+        "awk -F: '{print}'",                          # inert separator value
+        "mount -l",                                   # listing form
+    ])
+    def test_probe_forms_still_readonly(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+
+class TestValuelessTableSynopsisCompleteness:
+    """R40 self-review of R37-R39: every valueless-short table was built from
+    memory, not by mechanically diffing the tool's official SYNOPSIS. ping's
+    table matches iputils' synopsis verbatim; sar/hostname/arping/dig each
+    lacked members, and a MISSING member breaks the cluster scan twice over:
+
+    - attached/bundled: the missing letter is read as the FIRST value-option
+      character, so the cluster stops there and the real write flag after it
+      is never seen (``sar -ho file``, ``hostname -hF/etc/hn``);
+    - standalone-with-value-consumer (arping/dig): the missing letter is
+      judged as an unknown value option, so its "value" CONSUMES the next
+      token — which is the real write flag (``arping -a -U ...``).
+
+    Each fixed member is pinned below, proven from the tool's own synopsis
+    (sysstat sar ``[-h] [-p]``, net-tools hostname ``[-h]``, iputils arping
+    ``[-a]``, BIND dig ``[-h] [-v]``).
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "sar -ho /tmp/out",                           # h missing -> -o unseen
+        "sar -po /tmp/out",                           # p missing -> -o unseen
+        "sar -Aho /tmp/out",                          # h missing mid-bundle
+        "sar -hpo /tmp/out",                          # both missing
+        "sar -Fho /tmp/out",                          # F in table, h still hid -o
+        "hostname -hF/etc/hn",                        # h missing -> -F unseen
+        "arping -aU 10.0.0.254",                      # a missing -> U unseen
+        "arping -aS 10.0.0.1 10.0.0.254",             # a missing -> S unseen
+        "arping -a -U 10.0.0.254",                    # standalone: a "eats" -U
+        "arping -a -S 10.0.0.1 10.0.0.254",
+        "dig -hf /etc/hosts example.com",             # h missing -> f unseen
+        "dig -vf /etc/hosts example.com",             # v missing -> f unseen
+        "dig -h -f /etc/hosts example.com",           # standalone: h "eats" -f
+        "dig -v -f /etc/hosts example.com",
+        "awk -Wprofile '{print}'",                    # gawk -W profile writes (anchor)
+        "awk -Wlint,exec=/tmp/e.awk x",               # comma feature list (anchor)
+    ])
+    def test_missing_members_rejected(self, cmd):
+        assert not is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        "sar -h",                                     # synopsis valueless display flags
+        "sar -p",
+        "sar -hp 2 5",                                 # both together, no -o
+        "hostname -h",                                 # help stays read-only
+        "hostname -ha",
+        "arping -aq",                                  # two valueless bundled
+        "arping -a 10.0.0.254",
+        "dig -h",                                      # help stays read-only
+        "dig -v example.com",                          # -v is valueless
+        "dig -hv example.com",                         # bundled, no -f
+        "awk -W version",                              # gawk read-only -W features
+        "awk -W lint '{print}'",                       # must NOT be refused en bloc
+        "awk -W posix '{print}'",
+        "awk -W gen-po '{print}'",                    # R41 reversal: no -W gen-po feature
+    ])
+    def test_fixed_members_still_readonly(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+
+class TestGawkWriteFacesAndHostnameBoot:
+    """R41: re-fetching the manuals the R40 tables were diffed "from" found
+    that only sar had actually been fetched — hostname/arping were written
+    from memory, and gawk's OPTIONS list had never been read end to end:
+
+    - gawk ``-l``/``--load`` loads an extension .so — ``dl_load()`` runs
+      arbitrary native code, the same class as find's ``-exec``;
+      ``-d``/``--dump-variables`` and ``-o``/``--pretty-print`` write files
+      (awkvars.out / awkprof.out). All three were waved through.
+    - gawk long options abbreviate to any unique prefix, so exact-match
+      tables miss ``--lo``/``--dump``/``--pretty``; the guard judges the
+      prefix ranges instead.
+    - Reversals: ``--gen-pot`` writes to STDOUT (R39 had legislated it as a
+      writer), and gawk has no ``-W gen-po`` feature at all (R40 anchor).
+    - net-tools hostname: ``-b`` belongs to the SET-NAME synopsis group —
+      its plain form calls sethostname. It must NOT enter the valueless
+      table (that would wave ``-qb``/``-ab`` through as plain reads), so the
+      guard judges the cluster for BOTH ``b`` and ``F``. ``A``/``I``/``V``
+      are valueless and stay read-only. ``q`` joins ``n``/``o`` as a
+      fail-closed member: without it the unknown head of ``-qb`` truncates
+      the cluster and hides ``b``.
+    - iputils arping ``[-AbDfhqUV]``: ``V`` was missing, and the value walk
+      ate ``-U`` as ``-V``'s value (``arping -VU gw``).
+    """
+
+    @pytest.mark.parametrize("cmd", [
+        "awk -l /tmp/evil.so 'BEGIN{print 1}'",       # dl_load: arbitrary code
+        "awk --load=/tmp/evil.so x",                  # full long spelling
+        "awk --lo /tmp/evil.so x",                    # unique-prefix abbreviation
+        "awk -d '{print}'",                           # writes awkvars.out
+        "awk --dump-variables x",
+        "awk --dump '{print}'",                       # abbreviation channel
+        "awk -o '{print}'",                           # writes awkprof.out
+        "awk --pretty=/tmp/x '{print}'",
+        "hostname -b",                                # SET-NAME group (sethostname)
+        "hostname --boot",
+        "hostname -bF /dev/null",                     # b truncates, still seen
+        "hostname -qb",                               # unknown head hides b
+        "hostname -ab",                               # b bundled with a read flag
+        "hostname -aF/etc/hn",                        # attached value (a lost in the R41 edit)
+        "arping -V -U 10.0.0.254",                    # V missing -> walk eats -U
+        "arping -VU 10.0.0.254",
+    ])
+    def test_write_faces_rejected(self, cmd):
+        assert not is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+    @pytest.mark.parametrize("cmd", [
+        "awk --gen-pot '{print}'",                    # R41 reversal: STDOUT only
+        "awk -g '{print}'",
+        "awk -W gen-po '{print}'",                    # R41 reversal: no such feature
+        "hostname -A",                                # R41 table members stay RO
+        "hostname -I",
+        "hostname -V",
+        "hostname -AIV",
+        "hostname -aV",
+        "arping -V 10.0.0.254",
+        "arping -aV 10.0.0.254",
+    ])
+    def test_readonly_forms_stay_allowed(self, cmd):
+        assert is_readonly_host_command(cmd), host_command_rejection_reason(cmd)
+
+
 class TestGuardsApplyThroughCommandWrappers:
     """``env``/``timeout``/``nice``/``command`` unwrap and re-judge.
 
@@ -792,6 +1079,24 @@ class TestGuardsApplyThroughCommandWrappers:
         "dmesg -cT",
         "systemctl stop kubelet",
         "dd if=/dev/zero of=/dev/sda",
+        "ping -f -c 100000 10.0.0.1",
+        "ping -l100 10.0.0.1",
+        "ping --interval=0 10.0.0.1",
+        "arping -U -S 10.0.0.1 10.0.0.254",
+        "dig -f /etc/hosts example.com",
+        # R39 legacy-guard blind spots (one per root cause).
+        "date 091712342025",
+        "hostname -F/etc/hn",
+        "arp -f /tmp/entries",
+        "sort -mo /tmp/o /tmp/p",
+        "sort --compress-program=/tmp/x /tmp/p",
+        "awk -Wexec=/tmp/e.awk x",
+        "mount --source=/dev/sda1 --target=/mnt",
+        # R41 gawk write faces / synopsis recheck (one per channel).
+        "awk -l /tmp/evil.so x",                       # dl_load: arbitrary native code
+        "awk --dump-variables x",                      # long-abbreviation channel
+        "hostname -b",                                 # SET-NAME group (sethostname)
+        "arping -VU 10.0.0.254",                       # missing-member channel, V
     ]
     # Prefixes that must not launder any of them.
     PREFIXES = [
@@ -803,7 +1108,12 @@ class TestGuardsApplyThroughCommandWrappers:
         "uniq -c /tmp/f", "sar -u 1 3", "curl -sI http://svc/",
         "wget -qO- http://svc/", "find /etc -maxdepth 1",
         "awk '{print $1}' /etc/passwd", "ip addr show", "mount -l",
-        "mount -v", "dmesg -T", "dmesg -Tx",
+        "mount -v", "dmesg -T", "dmesg -Tx", "ping -c 4 10.0.0.1",
+        "arping -c 4 10.0.0.254", "dig +short example.com",
+        "date +%F", "hostname -s", "arp -n",
+        "awk --gen-pot '{print}'",                     # R41: writes STDOUT only
+        "hostname -A",                                 # R41 table members stay RO
+        "arping -V 10.0.0.254",
     ]
 
     @pytest.mark.parametrize("prefix", PREFIXES)
@@ -853,6 +1163,13 @@ class TestSameVerdictThroughKubectlExec:
         "sort -o /etc/cron.d/evil /tmp/p",
         "ss -K",
         "awk -f/tmp/evil.awk /etc/passwd",
+        "ping -f -c 100000 10.0.0.1",
+        "arping -U -S 10.0.0.1 10.0.0.254",
+        "date 091712342025",
+        "hostname -F/etc/hn",
+        # R41 write faces must hold on this path too.
+        "awk -l /tmp/evil.so x",
+        "hostname -bF /dev/null",
     ])
     def test_mutating_inner_rejected(self, inner):
         assert not is_readonly_kubectl_exec(f"pod -n default -- {inner}")
@@ -866,6 +1183,11 @@ class TestSameVerdictThroughKubectlExec:
         "command -v iptables",
         "curl -XGET http://svc/",
         "wget -erobots=off -qO- http://svc/",
+        "ping -c 4 10.0.0.1",
+        "arping -c 4 10.0.0.254",
+        "date +%F",
+        "hostname -s",
+        "awk --gen-pot '{print}'",                     # R41: stdout-only, stays allowed
     ])
     def test_readonly_inner_allowed(self, inner):
         v_args = f"pod -n default -- {inner}"
@@ -1418,3 +1740,402 @@ class TestFactsReasonCarriesOffset:
         reason = readonly.kubectl_exec_rejection_reason("mypod -- echo $(id)")
         assert reason is not None
         assert " at pos " in reason
+
+
+class TestSegmentChainedProbes:
+    """B46: a `;`/`&&`/`||`-chained inner command in which EVERY segment is
+    independently a read-only probe is admitted — the same dialect
+    target_guard's execute-phase readonly bypass already speaks
+    (``_PROBE_SEPARATOR_OPS``). Case 43173315 [177]: a verify-phase compound
+    probe over one debug pod was refused, forcing five single-probe pods
+    plus a 25s rejection-retry loop for a shape the execute phase accepts.
+
+    Redirects, substitutions, background and newlines still fail closed on
+    every surface; the host_read single-command contract is untouched.
+    """
+
+    # --- admitted chains (facts engine) ------------------------------------
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            # The exact [177] shape: chained nsenter probes over one pod.
+            "sh -c 'echo ===T===; nsenter -t 1 -m -- df -h; "
+            "nsenter -t 1 -m -- iostat -xd 1 2'",
+            # Plain chained diagnostics.
+            "sh -c 'cat /proc/diskstats; df -h'",
+            # && / || carry the same policy.
+            "command -v iostat && iostat -xd 1 2",
+            "cat /etc/passwd || cat /etc/group",
+            # Chains mixed with pipelines: `;` splits groups, `|` stays
+            # INSIDE a group (pipeline stages).
+            "cat /proc/diskstats | grep vda; df -h",
+            # Quoted literal `;` — no structure at all (the P1 dialect).
+            "echo 'a;b'",
+        ],
+    )
+    def test_chained_all_readonly_admitted(self, inner):
+        reason = readonly.kubectl_exec_rejection_reason(f"pod-x -n ns -- {inner}")
+        assert reason is None, reason
+
+    # --- refused chains (fail-closed matrix, facts engine) -----------------
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            "sh -c 'cat /proc/diskstats; rm -rf /tmp/x'",      # mutating segment
+            "sh -c 'cat /proc/diskstats; iptables -A INPUT -s x'",  # mutating segment
+            "sh -c 'df -h > /tmp/x; cat /etc/passwd'",        # redirect segment
+            "sh -c 'echo $(id); df -h'",                      # substitution
+            "sh -c 'df -h & cat /etc/passwd'",                # background
+            "sh -c 'df -h\ncat /etc/passwd'",                 # newline separator
+        ],
+    )
+    def test_chained_with_violation_refused(self, inner):
+        reason = readonly.kubectl_exec_rejection_reason(f"pod-x -n ns -- {inner}")
+        assert reason is not None
+
+    def test_chain_mutation_reason_names_the_segment(self):
+        reason = readonly.kubectl_exec_rejection_reason(
+            "pod-x -n ns -- sh -c 'cat /proc/diskstats; rm -rf /tmp/x'"
+        )
+        assert reason is not None and "'rm'" in reason
+
+    # --- the host surface keeps its single-command contract ------------------
+
+    def test_host_surface_chain_still_refused(self):
+        reason = readonly.host_command_rejection_reason("df -h; cat /etc/passwd")
+        assert reason is not None
+        assert "shell control operator" in reason
+
+    # --- token-layer fallback speaks the same dialect ------------------------
+
+    def test_token_fallback_chain_admitted(self):
+        tokens = shlex.split("sh -c 'cat /proc/diskstats; df -h'")
+        assert readonly.is_readonly_inner_tokens(tokens)
+
+    def test_token_fallback_chain_with_mutation_refused(self):
+        tokens = shlex.split("sh -c 'cat /proc/diskstats; rm -rf /tmp/x'")
+        assert not readonly.is_readonly_inner_tokens(tokens)
+
+    def test_token_fallback_chain_reason_names_segment(self):
+        tokens = shlex.split("sh -c 'cat /proc/diskstats; rm -rf /tmp/x'")
+        reason = readonly.readonly_inner_tokens_reason(tokens)
+        assert reason is not None and "'rm'" in reason
+
+    def test_token_fallback_embedded_separator_fails_closed(self):
+        # A separator glued mid-token cannot be told apart from a quoted
+        # literal at the token layer — the conservative refusal stays.
+        tokens = ["echo", "a;b"]
+        assert not readonly.is_readonly_inner_tokens(tokens)
+
+    def test_token_fallback_redirect_in_chain_refused(self):
+        tokens = shlex.split("sh -c 'df -h > /tmp/x; cat /etc/passwd'")
+        assert not readonly.is_readonly_inner_tokens(tokens)
+
+    # --- single-probe regressions (no behaviour change without chains) -------
+
+    def test_single_probe_unchanged(self):
+        assert readonly.kubectl_exec_rejection_reason(
+            "pod-x -- nsenter -t 1 -m -- df -h"
+        ) is None
+        assert readonly.kubectl_exec_rejection_reason("pod-x -- rm -rf /tmp/x") is not None
+        assert readonly.kubectl_exec_rejection_reason(
+            "pod-x -- cat /proc/diskstats | grep vda"
+        ) is None
+
+
+def _r42_exec_reason(inner: str) -> str | None:
+    """R42 probes run through the REAL consumption face: a full kubectl-exec
+    command line, exactly as the classifier sees it."""
+
+    return readonly.kubectl_exec_rejection_reason(
+        f"kubectl exec drill-pod -n default -- {inner}"
+    )
+
+
+class TestR42LongOptionPrefixChannel:
+    """getopt_long accepts any UNIQUE abbreviation of a long option
+    (``--se`` IS ``--set`` — man-pages 6.19). Tables that spelled option
+    names out in full were half-open in one direction each:
+
+    - on a WRITE-flag table the miss is a FAIL-OPEN: ``wget --metho=POST``
+      spelled the method out of reach of the ``--method`` entry and rode
+      the ``--spider`` exemption into a REMOTE mutation; ``awk
+      --dump-v=/tmp/v`` wrote awkvars.out behind ``--dump-variables``;
+    - on a READ-ONLY table the miss is a FALSE REJECT that pushes probes
+      onto less safe spellings (``iptables --lis`` IS the literal ``-L``).
+
+    ``_long_flag_hit`` now applies the prefix rule in both directions for
+    every getopt_long binary. curl stays exact-match on purpose: its
+    self-written parser rejects ``--out`` outright (measured: "is unknown",
+    exit 2), so no abbreviation channel exists there.
+    """
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            # --method by prefix rides the --spider exemption (remote write).
+            "wget --spider --metho=POST http://svc/",
+            "wget --spid --metho=POST http://svc/",
+            "wget --spid --method=POST http://svc/",  # exact spelling control
+            # gawk write faces: -W features and every long spelling.
+            "awk -W dump-variables=/tmp/v '{print}' /dev/null",
+            "awk -W dump-variables '{print}' /dev/null",
+            "awk -Wdump-variables=/tmp/v '{print}' /dev/null",
+            "awk --dump-variables=/tmp/v '{print}' /dev/null",
+            "awk --pretty-print=/tmp/v '{print}' /dev/null",
+            "awk --dump-v=/tmp/v '{print}' /dev/null",
+            "awk --pretty-p=/tmp/v '{print}' /dev/null",
+            "awk --prof=/tmp/p '{print}' /dev/null",
+            # --source by prefix: the program after ``=`` must be scanned.
+            "awk --sour='{print > \"/tmp/x\"}' /dev/null",
+            "awk --source='{print > \"/tmp/x\"}' /dev/null",
+            # write directions of the abbreviation tables stay refused.
+            "swapon -a",
+            "crontab -r",
+            "numactl --membind=0 stress",
+            "uniq --skip-fiel=2 in out",
+        ],
+    )
+    def test_write_faces_refused(self, inner):
+        reason = _r42_exec_reason(inner)
+        assert reason is not None, inner
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            "iptables --lis -n",
+            "iptables --list-r -n",
+            "swapon --sum",
+            "swapon --sh",
+            "crontab --lis",
+            "fdisk --lis",
+            "dpkg --listf /bin/sh",
+            "dpkg --stat bash",
+            "numactl --har",
+            "numactl --sho",
+            "wget --vers",
+            "wget --hel",
+            "wget --spid http://svc/",
+            "wget --spid --metho=HEAD http://svc/",  # read verb under prefix
+            "nft --vers",
+            "rpm --quer bash",
+            "chrt --ma",
+            "taskset --pi 1",
+            "taskset --pid 1",
+            "uniq --skip-fiel 2 /dev/null",
+            "ipvsadm --lis",
+        ],
+    )
+    def test_abbreviated_readonly_forms_allowed(self, inner):
+        reason = _r42_exec_reason(inner)
+        assert reason is None, reason
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            # Documented errata, measured on the CI host — ALLOW is the
+            # measured behaviour, not an assumption: without ``=`` the whole
+            # ``--sour{print}`` token is ONE unknown long option; awk prints
+            # "unknown option ... ignored" + "no program given", exits 2
+            # and creates no file even when the ignored token held a write.
+            "awk --sour'{print}' /dev/null",
+            "awk --sour'{print > \"/tmp/x\"}' /dev/null",
+            "awk --sour='{print}' /dev/null",
+            "awk -W version",
+            "awk -W posix '{print}' /dev/null",
+            # curl's parser does not abbreviate: ``--out`` is "is unknown"
+            # (exit 2) rather than ``--output`` — nothing to judge.
+            "curl --out /tmp/x http://svc/",
+            "curl --remote-n http://svc/",
+        ],
+    )
+    def test_measured_allow_forms(self, inner):
+        reason = _r42_exec_reason(inner)
+        assert reason is None, reason
+
+
+class TestR42AllowlistArgumentWriteFaces:
+    """Three allowlist names were admitted by NAME alone while carrying an
+    argument-level write face the name never shows (R42, each checked
+    against its own manual):
+
+    - ``dmidecode --dump-bin FILE`` dumps the DMI table to a file
+      (``--dump`` prints the same hex to STDOUT and stays allowed);
+    - ``file -C``/``--compile`` compiles the magic database into ``.mgc``;
+    - ``blkid -g``/``--garbage-collect`` rewrites the blkid cache.
+
+    A short cluster applies EVERY letter, so ``file -bC`` compiles and
+    ``blkid -pg`` garbage-collects exactly as the bare flags do — a
+    head-only ``startswith`` check missed both.
+    """
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            "dmidecode --dump-bin /tmp/d.bin",
+            "file -C -m /tmp/magic",
+            "file -bC -m /tmp/magic",           # bundled C, not at the head
+            "file --compile -m /tmp/magic",
+            "file --compi -m /tmp/magic",       # unique prefix of --compile
+            "blkid -g",
+            "blkid -pg",                        # bundled g, not at the head
+            "blkid --garbage-collect",
+            "blkid --garb",                     # unique prefix
+        ],
+    )
+    def test_argument_write_faces_refused(self, inner):
+        reason = _r42_exec_reason(inner)
+        assert reason is not None, inner
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            "dmidecode --dump",                 # hex to STDOUT, no file
+            "dmidecode --from-dump /tmp/x",     # reads a stored dump
+            "dmidecode -t 4",
+            "file -b /bin/sh",
+            "blkid /dev/sda1",
+        ],
+    )
+    def test_read_forms_allowed(self, inner):
+        reason = _r42_exec_reason(inner)
+        assert reason is None, reason
+
+
+class TestR43ComposedCommandsAndDashOperands:
+    """Two class-level blind spots (R43 — each pinned by source/manual evidence).
+
+    **A composed command line.** A guard judging only the FIRST command token
+    let a writing command ride the read-only one in the same invocation:
+
+    - ``iptables -L -Z`` — ``add_command(&p->command, CMD_ZERO,
+      CMD_LIST | CMD_LIST_RULES)`` declares the pair LEGAL (xshared.c), so
+      the read verb does not clear the line and ``-Z`` really zeroes every
+      chain's counters (man iptables: "It is legal to specify -L as well").
+      ``OPTSTRING_COMMON`` spells the verb ``Z::`` (optional arg), so a
+      SEPARATE ``-Z`` token keeps its write meaning.
+    - ``wget --spider -O FILE`` — ``--spider`` suppresses the response BODY;
+      wget still opens ``opt.output_document`` with ``fopen("wb")``
+      unconditionally (main.c), creating/truncating FILE. The save-to-file
+      judgement used to sit AFTER the spider exemption and never ran.
+
+    **The ``-`` operand.** POSIX getopt does not treat a lone ``-`` as an
+    option: it is the placeholder OPERAND for stdin/stdout. Positional-counting
+    guards using ``not a.startswith("-")`` dropped it:
+
+    - ``xxd IN OUT`` — the second positional is an output file
+      (created/truncated; verified live), and ``xxd - out`` writes too.
+    - ``uniq - out`` — output file (verified live).
+    - ``hostname -`` — net-tools calls ``sethname(argv[optind])`` with no
+      leading-dash filter, so the host name is SET.
+    - ``ss -D FILE`` — "dump raw information ... to FILE" (ss(8));
+      ``-D -`` is stdout and ``-D /dev/null`` discards (both stay allowed).
+
+    The same ``-`` rule was applied to every remaining positional-counting
+    guard (``mount``/``ifconfig``/``taskset``/``chrt``) so the class is
+    CLOSED instead of patched point-by-point.
+
+    **R43's own repair, self-audited (same round).** The full-token scan must
+    NOT read VALUE tokens as options: ``_reachable_cluster`` returns ``""``
+    for a token that does not start with ``-``, so ``iptables -L INPUT`` (I is
+    a write-set character) and ``iptables -L -j DROP`` (D likewise) stay
+    allowed — pinned below, because tightening the scan is exactly how that
+    property would be lost. A bare ``--`` stays inert too: ``_long_flag_hit``
+    returns ``None`` for it (``token == "--"``), so the option terminator can
+    never be read as a prefix of ``--append``/``--zero``. And
+    ``xxd --version`` stays allowed: the universal metadata exemption runs
+    BEFORE xxd's fail-closed long-option refusal — ordered the other way, the
+    guard would mis-reject the standard binary-presence probe.
+    """
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            # composed command lines
+            "iptables -L -Z",
+            "iptables -L -Z -n",
+            "iptables -S -Z",
+            "iptables --list --zero",
+            "iptables -t nat -L -Z",
+            "ip6tables -L -Z",
+            "iptables -L -nZ",                        # bundled write flag
+            "iptables -L --zero=eth0",
+            "iptables -L -F",                         # errors today, refused conservatively
+            "wget --spider -O /tmp/x http://svc/",
+            "wget -q --spider --output-document=/tmp/x http://svc/",
+            "wget --spider -O/tmp/x http://svc/",     # attached value
+            # "-" positional operands
+            "xxd /etc/hostname /tmp/out",
+            "xxd -p /etc/hostname /tmp/out",
+            "xxd -l 64 /etc/hostname /tmp/out",       # value flag, two operands
+            "xxd -l 64 - /tmp/out",                   # stdin IN, file OUT
+            "uniq - /tmp/out",
+            "uniq -c - /tmp/out",
+            "uniq -- - /tmp/out",
+            "hostname -",
+            "hostname -- -",
+            "ss -D /tmp/dump",
+            "ss --diag=/tmp/dump",
+            "ss -D/tmp/dump",                         # attached value
+        ],
+    )
+    def test_composed_writes_and_dash_operands_refused(self, inner):
+        reason = _r42_exec_reason(inner)
+        assert reason is not None, inner
+
+    @pytest.mark.parametrize(
+        "inner",
+        [
+            "iptables -L -n",
+            "iptables -S",
+            "iptables -t nat -L -n",
+            "iptables -L --line-numbers",
+            "ip6tables -L -n",
+            "wget --spider http://svc/",
+            "wget -O - http://svc/",
+            "wget -qO- http://svc/",
+            "wget -O /dev/null http://svc/",
+            "xxd /etc/hostname",
+            "xxd -p /etc/hostname",
+            "xxd -c 16 -l 64 /etc/hostname",          # values are not operands
+            "xxd -l 64",
+            "uniq /etc/hostname",
+            "uniq -",
+            "uniq -- -",
+            "uniq -c /etc/hostname",
+            "hostname",
+            "hostname -f",
+            "hostname -I",
+            "ss -t -a",
+            "ss -D -",                               # stdout dump
+            "ss -D /dev/null",                        # discard
+            # R43 self-audit: the full-token scan must not read VALUE tokens as
+            # options (INPUT / DROP spell write characters), a bare -- is inert,
+            # and the metadata exemption still precedes xxd's long-option refusal.
+            "iptables -L INPUT",
+            "iptables -L -j DROP",
+            "iptables -L --",
+            "xxd --version",
+        ],
+    )
+    def test_read_forms_still_allowed(self, inner):
+        reason = _r42_exec_reason(inner)
+        assert reason is None, reason
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "iptables -L -Z",
+            "xxd /etc/hostname /tmp/out",
+            "uniq - /tmp/out",
+            "hostname -",
+            "wget --spider -O /tmp/x http://svc/",
+            "ss -D /tmp/dump",
+        ],
+    )
+    def test_host_path_shares_the_verdict(self, cmd):
+        """The facts engine re-uses ``_classify_argv``, so the host path
+        (baseline capture / ``host_read``) must reach the identical verdicts."""
+        assert not is_readonly_host_command(cmd), cmd

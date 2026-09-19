@@ -18,6 +18,7 @@ constraint it stays clear of.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from collections.abc import Iterator
@@ -29,6 +30,9 @@ from chaos_agent.agent.target_guard.carriers import _FAULT_BINARIES
 from chaos_agent.agent.target_guard.classifier import (
     KIND_ALIASES,
     canonicalise_kind,
+    is_cluster_scoped_kind,
+    iter_flag_assignments,
+    namespace_values,
     parse_labels,
     parse_namespace,
 )
@@ -82,6 +86,29 @@ _FIX_ESCAPE_VIA_CARRIER = (
     "counts is family-specific and the guard names it when it rejects; a timer "
     "on its own, with no forward mutation, does not qualify."
 )
+_FIX_EXEC_USE_SEPARATOR = (
+    "kubectl requires `--` before an exec/debug inner command: write it as "
+    "`POD [flags] -- COMMAND` (the command-mode form without the separator is "
+    "refused by kubectl itself: \"exec [POD] [COMMAND] is not supported "
+    "anymore\"). If the trailing tokens are flag VALUES, write the flag and "
+    "its value together (`--image=busybox`, `-n default`) so the entry and its "
+    "flags stay the whole command line."
+)
+_FIX_EXEC_ONE_ENTRY = (
+    "The separator closes the ENTRY: write `POD [flags] -- COMMAND` with "
+    "exactly one positional before the `--`. Tokens between the entry and "
+    "the separator are refused because their effect is client-dependent — "
+    "some kubectl versions run them as the command head, others drop them — "
+    "so the guard cannot say what would execute. If the extra token was a "
+    "flag VALUE, glue it to its flag (`--image=busybox`, `-n default`)."
+)
+_FIX_DEBUG_ONE_TARGET = (
+    "One target per call: `debug POD [flags] -- COMMAND` (or `debug "
+    "node/<node> ... -- COMMAND`). Additional positionals are not extra "
+    "flags — kubectl debug resolves each one as a SEPARATE target, creating "
+    "a privileged pod / ephemeral container per target, so the guard cannot "
+    "compare them against the single approved target."
+)
 
 
 # Read-only kubectl subcommands. ``READONLY`` verdict, no comparison.
@@ -133,6 +160,17 @@ BANNED_KUBECTL_SUBS: frozenset[str] = frozenset(
 # Resources allowed to be created via kubectl apply/create -f with stdin_data.
 # Only low-risk resources that don't run workloads. Workload resources
 # (Deployment, DaemonSet, Pod, Job, etc.) are NOT allowed.
+#
+# ``faultdrill`` (openspec faultdrill-cr-channel): the CR CHANNEL's own
+# instance object — a namespaced, low-risk recipe record (the injected
+# fault lives in the swapped Secret / patched Deployment, not in the CR).
+# The whitelist entry is a LOWERCASED literal of
+# ``providers/faultdrill/crd.py:CRD_KIND`` — cross-carrier import would
+# couple the two subpackages, so the drift hazard is pinned by test
+# (``CRD_KIND.lower() in ALLOWED_MANIFEST_KINDS``) instead. The CRD
+# definition object itself (CustomResourceDefinition kind) is
+# deliberately NOT here: it installs programmatically (D2 — the LLM
+# face never sees an admissible CRD install).
 ALLOWED_MANIFEST_KINDS: frozenset[str] = frozenset(
     {
         "persistentvolumeclaim",
@@ -142,8 +180,46 @@ ALLOWED_MANIFEST_KINDS: frozenset[str] = frozenset(
         "configmap",
         "secret",
         "namespace",
+        "faultdrill",
     }
 )
+
+# Workload kinds — every kind that starts containers — on the IMPERATIVE
+# create channel (``kubectl create KIND NAME --image=...`` without -f).
+# Canonicalised names, the same vocabulary ``_classify_kubectl_resource``
+# emits in ``scope``. The manifest channel whitelists the NON-workload
+# kinds above and admits exactly one workload shape (the drill-target
+# Deployment contract); the imperative channel carries no manifest for
+# any contract to inspect, so every workload kind on it is banned
+# wholesale (see the ``sub == "create"`` branch of the dispatcher).
+# kubectl's imperative create today only builds deployment/job/cronjob
+# shapes, but the set is deliberately the full workload family: a kubectl
+# extension or a kind-alias spelling must land in the ban, not in a gap.
+_IMPERATIVE_WORKLOAD_KINDS: frozenset[str] = frozenset(
+    {
+        "pod",
+        "deployment",
+        "daemonset",
+        "statefulset",
+        "replicaset",
+        "replicationcontroller",
+        "job",
+        "cronjob",
+    }
+)
+
+
+# W-55-6: kubectl imperative-create subtype grammar. ``create service`` and
+# ``create secret`` take a SUBTYPE positional before the NAME (``create
+# service clusterip NAME``, ``create secret tls NAME``). The subtype is
+# grammar, not the resource name — the generic positional reader only models
+# ``KIND NAME``, so without stripping the subtype it reads the subtype AS the
+# name and drops the real one. Keyed by canonical kind; values are the kubectl
+# subtype tokens (lowercased).
+_CREATE_SUBTYPES: dict[str, frozenset[str]] = {
+    "service": frozenset({"clusterip", "nodeport", "loadbalancer", "externalname"}),
+    "secret": frozenset({"generic", "docker-registry", "tls"}),
+}
 
 
 def _allowed_manifest_kinds_text() -> str:
@@ -286,6 +362,33 @@ def _classify_kubectl(
     if global_ns and not _rest_has_namespace(rest):
         rest = ["-n", global_ns] + list(rest)
 
+    # Namespace-consistency gate — kubectl's pflag lets a LATER ``-n``
+    # silently override an earlier one (probe: ``get pods -n default
+    # -n kube-system`` returns kube-system pods). A call carrying two
+    # DISTINCT namespaces cannot be anchored to a single one: the
+    # guard would judge the first while kubectl executes the last
+    # (probe G6: ``-n prod pod mypod -nother`` classified against prod
+    # and passed while kubectl would have run in "other"). Form issue,
+    # not a mechanism ban — the compliant form exists (drop one).
+    ns_seen = namespace_values(rest)
+    if len(set(ns_seen)) > 1:
+        return EffectiveTarget(
+            scope=SCOPE_BANNED,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            reject_detail=(
+                "conflicting --namespace values in one call ("
+                + ", ".join(ns_seen)
+                + "): kubectl lets the LAST one silently win, so no single "
+                "namespace can be anchored for the drift check"
+            ),
+            reject_suggestion=(
+                "Re-issue the call with exactly one namespace flag (one "
+                "-n / --namespace, any spelling form)."
+            ),
+        )
+
     # Bans first — short-circuit before any parsing.
     if sub in BANNED_KUBECTL_SUBS:
         return EffectiveTarget(
@@ -309,13 +412,83 @@ def _classify_kubectl(
     # contains only whitelisted resource kinds, allow the operation.
     # Otherwise ban — content from -f <file> is not visible to us.
     if sub in ("apply", "create", "replace", "patch", "set", "delete", "edit"):
+        if _malformed_stdin_data(raw_args):
+            # The tool schema declares stdin_data: str, but the model emits
+            # tool_call args as JSON — a manifest can arrive structured
+            # (dict/list), which crashed the classifier with a TypeError
+            # inside re.findall instead of fail-closing (probe I2).
+            got = type((raw_args or {}).get("stdin_data")).__name__
+            return EffectiveTarget(
+                scope=SCOPE_UNKNOWN,
+                namespace="",
+                raw_command=raw_command,
+                confidence=ConfidenceLevel.HIGH,
+                reject_detail=(
+                    f"kubectl {sub}: stdin_data must be a YAML text string, "
+                    f"got {got} — a structured manifest cannot be classified"
+                ),
+                reject_suggestion=(
+                    "Re-send the manifest as a single YAML string in the "
+                    "stdin_data field (with v_args '-f -')."
+                ),
+            )
+        if _uses_kustomize_input(rest):
+            # Kustomize channel (probe KUSTO): ``-k <dir>`` makes kubectl
+            # BUILD the manifests from a directory the guard cannot see
+            # (apply/delete/replace/create all execute the built objects,
+            # live-verified on kubectl v1.34.1) — the same invisibility
+            # class as ``-f <file>``, one legislation for both. Judged
+            # BEFORE the -f branch so ``-k dir -f -`` (kubectl itself
+            # rejects the combo today) also lands here: one predicate,
+            # every spelling (``-k``, ``-k=dir``, ``-Rk dir``,
+            # ``--kustomize dir``).
+            return EffectiveTarget(
+                scope=SCOPE_BANNED,
+                namespace="",
+                raw_command=raw_command,
+                confidence=ConfidenceLevel.HIGH,
+                reject_detail=(
+                    f"kubectl {sub} -k reads a kustomization DIRECTORY "
+                    "whose built content is not visible to the guard"
+                ),
+                reject_suggestion=(
+                    "Render the kustomization locally (kubectl kustomize "
+                    "<dir>) and pass the resulting manifest via stdin_data "
+                    "with '-f -', containing only these kinds: "
+                    f"{_allowed_manifest_kinds_text()}."
+                ),
+            )
         if _uses_file_input(rest):
             stdin_data = (raw_args or {}).get("stdin_data", "") if raw_args else ""
             if stdin_data:
-                return _classify_kubectl_stdin_manifest(
-                    stdin_data,
-                    rest,
-                    raw_command,
+                if _stdin_filename_flag(rest):
+                    return _classify_kubectl_stdin_manifest(
+                        stdin_data,
+                        rest,
+                        raw_command,
+                        sub,
+                    )
+                # Decoy routing (probe: ``-f /tmp/evil.yaml`` plus a
+                # COMPLIANT stdin manifest classified as compliant):
+                # kubectl reads the file and ignores stdin, so judging
+                # the stdin manifest would bless a call that executes
+                # different content.
+                return EffectiveTarget(
+                    scope=SCOPE_BANNED,
+                    namespace="",
+                    raw_command=raw_command,
+                    confidence=ConfidenceLevel.HIGH,
+                    reject_detail=(
+                        f"kubectl {sub} carries BOTH '-f <file-or-url>' and "
+                        "stdin_data: kubectl reads the file, so the manifest "
+                        "the guard can see (stdin_data) is NOT the one that "
+                        "gets executed"
+                    ),
+                    reject_suggestion=(
+                        "Re-issue with '-f -' so kubectl reads the manifest "
+                        "from stdin_data — then the classified manifest IS "
+                        "the executed manifest."
+                    ),
                 )
             return EffectiveTarget(
                 scope=SCOPE_BANNED,
@@ -492,7 +665,61 @@ def _classify_kubectl(
     if sub == "create":
         # create RESOURCE name (without -f) — limited use, classify
         # by resource kind.
-        return _classify_kubectl_resource(rest, raw_command, default_kind=None)
+        # W-55-6: strip the imperative-create subtype positional (``create
+        # service clusterip NAME`` / ``create secret tls NAME``) before the
+        # generic reader — the subtype is grammar, not the resource name.
+        # Removed BY INDEX (the second positional's own slot from the shared
+        # ``_iter_positionals`` walk), not by value — ``list.remove(token)``
+        # would strip the first string match, so a flag value that happens to
+        # equal the subtype (``-n clusterip``) would be removed instead.
+        # raw_command is left untouched (audit fidelity).
+        _rest = rest
+        _pos_idx = list(_iter_positionals(rest))
+        if len(_pos_idx) >= 2:
+            _subs = _CREATE_SUBTYPES.get(canonicalise_kind(_pos_idx[0][1]))
+            if _subs and _pos_idx[1][1].lower() in _subs:
+                _rest = list(rest)
+                del _rest[_pos_idx[1][0]]
+        eff = _classify_kubectl_resource(_rest, raw_command, default_kind=None)
+        # Workload kinds are a MECHANISM ban on the IMPERATIVE channel
+        # (code review 2026-09-11, probe-verified): imperative create
+        # succeeds iff the object is ABSENT — exactly the drill-target
+        # staging scenario — yet carries no manifest the shape contract
+        # (T1-T5: single doc, one container, no privilege surface, image
+        # allow-set, volume kinds) could ever see, and nothing registers
+        # the created workload on the cleanup chain. The same
+        # create-succeeds-iff-absent logic that justified narrowing the
+        # manifest channel to apply/create cuts the other way here: the
+        # ONLY compliant staging form is the manifest contract, so the
+        # imperative form has no legitimate use. Non-workload kinds
+        # (namespace/secret/configmap/quota — the ALLOWED_MANIFEST set's
+        # siblings) keep the generic classification below.
+        if eff.scope in _IMPERATIVE_WORKLOAD_KINDS:
+            return EffectiveTarget(
+                scope=SCOPE_BANNED,
+                namespace="",
+                raw_command=raw_command,
+                confidence=ConfidenceLevel.HIGH,
+                mechanism_banned=True,
+                reject_detail=(
+                    f"imperative 'kubectl create {eff.scope}' starts a "
+                    f"{eff.scope} whose shape the guard cannot verify "
+                    "(image, command, lifetime) and whose cleanup the task "
+                    "cannot track"
+                ),
+                reject_suggestion=(
+                    "Stage the drill target in-band via the manifest channel: "
+                    "'kubectl apply -f -' with stdin_data under the "
+                    "drill-target contract (single Deployment document, "
+                    "metadata.name = the approved target name, exactly one "
+                    "container under spec.template.spec with no "
+                    "initContainers, no host* / privileged / capabilities / "
+                    "hostPath, an image from the carrier allow-set, "
+                    "persistentVolumeClaim/configMap/secret volumes only) — "
+                    "or inject into a workload that already exists."
+                ),
+            )
+        return eff
 
     if sub == "apply":
         # apply without -f AND without stdin_data (diagnosed above) — a
@@ -636,7 +863,9 @@ def _rest_has_namespace(rest: list[str]) -> bool:
 
     Used by ``_classify_kubectl`` to decide whether to inject the
     pre-subcommand global namespace. We don't want to clobber an
-    explicit per-subcommand ns with a global one.
+    explicit per-subcommand ns with a global one. Reads through
+    ``iter_flag_assignments`` so combined shorthand bundles
+    (``-nprod``) count as carrying a namespace too.
 
     Stops scanning at the ``--`` separator — anything after it is the
     INNER command of ``kubectl exec`` (or similar) and its ``-n`` would
@@ -645,59 +874,204 @@ def _rest_has_namespace(rest: list[str]) -> bool:
     would falsely report that the OUTER kubectl carries a namespace,
     suppressing global-ns propagation.
     """
-    for a in rest:
-        if a == "--":
-            return False
-        if a in ("-n", "--namespace"):
-            return True
-        if a.startswith("-n=") or a.startswith("--namespace="):
-            return True
-    return False
+    return any(
+        name == "--namespace" for name, _value, _origin in iter_flag_assignments(rest)
+    )
 
 
 def _uses_file_input(args: list[str]) -> bool:
     """Return True if any ``-f`` / ``--filename`` flag is present.
 
+    Reads through ``iter_flag_assignments`` so every pflag spelling
+    counts: separated (``-f -``), ``=`` forms, and bundle-interior
+    absorption (``-f-`` = stdin, ``-fdir/x.yaml``, ``-Rf x.yaml`` —
+    the trailing ``f`` absorbs the next arg).
+
     Stdin (``-f -``) and URL inputs are indistinguishable from local
-    files at this layer — we ban them all because the content is not
-    in the tool_call arg list.
+    files at this layer — the caller distinguishes stdin via
+    ``_stdin_filename_flag``; everything else is banned because the
+    content is not in the tool_call arg list.
     """
-    for i, a in enumerate(args):
-        if a in ("-f", "--filename"):
-            return True
-        if a.startswith("-f=") or a.startswith("--filename="):
-            return True
-    return False
+    return any(
+        name == "--filename" for name, _value, _origin in iter_flag_assignments(args)
+    )
+
+
+def _uses_kustomize_input(args: list[str]) -> bool:
+    """True if a ``-k`` / ``--kustomize`` flag is present.
+
+    The kustomize channel reads manifests from a DIRECTORY the guard
+    cannot see (kustomization.yaml + resources + patches build at
+    apply time) — the same invisibility class as ``-f <file>``: any
+    identity the guard classified would describe content kubectl does
+    not execute. Reads through ``iter_flag_assignments`` so bundled
+    (``-Rk``), glued (``-k=dir``) and long (``--kustomize dir``)
+    spellings all count (probe KUSTO, kubectl v1.34.1 live:
+    apply/delete/replace/create all execute the built objects).
+    """
+    return any(
+        name == "--kustomize"
+        for name, _value, _origin in iter_flag_assignments(args)
+    )
+
+
+def _stdin_filename_flag(args: list[str]) -> bool:
+    """True when EVERY ``-f`` / ``--filename`` value is exactly ``-``.
+
+    ``--filename`` is a REPEATABLE pflag (StringArray): ``-f - -f
+    x.yaml`` makes kubectl apply BOTH the stdin manifest AND the file
+    (probe I1c/I1d: dry-run shows both objects created, in either
+    flag order). Judging only the FIRST value let the stdin+file mix
+    through the stdin channel — the guard would audit the compliant
+    stdin manifest while kubectl also executes the invisible file
+    content (the P8 decoy class reached through the repetition
+    dimension). Every filename value must therefore be ``-``; any
+    non-"-" value routes the call to the decoy/file ban instead.
+    """
+    saw_filename = False
+    for name, value, _origin in iter_flag_assignments(args):
+        if name == "--filename":
+            saw_filename = True
+            if value != "-":
+                return False
+    return saw_filename
+
+
+def _malformed_stdin_data(raw_args: dict[str, Any] | None) -> bool:
+    """True when stdin_data is present but not a string.
+
+    The tool schema declares ``stdin_data: str``, but the model emits
+    tool_call arguments as JSON — a manifest can arrive structured
+    (dict / list), which would crash the classifier with a TypeError
+    inside ``re.findall`` instead of fail-closing (probe I2: a dict
+    stdin_data raised straight out of ``infer_effective_target``).
+    """
+    if raw_args is None or "stdin_data" not in raw_args:
+        return False
+    return not isinstance(raw_args.get("stdin_data"), str)
+
+
+def _stdin_manifest_docs(yaml_str: str) -> list[dict[str, Any]] | None:
+    """Structurally parse every document of a stdin manifest.
+
+    Text regexes and the YAML/JSON parser disagree on legal spellings:
+    a quoted key (``"kind": ClusterRole``) and a whole JSON document
+    are invisible to ``^kind:`` yet fully executed by kubectl (probe
+    J1/J2b: dry-run created the ConfigMap AND the ClusterRole while
+    the guard saw only the ConfigMap); a pure-JSON manifest is legal
+    kubectl input the regex could not see at all (probe J2). Parsing
+    is the only layer kubectl itself consults, so the guard must
+    parse too. Returns None on a YAML error (callers fail-closed);
+    non-mapping documents are dropped — kubectl rejects them itself
+    (probe J4: 'invalid object to validate').
+    """
+    try:
+        docs = [d for d in yaml.safe_load_all(yaml_str) if d is not None]
+    except yaml.YAMLError:
+        return None
+    return [d for d in docs if isinstance(d, dict)]
 
 
 def _extract_all_kinds_from_yaml(yaml_str: str) -> list[str]:
     """Extract ALL 'kind' fields from YAML (handles multi-document ``---``)."""
-    return re.findall(r"^kind:\s*(\S+)", yaml_str, re.MULTILINE)
+    docs = _stdin_manifest_docs(yaml_str)
+    if docs is None:
+        return []
+    kinds: list[str] = []
+    for doc in docs:
+        kind = doc.get("kind")
+        if isinstance(kind, str) and kind:
+            kinds.append(kind)
+    return kinds
 
 
-def _extract_name_from_yaml(yaml_str: str) -> str:
-    """Extract first ``metadata.name`` from YAML string."""
-    m = re.search(r"^\s+name:\s*(\S+)", yaml_str, re.MULTILINE)
-    return m.group(1) if m else ""
+# Flags that widen a stdin-manifest call's EFFECT beyond the manifest text.
+# ``apply --prune`` deletes live resources absent from the manifest
+# (officially those created by apply/create --save-config — in a
+# declaratively-managed cluster that is nearly everything), ``--all``
+# widens the operand set to every resource of the kind, and
+# ``-A`` / ``--all-namespaces`` widen across namespaces. The guard's
+# visibility boundary IS the manifest text: with one of these flags the
+# approved call (create the manifest's objects) and the executed call
+# (create AND delete a set the guard never saw) are not the same thing,
+# and the deletion bypasses every identity anchor. Third-round review
+# finding (2026-09-11, probe-verified P5/P6/P7 — all three stdin
+# channels passed ``--prune`` through); user ruling: ban them at the
+# SHARED manifest entry so every channel (drill-target contract /
+# occupant pod / generic kind whitelist) is covered by one gate. A FORM
+# issue, not a mechanism ban — the compliant form exists (drop the flag,
+# re-send the same manifest); an explicit ``=false`` off-form is inert
+# and passes.
 
 
-def _extract_namespace_from_yaml(yaml_str: str) -> str:
-    """Extract first ``metadata.namespace`` from YAML string."""
-    m = re.search(r"^\s+namespace:\s*(\S+)", yaml_str, re.MULTILINE)
-    return m.group(1) if m else ""
+def _stdin_manifest_widening_flag(rest: list[str]) -> str:
+    """Return the first range-widening flag token in ``rest``, or "".
+
+    Boolean flags accept an explicit ``=false`` off-form (inert — the
+    call's effect stays inside the manifest text; pflag supports
+    ``-A=false``, probe-verified). ``--prune-allowlist`` takes a LIST
+    value and exists only to steer ``--prune``, so any form of it
+    counts. Reads through ``iter_flag_assignments`` so pflag shorthand
+    bundles are judged positionally: a capital ``A`` at a shorthand
+    position (``-An prod`` = ``-A -n prod``) counts as the
+    all-namespaces widening, while an ``A`` inside a VALUE (``-nApp`` =
+    namespace "App", ``-lapp=App`` = selector) is inert — which plain
+    substring matching cannot tell apart (round-4 probes F1a/F1b/F1d:
+    the interim fix false-rejected all three while letting ``-nProd``
+    through — same shape, opposite verdicts).
+    """
+    for name, value, origin in iter_flag_assignments(rest):
+        if name == "--prune-allowlist":
+            return origin
+        if name in ("--prune", "--all", "--all-namespaces"):
+            if value is None:
+                return origin  # bare flag: pflag defaults it to true
+            if str(value).strip().lower() not in ("false", "0", "f"):
+                # truthy, or unparseable — kubectl itself rejects
+                # unparseable values client-side, so failing closed here
+                # costs nothing
+                return origin
+            # explicit off-form (``-A=false`` / ``--prune=0``): inert
+    return ""
 
 
 def _classify_kubectl_stdin_manifest(
     stdin_data: str,
     rest: list[str],
     raw_command: str,
+    sub: str,
 ) -> EffectiveTarget:
-    """Classify ``kubectl apply/create -f -`` with inline YAML via stdin_data.
+    """Classify ``kubectl <mutating-sub> -f -`` with inline YAML via stdin_data.
 
     Multi-document safety: ALL ``kind`` values must be in
     ``ALLOWED_MANIFEST_KINDS``. A single non-whitelisted kind causes
-    the entire call to be BANNED.
+    the entire call to be BANNED. FaultDrill documents are additionally
+    SINGLE-document (P7, handle integrity: one apply = one CR = one
+    recovery handle). ``sub`` additionally gates the drill-target
+    Deployment branch (staging channels apply/create only).
+    Range-widening flags (--prune / --all / -A / …) are refused at this
+    entry — see ``_stdin_manifest_widening_flag``.
     """
+    widening = _stdin_manifest_widening_flag(rest)
+    if widening:
+        return EffectiveTarget(
+            scope=SCOPE_BANNED,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            reject_detail=(
+                f"'{widening}' widens the call's effect beyond the manifest "
+                "text (--prune deletes live resources absent from the "
+                "manifest; --all / -A widen the operand set), and the guard "
+                "can only see the manifest — the flag-driven part would "
+                "bypass every identity anchor"
+            ),
+            reject_suggestion=(
+                "Re-issue the call WITHOUT the flag, applying the manifest "
+                "text as-is; deleting pre-existing resources is a separate, "
+                "individually-approved call."
+            ),
+        )
     kinds = _extract_all_kinds_from_yaml(stdin_data)
     if not kinds:
         return EffectiveTarget(
@@ -716,14 +1090,171 @@ def _classify_kubectl_stdin_manifest(
         )
     lower_kinds = [k.lower() for k in kinds]
     if all(k in ALLOWED_MANIFEST_KINDS for k in lower_kinds):
+        # Anchor EVERY document, not just the first: kubectl creates every
+        # document (probe K1: a two-doc all-whitelisted apply created
+        # ok-cm@default AND evil-cm@kube-system while the guard anchored
+        # only doc 1 and ALLOWed — doc 2 rode along with no name/ns anchor
+        # at all). kubectl resolves each doc's namespace individually
+        # (probe K-K1), and rejects an explicit -n that conflicts with a
+        # doc's own namespace (probe K-K2/K-K8) — so conflicting doc
+        # namespaces can never be anchored by one value: form-issue them,
+        # same legislation as the --namespace consistency gate.
+        # Kubectl creates every document as its OWN kind while the
+        # approval's scope anchors exactly ONE (probe M3: a two-doc
+        # ConfigMap+Secret apply under a namespace-wide configmap approval
+        # ALLOWed and the dry run created both — the Secret document rode
+        # along with no scope anchor at all). Same legislation as the
+        # mixed-namespace gate below: no single scope value can anchor a
+        # mixed-kind apply, form-issue it. Kind identity is compared
+        # lower-cased (kubectl itself rejects non-canonical spellings like
+        # ``kind: CONFIGMAP``, probe M5 — the mapper has no such kind — so
+        # case-merging is fail-closed on the executor side).
+        if len(set(lower_kinds)) > 1:
+            return EffectiveTarget(
+                scope=SCOPE_BANNED,
+                namespace="",
+                raw_command=raw_command,
+                confidence=ConfidenceLevel.HIGH,
+                reject_detail=(
+                    "the -f/stdin manifest mixes kinds ("
+                    + ", ".join(kinds)
+                    + "): kubectl creates every document as its own kind "
+                    "while the approval's scope anchors exactly one, so a "
+                    "document of an unapproved kind rides along with no "
+                    "scope anchor"
+                ),
+                reject_suggestion=(
+                    "Split the manifest into one kind per apply, or keep "
+                    "every document the same kind as the approved scope."
+                ),
+            )
+        # FaultDrill documents are SINGLE-document by legislation (P7,
+        # second-round adversarial review of faultdrill-cr-channel): the
+        # carrier's recovery handle references exactly ONE ns/name
+        # (``build_handle_from_messages`` hydrates the first document),
+        # so a second FaultDrill document in the same apply injects a
+        # second fault whose CR no handle ever references — leaked,
+        # unrecoverable through the reconcile path. The general branch
+        # anchors every document's NAME (``names`` tuple), but the
+        # faultdrill handle layer cannot consume a tuple; same
+        # single-document shape the pod-occupant and drill-target
+        # contracts legislate below.
+        if lower_kinds[0] == "faultdrill" and len(kinds) > 1:
+            return EffectiveTarget(
+                scope=SCOPE_BANNED,
+                namespace="",
+                raw_command=raw_command,
+                confidence=ConfidenceLevel.HIGH,
+                reject_detail=(
+                    "the -f/stdin manifest carries more than one FaultDrill "
+                    "document: each CR injects its OWN fault, but the "
+                    "channel's recovery handle references exactly one "
+                    "ns/name — a second CR's fault would leak with no "
+                    "recovery path"
+                ),
+                reject_suggestion=(
+                    "Apply one FaultDrill CR per apply call; carry the "
+                    "second fault in a separate, individually-approved "
+                    "apply."
+                ),
+            )
+        docs = _stdin_manifest_docs(stdin_data) or []
+        names: list[str] = []
+        doc_namespaces: list[str] = []
+        doc_labels: list[dict[str, str]] = []
+        for d in docs:
+            meta = d.get("metadata") if isinstance(d, dict) else None
+            meta = meta if isinstance(meta, dict) else {}
+            n = meta.get("name")
+            if isinstance(n, str) and n:
+                names.append(n)
+            ns = meta.get("namespace")
+            if isinstance(ns, str) and ns:
+                doc_namespaces.append(ns)
+            raw_labels = meta.get("labels")
+            if isinstance(raw_labels, dict):
+                doc_labels.append({str(k): str(v) for k, v in raw_labels.items()})
+            else:
+                doc_labels.append({})
         namespace = parse_namespace(rest, default="")
         if not namespace:
-            namespace = _extract_namespace_from_yaml(stdin_data)
-        name = _extract_name_from_yaml(stdin_data)
+            if len(set(doc_namespaces)) > 1:
+                return EffectiveTarget(
+                    scope=SCOPE_BANNED,
+                    namespace="",
+                    raw_command=raw_command,
+                    confidence=ConfidenceLevel.HIGH,
+                    reject_detail=(
+                        "the -f/stdin manifest mixes namespaces ("
+                        + ", ".join(doc_namespaces)
+                        + "): kubectl creates each document in its own "
+                        "namespace, so no single namespace can be anchored "
+                        "for the drift check"
+                    ),
+                    reject_suggestion=(
+                        "Split the manifest into one namespace per apply, or "
+                        "align every document's metadata.namespace."
+                    ),
+                )
+            # Explicit/implicit mix (probe NS-MIX): a doc WITHOUT a
+            # namespace lands in "default" while its explicit siblings
+            # land in their own — kubectl writes two namespaces, but
+            # doc_namespaces only records the explicit ones, so the
+            # anchor below would over-claim the implicit docs into the
+            # explicit namespace and the per-name reconciliation would
+            # happily pass an in-contract check for an out-of-contract
+            # (default) write. Same legislation as the mixed-namespace
+            # gate above: form-issue it. A manifest whose explicit
+            # namespaces are ALL "default" stays legal — the implicit
+            # docs land in "default" too, so one value still anchors.
+            implicit_docs = len(docs) - len(doc_namespaces)
+            if (
+                doc_namespaces
+                and implicit_docs
+                and set(doc_namespaces) != {"default"}
+            ):
+                return EffectiveTarget(
+                    scope=SCOPE_BANNED,
+                    namespace="",
+                    raw_command=raw_command,
+                    confidence=ConfidenceLevel.HIGH,
+                    reject_detail=(
+                        "the -f/stdin manifest mixes documents with an "
+                        "explicit namespace ("
+                        + ", ".join(doc_namespaces)
+                        + ") and documents without one: kubectl creates "
+                        "the namespace-less documents in \"default\" while "
+                        "the explicit ones land elsewhere, so no single "
+                        "namespace can be anchored for the drift check"
+                    ),
+                    reject_suggestion=(
+                        "Give every document the same metadata.namespace, or "
+                        "pass --namespace explicitly so the namespace-less "
+                        "documents inherit it."
+                    ),
+                )
+            namespace = doc_namespaces[0] if doc_namespaces else ""
+        # Labels anchor (probe M4): this branch never extracted manifest
+        # labels, so a label-only approval rejected a fully-compliant
+        # whitelisted apply while the SAME shape on the deployment
+        # contract branch passed — two branches of one channel, two
+        # verdicts. Multi-document semantics: the INTERSECTION of every
+        # document's labels, so the guard's superset check
+        # (effective ⊇ approved) passes exactly when EVERY created
+        # object carries the approved labels — a document without them
+        # empties the intersection and the call stays unanchored
+        # (fail-closed), rather than one labelled document vouching for
+        # an unlabelled sibling (fail-open). Single document: the
+        # intersection is that document's labels, matching the
+        # deployment branch.
+        labels: dict[str, str] = dict(doc_labels[0]) if doc_labels else {}
+        for other in doc_labels[1:]:
+            labels = {k: v for k, v in labels.items() if other.get(k) == v}
         return EffectiveTarget(
             scope=canonicalise_kind(kinds[0]),
             namespace=namespace,
-            names=(name,) if name else (),
+            names=tuple(names),
+            labels=labels,
             confidence=ConfidenceLevel.HIGH,
             raw_command=raw_command,
         )
@@ -733,6 +1264,23 @@ def _classify_kubectl_stdin_manifest(
     # the contract must see the whole effect, and a side document hides it.
     if lower_kinds == ["pod"]:
         return _classify_vehicle_pod_manifest(stdin_data, rest, raw_command)
+    # Drill target: a SINGLE Deployment document may pass when it satisfies
+    # the drill-target contract — the victim workload the task stages in-band
+    # when the approved target does not exist yet. Multi-document manifests
+    # stay refused (a side document hides part of the effect from the
+    # contract), same single-document policy as the occupant branch above.
+    # The staging channels are apply/create ONLY (code review 2026-09-11,
+    # probe-verified): kubectl replace 404s on an absent object, so it can
+    # never stage a new target — through the manifest channel it admits only
+    # re-shaping a PRE-EXISTING deployment, which would register it as
+    # task-owned and put a persistent workload on the cleanup (delete) chain;
+    # delete/patch/set/edit -f serve no staging purpose either and keep the
+    # standing workload-kind mechanism ban. The pod occupant branch keeps the
+    # wider dispatch: an occupant is a bounded-lifetime disposable vehicle
+    # (activeDeadlineSeconds self-expiry), so tracking-and-cleaning any
+    # occupant-shaped execution is the correct outcome there.
+    if lower_kinds == ["deployment"] and sub in ("apply", "create"):
+        return _classify_drill_target_manifest(stdin_data, rest, raw_command)
     if "pod" in lower_kinds:
         return EffectiveTarget(
             scope=SCOPE_BANNED,
@@ -747,6 +1295,39 @@ def _classify_kubectl_stdin_manifest(
                 "Apply the occupant pod as the ONLY document in stdin_data; "
                 "apply any whitelisted resources "
                 f"({_allowed_manifest_kinds_text()}) in separate calls."
+            ),
+        )
+    # Reshape distinction (inject-cc2d5080): a manifest whose EVERY kind is
+    # carried by the imperative create channel (the recovery-carrier RBAC
+    # family, :data:`_RECOVERY_CARRIER_CREATE_KINDS`) is a FORM rejection,
+    # not a mechanism ban — the same objects pass the guard as separate
+    # ``kubectl create sa <name>`` calls, so the model must be told that
+    # reshape exists. In that task the mislabel rendered "no reshape of
+    # this call will pass", which steered the model off its approved
+    # carrier-stacking path and into a forced un-armed injection.
+    from chaos_agent.agent.execution_artifacts import (
+        _RECOVERY_CARRIER_CREATE_KINDS,
+    )
+
+    if lower_kinds and all(
+        k in _RECOVERY_CARRIER_CREATE_KINDS for k in lower_kinds
+    ):
+        return EffectiveTarget(
+            scope=SCOPE_BANNED,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            reject_detail=(
+                "the manifest contains resource kinds the manifest channel "
+                f"does not whitelist ({', '.join(kinds)})"
+            ),
+            reject_suggestion=(
+                "The manifest whitelist covers only "
+                f"{_allowed_manifest_kinds_text()}; RBAC objects travel on "
+                "the IMPERATIVE channel instead — re-issue each object as "
+                "its own call ('kubectl create sa <name> -n <ns>', "
+                "'kubectl create clusterrole <name> ...'), one object per "
+                "call."
             ),
         )
     return EffectiveTarget(
@@ -764,11 +1345,16 @@ def _classify_kubectl_stdin_manifest(
             f"({', '.join(kinds)})"
         ),
         reject_suggestion=(
-            f"Accepted kinds: {_allowed_manifest_kinds_text()}. Workload "
-            "kinds (Deployment / DaemonSet / Pod / Job / …) are refused "
-            "because they start containers whose blast radius the guard "
-            "cannot scope — inject into a workload that already exists "
-            "instead of creating one."
+            f"Accepted kinds: {_allowed_manifest_kinds_text()} — plus a "
+            "single-document Deployment under the drill-target contract "
+            "(metadata.name = the approved target name, exactly one "
+            "container under spec.template.spec with no initContainers, no "
+            "host* / privileged / capabilities / hostPath, an image from "
+            "the carrier allow-set, persistentVolumeClaim/configMap/secret "
+            "volumes only), applied alone. Other workload kinds (DaemonSet / "
+            "StatefulSet / Job / …) start containers whose blast radius the "
+            "guard cannot scope — inject into a workload that already "
+            "exists instead of creating one."
         ),
     )
 
@@ -1002,6 +1588,16 @@ def _classify_vehicle_pod_manifest(
                 "the occupant pod violates the drill vehicle contract: "
                 + "; ".join(violations)
             ),
+            # B48 (case #33, pending): the occupant contract is the ONLY
+            # Pod-creation carve-out, so observation / probe carriers for
+            # non-occupancy drills have no legal create path, and this
+            # suggestion ("re-apply the SAME manifest") invites compliance
+            # toward PVC-holding even when the drill is not resource
+            # occupancy. A scenario-diversion sentence was tried and
+            # reverted (2026-09-10, user ruling: point patch, not a general
+            # solution). The general fix is a second exemption shape
+            # (PVC-less, bounded-lifetime carrier) — awaiting a real-drill
+            # need before expanding the write set.
             reject_suggestion=(
                 "A behaviourless occupant pod IS permitted — fix the listed "
                 "constraints and re-apply the SAME manifest: sleep-only "
@@ -1029,6 +1625,239 @@ def _classify_vehicle_pod_manifest(
         raw_command=raw_command,
         is_vehicle_manifest=True,
         occupant_claims=_extract_occupant_claims(spec),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Drill-target contract (manifest channel)
+#
+# A drill whose approved target does not exist yet (deleted out-of-band, or
+# never staged) needs the task to CREATE the victim workload itself — case
+# #38: the dedicated PVC-mounting target was gone and the first planning
+# round looped 30 minutes against the blanket workload-create ban. The
+# carve-out mirrors the occupant contract's verifiable-from-the-manifest
+# discipline, with the deployment-appropriate differences:
+#
+#   T2 one container (no initContainers) — the container surface, and so
+#      the blast radius, stays enumerable; unlike an occupant the command
+#      is NOT constrained (a victim workload may do real work — that is
+#      what gets faulted);
+#   T3 no privilege surface — host* flags, privileged/capabilities
+#      securityContext, hostPath volumes;
+#   T4 image ∈ the carrier allow-set (configured ∪ auto-discovered);
+#   T5 volumes limited to persistentVolumeClaim/configMap/secret — data
+#      volumes only (user ruling 2026-09-11: all three kinds, once —
+#      configMap- and secret-mounting targets are real workload shapes and
+#      PVC-only would make the victim unrealistic).
+#
+# Identity is NOT part of this gate: the manifest's metadata.name must be
+# declared, but whether it equals the approved target name is the
+# SCREENER's ordinary drift question — the drill target's name IS the
+# approved identity (unlike an occupant's generated name, which can never
+# match). Deployment has no activeDeadlineSeconds, so lifetime is governed
+# task-side: the screener registers the ALLOW as an ``occupant_deployment``
+# vehicle artifact whose cleanup chain deletes it.
+#
+# NOTE the path trap: unlike a Pod manifest (fields at spec.* directly), a
+# Deployment keeps the whole container surface inside spec.template.spec —
+# a checker that reads the pod-level paths instead silently misses every
+# constraint below.
+# ---------------------------------------------------------------------------
+
+_DRILL_TARGET_VOLUME_KINDS: frozenset[str] = frozenset(
+    {"persistentVolumeClaim", "configMap", "secret"}
+)
+
+
+def _drill_target_violations(doc: dict) -> list[str]:
+    """Validate one parsed Deployment document against the drill-target contract.
+
+    Returns the list of violated constraints (empty = compliant). Every
+    entry names the constraint and the fix, so the rejection text can be
+    surfaced verbatim as the actionable suggestion.
+    """
+    violations: list[str] = []
+    meta = doc.get("metadata") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+
+    # Explicit identity: the manifest name is what the screener anchors the
+    # ALLOW on (it must equal the approved target name) and what the cleanup
+    # chain deletes. generateName would leave the workload untrackable — and
+    # uncleanable.
+    if not str(meta.get("name") or ""):
+        violations.append(
+            "metadata.name must be declared explicitly (generateName is not "
+            "allowed — the drill target's identity must be fixed up front)"
+        )
+
+    spec = doc.get("spec") or {}
+    if not isinstance(spec, dict):
+        spec = {}
+    template = spec.get("template") or {}
+    if not isinstance(template, dict):
+        template = {}
+    pod_spec = template.get("spec") or {}
+    if not isinstance(pod_spec, dict) or not pod_spec:
+        violations.append(
+            "spec.template.spec must be declared — a Deployment keeps its "
+            "container, volumes and host flags under spec.template.spec (the "
+            "pod template), not under spec directly"
+        )
+        pod_spec = pod_spec if isinstance(pod_spec, dict) else {}
+
+    # T2 — exactly one container and no initContainers.
+    if pod_spec.get("initContainers"):
+        violations.append(
+            "spec.template.spec.initContainers are not allowed on a drill "
+            "target — the container surface must be exactly one container"
+        )
+    containers = pod_spec.get("containers")
+    if not isinstance(containers, list) or len(containers) != 1:
+        violations.append(
+            "spec.template.spec.containers must declare exactly one container"
+        )
+        containers = []
+    for i, c in enumerate(containers):
+        cname = str(c.get("name") or f"#{i}") if isinstance(c, dict) else f"#{i}"
+        if not isinstance(c, dict):
+            violations.append(f"container {cname} is not a mapping")
+            continue
+        # T3 container-level privilege surface
+        sec = c.get("securityContext") or {}
+        if isinstance(sec, dict) and (sec.get("privileged") or sec.get("capabilities")):
+            violations.append(
+                f"container '{cname}' securityContext must not set privileged "
+                "or capabilities"
+            )
+        # T4 image allow-set — same set as recovery carriers (configured ∪
+        # auto-discovered healthy DaemonSet images).
+        image = str(c.get("image") or "")
+        if image not in _recovery_carrier_allowed_images():
+            violations.append(_recovery_carrier_image_hint(image))
+
+    # T3 pod-level privilege surface
+    for flag in ("hostNetwork", "hostPID", "hostIPC"):
+        if pod_spec.get(flag):
+            violations.append(
+                f"spec.template.spec.{flag} must not be set on a drill target"
+            )
+
+    # T3/T5 volumes — hostPath is a privilege surface; the data-volume
+    # kinds are persistentVolumeClaim / configMap / secret. No minimum
+    # count: a drill target does not need any volume.
+    volumes = pod_spec.get("volumes")
+    for v in volumes if isinstance(volumes, list) else []:
+        vname = str(v.get("name") or "?") if isinstance(v, dict) else "?"
+        if not isinstance(v, dict):
+            violations.append(f"volume '{vname}' is not a mapping")
+            continue
+        if v.get("hostPath") is not None:
+            violations.append(
+                f"volume '{vname}' must not be a hostPath volume — hostPath "
+                "is a host privilege surface"
+            )
+            continue
+        if not any(v.get(k) is not None for k in _DRILL_TARGET_VOLUME_KINDS):
+            violations.append(
+                f"volume '{vname}' must be a persistentVolumeClaim, configMap "
+                "or secret volume — drill targets mount nothing else"
+            )
+    return violations
+
+
+def _classify_drill_target_manifest(
+    stdin_data: str,
+    rest: list[str],
+    raw_command: str,
+) -> EffectiveTarget:
+    """Classify a single-Deployment apply/create against the drill-target
+    contract.
+
+    A compliant manifest classifies as a normal scope=deployment creation
+    PLUS ``is_drill_target_manifest`` — the screener anchors it on the
+    approved target name through the ORDINARY drift net and registers the
+    ALLOW as an ``occupant_deployment`` vehicle artifact. Contract
+    violations are a reshapeable form issue.
+    """
+    try:
+        docs = [d for d in yaml.safe_load_all(stdin_data) if d]
+    except yaml.YAMLError as exc:
+        return EffectiveTarget(
+            scope=SCOPE_BANNED,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            reject_detail=(
+                f"the drill-target manifest does not parse as YAML: {exc}"
+            ),
+            reject_suggestion=(
+                "Fix the YAML syntax and re-apply the drill-target deployment."
+            ),
+        )
+    # Single-document policy: the contract must see the WHOLE effect. A side
+    # document — even one with no ``kind:`` that the kinds regex cannot see —
+    # hides part of the apply from this check. (The dispatcher's
+    # ``lower_kinds == ["deployment"]`` already implies a single document;
+    # this check stays as defence-in-depth, same as the occupant branch.)
+    if len(docs) != 1:
+        return EffectiveTarget(
+            scope=SCOPE_BANNED,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            reject_detail=(
+                f"the drill-target manifest carries {len(docs)} documents; a "
+                "drill-target deployment must be applied alone"
+            ),
+            reject_suggestion=(
+                "Apply the drill-target deployment as the ONLY document in "
+                "stdin_data."
+            ),
+        )
+    doc = docs[0] if docs else {}
+    if not isinstance(doc, dict):
+        doc = {}
+    violations = _drill_target_violations(doc)
+    if violations:
+        return EffectiveTarget(
+            scope=SCOPE_BANNED,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            reject_detail=(
+                "the drill-target deployment violates the drill target "
+                "contract: " + "; ".join(violations)
+            ),
+            reject_suggestion=(
+                "A dedicated drill-target Deployment IS permitted in-band — "
+                "fix the listed constraints and re-apply the SAME manifest: "
+                "metadata.name equal to the approved target name, exactly one "
+                "container under spec.template.spec (no initContainers), no "
+                "host* / privileged / capabilities / hostPath, an image from "
+                "the carrier allow-set, and only persistentVolumeClaim / "
+                "configMap / secret volumes."
+            ),
+        )
+    meta = doc.get("metadata") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    name = str(meta.get("name") or "")
+    namespace = parse_namespace(rest, default="")
+    if not namespace:
+        namespace = str(meta.get("namespace") or "")
+    labels: dict[str, str] = {}
+    raw_labels = meta.get("labels")
+    if isinstance(raw_labels, dict):
+        labels = {str(k): str(v) for k, v in raw_labels.items()}
+    return EffectiveTarget(
+        scope="deployment",
+        namespace=namespace,
+        names=(name,) if name else (),
+        labels=labels,
+        confidence=ConfidenceLevel.HIGH,
+        raw_command=raw_command,
+        is_drill_target_manifest=True,
     )
 
 
@@ -1088,6 +1917,84 @@ def _peek_escape_tokens_facts(cmdline_raw: str) -> list[str] | None:
     return [word_token(w) for w in words]
 
 
+def _fault_binary_in_payload_segments(
+    facts_line: str | None, inner: list[str],
+) -> bool:
+    """True when any command SEGMENT's head is a fault binary (R25/G-9).
+
+    The escape probe in ``_classify_kubectl_exec`` is a single-layer
+    peek at the FIRST command's head: a compound payload whose head is
+    innocent (``sh -c 'blade destroy x; stress-ng'``, ``cat f; iptables
+    -A``) hid every fault binary past the ``;``, so the branch's
+    ``fault_binary_mutation`` flag never fired and the vehicle/
+    machinery exemptions (both of which withhold on that flag) would
+    swallow a real fault binary — the R22 declaration domain (“a fault
+    binary inside the carrier keeps identity review”) silently diverged
+    from the implementation's traversal domain.
+
+    The judgement reuses the carriers-shared segment parser
+    (``exec_command_segments`` — the same single source the blade
+    carrier's own payload classifier rides): the raw inner line when
+    facts text exists, else the delivered payload argv (the parser's
+    token form — same separator/wrapper/script expansion). The
+    ``_FAULT_BINARIES`` set is the one the head path already consults.
+    """
+    from chaos_agent.agent.providers.message_scanning import (
+        exec_command_segments,
+    )
+
+    command: object = facts_line if facts_line is not None else inner
+    return any(
+        seg and seg[0].rsplit("/", 1)[-1] in _FAULT_BINARIES
+        for seg in exec_command_segments(command)
+    )
+
+
+#: Host-escape primitives, basename form — the same trio the head-only
+#: escape probe below legislates (R26/G-10 segments the check the same
+#: way G-9 segmented the fault-binary one).
+_ESCAPE_PRIMITIVES = frozenset({"nsenter", "chroot", "unshare"})
+
+
+def _escape_primitive_in_payload_segments(
+    facts_line: str | None, inner: list[str],
+) -> str | None:
+    """The escape primitive heading any command SEGMENT (R26/G-10).
+
+    The escape branch's single-layer peek reads only the FIRST
+    command's head, so a payload with an innocent head and an escape
+    primitive riding past a ``;``/``&&`` (``sh -c 'cat /etc/hosts;
+    nsenter -t 1 -m sh'``) never reached the SCOPE_ESCAPE legislation:
+    it classified as a plain pod mutation, and when the exec target IS
+    the approved pod the identity match passed the whole chain
+    end-to-end (screener probe: route=pass for the compound while every
+    direct/wrapped form was REJECT_BANNED) — the branch's own comment
+    promise ("a single ``sh -c`` wrapper must not hide the escape
+    primitive") was already broken by the compound form. Same parser,
+    same single source as the G-9 fault-binary twin, but the
+    chroot-KEEPING projection (``chroot_delegation=False``): the
+    default "what actually runs" delegation (``chroot /host bash`` →
+    ``[bash]``) would erase the very primitive being legislated from
+    a delegated tail segment.
+
+    Returns the CAUGHT primitive's name (R27/G-11c) so the reject
+    message can name the primitive the legislation actually caught —
+    the head-only probe names the innocent head ('cat') for a compound
+    payload, and the message is the model's repair guidance.
+    """
+    from chaos_agent.agent.providers.message_scanning import (
+        exec_command_segments,
+    )
+
+    command: object = facts_line if facts_line is not None else inner
+    for seg in exec_command_segments(command, chroot_delegation=False):
+        if seg:
+            head = seg[0].rsplit("/", 1)[-1]
+            if head in _ESCAPE_PRIMITIVES:
+                return head
+    return None
+
+
 def _classify_kubectl_exec(
     args: list[str],
     raw_command: str,
@@ -1120,11 +2027,66 @@ def _classify_kubectl_exec(
             reject_suggestion=_FIX_NAME_THE_TARGET,
         )
 
-    inner = _extract_after_double_dash(args)
+    # R45: the separator must be pflag's own and the entry stretch may hold
+    # exactly ONE positional. ``args.index("--")`` (the legacy slice) is
+    # blind to a ``--`` that a value-taking flag swallowed as its value, and
+    # it never asked what else sits before the boundary. The shared
+    # flag-aware walk decides both questions so this face and the facts
+    # judge cannot drift apart.
+    from chaos_agent.tools._readonly_facts import exec_separator_shape
+
+    positionals, after = exec_separator_shape(args)
+    if after is not None and len(positionals) > 1:
+        extras = positionals[1:]
+        shown = " ".join(extras[:8]) + (" ..." if len(extras) > 8 else "")
+        return EffectiveTarget(
+            scope=SCOPE_UNKNOWN,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.UNKNOWN,
+            reject_detail=(
+                f"the exec entry is followed by extra tokens ('{shown}') "
+                "before the '--' separator — kubectl reads only the FIRST "
+                "positional as the entry, and what happens to the rest is "
+                "client-dependent (current clients drop them, older ones run "
+                "them as the command head), so the guard cannot tell what "
+                "this call would do"
+            ),
+            reject_suggestion=_FIX_EXEC_ONE_ENTRY,
+        )
+    inner = list(after) if after is not None else []
     if not inner:
-        # Pure stdio attach — acts on the pod. Vehicle identity is decided
-        # DATA-side by the screener (state + live discovery), never from
-        # the pod name here.
+        # No ``--`` at all is TWO shapes, not one (R44). ``POD [flags]``
+        # — bare entry / attach — runs nothing: it acts on the pod, and
+        # vehicle identity is decided DATA-side by the screener (state +
+        # live discovery), never from the pod name here. ``POD COMMAND``
+        # instead CARRIES a command that this entry-only reading never
+        # handed to any judge: kubectl refuses the separator-less form
+        # outright, so the call cannot run — and reading it as "attach"
+        # would name a call whose command is invisible ("the shell did
+        # not run it" is the CLIENT's behaviour, not this judge's
+        # guarantee). The shared walker (single source, the same one the
+        # read-only judge uses at the tool layer) names the trailing
+        # command; refuse with the fix path.
+        from chaos_agent.tools._readonly_facts import (
+            exec_command_without_double_dash,
+        )
+
+        trailing = exec_command_without_double_dash(args)
+        if trailing is not None:
+            shown = " ".join(trailing[:8]) + (" ..." if len(trailing) > 8 else "")
+            return EffectiveTarget(
+                scope=SCOPE_UNKNOWN,
+                namespace="",
+                raw_command=raw_command,
+                confidence=ConfidenceLevel.UNKNOWN,
+                reject_detail=(
+                    f"the exec entry is followed by a command ('{shown}') "
+                    "written without the '--' separator, so the guard cannot "
+                    "tell what this call would do"
+                ),
+                reject_suggestion=_FIX_EXEC_USE_SEPARATOR,
+            )
         return EffectiveTarget(
             scope="pod",
             namespace=ns,
@@ -1226,7 +2188,26 @@ def _classify_kubectl_exec(
                 nested_tokens = []
             if nested_tokens:
                 escape_probe = nested_tokens
-    if escape_probe[0] in ("nsenter", "chroot", "unshare"):
+    escape_segment_hit = _escape_primitive_in_payload_segments(facts_line, inner)
+    if (
+        escape_probe[0] in ("nsenter", "chroot", "unshare")
+        # R26/G-10: the head-only peek cannot see an escape primitive
+        # riding PAST a ``;``/``&&`` inside a script or wrapper — check
+        # at SEGMENT level so the compound forms reach this branch's
+        # readonly ruling (the shared judge is already segment-level,
+        # B46: an all-readonly compound stays READONLY, an escape stage
+        # that mutates lands in SCOPE_ESCAPE).
+        or escape_segment_hit is not None
+    ):
+        # R27/G-11c: the reject message names the primitive the branch
+        # actually CAUGHT — for a compound payload the head-only probe
+        # holds the innocent head, and the message is the model's repair
+        # guidance (naming 'cat' sends the repair in the wrong direction).
+        escape_trigger = (
+            escape_probe[0]
+            if escape_probe[0] in ("nsenter", "chroot", "unshare")
+            else escape_segment_hit
+        )
         # A READ-ONLY probe through the escape primitive is not a mutation:
         # from a privileged debug pod, ``chroot /host cat /etc/os-release`` is
         # the only way to inspect the node, and Phase 1 must be able to verify
@@ -1254,7 +2235,8 @@ def _classify_kubectl_exec(
                 raw_command=raw_command,
                 confidence=ConfidenceLevel.UNKNOWN,
                 reject_detail=(
-                    f"the exec runs a host-escape primitive ('{escape_probe[0]}'); "
+                    f"the exec runs a host-escape primitive "
+                    f"('{escape_trigger}'); "
                     "it must go through an approved, current, privileged debug pod "
                     "on the approved node and be self-recovering"
                 ),
@@ -1286,41 +2268,57 @@ def _classify_kubectl_exec(
     # static (no cluster access), and the case it would catch — a fault binary
     # in a hostNetwork pod — is a genuine gap that belongs to a layer that can
     # read pod spec. Guessing from a pod name would fail both ways.
-    _READONLY_SUBS = {
-        "iptables": {"-L", "-S", "--list", "--list-rules"},
-        "ip6tables": {"-L", "-S", "--list", "--list-rules"},
-        "nft": {"list"},
-    }
-    # ``-Version`` is tc's own spelling for a version query (iproute2 uses it
-    # instead of the conventional ``--version``), and four skill cases probe
-    # tool availability with ``tc -Version`` before injecting. Without it the
-    # probe classifies as a pod mutation — harmless to execute, but it would
-    # consume a blast-radius comparison for what is only a capability check.
-    _READONLY_FLAGS = {"--help", "-h", "--version", "-V", "-Version", "version"}
+    # Delegate the read-only probe ruling to the SHARED judge — the same
+    # one the tool layer enforces on kubectl_read exec/debug inners
+    # (``tc qdisc show``, ``iptables -t nat -L``, ...). The private
+    # first-token vocabulary here lagged the judge: ``tc qdisc show``
+    # classifies as a pod mutation while the tool layer happily runs it,
+    # so the verify-phase screener refused a probe the model could never
+    # route around (the judge is the single source of truth for what a
+    # fault binary's read-only surface is).
+    from chaos_agent.tools.readonly import (
+        kubectl_exec_rejection_reason,
+        readonly_inner_tokens_reason,
+    )
+
     binary = escape_probe[0].rsplit("/", 1)[-1]
-    if binary in _FAULT_BINARIES:
-        probe_args = escape_probe[1:]
-        is_readonly_probe = bool(probe_args) and (
-            probe_args[0] in _READONLY_FLAGS
-            or probe_args[0] in _READONLY_SUBS.get(binary, set())
+    fault_binary_hit = binary in _FAULT_BINARIES
+    if not fault_binary_hit:
+        # R25/G-9: the head-only peek cannot see a fault binary riding
+        # PAST a ``;``/``&&`` inside a script or wrapper — judge at
+        # SEGMENT level so the compound forms keep the marker this
+        # branch exists to set.
+        fault_binary_hit = _fault_binary_in_payload_segments(
+            facts_line, inner,
         )
-        if not is_readonly_probe:
-            # A pod-scoped mutation: same shape the guard already accepts for
-            # any other pod-level fault, so identity/blast-radius comparison
-            # applies normally instead of the escape path's carrier
-            # requirement. ``fault_binary_mutation`` marks the shape so the
-            # screener's vehicle exemption does NOT swallow it: inside a
-            # privileged / hostNetwork tool pod the same binary shapes the
-            # HOST, which the static classifier cannot rule out — keep the
-            # identity review.
+    if fault_binary_hit:
+        if facts_line is not None:
+            fb_probe_reason = kubectl_exec_rejection_reason(facts_line)
+        else:
+            fb_probe_reason = readonly_inner_tokens_reason(escape_probe)
+        if fb_probe_reason is None:
             return EffectiveTarget(
-                scope="pod",
-                namespace=ns,
-                names=(pod_name,),
+                scope=SCOPE_READONLY,
+                namespace="",
                 raw_command=raw_command,
                 confidence=ConfidenceLevel.HIGH,
-                fault_binary_mutation=True,
             )
+        # A pod-scoped mutation: same shape the guard already accepts for
+        # any other pod-level fault, so identity/blast-radius comparison
+        # applies normally instead of the escape path's carrier
+        # requirement. ``fault_binary_mutation`` marks the shape so the
+        # screener's vehicle exemption does NOT swallow it: inside a
+        # privileged / hostNetwork tool pod the same binary shapes the
+        # HOST, which the static classifier cannot rule out — keep the
+        # identity review.
+        return EffectiveTarget(
+            scope="pod",
+            namespace=ns,
+            names=(pod_name,),
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            fault_binary_mutation=True,
+        )
 
     # Read-only probe (cat/ls/df/ps, iptables -L, ip addr show, ...) — a
     # non-mutating inspection of the pod. Classify as READONLY so the phase-1 /
@@ -1328,11 +2326,6 @@ def _classify_kubectl_exec(
     # not drift). Reached only AFTER the escape / mutating-fault-binary checks
     # above, so ``iptables -A`` / ``chroot`` / ``stress`` never land here — the
     # shared classifier returns False for them and this branch is skipped.
-    from chaos_agent.tools.readonly import (
-        kubectl_exec_rejection_reason,
-        readonly_inner_tokens_reason,
-    )
-
     if facts_line is not None:
         # Same raw-inner facts judgment as the escape branch above; the
         # token fallback below only runs when no raw text exists at all.
@@ -1394,6 +2387,32 @@ def _classify_kubectl_debug(args: list[str], raw_command: str) -> EffectiveTarge
                 "'node/<node-name>' as the first positional argument"
             ),
             reject_suggestion=_FIX_NAME_THE_TARGET,
+        )
+    # R45: kubectl debug resolves EVERY positional as a separate target
+    # (v1.34 ``o.TargetNames = args[:argsLen]`` → ``ResourceNames("pods",
+    # o.TargetNames...)`` + a per-info Visit that creates a privileged pod
+    # per node / patches an ephemeral container per pod). Reading only the
+    # FIRST positional let extra names ride the approved one into the
+    # cluster. The walk is flag-aware, so a flag's value (``--image ubuntu``)
+    # never counts as one.
+    from chaos_agent.tools._readonly_facts import exec_separator_shape
+
+    positionals, _after = exec_separator_shape(args)
+    if len(positionals) > 1:
+        extras = positionals[1:]
+        shown = " ".join(extras[:8]) + (" ..." if len(extras) > 8 else "")
+        return EffectiveTarget(
+            scope=SCOPE_UNKNOWN,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.UNKNOWN,
+            reject_detail=(
+                f"kubectl debug reads EVERY positional as a separate target "
+                f"— '{shown}' beyond the first would be debugged too, "
+                "creating a privileged pod / ephemeral container OUTSIDE "
+                "the single approved target"
+            ),
+            reject_suggestion=_FIX_DEBUG_ONE_TARGET,
         )
     kind, name = _split_kind_name(first)
     canonical = canonicalise_kind(kind) if kind else "pod"
@@ -1590,14 +2609,9 @@ def _classify_kubectl_resource(
         )
 
     # Cluster-scoped resources (node/pv/namespace/cluster*role*) skip ns
-    cluster_scoped = canonical in (
-        "node",
-        "pv",
-        "namespace",
-        "clusterrole",
-        "clusterrolebinding",
-        "storageclass",
-    )
+    # — topology single-sourced via is_cluster_scoped_kind (R21/G-5:
+    # this branch previously carried its own inline copy of the set).
+    cluster_scoped = is_cluster_scoped_kind(canonical)
     ns = parse_namespace(args, default="" if cluster_scoped else "default")
     labels = parse_labels(args)
     names: tuple[str, ...] = (name,) if name else ()
@@ -1620,6 +2634,290 @@ def _is_known_kind(token: str) -> bool:
     return head in KIND_ALIASES
 
 
+def _imperative_workload_create_kind(args: list[str]) -> str | None:
+    """The canonical workload kind an imperative create would start, if any.
+
+    ``args`` is the tail AFTER the ``create`` verb. Mirrors the positional
+    reading of ``_classify_kubectl_resource`` (``KIND NAME`` and the
+    ``KIND/NAME`` slash form) so the ToolGuard dispatch check and the
+    dispatcher's ``sub == "create"`` branch below share one vocabulary —
+    :data:`_IMPERATIVE_WORKLOAD_KINDS` — instead of two hand-kept lists.
+    """
+    first = _first_positional(args)
+    if not first:
+        return None
+    kind, _name = _split_kind_name(first)
+    if not kind:
+        kind = first if _is_known_kind(first) else ""
+    if not kind:
+        return None
+    canonical = canonicalise_kind(kind)
+    return canonical if canonical in _IMPERATIVE_WORKLOAD_KINDS else None
+
+
+def _recovery_carrier_allowed_images() -> frozenset[str]:
+    """The recovery-carrier image whitelist: configured ∪ auto-discovered.
+
+    ``settings.recovery_carrier_allowed_images`` is the manual fallback
+    (env/config). ``settings.recovery_carrier_discovered_images`` is
+    populated at task start by the preplan probe (healthy DaemonSet
+    images — node-cached, no pull needed), so restricted-network clusters
+    work without manual configuration.
+
+    Kept a function (not a module constant) so tests and operators can
+    reconfigure either setting at runtime and the classifier honours the
+    change — same discipline as the manifest whitelist's
+    ``_allowed_manifest_kinds_text``.
+    """
+    from chaos_agent.config.settings import settings
+
+    raw = str(settings.recovery_carrier_allowed_images or "")
+    discovered = str(settings.recovery_carrier_discovered_images or "")
+    return frozenset(
+        img.strip()
+        for img in f"{raw},{discovered}".split(",")
+        if img.strip()
+    )
+
+
+def _recovery_carrier_image_hint(image: str) -> str:
+    """One-line actionable hint for an off-allowlist carrier image."""
+    from chaos_agent.config.settings import settings
+
+    allowed = str(settings.recovery_carrier_allowed_images or "")
+    discovered = str(settings.recovery_carrier_discovered_images or "")
+    parts = [f"image {image!r} not in the carrier image allowlist"]
+    if discovered:
+        parts.append(f"auto-discovered this task: {discovered}")
+    else:
+        parts.append(
+            "auto-discovery found nothing (no healthy DaemonSet images or "
+            "probe not run)"
+        )
+    parts.append(
+        "manual fallback: settings key recovery_carrier_allowed_images / "
+        "env BLADE_AI_RECOVERY_CARRIER_ALLOWED_IMAGES"
+    )
+    if allowed:
+        parts.append(f"configured: {allowed}")
+    return "; ".join(parts)
+
+
+def _recovery_carrier_shape_failure(args: list[str], name: str) -> str | None:
+    """First failing SHAPE condition, human-readable — or ``None`` when OK.
+
+    Single source of truth for the shape predicate: the boolean wrapper
+    below delegates here, so the guard's rejection feedback and the
+    classifier verdict can never drift apart (run8 lesson: an image
+    allowlist miss surfaced as an opaque REJECT_DRIFT with no reason).
+    """
+    from chaos_agent.config.settings import settings
+
+    prefix = str(settings.recovery_carrier_name_prefix or "drill-rc-")
+    if not prefix or not name.startswith(prefix):
+        return f"name {name!r} lacks the carrier prefix {prefix!r}"
+    # Flag whitelist (condition 5). Values taken as separate tokens
+    # (``--image x``) or inline (``--image=x``); ``-n x`` is the only
+    # short form admitted.
+    value_flags = {"--image", "--restart", "--overrides", "-n", "--namespace"}
+    bare_flags = {"--command"}
+    separator = "--"
+    separator_index = args.index(separator) if separator in args else len(args)
+    for index, token in enumerate(args):
+        if index >= separator_index:
+            break
+        if token == separator:
+            break
+        if token.startswith("-"):
+            head = token.split("=", 1)[0]
+            if head in bare_flags and "=" not in token:
+                continue
+            if head in value_flags:
+                # Inline form carries its own value; separate form takes
+                # the next token — validated as a whole token, not a flag.
+                if "=" not in token and index + 1 >= separator_index:
+                    return f"flag {token!r} has no value before '--'"
+                continue
+            return (
+                f"flag {token!r} is outside the carrier flag whitelist "
+                "(only -n/--namespace, --image, --restart, --command, "
+                "--overrides admitted)"
+            )
+    # ``--restart=Never`` (both spellings; anything else keeps the default
+    # Always policy and the pod becomes an immortal restart loop).
+    restart = _option_pair_value(args, "--restart")
+    if restart != "Never":
+        return (
+            f"--restart must be Never (got {restart!r}) — no crash-restart "
+            "loops, the pod's terminal phase is its lifecycle truth"
+        )
+    # Condition 3 requires the EXPLICIT ``--command`` flag (design D7):
+    # without it ``--``-args feed the image's default entrypoint (busybox
+    # ``sh sleep N`` errors out), so the shape is not the prescribed
+    # skeleton. Bare flag only — ``--command=true`` is not a shape the
+    # standard prescribes, and fail-closed keeps it out.
+    if "--command" not in args[:separator_index]:
+        return "missing the explicit --command flag (skeleton must be sleep-only)"
+    image = _option_pair_value(args, "--image")
+    if not image:
+        return "missing --image (the carrier image allowlist applies to it)"
+    if image not in _recovery_carrier_allowed_images():
+        return _recovery_carrier_image_hint(image)
+    # Sleep-only skeleton: everything after ``--`` must be ``sleep N``.
+    if separator_index >= len(args):
+        return "missing '--' sleep skeleton arguments"
+    inner = args[separator_index + 1:]
+    if len(inner) != 2 or inner[0] != "sleep":
+        return (
+            "the '--' payload must be exactly ``sleep N`` (sleep-only "
+            "self-expiring skeleton)"
+        )
+    try:
+        sleep_seconds = int(inner[1])
+    except ValueError:
+        return f"sleep bound {inner[1]!r} is not an integer"
+    if not 0 < sleep_seconds <= int(settings.recovery_carrier_max_sleep_seconds):
+        return (
+            f"sleep bound {sleep_seconds} outside 1.."
+            f"{settings.recovery_carrier_max_sleep_seconds}"
+        )
+    return _recovery_carrier_overrides_failure(args)
+
+
+def _is_recovery_carrier_run(args: list[str], name: str) -> bool:
+    """Whether a ``kubectl run`` matches the recovery-carrier pod SHAPE.
+
+    Five conditions, all required (design D7 — fail closed on any miss):
+      1. task-side carrier name prefix (auxiliary signal — the SECURITY
+         boundary is the in-net pod secondary scope + task registration,
+         never the name alone);
+      2. ``--restart=Never`` (no crash-restart loop: the pod's terminal
+         phase is the truth of its lifecycle);
+      3. an explicit sleep-only skeleton command (``--command -- sleep N``
+         with N bounded by ``recovery_carrier_max_sleep_seconds``) — the
+         carrier must self-expire even if every cleanup path dies;
+      4. ``--image`` inside the effective allowlist (configured ∪
+         auto-discovered — see ``_recovery_carrier_allowed_images``);
+      5. a FLAG WHITELIST, not a blacklist. ``kubectl run`` accepts many
+         flags the five conditions never inspect (``--serviceaccount``,
+         ``--env``, ``--nodename``, ``--schedule``, ...). Checking only the
+         ones we DO inspect lets any other flag ride the carrier gate —
+         ``--serviceaccount`` smuggles an arbitrary SA past the overrides
+         white-list, ``--schedule`` turns the run into a CronJob. So the
+         shape admits ONLY ``-n/--namespace``, ``--image``, ``--restart``,
+         ``--command``, ``--overrides`` (the latter still payload-checked
+         below), plus the ``--`` separator; any other flag fails closed.
+
+    Thin boolean wrapper over ``_recovery_carrier_shape_failure`` (the
+    single implementation — keeps verdict and diagnostics in lockstep).
+    """
+    return _recovery_carrier_shape_failure(args, name) is None
+
+
+def _recovery_carrier_overrides_failure(args: list[str]) -> str | None:
+    """Overrides payload check (SHAPE condition 5b) — failure reason or None.
+
+    ``--overrides`` patches the raw Pod spec, which could smuggle
+    hostNetwork / privileged / hostPath past the shape check. Fail closed
+    on any overrides payload except the TWO documented scheduling keys:
+    ``{"spec": {"serviceAccountName": "<str>",
+                "tolerations": [<scheduling-only>]}}``. Tolerations are
+    POD SCHEDULING match rules — they admit the carrier onto tainted
+    nodes (enterprise clusters commonly taint EVERY node) but grant no
+    runtime privilege whatsoever. Structurally validated: each entry's
+    keys ⊆ {key, operator, value, effect}, key is a non-empty string
+    (an empty toleration matches EVERY taint — no free pass), operator
+    ∈ {Exists, Equal}, effect ∈ the three legal values.
+    """
+    overrides = _option_pair_value(args, "--overrides")
+    if not overrides:
+        return None
+    try:
+        doc = json.loads(overrides)
+    except (TypeError, ValueError):
+        return "--overrides payload is not valid JSON"
+    if not isinstance(doc, dict) or set(doc) != {"spec"}:
+        return (
+            "--overrides must contain exactly the top-level key 'spec' "
+            "(serviceAccountName + tolerations only)"
+        )
+    spec = doc["spec"]
+    if not isinstance(spec, dict) or not spec:
+        return "--overrides spec must be a non-empty object"
+    if not set(spec) <= {"serviceAccountName", "tolerations"}:
+        return (
+            "--overrides spec admits only serviceAccountName and "
+            "tolerations (scheduling keys; no hostNetwork/privileged/"
+            "hostPath)"
+        )
+    service_account = spec.get("serviceAccountName")
+    if service_account is not None and (
+        not isinstance(service_account, str) or not service_account
+    ):
+        return "--overrides serviceAccountName must be a non-empty string"
+    if "tolerations" in spec and not _valid_carrier_tolerations(
+        spec["tolerations"],
+    ):
+        return (
+            "--overrides tolerations must be scheduling-only entries "
+            "(keys ⊆ key/operator/value/effect, non-empty key, operator "
+            "Exists|Equal, effect NoSchedule|PreferNoSchedule|NoExecute)"
+        )
+    return None
+
+
+_TOLERATION_KEYS = {"key", "operator", "value", "effect"}
+_TOLERATION_OPERATORS = {"Exists", "Equal"}
+_TOLERATION_EFFECTS = {
+    "NoSchedule",
+    "NoExecute",
+    "PreferNoSchedule",
+}
+
+
+def _valid_carrier_tolerations(value: object) -> bool:
+    """Structural white-list for the carrier overrides tolerations array."""
+    if not isinstance(value, list) or not value:
+        return False
+    for toleration in value:
+        if not isinstance(toleration, dict):
+            return False
+        if not set(toleration) <= _TOLERATION_KEYS:
+            return False
+        # A toleration without a key matches EVERY taint (an empty entry
+        # matches all) — the carrier must name the taints it tolerates.
+        key = toleration.get("key")
+        if not isinstance(key, str) or not key:
+            return False
+        operator = toleration.get("operator")
+        if operator is not None and (
+            not isinstance(operator, str)
+            or operator not in _TOLERATION_OPERATORS
+        ):
+            return False
+        toleration_value = toleration.get("value")
+        if toleration_value is not None and not isinstance(
+            toleration_value, str,
+        ):
+            return False
+        effect = toleration.get("effect")
+        if effect is not None and (
+            not isinstance(effect, str) or effect not in _TOLERATION_EFFECTS
+        ):
+            return False
+    return True
+
+
+def _option_pair_value(args: list[str], option: str) -> str:
+    """Value of ``option value`` / ``option=value`` in argv ("" when absent)."""
+    for index, token in enumerate(args):
+        if token == option and index + 1 < len(args):
+            return args[index + 1]
+        if token.startswith(f"{option}="):
+            return token.split("=", 1)[1]
+    return ""
+
+
 def _classify_kubectl_run(args: list[str], raw_command: str) -> EffectiveTarget:
     """``kubectl run NAME --image=...`` — creates a new pod."""
     name = _first_positional(args)
@@ -1633,6 +2931,20 @@ def _classify_kubectl_run(args: list[str], raw_command: str) -> EffectiveTarget:
             reject_suggestion=_FIX_NAME_THE_TARGET,
         )
     ns = parse_namespace(args, default="default")
+    # Recovery-carrier shape first: a compliant run classifies as the
+    # vehicle marker the screener registers (task-side artifact + in-net
+    # pod secondary scope). Any other run keeps the plain pod scope and
+    # faces the ordinary drift review — behaviour identical to before
+    # this branch existed.
+    if _is_recovery_carrier_run(args, name):
+        return EffectiveTarget(
+            scope="pod",
+            namespace=ns,
+            names=(name,),
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            is_recovery_carrier=True,
+        )
     return EffectiveTarget(
         scope="pod",
         namespace=ns,
@@ -1775,15 +3087,6 @@ def _split_kind_name(token: str) -> tuple[str, str]:
         kind, _, name = token.partition("/")
         return kind, name
     return "", token
-
-
-def _extract_after_double_dash(args: list[str]) -> list[str]:
-    """Return args after the ``--`` separator, or [] if none."""
-    try:
-        idx = args.index("--")
-    except ValueError:
-        return []
-    return args[idx + 1 :]
 
 
 def _has_help_flag(args: list[str]) -> bool:

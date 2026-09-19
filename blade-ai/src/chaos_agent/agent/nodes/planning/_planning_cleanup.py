@@ -61,16 +61,26 @@ async def cleanup_planning_debug_pods(state: AgentState) -> dict:
             "kubectl", "kubectl_read",
         ):
             content = msg.content if isinstance(msg.content, str) else str(msg.content)
-            pod_name, ns = parse_debug_pod_info(content)
-            if pod_name:
+            pod_name, ns, tool_cleaned = parse_debug_pod_info(content)
+            # Same skip as verifier finalize: a one-shot probe pod the tool
+            # already auto-removed (meta ``cleaned: true``) must not queue a
+            # redundant NotFound delete (#31).
+            if pod_name and not tool_cleaned:
                 discovered_pods[pod_name] = ns
 
     already_cleaned: set[str] = set(state.get("cleaned_debug_pods") or [])
     already_cleaned.update(artifact_cleaned)
+    # Exclusion covers EVERY vehicle artifact type (not just debug_pod):
+    # ``parse_debug_pod_name``'s generic ``pod/<name> created`` pattern also
+    # matches a recovery carrier's creation banner — without this, the
+    # legacy scan force-deletes an armed carrier with NO gate, killing its
+    # in-flight recovery timer (run4 live fire).
+    from chaos_agent.agent.execution_artifacts import VEHICLE_ARTIFACT_TYPES
     tracked_names = {
         str(artifact.get("name") or "")
         for artifact in tracked_artifacts
-        if isinstance(artifact, dict) and artifact.get("type") == "debug_pod"
+        if isinstance(artifact, dict)
+        and artifact.get("type") in VEHICLE_ARTIFACT_TYPES
     }
     pods_to_delete = set(discovered_pods.keys()) - already_cleaned - tracked_names
     for pod_name in pods_to_delete:

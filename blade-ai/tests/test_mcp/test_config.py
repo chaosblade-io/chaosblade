@@ -86,6 +86,23 @@ class TestLoadMcpConfig:
         assert c.timeout_seconds == 60
         assert set(c.attach_to) == {"phase1", "verifier"}
 
+    def test_sse_server_legacy(self, tmp_path):
+        """Legacy HTTP+SSE remains a valid transport value so blade-ai
+        can still reach older SSE-only servers."""
+        path = tmp_path / "mcp.json"
+        path.write_text(json.dumps({
+            "mcpServers": {
+                "legacy": {
+                    "transport": "sse",
+                    "url": "https://old.example.com/sse",
+                }
+            }
+        }))
+        configs = load_mcp_config(path)
+        assert len(configs) == 1
+        assert configs[0].transport == "sse"
+        assert configs[0].url == "https://old.example.com/sse"
+
     def test_disabled_servers_omitted(self, tmp_path):
         path = tmp_path / "mcp.json"
         path.write_text(json.dumps({
@@ -186,3 +203,82 @@ class TestLoadMcpConfig:
         # Per _parse_one: invalid server is skipped with a warning, not
         # propagated. Verify the broken server didn't sneak through.
         assert configs == []
+
+
+class TestToolEffects:
+    """Per-tool read/write label override (posture B, advisory only)."""
+
+    def _write(self, tmp_path, server_body):
+        path = tmp_path / "mcp.json"
+        path.write_text(json.dumps({"mcpServers": {"s": server_body}}))
+        return path
+
+    def test_absent_defaults_to_empty(self, tmp_path):
+        path = self._write(tmp_path, {"command": "x", "args": []})
+        assert load_mcp_config(path)[0].tool_effects == {}
+
+    def test_valid_effects_parsed_and_lowercased(self, tmp_path):
+        path = self._write(tmp_path, {
+            "command": "x", "args": [],
+            "tool_effects": {"get": "ReadOnly", "cancel": "DESTRUCTIVE"},
+        })
+        assert load_mcp_config(path)[0].tool_effects == {
+            "get": "readonly", "cancel": "destructive",
+        }
+
+    def test_url_transport_also_carries_effects(self, tmp_path):
+        path = self._write(tmp_path, {
+            "transport": "http", "url": "http://x/mcp",
+            "tool_effects": {"run": "destructive"},
+        })
+        assert load_mcp_config(path)[0].tool_effects == {"run": "destructive"}
+
+    def test_invalid_effect_value_dropped_with_warning(self, caplog):
+        """Posture B: a bad per-tool label is advisory, so it is DROPPED
+        with a warning — NOT fatal. The server still loads and the
+        mislabeled tool falls back to annotation/unspecified."""
+        from chaos_agent.mcp.config import _parse_one
+        with caplog.at_level("WARNING"):
+            cfg = _parse_one("s", {
+                "command": "x", "args": [],
+                "tool_effects": {"get": "maybe"},
+            })
+        assert cfg.tool_effects == {}            # bad entry dropped
+        assert "tool_effects" in caplog.text     # warned, not silent
+
+    def test_mixed_effects_keep_good_drop_bad(self, tmp_path, caplog):
+        """Blast radius is the single bad entry: a good label survives
+        alongside a bad one, and the whole server is kept."""
+        path = self._write(tmp_path, {
+            "command": "x", "args": [],
+            "tool_effects": {"get": "readonly", "cancel": "nope"},
+        })
+        with caplog.at_level("WARNING"):
+            cfgs = load_mcp_config(path)
+        assert len(cfgs) == 1                              # server kept
+        assert cfgs[0].tool_effects == {"get": "readonly"}  # good kept, bad dropped
+        assert "cancel" in caplog.text                     # warned about the bad one
+
+    def test_non_dict_tool_effects_degrades_with_warning(self, caplog):
+        """A structurally wrong tool_effects (e.g. a list) degrades to no
+        overrides with a warning, instead of killing the whole server."""
+        from chaos_agent.mcp.config import _parse_one
+        with caplog.at_level("WARNING"):
+            cfg = _parse_one(
+                "s", {"command": "x", "args": [], "tool_effects": ["a"]}
+            )
+        assert cfg.tool_effects == {}
+        assert "must be a dict" in caplog.text
+
+    def test_invalid_effect_keeps_server_on_load(self, tmp_path, caplog):
+        """Regression flip of the old strict behavior: an invalid effect
+        value must NOT drop the whole server. The server still loads,
+        minus the bad label, with a warning."""
+        path = self._write(tmp_path, {
+            "command": "x", "args": [], "tool_effects": {"get": "nope"},
+        })
+        with caplog.at_level("WARNING"):
+            cfgs = load_mcp_config(path)
+        assert len(cfgs) == 1               # server survives (was == [])
+        assert cfgs[0].tool_effects == {}   # bad label dropped
+        assert "tool_effects" in caplog.text

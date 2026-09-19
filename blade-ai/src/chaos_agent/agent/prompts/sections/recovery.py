@@ -15,7 +15,10 @@ Design rationale (from first-principles audit of task-d0f0f506 recovery):
   with low-priority information in the middle.
 """
 
-from chaos_agent.agent.prompts.reminder import SYSTEM_REMINDER_DECLARATION
+from chaos_agent.agent.prompts.reminder import (
+    PARALLELIZE_PRINCIPLE,
+    SYSTEM_REMINDER_DECLARATION,
+)
 from chaos_agent.agent.prompts.sections.experience_section import get_experience_section
 from chaos_agent.agent.prompts.sections.knowledge_sections import get_knowledge_summary_section
 from chaos_agent.transports import PROFILE_K8S
@@ -64,6 +67,7 @@ def get_recover_core_principles_section() -> str:
 - Recovery = fault effect ABSENT. Prove by comparing CURRENT state to pre-injection BASELINE for the SAME metric on the SAME resource. When baseline is unavailable, confirm healthy state, then cross-validate with BaselineUsed: false
 - When a tool returns error, the TOOL is right — verify its actual interface before retrying
 - If an observation repeatedly fails or returns the same unexpected result, suspect your METHOD (wrong filter/command/assumption), not the target — switch to structured status (conditions/events/resource state) instead of retrying the same command. If still unobservable, mark the step skipped with the reason; never silently omit
+- {PARALLELIZE_PRINCIPLE}
 - {SYSTEM_REMINDER_DECLARATION}"""
 
 
@@ -185,7 +189,8 @@ Primary evidence = the SPECIFIC fault effect is now ABSENT (metric returned
 to baseline or within healthy range, artifacts removed, connections restored). NOT generic health
 (pod Running, no restarts). Set PrimaryEvidenceObserved: true ONLY when you
 directly observed the fault-specific effect being removed.
-If PrimaryEvidenceObserved=false, Overall CANNOT be "recovered" — use "partial".
+If PrimaryEvidenceObserved=false, Overall CANNOT be "recovered" — use "partial" at best,
+or "unverified" when the observation channel itself was unavailable.
 
 **Overall Definitions**:
 - **recovered**: The specific fault effect is ABSENT. The system is at
@@ -193,6 +198,9 @@ If PrimaryEvidenceObserved=false, Overall CANNOT be "recovered" — use "partial
   propagation with the trajectory improving toward baseline.
 - **partial**: Residual deviations attributable to the fault itself, or
   evidence genuinely mixed. A converging recovery tail is NOT partial.
+- **unverified**: You could NOT observe the post-recovery state (observation
+  tools failed on auth or were unavailable) — this is NOT evidence that the
+  fault persists, so it is distinct from unrecovered.
 - **unrecovered**: Fault effect is STILL present despite recovery attempt.
 
 **Per-Step Status Definitions**:
@@ -210,13 +218,14 @@ RECOVERY_VERIFICATION_CHECKLIST is mandatory — parsed programmatically."""
 
 def get_recover_remember_section() -> str:
     """REMEMBER segment — recency zone anchor for recover verifier."""
-    return """# REMEMBER
+    return f"""# REMEMBER
 - Evidence from CURRENT post-recovery state only — stale data is NOT evidence
 - Baseline comparison proves recovery — SAME metric on SAME resource; degrade to healthy-state confirmation, then cross-validation when baseline unavailable
 - When a tool returns error, the TOOL is right
 - Repeated failure → suspect your METHOD; switch approach, never silently omit
 - Primary evidence = fault effect ABSENT, not generic health (pod Running ≠ recovered)
-- Attribute residuals before judging: recovery propagation cost is NOT recovery failure — partial means fault-attributable residuals"""
+- Attribute residuals before judging: recovery propagation cost is NOT recovery failure — partial means fault-attributable residuals
+- {PARALLELIZE_PRINCIPLE}"""
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +276,13 @@ def build_recover_verifier_system_prompt(
         environment_fragment,
         get_recover_skill_priority_section(),
         get_recover_output_format_section(layer1_label=layer1_label),
-        # Progress ledger: re-injected so recovery stays anchored and records
-        # what it establishes (empty until something is recorded).
-        ledger_section or "",
+        # The progress ledger NO LONGER rides this head (context-cache-prefix-
+        # stability Unit A task 2.5): its per-round rewrite was an early volatile
+        # byte that re-billed the whole cached suffix on every recover round. It
+        # now rides the message tail (appended + persisted in
+        # _recover_verifier_loop) so this [system] head stays byte-stable across
+        # rounds. ``ledger_section`` is retained as an accepted-but-ignored kwarg
+        # for in-flight callers.
         # U-shaped attention: REMEMBER at END (recency)
         get_recover_remember_section(),
     ]

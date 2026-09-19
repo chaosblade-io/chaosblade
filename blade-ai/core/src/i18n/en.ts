@@ -47,6 +47,15 @@ export const en: Dict = {
   "loading.responding_label": "responding",
   "loading.tokens_estimate": "~{n} tokens",
 
+  // -- FaultWindowIndicator (fault-window hold phase) ----------------
+  // The hold is a continuation grade of the existing spinner: same
+  // icon, same frame rate, only the label changes — zero visual jump
+  // from verify wrap-up into the hold; the countdown is driven by the
+  // component's local 1Hz ticker.
+  "fault_window.indicator": "fault window in progress",
+  "fault_window.remaining": "{duration} left",
+  "fault_window.keys_hint": "ctrl+r recover now · esc exit",
+
   // -- Overflow / dynamic-frame height constraint -------------------
   "overflow.more_lines": "({count} lines folded · Ctrl+O to expand)",
   "overflow.show_more_hint": "Press Ctrl+O to expand folded content",
@@ -154,6 +163,7 @@ export const en: Dict = {
   "recordings.export_failed": "export {id} failed: {err}",
   "recordings.export_unsupported": "file export is not supported by this host",
   "command.replay.desc": "Replay a task recording — pass task_id (optional speed number or 'instant')",
+  "command.resume.desc": "Resume a previous session: /resume (list) / /resume <tui_session_id> (rebuild history and continue)",
   "command.doctor.desc": "Show diagnostic info (server / cluster / version / lang)",
   "command.retry.desc": "Resubmit the last natural-language turn (e.g. after a stream error)",
 
@@ -416,6 +426,16 @@ export const en: Dict = {
   "replay.failed": "failed to replay {id}: {err}",
   "replay.unknown_command": "unknown command: /{name} — try /help",
 
+  "resume.empty": "no resumable sessions (no events.jsonl under memory/tui/)",
+  "resume.head": "{n} resumable session(s) (most recent first):",
+  "resume.use_hint": "use **/resume <tui_session_id>** to take over a session and continue the conversation",
+  "resume.host_unsupported": "session resume is not supported by this host (/resume is TUI-only)",
+  "resume.no_events": "session {sid} has no events jsonl — nothing to rebuild from (no fallback chain)",
+  "resume.starting": "resuming session {sid} — {n} event(s)…",
+  "resume.done": "resumed **{sid}** ({events} events / {duration}) — just type to continue",
+  "resume.failed": "resume {sid} failed: {err}",
+  "resume.failed_list": "failed to list resumable sessions: {err}",
+
   "status.session": "session id",
   "status.cluster": "cluster",
   "status.namespace": "namespace",
@@ -439,6 +459,9 @@ export const en: Dict = {
   // streaming a reply — signals the locked Enter key without blocking
   // the user from drafting their next message.
   "input.placeholder_streaming": "agent finishing — Enter sends after current turn",
+  // Fault-window hold: same enterLocked semantics, but recovery fires
+  // on window expiry or ctrl+r rather than at turn end.
+  "input.placeholder_fault_window": "fault window held — Enter sends after recovery",
 
   // -- AgentMessage truncation hint (shown only while pending — full
   // text appears in scrollback after TURN_DONE moves the item to
@@ -553,6 +576,8 @@ export const en: Dict = {
   "confirm.intent.fault_index": "Fault {n}",
   "confirm.auto_approved": "Auto-approved",
   "confirm.auto_approved_node": "Auto-approved: {node}",
+  "confirm.attention.title": "Attention required",
+  "confirm.attention.body": "Blade-AI is waiting for your approval",
   "confirm.execution.preamble": "Confirm the execution plan:",
   "confirm.generic.preamble": "Please confirm:",
 
@@ -604,6 +629,11 @@ export const en: Dict = {
   "confirm.plan_saved": "saved ({path}) · /show plan to view",
   "confirm.field.conflicts": "Conflicts",
   "confirm.conflicts.hint": "/show experiments to inspect",
+  // Writes beyond the victim target (the CASE manifest's widened
+  // contract): approving authorizes these cluster writes, so they
+  // must be read before the buttons — danger tier, not warning.
+  "confirm.field.mechanism_writes": "Writes beyond victim",
+  "confirm.mechanism_writes.hint": "approving authorizes these cluster writes",
   // Empty-state placeholders so the Parameters / Target health
   // sections always render even when there's "nothing notable" — the
   // section heading itself signals "we did look at this", and the
@@ -703,11 +733,17 @@ export const en: Dict = {
   // -- boot screen: pending tasks card ------------------------------
   "boot.pending.title": "Unfinished tasks",
   "boot.pending.empty": "No unfinished tasks",
+  // Round-32b: the three-group split of liability-live rows — what the
+  // row claims (its lifecycle word) vs what the ledger says.
+  "boot.pending.group_in_flight": "In flight",
+  "boot.pending.group_needs_recovery": "Awaiting recovery",
+  "boot.pending.group_uncleared": "Completed but uncleared",
 
   // -- boot screen: progress phase labels (shown next to spinner) ---
   "boot.progress.spawning": "Starting blade-ai backend…",
   "boot.progress.health": "Waiting for backend to be ready…",
   "boot.progress.session": "Creating session…",
+  "boot.progress.resuming": "Resuming session…",
   "boot.progress.preflight": "Running environment self-check…",
   "boot.progress.tasks": "Checking pending tasks…",
 

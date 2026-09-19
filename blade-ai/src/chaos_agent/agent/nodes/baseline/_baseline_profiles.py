@@ -189,17 +189,32 @@ _FRAGMENT_K8S = (
     "task context — embed them directly, do not invent placeholders.\n"
     "- For ``kubectl exec``, the command after ``--`` MUST be a read-only "
     f"diagnostic ({', '.join(sorted(DIAG_BINARY_WHITELIST))}).\n"
-    "- To capture NODE host-level metrics (disk/io on a node's filesystem), "
-    "you cannot exec a node directly. Emit "
-    f"``kubectl exec {{debug_pod}} -n {_TOOL_POD_NAMESPACE} -- <diag>`` with "
-    "``\"mode\": \"debug_two_step\"`` — ``{debug_pod}`` is the ONLY "
-    "placeholder allowed and is resolved at execution time.\n\n"
+    "- To capture NODE host-level metrics you cannot exec a node directly: "
+    "emit ``kubectl exec {debug_pod} -n " + _TOOL_POD_NAMESPACE + " -- "
+    "<probe>`` with ``\"mode\": \"debug_two_step\"`` — ``{debug_pod}`` is "
+    "the ONLY placeholder allowed and is resolved at execution time. Know "
+    "your execution environment: the debug pod is a PRIVILEGED but MINIMAL "
+    "container — a jump board into the node, NOT a diagnostic toolbox; its "
+    "image may carry no diagnostic binaries at all. Read host-level state "
+    "through these channels, in order of availability certainty:\n"
+    "  1. ``kubectl get/top/describe`` when the metric is API-visible;\n"
+    "  2. kernel pseudo-files — ``cat /proc/diskstats``, ``cat /proc/stat``, "
+    "``cat /proc/meminfo`` (global counters: readable in-container, and the "
+    "data IS the node's);\n"
+    "  3. host tools via namespace entry — ``nsenter -t 1 -m -u -i -n -p "
+    "-- iostat -xd 1 3`` (the node is a full OS, its tools are there);\n"
+    "  4. a diagnostic binary BARE in the container only when the image is "
+    "known to carry it — minimal debug images usually do not.\n\n"
     "Examples:\n"
     '[{"description": "Pod CPU/Memory", '
     '"command": "kubectl top pod my-pod -n prod", "mode": "simple"},\n'
-    '{"description": "Node disk IO", '
+    '{"description": "Node disk counters", '
     f'"command": "kubectl exec {{debug_pod}} -n {_TOOL_POD_NAMESPACE} '
-    '-- iostat -xd 1 3", "mode": "debug_two_step"}]\n'
+    '-- cat /proc/diskstats", "mode": "debug_two_step"},\n'
+    '{"description": "Node disk IO rate", '
+    f'"command": "kubectl exec {{debug_pod}} -n {_TOOL_POD_NAMESPACE} '
+    '-- nsenter -t 1 -m -u -i -n -p -- iostat -xd 1 3", '
+    '"mode": "debug_two_step"}]\n'
 )
 
 _FRAGMENT_HOST = (

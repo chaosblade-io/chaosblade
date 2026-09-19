@@ -847,7 +847,7 @@ class TestBannedRejectionSeparatesCauseFromWayForward:
                 {
                     "subcommand": "apply",
                     "v_args": "-f -",
-                    "stdin_data": "kind: Deployment",
+                    "stdin_data": "kind: StatefulSet",
                 },
                 "blast radius",
             ),
@@ -876,7 +876,7 @@ class TestBannedRejectionSeparatesCauseFromWayForward:
                 {
                     "subcommand": "apply",
                     "v_args": "-f -",
-                    "stdin_data": "kind: Deployment",
+                    "stdin_data": "kind: StatefulSet",
                 },
             ),
         ],
@@ -909,7 +909,7 @@ class TestBannedRejectionSeparatesCauseFromWayForward:
         assert d.suggestion == ""
         assert decision_to_feedback(d).is_hard_floor is True
 
-    @pytest.mark.parametrize("kind", ["Deployment", "DaemonSet", "Job"])
+    @pytest.mark.parametrize("kind", ["DaemonSet", "Job"])
     def test_workload_kind_manifest_is_a_mechanism_ban(self, kind):
         """Creating a workload kind is a MECHANISM ban, not a form issue.
 
@@ -922,7 +922,11 @@ class TestBannedRejectionSeparatesCauseFromWayForward:
 
         ``Pod`` is deliberately NOT parametrised here: a single-Pod manifest
         now takes the drill-occupancy-vehicle branch (contract-checked,
-        reshapeable) — see ``test_vehicle_manifest.py``.
+        reshapeable) — see ``test_vehicle_manifest.py``. Same for
+        ``Deployment``: a single-document Deployment now takes the
+        drill-target contract branch (form-checked, reshapeable, then
+        drift-anchored to the approved target name) — see
+        ``test_drill_target_manifest.py``.
         """
         from chaos_agent.tools.guard_gateway import decision_to_feedback
 
@@ -1337,6 +1341,112 @@ class TestTier1ToolPodExec:
         assert d.verdict == GuardVerdict.REJECT_DRIFT
 
 
+class TestGenerationSuccessorExemption:
+    """Case #39: a mechanism that deletes the approved pod and lets the
+    controller recreate it ALWAYS operates on a renamed successor — the
+    frozen ownerReferences chain (not the transient pod name) is the
+    persistent identity, and the guard must recognise the successor
+    instead of rejecting it as resource-selection drift."""
+
+    def test_renamed_successor_pod_allowed(self):
+        """#39 exact shape: approved ssrk5, recreated bwn2f under the same
+        deployment chain → ALLOW."""
+        approved = ApprovedTarget(
+            scope="pod", namespace="default",
+            names=("drill-mntopt-target-74f644bf8d-ssrk5",),
+            owner_names=(
+                "drill-mntopt-target",                    # deployment
+                "drill-mntopt-target-74f644bf8d",          # replicaset
+            ),
+        )
+        effective = EffectiveTarget(
+            scope="pod", namespace="default",
+            names=("drill-mntopt-target-74f644bf8d-bwn2f",),
+        )
+        d = target_drift_guard(effective, approved)
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_foreign_pod_still_rejected(self):
+        """A name related to no frozen owner keeps the ordinary drift reject."""
+        approved = ApprovedTarget(
+            scope="pod", namespace="default",
+            names=("web-abc-111",), owner_names=("web",),
+        )
+        effective = EffectiveTarget(
+            scope="pod", namespace="default", names=("other-222",),
+        )
+        d = target_drift_guard(effective, approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "resource selection drift" in d.reason
+
+    def test_no_owner_anchor_fails_closed(self):
+        """Empty owner_names (bare pod / discovery failure) → the exemption
+        never fires; the pre-existing drift reject stands."""
+        approved = ApprovedTarget(
+            scope="pod", namespace="default", names=("web-abc-111",),
+        )
+        effective = EffectiveTarget(
+            scope="pod", namespace="default", names=("web-abc-222",),
+        )
+        d = target_drift_guard(effective, approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+
+    def test_sibling_pod_under_same_owner_allowed(self):
+        """A sibling replica of the same owner: the owner-scope branch has
+        always granted operating on the owner (scale deployment affects
+        EVERY replica), so the workload's pods were already inside the
+        approved blast radius — the successor exemption adds no surface."""
+        approved = ApprovedTarget(
+            scope="pod", namespace="default",
+            names=("web-abc-111",), owner_names=("web",),
+        )
+        effective = EffectiveTarget(
+            scope="pod", namespace="default", names=("web-abc-333",),
+        )
+        d = target_drift_guard(effective, approved)
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_mixed_names_require_all_prefix_match(self):
+        """Mixed effective names: one foreign name rejects the whole call."""
+        approved = ApprovedTarget(
+            scope="pod", namespace="default",
+            names=("web-abc-111",), owner_names=("web",),
+        )
+        effective = EffectiveTarget(
+            scope="pod", namespace="default",
+            names=("web-abc-222", "other-1"),
+        )
+        d = target_drift_guard(effective, approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+
+    def test_prefix_requires_trailing_dash(self):
+        """A pod named webapp-1 shares the leading string but NOT the
+        ``web-`` prefix — name-sharing workloads must not match."""
+        approved = ApprovedTarget(
+            scope="pod", namespace="default",
+            names=("web-abc-111",), owner_names=("web",),
+        )
+        effective = EffectiveTarget(
+            scope="pod", namespace="default", names=("webapp-1",),
+        )
+        d = target_drift_guard(effective, approved)
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+
+    def test_label_approval_name_ops_on_successor_allowed(self):
+        """Label-based approval + name-based op on a recreated successor:
+        the labels channel had already discovered the owner, so the
+        exemption benefits label approvals automatically."""
+        approved = ApprovedTarget(
+            scope="pod", namespace="default", labels={"app": "web"},
+            owner_names=("web",),
+        )
+        effective = EffectiveTarget(
+            scope="pod", namespace="default", names=("web-abc-222",),
+        )
+        d = target_drift_guard(effective, approved)
+        assert d.verdict == GuardVerdict.ALLOW
+
+
 class TestHostScope:
     """Host-scope faults (host_inject) are anchored by host_name + fault
     family, bypassing the k8s namespace/names/labels checks (steps 5-6)."""
@@ -1482,3 +1592,234 @@ class TestCrossFamilyScopeChange:
         )
         d = target_drift_guard(self._python_call(), approved)
         assert d.verdict == GuardVerdict.ALLOW
+
+
+class TestDrillCarrierRbacSecondaryScope:
+    """Workload drills may build a temporary drill carrier (SA + least-
+    privilege Role/RoleBinding + carrier pod) in the APPROVED namespace
+    when the cluster has no resident kubectl vehicle, so an in-cluster
+    token can arm the bounded self-recovery timer (verified on-cluster
+    2026-08-26). The RBAC trio is a workload secondary scope; namespace
+    anchoring must still reject every carrier object outside it.
+    """
+
+    @staticmethod
+    def _workload_approval():
+        from chaos_agent.agent.target_guard.freeze import (
+            approved_from_dict,
+            freeze_approved_target,
+        )
+        snap = freeze_approved_target(
+            target={
+                "namespace": "app-system",
+                "names": ["order-processor"],
+                "labels": {},
+                "resource_type": "deployment",
+            },
+            params={"scope": "deployment"},
+            fault_scope=None, fault_target=None, fault_action=None,
+        )
+        approved = approved_from_dict(snap)
+        assert approved is not None
+        return approved
+
+    @staticmethod
+    def _verdict(cmd: str, approved) -> GuardVerdict:
+        import shlex
+        argv = shlex.split(cmd)
+        assert argv[0] == "kubectl"
+        return target_drift_guard(
+            infer_effective_target("kubectl", argv[1:]), approved,
+        ).verdict
+
+    def test_carrier_rbac_trio_allowed_in_approved_namespace(self):
+        approved = self._workload_approval()
+        assert self._verdict(
+            "kubectl create sa drill-carrier -n app-system", approved,
+        ) == GuardVerdict.ALLOW
+        assert self._verdict(
+            "kubectl create role drill-carrier-role -n app-system "
+            "--verb=get,update --resource=deployments/scale", approved,
+        ) == GuardVerdict.ALLOW
+        assert self._verdict(
+            "kubectl create rolebinding drill-carrier-binding -n app-system "
+            "--role=drill-carrier-role "
+            "--serviceaccount=app-system:drill-carrier", approved,
+        ) == GuardVerdict.ALLOW
+
+    def test_carrier_rbac_trio_rejected_outside_approved_namespace(self):
+        approved = self._workload_approval()
+        assert self._verdict(
+            "kubectl create sa drill-carrier -n default", approved,
+        ) == GuardVerdict.REJECT_DRIFT
+        assert self._verdict(
+            "kubectl create role drill-carrier-role -n kube-system "
+            "--verb=get --resource=pods", approved,
+        ) == GuardVerdict.REJECT_DRIFT
+
+    def test_carrier_teardown_allowed_in_approved_namespace(self):
+        approved = self._workload_approval()
+        for cmd in (
+            "kubectl delete sa drill-carrier -n app-system",
+            "kubectl delete role drill-carrier-role -n app-system",
+            "kubectl delete rolebinding drill-carrier-binding -n app-system",
+            "kubectl delete pod drill-carrier -n app-system",
+        ):
+            assert self._verdict(cmd, approved) == GuardVerdict.ALLOW
+
+    def test_five_object_carrier_cluster_scoped_rbac_allowed(self):
+        # B28 (five-object carrier variant): when the recovery writes touch
+        # cluster-scoped resources (node taint/label restore after a
+        # Taint→Pending drill), the carrier stack extends with ClusterRole +
+        # ClusterRoleBinding — namespaced Roles cannot grant verbs on
+        # cluster-scoped kinds. Both are cluster-scoped (no ``-n``) and must
+        # ride the secondary-scope path like their namespaced siblings.
+        approved = self._workload_approval()
+        assert self._verdict(
+            "kubectl create clusterrole drill-carrier "
+            "--resource=nodes --verb=get,patch", approved,
+        ) == GuardVerdict.ALLOW
+        assert self._verdict(
+            "kubectl create clusterrolebinding drill-carrier "
+            "--clusterrole=drill-carrier "
+            "--serviceaccount=app-system:drill-carrier", approved,
+        ) == GuardVerdict.ALLOW
+
+    def test_five_object_carrier_cluster_scoped_teardown_allowed(self):
+        # The six-way delete (B28): cluster-scoped members carry no
+        # namespace — with or without ``-n``, kubectl resolves them
+        # cluster-wide, and the guard must not block the cleanup sweep.
+        approved = self._workload_approval()
+        for cmd in (
+            "kubectl delete clusterrole drill-carrier --ignore-not-found",
+            "kubectl delete clusterrole drill-carrier -n app-system "
+            "--ignore-not-found",
+            "kubectl delete clusterrolebinding drill-carrier "
+            "--ignore-not-found",
+        ):
+            assert self._verdict(cmd, approved) == GuardVerdict.ALLOW
+
+    def test_two_step_stack_patch_second_step_allowed(self):
+        # J4 (2026-09-17 probe, 5/5 live verdicts on the real pipeline):
+        # the two-step stack rule's second command — ``kubectl patch
+        # role/clusterrole --type=json -p '[self-revoke rule]'`` — must
+        # ride the workload secondary-scope path like its create/delete
+        # siblings (patch on the subcommand whitelist, the four RBAC
+        # kinds inside the secondary net, ``-p`` classified as data
+        # payload). Without these anchors a future net narrowing (say,
+        # clusterrole dropping out of secondary_scopes) would silently
+        # break every two-step-stack case: the json-patch append gets
+        # rejected, the self-revoke rule never lands, and the timer's
+        # DELETE goes 403. Negatives keep the tooth non-vacuous.
+        approved = self._workload_approval()
+        json_payload = (
+            '[{"op":"add","path":"/rules/-","value":{"apiGroups":'
+            '["rbac.authorization.k8s.io"],"resources":["clusterrolebindings"],'
+            '"resourceNames":["drill-rc-a1b2c3"],"verbs":["delete"]}}]'
+        )
+        assert self._verdict(
+            f"kubectl patch clusterrole drill-rc-a1b2c3 --type=json "
+            f"-p '{json_payload}'", approved,
+        ) == GuardVerdict.ALLOW
+        assert self._verdict(
+            f"kubectl patch role drill-rc-a1b2c3 -n app-system --type=json "
+            f"-p '{json_payload}'", approved,
+        ) == GuardVerdict.ALLOW
+        assert self._verdict(
+            "kubectl patch clusterrole drill-rc-a1b2c3 --type=json "
+            "-p '[{\"op\":\"add\",\"path\":\"/rules/-\"}]'", approved,
+        ) == GuardVerdict.ALLOW
+        assert self._verdict(
+            "kubectl patch namespace default --type=json "
+            "-p '[{\"op\":\"test\"}]'", approved,
+        ) != GuardVerdict.ALLOW
+        assert self._verdict(
+            "kubectl patch deployment other-app -n app-system --type=json "
+            "-p '[{\"op\":\"test\"}]'", approved,
+        ) != GuardVerdict.ALLOW
+
+
+class TestDurationAnchorDrift:
+    """Execution ``--timeout`` vs the frozen contract duration (E4).
+
+    The timeout bounds the experiment's AUTO-RECOVERY — layer 3 of the
+    three-layer duration guarantee (1: recover's active destroy,
+    2: the cleanup chain, 3: blade's own ``--timeout``). Layer 3 was
+    unanchored: a free-form ``--timeout 999999`` rode the flags string
+    past every gate, so a task that died with a failed cleanup chain
+    left a live fault for 11.5 days. The net freezes
+    ``FaultSpec.duration_seconds`` into the approval and rejects an
+    execution timeout beyond the 2x headroom ceiling; legitimate
+    operational margin and the verbatim executor discipline (CLI
+    direct calls keep their explicit timeout) stay untouched.
+    """
+
+    def _approved(self, duration: int) -> ApprovedTarget:
+        return ApprovedTarget(
+            scope="pod", namespace="default", names=("drill-t",),
+            fault_target="cpu", duration_seconds=duration,
+        )
+
+    def _effective(self, timeout: int) -> EffectiveTarget:
+        return EffectiveTarget(
+            scope="pod", namespace="default", names=("drill-t",),
+            fault_target="cpu", timeout_seconds=timeout,
+            raw_command=f"blade_create flags=--timeout {timeout}",
+        )
+
+    def test_inflated_timeout_rejected(self):
+        d = target_drift_guard(
+            self._effective(999999), self._approved(300),
+        )
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "duration drift" in d.reason
+        assert "999999" in d.reason
+        assert "300" in d.reason
+
+    def test_headroom_ceiling_boundary_allows(self):
+        # Exactly 2x is operational margin, not drift — strict > only.
+        d = target_drift_guard(
+            self._effective(600), self._approved(300),
+        )
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_within_headroom_allows(self):
+        d = target_drift_guard(
+            self._effective(450), self._approved(300),
+        )
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_no_execution_timeout_is_silent(self):
+        # Omitted --timeout: the executor injects the contract-derived
+        # bound itself; no anchor, no comparison.
+        d = target_drift_guard(
+            self._effective(0), self._approved(300),
+        )
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_no_contract_duration_is_silent(self):
+        # Legacy approvals frozen before the anchor existed carry no
+        # duration — the net must stay silent for them.
+        d = target_drift_guard(
+            self._effective(999999), self._approved(0),
+        )
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_full_loop_blade_create_flags_timeout_rejected(self):
+        """E4b reversal through the classifier: the flags string's
+        verbatim timeout reaches the guard anchored."""
+        eff = infer_effective_target(
+            "blade_create",
+            {
+                "scope": "pod",
+                "target": "cpu",
+                "action": "fullload",
+                "namespace": "default",
+                "names": "drill-t",
+                "flags": "--cpu-percent 80 --timeout 999999",
+            },
+        )
+        d = target_drift_guard(eff, self._approved(300))
+        assert d.verdict == GuardVerdict.REJECT_DRIFT
+        assert "duration drift" in d.reason
+

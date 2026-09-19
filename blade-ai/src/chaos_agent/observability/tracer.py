@@ -55,6 +55,12 @@ class TaskTrace:
     total_token_output: int = 0
     total_llm_calls: int = 0
     total_tool_calls: int = 0
+    # Prompt-cache hits, a SUBSET of ``total_token_input`` (not additive).
+    # Cache hit rate = total_token_cached / total_token_input. Aggregated
+    # in-memory, surfaced via ``to_dict()`` for the metric endpoint, AND
+    # persisted to task_details.total_token_cached at finalize (design D4)
+    # so the per-task hit rate survives a restart and is SQL-queryable.
+    total_token_cached: int = 0
 
     def start_span(self, node_name: str) -> NodeSpan:
         """Start timing a new span."""
@@ -94,34 +100,124 @@ class TaskTrace:
                 "total_llm_calls": self.total_llm_calls,
                 "total_tool_calls": self.total_tool_calls,
                 "total_duration_ms": sum(s.duration_ms for s in self.spans),
+                # Cache-hit subset of input tokens; consumers derive the
+                # rate as total_token_cached / total_token_input.
+                "total_token_cached": self.total_token_cached,
             },
         }
 
 
-def _extract_token_usage(response) -> tuple[int, int]:
-    """Extract (prompt_tokens, completion_tokens) from LLM response.
+def _cache_read_from_usage_metadata(um: dict) -> tuple[int, Optional[str]]:
+    """Extract prompt-cache-hit tokens from a LangChain ``usage_metadata``.
 
-    Tries multiple response structures for DashScope / OpenAI compatibility,
-    plus direct AIMessage handling for ``on_chat_model_end`` astream_events
-    where ``data.output`` is the raw AIMessage rather than an LLMResult.
+    Returns ``(cache_read_tokens, source_field)`` where ``source_field`` names
+    the matched key for diagnostics, or ``None`` when no cache field is
+    present (a genuine cold turn, or an unmapped vendor field name).
+
+    This is the AUTHORITATIVE source for DashScope / OpenAI-compat under
+    streaming (real-run verified: the cache hit lands in
+    ``input_token_details.cache_read`` as a plain key, while
+    ``response_metadata.token_usage`` is empty). Vendor-agnostic union:
+    LangChain prefixes the key with the service tier when
+    ``service_tier ∈ {priority, flex}`` (→ ``priority_cache_read`` /
+    ``flex_cache_read``), so probe all three, plus a flat ``cache_read``
+    some providers emit. Read-side probing is zero-risk.
     """
-    prompt = completion = 0
+    details = um.get("input_token_details")
+    if isinstance(details, dict):
+        for key in ("cache_read", "priority_cache_read", "flex_cache_read"):
+            v = details.get(key)
+            if v:
+                return int(v), f"usage_metadata.input_token_details.{key}"
+    v = um.get("cache_read")
+    if v:
+        return int(v), "usage_metadata.cache_read"
+    return 0, None
+
+
+def _cache_read_from_token_usage(usage: dict) -> tuple[int, Optional[str]]:
+    """Defensive fallback: cache-hit tokens from a raw OpenAI-shape
+    ``token_usage`` dict (``llm_output`` / ``response_metadata``).
+
+    Returns ``(cache_read_tokens, source_field)`` — see
+    :func:`_cache_read_from_usage_metadata` for the source semantics.
+
+    Real-run evidence shows these are EMPTY on the production streaming
+    path (usage only lands in ``usage_metadata`` when ``stream_usage=True``),
+    so this is a zero-risk safety net for non-streaming / other providers
+    rather than a live source. Union across vendor field names: OpenAI
+    ``prompt_tokens_details.cached_tokens``, Anthropic
+    ``cache_read_input_tokens``, DeepSeek ``prompt_cache_hit_tokens``
+    (the latter two unverified against a live key — kept because
+    read-side probing costs nothing).
+    """
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        v = details.get("cached_tokens")
+        if v:
+            return int(v), "token_usage.prompt_tokens_details.cached_tokens"
+    for key in ("cached_tokens", "cache_read_input_tokens", "prompt_cache_hit_tokens"):
+        v = usage.get(key)
+        if v:
+            return int(v), f"token_usage.{key}"
+    return 0, None
+
+
+def _log_cache_read_source(cache_read: int, source: Optional[str], prompt: int) -> None:
+    """Diagnostic: record which vendor field ``cache_read`` was extracted from.
+
+    When ``cache_read`` is 0 despite a non-zero prompt, log the neutral fact
+    (no cache-hit field mapped) plus its two benign explanations — a genuine
+    cold/no-cache turn, or an unmapped vendor whose cache field name we don't
+    yet probe. The wording deliberately avoids a "missed/failed" framing so a
+    healthy cold start (the first turn of every task, where cache_read is
+    legitimately 0) doesn't read as an error when debug logging is on, while
+    an unmapped vendor still stays diagnosable instead of silently reporting
+    a 0 hit rate. Debug-level: this fires on every LLM turn.
+    """
+    if cache_read > 0:
+        logger.debug(
+            "cache_read=%d from %s (prompt=%d)", cache_read, source, prompt
+        )
+    elif prompt > 0:
+        logger.debug(
+            "cache_read=0 (prompt=%d): no cache-hit field mapped for this "
+            "turn — a genuine cold/no-cache turn, or an unmapped vendor "
+            "cache field.",
+            prompt,
+        )
+
+
+def _extract_token_usage(response) -> tuple[int, int, int]:
+    """Extract (prompt_tokens, completion_tokens, cache_read_tokens).
+
+    ``cache_read_tokens`` is a SUBSET of ``prompt_tokens`` (not additive):
+    cache hit rate = cache_read / prompt. Tries multiple response structures
+    for DashScope / OpenAI compatibility, plus direct AIMessage handling for
+    ``on_chat_model_end`` astream_events where ``data.output`` is the raw
+    AIMessage rather than an LLMResult.
+    """
+    prompt = completion = cache_read = 0
+    cache_source: Optional[str] = None
 
     # Path 0: direct AIMessage / BaseMessage with usage_metadata. This is
     # the shape LangGraph's astream_events delivers under
     # ``on_chat_model_end`` — ``data.output`` is the AIMessage itself, not
     # an LLMResult, so the LLMResult-shaped paths below all miss. Done
     # before the legacy paths so chat-model events take the fast lane.
+    # This is also the authoritative cache_read source (real-run verified).
     try:
         um = getattr(response, "usage_metadata", None)
         if um and isinstance(um, dict):
             prompt = um.get("input_tokens", 0) or 0
             completion = um.get("output_tokens", 0) or 0
+            cache_read, cache_source = _cache_read_from_usage_metadata(um)
     except Exception:
         pass
 
     if prompt or completion:
-        return prompt, completion
+        _log_cache_read_source(cache_read, cache_source, prompt)
+        return prompt, completion, cache_read
 
     # Path 1: llm_output.token_usage (original path)
     try:
@@ -130,11 +226,13 @@ def _extract_token_usage(response) -> tuple[int, int]:
             if isinstance(usage, dict):
                 prompt = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
                 completion = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+                cache_read, cache_source = _cache_read_from_token_usage(usage)
     except Exception:
         pass
 
     if prompt or completion:
-        return prompt, completion
+        _log_cache_read_source(cache_read, cache_source, prompt)
+        return prompt, completion, cache_read
 
     # Path 2: response_metadata (DashScope OpenAI-compat / langchain_openai)
     try:
@@ -144,11 +242,13 @@ def _extract_token_usage(response) -> tuple[int, int]:
             if isinstance(usage, dict):
                 prompt = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
                 completion = usage.get("completion_tokens", 0) or usage.get("output_tokens", 0)
+                cache_read, cache_source = _cache_read_from_token_usage(usage)
     except Exception:
         pass
 
     if prompt or completion:
-        return prompt, completion
+        _log_cache_read_source(cache_read, cache_source, prompt)
+        return prompt, completion, cache_read
 
     # Path 3: generations[0][0].message.usage_metadata (LangChain standard)
     try:
@@ -159,10 +259,12 @@ def _extract_token_usage(response) -> tuple[int, int]:
             if um and isinstance(um, dict):
                 prompt = um.get("input_tokens", 0)
                 completion = um.get("output_tokens", 0)
+                cache_read, cache_source = _cache_read_from_usage_metadata(um)
     except (IndexError, AttributeError):
         pass
 
-    return prompt, completion
+    _log_cache_read_source(cache_read, cache_source, prompt)
+    return prompt, completion, cache_read
 
 
 class TracingCallback(BaseCallbackHandler):
@@ -174,9 +276,10 @@ class TracingCallback(BaseCallbackHandler):
     def on_llm_end(self, response, **kwargs) -> None:
         """Record token usage from LLM response."""
         self.trace.total_llm_calls += 1
-        prompt, completion = _extract_token_usage(response)
+        prompt, completion, cache_read = _extract_token_usage(response)
         self.trace.total_token_input += prompt
         self.trace.total_token_output += completion
+        self.trace.total_token_cached += cache_read
         if not prompt and not completion:
             logger.warning(
                 "TracingCallback.on_llm_end: extracted (0, 0) tokens. "
@@ -256,6 +359,7 @@ async def _persist_summary(task_id: str, trace: TaskTrace) -> None:
             task_id,
             total_token_input=trace.total_token_input,
             total_token_output=trace.total_token_output,
+            total_token_cached=trace.total_token_cached,
             total_llm_calls=trace.total_llm_calls,
             total_tool_calls=trace.total_tool_calls,
             total_duration_ms=int(sum(s.duration_ms for s in trace.spans)),
@@ -276,6 +380,7 @@ async def _load_trace_from_store(task_id: str) -> Optional[TaskTrace]:
         summary = await store.get_summary(task_id) or {}
         trace.total_token_input = summary.get("total_token_input", 0)
         trace.total_token_output = summary.get("total_token_output", 0)
+        trace.total_token_cached = summary.get("total_token_cached", 0)
         trace.total_llm_calls = summary.get("total_llm_calls", 0)
         trace.total_tool_calls = summary.get("total_tool_calls", 0)
         for span_dict in await store.get_spans(task_id):

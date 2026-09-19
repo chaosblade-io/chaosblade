@@ -48,7 +48,10 @@ import { WizardClient } from "../../api/wizard.js";
 import { t } from "@blade-ai/core";
 import { useAppDispatch, useAppSelector } from "@blade-ai/core";
 import type { HistoryItem } from "@blade-ai/core";
+import { runSessionResume } from "@blade-ai/core";
+import type { SessionResumeOutcome } from "@blade-ai/core";
 import { WizardCard } from "../wizard/WizardCard.js";
+import { fetchDoctorCard, fetchPendingCard } from "./bootCards.js";
 
 export interface BootRunnerProps {
   version: string;
@@ -60,6 +63,13 @@ export interface BootRunnerProps {
   /** Stream debug noise to stderr when ``BLADE_AI_DEBUG=1`` (the
    *  ``onProtocolError`` sink on BladeClient). */
   debug: boolean;
+  /** Take over a previous session instead of creating a fresh one —
+   *  set by ``blade-ai resume -i <sid>`` (the Python CLI execvp's
+   *  this process with ``--resume <sid>``). The takeover sequence
+   *  lives in core's ``runSessionResume`` (the exact code path the
+   *  ``/resume <sid>`` slash command uses), so the confirm-gate
+   *  flush and the per-segment event fold behave identically. */
+  resumeSid?: string;
   /** Fired exactly once when the handshake succeeds. cli.tsx stashes
    *  ``server`` so its exit-time ``cleanup()`` can call
    *  ``server.shutdown()``. */
@@ -120,6 +130,7 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
   version,
   bootCapturedAt,
   debug,
+  resumeSid,
   onResolved,
   onFailed,
 }) => {
@@ -268,6 +279,155 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
 
     const run = async () => {
       try {
+        // -- Phase 3a: resume branch (``blade-ai resume -i <sid>``) --
+        // skip createSession entirely and take over the previous
+        // session through core's runSessionResume: the same takeover
+        // sequence the ``/resume <sid>`` slash command uses (fold +
+        // confirm-gate flush + SESSION_INITIALIZED re-bind), so the
+        // two entry points can never drift apart.
+        if (resumeSid) {
+          dispatch({
+            type: "BOOT_PROGRESS_SHOW",
+            text: t("boot.progress.resuming"),
+          });
+
+          // Best-effort pre-read for the permission-mode seed and the
+          // header fallbacks; runSessionResume re-reads the state
+          // itself (its own Step 3 is also best-effort).
+          let resumeState: Record<string, unknown> = {};
+          try {
+            resumeState = await c.getSessionState(resumeSid);
+          } catch {
+            // Non-fatal — defaults below apply.
+          }
+          if (cancelledRef.current) return;
+
+          const bootMode =
+            resumeState["confirmation_required"] === false
+              ? "auto"
+              : "confirm";
+          if (bootMode !== permissionMode) {
+            dispatch({ type: "MODE_TOGGLED", mode: bootMode });
+          }
+
+          // -- Phase 3a.5 (resume): lay the boot cards BEFORE the
+          // replay. runSessionResume's HISTORY_CLEARED carries
+          // ``preserveBootCards``, so these survive at the head of the
+          // rebuilt history and the resumed boot shows the SAME card
+          // order as a fresh one (welcome → doctor → pending →
+          // replayed turns) instead of cards appended after N
+          // replayed events. The <Static> gate (session.id) is still
+          // CLOSED here — nothing burn-ins until the replay's
+          // SESSION_INITIALIZED opens it, so the whole stack renders
+          // exactly once, in history order.
+          const welcomeCard: HistoryItem = {
+            kind: "welcome_card",
+            id: "boot-welcome",
+            modelName: asString(resumeState["model_name"]),
+            permissionMode: bootMode,
+            kubeconfig: asString(resumeState["kubeconfig"]),
+            namespace: asString(resumeState["namespace"]) || "default",
+            version,
+          };
+          dispatch({ type: "HISTORY_APPENDED", item: welcomeCard });
+
+          dispatch({
+            type: "BOOT_PROGRESS_SHOW",
+            text: t("boot.progress.preflight"),
+          });
+          const { item: doctorItem, contextMax } = await fetchDoctorCard(
+            c,
+            bootCapturedAt,
+          );
+          if (cancelledRef.current) return;
+          dispatch({ type: "HISTORY_APPENDED", item: doctorItem });
+          // Seed the footer's context indicator (same as the fresh
+          // path — BootOrchestrator is skipped on resume, so THIS is
+          // the only place the seed happens).
+          if (contextMax !== null) {
+            dispatch({
+              type: "CONTEXT_SIZE_RECEIVED",
+              currentTokens: 0,
+              triggerTokens: 0,
+              maxTokens: contextMax,
+              messagesCount: 0,
+            });
+          }
+
+          dispatch({
+            type: "BOOT_PROGRESS_SHOW",
+            text: t("boot.progress.tasks"),
+          });
+          const pendingItem = await fetchPendingCard(c);
+          if (cancelledRef.current) return;
+          dispatch({ type: "HISTORY_APPENDED", item: pendingItem });
+
+          let outcome: SessionResumeOutcome;
+          try {
+            outcome = await runSessionResume(
+              {
+                client: c,
+                dispatch,
+                pushLog: (text, level) =>
+                  dispatch({ type: "LOG_APPENDED", text, level }),
+                // No clearScreen: nothing has rendered yet — only the
+                // boot spinner, which App's first paint replaces.
+                // preserveBootCards: the cards dispatched above must
+                // survive the replay's history clear.
+                preserveBootCards: true,
+                fallbackHeader: {
+                  cluster: asString(resumeState["cluster"]),
+                  namespace:
+                    asString(resumeState["namespace"]) || "default",
+                  modelName: asString(resumeState["model_name"]),
+                },
+              },
+              resumeSid,
+            );
+          } catch (err) {
+            throw new Error(
+              t("resume.failed", {
+                sid: resumeSid,
+                err: formatError(err),
+              }),
+            );
+          }
+          if (outcome === "no_events") {
+            // The user named THIS sid on the command line — silently
+            // falling back to a fresh session would be worse than a
+            // loud exit that points at the listing command.
+            throw new Error(t("resume.no_events", { sid: resumeSid }));
+          }
+          if (cancelledRef.current) return;
+
+          // Protocol-mismatch warning — same defensive check as the
+          // fresh-session path below.
+          const resumeProto = c.serverProtocolVersion;
+          if (resumeProto && resumeProto !== TUI_PROTOCOL_VERSION) {
+            dispatch({
+              type: "HISTORY_APPENDED",
+              item: {
+                kind: "log",
+                id: "log-bootwarn",
+                level: "warn",
+                text: t("protocol.mismatch", {
+                  tui: TUI_PROTOCOL_VERSION,
+                  server: resumeProto,
+                }),
+              },
+            });
+          }
+
+          // -- Phase 5 (resume): hand control to App -----------------
+          resolvedToCliRef.current = true;
+          onResolved(spawnedServer, c, resumeSid);
+          setClient(c);
+          setSessionId(resumeSid);
+          setServerUrl(spawnedServer.url);
+          setPhase("done");
+          return;
+        }
+
         // -- Phase 3: createSession + state -----------------------
         dispatch({
           type: "BOOT_PROGRESS_SHOW",
@@ -365,7 +525,7 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
     // Cleanup for this effect — no-op; spawning effect's cleanup
     // owns the server-shutdown logic until ``onResolved`` flips
     // ``resolvedToCliRef``.
-  }, [phase, onResolved, onFailed, dispatch, debug, permissionMode, version]);
+  }, [phase, onResolved, onFailed, dispatch, debug, permissionMode, version, resumeSid, bootCapturedAt]);
 
   // ── Render ────────────────────────────────────────────────────────
 
@@ -398,6 +558,7 @@ export const BootRunner: React.FC<BootRunnerProps> = ({
       serverUrl={serverUrl}
       version={version}
       bootCapturedAt={bootCapturedAt}
+      skipOrchestrator={Boolean(resumeSid)}
     />
   );
 };

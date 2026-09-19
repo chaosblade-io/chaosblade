@@ -310,6 +310,18 @@ const STATE_VISUALS: Record<string, { className: string; glyph: string; bold?: b
   interrupted: { className: "text-warning", glyph: "◐" },
   partial_recovered: { className: "text-warning", glyph: "◐" },
   cancelled: { className: "text-warning", glyph: "⊘" },
+  // Tier 2½ — fault effect UNCONFIRMED (round-17 C1): verification ran
+  // but evidence is unavailable, so the fault is suspected LIVE
+  // (fail-closed). Previously 'unverified' silently fell through to
+  // STATE_FALLBACK (gray) — kept only as a conscious decision in
+  // round-15; now given a dedicated warn visual to match the TUI map
+  // (the two STATE_VISUALS maps are pinned key-identical by the TS
+  // reconciliation test, so a missing key on one side fails CI).
+  unverified: { className: "text-warning", glyph: "◌" },
+  // Tier 2½ — newborn anchor (round-17 D4): zero lifecycle evidence,
+  // pipeline not entered. Neutral-faint family, pinned key-identical
+  // with the TUI map (TaskStateOverlay.PENDING).
+  pending: { className: "text-forge-text-faint", glyph: "◌" },
   recovered: { className: "text-success", glyph: "●" },
   completed: { className: "text-success", glyph: "●" },
   failed: { className: "text-danger", glyph: "✗", bold: true },

@@ -146,7 +146,12 @@ class TestGateVocabularyIsFullyWired:
     def test_retryable_set_excludes_command_level_verdicts(self):
         # Retrying these through discovery would overwrite the facts that
         # produced them (synthetic artifact is always active, family-less).
-        for name in ("FAMILY_MISMATCH", "NO_BOUNDED_RECOVERY", "CARRIER_NOT_ACTIVE"):
+        for name in (
+            "FAMILY_MISMATCH",
+            "NO_BOUNDED_RECOVERY",
+            "READONLY_FORM_UNPROVEN",
+            "CARRIER_NOT_ACTIVE",
+        ):
             assert (
                 CarrierRejectReason[name]
                 not in carriers.LIVE_DISCOVERY_RETRYABLE_REASONS

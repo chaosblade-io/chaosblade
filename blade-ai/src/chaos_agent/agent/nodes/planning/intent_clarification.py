@@ -277,14 +277,29 @@ def _clarification_bump(
     return current + 1
 
 
-def _confirmation_refund(current: int) -> int:
+def _confirmation_refund(
+    current: int, *, reviewed_contract_existed: bool,
+) -> int:
     """Give back the entry bump of a turn that was only a confirmation.
 
     The successful-submit fast path runs on the tool-loop re-entry of the
     confirming turn, whose entry already counted +1. A pure confirmation
     adds no clarification, so the count is refunded — never below zero: a
     one-shot session can reach submission without any bump ever firing.
+
+    The refund is conditional on a reviewed contract having existed at
+    submit time (the replay path): only then did the turn merely confirm
+    what was already on the table. When the fast path had to bootstrap the
+    contract from the submission itself, no contract pre-existed the
+    turn's dialogue — that turn carried the substantive decision
+    (answering a question, delegating a choice, supplying parameters), so
+    its bump stays. sess_5bb60326518c: the user's「你帮我选一个合适的」
+    was a real clarification round and the model decided the target and
+    submitted in that same turn; the old unconditional refund erased the
+    round, and the confirm card claimed one-shot convergence.
     """
+    if not reviewed_contract_existed:
+        return current
     return max(0, current - 1)
 
 
@@ -587,14 +602,17 @@ def submit_fault_intent(
 
     Inputs: fault_type "<scope>-<target>-<action>"; target = subsystem,
     NOT a resource instance name; namespace empty for host/cluster-scoped;
-    names/labels/params per the reviewed spec. Environment-bound params
+    names/labels/params per the reviewed spec (names = instance names of the
+    scope kind; a target identified by its workload/owner goes in labels).
+    Environment-bound params
     values must carry a probe trail from the CURRENT environment — on a
     probe/user conflict do NOT submit; go back to the user with the
     environment-verified recommendation. Skill-case example literals are
     templates, never data. Downstream preserves params verbatim as
     user-approved.
     duration_seconds: fault duration in seconds; pass the user's value, or 0
-    for the system recommended default. Never put duration into params.
+    for the system recommended default (the summary states the window that
+    will run). Never put duration into params.
     case_resource_path: settled case file, relative to the skill directory
     (``read_skill_resource`` input); omit when none.
 
@@ -730,7 +748,11 @@ async def query_active_experiments() -> str:
     store = await get_task_store()
     # 多租户隔离：仅查询当前租户的活跃实验
     tenant_id = getattr(settings, "tenant_id", "") or ""
-    active = await store.query_active(tenant_id=tenant_id)
+    # Workspace-scoped isolation (platform mode): both axes ride the same
+    # ContextVar channel — settings carries what the platform injected via
+    # blade_ai_context; empty locally = unfiltered (tenant_id's contract).
+    workspace_id = getattr(settings, "workspace_id", "") or ""
+    active = await store.query_active(tenant_id=tenant_id, workspace_id=workspace_id)
     if not active:
         return "There are no active fault-injection experiments, so there is nothing to recover."
     from chaos_agent.agent.experiment_display import format_experiment_line
@@ -1127,7 +1149,11 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
         # Extract the current turn's HumanMessage for session persistence.
         # This is the user-visible input that pairs with the AI response
         # in _persist_dialogue calls. Search from the end to find the
-        # most recent HumanMessage (converse_stream adds exactly one per turn).
+        # most recent HumanMessage (every entry point appends exactly one
+        # per turn: the server /turn route via load_memory, L4 via its
+        # own prev_messages.append, CLI NL via pipeline_init — the local
+        # converse_stream twin that used to carry this contract on the
+        # CLI side was retired 2026-09-01).
         current_human_msg = None
         if messages:
             for msg in reversed(messages):
@@ -1138,7 +1164,7 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                         break
 
         # A fresh user turn (as opposed to a tool-loop re-entry) ends with
-        # the HumanMessage itself: converse_stream appends exactly one per
+        # the HumanMessage itself: each entry point appends exactly one per
         # invocation. Only fresh turns can count as clarification rounds.
         _is_new_user_turn = (
             current_human_msg is not None
@@ -1247,6 +1273,16 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
             # without parsing prose or relaxing validation for an existing
             # COMPLETE contract — the anti-smuggling replay check below
             # still gates every submit against a complete spec.
+            #
+            # Capture the replay-vs-bootstrap verdict BEFORE the bootstrap:
+            # a bootstrapped spec is also "complete" afterwards, but it was
+            # born from this very submission. This is what tells
+            # ``_confirmation_refund`` at the converged return whether the
+            # submit turn merely confirmed an already-reviewed contract or
+            # actually carried the substantive decision.
+            reviewed_contract_existed = (
+                existing_spec is not None and existing_spec.is_complete
+            )
             if existing_spec is None or not existing_spec.is_complete:
                 existing_spec = (
                     _bootstrap_submitted_spec(llm_args, existing=existing_spec)
@@ -1360,9 +1396,15 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                     "fault_spec": existing_spec.to_dict(),
                     "intent_confidence": 1.0,
                     "intent_reasoning": "submit_fault_intent tool executed",
-                    # The confirming turn's entry bump counted a round that
-                    # turned out to be a pure confirmation — give it back.
-                    "clarification_round": _confirmation_refund(clarification_round),
+                    # Give back the confirming turn's entry bump — but only
+                    # for a replay of an already-reviewed contract: a turn
+                    # whose submission bootstrapped the contract carried the
+                    # substantive decision itself, so its round stays
+                    # counted.
+                    "clarification_round": _confirmation_refund(
+                        clarification_round,
+                        reviewed_contract_existed=reviewed_contract_existed,
+                    ),
                     "dialogue_round": dialogue_round + 1,
                     "task_id": op_task_id,
                 }, hook_updates)
@@ -1397,6 +1439,12 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                 # source.  Without this the replay gate below would diff the
                 # submission against an empty review — a guaranteed rejection
                 # the model can never repair.
+                #
+                # Same reviewed-vs-bootstrapped capture as the single-fault
+                # path: an empty ``existing_batch`` means the submission
+                # itself births the batch contract, so the submit turn
+                # carried the substantive decision.
+                reviewed_batch_existed = bool(existing_batch)
                 if not existing_batch:
                     existing_batch = [
                         _advance_fault_spec(None, f)
@@ -1482,8 +1530,12 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                     },
                     "intent_confidence": 1.0,
                     "intent_reasoning": "submit_batch_intent tool executed",
-                    # Same confirmation refund as the single-fault path.
-                    "clarification_round": _confirmation_refund(clarification_round),
+                    # Same conditional confirmation refund as the
+                    # single-fault path.
+                    "clarification_round": _confirmation_refund(
+                        clarification_round,
+                        reviewed_contract_existed=reviewed_batch_existed,
+                    ),
                     "dialogue_round": dialogue_round + 1,
                     "task_id": op_task_id,
                 }, hook_updates)
@@ -1512,6 +1564,39 @@ def make_intent_clarification(llm=None, tools: list = None, hook=None, registry=
                 dialogue_round=dialogue_round,
             )
             _persist_dialogue(tui_session_id, persist_list)
+            # Round-64 R64-1: a dry-run turn (/plan preview) must not
+            # bootstrap a recover session nor confirm the recover intent —
+            # a preview has no side effects (the stance the inject preview's
+            # route_after_confirmation "end" legislates). Before this early
+            # return the preview REALLY RAN the recovery: the branch
+            # bootstrapped and confirmed unconditionally, and the turn
+            # stream's _run_recover gated only on the confirmed intent, so
+            # /plan over a recovery request executed a REAL recovery (and
+            # an abort in the dispatch window leaked the bootstrapped
+            # session — the G5 fallback's own not-ctx.dry_run gate kept it
+            # closed for previews by design). The preview answers with an
+            # announcement instead; confirmed_intent stays unset so the
+            # graph ends this turn (no handler runs, no session exists,
+            # nothing to close or leak). recover_task_id is still recorded:
+            # a dialogue FACT that keeps the previewed target on record —
+            # the next real turn re-derives it from its own recover_task
+            # tool message (the same value, so this field is a fallback:
+            # recover_handler's pass-through reads whatever the state
+            # carries, which only matters when that re-derivation comes
+            # up empty).
+            if state.get("dry_run"):
+                return merge_hook_updates({
+                    "messages": [AIMessage(
+                        content=(
+                            f"Dry-run preview: recovery of task {recover_task_id} "
+                            "identified but NOT executed — previews never run "
+                            "recovery. Re-run the request without /plan to "
+                            "recover for real."
+                        ),
+                    )],
+                    "recover_task_id": recover_task_id,
+                    "dialogue_round": dialogue_round + 1,
+                }, hook_updates)
             op_task_id = _allocate_operation_task_id(state.get("task_id", ""), operation="recover")
             bootstrap_task_session(
                 op_task_id,

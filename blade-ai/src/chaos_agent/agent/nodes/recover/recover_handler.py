@@ -77,12 +77,19 @@ async def recover_handler(state: AgentState) -> dict:
     if tracker:
         tracker.start(StatusCategory.NODE, "recover_handler", "Querying active experiments...")
 
-    # Query active (injecting/injected) experiments from task_store
+    # Query active (injecting/injected/unverified — 'unverified' stays
+    # recoverable fail-closed, see task_store_backend.select_active_tasks)
+    # experiments from task_store
     try:
         store = await get_task_store()
         # Multi-tenant isolation: only query the current tenant's active experiments
         _tenant_id = state.get("tenant_id", "") or ""
-        active_tasks = await store.query_active(tenant_id=_tenant_id)
+        # Workspace axis rides along: the RECOVERER's workspace scopes the
+        # discovery set (李四 in another workspace must not see 526255's
+        # tasks). state carries it via interaction/adapter entries on
+        # platform mode; empty locally = unfiltered.
+        _workspace_id = state.get("workspace_id", "") or ""
+        active_tasks = await store.query_active(tenant_id=_tenant_id, workspace_id=_workspace_id)
 
         if not active_tasks:
             msg = "There are no active fault-injection experiments, so there is nothing to recover."

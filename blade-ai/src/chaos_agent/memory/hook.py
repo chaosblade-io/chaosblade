@@ -434,6 +434,60 @@ class PreReasoningHook:
             return {}
         return {"metric_observations": current + new_obs}
 
+    def _build_retired_update(self, state: dict, messages: list) -> dict:
+        """Durable death absorption, BEFORE compaction can destroy the proof.
+
+        An LLM-issued destroy's death evidence lives ONLY in messages (the
+        tool call + its paired ToolMessage). The execute loop's
+        registration seam (B76 review I1) covers the execute graph, but the
+        recover graph's own LLM loops issue destroys too — in-cluster exec
+        delivery routes through the LLM-driven Layer 1 by design — and no
+        seam there writes the ledger. At the FIRST compaction boundary the
+        evidence is summarised away while ``retired_experiment_uids`` stays
+        empty, so every later consumer (survival context, the resumed
+        checkpoint) asserts the dead experiment ACTIVE forever (B76 review
+        K1). This hook is the one topological choke point every LLM loop
+        passes through before compaction, so absorbing here registers the
+        death one step BEFORE the only machinery that can destroy its
+        evidence. The same call also closes the execute graph's one-
+        iteration lag (K2): the seam merges on node RETURN, but compaction
+        runs at node ENTRY — a destroy output landing mid-iteration used to
+        face a compaction whose doomed slice held only the create receipt
+        while the death sat in the kept tail where no filter looks.
+
+        Full-view semantics: ``retired_experiment_uids`` has no reducer
+        (last-write-wins), so the write must be the merged view — exactly
+        the execute seam's convention. Idempotent: returns ``{}`` when the
+        ledger already knows every proven death, so steady-state turns
+        write no state. Fail-open on the death axis only: an exception
+        leaves the message evidence in place and every consumer already
+        subtracts proven deaths from the live set, whereas a false retire
+        hides a LIVE experiment from every future recovery.
+        """
+        try:
+            # Lazy import (mirrors live_liability_uids): the providers
+            # package is graph-adjacent and this module is imported during
+            # graph construction.
+            from chaos_agent.agent.providers import FaultProviderRegistry
+
+            proven_dead = FaultProviderRegistry.destroyed_proven_experiment_ids(
+                messages
+            )
+        except Exception as e:
+            logger.debug(f"Death absorption scan failed: {e}")
+            return {}
+        if not proven_dead:
+            return {}
+        retired = list(state.get("retired_experiment_uids") or [])
+        unrecorded = sorted(uid for uid in proven_dead if uid not in retired)
+        if not unrecorded:
+            return {}
+        logger.info(
+            "Death absorption (pre-compaction): %s proven destroyed",
+            ", ".join(unrecorded),
+        )
+        return {"retired_experiment_uids": retired + unrecorded}
+
     def _emit_context_size_snapshot(
         self,
         task_id: str,
@@ -520,6 +574,34 @@ class PreReasoningHook:
             pass  # best-effort — never let the indicator break the hook
 
     async def __call__(self, state: dict, *, force: bool = False) -> dict:
+        """LangGraph entry: run the memory pipeline, and NEVER raise.
+
+        Nine bare ``await hook(state)`` call sites (execute/verify/
+        recover loops, planning, intent clarification, the server's
+        manual /compact route) mean any exception escaping this hook
+        aborts the graph — the whole session. Issue #1347 proved the
+        shape with a compactor bug; the round-35 topology audit found
+        three more unguarded steps (context check, metric extraction,
+        observation update). Class-level containment: the pipeline
+        body is ``_manage``; ANY exception there is contained here —
+        loud warning, memory management skipped for this turn, the
+        original messages ride on untouched. Worst case: one
+        un-compacted turn, never a dead session. ``_manage`` still
+        raises under direct invocation, so unit tests surface bugs.
+        """
+        try:
+            return await self._manage(state, force=force)
+        except Exception:
+            task_id = state.get("task_id", "") if isinstance(state, dict) else ""
+            logger.warning(
+                "Pre-reasoning memory pipeline failed for task %s; "
+                "skipping memory management this turn (messages untouched)",
+                task_id,
+                exc_info=True,
+            )
+            return {}
+
+    async def _manage(self, state: dict, *, force: bool = False) -> dict:
         """Execute memory management before LLM reasoning.
 
         Returns LangGraph-compatible state updates:
@@ -569,8 +651,30 @@ class PreReasoningHook:
         # compaction branch's append.
         obs_update = self._build_observation_update(messages, state)
 
-        # 1. Tool output truncation (modifies messages in-place)
-        messages = self.tool_compactor.compact(messages, task_id=task_id)
+        # Death absorption (B76 review K1/K2): same one-shot-then-spread
+        # pattern as obs_update — every return branch below must carry it,
+        # because every branch is a state write that compaction-free turns
+        # (and the recover graph's Layer-2 timeout/error exits) must not
+        # silently drop. Runs BEFORE tool-output truncation so the scan
+        # reads the raw destroy receipts, not their truncated heads.
+        retired_update = self._build_retired_update(state, messages)
+
+        # 1. Tool output truncation (modifies messages in-place).
+        # Compaction is a best-effort OPTIMISATION: if it raises, keep
+        # the original messages and continue — the worst case is losing
+        # token savings this turn, never killing the reasoning step
+        # (issue #1347: an unguarded compactor exception propagated
+        # through the graph node and aborted the whole session).
+        # context_manager below keeps its own breaker semantics; this
+        # guard deliberately wraps compaction only.
+        try:
+            messages = self.tool_compactor.compact(messages, task_id=task_id)
+        except Exception:
+            logger.warning(
+                f"Tool output compaction failed for task {task_id}; "
+                f"continuing with untruncated messages",
+                exc_info=True,
+            )
 
         # 2. Context check — pass per-task tracking so the circuit
         # breaker inside check_context can observe past failures.
@@ -627,8 +731,8 @@ class PreReasoningHook:
                 self.context_manager.compact_ratio,
             )
             if budget_warning is not None:
-                return {**obs_update, "messages": [budget_warning]}
-            return obs_update
+                return {**obs_update, **retired_update, "messages": [budget_warning]}
+            return {**obs_update, **retired_update}
 
         # --- Intermediate route: try aggressive tool output truncation first ---
         # If we can get below the compaction threshold by just truncating tool
@@ -676,7 +780,7 @@ class PreReasoningHook:
                 # dropped, and we'd hit the same threshold again next turn,
                 # paying the strip cost over and over with zero effect.
                 self._emit_context_size_snapshot(task_id, combined_tokens, len(combined))
-                return {**obs_update, "messages": stripped}
+                return {**obs_update, **retired_update, "messages": stripped}
 
         # Calculate total tokens before compression for observability.
         # Single-message observability — use raw .count (not safe_count)
@@ -722,6 +826,23 @@ class PreReasoningHook:
         # good day, lossy on a bad one. The auto path used to skip
         # ``state``; passing it here is the same fix the unification
         # applied to the manual /compact path.
+        #
+        # Boundary-turn freshness (round-24 R1): the death absorption
+        # above (retired_update) merges into THIS hook's return — the
+        # graph applies it only after the hook completes — so the local
+        # ``state`` dict still holds the PRE-absorption ledger here. The
+        # survival context this call builds is the one consumer that
+        # runs INSIDE that window, and on the boundary turn it faces
+        # exactly the K2 shape the absorption exists for (create in the
+        # doomed window, destroy pair in the kept tail, ledger still
+        # empty at entry): handing the stale view down resurrects the
+        # proven-dead uid as "Active experiment_uid" in the recovery
+        # message of the very turn the absorption was supposed to
+        # protect. Merge the absorption into the LOCAL view first — the
+        # hook's return semantics are unchanged (the graph merge stays
+        # the authority); this is only the view THIS call consumes.
+        if retired_update:
+            state = {**state, **retired_update}
         start_time = time.monotonic()
         try:
             previous_summary = state.get("compressed_summary", "")
@@ -847,7 +968,7 @@ class PreReasoningHook:
                 f"skipping this turn (failures: {tracking.consecutive_failures}/"
                 f"{MAX_CONSECUTIVE_COMPACT_FAILURES}): {e}"
             )
-            return obs_update
+            return {**obs_update, **retired_update}
 
         # 5. Build LangGraph-compatible state update:
         #    Remove compacted messages + add the new summary message.
@@ -887,6 +1008,7 @@ class PreReasoningHook:
 
         return {
             **obs_update,
+            **retired_update,
             **epoch_update,
             # The notice rides in the same update as the summary so the model
             # first sees them together — the data and how to treat it.

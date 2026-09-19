@@ -77,6 +77,7 @@ from chaos_agent.agent.spec.fault_registry import (
 # complete aggregate at import time. This import is what lets fault_registry
 # itself stay free of provider imports — assembly is triggered here, by the
 # spec layer that needs the vocabulary, not embedded in the registry.
+from chaos_agent.agent.spec.intent_anchor import extract_explicit_node_anchor
 import chaos_agent.agent.providers  # noqa: F401  (assembly side effect)
 from chaos_agent.utils.coerce import (
     coerce_to_dict,
@@ -147,6 +148,24 @@ INTENT_ACTION_DESCRIPTION: str = (
     f"Python application (in-process): "
     f"{'|'.join(carrier_actions('chaosblade_python'))}."
 )
+
+
+def _anchored_node_identity(input_text: str) -> tuple[str, tuple[str, ...]]:
+    """Identity pre-fill from the user's explicitly named node (B76).
+
+    The anchor is a property of the USER'S TEXT, not of any one transport:
+    every NL entry point that bypasses ``intent_clarification`` starts with
+    empty identity and otherwise races agent_loop's lazy derivation
+    (probe ORDER decides the contract — task inject-5552c6e4). One helper,
+    two consumers today (``from_cli_nl``, ``from_http_request`` NL branch);
+    a future NL entry point anchors by CALLING this, not by remembering
+    the fact. Returns ``(scope, names)`` — ``("", ())`` when the text
+    names no node, i.e. the caller's existing empty-identity default.
+    """
+    anchor = extract_explicit_node_anchor(input_text)
+    if not anchor:
+        return "", ()
+    return "node", anchor
 
 
 @dataclass(frozen=True, eq=True)
@@ -319,8 +338,16 @@ class FaultSpec:
     def from_cli_nl(cls, *, input_text: str, kwargs: Optional[dict] = None) -> "FaultSpec":
         """CLI with ``--input "..."``.
 
-        Identity fields (scope/target/action/namespace/names/labels)
-        are left empty for ``intent_clarification`` to fill later.
+        Identity fields default to the lazy-derivation path: this route never
+        visits ``intent_clarification`` (TUI-only), so ``agent_loop`` derives
+        identity write-once from the planner's probe commands (B76).
+        EXCEPTION — explicit node anchor: when the user's own text names a
+        node in prepositional form ("在节点 X 上" / "on node X"), that name
+        outranks every probe. We pre-fill ``scope=node`` + ``names`` so probe
+        ORDER can no longer lock a mismatched identity (task inject-5552c6e4:
+        a tool-health probe locked ``scope=pod`` and an observation-target
+        probe locked a Pod label under a node-scope task → 3× REJECT_DRIFT).
+        Narrow by design — see ``intent_anchor`` for why nothing else anchors.
         Tuning fields (``params`` / ``params_flags`` / ``duration``)
         ARE captured from kwargs when provided — CLI accepts
         ``--input "..." --duration 600 --params percent=80`` to seed
@@ -331,7 +358,10 @@ class FaultSpec:
         kwargs = kwargs or {}
         params = _normalise_params(kwargs.get("params"))
         _reject_timeout_param(params, "Use the --duration option instead.")
+        anchor_scope, anchor_names = _anchored_node_identity(input_text)
         return cls(
+            scope=anchor_scope,
+            names=anchor_names,
             params=params,
             params_flags=tuple(kwargs.get("params_flags") or ()),
             duration_seconds=coerce_to_int(kwargs.get("duration"), default=0),
@@ -371,7 +401,18 @@ class FaultSpec:
         _reject_timeout_param(
             params, 'Use the top-level "duration" field instead.',
         )
-        return _with_default_duration(cls(
+        # NL requests anchor identity from the user's own text exactly like
+        # ``from_cli_nl`` (B76 review P2-1): the anchor is a property of the
+        # TEXT, not of the CLI transport, and this route feeds the same
+        # agent_loop lazy-derivation path (route_pipeline_start). Guarded by
+        # "identity fields empty" so a half-structured request that happens
+        # to fail the 5-field structured test keeps its explicit fields —
+        # the anchor fills gaps, it never overrides a stated choice.
+        if not is_structured and not scope and not names:
+            scope, names = _anchored_node_identity(
+                coerce_to_str(getattr(request, "input", ""), default=""),
+            )
+        spec = cls(
             namespace=coerce_to_str(getattr(request, "namespace", ""), default=""),
             scope=coerce_to_str(scope, default=""),
             names=names,
@@ -383,7 +424,12 @@ class FaultSpec:
             duration_seconds=coerce_to_int(getattr(request, "duration", 0), default=0),
             source=source,
             user_description=coerce_to_str(getattr(request, "input", ""), default=""),
-        ))
+        )
+        # Duration floor policy applies to STRUCTURED specs only. An NL spec
+        # carries duration 0 as the system-recommended channel — the intent
+        # node extracts the user-stated value; lifting 0 here would inject
+        # the configured default and contradict the description.
+        return _with_default_duration(spec) if is_structured else spec
 
     @classmethod
     def from_intent_args(
@@ -661,16 +707,17 @@ def strip_timeout_alias(raw: dict) -> dict:
 
 
 def _with_default_duration(spec: "FaultSpec") -> "FaultSpec":
-    """Apply the duration floor policy at contract construction.
+    """Apply the duration policy at contract construction.
 
     Every spec that can reach ``is_complete`` carries the duration that
-    will ACTUALLY execute: unset (0) gets the recommended default, and
-    explicit values below the fault type's recommended minimum are
-    lifted to it. Lifting here — instead of silently at execution —
-    keeps confirmation cards truthful: the operator approves the bound
-    that will really run. Explicit values above the floor pass through
-    untouched; execution-layer ``ensure_min_duration`` remains the floor
-    of last resort.
+    will ACTUALLY execute: unset (0) gets the recommended default.
+    Explicit values pass through verbatim — including values below the
+    fault type's recommended minimum, which arrive with a warning from
+    ``ensure_min_duration`` (the executor must not amend a contract-
+    stated duration in either direction). Keeping the spec equal to the
+    bound that will really run keeps confirmation cards truthful;
+    execution-layer ``ensure_min_duration`` remains the floor
+    of last resort for the unspecified case.
     """
     effective = ensure_min_duration(
         spec.duration_seconds, spec.scope, spec.fault_target, spec.fault_action,
@@ -807,10 +854,13 @@ def fault_spec_from_legacy_state(
             context="fault_spec.legacy.params_flags",
         )
     )
+    # Retired old-key fallback (l4-contract-faithfulness, fresh-database
+    # ruling): top-level ``duration`` is no longer read — modern states
+    # carry ``duration_seconds``.
     duration_seconds = coerce_to_int(
-        state.get("duration_seconds") or state.get("duration"),
+        state.get("duration_seconds"),
         default=0,
-        context="fault_spec.legacy.duration",
+        context="fault_spec.legacy.duration_seconds",
     )
 
     if not any((target, scope, fault_target, fault_action, params, params_flags, duration_seconds)):

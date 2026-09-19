@@ -23,11 +23,50 @@ _ERROR_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"verif.*fail|assert.*fail|layer.?2", re.I), "ASSERT_FAILED"),
 ]
 
+# Matches an LLM provider rejection on BOTH the class name and the message
+# prefix. Both are needed: l4/execution.py's ``except`` path still holds the
+# real ``LLMProviderRejectError``, while ``_extract_error`` rebuilds a plain
+# ``RuntimeError`` from a state string, where only the message survives.
+_LLM_PROVIDER_REJECT = re.compile(
+    r"LLMProviderRejectError|LLM provider rejection", re.I
+)
+
 
 def map_to_agent_error(exc: Exception, context: dict | None = None) -> L4AgentError:
     """Map a blade-ai exception to a structured L4AgentError."""
     msg = str(exc)
     exc_type = type(exc).__name__
+
+    # Type-first guard, ahead of the pattern table. When no hint signature
+    # matches, the rejection's message echoes up to 300 chars of the raw
+    # provider body, and that body routinely contains phrases the table
+    # below reads as a DRILL fault:
+    #
+    #   "The model `qwen-x` does not exist" (404) → `does\s*not\s*exist`
+    #       → TARGET_UNREACHABLE, sending the operator to inspect the
+    #         cluster when the real cause is the llm_model setting;
+    #   "... request timed out" in a 400/422 body  → `timed?\s*out`
+    #       → AGENT_TIMEOUT with recoverable=True, which makes the platform
+    #         heal-rerun the WHOLE task — re-injecting the fault — for an
+    #         error the LLM layer just declared deterministic.
+    #
+    # (Genuine 408/409 never reach here: they sit in
+    # ``_RETRIABLE_4XX_STATUSES`` and stay unwrapped, so they keep the
+    # AGENT_TIMEOUT reading that is correct for them.)
+    #
+    # ``code`` stays UNKNOWN because the 6-value enum is a closed contract
+    # with ai-testing-platform (see L4AgentError.code); inventing a 7th code
+    # the platform cannot parse would be worse than an honest UNKNOWN. The
+    # distinguishing signal rides in ``details`` instead, and recoverable is
+    # forced False so no consumer retries a deterministic rejection.
+    if _LLM_PROVIDER_REJECT.search(msg) or _LLM_PROVIDER_REJECT.search(exc_type):
+        return L4AgentError(
+            code="UNKNOWN",
+            message=msg[:500],
+            recoverable=False,
+            details={**(context or {}), "error_kind": "llm_provider_reject"},
+        )
+
     code = "UNKNOWN"
     for pattern, error_code in _ERROR_PATTERNS:
         if pattern.search(msg) or pattern.search(exc_type):

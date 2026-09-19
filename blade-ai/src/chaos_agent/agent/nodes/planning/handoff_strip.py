@@ -5,8 +5,10 @@ Positioned on the single edge every plan-to-execution transition shares
 node removes the CURRENT planning round's process messages (AI turns,
 tool results, in-loop corrective feedback) from the messages channel once
 the plan is finalized. The handoff essentials survive: the context
-anchors (FAULT INTENT, pre-task probe hints) plus the ``Planning
-finalized`` summary and every message after it. extract_planning_metadata
+anchors (FAULT INTENT, pre-task probe hints), the finalization turn
+itself (the finish_planning caller AIMessage + ``Planning finalized``
+ToolMessage, kept as a caller/result pair so downstream pairing gates
+never see an orphan), and every message after it. extract_planning_metadata
 runs BEFORE this node on purpose — it reverse-scans AIMessage tool_calls
 (read_skill_resource / finish_planning args) that the strip would remove.
 
@@ -50,7 +52,7 @@ from __future__ import annotations
 
 import logging
 
-from langchain_core.messages import RemoveMessage, ToolMessage
+from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 
 from chaos_agent.agent.node_names import PLANNING_HANDOFF
 from chaos_agent.agent.state import AgentState
@@ -102,6 +104,19 @@ def _epoch_start(state: AgentState) -> int:
         return 0
 
 
+def _tool_call_ids(msg) -> set:
+    """All tool_call ids a message issues (AIMessage) or answers (ToolMessage)."""
+    if isinstance(msg, ToolMessage):
+        tc_id = getattr(msg, "tool_call_id", None)
+        return {tc_id} if tc_id else set()
+    ids: set = set()
+    for tc in getattr(msg, "tool_calls", None) or []:
+        tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+        if tc_id:
+            ids.add(tc_id)
+    return ids
+
+
 def select_strip_targets(
     messages: list, epoch_index: int, finalized_idx: int
 ) -> list:
@@ -114,15 +129,58 @@ def select_strip_targets(
     keeping context, never toward over-stripping. Messages without an id
     cannot receive a RemoveMessage (same guard as the compaction path in
     memory/hook.py) and are left in place.
+
+    The finalized ToolMessage sits OUTSIDE the range (right bound is
+    exclusive) and is retained on purpose — ``_phase2_kickoff_needed``
+    locates it positionally. Its caller AIMessage (the finish_planning
+    turn) is exempted from the strip as well (B44): stripping the caller
+    left the retained ToolMessage orphaned, so ``sanitize_tool_pairing``
+    dropped it before EVERY downstream LLM call — the "hand the summary
+    to execution" intent never actually reached a model, and each
+    inject/recover iteration logged a misleading orphan warning (case-32:
+    the same orphan was dropped 6 times across two graphs). Sibling
+    ToolMessages answering the SAME caller batch's other tool_calls are
+    exempted too — a parallel ``finish_planning + probe`` turn would
+    otherwise trade one orphan for another.
     """
     if finalized_idx is None or finalized_idx <= 0:
         return []
     if epoch_index >= finalized_idx:
         return []
+
+    # Out-of-range finalized_idx (reconstructed/synthetic lists) has no
+    # finalization message to read — same fail-safe as above: behave
+    # exactly like the pre-B44 selection, strip by anchor whitelist only.
+    finalized_msg = (
+        messages[finalized_idx] if finalized_idx < len(messages) else None
+    )
+    finalized_call_id = (
+        getattr(finalized_msg, "tool_call_id", None) or ""
+        if finalized_msg is not None
+        else ""
+    )
+    protected_call_ids: set = set()
+    if finalized_call_id:
+        for m in messages[epoch_index:finalized_idx]:
+            if (
+                not isinstance(m, AIMessage)
+                or finalized_call_id not in _tool_call_ids(m)
+            ):
+                continue
+            # Found the caller batch: protect ALL its tool_call ids so
+            # the whole finalization turn stays paired.
+            protected_call_ids = _tool_call_ids(m)
+            break
+
     return [
         m
         for m in messages[epoch_index:finalized_idx]
-        if getattr(m, "id", None) and not _is_context_anchor(m)
+        if getattr(m, "id", None)
+        and not _is_context_anchor(m)
+        and not (
+            protected_call_ids
+            and _tool_call_ids(m) & protected_call_ids
+        )
     ]
 
 

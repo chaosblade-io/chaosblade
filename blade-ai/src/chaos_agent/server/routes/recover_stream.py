@@ -1,5 +1,6 @@
 """POST /api/v1/recover-stream - SSE streaming recover endpoint."""
 
+import anyio
 import asyncio
 import json
 import logging
@@ -19,6 +20,12 @@ from chaos_agent.server.routes import recover_router
 from chaos_agent.server.routes.recover_common import (
     RecoverSetupError,
     build_recover_initial_state,
+)
+from chaos_agent.server.routes.stream_abort import (
+    ABORT_SQLITE_CEILING_S,
+    ClientDisconnected,
+    abort_row_word,
+    write_aborted_task_row,
 )
 from chaos_agent.server.routes.turn_result import build_recover_result_payload
 from chaos_agent.server.schemas import RecoverRequest
@@ -93,6 +100,12 @@ async def recover_stream(request: RecoverRequest, req: Request):
         # One record per recovery: a failure after the outcome record landed must
         # not append a contradicting interruption note on top of it.
         record_written = False
+        # The abort-cause memo (round-57 F1'): the finally fallback's
+        # session finalize runs for EVERY abort cause (the cleanup above
+        # never finalizes the session), and its word must be classified —
+        # the turn twin's own G5 lesson: a hard-coded word on a
+        # every-cause path mis-words every cause it was not written for.
+        abort_cause = ""
         started_monotonic = time.monotonic()
 
         async def _write_recover_interrupted(cause: str, error_detail: str = "") -> None:
@@ -142,10 +155,77 @@ async def recover_stream(request: RecoverRequest, req: Request):
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.debug(
+                # Warning, not debug (round-52, same family as the turn
+                # stream's record fix): this record is the ONLY memory
+                # that the fault may still be live — recovery was
+                # interrupted before it finished — and at debug level
+                # its loss was invisible in production.
+                logger.warning(
                     "Failed to write recover interruption record for %s (cause=%s)",
                     record_task_id, cause, exc_info=True,
                 )
+
+        async def _abort_recover_cleanup(cause: str, error_detail: str = "") -> None:
+            """Single-source abort cleanup for this recovery stream (round-52).
+
+            Also assigns the abort-cause memo (round-57): every handler
+            routes through here, so this is the one place the finally
+            fallback can learn the cause from.
+
+            The recover twin of ``turn_event_stream._abort_turn_cleanup``.
+            Starlette serves this generator inside an anyio task group: a
+            client disconnect cancels the task-group SCOPE — level-based
+            cancellation that re-delivers CancelledError at every await
+            suspension — so an unshielded cleanup await dies at its first
+            suspension. This stream's own handlers carried exactly that
+            defect family (round-48 found it on the turn twin; this module
+            was never swept): the user-cancel handler used an
+            ``asyncio.shield`` OUTER await — the form round-48 proved
+            ineffective, the shield only keeps its background job alive —
+            and the internal-error handler used a bare await.
+
+            Decision table:
+              shield — always: the whole body. Ceiling since round-54
+                       (G7/F5): the old no-ceiling ruling was
+                       checkpointer-shaped (AsyncSqliteSaver, verified r53)
+                       and this chain carries aget_state — a checkpointer
+                       READ — so a future remote checkpointer re-opens the
+                       r49 hang surface; the SQLite-class bound is generous
+                       (30s ≫ any local write) and a hit is bounded
+                       abandon.
+              record — every cause: an interrupted recovery's "fault may
+                       still be live" memory (``record_written`` guards the
+                       double write on the completed-then-crashed path).
+              row    — every cause (round-54 G4): the recover task row's
+                       terminal write via the shared guarded helper and
+                       the shared taxonomy (abort_row_word — interrupt
+                       causes "cancelled", internal_error "failed").
+                       Round-56 found this arm carrying its own inline
+                       cause→word conditional with the OPPOSITE
+                       unknown-cause polarity (unknown → "cancelled",
+                       fail-open — an unknown cause understated as a
+                       user cancel; the shared taxonomy is fail-closed).
+                       The r53 triad's cancel-exit-only wiring left
+                       this module's rows zombie at the last mid-graph
+                       upsert. Ordered AFTER the record (the record is
+                       the live-fault memory; the row is the derived
+                       user-facing fact).
+            """
+            with anyio.CancelScope(shield=True):
+                nonlocal abort_cause
+                abort_cause = cause
+                try:
+                    with anyio.fail_after(ABORT_SQLITE_CEILING_S):
+                        await _write_recover_interrupted(cause, error_detail)
+                        await write_aborted_task_row(
+                            record_task_id, abort_row_word(cause),
+                        )
+                except TimeoutError:
+                    logger.warning(
+                        "Recover stream %s abort cleanup exceeded %.0fs "
+                        "ceiling; remaining abort writes abandoned",
+                        record_task_id, ABORT_SQLITE_CEILING_S,
+                    )
 
         try:
             # 1. Build initial state from inject checkpoint
@@ -200,7 +280,16 @@ async def recover_stream(request: RecoverRequest, req: Request):
             ):
                 if await req.is_disconnected():
                     logger.info(f"Client disconnected, aborting recover stream {record_task_id}")
-                    break
+                    # Round-54 G2: the poll is an ABORT EXIT, not a silent
+                    # break. Before, it fell through to result extraction —
+                    # a half-run recovery could write a COMPLETED-LOOKING
+                    # summary record (record_written=True) on the stream
+                    # whose interrupted record is the ONLY "fault may still
+                    # be live" memory. The ClientDisconnected handler gives
+                    # the poll-loser path the cancel exit's semantics; which
+                    # one a disconnect gets must not be decided by the
+                    # poll-vs-cancel race (r48: the cancel usually wins).
+                    raise ClientDisconnected()
                 stream_evt = parse_stream_event(raw_event)
                 if stream_evt is not None:
                     stream_evt.task_id = record_task_id
@@ -314,15 +403,31 @@ async def recover_stream(request: RecoverRequest, req: Request):
             # ``CancelledError`` derives from BaseException, so the handler below
             # never saw it and a cancelled recovery left no record at all — the
             # worst case, since the fault is live by definition until recovery
-            # completes. Shielded as this runs under cancellation.
+            # completes. Routed through the single-source shielded cleanup since
+            # round-52 (the old asyncio.shield outer await here was the exact
+            # form round-48 proved ineffective on the turn twin).
             logger.info(f"Recover stream cancelled for task {inject_task_id}")
-            await asyncio.shield(_write_recover_interrupted("user_cancel"))
+            await _abort_recover_cleanup("user_cancel")
             raise
+        except ClientDisconnected:
+            # Round-54 G2: the poll-detected disconnect — the exit the
+            # poll-vs-cancel RACE decides (r48: the scope cancel usually
+            # wins a real disconnect, but the poll wins server-side cancels
+            # and fast/proxied disconnects). Same abort semantics as the
+            # cancel exit above: the interrupted record (cause
+            # "disconnected") and the recover row's terminal word, all
+            # through the single-source shielded cleanup.
+            logger.info(f"Recover stream disconnected for task {inject_task_id}")
+            await _abort_recover_cleanup("disconnected")
+            return
         except Exception as e:
             logger.exception(f"Recover stream failed for task {inject_task_id}")
             # Before the terminating events: the consumer stops iterating at
             # ``done`` and anything after the final yield would never run.
-            await _write_recover_interrupted(
+            # Single-source shielded cleanup since round-52 — a cancellation
+            # landing mid-record (error plus disconnect) must not lose the
+            # record: the fault is live by definition.
+            await _abort_recover_cleanup(
                 "internal_error", f"{type(e).__name__}: {e}",
             )
             yield StreamEvent(
@@ -334,17 +439,44 @@ async def recover_stream(request: RecoverRequest, req: Request):
         finally:
             _tsm.end_task_span(record_task_id)
             if session_store and session_store.has_active(record_task_id):
-                await finalize_recover_session(
-                    session_store,
-                    recover_graph,
-                    recover_config,
-                    record_task_id,
-                    inject_task_id,
-                    state_values,
-                    result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
-                    default_status="failed",
-                    error_log_level="debug",
-                )
+                # Shielded for the same reason as the turn stream's terminal
+                # finalize (round-48 site 4): under a real client disconnect
+                # the task-group scope cancellation is level-based and a bare
+                # await here dies at its first suspension — leaving the recover
+                # session row stuck active forever (this finalize is the ONLY
+                # writer of the terminal status on the abort path). Ceiling
+                # since round-54 (G7): same checkpointer-shaped ruling as the
+                # abort chain above — aget_state rides this shield too.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        with anyio.fail_after(ABORT_SQLITE_CEILING_S):
+                            await finalize_recover_session(
+                                session_store,
+                                recover_graph,
+                                recover_config,
+                                record_task_id,
+                                inject_task_id,
+                                state_values,
+                                result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+                                # Round-57 F1': the abort path's ONLY session
+                                # writer is this fallback, and no result payload
+                                # exists on it — so default_status IS the session
+                                # word. Classified, not hard-coded: a
+                                # user-cancelled recovery records "cancelled",
+                                # same word its TaskStore row already carries
+                                # (the memo is empty only when the run never
+                                # reached an abort handler — fail-closed).
+                                default_status=abort_row_word(
+                                    abort_cause or "internal_error",
+                                ),
+                                error_log_level="debug",
+                            )
+                    except TimeoutError:
+                        logger.warning(
+                            "Recover stream %s terminal finalize exceeded "
+                            "%.0fs ceiling; remaining terminal writes abandoned",
+                            record_task_id, ABORT_SQLITE_CEILING_S,
+                        )
             task_tracker.unregister(record_task_id)
 
     return StreamingResponse(

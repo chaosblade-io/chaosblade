@@ -70,6 +70,10 @@ class CarrierRejectReason(str, Enum):
     FAMILY_MISMATCH = "family_mismatch"
     #: The mutation has no paired reversal, so the recover graph cannot undo it.
     NO_BOUNDED_RECOVERY = "no_bounded_recovery"
+    #: The command carries no mutation verb, so it reads as read-only
+    #: inspection — but its compound form could not be statically proven
+    #: read-only (B34: a ``iptables -S | grep`` probe told to add ``-D``).
+    READONLY_FORM_UNPROVEN = "readonly_form_unproven"
     #: A live re-read succeeded and disagreed: the carrier is not the registered pod.
     CARRIER_STALE = "carrier_stale"
     #: The liveness re-read could not be completed, so identity stays unconfirmed.
@@ -95,7 +99,8 @@ _SUGGEST_APPROVED_NODE = (
 )
 _SUGGEST_FAMILY = (
     "Express the fault with a binary of the APPROVED fault family "
-    "(network → iptables/tc/nft, or a timeout-bounded nc -l listener for a "
+    "(network → iptables/tc/nft, or a timeout-bounded nc -l / socat "
+    "TCP-LISTEN listener for a "
     "port-occupation fault; disk → dd/fallocate/fio; cpu|mem → stress-ng; "
     "process → kill, a one-shot crictl stop for a discrete restart, a "
     "timer-armed bounded crictl-stop loop for a sustained terminate-style "
@@ -108,6 +113,85 @@ _SUGGEST_FAMILY = (
     "with its own reversal behind a time bound in the same call. Doing both at "
     "once avoids a second rejection."
 )
+# The banned-verb face of the FAMILY_MISMATCH gate (see the empty-family
+# branch in ``_resolve_carrier_from_artifact``): task inject-055c86cc had
+# the model re-issue a process-family crictl-stop loop three times in a row
+# because its terminator used ``systemctl stop`` while the rejection kept
+# saying "does not map to any fault family" — the family verb was right
+# there in the command, so the model had nothing actionable. The fix must
+# name what to do with the banned verb; the family shapes the model already
+# used are re-taught by ``_SUGGEST_FAMILY``, appended at the call site.
+#
+# The MECHANISM is generic (any banned verb gets named; the guidance is
+# assembled per hit verb); the GUIDANCE ENTRIES are per-verb substitutes
+# written only where a verified incident established the correct rewrite.
+# A rejection must carry ONLY the replacements matching the verbs actually
+# hit — showing the truncate recipe to a ``curl`` misuse would misdirect the
+# model exactly the way the old nameless rejection did. Verbs without an
+# entry fall back to the generic rewrite principle below.
+_SUGGEST_BANNED_VERB_HEAD = (
+    "Remove the banned verb from the command and re-express that one step "
+    "with the fault family's own binaries"
+)
+# An entry is either a plain string (family-neutral) or a dict mapping a
+# family name to its variant plus ``"*"`` as the fallback for every other
+# family — the family is part of the FIX, not just the diagnosis: a rewrite
+# that is canonical for one family can be a fresh rejection in another.
+# Evidence: the 2026-08-26 network-isolation drill — under a 'network'
+# approval the model followed the unconditional systemctl→pkill advice, and
+# the pkill (a process-family verb) voided the network family match, turning
+# one rejection into a loop.
+_BANNED_VERB_GUIDANCE = {
+    # inject-055c86cc: the model tore down its own systemd-run transient
+    # unit with ``systemctl stop``; for a PROCESS fault the family-canonical
+    # teardown is pkill. Under any other approval pkill is a foreign family
+    # verb that voids the match the same way systemctl did — there the
+    # canonical shape is in-chain self-recovery, which leaves no transient
+    # unit to manage at all.
+    "systemctl": {
+        "process": (
+            "a transient unit armed via systemd-run is stopped by pkill-ing "
+            "its payload process (the unit dies with its processes and the "
+            "timer still fires), never by systemctl"
+        ),
+        "*": (
+            "do NOT substitute pkill for systemctl here — pkill is a "
+            "process-family verb and voids the match against the approved "
+            "'{family}' fault the same way. Keep self-recovery in-chain "
+            "instead: pair the mutation with its own inverse behind a sleep "
+            "in the same call (<mutation> && sleep <N> && <inverse>), so no "
+            "transient unit is left to manage"
+        ),
+    },
+    "rm": (
+        "a filled file is reclaimed by the fault family's own reversal "
+        "(truncate -s 0 / fallocate -d), never by rm"
+    ),
+}
+
+
+def _banned_verb_suggestion(
+    banned_verbs: tuple[str, ...], approved_family: str = ""
+) -> str:
+    """Assemble the banned-verb suggestion for exactly the verbs hit.
+
+    ``approved_family`` picks the family-scoped variant of an entry: the
+    substitute a fault family considers canonical differs by family, and
+    advising a foreign family's verb manufactures the next rejection.
+    """
+    hints = []
+    for verb in banned_verbs:
+        entry = _BANNED_VERB_GUIDANCE.get(verb)
+        if entry is None:
+            continue
+        if isinstance(entry, dict):
+            entry = entry.get(approved_family) or entry["*"]
+        hints.append(entry.format(family=approved_family or "<empty>"))
+    if not hints:
+        return _SUGGEST_BANNED_VERB_HEAD + "."
+    return _SUGGEST_BANNED_VERB_HEAD + ": " + "; ".join(hints) + "."
+
+
 _SUGGEST_ACTIVE_CARRIER = (
     "Wait for the armed rollback to elapse, or create a fresh debug pod on "
     "the approved node and exec the next mutation through that one."
@@ -269,9 +353,10 @@ class CarrierResolution:
 #:   this set existed every rejection fell through to discovery, so both
 #:   bypasses were reachable.
 #: * NOT_A_HOST_EXEC / NO_APPROVAL / NOT_PRIVILEGED / NO_NODE_BINDING /
-#:   NO_BOUNDED_RECOVERY cannot be overturned by a read: the first two are about
-#:   the request, the last about the command, and the middle two read pod-spec
-#:   facts captured live at creation time and immutable thereafter.
+#:   NO_BOUNDED_RECOVERY / READONLY_FORM_UNPROVEN cannot be overturned by a
+#:   read: the first two are about the request, the last two about the
+#:   command, and the middle two read pod-spec facts captured live at
+#:   creation time and immutable thereafter.
 #:
 #: POD_NOT_DISCOVERABLE / NODE_NOT_APPROVED / CARRIER_STALE /
 #: VERIFICATION_FAILED are deliberately absent: they are produced BY discovery
@@ -289,10 +374,10 @@ _FAMILY_ALIASES = {
 
 _HOST_ENTRY = ("chroot", "nsenter", "unshare")
 _SHELL_WRAPPERS = ("sh", "bash", "ash", "dash", "/bin/sh", "/bin/bash")
-_READONLY_HOST_PROBES = frozenset({
-    "which", "type", "command", "test", "[", "ls", "stat", "readlink",
-    "realpath", "file", "readelf", "uname", "id", "cat", "echo",
-})
+# Fault binaries shared with the k8s classifier's pod-scoped fault-binary
+# branch (providers/k8s_native/classifier.py imports this set). The probe
+# vocabulary that used to live beside it was single-sourced to the shared
+# judge ``tools.readonly._classify_argv`` at the B34 fix.
 _FAULT_BINARIES = frozenset({
     "iptables", "ip6tables", "nft", "tc", "stress", "stress-ng", "dd",
     "fallocate", "fio",
@@ -449,6 +534,27 @@ def _resolve_carrier_from_artifact(
     if readonly_probe:
         operation_family = approved_family
     elif not operation_family:
+        # An empty family has TWO causes with different fixes, and only the
+        # classifier knows which fired: a banned verb (word-level and
+        # fail-closed — even a command that ALSO carries the approved
+        # family's binary is voided by one) versus no family verb at all.
+        # Lumping both into "does not map to any fault family" is what made
+        # task inject-055c86cc a three-rejection loop: the model's command
+        # contained the family verb all along, and the message gave it
+        # nothing to act on. Name the banned verb when one is present.
+        banned_verbs = find_banned_host_verbs(host_command)
+        if banned_verbs:
+            verbs = ", ".join(f"'{verb}'" for verb in banned_verbs)
+            return CarrierResolution.reject(
+                CarrierRejectReason.FAMILY_MISMATCH,
+                f"the host command contains banned verb(s) {verbs} — a banned "
+                f"verb never maps to a fault family (this voids the match "
+                f"even though the family's own binary is present), so the "
+                f"command cannot be matched against the approved "
+                f"'{approved_family or '<empty>'}' fault: {host_command}",
+                _banned_verb_suggestion(banned_verbs, approved_family)
+                + " " + _SUGGEST_FAMILY,
+            )
         return CarrierResolution.reject(
             CarrierRejectReason.FAMILY_MISMATCH,
             f"the host command does not map to any fault family, so it cannot "
@@ -487,6 +593,26 @@ def _resolve_carrier_from_artifact(
         # module docstring). The seam stays opt-in for the day one exists.
         recoverability = assess_recoverability(host_command, operation_family)
         if not recoverability.recoverable:
+            if recoverability.readonly_unproven:
+                # B34: zero mutation verbs means "add a paired inverse" is
+                # nonsense guidance — there is nothing to invert. Name the
+                # real cause (the compound form is not provably read-only)
+                # and give the two honest directions. Still fail-closed.
+                return CarrierResolution.reject(
+                    CarrierRejectReason.READONLY_FORM_UNPROVEN,
+                    "the compound host command carries no detectable "
+                    "mutation verb, so it reads as read-only inspection — "
+                    "but a compound form (chained / piped / redirected / "
+                    "expanded) cannot be statically proven read-only on "
+                    f"this gate: {host_command}",
+                    "Split read-only inspection into single-statement probes "
+                    "— one command per exec (e.g. `chroot /host iptables -S "
+                    "INPUT`); the exec channel returns stdout, so no "
+                    "chaining or redirect is needed. If the command is "
+                    "actually a mutation, spell it with the standard verbs "
+                    "(-I/-A paired with a matching -D) so the reversal "
+                    "check can verify it.",
+                )
             _missing = "; ".join(recoverability.missing) or "a bounded, reversible form"
             return CarrierResolution.reject(
                 CarrierRejectReason.NO_BOUNDED_RECOVERY,
@@ -538,11 +664,13 @@ async def _probe_debug_pod_with_backoff(
     from chaos_agent.tools.kubectl import _debug_pod_metadata
 
     kubeconfig = str(state.get("kubeconfig") or "")
-    kube_context = str(state.get("kube_context") or "")
     last: tuple[dict, str] = ({}, "")
     for attempt in range(_PROBE_MAX_ATTEMPTS):
+        # Exactly the 3-arg signature (W-56-2/4): connection context rides on
+        # TransportTarget.from_state({}) → settings, synced upstream by
+        # sync_kubewiz_runtime — there is no 4th/5th parameter to pass.
         metadata, error = await _debug_pod_metadata(
-            pod_name, namespace, kubeconfig, kube_context, "",
+            pod_name, namespace, kubeconfig,
         )
         if metadata and not error:
             return metadata, ""
@@ -634,8 +762,13 @@ async def discover_unregistered_carrier(
             _SUGGEST_APPROVED_NODE,
         )
 
+    # P5: shape-parity with registry artifacts (this synthetic dict never
+    # enters ``execution_artifacts`` — it feeds the shared validation only —
+    # but recording ``kind`` keeps every debug_pod-shaped literal aligned
+    # with the kind-records contract).
     synthetic_artifact = {
         "type": "debug_pod",
+        "kind": "pod",
         "status": "active",
         "name": pod_name,
         "namespace": metadata.get("namespace") or namespace or "default",
@@ -664,7 +797,22 @@ def is_host_carrier_call(tool_name: str, tool_args: Any) -> bool:
         return any(token in raw for token in _HOST_ENTRY) or "/host/" in raw
     if "--" not in args:
         return False
-    inner = args[args.index("--") + 1:]
+    # R45: the slice must start at the TRUE separator (pflag is value-FIRST)
+    # — a ``--`` in a value slot is that flag's VALUE, and slicing there
+    # read the line's remaining tokens as if they were the inner command
+    # (``exec pod -c -- -- chroot /host bash`` missed the host entry while
+    # every client runs it).
+    from chaos_agent.tools._readonly_facts import exec_separator_index
+
+    separator = exec_separator_index(args)
+    if separator is None:
+        # Every ``--`` was swallowed as a value: no true separator, so the
+        # deprecated path would run the tokens after the ENTRY. Keep carrier
+        # treatment (fail closed) when a host-entry token appears at all —
+        # the same containment the unlexable-input branch above applies.
+        raw = str(tool_args.get("v_args") or "").lower()
+        return any(token in raw for token in _HOST_ENTRY) or "/host/" in raw
+    inner = args[separator + 1:]
     entry = _host_entry_tokens(inner)
     return bool(
         entry
@@ -690,12 +838,16 @@ async def registered_carrier_is_current(artifact: dict, state: dict) -> bool:
     """
     from chaos_agent.tools.kubectl import _debug_pod_metadata
 
+    # Exactly the 3-arg signature (W-56-2/4, #56 msg#179): the former 5-arg
+    # call raised TypeError on EVERY re-read, which the fail-closed liveness
+    # gate then rendered as "carrier unavailable" → REJECT_BANNED even while
+    # the carrier was healthy. Connection context rides on
+    # TransportTarget.from_state({}) → settings (sync_kubewiz_runtime), so
+    # there is nothing extra to pass.
     metadata, error = await _debug_pod_metadata(
         str(artifact.get("name") or ""),
         str(artifact.get("namespace") or ""),
         str(state.get("kubeconfig") or ""),
-        str(state.get("kube_context") or ""),
-        "",
     )
     if error or not metadata:
         return False
@@ -713,10 +865,14 @@ def is_readonly_host_probe(command: str) -> bool:
 
     Accepts a single probe, a ``sh -c '<payload>'`` / ``bash -c`` wrapped probe
     (one wrapper layer, unwrapped structurally), and probes chained with
-    ``;`` / ``&&`` / ``||`` — but ONLY when EVERY resulting segment is itself
-    an approved read-only probe. A pipe, redirect, command substitution,
-    variable expansion, backgrounding, backtick, or any non-probe segment
-    fails closed.
+    ``;`` / ``&&`` / ``||`` / ``|`` — but ONLY when EVERY resulting segment
+    (pipeline stage) is itself an approved read-only probe, judged by the
+    shared per-binary vocabulary (``tools.readonly._classify_argv`` — the
+    same judge the classifier fast path and the kubectl_read tool layer
+    use; single-sourced at the B34 fix, which admitted the pipe: a
+    pipeline whose every stage is read-only mutates nothing). A redirect,
+    command substitution, variable expansion, backgrounding, backtick, or
+    any non-probe segment fails closed.
 
     Judged on bashfacts STRUCTURE by ``_probe_facts`` (design 4.6 face 3);
     the legacy shlex+substring chain was deleted at the engine flip.
@@ -728,33 +884,30 @@ def is_readonly_host_probe(command: str) -> bool:
     return is_readonly_host_probe_facts(command)
 
 
-def _is_single_readonly_probe(tokens: list[str]) -> bool:
-    """Whether one already-tokenised command segment is an approved probe."""
-    if not tokens:
-        return False
-    binary = tokens[0].rsplit("/", 1)[-1]
-    args = tokens[1:]
-
-    if binary == "command":
-        return len(args) == 2 and args[0] in ("-v", "-V")
-    if binary in ("which", "type"):
-        return bool(args) and all(not arg.startswith("-") for arg in args)
-    if binary in ("test", "["):
-        return len(args) >= 2 and args[0] in ("-e", "-f", "-d", "-x", "-r", "-L")
-    if binary == "cat":
-        return args == ["/etc/os-release"]
-    if binary in _READONLY_HOST_PROBES:
-        return True
-    if binary in _FAULT_BINARIES:
-        return bool(args) and all(
-            arg in ("--help", "-h", "--version", "-V", "version")
-            for arg in args
-        )
-    return False
+# Word-level banned verbs on the host: mutating verbs whose blast radius
+# the family regexes cannot bound (rm/chmod/reboot/...), arbitrary-code
+# interpreters (python/perl/curl/wget), or systemctl — whose benign uses
+# (stopping a unit THIS TASK armed) are indistinguishable at word level
+# from stopping kubelet. Kept word-level and fail-closed on purpose;
+# ``find_banned_host_verbs`` exists so a rejection can NAME the verb
+# instead of leaving the model to guess among every word it used.
+_BANNED_HOST_VERBS = re.compile(
+    r"(^|[\s;&|/])(rm|mv|cp|chmod|chown|curl|wget|python[0-9.]*|perl|"
+    r"systemctl|reboot|shutdown|mount|umount|mkfs(?:\.[a-z0-9]+)?|tee)"
+    r"([\s;&|]|$)"
+)
 
 
-def classify_host_operation(command: str) -> str:
-    """Classify a host command into the approved fault family."""
+def _surfaced_text(command: str) -> str:
+    """The lowered text the family and banned-verb regexes judge on.
+
+    ``classify_host_operation`` and ``find_banned_host_verbs`` MUST judge
+    the same text: if one unwrapped a quoted systemd-run payload and the
+    other did not, the classifier could reject a command BECAUSE of a
+    banned verb while the reporter finds none to name — the unactionable
+    rejection this pair exists to prevent. Sharing is by construction,
+    not by hope.
+    """
     from chaos_agent.agent.target_guard._probe_facts import host_payload_tokens_facts
 
     payload = host_payload_tokens_facts(command) or []
@@ -775,12 +928,31 @@ def classify_host_operation(command: str) -> str:
         )
         if quoted:
             lowered = f"{lowered} {quoted.lower()}"
-    if re.search(
-        r"(^|[\s;&|/])(rm|mv|cp|chmod|chown|curl|wget|python[0-9.]*|perl|"
-        r"systemctl|reboot|shutdown|mount|umount|mkfs(?:\.[a-z0-9]+)?|tee)"
-        r"([\s;&|]|$)",
-        lowered,
-    ):
+    return lowered
+
+
+def find_banned_host_verbs(command: str) -> tuple[str, ...]:
+    """Banned verbs present in ``command``, in first-occurrence order.
+
+    A banned verb is why ``classify_host_operation`` returns ``""`` even
+    when the command ALSO carries the approved family's binary — task
+    inject-055c86cc burned three consecutive rejections (and with them the
+    whole drill) on a process-family crictl-stop loop whose terminator
+    used ``systemctl stop`` while the message kept saying "does not map to
+    any fault family". Naming the verb turns that guess-loop into one fix.
+    """
+    verbs: list[str] = []
+    for match in _BANNED_HOST_VERBS.finditer(_surfaced_text(command)):
+        verb = match.group(2)
+        if verb not in verbs:
+            verbs.append(verb)
+    return tuple(verbs)
+
+
+def classify_host_operation(command: str) -> str:
+    """Classify a host command into the approved fault family."""
+    lowered = _surfaced_text(command)
+    if _BANNED_HOST_VERBS.search(lowered):
         return ""
     families: set[str] = set()
     if re.search(r"(^|[\s/])(iptables|ip6tables|nft|tc)(\s|$)", lowered):
@@ -789,6 +961,30 @@ def classify_host_operation(command: str) -> str:
     # port-occupation fault (skill case Node_网络故障_节点端口占用). Client-mode
     # nc carries no ``-l`` and is not a fault: it does not match this shape.
     if re.search(r"\bnc\b[^;&|\n]{0,20}-l\b", lowered):
+        families.add("network")
+    # ``socat`` with a TCP-LISTEN address is the same fault in the
+    # socat vocabulary (same skill case: nc is absent on this cluster's
+    # hosts, so the case law settled on socat — the guard's enforcement
+    # face now matches it). ONLY the LISTEN address form is a fault, and
+    # only when the same socat segment carries no EXEC:/SYSTEM:/SHELL:
+    # address — those turn the listener into arbitrary command execution
+    # (``socat TCP-LISTEN:9100 EXEC:/bin/sh`` is the classic bind-shell),
+    # and the dangerous-address scan is bounded to the same ``; & |``-
+    # delimited segment so a legit ``kill X; socat TCP-LISTEN:...``
+    # compound is not voided by unrelated segments. The scan carries NO
+    # character cap of its own: the former {0,200} window was an
+    # implementation seam — 200+ chars of option padding pushed the
+    # dangerous address past the scan while the LISTEN form still
+    # matched, adopting a timeout-bounded bind-shell as the
+    # port-occupation family (found by the 2026-09-10 self-audit of the
+    # #32 extension). The segment bound — set by ``[^;&|\n]`` itself —
+    # is the whole boundary.
+    if re.search(r"\bsocat\b[^;&|\n]{0,60}\btcp[46]?-listen:", lowered) and not re.search(
+        # Both danger scans stay INSIDE the socat segment. SHELL may
+        # appear bare (socat address syntax makes the colon and its
+        # argument optional); EXEC:/SYSTEM: require their colon.
+        r"\bsocat\b[^;&|\n]*\b(?:(?:exec|system):|shell\b)", lowered,
+    ):
         families.add("network")
     if re.search(r"(^|[\s/])(dd|fallocate|fio)(\s|$)", lowered):
         families.add("disk")
@@ -843,7 +1039,18 @@ def _parse_host_exec(v_args: str) -> tuple[str, str, str] | None:
         return None
     if "--" not in args:
         return None
-    separator = args.index("--")
+    # R45: the same value-aware locator the shape check below rides — a
+    # ``--`` swallowed as a flag's VALUE is not the separator, and slicing
+    # there handed the walk the text of a flag value while the real
+    # host-entry payload sat further right.
+    from chaos_agent.tools._readonly_facts import (
+        exec_separator_index,
+        exec_separator_shape,
+    )
+
+    separator = exec_separator_index(args)
+    if separator is None:
+        return None
     outer = args[:separator]
     inner = args[separator + 1:]
     if not outer or not inner:
@@ -869,6 +1076,15 @@ def _parse_host_exec(v_args: str) -> tuple[str, str, str] | None:
         if not token.startswith("-") and not pod_name:
             pod_name = token
 
+    # R45: positionals beyond the entry are not free space — kubectl debug
+    # resolves every one as a SEPARATE target and old exec clients run them
+    # as the command head, so the host operation this gate is about to
+    # verify (registered pod / approved node) is not the one that runs.
+    # Refuse the shape before the artifact/privilege walk can bless it.
+    positionals, _after = exec_separator_shape(args)
+    if len(positionals) > 1:
+        return None
+
     entry = _host_entry_tokens(inner)
     if not pod_name or not entry or not (
         entry[0] in _HOST_ENTRY or entry[0].startswith("/host/")
@@ -889,6 +1105,7 @@ __all__ = [
     "classify_host_operation",
     "discover_unregistered_carrier",
     "effective_target_from_registered_carrier",
+    "find_banned_host_verbs",
     "host_operation_has_bounded_recovery",
     "is_readonly_host_probe",
     "is_host_carrier_call",

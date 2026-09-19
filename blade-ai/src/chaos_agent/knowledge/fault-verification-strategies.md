@@ -908,6 +908,8 @@ When the fault target is a Service, the matching Pods MUST be discovered through
 6. **Make good use of label selectors**: fetch the state of several Pods of the same application in bulk via `-l app=<app>` rather than querying one at a time.
 7. **Mind the time window**: Events and logs both age out, so focus on new events near the injection timestamp using `--since=5m` or sorting by `lastTimestamp`.
 8. **Distinguish the container's view from the host's**: `kubectl exec` shows the inside of the container; `kubectl top` and `kubectl get` show the host/cluster view.
+9. **Batch independent fetches into one round**: most evidence reads for a verification checklist do not depend on each other (status of a known-named object, lists under a label selector, the event stream of the namespace) — issuing them together in one round costs one reasoning pass instead of several, without dropping any evidence item. A read genuinely depends on another only when its argument comes from the other's output (e.g. `describe pod <name>` needs the Pod name a listing discovers).
+10. **Break name-dependencies with the event stream**: `describe <object>` requires knowing the object's name, which often comes from an earlier listing round. When the events of recently-changed objects are the evidence (scheduler messages, provisioning failures, scaling), the namespace event stream (`get events -n <ns> --sort-by=.lastTimestamp` or `--field-selector involvedObject.kind=...`) yields the same events without knowing any name, so it composes into the same batch as the status reads.
 
 ---
 

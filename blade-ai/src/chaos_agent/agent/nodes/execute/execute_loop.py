@@ -2,8 +2,16 @@
 
 import json
 import logging
+from typing import Any
+from uuid import uuid4
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from chaos_agent.agent.node_names import EXECUTE_LOOP
 from chaos_agent.agent.execution_artifacts import (
@@ -20,6 +28,14 @@ from chaos_agent.agent.nodes.execute._kubeconfig_inject import (
     inject_kubeconfig_into_tool_calls,
     inject_task_id_into_tool_calls,
     sync_kubewiz_runtime,
+)
+# Baseline-pair lifecycle (change stale-baseline-pair-seam-cleanup): the
+# replan seam must remove the synthetic pair by its stable ids — imported
+# from the construction source instead of copying literals, so an id rename
+# cannot silently disarm the cleanup. Verify's package __init__ is a pure
+# docstring (no transitive imports), keeping this cross-node import acyclic.
+from chaos_agent.agent.nodes.verify._verifier_messages import (
+    BASELINE_PAIR_MESSAGE_IDS,
 )
 from chaos_agent.agent.nodes.store._store_sync import sync_to_store
 from chaos_agent.agent.nodes.execute.llm_step_helpers import (
@@ -49,7 +65,13 @@ from chaos_agent.agent.replan import (
 )
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
 from chaos_agent.agent.spec.skill_identity import read_active_skill_name
-from chaos_agent.agent.state import AgentState, has_active_fault
+from chaos_agent.agent.target_guard.types import GuardVerdict
+from chaos_agent.agent.state import (
+    AgentState,
+    has_active_fault,
+    has_live_fault,
+    live_liability_uids,
+)
 from chaos_agent.agent.state_mgmt.state_helpers import fail_state
 from chaos_agent.agent.result.verdict import FailureCategory
 from chaos_agent.config.settings import settings
@@ -72,6 +94,50 @@ _PHASE2_KICKOFF_MARKER = "**PHASE 2 — EXECUTE NOW**"
 # The stall-guard nudge (_detect_terminal_conclusion) already announces the
 # phase transition; a kickoff after it would be a duplicate signal.
 _EXECUTION_REQUIRED_MARKER = "**EXECUTION REQUIRED**"
+
+
+# The ledger terminal-phase vocabulary and merge seam (C1): the module
+# needs them at import time (reset_attribution_state reads the frozen set
+# at call time, but importing names here keeps the single-source import
+# discipline — progress.py owns the vocabulary, this module only borrows).
+from chaos_agent.tools.progress import EXECUTION_COMPLETE_PHASES  # noqa: E402
+from chaos_agent.agent.progress_ledger import merge_progress_ledger  # noqa: E402
+
+
+def _ledger_declares_execution_complete(state) -> bool:
+    """Thin wrapper so the tail gates read one line, import-free.
+
+    Delegates to :func:`chaos_agent.tools.progress.ledger_declares_execution_complete`
+    (imported lazily — the tools package imports cleanly standalone, but a
+    module-level import here would drag the tool surface into every
+    consumer that only wants the router's routing helpers)."""
+    from chaos_agent.tools.progress import ledger_declares_execution_complete
+    return ledger_declares_execution_complete(state if isinstance(state, dict) else {})
+
+
+def _issue_call_is_registered_teardown(
+    tool_name: str, tool_args: Any, state: AgentState,
+) -> bool:
+    """True when a freshly-issued kubectl call is a registered-vehicle TEARDOWN.
+
+    Thin state-reading wrapper (P3) over the single-source call-level
+    predicate :func:`execution_artifacts.issue_call_is_registered_teardown`
+    — the teardown≠mutation judgement (classifier + vehicle registry)
+    lives there, exactly once; this wrapper only adapts the agent-side
+    ``state`` shape (``state["execution_artifacts"]``) the two remaining
+    call-granular consumers use: the channel-A issue-time skip (R6-1)
+    and the replan-attempt skip (R10-1). Teardown is not a fault
+    mutation, so neither may weigh it as evidence. Registry-matched
+    ONLY: a delete of an UNREGISTERED object (the delete-pod-to-restart
+    fault forms) is a real native mutation and stays attributed.
+    """
+    from chaos_agent.agent.execution_artifacts import (
+        issue_call_is_registered_teardown,
+    )
+
+    return issue_call_is_registered_teardown(
+        tool_name, tool_args, state.get("execution_artifacts") or [],
+    )
 
 
 def _extract_original_replicas_from_messages(messages: list, resource_name: str) -> int | None:
@@ -97,6 +163,76 @@ def _extract_original_replicas_from_messages(messages: list, resource_name: str)
                 if 0 < count <= 1000:
                     return count
     return None
+
+
+def _collect_guard_rejections(messages: list, limit: int = 5) -> list[dict]:
+    """Collect target_guard FORM-LEVEL rejection receipts as replan constraints.
+
+    A guard rejection (``[target_guard] <VERDICT> — …``) is NOT a failed
+    attempt the planner may re-weigh as evidence — it is a boundary the
+    guard will not relax (B76: a replan round re-wrote a plan whose
+    addressing form had already been rejected, burning a full planning
+    cycle before the terminal rejection). ``_build_replan_context`` funnels
+    these into ``guard_rejections`` so ``get_replan_section`` can present
+    them as hard constraints, distinct from the "evidence, not verdict"
+    failure chain.
+
+    FORM-LEVEL only — ``GuardVerdict.is_form_level_rejection`` is the
+    single source of truth (B76 review P1-1): REJECT_STAGNANT alternates
+    by design and its receipt tells the LLM to retry a reshaped call,
+    so freezing it as a never-relaxing boundary would contradict the
+    guard's own semantics; it stays in the failure chain's evidence
+    semantics via the ordinary failed-call scan. Unknown verdict strings
+    (pre-upgrade checkpoints, fabricated text) are likewise left to the
+    failure chain rather than guessed at.
+
+    Receipts are CONTRACT-RELATIVE: each was judged against the approved
+    target frozen at the time. A plan-change approval REPLACES that
+    contract, so receipts older than the newest ``[PLAN CHANGE APPROVED``
+    notice are constraints of a contract that no longer exists — the B76
+    canonical continuation even re-approves the very form an old receipt
+    rejected, and freezing that receipt would outlaw the new contract's
+    own target. Scanning newest-first, the first approval notice seen is
+    the boundary: everything older is stale and the scan stops there
+    (measured on the production chain: guard → renderer →
+    plan_change_confirm → this collector). REJECTED/RETRY notices replace
+    nothing, so they are not boundaries.
+
+    Newest-first like the failed-call scan; verdict parsed from the fixed
+    ``[target_guard] VERDICT — reason`` prefix the guard emits
+    (tool_screener._format_rejection_for_llm).
+    """
+    import re as _re
+
+    pattern = _re.compile(r"^\[target_guard\]\s+([A-Z_]+)\s+—\s*(.*)", _re.DOTALL)
+    rejections: list[dict] = []
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            if "[PLAN CHANGE APPROVED" in (
+                msg.content if isinstance(msg.content, str) else str(msg.content)
+            ):
+                break
+            continue
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        match = pattern.match(content)
+        if not match:
+            continue
+        try:
+            verdict = GuardVerdict[match.group(1)]
+        except KeyError:
+            continue
+        if not verdict.is_form_level_rejection:
+            continue
+        rejections.append({
+            "tool": getattr(msg, "name", "") or "",
+            "verdict": match.group(1),
+            "message": content[:500],
+        })
+        if len(rejections) >= limit:
+            break
+    return rejections
 
 
 def _build_replan_context(state: AgentState, request: ReplanRequest) -> dict:
@@ -175,6 +311,7 @@ def _build_replan_context(state: AgentState, request: ReplanRequest) -> dict:
         "iteration_at_failure": state.get("execute_loop_count", 0),
         "rejected_params": list(dict.fromkeys(all_rejected)),
         "failed_tool_names": sorted(failed_tool_names),
+        "guard_rejections": _collect_guard_rejections(messages),
     }
 
 
@@ -257,7 +394,7 @@ def _detect_consecutive_idle_turns(
 
 
 def _detect_injection_method(
-    messages: list, *, is_host: bool = False
+    messages: list, *, is_host: bool = False, is_teardown=None,
 ) -> str | None:
     """Detect the injection method used based on conversation history.
 
@@ -268,6 +405,11 @@ def _detect_injection_method(
         messages: The conversation history to scan.
         is_host: Whether the resolved transport channel targets a host
             (ssh / kubewiz_host). Enables the ``host_native`` branch.
+        is_teardown: The teardown≠mutation matcher
+            (``execution_artifacts.make_teardown_matcher``), threaded into
+            every vocabulary-carrier scan (P3): a registered-vehicle
+            teardown delete is asset removal, never mutation evidence.
+            ``None`` (the default) is RAW evidence (test fixtures).
 
     Returns:
         "host_blade" | "kubectl_exec" | "kubectl_native" | "host_native" | None
@@ -281,7 +423,9 @@ def _detect_injection_method(
     # result; every carrier scans for its own evidence inside its provider.
     from chaos_agent.agent.providers import FaultProviderRegistry
 
-    return FaultProviderRegistry.detect_method(messages, is_host=is_host)
+    return FaultProviderRegistry.detect_method(
+        messages, is_host=is_host, is_teardown=is_teardown,
+    )
 
 
 def _should_redetect_injection_method(
@@ -348,7 +492,23 @@ def _issue_disproven_in_epoch(state: AgentState, messages: list, provider) -> bo
     disprove = getattr(provider, "issue_disproven", None)
     if disprove is None:
         return False
-    return bool(disprove(_epoch_bounded_messages(messages, state)))
+    # Teardown ≠ mutation, in the confirmation guard too (O-2): the
+    # registered-vehicle teardown delete's SUCCESS receipt would otherwise
+    # be counted by the pre-pass as "a write landed — attribution
+    # confirmed", masking the revocation a genuinely failed injection
+    # earned. P3 threads the ``is_teardown`` matcher INTO the scan — the
+    # call-level skip applies at the vocabulary layer, mixed batches
+    # included (the retired message-level window kept a mixed batch's
+    # teardown receipt readable). A real write's success/failure verdict
+    # is untouched (three shapes re-pinned by TestIssueTimeTeardownAttribution).
+    from chaos_agent.agent.execution_artifacts import make_teardown_matcher
+
+    return bool(disprove(
+        _epoch_bounded_messages(messages, state),
+        is_teardown=make_teardown_matcher(
+            state.get("execution_artifacts") or []
+        ),
+    ))
 
 
 def _maybe_revoke_issue_time_attribution(
@@ -412,6 +572,96 @@ def _project_fault_handle(state: AgentState, result: dict) -> None:
         result["fault_handle"] = next_handle
 
 
+async def _landing_readback_guard(
+    state: AgentState, result: dict, messages: list
+) -> None:
+    """Post-landing readback guard — the D5 hard-abort seam.
+
+    faultdrill-cr-channel task 2.1 (productised from the v2 experiment's
+    ``exit(5)`` guard): a carrier landing the registry recognises gets
+    its landing integrity verified PROGRAMMATICALLY on THIS iteration —
+    never deferred to an LLM turn (a prompt-layer readback is
+    observation, not a guard; safety rails are not delegable). A failed
+    verification is a HARD ABORT: the ``fail_state`` error triple routes
+    the turn out of the loop BEFORE any reconciliation entry — a
+    landed-but-stripped recipe reconciling on empty patches IS the v1
+    bare-injection incident. A passed verification writes the
+    ``fault_readback_verified`` bookkeeping the provider's idempotence
+    gate consumes (one readback per CR per epoch). Extracted as a helper
+    so the guard's dispatch contract is unit-testable without a full
+    execute-loop fixture.
+    """
+    from chaos_agent.agent.providers import FaultProviderRegistry
+
+    verdict = await FaultProviderRegistry.verify_landing_readback(
+        messages, state, kubeconfig=_resolve_kubeconfig(state),
+    )
+    if verdict is None:
+        return
+    if verdict.get("ok"):
+        handle = str(verdict.get("handle") or "")
+        if handle:
+            result["fault_readback_verified"] = handle
+        return
+    reason = str(verdict.get("reason") or "unknown")
+    handle = str(verdict.get("handle") or "")
+    detail = str(verdict.get("detail") or "")
+    # "not found" in the detail is load-bearing wording: a
+    # stripped/unreadable landing is recipe-layer evidence the replan
+    # classifier can act on (fix the recipe, or route to the SOP
+    # recovery form) — the same auto-replan channel every other
+    # replanable execution error rides.
+    result.update(fail_state(
+        FailureCategory.EXECUTION_FAILED,
+        (
+            f"carrier landing readback guard aborted the injection "
+            f"(reason={reason}, handle={handle or 'unnameable'}): "
+            f"{detail}. Injection is HALTED before reconciliation — "
+            "reconciling a landing whose recipe did not survive is the "
+            "bare-injection hazard (v1 incident law). Fix the recipe or "
+            "route to the SOP recovery form and retry."
+        ),
+        messages,
+    ))
+    logger.warning(
+        "landing readback guard: HARD ABORT (reason=%s, handle=%s)",
+        reason, handle or "<unnameable>",
+    )
+
+
+def _arm_fault_reconciler(state: AgentState, result: dict) -> None:
+    """Arm the session-side reconciler for a verified carrier landing —
+    the D4 recovery seam.
+
+    faultdrill-cr-channel task 2.2 (design D4): the readback guard's
+    PASSING verdict writes ``fault_readback_verified`` (task 2.1); this
+    seam arms the background reconcile loop on exactly that handle —
+    the loop owns the fault window from here (Pending → Injected → TTL
+    → Recovered), so the execute loop's LLM turns stay ~3 (apply /
+    readback / observe) instead of driving the injection by hand. A
+    stripped landing NEVER arms: the guard's hard abort leaves the loop
+    before this point. Arming is idempotent per handle (a live
+    reconciler re-reads the CR every pass), and the replan seam keeps
+    the reconciler alive by design — a re-apply under the same name is
+    reconciled with the new recipe by the already-running task.
+    """
+    handle = str(
+        result.get("fault_readback_verified")
+        or state.get("fault_readback_verified")
+        or ""
+    )
+    if not handle:
+        return
+    from chaos_agent.agent.providers import FaultProviderRegistry
+
+    if FaultProviderRegistry.arm_session_reconciler(
+        handle, kubeconfig=_resolve_kubeconfig(state),
+    ):
+        logger.info(
+            "session reconciler armed for verified landing %s", handle,
+        )
+
+
 def _epoch_bounded_messages(messages: list, state: AgentState) -> list:
     """Messages belonging to the CURRENT attribution epoch.
 
@@ -441,11 +691,47 @@ def _epoch_bounded_messages(messages: list, state: AgentState) -> list:
     return messages[start:]
 
 
+def _merged_message_count(state_messages: list, result_messages: list) -> int:
+    """Length of ``state_messages`` once ``add_messages`` merges ``result_messages``.
+
+    Replicates the reducer's LENGTH accounting without copying messages: a
+    ``RemoveMessage`` deletes its in-place id, a message whose id already
+    exists replaces it (length unchanged), everything else appends. Used by
+    ``reset_attribution_state`` so the recorded epoch boundary equals the real
+    post-merge length even when the seam's result already carries
+    replace-type messages — or a compaction hook's RemoveMessages + summary
+    merged ahead of it (``merge_hook_updates`` runs before the replan seam,
+    so the seam's accounting must simulate the MIXED batch).
+
+    Assumes at most one message per id in ``state_messages`` — the
+    ``add_messages`` replace-by-id invariant. The real reducer deletes EVERY
+    copy of a duplicated id, which this accounting would under-count; that
+    state is unreachable through the reducer itself (appending a duplicate
+    id replaces, it never stacks), so the invariant is not defended here.
+    """
+    alive = {m.id for m in state_messages if getattr(m, "id", None)}
+    total = len(state_messages)
+    for msg in result_messages:
+        mid = getattr(msg, "id", None)
+        if isinstance(msg, RemoveMessage):
+            if mid in alive:
+                alive.discard(mid)
+                total -= 1
+        elif mid is not None and mid in alive:
+            continue  # in-place replace: length unchanged
+        else:
+            total += 1
+            if mid is not None:
+                alive.add(mid)
+    return total
+
+
 def reset_attribution_state(
     result: dict,
     *,
     keep_experiment_uid: bool = False,
-    message_count: int | None = None,
+    state_messages: list | None = None,
+    state: AgentState | None = None,
 ) -> None:
     """Reset injection-attribution fields at a replan seam.
 
@@ -464,14 +750,36 @@ def reset_attribution_state(
     residue first (and retires the UID separately), so it always passes the
     default ``keep_experiment_uid=False``.
 
-    ``message_count``: total messages once this node's result lands in state
-    (``len(state messages) + len(result messages)``). Recorded as the
-    attribution epoch boundary so the RESUME re-detection scan only reads
-    CURRENT-epoch messages: clearing ``injection_method`` re-arms the scan, and
-    an unbounded scan would re-derive the PRE-replan attribution — counting
-    stale diagnostic execs as the new fault's injection and letting the
-    executor conclude "already injected" without issuing anything
-    (task-5193538b).
+    ``state``: the pre-seam state, for the ledger plan-scoped-field
+    reset (cascade review C1 knife-2; O2 extension). The ledger's
+    ``execution-complete`` is a fact about THE PLAN THAT JUST RAN — a
+    replan retires that plan, so the fact must not survive the seam: a
+    stale terminal phase would satisfy the stall gate and the router's
+    text-only branch for the NEXT plan, letting a fresh plan reach the
+    verifier with zero steps executed (the same
+    stale-fact-across-a-seam family as task-5193538b's attribution, in a
+    new carrier). ``current_step`` joins the reset for the same reason:
+    the retired plan's step pointer is meaningless for the next plan.
+    Cleared: ``state.phase`` (terminal marker) and
+    ``state.current_step``. Kept: facts, log and anchor — they describe
+    history, which the next plan may legitimately build on. Omit
+    ``state`` at call sites that have no ledger (or no seam semantics).
+
+    ``state_messages``: the state's message list at the seam. Two effects:
+    (1) the synthetic baseline pair persisted by the previous verification
+    cycle is removed — replan invalidates the epoch's baseline evidence along
+    with its attribution, and a surviving pair (stable ids outlive handoff
+    stripping) would be diagnosed INTACT by the next cycle's pair gate and
+    skip the rebuild, anchoring the model on pre-replan numbers while
+    ``baseline_data`` already holds the new ones (E1, change
+    ``stale-baseline-pair-seam-cleanup``); (2) the attribution epoch boundary
+    is recorded as the POST-MERGE list length (pair deletions accounted) so
+    the RESUME re-detection scan only reads CURRENT-epoch messages: clearing
+    ``injection_method`` re-arms the scan, and an unbounded scan would
+    re-derive the PRE-replan attribution — counting stale diagnostic execs as
+    the new fault's injection and letting the executor conclude "already
+    injected" without issuing anything (task-5193538b). Omit it for a pure
+    field reset with no boundary and no pair cleanup.
     """
     if not keep_experiment_uid:
         result["experiment_uid"] = None
@@ -479,6 +787,14 @@ def reset_attribution_state(
         # describes was invalidated with it (keep_experiment_uid keeps both — a
         # live experiment keeps its handle for the recover graph).
         result["fault_handle"] = None
+        # The readback-verified bookkeeping mirrors the handle's fate: a
+        # kept handle keeps its verified landing (keep_experiment_uid
+        # carries a live fault whose landing was already proven intact),
+        # while a cleared handle invalidates the verification — the next
+        # attempt's re-apply may carry a DIFFERENT recipe under the same
+        # carrier name, and a stale verification would wave a stripped
+        # landing through (faultdrill-cr-channel task 2.1).
+        result["fault_readback_verified"] = None
         # The combo marker belongs to the same attribution: the UID's
         # native companion is invalidated together with it (keep_experiment_uid
         # keeps both — a live experiment keeps its native component).
@@ -487,8 +803,73 @@ def reset_attribution_state(
     result["kubectl_exec_pod_name"] = None
     result["inject_layer1_cache"] = None
     result["injection_start_time"] = None
-    if message_count is not None:
-        result["attribution_epoch_index"] = message_count
+    # Fault-window hold origin: retired with the same attribution — the
+    # replanned attempt's window must re-anchor at ITS execute-loop end
+    # (the next verifier entry re-stamps), never inherit this attempt's
+    # verifier-entry stamp (a stale origin would silently erode the new
+    # attempt's window by the replan cycle's entire duration).
+    result["injection_window_start_time"] = None
+    # Ledger plan-scoped-field reset (C1 knife-2 + O2): retire the previous
+    # plan's execution facts together with its attribution. Two fields are
+    # plan-scoped — they describe THE PLAN THAT JUST RAN and must not leak
+    # into the replanned one: ``phase`` (terminal marker — a stale
+    # execution-complete satisfies the stall gate and the router's
+    # text-only branch for the NEXT plan, letting it reach the verifier
+    # with zero steps executed) and ``current_step`` (the retired plan's
+    # step pointer — meaningless for the next plan; display-layer only,
+    # no gate consumes it, but a stale "step s3" rendered as the new
+    # plan's current step is a lie to the model). The reset writes a
+    # MERGE patch (None values) rather than the whole ledger:
+    # progress_ledger's state is a shallow-merge channel
+    # (merge_progress_ledger state_update semantics), so None lands as
+    # "absent" in the merged view — facts/log/anchor ride through
+    # untouched (established_facts are environment facts, the log is
+    # history: both legitimately survive a replan). No ledger in state →
+    # nothing to retire (the normal first-attempt shape).
+    if state is not None:
+        _ledger = state.get("progress_ledger")
+        if isinstance(_ledger, dict) and isinstance(_ledger.get("state"), dict):
+            _phase = str(_ledger["state"].get("phase") or "").strip().lower()
+            _step = _ledger["state"].get("current_step")
+            _retired: dict = {}
+            if _phase in EXECUTION_COMPLETE_PHASES:
+                _retired["phase"] = None
+            if _step is not None:
+                _retired["current_step"] = None
+            if _retired:
+                _merged = merge_progress_ledger(
+                    _ledger, state_update=_retired,
+                )
+                result["progress_ledger"] = _merged
+                logger.info(
+                    "replan seam: retired plan-scoped ledger fields %s "
+                    "(belonged to the retired plan)",
+                    sorted(_retired),
+                )
+    if state_messages is None:
+        return
+    # Baseline-pair lifecycle: see docstring. SCAN-then-delete — only ids
+    # PRESENT in state get a RemoveMessage (``add_messages`` raises on absent
+    # ids; "pair not yet injected" is the norm at execute-time seams, not an
+    # edge). Sorted for deterministic emission; the deletions are a set
+    # operation, order carries no semantics.
+    present_ids = [
+        mid for mid in sorted(BASELINE_PAIR_MESSAGE_IDS)
+        if any(getattr(m, "id", None) == mid for m in state_messages)
+    ]
+    result_messages = list(result.get("messages") or []) + [
+        RemoveMessage(id=mid) for mid in present_ids
+    ]
+    result["messages"] = result_messages
+    # Epoch boundary = post-merge length. The old tail count
+    # (``len(state) + len(result)``) would overshoot by the deleted pair
+    # count: every epoch consumer's overshoot defence degrades to FULL
+    # history, re-arming exactly what the boundary exists to prevent
+    # (task-5193538b misattribution; stale context-HM suppression on the
+    # verifier side).
+    result["attribution_epoch_index"] = _merged_message_count(
+        state_messages, result_messages,
+    )
 
 
 def _build_execution_hints(
@@ -711,6 +1092,15 @@ def _process_response_tool_calls(
         _issuer = FaultProviderRegistry.resolve_by_method(_issued)
         if _issuer is None or _issuer.has_experiment_uid:
             continue
+        # Teardown ≠ fault mutation (R6-1): a registry-matched vehicle
+        # delete skips BOTH the method commit and the combo evaluation —
+        # see :func:`_issue_call_is_registered_teardown` for the ghost-row
+        # chain this skip closes. The loop then keeps scanning: teardown
+        # must not consume the first-native-call slot either (an iteration
+        # carrying [teardown delete, real patch] still attributes the
+        # patch).
+        if _issue_call_is_registered_teardown(tc_name, tc_args, state):
+            continue
         if not _current_method:
             result["injection_method"] = _issued
             logger.info("Recorded injection_method at issue time: %s", _issued)
@@ -727,13 +1117,18 @@ def _process_response_tool_calls(
             # alive even though nothing is attributed yet. The epoch-bounded
             # re-detect scan cannot see the pre-seam blade_create, so this
             # issue-time check is the only coverage for that ordering.
+            # The LIVE predicate (round-27 R2): the committed twin licensed a
+            # combo on a DESTROYED experiment's kept UID — a corpse parked by
+            # the seam mis-marked the next native issue as combo and durably
+            # routed recovery to the LLM path for a native-only task
+            # (the task-51193464 lesson, re-opened through the live door).
             #
             # Judge on the carried-over STATE only (never ``{**state, **result}``):
             # ``result`` may already hold the native method recorded a few lines
             # above for THIS very tool call, and a native provider would claim
             # it to build a handle — mis-marking a plain native fallback
             # (blade failed with no UID) as a combo.
-            _experiment_live = has_active_fault(state)
+            _experiment_live = has_live_fault(state)
         else:
             # COMBO (blade-first order): a native mutating injection was
             # issued while an experiment method is already attributed — both
@@ -755,9 +1150,19 @@ def _process_response_tool_calls(
                 # mis-read as blade evidence), and marking a combo on top
                 # of it would durably route recovery down the LLM path for
                 # a task whose only real mutation was the native one.
+                # LIVE axis (round-28, the R2 twin): the state-side UID
+                # PRESENCE used to license a combo on a DESTROYED
+                # experiment's corpse slot (destroy clears no slot); the
+                # liability oracle judges the slot instead (owned −
+                # retired − message-proven destroy — the durable-record
+                # evidence source keeps a compacted-away live UID owned,
+                # so the protected shape stays True). The result-side UID
+                # keeps presence semantics: it is THIS iteration's fresh
+                # birth, whose create receipt has not merged into the
+                # state's message face yet — born-live by construction.
                 and bool(
-                    state.get("experiment_uid")
-                    or result.get("experiment_uid")
+                    result.get("experiment_uid")
+                    or live_liability_uids(state)
                 )
             )
         if _experiment_live and not (
@@ -822,16 +1227,29 @@ def _maybe_build_phase2_kickoff(messages: list) -> HumanMessage | None:
 
     The wording says "the next unexecuted step" (not "start the injection")
     so a mid-execution resume through this seam still reads correctly.
+
+    The message carries an id at CONSTRUCTION time (B78): this object is
+    immediate-written to the session store before ``add_messages`` merges
+    it into state, and the PreReasoningHook flush writes it again after the
+    merge. An id-less construction made those two serializations fall under
+    two different dedup keys (composite vs ``id:``) — one logical message,
+    two audit records, drifting timestamps. With a construction-time id the
+    store's ID-first dedup collapses the deliberate double write. The store
+    itself now stamps uuids on id-less state messages as the general guard;
+    this is the belt-and-suspenders layer (identity from birth).
     """
     if not _phase2_kickoff_needed(messages):
         return None
-    return HumanMessage(content=wrap_system_reminder(
-        f"{_PHASE2_KICKOFF_MARKER} Phase 1 (planning) is OVER and the plan "
-        "is approved — you are now in Phase 2 (execution). Immediately call "
-        "the tool that performs the next unexecuted step of the approved "
-        "plan. Do NOT restate the plan, do NOT output a summary, do NOT "
-        "wait for confirmation. Execute now."
-    ))
+    return HumanMessage(
+        content=wrap_system_reminder(
+            f"{_PHASE2_KICKOFF_MARKER} Phase 1 (planning) is OVER and the plan "
+            "is approved — you are now in Phase 2 (execution). Immediately call "
+            "the tool that performs the next unexecuted step of the approved "
+            "plan. Do NOT restate the plan, do NOT output a summary, do NOT "
+            "wait for confirmation. Execute now."
+        ),
+        id=f"phase2-kickoff:{uuid4()}",
+    )
 
 
 def _detect_terminal_conclusion(
@@ -880,6 +1298,11 @@ def _detect_terminal_conclusion(
         and _method_provider is not None
         and _method_provider.is_multi_step
         and not state.get("_injection_selfcheck_nudged")
+        # A ledger-declared completion supersedes the step self-check:
+        # the model already asserted every mutation step ran (and the
+        # assertion is recorded fact, not prose) — re-questioning it
+        # re-opens the tail tension the declaration exists to close.
+        and not _ledger_declares_execution_complete(state)
     ):
         from chaos_agent.agent.nodes.execute._injection_detection import (
             build_injection_step_selfcheck,
@@ -889,8 +1312,23 @@ def _detect_terminal_conclusion(
             or state.get("skill_case_content", "")
         )
         _all_msgs = state.get("messages", []) + result.get("messages", [])
+        # O-3 (teardown ≠ step-credit): the step self-check counts EXECUTED
+        # verbs off the message history; a registered-vehicle teardown
+        # delete's success receipt used to credit the documented ``delete``
+        # step, silencing the "step not yet performed" soft reminder for a
+        # step the model never performed against the fault target. P3
+        # threads the matcher INTO the executed-side scan (call-level, mixed
+        # batches included); deliberately NO epoch bound here — the
+        # self-check is high-tolerance by design (under-reporting on
+        # purpose), so cross-epoch credit for a GENUINE step verb stays
+        # and only teardown-for-credit is removed.
+        from chaos_agent.agent.execution_artifacts import make_teardown_matcher
+
         _selfcheck = build_injection_step_selfcheck(
             _skill_case, _all_msgs, _injection_method,
+            is_teardown=make_teardown_matcher(
+                state.get("execution_artifacts") or []
+            ),
         )
         if _selfcheck:
             logger.info(
@@ -941,6 +1379,21 @@ def _detect_terminal_conclusion(
         and _resp_content
         and parse_replan_request(_resp_content) is None
     ):
+        # Ledger-declared completion (#39 third-retest tail-tension root
+        # fix): the model recorded ``execution-complete`` via
+        # ``finish_execution`` — every planned mutation step has run, and
+        # the nudge's premise ("call the injection tool NOW") is false.
+        # Issuing EXECUTION REQUIRED at a concluded plan burns rounds on
+        # redundant probes and pressures the model toward out-of-authority
+        # actions. Respect the recorded fact: let the text conclusion
+        # through to the router, which routes to the verifier (the fault's
+        # truth is checked there, never here).
+        if _ledger_declares_execution_complete(state):
+            logger.info(
+                "executor concluded with ledger phase execution-complete "
+                "— skipping stall nudge, routing to verifier",
+            )
+            return
         # Consecutive text-only stall: no tool call, no injection recorded, and
         # no parseable replan. A productive turn (tool_calls issued) resets this
         # counter in ``_process_response_tool_calls``, so only a genuine STREAK
@@ -1099,7 +1552,8 @@ def _fire_replan_seam(
     # boundary where the create ToolMessage may have been summarized
     # away. Worst case of the fallback (uid already dead) is bounded:
     # recover hits the designed "experiment lost -> alert" branch.
-    all_messages = list(state.get("messages") or []) + list(result.get("messages") or [])
+    state_msgs = list(state.get("messages") or [])
+    all_messages = state_msgs + list(result.get("messages") or [])
     retired_uids = state.get("retired_experiment_uids")
     from chaos_agent.agent.providers import FaultProviderRegistry
     from chaos_agent.transports.registry import is_host_scope_channel
@@ -1131,7 +1585,8 @@ def _fire_replan_seam(
     reset_attribution_state(
         result,
         keep_experiment_uid=bool(experiment_uid_at_seam),
-        message_count=len(all_messages),
+        state_messages=state_msgs,
+        state=state,
     )
     history = list(state.get("replan_history") or [])
     history.append({
@@ -1272,7 +1727,12 @@ def _injection_attempted_this_contract(state: AgentState) -> bool:
        issue-time classifier the attribution path commits to, so every carrier
        (blade, python-agent, kubectl object-write / exec-blade / command-mode
        mutation, host-native shell) is covered by one vocabulary and this rule
-       can never drift away from attribution.
+       can never drift away from attribution. A registered-vehicle TEARDOWN
+       delete is skipped at CALL granularity before classification (R10-1):
+       cleanup proves nothing about feasibility, and message-level filtering
+       would not cover the mixed batch (teardown alongside read-only calls —
+       no genuine attempt in the batch, yet the message survives filtering
+       and its teardown call would classify as kubectl_native).
     """
     # NOTE: this is an ATTRIBUTION-presence check, deliberately NOT
     # ``has_active_fault``: a blade attribution without a UID means the
@@ -1293,9 +1753,301 @@ def _injection_attempted_this_contract(state: AgentState) -> bool:
             continue
         for tc in getattr(msg, "tool_calls", None) or []:
             name, args = extract_tool_call_fields(tc)
+            # Teardown ≠ attempt (R10-1): a registered-vehicle teardown
+            # delete must not masquerade as the attempt evidence that gets
+            # an otherwise-refused replan granted — the review rule's whole
+            # point is state facts the model cannot fake, and cleanup is
+            # faked evidence (it proves nothing about feasibility). Call-
+            # level skip so the mixed-batch form (teardown + read-only
+            # calls, no genuine attempt anywhere in the batch) stays honest.
+            if _issue_call_is_registered_teardown(name, args, state):
+                continue
             if classify_issue_time_method(name, args, is_host=_is_host):
                 return True
     return False
+
+
+#: The CLOSED flag grammar an honest absence probe may carry. Flipping
+#: the enumeration: three blacklist passes each missed a form (template
+#: ``-file`` variants, ``poddisruptionbudgets`` under a "pod" prefix,
+#: ``--server``/``--as``/``--token`` global flags), and membership
+#: scanning misread a flag VALUE as a flag (``-n -A``: pflag consumes
+#: the next token as ``-n``'s value UNCONDITIONALLY). Only whitelisted
+#: flags parse; any other dash token — cluster, identity, or endpoint
+#: switch — refuses the proof outright.
+_PROBE_VALUE_FLAGS = frozenset({
+    "-n", "--namespace",
+    "-l", "--selector",
+    "-o", "--output",
+    "--kubeconfig",
+})
+_PROBE_BOOL_FLAGS = frozenset({
+    "-A", "--all-namespaces",
+    "--show-labels",
+    "--no-headers",
+})
+
+
+def _scan_probe_flags(tokens: list[str]) -> dict | None:
+    """Position-aware whitelist parse of a probe's flag tokens.
+
+    Mirrors kubectl's pflag consumption so the guard reads EXACTLY the
+    query kubectl ran: a value flag consumes the next token as its value
+    unconditionally — even one starting with ``-`` (``-n -A`` sets
+    namespace ``-A``; ``-A`` is NOT a flag there) — and a repeated flag
+    takes its LAST occurrence. Bool flags accept the bare form or
+    ``=true``; ``=false`` parses as the flag's explicit negation (same
+    effect as absence), anything else refuses. One matching pair of
+    surrounding quotes is stripped from values (shell semantics).
+
+    Returns the effective ``namespace``/``selector``/``output`` values
+    and the ``all_namespaces`` bool, or ``None`` when ANY token falls
+    outside the probe grammar: an unlisted flag (``--field-selector``,
+    ``--context``, ``--server``, ``--as``, ``--token``…) can change what
+    the query matched, and a positional argument (``pods web-1``)
+    narrows it to one named resource — for both, an empty result proves
+    nothing about the selector-defined set. ``-A`` alongside ``-n`` is
+    refused too: the local flag is then dead text and the receipt's
+    effective scope cannot be read off the command line.
+    """
+    namespace: str | None = None
+    selector: str | None = None
+    output: str | None = None
+    all_namespaces = False
+    i = 1  # tokens[0] is the resource kind, validated by the caller
+    while i < len(tokens):
+        tok = tokens[i]
+        if not tok.startswith("-"):
+            return None  # positional resource name narrows the query
+        flag, eq, inline = tok.partition("=")
+        if flag in _PROBE_BOOL_FLAGS:
+            if eq and inline != "true":
+                if inline != "false":
+                    return None  # not a pflag-legal bool form
+                # ``=false``: explicit negation, same effect as absence.
+            elif flag in ("-A", "--all-namespaces"):
+                all_namespaces = True
+            i += 1
+            continue
+        if flag not in _PROBE_VALUE_FLAGS:
+            return None
+        if eq:
+            value = inline
+            i += 1
+        elif i + 1 < len(tokens):
+            value = tokens[i + 1]
+            i += 2
+        else:
+            return None  # value flag with no value: kubectl errors out
+        if (
+            len(value) >= 2
+            and value[0] in ("\"", "'")
+            and value[-1] == value[0]
+        ):
+            value = value[1:-1]
+        if flag in ("-n", "--namespace"):
+            namespace = value
+        elif flag in ("-l", "--selector"):
+            selector = value
+        elif flag in ("-o", "--output"):
+            output = value
+        # --kubeconfig: consumed and discarded — it needs no anchoring
+    if all_namespaces and namespace is not None:
+        return None  # ambiguous scope: which of the two did kubectl run?
+    return {
+        "namespace": namespace,
+        "selector": selector,
+        "output": output,
+        "all_namespaces": all_namespaces,
+    }
+
+
+#: Output formats whose emptiness is a faithful empty MATCH SET.
+#: Table views (``wide``, default) list matching rows, ``name`` prints
+#: one line per match; ``json``/``yaml`` always emit the List envelope.
+#: Everything else — jsonpath/go-template (file variants included),
+#: custom-columns — can render EXISTING resources to nothing and is
+#: rejected. A positive allowlist, because enumerating dangerous
+#: spellings always misses one (poddisruptionbudget under a "pod"
+#: prefix, jsonpath-file without "jsonpath=").
+_SAFE_OUTPUT_FORMATS = frozenset({"wide", "name", "json", "yaml"})
+
+
+def _target_absence_proven_in_epoch(state: AgentState) -> bool:
+    """Structural proof that the approved target set is EMPTY.
+
+    The attempt proof above deadlocks when the target is physically gone:
+    an injection call can never be issued against pods that do not exist,
+    so "prove infeasibility by attempting" has no terminating path and the
+    executor is condemned to run the approved plan against an empty set
+    (task inject-65bbf344: 600s of no-op deletes, then a dead verify).
+    This second structural key unlocks exactly that case.
+
+    The proof is two halves paired by ``tool_call_id``:
+
+    1. A framework-generated EMPTY-SET RECEIPT — the ``EMPTY_SELECTOR_HINT``
+       that ``tools/kubectl.py`` appends only when a ``get`` carrying a
+       label selector returns NOTHING. The model cannot write ToolMessages,
+       so this half cannot be fabricated (the 71fa78b6 failure mode).
+    2. The issuing call ANCHORS the approved target: a read-only
+       ``kubectl``/``kubectl_read`` ``get`` whose effective flags match
+       the CURRENT contract. Namespace comes from the LAST ``-n``/
+       ``--namespace`` (kubectl/pflag: last wins) and must EQUAL the
+       approved one. The label selector comes from the LAST ``-l``/
+       ``--selector`` and must constrain a SUBSET of the approved pairs
+       — a WIDER probe (pairs dropped) is sound (its match set contains
+       the approved one), while a NARROWER probe (pairs added or
+       altered) can be empty while the approved target thrives, so its
+       emptiness proves nothing. For a pod-scope spec the probed
+       resource must be pods: an empty events list proves nothing about
+       pods. Flag reading is POSITION-AWARE over a closed whitelist
+       (:func:`_scan_probe_flags`), because pflag consumes a value
+       flag's next token unconditionally (``-n -A`` → namespace ``-A``,
+       NOT the all-namespaces flag) and membership scanning misread
+       exactly that.
+
+    Receipt soundness — an empty OUTPUT is only an empty MATCH SET when
+    nothing could have suppressed rows: the output format must be a
+    row-faithful one (``_SAFE_OUTPUT_FORMATS`` allowlist — templates
+    render existing resources to nothing, including their ``-file``
+    variants), and EVERY flag must belong to the probe grammar
+    (``_PROBE_VALUE_FLAGS``/``_PROBE_BOOL_FLAGS``) — any other flag can
+    change what the query matched: ``--field-selector`` makes the
+    emptiness unattributable, ``--context``/``--cluster``/``--server``/
+    ``--as``/``--token`` point it at another cluster or identity, a
+    positional resource name narrows it to one object. Cluster switches
+    are checked on BOTH entry points: the v_args strings AND the
+    structured tool args that ``_build_kubectl_global_args`` injects as
+    the same global flags (emptiness is about another cluster).
+    ``--kubeconfig`` is deliberately ALLOWED: skill recipes mandate an
+    explicit kubeconfig, the value points at the task's cluster in
+    practice, and the bounded cost of a forged path is one wasted
+    replan that Phase 1 re-checks under the user confirmation gate. An
+    all-namespaces probe (``-A``/``--all-namespaces``) is a SUPERSET
+    probe — its match set contains the approved namespace's — so its
+    emptiness is sound without a ``-n`` equality; combining ``-A`` WITH
+    ``-n`` is refused, since the local flag becomes dead text and the
+    receipt's effective scope can no longer be read off the command.
+
+    The receipt id must be UNAMBIGUOUS: exactly ONE ToolMessage answers
+    the call. A duplicated ``tool_call_id`` (adversarial reuse across
+    turns) could pair the anchor call with a receipt from a DIFFERENT
+    invocation — rejected outright rather than risk mis-pairing.
+
+    Scope soundness: the probed resource KIND must be EXACTLY the
+    target's (``pod`` scope → ``pod``/``pods``; ``node`` scope →
+    ``node``/``nodes`` — a prefix match would let an empty
+    ``poddisruptionbudget`` list pose as pod absence); any other or
+    empty scope cannot be kind-verified and stays out. A pod-scope spec
+    additionally REQUIRES a namespace: without one the probe may have
+    queried only the default namespace, and a default-namespace empty
+    set proves nothing about the approved target. A node-scope spec
+    normally carries no namespace (nodes are cluster-scoped) and
+    anchors on the selector alone.
+
+    Bounded by the same attribution epoch as the attempt proof, so probes
+    issued under an OLD contract cannot unlock a replan for the current
+    one. Specs carrying explicit ``names`` (alone or mixed with labels)
+    stay out of scope: their absence evidence is per-name NotFound, a
+    different receipt shape, and the names/labels combination semantics
+    make a selector-only empty set unprovable for the whole target.
+    """
+    spec = read_fault_spec(state)
+    if spec is None or spec.names or not spec.labels:
+        return False
+    kind = spec.scope.strip().lower().rstrip("s") if spec.scope else ""
+    if kind not in ("pod", "node"):
+        return False
+    kind_names = {kind, kind + "s"}
+    if kind == "pod" and not spec.namespace:
+        return False
+    epoch_msgs = _epoch_bounded_messages(state.get("messages") or [], state)
+    if not epoch_msgs:
+        return False
+    from chaos_agent.tools.kubectl import EMPTY_SELECTOR_HINT
+
+    receipts_by_id: dict[str, list[ToolMessage]] = {}
+    for msg in epoch_msgs:
+        if isinstance(msg, ToolMessage):
+            receipts_by_id.setdefault(msg.tool_call_id, []).append(msg)
+    empty_receipt_ids = {
+        tc_id
+        for tc_id, receipts in receipts_by_id.items()
+        if len(receipts) == 1
+        and EMPTY_SELECTOR_HINT in str(receipts[0].content)
+    }
+    if not empty_receipt_ids:
+        return False
+    approved_kv = {f"{k}={v}" for k, v in spec.labels.items()}
+    for msg in epoch_msgs:
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            name, args = extract_tool_call_fields(tc)
+            if name not in ("kubectl", "kubectl_read"):
+                continue
+            if not isinstance(args, dict):
+                continue
+            if str(args.get("subcommand") or "").lower() != "get":
+                continue
+            # Cluster-switch rejection has TWO entry points: the v_args
+            # ``--context``/``--cluster`` strings checked below, and the
+            # STRUCTURED ``context``/``cluster`` tool args that
+            # ``_build_kubectl_global_args`` injects as the very same global
+            # flags. An emptiness observed in another cluster proves nothing
+            # here — reject the structured form with the same rule.
+            if args.get("context") or args.get("cluster"):
+                continue
+            v_args = str(args.get("v_args") or "")
+            tokens = v_args.split()
+            if not tokens or tokens[0].lower() not in kind_names:
+                continue
+            flags = _scan_probe_flags(tokens)
+            if flags is None:
+                continue  # outside the probe grammar: refusal, not luck
+            # Receipt soundness: empty output must mean an empty MATCH SET.
+            output_format = flags["output"]
+            if output_format is not None and output_format not in _SAFE_OUTPUT_FORMATS:
+                continue  # non-row-faithful output can render resources to nothing
+            # All-namespaces probes (``-A``/``--all-namespaces``) cover
+            # every namespace, so their match set CONTAINS the approved
+            # one — the same superset soundness as dropping selector
+            # pairs. pflag forms: bare ``-A``/``--all-namespaces`` or
+            # ``--all-namespaces=true``; ``=false`` negates (needs the
+            # namespace equality), anything else fails closed in the
+            # scanner.
+            if (
+                spec.namespace
+                and not flags["all_namespaces"]
+                and flags["namespace"] != spec.namespace
+            ):
+                continue
+            selector = flags["selector"]
+            if selector is None:
+                continue
+            # Subset soundness: probe pairs ⊆ approved pairs ⇒ probe match
+            # set ⊇ approved set ⇒ empty probe result proves absence.
+            terms = [t for t in selector.split(",") if t]
+            if not terms or not all(t in approved_kv for t in terms):
+                continue
+            tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            if tc_id and tc_id in empty_receipt_ids:
+                return True
+    return False
+
+
+def _banned_rejection_on_record(state: AgentState) -> bool:
+    """A REJECT_BANNED receipt exists under the current contract.
+
+    Reuses :func:`_collect_guard_rejections` (same contract boundary: a
+    plan-change approval notice ends the scan), so the receipts counted
+    here are always judged against the target set this contract froze.
+    """
+    messages = state.get("messages", [])
+    return any(
+        r.get("verdict") == "REJECT_BANNED"
+        for r in _collect_guard_rejections(messages)
+    )
 
 
 def _review_replan_request(
@@ -1309,14 +2061,35 @@ def _review_replan_request(
     (or its recorded attribution), never by anticipation — so the check keys
     on state facts only (see :func:`_injection_attempted_this_contract`) and
     ignores the request's free text entirely.
+
+    Two structural exceptions:
+      - The approved target set is provably EMPTY
+        (:func:`_target_absence_proven_in_epoch`): an attempt is physically
+        impossible, and demanding one would deadlock the contract — the
+        plan replans on the framework's own empty-set receipt instead.
+      - A safety-kind request with a REJECT_BANNED receipt on record
+        (:func:`_banned_rejection_on_record`): the infeasibility is already
+        framework-proven, not anticipated — the guard refused the very
+        call the plan needs, and "issue the injection call first" would
+        order the model to bypass the safety boundary the refusal marks
+        (inject-cc2d5080: that review push landed a fault with no recovery
+        timer armed, because the refused call was the carrier that arms
+        it). The request's free text is still ignored — the kind label
+        and the receipt are both structured facts.
     """
     if request.decision == "needs_investigation":
         return "The request says more investigation is needed."
     if not _injection_attempted_this_contract(state):
+        if _target_absence_proven_in_epoch(state):
+            return None
+        if request.kind == "safety" and _banned_rejection_on_record(state):
+            return None
         return (
             "No injection attempt is recorded under the current contract. "
             "A plan is proven infeasible by attempting it, not by "
-            "anticipation — issue the injection call first."
+            "anticipation — issue the injection call first, or probe the "
+            "approved target with a read-only kubectl get whose empty "
+            "result proves the target is gone."
         )
     return None
 
@@ -1328,6 +2101,14 @@ async def execute_loop(state: AgentState) -> dict:
 
     Returns updated state fields.
     """
+    # Write-set boundary consistency assertion (D4): a still-pending
+    # snapshot here means no approval path ran — audit loudly, then
+    # proceed (the target_guard enforces the manifest boundary).
+    from chaos_agent.agent.nodes.gates._write_set_boundary import (
+        execute_loop_entry_sentinel,
+    )
+    execute_loop_entry_sentinel(state)
+
     task_id = state.get("task_id", "") or ""
     skill_name = read_active_skill_name(state)
     count = state.get("execute_loop_count", 0) + 1
@@ -1406,7 +2187,14 @@ async def _check_execute_loop_limits(
     zombie_replan = (
         state.get("replan_requested")
         and state.get("replan_count", 0) >= _max_replan_zombie
-        and not has_active_fault(state)
+        # LIVE predicate (round-27 R3): the committed twin is True for every
+        # task that ever injected, so on a destroyed experiment this guard
+        # NEVER fired and replan kept burning budget until MAX_EXECUTE_LOOP.
+        # "No further injection paths" is only worth terminating for when
+        # nothing live remains — a live experiment (or an attributed native
+        # mutation, which has no death oracle and stays committed-True)
+        # still needs the loop to converge.
+        and not has_live_fault(state)
     )
     if zombie_replan:
         stuck_error = (
@@ -1567,28 +2355,32 @@ def _build_convergence_hints(
 
 async def _build_execute_system_prompt(
     state: AgentState, task_id: str, skill_name: str, tools,
-    skill_catalog: str, env_info, registry, ledger=None,
+    skill_catalog: str, env_info, registry,
 ) -> tuple[str, object]:
     """Phase 3: build the execute-phase system prompt + capability context.
 
-    Returns ``(execute_prompt, capability_context)``. ``ledger`` is the current
-    progress ledger; when non-empty its rendered section is re-injected so the
-    executor re-reads the anchor each round.
+    Returns ``(execute_prompt, capability_context)``. The progress ledger is NO
+    LONGER injected here (context-cache-prefix-stability Unit A / task 2.1): it
+    rides the message TAIL via the append-only channel in
+    ``_execute_loop_with_llm`` so this head stays byte-stable across rounds.
     """
     from chaos_agent.agent.prompts import build_system_prompt, PromptMode
     from chaos_agent.agent.env_info import compute_env_info
     from chaos_agent.agent.spec.fault_spec import read_fault_spec
-    from chaos_agent.agent.progress_ledger import build_ledger_prompt_section
     plan = state.get("plan")
     plan_path = state.get("plan_path")
-    # Build structured_params_hint from FaultSpec
+    # Build structured_params_hint from FaultSpec. Duration rides along:
+    # the execute prompt (MINIMAL mode) has no Reviewed FaultSpec section,
+    # so this hint is the executor's ONLY view of the contracted injection
+    # window — command-level timers (sleep N / --timeout N) anchor on it.
     _spec_for_hint = read_fault_spec(state)
     structured_params_hint = ""
     if _spec_for_hint and _spec_for_hint.is_complete:
         structured_params_hint = (
             f"scope={_spec_for_hint.scope}, "
             f"target={_spec_for_hint.fault_target}, "
-            f"action={_spec_for_hint.fault_action}"
+            f"action={_spec_for_hint.fault_action}, "
+            f"duration={_spec_for_hint.duration_seconds}s"
         )
     # Build user_params_hint from FaultSpec.params so user-specified
     # values (e.g. finalizer=...) take priority over skill template
@@ -1609,7 +2401,6 @@ async def _build_execute_system_prompt(
         user_params_hint=user_params_hint,
         env_info=resolved_env_info,
         profile=capability_context.profile,
-        progress_ledger_section=build_ledger_prompt_section(ledger),
     )
     return execute_prompt, capability_context
 
@@ -1626,12 +2417,43 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         return execute_loop
 
     async def _execute_loop_with_llm(state: AgentState) -> dict:
+        # Write-set boundary consistency assertion (D4): a still-pending
+        # snapshot here means no approval path ran — audit loudly, then
+        # proceed (the target_guard enforces the manifest boundary).
+        # Runs BEFORE the first LLM call so the assertion costs zero
+        # tokens.
+        from chaos_agent.agent.nodes.gates._write_set_boundary import (
+            execute_loop_entry_sentinel,
+        )
+        execute_loop_entry_sentinel(state)
+
         # 0. Reset time_wait consecutive-call guard if last round included
         # any non-wait tool (allows time_wait to be called again after a
         # real tool like kubectl ran).  Scans the entire most-recent
         # ToolMessage batch to handle parallel tool calls correctly.
         from chaos_agent.tools.wait import check_and_reset_wait_guard
         check_and_reset_wait_guard(state.get("messages", []))
+
+        # 0b. Create-reconcile three-state scan (blade-create-reconcile-
+        # before-retry D6): classify the most recent gate-armed create
+        # ToolMessage (uncertain / gate-blocked-or-fabricated / plain;
+        # which tools are gate-armed is declared provider-side and
+        # consumed through the registry seam) and update the
+        # create_reconcile flag BEFORE this iteration's LLM call. The
+        # interception gate judges the response AFTER it — same
+        # iteration, strictly ordered, so the FIRST blind retry after a
+        # result-uncertain create already meets a registered flag. The
+        # scan derives everything from the message history, so a lost
+        # update (early-exit paths return before result-building) simply
+        # re-derives the same outcome next iteration.
+        from chaos_agent.agent.nodes.execute._reconcile_gate import (
+            NO_CHANGE as _RECONCILE_NO_CHANGE,
+            scan_create_reconcile,
+        )
+        _reconcile_update = scan_create_reconcile(
+            state.get("messages", []),
+            state.get("create_reconcile"),
+        )
 
         # 1. Iteration count + limit check
         task_id = state.get("task_id", "") or ""
@@ -1654,18 +2476,68 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         # Freeze the progress-ledger anchor on the first execute iteration.
         # Lazy (execute_loop runs AFTER confirmation_gate, so fault_spec here is
         # the APPROVED goal, not a pre-confirmation draft) and idempotent (only
-        # when absent, so the tool-maintained ledger on later turns is never
-        # clobbered). ``_ledger_seeded`` persists the fresh anchor in ``result``.
-        from chaos_agent.agent.progress_ledger import freeze_anchor
+        # when the anchor is absent, so the tool-maintained ledger on later
+        # turns is never clobbered). ``_ledger_seeded`` persists the seeded
+        # ledger in ``result``.
+        #
+        # "Absent" means the ANCHOR, not the whole ledger (tier1-speedup): the
+        # cross-graph bridge can deliver an intent-stage ledger here — facts
+        # the model recorded during clarification — which by design carries no
+        # anchor (``update_progress`` never writes one). Freezing only on an
+        # empty ledger would let that truthy-but-anchorless ledger silently
+        # disable anchor freezing for the whole execute/verify/recover run. So:
+        # seed the anchor while PRESERVING the intent-time state/log.
+        from chaos_agent.agent.progress_ledger import ANCHOR, LOG, STATE, freeze_anchor
         _ledger = state.get("progress_ledger")
         _ledger_seeded = False
-        if not _ledger:
+        # Non-dict corruption is treated as empty, matching merge/render's
+        # ``isinstance(Mapping)`` guards.
+        if not isinstance(_ledger, dict) or not _ledger:
             _spec_for_anchor = read_fault_spec(state)
             _ledger = freeze_anchor(
                 _spec_for_anchor.to_dict() if _spec_for_anchor else None,
                 goal=str(state.get("input") or ""),
             )
             _ledger_seeded = True
+        elif not (_ledger.get(ANCHOR) or {}):
+            _spec_for_anchor = read_fault_spec(state)
+            _frozen = freeze_anchor(
+                _spec_for_anchor.to_dict() if _spec_for_anchor else None,
+                goal=str(state.get("input") or ""),
+            )
+            _ledger = {
+                ANCHOR: _frozen[ANCHOR],
+                STATE: _ledger.get(STATE) or {},
+                LOG: _ledger.get(LOG) or [],
+            }
+            _ledger_seeded = True
+        else:
+            # Anchor present — reconcile its spec side against the CURRENT
+            # contract (cascade review C2, plan-A convergence point). The
+            # spec's legitimate change channels are structurally scattered
+            # (plan_change_confirm approval, tool_screener drift correction,
+            # agent_loop lazy derivation after a replan re-entry); patching
+            # each seam proved inexhaustible (O1 covered one of three).
+            # execute re-entry is the ONE point every changed spec must pass
+            # through, so the anchor realigns here before being rendered onto
+            # the execute/verify/recover message tails (context-cache-prefix-
+            # stability Unit A moved the ledger off the prompt heads; the
+            # reconciled anchor still reaches all three via state.progress_ledger,
+            # which each loop renders onto its tail). Goal/state/log untouched;
+            # no-drift → no write (None), keeping the result free of a
+            # needless override racing the model's update_progress.
+            from chaos_agent.agent.progress_ledger import reconcile_anchor_spec
+            _spec_now = read_fault_spec(state)
+            _reconciled = reconcile_anchor_spec(
+                _ledger, _spec_now.to_dict() if _spec_now else None,
+            )
+            if _reconciled is not None:
+                _ledger = dict(_reconciled)
+                _ledger_seeded = True  # persist via the same first-iteration channel below
+                logger.info(
+                    "anchor spec reconciled to current contract (drifted "
+                    "across a spec-change seam)",
+                )
 
         # 2. Call pre_reason_hook (memory compaction)
         hook_updates = {}
@@ -1705,8 +2577,11 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             # Persistence: ``_hints_for_state`` carries it into
             # ``result["messages"]`` (LangGraph state), and the direct write
             # below lands it in the task JSON immediately (the hook flush at
-            # the next pre_reason_hook sees the same message again — the
-            # session store's dedup key makes the double write idempotent).
+            # the next pre_reason_hook sees the same message again). This
+            # double write is INTENTIONAL (crash-safe archival before the
+            # node returns); it is idempotent ONLY because the message has
+            # an id from construction (B78) — see the session store's own
+            # id-stamping guard — so both serializations dedup to one entry.
             _kickoff = _maybe_build_phase2_kickoff(messages)
             if _kickoff is not None:
                 messages.append(_kickoff)
@@ -1730,6 +2605,29 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 _hints_for_state.append(_rejection_msg)
                 _rejection_consumed = True
 
+            # --- Progress ledger (drift anchor) — TAIL append, not the head ---
+            # context-cache-prefix-stability Unit A (tasks 2.2/2.3, design D1/D2):
+            # the ledger used to ride build_execute_system_prompt's head, so its
+            # per-round rewrite broke the provider cache prefix from the first
+            # changed byte. It now rides the message tail through the SAME
+            # append-only channel as the hints above (``messages.append`` +
+            # ``_hints_for_state``). A FRESH snapshot rides the tail every round
+            # (max recency for the anchor); ``build_ledger_tail_content`` prefixes
+            # it with a "supersedes earlier snapshots" marker so the stale copies
+            # append-only leaves in history can't mislead the model. NO stable id:
+            # a stable id would make add_messages replace the copy IN PLACE, pinning
+            # it at its first position — dragging it out of the recency tail AND
+            # reintroducing an early volatile byte that re-bills the whole suffix
+            # every round (measured: stable-prefix share decays 50%→41% as the loop
+            # grows, vs append's 63%→82%). Placed before the convergence hints so
+            # the terminal nudge stays outermost on the final iterations.
+            from chaos_agent.agent.progress_ledger import build_ledger_tail_content
+            _ledger_tail = build_ledger_tail_content(_ledger)
+            if _ledger_tail:
+                _ledger_msg = HumanMessage(content=wrap_system_reminder(_ledger_tail))
+                messages.append(_ledger_msg)
+                _hints_for_state.append(_ledger_msg)
+
             # --- Convergence hints (last-iteration conclusion prompts) ---
             messages.extend(_build_convergence_hints(
                 count, persist_into=_hints_for_state,
@@ -1739,7 +2637,6 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
             # prompt build extracted to _build_execute_system_prompt).
             execute_prompt, capability_context = await _build_execute_system_prompt(
                 state, task_id, skill_name, tools, skill_catalog, env_info, registry,
-                ledger=_ledger,
             )
             # On last iteration, unbind tools to force text conclusion
             if count >= MAX_EXECUTE_LOOP:
@@ -1775,6 +2672,13 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
 
         # 4. Build result
         result = {"execute_loop_count": count}
+        # Scan outcome → state. ``None`` is meaningful (clear the cycle);
+        # NO_CHANGE writes nothing (flag keeps its value, merge diff stays
+        # minimal). Written into ``result`` (not ``state``) so the merge
+        # publishes it AND the same iteration's interception gate — which
+        # reads the merged result view — sees the freshly registered flag.
+        if _reconcile_update is not _RECONCILE_NO_CHANGE:
+            result["create_reconcile"] = _reconcile_update
         if _rejection_consumed:
             result["_replan_review_rejection"] = None
 
@@ -1810,9 +2714,95 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         if experiment_uid and experiment_uid != state.get("experiment_uid"):
             result["experiment_uid"] = experiment_uid
             logger.info(f"Extracted experiment UID from ToolMessage: {experiment_uid}")
+            # Birth registry (B76 review G): record ownership the moment a UID
+            # is first seen — the same event that (legitimately) overwrites the
+            # single attribution slot. The slot is last-write-wins, so without
+            # this append a superseded experiment's liability claim is erased
+            # by the next create and becomes structurally un-recoverable (the
+            # message scan returns only the newest UID; the whitelist's durable
+            # source is that same slot). Append-only for the task lifetime.
+            _owned = list(state.get("owned_experiment_uids") or [])
+            if experiment_uid not in _owned:
+                _owned.append(experiment_uid)
+                result["owned_experiment_uids"] = _owned
+                # Round-32b — persist the combo discriminator at birth:
+                # False asserts "experiments born, no native companion
+                # (yet)" and lets a later BALANCED wing settle the row dead
+                # (may_carry_live_fault A2 — the C2 ghost fix). A combo
+                # mark overwrites it in either order (blade-first marks a
+                # later iteration; native-first's upgrade seam below in
+                # this same result dict writes True and the later write
+                # wins), and the store's upsert latch keeps a subsequent
+                # None flush from erasing either leg.
+                if not (
+                    state.get("combo_native_issued")
+                    or result.get("combo_native_issued")
+                ):
+                    result["combo_native_issued"] = False
             if not state.get("injection_start_time"):
                 result["injection_start_time"] = now_iso()
                 logger.info("Set injection_start_time (experiment UID first seen)")
+
+        # Birth registry plural face (round-26): the single-slot seam above
+        # registers ownership only for the uid that CHANGED the slot — a
+        # composite inline create (``blade create A && blade create B``)
+        # proves TWO births in one call and the single-slot scan surfaces
+        # only the first, so the second was born an orphan: never in
+        # ``owned_experiment_uids``, invisible to ``live_liability_uids``,
+        # unrecoverable by any sweep. Scan the plural face and append every
+        # un-owned birth. Idempotent against the ledger view (the single-slot
+        # append above may have already registered one of them — read the
+        # result's view first, it supersedes state).
+        _born = FaultProviderRegistry.extract_experiment_uids(
+            messages,
+            retired=state.get("retired_experiment_uids"),
+            is_host=is_host_scope_channel(state),
+        )
+        if _born:
+            _owned = list(
+                result.get("owned_experiment_uids")
+                or state.get("owned_experiment_uids")
+                or []
+            )
+            _unowned = sorted(uid for uid in _born if uid not in _owned)
+            if _unowned:
+                _owned.extend(_unowned)
+                result["owned_experiment_uids"] = _owned
+                # Round-32b — same birth assertion as the single-slot seam
+                # above: the plural face births UIDs the single face never
+                # fired on (the slot already held one of them).
+                if not (
+                    state.get("combo_native_issued")
+                    or result.get("combo_native_issued")
+                ):
+                    result["combo_native_issued"] = False
+                logger.info(
+                    "Birth registry (plural): %s proven born",
+                    ", ".join(_unowned),
+                )
+
+        # Death registration (B76 review I1): mirror twin of the birth
+        # registry above. An LLM-issued destroy's death proof lives ONLY in
+        # messages (the AIMessage tool_call + its paired ToolMessage), which
+        # compaction summarises away and the recover bridge resets — so the
+        # moment a PROVEN kill is visible in this turn's history, it must
+        # land in the durable retired ledger (LLM-side blade_destroy has no
+        # framework-side ToolMessage; only this seam records it). Idempotent:
+        # the append is filtered against the current ledger view, and
+        # ``live_liability_uids`` already subtracts the ledger.
+        _proven_dead = FaultProviderRegistry.destroyed_proven_experiment_ids(messages)
+        if _proven_dead:
+            _retired = list(state.get("retired_experiment_uids") or [])
+            _unrecorded = [
+                uid for uid in _proven_dead if uid not in _retired
+            ]
+            if _unrecorded:
+                _retired.extend(_unrecorded)
+                result["retired_experiment_uids"] = _retired
+                logger.info(
+                    "Death registry: %s proven destroyed (paired tool output)",
+                    ", ".join(_unrecorded),
+                )
 
         # Detect injection method for verifier Layer 1 strategy selection.
         # Direction B: injection_method is recorded at ISSUE time (channel A) by
@@ -1843,9 +2833,20 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
         )
 
         if not _revoked and _should_redetect_injection_method(current_injection_method, experiment_uid):
+            # Teardown ≠ fault mutation, on the history side too (R8-1):
+            # P3 threads the ``is_teardown`` matcher into the re-scan — a
+            # registered-vehicle cleanup delete in the epoch must not
+            # resurrect the attribution channel A correctly skipped
+            # (call-level skip, mixed batches included; the epoch bound
+            # still scopes out pre-seam attempts).
+            from chaos_agent.agent.execution_artifacts import make_teardown_matcher
+
             detected_method = _detect_injection_method(
                 _epoch_bounded_messages(messages, state),
                 is_host=is_host_scope_channel(state),
+                is_teardown=make_teardown_matcher(
+                    state.get("execution_artifacts") or []
+                ),
             )
             if detected_method and detected_method != current_injection_method:
                 _new_provider = FaultProviderRegistry.resolve_by_method(detected_method)
@@ -1929,6 +2930,19 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                     result["injection_start_time"] = now_iso()
                     logger.info("Set injection_start_time (%s detected)", detected_method or current_injection_method)
 
+        # Post-landing readback guard (faultdrill-cr-channel task 2.1,
+        # design D5): a freshly-landed carrier apply is integrity-verified
+        # programmatically on THIS iteration — see
+        # :func:`_landing_readback_guard` for the hard-abort law.
+        await _landing_readback_guard(state, result, messages)
+
+        # Session-reconciler arming (faultdrill-cr-channel task 2.2,
+        # design D4): a PASSING readback verdict arms the background
+        # reconcile loop — the handle comes from the same bookkeeping the
+        # guard wrote, so a stripped landing (hard abort above) never
+        # arms. See :func:`_arm_fault_reconciler`.
+        _arm_fault_reconciler(state, result)
+
         # Extract kubectl exec injection pod name for verifier preference
         current_pod_name = state.get("kubectl_exec_pod_name")
         if not current_pod_name:
@@ -1988,21 +3002,59 @@ def make_execute_loop(hook=None, llm=None, tools=None, skill_catalog="", env_inf
                 record_ai_message(hook, state, response, node_name=EXECUTE_LOOP)
                 log_reasoning_content(response, "Execute loop", count)
             else:
-                result["messages"] = _hints_for_state + [response]
-                if _hint_counts and _hint_counts != (state.get("hint_repeat_counts") or {}):
-                    result["hint_repeat_counts"] = _hint_counts
-                # Clear at the source every non-truncated turn: a flag left set
-                # by a turn that exited via replan/end (bypassing the screener
-                # that consumes it) must not reach a later, healthy batch.
-                result["truncated_tool_calls"] = False
+                # Create-reconcile gate (blade-create-reconcile-before-retry
+                # D6): judge the batch's gate-armed create calls against the
+                # registered flag BEFORE the response is published. Merged
+                # view — the same iteration's top-of-loop scan may have
+                # just registered the flag into ``result``.
+                if "create_reconcile" in result:
+                    _gate_flag = result["create_reconcile"]
+                else:
+                    _gate_flag = state.get("create_reconcile")
+                from chaos_agent.agent.nodes.execute._reconcile_gate import (
+                    apply_reconcile_gate,
+                )
+                _gate_outcome = await apply_reconcile_gate(
+                    response, state.get("messages", []), _gate_flag,
+                    tracker=tracker,
+                    kubeconfig=kubeconfig, task_id=task_id,
+                )
+                if _gate_outcome is not None:
+                    _gate_answers, _gate_flag_after = _gate_outcome
+                    # Whole batch held: fabricated answers replace
+                    # execution, the screener routes back here (never the
+                    # ToolNode), and the issue-time bookkeeping below is
+                    # skipped — none of these calls will run.
+                    result["messages"] = _hints_for_state + [response] + _gate_answers
+                    if _hint_counts and _hint_counts != (state.get("hint_repeat_counts") or {}):
+                        result["hint_repeat_counts"] = _hint_counts
+                    result["truncated_tool_calls"] = False
+                    result["_reconcile_gate_blocked"] = True
+                    result["create_reconcile"] = _gate_flag_after
+                    record_ai_message(hook, state, response, node_name=EXECUTE_LOOP)
+                    log_reasoning_content(response, "Execute loop", count)
+                    logger.info(
+                        "create_reconcile gate: held a same-fingerprint "
+                        "create batch (blocked_count=%d)",
+                        _gate_flag_after.get("blocked_count"),
+                    )
+                else:
+                    result["messages"] = _hints_for_state + [response]
+                    if _hint_counts and _hint_counts != (state.get("hint_repeat_counts") or {}):
+                        result["hint_repeat_counts"] = _hint_counts
+                    # Clear at the source every non-truncated turn: a flag left set
+                    # by a turn that exited via replan/end (bypassing the screener
+                    # that consumes it) must not reach a later, healthy batch.
+                    result["truncated_tool_calls"] = False
+                    result["_reconcile_gate_blocked"] = False
 
-                # Immediately save AI message (including reasoning_content) to session
-                record_ai_message(hook, state, response, node_name=EXECUTE_LOOP)
+                    # Immediately save AI message (including reasoning_content) to session
+                    record_ai_message(hook, state, response, node_name=EXECUTE_LOOP)
 
-                # Diagnostic log for reasoning_content presence
-                log_reasoning_content(response, "Execute loop", count)
+                    # Diagnostic log for reasoning_content presence
+                    log_reasoning_content(response, "Execute loop", count)
 
-                _process_response_tool_calls(response, state, result, tracker, count)
+                    _process_response_tool_calls(response, state, result, tracker, count)
 
         from chaos_agent.memory.hook import merge_hook_updates
         merge_hook_updates(result, hook_updates)

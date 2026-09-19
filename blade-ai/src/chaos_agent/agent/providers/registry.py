@@ -34,9 +34,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
-from chaos_agent.agent.providers.base import FaultProvider
+from chaos_agent.agent.providers.base import DestroyOutcome, FaultProvider
 
 if TYPE_CHECKING:
+    from chaos_agent.tools.request_identity import RequestFingerprint
     from chaos_agent.agent.target_guard.types import EffectiveTarget
 
 logger = logging.getLogger(__name__)
@@ -350,6 +351,56 @@ class FaultProviderRegistry:
         )
 
     @classmethod
+    def is_blade_exec_create_delivery(cls, command: object) -> bool:
+        """Domain-routing seam for the blade-exec create-delivery syntax
+        judgement (round-15 root fix).
+
+        The kubectl-native attribution scans need to EXCLUDE blade-exec
+        creates from their native-attribution paths; the judgement itself
+        is blade-carrier vocabulary (``chaosblade/verify.classify_blade_exec_payload``
+        — command-position syntax, the replacement for the eleven
+        copy-pasted word-containment gates a composite decoy payload used
+        to pass). Reaching it through the registry keeps the no-cross-
+        -carrier-import rule (phase-14 G3 pattern) while
+        ``providers.message_scanning`` stays carrier-agnostic: its scan
+        functions take the judgement as an ``is_blade_create_delivery``
+        parameter, injected by their callers.
+        """
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            classify_blade_exec_payload,
+        )
+
+        return classify_blade_exec_payload(command).has_create
+
+    @classmethod
+    def is_blade_exec_destroy_delivery(cls, command: object) -> bool:
+        """Domain-routing seam for the blade-exec DEMOLITION-delivery
+        syntax judgement (R25/G-8).
+
+        The machinery≠mutation predicate needs to exempt an exec carrying
+        a PURE blade destroy/revoke (the kubelet-stall case's preferred
+        recovery through the tool pod; the re-arm protocol's teardown
+        half); the judgement is blade-carrier vocabulary
+        (``chaosblade/verify.classify_blade_exec_payload`` —
+        command-position syntax, segment-level, wrapper-tolerant). The
+        seam answers ``has_destroy and not has_create``: a create segment
+        in the same payload keeps it attributed (a REAL experiment
+        delivery, whose issue-time claim belongs to the provider's own
+        hook anyway). The CALLER owns the fault-binary withhold (the
+        k8s classifier's ``fault_binary_mutation`` flag — G-9 makes it
+        segment-level), the same single flag the CHANNEL face withholds
+        on. Reaching the judgement through the registry keeps the
+        no-cross-carrier-import rule (phase-14 G3 pattern) while
+        ``execution_artifacts`` stays carrier-agnostic.
+        """
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            classify_blade_exec_payload,
+        )
+
+        payload = classify_blade_exec_payload(command)
+        return payload.has_destroy and not payload.has_create
+
+    @classmethod
     def parse_injection_params(cls, tool_name: str, tool_args: dict) -> "dict | None":
         """Structured injection parameters for a freshly issued tool call,
         parsed by the first provider that recognises the call, else ``None``.
@@ -402,6 +453,247 @@ class FaultProviderRegistry:
                 return method
         return None
 
+    @classmethod
+    async def verify_landing_readback(
+        cls,
+        messages: list,
+        state: dict,
+        *,
+        kubeconfig: str = "",
+    ) -> Optional[dict]:
+        """Post-landing readback guard, enacted by the first provider that
+        recognises a freshly-landed carrier apply in ``messages``, else
+        ``None``.
+
+        Readback seam (faultdrill-cr-channel task 2.1, design D5): the
+        execute loop consults the registry in its post-execution block,
+        AFTER the landing tool result is visible in history — each
+        backend recognises its own landed forms and runs its own
+        landing-integrity check PROGRAMMATICALLY, never on an LLM turn
+        (a prompt-layer readback is observation, not a guard; safety
+        rails are not delegable). A provider returning ``None`` means
+        "nothing of mine to verify" — the scan continues. Providers that
+        omit the hook contribute nothing (getattr default).
+        """
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            hook = getattr(provider, "verify_landing_readback", None)
+            if hook is None:
+                continue
+            verdict = await hook(messages, state, kubeconfig=kubeconfig)
+            if verdict is not None:
+                return verdict
+        return None
+
+    @classmethod
+    async def ensure_crd(cls, kubeconfig: str = "") -> Optional[dict]:
+        """Channel-installability seam (faultdrill-cr-channel, design
+        D2/D7): the CR-channel route gate consults this BEFORE admitting
+        a FaultDrill CR apply — the first legitimate CR write triggers
+        the channel's own lazy install (probe → programmatic apply →
+        Established poll), never an LLM-triggered CRD apply. Providers
+        that omit the hook contribute nothing (getattr default — every
+        backend but the CR channel: installability is a channel
+        capability, not a universal contract like the readback guard).
+        Returns the availability verdict as a provider-neutral dict
+        (``usable`` / ``status`` / ``reason`` / ``detail``); ``None``
+        when no registered provider claims the install responsibility
+        (the dark-launch window never gets here — the route gate
+        rejects on the flag before consulting this seam).
+        """
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            hook = getattr(provider, "ensure_crd", None)
+            if hook is None:
+                continue
+            verdict = await hook(kubeconfig)
+            if verdict is not None:
+                return verdict
+        return None
+
+    @classmethod
+    def arm_session_reconciler(
+        cls, handle_value: str, kubeconfig: str = ""
+    ) -> bool:
+        """Arm the session-side reconcile loop for a verified carrier
+        landing; ``True`` when a provider took the arm.
+
+        Reconciler-arming seam (faultdrill-cr-channel task 2.2, design
+        D4): the execute loop calls this with the handle the readback
+        guard just verified (``state["fault_readback_verified"]`` — the
+        bookkeeping written ONLY on a passing verdict, so a stripped
+        landing never arms: the hard abort leaves the loop first).
+        Providers that omit the hook (every backend but the CR channel
+        — a session-side reconciler is a carrier capability, not a
+        universal contract like the readback guard) contribute nothing
+        (getattr default). Arming is idempotent per handle — a live
+        reconciler re-reads the CR every pass, so re-arms are no-ops.
+        """
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            hook = getattr(provider, "arm_session_reconciler", None)
+            if hook is None:
+                continue
+            if hook(handle_value, kubeconfig):
+                return True
+        return False
+
+    @classmethod
+    def collect_provider_artifacts(
+        cls, messages: list, *, task_id: str = "", operation_family: str = "",
+    ) -> list[dict]:
+        """Carrier-owned artifact facts discovered from messages — AGGREGATED.
+
+        Artifact-ledger seam (faultdrill-cr-channel task 2.6): a carrier
+        that rides the standard kubectl face (e.g. the FaultDrill CR
+        apply) discovers its own landed objects from the tool history,
+        claim-based — the artifact layer stays free of carrier-specific
+        imports and vocabulary. Unlike the first-claim-wins seams, this
+        one AGGREGATES: several carriers may each own artifacts in the
+        same history, and the ledger records the full set (the fault
+        handle is latest-wins; a rename-retry's early object must not be
+        orphaned — review P11). Providers that omit the hook contribute
+        nothing (getattr default).
+        """
+        if not cls._providers:
+            cls.register_builtins()
+        artifacts: list[dict] = []
+        for provider in cls._providers.values():
+            hook = getattr(provider, "collect_artifacts_from_messages", None)
+            if hook is None:
+                continue
+            artifacts.extend(
+                hook(
+                    list(messages or []),
+                    task_id=task_id,
+                    operation_family=operation_family,
+                )
+            )
+        return artifacts
+
+    @classmethod
+    async def sweep_artifact(
+        cls, artifact: Any, *, kubeconfig: str = "", task_id: str = "",
+    ) -> "Optional[bool]":
+        """Claim-based single-artifact sweep; ``None`` when unowned.
+
+        Sweep seam (faultdrill-cr-channel task 2.6): the owning carrier
+        decides its own artifact's lifecycle — keep-while-Injected for
+        the CR channel (an Injected CR is still firing; deleting it
+        mid-window would be an early recovery, and the reconciler
+        deliberately leaves a Recovered CR's OBJECT in place, making this
+        sweep its sweeper of record). ``True`` = settled (mark cleaned),
+        ``False`` = keep (re-examined next round), ``None`` = no provider
+        claimed it (the artifact stays untouched). First claim wins — an
+        artifact has exactly one owning carrier.
+        """
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            hook = getattr(provider, "sweep_artifact", None)
+            if hook is None:
+                continue
+            outcome = await hook(
+                artifact, kubeconfig=kubeconfig, task_id=task_id,
+            )
+            if outcome is not None:
+                return outcome
+        return None
+
+    @classmethod
+    def build_reconcile_fingerprint(
+        cls, tool_name: str, tool_args: Any
+    ) -> "Optional[RequestFingerprint]":
+        """Create-reconcile request identity for a create tool call, built
+        by the first provider that recognises the call, else ``None``.
+
+        Create-reconcile seam (blade-create-reconcile-before-retry D6):
+        the generic gate (``agent/nodes/execute/_reconcile_gate.py``) owns
+        the three-state scan / interception / release / cap state machine
+        and consults this seam for the judgment material — which argument
+        keys form the four-dimension request identity (the same
+        construction safety_check's conflict query consumes) and how the
+        raw LLM argument shapes normalise is carrier knowledge. A provider
+        returning ``None`` means "not my create tool" — the scan
+        continues. Providers that omit the hook contribute nothing
+        (getattr default)."""
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            hook = getattr(provider, "build_reconcile_fingerprint", None)
+            if hook is None:
+                continue
+            fp = hook(tool_name, tool_args)
+            if fp is not None:
+                return fp
+        return None
+
+    @classmethod
+    async def reconcile_hold_feedback(
+        cls,
+        tool_name: str,
+        fp: "RequestFingerprint",
+        hold_count: int,
+        block_limit: int,
+        kubeconfig: str = "",
+        task_id: str = "",
+    ) -> Optional[tuple[str, bool]]:
+        """Interception-time cluster probe plus hold-feedback text for a
+        held create retry, composed by the first provider that recognises
+        the create tool, else ``None``.
+
+        Returns ``(feedback_text, counts_as_reconciliation)``: the probe —
+        which cluster query answers "is my uncertain create already in
+        effect", and which scopes cannot be probed at all — and the
+        feedback text (naming the carrier's reconciliation tools) are
+        carrier judgment material, hence a hook; the generic gate only
+        threads the outcome into its flag (``gate_reconciled``) and
+        fabricated answers. A provider returning ``None`` means "not my
+        create tool" — the scan continues. Providers that omit the hook
+        contribute nothing (getattr default)."""
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            hook = getattr(provider, "reconcile_hold_feedback", None)
+            if hook is None:
+                continue
+            outcome = await hook(
+                tool_name, fp, hold_count, block_limit,
+                kubeconfig=kubeconfig, task_id=task_id,
+            )
+            if outcome is not None:
+                return outcome
+        return None
+
+    @classmethod
+    def reconcile_batch_held_feedback(
+        cls, tool_name: str, other_tool_name: str
+    ) -> Optional[str]:
+        """Fabricated notice for the OTHER calls of a batch held back
+        together with a held create, composed by the provider whose create
+        tool held the batch, else ``None``.
+
+        The text names the carrier's reconciliation tools (carrier
+        judgment material), so it is a hook rather than a generic template;
+        it must carry the "was NOT executed" wording so the generic
+        three-state scan treats it as never-executed. A provider returning
+        ``None`` means "not my create tool" — the scan continues.
+        Providers that omit the hook contribute nothing (getattr
+        default)."""
+        if not cls._providers:
+            cls.register_builtins()
+        for provider in cls._providers.values():
+            hook = getattr(provider, "reconcile_batch_held_feedback", None)
+            if hook is None:
+                continue
+            text = hook(tool_name, other_tool_name)
+            if text is not None:
+                return text
+        return None
+
     # -- built-in backends + detection orchestration -----------------------
 
     @classmethod
@@ -444,8 +736,38 @@ class FaultProviderRegistry:
         ):
             cls.register(provider_cls())
 
+        # FaultDrill CR channel (openspec faultdrill-cr-channel) — registered
+        # LAST and gated by ``faultdrill_enabled`` (dark launch, default
+        # False). Order-insensitive like chaosblade_python: this backend
+        # claims no verb/tool vocabulary (attribution keys on the stdin
+        # manifest DOCUMENT KIND, which no other backend scans), so it never
+        # competes for recency — it can only ever win by positive evidence.
+        # When the flag is off the channel does not exist structurally:
+        # there is no runtime faultdrill branch anywhere in the graph.
+        from chaos_agent.config.settings import settings
+
+        if bool(getattr(settings, "faultdrill_enabled", False)):
+            from chaos_agent.agent.providers.faultdrill.provider import (
+                FaultDrillProvider,
+            )
+
+            cls.register(FaultDrillProvider())
+        else:
+            # Flag off — reconcile DOWN too, never leave a stale registration
+            # behind a re-register: ``register`` overwrites but never removes,
+            # so the dark-launch invariant (channel structurally absent) is
+            # this pop, not just the skipped register above.
+            from chaos_agent.agent.providers.faultdrill.declaration import (
+                CARRIER_ID as _FAULTDRILL_CARRIER_ID,
+            )
+
+            if cls._providers.pop(_FAULTDRILL_CARRIER_ID, None) is not None:
+                cls._reindex()
+
     @classmethod
-    def detect_method(cls, messages: list, *, is_host: bool) -> Optional[str]:
+    def detect_method(
+        cls, messages: list, *, is_host: bool, is_teardown=None,
+    ) -> Optional[str]:
         """Resolve the runtime ``injection_method`` by RECENCY, not raw
         precedence: among channel-scoped providers that recognise their carrier
         in ``messages``, the one whose injection evidence is MOST RECENT wins.
@@ -477,7 +799,9 @@ class FaultProviderRegistry:
         for rank, provider in enumerate(cls._providers.values()):
             if not provider.matches_channel(profile):
                 continue
-            method = provider.detect(messages, is_host=is_host)
+            method = provider.detect(
+                messages, is_host=is_host, is_teardown=is_teardown,
+            )
             if not method:
                 continue
             # Recency is the message index of this provider's injection
@@ -486,7 +810,9 @@ class FaultProviderRegistry:
             # registration-order rank below (legacy precedence behaviour).
             recency_fn = getattr(provider, "injection_recency", None)
             recency = (
-                recency_fn(messages, is_host=is_host) if recency_fn is not None else 0
+                recency_fn(messages, is_host=is_host, is_teardown=is_teardown)
+                if recency_fn is not None
+                else 0
             )
             # Higher recency wins; equal recency → lower rank (earlier
             # registration precedence) wins via ``-rank``.
@@ -705,6 +1031,49 @@ class FaultProviderRegistry:
         return ""
 
     @classmethod
+    def extract_experiment_uids(
+        cls, messages: list, retired=None, *, is_host: bool
+    ) -> set[str]:
+        """EVERY live experiment id born in ``messages`` — the UNION across
+        channel-compatible UID-bearing providers (round-26 birth face).
+
+        The single-slot seam above stays first-match ("which experiment is
+        current"); this seam answers the ownership ledger's question —
+        "which experiments does this task own" — where a composite inline
+        create can prove MULTIPLE births in one call and every one of them
+        is a liability the sweep must be able to recover. Union, not
+        first-match: ownership is additive (a provider claiming a birth
+        never invalidates another provider's claim).
+
+        Providers without an explicit plural face
+        (``extract_experiment_ids``) contribute their singular extraction
+        wrapped in a set — an upgrade path, not a protocol break: every
+        UID-bearing provider that has not pluralised yet still registers
+        the birth its single-slot scan surfaces."""
+        if not cls._providers:
+            cls.register_builtins()
+        from chaos_agent.transports import PROFILE_HOST, PROFILE_K8S
+
+        profile = PROFILE_HOST if is_host else PROFILE_K8S
+        born: set[str] = set()
+        for provider in cls._providers.values():
+            if not provider.has_experiment_uid:
+                continue
+            if not provider.matches_channel(profile):
+                continue
+            plural = getattr(provider, "extract_experiment_ids", None)
+            if plural is not None:
+                born |= {uid for uid in plural(messages, retired) if uid}
+                continue
+            extract = getattr(provider, "extract_experiment_id", None)
+            if extract is None:
+                continue
+            uid = extract(messages, retired)
+            if uid:
+                born.add(uid)
+        return born
+
+    @classmethod
     def created_experiment_ids(cls, messages: list, state: dict) -> set[str]:
         """Provenance union: every experiment id ANY provider proves this task
         created (each backend scans its own create results and claims its own
@@ -748,6 +1117,180 @@ class FaultProviderRegistry:
                 continue
             uids.update(scan(messages))
         return uids
+
+    @classmethod
+    def destroyed_proven_experiment_ids(cls, messages: list) -> set[str]:
+        """PROVEN-death union: destroys whose PAIRED tool output confirms
+        success — the death-registration feed for the liability ledger (B76
+        review I1).
+
+        Stricter twin of :meth:`destroyed_experiment_ids`: that seam's
+        "issued = terminal" is the right CONSERVISM for attribution (an
+        attempted destroy must stop the UID being re-claimed as the live
+        fault), but the retire LEDGER needs a higher bar — retirement
+        excludes a UID from every live-liability read, so a false entry
+        hides a LIVE experiment (strictly worse than the orphan the sweep
+        exists to prevent). Hence: only an output-proven death registers,
+        and the scan covers BOTH delivery forms (the ``blade_destroy`` tool
+        and the kubectl-exec ``blade destroy`` vehicle the issued-scan
+        cannot see — I1c). Providers that omit the hook contribute nothing.
+        """
+        if not cls._providers:
+            cls.register_builtins()
+        uids: set[str] = set()
+        for provider in cls._providers.values():
+            if not provider.has_experiment_uid:
+                continue
+            scan = getattr(provider, "destroyed_proven_experiment_ids", None)
+            if scan is None:
+                continue
+            uids.update(scan(messages))
+        return uids
+
+    @classmethod
+    async def sweep_live_liabilities(
+        cls, values: dict, *, exclude_uid: str = "",
+    ) -> tuple[list[str], list[str]]:
+        """Destroy every live liability experiment except ``exclude_uid``
+        (B76 review G — the liability-axis safety net).
+
+        ``exclude_uid`` is a CALLER-OWNED policy, not a mechanism promise:
+        exempt a UID only when its destroy is already proven elsewhere. The
+        recover finale gates the identity UID's exemption on the Layer-1
+        verdict (``_sweep_exempts_identity_uid``) — a failed main-flow
+        destroy must not be exempted, or the net orphans the experiment it
+        exists to catch (B76 review M2, the exempt orphan).
+
+        The single ``experiment_uid`` slot is last-write-wins (correct for
+        attribution), so a superseded experiment's recovery claim is erased
+        the moment a newer create lands; this sweep is the carrier-neutral
+        seam where the append-only birth registry (:func:`live_liability_uids`)
+        turns back into real destroys. Ridden by every seam that owes a
+        SETTLEMENT obligation (the settlement-action manifest,
+        tests/test_agent/test_settlement_action_manifest.py — a new
+        cleanup/rollback seam that dispatches its own singular destroy
+        is a domain violation, not a simplification): the plan-change
+        approval (contract-boundary serialization — the old contract's
+        experiments must not run under the new one), the recover finale
+        (the last point where the framework still holds the full
+        ownership record), the failure-path auto-rollback (round-30),
+        and the verify-replan residual cleanup (round-31 — the replan's
+        fresh verification must not run under the residual fault).
+
+        Deterministic destroy through the dispatched carrier's execution
+        domain; a SUCCESSFUL destroy retires (the CALLER appends to
+        ``retired_experiment_uids`` — a framework-side destroy leaves no
+        ToolMessage in history), a FAILED one keeps the UID in the liability
+        set so the next sweep / a re-run recover retries it.
+
+        Kubeconfig (round-32, K1): the destroy resolves through the
+        graph-wide three-level fallback
+        (:func:`chaos_agent.agent.kubeconfig.resolve_kubeconfig` —
+        state > spec > settings), the SAME contract the injection chain's
+        create runs under — a destroy dispatched under a different config
+        than its create targets a different cluster and the liability can
+        never clear. A caller may therefore pass bare state (the CORRECT
+        form — the empty CLI key falls through to spec/settings) or merge
+        its own resolved value (idempotent: the resolver returns a
+        non-empty state value unchanged).
+
+        Returns ``(retired_new, failures)``; failures are ``uid: reason``
+        lines for the caller's warning surface.
+        """
+        from chaos_agent.agent.state import live_liability_uids
+        from chaos_agent.agent.kubeconfig import resolve_kubeconfig
+
+        # Death-registration absorption (B76 review I1c): the sweep is the
+        # framework's convergence point — absorb the message-side PROVEN
+        # deaths into the LOCAL retired view FIRST, so the live set it
+        # computes reflects kills the LLM flow already achieved (notably the
+        # kubectl-exec vehicle whose destroy calls the issued-scan cannot
+        # see). Local view only: the durable write side is execute_loop's
+        # registration seam (and the callers' retire appends); this
+        # absorption additionally covers histories that seam never saw
+        # (sessions recovered before the seam existed, LLM destroys inside
+        # THIS graph's own Layer-1 flow). Since B76 review J1 the liability
+        # view itself applies the same PROVEN filter internally, making this
+        # block belt-and-suspenders — kept because the absorbed view is also
+        # what the dispatch/blocking reads below see.
+        _proven = cls.destroyed_proven_experiment_ids(
+            values.get("messages") or [],
+        )
+        if _proven:
+            _retired_view = (
+                set(values.get("retired_experiment_uids") or []) | _proven
+            )
+            values = {**values, "retired_experiment_uids": sorted(_retired_view)}
+
+        residuals = [
+            uid for uid in live_liability_uids(values) if uid != exclude_uid
+        ]
+        if not residuals:
+            return [], []
+        provider, _identity = cls.resolve_fault_dispatch(values)
+        if provider is None or not provider.has_experiment_uid:
+            return [], [f"{uid}: no experiment carrier dispatched" for uid in residuals]
+        if provider.blocks_deterministic_destroy(values, values.get("messages") or []):
+            # In-cluster delivery: the host-side destroy cannot reach a
+            # CRD-created experiment ("record not found") and a soft failure
+            # must not falsely retire a LIVE experiment — surface the UIDs
+            # instead; the kubectl-exec destroy is the LLM flow's vehicle.
+            return [], [
+                f"{uid}: in-cluster delivery — destroy via "
+                "`kubectl exec <tool-pod> -- blade destroy <uid>`"
+                for uid in residuals
+            ]
+        # Config-domain alignment (round-32, K1): NOT a bare state read —
+        # the state key is routinely empty on the CLI entry
+        # (``kwargs.get("kubeconfig", "")``), and a bare read silently
+        # re-homed every settlement destroy onto blade's own default
+        # cluster; resolving through the shared fallback keeps the destroy
+        # on the cluster its create ran under.
+        kubeconfig = resolve_kubeconfig(values)
+        retired_new: list[str] = []
+        failures: list[str] = []
+        for uid in residuals:
+            try:
+                out = await provider.layer1_raw_destroy(uid, kubeconfig)
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"{uid}: {e}")
+                continue
+            # Single-source three-state verdict: the carrier's classifier
+            # is the ONE decision source (this seam's own prefix table was
+            # the third table judging the same output — deleted; a non-JSON
+            # no-keyword output used to retire here while the authority's
+            # predicate kept it live). A carrier without the hook is
+            # fail-closed FAILED — the UID surfaces, never silently retires.
+            classify = getattr(provider, "classify_destroy_output", None)
+            outcome = (
+                classify(str(out or ""))
+                if classify is not None
+                else DestroyOutcome.FAILED
+            )
+            if outcome is DestroyOutcome.SUCCESS:
+                retired_new.append(uid)
+                continue
+            if outcome is DestroyOutcome.NOT_FOUND:
+                # Convergence valve (B76 review I2/I2b): a repeat-destroy of
+                # an already-dead experiment surfaces record-not-found (the
+                # local-DB record is gone) — without an escape the UID NEVER
+                # retires and every re-run recover repeats the same
+                # destroy+failure forever. The carrier gets one chance to
+                # PROVE the death through its status check (the same layer
+                # ``run_layer1_destroy``'s destroy-failed fallback already
+                # trusts); any doubt keeps the failure — fail-closed, the
+                # warning surface is the honest verdict.
+                _status_check = getattr(provider, "experiment_destroyed", None)
+                if _status_check is not None and await _status_check(
+                    uid, kubeconfig,
+                ):
+                    retired_new.append(uid)
+                    continue
+            failures.append(
+                f"{uid}: {str(out or '').strip()[:120] or '(empty destroy output)'}"
+            )
+            continue
+        return retired_new, failures
 
     @classmethod
     def recover_experiment_uid_from_session(

@@ -1,6 +1,7 @@
 """Tests for recover_verifier node: two-layer post-recovery verification."""
 
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -352,14 +353,14 @@ class TestRecoverVerifierNoLLM:
                 "kubeconfig": "",
                 "messages": [
                     ToolMessage(
-                        content='{"code":200,"success":true,"result":"uid-mh"}',
+                        content='{"code":200,"success":true,"result":"a1b2c3d4e5f60719"}',
                         name="blade_create", tool_call_id="c1",
                     ),
                 ],
             }
             result = await recover_verifier(state)
             assert mock_l1.await_count == 1
-            assert mock_l1.await_args.args[0] == "uid-mh"
+            assert mock_l1.await_args.args[0] == "a1b2c3d4e5f60719"
             assert result["result"]["recovered"] is True
 
 
@@ -486,6 +487,131 @@ class TestMakeRecoverVerifier:
             assert fin["recover_verification"]["level"] == "recovered"
 
     @pytest.mark.asyncio
+    async def test_ledger_rides_tail_not_system_head(self):
+        """Unit A (context-cache-prefix-stability tasks 2.5/2.7): the recover
+        progress ledger rides the message TAIL as an append-only system-reminder
+        HumanMessage carrying a supersedes marker — NOT the recover verifier
+        system head (whose per-round ledger rewrite broke the cache prefix).
+
+        Node-level complement to test_prefix_stability.py's
+        TestRecoverVerifierPrefixStability builder guard: that one proves the
+        head is byte-stable across ledger growth; this one proves the ledger
+        still reaches the model every round, at the tail, and persists.
+        """
+        from langchain_core.messages import SystemMessage
+        from chaos_agent.agent.progress_ledger import (
+            freeze_anchor,
+            merge_progress_ledger,
+        )
+
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_response.tool_calls = [
+            {"name": "kubectl", "args": {"subcommand": "get", "v_args": "pods -n default"}}
+        ]
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+        # Production recover inherits the anchor frozen during execute, so the
+        # recover ledger is ANCHORED — the tail must render the anchored
+        # directive variant ("...MUST serve its immutable ANCHOR..."), NOT the
+        # no-anchor one planning uses. Pinning the anchored shape here keeps the
+        # test faithful to the real recover path (the old no-anchor fixture
+        # silently rendered the other variant while its "before acting"
+        # assertion — shared by BOTH variants — still passed).
+        ledger = merge_progress_ledger(
+            freeze_anchor(
+                {"scope": "pod", "fault_target": "cpu", "fault_action": "fullload",
+                 "namespace": "default", "names": ["p0"]},
+                goal="inject cpu fullload on pod p0",
+            ),
+            log_append=[{"event": "LEDGER-TAIL-MARK step done", "status": "verified"}],
+        )
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "cpu-stress",
+                "kubeconfig": "",
+                "verifier_loop_count": 2,
+                "layer2_context_added": True,
+                "recover_phase": "layer2_verification",
+                "progress_ledger": ledger,
+                "messages": [],
+            }
+            result = await node(state)
+
+        sent = mock_llm.ainvoke.call_args[0][0]
+        # The system head must NOT carry the ledger anymore (that per-round
+        # rewrite was the volatile byte that broke the recover cache prefix).
+        for sm in [m for m in sent if isinstance(m, SystemMessage)]:
+            assert "LEDGER-TAIL-MARK" not in (sm.content or "")
+            assert "progress ledger below" not in (sm.content or "")
+        # The ledger rides the TAIL as a system-reminder HumanMessage.
+        tails = [
+            m for m in sent
+            if isinstance(m, HumanMessage) and "LEDGER-TAIL-MARK" in (m.content or "")
+        ]
+        assert len(tails) == 1, "exactly one ledger snapshot must ride the tail"
+        content = tails[0].content or ""
+        assert content.lstrip().startswith("<system-reminder>")
+        assert "supersedes" in content      # D2 marker
+        assert "before acting" in content    # anti-drift directive survives
+        # ...and it is the ANCHORED variant specifically ("immutable ANCHOR" is
+        # unique to _LEDGER_DIRECTIVE; the no-anchor variant instead says
+        # "do not re-derive what is already established").
+        assert "immutable ANCHOR" in content
+        assert "do not re-derive" not in content
+        # Persisted into LangGraph state (append-only) via result_update.
+        persisted = [
+            m for m in result.get("messages", [])
+            if isinstance(m, HumanMessage) and "LEDGER-TAIL-MARK" in (m.content or "")
+        ]
+        assert len(persisted) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_tail_when_ledger_empty(self):
+        """Empty ledger → the tail message is suppressed (no empty
+        system-reminder noise)."""
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_response.tool_calls = [
+            {"name": "kubectl", "args": {"subcommand": "get", "v_args": "pods -n default"}}
+        ]
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "cpu-stress",
+                "kubeconfig": "",
+                "verifier_loop_count": 2,
+                "layer2_context_added": True,
+                "recover_phase": "layer2_verification",
+                "progress_ledger": None,
+                "messages": [],
+            }
+            result = await node(state)
+        sent = mock_llm.ainvoke.call_args[0][0]
+        assert not [
+            m for m in sent
+            if isinstance(m, HumanMessage) and "LEDGER-TAIL-MARK" in (m.content or "")
+        ]
+        assert not [
+            m for m in result.get("messages", [])
+            if isinstance(m, HumanMessage) and "LEDGER-TAIL-MARK" in (m.content or "")
+        ]
+
+    @pytest.mark.asyncio
     async def test_layer2_tool_call_continues_loop(self):
         mock_response = MagicMock()
         mock_response.content = ""
@@ -512,8 +638,153 @@ class TestMakeRecoverVerifier:
             assert "messages" in result
             assert result["verifier_loop_count"] == 1
 
+
+    @pytest.mark.asyncio
+    async def test_b51_convergence_hint_silent_on_first_layer2_after_long_layer1(self):
+        """B51 (case #33): Layer 1 ran 7 observation iterations, so the shared
+        ``verifier_loop_count`` satisfied the old task-level ``count >= 4``
+        gate on Layer 2's FIRST iteration — the convergence hint ("conclude
+        now") then collided with the ``recover_layer2_first`` anti-laziness
+        guard (first-turn conclusions rejected) in the same turn. The hint
+        must be gated on the Layer-2-LOCAL iteration count instead."""
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_response.tool_calls = [{"name": "kubectl", "args": {"subcommand": "get", "v_args": "node n1"}}]
+
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "cpu-stress",
+                "kubeconfig": "",
+                "verifier_loop_count": 7,  # Layer 1 consumed 7 iterations
+                "recover_phase": "layer2_verification",  # first Layer 2 iteration
+            }
+            result = await node(state)
+
+        assert "result" not in result  # ReAct tool call continues the loop
+        assert result.get("recover_layer2_first") is True
+        # First Layer 2 iteration pins the counter for later local counting.
+        assert result["layer2_start_count"] == 8
+        sent = mock_llm.ainvoke.call_args[0][0]
+        assert not any("sufficient CURRENT" in getattr(m, "content", "") for m in sent), (
+            "convergence hint must NOT fire on the first Layer 2 iteration "
+            "even when Layer 1 iterations already pushed the shared count past 4 (B51)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_b51_convergence_hint_fires_at_layer2_local_iteration_4(self):
+        """With the Layer-2 start pinned, the hint fires on the Layer-2-LOCAL
+        4th iteration (shared count 11, start 8) — Layer-1 iterations no
+        longer accelerate the hint."""
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_response.tool_calls = [{"name": "kubectl", "args": {"subcommand": "get", "v_args": "node n1"}}]
+
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "cpu-stress",
+                "kubeconfig": "",
+                "verifier_loop_count": 11,  # shared
+                "layer2_start_count": 8,    # Layer 2 began at shared count 8
+                "layer2_context_added": True,
+                "recover_phase": "layer2_verification",  # Layer-2-local = 11-8+1 = 4
+            }
+            await node(state)
+
+        sent = mock_llm.ainvoke.call_args[0][0]
+        assert any("sufficient CURRENT" in getattr(m, "content", "") for m in sent)
+
+    @pytest.mark.asyncio
+    async def test_b51_legacy_state_without_start_pin_falls_back_to_shared_count(self):
+        """Legacy checkpoints predate ``layer2_start_count``: without the pin
+        the local count falls back to the shared counter (pre-B51 behavior
+        preserved for count >= 4)."""
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_response.tool_calls = [{"name": "kubectl", "args": {"subcommand": "get", "v_args": "node n1"}}]
+
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "cpu-stress",
+                "kubeconfig": "",
+                "verifier_loop_count": 4,
+                "layer2_context_added": True,  # no layer2_start_count (legacy)
+                "recover_phase": "layer2_verification",
+            }
+            await node(state)
+
+        sent = mock_llm.ainvoke.call_args[0][0]
+        assert any("sufficient CURRENT" in getattr(m, "content", "") for m in sent)
+
+    def test_b51_pin_is_a_declared_state_channel(self):
+        """B51 review finding (2026-09-10): LangGraph silently DROPS
+        node-update keys absent from the AgentState schema — an undeclared
+        pin never persists across real graph iterations while hand-built
+        state unit tests stay green. The pin MUST be declared (and lifecycle
+        registered), or the hint gate silently reverts to the shared counter
+        after Layer 2's first iteration."""
+        from chaos_agent.agent.state import AgentState
+
+        assert "layer2_start_count" in AgentState.__annotations__, (
+            "layer2_start_count must be a declared AgentState channel; "
+            "undeclared node updates are silently dropped by LangGraph"
+        )
+
+    def test_b51_pin_survives_a_stategraph_round_trip(self):
+        """The teeth for the drop class of bug: route the pin through a REAL
+        StateGraph(AgentState) round-trip, not a hand-built state dict —
+        the mechanism the three b51 tests above bypass entirely."""
+        from langgraph.graph import END, START, StateGraph
+
+        from chaos_agent.agent.state import AgentState
+
+        def writer(state):
+            return {"verifier_loop_count": 8, "layer2_start_count": 8}
+
+        graph = StateGraph(AgentState)
+        graph.add_node("writer", writer)
+        graph.add_edge(START, "writer")
+        graph.add_edge("writer", END)
+        out = graph.compile().invoke({"messages": []})
+        assert out.get("layer2_start_count") == 8, (
+            "the B51 pin must survive the LangGraph channel merge"
+        )
+
     @pytest.mark.asyncio
     async def test_max_iterations_fallback(self):
+        """Round-32 K2 修复验证：max-iterations 守卫的诚实词是 'unverified'
+        （无法确认 ≠ 部分恢复）。旧词 'partial' 经 recovery_task_state_from_level
+        落 'failed'——旧查询集对 failed 失明，在这个警告明说「故障可能
+        仍活跃」的行上永久关闭恢复入口。"""
         node = make_recover_verifier(llm=AsyncMock(), tools=[], registry=None)
         state = {
             "task_id": "t1",
@@ -523,8 +794,111 @@ class TestMakeRecoverVerifier:
             "verifier_loop_count": settings.max_recover_verifier_loop + 1,
         }
         result = await node(state)
-        assert result["recover_verification"]["level"] == "partial"
+        assert result["recover_verification"]["level"] == "unverified"
         assert result["result"]["recovered"] is False
+        # the verdict's downstream task_state word, on both axes:
+        #   word axis — 'unverified' is the honest verdict word;
+        #   liability axis — it does NOT clear the ledger (verdict-terminal
+        #     is not liability-clearing), so the row stays recoverable.
+        from chaos_agent.agent.state import (
+            TASK_STATE_ACTIVE_VALUES,
+            TASK_STATE_CLEARED_VALUES,
+            recovery_task_state_from_level,
+        )
+
+        new_state = recovery_task_state_from_level(
+            "unverified", recovered=False
+        )
+        assert new_state == "unverified"
+        assert new_state not in TASK_STATE_CLEARED_VALUES
+        # and the old word's mapping is exactly the bug this replaces:
+        # 'partial' fed the terminal 'failed' branch, which even the OLD
+        # word-based query set could not see (the K2 blinding mechanism)
+        old_state = recovery_task_state_from_level(
+            "partial", recovered=False
+        )
+        assert old_state == "failed"
+        assert old_state not in TASK_STATE_ACTIVE_VALUES
+
+
+class TestRecoverBaselineGateEndToEnd:
+    """The recover-side MIRROR of verify's TestBaselineComparisonInLayer2Context.
+
+    ``apply_synthetic_pair_gate`` is unit-tested where it lives, and its wiring
+    into ``_run_layer2_verification`` is AST-asserted in
+    test_synthetic_pair_gate_contract.py. What neither covers is the gate
+    actually EXECUTING inside the node: reading ``baseline_data``, rebuilding
+    the pair, and handing it to the LLM. The node is a 600-line async function,
+    but it is NOT unreachable — driving it with a mocked LLM and a baseline in
+    state opens the gate exactly as production does. This asserts the synthetic
+    pair reaches ``ainvoke``, the end-to-end coverage verify has always had.
+    """
+
+    @pytest.mark.asyncio
+    async def test_baseline_gate_injects_recover_pair_that_reaches_the_llm(self):
+        from chaos_agent.agent.nodes.recover._recover_layer1 import (
+            _RECOVER_BASELINE_TOOL_CALL_ID as TC_ID,
+        )
+
+        # A tool_call response keeps the loop on the layer2 path. The gate runs
+        # BEFORE the LLM call, so what the model replies does not matter here —
+        # only that the injected pair is in what it was handed.
+        mock_response = MagicMock()
+        mock_response.content = ""
+        mock_response.tool_calls = [{
+            "name": "kubectl",
+            "args": {"subcommand": "get", "v_args": "pods -n default -o json"},
+        }]
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        baseline = {
+            "captured_at": "2026-05-09T10:00:00",
+            "source": "registry",
+            "success_count": 1,
+            "total_count": 1,
+            "observations": [{
+                "exit_code": 0,
+                "stdout": "NAME   CPU%  MEM%\nmyapp  5%  30%",
+                "description": "pod resources",
+                "command": "kubectl top pod",
+            }],
+        }
+        with patch(
+            "chaos_agent.agent.nodes.recover._recover_verifier_loop."
+            "_layer1_destroy_via_provider"
+        ) as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok")
+            state = {
+                "task_id": "t1",
+                "experiment_uid": "abc",
+                "skill_name": "cpu-stress",
+                "kubeconfig": "",
+                "verifier_loop_count": 0,
+                "baseline_data": baseline,  # opens the gate (success_count > 0)
+            }
+            await node(state)
+
+        # Every message object handed to ainvoke, across all calls.
+        seen = []
+        for call in mock_llm.ainvoke.call_args_list:
+            for arg in list(call.args) + list(call.kwargs.values()):
+                if isinstance(arg, list):
+                    seen.extend(arg)
+
+        assert mock_llm.ainvoke.call_args_list, "the node never reached the LLM"
+        assert any(
+            isinstance(m, AIMessage)
+            and any(tc.get("id") == TC_ID for tc in (m.tool_calls or []))
+            for m in seen
+        ), "the gate's synthetic CALLER never reached the LLM"
+        assert any(
+            isinstance(m, ToolMessage) and m.tool_call_id == TC_ID for m in seen
+        ), "the gate's synthetic RESULT never reached the LLM"
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +984,26 @@ class TestBuildLayer1RecoveryPrompt:
         assert "Do NOT verify the fault has been removed" in prompt
         assert "Do NOT use interactive commands" in prompt
         assert "there is no experiment carrier" in prompt
+
+    def test_undo_effect_evidence_taught(self):
+        # inject-aac02265 (#35): Layer 1 issued the undo in the SAME batch
+        # as a consequence read and claimed success — the programmatic
+        # success guard correctly bounced it (no post-undo observation),
+        # costing ~36s. The guard stays authoritative; this prompt line
+        # teaches the SEMANTIC criterion, not the guard's mechanical
+        # form: a receipt proves issuance, not effect — a success claim
+        # needs direct evidence the undo is actually taking effect
+        # (fault cause revoked / visibly being removed), read
+        # immediately. Layer 1 never waits for recovery to finish.
+        # Scoped to the generic branch only — the kubectl-blade branch's
+        # destroy classifies READONLY and is exempt from the guard.
+        prompt = _build_layer1_recovery_prompt()
+        assert "proves the undo was issued, not that it took effect" in prompt
+        assert "fault cause is revoked or" in prompt
+        assert "visibly being removed" in prompt
+        assert "not a wait for recovery" in prompt
+        kubectl_blade = _build_layer1_recovery_prompt(is_kubectl_blade=True)
+        assert "not that it took effect" not in kubectl_blade
 
     def test_landed_reminder_kept_but_no_heuristic_gate(self):
         """Batch 2 (revised): enforcement is programmatic (Layer 1 success
@@ -882,6 +1276,52 @@ class TestMakeRecoverVerifierNonChaosBlade:
         # Layer 1 cache should reflect the failure
         cache = result.get("recover_layer1_cache", {})
         assert cache.get("status") == "failed"
+
+    @pytest.mark.asyncio
+    async def test_non_chaosblade_layer1_llm_exception_empty_str_backfills_class_name(self):
+        """Non-ChaosBlade: Layer 1 LLM call raises an EMPTY-str exception
+        (asyncio.TimeoutError/CancelledError shape, e.g. a 29-min read-timeout
+        window) — the error details must not end with a blank tail: the
+        exception class name is backfilled so the failure stays attributable.
+
+        Fall-through shape mirrors the live recover-c801f489 behaviour: the
+        Layer-1 error does NOT terminalize the node — the same invocation
+        proceeds into Layer 2, which times out on its own and finalizes.
+        """
+        mock_llm = AsyncMock()
+        # TimeoutError() has an empty str() — the exact shape observed in
+        # task recover-c801f489 ("LLM call failed: " with nothing after it).
+        mock_llm.ainvoke = AsyncMock(side_effect=TimeoutError())
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
+
+        state = {
+            "task_id": "t1",
+            "experiment_uid": "",
+            "skill_name": "pod-terminating",
+            "kubeconfig": "",
+            "verifier_loop_count": 0,
+            "messages": [],
+            "target": {"namespace": "default", "names": ["test-pod"]},
+            "recover_phase": "layer1_recovery",
+            "layer1_iteration_count": 0,
+            "inject_context": "Injected finalizers on pod test-pod",
+        }
+        result = await node(state)
+        # Layer 1 error falls through: the finalization comes from Layer 2's
+        # own timeout, not from the Layer-1 error itself.
+        assert result.get("error", "").startswith("recovery_verification_timeout"), (
+            f"expected Layer 2 timeout finalization, got {result.get('error')!r}"
+        )
+        cache = result.get("recover_layer1_cache", {})
+        assert cache.get("status") == "error"
+        details = str(cache.get("details", ""))
+        # The fix: no blank tail — the class name is backfilled
+        assert details.strip() != "LLM call failed:", "details must not end with a blank tail"
+        assert details.endswith("TimeoutError"), f"expected backfilled class name, got {details!r}"
+        assert str(cache.get("raw_output", "")).strip() != "", "raw_output must not be blank"
 
     @pytest.mark.asyncio
     async def test_non_chaosblade_no_inject_context_skips_layer1(self):
@@ -2938,9 +3378,10 @@ class TestBuildRecoverVerifierSystemPrompt:
         output_format_pos = prompt.index("RECOVERY_VERIFICATION_RESULT")
         assert remember_pos > output_format_pos
         # Tail of prompt must contain the REMEMBER recap (window sized for
-        # the full recap, including the attribution line)
-        assert "REMEMBER" in prompt[-700:]
-        assert "stale data is NOT evidence" in prompt[-600:]
+        # the full recap, including the attribution line and the
+        # PARALLELIZE_PRINCIPLE turn-economy line)
+        assert "REMEMBER" in prompt[-850:]
+        assert "stale data is NOT evidence" in prompt[-750:]
 
     def test_chaosblade_label(self):
         """is_chaosblade=True → Layer1 label is 'blade_destroy'."""
@@ -3150,8 +3591,8 @@ class TestFinalizeMarksInjectTask:
             async def upsert(self, task_id, **fields):
                 upsert_calls.append((task_id, fields))
 
-            async def update_task_state(self, task_id, task_state):
-                update_state_calls.append((task_id, task_state))
+            async def update_task_state(self, task_id, task_state, *, recover_verification=None):
+                update_state_calls.append((task_id, task_state, recover_verification))
 
         with patch(
             "chaos_agent.persistence.task_store.get_task_store",
@@ -3164,6 +3605,14 @@ class TestFinalizeMarksInjectTask:
         inject_updates = [c for c in update_state_calls if c[0] == inject_task_id]
         assert len(inject_updates) == 1, f"Expected 1 update_task_state for inject task, got {len(inject_updates)}"
         assert inject_updates[0][1] == "recovered"
+        # round-33b single-source: the clearance verdict MUST travel with the
+        # CLEARED word onto the SAME (inject) row — a bare word left the row a
+        # permanent "completed-but-uncleared" ghost under the fail-closed
+        # predicate (UID-less native carriers the ledger is blind to).
+        assert inject_updates[0][2] is not None, (
+            "verdict must be propagated onto the inject row with the word"
+        )
+        assert inject_updates[0][2]["level"] == "recovered"
 
     @pytest.mark.asyncio
     async def test_no_inject_task_update_when_recover_task_id_missing(self):
@@ -3215,8 +3664,8 @@ class TestFinalizeMarksInjectTask:
             async def upsert(self, task_id, **fields):
                 pass
 
-            async def update_task_state(self, task_id, task_state):
-                update_state_calls.append((task_id, task_state))
+            async def update_task_state(self, task_id, task_state, *, recover_verification=None):
+                update_state_calls.append((task_id, task_state, recover_verification))
 
         with patch(
             "chaos_agent.persistence.task_store.get_task_store",
@@ -3625,7 +4074,8 @@ def test_recover_prompts_carry_side_effect_reconciliation_contract():
 
 
 # ---------------------------------------------------------------------------
-# Baseline truncation restoration (problem D)
+# Baseline rendering (problem D; round-41 retirement: the compactor-cache
+# restore bridge was removed — see TestRecoverCacheBridgeRetirement)
 # ---------------------------------------------------------------------------
 
 class TestRecoverBaselineTruncationRestore:
@@ -3643,47 +4093,6 @@ class TestRecoverBaselineTruncationRestore:
             }],
         }
 
-    def test_cached_original_restored_format_agnostic(self, tmp_path):
-        from chaos_agent.agent.nodes.recover.recover_verifier import (
-            _build_recover_baseline_tool_messages,
-        )
-
-        # Host-channel baseline output (df) — no kubectl describe sections:
-        # the restore must work for ANY observation format.
-        cache = tmp_path / "out.txt"
-        cached_original = (
-            "Filesystem  Size  Used Avail Use% Mounted on\n"
-            "/dev/vda1   40G   30G   10G  75% /\n"
-            "tmpfs       7.8G  100M  7.7G   2% /dev/shm\n"
-        )
-        cache.write_text(cached_original, encoding="utf-8")
-        stdout = (
-            "Filesystem  Size  Used Avail Use% Mounted on\n"
-            "\n⚠️ TRUNCATED. Use field_selector. Cache: " + str(cache)
-        )
-        msgs = _build_recover_baseline_tool_messages(self._baseline(stdout))
-        assert msgs
-        content = msgs[-1].content
-        assert "Restored from compactor cache" in content
-        # The full cached original is back, tail included.
-        assert "/dev/shm" in content
-
-    def test_missing_cache_flags_incomplete_evidence(self, tmp_path):
-        from chaos_agent.agent.nodes.recover.recover_verifier import (
-            _build_recover_baseline_tool_messages,
-        )
-
-        missing = tmp_path / "does-not-exist.txt"
-        stdout = (
-            "head of output\n"
-            "\n⚠️ TRUNCATED. Use field_selector. Cache: " + str(missing)
-        )
-        msgs = _build_recover_baseline_tool_messages(self._baseline(stdout))
-        assert msgs
-        content = msgs[-1].content
-        assert "baseline evidence incomplete" in content
-        assert str(missing) in content
-
     def test_untruncated_baseline_unchanged(self):
         from chaos_agent.agent.nodes.recover.recover_verifier import (
             _build_recover_baseline_tool_messages,
@@ -3696,6 +4105,106 @@ class TestRecoverBaselineTruncationRestore:
         content = msgs[-1].content
         assert "plain short output" in content
         assert "restored from compactor cache" not in content
+
+    def test_legacy_baseline_without_total_count_renders_honest_denominator(self):
+        """Recover-layer header mirrors the verifier contract: baselines
+        persisted before the total_count column (#13/#10 audits) fall back
+        to len(observations), never to the "1/0" cosmetic receipt."""
+        from chaos_agent.agent.nodes.recover.recover_verifier import (
+            _build_recover_baseline_tool_messages,
+        )
+
+        legacy = self._baseline("plain short output")
+        del legacy["total_count"]
+        msgs = _build_recover_baseline_tool_messages(legacy)
+        assert msgs
+        assert "1/1 succeeded" in msgs[-1].content
+        assert "/0 succeeded" not in msgs[-1].content
+
+
+class TestRecoverCacheBridgeRetirement:
+    """Round-41 retirement guard: the compactor-cache restore bridge is
+    GONE. Rationale (adversarially confirmed before deletion): no producer
+    ever writes compactor notices into baseline observation stdout — the
+    baseline executors store raw result.stdout, and compactor notices only
+    live in conversation ToolMessages, a different data path — so the
+    bridge's genuine branch was dead code, while its spoof branch parsed
+    `Cache:` paths out of workload-controlled text (kubectl echoes pod
+    annotations verbatim) and read files on the operator machine. Absent
+    code cannot be spoofed, bypassed, or regress. These anchors keep the
+    "untrusted stdout → filesystem read" surface from creeping back."""
+
+    _SRC = Path(__file__).resolve().parents[3] / "src" / "chaos_agent" / \
+        "agent" / "nodes" / "recover" / "_recover_layer1.py"
+
+    def _baseline(self, stdout: str) -> dict:
+        return {
+            "success_count": 1,
+            "total_count": 1,
+            "captured_at": "2026-09-16T00:00:00",
+            "source": "skill",
+            "observations": [{
+                "exit_code": 0,
+                "description": "pod describe",
+                "command": "kubectl describe pod victim -n cms-demo",
+                "stdout": stdout,
+            }],
+        }
+
+    def _content(self, baseline: dict) -> str:
+        from chaos_agent.agent.nodes.recover.recover_verifier import (
+            _build_recover_baseline_tool_messages,
+        )
+        msgs = _build_recover_baseline_tool_messages(baseline)
+        assert msgs
+        return msgs[-1].content
+
+    def test_bridge_absent_from_source(self):
+        """The restore bridge, its pin, and its read primitive are gone;
+        the retirement NOTE explains why."""
+        src = self._SRC.read_text(encoding="utf-8")
+        assert "Restored from compactor cache" not in src
+        assert "_read_baseline_cache_content" not in src
+        assert "_recover_baseline_cache_path" not in src
+        assert "_is_compactor_cache_path" not in src
+        assert "TRUNCATION_CACHE_RE" not in src
+        assert "round-41 retirement" in src
+
+    def test_spoofed_marker_and_planted_path_render_honest_head_only(
+        self, tmp_path
+    ):
+        """The strongest spoof (⚠️ marker copied + planted path, target file
+        EXISTS on the operator machine) now renders exactly like any other
+        observation: honest head echo — no parse, no read, no retrieval-path
+        advertisement, no degraded-branch wording, no special casing."""
+        secret = tmp_path / "secret.txt"
+        secret.write_text("OPERATOR SECRET\n" * 500, encoding="utf-8")
+        stdout = (
+            "Name: victim-pod\n"
+            "Annotations: ops.note=rotate policy: logs ⚠️ TRUNCATED at 2GB, "
+            "Cache: " + str(secret) + "\n"
+        )
+        content = self._content(self._baseline(stdout))
+        assert "OPERATOR SECRET" not in content  # no read — no bridge at all
+        assert "Restored from compactor cache" not in content
+        assert f"full output at {secret}" not in content
+        assert "evidence incomplete" not in content
+        assert "Cache: " + str(secret) in content  # honest raw head echo
+
+    def test_marker_text_gets_same_oversize_notice_as_any_text(self):
+        """Marker-bearing text >1500 chars is CONTENT, not a notice: same
+        head cap + shared baseline-evidence notice as any other oversized
+        observation — no branch on marker presence."""
+        stdout = (
+            "app log line one\nCache: /etc/passwd\n" + "x" * 2000
+            + "\n⚠️ OUTPUT_TRUNCATED: output was reduced (original 20000bytes)"
+            + "\nFull output cached at: /nowhere/ab12cd34.txt"
+        )
+        content = self._content(self._baseline(stdout))
+        assert "Restored from compactor cache" not in content
+        assert "evidence incomplete" not in content
+        assert f"{len(stdout)} characters" in content  # shared honest notice
+        assert "state.baseline_data" in content
 
 
 # ---------------------------------------------------------------------------
@@ -3817,3 +4326,1010 @@ class TestRecoverVerifierHandleSeam:
         assert identity == {
             "kind": "experiment_uid", "value": "uid-combo", "method": "kubectl_native",
         }
+
+
+class TestUnverifiedRecoveryFinalize:
+    """Recovery unconfirmed: honest ignorance is not RECOVERY_FAILED.
+
+    fail_state writes a RECOVERY_FAILED diagnostic that directs operators to
+    debug the recovery chain — but "unverified" means the observation channel
+    was unavailable, and the right follow-up is to restore observability and
+    re-confirm. The verdict must flow through without a failure_reason.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unverified_recovery_no_fail_state(self):
+        mock_response = MagicMock()
+        mock_response.content = (
+            "RECOVERY_VERIFICATION_RESULT:\n"
+            "- Layer1 (blade_destroy): passed - success\n"
+            "- Layer2 (fault-specific): unknown - metrics query forbidden (403)\n"
+            "- Overall: unverified\n"
+            "- Warnings: observation channel unavailable"
+        )
+        mock_response.tool_calls = []
+
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
+
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok", raw_output="ok")
+            state = {
+                "task_id": "t-uv",
+                "experiment_uid": "abc",
+                "skill_name": "cpu-stress",
+                "kubeconfig": "",
+                "verifier_loop_count": 2,
+                "layer2_context_added": True,
+                "recover_phase": "layer2_verification",
+            }
+            result = await node(state)
+            fin = await _drive_finalize(state, result)
+            # Honest verdict: never claim recovery without evidence...
+            assert fin["result"]["recovered"] is False
+            assert fin["result"]["recovery_level"] == "unverified"
+            assert fin["recover_verification"]["level"] == "unverified"
+            # ...but no RECOVERY_FAILED diagnostic either — unconfirmed is not
+            # failed (operators should re-observe, not debug the chain).
+            assert not fin.get("failure_detail")
+            assert not fin.get("error")
+
+    @pytest.mark.asyncio
+    async def test_unrecovered_recovery_still_records_failure(self):
+        """Counter-evidence (fault still present) keeps the failure signal —
+        the unverified exemption must not swallow real recovery failures."""
+        mock_response = MagicMock()
+        mock_response.content = (
+            "RECOVERY_VERIFICATION_RESULT:\n"
+            "- Layer1 (blade_destroy): passed - success\n"
+            "- Layer2 (fault-specific): failed - CPU still at 95%\n"
+            "- Overall: unrecovered\n"
+            "- Warnings: fault persists"
+        )
+        mock_response.tool_calls = []
+
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+
+        node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
+
+        with patch("chaos_agent.agent.nodes.recover._recover_verifier_loop._layer1_destroy_via_provider") as mock_l1:
+            mock_l1.return_value = RecoverLayer1Result(status="passed", details="ok", raw_output="ok")
+            state = {
+                "task_id": "t-ur",
+                "experiment_uid": "abc",
+                "skill_name": "cpu-stress",
+                "kubeconfig": "",
+                "verifier_loop_count": 3,
+                "layer2_context_added": True,
+                "recover_phase": "layer2_verification",
+                # Retry-recovery already consumed (marker in message history)
+                # so l2=failed goes straight to fail_state, not loop-back.
+                "messages": [HumanMessage(content="recovery retry already executed")],
+            }
+            result = await node(state)
+            fin = await _drive_finalize(state, result)
+            assert fin["result"]["recovered"] is False
+            assert fin.get("failure_detail"), "real recovery failure keeps its diagnostic"
+
+
+# ---------------------------------------------------------------------------
+# truncation-governance-consistency: baseline injection notices follow the
+# shared three-field contract (marker + honest size + retrieval guidance),
+# and the cache-path parsing is the shared constant's duality.
+# ---------------------------------------------------------------------------
+
+class TestBaselineInjectionNoticeContract:
+    def _baseline(self, stdout: str) -> dict:
+        return {
+            "success_count": 1,
+            "total_count": 1,
+            "captured_at": "2026-07-01T00:00:00",
+            "source": "skill",
+            "observations": [{
+                "exit_code": 0,
+                "description": "pod describe",
+                "command": "kubectl describe pod pod-a",
+                "stdout": stdout,
+            }],
+        }
+
+    def test_recover_side_notice_three_fields(self, tmp_path):
+        """A >1500-char obs: the injected content carries the shared notice
+        — marker, honest size, retrieval guidance (state.baseline_data)."""
+        from chaos_agent.agent.nodes.recover.recover_verifier import (
+            _build_recover_baseline_tool_messages,
+        )
+        stdout = "line\n" * 600  # > 1500 chars, no TRUNCATED marker
+        msgs = _build_recover_baseline_tool_messages(self._baseline(stdout))
+        content = msgs[-1].content
+        assert "⚠️ TRUNCATED" in content
+        assert f"{len(stdout)} characters" in content   # honest size
+        assert "state.baseline_data" in content       # retrieval guidance
+
+    def test_verify_side_notice_three_fields(self):
+        """Verify-side baseline injection: same shared notice, with the
+        state.baseline_data retrieval guidance."""
+        from chaos_agent.agent.nodes.verify._verifier_messages import (
+            _build_baseline_tool_messages,
+        )
+        baseline = {
+            "success_count": 1,
+            "total_count": 1,
+            "captured_at": "2026-07-01T00:00:00",
+            "source": "skill",
+            "observations": [{
+                "exit_code": 0,
+                "description": "pod describe",
+                "command": "kubectl describe pod pod-a",
+                "stdout": "line\n" * 600,  # > 1500 chars
+            }],
+        }
+        msgs = _build_baseline_tool_messages(
+            baseline, fault_target="app", fault_action="cpu",
+            injection_parsed=None,
+        )
+        tool_contents = [
+            m.content for m in msgs if getattr(m, "type", "") == "tool"
+        ]
+        joined = "\n".join(tool_contents)
+        assert "⚠️ TRUNCATED" in joined
+        obs_len = len(baseline["observations"][0]["stdout"])
+        assert f"{obs_len} characters" in joined
+        assert "state.baseline_data" in joined
+
+
+class TestGraftBoundaryDeclaration:
+    """Anchor the inject→recover graft boundary declaration.
+
+    Openspec phase-boundary-declaration; #29 first-run evidence
+    (recover-98caf0cd msg[7]-[11]): three ``kubectl_read`` calls copied
+    from the grafted inject history were rejected by ToolNode before
+    self-correction. The declaration rides the Layer 1 state write
+    (``msg_list``), so it reaches every later L1 iteration, the Layer 2
+    message stream (built from ``state["messages"]``, L1040 of the loop),
+    and the task-JSON audit record — unlike the re-built expired-context
+    note it carries no ``NO_SESSION_MARKER``.
+    """
+
+    _DECL_MARKER = "**PHASE BOUNDARY"
+
+    def _grafted_history(self) -> list:
+        """A minimal stand-in for the completed inject task's history."""
+        return [
+            HumanMessage(content="Injected cpu fullload on pod/test-pod"),
+            AIMessage(content="", tool_calls=[{
+                "name": "kubectl_read",
+                "args": {"subcommand": "get", "v_args": "pod test-pod"},
+                "id": "graft_call_1", "type": "tool_call",
+            }]),
+        ]
+
+    def _base_state(self) -> dict:
+        return {
+            "task_id": "t1",
+            "experiment_uid": "",
+            "skill_name": "pod-cpu-fullload",
+            "kubeconfig": "/path/to/config",
+            "verifier_loop_count": 0,
+            "messages": self._grafted_history(),
+            "target": {"namespace": "default", "names": ["test-pod"]},
+            "recover_phase": "layer1_recovery",
+            "layer1_iteration_count": 0,
+            "inject_context": "Injected cpu fullload on pod/test-pod",
+        }
+
+    @staticmethod
+    def _llm_with(responses: list) -> AsyncMock:
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(side_effect=responses)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+        return mock_llm
+
+    @pytest.mark.asyncio
+    async def test_layer1_state_write_carries_declaration(self):
+        """Tool-call branch: msg_list = declaration → expired note → task context → response."""
+        mock_l1_response = MagicMock()
+        mock_l1_response.content = ""
+        mock_l1_response.tool_calls = [{
+            "name": "kubectl", "args": {"subcommand": "get", "v_args": "pod test-pod -n default"},
+            "id": "l1_call_1",
+        }]
+        mock_l1_response.additional_kwargs = {}
+
+        mock_llm = self._llm_with([mock_l1_response])
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+        result = await node(self._base_state())
+
+        msgs = result.get("messages", [])
+        assert msgs, "tool-call iteration must persist messages"
+        first = msgs[0]
+        assert isinstance(first, HumanMessage)
+        decl = first.content
+        # Wrapped per the kickoff precedent: a phase-transition directive.
+        assert "<system-reminder>" in decl and "</system-reminder>" in decl
+        # The three axes are locatable in the declaration text.
+        assert self._DECL_MARKER in decl
+        assert "RECOVERY task" in decl                    # role axis
+        assert "BEFORE or DURING injection" in decl       # evidence-tense axis
+        assert "tools currently bound" in decl            # tool-surface axis
+        # Reading order: past (grafted history) → boundary → present.
+        # The expired-context note and the Layer 1 task context come after.
+        contents = [str(m.content) for m in msgs]
+        assert any("EXPIRED" in c for c in contents[1:])
+        assert any("Recovery" in c or "Fault" in c for c in contents[1:])
+        # Persistence semantics: no NO_SESSION_MARKER — the declaration
+        # must land in the task JSON exactly once (audit-record contract).
+        assert not getattr(first, "additional_kwargs", {}).get("_no_session")
+
+    @pytest.mark.asyncio
+    async def test_layer1_llm_sees_declaration_after_grafted_history(self):
+        """The LLM call itself: SystemMessage → grafted history → declaration."""
+        mock_l1_response = MagicMock()
+        mock_l1_response.content = ""
+        mock_l1_response.tool_calls = [{
+            "name": "kubectl", "args": {"subcommand": "get", "v_args": "pod -n default"},
+            "id": "l1_call_1",
+        }]
+        mock_l1_response.additional_kwargs = {}
+
+        mock_llm = self._llm_with([mock_l1_response])
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+        await node(self._base_state())
+
+        sent = mock_llm.ainvoke.call_args[0][0]
+        # sent[0] is the system prompt; sent[1:3] is the grafted history.
+        decl_positions = [
+            i for i, m in enumerate(sent)
+            if isinstance(m, HumanMessage) and self._DECL_MARKER in str(m.content)
+        ]
+        assert decl_positions, "declaration missing from the LLM call"
+        assert decl_positions[0] >= 3, (
+            "declaration must sit AFTER the grafted history "
+            f"(found at {decl_positions[0]}, grafted history ends at 2)"
+        )
+        # And BEFORE the Layer 1 task context message.
+        task_ctx_positions = [
+            i for i, m in enumerate(sent)
+            if isinstance(m, HumanMessage) and self._DECL_MARKER not in str(m.content)
+        ]
+        if task_ctx_positions:
+            assert decl_positions[0] < task_ctx_positions[-1]
+
+    @pytest.mark.asyncio
+    async def test_layer2_first_iteration_inherits_declaration(self):
+        """Layer 2 builds from state.messages — the declaration rides along."""
+        # L1 turn 1: tool call (persist declaration into state).
+        mock_l1_response = MagicMock()
+        mock_l1_response.content = ""
+        mock_l1_response.tool_calls = [{
+            "name": "kubectl", "args": {"subcommand": "get", "v_args": "pod test-pod -n default"},
+            "id": "l1_call_1",
+        }]
+        mock_l1_response.additional_kwargs = {}
+        # L1 turn 2 (after the tool result): final execution text.
+        mock_l1_final = MagicMock()
+        mock_l1_final.content = (
+            "RECOVERY_EXECUTION_RESULT:\n- Status: success\n"
+            "- Actions: removed the fault\n- Details: none"
+        )
+        mock_l1_final.tool_calls = []
+        mock_l1_final.additional_kwargs = {}
+        # L2 turn 1: a verification tool call (keeps the loop alive).
+        mock_l2_tool = MagicMock()
+        mock_l2_tool.content = ""
+        mock_l2_tool.tool_calls = [{
+            "name": "kubectl", "args": {"subcommand": "get", "v_args": "pod -n default"},
+            "id": "l2_call_1",
+        }]
+        mock_l2_tool.additional_kwargs = {}
+
+        mock_llm = self._llm_with([mock_l1_response, mock_l1_final, mock_l2_tool])
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        state1 = self._base_state()
+        result1 = await node(state1)
+        tool_msg = MagicMock()
+        tool_msg.name = "kubectl"
+        tool_msg.content = "Running"
+        state2 = {
+            **state1,
+            "verifier_loop_count": 1,
+            "recover_phase": "layer1_recovery",
+            "layer1_iteration_count": 1,
+            "recover_layer1_cache": result1.get("recover_layer1_cache"),
+            "messages": result1.get("messages", []) + [tool_msg],
+        }
+        result2 = await node(state2)
+        assert result2.get("recover_phase") == "layer2_verification"
+
+        # LangGraph's add_messages reducer APPENDS result2's [response] onto
+        # state2.messages — it does not replace them. The declaration that
+        # iteration 1 persisted is still in the stream.
+        state3 = {
+            **state2,
+            "verifier_loop_count": 2,
+            "recover_phase": "layer2_verification",
+            "layer2_context_added": False,
+            "layer1_iteration_count": 1,
+            "recover_layer1_cache": result2.get("recover_layer1_cache"),
+            "messages": state2["messages"] + result2.get("messages", []) + [MagicMock()],
+        }
+        await node(state3)
+
+        # The LAST LLM call is Layer 2's first iteration: its message list
+        # is built from state["messages"] and must contain the declaration
+        # the Layer 1 write persisted.
+        sent_l2 = mock_llm.ainvoke.call_args_list[-1][0][0]
+        assert any(
+            isinstance(m, HumanMessage) and self._DECL_MARKER in str(m.content)
+            for m in sent_l2
+        ), "Layer 2 first iteration lost the graft boundary declaration"
+
+    def test_injection_point_is_the_graph_node_not_entry_sites(self):
+        """Every recover entry path (CLI ×2, L4, HTTP/TUI streaming — the
+        baseline_messages bootstrap sites) converges on the recover graph's
+        message stream; the declaration is injected inside
+        recover_verifier_loop — the single graph-internal choke point every
+        entry path must cross. Structural assertion: the node module
+        sources the constant, the entry sites stay declaration-free (they
+        graft history only).
+        """
+        import inspect
+
+        import chaos_agent.agent.nodes.recover._recover_verifier_loop as rvl
+        import chaos_agent.cli.runner as runner_mod
+        import chaos_agent.l4.recovery as recovery_mod
+        from chaos_agent.agent.prompts.boundary import (
+            INJECT_TO_RECOVER_BOUNDARY_DECLARATION,
+        )
+
+        assert INJECT_TO_RECOVER_BOUNDARY_DECLARATION in vars(rvl).values() or hasattr(
+            rvl, "INJECT_TO_RECOVER_BOUNDARY_DECLARATION"
+        )
+        assert "INJECT_TO_RECOVER_BOUNDARY_DECLARATION" not in inspect.getsource(runner_mod)
+        assert "INJECT_TO_RECOVER_BOUNDARY_DECLARATION" not in inspect.getsource(recovery_mod)
+
+    @pytest.mark.asyncio
+    async def test_layer2_first_iteration_injects_when_l1_was_deterministic(self):
+        """Deterministic Layer 1 (provider destroy, no LLM) writes no
+        messages, so Layer 2's first iteration is the recovery's FIRST
+        LLM loop — the graft declaration must be injected there, after
+        the grafted history and before the expired-context note, and ride
+        the Layer 2 state write (task-JSON audit contract)."""
+        mock_l2_tool = MagicMock()
+        mock_l2_tool.content = ""
+        mock_l2_tool.tool_calls = [{
+            "name": "kubectl", "args": {"subcommand": "get", "v_args": "pod -n default"},
+            "id": "l2_call_det_1",
+        }]
+        mock_l2_tool.additional_kwargs = {}
+
+        mock_llm = self._llm_with([mock_l2_tool])
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        # Deterministic shape: the grafted inject history is the ONLY
+        # content of state["messages"] — Layer 1 never appended anything.
+        state = {
+            **self._base_state(),
+            "verifier_loop_count": 1,
+            "recover_phase": "layer2_verification",
+            "layer1_iteration_count": 1,
+            "layer2_context_added": False,
+            "recover_layer1_type": "deterministic",
+            "recover_layer1_cache": {
+                "status": "passed", "details": "destroyed", "raw_output": "",
+            },
+        }
+        result = await node(state)
+
+        # The Layer 2 state write persists the declaration exactly once,
+        # without a NO_SESSION_MARKER (audit-record contract).
+        msgs = result.get("messages", [])
+        decls = [
+            m for m in msgs
+            if isinstance(m, HumanMessage) and self._DECL_MARKER in str(m.content)
+        ]
+        assert len(decls) == 1, (
+            f"deterministic-L1 shape must declare exactly once, got {len(decls)}"
+        )
+        assert not getattr(decls[0], "additional_kwargs", {}).get("_no_session")
+        # Head-of-block ordering: the declaration rides FIRST in the Layer 2
+        # write, so the next iteration reads [grafted history] → declaration
+        # → [current-recovery context] — "the history above" stays the
+        # completed inject task, never the current task's own context.
+        assert msgs[0] is decls[0], (
+            "declaration must lead the Layer 2 state write block"
+        )
+        # Reading order: the declaration precedes the expired-context note.
+        contents = [str(m.content) for m in msgs]
+        decl_idx = contents.index(str(decls[0].content))
+        expired = [i for i, c in enumerate(contents) if "EXPIRED" in c]
+        if expired:
+            assert decl_idx < expired[0]
+
+        # The LLM saw it after the grafted history (SystemMessage + 2
+        # grafted messages) and before the task instructions.
+        sent = mock_llm.ainvoke.call_args[0][0]
+        sent_decls = [
+            i for i, m in enumerate(sent)
+            if isinstance(m, HumanMessage) and self._DECL_MARKER in str(m.content)
+        ]
+        assert len(sent_decls) == 1
+        assert sent_decls[0] >= 3
+
+    @pytest.mark.asyncio
+    async def test_layer2_does_not_redeclare_when_already_present(self):
+        """Idempotence: when the LLM-driven Layer 1 already persisted the
+        declaration into state["messages"], the Layer 2 marker probe finds
+        it and injects nothing — exactly one declaration per recovery
+        context, whichever layer landed it."""
+        from chaos_agent.agent.prompts.boundary import (
+            INJECT_TO_RECOVER_BOUNDARY_DECLARATION,
+        )
+        from chaos_agent.agent.prompts.reminder import wrap_system_reminder
+
+        mock_l2_tool = MagicMock()
+        mock_l2_tool.content = ""
+        mock_l2_tool.tool_calls = [{
+            "name": "kubectl", "args": {"subcommand": "get", "v_args": "pod -n default"},
+            "id": "l2_call_idem_1",
+        }]
+        mock_l2_tool.additional_kwargs = {}
+
+        mock_llm = self._llm_with([mock_l2_tool])
+        node = make_recover_verifier(llm=mock_llm, tools=["kubectl"], registry=None)
+
+        state = {
+            **self._base_state(),
+            "verifier_loop_count": 1,
+            "recover_phase": "layer2_verification",
+            "layer1_iteration_count": 1,
+            "layer2_context_added": False,
+            "recover_layer1_type": "llm_driven",
+            "recover_layer1_cache": {
+                "status": "passed", "details": "", "raw_output": "",
+            },
+            # The LLM-driven Layer 1 already persisted its declaration.
+            "messages": self._grafted_history() + [HumanMessage(content=wrap_system_reminder(
+                INJECT_TO_RECOVER_BOUNDARY_DECLARATION
+            ))],
+        }
+        result = await node(state)
+
+        # The LLM call carried the inherited declaration — and only it.
+        sent = mock_llm.ainvoke.call_args[0][0]
+        sent_decls = [
+            m for m in sent
+            if isinstance(m, HumanMessage) and self._DECL_MARKER in str(m.content)
+        ]
+        assert len(sent_decls) == 1, "a second declaration leaked into the L2 call"
+        # The Layer 2 state write added no fresh copy.
+        fresh_decls = [
+            m for m in result.get("messages", [])
+            if isinstance(m, HumanMessage) and self._DECL_MARKER in str(m.content)
+        ]
+        assert not fresh_decls, "L2 re-declared an already-declared seam"
+
+
+# ---------------------------------------------------------------------------
+# truncation-debt-cleanup (3.2): side-effect injection speaks the shared
+# truncation dialect in both recover layers
+# ---------------------------------------------------------------------------
+
+class TestSideEffectInjectionSharedDialect:
+    """Oversized side-effect entries (>500 chars) injected into BOTH recover
+    layers must speak the shared truncation dialect — a both-ends preview
+    (head/tail anchors survive) plus the state-evidence notice (marker +
+    honest original size + retrieval guidance back to state.side_effects) —
+    replacing the old head-only ``[:500] + "...(truncated)"`` cut that hid
+    the tail and named no way back. Entries within the 500-char budget are
+    injected VERBATIM (zero truncation noise)."""
+
+    @staticmethod
+    def _oversized_side_effect() -> dict:
+        # ~1.3K chars serialized — well over the 500-char injection cut.
+        # The head carries the resource anchor + leading A-run; the tail
+        # carries the trailing Z-run: the both-ends assertions key on them.
+        return {
+            "resource": "configmap/app-config",
+            "before": "A" * 600,
+            "after": "Z" * 600,
+        }
+
+    @staticmethod
+    def _mock_llm() -> AsyncMock:
+        mock_response = MagicMock()
+        mock_response.content = (
+            "RECOVERY_EXECUTION_RESULT:\n"
+            "- Status: success\n"
+            "- Actions: restored the mutated configmap\n"
+            "- Details: ok"
+        )
+        mock_response.tool_calls = []
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=mock_response)
+        mock_llm.bind_tools = MagicMock(return_value=mock_llm)
+        mock_llm.bind = MagicMock(return_value=mock_llm)
+        return mock_llm
+
+    @staticmethod
+    def _message_texts(call) -> list:
+        # ainvoke(messages) — flatten message contents for content search.
+        messages = call.args[0] if call.args else call.kwargs.get("messages", [])
+        return [str(m.content) for m in messages if hasattr(m, "content")]
+
+    def _assert_shared_dialect(self, text: str, original_len: int, entry_key: str):
+        # Three-field notice contract.
+        assert "⚠️ TRUNCATED (state evidence):" in text
+        assert f"(original {original_len} characters)." in text
+        assert "state.side_effects" in text
+        # Both-ends preview: head and tail anchors survive, the middle run
+        # is quantified as elided exactly once.
+        assert '"resource": "configmap/app-config"' in text
+        assert "A" * 300 in text      # head window keeps the leading A-run
+        assert "Z" * 100 in text      # tail window keeps the trailing Z-run
+        assert "A" * 400 not in text  # the middle is actually elided
+        assert "Z" * 200 not in text
+        assert text.count("chars elided") == 1
+        # The old head-only dialect is gone.
+        assert "...(truncated)" not in text
+        # Per-entry injection growth is BOUNDED (design risk register:
+        # preview 500 + marker + notice ≈ 750 chars vs the old 514) —
+        # pinned so a future notice-wording change cannot silently balloon
+        # the per-entry prompt cost.
+        entry_line = next(
+            ln for ln in text.split("\n") if ln.startswith(f"- {entry_key}: ")
+        )
+        assert len(entry_line) <= 800, (
+            f"per-entry injection cost unbounded: {len(entry_line)} chars"
+        )
+
+    @pytest.mark.asyncio
+    async def test_layer1_oversized_side_effect_shared_dialect(self):
+        """Layer 1 human message: the side-effects section speaks the shared
+        dialect when an entry exceeds the 500-char cut."""
+        se_val = self._oversized_side_effect()
+        original_len = len(json.dumps(se_val, ensure_ascii=False))
+        mock_llm = self._mock_llm()
+        node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
+
+        state = {
+            "task_id": "t1",
+            "experiment_uid": "",  # no deterministic destroy → LLM-driven L1
+            "skill_name": "config-patch",
+            "kubeconfig": "",
+            "verifier_loop_count": 0,
+            "inject_context": "Patched configmap app-config during injection",
+            "recover_phase": "layer1_recovery",
+            "layer1_iteration_count": 0,
+            "side_effects": {"patched-config": se_val},
+        }
+        await node(state)
+
+        # The FIRST ainvoke is the Layer 1 recovery call — its messages
+        # carry the human content with the side-effects section.
+        assert mock_llm.ainvoke.await_count >= 1
+        first_texts = self._message_texts(mock_llm.ainvoke.await_args_list[0])
+        se_text = next(t for t in first_texts if "## Recorded Side Effects" in t)
+        assert "- patched-config: " in se_text
+        self._assert_shared_dialect(se_text, original_len, "patched-config")
+
+    @pytest.mark.asyncio
+    async def test_layer2_oversized_side_effect_shared_dialect(self):
+        """Layer 2 verification context (first iteration): the same shared
+        dialect, the same contract — the two layers inject identically."""
+        se_val = self._oversized_side_effect()
+        original_len = len(json.dumps(se_val, ensure_ascii=False))
+        mock_llm = self._mock_llm()
+        node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
+
+        state = {
+            "task_id": "t1",
+            "experiment_uid": "",
+            "skill_name": "config-patch",
+            "kubeconfig": "",
+            "verifier_loop_count": 1,
+            "recover_phase": "layer2_verification",
+            "layer1_iteration_count": 1,
+            "layer2_context_added": False,  # first L2 iteration → context built
+            "side_effects": {"patched-config": se_val},
+        }
+        await node(state)
+
+        assert mock_llm.ainvoke.await_count >= 1
+        first_texts = self._message_texts(mock_llm.ainvoke.await_args_list[0])
+        se_text = next(t for t in first_texts if "## Side-Effect Reconciliation" in t)
+        assert "- patched-config: " in se_text
+        self._assert_shared_dialect(se_text, original_len, "patched-config")
+
+    @pytest.mark.asyncio
+    async def test_within_budget_side_effect_verbatim(self):
+        """Entries within the 500-char budget inject VERBATIM — no marker,
+        no elision noise, the full record stays inline."""
+        small_val = {"resource": "configmap/app-config", "note": "x" * 200}
+        serialized = json.dumps(small_val, ensure_ascii=False)
+        assert len(serialized) < 500
+        mock_llm = self._mock_llm()
+        node = make_recover_verifier(llm=mock_llm, tools=[], registry=None)
+
+        state = {
+            "task_id": "t1",
+            "experiment_uid": "",
+            "skill_name": "config-patch",
+            "kubeconfig": "",
+            "verifier_loop_count": 1,
+            "recover_phase": "layer2_verification",
+            "layer1_iteration_count": 1,
+            "layer2_context_added": False,
+            "side_effects": {"small-note": small_val},
+        }
+        await node(state)
+
+        first_texts = self._message_texts(mock_llm.ainvoke.await_args_list[0])
+        se_text = next(t for t in first_texts if "## Side-Effect Reconciliation" in t)
+        assert f"- small-note: {serialized}" in se_text  # verbatim, single line
+        assert "TRUNCATED" not in se_text
+        assert "elided" not in se_text
+
+
+# ---------------------------------------------------------------------------
+# finalize_recover_verification: residual liability sweep (B76 review G)
+# ---------------------------------------------------------------------------
+
+class TestFinalizeResidualLiabilitySweep:
+    """The recover finale's safety net: destroy every live experiment the
+    task still owes a destroy for, EXCEPT the identity UID the main Layer-1
+    flow (and the retry below) already owns. Whichever seam let a superseded
+    experiment survive (approval-time destroy failure, an execute-replan
+    build-on-top, compaction blinding the destroy whitelist), THIS is the
+    last point where the framework still holds the full ownership record."""
+
+    def _state(self, *, owned, destroy_output='{"code":200,"success":true}'):
+        from chaos_agent.agent.nodes.verify._verifier_submit import (
+            SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+        )
+
+        submit_msg = AIMessage(
+            content="Recovery verified.",
+            tool_calls=[{
+                "name": SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+                "args": {
+                    "overall": "recovered",
+                    "layer2_status": "passed",
+                    "layer2_details": "fault effect absent, baseline restored",
+                },
+                "id": "tc_submit",
+                "type": "tool_call",
+            }],
+        )
+        tool_msg = ToolMessage(
+            content="Recovery verdict recorded.",
+            tool_call_id="tc_submit",
+            name=SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+        )
+        state = {
+            "task_id": "t-sweep",
+            "experiment_uid": "uid-main",
+            "injection_method": "host_blade",
+            "owned_experiment_uids": list(owned),
+            "skill_name": "pod-cpu-fullload",
+            "kubeconfig": "",
+            "verifier_loop_count": 3,
+            "messages": [submit_msg, tool_msg],
+            "recover_layer1_cache": {
+                "status": "passed",
+                "details": "destroyed",
+                "raw_output": "",
+                "system_prompt": "test",
+            },
+            "recover_layer2_first": False,
+        }
+        return state, destroy_output
+
+    def _patch_destroy(self, monkeypatch, destroy_output):
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        provider = FaultProviderRegistry.resolve_by_method("host_blade")
+        calls: list[str] = []
+
+        async def _fake_destroy(uid, kubeconfig=""):
+            calls.append(uid)
+            return destroy_output
+
+        monkeypatch.setattr(provider, "layer1_raw_destroy", _fake_destroy)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_finalize_sweeps_residual_experiments_and_retires(self, monkeypatch):
+        """The superseded experiment that survived the approval seam is
+        destroyed at the finale; the identity UID stays excluded (the main
+        Layer-1 flow owns it — the sweep must not race the destroy already
+        recorded in the Layer-1 cache). Round-32 death-wing completion:
+        the FULL verdict settles the proven identity UID too — retired
+        carries BOTH wings (sweep's destroy + verdict's proof), so the
+        persisted ledger ends balanced instead of haunting query_active."""
+        state, output = self._state(owned=["uid-old", "uid-main"])
+        calls = self._patch_destroy(monkeypatch, output)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == ["uid-old"]
+        assert fin["retired_experiment_uids"] == ["uid-main", "uid-old"]
+        # A successful sweep leaves the verdict itself untouched.
+        assert fin["recover_verification"]["level"] == "recovered"
+        assert not any(
+            "survived the final destroy sweep" in w
+            for w in fin["recover_verification"].get("warnings", [])
+        )
+
+    @pytest.mark.asyncio
+    async def test_finalize_failed_sweep_warns_without_false_retire(self, monkeypatch):
+        """False-retire guard at the finale: an Error destroy output (NOT
+        the not-found form — that one routes through the sweep's status
+        recheck valve) keeps the UID in the liability record and surfaces a
+        warning (the verdict stays recoverable but the residue is on the
+        record for the operator). Round-32 death-wing completion must NOT
+        swallow the failed residual: a destroy error is LIVE evidence, and
+        the full verdict settles only the PROVEN owned — the identity UID
+        (Layer-1 passed) retires, the failed residual never does."""
+        state, output = self._state(
+            owned=["uid-old", "uid-main"],
+            destroy_output="Error: blade daemon unreachable",
+        )
+        calls = self._patch_destroy(monkeypatch, output)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == ["uid-old"]
+        # uid-old: failed destroy — stays LIVE in the ledger despite the
+        # full verdict (false-settle guard). uid-main: destroy proven by
+        # the passed Layer-1 — the death wing settles exactly it.
+        assert fin["retired_experiment_uids"] == ["uid-main"]
+        assert any(
+            "survived the final destroy sweep" in w
+            for w in fin["recover_verification"]["warnings"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_finalize_not_found_failure_rechecks_status_and_retires(
+        self, monkeypatch,
+    ):
+        """B76 review I2/I2b — the convergence valve at the finale: a
+        record-not-found destroy failure (the repeat-destroy signature of an
+        already-dead experiment) triggers the carrier's status recheck; a
+        proven death retires instead of warning forever."""
+        state, output = self._state(
+            owned=["uid-old", "uid-main"],
+            destroy_output="Error: record not found",
+        )
+        calls = self._patch_destroy(monkeypatch, output)
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        provider = FaultProviderRegistry.resolve_by_method("host_blade")
+
+        async def _destroyed_true(uid, kubeconfig=""):
+            return True
+
+        monkeypatch.setattr(provider, "experiment_destroyed", _destroyed_true)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == ["uid-old"]
+        # both wings settled: the recheck-proven residual (sweep) + the
+        # Layer-1-proven identity UID (round-32 death wing)
+        assert fin["retired_experiment_uids"] == ["uid-main", "uid-old"]
+        assert not any(
+            "survived the final destroy sweep" in w
+            for w in fin["recover_verification"].get("warnings", [])
+        )
+
+    @pytest.mark.asyncio
+    async def test_finalize_single_experiment_task_is_untouched(self, monkeypatch):
+        """Normal single-experiment shape: the live set minus the identity
+        UID is empty — zero destroy dispatches, no warnings (the sweep is a
+        safety net, not a behaviour change). The single retire write is the
+        round-32 death wing: the passed Layer-1 IS the destroy proof the
+        persisted ledger lacked — without it the recovered row's
+        ``owned − retired`` stays unbalanced and haunts query_active
+        forever."""
+        state, output = self._state(owned=["uid-main"])
+        calls = self._patch_destroy(monkeypatch, output)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == []
+        assert fin["retired_experiment_uids"] == ["uid-main"]
+        assert fin["recover_verification"]["level"] == "recovered"
+
+
+# ---------------------------------------------------------------------------
+# finalize_recover_verification: identity-UID exemption gate (B76 review M2)
+# ---------------------------------------------------------------------------
+
+class TestFinalizeIdentityExemptionGate:
+    """The identity UID's exemption from the final sweep is EARNED by the
+    Layer-1 verdict, not unconditional (B76 review M2 — the exempt orphan).
+
+    ``exclude_uid`` exists to prevent a duplicate destroy of the experiment
+    the main Layer-1 flow owns. A failed/error/unknown Layer-1 means that
+    ownership never paid out — the sweep must CATCH the identity UID
+    instead of skipping it. The pre-fix chain: destroy failed (experiment
+    proven alive), Layer 2 passed, retry gate L2-only (never fires), sweep
+    unconditionally exempt → the experiment ended UNDESTROYED and UNWARNED
+    four ways while the task closed as "recovered"."""
+
+    def _state(self, *, layer1_status: str, owned=("uid-main",)):
+        from chaos_agent.agent.nodes.verify._verifier_submit import (
+            SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+        )
+
+        submit_msg = AIMessage(
+            content="Recovery verified.",
+            tool_calls=[{
+                "name": SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+                "args": {
+                    "overall": "recovered",
+                    "layer2_status": "passed",
+                    "layer2_details": "fault effect absent, baseline restored",
+                },
+                "id": "tc_submit",
+                "type": "tool_call",
+            }],
+        )
+        tool_msg = ToolMessage(
+            content="Recovery verdict recorded.",
+            tool_call_id="tc_submit",
+            name=SUBMIT_RECOVER_VERIFICATION_TOOL_NAME,
+        )
+        return {
+            "task_id": "t-exempt",
+            "experiment_uid": "uid-main",
+            "injection_method": "host_blade",
+            "owned_experiment_uids": list(owned),
+            "skill_name": "pod-cpu-fullload",
+            "kubeconfig": "",
+            "verifier_loop_count": 3,
+            "messages": [submit_msg, tool_msg],
+            "recover_layer1_cache": {
+                "status": layer1_status,
+                "details": "",
+                "raw_output": "",
+                "system_prompt": "test",
+            },
+            "recover_layer2_first": False,
+        }
+
+    def _patch_destroy(self, monkeypatch):
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        provider = FaultProviderRegistry.resolve_by_method("host_blade")
+        calls: list[str] = []
+
+        async def _fake_destroy(uid, kubeconfig=""):
+            calls.append(uid)
+            return '{"code":200,"success":true}'
+
+        monkeypatch.setattr(provider, "layer1_raw_destroy", _fake_destroy)
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_failed_layer1_revokes_exemption_identity_uid_swept(
+        self, monkeypatch,
+    ):
+        """M2 MAIN SCENARIO — the main-flow destroy failed (experiment
+        proven alive) but Layer 2 passed: the exemption must NOT hold. The
+        sweep destroys + retires the identity UID, closing the four-way
+        silent orphan."""
+        state = self._state(layer1_status="failed")
+        calls = self._patch_destroy(monkeypatch)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == ["uid-main"]
+        assert fin["retired_experiment_uids"] == ["uid-main"]
+        # The verdict axes stay decoupled: Layer 2 passed, so the level is
+        # recovered — the fix closes the LEDGER hole, it does not re-open
+        # the "Layer-1 one-vote veto" bug (inject-e47de3e8).
+        assert fin["recover_verification"]["level"] == "recovered"
+        assert not any(
+            "survived the final destroy sweep" in w
+            for w in fin["recover_verification"].get("warnings", [])
+        )
+
+    @pytest.mark.asyncio
+    async def test_error_layer1_revokes_exemption(self, monkeypatch):
+        """An errored main flow (exception during the deterministic destroy)
+        is equally an unproven destroy — the sweep catches the UID."""
+        state = self._state(layer1_status="error")
+        calls = self._patch_destroy(monkeypatch)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == ["uid-main"]
+        assert fin["retired_experiment_uids"] == ["uid-main"]
+
+    @pytest.mark.asyncio
+    async def test_missing_cache_defaults_unknown_and_sweeps(self, monkeypatch):
+        """Legacy checkpoint without a Layer-1 cache: the finalize's default
+        verdict is ``unknown`` — never a proven destroy, so the exemption
+        must not hold (fail-closed for every non-proving status)."""
+        state = self._state(layer1_status="unknown")
+        state.pop("recover_layer1_cache")
+        calls = self._patch_destroy(monkeypatch)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == ["uid-main"]
+        assert fin["retired_experiment_uids"] == ["uid-main"]
+
+    @pytest.mark.asyncio
+    async def test_passed_layer1_keeps_exemption_no_duplicate_destroy(
+        self, monkeypatch,
+    ):
+        """Mirror control: a passed Layer-1 proves the destroy already
+        happened — the exemption holds and the sweep must NOT dispatch a
+        duplicate destroy of the identity UID. The retire write is NOT a
+        duplicate destroy: it is the round-32 death wing recording the
+        proof the passed Layer-1 already earned (ledger-only, no dispatch)."""
+        state = self._state(layer1_status="passed")
+        calls = self._patch_destroy(monkeypatch)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == []
+        assert fin["retired_experiment_uids"] == ["uid-main"]
+        assert fin["recover_verification"]["level"] == "recovered"
+
+    @pytest.mark.asyncio
+    async def test_skipped_layer1_keeps_exemption(self, monkeypatch):
+        """Skipped = no deterministic destroy applies (UID typically empty) —
+        a degenerate non-empty UID under skipped still exempts; the sweep is
+        not a second opinion on the main flow's N/A verdict. The full verdict
+        still settles the degenerate UID on the ledger (round-32 death wing:
+        ``skipped`` itself says no experiment to destroy, so retiring the
+        name is bookkeeping, not a claim of a dispatched destroy)."""
+        state = self._state(layer1_status="skipped")
+        calls = self._patch_destroy(monkeypatch)
+
+        fin = await _drive_finalize(state, {})
+
+        assert calls == []
+        assert fin["retired_experiment_uids"] == ["uid-main"]
+
+    def test_helper_predicate_is_fail_closed(self):
+        """The gate's single decision table: only proving statuses exempt.
+        Every non-proving vocabulary (failed/error/unknown/in_progress/
+        empty/None) sweeps — pinned so a future status addition cannot
+        silently inherit the exemption."""
+        from chaos_agent.agent.nodes.recover._recover_finalize import (
+            _sweep_exempts_identity_uid,
+        )
+        from chaos_agent.agent.result.verdict import Layer1Status
+
+        # BOTH arms: the enum (what the finalize's cache-restored object
+        # actually carries) and the plain string (dict payloads).
+        assert _sweep_exempts_identity_uid(Layer1Status.PASSED) is True
+        assert _sweep_exempts_identity_uid(Layer1Status.SKIPPED) is True
+        assert _sweep_exempts_identity_uid("passed") is True
+        assert _sweep_exempts_identity_uid("skipped") is True
+        for status in (
+            Layer1Status.FAILED,
+            Layer1Status.ERROR,
+            Layer1Status.UNKNOWN,
+            Layer1Status.IN_PROGRESS,
+            "failed",
+            "error",
+            "unknown",
+            "in_progress",
+            "",
+            None,
+        ):
+            assert _sweep_exempts_identity_uid(status) is False, status

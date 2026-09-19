@@ -175,6 +175,22 @@ class TestKnownReadOnlyTools:
             "read_file",
             "save_fault_plan",
             "finish_planning",
+            # Control-signal ledger tools — the same READONLY short-circuit
+            # whitelist in classifier.py. ``finish_execution`` is the B81
+            # anchor: it was added with the #39 clean-exit fix (tool +
+            # factory binding + prompt teaching) but never made it into the
+            # classifier whitelist, so the guard answered the prompt-taught
+            # STOP call with REJECT_UNKNOWN and the model improvised an
+            # update_progress phase-write downgrade (case-36 retest,
+            # 3 wasted rounds). The rest of the whitelist members are
+            # locked here too so a future removal fails red, not silent.
+            "update_progress",
+            "finish_execution",
+            "time_wait",
+            "request_replan",
+            "propose_plan_change",
+            "submit_verification",
+            "submit_recover_verification",
         ],
     )
     def test_known_readonly_tools(self, tool):
@@ -373,6 +389,435 @@ class TestBladeCreate:
         )
         assert et.confidence == ConfidenceLevel.LOW
 
+    # -- flags-carried identity flags (probe D5/D6, blade CLI live) ------
+
+    @pytest.mark.parametrize(
+        "flags",
+        [
+            "--names evil-pod",
+            "--names=evil-pod",
+            "--labels app=evil-app",
+            "--namespace kube-system",
+            "--namespace=kube-system",
+            "--kubeconfig /tmp/other.kubeconfig",
+            "--uid 12345-evil-uid",
+            "--evict-count 1",
+            "--evict-percent 30",
+            "--kubewiz-url https://evil.example.com",
+            "--names evil-pod --namespace kube-system",
+            "--cpu-percent 80 --names evil-pod",
+        ],
+        ids=[
+            "names", "names-glued", "labels", "namespace", "ns-glued",
+            "kubeconfig", "uid", "evict-count", "evict-percent",
+            "kubewiz-url", "names-plus-namespace", "scene-plus-names",
+        ],
+    )
+    def test_flags_identity_flag_is_banned(self, flags):
+        """The executor appends ``flags`` AFTER the dedicated params and
+        blade CLI lets a repeated matcher flag override them (live probe:
+        ``--names drill-t ... --names ghost-b`` created an experiment whose
+        CRD matcher recorded ONLY ghost-b; double ``--namespace`` took
+        kube-system over default the same way). A flags-embedded identity
+        flag therefore rides along with whatever the guard anchored —
+        banned before any anchoring, same legislation as the kubectl
+        channel's decoy-route ban."""
+        et = infer_effective_target(
+            "blade_create",
+            {
+                "scope": "pod",
+                "target": "cpu",
+                "action": "fullload",
+                "namespace": "default",
+                "names": "drill-t",
+                "flags": flags,
+            },
+        )
+        assert et.scope == SCOPE_BANNED
+        assert "identity flag" in (et.reject_detail or "")
+        assert "dedicated params" in (et.reject_suggestion or "")
+
+    def test_flags_scene_flags_stay_legal(self):
+        """Scene flags tune the fault, never select the target — the denylist
+        is the closed identity/environment set, not an open flag ban."""
+        et = infer_effective_target(
+            "blade_create",
+            {
+                "scope": "pod",
+                "target": "cpu",
+                "action": "fullload",
+                "namespace": "default",
+                "names": "drill-t",
+                "flags": "--cpu-percent 80 --time 3000",
+            },
+        )
+        assert et.scope == "pod"
+        assert et.names == ("drill-t",)
+
+    def test_flags_container_names_stay_legal(self):
+        """--container-names/--container-ids are deliberately NOT on the
+        denylist: container selection happens WITHIN the --names-selected
+        pods and cannot change the pod-level anchor (scope=container calls
+        REQUIRE them per the tool docstring)."""
+        et = infer_effective_target(
+            "blade_create",
+            {
+                "scope": "container",
+                "target": "process",
+                "action": "kill",
+                "namespace": "default",
+                "names": "drill-t",
+                "flags": "--container-names main --process java",
+            },
+        )
+        assert et.scope == "pod"
+        assert et.names == ("drill-t",)
+
+
+class TestInlineBladeIdentityFlags:
+    """Repeated identity flags in an inline ``blade create`` CLI stream.
+
+    blade CLI follows pflag LAST-WINS (live probe D8: ``--names drill-t
+    --names evil-pod`` produced a CRD whose matcher recorded only
+    evil-pod) while the inline parsers take the FIRST — conflicting
+    repeats are a first-vs-last anchoring divergence, so they are
+    form-issues (identical repeats stay legal, same legislation as the
+    kubectl --namespace consistency gate).
+    """
+
+    def _classify(self, *tokens: str):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        inner = ["blade", "create", "k8s", "pod-cpu", "fullload", *tokens]
+        return classify_inline_blade(
+            inner, "kubectl exec toolpod -- " + " ".join(inner),
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+
+    def test_double_names_conflicting_is_banned(self):
+        et = self._classify("--names", "drill-t", "--names", "evil-pod")
+        assert et.scope == SCOPE_BANNED
+        assert "repeats the identity flag --names" in (et.reject_detail or "")
+
+    def test_double_namespace_conflicting_is_banned(self):
+        et = self._classify(
+            "--names", "drill-t", "--namespace", "default",
+            "--namespace", "kube-system",
+        )
+        assert et.scope == SCOPE_BANNED
+
+    def test_glued_double_values_banned(self):
+        et = self._classify("--names=drill-t", "--names=evil")
+        assert et.scope == SCOPE_BANNED
+
+    def test_mixed_spelling_double_values_banned(self):
+        et = self._classify("--names", "drill-t", "--names=", "evil")
+        assert et.scope == SCOPE_BANNED
+
+    def test_identical_repeat_stays_legal(self):
+        et = self._classify("--names", "drill-t", "--names", "drill-t")
+        assert et.scope == "pod"
+        assert et.names == ("drill-t",)
+
+    def test_single_flag_baseline_unchanged(self):
+        et = self._classify(
+            "--names", "drill-t", "--namespace", "default",
+        )
+        assert et.scope == "pod"
+        assert et.names == ("drill-t",)
+        assert et.namespace == "default"
+
+    def test_scene_flags_unchanged(self):
+        et = self._classify(
+            "--names", "drill-t", "--cpu-percent", "80", "--time", "3000",
+        )
+        assert et.scope == "pod"
+        assert et.names == ("drill-t",)
+
+    def test_destroy_routes_to_unknown_with_uid(self):
+        """Twelfth-round E3 reversal: inline destroy is MUTATING cleanup,
+        not read-only. The readonly verdict let ANY UID pass with zero
+        provenance (foreign experiments destroyable over the kubectl-exec
+        channel). The classifier now routes destroy to SCOPE_UNKNOWN with
+        the UID extracted, so the screener's provenance gate runs; the
+        old assertion merely checked "not banned" and fossilised the
+        read-only classification itself.
+        """
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        et = classify_inline_blade(
+            ["blade", "destroy", "aa11bb22cc33dd44"], "x",
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.blade_destroy_uid == "aa11bb22cc33dd44"
+        assert "provenance" in (et.reject_detail or "")
+
+
+class TestInlineBladeDestroyProvenance:
+    """UID extraction + vocabulary split for inline blade destroy/revoke.
+
+    The same mutating action the blade_destroy tool face performs,
+    arriving over ``kubectl exec POD -- blade destroy <uid>`` — the
+    in-cluster delivery the registry itself instructs when the
+    dedicated tool is capability-blocked. The classifier must extract
+    the UID (both spellings) and route to SCOPE_UNKNOWN so the shared
+    provenance gate can judge it; genuine reads (status/query/version)
+    keep the read-only fast path.
+    """
+
+    def _destroy(self, *tokens: str):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        inner = ["blade", "destroy", *tokens]
+        return classify_inline_blade(
+            inner, "kubectl exec toolpod -- " + " ".join(inner),
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+
+    def test_positional_uid_extracted(self):
+        et = self._destroy("aabbccdd0011ee22")
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.blade_destroy_uid == "aabbccdd0011ee22"
+
+    def test_flag_uid_extracted(self):
+        et = self._destroy("--uid", "aabbccdd0011ee22")
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.blade_destroy_uid == "aabbccdd0011ee22"
+
+    def test_glued_flag_uid_extracted(self):
+        et = self._destroy("--uid=aabbccdd0011ee22")
+        assert et.blade_destroy_uid == "aabbccdd0011ee22"
+
+    def test_repeated_flag_uid_last_wins(self):
+        # pflag last-wins: blade acts on the LAST --uid, so the provenance
+        # gate must see exactly that value.
+        et = self._destroy("--uid", "1111222233334444", "--uid", "5555666677778888")
+        assert et.blade_destroy_uid == "5555666677778888"
+
+    def test_flag_beats_positional(self):
+        et = self._destroy("aaaabbbbccccdddd", "--uid", "eeeeffff00001111")
+        assert et.blade_destroy_uid == "eeeeffff00001111"
+
+    def test_revoke_is_destroy_shaped(self):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        et = classify_inline_blade(
+            ["blade", "revoke", "aabbccdd0011ee22"], "x",
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.blade_destroy_uid == "aabbccdd0011ee22"
+
+    def test_destroy_without_uid_is_form_issue(self):
+        et = self._destroy()
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.blade_destroy_uid == ""
+        assert "no experiment UID" in (et.reject_detail or "")
+        assert (et.reject_suggestion or "").startswith("Pass the experiment UID")
+
+    @pytest.mark.parametrize("verb", ["status", "query", "version"])
+    def test_genuine_reads_stay_readonly(self, verb):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        et = classify_inline_blade(
+            ["blade", verb], "x",
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+        assert et.scope == SCOPE_READONLY
+        assert et.blade_destroy_uid == ""
+
+    def test_kubectl_exec_destroy_carries_uid_through_full_path(self):
+        """E3 reversal through the full kubectl-exec recursion: the
+        delegation must preserve the uid field, not just the scope."""
+        et = infer_effective_target(
+            "kubectl",
+            {
+                "command": [
+                    "exec", "chaosblade-tool-x", "-n", "chaosblade",
+                    "--", "blade", "destroy", "aabbccdd0011ee22",
+                ],
+            },
+        )
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.blade_destroy_uid == "aabbccdd0011ee22"
+
+    def test_value_taking_flag_value_not_mistaken_for_uid(self):
+        """Round-14 F3: a separated value-taking flag before the UID used
+        to hand its VALUE to the provenance gate (``--kubeconfig /root/kc
+        <uid>`` → gate queried "/root/kc") — a UID the whitelist can never
+        match, a fail-closed false refusal of the task's own cleanup."""
+        et = self._destroy("--kubeconfig", "/root/kc", "aabbccdd0011ee22")
+        assert et.blade_destroy_uid == "aabbccdd0011ee22"
+
+    def test_boolean_flag_before_uid_unchanged(self):
+        # Boolean blade flags take no value — the next token is still the
+        # positional UID (the skip logic must ONLY trigger on value flags).
+        et = self._destroy("--no-color", "aabbccdd0011ee22")
+        assert et.blade_destroy_uid == "aabbccdd0011ee22"
+
+    def test_glued_value_flag_not_confused_with_uid(self):
+        # Glued spellings carry their value after '='; the walk must not
+        # then ALSO skip the next positional token.
+        et = self._destroy("--kubeconfig=/root/kc", "aabbccdd0011ee22")
+        assert et.blade_destroy_uid == "aabbccdd0011ee22"
+
+
+class TestBladeTimeoutExtraction:
+    """``--timeout`` anchoring on both blade surfaces (E4).
+
+    The timeout bounds the experiment's auto-recovery (layer 3 of the
+    three-layer duration guarantee). The guard's duration net compares
+    the verbatim last-wins value against the frozen contract duration —
+    so both surfaces must report exactly the value the executor's pflag
+    chain would honour, and stay silent (zero) when the call carries
+    none.
+    """
+
+    def test_inline_create_timeout_extracted(self):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        et = classify_inline_blade(
+            [
+                "blade", "create", "k8s", "pod-cpu", "fullload",
+                "--names", "drill-t", "--timeout", "600",
+            ],
+            "kubectl exec toolpod -- blade create k8s pod-cpu fullload",
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+        assert et.scope == "pod"
+        assert et.timeout_seconds == 600
+
+    def test_inline_create_timeout_last_wins(self):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        et = classify_inline_blade(
+            [
+                "blade", "create", "k8s", "pod-cpu", "fullload",
+                "--names", "drill-t",
+                "--timeout", "300", "--timeout", "600",
+            ],
+            "x",
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+        assert et.timeout_seconds == 600
+
+    def test_inline_create_glued_timeout(self):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        et = classify_inline_blade(
+            [
+                "blade", "create", "k8s", "pod-cpu", "fullload",
+                "--names", "drill-t", "--timeout=600",
+            ],
+            "x",
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+        assert et.timeout_seconds == 600
+
+    def test_inline_create_without_timeout_is_zero(self):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        et = classify_inline_blade(
+            [
+                "blade", "create", "k8s", "pod-cpu", "fullload",
+                "--names", "drill-t",
+            ],
+            "x",
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+        assert et.timeout_seconds == 0
+
+    def test_tool_face_flags_timeout_extracted(self):
+        et = infer_effective_target(
+            "blade_create",
+            {
+                "scope": "pod",
+                "target": "cpu",
+                "action": "fullload",
+                "namespace": "default",
+                "names": "drill-t",
+                "flags": "--cpu-percent 80 --timeout 600",
+            },
+        )
+        assert et.scope == "pod"
+        assert et.timeout_seconds == 600
+
+    def test_tool_face_flags_timeout_last_wins(self):
+        et = infer_effective_target(
+            "blade_create",
+            {
+                "scope": "pod",
+                "target": "cpu",
+                "action": "fullload",
+                "namespace": "default",
+                "names": "drill-t",
+                "flags": "--timeout 300 --timeout 999999",
+            },
+        )
+        assert et.timeout_seconds == 999999
+
+    def test_tool_face_flags_glued_timeout(self):
+        et = infer_effective_target(
+            "blade_create",
+            {
+                "scope": "pod",
+                "target": "cpu",
+                "action": "fullload",
+                "namespace": "default",
+                "names": "drill-t",
+                "flags": "--timeout=600",
+            },
+        )
+        assert et.timeout_seconds == 600
+
+    def test_tool_face_flags_without_timeout_is_zero(self):
+        et = infer_effective_target(
+            "blade_create",
+            {
+                "scope": "pod",
+                "target": "cpu",
+                "action": "fullload",
+                "namespace": "default",
+                "names": "drill-t",
+                "flags": "--cpu-percent 80",
+            },
+        )
+        assert et.timeout_seconds == 0
+
+    def test_non_numeric_timeout_is_zero(self):
+        from chaos_agent.agent.providers.chaosblade.provider import (
+            classify_inline_blade,
+        )
+
+        et = classify_inline_blade(
+            [
+                "blade", "create", "k8s", "pod-cpu", "fullload",
+                "--names", "drill-t", "--timeout", "soon",
+            ],
+            "x",
+            fallback_ns="default", fallback_pod="toolpod",
+        )
+        assert et.timeout_seconds == 0
+
 
 # ---------------------------------------------------------------------------
 # kubectl read-only subcommands
@@ -570,6 +1015,37 @@ class TestKubectlPatchSetDelete:
         )
         assert et.scope == "pod"
         assert et.labels == {"app": "x"}
+
+
+class TestKubectlResourceQuota:
+    # The ResourceQuota-exceeded drill (quota caps the namespace pod count,
+    # a scaled-up workload's new replicas fail admission and stay Pending)
+    # creates and deletes a quota in the approved namespace. Before the
+    # ``quota``/``resourcequota`` aliases existed in KIND_ALIASES these
+    # collapsed to __unknown__ (REJECT_UNKNOWN) and the drill step was
+    # unexecutable-by-construction. Verified against a live cluster, where
+    # ``kubectl get quota`` additionally resolves to an Alibaba CRD short
+    # name — the group-qualified ``resourcequotas.v1.`` spelling is the
+    # unambiguous form the case prescribes.
+    @pytest.mark.parametrize(
+        "kind_token",
+        ["quota", "quotas", "resourcequota", "resourcequotas", "resourcequotas.v1."],
+    )
+    @pytest.mark.parametrize("sub", ["create", "delete"])
+    def test_quota_ops_classify_to_resourcequota(self, sub, kind_token):
+        args = [sub, kind_token, "drill-quota", "-n", "app-system"]
+        if sub == "create":
+            args.append("--hard=pods=5")
+        et = infer_effective_target("kubectl", args)
+        assert et.scope == "resourcequota"
+        assert et.namespace == "app-system"
+        assert et.names == ("drill-quota",)
+
+    def test_quota_get_stays_readonly(self):
+        et = infer_effective_target(
+            "kubectl", ["get", "resourcequotas.v1.", "drill-quota", "-n", "app-system"],
+        )
+        assert et.scope == SCOPE_READONLY
 
 
 class TestKubectlRun:
@@ -1025,12 +1501,17 @@ class TestHelpFlagReadonly:
 
 
 # ---------------------------------------------------------------------------
-# Non-create blade inside exec → READONLY
+# Non-create blade inside exec: reads stay READONLY, cleanup is gated
 # ---------------------------------------------------------------------------
 
 
 class TestBladeNonCreateReadonly:
-    """blade status/destroy/query inside kubectl exec should be READONLY."""
+    """blade status/query inside kubectl exec stay READONLY.
+
+    destroy no longer belongs here (twelfth-round E3 reversal): it is
+    MUTATING cleanup whose UID must pass the provenance gate — see
+    ``TestInlineBladeDestroyProvenance`` for the flipped anchor.
+    """
 
     def test_blade_status_inside_exec_is_readonly(self):
         et = infer_effective_target(
@@ -1048,7 +1529,11 @@ class TestBladeNonCreateReadonly:
         )
         assert et.scope == SCOPE_READONLY
 
-    def test_blade_destroy_inside_exec_is_readonly(self):
+    def test_blade_destroy_inside_exec_is_provenance_gated(self):
+        # Twelfth-round E3 reversal: destroy over the exec channel is
+        # MUTATING cleanup, not a read — the readonly verdict let ANY UID
+        # pass with zero provenance. UNKNOWN + extracted UID routes it to
+        # the shared provenance gate at the screener.
         et = infer_effective_target(
             "kubectl",
             [
@@ -1062,7 +1547,8 @@ class TestBladeNonCreateReadonly:
                 "98f70a1b2c3d4e5f",
             ],
         )
-        assert et.scope == SCOPE_READONLY
+        assert et.scope == SCOPE_UNKNOWN
+        assert et.blade_destroy_uid == "98f70a1b2c3d4e5f"
 
     def test_blade_create_with_labels_no_fallback_pod_name(self):
         """When --labels is specified, effective_names should be empty
@@ -1514,15 +2000,49 @@ class TestExecReadonlyProbeReason:
     """
 
     def test_malformed_probe_carries_operator_reason(self):
+        # B46 made `;`/`&&`/`||`-chained all-readonly probes legal, so the
+        # operator-refusal carrier here is a BACKGROUND `&` (still refused).
+        # The assertion target is unchanged: the reason view (not a boolean
+        # flattening) must reach readonly_probe_reason.
         et = infer_effective_target(
             "kubectl_read",
             {
                 "subcommand": "exec",
-                "v_args": "pod-x -n ns -- sh -c 'echo OK; command -v stress-ng'",
+                "v_args": "pod-x -n ns -- sh -c 'df -h & cat /etc/passwd'",
             },
         )
         assert et.scope == "pod"
         assert "shell control operator" in et.readonly_probe_reason
+
+    def test_chained_all_readonly_probe_is_admitted(self):
+        # B46: the [177] verify-phase shape — a compound all-readonly chain
+        # over ONE debug pod — is the same dialect target_guard's execute
+        # bypass already speaks; kubectl_read must not refuse it anymore.
+        et = infer_effective_target(
+            "kubectl_read",
+            {
+                "subcommand": "exec",
+                "v_args": (
+                    "pod-x -n ns -- sh -c 'echo ===T===; "
+                    "nsenter -t 1 -m -u -i -n -p -- df -h; "
+                    "nsenter -t 1 -m -u -i -n -p -- iostat -xd 1 2'"
+                ),
+            },
+        )
+        assert not et.readonly_probe_reason
+        assert et.scope == "__readonly__"
+
+    def test_chained_probe_with_mutation_segment_refused(self):
+        # One mutating segment poisons the whole chain — fail closed.
+        et = infer_effective_target(
+            "kubectl_read",
+            {
+                "subcommand": "exec",
+                "v_args": "pod-x -n ns -- sh -c 'cat /proc/diskstats; rm -rf /tmp/x'",
+            },
+        )
+        assert et.readonly_probe_reason is not None
+        assert "rm" in et.readonly_probe_reason
 
     def test_unknown_binary_carries_binary_reason(self):
         et = infer_effective_target(

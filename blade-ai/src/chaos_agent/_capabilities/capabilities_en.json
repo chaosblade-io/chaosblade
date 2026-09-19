@@ -3,7 +3,7 @@
   "lang": "en",
   "generated_at": "2026-08-25T04:54:50.798021+00:00",
   "skills_fingerprint": "42727b6157075309d6ec879199067662",
-  "total": 91,
+  "total": 90,
   "cases": [
     {
       "id": "host.host.cpu.fullload",
@@ -1234,67 +1234,6 @@
       "structured_cmd": "blade-ai inject --scope container --target network --action drop --labels app=<app> --namespace <ns> --params container-names=<sidecar-container-name>,source-port=<port>,timeout=<duration> --kubeconfig <kubeconfig>"
     },
     {
-      "id": "k8s.container.container.remove",
-      "skill": "k8s-chaos-skills",
-      "family": "k8s",
-      "profile": "k8s",
-      "scope": "container",
-      "target": "container",
-      "action": "remove",
-      "cluster_scoped": false,
-      "title": "Sidecar Container Removal",
-      "category": "Container_被删除",
-      "symptom": "The specified sidecar container is removed from the Pod and recreated by kubelet, causing a new container ID, restart count increase, and brief service interruption.",
-      "case_path": "references/catalogue/Container_被删除/Container_被删除_Sidecar容器被移除.md",
-      "nl_cmd": "blade-ai inject -i \"Remove the sidecar container <name> from Pods labeled app=<app> in namespace <namespace> for <duration> using kubeconfig <kubeconfig>\"",
-      "params": [
-        {
-          "name": "labels",
-          "kind": "target_resource",
-          "resolved_from": "environment",
-          "required": true,
-          "default": "",
-          "description": "Label selector identifying the target Pod(s), for example app=<app>."
-        },
-        {
-          "name": "namespace",
-          "kind": "target_resource",
-          "resolved_from": "environment",
-          "required": true,
-          "default": "",
-          "description": "Namespace of the target Pod."
-        },
-        {
-          "name": "container-names",
-          "kind": "target_resource",
-          "resolved_from": "environment",
-          "required": true,
-          "default": "",
-          "description": "Name of the sidecar container to remove."
-        },
-        {
-          "name": "timeout",
-          "kind": "fault_param",
-          "resolved_from": "user",
-          "required": false,
-          "default": "",
-          "description": "Duration for which the container removal fault remains active."
-        },
-        {
-          "name": "kubeconfig",
-          "kind": "target_resource",
-          "resolved_from": "environment",
-          "required": true,
-          "default": "",
-          "description": "Path to the kubeconfig file used to access the Kubernetes cluster."
-        }
-      ],
-      "executable": true,
-      "use_case_name": "Sidecar容器被移除 导致 Container_被删除",
-      "inject_kind": "blade",
-      "structured_cmd": "blade-ai inject --scope container --target container --action remove --labels app=<app> --namespace <ns> --params container-names=<sidecar-container-name>,timeout=<duration> --kubeconfig <kubeconfig>"
-    },
-    {
       "id": "k8s.container.process.stop",
       "skill": "k8s-chaos-skills",
       "family": "k8s",
@@ -1374,9 +1313,9 @@
       "cluster_scoped": false,
       "title": "Sidecar process kill",
       "category": "Container_进程异常",
-      "symptom": "Sidecar container restarts after its process is killed while the pod and other containers remain running.",
+      "symptom": "Sidecar container is repeatedly terminated and recreated during the fault window; its restartCount keeps growing while the main container and the pod stay unaffected.",
       "case_path": "references/catalogue/Container_进程异常/Container_进程异常_Sidecar进程被杀死.md",
-      "nl_cmd": "blade-ai inject -i \"Kill process <process-name> in sidecar container <sidecar-container-name> of pods labeled app=<app> in namespace <namespace> with signal 15 for <duration>, using kubeconfig <kubeconfig>\"",
+      "nl_cmd": "blade-ai inject -i \"在 <duration> 秒故障窗口内持续终止重建 <namespace> 中标签为 <labels> 的 Pod 的 Sidecar 容器 <container-names>（节点侧 crictl stop 有界循环，sandbox 限定目标 Pod），使用 <kubeconfig>\"",
       "params": [
         {
           "name": "labels",
@@ -1384,7 +1323,7 @@
           "resolved_from": "environment",
           "required": true,
           "default": "",
-          "description": "Label selector used to identify the target pod, for example app=<app>."
+          "description": "目标 Pod 的标签选择器"
         },
         {
           "name": "namespace",
@@ -1392,7 +1331,7 @@
           "resolved_from": "environment",
           "required": true,
           "default": "",
-          "description": "Namespace of the target pod."
+          "description": "目标 Pod 所在的命名空间"
         },
         {
           "name": "kubeconfig",
@@ -1400,7 +1339,7 @@
           "resolved_from": "environment",
           "required": true,
           "default": "",
-          "description": "Kubeconfig path used to access the Kubernetes cluster."
+          "description": "访问 Kubernetes 集群的 kubeconfig 路径"
         },
         {
           "name": "container-names",
@@ -1408,23 +1347,7 @@
           "resolved_from": "environment",
           "required": true,
           "default": "",
-          "description": "Name of the sidecar container whose process will be killed."
-        },
-        {
-          "name": "process",
-          "kind": "fault_param",
-          "resolved_from": "user",
-          "required": true,
-          "default": "",
-          "description": "Actual process name inside the sidecar container to kill; must be confirmed by ps."
-        },
-        {
-          "name": "signal",
-          "kind": "fault_param",
-          "resolved_from": "user",
-          "required": false,
-          "default": "15",
-          "description": "Signal sent to kill the process; 15 means SIGTERM."
+          "description": "Sidecar 容器名；循环内 crictl ps --name 依赖它"
         },
         {
           "name": "timeout",
@@ -1432,13 +1355,13 @@
           "resolved_from": "user",
           "required": true,
           "default": "",
-          "description": "Duration for which ChaosBlade keeps injecting the process kill fault."
+          "description": "故障窗口总时长（秒），即持续终止重建的时长；必填契约，一次性杀死形态已废除"
         }
       ],
       "executable": true,
       "use_case_name": "Sidecar进程被杀死 导致 Container_进程异常",
-      "inject_kind": "blade",
-      "structured_cmd": "blade-ai inject --scope container --target process --action kill --labels app=<app> --namespace <ns> --params container-names=<sidecar-container-name>,process=<process-name>,signal=15,timeout=<duration> --kubeconfig <kubeconfig>"
+      "inject_kind": "kubectl",
+      "structured_cmd": "blade-ai inject --scope container --target process --action kill --labels app=<app> --namespace <ns> --params timeout=<duration> --kubeconfig <kubeconfig>"
     },
     {
       "id": "k8s.node.schedule.taint",
@@ -3580,7 +3503,7 @@
       "category": "Pod_被删除",
       "symptom": "",
       "case_path": "references/catalogue/Pod_被删除/Pod_被删除_Pod故障.md",
-      "nl_cmd": "blade-ai inject -i \"删除 <namespace> 中由 <labels> 标签选择器匹配的 Pod；若指定 <timeout> 秒，则在该时间窗口内持续删除控制器重建出的 Pod，使用 <kubeconfig>\"",
+      "nl_cmd": "blade-ai inject -i \"在 <duration> 秒故障窗口内持续删除 <namespace> 中由 <labels> 标签选择器匹配的 Pod（载体内墙钟时限有界删除循环，控制器每次重建后立即被再次删除），使用 <kubeconfig>\"",
       "params": [
         {
           "name": "labels",
@@ -3610,15 +3533,15 @@
           "name": "timeout",
           "kind": "fault_param",
           "resolved_from": "user",
-          "required": false,
+          "required": true,
           "default": "",
-          "description": "持续删除的时间窗口（秒）；在该窗口内控制器重建出的 Pod 会被再次删除，未指定时表现为单次删除"
+          "description": "故障窗口总时长（秒），即持续删除的时长；必填契约，一次性删除形态已废除"
         }
       ],
       "executable": true,
       "use_case_name": "Pod故障 导致 Pod_被删除",
       "inject_kind": "kubectl",
-      "structured_cmd": "blade-ai inject --scope pod --target pod --action delete --labels app=<app> --namespace <ns> --params timeout=<seconds> --kubeconfig <kubeconfig>"
+      "structured_cmd": "blade-ai inject --scope pod --target pod --action delete --labels app=<app> --namespace <ns> --params timeout=<duration> --kubeconfig <kubeconfig>"
     },
     {
       "id": "k8s.node.disk.fill.2",
@@ -3753,63 +3676,55 @@
       "cluster_scoped": false,
       "title": "Kill Pod main process",
       "category": "Pod_进程被杀死",
-      "symptom": "Container main process is killed, causing container restarts and increasing Pod restart count.",
+      "symptom": "Container is repeatedly terminated and recreated during the fault window; Pod restart count keeps growing and may enter CrashLoopBackOff.",
       "case_path": "references/catalogue/Pod_进程被杀死/Pod_进程被杀死_应用主进程异常.md",
-      "nl_cmd": "blade-ai inject -i \"Kill process <process> in pods labeled app=<name> in namespace <namespace> with signal <signal> for <timeout> seconds using kubeconfig <kubeconfig>\"",
+      "nl_cmd": "blade-ai inject -i \"在 <duration> 秒故障窗口内持续终止重建 <namespace> 中标签为 <labels> 的 Pod 的容器 <container-name>（节点侧 crictl stop 有界循环，经 debug pod 注入），使用 <kubeconfig>\"",
       "params": [
         {
           "name": "labels",
           "kind": "target_resource",
           "resolved_from": "environment",
           "required": true,
-          "default": "app=<app>",
-          "description": "Label selector identifying target pods, e.g. app=<name>."
+          "default": "",
+          "description": "目标 Pod 的标签选择器，例如 app=<name>"
         },
         {
           "name": "namespace",
           "kind": "target_resource",
           "resolved_from": "environment",
           "required": true,
-          "default": "<namespace>",
-          "description": "Namespace of the target pods."
+          "default": "",
+          "description": "目标 Pod 所在的命名空间"
         },
         {
           "name": "kubeconfig",
           "kind": "target_resource",
           "resolved_from": "environment",
           "required": true,
-          "default": "<kubeconfig>",
-          "description": "Path to the kubeconfig file used to access the Kubernetes cluster."
+          "default": "",
+          "description": "访问 Kubernetes 集群的 kubeconfig 路径"
         },
         {
-          "name": "process",
-          "kind": "fault_param",
-          "resolved_from": "user",
+          "name": "container-name",
+          "kind": "target_resource",
+          "resolved_from": "environment",
           "required": true,
-          "default": "<process>",
-          "description": "Actual process binary name inside the container to kill."
-        },
-        {
-          "name": "signal",
-          "kind": "fault_param",
-          "resolved_from": "user",
-          "required": false,
-          "default": "15",
-          "description": "Signal sent to the process; 15 is SIGTERM and 9 is SIGKILL."
+          "default": "",
+          "description": "目标容器名；循环内 crictl ps --name 依赖它，多容器 Pod 必须核对归属"
         },
         {
           "name": "timeout",
           "kind": "fault_param",
           "resolved_from": "user",
           "required": true,
-          "default": "<timeout>",
-          "description": "Duration in seconds for which the process kill is maintained."
+          "default": "",
+          "description": "故障窗口总时长（秒），即持续终止重建的时长；必填契约，一次性杀死形态已废除"
         }
       ],
       "executable": true,
       "use_case_name": "应用主进程异常 导致 Pod_进程被杀死",
-      "inject_kind": "blade",
-      "structured_cmd": "blade-ai inject --scope pod --target process --action kill --labels app=<app> --namespace <namespace> --params process=<process>,signal=15,timeout=<timeout> --kubeconfig <kubeconfig>"
+      "inject_kind": "kubectl",
+      "structured_cmd": "blade-ai inject --scope pod --target process --action kill --labels app=<app> --namespace <ns> --params timeout=<duration> --kubeconfig <kubeconfig>"
     },
     {
       "id": "k8s.deployment.image.patch",
@@ -4132,7 +4047,7 @@
       "category": "Service_调用失败",
       "symptom": "",
       "case_path": "references/catalogue/Service_调用失败/Service_调用失败_kube-proxy异常.md",
-      "nl_cmd": "blade-ai inject -i \"在 <node> 节点上杀死 kube-proxy 进程，持续 <duration> 秒，使用 <kubeconfig> 访问集群，制造节点 Service 转发规则停滞\"",
+      "nl_cmd": "blade-ai inject -i \"在 <duration> 秒故障窗口内使 <node> 节点的 kube-proxy 持续缺位（标签排除调度方式）或持续挂起（STOP 方式，受 liveness 阈值约束），使用 <kubeconfig> 访问集群，制造节点 Service 转发规则停滞\"",
       "params": [
         {
           "name": "node",
@@ -4151,26 +4066,18 @@
           "description": "目标集群的 kubeconfig 路径"
         },
         {
-          "name": "process",
-          "kind": "fault_param",
-          "resolved_from": "user",
-          "required": true,
-          "default": "kube-proxy",
-          "description": "要杀死的进程名称，本用例固定为 kube-proxy"
-        },
-        {
           "name": "timeout",
           "kind": "fault_param",
           "resolved_from": "user",
           "required": true,
           "default": "",
-          "description": "故障持续时间，单位秒，到期后实验自动结束"
+          "description": "故障窗口总时长（秒）；一次性杀进程形态已废除"
         }
       ],
       "executable": true,
       "use_case_name": "kube-proxy异常 导致 Service_调用失败",
-      "inject_kind": "blade",
-      "structured_cmd": "blade-ai inject --scope node --target process --action kill -n <node> --params process=kube-proxy,timeout=<duration> --kubeconfig <kubeconfig>"
+      "inject_kind": "kubectl",
+      "structured_cmd": "blade-ai inject --scope node --target process --action kill -n <node> --params timeout=<duration> --kubeconfig <kubeconfig>"
     },
     {
       "id": "k8s.service.endpoint.patch",
@@ -4231,44 +4138,52 @@
       "family": "k8s",
       "profile": "k8s",
       "scope": "pod",
-      "target": "process",
-      "action": "kill",
+      "target": "network",
+      "action": "drop",
       "cluster_scoped": false,
-      "title": "后端 Pod 进程终止",
+      "title": "后端不可达",
       "category": "Service_负载均衡异常",
-      "symptom": "",
+      "symptom": "Backend pod network is continuously cut off during the fault window; the Service load balancer cannot forward requests, causing 5xx errors or connection timeouts.",
       "case_path": "references/catalogue/Service_负载均衡异常/Service_负载均衡异常_后端不可达.md",
-      "nl_cmd": "blade-ai inject -i \"对 <namespace> 命名空间中应用 <name> 的后端 Pod 注入进程终止故障，使后端不可达并触发 Service Endpoints 移除，使用 <kubeconfig> 访问集群\"",
+      "nl_cmd": "blade-ai inject -i \"在 <duration> 秒故障窗口内持续断开 <namespace> 中标签为 app=<app> 的后端 Pod 网络（pod-network drop，tc 规则状态贯穿窗口），使 Service 后端不可达\"",
       "params": [
         {
           "name": "labels",
           "kind": "target_resource",
           "resolved_from": "environment",
           "required": true,
-          "default": "app=<app>",
-          "description": "用于定位后端 Pod 的标签选择器，例如 app=<app>"
+          "default": "",
+          "description": "后端 Pod 的标签选择器，例如 app=<app>"
         },
         {
           "name": "namespace",
           "kind": "target_resource",
           "resolved_from": "environment",
           "required": true,
-          "default": "<ns>",
+          "default": "",
           "description": "后端 Pod 所在的命名空间"
         },
         {
-          "name": "kubeconfig",
-          "kind": "target_resource",
-          "resolved_from": "environment",
+          "name": "timeout",
+          "kind": "fault_param",
+          "resolved_from": "user",
           "required": true,
-          "default": "<kubeconfig>",
-          "description": "访问目标 Kubernetes 集群的 kubeconfig 路径"
+          "default": "",
+          "description": "故障窗口总时长（秒），到期实验自动销毁恢复；必填契约"
+        },
+        {
+          "name": "source-port",
+          "kind": "fault_param",
+          "resolved_from": "user",
+          "required": false,
+          "default": "",
+          "description": "可选端口过滤，仅断开指定服务端口的流量以缩小爆炸半径"
         }
       ],
       "executable": true,
       "use_case_name": "后端不可达 导致 Service_负载均衡异常",
       "inject_kind": "blade",
-      "structured_cmd": "blade-ai inject --scope pod --target process --action kill --labels app=<app> --namespace <ns> --kubeconfig <kubeconfig>"
+      "structured_cmd": "blade-ai inject --scope pod --target network --action drop --labels app=<app> --namespace <ns> --params timeout=<duration> --kubeconfig <kubeconfig>"
     },
     {
       "id": "k8s.deployment.replicas.scale.2",

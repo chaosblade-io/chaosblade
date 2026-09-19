@@ -153,12 +153,20 @@ async def test_write_operation_summary_rejects_reserved_state_update_keys():
 
 
 def test_operation_summary_persistence_paths_use_shared_writer():
-    """Server/CLI orchestration must not reimplement summary persistence."""
+    """Server/CLI orchestration must not reimplement summary persistence.
+
+    ``cli/runner.py`` left this checklist on 2026-09-01, when the local
+    ``converse_stream`` twin (the only CLI-side orchestration that wrote an
+    operation summary back to an intent graph) was retired with zero
+    callers — the server ``/turn`` flow is the single TUI conversation entry
+    point now. The plain CLI inject paths run the pipeline graph directly
+    (no intent-graph thread to summarize back into), so they have nothing
+    to persist through the shared writer.
+    """
 
     checked_files = [
         "src/chaos_agent/server/routes/turn_event_stream.py",
         "src/chaos_agent/server/routes/recover_stream.py",
-        "src/chaos_agent/cli/runner.py",
     ]
     forbidden_snippets = [
         "SystemMessage(content=summary",

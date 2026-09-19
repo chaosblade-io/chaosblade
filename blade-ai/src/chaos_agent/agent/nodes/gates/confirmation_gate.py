@@ -11,6 +11,15 @@ from chaos_agent.agent.spec.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState
 from chaos_agent.agent.state_mgmt.state_helpers import fail_state
 from chaos_agent.agent.target_guard import freeze_approved_target_from_spec
+from chaos_agent.agent.target_guard.freeze import approved_from_dict
+from chaos_agent.agent.target_guard.mechanism_writes import (
+    entries_beyond_victim,
+    entries_from_list,
+    format_entries_for_payload,
+)
+from chaos_agent.agent.nodes.gates._write_set_boundary import (
+    write_set_boundary_result,
+)
 from chaos_agent.agent.result.verdict import FailureCategory
 from chaos_agent.observability.status_tracker import (
     get_tracker,
@@ -68,6 +77,25 @@ def _build_plan_preview_markdown(state: dict) -> str:
     return "\n\n".join(parts)
 
 
+def _write_set_widening(state: dict) -> list[dict]:
+    """Manifest entries beyond the victim target's coverage, or ``[]``.
+
+    Reads the snapshot safety_check froze (victim ∪ manifest entries) and
+    applies the coverage predicate: an entry the victim approval — plus its
+    same-namespace secondary net — already governs is NOT widening. The
+    returned payloads render the entries verbatim for the confirmation
+    card and the unattended boundary exit; empty for every case without
+    a manifest, so both surfaces stay unchanged for them.
+    """
+    approved = approved_from_dict(state.get("approved_target") or {})
+    if approved is None:
+        return []
+    beyond = entries_beyond_victim(approved)
+    if not beyond:
+        return []
+    return format_entries_for_payload(beyond)
+
+
 async def confirmation_gate(state: AgentState) -> dict:
     """Pause execution and wait for human confirmation.
 
@@ -109,6 +137,17 @@ async def confirmation_gate(state: AgentState) -> dict:
     # Dry-Run: generate a complete injection plan and emit as AIMessage.
     if state.get("dry_run"):
         plan_text = _generate_dry_run_plan(state)
+        # Widened-contract entries ride the /plan preview verbatim so the
+        # operator sees the case legislation BEFORE issuing /run — the
+        # lift seam's knowledge card then confirms what was previewed.
+        widening = _write_set_widening(state)
+        if widening:
+            from chaos_agent.agent.target_guard.mechanism_writes import (
+                format_mechanism_writes_for_display,
+            )
+            entries_block = format_mechanism_writes_for_display(widening)
+            if entries_block:
+                plan_text = f"{plan_text}\n\n{entries_block}"
         logger.info("dry_run plan generated for task %s", task_id)
         tracker.complete("Dry-Run plan generated")
         sync_node_status_to_session(
@@ -125,8 +164,25 @@ async def confirmation_gate(state: AgentState) -> dict:
         await sync_to_store(state, result)
         return result
 
+    # Widened-contract entries beyond the victim coverage — computed
+    # EARLY because two branches below consult it: the force_override
+    # bypass must not swallow a widened contract (its charter is the
+    # same-action overlay exemption, not write-set authorization), and
+    # the card renders the entries verbatim. Empty for every case
+    # without a manifest.
+    widening = _write_set_widening(state)
+
     # P1: confirm_required with --force-override → skip interrupt
-    if safety_status == "confirm_required" and state.get("force_override"):
+    # A widened write-set contract is EXEMPT from this bypass: the flag's
+    # charter is the same-action overlay exemption only. Widened payloads
+    # keep one unified path — the interrupt below, where interactive
+    # channels render the card and unattended channels take the audited
+    # AUTO delegation (the manifest is the authority either way).
+    if (
+        safety_status == "confirm_required"
+        and state.get("force_override")
+        and not widening
+    ):
         logger.info("confirm_required bypassed via --force-override")
         tracker.complete("Execution auto-approved via --force-override")
         sync_node_status_to_session(state, "confirmation_gate",
@@ -212,8 +268,36 @@ async def confirmation_gate(state: AgentState) -> dict:
         "plan_preview_markdown": _build_plan_preview_markdown(state),
     }
 
-    # P1: confirm_required without --force-override in CLI mode → reject with guidance
-    if safety_status == "confirm_required" and state.get("interaction_mode") == "cli":
+    # Case-level write-set contract, rendered VERBATIM on the card (the
+    # case legislated these entries — not run-time plan prose). Absent
+    # for cases without a manifest, so their card is unchanged.
+    # ``widening`` itself was computed before the force_override branch.
+    if widening:
+        confirmation_info["mechanism_writes"] = widening
+        # Marker for the unattended channels: an auto-approve that covers
+        # a widened payload is an AUDITABLE delegation (the shared helper
+        # routes the ``auto_approved`` event with these entries verbatim —
+        # the manifest is the authority, the guard is the enforcement).
+        # Interactive channels (TUI card, CLI confirm callback) ignore it
+        # and decide through their own human-facing semantics.
+        confirmation_info["write_set_widened"] = {
+            "mechanism_writes": widening,
+        }
+
+    # P1: confirm_required without --force-override in CLI mode → reject
+    # with guidance. A WIDENED contract is exempt from this short-circuit:
+    # its rejection message ("Add --force-override") would be misleading —
+    # under AUTO delegation the widened contract proceeds WITHOUT any
+    # flag (the manifest is the authority; the runner emits the audited
+    # auto-approve), so the short-circuit would add friction that solves
+    # nothing. Widened payloads fall through to the interrupt, where the
+    # unattended runner takes the audited delegation path and interactive
+    # channels render the card.
+    if (
+        safety_status == "confirm_required"
+        and state.get("interaction_mode") == "cli"
+        and not widening
+    ):
         safety_reason = state.get("safety_reason", "")
         logger.info("confirm_required rejected: no --force-override in CLI mode")
         tracker.fail("Execution rejected: --force-override required")
@@ -231,6 +315,28 @@ async def confirmation_gate(state: AgentState) -> dict:
 
     # Interrupt and wait for resume
     decision = interrupt(confirmation_info)
+
+    if decision == "write_set_boundary":
+        # Defence-in-depth, not a live path: since the AUTO-delegation
+        # flip (2026-09-01) no shipped channel resumes with this signal
+        # — ``unattended_resume_value`` always returns "approved". The
+        # branch stays so a FUTURE channel that (mistakenly or by new
+        # design) sends the boundary signal still terminates cleanly
+        # with the dedicated category and machine-readable payload
+        # instead of falling into an unmatched-decision limbo.
+        logger.info(
+            "write_set_boundary: run declined widened contract "
+            "(%d entries beyond victim coverage)", len(widening),
+        )
+        tracker.fail("Unattended run: widened write-set contract declined")
+        sync_node_status_to_session(state, "confirmation_gate",
+            "Declined: mechanism writes beyond victim target (unattended)",
+            detail={"approved": False, "write_set_boundary": True,
+                    "entries": len(widening)},
+        )
+        result = write_set_boundary_result(state, widening)
+        await sync_to_store(state, result)
+        return result
 
     if decision == "approved":
         tracker.complete("Execution approved by user")
@@ -270,9 +376,17 @@ def _freeze_from_state(state: AgentState) -> dict | None:
     visible in the screener's WARNING log rather than silently
     constructing an empty approval).
 
-    Reuses ``owner_names``, ``resolved_names`` and ``pvc_claims`` from the
-    ``approved_target`` that safety_check already froze (avoiding a redundant
-    cluster query).
+    Reuses ``owner_names``, ``resolved_names``, ``pvc_claims`` AND the
+    case-manifest ``mechanism_entries`` from the ``approved_target``
+    that safety_check already froze (avoiding a redundant cluster
+    query and re-read of the case file — the entries were legislated
+    at settlement and must survive re-freeze unchanged).
+
+    This re-freeze is the SINGLE approval point for the widened
+    contract: ``widening_pending_approval`` deliberately defaults to
+    False here, so a knowing human's "approved" clears the pending
+    marker safety_check stamped — the execute_loop sentinel then lets
+    the run proceed.
     """
     spec = read_fault_spec(state)
     if spec is None:
@@ -281,7 +395,9 @@ def _freeze_from_state(state: AgentState) -> dict | None:
     owner_names = tuple(existing.get("owner_names") or ())
     resolved_names = tuple(existing.get("resolved_names") or ())
     pvc_claims = tuple(existing.get("pvc_claims") or ())
+    mechanism_entries = entries_from_list(existing.get("mechanism_entries"))
     return freeze_approved_target_from_spec(
         spec, owner_names=owner_names, resolved_names=resolved_names,
-        pvc_claims=pvc_claims,
+        pvc_claims=pvc_claims, mechanism_entries=mechanism_entries,
+        widening_pending_approval=False,
     )

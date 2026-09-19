@@ -17,7 +17,7 @@ Pure deterministic message parsing — no LLM calls, no async operations.
 import logging
 import re
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from chaos_agent.agent.node_names import TOOL_RESULT
 from chaos_agent.agent.prompts.reminder import wrap_system_reminder
@@ -39,23 +39,6 @@ _CB_SCOPE_TARGET_ACTION_RE = re.compile(
 # content (not directory listings) will have at least one of these.
 _USE_CASE_MARKERS = ("**故障现象**", "**注入验证**", "**恢复验证**")
 
-# ── Directory name → scope mapping ──
-# Skill catalogue directories are named <层级>_<现象>.
-# ChaosBlade only supports pod/node/container scopes for k8s.
-_DIR_PREFIX_SCOPE_MAP: dict[str, str] = {
-    "Pod": "pod",
-    "Node": "node",
-    "Workload": "pod",
-    "workload": "pod",
-    "Service": "pod",
-    "PVC": "pod",
-    "DaemonSet": "pod",
-    "HPA": "pod",
-    "DNS": "pod",
-    "节点容器运行时": "node",
-}
-
-
 _CASE_NAME_RE = re.compile(r"\*\*用例名称\*\*\s*(.+?)\s*$", re.MULTILINE)
 
 
@@ -72,6 +55,34 @@ def _extract_chosen_skill_case_path(messages: list) -> str:
                 if path:
                     return path
     return ""
+
+
+def _extract_planning_duration(messages: list) -> int:
+    """Extract duration_seconds from the LAST finish_planning tool-call args.
+
+    Mirrors ``_extract_chosen_skill_case_path``: the declaration travels on
+    the tool call itself (a control signal the tool body never consumes —
+    this node reads it from the message history). Only the newest
+    finish_planning counts: earlier declarations died with the planning
+    rounds they belonged to (nudge/replan re-runs). Returns 0 when the
+    call is absent, undeclared, or unparsable — callers treat 0 as
+    "not declared".
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            name = tc.get("name", "") if isinstance(tc, dict) else ""
+            if name != "finish_planning":
+                continue
+            raw = (tc.get("args", {}) if isinstance(tc, dict) else {}).get(
+                "duration_seconds", 0,
+            )
+            try:
+                return max(int(str(raw).strip()), 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def _extract_last_skill_resource_path(messages: list) -> str:
@@ -91,22 +102,6 @@ def _extract_last_skill_resource_path(messages: list) -> str:
             resource_path = tc_args.get("resource_path", "")
             if resource_path and "catalogue" in resource_path:
                 return resource_path
-    return ""
-
-
-def _extract_catalogue_dir_name(case_path: str) -> str:
-    """Extract the first-level directory name under 'catalogue/' from a case path.
-
-    Example:
-        "references/catalogue/Pod_被删除/Pod_被删除_Pod故障.md" → "Pod_被删除"
-    """
-    parts = case_path.split("/")
-    try:
-        catalogue_idx = parts.index("catalogue")
-    except ValueError:
-        return ""
-    if catalogue_idx + 1 < len(parts):
-        return parts[catalogue_idx + 1]
     return ""
 
 
@@ -197,52 +192,78 @@ def _extract_skill_case_from_messages(messages: list, plan: str = "") -> str:
     return candidates[0]
 
 
-def _derive_scope_target_action(skill_case: str) -> tuple[str, str, str]:
-    """Derive blade scope/target/action from skill case content.
+def _extract_planning_fault_identity(messages: list) -> tuple[str, str, str]:
+    """Read the planner's fault-identity declaration from the LAST finish_planning call.
 
-    Searches for ChaosBlade command patterns like ``pod-disk burn``
-    in the skill case content.
+    The declaration (``fault_scope`` / ``fault_target`` / ``fault_action``
+    args) travels on the tool call itself — the tool body never consumes
+    it (the same carrier pattern as ``duration_seconds``; this node reads
+    it from the message history). Only the newest finish_planning counts:
+    earlier declarations died with the planning rounds they belonged to
+    (nudge/replan re-runs). ``save_fault_plan`` is NOT a declaration
+    carrier — a saved draft is not a final decision (route_after_phase1_tools
+    keeps Phase 1 going after a save).
+
+    Returns a normalised (scope, target, action) tuple; every element is
+    "" when the call is absent or undeclared.
+    """
+    def _norm(value: object) -> str:
+        return str(value).strip().lower() if value else ""
+
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            name = tc.get("name", "") if isinstance(tc, dict) else ""
+            if name != "finish_planning":
+                continue
+            args = tc.get("args", {}) if isinstance(tc, dict) else {}
+            return (
+                _norm(args.get("fault_scope")),
+                _norm(args.get("fault_target")),
+                _norm(args.get("fault_action")),
+            )
+    return "", "", ""
+
+
+def _identity_nudge_plan_family_reset() -> dict:
+    """Plan-family reset carried by both identity nudges (F1).
+
+    Both nudges are the first nudge family that fires AFTER a
+    finalised round wrote the plan family into State (the catalogue
+    nudge fires on the rejection round, before any write). Round 2
+    must land its OWN plan — the round-1 plan attacked the identity
+    the nudge is about — so the write-once guards (plan /
+    plan_summary / plan_verification) must re-open.
+    plan_change_confirm's approved branch resets the same seam (plan /
+    plan_path / is_complex / skill_case_content); this is the union of
+    both families.
+    """
+    return {
+        "plan": None,
+        "plan_summary": None,
+        "plan_verification": None,
+        "plan_path": None,
+        "is_complex": False,
+        "skill_case_content": None,
+    }
+
+
+def _derive_scope_target_action(source_text: str) -> tuple[str, str, str]:
+    """Derive blade scope/target/action from the plan's Execution Steps.
+
+    Last-resort tier (B83): only ever applied to text the LLM actually
+    wrote as its plan — never to the skill-case document, which is a
+    menu of main path + backup means whose first blade command hijacked
+    #49's spec from pod to node. Fill-vacuum only: callers ignore every
+    element the spec already carries.
 
     Returns:
         (scope, target, action) tuple. Any element may be "" if not found.
     """
-    for match in _CB_SCOPE_TARGET_ACTION_RE.finditer(skill_case):
+    for match in _CB_SCOPE_TARGET_ACTION_RE.finditer(source_text):
         return match.group("scope"), match.group("target"), match.group("action")
     return "", "", ""
-
-
-def _derive_scope_from_resource_path(messages: list) -> str:
-    """Fallback: derive scope from read_skill_resource resource_path args.
-
-    Scans AIMessages for tool_calls to ``read_skill_resource``, extracts
-    the ``resource_path`` argument, and maps the directory prefix to a scope.
-
-    Example: ``references/catalogue/Pod_磁盘IO过高/...`` → scope=pod
-
-    Returns:
-        scope string, or "" if not found.
-    """
-    for msg in reversed(messages):
-        if not isinstance(msg, AIMessage):
-            continue
-        tool_calls = getattr(msg, "tool_calls", None) or []
-        for tc in tool_calls:
-            tc_name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
-            if tc_name != "read_skill_resource":
-                continue
-            tc_args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
-            resource_path = tc_args.get("resource_path", "")
-            if not resource_path:
-                continue
-            # resource_path format: references/catalogue/<DirPrefix>_.../<file>.md
-            # Extract the directory name prefix
-            parts = resource_path.split("/")
-            for part in parts:
-                # Find the part that matches a known directory prefix
-                for prefix, scope in _DIR_PREFIX_SCOPE_MAP.items():
-                    if part.startswith(prefix):
-                        return scope
-    return ""
 
 
 def _has_browsed_catalogue(messages: list) -> bool:
@@ -356,6 +377,7 @@ async def extract_planning_metadata(state: AgentState) -> dict:
         are already populated.
     """
     from chaos_agent.agent.spec.fault_spec import read_fault_spec
+    from chaos_agent.utils.fault_type import ensure_min_duration
 
     result: dict = {}
     messages = state.get("messages", [])
@@ -375,7 +397,6 @@ async def extract_planning_metadata(state: AgentState) -> dict:
                     not _has_browsed_catalogue(messages)
                     and not state.get("_catalogue_rejection_nudged")
                 ):
-                    from langchain_core.messages import HumanMessage
                     logger.warning(
                         "extract_planning_metadata: LLM rejected without "
                         "browsing catalogue, nudging to browse first"
@@ -417,6 +438,11 @@ async def extract_planning_metadata(state: AgentState) -> dict:
                 # browsed the catalogue (or was already nudged once), so
                 # the rejection is genuine and should be honoured.
                 result["error"] = reason.strip()
+                # The reject node renders safety_reason as the direct cause
+                # (W-56-5 defect c): a planning rejection must land its own
+                # reason there, or a stale gate reason from an earlier
+                # attempt would be attributed instead.
+                result["safety_reason"] = reason.strip()
                 logger.warning(
                     "extract_planning_metadata: LLM rejected planning after "
                     "browsing catalogue. Routing to reject (terminate). "
@@ -535,70 +561,195 @@ async def extract_planning_metadata(state: AgentState) -> dict:
         ))]
         return result
 
-    # 2. fault_spec scope/fault_target/fault_action derivation.
+    # 2. fault_spec identity resolution (B83/B84, #49 post-mortem).
     #
-    # TUI mode: intent_clarification populates the spec from the user's
-    # explicit submit_fault_intent — spec.is_complete is True here, this
-    # block is a no-op.
+    # The planner is the only actor that knows which mechanism the plan
+    # chose, so the identity triple comes from its explicit declaration
+    # on finish_planning (fault_scope / fault_target / fault_action).
+    # Nothing is mined from the skill-case document anymore: a case doc
+    # is a MENU (main path + backup means), and its first blade command
+    # hijacked #49's spec from pod to node — the guard then enforced the
+    # WRONG anchor and the intended fault never happened.
     #
-    # CLI NL mode: the entry point only writes a placeholder spec
-    # (user_description + source). LLM's planning actions (activate
-    # skill, read use-case) carry the fault_type information; without
-    # this lazy derivation, safety_check would reject every CLI NL turn
-    # with "No target specified".
+    # Contract:
+    # - complete identity + matching (or absent) declaration → no-op
+    #   (TUI / structured modes land here)
+    # - incomplete identity + declaration → the declaration is the
+    #   planner's final word: write all three, override-if-different;
+    #   a scope change clears names AND labels (both belong to the old
+    #   scope — B76's kind-consistency lesson, applied to the
+    #   declaration writer)
+    # - complete identity + conflicting declaration → split nudge, once:
+    #   a reviewed identity is never rewritten by a declaration; the
+    #   revision exit is propose_plan_change (user-confirmed)
+    # - incomplete identity + no declaration → derive from the plan's
+    #   Execution Steps (the LLM's actual plan, never the case menu),
+    #   fill-vacuum only; still unresolved after that (kubectl-native
+    #   plan with no blade pattern) → declaration nudge, once; a spec
+    #   that stays incomplete fails safety_check honestly with
+    #   "No target specified" instead of executing a guessed fault
     spec = read_fault_spec(state)
-    if spec is not None and not (
-        spec.scope and spec.fault_target and spec.fault_action
-    ):
-        source_case = (
-            result.get("skill_case_content")
-            or state.get("skill_case_content")
-            or ""
+    updates: dict = {}
+    if spec is not None:
+        identity_complete = bool(
+            spec.scope and spec.fault_target and spec.fault_action
         )
-        derived_scope, derived_target, derived_action = _derive_scope_target_action(source_case)
-        scope_from_blade = bool(derived_scope)
-        if not derived_scope:
-            derived_scope = _derive_scope_from_resource_path(messages)
+        decl_scope, decl_target, decl_action = _extract_planning_fault_identity(messages)
+        declared = bool(decl_scope or decl_target or decl_action)
 
-        # Scope derivation has two sources with different authority:
-        #
-        # 1. ChaosBlade command pattern (scope_from_blade=True):
-        #    AUTHORITATIVE — the blade scope IS the injection scope.
-        #    Always override agent_loop's value, and clear names if
-        #    scope changes (names belong to the old scope).
-        #
-        # 2. Catalogue directory prefix (scope_from_blade=False):
-        #    SYMPTOM-level only (e.g. "Pod_镜像拉取失败" → pod).
-        #    For non-ChaosBlade faults the injection scope comes from
-        #    the kubectl resource type (deployment, node, etc.) which
-        #    agent_loop already derived correctly. Write-once fallback:
-        #    only fill when spec.scope is empty.
-        updates: dict = {}
-        if derived_scope:
-            if scope_from_blade and spec.scope != derived_scope:
-                updates["scope"] = derived_scope
-                if spec.names:
-                    updates["names"] = ()
-            elif not scope_from_blade and not spec.scope:
-                updates["scope"] = derived_scope
-        if derived_target and not spec.fault_target:
-            updates["fault_target"] = derived_target
-        if derived_action and not spec.fault_action:
-            updates["fault_action"] = derived_action
-        if updates:
-            new_spec = spec.replace(**updates)
-            result["fault_spec"] = new_spec.to_dict()
-            logger.debug(
-                "spec-write: writer=extract_planning_metadata "
-                "names %s -> %s basis=skill-case fault_type derivation "
-                "(names never modified here)",
-                list(spec.names), list(new_spec.names),
+        if declared:
+            conflict = (
+                (decl_scope and decl_scope != spec.scope)
+                or (decl_target and decl_target != spec.fault_target)
+                or (decl_action and decl_action != spec.fault_action)
             )
+            if identity_complete and conflict:
+                if not state.get("_identity_split_nudged"):
+                    result["planning_rejected"] = True
+                    result["_identity_split_nudged"] = True
+                    result.update(_identity_nudge_plan_family_reset())
+                    result["messages"] = [HumanMessage(content=wrap_system_reminder(
+                        "**IDENTITY SPLIT**: The fault identity declared in "
+                        "finish_planning conflicts with the reviewed FaultSpec, "
+                        "and a reviewed identity is never rewritten by a "
+                        "declaration.\n\n"
+                        f"- Declared: {decl_scope or '-'}/{decl_target or '-'}/{decl_action or '-'}\n"
+                        f"- Reviewed: {spec.scope}/{spec.fault_target}/{spec.fault_action}\n\n"
+                        "Resolve the split before proceeding:\n"
+                        "1. If the plan's MAIN mechanism really attacks a "
+                        "different identity than reviewed, call "
+                        "`propose_plan_change` with the new triple — the "
+                        "change goes through user confirmation.\n"
+                        "2. Otherwise re-run `finish_planning` with a "
+                        "declaration that matches the reviewed identity.\n\n"
+                        "Do NOT re-declare the same conflicting triple: after "
+                        "this nudge a still-conflicting declaration is "
+                        "discarded and the reviewed identity stands."
+                    ))]
+                    return result
+                # Already nudged once — the reviewed identity stands and the
+                # conflicting declaration is discarded (the guard remains
+                # the final arbiter); fall through without any rewrite.
+            elif not identity_complete:
+                if decl_scope and decl_scope != spec.scope:
+                    updates["scope"] = decl_scope
+                    if spec.names:
+                        updates["names"] = ()
+                    if spec.labels:
+                        updates["labels"] = {}
+                if decl_target and decl_target != spec.fault_target:
+                    updates["fault_target"] = decl_target
+                if decl_action and decl_action != spec.fault_action:
+                    updates["fault_action"] = decl_action
+        elif not identity_complete:
+            # No declaration → derive from the plan's Execution Steps first
+            # (the LLM's actual plan — never the case menu): fill-vacuum
+            # only, zero extra round-trips when the plan itself carries a
+            # blade command.
+            plan_text = result.get("plan") or state.get("plan") or ""
+            derived_scope, derived_target, derived_action = _derive_scope_target_action(
+                _plan_section(plan_text, "execution steps")
+            )
+            if derived_scope and not spec.scope:
+                updates["scope"] = derived_scope
+            if derived_target and not spec.fault_target:
+                updates["fault_target"] = derived_target
+            if derived_action and not spec.fault_action:
+                updates["fault_action"] = derived_action
+            # Still incomplete after the plan tier (kubectl-native plan with
+            # no blade pattern anywhere) → nudge once for an explicit
+            # declaration: only the planner knows which family a
+            # kubectl-native mechanism belongs to, and the system will not
+            # invent it (#49).
+            _spec_after = spec.replace(**updates) if updates else spec
+            if (
+                not (_spec_after.scope and _spec_after.fault_target and _spec_after.fault_action)
+                and not state.get("_identity_declaration_nudged")
+            ):
+                result["planning_rejected"] = True
+                result["_identity_declaration_nudged"] = True
+                result.update(_identity_nudge_plan_family_reset())
+                result["messages"] = [HumanMessage(content=wrap_system_reminder(
+                    "**IDENTITY UNDECLARED**: The plan is finalized but the "
+                    "fault identity (scope / target / action) could not be "
+                    "resolved, and the system will NOT invent one — the "
+                    "skill-case document is a menu (main path + backup means), "
+                    "so copying a triple from it can hijack the injection onto "
+                    "a different fault (#49).\n\n"
+                    "Re-run `finish_planning` declaring the identity triple of "
+                    "the plan's MAIN injection mechanism:\n"
+                    "- fault_scope: pod | node | container\n"
+                    "- fault_target: the resource family attacked (cpu / mem / "
+                    "network / disk / process / ...)\n"
+                    "- fault_action: the fault action (fullload / burn / hold / "
+                    "...)\n\n"
+                    "A kubectl-native mechanism declares the family it belongs "
+                    "to (e.g. a file-descriptor hold is process)."
+                ))]
+                return result
+            # Nudged once, still unresolved → proceed without inventing: an
+            # identity that stays incomplete fails safety_check honestly with
+            # "No target specified" instead of executing a guessed fault.
+
+        # 2b. duration_seconds contract backfill (B14).
+        #
+        # CLI NL mode: from_cli_nl intentionally leaves duration=0 for an
+        # intent-extraction node the pipeline route never visits
+        # (route_pipeline_start sends CLI NL straight to agent_loop;
+        # intent_clarification is TUI-only). Without this backfill the
+        # duration contract stays empty end-to-end (audit snapshots show
+        # duration_seconds=0) and kubectl-native sleep timers ran with no
+        # recorded window at all (#8/#9 evidence: user-asked 300s executed
+        # as 300s, invisible to the contract). The planner's
+        # finish_planning now carries an explicit duration_seconds
+        # declaration; combine it with any hard-pinned entry value (CLI
+        # --duration) monotonically and apply ensure_min_duration
+        # (unspecified → configured default; declared values verbatim),
+        # so every entry path lands the same contract the structured/TUI
+        # constructors already apply.
+        declared_duration = _extract_planning_duration(messages)
+        _dur_candidate = max(declared_duration, spec.duration_seconds)
+        _floor_scope = updates.get("scope") or spec.scope
+        _floor_target = updates.get("fault_target") or spec.fault_target
+        _floor_action = updates.get("fault_action") or spec.fault_action
+        effective_duration = ensure_min_duration(
+            _dur_candidate if _dur_candidate > 0 else None,
+            _floor_scope, _floor_target, _floor_action,
+        )
+        if effective_duration != spec.duration_seconds:
+            updates["duration_seconds"] = effective_duration
             logger.info(
-                "extract_planning_metadata: derived spec fields %s "
-                "(CLI NL or initially incomplete spec path)",
-                {k: v for k, v in updates.items()},
+                "extract_planning_metadata: duration contract backfilled "
+                "declared=%ss previous=%ss effective=%ss (via "
+                "ensure_min_duration)",
+                declared_duration, spec.duration_seconds, effective_duration,
             )
+
+        # 2c. case_resource_path backfill (same spec-backfill family as 2b):
+        # the planner already hands the chosen case path to
+        # finish_planning/save_fault_plan (skill_case_content extraction
+        # reads it above), but the spec's own audit/hint field stayed
+        # empty. Write-once — an intent-dialogue-settled path
+        # (case_resource_path on the TUI spec) always wins.
+        if not spec.case_resource_path:
+            _case_path = _extract_chosen_skill_case_path(messages)
+            if _case_path:
+                updates["case_resource_path"] = _case_path
+
+    if updates:
+        new_spec = spec.replace(**updates)
+        result["fault_spec"] = new_spec.to_dict()
+        logger.debug(
+            "spec-write: writer=extract_planning_metadata "
+            "names %s -> %s basis=skill-case fault_type derivation + "
+            "duration contract backfill (names never modified here)",
+            list(spec.names), list(new_spec.names),
+        )
+        logger.info(
+            "extract_planning_metadata: derived spec fields %s "
+            "(CLI NL or initially incomplete spec path)",
+            {k: v for k, v in updates.items()},
+        )
 
     # Leaving Phase 1 for execution: remove any ephemeral capability-probe
     # debug pods the planner created (via kubectl_read debug) so they do not

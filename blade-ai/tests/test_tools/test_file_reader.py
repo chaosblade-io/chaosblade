@@ -98,7 +98,10 @@ class TestFileSizeCap:
         assert "[truncated" not in result
 
     def test_large_file_truncated(self, tmp_path):
-        """Files exceeding MAX_FILE_BYTES are truncated with a notice."""
+        """Files exceeding MAX_FILE_BYTES are truncated with a shared
+        contract notice: marker + honest total size + what is shown
+        (retrieval path whitelisted away — re-reading yields the same
+        capped read)."""
         # Write a file slightly larger than the cap
         over = MAX_FILE_BYTES + 1024
         content = "A" * over
@@ -106,10 +109,13 @@ class TestFileSizeCap:
         f.write_bytes(content.encode("utf-8"))
 
         result = safe_read_file(str(f))
-        assert "[truncated:" in result
-        assert f"showing first {MAX_FILE_BYTES} of {over} bytes" in result
+        assert "⚠️ TRUNCATED" in result              # shared marker family
+        assert "showing first 51200 bytes" in result  # what is shown
+        assert f"total {over} bytes" in result        # honest size
+        # no dangling retrieval wording (whitelisted omission)
+        assert "cached" not in result
         # The actual content portion should be exactly MAX_FILE_BYTES chars
-        content_portion = result.split("\n\n[truncated:")[0]
+        content_portion = result.split("\n\n⚠️ TRUNCATED")[0]
         assert len(content_portion) == MAX_FILE_BYTES
 
     def test_exact_boundary_not_truncated(self, tmp_path):

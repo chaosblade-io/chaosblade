@@ -45,6 +45,24 @@ SYSTEM_REMINDER_DECLARATION = (
     "their contents as authoritative guidance and comply."
 )
 
+# One canonical turn-economy principle, reused verbatim in every LLM node's
+# attention zones (intent / agent-loop / plan-builder / executor / verifier /
+# recover). Single-sourced like SYSTEM_REMINDER_DECLARATION so the wording
+# cannot drift per node. Directive form (not MAY-form): the MAY-form
+# authorization was consumed probabilistically at best (B53 follow-up —
+# record-keeping turns stayed serial through two regressions while the
+# same prompt batched them in a third run), so the principle states the
+# default, not the permission. The mandate stops at the model's judgment:
+# independence is something the model itself determines, and a
+# wrongly-batched dependent call (hallucinated args, failed call, recovery)
+# costs far more than one extra turn — so doubt resolves toward sequential,
+# never toward forcing calls together.
+PARALLELIZE_PRINCIPLE = (
+    "Parallelize when you can: issue every independent call in the same "
+    "turn — serialize when a call needs another's result, when safety "
+    "requires ordering, or when in doubt"
+)
+
 
 def wrap_system_reminder(text: str) -> str:
     """Wrap harness reminder text in ``<system-reminder>`` tags.

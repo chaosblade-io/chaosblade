@@ -49,16 +49,19 @@ class TestScreenerWiring:
                     f"got {ends['continue']}"
                 )
 
-    def test_screener_has_three_outbound_routes(self):
+    def test_screener_has_four_outbound_routes(self):
         graph = build_pipeline_graph(phase1_tools=[], phase2_tools=[])
         branches = graph.branches.get("tool_screener") or {}
         assert branches, "tool_screener must have conditional edges"
         for branch in branches.values():
             ends = getattr(branch, "ends", None) or {}
-            assert set(ends.keys()) == {"pass", "replan", "retry"}, (
-                f"screener must route exactly pass/replan/retry, got {set(ends.keys())}"
+            # "reject" (W-56-5): the hard-termination route ends at the
+            # terminal reject node instead of looping as retry.
+            assert set(ends.keys()) == {"pass", "replan", "retry", "reject"}, (
+                f"screener must route exactly pass/replan/retry/reject, got {set(ends.keys())}"
             )
             # And those routes must point to known successor nodes.
             assert ends["pass"] == "phase2_tools"
             assert ends["replan"] == "agent_loop"
             assert ends["retry"] == "execute_loop"
+            assert ends["reject"] == "reject"

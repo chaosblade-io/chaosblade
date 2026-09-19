@@ -11,6 +11,8 @@ environment_profile target-authority fragment. The only axis kept here is
 
 from __future__ import annotations
 
+from chaos_agent.agent.prompts.reminder import PARALLELIZE_PRINCIPLE
+
 
 def _is_expert(mode: str) -> bool:
     return mode == "expert"
@@ -40,14 +42,15 @@ recommendations; never silently decide a target or risk level for the user."""
 def get_plan_builder_critical_rules_section(mode: str = "guided") -> str:
     """Critical behavioral rules — BEGINNING (primacy zone)."""
     if _is_expert(mode):
-        return """### Expert Mode Rules
+        return f"""### Expert Mode Rules
 1. Form the fullest valid plan in one response when parameters are complete.
 2. Use discovery only to resolve a relevant uncertainty; do not create a
    mandatory query-then-question loop.
 3. Ask for confirmation only when target identity, blast radius, or risk would
    otherwise be guessed or expanded.
-4. Submit the plan through submit_plan; its structured schema remains binding."""
-    return """### Critical Rules
+4. Submit the plan through submit_plan; its structured schema remains binding.
+5. {PARALLELIZE_PRINCIPLE}"""
+    return f"""### Critical Rules
 
 1. **One question at a time** — never ask multiple questions in a single reply.
 2. **Discover before ask** — before asking something the environment can answer,
@@ -65,7 +68,8 @@ def get_plan_builder_critical_rules_section(mode: str = "guided") -> str:
 5. **Call submit_plan only when ALL parameters are confirmed** — every fault must
    have scope / target / action (and any required identity fields) filled.
 6. **Mark the best option** — set recommended=true on at most one, grounded in
-   domain knowledge (e.g. "80% CPU is standard for load testing")."""
+   domain knowledge (e.g. "80% CPU is standard for load testing").
+7. {PARALLELIZE_PRINCIPLE}"""
 
 
 def get_plan_builder_workflow_section(mode: str = "guided") -> str:
@@ -227,11 +231,12 @@ def get_plan_builder_progress_section(
 def get_plan_builder_critical_rules_reminder_section(mode: str = "guided") -> str:
     """End-of-prompt reminder — END (recency zone)."""
     if _is_expert(mode):
-        return """## Expert Reminder
+        return f"""## Expert Reminder
 - Do not invent target identity, scope, or risk tolerance.
 - Preserve all supplied valid parameters in the structured plan.
-- Submit directly when no material ambiguity remains."""
-    return """## Reminder — Pre-Response Checklist
+- Submit directly when no material ambiguity remains.
+- {PARALLELIZE_PRINCIPLE}"""
+    return f"""## Reminder — Pre-Response Checklist
 
 Before responding, verify:
 ✓ You called discovery / activate_skill / read_skill_resource FIRST to gather
@@ -244,6 +249,7 @@ Before responding, verify:
 ✓ Exactly ONE question per present_options call
 ✓ You did NOT make any decision for the user
 ✓ You did NOT call submit_plan before all faults have confirmed params
+✓ {PARALLELIZE_PRINCIPLE}
 
 The user should be able to answer every question with a single click. If they
 can't, you haven't researched enough — go back and use tools."""

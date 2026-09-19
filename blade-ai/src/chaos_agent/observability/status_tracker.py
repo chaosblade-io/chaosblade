@@ -32,6 +32,12 @@ from enum import Enum
 
 from chaos_agent.persistence.task_identity import is_real_task_id
 
+# Thin re-export: elided_preview's canonical implementation moved to
+# chaos_agent.utils.truncation (the shared home for truncation forms).
+# Kept so the 8 existing call sites (shell / baseline / status_display ...)
+# keep importing it from here — zero behavior change.
+from chaos_agent.utils.truncation import elided_preview  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 # Per-tracker event history cap. History exists only to replay recent

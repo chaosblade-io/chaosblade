@@ -2,9 +2,12 @@
 
 Verifies that the "unset" confirmed_intent semantics, fault_intent
 carry-forward, and dynamic section injection (completeness signal +
-confirmed parameters) work correctly after the converse_stream state
-reset strategy was changed from aggressive reset (None) to selective
-carry-forward ("unset").
+confirmed parameters) work correctly after the per-turn state input
+strategy was changed from aggressive reset (None) to selective
+carry-forward ("unset"). The strategy now lives in the server /turn
+route's later-turn branch (server/routes/turn.py); the local
+converse_stream twin that originally carried it was retired 2026-09-01
+— these router/prompt-semantics tests are entry-point-agnostic.
 """
 
 from langchain_core.messages import AIMessage

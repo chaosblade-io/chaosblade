@@ -45,9 +45,23 @@ from chaos_agent.agent.providers.message_scanning import (
     KUBECTL_COMMAND_SUBCOMMANDS,
     KUBECTL_WRITE_SUBCOMMANDS,
     build_tool_call_args_lookup,
+    exec_command_segments,
     exec_inner_command_mutates,
     scan_kubectl_injection_after_blade,
 )
+# Re-exported legislation constants (round-21) — this module keeps its
+# historical public surface (cli_python and the r19/r20 probes/tests import
+# the shapes from HERE) while the single source lives in the
+# carrier-agnostic arbitration layer the general layer is allowed to import.
+from chaos_agent.agent.providers.uid_shapes import (  # noqa: F401 — re-export
+    DASHED_UUID_SHAPE,
+    HEX16_UID_SHAPE,
+    HEX_HEAD_GUARD,
+    HEX_TAIL_GUARD,
+    UID_SHAPE_ALTERNATION,
+    UID_SHAPE_GATE,
+)
+from chaos_agent.agent.providers.base import DestroyOutcome
 from chaos_agent.agent.result.verdict import Layer1Result
 from chaos_agent.observability.status_tracker import get_tracker
 from chaos_agent.tools.pod_discovery import (
@@ -92,37 +106,90 @@ logger = logging.getLogger(__name__)
 #      (e.g. `kubectl get chaosblades` echo).
 # ---------------------------------------------------------------------------
 
-# Standard UUID shape (8-4-4-4-12 hex) embedded in a JSON-style key.
-_UUID_RE = re.compile(
-    r'"(?:result|uid)"\s*:\s*"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})"'
-)
+# Single-source experiment-UID shape legislation (round-19; round-20 Q1
+# extended it to the STRATEGY anchors below; round-21 moved the constants
+# to the carrier-agnostic arbitration layer
+# ``agent/providers/uid_shapes.py`` and re-exports them here): every
+# UID-bearing capture in the codebase — not just this module — composes
+# from that block. Round-19's list enumerated only the three failed-create
+# dialect anchors (FAILED_CREATE_UID_RE / RAW_FAILED_CREATE_UID_RE /
+# PY_FAILED_CREATE_UID_RE) plus the _UID_SHAPE_RE gate — the two anchors
+# INSIDE the extraction strategies never entered it, so each kept its own
+# shape dialect (dashed-only here, prefixed-and-open-bounded below): the
+# "enumerate the repair surface" defect in its 7th recurrence. Round-21
+# found the 8th recurrence OUTSIDE this package (memory/compactor.py's two
+# survival-context anchors and the side_effect conflict-check fallback each
+# hand-copied a pre-legislation dialect): the phase-11 import boundary bars
+# the general layer from importing this carrier subpackage, so a PRIVATE
+# single source could never govern those consumers — the constants are
+# legislated in uid_shapes.py, re-exported above (public surface unchanged
+# for this package's consumers), and a source-level scan test
+# (tests/test_agent/test_providers/test_uid_shape_legislation.py) refuses
+# any hex-class regex in src/chaos_agent that does not compose them.
+
+# Backward-compatible module-private alias (pre-round-21 spelling kept for
+# the in-module call sites and the round-19/20 probes).
+_UID_SHAPE_ALTERNATION = UID_SHAPE_ALTERNATION
+
+# Loose ``"result"/"uid"`` key fallback for output whose JSON the parser
+# bailed on (truncated stdout, unescaped quotes from kubectl-exec wrapping).
+# Composes the full single-source shape domain (round-20 Q3).
+_UUID_RE = re.compile(r'"(?:result|uid)"\s*:\s*"(' + _UID_SHAPE_ALTERNATION + r')"')
 
 # ChaosBlade resource-name fallback (used when blade emits a resource ref
-# rather than a UID — e.g. `chaosblade-1234abcd...`).
-_CHAOSBLADE_RESOURCE_RE = re.compile(r'\b(chaosblade-[a-f0-9]{8,})\b')
-
-# Sentinel returned by strategy 1 to mean "saw a 54000+success=false
-# response — do NOT fall back to looser strategies." Any non-None, non-str
-# object works; an object literal makes identity checks unambiguous.
-_FAILED_54000_SENTINEL = object()
+# rather than a UID — e.g. `chaosblade-1234abcd...`). The resource-name
+# suffix IS the experiment UID (``chaosblade-<uid>``), so the capture STRIPS
+# the prefix and composes the single-source hex16 shape (round-20 Q2: the
+# pre-round-20 pattern captured the PREFIXED string verbatim — an un-shaped
+# value that rode every ingestor, short-circuiting even the round-19 N1
+# dict-branch gate — with an 8-hex lower bound and no upper bound).
+_CHAOSBLADE_RESOURCE_RE = re.compile(r"\bchaosblade-(" + HEX16_UID_SHAPE + r")\b")
 
 
 def extract_experiment_uid(text: str) -> str | None:
     """Extract a ChaosBlade experiment UID from arbitrary tool output.
 
     Returns the UID string on success, or None if no usable UID was found
-    (including the case where a 54000 response indicates the injection
+    (including the case where a structured receipt indicates the injection
     actually failed — callers must treat None as "no live experiment").
+
+    Strategy chain (round-22 Q4b tightened the fallthrough): the JSON-aware
+    walk runs first and reports whether it SAW a structured blade receipt
+    (a dict carrying ``code``/``success``). A structured refusal blocks the
+    shape-only fallbacks — they exist for JSON-BLIND output (truncated
+    stdout, unescaped quotes), and a receipt the structured strategy has
+    already judged un-licensable (code=500 failed-create, the 54000
+    terminal failure, any non-200 non-54000 receipt) must not be
+    re-admitted by a regex that cannot even see the ``code`` it is
+    ignoring. The pre-round-22 chain only blocked the 54000 spelling
+    (the r20-Q8 sentinel): a code=500 receipt's ``"result": "<uid>"``
+    fell straight through to the fallback and laundered a failed
+    experiment's UID into the live slot.
+
+    This extractor is only ever handed output from a PROVEN-pure domain:
+    every caller gates on ``BladeExecPayload.pure_create`` first (a
+    composite payload's receipt licenses NOTHING — round-18 F reverted
+    the round-17 graded lane: its "strict" JSON-aware success anchor was
+    believed to be the one shape a companion does not produce organically,
+    but round-16 F had already established that an ECHO companion can
+    forge ANY shape verbatim, so ``echo '{"code":200,...}'`` laundered a
+    forged UID right through the strict lane. The segment-composition
+    gate is the only lever; the extractor itself stays single-mode). The
+    JSON-aware anchors shape-validate their payloads (``_UID_SHAPE_RE``):
+    a success receipt whose ``result`` is not a UID-shaped string is not
+    an experiment UID.
     """
     if not isinstance(text, str) or not text:
         return None
 
-    uid = _uid_strategy_json_aware(text)
-    if uid is _FAILED_54000_SENTINEL:
-        # Known-failed injection; do NOT fall back to looser strategies.
-        return None
+    uid, saw_receipt = _uid_strategy_json_aware(text)
     if uid is not None:
         return uid
+    if saw_receipt:
+        # A structured blade receipt was seen and refused to license a
+        # UID — do NOT fall back to looser strategies (the 54000 ruling
+        # of round-20 Q8, generalized to every structured refusal).
+        return None
 
     uid = _uid_strategy_regex(text)
     if uid is not None:
@@ -131,18 +198,30 @@ def extract_experiment_uid(text: str) -> str | None:
     return _uid_strategy_chaosblade_resource(text)
 
 
-def _uid_strategy_json_aware(text: str):
-    """Walk every `{` in `text`, parse JSON segments, apply blade semantics.
+def _uid_strategy_json_aware(text: str) -> tuple[str | None, bool]:
+    """Walk every ``{`` in ``text``, parse JSON segments, apply blade semantics.
 
-    Returns one of:
-      - str: a UID extracted from a recognized success or 54000 response.
-      - None: no JSON object yielded a usable UID.
-      - _FAILED_54000_SENTINEL: encountered a 54000+success=false response;
-        caller MUST refuse to extract a UID from this output.
+    Returns ``(uid, saw_receipt)``:
+      - uid: a UID extracted from a recognized success or
+        54000-initializing response, else ``None``.
+      - saw_receipt: ``True`` when the walk saw at least one structured
+        blade FAILURE verdict — a receipt dict whose semantics are a
+        refusal (``success`` is false, or a ``code`` that is neither 200
+        nor the initializing 54000) — without licensing a UID from it.
+        The caller must refuse to extract a UID from this output by any
+        looser strategy (round-22 Q4b: the r20-Q8 54000 sentinel's
+        reject-and-block ruling, generalized from one status code to
+        every structured refusal). A SUCCESS receipt whose ``result``
+        merely has an unusable shape (blade_status's dict result) is NOT
+        a refusal and does not block the fallbacks — the first draft of
+        this flag blocked it and broke the status-face dict lane
+        (test_short_resource_suffix_refused: 200+true with a dict result
+        is the status tool's NORMAL success form; shape-inapplicability
+        is not a structured verdict).
     """
     decoder = json.JSONDecoder()
     scan_from = 0
-    saw_failed_54000 = False
+    saw_receipt = False
 
     while True:
         idx = text.find("{", scan_from)
@@ -155,10 +234,25 @@ def _uid_strategy_json_aware(text: str):
             continue
 
         if isinstance(data, dict):
+            if data.get("success") is False or (
+                "code" in data and data.get("code") != 200 and data.get("code") != 54000
+            ):
+                # A structured FAILURE verdict (round-22 Q4b): the
+                # shape-only fallbacks lose their jurisdiction over this
+                # text — they exist for JSON-BLIND output and must not
+                # overrule a verdict they cannot even read. (54000 counts
+                # as failure only when its own branch below rules it
+                # terminal; a non-200 code that is not 54000 — e.g. 500 —
+                # is a refusal here and now.)
+                saw_receipt = True
             if data.get("success") is True and data.get("code") == 200:
                 result = data.get("result")
-                if isinstance(result, str) and result:
-                    return result
+                # Shape-validated (round-18 F-e): a success receipt whose
+                # ``result`` is not a UID-shaped string is not an experiment
+                # UID — the anchor must not launder arbitrary strings into
+                # the single-slot / evidence ledgers.
+                if isinstance(result, str) and _UID_SHAPE_RE.fullmatch(result):
+                    return result, True
 
             if data.get("code") == 54000:
                 result = data.get("result")
@@ -183,20 +277,40 @@ def _uid_strategy_json_aware(text: str):
                                 "terminal error, treating as failed (uid=%s ignored)",
                                 uid,
                             )
-                            saw_failed_54000 = True
-                        else:
+                            return None, True
+                        elif _UID_SHAPE_RE.fullmatch(uid):
                             logger.info(
                                 "experiment_uid extraction: 54000, extracted uid=%s "
                                 "(initializing=%s)",
                                 uid, _is_initializing,
                             )
-                            return uid
+                            return uid, True
+                elif isinstance(result, str) and result:
+                    # 54000 with a STRING result (round-20 Q8, surfaced by
+                    # the strategy-2 domain-parity fix): the python face's
+                    # failure spelling — registered but failed. The dict
+                    # branch's reject-and-block ruling applies verbatim: a
+                    # terminal failure's UID must not be promoted to the
+                    # live slot. The pre-r20 extractor only refused it by
+                    # ACCIDENT — the dashed-only fallback regex happened
+                    # not to match a hex16 string; once the fallback took
+                    # the single-source domain, the un-gated branch
+                    # surfaced (strategy 2 would launder the UID straight
+                    # into the single slot).
+                    error_msg = (data.get("error") or "").lower()
+                    _is_initializing = (
+                        "please wait" in error_msg or "initialized" in error_msg
+                    )
+                    if data.get("success") is False and not _is_initializing:
+                        logger.info(
+                            "experiment_uid extraction: 54000 + success=false + "
+                            "terminal error (string result), treating as failed"
+                        )
+                        return None, True
 
         scan_from = end_idx
 
-    if saw_failed_54000:
-        return _FAILED_54000_SENTINEL
-    return None
+    return None, saw_receipt
 
 
 def _uid_strategy_regex(text: str) -> str | None:
@@ -208,7 +322,14 @@ def _uid_strategy_regex(text: str) -> str | None:
 
 
 def _uid_strategy_chaosblade_resource(text: str) -> str | None:
-    """Find a `chaosblade-<hex>` resource name as a last-resort identifier."""
+    """Find a `chaosblade-<uid>` resource name as a last-resort identifier.
+
+    The capture strips the ``chaosblade-`` prefix (round-20 Q2): the suffix
+    is the experiment UID, and a prefixed string is not a UID-shape value —
+    it used to ride the extractor's return verbatim into the single slot,
+    the birth registry and the destroy whitelist, where ``blade destroy
+    chaosblade-xxx`` can never match a real experiment.
+    """
     match = _CHAOSBLADE_RESOURCE_RE.search(text)
     if match:
         return match.group(1)
@@ -216,29 +337,728 @@ def _uid_strategy_chaosblade_resource(text: str) -> str | None:
 
 
 def scan_destroyed_uids(messages: list) -> set[str]:
-    """UIDs the LLM has issued ``blade_destroy`` for (from AIMessage tool_calls).
+    """UIDs the LLM has issued a destroy for — BOTH delivery faces.
 
-    A UID sent to ``blade_destroy`` is no longer an active injection: whether
-    the destroy succeeded or failed, it is residual and MUST NOT be picked up
-    as the current fault's carrier. In-package shared tool (phase-13): consumed
-    by both blade-family providers' ``destroyed_experiment_ids`` hooks (the
-    registry's union seam for the generic layer), by
-    ``extract_experiment_uid_from_messages`` internally, and by provider
-    detection — every blade-family consumer applies the same destroyed-exclusion
-    rigor (task-76c59364 regression: ``ChaosbladeProvider.detect`` re-claimed a
-    failed, already-cleaned experiment when only the extractor excluded).
+    A UID sent to ``blade_destroy`` (tool face) or to an inline
+    ``kubectl exec ... blade destroy/revoke`` (vehicle face, round-14
+    F1: issued = terminal applies channel-neutrally — the inline destroy
+    the registry itself instructs for in-cluster deliveries used to leave
+    the UID re-claimable as the live fault) is no longer an active
+    injection: whether the destroy succeeded or failed, it is residual
+    and MUST NOT be picked up as the current fault's carrier. In-package
+    shared tool (phase-13): consumed by both blade-family providers'
+    ``destroyed_experiment_ids`` hooks (the registry's union seam for the
+    generic layer), by ``extract_experiment_uid_from_messages``
+    internally, and by provider detection — every blade-family consumer
+    applies the same destroyed-exclusion rigor (task-76c59364
+    regression: ``ChaosbladeProvider.detect`` re-claimed a failed,
+    already-cleaned experiment when only the extractor excluded).
     """
     destroyed: set[str] = set()
     for msg in messages:
         for tc in getattr(msg, "tool_calls", None) or []:
             name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
-            if name != "blade_destroy":
-                continue
             args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
-            uid = args.get("uid", "") if isinstance(args, dict) else ""
-            if uid:
-                destroyed.add(uid)
+            if name == "blade_destroy":
+                uid = args.get("uid", "") if isinstance(args, dict) else ""
+                if uid:
+                    destroyed.add(uid)
+            elif (
+                name == "kubectl"
+                and isinstance(args, dict)
+                and args.get("subcommand") == "exec"
+            ):
+                destroyed |= inline_destroy_uids(str(args.get("v_args") or ""))
     return destroyed
+
+
+# ---------------------------------------------------------------------------
+# Blade-delivery SYNTAX judgement (round-15 root fix)
+#
+# The word-containment gates this replaces (``"blade" in v_args and
+# "create" in v_args`` — eleven copy-pasted sites across the blade scans,
+# the provider faces, and the shared attribution scans) judged VOCABULARY,
+# not SYNTAX: a composite decoy payload (``sh -c 'kubectl get pods -o
+# json; echo blade create done'``) passed every one of them while carrying
+# no blade command, and the kubectl output it returned then laundered K8s
+# resource UIDs into the birth registry (round-15 H2 — the destroy
+# provenance gate went on to ALLOW an inline destroy of a UID this task
+# never created). The judgement is now ONE function over the carriers-
+# shared syntax parser: a blade delivery is a command SEGMENT whose
+# command-position head is ``blade``. A word inside an ``echo`` argument
+# or a quoted literal is vocabulary, never a command.
+# ---------------------------------------------------------------------------
+BladeExecPayload = namedtuple(
+    "BladeExecPayload", ["segments", "has_create", "has_destroy", "pure_create"]
+)
+
+
+def classify_blade_exec_payload(command: object) -> BladeExecPayload:
+    """Single-source syntax judgement of a blade-exec delivery command.
+
+    Wraps the carriers-shared parser :func:`exec_command_segments` and
+    keeps only the segments whose COMMAND POSITION (head token, bare or
+    ``/path`` form) is ``blade``:
+
+    - ``segments`` — the ``blade ...`` token lists, verb at index 1
+      (redirections stripped, wrapper prefixes resolved by the parser);
+    - ``has_create`` — any segment enacting ``blade create``;
+    - ``has_destroy`` — any segment enacting ``blade destroy``/``revoke``;
+    - ``pure_create`` — EVERY command segment is a ``blade create``
+      segment (no echo/query/destroy companion): the payload's whole
+      output domain is the blade CLI's own output. Round-16 A/E/F: the
+      receipt-ingestion dialect cannot be separated by SHAPE (a query
+      output's ``"uid": "<hex16>"`` key is form-identical to a failed
+      create's, and an ``echo`` companion can forge ANY shape), so the
+      birth ledger trusts a receipt ONLY when the segment composition
+      proves no other command contributed to it.
+
+    Accepts v_args (the CALLER owns the subcommand check) or a full
+    command line (``kubectl [flags] exec|debug ...`` — non-command-mode
+    kubectl lines yield no segments inside the parser). Fail-closed on
+    any parse doubt: unlexable input yields no segments and no judgements.
+    """
+    all_segments = exec_command_segments(command)
+    segments = [
+        seg
+        for seg in all_segments
+        if seg and (seg[0] == "blade" or seg[0].endswith("/blade"))
+    ]
+    verbs = {seg[1] for seg in segments if len(seg) >= 2}
+    return BladeExecPayload(
+        segments=segments,
+        has_create="create" in verbs,
+        has_destroy=bool(verbs & {"destroy", "revoke"}),
+        pure_create=(
+            bool(segments)
+            and len(segments) == len(all_segments)
+            and verbs == {"create"}
+        ),
+    )
+
+
+def _is_blade_create_delivery(command: object) -> bool:
+    """Injection adapter for the shared attribution scans: THIS module owns
+    the blade-exec create-delivery judgement (round-15 root fix — the
+    shared scans take it as a parameter so they stay carrier-agnostic, the
+    same dependency direction ``is_mutating_command`` already rides)."""
+    return classify_blade_exec_payload(command).has_create
+
+
+def collect_flag_values(args: list[str], flag: str) -> list[str]:
+    """Every value assigned to ``flag`` (both spellings, all instances).
+
+    Single source for the blade token family (round-14: moved here from
+    provider.py so the death-ledger scans and the classifier's inline
+    parsers share ONE extractor — provider imports it as a same-package
+    dependency, the same direction every other provider→verify import
+    already runs). blade CLI follows pflag LAST-WINS on repeated flags
+    (probe D8), so callers needing "the value blade honours" take the
+    LAST; callers needing first-vs-last agreement take the whole list.
+    """
+    vals: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == flag and i + 1 < len(args):
+            vals.append(args[i + 1])
+            i += 2
+            continue
+        if a.startswith(flag + "="):
+            vals.append(a.split("=", 1)[1])
+        i += 1
+    return vals
+
+
+# Experiment-UID shape a blade destroy target may take (round-16 B,
+# tightened round-17 S3): a bare hex16 (the blade experiment UID — LOWERCASE
+# hex, matching every ingestion anchor in this module, with an upper bound
+# that keeps sha256-shaped 40-hex garbage out) or a dashed UUID (the legacy
+# spelling the r14 anchors carried). Anything else — a variable reference
+# ``$EXP_UID``, a command substitution, a path — is not a UID; registering
+# it would persist a junk token into the durable retired ledger (r15 H1's
+# residue in new shapes). Composes the full single-source shape domain
+# (defined with the strategy anchors above — round-20 Q1). Round-22: the
+# compiled gate itself is single-sourced too — this name is now an alias of
+# the arbitration layer's UID_SHAPE_GATE (a second hand-compiled fullmatch
+# gate over the same domain is a second legislation, the r21 review's
+# finding on this very line).
+_UID_SHAPE_RE = UID_SHAPE_GATE
+
+
+def destroy_uid_from_tokens(rest: list[str]) -> str:
+    """UID of an inline ``blade destroy/revoke`` from its token tail.
+
+    ``blade destroy <uid>`` (positional) and ``blade destroy --uid <uid>``
+    (flag) both reach the CLI; pflag last-wins applies to the flag
+    spelling, so the LAST value is the one blade would act on. Explicit
+    flag beats positional when both appear. Value-absorbing flags skip
+    their values in the positional walk (round-14 F3: ``blade destroy
+    --kubeconfig /root/kc <uid>`` used to hand ``/root/kc`` to the
+    provenance gate — a false UID the whitelist can never match, a
+    fail-closed FALSE REFUSAL of the task's own cleanup). The surviving
+    token MUST match the experiment-UID shape (round-16 B: a variable
+    reference, a command substitution or a redirection token is not a
+    UID — returning it would persist a junk token into the durable
+    ledger). A non-shaped token yields "" — the callers treat that as a
+    form issue, not a default-clean verdict.
+    """
+    from chaos_agent.tools.guard_parser import BLADE_VALUE_FLAGS
+
+    vals = collect_flag_values(rest, "--uid")
+    if vals:
+        return vals[-1] if _UID_SHAPE_RE.fullmatch(vals[-1]) else ""
+    skip_value = False
+    for tok in rest:
+        if tok.startswith("-"):
+            # Glued spellings carry their value after ``=`` (nothing to
+            # skip); separated value-taking flags absorb the NEXT token.
+            skip_value = tok in BLADE_VALUE_FLAGS
+            continue
+        if skip_value:
+            skip_value = False
+            continue
+        if tok:
+            # First positional is the target blade would act on — a
+            # non-shaped one means the command itself is malformed.
+            return tok if _UID_SHAPE_RE.fullmatch(tok) else ""
+    return ""
+
+
+def inline_destroy_uids(v_args: str) -> set[str]:
+    """Every UID an inline ``blade destroy`` command targets.
+
+    Round-15 root fix: the dual-lane union (regex + semantic token walk,
+    round-14 F1) is retired. The regex lane captured the token after the
+    verb LITERALLY — a flag spelling registered ``--uid``/``--kubeconfig``
+    as killed UIDs (r14 F1), and those junk tokens persisted into the
+    durable retired ledger through the registration seam (r15 H1: the
+    A2 seam appends the whole proven set). The single source is now the
+    payload classifier: destroy segments are command-position facts, and
+    each segment's target UID comes from the SAME
+    :func:`destroy_uid_from_tokens` walk the provenance gate applies —
+    flag spellings resolve to their VALUES, value-absorbing flags skip
+    their values, and no literal flag token ever reaches a ledger.
+
+    ``revoke`` is NOT a death carrier (round-25 K1, aligning the inline
+    face with the round-24 K3 ruling the host face already carries):
+    revoke tears down a PREPARE uid — a precondition — so retiring its
+    target would pollute a ledger only experiment uids consume, and a
+    successful revoke against an owned experiment uid would FALSE-RETIRE
+    a live experiment (strictly worse than the orphan). The mutating-
+    action and provenance-gate semantics of ``destroy/revoke`` live in
+    the provider's target-scope judgement (same vocabulary as
+    ``readonly.py``), not in this death-registration scan.
+    """
+    uids: set[str] = set()
+    for seg in classify_blade_exec_payload(v_args).segments:
+        if len(seg) >= 2 and seg[1] == "destroy":
+            uid = destroy_uid_from_tokens(seg[2:])
+            if uid:
+                uids.add(uid)
+    return uids
+
+
+# Framework-synthesized receipt prefixes — a ToolMessage carrying one of
+# these NEVER executed its tool call (B76 review K4): the screener answers
+# rejected/deferred batches itself (``[target_guard]`` / ``[screener]``
+# renderings), and execute_loop answers replan-turn calls (``Not executed:``).
+# These are framework CONTRACT strings (the same family as the screener's
+# ``EMPTY_SELECTOR_HINT`` structural proof anchor), so matching them is a
+# structural gate, not vocabulary luck: a future rewording of the receipt
+# body cannot forge a death certificate if the prefix discipline holds.
+_FRAMEWORK_RECEIPT_PREFIXES = (
+    "[screener] ",
+    "[target_guard] ",
+    "Not executed: ",
+)
+
+
+def classify_destroy_output(output) -> "DestroyOutcome":
+    """Three-state verdict on a raw destroy output — the single
+    destroy-decision source for every framework-side consumer.
+
+    The registry sweep's retire/failure fork, the verify-replan retire
+    filter and this module's own death-proof predicate all compose THIS
+    function (the three pre-merge tables judged "not found", prefixes and
+    non-JSON outputs three different ways; a non-JSON no-keyword output
+    retired on the sweep's table and stayed live on the authority's).
+
+    Ordering is load-bearing and preserves :func:`parse_blade_destroy_output`
+    semantics exactly: a framework-receipt prefix can never be SUCCESS
+    (a never-executed call proves nothing), SUCCESS is decided first
+    (``success`` truthy / ``code == 200`` JSON — the authority's predicate —
+    or the non-JSON success/destroyed wording fallback), NOT_FOUND only on
+    the failure side — "not found" wording inside a SUCCESS receipt is
+    evidence prose, not a convergence-valve signal. Everything else is
+    FAILED: doubt is not death (a false retire hides a LIVE experiment
+    from every future recovery, strictly worse than the orphan the sweep
+    exists to prevent).
+    """
+    text = output.strip() if isinstance(output, str) and output.strip() else ""
+    if not text:
+        return DestroyOutcome.FAILED
+    prefixed = text.startswith(("Error:", "failed", *_FRAMEWORK_RECEIPT_PREFIXES))
+    if not prefixed:
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            if "success" in text.lower() or "destroyed" in text.lower():
+                return DestroyOutcome.SUCCESS
+        else:
+            if isinstance(payload, dict) and (
+                bool(payload.get("success")) or payload.get("code") == 200
+            ):
+                return DestroyOutcome.SUCCESS
+    low = text.lower()
+    if "not found" in low or "notfound" in low:
+        return DestroyOutcome.NOT_FOUND
+    return DestroyOutcome.FAILED
+
+
+# ---------------------------------------------------------------------------
+# Execution-event alignment (round-26 root fix — the receipt-side half of
+# the composite-command family)
+#
+# The 1:1 fossil: every receipt-side consumer assumed ONE tool call == ONE
+# command == ONE receipt, so the paired output was judged as one blob. A
+# composite's real receipt is the CONCATENATION of its commands' outputs —
+# and the blob judgement cannot attribute a slice to its command: the JSON
+# authority lane needs a single object (a concatenation fails json.loads),
+# so EVERY composite verdict rode the wording fallback, where any one
+# command's "success"/"destroyed" substring launders every sibling's
+# failure (round-26 K1/K2/K4). The command side learned to see every
+# segment (round-25 token-face split); this is the mirror half — each
+# segment gets its OWN receipt slice and its OWN verdict.
+#
+# The alignment's safety direction follows the ledger's structural
+# asymmetry: a false retire has NO later escape (retired only grows, the
+# live set only shrinks), while an unproven death has the sweep's
+# status-recheck convergence valve. Every alignment doubt therefore
+# lands on un-proven, never on proof-by-guesswork.
+#
+# Round-27 amendment: this machinery is the DEATH side's own. Births never
+# needed positional binding (the uid lives in the receipt line, not the
+# segment argv) — the birth faces now license content-derived through
+# :func:`receipt_birth_uids`, and the strict layer-2 gate that leaked
+# honest births through transport shapes no longer touches them.
+# ---------------------------------------------------------------------------
+ExecutionEvent = namedtuple(
+    "ExecutionEvent", ["segment", "receipt_slice", "provable"]
+)
+
+
+def align_execution(v_args: str, receipt) -> list[ExecutionEvent]:
+    """One execution event per command segment, each with its own receipt
+    slice — the decomposition primitive for FACES THAT NEED POSITIONAL
+    BINDING (round-27 amendment): the death face, where the uid rides the
+    destroy segment's ARGV and the proof rides the receipt line, so a
+    misattributed pairing false-retires a LIVE experiment. Birth faces do
+    NOT compose this (round-27): a birth licence is content-derived
+    (:func:`receipt_birth_uids`) — the uid lives in the line itself — and
+    the positional gate only leaked honest births through transport
+    shapes (the kubectl ``Error:`` wrapper, ``&&``/``||`` short-circuit,
+    stderr trailers).
+
+    Three layers, decided by STRUCTURE, not by receipt wording:
+
+    - **Layer 3 (unprovable)** — any segment whose command-position head is
+      not ``blade`` rode the output path (an ``echo``/``tee`` companion, or
+      the downstream stage of a pipe: the round-25 split draws ``|`` as a
+      segment boundary, so ``blade destroy X | wc -l`` is a blade segment
+      plus a ``wc`` companion). A companion's contribution is forgeable and
+      a pipe TRANSLATES the output (``wc -l`` emits a digit) — no slice can
+      be attributed, so NO event is provable. For pipes this is not a
+      limitation but the physical fact: the proof genuinely no longer
+      exists; the sweep's convergence valve is the honest escape.
+    - **Layer 1 (single command)** — the whole receipt belongs to the one
+      segment, whatever its shape (transport preamble, wrapped JSON,
+      prose): the existing single-command verdict lanes keep their exact
+      behaviour, byte for byte.
+    - **Layer 2 (pure-blade composite)** — blade prints ONE JSON object per
+      invocation, so the honest receipt is one JSON object per line and the
+      line count MUST equal the segment count. A ``&&`` left failure makes
+      the right side never run (one line, two segments — mismatch, fail
+      closed); a failure stack trace adds lines (mismatch, fail closed);
+      any non-JSON line is not a blade receipt (fail closed). Only an
+      exact, fully-JSON, line-per-segment alignment is provable — and then
+      each event carries its OWN line, so a failed sibling can no longer
+      ride a successful sibling's wording.
+
+    ``provable=False`` means "this segment's receipt attribution is
+    structurally unsound" — consumers must register NOTHING from it; the
+    uid stays live (doubt is not death) and the convergence valve decides
+    later. ``receipt_slice`` is ``None`` exactly when ``provable`` is
+    False.
+    """
+    all_segments = exec_command_segments(v_args)
+    events = [ExecutionEvent(seg, None, False) for seg in all_segments]
+    if not all_segments:
+        return events
+
+    def _is_blade_head(seg: list[str]) -> bool:
+        return bool(seg) and (seg[0] == "blade" or seg[0].endswith("/blade"))
+
+    # Layer 3: a non-blade companion shares the output path.
+    if any(not _is_blade_head(seg) for seg in all_segments):
+        return events
+
+    text = receipt if isinstance(receipt, str) else ""
+
+    # Layer 1: a single command owns the whole receipt.
+    if len(all_segments) == 1:
+        return [ExecutionEvent(all_segments[0], text, True)]
+
+    # Layer 2: line-per-segment JSON alignment, exact or nothing.
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) != len(all_segments):
+        return events
+    for ln in lines:
+        try:
+            obj = json.loads(ln)
+        except ValueError:
+            return events
+        if not isinstance(obj, dict):
+            return events
+    return [
+        ExecutionEvent(seg, ln, True)
+        for seg, ln in zip(all_segments, lines)
+    ]
+
+
+def _destroy_output_proves_death(output) -> bool:
+    """Whether a destroy call's raw tool output PROVES the experiment died.
+
+    Thin composition over :func:`classify_destroy_output` (the single
+    destroy-decision source): SUCCESS — and only SUCCESS — proves death.
+    A key-less error JSON (``{"code": 500, "error": ...}``) is a FAILED
+    destroy under the authority and must prove nothing here either; a
+    second table here would drift exactly the way the readonly
+    double-judge drift did (B76 review K2). Doubt is NOT death — a false
+    retire hides a LIVE experiment from every future recovery, strictly
+    worse than the orphan the sweep exists to prevent.
+
+    Framework-synthesized receipts (K4) are excluded STRUCTURALLY by the
+    classifier's prefix gate before any verdict: a never-executed call
+    cannot prove death no matter how its receipt is worded.
+    """
+    return classify_destroy_output(output) is DestroyOutcome.SUCCESS
+
+
+def scan_destroyed_proven_uids(messages: list) -> set[str]:
+    """UIDs whose destroy is PROVEN by a SUCCESSFUL paired tool output.
+
+    Death-registration half of the liability ledger (B76 review I1). Unlike
+    :func:`scan_destroyed_uids` (issued = terminal, the conservative
+    attribution semantics — a destroy ATTEMPT must stop the UID being
+    re-claimed), this scan feeds the durable ``retired`` ledger, so it
+    registers a UID only when the paired ToolMessage output confirms the
+    kill. Two delivery forms, both channel-agnostic:
+
+    1. ``blade_destroy`` tool calls (host delivery);
+    2. kubectl-exec tool calls carrying ``blade destroy <uid>`` in
+       ``v_args`` — the in-cluster delivery's LLM vehicle, structurally
+       invisible to ``scan_destroyed_uids`` (I1c). One exec can carry
+       MULTIPLE destroy payloads (``blade destroy A && blade destroy B``):
+       round-26 retired the J3 shared-verdict contract (every captured UID
+       shared the call's ONE blob verdict — one "success" substring
+       retired a failed sibling, and an echo companion's wording forged the
+       certificate). The receipt is now aligned per segment
+       (:func:`align_execution`): each destroy's proof is its OWN receipt
+       slice — a companion or a pipe makes the whole call unprovable, and
+       a pure-blade composite needs an exact line-per-segment JSON
+       alignment where every destroy's own line proves its own kill.
+
+    An unpaired or failed call contributes NOTHING (doubt stays live; the
+    sweep's status-recheck convergence valve is the later escape).
+    """
+    # tool_call_id → paired ToolMessage content (single pass, any position:
+    # the pair may straddle compaction leftovers).
+    results: dict[str, object] = {}
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            tc_id = getattr(msg, "tool_call_id", "")
+            if tc_id:
+                results[tc_id] = msg.content
+
+    proven: set[str] = set()
+    for msg in messages:
+        for tc in getattr(msg, "tool_calls", None) or []:
+            args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+            if not isinstance(args, dict):
+                continue
+            name = tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+            tc_id = (
+                tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+            )
+            uids: list[str] = []
+            if name == "blade_destroy":
+                _uid = str(args.get("uid") or "").strip()
+                if _uid:
+                    uids.append(_uid)
+            elif name == "kubectl" and args.get("subcommand") == "exec":
+                # Round-26 root fix: per-segment receipt alignment. The
+                # pre-fix lane collected every destroy UID across segments
+                # and judged the WHOLE concatenated output once — one
+                # command's success wording retired every sibling (K2), and
+                # an echo companion riding the composite forged the
+                # certificate outright (K1). Each destroy's proof is now its
+                # OWN receipt slice; companions/pipes/misaligned shapes
+                # prove nothing (the convergence valve owns the doubt).
+                v_args = str(args.get("v_args") or "")
+                receipt = results.get(tc_id) if tc_id else None
+                for ev in align_execution(v_args, receipt):
+                    if not ev.provable:
+                        continue
+                    if len(ev.segment) >= 2 and ev.segment[1] == "destroy":
+                        uid = destroy_uid_from_tokens(ev.segment[2:])
+                        if uid and _destroy_output_proves_death(
+                            ev.receipt_slice
+                        ):
+                            proven.add(uid)
+            if not uids:
+                continue
+            if tc_id and _destroy_output_proves_death(results.get(tc_id)):
+                proven.update(uids)
+    return proven
+
+
+# Terminal create failures still owe cleanup: the CRD exists even when the
+# create errored out, so its UID joins the birth registry (mirrors the
+# host-face scan's treatment in ``created_experiment_ids``). Moved to this
+# module (round-14 G1): the inline create scan below needs the same
+# vocabulary, and provider→verify is the package's established import
+# direction.
+#
+# Round-15 root fix (R1 — dialect anchors do not cross output domains): the
+# ``"uid":`` JSON-key branch this RE used to carry is K8s-output
+# vocabulary, not blade dialect. The host face is structurally closed (its
+# input is ``blade_create`` ToolMessages only), so the branch was dormant
+# there; the inline face's input is kubectl-exec output, where that branch
+# matched every ``metadata.uid`` in a ``get -o json`` receipt — the wash-in
+# channel of round-15 H2.
+#
+# Round-16 domain split (the r15 cut was HALF done — one leg over-cut,
+# one leg left open): the ``UID: <uid>`` wording is the HOST face's
+# dialect ONLY (cli.py's ``Experiment CRD was created (UID: ...)``
+# wrapper — this RE stays that face's anchor). The exec channel sees
+# the blade CLI's RAW failure JSON instead: a top-level
+# ``"uid": "<hex16>"`` key — exactly the shape cli.py mines for the
+# host face, and the shape the r15 cut wrongly deleted here too
+# (round-16 A: failed-create ingestion went dark on the inline face).
+# The companion anchor below is hex16-ONLY (a dashed UUID is K8s-object
+# vocabulary, never a blade experiment UID), and SHAPE alone still cannot
+# keep a query output out (its ``"uid"`` keys are form-identical,
+# round-16 E3) — the pure-create segment gate in
+# :func:`inline_blade_create_receipt_uids` is what separates the domains.
+# Round-19 N3: the shape itself is now composed from the single source
+# (HEX16_UID_SHAPE) — the pre-round-19 tolerance (uppercase, dashes, an
+# 8-char lower bound, no upper bound) predated the r16/r17 legislation and
+# contradicted it; the host face's ``UID: <uid>`` wording is cli.py's own
+# re-wrap of a UID it mined with RAW_FAILED_CREATE_UID_RE, so a shaped
+# lowercase hex16 is the only form this anchor ever legitimately sees.
+# The trailing lookahead is load-bearing: unlike the JSON-key anchors
+# (whose closing quote anchors the shape's right edge), this prose wording
+# has no terminator, so a bare bound would PARTIAL-match a 40-hex string
+# and admit its first 32 chars as a truncated, well-shaped fake UID.
+# Round-22 Q1: the edge spelling is single-sourced too — the lookahead
+# composes HEX_TAIL_GUARD (uid_shapes.py), the case-insensitive refusal
+# round-19 N3b legislated. A hand-typed edge can drift casing silently
+# (round-21's FALLBACK_UID_RE drifted exactly this way) while every
+# shape-domain check stays green.
+FAILED_CREATE_UID_RE = re.compile(
+    r"UID:\s*(" + HEX16_UID_SHAPE + r")" + HEX_TAIL_GUARD
+)
+
+# Raw blade-CLI failed-create dialect (round-16 domain split): the exec
+# channel's own spelling of "the CRD was created although execution
+# failed" — a top-level ``"uid": "<hex16>"`` key in the CLI's error
+# JSON. cli.py mines the SAME shape for the host face (single source).
+# Round-19 N2: the shape bounds are the single source too — the open
+# ``{16,}`` upper end used to admit 40-hex sha256-shaped garbage into the
+# birth ledger through a pure-create receipt; it now composes from
+# HEX16_UID_SHAPE (lowercase, bounded 16-32) like every capturing anchor.
+RAW_FAILED_CREATE_UID_RE = re.compile(
+    r'"uid"\s*:\s*"(' + HEX16_UID_SHAPE + r')"'
+)
+
+
+# The kubectl tool's failure wrapper: ``Error: kubectl <sub> (exit N): ``
+# glued onto the first stdout line when the batch exits non-zero (e.g.
+# ``create A && create B`` with B failing — A's line is prefixed). The
+# wrapper is METADATA about the batch, not output of any create segment;
+# birth licensing unwraps it before scanning lines (the death face keeps
+# its own wrapper-tolerant normalisation inside the classifier).
+_KUBECTL_ERROR_PREFIX_RE = re.compile(
+    r"^Error:\s*kubectl\s+\S+\s+\(exit\s+-?\d+\):\s*"
+)
+
+# Round-29 K4 — the JSON-blind fallback's plural collector. The
+# anchoring discipline is KEY-VALUE CONTEXT, never a bare shape: a
+# truncated composite receipt keeps its semantic residue in
+# ``"result":"<uid>"`` / ``"uid":"<uid>"`` fragments, and ONLY those
+# count (the same discipline as RAW_FAILED_CREATE_UID_RE's failure
+# lane — a forged ``UID:`` wording or a bare hex16 in noise licenses
+# nothing, r16-F's boundary kept verbatim). The JSON-aware walk's
+# ``saw_receipt`` refusal-blocking stays the authority ahead of this
+# collector.
+_BLIND_BIRTH_UID_RE = re.compile(
+    r'"(?:result|uid)"\s*:\s*"(' + UID_SHAPE_ALTERNATION + r')"'
+)
+
+
+def receipt_birth_uids(content: object) -> list[str]:
+    """Every SUCCESS birth a PURE-CREATE receipt licenses, content order.
+
+    Round-27 root fix — the birth family's single licensing primitive,
+    consumed by the whitelist inline face, the plural ownership face and
+    the singular live face's kubectl lane (one source, three faces: the
+    pre-round-27 faces each carried their own copy of the 1:1 assumption
+    — the whitelist's success lane walked the blob and licensed only the
+    FIRST birth, the singular face filtered deaths at message
+    granularity and went blind on the sibling).
+
+    A birth licence is CONTENT-DERIVED: ``blade create`` prints the uid,
+    the segment argv never carried it, so every JSON line of a
+    pure-create receipt licenses its own uid and POSITION is irrelevant.
+    The round-26 per-event gate (:func:`align_execution`) was the death
+    face's discipline — there the uid rides the destroy segment's argv
+    and the proof rides the line, so misattribution false-retires a LIVE
+    experiment — inherited by the birth face, where it leaked honest
+    births through transport shapes the death gate was never asked to
+    survive: the kubectl ``Error:`` wrapper above, ``&&``/``||``
+    short-circuit (fewer lines than segments), stderr trailers (more).
+    The caller's ``pure_create`` gate remains the domain lever — within
+    it every line of stdout is this task's own ``blade create`` output
+    (the companion-forgery lever is and stays the segment composition,
+    rounds 16-18: an ``echo`` stage breaks ``pure_create`` and licenses
+    nothing).
+
+    A failure line licenses no birth (a failed create owns no
+    liability); its CRD uid still reaches the whitelist through
+    :data:`RAW_FAILED_CREATE_UID_RE` — different lane, different
+    obligation (cleanup of a failed create is still owed).
+
+    JSON-blind receipts (no line parses as a JSON object — truncated
+    stdout, transport garbage) keep the whole-content extractor with its
+    fallback chain: single-command receipts have always licensed through
+    it, and a receipt with no structured line has nothing to
+    misattribute.
+    """
+    if not isinstance(content, str) or not content:
+        return []
+    text = _KUBECTL_ERROR_PREFIX_RE.sub("", content, count=1)
+    births: list[str] = []
+    saw_receipt_line = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        # Round-28 K1 — the family's single-source legislation (round-22
+        # Q4b, generalized from the extractor chain): only a STRUCTURED
+        # BLADE RECEIPT — a dict carrying blade's ``code``/``success``
+        # semantics — holds the fallback-blocking jurisdiction. A
+        # non-receipt dict line (kubectl's own table JSON, an unrelated
+        # dict) never carried blade semantics; the first draft let ANY
+        # dict line block the JSON-blind fallback, orphaning a uid the
+        # truncated text still carried — stricter than the family this
+        # primitive licenses for, and divergent from the extractor chain
+        # the fallback delegates to.
+        if "success" not in parsed and "code" not in parsed:
+            continue
+        saw_receipt_line = True
+        uid = extract_experiment_uid(stripped)
+        if uid:
+            births.append(uid)
+    if not saw_receipt_line:
+        # JSON-blind receipt: the whole-content extractor with its
+        # fallback chain stays the FIRST licence (layer-1 parity —
+        # truncated single receipts have always licensed through it);
+        # round-29 K4 adds the plural sweep — every OTHER uid-shaped
+        # birth in the truncated text joins it (the single-value
+        # extractor licensed only the first, leaking the second past
+        # ownership, the sweep and the plural poll when the 64KB output
+        # safety valve's middle cut degraded a composite receipt to
+        # free text). Shape collection is safe ONLY inside the caller's
+        # pure-create domain gate (the r16-r18 segment-composition
+        # lever) — an auxiliary extractor there, never an authority.
+        uid = extract_experiment_uid(text)
+        collected = dict.fromkeys(
+            m.group(1) for m in _BLIND_BIRTH_UID_RE.finditer(text)
+        )
+        if uid:
+            births.append(uid)
+        births.extend(u for u in collected if u != uid)
+    return births
+
+
+def inline_blade_create_receipt_uids(messages: list) -> set[str]:
+    """UIDs proven by inline ``kubectl exec ... blade create`` receipts.
+
+    Birth-ledger channel parity (round-14 G1): the provenance scan's
+    message side saw ONLY host ``blade_create`` ToolMessages, so an
+    inline-delivered experiment was invisible to the destroy whitelist
+    — the main chain hid this behind the durable birth registry
+    (execute_loop's attribution sync), but the hydration fallback
+    (legacy checkpoints / DB-only recovery, ``live_liability_uids``'s
+    own documented target scenario) has no such cover: the LLM's own
+    destroy of its own inline experiment was REFUSED with the receipt
+    sitting in the visible history.
+
+    Paired-call gate (task-51193464) + PURE-CREATE segment gate
+    (round-16 A/E/F): a kubectl ToolMessage counts ONLY when its owning
+    AIMessage tool_call is the blade-exec delivery AND the payload's
+    every command segment is a ``blade create`` segment
+    (:attr:`BladeExecPayload.pure_create`). The ingestion dialect is
+    output-domain-split: the ``UID: <uid>`` wording is the HOST face's
+    (cli.py's wrapper); this face consumes the blade CLI's RAW failure
+    JSON — a top-level ``"uid": "<hex16>"`` key
+    (:data:`RAW_FAILED_CREATE_UID_RE`, the shape cli.py itself mines).
+    Shape alone cannot keep a query output out (its ``"uid"`` keys are
+    form-identical, round-16 E3) and an ``echo`` companion can forge ANY
+    shape (round-16 F): the segment composition is the only lever — an
+    echo/query/destroy companion proves some OTHER command contributed
+    to the receipt, so the receipt licenses NOTHING (fail-closed).
+    Failed-create CRD UIDs count too — cleanup is still owed for them.
+
+    Round-27: the success lane is plural and content-derived
+    (:func:`receipt_birth_uids`) — position-independent licensing that
+    unwraps the kubectl ``Error:`` transport wrapper and takes every JSON
+    line's birth; positional alignment remains the DEATH face's own
+    discipline.
+    """
+    lookup = build_tool_call_args_lookup(messages)
+    uids: set[str] = set()
+    for msg in messages:
+        if not isinstance(msg, ToolMessage):
+            continue
+        if (getattr(msg, "name", "") or "") != "kubectl":
+            continue
+        args = lookup.get(getattr(msg, "tool_call_id", "") or "")
+        if not isinstance(args, dict) or args.get("subcommand") != "exec":
+            continue
+        v_args = str(args.get("v_args") or "")
+        if not classify_blade_exec_payload(v_args).pure_create:
+            continue
+        content = msg.content if isinstance(msg.content, str) else ""
+        # Round-27: the success lane rides the shared plural primitive —
+        # a pure-create composite proves EVERY birth its lines carry (the
+        # singular walk licensed only the first, so the second birth was
+        # destroy-gate-REJECTed with the receipt sitting in the visible
+        # history, and leaked out of the hydration fallback's ownership
+        # rebuild — legacy checkpoints / DB-only recovery). The failure
+        # lane below stays finditer (already plural).
+        uids.update(receipt_birth_uids(content))
+        uids.update(
+            m.group(1) for m in RAW_FAILED_CREATE_UID_RE.finditer(content)
+        )
+    return uids
 
 
 def scan_blade_evidence_index(
@@ -257,20 +1077,39 @@ def scan_blade_evidence_index(
     successful injection, not the earliest blade UID in history).
 
     A ``kubectl`` ToolMessage attests blade evidence ONLY when its owning
-    tool_call is the blade-exec delivery (``subcommand='exec'`` with ``blade``
-    and ``create`` in ``v_args``) — cross-checked through the AIMessage
-    tool-call lookup, the SAME gate :func:`extract_experiment_uid_from_messages`
-    and :func:`scan_kubectl_blade_success` apply. Every other kubectl output
-    is outside the blade domain: a ``kubectl debug`` result embeds a
-    ``[debug-pod-meta: {"uid": ...}]`` block whose ``uid`` is the K8s OBJECT
-    UID of the debug pod, and a ``get -o json`` embeds ``metadata.uid`` —
-    shape-identical to a blade experiment UID and reachable by the loose
-    regex fallback, but never a ChaosBlade experiment (task-51193464: such a
-    mis-read attributed ``injection_method=kubectl_exec`` four minutes BEFORE
-    the real native injection ran, and the unfulfillable UID-less attribution
-    then deadlocked the executor out of the verifier). A kubectl ToolMessage
-    whose call cannot be resolved in the lookup is skipped fail-closed — an
-    unattributable kubectl output must not license a blade attribution.
+    tool_call is the INGESTION-qualified blade-exec delivery —
+    ``subcommand='exec'`` whose payload is pure-create
+    (:attr:`BladeExecPayload.pure_create`), cross-checked through the
+    AIMessage tool-call lookup. Rounds 17-18: this is an INGESTION face
+    (it certifies a UID as blade evidence), so the gate is the
+    segment-composition proof, NOT the looser "some segment creates"
+    attribution judgement. The round-17 "graded" middle lane (composite
+    receipts allowed the JSON-aware anchors only) is REVERTED — round-18 F
+    proved the strict anchor forgeable (an ``echo`` companion prints the
+    success JSON verbatim), and round-16 F had already ruled the segment
+    composition the only lever: a composite receipt licenses NOTHING,
+    exactly like the birth registry. A composite payload (real ``blade
+    create`` + ``kubectl get pods -o json``) passing the attribution gate
+    used to launder the K8s ``metadata.uid`` in with ``method=
+    'kubectl_exec'`` when the create failed, deadlocking the executor on an
+    unfulfillable UID. The ATTRIBUTION faces
+    (:func:`scan_kubectl_blade_success`, the pod-name extractors) keep
+    ``has_create`` — attributing WHICH channel delivered a create is correct
+    there; ingesting WHAT a receipt licenses is decided here. A kubectl
+    ToolMessage whose call cannot be resolved in the lookup is skipped
+    fail-closed — an unattributable kubectl output must not license a blade
+    attribution.
+
+    Round-28 K2 — the kubectl lane licenses PLURALLY through the birth
+    family's primitive (:func:`receipt_birth_uids`): the singular walk
+    licensed only the FIRST birth, so a composite double-create whose
+    first experiment was destroyed attested NOTHING (the whole message
+    skipped on the dead uid, the still-live sibling invisible) and the
+    attribution face returned ``(-1, None)`` over a task that still owed
+    a live experiment — the fifth private copy of the 1:1 assumption
+    (r27 rewired four faces; this one had its own). The host
+    ``blade_create`` lane stays singular — the structured tool call is
+    one-create-per-call by construction, no composite shape exists.
     """
     lookup = build_tool_call_args_lookup(messages)
     for i in range(len(messages) - 1, -1, -1):
@@ -286,16 +1125,20 @@ def scan_blade_evidence_index(
             if not isinstance(args, dict):
                 continue
             v_args = args.get("v_args", "") or ""
-            if (
-                args.get("subcommand") != "exec"
-                or "blade" not in v_args
-                or "create" not in v_args
-            ):
+            payload = classify_blade_exec_payload(v_args)
+            if args.get("subcommand") != "exec" or not payload.pure_create:
                 continue
+            content = msg.content if isinstance(msg.content, str) else str(msg.content)
+            # Round-28 K2: per-uid destroyed filter — the first birth the
+            # receipt licenses that is STILL live wins the recency slot.
+            for uid in receipt_birth_uids(content):
+                if uid not in destroyed:
+                    return i, "kubectl_exec"
+            continue
         content = msg.content if isinstance(msg.content, str) else str(msg.content)
         uid = extract_experiment_uid(content)
         if uid and uid not in destroyed:
-            return i, ("host_blade" if name == "blade_create" else "kubectl_exec")
+            return i, "host_blade"
     return -1, None
 
 
@@ -336,7 +1179,10 @@ def scan_kubectl_blade_success(messages: list) -> bool:
             args = lookup[tc_id]
             subcommand = args.get("subcommand", "")
             v_args = args.get("v_args", "")
-            if subcommand == "exec" and "blade" in v_args and "create" in v_args:
+            if (
+                subcommand == "exec"
+                and classify_blade_exec_payload(v_args).has_create
+            ):
                 return True
             continue
 
@@ -387,6 +1233,7 @@ def was_kubectl_exec_delivery(
 
 def was_blade_create_attempted(
     messages: list, injection_method: str | None = None,
+    *, is_teardown=None,
 ) -> bool:
     """Check if ChaosBlade injection was attempted but ultimately failed.
 
@@ -396,6 +1243,15 @@ def was_blade_create_attempted(
       - kubectl-native injection was used as an alternative after blade_create failed
     Returns True only if blade_create was called AND no successful injection
     was detected via any method.
+
+    ``is_teardown`` (P3, the O-1 door closed): the teardown≠mutation
+    matcher — a registered-vehicle cleanup delete after the failed
+    ``blade_create`` is NOT a kubectl-native fallback injection, so it
+    must not flip this judgement to "not attempted-and-failed". Callers
+    with task state thread ``execution_artifacts.make_teardown_matcher(
+    state["execution_artifacts"])``; ``None`` (the default) is the RAW
+    scan (test fixtures, state-less callers whose histories carry no
+    registered vehicles).
 
     This distinguishes two scenarios when experiment_uid is empty:
       - True:  ChaosBlade injection was attempted but failed → Layer 1 returns "failed"
@@ -431,6 +1287,8 @@ def was_blade_create_attempted(
         KUBECTL_WRITE_SUBCOMMANDS,
         command_subcommands=KUBECTL_COMMAND_SUBCOMMANDS,
         is_mutating_command=exec_inner_command_mutates,
+        is_blade_create_delivery=_is_blade_create_delivery,
+        is_teardown=is_teardown,
     ):
         return False
 
@@ -477,7 +1335,13 @@ def _parse_uid_from_status_content(content) -> str | None:
     if uid:
         return uid
 
-    # Handle blade_status/blade_query_k8s format where result is a dict
+    # Handle blade_status/blade_query_k8s format where result is a dict.
+    # Round-19 N1: this is the THIRD return point of the code=200/
+    # success=true extraction family (after the result string and the
+    # 54000-initializing uid) — it takes the same ``_UID_SHAPE_RE`` gate
+    # the round-18 F-e ruling put on the first two; a non-shaped
+    # ``result.uid`` string is not an experiment UID and must not ride
+    # the single slot.
     try:
         data = json.loads(content)
     except (json.JSONDecodeError, TypeError):
@@ -491,7 +1355,7 @@ def _parse_uid_from_status_content(content) -> str | None:
         result = data.get("result")
         if isinstance(result, dict):
             uid = result.get("uid")
-            if isinstance(uid, str) and uid:
+            if isinstance(uid, str) and _UID_SHAPE_RE.fullmatch(uid):
                 return uid
 
     return None
@@ -516,9 +1380,24 @@ def extract_experiment_uid_from_messages(
          timed out but the experiment was in fact created, so the LLM discovered
          the uid via a status query (uid nested in a dict ``result`` field).
 
-    Only kubectl exec calls whose v_args contain "blade create" are considered —
-    other kubectl outputs (get -o json, describe, ...) are NOT scanned, to
-    prevent false-positive extraction from K8s resource ``metadata.uid`` fields.
+    Only PURE-CREATE kubectl exec calls are considered for the kubectl face
+    (round-17 H2c; round-18 F made it the ONLY lane — the graded middle
+    lane is reverted): this is an INGESTION face — the segment composition
+    (:attr:`BladeExecPayload.pure_create`) must prove no other command
+    (``kubectl get -o json``, an ``echo``) contributed to the receipt before
+    its output may license a UID. The round-17 middle lane let a composite
+    receipt license the JSON-aware success anchors on the theory that a
+    companion does not produce that shape "organically" — round-18 F
+    proved an ``echo`` companion forges it verbatim, and round-16 F had
+    already ruled segment composition the only lever, so composite
+    receipts now license NOTHING (legislative parity with the birth
+    registry). A composite payload whose create segment FAILED used to
+    pass the looser ``has_create`` gate and let the loose regex fallback
+    pick up the K8s ``metadata.uid`` from the companion ``get -o json``
+    output, deadlocking recovery on an unfulfillable UID.
+    Other kubectl outputs (get -o json, describe, ...) are NOT scanned, to
+    prevent false-positive extraction from K8s resource ``metadata.uid``
+    fields.
 
     ``retired``: UIDs destroyed by FRAMEWORK-side cleanup (verify-replan
     residual destroy). They leave no ``blade_destroy`` ToolMessage, so the
@@ -536,8 +1415,14 @@ def extract_experiment_uid_from_messages(
     if retired:
         destroyed |= set(retired)
 
-    # Build a set of tool_call_ids that correspond to "kubectl exec ... blade create"
-    blade_exec_call_ids: set[str] = set()
+    # Build the tool_call_id set for the kubectl face — the ingestion gate
+    # is the segment composition (round-17 H2c opened the graded lane,
+    # round-18 F closed it: the strict anchor is forgeable, so a composite
+    # receipt licenses NOTHING — legislative parity with the birth
+    # registry). Only PURE-CREATE calls may license a UID:
+    #   ``pure_create_call_ids`` — every segment is a ``blade create``, so
+    #   the receipt's output domain is blade's own, full anchor chain.
+    pure_create_call_ids: set[str] = set()
     for msg in messages:
         if not hasattr(msg, "tool_calls"):
             continue
@@ -547,13 +1432,13 @@ def extract_experiment_uid_from_messages(
             tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
             if name == "kubectl" and isinstance(args, dict):
                 v_args = args.get("v_args", "")
-                if "blade" in v_args and "create" in v_args:
-                    blade_exec_call_ids.add(tc_id)
+                payload = classify_blade_exec_payload(v_args)
+                if payload.pure_create:
+                    pure_create_call_ids.add(tc_id)
 
     # Check if an experiment-creating tool was attempted (even if it failed /
     # timed out). blade_status UID extraction is only relevant then — otherwise
     # the status check might pick up unrelated experiments.
-    _EXPERIMENT_CREATE_TOOLS = ("blade_create", "blade_python_create")
     _has_blade_create = any(
         isinstance(msg, ToolMessage)
         and getattr(msg, "name", "") in _EXPERIMENT_CREATE_TOOLS
@@ -580,10 +1465,26 @@ def extract_experiment_uid_from_messages(
         # Priority 2: kubectl exec blade ToolMessage ONLY
         if msg_name == "kubectl" and not kubectl_uid:
             tool_call_id = getattr(msg, "tool_call_id", "") or ""
-            if tool_call_id in blade_exec_call_ids:
-                _uid = _parse_blade_uid_from_content(content)
-                if _uid and _uid not in destroyed:
-                    kubectl_uid = _uid
+            if tool_call_id in pure_create_call_ids:
+                # Composite receipts license NOTHING (round-18 F revert of
+                # the round-17 graded lane — the strict anchor is forgeable
+                # by an echo companion; segment composition is the only
+                # lever, exactly like the birth registry's ruling).
+                # Round-27: the destroyed filter sits at BIRTH granularity.
+                # It used to sit at MESSAGE granularity — a composite
+                # create message yielded its FIRST uid, a destroyed first
+                # birth skipped the whole message, and the still-live
+                # second birth in the SAME message was never re-extracted
+                # (every singular consumer — the replan seam, the
+                # compactor's survival pin, session recovery — reported
+                # "no live experiment" while the sibling ran). The FIRST
+                # live birth in content order wins: both live keeps the
+                # first (the round-26 single-slot contract anchor), a dead
+                # first-born now falls through to its live sibling.
+                for _uid in receipt_birth_uids(content):
+                    if _uid not in destroyed:
+                        kubectl_uid = _uid
+                        break
 
         # Priority 3: blade_status / blade_query_k8s ToolMessage
         # Relevant when blade_create timed out but experiment was created.
@@ -595,6 +1496,121 @@ def extract_experiment_uid_from_messages(
 
     # Return by priority: blade_create > kubectl exec > blade_status
     return kubectl_uid or status_uid
+
+
+#: Experiment-creating tool names (both carriers of the blade family: the
+#: OS/K8s carrier's ``blade_create`` and the python carrier's
+#: ``blade_python_create`` — same ChaosBlade CLI receipt, same
+#: ``blade destroy <uid>`` recovery). Hoisted module-level (round-26):
+#: the singular and plural extraction faces below share ONE vocabulary,
+#: not two copies that can drift.
+_EXPERIMENT_CREATE_TOOLS = ("blade_create", "blade_python_create")
+
+
+def extract_experiment_uids_from_messages(
+    messages: list,
+    retired: "list[str] | set[str] | None" = None,
+) -> set[str]:
+    """EVERY experiment uid provably born in these messages (plural face).
+
+    The single-slot face (:func:`extract_experiment_uid_from_messages`)
+    answers "which ONE experiment is current" — a 1-call=1-birth fossil:
+    a composite inline create (``blade create A && blade create B``) proves
+    TWO births in one call and the single-slot scan surfaces only the
+    first, so the second is born an ORPHAN — never in the ownership
+    ledger (``owned_experiment_uids``), invisible to
+    ``live_liability_uids``, unrecoverable by any sweep (round-26 birth
+    face, the symmetric defect of the death face's J3 hole). The birth
+    registry's question is "which experiments does this task OWN" — a
+    liability question, and the answer is plural by nature.
+
+    Faces scanned:
+
+    1. every ``blade_create``/``blade_python_create`` ToolMessage — each
+       tool call IS one create, so every receipt proves its own birth
+       (multiple calls, multiple births — the singular face returns only
+       the newest);
+    2. every PURE-CREATE kubectl exec call, licensed per receipt LINE
+       (:func:`receipt_birth_uids`, round-27): a birth licence is
+       content-derived — the uid lives in the line, the segment argv
+       never carried it — so every JSON line of the receipt licenses its
+       own birth, position-independently (the same composition gate the
+       birth ledger always had: a companion licenses nothing). A failure
+       line licenses nothing (a failed create owns no liability); the
+       round-26 per-event positional gate was the death face's discipline
+       inherited by the birth face, and it leaked honest births through
+       transport shapes (the ``Error:`` wrapper, short-circuit, trailers).
+
+    The status face is deliberately ABSENT: ``blade_status`` with no
+    arguments lists EVERY experiment on the cluster — plural extraction
+    from it would claim OTHER tasks' experiments as owned. The singular
+    face's gated status fallback (create attempted, uid discovered via
+    status) still feeds the single-slot seam, which the birth registry
+    also consumes — nothing is lost, nothing foreign is claimed.
+
+    ``retired``/destroyed uids are excluded (a dead experiment is not a
+    live liability) — same exclusion the singular face applies.
+    """
+    born: set[str] = set()
+    destroyed = scan_destroyed_uids(messages)
+    if retired:
+        destroyed |= set(retired)
+
+    # tool_call_id → paired ToolMessage content (single pass, any position).
+    results: dict[str, object] = {}
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            tc_id = getattr(msg, "tool_call_id", "")
+            if tc_id:
+                results[tc_id] = msg.content
+
+    # Face 2: pure-create kubectl exec calls, receipt-aligned per segment.
+    for msg in messages:
+        for tc in getattr(msg, "tool_calls", None) or []:
+            args = (
+                tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+            )
+            if not isinstance(args, dict):
+                continue
+            name = (
+                tc.get("name", "") if isinstance(tc, dict) else getattr(tc, "name", "")
+            )
+            if name != "kubectl" or args.get("subcommand") != "exec":
+                continue
+            v_args = str(args.get("v_args") or "")
+            if not classify_blade_exec_payload(v_args).pure_create:
+                continue
+            tc_id = (
+                tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "")
+            )
+            receipt = results.get(tc_id) if tc_id else None
+            # Round-27: content-derived licensing (:func:`receipt_birth_uids`).
+            # A birth licence lives in the receipt LINE — ``blade create``
+            # prints the uid, the segment argv never carried it — so
+            # positional alignment (the death face's binding discipline,
+            # :func:`align_execution`) was over-strict here: the kubectl
+            # ``Error:`` wrapper (a ``create A && create B`` whose second
+            # stage failed exits non-zero and the tool glues the prefix
+            # onto A's line), ``&&``/``||`` short-circuit (fewer lines than
+            # segments) and stderr trailers (more) all leaked honest
+            # births out of the liability ledger. The pure-create gate
+            # above remains the domain lever: within it every JSON line of
+            # the receipt is this task's own create output.
+            for uid in receipt_birth_uids(receipt):
+                if uid not in destroyed:
+                    born.add(uid)
+
+    # Face 1: every experiment-creating tool message — one create each.
+    for msg in messages:
+        if (
+            isinstance(msg, ToolMessage)
+            and getattr(msg, "name", "") in _EXPERIMENT_CREATE_TOOLS
+        ):
+            uid = _parse_blade_uid_from_content(msg.content)
+            if uid and uid not in destroyed:
+                born.add(uid)
+
+    return born
 
 
 # ---------------------------------------------------------------------------
@@ -1225,6 +2241,7 @@ async def _run_host_blade_layer1(
     experiment_uid: str, kubeconfig: str, *, task_id: str = "",
     messages: list | None = None,
     injection_method: str | None = None,
+    is_teardown=None,
 ) -> Layer1Result:
     """Execute host-blade Layer 1 verification: blade_status + blade_query_k8s.
 
@@ -1240,7 +2257,9 @@ async def _run_host_blade_layer1(
     if not experiment_uid:
         # Same-package attempted judgement (was ``_was_blade_create_attempted``
         # through the nodes re-export pre-migration — same function object).
-        if messages and was_blade_create_attempted(messages, injection_method):
+        if messages and was_blade_create_attempted(
+            messages, injection_method, is_teardown=is_teardown,
+        ):
             # blade_create was called but extract_blade_uid rejected the UID
             # (e.g., 54000+success=false). blade's error report may be wrong
             # (ChaosBlade may use fallback mechanisms like tc instead of

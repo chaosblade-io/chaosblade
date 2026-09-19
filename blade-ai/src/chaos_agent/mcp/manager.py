@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 from chaos_agent.mcp.adapter import make_langchain_tool
 from chaos_agent.mcp.client import McpClient
 from chaos_agent.mcp.config import McpServerConfig, load_mcp_config
+from chaos_agent.mcp.effect import resolve_tool_effect
+from chaos_agent.mcp.registry import McpToolRegistry
 
 if TYPE_CHECKING:
     from langchain_core.tools import StructuredTool
@@ -83,10 +85,21 @@ class McpManager:
             # failures (e.g. bad JSON Schema) are per-tool: log warning,
             # skip that tool, keep the rest.
             adapted: list[StructuredTool] = []
+            # Advisory read/write labels (posture B): operator override
+            # wins, else the server's own ToolAnnotations, else
+            # unspecified. Recorded here, surfaced in the tool
+            # description; NEVER gates execution.
+            effect_records: list[tuple[str, str, str]] = []
             for descriptor in tools:
+                effect, source = resolve_tool_effect(
+                    cfg.tool_effects.get(descriptor.name), descriptor.annotations
+                )
+                effect_records.append((descriptor.name, effect, source))
                 try:
                     adapted.append(
-                        make_langchain_tool(client, descriptor, cfg.timeout_seconds)
+                        make_langchain_tool(
+                            client, descriptor, cfg.timeout_seconds, effect
+                        )
                     )
                 except Exception as e:
                     logger.warning(
@@ -94,9 +107,38 @@ class McpManager:
                         cfg.name, descriptor.name, e,
                     )
             self._tools_by_client[cfg.name] = adapted
+            # Advisory-label integrity (posture B): warn on ``tool_effects``
+            # keys that matched NO real tool. The VALUE axis is validated at
+            # config load (config.py); the KEY axis can only be checked
+            # here, where the server's actual tool names are known. Without
+            # this, a typo'd tool name (valid value, wrong key) makes the
+            # operator's override silently no-op — the mirror image of the
+            # silent config error we removed on the value side. Advisory
+            # only: warn, never gate; the real tools are unaffected.
+            known_names = {d.name for d in tools}
+            orphans = sorted(set(cfg.tool_effects) - known_names)
+            if orphans:
+                logger.warning(
+                    "MCP server '%s' tool_effects key(s) %s matched no tool "
+                    "(server exposes: %s); these overrides are ignored",
+                    cfg.name, orphans, sorted(known_names) or "none",
+                )
+            # Register each adapted tool with the guard-classification
+            # registry so the target_guard classifier recognises it instead
+            # of default-denying it as UNKNOWN. Posture A: the classifier
+            # passes a registered MCP tool through as READONLY (best-effort;
+            # the operator owns the wiring). Keyed by the LangChain full
+            # name the LLM will actually call it by.
+            for adapted_tool in adapted:
+                McpToolRegistry.register(adapted_tool.name, cfg.attach_to)
             logger.info(
                 "MCP connected: %s (%d tools, attach_to=%s)",
                 cfg.name, len(adapted), list(cfg.attach_to),
+            )
+            logger.info(
+                "MCP tool effects (server=%s): %s",
+                cfg.name,
+                ", ".join(f"{n}={e}({s})" for n, e, s in effect_records) or "none",
             )
             return client
 
@@ -144,3 +186,6 @@ class McpManager:
         )
         self._clients = []
         self._tools_by_client = {}
+        # Drop the guard-classification entries too, so a tool from a
+        # server that is no longer connected can never be classified.
+        McpToolRegistry.clear()

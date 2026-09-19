@@ -3,6 +3,8 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from langchain_core.messages import AIMessage, ToolMessage
+
 from chaos_agent.memory.compactor import (
     _prepare_compaction_messages,
     _simple_compact,
@@ -192,21 +194,34 @@ class TestExtractCriticalContext:
     """Test extract_critical_context extracts key operational state."""
 
     def test_extracts_experiment_uid_from_tool_message(self):
-        # phase-14 G5: 单键正则——消息文本只认 experiment_uid 拼写
+        # round-22 Q4: the message face delegates to the registry seam —
+        # only an experiment-CREATING tool's structured receipt licenses
+        # a UID. The pre-round-22 prose miner matched any message's
+        # ``experiment_uid: <uid>`` spelling (a HumanMessage mention rode
+        # straight into the survival context); the fixture is now a real
+        # blade_create ToolMessage with a legal receipt.
         msgs = [
-            MagicMock(content='experiment_uid: abc123def456'),
+            ToolMessage(
+                content='{"code":200,"success":true,"result":"abc123def4560789"}',
+                name="blade_create",
+                tool_call_id="tc-comp-1",
+            ),
         ]
         state = {}
         result = extract_critical_context(msgs, state)
-        assert result["active_experiment_uid"] == "abc123def456"
+        assert result["active_experiment_uid"] == "abc123def4560789"
 
     def test_extracts_blade_uid_from_json_result(self):
         msgs = [
-            MagicMock(content='{"code": 200, "success": true, "result": "f00baa123"}'),
+            ToolMessage(
+                content='{"code": 200, "success": true, "result": "f00baa1230000001"}',
+                name="blade_create",
+                tool_call_id="tc-comp-2",
+            ),
         ]
         state = {}
         result = extract_critical_context(msgs, state)
-        assert result["active_experiment_uid"] == "f00baa123"
+        assert result["active_experiment_uid"] == "f00baa1230000001"
 
     def test_extracts_skill_from_state(self):
         msgs = []
@@ -239,16 +254,25 @@ class TestExtractCriticalContext:
 
     def test_experiment_uid_from_state_fallback(self):
         msgs = []
-        state = {"experiment_uid": "aabb1122ccdd"}
+        state = {"experiment_uid": "aabb1122ccdd0718"}
         result = extract_critical_context(msgs, state)
-        assert result["active_experiment_uid"] == "aabb1122ccdd"
+        assert result["active_experiment_uid"] == "aabb1122ccdd0718"
 
     def test_message_uid_takes_priority_over_state(self):
-        msgs = [MagicMock(content='experiment_uid: cc1234ab5678')]
-        state = {"experiment_uid": "ff9876ba5432"}
+        # round-22 Q4: the delegation order is preserved — the registry's
+        # message-face verdict (create receipt) beats the durable state
+        # slot, which only runs as the fallback.
+        msgs = [
+            ToolMessage(
+                content='{"code":200,"success":true,"result":"cc1234ab56780718"}',
+                name="blade_create",
+                tool_call_id="tc-comp-3",
+            ),
+        ]
+        state = {"experiment_uid": "ff9876ba54320718"}
         result = extract_critical_context(msgs, state)
         # Message-extracted UID should take priority
-        assert result["active_experiment_uid"] == "cc1234ab5678"
+        assert result["active_experiment_uid"] == "cc1234ab56780718"
 
     def test_empty_state_returns_empty(self):
         msgs = [MagicMock(content="no relevant content")]
@@ -269,12 +293,106 @@ class TestExtractCriticalContext:
 
     def test_pins_blade_fault_handle_from_state(self):
         msgs = []
-        state = {"experiment_uid": "aabb1122ccdd", "injection_method": "host_blade"}
+        # round-22 Q3: the 12-hex placeholder was a pre-legislation value —
+        # the read-side gate now refuses it (真实化为 hex16，与 r20 的占位符
+        # 真实化同型)
+        state = {"experiment_uid": "aabb1122ccdd0718", "injection_method": "host_blade"}
         result = extract_critical_context(msgs, state)
-        assert result["active_experiment_uid"] == "aabb1122ccdd"
+        assert result["active_experiment_uid"] == "aabb1122ccdd0718"
         assert result["active_fault_handle"] == {
-            "kind": "experiment_uid", "value": "aabb1122ccdd", "method": "host_blade"
+            "kind": "experiment_uid", "value": "aabb1122ccdd0718", "method": "host_blade"
         }
+
+    def test_state_fallback_refuses_retired_uid(self):
+        # round-23 R1: the slot is last-write-wins and NEVER cleared on
+        # destroy (every destroy surface only appends to the retired
+        # ledger), so slot = dead uid + retired landed is the post-destroy
+        # STEADY state of the fallback's input. The round-22 shape-only
+        # read gate waved the corpse into "Active experiment_uid: <dead>";
+        # the read side now judges liveness through the same
+        # live_liability_uids primitive every other read face of the slot
+        # uses (the slot self-proves provenance via the durable-record
+        # evidence source, so no owned registry is needed to convict it).
+        state = {
+            "experiment_uid": "aabb1122ccdd0718",
+            "retired_experiment_uids": ["aabb1122ccdd0718"],
+        }
+        result = extract_critical_context([], state)
+        assert "active_experiment_uid" not in result
+
+    def test_state_fallback_live_uid_still_flows(self):
+        # The death gate is fail-open ONLY on the no-evidence quadrant:
+        # a slot uid with nothing proving it dead (no retired ledger, no
+        # destroy in the messages) still survives — legacy checkpoints
+        # with no provenance at all keep their attribution.
+        state = {"experiment_uid": "aabb1122ccdd0718"}
+        result = extract_critical_context([], state)
+        assert result["active_experiment_uid"] == "aabb1122ccdd0718"
+
+    def test_boundary_turn_corpse_refused_on_widest_view(self):
+        # round-24 R1/R2: the hook hands state carrying the FULL message
+        # list while ``messages`` is only the compaction window — the K2
+        # boundary shape parks the destroy pair in the KEPT TAIL,
+        # outside the window, and the retired ledger is still empty at
+        # hook ENTRY (the K1/K2 absorption merges only in the hook's
+        # RETURN). BOTH UID consumers must judge on the state's OWN
+        # view: the delegation licenses the uid from the create receipt
+        # only to filter it on the tail's destroy pair, and the fallback
+        # (were it reached) convicts through the same view. Pre-round-24
+        # the delegation ran on the window ALONE (create receipt
+        # licenses, destroy invisible, ledger stale-empty) and preempted
+        # the fallback gate entirely — the corpse rendered as "Active
+        # experiment_uid" in the recovery message of the very turn the
+        # absorption was supposed to protect.
+        uid = "aabb1122ccdd0718"
+        create_pair = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "blade_create",
+                    "args": {"command": "create k8s pod-cpu fullload"},
+                    "id": "tc-r24-bc",
+                    "type": "tool_call",
+                }],
+            ),
+            ToolMessage(
+                content='{"code":200,"success":true,"result":"%s"}' % uid,
+                name="blade_create",
+                tool_call_id="tc-r24-bc",
+            ),
+        ]
+        destroy_pair = [
+            AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "blade_destroy",
+                    "args": {"uid": uid},
+                    "id": "tc-r24-bd",
+                    "type": "tool_call",
+                }],
+            ),
+            ToolMessage(
+                content='{"code":200,"success":true,"result":"success"}',
+                name="blade_destroy",
+                tool_call_id="tc-r24-bd",
+            ),
+        ]
+        full_view = create_pair + destroy_pair  # window ⊂ full
+        state = {
+            "experiment_uid": uid,
+            "retired_experiment_uids": [],  # pre-absorption ledger
+            "messages": full_view,          # the state's OWN full view
+        }
+
+        # Window = the doomed slice (create receipt only): the widest
+        # view must refuse the corpse the window cannot even see.
+        result = extract_critical_context(create_pair, state)
+        assert "active_experiment_uid" not in result
+
+        # And with NO window evidence at all — the same refusal holds
+        # through whichever consumer runs.
+        result = extract_critical_context([], state)
+        assert "active_experiment_uid" not in result
 
 
 class TestBuildPostCompactContextMessage:
@@ -384,11 +502,14 @@ class TestCompactMemoryWithModes:
         msgs = [MagicMock(content="test message")]
         state = {
             "skill_name": "pod-kill",
-            "experiment_uid": "abc123",
+            # round-22 Q3: read-side shape gate — the pre-round-22 "abc123"
+            # placeholder (6 hex) rode straight into the recovery message;
+            # the durable fallback now only admits legislated shapes.
+            "experiment_uid": "abc123def4560789",
         }
         result = await compact_memory(msgs, llm=None, state=state)
         assert "[Context preserved after compaction]" in result
-        assert "abc123" in result
+        assert "abc123def4560789" in result
         assert "pod-kill" in result
 
     async def test_no_context_recovery_without_state(self):

@@ -1,8 +1,55 @@
+---
+# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 memory limits），路由进 FaultDrill
+# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+recovery_channel: apiserver-write
+# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
+# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
+# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
+# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
+mechanism_writes:
+  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
+  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
+  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
+  - scope: faultdrill
+    namespace: default
+    name_prefix: "fd-"
+---
+
 **用例名称** limit单位写错 导致 Pod_OOM内存异常
+
+**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 memory limits；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+
+```yaml
+apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
+kind: FaultDrill
+metadata:
+  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
+  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
+spec:
+  action: specPatch
+  targetRef:
+    kind: Deployment
+    name: <deployment-name>
+    namespace: <namespace>
+  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+  - op: replace
+    path: /spec/template/spec/containers/0/resources/limits/memory
+    value: <错误单位的值（如把 Mi 写成 M 或 Ti）>
+  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
+  - op: replace
+    path: /spec/template/spec/containers/0/resources/limits/memory
+    value: <注入前记录的基线值>
+  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+```
+
+- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
+- 多容器 Pod 调整 containers/N 索引至目标容器；滚动由 patch 自动触发。
+- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. Pod 启动后立即异常退出，状态为 CrashLoopBackOff
-2. Pod 的 lastState 显示 reason: OOMKilled，或新 Pod 卡在 ContainerCreating（极小 limit 在 cgroup v2 下的实测形态，见注入验证第 3 条）
+2. Pod 的 lastState 显示 reason: OOMKilled，或新 Pod 卡在 ContainerCreating（极小 limit 在 cgroup v2 下的实际形态，见注入验证第 3 条）
 3. 容器 memory limit 值极小（如 100m = 0.1 字节），应用启动即超限或无法启动
 
 **资源准备**：
@@ -24,15 +71,30 @@
    ```
 3. **武装定时自恢复**（恢复命令幂等：定时器到期自动还原为主，Agent 在演练结束时主动执行
    同一条命令兜底，定时器迟到重复执行无副作用。定时器 shell 逻辑必须作为 `kubectl exec` 载体载荷派发——直接以
-   `sh -c '…'` 作为顶层命令派发会被命令守卫拦截（unknown_binary: sh）；执行通道为多副本
-   路由，无法可靠终止定时器，故不设 pidfile。恢复含 json patch 引号嵌套，用 base64 折叠
-   武装；`<duration>` 需覆盖滚动更新与观察窗口）。
-   载体 Pod 选集群内带 kubectl 且有足够 RBAC 权限的常驻 Pod（如演练工具 Pod）：
+   `sh -c '…'` 作为顶层命令派发会被命令守卫拦截（unknown_binary: sh）；载体 Pod 为多副本
+   时无法可靠终止定时器，故不设 pidfile。恢复脚本落盘形态按 recovery-carrier.md 第七节「四档定案表」
+   按明文字节数查表选定（Phase 2 无 base64 生成器，勿留 <restore-b64> 占位符或手算 b64 长度）；
+   `<duration>` 需覆盖滚动更新与观察窗口）。
+   载体 Pod 选集群内带 kubectl 且有足够 RBAC 权限的常驻 Pod（如演练工具 Pod）；集群无常驻带
+   kubectl 的 Pod 时按**恢复载体标准件**自建四件套（Role 按标准件第二节推导表取
+   `--verb=get,patch --resource=deployments`——verb 清单按钦定恢复形态推导，换形态时以恢复脚本
+   实际载荷动词为准重建，见第二节形态无关总则与第三节写动词 SSAR 对账；武装用第四节紧凑变量 REST 形态，恢复
+   PATCH 的 Content-Type 用 application/json-patch+json——resources 位于 containers 数组
+   元素内部（merge-patch 对数组是整组替换语义会抹掉容器），json patch 精确路径 replace 整对象
+   与注入同型满足铁律 1 对称律；resources+MU 双 op 可并入单条 json-patch 数组一条 curl 完成
+   （#45 实证））：
    ```bash
-   # 武装定时自恢复（将"注入恢复"第 1 步命令 base64 编码后填入 <restore-b64>）
-   kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'echo <restore-b64> | base64 -d > /tmp/blade-restore-oom.sh; ( sleep <duration>; sh /tmp/blade-restore-oom.sh ) >/dev/null 2>&1 & echo armed'
+   # 武装定时自恢复（"注入恢复"第 1 步命令按第七节四档表选定落盘形态；标准件 REST 路径下恢复明文
+   # （紧凑变量形态一条 json-patch 双 op PATCH，含 token/CA 变量赋值）~450-570B ⇒ 档②；#45 实测
+   # 形态=双文件分离——脚本 ~250B + patch.json 206B 各自 quoted heredoc 落盘、curl `-d @/tmp/patch.json`
+   # 引用 payload（零反斜杠转义、payload 文件内容零单引号字符——载荷引号保真律免疫；下行为旧契约历史形态示例，勿套用）
+   kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'echo <restore-b64> | base64 -d > /tmp/blade-restore-oom.sh; ( sleep <duration>; sh /tmp/blade-restore-oom.sh ) >/tmp/restore.log 2>&1 & echo armed'
    ```
-4. 修改应用 A 的 Deployment，将 memory limit 单位写错：
+   倒计时从武装时刻起算：先校验后武装、与注入紧邻（≤60s）；武装后发生任何修复须先 `kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'pkill -f blade-restore-oo[m]; true'` 停旧定时器再全额重武装（见 SKILL.md 安全红线「故障窗口完整」）
+4. 修改应用 A 的 Deployment，将 memory limit 单位写错（注入命令形态按基线二分，与恢复分支
+   键级对称（B80 对称律，见 recovery-carrier.md 第七节铁律 1）：基线**有** resources → json patch
+   **replace 整对象**（limits/requests 一并携带注入值）；基线**无** resources → json patch
+   **add 整对象**（replace 对不存在的键报 path 错误；add 与恢复 remove 配对是键级对称）：
    ```yaml
    resources:
      limits:
@@ -40,17 +102,23 @@
      requests:
        memory: "100m"
    ```
-   注意：在 Kubernetes 中，`m` 表示 milli（千分之一），`100m` = 0.1 字节；正确应为 `Mi`（Mebibyte）。patch 提交时 API server 会输出 `Warning: fractional byte value "100m" is invalid, must be an integer`——该 Warning 即单位错误的即时确认信号，且不妨碍 patch 生效
+   注入值选型判型：进程实际内存超限才会触发形态 A（OOMKilled）——轻量骨架靶（sleep 类，实际
+   内存 ~1MB）取 10Mi 不会 OOM，必须取 **100m 走形态 B**（CRI 取整 0 字节 → cgroup
+   memory.max=0 → 容器创建失败，故障在 cgroup 配置层与进程内存无关，注入验证第 3 条形态 B）；
+   有真实内存负载的应用取 10Mi 可走形态 A（lastState OOMKilled 判据更直）；形态预判以注入后实测为准
+   ——容器内 `/sys/fs/cgroup` 视图不可靠（#45：容器内探测显示 v1 布局，节点实际行为是 v2 语义
+   memory.max=0 → 形态 B 兑现；bind-mount 视角与节点运行时 cgroup 语义可不一致），勿据容器内探测改判型
+   注意：在 Kubernetes 中，`m` 表示 milli（千分之一），`100m` = 0.1 字节；正确应为 `Mi`（Mebibyte）。patch 提交时 API server 在响应头携带 `Warning: fractional byte value "100m" is invalid, must be an integer`（不影响 patch 生效）——但 **kubectl CLI 不渲染 Warning 响应头**（#45 实证：Warning 未在输出中出现），勿以「未见 Warning」判失败；单位错误的权威确认信号是 **spec 持久化值**（Deployment 模板与各 Pod spec 中 `100m` 原样落地、无 LimitRange/ResourceQuota 改写即注入生效）
 5. 等待 Pod 滚动更新完成，确认所有旧 Pod 已被替换
-6. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段）
+6. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段；置 100% 的数学必要性：2 副本 × 25% ⇒ floor(0.5)=0 个不可用，永不 Ready 的新 Pod 下滚动死锁——注入期新 Pod 本就永不 Ready，默认 MU 下 K8s 不会终止旧 Pod）
 7. 观察 Pod 启动行为
 
 **注入验证**：
-1. 执行 `kubectl rollout status deployment <deployment-name>`，确认滚动更新已完成（所有旧 Pod 已被替换）。如果滚动更新未完成（卡死），则故障未完全生效，不可判定为 verified
-2. 执行 `kubectl get pods`，确认**所有**目标 Pod 状态为 CrashLoopBackOff，RESTARTS 持续增长（不是仅一个新 Pod，而是全部副本）
-3. 按 limit 取整结果分形态验证（两种形态均已实测复现）：
+1. 确认所有旧 Pod 已被替换（滚动更新完成）：**用 RS 视角判据，不要用 `kubectl rollout status`**——注入期新 Pod CrashLoop 或卡 ContainerCreating（故障本身），`rollout status` 等待 available 副本必然超时报错，按其退出码会把已完全生效的故障误判为「滚动未完成」；正确判据是 `kubectl get rs -n <namespace> -l <label>`：旧 RS DESIRED=0、新 RS DESIRED=目标副本数（或旧 Pod 名消失、新 Pod 处于故障形态）
+2. 执行 `kubectl get pods`，确认**所有**目标 Pod 的故障形态到位（不是仅一个新 Pod，而是全部副本）：形态 A（OOMKilled）为 CrashLoopBackOff 且 RESTARTS 已高于注入前读数（单调递增计数器，高于基线即重启已发生，无需等待持续增长——状态标签是重启的渲染）；形态 B（ContainerCreating 卡死）容器未创建、**无 RESTARTS 增长**（重启计数无从累加，判据见第 3 条形态 B——勿把「无重启」误判为注入失败）
+3. 按 limit 取整结果分形态验证（两种形态均已复现）：
    - limit 为可用级小值（如 10Mi，容器可创建但启动即超限）：执行 `kubectl get pod <pod-name> -o jsonpath='{.status.containerStatuses[0].lastState}'`，确认 reason 为 OOMKilled
-   - limit 极小（如 100m，CRI 取整为 0 字节、cgroup v2 memory.max=0）：容器无法创建，新 Pod 卡在 ContainerCreating，Events 显示 `FailedMount ... no space left on device`。**该报错是误导信号**：projected volume 以 tmpfs 承载、写入计入 Pod memcg，memory.max=0 时 tmpfs 页分配被拒而返回 ENOSPC，与节点磁盘空间无关（实测节点磁盘仅用 14% 仍稳定复现；此时 lastState 为空，查 OOMKilled 必然查不到，不是注入失败）
+   - limit 极小（如 100m，CRI 取整为 0 字节、cgroup v2 memory.max=0）：容器无法创建，新 Pod 卡在 ContainerCreating，Events 显示 `FailedMount ... no space left on device`。**该报错是误导信号**：projected volume 以 tmpfs 承载、写入计入 Pod memcg，memory.max=0 时 tmpfs 页分配被拒而返回 ENOSPC，与节点磁盘空间无关（节点磁盘仅用 14% 仍稳定复现；此时 lastState 为空，查 OOMKilled 必然查不到，不是注入失败）
 4. 执行 `kubectl describe pod <pod-name>`，确认 limits.memory 为极小值
 5. 确认容器启动后立即异常退出（运行时间极短或无法启动）
 
@@ -67,9 +135,18 @@
 2. 等待 Pod 滚动更新完成
 
 **恢复验证**：
-1. 执行 `kubectl get pods`，确认 Pod 状态为 Running 且不再重启
-2. 确认容器正常运行，内存使用率在合理范围
+1. 执行 `kubectl get pods`，确认 Pod 状态为 Running 且不再重启（恢复代新 Pod RESTARTS 冻结即为「不再重启」；形态 B 案注入期本无重启，判据退化为「新 Pod 创建成功转 Running」——ContainerCreating 解除本身就是恢复生效的最强证据）
+2. 确认容器正常运行，内存使用率在合理范围（`kubectl top pod <pod-name> -n <namespace>` 单行判据，截断免疫）
 3. 确认应用 A 服务正常
+4. **恢复判据锄基线（勿从恢复命令的字段域派生）**：jsonpath 读回**整个 resources 子树**
+   （`-o jsonpath='{.spec.template.spec.containers[0].resources}'`）与步骤 1 基线逐字段比对——
+   **replace 分支**逐字段全比（勿只查恢复命令写过的字段——判据域跟着恢复命令窄化是 B80 验证层
+   失效机制）；**remove 分支**（基线本无 resources）判据是读回**空输出**（jsonpath 对不存在的键
+   返回空串——空即键已移除，任何非空输出都是残留）；另读 `kubectl get rs -n <namespace> -l <label>`
+   确认**当前代 RS hash 回到注入前基线值**（RS hash 是 pod template 全字段相等性的免费校验和——
+   resources 键还原/移除且 MU 还原后 template 与基线逐字段相等 ⇒ hash 必回基线值，hash 不回
+   即有残留不必猜哪个字段）。verify 窗口先于 timer fire 结束属常态（效果证据在窗口存活期采集），
+   本条判据由带外终验兑现（timer fire 后读子树 + RS hash；Agent 收尾报告须注明恢复正确性待带外终验确认）
 
 **基准事实**：
 - **根因**：memory limit 单位写错（如 `100m` 而非 `100Mi`），导致 limit 值极小，容器启动后内存使用立即超过 limit 被 OOMKill，或在 cgroup v2 环境下因内存配置过小无法启动

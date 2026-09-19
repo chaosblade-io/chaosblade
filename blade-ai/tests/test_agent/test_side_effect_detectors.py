@@ -1,5 +1,7 @@
 """Tests for the side-effect detection framework."""
 
+import pytest
+
 from chaos_agent.agent.nodes.side_effect._side_effect_detectors import (
     ContainerRestartDetector,
     CrashLoopDetector,
@@ -125,6 +127,177 @@ class TestContainerRestartDetector:
         assert len(results) == 1
 
 
+class TestContainerRestartNaturalCyclePeel:
+    """B7 (cases #2/#17/#34): `sleep 7200` keep-alive targets restart on
+    their natural ~2h cadence; when that renewal lands inside the run
+    window the restart diff must NOT surface as a side effect. A
+    successful lifecycle completion (exit 0 / reason "Completed") is a
+    periodic workload renewing itself, not a fault — AUTO mode has no
+    confirmation card where a reviewer would catch the false positive.
+    """
+
+    @staticmethod
+    def _keepalive_after(exit_code=None, reason="Completed"):
+        # The #2 incident's exact shape: baseline restartCount=4, post-state
+        # restartCount=6 (delta=2), last termination successful and INSIDE
+        # the window (finished_at 10:26 vs injection 10:00).
+        terminated = {
+            "reason": reason,
+            "finishedAt": "2026-05-26T10:26:00Z",
+        }
+        if exit_code is not None:
+            terminated["exitCode"] = exit_code
+        return PostInjectState(
+            pods_json={"items": [{
+                "metadata": {"name": "drill-pvc-target"},
+                "status": {
+                    "containerStatuses": [{
+                        "name": "main",
+                        "restartCount": 6,
+                        "lastState": {"terminated": terminated},
+                        "state": {"running": {}},
+                    }],
+                },
+            }]},
+        )
+
+    @staticmethod
+    def _keepalive_snapshot():
+        return _make_snapshot(pods={
+            "default/drill-pvc-target": PodSnapshot(
+                name="drill-pvc-target", namespace="default", phase="Running",
+                restart_counts={"main": 4},
+            ),
+        })
+
+    def test_exit_zero_completion_not_reported(self):
+        detector = ContainerRestartDetector()
+        results = detector.detect(
+            self._keepalive_snapshot(), self._keepalive_after(exit_code=0), _make_ctx()
+        )
+        assert results == []
+
+    def test_completed_reason_without_exit_code_not_reported(self):
+        # Some runtimes stamp only the reason; "Completed" is the standard
+        # K8s wording for a zero exit — same peel, same evidence.
+        detector = ContainerRestartDetector()
+        results = detector.detect(
+            self._keepalive_snapshot(), self._keepalive_after(), _make_ctx()
+        )
+        assert results == []
+
+    def test_nonzero_exit_restart_still_reported(self):
+        # A kill-shaped injection restart (Pod_进程被杀死: exit 137) must
+        # keep surfacing — the peel discriminates by SUCCESS, never by
+        # "it's a restart".
+        detector = ContainerRestartDetector()
+        results = detector.detect(
+            self._keepalive_snapshot(),
+            self._keepalive_after(exit_code=137, reason="Error"),
+            _make_ctx(),
+        )
+        assert len(results) == 1
+        assert results[0]["restart_delta"] == 2
+        assert results[0]["reason"] == "Error"
+
+    def test_unknown_exit_evidence_still_reported(self):
+        # No exit code, no "Completed" reason: cannot be PROVEN a natural
+        # completion, so the report stands (fail-closed — the peel never
+        # silently swallows what it cannot classify).
+        detector = ContainerRestartDetector()
+        results = detector.detect(
+            self._keepalive_snapshot(),
+            self._keepalive_after(reason=""),
+            _make_ctx(),
+        )
+        assert len(results) == 1
+
+    def test_peel_is_per_container_not_per_pod(self):
+        # Generality of the peel's GRANULARITY: one Pod, two containers —
+        # main renewed naturally (exit 0, peeled) while its sidecar died
+        # fault-shaped (exit 137, reported). A pod-level peel would have
+        # swallowed the sidecar's real fault signal along with the main's
+        # renewal.
+        detector = ContainerRestartDetector()
+        before = _make_snapshot(pods={
+            "default/mixed-pod": PodSnapshot(
+                name="mixed-pod", namespace="default", phase="Running",
+                restart_counts={"main": 4, "sidecar": 0},
+            ),
+        })
+        after = PostInjectState(
+            pods_json={"items": [{
+                "metadata": {"name": "mixed-pod"},
+                "status": {
+                    "containerStatuses": [
+                        {
+                            "name": "main",
+                            "restartCount": 6,
+                            "lastState": {"terminated": {
+                                "exitCode": 0,
+                                "reason": "Completed",
+                                "finishedAt": "2026-05-26T10:26:00Z",
+                            }},
+                            "state": {"running": {}},
+                        },
+                        {
+                            "name": "sidecar",
+                            "restartCount": 1,
+                            "lastState": {"terminated": {
+                                "exitCode": 137,
+                                "reason": "Error",
+                                "finishedAt": "2026-05-26T10:04:00Z",
+                            }},
+                            "state": {"running": {}},
+                        },
+                    ],
+                },
+            }]},
+        )
+        results = detector.detect(before, after, _make_ctx())
+        assert len(results) == 1
+        assert results[0]["container"] == "sidecar"
+        assert results[0]["restart_delta"] == 1
+        assert results[0]["reason"] == "Error"
+
+    def test_peel_leaves_an_audit_log_trail(self, caplog):
+        # "Distinguish, don't discard" is a design promise: the peeled
+        # renewal must leave a logger.info trail naming the pod, the
+        # container and the delta — the peel is observable after the fact,
+        # not a silent drop. Pin it so a future refactor cannot delete the
+        # trail without this test going red.
+        import logging
+
+        detector = ContainerRestartDetector()
+        with caplog.at_level(logging.INFO, logger="chaos_agent.agent.nodes.side_effect._side_effect_detectors"):
+            results = detector.detect(
+                self._keepalive_snapshot(),
+                self._keepalive_after(exit_code=0),
+                _make_ctx(),
+            )
+        assert results == []
+        assert "drill-pvc-target" in caplog.text
+        assert "peeled as natural lifecycle completion" in caplog.text
+        assert "restart_delta=2" in caplog.text
+
+    def test_contradictory_nonzero_exit_beats_completed_reason(self):
+        # Evidence hierarchy: exitCode is the K8s API's REQUIRED field, the
+        # reason label is optional. When they CONTRADICT (non-zero exit +
+        # "Completed" label — anomalous or hand-crafted payloads), the
+        # stronger evidence wins and the report stands: a naive
+        # ``exit_code == 0 or reason == "Completed"`` would fail-open here
+        # and swallow a REAL fault hiding behind a stale label.
+        detector = ContainerRestartDetector()
+        results = detector.detect(
+            self._keepalive_snapshot(),
+            self._keepalive_after(exit_code=137, reason="Completed"),
+            _make_ctx(),
+        )
+        assert len(results) == 1
+        assert results[0]["restart_delta"] == 2
+        assert results[0]["reason"] == "Completed"
+
+
 class TestEvictedPodDetector:
     def test_detects_new_eviction(self):
         detector = EvictedPodDetector()
@@ -236,6 +409,105 @@ class TestCrashLoopDetector:
                         "restartCount": 3,
                         "state": {"waiting": {"reason": "CrashLoopBackOff"}},
                         "lastState": {},
+                    }],
+                },
+            }]},
+        )
+        ctx = _make_ctx()
+        results = detector.detect(before, after, ctx)
+        assert len(results) == 1
+        assert results[0]["restart_delta"] == 3
+
+    def test_crashloop_over_completed_laststate_not_reported(self):
+        """B7 sibling: CrashLoopBackOff rendered on top of a SUCCESSFUL last
+        termination is the back-off view of a periodic workload renewing
+        itself (the #2 incident's ``CrashLoop: 1`` half), not a crash — a
+        container that exited zero did not fail."""
+        detector = CrashLoopDetector()
+        before = _make_snapshot(pods={
+            "default/drill-pvc-target": PodSnapshot(
+                name="drill-pvc-target", namespace="default", phase="Running",
+                restart_counts={"main": 4}, crash_loop_containers=set(),
+            ),
+        })
+        after = PostInjectState(
+            pods_json={"items": [{
+                "metadata": {"name": "drill-pvc-target"},
+                "status": {
+                    "containerStatuses": [{
+                        "name": "main",
+                        "restartCount": 6,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {
+                            "exitCode": 0,
+                            "reason": "Completed",
+                            "finishedAt": "2026-05-26T10:26:00Z",
+                        }},
+                    }],
+                },
+            }]},
+        )
+        ctx = _make_ctx()
+        results = detector.detect(before, after, ctx)
+        assert results == []
+
+    def test_crashloop_over_nonzero_exit_still_reported(self):
+        """A real crash loop exits non-zero (Pod_进程被杀死 exit 137;
+        Node_网络故障_节点端口占用 bind-failure exit 1) — those keep
+        surfacing, the peel discriminates by SUCCESS."""
+        detector = CrashLoopDetector()
+        before = _make_snapshot(pods={
+            "default/worker-1": PodSnapshot(
+                name="worker-1", namespace="default", phase="Running",
+                restart_counts={"main": 0}, crash_loop_containers=set(),
+            ),
+        })
+        after = PostInjectState(
+            pods_json={"items": [{
+                "metadata": {"name": "worker-1"},
+                "status": {
+                    "containerStatuses": [{
+                        "name": "main",
+                        "restartCount": 3,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {
+                            "exitCode": 137,
+                            "reason": "Error",
+                            "finishedAt": "2026-05-26T10:05:00Z",
+                        }},
+                    }],
+                },
+            }]},
+        )
+        ctx = _make_ctx()
+        results = detector.detect(before, after, ctx)
+        assert len(results) == 1
+        assert results[0]["restart_delta"] == 3
+
+    def test_crashloop_contradictory_nonzero_exit_beats_completed_reason(self):
+        """Same evidence hierarchy as the container_restarts peel: a
+        non-zero exitCode outranks a contradicting "Completed" label, so
+        the report stands even though the label alone would have peeled."""
+        detector = CrashLoopDetector()
+        before = _make_snapshot(pods={
+            "default/worker-1": PodSnapshot(
+                name="worker-1", namespace="default", phase="Running",
+                restart_counts={"main": 0}, crash_loop_containers=set(),
+            ),
+        })
+        after = PostInjectState(
+            pods_json={"items": [{
+                "metadata": {"name": "worker-1"},
+                "status": {
+                    "containerStatuses": [{
+                        "name": "main",
+                        "restartCount": 3,
+                        "state": {"waiting": {"reason": "CrashLoopBackOff"}},
+                        "lastState": {"terminated": {
+                            "exitCode": 137,
+                            "reason": "Completed",
+                            "finishedAt": "2026-05-26T10:05:00Z",
+                        }},
                     }],
                 },
             }]},
@@ -399,6 +671,46 @@ class TestRunAllDetectors:
         ctx = _make_ctx()
         results = run_all_detectors(None, after, ctx)
         assert results == {}
+
+    def test_peeled_renewal_leaves_no_key_for_consumers(self):
+        # The consumer-side invariant of the B7 peel: an EMPTY detector
+        # result must not enter the dict at all ("container_restarts" key
+        # absent, not present-as-empty-list). Downstream consumers branch
+        # on key presence / truthiness — verification["side_effects"].get(
+        # "container_restarts", False) in the layer2_layer1_conflict gap,
+        # side_effects.get("container_restarts") in infer_phase's
+        # side-effect confirmation, state["side_effects"] in recover L1 —
+        # so a peeled renewal is invisible to every one of them, which is
+        # exactly the structural fix AUTO mode needs (no confirmation card
+        # to catch the false positive).
+        before = _make_snapshot(pods={
+            "default/drill-pvc-target": PodSnapshot(
+                name="drill-pvc-target", namespace="default", phase="Running",
+                restart_counts={"main": 4},
+            ),
+        })
+        after = PostInjectState(
+            pods_json={"items": [{
+                "metadata": {"name": "drill-pvc-target"},
+                "status": {
+                    "containerStatuses": [{
+                        "name": "main",
+                        "restartCount": 6,
+                        "lastState": {"terminated": {
+                            "exitCode": 0,
+                            "reason": "Completed",
+                            "finishedAt": "2026-05-26T10:26:00Z",
+                        }},
+                        "state": {"running": {}},
+                    }],
+                },
+            }]},
+            events_json={"items": []},
+            endpoints_json={"items": []},
+        )
+        results = run_all_detectors(before, after, _make_ctx())
+        assert "container_restarts" not in results
+        assert "crash_loop_pods" not in results
 
 
 class TestSnapshotSerialization:
@@ -711,3 +1023,383 @@ class TestProfileScopedSummary:
         assert "1 collateral impact(s) detected" in summary
         assert "ContainerRestarts: 1" in summary
         assert "ProcessDeaths" not in summary
+
+
+class TestPostInjectCaptureErrors:
+    """B77/B81 family: a failed capture channel must stay distinguishable
+    from a genuinely-empty one past the log layer (``capture_errors``)."""
+
+    async def test_failed_channels_record_diagnosis(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+        from chaos_agent.models.command_result import CommandResult
+
+        async def fake_execute(cmd, target, timeout=0, task_id="",
+                               source="", expect_profile=None, **kwargs):
+            tokens = [str(t) for t in cmd]
+            # pods query fails; events query succeeds but empty; endpoints
+            # query returns unparseable json.
+            if "pods" in tokens:
+                return CommandResult(
+                    exit_code=1, stdout="", stderr="forbidden",
+                )
+            if "endpoints" in tokens:
+                return CommandResult(exit_code=0, stdout="not-json", stderr="")
+            return CommandResult(exit_code=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        state = await det.fetch_post_inject_state(
+            "ns", "", "2026-01-01T00:00:00Z", ["web-0"],
+        )
+        assert state.pods_json == {}          # fail-closed payload
+        assert "exit=1" in state.capture_errors["pods"]
+        assert "bad json" in state.capture_errors["endpoints"]
+        # A healthy empty channel stays OUT of capture_errors entirely.
+        assert "events" not in state.capture_errors
+
+    async def test_all_healthy_leaves_errors_empty(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+        from chaos_agent.models.command_result import CommandResult
+
+        async def fake_execute(cmd, target, timeout=0, task_id="",
+                               source="", expect_profile=None, **kwargs):
+            return CommandResult(exit_code=0, stdout="{}", stderr="")
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_execute,
+        )
+        state = await det.fetch_post_inject_state(
+            "ns", "", "2026-01-01T00:00:00Z", ["web-0"],
+        )
+        assert state.capture_errors == {}
+
+
+class TestUnreadableChannelGate:
+    """B77 tri-state gate: a detector whose declared channel is Unreadable
+    (``capture_errors``) must be SKIPPED — "not captured" is never adjudicated
+    as "captured, found empty" (case #40: failed endpoints query reported
+    EndpointRemovals 2→0 off an empty payload)."""
+
+    def test_unreadable_endpoints_skips_endpoint_removal(self):
+        # #40 replay: baseline has a live service, the post-inject endpoints
+        # QUERY FAILED (payload {} + capture_errors) — the old code read the
+        # empty dict as "0 ready endpoints" and reported a removal.
+        before = _make_snapshot(endpoints={
+            "svc-a": EndpointSnapshot(service="svc-a", ready_count=2),
+        })
+        after = PostInjectState(
+            endpoints_json={},
+            capture_errors={"endpoints": "exit=1: forbidden"},
+        )
+        results = run_all_detectors(before, after, _make_ctx())
+        assert "endpoint_removals" not in results
+
+    def test_true_empty_endpoints_still_reports_removal(self):
+        # Empty leg: the query SUCCEEDED and the Endpoints list is genuinely
+        # empty — the service really lost all its addresses. This is a REAL
+        # finding and must still be reported (gating must not over-suppress).
+        before = _make_snapshot(endpoints={
+            "svc-a": EndpointSnapshot(service="svc-a", ready_count=2),
+        })
+        after = PostInjectState(endpoints_json={"items": []})
+        results = run_all_detectors(before, after, _make_ctx())
+        assert results.get("endpoint_removals") == [
+            {"service": "svc-a", "before": 2, "after": 0},
+        ]
+
+    def test_value_endpoints_normal_diff(self):
+        # Value leg: healthy capture, healthy diff (2 → 1 partial removal).
+        before = _make_snapshot(endpoints={
+            "svc-a": EndpointSnapshot(service="svc-a", ready_count=2),
+        })
+        after = PostInjectState(endpoints_json={"items": [{
+            "metadata": {"name": "svc-a"},
+            "subsets": [{"addresses": [{"ip": "10.0.0.1"}]}],
+        }]})
+        results = run_all_detectors(before, after, _make_ctx())
+        assert results.get("endpoint_removals") == [
+            {"service": "svc-a", "before": 2, "after": 1},
+        ]
+
+    def test_unreadable_pods_skips_pods_detectors(self):
+        # Symmetric hazard on the pods channel: a failed pods query must not
+        # be diffed (restart deltas / evictions / crash loops all read the
+        # empty items list as "nothing changed", which is a claim about the
+        # cluster the capture cannot support).
+        before = _make_snapshot(pods={
+            "default/app-pod-1": PodSnapshot(
+                name="app-pod-1", namespace="default", phase="Running",
+                restart_counts={"main": 0},
+            ),
+        })
+        after = PostInjectState(
+            pods_json={},
+            capture_errors={"pods": "exit=1: connection refused"},
+        )
+        results = run_all_detectors(before, after, _make_ctx())
+        for key in ("container_restarts", "evicted_pods", "crash_loop_pods"):
+            assert key not in results, key
+
+    def test_unreadable_channels_helper_single_source(self):
+        from chaos_agent.agent.nodes.side_effect._side_effect_detectors import (
+            unreadable_channels,
+        )
+        after = PostInjectState(capture_errors={"endpoints": "exit=1: x"})
+        assert unreadable_channels(after) == {"endpoints": "exit=1: x"}
+        # Empty/Value legs: healthy capture → no unreadable channels.
+        assert unreadable_channels(PostInjectState()) == {}
+
+    def test_host_ps_failure_gates_process_death(self):
+        # Host symmetric #40: a failed `ps` yields an empty after-set and the
+        # old code would report EVERY baseline process as dead.
+        before = _host_before(processes={"nginx", "sshd"})
+        after = PostInjectState(
+            host=HostPostInjectState(processes=set()),
+            capture_errors={"processes": "diag failed: ps -e -o comm= returned nothing"},
+        )
+        ctx = _make_ctx(profile="host", target="process")
+        results = run_all_detectors(before, after, ctx, profile="host")
+        assert "process_deaths" not in results
+
+    def test_host_healthy_ps_reports_real_death(self):
+        # Empty leg must NOT suppress a genuine finding: ps succeeded, the
+        # process is really gone.
+        before = _host_before(processes={"nginx", "sshd"})
+        after = _host_after(processes={"nginx"})
+        ctx = _make_ctx(profile="host", target="process")
+        results = run_all_detectors(before, after, ctx, profile="host")
+        assert results.get("process_deaths") == [{"process": "sshd"}]
+
+
+class TestHostObserverCaptureErrors:
+    """HostObserver must mark a None diag output as Unreadable (tri-state),
+    not as an empty host."""
+
+    async def test_failed_diags_recorded_as_unreadable(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+
+        async def fake_diag(command, timeout=10):
+            # ps and dmesg fail; df and systemctl succeed.
+            if command[:2] == ["ps", "-e"]:
+                return None
+            if command[0] == "dmesg":
+                return None
+            if command[0] == "df":
+                return "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 1 1 1 1% /\n"
+            return "nginx.service loaded active running Nginx\n"
+
+        monkeypatch.setattr(det, "_run_host_diag", fake_diag)
+
+        class _Spec:
+            namespace = ""
+            scope = "host"
+            names = ()
+            fault_target = "process"
+
+        state = await det.HostObserver().fetch_post_inject_state(
+            _Spec(), "", "2026-01-01T00:00:00Z",
+        )
+        assert "processes" in state.capture_errors
+        assert "dmesg" in state.capture_errors
+        assert "mounts" not in state.capture_errors
+        assert "services" not in state.capture_errors
+
+    async def test_healthy_diags_leave_errors_empty(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+
+        async def fake_diag(command, timeout=10):
+            return "some output\n"
+
+        monkeypatch.setattr(det, "_run_host_diag", fake_diag)
+
+        class _Spec:
+            namespace = ""
+            scope = "host"
+            names = ()
+            fault_target = "process"
+
+        state = await det.HostObserver().fetch_post_inject_state(
+            _Spec(), "", "2026-01-01T00:00:00Z",
+        )
+        assert state.capture_errors == {}
+
+
+# ---------------------------------------------------------------------------
+# F2 symmetry: BEFORE-side tri-state (baseline capture_errors + gating)
+# ---------------------------------------------------------------------------
+
+
+class TestBeforeSideTriState:
+    """F2: the baseline snapshot carries the same Unreadable leg as after.
+
+    A channel that failed at baseline must gate the detectors reading it —
+    in the OPPOSITE failure direction from an after-side miss: a failed
+    before-pods query reads as baseline_rc=0 (ContainerRestart would flag
+    every pre-existing restart), a failed before-endpoints reads as an
+    empty baseline (EndpointRemoval would miss every removal).
+    """
+
+    def test_before_pods_error_gates_restart_detector(self):
+        """B85/F2 headline case: before-pods Unreadable → a pod whose
+        restartCount ROSE from an unknown baseline is NOT adjudicated —
+        the container_restarts key must stay absent."""
+        before = _make_snapshot(pods={}, capture_errors={
+            "pods": "exit=1: connection refused",
+        })
+        after = PostInjectState(
+            pods_json={"items": [{
+                "metadata": {"name": "app-pod-1"},
+                "status": {
+                    "containerStatuses": [{
+                        "name": "main",
+                        "restartCount": 5,
+                        "state": {"running": {}},
+                    }],
+                },
+            }]},
+            events_json={"items": []},
+            endpoints_json={"items": []},
+        )
+        results = run_all_detectors(before, after, _make_ctx())
+        assert "container_restarts" not in results
+
+    def test_before_endpoints_error_gates_removal_detector(self):
+        before = _make_snapshot(
+            endpoints={}, capture_errors={"endpoints": "bad json: x"},
+        )
+        after = PostInjectState(
+            pods_json={"items": []},
+            events_json={"items": []},
+            endpoints_json={"items": []},
+        )
+        results = run_all_detectors(before, after, _make_ctx())
+        assert "endpoint_removals" not in results
+
+    def test_before_and_after_errors_both_gate(self):
+        """Same channel failed on BOTH sides — still one skip, and the
+        warning names both sources (dedup, no double listing)."""
+        before = _make_snapshot(capture_errors={"pods": "exit=1: before"})
+        after = PostInjectState(
+            pods_json={}, events_json={}, endpoints_json={},
+            capture_errors={"pods": "exit=1: after"},
+        )
+        results = run_all_detectors(before, after, _make_ctx())
+        assert "container_restarts" not in results
+
+    def test_unaffected_detector_still_runs(self):
+        """A failing before-endpoints channel must not gate detectors that
+        read OTHER channels (pods-reading restarts keep running)."""
+        before = _make_snapshot(
+            pods={"default/app-pod-1": PodSnapshot(
+                name="app-pod-1", namespace="default", phase="Running",
+                restart_counts={"main": 0},
+            )},
+            endpoints={},
+            capture_errors={"endpoints": "exit=1: refused"},
+        )
+        after = PostInjectState(
+            pods_json={"items": [{
+                "metadata": {"name": "app-pod-1"},
+                "status": {
+                    "containerStatuses": [{
+                        "name": "main",
+                        "restartCount": 1,
+                        "lastState": {"terminated": {
+                            "reason": "OOMKilled",
+                            "finishedAt": "2026-05-26T10:05:00Z",
+                        }},
+                        "state": {"running": {}},
+                    }],
+                },
+            }]},
+            events_json={"items": []},
+            endpoints_json={"items": []},
+        )
+        results = run_all_detectors(before, after, _make_ctx())
+        assert "container_restarts" in results
+        assert "endpoint_removals" not in results
+
+    def test_snapshot_round_trip_carries_capture_errors(self):
+        snapshot = _make_snapshot(capture_errors={"pods": "exit=1: boom"})
+        restored = SideEffectSnapshot.from_dict(snapshot.to_dict())
+        assert restored.capture_errors == {"pods": "exit=1: boom"}
+
+    def test_legacy_snapshot_dict_without_errors_stays_empty(self):
+        """Pre-F2 persisted snapshots (no capture_errors key) deserialize
+        to an empty dict — legacy baselines keep their old semantics."""
+        d = _make_snapshot().to_dict()
+        del d["capture_errors"]
+        restored = SideEffectSnapshot.from_dict(d)
+        assert restored.capture_errors == {}
+
+
+class TestBeforeCaptureRecordsErrors:
+    """The baseline capture paths record failures instead of fake-empty."""
+
+    @pytest.mark.asyncio
+    async def test_k8s_capture_records_pods_failure(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+
+        class _FakeResult:
+            exit_code = 1
+            stdout = ""
+            stderr = "Error from server: forbidden"
+
+        async def fake_exec(cmd, target, **kwargs):
+            return _FakeResult()
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_exec,
+        )
+        snap = await det.capture_snapshot("default", "/kc", task_id="t1")
+        assert snap is not None
+        assert "pods" in snap.capture_errors
+        assert "forbidden" in snap.capture_errors["pods"]
+
+    @pytest.mark.asyncio
+    async def test_k8s_capture_healthy_leaves_errors_empty(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+
+        class _FakeResult:
+            exit_code = 0
+            stdout = '{"items": []}'
+            stderr = ""
+
+        async def fake_exec(cmd, target, **kwargs):
+            return _FakeResult()
+
+        monkeypatch.setattr(
+            "chaos_agent.transports.execute_via_transport", fake_exec,
+        )
+        snap = await det.capture_snapshot("default", "/kc", task_id="t1")
+        assert snap is not None
+        assert snap.capture_errors == {}
+
+    @pytest.mark.asyncio
+    async def test_host_baseline_records_failed_diags(self, monkeypatch):
+        from chaos_agent.agent.nodes.side_effect import _side_effect_detectors as det
+
+        async def fake_diag(command, timeout=10):
+            return None if command[:2] == ["ps", "-e"] else "ok\n"
+
+        monkeypatch.setattr(det, "_run_host_diag", fake_diag)
+
+        class _Spec:
+            namespace = ""
+            scope = "host"
+            names = ()
+            fault_target = "process"
+
+        snap = await det.HostObserver().capture_base_snapshot(_Spec(), "")
+        assert snap is not None
+        assert "processes" in snap.capture_errors
+        assert "mounts" not in snap.capture_errors
+        # and the failure gates the matching host detector:
+        after = det.PostInjectState(
+            host=det.HostPostInjectState(processes=set()),
+        )
+        results = run_all_detectors(
+            snap, after, _make_ctx(profile="host", target="process"),
+        )
+        assert "process_deaths" not in results

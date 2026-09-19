@@ -138,18 +138,27 @@ class TestSiblingBuildersRememberRecency:
             "## Environment",
             "the approved plan body",
             "## EXECUTION PHASE DIRECTIVES",
-            "## Progress Ledger",
+            # NOTE: "## Progress Ledger" is intentionally absent here — Unit A
+            # (context-cache-prefix-stability task 2.1) moved the execute ledger
+            # OUT of the system prompt head onto the message tail, so it is no
+            # longer a dynamic head section that could displace REMEMBER.
         ):
             assert remember_idx > prompt.index(dynamic_marker), (
                 f"# REMEMBER must come after {dynamic_marker!r}"
             )
         assert remember_idx == prompt.rindex("# REMEMBER")
         assert prompt.rstrip().endswith(get_executor_remember_section().strip())
+        # The ledger must NOT ride the execute head anymore (it rides the tail).
+        assert "## Progress Ledger" not in prompt
 
-    def test_verifier_remember_trails_ledger(self):
+    def test_verifier_head_omits_ledger_and_remember_trails(self):
+        # Unit A (context-cache-prefix-stability task 2.4): the verify ledger
+        # moved OUT of build_verifier_prompt's head onto the message tail, so the
+        # head no longer carries it (passing the kwarg is now a no-op). REMEMBER
+        # still trails every dynamic head section.
         prompt = build_verifier_prompt(progress_ledger_section=self.LEDGER)
+        assert "## Progress Ledger" not in prompt
         remember_idx = prompt.index("# REMEMBER")
-        assert remember_idx > prompt.index("## Progress Ledger")
         assert remember_idx == prompt.rindex("# REMEMBER")
         assert prompt.rstrip().endswith(get_verifier_remember_section().strip())
 
@@ -332,3 +341,59 @@ class TestCaseHandoffReferenceSemantics:
         assert "Start from it" not in prompt
         assert "exactly what `read_skill_resource` consumes" not in prompt
         assert "browse the active skill" not in prompt
+
+
+class TestIntentKnowledgeIndexInjection:
+    """intent-outcome-to-means: the intent prompt must carry the plan-phase
+    knowledge index, or the outcome→means methodology is invisible.
+
+    Trace sess_4b696f566f23: without the index the intent node saw ONLY the
+    means-named skill-package index, so an outcome-stated request collapsed
+    lexically onto the catalogue entries whose names matched the outcome's
+    wording. These tests pin the full chain the fix depends on: the doc
+    exists in the registry (auto-discovery), the index row reaches the
+    prompt ahead of the Skill Index, and the host exemption holds (host
+    intent prompts are contractually free of cluster vocabulary).
+    """
+
+    def test_k8s_prompt_carries_plan_knowledge_index_before_skill_index(self):
+        prompt = build_intent_clarification_prompt(
+            semantic_only=True, profile="k8s"
+        )
+        ki = prompt.find("Domain Knowledge (on-demand)")
+        si = prompt.find("## Skill Index")
+        assert ki != -1, (
+            "intent prompt lost the knowledge index — outcome-stated "
+            "requests fall back to lexical catalogue matching"
+        )
+        assert si != -1
+        assert ki < si, (
+            "knowledge index must precede the Skill Index: methodology "
+            "sight before means selection"
+        )
+
+    def test_index_lists_outcome_to_means_doc(self):
+        from chaos_agent.agent.prompts.sections.knowledge_sections import (
+            get_knowledge_summary_section,
+        )
+
+        plan_index = get_knowledge_summary_section("plan")
+        assert "`outcome-to-means.md`" in plan_index, (
+            "outcome-to-means.md missing from the plan-phase index — "
+            "frontmatter (phases: [plan]) or registry auto-discovery broke"
+        )
+        # Phase discipline: the doc declares plan only, so the verifier
+        # index must not pay its row.
+        verify_index = get_knowledge_summary_section("verify")
+        assert "`outcome-to-means.md`" not in verify_index
+
+    def test_host_prompt_omits_knowledge_index(self):
+        from chaos_agent.transports import PROFILE_HOST
+
+        prompt = build_intent_clarification_prompt(
+            semantic_only=True, profile=PROFILE_HOST
+        )
+        assert "Domain Knowledge (on-demand)" not in prompt, (
+            "host intent prompt must stay free of cluster vocabulary — "
+            "the index carries k8s-knowledge/kubectl-guide rows"
+        )

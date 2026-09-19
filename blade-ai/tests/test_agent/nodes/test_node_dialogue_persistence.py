@@ -64,7 +64,7 @@ def _disk_text(store: TuiSessionStore, sid: str) -> str:
 def _task_store(tasks: list):
     async def _get():
         class _Store:
-            async def query_active(self, tenant_id=""):
+            async def query_active(self, tenant_id="", workspace_id=""):
                 return tasks
 
             async def get(self, tid):

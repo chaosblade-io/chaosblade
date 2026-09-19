@@ -1,4 +1,4 @@
-**⚠️ 注意：此场景为 kubectl-native 方案。选用前提是 ChaosBlade 没有 pod-IO target（以 `blade create k8s --help` 实测为准；若本地版本提供 `pod-IO delay`，优先用它），需通过 kubectl exec + tc（块设备级）或 blade pod-disk burn（IO 饱和）实现近似效果。**
+**⚠️ 注意：此场景为 kubectl-native 方案。选用前提是 ChaosBlade 没有 pod-IO target（以 `blade create k8s --help` 探测为准；若本地版本提供 `pod-IO delay`，优先用它），需通过 kubectl exec + tc（块设备级）或 blade pod-disk burn（IO 饱和）实现近似效果。**
 
 **用例名称** 文件系统IO延迟 导致 Pod_磁盘IO异常
 
@@ -28,8 +28,8 @@
      --size <size> \
      --namespace <namespace> \
      --labels "<label-key>=<label-value>" \
-     --timeout <duration> \
-     --kubeconfig <kubeconfig-path>
+     --timeout <duration>
+
    ```
    - `--read --write`：同时制造读写 IO 负载
    - `--path`：必须使用 `/`（容器根文件系统）。不要使用 EmptyDir、hostPath 等子目录挂载路径，这些路径在 ChaosBlade nsexec 模式下校验会失败
@@ -38,7 +38,7 @@
 3. 记录返回的 experiment_uid，用于后续恢复
 
 **注入验证**：
-1. 在 Pod 内执行写入操作，确认耗时明显增加（`conv=fsync` 写完强制落盘，busybox dd 实测支持；
+1. 在 Pod 内执行写入操作，确认耗时明显增加（`conv=fsync` 写完强制落盘，busybox dd 支持；
    不要用 `oflag=dsync`——busybox dd 不支持 oflag，会报 `unrecognized option`）：
    ```bash
    kubectl exec <pod-name> -n <namespace> -- dd if=/dev/zero of=/.iolatency.tmp bs=1M count=10 conv=fsync
@@ -67,11 +67,11 @@
 **基准事实**：
 - **根因**：通过 pod-disk burn 使磁盘 IO 队列饱和，应用的正常 IO 请求需排队等待，表现为 IO 操作延迟显著增加
 - **必现现象**：Pod 内文件读写耗时显著增加；磁盘 IO 利用率接近 100%；应用出现慢查询或超时；请求延迟 P99 升高
-- **方案说明**：此为 blade pod-disk burn 近似方案（选用前提：无 pod-IO target，以 `--help` 实测为准）。与精确 IO 延迟注入（每次 IO 固定增加 Nms）不同，burn 方案通过 IO 竞争间接制造延迟，效果为非确定性延迟增加而非固定值注入
+- **方案说明**：此为 blade pod-disk burn 近似方案（选用前提：无 pod-IO target，以 `--help` 探测为准）。与精确 IO 延迟注入（每次 IO 固定增加 Nms）不同，burn 方案通过 IO 竞争间接制造延迟，效果为非确定性延迟增加而非固定值注入
 
 ---
 
-**降级方案（kubectl-native）**
+**手段2（kubectl-native）**
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效 IO 负载注入。
 
@@ -87,6 +87,7 @@ kubectl exec <pod-name> -n <namespace> -- sh -c '
   ( sleep <duration>; kill $(cat /tmp/iostat-sampler.pid) 2>/dev/null; rm -f /tmp/iostat-sampler.pid /.iocache.dat ) >/dev/null 2>&1 &
 '
 ```
+倒计时从武装时刻起算：IO 负载启动与定时器武装在同一 sh -c 载荷内原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f "iostat-sampler.pi[d]"; true'` 一并停掉故障与旧定时器（后台 subshell 共享载荷 cmdline，此杀同时命中定时器与 IO 循环，即全停语义），再重跑上方注入命令原子重武装+重注入（见 SKILL.md 安全红线「故障窗口完整」）
 
 恢复命令（从精确到兜底）：
 ```bash

@@ -347,10 +347,12 @@ class OTelGenAICallback(BaseCallbackHandler):
             return
 
         from chaos_agent.observability.tracer import _extract_token_usage
-        prompt_tokens, completion_tokens = _extract_token_usage(response)
+        prompt_tokens, completion_tokens, cache_read_tokens = _extract_token_usage(response)
 
         span.set_attribute("gen_ai.usage.input_tokens", prompt_tokens)
         span.set_attribute("gen_ai.usage.output_tokens", completion_tokens)
+        # Cache-hit subset of input tokens (0 when the provider reports none).
+        span.set_attribute("gen_ai.usage.cache_read_input_tokens", cache_read_tokens)
         span.end()
 
         duration = time.perf_counter() - start_time if start_time is not None else 0.0

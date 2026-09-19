@@ -15,14 +15,13 @@ Symbols (owned here — generic):
 """
 
 import logging
-import re
-from pathlib import Path
 
 from langchain_core.messages import AIMessage, ToolMessage
 
 from chaos_agent.agent.prompts.reminder import SYSTEM_REMINDER_DECLARATION
 from chaos_agent.agent.result.verdict import Layer1Result
 from chaos_agent.transports import PROFILE_K8S
+from chaos_agent.utils.truncation import build_truncation_notice
 
 logger = logging.getLogger(__name__)
 
@@ -37,42 +36,36 @@ RecoverLayer1Result = Layer1Result
 
 _RECOVER_BASELINE_TOOL_CALL_ID = "recover_baseline_collector"
 
-# Cache-path reference embedded in compactor truncation notices (both the
-# recent "Full output cached at:" and the historical "Cache:" forms).
-_TRUNCATION_CACHE_RE = re.compile(r"(?:Cache:|Full output cached at:)\s*(\S+)")
+# Per-observation render budget: baseline observations are head-capped
+# with the shared truncation notice when oversized.
+_BASELINE_RENDER_MAX_CHARS = 1500
 
-# Per-observation budget when restoring a truncated baseline from the
-# compactor cache (the cache holds the FULL pre-compaction output).
-_BASELINE_RESTORE_MAX_CHARS = 4000
-
-
-def _recover_baseline_cache_path(output: str) -> str:
-    """Extract the compactor cache path from a truncated baseline output."""
-    m = _TRUNCATION_CACHE_RE.search(output)
-    return m.group(1) if m else ""
-
-
-def _read_baseline_cache_content(cache_path: str, max_chars: int = _BASELINE_RESTORE_MAX_CHARS) -> str:
-    """Restore a truncated baseline observation from the compactor cache.
-
-    Tool-output-format agnostic: returns the cached original content capped
-    at ``max_chars`` — whatever the observation was (describe output, df,
-    /proc reads, ...). Returns "" when the file is unreadable — the caller
-    falls back to an explicit "evidence incomplete" annotation instead of
-    fabricating baseline content.
-    """
-    try:
-        text = Path(cache_path).read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        logger.warning("Recover baseline cache read failed for %s: %s", cache_path, exc)
-        return ""
-    return text[:max_chars]
+# NOTE (round-41 retirement): this module used to host a "compactor
+# cache restore bridge" — parse `Cache: <path>` out of observation
+# stdout, gate on truncation markers, read the file back, and inject it
+# as restored baseline evidence. It was retired because no producer
+# ever writes compactor notices into baseline observation stdout (the
+# baseline executors store raw result.stdout; compactor notices only
+# ever live in conversation ToolMessages — a different data path), so
+# the bridge's genuine branch was dead code, while its spoof branch
+# (a planted `Cache: /etc/passwd` in workload-controlled text echoed by
+# kubectl describe) steered unconstrained file reads on the operator
+# machine. Absent code cannot be spoofed, bypassed, or regress — the
+# honest uniform render below (head cap + shared notice) is the whole
+# story for every observation, trusted or not.
 
 
 # Aggregate set of all synthetic tool_call_ids used for state persistence.
 _RECOVER_SYNTHETIC_TOOL_CALL_IDS = frozenset({
     _RECOVER_BASELINE_TOOL_CALL_ID,
 })
+
+# STABLE langchain message ids for the synthetic pair — see the matching
+# comment in verify/_verifier_messages.py: the dedup gate rebuilds on damage
+# and ``add_messages`` replaces by id, so stable ids keep the rebuild
+# idempotent instead of appending a duplicate pair set to state every turn.
+_RECOVER_BASELINE_MSG_ID_CALLER = "synthetic:recover:baseline:caller"
+_RECOVER_BASELINE_MSG_ID_RESULT = "synthetic:recover:baseline:result"
 
 # Marker for the main recover context HumanMessage — used to identify
 # the ephemeral HumanMessage that should be persisted to AgentState on
@@ -107,32 +100,19 @@ def _build_recover_baseline_tool_messages(baseline: dict) -> list:
         desc = obs.get("description", "unknown metric")
         cmd = obs.get("command", "")
         raw_out = obs["stdout"]
-        if "TRUNCATED" in raw_out:
-            # Compactor already cut this observation. The cache holds the
-            # FULL pre-compaction original — restore it (format-agnostic,
-            # budget-capped) instead of showing only the truncated head;
-            # on failure keep the cache path and flag the evidence as
-            # incomplete instead of hiding the gap.
-            cache_path = _recover_baseline_cache_path(raw_out)
-            restored = (
-                _read_baseline_cache_content(cache_path) if cache_path else ""
+        # Uniform honest render (round-41 retirement, see module NOTE):
+        # every observation — with or without any marker-like text —
+        # renders head-capped, and the shared notice flags oversize with
+        # the honest size and the state-baseline retrieval guidance.
+        output = raw_out[:_BASELINE_RENDER_MAX_CHARS]
+        if len(raw_out) > _BASELINE_RENDER_MAX_CHARS:
+            # Shared contract (kind=baseline-evidence): marker +
+            # honest size + retrieval guidance. No cache parsing —
+            # observation stdout is workload-echoed text, never a
+            # compactor notice.
+            output += build_truncation_notice(
+                "baseline-evidence", len(raw_out), unit="characters",
             )
-            if restored:
-                output = (
-                    "[Restored from compactor cache — original observation "
-                    "was truncated]\n" + restored
-                )
-            else:
-                output = raw_out[:1500] + (
-                    f"\n(baseline evidence incomplete — full output at "
-                    f"{cache_path}; re-observe if needed)"
-                    if cache_path
-                    else "\n(baseline evidence incomplete — re-observe if needed)"
-                )
-        else:
-            output = raw_out[:1500]
-            if len(raw_out) > 1500:
-                output += "\n... (truncated)"
         obs_lines.append(
             f"### {desc}\n"
             f"Command: `{cmd}`\n"
@@ -142,9 +122,13 @@ def _build_recover_baseline_tool_messages(baseline: dict) -> list:
     if not obs_lines:
         return []
 
+    # Same denominator contract as verify/_verifier_messages: legacy
+    # baselines lack total_count — the observation count in hand is the
+    # honest fallback (0 fallback rendered "N/0" receipts, #13/#10 audits).
     content = (
         f"Pre-injection baseline collected at {captured_at} "
-        f"(strategy: {source}, {baseline.get('success_count', 0)}/{baseline.get('total_count', 0)} succeeded).\n\n"
+        f"(strategy: {source}, {baseline.get('success_count', 0)}/"
+        f"{baseline.get('total_count', len(observations))} succeeded).\n\n"
         f"These metrics were captured BEFORE fault injection using the same "
         f"observation methods you should use for recovery verification. "
         f"Recovery is confirmed when YOUR CURRENT observations return to "
@@ -157,6 +141,7 @@ def _build_recover_baseline_tool_messages(baseline: dict) -> list:
 
     ai_msg = AIMessage(
         content="",
+        id=_RECOVER_BASELINE_MSG_ID_CALLER,
         tool_calls=[{
             "name": "recover_baseline_collector",
             "args": {"phase": "pre-injection", "purpose": "recovery_comparison"},
@@ -166,6 +151,7 @@ def _build_recover_baseline_tool_messages(baseline: dict) -> list:
     )
     tool_msg = ToolMessage(
         content=content,
+        id=_RECOVER_BASELINE_MSG_ID_RESULT,
         tool_call_id=_RECOVER_BASELINE_TOOL_CALL_ID,
         name="recover_baseline_collector",
     )
@@ -303,6 +289,9 @@ verifying — Layer 2 owns outcome verification.
 1. Use the Recovery Actions and injection context to determine what must be undone.
 2. Execute each supported recovery action through the currently bound tools.
 3. Preserve the target boundary.
+4. A receipt proves the undo was issued, not that it took effect — a
+success claim rests on direct evidence the fault cause is revoked or
+visibly being removed; immediate evidence, not a wait for recovery.
 
 # REMEMBER
 - Execute ONLY through currently bound tools; inspect their help/usage and

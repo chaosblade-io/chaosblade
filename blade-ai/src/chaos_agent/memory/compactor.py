@@ -23,11 +23,48 @@ from typing import Optional
 
 from langchain_core.messages import SystemMessage
 
+from chaos_agent.agent.providers.uid_shapes import UID_SHAPE_GATE
 from chaos_agent.agent.spec.skill_identity import read_active_skill_name
 from chaos_agent.config.settings import settings
 from chaos_agent.utils.reasoning_replay import replayed_reasoning
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Experiment-UID survival-context policy (round-21 legislated the shapes;
+# round-22 Q4 retired the anchors): the pre-round-22 survival context ran
+# its OWN message miner — two regexes (a ``experiment_uid`` key-spelling
+# anchor and a ``"result": "<uid>"`` anchor) that matched ANY message,
+# regardless of tool identity, success semantics or lifecycle state. The
+# round-22 adversarial re-review demonstrated the consequence: a
+# ``blade_destroy`` SUCCESS receipt is form-identical to a create receipt,
+# so a DESTROYED uid was promoted to "Active experiment_uid" in the
+# post-compaction recovery message (``retired_experiment_uids`` sat in
+# the very state dict the function already receives — unread); a
+# failed-create receipt and a HumanMessage prose mention promoted the
+# same way. Shape legislation alone cannot fix that — the defect is the
+# PARALLEL EXTRACTOR (the 9th "enumerate the repair surface" recurrence:
+# a fourth UID miner beside the registry seam, with its own — weaker —
+# lifecycle semantics). The anchors are therefore GONE: the survival
+# context delegates to ``FaultProviderRegistry.extract_experiment_uid``
+# (create-only faces, retired death-filter, the 54000 failure sentinel,
+# channel pairing — the full provider-side legislation) and falls back
+# to the durable state slot, which execute_loop syncs from that SAME
+# seam and which now carries BOTH read-side gates (round-22 Q3 put the
+# UID_SHAPE_GATE shape gate on; round-23 R1 added the DEATH gate — the
+# slot is last-write-wins and never cleared on destroy, so a legal-shape
+# corpse was the post-destroy steady state of this fallback's input,
+# and a shape-only gate waved it into "Active experiment_uid" — see
+# the section-2 comment for the full chain). Round-24 completed the
+# evidence-axis: BOTH read faces (the delegation and the state
+# fallback) now judge on the WIDEST message view available — the
+# state's own message list when it has one (the hook hands the FULL
+# list; the compaction window is a subset), the window only for
+# partial-state callers — because the K2 boundary shape parks the
+# destroy pair in the KEPT TAIL, outside the window, and a window-
+# scoped death filter is structurally blind exactly there.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -371,33 +408,98 @@ def extract_critical_context(messages: list, state: dict) -> dict:
     """
     context = {}
 
-    # 1. Active experiment_uid (from tool_result / ToolMessage content)
-    for msg in reversed(messages):
-        content = getattr(msg, "content", "")
-        if isinstance(content, str) and "experiment_uid" in content:
-            # Match experiment_uid followed by separators and a hex/hyphen
-            # value. Single-key regex: the pre-phase-9 ``blade_uid`` alias
-            # was retired in phase-14 G5 (fresh-database ruling), so old
-            # session messages no longer match.
-            match = re.search(
-                r'experiment_uid[":\s]+([0-9a-fA-F\-]+)', content
-            )
-            if match:
-                context["active_experiment_uid"] = match.group(1)
-                break
-        # Also check for UID in JSON-format tool results
-        # blade create returns: {"code":200,"success":true,"result":"<uid>"}
-        if isinstance(content, str) and '"result"' in content:
-            match = re.search(r'"result"\s*:\s*"([0-9a-fA-F\-]+)"', content)
-            if match:
-                context["active_experiment_uid"] = match.group(1)
-                break
+    # 0. Widest evidence view (round-24 R1): both UID consumers below
+    #    judge DEATH, and a destroy pair lands wherever the conversation
+    #    put it — inside the compaction window OR in the kept tail. The
+    #    hook calls this with state carrying the FULL message list
+    #    (window ⊂ full), so judging either consumer on the window alone
+    #    structurally hides a kept-tail destroy (the K2 boundary shape:
+    #    old create in the window, recent destroy in the tail). Both
+    #    therefore read the state's OWN message face when it has one;
+    #    the window stays the evidence face only for partial-state
+    #    callers (unit tests, legacy paths) whose state carries no
+    #    messages at all. Widening refutes, never asserts: a create
+    #    receipt licenses a UID only if nothing in the wider view has
+    #    proven it dead since.
+    _view = dict(state)
+    if _view.get("messages") is None:
+        _view["messages"] = messages
 
-    # 2. Experiment UID from state (direct field) — only used as fallback
-    #    if not already found from message content
-    _state_uid = state.get("experiment_uid")
+    # 1. Active experiment_uid — DELEGATED to the registry seam (round-22
+    #    Q4; see the policy comment at module top). The seam applies the
+    #    full lifecycle legislation the pre-round-22 miner lacked: only
+    #    experiment-CREATING tool faces (blade_create /
+    #    blade_python_create / pure-create kubectl exec /
+    #    blade_status-after-create) license a UID, destroyed and retired
+    #    UIDs are filtered, and the 54000 failed-create sentinel blocks
+    #    wash-in. The destroy filter works off the message face handed
+    #    in, so this call feeds it the widest view (block 0 above) —
+    #    pre-round-24 the delegation ran on the window ALONE, licensed
+    #    the uid from the window's create receipt while the destroy sat
+    #    invisible in the kept tail, and preempted the fallback gate
+    #    below entirely (first gate to fire wins, and it was the
+    #    narrow-view one); the boundary turn must not ride entirely on
+    #    the retired ledger's freshness one seam upstream. Lazy import +
+    #    fail-closed: on any import/wiring failure the survival context
+    #    simply carries no UID (never a fabricated one) — the same
+    #    pattern the fault-handle pin below uses.
+    try:
+        from chaos_agent.agent.providers import FaultProviderRegistry
+        from chaos_agent.transports.registry import is_host_scope_channel
+
+        active_uid = FaultProviderRegistry.extract_experiment_uid(
+            _view["messages"],
+            retired=_view.get("retired_experiment_uids"),
+            is_host=is_host_scope_channel(state),
+        )
+    except Exception:
+        logger.debug("survival-context uid delegation failed", exc_info=True)
+        active_uid = ""
+    if active_uid:
+        context["active_experiment_uid"] = active_uid
+
+    # 2. Durable state fallback — the slot execute_loop syncs from the SAME
+    #    registry seam (lifecycle-correct at WRITE time). The READ side
+    #    gates BOTH axes (round-23 R1 completed round-22 Q3's half-built
+    #    read gate): the shape gate refuses legacy-checkpoint garbage, the
+    #    DEATH gate refuses a retired corpse — the slot is last-write-wins
+    #    and NO destroy path clears it (every destroy surface only appends
+    #    to the retired ledger), so ``slot = dead uid + retired landed`` is
+    #    the post-destroy STEADY state of this fallback's input, not a race
+    #    window. The write-time correctness the round-22 comment leaned on
+    #    says nothing about read time: the destroy happens BETWEEN the
+    #    write and this read, and a shape-only gate resurrected the corpse
+    #    into "Active experiment_uid: <dead>" for the post-compaction LLM
+    #    while live_liability_uids — the OTHER read face of the same slot —
+    #    correctly reported it dead (r20-Q3 twins, lifecycle edition). The
+    #    death axis is therefore judged by that same single-source
+    #    liability primitive (owned − retired − message-proven destroys),
+    #    never re-derived here: it hydrates provenance internally (legacy
+    #    checkpoints predate the birth registry; owned is rebuilt from the
+    #    message scan), so an owned-less slot still flows when nothing
+    #    proves it dead — fail-open ONLY on the death axis, never on the
+    #    shape axis. Fail-closed like the delegation above.
+    #
+    #    Evidence view (round-24 R2): the death axis reads the shared
+    #    widest view from block 0 — the K2 boundary shape puts the
+    #    destroy pair in the KEPT TAIL, outside the window, so a merge
+    #    that overwrites the state's message face with the window throws
+    #    away the very evidence the death axis needs (self-blinding: the
+    #    round-23 gate resurrected on the boundary turn exactly this
+    #    way).
+    _state_uid = str(state.get("experiment_uid") or "").strip()
     if _state_uid and "active_experiment_uid" not in context:
-        context["active_experiment_uid"] = _state_uid
+        try:
+            from chaos_agent.agent.state import live_liability_uids
+
+            _live = live_liability_uids(_view)
+            if _state_uid in _live and UID_SHAPE_GATE.fullmatch(_state_uid):
+                context["active_experiment_uid"] = _state_uid
+        except Exception:
+            logger.debug(
+                "survival-context state-uid liveness check failed",
+                exc_info=True,
+            )
 
     # 2b. Carrier-neutral fault identity (Task A): a UID-less native fault has
     #    nothing the UID scan above can see, so the materialized handle — the

@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from chaos_agent.mcp.effect import EFFECT_DESTRUCTIVE, EFFECT_READONLY
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,7 +30,15 @@ class McpConfigError(ValueError):
 _ALLOWED_PHASES: frozenset[str] = frozenset({
     "clarification", "phase1", "phase2", "verifier",
 })
-_ALLOWED_TRANSPORTS: frozenset[str] = frozenset({"stdio", "http"})
+_ALLOWED_TRANSPORTS: frozenset[str] = frozenset({"stdio", "http", "sse"})
+# Operator per-tool effect overrides (``tool_effects``). Advisory only
+# (posture B) — see ``mcp/effect.py``; these never gate execution, they
+# just label the tool for the LLM ahead of the server's own annotation.
+# Single source of truth: reuse effect.py's constants so config-time
+# validation and ``resolve_tool_effect``'s runtime re-check can never
+# drift — a drift would let config accept a value effect.py then
+# silently drops (falling back to annotation with no warning).
+_ALLOWED_EFFECTS: frozenset[str] = frozenset({EFFECT_READONLY, EFFECT_DESTRUCTIVE})
 
 # ${VAR} or ${VAR_NAME_123}
 _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -37,7 +47,7 @@ _ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 @dataclass(frozen=True)
 class McpServerConfig:
     name: str
-    transport: str                                # "stdio" | "http"
+    transport: str                                # "stdio" | "http" | "sse"
     command: str | None
     args: tuple[str, ...]
     env: dict[str, str] = field(default_factory=dict)
@@ -47,6 +57,10 @@ class McpServerConfig:
     attach_to: tuple[str, ...] = ()
     enabled: bool = True
     timeout_seconds: int = 30
+    # Per-tool read/write label override (server-side tool name →
+    # "readonly" | "destructive"). Advisory only; absent → fall back to
+    # the server's MCP ToolAnnotations, then to "unspecified".
+    tool_effects: dict[str, str] = field(default_factory=dict)
 
 
 def _interpolate(value: str, env_overrides: dict[str, str]) -> str:
@@ -94,6 +108,37 @@ def _parse_one(name: str, raw: dict) -> McpServerConfig:
             )
     attach_to = tuple(attach_to_raw)
 
+    # ``tool_effects`` is an ADVISORY field (posture B — see mcp/effect.py):
+    # it only labels a tool read/write for the LLM, never gates execution
+    # and never affects whether the tool loads. So a malformation here must
+    # NOT kill the whole server the way a wiring field (transport/url/
+    # attach_to) legitimately does. Blast radius of a bad label is exactly
+    # one label: drop it, warn loudly, let the tool fall back to the
+    # server's annotation / unspecified. Two shapes degrade:
+    #   - the whole field is not a dict  -> ignore ALL labels;
+    #   - one entry's value is invalid   -> ignore THAT entry, keep the rest.
+    tool_effects_raw = raw.get("tool_effects", {}) or {}
+    tool_effects: dict[str, str] = {}
+    if not isinstance(tool_effects_raw, dict):
+        logger.warning(
+            "mcp.json: server '%s' tool_effects must be a dict, got %s; "
+            "ignoring all per-tool labels (tools fall back to "
+            "annotation/unspecified)",
+            name, type(tool_effects_raw).__name__,
+        )
+    else:
+        for tool_name, effect in tool_effects_raw.items():
+            val = str(effect).lower()
+            if val not in _ALLOWED_EFFECTS:
+                logger.warning(
+                    "mcp.json: server '%s' tool_effects['%s']='%s' not in "
+                    "%s; ignoring this label (tool falls back to "
+                    "annotation/unspecified)",
+                    name, tool_name, effect, sorted(_ALLOWED_EFFECTS),
+                )
+                continue
+            tool_effects[str(tool_name)] = val
+
     env_raw = raw.get("env", {}) or {}
     if not isinstance(env_raw, dict):
         raise McpConfigError(f"server '{name}' env must be a dict")
@@ -126,8 +171,9 @@ def _parse_one(name: str, raw: dict) -> McpServerConfig:
             command=command, args=args, env=env, cwd=cwd,
             url=None, headers={},
             attach_to=attach_to, enabled=enabled, timeout_seconds=timeout,
+            tool_effects=tool_effects,
         )
-    else:  # http
+    else:  # http (Streamable) / sse (legacy) — both url-based
         url = raw.get("url")
         if not url:
             raise McpConfigError(f"http server '{name}' requires 'url'")
@@ -136,6 +182,7 @@ def _parse_one(name: str, raw: dict) -> McpServerConfig:
             command=None, args=(), env={}, cwd=None,
             url=_interpolate(str(url), env), headers=headers,
             attach_to=attach_to, enabled=enabled, timeout_seconds=timeout,
+            tool_effects=tool_effects,
         )
 
 

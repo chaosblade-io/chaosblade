@@ -199,3 +199,20 @@ def test_skill_name_is_active_skill_not_reported_fault_type():
         "src/chaos_agent/agent/spec/fault_spec.py",
         "src/chaos_agent/agent/spec/skill_identity.py",
     }
+
+
+def test_isolation_axes_declared_on_both_graph_schemas():
+    """tenant_id / workspace_id 必须同时声明在 AgentState 与 IntentState。
+
+    langgraph 静默丢弃未声明 channel 的输入（unknown-channel updates
+    vanish without error，IntentState 的 progress_ledger 先例注释同源）。
+    若 IntentState 缺声明：intent graph 里的 load_memory / recover_handler
+    读 state 恒空 → query_active 回退全量（无租户/无空间隔离）—— 这正是
+    方案 A 要关的泄漏面，也是 tenant_id 此前的潜伏缺口。声明即防丢，
+    本断言锁住两个 schema 都不退化。"""
+    from chaos_agent.agent.state import AgentState, IntentState
+
+    for schema in (AgentState, IntentState):
+        hints = schema.__annotations__
+        assert "tenant_id" in hints, schema.__name__
+        assert "workspace_id" in hints, schema.__name__

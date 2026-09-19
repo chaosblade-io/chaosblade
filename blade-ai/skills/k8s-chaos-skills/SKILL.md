@@ -31,6 +31,15 @@ scripts:
 - **隔离**：在隔离命名空间或测试集群演练，严禁在生产核心链路注入
 - **最小影响**：用精确标签选择器定位目标，范围尽可能小
 - **可回滚**：注入前明确回滚方案，确保 30 秒内可恢复
+- **故障窗口完整**：自恢复定时器倒计时从**武装时刻**起算——恢复脚本必须先校验后武装，武装与注入必须是紧邻步骤（间隔 ≤ 60 秒），武装后发生任何修复必须重新武装；用户批准的 duration 是故障窗口契约，严禁被调试/计划变更侵蚀，同样严禁擅自延长
+- **武装载荷单次性（勿重复武装）**：带 PID/状态文件的自恢复载荷（负载循环、压力发生器等）对同一目标容器只下发一次——`kubectl exec` 立即返回的空回执即武装完成。重复下发同一载荷时其开头的 `: > 状态文件` 会截断前一轮记录，使前一轮进程 PID 失联（定时器 kill 不到它，清理由兜底而非机制保证）。不确定是否已落位时，先只读探针读状态文件（`kubectl exec <pod> -- cat <pids-file>`）：文件在 = 已武装，跳过
+- **效果证据在窗口内采齐（生效确认硬门禁）**：故障「生效确认」= 注入验证段全部判据通过（行为判据 + 白盒判据缺一不可），行为判据（探针探测故障效果）未采集即视为**未生效确认**——不得进入等待、不得拆线、不得结束执行段；效果证据只能在故障存活期内采集，恢复后/拆线后永久不可再采；机制证据（规则快照）不能替代效果证据
+- **拆线不进执行计划**：演练资产拆除（接线移除/对象删除，以及注入逆操作还原——untaint / uncordon / patch 还原 / scale 回基线等一切使故障现象消失的操作，同属拆线类）属于恢复生命周期（`blade-ai recover` 或人工），**不是执行段 mutation step**——执行计划的变更步骤只含「接线 + 武装 + 注入」；把拆线写进执行计划会迫使执行器在线等待恢复完成（receipt-then-exit 边界被结构性破坏）并销毁验证证据载体
+- **恢复载体标准件**：API 平面恢复（patch/delete K8s 对象）无宿主时，按 `references/carrier/recovery-carrier.md` 自建载体栈（Pod/SA/Role/RoleBinding 四对象同名、同靶点命名空间、命令式创建）；武装前必须真实 token 验权（禁 can-i --as 假放行），结束必须四连删除并带外核实零残留
+- **爆炸半径 scope 枚举映射（规划期填表纪律）**：`blast_radius_scope` 三值枚举按写入集判，node 等非命名空间 primary target 自身的 mutation（cordon/taint）不算扩散——①仅 target 自身 + 声明在写入集内的 ephemeral 载体（node-debugger 等一次性调试载体，跨 ns 也算）→ `target-only`；②含同命名空间其他资源（如 node 靶下删 ns 内 Pod）→ `namespace-wide`；③含跨命名空间**持久**资源写入（如 ClusterRole/ClusterRoleBinding）→ `cluster-wide`。勿在 target-only 与 namespace-wide 之间反复纠结——写入集里除 target 与一次性载体外**只有 ns 内对象**即为 namespace-wide
+- **驱逐波及面甄别（容忍三分法，规划期义务）**：驱逐类故障（taint NoExecute / drain / 节点失联驱逐）预检靶名册时按 tolerations 三分：① `operator: Exists` 无 key 无 effect → 全 effect 免疫（系统 DS 常见形态）；② `operator: Exists` 无 key 但带 `effect:` 限定 → **仅该 effect 免疫**（如 `effect: NoSchedule` 对 NoExecute 驱逐不免——部分组件 Pod 是此形态）；③ 仅容忍标准键（node.kubernetes.io/*）或指定 key → 对自定义 key 必驱逐。判读以逐 Pod jsonpath 读 tolerations 字段为准，勿按 workload 类型猜测。免疫组与必驱逐组都必须显式列入预检结论（防误判「驱逐失败」）
+- **判据形态三原则**：① 事件查询的过滤维度必须与事件挂载对象对齐（节点级事件查节点名、Pod 级事件查 Pod 名/命名空间；挂载维度未定时先按 reason 小样确认再收敛——严禁的是无过滤全量拉取，`type`/`reason` 过滤 + grep 收敛形态合法）；② 状态类裁决判据优先 jsonpath 单行输出（截断免疫），describe|grep 多行管道仅作人读展示、不作裁决载体；③ 验证与恢复验证的每条判据必须可执行可断言（悬空软判据删除或补对应命令）
+- **选靶论证字段化（规划期纪律）**：节点选靶以字段级查询逐项核验排除维度（控制面 / 系统组件命名空间 / 既有同名污点 / 容量可接纳驱逐 / 反亲和极点），命中即排除、剩余候选 ≥1 即可行——勿做全集群逐节点拓扑算术论证展开（排除维度以单条字段查询回执为准）
 - **有监控**：无监控不演练
 - **仅限已有用例**：只能执行 `references/catalogue/` 中已有的故障注入用例，严禁自行编造、拼凑或即兴发挥用例中未涉及的故障注入操作。无法匹配时必须明确告知用户「当前不支持该场景」并停止
 - **禁止**：业务高峰期演练 / 对 etcd、kube-apiserver 等控制平面注入 / 无备份对 StatefulSet 做破坏性实验
@@ -87,7 +96,7 @@ references/catalogue/
 示例：
 - `references/catalogue/Pod_Pending/Pod_Pending_节点资源不足.md`
 - `references/catalogue/Pod_磁盘空间使用率过高/Pod_磁盘空间使用率过高_应用日志数据积累.md`（pod-disk fill）
-- `references/catalogue/Pod_磁盘IO过高/Pod_磁盘IO过高_异常IO占用.md`（pod-disk burn）
+- `references/catalogue/Pod_磁盘IO过高/Pod_磁盘IO过高_磁盘IO读写负载.md`（pod-disk burn）
 
 ### 发现流程
 

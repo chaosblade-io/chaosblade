@@ -56,8 +56,8 @@ blade destroy <experiment-uid>
 #    分配量 = MemTotal × 目标百分比 − (MemTotal − MemAvailable)，按增量算，勿用绝对值
 
 # stress-ng 的 vm stressor 与本用例同属 mem 故障族，可直接执行。
-# 注意（实测）：vm stressor 占用的是**匿名内存**——观测面是 free 的 used 列增长，
-# **不会**进入 buff/cache（实测 Cached 仅 +37MB 噪音级）。--vm-keep 只改写
+# 注意：vm stressor 占用的是**匿名内存**——观测面是 free 的 used 列增长，
+# **不会**进入 buff/cache（Cached 仅 +37MB 噪音级）。--vm-keep 只改写
 # 策略（驻留不释放），不改变内存类型。
 # 效果口径：从「可用内存减少」的应用视角等效；但上方注入验证的 buff/cache
 # 判据在 stress-ng 路径下**不可达**——若监控告警钉在 buff/cache 指标上，

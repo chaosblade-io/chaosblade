@@ -1151,7 +1151,7 @@ class TestLLMRetryFailedCommands:
 
     @pytest.mark.asyncio
     async def test_retry_sends_error_feedback(self):
-        """LLM retry prompt must contain the failed command and its error."""
+        """LLM retry prompt must contain the non-zero command and its error."""
         mock_llm = AsyncMock()
         mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
             {"description": "Fixed endpoints",
@@ -1168,16 +1168,148 @@ class TestLLMRetryFailedCommands:
         result = await _llm_retry_failed_commands(
             mock_llm, "skill content", "pod", "process", "kill", failed_obs,
         )
-        assert len(result) == 1
-        assert result[0].description == "Fixed endpoints"
+        # Legacy entry shape (no verdict field) defaults to replace.
+        assert len(result["replace"]) == 1
+        assert result["replace"][0].description == "Fixed endpoints"
+        assert result["expected"] == []
 
         # Verify error feedback was included in the prompt
         call_args = mock_llm.ainvoke.call_args
         messages = call_args[0][0]
         human_content = messages[1].content
-        assert "FAILED" in human_content
+        assert "non-zero" in human_content
         assert "-l -l" in human_content
         assert "error: there is no need" in human_content
+        # Both streams are presented, explicitly marked when empty
+        # (this obs carries no stdout).
+        assert "stdout: (empty)" in human_content
+        assert "stderr: error: there is no need" in human_content
+
+    @pytest.mark.asyncio
+    async def test_retry_expected_absence_verdict_keeps_observation(self):
+        """expected_absence verdict binds the observation, not a replacement.
+
+        #31: `ls /etc/hosts.bak` exit 2 is a correct pre-check whose
+        non-zero exit IS the baseline value — the retry contract must let
+        the LLM say "keep it" instead of being forced to re-derive.
+        """
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
+            {"verdict": "expected_absence",
+             "reason": "pre-injection: backup does not exist yet per case pre-check"},
+        ])))
+
+        failed_obs = [{
+            "description": "Node /etc/hosts.bak existence",
+            "command": "kubectl exec dbg -- ls /etc/hosts.bak",
+            "exit_code": 2,
+            "stderr": "ls: cannot access '/etc/hosts.bak': No such file or directory",
+        }]
+
+        result = await _llm_retry_failed_commands(
+            mock_llm, "skill content", "node", "network", "dns", failed_obs,
+        )
+        assert result["replace"] == []
+        assert len(result["expected"]) == 1
+        obs, reason = result["expected"][0]
+        # Same observation object: the caller marks it in place.
+        assert obs is failed_obs[0]
+        assert "backup does not exist" in reason
+
+        # The prompt carries the semantic-verdict contract and the
+        # complete stream evidence.
+        human_content = mock_llm.ainvoke.call_args[0][0][1].content
+        assert "expected_absence" in human_content
+        assert "No such file or directory" in human_content
+
+    @pytest.mark.asyncio
+    async def test_retry_prompt_surfaces_stdout_evidence(self):
+        """kubewiz merges stderr into stdout: absence evidence may live
+        in stdout ONLY — the retry prompt must present both streams so
+        the model judges from complete evidence, not from whichever
+        stream the channel happened to fill.
+        """
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
+            {"verdict": "expected_absence",
+             "reason": "marker absent pre-injection per case pre-check"},
+        ])))
+
+        failed_obs = [{
+            "description": "Residue marker existence",
+            "command": "kubectl get cm hosts-bak-marker -n cms-demo",
+            "exit_code": 1,
+            "stdout": "Error from server (NotFound): configmaps \"hosts-bak-marker\" not found",
+            "stderr": "",
+        }]
+
+        result = await _llm_retry_failed_commands(
+            mock_llm, "skill content", "node", "network", "dns", failed_obs,
+        )
+        assert len(result["expected"]) == 1
+
+        human_content = mock_llm.ainvoke.call_args[0][0][1].content
+        # The absence evidence lives in stdout (kubewiz merge) and is
+        # fully visible to the judging model.
+        assert "stdout: Error from server (NotFound)" in human_content
+        assert "stderr: (empty)" in human_content
+
+    @pytest.mark.asyncio
+    async def test_retry_mixed_verdicts_split_correctly(self):
+        """Mixed verdicts: one kept absence + one legacy replace entry."""
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
+            {"verdict": "expected_absence", "reason": "timer absent pre-injection"},
+            {"verdict": "replace", "reason": "typo in resource",
+             "description": "Pod status fixed",
+             "command": "kubectl get pods -n {namespace} {label_selector}",
+             "mode": "simple"},
+        ])))
+
+        failed_obs = [
+            {"command": "systemctl status blade-restore-hosts.timer",
+             "exit_code": 4, "stderr": "Unit blade-restore-hosts.timer could not be found."},
+            {"command": "kubectl get pod rec-podd -n cms-demo",
+             "exit_code": 1, "stderr": "Error from server (NotFound)"},
+        ]
+
+        result = await _llm_retry_failed_commands(
+            mock_llm, "skill content", "node", "network", "dns", failed_obs,
+        )
+        assert len(result["expected"]) == 1
+        assert result["expected"][0][0] is failed_obs[0]
+        assert len(result["replace"]) == 1
+        assert result["replace"][0].description == "Pod status fixed"
+
+
+    @pytest.mark.asyncio
+    async def test_retry_prompt_teaches_placeholder_over_stale_pod_name(self):
+        """B50 (case #33): retry 1 hardcoded the pod name of an
+        already-deleted debug pod (three NotFound commands, one wasted
+        retry round). The retry prompt must carry the {debug_pod}
+        placeholder discipline so the model does not copy a stale literal
+        pod name out of failed-command error output."""
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([
+            {"verdict": "replace", "reason": "stale pod name",
+             "command": "kubectl exec {debug_pod} -n default -- chroot /host iptables -L INPUT -n -v",
+             "description": "Node iptables INPUT rules"},
+        ])))
+
+        failed_obs = [{
+            "command": "kubectl exec -c debugger node-debugger-n1-dtggw -n default -- chroot /host iptables -L INPUT -n -v",
+            "exit_code": 1,
+            "stderr": 'Error from server (NotFound): pods "node-debugger-n1-dtggw" not found',
+        }]
+
+        await _llm_retry_failed_commands(
+            mock_llm, "skill content", "node", "network", "drop", failed_obs,
+        )
+
+        human_content = mock_llm.ainvoke.call_args[0][0][1].content
+        assert "{debug_pod}" in human_content
+        assert "ALREADY-DELETED" in human_content
+        assert "never a literal debug pod name" in human_content
 
     @pytest.mark.asyncio
     async def test_retry_returns_empty_on_llm_failure(self):
@@ -1187,7 +1319,7 @@ class TestLLMRetryFailedCommands:
             mock_llm, "skill", "pod", "process", "kill",
             [{"command": "bad", "exit_code": 1, "stderr": "err"}],
         )
-        assert result == []
+        assert result == {"expected": [], "replace": []}
 
     @pytest.mark.asyncio
     async def test_retry_returns_empty_when_no_llm(self):
@@ -1195,7 +1327,7 @@ class TestLLMRetryFailedCommands:
             None, "skill", "pod", "process", "kill",
             [{"command": "bad", "exit_code": 1, "stderr": "err"}],
         )
-        assert result == []
+        assert result == {"expected": [], "replace": []}
 
     def test_max_retries_constant(self):
         assert _LLM_BASELINE_MAX_RETRIES == 3
@@ -1286,6 +1418,9 @@ class TestBaselineCaptureRetryIntegration:
 
         assert result["baseline_data"]["source"] == "llm"
         assert result["baseline_data"]["success_count"] == 1
+        # Denominator ships with the counts (#13/#10 audits: persistent
+        # layer lacked total_count, downstream receipts read "N/0").
+        assert result["baseline_data"]["total_count"] == 1
         # LLM was called twice: initial + retry
         assert call_count["n"] == 2
         # Execution was called twice: initial + retry
@@ -1336,6 +1471,279 @@ class TestBaselineCaptureRetryIntegration:
         assert result["baseline_data"]["success_count"] == 1
         # LLM called only once (no retry)
         assert mock_llm.ainvoke.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_expected_absence_converges_in_one_round(self):
+        """#31 regression: a correct pre-check must not burn all 3 retries.
+
+        `ls /etc/hosts.bak` exit 2 is the expected pre-injection form —
+        the old loop fed it back as FAILED and re-derived the identical
+        command three times (~35s). With the semantic verdict the loop
+        converges in ONE retry round and the non-zero observation is
+        kept as a baseline value.
+        """
+        call_count = {"n": 0}
+        mock_llm = AsyncMock()
+
+        def make_response(content):
+            r = MagicMock()
+            r.content = content
+            return r
+
+        def ainvoke_side_effect(messages):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return make_response(json.dumps([
+                    {"description": "Pod status",
+                     "command": "kubectl get pods -n {namespace} {label_selector}",
+                     "mode": "simple"},
+                    {"description": "Node /etc/hosts.bak existence",
+                     "command": "kubectl get configmap hosts-bak-marker -n {namespace}",
+                     "mode": "simple"},
+                ]))
+            # Retry: judged expected pre-injection absence, nothing to replace.
+            return make_response(json.dumps([
+                {"verdict": "expected_absence",
+                 "reason": "pre-injection: backup marker absent per case pre-check"},
+            ]))
+
+        mock_llm.ainvoke = AsyncMock(side_effect=ainvoke_side_effect)
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            results = []
+            for cmd in commands:
+                if "hosts-bak-marker" in (cmd.get("command") or ""):
+                    results.append({
+                        "description": cmd["description"],
+                        "command": "kubectl get configmap hosts-bak-marker -n cms-demo",
+                        "exit_code": 1,
+                        "stdout": "",
+                        "stderr": "Error from server (NotFound)",
+                    })
+                else:
+                    results.append({
+                        "description": cmd["description"],
+                        "command": "kubectl get pods ...",
+                        "exit_code": 0,
+                        "stdout": "NAME   READY   STATUS\nrec-pod   1/1   Running",
+                        "stderr": "",
+                    })
+            return results
+
+        node = make_baseline_capture(llm=mock_llm, registry=None)
+        state = {
+            "task_id": "test-absence-converge",
+            "fault_scope": "pod",
+            "fault_target": "process",
+            "fault_action": "kill",
+            "skill_case_content": "skill case",
+            "target": {
+                "namespace": "cms-demo",
+                "names": ["node-1"],
+                "labels": {"app": "rec"},
+            },
+            "kubeconfig": "/path/to/kubeconfig",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
+            new=fake_exec,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
+            return_value=[],
+        ):
+            result = await node(state)
+
+        # LLM called exactly twice: initial derive + ONE retry round
+        # (old loop: 4 calls — initial + 3 identical retries).
+        assert call_count["n"] == 2
+        # The non-zero observation is kept and carries the verdict reason.
+        obs = [o for o in result["baseline_data"]["observations"]
+               if "hosts-bak-marker" in (o.get("command") or "")]
+        assert len(obs) == 1
+        assert obs[0].get("expected_absence")
+        assert "pre-injection" in obs[0]["expected_absence"]
+        # Honest counting: only zero-exit observations count as success
+        # (robust to evidence-supplement commands joining the set).
+        n_zero = sum(1 for o in result["baseline_data"]["observations"]
+                     if o.get("exit_code") == 0)
+        assert result["baseline_data"]["success_count"] == n_zero
+        assert obs[0] not in [
+            o for o in result["baseline_data"]["observations"]
+            if o.get("exit_code") == 0
+        ]
+        assert result["baseline_data"]["source"] == "llm"
+
+    @pytest.mark.asyncio
+    async def test_pure_precheck_baseline_does_not_fall_through(self):
+        """A pure-precheck baseline (ALL observations expected-absence)
+        must not trigger the 4.0.7 strategy fallback chain.
+        """
+        call_count = {"n": 0}
+        mock_llm = AsyncMock()
+
+        def make_response(content):
+            r = MagicMock()
+            r.content = content
+            return r
+
+        def ainvoke_side_effect(messages):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return make_response(json.dumps([
+                    {"description": "Backup marker absence",
+                     "command": "kubectl get configmap hosts-bak-marker -n {namespace}",
+                     "mode": "simple"},
+                    {"description": "Restore timer absence",
+                     "command": "kubectl get configmap restore-timer-marker -n {namespace}",
+                     "mode": "simple"},
+                ]))
+            return make_response(json.dumps([
+                {"verdict": "expected_absence",
+                 "reason": "pre-injection: marker absent per case pre-check"},
+                {"verdict": "expected_absence",
+                 "reason": "pre-injection: timer absent per case pre-check"},
+            ]))
+
+        mock_llm.ainvoke = AsyncMock(side_effect=ainvoke_side_effect)
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            return [{
+                "description": cmd["description"],
+                "command": f"kubectl get configmap {cmd['description']} -n cms-demo",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "Error from server (NotFound)",
+            } for cmd in commands]
+
+        dispatched: list[str] = []
+
+        async def fake_dispatch(node_name, text):
+            dispatched.append(text)
+
+        node = make_baseline_capture(llm=mock_llm, registry=None)
+        state = {
+            "task_id": "test-pure-precheck",
+            "fault_scope": "pod",
+            "fault_target": "process",
+            "fault_action": "kill",
+            "skill_case_content": "skill case",
+            "target": {
+                "namespace": "cms-demo",
+                "names": ["node-1"],
+                "labels": {"app": "rec"},
+            },
+            "kubeconfig": "/path/to/kubeconfig",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
+            new=fake_exec,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
+            return_value=[],
+        ), patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture.dispatch_node_message",
+            new=fake_dispatch,
+        ):
+            result = await node(state)
+
+        # The retry loop converged WITHOUT burning the full 3-round
+        # budget (old loop: always 3 rounds for any non-zero observation,
+        # then a strategy fallthrough). Two rounds here: the initial
+        # pre-checks plus evidence-supplement observations (the fake
+        # executor reports NotFound for everything) get judged across
+        # rounds as the verdict entries pair up.
+        judging = [t for t in dispatched if "judging semantics" in t]
+        assert 1 <= len(judging) < _LLM_BASELINE_MAX_RETRIES
+        kept = [t for t in dispatched if "kept as baseline values" in t]
+        assert len(kept) >= 1
+        assert result["baseline_data"]["source"] == "llm"
+        # Both non-zero observations kept as baseline values.
+        notfound = [o for o in result["baseline_data"]["observations"]
+                    if "(NotFound)" in (o.get("stderr") or "")]
+        assert len(notfound) >= 2
+        assert all(o.get("expected_absence") for o in notfound)
+        # No strategy fallback fired for the pure-precheck baseline.
+        assert not any("falling through" in t for t in dispatched)
+
+    @pytest.mark.asyncio
+    async def test_absence_pair_preserves_target_bookkeeping(self):
+        """Multi-target drill: an expected-absence observation must keep its
+        ORIGINAL resolved pair (``_target_name``/``_target_sampled`` et al.)
+        so ``_target_coverage`` still counts the planned target. Rebuilding
+        a minimal dict from the observation would silently drop those
+        per-target fields and skew coverage for multi-target drills.
+        """
+        call_count = {"n": 0}
+        mock_llm = AsyncMock()
+
+        def make_response(content):
+            r = MagicMock()
+            r.content = content
+            return r
+
+        def ainvoke_side_effect(messages):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return make_response(json.dumps([
+                    {"description": "Node backup marker existence",
+                     "command": "kubectl get configmap hosts-bak-{node_name} -n {namespace}",
+                     "mode": "simple"},
+                ]))
+            # Retry: both per-target expansions judged expected absence.
+            return make_response(json.dumps([
+                {"verdict": "expected_absence",
+                 "reason": "marker absent pre-injection per case pre-check"},
+                {"verdict": "expected_absence",
+                 "reason": "marker absent pre-injection per case pre-check"},
+            ]))
+
+        mock_llm.ainvoke = AsyncMock(side_effect=ainvoke_side_effect)
+
+        async def fake_exec(commands, kubeconfig, task_id):
+            return [{
+                "description": cmd["description"],
+                "command": f"kubectl get configmap hosts-bak -n cms-demo ({cmd['description']})",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "Error from server (NotFound)",
+            } for cmd in commands]
+
+        node = make_baseline_capture(llm=mock_llm, registry=None)
+        state = {
+            "task_id": "test-absence-target-name",
+            "fault_scope": "node",
+            "fault_target": "network",
+            "fault_action": "dns",
+            "skill_case_content": "skill case",
+            "target": {
+                "namespace": "cms-demo",
+                "names": ["node-1", "node-2"],
+                "labels": {},
+            },
+            "kubeconfig": "/path/to/kubeconfig",
+        }
+        with patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture._execute_observations",
+            new=fake_exec,
+        ), patch(
+            "chaos_agent.agent.nodes.baseline.baseline_capture._lookup_baseline_commands",
+            return_value=[],
+        ):
+            result = await node(state)
+
+        # Both per-target expansions kept as expected-absence baseline values.
+        notfound = [o for o in result["baseline_data"]["observations"]
+                    if "(NotFound)" in (o.get("stderr") or "")]
+        assert len(notfound) >= 2
+        assert all(o.get("expected_absence") for o in notfound)
+        # The original resolved pair survived: coverage still plans BOTH
+        # targets (a rebuilt minimal dict would drop ``_target_name`` and
+        # degrade collection_mode to "aggregate_or_llm").
+        tc = result["baseline_data"]["target_coverage"]
+        assert tc["applicable"] is True
+        assert "node-1" in tc["planned_names"]
+        assert "node-2" in tc["planned_names"]
+        assert tc["collection_mode"] == "targeted_full"
 
     @pytest.mark.asyncio
     async def test_retry_preserves_original_successes(self):
@@ -1823,3 +2231,61 @@ class TestRetryRemembersWhatItTried:
         captured: list[str] = []
         await self._retry(captured, ("kubectl exec {debug_pod} -- pidof containerd",))
         assert "variant that would fail the same way" in captured[0]
+
+    # ── truncation-governance-consistency: off-graph aux-call truncation
+    # contract (design decision 8). This prompt never passes through the
+    # context compactor — the shared notice is its ONLY retrieval defense. ──
+
+    @pytest.mark.asyncio
+    async def test_retry_long_observation_both_ends_and_notice(self):
+        """A >1000-char failed-observation stream must show BOTH ends
+        (elided_preview) + a shared baseline-evidence notice pointing at
+        state.baseline_data — never a silent head cut (which would hide
+        the semantic evidence the expected_absence/replace verdict needs)."""
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([])))
+
+        head = "Warning: Immediate deletion does not include finalizers\n"
+        verdict = "ls: cannot access '/etc/hosts.bak': No such file or directory"
+        stderr = head * 40 + verdict  # > 1000 chars
+        assert len(stderr) > 1000
+
+        failed_obs = [{
+            "description": "Node /etc/hosts.bak existence",
+            "command": "kubectl exec dbg -- ls /etc/hosts.bak",
+            "exit_code": 2,
+            "stderr": stderr,
+        }]
+
+        await _llm_retry_failed_commands(
+            mock_llm, "skill content", "node", "network", "dns", failed_obs,
+        )
+        human_content = mock_llm.ainvoke.call_args[0][0][1].content
+        # BOTH ends survive the preview
+        assert head in human_content            # head anchor
+        assert verdict in human_content         # tail anchor (the causal line)
+        # Shared notice: marker + honest size + state retrieval guidance
+        assert "⚠️ TRUNCATED" in human_content
+        assert "state.baseline_data" in human_content
+        assert f"original {len(stderr)} characters" in human_content
+
+    @pytest.mark.asyncio
+    async def test_retry_short_observation_no_notice_noise(self):
+        """Within-preview-budget streams carry ZERO truncation markers —
+        the notice appears only when truncation actually happens."""
+        mock_llm = AsyncMock()
+        mock_llm.ainvoke = AsyncMock(return_value=MagicMock(content=json.dumps([])))
+
+        failed_obs = [{
+            "command": "kubectl get endpoints -n cms-demo",
+            "exit_code": 1,
+            "stderr": "error: there is no need to specify a resource type",
+        }]
+
+        await _llm_retry_failed_commands(
+            mock_llm, "skill content", "pod", "process", "kill", failed_obs,
+        )
+        human_content = mock_llm.ainvoke.call_args[0][0][1].content
+        assert "TRUNCATED" not in human_content
+        assert "elided" not in human_content
+        assert "error: there is no need" in human_content

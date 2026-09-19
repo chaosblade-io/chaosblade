@@ -178,3 +178,90 @@ class TestConnectAll:
         await mgr.connect_all()
         for phase in ("clarification", "phase1", "phase2", "verifier"):
             assert mgr.tools_for_phase(phase) == []
+
+
+class TestToolEffectResolution:
+    """Posture B end-to-end: manager resolves each tool's advisory effect
+    (config > annotation > unspecified) and it lands in the description.
+    No gating — the tool is still bound and callable either way."""
+
+    def _descriptor(self, name, annotations=None):
+        from chaos_agent.mcp.client import McpToolDescriptor
+        return McpToolDescriptor(
+            name=name, description=f"{name} base",
+            input_schema={"type": "object"}, annotations=annotations,
+        )
+
+    def _client_with(self, name, attach_to, descriptors):
+        client = _make_fake_client(name, attach_to)
+        client.list_tools = AsyncMock(return_value=descriptors)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_annotation_destructive_shows_in_description(self, monkeypatch):
+        cfg = _stub_config("s", attach_to=("phase1",))
+        descriptors = [
+            self._descriptor("cancel", {"destructiveHint": True}),
+            self._descriptor("get", {"readOnlyHint": True}),
+            self._descriptor("ping", None),
+        ]
+        mgr = McpManager(configs=[cfg])
+        monkeypatch.setattr(
+            "chaos_agent.mcp.manager.McpClient",
+            lambda c: self._client_with(c.name, c.attach_to, descriptors),
+        )
+        await mgr.connect_all()
+        by_name = {t.name: t for t in mgr.tools_for_phase("phase1")}
+        assert "DESTRUCTIVE" in by_name["s__cancel"].description
+        assert "read-only" in by_name["s__get"].description
+        assert "unspecified" in by_name["s__ping"].description
+
+    @pytest.mark.asyncio
+    async def test_config_override_beats_annotation(self, monkeypatch):
+        # Operator declares 'cancel' readonly; server says destructive.
+        # Config wins (advisory label), and the tool is STILL bound.
+        cfg = _stub_config("s", attach_to=("phase1",))
+        object.__setattr__(cfg, "tool_effects", {"cancel": "readonly"})
+        descriptors = [self._descriptor("cancel", {"destructiveHint": True})]
+        mgr = McpManager(configs=[cfg])
+        monkeypatch.setattr(
+            "chaos_agent.mcp.manager.McpClient",
+            lambda c: self._client_with(c.name, c.attach_to, descriptors),
+        )
+        await mgr.connect_all()
+        tool = mgr.tools_for_phase("phase1")[0]
+        assert "read-only" in tool.description
+        assert "DESTRUCTIVE" not in tool.description
+
+    @pytest.mark.asyncio
+    async def test_orphan_tool_effects_key_warns_and_is_ignored(
+        self, monkeypatch, caplog
+    ):
+        """Finding 1 (KEY axis): a tool_effects key that matches NO real
+        tool (e.g. a typo'd tool name carrying a valid value) must WARN —
+        not silently no-op — while the real tools load unaffected. This is
+        the mirror of the value-axis fix in config.py; only manager knows
+        the server's real tool names, so only here can the key be checked.
+        """
+        cfg = _stub_config("s", attach_to=("phase1",))
+        # 'cancle' is a typo — no such tool; the VALUE is valid, so config
+        # load accepts it and only this connect-time check can catch it.
+        object.__setattr__(cfg, "tool_effects", {"cancle": "destructive"})
+        descriptors = [self._descriptor("cancel", {"destructiveHint": True})]
+        mgr = McpManager(configs=[cfg])
+        monkeypatch.setattr(
+            "chaos_agent.mcp.manager.McpClient",
+            lambda c: self._client_with(c.name, c.attach_to, descriptors),
+        )
+        with caplog.at_level("WARNING"):
+            await mgr.connect_all()
+        # The orphan key is called out, and the real exposed name is shown
+        # so the operator can spot the typo ('cancle' vs 'cancel').
+        assert "cancle" in caplog.text
+        assert "matched no tool" in caplog.text
+        assert "cancel" in caplog.text
+        # The real tool is unaffected: still bound, and labelled from its
+        # OWN annotation (the orphan override never applied to it).
+        tools = mgr.tools_for_phase("phase1")
+        assert [t.name for t in tools] == ["s__cancel"]
+        assert "DESTRUCTIVE" in tools[0].description

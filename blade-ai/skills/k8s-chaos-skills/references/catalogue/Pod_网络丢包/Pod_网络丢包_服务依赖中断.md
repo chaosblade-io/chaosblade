@@ -9,7 +9,7 @@
 1. 确认目标应用已正常运行，且有对外网络调用（数据库、缓存、上下游服务等）
 2. 确认监控系统可观测网络请求成功率和延迟指标
 3. 确认目标 Pod 的标签选择器和命名空间
-4. 若走 kubectl-native 降级方案的 tc netem 路径：确认目标节点内核支持 netem（**内核级依赖，路径 A/B 都绕不开**）。netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换 Pod / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`——有输出说明已加载；无输出时可用更强的前置确证（实测）：经 node debug 载体执行 `chroot /host modprobe sch_netem` 试载，报 `FATAL: Module sch_netem not found` 即模块文件本身缺失（内核自动加载不可能成功），**注入前即可定案不可行**；实测 ACK/ASI al8 内核（5.10.134-13.1.al8）即为此形态——同一节点 netem 全家（loss/delay/corrupt）全部不可行，而 sch_tbf 存在（带宽受限场景可用，见 `Pod_网络带宽不足_带宽受限`）。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`（后者为节点上 sch_netem 模块文件本身缺失、内核自动加载失败）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一实测形态）即为内核不支持 netem 的确证
+4. 若走 手段2（kubectl-native）的 tc netem 路径：确认目标节点内核支持 netem（**内核级依赖，路径 A/B 都绕不开**）。netem 由宿主机内核的 sch_netem 模块提供，容器与宿主共享内核，换 Pod / 换临时容器都改变不了。只读探查：`kubectl exec <pod-name> -n <namespace> -- grep sch_netem /proc/modules`——有输出说明已加载；无输出时可用更强的前置确证：经 node debug 载体执行 `chroot /host modprobe sch_netem` 试载，报 `FATAL: Module sch_netem not found` 即模块文件本身缺失（内核自动加载不可能成功），**注入前即可定案不可行**；部分 ACK/ASI al8 内核（5.10.134-13.1.al8）即为此形态——同一节点 netem 全家（loss/delay/corrupt）全部不可行，而 sch_tbf 存在（带宽受限场景可用，见 `Pod_网络带宽不足_带宽受限`）。**判据以注入输出为准**：注入报 `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`（后者为节点上 sch_netem 模块文件本身缺失、内核自动加载失败）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一种报错形态）即为内核不支持 netem 的确证
 
 **演练步骤**：
 1. 确认目标 Pod 的标签选择器和命名空间：
@@ -23,8 +23,8 @@
      --namespace <namespace> \
      --labels "<label-key>=<label-value>" \
      --source-port <port> \
-     --timeout <duration> \
-     --kubeconfig <kubeconfig-path>
+     --timeout <duration>
+
    ```
    - `--source-port`：限定丢包端口（如 3306 丢弃 MySQL 流量、53 丢弃 DNS 流量）
    - 不指定端口时为全量丢包（慎用，影响所有流量包括监控和健康检查）
@@ -63,7 +63,7 @@
 
 ---
 
-**降级方案（kubectl-native）**
+**手段2（kubectl-native）**
 
 > 当 ChaosBlade 不可用时，用以下 kubectl 原生命令实现等效网络丢包注入。
 > **工具选择很关键**：`tc netem loss <percent>%` 是唯一能做出「按百分比丢包」的手段；
@@ -95,7 +95,7 @@ kubectl exec <pod-name> -n <namespace> -- tc qdisc add dev eth0 root netem loss 
 # ── 路径 B：容器内无可用工具（精简镜像的常态）。
 #    先建【长驻】临时容器作为载体 —— 必须 sleep 保活；若把 tc 直接交给 kubectl debug，
 #    命令跑完容器即终止，后续 `kubectl exec -c <debugger>` 会报 container not found，
-#    故障将无法恢复（已实测）。
+#    故障将无法恢复。
 # 0) 前置安全检查：确认目标 Pod 不是 hostNetwork。hostNetwork=true 的 Pod
 #    其网络命名空间【就是宿主机】，临时容器里的 tc 会打穿整个节点，
 #    爆炸半径从单 Pod 扩大到整台机器。为 true 时禁止此路径，改用 node 级用例。
@@ -116,6 +116,7 @@ kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- sh -c \
   '( sleep <duration>; tc qdisc del dev eth0 root ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev eth0 root netem loss <percent>%
 ```
+各路径倒计时均从武装时刻起算：武装与注入两条命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先停旧定时器再全额重武装：`kubectl exec <pod-name> -n <namespace> [-c <debugger-name>] -- sh -c 'pkill -f "qdisc de[l]"; true'`（exec 目标必须与武装时同一容器）；精简镜像无 pkill 时旧定时器无法停止，到期会提前恢复侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
 - `<verified-cluster-image>`：当前集群**已验证可拉取**且含 iproute2 的镜像。先看集群在用哪些仓库
   （`kubectl get pods -A -o jsonpath='{..image}'`）并从同仓库取；拉不动时 Pod 事件里会出现
   `ErrImagePull` / `ImagePullBackOff`
@@ -123,7 +124,7 @@ kubectl exec <pod-name> -n <namespace> -c <debugger-name> -- tc qdisc add dev et
 - 载体名形如 `debugger-xxxxx`，注入/验证/恢复三步都要用同一个
 - **内核级依赖（两条路径相同）**：netem 需要宿主机内核支持 sch_netem。若注入报
   `RTNETLINK answers: Operation not supported`、`RTNETLINK answers: No such file or directory`
-  （模块文件缺失）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一实测形态），
+  （模块文件缺失）或 `Error: Specified qdisc kind is unknown.`（RC=2，另一实际形态），
   即内核不支持 netem 的确证 —— 立即停止，
   **不要重试、不要换 Pod 或重建临时容器**（内核是同一个，重试只是空转），发起 replan
   并附上该报错证据，改选其他可行方案（如 iptables 全丢）或判定不可行
@@ -136,6 +137,7 @@ kubectl exec <pod-name> -n <namespace> -- sh -c \
   '( sleep <duration>; iptables -D OUTPUT -p tcp --dport <port> -j DROP ) >/dev/null 2>&1 &'
 kubectl exec <pod-name> -n <namespace> -- iptables -A OUTPUT -p tcp --dport <port> -j DROP
 ```
+倒计时从武装时刻起算：武装与注入两条命令必须紧邻连续下发（≤60s）；武装后发生任何修复须先 `kubectl exec <pod-name> -n <namespace> -- sh -c 'pkill -f "iptables -[D]"; true'` 停旧定时器再全额重武装；容器无 pkill 时旧定时器无法停止，到期会提前恢复侵蚀故障窗口——须中止演练改人工恢复或如实上报缩短的窗口（见 SKILL.md 安全红线「故障窗口完整」）
 
 恢复命令：
 

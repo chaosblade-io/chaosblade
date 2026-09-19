@@ -38,6 +38,7 @@ _BOOL_KEYS = {
     "retry_jitter",
     "replan_auto_trigger",
     "replan_reset_execute_count",
+    "turn_hold_fault_window",
 }
 # Keys where a string value should be cast to int.
 _INT_KEYS = {

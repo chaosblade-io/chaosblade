@@ -403,7 +403,7 @@ def test_save_seeds_first_tier_defaults(test_client, tmp_path):
     assert cfg["context_compact_ratio"] == 0.85
     assert cfg["llm_thinking_format"] == "auto"
     assert cfg["safety_blacklist_namespaces"] == ""
-    assert cfg["experiment_timeout"] == 600
+    assert cfg["experiment_timeout"] == 300
     assert cfg["confirmation_required"] is False
     assert cfg["kube_connection_mode"] == "kubeconfig"
     assert cfg["max_agent_loop"] == 100
@@ -456,7 +456,7 @@ _OLD_CONFIG = {
     "llm_api_key": "sk-old",
     "model_name": "totally-unknown-llm",
     "api_base_url": "https://example.com/v1",
-    "experiment_timeout": 300,  # user-tuned value that must survive
+    "experiment_timeout": 900,  # user-tuned value that must survive
 }
 
 
@@ -480,7 +480,7 @@ def test_backfill_seeds_old_config(seed_env):
     }  # experiment_timeout EXCLUDED — already present
 
     cfg = json.loads(seed_env.read_text())
-    assert cfg["experiment_timeout"] == 300  # user value preserved
+    assert cfg["experiment_timeout"] == 900  # user value preserved
     assert cfg["llm_api_key"] == "sk-old"
     # Personalized entry valued with the global fallback (unknown model).
     assert cfg["model_budgets"] == {
@@ -591,7 +591,7 @@ def test_seed_never_overwrites_existing_values(test_client, tmp_path):
     assert cfg["model_budgets"] == {"my-llm": {"max_tokens": 4096, "compact_ratio": 0.9}}
     assert cfg["safety_blacklist_namespaces"] == "kube-system,prod"
     # Absent keys still get seeded.
-    assert cfg["experiment_timeout"] == 600
+    assert cfg["experiment_timeout"] == 300
 
 
 def test_user_payload_wins_over_seed(test_client, tmp_path):

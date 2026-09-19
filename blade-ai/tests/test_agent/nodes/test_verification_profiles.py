@@ -69,11 +69,16 @@ class TestSlimSeam:
     def test_none_and_empty_target_resolve_same(self):
         assert resolve_verification_profile(None) is resolve_verification_profile("")
 
-    def test_only_disk_is_registered(self):
-        # network / mem / process no longer carry code knowledge → default.
-        for t in ("network", "mem", "process", "cpu"):
+    def test_only_asset_carrying_families_are_registered(self):
+        # Families without a programmatic runtime asset (post-check OR
+        # deterministic rule) → default. "process" joined "disk" when the
+        # kill rule landed; cpu/mem joined when their placeholder rules
+        # were declared (pinned to unknown — no runtime behaviour);
+        # network still carries no code asset at all.
+        for t in ("network",):
             assert resolve_verification_profile(t) is resolve_verification_profile("zzz")
-        assert resolve_verification_profile("disk") is not resolve_verification_profile("zzz")
+        for t in ("disk", "process", "cpu", "mem"):
+            assert resolve_verification_profile(t) is not resolve_verification_profile("zzz")
 
 
 class TestFaultHintsCarryNoKnowledge:

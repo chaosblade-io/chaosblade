@@ -46,6 +46,16 @@ class L4TaskResult:
     summary: str = ""
     error: L4AgentError | None = None
     extras: dict = field(default_factory=dict)
+    # Verification verdict as a first-class field (mirrored in
+    # extras["verification"] for legacy readers during the transition):
+    # level / layer1.status / layer2.status / checklist / warnings — the
+    # machine-readable answer to "how do you know".
+    verification: dict | None = None
+    # Structured observation-failure log: [{channel, error_class, count}]
+    # with error_class in {"auth", "transient", "unknown"} — populated by the
+    # adapter from checklist/warnings error text (see the evidence-boundary
+    # vocabulary shared with the verifier prompt).
+    observation_failures: list[dict] | None = None
 
 
 @dataclass
@@ -188,7 +198,10 @@ _FAULT_INTENT_SCHEMA: dict = {
             "additionalProperties": {"type": "string"},
         },
         "params": {"type": "object", "additionalProperties": {"type": "string"}},
-        "duration": {"type": "integer", "description": "seconds"},
+        # Single canonical duration key (l4-contract-faithfulness):
+        # matches to_intent_dict()'s output and the intent-phase rule
+        # that duration_seconds is the only legal duration channel.
+        "duration_seconds": {"type": "integer", "description": "seconds"},
         "user_description": {"type": "string"},
         "case_resource_path": {
             "type": "string",

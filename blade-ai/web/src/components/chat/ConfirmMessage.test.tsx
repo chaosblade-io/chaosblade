@@ -92,6 +92,36 @@ const L2_CONTEXT: ConfirmContextItem = {
   payload: { skill_name: "k8s-chaos-skills", duration_seconds: 120 },
 };
 
+// Widened write-set contract (CASE manifest): the entries ride the
+// payload verbatim — the D4 knowing-human requirement. A payload with
+// ONLY mechanism_writes (everything else empty) must still dispatch to
+// the structured execution card, never the generic fallback.
+const WIDENED_CONTEXT: ConfirmContextItem = {
+  kind: "confirm_context",
+  id: "c-ctx-3",
+  taskId: "T1",
+  node: "confirmation_gate",
+  content: "",
+  payload: {
+    mechanism_writes: [
+      {
+        scope: "configmap",
+        namespace: "kube-system",
+        names: ["coredns"],
+        name_prefix: "",
+        description: "",
+      },
+      {
+        scope: "configmap",
+        namespace: "kube-system",
+        names: [],
+        name_prefix: "drill-nxdomain-",
+        description: "",
+      },
+    ],
+  },
+};
+
 function promptItem(partial: Partial<ConfirmPromptItem>): ConfirmPromptItem {
   return {
     kind: "confirm_prompt",
@@ -139,6 +169,20 @@ describe("ConfirmContextView", () => {
     // (never silently missing).
     expect(screen.getByText("—")).toBeInTheDocument();
     expect(screen.getAllByText(/check not run/)).toHaveLength(2);
+  });
+
+  it("widened contract renders the manifest entries verbatim — never the generic fallback", () => {
+    render(<ConfirmContextView item={WIDENED_CONTEXT} />);
+    // Structured execution card (not the generic fallback: the card
+    // title proves the dispatch), danger label, and BOTH entry shapes
+    // rendered as single lines — names list and prefix selector.
+    expect(screen.getByText("Confirm execution plan")).toBeInTheDocument();
+    expect(screen.getByText("Writes beyond victim")).toBeInTheDocument();
+    expect(screen.getByText("configmap/kube-system: coredns")).toBeInTheDocument();
+    expect(screen.getByText("configmap/kube-system: 'drill-nxdomain-' (prefix)")).toBeInTheDocument();
+    expect(
+      screen.getByText("approving authorizes these cluster writes"),
+    ).toBeInTheDocument();
   });
 
   it("execution card floats the safety alert to the top on a problem status", () => {

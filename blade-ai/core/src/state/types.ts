@@ -295,6 +295,10 @@ export interface TurnUsageItem {
   inputTokens: number;
   /** Sum of output_tokens across every ``usage`` event of this turn. */
   outputTokens: number;
+  /** Sum of cached_tokens across every ``usage`` event of this turn.
+   *  A SUBSET of ``inputTokens`` (not additive) — cache hit rate is
+   *  ``cachedTokens / inputTokens``. */
+  cachedTokens: number;
   /** Epoch ms when the turn committed — frozen at creation (not at
    *  render time) so the summary row keeps showing the actual turn-end
    *  moment even after later repaints / remounts. Rendered in the
@@ -450,6 +454,20 @@ export interface PendingTaskRow {
   faultType: string;
   state: string;
   createdAt: string;
+  /**
+   * Round-32b: server-legislated three-group split for liability-live
+   * rows — "in_flight" (lifecycle word not terminal: the drill is
+   * still running) / "needs_recovery" (verdict-terminal,
+   * non-clearing: the run stopped with the fault on the books) /
+   * "uncleared" (a CLEARED word over a live ledger — the ghost family:
+   * the row claims settlement while the wings stay unbalanced).
+   * Derived server-side off the state.py word tables so this layer
+   * carries NO word copy (the PENDING_STATES drift family stays
+   * retired). Optional because history payloads persisted before
+   * round-32b lack the field; such rows render ungrouped (flat legacy
+   * layout).
+   */
+  group?: "in_flight" | "needs_recovery" | "uncleared";
 }
 
 export interface PendingTasksCardItem {
@@ -743,6 +761,15 @@ export interface AppState {
   pending: HistoryItem[];
   session: SessionInfo;
   streamState: StreamState;
+  /** True between REPLAY_STARTED and REPLAY_ENDED. Replay drives the
+   *  SAME reducer actions as a live turn (an ``InterruptRequired``
+   *  recording dispatches a real CONFIRM_RECEIVED and flips
+   *  ``streamState`` to ``waiting_confirmation``), so consumers that
+   *  distinguish "a live gate is waiting on the human" from "history
+   *  is being re-enacted" must gate on this flag — e.g. the TUI's
+   *  terminal-attention bell/notification hook, which must stay silent
+   *  during a replay the user is actively watching. */
+  isReplaying: boolean;
   /** Current thinking subject — derived from accumulated thinking buffer. */
   thoughtSubject: string;
   /**
@@ -792,6 +819,14 @@ export interface AppState {
    */
   turnInputTokens: number;
   turnOutputTokens: number;
+  /**
+   * Prompt-cache hits for the current turn, a SUBSET of
+   * ``turnInputTokens`` (not additive). Same reset/accumulate lifecycle
+   * as ``turnInputTokens`` (zeroed on TURN_STARTED / REPLAY_STARTED,
+   * summed on each USAGE_RECEIVED). Drives the Footer / StatusBar cache
+   * hit-rate indicator rendered beside the context-window gauge.
+   */
+  turnCachedTokens: number;
   /**
    * Last context-size snapshot from PreReasoningHook. Updated on
    * every ``CONTEXT_SIZE_RECEIVED`` action; persists across turns
@@ -1082,6 +1117,32 @@ export interface AppState {
       }
     | null;
   /**
+   * Fault-window hold state (``turn_hold_fault_window`` opt-in).
+   *
+   * Set while the server holds the turn open through the injection
+   * contract window (after verify, before the agent-driven recovery):
+   * the SSE stream carries ``fault_window`` enter/tick/exit events and
+   * this slot is their client-side mirror. Drives the
+   * ``FaultWindowIndicator`` spinner row (rotating spinner + live
+   * countdown) and suppresses the regular ``LoadingIndicator`` while
+   * non-null — same single-spinner mutex as ``currentCompaction``.
+   *
+   * The local 1Hz countdown runs off ``deadlineAt`` (client clock);
+   * each server ``tick`` re-bases it so drift stays bounded by one
+   * tick interval (~30s). Cleared at TURN_STARTED / commitPending /
+   * SESSION_INITIALIZED defensively — a dropped ``exit`` event must
+   * never leave a stuck countdown across turns.
+   */
+  faultWindow:
+    | {
+        turnId: string;          // held turn id (early-recover endpoint target)
+        injectTaskId: string;   // the inject task being held
+        durationSec: number;     // contract window length (s)
+        deadlineAt: number;      // Date.now() + remaining at last sync
+        remainingSec: number;    // last server-synced remaining (s)
+      }
+    | null;
+  /**
    * Reducer-driven phrase cycler — fallback header label for the
    * LoadingIndicator. While ``streamState === "responding"`` and no
    * memory compaction is in flight, ``Composer``'s ticker effect
@@ -1112,6 +1173,7 @@ export const initialAppState: AppState = {
   pending: [],
   session: { id: "" },
   streamState: "idle",
+  isReplaying: false,
   thoughtSubject: "",
   thoughtBuffer: "",
   thoughtStartedAt: 0,
@@ -1119,6 +1181,7 @@ export const initialAppState: AppState = {
   suppressMidContentThinking: false,
   turnInputTokens: 0,
   turnOutputTokens: 0,
+  turnCachedTokens: 0,
   contextCurrentTokens: 0,
   contextTriggerTokens: 0,
   // Seed with the server-side default so Footer renders proper
@@ -1154,6 +1217,7 @@ export const initialAppState: AppState = {
   bootProgress: null,
   pendingDecision: null,
   currentCompaction: null,
+  faultWindow: null,
   idlePhrase: "",
   config: {
     // Default to ``confirm`` to match the Python side

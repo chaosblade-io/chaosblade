@@ -1307,6 +1307,50 @@ describe("reducer / HISTORY_CLEARED", () => {
     const s = reducer(initialAppState, { type: "HISTORY_CLEARED" });
     expect(s.historyRemountKey).toBe(before + 1);
   });
+
+  it("preserveBootCards keeps the boot cards in order, drops the rest", () => {
+    // The session-resume BOOT path dispatches welcome / doctor /
+    // pending cards BEFORE the replay; HISTORY_CLEARED must keep
+    // them (dispatch order intact) while dropping every non-boot
+    // item interleaved between them.
+    const welcome: HistoryItem = {
+      kind: "welcome_card",
+      id: "boot-welcome",
+      modelName: "m",
+      permissionMode: "confirm",
+      kubeconfig: "",
+      namespace: "default",
+      version: "v",
+    };
+    const doctor: HistoryItem = {
+      kind: "boot_doctor_card",
+      id: "boot-doctor",
+      capturedAt: "t",
+      passedCount: 1,
+      totalCount: 1,
+      checks: [],
+    };
+    const pending: HistoryItem = {
+      kind: "pending_tasks_card",
+      id: "boot-pending",
+      tasks: [],
+    };
+    const s = fold([
+      { type: "HISTORY_APPENDED", item: welcome },
+      { type: "HISTORY_APPENDED", item: doctor },
+      { type: "LOG_APPENDED", level: "info", text: "boot noise" },
+      { type: "HISTORY_APPENDED", item: pending },
+      { type: "HISTORY_CLEARED", preserveBootCards: true },
+    ]);
+    expect(s.history).toEqual([welcome, doctor, pending]);
+    // Remount still bumps: on the boot path the Static gate
+    // (session.id) is still closed while the cards dispatch, so
+    // nothing has burn-in'd yet and the bump renders everything
+    // exactly once — see the reducer case comment.
+    expect(s.historyRemountKey).toBe(
+      initialAppState.historyRemountKey + 1,
+    );
+  });
 });
 
 describe("reducer / thinking session commit", () => {
@@ -1626,6 +1670,33 @@ describe("reducer / USAGE_RECEIVED + TurnUsageItem", () => {
     expect(s.turnOutputTokens).toBe(90);
   });
 
+  it("accumulates turnCachedTokens across usage events (subset of input)", () => {
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "USAGE_RECEIVED", inputTokens: 2990, outputTokens: 100, cachedTokens: 2176 },
+      { type: "USAGE_RECEIVED", inputTokens: 3000, outputTokens: 50, cachedTokens: 824 },
+    ]);
+    expect(s.turnInputTokens).toBe(5990);
+    // cached is a SUBSET of input, summed independently per event.
+    expect(s.turnCachedTokens).toBe(3000);
+  });
+
+  it("resets turnCachedTokens on TURN_STARTED; missing field coerces to 0 (no NaN)", () => {
+    const s = fold([
+      { type: "TURN_STARTED", input: "first" },
+      { type: "USAGE_RECEIVED", inputTokens: 2990, outputTokens: 100, cachedTokens: 2176 },
+      { type: "TURN_DONE" },
+      { type: "TURN_STARTED", input: "second" },
+    ]);
+    expect(s.turnCachedTokens).toBe(0);
+    // Older server omits cachedTokens entirely → 0, never NaN.
+    const s2 = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "USAGE_RECEIVED", inputTokens: 100, outputTokens: 50 },
+    ]);
+    expect(s2.turnCachedTokens).toBe(0);
+  });
+
   it("resets per-turn token counters on TURN_STARTED", () => {
     const s = fold([
       { type: "TURN_STARTED", input: "first" },
@@ -1756,6 +1827,31 @@ describe("reducer / USAGE_RECEIVED + TurnUsageItem", () => {
     ]);
     const last = s.history[s.history.length - 1];
     expect(last?.kind).toBe("turn_usage");
+  });
+
+  it("emits the usage row ONCE when a second boundary action follows TURN_DONE", () => {
+    // The resume fold's tail sequence: the last turn's TURN_DONE is
+    // immediately followed by REPLAY_ENDED (runSessionResume step 9)
+    // — two turn-boundary actions back-to-back with NO TURN_STARTED
+    // in between to re-zero the counters. The usage summary is a
+    // ONE-SHOT per-turn artifact: committing it must CONSUME the
+    // counters, or every boundary action after the first re-emits
+    // an identical row (same cumulative totals, same Date.now()) —
+    // the duplicated "⚡ 本轮共 N tokens" lines users saw when a
+    // resumed session's last turn carried usage events.
+    const s = fold([
+      { type: "TURN_STARTED", input: "hi" },
+      { type: "USAGE_RECEIVED", inputTokens: 650, outputTokens: 38 },
+      { type: "RESULT_RECEIVED", content: "ok", taskId: "t1" },
+      { type: "TURN_DONE" },
+      { type: "REPLAY_ENDED", aborted: false },
+    ]);
+    const usage = s.history.filter((i) => i.kind === "turn_usage");
+    expect(usage).toHaveLength(1);
+    // And the counters themselves are drained — a THIRD boundary
+    // would early-bail, not emit.
+    expect(s.turnInputTokens).toBe(0);
+    expect(s.turnOutputTokens).toBe(0);
   });
 });
 
@@ -2902,5 +2998,100 @@ describe("reducer / DAG node tracking", () => {
       },
     ]);
     expect(s.currentPhaseStepper).toBeNull();
+  });
+});
+
+describe("reducer / fault_window hold slot", () => {
+  const enter = {
+    type: "FAULT_WINDOW_ENTERED" as const,
+    turnId: "turn-hold-1",
+    injectTaskId: "inject-1",
+    durationSec: 300,
+    remainingSec: 270,
+  };
+
+  it("ENTERED writes the slot with a client-clock deadline", () => {
+    const before = Date.now();
+    const s = fold([enter]);
+    const after = Date.now();
+    expect(s.faultWindow).not.toBeNull();
+    expect(s.faultWindow!.turnId).toBe("turn-hold-1");
+    expect(s.faultWindow!.injectTaskId).toBe("inject-1");
+    expect(s.faultWindow!.durationSec).toBe(300);
+    expect(s.faultWindow!.remainingSec).toBe(270);
+    // deadlineAt = now + remaining — within the fold's own execution
+    // window (not the server's until_ts, which the client never trusts
+    // for interpolation).
+    expect(s.faultWindow!.deadlineAt).toBeGreaterThanOrEqual(before + 270_000);
+    expect(s.faultWindow!.deadlineAt).toBeLessThanOrEqual(after + 270_000);
+  });
+
+  it("ENTERED clamps negative/garbage numerics to safe values", () => {
+    const s = fold([
+      {
+        type: "FAULT_WINDOW_ENTERED",
+        turnId: "turn-hold-1",
+        injectTaskId: "inject-1",
+        durationSec: -5,
+        remainingSec: Number.NaN,
+      },
+    ]);
+    // NaN || 0 → 0 via the Number fallback in the action producer; the
+    // reducer's Math.max(0, …) belt-and-braces keeps it at 0.
+    expect(s.faultWindow!.durationSec).toBe(0);
+    expect(s.faultWindow!.remainingSec).toBe(0);
+  });
+
+  it("TICKED re-bases the deadline without losing slot identity", () => {
+    const s = fold([enter, { type: "FAULT_WINDOW_TICKED", remainingSec: 120 }]);
+    expect(s.faultWindow!.remainingSec).toBe(120);
+    expect(s.faultWindow!.deadlineAt).toBeGreaterThan(Date.now() + 110_000);
+    // Identity fields survive the re-base.
+    expect(s.faultWindow!.turnId).toBe("turn-hold-1");
+    expect(s.faultWindow!.injectTaskId).toBe("inject-1");
+  });
+
+  it("orphan TICKED without a slot is a no-op", () => {
+    const s = fold([{ type: "FAULT_WINDOW_TICKED", remainingSec: 120 }]);
+    expect(s.faultWindow).toBeNull();
+  });
+
+  it("EXITED clears the slot; orphan EXITED stays a no-op", () => {
+    const cleared = fold([enter, { type: "FAULT_WINDOW_EXITED", reason: "elapsed" }]);
+    expect(cleared.faultWindow).toBeNull();
+    // Orphan exit (resume fold replaying a mid-window segment tail).
+    const untouched = fold([
+      enter,
+      { type: "FAULT_WINDOW_EXITED", reason: "early" },
+      { type: "FAULT_WINDOW_EXITED", reason: "early" },
+    ]);
+    expect(untouched.faultWindow).toBeNull();
+  });
+
+  it("every turn boundary clears the slot (dropped-exit defence)", () => {
+    // TURN_DONE (commitPending): a server crash after enter must not
+    // leave a stuck countdown bleeding into the next turn.
+    expect(fold([enter, { type: "TURN_DONE" }]).faultWindow).toBeNull();
+    // TURN_ABORTED: user Esc during the hold.
+    expect(
+      fold([enter, { type: "TURN_ABORTED", reason: "x" }]).faultWindow,
+    ).toBeNull();
+    // TURN_TRANSITION (supersede): commitPending twin.
+    expect(fold([enter, { type: "TURN_TRANSITION" }]).faultWindow).toBeNull();
+    // TURN_STARTED: the canonical fresh boundary.
+    expect(
+      fold([enter, { type: "TURN_STARTED", input: "next" }]).faultWindow,
+    ).toBeNull();
+    // SESSION_INITIALIZED (resume switch): the old session's hold must
+    // not flash its countdown in the rebuilt one.
+    expect(
+      fold([
+        enter,
+        {
+          type: "SESSION_INITIALIZED",
+          session: { id: "s-new", cluster: "c", namespace: "default", modelName: "m" },
+        },
+      ]).faultWindow,
+    ).toBeNull();
   });
 });

@@ -29,6 +29,7 @@ from .declaration import (
     SUPPORTED_TARGETS,
 )
 from chaos_agent.agent.providers.base import (
+    DestroyOutcome,
     ProviderPrompts,
     RecoverResult,
     StepActionScan,
@@ -53,6 +54,7 @@ from chaos_agent.transports import PROFILE_K8S
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
 
+    from chaos_agent.tools.request_identity import RequestFingerprint
     from chaos_agent.agent.result.verdict import Layer1Result
 
     from chaos_agent.agent.target_guard.types import EffectiveTarget
@@ -86,6 +88,19 @@ class K8sNativeProvider:
     # Invariant (test_kubectl_verb_consistency): this set must stay a subset of
     # ``classifier.DESTRUCTIVE_KUBECTL_SUBS`` so every injection verb is also
     # classified destructive by the target guard.
+    #
+    # TEARDOWN≠MUTATION CONTRACT (B76 family → P3 closed): every hook on
+    # this class that consumes this vocabulary (detect / issue_disproven /
+    # injection_recency / scan_step_actions / was_injection_attempted)
+    # accepts the ``is_teardown`` matcher and skips registered-vehicle
+    # teardown calls at CALL granularity inside the vocabulary scans —
+    # the exemption now lives IN this layer (``issue_time_method`` is the
+    # one exception: the issue-loop caller applies the call-level skip
+    # before classification, R6-1). The agent-side seams thread
+    # ``execution_artifacts.make_teardown_matcher`` fresh at each
+    # invocation; those obligations are enforced by
+    # tests/test_agent/test_teardown_vocab_sentinel.py and pinned by the
+    # family teeth (TestIssueTimeTeardownAttribution).
     inject_kubectl_subcommands = KUBECTL_WRITE_SUBCOMMANDS
     # kubectl subcommands that ENTER a pod/host to run a command (command-mode
     # injection: the ChaosBlade-unavailable node fallback runs a fault binary
@@ -115,6 +130,13 @@ class K8sNativeProvider:
     kubeconfig_scoped_tool_names = frozenset({"kubectl", "kubectl_read"})
     audit_scoped_tool_names = frozenset()
     log_shipping_tool_names = frozenset({"kubectl"})
+    # Create-reconcile gate (D6): kubectl-native mutations are declared
+    # intents rendered from the fault spec — a retry re-applies the same
+    # approved mutation, and the carrier has no non-idempotent
+    # experiment-create whose uncertain outcome could arm the gate (the
+    # protocol defaults, made explicit).
+    reconcile_create_tool_names = frozenset()
+    reconcile_read_tool_names = frozenset()
     # Action vocabulary for the multi-step injection step self-check (high
     # tolerance): ``step_kubectl_verbs`` are the kubectl write verbs that may
     # appear in a skill case 演练步骤; ``chinese_verb_map`` maps Chinese step
@@ -241,7 +263,7 @@ class K8sNativeProvider:
             return [kubectl]
         return []
 
-    def detect(self, messages: list, *, is_host: bool) -> Optional[str]:
+    def detect(self, messages: list, *, is_host: bool, is_teardown=None) -> Optional[str]:
         """Classify as ``kubectl_native`` when, on a cluster channel with no
         experiment UID, a mutating kubectl call was ATTEMPTED.
 
@@ -282,10 +304,11 @@ class K8sNativeProvider:
             self.inject_kubectl_subcommands,
             command_subcommands=self.inject_command_subcommands,
             is_mutating_command=exec_inner_command_mutates,
+            is_teardown=is_teardown,
         )
         return "kubectl_native" if idx >= 0 else None
 
-    def issue_disproven(self, messages: list) -> bool:
+    def issue_disproven(self, messages: list, *, is_teardown=None) -> bool:
         """Counter-evidence for an issue-time attribution: the MOST RECENT
         object-write attempt came back as ``Error:`` — the API server proves
         the write never landed, so the attribution never committed — and NO
@@ -295,21 +318,27 @@ class K8sNativeProvider:
 
         Command-mode (exec/debug) attempts are deliberately NOT judgeable
         here: their error results may be the injected fault severing its own
-        exec channel (the forensic paradox — see
-        :func:`scan_kubectl_mutation_attempted`), so absence of a positive
+        exec channel (the forensic paradox), so absence of a positive
         object-write verdict is never counter-evidence."""
         from chaos_agent.agent.providers.message_scanning import (
             scan_native_issue_disproven,
         )
+        from chaos_agent.agent.providers.registry import FaultProviderRegistry
 
         return scan_native_issue_disproven(
             messages,
             self.inject_kubectl_subcommands,
             command_subcommands=self.inject_command_subcommands,
             is_mutating_command=exec_inner_command_mutates,
+            is_blade_create_delivery=(
+                FaultProviderRegistry.is_blade_exec_create_delivery
+            ),
+            is_teardown=is_teardown,
         )
 
-    def injection_recency(self, messages: list, *, is_host: bool) -> int:
+    def injection_recency(
+        self, messages: list, *, is_host: bool, is_teardown=None,
+    ) -> int:
         """Message index of the latest kubectl-native mutation, or ``-1``."""
         if is_host:
             return -1
@@ -322,6 +351,7 @@ class K8sNativeProvider:
             self.inject_kubectl_subcommands,
             command_subcommands=self.inject_command_subcommands,
             is_mutating_command=exec_inner_command_mutates,
+            is_teardown=is_teardown,
         )
 
     def build_fault_handle(self, values: dict) -> Optional[dict]:
@@ -347,6 +377,16 @@ class K8sNativeProvider:
         """UID-less carrier: no experiment ids exist to prove. A kubectl-native
         fault is undone by reversing the mutation, never by a destroy call, so
         the provenance gate has nothing to admit here."""
+        return set()
+
+    def destroyed_experiment_ids(self, messages: list) -> set[str]:
+        """UID-less carrier: no destroy calls exist to attribute terminal
+        state to (the issued-scan seam's neutral empty contribution)."""
+        return set()
+
+    def destroyed_proven_experiment_ids(self, messages: list) -> set[str]:
+        """UID-less carrier: no destroy output exists to prove a death (the
+        retire ledger's neutral empty contribution)."""
         return set()
 
     def classify_tool_target(
@@ -409,6 +449,44 @@ class K8sNativeProvider:
             return "kubectl_native"
         return None
 
+    def build_reconcile_fingerprint(
+        self, tool_name: str, tool_args: Any
+    ) -> Optional["RequestFingerprint"]:
+        """Create-reconcile seam (D6): this carrier declares no create
+        under the gate (``reconcile_create_tool_names`` is empty), so the
+        fingerprint hook never claims — pinned ``None``."""
+        return None
+
+    async def reconcile_hold_feedback(
+        self,
+        tool_name: str,
+        fp: "RequestFingerprint",
+        hold_count: int,
+        block_limit: int,
+        kubeconfig: str = "",
+        task_id: str = "",
+    ) -> Optional[tuple[str, bool]]:
+        """Create-reconcile seam (D6): no create under the gate — pinned
+        ``None`` (the registry scan continues past this carrier)."""
+        return None
+
+    def reconcile_batch_held_feedback(
+        self, tool_name: str, other_tool_name: str
+    ) -> Optional[str]:
+        """Create-reconcile seam (D6): no create under the gate — pinned
+        ``None``."""
+        return None
+
+    async def verify_landing_readback(
+        self, messages: list, state: dict, *, kubeconfig: str = ""
+    ) -> Optional[dict]:
+        """Landing readback guard (faultdrill-cr-channel task 2.1, design
+        D5): this carrier's landings carry no CR recipe-integrity contract
+        to verify — pinned ``None`` (the registry scan continues; the
+        faultdrill channel's D5 seam is the only owner of the post-apply
+        readback)."""
+        return None
+
     async def rollback_handle(self, handle: dict, **kwargs) -> str:
         """Kubectl-native faults are undone by reversing the mutation in the
         recover graph, not by a synchronous failure-path rollback."""
@@ -418,6 +496,8 @@ class K8sNativeProvider:
         self,
         messages: list,
         injection_method: str | None = None,
+        *,
+        is_teardown=None,
     ) -> bool:
         """Always False, pinned explicitly: this UID-less carrier has no
         experiment record whose create could be "attempted but never
@@ -426,33 +506,44 @@ class K8sNativeProvider:
         mis-trigger the recover terminal "no UID" branch. The builtin
         providers satisfy the protocol structurally, so the protocol
         default is invisible to them; this explicit mirror is what the
-        conformance suite pins."""
+        conformance suite pins. ``is_teardown`` is accepted for protocol
+        uniformity (P3) and ignored: the judgement never consults the
+        message history."""
         return False
 
     def scan_step_actions(
-        self, steps: list[str], messages: list
+        self, steps: list[str], messages: list, *, is_teardown=None,
     ) -> Optional[StepActionScan]:
         """Form B hook (phase-8 T3): THIS backend's step vocabulary — kubectl
         write verbs (English tokens + the Chinese verb map) for the required
         side, attempted kubectl inject subcommands (``patch`` ↔ dedicated
-        verb credited both ways) for the executed side."""
+        verb credited both ways) for the executed side. The ``is_teardown``
+        matcher (P3) is threaded into the executed-side scan so a
+        registered-vehicle teardown receipt credits no step verb — at call
+        granularity, mixed batches included."""
         return StepActionScan(
             required=_required_kubectl_verbs(steps),
-            executed=_executed_kubectl_verbs(messages),
+            executed=_executed_kubectl_verbs(messages, is_teardown=is_teardown),
         )
 
-    def was_injection_attempted(self, messages: list) -> bool:
+    def was_injection_attempted(self, messages: list, *, is_teardown=None) -> bool:
         """Form B hook (phase-8 T3): back-scan for a kubectl-native
         alternative injection after a ``blade_create`` attempt —
         object-write verbs, or exec/debug whose inner command mutates.
         Delegates to the shared scan primitive with THIS class's
         vocabulary (formerly the generic layer's read-through wrapper
         ``_was_kubectl_injection_attempted``)."""
+        from chaos_agent.agent.providers.registry import FaultProviderRegistry
+
         return scan_kubectl_injection_after_blade(
             messages,
             self.inject_kubectl_subcommands,
             command_subcommands=self.inject_command_subcommands,
             is_mutating_command=exec_inner_command_mutates,
+            is_blade_create_delivery=(
+                FaultProviderRegistry.is_blade_exec_create_delivery
+            ),
+            is_teardown=is_teardown,
         )
 
     async def layer1_verify(self, state: dict, **kwargs) -> "Layer1Result":
@@ -469,6 +560,12 @@ class K8sNativeProvider:
         """No bare destroy exists for a kubectl-native fault (nothing to
         destroy programmatically); the finalize retry never routes here."""
         return ""
+
+    def classify_destroy_output(self, output: str) -> DestroyOutcome:
+        """UID-less carrier: no destroy output exists to classify — the
+        empty string this carrier returns is FAILED under the authority
+        anyway; pinned explicitly so the protocol stays satisfied."""
+        return DestroyOutcome.FAILED
 
     async def layer1_destroy(
         self,
@@ -634,8 +731,33 @@ class K8sNativeProvider:
 # ---------------------------------------------------------------------------
 
 
+# English verbs count as REQUIRED only in COMMAND POSITION: the verb is the
+# subcommand of a kubectl invocation on the step line (``kubectl [--flags]
+# <verb>``). A bare prose mention is NOT an action-bearing form — counting it
+# manufactures a REQUIRED verb and the soft self-check then nudges the model
+# toward an out-of-scope mutation the case never asked for (task
+# inject-65a44501: a step's reasoning citation "仅放行节点自操作（uncordon
+# 族，#30 实测立法）" flagged ``uncordon`` as possibly-not-performed; the model
+# burned an execute iteration justifying the refusal). This is the
+# English-side mirror of ``chinese_verb_map``'s SELECTION RULE, and it restores
+# symmetry with the executed side (which reads the ``subcommand`` field of
+# issued kubectl calls). Under-anchoring a genuine bare-prose action merely
+# skips the SOFT reminder — the documented under-report bias, not a regression.
+_KUBECTL_INVOCATION_TMPL = (
+    r"kubectl(?:\s+(?:--?[^\s`]+|\"[^\"]*\"|'[^']*'))*\s+{verb}\b"
+)
+
+
 def _required_kubectl_verbs(steps: list[str]) -> dict[str, str]:
-    """REQUIRED kubectl write verbs mentioned in the drill steps (token -> step)."""
+    """REQUIRED kubectl write verbs mentioned in the drill steps (token -> step).
+
+    English verbs are recognised only at a kubectl invocation's subcommand
+    position (``kubectl [--flags] <verb>``, incl. quote-wrapped payload forms
+    like ``sh -c 'kubectl --kubeconfig=... uncordon <node>'``); Chinese
+    phrases go through ``chinese_verb_map`` unchanged. Bare prose mentions of
+    an English verb (reasoning citations, outcome descriptions) are not
+    action-bearing and are ignored — see ``_KUBECTL_INVOCATION_TMPL``.
+    """
     verbs = K8sNativeProvider.step_kubectl_verbs
     cmap = K8sNativeProvider.chinese_verb_map
     required: dict[str, str] = {}
@@ -643,7 +765,9 @@ def _required_kubectl_verbs(steps: list[str]) -> dict[str, str]:
         first = step.split('\n')[0].strip()
         lower = step.lower()
         for v in verbs:
-            if re.search(rf"\b{re.escape(v)}\b", lower):
+            if re.search(
+                _KUBECTL_INVOCATION_TMPL.format(verb=re.escape(v)), lower
+            ):
                 required.setdefault(v, first)
         for cn, en in cmap.items():
             if cn in step:
@@ -685,7 +809,7 @@ def _patch_expressible_verbs() -> frozenset[str]:
     )
 
 
-def _executed_kubectl_verbs(messages: list) -> set[str]:
+def _executed_kubectl_verbs(messages: list, *, is_teardown=None) -> set[str]:
     """kubectl inject verbs ATTEMPTED (high tolerance: reached-cluster counts,
     incl. timeout / non-zero exit; only pre-exec rejections are excluded).
 
@@ -693,6 +817,11 @@ def _executed_kubectl_verbs(messages: list) -> set[str]:
     documented as ``label`` / ``taint`` / ``scale`` is not reported missing
     when carried out via ``patch`` (and a step documented as ``patch`` is
     not reported missing when carried out with the dedicated verb).
+
+    Teardown≠step-credit (O-3, P3 call-granular): a registered-vehicle
+    teardown delete's receipt credits NO verb when the ``is_teardown``
+    matcher is threaded — the documented ``delete`` step stays honestly
+    "not yet performed" even inside a mixed batch.
     """
     lookup = build_tool_call_args_lookup(messages)
     executed: set[str] = set()
@@ -705,6 +834,8 @@ def _executed_kubectl_verbs(messages: list) -> set[str]:
             continue
         tc_id = getattr(msg, "tool_call_id", "")
         args = lookup.get(tc_id) or {}
+        if is_teardown is not None and is_teardown("kubectl", args):
+            continue
         sub = args.get("subcommand", "")
         if sub in K8sNativeProvider.inject_kubectl_subcommands:
             executed.add(sub)

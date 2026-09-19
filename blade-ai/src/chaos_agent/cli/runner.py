@@ -7,16 +7,15 @@ Returns response dicts in the same format as server routes.
 import asyncio
 import json
 import logging
+import signal
 import sys
-import uuid
 from collections import defaultdict
-from typing import Optional
+from typing import Callable, Optional
 
 from chaos_agent import __version__
 from chaos_agent.agent.factory import create_agent
 from chaos_agent.agent.state import has_active_fault
 from chaos_agent.agent.spec.fault_spec import DurationParamError, FaultSpec
-from chaos_agent.agent.result.operation_summary import build_operation_record
 from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.agent.streaming import StreamEvent, parse_stream_events
 from chaos_agent.config.settings import settings
@@ -24,7 +23,6 @@ from chaos_agent.persistence.task_identity import (
     new_inject_task_id,
     new_recover_task_id,
 )
-from chaos_agent.memory.operation_summary_writer import write_operation_summary
 from chaos_agent.models.schemas import JSONEnvelope, ResponseCode, build_inject_envelope
 from chaos_agent.observability.status_tracker import (
     subscribe,
@@ -43,7 +41,6 @@ from chaos_agent.utils.fault_type import extract_fault_type
 from chaos_agent.utils.time import now_iso
 from chaos_agent.cli.result_builder import (
     _build_inject_result_events,
-    _extract_visible_reply,
 )
 from chaos_agent.cli.session_finalize import (
     _finalize_inject_session,
@@ -53,6 +50,71 @@ from chaos_agent.cli.session_finalize import (
 from chaos_agent.cli.status_display import _status_printer
 
 logger = logging.getLogger(__name__)
+
+
+# Shared boundary decision for unattended auto-approve (single source:
+# gates/_write_set_boundary). Kept importable here for the existing
+# tests and call sites; every unattended channel — this runner's
+# streaming and non-streaming paths, the HTTP SSE route, L4's legacy
+# pre_approved branch — must decide through it, never a hard-coded
+# "approved". AUTO delegation semantics: a widened write-set contract
+# (case manifest beyond the victim coverage) auto-approves too, with
+# an auditable ``auto_approved`` event carrying the entries — the
+# manifest is the authority, the guard is the enforcement.
+from chaos_agent.agent.nodes.gates._write_set_boundary import (  # noqa: E402
+    unattended_resume_value as _unattended_resume_value,
+    widened_auto_approval_payload as _widened_auto_approval_payload,
+)
+
+
+def _install_sigterm_cancel_guard() -> Optional[Callable[[], None]]:
+    """Replace SIGTERM's default kill disposition with a driving-task cancel.
+
+    The default disposition terminates the process with no Python-level
+    chance to write the row's terminal word — the row stays at its last
+    mid-graph upsert ("injecting"/"recovering"), a zombie no later
+    writer can fix. The except branch around each CLI graph run catches
+    the resulting CancelledError and writes the terminal word via
+    write_aborted_task_row (skip_if_terminal keeps a finished run's
+    verdict). SIGINT keeps its default KeyboardInterrupt disposition
+    (the confirm prompts rely on it) and lands in the same except
+    branch.
+
+    Returns a cleanup callable, or None when the guard cannot be
+    installed (non-main-thread / unsupported platform) — callers must
+    degrade to the pre-guard behavior, not fail the run.
+    """
+    loop = asyncio.get_running_loop()
+    # Capture the driving task at install time: signal-handler callbacks
+    # run in loop-iteration context, not inside any task, so
+    # current_task() inside the callback is always None.
+    driving_task = asyncio.current_task()
+
+    def _on_sigterm() -> None:
+        if driving_task is not None and not driving_task.done():
+            driving_task.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _on_sigterm)
+    except (NotImplementedError, RuntimeError):
+        return None
+    return lambda: loop.remove_signal_handler(signal.SIGTERM)
+
+
+async def _write_signal_interrupted_row(task_id: str) -> None:
+    """Terminal row write for a signal-interrupted CLI graph run.
+
+    "user_cancel" classifies to "cancelled" through the shared
+    abort_row_word taxonomy — the same single source the server abort
+    paths use. Fail-soft by design (an interrupt path must not raise
+    past the exit that is already unwinding); write_aborted_task_row
+    logs LOUD when the write is lost.
+    """
+    from chaos_agent.server.routes.stream_abort import (
+        abort_row_word,
+        write_aborted_task_row,
+    )
+    await write_aborted_task_row(task_id, abort_row_word("user_cancel"))
 
 
 class AgentRunner:
@@ -72,33 +134,6 @@ class AgentRunner:
         self._agents: Optional[dict] = None
         self._initialized = False
         self._checkpointer_conn = None  # hold ref for cleanup
-        self._tui_session_store = None  # set by TUI app
-
-    def _sidewrite_event(
-        self,
-        session_id: str,
-        evt: "StreamEvent",
-        source: str = "pipeline",
-    ) -> None:
-        """Fire-and-forget: persist a StreamEvent to the Display Store."""
-        if not self._tui_session_store or not session_id:
-            return
-        try:
-            self._tui_session_store.append_event(session_id, {
-                "ts": evt.timestamp,
-                "source": source,
-                "task_id": evt.task_id or "",
-                "event_type": evt.type,
-                "data": evt.to_dict(),
-            })
-        except Exception:
-            pass
-
-    async def _wrap_stream_with_sidewrite(self, stream, session_id: str, source: str = "pipeline"):
-        """Wrap an async generator to sidewrite all StreamEvents."""
-        async for evt in stream:
-            self._sidewrite_event(session_id, evt, source)
-            yield evt
 
     async def initialize(self):
         """Explicitly initialize Agent Core components.
@@ -187,24 +222,15 @@ class AgentRunner:
         """
         await self._ensure_initialized()
 
-        # TUI mode: delegate to dual-graph converse_stream
-        _interaction_mode = kwargs.get("interaction_mode", "cli")
-        if _interaction_mode == "tui":
-            session_id = kwargs.get("tui_session_id", "") or ""
-            input_text = kwargs.get("input", "")
-            async for evt in self.converse_stream(
-                session_id, input_text,
-                interrupt_callback=interrupt_callback,
-                tui_session_id=session_id,
-                interaction_mode="tui",
-                kubeconfig=kwargs.get("kubeconfig", ""),
-                kube_context=kwargs.get("context", ""),
-                needs_confirmation=kwargs.get("confirm", False),
-                dry_run=kwargs.get("dry_run", False),
-                planning_mode=kwargs.get("planning_mode", ""),
-            ):
-                yield evt
-            return
+        # TUI conversations live in exactly ONE place: the server's /turn
+        # SSE route (server/routes/turn.py builds the intent initial_state,
+        # turn_event_stream.py event_generator drives the dual-graph flow).
+        # The local converse_stream twin this branch used to delegate to
+        # was retired 2026-09-01 — zero callers and drifting from the
+        # server implementation (channel-field fallbacks, interruption
+        # records, checkpoint rollback). This method serves the CLI
+        # streaming path only; interaction_mode="tui" is no longer a
+        # supported entry point here.
 
         if kwargs.get("kubeconfig"):
             settings.kubeconfig_path = kwargs["kubeconfig"]
@@ -296,19 +322,17 @@ class AgentRunner:
             )
 
         # Subscribe to status events for the background printer.
-        # In TUI mode the renderer drives its own phase visualization,
-        # so the stderr printer would just leak noise alongside the UI.
-        _suppress_stderr = _interaction_mode == "tui"
         status_queue = subscribe(task_id)
         done_event = asyncio.Event()
-        printer_task = (
-            None if _suppress_stderr
-            else asyncio.create_task(_status_printer(status_queue, done_event))
-        )
+        printer_task = asyncio.create_task(_status_printer(status_queue, done_event))
+
+        # Orphan-row guard: SIGTERM's default kill disposition leaves the
+        # row at its last mid-graph upsert (see _install_sigterm_cancel_guard).
+        _sigterm_cleanup = _install_sigterm_cancel_guard()
 
         try:
             # Print a notice so the user knows the process is running
-            if not _suppress_stderr and not settings.is_debug:
+            if not settings.is_debug:
                 sys.stderr.write("  ⏳ Fault injection in progress — the AI is analysing and planning, please wait...\n")
                 sys.stderr.flush()
 
@@ -382,11 +406,30 @@ class AgentRunner:
                     plan_summary = current_state.values.get("plan_summary", "") if current_state.values else ""
 
                     if not kwargs.get("confirm", False):
-                        # Auto-approve: resume with "approved"
+                        resume_value = _unattended_resume_value(interrupt_info)
+                        # AUTO delegation over a widened contract is an
+                        # auditable event — the manifest entries ride the
+                        # stream verbatim so the approval is on the record
+                        # even with no human at the console (the guard
+                        # still enforces the boundary per-name).
+                        _widened = _widened_auto_approval_payload(interrupt_info)
+                        if _widened is not None:
+                            yield StreamEvent(
+                                type="auto_approved",
+                                content=(
+                                    "[Auto-approved: confirmation_gate] "
+                                    "widened write-set contract "
+                                    "(case manifest mechanism_writes) — "
+                                    "see payload for the entries"
+                                ),
+                                node="confirmation_gate",
+                                task_id=task_id,
+                                payload=_widened,
+                            )
                         from langgraph.types import Command
 
                         async for event in graph.astream_events(
-                            Command(resume="approved"), config, version="v2"
+                            Command(resume=resume_value), config, version="v2"
                         ):
                             resume_event_count += 1
                             for stream_evt in parse_stream_events(event):
@@ -400,8 +443,17 @@ class AgentRunner:
                         )
                         # Continue loop to check for subsequent interrupts
                     elif confirm_callback:
-                        # Legacy confirm_callback: only handles confirmation
-                        decision = await confirm_callback(plan_summary)
+                        # Legacy confirm_callback: only handles confirmation.
+                        # Pass the FULL interrupt payload (dict) when available
+                        # so the callback can render the widened-contract
+                        # entries verbatim — a human approving a case manifest
+                        # must see what the case legislated, not just the
+                        # plan prose. Plan-text-only callbacks (old signature)
+                        # still receive the summary string.
+                        decision = await confirm_callback(
+                            interrupt_info if isinstance(interrupt_info, dict)
+                            else plan_summary
+                        )
                         from langgraph.types import Command
 
                         async for event in graph.astream_events(
@@ -438,6 +490,18 @@ class AgentRunner:
             if should_return:
                 return
 
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
+            # never finished, so the row must leave its mid-graph word.
+            try:
+                await _write_signal_interrupted_row(task_id)
+            except Exception:
+                logger.warning(
+                    "Failed to write interrupted terminal word for %s "
+                    "(zombie-row risk)", task_id,
+                )
+            raise
+
         except Exception as e:
             code, msg = _format_error(e)
             logger.exception(f"Stream inject failed for task {task_id}")
@@ -466,44 +530,20 @@ class AgentRunner:
                 task_id=task_id,
             )
         finally:
+            if _sigterm_cleanup is not None:
+                _sigterm_cleanup()
             # Finalize session: flush remaining messages from final graph state.
-            # Skip finalize when the TUI conversation is still ongoing — i.e.,
-            # the graph yielded a conversation_turn and is expected to receive
-            # more messages via converse_stream on the same thread_id. Finalizing
-            # here would remove the task from _active_sessions and cause the
-            # subsequent turn's hook appends to log "Task not found".
-            # Compute is_open_conversation here (needs local _interaction_mode)
-            # rather than inside _finalize_inject_session.
-            _is_open = False
-            _vals = {}
-            if _interaction_mode == "tui":
-                try:
-                    _fgs = await graph.aget_state(config)
-                    _vals = _fgs.values if _fgs and _fgs.values else {}
-                    from chaos_agent.agent.result.operation_outcome import (
-                        read_operation_outcome,
-                    )
-
-                    _outcome = read_operation_outcome(_vals)
-                    _is_open = (
-                        not has_active_fault(_vals)
-                        and not _outcome.error
-                        and _vals.get("safety_status") != "rejected"
-                        and _vals.get("confirmed_intent") not in ("chat",)
-                    )
-                except Exception:
-                    pass
+            # Conversations are the server /turn route's business (the local
+            # converse_stream twin that carried the open-conversation
+            # exception was retired 2026-09-01): a CLI-streaming inject is
+            # always a blocking one-shot — always finalize.
             await _finalize_inject_session(
                 self._session_store, graph, config, task_id,
                 kwargs=kwargs,
-                is_open_conversation=_is_open if _interaction_mode == "tui" else None,
                 error_log_level="warning",
-                precomputed_values=_vals if _interaction_mode == "tui" else None,
-                tui_session_store=self._tui_session_store,
             )
             done_event.set()
-            if printer_task is not None:
-                await printer_task
+            await printer_task
             unsubscribe(task_id, status_queue)
             remove_tracker(task_id)
 
@@ -608,6 +648,9 @@ class AgentRunner:
         done_event = asyncio.Event()
         printer_task = asyncio.create_task(_status_printer(status_queue, done_event))
 
+        # Orphan-row guard (see _install_sigterm_cancel_guard).
+        _sigterm_cleanup = _install_sigterm_cancel_guard()
+
         try:
             # Print a notice so the user knows the process is running
             if not settings.is_debug:
@@ -625,8 +668,28 @@ class AgentRunner:
                 current_state = await self._agents["pipeline"].aget_state(config)
                 # If graph is waiting for human input (at confirmation_gate), resume it
                 if current_state and current_state.next:
+                    # Unattended auto-approve decides through the shared
+                    # boundary helper (AUTO delegation: always "approved" —
+                    # the manifest is the authority, the guard enforces it).
+                    # A widened write-set contract (the interrupt payload's
+                    # ``write_set_widened`` marker) additionally lands in the
+                    # audit log: no stream here to carry the event, so the
+                    # delegation is recorded through the logger.
+                    interrupt_info = None
+                    for t in (current_state.tasks or []):
+                        if getattr(t, "interrupts", None):
+                            interrupt_info = t.interrupts[0].value
+                            break
+                    resume_value = _unattended_resume_value(interrupt_info)
+                    if _widened_auto_approval_payload(interrupt_info) is not None:
+                        logger.info(
+                            "auto_approved: confirmation_gate delegated a "
+                            "widened write-set contract (case manifest "
+                            "mechanism_writes beyond victim coverage); "
+                            "target_guard enforces the per-name boundary"
+                        )
                     result = await self._agents["pipeline"].ainvoke(
-                        Command(resume="approved"), config
+                        Command(resume=resume_value), config
                     )
 
             # Non-injection intent completed via intent_clarification (TUI mode)
@@ -648,6 +711,18 @@ class AgentRunner:
                 inject_data, inject_data["task_state"], inject_data.get("error", ""),
             )
 
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
+            # never finished, so the row must leave its mid-graph word.
+            try:
+                await _write_signal_interrupted_row(task_id)
+            except Exception:
+                logger.warning(
+                    "Failed to write interrupted terminal word for %s "
+                    "(zombie-row risk)", task_id,
+                )
+            raise
+
         except Exception as e:
             code, msg = _format_error(e)
             logger.exception(f"Local inject failed for task {task_id}")
@@ -667,13 +742,13 @@ class AgentRunner:
                 ),
             )
         finally:
+            if _sigterm_cleanup is not None:
+                _sigterm_cleanup()
             # Finalize session: flush remaining messages from final graph state
             await _finalize_inject_session(
                 self._session_store, self._agents["pipeline"], config, task_id,
                 kwargs=kwargs,
-                is_open_conversation=None,  # blocking inject always finalizes
                 error_log_level="warning",
-                tui_session_store=self._tui_session_store,
             )
             done_event.set()
             await printer_task
@@ -710,367 +785,6 @@ class AgentRunner:
 
     # ---- resume_stream ----
 
-    async def converse_stream(self, session_id: str, user_message: str, interrupt_callback=None, **kwargs):
-        """Dual-graph TUI conversation: Intent Graph → Pipeline Graph.
-
-        Phase 1 (Intent Graph, thread_id=session_id):
-          Stream intent_clarification dialogue. On inject intent,
-          intent_confirm fires interrupt(). After approval, handoff_summary
-          and fault_spec are extracted.
-
-        Phase 2 (Pipeline Graph, thread_id=task_id):
-          Only runs when confirmed_intent == "inject". Streams the full
-          injection pipeline (agent_loop → safety → execute → verify).
-
-        Chat / recover / unresolved intents end at Phase 1 with
-        a conversation_turn event.
-
-        Yields:
-            StreamEvent: token, tool_start, tool_end, confirm, result, error, conversation_turn
-        """
-        await self._ensure_initialized()
-
-        from langchain_core.messages import HumanMessage, SystemMessage
-        from langgraph.types import Command
-
-        intent_graph = self._agents["intent"]
-        pipeline_graph = self._agents["pipeline"]
-        intent_config = {"configurable": {"thread_id": session_id}, "recursion_limit": settings.recursion_limit}
-
-        # Session-level fields for Intent Graph (needed on first turn;
-        # subsequent turns carry them via checkpoint merge).
-        intent_input = {
-            "messages": [HumanMessage(content=user_message)],
-            "confirmed_intent": "unset",
-        }
-        # Merge session-level kwargs (tui_session_id, kubeconfig,
-        # needs_confirmation, dry_run, interaction_mode, etc.)
-        #
-        # The transport/channel fields matter beyond command dispatch: the
-        # intent prompt states the resolved capability profile as a fact so the
-        # model can tell a host environment from a K8s one, and that section is
-        # rendered from ``state["kube_connection_mode"]``. Omitting the field
-        # here left it unset, the profile resolved to "unknown", the section was
-        # skipped — and the Inject Flow rule that tells the model to check the
-        # `Capability Profile` section then pointed at something absent, so a
-        # host fault on a k8s channel was submitted with no warning.
-        #
-        # Same omission as the three ``graph_input`` branches in
-        # ``l4/interaction.py`` (fixed separately): both hand-offs carried only
-        # the four Kubernetes fields.
-        _session_keys = (
-            "tui_session_id", "interaction_mode", "kubeconfig",
-            "kube_context", "kubewiz_cluster_uuid", "kubewiz_profile",
-            "kube_connection_mode", "host_name",
-            "ssh_host", "ssh_user", "ssh_key_path", "ssh_port",
-            "needs_confirmation", "dry_run",
-            "planning_mode",
-        )
-        for k in _session_keys:
-            if k in kwargs:
-                intent_input[k] = kwargs[k]
-
-        # Channel fields fall back to settings when the caller omits them.
-        #
-        # Necessary because the TUI calls this with only session_id /
-        # user_message / interrupt_callback — no transport kwargs at all — while
-        # the channel itself comes from ``~/.blade-ai/config.json``. Command
-        # dispatch never noticed: ``TransportTarget.from_state`` applies the same
-        # settings fallback on its own.
-        #
-        # The intent prompt does not. It renders the `Capability Profile` section
-        # from ``state["kube_connection_mode"]`` directly, so an unset field made
-        # the profile "unknown" and dropped the section — leaving the Inject Flow
-        # rule pointing at a section that was not there, and a host fault on a
-        # k8s channel was submitted with no warning.
-        for _k in (
-            "kube_connection_mode", "host_name",
-            "ssh_host", "ssh_user", "ssh_key_path",
-        ):
-            if not intent_input.get(_k):
-                _v = getattr(settings, _k, "") or ""
-                if _v:
-                    intent_input[_k] = _v
-        if not intent_input.get("ssh_port"):
-            _port = getattr(settings, "ssh_port", None)
-            if _port:
-                intent_input["ssh_port"] = _port
-
-        turn_tokens_seen = False
-        pipeline_started = False
-        pipeline_task_id = ""
-        # One record per turn: a failure after the outcome record landed must not
-        # append a contradicting interruption note on top of it.
-        record_written = False
-
-        async def _write_turn_interrupted(cause: str, error_detail: str = "") -> None:
-            """Mirror an interruption record to the Intent Graph (Python TUI path).
-
-            The TUI's own cancel (Esc / Ctrl+C) raises ``CancelledError``, which
-            derives from BaseException and so was never caught here — leaving the
-            context-isolated intent graph with no record that the turn happened,
-            nor that a fault may still be live. Reads whatever the executor had
-            recorded in its progress ledger when it stopped.
-            """
-            if record_written:
-                return
-            try:
-                from chaos_agent.agent.result.operation_summary import (
-                    build_interrupted_record,
-                )
-                if pipeline_started and pipeline_task_id:
-                    snapshot = await pipeline_graph.aget_state(
-                        {"configurable": {"thread_id": pipeline_task_id}}
-                    )
-                    record_task_id = pipeline_task_id
-                else:
-                    snapshot = await intent_graph.aget_state(intent_config)
-                    record_task_id = session_id
-                values = snapshot.values if snapshot and snapshot.values else {}
-                await write_operation_summary(
-                    build_interrupted_record(
-                        values, record_task_id, cause=cause, error_detail=error_detail,
-                    ),
-                    intent_graph=intent_graph,
-                    thread_id=session_id,
-                    tui_session_id=session_id,
-                    tui_session_store=self._tui_session_store,
-                    recursion_limit=settings.recursion_limit,
-                    raise_graph_error=False,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.debug(
-                    "Failed to write interruption record for session %s (cause=%s)",
-                    session_id, cause, exc_info=True,
-                )
-
-        try:
-            # ── Phase 1: Intent Graph ──────────────────────────────
-            async for event in intent_graph.astream_events(intent_input, intent_config, version="v2"):
-                for stream_evt in parse_stream_events(event):
-                    stream_evt.task_id = session_id
-                    if stream_evt.type == "token":
-                        turn_tokens_seen = True
-                    yield stream_evt
-
-            # Handle Intent Graph interrupts (intent_confirm)
-            while True:
-                cur = await intent_graph.aget_state(intent_config)
-                if not (cur and cur.next):
-                    break
-
-                interrupt_info = None
-                for t in (cur.tasks or []):
-                    if hasattr(t, "interrupts") and t.interrupts:
-                        interrupt_info = t.interrupts[0].value
-                        break
-                if not interrupt_info:
-                    break
-
-                if interrupt_callback:
-                    response = await interrupt_callback(interrupt_info)
-                    async for event in intent_graph.astream_events(
-                        Command(resume=response), intent_config, version="v2"
-                    ):
-                        for stream_evt in parse_stream_events(event):
-                            stream_evt.task_id = session_id
-                            if stream_evt.type == "token":
-                                turn_tokens_seen = True
-                            yield stream_evt
-                else:
-                    break
-
-            # Read Intent Graph result
-            intent_final = await intent_graph.aget_state(intent_config)
-            iv = intent_final.values if intent_final else {}
-            confirmed = iv.get("confirmed_intent")
-
-            # ── Phase 2: Pipeline Graph (inject only) ──────────────
-            if confirmed == "inject" and iv.get("fault_spec"):
-                pipeline_started = True
-                task_id = iv.get("task_id", "") or new_inject_task_id()
-                pipeline_task_id = task_id
-                handoff = iv.get("handoff_summary", "")
-                tui_sid = iv.get("tui_session_id", "") or session_id
-
-                # Bootstrap task session (moved from intent_confirm)
-                from chaos_agent.agent.nodes.planning.intent_clarification import bootstrap_task_session
-                # ONE object with an explicit id, reused for both the task-file
-                # write below and the graph input further down. Without an id the
-                # two writes land in the task file as separate entries:
-                # ``_message_dedup_key`` keys on ``id`` when present, and the jsonl
-                # copy is written before ``add_messages`` assigns a UUID — so one
-                # copy was keyed on its id and the other on its content, and
-                # read_session kept both. Same fix as 1c21325 for HumanMessage in
-                # memory_nodes. ``add_messages`` preserves an existing id rather
-                # than replacing it, which is what makes the two keys match.
-                #
-                # Built outside the ``if task_id`` block because the graph input
-                # needs it either way.
-                handoff_msg = (
-                    SystemMessage(content=handoff, id=str(uuid.uuid4()))
-                    if handoff else None
-                )
-                if task_id:
-                    bootstrap_task_session(
-                        task_id, operation="inject",
-                        tui_session_id=tui_sid,
-                        handoff_message=handoff_msg,
-                    )
-
-                pipeline_config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
-                pipeline_input = {
-                    "task_id": task_id,
-                    "tui_session_id": tui_sid,
-                    "operation": "inject",
-                    "confirmed_intent": "inject",
-                    "fault_spec": iv.get("fault_spec"),
-                    "needs_confirmation": iv.get("needs_confirmation", True),
-                    "interaction_mode": "tui",
-                    "kubeconfig": iv.get("kubeconfig", ""),
-                    "kube_context": iv.get("kube_context", ""),
-                    "messages": [handoff_msg] if handoff_msg else [],
-                    "safety_status": "pending",
-                    "created_at": now_iso(),
-                    "planning_mode": iv.get("planning_mode", kwargs.get("planning_mode")),
-                }
-
-                # Stream Pipeline Graph
-                async for event in pipeline_graph.astream_events(pipeline_input, pipeline_config, version="v2"):
-                    for stream_evt in parse_stream_events(event):
-                        stream_evt.task_id = task_id
-                        if stream_evt.type == "token":
-                            turn_tokens_seen = True
-                        yield stream_evt
-
-                # Handle Pipeline interrupts (confirmation_gate)
-                while True:
-                    cur = await pipeline_graph.aget_state(pipeline_config)
-                    if not (cur and cur.next):
-                        break
-                    interrupt_info = None
-                    _interrupt_node = ""
-                    for t in (cur.tasks or []):
-                        if hasattr(t, "interrupts") and t.interrupts:
-                            interrupt_info = t.interrupts[0].value
-                            _interrupt_node = getattr(t, "name", "")
-                            break
-                    if not interrupt_info:
-                        break
-                    # Auto mode: skip confirmation_gate without user interaction
-                    _auto_mode = not iv.get("needs_confirmation", True)
-                    if _auto_mode and _interrupt_node == "confirmation_gate":
-                        response = "approved"
-                    elif interrupt_callback:
-                        response = await interrupt_callback(interrupt_info)
-                    else:
-                        break
-                    async for event in pipeline_graph.astream_events(
-                        Command(resume=response), pipeline_config, version="v2"
-                    ):
-                        for stream_evt in parse_stream_events(event):
-                            stream_evt.task_id = task_id
-                            if stream_evt.type == "token":
-                                turn_tokens_seen = True
-                            yield stream_evt
-
-                # Build and yield result from Pipeline Graph
-                pfinal = await pipeline_graph.aget_state(pipeline_config)
-                pv = pfinal.values if pfinal else {}
-
-                # Dry-run (plan_builder path): no result card.
-                # Emit conversation_turn with pipeline task_id so the TUI's
-                # _conversation_thread_id points to the Pipeline checkpoint
-                # (needed by lift_dry_run_and_run / is_dry_run_thread).
-                if pv.get("dry_run"):
-                    yield StreamEvent(type="conversation_turn", content="", task_id=task_id)
-                    return
-
-                if has_active_fault(pv):
-                    from chaos_agent.models.schemas import build_inject_envelope
-                    from chaos_agent.agent.result.operation_result import build_inject_data_from_state
-
-                    _data = build_inject_data_from_state(pv, task_id)
-                    yield StreamEvent(
-                        type="result",
-                        content=json.dumps(build_inject_envelope(
-                            _data, _data["task_state"], _data.get("error", ""),
-                        ), ensure_ascii=False),
-                        task_id=task_id,
-                    )
-                else:
-                    # Pipeline ran but no active fault (error / rejection)
-                    from chaos_agent.agent.result.operation_outcome import read_operation_outcome
-                    error_msg = read_operation_outcome(pv).error
-                    if error_msg or pv.get("safety_status") == "rejected":
-                        yield StreamEvent(
-                            type="error",
-                            content=error_msg or pv.get("safety_reason") or "Request rejected",
-                            task_id=task_id,
-                        )
-                    # Use session_id (not pipeline task_id) so the TUI's
-                    # _conversation_thread_id stays = session_id for the
-                    # next converse_stream call.
-                    yield StreamEvent(type="conversation_turn", content="", task_id=session_id)
-
-                # Write task summary back to Intent Graph + session file
-                try:
-                    # ONE combined record: summary headline + ledger process detail.
-                    summary = build_operation_record(pv, task_id)
-                    await write_operation_summary(
-                        summary,
-                        intent_graph=intent_graph,
-                        thread_id=session_id,
-                        state_update={"pipeline_task_id": task_id},
-                        tui_session_id=session_id,
-                        tui_session_store=self._tui_session_store,
-                        recursion_limit=settings.recursion_limit,
-                    )
-                    record_written = True
-                except Exception:
-                    logger.debug("Failed to write task summary to Intent Graph", exc_info=True)
-
-            else:
-                # Non-inject: chat / recover / unresolved
-                if not turn_tokens_seen:
-                    synthetic = _extract_visible_reply(iv)
-                    if synthetic:
-                        yield StreamEvent(type="token", content=synthetic, task_id=session_id)
-                yield StreamEvent(type="conversation_turn", content="", task_id=session_id)
-
-        except asyncio.CancelledError:
-            # The TUI cancel path — ``CancelledError`` derives from BaseException
-            # so the handler below never saw it, leaving no record of the turn.
-            # Shielded as this runs under cancellation.
-            await asyncio.shield(_write_turn_interrupted("user_cancel"))
-            raise
-        except Exception as e:
-            logger.exception(f"converse_stream failed for session {session_id}")
-            await _write_turn_interrupted("internal_error", f"{type(e).__name__}: {e}")
-            yield StreamEvent(type="error", content=f"Conversation failed: {e}", task_id=session_id)
-        finally:
-            if pipeline_started and pipeline_task_id:
-                try:
-                    _pfinal = await pipeline_graph.aget_state(
-                        {"configurable": {"thread_id": pipeline_task_id}}
-                    )
-                    _pvals = _pfinal.values if _pfinal else {}
-                    await _finalize_inject_session(
-                        self._session_store, pipeline_graph,
-                        {"configurable": {"thread_id": pipeline_task_id}},
-                        pipeline_task_id,
-                        is_open_conversation=False,
-                        error_log_level="debug",
-                        precomputed_values=_pvals,
-                        tui_session_store=self._tui_session_store,
-                    )
-                except Exception:
-                    logger.debug("Pipeline session finalize failed", exc_info=True)
-
-    # ---- resume_stream ----
-
     async def resume_stream(self, task_id: str, resume_value=None, interrupt_callback=None):
         """Resume a paused graph from its checkpoint.
 
@@ -1101,6 +815,9 @@ class AgentRunner:
         status_queue = subscribe(task_id)
         done_event = asyncio.Event()
         printer_task = asyncio.create_task(_status_printer(status_queue, done_event))
+
+        # Orphan-row guard (see _install_sigterm_cancel_guard).
+        _sigterm_cleanup = _install_sigterm_cancel_guard()
 
         try:
             # Initial resume from the provided resume_value
@@ -1144,10 +861,24 @@ class AgentRunner:
                         stream_evt.task_id = task_id
                         yield stream_evt
 
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
+            # never finished, so the row must leave its mid-graph word.
+            try:
+                await _write_signal_interrupted_row(task_id)
+            except Exception:
+                logger.warning(
+                    "Failed to write interrupted terminal word for %s "
+                    "(zombie-row risk)", task_id,
+                )
+            raise
+
         except Exception as e:
             logger.exception(f"Resume stream failed for task {task_id}")
             yield StreamEvent(type="error", content=f"Resume failed: {e}", task_id=task_id)
         finally:
+            if _sigterm_cleanup is not None:
+                _sigterm_cleanup()
             done_event.set()
             unsubscribe(task_id, status_queue)
             try:
@@ -1201,6 +932,66 @@ class AgentRunner:
             )
             return
 
+        # Write-set boundary at the lift seam: ``aupdate_state`` writes the
+        # lift values "as if" confirmation_gate had emitted them — the gate
+        # node body NEVER runs, so its approval/clearance cannot happen
+        # implicitly. A snapshot still pending its knowing human must be
+        # cleared through an explicit decision BEFORE the stream continues:
+        #   confirm mode  → knowledge card via interrupt_callback (the
+        #                   manifest entries render verbatim; approval
+        #                   rewrites the snapshot without the marker)
+        #   auto mode     → /run is the operator's explicit command and the
+        #                   standing delegation covers the widened contract
+        #                   (D4) — clear with an audit log line
+        from chaos_agent.agent.nodes.gates._write_set_boundary import (
+            snapshot_widening_pending,
+        )
+        from chaos_agent.agent.target_guard.freeze import approved_from_dict
+        from chaos_agent.agent.target_guard.mechanism_writes import (
+            entries_beyond_victim,
+            format_entries_for_payload,
+        )
+        _lift_clear_pending: dict = {}
+        if snapshot_widening_pending(snapshot.values):
+            _approved = approved_from_dict(snapshot.values.get("approved_target") or {})
+            _widening = format_entries_for_payload(
+                entries_beyond_victim(_approved) if _approved else (),
+            )
+            if interrupt_callback is not None:
+                _card = {
+                    "type": "confirmation",
+                    "write_set_widened": {"mechanism_writes": _widening},
+                    "mechanism_writes": _widening,
+                    "plan_summary": snapshot.values.get("plan_summary", ""),
+                    "safety_reason": (
+                        "The dry-run plan's case contract includes mechanism "
+                        "writes beyond the victim target. Approve to freeze "
+                        "the extended write-set contract."
+                    ),
+                }
+                _decision = await interrupt_callback(_card)
+                if _decision != "approved":
+                    yield StreamEvent(
+                        type="error",
+                        content="Dry-Run apply rejected: the widened write-set "
+                                "contract (case manifest mechanism_writes) was "
+                                "declined. Re-plan or approve the entries.",
+                        task_id=thread_id,
+                    )
+                    return
+            else:
+                logger.info(
+                    "lift_dry_run_and_run: auto-mode /run approved the widened "
+                    "write-set contract (%d manifest entries beyond victim "
+                    "coverage) under the operator's standing delegation",
+                    len(_widening),
+                )
+            # Approval (or standing delegation): rewrite the snapshot with
+            # the pending marker cleared, same as the gate's approved re-freeze.
+            _existing = dict(snapshot.values.get("approved_target") or {})
+            _existing.pop("widening_pending_approval", None)
+            _lift_clear_pending = {"approved_target": _existing}
+
         # Re-enter from confirmation_gate's outgoing edge: write the lift
         # values "as if" confirmation_gate had just produced them. The /run
         # invocation itself counts as the user confirmation, so we also clear
@@ -1216,6 +1007,9 @@ class AgentRunner:
                 "replan_requested": False,
                 "replan_count": 0,
                 "replan_context": None,
+                # Widened-contract clearance decided above (knowledge card
+                # or standing delegation) rides the same lift write.
+                **_lift_clear_pending,
             },
             as_node="confirmation_gate",
         )
@@ -1367,6 +1161,11 @@ class AgentRunner:
         # Pre-declare in case fallback path is taken or an early exception fires.
         experiment_uid = ""
         state_values: dict = {}
+        # Round-63 R63-1: the CLI envelope's session status consumes
+        # default_status, so the failure exits must say WHICH exit ran —
+        # otherwise a failed recovery records "completed" on its session
+        # (the envelope's own data.result says failed/unverified).
+        recover_failed = False
 
         try:
             # Try to fetch LangGraph checkpoint as supplemental live context.
@@ -1434,6 +1233,7 @@ class AgentRunner:
                 state_values,
             )
             if recover_data.get("result") == "failed":
+                recover_failed = True
                 error_msg = recover_data.get("error") or "Recovery verification failed"
                 recover_fail_data = {**recover_data, "error": error_msg}
                 # RECOVERY_FAILED (4xxx operational), matching the remote
@@ -1448,6 +1248,7 @@ class AgentRunner:
             return JSONEnvelope.ok(data=recover_data)
 
         except Exception as e:
+            recover_failed = True
             code, msg = _format_error(e)
             logger.exception(f"Local recover failed for task {inject_task_id}")
             from chaos_agent.agent.result.operation_result import (
@@ -1480,6 +1281,193 @@ class AgentRunner:
                     inject_task_id,
                     state_values,
                     result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+                    default_status="failed" if recover_failed else "completed",
+                )
+            done_event.set()
+            await printer_task
+            unsubscribe(record_task_id, status_queue)
+            remove_tracker(record_task_id)
+
+    # ---- recover_stream ----
+
+    async def recover_stream(self, task_id: str, **kwargs):
+        """Stream recover execution, yielding StreamEvent objects in real-time.
+
+        Streaming twin of ``recover()``: same setup/finalization contract
+        (TaskStore state transition, recover session record, ledger-aware
+        session finalize), but the recover graph runs under
+        ``astream_events`` so the CLI renders LLM tokens and tool results
+        as they happen instead of a static "in progress" line.
+
+        The recover graph has no confirmation interrupt, so unlike
+        ``inject_stream`` there is no resume loop — one streaming pass,
+        then the final envelope is rebuilt from the graph's final state
+        and yielded as a ``result`` event (same JSONEnvelope shape that
+        ``recover()`` returns, so ``--output`` formatting and exit codes
+        are identical between streaming and non-streaming calls).
+
+        Yields:
+            StreamEvent: token, thinking, tool_start, tool_end,
+            node_message, result, error
+        """
+        await self._ensure_initialized()
+
+        # Reset module-level time_wait state for the new recover task.
+        from chaos_agent.tools.wait import reset_wait_state
+        reset_wait_state()
+
+        inject_task_id = task_id
+        record_task_id = new_recover_task_id()
+        config = {"configurable": {"thread_id": inject_task_id}, "recursion_limit": settings.recursion_limit}
+
+        status_queue = subscribe(record_task_id)
+        done_event = asyncio.Event()
+        printer_task = asyncio.create_task(_status_printer(status_queue, done_event))
+
+        # Pre-declare in case fallback path is taken or an early exception fires.
+        experiment_uid = ""
+        state_values: dict = {}
+        # Round-63 R63-1: the CLI envelope's session status consumes
+        # default_status, so the failure exits must say WHICH exit ran —
+        # otherwise a failed recovery records "completed" on its session
+        # (the envelope's own data.result says failed/unverified).
+        recover_failed = False
+
+        try:
+            current_state = await self._agents["pipeline"].aget_state(config)
+            checkpoint_values = current_state.values if current_state and current_state.values else {}
+
+            from chaos_agent.agent.result.task_snapshot import resolve_recover_initial_state
+
+            resolution = await resolve_recover_initial_state(
+                inject_task_id,
+                record_task_id=record_task_id,
+                agents=self._agents,
+                checkpoint_values=checkpoint_values,
+                kubeconfig_override=kwargs.get("kubeconfig") or None,
+            )
+            if resolution is None:
+                yield StreamEvent(
+                    type="error",
+                    content=f"Task not recoverable: {inject_task_id}",
+                    task_id=record_task_id,
+                )
+                yield StreamEvent(
+                    type="result",
+                    content=json.dumps(JSONEnvelope.fail(
+                        code=ResponseCode.TASK_NOT_FOUND,
+                        message=f"Task not recoverable: {inject_task_id}",
+                    ), ensure_ascii=False),
+                    task_id=record_task_id,
+                )
+                return
+
+            initial_state = resolution.initial_state
+            state_values = resolution.source_values
+            experiment_uid = initial_state.get("experiment_uid") or ""
+            inject_tui_session_id = initial_state.get("tui_session_id", "") or ""
+
+            try:
+                from chaos_agent.persistence.task_store import get_task_store
+                store = await get_task_store()
+                await store.update_task_state(inject_task_id, "recovering")
+            except Exception:
+                logger.warning(f"Failed to write recover state to TaskStore for {inject_task_id}")
+
+            if self._session_store:
+                inject_messages = state_values.get("messages", [])
+                self._session_store.create_session(
+                    record_task_id,
+                    operation="recover",
+                    tui_session_id=inject_tui_session_id,
+                    parent_task_id=inject_task_id,
+                    baseline_messages=inject_messages,
+                )
+
+            # Stream the recover graph (includes two-layer verification).
+            async for event in self._agents["recover"].astream_events(
+                initial_state, config, version="v2"
+            ):
+                for stream_evt in parse_stream_events(event):
+                    stream_evt.task_id = record_task_id
+                    yield stream_evt
+
+            # astream_events does not return final values the way ainvoke
+            # does — rebuild them from the checkpoint.
+            final_snapshot = await self._agents["recover"].aget_state(config)
+            result_values = (
+                final_snapshot.values if final_snapshot and final_snapshot.values else {}
+            )
+
+            from chaos_agent.agent.result.operation_result import (
+                build_recover_cli_data_from_state,
+            )
+
+            recover_data = build_recover_cli_data_from_state(
+                result_values,
+                inject_task_id,
+                state_values,
+            )
+            if recover_data.get("result") == "failed":
+                recover_failed = True
+                error_msg = recover_data.get("error") or "Recovery verification failed"
+                envelope = JSONEnvelope.fail(
+                    code=ResponseCode.RECOVERY_FAILED,
+                    message=error_msg,
+                    data={**recover_data, "error": error_msg},
+                )
+            else:
+                envelope = JSONEnvelope.ok(data=recover_data)
+
+            yield StreamEvent(
+                type="result",
+                content=json.dumps(envelope, ensure_ascii=False),
+                task_id=record_task_id,
+            )
+
+        except Exception as e:
+            recover_failed = True
+            code, msg = _format_error(e)
+            logger.exception(f"Local recover_stream failed for task {inject_task_id}")
+            from chaos_agent.agent.result.operation_result import (
+                build_recover_cli_failure_data_from_state,
+            )
+
+            yield StreamEvent(
+                type="error",
+                content=f"Recovery failed: {msg}",
+                task_id=record_task_id,
+            )
+            yield StreamEvent(
+                type="result",
+                content=json.dumps(JSONEnvelope.fail(
+                    code=code,
+                    message=f"Recovery failed: {msg}",
+                    data=build_recover_cli_failure_data_from_state(
+                        inject_task_id,
+                        state_values,
+                        experiment_uid=experiment_uid or "",
+                        error=f"internal_error: Recovery failed: {msg}",
+                    ),
+                ), ensure_ascii=False),
+                task_id=record_task_id,
+            )
+        finally:
+            if self._session_store:
+                from chaos_agent.memory.session_finalizer import (
+                    RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+                    finalize_recover_session,
+                )
+
+                await finalize_recover_session(
+                    self._session_store,
+                    self._agents["recover"],
+                    config,
+                    record_task_id,
+                    inject_task_id,
+                    state_values,
+                    result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+                    default_status="failed" if recover_failed else "completed",
                 )
             done_event.set()
             await printer_task

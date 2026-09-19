@@ -150,3 +150,19 @@ class TestFaultPayloadSchema:
             "action",
             "namespace",
         }
+
+
+class TestFaultPayloadSchemaDurationKey:
+    """The payload contract declares exactly one duration key (l4-contract-
+    faithfulness): duration_seconds, matching to_intent_dict()'s output and
+    the intent-phase legislation. The retired ``duration`` alias must not
+    reappear in the advertised contract."""
+
+    def test_duration_seconds_declared(self):
+        props = FAULT_PAYLOAD_SCHEMA["properties"]["fault_intent"]["properties"]
+        assert "duration_seconds" in props
+        assert props["duration_seconds"]["type"] == "integer"
+
+    def test_retired_duration_alias_absent(self):
+        props = FAULT_PAYLOAD_SCHEMA["properties"]["fault_intent"]["properties"]
+        assert "duration" not in props

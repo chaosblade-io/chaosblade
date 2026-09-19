@@ -49,11 +49,13 @@ still a K8s experiment.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # imported only for typing — avoids import cycles at runtime
     from langchain_core.tools import BaseTool
 
+    from chaos_agent.tools.request_identity import RequestFingerprint
     from chaos_agent.agent.result.verdict import Layer1Result
     from chaos_agent.agent.target_guard.types import EffectiveTarget
 
@@ -170,6 +172,29 @@ class StepActionScan:
     executed: set[str]
 
 
+class DestroyOutcome(StrEnum):
+    """Three-state verdict on a raw destroy output.
+
+    Legislation for the destroy-decision family: before it, three tables
+    judged the SAME raw output three different ways (the registry sweep's
+    prefix table, the verify-replan retire filter's prefix pair and the
+    carrier's own death-proof predicate — a non-JSON no-keyword output
+    retired on one table and stayed live on another). Every framework-side
+    consumer now composes the carrier's single :meth:`FaultProvider.
+    classify_destroy_output` classifier.
+
+    SUCCESS proves the destroy happened. NOT_FOUND is the failure that
+    smells like the experiment being already gone — the sweep's
+    convergence valve re-checks through the carrier's status face before
+    surfacing the UID. FAILED is everything else: doubt is failure, a
+    false retire hides a LIVE experiment from every future recovery.
+    """
+
+    SUCCESS = "success"
+    NOT_FOUND = "not_found"
+    FAILED = "failed"
+
+
 @runtime_checkable
 class FaultProvider(Protocol):
     """One fault execution backend. See module docstring for the seam rationale.
@@ -264,6 +289,27 @@ class FaultProvider(Protocol):
     #: instead of hardcoding carrier namespaces in the generic layer.
     #: Backends without dedicated infra pods declare the empty set.
     tool_pod_namespaces: frozenset[str] = frozenset()
+    #: Tool names whose RESULT-UNCERTAIN outcomes arm the create-reconcile
+    #: gate: a create whose transport failed ambiguously (timeout /
+    #: transient no-UID error) leaves the executor not knowing whether the
+    #: experiment was created, and a blind retry of a NON-IDEMPOTENT create
+    #: can materialise a duplicate experiment on the same target. The
+    #: generic gate (``agent/nodes/execute/_reconcile_gate.py``) scans and
+    #: intercepts by the provider UNION of this attribute
+    #: (:meth:`FaultProviderRegistry.union_tool_names`) instead of
+    #: hardcoded tool names. Backends whose creates are retry-safe (or that
+    #: create no experiment record at all) declare the empty set and are
+    #: invisible to the gate.
+    reconcile_create_tool_names: frozenset[str] = frozenset()
+    #: Read-only tool names whose execution after a result-uncertain create
+    #: counts as reconciliation for THIS backend's gate — the release
+    #: condition that lets an honest post-reconcile retry through instead
+    #: of intercepting it (spec: 宽进). Members may be other carriers' or
+    #: generic read tools the LLM can legitimately reconcile with: the
+    #: declaration owns the judgement "this read resolves MY uncertain
+    #: create", not the tool itself. Unioned across providers for the
+    #: whitelist scan.
+    reconcile_read_tool_names: frozenset[str] = frozenset()
 
     def matches_channel(self, profile: str) -> bool:
         """True if this backend can operate against a ``profile`` ("k8s"|"host").
@@ -291,16 +337,23 @@ class FaultProvider(Protocol):
         ...
 
     def detect(
-        self, messages: list, *, is_host: bool
+        self, messages: list, *, is_host: bool, is_teardown=None,
     ) -> Optional[str]:
         """Return this backend's ``injection_method`` if its carrier is found in
         ``messages``, else ``None``. The registry arbitrates competing carriers
         by RECENCY (see :meth:`injection_recency`), using registration order
-        only as a tie-breaker."""
+        only as a tie-breaker.
+
+        ``is_teardown`` (P3 matcher threading): the teardown≠mutation
+        exemption closure (``execution_artifacts.make_teardown_matcher``).
+        Kubectl-vocabulary carriers thread it into their scans; carriers
+        whose evidence can never be a registered-vehicle delete accept and
+        ignore it (protocol uniformity — the registry passes it to every
+        backend)."""
         ...
 
     def injection_recency(
-        self, messages: list, *, is_host: bool
+        self, messages: list, *, is_host: bool, is_teardown=None,
     ) -> int:
         """Message index of this backend's most-recent injection evidence, or
         ``-1`` when its carrier is absent. The registry attributes the method
@@ -355,6 +408,27 @@ class FaultProvider(Protocol):
         screener's destroy-provenance gate through the registry aggregate so
         generic nodes never name a carrier-specific extractor. UID-less
         backends have no experiment ids to prove; they return the empty set."""
+        return set()
+
+    def destroyed_experiment_ids(self, messages: list) -> set[str]:
+        """Every experiment id this backend's destroy tool calls have
+        TARGETED — the terminal-state attribution scan, union-aggregated by
+        the registry (issued = terminal: an attempted destroy must stop the
+        UID being re-claimed as the live fault, whether or not the output
+        confirms the kill). Only meaningful for ``has_experiment_uid``
+        backends; UID-less backends return the empty set."""
+        return set()
+
+    def destroyed_proven_experiment_ids(self, messages: list) -> set[str]:
+        """Destroys whose PAIRED tool output PROVES the kill — the death
+        registration feed for the retire ledger.
+
+        Stricter twin of :meth:`destroyed_experiment_ids` on purpose: a
+        retire excludes a UID from every live-liability read, so only an
+        output-proven death may register — a false entry hides a LIVE
+        experiment (strictly worse than the orphan the sweep exists to
+        prevent). Only meaningful for ``has_experiment_uid`` backends;
+        UID-less backends return the empty set."""
         return set()
 
     def classify_tool_target(
@@ -412,8 +486,97 @@ class FaultProvider(Protocol):
         classifier never names a carrier-specific tool or method."""
         return None
 
+    async def verify_landing_readback(
+        self, messages: list, state: dict, *, kubeconfig: str = ""
+    ) -> Optional[dict]:
+        """Landing-integrity verdict for this backend's freshly-LANDED
+        carrier apply visible in ``messages``, or ``None`` when there is
+        nothing of this backend's to verify.
+
+        Post-landing readback seam (faultdrill-cr-channel task 2.1,
+        design D5): the execute loop consults the registry in its
+        post-execution block — AFTER the landing tool result is visible
+        in history, BEFORE the response is published — and each backend
+        that declares a landing form runs its own integrity check
+        PROGRAMMATICALLY on that same iteration, never on an LLM turn
+        (a prompt-layer readback is observation, not a guard; safety
+        rails are not delegable). ``state`` carries the idempotence
+        bookkeeping (``fault_readback_verified``) the hook consumes; a
+        FAILED verdict is the hard-abort signal the generic seam turns
+        into the ``fail_state`` error triple — no reconciliation entry
+        ever runs behind a landing whose integrity is unproven.
+        Backends without a landing-integrity contract pin ``None``."""
+        return None
+
+    def build_reconcile_fingerprint(
+        self, tool_name: str, tool_args: Any
+    ) -> Optional["RequestFingerprint"]:
+        """Request identity (four-dimension fingerprint) for a create tool
+        call this backend recognises, or ``None`` when the call is not this
+        backend's create tool.
+
+        Create-reconcile seam (blade-create-reconcile-before-retry D6):
+        the generic gate (``agent/nodes/execute/_reconcile_gate.py``) owns
+        the three-state scan / interception / release / cap state machine;
+        WHICH argument keys form the request identity and how the raw LLM
+        argument shapes normalise (CSV vs list, dict vs CSV, key-face
+        lowercasing) is carrier judgment material — the ChaosBlade
+        provider normalises the unified scope/target/action key face into
+        the same fingerprint construction safety_check's conflict query
+        consumes. Consulted via
+        :meth:`FaultProviderRegistry.build_reconcile_fingerprint` so the
+        generic scan never names a carrier-specific tool or argument key.
+        Backends outside the gate (empty ``reconcile_create_tool_names``)
+        pin ``None``."""
+        return None
+
+    async def reconcile_hold_feedback(
+        self,
+        tool_name: str,
+        fp: "RequestFingerprint",
+        hold_count: int,
+        block_limit: int,
+        kubeconfig: str = "",
+        task_id: str = "",
+    ) -> Optional[tuple[str, bool]]:
+        """Interception-time cluster probe plus hold-feedback text for a
+        held create retry this backend recognises, or ``None`` when the
+        call is not this backend's create tool.
+
+        Returns ``(feedback_text, counts_as_reconciliation)``: the text is
+        the fabricated ToolMessage body for the held create
+        (GuardFeedback semantics — reason / fix / not-a-ban — headed by
+        ``GATE_RECONCILE_BLOCKED_MARKER`` so the generic three-state scan
+        recognises it as never-executed), and the flag says whether the
+        probe COMPLETED (a completed probe reconciles: the next retry is
+        released). The probe itself — which cluster query answers "is my
+        uncertain create already in effect", and which scopes CANNOT be
+        probed (host-scope experiments record on the host's local DB, not
+        cluster CRDs) — is carrier judgment material. Consulted via
+        :meth:`FaultProviderRegistry.reconcile_hold_feedback` so the
+        generic gate never names a carrier-specific query or tool.
+        Backends outside the gate pin ``None``."""
+        return None
+
+    def reconcile_batch_held_feedback(
+        self, tool_name: str, other_tool_name: str
+    ) -> Optional[str]:
+        """Fabricated notice for the OTHER calls of a batch held back
+        together with a held create (``tool_name`` = the create that held
+        the batch; ``other_tool_name`` = the call being answered), or
+        ``None`` when ``tool_name`` is not this backend's create tool.
+
+        The text names the carrier's reconciliation tools and must carry
+        the "was NOT executed" wording so the generic three-state scan
+        treats it as never-executed (``status="error"`` is set by the
+        generic caller). Text content is carrier judgment material, hence
+        a hook rather than a generic template. Consulted via
+        :meth:`FaultProviderRegistry.reconcile_batch_held_feedback`.
+        Backends outside the gate pin ``None``."""
+        return None
+
     def scan_step_actions(
-        self, steps: list[str], messages: list
+        self, steps: list[str], messages: list, *, is_teardown=None,
     ) -> Optional[StepActionScan]:
         """OPTIONAL hook (phase-8 Form B): scan drill ``steps`` + execution
         ``messages`` with THIS backend's injection vocabulary and report the
@@ -428,7 +591,7 @@ class FaultProvider(Protocol):
         caller getattr-skips a missing hook)."""
         return None
 
-    def was_injection_attempted(self, messages: list) -> bool:
+    def was_injection_attempted(self, messages: list, *, is_teardown=None) -> bool:
         """OPTIONAL hook (phase-8 Form B): back-scan the message history for
         whether THIS backend's native injection was attempted at all (e.g.
         a mutating ``kubectl exec`` fallback after a failed experiment
@@ -443,7 +606,7 @@ class FaultProvider(Protocol):
         back-scan vocabulary never claims one."""
         return False
 
-    def issue_disproven(self, messages: list) -> bool:
+    def issue_disproven(self, messages: list, *, is_teardown=None) -> bool:
         """True when ``messages`` carry EXPLICIT counter-evidence that this
         backend's issue-time (channel A) attribution provably never committed.
 
@@ -469,6 +632,7 @@ class FaultProvider(Protocol):
 
     def was_fault_create_attempted(
         self, messages: list, injection_method: str | None = None,
+        *, is_teardown=None,
     ) -> bool:
         """Whether this backend's experiment CREATE was attempted but no live
         experiment (UID) resulted — the terminal "attempted and failed, nothing
@@ -510,6 +674,18 @@ class FaultProvider(Protocol):
         output to re-verify against). Only experiment carriers override this;
         the default ``""`` means nothing was destroyed programmatically."""
         return ""
+
+    def classify_destroy_output(self, output: str) -> "DestroyOutcome":
+        """Three-state verdict on a raw :meth:`layer1_raw_destroy` output —
+        the single destroy-decision source for every framework-side
+        consumer (the registry sweep's retire/failure fork and the
+        verify-replan retire filter both compose it, so the decision tables
+        can never drift apart again).
+
+        Only experiment carriers implement this; the default is fail-closed
+        FAILED. NOT_FOUND is the convergence-valve signal: the sweep gives
+        the carrier one status-face re-check before surfacing the UID."""
+        return DestroyOutcome.FAILED
 
     def recovery_vehicle(self, state: dict) -> str:
         """Durable recovery-vehicle locator this backend recorded at injection

@@ -237,6 +237,36 @@ def _systemd_run_payload_start(cmd: list[str]) -> int:
     return len(cmd)
 
 
+def is_systemd_run_timer(cmd: list[str]) -> bool:
+    """True when a ``systemd-run`` argv is in its self-recovery TIMER form.
+
+    SINGLE SOURCE for two consumers that must never drift:
+
+    - ToolGuard admission (:meth:`_check_systemd_run`): ``systemd-run`` is
+      admitted ONLY in this form — an ``--on-active`` delay before the
+      first positional makes the payload run at the DEADLINE, so a native
+      fault self-reverses even if the session dies; without it the payload
+      runs IMMEDIATELY (arbitrary execution wearing a whitelisted name).
+    - machinery≠mutation attribution (R23/G-7, execution_artifacts' HOST
+      face): a call in this admitted form is a timer REGISTRATION, never
+      an injection — the payload executes at the deadline, not at issue
+      time, so the issue-time attributor must not count it. Because the
+      guard rejects every other systemd-run shape BEFORE the tool runs,
+      this form verdict is also the machinery verdict by construction.
+
+    The ``--on-active`` must sit in the OPTION region (before the payload
+    start) — a payload-carried flag (``systemd-run nginx --on-active=600s``
+    hands the flag to NGINX, arming nothing) is NOT a timer.
+    """
+    if not cmd or cmd[0] != "systemd-run":
+        return False
+    payload_start = _systemd_run_payload_start(cmd)
+    return any(
+        arg == "--on-active" or arg.startswith("--on-active=")
+        for arg in cmd[1:payload_start]
+    )
+
+
 def _systemd_run_payload_tokens(cmd: list[str]) -> frozenset[str]:
     """The timer-payload tokens of a ``systemd-run`` argv.
 
@@ -429,6 +459,16 @@ class ToolGuard:
         "explain",
         "auth",
         "config",
+        # Pod creation via ``kubectl run``. Admitted for the recovery-carrier
+        # standard (openspec recovery-carrier-standard): the recovery timer
+        # host pod for API-plane faults. The verb is whitelisted HERE, but
+        # the SHAPE is narrowed by the per-subcommand guard below
+        # (``_check_kubectl_run``) — an unrestricted ``run`` is an arbitrary
+        # pod spawner the identity review cannot see: a CREATED pod's name
+        # can never match the approved identity, and the secondary net's
+        # pod entry is namespace-anchored, so an in-net non-carrier run
+        # would pass the drift gate by construction.
+        "run",
     }
 
     # ``kubectl drain`` flags that exceed a drill's blast radius, each mapped to
@@ -678,6 +718,24 @@ class ToolGuard:
                 drain_feedback = self._check_kubectl_drain(cmd)
                 if drain_feedback is not None:
                     return drain_feedback
+            if parsed.subcommand == "run":
+                run_feedback = self._check_kubectl_run(cmd)
+                if run_feedback is not None:
+                    return run_feedback
+            if parsed.subcommand == "create":
+                create_feedback = self._check_kubectl_create(cmd)
+                if create_feedback is not None:
+                    return create_feedback
+            kustomize_feedback = self._check_kubectl_kustomize(
+                cmd, parsed.subcommand
+            )
+            if kustomize_feedback is not None:
+                return kustomize_feedback
+            manifest_widening_feedback = (
+                self._check_kubectl_manifest_widening(cmd, parsed.subcommand)
+            )
+            if manifest_widening_feedback is not None:
+                return manifest_widening_feedback
 
         # 3b. Per-binary host guards for the Tier-2 / signal binaries. These
         # narrow an admitted binary down to its safe, single-target forms. Each
@@ -837,6 +895,261 @@ class ToolGuard:
             )
         return None
 
+    def _check_kubectl_run(self, cmd: list[str]) -> GuardFeedback | None:
+        """Narrow ``kubectl run`` to the recovery-carrier shape.
+
+        ``run`` is admitted for exactly one purpose (openspec
+        recovery-carrier-standard): creating the recovery timer host pod
+        for API-plane fault recovery. Any other run — arbitrary image,
+        arbitrary command, crash-loop restart policy — is an unrestricted
+        pod spawner: the identity review cannot catch it because a CREATED
+        pod's name never matches the approved identity, and the workload
+        net's pod entry is namespace-anchored, so an in-net non-carrier
+        run passes the drift gate by construction. This guard fires at
+        dispatch in EVERY phase (execute loop, recover Layer 1, direct
+        transport calls) precisely because the screener only screens some
+        of them.
+
+        The shape predicate is DELEGATED to the canonical classifier
+        (``_is_recovery_carrier_run``) rather than re-implemented here —
+        the two layers must never drift apart. Lazy import mirrors the
+        registry import above (tools → agent stays call-time only).
+
+        Returns the rejection feedback, or ``None`` when the call is the
+        carrier shape.
+        """
+        run_index = cmd.index("run")
+        args = cmd[run_index + 1:]
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _first_positional,
+            _is_recovery_carrier_run,
+            _recovery_carrier_shape_failure,
+        )
+
+        name = _first_positional(args)
+        if name and _is_recovery_carrier_run(args, name):
+            return None
+        # Diagnose the FIRST failing condition and surface it — an opaque
+        # rejection sent the executor fishing across replans (run8: an
+        # image-allowlist miss read as a target-drift attack because the
+        # real reason was not in the feedback).
+        failure = (
+            _recovery_carrier_shape_failure(args, name)
+            if name
+            else "missing the positional carrier pod name"
+        )
+        reason = (
+            "kubectl run is admitted only in the recovery-carrier "
+            "shape (timer-host pod for API-plane fault recovery)"
+        )
+        if failure:
+            reason += f" — failed condition: {failure}"
+        return GuardFeedback(
+            allowed=False,
+            constraint=ViolatedConstraint.UNSUPPORTED_FORM,
+            reason=reason,
+            offending="run",
+            # NOT a hard floor: reshaping the call to the carrier skeleton
+            # makes the same intent legal.
+            compliant_form=(
+                "kubectl run <drill-rc-<hash>> -n <ns> --image=busybox:1.36 "
+                "--restart=Never --command -- sleep <N> (see "
+                "references/carrier/recovery-carrier.md; --overrides admits "
+                "spec.serviceAccountName only; any healthy-DaemonSet image "
+                "auto-discovered at task start is also allowed)"
+            ),
+        )
+
+    def _check_kubectl_create(self, cmd: list[str]) -> GuardFeedback | None:
+        """Ban imperative ``kubectl create KIND`` for workload kinds.
+
+        Imperative create (no ``-f``) that names a workload kind starts
+        containers whose shape no contract can verify: there is no
+        manifest for the drill-target checks (image allow-set, single
+        container, no privilege surface) to inspect, and nothing
+        registers the created workload on the cleanup chain. Unlike
+        ``run`` — which has the recovery-carrier carve-out — no imperative
+        workload create has a compliant form; the manifest channel
+        (``kubectl apply -f -`` with stdin_data) is the only admitted
+        staging path.
+
+        The kind predicate is DELEGATED to the canonical classifier
+        (``_imperative_workload_create_kind``) rather than re-implemented
+        — the dispatcher's ``sub == "create"`` branch bans the same kinds
+        on the screener path, and the two layers must never drift apart.
+        Like ``_check_kubectl_run`` this fires at dispatch in EVERY phase
+        (execute loop, recover Layer 1, direct transport calls) precisely
+        because the screener only screens some of them.
+
+        Returns the rejection feedback, or ``None`` for manifest-channel
+        creates (``-f`` / ``--filename``) and non-workload kinds.
+        """
+        create_index = cmd.index("create")
+        args = cmd[create_index + 1:]
+        # Manifest-channel creates carry their own contract (the
+        # drill-target Deployment checks run at classification time);
+        # this guard polices only the imperative form. Filename detection
+        # is DELEGATED to the classifier's pflag-normalised predicate
+        # (``_uses_file_input``) so bundled spellings (``-Af -`` — boolean
+        # A + f absorbing the next token as stdin) count as manifest
+        # creates too, matching what kubectl actually parses (round-5
+        # probe: the token-level check let all three -Af forms through).
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _uses_file_input,
+        )
+
+        if _uses_file_input(args):
+            return None
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _imperative_workload_create_kind,
+        )
+
+        kind = _imperative_workload_create_kind(args)
+        if kind is None:
+            return None
+        return GuardFeedback(
+            allowed=False,
+            constraint=ViolatedConstraint.UNSUPPORTED_FORM,
+            reason=(
+                f"imperative 'kubectl create {kind}' starts a {kind} whose "
+                "shape the guard cannot verify (image, command, lifetime) "
+                "and whose cleanup the task cannot track"
+            ),
+            offending=kind,
+            # NOT a hard floor: staging a drill target stays expressible
+            # through the manifest channel, so this points at the
+            # compliant mechanism instead of walling off the intent.
+            compliant_form=(
+                "Stage the drill target via the manifest channel: "
+                "'kubectl apply -f -' with stdin_data under the "
+                "drill-target contract (single Deployment document, "
+                "metadata.name = the approved target name, exactly one "
+                "container under spec.template.spec with no "
+                "initContainers, no host*/privileged/capabilities/"
+                "hostPath, an image from the carrier allow-set, "
+                "persistentVolumeClaim/configMap/secret volumes only) — "
+                "or inject into a workload that already exists."
+            ),
+        )
+
+    def _check_kubectl_kustomize(
+        self, cmd: list[str], sub: str,
+    ) -> GuardFeedback | None:
+        """Ban the kustomize input channel on mutating subcommands.
+
+        ``kubectl apply -k <dir>`` builds the manifests from a
+        directory the guard cannot see (live probe, kubectl v1.34.1:
+        apply/delete/replace/create all execute the built objects) —
+        the same invisibility class as ``-f <file>``, which the
+        classifier already bans. The screener's classifier face now
+        refuses it too, but this gate fires at dispatch in EVERY phase
+        (recover Layer 1, direct transport calls) — the same
+        every-phase discipline as ``_check_kubectl_manifest_widening``.
+
+        The predicate is DELEGATED to the canonical classifier
+        (``_uses_kustomize_input``) so bundled (``-Rk``), glued
+        (``-k=dir``) and long (``--kustomize dir``) spellings share one
+        parser between the layers. Read-only ``-k`` calls (``get -k``)
+        stay outside: this check admits only the mutating -f subs.
+        """
+        if sub not in (
+            "apply", "create", "replace", "patch", "delete", "set", "edit",
+        ):
+            return None
+        sub_index = cmd.index(sub)
+        args = cmd[sub_index + 1:]
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _uses_kustomize_input,
+        )
+
+        if not _uses_kustomize_input(args):
+            return None
+        return GuardFeedback(
+            allowed=False,
+            constraint=ViolatedConstraint.UNSUPPORTED_FORM,
+            reason=(
+                "kubectl -k builds manifests from a kustomization DIRECTORY "
+                "whose contents are not visible to the guard — the same "
+                "invisibility class as '-f <file>' (probe: apply/delete/"
+                "replace/create all execute the built objects)"
+            ),
+            offending="-k",
+            compliant_form=(
+                "Render the kustomization locally (kubectl kustomize <dir>) "
+                "and pass the resulting manifest via stdin_data with "
+                "'-f -'."
+            ),
+        )
+
+    def _check_kubectl_manifest_widening(
+        self, cmd: list[str], sub: str,
+    ) -> GuardFeedback | None:
+        """Ban range-widening flags on the stdin-manifest channel.
+
+        ``apply --prune -f -`` deletes live resources absent from the
+        manifest; ``--all`` / ``-A`` widen the operand set. The guard's
+        visibility boundary IS the manifest text, so the flag-driven
+        part bypasses every identity anchor — the same class of gap
+        ``_check_kubectl_create`` closes for the imperative form, found
+        by the same third-round review: the screener's classifier bans
+        these flags at the shared manifest entry, but the screener only
+        screens the ReAct loop, while this gate fires at dispatch in
+        EVERY phase (recover Layer 1, direct transport calls).
+
+        The flag predicate is DELEGATED to the canonical classifier
+        (``_stdin_manifest_widening_flag``) so the two layers can never
+        drift apart — including the combined-shorthand forms (``-An``).
+
+        Returns the rejection feedback, or ``None`` for manifest calls
+        without a widening flag and for non-manifest subcommands
+        (``get pods -A`` stays a read-only call).
+        """
+        if sub not in (
+            "apply", "create", "replace", "patch", "delete", "set", "edit",
+        ):
+            return None
+        sub_index = cmd.index(sub)
+        args = cmd[sub_index + 1:]
+        # Filename detection is DELEGATED to the classifier's
+        # pflag-normalised predicate (``_uses_file_input``) — same single
+        # source as the classifier's own manifest-entry decision, so a
+        # bundled spelling (``-Af -``) is a manifest call HERE too
+        # (round-5 probe: the token-level check let ``delete -Af -``
+        # through the every-phase backstop while the classifier face
+        # already banned it — the two layers must share one parser).
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _uses_file_input,
+        )
+
+        if not _uses_file_input(args):
+            return None
+        from chaos_agent.agent.providers.k8s_native.classifier import (
+            _stdin_manifest_widening_flag,
+        )
+
+        widening = _stdin_manifest_widening_flag(args)
+        if not widening:
+            return None
+        return GuardFeedback(
+            allowed=False,
+            constraint=ViolatedConstraint.UNSUPPORTED_FORM,
+            reason=(
+                f"'{widening}' widens the call's effect beyond the manifest "
+                "text (--prune deletes live resources absent from the "
+                "manifest; --all / -A widen the operand set), and the guard "
+                "can only see the manifest — the flag-driven part would "
+                "bypass every identity anchor"
+            ),
+            offending=widening,
+            # NOT a hard floor: the compliant form exists (drop the flag,
+            # re-send the same manifest).
+            compliant_form=(
+                "Re-issue the call WITHOUT the flag, applying the manifest "
+                "text as-is; deleting pre-existing resources is a "
+                "separate, individually-approved call."
+            ),
+        )
+
     def _check_systemctl(self, cmd: list[str]) -> GuardFeedback | None:
         """Allow only service-level systemctl verbs; reject machine/boot ones.
 
@@ -902,10 +1215,10 @@ class ToolGuard:
         "not whitelisted" binaries (timer-payload readmission hole).
         """
         payload_start = _systemd_run_payload_start(cmd)
-        armed = any(
-            arg == "--on-active" or arg.startswith("--on-active=")
-            for arg in cmd[1:payload_start]
-        )
+        # The armed check is shared with the machinery≠mutation attributor
+        # via the module-level single source ``is_systemd_run_timer``
+        # (R23/G-7) — admission here and exemption there are ONE verdict.
+        armed = is_systemd_run_timer(cmd)
         if not armed:
             return GuardFeedback(
                 allowed=False,
@@ -977,6 +1290,17 @@ class ToolGuard:
         ``--command`` value of ``wiz task exec`` — reached execution meeting
         neither. This is the hole-class fix: the region passes the SAME
         admission judgment a directly-executed command would.
+
+        Coverage is exactly those two carriers, by design: both payload
+        regions execute OUTSIDE the k8s target model — on the host (timer)
+        or on a remote host (``wiz`` task exec) — where ``approved_target``
+        has no jurisdiction and this grammar is the only line of defence.
+        ``kubectl exec … -- sh -c '<script>'`` is deliberately NOT in this
+        hole class: its payload lands inside a k8s object (the target
+        container) — ``target_guard``'s jurisdiction — and exec into a
+        container is the product's own injection surface, not a bypass of
+        it. That container-region exemption is a documented trust boundary
+        from the hole-class inventory (8e34b2b7), not an unpatched position.
 
         Two shapes, mirroring how the region reaches the target:
           argv form    ``… rm -f /tmp/x.log`` — the region IS an argv; its
@@ -1614,8 +1938,19 @@ class ToolGuard:
         cmd: list[str],
         result: CommandResult,
         task_id: str = "",
+        *,
+        transient_retries: int = 0,
     ) -> None:
-        """Record an execution audit log entry."""
+        """Record an execution audit log entry.
+
+        ``transient_retries`` (O1): how many transport-level transient
+        dispatch retries preceded this FINAL result. Zero retries keep the
+        entry shape unchanged; a non-zero count is added as its own key so
+        downstream frequency statistics (how often a channel blips) can
+        group on the audit trail instead of under-counting — the retries
+        themselves leave no other record (one guard pass, one audit entry
+        by design; the mid-loop warnings are log-only).
+        """
         log_entry = {
             "timestamp": now_iso(),
             "task_id": task_id,
@@ -1623,4 +1958,6 @@ class ToolGuard:
             "exit_code": result.exit_code,
             "duration_ms": round(result.duration_ms, 1),
         }
+        if transient_retries:
+            log_entry["transient_retries"] = transient_retries
         logger.info(json.dumps(log_entry, ensure_ascii=False))

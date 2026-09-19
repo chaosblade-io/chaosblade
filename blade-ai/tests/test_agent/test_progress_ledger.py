@@ -21,8 +21,11 @@ from langgraph.graph.message import add_messages
 from chaos_agent.agent.progress_ledger import (
     LOG_CAP,
     build_ledger_prompt_section,
+    build_ledger_tail_content,
     freeze_anchor,
+    merge_ledger_channel,
     merge_progress_ledger,
+    reconcile_anchor_spec,
     render_ledger,
 )
 
@@ -36,7 +39,12 @@ class _LedgerState(TypedDict):
     # Module-level so langgraph can resolve the annotation lazily (a nested
     # class under ``from __future__ import annotations`` cannot see the reducer).
     messages: Annotated[list, add_messages]
-    progress_ledger: dict
+    # Same channel wiring as the fixed AgentState/IntentState: the ledger is a
+    # reducer channel, not a bare LastValue field. Type ``dict`` (not Optional)
+    # so the channel seeds empty and the FIRST write runs the reducer too
+    # (an Optional[dict] annotation leaves the channel MISSING and the first
+    # write bypasses the reducer — direct store).
+    progress_ledger: Annotated[dict, merge_ledger_channel]
 
 
 # ── Merge semantics (the heart of the ledger) ──────────────────────────
@@ -47,6 +55,62 @@ def test_freeze_anchor_captures_goal_and_spec_with_empty_state_log():
     assert led["anchor"]["fault_spec"] == _SPEC
     assert led["state"] == {}
     assert led["log"] == []
+
+
+# ── Anchor spec reconciliation (cascade review C2, plan-A) ────────────
+
+def test_reconcile_drifted_spec_refreezes_spec_side_only():
+    """A drifted anchor spec re-freezes to the CURRENT contract — field
+    level: goal, state, log and every other anchor field ride through
+    verbatim (the drift-correction lesson: a full rebuild silently drops
+    what it didn't know to carry)."""
+    led = freeze_anchor(_SPEC, goal="演练")
+    led = merge_progress_ledger(
+        led, state_update={"phase": "executing"},
+        log_append=[{"event": "probed", "status": "observed"}],
+    )
+    led["anchor"]["extra_anchor_field"] = "keep-me"  # e.g. a future anchor field
+
+    new_spec = {**_SPEC, "fault_action": "delay", "revision": 4}
+    out = reconcile_anchor_spec(led, new_spec)
+
+    assert out is not None
+    assert out["anchor"]["fault_spec"] == new_spec
+    assert out["anchor"]["goal"] == "演练"
+    assert out["anchor"]["extra_anchor_field"] == "keep-me"
+    assert out["state"]["phase"] == "executing"
+    assert [e["event"] for e in out["log"]] == ["probed"]
+    # Pure: the input ledger is untouched.
+    assert led["anchor"]["fault_spec"] == _SPEC
+
+
+def test_reconcile_equal_spec_writes_nothing():
+    """The healthy steady state — no write, so the turn's result stays free
+    of a needless ledger override racing the model's update_progress."""
+    led = freeze_anchor(_SPEC, goal="g")
+    assert reconcile_anchor_spec(led, _SPEC) is None
+    assert reconcile_anchor_spec(led, dict(_SPEC)) is None
+
+
+def test_reconcile_intent_stage_and_malformed_shapes_are_inert():
+    """No anchor / goal-only anchor / absent-or-empty spec / ill-shaped
+    ledger → None: the lazy seeding owns freezing the first anchor;
+    reconciliation owns only keeping an EXISTING frozen spec current."""
+    # No ledger at all.
+    assert reconcile_anchor_spec(None, _SPEC) is None
+    # Goal-only anchor (intent-stage shape).
+    assert reconcile_anchor_spec({"anchor": {"goal": "g"}, "state": {}, "log": []}, _SPEC) is None
+    # Malformed spec value in the anchor.
+    assert reconcile_anchor_spec(
+        {"anchor": {"goal": "g", "fault_spec": "oops"}, "state": {}, "log": []},
+        _SPEC,
+    ) is None
+    # Absent / empty current spec (nothing to realign to).
+    led = freeze_anchor(_SPEC, goal="g")
+    assert reconcile_anchor_spec(led, None) is None
+    assert reconcile_anchor_spec(led, {}) is None
+    # Ill-shaped ledger.
+    assert reconcile_anchor_spec("oops", _SPEC) is None
 
 
 def test_state_is_overwritten_and_log_is_appended():
@@ -345,6 +409,12 @@ def test_state_layer_is_bounded_so_re_injection_stays_cheap():
 
 
 def test_rendered_ledger_has_a_hard_ceiling():
+    """truncation-debt-cleanup (3.3): the render backstop speaks the shared
+    dialect — both-ends preview (the HEAD carries the immutable ANCHOR, the
+    TAIL the most recent milestones — both drift-critical) + quantified
+    elision marker + a state-evidence notice pointing at the lossless
+    state.progress_ledger. Total stays ~2600 chars ≈ 1300 CJK tokens, inside
+    the <1.5k-token design budget the cap exists to enforce."""
     from chaos_agent.agent.progress_ledger import RENDER_CHAR_CAP
 
     led = merge_progress_ledger(
@@ -354,8 +424,19 @@ def test_rendered_ledger_has_a_hard_ceiling():
         log_append=[{"event": "E" * 900, "status": "observed"}] * 90,
     )
     body = render_ledger(led)
-    assert len(body) <= RENDER_CHAR_CAP + 32     # + truncation marker
-    assert "truncated" in body
+    # Hard ceiling + marker + notice width (head 1800 + tail 600 + ~180).
+    assert len(body) <= RENDER_CHAR_CAP + 200
+    # Quantified elision marker + three-field state-evidence notice.
+    assert "chars elided" in body
+    assert "⚠️ TRUNCATED (state evidence):" in body
+    assert "(original " in body and " characters)." in body
+    assert "state.progress_ledger" in body
+    # Both ends survive: the ANCHOR headline at the head, the log block
+    # (most recent milestones) at the tail. The old head-only
+    # "…(ledger truncated)" dialect is gone.
+    assert "Goal (ANCHOR, immutable):" in body
+    assert "Progress log (how we got here):" in body
+    assert "ledger truncated" not in body
 
 
 def test_normal_sized_ledger_is_never_truncated():
@@ -391,6 +472,57 @@ def test_prompt_section_carries_anchor_state_log_and_directive():
     assert "注入30%丢包" in section
     assert "pod p0 Running" in section
     assert "[verified] 已注入" in section
+
+
+# ── Unit A (context-cache-prefix-stability task 2.7): tail-content parity ──
+
+def test_tail_content_is_supersedes_plus_identical_head_section():
+    """The message-tail ledger content is byte-identical to the section that used
+    to render in each phase's system-prompt head, with the D2 supersedes marker
+    prepended. This pins migration invariance: moving the ledger from head to
+    tail changed WHERE it rides, not WHAT the model sees — the rendered body
+    (anchor / state / log / anti-drift directive) is unchanged, so per-round
+    visibility matches the pre-migration form.
+    """
+    from chaos_agent.agent.progress_ledger import _LEDGER_SUPERSEDES
+
+    led = merge_progress_ledger(
+        freeze_anchor(_SPEC, goal="注入30%丢包"),
+        state_update={"phase": "executing", "established_facts": ["pod p0 Running"]},
+        log_append=[{"event": "已注入", "status": "verified"}],
+    )
+    tail = build_ledger_tail_content(led)
+    head_section = build_ledger_prompt_section(led)
+
+    # Exactly: supersedes marker + blank line + the SAME head section body.
+    assert tail == f"{_LEDGER_SUPERSEDES}\n\n{head_section}"
+    # D2 supersedes semantics present; anti-drift directive + full content intact.
+    assert "supersedes" in tail
+    assert "update_progress" in tail          # _LEDGER_DIRECTIVE survives the move
+    assert "注入30%丢包" in tail
+    assert "pod p0 Running" in tail
+    assert "[verified] 已注入" in tail
+
+
+def test_tail_content_empty_for_empty_ledger():
+    """No ledger → no tail message (the append is suppressed, not an empty stub)."""
+    assert build_ledger_tail_content(None) == ""
+    assert build_ledger_tail_content({"anchor": {}, "state": {}, "log": []}) == ""
+
+
+def test_tail_content_no_anchor_uses_no_anchor_directive():
+    """Planning freezes no anchor, so the tail renders the no-anchor directive
+    variant ("do not re-derive what is already established") — the wording the
+    plan phase relies on — while still carrying the supersedes marker."""
+    led = merge_progress_ledger(
+        {},
+        log_append=[{"event": "plan step done", "status": "verified"}],
+    )
+    tail = build_ledger_tail_content(led)
+    assert "supersedes" in tail
+    assert "do not re-derive what is already established" in tail
+    # The anchored variant's vocabulary must NOT leak into a no-anchor ledger.
+    assert "immutable ANCHOR" not in tail
 
 
 # ── Tool write path (through a real ToolNode) ──────────────────────────
@@ -511,6 +643,125 @@ def test_a_genuine_type_error_is_still_reported(raw):
         })
 
 
+# ── Channel reducer (Case #46: concurrent ledger writes) ──────────────
+#
+# Task inject-357401b8: the executor model batched update_progress +
+# finish_execution in ONE turn; both Commands wrote the bare LastValue
+# `progress_ledger` channel in the same super-step (InvalidUpdateError: Can
+# receive only one value per step), the graph died mid-execute, the
+# auto-rollback failed the same way, and the cleanup chain never ran — the
+# self-built target stayed deployed. The reducer channel (delta form from
+# the tools, snapshot form from nodes/inputs) makes concurrent writes legal.
+
+def test_channel_reducer_applies_delta_over_snapshot():
+    led = freeze_anchor(_SPEC, goal="g")
+    led = merge_progress_ledger(
+        led, state_update={"phase": "executing"},
+        log_append=[{"event": "a", "status": "observed"}],
+    )
+    out = merge_ledger_channel(led, {
+        "state_update": {"current_step": "s2"},
+        "log_append": [{"event": "b", "status": "verified"}],
+    })
+    assert out["state"]["phase"] == "executing"       # kept
+    assert out["state"]["current_step"] == "s2"       # applied
+    assert [e["event"] for e in out["log"]] == ["a", "b"]
+    assert out["anchor"]["goal"] == "g"               # anchor untouched
+
+
+def test_channel_reducer_folds_two_deltas_sequentially():
+    """reduce(reduce(base, δ₁), δ₂) — both patches land, later state keys win,
+    both log tails append. This is the exact fold LangGraph performs when a
+    model batches two ledger writes in one turn."""
+    base = freeze_anchor(_SPEC, goal="g")
+    d1 = {"state_update": {"current_step": "ALL STEPS ISSUED"},
+          "log_append": [{"event": "receipt ok", "status": "verified"}]}
+    d2 = {"state_update": {"phase": "execution-complete"},
+          "log_append": [{"event": "declared complete", "status": "observed"}]}
+    out = merge_ledger_channel(merge_ledger_channel(base, d1), d2)
+    assert out["state"]["current_step"] == "ALL STEPS ISSUED"
+    assert out["state"]["phase"] == "execution-complete"
+    assert [e["event"] for e in out["log"]] == ["receipt ok", "declared complete"]
+    assert out["anchor"]["goal"] == "g"
+
+
+def test_channel_reducer_replaces_on_snapshot_form():
+    """Node returns and graph inputs submit authoritative wholes — replace,
+    not merge (a stale snapshot write must not partially mix into the stored
+    ledger)."""
+    led = freeze_anchor(_SPEC, goal="new")
+    out = merge_ledger_channel({"anchor": {"goal": "old"}, "state": {}, "log": []}, led)
+    assert out == led
+
+
+def test_channel_reducer_none_write_is_a_reset():
+    """An explicit None write (intent_confirm's cleared ledger, lifecycle
+    resets) clears the channel — it is a write, not a no-op."""
+    led = freeze_anchor(_SPEC, goal="g")
+    assert merge_ledger_channel(led, None) is None
+    # And a delta applied over None starts fresh (first write after a reset).
+    out = merge_ledger_channel(None, {"state_update": {"phase": "executing"}})
+    assert out["state"]["phase"] == "executing"
+
+
+def test_channel_reducer_passes_malformed_writes_through():
+    led = freeze_anchor(_SPEC, goal="g")
+    # A non-dict write neither crashes nor erases the good ledger.
+    assert merge_ledger_channel(led, "garbage") == "garbage"
+
+
+@pytest.mark.asyncio
+async def test_batched_update_progress_and_finish_execution_survive_one_turn():
+    """THE Case #46 regression: both ledger tools called in ONE AIMessage
+    turn through a real ToolNode — the step must complete and the folded
+    ledger must carry BOTH patches (the pre-fix graph died with
+    InvalidUpdateError and the failed rollback skipped the cleanup chain)."""
+    from langchain_core.messages import AIMessage
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.prebuilt import ToolNode
+
+    from chaos_agent.tools.progress import finish_execution, update_progress
+
+    builder = StateGraph(_LedgerState)
+    builder.add_node("t", ToolNode([update_progress, finish_execution]))
+    builder.add_edge(START, "t")
+    builder.add_edge("t", END)
+    app = builder.compile(checkpointer=MemorySaver())
+
+    led0 = merge_progress_ledger(
+        freeze_anchor(_SPEC, goal="memload drill"),
+        state_update={"phase": "executing", "current_step": "step4"},
+        log_append=[{"event": "baseline measured", "status": "verified"}],
+    )
+    call = AIMessage(content="", tool_calls=[
+        {"name": "update_progress", "id": "c1", "args": {
+            "state_update": {"current_step": "ALL STEPS ISSUED"},
+            "log_append": [{"event": "receipt: pct=80 failcnt=0",
+                            "status": "verified"}],
+        }},
+        {"name": "finish_execution", "id": "c2", "args": {
+            "summary": "memory pressure injected at 80% of limit",
+        }},
+    ])
+    out = await app.ainvoke(
+        {"messages": [call], "progress_ledger": led0},
+        {"configurable": {"thread_id": "t-batch"}},
+    )
+    led = out["progress_ledger"]
+    # The turn survived; the fold applied both patches in emission order.
+    assert led["state"]["current_step"] == "ALL STEPS ISSUED"
+    assert led["state"]["phase"] == "execution-complete"
+    assert [e["event"] for e in led["log"]] == [
+        "baseline measured",
+        "receipt: pct=80 failcnt=0",
+        "execution declared complete: memory pressure injected at 80% of limit",
+    ]
+    assert led["anchor"]["goal"] == "memload drill"
+    # Both tool calls got their ToolMessage (no dangling pairing).
+    assert len(out["messages"]) == 3
+
+
 # ── Guard classification ───────────────────────────────────────────────
 
 def test_update_progress_is_classified_readonly_not_an_injection():
@@ -618,27 +869,41 @@ def _ledger_with_content():
     )
 
 
-def test_full_prompt_planning_renders_ledger_section():
+def test_full_prompt_planning_head_omits_ledger():
+    # Unit A (context-cache-prefix-stability task 2.6): the planning ledger moved
+    # OUT of the FULL system prompt head onto the message tail (see agent_loop.py's
+    # append-only channel). The head must no longer carry the ledger content, so
+    # the cached [system][tools] prefix stays byte-stable across planning rounds.
     from chaos_agent.agent.prompts import PromptMode, build_system_prompt
 
     p = build_system_prompt(
         PromptMode.FULL, skill_catalog="", input_is_nl=True,
         progress_ledger_section=build_ledger_prompt_section(_ledger_with_content()),
     )
-    assert "update_progress" in p and "pod p0 Running" in p
+    assert "pod p0 Running" not in p
 
 
-def test_verification_prompt_renders_ledger_section():
+def test_verification_prompt_head_omits_ledger():
+    # Unit A (context-cache-prefix-stability task 2.4): the verify ledger moved
+    # OUT of the VERIFICATION system prompt head onto the message tail (see
+    # verifier.py's append-only channel). The head must no longer carry the
+    # ledger content, so the cached [system][tools] prefix stays byte-stable
+    # across verify rounds.
     from chaos_agent.agent.prompts import PromptMode, build_system_prompt
 
     p = build_system_prompt(
         PromptMode.VERIFICATION,
         progress_ledger_section=build_ledger_prompt_section(_ledger_with_content()),
     )
-    assert "update_progress" in p and "pod p0 Running" in p
+    assert "pod p0 Running" not in p
 
 
-def test_recover_verifier_prompt_renders_ledger_section():
+def test_recover_verifier_prompt_head_omits_ledger():
+    # Unit A (context-cache-prefix-stability task 2.5): the recover ledger moved
+    # OUT of the recover verifier system prompt head onto the message tail (see
+    # _recover_verifier_loop.py's append-only channel). The head must no longer
+    # carry the ledger content, so the cached [system][tools] prefix stays
+    # byte-stable across recover rounds.
     from chaos_agent.agent.prompts.sections.recovery import (
         build_recover_verifier_system_prompt,
     )
@@ -646,7 +911,7 @@ def test_recover_verifier_prompt_renders_ledger_section():
     p = build_recover_verifier_system_prompt(
         ledger_section=build_ledger_prompt_section(_ledger_with_content()),
     )
-    assert "update_progress" in p and "pod p0 Running" in p
+    assert "pod p0 Running" not in p
 
 
 def test_all_three_prompts_omit_ledger_when_empty():
@@ -667,10 +932,16 @@ def test_all_three_prompts_omit_ledger_when_empty():
 
 
 def test_ledger_survives_a_prompt_budget_squeeze():
-    # The ledger is assembled as a CONTRACT, not optional context: under a tight
-    # budget the assembler drops "context"/"optional" segments, and a dropped
-    # ledger would silently remove both the model's own anti-drift anchor and the
-    # only record an interrupted turn could report.
+    # The ledger is NO LONGER a prompt section in EITHER long-loop head. Unit A
+    # (context-cache-prefix-stability tasks 2.1 / 2.6) moved the EXECUTE ledger
+    # (PromptMode.MINIMAL) and the PLANNING ledger (PromptMode.FULL) onto the
+    # message tail, where the budget assembler cannot touch it — under a tight
+    # budget the assembler drops "context"/"optional"/even "contract" segments,
+    # but a tail message is immune to the squeeze by construction, which is
+    # strictly stronger than the old "contract" guarantee. A dropped ledger would
+    # have silently removed both the model's own anti-drift anchor and the only
+    # record an interrupted turn could report; the tail move makes that
+    # impossible. So this guard now pins: NEITHER head carries the ledger.
     from chaos_agent.agent.prompts import PromptMode, build_system_prompt
 
     led = merge_progress_ledger(
@@ -689,8 +960,9 @@ def test_ledger_survives_a_prompt_budget_squeeze():
         PromptMode.FULL, skill_catalog=huge, input_is_nl=True,
         progress_ledger_section=section,
     )
-    assert "LEDGER-MARK injected" in execute
-    assert "LEDGER-MARK injected" in planning
+    # Neither head carries the ledger (both ride the tail now).
+    assert "LEDGER-MARK injected" not in execute
+    assert "LEDGER-MARK injected" not in planning
 
 
 # ── Phase 2: ONE combined operation record ─────────────────────────────

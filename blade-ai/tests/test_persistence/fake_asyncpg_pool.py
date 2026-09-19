@@ -110,7 +110,10 @@ class FakeConn:
         s = sql.strip()
         if s.startswith("SELECT COUNT(*)"):
             return [FakeRecord({"count": self._count(s, args)})]
-        if "FROM tasks t" in s and "LEFT JOIN task_details" in s:
+        # Round-32: select_active_tasks dropped the LEFT JOIN (the predicate
+        # moved onto tasks.liability_live), so dispatch on the t-alias shape —
+        # it is the only fetch in the backend using "FROM tasks t".
+        if "FROM tasks t" in s:
             return self._select_active(s, args)
         if s.startswith("SELECT * FROM task_details WHERE task_id IN"):
             return self._select_details_batch(s, args)
@@ -155,6 +158,31 @@ class FakeConn:
                     row["injection_start_time"] = (
                         (task_row or {}).get("gmt_create") or row.get("gmt_create")
                     )
+        # Round-32: the liability_live migration backfills inside the same
+        # transaction (cleared-word fallback + issued-intent evidence);
+        # reproduce its semantics, mirroring injection_start_time above, so
+        # legacy already-blinded rows are observably re-admitted in tests.
+        if table == "tasks" and col == "liability_live":
+            from chaos_agent.agent.state import TASK_STATE_CLEARED_VALUES
+
+            details = self._db.tables.get("task_details", {})
+            for row in self._db.tables.get("tasks", {}).values():
+                # ALTER ADD COLUMN … DEFAULT 0 materialises 0 on every
+                # pre-existing row in real PG; then the one-shot backfill
+                # re-admits issued-but-uncleared rows.
+                row.setdefault("liability_live", 0)
+                if row["liability_live"] == 1:
+                    continue
+                if row.get("task_state") in TASK_STATE_CLEARED_VALUES:
+                    continue
+                d = details.get(row.get("task_id"))
+                if d is None:
+                    continue
+                if d.get("target") is None and d.get("fault_spec") is None:
+                    continue
+                if d.get("injection_start_time") is None:
+                    continue
+                row["liability_live"] = 1
         return "ALTER TABLE"
 
     def _insert(self, s: str, args: tuple) -> str:
@@ -239,24 +267,24 @@ class FakeConn:
         return len(rows)
 
     def _select_active(self, s: str, args: tuple) -> list[FakeRecord]:
-        # Replicates the select_active_tasks criteria, including the
-        # positional filter params appended in tenant/namespace/target order.
-        details = self._db.tables.get("task_details", {})
+        # Round-32: replicates the select_active_tasks criteria — the
+        # materialised liability verdict column (tasks.liability_live,
+        # written by TaskStore.upsert / update_task_state via
+        # may_carry_live_fault), including the positional filter params
+        # appended in tenant/namespace/target order. The word-vs-liability
+        # semantics (never-issued ghosts, unverified fail-closed, K1/K2
+        # blinded words) live one layer up in task_store.py — the backend
+        # is a pure column-filter here, and so is this fake.
         out = []
         for row in self._db.tables.get("tasks", {}).values():
-            if row.get("task_state") not in ("injecting", "injected"):
-                continue
-            d = details.get(row.get("task_id"))
-            if d is None:
-                continue
-            if d.get("target") is None and d.get("fault_spec") is None:
-                continue
-            if d.get("injection_start_time") is None:
+            if row.get("liability_live") != 1:
                 continue
             out.append(row)
         # Positional filters in the exact order the backend appends them
+        # (tenant_id → workspace_id → namespace → target_name; the workspace
+        # axis slots in right after tenant per the 方案 A contract)
         idx = 0
-        for field in ("tenant_id", "namespace", "target_name"):
+        for field in ("tenant_id", "workspace_id", "namespace", "target_name"):
             if f"t.{field} = $" in s:
                 out = [r for r in out if r.get(field) == args[idx]]
                 idx += 1

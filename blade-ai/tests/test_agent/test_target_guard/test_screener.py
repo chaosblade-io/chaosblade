@@ -19,6 +19,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from chaos_agent.agent.nodes.planning.tool_screener import (
+    SCREENER_ROUTE_FAIL,
     SCREENER_ROUTE_PASS,
     SCREENER_ROUTE_REPLAN,
     SCREENER_ROUTE_RETRY,
@@ -40,6 +41,8 @@ from chaos_agent.agent.target_guard.carriers import (
     is_host_carrier_call,
     _parse_host_exec,
 )
+from chaos_agent.agent.target_guard.mechanism_writes import MechanismWriteEntry
+from chaos_agent.agent.providers.registry import FaultProviderRegistry
 from chaos_agent.config.settings import settings
 
 
@@ -54,10 +57,12 @@ def _reset_settings():
     orig_enforce = settings.target_guard_enforcing
     orig_skill = settings.skill_script_default_allow
     orig_ttl = settings.carrier_liveness_ttl_seconds
+    orig_faultdrill = settings.faultdrill_enabled
     yield
     settings.target_guard_enforcing = orig_enforce
     settings.skill_script_default_allow = orig_skill
     settings.carrier_liveness_ttl_seconds = orig_ttl
+    settings.faultdrill_enabled = orig_faultdrill
 
 
 def _approved_pod_a_in_ns():
@@ -336,6 +341,117 @@ class TestEnforcingAllow:
         delta = await tool_screener(state)
         assert delta["screener_route"] == SCREENER_ROUTE_RETRY
         assert "REJECT_BANNED" in delta["messages"][0].content
+
+    @pytest.mark.asyncio
+    async def test_compound_escape_payload_is_banned_for_approved_pod(self):
+        # R26/G-10 end-to-end tooth: the exec target IS the approved
+        # pod, so identity drift cannot fire — the ONLY thing standing
+        # between the compound payload and a full pass is the escape
+        # legislation. Pre-fix probe (live, this repo): every direct /
+        # wrapped escape form → REJECT_BANNED, while the compound form
+        # (readonly head + escape primitive past the ``;``) sailed
+        # through with route=pass — the head-only peek never saw the
+        # nsenter, the payload classified as a plain pod mutation, and
+        # the identity match passed it. Segment-level escape detection
+        # must route it into carrier resolution, where the unregistered
+        # approved pod fails closed.
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [_ai_with_tool_call("kubectl", {
+                "subcommand": "exec",
+                "v_args": (
+                    "pod-a -n ns -- "
+                    "sh -c 'cat /etc/hosts; nsenter -t 1 -m sh'"
+                ),
+            })],
+            "approved_target": _approved_pod_a_in_ns(),
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "REJECT_BANNED" in delta["messages"][0].content
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "v_args",
+        [
+            "pod-a -n ns -- sh -c 'blade destroy aa11bb22cc33dd44; $(nsenter -t 1 -m sh)'",
+            "pod-a -n ns -- sh -c 'cat /etc/hosts; (nsenter -t 1 -m sh)'",
+            "pod-a -n ns -- sh -c 'cat /etc/hosts; \"$(nsenter -t 1 -m sh)\"'",
+            "pod-a -n ns -- sh -c 'case x in a) nsenter -t 1 -m sh;; esac'",
+        ],
+        ids=["cmdsub-tail", "subshell", "dq-wrapped", "case-branch"],
+    )
+    async def test_structure_hidden_escape_payload_is_banned(self, v_args):
+        # R33/G-12 end-to-end tooth: same approved-pod identity-match
+        # setup as the G-10 tooth above, but the escape primitive rides
+        # a shell STRUCTURE (command substitution / subshell / double-
+        # quoted substitution) instead of a bare ';'. Pre-fix probe
+        # (live): all forms passed end-to-end — the splitter's six-
+        # separator vocabulary never produced a primitive-headed
+        # segment, so the escape legislation never fired.
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [_ai_with_tool_call("kubectl", {
+                "subcommand": "exec", "v_args": v_args,
+            })],
+            "approved_target": _approved_pod_a_in_ns(),
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY, (
+            "an escape primitive hidden in a shell structure must reach "
+            "the same REJECT_BANNED as one past a bare ';'"
+        )
+        assert "REJECT_BANNED" in delta["messages"][0].content
+
+    @pytest.mark.asyncio
+    async def test_arg_tail_escape_parameter_text_is_not_rejected(self):
+        # R35/G-13 end-to-end tooth: the closer's PARAMETER TAIL is the
+        # host command's argument text — nsenter as echo's parameter
+        # must not trigger the escape reject. Pre-fix probe (live):
+        # scope=__escape__ → route=RETRY with REJECT_BANNED naming
+        # 'nsenter' (a legal form killed by the G-12 closer split).
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [_ai_with_tool_call("kubectl", {
+                "subcommand": "exec",
+                "v_args": (
+                    "pod-a -n ns -- sh -c "
+                    "'echo done $(date) nsenter -t 1 -m sh'"
+                ),
+            })],
+            "approved_target": _approved_pod_a_in_ns(),
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS, (
+            "an escape primitive in an argument tail is parameter text "
+            "— the legal form must pass like its no-substitution twin"
+        )
+
+    @pytest.mark.asyncio
+    async def test_heredoc_body_escape_text_is_not_rejected(self):
+        # R36/G-14 end-to-end tooth: a restore script WRITTEN via the
+        # carrier-blessed quoted-heredoc form, whose body merely
+        # MENTIONS nsenter, is a legal pod-scoped write. Pre-fix probe
+        # (live): scope=__escape__ → route=RETRY with reject_banned
+        # naming 'nsenter' (text, not execution).
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [_ai_with_tool_call("kubectl", {
+                "subcommand": "exec",
+                "v_args": (
+                    "pod-a -n ns -- sh -c "
+                    "'cat > /tmp/restore.sh <<\"EOF\"\n"
+                    "nsenter -t 1 -m sh -c \"umount /tmp/stale-mount\"\n"
+                    "EOF\necho done'"
+                ),
+            })],
+            "approved_target": _approved_pod_a_in_ns(),
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS, (
+            "a heredoc body is stdin text — an escape word inside it "
+            "must not reject the legal write form"
+        )
 
     @pytest.mark.asyncio
     async def test_blade_destroy_allows_uid_from_current_failed_create(self):
@@ -720,6 +836,9 @@ class TestEnforcingDriftInterrupt:
         # After one rejection, next drift hard-terminates (no interrupt).
         settings.target_guard_enforcing = True
         state = {
+            # CLI mode mirrors the #56 live scene: no interactive drift card,
+            # so the second drift is the auto-reject hard stop.
+            "interaction_mode": "cli",
             "messages": [
                 _ai_with_tool_call("blade_create", {
                     "scope": "pod", "target": "cpu", "namespace": "ns",
@@ -730,10 +849,18 @@ class TestEnforcingDriftInterrupt:
             "drift_reject_count": 1,
         }
         delta = await tool_screener(state)
-        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        # W-56-5 (defect a): the hard stop routes FAIL → the reject terminal
+        # node. The former RETRY here was a ghost termination: the graph kept
+        # running, the fail error leaked into the next attempt, and the
+        # terminal renderer stitched two stale reasons together (#56).
+        assert delta["screener_route"] == SCREENER_ROUTE_FAIL
+        assert route_after_screener({"screener_route": SCREENER_ROUTE_FAIL}) == "reject"
         # fail_state sets error field
         assert "error" in delta
         assert "failure_detail" in delta
+        # The hard stop lands its own fresh safety_reason so the reject node's
+        # single-source attribution names THIS termination (defect c).
+        assert "human" in delta["safety_reason"]
 
     @pytest.mark.asyncio
     @pytest.mark.asyncio
@@ -864,6 +991,76 @@ class TestMixedVerdicts:
         assert len(delta["messages"]) == 2
         ids = {tm.tool_call_id for tm in delta["messages"]}
         assert ids == {"tc-A", "tc-B"}
+
+    @pytest.mark.asyncio
+    async def test_readonly_plus_banned_defers_cleared_sibling(self):
+        """B43: a screener-cleared sibling must NOT receive rejection text.
+
+        The batch stays atomic (nothing executes — retry route), but the
+        fabricated ToolMessage for the cleared call must say DEFERRED.
+        Case-32: update_progress answered with "[target_guard] READONLY —
+        adjust the tool_call and retry" read to the LLM like a guard
+        verdict against the tool itself, delaying its re-issue by four
+        iterations.
+        """
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                AIMessage(content="", tool_calls=[
+                    {"name": "update_progress", "args": {
+                        "note": "mid-execution checkpoint",
+                    }, "id": "tc-meta"},
+                    {"name": "kubectl", "args": {
+                        "command": ["apply", "-f", "x.yaml"],
+                    }, "id": "tc-bad"},
+                ]),
+            ],
+            "approved_target": _approved_pod_a_in_ns(),
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        by_id = {tm.tool_call_id: tm for tm in delta["messages"]}
+        assert set(by_id) == {"tc-meta", "tc-bad"}
+        # Cleared sibling: deferred, NOT a rejection — no guard verdict,
+        # no "adjust and retry" instructions for a call that was fine.
+        meta_tm = by_id["tc-meta"]
+        assert "DEFERRED" in meta_tm.content
+        assert "NOT rejected" in meta_tm.content
+        assert "target_guard" not in meta_tm.content
+        assert "READONLY" not in meta_tm.content
+        # Rejected sibling: rejection rendering unchanged.
+        assert "REJECT_BANNED" in by_id["tc-bad"].content
+
+    @pytest.mark.asyncio
+    async def test_finish_execution_passes_as_readonly(self):
+        """B81: the prompt-taught STOP call must clear the screener.
+
+        Case-36 retest: the model called update_progress + finish_execution
+        in one batch (exactly this shape) at the end of a finished execution;
+        the guard answered the finish_execution half with REJECT_UNKNOWN
+        ("unrecognized tool, default-deny") because the classifier's
+        control-tool whitelist never heard of it — the model then improvised
+        a update_progress phase-write downgrade over three wasted rounds.
+        The classifier whitelist now carries it; this pins the end-to-end
+        shape: the whole batch passes, no fabricated ToolMessages.
+        """
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                AIMessage(content="", tool_calls=[
+                    {"name": "update_progress", "args": {
+                        "log_append": [{"event": "final ledger"}],
+                    }, "id": "tc-ledger"},
+                    {"name": "finish_execution", "args": {
+                        "summary": "all approved mutation steps issued",
+                    }, "id": "tc-stop"},
+                ]),
+            ],
+            "approved_target": _approved_pod_a_in_ns(),
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert not delta.get("messages")
 
 
 # ---------------------------------------------------------------------------
@@ -2296,3 +2493,656 @@ class TestLiveDiscoveryOnlyRetriesRecoverableGates:
             delta = await tool_screener(state)
         assert delta["screener_route"] == SCREENER_ROUTE_PASS
         discover.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Armed-before-inject gate (inject-cc2d5080)
+# ---------------------------------------------------------------------------
+
+
+def _approved_workload_deploy_a():
+    """Workload-scope approval: secondary_scopes statically include the
+    carrier RBAC family, so this is the net where the gate lives."""
+    return freeze_approved_target(
+        target={"namespace": "ns", "names": ["deploy-a"]},
+        params={"scope": "deployment"},
+        fault_scope="deployment", fault_target="pod", fault_action="fill",
+    )
+
+
+def _carrier_artifact(status: str = "active") -> dict:
+    return {
+        "artifact_id": "recovery_carrier:ns/drill-rc-x",
+        "type": "recovery_carrier",
+        "status": status,
+        "task_id": "task-1",
+        "name": "drill-rc-x",
+        "namespace": "ns",
+        "operation_family": "recovery_carrier",
+    }
+
+
+class TestArmedBeforeInjectGate:
+    """A kubectl object-write injection under a write-set that admits the
+    carrier family must not run while no recovery carrier is registered —
+    the inject-cc2d5080 shape (carrier refused → forced injection → fault
+    with no timer armed). The rejection is retryable form guidance, not a
+    mechanism ban: stacking the carrier IS the reshape."""
+
+    @pytest.mark.asyncio
+    async def test_object_write_without_carrier_is_rejected(self):
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "scale",
+                    "v_args": "deployment deploy-a -n ns --replicas=0",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        body = delta["messages"][0].content
+        assert "armed-before-inject" in body
+        # Retryable FORM guidance, not a mechanism-ban hard floor.
+        assert "not a dead-end" in body
+        assert "MECHANISM is banned" not in body
+        assert "recovery-carrier.md" in body
+        # F1-A: the reason names the generalized underwriter (vehicle),
+        # not just the carrier form the suggestion teaches.
+        assert "recovery vehicle" in body
+
+    @pytest.mark.asyncio
+    async def test_object_write_with_registered_carrier_passes(self):
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "scale",
+                    "v_args": "deployment deploy-a -n ns --replicas=0",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [_carrier_artifact("active")],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_cleaned_carrier_does_not_count_as_armed(self):
+        """A cleaned carrier is gone — a fresh object write would again run
+        un-armed, so the gate re-arms on the next injection."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "scale",
+                    "v_args": "deployment deploy-a -n ns --replicas=0",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [_carrier_artifact("cleaned")],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "armed-before-inject" in delta["messages"][0].content
+
+    @staticmethod
+    def _cleaned_carrier_with_family() -> dict:
+        carrier = _carrier_artifact("cleaned")
+        carrier["rbac_family"] = [
+            {"kind": "rolebinding", "name": "drill-rc-x", "namespace": "ns"},
+            {"kind": "role", "name": "drill-rc-x", "namespace": "ns"},
+            {"kind": "serviceaccount", "name": "drill-rc-x", "namespace": "ns"},
+        ]
+        return carrier
+
+    @pytest.mark.asyncio
+    async def test_cleaned_carrier_rbac_replay_is_cleanup(self):
+        """F1-C (probe-measured): the framework sweep is fire-and-forget —
+        it marks the artifact ``cleaned`` after ONE delete attempt, so a
+        partial failure leaves live assets under a cleaned registration.
+        The idempotent ``--ignore-not-found`` replay of the §6 four-way
+        delete is TEARDOWN of the task's own registered machinery, never
+        an injection, and must not be ordered to re-stack a carrier
+        first (pre-fix this exact state rendered REJECT_BANNED "stack
+        the recovery carrier FIRST" for deleting a leftover Role)."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "delete",
+                    "v_args": "role drill-rc-x -n ns --ignore-not-found",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._cleaned_carrier_with_family()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_cleaned_carrier_pod_replay_is_cleanup(self):
+        """The carrier's own pod delete — same idempotent replay, same
+        teardown semantics (status is irrelevant to the registry fact)."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "delete",
+                    "v_args": "pod drill-rc-x -n ns --ignore-not-found",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._cleaned_carrier_with_family()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_carrier_batch_delete_is_cleanup(self):
+        """G-4/R20: a legal kubectl BATCH delete — the §6 four-way sweep
+        collapsed into ONE mixed-kind call (`pod/carrier,role/carrier`) —
+        is teardown spelled in batch form. The carrier-gate exemption
+        must survive the parser boundary: pre-fix the comma-joined
+        "name" matched no registration and this exact cleanup was
+        screened as a fault write."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "delete",
+                    "v_args": (
+                        "pod/drill-rc-x,role/drill-rc-x -n ns "
+                        "--ignore-not-found"
+                    ),
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._cleaned_carrier_with_family()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_carrier_batch_delete_with_unregistered_name_rejected(self):
+        """The poison law survives batch expansion: a batch pairing the
+        registered carrier pod with an UNREGISTERED pod deletes an object
+        this task did not build — no exemption, the armed-before-inject
+        gate governs (retry guidance, same as any object write)."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "delete",
+                    "v_args": (
+                        "pod drill-rc-x,other-pod -n ns "
+                        "--ignore-not-found"
+                    ),
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._cleaned_carrier_with_family()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "armed-before-inject" in delta["messages"][0].content
+
+    @pytest.mark.asyncio
+    async def test_sa_alias_cleanup_replay_passes(self):
+        """Kind matching canonicalises both sides — the ``sa`` alias
+        (classifier resolves it to serviceaccount) matches the
+        registered member's kind."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "delete",
+                    "v_args": "sa drill-rc-x -n ns --ignore-not-found",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._cleaned_carrier_with_family()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_unregistered_delete_still_gated(self):
+        """The exemption is earned by the registry, not the verb: a
+        kind+ns-loose delete of an object NO vehicle registration names
+        is still an object write and keeps the gate."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "delete",
+                    "v_args": "role other-role -n ns --ignore-not-found",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [self._cleaned_carrier_with_family()],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "armed-before-inject" in delta["messages"][0].content
+
+    def test_predicate_batch_subset_semantics(self):
+        """Unit tooth on the predicate's subset contract: the classifier
+        currently collapses multi-name deletes to the first positional
+        (``kubectl delete role a b`` parses as names=('a',)), so the
+        batch-poisoning shape is unreachable through the real channel
+        today — the subset semantics are defense-in-depth for the day
+        the parser gains multi-name support, anchored here directly:
+        one unregistered name poisons the batch."""
+        from chaos_agent.agent.nodes.planning.tool_screener import (
+            _vehicle_delete_is_cleanup,
+        )
+        state = {"execution_artifacts": [self._cleaned_carrier_with_family()]}
+        poisoned = EffectiveTarget(
+            scope="role", namespace="ns", names=("drill-rc-x", "other-role"),
+        )
+        assert _vehicle_delete_is_cleanup(
+            {"subcommand": "delete"}, poisoned, {}, state,
+        ) is False
+        clean = EffectiveTarget(
+            scope="role", namespace="ns", names=("drill-rc-x",),
+        )
+        assert _vehicle_delete_is_cleanup(
+            {"subcommand": "delete"}, clean, {}, state,
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_carrier_stacking_create_is_never_blocked(self):
+        """The carrier-stacking verb itself must pass the gate: ``create`` is
+        NOT an object-write injection verb (KUBECTL_WRITE_SUBCOMMANDS), so
+        stacking the SA under the workload net is never refused — the gate
+        must not deadlock the very remedy it demands."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "create",
+                    "v_args": "serviceaccount drill-rc-x -n ns",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_node_domain_object_write_is_outside_the_gate(self):
+        """The node net's secondary_scopes carry NO carrier family — node
+        faults ride the host carrier (debug pod + systemd-run timer),
+        case-legislated and outside this object-write first cut. A cordon
+        on an approved node passes with no recovery_carrier registered."""
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "cordon",
+                    "v_args": "node-a",
+                }),
+            ],
+            "approved_target": _approved_node_network(),
+            "execution_artifacts": [],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    def test_write_set_helpers_single_source_semantics(self):
+        """_carrier_family_in_write_set: workload net True, node net False
+        (the discriminating boundary), mechanism_entries contribute the
+        same way; _recovery_vehicle_registered: vehicle_cache read-first
+        so a same-batch run + injection pair sees the registration;
+        occupant forms underwrite, a debug pod does not."""
+        from chaos_agent.agent.nodes.planning.tool_screener import (
+            _carrier_family_in_write_set,
+            _recovery_vehicle_registered,
+        )
+
+        workload = approved_from_dict(_approved_workload_deploy_a())
+        node = approved_from_dict(_approved_node_network())
+        assert _carrier_family_in_write_set(workload) is True
+        assert _carrier_family_in_write_set(node) is False
+
+        empty_state = {"execution_artifacts": []}
+        assert _recovery_vehicle_registered({}, empty_state) is False
+        assert _recovery_vehicle_registered(
+            {"execution_artifacts": [_carrier_artifact()]}, empty_state,
+        ) is True
+        # The occupant forms underwrite too: a task-built target's
+        # cleanup record deletes the asset — and the fault riding it —
+        # wholesale (the drill-target lifecycle contract)
+        assert _recovery_vehicle_registered(
+            {"execution_artifacts": [
+                _carrier_artifact() | {"type": "occupant_deployment"},
+            ]}, empty_state,
+        ) is True
+        # A debug pod does NOT: it is a probe channel — a debug pod
+        # plus an un-armed injection is still an un-armed injection
+        assert _recovery_vehicle_registered(
+            {"execution_artifacts": [
+                _carrier_artifact() | {"type": "debug_pod"},
+            ]}, empty_state,
+        ) is False
+
+
+# ---------------------------------------------------------------------------
+# CR-channel route gate (openspec faultdrill-cr-channel, design D3 source 3)
+# ---------------------------------------------------------------------------
+
+_FAULTDRILL_MANIFEST = """apiVersion: drill.blade-ai.io/v1alpha1
+kind: FaultDrill
+metadata:
+  name: fd-demo1
+  namespace: ns
+spec:
+  action: secretSwap
+"""
+
+
+def _approved_cr_channel_pod(bt: str, ba: str, *, entry: bool = True) -> dict:
+    """Pod-victim approval whose case manifest legislates the FaultDrill CR
+    write (the widened write-set contract that admits a faultdrill-scope
+    apply at all), with the frozen intent verbs parameterised so the
+    three-class verdict is the only variable under test."""
+    me = (
+        (MechanismWriteEntry(scope="faultdrill", namespace="ns", names=("fd-demo1",)),)
+        if entry else ()
+    )
+    return freeze_approved_target(
+        target={"namespace": "ns", "names": ["pod-a"]},
+        params={"scope": "pod"},
+        fault_scope="pod", fault_target=bt, fault_action=ba,
+        mechanism_entries=me,
+    )
+
+
+def _cr_apply_call(sub: str = "apply") -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{
+            "id": "tc-1", "name": "kubectl",
+            "args": {
+                "subcommand": sub, "v_args": "-f -",
+                "stdin_data": _FAULTDRILL_MANIFEST,
+            },
+        }],
+    )
+
+
+class TestCrChannelRouteGate:
+    """D3 source 3 (write-set 审批门三分类程序化校验): a FaultDrill CR
+    creation that already passed write-set admission (case-manifest
+    faultdrill entry → ALLOW at the drift guard) is still subject to the
+    programmatic three-class routing check — the channel belongs to
+    apiserver-write recovery only, and a symmetric-revert-reachable fault
+    (blade vocabulary) routed into it is rejected with re-plan guidance
+    (spec scenario "零工坊 case 误路由被审批门拒绝")."""
+
+    @pytest.mark.asyncio
+    async def test_symmetric_revert_domain_misroute_is_rejected(self):
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("cpu", "fullload"),
+            "execution_artifacts": [],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        body = delta["messages"][0].content
+        assert "cr-channel route" in body
+        # The reason names the declared verbs and the domain verdict.
+        assert "cpu" in body and "fullload" in body
+        assert "symmetric-revert" in body
+        assert "blade destroy" in body
+        # Retryable form guidance: the fix is a re-plan onto the correct
+        # channel, not a mechanism ban (same family as armed-before-inject).
+        assert "not a dead-end" in body
+        assert "MECHANISM is banned" not in body
+        assert "blade create" in body
+        assert "recovery-carrier.md" in body
+
+    @pytest.mark.asyncio
+    async def test_apiserver_write_domain_passes(self):
+        # k8s-native vocabulary verbs (apiserver-write family): the
+        # legitimate CR-channel shape — admission via the manifest entry,
+        # no route objection, and a cluster that can accept the write
+        # (the installability seam reports an established CRD).
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("image", "corrupt"),
+            "execution_artifacts": [],
+            "kubeconfig": "/tmp/fd-route-gate.kubeconfig",
+        }
+        seam = AsyncMock(return_value={"usable": True, "status": "ready"})
+        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
+            delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+        # The lazy-install seam WAS consulted with the task's resolved
+        # kubeconfig (the first admitted CR write is installability-
+        # checked — spec scenario "首次注入时惰性安装").
+        seam.assert_awaited_once_with(
+            kubeconfig="/tmp/fd-route-gate.kubeconfig",
+        )
+
+    @pytest.mark.asyncio
+    async def test_disabled_channel_rejects_any_cr_apply(self):
+        # Dark launch: while faultdrill_enabled is False the channel's own
+        # guards (landing readback, session reconciler) are short-circuited,
+        # so ANY CR apply in that window is an unguarded bare write —
+        # rejected regardless of verb domain.
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = False
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("image", "corrupt"),
+            "execution_artifacts": [],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        body = delta["messages"][0].content
+        assert "cr-channel route" in body
+        assert "not enabled" in body
+        # The fix names the standard SOP channel, not the CR channel.
+        assert "recovery-carrier.md" in body
+
+    @pytest.mark.asyncio
+    async def test_replace_form_is_not_gated(self):
+        # Only the CREATING verbs (apply/create) are gated: replace -f CR
+        # (the re-recipe replay path) keeps manifest-entry admission only —
+        # the route gate owns channel entry, not every faultdrill-scope
+        # write. (A delete -f CR is additionally subject to the
+        # armed-before-inject gate — delete IS an object-write verb there —
+        # which is the pre-existing behaviour for LLM-side deletes of any
+        # carrier asset; provider-side recovery deletes go through the
+        # programmatic transport, not this face.)
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        state = {
+            "messages": [_cr_apply_call("replace")],
+            "approved_target": _approved_cr_channel_pod("cpu", "fullload"),
+            "execution_artifacts": [],
+        }
+        seam = AsyncMock(return_value={"usable": True})
+        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
+            delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+        # The installability check rides the CREATING-verbs gate only.
+        seam.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_verbs_are_not_decidable_so_pass(self):
+        # A fallback does not block what it cannot classify: with both
+        # frozen verbs empty the write-set admission (manifest entry) is
+        # the guard on record, and the route check stays silent.
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("", ""),
+            "execution_artifacts": [],
+        }
+        seam = AsyncMock(return_value={"usable": True, "status": "installed"})
+        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
+            delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    @patch(
+        "chaos_agent.agent.nodes.planning.tool_screener.interrupt",
+        return_value="rejected",
+    )
+    async def test_no_manifest_entry_stays_scope_drift(self, _mock):
+        # Existing admission behaviour pinned (the route gate never sees
+        # this call): without a case-manifest faultdrill entry the apply is
+        # scope-drift rejected BEFORE any routing verdict — a mis-route
+        # with no legislation behind it never reaches the channel at all.
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("cpu", "fullload", entry=False),
+            "execution_artifacts": [],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert delta["drift_reject_count"] == 1
+        body = delta["messages"][0].content
+        assert "REJECT_DRIFT" in body
+        assert "scope drift" in body
+        assert "faultdrill" in body
+        # The route gate did not fire (its rejection would be BANNED, not
+        # DRIFT — and would not increment the drift counter).
+        assert "cr-channel route" not in body
+
+    def test_domain_predicate_unit_teeth(self):
+        from chaos_agent.agent.nodes.planning.tool_screener import (
+            _declared_verbs_in_symmetric_revert_domain,
+        )
+
+        blade = approved_from_dict(_approved_cr_channel_pod("cpu", "fullload"))
+        k8s_domain = approved_from_dict(_approved_cr_channel_pod("image", "corrupt"))
+        empty = approved_from_dict(_approved_cr_channel_pod("", ""))
+        target_only = approved_from_dict(_approved_cr_channel_pod("cpu", "patch"))
+        action_only = approved_from_dict(_approved_cr_channel_pod("pod", "fullload"))
+        assert _declared_verbs_in_symmetric_revert_domain(blade) is True
+        assert _declared_verbs_in_symmetric_revert_domain(k8s_domain) is False
+        # EITHER axis marking the domain is decisive (the carrier
+        # vocabularies are disjoint, so a mixed pair is a blade-shaped
+        # fault the plan mis-declared, not an apiserver-write fault).
+        assert _declared_verbs_in_symmetric_revert_domain(target_only) is True
+        assert _declared_verbs_in_symmetric_revert_domain(action_only) is True
+        # Not decidable → not blocked.
+        assert _declared_verbs_in_symmetric_revert_domain(empty) is False
+
+    @pytest.mark.asyncio
+    async def test_crd_unavailable_rejects_with_sop_degradation_guidance(self):
+        # D7 degradation branch: the installability seam reports the CRD
+        # uninstallable (probe / install / Established / compatibility
+        # family) — the apply is rejected BEFORE any CR attempt round,
+        # with re-plan guidance onto the SOP form (a routing branch, not
+        # a task failure). Spec scenario "CRD 不可装时降级路由".
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("image", "corrupt"),
+            "execution_artifacts": [],
+            "kubeconfig": "/tmp/fd-route-gate.kubeconfig",
+        }
+        seam = AsyncMock(return_value={
+            "usable": False, "status": "unavailable",
+            "reason": "apply-forbidden",
+            "detail": "RBAC denies creating customresourcedefinitions",
+        })
+        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
+            delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        body = delta["messages"][0].content
+        assert "cr-channel route" in body
+        # The decision family's verdict is surfaced for the audit log.
+        assert "apply-forbidden" in body
+        assert "RBAC denies creating" in body
+        # Degradation guidance: the SOP route, retryable (not a ban).
+        assert "degradation branch" in body
+        assert "recovery-carrier.md" in body
+        assert "not a dead-end" in body
+        assert "MECHANISM is banned" not in body
+        seam.assert_awaited_once_with(
+            kubeconfig="/tmp/fd-route-gate.kubeconfig",
+        )
+
+    @pytest.mark.asyncio
+    async def test_install_seam_not_consulted_while_dark_launched(self):
+        # Dark launch spends ZERO install traffic: the flag rejection
+        # fires before the seam is ever consulted.
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = False
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("image", "corrupt"),
+            "execution_artifacts": [],
+        }
+        seam = AsyncMock()
+        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
+            delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "not enabled" in delta["messages"][0].content
+        seam.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_install_seam_not_consulted_on_vocabulary_misroute(self):
+        # Check-order pin: the vocabulary objection is pure-Python and
+        # fires BEFORE the installability seam — a mis-routed fault
+        # never spends an install roundtrip.
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("cpu", "fullload"),
+            "execution_artifacts": [],
+        }
+        seam = AsyncMock()
+        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
+            delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "symmetric-revert" in delta["messages"][0].content
+        seam.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_install_seam_none_passes_through(self):
+        # ``None`` = no registered provider claims the install
+        # responsibility (the defensive window): the gate does not
+        # invent a verdict — the apply proceeds under its own
+        # not-landed error family.
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": _approved_cr_channel_pod("image", "corrupt"),
+            "execution_artifacts": [],
+        }
+        seam = AsyncMock(return_value=None)
+        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
+            delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta

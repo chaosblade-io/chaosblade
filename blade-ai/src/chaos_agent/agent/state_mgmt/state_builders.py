@@ -47,6 +47,12 @@ def build_inject_initial_state(
     batch_submit_args: dict | None = None,
     created_at: str | None = None,
     tenant_id: str = "",
+    workspace_id: str = "",
+    # Cross-graph bridge (tier1-speedup): intent-time evidence copied from the
+    # Intent Graph via PipelineHandoff. None on direct entry paths (no intent
+    # dialogue) — pre-change rendering baseline.
+    progress_ledger: dict | None = None,
+    probe_snapshot: dict | None = None,
 ) -> dict[str, Any]:
     """Build the initial AgentState for an inject Pipeline Graph run."""
 
@@ -55,6 +61,7 @@ def build_inject_initial_state(
         "tui_session_id": tui_session_id or "",
         "operation": "inject",
         "tenant_id": tenant_id or "",
+        "workspace_id": workspace_id or "",
         "fault_spec": _fault_spec_to_dict(fault_spec),
         "needs_confirmation": bool(needs_confirmation),
         "safety_status": "pending",
@@ -85,6 +92,10 @@ def build_inject_initial_state(
         state["messages"] = list(messages)
     if batch_submit_args is not None:
         state["batch_submit_args"] = deepcopy(batch_submit_args)
+    if progress_ledger is not None:
+        state["progress_ledger"] = deepcopy(progress_ledger)
+    if probe_snapshot is not None:
+        state["probe_snapshot"] = deepcopy(probe_snapshot)
     return state
 
 

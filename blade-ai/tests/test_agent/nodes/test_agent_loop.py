@@ -818,3 +818,127 @@ class TestAgentLoopTextOnlyStall:
         result = await node(self._state(stall_count=2))
         assert result.get("_plan_text_stall_count") == 0
         assert not result.get("error")
+
+
+class TestPlanningLedgerTailMigration:
+    """Unit A (context-cache-prefix-stability task 2.6): the planning progress
+    ledger rides the message TAIL as an append-only system-reminder HumanMessage
+    carrying a supersedes marker — NOT the FULL system-prompt head.
+
+    This is the node-level complement to the builder-level prefix guard
+    (``TestPlanningPrefixStability`` in test_prefix_stability.py): that one
+    proves build_inject_system_prompt's head is byte-stable across ledger
+    rounds; this one proves the ledger still reaches the model every planning
+    round, at the tail, and is persisted into LangGraph state.
+    """
+
+    MAX = 10  # Small max for testability
+
+    def _make_mock_llm(self):
+        mock_response = MagicMock()
+        mock_response.content = "Planning summary: ready to execute."
+        mock_response.tool_calls = []
+        mock_response.additional_kwargs = {}
+
+        llm = MagicMock()
+        llm.ainvoke = AsyncMock(return_value=mock_response)
+        bound_llm = MagicMock()
+        bound_llm.ainvoke = AsyncMock(return_value=mock_response)
+        llm.bind_tools = MagicMock(return_value=bound_llm)
+        return llm, bound_llm
+
+    def _make_node(self, llm, monkeypatch):
+        import chaos_agent.agent.nodes.execute.agent_loop as loop_mod
+
+        monkeypatch.setattr(loop_mod, "MAX_AGENT_LOOP", self.MAX)
+        monkeypatch.setattr(settings, "max_agent_loop", self.MAX)
+        monkeypatch.setattr(
+            "chaos_agent.agent.nodes.execute.agent_loop.compute_env_info",
+            AsyncMock(return_value=""),
+        )
+        monkeypatch.setattr(
+            "chaos_agent.agent.nodes.execute.agent_loop.sync_to_store",
+            AsyncMock(),
+        )
+        mock_tool = MagicMock()
+        mock_tool.name = "test_tool"
+        return make_agent_loop(llm=llm, tools=[mock_tool], skill_catalog="test")
+
+    def _make_state(self):
+        return {
+            "task_id": "test-task",
+            "operation": "inject",
+            "agent_loop_count": 0,
+            "skill_name": "k8s-chaos-skills",
+            "messages": [],
+            "replan_context": None,
+            "replan_history": None,
+            "replan_count": 0,
+            "target": {"namespace": "test-ns"},
+        }
+
+    @staticmethod
+    def _planning_ledger():
+        from chaos_agent.agent.progress_ledger import merge_progress_ledger
+
+        # Planning freezes NO anchor (the spec is still converging), so the
+        # no-anchor directive variant is what must render on the tail.
+        return merge_progress_ledger(
+            {},
+            log_append=[{"event": "LEDGER-TAIL-MARK plan step done", "status": "verified"}],
+        )
+
+    @staticmethod
+    def _ledger_tails(messages):
+        return [
+            m
+            for m in messages
+            if isinstance(m, HumanMessage)
+            and "LEDGER-TAIL-MARK" in (m.content or "")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_ledger_rides_tail_not_system_head(self, monkeypatch):
+        llm, bound_llm = self._make_mock_llm()
+        node = self._make_node(llm, monkeypatch)
+        state = self._make_state()
+        state["progress_ledger"] = self._planning_ledger()
+
+        result = await node(state)
+
+        seen = bound_llm.ainvoke.call_args[0][0]
+        # The FULL system head must NOT carry the ledger anymore (its per-round
+        # rewrite was the volatile byte that broke the cache prefix).
+        system_msgs = [m for m in seen if isinstance(m, SystemMessage)]
+        assert system_msgs, "expected a SystemMessage head"
+        for sm in system_msgs:
+            assert "LEDGER-TAIL-MARK" not in (sm.content or "")
+            assert "progress ledger below" not in (sm.content or "")
+
+        # The ledger rides the TAIL as a system-reminder HumanMessage.
+        tails = self._ledger_tails(seen)
+        assert len(tails) == 1, "exactly one ledger snapshot must ride the tail"
+        content = tails[0].content or ""
+        assert content.lstrip().startswith("<system-reminder>")
+        # D2 supersedes marker keeps the append-only history single-valued.
+        assert "supersedes" in content
+        # Planning renders the NO-ANCHOR directive variant (the anchor is not
+        # frozen until execute_loop), so its anti-re-derivation wording — not the
+        # anchored "before acting" phrasing — is what must survive the move.
+        assert "do not re-derive what is already established" in content
+
+        # Persisted into LangGraph state via the _injections_for_state channel.
+        assert len(self._ledger_tails(result.get("messages", []))) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_tail_when_ledger_empty(self, monkeypatch):
+        llm, bound_llm = self._make_mock_llm()
+        node = self._make_node(llm, monkeypatch)
+        state = self._make_state()
+        state["progress_ledger"] = None
+
+        result = await node(state)
+
+        seen = bound_llm.ainvoke.call_args[0][0]
+        assert not self._ledger_tails(seen)
+        assert not self._ledger_tails(result.get("messages", []))

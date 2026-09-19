@@ -48,9 +48,9 @@ blade create k8s <scope>-<target> <action> [flags]
 | --- | --- |
 | `pod-cpu fullload` | `--cpu-percent 80` (single CPU) ; `--cpu-count 2 --cpu-percent 100` (pin 2 cores) |
 | `pod-memory load` | `--mem-percent 70` ; `--mem-size 512` (MB) ; `--mode cache` (cache vs ram) |
-| ~~`pod-network delay`~~ | **Unavailable in v1.8.0** — legacy flags: `--time 3000 --offset 1000 --interface eth0 --local-port 8080`. Requires the Tier 2 tc qdisc substitute |
+| `pod-network delay` | **Build-dependent** — probe with `blade create k8s pod-network -h` first. Where available (netem builds): `--time 3000 --offset 1000 --interface eth0` ; absent builds need the Tier 2 tc qdisc substitute |
 | `pod-network drop` | `--destination-ip 10.1.2.3` ; `--source-port 3306` ; `--network-traffic out` for direction. **Does NOT support `--percent` or `--interface`** (iptables DROP semantics: all matching traffic is dropped) |
-| ~~`pod-network corrupt` / `duplicate` / `reorder`~~ | **Not applicable to v1.8.0** — only `dns`, `drop` and `occupy` are available |
+| `pod-network corrupt` / `duplicate` / `reorder` | **Build-dependent** — probe with `blade create k8s pod-network -h`: netem builds expose them, trimmed builds expose only `dns` / `drop` / `occupy`. Verified reorder flags (netem build): `--interface eth0 --percent 50 --correlation 50` (**all three required**) + optional `--gap 2 --time 20 --timeout <s>`; underlying rule is `tc netem delay <time>ms reorder <percent>% <correlation>% gap <gap>` |
 | `pod-disk fill` | `--path /tmp --size 1024` (MB). Path is inside the container; check writable mounts first |
 | `pod-disk burn` | `--read --write --size 50` for IO contention |
 | `pod-process kill` | `--process java` ; `--process-cmd "java -jar"` |
@@ -58,9 +58,9 @@ blade create k8s <scope>-<target> <action> [flags]
 | `pod-network dns` | `--domain www.example.com --ip 10.0.0.0` (both **required**). Modifies `/etc/hosts` — see [DNS note](#dns-fault-note) below |
 | `pod-network occupy` | `--port 8080` — occupies the given port |
 
-> **⚠️ blade v1.8.0 network sub-command changes**: `pod-network` supports only `dns` / `drop` / `occupy`.
-> The legacy `loss` (tc netem, supported --percent) became `drop` (iptables DROP, **does NOT support --percent**, drops all matching traffic); the legacy `delay` / `corrupt` / `duplicate` / `reorder` are unavailable in v1.8.0.
-> For a delay effect, use the Tier 2 kubectl-native approach (tc qdisc) or upgrade the blade version.
+> **⚠️ `pod-network` sub-command set is BUILD-dependent, not version-dependent** — always probe the actual binary with `blade create k8s pod-network -h` before choosing a path.
+> Empirically verified on two live clusters: an upstream v1.8.0 build (Git Tag `v1.8.0`) exposed the full netem family (`delay` / `loss` / `corrupt` / `duplicate` / `reorder`) besides `dns` / `drop` / `occupy`; a trimmed v1.8.5 distribution build (Git Tag `blade-ai-v0.1.1`) exposed only `dns` / `drop` / `occupy`.
+> Where the netem actions exist, use them directly (they manage their own timeout auto-recovery); where they are absent, fall back to the Tier 2 kubectl-native approach (tc qdisc). `drop` everywhere is iptables DROP — **no `--percent`, no `--interface`**, drops all matching traffic.
 
 ### Container Scope
 

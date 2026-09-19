@@ -18,6 +18,7 @@ from langchain_core.tools import tool
 from chaos_agent.agent.spec.fault_registry import is_host_scope
 from chaos_agent.config.settings import settings
 from chaos_agent.tools._tool_profiles import profile_for_tool
+from chaos_agent.tools.markers import UNCERTAIN_OUTCOME_MARKER  # re-exported
 from chaos_agent.transports import (
     KUBEWIZ_CHANNELS,
     PROFILE_HOST,
@@ -30,6 +31,29 @@ from chaos_agent.transports import (
 from chaos_agent.transports.protocol import explain_transport_anomaly
 
 logger = logging.getLogger(__name__)
+
+# Machine-readable marker embedded in blade_create returns whose outcome is
+# UNKNOWN (transport exception / no-UID transient error). Defined in
+# chaos_agent/tools/markers.py (neutral ground — the execute-loop scan
+# consumes it without crossing the carrier-import boundary); re-exported
+# above for historical import paths. Consumed by the execute_loop
+# create-reconcile gate's three-state scan; the guidance text below is
+# for the LLM. Wording is deliberately distinct from the gate's own
+# interception marker ("[gate:reconcile-blocked]", also defined in
+# chaos_agent/tools/markers.py): uncertain = real execution with
+# unknown result, gate-blocked = interception that never executed.
+
+# Guidance appended to uncertain returns: assert neither success nor
+# failure, point at reconciliation first (mirrors the uid_in_error POLL
+# precedent's "Do NOT try alternative" discipline).
+_UNCERTAIN_GUIDANCE = (
+    "Outcome UNKNOWN — the create request may have reached the cluster "
+    "even though its response did not reach us. Result-uncertain is NOT "
+    "failure: a blind retry can create a DUPLICATE experiment on the same "
+    "target. Reconcile FIRST: check whether an experiment matching this "
+    "request (namespace/labels/names/target-action) is already active — "
+    "reuse its UID if it is; retry only after confirming it is absent."
+)
 
 
 def _split_args(args: str) -> list[str]:
@@ -143,8 +167,6 @@ async def blade_create(
       - Memory: pod: --mem-percent|--mem-size; node: --mem-percent ONLY.
       - "unknown flag: --namespace" (host blade) = version issue — retry
         without it.
-      - --timeout auto-injected/boosted to ≥600s; may lengthen, not
-        shorten.
     """
     # Universal first-use trigger: pip-install users get a pure-Python wheel
     # with no blade binary. Ensure it exists before the first mutating
@@ -210,7 +232,7 @@ async def blade_create(
     if flags:
         cmd.extend(_split_args(flags))
 
-    # Auto-inject --timeout if not present, or boost if below minimum
+    # Auto-inject --timeout if not present; explicit values pass through verbatim
     # This is the BOTTOM layer of the three-layer duration guarantee,
     # ensuring ALL injection paths (every blade_create call) are covered.
     from chaos_agent.utils.fault_type import ensure_min_duration, normalize_timeout_flag
@@ -222,7 +244,8 @@ async def blade_create(
         cmd.extend(["--timeout", str(effective_timeout)])
         logger.info(f"Auto-injected --timeout {effective_timeout}s into blade create command")
     else:
-        # Timeout specified (by LLM or CLI): check if it meets the minimum.
+        # Timeout specified (by LLM or CLI): passes through verbatim;
+        # zero/malformed values normalize to the default.
         # ``normalize_timeout_flag`` also canonicalizes ``--timeout=<value>``.
         timeout_idx = cmd.index("--timeout")
         try:
@@ -233,14 +256,25 @@ async def blade_create(
         if effective_timeout != current_int:
             cmd[timeout_idx + 1] = str(effective_timeout)
             logger.info(
-                f"Auto-boosted --timeout from {timeout_value}s to {effective_timeout}s "
-                f"for {scope}-{target}-{action} (recommended minimum)"
+                f"Normalized --timeout from {timeout_value}s to {effective_timeout}s "
+                f"for {scope}-{target}-{action}"
             )
 
     try:
         result = await execute_via_transport(cmd, _target, timeout=settings.timeout_blade, task_id=task_id, bypass_channel=_kubewiz, expect_profile=profile_for_tool("blade_create"))
     except Exception as e:
-        return f"Error: blade create failed: {e}"
+        # Transport-level failure (timeout, connection loss): the request
+        # MAY have been accepted — the outcome is UNKNOWN, not failed.
+        # Embed the machine-readable marker for the create-reconcile gate
+        # (execute_loop three-state scan) + reconciliation guidance. A
+        # client-side distinction between "never sent" and "sent, response
+        # lost" is not reliably possible, so every transport exception is
+        # uncertain (a mis-block costs one read-only reconcile call; a
+        # missed one can duplicate a fault experiment).
+        return (
+            f"Error: blade create transport failure: {e}\n"
+            f"{UNCERTAIN_OUTCOME_MARKER} {_UNCERTAIN_GUIDANCE}"
+        )
 
     if result.exit_code != 0:
         # Combine both streams: JSON (including 54000) may land on stdout
@@ -275,10 +309,21 @@ async def blade_create(
         # rejects 54000+success=false UIDs. We want the UID regardless of
         # blade's self-reported success status, because the CRD exists in the
         # cluster and may be causing real effects.
-        import re
-        uid_match = re.search(r'"uid"\s*:\s*"([a-f0-9]{16,})"', combined)
+        #
+        # Round-16 single source: this shape (the blade CLI's raw failure JSON
+        # top-level ``"uid": "<hex16>"`` key) is ALSO the exec channel's
+        # failed-create dialect — verify.py's RAW_FAILED_CREATE_UID_RE. The
+        # host face re-wraps the UID into the ``UID: ...`` wording below; the
+        # exec face sees the raw key. One anchor, two faces.
+        from .verify import RAW_FAILED_CREATE_UID_RE
+
+        uid_match = RAW_FAILED_CREATE_UID_RE.search(combined)
         uid_in_error = uid_match.group(1) if uid_match else None
         if uid_in_error:
+            # NOTE: no uncertain marker on this path — the UID is known, so
+            # the outcome is NOT uncertain; the POLL/REPLAN guidance below
+            # already IS the reconciliation path (create-reconcile gate
+            # must not add a second interception here).
             # Classify the error to decide whether polling makes sense.
             # Terminal errors (permission denied, tool not found, etc.) will
             # NEVER self-heal no matter how long the operator retries — tell
@@ -319,6 +364,22 @@ async def blade_create(
                 f"  6. Do NOT try alternative injection methods before "
                 f"completing these checks\n"
                 f"Raw output: {_shown}"
+            )
+        # No UID in the output. Transient classes (connection reset,
+        # channel timeout): whether the CRD was created is UNKNOWN — mark
+        # uncertain for the create-reconcile gate. Terminal classes
+        # (parameter/permission rejections): the command was never
+        # admitted, retrying cannot duplicate anything — keep the plain
+        # deterministic-failure return (no marker, no gate interception).
+        # Classify on `combined` (raw output), NOT `_shown`: the anomaly
+        # annotation may contain words like "timeout" that would flip
+        # END_FAILED to SHORT_RETRY — same guard as the uid_in_error path.
+        from chaos_agent.errors import classify_error, ErrorAction
+        no_uid_class = classify_error(combined)
+        if no_uid_class.action == ErrorAction.SHORT_RETRY:
+            return (
+                f"Error: blade create failed (exit {result.exit_code}): {_shown}\n"
+                f"{UNCERTAIN_OUTCOME_MARKER} {_UNCERTAIN_GUIDANCE}"
             )
         return f"Error: blade create failed (exit {result.exit_code}): {_shown}"
 

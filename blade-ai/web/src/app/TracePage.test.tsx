@@ -199,6 +199,26 @@ describe("TracePage", () => {
     ).toBeInTheDocument();
   });
 
+  it("colours unverified with caution, not failure — distinct from unrecovered", async () => {
+    // Honest ignorance (observation channel unavailable) must not read as
+    // counter-evidence: "unverified" shares the caution colour with
+    // "partial", while "unrecovered" keeps red. One page, both verdicts —
+    // inject side spelled "overall", recover side spelled "level".
+    const detail = {
+      ...DETAIL,
+      verification: { ...(DETAIL.verification as Record<string, unknown>), overall: "unverified" },
+      recover_verification: { level: "unrecovered", layer1: { status: "failed" } },
+    };
+    renderTrace("inject-abc-123", async () => detail);
+
+    const unknown = await screen.findByText("unverified");
+    expect(unknown.className).toContain("text-warning");
+    expect(unknown.className).not.toContain("text-danger");
+
+    const notRecovered = screen.getByText("unrecovered");
+    expect(notRecovered.className).toContain("text-danger");
+  });
+
   it("auto-selects the newest task on the bare /trace route", async () => {
     const { router } = renderTrace(null, async () => DETAIL);
     // The list's first row wins; the URL becomes its deep link without

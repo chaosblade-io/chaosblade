@@ -148,10 +148,14 @@ function layerStatusColor(status: string): string {
 /** Holistic verdict word → layer-status token. Inject and recover
  *  spell the same three-way outcome differently: overall
  *  (verified / partial / unverified) vs level (recovered / partial /
- *  unrecovered). */
+ *  unverified / unrecovered — the unverified member joined the recover
+ *  vocabulary in round-14). "unverified" is honest ignorance — the
+ *  observation channel was unavailable, which is NOT counter-evidence:
+ *  colouring it red like "unrecovered" would visually translate "cannot
+ *  tell" back into "failed". It shares the caution colour with "partial". */
 function holisticStatus(level: string): string {
   if (level === "verified" || level === "recovered") return "passed";
-  if (level === "unverified" || level === "unrecovered") return "failed";
+  if (level === "unrecovered") return "failed";
   return "partial";
 }
 
@@ -174,7 +178,7 @@ function checklistGlyph(status: string): [string, string] {
  *  layer2 / checklist / warnings shape. Both carry a holistic verdict
  *  shown next to the title — inject side ``overall`` (verified /
  *  partial / unverified), recover side ``level`` (recovered / partial /
- *  unrecovered). */
+ *  unverified / unrecovered). */
 function VerdictSection({ title, verdict }: { title: string; verdict: unknown }) {
   if (!verdict || typeof verdict !== "object") return null;
   const v = verdict as Record<string, unknown>;

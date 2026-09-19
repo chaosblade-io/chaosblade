@@ -71,10 +71,14 @@ def replayed_reasoning(message) -> str:
        mismatch, which also excludes legacy messages recorded before the marker
        existed;
     4. tail truncation at ``reasoning_replay_max_chars`` — the TAIL, because a
-       thinking trace ends with its conclusion. The limit is a guard against one
-       pathological message, not a routine budget: normal traces run
-       100–2500 chars, and the context budget itself is managed by the
-       compaction system (which needs this function to see the payload at all).
+       thinking trace ends with its conclusion. The limit is a guard against
+       a pathological runaway trace (e.g. a reasoning loop), not a routine
+       budget: deep-thinking planning turns routinely run 20k–35k chars
+       (measured 2026-09-18 on the #13-R task: 5 of 32 AI messages exceeded
+       the old 8k limit, max 34232 — which turned the "never-triggered
+       guard" into a per-case routine cut that forced re-derivation), and
+       the context budget itself is managed by the compaction system (which
+       needs this function to see the payload at all).
     """
     if getattr(message, "type", "") != _ASSISTANT_TYPE:
         return ""

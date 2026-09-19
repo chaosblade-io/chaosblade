@@ -25,7 +25,7 @@ def _valid_payload(**overrides):
             "names": ["app=myapp"],
             "labels": {"app": "myapp"},
             "params": {"cpu-percent": "80"},
-            "duration": 300,
+            "duration_seconds": 300,
         },
         "kubeconfig": "/home/user/.kube/config",
     }
@@ -60,6 +60,51 @@ class TestTestTaskToInitialState:
         assert fs["duration_seconds"] == 300
         assert fs["source"] == "l4_sdk"
         assert fs["user_description"] == "inject pod cpu fault"
+
+    def _payload_with_duration(self, **duration_keys):
+        """Build a valid payload whose fault_intent carries only duration_keys."""
+        fi = {
+            "scope": "pod",
+            "target": "cpu",
+            "action": "fullload",
+            "namespace": "cms-demo",
+        }
+        fi.update(duration_keys)
+        return {"fault_intent": fi, "kubeconfig": "/home/user/.kube/config"}
+
+    def test_duration_seconds_key_honored(self):
+        """The single canonical duration key (to_intent_dict's output)
+        reaches the fault spec verbatim — regression for the seam where
+        the adapter read `duration` while the contract emitted
+        `duration_seconds`, silently dropping the platform's value."""
+        task = L4TestTask(
+            task_id="t-durs",
+            intent="x",
+            payload=self._payload_with_duration(duration_seconds=180),
+        )
+        state = _to_initial_state(task)
+        assert state["fault_spec"]["duration_seconds"] == 180
+
+    def test_retired_duration_alias_not_honored(self):
+        """The retired `duration` alias has no reader: a payload carrying
+        only it falls to the default (l4-contract-faithfulness ruling —
+        no compatibility layer for old keys)."""
+        task = L4TestTask(
+            task_id="t-dura",
+            intent="x",
+            payload=self._payload_with_duration(duration=240),
+        )
+        state = _to_initial_state(task)
+        assert state["fault_spec"]["duration_seconds"] == 300
+
+    def test_duration_absent_falls_to_default(self):
+        task = L4TestTask(
+            task_id="t-durx",
+            intent="x",
+            payload=self._payload_with_duration(),
+        )
+        state = _to_initial_state(task)
+        assert state["fault_spec"]["duration_seconds"] == 300
 
     def test_transport_fields_forwarded(self):
         """L4 payload transport fields (channel override + kubewiz + ssh/host)
@@ -195,6 +240,23 @@ class TestStateToTaskResult:
 
     @patch("chaos_agent.agent.state.build_status_data")
     @patch("chaos_agent.agent.state.infer_task_state")
+    def test_unverified_maps_to_degraded_without_error(self, mock_infer, mock_build):
+        """Honest ignorance → "completed with reservations".
+
+        Verification ran but evidence was unavailable: not passed (no evidence
+        of success), not failed (no counter-evidence either — so no
+        L4AgentError: there is nothing to report as an error).
+        """
+        mock_infer.return_value = "unverified"
+        mock_build.return_value = {"fault_type": "pod-cpu"}
+
+        result = _to_task_result({}, "t-uv")
+        assert result.status == "degraded"
+        assert result.error is None
+        assert "unverified" in result.summary
+
+    @patch("chaos_agent.agent.state.build_status_data")
+    @patch("chaos_agent.agent.state.infer_task_state")
     def test_extras_contain_status_data(self, mock_infer, mock_build):
         mock_infer.return_value = "recovered"
         mock_build.return_value = {
@@ -271,3 +333,139 @@ class TestMakeTrajectoryId:
     def test_uniqueness(self):
         ids = {_make_traj_id("t-001") for _ in range(100)}
         assert len(ids) == 100
+
+
+class TestVerificationFirstClassFields:
+    """D6: verification as a first-class field, extras mirror kept."""
+
+    @patch("chaos_agent.agent.state.build_status_data")
+    @patch("chaos_agent.agent.state.infer_task_state")
+    def test_verification_field_mirrors_extras(self, mock_infer, mock_build):
+        """First-class field and extras mirror carry the same verdict —
+        legacy readers (benchmark worker) and new readers agree."""
+        verification = {
+            "level": "unverified",
+            "layer1": {"status": "passed"},
+            "layer2": {"status": "unknown"},
+            "warnings": ["metrics query forbidden"],
+        }
+        mock_infer.return_value = "unverified"
+        mock_build.return_value = {"fault_type": "pod-cpu", "verification": verification}
+
+        result = _to_task_result({}, "t-vc")
+        assert result.verification == verification
+        assert result.extras["verification"] == verification
+        assert result.status == "degraded"
+        assert result.error is None
+
+    def test_new_fields_default_none(self):
+        """dataclass tail defaults: legacy constructors keep working."""
+        result = L4TaskResult(task_id="t-legacy", status="passed")
+        assert result.verification is None
+        assert result.observation_failures is None
+
+    @patch("chaos_agent.agent.state.build_status_data")
+    @patch("chaos_agent.agent.state.infer_task_state")
+    def test_observation_failures_auth_class(self, mock_infer, mock_build):
+        """Forbidden (403) in checklist evidence → auth-class entry."""
+        verification = {
+            "level": "unverified",
+            "layer1": {"status": "passed"},
+            "layer2": {"status": "unknown"},
+            "checklist": {
+                "items": [
+                    {"step": 1, "status": "skipped", "evidence": "kubectl top forbidden (403)"},
+                    {"step": 2, "status": "passed", "evidence": "CPU at 95%"},
+                ],
+            },
+        }
+        mock_infer.return_value = "unverified"
+        mock_build.return_value = {"fault_type": "pod-cpu", "verification": verification}
+
+        result = _to_task_result({}, "t-of")
+        assert result.observation_failures == [
+            {"channel": "step-1", "error_class": "auth", "count": 1},
+        ]
+
+    @patch("chaos_agent.agent.state.build_status_data")
+    @patch("chaos_agent.agent.state.infer_task_state")
+    def test_observation_failures_transient_class(self, mock_infer, mock_build):
+        """Timeout in evidence → transient-class entry (marker vocabulary
+        shared with the verifier prompt's evidence boundary)."""
+        verification = {
+            "level": "partial",
+            "layer1": {"status": "passed"},
+            "layer2": {"status": "partial"},
+            "checklist": {
+                "items": [
+                    {"step": 1, "status": "failed", "evidence": "metrics query timed out"},
+                    {"step": 1, "status": "failed", "evidence": "connection reset, retried ok"},
+                ],
+            },
+        }
+        mock_infer.return_value = "injected"
+        mock_build.return_value = {"fault_type": "pod-cpu", "verification": verification}
+
+        result = _to_task_result({}, "t-tr")
+        assert result.observation_failures == [
+            {"channel": "step-1", "error_class": "transient", "count": 2},
+        ]
+
+    @patch("chaos_agent.agent.state.build_status_data")
+    @patch("chaos_agent.agent.state.infer_task_state")
+    def test_observation_failures_empty_when_healthy(self, mock_infer, mock_build):
+        """No error markers anywhere → None, no placeholder entries."""
+        verification = {
+            "level": "verified",
+            "layer1": {"status": "passed"},
+            "layer2": {"status": "passed"},
+            "checklist": {
+                "items": [{"step": 1, "status": "passed", "evidence": "CPU at 95%"}],
+            },
+        }
+        mock_infer.return_value = "injected"
+        mock_build.return_value = {"fault_type": "pod-cpu", "verification": verification}
+
+        result = _to_task_result({}, "t-ok")
+        assert result.observation_failures is None
+
+    @patch("chaos_agent.agent.state.build_status_data")
+    @patch("chaos_agent.agent.state.infer_task_state")
+    def test_observation_failures_unknown_class_via_skipped(self, mock_infer, mock_build):
+        """A skipped step with marker-free text is still recorded (the
+        ``status == "skipped"`` flag IS the structural signal), classifying
+        as unknown. Free-form warnings without markers are NOT recorded —
+        otherwise every string warning would become noise."""
+        verification = {
+            "level": "partial",
+            "layer1": {"status": "passed"},
+            "layer2": {"status": "partial"},
+            "checklist": {
+                "items": [
+                    {"step": 3, "status": "skipped", "evidence": "tool unavailable"},
+                ],
+            },
+            "warnings": ["baseline was stale"],
+        }
+        mock_infer.return_value = "injected"
+        mock_build.return_value = {"fault_type": "pod-cpu", "verification": verification}
+
+        result = _to_task_result({}, "t-wn")
+        assert result.observation_failures == [
+            {"channel": "step-3", "error_class": "unknown", "count": 1},
+        ]
+
+    def test_status_code_matching_requires_word_boundary(self):
+        """Plain substring matching would let "24013ms" (transient timing
+        noise) contain "401" and misclassify it as auth — steering the
+        operator toward credentials instead of the network. Status codes
+        must match on word boundaries; real auth errors still classify."""
+        from chaos_agent.l4.adapter import _classify_observation_error
+
+        # Digit-noise containing "401"/"403" as substrings → NOT auth
+        assert _classify_observation_error("connection reset after 24013ms") == "transient"
+        assert _classify_observation_error("read 14033 bytes") == "unknown"
+        # Genuine status codes → auth
+        assert _classify_observation_error("HTTP 401 Unauthorized") == "auth"
+        assert _classify_observation_error("metrics query failed: (403)") == "auth"
+        assert _classify_observation_error("Error from server (Forbidden)") == "auth"

@@ -464,11 +464,15 @@ class TestPhase9D7CarrierNeutralNarrative:
 
 
 # phase-10 T3.4 —— 通用层旧键字面量的白名单。
-# phase-14 G5/G6/G7 清偿完毕：state_contract 删 blade_* 三条、compactor
-# 双键正则降单键 + kind 判据改名、两 store 迁移段 EOL（含 blade_uid
-# RENAME 的历史 ALTER 语句）。四文件内的旧键字面全部退役，白名单归
-# 空集——任何新增命中即违规（需先走 G3 式清偿或登记例外）。
-_PHASE10_LEGACY_LITERAL_ALLOWLIST: set[str] = set()
+# phase-14 G5/G6/G7 清偿后曾归空集；但 G6 fresh-database 裁决已被推翻
+# （kubectl-native 注入天然无 uid，存量旧库常见），两 store 的启动迁移段
+# 恢复——迁移 SQL 必须引用旧列名 blade_uid 才能兑旧库，属合法字面点，
+# 两文件登记回白名单（九期时同样登记过）。其余文件仍零容忍：任何新增
+# 命中即违规（需先走 G3 式清偿或登记例外）。
+_PHASE10_LEGACY_LITERAL_ALLOWLIST: set[str] = {
+    "persistence/task_store_postgresql.py",
+    "persistence/task_store_sqlite.py",
+}
 
 
 class TestPhase10KeyFaceUniformity:
@@ -592,6 +596,38 @@ _PHASE11_PROVIDER_IMPORT_ALLOWLIST = {
      "chaos_agent.agent.providers.host_shell.provider"),
     ("agent/providers/registry.py",
      "chaos_agent.agent.providers.k8s_native.provider"),
+    # drill-target-manifest-contract r15（2026-09）根因级修复：registry 新增
+    # is_blade_exec_create_delivery 垂直路由接缝——「kubectl exec 交付 blade
+    # create」的句法判定单源收敛到 chaosblade.verify 的
+    # classify_blade_exec_payload，k8s_native 两个 scan hook 经 registry
+    # 路由取用（与上组 register_builtins 同型：lazy、call-time-only、
+    # 仲裁层组装点）。
+    ("agent/providers/registry.py",
+     "chaos_agent.agent.providers.chaosblade.verify"),
+    # recovery-carrier-standard（2026-09）：ToolGuard 对 ``kubectl run`` 的
+    # 载体形态判定委托 canonical classifier（_is_recovery_carrier_run）
+    # ——两层判定单源永不漂移是显式设计决策（guard.py docstring），lazy、
+    # call-time-only，与本文件 registry 委托（L589）同型入册。
+    ("tools/guard.py",
+     "chaos_agent.agent.providers.k8s_native.classifier"),
+    # machinery≠matrix R23/G-7（2026-09）：归因层 HOST 面的工具名域
+    # （host_call_is_registered_recovery 的豁免由 provider 自己的工具名
+    # 挣得）经 declaration 接缝取纯数据常量 HOST_INJECT_TOOL_NAMES——
+    # provider 类属性与谓词同源永不漂移是显式设计决策，lazy、
+    # call-time-only，与 settings→declaration 同型（通用层取纯数据，
+    # 非具体 provider 实现）。
+    ("agent/execution_artifacts.py",
+     "chaos_agent.agent.providers.host_shell.declaration"),
+    # faultdrill-cr-channel M1（2026-09）：第四载体入册，三处均与既有同型
+    # ——组装点 declaration（纯数据，空词汇）、register_builtins 的 lazy
+    # provider 注册（暗启动门内）、关门分支 reconciliation 取 CARRIER_ID
+    # 纯常量（防 stale 注册，lazy、call-time-only）。
+    ("agent/providers/__init__.py",
+     "chaos_agent.agent.providers.faultdrill.declaration"),
+    ("agent/providers/registry.py",
+     "chaos_agent.agent.providers.faultdrill.provider"),
+    ("agent/providers/registry.py",
+     "chaos_agent.agent.providers.faultdrill.declaration"),
 }
 
 #: providers 目录下的平铺通用文件（通用仲裁 + 载体中立扫描原语）——
@@ -603,6 +639,7 @@ _PHASE11_PROVIDERS_GENERIC_FILES = {
     "agent/providers/base.py",
     "agent/providers/__init__.py",
     "agent/providers/message_scanning.py",
+    "agent/providers/uid_shapes.py",
 }
 
 
@@ -898,7 +935,7 @@ class TestPhase12DeclarationDiscipline:
                         bad.append(alias.name)
             elif isinstance(node, ast.ImportFrom):
                 if node.level > 0:
-                    bad.append(f"." * node.level + (node.module or ""))
+                    bad.append("." * node.level + (node.module or ""))
                 elif node.module and not _declaration_import_ok(node.module):
                     bad.append(node.module)
         assert bad == [

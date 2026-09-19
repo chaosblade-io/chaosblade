@@ -33,6 +33,7 @@ from chaos_agent.memory.tokens import (
     count_tokens_messages,
     estimate_context_tokens,
 )
+from chaos_agent.utils.truncation import elided_preview
 
 logger = logging.getLogger(__name__)
 
@@ -556,8 +557,23 @@ class ContextManager:
 
         # Ensure tool_call/tool_result pairs are not split.
         # Scan to_keep from the start, skipping [Compressed History]
-        # summaries: any ToolMessage whose AI caller is in to_compact
-        # is an orphan and must move back so the pair stays together.
+        # summaries: any ToolMessage sitting at the head of to_keep
+        # UNCONDITIONALLY moves to to_compact (fail-closed).
+        #
+        # Why unconditional: a head ToolMessage whose AI caller cannot be
+        # found in to_compact is either (a) a true orphan — its caller was
+        # lost to an earlier compaction or a history operation — or (b) a
+        # lookup miss (a call id home this scan does not cover, e.g.
+        # invalid_tool_calls). Moving is safe in BOTH cases: to_compact
+        # content is summarised, so nothing is lost semantically. Keeping
+        # it (the old ``break``) was fail-open — case (a)/(b) shipped the
+        # orphan to the provider, and strict endpoints (DeepSeek) reject
+        # unpaired tool messages with a 400 that aborts the whole turn
+        # (chaosblade-io/chaosblade#1344 signature #2). The caller lookup
+        # below is therefore LOGGING-ONLY: it distinguishes a paired move
+        # from an orphan recycle in the logs; correctness never depends on
+        # its completeness. The send-side gate (utils/message_integrity.py)
+        # remains the last line of defence.
         if messages_to_keep and messages_to_compact:
             i = 0
             while i < len(messages_to_keep):
@@ -578,8 +594,28 @@ class ContextManager:
                         if caller_in_compact:
                             break
                 if not caller_in_compact:
-                    break
+                    logger.warning(
+                        "Compaction boundary recycling an ORPHAN ToolMessage "
+                        "(tool_call_id=%r): no AI caller found in to_compact. "
+                        "Moved to to_compact anyway (fail-closed) so it cannot "
+                        "ship unpaired; its content survives in the summary.",
+                        tc_id,
+                    )
                 messages_to_compact.append(messages_to_keep.pop(i))
+
+            # ``append`` lands a recycled message at the END of to_compact, which
+            # is only its chronological home when to_compact's tail is the
+            # message immediately before it. Not guaranteed: the recent-window
+            # pass SKIPS summaries without spending budget, so a RECYCLED summary
+            # can sit in to_compact at a position LATER than a kept message this
+            # scan then moves — measured [0, 2, 1] for original positions.
+            # to_compact is the summariser's input, so restore original order
+            # with the same idiom to_keep uses above. Sorting BEFORE
+            # ``ensure_pair_integrity`` also hands that check a truthful tail: it
+            # inspects ``to_compact[-1]`` to decide whether a caller's results
+            # were stranded in to_keep, and an out-of-order tail answers that
+            # question about the wrong message.
+            messages_to_compact.sort(key=lambda m: msg_index_map.get(id(m), 0))
 
         # Additional safety: if the last message in to_compact is an AI
         # with tool_calls, its results may be in to_keep — pull it over.
@@ -599,7 +635,6 @@ class ContextManager:
 STRIP_HEAD_CHARS = 500
 STRIP_TAIL_CHARS = 500
 STRIP_THRESHOLD_CHARS = 2000
-STRIP_MARKER = "\n... [output truncated] ...\n"
 
 
 def strip_large_outputs(messages: list, threshold: int = STRIP_THRESHOLD_CHARS) -> list:
@@ -611,6 +646,18 @@ def strip_large_outputs(messages: list, threshold: int = STRIP_THRESHOLD_CHARS) 
 
     This reduces token usage without losing critical information,
     making the compaction input smaller and cheaper.
+
+    Two-layer semantics stay DECOUPLED (design D3): the threshold decides
+    WHO gets stripped (len > threshold); elided_preview's own passthrough
+    boundary (len <= head+tail) decides the cut shape. The order matters:
+    elided_preview alone would elide a 1000<len<=2000 message that the
+    default threshold deliberately leaves alone — the threshold gate runs
+    FIRST, so the default 2000 path is behavior-identical and the hook's
+    threshold=1000 path is mathematically identical (only the marker
+    changes: unquantified → ``[N chars elided]``). No notice is appended:
+    the stripped original never lands on disk (model_copy replaces the
+    message in place), so there is no retrieval path to promise — the
+    quantified elision marker is this layer's honesty floor.
 
     Args:
         messages: Conversation messages to strip.
@@ -634,10 +681,9 @@ def strip_large_outputs(messages: list, threshold: int = STRIP_THRESHOLD_CHARS) 
             result.append(msg)
             continue
 
-        # Truncate: keep head + marker + tail
-        head = content[:STRIP_HEAD_CHARS]
-        tail = content[-STRIP_TAIL_CHARS:]
-        truncated = head + STRIP_MARKER + tail
+        # Both-ends preview with a quantified elision marker (shared
+        # dialect) — the threshold gate above already ran.
+        truncated = elided_preview(content, STRIP_HEAD_CHARS, STRIP_TAIL_CHARS)
 
         # Create a copy with truncated content
         if hasattr(msg, "model_copy") and hasattr(msg, "__fields__"):

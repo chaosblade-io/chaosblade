@@ -8,6 +8,8 @@ locations to prevent reading secrets or system-critical files.
 import logging
 from pathlib import Path
 
+from chaos_agent.utils.truncation import build_truncation_notice
+
 logger = logging.getLogger(__name__)
 
 # Maximum file size to read in bytes (50 KB).
@@ -131,7 +133,15 @@ def safe_read_file(file_path: str) -> str:
         # ``st_size`` is only meaningful for regular files; omit the total
         # when it is unavailable or unreliable (0 for special files).
         size = p.stat().st_size
-        total = f" of {size}" if size > MAX_FILE_BYTES else ""
-        return text + f"\n\n[truncated: showing first {MAX_FILE_BYTES}{total} bytes]"
+        total = size if size > MAX_FILE_BYTES else len(raw)
+        # Shared truncation contract (kind=file-content): marker + honest
+        # total size + what is shown. Retrieval path deliberately omitted
+        # per the kind whitelist — re-reading the same file yields the same
+        # capped read, so a retrieval path would promise what this tool
+        # cannot deliver. MAX_FILE_BYTES semantics unchanged.
+        return text + build_truncation_notice(
+            "file-content", total, unit="bytes",
+            strategy_hint=f"showing first {MAX_FILE_BYTES} bytes",
+        )
 
     return raw.decode("utf-8", errors="replace")

@@ -368,6 +368,11 @@ def _is_observation_success(obs: dict) -> bool:
       * exit_code != 0  → False
       * exit_code == 0 but stdout contains a kubectl error marker → False
       * otherwise → True
+
+    Note: an observation flagged ``expected_absence`` (the retry LLM judged
+    its non-zero exit to be the expected pre-injection absence form) is
+    still not "success" by this predicate — callers that need "is this a
+    valid baseline value" must OR it in explicitly.
     """
     if obs.get("exit_code") != 0:
         return False
@@ -378,9 +383,51 @@ def _is_observation_success(obs: dict) -> bool:
     return True
 
 
+# Semantic-empty forms an exit-0 kubectl observation can take: a selector
+# query that matched nothing ("No resources found"), an empty List JSON
+# (``"items": []`` — compact or pretty), or genuinely empty merged output.
+# None of these carry a baseline VALUE: the command executed fine, but the
+# observation anchored on nothing (wrong selector, wrong name, or a resource
+# the approved plan only creates during execute). #16 R10 live-cluster
+# replay: three of four "succeeded" observations were exactly this form,
+# yet counted into ``success_count`` and coverage as if they had observed
+# something. The executor chokepoint stamps ``empty_observation`` and the
+# assembly layer keeps ``valid_count`` / ``empty_count`` separate from
+# ``success_count`` so an empty-spinning baseline can no longer read as a
+# high-quality one.
+_EMPTY_OUTPUT_MARKERS = (
+    "No resources found",
+)
+_EMPTY_LIST_JSON_RE = re.compile(r'"items"\s*:\s*\[\s*\]')
+
+
+def _is_empty_observation(obs: dict) -> bool:
+    """Return True iff a SUCCESSFUL observation carries no observable value.
+
+    Strictly a refinement of ``_is_observation_success`` — the two are
+    composable: non-zero exits and kubectl error markers are failures with
+    their own signal, not emptiness. This predicate classifies only the
+    exit-0-with-nothing-to-show form (the three marker shapes above), the
+    form both the #16 replay reproduced live and the message-integrity
+    notes already documented as a benign predicate disagreement. The
+    explicit flag resolves that disagreement: execution success and
+    observation validity stop sharing one predicate.
+    """
+    if obs.get("exit_code") != 0:
+        return False
+    merged = (obs.get("stdout") or "") + (obs.get("stderr") or "")
+    if not merged.strip():
+        return True
+    if any(marker in merged for marker in _EMPTY_OUTPUT_MARKERS):
+        return True
+    return bool(_EMPTY_LIST_JSON_RE.search(merged))
+
+
 __all__ = [
     "_KUBECTL_ERROR_MARKERS",
     "_is_observation_success",
+    "_EMPTY_OUTPUT_MARKERS",
+    "_is_empty_observation",
     "BaselineCommand",
     "BASELINE_COMMANDS",
     "_SCOPE_FALLBACK",

@@ -47,6 +47,12 @@ interface AppProps {
    *  through to ``BootOrchestrator`` so the doctor card's captured-at
    *  matches when the check started rather than when it landed. */
   bootCapturedAt: string;
+  /** Resume boot (``blade-ai resume -i <sid>``): BootRunner's resume
+   *  branch already dispatched the doctor + pending-tasks cards
+   *  BEFORE the replay, so ``BootOrchestrator`` must not mount — it
+   *  would fetch the same pair again and append the duplicates after
+   *  the replayed history. */
+  skipOrchestrator?: boolean;
 }
 
 /**
@@ -75,20 +81,22 @@ export const App: React.FC<AppProps> = ({
   serverUrl,
   version,
   bootCapturedAt,
+  skipOrchestrator = false,
 }) => {
   return (
     <Box flexDirection="column">
       {/* Debug-only — see OVERFLOW_PROBE_ENABLED above. Not mounted
-       *  in production (env var unset) so the probe's 9
-       *  ``useAppSelector`` subscriptions never attach. */}
+       * in production (env var unset) so the probe's 9
+       * ``useAppSelector`` subscriptions never attach. */}
       {OVERFLOW_PROBE_ENABLED && <OverflowProbeMount />}
       {/* BootOrchestrator and Composer require a reachable backend.
           While ``BootRunner`` is still doing the spawn / health / create
           handshake, ``client`` is null and we render only MainContent
           — which shows the boot spinner sourced from
           ``state.bootProgress`` (set by BootRunner during the handshake
-          and by BootOrchestrator afterwards). */}
-      {client && (
+          and by BootOrchestrator afterwards). Resume boots skip the
+          orchestrator entirely — see ``skipOrchestrator`` above. */}
+      {client && !skipOrchestrator && (
         <BootOrchestrator client={client} capturedAt={bootCapturedAt} />
       )}
       <MainContent version={version} serverUrl={serverUrl} />

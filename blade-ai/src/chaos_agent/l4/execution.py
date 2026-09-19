@@ -10,6 +10,7 @@ import warnings
 from typing import TYPE_CHECKING
 
 from chaos_agent.l4.adapter import (
+    attach_intent_handoff,
     make_trajectory_id,
     state_to_task_result,
     test_task_to_initial_state,
@@ -62,7 +63,6 @@ class _L4ExecutionMixin:
         healed: marks self-heal recursion to avoid double finish and double heal.
         """
         trajectory_id = make_trajectory_id(task.task_id)
-        initial_state = test_task_to_initial_state(task)
         config = {
             "configurable": {"thread_id": task.task_id},
             "recursion_limit": 150,
@@ -70,6 +70,25 @@ class _L4ExecutionMixin:
         final_result: L4TaskResult | None = None
 
         try:
+            # Contract construction lives INSIDE the try (l4-contract-
+            # faithfulness): a payload violating the fault_intent contract
+            # must surface as a structured failed result (diagnostics name
+            # the missing key and the payload keys actually present), never
+            # as an uncaught ValueError that kills the host worker process.
+            initial_state = test_task_to_initial_state(task)
+            # l4-intent-handoff-parity: when the payload declares the dialogue
+            # source (platform injects ``chaos-<session>``), bridge the intent
+            # graph checkpoint's evidence (probe_snapshot / progress_ledger /
+            # handoff_summary) into the pipeline's initial state — same handoff
+            # a TUI dispatch performs. No declaration (REST direct, older
+            # platforms) keeps the cold-start path byte-identical. The heal
+            # recursion re-enters this line and re-bridges — idempotent (re-reads
+            # the checkpoint, overwrites the same fields).
+            intent_thread_id = (task.payload or {}).get("intent_thread_id", "")
+            if intent_thread_id:
+                initial_state = await attach_intent_handoff(
+                    initial_state, pool, intent_thread_id,
+                )
             inject_result = await self._run_inject_with_runtime(
                 pool, runtime, initial_state, config, task, trajectory_id
             )
@@ -330,12 +349,38 @@ class _L4ExecutionMixin:
                 raise _CancelRequested()
 
         # --- Bootstrap session for task file persistence ---
+        # l4-intent-handoff-parity: reuse the same bootstrap helper the TUI
+        # dispatch and CLI runner use (bootstrap_task_session — third
+        # caller, no fourth copy) so an L4 task file is born identically:
+        # when the intent bridge seeded a handoff summary, it becomes the
+        # task file's FIRST entry (P0-7-6 intent/execution boundary marker)
+        # instead of first appearing via an in-run flush — or never, if
+        # the run dies before any memory node. The helper is fully
+        # defensive (no store → no-op; has_active → no-op; exceptions
+        # logged, never raised), matching this block's old contract.
         try:
-            from chaos_agent.memory.session_store import get_global_session_store
+            from langchain_core.messages import SystemMessage
 
-            _store = get_global_session_store()
-            if _store and not _store.has_active(task.task_id):
-                _store.create_session(task.task_id, operation="inject")
+            from chaos_agent.agent.nodes.planning.intent_clarification import (
+                bootstrap_task_session,
+            )
+
+            _seed = None
+            for _m in initial_state.get("messages") or []:
+                _content = getattr(_m, "content", "")
+                if (
+                    isinstance(_m, SystemMessage)
+                    and isinstance(_content, str)
+                    and _content.startswith("[Intent Clarification Summary]")
+                ):
+                    _seed = _m
+                    break
+            bootstrap_task_session(
+                task.task_id,
+                operation="inject",
+                tui_session_id="",
+                handoff_message=_seed,
+            )
         except Exception:
             pass
 
@@ -498,31 +543,65 @@ class _L4ExecutionMixin:
             from chaos_agent.agent.result.operation_outcome import (
                 read_recover_verification,
             )
-            from chaos_agent.agent.state import infer_task_state
+            from chaos_agent.agent.state import TaskState, infer_task_state
+            from chaos_agent.l4.adapter import _collect_observation_failures
 
             recover_task_state = infer_task_state(recover_result)
-            if recover_task_state in ("recovered", "partial_recovered"):
+            # First-class verification follows the FINAL verdict: after the
+            # auto-recovery stage the result's status is decided by the
+            # recover graph, so ``result.verification`` must explain THAT
+            # decision (same contract as the explicit path in recovery.py).
+            # Leaving the inject-side verdict in place would read as
+            # self-contradictory to an auditor — e.g. status="degraded"
+            # (recovery unconfirmed) with verification.level="verified"
+            # (inject confirmed). The inject-side evidence stays reachable
+            # via extras["verification"] (the adapter's mirror).
+            recover_verification = read_recover_verification(recover_result)
+            if recover_task_state in (TaskState.RECOVERED.value, TaskState.PARTIAL_RECOVERED.value):
                 inject_result.status = (
-                    "passed" if recover_task_state == "recovered" else "degraded"
+                    "passed"
+                    if recover_task_state == TaskState.RECOVERED.value
+                    else "degraded"
                 )
                 inject_result.extras["recovery_level"] = recover_task_state
-                inject_result.extras["recover_verification"] = (
-                    read_recover_verification(recover_result)
+                inject_result.extras["recover_verification"] = recover_verification
+                inject_result.verification = recover_verification
+                inject_result.observation_failures = (
+                    _collect_observation_failures(recover_verification)
+                )
+            elif recover_task_state == TaskState.UNVERIFIED.value:
+                # Recovery issued but unconfirmed (observation channel
+                # unavailable): the system may still be under fault. Downgrade
+                # a "passed" to "degraded" so callers re-check manually —
+                # never upgrade a "failed" (counter-evidence stands).
+                if inject_result.status == "passed":
+                    inject_result.status = "degraded"
+                inject_result.extras["recovery_level"] = TaskState.UNVERIFIED.value
+                inject_result.extras["recover_verification"] = recover_verification
+                inject_result.verification = recover_verification
+                inject_result.observation_failures = (
+                    _collect_observation_failures(recover_verification)
                 )
 
             # Emit recover conclusion event.
             if runtime and hasattr(runtime, "emit_event"):
                 _recover_status_map = {
-                    "recovered": "succeeded",
-                    "partial_recovered": "succeeded (partial recovery)",
-                    "failed": "failed",
+                    TaskState.RECOVERED.value: "succeeded",
+                    TaskState.PARTIAL_RECOVERED.value: "succeeded (partial recovery)",
+                    TaskState.UNVERIFIED.value: "unconfirmed (recovery not verified)",
+                    TaskState.FAILED.value: "failed",
                 }
                 recover_text = _recover_status_map.get(recover_task_state, "completed")
                 recover_level = (
                     "ok"
-                    if recover_task_state == "recovered"
+                    if recover_task_state == TaskState.RECOVERED.value
                     else (
-                        "warn" if recover_task_state == "partial_recovered" else "error"
+                        "warn"
+                        if recover_task_state in (
+                            TaskState.PARTIAL_RECOVERED.value,
+                            TaskState.UNVERIFIED.value,
+                        )
+                        else "error"
                     )
                 )
                 experiment_uid = (inject_result.extras or {}).get(
@@ -581,11 +660,29 @@ class _L4ExecutionMixin:
 
             trace = _traces.get(task.task_id)
             if trace:
-                traj.context_window = {
-                    "total_input": trace.total_token_input,
-                    "total_output": trace.total_token_output,
-                    "llm_calls": trace.total_llm_calls,
-                }
+                # Defensive isolation: ``traj.context_window`` belongs to the
+                # external resiliencebenchmark trajectory schema, which is not
+                # a hard dependency here. If a future schema rejects the extra
+                # ``total_cached`` key (or its setter validates on assign),
+                # degrade to a warning instead of crashing trajectory
+                # population — the cache metric is observability, not control
+                # flow.
+                try:
+                    traj.context_window = {
+                        "total_input": trace.total_token_input,
+                        "total_output": trace.total_token_output,
+                        "llm_calls": trace.total_llm_calls,
+                        # Prompt-cache hits: a SUBSET of total_input (not additive).
+                        # Consumers derive hit rate = total_cached / total_input.
+                        "total_cached": trace.total_token_cached,
+                    }
+                except Exception as e:
+                    logger.warning(
+                        "_populate_trajectory: failed to set context_window for "
+                        "task %s: %s",
+                        task.task_id,
+                        e,
+                    )
 
         if hasattr(traj, "eval_report"):
             metrics = self._derive_metrics(values)
@@ -604,7 +701,7 @@ class _L4ExecutionMixin:
             read_inject_verification,
             read_operation_outcome,
         )
-        from chaos_agent.agent.state import infer_task_state
+        from chaos_agent.agent.state import TaskState, infer_task_state
 
         task_state = infer_task_state(values)
         verification = read_inject_verification(values) or {}
@@ -637,7 +734,11 @@ class _L4ExecutionMixin:
                 pass
 
         return {
-            "success_rate": (1.0 if task_state in ("injected", "recovered") else 0.0),
+            "success_rate": (
+                1.0
+                if task_state in (TaskState.INJECTED.value, TaskState.RECOVERED.value)
+                else 0.0
+            ),
             "coverage": 1.0 if fault_type_from_state(values) else 0.5,
             "flake_score": min(1.0, (replan_count + verify_replan_count) / 3.0),
             "assert_confidence": level_confidence.get(ver_level, 0.3),
@@ -648,8 +749,12 @@ class _L4ExecutionMixin:
             "token_efficiency": 0,
             "recovery_rate": (
                 1.0
-                if task_state == "recovered"
-                else (0.5 if task_state == "partial_recovered" else 0.0)
+                if task_state == TaskState.RECOVERED.value
+                else (
+                    0.5
+                    if task_state == TaskState.PARTIAL_RECOVERED.value
+                    else 0.0
+                )
             ),
             "blast_radius_score": 0.5,
         }
@@ -661,9 +766,25 @@ class _L4ExecutionMixin:
         try:
             state = await pool.inject_graph.aget_state(config)
             if state and state.values:
-                from chaos_agent.agent.state import has_active_fault
+                from chaos_agent.agent.state import has_live_fault
 
-                if has_active_fault(state.values):
+                # Live gate (round-25 R1/R5, single-sourced round-27):
+                # has_active_fault is the COMMITTED predicate — a destroyed
+                # experiment stays committed forever (the handle mirrors the
+                # never-clear UID slot) and firing the recover graph at the
+                # corpse wastes a full LLM run, flips the task state and
+                # pollutes the trajectory. The live twin carries the
+                # carrier split round-25 legislated here inline: experiment
+                # carriers gate on the liability primitive (owned − retired
+                # − message-proven destroy), UID-less (native) tasks keep
+                # the committed predicate (a missed emergency recovery —
+                # residual environment fault — is strictly worse than a
+                # redundant one; no native death oracle exists). Round-27
+                # also closed the hydration lane the inline gate missed: a
+                # corpse UID with NO stored handle used to fall into the
+                # committed branch and fire; the predicate hydrates first,
+                # so the derived experiment handle reaches the oracle.
+                if has_live_fault(state.values):
                     from chaos_agent.agent.result.task_snapshot import (
                         resolve_recover_initial_state,
                     )
@@ -740,7 +861,25 @@ class _L4ExecutionMixin:
                 DeprecationWarning,
                 stacklevel=2,
             )
-            return "approved"
+            # Unattended auto-approve decides through the shared boundary
+            # helper (AUTO delegation: always "approved" — the manifest
+            # is the authority, the guard enforces the per-name
+            # boundary). Delegating a WIDENED contract (the interrupt
+            # payload's ``write_set_widened`` marker) additionally lands
+            # in the audit log — this legacy path has no event stream to
+            # carry an ``auto_approved`` event.
+            from chaos_agent.agent.nodes.gates._write_set_boundary import (
+                unattended_resume_value,
+                widened_auto_approval_payload,
+            )
+            if widened_auto_approval_payload(interrupt_payload) is not None:
+                logging.getLogger(__name__).info(
+                    "auto_approved: legacy pre_approved path delegated a "
+                    "widened write-set contract (case manifest "
+                    "mechanism_writes beyond victim coverage); "
+                    "target_guard enforces the per-name boundary"
+                )
+            return unattended_resume_value(interrupt_payload)
 
         # 3) Legacy require_approval boolean
         if runtime is not None and hasattr(runtime, "require_approval"):
@@ -817,8 +956,13 @@ class _L4ExecutionMixin:
             — pending_card is non-None when an interrupt is reached.
             — token_usage aggregates all LLM calls during this drive.
         """
+        from chaos_agent.observability.tracer import (
+            _cache_read_from_token_usage,
+            _cache_read_from_usage_metadata,
+        )
         prompt_tokens = 0
         completion_tokens = 0
+        cache_tokens = 0
 
         async for event in graph.astream_events(graph_input, config, version="v2"):
             if on_event is not None:
@@ -833,12 +977,14 @@ class _L4ExecutionMixin:
                     if um and isinstance(um, dict):
                         prompt_tokens += um.get("input_tokens", 0)
                         completion_tokens += um.get("output_tokens", 0)
+                        cache_tokens += _cache_read_from_usage_metadata(um)[0]
                     # Fallback: response_metadata.token_usage
                     elif hasattr(output, "response_metadata"):
                         tu = (output.response_metadata or {}).get("token_usage")
                         if tu and isinstance(tu, dict):
                             prompt_tokens += tu.get("prompt_tokens", 0)
                             completion_tokens += tu.get("completion_tokens", 0)
+                            cache_tokens += _cache_read_from_token_usage(tu)[0]
                         else:
                             logger.warning(
                                 "_drive_until_interrupt: on_chat_model_end fired but "
@@ -881,11 +1027,13 @@ class _L4ExecutionMixin:
                     if um and isinstance(um, dict):
                         prompt_tokens += um.get("input_tokens", 0)
                         completion_tokens += um.get("output_tokens", 0)
+                        cache_tokens += _cache_read_from_usage_metadata(um)[0]
                     elif hasattr(msg, "response_metadata"):
                         tu = (msg.response_metadata or {}).get("token_usage")
                         if tu and isinstance(tu, dict):
                             prompt_tokens += tu.get("prompt_tokens", 0)
                             completion_tokens += tu.get("completion_tokens", 0)
+                            cache_tokens += _cache_read_from_token_usage(tu)[0]
             total = prompt_tokens + completion_tokens
             if total == 0:
                 # Log the first AI message's metadata for debugging
@@ -906,6 +1054,8 @@ class _L4ExecutionMixin:
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "total_tokens": total,
+                # Cache-hit subset of prompt_tokens (0 when none reported).
+                "cached_tokens": cache_tokens,
             }
             if total > 0
             else None

@@ -138,6 +138,7 @@ class TestOccupantContract:
         assert eff.reject_suggestion
         assert _feedback_for(eff).is_hard_floor is False
 
+
     def test_pod_mixed_into_multi_document_stays_refused(self):
         stdin = _COMPLIANT + "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: side\n"
         eff = infer_effective_target("kubectl", _apply_args(stdin))
@@ -155,8 +156,12 @@ class TestOccupantContract:
         assert "ONLY document" in (eff.reject_suggestion or "")
 
     def test_non_pod_workload_kind_keeps_mechanism_ban(self):
+        # Deployment is deliberately NOT the sample here: a single-document
+        # Deployment now takes the drill-target contract branch (see
+        # test_drill_target_manifest.py); the still-banned workload kinds are
+        # anchored with StatefulSet instead.
         eff = infer_effective_target(
-            "kubectl", _apply_args("apiVersion: apps/v1\nkind: Deployment\n"),
+            "kubectl", _apply_args("apiVersion: apps/v1\nkind: StatefulSet\n"),
         )
         assert eff.scope == "__banned__"
         assert eff.mechanism_banned is True
@@ -294,8 +299,12 @@ class TestScreenerLoopVehicleManifest:
 
 
 class TestDriftCorrectionPvcClaims:
-    """pvc_claims invalidate on ANY identity change; the label-derived
-    owner/resolved sets keep their pre-existing (labels-only) invalidation."""
+    """pvc_claims invalidate on ANY identity change. owner_names is
+    DUAL-SOURCED (labels-matched owners + the names→ownerReferences
+    generation anchor) so it too invalidates on ANY identity change —
+    after a merge the surviving anchors cannot be attributed to one
+    source, so the guard fails closed. resolved_names remains
+    labels-only derived and keeps the labels-only invalidation."""
 
     def _state(self):
         return {
@@ -321,15 +330,17 @@ class TestDriftCorrectionPvcClaims:
         base.update(kw)
         return EffectiveTarget(**base)
 
-    def test_names_change_drops_claims_but_keeps_label_derived_sets(self):
+    def test_names_change_drops_claims_and_owner_anchor_keeps_resolved(self):
         result = _apply_drift_correction(
             self._state(), self._eff(names=("pod-c",)),
         )
         approved = result["approved_target"]
         assert approved["pvc_claims"] == []
-        # owner/resolved are LABEL-derived — a names-only drift must not
-        # discard them (pre-existing behaviour, deliberately preserved).
-        assert approved["owner_names"] == ["deploy-a"]
+        # owner_names is dual-sourced (labels + names→ownerReferences);
+        # a names-only drift can stale the generation anchor and the
+        # merged set cannot be re-attributed — drop it, fail closed.
+        assert approved["owner_names"] == []
+        # resolved_names is purely label-derived and survives.
         assert approved["resolved_names"] == ["pod-a", "pod-b"]
 
     def test_labels_change_drops_all_derived_sets(self):
@@ -341,10 +352,103 @@ class TestDriftCorrectionPvcClaims:
         assert approved["owner_names"] == []
         assert approved["resolved_names"] == []
 
-    def test_namespace_only_change_keeps_all_derived_sets(self):
+    def test_namespace_change_drops_claims_keeps_owner_anchor(self):
+        """B81 follow-up: a namespace-only correction moves the target to
+        a DIFFERENT object domain — claims are old-namespace facts and a
+        same-name PVC in the new namespace must not silently widen the
+        whitelist, so they drop (fail closed). owner_names keeps its
+        names/labels-only invalidation semantics."""
         result = _apply_drift_correction(
             self._state(), self._eff(names=("pod-a",), namespace="ns2"),
         )
         approved = result["approved_target"]
-        assert approved["pvc_claims"] == ["data-pvc"]
+        assert approved["pvc_claims"] == []
         assert approved["owner_names"] == ["deploy-a"]
+
+
+class TestDeploymentApprovalAnchor:
+    """B79 (case #39-R): a workload-scope approval freezes its pod
+    template's PVC claims, so the occupant channel is anchored exactly
+    like a pod-scope approval. The gate itself never inspected the
+    approved scope — the blind spot was upstream claim discovery, so
+    these tests pin the gate's scope-agnostic behaviour: only the frozen
+    claim set decides."""
+
+    def _approved(self, claims, scope="deployment"):
+        return ApprovedTarget(
+            scope=scope, namespace="prod",
+            names=("drill-mntopt-target",),
+            pvc_claims=tuple(claims),
+        )
+
+    def test_deployment_anchor_allows_the_occupant(self):
+        # #39-R replay: deployment approval, claims frozen from the pod
+        # template, occupant mounts the same claim → ALLOW.
+        d = _screen_vehicle_manifest(
+            TestVehicleManifestScreening.EFFECTIVE,
+            self._approved(("data-pvc",)),
+        )
+        assert d.verdict == GuardVerdict.ALLOW
+
+    def test_claims_outside_template_whitelist_still_reject(self):
+        # The whitelist has teeth: a deployment whose template mounts
+        # only its own claims must not admit an occupant on anything else.
+        d = _screen_vehicle_manifest(
+            TestVehicleManifestScreening.EFFECTIVE,
+            self._approved(("drill-mntopt-pvc",)),
+        )
+        assert d.verdict == GuardVerdict.REJECT_BANNED
+        assert d.effective.mechanism_banned is False
+        # The suggestion names the APPROVED whitelist (what the occupant
+        # may claim), mirroring the pod-approval rejection shape.
+        assert "drill-mntopt-pvc" in d.suggestion
+        assert decision_to_feedback(d).is_hard_floor is False
+
+    def test_templateless_deployment_keeps_the_ban(self):
+        # A deployment with no PVC in its template freezes claims=()
+        # — no anchor, so the occupant channel stays closed. Fail-closed
+        # is the gate's job and it must not change with this fix.
+        d = _screen_vehicle_manifest(
+            TestVehicleManifestScreening.EFFECTIVE,
+            self._approved(()),
+        )
+        assert d.verdict == GuardVerdict.REJECT_BANNED
+        assert d.effective.mechanism_banned is True
+        assert decision_to_feedback(d).is_hard_floor is True
+
+
+class TestScreenerLoopDeploymentAnchor:
+    """End-to-end: the #39-R path — deployment-scope approval frozen
+    WITH its template claims lets the occupant apply pass the screener
+    and register its artifact."""
+
+    @pytest.mark.asyncio
+    async def test_deployment_approval_passes_occupant_apply(self):
+        settings.target_guard_enforcing = True
+        approved = freeze_approved_target(
+            target={"namespace": "prod", "names": ["drill-mntopt-target"]},
+            params={"scope": "deployment"},
+            fault_scope="deployment", fault_target="disk", fault_action="fill",
+            pvc_claims=("data-pvc",),
+        )
+        state = {
+            "task_id": "task-39r",
+            "messages": [AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "kubectl",
+                    "args": _apply_args(_COMPLIANT),
+                    "id": "tc-apply-39r",
+                }],
+            )],
+            "approved_target": approved,
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        artifacts = delta.get("execution_artifacts") or []
+        occupants = [
+            a for a in artifacts if a.get("type") == "occupant_pod"
+        ]
+        assert len(occupants) == 1
+        assert occupants[0]["claims"] == ["data-pvc"]
+        assert "messages" not in delta  # no fabricated rejection

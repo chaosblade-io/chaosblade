@@ -15,7 +15,7 @@
 3. 观察 Pod CPU 使用率变化
 
 **注入验证**：
-1. `kubectl top pod <pod-name> -n <namespace>` 确认 CPU 使用率持续高于阈值
+1. `kubectl top pod <pod-name> -n <namespace>` 确认 CPU 使用率高于注入目标——单次采样读数高于目标即压力已发生；「持续保持」由机制存活保证（fullload 实验在册即持续满载由构造成立），无需反复采样验证持续
 2. 进入容器查看 CPU 占用进程
 3. （可选，仅当环境部署了 APM 时）借助 APM 分析 CPU 热点分布；无 APM 不影响判定
 4. （可选，仅当演练方提供了应用访问入口时）确认对其他服务的调用出现延迟或超时；无入口时上述 CPU 级证据成立即可判定
@@ -34,7 +34,7 @@
 
 ---
 
-**降级方案（kubectl-native）**
+**手段2（kubectl-native）**
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现等效 CPU 压力注入。
 
@@ -70,6 +70,7 @@ kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c '
   echo "started <N> loops, auto-stop after <duration>s"
 '
 ```
+倒计时从武装时刻起算：负载发生器启动与定时器武装在同一 sh -c 载荷内原子紧邻（无侵蚀间隙）；武装后发生任何修复需全额重武装：先 `kubectl exec <pod-name> -n <namespace> -c <container> -- sh -c 'pkill -f "loadgen-worker.pid[s]"; true'` 一并停掉故障与旧定时器（后台 subshell 共享载荷 cmdline，此杀同时命中定时器与负载循环，即全停语义），再重跑上方注入命令原子重武装+重注入（见 SKILL.md 安全红线「故障窗口完整」）
 
 恢复命令（从精确到兜底，任选其一）：
 ```bash

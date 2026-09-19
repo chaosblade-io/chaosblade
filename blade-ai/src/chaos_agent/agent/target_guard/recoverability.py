@@ -67,10 +67,18 @@ class Recoverability:
         missing: When not recoverable, the concrete things that are absent
             (e.g. "a time bound", "a paired inverse (iptables -D ...)"). These
             are surfaced verbatim to the model so the feedback is actionable.
+        readonly_unproven: True when the rejection is about FORM, not about a
+            missing reversal — the command carries no detectable mutation verb
+            (B34: a compound ``iptables -S | grep`` probe was told to "add a
+            paired iptables -D" when there was no ``-I`` to invert). Callers
+            render the split-into-single-statement-probes direction instead
+            of the reversal direction. Never affects ``recoverable``: the
+            verdict stays fail-closed either way.
     """
 
     recoverable: bool
     missing: tuple[str, ...] = ()
+    readonly_unproven: bool = False
 
 
 def _has_systemd_timer(lowered: str) -> bool:
@@ -109,10 +117,16 @@ def _has_self_terminating_bound(lowered: str) -> bool:
 
 
 def _iptables_rules_are_reversed(command: str) -> bool:
-    """Require every inserted rule to have the same explicit delete rule."""
+    """Require every inserted rule to have the same explicit delete rule.
+
+    Long forms (``--insert`` / ``--append`` / ``--delete``) joined the short
+    verbs at the B34 fix — a pure tightening: they used to be invisible to
+    this regex, so ``iptables --insert INPUT 1 ...`` read as "zero rules
+    inserted" and the command fell into the zero-mutation guidance below.
+    """
     mutations = re.findall(
         r"\b(ip6tables|iptables)\b\s+(?:--wait(?:=[0-9]+)?\s+|-w(?:\s+[0-9]+)?\s+)?"
-        r"(-[iad])\s+([^;&|]+)",
+        r"(-[iad]|--insert|--append|--delete)\s+([^;&|]+)",
         command,
     )
     inserted: list[tuple[str, str]] = []
@@ -124,9 +138,9 @@ def _iptables_rules_are_reversed(command: str) -> bool:
         rule = re.split(r"\s+(?:[0-9]*>|<)", rule, maxsplit=1)[0]
         normalized = " ".join(rule.strip(" \t\r\n\"'").split())
         item = (binary, normalized)
-        if action in ("-i", "-a"):
+        if action in ("-i", "-a", "--insert", "--append"):
             inserted.append(item)
-        elif action == "-d":
+        elif action in ("-d", "--delete"):
             deleted.append(item)
     if not inserted:
         return False
@@ -190,6 +204,37 @@ def _network_inverse(lowered: str) -> bool:
     return False
 
 
+# Every mutation verb the network pairing frame can SEE, short and long
+# forms. Anchored to the family's binaries with a gap that cannot cross a
+# command separator (``;`` / ``&`` / ``|`` / newline), so a ``grep -i`` in
+# the NEXT segment can never pair up with an ``iptables`` in this one —
+# B34's rejected compound had exactly that shape. Judged on lowered text,
+# where case cannot separate ``-X`` (delete-chain) from ``-x`` (exact
+# display): the collision is accepted in the mutation direction on purpose
+# (over-detecting routes guidance to the reversal frame, which stays
+# fail-closed; under-detecting would hand a real mutation the read-only
+# guidance). Routing-only signal — it never admits anything by itself.
+_NETWORK_MUTATION_VERB = re.compile(
+    r"\b(?:ip6tables|iptables)\b[^;&|\n]{0,48}?"
+    r"(?:-[iadrfpze]\b|--insert\b|--append\b|--delete\b|--replace\b"
+    r"|--flush\b|--delete-chain\b|--new-chain\b|--policy\b|--zero\b"
+    r"|--rename-chain\b)"
+    r"|\btc\b[^;&|\n]{0,48}?\b(?:add|del|delete|change|replace|mod)\b"
+    r"|\bnft\b[^;&|\n]{0,48}?\b(?:add|delete|insert|flush|create|destroy)\b"
+)
+
+
+def _network_has_mutation_verb(lowered: str) -> bool:
+    """Whether any family binary is invoked with a mutation verb (B34).
+
+    A network-family command with NO mutation verb is not "missing a paired
+    inverse" — there is nothing to invert. It reached this gate because the
+    read-only probe face could not clear its compound form (redirect /
+    expansion / unknown segment), so the honest guidance points at the FORM.
+    """
+    return _NETWORK_MUTATION_VERB.search(lowered) is not None
+
+
 def _disk_inverse(lowered: str) -> bool:
     fill_path = _disk_fill_path(lowered)
     if not fill_path:
@@ -234,8 +279,16 @@ _ANY_LOOP = re.compile(
 # A port-occupation fault expressed as a LISTENER bounded by timeout(1) or
 # --timeout (skill case Node_网络故障_节点端口占用): the port is held only while
 # the listener runs, so ending the process IS the recovery — no inverse rule
-# exists to pair.
-_NC_LISTEN = re.compile(r"\bnc\b[^;&|\n]{0,20}-l\b")
+# exists to pair. Both listener vocabularies match: ``nc -l`` and a socat
+# TCP-LISTEN address (the case-law equivalent for hosts without nc). The
+# EXEC:/SYSTEM:/SHELL: danger is NOT re-checked here — the family classifier
+# (``carriers.classify_host_operation``) voids those shapes before this gate
+# ever sees family="network", and this layer's single responsibility is the
+# lifetime bound.
+_PORT_LISTENER = re.compile(
+    r"\bnc\b[^;&|\n]{0,20}-l\b"
+    r"|\bsocat\b[^;&|\n]{0,60}\btcp[46]?-listen:"
+)
 
 # An IO-pressure burn bounded the same way (skill cases Node_磁盘IO过高,
 # Pod_Terminating_Volume卸载失败): the pressure stops when the bounded burner
@@ -378,15 +431,35 @@ def assess(
     if family == "network":
         # A timeout-bounded listener occupies the port only while it runs:
         # ending the process IS the recovery, no inverse rule exists.
-        if _is_bounded_listener_or_burn(lowered, _NC_LISTEN):
+        if _is_bounded_listener_or_burn(lowered, _PORT_LISTENER):
             return Recoverability(True)
         has_timer = _has_delayed_reversal(lowered)
         has_inverse = _network_inverse(lowered)
+        # B34: with no mutation verb anywhere, "add a paired iptables -D"
+        # is nonsense guidance — there is no -I/-A to invert. The command
+        # is either read-only inspection whose compound form the probe
+        # face could not clear (redirect / expansion / unknown segment),
+        # or a mutation spelled with verbs this frame cannot pair. Either
+        # way the two honest directions are the ones in the guidance
+        # below; both keep the rejection fail-closed.
+        if not has_inverse and not _network_has_mutation_verb(lowered):
+            return Recoverability(
+                False,
+                (
+                    "a provable form: split read-only inspection into "
+                    "single-statement probes (one command per exec, e.g. "
+                    "`chroot /host iptables -S INPUT`), or spell a real "
+                    "mutation with the standard verbs (-I/-A paired with a "
+                    "matching -D) so the reversal check can verify it",
+                ),
+                readonly_unproven=True,
+            )
         return _combine(
             has_timer, has_inverse,
             inverse_hint="a paired inverse (iptables -D matching every -I/-A, "
             "or tc qdisc del / nft delete); a port-occupation fault instead "
-            "bounds its nc -l listener with timeout N so it self-terminates",
+            "bounds its nc -l / socat TCP-LISTEN listener with timeout N so "
+            "it self-terminates",
         )
 
     if family == "process":

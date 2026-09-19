@@ -127,7 +127,7 @@ class TestGenerateSkillCatalog:
         fp = _content_fingerprint(skill_content)
 
         # Pre-populate cache
-        cache_file = tmp_path / "memory" / "tool_cache" / "skill_catalog_cache.json"
+        cache_file = tmp_path / "memory" / "skill_catalog" / "skill_catalog_cache.json"
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_data = {
             "test-skill": {
@@ -180,7 +180,7 @@ class TestGenerateSkillCatalog:
         fp = _content_fingerprint(skill_content)
 
         # Pre-populate cache
-        cache_file = tmp_path / "memory" / "tool_cache" / "skill_catalog_cache.json"
+        cache_file = tmp_path / "memory" / "skill_catalog" / "skill_catalog_cache.json"
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_data = {
             "test-skill": {
@@ -231,7 +231,7 @@ class TestGenerateSkillCatalog:
         old_fp = _content_fingerprint(old_content)
 
         # Pre-populate cache with old content fingerprint
-        cache_file = tmp_path / "memory" / "tool_cache" / "skill_catalog_cache.json"
+        cache_file = tmp_path / "memory" / "skill_catalog" / "skill_catalog_cache.json"
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_data = {
             "test-skill": {
@@ -272,7 +272,7 @@ class TestGenerateSkillCatalog:
         old_fp = _dir_fingerprint(skill_dir)
 
         # Pre-populate cache with old directory fingerprint
-        cache_file = tmp_path / "memory" / "tool_cache" / "skill_catalog_cache.json"
+        cache_file = tmp_path / "memory" / "skill_catalog" / "skill_catalog_cache.json"
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_data = {
             "my-skill": {

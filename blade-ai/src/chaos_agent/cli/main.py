@@ -47,8 +47,12 @@ def main(ctx: typer.Context) -> None:
         _launch_default_tui()
 
 
-def _launch_default_tui() -> None:
+def _launch_default_tui(extra_args: list[str] | None = None) -> None:
     """Hand the terminal over to the TS (Ink) TUI — the only TUI.
+
+    ``extra_args`` is appended verbatim to the TUI's argv — used by
+    ``blade-ai resume -i <sid>`` to pass ``--resume <sid>`` (parsed by
+    the TS side's ``parseResumeArgv``).
 
     The legacy Python TUI was removed; the TS TUI is the sole
     interactive surface. Failure modes are all fail-loud:
@@ -117,6 +121,8 @@ def _launch_default_tui() -> None:
                 del os.environ["LD_LIBRARY_PATH"]
 
     argv, exec_path = bundle
+    if extra_args:
+        argv = [*argv, *extra_args]
     try:
         os.execvp(exec_path, argv)
     except OSError as err:
@@ -276,6 +282,8 @@ from chaos_agent.cli.commands.config_check import config_check_command  # noqa: 
 app.command(name="config-check", help="Exit 0 if required config fields are set (machine-readable gate for scripts/CI)")(config_check_command)
 app.command(name="inject", help="Inject a fault into a Kubernetes target")(inject_command)
 app.command(name="recover", help="Recover a fault injection by task ID")(recover_command)
+from chaos_agent.cli.commands.resume_cmd import resume_command  # noqa: E402
+app.command(name="resume", help="Start the TUI taking over a previous session (-i <sid>; bare form lists sessions)")(resume_command)
 app.command(name="metric", help="Query task status and execution metrics")(metric_command)
 app.command(name="list", help="List supported fault capabilities")(list_command)
 app.command(name="capabilities-sync", help="Sync: LLM derives commands from each skill case (slow, manual)")(capabilities_sync)

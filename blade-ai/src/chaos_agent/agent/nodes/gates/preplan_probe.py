@@ -189,6 +189,171 @@ async def _probe_metrics_server(kubeconfig: str) -> tuple[str, str, dict]:
     )
 
 
+async def _probe_carrier_images(kubeconfig: str) -> tuple[str, str, dict]:
+    """Auto-discover recovery-carrier image candidates (healthy DS images).
+
+    Restricted-network clusters (VPC without docker.io egress) cannot pull
+    the default allowlist (busybox/curl) — the operator's manual env-var
+    workaround was fragile (run8: lost across sessions → opaque
+    REJECT_DRIFT). A HEALTHY DaemonSet (desired == ready > 0) proves its
+    images are cached on every node the carrier can land on: the scheduler
+    never places the carrier on a cordoned node, and a fully-ready DS
+    covers every schedulable one. Those images are therefore usable by the
+    carrier without any network pull — publish them into
+    ``settings.recovery_carrier_discovered_images`` (process-lifetime,
+    re-probed every task) and into the observation message so the planner
+    picks a candidate directly instead of re-discovering in-loop.
+
+    Toolchain verification (sh/curl/sleep inside the image) stays with the
+    planner per recovery-carrier.md section 9 — the probe contributes
+    placement facts, not image-content verdicts.
+    """
+    import json as _json
+
+    from chaos_agent.tools.kubectl import exec_kubectl_raw
+
+    result = await exec_kubectl_raw(
+        "get", ["ds", "-A", "-o", "json"], kubeconfig=kubeconfig, timeout=8.0,
+    )
+    if result.exit_code != 0:
+        return (
+            "unknown",
+            "carrier-image auto-discovery failed (kubectl get ds); "
+            "falling back to the configured allowlist only",
+            {},
+        )
+    try:
+        items = _json.loads(result.stdout).get("items", [])
+    except (TypeError, ValueError):
+        return (
+            "unknown",
+            "carrier-image auto-discovery got unparseable ds output",
+            {},
+        )
+
+    candidates: dict[str, str] = {}
+    for item in items:
+        status = (item.get("status") or {})
+        desired = status.get("desiredNumberScheduled") or 0
+        ready = status.get("numberReady") or 0
+        if desired <= 0 or ready != desired:
+            continue  # unhealthy DS: coverage unproven, fail closed
+        ds_name = f"{(item.get('metadata') or {}).get('namespace', '?')}/{(item.get('metadata') or {}).get('name', '?')}"
+        for container in (
+            (item.get("spec") or {})
+            .get("template", {})
+            .get("spec", {})
+            .get("containers", [])
+        ):
+            image = str(container.get("image") or "").strip()
+            if image:
+                candidates.setdefault(image, ds_name)
+
+    from chaos_agent.config.settings import settings as _settings
+
+    configured = {
+        img.strip()
+        for img in str(_settings.recovery_carrier_allowed_images or "").split(",")
+        if img.strip()
+    }
+    previously = {
+        img.strip()
+        for img in str(_settings.recovery_carrier_discovered_images or "").split(",")
+        if img.strip()
+    }
+    new_images = sorted(set(candidates) - configured - previously)
+    if new_images:
+        merged = sorted(previously | set(new_images))
+        _settings.recovery_carrier_discovered_images = ",".join(merged)
+
+    if not candidates:
+        return (
+            "warning",
+            "no healthy DaemonSet images found; carrier image allowlist "
+            "stays as configured (busybox/curl default)",
+            {},
+        )
+    # No cap: the summary line is the ONLY channel the planner sees (the
+    # detail dict stays tracker-side), so a "…and N more" truncation hides
+    # live candidates and forces in-loop re-discovery. #36 retest evidence:
+    # the [:6] alphabetical cap buried terway — the empirically preferred
+    # carrier image — behind "…and 3 more", costing two re-verification
+    # rounds (~110s). Candidate count is bounded by the cluster's healthy
+    # DaemonSets, so the unbounded line stays small in practice.
+    shown = ", ".join(
+        f"{img} (ds {candidates[img]})" for img in sorted(candidates)
+    )
+    return (
+        "ok",
+        f"carrier image candidates (healthy DaemonSet images = node-cached, "
+        f"no pull needed): {shown} — verify sh/curl/sleep toolchain "
+        "per recovery-carrier.md section 9 before use; auto-added to the "
+        "carrier shape allowlist for this task",
+        {"images": sorted(candidates), "added_now": new_images},
+    )
+
+
+async def _probe_faultdrill_crd(kubeconfig: str) -> tuple[str, str, dict]:
+    """FaultDrill CRD installability — the D3 planning-route signal.
+
+    Read-only two-step: (1) the CRD already exists → the channel needs no
+    install (schema compatibility stays with the execute-time lazy check —
+    the probe contributes a routing hint, not a verdict); (2) otherwise
+    ``kubectl auth can-i create customresourcedefinitions`` decides whether
+    the provider channel could install it. ``can-i`` reports a denial as
+    exit 0 + ``no`` (a denial is an answer, not an error) — only a nonzero
+    exit is a probe failure (``unknown``). A denied can-i at plan time
+    means the CR route is unavailable, so the planner routes an
+    ``apiserver-write`` case onto the recovery-carrier SOP form directly —
+    no CR attempt round is spent (design D3: degradation completes at the
+    plan layer).
+
+    Probed ONLY while ``faultdrill_enabled`` is on (the wiring site) —
+    dark launch keeps the observation message identical to pre-change.
+    """
+    from chaos_agent.tools.kubectl import exec_kubectl_raw
+
+    crd_name = f"faultdrills.{settings.faultdrill_crd_group}"
+    exists = await exec_kubectl_raw(
+        "get", ["crd", crd_name], kubeconfig=kubeconfig, timeout=5.0,
+    )
+    if exists.exit_code == 0:
+        return (
+            "ok",
+            f"FaultDrill CRD {crd_name} already installed — the CR channel "
+            "needs no install (schema compatibility is re-checked lazily "
+            "at apply)",
+            {},
+        )
+    can = await exec_kubectl_raw(
+        "auth", ["can-i", "create", "customresourcedefinitions"],
+        kubeconfig=kubeconfig, timeout=5.0,
+    )
+    if can.exit_code != 0:
+        return (
+            "unknown",
+            "FaultDrill CRD installability probe failed (kubectl auth "
+            "can-i errored); treat the CR channel as unverified",
+            {},
+        )
+    if can.stdout.strip().lower() == "yes":
+        return (
+            "ok",
+            "FaultDrill CRD not installed but installable (can create "
+            "customresourcedefinitions) — the CR channel installs it "
+            "lazily on first use",
+            {},
+        )
+    return (
+        "warning",
+        "FaultDrill CRD not installed and NOT installable (cannot create "
+        "customresourcedefinitions) — the CR channel is unavailable: plan "
+        "recovery_channel: apiserver-write cases onto the recovery-carrier "
+        "SOP form",
+        {},
+    )
+
+
 # ── Probe runner ─────────────────────────────────────────────────────
 
 
@@ -281,7 +446,16 @@ async def preplan_probe(state: AgentState) -> dict:
             kubeconfig, target_node=target_node, task_id=task_id,
         )),
         ("metrics_server", _probe_metrics_server(kubeconfig)),
+        ("carrier_images", _probe_carrier_images(kubeconfig)),
     ]
+    if settings.faultdrill_enabled:
+        # D3 planning-route signal (openspec faultdrill-cr-channel): the
+        # CRD installability line the routing guide points the planner at.
+        # Probed only while the channel is enabled — dark launch keeps the
+        # observation message identical to pre-change.
+        probe_specs.append(
+            ("faultdrill_crd", _probe_faultdrill_crd(kubeconfig)),
+        )
     try:
         results = await asyncio.wait_for(
             asyncio.gather(*(

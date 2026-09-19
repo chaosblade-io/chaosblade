@@ -7,16 +7,37 @@ dangerous metacharacters; this module re-judges the same surface on
 bashfacts STRUCTURE. Unified at the fact layer (parsing, peeling, part
 kinds); deliberately PRESERVED at the policy layer (design 4.6 row 3):
 
-  (a) separator semantics — ``;`` / ``&&`` / ``||`` are legal BETWEEN probe
-      segments (each segment independently a read-only probe); unlike the
-      readonly face, a chain is not refused wholesale;
+  (a) separator semantics — ``;`` / ``&&`` / ``||`` / ``|`` are legal
+      BETWEEN probe segments (each segment independently a read-only
+      probe); unlike the readonly face, a chain is not refused wholesale.
+      The pipe joined the trio at the B34 fix: a pipe is kernel plumbing
+      between two commands, not a mutation, so a pipeline whose every
+      stage is a read-only probe mutates nothing — the same verdict the
+      readonly face's ``allow_pipes=True`` already reaches for single
+      ``sh -c`` bodies. ``|&`` (stderr tee) stays refused, mirroring that
+      face. One command, one semantic question ("does it mutate the
+      host?"), one answer per form — B34 fell through the two faces'
+      COMPLEMENTARY blind spots (readonly face: pipes only, no ``;``
+      chains; probe face: chains only, no pipes), and the fallout landed
+      in ``recoverability.assess`` as a misleading "add iptables -D"
+      guidance for a command with no ``-I`` at all;
   (b) host-entry form — the command must reach the host through
       ``chroot`` / ``nsenter`` / ``unshare`` or a ``/host/`` path,
       optionally ``sh -c`` wrapped; a bare command is NOT a host probe;
   (c) parameter-expansion strictness — any ``$var`` / ``${...}`` / ``$1``
       expansion refuses (probe determinism); the readonly face lets the
       same PartKind through. Same facts, different policy — the
-      fact/policy split made concrete.
+      fact/policy split made concrete;
+  (d) per-segment vocabulary — single-sourced to the shared judge
+      ``tools.readonly._classify_argv`` (the same ~100-binary vocabulary
+      with per-binary argument guards the classifier fast path and the
+      kubectl_read tool layer already use). The deleted private table
+      (``carriers._is_single_readonly_probe``, 16 binaries + metadata
+      flags for fault binaries) was the second half of the one-question/
+      two-answers defect: ``chroot /host iptables -S INPUT`` read as
+      read-only by the classifier fast path and NOT read-only here.
+      Structural policy (no substitution, no expansion, no redirect, no
+      subshell) stays local — only the per-binary verdict delegates.
 
 Behaviour changes vs the legacy chain, each registered in the adjudication
 list (design 5.x):
@@ -47,7 +68,6 @@ tokens.
 
 from __future__ import annotations
 
-from chaos_agent.agent.target_guard.carriers import _is_single_readonly_probe
 from chaos_agent.bashfacts import (
     Budget,
     CommandFacts,
@@ -59,12 +79,16 @@ from chaos_agent.bashfacts import (
     unwrap_sh_c,
     word_token,
 )
+from chaos_agent.agent.target_guard.carriers import _BANNED_HOST_VERBS
+from chaos_agent.tools.readonly import _classify_argv, _strip_wrappers
 
 __all__ = ["host_payload_tokens_facts", "is_readonly_host_probe_facts"]
 
-# Policy (a): the only operators legal between probe segments (the same
-# trio the deleted legacy chain allowed between its token-stream segments).
-_PROBE_SEPARATOR_OPS = frozenset({";", "&&", "||"})
+# Policy (a): the only operators legal between probe segments — the deleted
+# legacy chain's trio plus the pipe the B34 fix admitted (module docstring).
+# ``|&`` (stderr tee) is its own operator token in the scanner and is
+# deliberately absent, mirroring the readonly face's refusal of it.
+_PROBE_SEPARATOR_OPS = frozenset({";", "&&", "||", "|"})
 
 # Part kinds that never appear in a plain probe (policy: no substitution of
 # any flavour). PARAM_EXPANSION is handled separately (policy c) only to
@@ -86,9 +110,11 @@ def _segment_words(cmd: CommandFacts) -> list[WordFacts]:
 
 
 def _segment_is_probe(words: list[WordFacts]) -> bool:
-    """One segment: no substitution/expansion parts, then the shared
-    token-level probe vocabulary (policy unchanged, single-sourced in
-    ``carriers._is_single_readonly_probe``)."""
+    """One segment: no substitution/expansion parts (policy c), then the
+    shared per-binary judge (policy d — single-sourced to
+    ``tools.readonly._classify_argv`` at the B34 fix; the private carriers
+    vocabulary and its one-question/two-answers split are gone), overlaid
+    with the carriers-face head ban below."""
     values: list[str] = []
     for word in words:
         for part in iter_parts(word):
@@ -100,7 +126,35 @@ def _segment_is_probe(words: list[WordFacts]) -> bool:
         if value is None:
             return False  # defensive: the scan above makes this unreachable
         values.append(value)
-    return _is_single_readonly_probe(values)
+    if not values:
+        # An empty segment is not a probe. ``_classify_argv`` returns True
+        # for an empty argv (a sentinel its own callers rely on), so this
+        # check must come BEFORE the head-token access below it.
+        return False
+    ok, _reason = _classify_argv(values)
+    if not ok:
+        return False
+    # Carriers-face overlay: a banned verb as the segment's BINARY never
+    # routes through the readonly bypass, whatever guarded read-only form
+    # the shared judge admits for it (``curl -fsSL <url>`` GET-to-stdout,
+    # ``systemctl status``, bare ``mount``). The readonly face's width
+    # belongs to pod-exec probes; on HOST entry those binaries stay banned
+    # at word level (benign and hostile forms are indistinguishable there).
+    # ARGUMENT position is data, not code — ``which curl`` and
+    # ``iptables -S | grep curl`` stay fine. The head is taken AFTER
+    # wrapper stripping (``timeout 5 curl …`` / ``env curl …`` / nested),
+    # mirroring the strip ``_classify_argv`` itself performs before it
+    # judges the wrapped binary — anchoring on the raw first token left the
+    # wrapped binary outside the ban. Iterated to a fixed point because
+    # ``_strip_wrappers`` caps its own depth at three layers while the
+    # judge recurses past that.
+    head = values
+    for _ in range(4):
+        stripped = _strip_wrappers(head)
+        if stripped == head:
+            break
+        head = stripped
+    return _BANNED_HOST_VERBS.search(head[0]) is None
 
 
 def _script_is_probe_chain(script: ScriptFacts) -> bool:

@@ -78,6 +78,28 @@ function durationStr(v: unknown): string {
     : "";
 }
 
+/** One widened-contract entry as a single line — the TS twin of
+ *  Python's ``format_mechanism_writes_for_display`` row: scope/ns +
+ *  names (long lists collapse to ``N: a, b …(+M)``) or a 'prefix'
+ *  (prefix) selector. Blank names fall back to ``*``. */
+function mechanismWriteLine(entry: Record<string, unknown>): string {
+  const scope = asString(entry["scope"]) || "?";
+  const ns = asString(entry["namespace"]) || "<cluster>";
+  const names = (asArray(entry["names"]) ?? [])
+    .map(asString)
+    .filter(Boolean);
+  let sel: string;
+  if (names.length > 4) {
+    sel = `${names.length}: ${names.slice(0, 4).join(", ")} …(+${names.length - 4})`;
+  } else if (names.length > 0) {
+    sel = names.join(", ");
+  } else {
+    const prefix = asString(entry["name_prefix"]);
+    sel = prefix ? `'${prefix}' (prefix)` : "*";
+  }
+  return `${scope}/${ns}: ${sel}`;
+}
+
 // ── shared bits ─────────────────────────────────────────────────────
 
 function StatusDot({ className }: { className: string }) {
@@ -251,6 +273,11 @@ function hasExecutionContent(payload: Record<string, unknown>): boolean {
   if (asString(payload["safety_reason"])) return true;
   const target = asRecord(payload["target"]);
   if (target && Object.keys(target).length > 0) return true;
+  // A widened-contract card rides the structured execution body even
+  // when every other field is empty — the manifest entries are the
+  // one thing the approving human must not miss.
+  const writes = asArray(payload["mechanism_writes"]);
+  if (writes && writes.length > 0) return true;
   return false;
 }
 
@@ -624,6 +651,14 @@ function ExecutionContent({ payload }: { payload: Record<string, unknown> }) {
     .map(asString)
     .filter(Boolean);
 
+  // Widened write-set contract (CASE manifest): entries the case
+  // legislated BEYOND the victim target. Danger-toned — approving
+  // authorizes these cluster writes, so they must be read before the
+  // buttons are touched.
+  const mechanismWrites = (asArray(payload["mechanism_writes"]) ?? [])
+    .map((r) => asRecord(r))
+    .filter((r): r is Record<string, unknown> => r !== null);
+
   const safetyScore = asRecord(payload["safety_score"]);
 
   const hasProblem =
@@ -771,6 +806,27 @@ function ExecutionContent({ payload }: { payload: Record<string, unknown> }) {
           </StatusRow>
         )}
       </div>
+
+      {mechanismWrites.length > 0 ? (
+        <div className="flex flex-col gap-0.5">
+          <StatusRow tone="danger">
+            <span className="font-medium">
+              {t("confirm.field.mechanism_writes")}
+            </span>
+          </StatusRow>
+          {mechanismWrites.map((entry, i) => (
+            <div
+              key={i}
+              className="pl-3.5 font-mono break-words text-danger"
+            >
+              {mechanismWriteLine(entry)}
+            </div>
+          ))}
+          <div className="pl-3.5 text-forge-text-faint">
+            {t("confirm.mechanism_writes.hint")}
+          </div>
+        </div>
+      ) : null}
 
       {conflictUids.length > 0 ? (
         <div className="flex flex-col gap-0.5">

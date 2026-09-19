@@ -1,9 +1,10 @@
 /**
  * i18n translator tests.
  *
- * Scope: the pure ``t()`` / ``tArr()`` runtime, NOT locale detection
- * (that lives behind module-load-time captured ``ACTIVE_LANG`` and
- * needs a child process to exercise — see scripts/smoke-i18n.mjs).
+ * Scope: the pure ``t()`` / ``tArr()`` runtime and the en↔zh
+ * dictionary parity contract, NOT locale detection (that lives
+ * behind module-load-time captured ``ACTIVE_LANG`` and needs a child
+ * process to exercise — see scripts/smoke-i18n.mjs).
  *
  * What matters here:
  *   - {param} interpolation handles missing params gracefully
@@ -19,6 +20,8 @@ import {
   t,
   tArr,
 } from "./index.js";
+import { en } from "./en.js";
+import { zh } from "./zh.js";
 
 describe("t() interpolation", () => {
   it("returns the raw string when no params are given", () => {
@@ -116,6 +119,67 @@ describe("detectLangFromEnv (pure)", () => {
 
   it("defaults to en when nothing is set", () => {
     expect(detectLangFromEnv({})).toBe("en");
+  });
+});
+
+/** Extract ``{param}`` names in the SAME order-insensitive way
+ * ``t()`` matches them (same regex — single source). Array values
+ * return []: ``tArr()`` never interpolates, so placeholders inside
+ * array items are inert and not part of the contract. */
+const placeholders = (v: unknown): string[] =>
+  typeof v === "string"
+    ? [...v.matchAll(/\{(\w+)\}/g)].map((m) => m[1]!).sort()
+    : [];
+
+describe("dictionary parity (en ↔ zh)", () => {
+  // The dictionaries are maintained by hand in two files; nothing
+  // else cross-checks them. Each drift has a SILENT user-facing
+  // failure mode, which is why parity is asserted rather than
+  // trusted:
+  //   - zh missing a key  → t() falls back to English with no
+  //     marker, so the zh UI quietly mixes languages;
+  //   - type mismatch     → tArr() returns [] and the phrase pool
+  //     silently empties;
+  //   - placeholder drift → the zh string renders a literal
+  //     ``{sid}`` or drops a value the en string shows.
+  const enKeys = Object.keys(en).sort();
+  const zhKeys = Object.keys(zh).sort();
+
+  it("carries the exact same key set in both dictionaries", () => {
+    const missingInZh = enKeys.filter((k) => !(k in zh));
+    const extraInZh = zhKeys.filter((k) => !(k in en));
+    // Report the drift, not just a count — the fixer needs the key
+    // names to know which file to touch.
+    expect(missingInZh).toEqual([]);
+    expect(extraInZh).toEqual([]);
+  });
+
+  it("keeps the value type aligned per key (string ↔ string, array ↔ array)", () => {
+    const mismatches: string[] = [];
+    for (const key of enKeys) {
+      const eIsArray = Array.isArray(en[key]);
+      const zIsArray = Array.isArray(zh[key]);
+      if (eIsArray !== zIsArray) {
+        mismatches.push(
+          `${key}: en is ${eIsArray ? "array" : "string"} but zh is ${
+            zIsArray ? "array" : "string"
+          }`,
+        );
+      }
+    }
+    expect(mismatches).toEqual([]);
+  });
+
+  it("keeps interpolation placeholders aligned per key", () => {
+    const mismatches: string[] = [];
+    for (const key of enKeys) {
+      const e = placeholders(en[key]).join(",");
+      const z = placeholders(zh[key]).join(",");
+      if (e !== z) {
+        mismatches.push(`${key}: en=[${e}] zh=[${z}]`);
+      }
+    }
+    expect(mismatches).toEqual([]);
   });
 });
 

@@ -6,11 +6,83 @@ outbound (graph final state → TaskResult) transformations.
 
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 
+from chaos_agent.agent.intent_handoff import (
+    build_pipeline_handoff_from_intent_state,
+    is_previous_intent_residue,
+    spec_relevance_tokens,
+)
 from chaos_agent.agent.state_mgmt.state_builders import build_inject_initial_state
 from chaos_agent.l4.error_mapping import _extract_error
 from chaos_agent.l4.schemas import L4TaskResult, L4TestTask
+
+logger = logging.getLogger(__name__)
+
+# Observation-failure marker vocabulary — the SAME markers the verifier
+# prompt's evidence boundary uses (auth-class vs transient-class). Single
+# source of truth: when the prompt vocabulary changes, change it here too.
+# The status codes match on word boundaries: plain substring matching would
+# let "24013ms" (transient timing noise) contain "401" and misclassify it
+# as auth, steering the operator toward credentials instead of the network.
+_AUTH_MARKERS = ("forbidden", "unauthorized")
+_AUTH_STATUS_RE = re.compile(r"\b(?:401|403)\b")
+_TRANSIENT_MARKERS = ("timeout", "timed out", "connection", "transport")
+
+
+def _classify_observation_error(text: str) -> str:
+    """Classify an observation-failure text as auth / transient / unknown."""
+    t = (text or "").lower()
+    if any(m in t for m in _AUTH_MARKERS) or _AUTH_STATUS_RE.search(t):
+        return "auth"
+    if any(m in t for m in _TRANSIENT_MARKERS):
+        return "transient"
+    return "unknown"
+
+
+def _collect_observation_failures(verification: dict | None) -> list[dict] | None:
+    """Aggregate the observation-failure log from a verification verdict.
+
+    Sources: checklist items (``status == "skipped"`` marks the channel as
+    unavailable; evidence text carrying error markers marks a failed probe)
+    and warnings. Items are keyed by (channel, error_class) with a count —
+    ``channel`` names come from the checklist's own step numbering, no new
+    naming scheme is invented. Returns None when nothing failed (no
+    placeholder entries).
+    """
+    if not isinstance(verification, dict):
+        return None
+    failures: dict[tuple[str, str], int] = {}
+
+    def _record(channel: str, text: str) -> None:
+        key = (channel, _classify_observation_error(text))
+        failures[key] = failures.get(key, 0) + 1
+
+    checklist = verification.get("checklist")
+    items = checklist.get("items") if isinstance(checklist, dict) else checklist
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            evidence = item.get("evidence")
+            evidence_text = evidence if isinstance(evidence, str) else ""
+            if item.get("status") == "skipped":
+                _record(f"step-{item.get('step', '?')}", evidence_text or "skipped")
+            elif evidence_text and _classify_observation_error(evidence_text) != "unknown":
+                _record(f"step-{item.get('step', '?')}", evidence_text)
+    warnings = verification.get("warnings")
+    if isinstance(warnings, list):
+        for w in warnings:
+            if isinstance(w, str) and _classify_observation_error(w) != "unknown":
+                _record("warnings", w)
+    if not failures:
+        return None
+    return [
+        {"channel": ch, "error_class": ec, "count": n}
+        for (ch, ec), n in sorted(failures.items())
+    ]
 
 
 def test_task_to_initial_state(task: L4TestTask) -> dict:
@@ -87,7 +159,11 @@ def test_task_to_initial_state(task: L4TestTask) -> dict:
         "fault_target": fault_target,
         "fault_action": fault_action,
         "params": fi.get("params", {}),
-        "duration_seconds": fi.get("duration", 600),
+        # Single canonical duration key (l4-contract-faithfulness):
+        # ``duration_seconds`` — the key emitted by to_intent_dict() and
+        # the only legal duration channel. The retired ``duration``
+        # alias has no reader here.
+        "duration_seconds": fi.get("duration_seconds", 300),
         "source": "l4_sdk",
         "user_description": fi.get("user_description") or task.intent,
     }
@@ -111,6 +187,10 @@ def test_task_to_initial_state(task: L4TestTask) -> dict:
         ssh_port=payload.get("ssh_port"),
         messages=[],
         tenant_id=payload.get("tenant_id", ""),
+        # str() normalization: platform sides (tools_l4 / tools_chaos) carry
+        # workspace_id as a UUID OBJECT for their own token-attribution
+        # consumers; state/SQL want the plain string form.
+        workspace_id=str(payload.get("workspace_id") or ""),
     )
 
 
@@ -121,7 +201,11 @@ def state_to_task_result(
 
     Reuses build_status_data() to avoid reinventing field assembly.
     """
-    from chaos_agent.agent.state import build_status_data, infer_task_state
+    from chaos_agent.agent.state import (
+        TaskState,
+        build_status_data,
+        infer_task_state,
+    )
 
     task_state = infer_task_state(values)
     status_data = build_status_data(task_id, values)
@@ -147,15 +231,22 @@ def state_to_task_result(
     except Exception:
         token_usage_dict = None
 
+    # Keys derive from the TaskState legislation (round-15): the map is
+    # total over the closed set minus "cancelled" (default → failed).
     status_map = {
-        "injected": "passed",
-        "recovered": "passed",
-        "partial_recovered": "degraded",
-        "failed": "failed",
-        "rejected": "failed",
-        "injecting": "degraded",
-        "recovering": "degraded",
-        "completed": "passed",
+        TaskState.INJECTED.value: "passed",
+        TaskState.RECOVERED.value: "passed",
+        TaskState.PARTIAL_RECOVERED.value: "degraded",
+        TaskState.FAILED.value: "failed",
+        TaskState.REJECTED.value: "failed",
+        # Verification ran but produced no conclusion (evidence unavailable):
+        # "completed with reservations" — not passed (no evidence of success),
+        # not failed (no counter-evidence either). error stays None: there is
+        # nothing to report as an error.
+        TaskState.UNVERIFIED.value: "degraded",
+        TaskState.INJECTING.value: "degraded",
+        TaskState.RECOVERING.value: "degraded",
+        TaskState.COMPLETED.value: "passed",
     }
     status = status_map.get(task_state, "failed")
 
@@ -185,8 +276,13 @@ def state_to_task_result(
         task_id=task_id,
         status=status,
         trajectory_id=trajectory_id,
-        summary=status_data.get("fault_type", "") + " \u00b7 " + task_state,
+        summary=status_data.get("fault_type", "") + " · " + task_state,
         error=error,
+        # First-class verification fields (D6): the machine-readable answer
+        # to "how do you know" — extras["verification"] stays as the mirror
+        # for legacy readers during the transition.
+        verification=verification,
+        observation_failures=_collect_observation_failures(verification),
         extras={
             "experiment_uid": experiment_uid_out,
             "verification": verification,
@@ -226,3 +322,170 @@ def make_trajectory_id(task_id: str) -> str:
     """Generate a trajectory_id. Format: traj-{task_id}-{short_uuid}."""
     short = uuid.uuid4().hex[:8]
     return f"traj-{task_id}-{short}"
+
+
+async def attach_intent_handoff(
+    initial_state: dict, pool, intent_thread_id: str
+) -> dict:
+    """Bridge intent-dialogue evidence into an L4 inject task's initial state.
+
+    The platform's three-step protocol (clarify → step(approved) → invoke)
+    runs the intent dialogue and the inject pipeline as two independent SDK
+    calls. The approval path already harvests ``probe_snapshot`` /
+    ``progress_ledger`` / ``handoff_summary`` into the Intent Graph
+    checkpoint (``_commit_inject_handoff``); this function reads that
+    checkpoint back at invoke time so the pipeline starts with the same
+    intent-time evidence a TUI dispatch would carry — same extraction
+    function (``build_pipeline_handoff_from_intent_state``), same
+    cross-intent residue guards — one source of truth, no fourth copy.
+
+    ``intent_thread_id`` must carry the ``chaos-`` prefix — the SDK's own
+    convention for intent-dialogue threads (``_async_step`` uses the same
+    discriminator). Anything else means "no dialogue source declared"
+    (REST direct calls, older platforms) and skips the bridge silently.
+
+    Enhancement-only / fail-open: a missing checkpoint, an unreadable
+    state, or a guard rejection degrades to the cold-start initial_state
+    — a new failure mode here must never block the injection itself.
+    """
+    if not intent_thread_id or not intent_thread_id.startswith("chaos-"):
+        return initial_state
+    try:
+        config = {"configurable": {"thread_id": intent_thread_id}}
+        existing = await pool.intent_graph.aget_state(config)
+        values = existing.values if existing else None
+        if not values:
+            logger.debug(
+                "attach_intent_handoff: no checkpoint for thread %s; "
+                "cold-start initial_state kept",
+                intent_thread_id,
+            )
+            return initial_state
+
+        handoff = build_pipeline_handoff_from_intent_state(
+            values,
+            operation="inject",
+            task_id=initial_state.get("task_id", ""),
+            default_tui_session_id="",
+        )
+
+        # Residue guard, anchored on the TASK-side spec: the checkpoint's
+        # evidence may belong to a previously approved intent about a
+        # different target (the clarify loop resets fault_spec each turn,
+        # but a fresh clarify is not guaranteed between approvals). The
+        # task payload's fault_intent is the only authoritative statement
+        # of what THIS run targets. Same guards as _commit_inject_handoff;
+        # snapshot and ledger are judged independently.
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        task_spec = read_fault_spec({"fault_spec": initial_state.get("fault_spec")})
+        tokens = spec_relevance_tokens(task_spec) if task_spec is not None else []
+
+        # Identity guard for the seed summary: the summary carries the
+        # APPROVED intent's identity line ("Fault: … → scope/target/action
+        # @ ns"). TUI needs no such guard — approval and dispatch happen in
+        # the same conversational turn — but the decoupled platform timing
+        # allows "approve A, then direct-inject B" in one session, and an
+        # A-flavoured summary seeding B's pipeline is stale intent identity,
+        # not conversation context. Two complementary judgements, because
+        # the checkpoint's fault_spec and handoff_summary have different
+        # lifetimes — a later clarify turn resets fault_spec (interaction.py
+        # reset dicts) but NOT handoff_summary:
+        #   spec alive  → identity quadruple (scope/namespace/fault_target/
+        #                 fault_action). params are excluded because the
+        #                 platform legitimately injects defaults (timeout)
+        #                 into the payload after approval.
+        #   spec absent → word-boundary residue against the task's tokens
+        #                 (same guard class as snapshot/ledger). A summary
+        #                 never carries names, so only the namespace token
+        #                 can hit: this narrows the stale window to
+        #                 same-ns-different-target after a clarify reset —
+        #                 accepted residue (design D3).
+        # A missing task-side spec skips both → fail-open (pre-change
+        # behaviour is the floor).
+        summary = handoff.handoff_summary
+        if summary and task_spec is not None:
+            if handoff.fault_spec is not None:
+                ckpt_spec = read_fault_spec({"fault_spec": handoff.fault_spec})
+                if ckpt_spec is not None and (
+                    ckpt_spec.scope,
+                    ckpt_spec.namespace,
+                    ckpt_spec.fault_target,
+                    ckpt_spec.fault_action,
+                ) != (
+                    task_spec.scope,
+                    task_spec.namespace,
+                    task_spec.fault_target,
+                    task_spec.fault_action,
+                ):
+                    logger.debug(
+                        "attach_intent_handoff: handoff_summary from thread %s "
+                        "describes a different approved intent; dropped",
+                        intent_thread_id,
+                    )
+                    summary = ""
+            elif tokens and is_previous_intent_residue([summary], tokens):
+                logger.debug(
+                    "attach_intent_handoff: handoff_summary from thread %s "
+                    "names none of this task's target tokens; dropped",
+                    intent_thread_id,
+                )
+                summary = ""
+
+        snapshot = handoff.probe_snapshot
+        if snapshot is not None and tokens:
+            facts = [
+                entry.get("fact")
+                for entry in snapshot.get("facts", [])
+                if isinstance(entry, dict)
+            ]
+            if is_previous_intent_residue(facts, tokens):
+                logger.debug(
+                    "attach_intent_handoff: probe_snapshot from thread %s "
+                    "names none of this task's target tokens; dropped",
+                    intent_thread_id,
+                )
+                snapshot = None
+
+        ledger = handoff.progress_ledger
+        if ledger is not None and tokens:
+            ledger_state = ledger.get("state")
+            established = (
+                ledger_state.get("established_facts")
+                if isinstance(ledger_state, dict)
+                else None
+            )
+            if is_previous_intent_residue(list(established or []), tokens):
+                logger.debug(
+                    "attach_intent_handoff: progress_ledger from thread %s "
+                    "names none of this task's target tokens; dropped",
+                    intent_thread_id,
+                )
+                ledger = None
+
+        # build_pipeline_handoff_from_intent_state already deep-copied both
+        # payloads out of the checkpoint, so assigning them straight into the
+        # initial_state keeps the pipeline decoupled from the dialog thread.
+        if snapshot is not None:
+            initial_state["probe_snapshot"] = snapshot
+        if ledger is not None:
+            initial_state["progress_ledger"] = ledger
+
+        if summary:
+            from langchain_core.messages import SystemMessage
+
+            seed = SystemMessage(content=summary)
+            initial_state["messages"] = [
+                seed,
+                *list(initial_state.get("messages") or []),
+            ]
+
+        return initial_state
+    except Exception:
+        logger.debug(
+            "attach_intent_handoff failed for thread %s; cold-start "
+            "initial_state kept",
+            intent_thread_id,
+            exc_info=True,
+        )
+        return initial_state

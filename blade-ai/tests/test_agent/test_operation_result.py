@@ -34,7 +34,7 @@ def _inject_state() -> dict:
         "experiment_uid": "uid-1",
         "result": {"success": True},
         "verification": {
-            "level": "strong",
+            "level": "verified",
             "layer1": {"status": "passed"},
             "layer2": {"status": "passed"},
             "side_effects": {"container_restarts": []},
@@ -58,17 +58,22 @@ def test_build_inject_data_uses_fault_spec_projection():
     assert data["target"]["namespace"] == "arms-prom"
     assert data["target"]["names"] == ["pod-a"]
     assert data["params"] == {"cpu-percent": "80"}
-    assert data["verification"]["level"] == "strong"
+    assert data["verification"]["level"] == "verified"
     assert "side_effects" not in data["verification"]
     assert data["side_effects"] == {"container_restarts": []}
 
 
 def test_build_recover_data_uses_inject_state_for_fault_and_target():
+    # Write-path invariant (round-15 D4): result.recovery_level mirrors
+    # recover_verification.level — the fixture used to carry the divergent
+    # pair (result="partial" vs verification="recovered"), which D4's
+    # verification-authoritative ruling resolves to "recovered". Made
+    # self-consistent here so the test keeps exercising the partial path.
     recover_state = {
         "operation": "recover",
         "result": {"recovered": True, "recovery_level": "partial"},
         "recover_verification": {
-            "level": "recovered",
+            "level": "partial",
             "layer1": {"status": "passed"},
             "layer2": {"status": "passed"},
         },
@@ -102,7 +107,7 @@ def test_build_recover_data_uses_inject_state_for_fault_and_target():
         },
         "params": {"cpu-percent": "80"},
         "verification": {
-            "level": "recovered",
+            "level": "partial",
             "layer1": {"status": "passed"},
             "layer2": {"status": "passed"},
         },
@@ -278,6 +283,16 @@ def test_recover_state_helpers_map_failed_and_partial_states():
         )
         == "partial"
     )
+
+
+def test_recover_state_helpers_keep_unverified_distinct_from_failed():
+    """"unverified" (destroy issued, observation unavailable) must not be
+    flattened to "failed" — that would claim counter-evidence nobody
+    observed. Both the result-card task_state and the legacy CLI label
+    keep the honest-ignorance vocabulary (aligns with infer_task_state)."""
+    values = {"result": {"recovered": False, "recovery_level": "unverified"}}
+    assert recover_task_state_from_values(values) == "unverified"
+    assert recover_result_label_from_values(values) == "unverified"
 
 
 def test_target_list_from_state_falls_back_to_fault_spec_projection():

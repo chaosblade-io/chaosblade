@@ -14,6 +14,7 @@ from chaos_agent.agent.nodes.side_effect._side_effect_detectors import (
     SideEffectSnapshot,
     resolve_observer,
     run_all_detectors,
+    unreadable_channels,
 )
 from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.nodes.store._store_sync import sync_node_status_to_session
@@ -94,7 +95,20 @@ async def se_detect_node(state: AgentState) -> dict:
         tracker.complete(f"Side-effect detectors failed: {e}")
         return {}
 
-    if not detected:
+    # B77: detectors gated off by an Unreadable capture channel never ran —
+    # surface WHICH channels were "not captured (query failed)" into the
+    # report so a missing observation cannot read as a clean bill of health.
+    # Reserved-key payload (dict, not list) — summary counters skip it by
+    # value-type, and it must not be counted as findings.
+    # F2 symmetry: the BEFORE side carries the same tri-state
+    # (``SideEffectSnapshot.capture_errors``); a channel unreadable at
+    # baseline is equally not adjudicable. Merged with after-side wins on
+    # key collision (the latest capture's diagnosis is the one to show).
+    unreadable = unreadable_channels(after)
+    if snapshot is not None and snapshot.capture_errors:
+        unreadable = {**snapshot.capture_errors, **unreadable}
+
+    if not detected and not unreadable:
         logger.info("se_detect: no incremental side-effects detected")
         tracker.complete("No incremental side-effects detected")
         await dispatch_node_message("se_detect", "No incremental side effects detected\n\n")
@@ -106,16 +120,25 @@ async def se_detect_node(state: AgentState) -> dict:
     total_items = sum(len(v) for v in detected.values())
     categories = list(detected.keys())
     logger.info(
-        "se_detect: detected %d side-effect(s) across %d categories: %s",
+        "se_detect: detected %d side-effect(s) across %d categories: %s"
+        " (%d unreadable capture channel(s))",
         total_items,
         len(categories),
         categories,
+        len(unreadable),
     )
     tracker.complete(
         f"Detected {total_items} side-effect(s): {', '.join(categories)}",
         {"total": total_items, "categories": categories, "details": detected},
     )
-    await dispatch_node_message("se_detect", f"{total_items} side effect(s) detected: {', '.join(categories)}\n\n")
+    summary = f"{total_items} side effect(s) detected: {', '.join(categories)}"
+    if unreadable:
+        summary += (
+            f"; {len(unreadable)} capture channel(s) unreadable "
+            f"({', '.join(sorted(unreadable))}) — findings over them are "
+            "not adjudicated"
+        )
+    await dispatch_node_message("se_detect", summary + "\n\n")
     sync_node_status_to_session(
         state, "se_detect",
         f"Detected {total_items} side-effect(s) in {len(categories)} categories: {categories}",
@@ -125,6 +148,12 @@ async def se_detect_node(state: AgentState) -> dict:
     verification = read_inject_verification(state) or {}
     existing_se = dict(verification.get("side_effects") or {})
     existing_se.update(detected)
+    if unreadable:
+        # Reserved key (leading underscore): a {channel: reason} map of every
+        # capture channel that FAILED — the tri-state's Unreadable leg. Layer2
+        # and postmortem see it verbatim, so "not captured" stays auditable
+        # instead of masquerading as "captured, found nothing".
+        existing_se["_unreadable_probes"] = unreadable
     verification["side_effects"] = existing_se
 
     return write_inject_verification(verification=verification)

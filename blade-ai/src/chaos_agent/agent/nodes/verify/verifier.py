@@ -83,13 +83,29 @@ from chaos_agent.agent.spec.skill_identity import read_active_skill_name
 from chaos_agent.agent.state import AgentState, materialize_fault_handle
 from chaos_agent.config.settings import settings
 from chaos_agent.agent.state_mgmt.state_helpers import fail_state
-from chaos_agent.agent.result.verdict import FailureCategory
+from chaos_agent.agent.result.verdict import (
+    ChecklistItemStatus,
+    FailureCategory,
+    InjectVerdict,
+    Layer2Status,
+)
 from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
+from chaos_agent.utils.time import now_iso
 from chaos_agent.agent.dispatch import dispatch_node_message
 from chaos_agent.agent.providers import FaultProviderRegistry
+
+# JSON-mode schema vocabulary derives from the legislation enums
+# (B76 round-14): the reminder can never teach a word set the boundary
+# clamps would reject. The layer1 line stays a deliberate teaching
+# subset (passed/failed/skipped are the only terminal Layer1 outcomes
+# an LLM may claim — warning/error/in_progress are internal states and
+# the claim is overwritten by the real Layer1 result anyway).
+_JSON_OVERALL_VOCAB = "|".join(m.value for m in InjectVerdict)
+_JSON_LAYER2_VOCAB = "|".join(m.value for m in Layer2Status)
+_JSON_ITEM_STATUS_VOCAB = "|".join(m.value for m in ChecklistItemStatus)
 
 
 def _experiment_uid_of(handle) -> str:
@@ -109,6 +125,35 @@ def _resolve_fault_dispatch(state):
     return FaultProviderRegistry.resolve_fault_dispatch(state)
 
 
+def _stamp_window_start(state: AgentState, result: dict) -> None:
+    """Stamp ``injection_window_start_time`` at the verifier entry.
+
+    The verifier is the first node after the execute-loop concludes, so
+    this moment IS the execute-loop end for window purposes — the
+    fault-window hold (``turn_hold_fault_window``) anchors its contract
+    window here, and verification time counts against that window (an
+    execute-loop that kept probing after blade_create succeeded must not
+    have eroded it first).
+
+    Write-once per attempt: verifier self-loop re-entries (L2 needing
+    more tool evidence) keep the FIRST stamp — the window origin is a
+    fact about the execute-loop boundary, not about any given verify
+    iteration. Re-arming happens exclusively at replan seams, where
+    ``reset_attribution_state`` clears the field and the replanned
+    attempt's verifier entry stamps a fresh origin.
+
+    Guarded on ``injection_start_time`` (the blade_create-moment
+    attribution evidence): a turn that never committed an injection has
+    no window to anchor, and stamping anyway would let the hold flip a
+    recover dispatch for a turn with no experiment in flight.
+    """
+    if state.get("injection_window_start_time"):
+        return
+    if not state.get("injection_start_time"):
+        return
+    result["injection_window_start_time"] = now_iso()
+
+
 def _recovery_vehicle_of(state: dict) -> str | None:
     """Recovery vehicle (e.g. the kubectl-exec tool pod) rendered via the
     dispatched provider's ``recovery_vehicle`` hook — the verifier never
@@ -118,6 +163,47 @@ def _recovery_vehicle_of(state: dict) -> str | None:
     whose vehicle record then renders."""
     provider, _identity = _resolve_fault_dispatch(state)
     return (provider.recovery_vehicle(state) or "") or None
+
+
+def _layer1_session_content(layer1) -> str:
+    """Session-record content line for a Layer-1 result (round-29).
+
+    The anchor's status/details stay the mainline; the plural face adds
+    one bounded sibling digest (``uid=status`` per sibling) so the L4
+    replay reader sees every polled experiment without parsing — the
+    r28 string-append's session-side replacement (the append lived in
+    ``details``, which this face renders untruncated but the Layer-2
+    prompt starved; structure beats suffixes everywhere).
+    """
+    base = f"[Verifier Layer 1] status={layer1.status}, details={layer1.details}"
+    siblings = [e for e in layer1.experiments if not e.is_anchor]
+    if siblings:
+        base += "; siblings: " + ", ".join(
+            f"{e.uid}={e.status}" for e in siblings
+        )
+    return base
+
+
+def _layer1_session_detail(layer1) -> dict:
+    """Session-record detail dict for a Layer-1 result (round-29).
+
+    Identical to the pre-round-29 shape, plus the structured plural face
+    (``experiments`` — full :class:`ExperimentEvidence` dicts) whenever
+    the poll produced one. Absent on the single-experiment mainline —
+    old replay consumers keep their exact shape.
+    """
+    detail = {
+        "layer": 1,
+        "status": layer1.status,
+        "details": layer1.details,
+        "raw_output": (layer1.raw_output or "")[:500],
+    }
+    if layer1.experiments:
+        detail["experiments"] = [
+            e.model_dump(mode="json") for e in layer1.experiments
+        ]
+    return detail
+
 
 logger = logging.getLogger(__name__)
 
@@ -197,13 +283,8 @@ async def verifier(state: AgentState) -> dict:
         try:
             _session_store.append_raw_message(_task_id_local, {
                 "type": "system",
-                "content": f"[Verifier Layer 1] status={layer1.status}, details={layer1.details}",
-                "detail": {
-                    "layer": 1,
-                    "status": layer1.status,
-                    "details": layer1.details,
-                    "raw_output": (layer1.raw_output or "")[:500],
-                },
+                "content": _layer1_session_content(layer1),
+                "detail": _layer1_session_detail(layer1),
                 "node": VERIFIER,
             })
         except Exception:
@@ -282,6 +363,11 @@ async def verifier(state: AgentState) -> dict:
         await dispatch_node_message("verifier", f"Verification result: {layer1.status}")
 
     result_dict = write_inject_verification(result=result, verification=verification)
+    # Window origin (fault-window hold): the execute-loop just concluded —
+    # this entry is the earliest moment that fact is observable. Must ride
+    # the TOP-LEVEL update (not inside ``result``) to reach the state
+    # channel; write-once + attribution-guarded, see the helper.
+    _stamp_window_start(state, result_dict)
     if not _verified:
         result_dict.update(fail_state(
             FailureCategory.VERIFICATION_FAILED,
@@ -395,13 +481,8 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             if hook and getattr(hook, "session_store", None) and _task_id_local:
                 hook.session_store.append_raw_message(_task_id_local, {
                     "type": "system",
-                    "content": f"[Verifier Layer 1] status={layer1.status}, details={layer1.details}",
-                    "detail": {
-                        "layer": 1,
-                        "status": layer1.status,
-                        "details": layer1.details,
-                        "raw_output": (layer1.raw_output or "")[:500],
-                    },
+                    "content": _layer1_session_content(layer1),
+                    "detail": _layer1_session_detail(layer1),
                     "node": VERIFIER,
                 })
         else:
@@ -465,10 +546,16 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
         # list for state persistence. On the cycle's first turn, prepend them
         # to result_update["messages"] BEFORE the response so that
         # state["messages"][-1] remains the real AIMessage (routing-safe).
-        # On later turns, they are already in AgentState.messages (persisted
-        # from the cycle's first turn) and _build_layer2_messages detected
-        # them via the _already_in_state check, so _synthetic_for_state is
-        # empty.
+        # On later turns this is NOT empty. The pairs are already in
+        # AgentState.messages, ``_build_layer2_messages`` starts from a copy of
+        # it, and ``extract_synthetic_messages`` does no "already in state"
+        # filtering (unlike ``extract_persistent_hm`` right below, which does),
+        # so they are found again every turn. Re-persisting is idempotent
+        # rather than duplicating: the pairs carry STABLE message ids, so
+        # ``add_messages`` replaces them in place — measured over two turns,
+        # state grows by 0 and holds exactly one copy of each half. See the
+        # ``_BASELINE_MSG_ID_*`` constants in _verifier_messages.py for why the
+        # ids must be stable.
         _synthetic_for_state = extract_synthetic_messages(messages, _SYNTHETIC_TOOL_CALL_IDS)
 
         # Extract the main verifier context HumanMessage for state persistence.
@@ -523,6 +610,24 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 counts=_hint_counts, counts_out=_hint_counts,
             ))
 
+        # --- Progress ledger (drift anchor) — TAIL append, not the head ---
+        # context-cache-prefix-stability Unit A (task 2.4, design D1/D2): the
+        # verify ledger moved OUT of build_verifier_prompt's head (its per-round
+        # rewrite broke the cache prefix) onto the message tail via the same
+        # append-only channel as the corrective hints above. NO stable id: a
+        # stable id would make add_messages replace the copy IN PLACE, pinning it
+        # early (out of the recency tail) AND reintroducing an early volatile
+        # byte that re-bills the whole suffix every round (see execute_loop's
+        # note + the measured 50%→41% vs 63%→82% prefix-share comparison).
+        # Placed before the final-iteration JSON reminder so that nudge stays
+        # outermost.
+        from chaos_agent.agent.progress_ledger import build_ledger_tail_content
+        _ledger_tail = build_ledger_tail_content(state.get("progress_ledger"))
+        if _ledger_tail:
+            _ledger_msg = HumanMessage(content=wrap_system_reminder(_ledger_tail))
+            messages.append(_ledger_msg)
+            _hints_for_state.append(_ledger_msg)
+
         # On last iteration, force LLM to produce a summary (unbind tools)
         # Use JSON mode (response_format) when enabled for guaranteed structured output
         if count >= settings.max_verifier_loop and settings.verifier_json_mode:
@@ -531,13 +636,13 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
                 "You MUST output valid JSON matching this schema:\n"
                 "{\n"
                 '  "verification_checklist": [\n'
-                '    {"step": 1, "status": "passed|failed|skipped|recovered_before_observation|expected|not_applicable", "evidence": "brief"},\n'
+                f'    {{"step": 1, "status": "{_JSON_ITEM_STATUS_VOCAB}", "evidence": "brief"}},\n'
                 '    ...\n'
                 '  ],\n'
                 '  "layer1": "passed|failed|skipped",\n'
-                '  "layer2": "passed|failed|skipped|partial|recovered_before_observation",\n'
+                f'  "layer2": "{_JSON_LAYER2_VOCAB}",\n'
                 '  "layer2_details": "evidence summary",\n'
-                '  "overall": "verified|partial|unverified",\n'
+                f'  "overall": "{_JSON_OVERALL_VOCAB}",\n'
                 '  "warnings": ["warning text"]\n'
                 "}\n"
                 'layer2: "passed" = fault effect IS observable; "failed" = NOT observable.'
@@ -582,11 +687,12 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
 
         # Record system prompt to session store (dedup handles repeated prompts)
         capability_context = build_capability_context(state, "verify", tools)
-        from chaos_agent.agent.progress_ledger import build_ledger_prompt_section
+        # The progress ledger NO LONGER rides this head (Unit A task 2.4): it
+        # rides the message tail (appended above) so the [system][tools] prefix
+        # stays byte-stable across verify rounds.
         verifier_prompt = build_system_prompt(
             PromptMode.VERIFICATION,
             profile=capability_context.profile,
-            progress_ledger_section=build_ledger_prompt_section(state.get("progress_ledger")),
         )
         record_system_prompt(hook, state, verifier_prompt, node_name=VERIFIER)
 
@@ -609,6 +715,12 @@ def make_verifier(hook=None, llm=None, tools=None, registry=None):
             "verifier_loop_count": count,
             "inject_layer1_cache": layer1_to_dict(layer1),  # persist for subsequent iterations
         }
+        # Window origin (fault-window hold): the execute-loop just concluded
+        # — this FIRST verifier step is the earliest observable moment of
+        # that fact. Write-once per attempt: verifier self-loop re-entries
+        # (this node returns per ReAct step) keep the first stamp; replan
+        # seams clear the field and the replanned attempt re-stamps here.
+        _stamp_window_start(state, result_update)
 
         tool_calls = getattr(response, "tool_calls", None) or []
         # Scheme B: verifier_loop is a pure ReAct step. Persist the response

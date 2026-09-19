@@ -38,7 +38,7 @@ def test_task_summary_uses_fault_spec_not_active_skill_name():
             "experiment_uid": "uid-1",
             "result": {"success": True},
             "verification": {
-                "level": "strong",
+                "level": "verified",
                 "layer1": {"status": "passed"},
                 "layer2": {"status": "passed"},
             },
@@ -49,7 +49,7 @@ def test_task_summary_uses_fault_spec_not_active_skill_name():
     assert text.startswith("[Task Summary] task_id=task-inject")
     assert "Type: pod-network-delay | Target: arms-prom/pod-a" in text
     assert "Result: injected | experiment_uid: uid-1" in text
-    assert "Verification: strong (L1=passed, L2=passed)" in text
+    assert "Verification: verified (L1=passed, L2=passed)" in text
     assert "current existence MUST be re-verified with kubectl" in text
 
 
@@ -80,6 +80,29 @@ def test_batch_summary_contains_targets_failures_and_freshness_note():
     assert "Failure reason: pod not found" in text
     assert "Batch analysis report: /tmp/batch.md" in text
     assert "resource names in this summary and in earlier" in text
+
+
+def test_batch_summary_renders_unverified_as_unknown_question_mark():
+    """Three-way rendering: "unverified" must read as ? — ✓ would claim
+    success, ✗ would claim failure; neither was observed. This is the
+    display-side twin of the unverified→unknown streaming mapping."""
+    text = build_batch_summary_text(
+        [
+            {
+                "task_id": "task-u",
+                "task_state": "unverified",
+                "fault_type": "pod-cpu-fullload",
+            },
+            {
+                "task_id": "task-f",
+                "task_state": "failed",
+                "fault_type": "pod-cpu-fullload",
+            },
+        ],
+    )
+    assert "→ unverified ?" in text
+    assert "✓" not in text
+    assert "→ failed ✗" in text
 
 
 def test_recover_summary_falls_back_to_inject_state_fault_type():

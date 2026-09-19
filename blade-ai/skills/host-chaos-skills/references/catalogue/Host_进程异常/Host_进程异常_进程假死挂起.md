@@ -29,7 +29,8 @@ blade create process stop --process <process-name> --timeout <duration>
 **注入验证**：
 1. `ps aux | grep <process>` 确认进程状态为 T（Stopped）
 2. `curl --connect-timeout 5 <service-url>` 确认连接后无响应
-3. 健康检查（如 LB 心跳）是否触发报警
+3. 健康检查（如 LB 心跳）是否触发报警（报警由 LB 多轮失败检测累积触发，存在传播
+   延迟——首查未见报警不构成反证，挂起的直接证据是第 1 条的进程 T 状态）
 
 **注入恢复**：
 ```bash

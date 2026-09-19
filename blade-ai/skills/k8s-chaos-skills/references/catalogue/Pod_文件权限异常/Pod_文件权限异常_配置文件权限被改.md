@@ -33,17 +33,19 @@
 2. **先武装定时恢复，再注入**（载体 Pod 武装形态——直接以顶层 `( sleep … ) &` 后台子 shell
    派发会被命令守卫拦截（unknown_binary: `(`），载体内 `sh -c` 载荷同时解决 exec-form 通道
    不解释裸后台语法的问题；到期自动将权限改回资源准备第 4 步记录的原始值，补齐自恢复能力；
-   执行通道为多副本路由，无法可靠终止定时器，故不设 pidfile——恢复命令幂等（chmod 到原值
+   载体 Pod 为多副本时无法可靠终止定时器，故不设 pidfile——恢复命令幂等（chmod 到原值
    重复执行是 no-op），迟到触发无害；武装失败则不注入。还原脚本 = 一条
-   `kubectl exec <pod-name> -n <namespace> -- chmod <原始权限数字> <目标路径>`，base64 折叠为
-   <restore-b64> 后按下式武装；载体 SA 需目标命名空间 pods/exec create 权限——从载体远程
+   `kubectl exec <pod-name> -n <namespace> -- chmod <原始权限数字> <目标路径>`，落盘形态按
+   recovery-carrier.md 第七节「四档定案表」按明文字节数查表选定（Phase 2 无 base64 生成器，勿留
+   <restore-b64> 占位符——下式为旧契约历史形态示例，勿套用）；载体 SA 需目标命名空间 pods/exec create 权限——从载体远程
    exec 目标 Pod 执行 chmod，注入前先在载体验证（⚠️ can-i 子资源假阴性陷阱：
    `kubectl auth can-i create pods/exec` 对子资源报 no 但实际可 exec，必须用
    `--subresource` 旗标形态）：
    `kubectl exec <载体Pod> -n <载体ns> -- kubectl auth can-i create pods --subresource=exec -n <namespace>`）：
    ```bash
-   kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'echo <restore-b64> | base64 -d > /tmp/blade-restore-perms.sh; ( sleep <duration>; sh /tmp/blade-restore-perms.sh ) >/dev/null 2>&1 & echo armed'
+   kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'echo <restore-b64> | base64 -d > /tmp/blade-restore-perms.sh; ( sleep <duration>; sh /tmp/blade-restore-perms.sh ) >/tmp/restore.log 2>&1 & echo armed'
    ```
+   倒计时从武装时刻起算：先校验后武装、与注入紧邻（≤60s）；武装后发生任何修复须先 `kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'pkill -f blade-restore-perm[s]; true'` 停旧定时器再全额重武装（见 SKILL.md 安全红线「故障窗口完整」）
    随后按要模拟的故障方向二选一注入：
 
    **方向 A —— 配置文件不可读**（应用读配置失败）：
@@ -74,7 +76,7 @@
    kubectl exec <pod-name> -n <namespace> -- ls -la <目标路径>
    ```
    方向 A 应显示 `----------`，方向 B 应显示 `dr-xr-xr-x`
-2. 确认应用**实际读不到** —— 这是效果判据，不能只看权限位。以容器内进程的身份实测：
+2. 确认应用**实际读不到** —— 这是效果判据，不能只看权限位。以容器内进程的身份验证：
    ```bash
    # 方向 A：应报 Permission denied
    kubectl exec <pod-name> -n <namespace> -- cat <配置文件路径>

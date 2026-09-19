@@ -13,6 +13,7 @@ from pathlib import Path
 from chaos_agent.agent.spec.fault_spec import fault_type_from_state
 from chaos_agent.agent.result.operation_outcome import read_inject_verification, read_operation_outcome
 from chaos_agent.agent.prompts.constants import MAX_EXPERIENCE_MD_BYTES
+from chaos_agent.utils.truncation import build_truncation_notice
 
 EXPERIENCE_MD_PATH = Path(os.path.expanduser("~/.blade-ai/EXPERIENCE.md"))
 MAX_EXPERIENCE_MD_LINES = 200
@@ -23,6 +24,10 @@ def load_agent_experience() -> str:
 
     - If file exceeds MAX_EXPERIENCE_MD_BYTES, truncate preserving head (75%) and tail (25%)
       (borrowed from OpenClaw's context file budgeting pattern)
+    - Both truncation paths (byte budget, line budget) speak the shared
+      truncation dialect: quantified elision markers + ONE state-evidence
+      notice appended at the end (honest original size + read_file
+      retrieval guidance)
     - Returns empty string if file doesn't exist (no warning for missing file)
     """
     if not EXPERIENCE_MD_PATH.is_file():
@@ -37,32 +42,72 @@ def load_agent_experience() -> str:
     if not content:
         return ""
 
-    # Size budgeting
-    if len(content.encode("utf-8")) > MAX_EXPERIENCE_MD_BYTES:
-        content = _truncate_with_budget(content)
+    # Size budgeting — the notice counts against the byte budget (the
+    # returned text stays within MAX_EXPERIENCE_MD_BYTES).
+    original_bytes = len(content.encode("utf-8"))
+    notice = ""
+    if original_bytes > MAX_EXPERIENCE_MD_BYTES:
+        notice = _experience_truncation_notice(original_bytes)
+        content = _truncate_with_budget(content, notice)
 
     lines = content.split("\n")
     if len(lines) > MAX_EXPERIENCE_MD_LINES:
-        # Keep head (75%) and tail (25%)
+        # Keep head (75%) and tail (25%) with a quantified elision marker
+        # (line-level keeps Markdown paragraph integrity).
         head_count = int(MAX_EXPERIENCE_MD_LINES * 0.75)
         tail_count = MAX_EXPERIENCE_MD_LINES - head_count
-        content = "\n".join(lines[:head_count] + ["\n... (truncated) ...\n"] + lines[-tail_count:])
-
+        elided_lines = len(lines) - head_count - tail_count
+        content = (
+            "\n".join(lines[:head_count])
+            + f"\n...[{elided_lines} lines elided]...\n"
+            + "\n".join(lines[-tail_count:])
+        )
+        if not notice:
+            # The byte-budget notice already rides the tail above (it is
+            # the last line and survives the line cut); only the
+            # line-budget-only path appends it here.
+            content += _experience_truncation_notice(original_bytes)
     return content
 
 
-def _truncate_with_budget(content: str) -> str:
-    """Truncate content to fit byte budget, preserving head 75% and tail 25%."""
+def _experience_truncation_notice(original_bytes: int) -> str:
+    """State-evidence notice for the EXPERIENCE.md injection truncation.
+
+    The full file stays on disk and read_file's 50KB cap exceeds the 25KB
+    injection budget, so the retrieval hint is a promise this loader keeps.
+    """
+    return build_truncation_notice(
+        "state-evidence",
+        original_bytes,
+        state_hint="Full EXPERIENCE.md is re-readable via the read_file tool",
+        unit="bytes",
+    )
+
+
+def _truncate_with_budget(content: str, notice: str = "") -> str:
+    """Truncate content to fit byte budget, preserving head 75% and tail 25%.
+
+    The quantified elision marker and the caller's state-evidence notice
+    both count against MAX_EXPERIENCE_MD_BYTES: the returned text stays
+    within the ceiling instead of silently returning budget + notice.
+    """
     encoded = content.encode("utf-8")
     if len(encoded) <= MAX_EXPERIENCE_MD_BYTES:
         return content
 
-    head_bytes = int(MAX_EXPERIENCE_MD_BYTES * 0.75)
-    tail_bytes = MAX_EXPERIENCE_MD_BYTES - head_bytes - 30  # 30 bytes for truncation marker
+    # Reserve for the marker (worst-case numeric width) + the notice.
+    reserved = 64 + len(notice.encode("utf-8"))
+    head_bytes = int((MAX_EXPERIENCE_MD_BYTES - reserved) * 0.75)
+    tail_bytes = MAX_EXPERIENCE_MD_BYTES - reserved - head_bytes
 
     head = encoded[:head_bytes].decode("utf-8", errors="ignore")
-    tail = encoded[-tail_bytes:].decode("utf-8", errors="ignore")
-    return head + "\n\n... (truncated for size budget) ...\n\n" + tail
+    tail = (
+        encoded[len(encoded) - tail_bytes:].decode("utf-8", errors="ignore")
+        if tail_bytes > 0
+        else ""
+    )
+    omitted = len(encoded) - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+    return f"{head}\n...[{omitted} bytes elided]...\n{tail}{notice}"
 
 
 def ensure_experience_md_dir() -> None:

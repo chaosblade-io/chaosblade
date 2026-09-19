@@ -27,6 +27,7 @@ from chaos_agent.skills.models import ScriptInfo, Skill, SkillMetadata
 from chaos_agent.skills.validator import SkillValidator
 from chaos_agent.tools.guard import CommandResult, ToolGuard
 from chaos_agent.tools.shell import run_command
+from chaos_agent.utils.truncation import apply_output_safety_valve
 
 logger = logging.getLogger(__name__)
 
@@ -625,31 +626,42 @@ class SkillRegistry:
 
     @staticmethod
     def _format_script_output(script_name: str, result: CommandResult) -> str:
-        """Format script execution result for LLM consumption."""
-        max_stdout = settings.skill_script_max_output
-        max_stderr = 1000
+        """Format script execution result for LLM consumption.
 
+        Near-complete output at the tool layer — governance is the
+        context compactor's job (same contract as the kubectl tool). No
+        routine stdout/stderr cuts: on failure the stderr is a Python
+        traceback whose TAIL carries the exception type+message (a
+        head cut would hide exactly what self-repair needs). The only
+        tool-layer cut is the shared 64KB safety valve over the combined
+        body (head-tail middle cut + shared notice, kind by outcome).
+        """
         # Header line
         header = f"[Script: {script_name}] Exit code: {result.exit_code} | Duration: {result.duration_ms:.0f}ms"
 
-        # Truncate stdout
-        stdout = result.stdout
-        stdout_truncated = False
-        if len(stdout) > max_stdout:
-            stdout = stdout[:max_stdout]
-            stdout_truncated = True
+        # Body: stdout always; stderr appended when non-empty (its tail
+        # lands in the valve's kept tail on runaway output).
+        body = "--- STDOUT ---\n" + (result.stdout or "")
+        if (result.stderr or "").strip():
+            body += "\n--- STDERR ---\n" + result.stderr
 
-        parts = [header, "--- STDOUT ---", stdout]
-        if stdout_truncated:
-            parts.append(f"... (truncated, {len(result.stdout)} characters total)")
+        kind = "error" if result.exit_code != 0 else "success-output"
+        # Script-appropriate narrowing guidance: the shared notice's
+        # DEFAULT success strategies are kubectl narrowing flags — on a
+        # script's stdout they would be actively misleading. Keep the
+        # universal "do not repeat" header; swap the strategy list.
+        strategy_hint = (
+            "If you need more of this data, narrow the script's output "
+            "(its own filter/limit flags, or redirect to a file and read "
+            "the relevant section) instead of re-running it verbatim."
+            if kind == "success-output"
+            else None
+        )
+        body = apply_output_safety_valve(
+            body, kind=kind, strategy_hint=strategy_hint,
+        )
 
-        # Include stderr only if non-empty
-        stderr = result.stderr
-        if stderr.strip():
-            if len(stderr) > max_stderr:
-                stderr = stderr[:max_stderr]
-            parts.append("--- STDERR ---")
-            parts.append(stderr)
+        parts = [header, body]
 
         # Prefix errors
         if result.exit_code != 0:

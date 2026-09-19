@@ -46,7 +46,10 @@ class TestInjectRequest:
             target_name="my-pod",
             namespace="default",
         )
-        assert req.duration == 600
+        # Unset duration must stay None (→ 0 at FaultSpec construction) so
+        # NL requests let the intent node extract the user-stated value —
+        # a hardcoded default would masquerade as a user-pinned hard-pin.
+        assert req.duration is None
         assert req.params is None
         assert req.params_flags is None
         assert req.confirm is False

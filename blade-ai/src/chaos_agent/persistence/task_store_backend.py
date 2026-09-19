@@ -22,14 +22,43 @@ _JSON_COLUMNS: frozenset[str] = frozenset(
      # R18 — postmortem dict (path/markdown/summary) JSON-serialised.
      "postmortem",
      # E18 — safety pre-check report dicts.
-     "target_health_report", "feasibility_report"}
+     "target_health_report", "feasibility_report",
+     # Round-32 — the row-level liability ledger (agent/state.py
+     # owned_experiment_uids / retired_experiment_uids, the two wings
+     # behind ``live_liability_uids``). JSON arrays of experiment UIDs:
+     # birth wing monotonic by append, death wing extended by proven
+     # destroys and framework-side cleanup. Consumed by
+     # ``may_carry_live_fault`` to materialise tasks.liability_live.
+     "owned_experiment_uids", "retired_experiment_uids",
+     # Round-32b — combo discriminator (agent/state.py
+     # ``combo_native_issued``): True = a native mutation was issued
+     # alongside a live experiment (the combo shape whose native half
+     # survives experiment-wing balance). Persisted as JSON true/false so
+     # the tri-state survives the round trip: NULL = never asserted
+     # (legacy rows — keep the committed fallback), false = the execute
+     # side asserted experiments-only at birth, true = combo. The upsert
+     # latch (task_store.py) keeps true sticky and lets None flushes
+     # never erase it — same hydration-gap discipline as the wings.
+     "combo_native_issued"}
 )
 
-# tasks table — narrow, hot path (16 columns + tenant_id)
+# tasks table — narrow, hot path (16 columns + tenant_id + workspace_id)
 _TASK_COLUMNS: list[str] = [
     "id", "task_id", "task_state", "stage", "phase", "operation",
     "skill_name", "experiment_uid", "namespace", "target_name",
     "tenant_id",
+    # Workspace-scoped isolation (platform mode): the home workspace of
+    # the task — a durable ownership fact, unlike connection credentials.
+    # Empty on local CLI / bare SDK entries; empty means UNFILTERED in
+    # select_active_tasks, exactly like tenant_id's contract.
+    "workspace_id",
+    # Round-32 — materialised liability verdict: MAY this row still carry
+    # a live fault on the cluster? Recomputed on every upsert /
+    # update_task_state write from ``may_carry_live_fault`` (ledger first,
+    # clearing-word proof, monotonic guard). This column — not the
+    # task_state word — is what select_active_tasks keys on: words answer
+    # display questions, the ledger answers the recovery question.
+    "liability_live",
     "error", "finished_at", "duration_ms",
     "gmt_create", "gmt_modified",
 ]
@@ -41,6 +70,13 @@ _DETAIL_COLUMNS: list[str] = [
     "plan_summary", "kubeconfig", "kube_context",
     "verification", "recover_verification", "result",
     "failure_reason",
+    # Round-32 — liability ledger wings (see _JSON_COLUMNS).
+    "owned_experiment_uids", "retired_experiment_uids",
+    # Round-32b — combo discriminator (see _JSON_COLUMNS): the DB-side
+    # gate that lets a BALANCED wing settle an experiments-only row dead
+    # (may_carry_live_fault branch A2) — combo rows keep the committed
+    # fallback because their native half may still be owed.
+    "combo_native_issued",
     "baseline_data", "inject_context", "skill_use_case",
     "injection_method", "execution_artifacts", "kubectl_exec_pod_name",
     "injection_start_time",
@@ -53,7 +89,11 @@ _DETAIL_COLUMNS: list[str] = [
     "postmortem",
     # E18 — safety pre-check reports (JSON-serialised).
     "target_health_report", "feasibility_report",
-    "total_token_input", "total_token_output",
+    # total_token_cached is a SUBSET of total_token_input (prompt-cache
+    # hits, not additive) — persisted so per-task hit rate survives a
+    # restart and is queryable/aggregatable in SQL. Written absolutely by
+    # tracer._persist_summary at finalize; see design D4.
+    "total_token_input", "total_token_output", "total_token_cached",
     "total_llm_calls", "total_tool_calls", "total_duration_ms",
     "gmt_create", "gmt_modified",
 ]
@@ -150,8 +190,22 @@ class StorageBackend(Protocol):
         """SELECT * FROM tasks WHERE task_state = ? ORDER BY gmt_create DESC LIMIT ? OFFSET ?"""
         ...
 
-    async def select_active_tasks(self, namespace: str = "", target_name: str = "") -> list[dict]:
-        """SELECT * FROM tasks WHERE task_state IN ('injecting','injected') [AND namespace=?] [AND target_name=?] ORDER BY gmt_create DESC"""
+    async def select_active_tasks(self, namespace: str = "", target_name: str = "", tenant_id: str = "", workspace_id: str = "") -> list[dict]:
+        """SELECT * FROM tasks WHERE liability_live = 1 [AND namespace=?] [AND target_name=?] [AND tenant_id=?] [AND workspace_id=?] ORDER BY gmt_create DESC
+
+        Round-32 root-cause fix: the recoverable set keys on the
+        materialised ``tasks.liability_live`` verdict (ledger-first,
+        rendered by ``may_carry_live_fault`` in task_store.py), not on
+        the task_state word. The word-guessing predicate
+        (task_state IN TASK_STATE_ACTIVE_VALUES …) answered "which
+        lifecycle words sound unfinished" — every new word
+        (recovering, failed-with-experiment, partial_recovered) then
+        needed a fresh human re-derivation, and the two that lost
+        (round-32 K1/K2) permanently blinded recovery to live faults.
+        The ledger column absorbs the injection_start_time / target /
+        fault_spec joins of the old predicate: "may still owe a
+        destroy" is computed once, at write time, from evidence.
+        """
         ...
 
     async def delete_task(self, task_id: str) -> bool:

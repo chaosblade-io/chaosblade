@@ -134,6 +134,37 @@ class TestFindContradictions:
         result = _find_contradictions(evidence, truth, 2)
         assert result == []
 
+    def test_comma_grouped_delta_parsed_as_whole(self):
+        # LLM evidence often uses human-style comma grouping
+        # ("78,505,306 → 78,697,402"). The old pattern backtracked
+        # past the commas and parsed "306 → 78" — a fabricated delta
+        # whose wrong numbers landed verbatim in the warning text.
+        evidence = "Disk writes (vda3) 78,505,306 → 78,697,402"
+        truth = {"Disk writes (vda3)": (78505306.0, 78505306.0)}
+        result = _find_contradictions(evidence, truth, 2)
+        assert len(result) == 1
+        assert "78,505,306→78,697,402" in result[0]
+        assert "Δ=+192096" in result[0]
+
+    def test_comma_grouped_with_units_parsed_as_whole(self):
+        # "3,145Mi → 3,146Mi" used to degrade to "145 → 3" (Δ=-142) —
+        # the exact false-positive shape that would downgrade a faithful
+        # citation to a hallucination warning.
+        evidence = "Memory usage 3,145Mi → 3,146Mi"
+        truth = {"Memory usage": (3145.0, 3145.0)}
+        result = _find_contradictions(evidence, truth, 2)
+        assert len(result) == 1
+        assert "3,145→3,146" in result[0]
+        assert "Δ=+1" in result[0]
+
+    def test_comma_grouped_no_flag_when_truth_changed(self):
+        # Comma-grouped citation of a REAL change must not be flagged
+        # (truth delta non-zero → no contradiction, comma or not).
+        evidence = "Disk writes (vda3) 78,505,306 → 78,697,402"
+        truth = {"Disk writes (vda3)": (78505306.0, 78697402.0)}
+        result = _find_contradictions(evidence, truth, 2)
+        assert result == []
+
 
 class TestCrossCheckEvidence:
     def test_empty_observations_noop(self):

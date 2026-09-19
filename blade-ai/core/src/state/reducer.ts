@@ -318,12 +318,24 @@ function commitThinking(state: AppState): AppState {
   };
 }
 
+/** History kinds owned by the boot phases. The session-resume BOOT
+ * path (``blade-ai resume -i <sid>``) dispatches these cards BEFORE
+ * the replay's HISTORY_CLEARED and passes ``preserveBootCards`` so
+ * they stay at the head of the rebuilt history — fresh-boot visual
+ * parity (welcome → doctor → pending → replayed turns) instead of
+ * cards appended after N replayed events. */
+export const BOOT_CARD_KINDS: ReadonlySet<string> = new Set([
+  "welcome_card",
+  "boot_doctor_card",
+  "pending_tasks_card",
+]);
+
 export type Action =
   | { type: "TURN_STARTED"; input: string }
   | { type: "TOKEN_APPENDED"; content: string; node: string }
   | { type: "THINKING_APPENDED"; content: string; node: string }
   | { type: "LLM_STARTED"; node: string }
-  | { type: "USAGE_RECEIVED"; inputTokens: number; outputTokens: number }
+  | { type: "USAGE_RECEIVED"; inputTokens: number; outputTokens: number; cachedTokens?: number }
   | { type: "TOOL_STARTED"; callId: string; name: string; node: string }
   | {
       type: "TOOL_ENDED";
@@ -430,7 +442,13 @@ export type Action =
       mode: AppState["config"]["displayMode"];
     }
   | { type: "LOG_APPENDED"; level: "info" | "warn" | "ok"; text: string }
-  | { type: "HISTORY_CLEARED" }
+  /** ``preserveBootCards``: keep the boot-phase cards (welcome /
+   *  doctor / pending-tasks) when clearing — set by the session-resume
+   *  BOOT path, which dispatches those cards BEFORE the replay and
+   *  needs them at the head of the rebuilt history. /clear and the
+   *  slash ``/resume`` path omit it: their cards belong to the
+   *  discarded session. */
+  | { type: "HISTORY_CLEARED"; preserveBootCards?: boolean }
   // M8: replay lifecycle. REPLAY_STARTED flips streamState into a
   // pseudo-busy mode so InputPrompt unsubscribes (no accidental new
   // turn races with the timed setTimeout chain). REPLAY_ENDED commits
@@ -477,10 +495,17 @@ export type Action =
    * Backend handshake completed: server spawned, /health passed,
    * session created and state fetched. Sets ``session`` so Header
    * (which lives inside ``<Static>``) renders for the first time
-   * with real values. Issued exactly once per process by
-   * ``BootRunner`` — before this, ``session.id`` is ``""`` and
-   * MainContent skips the header so the dynamic-area boot spinner
-   * is the only thing the user sees.
+   * with real values. Issued by ``BootRunner`` at boot — before
+   * this, ``session.id`` is ``""`` and MainContent skips the header
+   * so the dynamic-area boot spinner is the only thing the user
+   * sees.
+   *
+   * Re-issued by ``/resume <sid>`` to SWITCH the active session:
+   * the new sid lands in ``state.session.id``, Composer's store
+   * subscription re-binds useStream to the resumed session's
+   * endpoints, and the case below resets the old session's
+   * DAG / task pointers (same semantics as the web sidebar's
+   * resetSession, which re-uses this action).
    */
   | {
       type: "SESSION_INITIALIZED";
@@ -521,7 +546,19 @@ export type Action =
    * reducer). Idempotent: if ``phrase === state.idlePhrase`` the
    * reducer returns the same state, avoiding a no-op re-render.
    */
-  | { type: "PHRASE_TICK"; phrase: string };
+  | { type: "PHRASE_TICK"; phrase: string }
+  /**
+   * Fault-window hold lifecycle (``turn_hold_fault_window`` opt-in).
+   * Mirror of the server's ``fault_window`` SSE events. ENTERED writes
+   * the transient ``faultWindow`` slot (FaultWindowIndicator's data
+   * source + LoadingIndicator mutex); TICKED re-bases the local
+   * countdown deadline against server clock truth; EXITED clears the
+   * slot — the recover graph then streams on the same turn and the
+   * regular loading indicator takes the slot back.
+   */
+  | { type: "FAULT_WINDOW_ENTERED"; turnId: string; injectTaskId: string; durationSec: number; remainingSec: number }
+  | { type: "FAULT_WINDOW_TICKED"; remainingSec: number }
+  | { type: "FAULT_WINDOW_EXITED"; reason: "elapsed" | "early" | "aborted" };
 
 const PREVIEW_MAX = 80;
 const SUBJECT_MAX = 80;
@@ -759,12 +796,14 @@ export function reducer(state: AppState, action: Action): AppState {
         suppressMidContentThinking: false,
         turnInputTokens: 0,
         turnOutputTokens: 0,
+        turnCachedTokens: 0,
         // Phase 4 — defensive reset. A compaction whose COMPLETED
         // event somehow never arrived (server crash mid-turn, network
         // drop) would otherwise leave the spinner stuck across into
         // the next turn. TURN_STARTED is the canonical
         // "everything begins fresh" boundary.
         currentCompaction: null,
+        faultWindow: null,
         turnStartedAt: Date.now(),
         taskId: undefined,
         isReceiving: false,
@@ -1048,11 +1087,14 @@ export function reducer(state: AppState, action: Action): AppState {
       // server builds + future serialisation drift can't recreate the bug.
       const inAdd = Math.max(0, Number(action.inputTokens) || 0);
       const outAdd = Math.max(0, Number(action.outputTokens) || 0);
-      if (inAdd === 0 && outAdd === 0) return state;
+      // Cache-hit subset of input tokens; same NaN/negative defence.
+      const cacheAdd = Math.max(0, Number(action.cachedTokens) || 0);
+      if (inAdd === 0 && outAdd === 0 && cacheAdd === 0) return state;
       return {
         ...state,
         turnInputTokens: state.turnInputTokens + inAdd,
         turnOutputTokens: state.turnOutputTokens + outAdd,
+        turnCachedTokens: state.turnCachedTokens + cacheAdd,
       };
     }
 
@@ -1821,6 +1863,43 @@ export function reducer(state: AppState, action: Action): AppState {
     }
 
     // ---------------------------------------------------------------
+    case "FAULT_WINDOW_ENTERED": {
+      const remainingSec = Math.max(0, action.remainingSec || 0);
+      return {
+        ...state,
+        faultWindow: {
+          turnId: action.turnId || "",
+          injectTaskId: action.injectTaskId || "",
+          durationSec: Math.max(0, action.durationSec || 0),
+          deadlineAt: Date.now() + remainingSec * 1000,
+          remainingSec,
+        },
+      };
+    }
+
+    // ---------------------------------------------------------------
+    case "FAULT_WINDOW_TICKED": {
+      // Orphan tick (a resume fold replaying a mid-window segment, or a
+      // dropped enter): nothing to re-base — the indicator isn't up.
+      if (!state.faultWindow) return state;
+      const remainingSec = Math.max(0, action.remainingSec || 0);
+      return {
+        ...state,
+        faultWindow: {
+          ...state.faultWindow,
+          deadlineAt: Date.now() + remainingSec * 1000,
+          remainingSec,
+        },
+      };
+    }
+
+    // ---------------------------------------------------------------
+    case "FAULT_WINDOW_EXITED":
+      // Idempotent: an exit with no slot up (orphan from a replay fold)
+      // is a no-op, not an error.
+      return state.faultWindow ? { ...state, faultWindow: null } : state;
+
+    // ---------------------------------------------------------------
     case "TURN_DONE":
       return commitPending(applyTurnStats(state));
 
@@ -1876,10 +1955,11 @@ export function reducer(state: AppState, action: Action): AppState {
       return { ...state, history: [...state.history, action.item] };
 
     case "SESSION_INITIALIZED":
-      // First and only time session details are written. Triggered by
-      // ``BootRunner`` once the backend handshake completes; before
-      // this the session is the ``initialAppState`` placeholder
-      // (``id: ""``).
+      // Session details written at boot by ``BootRunner`` (before
+      // this the session is the ``initialAppState`` placeholder,
+      // ``id: ""``) — and RE-written by ``/resume <sid>`` when the
+      // user takes over a previous session: the new id re-binds
+      // Composer's useStream via its ``s.session.id`` subscription.
       return {
         ...state,
         session: action.session,
@@ -1901,6 +1981,7 @@ export function reducer(state: AppState, action: Action): AppState {
         // not cross the boundary. Boot is a no-op (both unset).
         taskId: undefined,
         currentPhaseStepper: null,
+        faultWindow: null,
       };
 
     case "CONFIRM_USER_DECIDED":
@@ -1987,12 +2068,17 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...baseState,
         streamState: "responding",
+        // Replay re-enacts CONFIRM_RECEIVED mid-stream (``streamState``
+        // flips to ``waiting_confirmation``), so downstream attention
+        // hooks need this flag to tell a re-enacted gate from a live one.
+        isReplaying: true,
         thoughtSubject: `replaying ${action.taskId}`,
         thoughtBuffer: "",
         thoughtStartedAt: 0,
         hasActiveThinking: false,
         turnInputTokens: 0,
         turnOutputTokens: 0,
+        turnCachedTokens: 0,
         turnStartedAt: Date.now(),
         taskId: action.taskId,
         isReceiving: true,
@@ -2006,7 +2092,9 @@ export function reducer(state: AppState, action: Action): AppState {
       // separately by the /replay handler, so we don't add another
       // visual artifact here.
       void action.aborted;
-      return commitPending(state);
+      // Drop the replay flag alongside: commitPending resets
+      // ``streamState`` but knows nothing about replay semantics.
+      return { ...commitPending(state), isReplaying: false };
     }
 
     // ---------------------------------------------------------------
@@ -2018,6 +2106,16 @@ export function reducer(state: AppState, action: Action): AppState {
       // *before* dispatching this action so the previously burn-in'd
       // lines get erased.
       //
+      // The session-resume BOOT path dispatches its boot cards
+      // BEFORE the replay and passes ``preserveBootCards`` — those
+      // cards describe the CURRENT environment (self-check, pending
+      // injections), not the discarded session, so they survive at
+      // the head of the rebuilt history. On that path the remount
+      // bump is harmless: the Static gate (``session.id``) is still
+      // closed while the boot cards dispatch, so nothing has
+      // burn-in'd yet and the remount renders everything exactly
+      // once, in history order.
+      //
       // Pending items (mid-turn streaming) survive — we don't want
       // /clear during a turn to disappear the running thinking row.
       //
@@ -2026,10 +2124,15 @@ export function reducer(state: AppState, action: Action): AppState {
       // Counters restart at 1 so the next allocated locator reads
       // ``T1`` / ``E1`` again — the user has no way to see "T7"
       // anywhere on screen so reusing the namespace causes no
-      // confusion.
+      // confusion. (Boot cards carry no locators, so the preserve
+      // path resets them just the same.)
+      const kept =
+        action.preserveBootCards === true
+          ? state.history.filter((h) => BOOT_CARD_KINDS.has(h.kind))
+          : [];
       return {
         ...state,
-        history: [],
+        history: kept,
         historyRemountKey: state.historyRemountKey + 1,
         locators: { byId: {}, nextToolN: 1, nextExperimentN: 1 },
         // ``lastTaskId`` is keyed off history items the user could
@@ -2158,7 +2261,13 @@ function commitPending(
     state.pending.length === 0 &&
     state.streamState === "idle" &&
     !hasUsage &&
-    !state.currentPhaseStepper
+    !state.currentPhaseStepper &&
+    // Fault-window dropped-exit defence: a boundary action arriving
+    // with the hold slot still up (replay fold on an idle base, exit
+    // event dropped mid-window) must fall through to the tail
+    // cleanup — bailing here would keep FaultWindowIndicator mounted
+    // across turns, ticking a countdown against a stale deadline.
+    !state.faultWindow
   ) {
     perfMark("commitPending", {
       dur: performance.now() - __perfStart,
@@ -2179,6 +2288,7 @@ function commitPending(
       id: alloc.id,
       inputTokens: state.turnInputTokens,
       outputTokens: state.turnOutputTokens,
+      cachedTokens: state.turnCachedTokens,
       endedAt: Date.now(),
     };
     state = {
@@ -2219,6 +2329,17 @@ function commitPending(
     hasActiveThinking: false,
     turnStartedAt: 0,
     isReceiving: false,
+    // The usage row above CONSUMED the per-turn counters — clear
+    // them so a second boundary action in the same turn-end window
+    // (REPLAY_ENDED right after the resume fold's TURN_DONE; any
+    // future back-to-back boundary) cannot re-commit an identical
+    // summary row with the same cumulative totals and Date.now().
+    // TURN_STARTED zeroes them as well — that is the other half of
+    // this contract and covers boundary pairs with a TURN_STARTED
+    // in between (live supersede: TURN_TRANSITION → TURN_STARTED).
+    turnInputTokens: 0,
+    turnOutputTokens: 0,
+    turnCachedTokens: 0,
     // Phase 4 — defensive end-of-turn cleanup. Any in-flight compaction
     // that didn't close cleanly (the COMPLETED/FAILED event was
     // dropped) shouldn't bleed visible chrome into the next turn.
@@ -2226,6 +2347,7 @@ function commitPending(
     // the dedicated reducer cases — clearing the slot here only
     // affects the live spinner, not scrollback.
     currentCompaction: null,
+    faultWindow: null,
   };
   perfMark("commitPending", {
     dur: performance.now() - __perfStart,

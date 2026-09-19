@@ -169,9 +169,13 @@ class _L4InteractionMixin:
         # flow and were mis-selected, failing with "no injection state found
         # for this task" because nothing had ever been injected.
         #
-        # The CLI's ``intent_input`` (cli/runner.py ``converse_stream``)
-        # likewise carries no ``task_id`` — keeping this path identical is
-        # what makes platform / CLI / TUI behave the same.
+        # The server /turn route (server/routes/turn.py) likewise carries
+        # no task id — it passes its per-turn ``turn-<hex>`` which the
+        # persistence layer's ``is_real_task_id`` rejects. Keeping this
+        # path identical is what makes platform / TUI behave the same.
+        # (The local CLI twin, ``cli/runner.py``'s converse_stream, was
+        # retired 2026-09-01; the server route is the single TUI
+        # conversation entry point.)
         #
         # The persistence layer independently rejects non-task ids
         # (``persistence.task_identity.is_real_task_id``); that is
@@ -181,6 +185,10 @@ class _L4InteractionMixin:
         # tools_chaos.py) so it propagates into LangGraph state for
         # load_memory / recover_handler tenant-scoped queries.
         _tenant_id = getattr(_settings, "tenant_id", "") or ""
+        # Workspace-scoped isolation rides the exact same channel (platform
+        # injects BLADE_AI_WORKSPACE_ID via blade_ai_context; empty locally
+        # and on bare SDK entries — empty means unfiltered, same contract).
+        _workspace_id = getattr(_settings, "workspace_id", "") or ""
 
         config = {
             "configurable": {"thread_id": thread_id},
@@ -251,6 +259,7 @@ class _L4InteractionMixin:
                 "dry_run": False,
                 "interaction_mode": "tui",
                 "tenant_id": _tenant_id,
+                "workspace_id": _workspace_id,
                 **_conn_state_fields(conn),
                 "messages": prev_messages,
             }
@@ -270,6 +279,7 @@ class _L4InteractionMixin:
                 "dry_run": False,
                 "interaction_mode": "tui",
                 "tenant_id": _tenant_id,
+                "workspace_id": _workspace_id,
                 **_conn_state_fields(conn),
                 "messages": prev_messages,
             }
@@ -284,6 +294,7 @@ class _L4InteractionMixin:
                 "dry_run": False,
                 "interaction_mode": "tui",
                 "tenant_id": _tenant_id,
+                "workspace_id": _workspace_id,
                 **_conn_state_fields(conn),
                 "messages": [HumanMessage(content=user_message)],
             }

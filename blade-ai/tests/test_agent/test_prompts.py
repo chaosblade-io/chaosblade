@@ -17,6 +17,19 @@ from chaos_agent.agent.prompts import (
 from chaos_agent.agent.prompts.sections.workflow import (
     get_verification_heuristics_compact_section,
 )
+from chaos_agent.agent.prompts.sections.verification import (
+    get_verifier_core_principles_section,
+    get_verifier_remember_section,
+)
+from chaos_agent.agent.prompts.sections.recovery import (
+    get_recover_core_principles_section,
+    get_recover_remember_section,
+)
+from chaos_agent.agent.prompts.sections.plan_builder import (
+    get_plan_builder_critical_rules_section,
+    get_plan_builder_critical_rules_reminder_section,
+)
+from chaos_agent.agent.prompts.reminder import PARALLELIZE_PRINCIPLE
 from chaos_agent.agent.prompts.sections.execution import (
     _execution_steps_only,
     get_execution_directives_section,
@@ -70,6 +83,50 @@ class TestSectionFunctions:
         assert "MUTATION steps only" in section
         assert "don't invent observation rounds" in section
         assert "rule an effect OUT" in section
+
+    def test_workflow_plan_contract_bounds_verification_time_annotations(self):
+        # Postmortem (inject-6001154d): the planner parameterized the case's
+        # "confirm within the window" into "mid-window ~3-5 minutes" and the
+        # verifier burned the window waiting for a status label after the
+        # physical quantity was already proven; a recovery-period wait also
+        # leaked into Verification Methods as a 60s pre-recovery hold.
+        # Time annotations are upper bounds; recovery waits belong to
+        # Rollback and Recovery.
+        section = get_workflow_section()
+        assert "upper bounds, not quotas" in section
+        assert "satisfied at any point inside its window" in section
+        assert '"Rollback and Recovery"' in section
+        assert "the verifier does not wait for recovery" in section
+
+    def test_workflow_duration_teaching_claims_no_floor_raise(self):
+        # inject-aac02265 (#35 round audit): the duration teaching claimed
+        # "values below the 600s safety floor are raised to the floor" —
+        # doubly false. ensure_min_duration honours an explicitly declared
+        # duration verbatim (floor 300s applies only to the UNSPECIFIED
+        # default path), and the floor was never 600s post-adjustment.
+        # The false claim cost a full 121.7s planning turn: the LLM
+        # believed its honest ~120s declaration would be inflated, so it
+        # second-guessed itself across three reasoning passes and finally
+        # declared 600 "to match what will actually be applied". The
+        # purge directive: no surface may teach raise-the-floor semantics.
+        section = get_workflow_section()
+        assert "raised to the floor" not in section
+        assert "safety floor" not in section
+        assert "600s" not in section
+        # The surviving teaching: declare the window the plan actually uses.
+        assert "Declare the window the plan actually" in section
+
+    def test_workflow_finish_planning_identity_declaration_teaching(self):
+        # B83/B84 (#49 post-mortem): step 6 MUST list the fault-identity
+        # triple (absence reads as "optional" and burns a nudge round on
+        # every CLI NL run) — but the CONTRACT lives in the tool schema
+        # alone (same pointer shape as blast_radius_scope). The prompt
+        # keeps one generalized principle only: identity comes from what
+        # the plan attacks, never from the case menu.
+        section = get_workflow_section()
+        assert "fault-identity" in section
+        assert "never from the skill-case document" in section
+        assert "`finish_planning` tool schema" in section
 
     def test_execution_directives_skip_planned_observation_steps(self):
         # Legacy or malformed plans may still carry observation steps; the
@@ -128,6 +185,64 @@ class TestSectionFunctions:
         # Timeout Protection removed: default timeout is a program guarantee
         # visible in the injection tool's own schema/docstring.
         assert "Timeout Protection" not in section
+
+    def test_phase1_parallel_authorization_covers_all_independent_calls(self):
+        # inject-aac02265 (#35): planning spent 262s on three SERIAL
+        # bookkeeping turns (ledger → plan file → exit signal) because the
+        # Phase 1 parallel authorization was scoped to "read-only query
+        # calls" only — every non-query call was implicitly serialized.
+        # The dependency definition line already constrains what counts as
+        # independent; the read-only qualifier only excluded calls that
+        # were safe to batch.
+        #
+        # 2026-09-11 slimming: the SAME-turn directive itself moved out of
+        # the middle-zone Parallel Calls block — the canonical
+        # PARALLELIZE_PRINCIPLE (Core Principles + REMEMBER, pinned by
+        # test_parallelize_principle_single_sourced_in_every_node) is the
+        # only directive copy; the block keeps only what the principle does
+        # NOT say: the dependency criteria (and, in Phase 2, the mutation
+        # receipt sequencing). This test pins the slimmed shape: no
+        # read-only re-scoping of Phase 1, and Phase 2 mutation receipts
+        # stay sequenced.
+        phase1 = get_tools_section(phase=1)
+        assert "read-only query calls" not in phase1
+        assert '"Dependent" means one call\'s arguments require another call\'s result' in phase1
+        phase2 = get_tools_section(phase=2)
+        assert "Mutation calls stay sequenced by their receipts" in phase2
+
+    def test_parallelize_principle_single_sourced_in_every_node(self):
+        # B53 follow-up (inject-0cac8c21 #35 / inject-172a2765 #26): the
+        # MAY-form authorization above was consumed probabilistically at
+        # best — the record-keeping turns stayed serial (262s/309s) in both
+        # regressions while #36 batched 2/3 on the same prompt. The fix is
+        # a single canonical principle (reminder.PARALLELIZE_PRINCIPLE:
+        # parallelize when you can; serialize on dependency, safety
+        # ordering, or doubt) rendered verbatim in every LLM node's primacy AND
+        # recency zones — a principle travels across faces; a scoped
+        # permission does not. This test pins the single-sourcing: every
+        # zone must carry the constant verbatim, so the wording can never
+        # drift per node.
+        zones = {
+            "planner Core Principles": get_core_principles_section(),
+            "planner REMEMBER": get_remember_section(),
+            "executor Core Principles": get_executor_core_principles_section(),
+            "executor REMEMBER": get_executor_remember_section(),
+            "verifier Core Principles": get_verifier_core_principles_section(),
+            "verifier REMEMBER": get_verifier_remember_section(),
+            "recover Core Principles": get_recover_core_principles_section(),
+            "recover REMEMBER": get_recover_remember_section(),
+            "intent REMEMBER": get_intent_reminder_section(),
+            "plan-builder critical rules (guided)":
+                get_plan_builder_critical_rules_section(),
+            "plan-builder critical rules (expert)":
+                get_plan_builder_critical_rules_section(mode="expert"),
+            "plan-builder reminder (guided)":
+                get_plan_builder_critical_rules_reminder_section(),
+            "plan-builder reminder (expert)":
+                get_plan_builder_critical_rules_reminder_section(mode="expert"),
+        }
+        for zone_name, zone in zones.items():
+            assert PARALLELIZE_PRINCIPLE in zone, zone_name
 
     def test_guidelines_section_contains_follow_instructions(self):
         section = get_guidelines_section(phase=2)
@@ -347,6 +462,10 @@ class TestIntentClarificationSectionFunctions:
         assert "system recommended default" in section
         assert "duration_seconds" in section
         assert "rejected" in section
+        # sess_67b835f8977c: intensity got declared in the submit summary,
+        # the window never was — the user approved a duration they never saw.
+        assert "nobody approved" in section
+        assert "states the window" in section
 
     def test_parameter_model_states_params_provenance_rule(self):
         """Intent accuracy: the probed environment is the ONLY authority.
@@ -393,6 +512,48 @@ class TestIntentClarificationSectionFunctions:
         assert "submit_fault_intent" in section
         assert "Probe" in section
         assert "Recommend" in section
+
+    def test_inject_flow_outcome_vs_means_teaches_criteria_not_verdicts(self):
+        """sess_9d6b3bbfe54f: the user's "make the component down" (an
+        OUTCOME) was silently single-picked into "Pod deleted" out of five
+        realizing forms — the user had to redirect to process-kill by hand.
+        The rule must teach the ranking CRITERIA and the presentation shape
+        (top-ranked primary + alternatives with observable differences);
+        WHICH form wins stays the model's judgement from case facts, so the
+        agent layer must never bake in a domain verdict.
+
+        intent-outcome-to-means: the rule now also routes through the
+        knowledge doc's question chain (what must break → which families →
+        four-axis comparison) and adds the sibling behavioural rules —
+        list-before-probe, the pre-recommendation
+        query_active_experiments compound-state check, and explicit
+        handling of partial answers — all sourced from trace
+        sess_4b696f566f23's FM1/FM2/FM4/FM5.
+        """
+        for kwargs in ({}, {"semantic_only": True}):
+            section = get_intent_inject_flow_section(**kwargs)
+            assert "Outcome vs means" in section
+            # routes through the methodology doc's question chain
+            assert "outcome-to-means.md" in section
+            assert "question chain" in section
+            assert "fault families" in section
+            # realism-first ranking: a drill rehearses what production
+            # actually hits, not the fastest trigger
+            assert "how likely each means is to occur in the real world" in section
+            assert "how certainly it achieves the named outcome" in section
+            assert "Never silently" in section
+            # behavioural siblings (trace sess_4b696f566f23)
+            assert "Means before carrier probe" in section
+            assert "query_active_experiments" in section
+            # sess_67b835f8977c: the compound warning fired at recommendation
+            # time but vanished from the submit summary — the approval
+            # decision was made without the composition in view
+            assert "submit summary" in section
+            assert "Partial answers" in section
+            # no domain winner hardcoded in the agent layer (phrase-level:
+            # bare "kill" collides with "skill/case")
+            assert "pod deleted" not in section.lower()
+            assert "process kill" not in section.lower()
 
     def test_inject_flow_warns_on_channel_mismatch_but_never_blocks(self):
         """One-line heads-up only — enforcement lives in the submit gate.
@@ -680,3 +841,114 @@ class TestExecutorEffectObservationBoundary:
         sliced = _execution_steps_only(plan)
         assert "step one" in sliced and "step two" in sliced
         assert "memory ~80%" not in sliced
+
+    def test_planned_wait_step_exemption(self):
+        # inject-aac02265 (#35): the executor burned a full 27s turn
+        # reconciling the observation ban against a wait step the plan
+        # itself declared (taint → 30s propagation → untaint). The ban
+        # targets ADDED observations; a plan-declared wait sequences the
+        # mutations and must be executed literally. The exemption is
+        # scoped to plan-declared steps only — both bans stay intact.
+        section = get_execution_directives_section()
+        assert (
+            "A wait or pause the plan declares as a step is executed as "
+            "written, not skipped." in " ".join(section.split())
+        )
+        # the two bans the exemption carves around are untouched
+        assert "verification work — skip it" in section
+        assert "Do not add effect observations" in section
+
+
+class TestExecutorPlanContractDiscipline:
+    """tier1-speedup unit 3 — the executor's first-round budget was burned
+    re-deriving already-frozen commands (task inject-8b757abb: 286s before
+    the first tool call). The pre-change "current hypothesis, not a script"
+    wording licensed that re-derivation. These tests freeze the contract
+    framing and the discipline clauses that forbid it.
+    """
+
+    def test_contract_framing_replaces_hypothesis_wording(self):
+        section = get_execution_directives_section()
+        assert "contract, not a hypothesis" in section
+        # The old licensing phrase must be gone from the orchestration section
+        assert "current hypothesis, not a script" not in section
+
+    def test_discipline_clauses_present_with_plan(self):
+        plan = "## Execution Steps\n1. issue the mutation\n"
+        section = get_execution_directives_section(plan=plan)
+        # (1) written order
+        assert "in their written order" in section
+        # (2) exactly one read-only existence check before the first mutation
+        assert "exactly one read-only call" in section
+        assert "still exists" in section
+        # (3) re-derivation ban
+        assert "Do NOT re-derive command texts" in section
+        assert "re-evaluate quoting or" in section
+        # (4) tool-error correction is legitimate; twice = replan
+        assert "legitimate path" in section
+        assert "failing twice means replan" in section
+
+    def test_plan_conditioned_clauses_absent_without_plan(self):
+        section = get_execution_directives_section()
+        # No frozen plan → no plan-conditioned discipline; nothing to forbid
+        # re-deriving.
+        assert "Do NOT re-derive command texts" not in section
+        assert "in their written order" not in section
+
+
+class TestCrChannelRoutingGuide:
+    """openspec faultdrill-cr-channel D3 source 2 — the Workflow routing
+    guide that teaches the planner to read the skill case's
+    ``recovery_channel`` declaration. Gated by the builder on
+    (faultdrill_enabled ∧ K8s profile): the dark-launch window keeps the
+    section byte-identical to pre-change."""
+
+    def test_dark_launch_section_is_byte_identical(self):
+        default = get_workflow_section()
+        assert default == get_workflow_section(include_cr_channel_routing=False)
+        assert "4b." not in default
+        assert "recovery_channel" not in default
+        assert "FaultDrill" not in default
+
+    def test_guide_splices_cleanly_at_the_step_boundary(self):
+        # Enabled output minus the guide is EXACTLY the pre-change section:
+        # the guide inserts between step 4 and step 5 and disturbs nothing
+        # else — no renumbering, no rewording of neighbouring steps.
+        default = get_workflow_section()
+        on = get_workflow_section(include_cr_channel_routing=True)
+        i = on.index("4b. **Recovery-channel routing**")
+        j = on.index("5. **Assess complexity**")
+        assert on[:i] + on[j:] == default
+
+    def test_guide_teaches_the_d3_route(self):
+        on = get_workflow_section(include_cr_channel_routing=True)
+        i = on.index("4b. **Recovery-channel routing**")
+        j = on.index("5. **Assess complexity**")
+        guide = " ".join(on[i:j].split())
+        # Declaration routes: apiserver-write → the FaultDrill CR channel.
+        assert "recovery_channel: apiserver-write" in guide
+        assert "FaultDrill custom resource" in guide
+        # Recovery single-source: the channel arms its own guards — no SOP
+        # stacking (the reconciler race guard, same legislation as 2.2).
+        assert "landing readback and reconciler it arms itself" in guide
+        assert "do NOT stack a recovery-carrier SOP" in guide
+        # No declaration → documented path unchanged (M3 not landed yet:
+        # zero behavior change until cases carry the field).
+        assert "keep their documented path unchanged" in guide
+        # CRD-unavailable degradation completes at the plan layer.
+        assert "pre-task environment probes message" in guide
+        assert "recovery-carrier SOP form directly" in guide
+        assert "no CR attempt round" in guide
+
+    def test_builder_gate_combines_flag_with_profile(self):
+        # The builder gate (not the section) combines the caller's feature
+        # flag with the K8s profile: host/unknown channels never see the
+        # guide even with the flag on; the prompts layer reads no settings.
+        p_on = build_inject_system_prompt("catalog", profile="k8s", cr_channel_enabled=True)
+        assert "4b. **Recovery-channel routing**" in p_on
+        p_off = build_inject_system_prompt("catalog", profile="k8s")
+        assert "4b." not in p_off
+        p_host = build_inject_system_prompt("catalog", profile="host", cr_channel_enabled=True)
+        assert "4b." not in p_host
+        p_unknown = build_inject_system_prompt("catalog", profile="unknown", cr_channel_enabled=True)
+        assert "4b." not in p_unknown

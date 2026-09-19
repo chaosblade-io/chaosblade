@@ -222,18 +222,18 @@ class TestSeamBladeUidRetention:
     def test_live_uid_survives_five_failure_truncation(self):
         """Successful create followed by >=5 failed tool messages — the
         exact truncation shape that lost the uid."""
-        messages = [_create_msg("uid-live")] + [_fail_msg(i) for i in range(6)]
+        messages = [_create_msg("1eafbeef00000002")] + [_fail_msg(i) for i in range(6)]
         state = _state(messages=messages)  # NO state.experiment_uid: found in history
         result = _fail_result()
-        result["experiment_uid"] = "uid-live"
+        result["experiment_uid"] = "1eafbeef00000002"
         _fire_replan_seam(state, result, _request(), {"error_summary": REPLAN_ERROR})
-        assert result["experiment_uid"] == "uid-live"  # kept, not cleared
-        assert result["replan_context"]["existing_experiment_uids"] == ["uid-live"]
+        assert result["experiment_uid"] == "1eafbeef00000002"  # kept, not cleared
+        assert result["replan_context"]["existing_experiment_uids"] == ["1eafbeef00000002"]
 
     def test_destroyed_uid_is_not_resurrected(self):
         """An experiment already sent to blade_destroy must stay dead —
         keeping its uid would re-arm recover on a gone experiment."""
-        messages = [_create_msg("uid-dead"), _destroy_msg("uid-dead"), _fail_msg(0)]
+        messages = [_create_msg("deadbeef00000001"), _destroy_msg("deadbeef00000001"), _fail_msg(0)]
         state = _state(messages=messages)
         result = _fail_result()
         _fire_replan_seam(state, result, _request(), {"error_summary": REPLAN_ERROR})
@@ -246,10 +246,10 @@ class TestSeamBladeUidRetention:
         so the raw persisted uid would otherwise resurrect the dead
         experiment into existing_experiment_uids (the Phase-1 replan prompt)
         and the keep decision."""
-        messages = [_create_msg("uid-dead"), _destroy_msg("uid-dead"), _fail_msg(0)]
-        state = _state(messages=messages, experiment_uid="uid-dead")
+        messages = [_create_msg("deadbeef00000001"), _destroy_msg("deadbeef00000001"), _fail_msg(0)]
+        state = _state(messages=messages, experiment_uid="deadbeef00000001")
         result = _fail_result()
-        result["experiment_uid"] = "uid-dead"
+        result["experiment_uid"] = "deadbeef00000001"
         _fire_replan_seam(state, result, _request(), {"error_summary": REPLAN_ERROR})
         assert result["experiment_uid"] is None
         assert result["replan_context"]["existing_experiment_uids"] == []
@@ -258,8 +258,8 @@ class TestSeamBladeUidRetention:
     def test_retired_uid_is_not_resurrected(self):
         """Framework-side cleanup leaves no destroy ToolMessage; the
         retired list is the seam's only evidence."""
-        messages = [_create_msg("uid-retired"), _fail_msg(0)]
-        state = _state(messages=messages, retired_experiment_uids=["uid-retired"])
+        messages = [_create_msg("5e71a1b2c3d4e5f6"), _fail_msg(0)]
+        state = _state(messages=messages, retired_experiment_uids=["5e71a1b2c3d4e5f6"])
         result = _fail_result()
         _fire_replan_seam(state, result, _request(), {"error_summary": REPLAN_ERROR})
         assert result["experiment_uid"] is None
@@ -278,11 +278,11 @@ class TestSeamBladeUidRetention:
     def test_experiment_uid_at_seam_recorded_in_history(self):
         """Audit trail: the uid observed at the seam lands in
         replan_history whether it was kept or dropped."""
-        state = _state(messages=[_create_msg("uid-live")])
+        state = _state(messages=[_create_msg("1eafbeef00000002")])
         result = _fail_result()
-        result["experiment_uid"] = "uid-live"
+        result["experiment_uid"] = "1eafbeef00000002"
         _fire_replan_seam(state, result, _request(), {"error_summary": REPLAN_ERROR})
-        assert result["replan_history"][-1]["experiment_uid_at_seam"] == "uid-live"
+        assert result["replan_history"][-1]["experiment_uid_at_seam"] == "1eafbeef00000002"
 
         # Nothing alive at the seam -> still recorded (as None).
         result2 = _fail_result()
@@ -311,8 +311,8 @@ class TestSeamBladeUidRetention:
     def test_state_destroyed_uid_is_not_resurrected(self):
         """The durable state uid passes the SAME death filters as the
         message scan: a uid whose experiment was destroyed stays dead."""
-        messages = [_create_msg("uid-dead"), _destroy_msg("uid-dead"), _fail_msg(0)]
-        state = _state(messages=messages, experiment_uid="uid-dead")
+        messages = [_create_msg("deadbeef00000001"), _destroy_msg("deadbeef00000001"), _fail_msg(0)]
+        state = _state(messages=messages, experiment_uid="deadbeef00000001")
         result = _fail_result()
         _fire_replan_seam(state, result, _request(), {"error_summary": REPLAN_ERROR})
         assert result["experiment_uid"] is None

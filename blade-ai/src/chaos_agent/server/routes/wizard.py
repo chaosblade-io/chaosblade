@@ -80,7 +80,7 @@ _WIZARD_SEED_DEFAULTS: dict[str, Any] = {
     "context_compact_ratio": 0.85,
     "llm_thinking_format": "auto",
     "safety_blacklist_namespaces": "",
-    "experiment_timeout": 600,
+    "experiment_timeout": 300,
     "confirmation_required": False,
     "kube_connection_mode": "kubeconfig",
     "max_agent_loop": 100,

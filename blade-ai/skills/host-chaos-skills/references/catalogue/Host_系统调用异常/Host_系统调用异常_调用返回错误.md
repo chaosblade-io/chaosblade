@@ -94,8 +94,10 @@ ChaosBlade 不可用时，只有两条路，都不由 Agent 执行：
 恢复命令：
 ```bash
 # 若用了上面第 2 条：先停定时器，再取 strace 自身 PID 后终止
+# （-x 按进程名精确匹配；-f 会把携带 strace 字符串的执行 shell 一并匹配，
+#   拿输出去 kill 会误杀执行 shell）
 systemctl stop blade-kill-strace.timer 2>/dev/null
-pgrep -f strace
+pgrep -x strace
 kill <pid>
 ```
 

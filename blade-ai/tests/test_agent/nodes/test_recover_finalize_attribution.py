@@ -104,3 +104,43 @@ class TestResidualAttributionGuard:
         assert result["level"] == "recovered"
         assert "residual_attribution" not in result
         assert result["warnings"] == []
+
+
+class TestUnverifiedVerdict:
+    """Recovery "unconfirmed" is a fourth verdict, not a disguised failure.
+
+    The recover overall vocabulary was three-valued (recovered / partial /
+    unrecovered) where "unrecovered" is defined as counter-evidence ("fault
+    STILL present"). With observation channels unavailable the LLM had no
+    honest output — "unverified" gives it one, mirroring the inject side.
+    """
+
+    def test_submit_args_unverified_passes_through(self):
+        result = _recover_verification_from_submit_args(
+            _submit(overall="unverified", layer2_status="unknown")
+        )
+        assert result["level"] == "unverified"
+
+    def test_submit_args_invalid_still_falls_back_to_unrecovered(self):
+        """Unknown vocabulary keeps the old fail-loud fallback."""
+        result = _recover_verification_from_submit_args(
+            _submit(overall="no-idea-what-this-is")
+        )
+        assert result["level"] == "unrecovered"
+
+    def test_text_fallback_overall_unverified(self):
+        """'unverified' must not be swallowed by the 'verified' substring
+        branch (inject-side vocabulary cross-contamination guard)."""
+        from chaos_agent.agent.nodes.recover._recover_layer2_parse import (
+            _parse_recovery_verification_result,
+        )
+
+        text = (
+            "RECOVERY_VERIFICATION_RESULT:\n"
+            "- Layer1 (blade_destroy): passed - success\n"
+            "- Layer2 (fault-specific): unknown - metrics query forbidden\n"
+            "- Overall: unverified\n"
+            "- Warnings: observation channel unavailable"
+        )
+        result = _parse_recovery_verification_result(text)
+        assert result["level"] == "unverified"

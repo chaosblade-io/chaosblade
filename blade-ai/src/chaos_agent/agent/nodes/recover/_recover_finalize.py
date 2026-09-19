@@ -44,10 +44,16 @@ from chaos_agent.agent.nodes.verify._verifier_shared import (
 )
 from chaos_agent.agent.nodes.verify._verifier_submit import SUBMIT_RECOVER_VERIFICATION_TOOL_NAME
 from chaos_agent.agent.spec.skill_identity import read_active_skill_name
-from chaos_agent.agent.state import AgentState
+from chaos_agent.agent.state import AgentState, recovery_task_state_from_level
 from chaos_agent.agent.state_mgmt.state_helpers import fail_state
 from chaos_agent.agent.result.verdict import (
+    CHECKLIST_STATUS_VALUES,
     FailureCategory,
+    LAYER2_STATUS_VALUES,
+    RECOVER_SUCCESS_VALUES,
+    RECOVER_VERDICT_VALUES,
+    RESIDUAL_ATTRIBUTION_VALUES,
+    RecoverVerdict,
     ResidualAttribution,
     WarningCode,
 )
@@ -72,10 +78,19 @@ def _recover_verification_from_submit_args(args: dict, skill_name: str = "") -> 
     checklist = args.get("checklist") or []
     if not isinstance(checklist, list):
         checklist = []
-    l2_status = args.get("layer2_status", "unknown")
+    raw_l2_status = args.get("layer2_status", "unknown")
     overall = args.get("overall", "unrecovered")
-    if overall not in ("recovered", "partial", "unrecovered"):
+    # "unverified" = recovery unconfirmed (observation channel unavailable) —
+    # distinct from "unrecovered" (counter-evidence: fault still present).
+    # Both closed sets derive from the legislation enums (B76 round-14
+    # root-cause fix): the clamp accepts exactly RecoverVerdict's members,
+    # anything else falls back fail-closed — no hand-copied word list here.
+    if overall not in RECOVER_VERDICT_VALUES:
         overall = "unrecovered"
+    if raw_l2_status not in LAYER2_STATUS_VALUES:
+        l2_status = "unknown"
+    else:
+        l2_status = raw_l2_status
     result = {
         "level": overall,
         "layer1": {"status": "unknown", "details": ""},  # overwritten by code later
@@ -83,17 +98,32 @@ def _recover_verification_from_submit_args(args: dict, skill_name: str = "") -> 
         "warnings": list(args.get("warnings") or []),
         "baseline_used": bool(args.get("baseline_used", False)),
     }
+    if l2_status != raw_l2_status:
+        result["warnings"].append(
+            f"Layer2 status '{raw_l2_status}' is outside the closed vocabulary; "
+            "recorded as 'unknown'."
+        )
     if checklist:
         result["checklist"] = {
             "items": checklist,
             "total_count": len(checklist),
             "total_executed": len(checklist),
         }
+        # Closed-set violations stay visible instead of silently flowing
+        # into the task JSON (items are kept verbatim for audit).
+        _outside = sorted({
+            c.get("status") for c in checklist
+            if isinstance(c, dict) and c.get("status") not in CHECKLIST_STATUS_VALUES
+        })
+        if _outside:
+            result["warnings"].append(
+                f"Checklist item statuses outside the closed vocabulary: {_outside}."
+            )
     # Attribution first — the Layer-2 attribution contract (see
     # get_recover_delay_section) decides whether a step-level 'partial'
     # aggregate may coexist with a holistic 'recovered' judgement.
     attribution = args.get("residual_attribution")
-    if attribution in {a.value for a in ResidualAttribution}:
+    if attribution in RESIDUAL_ATTRIBUTION_VALUES:
         result["residual_attribution"] = attribution
 
     # Level sync: if Layer 2 did not pass, recovery cannot be fully
@@ -142,6 +172,33 @@ def _phrase_in_messages(messages: list, phrase: str) -> bool:
     )
 
 
+def _sweep_exempts_identity_uid(layer1_status) -> bool:
+    """Whether the final liability sweep may exempt the identity UID.
+
+    The sweep's ``exclude_uid`` exists to prevent a duplicate destroy of
+    the experiment the main Layer-1 flow already owns — a valid exemption
+    ONLY while that ownership paid out: ``passed`` (the deterministic
+    destroy succeeded, or its not-found fallback verified the death) or
+    ``skipped`` (no deterministic destroy applies). Every other status
+    (``failed`` / ``error`` / ``unknown`` / ``in_progress``) means the main
+    flow did NOT prove the destroy — exempting anyway would orphan the very
+    experiment the net exists to catch (B76 review M2, the exempt orphan:
+    destroy failed, Layer 2 passed, task closed "recovered" with the
+    experiment alive and unwarned four ways). Fail-closed by construction:
+    only a proving status exempts.
+
+    Accepts the status as a ``Layer1Status`` enum OR its plain-string
+    value. Historical note: under the pre-B76-round-13 ``(str, Enum)``
+    base, ``str()`` on a member yielded ``"Layer1Status.PASSED"`` — the
+    ``.value`` normalization below was the workaround; the verdict enums
+    are now ``StrEnum`` so both arms render "passed", but the explicit
+    normalization stays (fail-closed against either input shape, and
+    against any future carrier re-introducing a raw-enum path).
+    """
+    status = str(getattr(layer1_status, "value", layer1_status) or "")
+    return status in ("passed", "skipped")
+
+
 def make_finalize_recover_verification(registry=None):
     """Build the finalize_recover_verification node."""
 
@@ -154,6 +211,7 @@ def make_finalize_recover_verification(registry=None):
         # plain materialization would return), materialized attribution as
         # fallback.
         from chaos_agent.agent.nodes.recover._recover_verifier_loop import (
+            _deterministic_recover_identity,
             _experiment_uid_of,
             _provider_for_recover,
             _resolve_recover_dispatch,
@@ -239,6 +297,60 @@ def make_finalize_recover_verification(registry=None):
 
         verification["layer1"] = layer1_to_dict(layer1)
 
+        # ---- Residual liability sweep (B76 review G, safety net) ----
+        # Destroy every live experiment this task still owes a destroy for,
+        # EXCEPT the identity UID — and only while the main Layer-1 flow
+        # (and the retry below) still OWNS that destroy: a passed verdict
+        # proves the destroy happened (or its not-found fallback verified
+        # the death); skipped means no deterministic destroy applies. A
+        # failed/error/unknown Layer-1 revokes the exemption (B76 review M2,
+        # the exempt orphan): the main flow's destroy did NOT succeed, and an
+        # unconditional exemption would let the net skip the one experiment
+        # it exists to catch. Structurally un-bypassable net: whichever seam
+        # let a superseded experiment survive (approval-time destroy
+        # failure, an execute-replan build-on-top, compaction blinding the
+        # destroy whitelist), THIS is the last point where the framework
+        # still holds the full ownership record. Idempotent across finalize
+        # passes — retired UIDs leave the live set — and a no-op for the
+        # normal single-experiment task (residuals are empty). Runs BEFORE
+        # the retry-recovery check so a retry's re-verification round
+        # observes a clean cluster.
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        _retired_sweep, _sweep_failures = (
+            await FaultProviderRegistry.sweep_live_liabilities(
+                state,
+                exclude_uid=(
+                    experiment_uid
+                    if _sweep_exempts_identity_uid(layer1.status)
+                    else ""
+                ),
+            )
+        )
+        if _retired_sweep:
+            # write_recover_verification dict-copies result_update, so the
+            # retire record survives both the retry loop-back (early return)
+            # and the final verdict path.
+            result_update["retired_experiment_uids"] = (
+                list(state.get("retired_experiment_uids") or []) + _retired_sweep
+            )
+            logger.info(
+                "finalize_recover_verification: residual liability sweep "
+                "destroyed %s", _retired_sweep,
+            )
+            tracker.update(
+                "Residual experiment sweep: destroyed "
+                f"{', '.join(_retired_sweep)}",
+                {"residual_sweep_destroyed": _retired_sweep},
+            )
+        if _sweep_failures:
+            verification.setdefault("warnings", []).append(
+                "residual experiment(s) survived the final destroy sweep "
+                f"({' | '.join(_sweep_failures)}) — they remain in the "
+                "task's liability record; re-run recover or destroy them "
+                "manually."
+            )
+
         # ---- Baseline confidence + enforcement ----
         if "baseline_confidence" not in verification:
             verification["baseline_confidence"] = _compute_baseline_confidence(state)
@@ -252,9 +364,20 @@ def make_finalize_recover_verification(registry=None):
         # ---- Retry-recovery: fault still active → retry once, loop back ----
         _rl1_type = state.get("recover_layer1_type")
         if _rl1_type is None:
+            # Same seam-compat inference as the verifier loop's Layer-2
+            # entry (D1 / M2 task 2.3): a UID-less deterministic handle
+            # (the CR-reference kind) types as "deterministic" too, or
+            # legacy checkpoints would mislabel it "llm_driven". The
+            # bare-destroy retry below stays UID-only — the CR carrier
+            # has no bare destroy form (its retry re-enters the loop and
+            # re-runs the provider convergence, which is idempotent).
             _rl1_type = (
                 "deterministic"
-                if experiment_uid and _provider_for_recover(state).has_deterministic_recover
+                if (
+                    experiment_uid
+                    or _deterministic_recover_identity(state)
+                )
+                and _provider_for_recover(state).has_deterministic_recover
                 else "llm_driven"
             )
         _layer1_is_deterministic = _rl1_type == "deterministic"
@@ -305,9 +428,40 @@ def make_finalize_recover_verification(registry=None):
             "skill": skill_name,
             # External contract key (L4/Web/DB) — permanent compatibility.
             "experiment_uid": experiment_uid,
-            "recovered": verification["level"] in ("recovered", "partial"),
+            "recovered": verification["level"] in RECOVER_SUCCESS_VALUES,
             "recovery_level": verification["level"],
         }
+
+        # Round-32 — a FULL recovery verdict completes the row-level ledger's
+        # death wing: the main UID's destroy proof lives in the in-memory
+        # ToolMessage history (never persisted), so without this retire the
+        # persisted ``owned − retired`` would keep naming it and
+        # ``may_carry_live_fault`` would keep the recovered row recoverable
+        # forever (a recovered task haunting query_active — the inverse of
+        # the K1 blindness, same root: DB-side death evidence was incomplete).
+        # DELIBERATELY full-recovery-only: a ``partial`` verdict means at
+        # least one experiment may survive — retiring everything would erase
+        # exactly the liability the partial verdict still names. And even
+        # under a full verdict, the sweep's FAILED residuals keep theirs:
+        # a destroy error is LIVE evidence (the warning above says they
+        # "remain in the task's liability record") — retiring a proven-live
+        # UID here would be the false settle the sweep contract exists to
+        # forbid. The verdict settles what it can prove; it never overrides
+        # a destroy failure with a recovery claim.
+        if verification["level"] == RecoverVerdict.RECOVERED.value:
+            _sweep_failed_uids = {
+                line.split(":", 1)[0].strip() for line in _sweep_failures
+            }
+            _owned_proven = [
+                uid for uid in (state.get("owned_experiment_uids") or [])
+                if uid not in _sweep_failed_uids
+            ]
+            if _owned_proven:
+                result_update["retired_experiment_uids"] = sorted(
+                    set(list(state.get("retired_experiment_uids") or [])
+                        + _owned_proven)
+                )
+
         result_update = write_recover_verification(
             result_update,
             result=result,
@@ -315,7 +469,13 @@ def make_finalize_recover_verification(registry=None):
             finished_at=now_iso(),
         )
 
-        if not result["recovered"]:
+        # fail_state writes a RECOVERY_FAILED diagnostic signal — that directs
+        # operators to debug the recovery chain. "unverified" is not a recovery
+        # failure: the destroy may well have succeeded, the observation channel
+        # was unavailable. The right follow-up is to restore observability and
+        # re-confirm, so no failure_reason is recorded (recovered stays False —
+        # we never claim recovery without evidence).
+        if not result["recovered"] and verification["level"] != "unverified":
             result_update.update(fail_state(
                 FailureCategory.RECOVERY_FAILED,
                 f"Layer1={layer1.status}, Layer2={l2_status}, level={verification['level']}",
@@ -344,17 +504,30 @@ def make_finalize_recover_verification(registry=None):
         # (which would infer state and overwrite ``operation`` / ``result``).
         inject_task_id = state.get("recover_task_id", "")
         if inject_task_id and inject_task_id != task_id:
-            inject_state = (
-                "recovered"
-                if result["recovered"] and result.get("recovery_level") != "partial"
-                else "partial_recovered"
-                if result["recovered"]
-                else "failed"
+            # Four states: recovered / partial_recovered / unverified / failed.
+            # "unverified" keeps the original task queryable for re-confirmation
+            # instead of masquerading as either a recovered or a failed drill.
+            # Single-source mapping (round-15 D3): this ternary was the third
+            # parallel copy of the recover verdict → task_state truth table.
+            inject_state = recovery_task_state_from_level(
+                verification["level"],
+                recovered=result["recovered"],
+                layer1_status=layer1.status,
             )
             try:
                 from chaos_agent.persistence.task_store import get_task_store
                 _store = await get_task_store()
-                await _store.update_task_state(inject_task_id, inject_state)
+                # Round-33b single-source: propagate the clearance verdict
+                # onto the inject row TOGETHER with the CLEARED word. The
+                # verdict above was synced to THIS (recover) row only; a
+                # bare word on the inject row left it a CLEARED state with
+                # no row-local proof — a permanent "completed-but-
+                # uncleared" ghost under the fail-closed predicate.
+                await _store.update_task_state(
+                    inject_task_id,
+                    inject_state,
+                    recover_verification=verification,
+                )
                 logger.info(
                     "finalize_recover_verification: marked original inject task %s "
                     "as %s (recover task %s)",

@@ -97,6 +97,21 @@ def _finalized(summary: str = "inject node-mem via blade") -> ToolMessage:
     )
 
 
+def _finish_planning_caller(
+    call_id: str = "call-finish",
+    extra_calls: list | None = None,
+) -> AIMessage:
+    """The AIMessage that issued finish_planning (optionally parallel calls)."""
+    calls = [{
+        "name": "finish_planning",
+        "args": {"summary": "inject"},
+        "id": call_id,
+        "type": "tool_call",
+    }]
+    calls.extend(extra_calls or [])
+    return AIMessage(content="", tool_calls=calls)
+
+
 def _kickoff() -> HumanMessage:
     return HumanMessage(content="**PHASE 2 — EXECUTE NOW** proceed with step 1.")
 
@@ -214,6 +229,64 @@ class TestSelectStripTargets:
         for m in seq[2:finalized_idx]:
             assert m.id in target_ids
         assert len(targets) == finalized_idx - 2
+
+    def test_finalization_caller_exempt_from_strip(self):
+        """B44: the finish_planning caller must survive the strip.
+
+        Stripping the caller orphaned the retained ``Planning finalized``
+        ToolMessage — sanitize_tool_pairing then dropped that orphan
+        before EVERY downstream LLM call (case-32: six drops across the
+        inject and recover graphs), so the summary the strip meant to
+        hand to execution never reached a model.
+        """
+        seq = list(add_messages([], [
+            _anchor_fault_intent(),               # 0
+            _ai_probe_turn("c1", "nodes"),        # 1
+            _tool_result("c1", "NAME STATUS"),    # 2
+            _finish_planning_caller(),            # 3 — caller of finalized
+            _finalized(),                         # 4
+            _kickoff(),                           # 5
+        ]))
+        finalized_idx = _find_finalized_idx(seq)
+        assert finalized_idx == 4
+
+        targets = select_strip_targets(seq, 0, finalized_idx)
+        target_ids = {t.id for t in targets}
+
+        # Probe turn still stripped.
+        assert seq[1].id in target_ids
+        assert seq[2].id in target_ids
+        # The caller is exempt: finalized keeps its AIMessage pair.
+        assert seq[3].id not in target_ids
+
+    def test_parallel_finalization_batch_tool_results_exempt(self):
+        """A parallel finish_planning + probe turn keeps its whole batch paired.
+
+        Exempting only the caller AIMessage would trade one orphan for
+        another when the finalization turn carried sibling tool_calls
+        whose ToolMessages land inside the strip range.
+        """
+        seq = list(add_messages([], [
+            _anchor_fault_intent(),               # 0
+            _finish_planning_caller("call-finish", extra_calls=[{
+                "name": "kubectl",
+                "args": {"subcommand": "get", "v_args": "nodes"},
+                "id": "c9",
+                "type": "tool_call",
+            }]),                                 # 1 — batch of 2 calls
+            _tool_result("c9", "NAME STATUS"),    # 2 — sibling result in range
+            _finalized(),                         # 3
+        ]))
+        finalized_idx = _find_finalized_idx(seq)
+        assert finalized_idx == 3
+
+        targets = select_strip_targets(seq, 0, finalized_idx)
+        target_ids = {t.id for t in targets}
+
+        # Whole finalization batch survives: caller + sibling result.
+        assert seq[1].id not in target_ids
+        assert seq[2].id not in target_ids
+        assert targets == []
 
     def test_epoch_boundary_excludes_prior_round_evidence(self):
         # Replan scenario: round-1 execution/verification evidence sits

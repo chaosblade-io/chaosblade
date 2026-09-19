@@ -130,7 +130,7 @@ class TestInjectRoute:
             },
         )
         data = response.json()
-        # Default duration should be 600
+        # Default duration should be 300
         assert "task_id" in data["data"]
 
     def test_inject_nl_field(self, test_client):

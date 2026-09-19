@@ -17,7 +17,7 @@
    kubectl get nodes
    kubectl get pods -o wide --field-selector spec.nodeName=<node-name>
    ```
-2. 选择执行通道并注入节点网络屏蔽：
+2. 选择注入方式并注入节点网络屏蔽：
 
    **方式一：DaemonSet 通道**（⚠️ 注入后可能无法通过 K8s API 恢复，必须指定 `--timeout`）
    ```bash
@@ -25,8 +25,8 @@
      --names <node-name> \
      --destination-port <port> \
      --network-traffic out \
-     --timeout <duration> \
-     --kubeconfig <kubeconfig-path>
+     --timeout <duration>
+
    ```
 
    **方式二：SSH 通道**（推荐，恢复更可靠）
@@ -46,24 +46,24 @@
 
 **注入验证**：
 
-> ⚠️ **自断链路故障的判读规范（务必先读）**：**当屏蔽范围覆盖 6443/10250 时**（不指定端口的全量屏蔽必然覆盖），被切断的正是 `kubectl exec` / kubewiz 依赖的通道。因此**注入用的那条 exec 命令自身会超时或断连（如 `task timed out after 10s`），这是预期的成功信号，不是失败**。收到超时后：
+> ⚠️ **自断链路故障的判读规范（务必先读）**：**当屏蔽范围覆盖 6443/10250 时**（不指定端口的全量屏蔽必然覆盖），被切断的正是 `kubectl exec` 等带内命令下发依赖的通道。因此**注入用的那条 exec 命令自身会超时或断连（如 `task timed out after 10s`），这是预期的成功信号，不是失败**。收到超时后：
 > 1. **不要重试同一条 exec，也不要归因为"镜像没 shell / 通道坏了"**——通道正是被你成功切断的；
 > 2. **立即改从集群侧（apiserver 视角）验证**，而不是继续探入该节点：`kubectl get nodes <node-name>` 应变为 `NotReady`，`kubectl describe node` 的 Condition 出现 `Kubelet stopped posting node status`；
 > 3. **停止对被隔离节点的探入式取证**（`kubectl exec`/`get` 该节点上的 Pod 都会 10s 超时，纯属浪费）——节点侧探测超时本身即佐证，拿到 NotReady + kubelet 失联即可判定成功并收敛。
 >
 > 若屏蔽范围**不覆盖** 6443/10250（即指定了业务端口），则控制面通道完好，上述自断现象与 NotReady **都不会出现**，按下方分支验证。
 
-1. **（主证据，必做）** 确认实验已生效：
+1. （诊断，仅当下述效果证据未出现时执行）确认实验已生效：
    ```bash
    blade status --uid <experiment_uid>
    ```
-   状态为 Success/Running 即表示屏蔽规则已下到节点网络栈。
-2. **（只做与本次屏蔽范围匹配的分支）** 另一分支的现象在本次注入下**不可能出现**，直接标记为 `expected` 并跳过：
+   状态为 Success/Running 即表示屏蔽规则已下到节点网络栈——这是机制回执，为机制代言不为结果代言，用于定位失败层（规则未下发 vs 下发未生效），不构成效果证据
+2. **（主证据，必做）**（只做与本次屏蔽范围匹配的分支）另一分支的现象在本次注入下**不可能出现**，直接标记为 `expected` 并跳过：
    - **全量屏蔽（未指定 `--destination-port`/`--source-port`）**：检查节点状态，**这是首要且可靠的判据**
      ```bash
      kubectl get nodes <node-name>
      ```
-     预期变为 `NotReady`；`kubectl describe node <node-name>` 可见 `Kubelet stopped posting node status`。此条成立即可判定成功并收敛。
+     预期变为 `NotReady`；`kubectl describe node <node-name>` 可见 `Kubelet stopped posting node status`。此条成立即可判定成功并收敛。NotReady 需 kubelet 心跳停止满 node-monitor-grace-period（默认 40s）后才出现——注入后 40s 内仍 Ready 是预期中间态而非失败，勿提前判负；等待期间注入命令自身的超时（上方自断链路信号）已是即时确证。
    - **端口级屏蔽（指定了端口且不含 6443/10250）**：**节点不会 NotReady，不要去等、也不要因为 Ready 就判失败**。改为验证被屏蔽端口不可达（见第 3 步），节点保持 `Ready` 是预期。
 3. **（按本次 `--network-traffic` 选择测试发起侧）** 验证被屏蔽端口的连通性（探测端/被测端须为 hostNetwork Pod 或宿主机进程——iptables OUTPUT/INPUT 链规则对非 hostNetwork Pod 的流量零传导，用非 hostNetwork 业务 Pod 探测会恒连通而误判，见注意事项）：
    - **`out`（出站屏蔽）**：从被隔离节点侧向外访问不通。若控制面通道未被切断可用 debug Pod（hostNetwork）发起；已被切断则跳过（节点侧探测超时本身即佐证）
@@ -103,11 +103,11 @@
 **基准事实**：
 - **根因**：节点宿主机网络栈被注入 iptables DROP 规则，指定方向/端口的所有流量被丢弃，模拟网络分区或节点隔离场景
 - **必现现象**：宿主机进程与 hostNetwork Pod 网络中断；节点可能变为 NotReady（全量屏蔽时）；Pod 健康检查失败触发驱逐
-- **传导边界（CNI 相关，实测 terway-eniip）**：非 hostNetwork Pod 的流量在宿主机网络栈走 FORWARD 链转发，不经 OUTPUT/INPUT 链——宿主机 iptables OUTPUT/INPUT DROP 对其零传导（实测出站方向：同一注入下 hostNetwork Pod 探测被拦、非 hostNetwork Pod 恒连通）。ChaosBlade 主方案（tc/网卡级注入）作用于网卡队列，对该类 Pod 同样有效；降级方案（iptables 链路级）与主方案存在此保真度差异
+- **传导边界（CNI 相关，terway-eniip）**：非 hostNetwork Pod 的流量在宿主机网络栈走 FORWARD 链转发，不经 OUTPUT/INPUT 链——宿主机 iptables OUTPUT/INPUT DROP 对其零传导（出站方向：同一注入下 hostNetwork Pod 探测被拦、非 hostNetwork Pod 恒连通）。手段1（ChaosBlade，tc/网卡级注入）作用于网卡队列，对该类 Pod 同样有效；手段2（iptables 链路级）与手段1存在此保真度差异
 
 ---
 
-**降级方案（kubectl-native）**
+**手段2（kubectl-native）**
 
 > 当 ChaosBlade 不可用时，可使用以下 kubectl 原生命令实现节点网络隔离。
 
@@ -151,6 +151,7 @@ kubectl exec <debug-pod> -n <debug-namespace> -- chroot /host sh -c '
 kubectl exec <debug-pod> -n <debug-namespace> -- chroot /host sh -c \
   'systemd-run --on-active=<recovery-seconds>s --unit=blade-restore-port sh -c "iptables -D OUTPUT -p tcp --dport <port> -j DROP" && iptables -I OUTPUT -p tcp --dport <port> -j DROP'
 ```
+方案A 倒计时从武装时刻起算：systemd-run 武装与 DROP 注入在同一载荷内 && 串联原子紧邻（先武装是防御性顺序）；注入后 exec 通道已断，武装后发生任何修复需重武装时必须走带外 SSH：`ssh root@<node-ip> 'systemctl stop blade-restore-netiso.timer 2>/dev/null; systemctl stop blade-restore-netiso.service 2>/dev/null; systemctl reset-failed blade-restore-netiso.service'`（port 变体把 netiso 换成 port）再重跑 systemd-run 武装命令（见 SKILL.md 安全红线「故障窗口完整」）
 
 恢复命令：
 
@@ -179,6 +180,11 @@ kubectl exec <debug-pod> -n <debug-namespace> -- chroot /host sh -c '
   iptables -I OUTPUT -j DROP && iptables -I INPUT -j DROP
 '
 ```
+方案B 倒计时从武装时刻起算：武装与注入在同一载荷内 && 串联原子紧邻；全量断网后包括 SSH 在内的一切远程通道丢失，窗口内发生任何修复均无重武装手段——须接受剩余窗口被侵蚀或经控制台/IPMI 提前恢复（见 SKILL.md 安全红线「故障窗口完整」）
+
+**方案B 预期伴生现象（判据预约定，勿判异常）**：全量 OUTPUT DROP 同时切断 kubelet 对本节点所有 Pod 的 liveness 探测流量（探针由宿主网络栈发起、同被丢弃）——带 livenessProbe 的容器自注入起 failureThreshold×period（典型 ~30-40s）后陆续重启，窗口内每容器 RESTARTS 增长 1-3 次属预期 consequence（基准事实「Pod 健康检查失败」的容器层形态），fire 后探针恢复、容器回归稳定 Running；判读勿以窗口内 RESTARTS 增长判故障异常或 scope 膨胀。选靶宜选无 quorum/有状态负载的静默节点（zookeeper 等 quorum 成员所在节点须排除）以最小化伴生面。伴生重启按容器探针形态分化属预期（常见形态：csi-plugin 4 次 / node-local-dns 与 terway 各 2 次 / 同为 hostNetwork 的 node-exporter 0 次——探针类型与阈值差异，勿以个别容器零重启质疑注入生效）。窗口内还可能出现云平台实例级事件对 `InstanceToBeTerminated`（Warning）/ `InstanceNotToBeTerminated`（NotReady 期出现，fire 恢复后解除）——云监控对节点失联的自动响应，属集群外部 consequence 噪声勿判异常，恢复验证勿要求该事件对消失。
+
+**方案B 窗口期观测通道定案（勿再设计替代路径）**：全量断网后靶节点一切带内通道（exec/debug）死亡，**窗口期观测只能走 API 侧三件套**——Lease renewTime 冻结（kube-node-lease，即时主证）+ Node Ready/NotReady 状态（40-50s grace）+ 靶节点 Pod RESTARTS 增长对照（hostNetwork vs 非 hostNetwork 分化 = terway 传导边界的判据）。两条已证死路勿再尝试：①跨节点观测载体（kubectl debug node/<健康节点>）会被 approved_target 边界拦截（写入集只含靶节点，正确执法——观测资产也不例外）②任务内创建裸观测 Pod（探针/sleep Pod）会被守卫 occupant contract 拒（Pod 创建唯一合法形态 = PVC 资源占用载体，磁盘占用场景契约；拒因是缺 PVC 卷与 activeDeadlineSeconds——对网络 case 照做即 scope creep 进 storage 域，勿合规）——传导边界判据的正道 = 靶节点**既有**非 hostNetwork Pod 的 RESTARTS 窗口期零增长对照 hostNetwork Pod 重启级联（既有负载是免费观测资产；靶节点无非 hostNetwork Pod 时选靶阶段就须补此维度）。
 
 恢复机制：
 - 超时到期后 systemd 自动执行 iptables -D，节点恢复 Ready
@@ -187,7 +193,7 @@ kubectl exec <debug-pod> -n <debug-namespace> -- chroot /host sh -c '
 
 ---
 
-**降级方案选择指南**：
+**手段选择指南**：
 
 | 方案 | 真实度 | 恢复可靠性 | 前提条件 |
 |------|--------|-----------|----------|
@@ -198,4 +204,4 @@ kubectl exec <debug-pod> -n <debug-namespace> -- chroot /host sh -c '
 - systemd-run --on-active 创建的 transient timer 由宿主机 systemd 管理，不依赖 debug Pod 存活
 - 建议超时设置 30-120 秒，单节点故障影响面可控
 - 禁止使用无自恢复机制的全量 DROP 方案（可能导致节点永久失联）
-- **保真度边界（实测 terway-eniip）**：本降级方案走 iptables OUTPUT/INPUT 链，对非 hostNetwork Pod（流量走 FORWARD 链转发）零传导——若演练目标是业务 Pod（非 hostNetwork）的网络中断，本方案无效，须改用 ChaosBlade 主方案（tc/网卡级，作用于网卡队列、影响所有流量）或 Pod 级注入；本降级方案的实际效果为"宿主机与 hostNetwork Pod 隔离 + 节点 NotReady"
+- **保真度边界（terway-eniip）**：本手段2走 iptables OUTPUT/INPUT 链，对非 hostNetwork Pod（流量走 FORWARD 链转发）零传导——若演练目标是业务 Pod（非 hostNetwork）的网络中断，本方案无效，须改用手段1（ChaosBlade，tc/网卡级，作用于网卡队列、影响所有流量）或 Pod 级注入；本手段2的实际效果为"宿主机与 hostNetwork Pod 隔离 + 节点 NotReady"

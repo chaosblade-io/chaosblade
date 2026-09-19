@@ -14,7 +14,7 @@
 > blade create k8s <scope>-<target> --help
 > ```
 >
-> 以该输出的 `Available Commands` 为准。本文件后续标注「可用性以实测为准」的地方，都是指这件事。
+> 以该输出的 `Available Commands` 为准。本文件后续标注「可用性以当次探测为准」的地方，都是指这件事。
 
 ---
 
@@ -34,18 +34,18 @@ blade create k8s <scope>-<target> <action> [flags]
 |---|---|---|
 | pod-cpu | `fullload` | CPU 满载 |
 | pod-mem | `load` | 内存占用 |
-| pod-network | `dns`, `drop`, `occupy` | 网络故障（是否另有 `delay`/`loss`，以 `--help` 实测为准） |
+| pod-network | `dns`, `drop`, `occupy` | 网络故障（是否另有 `delay`/`loss`，以 `--help` 实际输出为准） |
 | pod-disk | `fill`, `burn` | 磁盘填充 / IO 负载 |
 | pod-process | `kill`, `stop` | 进程操作 |
 | pod-pod | `delete` | Pod 删除 |
-| pod-IO | `delay`, `errno` | 文件系统 IO 故障（部分版本无此 target，以 `--help` 实测为准） |
+| pod-IO | `delay`, `errno` | 文件系统 IO 故障（部分版本无此 target，以 `--help` 实际输出为准） |
 | node-cpu | `fullload` | CPU 满载 |
 | node-mem | `load` | 内存占用 |
-| node-network | `drop` | 网络故障（`delay`/`loss` 在部分版本中不存在，以 `--help` 实测为准） |
+| node-network | `drop` | 网络故障（`delay`/`loss` 在部分版本中不存在，以 `--help` 实际输出为准） |
 | node-disk | `fill`, `burn` | 磁盘填充 / IO 负载 (**无 fullload**) |
 | node-process | `kill`, `stop` | 进程操作 |
 | container-cpu | `fullload` | CPU 满载 |
-| container-network | `drop` | 网络故障（`delay`/`loss` 在部分版本中不存在，以 `--help` 实测为准） |
+| container-network | `drop` | 网络故障（`delay`/`loss` 在部分版本中不存在，以 `--help` 实际输出为准） |
 | container-process | `kill`, `stop` | 进程操作 |
 | container-container | `remove` | 容器删除 |
 
@@ -114,7 +114,7 @@ blade create k8s pod-mem load \
 
 ### 3. Pod 网络延迟
 
-> **⚠️ 可用性以实测为准**：部分版本的 `pod-network` 只提供 `dns`/`drop`/`occupy`，没有 `delay`。
+> **⚠️ 可用性以当次探测为准**：部分版本的 `pod-network` 只提供 `dns`/`drop`/`occupy`，没有 `delay`。
 > 先用 `blade create k8s pod-network --help` 确认；确实没有时改走 Tier 2 kubectl-native 方案（tc qdisc）。
 > 以下命令供提供该 action 的版本使用：
 
@@ -327,7 +327,7 @@ Flags 与 Pod 内存压力一致（`--mode`、`--mem-percent`、`--reserve`、`-
 
 ### 3. 节点网络延迟
 
-> **⚠️ 可用性以实测为准**：部分版本的 `node-network` 没有 `delay`。先用
+> **⚠️ 可用性以当次探测为准**：部分版本的 `node-network` 没有 `delay`。先用
 > `blade create k8s node-network --help` 确认。以下命令供提供该 action 的版本使用：
 
 ```bash
@@ -423,7 +423,7 @@ blade create k8s container-cpu fullload \
 
 ### 2. 容器网络延迟
 
-> **⚠️ 可用性以实测为准**：部分版本的 `container-network` 没有 `delay`。先用
+> **⚠️ 可用性以当次探测为准**：部分版本的 `container-network` 没有 `delay`。先用
 > `blade create k8s container-network --help` 确认。以下命令供提供该 action 的版本使用：
 
 ```bash

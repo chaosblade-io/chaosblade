@@ -26,7 +26,7 @@ class InjectRequest(BaseModel):
     action: Optional[str] = Field(None, description="ChaosBlade action: fullload, delay, loss, fill, kill, delete, load, burn")
     target_name: Optional[str] = Field(None, description="Resource name(s), comma-separated for batch")
     namespace: Optional[str] = Field(None, description="K8s namespace")
-    duration: int = Field(600, description="Fault duration in seconds, 0 for manual recovery")
+    duration: Optional[int] = Field(None, description="Fault duration in seconds. Omit (or 0) in NL mode to let the agent extract it from the description; structured mode applies the fault-type floor when unset")
     params: Optional[dict] = Field(None, description="Additional fault parameters (key=value)")
     params_flags: Optional[list[str]] = Field(None, description="Boolean flags for blade (e.g. ['read', 'write'])")
     confirm: bool = Field(False, description="Whether to require confirmation before execution")

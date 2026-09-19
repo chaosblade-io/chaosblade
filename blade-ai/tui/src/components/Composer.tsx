@@ -73,6 +73,7 @@ import {
   type SlashCommandContext,
 } from "@blade-ai/core";
 import { Footer } from "./Footer.js";
+import { FaultWindowIndicator } from "./FaultWindowIndicator.js";
 import { InputPrompt } from "./InputPrompt.js";
 import { LoadingIndicator } from "./LoadingIndicator.js";
 import { ManualCompactIndicator } from "./ManualCompactIndicator.js";
@@ -84,6 +85,7 @@ import {
   setProbeLoadingRef,
 } from "../utils/overflowProbe.js";
 import { setChromeMeasureRef } from "../state/chromeMeasureRef.js";
+import { useTerminalAttention } from "../hooks/useTerminalAttention.js";
 import type { DOMElement } from "ink";
 import { getPool, pickRandomDistinct } from "../utils/phrasePool.js";
 import { saveTextFile } from "../utils/saveTextFile.js";
@@ -113,10 +115,29 @@ const CLEAR_SCREEN = "\x1b[H\x1b[J";
 
 interface Props {
   client: BladeClient;
+  /** Boot-time session id (BootRunner's state — set exactly once,
+   *  before this component mounts). The ACTIVE id lives in the
+   *  store (``state.session.id``) and is what ``/resume`` switches —
+   *  see the ``storeSessionId`` selector below. This prop remains
+   *  the fallback and App's mount gate. */
   sessionId: string;
 }
 
 export const Composer: React.FC<Props> = ({ client, sessionId }) => {
+  // /resume: the active session id is store-driven. BootRunner
+  // dispatches SESSION_INITIALIZED BEFORE the setState that mounts
+  // this component, so by the time we first read it the store
+  // already carries the boot sid. ``/resume <sid>`` dispatches the
+  // same action with the resumed sid; the prop never changes (it's
+  // the boot-time value) and serves only as the empty-store
+  // fallback. Downstream: useStream's useCallback deps rebuild on
+  // the change — submitTurn / resolveConfirm / cancelTurn re-bind
+  // to the resumed session's endpoints — and SlashCommandContext
+  // hands the active id to every slash handler (e.g. /export,
+  // /compact must operate on the resumed session, not the boot
+  // one).
+  const storeSessionId = useAppSelector((s) => s.session.id);
+  const activeSessionId = storeSessionId || sessionId;
   const {
     submitTurn,
     submitRecover,
@@ -126,9 +147,16 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
     cancelReplay,
     beginManualCompact,
     cancelManualCompact,
+    triggerEarlyRecover,
     busy,
     awaitingConfirmation,
-  } = useStream(client, sessionId);
+  } = useStream(client, activeSessionId);
+  // Terminal-level attention while a confirmation card waits: bell +
+  // dock/taskbar progress marker + (where supported) an OS notification
+  // banner, cleared when the gate resolves. Mounted here because Composer
+  // already owns the ``awaitingConfirmation`` binding — no new App-level
+  // subscription. See hooks/useTerminalAttention.ts.
+  useTerminalAttention(awaitingConfirmation);
   // Phase 1.2 — replaced ``useAppState()`` (whole-tree subscription
   // that re-rendered Composer on every reducer dispatch) with two
   // narrow tools:
@@ -154,6 +182,11 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
   const compactionInFlight = useAppSelector(
     (s) => s.currentCompaction !== null,
   );
+  // Fault-window hold — drives the indicator's conditional mount, the
+  // Ctrl+R binding's gate, and the InputPrompt's hold placeholder.
+  // Narrow boolean selector: flips once per hold open/close, immune to
+  // the 30s tick re-bases (slot object replaced, boolean unchanged).
+  const faultWindowActive = useAppSelector((s) => s.faultWindow !== null);
 
   // Single registry for the lifetime of the Composer. Built once;
   // commands are static for now (no skill-driven dynamic entries yet).
@@ -226,6 +259,36 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
       cancelManualCompact();
     },
     { isActive: manualCompactInFlight },
+  );
+
+  // Ctrl+R — break the fault-window hold and dispatch the recover
+  // graph NOW, on the same open SSE stream (recovery stays in-band:
+  // the evaluation protocol's evidence requirement). Gated on the
+  // hold slot so the binding is inert everywhere else — the letter
+  // "r" is ordinary input otherwise.
+  //
+  // Two-shape match, same Ink decoder quirk as Ctrl+O below: macOS
+  // Terminal delivers the literal DC2 control byte (Ctrl+R = 18 =
+  // 0x12) with ``key.ctrl=false``; catch both shapes.
+  //
+  // Failure fallback: when the early-recover POST doesn't land (no
+  // hold anymore / HTTP failure), fall back to cancelTurn — the
+  // stream drops, the server's abort cleanup runs, and the blade
+  // ``--timeout`` / carrier timers still guarantee recovery. Esc
+  // keeps its own "exit watching" binding; both keys coexist because
+  // the two user intents are genuinely different (act now vs walk
+  // away).
+  useInput(
+    (input, key) => {
+      const isCtrlR =
+        (key.ctrl && input === "r") || input === "\u0012";
+      if (!isCtrlR) return;
+      void (async () => {
+        const woke = await triggerEarlyRecover();
+        if (!woke) cancelTurn();
+      })();
+    },
+    { isActive: faultWindowActive },
   );
 
   // Ctrl+O — toggle ``constrainHeight``. Always active so the user
@@ -481,7 +544,13 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
 
         const ctx: SlashCommandContext = {
           client,
-          sessionId,
+          // Active (possibly /resume-switched) id — see the
+          // ``storeSessionId`` comment at the component top.
+          sessionId: activeSessionId,
+          // /resume capability: this host re-binds useStream off the
+          // store's session.id (see SlashCommandContext.supportsResume),
+          // so a resumed session's NEXT turn streams into the old sid.
+          supportsResume: true,
           state: stateSnapshot,
           registry,
           dispatch,
@@ -538,10 +607,14 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
     // ``submitRecover`` / ``beginReplay`` / ``beginManualCompact`` come
     // from ``useStream`` already wrapped in ``useCallback``, so listing
     // them costs no churn.
+    //
+    // ``activeSessionId`` swaps only when SESSION_INITIALIZED re-fires
+    // (/resume session switch) — the rebuild is exactly what re-points
+    // this closure's ctx.sessionId at the resumed session.
     [
       submitTurn,
       client,
-      sessionId,
+      activeSessionId,
       getAppState,
       dispatch,
       registry,
@@ -569,8 +642,10 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
           than the server-side one flashing in and out mid-operation. */}
       {manualCompactInFlight ? (
         <ManualCompactIndicator />
+      ) : compactionInFlight ? (
+        <MemoryCompactingIndicator />
       ) : (
-        compactionInFlight && <MemoryCompactingIndicator />
+        faultWindowActive && <FaultWindowIndicator />
       )}
       {/* Sub-control wrappers — each strip lives in its own Box so
        *  the overflow probe (only active when BLADE_AI_DEBUG_OVERFLOW=1)
@@ -587,6 +662,7 @@ export const Composer: React.FC<Props> = ({ client, sessionId }) => {
         <InputPrompt
           disabled={awaitingConfirmation}
           enterLocked={busy && !awaitingConfirmation}
+          faultWindowHold={faultWindowActive}
           registry={registry}
           onSubmit={handleSubmit}
           onExit={handleExit}

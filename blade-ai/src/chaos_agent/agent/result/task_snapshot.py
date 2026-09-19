@@ -52,6 +52,48 @@ def _coerce_json_list(value) -> list:
     return []
 
 
+def _recover_marker_value(checkpoint_value, record_value) -> bool | None:
+    """Combine the combo marker's two carriers into a typed tri-state.
+
+    The recover-side consumers read ``bool(state.get(...))`` or test for
+    None — a raw JSON string would poison them (the string "false" is
+    truthy), so both carriers are decoded to real bools before they
+    reach the seed.
+
+    Precedence mirrors the DB latch's monotonic semantics (round-32b
+    F-2): TRUE on EITHER carrier sticks. The checkpoint (the fresher
+    word) can hold a stale False from before a combo upgrade whose
+    store sync landed but whose next superstep checkpoint save did not
+    — a crash inside that window would otherwise hydrate the seed with
+    False, route that round's recovery deterministic-only, and leak
+    the native mutation (exactly what the marker exists to prevent)
+    while the DB row keeps the True via the latch: the row stays
+    recoverable, only the routing was wrong. Below True, the
+    checkpoint's word (fresher) wins over the record's; neither known
+    → None.
+    """
+    def _as_bool(value) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                loaded = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            return loaded if isinstance(loaded, bool) else None
+        return None
+
+    checkpoint_marker = _as_bool(checkpoint_value)
+    record_marker = _as_bool(record_value)
+    if checkpoint_marker is True or record_marker is True:
+        # Sticky: a combo fact on EITHER carrier — mirrors the upsert
+        # latch's True-sticks discipline at the hydration seam.
+        return True
+    if checkpoint_marker is not None:
+        return checkpoint_marker
+    return record_marker
+
+
 def _session_result_data(session: dict | None) -> dict:
     """Extract JSONEnvelope.data from the task file result_summary."""
     if not isinstance(session, dict):
@@ -604,8 +646,14 @@ async def build_recover_initial_from_task_snapshot(
     agents: dict | None = None,
     kubeconfig_override: str | None = None,
     checkpoint_values: dict | None = None,
+    connection_override: dict | None = None,
 ) -> dict | None:
-    """Build recover initial_state from a merged TaskSnapshot."""
+    """Build recover initial_state from a merged TaskSnapshot.
+
+    ``connection_override`` (caller-carried runtime connection, e.g. the
+    L4 payload snapshot of the session-bound environment) outranks every
+    seed value below — see ``build_recover_initial_from_checkpoint``.
+    """
     checkpoint_values = checkpoint_values or {}
     if not snapshot.has_recover_context and not _checkpoint_has_recover_context(checkpoint_values):
         return None
@@ -638,6 +686,24 @@ async def build_recover_initial_from_task_snapshot(
             or checkpoint_values.get("experiment_uid", "")
             or ""
         ),
+        # Liability axis (B76 review G): birth + death registries for the
+        # recover finale's residual sweep. Round-32 made both wings DB
+        # columns, so the record fills sessions whose checkpoint predates
+        # them — the live checkpoint (fresher) wins when it carries the
+        # wings at all. The combo discriminator (round-32b) rides the same
+        # precedence: checkpoint first, record for DB-only recovery.
+        "owned_experiment_uids": (
+            list(checkpoint_values.get("owned_experiment_uids") or [])
+            or _coerce_json_list(snapshot.record.get("owned_experiment_uids"))
+        ),
+        "retired_experiment_uids": (
+            list(checkpoint_values.get("retired_experiment_uids") or [])
+            or _coerce_json_list(snapshot.record.get("retired_experiment_uids"))
+        ),
+        "combo_native_issued": _recover_marker_value(
+            checkpoint_values.get("combo_native_issued"),
+            snapshot.record.get("combo_native_issued"),
+        ),
         "skill_name": skill_name,
         "fault_type": snapshot.fault_type or checkpoint_values.get("fault_type", ""),
         "skill_case_content": skill_case_content,
@@ -658,9 +724,11 @@ async def build_recover_initial_from_task_snapshot(
         "target": target,
         "params": params,
         "params_flags": list(checkpoint_values.get("params_flags") or []),
+        # Retired old-key fallback (l4-contract-faithfulness): checkpoint
+        # values carry ``duration_seconds``; the legacy ``duration`` key
+        # is no longer hydrated.
         "duration_seconds": int(
             checkpoint_values.get("duration_seconds")
-            or checkpoint_values.get("duration")
             or fault_spec.get("duration_seconds")
             or 0
         ),
@@ -676,6 +744,11 @@ async def build_recover_initial_from_task_snapshot(
         "kube_context": snapshot.record.get("kube_context") or checkpoint_values.get("kube_context", "") or "",
         "kubewiz_cluster_uuid": checkpoint_values.get("kubewiz_cluster_uuid", "") or "",
         "kubewiz_profile": checkpoint_values.get("kubewiz_profile", "") or "",
+        # Injection-time channel, carried for the builder's cross-channel
+        # guard only — the recover graph's own channel comes from the
+        # carried connection override or the caller's settings, never this
+        # frozen value.
+        "kube_connection_mode": checkpoint_values.get("kube_connection_mode", "") or "",
         "injection_method": (
             snapshot.injection_method or checkpoint_values.get("injection_method")
         ),
@@ -701,7 +774,27 @@ async def build_recover_initial_from_task_snapshot(
             or checkpoint_values.get("gmt_create")
             or ""
         ),
-        "tenant_id": checkpoint_values.get("tenant_id", "") or "",
+        # Identity axes are birth-constant facts (the wing-field
+        # precedent, round-32): the live checkpoint wins when it carries
+        # them, and the DB record leg fills sessions whose checkpoint is
+        # gone — a checkpoint-only read would silently re-scope the recover
+        # task's own rows to unfiltered on the DB-only recovery path
+        # (round-32b F-6; same seam as the wings and the combo marker).
+        "tenant_id": (
+            checkpoint_values.get("tenant_id", "")
+            or str(snapshot.record.get("tenant_id") or "")
+        ),
+        # Durable ownership fact (see recovery_state builder): rides the
+        # same checkpoint carrier as tenant_id, never the connection
+        # override — a recovered task keeps its home workspace. Same
+        # checkpoint-first, record-fallback shape as tenant_id above
+        # (mirrors its two-carrier discipline deliberately — a workspace
+        # copy of tenant's original single-carrier line was exactly the
+        # F-6 defect this shape replaces).
+        "workspace_id": (
+            checkpoint_values.get("workspace_id", "")
+            or str(snapshot.record.get("workspace_id") or "")
+        ),
         "messages": list(checkpoint_values.get("messages") or []),
     }
     return build_recover_initial_from_checkpoint(
@@ -709,6 +802,7 @@ async def build_recover_initial_from_task_snapshot(
         snapshot.task_id,
         record_task_id=record_task_id,
         inject_context=inject_context,
+        connection_override=connection_override,
     )
 
 
@@ -720,8 +814,17 @@ async def resolve_recover_initial_state(
     checkpoint_values: dict | None = None,
     tui_session_id: str = "",
     kubeconfig_override: str | None = None,
+    connection_override: dict | None = None,
 ) -> RecoverInitialResolution | None:
     """Resolve recover graph input from TaskSnapshot plus optional checkpoint.
+
+    ``connection_override`` carries the recovering caller's runtime
+    connection (channel + credentials).  It outranks both the persisted
+    snapshot record and the checkpoint-frozen inject values, so a
+    cross-user / cross-time recover runs with the caller's identity
+    instead of the injector's (see ``recovery_state`` module docstring).
+    Entries that carry no connection pass ``None`` and behave exactly as
+    before — frozen values remain the fallback.
 
     Persistent task data is always attempted first so ``.jsonl`` increments are
     considered even when a LangGraph checkpoint is still available.  The
@@ -742,6 +845,7 @@ async def resolve_recover_initial_state(
             agents=agents,
             kubeconfig_override=kubeconfig_override,
             checkpoint_values=checkpoint_values,
+            connection_override=connection_override,
         )
         if initial is not None:
             return RecoverInitialResolution(
@@ -768,6 +872,7 @@ async def resolve_recover_initial_state(
         record_task_id=record_task_id,
         kubeconfig_override=kubeconfig_override,
         tui_session_id_override=tui_session_id or None,
+        connection_override=connection_override,
     )
     return RecoverInitialResolution(
         initial_state=initial,
@@ -824,7 +929,7 @@ def _merge_snapshot_checkpoint_fault_spec(
     merged.setdefault("params_flags", list(checkpoint_values.get("params_flags") or []))
     merged.setdefault(
         "duration_seconds",
-        int(checkpoint_values.get("duration_seconds") or checkpoint_values.get("duration") or 0),
+        int(checkpoint_values.get("duration_seconds") or 0),
     )
     merged.setdefault("source", "task_snapshot_rebuild")
     merged.setdefault("user_description", "")

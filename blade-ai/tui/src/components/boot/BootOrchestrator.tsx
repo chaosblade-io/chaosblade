@@ -27,7 +27,8 @@ import { useEffect } from "react";
 import type { BladeClient } from "@blade-ai/core";
 import { t } from "@blade-ai/core";
 import { useAppDispatch } from "@blade-ai/core";
-import type { HistoryItem } from "@blade-ai/core";
+
+import { fetchDoctorCard, fetchPendingCard } from "./bootCards.js";
 
 export interface BootOrchestratorProps {
   client: BladeClient;
@@ -35,11 +36,6 @@ export interface BootOrchestratorProps {
    *  card's ``capturedAt`` matches when the check started. */
   capturedAt: string;
 }
-
-// Soft cap on preflight wait. MUST exceed the server's outer
-// ``_PREFLIGHT_BUDGET_S`` (currently 15s); 17s leaves a healthy 2s
-// buffer for network + uvicorn dispatch.
-const PREFLIGHT_BUDGET_MS = 17_000;
 
 export const BootOrchestrator: React.FC<BootOrchestratorProps> = ({
   client,
@@ -57,53 +53,21 @@ export const BootOrchestrator: React.FC<BootOrchestratorProps> = ({
         text: t("boot.progress.preflight"),
       });
 
-      const deadline = new Promise<null>((resolve) =>
-        setTimeout(() => resolve(null), PREFLIGHT_BUDGET_MS),
+      const { item: doctorItem, contextMax } = await fetchDoctorCard(
+        client,
+        capturedAt,
       );
-      const preflight = await Promise.race([client.getPreflight(), deadline]);
       if (cancelled) return;
-
-      const doctorItem: HistoryItem = preflight
-        ? {
-            kind: "boot_doctor_card",
-            id: "boot-doctor",
-            capturedAt,
-            passedCount: (preflight["passed_count"] as number) ?? 0,
-            totalCount:
-              (preflight["total_count"] as number) ??
-              ((preflight["checks"] as Array<unknown>) ?? []).length,
-            checks: (
-              (preflight["checks"] as Array<Record<string, unknown>>) ?? []
-            ).map((c) => ({
-              name: (c["name"] as string) ?? "",
-              severity: ((c["severity"] as string) ?? "warning") as
-                | "blocking"
-                | "warning",
-              passed: Boolean(c["passed"]),
-              message: (c["message"] as string) ?? "",
-              fix: (c["fix"] as string) ?? "",
-            })),
-          }
-        : {
-            kind: "boot_doctor_card",
-            id: "boot-doctor",
-            capturedAt,
-            passedCount: 0,
-            totalCount: 0,
-            checks: [],
-            unavailable: true,
-          };
       dispatch({ type: "HISTORY_APPENDED", item: doctorItem });
 
       // Seed the footer's context indicator with the real model budget
       // so it never flickers from the 128k placeholder to the actual value.
-      const ctxMax = preflight?.["context_max_tokens"];
-      if (typeof ctxMax === "number" && ctxMax > 0) {
+      if (contextMax !== null) {
         dispatch({
           type: "CONTEXT_SIZE_RECEIVED",
           currentTokens: 0,
           triggerTokens: 0,
-          maxTokens: ctxMax,
+          maxTokens: contextMax,
           messagesCount: 0,
         });
       }
@@ -114,33 +78,8 @@ export const BootOrchestrator: React.FC<BootOrchestratorProps> = ({
         text: t("boot.progress.tasks"),
       });
 
-      const tasksRaw = await client.listTasks().catch(() => null);
+      const pendingItem = await fetchPendingCard(client);
       if (cancelled) return;
-
-      // Same canonical "in-flight" set the Python TUI uses
-      // (task_store_backend.py:123). Anything outside this set is
-      // either still being driven by an active turn (showing it would
-      // confuse) or already terminal.
-      const PENDING_STATES = new Set(["injecting", "injected"]);
-      const allTasks =
-        (tasksRaw?.["tasks"] as Array<Record<string, unknown>>) ?? [];
-      const pendingTasks = allTasks
-        .filter((tt) =>
-          PENDING_STATES.has((tt["task_state"] as string) ?? ""),
-        )
-        .slice(0, 8)
-        .map((tt) => ({
-          taskId: (tt["task_id"] as string) ?? "?",
-          faultType: (tt["fault_type"] as string) ?? "",
-          state: (tt["task_state"] as string) ?? "?",
-          createdAt: (tt["created_at"] as string) ?? "",
-        }));
-
-      const pendingItem: HistoryItem = {
-        kind: "pending_tasks_card",
-        id: "boot-pending",
-        tasks: pendingTasks,
-      };
       dispatch({ type: "HISTORY_APPENDED", item: pendingItem });
 
       dispatch({ type: "BOOT_PROGRESS_HIDE" });

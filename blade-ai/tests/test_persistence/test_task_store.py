@@ -1,6 +1,7 @@
 """Tests for the async persistent TaskStore (SQLiteBackend)."""
 
 import json
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -85,45 +86,142 @@ class TestSchema:
         # from task_details; without the column the drill's model is
         # invisible in every review surface.
         assert "model_name" in col_names
-        # phase-14 G6：六列先前只存在于启动迁移段，现已并入 DDL ——
-        # fresh 库建表即含终态列集，不再依赖 ALTER 补列。
+        # 六列已并入 DDL（fresh 库直建终态列集），同时启动迁移段的
+        # ALTER 兑旧库双保险——两者不冲突：DDL 管新库，ALTER 管旧库。
         for migrated in ("baseline_data", "inject_context", "skill_use_case",
                          "injection_method", "kubectl_exec_pod_name",
                          "injection_start_time"):
             assert migrated in col_names, migrated
-
-    def test_schema_is_pure_ddl_no_alter_segments(self):
-        """phase-14 G6 7.3：启动迁移段整体退役——建表路径只允许
-        executescript(纯 DDL)，不允许任何 conn.execute 调用（迁移
-         ALTER/回填只能由它发出）。DDL 本体零 ALTER 字面。"""
-        import inspect
-
-        from chaos_agent.persistence import task_store_sqlite as mod
-        assert "ALTER TABLE" not in mod._SCHEMA_DDL
-        src = inspect.getsource(mod.SQLiteBackend._ensure_schema_on_conn)
-        # 带左括号以避开 conn.executescript 的前缀子串：本方法只许
-        # executescript(纯 DDL)，任何 conn.execute( 单语句调用都是迁移残留。
-        assert "conn.execute(" not in src
+        # Round-32/32b — 负债账本列组：双翼 + combo 判别器。判别器
+        # 闸门翼平衡的终审权（may_carry_live_fault A2），列缺失会让
+        # 新行写不进 marker、旧库永远 NULL（保守但永不修复 C2）。
+        for r32 in ("owned_experiment_uids", "retired_experiment_uids",
+                    "combo_native_issued"):
+            assert r32 in col_names, r32
 
     @pytest.mark.asyncio
-    async def test_fresh_start_emits_zero_alter_statements(self, tmp_path):
-        """phase-14 G6 7.3：运行时捕获——``_ensure_schema_on_conn`` 执行期间
-        发出的 SQL 语句流零 ALTER / 零回填 UPDATE（sqlite3 trace callback
-        钉扎，与源码级断言互为印证；幂等重跑走同一语句流，DDL 语句照发
-        仅被 IF NOT EXISTS 短路，迁移残留若有必同样发出）。"""
-        backend = await SQLiteBackend.create(db_path=tmp_path / "fresh.db")
+    async def test_legacy_blade_uid_column_renamed_on_startup(self, tmp_path):
+        """九期前旧库（tasks.blade_uid）：首次启动 RENAME 迁移生效一次——
+        列名翻新、存量数据保留、随后 experiment_uid 的 upsert 不炸；
+        第二次启动零动作（幂等，靠 ALTER 自身失败探列，无版本号）。"""
+        import sqlite3
+
+        db_path = tmp_path / "legacy.db"
+        # 九期前真实形态：blade_uid 列名，无 tenant_id（由迁移段 ALTER 补）；
+        # namespace/target_name 等列必须在——DDL 的 CREATE INDEX 依赖它们。
+        raw = sqlite3.connect(db_path)
+        raw.executescript(
+            "CREATE TABLE tasks ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  task_id TEXT NOT NULL,"
+            "  task_state TEXT NOT NULL DEFAULT 'injecting',"
+            "  stage TEXT NOT NULL DEFAULT 'injection',"
+            "  phase TEXT NOT NULL DEFAULT 'planning',"
+            "  operation TEXT NOT NULL DEFAULT 'inject',"
+            "  skill_name TEXT,"
+            "  blade_uid TEXT,"
+            "  namespace TEXT,"
+            "  target_name TEXT,"
+            "  error TEXT,"
+            "  finished_at TEXT,"
+            "  duration_ms INTEGER DEFAULT 0,"
+            "  gmt_create TEXT,"
+            "  gmt_modified TEXT"
+            ");"
+        )
+        raw.execute(
+            "INSERT INTO tasks (task_id, task_state, blade_uid)"
+            " VALUES ('task-legacy', 'injected', 'uid-old')"
+        )
+        raw.commit()
+        raw.close()
+
+        backend = await SQLiteBackend.create(db_path=db_path)
         try:
-            executed: list[str] = []
-            await backend._conn.set_trace_callback(executed.append)
-            try:
-                await backend._ensure_schema_on_conn(backend._conn)
-            finally:
-                await backend._conn.set_trace_callback(None)
-            joined = "\n".join(executed)
-            assert "ALTER TABLE" not in joined
-            assert "UPDATE task_details" not in joined
-            # 语句流确实是建表 DDL（非空转）
-            assert "CREATE TABLE IF NOT EXISTS task_details" in joined
+            cursor = await backend._conn.execute("PRAGMA table_info(tasks)")
+            cols = {r[1] for r in await cursor.fetchall()}
+            assert "experiment_uid" in cols
+            assert "blade_uid" not in cols
+            # 存量数据随列名翻新保留
+            row = await backend.select_task("task-legacy")
+            assert row["experiment_uid"] == "uid-old"
+            # 迁移后新写入不再报 no such column
+            await backend.upsert_task(
+                "task-legacy",
+                ["task_id", "experiment_uid"],
+                ["task-legacy", "uid-new"],
+            )
+            row = await backend.select_task("task-legacy")
+            assert row["experiment_uid"] == "uid-new"
+        finally:
+            await backend.close()
+
+        # 第二次启动：列已改名，RENAME raise 被吞，无重复动作
+        backend = await SQLiteBackend.create(db_path=db_path)
+        try:
+            row = await backend.select_task("task-legacy")
+            assert row["experiment_uid"] == "uid-new"
+        finally:
+            await backend.close()
+
+    @pytest.mark.asyncio
+    async def test_injection_start_time_backfill_one_shot(self, tmp_path):
+        """旧库缺 injection_start_time 列：首次启动补列 + 存量有意图行
+        一次性回填；迁移后新插入的行永不被碰（重复回填会给「已确认
+        但从未发出命令」的新行盖时间戳，永久废掉 select_active_tasks
+        的「已发出」判据）。"""
+        import sqlite3
+
+        db_path = tmp_path / "backfill.db"
+        # R18 时代形态：task_details 缺 injection_start_time；tasks 的
+        # namespace/target_name 列必须在（DDL 索引依赖）。
+        raw = sqlite3.connect(db_path)
+        raw.executescript(
+            "CREATE TABLE tasks ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  task_id TEXT NOT NULL,"
+            "  task_state TEXT NOT NULL DEFAULT 'injecting',"
+            "  namespace TEXT,"
+            "  target_name TEXT,"
+            "  gmt_create TEXT"
+            ");"
+            "CREATE TABLE task_details ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  task_id TEXT NOT NULL,"
+            "  target TEXT,"
+            "  gmt_create TEXT"
+            ");"
+        )
+        raw.execute(
+            "INSERT INTO tasks (task_id, task_state, gmt_create)"
+            " VALUES ('task-legacy', 'injected', '2026-08-01T00:00:00')"
+        )
+        raw.execute(
+            "INSERT INTO task_details (task_id, target, gmt_create)"
+            " VALUES ('task-legacy', 'app=legacy', '2026-08-01T00:00:00')"
+        )
+        raw.commit()
+        raw.close()
+
+        backend = await SQLiteBackend.create(db_path=db_path)
+        try:
+            legacy = await backend.select_details("task-legacy")
+            assert legacy["injection_start_time"] == "2026-08-01T00:00:00"
+
+            # 迁移后新插入的行：有意图但从未发出命令 → 不被回填
+            await backend.upsert_details(
+                "task-new", ["task_id", "target"], ["task-new", "app=new"]
+            )
+        finally:
+            await backend.close()
+
+        # 第二次启动：ALTER raise → 回填短路，新行保持 NULL
+        backend = await SQLiteBackend.create(db_path=db_path)
+        try:
+            new = await backend.select_details("task-new")
+            assert new.get("injection_start_time") is None
+            legacy = await backend.select_details("task-legacy")
+            assert legacy["injection_start_time"] == "2026-08-01T00:00:00"
         finally:
             await backend.close()
 
@@ -220,6 +318,60 @@ class TestUpsert:
         data = await store.get("task-t1")
         assert data["task_state"] == "recovering"
         assert await store.count() == 1  # no ghost row
+
+    @pytest.mark.asyncio
+    async def test_update_task_state_skip_if_terminal_keeps_own_verdict(self, store):
+        """Round-54 G6: a guarded abort write must never regress a row that
+        already reached its own terminal word.
+
+        The abort exits' row write (write_aborted_task_row) races the run's
+        own tail writers: a cancel landing during result extraction, after
+        the pipeline completed, used to rewrite "completed" into
+        "cancelled". The run that finished keeps its own verdict; the
+        abort word is only for runs whose graph never got to finish.
+        """
+        await store.upsert("task-t1", skill_name="pod-kill")
+        await store.update_task_state("task-t1", "completed")
+
+        landed = await store.update_task_state(
+            "task-t1", "cancelled", skip_if_terminal=True,
+        )
+
+        assert landed is False
+        data = await store.get("task-t1")
+        assert data["task_state"] == "completed", (
+            "a completed run's verdict must survive a late abort write"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_task_state_skip_if_terminal_writes_mid_flight_row(self, store):
+        """The guard is scoped to terminal words only: a mid-flight row
+        (the abort exits' actual target) still takes the abort word."""
+        await store.upsert("task-t1", skill_name="pod-kill")
+        # upsert's inference keeps an unevidenced row at "injecting" — the
+        # mid-graph upsert a real abort interrupts.
+
+        landed = await store.update_task_state(
+            "task-t1", "cancelled", skip_if_terminal=True,
+        )
+
+        assert landed is True
+        data = await store.get("task-t1")
+        assert data["task_state"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_update_task_state_default_keeps_legacy_overwrite_semantics(self, store):
+        """The guard is opt-in: the non-abort write paths (the recover
+        flow's own verdict upgrades — failed → recovered on the SAME row)
+        must keep the plain overwrite semantics."""
+        await store.upsert("task-t1", skill_name="pod-kill")
+        await store.update_task_state("task-t1", "failed")
+
+        landed = await store.update_task_state("task-t1", "recovered")
+
+        assert landed is True
+        data = await store.get("task-t1")
+        assert data["task_state"] == "recovered"
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +697,739 @@ class TestQueryActive:
         assert record["target_name"] == "registry-sts"
         assert record["plan_summary"] == "将 StatefulSet registry-sts 镜像改为无效值"
 
+    @pytest.mark.asyncio
+    async def test_unverified_inject_stays_recoverable(self, store):
+        """End-to-end: an inject run that ends 'unverified' (verification
+        ran, no conclusion) lands task_state='unverified' in the row — and
+        MUST remain in the recoverable set. The command was issued, so the
+        fault is likely still live on the cluster; dropping it from
+        query_active would strand a live fault with no recovery entry
+        (fail-closed: not-knowing is not evidence-of-absence)."""
+        await store.upsert(
+            "task-unv",
+            target={"namespace": "reg-center", "names": ["registry-sts"]},
+            injection_start_time=self._ISSUED,
+            verification={
+                "level": "unverified",
+                "layer1": {"status": "passed"},
+                "layer2": {"status": "unknown"},
+            },
+        )
+        data = await store.get("task-unv")
+        assert data["task_state"] == "unverified"
+        active = await store.query_active()
+        assert "task-unv" in {t["task_id"] for t in active}
+
+    @pytest.mark.asyncio
+    async def test_unverified_is_terminal_no_regression_to_injecting(self, store):
+        """Monotonicity guard: a later field-less flush (tracer-style
+        upsert with no lifecycle evidence) must not regress a finished
+        'unverified' run back to the 'injecting' fallback — that would show
+        an ended run as in-flight."""
+        await store.update_task_state("task-unv2", "unverified")
+        # Field-less flush: no verification / result / intent evidence.
+        await store.upsert("task-unv2", experiment_uid="uid-x")
+        data = await store.get("task-unv2")
+        assert data["task_state"] == "unverified"
+
+    # ------------------------------------------------------------------
+    # Workspace isolation（方案 A：workspace 列下沉 SDK 任务库）
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_workspace_filter_scopes_discovery_set(self, store):
+        """workspace 轴过滤：李四的 query 只回自己空间的行 ——
+        事故场景的直接断言（526255 的行不在李四的发现集里）。"""
+        await store.upsert("task-a", skill_name="pod-kill",
+                           target={"namespace": "default", "names": ["p1"]},
+                           injection_start_time=self._ISSUED, workspace_id="ws-lisi")
+        await store.upsert("task-b", skill_name="pod-kill",
+                           target={"namespace": "default", "names": ["p2"]},
+                           injection_start_time=self._ISSUED,
+                           workspace_id="ws-526255")
+        active = await store.query_active(workspace_id="ws-lisi")
+        assert [r["task_id"] for r in active] == ["task-a"]
+
+    @pytest.mark.asyncio
+    async def test_empty_workspace_means_unfiltered(self, store):
+        """空值 = 不过滤 —— 本地 CLI / 裸 SDK 入口的零回归契约：
+        本地库所有行 workspace 为空串，查询行为与列存在前逐字节一致。"""
+        await store.upsert("task-a", skill_name="pod-kill",
+                           target={"namespace": "default", "names": ["p1"]},
+                           injection_start_time=self._ISSUED)
+        await store.upsert("task-b", skill_name="pod-kill",
+                           target={"namespace": "default", "names": ["p2"]},
+                           injection_start_time=self._ISSUED,
+                           workspace_id="ws-x")
+        # 不传 → 全量（含未标注空间的行）
+        assert len(await store.query_active()) == 2
+        # 显式空串 → 同样全量（falsy 不过滤，与 tenant_id 同构）
+        assert len(await store.query_active(workspace_id="")) == 2
+
+    @pytest.mark.asyncio
+    async def test_tenant_and_workspace_compose(self, store):
+        """双轴组合：同租户（同组织）不同空间的行互不可见 ——
+        事故形态（realm 级 tenant 相同、workspace 不同）。"""
+        for tid, ws in (("task-a", "ws-1"), ("task-b", "ws-2")):
+            await store.upsert(tid, skill_name="pod-kill",
+                               target={"namespace": "default", "names": ["p"]},
+                               injection_start_time=self._ISSUED,
+                               tenant_id="t-org", workspace_id=ws)
+        assert [r["task_id"] for r in await store.query_active(
+            tenant_id="t-org", workspace_id="ws-1")] == ["task-a"]
+        assert [r["task_id"] for r in await store.query_active(
+            tenant_id="t-org", workspace_id="ws-2")] == ["task-b"]
+
+
+# ---------------------------------------------------------------------------
+# Schema migration — workspace_id column (方案 A)
+# ---------------------------------------------------------------------------
+
+class TestWorkspaceMigration:
+    @pytest.mark.asyncio
+    async def test_legacy_db_gains_workspace_column_idempotently(self, tmp_path):
+        """旧库（有 tenant_id、无 workspace_id）：启动迁移 ALTER 补列、
+        存量行默认空串（= 不过滤，行为不变）、二次启动幂等存活。"""
+        import sqlite3
+
+        db_path = tmp_path / "legacy-ws.db"
+        raw = sqlite3.connect(db_path)
+        raw.executescript(
+            "CREATE TABLE tasks ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  task_id TEXT NOT NULL,"
+            "  task_state TEXT NOT NULL DEFAULT 'injecting',"
+            "  stage TEXT NOT NULL DEFAULT 'injection',"
+            "  phase TEXT NOT NULL DEFAULT 'planning',"
+            "  operation TEXT NOT NULL DEFAULT 'inject',"
+            "  skill_name TEXT,"
+            "  experiment_uid TEXT,"
+            "  namespace TEXT,"
+            "  target_name TEXT,"
+            "  tenant_id TEXT DEFAULT '',"
+            "  liability_live INTEGER NOT NULL DEFAULT 0,"
+            "  error TEXT,"
+            "  finished_at TEXT,"
+            "  duration_ms INTEGER DEFAULT 0,"
+            "  gmt_create TEXT,"
+            "  gmt_modified TEXT"
+            ");"
+        )
+        raw.execute(
+            "INSERT INTO tasks (task_id, task_state, tenant_id)"
+            " VALUES ('task-old', 'injected', 't-org')"
+        )
+        raw.commit()
+        raw.close()
+
+        b = await SQLiteBackend.create(db_path=db_path)
+        try:
+            conn = b._conn
+            cursor = await conn.execute("PRAGMA table_info(tasks)")
+            col_names = {r[1] for r in await cursor.fetchall()}
+            assert "workspace_id" in col_names
+            # 存量行默认空串：不过滤契约让旧行保持全可见
+            cursor = await conn.execute(
+                "SELECT workspace_id FROM tasks WHERE task_id = 'task-old'")
+            assert (await cursor.fetchone())[0] == ""
+        finally:
+            await b.close()
+        # 二次启动：ALTER 因列已存在而 raise 被吞，迁移幂等
+        b2 = await SQLiteBackend.create(db_path=db_path)
+        await b2.close()
+
+
+# ---------------------------------------------------------------------------
+# Round-32 — the row-level liability ledger
+# ---------------------------------------------------------------------------
+
+class TestLiabilityLedger:
+    """Round-32 根因修复的测试锚：可恢复性不再从 task_state **词**里猜，
+    而是键在行级账本（owned/retired 双翼 + 物化列 liability_live，
+    写侧单源谓词 may_carry_live_fault）。
+
+    旧词谓词的两个推导错误（K1 recovering 孤儿行、K2
+    failed-with-experiment）让确定活着的故障永久失明；本类钉三件事：
+    谓词三分支、双翼单调合并、K1/K2 的端到端修复验证。"""
+
+    _ISSUED = "2026-09-16T10:00:00+08:00"
+
+    # -- single-source predicate: three branches --------------------------
+
+    def test_branch_a_unbalanced_wings_mean_live(self):
+        """A 支：账本翼不平衡（owned − retired 非空）→ 活。账本是权威：
+        即使词读 'recovered'（判决面），未销毁的命名实验仍是活负债。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        assert may_carry_live_fault({
+            "task_state": "recovered",
+            "owned_experiment_uids": '["uid-1"]',
+            "retired_experiment_uids": '[]',
+        }) is True
+
+    def test_branch_a_balanced_wings_fall_through_to_b(self):
+        """A 支翼平衡 → 落 B；B 无 committed 证据 → 死。清算后的空负债
+        不该因翼的存史而永久活。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        assert may_carry_live_fault({
+            "task_state": "recovered",
+            "owned_experiment_uids": '["uid-1"]',
+            "retired_experiment_uids": '["uid-1"]',
+        }) is False
+
+    def test_branch_b_committed_fallback_without_ledger(self):
+        """B 支：无账本（遗留行）但有 issued 证据 → 活；直到
+        recover_verification/result 给出全恢复证明才清算。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        committed = {
+            "task_state": "failed",
+            "target": '{"names": ["pod1"]}',
+            "injection_start_time": self._ISSUED,
+        }
+        assert may_carry_live_fault(committed) is True
+        # fully-cleared recover proof settles the legacy row
+        settled = dict(committed, recover_verification='{"level": "recovered"}')
+        assert may_carry_live_fault(settled) is False
+        # the result-dict shape of the same proof settles too
+        settled2 = dict(committed, result='{"recovered": true, "recovery_level": "recovered"}')
+        assert may_carry_live_fault(settled2) is False
+
+    def test_branch_c_no_injection_intent_is_dead(self):
+        """C 支：无账本、无 committed 证据 → 死（新生行/裸锚行）。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        assert may_carry_live_fault({"task_state": "injecting"}) is False
+        assert may_carry_live_fault({}) is False
+
+    # -- ledger wings roundtrip + monotonic merge -------------------------
+
+    @pytest.mark.asyncio
+    async def test_ledger_wings_roundtrip_through_store(self, store):
+        """双翼以 JSON list 落库、以 list 读回 —— 账本的持久面。"""
+        await store.upsert(
+            "task-ledger",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["uid-1", "uid-2"],
+            retired_experiment_uids=["uid-0"],
+        )
+        data = await store.get("task-ledger")
+        assert data["owned_experiment_uids"] == ["uid-1", "uid-2"]
+        assert data["retired_experiment_uids"] == ["uid-0"]
+
+    @pytest.mark.asyncio
+    async def test_wing_union_merge_is_monotonic(self, store):
+        """单调守卫：同步路径写的是全量 AgentState 快照，水合缺口
+        （state.owned=None → 空 list）不能抹掉 DB 里已存的翼值 ——
+        upsert 对双翼取并集，双翼立法上是 append-only。"""
+        await store.upsert(
+            "task-mono",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["uid-1"],
+            retired_experiment_uids=["uid-0"],
+        )
+        # hydration-gap flush: BOTH wings arrive empty lists
+        await store.upsert(
+            "task-mono",
+            owned_experiment_uids=[],
+            retired_experiment_uids=[],
+        )
+        data = await store.get("task-mono")
+        assert data["owned_experiment_uids"] == ["uid-1"]  # survived
+        assert data["retired_experiment_uids"] == ["uid-0"]  # survived
+        # and genuine appends accumulate (no clobber between writes)
+        await store.upsert("task-mono", retired_experiment_uids=["uid-1"])
+        data = await store.get("task-mono")
+        assert data["retired_experiment_uids"] == ["uid-0", "uid-1"]
+
+    # -- K1 / K2 end-to-end repair verification ---------------------------
+
+    @pytest.mark.asyncio
+    async def test_k1_recovering_midword_keeps_liability(self, store):
+        """K1 修复验证：崩溃孤儿行读 'recovering'（恢复在途、无判决）——
+        update_task_state 的中途词写**不清除无判决证明的负债**，
+        query_active 仍返回它（旧词谓词的 ACTIVE 集不含 recovering，
+        这正是孤儿行失明的根因）。"""
+        await store.upsert(
+            "task-orphan",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["uid-1"],
+        )
+        await store.update_task_state("task-orphan", "recovering")
+        active = await store.query_active()
+        assert "task-orphan" in {t["task_id"] for t in active}
+
+    @pytest.mark.asyncio
+    async def test_k2_failed_word_with_experiment_keeps_liability(self, store):
+        """K2 修复验证：判决词 'failed' 但实验在册（owned 未清算）→
+        账本说活。旧词谓词把 failed 排除在 ACTIVE 集外，确定活着的
+        故障永久失明；新谓词的 A 支直接看翼。"""
+        await store.upsert(
+            "task-fail-live",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["uid-1"],
+        )
+        await store.update_task_state("task-fail-live", "failed")
+        active = await store.query_active()
+        assert "task-fail-live" in {t["task_id"] for t in active}
+
+    @pytest.mark.asyncio
+    async def test_full_recovery_settles_row_out_of_active(self, store):
+        """镜像面：全恢复判决（死亡翼补全后 retired 吞掉 owned）→
+        翼平衡 + recover 证明 → 行离开可恢复集。恢复了的行不再
+        haunt query_active（K1 的逆向，同一根因：DB 侧死亡证据不全）。"""
+        await store.upsert(
+            "task-settled",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["uid-1"],
+        )
+        # the finalize death-wing write: full verdict retires all owned
+        await store.upsert(
+            "task-settled",
+            retired_experiment_uids=["uid-1"],
+            recover_verification={"level": "recovered"},
+        )
+        await store.update_task_state("task-settled", "recovered")
+        active = await store.query_active()
+        assert "task-settled" not in {t["task_id"] for t in active}
+
+    # -- round-33b: CLEARED word + clearance verdict are one atomic fact ----
+
+    @pytest.mark.asyncio
+    async def test_uidless_native_recovered_without_verdict_stays_live(self, store):
+        """幽灵行复现（fail-closed 保留）：UID-less kubectl-native 注入
+        ——无 experiment_uid、两翼空，账本（A 支）结构性失明；但
+        injection_start_time + target 证明命令确已发出（B 支
+        ``_injection_was_issued``）。只写 CLEARED 词 'recovered' 而本行
+        无清算裁决时，``_recovery_fully_cleared`` 无从证明已清 →
+        负债仍活（liability_live=1），行留在可恢复集。这正是 round-33b
+        前 inject 行的形状：词落到了 inject 行、裁决却留在 recover 行。"""
+        await store.upsert(
+            "task-native-ghost",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            # no experiment_uid, no owned/retired wings — UID-less native
+        )
+        await store.update_task_state("task-native-ghost", "recovered")
+        active = await store.query_active()
+        assert "task-native-ghost" in {t["task_id"] for t in active}
+
+    @pytest.mark.asyncio
+    async def test_recovered_word_with_verdict_clears_same_row(self, store):
+        """通用修复：CLEARED 词与其清算裁决是同一次写、同一行的原子事实。
+        ``update_task_state`` 现在携带 ``recover_verification``——裁决先落
+        到本行，再据合并行证据重算 liability_live，词与裁决一起清。同一
+        条 UID-less native 行（上一测的幽灵），带上 level=recovered 的裁决
+        即离开可恢复集，且裁决确落在本行（非另立 recover 行）。"""
+        await store.upsert(
+            "task-native-cleared",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+        )
+        await store.update_task_state(
+            "task-native-cleared",
+            "recovered",
+            recover_verification={"level": "recovered"},
+        )
+        active = await store.query_active()
+        assert "task-native-cleared" not in {t["task_id"] for t in active}
+        # the verdict landed on THIS row — word + proof travel together
+        row = await store.get("task-native-cleared")
+        assert row["recover_verification"]["level"] == "recovered"
+
+    @pytest.mark.asyncio
+    async def test_partial_verdict_does_not_clear(self, store):
+        """反向闩锁：裁决 level=partial 不是全清证明（``_recovery_fully_cleared``
+        刻意排除 partial——部分恢复意味着至少一个故障可能仍活）。即便词写
+        'recovered' 且带了裁决，partial 裁决也不放行，行仍是负债。防止把
+        '带裁决' 误当成 '带清算证明'。"""
+        await store.upsert(
+            "task-native-partial",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+        )
+        await store.update_task_state(
+            "task-native-partial",
+            "recovered",
+            recover_verification={"level": "partial"},
+        )
+        active = await store.query_active()
+        assert "task-native-partial" in {t["task_id"] for t in active}
+
+
+class TestComboDiscriminator:
+    """Round-32b C2 修复的测试锚：翼平衡对「纯实验行」拥有终审权。
+
+    r32v2 审计坐实的级联缺陷：A 支翼平衡后无条件落 B，而 B 的
+    committed 谓词对每个跑完的 blade 任务都投影 fault_handle ——
+    于是被框架 sweep 清算过、但从未跑 recover 的任务永久 haunt
+    query_active（boot 待处理卡刷满、恢复入口自动选中幽灵行）。
+
+    修复引入 combo 判别器（combo_native_issued 落库三态）：
+    false = 出生 seam 断言「只有实验」，翼平衡即死；true / NULL
+    （遗留行）/ native 族归因（upgrade 漏标的 criterion-2 镜像）
+    保 B 回退。配套闩锁：None 冲刷不抹、True 粘滞。"""
+
+    _ISSUED = "2026-09-16T10:00:00+08:00"
+
+    # -- A2 gate: three-leg discrimination ----------------------------------
+
+    def test_a2_experiments_only_balanced_wing_settles_dead(self):
+        """C2 核心：marker=false + 实验族归因 + 翼平衡 → 死。
+        行自己的死亡记录（retired 翼）终审，不再被 committed
+        形状回退否决。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        assert may_carry_live_fault({
+            "task_state": "completed",
+            "experiment_uid": "u1",
+            "injection_method": "host_blade",
+            "injection_start_time": self._ISSUED,
+            "target": '{"namespace": "default", "names": ["pod1"]}',
+            "owned_experiment_uids": '["u1"]',
+            "retired_experiment_uids": '["u1"]',
+            "combo_native_issued": "false",
+        }) is False
+
+    def test_a2_combo_marker_keeps_committed_fallback(self):
+        """combo（native 半边可能未清算）→ 翼平衡后仍走 B → 活。
+        JSON 字串形态（DB 读路径）与 bool 直传形态同判。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        row = {
+            "task_state": "completed",
+            "experiment_uid": "u1",
+            "injection_method": "host_blade",
+            "injection_start_time": self._ISSUED,
+            "target": '{"namespace": "default", "names": ["pod1"]}',
+            "owned_experiment_uids": '["u1"]',
+            "retired_experiment_uids": '["u1"]',
+        }
+        assert may_carry_live_fault(dict(row, combo_native_issued="true")) is True
+        assert may_carry_live_fault(dict(row, combo_native_issued=True)) is True
+
+    def test_a2_legacy_null_marker_is_conservative(self):
+        """遗留行（marker 从未落库）→ 未知不是否证 → 保 B 回退。
+        猜一个 false 会假清算 marker 从未落地的 combo 行。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        assert may_carry_live_fault({
+            "task_state": "completed",
+            "experiment_uid": "u1",
+            "injection_method": "host_blade",
+            "injection_start_time": self._ISSUED,
+            "target": '{"namespace": "default", "names": ["pod1"]}',
+            "owned_experiment_uids": '["u1"]',
+            "retired_experiment_uids": '["u1"]',
+        }) is True
+
+    def test_a2_native_attribution_beats_false_marker(self):
+        """criterion-2 镜像：native 族归因 + 实验在册 = marker 漏标的
+        combo 证据 → 保 B 回退（upgrade seam 可能漏掉重归因，留下
+        method=kubectl_native + 活实验的行）。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        assert may_carry_live_fault({
+            "task_state": "completed",
+            "experiment_uid": "u1",
+            "injection_method": "kubectl_native",
+            "injection_start_time": self._ISSUED,
+            "target": '{"namespace": "default", "names": ["pod1"]}',
+            "owned_experiment_uids": '["u1"]',
+            "retired_experiment_uids": '["u1"]',
+            "combo_native_issued": "false",
+        }) is True
+
+    def test_a2_imbalance_still_has_no_appeal(self):
+        """不平衡翼的 A 支无上诉（不因 marker 改变）——回归守卫。"""
+        from chaos_agent.persistence.task_store import may_carry_live_fault
+
+        assert may_carry_live_fault({
+            "task_state": "recovered",
+            "injection_method": "host_blade",
+            "owned_experiment_uids": '["u1"]',
+            "retired_experiment_uids": '[]',
+            "combo_native_issued": "false",
+        }) is True
+
+    # -- end-to-end: the C2 ghost leaves query_active ----------------------
+
+    @pytest.mark.asyncio
+    async def test_swept_completed_task_leaves_query_active(self, store):
+        """C2 端到端：注入成功、框架 sweep 已销毁全部实验、从未跑
+        recover 的完成任务 → 离开可恢复集（幽灵死亡）。
+        真实形态 = 出生 seam 写 false + retired 翼由 sweep 回写。"""
+        await store.upsert(
+            "task-swept",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            injection_method="host_blade",
+            experiment_uid="uid-1",
+            owned_experiment_uids=["uid-1"],
+            combo_native_issued=False,
+        )
+        # framework-side sweep retires the experiment (no recover flow)
+        await store.upsert(
+            "task-swept",
+            retired_experiment_uids=["uid-1"],
+        )
+        active = await store.query_active()
+        assert "task-swept" not in {t["task_id"] for t in active}
+
+    @pytest.mark.asyncio
+    async def test_swept_combo_task_stays_recoverable(self, store):
+        """镜像面：同上形状但 combo（native 半边）→ 留在可恢复集。"""
+        await store.upsert(
+            "task-swept-combo",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            injection_method="host_blade",
+            experiment_uid="uid-1",
+            owned_experiment_uids=["uid-1"],
+            combo_native_issued=True,
+        )
+        await store.upsert(
+            "task-swept-combo",
+            retired_experiment_uids=["uid-1"],
+        )
+        active = await store.query_active()
+        assert "task-swept-combo" in {t["task_id"] for t in active}
+
+    # -- marker latch --------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_marker_latch_none_flush_never_erases(self, store):
+        """闩锁：None 冲刷（replan 清零 / 水合缺口）不抹掉已落库定值。"""
+        await store.upsert(
+            "task-latch",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            combo_native_issued=True,
+        )
+        await store.upsert("task-latch", combo_native_issued=None)
+        data = await store.get("task-latch")
+        assert data["combo_native_issued"] is True
+
+    @pytest.mark.asyncio
+    async def test_marker_latch_true_sticks_over_false(self, store):
+        """闩锁：True 粘滞 —— 后到的 False（新 epoch 出生断言）不能把
+        已 committed 的 combo 降级回「纯实验」（假清算防线）。"""
+        await store.upsert(
+            "task-sticky",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            combo_native_issued=True,
+        )
+        await store.upsert("task-sticky", combo_native_issued=False)
+        data = await store.get("task-sticky")
+        assert data["combo_native_issued"] is True
+
+    @pytest.mark.asyncio
+    async def test_marker_latch_false_lands_on_fresh_row(self, store):
+        """新行首写 False 正常落库（出生 seam 的主路径）。"""
+        await store.upsert(
+            "task-fresh",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            combo_native_issued=False,
+        )
+        data = await store.get("task-fresh")
+        assert data["combo_native_issued"] is False
+
+    @pytest.mark.asyncio
+    async def test_marker_birth_order_false_then_true(self, store):
+        """出生顺序模拟：先 False（出生 seam）后 True（combo 标记，
+        任一顺序）→ 终值 True；再 None 冲刷 → 仍 True（闩锁双保险）。"""
+        await store.upsert(
+            "task-order",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["uid-1"],
+            combo_native_issued=False,
+        )
+        await store.upsert("task-order", combo_native_issued=True)
+        data = await store.get("task-order")
+        assert data["combo_native_issued"] is True
+        await store.upsert("task-order", combo_native_issued=None)
+        data = await store.get("task-order")
+        assert data["combo_native_issued"] is True
+
+
+class TestLiabilityGroupSerialization:
+    """Round-32b P3 — get_all_metrics 行的 ``liability_group`` 三组透传。
+
+    分组立法在 state.py 的 ``liability_group_for``（同一词表单源：
+    CLEARED / TERMINAL），服务端序列化面只在 liability-live 行上携带；
+    dead 行 ship null。TUI 消费此字段分桶渲染 boot 卡，TS 侧零词表
+    复制（PENDING_STATES 漂移家族保持退役）。"""
+
+    _ISSUED = "2026-09-16T10:00:00+08:00"
+
+    @pytest.mark.asyncio
+    async def test_live_rows_carry_group_dead_rows_ship_null(self, store):
+        """四形态：in_flight / needs_recovery / uncleared / dead(null)。"""
+        # in_flight — 非终态词 + 翼不平衡 → live
+        await store.upsert(
+            "task-grp-inflight",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["u1"],
+        )
+        await store.update_task_state("task-grp-inflight", "injecting")
+
+        # needs_recovery — 终态非清算词（fault 仍在账上）→ live
+        await store.upsert(
+            "task-grp-needs",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["u2"],
+        )
+        await store.update_task_state("task-grp-needs", "failed")
+
+        # uncleared — CLEARED 词压活账本（round-32b C1 haunt 形状）→ live
+        await store.upsert(
+            "task-grp-uncleared",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            owned_experiment_uids=["u3"],
+        )
+        await store.update_task_state("task-grp-uncleared", "completed")
+
+        # dead — 无注入意图（C 支）→ liability_live=False → group null
+        await store.update_task_state("task-grp-dead", "rejected")
+
+        result = await store.get_all_metrics()
+        rows = {t["task_id"]: t for t in result["tasks"]}
+
+        assert rows["task-grp-inflight"]["liability_live"] is True
+        assert rows["task-grp-inflight"]["liability_group"] == "in_flight"
+        assert rows["task-grp-needs"]["liability_live"] is True
+        assert rows["task-grp-needs"]["liability_group"] == "needs_recovery"
+        assert rows["task-grp-uncleared"]["liability_live"] is True
+        assert rows["task-grp-uncleared"]["liability_group"] == "uncleared"
+        assert rows["task-grp-dead"]["liability_live"] is False
+        assert rows["task-grp-dead"]["liability_group"] is None
+
+    @pytest.mark.asyncio
+    async def test_c2_settled_row_has_no_group_either(self, store):
+        """A2 门控与分组正交：marker=False 翼平衡即死的行同样无组
+        （死行不管怎么死的都不进 boot 卡）。"""
+        await store.upsert(
+            "task-grp-c2",
+            target={"namespace": "default", "names": ["pod1"]},
+            injection_start_time=self._ISSUED,
+            injection_method="host_blade",
+            owned_experiment_uids=["u9"],
+            combo_native_issued=False,
+        )
+        await store.upsert("task-grp-c2", retired_experiment_uids=["u9"])
+        await store.update_task_state("task-grp-c2", "failed")
+
+        rows = {t["task_id"]: t for t in (await store.get_all_metrics())["tasks"]}
+        assert rows["task-grp-c2"]["liability_live"] is False
+        assert rows["task-grp-c2"]["liability_group"] is None
+
+
+# ---------------------------------------------------------------------------
+# task_state closed-set guards (round-16 S4/S5)
+# ---------------------------------------------------------------------------
+
+class TestTaskStateClosedSetGuards:
+    """Round-16 S4/S5: the task_state column was unprotected on BOTH
+    sides — reads defaulted a missing column to "injecting" (dressing an
+    unknown/terminal row up as in-flight), and update_task_state wrote
+    any string as-is (a typo like "reocvered" persisted silently).
+    Contrast: the verification vocabulary got a write clamp (round-14)
+    AND a read gate (round-15 D5); these pins close the task_state gap."""
+
+    @pytest.mark.asyncio
+    async def test_bare_insert_row_defaults_to_injecting_via_ddl(
+        self, backend, store
+    ):
+        """S4 事实修正后的正向立法：DDL
+        ``task_state TEXT NOT NULL DEFAULT 'injecting'`` 是 schema 立法
+        ——裸插（无 Python 推断）的行从 in-flight 起步，与 upsert 推断
+        语义一致，不是漂移。（区分于读侧缺 key 防御：一个真的缺列
+        legacy 库在 SQLiteBackend.create 的索引 DDL 处就 fail loudly
+        ——实测 ``no such column: task_state``，根本到不了读侧。）"""
+        await backend.upsert_task(
+            "task-bare", ["task_id", "operation"], ["task-bare", "inject"]
+        )
+        row = await store.get("task-bare")
+        assert row["task_state"] == "injecting"
+
+    @pytest.mark.asyncio
+    async def test_task_row_dict_missing_task_state_key_reports_unknown(
+        self, store, monkeypatch
+    ):
+        """S4 防御位行为钉扎：行 dict 缺 ``task_state`` key（未来部分列
+        查询 / 新 backend 构造路径）时，读侧拼 ``unknown``，不伪造
+        in-flight。``unknown`` 刻意在 TaskState 闭集之外：它断言「行内
+        无证据」，永远不是生命周期宣称。"""
+
+        async def fake_select_task(task_id):
+            return {"task_id": task_id, "operation": "inject"}  # no key
+
+        async def fake_select_details(task_id):
+            return None
+
+        async def fake_select_spans(task_id):
+            return []
+
+        monkeypatch.setattr(store._backend, "select_task", fake_select_task)
+        monkeypatch.setattr(store._backend, "select_details", fake_select_details)
+        monkeypatch.setattr(store._backend, "select_spans", fake_select_spans)
+
+        metric = await store.get_metric("task-x")
+        assert metric["task_state"] == "unknown"
+
+    def test_task_store_reads_have_no_hand_copied_injecting_default(self):
+        """S4 源级钉扎：读路径不得再出现
+        ``task.get("task_state", "injecting")`` 手抄默认形态（修复前
+        的形态）——缺 key 防御必须走 ``or "unknown"`` sentinel。"""
+        src = (
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "chaos_agent"
+            / "persistence"
+            / "task_store.py"
+        )
+        text = src.read_text(encoding="utf-8")
+        assert 'task.get("task_state", "injecting")' not in text
+
+    @pytest.mark.asyncio
+    async def test_update_task_state_rejects_word_outside_closed_set(
+        self, backend, store
+    ):
+        """S5: an out-of-set word is a PROGRAM BUG (typo, foreign domain
+        word), not legacy data — reject loudly, never persist it. A
+        silent clamp would mask the bug (contrast the read-side gate,
+        which faces legacy rows and may only normalise)."""
+        await backend.upsert_task(
+            "task-typo", ["task_id", "operation"], ["task-typo", "inject"]
+        )
+        with pytest.raises(ValueError, match="value domain"):
+            await store.update_task_state("task-typo", "reocvered")
+        row = await store.get("task-typo")
+        assert row["task_state"] != "reocvered"
+
+    @pytest.mark.asyncio
+    async def test_update_task_state_accepts_legislated_words(self, backend, store):
+        """The guard rejects only out-of-set words; the legislated
+        vocabulary (e.g. the recover flow's "recovered") still writes."""
+        await backend.upsert_task(
+            "task-ok", ["task_id", "operation"], ["task-ok", "inject"]
+        )
+        await store.update_task_state("task-ok", "recovered")
+        row = await store.get("task-ok")
+        assert row["task_state"] == "recovered"
+
 
 # ---------------------------------------------------------------------------
 # Delete
@@ -630,6 +1515,96 @@ class TestSpans:
     async def test_get_spans_empty(self, store):
         await store.upsert("task-t1")
         assert await store.get_spans("task-t1") == []
+
+
+# ---------------------------------------------------------------------------
+# total_token_cached — task-level prompt-cache persistence (design D4)
+# ---------------------------------------------------------------------------
+
+class TestTokenCachedPersistence:
+    """task_details.total_token_cached — the task-level prompt-cache aggregate.
+
+    Cache hits are a SUBSET of total_token_input (not additive), written
+    ABSOLUTELY by ``tracer._persist_summary`` at finalize (never per-span
+    rollup — cache is a task-level aggregate, unrelated to graph nodes).
+    These tests pin the DB write/read path + the idempotent migration.
+    """
+
+    @pytest.mark.asyncio
+    async def test_task_details_has_total_token_cached_column(self, backend):
+        cursor = await backend._conn.execute("PRAGMA table_info(task_details)")
+        col_names = {r[1] for r in await cursor.fetchall()}
+        assert "total_token_cached" in col_names
+
+    @pytest.mark.asyncio
+    async def test_upsert_roundtrips_total_token_cached(self, store):
+        await store.upsert("task-t1", total_token_input=2990,
+                           total_token_cached=2176)
+        summary = await store.get_summary("task-t1")
+        assert summary["total_token_cached"] == 2176
+        assert summary["total_token_input"] == 2990
+
+    @pytest.mark.asyncio
+    async def test_total_token_cached_defaults_to_zero(self, store):
+        # A task written without cache (legacy producer / cold run) reads 0,
+        # never absent — get_summary's column list always includes it.
+        await store.upsert("task-t1", total_token_input=100)
+        summary = await store.get_summary("task-t1")
+        assert summary["total_token_cached"] == 0
+
+    @pytest.mark.asyncio
+    async def test_get_metric_summary_carries_total_token_cached(self, store):
+        await store.upsert("task-t1", total_token_input=2990,
+                           total_token_cached=2176)
+        metric = await store.get_metric("task-t1")
+        assert metric["summary"]["total_token_cached"] == 2176
+
+    @pytest.mark.asyncio
+    async def test_get_all_metrics_summary_carries_total_token_cached(self, store):
+        # The list path (get_all_metrics) has its OWN summary column list —
+        # it must carry cache too, or single-task vs list views diverge.
+        await store.upsert("task-t1", total_token_input=2990,
+                           total_token_cached=2176)
+        result = await store.get_all_metrics()
+        row = next(t for t in result["tasks"] if t["task_id"] == "task-t1")
+        assert row["summary"]["total_token_cached"] == 2176
+
+    @pytest.mark.asyncio
+    async def test_legacy_db_gains_total_token_cached_on_startup(self, tmp_path):
+        """A pre-cache DB (task_details WITHOUT total_token_cached) gains the
+        column via the idempotent ALTER on reopen; a subsequent write carrying
+        total_token_cached does not raise 'no such column'. Backend-level to
+        isolate the migration from store.upsert's inference path."""
+        import sqlite3
+
+        db_path = tmp_path / "legacy_cache.db"
+        raw = sqlite3.connect(db_path)
+        raw.executescript(
+            "CREATE TABLE task_details ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  task_id TEXT NOT NULL,"
+            "  total_token_input INTEGER NOT NULL DEFAULT 0,"
+            "  gmt_create TEXT,"
+            "  gmt_modified TEXT"
+            ");"
+        )
+        raw.commit()
+        raw.close()
+
+        backend = await SQLiteBackend.create(db_path=db_path)
+        try:
+            cursor = await backend._conn.execute("PRAGMA table_info(task_details)")
+            cols = {r[1] for r in await cursor.fetchall()}
+            assert "total_token_cached" in cols  # ALTER migration added it
+            await backend.upsert_details(
+                "task-legacy",
+                ["task_id", "total_token_input", "total_token_cached"],
+                ["task-legacy", 2990, 2176],
+            )
+            row = await backend.select_details("task-legacy")
+            assert row["total_token_cached"] == 2176
+        finally:
+            await backend.close()
 
 
 # ---------------------------------------------------------------------------

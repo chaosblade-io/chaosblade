@@ -14,15 +14,22 @@ the conversation in the next invocation to refine their intent.
 
 from __future__ import annotations
 
+import json
 import logging
 
 from langchain_core.messages import AIMessage, RemoveMessage, SystemMessage
 from langgraph.types import interrupt
 
+from chaos_agent.agent.intent_handoff import (
+    is_previous_intent_residue as _is_previous_intent_residue,
+    spec_relevance_tokens as _spec_relevance_tokens,
+    word_contains as _word_contains,
+)
 from chaos_agent.agent.spec.fault_spec import read_fault_spec
 from chaos_agent.agent.state import AgentState
 from chaos_agent.memory.tui_session_store import persist_node_dialogue
 from chaos_agent.observability.status_tracker import get_tracker, StatusCategory
+from chaos_agent.utils.time import now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +133,9 @@ def _build_handoff_summary(fault_intent: dict, dialogue_round: int) -> SystemMes
 
     Format and content are kept identical to the pre-Option-A summary
     that ``intent_clarification`` used to produce — downstream consumers
-    (``session_store._split_at_handoff``, ``cli/runner.py`` handoff
-    detection at ~478, ``cli/runner.py`` at ~919) match on the
+    (``session_store._split_at_handoff`` and the handoff extraction in
+    ``cli/runner.py``'s create-session blocks — the create_session call
+    sites of ``inject_stream`` and ``run``) match on the
     ``[Intent Clarification Summary]`` content prefix, so producing the
     same string from a different node is a transparent move.
     """
@@ -176,7 +184,237 @@ def _build_trim_remove_list(messages: list) -> list[RemoveMessage]:
     return remove_list
 
 
-def _commit_inject_handoff(state: AgentState, fault_intent: dict) -> dict:
+# ── Probe snapshot harvest (tier1-speedup) ─────────────────────────
+
+#: Read-only observation tools whose ToolMessage results the fallback
+#: extractor scans. ``kubectl_read`` covers get/describe/top/logs and
+#: read-only exec (``ps aux``); ``host_read`` covers host-side observation.
+#: ``blade_help`` / ``blade_status`` produce no target facts and are
+#: deliberately excluded — scanning them would only add noise.
+_PROBE_SOURCE_TOOLS = ("kubectl_read", "host_read")
+
+#: Whole-snapshot ceiling. Slightly under the ledger's FACTS_CAP so the
+#: snapshot section stays in the same context-weight class as the ledger
+#: section it complements.
+_SNAPSHOT_MAX_FACTS = 12
+
+#: Per-fact character ceiling — identical to the ledger's VALUE_CHAR_CAP
+#: so a snapshot fact is never fatter than the ledger fact it mirrors.
+_SNAPSHOT_FACT_CHAR_CAP = 200
+
+
+def _maybe_json(value):
+    """Best-effort decode of a JSON-encoded string into its structure.
+
+    Models do pass dicts/lists as JSON *strings* in tool_call args (the
+    same mis-formatting ``progress_ledger._maybe_json`` guards against).
+    Anything that is not JSON-shaped is returned unchanged.
+    """
+    if isinstance(value, str) and value.lstrip()[:1] in ("[", "{"):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _latest_established_facts(messages: list) -> list:
+    """Return the established_facts list from the LAST update_progress
+    tool_call that carried one, in the model's own order.
+
+    The ledger's state layer is shallow-overwrite: the last call carrying
+    ``established_facts`` defines the ledger's final view. The snapshot
+    must agree with that view exactly — the ``[FAULT INTENT]`` section
+    declares itself same-source as the ledger section — so facts from
+    earlier calls (which the model may have deliberately rewritten to
+    drop wrong entries) are NOT merged back in.
+    """
+    for msg in reversed(messages):
+        if getattr(msg, "type", "") != "ai":
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            if tc.get("name") != "update_progress":
+                continue
+            args = _maybe_json(tc.get("args"))
+            if not isinstance(args, dict):
+                continue
+            state_update = _maybe_json(args.get("state_update"))
+            if not isinstance(state_update, dict):
+                continue
+            facts = state_update.get("established_facts")
+            if isinstance(facts, str):
+                facts = [facts]
+            if isinstance(facts, list):
+                cleaned = [f.strip() for f in facts if isinstance(f, str) and f.strip()]
+                if cleaned:
+                    return cleaned
+    return []
+
+
+def _fallback_rows(messages: list, names: list, param_values: list) -> list:
+    """Deterministic row extraction from read-only tool results.
+
+    The fallback exists for the case the model forgot to self-record:
+    it scans ToolMessage results of whitelisted read-only tools and keeps
+    only rows that name the target — a spec name or a param value as a
+    whole token — plus ``Restart Policy:`` lines from tool calls that
+    targeted a spec name. Generic tool output never leaks in. Rows are
+    returned in message order (oldest first); the caller fills the
+    remaining snapshot budget from the newest end.
+    """
+    # tool_call_id → args, so a describe's Restart Policy line can be tied
+    # to a call that actually named the target.
+    call_args_by_id: dict = {}
+    for msg in messages:
+        if getattr(msg, "type", "") != "ai":
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            if tc.get("id"):
+                call_args_by_id[tc["id"]] = tc.get("args") or {}
+
+    rows: list = []
+    for msg in messages:
+        if getattr(msg, "type", "") != "tool":
+            continue
+        tool_name = getattr(msg, "name", "") or ""
+        if tool_name not in _PROBE_SOURCE_TOOLS:
+            continue
+        content = getattr(msg, "content", None)
+        if not isinstance(content, str):
+            continue
+        args_text = json.dumps(
+            call_args_by_id.get(getattr(msg, "tool_call_id", ""), {}),
+            ensure_ascii=False,
+        )
+        for raw in content.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("---") or len(line) > 500:
+                continue
+            hit = _first_mentioned(line, names)
+            if hit:
+                # resource row: get/describe/-o wide line naming the target
+                rows.append({"fact": line, "source_tool": tool_name, "key": hit})
+                continue
+            hit = _first_mentioned(line, param_values)
+            if hit:
+                # ps aux / process row naming the target process
+                rows.append({"fact": line, "source_tool": tool_name, "key": hit})
+                continue
+            low = line.lower()
+            if low.startswith("restart policy:") and any(n in args_text for n in names):
+                rows.append({"fact": line, "source_tool": tool_name, "key": "restartpolicy"})
+    return rows
+
+
+def _first_mentioned(text: str, candidates: list) -> str:
+    """First candidate occurring in ``text`` as a whole word.
+
+    Word-boundary matching (not bare substring) keeps the "complete
+    string match" discipline — ``drill-target`` must not match
+    ``drill-target-2`` — while still catching the forms real tool output
+    uses: ``pod/drill-target``, ``nginx: master``, ``/usr/sbin/nginx``.
+    """
+    for c in candidates:
+        if _word_contains(text, c):
+            return c
+    return ""
+
+
+def _harvest_probe_snapshot(messages: list, spec, *, now: str | None = None) -> dict | None:
+    """Dual-source harvest of what intent clarification established about
+    the target environment, frozen just before the clarification history
+    is trimmed away.
+
+    Primary source — the model's own ``update_progress`` records: every
+    established_fact with the model's wording, taken from the LAST call
+    that carried the list (same-source as the ledger's final view).
+    Cross-intent guard: the intent graph keeps its messages across
+    rejected/abandoned intents (deliberately — a continued conversation
+    iterates on established context), so that last record may belong to a
+    PREVIOUS intent about a DIFFERENT target. The ledger keeps such
+    continuity on purpose, but this snapshot section claims "Established
+    while clarifying the intent" — a record naming none of THIS intent's
+    tokens is previous-intent residue with a fabricated probed_at. The
+    whole batch is dropped in that case; the spec-driven fallback stays
+    clean either way.
+
+    Fallback — deterministic keyword rows from whitelisted read-only tool
+    results (spec names / param values as whole tokens, Restart Policy
+    lines). When both sources carry the same information, the self-recorded
+    entry wins: the fallback row is dropped if any recorded fact already
+    mentions its key token, so the 12-entry budget is not spent twice on
+    one fact.
+
+    ``probed_at`` is the harvest moment for every entry. LangChain message
+    objects carry no timestamps (and langchain_openai does not surface the
+    API's ``created``), so per-message times do not exist inside the graph;
+    the snapshot's consumption semantics — "age since the handoff
+    baseline" — is exactly what one shared timestamp provides.
+
+    Caps: ≤ 12 entries total (self-recorded kept first, overflow drops the
+    oldest = list head, mirroring the ledger's keep-tail rolling), ≤ 200
+    chars per fact. Any failure degrades to ``None`` — a missing snapshot
+    is the pre-change behaviour and must never block the handoff.
+    """
+    try:
+        recorded = _latest_established_facts(messages)
+        names = [n for n in (getattr(spec, "names", ()) or ()) if isinstance(n, str) and n.strip()]
+        params = getattr(spec, "params", None) or {}
+        param_values = [
+            v.strip() for v in params.values()
+            if isinstance(v, str) and len(v.strip()) >= 3 and not v.strip().isdigit()
+        ]
+        # Cross-intent staleness guard (see docstring): relevance tokens are
+        # this intent's names / param values / namespace. Whole-BATCH check
+        # via ``_is_previous_intent_residue`` — a causal-insight fact need
+        # not name the target itself as long as its batch does.
+        if _is_previous_intent_residue(recorded, _spec_relevance_tokens(spec)):
+            recorded = []
+
+        recorded_blob = "\n".join(recorded)
+        fallback = []
+        for row in _fallback_rows(messages, names, param_values):
+            key = row["key"]
+            if not key:
+                continue
+            if key == "restartpolicy":
+                policy_value = row["fact"].split(":", 1)[-1].strip()
+                low = recorded_blob.lower()
+                if "restartpolicy" in low or (policy_value and policy_value.lower() in low):
+                    continue  # self-recorded already covers it
+            elif _word_contains(recorded_blob, key):
+                continue  # self-recorded already mentions this target token
+            fallback.append(row)
+
+        ts = now or now_iso()
+        facts = [
+            {
+                "fact": f[:_SNAPSHOT_FACT_CHAR_CAP],
+                "source_tool": "update_progress",
+                "probed_at": ts,
+            }
+            # Keep the TAIL: the ledger's own rolling keeps the most recent
+            # FACTS_CAP entries, and the snapshot must drop the same (oldest,
+            # head) entries the ledger would.
+            for f in recorded[-_SNAPSHOT_MAX_FACTS:]
+        ]
+        budget = _SNAPSHOT_MAX_FACTS - len(facts)
+        for row in reversed(fallback):  # newest tool results first
+            if budget <= 0:
+                break
+            facts.append({
+                "fact": row["fact"][:_SNAPSHOT_FACT_CHAR_CAP],
+                "source_tool": row["source_tool"],
+                "probed_at": ts,
+            })
+            budget -= 1
+        return {"facts": facts} if facts else None
+    except Exception:
+        logger.debug("probe snapshot harvest failed; continuing without snapshot", exc_info=True)
+        return None
+
+
+def _commit_inject_handoff(state: AgentState, fault_intent: dict, spec=None) -> dict:
     """Run the inject pipeline handoff and produce the state delta.
 
     Dual-graph model: ``handoff_summary`` is read by the Runner to
@@ -186,11 +424,45 @@ def _commit_inject_handoff(state: AgentState, fault_intent: dict) -> dict:
     messages = state.get("messages", [])
     dialogue_round = int(state.get("dialogue_round") or 0)
     summary_msg = _build_handoff_summary(fault_intent, dialogue_round)
+    # Harvest the probe snapshot BEFORE the trim removes the clarification
+    # history the harvester reads — this is the last moment those tool
+    # results and self-recorded facts still exist in ``messages``. Written
+    # unconditionally: ``None`` overwrites any snapshot left by a previous
+    # fault in the same session (the field is durable, so a stale snapshot
+    # would otherwise leak into this fault's plan context).
+    probe_snapshot = _harvest_probe_snapshot(
+        messages, spec if spec is not None else read_fault_spec(state),
+    )
     remove_list = _build_trim_remove_list(messages)
+
+    # Cross-intent guard for the LEDGER handoff (same residue class the
+    # snapshot guard above drops): the ledger's ``established_facts`` are
+    # the LAST update_progress batch — the very list the snapshot's
+    # primary source checks. When that batch belongs to a PREVIOUS intent
+    # about a different target (rejected/abandoned, then the user changed
+    # targets and the new clarification never re-recorded), the snapshot
+    # drops it — but the ledger bridge would otherwise copy it verbatim
+    # into the pipeline, where the plan's system prompt renders it under
+    # "do not re-derive what is already established" and the
+    # seed-anchor-and-preserve branch then carries it through
+    # execute/verify/recover. Hand off None in that case (pre-change
+    # baseline); the IntentState copy is wiped by the dispatch clear
+    # anyway, so nothing session-scoped is lost.
+    ledger = state.get("progress_ledger")
+    if isinstance(ledger, dict) and ledger:
+        _st = ledger.get("state")
+        _facts = _st.get("established_facts") if isinstance(_st, dict) else None
+        if _is_previous_intent_residue(
+            list(_facts or []),
+            _spec_relevance_tokens(spec if spec is not None else read_fault_spec(state)),
+        ):
+            ledger = None
 
     return {
         "messages": remove_list,
         "handoff_summary": summary_msg.content,
+        "probe_snapshot": probe_snapshot,
+        "progress_ledger": ledger,
     }
 
 
@@ -265,7 +537,7 @@ async def intent_confirm(state: AgentState) -> dict:
         # this would leave Phase 1 reading the verbose clarification
         # dialogue and produce a different plan preview than the
         # post-Option-A approved flow.
-        return _commit_inject_handoff(state, fault_intent)
+        return _commit_inject_handoff(state, fault_intent, spec)
 
     if tracker:
         tracker.start(
@@ -287,9 +559,13 @@ async def intent_confirm(state: AgentState) -> dict:
     #   · ``clarification_round`` — how many user turns were spent
     #                                clarifying the intent before submission:
     #                                every fresh turn after the opening
-    #                                counts one, a pure confirmation is
-    #                                refunded (0 = one-shot convergence). The
-    #                                TUI renders this field only when N>0.
+    #                                counts one; a turn that only replayed an
+    #                                already-reviewed contract is refunded,
+    #                                while a turn whose submission bootstrapped
+    #                                the contract (no review pre-existed it)
+    #                                keeps its count (0 = one-shot
+    #                                convergence). The TUI renders this field
+    #                                only when N>0.
     batch_args = state.get("batch_submit_args")
     if batch_args and isinstance(batch_args, dict) and batch_args.get("faults"):
         batch_faults = batch_args["faults"]
@@ -341,7 +617,7 @@ async def intent_confirm(state: AgentState) -> dict:
         # alive across rejections (so a continued conversation can
         # refine, not restart) and stops orphan task files from being
         # created for rejected intents.
-        return _commit_inject_handoff(state, fault_intent)
+        return _commit_inject_handoff(state, fault_intent, spec)
     else:
         # User rejected — clear confirmed_intent so router routes to END.
         # Notably we do NOT touch ``messages`` here: the full

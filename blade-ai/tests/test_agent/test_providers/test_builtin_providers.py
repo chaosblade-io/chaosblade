@@ -28,7 +28,10 @@ def _isolate_registry():
 # -- message-history builders (mirror test_execute_loop.py conventions) ------
 
 
-def _blade_ok(uid: str = "uid-123") -> ToolMessage:
+def _blade_ok(uid: str = "a1b2c3d4e5f60718") -> ToolMessage:
+    # hex16 defaults (round-18 F-e): the JSON-aware anchors shape-validate
+    # their payloads — placeholder "uid-123"-style tokens are refused by
+    # design, so every fixture on an ingestion path carries a real shape.
     return ToolMessage(
         content='{"code":200,"success":true,"result":"%s"}' % uid,
         name="blade_create",
@@ -36,7 +39,7 @@ def _blade_ok(uid: str = "uid-123") -> ToolMessage:
     )
 
 
-def _kubectl_blade_ok(uid: str = "uid-xyz") -> list:
+def _kubectl_blade_ok(uid: str = "b2c3d4e5f6071829") -> list:
     """A kubectl-exec blade delivery as it appears in a real conversation:
     the owning AIMessage tool_call (``exec`` + ``blade`` + ``create`` in
     ``v_args``) followed by the success-JSON ToolMessage. The blade-evidence
@@ -106,8 +109,12 @@ def test_builtins_satisfy_protocol():
 def test_register_builtins_order_and_carriers():
     FaultProviderRegistry.register_builtins()
     carriers = [p.carrier for p in FaultProviderRegistry.all_providers()]
-    # Order is load-bearing: chaosblade probed first (UID methods).
-    assert carriers == ["chaosblade", "k8s_native", "host_shell", "chaosblade_python"]
+    # Order is load-bearing: chaosblade probed first (UID methods);
+    # faultdrill_cr last (the post-dark-launch default registers it).
+    assert carriers == [
+        "chaosblade", "k8s_native", "host_shell", "chaosblade_python",
+        "faultdrill_cr",
+    ]
 
 
 def test_register_builtins_method_index():
@@ -221,7 +228,7 @@ def test_detect_kubectl_exec_requires_blade_delivery_cross_check():
     # skipped fail-closed: an unattributable kubectl output must not license
     # a blade attribution.
     orphan = [ToolMessage(
-        content='{"code":200,"success":true,"result":"uid-orphan"}',
+        content='{"code":200,"success":true,"result":"c3d4e5f607182938"}',
         name="kubectl",
         tool_call_id="missing",
     )]
@@ -394,6 +401,7 @@ def test_detect_method_self_bootstraps_on_empty_registry():
     ) == "host_blade"
     assert [p.carrier for p in FaultProviderRegistry.all_providers()] == [
         "chaosblade", "k8s_native", "host_shell", "chaosblade_python",
+        "faultdrill_cr",
     ]
 
 
@@ -406,7 +414,7 @@ def test_detect_method_no_injection_returns_none():
 # -- recency-based attribution (task-76c59364) -------------------------------
 
 
-def _destroyed_blade_then_native(uid: str = "uid-dead") -> list:
+def _destroyed_blade_then_native(uid: str = "f6071829384950a1") -> list:
     """blade_create yields a UID, it is blade_destroy'd, THEN a kubectl-native
     iptables DROP is injected. The stale (destroyed) UID must not be claimed."""
     return [
@@ -445,7 +453,7 @@ def test_stale_blade_uid_in_state_does_not_force_blade():
     # the mere presence of a UID.
     FaultProviderRegistry.register_builtins()
     assert FaultProviderRegistry.detect_method(
-        _destroyed_blade_then_native("uid-dead"), is_host=False,
+        _destroyed_blade_then_native("f6071829384950a1"), is_host=False,
     ) == "kubectl_native"
 
 
@@ -456,7 +464,7 @@ def test_later_native_wins_over_earlier_live_blade():
     msgs = [
         AIMessage(content="", tool_calls=[
             {"name": "blade_create", "args": {}, "id": "b1"}]),
-        _blade_ok("uid-live"),
+        _blade_ok("d4e5f60718293849"),
         AIMessage(content="", tool_calls=[
             {"name": "kubectl", "args": {
                 "subcommand": "exec",
@@ -483,7 +491,7 @@ def test_later_live_blade_wins_over_earlier_native():
                     tool_call_id="k1"),
         AIMessage(content="", tool_calls=[
             {"name": "blade_create", "args": {}, "id": "b1"}]),
-        _blade_ok("uid-late"),
+        _blade_ok("e5f6071829384950"),
     ]
     assert FaultProviderRegistry.detect_method(
         msgs, is_host=False,

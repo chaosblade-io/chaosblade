@@ -174,3 +174,77 @@ def with_phase_events(
                 )
             return result
     return wrapped
+
+
+def with_tool_span(node_name: str, tool_node):
+    """Wrap a LangGraph ``ToolNode`` so its execution time lands in ``task_spans``.
+
+    The wall-clock gap this closes: a loop node (``execute_loop`` /
+    ``verifier_loop`` / ``agent_loop``) only *emits* tool calls — its span
+    covers the LLM reasoning. The tools actually RUN in the next graph node,
+    a prebuilt ``ToolNode`` that ``with_phase_events`` never wrapped (it is a
+    ``Runnable``, not a ``(state) -> dict`` coroutine, and it is not a
+    user-facing stepper phase). So every tool execution — including a 60s
+    ``time_wait`` — fell outside all spans, and ``total_duration_ms``
+    (the sum of span durations) systematically undercounted the real wall
+    clock. This wrapper records ONE span per ``ToolNode`` invocation.
+
+    Design choices, each load-bearing:
+
+    * **Aggregate per invocation, not per tool.** A ``ToolNode`` runs the
+      batch's tool calls concurrently; per-tool spans would OVERLAP, and
+      summing them (which the trace preview does for ``total_duration_ms``)
+      would overcount wall time. The batch's own wall time is the correct,
+      non-overlapping contribution.
+    * **``tool_calls`` left empty on this span.** The tool NAMES are already
+      recorded on the loop node's span (collected from the status tracker in
+      ``with_phase_events._end_span``), and ``render_task_trace_preview`` sums
+      ``len(span.tool_calls)`` across spans — populating them here would
+      double-count. This span contributes DURATION only.
+    * **No ``total_tool_calls`` increment.** Same reason: that counter is fed
+      once, in ``with_phase_events._end_span``. ``end_span`` does not touch it.
+    * **No phase events.** ``phase_started``/``phase_completed`` drive the TUI
+      stepper; a tools node is an internal execution detail, not a step.
+    """
+    async def wrapped(state, config=None):
+        task_id = state.get("task_id", "") if isinstance(state, dict) else ""
+        span_ctx = None
+        try:
+            from chaos_agent.persistence.task_identity import is_real_task_id
+            if is_real_task_id(task_id):
+                from chaos_agent.observability.tracer import get_trace
+                trace = await get_trace(task_id)
+                span = trace.start_span(node_name)
+                span_ctx = (trace, span)
+        except Exception:
+            logger.debug("tool span start failed for %s (non-critical)", node_name)
+            span_ctx = None
+
+        async def _end_span(error: str | None = None) -> None:
+            if span_ctx is None:
+                return
+            trace, span = span_ctx
+            try:
+                await trace.end_span(span, error=error)
+                # Persist the summary rollup now (CLI exits right after the
+                # last node) so total_duration_ms reflects the tool time.
+                from chaos_agent.observability.tracer import flush_trace
+                await flush_trace(task_id)
+            except Exception:
+                logger.debug("tool span end failed for %s (non-critical)", node_name)
+
+        try:
+            # Propagate config explicitly when LangGraph hands it to us so
+            # the ToolNode's streaming/callback context is preserved; fall
+            # back to the ambient child-runnable config otherwise.
+            if config is not None:
+                result = await tool_node.ainvoke(state, config)
+            else:
+                result = await tool_node.ainvoke(state)
+        except Exception as e:
+            await _end_span(error=str(e))
+            raise
+        else:
+            await _end_span()
+            return result
+    return wrapped

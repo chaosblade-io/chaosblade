@@ -41,9 +41,8 @@ def get_tools_section(phase: int = 1) -> str:
    FAILED attempt.
 
 ### Parallel Calls
-- You MAY make multiple independent read-only queries in a single turn (e.g., inspect two independent targets simultaneously)
 - "Dependent" means one call's arguments require another call's result — not that the calls are about the same thing. A probe that comes back "not found" is itself a usable answer.
-- Do NOT make dependent calls in parallel
+- Mutation calls stay sequenced by their receipts
 
 ### Avoid Redundancy
 - Do not repeat read-only queries that were just answered in a previous tool result"""
@@ -56,9 +55,7 @@ def get_tools_section(phase: int = 1) -> str:
 3. **Plan, don't execute**: Your output is the input to `confirmation_gate`. Capture the intended injection parameters in your plan (via `save_fault_plan`); the executor (Phase 2) will issue the actual call
 
 ### Parallel Calls
-- You MAY make multiple independent read-only query calls in a single turn (e.g., inspect two independent targets simultaneously)
 - "Dependent" means one call's arguments require another call's result — not that the calls are about the same thing. A probe that comes back "not found" is itself a usable answer.
-- Do NOT make dependent calls in parallel
 
 ### Avoid Redundancy
 - Do not call `activate_skill` more than once in the same Phase 1 session
@@ -139,24 +136,47 @@ def get_execution_directives_section(
         "The plan has been approved.",
         "",
         "### Execution Orchestration",
-        "Treat the approved plan as the current hypothesis, not a script: preserve",
-        "its target and safety constraints, but select each next action from actual",
-        "tool capabilities and accumulated evidence (see Core Principles for how to",
-        "read tool output and avoid unchanged repetition). Use only capabilities",
-        "grounded in runtime evidence and within the approved scope — do not fabricate",
-        "tool interfaces or expand the approved target or safety boundaries. When the",
-        "plan itself needs a different assumption, target, or safety decision, use the",
-        "Replan Mechanism below; when a documented method fails but the approved goal",
-        "remains reachable another way, choosing an equivalent-effect alternative",
-        "within the approved scope is yours to make.",
+        "The approved plan is a contract, not a hypothesis: its commands were",
+        "constructed and validated during planning — execute them as written",
+        "(see Execution Discipline below). Use only capabilities within the",
+        "approved scope — do not fabricate tool interfaces or expand the approved",
+        "target or safety boundaries. When the plan itself needs a different",
+        "assumption, target, or safety decision, use the Replan Mechanism below;",
+        "when a documented method fails but the approved goal remains reachable",
+        "another way, choosing an equivalent-effect alternative within the",
+        "approved scope is yours to make.",
+        "",
+        "### Execution Discipline",
+        "A tool error corrected by the tool's own feedback is a legitimate path,",
+        "not a plan failure; the same method failing twice means replan, not a",
+        "third attempt.",
+    ]
+
+    if plan:
+        # Plan-conditioned discipline clauses (tier1-speedup unit 3): with a
+        # frozen plan, the executor's job is faithful execution, not
+        # re-derivation — the pre-change "current hypothesis, not a script"
+        # wording licensed re-thinking every step from scratch and burned
+        # the first-round reasoning budget on re-deriving already-frozen
+        # commands (task inject-8b757abb: 286s before the first tool call).
+        parts.extend([
+            "Execute the plan's '## Execution Steps' in their written order.",
+            "Before your FIRST mutation step, spend exactly one read-only call to",
+            "confirm the target still exists (skip it when that step is itself",
+            "read-only). Do NOT re-derive command texts, re-evaluate quoting or",
+            "escaping, or reorder steps — the plan froze them.",
+        ])
+
+    parts.extend([
         "",
         "### Multi-Step Execution",
         "The approved mutation steps live in the plan's '## Execution Steps' section.",
         "Run them through tool calls (never prose), using each step's receipt to",
         "decide whether the next step still applies. A step that observes or",
-        "verifies the effect is verification work — skip it. Do not add effect",
-        "observations after an issued step either; a later phase verifies the",
-        "effect, and watching for it here only consumes the fault's active",
+        "verifies the effect is verification work — skip it. A wait or pause",
+        "the plan declares as a step is executed as written, not skipped.",
+        "Do not add effect observations after an issued step either; a later",
+        "phase verifies the effect, and watching for it here only consumes the",
         "window. When the LAST mutation step is issued, state what was issued",
         "and through which path, then STOP — the system owns post-execution",
         "verification and recovery.",
@@ -168,7 +188,7 @@ def get_execution_directives_section(
         "2. User-specified parameters — user intent takes priority over template defaults",
         "3. Pre-defined structured parameters — use as specified unless a tool error proves invalid",
         "4. Skill case template defaults",
-    ]
+    ])
 
     if skill_name:
         parts.append(f"\nActive skill: {skill_name}")

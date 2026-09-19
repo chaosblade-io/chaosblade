@@ -541,6 +541,44 @@ describe("ConfirmContextMessage", () => {
       expect(frame).toContain("/show experiments");
     });
 
+    it("renders the widened-contract entries verbatim (D4 knowing human)", () => {
+      // The CASE manifest legislated writes BEYOND the victim target —
+      // the card must show them verbatim (names list + prefix selector
+      // shapes) with the danger label, because approving authorizes
+      // exactly these cluster writes.
+      const cr = baseContext({
+        node: "confirmation_gate",
+        payload: {
+          skill_name: "k8s-chaos-skills",
+          target: { namespace: "default", names: ["victim-pod"] },
+          plan_summary: "patch coredns",
+          safety_status: "safe",
+          mechanism_writes: [
+            {
+              scope: "configmap",
+              namespace: "kube-system",
+              names: ["coredns"],
+              name_prefix: "",
+              description: "",
+            },
+            {
+              scope: "configmap",
+              namespace: "kube-system",
+              names: [],
+              name_prefix: "drill-nxdomain-",
+              description: "",
+            },
+          ],
+        },
+      });
+      const { lastFrame } = render(<ConfirmContextMessage item={cr} />);
+      const frame = lastFrame() ?? "";
+      expect(frame).toContain("写入集外条目");
+      expect(frame).toContain("configmap/kube-system: coredns");
+      expect(frame).toContain("configmap/kube-system: 'drill-nxdomain-' (prefix)");
+      expect(frame).toContain("批准即授权上述集群写入");
+    });
+
     it("renders 'Attempt N' inside the Execution-plan section when pipeline_attempt > 1", () => {
       const cr = baseContext({
         node: "confirmation_gate",

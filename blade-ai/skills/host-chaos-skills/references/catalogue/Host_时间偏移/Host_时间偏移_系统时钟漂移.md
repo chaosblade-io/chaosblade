@@ -96,4 +96,4 @@ ntpdate pool.ntp.org
 - 时间偏移会影响所有依赖系统时钟的应用（日志、证书、定时器、分布式一致性）
 - 自恢复基于注入前武装的 systemd-run transient timer（到期自动启回时间同步服务并校时）；提前恢复仍用上方手动命令
 - 同名 transient timer 重复武装会报 `Unit blade-restore-ntp.service was already loaded`（上次武装命令执行失败时 unit 以 failed 状态残留所致）；重武装前先清理残留：`systemctl stop blade-restore-ntp.service; systemctl reset-failed blade-restore-ntp.service`（武装命令成功执行过的 unit 无残留，可直接重武装）
-- 恢复后时间是否立即校回取决于偏移量与 chrony.conf `makestep` 阈值（如 `makestep 10 3` 表示仅启动后前 3 次更新中偏差 >10 秒才自动步进）：偏移量 ≤ 阈值时 chronyd 走纯 slew 缓慢修正（实测 +10 秒偏移约 2.5 分钟收敛），时间敏感的恢复验证需预留等待窗口或手动 `date -s` 精确校回；`chronyc makestep` 在 chronyd 刚启动、尚未完成首次测量时执行是 no-op
+- 恢复后时间是否立即校回取决于偏移量与 chrony.conf `makestep` 阈值（如 `makestep 10 3` 表示仅启动后前 3 次更新中偏差 >10 秒才自动步进）：偏移量 ≤ 阈值时 chronyd 走纯 slew 缓慢修正（如 +10 秒偏移约 2.5 分钟收敛），时间敏感的恢复验证需预留等待窗口或手动 `date -s` 精确校回；`chronyc makestep` 在 chronyd 刚启动、尚未完成首次测量时执行是 no-op

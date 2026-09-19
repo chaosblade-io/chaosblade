@@ -241,12 +241,18 @@ class TestKubectlBypassRejection:
 @pytest.mark.asyncio
 class TestTruthfulRejectionReasons:
     async def test_malformed_probe_carries_specific_operator_reason(self):
-        """The exact shape refused in task inject-a9ea4da7 (msg 20)."""
+        """The exact shape refused in task inject-a9ea4da7 (msg 20).
+
+        B46 made `;`/`&&`/`||`-chained all-readonly probes legal, so the
+        operator-refusal carrier here is a BACKGROUND `&` (still refused);
+        the assertion target — the judge's actual cause surviving to the
+        model — is unchanged.
+        """
         msg = _ai("kubectl_read", {
             "subcommand": "exec",
             "v_args": (
                 "pod-x -n ns -- sh -c "
-                "'echo SHELL_OK; command -v stress-ng'"
+                "'df -h & command -v stress-ng'"
             ),
         })
         result = await phase1_screener({"messages": [msg]})

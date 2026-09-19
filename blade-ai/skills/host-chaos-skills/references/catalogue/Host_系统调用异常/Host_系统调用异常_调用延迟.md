@@ -75,7 +75,9 @@ strace -p <pid> -e trace=<syscall> -T
 ```bash
 systemctl stop blade-kill-strace.timer 2>/dev/null
 # 取 strace 自身的 PID 后终止，目标进程随即恢复原速
-pgrep -f strace
+# （-x 按进程名精确匹配；-f 会把携带 strace 字符串的执行 shell 一并匹配，
+#   拿输出去 kill 会误杀执行 shell）
+pgrep -x strace
 kill <strace-pid>
 ```
 

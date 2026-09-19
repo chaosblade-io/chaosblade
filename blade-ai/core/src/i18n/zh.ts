@@ -34,6 +34,13 @@ export const zh: Dict = {
   "loading.responding_label": "回答中",
   "loading.tokens_estimate": "约 {n} tokens",
 
+  // -- FaultWindowIndicator（故障窗口持有期） -------------------------
+  // 持有期是现有 spinner 的连续档：图标与帧率不变，只换文案 —
+  // 从 verify 收尾到持有零视觉跳变；倒计时由组件本地 1Hz 驱动。
+  "fault_window.indicator": "故障窗口进行中",
+  "fault_window.remaining": "剩余 {duration}",
+  "fault_window.keys_hint": "ctrl+r 立即恢复 · esc 退出",
+
   // -- Overflow / 高度约束 -----------------------------------------
   "overflow.more_lines": "（还有 {count} 行被折叠 · Ctrl+O 展开）",
   "overflow.show_more_hint": "Ctrl+O 展开被折叠的内容",
@@ -141,6 +148,7 @@ export const zh: Dict = {
   "recordings.export_failed": "导出 {id} 失败：{err}",
   "recordings.export_unsupported": "当前宿主不支持文件导出",
   "command.replay.desc": "回放任务录像 — 传 task_id 即可（可选 speed 数字或 instant）",
+  "command.resume.desc": "会话恢复：/resume（列表） / /resume <tui_session_id>（重建历史并继续对话）",
   "command.doctor.desc": "查看诊断信息（server / 集群 / 版本 / 语言）",
   "command.retry.desc": "重发上一次自然语言对话（例如流断后恢复）",
 
@@ -402,6 +410,16 @@ export const zh: Dict = {
   "replay.failed": "回放 {id} 失败：{err}",
   "replay.unknown_command": "未知命令：/{name} — 试试 /help",
 
+  "resume.empty": "没有可恢复的会话（memory/tui/ 下无 events.jsonl）",
+  "resume.head": "{n} 个可恢复会话（最近在前）：",
+  "resume.use_hint": "用 **/resume <tui_session_id>** 恢复指定会话并继续对话",
+  "resume.host_unsupported": "当前宿主不支持会话恢复（/resume 仅限 TUI）",
+  "resume.no_events": "会话 {sid} 没有事件文件（events.jsonl），无法恢复——本功能不设降级链",
+  "resume.starting": "正在恢复会话 {sid} — {n} 个事件…",
+  "resume.done": "已恢复 **{sid}**（{events} 个事件 / {duration}）——直接输入即可继续对话",
+  "resume.failed": "恢复 {sid} 失败：{err}",
+  "resume.failed_list": "拉取可恢复会话列表失败：{err}",
+
   "status.session": "会话 ID",
   "status.cluster": "集群",
   "status.namespace": "命名空间",
@@ -423,6 +441,8 @@ export const zh: Dict = {
   "input.placeholder": "输入消息 · /help 查看命令",
   // 流式中替换普通 placeholder：提示 Enter 被锁，但仍允许提前撰写下一条
   "input.placeholder_streaming": "agent 输出中 — Enter 在本轮结束后发送",
+  // 故障窗口持有期：同 enterLocked 语义，但恢复由窗口到点或 ctrl+r 触发
+  "input.placeholder_fault_window": "故障窗口持有中 — Enter 在恢复完成后发送",
 
   // -- AgentMessage 流式截断提示（仅 pending 状态显示，TURN_DONE 后落入
   // <Static>，scrollback 内可见完整文本） ----------------------------------
@@ -536,6 +556,8 @@ export const zh: Dict = {
   "confirm.intent.fault_index": "故障 {n}",
   "confirm.auto_approved": "自动批准",
   "confirm.auto_approved_node": "自动批准：{node}",
+  "confirm.attention.title": "等待确认",
+  "confirm.attention.body": "Blade-AI 正在等待你的批准",
   "confirm.execution.preamble": "请确认执行计划：",
   "confirm.generic.preamble": "请确认：",
 
@@ -584,6 +606,10 @@ export const zh: Dict = {
   "confirm.plan_saved": "已保存（{path}）· /show plan 查看",
   "confirm.field.conflicts": "冲突实验",
   "confirm.conflicts.hint": "/show experiments 查看详情",
+  // 写入集外条目（CASE 清单立法的 widened 契约）：批准即授权这些
+  // 集群写入，所以必须在按钮之前被读到——danger 级，非 warning。
+  "confirm.field.mechanism_writes": "写入集外条目",
+  "confirm.mechanism_writes.hint": "批准即授权上述集群写入",
   // 故障参数 / 目标健康两个 section 即使"没异常"也要常驻——
   // section 标题本身代表"我们查过了"，留个空值比直接隐藏更诚实
   //（否则用户可能以为 agent 没检查）。
@@ -679,11 +705,17 @@ export const zh: Dict = {
   // -- 启动屏：未完成任务卡片 ----------------------------------------
   "boot.pending.title": "未完成任务",
   "boot.pending.empty": "没有未执行完的任务",
+  // Round-32b：负债存活行的三组划分 —— 行自己声称什么（生命周期词）
+  // 对账本说什么。
+  "boot.pending.group_in_flight": "在途",
+  "boot.pending.group_needs_recovery": "待恢复",
+  "boot.pending.group_uncleared": "已完成未清算",
 
   // -- 启动屏：进度提示文案（伴随 spinner） ---------------------------
   "boot.progress.spawning": "正在启动 blade-ai 后端...",
   "boot.progress.health": "等待后端就绪...",
   "boot.progress.session": "正在创建会话...",
+  "boot.progress.resuming": "正在恢复会话...",
   "boot.progress.preflight": "正在自检环境...",
   "boot.progress.tasks": "正在检查未完成任务...",
 

@@ -17,7 +17,7 @@ def inject_command(
     action: Optional[str] = typer.Option(None, "--action", help="ChaosBlade action: fullload/delay/loss/fill/kill/..."),
     target_name: Optional[str] = typer.Option(None, "--target-name", "-n", help="Resource name(s)"),
     namespace: Optional[str] = typer.Option(None, "--namespace", "--ns", help="K8s namespace"),
-    duration: int = typer.Option(600, "--duration", "-d", help="Duration in seconds"),
+    duration: Optional[int] = typer.Option(None, "--duration", "-d", help="Duration in seconds (omit in -i mode to let the agent extract it from the description)"),
     params: Optional[str] = typer.Option(None, "--params", "-p", help="Key=value params and boolean flags"),
     confirm: bool = typer.Option(False, "--confirm", help="Require confirmation"),
     labels: Optional[str] = typer.Option(None, "--labels", "-l", help="Custom labels"),
@@ -33,25 +33,29 @@ def inject_command(
     Provide either --input/-i for natural language mode, or all structured params
     (--scope, --target, --action, --target-name, --namespace).
     """
-    # Duration auto-boost: ensure minimum duration for reliable verification
-    # This is the TOP layer of the three-layer duration guarantee.
+    # Duration pre-fill: the TOP layer of the three-layer duration guarantee.
+    # Structured mode only: in -i NL mode an unset duration must reach the
+    # intent node as 0 so the value stated in natural language is extracted
+    # there — a hardcoded CLI default would masquerade as a user-pinned
+    # hard-pin and contradict the description (observed: "持续 300 秒"
+    # intent arriving as duration_seconds=600).
     if scope and target and action:
+        if duration is None:
+            duration = 300
         from chaos_agent.utils.fault_type import ensure_min_duration
         effective = ensure_min_duration(duration, scope, target, action)
         if effective != duration:
-            if duration == 0:
-                typer.echo(
-                    f"No --duration specified. Auto-setting to {effective}s "
-                    f"for {scope}-{target}-{action} (ensures verification window).",
-                    err=True,
-                )
-            else:
-                typer.echo(
-                    f"Warning: --duration {duration}s is below the recommended minimum "
-                    f"for {scope}-{target}-{action} ({effective}s). "
-                    f"Auto-adjusting for reliable verification.",
-                    err=True,
-                )
+            # Reachable only for a non-positive --duration (treated as
+            # unspecified): ensure_min_duration injects the recommended
+            # default. Explicit positive values pass through verbatim
+            # (l4-contract-faithfulness) — a below-floor request is
+            # honoured as-is with a warning inside ensure_min_duration,
+            # so it never lands here.
+            typer.echo(
+                f"No --duration specified. Auto-setting to {effective}s "
+                f"for {scope}-{target}-{action} (ensures verification window).",
+                err=True,
+            )
             duration = effective
     # Validate: NL mode or structured mode, not both missing
     has_input = bool(input)
@@ -112,6 +116,9 @@ def inject_command(
                 k, v = pair.split("=", 1)
                 labels_dict[k.strip()] = v.strip()
 
+    # NL mode without explicit -d: pass None through — from_cli_nl coerces
+    # it to 0 (system-recommended channel), letting the intent node honour
+    # the duration stated in the natural language description.
     request_data = {
         "scope": scope,
         "target": target,
@@ -140,9 +147,29 @@ def inject_command(
             # Streaming mode: print events in real-time
             final_result = None
 
-            async def _confirm_cb(plan_summary: str) -> str:
-                """Interactive confirmation callback for streaming mode."""
-                typer.echo(f"\nPlan Summary:\n{plan_summary}\n", err=True)
+            async def _confirm_cb(confirm_payload) -> str:
+                """Interactive confirmation callback for streaming mode.
+
+                Receives the gate's interrupt payload (dict) — or a bare
+                plan-summary string on legacy paths — and renders the
+                widened-contract manifest entries verbatim when present,
+                so the human approves what the CASE legislated, not just
+                the plan prose.
+                """
+                from chaos_agent.agent.target_guard.mechanism_writes import (
+                    format_mechanism_writes_for_display,
+                )
+                if isinstance(confirm_payload, dict):
+                    summary = confirm_payload.get("plan_summary", "")
+                    entries_block = format_mechanism_writes_for_display(
+                        confirm_payload.get("mechanism_writes") or [],
+                    )
+                else:
+                    summary = str(confirm_payload or "")
+                    entries_block = ""
+                typer.echo(f"\nPlan Summary:\n{summary}\n", err=True)
+                if entries_block:
+                    typer.echo(f"{entries_block}\n", err=True)
                 approved = typer.confirm("Approve this injection?", default=False)
                 return "approved" if approved else "rejected"
 

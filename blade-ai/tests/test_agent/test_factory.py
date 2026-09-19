@@ -72,6 +72,55 @@ class TestBuildSkillTools:
         execute_tool = next(t for t in tools if t.name == "execute_skill_script")
         assert "{_scripts_catalog}" not in execute_tool.description
 
+    def test_save_fault_plan_docstring_matches_router_semantics(self, mock_registry):
+        """save_fault_plan docstring must teach the router's actual exit rule.
+
+        route_after_phase1_tools treats finish_planning (or
+        propose_plan_change) as the ONLY Phase 1 exit signals — a saved
+        plan alone keeps the loop going. The legacy "your next message
+        should be final summary text WITHOUT tool_calls — the system
+        advances to Phase 2" wording described a transition that never
+        happens on save and steered the model into a text-only stall the
+        loop hint then has to bounce.
+        """
+        tools = _build_skill_tools(mock_registry)
+        save_tool = next(t for t in tools if t.name == "save_fault_plan")
+        assert "persists the draft" in save_tool.description
+        assert "finish_planning" in save_tool.description
+        assert "advances to Phase 2" not in save_tool.description
+
+    def test_finish_planning_docstring_claims_no_floor_raise(self, mock_registry):
+        """finish_planning duration teaching must not claim floor-raising.
+
+        inject-aac02265 (#35 round audit): the docstring taught "values
+        below the safety floor (600s) are raised to the floor" — false on
+        both counts (ensure_min_duration honours declared values
+        verbatim; the floor is 300s and applies only to the unspecified
+        default path). The purge directive: no LLM-facing surface may
+        teach raise-the-floor semantics.
+        """
+        tools = _build_skill_tools(mock_registry)
+        finish_tool = next(t for t in tools if t.name == "finish_planning")
+        assert "raised to the floor" not in finish_tool.description
+        assert "safety floor" not in finish_tool.description
+        assert "Default 0 = not declared" in finish_tool.description
+
+    def test_finish_planning_declares_fault_identity_triple(self, mock_registry):
+        """B83/B84 (#49 post-mortem): finish_planning carries the fault-identity
+        declaration surface.
+
+        The planner is the only actor that knows which mechanism the plan
+        chose; the declaration (fault_scope / fault_target / fault_action)
+        hands that knowledge to the spec-resolution node, which never
+        rewrites a reviewed identity from it — a conflict is routed back as
+        a split with propose_plan_change as the revision exit.
+        """
+        tools = _build_skill_tools(mock_registry)
+        finish_tool = next(t for t in tools if t.name == "finish_planning")
+        assert {"fault_scope", "fault_target", "fault_action"} <= set(finish_tool.args)
+        assert "MAIN injection mechanism" in finish_tool.description
+        assert "propose_plan_change" in finish_tool.description
+
 
 class TestCreateAgent:
     """Tests for create_agent.
@@ -508,8 +557,13 @@ class TestPhaseSpecMatrix:
     # first, then the provider union in registry order.
     _BASELINE = {
         "clarification": [
-            "activate_skill", "read_skill_resource", "submit_fault_intent",
+            "activate_skill", "read_skill_resource", "read_knowledge_resource",
+            "submit_fault_intent",
             "submit_batch_intent", "query_active_experiments", "recover_task",
+            # Intent-time fact recording (tier1-speedup): update_progress lets
+            # the model log probe-established facts during clarification; the
+            # ledger re-injection chain carries them to the planner.
+            "update_progress",
             "blade_help", "blade_status", "kubectl_read", "host_read",
         ],
         "phase1": [
@@ -521,6 +575,9 @@ class TestPhaseSpecMatrix:
         "phase2": [
             "execute_skill_script", "read_knowledge_resource", "time_wait",
             "request_replan", "update_progress",
+            # #39 tail-tension root fix: the clean terminal exit for a
+            # finished execution (see test_finish_execution.py).
+            "finish_execution",
             "blade_create", "blade_destroy", "blade_help", "blade_status",
             "blade_query_k8s", "kubectl", "host_inject",
             "blade_python_create", "blade_python_prepare", "blade_python_revoke",

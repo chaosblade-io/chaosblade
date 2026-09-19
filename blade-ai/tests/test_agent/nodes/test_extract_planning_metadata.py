@@ -12,7 +12,6 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
     _extract_skill_case_from_messages,
     _derive_scope_target_action,
-    _derive_scope_from_resource_path,
     _extract_plan_verification_slices,
     _find_saved_plan,
     _has_browsed_catalogue,
@@ -226,79 +225,28 @@ class TestDeriveScopeTargetAction:
         assert action == "burn"
 
 
-# ── _derive_scope_from_resource_path ──
-
-
-class TestDeriveScopeFromResourcePath:
-
-    def test_pod_directory(self):
-        """Pod_磁盘IO过高 path → scope=pod."""
-        messages = [
-            _make_ai_msg_with_read_skill(
-                "references/catalogue/Pod_磁盘IO过高/Pod_磁盘IO过高_异常IO占用.md",
-            ),
-        ]
-        scope = _derive_scope_from_resource_path(messages)
-        assert scope == "pod"
-
-    def test_node_directory(self):
-        """Node_CPU使用率过高 path → scope=node."""
-        messages = [
-            _make_ai_msg_with_read_skill(
-                "references/catalogue/Node_CPU使用率过高/Node_CPU使用率过高_异常占用.md",
-            ),
-        ]
-        scope = _derive_scope_from_resource_path(messages)
-        assert scope == "node"
-
-    def test_daemonset_directory(self):
-        """DaemonSet_未完全调度 path → scope=pod (mapped)."""
-        messages = [
-            _make_ai_msg_with_read_skill(
-                "references/catalogue/DaemonSet_未完全调度/DaemonSet_未完全调度_调度受限.md",
-            ),
-        ]
-        scope = _derive_scope_from_resource_path(messages)
-        assert scope == "pod"
-
-    def test_node_container_runtime_disk(self):
-        """节点容器运行时 disk path → scope=node."""
-        messages = [
-            _make_ai_msg_with_read_skill(
-                "references/catalogue/节点容器运行时磁盘使用率过高/节点容器运行时磁盘使用率过高_日志堆积.md",
-            ),
-        ]
-        scope = _derive_scope_from_resource_path(messages)
-        assert scope == "node"
-
-    def test_no_read_skill_resource_call(self):
-        """No read_skill_resource call → empty scope."""
-        messages = [
-            AIMessage(content="I will proceed", tool_calls=[]),
-        ]
-        scope = _derive_scope_from_resource_path(messages)
-        assert scope == ""
-
-    def test_prefers_last_call(self):
-        """Multiple read_skill_resource calls → last one wins."""
-        messages = [
-            _make_ai_msg_with_read_skill(
-                "references/catalogue/Pod_磁盘IO过高/Pod_磁盘IO过高_异常IO占用.md",
-                tool_call_id="tc_1",
-            ),
-            _make_ai_msg_with_read_skill(
-                "references/catalogue/Node_CPU使用率过高/Node_CPU使用率过高_异常占用.md",
-                tool_call_id="tc_2",
-            ),
-        ]
-        scope = _derive_scope_from_resource_path(messages)
-        assert scope == "node"
+# Retired with B83: the resource-path directory-prefix scope derivation
+# (_derive_scope_from_resource_path + _DIR_PREFIX_SCOPE_MAP) was deleted —
+# symptom-level directory names are exactly the "unaware source" the
+# declaration contract replaced (see TestFinishPlanningFaultIdentityDeclaration).
 
 
 # ── extract_planning_metadata (full node) ──
 
 
 class TestExtractPlanningMetadataNode:
+
+    @pytest.fixture(autouse=True)
+    def _isolate_experiment_timeout(self):
+        # Pin the operator default to the code floor so the B14 backfill
+        # floor assertion does not depend on the host machine's
+        # ~/.blade-ai/config.json (a stale experiment_timeout there wins
+        # the unspecified-duration path via max(configured, floor)).
+        from chaos_agent.config.settings import blade_ai_context
+        from chaos_agent.utils.fault_type import _DEFAULT_MIN_DURATION
+
+        with blade_ai_context(experiment_timeout=_DEFAULT_MIN_DURATION):
+            yield
 
     @pytest.mark.asyncio
     async def test_nl_mode_full_extraction(self):
@@ -328,7 +276,15 @@ class TestExtractPlanningMetadataNode:
 
     @pytest.mark.asyncio
     async def test_direct_mode_not_affected(self):
-        """Direct mode: State already has values → node returns empty dict."""
+        """Direct mode: State already has values → no re-derivation.
+
+        The one write the node still performs is the B14 duration
+        contract backfill: a spec materialised from legacy scattered
+        fields carries no duration, so it lands on the safety floor.
+        Everything the State already had stays untouched. Modern direct
+        entries (from_cli_structured / from_intent_args) pre-fill the
+        duration at construction, so for them the node stays a no-op.
+        """
         state = AgentState(
             task_id="test-task",
             skill_case_content="already loaded",
@@ -338,7 +294,17 @@ class TestExtractPlanningMetadataNode:
             messages=[],
         )
         result = await extract_planning_metadata(state)
-        assert result == {}
+        # No re-extraction of what the State already has.
+        assert "skill_case_content" not in result
+        # Duration contract backfilled onto the floor (B14); the
+        # already-populated identity fields pass through untouched.
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+        spec = read_fault_spec({**state, **result})
+        assert spec is not None
+        assert spec.duration_seconds == 300
+        assert (spec.scope, spec.fault_target, spec.fault_action) == (
+            "pod", "cpu", "fullload",
+        )
 
     @pytest.mark.asyncio
     async def test_partial_state_skill_case_only(self):
@@ -440,6 +406,100 @@ class TestExtractPlanningMetadataNode:
 # ---------------------------------------------------------------------------
 # _has_browsed_catalogue — catalogue browse detection
 # ---------------------------------------------------------------------------
+
+
+# ── B76 ② (rewritten for the B83 declaration contract): a scope change
+# from the planner's declaration clears BOTH old-scope fields ──
+
+
+@pytest.mark.asyncio
+async def test_declaration_scope_change_clears_stale_labels_along_with_names():
+    """B76 regression, carried into the declaration contract: a label
+    selector locked under the OLD scope is exactly as kind-inconsistent as
+    a name. The planner's declaration rewrites an INCOMPLETE identity
+    (the lazy probe-derived scope below), and a scope change clears names
+    AND labels with it — the r4 run froze scope=node + a Pod label into an
+    unexecutable contract the guard rejected in every addressing form."""
+    from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
+
+    spec = FaultSpec(
+        scope="pod",
+        namespace="default",
+        labels={"app": "drill-nodedown-target"},
+        names=("stale-pod",),
+        source="cli_nl",
+        user_description="模拟节点宕机（lazy derivation 中间态重现）",
+    )
+    state = AgentState(
+        task_id="t-b76",
+        messages=[
+            AIMessage(content="", tool_calls=[{
+                "name": "finish_planning", "id": "fp1", "type": "tool_call",
+                "args": {
+                    "summary": "node network loss",
+                    "fault_scope": "node",
+                    "fault_target": "network",
+                    "fault_action": "loss",
+                },
+            }]),
+            ToolMessage(
+                content="Planning finalized. Summary: node network loss",
+                tool_call_id="fp1", name="finish_planning",
+            ),
+        ],
+        skill_case_content=SAMPLE_SKILL_CASE,
+        fault_spec=spec.to_dict(),
+    )
+    result = await extract_planning_metadata(state)
+    new_spec = read_fault_spec({**state, **result})
+    assert new_spec is not None
+    assert new_spec.scope == "node"
+    assert new_spec.fault_target == "network"
+    assert new_spec.fault_action == "loss"
+    assert new_spec.names == ()
+    assert new_spec.labels == {}
+
+
+@pytest.mark.asyncio
+async def test_declaration_same_scope_keeps_labels():
+    """Same-scope declaration is a fill-in for the missing fields, not an
+    override: labels survive."""
+    from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
+
+    spec = FaultSpec(
+        scope="pod",
+        namespace="default",
+        labels={"app": "keep-me"},
+        source="cli_nl",
+        user_description="pod CPU 满载",
+    )
+    state = AgentState(
+        task_id="t-b76b",
+        messages=[
+            AIMessage(content="", tool_calls=[{
+                "name": "finish_planning", "id": "fp1", "type": "tool_call",
+                "args": {
+                    "summary": "pod cpu fullload",
+                    "fault_scope": "pod",
+                    "fault_target": "cpu",
+                    "fault_action": "fullload",
+                },
+            }]),
+            ToolMessage(
+                content="Planning finalized. Summary: pod cpu fullload",
+                tool_call_id="fp1", name="finish_planning",
+            ),
+        ],
+        skill_case_content=SAMPLE_SKILL_CASE,
+        fault_spec=spec.to_dict(),
+    )
+    result = await extract_planning_metadata(state)
+    new_spec = read_fault_spec({**state, **result})
+    assert new_spec is not None
+    assert new_spec.scope == "pod"
+    assert new_spec.fault_target == "cpu"
+    assert new_spec.fault_action == "fullload"
+    assert new_spec.labels == {"app": "keep-me"}
 
 
 class TestHasBrowsedCatalogue:
@@ -695,3 +755,587 @@ class TestSavedPlanHydration:
         # No verification sections → empty (simple prose plan).
         assert _extract_plan_verification_slices("just a summary") == ""
         assert _extract_plan_verification_slices("") == ""
+
+
+# ---------------------------------------------------------------------------
+# B83/B84 (#49 post-mortem): finish_planning fault-identity declaration
+#
+# The planner is the only actor that knows which mechanism the plan chose.
+# The declaration (fault_scope / fault_target / fault_action on
+# finish_planning) hands that knowledge to the spec-resolution node.
+# The skill-case document is a MENU (main path + backup means); its first
+# blade command is not the chosen mechanism — #49's case doc carried a
+# kubectl-native main path plus a ``node-disk burn`` backup, and the old
+# AUTHORITATIVE regex hijacked the spec from pod to node.
+# ---------------------------------------------------------------------------
+
+# A #49-shaped menu: kubectl-native main path + blade backup means.
+_HIJACK_STYLE_CASE = """**用例名称** Volume卸载失败 导致 Pod_Terminating
+
+**故障现象**：
+1. Pod 删除后卡在 Terminating
+
+**演练步骤**（主路径）：
+1. kubectl exec 进入目标 Pod，执行 timeout 300 tail -f 占用挂载卷文件句柄
+2. kubectl delete pod 触发 Terminating
+
+**备选手段**：
+1. blade create k8s node-disk burn --names <节点名> --path <volume挂载路径> --read --write --timeout 600
+
+**注入验证**：
+1. kubectl get pod 确认 Terminating
+
+**恢复验证**：
+1. 确认句柄释放后 Pod 完成 Termination
+"""
+
+# A case with NO blade command anywhere (kubectl-native only).
+_WEAK_CASE_NO_BLADE = """**故障现象**：Pod Pending
+
+**注入验证**：
+1. kubectl get pods 查看
+
+**恢复验证**：
+1. 确认 Pod Running
+"""
+
+
+def _make_finish_call(declared: dict | None = None, **extra_args) -> AIMessage:
+    """AI message carrying a finish_planning tool call (optional identity)."""
+    args: dict = {"summary": "Plan finalized", "duration_seconds": 600}
+    if declared:
+        args.update(declared)
+    args.update(extra_args)
+    return AIMessage(content="", tool_calls=[{
+        "name": "finish_planning", "id": "fp1", "type": "tool_call", "args": args,
+    }])
+
+
+def _make_finish_tm(content: str = "Planning finalized. Summary: Plan finalized") -> ToolMessage:
+    return ToolMessage(content=content, tool_call_id="fp1", name="finish_planning")
+
+
+def _cli_nl_spec(**kwargs):
+    from chaos_agent.agent.spec.fault_spec import FaultSpec
+
+    return FaultSpec(
+        source="cli_nl",
+        user_description="注入 Volume卸载失败导致 Pod Terminating",
+        **kwargs,
+    )
+
+
+class TestFinishPlanningFaultIdentityDeclaration:
+    """Node-level behaviour of the declaration-driven identity resolution."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_experiment_timeout(self):
+        # Same isolation as TestExtractPlanningMetadataNode: the duration
+        # backfill floor must not depend on the host's config.json.
+        from chaos_agent.config.settings import blade_ai_context
+        from chaos_agent.utils.fault_type import _DEFAULT_MIN_DURATION
+
+        with blade_ai_context(experiment_timeout=_DEFAULT_MIN_DURATION):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_declaration_fills_empty_triple_cli_nl(self):
+        """B83 primary path: the declaration is the identity source in CLI NL.
+
+        The case menu carries a ``node-disk burn`` backup; the declared
+        triple (pod/process — the fd-hold mechanism family) must win and
+        the backup must land nowhere in the spec.
+        """
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = AgentState(
+            task_id="t-b83a",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=_cli_nl_spec().to_dict(),
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        new_spec = read_fault_spec({**state, **result})
+        assert new_spec is not None
+        assert new_spec.scope == "pod"
+        assert new_spec.fault_target == "process"
+        assert new_spec.fault_action == "hold"
+
+    @pytest.mark.asyncio
+    async def test_case_doc_blade_command_no_longer_derives_identity(self):
+        """B83 hijack killed: no declaration → the case-menu blade command
+        must NOT be copied into the spec; the planner is nudged once to
+        declare instead of the system silently inventing an identity."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = AgentState(
+            task_id="t-b83b",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=_cli_nl_spec().to_dict(),
+            messages=[
+                _make_finish_call(),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+        assert result.get("_identity_declaration_nudged") is True
+        assert any("fault_scope" in m.content for m in result.get("messages", []))
+        # The hijack shape: node/disk/burn must land nowhere.
+        assert "fault_spec" not in result
+        merged = read_fault_spec({**state, **{k: v for k, v in result.items() if k != "messages"}})
+        assert merged is not None
+        assert merged.fault_target != "disk"
+        assert merged.scope != "node"
+
+    @pytest.mark.asyncio
+    async def test_plan_execution_steps_blade_command_is_derivation_source(self):
+        """Fallback tier: no declaration → the blade pattern in the plan's
+        Execution Steps (the LLM's actual plan, not the case menu) derives
+        the identity."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = AgentState(
+            task_id="t-b83c",
+            skill_case_content=_WEAK_CASE_NO_BLADE,
+            fault_spec=_cli_nl_spec().to_dict(),
+            plan=(
+                "## Task Summary\nCPU fullload drill\n\n"
+                "## Execution Steps\n"
+                "1. blade create k8s pod-cpu fullload --names target --timeout 600\n\n"
+                "## Verification Methods\n- kubectl top pod\n"
+            ),
+            messages=[
+                _make_finish_call(),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        new_spec = read_fault_spec({**state, **result})
+        assert new_spec is not None
+        assert new_spec.scope == "pod"
+        assert new_spec.fault_target == "cpu"
+        assert new_spec.fault_action == "fullload"
+
+    @pytest.mark.asyncio
+    async def test_declaration_conflict_with_reviewed_identity_is_split_nudge(self):
+        """B84: the declaration never rewrites a reviewed identity — a
+        conflict is routed back once as a split (align or propose_plan_change)."""
+        from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
+
+        reviewed = FaultSpec(
+            scope="node",
+            fault_target="disk",
+            fault_action="burn",
+            names=("node-1",),
+            namespace="default",
+            source="tui",
+            user_description="node disk burn",
+            duration_seconds=600,
+        )
+        state = AgentState(
+            task_id="t-b84a",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=reviewed.to_dict(),
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+        assert result.get("_identity_split_nudged") is True
+        msg_text = " ".join(m.content for m in result.get("messages", []))
+        assert "propose_plan_change" in msg_text
+        assert "conflicts" in msg_text
+        # Reviewed identity is untouched — no frozen franken-contract.
+        assert "fault_spec" not in result
+        merged = read_fault_spec({**state, **{k: v for k, v in result.items() if k != "messages"}})
+        assert merged is not None
+        assert (merged.scope, merged.fault_target, merged.fault_action) == (
+            "node", "disk", "burn",
+        )
+
+    @pytest.mark.asyncio
+    async def test_split_nudge_fires_once_then_proceeds(self):
+        """After one nudge the reviewed identity stands; the conflicting
+        declaration is discarded (the guard stays the final arbiter)."""
+        from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
+
+        reviewed = FaultSpec(
+            scope="node",
+            fault_target="disk",
+            fault_action="burn",
+            names=("node-1",),
+            namespace="default",
+            source="tui",
+            user_description="node disk burn",
+            duration_seconds=600,
+        )
+        state = AgentState(
+            task_id="t-b84b",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=reviewed.to_dict(),
+            _identity_split_nudged=True,
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        merged = read_fault_spec({**state, **{k: v for k, v in result.items() if k != "messages"}})
+        assert merged is not None
+        assert (merged.scope, merged.fault_target, merged.fault_action) == (
+            "node", "disk", "burn",
+        )
+
+    @pytest.mark.asyncio
+    async def test_declaration_matching_reviewed_identity_proceeds_silently(self):
+        """A declaration consistent with the reviewed identity is a no-op
+        cross-check — no nudge, no rewrite."""
+        from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
+
+        reviewed = FaultSpec(
+            scope="pod",
+            fault_target="disk",
+            fault_action="fill",
+            names=("target",),
+            namespace="default",
+            source="cli_structured",
+            user_description="pod disk fill",
+            duration_seconds=600,
+        )
+        state = AgentState(
+            task_id="t-b84c",
+            skill_case_content=SAMPLE_SKILL_CASE,
+            fault_spec=reviewed.to_dict(),
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "disk",
+                    "fault_action": "fill",
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        merged = read_fault_spec({**state, **{k: v for k, v in result.items() if k != "messages"}})
+        assert merged is not None
+        assert (merged.scope, merged.fault_target, merged.fault_action) == (
+            "pod", "disk", "fill",
+        )
+
+    @pytest.mark.asyncio
+    async def test_declaration_fills_only_missing_fields(self):
+        """Fill-vacuum per field: a lazy scope (with names/labels) survives
+        a same-scope declaration; only the missing target/action are filled."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = AgentState(
+            task_id="t-b83d",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=_cli_nl_spec(
+                scope="pod",
+                namespace="default",
+                names=("drill-sts-pvc-target",),
+                labels={"app": "keep-me"},
+            ).to_dict(),
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        new_spec = read_fault_spec({**state, **result})
+        assert new_spec is not None
+        assert new_spec.fault_target == "process"
+        assert new_spec.fault_action == "hold"
+        assert new_spec.scope == "pod"
+        assert new_spec.names == ("drill-sts-pvc-target",)
+        assert new_spec.labels == {"app": "keep-me"}
+
+    @pytest.mark.asyncio
+    async def test_declaration_nudge_fires_once_then_proceeds(self):
+        """Still-unresolved identity after one declaration nudge → proceed
+        without inventing one (safety_check gates an empty scope honestly)."""
+        from chaos_agent.agent.spec.fault_spec import read_fault_spec
+
+        state = AgentState(
+            task_id="t-b83e",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=_cli_nl_spec().to_dict(),
+            _identity_declaration_nudged=True,
+            messages=[
+                _make_finish_call(),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        merged = read_fault_spec({**state, **{k: v for k, v in result.items() if k != "messages"}})
+        assert merged is not None
+        # Nothing was invented from the case menu.
+        assert merged.fault_target == ""
+        assert merged.scope == ""
+
+    @pytest.mark.asyncio
+    async def test_split_nudge_resets_plan_family_for_round_two(self):
+        """F1 (cascade review of the B83/B84 fix): both identity nudges
+        fire AFTER a finalised round wrote the plan family into State —
+        the first nudge family with that property (the catalogue nudge
+        fires on the rejection round, before any write). Round 2 must
+        land its OWN plan: the round-1 plan attacked the identity the
+        nudge is rejecting. The nudge result therefore resets the plan
+        family so the write-once guards re-open (same seam as
+        plan_change_confirm's approved branch)."""
+        from chaos_agent.agent.spec.fault_spec import FaultSpec
+
+        reviewed = FaultSpec(
+            scope="node",
+            fault_target="disk",
+            fault_action="burn",
+            names=("node-1",),
+            namespace="default",
+            source="tui",
+            user_description="node disk burn",
+            duration_seconds=600,
+        )
+        state = AgentState(
+            task_id="t-f1a",
+            skill_case_content=_HIJACK_STYLE_CASE,
+            fault_spec=reviewed.to_dict(),
+            plan="## Task Summary\nR1 old plan (attacked the wrong identity)",
+            plan_summary="R1 old summary",
+            plan_verification="## Verification Methods\nR1 old",
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+        assert result.get("_identity_split_nudged") is True
+        # Plan-family reset: round 2's write-once guards must re-open.
+        for key in ("plan", "plan_summary", "plan_verification",
+                    "plan_path", "skill_case_content"):
+            assert result.get(key, "MISSING") is None, key
+        assert result.get("is_complex", "MISSING") is False
+
+    @pytest.mark.asyncio
+    async def test_declaration_nudge_resets_plan_family_for_round_two(self):
+        """F1: the declaration nudge carries the same plan-family reset —
+        its round 2 must also land its own plan (a re-finalised
+        kubectl-native plan carrying an explicit declaration)."""
+        state = AgentState(
+            task_id="t-f1b",
+            skill_case_content=_WEAK_CASE_NO_BLADE,
+            fault_spec=_cli_nl_spec().to_dict(),
+            plan="## Execution Steps\n1. kubectl delete pod target",
+            plan_summary="R1 old summary",
+            messages=[
+                _make_finish_call(),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is True
+        assert result.get("_identity_declaration_nudged") is True
+        for key in ("plan", "plan_summary", "plan_verification",
+                    "plan_path", "skill_case_content"):
+            assert result.get(key, "MISSING") is None, key
+        assert result.get("is_complex", "MISSING") is False
+
+    @pytest.mark.asyncio
+    async def test_split_nudge_round_two_lands_new_plan(self):
+        """F1 end-to-end over the nudge seam: after the split nudge routes
+        back and the LLM re-finalises with a matching declaration, the
+        round-2 plan must REPLACE the round-1 plan in State. Without the
+        reset the write-once guards keep the round-1 plan — the one that
+        attacked the wrong identity — feeding Phase 2."""
+        from chaos_agent.agent.spec.fault_spec import FaultSpec, read_fault_spec
+
+        reviewed = FaultSpec(
+            scope="node",
+            fault_target="disk",
+            fault_action="burn",
+            names=("node-1",),
+            namespace="default",
+            source="tui",
+            user_description="node disk burn",
+            duration_seconds=600,
+        )
+        read_call = AIMessage(content="", tool_calls=[{
+            "name": "read_skill_resource", "id": "rs1", "type": "tool_call",
+            "args": {"resource_path": "references/catalogue/Pod_Terminating/x.md"},
+        }])
+        read_tm = ToolMessage(content=_HIJACK_STYLE_CASE, tool_call_id="rs1",
+                              name="read_skill_resource")
+        state = AgentState(
+            task_id="t-f1c",
+            fault_spec=reviewed.to_dict(),
+            plan="## Task Summary\nR1 old plan",
+            plan_summary="R1 old plan",
+            plan_verification="## Verification Methods\nR1 old",
+            messages=[
+                read_call,
+                read_tm,
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "process",
+                    "fault_action": "hold",
+                }),
+                _make_finish_tm("Planning finalized. Summary: R1 old plan"),
+            ],
+        )
+        result1 = await extract_planning_metadata(state)
+        assert result1.get("planning_rejected") is True
+
+        # LangGraph merge of the nudged round + round-2 re-entry: the LLM
+        # re-finalises with a declaration matching the reviewed identity.
+        merged_state = {
+            **state,
+            **{k: v for k, v in result1.items() if k != "messages"},
+            "messages": [
+                *state["messages"],
+                *result1["messages"],
+                _make_finish_call({
+                    "fault_scope": "node",
+                    "fault_target": "disk",
+                    "fault_action": "burn",
+                }),
+                _make_finish_tm("Planning finalized. Summary: R2 corrected plan"),
+            ],
+        }
+        result2 = await extract_planning_metadata(merged_state)
+        assert result2.get("planning_rejected") is not True
+        assert result2.get("plan", "MISSING") == "R2 corrected plan"
+        assert result2.get("plan_summary", "MISSING") == "R2 corrected plan"
+        merged_spec = read_fault_spec({**merged_state, **{
+            k: v for k, v in result2.items() if k != "messages"
+        }})
+        assert merged_spec is not None
+        assert (merged_spec.scope, merged_spec.fault_target,
+                merged_spec.fault_action) == ("node", "disk", "burn")
+
+    @pytest.mark.asyncio
+    async def test_no_nudge_round_keeps_write_once_semantics(self):
+        """Guard rail: the plan-family reset is nudge-only — a plain
+        re-entry with a matching declaration keeps write-once semantics
+        (an already-written plan is NOT cleared or rewritten)."""
+        from chaos_agent.agent.spec.fault_spec import FaultSpec
+
+        reviewed = FaultSpec(
+            scope="pod",
+            fault_target="disk",
+            fault_action="fill",
+            names=("target",),
+            namespace="default",
+            source="cli_structured",
+            user_description="pod disk fill",
+            duration_seconds=600,
+        )
+        state = AgentState(
+            task_id="t-f1d",
+            skill_case_content=SAMPLE_SKILL_CASE,
+            fault_spec=reviewed.to_dict(),
+            plan="## Task Summary\nsettled plan",
+            plan_summary="settled",
+            plan_verification="## Verification Methods\nsettled",
+            messages=[
+                _make_finish_call({
+                    "fault_scope": "pod",
+                    "fault_target": "disk",
+                    "fault_action": "fill",
+                }),
+                _make_finish_tm(),
+            ],
+        )
+        result = await extract_planning_metadata(state)
+        assert result.get("planning_rejected") is not True
+        assert "plan" not in result
+        assert "plan_summary" not in result
+        assert "plan_verification" not in result
+
+
+class TestExtractPlanningFaultIdentityHelper:
+    """Unit behaviour of the declaration reader."""
+
+    def test_reads_last_finish_planning_declaration(self):
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _extract_planning_fault_identity,
+        )
+
+        msgs = [
+            _make_finish_call({"fault_scope": "node", "fault_target": "disk",
+                               "fault_action": "burn"}),
+            _make_finish_call({"fault_scope": "pod", "fault_target": "process",
+                               "fault_action": "hold"}),
+        ]
+        assert _extract_planning_fault_identity(msgs) == ("pod", "process", "hold")
+
+    def test_absent_declaration_returns_empty(self):
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _extract_planning_fault_identity,
+        )
+
+        assert _extract_planning_fault_identity([]) == ("", "", "")
+        assert _extract_planning_fault_identity(
+            [_make_finish_call()]
+        ) == ("", "", "")
+
+    def test_normalises_whitespace_and_case(self):
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _extract_planning_fault_identity,
+        )
+
+        msgs = [_make_finish_call({
+            "fault_scope": " Pod ",
+            "fault_target": "Process",
+            "fault_action": "Hold",
+        })]
+        assert _extract_planning_fault_identity(msgs) == ("pod", "process", "hold")
+
+    def test_ignores_save_fault_plan_carrier(self):
+        """The declaration carrier is finish_planning only — a saved draft
+        is not a final declaration."""
+        from chaos_agent.agent.nodes.planning.extract_planning_metadata import (
+            _extract_planning_fault_identity,
+        )
+
+        msgs = [AIMessage(content="", tool_calls=[{
+            "name": "save_fault_plan", "id": "sp1", "type": "tool_call",
+            "args": {
+                "task_id": "t", "plan_content": "# plan",
+                "fault_scope": "pod", "fault_target": "process",
+                "fault_action": "hold",
+            },
+        }])]
+        assert _extract_planning_fault_identity(msgs) == ("", "", "")

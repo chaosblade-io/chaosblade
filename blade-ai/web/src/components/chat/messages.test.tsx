@@ -288,6 +288,7 @@ describe("HistoryList message renderers", () => {
         id: "tu1",
         inputTokens: 198,
         outputTokens: 89,
+        cachedTokens: 0,
         endedAt: new Date(2026, 7, 20, 14, 32, 7).getTime(),
       },
     ]);

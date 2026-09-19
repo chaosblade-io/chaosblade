@@ -36,11 +36,22 @@ AIMessage when any one is rejected. LangChain's ToolNode would normally
 do this matching; bypassing ToolNode means we have to satisfy the
 "every tool_call needs a corresponding ToolMessage" invariant ourselves,
 otherwise the next LLM iteration sees a malformed conversation.
+
+Inside such a fabricated batch the REJECTED calls get the rejection
+rendering, while calls the screener itself ALLOWED (allow / readonly
+verdicts) get a DEFERRED rendering instead: the batch is atomic (no
+call in it executed), and telling an allowed call it was "rejected —
+adjust and retry" teaches the model wrong facts about its own call
+(case-32: a READONLY update_progress answered with a READONLY rejection
+read to the LLM like a guard verdict against the tool itself).
 """
 
 from __future__ import annotations
 
+import base64
 import logging
+import re
+import shlex
 import time
 from dataclasses import replace
 from typing import Any
@@ -48,12 +59,18 @@ from typing import Any
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.types import interrupt
 
+from chaos_agent.agent.spec.fault_registry import carrier_actions, carrier_targets
 from chaos_agent.agent.spec.fault_spec import read_fault_spec
 from chaos_agent.agent.capabilities import explain_tool_refusal, tool_call_allowed
 from chaos_agent.agent.execution_artifacts import (
+    _RECOVERY_CARRIER_CREATE_KINDS,
+    _exec_pod_identity,
+    VEHICLE_ARTIFACT_TYPES,
     is_vehicle_name,
+    is_vehicle_teardown_delete,
     vehicle_artifact_types,
 )
+from chaos_agent.agent.kubeconfig import resolve_kubeconfig
 from chaos_agent.agent.nodes.execute.llm_step_helpers import hint_count_key
 from chaos_agent.agent.nodes.execute.react_helpers import _stagnation_key
 from chaos_agent.agent.state import AgentState
@@ -68,6 +85,7 @@ from chaos_agent.agent.target_guard import (
     freeze_approved_target_from_spec,
     infer_effective_target,
 )
+from chaos_agent.agent.target_guard.mechanism_writes import entries_from_list
 from chaos_agent.agent.target_guard.carriers import (
     LIVE_DISCOVERY_RETRYABLE_REASONS,
     CarrierResolution,
@@ -82,6 +100,10 @@ from chaos_agent.agent.target_guard.classifier import (
     SCOPE_UNKNOWN,
     canonicalise_kind,
 )
+from chaos_agent.agent.providers.message_scanning import (
+    KUBECTL_WRITE_SUBCOMMANDS,
+)
+from chaos_agent.agent.providers.registry import FaultProviderRegistry
 from chaos_agent.agent.result.verdict import FailureCategory
 from chaos_agent.config.settings import settings
 from chaos_agent.tools.guard_gateway import decision_to_feedback, get_guard_gateway
@@ -324,6 +346,341 @@ def _identity_matches_approved(
     return bool(known) and all(n in known for n in effective.names)
 
 
+# Vehicles whose presence underwrites an object-write injection's
+# bounded recovery: the recovery-carrier Pod (timer host for the precise
+# rollback of API-plane faults on STOCK assets) plus the drill-occupancy
+# forms (task-built targets whose cleanup record deletes the asset — and
+# the fault riding it — wholesale). A ``debug_pod`` is a PROBE channel,
+# not a recovery underwriter, and is deliberately excluded.
+_RECOVERY_UNDERWRITER_TYPES: frozenset[str] = frozenset(
+    VEHICLE_ARTIFACT_TYPES - {"debug_pod"},
+)
+
+
+def _recovery_vehicle_registered(
+    vehicle_cache: dict[str, Any], state: AgentState,
+) -> bool:
+    """A recovery-underwriter vehicle is registered (armed or active).
+
+    Reads the screening round's cache FIRST — the carrier ``run`` branch
+    and the occupant registration register their artifacts at ALLOW time
+    (screening precedes execution), so a same-batch vehicle + injection
+    pair sees the registration even before the state delta lands. Status
+    ``cleaned`` does not count: the vehicle is gone, and a fresh
+    injection would again run un-armed.
+    """
+    artifacts = vehicle_cache.get(
+        "execution_artifacts", state.get("execution_artifacts") or [],
+    )
+    return any(
+        isinstance(a, dict)
+        and a.get("type") in _RECOVERY_UNDERWRITER_TYPES
+        and a.get("status") in ("active", "recovery_armed")
+        for a in artifacts
+    )
+
+
+def _vehicle_delete_is_cleanup(
+    tool_args: Any, effective: EffectiveTarget,
+    vehicle_cache: dict[str, Any], state: AgentState,
+) -> bool:
+    """A delete naming only task-registered vehicle assets is TEARDOWN.
+
+    Thin wrapper over the shared core
+    (:func:`execution_artifacts.is_vehicle_teardown_delete`, extracted
+    R6-1 so the issue-time attribution layer answers the SAME question):
+    this side adds the screening-round cache as the artifacts source
+    (the carrier ``run`` branch registers at ALLOW time, so a same-batch
+    vehicle + delete pair sees the registration before the state delta
+    lands) and the subcommand gate. The guard's identity verdict has
+    already ALLOWed the call by the time this exemption runs — it only
+    bypasses the carrier gate, never the drift net.
+    """
+    if not isinstance(tool_args, dict) or tool_args.get("subcommand") != "delete":
+        return False
+    artifacts = vehicle_cache.get(
+        "execution_artifacts", state.get("execution_artifacts") or [],
+    )
+    return is_vehicle_teardown_delete(
+        effective, artifacts,
+        v_args=str(tool_args.get("v_args") or ""),
+    )
+
+
+def _carrier_family_in_write_set(approved: ApprovedTarget) -> bool:
+    """The frozen write-set admits carrier-family objects for this target.
+
+    The workload/pod nets' ``secondary_scopes`` statically include the
+    RBAC family (every such approval can legally stack a carrier); the
+    node net does not — its bounded recovery rides the host carrier
+    (debug pod + systemd-run timer), deliberately outside this gate's
+    object-write first cut. Case-manifest ``mechanism_entries``
+    contribute their scopes the same way. Vocabulary is
+    :data:`_RECOVERY_CARRIER_CREATE_KINDS`' value set — single source
+    with the manifest-channel reshape branch and the artifact attach.
+    """
+    carrier_kinds = frozenset(_RECOVERY_CARRIER_CREATE_KINDS.values())
+    write_set = set(approved.secondary_scopes or ())
+    write_set.update(
+        e.scope for e in (approved.mechanism_entries or ())
+    )
+    return bool(write_set & carrier_kinds)
+
+
+def _declared_verbs_in_symmetric_revert_domain(approved: ApprovedTarget) -> bool:
+    """Do the frozen intent verbs land in the symmetric-revert carrier's vocabulary?
+
+    The ChaosBlade carrier vocabulary (cpu/mem/network/disk/process ×
+    fullload/load/…) is the mechanical projection of the symmetric-revert
+    routing class: a fault expressible as a blade experiment is recovered
+    by ``blade destroy`` on its experiment UID — no apiserver write happens
+    in its recovery, so it cannot justify the declarative-restore CR
+    channel (whose entire value is apiserver-write recovery). EITHER the
+    frozen ``fault_target`` or ``fault_action`` matching the vocabulary
+    marks the domain: the two carrier vocabularies (chaosblade vs
+    k8s_native) are disjoint on both axes, so a single hit is decisive —
+    and a target like ``cpu`` paired with a k8s-native action (or vice
+    versa) is still a blade-shaped fault the plan mis-declared. Empty
+    verbs on both axes mean "not decidable": the write-set admission
+    (case-manifest ``mechanism_entries``) remains the guard there, and
+    this fallback does not block what it cannot classify.
+    """
+    bt = str(approved.fault_target or "").strip().lower()
+    ba = str(approved.fault_action or "").strip().lower()
+    if not bt and not ba:
+        return False
+    blade_targets = set(carrier_targets("chaosblade"))
+    blade_actions = set(carrier_actions("chaosblade"))
+    return bt in blade_targets or ba in blade_actions
+
+
+# REST method → RBAC verb (recovery-carrier.md §2 form-agnostic rule;
+# #51/B85: the grant must follow the payload's ACTUAL write verbs, not
+# the form the plan pinned at design time).
+_REST_WRITE_VERB_BY_METHOD = {
+    "PATCH": "patch",
+    "PUT": "update",
+    "DELETE": "delete",
+    "POST": "create",
+}
+
+# ``curl -X <METHOD>`` in an arming payload — either spelling (``-X PATCH``
+# separate, ``-XPATCH`` fused). Case-sensitive on the flag itself: curl's
+# lowercase ``-x`` is the PROXY flag and must not match.
+_CURL_METHOD_RE = re.compile(r"-X\s*['\"]?(\w+)")
+
+# A long base64 run inside an arming payload. The local-encode two-step
+# (recovery-carrier.md §7 iron rule 2 / tier table ③ fallback: ``echo <b64> |
+# base64 -d >/tmp/r.sh; sh /tmp/r.sh``) is a LEGAL staging form whose payload
+# carries the restore verbs only in encoded form — the layer-1 reconcile
+# must read through it or the grant check goes blind exactly where #51 bit.
+# 32+ chars of the base64 alphabet excludes ordinary shell words (URLs break
+# on ``:``/``.``; JWT/CA blobs decode to non-curl bytes and reconcile to
+# nothing), so the probe is idempotent on plain payloads.
+_B64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{32,}={0,2}")
+
+# K8s review-family APIs are QUERY-shaped POSTs: the body carries the
+# access question, the response carries the verdict, and NOTHING persists
+# — the apiserver writes no cluster state for them (authorization.k8s.io:
+# selfsubjectaccessreviews / selfsubjectrulesreviews / subjectaccessreviews
+# / localsubjectaccessreviews; authentication.k8s.io: tokenreviews; all
+# granted globally via system:basic-user, so no carrier Role can or should
+# carry their verbs). §3's SSAR arm-time gate MANDATES these probes inside
+# the carrier payload — a bare method→verb mapping would have layer 1
+# reject layer 2's own legislation (live in #51-R: gate=carrier_verb_
+# reconcile refused the SSAR probe's POST as write verb [create], forcing
+# a pointless Role grant to get past the guard).
+_NO_STATE_POST_RESOURCES = frozenset({
+    "selfsubjectaccessreviews",
+    "selfsubjectrulesreviews",
+    "subjectaccessreviews",
+    "localsubjectaccessreviews",
+    "tokenreviews",
+})
+
+# Shell command separators — each curl invocation (and therefore each
+# invocation's URL) lives inside its own segment, never in a neighbour's.
+_CURL_CMD_SPLIT_RE = re.compile(r";|&&|\|\||\n")
+
+# A review-family resource in URL path position: ``/selfsubjectaccessreviews``
+# etc. (API paths are lowercase; the ``\b`` keeps ``...reviews2``-shaped names
+# from matching). Alternation order puts the longer ``self*`` spellings
+# first, though ``/subject...`` cannot match inside ``/selfsubject...``
+# anyway because the required ``/`` never precedes the embedded substring.
+_NO_STATE_POST_URL_RE = re.compile(
+    r"/(?:" + "|".join(sorted(_NO_STATE_POST_RESOURCES)) + r")\b"
+)
+
+
+def _verbs_in_payload_text(payload: str) -> set[str]:
+    """REST write verbs carried by ``curl -X`` spellings in raw text.
+
+    The payload is split into shell command segments (``;`` / ``&&`` /
+    ``||`` / newline) so each ``-X METHOD`` is judged together with its own
+    invocation's URL: a POST aimed at a review-family resource is a
+    query-shaped call (no cluster state changes) and carries no write verb
+    the grant must cover; every other method keeps the §2 form-agnostic
+    method→verb mapping. Residual fail-open edge (same family as the
+    documented shard-split boundary): one curl invocation listing BOTH a
+    real write URL and a review URL keeps its POST exempt — layer-2 SSAR
+    at arm time owns the remainder.
+    """
+    verbs: set[str] = set()
+    for segment in _CURL_CMD_SPLIT_RE.split(payload):
+        no_state_post = _NO_STATE_POST_URL_RE.search(segment) is not None
+        for method in _CURL_METHOD_RE.findall(segment):
+            verb = _REST_WRITE_VERB_BY_METHOD.get(method.upper())
+            if verb == "create" and no_state_post:
+                continue
+            if verb:
+                verbs.add(verb)
+    return verbs
+
+
+def _carrier_restore_write_verbs(v_args: str) -> set[str]:
+    """Write verbs the exec payload AFTER ``--`` actually uses (curl -X).
+
+    Everything past the first ``--`` is the pod-side payload (``sh -c
+    '...'`` with its restore curls inside); only its REST WRITE methods
+    map to RBAC verbs — GET probes and log cats reconcile to nothing.
+
+    The local-encode base64 two-step is decoded too (iron rule 2): the
+    verbs live inside the encoded blob, and a blind spot here re-opens
+    the #51 leak through a md-sanctioned staging form. Review-family
+    POSTs are exempt from verb extraction in BOTH readings (plain and
+    decoded) — the §3 SSAR probe itself is not a restore write. Residual
+    edge: a blob SPLIT across segment-staged execs (each exec lands one
+    shard) hides a verb cut at the shard boundary — single-exec vision
+    cannot reconcile cross-command content, same fail-open boundary as
+    the staged-script form documented in ``_screen_carrier_restore_verbs``.
+    """
+    _, _, payload = v_args.partition("--")
+    if not payload:
+        return set()
+    verbs = _verbs_in_payload_text(payload)
+    for run in _B64_RUN_RE.findall(payload):
+        try:
+            decoded = base64.b64decode(run + "=" * (-len(run) % 4))
+        except (ValueError, TypeError):
+            continue
+        verbs |= _verbs_in_payload_text(decoded.decode("utf-8", "replace"))
+    return verbs
+
+
+def _registered_recovery_carrier(
+    vehicle_cache: dict[str, Any], state: AgentState, pod_name: str,
+) -> dict | None:
+    """The registered recovery-carrier artifact named by an exec target.
+
+    Cache-first with a STATE default (``get`` default-value form, same as
+    ``_recovery_vehicle_registered``): the cache key only ever lands
+    populated (ALLOW-time registration), but the get-default form keeps
+    the two readers' semantics identical — an empty cached list would
+    shadow state under an ``or`` form, silently hiding registrations.
+    """
+    artifacts = vehicle_cache.get(
+        "execution_artifacts", state.get("execution_artifacts") or [],
+    )
+    for artifact in artifacts:
+        if (
+            isinstance(artifact, dict)
+            and artifact.get("type") == "recovery_carrier"
+            and artifact.get("name") == pod_name
+        ):
+            return artifact
+    return None
+
+
+def _screen_carrier_restore_verbs(
+    tool_args: Any,
+    vehicle_cache: dict[str, Any],
+    state: AgentState,
+) -> tuple[str, str] | None:
+    """B85 layer-1 admission check: arming payload ⊆ registered grant.
+
+    The #51/B85 failure form: the plan pinned PUT, the agent lawfully
+    switched the restore form at arm time (2 PATCH + 1 DELETE), and the
+    stack's Role still granted ``get,update`` — the timer fired into 403s
+    and the pod "recovered" without recovering. The form-agnostic rule
+    (recovery-carrier.md §2) legislates the behaviour; THIS is the
+    code-level fail-closed assertion of it — an exec into a REGISTERED
+    carrier whose payload carries REST write verbs must see every one of
+    them inside the registered Role/ClusterRole verbs (create-time
+    ``--verb`` + json-patch additions, folded by
+    ``execution_artifacts._extend_recovery_carrier_rbac_verbs``).
+
+    Returns ``(reason, suggestion)`` when the grant is missing verbs,
+    ``None`` to admit. Deliberate fail-OPEN scope (layer-2 SSAR at arm
+    time owns the remainder): an unregistered pod (other guards judge
+    it), a payload with no write verbs (read probes / log cats), a
+    carrier with no Role member on record (manifest-built stack, resumed
+    pre-verbs artifact), or an empty grant parse — each reconciles
+    nothing and passes with a warning where the blind spot is real.
+    """
+    if not isinstance(tool_args, dict) or tool_args.get("subcommand") != "exec":
+        return None
+    v_args = str(tool_args.get("v_args") or "")
+    try:
+        tokens = shlex.split(v_args)
+    except ValueError:
+        return None
+    # Pod identity lives BEFORE the ``--`` separator only — the payload
+    # after it may itself contain ``-n``-looking tokens (curl URLs, sh
+    # flags), which must never be misread as the exec's namespace flag
+    # (same outer/inner split as ``_mark_bounded_host_recovery``).
+    separator = tokens.index("--") if "--" in tokens else len(tokens)
+    pod_name, _namespace = _exec_pod_identity(tokens[:separator])
+    if not pod_name:
+        return None
+    payload_verbs = _carrier_restore_write_verbs(v_args)
+    if not payload_verbs:
+        return None
+    carrier = _registered_recovery_carrier(vehicle_cache, state, pod_name)
+    if carrier is None:
+        return None
+    granted: set[str] = set()
+    has_role_member = False
+    for member in carrier.get("rbac_family") or []:
+        if (
+            isinstance(member, dict)
+            and member.get("kind") in ("role", "clusterrole")
+        ):
+            has_role_member = True
+            granted.update(
+                str(verb).strip().lower()
+                for verb in member.get("verbs") or []
+                if str(verb).strip()
+            )
+    # RBAC's ``verbs: ["*"]`` wildcard grants EVERY verb — reconcile to
+    # full admission (a literal set-difference would false-reject every
+    # payload verb against the "*" string).
+    if "*" in granted:
+        return None
+    if not has_role_member or not granted:
+        logger.warning(
+            "carrier-verb-reconcile: carrier %s armed with write verbs "
+            "%s but no parseable Role verbs on record (rbac_family=%r) "
+            "— passing; §3 SSAR at arm time owns the check",
+            pod_name, sorted(payload_verbs), carrier.get("rbac_family"),
+        )
+        return None
+    missing = sorted(payload_verbs - granted)
+    if not missing:
+        return None
+    return (
+        "carrier-verb-reconcile (B85): the arming payload's write verbs "
+        f"[{','.join(missing)}] are not in the registered carrier "
+        f"Role/ClusterRole verbs [{','.join(sorted(granted))}] — arming "
+        "now would let the timer fire into 403s and a pod that reports "
+        "recovery without recovering",
+        "Reconcile the grant to the payload's ACTUAL write verbs "
+        "(form-agnostic rule, references/carrier/recovery-carrier.md §2): "
+        "kubectl patch the carrier's Role/ClusterRole (two-step json-patch "
+        "rule form) to add the missing verbs, then re-issue this arming "
+        "exec. The §3 SSAR token probe still applies before arm.",
+    )
+
+
 def _screen_vehicle_manifest(
     effective: EffectiveTarget, approved: ApprovedTarget | None,
 ) -> GuardDecision:
@@ -394,6 +751,40 @@ def _screen_vehicle_manifest(
     )
 
 
+def _screen_destroy_uid_provenance(
+    uid: str,
+    effective: EffectiveTarget,
+    messages: list,
+    state: AgentState | None = None,
+) -> GuardDecision:
+    """The provenance check shared by BOTH destroy delivery faces.
+
+    ALLOW only when the UID was produced by this graph task — message
+    evidence plus the durable birth registry (``owned_experiment_uids``
+    union ``experiment_uid``), which inline ``kubectl exec ... blade
+    create`` receipts register into too, so the in-cluster recovery
+    path the registry itself instructs stays usable. Empty and foreign
+    UIDs both fail closed. The REJECT carries the tool face's original
+    wording so the model reads one consistent lesson whichever channel
+    its cleanup attempt rode.
+    """
+    if uid and uid in _experiment_uids_created_by_current_task(messages, state):
+        return GuardDecision(
+            verdict=GuardVerdict.ALLOW,
+            reason="experiment UID was created by this task",
+            effective=effective,
+        )
+    return GuardDecision(
+        verdict=GuardVerdict.REJECT_UNKNOWN,
+        reason="blade_destroy UID was not produced by this task's blade_create",
+        effective=effective,
+        suggestion=(
+            "Only clean the UID reported by the current failed blade_create "
+            "call."
+        ),
+    )
+
+
 def _screen_blade_destroy(
     tool_args: Any, messages: list, state: AgentState | None = None,
 ) -> tuple[EffectiveTarget, GuardDecision]:
@@ -406,17 +797,8 @@ def _screen_blade_destroy(
         confidence=ConfidenceLevel.HIGH,
         raw_command=f"blade_destroy uid={uid}",
     )
-    if uid and uid in _experiment_uids_created_by_current_task(messages, state):
-        return effective, GuardDecision(
-            verdict=GuardVerdict.ALLOW,
-            reason="experiment UID was created by this task",
-            effective=effective,
-        )
-    return effective, GuardDecision(
-        verdict=GuardVerdict.REJECT_UNKNOWN,
-        reason="blade_destroy UID was not produced by this task's blade_create",
-        effective=effective,
-        suggestion="Only clean the UID reported by the current failed blade_create call.",
+    return effective, _screen_destroy_uid_provenance(
+        uid, effective, messages, state,
     )
 
 
@@ -426,6 +808,13 @@ def _screen_blade_destroy(
 SCREENER_ROUTE_PASS = "pass"
 SCREENER_ROUTE_REPLAN = "replan"
 SCREENER_ROUTE_RETRY = "retry"
+# Hard-termination route: unlike RETRY (loop back and keep running), FAIL
+# routes to the reject terminal node. A hard stop that kept returning RETRY
+# was a ghost termination (W-56-5 defect a, #56): the graph kept executing,
+# the fail_state error leaked into the next attempt (should_continue_agent_loop
+# rejects on any set error), and the terminal renderer stitched two stale
+# reasons together.
+SCREENER_ROUTE_FAIL = "fail"
 
 
 def _carrier_within_liveness_window(
@@ -552,6 +941,61 @@ def _hard_stagnation_block(
     return reason, suggestion
 
 
+def _register_drill_target_artifact(
+    vehicle_cache: dict[str, Any],
+    state: AgentState,
+    effective: EffectiveTarget,
+    tool_call_id: str,
+) -> None:
+    """Register a drill-target Deployment as a task-side vehicle artifact.
+
+    Registration tracks EXECUTION, not just the ALLOW verdict — the callers
+    are the screener's ALLOW branch, a human-approved drift card (the drifted
+    apply executes once approved), and log-only mode's pass-through sweep.
+    An idempotent re-apply (the LLM re-issues the same manifest after a
+    timeout) keeps the FIRST registration rather than clobbering it — dedup
+    by artifact_id, same discipline as the occupant and carrier branches.
+    """
+    dt_name = effective.names[0] if effective.names else ""
+    if not dt_name:
+        return
+    dt_ns = effective.namespace or "default"
+    # P5: the recorded ``kind`` field is the teardown predicate's
+    # authoritative source (the ``_deployment`` suffix derivation is a
+    # legacy-artifact fallback only) — register it like every other
+    # vehicle constructor does.
+    target_artifact = {
+        "artifact_id": f"occupant_deployment:{dt_ns}/{dt_name}",
+        "type": "occupant_deployment",
+        "kind": "deployment",
+        "status": "active",
+        "task_id": str(state.get("task_id") or ""),
+        "name": dt_name,
+        "namespace": dt_ns,
+        "operation_family": "drill_target",
+        "created_tool_call_id": tool_call_id,
+        "cleanup": {
+            "tool": "kubectl",
+            "subcommand": "delete",
+            "v_args": (
+                f"deployment {dt_name} -n {dt_ns} "
+                "--ignore-not-found"
+            ),
+        },
+    }
+    merged: dict[str, dict] = {
+        str(a.get("artifact_id") or ""): a
+        for a in vehicle_cache.get(
+            "execution_artifacts",
+            state.get("execution_artifacts") or [],
+        )
+        if isinstance(a, dict)
+    }
+    if target_artifact["artifact_id"] not in merged:
+        merged[target_artifact["artifact_id"]] = target_artifact
+    vehicle_cache["execution_artifacts"] = list(merged.values())
+
+
 async def tool_screener(state: AgentState) -> dict:
     """Inspect pending tool_calls and decide whether to forward them.
 
@@ -588,6 +1032,25 @@ async def tool_screener(state: AgentState) -> dict:
         logger.warning(
             "tool_screener: stale truncated_tool_calls flag with an unanswered "
             "batch pending — clearing and screening normally",
+        )
+
+    # Create-reconcile gate hold (blade-create-reconcile-before-retry D6):
+    # execute_loop held a whole batch after a same-fingerprint gate-armed
+    # create retry (result-uncertain protection; which creates are
+    # gate-armed is declared provider-side, consumed through the registry
+    # seam) and fabricated its answers — route straight back to the loop
+    # so the ToolNode never sees it. Same staleness precondition as the
+    # truncated flag above.
+    if state.get("_reconcile_gate_blocked"):
+        pending = isinstance(last_msg, AIMessage) and getattr(last_msg, "tool_calls", None)
+        if not pending:
+            return {
+                "screener_route": SCREENER_ROUTE_RETRY,
+                "_reconcile_gate_blocked": False,
+            }
+        logger.warning(
+            "tool_screener: stale _reconcile_gate_blocked flag with an "
+            "unanswered batch pending — screening normally",
         )
 
     # Defensive: no tool_calls to screen → pass through. This shouldn't
@@ -692,6 +1155,53 @@ async def tool_screener(state: AgentState) -> dict:
                     tool_name, tool_args,
                     skill_script_allowed=skill_script_allowed,
                 )
+                # B85 layer-1 (fail-closed, admission time): an arming
+                # exec into a REGISTERED recovery carrier must reconcile
+                # its payload's REST write verbs against the registered
+                # Role/ClusterRole grant — the form-agnostic rule as a
+                # code assertion, ahead of the drift net so the refusal
+                # names the missing verb instead of a generic drift.
+                _b85 = (
+                    _screen_carrier_restore_verbs(
+                        tool_args, vehicle_cache, state,
+                    )
+                    if tool_name == "kubectl"
+                    else None
+                )
+                if _b85:
+                    _b85_reason, _b85_fix = _b85
+                    decisions.append({
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "verdict": GuardVerdict.REJECT_BANNED.value,
+                        "reason": _b85_reason,
+                        "suggestion": _b85_fix,
+                        "is_hard_floor": False,
+                        "constraint": "",
+                        "carrier_gate": "carrier_verb_reconcile",
+                        "effective": effective,
+                    })
+                    has_other_reject = True
+                    continue
+                if effective.blade_destroy_uid:
+                    # Inline ``kubectl exec ... blade destroy/revoke``
+                    # (twelfth-round E3): the classifier extracted the UID;
+                    # run the SAME provenance gate the blade_destroy tool
+                    # face rides. The gate owns the verdict — the ordinary
+                    # drift net (and carrier resolution) is skipped below
+                    # via the ``blade_destroy_uid`` marker, so a provenance
+                    # ALLOW is not re-judged by the UNKNOWN scope and a
+                    # provenance REJECT keeps its own reason intact. The
+                    # decision then flows through the standard append /
+                    # reject accounting / routing below, exactly like the
+                    # tool face's.
+                    decision = _screen_destroy_uid_provenance(
+                        effective.blade_destroy_uid, effective,
+                        messages, state,
+                    )
+                    if decision.verdict != GuardVerdict.ALLOW:
+                        has_provenance_reject = True
+                    feedback = decision_to_feedback(decision)
             if tool_name != "blade_destroy" and effective.is_vehicle_manifest:
                 # Occupant-vehicle apply: an identity verdict of its own
                 # (claims-vs-approval anchor) instead of check_target — the
@@ -759,7 +1269,167 @@ async def tool_screener(state: AgentState) -> dict:
                 ):
                     has_other_reject = True
                 continue
-            if tool_name != "blade_destroy" and (
+            if tool_name != "blade_destroy" and effective.is_recovery_carrier:
+                # Recovery-carrier run (recovery-carrier-standard): judged by
+                # the ORDINARY net — the shape marker from the classifier
+                # exempts nothing by itself. In-net pod secondary scope +
+                # same namespace is the whole anchor (design D3/D7); a
+                # carrier run outside the net keeps the standard drift
+                # verdict and its routing, unchanged. ALLOW additionally
+                # registers the pod as a task-side vehicle artifact
+                # (occupant pattern — screening precedes execution): the
+                # registration is what makes later execs into the carrier
+                # (token probe / timer arm / re-arm) vehicle-exempt and
+                # finalize/recover's stack cleanup delete pod + RBAC family.
+                rc_decision, rc_feedback = get_guard_gateway().check_target(
+                    effective, approved,
+                )
+                if rc_decision.verdict == GuardVerdict.ALLOW:
+                    rc_name = effective.names[0] if effective.names else ""
+                    rc_ns = effective.namespace or "default"
+                    if rc_name:
+                        carrier_artifact = {
+                            "artifact_id": (
+                                f"recovery_carrier:{rc_ns}/{rc_name}"
+                            ),
+                            "type": "recovery_carrier",
+                            "kind": "pod",
+                            "status": "active",
+                            "task_id": str(state.get("task_id") or ""),
+                            "name": rc_name,
+                            "namespace": rc_ns,
+                            "operation_family": "recovery_carrier",
+                            "created_tool_call_id": tool_call_id,
+                            # sa/role/rolebinding members attach here as
+                            # their successful ``kubectl create`` results
+                            # arrive (execution_artifacts collects them).
+                            "rbac_family": [],
+                            # The four-way stack delete, recorded for the
+                            # audit trail (the executor lives in
+                            # ``cleanup_debug_pod_artifacts``). Delete order
+                            # mirrors it: pod, then binding → role → sa.
+                            "cleanup": [
+                                {
+                                    "tool": "kubectl",
+                                    "subcommand": "delete",
+                                    "v_args": (
+                                        f"pod {rc_name} -n {rc_ns} "
+                                        "--ignore-not-found"
+                                    ),
+                                },
+                                {
+                                    "tool": "kubectl",
+                                    "subcommand": "delete",
+                                    "v_args": (
+                                        f"rolebinding {rc_name} -n {rc_ns} "
+                                        "--ignore-not-found"
+                                    ),
+                                },
+                                {
+                                    "tool": "kubectl",
+                                    "subcommand": "delete",
+                                    "v_args": (
+                                        f"role {rc_name} -n {rc_ns} "
+                                        "--ignore-not-found"
+                                    ),
+                                },
+                                {
+                                    "tool": "kubectl",
+                                    "subcommand": "delete",
+                                    "v_args": (
+                                        f"serviceaccount {rc_name} -n {rc_ns} "
+                                        "--ignore-not-found"
+                                    ),
+                                },
+                            ],
+                        }
+                        merged: dict[str, dict] = {
+                            str(a.get("artifact_id") or ""): a
+                            for a in vehicle_cache.get(
+                                "execution_artifacts",
+                                state.get("execution_artifacts") or [],
+                            )
+                            if isinstance(a, dict)
+                        }
+                        # A repeat ALLOW for the SAME carrier (LLM re-issues
+                        # the run after a timeout, or an idempotency probe)
+                        # must NOT clobber the registered artifact: rbac_family
+                        # members collected from create results and the
+                        # recovery_armed/deadline stamped by an arming exec
+                        # are durable facts. Resetting them would make
+                        # finalize's keep-while-armed cleanup delete a live
+                        # timer host (family + armed state lost = immediate
+                        # stack delete) — the re-run is AlreadyExists noise.
+                        if carrier_artifact["artifact_id"] not in merged:
+                            merged[carrier_artifact["artifact_id"]] = (
+                                carrier_artifact
+                            )
+                        vehicle_cache["execution_artifacts"] = (
+                            list(merged.values())
+                        )
+                    decisions.append({
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "verdict": rc_decision.verdict.value,
+                        "reason": rc_decision.reason,
+                        "suggestion": rc_decision.suggestion,
+                        "is_hard_floor": rc_feedback.is_hard_floor,
+                        "constraint": rc_feedback.constraint.value,
+                        "carrier_gate": "recovery_carrier",
+                        "effective": effective,
+                    })
+                    continue
+                # Non-ALLOW: fall through to the standard path so the drift
+                # interrupt / retry rendering keeps its exact pre-existing
+                # behaviour — the carrier marker must not change rejection
+                # routing.
+            if tool_name != "blade_destroy" and effective.is_drill_target_manifest:
+                # Drill-target Deployment apply (drill-target-contract): the
+                # classifier already enforced the shape contract; this gate
+                # is the ORDINARY drift net — unlike an occupant (whose
+                # generated name can never match the approval) the drill
+                # target's name IS the approved identity, so check_target
+                # alone anchors it: name+namespace match = ALLOW, anything
+                # else = standard drift rejection. ALLOW additionally
+                # registers the deployment as a task-side
+                # ``occupant_deployment`` vehicle artifact (screening
+                # precedes execution): that registration is what
+                # finalize/recover's cleanup chain deletes when the task dies
+                # without an explicit teardown, and what the recovery
+                # delete's deployment-kind exemption keys on (the identity
+                # match alone would already ALLOW the delete — the
+                # registration is the durable, drift-independent belt).
+                dt_decision, dt_feedback = get_guard_gateway().check_target(
+                    effective, approved,
+                )
+                if dt_decision.verdict == GuardVerdict.ALLOW:
+                    _register_drill_target_artifact(
+                        vehicle_cache, state, effective, tool_call_id,
+                    )
+                    decisions.append({
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "verdict": dt_decision.verdict.value,
+                        "reason": dt_decision.reason,
+                        "suggestion": dt_decision.suggestion,
+                        "is_hard_floor": dt_feedback.is_hard_floor,
+                        "constraint": dt_feedback.constraint.value,
+                        "carrier_gate": "drill_target_manifest",
+                        "effective": effective,
+                    })
+                    continue
+                # Non-ALLOW: fall through to the standard path so the drift
+                # interrupt / retry rendering keeps its exact pre-existing
+                # behaviour — the drill-target marker must not change
+                # rejection routing.
+            if (
+                tool_name != "blade_destroy"
+                # Inline destroy carries its own provenance verdict; carrier
+                # resolution would REPLACE the UNKNOWN-with-uid effective and
+                # silently drop the uid marker, re-opening the E3 bypass via a
+                # registered exec vehicle.
+                and not effective.blade_destroy_uid
+                and (
                 effective.scope in (SCOPE_UNKNOWN, SCOPE_ESCAPE)
                 or (
                     is_host_carrier_call(tool_name, tool_args)
@@ -775,6 +1445,7 @@ async def tool_screener(state: AgentState) -> dict:
                     # command is classified __escape__ (not __readonly__) and
                     # still enters carrier resolution here.
                     and effective.scope != SCOPE_READONLY
+                )
                 )
             ):
                 carrier_resolved = False
@@ -1068,7 +1739,7 @@ async def tool_screener(state: AgentState) -> dict:
                             approved,
                             resolved_names=tuple(sorted(resolved_set)),
                         )
-            if tool_name != "blade_destroy":
+            if tool_name != "blade_destroy" and not effective.blade_destroy_uid:
                 # Single funnel: identity / recoverability verdict via the
                 # gateway. ``decision`` drives routing (drift interrupt /
                 # retry); ``feedback`` is the uniform shape rendered + audited
@@ -1076,6 +1747,216 @@ async def tool_screener(state: AgentState) -> dict:
                 decision, feedback = get_guard_gateway().check_target(
                     effective, approved,
                 )
+                # Armed-before-inject gate (inject-cc2d5080): a kubectl
+                # OBJECT-WRITE injection (the verb itself is the mutation,
+                # ``KUBECTL_WRITE_SUBCOMMANDS`` — the same single-source
+                # vocabulary the issue-time attribution uses) carries no
+                # experiment UID and no self-timeout, so its ONLY bounded
+                # recovery is the recovery-carrier timer the plan stacks
+                # (a REST-reversible object write can always construct the
+                # SA carrier path — no exemption form exists). In that
+                # task the carrier stack was refused (manifest-channel RBAC
+                # mislabel), the replan review then demanded "issue the
+                # injection call first", and the fault landed with no timer
+                # armed — this gate is the graph-level invariant that fires
+                # regardless of what any prompt or review text says.
+                # Gated on the write-set admitting the carrier family
+                # (workload/pod nets) so the node domain's host-carrier
+                # timer forms stay outside this first cut. Deliberately
+                # narrow elsewhere: command-mode exec/debug injections
+                # excluded (their timer forms are case-legislated, not
+                # structurally provable here), and a
+                # registered-but-not-yet-armed carrier passes (the arming
+                # exec lands one loop later; the receipt-bound evidence
+                # gate generalises this once per-step receipts exist).
+                # A delete naming only task-registered vehicle assets is
+                # teardown, never an injection, and is exempt
+                # (:func:`_vehicle_delete_is_cleanup`, F1-C — the §6
+                # four-way delete replay after the sweep marked the
+                # artifact ``cleaned`` was refused with "stack the carrier
+                # FIRST", ordering the model to re-build the asset class
+                # it is deleting).
+                # NOT mechanism_banned: stacking the carrier IS the
+                # reshape, so the rejection must render as retryable form,
+                # not a hard floor.
+                if (
+                    decision.verdict == GuardVerdict.ALLOW
+                    and tool_name == "kubectl"
+                    and isinstance(tool_args, dict)
+                    and tool_args.get("subcommand") in KUBECTL_WRITE_SUBCOMMANDS
+                    and approved is not None
+                    and _carrier_family_in_write_set(approved)
+                    and not _recovery_vehicle_registered(vehicle_cache, state)
+                    and not _vehicle_delete_is_cleanup(
+                        tool_args, effective, vehicle_cache, state,
+                    )
+                ):
+                    decision = GuardDecision(
+                        verdict=GuardVerdict.REJECT_BANNED,
+                        reason=(
+                            "armed-before-inject: this object-write "
+                            "injection has no recovery vehicle registered "
+                            "— a kubectl-native fault carries no UID and "
+                            "no self-timeout, so issuing it now would arm "
+                            "no bounded recovery at all"
+                        ),
+                        effective=effective,
+                        suggestion=(
+                            "Stack the recovery carrier FIRST "
+                            "(references/carrier/recovery-carrier.md: "
+                            "kubectl run drill-rc-* + imperative create for "
+                            "the RBAC family), arm its timer, THEN re-issue "
+                            "the injection; for a task-built target, staging "
+                            "it first underwrites recovery the same way (its "
+                            "registration carries the wholesale cleanup). If "
+                            "the carrier genuinely cannot be built, "
+                            "request_replan with kind=safety — an honest "
+                            "failure, not an un-armed injection."
+                        ),
+                    )
+                    feedback = decision_to_feedback(decision)
+                    carrier_gate = "armed_before_inject"
+                # CR-channel route gate (openspec faultdrill-cr-channel,
+                # design D3 source 3): a FaultDrill CR creation (kubectl
+                # apply/create whose stdin manifest is all-FaultDrill
+                # documents — the classifier anchors it as
+                # scope="faultdrill") that has ALREADY passed write-set
+                # admission (ALLOW here means a case-manifest
+                # mechanism_entries faultdrill entry covered the call —
+                # the widened contract a human approved) still has to
+                # survive the three-way routing check. The channel is
+                # reserved for faults whose recovery MUST write apiserver
+                # state (recovery_channel: apiserver-write); routing into
+                # it is a CASE-SEMANTIC decision (D3: not derivable from
+                # fault_spec mechanically), and every upstream source can
+                # be wrong — the case author can mis-declare the channel,
+                # the planning prompt can be ignored. THIS gate is the
+                # programmatic fallback that does not trust either: the
+                # declared fault verbs landing in the ChaosBlade carrier
+                # vocabulary mean the fault is symmetric-revert reachable
+                # (blade destroy recovers it by experiment UID — zero
+                # apiserver writes), so the CR channel's
+                # declarative-restore machinery is the wrong route for it
+                # (spec scenario "零工坊 case 误路由被审批门拒绝").
+                # Host-domain mis-routes never reach here structurally:
+                # a host-scope approval fails the guard's cross-profile
+                # check before this point. Only the CREATING verbs
+                # (apply/create) are gated — a delete/patch of the CR is
+                # the recovery / re-recipe path whose admission the
+                # manifest entries already govern. Dark launch: while
+                # faultdrill_enabled is False the channel's own guards
+                # (landing readback, session reconciler) are all
+                # short-circuited, so ANY CR apply in that window is an
+                # unguarded bare write — rejected outright regardless of
+                # verb domain (the pre-change behaviour for the same
+                # shape was a classifier kind-ban, so dark-launch parity
+                # holds: still rejected, never silently admitted). The
+                # ALLOW path additionally consults the channel's
+                # installability seam (D2/D7, else branch below): the
+                # first admitted CR apply triggers the provider's own
+                # lazy CRD install, and an uninstallable CRD degrades
+                # onto the SOP route right here — before any CR apply
+                # attempt round (spec: 不产生 CR apply 尝试轮次).
+                # The verdict is retryable form guidance, same family as the
+                # armed-before-inject gate above: the reshape is a
+                # re-plan onto the correct channel, not a mechanism ban.
+                if (
+                    decision.verdict == GuardVerdict.ALLOW
+                    and tool_name == "kubectl"
+                    and isinstance(tool_args, dict)
+                    and tool_args.get("subcommand") in ("apply", "create")
+                    and effective.scope == "faultdrill"
+                    and approved is not None
+                ):
+                    if not settings.faultdrill_enabled:
+                        decision = GuardDecision(
+                            verdict=GuardVerdict.REJECT_BANNED,
+                            reason=(
+                                "cr-channel route: the FaultDrill channel "
+                                "is not enabled (faultdrill_enabled=false) "
+                                "— in the dark-launch window the channel's "
+                                "landing-readback and reconciler guards "
+                                "are short-circuited, so this CR apply "
+                                "would be an unguarded bare write with no "
+                                "recovery arming"
+                            ),
+                            effective=effective,
+                            suggestion=(
+                                "Re-plan onto the standard recovery-carrier "
+                                "SOP form (references/carrier/"
+                                "recovery-carrier.md) — the CR channel only "
+                                "carries drills while faultdrill_enabled is "
+                                "on."
+                            ),
+                        )
+                        feedback = decision_to_feedback(decision)
+                        carrier_gate = "cr_channel_route"
+                    elif _declared_verbs_in_symmetric_revert_domain(approved):
+                        decision = GuardDecision(
+                            verdict=GuardVerdict.REJECT_BANNED,
+                            reason=(
+                                "cr-channel route: the declared fault verbs "
+                                f"(target={approved.fault_target or ''!r} "
+                                f"action={approved.fault_action or ''!r}) "
+                                "fall in the ChaosBlade symmetric-revert "
+                                "domain — blade destroy recovers such faults "
+                                "by experiment UID with zero apiserver "
+                                "writes, so the faultdrill CR channel "
+                                "(reserved for recovery_channel: "
+                                "apiserver-write cases) is the wrong route"
+                            ),
+                            effective=effective,
+                            suggestion=(
+                                "Re-plan this fault on its symmetric-revert "
+                                "route: blade create <scope>-<target> "
+                                "<action> with --timeout, recovered by "
+                                "blade destroy (experiment UID). Reserve the "
+                                "FaultDrill CR channel for faults whose "
+                                "recovery must write apiserver state "
+                                "(references/carrier/recovery-carrier.md)."
+                            ),
+                        )
+                        feedback = decision_to_feedback(decision)
+                        carrier_gate = "cr_channel_route"
+                    else:
+                        # Third branch — channel installability (D2/D7):
+                        # a legitimate CR write still needs a cluster that
+                        # can accept it, so the first admitted apply
+                        # triggers the channel's own lazy install through
+                        # the registry seam (probe → programmatic apply →
+                        # Established poll — never an LLM-triggered CRD
+                        # apply, D2). The gate imports no faultdrill
+                        # module (zero-import discipline, same as the
+                        # vocabulary check above). ``None`` = no provider
+                        # claims the install responsibility — the apply's
+                        # own not-landed error family governs that window;
+                        # an explicit ``usable=False`` is the degradation
+                        # signal (D7: a routing branch, never an error).
+                        crd = await FaultProviderRegistry.ensure_crd(
+                            kubeconfig=resolve_kubeconfig(state),
+                        )
+                        if crd is not None and crd.get("usable") is False:
+                            decision = GuardDecision(
+                                verdict=GuardVerdict.REJECT_BANNED,
+                                reason=(
+                                    "cr-channel route: the FaultDrill CRD "
+                                    "is unavailable on this cluster ("
+                                    f"{crd.get('reason') or 'unknown'}: "
+                                    f"{crd.get('detail') or ''}) — the CR "
+                                    "channel's declarative-restore machinery "
+                                    "has nothing to land on"
+                                ),
+                                effective=effective,
+                                suggestion=(
+                                    "Re-plan onto the standard recovery-"
+                                    "carrier SOP form (references/carrier/"
+                                    "recovery-carrier.md) — an uninstallable "
+                                    "CRD is a degradation branch (design D7: "
+                                    "a routing decision, not a task failure)."
+                                ),
+                            )
+                            feedback = decision_to_feedback(decision)
+                            carrier_gate = "cr_channel_route"
         except Exception as exc:
             if is_host_carrier_call(tool_name, tool_args):
                 logger.exception(
@@ -1149,20 +2030,40 @@ async def tool_screener(state: AgentState) -> dict:
             "" if enforcing else " (log-only, enforcement disabled)",
         )
 
-    # Log-only mode: pass through regardless of verdicts.
+    # Log-only mode: pass through regardless of verdicts. The CLEANUP chain
+    # is orthogonal to enforcement: a drifted (or otherwise rejected)
+    # drill-target apply still executes here and must still register —
+    # registration follows execution. ALLOW-verdict registrations already
+    # happened per-call above; this sweep catches the non-ALLOW ones the
+    # pass-through is about to run (dedup makes re-registering the
+    # already-registered calls a no-op).
     if (
         not enforcing
         and not has_provenance_reject
         and not has_context_reject
     ) or not any_reject:
+        for d in decisions:
+            d_eff = d.get("effective")
+            if d_eff is not None and getattr(
+                d_eff, "is_drill_target_manifest", False,
+            ):
+                _register_drill_target_artifact(
+                    vehicle_cache, state, d_eff, d["tool_call_id"],
+                )
         return {"screener_route": SCREENER_ROUTE_PASS, **vehicle_cache}
 
     # Enforcing mode + at least one reject — fabricate ToolMessages so
     # the LangChain conversation stays well-formed (every tool_call
-    # needs a matching response) and the LLM sees the rejection text.
+    # needs a matching response) and the LLM sees the failure text.
+    # Cleared siblings get the DEFERRED rendering (B43): the batch is
+    # atomic, but an allowed call must not be told it was rejected.
     rejection_msgs = [
         ToolMessage(
-            content=_format_rejection_for_llm(d, approved is None, approved),
+            content=(
+                _format_deferred_for_llm(d)
+                if d["verdict"] in _CLEARED_VERDICTS
+                else _format_rejection_for_llm(d, approved is None, approved)
+            ),
             name=d["tool_name"],
             tool_call_id=d["tool_call_id"],
             status="error",
@@ -1178,13 +2079,36 @@ async def tool_screener(state: AgentState) -> dict:
 
         if drift_reject_count >= 1:
             # Already rejected once — hard terminate.
+            # Category honesty (B12): in CLI mode NO human was ever
+            # consulted — the first rejection was the mode's silent
+            # auto-reject (CLI has no interactive drift card) — so this
+            # is not a user rejection. Report the dedicated
+            # drift-termination category. TUI keeps USER_REJECTED: a
+            # human really did reject the drift-correction card before
+            # this second drift (auto mode never accumulates the count).
+            if state.get("interaction_mode") == "cli":
+                _ctx = (
+                    "Repeated target drift terminated the run without "
+                    "human confirmation; no user was consulted in CLI "
+                    "drift handling."
+                )
+                # W-56-5 (defect a): FAIL routes to the reject terminal node.
+                # The former RETRY here let the graph keep running, leaked the
+                # fail error into attempt 2, and produced the contradictory
+                # double-rendered terminal attribution (#56).
+                return {
+                    "messages": rejection_msgs,
+                    "screener_route": SCREENER_ROUTE_FAIL,
+                    "safety_reason": _ctx,
+                    **fail_state(FailureCategory.DRIFT_TERMINATED, _ctx),
+                    **vehicle_cache,
+                }
+            _ctx = "Target drift persists after user rejection; terminating."
             return {
                 "messages": rejection_msgs,
-                "screener_route": SCREENER_ROUTE_RETRY,
-                **fail_state(
-                    FailureCategory.USER_REJECTED,
-                    "Target drift persists after user rejection; terminating.",
-                ),
+                "screener_route": SCREENER_ROUTE_FAIL,
+                "safety_reason": _ctx,
+                **fail_state(FailureCategory.USER_REJECTED, _ctx),
                 **vehicle_cache,
             }
 
@@ -1224,6 +2148,21 @@ async def tool_screener(state: AgentState) -> dict:
             spec_delta = _apply_drift_correction(
                 state, first_eff, cluster_vehicles,
             )
+            # Registration follows EXECUTION, not just the ALLOW verdict:
+            # the drifted apply runs once a human approves the card, and the
+            # Deployment it creates must not orphan when the task dies
+            # without teardown — the exact residual this change exists to
+            # close. Only the manifest channel carries the cleanup promise;
+            # sibling kinds (configmap, …) have no registration machinery
+            # and keep their standing behaviour.
+            for d in drifted:
+                d_eff = d.get("effective")
+                if d_eff is not None and getattr(
+                    d_eff, "is_drill_target_manifest", False,
+                ):
+                    _register_drill_target_artifact(
+                        vehicle_cache, state, d_eff, d["tool_call_id"],
+                    )
             return {
                 "screener_route": SCREENER_ROUTE_PASS,
                 "drift_reject_count": 0,
@@ -1250,9 +2189,13 @@ def route_after_screener(state: AgentState) -> str:
     """Map the screener's ``screener_route`` field to a graph edge.
 
     Mirrors the SCREENER_ROUTE_* sentinels. Defaults to "pass" so a
-    missing/unknown value never strands the graph.
+    missing/unknown value never strands the graph. FAIL is the hard
+    termination: it routes to the reject terminal node — a hard stop that
+    kept looping as RETRY was a ghost termination (W-56-5 defect a, #56).
     """
     route = state.get("screener_route") or SCREENER_ROUTE_PASS
+    if route == SCREENER_ROUTE_FAIL:
+        return "reject"
     if route == SCREENER_ROUTE_REPLAN:
         return "replan"
     if route == SCREENER_ROUTE_RETRY:
@@ -1330,6 +2273,36 @@ def _format_rejection_for_llm(
             "This is not a dead-end: adjust the tool_call as above and retry."
         )
     return " ".join(parts)
+
+
+# Verdicts the screener itself cleared; in a fabricated (rejected) batch
+# these calls get the DEFERRED rendering below instead of a rejection.
+_CLEARED_VERDICTS = ("allow", "readonly")
+
+
+def _format_deferred_for_llm(decision: dict[str, Any]) -> str:
+    """Render a ToolMessage body for an ALLOWED call that did not execute.
+
+    The batch is atomic: when any sibling call is rejected, NONE of the
+    batch's calls run (the screener routes back to the loop before
+    phase2_tools ever sees the turn). LangChain still requires an answer
+    for every tool_call, so this message replaces the full-rejection text
+    the allowed call used to receive (B43): a READONLY meta tool answered
+    with "[target_guard] READONLY — adjust the tool_call and retry" reads
+    like a guard verdict against the call itself — the model then either
+    misdiagnoses its own (correct) call or delays re-issuing it. The
+    honest status is "not rejected, not executed, re-issue it".
+
+    Kept status="error" upstream: the call did not succeed and replan
+    failure-collection treats it accordingly.
+    """
+    return (
+        f"[screener] DEFERRED — {decision['tool_name']} was NOT rejected; "
+        "the screener found nothing wrong with this call. A sibling call "
+        "in the same batch was rejected, so the whole batch was returned "
+        "unexecuted. Re-issue this call (with the corrected siblings, or "
+        "on its own) and it will run normally."
+    )
 
 
 def _format_approved_for_card(approved: ApprovedTarget | None) -> dict:
@@ -1459,31 +2432,62 @@ def _apply_drift_correction(
     else:
         new_spec = spec
 
-    # Preserve the label-derived frozen sets (owner_names / resolved_names)
-    # that safety_check discovered, UNLESS the correction changed the label
-    # selector — in which case they are stale and must be dropped (the guard
-    # then falls back to its stricter labels/name comparison). Both are derived
-    # from the approved labels, so "labels changed" invalidates both.
+    # Preserve the discovered frozen sets (owner_names / resolved_names)
+    # that safety_check discovered, UNLESS the correction changed the
+    # identity they were derived from. resolved_names is label-derived
+    # (label selector → concrete names), so "labels changed" invalidates
+    # it. owner_names is now DUAL-SOURCED — labels-matched owners AND the
+    # names→ownerReferences chain (the generation anchor) — so ANY
+    # identity change (names OR labels) can stale one of its sources;
+    # rather than track which source survives, both identity changes
+    # drop it (conservative, aligned with pvc_claims below: the guard
+    # then falls back to namespace-only anchoring until the next
+    # approval re-discovers).
     existing = state.get("approved_target") or {}
     if "labels" in corrections:
         owner_names: tuple[str, ...] = ()
         resolved_names: tuple[str, ...] = ()
+    elif "names" in corrections:
+        owner_names = ()
+        resolved_names = tuple(existing.get("resolved_names") or ())
     else:
         owner_names = tuple(existing.get("owner_names") or ())
         resolved_names = tuple(existing.get("resolved_names") or ())
     # pvc_claims anchor the occupant-vehicle exception and were discovered
-    # against the CONCRETE approved pod identities: any identity change
-    # (names OR labels) stales them — drop, fail closed (the vehicle
-    # exception stays banned until a fresh approval re-discovers claims).
-    if "labels" in corrections or "names" in corrections:
+    # against the CONCRETE approved identities IN THE APPROVED NAMESPACE:
+    # any identity change (names, labels OR namespace) stales them — the
+    # frozen claim names are namespace-scoped facts about the OLD target,
+    # and a same-name PVC in the corrected namespace would silently widen
+    # the whitelist onto a disk the target never uses. Drop, fail closed
+    # (the vehicle exception stays banned until a fresh approval
+    # re-discovers claims).
+    if (
+        "labels" in corrections
+        or "names" in corrections
+        or "namespace" in corrections
+    ):
         pvc_claims: tuple[str, ...] = ()
     else:
         pvc_claims = tuple(existing.get("pvc_claims") or ())
 
+    # Case-manifest mechanism entries are legislation parsed from the
+    # case file at settlement — orthogonal to the victim identity
+    # correction above: a names/labels correction never stales them
+    # (they anchor the MECHANISM domain, not the victim). Carry them
+    # forward verbatim so mechanism writes stay in-contract after the
+    # snapshot rebuild; dropping them would regress every frozen
+    # mechanism write into drift.
+    mechanism_entries = entries_from_list(existing.get("mechanism_entries"))
+
     result: dict = {"fault_spec": new_spec.to_dict()}
     result["approved_target"] = freeze_approved_target_from_spec(
         new_spec, owner_names=owner_names, resolved_names=resolved_names,
-        pvc_claims=pvc_claims,
+        pvc_claims=pvc_claims, mechanism_entries=mechanism_entries,
+        # The drift-correction card ran under a human's eyes, so the
+        # rebuild counts as an approval: the pending marker clears
+        # (explicit here to document the semantics; the sentinel would
+        # otherwise terminate the corrected run at the next entry).
+        widening_pending_approval=False,
     )
     return result
 

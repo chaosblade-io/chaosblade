@@ -1,14 +1,18 @@
 /**
- * Boot-time card listing tasks in non-terminal states. When empty,
- * shows a single "no pending tasks" line; when non-empty, lists
- * task_id + state + fault_type per row so the user can `/replay <id>`
- * or `blade-ai recover <id>` to resume.
+ * Boot-time card listing tasks whose liability verdict says the fault
+ * may still be live (round-32), split into THREE display groups
+ * (round-32b) by what the row itself claims vs what the ledger says:
+ * in-flight (drill still running) / awaiting recovery (run stopped,
+ * fault on the books) / completed-but-uncleared (a settled word over
+ * a live ledger — the ghost family). When empty, shows a single "no
+ * pending tasks" line; each row carries task_id + state + fault_type
+ * so the user can `/replay <id>` or `blade-ai recover <id>` to resume.
  */
 
 import { Box, Text } from "ink";
 import { memo } from "react";
 import { t } from "@blade-ai/core";
-import type { PendingTasksCardItem } from "@blade-ai/core";
+import type { PendingTasksCardItem, PendingTaskRow } from "@blade-ai/core";
 import { Theme } from "../../theme/colors.js";
 import { Icons } from "../../theme/icons.js";
 import { BootCardFrame } from "./BootCardFrame.js";
@@ -78,6 +82,19 @@ const STATE_VISUALS: Record<string, Visual> = {
   interrupted: { color: Theme.status.warn, glyph: "◐" },
   partial_recovered: { color: Theme.status.warn, glyph: "◐" },
   cancelled: { color: Theme.status.warn, glyph: "⊘" },
+  // Tier 2½ — fault effect UNCONFIRMED (round-17 C1): verification ran
+  // but evidence is unavailable, so the fault is suspected LIVE
+  // (fail-closed: “不知道 ≠ 不在”). These rows enter the card via the
+  // liability verdict filter (round-32: ``liability_live`` keeps
+  // unverified rows recoverable by evidence, not by word membership)
+  // and MUST read as "you should look at this", NOT the gray fallback —
+  // the header's "only rejected renders gray" invariant stays true.
+  unverified: { color: Theme.status.warn, glyph: "◌" },
+  // Tier 2½ — newborn anchor (round-17 D4): a row with zero lifecycle
+  // evidence has not entered its pipeline yet — neutral-faint family:
+  // not urgent (nothing has fired), but not gray-fallback either
+  // (the row exists and deserves a distinguishable dot).
+  pending: { color: Theme.gray[500], glyph: "◌" },
   // Tier 3 — settled / safe.
   recovered: { color: Theme.status.ok, glyph: "●" },
   completed: { color: Theme.status.ok, glyph: "●" },
@@ -93,9 +110,120 @@ function stateVisual(state: string): Visual {
   return STATE_VISUALS[state] ?? FALLBACK;
 }
 
+// Round-32b — the three-group split of liability-live rows, in display
+// order. Loudness tracks the ledger-vs-word mismatch: in_flight is
+// normal traffic (quiet secondary), needs_recovery asks for action
+// (amber), uncleared is the ghost — the row CLAIMS settlement while
+// the wings stay unbalanced (err red, loudest). Group membership is
+// legislated server-side (``liability_group_for`` in state.py) and
+// arrives on the row; this table holds presentation only, never the
+// word→group derivation (the PENDING_STATES drift family stays
+// retired).
+const GROUP_ORDER = ["in_flight", "needs_recovery", "uncleared"] as const;
+type GroupKey = (typeof GROUP_ORDER)[number];
+
+const GROUP_META: Record<GroupKey, { i18nKey: string; color: string; glyph: string }> = {
+  in_flight: {
+    i18nKey: "boot.pending.group_in_flight",
+    color: Theme.text.secondary,
+    glyph: "⠿",
+  },
+  needs_recovery: {
+    i18nKey: "boot.pending.group_needs_recovery",
+    color: Theme.status.warn,
+    glyph: "◉",
+  },
+  uncleared: {
+    i18nKey: "boot.pending.group_uncleared",
+    color: Theme.status.err,
+    glyph: "⚠",
+  },
+};
+
+function isGroupKey(value: string | undefined): value is GroupKey {
+  return (
+    value !== undefined && (GROUP_ORDER as readonly string[]).includes(value)
+  );
+}
+
+function TaskRow({
+  row,
+  indent,
+}: {
+  row: PendingTaskRow;
+  indent: number;
+}): React.ReactElement {
+  // Glyph fixed-width + state fixed-width + task_id flexible
+  // + fault_type fills remaining space. task_id is the most
+  // valuable column for /replay / blade-ai recover invocations,
+  // so we give it the bigger share via flexGrow=2.
+  //
+  // Width note: the state column was 16 cols when the only
+  // displayed states were ``injected``/``running``/``failed``;
+  // the redesigned palette covers ``pending_confirmation`` and
+  // ``partial_recovered`` (20 chars each) so widen to 22 to
+  // keep all rows aligned without truncation. flexShrink=0
+  // protects the column under narrow terminals.
+  const v = stateVisual(row.state);
+  return (
+    <Box marginLeft={indent}>
+      <Box minWidth={3} flexShrink={0}>
+        <Text color={v.color} bold={v.bold}>
+          {v.glyph}
+        </Text>
+      </Box>
+      <Box minWidth={22} flexShrink={0}>
+        <Text color={v.color} bold={v.bold}>
+          {row.state}
+        </Text>
+      </Box>
+      <Box flexGrow={2} flexBasis={0} paddingRight={2}>
+        <Text color={Theme.text.primary} wrap="truncate-end">
+          {row.taskId}
+        </Text>
+      </Box>
+      {row.faultType ? (
+        <Box flexGrow={1} flexBasis={0}>
+          <Text color={Theme.text.secondary} wrap="truncate-end">
+            {row.faultType}
+          </Text>
+        </Box>
+      ) : (
+        <Box flexGrow={1} flexBasis={0} />
+      )}
+    </Box>
+  );
+}
+
 const PendingTasksCardInternal: React.FC<{ item: PendingTasksCardItem }> = ({
   item,
 }) => {
+  // Round-32b — bucket the rows by the server-legislated group. Rows
+  // WITHOUT one (history payloads persisted before round-32b, or a
+  // server predating the field) keep the flat legacy layout instead of
+  // being force-bucketed — an unknown group is not "in flight".
+  const buckets: Record<GroupKey, PendingTaskRow[]> = {
+    in_flight: [],
+    needs_recovery: [],
+    uncleared: [],
+  };
+  const legacy: PendingTaskRow[] = [];
+  for (const row of item.tasks) {
+    // Fail-safe (round-32b F-1): the TS literal union is a compile-time
+    // claim, but the field is RUNTIME wire data — a server vocabulary
+    // drift (or a newer server paired with an older TUI binary in the
+    // independent-distribution upgrade window) can deliver a group
+    // word this build never legislated. ``buckets[unknownWord]`` is
+    // undefined and ``undefined.push`` would crash the whole boot card;
+    // the unknown word degrades to the flat legacy layout instead,
+    // mirroring the fetcher's "a boot card is never worth failing a
+    // boot over" contract on the render face.
+    if (isGroupKey(row.group)) {
+      buckets[row.group].push(row);
+    } else {
+      legacy.push(row);
+    }
+  }
   return (
     <BootCardFrame>
       <Box marginBottom={1}>
@@ -108,48 +236,25 @@ const PendingTasksCardInternal: React.FC<{ item: PendingTasksCardItem }> = ({
           <Text color={Theme.text.secondary}>{t("boot.pending.empty")}</Text>
         </Box>
       ) : (
-        item.tasks.map((row) => {
-          // Glyph fixed-width + state fixed-width + task_id flexible
-          // + fault_type fills remaining space. task_id is the most
-          // valuable column for /replay / blade-ai recover invocations,
-          // so we give it the bigger share via flexGrow=2.
-          //
-          // Width note: the state column was 16 cols when the only
-          // displayed states were ``injected``/``running``/``failed``;
-          // the redesigned palette covers ``pending_confirmation`` and
-          // ``partial_recovered`` (20 chars each) so widen to 22 to
-          // keep all rows aligned without truncation. flexShrink=0
-          // protects the column under narrow terminals.
-          const v = stateVisual(row.state);
-          return (
-            <Box key={row.taskId}>
-              <Box minWidth={3} flexShrink={0}>
-                <Text color={v.color} bold={v.bold}>
-                  {v.glyph}
+        <>
+          {GROUP_ORDER.filter((g) => buckets[g].length > 0).map((g) => (
+            <Box key={g} flexDirection="column" marginBottom={1}>
+              <Box marginLeft={1}>
+                <Text color={GROUP_META[g].color} bold>
+                  {GROUP_META[g].glyph} {t(GROUP_META[g].i18nKey)}
                 </Text>
               </Box>
-              <Box minWidth={22} flexShrink={0}>
-                <Text color={v.color} bold={v.bold}>
-                  {row.state}
-                </Text>
-              </Box>
-              <Box flexGrow={2} flexBasis={0} paddingRight={2}>
-                <Text color={Theme.text.primary} wrap="truncate-end">
-                  {row.taskId}
-                </Text>
-              </Box>
-              {row.faultType ? (
-                <Box flexGrow={1} flexBasis={0}>
-                  <Text color={Theme.text.secondary} wrap="truncate-end">
-                    {row.faultType}
-                  </Text>
-                </Box>
-              ) : (
-                <Box flexGrow={1} flexBasis={0} />
-              )}
+              {buckets[g].map((row) => (
+                <TaskRow key={row.taskId} row={row} indent={2} />
+              ))}
             </Box>
-          );
-        })
+          ))}
+          {legacy.length > 0
+            ? legacy.map((row) => (
+                <TaskRow key={row.taskId} row={row} indent={0} />
+              ))
+            : null}
+        </>
       )}
     </BootCardFrame>
   );

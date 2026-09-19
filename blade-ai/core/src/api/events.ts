@@ -23,6 +23,7 @@ export type StreamEventType =
   | "usage"
   | "memory_compaction"
   | "context_size"
+  | "fault_window"
   | "done";
 
 export interface StreamEventBase {
@@ -170,6 +171,12 @@ export interface UsageEvent extends StreamEventBase {
   type: "usage";
   input_tokens: number;
   output_tokens: number;
+  /** Prompt-cache hits — a SUBSET of ``input_tokens`` (not additive);
+   *  cache hit rate = ``cached_tokens / input_tokens``. Optional so frames
+   *  from older servers (pre-cache-telemetry) still type-check; the server
+   *  now always forces it onto the wire and the reducer coerces a missing
+   *  field to 0. */
+  cached_tokens?: number;
 }
 
 /**
@@ -249,6 +256,30 @@ export interface ContextSizeEvent extends StreamEventBase {
   context_messages_count: number;
 }
 
+/**
+ * Fault-window hold lifecycle (``turn_hold_fault_window`` opt-in).
+ *
+ * Emitted by the server's hold loop while a turn is held open through
+ * the injection contract window — the evaluation protocol's "fault
+ * stays present, recovery reported from this stream" mode:
+ *
+ *   - ``enter`` — window starts (or is joined mid-flight); payload
+ *     carries ``inject_task_id`` / ``duration_sec`` / ``remaining_sec``
+ *     / ``until_ts``.
+ *   - ``tick``  — every ~30s; ``remaining_sec`` re-synchronises the
+ *     client's local 1Hz countdown against server clock truth.
+ *   - ``exit``  — window over (``reason``: "elapsed" | "early" |
+ *     "aborted"); the recover graph follows on the same stream.
+ *
+ * ``content`` is a JSON-stringified payload (same convention as
+ * ``result``): the wire type carries no per-phase fields, so the
+ * mapping layer parses and dispatches per phase.
+ */
+export interface FaultWindowEvent extends StreamEventBase {
+  type: "fault_window";
+  content: string;
+}
+
 export type StreamEvent =
   | TokenEvent
   | ThinkingEvent
@@ -265,6 +296,7 @@ export type StreamEvent =
   | UsageEvent
   | MemoryCompactionEvent
   | ContextSizeEvent
+  | FaultWindowEvent
   | DoneEvent;
 
 /** Type guard helper. */
@@ -287,6 +319,7 @@ export function isStreamEvent(value: unknown): value is StreamEvent {
     t === "usage" ||
     t === "memory_compaction" ||
     t === "context_size" ||
+    t === "fault_window" ||
     t === "done"
   );
 }

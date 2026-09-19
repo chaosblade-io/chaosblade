@@ -26,6 +26,28 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Standalone ``df`` token — catches ``df``, ``df -h``, ``df -k /tmp``;
+# rejects ``diff`` and ``df.txt`` (no whitespace/end boundary after "df").
+_DF_TOKEN = re.compile(r"(?:^|\s)df(?:\s|$)")
+
+# Standalone ``get`` token — catches ``get pods -n default
+# --no-headers``, ``get sa,role,rolebinding -n default``; rejects
+# ``forget`` and "budget" (no whitespace/end boundary after "get").
+_GET_TOKEN = re.compile(r"(?:^|\s)get(?:\s|$)")
+
+# Output forms that rewrite the kubectl table into something that is
+# NOT a line-per-resource table (JSON/YAML/custom-columns/jsonpath).
+# ``-o name`` and ``-o wide`` ARE tables — not excluded.
+_NON_TABLE_OUTPUT = re.compile(
+    r"-o\s*(json|yaml|custom-columns)|-ojson|--output=(json|yaml)|jsonpath"
+)
+
+# kubectl table headers are ALL-CAPS tokens (NAME, READY, STATUS,
+# UP-TO-DATE, RESTARTS, AGE …) — a data row can't match this: pod
+# names are lowercase hashes, IPs contain dots, AGE suffixes ("23d")
+# and restart counts ("0/1" or "0") mix lowercase/slash.
+_TABLE_HEADER_TOKEN = re.compile(r"^[A-Z0-9_-]+$")
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -61,9 +83,15 @@ def extract_metrics(
     cmd_lower = (command or "").lower()
     metrics: dict[str, str] = {}
 
-    # ── df -h (host or container fs via kubectl exec)
-    if "df -h" in cmd_lower or "df --human" in cmd_lower:
-        metrics.update(_parse_df_h(stdout))
+    # ── df family (host or container fs via kubectl exec) — ``df``,
+    #    ``df -h``, ``df -k /tmp``: any standalone ``df`` token. The
+    #    disk cases' primary evidence command is ``df -k`` (KB precision,
+    #    mandated by the #9 quality bar over Use%'s coarse granularity) —
+    #    the old "-h"-only literal left every verify-phase ``df -k`` call
+    #    out of the metric timeline (no auto-summary, no cross-check
+    #    ground truth for the primary evidence channel).
+    if _DF_TOKEN.search(cmd_lower):
+        metrics.update(_parse_df_usage(stdout))
 
     # ── kubectl describe pod / po
     if "describe pod" in cmd_lower or "describe po " in cmd_lower:
@@ -95,6 +123,15 @@ def extract_metrics(
     if " logs " in f" {cmd_lower} " or cmd_lower.startswith("logs "):
         metrics.update(_parse_kubectl_logs(stdout))
 
+    # ── kubectl get <resource> — table data-row count. The one fact most
+    #    often lost to the tool-compactor's 1KB historical demotion:
+    #    #13-R's 92-pod namespace listing (9785B) demoted to a 1018B head
+    #    lost the very number the plan was built around, costing 226s of
+    #    re-probing. The [Auto-extracted] head carrying the count
+    #    survives that demotion (head-only retention).
+    if _GET_TOKEN.search(cmd_lower) and not _NON_TABLE_OUTPUT.search(cmd_lower):
+        metrics.update(_parse_get_table_rows(stdout))
+
     if metrics:
         logger.debug(
             "extract_metrics(%s, %r) → %s",
@@ -108,14 +145,27 @@ def extract_metrics(
 # ---------------------------------------------------------------------------
 
 
-def _parse_df_h(stdout: str) -> dict[str, str]:
-    """``df -h``: overlay/root partition usage.
+def _parse_df_usage(stdout: str) -> dict[str, str]:
+    """``df`` family (``df``, ``df -h``, ``df -k``): overlay/root usage.
+
+    Same 6-column shape across the byte-usage variants — only the units
+    differ (1K-blocks vs human); the value keeps the raw
+    ``used/total`` strings, so a ``-k`` reading lands as
+    ``"32% (37384168/123456789)"``.
 
     Recognises:
       - ``/``           → overlay/container fs ("Disk usage (overlay)")
       - ``/host``       → host node fs ("Disk usage (nodefs)")
       - filesystems starting with ``overlay`` → also overlay
+
+    Rejected formats (no signal beats a mislabeled signal):
+      - ``df -i`` — inode table: "IUse%" is not disk usage (header
+        carries "Inodes")
+      - ``df -T*`` — extra Type column shifts Use% off position; the
+        per-row "%"-suffix check drops those rows
     """
+    if "Inodes" in stdout:  # df -i header token — inode mode, not bytes
+        return {}
     metrics: dict[str, str] = {}
     for line in stdout.strip().splitlines():
         parts = line.strip().split()
@@ -124,6 +174,8 @@ def _parse_df_h(stdout: str) -> dict[str, str]:
         if parts[0] == "Filesystem":
             continue
         use_pct, mount = parts[4], parts[5]
+        if not use_pct.endswith("%"):
+            continue  # column layout shifted (e.g. df -T) — refuse to guess
         if mount == "/" or parts[0].startswith("overlay"):
             metrics["Disk usage (overlay)"] = f"{use_pct} ({parts[2]}/{parts[1]})"
         elif mount == "/host":
@@ -132,7 +184,8 @@ def _parse_df_h(stdout: str) -> dict[str, str]:
 
 
 def _parse_describe_pod(stdout: str) -> dict[str, str]:
-    """``kubectl describe pod``: restart count, ready state, termination reason."""
+    """``kubectl describe pod``: restart count, container ID, ready state,
+    termination reason."""
     metrics: dict[str, str] = {}
 
     for line in stdout.splitlines():
@@ -143,6 +196,15 @@ def _parse_describe_pod(stdout: str) -> dict[str, str]:
                 metrics["RestartCount"] = str(int(s.split()[-1]))
             except (ValueError, IndexError):
                 pass
+        # ``Container ID:  containerd://a1b2…`` — the last token is the
+        # runtime-qualified ID. A change across the timeline is the
+        # deterministic kill signature (process kill → container
+        # replacement). Last occurrence wins, mirroring Restart Count
+        # (multi-container pods: the rule layer sees the last container).
+        if "Container ID" in s:
+            _cid = s.split()[-1] if s.split() else ""
+            if _cid and "://" in _cid:
+                metrics["Container ID"] = _cid
         # Ready conditions appear in multiple forms:
         #   ``Ready             True``
         #   ``Ready   True``
@@ -188,6 +250,11 @@ def _parse_get_pod_json(stdout: str) -> dict[str, str]:
             cs = cs_list[0]  # first container — caller can re-call per-container
             if "restartCount" in cs:
                 metrics["RestartCount"] = str(cs.get("restartCount", 0))
+            # Container replacement signature (see _parse_describe_pod);
+            # empty containerID (pod not yet started) is skipped.
+            _cid = cs.get("containerID") or ""
+            if _cid:
+                metrics["Container ID"] = _cid
             if "ready" in cs:
                 metrics["Pod Ready"] = "True" if cs["ready"] else "False"
             terminated = (cs.get("lastState") or {}).get("terminated") or {}
@@ -235,19 +302,35 @@ def _parse_kubectl_top(stdout: str) -> dict[str, str]:
 
 
 def _parse_diskstats(stdout: str) -> dict[str, str]:
-    """``/proc/diskstats``: write throughput hint for vdb/sdb device.
+    """``/proc/diskstats``: per-device write sector counters.
+
+    All physical devices (loop/ram/sr/fd excluded) are reported — the
+    injection landing device depends on the case: root-disk overlay
+    injections (pod-disk burn/fill with ``--path /``) land on the system
+    disk (vda/sda, often a partition like vda3) while PVC-backed ones land
+    on the data disk. A hardcoded device pick (the old vdb/sdb guess)
+    silently mis-baselines root-disk injections — Case #10 evidence: IO
+    burn landed on vda3 while the extracted baseline metric pointed at
+    vdb, leaving the baseline layer blind to the actual landing device.
+    Downstream consumers select the device to compare (the
+    ``_filter_metrics_by_fault`` prefix match keeps every
+    ``Disk writes (...)`` key for disk faults).
 
     Field positions per ``Documentation/iostats.txt``:
       [0] major  [1] minor  [2] device-name  …  [9] sectors-written
     """
+    metrics: dict[str, str] = {}
     for line in stdout.strip().splitlines():
         parts = line.strip().split()
         if len(parts) < 11:
             continue
         name = parts[2]
-        if name.startswith("vdb") or name.startswith("sdb"):
-            return {f"Disk writes ({name})": f"{parts[9]} sectors"}
-    return {}
+        # zram excluded alongside loop/ram: RAM-backed swap — its writes
+        # are memory ops, not disk traffic.
+        if name.startswith(("loop", "ram", "zram", "sr", "fd")):
+            continue
+        metrics[f"Disk writes ({name})"] = f"{parts[9]} sectors"
+    return metrics
 
 
 def _parse_proc_stat(stdout: str) -> dict[str, str]:
@@ -309,6 +392,46 @@ def _parse_kubectl_logs(stdout: str) -> dict[str, str]:
     }
 
 
+def _parse_get_table_rows(stdout: str) -> dict[str, str]:
+    """``kubectl get <resource>`` table listing: number of data rows.
+
+    The count is the fact most often lost to the tool-compactor's 1KB
+    historical demotion — a 92-pod namespace listing (9785B) demoted to
+    a 1018B head loses the very number the plan was built around
+    (#13-R: 226s of re-probing to recover it). The [Auto-extracted]
+    head carrying ``List rows=92`` survives that demotion.
+
+    Format contract (deliberately narrow, kubectl-only):
+      - header row: every whitespace token matches ``[A-Z0-9_-]+``
+        (NAME, READY, UP-TO-DATE …) → data rows = non-empty lines − 1
+      - ``--no-headers`` / ``-o name`` listings: no header → data
+        rows = non-empty lines
+      - empty listings (``No resources found`` / the kubectl tool's
+        ``💡 No resources matched`` hint) and error envelopes
+        (``Error: …``) carry no row signal → ``{}``
+
+    A data row that happens to be all-caps tokens would overcount by
+    one header; accepted — kubectl data rows (lowercase hashes, IPs,
+    ages, timestamps) never matched that shape in practice.
+    """
+    if stdout.lstrip().startswith("Error:"):
+        return {}
+    lower = stdout.lower()
+    if "no resources found" in lower or "no resources matched" in lower:
+        return {}
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    if not lines:
+        return {}
+    first_tokens = lines[0].split()
+    if all(_TABLE_HEADER_TOKEN.match(t) for t in first_tokens):
+        rows = len(lines) - 1
+    else:
+        rows = len(lines)
+    if rows <= 0:
+        return {}
+    return {"List rows": str(rows)}
+
+
 # ---------------------------------------------------------------------------
 # Baseline integration — backward-compat wrapper used by
 # ``_verifier_hints._extract_baseline_key_metrics``.
@@ -358,6 +481,9 @@ def extract_baseline_metrics(
 _ALWAYS_KEEP = frozenset({
     "RestartCount", "Pod Ready", "Pod phase",
     "Last termination reason", "Target path size",
+    # Container replacement signature — same tier as RestartCount (pod
+    # identity facts, relevant to every fault family's timeline).
+    "Container ID",
 })
 
 _FAULT_METRICS: dict[str, frozenset[str]] = {

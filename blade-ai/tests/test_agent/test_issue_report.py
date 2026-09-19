@@ -166,9 +166,12 @@ class TestShouldPublish:
         )
         assert should_publish_issue(state, s) is False
 
-    def test_on_when_unverified(self):
-        """Card-badge parity: L1 passed but level=unverified is FAILED on
-        the card (timeout without a verdict), so it publishes."""
+    def test_off_when_unverified(self):
+        """Card-badge parity: L1 passed but level=unverified is no longer
+        FAILED on the card (it is its own "unverified" knowledge claim —
+        observation unavailable, no counter-evidence), so no issue is
+        attempted. The local postmortem still records the run; the GitHub
+        issue is reserved for actual drill failures."""
         s = _GateSettings()
         state = _failed_inject_state(
             failure_detail=None,
@@ -179,7 +182,7 @@ class TestShouldPublish:
                 "layer2": {"status": "unknown"},
             },
         )
-        assert should_publish_issue(state, s) is True
+        assert should_publish_issue(state, s) is False
 
     def test_off_for_user_rejected_category(self):
         """Pre-execution rejection — the user said no at the confirm

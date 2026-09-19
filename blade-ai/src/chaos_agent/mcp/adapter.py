@@ -18,8 +18,29 @@ from typing import Any
 from langchain_core.tools import StructuredTool
 
 from chaos_agent.mcp.client import McpClient, McpToolDescriptor
+from chaos_agent.mcp.effect import (
+    EFFECT_DESTRUCTIVE,
+    EFFECT_READONLY,
+    EFFECT_UNSPECIFIED,
+)
 
 logger = logging.getLogger(__name__)
+
+# Advisory effect suffix appended to the tool description so the LLM
+# sees the read/write attribute and judges the call itself (posture B —
+# transparency, never gating). The guard classifier is untouched; a
+# destructive-labelled tool is still passed through READONLY.
+_EFFECT_HINTS: dict[str, str] = {
+    EFFECT_DESTRUCTIVE:
+        "\n\n[Effect: DESTRUCTIVE — server/operator declares this tool may "
+        "change or cancel external state. It is not gated; call it only if "
+        "this drill step truly needs it.]",
+    EFFECT_READONLY:
+        "\n\n[Effect: read-only — declared to only read state.]",
+    EFFECT_UNSPECIFIED:
+        "\n\n[Effect: unspecified — no read/write declaration from operator "
+        "or server; treat side effects as unknown.]",
+}
 
 # OpenAI tool name max length is 64 characters.
 _OPENAI_TOOL_NAME_MAX = 64
@@ -70,6 +91,7 @@ def make_langchain_tool(
     client: McpClient,
     descriptor: McpToolDescriptor,
     timeout_seconds: int,
+    effect: str = EFFECT_UNSPECIFIED,
 ) -> StructuredTool:
     """Wrap an MCP tool descriptor as a LangChain StructuredTool.
 
@@ -77,6 +99,10 @@ def make_langchain_tool(
     the tool result (rather than raising) so the LLM can recover by
     trying another approach. Timeout per call is enforced via
     ``asyncio.wait_for``.
+
+    ``effect`` (resolved by ``mcp.effect.resolve_tool_effect``) is
+    appended to the description as an advisory read/write label so the
+    LLM can judge the call; it never affects execution or gating.
     """
     full_name = _safe_tool_name(client.name, descriptor.name)
     mcp_name = descriptor.name  # name as the server knows it
@@ -101,9 +127,12 @@ def make_langchain_tool(
     # so LangChain treats the tool as no-arg.
     schema = descriptor.input_schema or {"type": "object", "properties": {}}
 
+    base_description = descriptor.description or f"MCP tool {full_name}"
+    hint = _EFFECT_HINTS.get(effect, _EFFECT_HINTS[EFFECT_UNSPECIFIED])
+
     return StructuredTool(
         name=full_name,
-        description=descriptor.description or f"MCP tool {full_name}",
+        description=base_description + hint,
         args_schema=schema,
         coroutine=_coroutine,
     )

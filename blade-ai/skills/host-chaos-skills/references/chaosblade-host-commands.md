@@ -174,6 +174,11 @@ blade create process kill --process nginx --signal 9 --timeout 60
 blade create process kill --local-port 8080 --signal 15 --timeout 60
 ```
 
+> ⚠️ 取证警示（chaosblade-exec-os `exec/process/process_kill.go` `KillProcessExecutor.Exec`）：
+> kill 仅在实验创建时发送**一次**信号——`--count` 执行器从不读取，不存在持续杀死；
+> `--timeout` 只控制实验记录销毁，destroy 也不恢复进程。持续型「进程被杀死」演练
+> 不用本命令，见用例 Host_进程异常_进程被杀死（有界 kill 循环形态）。
+
 ### `blade create process stop`
 
 进程假死/挂起实验（SIGSTOP）。

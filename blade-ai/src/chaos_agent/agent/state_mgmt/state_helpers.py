@@ -21,6 +21,15 @@ def fail_state(
     Returns keys: ``failure_detail`` (structured dict) and ``error``
     (short string for logs/UI fallback).
 
+    CONTRACT WARNING: this helper only *records* failure — it never
+    terminates the graph.  Termination is the caller's routing decision:
+    a node that returns ``fail_state(...)`` alongside a continue-style
+    route (e.g. the screener's old ``RETRY``) produces a ghost run — the
+    graph keeps looping after death was declared, and the stale ``error``
+    leaks into the next attempt where the router short-circuits on it
+    (W-56-5 defect a, task #56).  Loop-internal nodes MUST pair
+    ``fail_state`` with a terminal route.
+
     If *llm_analysis* is provided directly it takes precedence over
     running ``extract_llm_diagnosis`` on *messages*.
     """

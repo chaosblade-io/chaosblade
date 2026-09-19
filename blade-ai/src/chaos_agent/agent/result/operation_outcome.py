@@ -12,9 +12,19 @@ result builders and terminal nodes do not accidentally cross the two lanes.
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Mapping
+
+from chaos_agent.agent.result.verdict import (
+    INJECT_VERDICT_VALUES,
+    RECOVER_VERDICT_VALUES,
+    InjectVerdict,
+    RecoverVerdict,
+)
+
+logger = logging.getLogger(__name__)
 
 
 _MISSING = object()
@@ -41,16 +51,76 @@ def _copy_optional(value: Any) -> Any:
     return deepcopy(value) if value is not None else None
 
 
-def read_inject_verification(state: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Read the injection verification result from state."""
+def _gate_verification_level(
+    verification: dict[str, Any] | None,
+    closed_set: frozenset[str],
+    clamp_to: str,
+    domain: str,
+) -> dict[str, Any] | None:
+    """Read-side level closed-set gate (B76 round-15 D5).
 
-    return _copy_dict(state.get("verification"))
+    A verification read back from state/persistence with a level OUTSIDE
+    its closed set (legacy fossil word, foreign writer) is clamped to the
+    domain's fail-closed word and warned — mirroring the write-path clamps
+    (inject finalize → "unverified", recover parse → "unrecovered") so
+    both sides of the boundary enforce the same vocabulary. A MISSING
+    level key passes through unchanged (schema tolerance for legacy
+    states); the underlying state dict is NEVER rewritten — the gate
+    operates on the defensive copy ``_copy_dict`` already made.
+    """
+    if not isinstance(verification, dict) or "level" not in verification:
+        return verification
+    level = verification["level"]
+    if isinstance(level, str) and level in closed_set:
+        return verification
+    logger.warning(
+        "%s verification level %r outside closed set; clamped to %r "
+        "(read-side gate, underlying state untouched)",
+        domain,
+        level,
+        clamp_to,
+    )
+    verification["level"] = clamp_to
+    return verification
+
+
+def read_inject_verification(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read the injection verification result from state.
+
+    The level passes a read-side closed-set gate (round-15 D5): an
+    out-of-set word (e.g. a legacy fossil) clamps to "unverified" — the
+    same word the inject finalize write-clamp uses.
+    """
+
+    verification = _copy_dict(state.get("verification"))
+    return _gate_verification_level(
+        verification,
+        INJECT_VERDICT_VALUES,
+        InjectVerdict.UNVERIFIED.value,
+        "inject",
+    )
 
 
 def read_recover_verification(state: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Read the recovery verification result from state."""
+    """Read the recovery verification result from state.
 
-    return _copy_dict(state.get("recover_verification"))
+    The level passes a read-side closed-set gate (round-15 D5): an
+    out-of-set word (e.g. the legacy "failed" fossil — its historical
+    "still failed" reading is what the counter-evidence word
+    "unrecovered" now spells) clamps to "unrecovered" — the same word
+    the recover parse write-clamp uses. The pre-gate coincidence (every
+    downstream consumer treats "failed" ∉ success sets, so the fossil
+    accidentally behaved like "unrecovered") is now an explicit
+    contract instead of luck.
+    """
+
+    verification = _copy_dict(state.get("recover_verification"))
+    return _gate_verification_level(
+        verification,
+        RECOVER_VERDICT_VALUES,
+        RecoverVerdict.UNRECOVERED.value,
+        "recover",
+    )
 
 
 def read_verification_side_effects(verification: Mapping[str, Any] | None) -> Any | None:

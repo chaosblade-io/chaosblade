@@ -6,6 +6,11 @@ can be independently split into sub-modules without circular imports.
 
 import re
 
+from chaos_agent.agent.nodes.baseline._commands import (
+    _is_empty_observation,
+    _is_observation_success,
+)
+from chaos_agent.agent.result.verdict import LAYER2_PARSE_KEYWORDS
 from chaos_agent.agent.state import AgentState
 
 
@@ -22,13 +27,7 @@ def _has_negative_prefix(text: str, keyword: str) -> bool:
     return prefix.endswith("not") or prefix.endswith("un")
 
 
-def _parse_status_keyword(text: str, keywords: tuple = (
-    "recovered_before_observation",  # MUST be before "partial" — longer keyword first
-    "passed",
-    "failed",
-    "skipped",
-    "partial",
-)) -> str:
+def _parse_status_keyword(text: str, keywords: tuple = LAYER2_PARSE_KEYWORDS) -> str:
     """Parse status keyword with negation awareness.
 
     Returns the status ('passed', 'failed', 'skipped', 'partial',
@@ -74,19 +73,52 @@ def _compute_baseline_confidence(state: AgentState) -> str:
     """Compute baseline_confidence from state's baseline_data.
 
     Returns:
-        "high" — baseline captured with all commands succeeding
-        "partial" — baseline captured but some commands failed
-        "none" — no baseline data or zero successes
+        "high" — baseline captured with all commands succeeding AND none
+        of the successes empty-spinning (#16 fix C — an empty success
+        carries no comparison value, so "4/4 succeeded" with 3 of them
+        empty must not read as a high-quality baseline)
+        "partial" — baseline captured but some commands failed or span empty
+        "none" — no baseline data, zero successes, or every success empty
     """
     baseline = state.get("baseline_data")
     if not baseline:
         return "none"
     success_count = baseline.get("success_count", 0)
-    if success_count <= 0:
+    # Validity axis (#16 fix C): ``valid_count`` counts observations that
+    # carry a usable baseline value — a non-empty success, or a judged
+    # expected absence (the absence IS the value, #31 — a pure pre-check
+    # baseline has success_count 0 yet its absences are exactly what
+    # verify must compare against, so the old ``success_count <= 0``
+    # early-exit misclassified it as "none"). ``empty_count`` counts
+    # unexplained empty spins. Legacy baselines captured before the fix
+    # lack both fields; recompute from the observation list so hydrated
+    # old tasks classify identically to fresh ones.
+    observations = baseline.get("observations", [])
+    valid_count = baseline.get("valid_count")
+    if valid_count is None:
+        valid_count = sum(
+            1 for obs in observations
+            if (_is_observation_success(obs)
+                and not _is_empty_observation(obs))
+            or obs.get("expected_absence")
+        )
+    empty_count = baseline.get("empty_count")
+    if empty_count is None:
+        empty_count = sum(
+            1 for obs in observations
+            if _is_observation_success(obs)
+            and _is_empty_observation(obs)
+            and not obs.get("expected_absence")
+        )
+    if valid_count <= 0:
+        # Nothing carries a value: every "success" is empty and nothing
+        # was judged absent — execution may have succeeded, but nothing
+        # was observed and no absence was established. Not a usable
+        # baseline.
         return "none"
     # Derive total from observations list length
-    total = baseline.get("total_count", len(baseline.get("observations", [])))
-    if total > 0 and success_count >= total:
+    total = baseline.get("total_count", len(observations))
+    if total > 0 and success_count >= total and empty_count <= 0:
         return "high"
     return "partial"
 

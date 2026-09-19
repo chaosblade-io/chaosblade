@@ -46,8 +46,10 @@ from chaos_agent.agent.providers.base import (
 )
 from chaos_agent.agent.providers.message_scanning import (
     KUBECTL_COMMAND_SUBCOMMANDS,
+    KUBECTL_EXEC_VALUE_FLAGS as _EXEC_FLAGS_WITH_VALUE,
     build_tool_call_args_lookup,
 )
+from .verify import classify_blade_exec_payload
 from chaos_agent.transports import PROFILE_HOST, PROFILE_K8S
 
 # NOTE: this module must keep importing ONLY providers-internal + stdlib
@@ -65,6 +67,8 @@ from chaos_agent.transports import PROFILE_HOST, PROFILE_K8S
 if TYPE_CHECKING:
     from langchain_core.tools import BaseTool
 
+    from chaos_agent.agent.providers.base import DestroyOutcome
+    from chaos_agent.tools.request_identity import RequestFingerprint
     from chaos_agent.agent.result.verdict import Layer1Result
 
     from chaos_agent.agent.target_guard.types import EffectiveTarget
@@ -74,9 +78,9 @@ logger = logging.getLogger(__name__)
 # UID shape inside a FAILED blade_create result (``UID: <uid>`` / JSON) — a
 # terminal create failure never counts as an active experiment, but its CRD
 # may still exist and needs cleanup, so the provenance gate must accept it.
-_FAILED_CREATE_UID_RE = re.compile(
-    r'(?:UID:\s*|"uid"\s*:\s*")([a-fA-F0-9][a-fA-F0-9-]{7,})'
-)
+# Lives in ``verify.py`` (round-14 G1) — the inline create scan needs the
+# same vocabulary, and provider→verify is this package's established
+# import direction.
 
 
 # ---------------------------------------------------------------------------
@@ -89,18 +93,11 @@ _POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
 
 # kubectl exec flags that consume a following value. Anything else starting
 # with '-' is treated as a boolean flag (-i/-t/-q/--stdin/--tty/...).
-_EXEC_FLAGS_WITH_VALUE = frozenset(
-    {
-        "-n",
-        "--namespace",
-        "-c",
-        "--container",
-        "--profile",
-        "--context",
-        "--kubeconfig",
-        "--pod-running-timeout",
-    }
-)
+# Single-sourced as ``KUBECTL_EXEC_VALUE_FLAGS`` — DECLARED in
+# ``tools._readonly_facts`` (R44: the read-only judge walks the same table)
+# and re-exported by ``providers.message_scanning``, which this module may
+# import at module level (providers-internal); the alias import above keeps
+# this module's historical name readable.
 
 
 def _parse_pod_name_from_v_args(v_args: str) -> str | None:
@@ -140,13 +137,13 @@ def _parse_pod_name_from_v_args(v_args: str) -> str | None:
     return None
 
 
-def _find_pod_name_from_aimessages(
-    messages: list, *, v_args_hint: str = ""
-) -> str | None:
+def _find_pod_name_from_aimessages(messages: list) -> str | None:
     """Fallback: scan AIMessages for kubectl exec blade create tool calls.
 
     Used when ToolMessage lacks tool_call_id (older session format).
-    Returns the pod name from the most recent matching AIMessage.
+    Returns the pod name from the most recent matching AIMessage. The
+    blade-create delivery judgement is the syntax classifier's (round-15
+    root fix — the word gate here was one of the same-disease sites).
     """
     for msg in reversed(messages):
         if not isinstance(msg, AIMessage):
@@ -163,7 +160,10 @@ def _find_pod_name_from_aimessages(
                 continue
             subcommand = args.get("subcommand", "")
             v_args = args.get("v_args", "") or ""
-            if subcommand == "exec" and v_args_hint in v_args and "create" in v_args:
+            if (
+                subcommand == "exec"
+                and classify_blade_exec_payload(v_args).has_create
+            ):
                 pod_name = _parse_pod_name_from_v_args(v_args)
                 if pod_name:
                     return pod_name
@@ -213,7 +213,10 @@ def extract_kubectl_exec_pod_name(messages: list) -> str | None:
             args = lookup[tc_id]
             subcommand = args.get("subcommand", "")
             v_args = args.get("v_args", "") or ""
-            if subcommand == "exec" and "blade" in v_args and "create" in v_args:
+            if (
+                subcommand == "exec"
+                and classify_blade_exec_payload(v_args).has_create
+            ):
                 pod_name = _parse_pod_name_from_v_args(v_args)
                 if pod_name:
                     return pod_name
@@ -222,7 +225,7 @@ def extract_kubectl_exec_pod_name(messages: list) -> str | None:
             continue
 
         # No tool_call_id (older session format) — scan AIMessages directly
-        pod_name = _find_pod_name_from_aimessages(messages, v_args_hint="blade")
+        pod_name = _find_pod_name_from_aimessages(messages)
         if pod_name:
             return pod_name
 
@@ -316,6 +319,60 @@ def parse_blade_flags(flags_str: str) -> dict[str, str]:
 # prefix) resolves to scope=node.
 
 
+# Identity/environment flags that must ride their DEDICATED schema params,
+# never the free-form ``flags`` string. The executor appends ``flags`` to
+# the END of the blade command (cli.py ``cmd.extend(_split_args(flags))``)
+# with zero filtering, and duplicated matcher flags follow pflag LAST-WINS
+# (probe D5/D6, blade CLI live: ``--names drill-t ... --names evil-pod``
+# created an experiment whose CRD matcher recorded ONLY evil-pod, and the
+# destroy receipt echoed ``"flags":{"names":"ghost-b"}`` — the second
+# value won). So a ``flags``-embedded matcher silently overrides whatever
+# the guard anchored from the dedicated params: the guard approves
+# drill-t while blade injects evil-pod. The closed denylist covers the
+# k8s identity matchers (--names/--namespace/--labels/--uid — another pod
+# locator in the same bypass class), the eviction selectors, and the
+# environment flags (--kubeconfig/--kubewiz-url/--kubewiz-token). Scene
+# flags (--cpu-percent/--time/...) stay legal: they tune the fault, never
+# select the target. --container-names/--container-ids are deliberately
+# NOT listed: container selection happens WITHIN the --names-selected
+# pods and cannot change the pod-level anchor.
+_FLAGS_IDENTITY_DENYLIST = (
+    "--names",
+    "--namespace",
+    "--labels",
+    "--uid",
+    "--kubeconfig",
+    "--kubewiz-url",
+    "--kubewiz-token",
+    "--evict-count",
+    "--evict-percent",
+)
+
+
+def _flags_identity_violation(flags: str) -> str | None:
+    """First identity flag riding the free-form ``flags`` string, if any.
+
+    Splits with the executor's OWN ``_split_args`` (lazy import — cli.py
+    must stay importable without this provider) so the guard inspects
+    exactly the tokens the executor will append: same function, same
+    input, no divergence surface. Both spellings (``--names evil`` and
+    ``--names=evil``) count.
+    """
+    from chaos_agent.agent.providers.chaosblade.cli import _split_args
+
+    try:
+        tokens = _split_args(flags or "")
+    except (ValueError, TypeError):
+        # Unsplittable flags: the executor's _split_args fails the same
+        # way, so nothing here can reach blade — treat as clean.
+        return None
+    for tok in tokens:
+        for deny in _FLAGS_IDENTITY_DENYLIST:
+            if tok == deny or tok.startswith(deny + "="):
+                return deny
+    return None
+
+
 def _classify_blade_create(args: dict, raw_command: str) -> EffectiveTarget:
     """Classify a ``blade_create`` tool_call.
 
@@ -332,12 +389,46 @@ def _classify_blade_create(args: dict, raw_command: str) -> EffectiveTarget:
     from chaos_agent.agent.target_guard.types import (
         ConfidenceLevel,
         EffectiveTarget,
+        SCOPE_BANNED,
         SCOPE_UNKNOWN,
     )
 
     fault_target = str(args.get("target") or args.get("blade_target") or "").lower()
     fault_action = str(args.get("action") or args.get("blade_action") or "").lower()
     raw_scope = str(args.get("scope") or args.get("blade_scope") or "").lower()
+
+    # Execution-side duration from the free-form flags string (last-wins,
+    # the value the executor's pflag chain would honour). Extracted BEFORE
+    # the identity violation short-circuit so both branches below can
+    # carry it; a banned call never reaches the duration net anyway.
+    timeout_seconds = _extract_timeout_from_flags(str(args.get("flags") or ""))
+
+    # Identity flags in the free-form ``flags`` string are a target-selection
+    # bypass, not a form nuisance: the executor appends them AFTER the
+    # dedicated params and pflag last-wins makes them override what the
+    # guard anchored (probe D5/D6). Fail-closed BEFORE any anchoring — the
+    # same legislation as the kubectl channel's decoy-route ban: an identity
+    # that the guard cannot see must never ride along.
+    violation = _flags_identity_violation(str(args.get("flags") or ""))
+    if violation is not None:
+        return EffectiveTarget(
+            scope=SCOPE_BANNED,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+            reject_detail=(
+                f"blade_create's flags field carries the identity flag "
+                f"{violation}: the executor appends flags after the dedicated "
+                "params and blade CLI lets a repeated matcher flag override "
+                "them, so the guard's anchor would describe a target the "
+                "injection never hits"
+            ),
+            reject_suggestion=(
+                f"Remove {violation} from flags and set the target's identity "
+                "in the dedicated params (names/namespace/labels/kubeconfig) — "
+                "flags is for scene flags only (--cpu-percent, --time, ...)."
+            ),
+        )
 
     # Host scope (bare-metal / VM faults) — identity is the host name, not a
     # k8s namespace/labels selector. Recognised explicitly so host carriers
@@ -362,6 +453,7 @@ def _classify_blade_create(args: dict, raw_command: str) -> EffectiveTarget:
             fault_action=fault_action,
             confidence=ConfidenceLevel.HIGH if host_name else ConfidenceLevel.LOW,
             raw_command=raw_command,
+            timeout_seconds=timeout_seconds,
         )
 
     # Resolve k8s scope: prefer explicit ``scope`` field if it
@@ -402,6 +494,7 @@ def _classify_blade_create(args: dict, raw_command: str) -> EffectiveTarget:
         fault_action=fault_action,
         confidence=confidence,
         raw_command=raw_command,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -481,11 +574,75 @@ def classify_inline_blade(
         ConfidenceLevel,
         EffectiveTarget,
         SCOPE_READONLY,
+        SCOPE_UNKNOWN,
     )
 
-    if len(inner) < 2 or inner[0] != "blade" or inner[1] != "create":
-        # Non-create blade commands (status/destroy/query/version/prepare/revoke)
-        # don't target new k8s resources — guard drift comparison not applicable.
+    if len(inner) < 2 or inner[0] != "blade":
+        # Degenerate inner command — keep the historical read-only
+        # fallback (nothing parseable to anchor).
+        return EffectiveTarget(
+            scope=SCOPE_READONLY,
+            namespace="",
+            raw_command=raw_command,
+            confidence=ConfidenceLevel.HIGH,
+        )
+
+    if inner[1] != "create":
+        if inner[1] in ("destroy", "revoke"):
+            # Experiment cleanup — the SAME mutating action the
+            # blade_destroy tool face performs, arriving over the
+            # kubectl-exec channel (in-cluster delivery, where the
+            # dedicated tool is capability-blocked and the registry
+            # itself instructs the model to ``destroy via kubectl exec
+            # <tool-pod> -- blade destroy <uid>``). Cleanup is NOT
+            # read-only: the readonly bucket's probe-layer twin
+            # (``readonly.py``) has always legislated destroy/revoke as
+            # mutating, while a read-only verdict here let ANY UID pass
+            # with zero provenance (twelfth-round finding E3). Route to
+            # SCOPE_UNKNOWN with the UID extracted, so the screener's
+            # provenance gate — the one the blade_destroy tool face
+            # rides — runs before execution; when the gate never runs,
+            # the UNKNOWN scope fails closed at the guard instead of
+            # passing the cleanup through as read-only.
+            from .verify import destroy_uid_from_tokens
+
+            uid = destroy_uid_from_tokens(inner[2:])
+            if not uid:
+                return EffectiveTarget(
+                    scope=SCOPE_UNKNOWN,
+                    namespace="",
+                    raw_command=raw_command,
+                    confidence=ConfidenceLevel.HIGH,
+                    reject_detail=(
+                        "inline blade destroy/revoke carries no experiment "
+                        "UID: provenance cannot be verified without one"
+                    ),
+                    reject_suggestion=(
+                        "Pass the experiment UID: blade destroy <uid>."
+                    ),
+                )
+            return EffectiveTarget(
+                scope=SCOPE_UNKNOWN,
+                namespace="",
+                blade_destroy_uid=uid,
+                raw_command=raw_command,
+                confidence=ConfidenceLevel.HIGH,
+                reject_detail=(
+                    "inline blade destroy/revoke: experiment cleanup whose "
+                    "UID provenance must be verified against this task's "
+                    "created experiments before it may run"
+                ),
+                reject_suggestion=(
+                    "Only destroy the UID the current task's blade_create "
+                    "(or inline kubectl-exec blade create) reported."
+                ),
+            )
+        # Non-create, non-destroy blade commands (status/query/version)
+        # don't target new k8s resources — genuine reads, keep the
+        # read-only fast path. ``prepare`` is mutating per the probe
+        # layer's verb list but carries no experiment UID to provenance-
+        # check, so it stays on this fallback as a documented residual
+        # (the execute-phase screener does not ride on it).
         return EffectiveTarget(
             scope=SCOPE_READONLY,
             namespace="",
@@ -509,6 +666,39 @@ def classify_inline_blade(
         scope_hint, _, target_hint = blade_subtype.partition("-")
 
     fault_action = rest[0] if rest else ""
+
+    # Identity-flag consistency gate (probe D8/D8b): blade CLI follows
+    # pflag LAST-WINS on repeated flags while the parsers below take the
+    # FIRST — a repeated identity flag with DIFFERENT values would let the
+    # guard anchor drill-t while blade injects evil-pod. Same legislation
+    # as the kubectl channel's --namespace consistency gate: conflicting
+    # values refuse, identical repeats stay legal. Scene flags are not
+    # gated: they never select the target.
+    from chaos_agent.agent.target_guard.types import SCOPE_BANNED
+
+    for deny in _FLAGS_IDENTITY_DENYLIST:
+        from .verify import collect_flag_values
+
+        vals = collect_flag_values(rest, deny)
+        if len(set(vals)) > 1:
+            return EffectiveTarget(
+                scope=SCOPE_BANNED,
+                namespace="",
+                raw_command=raw_command,
+                confidence=ConfidenceLevel.HIGH,
+                reject_detail=(
+                    f"inline blade command repeats the identity flag {deny} "
+                    "with conflicting values ("
+                    + ", ".join(vals)
+                    + "): blade CLI lets the LAST value win while the guard "
+                    "anchors the first, so no single value can be anchored "
+                    "for the drift check"
+                ),
+                reject_suggestion=(
+                    f"Send {deny} exactly once with the intended target "
+                    "identity."
+                ),
+            )
 
     # Parse flags inside the inner cmd
     ns = parse_namespace(rest, default="")
@@ -588,6 +778,7 @@ def classify_inline_blade(
         is_tier1_exec=is_tier1,
         exec_pod_name=exec_pod_name,
         exec_pod_namespace=exec_pod_namespace,
+        timeout_seconds=_extract_timeout_seconds(rest),
     )
 
 
@@ -610,6 +801,44 @@ def _parse_flag_value(args: list[str], flag: str) -> str:
             return a.split("=", 1)[1]
         i += 1
     return ""
+
+
+def _extract_timeout_seconds(tokens: list[str]) -> int:
+    """``--timeout`` value in SECONDS from blade tokens, last-wins.
+
+    pflag last-wins (probe D8): blade honours the LAST ``--timeout`` when
+    repeated, so the drift net must see exactly the value the executor
+    would honour — not the first. Zero when absent or non-numeric (no
+    anchor, the comparison stays silent).
+    """
+    from .verify import collect_flag_values
+
+    vals = collect_flag_values(tokens, "--timeout")
+    if not vals:
+        return 0
+    try:
+        return max(0, int(str(vals[-1]).strip()))
+    except ValueError:
+        return 0
+
+
+def _extract_timeout_from_flags(flags: str) -> int:
+    """``--timeout`` from the blade_create tool's free-form flags string.
+
+    Splits with the executor's own ``_split_args`` (the same function the
+    identity-flag gate uses — lazy import, cli.py must stay importable
+    without this provider) so the tokens inspected are exactly the tokens
+    the executor will append: same function, same input, no divergence
+    surface.
+    """
+    from chaos_agent.agent.providers.chaosblade.cli import _split_args
+
+    try:
+        return _extract_timeout_seconds(_split_args(flags or ""))
+    except (ValueError, TypeError):
+        # Unsplittable flags: the executor's _split_args fails the same
+        # way, so nothing here can reach blade — no timeout to anchor.
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -679,6 +908,18 @@ class ChaosbladeProvider:
             "blade_status",
         }
     )
+    # Create-reconcile gate (blade-create-reconcile-before-retry D6): the
+    # gate's generic state machine (agent/nodes/execute/_reconcile_gate.py)
+    # consults these declarations and the reconcile hooks below through the
+    # registry seam. This carrier's create is NOT idempotent — a
+    # result-uncertain blade_create arms the gate because a blind retry
+    # can materialise a duplicate experiment; the read tools that
+    # reconcile include the generic cluster read (kubectl_read) because an
+    # honest read through any of them resolves the unknown outcome.
+    reconcile_create_tool_names = frozenset({"blade_create"})
+    reconcile_read_tool_names = frozenset(
+        {"blade_status", "blade_query_k8s", "kubectl_read"}
+    )
 
     def matches_channel(self, profile: str) -> bool:
         # ChaosBlade operates on both cluster and bare-host targets.
@@ -725,7 +966,9 @@ class ChaosbladeProvider:
             ]
         return []
 
-    def detect(self, messages: list, *, is_host: bool) -> Optional[str]:
+    def detect(
+        self, messages: list, *, is_host: bool, is_teardown=None,
+    ) -> Optional[str]:
         """Reverse-scan for a live (NON-destroyed) ChaosBlade injection.
 
         Attributes the task to ChaosBlade only when the most recent parseable
@@ -747,7 +990,9 @@ class ChaosbladeProvider:
         )
         return method
 
-    def injection_recency(self, messages: list, *, is_host: bool) -> int:
+    def injection_recency(
+        self, messages: list, *, is_host: bool, is_teardown=None,
+    ) -> int:
         """Message index of the live blade evidence, or ``-1``. See registry."""
         from .verify import (
             scan_blade_evidence_index,
@@ -782,6 +1027,21 @@ class ChaosbladeProvider:
 
         return extract_experiment_uid_from_messages(messages, retired=retired)
 
+    def extract_experiment_ids(self, messages: list, retired=None) -> set[str]:
+        """EVERY live blade UID born in ``messages`` — the plural birth face
+        the registry's ownership seam consumes (round-26).
+
+        The singular face answers "which ONE experiment is current"; the
+        ownership ledger's question is "which experiments does this task
+        OWN" — a composite inline create (``blade create A && blade create
+        B``) proves two births in one call, and every one of them is a
+        liability the sweep must be able to recover. Delegates to the
+        plural extraction in verify (same module, same exclusion rigour:
+        destroyed/retired uids are not live liabilities)."""
+        from .verify import extract_experiment_uids_from_messages
+
+        return extract_experiment_uids_from_messages(messages, retired=retired)
+
     def destroyed_experiment_ids(self, messages: list) -> set[str]:
         """UIDs this carrier's ``blade_destroy`` tool calls have targeted —
         the destroy half of the experiment lifecycle scan, union-aggregated
@@ -791,6 +1051,51 @@ class ChaosbladeProvider:
         from .verify import scan_destroyed_uids
 
         return scan_destroyed_uids(messages)
+
+    def destroyed_proven_experiment_ids(self, messages: list) -> set[str]:
+        """PROVEN deaths: destroy calls whose PAIRED tool output confirms
+        success — the death-registration half of the liability ledger (B76
+        review I1).
+
+        Unlike :meth:`destroyed_experiment_ids` (issued = terminal, the
+        attribution semantics), this set feeds the durable ``retired``
+        ledger, so it only registers an output-proven death: a false retire
+        hides a LIVE experiment from every future recovery — strictly worse
+        than the orphan the sweep exists to prevent. Covers both delivery
+        forms (blade_destroy tool + the kubectl-exec vehicle)."""
+        from .verify import scan_destroyed_proven_uids
+
+        return scan_destroyed_proven_uids(messages)
+
+    def classify_destroy_output(self, output: str) -> "DestroyOutcome":
+        """Three-state verdict on a raw destroy output — delegates to the
+        carrier family's single classifier so the registry sweep and the
+        verify-replan retire compose the SAME decision source."""
+        from .verify import classify_destroy_output
+
+        return classify_destroy_output(output)
+
+    async def experiment_destroyed(self, uid: str, kubeconfig: str = "") -> bool:
+        """Status-only death check — the sweep's convergence valve (B76
+        review I2/I2b).
+
+        A repeat-destroy of an already-dead experiment surfaces
+        record-not-found (the local-DB record is gone); without this check
+        the UID never retires and every re-run recover repeats the same
+        destroy+failure forever. Mirrors :func:`run_layer1_destroy`'s
+        destroy-failed fallback (same status layer,
+        :func:`parse_blade_status_destroyed`). False on any doubt —
+        fail-closed, because a false retire hides a LIVE experiment."""
+        from chaos_agent.agent.providers.chaosblade.cli import blade_status
+        from .recover import parse_blade_status_destroyed
+
+        try:
+            out = await blade_status.ainvoke({"uid": uid, "kubeconfig": kubeconfig})
+        except Exception:  # noqa: BLE001
+            return False
+        raw = out if isinstance(out, str) else str(out)
+        verdict, _ = parse_blade_status_destroyed(raw)
+        return verdict == "passed"
 
     def extract_experiment_id_from_session_dict(self, session_messages: list) -> str:
         """Session-dict fallback: recover a UID from the RAW task-file
@@ -804,8 +1109,23 @@ class ChaosbladeProvider:
         stdout/stderr/content text-union extraction moved here WHOLESALE
         from task_snapshot's fallback loop — the vocabulary belongs to the
         carrier side, not the generic layer. Newest-first scan, first
-        create-shaped ``tool_execution`` wins."""
-        from .verify import extract_experiment_uid
+        create-shaped ``tool_execution`` wins.
+
+        Round-17 H2c opened a graded lane here; round-18 F REVERTED it:
+        the "strict" JSON-aware anchor is forgeable by an ``echo``
+        companion (round-16 F had already ruled the segment composition
+        the only lever), so a COMPOSITE command (create + ``kubectl get
+        -o json``/``echo`` companions) licenses NOTHING — legislative parity
+        with the birth registry (``inline_blade_create_receipt_uids``).
+        Only a PURE-CREATE command's receipt is ingested (its output domain
+        is blade's own, full anchor chain). This face INGESTS a UID from
+        raw session output, and the loose shapes (``"uid": <dashed>``
+        keys, ``chaosblade-<hex>`` resource names) are exactly what a
+        companion's K8s output carries, so a failed create must not
+        license the K8s ``metadata.uid`` riding in it (the same
+        ingestion/attribution split as verify.py's single-slot and
+        evidence-index faces — the ATTRIBUTION faces keep ``has_create``)."""
+        from .verify import receipt_birth_uids
 
         if not isinstance(session_messages, list):
             return ""
@@ -814,7 +1134,15 @@ class ChaosbladeProvider:
                 continue
             detail = msg.get("detail") if isinstance(msg.get("detail"), dict) else {}
             command = detail.get("command") if isinstance(detail.get("command"), str) else ""
-            if "blade" not in command or "create" not in command:
+            # Round-15 root fix: the command-shape judgement is the syntax
+            # classifier's (the word gate here was one of the same-disease
+            # sites — a decoy command string could pass it). Rounds 17-18:
+            # composite receipts license NOTHING (the round-17 strict-only
+            # lane is reverted — round-18 F proved the anchor forgeable by
+            # an echo companion); only a pure-create command's receipt is
+            # ingested.
+            payload = classify_blade_exec_payload(command)
+            if not payload.pure_create:
                 continue
             chunks = [
                 detail.get("stdout_preview"),
@@ -822,9 +1150,15 @@ class ChaosbladeProvider:
                 msg.get("content"),
             ]
             text = "\n".join(c for c in chunks if isinstance(c, str) and c)
-            uid = extract_experiment_uid(text)
-            if uid:
-                return uid
+            # Round-27: the shared plural primitive — the same licensing
+            # as every other birth face (content-derived, transport-
+            # wrapper-tolerant). The pin keeps the FIRST birth in content
+            # order (this face's pre-round-27 selection); the ownership
+            # rebuild behind it owns the rest (a dead pin converges through
+            # the sweep's status-recheck valve).
+            births = receipt_birth_uids(text)
+            if births:
+                return births[0]
         return ""
 
     def build_handle_from_messages(
@@ -864,7 +1198,12 @@ class ChaosbladeProvider:
         """
         from langchain_core.messages import ToolMessage
 
-        from .verify import extract_experiment_uid
+        from .verify import (
+            FAILED_CREATE_UID_RE,
+            _UID_SHAPE_RE,
+            extract_experiment_uid,
+            inline_blade_create_receipt_uids,
+        )
 
         state = state or {}
         uids: set[str] = set()
@@ -880,12 +1219,42 @@ class ChaosbladeProvider:
             # Terminal create failures deliberately do not count as active UIDs
             # in extract_experiment_uid, but their CRDs still need cleanup.
             uids.update(
-                match.group(1) for match in _FAILED_CREATE_UID_RE.finditer(content)
+                match.group(1) for match in FAILED_CREATE_UID_RE.finditer(content)
             )
+        # Inline create receipts (round-14 G1 — birth-ledger channel parity):
+        # the kubectl-exec delivery's create evidence is just as much THIS
+        # task's create as the host tool face's. Paired-call gated inside the
+        # scan (a ``get -o json`` output embeds metadata.uid shaped like an
+        # experiment UID but is never a blade receipt — task-51193464). This
+        # closes the hydration fallback's blind side: legacy checkpoints /
+        # DB-only recovery rebuild ownership from THIS scan, and the inline
+        # experiment used to fall out of the destroy whitelist (and the
+        # liability set) the moment the durable registry was absent — the
+        # LLM's own destroy of its own inline experiment was refused with
+        # the receipt sitting in the visible history.
+        uids.update(inline_blade_create_receipt_uids(messages))
+        # Durable read-side gate (round-20 Q4): the durable sources trust
+        # the writer chain, whose only un-gated writers were the extraction
+        # strategies' own anchors — belt-and-suspenders at the trust-chain
+        # END so a non-shaped value (a prefixed resource name, a junk token)
+        # can never ride the whitelist whatever wrote it.
         if state.get("injection_method") != "python_agent":
             durable_uid = str(state.get("experiment_uid") or "").strip()
-            if durable_uid:
+            if durable_uid and _UID_SHAPE_RE.fullmatch(durable_uid):
                 uids.add(durable_uid)
+        # Birth registry (B76 review G): the legacy single-slot durable source
+        # above is last-write-wins — after a contract replacement the slot
+        # holds only the newest UID, and once compaction removes the old
+        # create ToolMessages a superseded experiment falls out of the
+        # whitelist entirely: the LLM could no longer destroy its own task's
+        # orphan even if it somehow learned its UID. The append-only registry
+        # keeps proving provenance for EVERY experiment this task created,
+        # across compaction and contract replacement.
+        uids.update(
+            str(uid).strip()
+            for uid in (state.get("owned_experiment_uids") or [])
+            if str(uid).strip() and _UID_SHAPE_RE.fullmatch(str(uid).strip())
+        )
         return uids
 
     def classify_tool_target(
@@ -933,7 +1302,7 @@ class ChaosbladeProvider:
             return parsed or None
         if tool_name == "kubectl" and tool_args.get("subcommand") == "exec":
             v_args = tool_args.get("v_args", "") or ""
-            if "blade" in v_args and "create" in v_args:
+            if classify_blade_exec_payload(v_args).has_create:
                 embedded = _parse_blade_create_from_v_args(v_args)
                 if embedded:
                     logger.info(
@@ -964,14 +1333,83 @@ class ChaosbladeProvider:
             v_args = tool_args.get("v_args", "") or ""
             if (
                 subcommand in KUBECTL_COMMAND_SUBCOMMANDS
-                and isinstance(v_args, str)
-                and "blade" in v_args
-                and "create" in v_args
+                and classify_blade_exec_payload(v_args).has_create
             ):
                 return "kubectl_exec"
         return None
 
-    def issue_disproven(self, messages: list) -> bool:
+    def build_reconcile_fingerprint(
+        self, tool_name: str, tool_args: Any
+    ) -> Optional["RequestFingerprint"]:
+        """Create-reconcile request identity for this carrier's create tool
+        (blade-create-reconcile-before-retry D6): the unified key face
+        (scope/target/action, lowercased) normalised through the same
+        fingerprint construction safety_check's conflict query consumes.
+        ``None`` for every other tool lets the registry scan continue."""
+        if tool_name not in self.reconcile_create_tool_names:
+            return None
+
+        from .reconcile import fingerprint_from_tool_call_args
+
+        return fingerprint_from_tool_call_args(tool_args)
+
+    async def reconcile_hold_feedback(
+        self,
+        tool_name: str,
+        fp: "RequestFingerprint",
+        hold_count: int,
+        block_limit: int,
+        kubeconfig: str = "",
+        task_id: str = "",
+    ) -> Optional[tuple[str, bool]]:
+        """Interception-time probe plus hold-feedback text for this
+        carrier's held create retry (D6): probe the cluster for the
+        registered request with the SAME query safety_check runs (a hit is
+        OUR OWN possibly-in-effect create → reuse the UID; safety_check's
+        consumption of the same hit is warn/confirm), then compose the
+        GuardFeedback-shaped body naming this carrier's reconciliation
+        tools. ``None`` for every other tool lets the registry scan
+        continue."""
+        if tool_name not in self.reconcile_create_tool_names:
+            return None
+
+        from .reconcile import (
+            format_gate_feedback,
+            probe_registered_request,
+        )
+
+        probe_section, gate_reconciled = await probe_registered_request(
+            fp, kubeconfig, task_id,
+        )
+        content = format_gate_feedback(
+            fp, hold_count, block_limit, probe_section,
+        )
+        return content, gate_reconciled
+
+    def reconcile_batch_held_feedback(
+        self, tool_name: str, other_tool_name: str
+    ) -> Optional[str]:
+        """Fabricated notice for the OTHER calls of a batch held back
+        together with a held blade_create (D6). ``None`` for every other
+        create tool lets the registry scan continue."""
+        if tool_name not in self.reconcile_create_tool_names:
+            return None
+
+        from .reconcile import format_batch_held_feedback
+
+        return format_batch_held_feedback(other_tool_name)
+
+    async def verify_landing_readback(
+        self, messages: list, state: dict, *, kubeconfig: str = ""
+    ) -> Optional[dict]:
+        """Landing readback guard (faultdrill-cr-channel task 2.1, design
+        D5): this carrier's landings carry no CR recipe-integrity contract
+        to verify — pinned ``None`` (the registry scan continues; the
+        faultdrill channel's D5 seam is the only owner of the post-apply
+        readback)."""
+        return None
+
+    def issue_disproven(self, messages: list, *, is_teardown=None) -> bool:
         """Experiment attribution is RESULT-born (committed only when the UID
         appears in a successful create result), so there is no issue-time
         guesswork to revoke."""
@@ -994,14 +1432,16 @@ class ChaosbladeProvider:
         except Exception as rb_err:  # noqa: BLE001 — best-effort rollback
             return f" (rollback FAILED: {rb_err})"
 
-    def scan_step_actions(self, steps: list[str], messages: list):
+    def scan_step_actions(
+        self, steps: list[str], messages: list, *, is_teardown=None,
+    ):
         """Explicitly not claimed (pinned None, phase-8 D4): an
         experiment-UID carrier judges injection completion by the
         experiment evidence chain (the UID), not step-verb heuristics —
         the step self-check is native-carrier territory."""
         return None
 
-    def was_injection_attempted(self, messages: list) -> bool:
+    def was_injection_attempted(self, messages: list, *, is_teardown=None) -> bool:
         """Explicitly not claimed (pinned False): the native-fallback
         message back-scan is native-carrier territory; THIS backend's
         attempt state is carried by :meth:`was_fault_create_attempted`
@@ -1012,6 +1452,8 @@ class ChaosbladeProvider:
         self,
         messages: list,
         injection_method: str | None = None,
+        *,
+        is_teardown=None,
     ) -> bool:
         """Attempted-but-no-UID judgement for this experiment-recording
         carrier — durable-attribution exemption first, then the kubectl
@@ -1022,7 +1464,9 @@ class ChaosbladeProvider:
             was_blade_create_attempted,
         )
 
-        return was_blade_create_attempted(messages, injection_method)
+        return was_blade_create_attempted(
+            messages, injection_method, is_teardown=is_teardown,
+        )
 
     async def layer1_verify(self, state: dict, **kwargs) -> "Layer1Result":
         """ChaosBlade Layer-1 verification.
@@ -1046,6 +1490,13 @@ class ChaosbladeProvider:
         kubeconfig = kwargs.get("kubeconfig", "") or ""
         task_id = kwargs.get("task_id", "")
 
+        # Teardown≠mutation at the Layer-1 attempted judgement too (O-1,
+        # P3): a registered-vehicle cleanup delete in the history must not
+        # read as a kubectl-native fallback that flips
+        # was_blade_create_attempted to False. Snapshot the CURRENT registry
+        # per invocation (see make_teardown_matcher).
+        from chaos_agent.agent.execution_artifacts import make_teardown_matcher
+
         if state.get("injection_method") == "kubectl_exec":
             return await _run_layer1_via_kubectl_exec(
                 experiment_uid,
@@ -1059,6 +1510,9 @@ class ChaosbladeProvider:
             task_id=task_id,
             messages=state.get("messages", []),
             injection_method=state.get("injection_method"),
+            is_teardown=make_teardown_matcher(
+                state.get("execution_artifacts") or []
+            ),
         )
 
     async def layer1_destroy(

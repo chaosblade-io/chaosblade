@@ -56,7 +56,9 @@ async def test_recover_initial_state_uses_resolver_without_checkpoint(monkeypatc
     from chaos_agent.agent.result.task_snapshot import RecoverInitialResolution
     from chaos_agent.agent.result import task_snapshot
 
-    async def fake_resolve(task_id, *, record_task_id, agents, checkpoint_values, **kwargs):
+    async def fake_resolve(
+        task_id, *, record_task_id, agents, checkpoint_values, **kwargs
+    ):
         assert task_id == "task-inject"
         assert record_task_id == "task-recover"
         assert checkpoint_values == {}
@@ -79,7 +81,9 @@ async def test_recover_initial_state_uses_resolver_without_checkpoint(monkeypatc
             "layer1_iteration_count": 0,
             "layer2_context_added": False,
         }
-        return RecoverInitialResolution(initial_state=initial, source_values=initial, source="snapshot")
+        return RecoverInitialResolution(
+            initial_state=initial, source_values=initial, source="snapshot"
+        )
 
     monkeypatch.setattr(
         task_snapshot,
@@ -165,7 +169,7 @@ async def test_recover_store_rebuild_fills_missing_uid_from_task_jsonl(tmp_path)
                     ],
                 ),
                 ToolMessage(
-                    content='{"code":200,"success":true,"result":"uid-from-jsonl"}',
+                    content='{"code":200,"success":true,"result":"a0b1c2d3e4f50617"}',
                     name="blade_create",
                     tool_call_id="tc-create",
                 ),
@@ -184,7 +188,7 @@ async def test_recover_store_rebuild_fills_missing_uid_from_task_jsonl(tmp_path)
     assert initial is not None
     assert initial["task_id"] == "task-recover"
     assert initial["parent_task_id"] == "task-inject"
-    assert initial["experiment_uid"] == "uid-from-jsonl"
+    assert initial["experiment_uid"] == "a0b1c2d3e4f50617"
     assert initial["skill_name"] == "pod-cpu-fullload"
     assert initial["fault_spec"]["scope"] == "pod"
     assert initial["fault_spec"]["fault_target"] == "cpu"
@@ -278,7 +282,7 @@ async def test_recover_store_rebuild_prefers_task_jsonl_when_live(tmp_path):
                     ],
                 ),
                 ToolMessage(
-                    content='{"code":200,"success":true,"result":"uid-from-live-jsonl"}',
+                    content='{"code":200,"success":true,"result":"a0b1c2d3e4f50618"}',
                     name="blade_create",
                     tool_call_id="tc-create-live",
                 ),
@@ -295,7 +299,7 @@ async def test_recover_store_rebuild_prefers_task_jsonl_when_live(tmp_path):
         set_global_session_store(None)  # type: ignore[arg-type]
 
     assert initial is not None
-    assert initial["experiment_uid"] == "uid-from-live-jsonl"
+    assert initial["experiment_uid"] == "a0b1c2d3e4f50618"
     assert "latest inject observation" in initial["inject_context"]
     assert initial["inject_context"] != "stale task-store context"
 
@@ -364,7 +368,7 @@ async def test_recover_initial_state_prefers_live_jsonl_over_checkpoint(tmp_path
                     ],
                 ),
                 ToolMessage(
-                    content='{"code":200,"success":true,"result":"uid-from-jsonl-even-with-checkpoint"}',
+                    content='{"code":200,"success":true,"result":"a0b1c2d3e4f50619"}',
                     name="blade_create",
                     tool_call_id="tc-create-live-checkpoint",
                 ),
@@ -380,8 +384,8 @@ async def test_recover_initial_state_prefers_live_jsonl_over_checkpoint(tmp_path
     finally:
         set_global_session_store(None)  # type: ignore[arg-type]
 
-    assert initial["experiment_uid"] == "uid-from-jsonl-even-with-checkpoint"
-    assert state_values["experiment_uid"] == "uid-from-jsonl-even-with-checkpoint"
+    assert initial["experiment_uid"] == "a0b1c2d3e4f50619"
+    assert state_values["experiment_uid"] == "a0b1c2d3e4f50619"
     assert "fresh jsonl observation" in initial["inject_context"]
     assert initial["inject_context"] != "stale checkpoint context"
     assert state_values["messages"] == ["baseline-message"]

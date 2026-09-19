@@ -178,9 +178,15 @@ Safety is not a single check but five progressive layers. An injection only reac
 2. **Confirmation Gate** — a dynamic, data-driven `interrupt()` that pauses for human approve/reject; critical operations cannot proceed without it.
 3. **Per-phase guards** — each phase that lets the LLM pick tools has its own guard with its own red line: planning is denied every mutating call, execute is screened against the frozen approved target (*method may change, identity may not*, including escapes hidden inside `sh -c`), verify and recover are limited to the connected environment.
 4. **ToolGuard** — a fail-closed command whitelist plus a dangerous-pattern blacklist (`rm -rf`, `| bash`, `$(…)` …); everything runs exec-form, so pipes and substitutions are inert. It sits at the execution entry point, so commands from *every* phase pass through it.
-5. **Loop Max & Timeout** — per-phase loop caps, a global recursion limit, and a mandatory timeout (auto-boosted, never shortened) that self-destructs the experiment even if the agent dies.
+5. **Loop Max & Timeout** — per-phase loop caps, a global recursion limit, and a mandatory timeout that self-destructs the experiment even if the agent dies. When no duration is specified, a per-fault-type floor (default 300s) is injected; an explicitly stated duration is honored verbatim and never silently amended.
 
 Those five gate what *reaches* the cluster. One more answers what no gate can: **did it stay inside the blast radius you approved?** The environment is snapshotted before injection and diffed after verification — restarts, evictions, OOM kills, endpoint removals, HPA scaling and more. Verifying that the target broke is easy; proving nothing *else* did is what makes a drill safe to repeat.
+
+### The third verdict: `unverified`
+
+Verification can go wrong in two very different ways: the fault effect is provably absent (counter-evidence → `failed`), or the **observation channel itself** was down — kubectl auth expired, metrics queries timed out. Reporting the latter as a failure would claim evidence nobody observed. So a run can also end `unverified`: the command was issued, the conclusion is simply not knowable right now.
+
+`unverified` tasks stay in the recoverable list — re-destroying is idempotent. Fix the observation channel first (the result's `observation_failures` field classifies each failed probe as `auth` / `transient` / `unknown`), then re-check or simply recover. In batch summaries it renders as `?`: `✓` claims success, `✗` claims failure, and "cannot tell" is neither.
 
 ---
 

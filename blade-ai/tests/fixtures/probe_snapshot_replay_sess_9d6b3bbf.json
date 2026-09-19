@@ -1,0 +1,270 @@
+{
+ "spec": {
+  "names": [
+   "kone-app-service-58c7db669c-mpwr6"
+  ],
+  "params": {
+   "process": "kone-app-service",
+   "signal": "15"
+  }
+ },
+ "messages": [
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_b69692de35af4cceaa0f8543",
+     "name": "kubectl_read",
+     "args": {
+      "subcommand": "get",
+      "v_args": "pods -A -o wide"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_b69692de35af4cceaa0f8543",
+   "name": "kubectl_read",
+   "content": "NAMESPACE       NAME                                                       READY   STATUS                  RESTARTS         AGE     IP              NODE                                 NOMINATED NODE   READINESS GATES\nark-system      kone-app-service-58c7db669c-mpwr6                          1/1     Running                 0                22h     25.209.74.113   cn-shanghai-cloudspe.25.209.71.186   <none>           <none>\nark-system      kone-app-service-58c7db669c-v4dng                          1/1     Running                 0                18d     25.209.74.20    cn-shanghai-cloudspe.25.209.71.163   <none>           <none>"
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_e804e0fe5552481da79c8d90",
+     "name": "activate_skill",
+     "args": {
+      "skill_name": "k8s-chaos-skills"
+     }
+    },
+    {
+     "id": "call_54665b01c2fa4e909801921f",
+     "name": "kubectl_read",
+     "args": {
+      "subcommand": "get",
+      "v_args": "deployments -A -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,READY:.status.readyReplicas,REPLICAS:.spec.replicas --no-headers"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_e804e0fe5552481da79c8d90",
+   "name": "activate_skill",
+   "content": "# K8s 故障演练\n\n```\n意图识别 ──→ 用例选择 ──→ 意图提交\n(提取语义维度)(决策树匹配)  (提交意图，执行交给引擎)\n```\n\n## 安全红线\n\n以下规则优先级高于一切操作指令，在任何步骤中都不得违反：\n\n- **隔离**：在隔离命名空间或测试集群演练，严禁在生产核心链路注入\n- **最小影响**：用精确标签选择器定位目标，范围尽可能小\n- **可回滚**：注入前明确回滚方案，确保 30 秒内可恢复\n- **故障窗口完整**：自恢复定时器倒计时从**武装时刻**起算——恢复脚本必须先校验后武装，武装与注入必须是紧邻步骤（间隔 ≤ 60 秒），武装后发生任何修复必须重新武装；用户批准的 duration 是故障窗口契约，严禁被调试/计划变更侵蚀，同样严禁擅自延长\n- **有监控**：无监控不演练\n- **仅限已有用例**：只能执行 `references/catalogue/` 中已有的故障注入用例，严禁自行编造、拼凑或即兴发挥用例中未涉及的故障注入操作。无法匹配时必须明确告知用户「当前不支持该场景」并停止\n- **禁止**：业务高峰期演练 / 对 etcd、kube-apiserver 等控制平面注入 / 无备份对 StatefulSet 做破坏性实验\n\n---\n\n## 第一步：意图识别\n\n从用户输入中提取四个**语义维度**（只关心「注入什么故障、打在哪个应用」，不关心「用什么集群凭证」）：\n\n| 维度 | 说明 | 示例 |\n|------|------|------|\n| **故障层级** | 作用在哪个层面 | Pod / Workload / Service / Node |\n| **故障现象** | 期望模拟的表现 | Pending、OOM、CPU 高 |\n| **故障原因** | 具体根因 | 资源不足、配置错误 |\n| **目标应用** | 注入目标 | 应用名、命名空间、标签选择器 |\n\n> **不要向用户索要 kubeconfig 路径**：集群连接（kubeconfig / kubewiz 等）由运行时配置自动注入，不属于意图识别范畴。\n\n**层级判断关键词：**\n\n| 关键词 | 层级 |\n|--------|-----|\n| pod、容器、崩溃、重启、OOM、CPU高、内存高、镜像、挂载、磁盘空间、磁盘IO | Pod |\n| 副本、deployment、扩容、缩容 | Workload |\n| service、服务发现、负载均衡、端口、endpoints | Service |\n| 节点、node、磁盘、宿主机 | Node |\n\n**信息不全时的处理：**\n- 用户明确说出故障现象 → 直接进入第二步\n- 用户只说大致目标（如「测试容错」） → 提问引导确认四个维度\n- 用户描述生产问题要复现 → 从描述提取现象和原因，匹配用例\n- 匹配到多个用例 → 列出候选，让用户选择\n- 只说了现象没说根因 → 推荐该分类下最常见的用例，并列出其他选项\n- 不在覆盖范围 → 明确告知「当前不支持该场景」，停止操作，严禁自行构造用例外的故障注入\n\n---\n\n## 第二步：用例选择（动态发现）\n\n所有用例存储在 `references/catalogue/` 下，通过目录结构和文件命名规约自动发现，无需维护静态索引。\n\n### 命名规约\n\n```\nreferences/catalogue/\n├── <故障分类>/                         # 目录名 = 故障层级_故障现象（每个目录对应唯一的 Scope+Target+Action 组合）\n│   ├── <故障分类>_<根因A>.md           # 文件名 = 分类名_具体根因\n│   ├── <故障分类>_<根因B>.md\n│   └── ...\n└── ...\n```\n\n示例：\n- `references/catalogue/Pod_Pending/Pod_Pending_节点资源不足.md`\n- `references/catalogue/Pod_磁盘空间使用率过高/Pod_磁盘空间使用率过高_应用日志数据积累.md`（pod-disk fill）\n- `references/catalogue/Pod_磁盘IO过高/Pod_磁盘IO过高_异常IO占用.md`（pod-disk burn）\n\n### 发现流程\n\n**第 1 步：列出所有分类目录，匹配故障现象**\n\n```bash\nls references/catalogue/\n```\n\n从返回的目录名中，根据第一步识别的故障现象选择最匹配的目录。目录名本身已包含故障层级和故障现象信息（如 `Pod_Pending`、`service_condi"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_54665b01c2fa4e909801921f",
+   "name": "kubectl_read",
+   "content": "ark-system      kone-app-service                          2        2"
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_b3ff8b88b5874f0889d09c42",
+     "name": "read_skill_resource",
+     "args": {
+      "resource_path": "references/catalogue",
+      "skill_name": "k8s-chaos-skills"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_b3ff8b88b5874f0889d09c42",
+   "name": "read_skill_resource",
+   "content": "[Skill resource — REFERENCE for planning]\nThe injection / verification commands shown below are\nEXECUTION TEMPLATES that Phase 2 will run automatically\nonce your plan is approved. In Phase 1 (current), use them\nto understand WHAT will happen and decide IF the plan is\nsafe. DO NOT execute them yourself in this phase.\n─────────────────────────────────────────────────────\n\nDirectory: references/catalogue/\nContents:\n  - references/catalogue/ConfigMap_内容错误/\n  - references/catalogue/ConfigMap_内容错误/ConfigMap_内容错误_关键配置被篡改.md\n  - references/catalogue/Container_CPU满载/\n  - references/catalogue/Container_CPU满载/Container_CPU满载_Sidecar资源争抢.md\n  - references/catalogue/Container_网络丢包/\n  - references/catalogue/Container_网络丢包/Container_网络丢包_Sidecar网络中断.md\n  - references/catalogue/Container_被删除/\n  - references/catalogue/Container_被删除/Container_被删除_Sidecar容器被移除.md\n  - references/catalogue/Container_进程异常/\n  - references/catalogue/Container_进程异常/Container_进程异常_Sidecar进程被挂起.md\n  - references/catalogue/Container_进程异常/Container_进程异常_Sidecar进程被杀死.md\n  - references/catalogue/DaemonSet_未完全调度/\n  - references/catalogue/DaemonSet_未完全调度/DaemonSet_未完全调度_节点不可调度.md\n  - references/catalogue/HPA_副本达到上限/\n  - references/catalogue/HPA_副本达到上限/HPA_副本达到上限_资源饱和.md\n  - references/catalogue/Node_CPU使用率过高/\n  - references/catalogue/Node_CPU使用率过高/Node_CPU使用率过高_异常进程占用.md\n  - references/catalogue/Node_不可用/\n  - references/catalogue/Node_不可用/Node_不可用_kubelet停止.md\n  - references/catalogue/Node_不可用/Node_不可用_节点宕机.md\n  - references/catalogue/Node_内存使用率过高/\n  - references/catalogue/Node_内存使用率过高/Node_内存使用率过高_异常进程占用.md\n  - references/catalogue/Node_磁盘IO过高/\n  - references/catalogue/Node_磁盘IO过高/Node_磁盘IO过高_异常IO占用.md\n  - references/catalogue/Node_磁盘空间不足/\n  - references/catalogue/Node_磁盘空间不足/Node_磁盘空间不足_日志或临时文件堆积.md\n  - references/catalogue/Node_维护/\n  - references/catalogue/Node_维护/Node_维护_节点排空Drain.md\n  - references/catalogue/Node_维护/Node_维护_节点污点注入Taint.md\n  - references/catalogue/Node_网络故障/\n  - references/catalogue/Node_网络故障/No"
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_1e1b715aeac649d999231b06",
+     "name": "read_skill_resource",
+     "args": {
+      "resource_path": "references/catalogue/Pod_被删除/Pod_被删除_Pod故障.md",
+      "skill_name": "k8s-chaos-skills"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_1e1b715aeac649d999231b06",
+   "name": "read_skill_resource",
+   "content": "[Skill resource — REFERENCE for planning]\nThe injection / verification commands shown below are\nEXECUTION TEMPLATES that Phase 2 will run automatically\nonce your plan is approved. In Phase 1 (current), use them\nto understand WHAT will happen and decide IF the plan is\nsafe. DO NOT execute them yourself in this phase.\n─────────────────────────────────────────────────────\n\n**用例名称** Pod故障 导致 Pod_被删除\n\n**故障现象**：\n1. 目标 Pod 被直接删除，短暂出现 Terminating 状态后消失\n2. 如 Pod 由 Deployment/ReplicaSet 管理，控制器自动创建新 Pod 替代（Pod 名称变化，AGE 重置）\n3. Service Endpoints 短暂减少（旧 Pod 摘除到新 Pod 就绪的窗口期内流量中断）\n4. Pod Events 中出现 Killing 事件，随后有新 Pod 的 Scheduled/Pulling/Created/Started 事件\n\n**资源准备**：\n1. 确认目标应用已正常运行，有明确的 namespace 和 label selector\n2. 确认目标 Pod 由 Deployment/ReplicaSet 管理（确保删除后能自动重建）\n3. 确认监控系统可观测 Pod 生命周期事件和 Service Endpoints 变化\n\n**演练步骤**：\n1. 确认目标 Pod 当前状态为 Running 且 Ready，记录当前 Pod 名称：\n   ```bash\n   kubectl get pods -n <namespace> -l <label-selector> -o wide\n   ```\n2. 使用 ChaosBlade 对目标 Pod 注入删除故障：\n   ```bash\n   blade create k8s pod-pod delete \\\n     --labels <label-selector> \\\n     --namespace <namespace> \\\n     --timeout <seconds> \\\n     --kubeconfig <路径>\n   ```\n   - `--timeout`：控制 ChaosBlade 持续删除的时间窗口，在此时间内 Pod 每次被控制器重建后都会再次被删除\n   - 故障机制：ChaosBlade 直接执行 kubectl delete pod，目标 Pod 被立即终止\n3. 记录返回的 experiment_uid，用于后续恢复\n\n**注入验证**：\n1. 执行 `kubectl get pods -n <namespace> -l <label-selector>`，确认旧 Pod 名称已不存在，新 Pod 已被创建（名称不同、AGE 很短）\n2. 执行 `kubectl get events -n <namespace> --sort-by='.lastTimestamp'`，确认存在 Killing 事件（旧 Pod 被删除）以及 Scheduled/Created/Started 事件（新 Pod 被重建）\n3. 执行 `kubectl get endpoints <service-name> -n <namespace>`，观察 Endpoints 是否短暂减少（取决于新 Pod 就绪速度）\n4. **持续性检查（\"持续删除\"意图必须做）**：单次删除与持续删除是两种故障形态——\n   单次删除后控制器重建一次即稳定。判据是\"无外部干预下删除仍在继续\"，按证据强度分层：\n   - **白盒主证（首选，即时）**：故障机制本身仍存活——blade 实验状态 Running（或宿主 systemd 循环单元 active 且守卫 timer pending）。机制存活时\"持续在删\"由构造成立\n   - **有界佐证（≤60 秒）**：静观一个短窗口后再次执行 `kubectl get pods`，Pod 仍在被反复 Killing、AGE 持续极短即强确认\n   - **黑盒回退（仅当机制状态完全不可查时）**：停止一切操作、静观 1-2 分钟后再查\n   - 若机制已终止且 Pod 已稳定，"
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_f4377e27d36a4cffa0b44904",
+     "name": "kubectl_read",
+     "args": {
+      "subcommand": "get",
+      "v_args": "deployment kone-app-service -n ark-system -o jsonpath={.spec.selector.matchLabels}"
+     }
+    },
+    {
+     "id": "call_de48fc1ddf634e51b8feeafb",
+     "name": "kubectl_read",
+     "args": {
+      "subcommand": "get",
+      "v_args": "deployment kone-runtime -n ark-system -o jsonpath={.spec.selector.matchLabels}"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_f4377e27d36a4cffa0b44904",
+   "name": "kubectl_read",
+   "content": "{\"component\":\"kone-app-service\"}"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_de48fc1ddf634e51b8feeafb",
+   "name": "kubectl_read",
+   "content": "{\"component\":\"kone-runtime\"}"
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_84b0ef6e12d54264a656b38c",
+     "name": "read_skill_resource",
+     "args": {
+      "resource_path": "references/catalogue/Pod_进程被杀死/Pod_进程被杀死_应用主进程异常.md",
+      "skill_name": "k8s-chaos-skills"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_84b0ef6e12d54264a656b38c",
+   "name": "read_skill_resource",
+   "content": "[Skill resource — REFERENCE for planning]\nThe injection / verification commands shown below are\nEXECUTION TEMPLATES that Phase 2 will run automatically\nonce your plan is approved. In Phase 1 (current), use them\nto understand WHAT will happen and decide IF the plan is\nsafe. DO NOT execute them yourself in this phase.\n─────────────────────────────────────────────────────\n\n**用例名称** 应用主进程异常 导致 Pod_进程被杀死\n\n**故障定位**：持续型故障——故障窗口内容器反复被终止重建，Pod RestartCount 持续增长；\n超过 kubelet 退避阈值后进入 CrashLoopBackOff。**本用例不提供一次性注入**：单次杀死\n随 kubelet 重建收敛（15-90s）即自愈，不构成有效演练窗口；`duration_seconds` 是必填的\n故障窗口契约，未给定时先向用户确认，不得默认成一次性操作。\n\n**故障现象**：\n1. 容器内应用主进程反复被杀死，容器因主进程退出而被 kubelet 重建\n2. Pod RestartCount 在故障窗口内持续增长\n3. 持续杀进程超过退避阈值后，Pod 状态进入 CrashLoopBackOff\n4. Pod Events 中显示 `Back-off restarting failed container`\n\n**资源准备**：\n1. 确认应用 A 已正常运行，确认 `duration_seconds`（故障窗口）已明确\n2. 确认目标 Pod 所在 namespace 和 labels\n3. 确认容器内实际进程名（不可凭服务名猜测，主方案 `--process` 参数依赖它）与容器名（降级方案 `crictl ps --name` 依赖它）\n4. 确认 `restartPolicy`：`kubectl get pod <pod-name> -n <namespace> -o jsonpath={.spec.restartPolicy}`——`Never` 的 Pod 被杀后不会重建，故障变成永久停机而非反复重启，需先与用户确认\n\n**演练步骤**：\n1. 记录应用 A 当前 Pod 状态和 RestartCount：\n   ```bash\n   kubectl get pods -l <labels> -n <namespace> -o wide\n   ```\n2. **验证实际进程名（必须）** — 进入容器确认目标进程的二进制名称：\n   ```bash\n   kubectl exec <pod-name> -n <namespace> -- ps aux\n   ```\n   注意：实际进程名可能与服务名不同（如 prometheus 服务的实际二进制为 `prometheus-agent-linux`），必须以 ps 输出为准\n3. 使用 ChaosBlade 注入持续进程杀死故障（`--timeout` 即故障窗口契约，取 `duration_seconds`；窗口内持续杀是 ChaosBlade 固有行为，不得省略、改小，更不得解读成\"观察窗口\"）：\n   ```bash\n   blade create k8s pod-process kill \\\n     --process <实际进程名> \\\n     --signal 15 \\\n     --namespace <namespace> \\\n     --labels <labels> \\\n     --timeout <duration_seconds> \\\n     --kubeconfig <路径>\n   ```\n   说明：`--signal 15` 发送 SIGTERM，如需强制杀死可用 `--signal 9`（SIGKILL）\n4. 观察 Pod 重启行为\n\n**注入验证**：\n1. 执行 `kubectl get pods -l <labels> -n <namespace>`，确认 RESTARTS 数相比注入前增加\n2. 确认容器发生过重建：优先从 `kubectl get pod <pod-name> -n <namespace> -o json` 读取 containerID 变化与 Last Sta"
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_391fb9b6a1dd462f9b46cbf3",
+     "name": "kubectl_read",
+     "args": {
+      "subcommand": "get",
+      "v_args": "pods -n ark-system -l component=kone-app-service -o wide --no-headers"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_391fb9b6a1dd462f9b46cbf3",
+   "name": "kubectl_read",
+   "content": "kone-app-service-58c7db669c-mpwr6   1/1   Running   0     22h   25.209.74.113   cn-shanghai-cloudspe.25.209.71.186   <none>   <none>\nkone-app-service-58c7db669c-v4dng   1/1   Running   0     18d   25.209.74.20    cn-shanghai-cloudspe.25.209.71.163   <none>   <none>"
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_0c42b190ca5e4251a2760da1",
+     "name": "kubectl_read",
+     "args": {
+      "subcommand": "exec",
+      "v_args": "kone-app-service-58c7db669c-mpwr6 -n ark-system -- ps aux"
+     }
+    },
+    {
+     "id": "call_1282447a1f2349edb87c2b82",
+     "name": "kubectl_read",
+     "args": {
+      "subcommand": "get",
+      "v_args": "pod kone-app-service-58c7db669c-mpwr6 -n ark-system -o jsonpath={.spec.restartPolicy}"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_0c42b190ca5e4251a2760da1",
+   "name": "kubectl_read",
+   "content": "USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\nroot           1  0.0  0.0  91792 15584 ?        Ss   Aug25   0:20 /usr/bin/python /usr/lib/systemd/system.py init crond ilogtaild kubeone\nroot          39  0.0  0.0  22200  3128 ?        Ss   Aug25   0:00 /usr/sbin/crond -n\nroot         138  0.0  0.0  13304  3096 ?        S    Aug25   0:00 /bin/sh /home/admin/app.sh\nroot         143  0.0  0.0  38460  6916 ?        S    Aug25   0:00 /usr/bin/perl /usr/bin/ts\nroot         148  0.0  0.0   5988   712 ?        S    Aug25   0:00 tail -f /dev/null\nadmin        172  0.0  0.0 746768 44536 ?        Sl   Aug25   0:19 /home/admin/kone-app-service/target/kone-app-service --enable-leader-election=true --enable-general-service=true --enable-headless=true --enable-appservice=true --enable-netservice=true --enable-eip=true\nroot         274  0.0  0.0  30256  3020 ?        Ss   Aug25   0:00 /usr/local/ilogtail/ilogtail\nroot         275  0.0  0.0 179576 22036 ?        Sl   Aug25   1:09 /usr/local/ilogtail/ilogtail\nroot       46899  0.0  0.0  51728  3508 ?        Rs   13:29   0:00 ps aux"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_1282447a1f2349edb87c2b82",
+   "name": "kubectl_read",
+   "content": "Always"
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_fabc61b063034374b24dc843",
+     "name": "submit_fault_intent",
+     "args": {
+      "fault_type": "pod-process-kill",
+      "scope": "pod",
+      "target": "process",
+      "action": "kill",
+      "namespace": "ark-system",
+      "names": "[\"kone-app-service-58c7db669c-mpwr6\"]",
+      "params": "{\"process\": \"kone-app-service\", \"signal\": \"15\"}",
+      "duration_seconds": 60,
+      "user_description": "干掉 kone-app-service 服务组件的服务进程（容器内实测进程名 kone-app-service），持续 60 秒，目标为 2 副本中的单个 Pod，窗口内进程反复被杀，到期自动恢复",
+      "case_resource_path": "references/catalogue/Pod_进程被杀死/Pod_进程被杀死_应用主进程异常.md"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_fabc61b063034374b24dc843",
+   "name": "submit_fault_intent",
+   "content": "✓ Fault-injection intent submitted; moving on to the execution-confirmation stage."
+  },
+  {
+   "role": "ai",
+   "tool_calls": [
+    {
+     "id": "call_c635435bce26419494cbaf8e",
+     "name": "submit_fault_intent",
+     "args": {
+      "fault_type": "pod-process-kill",
+      "scope": "pod",
+      "target": "process",
+      "action": "kill",
+      "namespace": "ark-system",
+      "names": "[\"kone-app-service-58c7db669c-mpwr6\"]",
+      "params": "{\"process\": \"kone-app-service\", \"signal\": \"15\"}",
+      "duration_seconds": 600,
+      "user_description": "干掉 kone-app-service 服务组件的服务进程（容器内实测进程名 kone-app-service），持续 600 秒，目标为 2 副本中的单个 Pod，窗口内进程反复被杀，到期自动恢复",
+      "case_resource_path": "references/catalogue/Pod_进程被杀死/Pod_进程被杀死_应用主进程异常.md"
+     }
+    }
+   ],
+   "content": ""
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "call_c635435bce26419494cbaf8e",
+   "name": "submit_fault_intent",
+   "content": "✓ Fault-injection intent submitted; moving on to the execution-confirmation stage."
+  }
+ ]
+}

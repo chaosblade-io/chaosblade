@@ -31,7 +31,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from .mechanism_writes import MechanismWriteEntry
 
 
 class GuardVerdict(str, Enum):
@@ -65,6 +68,34 @@ class GuardVerdict(str, Enum):
     # stagnation. The refusal also ALTERNATES, so unlike the others it is not a
     # statement about the call's admissibility.
     REJECT_STAGNANT = "reject_stagnant"
+
+    @property
+    def is_form_level_rejection(self) -> bool:
+        """True when re-submitting the SAME call form is guaranteed to be
+        rejected again — the verdict is a statement about the form's
+        admissibility, so a replan must treat it as a hard constraint.
+
+        DRIFT/BANNED/UNKNOWN qualify. STAGNANT does not: it is a repetition
+        circuit-breaker that ALTERNATES by design (same reasoning as its
+        member docstring), and its receipt explicitly tells the LLM to
+        "adjust the tool_call and retry" — rendering it as a never-relaxing
+        boundary hands the model two contradictory definitions of the same
+        refusal (B76 review P1-1). ALLOW/READONLY are trivially not
+        rejections.
+
+        Single source of truth for every consumer that needs the
+        "hard boundary vs evidence" split (execute_loop's replan
+        constraint collector). New verdicts default to False — fail-open
+        into the evidence semantics rather than falsely freezing a plan.
+        """
+        return self.name in _FORM_LEVEL_REJECTION_NAMES
+
+
+# Member names (not values — values are wire strings, names are stable
+# enum identifiers) whose rejections are form-level.
+_FORM_LEVEL_REJECTION_NAMES = frozenset({
+    "REJECT_DRIFT", "REJECT_BANNED", "REJECT_UNKNOWN",
+})
 
 
 # Sentinel scopes — the guard knows these aren't real k8s kinds. Canonical
@@ -192,6 +223,48 @@ class ApprovedTarget:
     # (bare-metal / VM faults). Empty for Kubernetes targets, which keep
     # using namespace/names/labels. See ``as_target()``.
     host_name: str = ""
+    # Case-manifest mechanism writes — FIRST-CLASS, deliberately NOT routed
+    # through ``secondary_scopes``/``secondary_namespace`` (whose comparison
+    # path skips name validation, so a name-level entry there would degrade
+    # to kind+namespace matching). Each entry legislates one write domain
+    # OUTSIDE the victim target's own coverage: cross-namespace auxiliary
+    # objects, cluster-scoped mechanism nodes, transient objects created
+    # under a declared name prefix. Parsed deterministically from the settled
+    # case file's ``mechanism_writes`` frontmatter (code reads the file — the
+    # Agent's reading of the case prose is never an authorization input) and
+    # frozen at approval together with the victim. The drift policy consults
+    # these BEFORE the victim comparison: a call whose canonicalised
+    # scope+namespace matches an active entry passes only when its names are
+    # a subset of the entry's names (or, for a prefix entry, every name
+    # starts with the prefix). Empty for every case without a manifest —
+    # those runs keep today's freeze output and guard behaviour
+    # byte-identically.
+    mechanism_entries: "tuple[MechanismWriteEntry, ...]" = ()
+    # Write-set approval state — the in-graph half of the D4 invariant.
+    # True means the snapshot still carries manifest entries beyond the
+    # victim coverage that NO knowing human has approved yet. Set at the
+    # single freeze point (safety_check, when ``entries_beyond_victim``
+    # is non-empty); cleared at the single approval point (the gate's
+    # approved branch re-freeze, and the human-approved drift-correction
+    # rebuild). ``execute_loop``'s entry sentinel terminates the run
+    # before any cluster mutation while this flag survives — the
+    # structural backstop for every path that reaches execution without
+    # passing a confirmation card under a human's eyes (route skips,
+    # ``aupdate_state(as_node=...)`` lifts, blind channel resumes, and
+    # future paths not yet invented). False / absent for every case
+    # without a manifest, and after any legitimate approval.
+    widening_pending_approval: bool = False
+    # Contract duration frozen from ``FaultSpec.duration_seconds`` at the
+    # single freeze point. Anchors the duration drift net: the executor's
+    # ``--timeout`` flag (experiment auto-recovery bound — layer 3 of the
+    # three-layer duration guarantee) may carry operational headroom over
+    # the contract value but must not exceed it unboundedly. A free-form
+    # flags ``--timeout 999999`` would silently convert the user-approved
+    # verification window into an unbounded fault residence time the
+    # moment the task dies before its cleanup chain runs — the exact
+    # scenario layer 3 exists to bound. Zero when the spec carried no
+    # duration (the net then stays silent — no anchor, no comparison).
+    duration_seconds: int = 0
 
     def as_target(self):
         """Return the carrier-agnostic :class:`TargetProtocol` view.
@@ -359,6 +432,61 @@ class EffectiveTarget:
     # (``spec.volumes[*].persistentVolumeClaim.claimName``). Meaningful only
     # when ``is_vehicle_manifest`` is True.
     occupant_claims: tuple[str, ...] = ()
+    # Recovery-carrier vehicle: a ``kubectl run`` that passed the RECOVERY
+    # CARRIER SHAPE (recovery-carrier-standard) — a sleep-skeleton pod this
+    # task creates inside the approved namespace to host the bounded-recovery
+    # TIMER for API-plane faults (patch deployment / delete PVC / patch cm),
+    # whose rollback lives in no node-local or blade host. Set by the
+    # classifier; the screener registers the pod as a ``recovery_carrier``
+    # vehicle artifact (task-side, zero cluster-side marker) so subsequent
+    # execs into it — token probe, timer arm, re-arm — ride the vehicle
+    # exemption, and finalize/recover's cleanup chain deletes the whole
+    # asset stack (pod + sa/role/rolebinding family). Distinct from the
+    # occupant contract: occupancy HOLDS a resource (anchor =
+    # ``approved.pvc_claims``); a recovery carrier EXECUTES recovery calls
+    # (anchor = in-net pod secondary scope + task-side registration).
+    is_recovery_carrier: bool = False
+    # Drill-target manifest: a single-Deployment ``kubectl apply -f`` that
+    # passed the DRILL-TARGET CONTRACT (drill-target-contract) — the victim
+    # workload this task stages itself when the approved target does not
+    # exist yet (case #38: the dedicated PVC-mounting target was deleted
+    # out-of-band between drills). Shape gate, classifier-side: exactly one
+    # container under spec.template.spec (no initContainers), no host* /
+    # privileged / capabilities / hostPath, an image from the carrier
+    # allow-set, and only persistentVolumeClaim/configMap/secret volumes.
+    # Identity is NOT anchored here — unlike an occupant (whose generated
+    # name can never match the approval) the drill target's name IS the
+    # approved identity, so the screener runs the ORDINARY drift net and
+    # registers the ALLOW as an ``occupant_deployment`` vehicle artifact:
+    # finalize/recover cleanup deletes it and the recovery delete rides
+    # the deployment-kind exemption.
+    is_drill_target_manifest: bool = False
+    # Inline blade experiment cleanup over the kubectl-exec channel:
+    # ``kubectl exec POD -- blade destroy <uid>`` (or ``revoke``). The
+    # classifier routes this shape to SCOPE_UNKNOWN — experiment cleanup
+    # is MUTATING, not read-only (the readonly bucket's probe-layer twin,
+    # ``readonly.py``, has always legislated destroy/revoke as mutating;
+    # a read-only verdict here let ANY UID pass with zero provenance,
+    # twelfth-round finding E3) — and records the UID here so the
+    # screener's provenance gate (the one the blade_destroy tool face
+    # rides) can verify it against the UIDs this task created before the
+    # call executes. Empty for every non-destroy blade shape and every
+    # other tool. Defence-in-depth: when the screener's gate never runs,
+    # the UNKNOWN scope makes the guard fail closed instead of passing
+    # the cleanup through as read-only.
+    blade_destroy_uid: str = ""
+    # Execution-side fault duration: the ``--timeout`` value the call's
+    # blade tokens carry (last-wins, matching blade's pflag semantics) in
+    # SECONDS. Set by both blade surfaces — the blade_create tool's
+    # free-form flags string and the inline ``kubectl exec ... blade
+    # create`` tokens — so the drift net can compare it against the frozen
+    # contract duration (``ApprovedTarget.duration_seconds``). Zero when
+    # the call carries no ``--timeout`` (the executor then injects one
+    # from the contract / minimum floor). Deliberately NOT clamped to the
+    # minimum-duration floor: the guard must see the verbatim value the
+    # executor would honour, so an over-large token stays visible as
+    # duration drift before execution.
+    timeout_seconds: int = 0
 
     def as_target(self):
         """Return the carrier-agnostic :class:`TargetProtocol` view."""

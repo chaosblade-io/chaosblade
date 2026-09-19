@@ -96,6 +96,48 @@ async def inject_fault(request: InjectRequest, req: Request):
             if _otel_cb is not None:
                 _otel_cb.set_task_id(task_id)
             result = await agents["pipeline"].ainvoke(initial_state, config)
+
+            # Unattended AUTO delegation (mirrors the CLI non-streaming
+            # path in cli/runner.py struct-for-struct): with confirm=false
+            # the graph pauses at confirmation_gate with no callback to
+            # ask — the task would hang forever in a "planned but never
+            # executed" limbo. Decide the resume through the shared
+            # boundary helper: the manifest is the authority and the guard
+            # enforces the per-name boundary, so the answer is always
+            # "approved"; a WIDENED contract auto-approval additionally
+            # lands in the audit log (no event stream on this route).
+            # Like the CLI twin, the resume fires whenever the graph is
+            # paused — the interrupt payload is read for the audit log,
+            # never as a precondition (a pause without a payload must not
+            # fall back into the limbo this block exists to close).
+            # confirm=true is the API's client-controlled confirmation
+            # contract — keep the pause and let POST /confirm/{task_id}
+            # resume it.
+            if not request.confirm:
+                from langgraph.types import Command
+                from chaos_agent.agent.nodes.gates._write_set_boundary import (
+                    unattended_resume_value,
+                    widened_auto_approval_payload,
+                )
+
+                paused = await agents["pipeline"].aget_state(config)
+                if paused and paused.next:
+                    interrupt_info = None
+                    for t in (paused.tasks or []):
+                        if getattr(t, "interrupts", None):
+                            interrupt_info = t.interrupts[0].value
+                            break
+                    if widened_auto_approval_payload(interrupt_info) is not None:
+                        logger.info(
+                            "auto_approved: confirmation_gate delegated a "
+                            "widened write-set contract (case manifest "
+                            "mechanism_writes beyond victim coverage); "
+                            "target_guard enforces the per-name boundary"
+                        )
+                    result = await agents["pipeline"].ainvoke(
+                        Command(resume=unattended_resume_value(interrupt_info)),
+                        config,
+                    )
             return result
         except Exception as e:
             logger.exception(f"Inject failed for task {task_id}")
@@ -107,11 +149,13 @@ async def inject_fault(request: InjectRequest, req: Request):
             # cli/session_finalize.py (no route-local twin copy).
             from chaos_agent.cli.session_finalize import auto_rollback
 
+            # abort-safe: see invariants allowlist
             await auto_rollback(agents["pipeline"], config)
 
             return {"error": f"{type(e).__name__}: {e}"}
         finally:
             # Finalize session: flush remaining messages from final graph state
+            # abort-safe: see invariants allowlist
             await finalize_inject_session(
                 session_store,
                 agents["pipeline"],

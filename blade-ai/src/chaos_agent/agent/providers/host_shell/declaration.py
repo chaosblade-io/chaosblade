@@ -34,3 +34,17 @@ SUPPORTED_ACTIONS = (
     "kill",
     "burn",
 )
+
+#: Raw host command tools that, when run successfully, mark a host-native
+#: injection — the host-native carrier vocabulary. SINGLE SOURCE for two
+#: consumers that must never drift (R23/G-7): the provider's
+#: ``inject_tool_names`` class attribute (detect/recency scans) and the
+#: machinery≠mutation HOST face's tool-name domain
+#: (``execution_artifacts.host_call_is_registered_recovery`` — the
+#: exemption is earned by the provider's own tool names, never by a
+#: hand-copied set). Declared HERE so the generic layer consumes pure
+#: data through the declaration seam instead of importing the provider
+#: class (phase-11 carrier-import boundary).
+HOST_INJECT_TOOL_NAMES = frozenset(
+    {"host_inject", "exec_host_command", "shell"}
+)

@@ -13,6 +13,11 @@
  * Left side  — single contextual hint (mutually exclusive sources).
  * Right side — minimal session signals:
  *   - ``permissionMode`` (auto / confirm)
+ *   - ``⚡ N%`` cache hit-rate for the current turn
+ *     (``turnCachedTokens / turnInputTokens``), always rendered — a boot
+ *     or no-LLM-call turn shows a dimmed ``⚡ 0%``. Colour is REVERSED vs
+ *     the window gauge — high is good (green), 0% is a neutral cold-start
+ *     (dimmed gray).
  *   - ``state size / window (tail)`` indicator, populated by the
  *     PreReasoningHook's ``context_size`` events. ``tail`` is
  *     ``(N.N%)`` in normal mode or ``(error)`` when an ERROR_RECEIVED
@@ -38,12 +43,20 @@ import {
   contextSizeSeverity,
   formatContextSize,
 } from "../utils/formatContextSize.js";
+import {
+  cacheHitRateSeverity,
+  formatCacheHitRate,
+} from "../utils/formatCacheHitRate.js";
 
 const FooterInternal: React.FC = () => {
   const config = useAppSelector((s) => s.config);
   const currentTokens = useAppSelector((s) => s.contextCurrentTokens);
   const maxTokens = useAppSelector((s) => s.contextMaxTokens);
   const contextError = useAppSelector((s) => s.contextError);
+  // Per-turn cache counters (subset semantics: cached ⊆ input). Reset on
+  // TURN_STARTED, summed on each USAGE_RECEIVED — see core reducer.
+  const turnCachedTokens = useAppSelector((s) => s.turnCachedTokens);
+  const turnInputTokens = useAppSelector((s) => s.turnInputTokens);
   const { columns } = useTerminalSize();
 
   if (columns < 40) return null;
@@ -66,11 +79,24 @@ const FooterInternal: React.FC = () => {
         ? Theme.status.warn
         : Theme.text.secondary;
 
+  // Cache hit-rate segment — rendered beside the context gauge from boot;
+  // a turn with no input tokens yet shows a dimmed "⚡ 0%" (never hidden).
+  const cacheText = formatCacheHitRate(turnCachedTokens, turnInputTokens);
+  const cacheSeverity = cacheHitRateSeverity(turnCachedTokens, turnInputTokens);
+  // Reversed palette: high hit-rate is GOOD (green); partial is neutral
+  // gray; a cold 0% is dimmed gray (``dimColor``) — never red, since a
+  // cold prefix is expected, not an error.
+  const cacheColor =
+    cacheSeverity === "good" ? Theme.status.ok : Theme.text.secondary;
+
   return (
     <Box paddingLeft={2} paddingRight={2} marginTop={1} justifyContent="space-between">
       <Text color={Theme.text.secondary}>{hint}</Text>
       <Box>
         <Text color={Theme.text.secondary}>{config.permissionMode} · </Text>
+        <Text color={cacheColor} dimColor={cacheSeverity === "none"}>
+          {cacheText} ·{" "}
+        </Text>
         <Text color={sizeColor}>{sizeText}</Text>
       </Box>
     </Box>

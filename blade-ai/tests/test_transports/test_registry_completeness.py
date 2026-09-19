@@ -266,35 +266,108 @@ class TestChannelProviderMatrix:
         """Pin which provider is usable on which channel.
 
         Adding a channel or a provider changes this matrix; the diff makes the
-        new combination an explicit decision instead of an accident.
+        new combination an explicit decision instead of an accident. The
+        post-dark-launch default (``faultdrill_enabled=True``) puts
+        FaultDrillProvider on the K8S-profile channels.
         """
         from chaos_agent.agent.providers import FaultProviderRegistry
+        from chaos_agent.config.settings import settings
         from chaos_agent.transports.registry import TransportRegistry, profile_of
 
+        _orig = settings.faultdrill_enabled
+        settings.faultdrill_enabled = True
         TransportRegistry._ensure_default()
+        try:
+            FaultProviderRegistry.register_builtins()
+
+            matrix = {
+                channel: sorted(
+                    type(p).__name__
+                    for p in FaultProviderRegistry.all_providers()
+                    if p.matches_channel(profile_of(channel))
+                )
+                for channel in sorted(TransportRegistry._channels)
+            }
+
+            assert matrix == {
+                "kubeconfig": [
+                    "ChaosbladeProvider", "FaultDrillProvider", "K8sNativeProvider",
+                ],
+                # ChaosBlade is intentionally on host channels too — the same
+                # ``blade`` CLI drives bare-host faults (``blade create cpu load``).
+                "kubewiz_host": [
+                    "ChaosbladeProvider", "ChaosbladePythonProvider", "HostShellProvider",
+                ],
+                "kubewiz_k8s": [
+                    "ChaosbladeProvider", "FaultDrillProvider", "K8sNativeProvider",
+                ],
+                "ssh": [
+                    "ChaosbladeProvider", "ChaosbladePythonProvider", "HostShellProvider",
+                ],
+            }, f"channel x provider matrix changed: {matrix}"
+        finally:
+            settings.faultdrill_enabled = _orig
+            FaultProviderRegistry.register_builtins()
+
+    def test_faultdrill_dark_launch_matrix(self):
+        """faultdrill-cr-channel M1: the CR channel's matrix footprint.
+
+        Dark launch (``faultdrill_enabled`` OFF — the post-flip default is
+        True; this tooth pins the channel-off structural absence). Flipped
+        on, FaultDrillProvider joins the K8S-profile channels ONLY (same
+        channel set as K8sNativeProvider: the CR carrier talks to the
+        cluster API, never a host shell), and re-registering with the flag
+        back off REMOVES it (register_builtins reconciles down — no stale
+        registration behind the gate).
+        """
+        from chaos_agent.agent.providers import FaultProviderRegistry
+        from chaos_agent.config.settings import settings
+        from chaos_agent.transports.registry import (
+            TransportRegistry,
+            profile_of,
+        )
+
+        TransportRegistry._ensure_default()
+        _orig = settings.faultdrill_enabled
+        try:
+            settings.faultdrill_enabled = True
+            FaultProviderRegistry.register_builtins()
+            matrix = {
+                channel: sorted(
+                    type(p).__name__
+                    for p in FaultProviderRegistry.all_providers()
+                    if p.matches_channel(profile_of(channel))
+                )
+                for channel in sorted(TransportRegistry._channels)
+            }
+            assert matrix == {
+                "kubeconfig": [
+                    "ChaosbladeProvider", "FaultDrillProvider", "K8sNativeProvider",
+                ],
+                "kubewiz_host": [
+                    "ChaosbladeProvider", "ChaosbladePythonProvider",
+                    "HostShellProvider",
+                ],
+                "kubewiz_k8s": [
+                    "ChaosbladeProvider", "FaultDrillProvider", "K8sNativeProvider",
+                ],
+                "ssh": [
+                    "ChaosbladeProvider", "ChaosbladePythonProvider",
+                    "HostShellProvider",
+                ],
+            }, f"faultdrill-enabled matrix changed: {matrix}"
+        finally:
+            settings.faultdrill_enabled = False
+            FaultProviderRegistry.register_builtins()
+
+        # Flag back off → structurally absent again (reconcile-down pin).
+        carriers = [p.carrier for p in FaultProviderRegistry.all_providers()]
+        assert "faultdrill_cr" not in carriers, carriers
+        # Then restore the PRE-TEST flag (post-flip default True) and
+        # reconcile back up — no flag or registration state leaks past
+        # this test.
+        settings.faultdrill_enabled = _orig
         FaultProviderRegistry.register_builtins()
-
-        matrix = {
-            channel: sorted(
-                type(p).__name__
-                for p in FaultProviderRegistry.all_providers()
-                if p.matches_channel(profile_of(channel))
-            )
-            for channel in sorted(TransportRegistry._channels)
-        }
-
-        assert matrix == {
-            "kubeconfig": ["ChaosbladeProvider", "K8sNativeProvider"],
-            # ChaosBlade is intentionally on host channels too — the same
-            # ``blade`` CLI drives bare-host faults (``blade create cpu load``).
-            "kubewiz_host": [
-                "ChaosbladeProvider", "ChaosbladePythonProvider", "HostShellProvider",
-            ],
-            "kubewiz_k8s": ["ChaosbladeProvider", "K8sNativeProvider"],
-            "ssh": [
-                "ChaosbladeProvider", "ChaosbladePythonProvider", "HostShellProvider",
-            ],
-        }, f"channel x provider matrix changed: {matrix}"
 
 
 class TestExecutionLocationVisible:

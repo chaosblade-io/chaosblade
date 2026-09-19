@@ -418,3 +418,350 @@ class TestDriftCorrectionNeverRewritesTowardVehicle:
         )
         delta = _apply_drift_correction(state, eff)
         assert delta["fault_spec"]["names"] == ["kone-runtime-5b69b7b8bd-OTHER"]
+
+
+class TestDriftCorrectionOwnerAnchorStaleness:
+    """owner_names is dual-sourced (labels-matched owners AND the
+    names→ownerReferences chain discovered for the generation anchor):
+    a human-approved correction that changes the NAMES identity drops it —
+    the anchor must never outlive the identity it was discovered against
+    (case #39 follow-up)."""
+
+    def _state(self, owner_names, resolved_names=()) -> dict:
+        return {
+            "fault_spec": {
+                "namespace": "default", "scope": "pod",
+                "names": ["web-abc-111"],
+                "labels": {}, "fault_target": "cpu",
+                "fault_action": "fullload",
+                "params": {}, "params_flags": [], "duration_seconds": 0,
+                "source": "test", "user_description": "",
+            },
+            "approved_target": {
+                "scope": "pod", "namespace": "default",
+                "names": ["web-abc-111"],
+                "owner_names": list(owner_names),
+                "resolved_names": list(resolved_names),
+            },
+        }
+
+    def test_names_correction_drops_owner_names(self):
+        state = self._state(("web", "web-abc"), ("web-abc-111",))
+        eff = EffectiveTarget(
+            scope="pod", namespace="default",
+            names=("web-abc-222",),
+        )
+        delta = _apply_drift_correction(state, eff)
+        at = delta["approved_target"]
+        assert at["names"] == ["web-abc-222"]
+        # Generation anchor dropped — it was discovered against the OLD
+        # pod identity; the guard falls back to namespace-only anchoring
+        # until the next approval re-discovers.
+        assert at["owner_names"] == []
+        # resolved_names is purely label-derived: a names-only
+        # correction leaves the label identity (hence it) intact.
+        assert at["resolved_names"] == ["web-abc-111"]
+
+    def test_no_identity_change_keeps_owner_names(self):
+        state = self._state(("web", "web-abc"))
+        eff = EffectiveTarget(
+            scope="pod", namespace="default",
+            names=("web-abc-111",),
+        )
+        delta = _apply_drift_correction(state, eff)
+        assert delta["approved_target"]["owner_names"] == ["web", "web-abc"]
+
+
+class TestFaultBinaryMutationSegmentCoverage:
+    """R25/G-9: the identity-review marker must survive COMPOUND payloads.
+
+    The fault-binary branch keyed on the (single-layer-peeked) head
+    token missed every fault binary riding past a ``;`` separator inside
+    ``sh -c`` — a ``blade destroy x; stress-ng`` compound lost the
+    marker, so the vehicle exemption (this file's screener face) AND the
+    machinery≠mutation faces (execution_artifacts) would swallow a real
+    fault binary. Segment-level detection (the shared syntax parser +
+    the shared ``_FAULT_BINARIES`` set) closes the head-only blind spot;
+    a pure-machinery compound (destroy + readonly companion) still earns
+    no marker.
+    """
+
+    @pytest.mark.parametrize(
+        "v_args,expected",
+        [
+            # fault binary past a ";" inside sh -c — head-only peek missed it
+            (
+                "tp -n ns -- sh -c "
+                "'blade destroy aa11bb22cc33dd44; stress-ng --cpu 4'",
+                True,
+            ),
+            (
+                "tp -n ns -- sh -c "
+                "'blade destroy aa11bb22cc33dd44; "
+                "tc qdisc add dev eth0 root netem loss 10%'",
+                True,
+            ),
+            # readonly head + mutating tail — the same blind spot
+            (
+                "tp -n ns -- sh -c 'cat /etc/hosts; iptables -A INPUT -j DROP'",
+                True,
+            ),
+            # wrapper-prefixed compound (timeout resolves to the script)
+            (
+                "tp -n ns -- timeout 30 sh -c "
+                "'blade destroy aa11bb22cc33dd44; stress-ng --cpu 4'",
+                True,
+            ),
+            # pure machinery compound: destroy + readonly companion
+            (
+                "tp -n ns -- sh -c "
+                "'blade destroy aa11bb22cc33dd44; cat /tmp/destroy.log'",
+                False,
+            ),
+        ],
+        ids=[
+            "destroy-plus-stress-ng",
+            "destroy-plus-tc",
+            "readonly-head-plus-iptables",
+            "timeout-wrapped-compound",
+            "pure-machinery-compound",
+        ],
+    )
+    def test_compound_fault_binary_marker(self, v_args, expected):
+        eff = infer_effective_target(
+            "kubectl", {"subcommand": "exec", "v_args": v_args},
+        )
+        assert eff.fault_binary_mutation is expected
+
+
+class TestEscapePrimitiveSegmentCoverage:
+    """R26/G-10: escape primitives must be caught in COMPOUND payloads.
+
+    Same function, same head-only root, same fix shape as G-9
+    (TestFaultBinaryMutationSegmentCoverage): the escape branch's
+    single-layer peek reads only the FIRST command's head, so a payload
+    with an innocent head and an escape primitive riding past a ``;``
+    (``cat /etc/hosts; nsenter -t 1 -m sh``) never reached the
+    SCOPE_ESCAPE legislation — it classified as a plain pod mutation,
+    and when the exec target IS the approved pod the identity match
+    passes the whole chain end-to-end (screener-level probe: route=pass
+    for the compound while every direct/wrapped form is REJECT_BANNED).
+    The escape branch's own comment promises "a single ``sh -c`` wrapper
+    must not hide the escape primitive" — the compound form hid it
+    anyway.
+
+    Segment-level detection (the shared parser, same as G-9) routes any
+    payload whose ANY segment head is nsenter/chroot/unshare into the
+    escape branch, where the shared readonly judge (already
+    segment-level, B46) rules the compound: an escape stage that is not
+    read-only lands in SCOPE_ESCAPE; an all-readonly compound stays
+    SCOPE_READONLY (the readonly-escape exemption keeps its width).
+    """
+
+    @pytest.mark.parametrize(
+        "v_args",
+        [
+            "tp -n ns -- sh -c 'cat /etc/hosts; nsenter -t 1 -m sh'",
+            "tp -n ns -- sh -c 'cat /etc/hosts; chroot /host bash'",
+            "tp -n ns -- sh -c 'ls /tmp; unshare -m sh'",
+            "tp -n ns -- sh -c 'cat /etc/os-release && nsenter -t 1 -m sh'",
+            "tp -n ns -- timeout 30 sh -c 'cat f; nsenter -t 1 -m sh'",
+        ],
+        ids=[
+            "cat-then-nsenter",
+            "cat-then-chroot",
+            "ls-then-unshare",
+            "and-then-nsenter",
+            "timeout-wrapped-compound",
+        ],
+    )
+    def test_compound_escape_is_scope_escape(self, v_args):
+        """复合逃逸形态必须落 SCOPE_ESCAPE（现行落 pod——红侧牙）。"""
+        eff = infer_effective_target(
+            "kubectl", {"subcommand": "exec", "v_args": v_args},
+        )
+        assert eff.scope == "__escape__", (
+            f"{v_args!r}: an escape primitive riding past a ';' must hit "
+            "the SCOPE_ESCAPE legislation, not classify as a pod mutation"
+        )
+
+    @pytest.mark.parametrize(
+        "v_args",
+        [
+            # all-readonly compound WITHOUT an escape segment: unchanged
+            "tp -n ns -- sh -c 'cat /etc/hosts; cat /proc/uptime'",
+            # readonly compound WITH a readonly escape tail: the
+            # readonly-escape exemption keeps its width (head-position
+            # chroot was already exempt; the tail-position form must not
+            # narrow it)
+            "tp -n ns -- sh -c 'cat /etc/hosts; chroot /host cat /etc/os-release'",
+        ],
+        ids=[
+            "readonly-compound-no-escape",
+            "readonly-compound-with-readonly-escape-tail",
+        ],
+    )
+    def test_readonly_compound_stays_readonly(self, v_args):
+        """阴性对照：全 readonly 复合（含 readonly 逃逸尾）仍 READONLY。"""
+        eff = infer_effective_target(
+            "kubectl", {"subcommand": "exec", "v_args": v_args},
+        )
+        assert eff.scope == "__readonly__"
+
+
+class TestEscapeRejectDetailNamesTheRealPrimitive:
+    """R27/G-11c: the reject message must name the primitive that
+    TRIGGERED the escape branch — the model's repair loop reads it.
+
+    G-10 made the branch trigger segment-level, but the reject_detail
+    still quotes the head-only ``escape_probe[0]`` — for a compound
+    payload the message names the innocent head ('cat'/'blade'),
+    misleading the model's self-repair direction. The message is the
+    guidance surface; the named primitive must be the one the
+    legislation actually caught.
+    """
+
+    @pytest.mark.parametrize(
+        "v_args,expected_primitive",
+        [
+            # segment-level trigger: the message must name the RIDING
+            # primitive, not the innocent head 'cat'
+            (
+                "tp -n ns -- sh -c 'cat /etc/hosts; nsenter -t 1 -m sh'",
+                "nsenter",
+            ),
+            (
+                "tp -n ns -- sh -c 'cat /etc/hosts; chroot /host bash'",
+                "chroot",
+            ),
+            # head-position trigger: unchanged — the head IS the trigger
+            (
+                "tp -n ns -- nsenter -t 1 -m sh",
+                "nsenter",
+            ),
+        ],
+        ids=[
+            "compound-names-riding-primitive",
+            "compound-names-chroot",
+            "direct-head-unchanged",
+        ],
+    )
+    def test_reject_detail_names_trigger_primitive(self, v_args, expected_primitive):
+        eff = infer_effective_target(
+            "kubectl", {"subcommand": "exec", "v_args": v_args},
+        )
+        assert eff.scope == "__escape__"
+        assert f"'{expected_primitive}'" in eff.reject_detail, (
+            f"reject_detail must name the primitive the escape branch "
+            f"actually caught ({expected_primitive!r}), got: "
+            f"{eff.reject_detail!r}"
+        )
+
+
+class TestHiddenEscapeFormsAreScoped:
+    """R33/G-12: escape primitives riding shell STRUCTURES.
+
+    Command substitution (``$()``), backticks, subshells and command
+    groups execute the primitive just as ``;`` does — the escape scope
+    legislation must see them. Pre-fix probe (live): all forms below
+    classified scope=pod and the screener passed them end-to-end with
+    an approved-pod identity match.
+    """
+
+    @pytest.mark.parametrize(
+        "v_args",
+        [
+            "tp -n ns -- sh -c 'cat f; $(nsenter -t 1 -m sh)'",
+            "tp -n ns -- sh -c 'cat f; `nsenter -t 1 -m sh`'",
+            "tp -n ns -- sh -c 'cat f; (nsenter -t 1 -m sh)'",
+            "tp -n ns -- sh -c 'cat f; { nsenter -t 1 -m sh; }'",
+            "tp -n ns -- sh -c 'cat f; \"$(nsenter -t 1 -m sh)\"'",
+            "tp -n ns -- sh -c 'cat $(nsenter -t 1 -m cat /etc/shadow)'",
+            "tp -n ns -- sh -c 'cat f; $(echo $(nsenter -t 1 -m sh))'",
+        ],
+        ids=[
+            "cmdsub", "backtick", "subshell", "brace-group",
+            "dq-wrapped", "arg-position", "nested",
+        ],
+    )
+    def test_structure_riding_escape_is_scoped_and_named(self, v_args):
+        eff = infer_effective_target(
+            "kubectl", {"subcommand": "exec", "v_args": v_args},
+        )
+        assert eff.scope == "__escape__", (
+            f"an escape primitive riding a shell structure executes just "
+            f"as one past ';' — scope must be __escape__: {v_args!r}"
+        )
+        assert "'nsenter'" in eff.reject_detail, (
+            f"reject_detail must name the caught primitive: "
+            f"{eff.reject_detail!r}"
+        )
+
+    def test_chroot_riding_structure_is_scoped(self):
+        eff = infer_effective_target(
+            "kubectl",
+            {"subcommand": "exec",
+             "v_args": "tp -n ns -- sh -c 'echo done `chroot /host bash`'"},
+        )
+        assert eff.scope == "__escape__"
+
+    def test_case_branch_escape_is_scoped(self):
+        # R33/G-12b: the case pattern terminator `)` opens a branch
+        # command list — an escape primitive in the branch executes.
+        # Pre-fix probe (live): scope=pod and the screener passed it
+        # end-to-end with an approved-pod identity match, even in the
+        # destroy+escape compound form.
+        for v_args in (
+            "tp -n ns -- sh -c 'case x in a) nsenter -t 1 -m sh;; esac'",
+            "tp -n ns -- sh -c 'case x in a) blade destroy aa11bb22cc33dd44;"
+            "; b) nsenter -t 1 -m sh;; esac'",
+        ):
+            eff = infer_effective_target(
+                "kubectl", {"subcommand": "exec", "v_args": v_args},
+            )
+            assert eff.scope == "__escape__", (
+                f"a case-branch escape executes — scope must be "
+                f"__escape__: {v_args!r}"
+            )
+
+    def test_escape_in_argument_tail_is_not_scoped(self):
+        # R35/G-13: the closer's PARAMETER TAIL is the host command's
+        # argument text — the shell never executes it as a command, so
+        # it must not trigger the escape scope. Pre-fix probe (live):
+        # the bare form classified scope=__escape__ and the screener
+        # rejected it end-to-end (a legal form killed).
+        for v_args in (
+            "tp -n ns -- sh -c 'echo done $(date) nsenter -t 1 -m sh'",
+            "tp -n ns -- sh -c 'echo done \"$(date) nsenter -t 1 -m sh\"'",
+        ):
+            eff = infer_effective_target(
+                "kubectl", {"subcommand": "exec", "v_args": v_args},
+            )
+            assert eff.scope == "pod", (
+                f"an escape primitive in an argument tail is parameter "
+                f"text, not a command — scope must stay pod: {v_args!r}"
+            )
+
+    def test_escape_in_heredoc_body_is_not_scoped(self):
+        # R36/G-14: a heredoc body is stdin text — a restore script
+        # WRITTEN via the carrier-blessed quoted-heredoc form that merely
+        # MENTIONS nsenter must not be classified as a host escape.
+        # Pre-fix probe (live): scope=__escape__ → the screener rejected
+        # it end-to-end with reject_banned naming 'nsenter'.
+        for v_args in (
+            # double-quoted delimiter — the exact carrier-blessed form
+            "tp -n ns -- sh -c 'cat > /tmp/restore.sh <<\"EOF\"\n"
+            "nsenter -t 1 -m sh -c \"umount /tmp/stale-mount\"\n"
+            "EOF\necho done'",
+            # bare delimiter variant
+            "tp -n ns -- sh -c 'cat > /tmp/restore.sh <<EOF\n"
+            "nsenter -t 1 -m sh\n"
+            "EOF\necho done'",
+        ):
+            eff = infer_effective_target(
+                "kubectl", {"subcommand": "exec", "v_args": v_args},
+            )
+            assert eff.scope == "pod", (
+                f"a heredoc body is stdin text — an escape word inside "
+                f"it must not scope the exec: {v_args!r}"
+            )

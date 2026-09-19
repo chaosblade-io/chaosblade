@@ -38,9 +38,15 @@
  * sibling file under ``commands/``.
  */
 
-import { type BladeClient, TUI_PROTOCOL_VERSION } from "../api/client.js";
+import {
+  type BladeClient,
+  BladeApiError,
+  RESPONSE_CODE_TASK_NOT_FOUND,
+  TUI_PROTOCOL_VERSION,
+} from "../api/client.js";
 import { getActiveLang, t } from "../i18n/index.js";
 import { replayRecording } from "../utils/replay.js";
+import { foldSessionEvents } from "../utils/sessionEvents.js";
 import type { Action } from "./reducer.js";
 import { resetStreamingCounters } from "./streamingRefs.js";
 import type {
@@ -145,6 +151,19 @@ export interface SlashCommandContext {
     | { saved: true; absPath: string; bytes: number }
     | { saved: false; alreadyExists: true; absPath: string }
   >;
+  /**
+   * Host capability gate for ``/resume``: the host must wire the
+   * store's ``session.id`` (written by the resume flow's
+   * SESSION_INITIALIZED) back into its ``useStream`` binding — i.e.
+   * the store-driven session switch must survive into the next
+   * submitted turn. The Ink TUI does this via Composer's
+   * ``s.session.id`` subscription; the web host still passes a
+   * boot-time prop, so a resume there would rebuild the visuals but
+   * send subsequent turns to the OLD session. Absent / false → the
+   * /resume handlers refuse with ``resume.host_unsupported`` (same
+   * pattern as ``saveTextFile`` gating ``/recordings export``).
+   */
+  supportsResume?: boolean;
 }
 
 /** Subcommand under a two-level command (e.g. ``/skills list``). The
@@ -576,6 +595,358 @@ async function planHandler(
     return;
   }
   await ctx.submitTurn(nl, { dryRun: true });
+}
+
+// ── /resume helpers ──────────────────────────────────────────────────
+//
+// Session-level takeover of a previous TUI session: rebuild the visual
+// history from the events jsonl (``memory/tui/<sid>.events.jsonl``)
+// and re-bind the active session id so the NEXT turn appends to the
+// OLD session's files (and, server-side, continues the old
+// conversation thread). Task-level playback (``/replay``) and this are
+// orthogonal: replay re-watches one task's tape, resume takes over the
+// whole session.
+
+/** Minute-resolution stamp for resumable-session listings, derived
+ * from ``modified_at`` — the events-file mtime the listing SORTS by.
+ * The old rendering showed ``started_at`` (creation), which can sit
+ * days earlier and made the timestamp column contradict the
+ * "newest first" order it sits under. Widens to ``YYYY-MM-DD`` for
+ * sessions from a different year so staleness stays visible. */
+function formatLastActive(
+  epochSeconds: number,
+  nowMs: number = Date.now(),
+): string {
+  const dt = new Date(epochSeconds * 1000);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  if (dt.getFullYear() !== new Date(nowMs).getFullYear()) {
+    return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+  }
+  return `${pad(dt.getMonth() + 1)}-${pad(dt.getDate())} ${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+}
+
+/** Bare ``/resume``: list the sessions that carry an events jsonl on
+ *  disk (server's ``GET /api/v1/memory/resumable``, newest first).
+ *  Output mirrors the ``/recordings list`` shape: id · size · events ·
+ *  last-active · first-input digest, plus a usage tail. */
+async function listResumableHandler(ctx: SlashCommandContext): Promise<void> {
+  try {
+    const items = await ctx.client.listResumableSessions();
+    if (items.length === 0) {
+      pushLog(ctx, t("resume.empty"), "info");
+      return;
+    }
+    const head = t("resume.head", { n: items.length });
+    const rows = items.slice(0, 20).map((r) => {
+      // LAST ACTIVE from mtime (the sort key) — see
+      // formatLastActive. The day-level date alone loses "which of
+      // today's sessions", and full precision is noise.
+      const when = formatLastActive(r.modified_at);
+      const digest = r.first_input || "…";
+      return `  ${r.tui_session_id}  ·  ${formatBytes(r.size_bytes)}  ·  ${r.event_count} ev  ·  ${when}  ·  ${digest}`;
+    });
+    pushLog(
+      ctx,
+      [head, ...rows, "", t("resume.use_hint")].join("\n"),
+      "info",
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    pushLog(ctx, t("resume.failed_list", { err: msg }), "warn");
+  }
+}
+
+/** Narrow context for {@link runSessionResume}. The slash-command path
+ * adapts its full SlashCommandContext into this shape; the boot path
+ * (BootRunner, ``blade-ai resume -i <sid>``) has no session yet and
+ * no viewport burn-in, so it supplies an empty fallback header and
+ * omits ``clearScreen``. */
+export interface SessionResumeContext {
+  client: BladeClient;
+  dispatch: (action: Action) => void;
+  /** Append a log line to history (LOG_APPENDED semantics). */
+  pushLog: (text: string, level: "info" | "warn" | "ok") => void;
+  /** Host-injected viewport wipe. Optional: boot-time resume has no
+   *  burn-in to clear, so BootRunner omits it. */
+  clearScreen?: () => void;
+  /** Boot path only: keep the boot-phase cards (welcome / doctor /
+   *  pending-tasks) through the replay's HISTORY_CLEARED. The boot
+   *  path dispatches those cards BEFORE the replay so they land at
+   *  the head of the rebuilt history; the slash path never sets it
+   *  (its cards belong to the session being discarded). */
+  preserveBootCards?: boolean;
+  /** Header fallbacks while the resumed session's own state loads
+   *  (Step 3 is best-effort). */
+  fallbackHeader: {
+    cluster: string;
+    namespace: string;
+    modelName: string;
+  };
+}
+
+export type SessionResumeOutcome = "ok" | "no_events";
+
+/** The takeover sequence shared by ``/resume <sid>`` and the TUI's
+ * ``--resume <sid>`` boot path. Order matters:
+ *
+ *   1. ``getMemoryEvents`` — hard fail on a missing events jsonl (no
+ *      fallback chain, by design); the dedicated ``resume.no_events``
+ *      message keys off the server's fail-envelope CODE
+ *      (TASK_NOT_FOUND), carried through as ``BladeApiError.code``.
+ *   2. ``resumeSession`` — server-side rehydrate of the in-memory
+ *      session entry (conversation thread, task ids) BEFORE any
+ *      visual work, so a mid-fold failure can't leave the UI on the
+ *      old session while the server already switched.
+ *   3. ``getSessionState`` — header fields for the resumed session
+ *      (cluster / namespace / model may differ from the boot ones).
+ *      Best-effort: a failure keeps the caller-supplied fallbacks.
+ *   4. ``clearScreen`` — host-injected viewport wipe (same contract
+ *      as /clear) BEFORE the state-level clear below: HISTORY_CLEARED
+ *      resets the store only — without the wipe the boot session's
+ *      burn-in stays on the terminal and the folded history renders
+ *      BELOW it, mixing two sessions on one screen. Hosts without a
+ *      viewport to wipe (web, or the boot path where nothing has
+ *      rendered yet) omit the hook and skip silently.
+ *   5. ``REPLAY_STARTED`` — pseudo-busy for the fold duration;
+ *      ``isReplaying`` also silences the terminal-attention bell that
+ *      CONFIRM_RECEIVED would otherwise ring mid-fold.
+ *   6. ``HISTORY_CLEARED`` — drop the caller's history (welcome
+ *      card included on the slash path; nothing yet on the boot path)
+ *      and reset the locator namespace. With ``preserveBootCards``
+ *      (boot path) the boot-phase cards survive the clear — they
+ *      were dispatched before the replay and describe the current
+ *      environment, not the old session. The "restoring…" notice
+ *      goes out as a TRANSIENT ``BOOT_PROGRESS_SHOW`` spinner row,
+ *      NOT a persisted log — a persisted row stays in scrollback
+ *      forever after the restore it announces has finished (Step
+ *      9's HIDE retires the spinner; ``resume.done`` is the durable
+ *      confirmation).
+ *   7. Fold + synchronous dispatch loop — the reducer is a pure
+ *      state machine over the same Actions the live SSE path
+ *      dispatches, so the visual rebuild IS a replay. React 18
+ *      batching coalesces the whole loop into one render commit;
+ *      the burn-in cost is handled by MainContent's Progressive
+ *      Static chunking (same as /replay). Every turn-boundary action
+ *      (TURN_DONE / TURN_ABORTED / TURN_TRANSITION) is prefixed with
+ *      a sentinel ``CONFIRM_RESOLVED("interrupted")`` flush of every
+ *      still-open gate — an unresolved card must never be committed
+ *      into history by commitPending (see the in-loop comment).
+ *   8. Trailing unresolved confirm → same sentinel flush, for an
+ *      events file that ends mid-confirm (server died / TUI closed
+ *      while a card waited).
+ *   9. ``REPLAY_ENDED`` — commitPending + streamState=idle.
+ *      ``BOOT_PROGRESS_HIDE`` retires the spinner row so it cannot
+ *      outlive the restore it announces — a finally guard fires it
+ *      on BOTH exit paths (success and mid-fold throw; the boot
+ *      path's catch also re-hides, idempotently).
+ *  10. ``SESSION_INITIALIZED`` — writes the resumed sid into the
+ *      store; Composer's ``s.session.id`` subscription re-binds
+ *      useStream, so subsequent turns stream INTO the old session.
+ *
+ * Returns ``"no_events"`` (caller decides the UX — the slash path
+ * warns, the boot path fails loud) or ``"ok"``; anything else throws.
+ */
+export async function runSessionResume(
+  ctx: SessionResumeContext,
+  sid: string,
+): Promise<SessionResumeOutcome> {
+  const started = Date.now();
+  {
+    // Step 1 — events fetch. A missing jsonl surfaces as the server's
+    // fail envelope with code TASK_NOT_FOUND; BladeClient rethrows it
+    // as a ``BladeApiError`` carrying that code, so we branch on the
+    // CODE — the wire contract — not on the English message prose,
+    // which is user-facing and free to reword without notice.
+    let events;
+    try {
+      events = await ctx.client.getMemoryEvents(sid);
+    } catch (err) {
+      if (
+        err instanceof BladeApiError &&
+        err.code === RESPONSE_CODE_TASK_NOT_FOUND
+      ) {
+        return "no_events";
+      }
+      throw err;
+    }
+    if (events.length === 0) {
+      return "no_events";
+    }
+
+    // Step 2 — server-side rehydrate (conversation thread + task ids).
+    await ctx.client.resumeSession(sid);
+
+    // Step 3 — header fields for the resumed session, best-effort.
+    let cluster = ctx.fallbackHeader.cluster;
+    let namespace = ctx.fallbackHeader.namespace || "default";
+    let modelName = ctx.fallbackHeader.modelName;
+    try {
+      const st = await ctx.client.getSessionState(sid);
+      if (typeof st["cluster"] === "string") cluster = st["cluster"];
+      if (typeof st["namespace"] === "string" && st["namespace"]) {
+        namespace = st["namespace"];
+      }
+      if (typeof st["model_name"] === "string") modelName = st["model_name"];
+    } catch {
+      // Header falls back to the current (boot) values; non-fatal.
+    }
+
+    // Steps 4-6 — wipe the viewport, enter the replay frame, then drop
+    // the boot history. The wipe goes FIRST (see docstring step 4): the
+    // state-level clear never touches terminal pixels.
+    try {
+      ctx.clearScreen?.();
+    } catch {
+      // Best-effort — tests / non-TTY contexts may have a stub stdout.
+    }
+    ctx.dispatch({ type: "REPLAY_STARTED", taskId: sid });
+    resetStreamingCounters();
+    ctx.dispatch({
+      type: "HISTORY_CLEARED",
+      preserveBootCards: ctx.preserveBootCards,
+    });
+    // AFTER the clear, so the spinner survives it — and as a
+    // TRANSIENT row (BOOT_PROGRESS_SHOW), not a persisted log: a
+    // "restoring…" line in history stays in scrollback forever
+    // after the restore it announces has finished. MainContent
+    // renders the spinner above the pending area; the finally below
+    // retires it on EVERY exit path — success AND mid-fold throws.
+    ctx.dispatch({
+      type: "BOOT_PROGRESS_SHOW",
+      text: t("resume.starting", { sid, n: events.length }),
+    });
+
+    try {
+      // Step 6 — fold + synchronous dispatch loop.
+      //
+      // An unresolved gate must NEVER survive a turn boundary:
+      // TURN_DONE → commitPending drains ``pending`` into history
+      // VERBATIM, and CONFIRM_RESOLVED only maps over ``pending`` — a
+      // card committed unresolved would render as a live keyboard-active
+      // Select inside <Static> (HistoryItemDisplay defaults ``isFocused``
+      // on for history items), letting the user "answer" a long-gone
+      // turn and re-firing Composer's resolveInterrupt network effect.
+      // So each boundary action is prefixed with a sentinel flush of
+      // every STILL-OPEN gate. The FIFO tracks all open gates — the
+      // L1→L2 double-gate race can hold two at once, and only the
+      // answered one is closed by CONFIRM_USER_DECIDED.
+      const actions = foldSessionEvents(events);
+      const openGates: (string | null)[] = [];
+      const flushOpenGates = (): void => {
+        for (const gateTaskId of openGates) {
+          // A gate recorded without a task_id (defensive: the server's
+          // sidewrite contract always carries one) derives its card's
+          // taskId from state inside the reducer, which this loop can't
+          // observe — a sentinel would miss-match, so skip it (same
+          // behaviour as the old single-trailing-gate version).
+          if (gateTaskId === null) continue;
+          ctx.dispatch({
+            type: "CONFIRM_RESOLVED",
+            taskId: gateTaskId,
+            answer: "interrupted",
+          });
+        }
+        openGates.length = 0;
+      };
+      for (const action of actions) {
+        if (
+          action.type === "TURN_DONE" ||
+          action.type === "TURN_ABORTED" ||
+          action.type === "TURN_TRANSITION"
+        ) {
+          flushOpenGates();
+        }
+        if (action.type === "CONFIRM_RECEIVED") {
+          openGates.push(action.taskId ?? null);
+        } else if (action.type === "CONFIRM_USER_DECIDED") {
+          const i = openGates.indexOf(action.taskId ?? null);
+          if (i >= 0) openGates.splice(i, 1);
+        }
+        ctx.dispatch(action);
+      }
+
+      // Step 7 — trailing unresolved gate: the events file ends mid-
+      // confirm (server died / TUI closed while a card waited). Same
+      // sentinel flush as the in-loop boundaries, for the file's tail.
+      flushOpenGates();
+
+      // Steps 8-9 — close the replay frame, then switch the session.
+      ctx.dispatch({ type: "REPLAY_ENDED", aborted: false });
+      ctx.dispatch({
+        type: "SESSION_INITIALIZED",
+        session: { id: sid, cluster, namespace, modelName },
+      });
+      ctx.pushLog(
+        t("resume.done", {
+          sid,
+          events: events.length,
+          duration: formatMs(Date.now() - started),
+        }),
+        "ok",
+      );
+      return "ok";
+    } finally {
+      // Retire the transient spinner on BOTH exit paths. On the
+      // success path this lands in the same React 18 batch as the
+      // done log, so the "restoring…" row vanishes exactly when the
+      // confirmation appears; on a mid-fold throw it fires BEFORE
+      // the exception reaches the caller — without it, the slash
+      // path's catch only logs the failure and the spinner row
+      // would sit above the input forever, the same stuck-message
+      // class of bug this transient channel exists to prevent. (The
+      // boot path's catch also re-hides; HIDE is idempotent.)
+      ctx.dispatch({ type: "BOOT_PROGRESS_HIDE" });
+    }
+  }
+}
+
+/** ``/resume [<sid>]`` — slash-command entry: the host/stream gates
+ * and the bare-list fallback stay here; the takeover sequence itself
+ * lives in {@link runSessionResume} (shared with the boot path). */
+async function resumeSessionHandler(
+  ctx: SlashCommandContext,
+  args: string[],
+): Promise<void> {
+  // Host gate FIRST — before any network call. The Ink TUI sets
+  // ``supportsResume`` (store-driven session switch is wired); a
+  // host without it (web: boot-time sessionId prop) would rebuild
+  // the visuals but stream subsequent turns into the OLD session —
+  // worse than refusing.
+  if (ctx.supportsResume !== true) {
+    pushLog(ctx, t("resume.host_unsupported"), "warn");
+    return;
+  }
+  const sid = (args[0] || "").trim();
+  if (!sid) {
+    await listResumableHandler(ctx);
+    return;
+  }
+  if (ctx.state.streamState !== "idle") {
+    pushLog(ctx, t("retry.busy"), "warn");
+    return;
+  }
+  try {
+    const outcome = await runSessionResume(
+      {
+        client: ctx.client,
+        dispatch: ctx.dispatch,
+        pushLog: (text, level) => pushLog(ctx, text, level),
+        clearScreen: () => ctx.clearScreen?.(),
+        fallbackHeader: {
+          cluster: ctx.state.session.cluster ?? "",
+          namespace: ctx.state.session.namespace ?? "default",
+          modelName: ctx.state.session.modelName ?? "",
+        },
+      },
+      sid,
+    );
+    if (outcome === "no_events") {
+      pushLog(ctx, t("resume.no_events", { sid }), "warn");
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    pushLog(ctx, t("resume.failed", { sid, err: msg }), "warn");
+  }
 }
 
 // ── Locator command helpers ──────────────────────────────────────────
@@ -2262,6 +2633,21 @@ function buildBuiltInCommands(): SlashCommand[] {
           const msg = err instanceof Error ? err.message : String(err);
           pushLog(ctx, t("replay.failed", { id: taskId, err: msg }), "warn");
         }
+      },
+    },
+    {
+      name: "resume",
+      description: t("command.resume.desc"),
+      group: "business",
+      usage: "[<tui_session_id>]",
+      // Deliberately NOT stream-safe: resume rebuilds the whole visual
+      // history and switches the active session mid-command — racing
+      // a live turn would interleave the old session's replayed items
+      // with the new session's live ones. The default (false) fails
+      // closed; the Composer gate + the handler's own idle check
+      // (defense-in-depth, same as /run) both enforce it.
+      async handler(ctx, args) {
+        await resumeSessionHandler(ctx, args);
       },
     },
   ];

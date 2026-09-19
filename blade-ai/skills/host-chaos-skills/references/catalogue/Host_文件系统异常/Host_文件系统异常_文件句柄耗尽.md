@@ -63,8 +63,7 @@ stress-ng --open <count> --timeout <duration>s
 ```bash
 # --timeout 到期后 stress-ng 自行退出，正常路径无需干预。
 # 如需提前终止，必须两步：open stressor 的 worker 不随主进程退出（孤儿化，
-# fd 持续增长），只杀主进程会残留 worker——实测 kill 主 PID 后仍剩 9 个
-# worker 且 fd 继续上涨。先杀主进程再按名清 worker（-x 精确匹配进程名）：
+# fd 持续增长），只杀主进程会残留 worker 且 fd 继续上涨。先杀主进程再按名清 worker（-x 精确匹配进程名）：
 pkill -x stress-ng
 pkill -9 -x stress-ng-open
 # 清理后用 cat /proc/sys/fs/file-nr 复核已分配 fd 数回落，未回落重复执行一次
@@ -76,6 +75,6 @@ pkill -9 -x stress-ng-open
 - 单进程受 `ulimit -n` 限制，全局受 `file-max` 限制
 - 建议在演练前临时提高 ulimit 以达到预期效果：`ulimit -n 1000000`
 - 自恢复基于 stress-ng 自带的 `--timeout <duration>s`，到期进程自行退出、fd 释放；提前恢复用上方 kill 命令
-- **open worker 孤儿化（实测）**：kill 主进程后 worker 被收养（PPID 归 1 号进程族）继续打开 fd，必须用 `pkill -9 -x stress-ng-open` 按名清理；与 vm/fork stressor（worker 随主进程退出）行为不同
-- **timeout 自恢复有迟滞（实测）**：到期后 worker 逐个退出，完全释放滞后约 1–2 分钟（实测 9 个 worker 约 75s 清零）——勿在到期则立即判「未恢复」
-- **不要用 `pgrep -f stress-ng` 取 PID**：`-f` 匹配完整命令行，会把携带该字符串的执行 shell 自身一并匹配（实测自匹配 PID 1974739），拿输出去 kill 会杀掉执行 shell；`-x` 按进程名精确匹配
+- **open worker 孤儿化**：kill 主进程后 worker 被收养（PPID 归 1 号进程族）继续打开 fd，必须用 `pkill -9 -x stress-ng-open` 按名清理；与 vm/fork stressor（worker 随主进程退出）行为不同
+- **timeout 自恢复有迟滞**：到期后 worker 逐个退出，完全释放滞后约 1–2 分钟（如 9 个 worker 约 75s 清零）——勿在到期则立即判「未恢复」
+- **不要用 `pgrep -f stress-ng` 取 PID**：`-f` 匹配完整命令行，会把携带该字符串的执行 shell 自身一并匹配，拿输出去 kill 会杀掉执行 shell；`-x` 按进程名精确匹配

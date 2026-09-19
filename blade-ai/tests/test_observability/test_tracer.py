@@ -1,6 +1,8 @@
 """Tests for observability tracer."""
 
+import logging
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,6 +11,10 @@ from chaos_agent.observability.tracer import (
     NodeSpan,
     TaskTrace,
     TracingCallback,
+    _cache_read_from_token_usage,
+    _cache_read_from_usage_metadata,
+    _extract_token_usage,
+    _log_cache_read_source,
     clear_trace,
     flush_trace,
     get_all_metrics,
@@ -201,6 +207,258 @@ class TestTracingCallback:
         response.llm_output = "not a dict"
         callback.on_llm_end(response)
         assert trace.total_llm_calls == 1
+
+
+class TestCacheReadExtraction:
+    """Prompt-cache-hit token extraction — vendor-agnostic union.
+
+    ``cache_read`` is a SUBSET of ``input_tokens`` (not additive); the
+    authoritative source is ``usage_metadata.input_token_details.cache_read``
+    (real-run verified for DashScope), with service-tier prefix variants and
+    raw ``token_usage`` shapes kept as zero-risk defensive fallbacks.
+    """
+
+    def test_usage_metadata_plain_cache_read(self):
+        resp = SimpleNamespace(usage_metadata={
+            "input_tokens": 2990,
+            "output_tokens": 120,
+            "input_token_details": {"cache_read": 2176},
+        })
+        assert _extract_token_usage(resp) == (2990, 120, 2176)
+
+    def test_usage_metadata_service_tier_prefix(self):
+        # LangChain prefixes the key when service_tier ∈ {priority, flex}.
+        prio = SimpleNamespace(usage_metadata={
+            "input_tokens": 1000,
+            "output_tokens": 10,
+            "input_token_details": {"priority_cache_read": 800},
+        })
+        assert _extract_token_usage(prio)[2] == 800
+        flex = SimpleNamespace(usage_metadata={
+            "input_tokens": 1000,
+            "output_tokens": 10,
+            "input_token_details": {"flex_cache_read": 640},
+        })
+        assert _extract_token_usage(flex)[2] == 640
+
+    def test_response_metadata_openai_shape_fallback(self):
+        # Defensive fallback (empty on the production streaming path).
+        resp = SimpleNamespace(
+            usage_metadata=None,
+            llm_output=None,
+            response_metadata={"token_usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 300},
+            }},
+        )
+        assert _extract_token_usage(resp) == (500, 20, 300)
+
+    def test_deepseek_native_field_fallback(self):
+        # Unverified against a live key, but read-side probing is zero-risk.
+        resp = SimpleNamespace(
+            usage_metadata=None,
+            llm_output=None,
+            response_metadata={"token_usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 20,
+                "prompt_cache_hit_tokens": 450,
+            }},
+        )
+        assert _extract_token_usage(resp)[2] == 450
+
+    def test_no_cache_field_degrades_to_zero(self):
+        resp = SimpleNamespace(usage_metadata={
+            "input_tokens": 100, "output_tokens": 5,
+        })
+        assert _extract_token_usage(resp) == (100, 5, 0)
+
+    def test_callback_accumulates_total_token_cached(self):
+        trace = TaskTrace(task_id="t1")
+        cb = TracingCallback(trace)
+        cb.on_llm_end(SimpleNamespace(usage_metadata={
+            "input_tokens": 2990, "output_tokens": 120,
+            "input_token_details": {"cache_read": 2176},
+        }))
+        cb.on_llm_end(SimpleNamespace(usage_metadata={
+            "input_tokens": 3000, "output_tokens": 100,
+            "input_token_details": {"cache_read": 824},
+        }))
+        assert trace.total_token_input == 5990
+        assert trace.total_token_cached == 3000
+
+    def test_to_dict_summary_exposes_total_token_cached(self):
+        trace = TaskTrace(task_id="t1")
+        trace.total_token_input = 2990
+        trace.total_token_cached = 2176
+        summary = trace.to_dict()["summary"]
+        assert summary["total_token_cached"] == 2176
+
+
+class TestCacheReadSourceDiagnostics:
+    """The cache-read helpers report WHICH vendor field matched, so an
+    unmapped provider is diagnosable from logs instead of silently reporting
+    a 0 hit rate (tasks.md 1.4 source-diagnostic requirement).
+    """
+
+    def test_usage_metadata_helper_returns_source(self):
+        assert _cache_read_from_usage_metadata(
+            {"input_token_details": {"cache_read": 2176}}
+        ) == (2176, "usage_metadata.input_token_details.cache_read")
+
+    def test_usage_metadata_helper_service_tier_source(self):
+        assert _cache_read_from_usage_metadata(
+            {"input_token_details": {"priority_cache_read": 800}}
+        ) == (800, "usage_metadata.input_token_details.priority_cache_read")
+
+    def test_usage_metadata_helper_flat_source(self):
+        assert _cache_read_from_usage_metadata({"cache_read": 50}) == (
+            50,
+            "usage_metadata.cache_read",
+        )
+
+    def test_usage_metadata_helper_miss_returns_none_source(self):
+        assert _cache_read_from_usage_metadata({"input_tokens": 100}) == (0, None)
+
+    def test_token_usage_helper_returns_source(self):
+        assert _cache_read_from_token_usage(
+            {"prompt_tokens_details": {"cached_tokens": 300}}
+        ) == (300, "token_usage.prompt_tokens_details.cached_tokens")
+
+    def test_token_usage_helper_deepseek_source(self):
+        assert _cache_read_from_token_usage({"prompt_cache_hit_tokens": 450}) == (
+            450,
+            "token_usage.prompt_cache_hit_tokens",
+        )
+
+    def test_token_usage_helper_miss_returns_none_source(self):
+        assert _cache_read_from_token_usage({"prompt_tokens": 100}) == (0, None)
+
+    def test_log_names_source_on_hit(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="chaos_agent.observability.tracer"):
+            _log_cache_read_source(
+                2176, "usage_metadata.input_token_details.cache_read", 2990
+            )
+        assert "usage_metadata.input_token_details.cache_read" in caplog.text
+        assert "cache_read=2176" in caplog.text
+
+    def test_log_neutral_on_zero_with_prompt(self, caplog):
+        # The diagnostic case: a non-zero prompt but no cache field mapped —
+        # logged with NEUTRAL wording (not "missed/failed") so a healthy cold
+        # start doesn't read as an error, while still naming both benign
+        # explanations (cold turn vs unmapped vendor field).
+        with caplog.at_level(logging.DEBUG, logger="chaos_agent.observability.tracer"):
+            _log_cache_read_source(0, None, 2990)
+        assert "no cache-hit field mapped" in caplog.text
+        assert "cold/no-cache turn" in caplog.text
+        # the old failure-framed wording must be gone
+        assert "all mapped sources missed" not in caplog.text
+
+    def test_no_log_when_zero_prompt(self, caplog):
+        # Nothing to diagnose when there was no prompt at all.
+        with caplog.at_level(logging.DEBUG, logger="chaos_agent.observability.tracer"):
+            _log_cache_read_source(0, None, 0)
+        assert "cache_read" not in caplog.text
+
+    def test_extract_logs_source_end_to_end(self, caplog):
+        # The choke point wires the source through to the diagnostic log.
+        resp = SimpleNamespace(usage_metadata={
+            "input_tokens": 2990,
+            "output_tokens": 120,
+            "input_token_details": {"cache_read": 2176},
+        })
+        with caplog.at_level(logging.DEBUG, logger="chaos_agent.observability.tracer"):
+            assert _extract_token_usage(resp) == (2990, 120, 2176)
+        assert "usage_metadata.input_token_details.cache_read" in caplog.text
+
+
+class TestCacheSummaryPersistence:
+    """tracer ↔ DB wiring for the task-level cache aggregate (design D4).
+
+    ``_persist_summary`` MUST write ``trace.total_token_cached`` absolutely at
+    finalize; ``_load_trace_from_store`` MUST restore it — so the per-task hit
+    rate survives a restart. Stubbed store (no real DB) to isolate the wiring.
+    """
+
+    @pytest.mark.asyncio
+    async def test_persist_summary_writes_total_token_cached(self, monkeypatch):
+        import chaos_agent.observability.tracer as tracer_mod
+        import chaos_agent.persistence.task_store as ts_mod
+
+        captured: dict = {}
+
+        class _FakeStore:
+            async def upsert(self, task_id, **fields):
+                captured.update(fields)
+
+        async def _fake_get_store():
+            return _FakeStore()
+
+        monkeypatch.setattr(ts_mod, "get_task_store", _fake_get_store)
+
+        trace = tracer_mod.TaskTrace(task_id="task-cache1")
+        trace.total_token_input = 2990
+        trace.total_token_cached = 2176
+        await tracer_mod._persist_summary("task-cache1", trace)
+
+        assert captured["total_token_cached"] == 2176
+        assert captured["total_token_input"] == 2990
+
+    @pytest.mark.asyncio
+    async def test_load_trace_restores_total_token_cached(self, monkeypatch):
+        import chaos_agent.observability.tracer as tracer_mod
+        import chaos_agent.persistence.task_store as ts_mod
+
+        class _FakeStore:
+            async def get(self, task_id):
+                return {"task_id": task_id, "task_state": "injected"}
+
+            async def get_summary(self, task_id):
+                return {
+                    "total_token_input": 2990,
+                    "total_token_output": 500,
+                    "total_token_cached": 2176,
+                    "total_llm_calls": 3,
+                    "total_tool_calls": 2,
+                }
+
+            async def get_spans(self, task_id):
+                return []
+
+        async def _fake_get_store():
+            return _FakeStore()
+
+        monkeypatch.setattr(ts_mod, "get_task_store", _fake_get_store)
+
+        trace = await tracer_mod._load_trace_from_store("task-cache1")
+        assert trace is not None
+        assert trace.total_token_cached == 2176
+        assert trace.total_token_input == 2990
+
+    @pytest.mark.asyncio
+    async def test_load_trace_defaults_cached_to_zero_when_absent(self, monkeypatch):
+        # A legacy row whose summary predates the column reads 0, never KeyError.
+        import chaos_agent.observability.tracer as tracer_mod
+        import chaos_agent.persistence.task_store as ts_mod
+
+        class _FakeStore:
+            async def get(self, task_id):
+                return {"task_id": task_id, "task_state": "injected"}
+
+            async def get_summary(self, task_id):
+                return {"total_token_input": 100, "total_token_output": 20}
+
+            async def get_spans(self, task_id):
+                return []
+
+        async def _fake_get_store():
+            return _FakeStore()
+
+        monkeypatch.setattr(ts_mod, "get_task_store", _fake_get_store)
+
+        trace = await tracer_mod._load_trace_from_store("task-cache1")
+        assert trace is not None
+        assert trace.total_token_cached == 0
 
 
 class TestGlobalTraceManagement:

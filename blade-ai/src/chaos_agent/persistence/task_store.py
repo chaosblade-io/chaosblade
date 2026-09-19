@@ -27,6 +27,11 @@ import json
 import logging
 from typing import Optional
 
+from chaos_agent.agent.state import (
+    TASK_STATE_COLUMN_VALUES,
+    TASK_STATE_TERMINAL_VALUES,
+    TaskStateOverlay,
+)
 from chaos_agent.config.settings import settings
 from chaos_agent.persistence.task_identity import is_real_task_id
 from chaos_agent.persistence.task_store_backend import (
@@ -46,10 +51,13 @@ logger = logging.getLogger(__name__)
 # and that fallback must never overwrite a verdict already on record.
 # "cancelled" joins the set: once a task is cancelled (intent rejected /
 # turn aborted), later field-less flushes must not resurrect it.
-_TERMINAL_TASK_STATES = frozenset({
-    "injected", "recovered", "partial_recovered",
-    "failed", "rejected", "completed", "cancelled",
-})
+# "unverified" joins the set: it is a TERMINAL knowledge claim (verification
+# ran, conclusion unavailable) — a later field-less flush must not regress it
+# to the "injecting" fallback, which would show a finished run as in-flight.
+# Single-sourced from the TaskState legislation (round-15): this frozenset
+# was a hand copy of the terminal subset — one word drifting here would
+# desync the flush guard from every other terminal consumer.
+_TERMINAL_TASK_STATES = TASK_STATE_TERMINAL_VALUES
 
 # Fields whose presence proves the pipeline has taken ownership of a task
 # (an intent converged, a fault spec produced, a plan generated, a command
@@ -78,6 +86,183 @@ _LIFECYCLE_EVIDENCE_FIELDS = (
     "error",
     "skill_name",
 )
+
+
+def _decode_json_value(value: object) -> object:
+    """Decode a JSON column value if it is a string; pass through otherwise."""
+    if isinstance(value, str) and value:
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return value
+
+
+def _recovery_fully_cleared(record: dict) -> bool:
+    """True when the recover flow's OWN verdict proves the whole task clear.
+
+    Two machine-readable landing shapes of the same verdict (both written
+    by ``finalize_recover_verification``): the ``recover_verification``
+    dict's ``level`` and the ``result`` dict's ``recovered`` /
+    ``recovery_level`` pair. Either signal alone is accepted — legacy
+    rows may carry only one. Deliberately EXCLUDES ``partial``: a partial
+    recovery means at least one fault may survive, which is a live
+    liability, not a cleared one.
+    """
+    rv = _decode_json_value(record.get("recover_verification"))
+    if isinstance(rv, dict) and rv.get("level") == "recovered":
+        return True
+    result = _decode_json_value(record.get("result"))
+    if isinstance(result, dict):
+        if (
+            result.get("recovered") is True
+            and result.get("recovery_level") == "recovered"
+        ):
+            return True
+    return False
+
+
+def _injection_was_issued(record: dict) -> bool:
+    """True when the record shows an injection command WAS ACTUALLY ISSUED.
+
+    The old word-predicate's one irreproachable judgment, promoted intact:
+    ``injection_start_time`` is written exactly at the moment the command
+    goes out (write-once, never cleared — unlike ``injection_method``,
+    which execute_loop's multi-step self-check resets to None), and the
+    intent evidence (``target`` legacy shape / ``fault_spec`` canonical
+    shape) proves a rollback target exists. Without this signal a row
+    whose carrier fields were cleared post-issuance would project no
+    fault handle and vanish from the recoverable set — the very
+    "injected but unrecoverable" family the old predicate's pitfalls
+    archive records.
+    """
+    issued = record.get("injection_start_time")
+    if not issued:
+        return False
+    intent = _decode_json_value(record.get("target")) or _decode_json_value(
+        record.get("fault_spec")
+    )
+    return bool(intent)
+
+
+def _experiment_shaped_only(record: dict) -> bool:
+    """Whether the row's whole liability is experiment-shaped (A2 gate).
+
+    The balanced wing already proved every OWNED experiment dead. The
+    residual question is whether anything ELSE rides this row — the combo
+    shape (experiment + native mutation) whose native half survives wing
+    balance. Three-leg discrimination on the persisted combo marker
+    (``combo_native_issued``, round-32b):
+
+    - ``true``  → combo: the native half may still be owed → NOT
+      experiments-only (keep the committed-carrier fallback).
+    - ``NULL``  → never asserted (legacy rows, pre-round-32b windows):
+      absence of evidence is NOT evidence of absence — a combo whose
+      marker never landed would be false-cleared by a guessed "no" →
+      keep the fallback.
+    - ``false`` → the execute birth seam asserted experiments-only. One
+      cross-check before trusting it: a NATIVE-family method attribution
+      alongside the experiments is combo evidence the marker missed (the
+      recover-side criterion-2 mirror — the upgrade seam can miss the
+      native→experiment re-attribution, leaving the row
+      method=kubectl_native with live experiments). Only an
+      experiment-family (or absent) attribution lets the balanced wing
+      settle the row.
+    """
+    marker = _decode_json_value(record.get("combo_native_issued"))
+    # Tri-state: None = never asserted → unknown → keep the fallback.
+    # Only an explicit false/0 asserts experiments-only; true/1 (and any
+    # unrecognised shape) is the combo leg — conservative by default.
+    if marker is None:
+        return False
+    if not (marker is False or marker == 0):
+        return False
+    method = record.get("injection_method")
+    if method:
+        from chaos_agent.agent.providers import FaultProviderRegistry
+
+        provider = FaultProviderRegistry.resolve_by_method(method)
+        if provider is not None and not provider.has_experiment_uid:
+            # Native-family attribution alongside experiments — combo
+            # evidence the marker missed (criterion-2 mirror).
+            return False
+    return True
+
+
+def may_carry_live_fault(record: dict) -> bool:
+    """Single-source predicate behind the materialised ``tasks.liability_live``
+    column (round-32 root-cause fix).
+
+    "May this row still carry a live fault the cluster owes a destroy for?"
+    — the RECOVERY question. Previously answered by guessing from the
+    ``task_state`` word (TASK_STATE_ACTIVE_VALUES: "which lifecycle words
+    sound unfinished"), which required a fresh human re-derivation for
+    every new word and lost twice (round-32 K1 ``recovering`` orphan rows,
+    K2 ``failed``-with-experiment verdicts) — permanently blinding
+    recovery to faults that were deterministically live.
+
+    Evidence order (highest authority first):
+
+    A) **Ledger wing** — ``owned_experiment_uids`` / ``retired_experiment_uids``
+       (the row-level persistence of ``live_liability_uids``, agent/state.py):
+       ``owned − retired`` non-empty → True, no further appeal. An issued
+       destroy that was never PROVEN dead stays a liability (fail-closed:
+       a failed destroy leaves the experiment possibly-alive and still
+       owed). BALANCED wings settle an experiments-only row dead outright
+       (round-32b C2 — pre-fix the committed-carrier fallback overruled
+       the row's own death record, so every swept-but-never-recovered
+       task haunted ``query_active`` forever); a combo row keeps the
+       fallback because its native half may still be owed — see
+       :func:`_experiment_shaped_only` for the three-leg discrimination.
+
+    B) **Committed-carrier fallback** (legacy rows that predate the ledger,
+       and UID-less native carriers the ledger is structurally blind to):
+       a fault handle still projects (``has_active_fault`` — carrier-agnostic
+       committed predicate) OR the issued-evidence pair survived on its own
+       (``_injection_was_issued``: write-once ``injection_start_time`` plus
+       intent evidence) → True UNLESS the recover flow's own final verdict
+       proves the whole task cleared (``_recovery_fully_cleared``).
+
+    C) Never injected → False.
+
+    The function is PURE over its record: both write paths (``upsert``
+    inference and ``update_task_state`` recompute) feed it the merged
+    tasks+task_details logical record, JSON columns as strings or decoded
+    values alike (decoded internally). Monotonicity is inherited from the
+    inputs' own monotonicity: the birth wing is append-only, the death
+    wing only grows, and the recovery verdict only lands at finalize.
+    """
+    from chaos_agent.agent.state import has_active_fault
+
+    owned = _decode_json_value(record.get("owned_experiment_uids"))
+    retired = _decode_json_value(record.get("retired_experiment_uids"))
+    owned = owned if isinstance(owned, list) else []
+    retired = retired if isinstance(retired, list) else []
+
+    # A) Ledger axis: authoritative for every row that ever landed one.
+    if owned or retired:
+        if set(owned) - set(retired):
+            return True
+        # Wings balanced → every owned experiment has a PROVEN death. For
+        # an experiments-only row that IS the whole liability settled
+        # (C2: the row's own death record outranks the committed-shape
+        # fallback). Combo rows — marker true, marker NULL (legacy), or a
+        # native-family attribution the marker missed — keep the fallback:
+        # their native half survives wing balance.
+        if _experiment_shaped_only(record):
+            return False
+        # else fall through to B.
+
+    # B) Committed-carrier fallback: EITHER a fault handle still projects
+    # (legacy experiment_uid / injection_method columns, native carriers)
+    # OR the issued-evidence pair survived on its own (command went out,
+    # carrier fields later cleared). Both are "committed"; neither clears
+    # without the recover flow's own final verdict.
+    if has_active_fault(record) or _injection_was_issued(record):
+        return not _recovery_fully_cleared(record)
+
+    # C) No committed fault, no ledger → nothing owed.
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +322,74 @@ class TaskStore:
         # (inject-9bf2dddd: tasks row has experiment_uid but no verification
         # column, so infer saw "no verification" and regressed 'injected').
         inference_base = dict(merged)
+        detail_row = None
         if row:
             detail_row = await self._backend.select_details(task_id)
             if detail_row:
                 for k, v in detail_row.items():
                     inference_base.setdefault(k, v)
+        # Round-32 — liability ledger wings merge MONOTONICALLY (union),
+        # never overwrite: the sync path writes full AgentState snapshots,
+        # so a hydration gap (state.owned is None after a DB-only recovery
+        # path never re-read the ledger) would otherwise overwrite the
+        # persisted wings with NULL and erase the row's recovery record.
+        # Both wings are append-only by legislation (agent/state.py), so
+        # union is lossless and idempotent.
+        # ❗ previous MUST be read from the raw DB detail row: the fields
+        # merge above already wrote the INCOMING wing value into
+        # merged/inference_base, so ``inference_base.get(wing)`` would
+        # union the incoming list with itself and silently drop the
+        # persisted members (the hydration-gap erase this exists to stop).
+        for wing in ("owned_experiment_uids", "retired_experiment_uids"):
+            if wing not in merged:
+                continue  # writer did not touch the wing → DB value survives
+            incoming = _decode_json_value(merged.get(wing))
+            previous_source = (
+                (detail_row or {}).get(wing) if row else inference_base.get(wing)
+            )
+            previous = _decode_json_value(previous_source)
+            incoming = incoming if isinstance(incoming, list) else []
+            previous = previous if isinstance(previous, list) else []
+            union = sorted({str(u) for u in previous} | {str(u) for u in incoming})
+            payload = json.dumps(union, ensure_ascii=False)
+            merged[wing] = payload
+            inference_base[wing] = payload
+        # Round-32b — combo-marker latch. The marker is tri-state and the
+        # sync path writes full AgentState snapshots, so a None flush
+        # (replan clear, hydration gap) must never erase the persisted
+        # assertion — mirroring the wings' discipline above. True
+        # additionally STICKS over a later False/None: a native companion
+        # issued alongside a live experiment is a historical fact about
+        # those experiments, and the wings it describes are append-only,
+        # so downgrading the row back to "experiments-only" after the
+        # fact would license exactly the false clear the marker exists to
+        # prevent (fail-closed: an over-sticky true costs a lingering
+        # recoverable row, a lost true can leak a live native mutation).
+        if "combo_native_issued" in merged:
+            _marker_in = _decode_json_value(merged.get("combo_native_issued"))
+            # ❗ read the persisted leg from the RAW DB detail row — the
+            # fields merge above already wrote the incoming value into
+            # merged (the same shadowing the wing union guards against).
+            _marker_db = (
+                _decode_json_value((detail_row or {}).get("combo_native_issued"))
+                if row
+                else _marker_in
+            )
+            if _marker_in is None:
+                _final = _marker_db  # a None flush never erases
+            elif _marker_db is True or _marker_db == 1:
+                _final = True  # sticky: a committed combo stays a combo
+            else:
+                _final = bool(_marker_in)
+            _payload = None if _final is None else json.dumps(_final)
+            merged["combo_native_issued"] = _payload
+            inference_base["combo_native_issued"] = _payload
         merged.update(self._infer_fields(inference_base))
+        # Round-32 — materialised liability verdict (single-source
+        # predicate; see may_carry_live_fault). Computed on the SAME merged
+        # logical record the state inference sees, so the word and the
+        # verdict can never disagree about different data.
+        merged["liability_live"] = 1 if may_carry_live_fault(inference_base) else 0
         merged["task_id"] = task_id
 
         # 5. Set gmt_create / gmt_modified
@@ -162,7 +409,14 @@ class TaskStore:
 
     # -- read ----------------------------------------------------------------
 
-    async def update_task_state(self, task_id: str, task_state: str) -> None:
+    async def update_task_state(
+        self,
+        task_id: str,
+        task_state: str,
+        *,
+        recover_verification: Optional[dict] = None,
+        skip_if_terminal: bool = False,
+    ) -> bool:
         """Directly update ``task_state`` on a task **without** inference.
 
         Unlike ``upsert``, this method writes the ``task_state`` column
@@ -171,19 +425,120 @@ class TaskStore:
         ``partial_recovered`` / ``failed`` without overwriting its
         ``operation``, ``result``, or ``verification`` fields.
 
+        ``recover_verification`` (round-33b single-source): the clearance
+        verdict that JUSTIFIES a CLEARED word, propagated onto the SAME
+        row in the SAME write. A CLEARED state word and its clearance
+        verdict are one atomic fact; before this they could split across
+        rows (the recover flow wrote the verdict to the recover- row but
+        only the bare word to the inject- row), leaving the inject row a
+        CLEARED word with no row-local proof — a permanent
+        "completed-but-uncleared" ghost under the fail-closed predicate.
+        When supplied, the verdict is persisted to
+        ``task_details.recover_verification`` BEFORE the liability
+        recompute below, so the word and the verdict clear together.
+        Omitting it keeps the fail-closed behaviour: a CLEARED word with
+        no verdict on record stays ``liability_live = 1``.
+
+        ``skip_if_terminal`` (round-54 G6, the abort-path guard): when
+        True, a row already resting on its OWN terminal word — the run
+        reached ``completed`` / ``recovered`` / ``failed`` / … before
+        the abort fired — is left untouched and the call returns False.
+        The abort exits (stream cancel / disconnect / internal error)
+        write ``cancelled`` / ``failed`` for runs whose graph NEVER
+        finished; a race that lands the abort write during result
+        extraction, after the pipeline completed, must not rewrite the
+        run's own verdict ("completed" → "cancelled"). Returns True
+        when the write landed.
+
         Same identity guard as :meth:`upsert` — only a real ``task-``
         id may be written.
+
+        Closed-set guard (round-16 S5, domain widened round-17 D4): an
+        out-of-set word here is a PROGRAM BUG (typo, foreign domain
+        word), not legacy data — a silent clamp would mask it, so the
+        write is rejected loudly. The domain is the COLUMN's value
+        domain (lifecycle closed set ∪ persistence overlay words —
+        upsert's _infer_fields legitimately emits ``waiting_input`` /
+        ``pending`` into the same column), not the bare TaskState set:
+        before round-17 the gate would have rejected the very words
+        the upsert write path emits (one column, two write paths,
+        one gated one not). Contrast the verification-vocabulary read
+        gate (round-15 D5): reads face legacy rows and may only
+        normalise, never reject; writes face fresh code and must fail
+        fast.
+
+        Round-32: the word and the materialised liability verdict travel
+        together on this write path too — ``recovering`` (this method's
+        dominant caller during recover start) is a MID-FLIGHT word, and
+        the row it lands on must keep its ``liability_live = 1`` (the
+        pre-fix write lost exactly this: a crash between this write and
+        finalize left the row in a state no query could ever find again
+        — round-32 K1). The verdict is recomputed from the merged row
+        evidence (not derived from the word — that's the whole point of
+        the column), so a finalize write of ``recovered`` lands on a row
+        whose recover verdict is already on record and clears it, while
+        a mid-flight ``recovering`` write cannot clear what no verdict
+        proved dead.
         """
         if not is_real_task_id(task_id):
             return
+        if task_state not in TASK_STATE_COLUMN_VALUES:
+            raise ValueError(
+                f"update_task_state: {task_state!r} is outside the task_state "
+                f"column value domain (lifecycle closed set + persistence "
+                f"overlay); refusing to persist an unlegislated word"
+            )
+        # Rebuild the logical record (tasks + task_details merged) the
+        # single-source predicate sees on the upsert path, so both write
+        # paths compute ``liability_live`` from identical evidence.
+        record: dict = dict(await self._backend.select_task(task_id) or {})
+        detail_row = await self._backend.select_details(task_id)
+        if detail_row:
+            record.update(
+                {k: v for k, v in detail_row.items() if k not in ("id",)}
+            )
+        # Round-54 G6: an abort word must never regress a row that
+        # already reached its own terminal verdict. The abort exits'
+        # write (``write_aborted_task_row``) races the run's own tail
+        # writers — a cancel landing during result extraction, after
+        # the pipeline completed, used to rewrite "completed" into
+        # "cancelled". The run that finished keeps its own word; the
+        # abort word is only for runs whose graph never got to finish.
+        if skip_if_terminal and str(record.get("task_state") or "") in (
+            TASK_STATE_TERMINAL_VALUES
+        ):
+            return False
+        # Round-33b: land the clearance verdict on THIS row first so the
+        # liability recompute below sees it (word + verdict clear together).
+        if recover_verification is not None:
+            _verdict_payload = (
+                recover_verification
+                if isinstance(recover_verification, str)
+                else json.dumps(recover_verification, ensure_ascii=False)
+            )
+            # ❗ task_id MUST be in the column list: upsert_details builds
+            # INSERT … ON CONFLICT(task_id) from ``columns`` (its task_id
+            # arg is not injected into the SQL), so omitting it yields a
+            # NOT NULL violation on task_details.task_id — the same trap
+            # upsert_task guards against.
+            await self._backend.upsert_details(
+                task_id,
+                ["task_id", "recover_verification"],
+                [task_id, _verdict_payload],
+            )
+            record["recover_verification"] = _verdict_payload
+        liability_live = 1 if may_carry_live_fault(record) else 0
         # ❗ task_id MUST be in the column list: the backend builds
         # INSERT … ON CONFLICT(task_id) DO UPDATE SET from it. Omitting it
         # produced a NULL-task_id ghost row on SQLite and a NOT NULL
         # violation on PostgreSQL (empty SET clause on PG additionally
         # yields a syntax error for conflict-key-only upserts).
         await self._backend.upsert_task(
-            task_id, ["task_id", "task_state"], [task_id, task_state]
+            task_id,
+            ["task_id", "task_state", "liability_live"],
+            [task_id, task_state, liability_live],
         )
+        return True
 
     async def get(self, task_id: str) -> Optional[dict]:
         """Return the full task data (tasks + task_details merged).
@@ -209,15 +564,24 @@ class TaskStore:
             rows = await self._backend.select_tasks_ordered(limit, offset)
         return [self._row_to_dict(r) for r in rows]
 
-    async def query_active(self, namespace: str = "", target_name: str = "", tenant_id: str = "") -> list[dict]:
-        """Return active tasks (``injecting`` / ``injected``) as
-        ExperimentStore-compatible dicts.
+    async def query_active(self, namespace: str = "", target_name: str = "", tenant_id: str = "", workspace_id: str = "") -> list[dict]:
+        """Return liability-carrying rows (``tasks.liability_live = 1``) as
+        ExperimentStore-compatible dicts — the recovery-discovery set.
+
+        Round-32 re-keyed this query off the retired word predicate
+        (``task_state IN ACTIVE_SET``) onto the materialised verdict column
+        (written by ``may_carry_live_fault`` on both write paths); the
+        release channel for that column is the recover flow's own verdict
+        (round-33) — an issued-but-never-recovered row staying listed is
+        the fail-closed design, not a leak.
 
         Filtering is done at the SQL level using the ``namespace`` /
-        ``target_name`` / ``tenant_id`` indexed columns (no Python-side
-        JSON filtering).
+        ``target_name`` / ``tenant_id`` / ``workspace_id`` indexed columns
+        (no Python-side JSON filtering). Empty filter values mean
+        unfiltered — local CLI / bare SDK entries pass empty strings and
+        see everything, exactly as before the workspace axis existed.
         """
-        rows = await self._backend.select_active_tasks(namespace, target_name, tenant_id)
+        rows = await self._backend.select_active_tasks(namespace, target_name, tenant_id, workspace_id)
         results = []
         for d in (self._row_to_dict(r) for r in rows):
             # Need target JSON from task_details for compatibility
@@ -297,7 +661,7 @@ class TaskStore:
         if detail is None:
             return None
         return {k: detail[k] for k in (
-            "total_token_input", "total_token_output",
+            "total_token_input", "total_token_output", "total_token_cached",
             "total_llm_calls", "total_tool_calls", "total_duration_ms",
         ) if k in detail}
 
@@ -321,6 +685,7 @@ class TaskStore:
         summary = await self.get_summary(task_id) or {
             "total_token_input": 0,
             "total_token_output": 0,
+            "total_token_cached": 0,
             "total_llm_calls": 0,
             "total_tool_calls": 0,
             "total_duration_ms": 0,
@@ -328,7 +693,20 @@ class TaskStore:
 
         fault_type = self._compute_fault_type(task)
         from chaos_agent.agent.state import infer_status
-        task_state = task.get("task_state", "injecting")
+        # Read-side missing-field sentinel (round-16 S4): a row without the
+        # task_state column (legacy schema / partial migration) is UNKNOWN,
+        # not in-flight — defaulting to "injecting" dressed a terminal or
+        # unknown record up as running (the round-14 default+closed-set
+        # trap, phase-domain edition). "unknown" is deliberately OUTSIDE
+        # the TaskState closed set: it asserts "no evidence in the row",
+        # never a lifecycle claim.
+        task_state = task.get("task_state") or "unknown"
+        if "task_state" not in task:
+            logger.warning(
+                "task row %s has no task_state column (legacy schema?); "
+                "reporting 'unknown' instead of guessing a lifecycle word",
+                task.get("task_id", "?"),
+            )
         operation = task.get("operation", "")
         stage = task.get("stage", "injection")
 
@@ -400,15 +778,20 @@ class TaskStore:
         details_rows = await self._backend.select_details_batch(task_ids)
         details_map = {r["task_id"]: r for r in details_rows}
 
-        from chaos_agent.agent.state import infer_status
+        from chaos_agent.agent.state import (
+            infer_status,
+            liability_group_for,
+        )
         task_list = []
         for task in tasks:
             detail = self._row_to_dict(details_map.get(task["task_id"], {}))
             summary = {k: detail.get(k, 0) for k in (
-                "total_token_input", "total_token_output",
+                "total_token_input", "total_token_output", "total_token_cached",
                 "total_llm_calls", "total_tool_calls", "total_duration_ms",
             )}
-            _ts = task.get("task_state", "injecting")
+            # Same missing-field sentinel as get_metric (round-16 S4):
+            # no lifecycle column → "unknown", never "injecting".
+            _ts = task.get("task_state") or "unknown"
             _op = task.get("operation", "")
             _stage = task.get("stage", "injection")
 
@@ -432,18 +815,31 @@ class TaskStore:
                 # filters on ``task_state in {"injecting","injected"}``
                 # but was reading ``undefined`` on every row.
                 "task_state": _ts,
-                # Commitment evidence, same source of truth as
-                # ``select_active_tasks`` — verbatim: a task only counts
-                # as "in flight" once a command was actually issued
-                # (``injection_start_time`` write-once at execute). Not
-                # ``task_state == "injected"`` OR-ed in: that would
-                # re-open the very split this flag closes (a corrupted
-                # injected-without-evidence row shown by the boot card
-                # but rejected by recovery). ``task_state`` alone cannot
-                # tell "running" from "died mid-flight" (both project
-                # to injecting), so consumers filtering unfinished work
-                # — e.g. the boot card's pending list — should require
-                # ``committed !== false`` alongside the state check.
+                # Round-32 — the materialised liability verdict, same column
+                # ``select_active_tasks`` keys on. Exposed here so
+                # list-consuming clients (TUI boot card's pending list)
+                # filter on the EVIDENCE-backed verdict instead of
+                # re-guessing from task_state words — the boot card's old
+                # PENDING_STATES word copy is exactly the round-16 S1 /
+                # round-32 drift family this field retires.
+                "liability_live": bool(task.get("liability_live")),
+                # Round-32b P3 — the boot card's three-group split
+                # (in_flight / needs_recovery / uncleared), legislated
+                # server-side off the state.py word tables so the TS
+                # display layer carries no word copy (the PENDING_STATES
+                # drift family stays retired). Only meaningful for
+                # liability-live rows — dead rows ship null.
+                "liability_group": (
+                    liability_group_for(_ts)
+                    if task.get("liability_live")
+                    else None
+                ),
+                # Commitment evidence (injection command was issued).
+                # NOTE (round-32): this is NO LONGER the same source of
+                # truth as ``select_active_tasks`` — the recoverable set
+                # now keys on ``liability_live`` (ledger-first verdict);
+                # ``committed`` remains the issued-evidence signal for
+                # display-layer "in flight" rollups.
                 "committed": bool(detail.get("injection_start_time")),
                 "operation": _op,
                 "stage": _stage,
@@ -548,9 +944,9 @@ class TaskStore:
             # still be able to find it (a cancelled verdict from the
             # previous round must not blind it).
             if task_state in ("injecting", "cancelled") and values.get("needs_confirmation") and not has_active_fault(values):
-                task_state = "waiting_input"
+                task_state = TaskStateOverlay.WAITING_INPUT.value
             elif values.get("interaction_mode") == "tui" and not values.get("confirmed_intent") and not has_active_fault(values):
-                task_state = "waiting_input"
+                task_state = TaskStateOverlay.WAITING_INPUT.value
 
             # Newborn anchor: a row with zero lifecycle evidence has not
             # entered its pipeline yet. Reporting it as "injecting" made
@@ -562,7 +958,7 @@ class TaskStore:
             if task_state == "injecting" and not any(
                 values.get(_field) for _field in _LIFECYCLE_EVIDENCE_FIELDS
             ):
-                task_state = "pending"
+                task_state = TaskStateOverlay.PENDING.value
 
             return {
                 "task_state": task_state,
