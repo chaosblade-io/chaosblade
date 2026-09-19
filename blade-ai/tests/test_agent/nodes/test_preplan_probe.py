@@ -446,6 +446,158 @@ class TestCarrierImageDiscovery:
         assert status == "unknown"
         assert "auto-discovery failed" in summary
 
+    @pytest.mark.asyncio
+    async def test_retry_recovers_from_first_attempt_jitter(self, monkeypatch):
+        """R (run5): ONE gateway timeout is jitter, not a cluster fact —
+        the retry must rescue the probe from a first-attempt failure to a
+        full ``ok`` with the discovery set populated."""
+        class _Bad:
+            exit_code = 1
+            stdout = ""
+
+        import sys
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(settings, "recovery_carrier_discovered_images", "")
+        # No real 0.5s backoff sleep in tests.
+        monkeypatch.setattr(pp, "_DS_FETCH_RETRY_BACKOFF_SECONDS", 0.0)
+
+        exec_mock = AsyncMock(side_effect=[
+            _Bad(),
+            self._raw_result([self._ds(
+                "terway-eniip", "kube-system", 41, 41,
+                ["registry.local/acs/terway:v1"],
+            )]),
+        ])
+        with patch.object(kubectl_mod, "exec_kubectl_raw", new=exec_mock):
+            status, summary, detail = await pp._probe_carrier_images("/fake")
+        assert status == "ok"
+        assert exec_mock.await_count == 2
+        assert settings.recovery_carrier_discovered_images == (
+            "registry.local/acs/terway:v1"
+        )
+        assert detail["images"] == ["registry.local/acs/terway:v1"]
+        assert "terway" in summary
+
+    @pytest.mark.asyncio
+    async def test_unknown_reports_retry_attempt_count(self, monkeypatch):
+        """The unknown message distinguishes "retried and still failing"
+        (attempt count in the note) from a one-shot failure."""
+        class _Bad:
+            exit_code = 1
+            stdout = ""
+
+        import sys
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(pp, "_DS_FETCH_RETRY_BACKOFF_SECONDS", 0.0)
+
+        exec_mock = AsyncMock(return_value=_Bad())
+        with patch.object(kubectl_mod, "exec_kubectl_raw", new=exec_mock):
+            status, summary, _ = await pp._probe_carrier_images("/fake")
+        assert status == "unknown"
+        assert exec_mock.await_count == 2
+        assert "auto-discovery failed" in summary
+        assert "2 attempt(s)" in summary
+
+    @pytest.mark.asyncio
+    async def test_first_attempt_success_skips_retry(self, monkeypatch):
+        """Retry budget is spent only on failure — a healthy first fetch
+        makes exactly ONE kubectl call."""
+        import sys
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(settings, "recovery_carrier_discovered_images", "")
+
+        exec_mock = AsyncMock(return_value=self._raw_result(
+            [self._ds("x", "kube-system", 2, 2, ["reg/x:v1"])],
+        ))
+        with patch.object(kubectl_mod, "exec_kubectl_raw", new=exec_mock):
+            status, _, _ = await pp._probe_carrier_images("/fake")
+        assert status == "ok"
+        assert exec_mock.await_count == 1
+
+
+# Direct reference to the real refresh entry point, taken at import time:
+# the global conftest neutralises the MODULE attribute so unrelated
+# screener tests never reach a real cluster — these tests invoke the
+# function object itself instead of the (patched) module attribute.
+_refresh_real = pp.refresh_carrier_image_discovery
+
+
+class TestCarrierImageLazyRefresh:
+    """L: execute-time second chance for a starved discovery set."""
+
+    @staticmethod
+    def _ds(name, ns, desired, ready, images):
+        return {
+            "metadata": {"name": name, "namespace": ns},
+            "spec": {"template": {"spec": {
+                "containers": [{"image": i} for i in images],
+            }}},
+            "status": {
+                "desiredNumberScheduled": desired,
+                "numberReady": ready,
+            },
+        }
+
+    @staticmethod
+    def _ok_result(items):
+        import json as _json
+
+        class _R:
+            exit_code = 0
+            stdout = _json.dumps({"items": items})
+
+        return _R()
+
+    async def _refresh(self, raw_results, monkeypatch):
+        import sys
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        monkeypatch.setattr(settings, "recovery_carrier_discovered_images", "")
+        monkeypatch.setattr(pp, "_DS_FETCH_RETRY_BACKOFF_SECONDS", 0.0)
+        exec_mock = AsyncMock(side_effect=raw_results)
+        with patch.object(kubectl_mod, "exec_kubectl_raw", new=exec_mock):
+            ok = await _refresh_real("/fake")
+        return ok, exec_mock
+
+    @pytest.mark.asyncio
+    async def test_starved_set_refilled_by_refresh(self, monkeypatch):
+        """run5 shape: the preplan probe starved the set (one gateway
+        jitter), the guard-time refresh refills it from a healthy DS."""
+        ok, _ = await self._refresh([self._ok_result([self._ds(
+            "terway-eniip", "kube-system", 41, 41,
+            ["registry.local/acs/terway:v1"],
+        )])], monkeypatch)
+        assert ok is True
+        assert settings.recovery_carrier_discovered_images == (
+            "registry.local/acs/terway:v1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_refresh_is_once_per_process(self, monkeypatch):
+        """A second call must not re-fetch: a genuinely empty cluster must
+        not pay a probe on every carrier call (the latch is the bound —
+        it trips whether the first refresh succeeded OR found nothing)."""
+        ok, exec_mock = await self._refresh(
+            [self._ok_result([])], monkeypatch,
+        )
+        assert ok is False
+        # Second call: latch short-circuits BEFORE any fetch.
+        ok2 = await _refresh_real("/fake")
+        assert ok2 is False
+        assert exec_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_refresh_no_healthy_ds_returns_false(self, monkeypatch):
+        """Fetch ok but zero healthy candidates → nothing to merge."""
+        ok, _ = await self._refresh([self._ok_result([self._ds(
+            "broken", "kube-system", 10, 7, ["reg/bad:v1"],
+        )])], monkeypatch)
+        assert ok is False
+        assert settings.recovery_carrier_discovered_images == ""
+
 
 # ---------------------------------------------------------------------------
 # FaultDrill CRD installability probe (openspec faultdrill-cr-channel D3

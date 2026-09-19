@@ -189,48 +189,47 @@ async def _probe_metrics_server(kubeconfig: str) -> tuple[str, str, dict]:
     )
 
 
-async def _probe_carrier_images(kubeconfig: str) -> tuple[str, str, dict]:
-    """Auto-discover recovery-carrier image candidates (healthy DS images).
+# R (run5 lesson): the ds fetch is jitter-exposed — the same command
+# measured 2.0s against a healthy gateway timed out an 8s budget under
+# gateway slow-tail. A single attempt treats that jitter as a durable
+# fact and starves the image allowlist's discovery half for the whole
+# process; a second attempt squares the odds for one extra budget slot
+# (8+0.5+8 = 16.5s worst case, still under the 30s node budget — probes
+# run concurrently, so the gather sees the max, not the sum).
+_DS_FETCH_TIMEOUT_SECONDS = 8.0
+_DS_FETCH_ATTEMPTS = 2
+_DS_FETCH_RETRY_BACKOFF_SECONDS = 0.5
 
-    Restricted-network clusters (VPC without docker.io egress) cannot pull
-    the default allowlist (busybox/curl) — the operator's manual env-var
-    workaround was fragile (run8: lost across sessions → opaque
-    REJECT_DRIFT). A HEALTHY DaemonSet (desired == ready > 0) proves its
-    images are cached on every node the carrier can land on: the scheduler
-    never places the carrier on a cordoned node, and a fully-ready DS
-    covers every schedulable one. Those images are therefore usable by the
-    carrier without any network pull — publish them into
-    ``settings.recovery_carrier_discovered_images`` (process-lifetime,
-    re-probed every task) and into the observation message so the planner
-    picks a candidate directly instead of re-discovering in-loop.
 
-    Toolchain verification (sh/curl/sleep inside the image) stays with the
-    planner per recovery-carrier.md section 9 — the probe contributes
-    placement facts, not image-content verdicts.
+async def _fetch_healthy_ds_images(
+    kubeconfig: str,
+) -> tuple[bool, dict[str, str] | None, str]:
+    """ONE discovery attempt: fetch + parse + healthy-DS image filter.
+
+    Returns ``(ok, image→DaemonSet mapping or None, failure_note)``.
+    Pure fetch, no settings mutation — the preplan probe and the
+    guard-time lazy refresh
+    (:func:`refresh_carrier_image_discovery`) compose retry + merge on
+    top of this single-attempt core, so the two writers can never drift
+    apart on what counts as a healthy candidate.
     """
     import json as _json
 
     from chaos_agent.tools.kubectl import exec_kubectl_raw
 
-    result = await exec_kubectl_raw(
-        "get", ["ds", "-A", "-o", "json"], kubeconfig=kubeconfig, timeout=8.0,
-    )
-    if result.exit_code != 0:
-        return (
-            "unknown",
-            "carrier-image auto-discovery failed (kubectl get ds); "
-            "falling back to the configured allowlist only",
-            {},
+    try:
+        result = await exec_kubectl_raw(
+            "get", ["ds", "-A", "-o", "json"], kubeconfig=kubeconfig,
+            timeout=_DS_FETCH_TIMEOUT_SECONDS,
         )
+    except Exception as exc:  # noqa: BLE001 — fetch resilience, degrade below
+        return False, None, f"kubectl get ds raised {exc.__class__.__name__}"
+    if result.exit_code != 0:
+        return False, None, "kubectl get ds failed"
     try:
         items = _json.loads(result.stdout).get("items", [])
     except (TypeError, ValueError):
-        return (
-            "unknown",
-            "carrier-image auto-discovery got unparseable ds output",
-            {},
-        )
-
+        return False, None, "unparseable ds output"
     candidates: dict[str, str] = {}
     for item in items:
         status = (item.get("status") or {})
@@ -248,7 +247,39 @@ async def _probe_carrier_images(kubeconfig: str) -> tuple[str, str, dict]:
             image = str(container.get("image") or "").strip()
             if image:
                 candidates.setdefault(image, ds_name)
+    return True, candidates, ""
 
+
+async def _fetch_healthy_ds_images_with_retry(
+    kubeconfig: str,
+) -> tuple[bool, dict[str, str] | None, str, int]:
+    """Jitter-hardened fetch: N attempts with a short backoff (R above).
+
+    Returns ``(ok, candidates_or_None, failure_note, attempts)`` — the
+    attempt count feeds the probe's unknown message so an operator can
+    tell "one-shot failure" from "retried and still failing".
+    """
+    ok = False
+    candidates: dict[str, str] | None = None
+    note = "not attempted"
+    attempts = 0
+    for attempt in range(_DS_FETCH_ATTEMPTS):
+        attempts += 1
+        ok, candidates, note = await _fetch_healthy_ds_images(kubeconfig)
+        if ok:
+            break
+        if attempt + 1 < _DS_FETCH_ATTEMPTS:
+            await asyncio.sleep(_DS_FETCH_RETRY_BACKOFF_SECONDS)
+    return ok, candidates, note, attempts
+
+
+def _merge_discovered_images(candidates: dict[str, str]) -> list[str]:
+    """Merge healthy-DS images into the discovery set; returns the NEW ones.
+
+    Single merge point for both writers (probe + lazy refresh):
+    configured-set dedup, previously-discovered dedup, sorted stable
+    order — identical semantics wherever the set gets written.
+    """
     from chaos_agent.config.settings import settings as _settings
 
     configured = {
@@ -265,6 +296,79 @@ async def _probe_carrier_images(kubeconfig: str) -> tuple[str, str, dict]:
     if new_images:
         merged = sorted(previously | set(new_images))
         _settings.recovery_carrier_discovered_images = ",".join(merged)
+    return new_images
+
+
+# L: ONE lazy refresh per process (see refresh_carrier_image_discovery).
+_LAZY_REFRESH_DONE = False
+
+
+async def refresh_carrier_image_discovery(kubeconfig: str) -> bool:
+    """L: execute-time second chance for a starved discovery set (run5).
+
+    The preplan probe is the discovery set's primary writer, but its
+    failure mode is structural: ONE gateway jitter leaves the set empty
+    for the whole process lifetime, and both sync allowlist consumers
+    (the carrier-run shape check, the drill-target manifest T4 check)
+    then fail closed against the configured docker.io-only set — on a
+    VPC cluster without docker.io egress that is a dead end no amount
+    of LLM adaptation can escape (run5: every allowlisted image
+    ErrImagePull'd while the node-cached terway image sat outside the
+    set purely because the probe had timed out).
+
+    This re-fetches (retry-hardened, same core as the probe) and merges.
+    Bounded to ONE attempt per process: a genuinely empty cluster must
+    not pay a futile probe on every carrier call, and the preplan probe
+    still re-runs at every task start as the primary path. Returns True
+    when the discovery set gained at least one image.
+    """
+    global _LAZY_REFRESH_DONE
+    if _LAZY_REFRESH_DONE:
+        return False
+    _LAZY_REFRESH_DONE = True
+    ok, candidates, _note, _attempts = (
+        await _fetch_healthy_ds_images_with_retry(kubeconfig)
+    )
+    if not ok or not candidates:
+        return False
+    return bool(_merge_discovered_images(candidates))
+
+
+async def _probe_carrier_images(kubeconfig: str) -> tuple[str, str, dict]:
+    """Auto-discover recovery-carrier image candidates (healthy DS images).
+
+    Restricted-network clusters (VPC without docker.io egress) cannot pull
+    the default allowlist (busybox/curl) — the operator's manual env-var
+    workaround was fragile (run8: lost across sessions → opaque
+    REJECT_DRIFT). A HEALTHY DaemonSet (desired == ready > 0) proves its
+    images are cached on every node the carrier can land on: the scheduler
+    never places the carrier on a cordoned node, and a fully-ready DS
+    covers every schedulable one. Those images are therefore usable by the
+    carrier without any network pull — publish them into
+    ``settings.recovery_carrier_discovered_images`` (process-lifetime,
+    re-probed every task) and into the observation message so the planner
+    picks a candidate directly instead of re-discovering in-loop.
+
+    The fetch is retry-hardened (R, run5): a single gateway timeout is
+    jitter, not a cluster fact — the probe only reports unknown after
+    ``_DS_FETCH_ATTEMPTS`` attempts have failed.
+
+    Toolchain verification (sh/curl/sleep inside the image) stays with the
+    planner per recovery-carrier.md section 9 — the probe contributes
+    placement facts, not image-content verdicts.
+    """
+    ok, candidates, note, attempts = (
+        await _fetch_healthy_ds_images_with_retry(kubeconfig)
+    )
+    if not ok:
+        return (
+            "unknown",
+            f"carrier-image auto-discovery failed ({note}; "
+            f"{attempts} attempt(s)); falling back to the configured "
+            "allowlist only",
+            {},
+        )
+    new_images = _merge_discovered_images(candidates)
 
     if not candidates:
         return (

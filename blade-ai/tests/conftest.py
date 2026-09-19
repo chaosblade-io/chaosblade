@@ -62,6 +62,26 @@ def _isolate_task_store(tmp_path, monkeypatch):
     # gate treats an empty token as "issue reporting off".
     monkeypatch.setattr(_settings_mod.settings, "github_token", "", raising=False)
 
+    # R+L carrier-image resilience (run5): the discovery set and the
+    # once-per-process lazy-refresh latch are process-global mutable state
+    # the preplan probe / guard-time refresh write. Reset both per test, and
+    # neutralise the refresh entry point itself — unrelated screener tests
+    # that screen a ``kubectl run/apply/create`` call would otherwise make a
+    # REAL ``kubectl get ds -A`` against whatever cluster the developer's
+    # config resolves to. Tests exercising the refresh call the real
+    # function through a direct reference (top-of-file import) instead of
+    # the module attribute, so this default never mutes them.
+    import chaos_agent.agent.nodes.gates.preplan_probe as _pp_mod
+
+    monkeypatch.setattr(
+        _settings_mod.settings, "recovery_carrier_discovered_images", "",
+    )
+    monkeypatch.setattr(_pp_mod, "_LAZY_REFRESH_DONE", False)
+    monkeypatch.setattr(
+        _pp_mod, "refresh_carrier_image_discovery",
+        AsyncMock(return_value=False),
+    )
+
     yield
 
     _ts_mod._sync_close_store()

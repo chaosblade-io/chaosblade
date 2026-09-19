@@ -996,6 +996,37 @@ def _register_drill_target_artifact(
     vehicle_cache["execution_artifacts"] = list(merged.values())
 
 
+async def _refresh_carrier_images_if_starved(state: AgentState) -> None:
+    """L: refill a starved carrier-image discovery set, never raising.
+
+    Run5 lesson (openspec faultdrill-cr-channel 3.4 finding ⑥): the
+    discovery half of the carrier image allowlist is process-lifetime
+    state whose ONLY writer was the preplan probe — one gateway jitter
+    there starved both sync consumers (the carrier-run shape check and
+    the drill-target manifest T4 check) for the whole process, and on a
+    VPC cluster without docker.io egress the configured-only allowlist
+    is a dead end no LLM adaptation can escape. This gives the starved
+    state its execute-time second chance BEFORE classification, so the
+    call's own verdict and the dispatch-time ToolGuard re-check both
+    see the repopulated set (``settings`` is process-wide). The
+    once-per-process bound lives in the refresh itself; any failure is
+    non-fatal — the verdict then falls back to exactly the pre-change
+    behaviour (configured-only allowlist).
+    """
+    if str(settings.recovery_carrier_discovered_images or "").strip():
+        return
+    from chaos_agent.agent.nodes.gates.preplan_probe import (
+        refresh_carrier_image_discovery,
+    )
+
+    try:
+        await refresh_carrier_image_discovery(resolve_kubeconfig(state))
+    except Exception:  # noqa: BLE001 — admission enrichment, never fatal
+        logger.debug(
+            "carrier-image lazy refresh failed (non-fatal)", exc_info=True,
+        )
+
+
 async def tool_screener(state: AgentState) -> dict:
     """Inspect pending tool_calls and decide whether to forward them.
 
@@ -1090,6 +1121,25 @@ async def tool_screener(state: AgentState) -> dict:
         # stuck drill can be grouped by GATE in logs instead of by prose that
         # may be reworded.
         carrier_gate = ""
+
+        # Carrier-image admission resilience (run5 lesson, finding ⑥):
+        # the image-allowlist-consuming subcommands get one execute-time
+        # discovery refill when the set is starved — BEFORE classification
+        # (see _refresh_carrier_images_if_starved). ``run`` feeds the
+        # carrier-run shape check and ``apply`` the drill-target manifest
+        # T4 check — the two direct allowlist consumers. ``create`` consumes
+        # nothing image-wise itself (sa/role stack, CR objects) but rides
+        # the same carrier build-out path, so the trigger set is
+        # deliberately a superset: the once-per-process bound keeps the
+        # over-trigger cost one probe per process, while a strict set
+        # could miss a first-contact shape (e.g. a CR apply written as
+        # ``create -f``).
+        if (
+            tool_name == "kubectl"
+            and isinstance(tool_args, dict)
+            and tool_args.get("subcommand") in ("run", "apply", "create")
+        ):
+            await _refresh_carrier_images_if_starved(state)
 
         # Shared capability verdict (fail-CLOSED), see capabilities.context.
         if not tool_call_allowed(tool_name, state, "execute"):

@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
+from chaos_agent.agent.nodes.gates import preplan_probe
 from chaos_agent.agent.nodes.planning.tool_screener import (
     SCREENER_ROUTE_FAIL,
     SCREENER_ROUTE_PASS,
@@ -3146,3 +3147,95 @@ class TestCrChannelRouteGate:
             delta = await tool_screener(state)
         assert delta["screener_route"] == SCREENER_ROUTE_PASS
         assert "messages" not in delta
+
+
+# ---------------------------------------------------------------------------
+# Carrier-image admission refresh (L, run5 finding ⑥)
+# ---------------------------------------------------------------------------
+
+
+class TestCarrierImageAdmissionRefresh:
+    """Starved-set refill trigger: kubectl run/apply/create get ONE
+    execute-time discovery refill BEFORE classification (the call's own
+    verdict and the dispatch-time ToolGuard re-check then see the same
+    repopulated set); non-fatal; skipped when the set is already fed."""
+
+    @staticmethod
+    def _state(*, subcommand: str, v_args: str) -> dict:
+        return {
+            "messages": [_ai_with_tool_call("kubectl", {
+                "subcommand": subcommand, "v_args": v_args,
+            })],
+            "approved_target": _approved_pod_a_in_ns(),
+            "kubeconfig": "/fake/kubeconfig",
+        }
+
+    @pytest.fixture(autouse=True)
+    def _log_only(self):
+        # Log-only keeps the route PASS regardless of classification, so
+        # the assertions below isolate the REFRESH behaviour from verdict
+        # plumbing (the preplan-probe tests own the refresh semantics
+        # themselves).
+        settings.target_guard_enforcing = False
+        yield
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("subcommand", ["run", "apply", "create"])
+    async def test_admission_subcommands_trigger_refresh(
+        self, monkeypatch, subcommand,
+    ):
+        # Starved set is the global-conftest default (reset to "" per test).
+        mock_refresh = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            preplan_probe, "refresh_carrier_image_discovery", mock_refresh,
+        )
+        delta = await tool_screener(self._state(
+            subcommand=subcommand, v_args="carrier-x --image=busybox:1.36 -n ns",
+        ))
+        mock_refresh.assert_awaited_once_with("/fake/kubeconfig")
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+
+    @pytest.mark.asyncio
+    async def test_fed_set_skips_refresh(self, monkeypatch):
+        monkeypatch.setattr(
+            settings, "recovery_carrier_discovered_images", "reg/x:v1",
+        )
+        mock_refresh = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            preplan_probe, "refresh_carrier_image_discovery", mock_refresh,
+        )
+        await tool_screener(self._state(
+            subcommand="run",
+            v_args="carrier-x --image=busybox:1.36 -n ns",
+        ))
+        mock_refresh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("subcommand", ["get", "delete", "describe"])
+    async def test_non_admission_subcommand_skips_refresh(
+        self, monkeypatch, subcommand,
+    ):
+        mock_refresh = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            preplan_probe, "refresh_carrier_image_discovery", mock_refresh,
+        )
+        await tool_screener(self._state(
+            subcommand=subcommand, v_args="pod x -n ns",
+        ))
+        mock_refresh.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_is_non_fatal(self, monkeypatch):
+        # Non-fatal by contract: a crashed refresh must leave the screening
+        # running under the configured-only allowlist — exactly the
+        # pre-change behaviour, never a raised exception.
+        mock_refresh = AsyncMock(side_effect=RuntimeError("gateway gone"))
+        monkeypatch.setattr(
+            preplan_probe, "refresh_carrier_image_discovery", mock_refresh,
+        )
+        delta = await tool_screener(self._state(
+            subcommand="run",
+            v_args="carrier-x --image=busybox:1.36 -n ns",
+        ))
+        mock_refresh.assert_awaited_once()
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
