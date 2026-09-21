@@ -29,7 +29,14 @@ def _wiz_timeout_seconds(timeout: float | None) -> int:
     long-running commands routed through the gateway (fault injection, or a
     self-severing exec that blocks until the channel drops). We mirror the
     caller's per-command ``timeout`` — unless ``kubewiz_wait_timeout`` pins an
-    explicit override.
+    explicit override. The MIRROR branch is the shipped default
+    (``kubewiz_wait_timeout = 0``): a former default of 30 pinned the wait and
+    deterministically mis-killed commands that really ran >30s inside a larger
+    caller budget (timeout_kubectl=60 / timeout_kubectl_exec=180) — wiz
+    answered ``task timed out after 30s`` while the task kept running
+    server-side, and ``classify_error`` reads that text as SHORT_RETRY, so a
+    side-effecting command risked double execution (measured live 2026-09-20;
+    with the override at 0 the same 45s sleep succeeds).
 
     ``isinstance(int)`` guards against a fully-mocked ``settings`` object
     (whose attribute would be a truthy MagicMock) falling into the override

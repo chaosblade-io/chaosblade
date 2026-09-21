@@ -603,7 +603,13 @@ class SkillRegistry:
         script_timeout = timeout
         if script_timeout is None and script_meta and script_meta.timeout:
             script_timeout = script_meta.timeout
-        if script_timeout is None or script_timeout == 0:
+        # R64 (user ruling, option a): the fallback must catch NON-POSITIVE
+        # values, not just 0. A negative manifest/caller value is truthy, so
+        # the old `== 0` check let it flow into run_command, where the `or`
+        # fallback also missed it and wait_for(-N) reported an instant,
+        # nonsensical "timed out after -Ns" timeout. A timeout of 0 or less
+        # means "unset" — fall back to the settings default like None does.
+        if script_timeout is None or script_timeout <= 0:
             script_timeout = settings.timeout_skill_script
 
         # 10. Execute via run_command (skip ToolGuard — we have our own checks)

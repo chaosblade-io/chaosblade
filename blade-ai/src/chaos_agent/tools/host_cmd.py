@@ -36,11 +36,14 @@ import shlex
 from langchain_core.tools import tool
 from pydantic import Field
 
+from chaos_agent.config.settings import settings
+from chaos_agent.errors import ToolTimeoutError
 from chaos_agent.tools._strict_args import StrictToolArgs
 from chaos_agent.tools._tool_profiles import profile_for_tool
 from chaos_agent.tools.guard import CommandResult
 from chaos_agent.transports import PROFILE_HOST, TransportTarget, execute_via_transport
 from chaos_agent.transports.executor import PROFILE_MISMATCH_EXIT_CODE
+from chaos_agent.utils.truncation import apply_output_safety_valve
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +112,57 @@ class _HostInjectArgs(_HostTargetingArgs):
     task_id: str = Field(default="", description="Internal task id; leave unset.")
 
 
+def _effective_host_timeout(requested: int) -> tuple[int, str]:
+    """Clamp the LLM-supplied wait into ``[1, settings.timeout_host_cmd]``.
+
+    The ``timeout`` args on these two tools are the ONLY LLM-writable
+    timeouts in src — every other tool reads ``settings.timeout_*``. R60
+    measured the unbounded path end-to-end (``_r60_timeout_ceiling.py``):
+    the requested value flows verbatim into ``run_command``'s
+    ``asyncio.wait_for`` (no clamp on either layer), and on the SSH face
+    the wrap carries no timeout flag and there is NO server-side budget —
+    a hung command plus an absurd LLM value parked the turn with no
+    lower-layer bail-out (the wall-clock guard ships disabled and is a
+    node-boundary check that cannot interrupt an in-flight tool call).
+    The 2026-09-20 user ruling keeps the per-call parameter (the LLM may
+    express intent) but bounds it: effective wait = ``min(requested,
+    ceiling)`` with the ceiling defaulting to 600s — aligned with the
+    kubewiz ``--timeout`` server task budget, beyond which the kubewiz
+    face gains nothing anyway.
+
+    R61 audited the clamp itself (``_r61_timeout_floor.py``) and closed
+    the FLOOR half: a requested 0 or negative passed through unclamped
+    while the local face's ``wait_for`` treats ``<=0`` as an IMMEDIATE
+    timeout (measured 0.000s) — every call died before the command could
+    start and landed in the R58 reconcile branch, and the kubewiz face
+    mapped the same value to its own 10s fallback (the SAME LLM value
+    carried different semantics per channel). The floor is 1s: no
+    legitimate call wants to wait zero, and the schema has no ``ge``
+    constraint to stop one.
+
+    Returns ``(effective_timeout, clamp_note)``. The note is empty when
+    no clamp happened (zero noise inside the window) and is a plain
+    trailing note (NOT an "Error:" prefix — the call itself succeeds and
+    must not flip the error classification) for the caller to append to
+    execution-result paths only: guard/profile rejections never execute,
+    so they carry no "waited differently than requested" fact to disclose.
+    """
+    ceiling = max(1, int(settings.timeout_host_cmd))
+    effective = min(max(1, requested), ceiling)
+    if effective == requested:
+        return requested, ""
+    if requested < 1:
+        return effective, (
+            f"\n\nNote: the requested wait ({requested}s) was raised to the "
+            f"minimum wait of {effective}s; the call waited {effective}s."
+        )
+    return effective, (
+        f"\n\nNote: the requested wait ({requested}s) was clamped to the "
+        f"configured ceiling of {effective}s "
+        f"(BLADE_AI_TIMEOUT_HOST_CMD); the call waited {effective}s."
+    )
+
+
 async def exec_host_command(
     binary: str,
     args: list[str],
@@ -153,26 +207,31 @@ async def host_inject(command: str, timeout: int = 60, task_id: str = "") -> str
     (``scope=host``) and the skill case prescribes a native command; K8s
     faults → blade_create / kubectl.
 
-    When to use:
-      - Phase 2 host-scope injection prescribed by the skill case.
-
-    Safety: the binary is checked against the host fault whitelist by the
-    tool guard — non-fault binaries (rm, curl, systemctl, …) rejected. The
-    call is drift-guarded against the approved host target. Recovery is
-    LLM-driven: the recover graph later runs the skill-case reverse command
-    through this same tool (no artifact-based auto-reversal).
+    Safety: the binary is checked against the host fault whitelist —
+    non-fault binaries (rm, curl, systemctl, …) rejected; the call is
+    drift-guarded against the approved host target; recovery is
+    LLM-driven (no auto-reversal).
 
     Inputs:
       - command: the full host command, e.g. "tc qdisc add dev eth0 root
-        netem delay 200ms", "stress-ng --cpu 4 --timeout 600s".
-      - timeout: max seconds to wait for the command (default 60).
+        netem delay 200ms".
+      - timeout: max seconds the LOCAL call waits (default 60) — NOT the
+        command's own runtime; a longer-running command returns timed-out
+        with outcome UNKNOWN while it keeps running on the host. Values
+        above the BLADE_AI_TIMEOUT_HOST_CMD ceiling (default 600) are
+        clamped, with a note in the output.
 
-    Output: command stdout on success; "Error:" on failure (guard
-            rejection, non-zero exit, or transport error).
+    Output: stdout on success; "Error:" on failure (guard rejection,
+            non-zero exit, or transport error).
 
-    Side effects: injects a real fault on the host until reversed /
-                  recovered.
+    Side effects: injects a real fault until reversed / recovered.
     """
+    # R60: bound the only LLM-writable wait in src. Rebinding ``timeout``
+    # here routes EVERY execution path below (success, failed, R58/R59
+    # timeout shapes, transport errors) through the effective budget with
+    # no per-path changes; the note rides only the paths that actually
+    # executed (see the helper's docstring).
+    timeout, clamp_note = _effective_host_timeout(timeout)
     target = TransportTarget.from_state({})
     try:
         argv = shlex.split(command)
@@ -206,6 +265,29 @@ async def host_inject(command: str, timeout: int = 60, task_id: str = "") -> str
             # audit trail all the same.
             audit=True,
         )
+    except ToolTimeoutError as e:
+        # R58: a caller-budget expiry is outcome-UNKNOWN. Only the local wait
+        # was killed — the fault command may STILL be running on the host
+        # (R57 measured this exact mechanism on the shared transport: ghost
+        # marker t+72s), and on the host face the edge is the NORM, not the
+        # exception: this tool's own docstring example (``stress-ng --timeout
+        # 600s``) outlives the default 60s budget. Keep the "Error:" prefix
+        # (load-bearing for carrier attribution), keep the raw "timed out"
+        # text (classify stays SHORT_RETRY; the census/budget layer still
+        # caps retries), keep no "failed" verdict, and append reconcile-first
+        # advice — advice, never a gate (same license as the completed-pod
+        # note in kubectl.py).
+        return apply_output_safety_valve(
+            f"Error: host_inject: {e}\n"
+            "Outcome UNKNOWN: only the local wait was killed — the fault "
+            "command may STILL be running on the host. A blind retry can "
+            "double-execute the fault. Reconcile first: use host_read to "
+            "check the host's actual state (e.g. `ps -ef` for a "
+            "still-running fault process, `iptables -L -n` for installed "
+            "rules), then retry only what is genuinely missing."
+            + clamp_note,
+            kind="error",
+        )
     except Exception as e:  # includes ToolGuardError from the guard check
         return f"Error: host_inject blocked or failed: {e}"
 
@@ -216,9 +298,42 @@ async def host_inject(command: str, timeout: int = 60, task_id: str = "") -> str
         stdout = (result.stdout or "").strip()
         # Merge when both carry content — `or` drops one side's evidence.
         _detail = "\n".join(p for p in (stdout, stderr) if p) or "(no output)"
-        return f"Error: host_inject failed (exit {result.exit_code}): {_detail}"
+        # R59: receipt-form timeout — the sibling of the R58 exception
+        # branch above. The caller timeout feeds BOTH the local run_command
+        # kill AND the wiz CLI's --wait-timeout mirror (executor.py passes
+        # one timeout to both); when the CLI's wait expires first (explicit
+        # kubewiz_wait_timeout override below the caller budget), the CLI
+        # exits non-zero with the platform's fixed receipt — "Error: task
+        # timed out after Ns" — and parse_wiz_output passes it through: no
+        # ToolTimeoutError is raised, so the R58 exception branch never
+        # sees this shape. The fault command may STILL be running
+        # server-side; the "failed" verdict plus the bare SHORT_RETRY shape
+        # invites a blind retry (double-execute). The receipt is a
+        # closed-set platform format (measured verbatim in R56 on the
+        # isomorphic k8s channel), so matching it is legitimate
+        # paired-prescription feedback (B38/B40): on a wording change this
+        # silently degrades to the raw error below — advice, never a gate.
+        # Known over-conservative sub-shape: when the caller budget exceeds
+        # the 600s server task budget the command really is dead and a
+        # retry is safe — the two forms are text-indistinguishable, so both
+        # get the reconcile-first advice (harmlessly conservative:
+        # reconcile finds nothing missing).
+        if "task timed out" in _detail:
+            return apply_output_safety_valve(
+                f"Error: host_inject (exit {result.exit_code}): {_detail}\n"
+                "Outcome UNKNOWN: the CLI's own wait expired — the fault "
+                "command may STILL be running on the host. A blind retry "
+                "can double-execute the fault. Reconcile first: use "
+                "host_read to check the host's actual state (e.g. `ps -ef` "
+                "for a still-running fault process, `iptables -L -n` for "
+                "installed rules), then retry only what is genuinely "
+                "missing."
+                + clamp_note,
+                kind="error",
+            )
+        return f"Error: host_inject failed (exit {result.exit_code}): {_detail}" + clamp_note
 
-    return result.stdout or "(command completed, no output)"
+    return (result.stdout or "(command completed, no output)") + clamp_note
 
 
 @tool(args_schema=_HostReadArgs)
@@ -247,7 +362,9 @@ async def host_read(command: str, timeout: int = 30, task_id: str = "") -> str:
     Inputs:
       - command: the full diagnostic command, e.g. "df -h /var/lib",
         "iostat -xd 1 2", "iptables -L -n".
-      - timeout: max seconds to wait (default 30).
+      - timeout: max seconds to wait (default 30). Values above the
+        configured ceiling (BLADE_AI_TIMEOUT_HOST_CMD, default 600) are
+        clamped to it and the output says so.
 
     Output: command stdout (or stderr) on success; "Error:" on
             rejection/failure.
@@ -255,6 +372,10 @@ async def host_read(command: str, timeout: int = 30, task_id: str = "") -> str:
     Side effects: none (read-only).
     """
     from chaos_agent.tools.readonly import host_command_rejection_reason
+
+    # R60: same bound as host_inject — rebind before ANY execution path;
+    # the note rides only the paths that actually executed.
+    timeout, clamp_note = _effective_host_timeout(timeout)
 
     reason = host_command_rejection_reason(command)
     if reason is not None:
@@ -300,7 +421,9 @@ async def host_read(command: str, timeout: int = 30, task_id: str = "") -> str:
             audit=True,
         )
     except Exception as e:
-        return f"Error: host_read failed: {e}"
+        # May be a ToolTimeoutError (the wait DID happen) — the clamp fact
+        # belongs here just as on the success path.
+        return f"Error: host_read failed: {e}" + clamp_note
 
     stdout = (result.stdout or "").strip()
     stderr = (result.stderr or "").strip()
@@ -309,4 +432,4 @@ async def host_read(command: str, timeout: int = 30, task_id: str = "") -> str:
     # and never mistakes the explanation for diagnostic data.
     if result.exit_code == PROFILE_MISMATCH_EXIT_CODE:
         return f"Error: host_read {stderr}"
-    return stdout or stderr or "(no output)"
+    return (stdout or stderr or "(no output)") + clamp_note

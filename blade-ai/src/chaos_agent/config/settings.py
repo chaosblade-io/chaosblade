@@ -215,6 +215,51 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator(
+        "command_timeout",
+        "timeout_blade",
+        "timeout_kubectl",
+        "timeout_kubectl_exec",
+        "timeout_host_cmd",
+        "kubewiz_task_timeout",
+    )
+    @classmethod
+    def _validate_positive_wait_budgets(cls, v: int) -> int:
+        """Command-wait budgets must be >= 1 second — fail fast at config
+        load (R62, user ruling: raise, do NOT clamp).
+
+        A 0/negative value flows verbatim into the direct-pass call sites'
+        ``asyncio.wait_for`` (~21 of them across kubectl.py / _debug_pod /
+        side_effect / tool_screener, plus ``timeout_blade``), and
+        ``wait_for`` treats ``<=0`` as an IMMEDIATE timeout — the whole
+        kubectl/blade face would park on instant failures with no hint
+        why (R62 probe C measured pydantic accepting -5/0 verbatim).
+
+        The LLM-supplied host waits got a clamp+disclose helper instead
+        (R60/R61) because LLM input is untrusted runtime input that must
+        keep flowing; config is the operator's own voice, and this
+        project's convention (hint_escalate_after) is to raise rather
+        than clamp — silently clamping would hide an operator's mistake
+        behind behaviour they did not ask for.
+
+        Fields with a LEGITIMATE 0 semantic are exempt:
+        ``kubewiz_wait_timeout`` (0 = mirror the caller budget, R56) and
+        ``max_inject_seconds`` (0 = wall-clock guard off, shipped default).
+        The LLM/report-face budgets (llm_*_timeout / timeout_baseline_llm /
+        timeout_default / postmortem / issue_report) are NOT covered here —
+        their consumption semantics have not been audited field by field;
+        extending the ledger is a future round, not an assumption.
+        """
+        if v < 1:
+            raise ValueError(
+                f"Invalid wait budget: {v}; must be >= 1 second.\n"
+                f"0/negative would flow verbatim into asyncio.wait_for on the "
+                f"direct-pass call sites and park the whole command face on "
+                f"INSTANT timeouts with no diagnostic.\n"
+                f"Fix: set the value to a positive number of seconds."
+            )
+        return v
+
     @field_validator("llm_thinking_format")
     @classmethod
     def _validate_llm_thinking_format(cls, v: str) -> str:
@@ -489,7 +534,7 @@ class Settings(BaseSettings):
     kubewiz_token: str = ""                    # BLADE_AI_KUBEWIZ_TOKEN (认证 token，blade 用)
     kubewiz_profile: str = ""                  # BLADE_AI_KUBEWIZ_PROFILE (wiz task exec 的 --profile)
     wiz_path: str = "wiz"                      # BLADE_AI_WIZ_PATH (wiz 二进制路径)
-    kubewiz_wait_timeout: int = 30             # BLADE_AI_KUBEWIZ_WAIT_TIMEOUT (wiz task exec --wait-timeout 秒；0=跟随每条命令的 timeout，>0=固定覆盖。wiz 内置默认 10s 会让长命令过早超时)
+    kubewiz_wait_timeout: int = 0              # BLADE_AI_KUBEWIZ_WAIT_TIMEOUT (wiz task exec --wait-timeout 秒；0=跟随每条命令的 timeout（默认），>0=固定覆盖。wiz 内置默认 10s 会让长命令过早超时；曾默认 30 ——实测会确定性误杀 caller 预算 60/180s 内真跑 >30s 的命令（"task timed out after 30s" 被 classify_error 判为 SHORT_RETRY → 副作用命令重试双执行风险），2026-09-20 改回文档语义 0)
     kubewiz_task_timeout: int = 600            # BLADE_AI_KUBEWIZ_TASK_TIMEOUT (wiz task exec --timeout 秒，任务服务端执行预算；独立于 --wait-timeout)
 
     # 主机故障注入连接配置（host scope — kubewiz-host / SSH 通道）
@@ -512,8 +557,28 @@ class Settings(BaseSettings):
 
     # 分工具超时配置(秒)
     timeout_blade: int = 60                  # BLADE_AI_TIMEOUT_BLADE
-    timeout_kubectl: int = 60                # BLADE_AI_TIMEOUT_KUBECTL
-    timeout_kubectl_exec: int = 180          # BLADE_AI_TIMEOUT_KUBECTL_EXEC
+    # 2026-09-20 user ruling: 60→300 / 180→600 — wait-class commands
+    # (kubectl wait / --watch) no longer hug the expiry edge; reads and
+    # submits finish in seconds and are unaffected by a larger budget.
+    # Raised AFTER the timeout-presentation fixes (R57/R58/R59): a budget
+    # expiry now renders as outcome-UNKNOWN + reconcile-first in BOTH
+    # shapes (ToolTimeoutError exception and the CLI "task timed out"
+    # receipt), so a larger budget is pure headroom, not a deeper trap.
+    # Boundary note: exec=600 equals kubewiz_task_timeout=600 (the
+    # server-side task budget) — at that edge the receipt and exception
+    # shapes race, but both render the reconcile-first advice.
+    timeout_kubectl: int = 300               # BLADE_AI_TIMEOUT_KUBECTL
+    timeout_kubectl_exec: int = 600          # BLADE_AI_TIMEOUT_KUBECTL_EXEC
+    # 2026-09-20 user ruling (R60): ceiling for the LLM-supplied wait on
+    # host_inject / host_read — the ONLY two LLM-writable timeouts in
+    # src. The requested value is clamped with min(requested, this) and
+    # a clamp emits a warning line in the tool output. 600s aligns with
+    # the kubewiz_task_timeout server-side budget: beyond it the
+    # kubewiz-host face gains nothing, and on the SSH face (whose wrap
+    # carries no timeout and has NO server-side budget — R56/R60) this
+    # ceiling is the ONLY bound on a hung command, so without it an
+    # absurd LLM value parks the turn with no lower-layer bail-out.
+    timeout_host_cmd: int = 600              # BLADE_AI_TIMEOUT_HOST_CMD
     # LLM timeout split into connect vs read (httpx.Timeout semantics).
     # ``llm_connect_timeout`` bounds TCP/TLS connection establishment —
     # short (10s) so a misconfigured base URL / DNS / firewall surfaces a
@@ -669,8 +734,6 @@ class Settings(BaseSettings):
     target_health_check_block_on_blocker: bool = False    # BLADE_AI_TARGET_HEALTH_CHECK_BLOCK_ON_BLOCKER
 
     blade_agent_check_enabled: bool = True               # BLADE_AI_BLADE_AGENT_CHECK_ENABLED
-    blade_agent_namespace: str = "chaosblade"            # BLADE_AI_BLADE_AGENT_NAMESPACE
-    blade_agent_label: str = "app=chaosblade-tool"       # BLADE_AI_BLADE_AGENT_LABEL
 
     feasibility_check_enabled: bool = True               # BLADE_AI_FEASIBILITY_CHECK_ENABLED
     feasibility_check_block_on_impossible: bool = False   # BLADE_AI_FEASIBILITY_CHECK_BLOCK_ON_IMPOSSIBLE
@@ -800,26 +863,19 @@ class Settings(BaseSettings):
     # 显式配置则完全覆盖候选链（单一候选，人工兜底入口）。
     debug_pod_image: str = ""  # BLADE_AI_DEBUG_POD_IMAGE
 
-    # FaultDrill CR 通道（faultdrill-cr-channel）— 全工坊 case（恢复 = apiserver
-    # 写）的声明式注入通道：apply 一条 CR = 注入，调和 restorePatches = 恢复，
-    # status.injectedAt = TTL 时钟（集群状态非进程内存，Agent 死亡后恢复迟到
-    # 不丢失）。默认 True（2026-09-19 钦定翻默认，暗启动收口：M1/M2 落地期间
-    # 曾默认 False 全量走旧路径，M3 实弹前置双修复交付 + d83890d7 复演全绿后
-    # 翻正）；关闭时 register_builtins 跳过 provider
-    # 注册（通道结构性不存在，非运行时分支）。
+    # FaultDrill 载体域（openspec faultdrill-cluster-native-recovery）— CR
+    # 通道已于 M2 整体移除；provider 现承载程序化恢复载体装配器
+    # （EXECUTE 工具）、迁移窗口 CR 归因面与台账 recover。本开关 =
+    # provider 注册开关（关闭时 register_builtins 跳过注册，域结构性
+    # 不存在，非运行时分支）；默认 True（2026-09-19 暗启动收口翻正，
+    # M2 后语义随域重定位）。
     faultdrill_enabled: bool = True  # BLADE_AI_FAULTDRILL_ENABLED
-    # CRD 组名。平淡组名降低 api-resources 扫读穿帮率；变更即铸造新 CRD
+    # CRD 组名。CR 通道已移除，唯二消费者是迁移窗口工件面：artifact
+    # ledger 的 sweep/collect 用它构造 `faultdrills.<group>` 资源名（扫
+    # 除历史 session 落地的 CR 残留），随迁移窗口关闭（task 2.5 后）一
+    # 并退役。平淡组名降低 api-resources 扫读穿帮率；变更即铸造新 CRD
     # （与存量不互通），切换前需确认旧 CRD 已清理。
     faultdrill_crd_group: str = "drill.blade-ai.io"  # BLADE_AI_FAULTDRILL_CRD_GROUP
-    # CR 落位 namespace（空 = 默认 victim ns；stealth 场景可配 ops ns，
-    # 被测 RCA agent RBAC 收窄后结构性不可见）。
-    faultdrill_cr_namespace: str = ""  # BLADE_AI_FAULTDRILL_CR_NAMESPACE
-    # CR 实例名前缀。命名纪律不变量 = 任务标识派生 + 零演练签名词根 +
-    # 同任务可复现；前缀可配置，钉扎测试校验不变量而非固定拼写。
-    faultdrill_name_prefix: str = "fd-"  # BLADE_AI_FAULTDRILL_NAME_PREFIX
-    # CRD Established 等待窗口（秒）。超时判定通道不可用 → 降级 recovery-carrier
-    # SOP 路径（降级是路由分支，不是失败路径）。
-    faultdrill_crd_established_timeout_seconds: int = 60  # BLADE_AI_FAULTDRILL_CRD_ESTABLISHED_TIMEOUT_SECONDS
 
     # 日志级别 (DEBUG=显示LLM迭代详情, INFO=正常输出, WARNING=静默模式)
     log_level: str = "DEBUG"                  # BLADE_AI_LOG_LEVEL

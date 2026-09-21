@@ -73,8 +73,13 @@ class TestSettingsDefaults:
 
         s = Settings(llm_api_key="test")
         assert s.timeout_blade == 60
-        assert s.timeout_kubectl == 60
-        assert s.timeout_kubectl_exec == 180
+        # 2026-09-20 user ruling: 300/600 (wait-class headroom; see the
+        # settings comment for the R57-R59 presentation-fix precondition).
+        assert s.timeout_kubectl == 300
+        assert s.timeout_kubectl_exec == 600
+        # 2026-09-20 user ruling (R60): ceiling for the only LLM-writable
+        # waits (host_inject/host_read) — min(requested, this) + warning.
+        assert s.timeout_host_cmd == 600
         # LLM timeout split into connect (fast-fail on bad URL/DNS) vs
         # read (generous so thinking models aren't cut off mid-inference).
         assert s.llm_connect_timeout == 10
@@ -614,3 +619,55 @@ class TestSettingsSshStrictHostKeyChecking:
 
         with pytest.raises(ValidationError):
             Settings(llm_api_key="test", ssh_strict_host_key_checking="true")
+
+
+class TestWaitBudgetValidators:
+    """R62: command-wait budgets must be >= 1s — fail fast at config load
+    (user ruling: raise, do NOT clamp). A 0/negative would flow verbatim
+    into ~21 direct-pass asyncio.wait_for sites (immediate timeout, the
+    whole command face parked with no diagnostic)."""
+
+    def test_zero_and_negative_raise(self):
+        import pytest
+        from pydantic import ValidationError
+        from chaos_agent.config.settings import Settings
+
+        for field, bad in (
+            ("command_timeout", 0),
+            ("timeout_blade", -5),
+            ("timeout_kubectl", 0),
+            ("timeout_kubectl_exec", -5),
+            ("timeout_host_cmd", 0),
+            ("kubewiz_task_timeout", -1),
+        ):
+            with pytest.raises(ValidationError, match="wait budget"):
+                Settings(llm_api_key="test", **{field: bad})
+
+    def test_zero_semantic_fields_stay_exempt(self):
+        """Two fields have a LEGITIMATE 0: kubewiz_wait_timeout (0 =
+        mirror the caller budget, R56) and max_inject_seconds (0 =
+        wall-clock guard off, shipped default). The validator must not
+        touch them."""
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(llm_api_key="test", kubewiz_wait_timeout=0)
+        assert s.kubewiz_wait_timeout == 0
+        s = Settings(llm_api_key="test", max_inject_seconds=0)
+        assert s.max_inject_seconds == 0
+
+    def test_positive_values_pass_through(self):
+        from chaos_agent.config.settings import Settings
+
+        s = Settings(
+            llm_api_key="test",
+            command_timeout=5,
+            timeout_blade=5,
+            timeout_kubectl=5,
+            timeout_kubectl_exec=5,
+            timeout_host_cmd=5,
+            kubewiz_task_timeout=5,
+        )
+        for f in ("command_timeout", "timeout_blade", "timeout_kubectl",
+                  "timeout_kubectl_exec", "timeout_host_cmd",
+                  "kubewiz_task_timeout"):
+            assert getattr(s, f) == 5

@@ -204,6 +204,18 @@ class TestKubewizK8sChannel:
         assert wrapped[wrapped.index("--timeout") + 1] == "900"
         assert wrapped[wrapped.index("--wait-timeout") + 1] == "120"
 
+    def test_wait_timeout_shipped_default_is_mirror(self):
+        # The SHIPPED default must keep the mirror branch live. A former
+        # default of 30 deterministically mis-killed commands that really ran
+        # >30s inside a larger caller budget (timeout_kubectl=60 /
+        # timeout_kubectl_exec=180): wiz answered "task timed out after 30s"
+        # while the task kept running server-side, and classify_error reads
+        # that text as SHORT_RETRY — a side-effecting retry risked double
+        # execution (measured live 2026-09-20). model_fields pins the FIELD
+        # default so a local config.json or env var cannot mask a regression.
+        from chaos_agent.config.settings import Settings
+        assert Settings.model_fields["kubewiz_wait_timeout"].default == 0
+
     def test_adapt_result_parses_wiz(self):
         r = CommandResult(exit_code=0, stdout="exit_code: 0\nok", stderr="")
         out = self.ch.adapt_result(r, TransportTarget())
@@ -321,6 +333,21 @@ class TestKubewizHostChannel:
         out = self.ch.adapt_result(r, TransportTarget())
         assert out.exit_code == 0
         assert out.stdout == "chain OUTPUT"
+
+    @patch("chaos_agent.transports.channels.settings")
+    def test_floor_value_mirrors_verbatim(self, mock_settings):
+        """R62: the R61 floor (1s) is the value this face MIRRORS. Before
+        R61 an LLM-supplied 0 reached the fallback branch (10s); now the
+        floored 1 arrives here and is mirrored verbatim — pin the mirror
+        semantics of the floor so this consumer chain stays observable."""
+        mock_settings.wiz_path = "wiz"
+        mock_settings.kubewiz_wait_timeout = 0  # mirror mode
+        mock_settings.kubewiz_task_timeout = 600
+        target = TransportTarget(host_name="10.0.0.1", kubewiz_profile="prof")
+        wrapped = self.ch.wrap_command(["uptime"], target, timeout=1)
+        assert wrapped[wrapped.index("--wait-timeout") + 1] == "1"
+        # The server-side task budget is independent and stays 600.
+        assert wrapped[wrapped.index("--timeout") + 1] == "600"
 
     def test_preflight_missing_host_name(self):
         target = TransportTarget(kubewiz_profile="p")

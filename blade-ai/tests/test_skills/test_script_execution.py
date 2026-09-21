@@ -392,11 +392,85 @@ class TestExecuteScriptExecution:
         assert mock_run.call_args[1]["timeout"] == 120
 
     @pytest.mark.asyncio
+    async def test_negative_caller_timeout_falls_back_to_default(
+        self, registry_with_scripts, mocker
+    ):
+        """R64 (option a): a negative explicit timeout is "unset", not a
+        budget. The old `== 0` fallback let a truthy negative flow into
+        run_command, where wait_for(-N) failed instantly with a nonsensical
+        "timed out after -Ns" diagnostic."""
+        mock_result = CommandResult(
+            exit_code=0, stdout="ok", stderr="", duration_ms=50.0
+        )
+        mock_run = mocker.patch(
+            "chaos_agent.skills.registry.run_command",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        )
+
+        await registry_with_scripts.execute_script(
+            "test-skill", "list_items.py", timeout=-5
+        )
+
+        from chaos_agent.config.settings import settings
+
+        assert mock_run.call_args[1]["timeout"] == settings.timeout_skill_script
+
+    @pytest.mark.asyncio
+    async def test_negative_manifest_timeout_falls_back_to_default(
+        self, tmp_path, mocker
+    ):
+        """R64 (option a): a negative timeout in the skill MANIFEST goes
+        through the truthiness adoption and the `== 0` fallback missed it —
+        the only open path to the run_command negative hole. It must fall
+        back to the settings default exactly like an unset timeout."""
+        from chaos_agent.skills.registry import SkillRegistry
+
+        skill_dir = tmp_path / "skills" / "neg-timeout-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: neg-timeout-skill\n"
+            "description: Skill whose manifest carries a negative timeout\n"
+            "scripts:\n"
+            "  - name: work.py\n"
+            "    description: Does work\n"
+            "    timeout: -5\n"
+            "---\n"
+            "\n"
+            "# Neg Timeout Skill\n",
+            encoding="utf-8",
+        )
+        scripts_dir = skill_dir / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "work.py").write_text(
+            '#!/usr/bin/env python3\nprint("done")\n', encoding="utf-8"
+        )
+
+        registry = SkillRegistry()
+        registry.load_from_directory(tmp_path / "skills")
+
+        mock_result = CommandResult(
+            exit_code=0, stdout="done", stderr="", duration_ms=50.0
+        )
+        mock_run = mocker.patch(
+            "chaos_agent.skills.registry.run_command",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        )
+
+        await registry.execute_script("neg-timeout-skill", "work.py")
+
+        from chaos_agent.config.settings import settings
+
+        assert mock_run.call_args[1]["timeout"] == settings.timeout_skill_script
+
+    @pytest.mark.asyncio
     async def test_timeout_error_converted(self, registry_with_scripts, mocker):
         """ToolTimeoutError should be converted to ScriptTimeoutError."""
         from chaos_agent.errors import ToolTimeoutError
 
-        mock_run = mocker.patch(
+        mocker.patch(
             "chaos_agent.skills.registry.run_command",
             new_callable=AsyncMock,
             side_effect=ToolTimeoutError("timed out"),
