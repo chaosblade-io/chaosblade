@@ -1,57 +1,45 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 摘除自定义污点并解除 cordon），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2/ND9）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 摘除自定义污点并解除 cordon），
+# 但靶为 Node（cluster-scoped）——装配器 M1 四对象栈仅支持 namespaced 靶
+# （Role/RoleBinding 无法授权 cluster-scoped 资源，工具对 Node 靶 fail-closed
+# 拒绝），本 case 无装配器主路径：恢复走正文 SOP 路径（宿主机 systemd timer
+# 武装 uncordon 自治 + Agent 演练结束时主动兜底污点摘除），属 recovery-carrier
+# spec「降级路径」的结构性形态，恢复闭环不缺失。
 recovery_channel: apiserver-write
-# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
-# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
-# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
-# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
-mechanism_writes:
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: default
-    name_prefix: "fd-"
+# 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
+# 自身（cordon/污点写靶 Node 的 spec 属靶域内，名字匹配放行），无跨对象写条
+# 目；宿主机 timer 通道（systemd-run）不建 k8s 对象，无立法条目。
 ---
 
 **用例名称** 节点不可调度 导致 DaemonSet_未完全调度
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 摘除自定义污点并解除 cordon；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**恢复动作配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 摘除自定义污点并解除 cordon。**靶为 Node（cluster-scoped），装配器 M1 不支持**（四对象栈 Role/RoleBinding 无法授权 cluster-scoped 资源，工具对 Node 靶 fail-closed 拒绝）——本配方不经装配器，作为 Agent 主动兜底与恢复验证的权威动作清单；自治通道走正文宿主机 systemd timer（载荷仅 uncordon——kubelet.conf 凭证受 NodeRestriction 不能修改 taints，污点摘除由 Agent 演练结束时主动兜底）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: Node
-    name: <node-name>
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  - op: add
-    path: /spec/taints/-
-    value: {key: node.ops/maintenance, value: "true", effect: NoSchedule}
-  - op: replace
-    path: /spec/unschedulable
-    value: true
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  # 基线空 → remove 整键；基线非空 → replace <基线完整数组>（严禁整组清空——误删集群固有污点）
-  - op: remove
-    path: /spec/taints
-  - op: replace
-    path: /spec/unschedulable
-    value: false
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+targetRef:                                # 靶（cluster-scoped，无 namespace）
+  kind: Node
+  name: <node-name>
+patches:                                  # 注入域（json-patch 语义；实际经 kubectl cordon/taint 命令执行）
+- op: add
+  path: /spec/taints/-
+  value: {key: node.ops/maintenance, value: "true", effect: NoSchedule}
+- op: replace
+  path: /spec/unschedulable
+  value: true
+restorePatches:                           # 恢复域：Agent 主动兜底动作清单（无载体 TTL 自治）
+# 基线空 → remove 注入污点；基线非空 → replace <基线完整数组>（严禁整组清空——误删集群固有污点）
+- op: remove
+  path: /spec/taints
+- op: replace
+  path: /spec/unschedulable
+  value: false
+durationSeconds: <duration>               # 演练窗口（宿主机 timer 的 --on-active 参数）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
-- cluster-scoped 目标（Node）：targetRef 不写 namespace；CR 本体落任务主 ns（metadata.namespace 仍必须显式写入）。
+- cluster-scoped 目标（Node）：targetRef 无 namespace 字段；恢复不经装配器（见配方标题）。
 - 删除该节点上的 DS Pod（呈现「节点缺 Pod」的必要触发步）保留为 execute 计划普通步骤。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- 恢复由宿主机 timer（uncordon 自治）+ Agent 主动兜底（污点摘除）承载——cluster-scoped 靶无载体 TTL 通道，属 recovery-carrier spec「降级路径」的结构性形态；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. DaemonSet 的 desiredNumberScheduled 相对基线降 1——DS 控制器把未容忍污点节点从

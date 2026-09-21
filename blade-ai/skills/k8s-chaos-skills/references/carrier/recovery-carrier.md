@@ -153,7 +153,8 @@ kubectl exec drill-rc-<hash> -n <namespace> -- sh -c \
 
 **回执自证三态判定（2026-09-18 三探针实测定案：正确/错拼/破语法三形态回执均已实测锚定）**：拿到回执先核对 `spec.resourceAttributes` 回显的 namespace/verb/group/resource 四字段与请求意图逐项一致，再做权限判定——静默忽略式 API 丢字段不报错，但被丢字段同样不会出现在回显里（实测：apiGroup 错拼 → 回显只剩三字段、managedFields 无 f:group，问题已漂移成「无 group 的授权检查」，此时 allowed 值无意义）：
 
-- 回显字段缺失/漂移 → **请求形态错误，不进权限判定**：对照上方模板查拼写，修正重发
+- **omitempty 契约（2026-09-21 #55 实弹补锚，先于漂移判定）**：`ResourceAttributes` 全字段是 Go `omitempty` 字符串——**请求里显式空串的字段，apiserver 回显时省略该键（而非回显 `""`）**。core group 靶（Service/ConfigMap/Pod 等）的 `"group": ""` 请求，回显**无 group 键是序列化契约、不是漂移**；对照时「键缺失」与「显式空串」按等价处理。反方向仍然 fail-closed：请求了**非空**值（如 `group: "apps"`）而回显缺失/异值，就是真漂移（实测翻车：装配器首版字节级对照把全部 core group 靶误判 form_error）
+- 回显字段漂移（非空值对不上）→ **请求形态错误，不进权限判定**：对照上方模板查拼写，修正重发
 - 回显完整 + `"allowed": true` → 该动词已授权，验下一个
 - 回显完整 + `"allowed": false` → **中止武装**（缺动词：按第二节形态无关总则补 Role 后重验）
 - 通道层错误（超时/解析失败/HTTP 400 json parse error）→ 见「降级路径」
@@ -295,7 +296,7 @@ Phase 1（planner）在计划里只写恢复脚本**明文** + 档位指令，**
 
 各档目检门不变（第四节「先校验后武装」）：回显全文中键路径/字段域/Content-Type/`$` 变量字面量逐项核对才武装；档位边界处（如 550B）取更保守档不违法。
 
-**exec 载荷引号保真律（#45 实证立法；2026-09-16 二轮归因修正：根因在本地分词器，非 wiz 通道；同日方案 A 修复落地）**：引号损毁的第一现场在**本地 kubectl 分词器 `_split_args`**（tools/kubectl.py：plain quoted region 逐字符扫描遇同类引号即闭合，**不识别双引号区内的反斜杠转义**）——外层双引号+转义形态（`\"`/`\$`）的 exec payload 被静默碎片化成多 token（`\"` 剥引号留反斜杠、token 在 `\Authorization:` 处截断、`Bearer` 沦为容器 shell `$0`），碎片经 wiz 通道（shlex.quote 逐词重组）**忠实**传输、容器 shell 再把残骸解析出错（残留 `\`+换行成行续接吞行——#45 corrupt file 209B≠正确 206B 三特征经四形态矩阵探针（.codex_work/probe_splitargs_45.py）逐字复现）；「外层单引号保真」的真因 = 分词器 verbatim-until-`'` 恰是 shell 单引号精确语义（无转义概念、无假闭合点），**wiz 通道对两种形态均无损**（同文件同型归因失误判例 d9117d36：从远端回显反推平台行为的坑两次——归因纪律：从 guard 派发最早的本地证据起比对）。**2026-09-16 方案 A 修复（用户裁决保留，实测四层验证）**：`_split_args` 双引号区已按 POSIX 解转义（`\"` `\\` `\$` `\`` → 字面字符、`\<newline>` 行续接、其他 `\x` 字面保留）——转义形态经真实集群 live-path 四形态实测 INTACT（修复前同 payload 11 token 碎片化 + 容器静默零输出；修复后 7 token 与单引号形态逐字节等价）；真实 /bin/sh oracle 9/9 一致；8351 项回归零破坏。**当前防御纪律**（修复后从硬律降为形态建议）：①落盘命令外层**首推单引号**（更简、无转义心智负担；转义形态已可用但两形态 token 等价，无收益）；②**单引号外层形态 payload 零单引号字符——此洞方案 A 不修**：外层 `'` 在 payload 首个 `'` 处假闭合，其后 JSON 双引号被**静默剥除**（`{"op":"replace"}` → `{op:replace}`，产物「看似合法裸文本」，比可见残骸更难目检）——payload 需要单引号时（如 awk 脚本）改走③或转义形态；③payload 含双引号/引号嵌套冲突时用 quoted heredoc 直书或 `-d @file` 分离（脚本与 payload 分两个文件各自 heredoc 落盘，curl `-d @/tmp/patch.json` 引用——payload 字节原样落盘，字段域零缩窄，#45 实证形态）；④载体内 base64 编码（档③）天然免疫。
+**exec 载荷引号保真律（#45 实证立法；2026-09-16 二轮归因修正：根因在本地分词器，非 wiz 通道；同日方案 A 修复落地）**：引号损毁的第一现场在**本地 kubectl 分词器 `_split_args`**（tools/kubectl_cli.py：plain quoted region 逐字符扫描遇同类引号即闭合，**不识别双引号区内的反斜杠转义**）——外层双引号+转义形态（`\"`/`\$`）的 exec payload 被静默碎片化成多 token（`\"` 剥引号留反斜杠、token 在 `\Authorization:` 处截断、`Bearer` 沦为容器 shell `$0`），碎片经 wiz 通道（shlex.quote 逐词重组）**忠实**传输、容器 shell 再把残骸解析出错（残留 `\`+换行成行续接吞行——#45 corrupt file 209B≠正确 206B 三特征经四形态矩阵探针（.codex_work/probe_splitargs_45.py）逐字复现）；「外层单引号保真」的真因 = 分词器 verbatim-until-`'` 恰是 shell 单引号精确语义（无转义概念、无假闭合点），**wiz 通道对两种形态均无损**（同文件同型归因失误判例 d9117d36：从远端回显反推平台行为的坑两次——归因纪律：从 guard 派发最早的本地证据起比对）。**2026-09-16 方案 A 修复（用户裁决保留，实测四层验证）**：`_split_args` 双引号区已按 POSIX 解转义（`\"` `\\` `\$` `\`` → 字面字符、`\<newline>` 行续接、其他 `\x` 字面保留）——转义形态经真实集群 live-path 四形态实测 INTACT（修复前同 payload 11 token 碎片化 + 容器静默零输出；修复后 7 token 与单引号形态逐字节等价）；真实 /bin/sh oracle 9/9 一致；8351 项回归零破坏。**当前防御纪律**（修复后从硬律降为形态建议）：①落盘命令外层**首推单引号**（更简、无转义心智负担；转义形态已可用但两形态 token 等价，无收益）；②**单引号外层形态 payload 零单引号字符——此洞方案 A 不修**：外层 `'` 在 payload 首个 `'` 处假闭合，其后 JSON 双引号被**静默剥除**（`{"op":"replace"}` → `{op:replace}`，产物「看似合法裸文本」，比可见残骸更难目检）——payload 需要单引号时（如 awk 脚本）改走③或转义形态；③payload 含双引号/引号嵌套冲突时用 quoted heredoc 直书或 `-d @file` 分离（脚本与 payload 分两个文件各自 heredoc 落盘，curl `-d @/tmp/patch.json` 引用——payload 字节原样落盘，字段域零缩窄，#45 实证形态）；④载体内 base64 编码（档③）天然免疫。
 
 ## 八、降级路径
 

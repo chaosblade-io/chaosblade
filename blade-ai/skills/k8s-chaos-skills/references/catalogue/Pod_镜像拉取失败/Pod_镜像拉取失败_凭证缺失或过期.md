@@ -1,69 +1,70 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 imagePullSecrets/imagePullPolicy 并由调和器删除派生的失效凭证道具），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 imagePullSecrets/
+# imagePullPolicy/maxUnavailable），路由进程序化恢复载体装配器
+# （faultdrill_assemble_carrier 工具一次调用：建栈+验权+武装+注入+readback
+# 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC 不可授/验权 403）
+# 时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
-# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
-# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
-# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
-# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
+# 机制写入集立法（write-set approval contract）：本用例的故障机制需要写受害者
+# 覆盖之外的对象——靶是 Deployment（Pod 的 owner），patch imagePullSecrets/
+# imagePullPolicy/maxUnavailable 属受害者自身域内（名字匹配放行），但注入要
+# **创建**（恢复时删除）失效凭证道具 Secret——跨对象写，须立法声明。由 case
+# 作者在此声明，确定性代码在意图定案时装载，确认卡渲染、人工批准后冻结进守卫
+# 快照。LLM 无权扩写；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名
+# drill-rc-<hash> 四件套）由工具内程序化构建——构造保证 + fail-closed 内嵌
+# 检查，不经 LLM kubectl 写面，无立法条目。
 mechanism_writes:
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
+  # 注入创建 / 恢复删除：失效凭证道具 Secret（invalid-user/invalid-password，
+  # 零真实凭证材料——仅用于使拉取认证失败；原 CR secretSwap 源引用派生形态随
+  # CR 通道退役，改 LLM kubectl create 直建，走本条目）
+  - scope: secret
     namespace: default
-    name_prefix: "fd-"
+    names: [registry-cred-rotating]
 ---
 
 **用例名称** 凭证缺失或过期 导致 Pod_镜像拉取失败
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 imagePullSecrets/imagePullPolicy 并由调和器删除派生的失效凭证道具；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 imagePullSecrets/imagePullPolicy/maxUnavailable（凭证道具 Secret 的创建/删除为非 patch 域动作，走 execute 计划步骤+frontmatter 立法条目）；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；装配不可用时降级正文 SOP 形态）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: secretSwap
-  targetRef:
-    kind: Deployment
-    name: <deployment-name>
-    namespace: <namespace>
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  - op: replace
-    path: /spec/template/spec/imagePullSecrets
-    value: [{name: registry-cred-rotating}]
-  - op: replace
-    path: /spec/template/spec/containers/0/imagePullPolicy
-    value: Always
-  - op: replace
-    path: /spec/strategy/rollingUpdate/maxUnavailable
-    value: "100%"
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  # 逆 patch 还原三字段；失效 Secret 是 CR 派生道具——调和器恢复时自动删除，无需手删
-  - op: replace
-    path: /spec/template/spec/imagePullSecrets
-    value: <基线值（注入前记录的 imagePullSecrets）>
-  - op: replace
-    path: /spec/template/spec/containers/0/imagePullPolicy
-    value: <基线值（如 IfNotPresent 则连基线一并还原）>
-  - op: replace
-    path: /spec/strategy/rollingUpdate/maxUnavailable
-    value: <基线值>
-  invalidSecret:                         # 凭证道具：源引用 + 变换配方，零凭证材料内联
-    name: registry-cred-rotating
-    sourceName: <有效源 Secret 名（含真实凭证）>
-    registryHostOverride: <registry-server>
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
+  kind: Deployment
+  name: <deployment-name>
+  namespace: <namespace>
+patches:                                  # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+# 基线有 imagePullSecrets → replace 指向道具 Secret；基线无 → 改 add 整键
+- op: replace
+  path: /spec/template/spec/imagePullSecrets
+  value: [{name: registry-cred-rotating}]
+# 基线 policy 为 Always 时省略本条；IfNotPresent → 改 Always（否则 K8s 直接使用
+# 本地缓存镜像启动 Pod，不触发凭证校验，故障无法注入）
+- op: replace
+  path: /spec/template/spec/containers/0/imagePullPolicy
+  value: Always
+# maxUnavailable 100% 并入注入域（正文步骤 2 的防滚动死锁操作——注入期新 Pod
+# 永不 Ready，默认 MU 下 K8s 不会终止旧 Pod，滚动死锁）
+- op: replace
+  path: /spec/strategy/rollingUpdate/maxUnavailable
+  value: "100%"
+restorePatches:                           # 恢复域：载体 TTL 到点自治执行；Agent 死亡后 recover 从台账重放同源
+# 基线空 → remove 整键；基线有 → replace <基线值>；失效 Secret 为 execute 计划
+# 道具，收尾清理步删除
+- op: replace
+  path: /spec/template/spec/imagePullSecrets
+  value: <基线值（注入前记录的 imagePullSecrets）>
+- op: replace
+  path: /spec/template/spec/containers/0/imagePullPolicy
+  value: <基线值（如 IfNotPresent 则连基线一并还原）>
+- op: replace
+  path: /spec/strategy/rollingUpdate/maxUnavailable
+  value: <步骤2记录的基线值>
+durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
-- **invalidSecret 源引用立法**：只携带 sourceName（源 Secret）与变换参数——零凭证材料内联（CR 不在 Secret encryption-at-rest 覆盖内，内联 = 凭证明文落 etcd）；调和器读源派生失效副本（invalid-user/invalid-password）写入 name 指定的道具 Secret。
-- **host 匹配律警示（实验第二坑）**：registryHostOverride 必须与镜像地址中的 registry host 逐字匹配——dockerconfigjson 的 auths 键 host 不匹配时拉取不引用该凭证，故障静默失效（CR 已落地、现象不出现）。
-- 恢复由通道调和承载（restorePatches + 删 invalidSecret 派生道具），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划 普通 kubectl 步骤。
+- **凭证道具零材料纪律**：失效凭证 Secret（步骤 4 `kubectl create secret docker-registry` 直建，invalid-user/invalid-password）零真实凭证材料内联——仅创建指向失效凭据的新 Secret，不复制/不读取有效源 Secret 的材料；原 CR secretSwap 源引用派生形态（sourceName + registryHostOverride）随 CR 通道退役。
+- **host 匹配律警示（实验第二坑）**：`--docker-server`（原 registryHostOverride 同位参数）必须与镜像地址中的 registry host 逐字匹配——dockerconfigjson 的 auths 键 host 不匹配时拉取不引用该凭证，故障静默失效（Secret 已落地、现象不出现）。
+- 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（Secret 创建/删除）保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. Pod 状态为 ImagePullBackOff 或 ErrImagePull
@@ -74,7 +75,7 @@ spec:
 1. 确认应用 A 已正常运行，且使用私有镜像仓库
 2. 确认应用 A 的 Pod 配置了 imagePullSecrets
 
-**演练步骤**：
+**演练步骤**（主路径 = 基线捕获（步骤 1 的 imagePullSecrets/policy 记录 + 步骤 2 的 MU 读取，restorePatches 的基线值来源，两条路径共用）→ 创建失效凭证 Secret（步骤 4，道具，走 frontmatter mechanism_writes 立法条目，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Deployment、patches=imagePullSecrets 指向道具+policy Always+maxUnavailable 100%、restorePatches=三字段基线还原、duration_seconds=<duration>），注入+武装+readback 工具内同步完成——步骤 2 的手动置 100% 在主路径下由配方注入域承载；步骤 1 的基线 JSON 导出（剥离 resourceVersion）仅为降级兜底的 replace 形态所需，主路径配方为 json-patch 三字段无需整体替换；步骤 2-3、5 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. 记录应用 A 当前的 imagePullSecrets 名称和 imagePullPolicy 值，并导出还原基线（**必须剥离
    metadata 中的 resourceVersion/uid/creationTimestamp/generation 与整个 status**——结论：
    带 resourceVersion 的 `kubectl get -o yaml` 原样输出，无论 apply 还是 replace 都会因乐观锁
@@ -139,7 +140,7 @@ spec:
 5. 修改应用 A 的 Deployment，将 imagePullSecrets 指向无效 Secret（或直接移除 imagePullSecrets）。
    同时检查 imagePullPolicy：如果当前为 `IfNotPresent`，需同时改为 `Always`，否则 K8s 直接使用本地缓存镜像启动 Pod，不会触发凭证校验，故障无法注入
 6. 等待 Pod 滚动更新完成，确认所有旧 Pod 已被替换
-7. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段）
+7. 滚动更新完成后，立即还原 maxUnavailable 为原始值（maxUnavailable 只是使滚动更新完成的手段，不是故障本身，不应泄漏到恢复阶段。主路径下此项随载体配方 restorePatches 由载体 TTL 还原，无需手动执行）
 8. 观察 Pod 状态变化
 
 **注入验证**：
@@ -148,7 +149,7 @@ spec:
 3. 执行 `kubectl describe pod <pod-name>`，确认 Events 中显示认证失败相关错误
 4. 确认错误信息包含 `unauthorized` 或 `authentication required`
 
-**注入恢复**：
+**注入恢复**（主路径下三字段还原无需 Agent 执行动作——载体 TTL 自治按 restorePatches 还原 imagePullSecrets/imagePullPolicy/maxUnavailable（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。失效凭证 Secret 删除为非 patch 域动作，走 execute 计划收尾清理步。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期后武装的定时器自动用基线整体替换还原 imagePullSecrets/imagePullPolicy
    并删除无效 Secret。如需提前恢复，Agent 幂等重执行同款恢复命令（先把步骤 1 的基线 JSON 写入
    本地临时文件再 replace；定时器迟到触发无害——replace 对已还原对象是 no-op，delete 对已删

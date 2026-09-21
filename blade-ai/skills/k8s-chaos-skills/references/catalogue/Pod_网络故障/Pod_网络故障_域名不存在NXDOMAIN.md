@@ -1,14 +1,23 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 Corefile 配置），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 Corefile 配置），路由进程序化
+# 恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+武装+
+# 注入+readback 工具内同步完成）；装配不可用（执行凭证无 cm patch/kube-system
+# 建权不可授/RBAC 不可授/验权 403）时降级正文 SOP 路径（三权路由 A/B）。
 recovery_channel: apiserver-write
 # 机制写入集立法（write-set approval contract）：本用例的故障机制需要写受害者
 # 覆盖之外的对象。由 case 作者在此声明，确定性代码在意图定案时装载，确认卡
 # 渲染、人工批准后冻结进守卫快照。LLM 无权扩写。同命名空间辅助资源无需
 # 声明（secondary_scopes 已覆盖）；条目只约束受害者覆盖之外的跨域写。
+# 主路径装配器四件套（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash>，全落
+# 靶 ns kube-system）由工具内程序化构建——构造保证 + fail-closed 内嵌检查
+# （RBAC 从 restorePatches 同源推导禁通配、SA 真实 token 验权 403 中止+清理），
+# 不经 LLM kubectl 写面（design ND3：程序化路径不复用 LLM 守卫），无立法条目；
+# 下列条目全部服务降级路径的 LLM kubectl 写面。
 mechanism_writes:
-  # 路径 A：patch 共享 Corefile（CoreDNS 配置本体；发行版名 coredns/kube-dns）
+  # 降级 SOP 路径 A：LLM 直笔 patch 共享 Corefile（CoreDNS 配置本体；发行版名
+  # coredns/kube-dns）的注入/还原写面——主路径下该 patch 由装配器工具内执行，
+  # 不经 LLM 写面
   - scope: configmap
     namespace: kube-system
     names: [coredns, kube-dns]
@@ -16,24 +25,20 @@ mechanism_writes:
   - scope: configmap
     namespace: kube-system
     name_prefix: "drill-nxdomain-"
-  # 两条路径：rollout restart / strategic patch CoreDNS Deployment
+  # 两条路径：rollout restart / strategic patch CoreDNS Deployment——生效触发
+  # 与路径 B 注入是 execute 计划普通步骤，走 LLM kubectl 写面
   - scope: deployment
     namespace: kube-system
     names: [coredns, kube-dns]
-  # 载体标准件跨 ns 变体：Role/RoleBinding 落 kube-system（把恢复动词授予
-  # 靶 ns 的载体 SA）；SA 与载体 Pod 留在靶 ns 免立法（同 ns secondary 覆盖）
+  # 降级 SOP 的恢复载体跨 ns 标准件：SA 与载体 Pod 建在靶 ns，Role/RoleBinding
+  # 落 kube-system（把恢复动词授予靶 ns 的载体 SA）——LLM 手动建栈写面立法
+  # （主路径装配器四件套全落靶 ns kube-system 且程序化构建，免本条目）
   - scope: role
     namespace: kube-system
     name_prefix: "drill-rc-"
   - scope: rolebinding
     namespace: kube-system
     name_prefix: "drill-rc-"
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: kube-system
-    name_prefix: "fd-"
 ---
 
 **用例名称** 域名不存在NXDOMAIN 导致 Pod_网络故障
@@ -43,8 +48,9 @@ mechanism_writes:
 生效，无 reload 时滚动重启）即自动恢复。
 本用例为**单手段用例（kubectl-native）**：ChaosBlade 的 `pod-network dns` action 只能把域名
 劫持到指定 IP（那是 `Pod_网络故障_DNS劫持` 用例），**没有返回 NXDOMAIN rcode 的 等价
-action**，语义不等价。手段内部按**当前执行凭证的 RBAC** 二选一路径（`kubectl auth
-can-i` 直查，见资源准备第 5 条）：
+action**，语义不等价。手段按**当前执行凭证的 RBAC** 路由：主路径 = 装配器载体
+配方（路径 A 形态——见下方载体配方；须 kube-system 建权 + cm patch），装配
+不可用时降级正文二选一路径（`kubectl auth can-i` 直查，见资源准备第 5 条）：
 - **路径 A（改 coredns ConfigMap）**：当前凭证有 `patch configmaps -n kube-system` 权限时
   优先——只动一个对象，还原链最短
 - **路径 B（独立 NXDOMAIN ConfigMap + Deployment `-conf` 追加）**：当前凭证**无** cm patch
@@ -80,36 +86,33 @@ can-i` 直查，见资源准备第 5 条）：
    之外的 kube-system 写属于守卫绕过，禁止
 
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 Corefile 配置；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 Corefile 配置；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，**全落靶 ns kube-system**，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权（GET 探测 + 写动词 SSAR 全查）→ 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告。装配不可用形态（对号入座即降级正文 SOP）：执行凭证无 kube-system 建权（栈构建 fail-closed 报告会精确指出缺哪权）/ 无 cm patch（注入 partial——载体保留至 TTL 对未注入靶标 no-op fire 后自然收敛，降级前按 receipt 的 recovery_handle 处置载体）/ SSAR 403）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: ConfigMap
-    name: coredns
-    namespace: kube-system
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  # Corefile 是单键整文件——replace 全文值 = 基线全文 + 注入行（路径 A 共享 Corefile 主形态）
-  - op: replace
-    path: /data/Corefile
-    value: <基线 Corefile 全文 + 注入的 NXDOMAIN 转发/劫持配置段>
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  - op: replace
-    path: /data/Corefile
-    value: <注入前记录的基线 Corefile 全文>
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+targetRef:                                # 靶（kube-system 基础设施对象；主路径建模路径 A 形态）
+  kind: ConfigMap
+  name: coredns                           # 发行版差异：kube-dns 同形态换名
+  namespace: kube-system
+patches:                                  # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+# Corefile 是单键整文件——replace 全文值 = 基线全文 + 顶层独立 template NXDOMAIN
+# server block 追加文件末尾（与 .:53 块平级，严禁嵌入 .:53 块内部——插件链冲突
+# 会使 CoreDNS BackOff crash；文本替换式注入的锚点陷阱见资源准备第 4 条，
+# 必须由 Agent 从原文构造注入后完整 Corefile）
+- op: replace
+  path: /data/Corefile
+  value: <基线 Corefile 全文 + 顶层独立 template NXDOMAIN server block>
+restorePatches:                           # 恢复域：载体 TTL 到点执行；Agent 死亡后 recover 重放同源
+- op: replace
+  path: /data/Corefile
+  value: <注入前记录的基线 Corefile 全文>
+durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
-- 目标是 kube-system 基础设施对象：targetRef.namespace 写 kube-system，CR 本体仍落 victim ns；跨域写继续受 front matter mechanism_writes 立法条目约束。
-- CoreDNS 生效触发（rollout restart 或等待配置 reload）保留为 execute 计划普通步骤。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- **基线对账的机械化防线**：装配器基线校验要求 restorePatches 的 value 逐字等于活体对象当前值（restore 值 ≠ 活体即中止——armed timer would mutate the target, not restore it），Corefile 全文 replace 形态下即「注入前原文必须逐字精确」；资源准备第 4 条锚点陷阱（块形 forward 静默失配）由该防线拦成显式中止而非无声漂移。
+- 目标是 kube-system 基础设施对象：targetRef.namespace 写 kube-system；装配器四件套全落 kube-system（与靶同 ns），执行凭证需 kube-system 建权（create serviceaccounts/roles/rolebindings/pods + 载体 exec）——托管集群常态不可授，即装配 fail-closed 降级正文路径；降级路径的跨域写继续受 frontmatter mechanism_writes 立法条目约束（LLM 写面）。
+- CoreDNS 生效触发（reload 热加载等待 ≤2 分钟，无 reload 时 rollout restart）保留为 execute 计划普通步骤——它不是恢复动作，主路径与降级路径共用。
+- **通道安全前提（主路径延续成立）**：装配器载体 TTL 恢复载荷走 `https://kubernetes.default.svc`——该域名由 `.:53` 块的 kubernetes 插件直接应答，不受 template NXDOMAIN 影响（目标域名必为外部域名的硬约束反向保证），载体恢复通道不因本故障不可达（与 `Pod_网络故障_CoreDNS异常` 的装配器死锁形态的本质区别——那边故障摧毁的就是解析链路本身）。
+- 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（生效触发 rollout、路径 B 全域）保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. 特定域名解析返回 NXDOMAIN（域名不存在），而非解析到错误 IP（那是 DNS 劫持）
@@ -123,7 +126,7 @@ spec:
 
 | 输入 | 决定 | 锚点 |
 |---|---|---|
-| 凭证 RBAC 三权+两权 | 路径 A/B 选型 + 跨 ns 载体可行性 | 第 5 条 |
+| 凭证 RBAC 三权+装配器建权面+两权 | 主路径装配器面 + 路径 A/B 降级选型 + 跨 ns 载体可行性 | 第 5 条 |
 | Corefile 原文全文（含 forward 形态、reload 在位与否） | 注入/还原构造基准 + 生效路径 | 第 4 条 |
 | CoreDNS 副本数/标签/容器名/args | 白盒判据 + 路径 B 锚点 | 第 2、3 条 |
 | 靶容器工具面（nslookup/dig/curl 哪个在） | 验证判据形态 | 第 6 条 |
@@ -164,9 +167,13 @@ spec:
    kubectl auth can-i delete configmaps -n kube-system
    kubectl auth can-i patch deployments -n kube-system
    ```
-   RBAC 检查结果路由：`cm_patch=yes` → 路径 A（优先）；`cm_patch=no` 且
-   `cm_create=yes` + `cm_delete=yes` + `deploy_patch=yes` → 路径 B。
-   ⚠️ **恢复定时器宿主（先武装定时恢复，再注入——见各路径步骤 2）**：本用例恢复对象在
+   RBAC 检查结果路由（主路径优先）：`cm_patch=yes` 且 kube-system 建权可授
+   （装配器四件套全落 kube-system——`create serviceaccounts`/`create roles`/
+   `create rolebindings`/`create pods` 四权各查一次 + 载体 `exec pods`）→
+   装配器主路径（载体配方）；任一不可授 → 装配器 fail-closed 降级正文路径：
+   `cm_patch=yes` → 路径 A（LLM 直笔优先）；`cm_patch=no` 且 `cm_create=yes` +
+   `cm_delete=yes` + `deploy_patch=yes` → 路径 B。
+   ⚠️ **恢复定时器宿主（降级 SOP 素材——主路径装配器载体 TTL 自治承载免手动建栈；先武装定时恢复，再注入——见各路径步骤 2）**：本用例恢复对象在
    kube-system（超出靶 ns），定时器按**恢复载体标准件「跨命名空间变体」**承载（`references/carrier/recovery-carrier.md` 第十节）——SA 与载体 Pod 建在靶 ns，Role/RoleBinding 落 kube-system（恢复动词授予载体 SA；本用例 frontmatter 的 mechanism_writes 已立法 role/rolebinding @ kube-system + drill-rc- 前缀，无需运行时扩权）。**通道安全前提**：载体恢复命令走 `https://kubernetes.default.svc`——该域名由 `.:53` 块的 kubernetes 插件直接应答，不受 template NXDOMAIN 影响（目标域名必为外部域名的通道安全约束反向保证），载体的恢复通道不因本故障不可达。跨 ns 变体的执行凭证硬门（与上方三权一并查）：
    ```bash
    kubectl auth can-i create roles -n kube-system
@@ -188,7 +195,7 @@ spec:
    - 只有 curl：`curl -sv --max-time 5 http://<target-domain> -o /dev/null`，从 `*   Trying <IP>:80`
      行读取解析 IP 作为基线
 
-**演练步骤**：
+**演练步骤**（主路径 = 基线捕获（步骤 1 + 资源准备第 4 条 Corefile 原文——restorePatches 基线值来源，两条路径共用）→ 资源准备第 5 条 RBAC 探测（主路径装配器面：kube-system 建权四权 + cm patch；不可授即降级三权路由）→ 调 faultdrill_assemble_carrier（参数取自载体配方：target_kind=configmap、target_name=coredns、target_namespace=kube-system、patches=…、restorePatches=…、duration_seconds=<duration>），注入+武装+readback 工具内同步完成 → 生效触发（reload 等待/rollout）为 execute 计划普通步骤接续。路径 A 步骤 2-4 的手动载体标准件序列与路径 B 全域仅当装配器 fail-closed/partial 报告不可用时作降级兜底——三权路由（cm_patch=yes → 路径 A；cm_patch=no 且 cm_create+cm_delete+deploy_patch=yes → 路径 B）即降级路由表）：
 
 1. 记录注入前基线（两条路径共用）：
    ```bash
@@ -197,7 +204,7 @@ spec:
    记录 CoreDNS Pod 列表（恢复验证对照）；路径 A 另需步骤 4 的 Corefile 原文，路径 B 另需
    步骤 3 的 args 原文（还原 patch 的对照基准）
 
-**路径 A —— 改 coredns ConfigMap（执行器 `cm_patch=yes` 时优先）**
+**路径 A —— 改 coredns ConfigMap（降级形态：装配器不可用且执行器 `cm_patch=yes` 时优先）**
 
 **执行序列速查**（四件套首查 NotFound 是预期初始态——不存在即直接创建，不是错误；命令全文与警示见本节正文）：基线读取（Corefile 原文 + CoreDNS Pod 列表）→ create sa（靶 ns）→ create role（kube-system）→ create rolebinding（kube-system）→ kubectl run 载体（overrides 挂 SA + tolerations，完整序列见标准件第十节）→ 载体 Running 确认 → 验权 GET 200 硬门 → 武装定时器（restore 脚本 base64 折叠 + `sh -n` 校验）→ 注入 merge patch → 白盒回读比对
 
@@ -275,7 +282,7 @@ spec:
    `kubectl exec drill-rc-<hash> -n <namespace> -- sh -c 'pkill -f blade-restore-nxdomai[n]; true'`
    停旧定时器再全额重武装（见 SKILL.md 安全红线「故障窗口完整」）
 
-**路径 B —— 独立 NXDOMAIN ConfigMap + Deployment `-conf` 追加（当前凭证无 cm patch 权限时）**
+**路径 B —— 独立 NXDOMAIN ConfigMap + Deployment `-conf` 追加（降级形态：当前凭证无 cm patch 权限时）**
 
 不碰集群共享的 coredns ConfigMap：新建一个只含 NXDOMAIN 规则的独立 ConfigMap，把它挂进
 CoreDNS 容器并在启动参数追加第二个 `-conf` 文件。CoreDNS 原生支持多配置文件（各文件
@@ -405,7 +412,7 @@ server 块合并）。全程只用 `cm create/delete` + `deployments patch` 三�
    （注入验证第 4 条形态），**具体记录命令与输出**——效果证据须在故障存活期内
    采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告
 
-**注入恢复**：
+**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原（restorePatches 的 Corefile replace 由载体内 timer 到点 curl 执行；kubernetes.default.svc 由 kubernetes 插件直接应答、不受 template NXDOMAIN 影响，恢复通道照常可达；fire 证据落载体 /tmp/restore.log + 任务台账 recovery_handle）；reload 热加载生效约 ≤2 分钟；演练提前结束时 blade-ai recover 从台账重放同源配方提前收敛，与载体幂等双执行。路径 A 手动还原与路径 B 恢复域（remove 三连+删 ConfigMap+滚动重启）为降级兜底形态）：
 1. 等待 `<duration>` 到期，武装的定时器自动还原（路径 A：merge patch 原文——Corefile
    内容变更由 `reload` 热加载生效（约 ≤2 分钟，无 Pod 重建），无 reload 时加滚动
    重启；路径 B：remove patch 三连 + 删独立 ConfigMap + 滚动重启——deployment spec

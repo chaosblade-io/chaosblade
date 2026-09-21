@@ -1,51 +1,41 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 移除注入的 finalizer），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 移除注入的 finalizer），路由进程序化
+# 恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+武装+
+# 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
+# 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
-# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
-# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
-# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
-# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
-mechanism_writes:
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: default
-    name_prefix: "fd-"
+# 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
+# 自身（add finalizer 写靶 Pod 的 metadata 属受害者域内，名字匹配放行），无
+# 跨对象写条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash>
+# 四件套）由工具内程序化构建——构造保证 + fail-closed 内嵌检查（RBAC 从
+# restorePatches 同源推导禁通配、SA 真实 token 验权 403 中止+清理），不经
+# LLM kubectl 写面，无立法条目。
 ---
 
 **用例名称** Finalizers未清理 导致 Pod_Terminating
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的 finalizer；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的 finalizer；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；装配不可用时降级正文 SOP 形态）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: Pod
-    name: <pod-name>
-    namespace: <namespace>
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  - op: add
-    path: /metadata/finalizers
-    value: [vol.ops/detach-pending]
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  - op: remove
-    path: /metadata/finalizers
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+targetRef:
+  kind: Pod
+  name: <pod-name>
+  namespace: <namespace>
+patches:                                  # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+- op: add
+  path: /metadata/finalizers
+  value: [vol.ops/detach-pending]
+restorePatches:                           # 恢复域：载体 TTL 到点执行；Agent 死亡后 recover 重放同源
+- op: remove
+  path: /metadata/finalizers
+durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
-- 删除 Pod（`--wait=false`——触发终止流程的必要步）保留为 execute 计划普通步骤。
-- 注入后 Pod 带 deletionTimestamp 停留 Terminating——目标对象持续可读，readback 守卫正常；恢复 remove finalizer 后 Pod 被 GC 消失，属恢复完成的预期形态。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- **remove 对账前提**：装配器基线校验对 remove op 要求基线无该键（基线已存在则中止——remove 会删掉基线状态）；本 case 资源准备第 2 条确认基线无 finalizers，add/remove 自逆配对成立。基线带既有 finalizers 的 Pod 不得选靶（remove 整键会误删既有 finalizer——那批须按「replace <基线完整数组>」形态重写配方，超出本模板）。
+- 删除 Pod（`--wait=false`——触发终止流程的必要步）保留为 execute 计划普通步骤（主路径下在装配器注入 add finalizer 之后接续执行）。
+- 注入后 Pod 带 deletionTimestamp 停留 Terminating——目标对象持续可读，装配器 landing readback 与恢复验证正常；恢复 remove finalizer 后 Pod 被 GC 消失，属恢复完成的预期形态（载体 timer 迟到再执行 remove 时报 NotFound 无害）。
+- 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 NotFound 即已恢复）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作（删 Pod 触发终止）保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. Pod 无法完成删除，`metadata.deletionTimestamp` 已设置但 Pod 对象仍存在于 API 中
@@ -67,7 +57,7 @@ spec:
 1. 确认目标应用已正常运行
 2. 确认目标 Pod 当前没有 finalizers（`kubectl get pod <name> -o jsonpath='{.metadata.finalizers}'` 返回空）
 
-**演练步骤**：
+**演练步骤**（主路径 = 步骤 1 定位目标 Pod + 资源准备第 2 条基线确认（无 finalizers——remove 对账前提）→ 调 faultdrill_assemble_carrier（参数取自载体配方：target_kind=pod、target_name=<pod-name>、target_namespace=<namespace>、patches=…、restorePatches=…、duration_seconds=<duration>），add finalizer 注入+武装+readback 工具内同步完成（武装与注入紧邻、修复必重武装三条纪律由工具内结构性满足）→ 步骤 4 删 Pod（--wait=false，execute 计划普通步骤，两路径共用）触发终止流程——故障形态在删除后才出现，TTL 从武装时刻起算已覆盖。步骤 2-3 的手动定时器序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. 定位目标 Pod
 2. **先武装定时自恢复，再注入**（恢复命令幂等：定时器到期自动恢复为主，Agent 在演练结束时
    主动执行同一条命令兜底——第一次执行后 Pod 即被 GC，定时器迟到再执行报 NotFound 无副作用）。
@@ -111,7 +101,7 @@ spec:
 3. 执行 `kubectl get pod <pod-name> -o jsonpath='{.metadata.finalizers}'`，确认包含注入的 finalizer
 4. 确认没有控制器在处理该 finalizer（`vol.ops/detach-pending` 无对应控制器，因此不会被自动清理）
 
-**注入恢复**：
+**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治还原（restorePatches 的 remove finalizer 由载体内 timer 到点执行，remove 后 Pod 被 Kubernetes GC 自动清除——目标对象消失即恢复完成的预期形态；fire 证据落载体 /tmp/restore.log + 任务台账 recovery_handle）；演练提前结束时 blade-ai recover 从台账重放同源配方提前收敛（Pod 已被 GC 时 remove 报 NotFound 无害）。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动移除注入的 finalizer，Pod 将被 Kubernetes GC 自动清除；
    演练提前结束时由 Agent 主动执行同一条恢复命令（幂等——第一次执行后 Pod 已被 GC，
    定时器迟到再执行报 NotFound 无副作用）：

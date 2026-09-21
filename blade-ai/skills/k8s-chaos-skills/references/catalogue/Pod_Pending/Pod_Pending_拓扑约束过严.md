@@ -1,39 +1,29 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 移除注入的调度约束并还原副本数与 maxUnavailable），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 移除注入的调度约束并还原副本数与 maxUnavailable），
+# 路由进程序化恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+
+# 武装+注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
+# 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
-# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
-# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
-# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
-# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
-mechanism_writes:
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: default
-    name_prefix: "fd-"
+# 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者自身
+# （patch Deployment 的 affinity/replicas/maxUnavailable 属受害者域内，名字匹配
+# 放行），无跨对象写条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名
+# drill-rc-<hash> 四件套）由工具内程序化构建——构造保证 + fail-closed 内嵌检查
+# （RBAC 从 restorePatches 同源推导禁通配、SA 真实 token 验权 403 中止+清理），
+# 不经 LLM kubectl 写面，无立法条目。
 ---
 
 **用例名称** 拓扑约束过严 导致 Pod_Pending
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的调度约束并还原副本数与 maxUnavailable；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的调度约束并还原副本数与 maxUnavailable；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；装配不可用时降级正文 SOP 形态）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: Deployment
-    name: <deployment-name>
-    namespace: <namespace>
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  # 首选反亲和形态（正文立法：topologySpreadConstraints 形态 Pending 判据结构性不可达）
+targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
+  kind: Deployment
+  name: <deployment-name>
+  namespace: <namespace>
+patches:                                  # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+# 首选反亲和形态（正文立法：topologySpreadConstraints 形态 Pending 判据结构性不可达）
   - op: add
     path: /spec/template/spec/affinity
     value:
@@ -47,8 +37,8 @@ spec:
   - op: replace
     path: /spec/strategy/rollingUpdate/maxUnavailable
     value: "100%"
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  # 逆序还原（正文恢复顺序立法）：affinity → replicas → maxUnavailable
+restorePatches:                           # 恢复域：载体 TTL 到点自治执行；Agent 死亡后 recover 从台账重放同源
+# 逆序还原（正文恢复顺序立法）：affinity → replicas → maxUnavailable
   - op: remove
     path: /spec/template/spec/affinity
   - op: replace
@@ -57,12 +47,11 @@ spec:
   - op: replace
     path: /spec/strategy/rollingUpdate/maxUnavailable
     value: <基线值>
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
-- maxUnavailable 还原须待恢复流程移除约束且第二次滚动完成后（正文「暂缓还原」纪律）——调和器按 restorePatches 顺序执行，逆序排列已满足该纪律。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- maxUnavailable 还原须待恢复流程移除约束且第二次滚动完成后（正文「暂缓还原」纪律）——载体按 restorePatches 顺序执行，逆序排列已满足该纪律。
+- 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. Pod 状态为 Pending，无法被调度
@@ -97,7 +86,7 @@ spec:
    kubectl delete sa drill-rc-<hash> -n <namespace> --ignore-not-found
    ```
 
-**演练步骤**：
+**演练步骤**（主路径 = 基线捕获后调 `faultdrill_assemble_carrier`（参数取自载体配方），注入+武装+readback 工具内同步完成；以下手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. 记录还原基线（基线捕获：Agent 读取输出并记录以下字段的原始值，恢复时使用；
    topologySpreadConstraints/affinity 原本无约束时输出为空）：
    ```bash
@@ -166,7 +155,7 @@ spec:
 2. 行为复查：超节点数扩出的副本仍 Pending（`kubectl get pods -n <namespace> -l <app-label>` 中 Pending 数不变）
 3. 事件复查：FailedScheduling 事件 LAST SEEN 相比注入时有新增（调度器仍在周期性重试）
 
-**注入恢复**：
+**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治按 restorePatches 逆序还原，fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动还原拓扑约束与副本数；演练提前结束时由 Agent 主动执行
    同组恢复命令（幂等，定时器迟到再执行一次无副作用。json patch 按字段精确替换/移除，天然
    规避 resourceVersion 乐观锁问题，也不会像 apply 三方合并那样保留注入新增的字段。

@@ -1,64 +1,54 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 移除注入的卷挂载），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 移除注入的卷挂载），路由进程序化
+# 恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+武装+
+# 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
+# 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
 # 机制写入集立法（write-set approval contract）：本用例的故障机制需要写受害者
 # 覆盖之外的对象——靶是 StatefulSet（Pod 的 owner），patch spec.template 的
 # volumes/volumeMounts 属受害者自身域内（名字匹配放行），但注入要**创建**（恢复
 # 时删除）演练用 PVC——跨对象写，须立法声明。由 case 作者在此声明，确定性代码
-# 在意图定案时装载，确认卡渲染、人工批准后冻结进守卫快照。LLM 无权扩写。
+# 在意图定案时装载，确认卡渲染、人工批准后冻结进守卫快照。LLM 无权扩写；装配器
+# 载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash> 四件套）由工具内程序化
+# 构建——构造保证 + fail-closed 内嵌检查，不经 LLM kubectl 写面，无立法条目。
 mechanism_writes:
   # 注入创建 / 恢复删除：演练用 PVC（引用不存在的 StorageClass，瞬态对象；
   # 名字与 Deployment 版用例的 app-data-claim 刻意区分，避免并行演练与审计混淆）
   - scope: persistentvolumeclaim
     namespace: default
     names: [sts-unbound-claim]
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: default
-    name_prefix: "fd-"
 ---
 
 **用例名称** PVC未绑定（StatefulSet 靶） 导致 Pod_Pending
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 移除注入的卷挂载；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；装配不可用时降级正文 SOP 形态）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: StatefulSet
-    name: <sts-name>
-    namespace: <namespace>
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  # 基线无卷 → add 整键；基线有卷 → add /…/volumes/- 追加
-  - op: add
-    path: /spec/template/spec/volumes
-    value: [{name: sts-data, persistentVolumeClaim: {claimName: sts-unbound-claim}}]
-  - op: add
-    path: /spec/template/spec/containers/0/volumeMounts
-    value: [{name: sts-data, mountPath: /data}]
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  # 基线空 → remove 整键；基线非空 → replace <基线数组>
-  - op: remove
-    path: /spec/template/spec/volumes
-  - op: remove
-    path: /spec/template/spec/containers/0/volumeMounts
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
+  kind: StatefulSet
+  name: <sts-name>
+  namespace: <namespace>
+patches:                                  # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+# 基线无卷 → add 整键；基线有卷 → add /…/volumes/- 追加
+- op: add
+  path: /spec/template/spec/volumes
+  value: [{name: sts-unbound-vol, persistentVolumeClaim: {claimName: sts-unbound-claim}}]
+- op: add
+  path: /spec/template/spec/containers/0/volumeMounts
+  value: [{name: sts-unbound-vol, mountPath: /var/lib/drill-unbound}]
+restorePatches:                           # 恢复域：载体 TTL 到点自治执行；Agent 死亡后 recover 从台账重放同源
+# 基线空 → remove 整键；基线非空 → replace <基线数组>
+- op: remove
+  path: /spec/template/spec/volumes
+- op: remove
+  path: /spec/template/spec/containers/0/volumeMounts
+durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
 - 道具 PVC 为 execute 计划 manifest 步骤（走 front matter mechanism_writes 立法条目）；收尾清理步删除。
 - 删除卡住的错误 revision Pod（revision-hash 不等标签选择器——正文 OrderedReady 立法：控制器对 Pending 错误 revision Pod 零动作）保留为 execute 计划收尾步骤。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（删卡住 Pod、删演练 PVC）保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. StatefulSet 最高序号 Pod 状态为 Pending，READY < DESIRED 持续不收敛
@@ -99,8 +89,8 @@ spec:
    （volumeClaimTemplates 派生的数据卷零触碰），对齐 SKILL.md「无备份对
    StatefulSet 做破坏性实验」红线（本用例非破坏性）
 
-**演练步骤**：
-1. **基线捕获**（恢复对照基准；Agent 读取输出并记录原始 JSON。updateStrategy
+**演练步骤**（主路径 = 基线捕获（步骤 1）→ 创建道具 PVC（步骤 2，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=StatefulSet、patches=模板卷挂载注入、restorePatches=模板还原、duration_seconds=<duration>），模板注入+武装+readback 工具内同步完成；步骤 3-4 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底。updateStrategy 为 `OnDelete` 时主路径同样须在装配器注入后手动删除最高序号 Pod 触发重建，见步骤 1 注）：
+1. **基线捕获**（恢复对照基准；restorePatches 的基线值来源，两条路径共用。Agent 读取输出并记录原始 JSON。updateStrategy
    输出为空即默认 `RollingUpdate`；`rollingUpdate.partition` 非零时仅序号 ≥
    partition 的副本参与更新，最高序号仍会更新、故障照常成立，但需在方案中知悉）：
    ```bash
@@ -269,7 +259,7 @@ unbound PVC 事件 + PVC Pending」即效果确证。恢复由定时器带外完
    原地变老），此时本条判据结构性不可达，如实记 partial，持续性证明由第 1/2 条
    承载（配置即状态 + 行为不收敛）；勿把事件不前进误判为故障已恢复
 
-**注入恢复**：
+**注入恢复**（主路径下模板还原无需 Agent 执行动作——载体 TTL 自治按 restorePatches 还原 Pod 模板（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。非 patch 域动作——删卡住错误 revision Pod（**不可省略**）与删演练 PVC——保留为 execute 计划收尾步骤，在模板还原后执行（先模板、次卡住 Pod、后 PVC，顺序即安全顺序，见步骤 3）。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期执行基线还原：定时器宿主形态由定时器自动执行；演练
    提前结束时由 Agent 主动执行同一组恢复命令（幂等，定时器迟到再执行一次无
    副作用。**数组整体 replace 回基线而非按索引 remove**——remove 按位置删除，

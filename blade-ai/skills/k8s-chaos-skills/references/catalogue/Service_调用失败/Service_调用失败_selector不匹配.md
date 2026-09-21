@@ -1,50 +1,39 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 Service selector），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 Service selector），路由进
+# 程序化恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+
+# 武装+注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
+# 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
-# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
-# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
-# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
-# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
-mechanism_writes:
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: default
-    name_prefix: "fd-"
+# 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
+# 自身（patch Service selector 属受害者域内，名字匹配放行），无跨对象写条目；
+# 装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash> 四件套）由工具
+# 内程序化构建——构造保证 + fail-closed 内嵌检查（RBAC 从 restorePatches 同源
+# 推导禁通配、SA 真实 token 验权 403 中止+清理），不经 LLM kubectl 写面，无立
+# 法条目。
 ---
 
 **用例名称** selector不匹配 导致 Service_调用失败
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 Service selector；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 Service selector；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；装配不可用时降级正文 SOP 形态）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: Service
-    name: <service-name>
-    namespace: <namespace>
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
+  kind: Service
+  name: <service-name>
+  namespace: <namespace>
+patches:                                  # 注入域（json-patch，value 任意 JSON 形态逐字保留）
   - op: replace
     path: /spec/selector
     value: <与后端 Pod 标签不匹配的 selector>
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
+restorePatches:                           # 恢复域：载体 TTL 到点自治执行；Agent 死亡后 recover 从台账重放同源
   - op: replace
     path: /spec/selector
     value: <注入前记录的基线 selector>
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. Service 的 Endpoints 列表为空
@@ -55,9 +44,16 @@ spec:
 1. 确认应用 A 已正常运行，对外暴露 Service
 2. 确认监控系统可观测 Service 请求指标和 Endpoints 状态
 
-**演练步骤**：
-1. 记录应用 A 的 Service 当前 selector 配置
-2. **先武装定时自恢复，再注入**（基线捕获 → 武装定时器 → 注入三步。恢复命令幂等：定时器到期
+**演练步骤**（主路径 = 载体配方经 `faultdrill_assemble_carrier` 一次调用执行；手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
+1. 基线捕获：记录应用 A 的 Service 当前 selector 配置（restorePatches 的基线值来源，两条路径共用）：
+   ```bash
+   kubectl get svc <service-name> -n <namespace> -o jsonpath='{.spec.selector}'
+   ```
+2. 调用 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Service、target_name=<service-name>、target_namespace=<namespace>、patches=<不匹配 selector 的 replace>、restore_patches=<基线 selector 的 replace>、duration_seconds=<duration>）——工具内同步完成建栈+验权+武装+注入+readback，回执 status=success 即注入落地且载体已武装；status=partial = 载体已武装但注入未确认，勿重建载体，用 `blade-ai recover` 提前收敛
+3. 观察 Endpoints 变化和服务可用性
+
+**降级兜底（装配器不可用时，SOP 手动序列）**：
+1. **先武装定时自恢复，再注入**（基线捕获 → 武装定时器 → 注入三步。恢复命令幂等：定时器到期
    自动恢复为主，Agent 在演练结束时主动执行同一条命令兜底，定时器迟到重复执行无副作用。定时器
    shell 逻辑必须作为 `kubectl exec` 载体载荷派发——直接以 `sh -c '…'` 作为顶层命令派发会被
    命令守卫拦截（unknown_binary: sh），载体内 `sh -c` 同时解决 exec-form 通道不解释裸
@@ -68,8 +64,6 @@ spec:
    恢复脚本落盘形态按 recovery-carrier.md 第七节「四档定案表」按明文字节数查表选定
    （Phase 2 无 base64 生成器，勿留 <restore-b64> 占位符或手算 b64 长度）：
    ```bash
-   # 基线捕获：Agent 读取输出并记录原始 selector（定时器与主动恢复均使用）
-   kubectl get svc <service-name> -n <namespace> -o jsonpath='{.spec.selector}'
    # 武装定时自恢复（"注入恢复"第 1 步命令按第七节四档表选定落盘形态；下行为旧契约历史形态示例，勿套用）
    kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'echo <restore-b64> | base64 -d > /tmp/blade-restore-selector.sh; ( sleep <duration>; sh /tmp/blade-restore-selector.sh ) >/tmp/restore.log 2>&1 & echo armed'
    # 篡改 selector 注入（json patch replace 整体替换——与恢复段同形态对称。勿用 strategic merge patch：
@@ -79,7 +73,6 @@ spec:
      -p='[{"op":"replace","path":"/spec/selector","value":{"app":"non-existent-app"}}]'
    ```
    倒计时从武装时刻起算：先校验后武装、与注入紧邻（≤60s）；武装后发生任何修复须先 `kubectl exec <载体Pod> -n <载体命名空间> -- sh -c 'pkill -f blade-restore-selecto[r]; true'` 停旧定时器再全额重武装（见 SKILL.md 安全红线「故障窗口完整」）
-3. 观察 Endpoints 变化和服务可用性
 
 **注入验证**：
 1. 执行 `kubectl get endpoints <service-name>`，确认 Endpoints 列表为空（无子集）。patch 后
@@ -89,12 +82,12 @@ spec:
 3. 执行 `kubectl get pods -l app=<原标签>`，确认 Pod 实际正常运行
 4. 对比 Service selector 与 Pod labels，确认不匹配
 
-**注入恢复**：
-1. 等待 `<duration>` 到期，定时器自动将 selector 整体替换回基线；演练提前结束时由 Agent 主动
-   执行同一条恢复命令（幂等，定时器迟到再执行一次无副作用。注意用 json patch 的 `replace`
+**注入恢复**（主路径下恢复无需 Agent 执行动作——载体 TTL 自治 fire）：
+1. 等待 `<duration>` 到期，载体自治将 selector 整体替换回基线（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle，可查不静默）；演练提前结束时执行 `blade-ai recover` 从台账重放同源配方提前收敛（幂等，与载体双执行——先到先收敛、后到读回 no-op）。恢复语义注意用 json patch 的 `replace`
    而非 strategic merge patch——后者对 map 是键级合并，若注入期间键集变化会残留多余键导致
-   selector 永久不匹配）：
+   selector 永久不匹配（装配器与载体 REST 载荷均按 replace 构造，此陷阱仅手动降级路径需自防）：
    ```bash
+   # 降级兜底路径的手动恢复命令（主路径无需执行）
    kubectl patch svc <service-name> -n <namespace> --type='json' \
      -p='[{"op":"replace","path":"/spec/selector","value":<基线捕获的原始 selector JSON>}]'
    ```

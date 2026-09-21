@@ -15,6 +15,17 @@
 > ```
 >
 > 以该输出的 `Available Commands` 为准。本文件后续标注「可用性以当次探测为准」的地方，都是指这件事。
+>
+> **⚠️ 探测的二进制 ≠ 执行的二进制**
+>
+> k8s 域命令的实际执行位置是**集群内 tool pod 里的 blade**，与本地 CLI 的 blade 是不同
+> 构建；python 域命令走进程内 agent 通道，不经本地 CLI flag 解析。因此**本地 `-h` 探测
+> 的结果对执行环境只有参考意义**——本地没有某 action 不代表执行环境没有（反之亦然），
+> 最终以执行环境侧的探测为准。实测本地 fork（v1.9.0-alpha）裁剪了以下链（本地 Flags
+> 区为空壳，无法携带参数）：`pod-network delay/corrupt/duplicate/reorder`、
+> `node-network delay`、`container-network delay`、`python http/kafka/mysql/redis throw`；
+> 同族 `dns`/`drop`/`occupy` 满血。无某链的构建走 Tier 2 tc qdisc 载体替代
+> （见 `src/chaos_agent/knowledge/chaosblade-cli.md`）。
 
 ---
 

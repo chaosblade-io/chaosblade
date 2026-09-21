@@ -1,19 +1,18 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 缩回基线副本数），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2/ND9）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 缩回基线副本数），但装配器主路径
+# 对本 case 结构性死锁——装配器载体 TTL 恢复载荷经 https://kubernetes.default.svc
+# 域名直连 apiserver，该域名解析依赖本故障摧毁的集群 DNS：注入前时段验权/武装/
+# 注入全部可达且成功（装配器如实报告 success），窗口到期载体内恢复 curl 必解析
+# 失败——表面自治、实际死锁。本 case 不经装配器，恢复走正文降级 SOP（集群内
+# 工具 Pod kubectl 定时器——kubectl in-cluster 走 KUBERNETES_SERVICE_HOST IP
+# 字面量，不经集群 DNS——+ 带外恢复双通道），属 recovery-carrier spec「降级
+# 路径」回落 agent-online 恢复的结构性形态，恢复闭环不缺失。
 recovery_channel: apiserver-write
-# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
-# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
-# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
-# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
-mechanism_writes:
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: kube-system
-    name_prefix: "fd-"
+# 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
+# 自身（patch Deployment replicas 属受害者域内，名字匹配放行），无跨对象写
+# 条目；降级 SOP 的定时器宿主复用集群既有工具 Pod（不新建 k8s 对象），无立法
+# 条目。
 ---
 
 **用例名称** CoreDNS异常 导致 Pod_网络故障
@@ -26,34 +25,27 @@ action——`pod-process kill` 杀掉 CoreDNS 进程后 Deployment 控制器秒�
 CoreDNS 是**集群级依赖**（缩零期间全集群 DNS 解析瘫痪），窗口应取小值（如 120 秒）。
 ⚠️ **通道依赖死锁（硬性前置）**：若控制通道本身依赖集群 DNS（如有的执行链路在命令执行前就要解析外部域名上传工件，解析走的正是集群 DNS），CoreDNS 缩零后**一切经该通道的命令——包括定时器武装与所有恢复命令——都不可达**，形成拓扑死锁。因此：定时器必须在注入前武装完毕，**且**必须存在不依赖集群 DNS 的带外恢复手段（直连 kubeconfig/控制台手动）；无带外手段时不得注入本用例。
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 缩回基线副本数；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**恢复动作配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 缩回基线副本数。**装配器主路径对本 case 结构性死锁**——装配器载体 TTL 恢复载荷经 `https://kubernetes.default.svc` 域名直连 apiserver，Pod 内该域名解析走 kube-dns service → CoreDNS，正是本故障摧毁的链路：注入前时段验权 GET/武装/注入全部可达且成功（装配器如实报告 success），窗口到期载体内恢复 curl 必解析失败——**表面自治、实际死锁**，比 fail-closed 拒绝更隐蔽。本配方不经装配器，作为正文降级 SOP（先武装后注入硬序）与 Agent 主动兜底/恢复验证的权威动作清单：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: Deployment
-    name: <coredns-deployment>
-    namespace: kube-system
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  - op: replace
-    path: /spec/replicas
-    value: 0
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  - op: replace
-    path: /spec/replicas
-    value: <基线副本数>
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+targetRef:                                # 靶（kube-system 基础设施对象）
+  kind: Deployment
+  name: <coredns-deployment>
+  namespace: kube-system
+patches:                                  # 注入域（json-patch 语义；实际经 kubectl scale 执行）
+- op: replace
+  path: /spec/replicas
+  value: 0
+restorePatches:                           # 恢复域：Agent 主动兜底动作清单（自治承载于正文工具 Pod kubectl 定时器，非载体 TTL）
+- op: replace
+  path: /spec/replicas
+  value: <基线副本数>
+durationSeconds: <duration>               # 演练窗口（正文定时器 sleep 参数；CoreDNS 集群级依赖，取小值如 120 秒）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
-- 目标是 kube-system 基础设施对象：targetRef.namespace 写 kube-system，CR 本体仍落 victim ns（metadata.namespace 两者独立，均须显式）。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- **装配器死锁根因（与正文定时器通路的本质差异）**：不是 kind 不支持（Deployment 在装配器支持域内），而是恢复通道拓扑——装配器载体内 timer 以 curl 直连域名形态回连 apiserver，域名解析依赖集群 DNS；正文工具 Pod 定时器的 kubectl 走 in-cluster 配置的 `KUBERNETES_SERVICE_HOST` IP 字面量（kubelet 注入的环境变量），不经集群 DNS——同一条「载体内自恢复」路径，API 地址形态的差别决定 DNS 全瘫下的生死。
+- 目标是 kube-system 基础设施对象：targetRef.namespace 写 kube-system；降级 SOP 定时器宿主复用集群既有工具 Pod（不新建 k8s 对象），宿主探测见资源准备第 4/5 条。
+- 恢复由正文定时器承载（`kubectl scale` 幂等）：定时器到期自动恢复为主，演练提前结束时 Agent 主动执行同一条恢复命令兜底，Agent 死亡后 `blade-ai recover` 从任务台账重放（恢复命令幂等）——不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. Pod 内 DNS 解析失败，应用报 `Name or service not known` 或 `NXDOMAIN` 错误
@@ -89,7 +81,7 @@ spec:
    返回 no 则定时器方案不可用——按资源准备第 4 条不得注入，任务如实失败收尾；故障已落地则靠带外 `blade-ai recover --task-id` 或控制台手动 scale（仅限控制通道不依赖集群 DNS 的环境）
 6. ⚠️ **带外恢复手段确认（无则不得注入）**：确认存在一条不依赖集群 DNS 的恢复路径——如直连集群的 kubeconfig（`kubectl scale` 走 API server IP，不依赖集群 DNS）或控制台手动改副本数。控制通道若依赖集群 DNS（如任务封装需在命令执行前解析外部域名），故障一旦落地，经该通道的任何恢复命令（含定时器武装、盲发重放）都会在执行前失败——无带外手段时本用例**禁止注入**。反之，若控制通道是直连 kubeconfig（不经依赖集群 DNS 的任务封装），本条件天然满足：集群内定时器的 kubectl 走 in-cluster 配置的 IP 字面量（KUBERNETES_SERVICE_HOST），带外恢复走本机 resolver，两者均不经集群 DNS，故障期间照常可达，定时器+带外恢复双通道有效
 
-**演练步骤**：
+**演练步骤**（本 case 无装配器主路径——装配器载体 TTL 恢复对本 case 结构性死锁（见恢复动作配方标题），正文降级 SOP 即主路径；时序硬律不变：步骤 1 基线捕获（restorePatches 基线值来源）→ 资源准备第 4/5 条载体探测与 RBAC 前置 + 第 6 条带外恢复确认 → 步骤 2 先武装定时器、再缩零注入，武装与注入紧邻下发）：
 1. 记录注入前基线：
    ```bash
    kubectl get deployment <coredns-deployment> -n kube-system -o jsonpath='{.spec.replicas}'
@@ -135,7 +127,7 @@ spec:
    的 replicas 与事件后如实报告
 2. 窗口中段在应用 Pod 内复查一次 DNS 解析仍失败（同注入验证第 2 条形态）
 
-**注入恢复**：
+**注入恢复**（自治承载 = 正文工具 Pod 定时器——kubectl in-cluster 走 KUBERNETES_SERVICE_HOST IP 字面量，不经集群 DNS，CoreDNS 全瘫期间照常可达；Agent 在线兜底 = 主动执行同一条 scale 命令（幂等）；Agent 死亡 = 带外 `blade-ai recover` / 控制台手动。⚠️ 装配器载体 TTL 形态对本 case 死锁（域名解析依赖被本故障摧毁的集群 DNS），严禁以装配器承载本 case 恢复）：
 1. 等待 `<duration>` 到期，定时器自动将副本数恢复为基线；演练提前结束时由 Agent 主动执行
    同一条恢复命令（幂等，定时器迟到再执行一次无副作用）：
    ```bash

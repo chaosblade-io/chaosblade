@@ -72,7 +72,30 @@ _EXEMPLAR_CASE = "Pod_ContainerCreating_无效挂载选项注入.md"
 # Legitimate exemptions: basename -> reason. Empty today — the socat-timer
 # case (Node_网络故障_节点端口占用) carries no carrier signature and is
 # naturally out of scope. Add ONLY with a written reason.
-_VEHICLE_TEARDOWN_EXEMPT: dict[str, str] = {}
+_VEHICLE_TEARDOWN_EXEMPT: dict[str, str] = {
+    # M2 (openspec faultdrill-cluster-native-recovery, task 2.5): these
+    # cases carry the ``drill-rc-`` signature ONLY via the assembler
+    # carrier-stack note (frontmatter legislation header + recipe title —
+    # "SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash> 四件套"). That
+    # stack is built programmatically INSIDE the faultdrill_assemble_carrier
+    # tool (design ND3: it never rides the LLM write face) and its teardown
+    # is structural — the tool's fail-closed path and the recovery handle's
+    # cleanup chain both execute it, so there is no tail-step knowledge a
+    # case body needs to transmit. Their degraded-path timer host is an
+    # EXISTING tool Pod (armed via kubectl exec), not a self-built RBAC
+    # stack — nothing self-revoking to teach. Signature without a stack to
+    # tear down; the exemption names that shape.
+    "Pod_CPU_Throttling_limits.cpu过低.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "Pod_CrashLoopBackOff_LivenessProbe配置不合理.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "Pod_CrashLoopBackOff_StartupProbe配置不足.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "Pod_OOM内存异常_limit单位写错.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "Pod_Terminating_Finalizers未清理.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "Pod_镜像拉取失败_凭证缺失或过期.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "Pod_镜像拉取失败_镜像不存在或标签错误.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "Service_调用失败_ReadinessProbe配置不一致.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "Service_调用失败_selector不匹配.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+    "workload_副本被缩容_人为误操作.md": "assembler-note-only signature; degraded host is an existing tool Pod",
+}
 
 # The merged self-revoke flag strings (F-A propagation vector): a case
 # teaching the model to fold these into ``kubectl create role/clusterrole``

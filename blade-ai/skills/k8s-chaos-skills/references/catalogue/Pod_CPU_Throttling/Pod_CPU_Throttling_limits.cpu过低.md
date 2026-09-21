@@ -1,51 +1,40 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 CPU limits），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 CPU limits），路由进程序化
+# 恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+武装+
+# 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
+# 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
-# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
-# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
-# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
-# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
-mechanism_writes:
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: default
-    name_prefix: "fd-"
+# 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
+# 自身（patch Deployment 模板的 resources 属受害者域内，名字匹配放行），无跨
+# 对象写条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash>
+# 四件套）由工具内程序化构建——构造保证 + fail-closed 内嵌检查（RBAC 从
+# restorePatches 同源推导禁通配、SA 真实 token 验权 403 中止+清理），不经 LLM
+# kubectl 写面，无立法条目。
 ---
 
 **用例名称** limits.cpu过低 导致 Pod_CPU_Throttling
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 CPU limits；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 CPU limits；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；装配不可用时降级正文 SOP 形态）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: Deployment
-    name: <deployment-name>
-    namespace: <namespace>
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  - op: replace
-    path: /spec/template/spec/containers/0/resources/limits/cpu
-    value: <过低的 limits.cpu 值>
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  - op: replace
-    path: /spec/template/spec/containers/0/resources/limits/cpu
-    value: <注入前记录的基线值>
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
+  kind: Deployment
+  name: <deployment-name>
+  namespace: <namespace>
+patches:                                  # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+- op: replace
+  path: /spec/template/spec/containers/0/resources/limits/cpu
+  value: <过低的 limits.cpu 值>
+restorePatches:                           # 恢复域：载体 TTL 到点自治执行；Agent 死亡后 recover 从台账重放同源
+- op: replace
+  path: /spec/template/spec/containers/0/resources/limits/cpu
+  value: <注入前记录的基线值>
+durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
 - 多容器 Pod 调整 containers/N 索引至目标容器；滚动由 patch 自动触发。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（chaosblade CPU 负载注入/销毁）保留为 execute 计划普通步骤。
 
 **故障现象**：
 1. Pod 内进程频繁被内核 CPU 节流（throttle），`cpu.stat` 中 `nr_throttled` 持续增长
@@ -56,7 +45,7 @@ spec:
 1. 确认应用 A 已正常运行，且 Pod 配置了 resources.limits.cpu
 2. 确认监控系统可观测 Pod CPU 使用率及 throttle 指标
 
-**演练步骤**：
+**演练步骤**（主路径 = 基线捕获（步骤 2 前半的 limits 读取，restorePatches 的基线值来源，两条路径共用）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=Deployment、patches=limits.cpu 调低、restorePatches=基线还原、duration_seconds=<duration>），注入+武装+readback 工具内同步完成 → chaosblade CPU 负载注入（步骤 3，execute 计划普通步骤，两条路径共用）；步骤 2 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 1. 定位应用 A 的 Deployment，并记录其 CPU limits 原始值
 2. **先武装定时自恢复，再注入**（先捕获原始 CPU limits 并武装定时器，再注入。恢复命令幂等：
    定时器到期自动恢复为主，Agent 在演练结束时主动执行同一条命令兜底，定时器迟到重复执行无
@@ -86,7 +75,7 @@ spec:
 2. `kubectl top pod <pod-name> -n <namespace>` 确认 Pod CPU 使用率接近 limits
 3. （可选，仅当演练方提供了应用访问入口时）确认请求延迟显著增大；无入口时上述 throttling 与 CPU 证据成立即可判定
 
-**注入恢复**：
+**注入恢复**（主路径下 limits 还原无需 Agent 执行动作——载体 TTL 自治还原 CPU limits 基线（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。chaosblade 负载销毁（第 1 条）为非 patch 域动作，保留为 execute 计划普通步骤，两条路径共用。第 2 条手动命令为降级兜底形态）：
 1. 销毁 chaosblade CPU 负载实验（见演练步骤 3 的实验 UID）
 2. 等待 `<duration>` 到期，定时器自动将 CPU limits 还原为基线；演练提前结束时由 Agent 主动
    执行同一条恢复命令（幂等，定时器迟到再执行一次无副作用）：

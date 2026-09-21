@@ -1,51 +1,40 @@
 ---
-# 恢复通道路由声明（openspec faultdrill-cr-channel，design D3 第一源）：
-# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 ConfigMap 配置值），路由进 FaultDrill
-# CR 通道；CRD 不可装时降级正文 recovery-carrier SOP 路径。
+# 恢复通道路由声明（openspec faultdrill-cluster-native-recovery，design ND2）：
+# 本 case 恢复动作住址 = apiserver 写（逆 patch 还原 ConfigMap 配置值），路由进程序化
+# 恢复载体装配器（faultdrill_assemble_carrier 工具一次调用：建栈+验权+武装+
+# 注入+readback 工具内同步完成）；装配不可用（镜像不可拉/节点不容纳/RBAC
+# 不可授/验权 403）时降级正文 recovery-carrier SOP 路径。
 recovery_channel: apiserver-write
-# 机制写入集立法（write-set approval contract）：CR 通道本体（FaultDrill CR）
-# 落 victim ns（P10 显式写入），scope 在受害者覆盖与同 ns secondary 网之外——
-# 写集准入唯一路径 = 本条目；CR 名 = fd-<任务派生短哈希>（前缀与正文 CR 模板
-# 同源默认值），走 name_prefix 动态形态；条目 ns 与本 case 演练窗口 ns 对齐。
-mechanism_writes:
-  # CR 通道本体（FaultDrill CR 落 victim ns——P10 显式写入；名 = fd-<任务派生
-  # 短哈希>，前缀与正文 CR 模板同源默认值）：scope 在受害者覆盖与同 ns secondary
-  # 网之外，写集准入唯一路径 = 本立法条目（guard 3.6 mechanism-entries 分支）
-  - scope: faultdrill
-    namespace: default
-    name_prefix: "fd-"
+# 机制写入集立法（write-set approval contract）：本 case 故障机制只需写受害者
+# 自身（patch ConfigMap 的 data 键值属受害者域内，名字匹配放行），无跨对象写
+# 条目；装配器载体栈（SA/Role/RoleBinding/裸 Pod 同名 drill-rc-<hash> 四件套）由工具
+# 内程序化构建——构造保证 + fail-closed 内嵌检查（RBAC 从 restorePatches 同源
+# 推导禁通配、SA 真实 token 验权 403 中止+清理），不经 LLM kubectl 写面，无立
+# 法条目。
 ---
 
 **用例名称** 关键配置被篡改 导致 ConfigMap_内容错误
 
-**CR 通道模板**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 ConfigMap 配置值；planning 优先路由 FaultDrill CR 通道，CRD 不可装时降级正文 SOP 形态）：
+**载体配方**（`recovery_channel: apiserver-write`——恢复动作住址 = apiserver 写：逆 patch 还原 ConfigMap 配置值；主路径经程序化装配器 `faultdrill_assemble_carrier` 一次调用执行——LLM 从本配方取参（靶标三元组/patches/restorePatches/durationSeconds），工具内确定性完成：基线校验（restorePatches 值对账活体对象，基线漂移即中止）→ 载体栈（SA/Role/RoleBinding/裸 Pod 同名 `drill-rc-<hash>`，RBAC 从 restorePatches 同源推导禁通配）→ SA 真实 token 验权 → 两步 exec 武装（倒计时从武装时刻起算）→ 同步注入 patch 靶标 → landing readback；任一步失败 fail-closed 清理已建对象并如实报告；装配不可用时降级正文 SOP 形态）：
 
 ```yaml
-apiVersion: drill.blade-ai.io/v1alpha1   # 组名可配（faultdrill_crd_group）
-kind: FaultDrill
-metadata:
-  name: fd-<任务派生短哈希>               # 前缀可配（faultdrill_name_prefix）；零演练签名词根
-  namespace: <namespace>                  # 必须显式写入——见下方 P10 条款
-spec:
-  action: specPatch
-  targetRef:
-    kind: ConfigMap
-    name: <configmap-name>
-    namespace: <namespace>
-  patches:                                # 注入域（json-patch，value 任意 JSON 形态逐字保留）
-  - op: replace
-    path: /data/<目标配置键>
-    value: <篡改后的配置值>
-  restorePatches:                         # 恢复域：调和器 TTL 到点执行；Agent 死亡后 recover 重放同源
-  - op: replace
-    path: /data/<目标配置键>
-    value: <注入前记录的基线配置值>
-  durationSeconds: <duration>             # TTL 从 Injected 相位起算，取正文演练窗口同值（宁宽勿窄）
+targetRef:                                # 靶标（装配器 target_kind/name/namespace 参数）
+  kind: ConfigMap
+  name: <configmap-name>
+  namespace: <namespace>
+patches:                                  # 注入域（json-patch，value 任意 JSON 形态逐字保留）
+- op: replace
+  path: /data/<目标配置键>
+  value: <篡改后的配置值>
+restorePatches:                           # 恢复域：载体 TTL 到点自治执行；Agent 死亡后 recover 从台账重放同源
+- op: replace
+  path: /data/<目标配置键>
+  value: <注入前记录的基线配置值>
+durationSeconds: <duration>               # TTL 从武装时刻起算，取正文演练窗口同值（宁宽勿窄）
 ```
 
-- **P10 立法（namespace 显式写入）**：`metadata.namespace` 必须显式写入（victim ns；stealth 配置 ops ns 时写 ops ns）——恢复句柄水合链是 manifest ns > `-n` flag > context default，不读 settings 落位字段；省略则 CR 落位与恢复句柄错位（句柄指向配置 ns 而 CR 实落默认 ns），recover get NotFound 误判实验丢失。
-- 配置生效触发（Pod 重启或应用 reload）保留为 execute 计划普通步骤。
-- 恢复由通道调和承载（restorePatches），不再武装 recovery carrier timer（恢复语义单一来源）；非 patch 域动作保留为 execute 计划普通 kubectl 步骤。
+- 配置生效触发（Pod 重启或应用 reload——注入侧与恢复侧均需要，见注意事项「只 patch 不 rollout 故障不显形」）保留为 execute 计划普通步骤。
+- 恢复由载体 TTL 自治承载（restorePatches）：配方随注入写进任务台账 fault_handle，Agent 死亡后 `blade-ai recover` 从台账重放同源配方（与载体幂等双执行——先到先收敛、后到读回 no-op）；演练提前结束时 recover 即提前收敛，不再由 LLM 武装 recovery carrier timer（恢复语义单一来源）。非 patch 域动作（rollout restart）保留为 execute 计划普通 kubectl 步骤。
 
 **故障现象**：
 1. 应用滚动更新后读取到错误的配置值（环境变量或挂载文件内容异常）
@@ -81,11 +70,11 @@ spec:
    kubectl delete sa drill-rc-<hash> -n <namespace> --ignore-not-found
    ```
 
-**演练步骤**：
+**演练步骤**（主路径 = 基线捕获（步骤 1）→ 调 `faultdrill_assemble_carrier`（参数取自载体配方：target_kind=ConfigMap、patches=data 键篡改、restorePatches=基线还原、duration_seconds=<duration>），CM 注入+武装+readback 工具内同步完成 → rollout restart 使新值生效（步骤 3 后半，execute 计划普通步骤，两条路径共用）；步骤 2-3 的手动序列仅当装配器 fail-closed 报告不可用时作降级兜底）：
 
-> **爆炸半径分类（定案）**：`target-only`——被修改的既有资源仅靶 Deployment 自身（CM、载体四件套均为演练新建资产，不触及任何既有非靶资源；新建资产不构成"影响其他资源"，与既有节点 taint 的 cluster-wide 场景不同），勿纠结是否升格。
+> **爆炸半径分类（定案）**：`target-only`——被修改的既有资源仅靶 ConfigMap 自身（env 接线、载体四件套均为演练新建资产，不触及任何既有非靶资源；新建资产不构成"影响其他资源"，与既有节点 taint 的 cluster-wide 场景不同），勿纠结是否升格。
 
-1. **基线捕获**：记录 ConfigMap 原始键值与当前生效值（定时器与主动恢复均使用）
+1. **基线捕获**：记录 ConfigMap 原始键值与当前生效值（restorePatches 的基线值来源，两条路径共用）
    ```bash
    kubectl get cm <cm-name> -n <namespace> -o jsonpath={.data.<KEY>}
    kubectl exec <app-pod> -n <namespace> -c <container> -- printenv <KEY>
@@ -116,7 +105,7 @@ spec:
 2. 行为复查：Pod 内 `printenv <KEY>` 仍为错误值（env 在 Pod 启动时固化，存量 Pod 不会自行重载）
 3. 稳定性复查：目标 Pod RESTARTS 计数无增长（排除应用侧 crash 自愈路径；本故障为配置型，无调度类周期事件可查——白盒字段在位即故障在位，事件探针不适用）
 
-**注入恢复**：
+**注入恢复**（主路径下 CM 还原无需 Agent 执行动作——载体 TTL 自治还原 ConfigMap data（fire 证据落载体 `/tmp/restore.log` + 任务台账 recovery_handle）；演练提前结束时 `blade-ai recover` 从台账重放同源配方提前收敛，与载体幂等双执行。配置生效触发（rollout restart）为非 patch 域动作，走 execute 计划普通步骤在载体 fire 后执行。以下手动命令为降级兜底形态）：
 1. 等待 `<duration>` 到期，定时器自动还原 ConfigMap 并触发滚动（两条 merge-patch curl：configmap data 还原基线值 + deployment restartedAt 注解触发第二次滚动）；演练提前结束时由 Agent 主动执行同一组恢复命令（幂等，定时器迟到再执行一次无副作用）：
    ```bash
    kubectl patch cm <cm-name> -n <namespace> --type merge -p '{"data":{"<KEY>":"<baseline-value>"}}'
