@@ -42,6 +42,12 @@ TOOL_PROFILE: dict[str, str] = {
     "blade_python_create": PROFILE_HOST,
     "blade_python_prepare": PROFILE_HOST,
     "blade_python_revoke": PROFILE_HOST,
+    # The faultdrill recovery-carrier assembler rides the kubectl face
+    # (every command goes through the provider's `_kubectl` → transport
+    # layer) and its owning provider accepts ONLY the k8s profile — same
+    # single-profile shape as the kubectl entries above
+    # (faultdrill-cluster-native-recovery M1).
+    "faultdrill_assemble_carrier": PROFILE_K8S,
 }
 
 

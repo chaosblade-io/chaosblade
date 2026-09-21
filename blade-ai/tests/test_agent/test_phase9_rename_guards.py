@@ -628,6 +628,16 @@ _PHASE11_PROVIDER_IMPORT_ALLOWLIST = {
      "chaos_agent.agent.providers.faultdrill.provider"),
     ("agent/providers/registry.py",
      "chaos_agent.agent.providers.faultdrill.declaration"),
+    # faultdrill-cluster-native-recovery M1（2026-09）：程序化装配器的
+    # 镜像允许集与构造形态自检经 registry 垂直路由接缝取 canonical
+    # classifier（_recovery_carrier_allowed_images /
+    # _is_recovery_carrier_run）——装配器构造保证与 classifier 判面
+    # 单源永不漂移是显式设计决策（assembler.py docstring；载体子包
+    # 不横向伸手，phase-14 G3 pattern），lazy、call-time-only，与
+    # chaosblade.verify 接缝条目及 tools/guard.py classifier 委托同型
+    # 入册。
+    ("agent/providers/registry.py",
+     "chaos_agent.agent.providers.k8s_native.classifier"),
 }
 
 #: providers 目录下的平铺通用文件（通用仲裁 + 载体中立扫描原语）——

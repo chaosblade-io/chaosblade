@@ -85,7 +85,10 @@ from chaos_agent.agent.target_guard import (
     freeze_approved_target_from_spec,
     infer_effective_target,
 )
-from chaos_agent.agent.target_guard.mechanism_writes import entries_from_list
+from chaos_agent.agent.target_guard.mechanism_writes import (
+    RECOVERY_CHANNEL_APISERVER_WRITE,
+    entries_from_list,
+)
 from chaos_agent.agent.target_guard.carriers import (
     LIVE_DISCOVERY_RETRYABLE_REASONS,
     CarrierResolution,
@@ -205,7 +208,7 @@ async def _resolve_exec_pod_node(
         TransportTarget,
         execute_via_transport,
     )
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
 
     kubeconfig = str(state.get("kubeconfig") or "")
     node = ""
@@ -280,7 +283,7 @@ async def _resolve_label_pod_names(
         TransportTarget,
         execute_via_transport,
     )
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
 
     kubeconfig = str(state.get("kubeconfig") or "")
     selector = ",".join(f"{k}={v}" for k, v in sorted(labels.items()))
@@ -347,35 +350,73 @@ def _identity_matches_approved(
 
 
 # Vehicles whose presence underwrites an object-write injection's
-# bounded recovery: the recovery-carrier Pod (timer host for the precise
-# rollback of API-plane faults on STOCK assets) plus the drill-occupancy
-# forms (task-built targets whose cleanup record deletes the asset — and
-# the fault riding it — wholesale). A ``debug_pod`` is a PROBE channel,
-# not a recovery underwriter, and is deliberately excluded.
+# bounded recovery, split by RECOVERY MODEL:
+#   - ``recovery_carrier`` — a self-built timer host that patches a
+#     PRE-EXISTING (stock) target back. Its recovery is the ARMED timer's
+#     restore payload, so only ``recovery_armed`` underwrites; a bare
+#     ``sleep N`` skeleton restores nothing (run6 inject-3d5de7fa).
+#   - the drill-occupancy forms (``occupant_pod`` / ``occupant_deployment``)
+#     — task-BUILT targets whose cleanup record deletes the asset, and the
+#     fault riding it, wholesale. Teardown-by-deletion needs no timer, so an
+#     ``active`` registration already underwrites recovery.
+# A ``debug_pod`` is a PROBE channel, not a recovery underwriter, and is
+# deliberately excluded.
 _RECOVERY_UNDERWRITER_TYPES: frozenset[str] = frozenset(
     VEHICLE_ARTIFACT_TYPES - {"debug_pod"},
 )
+_RECOVERY_CARRIER_TYPE = "recovery_carrier"
+_TEARDOWN_UNDERWRITER_TYPES: frozenset[str] = frozenset(
+    _RECOVERY_UNDERWRITER_TYPES - {_RECOVERY_CARRIER_TYPE},
+)
 
 
-def _recovery_vehicle_registered(
+def _underwrites_bounded_recovery(a: dict[str, Any]) -> bool:
+    """Whether one registered vehicle artifact underwrites a bounded recovery.
+
+    Recovery-model split (see ``_RECOVERY_UNDERWRITER_TYPES``): a carrier
+    must be ARMED (``recovery_armed``); a task-built drill occupant
+    underwrites at ``active`` because its recovery is wholesale deletion.
+    ``cleaned`` never counts — the vehicle is gone, and a fresh injection
+    would again run un-recovered.
+    """
+    atype = a.get("type")
+    status = a.get("status")
+    if status == "cleaned":
+        return False
+    if atype == _RECOVERY_CARRIER_TYPE:
+        return status == "recovery_armed"
+    if atype in _TEARDOWN_UNDERWRITER_TYPES:
+        return status in ("active", "recovery_armed")
+    return False
+
+
+def _recovery_vehicle_armed(
     vehicle_cache: dict[str, Any], state: AgentState,
 ) -> bool:
-    """A recovery-underwriter vehicle is registered (armed or active).
+    """A recovery-underwriter vehicle can still reverse the fault.
 
     Reads the screening round's cache FIRST — the carrier ``run`` branch
     and the occupant registration register their artifacts at ALLOW time
     (screening precedes execution), so a same-batch vehicle + injection
-    pair sees the registration even before the state delta lands. Status
-    ``cleaned`` does not count: the vehicle is gone, and a fresh
-    injection would again run un-armed.
+    pair sees the registration even before the state delta lands.
+
+    The per-artifact verdict is :func:`_underwrites_bounded_recovery`: a
+    ``recovery_carrier`` counts ONLY when ``recovery_armed`` — a carrier pod
+    sitting on its bare ``sleep N`` skeleton is registered but its timer host
+    carries no restore payload, so it will never reverse the fault (run6
+    inject-3d5de7fa: a bare-sleep carrier passed the old ``active``-tolerant
+    face and the selector patch landed permanently unrecovered; the
+    ``recovery_armed`` status is stamped by an ARMING EXEC into the carrier
+    whose payload carries a timer form, see execution_artifacts
+    ``_mark_recovery_armed``). A task-built drill occupant still underwrites
+    at ``active`` — its cleanup deletes the asset and the fault wholesale, so
+    it needs no timer.
     """
     artifacts = vehicle_cache.get(
         "execution_artifacts", state.get("execution_artifacts") or [],
     )
     return any(
-        isinstance(a, dict)
-        and a.get("type") in _RECOVERY_UNDERWRITER_TYPES
-        and a.get("status") in ("active", "recovery_armed")
+        isinstance(a, dict) and _underwrites_bounded_recovery(a)
         for a in artifacts
     )
 
@@ -429,6 +470,19 @@ def _carrier_family_in_write_set(approved: ApprovedTarget) -> bool:
 
 def _declared_verbs_in_symmetric_revert_domain(approved: ApprovedTarget) -> bool:
     """Do the frozen intent verbs land in the symmetric-revert carrier's vocabulary?
+
+    FALLBACK PROXY (D3 source 3's temporary M2 stand-in — tasks.md 2.4:
+    the gate could not depend on case metadata that M3 task 3.1 had not
+    written yet). The caller consults the frozen snapshot's explicit
+    ``recovery_channel`` declaration FIRST and only reaches this proxy
+    when no declaration exists: the proxy classifies by TAXONOMY VERBS,
+    and a k8s-native mechanism whose verbs happen to land in the blade
+    vocabulary (NXDOMAIN: target=network action=dns — blade's dns action
+    is a HIJACK to an IP, it has no rcode forgery) is symmetric-revert
+    UNreachable despite the verb hit (run8 inject-2a8cd99a: the proxy's
+    rejection deadlocked the executor — the suggested blade route had no
+    equivalent action). Only the case legislation can distinguish the
+    two; the proxy stays as the no-declaration fallback.
 
     The ChaosBlade carrier vocabulary (cpu/mem/network/disk/process ×
     fullload/load/…) is the mechanical projection of the symmetric-revert
@@ -573,7 +627,7 @@ def _registered_recovery_carrier(
     """The registered recovery-carrier artifact named by an exec target.
 
     Cache-first with a STATE default (``get`` default-value form, same as
-    ``_recovery_vehicle_registered``): the cache key only ever lands
+    ``_recovery_vehicle_armed``): the cache key only ever lands
     populated (ALLOW-time registration), but the get-default form keeps
     the two readers' semantics identical — an empty cached list would
     shadow state under an ``or`` form, silently hiding registrations.
@@ -1815,10 +1869,17 @@ async def tool_screener(state: AgentState) -> dict:
                 # timer forms stay outside this first cut. Deliberately
                 # narrow elsewhere: command-mode exec/debug injections
                 # excluded (their timer forms are case-legislated, not
-                # structurally provable here), and a
-                # registered-but-not-yet-armed carrier passes (the arming
-                # exec lands one loop later; the receipt-bound evidence
-                # gate generalises this once per-step receipts exist).
+                # structurally provable here). The gate's underwriter test
+                # (:func:`_recovery_vehicle_armed`) splits by recovery model:
+                # a ``recovery_carrier`` (timer host patching a STOCK target
+                # back) must be ARMED (status ``recovery_armed``, stamped by
+                # the arming exec), NOT merely registered — a carrier sitting
+                # on its bare ``sleep N`` skeleton is refused until the arming
+                # exec lands (run6 inject-3d5de7fa: the old ``active``-tolerant
+                # face let a bare-sleep carrier through and the selector patch
+                # landed permanently unrecovered). A task-built drill occupant
+                # still underwrites at ``active``: its cleanup deletes the
+                # asset and the fault wholesale, so it needs no timer.
                 # A delete naming only task-registered vehicle assets is
                 # teardown, never an injection, and is exempt
                 # (:func:`_vehicle_delete_is_cleanup`, F1-C — the §6
@@ -1836,7 +1897,7 @@ async def tool_screener(state: AgentState) -> dict:
                     and tool_args.get("subcommand") in KUBECTL_WRITE_SUBCOMMANDS
                     and approved is not None
                     and _carrier_family_in_write_set(approved)
-                    and not _recovery_vehicle_registered(vehicle_cache, state)
+                    and not _recovery_vehicle_armed(vehicle_cache, state)
                     and not _vehicle_delete_is_cleanup(
                         tool_args, effective, vehicle_cache, state,
                     )
@@ -1845,23 +1906,34 @@ async def tool_screener(state: AgentState) -> dict:
                         verdict=GuardVerdict.REJECT_BANNED,
                         reason=(
                             "armed-before-inject: this object-write "
-                            "injection has no recovery vehicle registered "
-                            "— a kubectl-native fault carries no UID and "
-                            "no self-timeout, so issuing it now would arm "
-                            "no bounded recovery at all"
+                            "injection has no ARMED recovery vehicle (a "
+                            "carrier registered on a bare `sleep N` "
+                            "skeleton is not armed) — a kubectl-native "
+                            "fault carries no UID and no self-timeout, so "
+                            "issuing it now would leave no bounded recovery "
+                            "at all"
                         ),
                         effective=effective,
                         suggestion=(
-                            "Stack the recovery carrier FIRST "
-                            "(references/carrier/recovery-carrier.md: "
-                            "kubectl run drill-rc-* + imperative create for "
-                            "the RBAC family), arm its timer, THEN re-issue "
-                            "the injection; for a task-built target, staging "
-                            "it first underwrites recovery the same way (its "
-                            "registration carries the wholesale cleanup). If "
-                            "the carrier genuinely cannot be built, "
-                            "request_replan with kind=safety — an honest "
-                            "failure, not an un-armed injection."
+                            "Arm a recovery carrier BEFORE re-issuing this "
+                            "injection. (1) If none is stacked yet: kubectl "
+                            "run drill-rc-* --restart=Never --command -- "
+                            "sleep N + imperative create for the "
+                            "SA/Role/RoleBinding (recovery-carrier.md §1). "
+                            "(2) ARM its timer via exec — the bare sleep "
+                            "skeleton restores nothing: kubectl exec "
+                            "<carrier> -n <ns> -- sh -c '( sleep <window>; "
+                            "<restore: curl -X PATCH the target via the "
+                            "carrier SA token> ) >/tmp/restore.log 2>&1 & "
+                            "echo armed' — this stamps the carrier "
+                            "recovery_armed; the SA-token pre-auth and the "
+                            "exact restore form are in recovery-carrier.md "
+                            "§3-4 (knowledge: recovery-carrier-arming.md). "
+                            "Arm immediately before the fault lands; the "
+                            "countdown starts at arming. (3) THEN re-issue "
+                            "the injection. If the carrier genuinely cannot "
+                            "be armed, request_replan with kind=safety — an "
+                            "honest failure, not an un-armed injection."
                         ),
                     )
                     feedback = decision_to_feedback(decision)
@@ -1881,32 +1953,44 @@ async def tool_screener(state: AgentState) -> dict:
                 # fault_spec mechanically), and every upstream source can
                 # be wrong — the case author can mis-declare the channel,
                 # the planning prompt can be ignored. THIS gate is the
-                # programmatic fallback that does not trust either: the
-                # declared fault verbs landing in the ChaosBlade carrier
-                # vocabulary mean the fault is symmetric-revert reachable
-                # (blade destroy recovers it by experiment UID — zero
-                # apiserver writes), so the CR channel's
-                # declarative-restore machinery is the wrong route for it
-                # (spec scenario "零工坊 case 误路由被审批门拒绝").
+                # programmatic fallback that does not trust either — but
+                # it does trust the third programmatic source: the frozen
+                # snapshot's case-file ``recovery_channel`` declaration
+                # (D3 source 1, loaded by code from the settled case at
+                # freeze time — not an LLM input). Declaration first:
+                # ``apiserver-write`` admits the route (the case author
+                # legislated the recovery address; the verb-vocabulary
+                # proxy below is only the NO-declaration fallback, and
+                # run8 inject-2a8cd99a proved why — its taxonomy verbs
+                # target=network action=dns hit the blade vocabulary
+                # while the mechanism had no blade equivalent). Without
+                # a declaration, declared fault verbs landing in the
+                # ChaosBlade carrier vocabulary mean the fault is presumed
+                # symmetric-revert reachable (blade destroy recovers it by
+                # experiment UID — zero apiserver writes), so the CR
+                # channel's declarative-restore machinery is the wrong
+                # route for it (spec scenario "零工坊 case 误路由被审批门
+                # 拒绝"). The rejection reports the routing conflict
+                # WITHOUT prescribing a mechanism — whether a blade
+                # equivalent action exists is feasibility knowledge the
+                # planning layer has and this gate does not.
                 # Host-domain mis-routes never reach here structurally:
                 # a host-scope approval fails the guard's cross-profile
                 # check before this point. Only the CREATING verbs
                 # (apply/create) are gated — a delete/patch of the CR is
                 # the recovery / re-recipe path whose admission the
-                # manifest entries already govern. Dark launch: while
-                # faultdrill_enabled is False the channel's own guards
-                # (landing readback, session reconciler) are all
-                # short-circuited, so ANY CR apply in that window is an
-                # unguarded bare write — rejected outright regardless of
-                # verb domain (the pre-change behaviour for the same
-                # shape was a classifier kind-ban, so dark-launch parity
-                # holds: still rejected, never silently admitted). The
-                # ALLOW path additionally consults the channel's
-                # installability seam (D2/D7, else branch below): the
-                # first admitted CR apply triggers the provider's own
-                # lazy CRD install, and an uninstallable CRD degrades
-                # onto the SOP route right here — before any CR apply
-                # attempt round (spec: 不产生 CR apply 尝试轮次).
+                # manifest entries already govern. Disabled flag: while
+                # faultdrill_enabled is False the provider is not even
+                # registered — an attempted CR apply would carry no
+                # attribution, no ledger recipe and no recovery path at
+                # all, so it is rejected outright regardless of verb
+                # domain (parity with the pre-change kind-ban: still
+                # rejected, never silently admitted). The
+                # installability consult (D2/D7, the old third branch)
+                # retired with the CR channel's ensure_crd wiring (M2
+                # task 2.4): an admitted migration-window apply is
+                # governed by its own not-landed error family, and its
+                # recovery rides the task ledger either way.
                 # The verdict is retryable form guidance, same family as the
                 # armed-before-inject gate above: the reshape is a
                 # re-plan onto the correct channel, not a mechanism ban.
@@ -1922,26 +2006,41 @@ async def tool_screener(state: AgentState) -> dict:
                         decision = GuardDecision(
                             verdict=GuardVerdict.REJECT_BANNED,
                             reason=(
-                                "cr-channel route: the FaultDrill channel "
+                                "cr-channel route: the FaultDrill carrier "
                                 "is not enabled (faultdrill_enabled=false) "
-                                "— in the dark-launch window the channel's "
-                                "landing-readback and reconciler guards "
-                                "are short-circuited, so this CR apply "
-                                "would be an unguarded bare write with no "
-                                "recovery arming"
+                                "— the provider is unregistered, so this "
+                                "CR apply would carry no attribution, no "
+                                "ledger recipe and no recovery path"
                             ),
                             effective=effective,
                             suggestion=(
                                 "Re-plan onto the standard recovery-carrier "
                                 "SOP form (references/carrier/"
-                                "recovery-carrier.md) — the CR channel only "
-                                "carries drills while faultdrill_enabled is "
-                                "on."
+                                "recovery-carrier.md) — the FaultDrill "
+                                "carrier only carries drills while "
+                                "faultdrill_enabled is on."
                             ),
                         )
                         feedback = decision_to_feedback(decision)
                         carrier_gate = "cr_channel_route"
-                    elif _declared_verbs_in_symmetric_revert_domain(approved):
+                    elif (
+                        approved.recovery_channel != RECOVERY_CHANNEL_APISERVER_WRITE
+                        and _declared_verbs_in_symmetric_revert_domain(approved)
+                    ):
+                        # Verb-proxy fallback ONLY — the frozen snapshot
+                        # carries no case-file ``recovery_channel:
+                        # apiserver-write`` declaration. The explicit
+                        # declaration (D3 source 1, loaded by code from
+                        # the settled case file at freeze time) OUTRANKS
+                        # the proxy: the proxy classifies by taxonomy
+                        # verbs, and a k8s-native mechanism whose verbs
+                        # happen to land in the blade vocabulary
+                        # (NXDOMAIN: target=network action=dns — blade
+                        # only has dns HIJACK, no rcode forgery; run8
+                        # inject-2a8cd99a deadlocked here) is only
+                        # distinguishable via the case legislation. A
+                        # declared case skips this branch and rides the
+                        # installability check below.
                         decision = GuardDecision(
                             verdict=GuardVerdict.REJECT_BANNED,
                             reason=(
@@ -1951,62 +2050,35 @@ async def tool_screener(state: AgentState) -> dict:
                                 "fall in the ChaosBlade symmetric-revert "
                                 "domain — blade destroy recovers such faults "
                                 "by experiment UID with zero apiserver "
-                                "writes, so the faultdrill CR channel "
-                                "(reserved for recovery_channel: "
-                                "apiserver-write cases) is the wrong route"
+                                "writes — and the frozen snapshot carries no "
+                                "case-file recovery_channel declaration "
+                                "outranking that inference, so the faultdrill "
+                                "CR channel (reserved for recovery_channel: "
+                                "apiserver-write cases) cannot be justified "
+                                "for this route"
                             ),
                             effective=effective,
                             suggestion=(
-                                "Re-plan this fault on its symmetric-revert "
-                                "route: blade create <scope>-<target> "
-                                "<action> with --timeout, recovered by "
-                                "blade destroy (experiment UID). Reserve the "
-                                "FaultDrill CR channel for faults whose "
-                                "recovery must write apiserver state "
-                                "(references/carrier/recovery-carrier.md)."
+                                "Re-plan this fault on the route that fits "
+                                "its ACTUAL recovery address — the mechanism "
+                                "decision belongs to planning, not this "
+                                "gate: a symmetric-revert-reachable fault "
+                                "recovers via blade destroy on its "
+                                "experiment UID (see references/carrier/"
+                                "recovery-carrier.md for the route forms). "
+                                "If this case's recovery genuinely must "
+                                "write apiserver state (e.g. the blade "
+                                "vocabulary has no equivalent action for "
+                                "the mechanism), the case file is missing "
+                                "its recovery_channel: apiserver-write "
+                                "front-matter legislation — route the "
+                                "recovery-carrier SOP form instead; the "
+                                "CR channel stays closed until the case "
+                                "declares otherwise."
                             ),
                         )
                         feedback = decision_to_feedback(decision)
                         carrier_gate = "cr_channel_route"
-                    else:
-                        # Third branch — channel installability (D2/D7):
-                        # a legitimate CR write still needs a cluster that
-                        # can accept it, so the first admitted apply
-                        # triggers the channel's own lazy install through
-                        # the registry seam (probe → programmatic apply →
-                        # Established poll — never an LLM-triggered CRD
-                        # apply, D2). The gate imports no faultdrill
-                        # module (zero-import discipline, same as the
-                        # vocabulary check above). ``None`` = no provider
-                        # claims the install responsibility — the apply's
-                        # own not-landed error family governs that window;
-                        # an explicit ``usable=False`` is the degradation
-                        # signal (D7: a routing branch, never an error).
-                        crd = await FaultProviderRegistry.ensure_crd(
-                            kubeconfig=resolve_kubeconfig(state),
-                        )
-                        if crd is not None and crd.get("usable") is False:
-                            decision = GuardDecision(
-                                verdict=GuardVerdict.REJECT_BANNED,
-                                reason=(
-                                    "cr-channel route: the FaultDrill CRD "
-                                    "is unavailable on this cluster ("
-                                    f"{crd.get('reason') or 'unknown'}: "
-                                    f"{crd.get('detail') or ''}) — the CR "
-                                    "channel's declarative-restore machinery "
-                                    "has nothing to land on"
-                                ),
-                                effective=effective,
-                                suggestion=(
-                                    "Re-plan onto the standard recovery-"
-                                    "carrier SOP form (references/carrier/"
-                                    "recovery-carrier.md) — an uninstallable "
-                                    "CRD is a degradation branch (design D7: "
-                                    "a routing decision, not a task failure)."
-                                ),
-                            )
-                            feedback = decision_to_feedback(decision)
-                            carrier_gate = "cr_channel_route"
         except Exception as exc:
             if is_host_carrier_call(tool_name, tool_args):
                 logger.exception(
@@ -2529,10 +2601,17 @@ def _apply_drift_correction(
     # mechanism write into drift.
     mechanism_entries = entries_from_list(existing.get("mechanism_entries"))
 
+    # The case-file ``recovery_channel`` legislation is carried forward
+    # verbatim for the same reason: it anchors the CASE's recovery route,
+    # not the victim identity — a correction never stales it, and dropping
+    # it would demote the route gate back to its verb-vocabulary proxy.
+    recovery_channel = str(existing.get("recovery_channel") or "")
+
     result: dict = {"fault_spec": new_spec.to_dict()}
     result["approved_target"] = freeze_approved_target_from_spec(
         new_spec, owner_names=owner_names, resolved_names=resolved_names,
         pvc_claims=pvc_claims, mechanism_entries=mechanism_entries,
+        recovery_channel=recovery_channel,
         # The drift-correction card ran under a human's eyes, so the
         # rebuild counts as an approval: the pending marker clears
         # (explicit here to document the semantics; the sentinel would

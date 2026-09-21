@@ -23,15 +23,18 @@ from chaos_agent.agent.spec.fault_spec import FaultSpec
 from chaos_agent.agent.target_guard import approved_from_dict, freeze_approved_target_from_spec
 from chaos_agent.agent.target_guard.drift_policy import K8sDriftPolicy
 from chaos_agent.agent.target_guard.mechanism_writes import (
+    RECOVERY_CHANNEL_APISERVER_WRITE,
     MechanismWriteEntry,
     entries_beyond_victim,
     entries_from_list,
     entries_to_list,
     format_entries_for_payload,
     load_case_mechanism_writes,
+    load_case_recovery_channel,
     match_mechanism_entries,
     names_within_entry,
     parse_mechanism_writes,
+    parse_recovery_channel,
 )
 from chaos_agent.agent.target_guard.types import EffectiveTarget
 
@@ -232,6 +235,64 @@ class TestLoadCaseMechanismWrites:
 
 
 # ---------------------------------------------------------------------------
+# §1b recovery_channel — the case file's recovery-route legislation (D3
+# source 1, faultdrill-cr-channel task 3.6)
+# ---------------------------------------------------------------------------
+
+class TestParseRecoveryChannel:
+    def test_apiserver_write_declaration_parses(self):
+        content = "---\nname: x\nrecovery_channel: apiserver-write\n---\nbody"
+        assert parse_recovery_channel(content) == RECOVERY_CHANNEL_APISERVER_WRITE
+
+    def test_value_is_normalised(self):
+        content = "---\nrecovery_channel: ' ApiServer-Write '\n---\nbody"
+        assert parse_recovery_channel(content) == RECOVERY_CHANNEL_APISERVER_WRITE
+
+    def test_unknown_value_is_ignored(self):
+        # A typo must not widen the CR channel's admission surface — the
+        # gate falls back to the verb proxy exactly as if no declaration
+        # existed (fail closed to the pre-declaration behaviour).
+        content = "---\nrecovery_channel: apiserver-write-ish\n---\nbody"
+        assert parse_recovery_channel(content) == ""
+
+    def test_missing_key_or_frontmatter_yields_empty(self):
+        assert parse_recovery_channel("# plain markdown") == ""
+        assert parse_recovery_channel("---\nname: x\n---\nbody") == ""
+        assert parse_recovery_channel("") == ""
+
+    def test_malformed_yaml_yields_empty(self):
+        assert parse_recovery_channel("---\n: : :\n  - [\n---\nbody") == ""
+
+
+class TestLoadCaseRecoveryChannel:
+    def test_load_reads_case_file_directly(self, tmp_path, monkeypatch):
+        skill_dir = tmp_path / "demo-skill"
+        (skill_dir / "cases").mkdir(parents=True)
+        (skill_dir / "cases" / "case.md").write_text(
+            "---\nrecovery_channel: apiserver-write\n---\nbody",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(
+            "chaos_agent.skills.loader.get_skills_dir", lambda: tmp_path,
+        )
+        assert load_case_recovery_channel(
+            "demo-skill", "cases/case.md",
+        ) == RECOVERY_CHANNEL_APISERVER_WRITE
+
+    def test_load_escapes_and_missing_inputs_are_empty(self, tmp_path, monkeypatch):
+        # Same escape-proof resolver discipline as the manifest loader:
+        # traversal lands in the loader rejection → "" → verb-proxy
+        # fallback (never a routing input from LLM-influenced paths).
+        monkeypatch.setattr(
+            "chaos_agent.skills.loader.get_skills_dir", lambda: tmp_path,
+        )
+        assert load_case_recovery_channel("demo-skill", "../../etc/passwd") == ""
+        assert load_case_recovery_channel("", "cases/case.md") == ""
+        assert load_case_recovery_channel("demo-skill", "") == ""
+        assert load_case_recovery_channel("no-such-skill", "cases/case.md") == ""
+
+
+# ---------------------------------------------------------------------------
 # §2.1 Freeze golden + serialisation
 # ---------------------------------------------------------------------------
 
@@ -262,6 +323,31 @@ class TestFreezeGolden:
         assert entries_from_list([{"nope": 1}, *as_list]) == entries
         assert entries_from_list(None) == ()
         assert entries_from_list("junk") == ()
+
+    def test_no_declaration_freeze_has_no_recovery_channel_key(self):
+        # Byte-identical contract (task 3.6): every legacy snapshot stays
+        # untouched — the key is absent, not empty, so the route gate's
+        # fallback reads off key absence.
+        snap = freeze_approved_target_from_spec(_victim_pod_spec())
+        assert "recovery_channel" not in snap
+
+    def test_declared_recovery_channel_round_trips(self):
+        snap = freeze_approved_target_from_spec(
+            _victim_pod_spec(),
+            recovery_channel=RECOVERY_CHANNEL_APISERVER_WRITE,
+        )
+        assert snap["recovery_channel"] == RECOVERY_CHANNEL_APISERVER_WRITE
+        hydrated = approved_from_dict(snap)
+        assert hydrated.recovery_channel == RECOVERY_CHANNEL_APISERVER_WRITE
+
+    def test_unknown_hydrated_recovery_channel_is_dropped(self):
+        # A hand-edited state or a future renamed value must not smuggle
+        # an unknown channel into the gate's declaration-first branch —
+        # hydration re-validates against the known vocabulary (fail
+        # closed to the verb proxy).
+        snap = freeze_approved_target_from_spec(_victim_pod_spec())
+        snap["recovery_channel"] = "totally-unknown-channel"
+        assert approved_from_dict(snap).recovery_channel == ""
 
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,7 @@ from chaos_agent.agent.target_guard.carriers import (
     discover_unregistered_carrier,
 )
 
-_META = "chaos_agent.tools.kubectl._debug_pod_metadata"
+_META = "chaos_agent.tools.kubectl_cli._debug_pod_metadata"
 _SLEEP = "chaos_agent.agent.target_guard.carriers.asyncio.sleep"
 
 

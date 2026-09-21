@@ -42,8 +42,10 @@ from chaos_agent.agent.target_guard.carriers import (
     is_host_carrier_call,
     _parse_host_exec,
 )
-from chaos_agent.agent.target_guard.mechanism_writes import MechanismWriteEntry
-from chaos_agent.agent.providers.registry import FaultProviderRegistry
+from chaos_agent.agent.target_guard.mechanism_writes import (
+    RECOVERY_CHANNEL_APISERVER_WRITE,
+    MechanismWriteEntry,
+)
 from chaos_agent.config.settings import settings
 
 
@@ -2076,7 +2078,7 @@ class TestCarrierRejectReasonIsTruthful:
             "task_id": "task-1",
         }
         with patch(
-            "chaos_agent.tools.kubectl._debug_pod_metadata",
+            "chaos_agent.tools.kubectl_cli._debug_pod_metadata",
             new=AsyncMock(return_value=meta),
         ), patch(_PROBE, new=AsyncMock(return_value=True)):
             delta = await tool_screener(state)
@@ -2525,10 +2527,12 @@ def _carrier_artifact(status: str = "active") -> dict:
 
 class TestArmedBeforeInjectGate:
     """A kubectl object-write injection under a write-set that admits the
-    carrier family must not run while no recovery carrier is registered —
+    carrier family must not run while no recovery carrier is ARMED —
     the inject-cc2d5080 shape (carrier refused → forced injection → fault
-    with no timer armed). The rejection is retryable form guidance, not a
-    mechanism ban: stacking the carrier IS the reshape."""
+    with no timer armed) and the run6 inject-3d5de7fa shape (carrier
+    registered on a bare ``sleep N`` skeleton but never armed). The
+    rejection is retryable form guidance, not a mechanism ban: arming the
+    carrier IS the reshape."""
 
     @pytest.mark.asyncio
     async def test_object_write_without_carrier_is_rejected(self):
@@ -2556,7 +2560,30 @@ class TestArmedBeforeInjectGate:
         assert "recovery vehicle" in body
 
     @pytest.mark.asyncio
-    async def test_object_write_with_registered_carrier_passes(self):
+    async def test_object_write_with_armed_carrier_passes(self):
+        settings.target_guard_enforcing = True
+        state = {
+            "messages": [
+                _ai_with_tool_call("kubectl", {
+                    "subcommand": "scale",
+                    "v_args": "deployment deploy-a -n ns --replicas=0",
+                }),
+            ],
+            "approved_target": _approved_workload_deploy_a(),
+            "execution_artifacts": [_carrier_artifact("recovery_armed")],
+        }
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_object_write_with_bare_active_carrier_is_rejected(self):
+        """Fix-4 (run6 inject-3d5de7fa): a carrier registered on its bare
+        ``sleep N`` skeleton is ``active`` but NOT armed — its timer host
+        carries no restore payload, so the object write would land
+        permanently unrecovered. The gate now demands ``recovery_armed``
+        (stamped by the arming exec), refusing the ``active``-tolerant face
+        that let run6's selector patch through."""
         settings.target_guard_enforcing = True
         state = {
             "messages": [
@@ -2569,8 +2596,8 @@ class TestArmedBeforeInjectGate:
             "execution_artifacts": [_carrier_artifact("active")],
         }
         delta = await tool_screener(state)
-        assert delta["screener_route"] == SCREENER_ROUTE_PASS
-        assert "messages" not in delta
+        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
+        assert "armed-before-inject" in delta["messages"][0].content
 
     @pytest.mark.asyncio
     async def test_cleaned_carrier_does_not_count_as_armed(self):
@@ -2805,12 +2832,13 @@ class TestArmedBeforeInjectGate:
     def test_write_set_helpers_single_source_semantics(self):
         """_carrier_family_in_write_set: workload net True, node net False
         (the discriminating boundary), mechanism_entries contribute the
-        same way; _recovery_vehicle_registered: vehicle_cache read-first
-        so a same-batch run + injection pair sees the registration;
-        occupant forms underwrite, a debug pod does not."""
+        same way; _recovery_vehicle_armed: vehicle_cache read-first
+        so a same-batch run + injection pair sees the registration, and
+        only ``recovery_armed`` counts (a bare ``active`` skeleton is not
+        armed); occupant forms underwrite, a debug pod does not."""
         from chaos_agent.agent.nodes.planning.tool_screener import (
             _carrier_family_in_write_set,
-            _recovery_vehicle_registered,
+            _recovery_vehicle_armed,
         )
 
         workload = approved_from_dict(_approved_workload_deploy_a())
@@ -2819,23 +2847,31 @@ class TestArmedBeforeInjectGate:
         assert _carrier_family_in_write_set(node) is False
 
         empty_state = {"execution_artifacts": []}
-        assert _recovery_vehicle_registered({}, empty_state) is False
-        assert _recovery_vehicle_registered(
-            {"execution_artifacts": [_carrier_artifact()]}, empty_state,
+        assert _recovery_vehicle_armed({}, empty_state) is False
+        # A registered-but-unarmed carrier (bare ``sleep N`` skeleton) is
+        # NOT armed — Fix-4 (run6 inject-3d5de7fa).
+        assert _recovery_vehicle_armed(
+            {"execution_artifacts": [_carrier_artifact("active")]}, empty_state,
+        ) is False
+        assert _recovery_vehicle_armed(
+            {"execution_artifacts": [_carrier_artifact("recovery_armed")]},
+            empty_state,
         ) is True
-        # The occupant forms underwrite too: a task-built target's
-        # cleanup record deletes the asset — and the fault riding it —
-        # wholesale (the drill-target lifecycle contract)
-        assert _recovery_vehicle_registered(
+        # The occupant (task-built drill target) forms underwrite at
+        # ``active``: their cleanup record deletes the asset — and the
+        # fault riding it — wholesale, so they need no timer (the
+        # drill-target lifecycle contract; test_drill_target_manifest pins
+        # the object-write PASS on an active occupant).
+        assert _recovery_vehicle_armed(
             {"execution_artifacts": [
-                _carrier_artifact() | {"type": "occupant_deployment"},
+                _carrier_artifact("active") | {"type": "occupant_deployment"},
             ]}, empty_state,
         ) is True
         # A debug pod does NOT: it is a probe channel — a debug pod
         # plus an un-armed injection is still an un-armed injection
-        assert _recovery_vehicle_registered(
+        assert _recovery_vehicle_armed(
             {"execution_artifacts": [
-                _carrier_artifact() | {"type": "debug_pod"},
+                _carrier_artifact("active") | {"type": "debug_pod"},
             ]}, empty_state,
         ) is False
 
@@ -2854,11 +2890,14 @@ spec:
 """
 
 
-def _approved_cr_channel_pod(bt: str, ba: str, *, entry: bool = True) -> dict:
+def _approved_cr_channel_pod(
+    bt: str, ba: str, *, entry: bool = True, recovery_channel: str = "",
+) -> dict:
     """Pod-victim approval whose case manifest legislates the FaultDrill CR
     write (the widened write-set contract that admits a faultdrill-scope
-    apply at all), with the frozen intent verbs parameterised so the
-    three-class verdict is the only variable under test."""
+    apply at all), with the frozen intent verbs — and, since task 3.6,
+    the frozen case-file ``recovery_channel`` declaration — parameterised
+    so the three-class verdict is the only variable under test."""
     me = (
         (MechanismWriteEntry(scope="faultdrill", namespace="ns", names=("fd-demo1",)),)
         if entry else ()
@@ -2868,6 +2907,7 @@ def _approved_cr_channel_pod(bt: str, ba: str, *, entry: bool = True) -> dict:
         params={"scope": "pod"},
         fault_scope="pod", fault_target=bt, fault_action=ba,
         mechanism_entries=me,
+        recovery_channel=recovery_channel,
     )
 
 
@@ -2914,15 +2954,27 @@ class TestCrChannelRouteGate:
         # channel, not a mechanism ban (same family as armed-before-inject).
         assert "not a dead-end" in body
         assert "MECHANISM is banned" not in body
-        assert "blade create" in body
         assert "recovery-carrier.md" in body
+        # Task 3.6 — the fallback rejection reports the routing conflict
+        # WITHOUT prescribing a mechanism form: whether a blade equivalent
+        # action exists is feasibility knowledge the planning layer has
+        # and this gate does not (run8 inject-2a8cd99a: the prescribed
+        # "blade create <scope>-<target> <action>" route had no NXDOMAIN
+        # equivalent and deadlocked the executor).
+        assert "blade create <scope>" not in body
+        assert "belongs to planning" in body
+        # The guidance names the missing legislation so the re-plan can
+        # address the actual gap (case under-declaration vs mis-route).
+        assert "recovery_channel: apiserver-write" in body
 
     @pytest.mark.asyncio
     async def test_apiserver_write_domain_passes(self):
         # k8s-native vocabulary verbs (apiserver-write family): the
-        # legitimate CR-channel shape — admission via the manifest entry,
-        # no route objection, and a cluster that can accept the write
-        # (the installability seam reports an established CRD).
+        # legitimate migration-window CR shape — admission via the
+        # manifest entry, no route objection (the installability branch
+        # retired with the CR channel, M2 task 2.4: an admitted apply is
+        # governed by its own not-landed error family, recovery by the
+        # task ledger).
         settings.target_guard_enforcing = True
         settings.faultdrill_enabled = True
         state = {
@@ -2931,24 +2983,17 @@ class TestCrChannelRouteGate:
             "execution_artifacts": [],
             "kubeconfig": "/tmp/fd-route-gate.kubeconfig",
         }
-        seam = AsyncMock(return_value={"usable": True, "status": "ready"})
-        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
-            delta = await tool_screener(state)
+        delta = await tool_screener(state)
         assert delta["screener_route"] == SCREENER_ROUTE_PASS
         assert "messages" not in delta
-        # The lazy-install seam WAS consulted with the task's resolved
-        # kubeconfig (the first admitted CR write is installability-
-        # checked — spec scenario "首次注入时惰性安装").
-        seam.assert_awaited_once_with(
-            kubeconfig="/tmp/fd-route-gate.kubeconfig",
-        )
 
     @pytest.mark.asyncio
     async def test_disabled_channel_rejects_any_cr_apply(self):
-        # Dark launch: while faultdrill_enabled is False the channel's own
-        # guards (landing readback, session reconciler) are short-circuited,
-        # so ANY CR apply in that window is an unguarded bare write —
-        # rejected regardless of verb domain.
+        # Disabled flag: while faultdrill_enabled is False the provider is
+        # not even registered — an attempted CR apply would carry no
+        # attribution, no ledger recipe and no recovery path at all, so
+        # ANY CR apply in that window is rejected regardless of verb
+        # domain.
         settings.target_guard_enforcing = True
         settings.faultdrill_enabled = False
         state = {
@@ -2981,13 +3026,9 @@ class TestCrChannelRouteGate:
             "approved_target": _approved_cr_channel_pod("cpu", "fullload"),
             "execution_artifacts": [],
         }
-        seam = AsyncMock(return_value={"usable": True})
-        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
-            delta = await tool_screener(state)
+        delta = await tool_screener(state)
         assert delta["screener_route"] == SCREENER_ROUTE_PASS
         assert "messages" not in delta
-        # The installability check rides the CREATING-verbs gate only.
-        seam.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_empty_verbs_are_not_decidable_so_pass(self):
@@ -3001,9 +3042,7 @@ class TestCrChannelRouteGate:
             "approved_target": _approved_cr_channel_pod("", ""),
             "execution_artifacts": [],
         }
-        seam = AsyncMock(return_value={"usable": True, "status": "installed"})
-        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
-            delta = await tool_screener(state)
+        delta = await tool_screener(state)
         assert delta["screener_route"] == SCREENER_ROUTE_PASS
         assert "messages" not in delta
 
@@ -3056,97 +3095,55 @@ class TestCrChannelRouteGate:
         assert _declared_verbs_in_symmetric_revert_domain(empty) is False
 
     @pytest.mark.asyncio
-    async def test_crd_unavailable_rejects_with_sop_degradation_guidance(self):
-        # D7 degradation branch: the installability seam reports the CRD
-        # uninstallable (probe / install / Established / compatibility
-        # family) — the apply is rejected BEFORE any CR attempt round,
-        # with re-plan guidance onto the SOP form (a routing branch, not
-        # a task failure). Spec scenario "CRD 不可装时降级路由".
+    async def test_declared_apiserver_write_outranks_blade_verb_proxy(self):
+        # Task 3.6, the run8 inject-2a8cd99a regression: the NXDOMAIN case
+        # legislates ``recovery_channel: apiserver-write`` while its frozen
+        # taxonomy verbs (network × dns) land in the blade vocabulary — the
+        # verb proxy alone rejected the CR route and prescribed a blade
+        # form that has no rcode-forgery equivalent (deadlock). The frozen
+        # declaration (D3 source 1, loaded by code from the case file)
+        # OUTRANKS the proxy: the route gate must not reject (the CRD-
+        # installability consult that used to follow retired with the CR
+        # channel, M2 task 2.4).
         settings.target_guard_enforcing = True
         settings.faultdrill_enabled = True
         state = {
             "messages": [_cr_apply_call()],
-            "approved_target": _approved_cr_channel_pod("image", "corrupt"),
+            "approved_target": _approved_cr_channel_pod(
+                "network", "dns",
+                recovery_channel=RECOVERY_CHANNEL_APISERVER_WRITE,
+            ),
             "execution_artifacts": [],
             "kubeconfig": "/tmp/fd-route-gate.kubeconfig",
         }
-        seam = AsyncMock(return_value={
-            "usable": False, "status": "unavailable",
-            "reason": "apply-forbidden",
-            "detail": "RBAC denies creating customresourcedefinitions",
-        })
-        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
-            delta = await tool_screener(state)
+        delta = await tool_screener(state)
+        assert delta["screener_route"] == SCREENER_ROUTE_PASS
+        assert "messages" not in delta
+
+    @pytest.mark.asyncio
+    async def test_unknown_hydrated_declaration_falls_back_to_proxy(self):
+        # Hydration re-validates the frozen value against the known
+        # vocabulary: a hand-edited ``recovery_channel`` (or a future
+        # renamed value) is dropped to "" — the verb proxy then rules
+        # exactly as before the declaration existed (fail closed to the
+        # pre-declaration behaviour, never fail open).
+        settings.target_guard_enforcing = True
+        settings.faultdrill_enabled = True
+        snapshot = _approved_cr_channel_pod(
+            "cpu", "fullload",
+            recovery_channel=RECOVERY_CHANNEL_APISERVER_WRITE,
+        )
+        snapshot["recovery_channel"] = "host-local-timer"  # unknown value
+        state = {
+            "messages": [_cr_apply_call()],
+            "approved_target": snapshot,
+            "execution_artifacts": [],
+        }
+        delta = await tool_screener(state)
         assert delta["screener_route"] == SCREENER_ROUTE_RETRY
         body = delta["messages"][0].content
         assert "cr-channel route" in body
-        # The decision family's verdict is surfaced for the audit log.
-        assert "apply-forbidden" in body
-        assert "RBAC denies creating" in body
-        # Degradation guidance: the SOP route, retryable (not a ban).
-        assert "degradation branch" in body
-        assert "recovery-carrier.md" in body
-        assert "not a dead-end" in body
-        assert "MECHANISM is banned" not in body
-        seam.assert_awaited_once_with(
-            kubeconfig="/tmp/fd-route-gate.kubeconfig",
-        )
-
-    @pytest.mark.asyncio
-    async def test_install_seam_not_consulted_while_dark_launched(self):
-        # Dark launch spends ZERO install traffic: the flag rejection
-        # fires before the seam is ever consulted.
-        settings.target_guard_enforcing = True
-        settings.faultdrill_enabled = False
-        state = {
-            "messages": [_cr_apply_call()],
-            "approved_target": _approved_cr_channel_pod("image", "corrupt"),
-            "execution_artifacts": [],
-        }
-        seam = AsyncMock()
-        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
-            delta = await tool_screener(state)
-        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
-        assert "not enabled" in delta["messages"][0].content
-        seam.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_install_seam_not_consulted_on_vocabulary_misroute(self):
-        # Check-order pin: the vocabulary objection is pure-Python and
-        # fires BEFORE the installability seam — a mis-routed fault
-        # never spends an install roundtrip.
-        settings.target_guard_enforcing = True
-        settings.faultdrill_enabled = True
-        state = {
-            "messages": [_cr_apply_call()],
-            "approved_target": _approved_cr_channel_pod("cpu", "fullload"),
-            "execution_artifacts": [],
-        }
-        seam = AsyncMock()
-        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
-            delta = await tool_screener(state)
-        assert delta["screener_route"] == SCREENER_ROUTE_RETRY
-        assert "symmetric-revert" in delta["messages"][0].content
-        seam.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_install_seam_none_passes_through(self):
-        # ``None`` = no registered provider claims the install
-        # responsibility (the defensive window): the gate does not
-        # invent a verdict — the apply proceeds under its own
-        # not-landed error family.
-        settings.target_guard_enforcing = True
-        settings.faultdrill_enabled = True
-        state = {
-            "messages": [_cr_apply_call()],
-            "approved_target": _approved_cr_channel_pod("image", "corrupt"),
-            "execution_artifacts": [],
-        }
-        seam = AsyncMock(return_value=None)
-        with patch.object(FaultProviderRegistry, "ensure_crd", new=seam):
-            delta = await tool_screener(state)
-        assert delta["screener_route"] == SCREENER_ROUTE_PASS
-        assert "messages" not in delta
+        assert "symmetric-revert" in body
 
 
 # ---------------------------------------------------------------------------

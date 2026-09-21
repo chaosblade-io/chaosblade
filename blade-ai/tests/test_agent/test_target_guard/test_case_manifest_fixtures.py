@@ -32,7 +32,9 @@ from chaos_agent.agent.target_guard import approved_from_dict
 from chaos_agent.agent.target_guard.drift_policy import K8sDriftPolicy
 from chaos_agent.agent.target_guard.freeze import freeze_approved_target_from_spec
 from chaos_agent.agent.target_guard.mechanism_writes import (
+    RECOVERY_CHANNEL_APISERVER_WRITE,
     load_case_mechanism_writes,
+    load_case_recovery_channel,
 )
 from chaos_agent.agent.target_guard.types import EffectiveTarget
 
@@ -90,6 +92,35 @@ class TestNxDomainBackfillAcceptance:
         assert "configmap/kube-system: names=['coredns', 'kube-dns']" in described
         assert "configmap/kube-system: name_prefix='drill-nxdomain-'" in described
         assert "deployment/kube-system: names=['coredns', 'kube-dns']" in described
+        # Degraded-path carrier-standard stack writes (the LLM SOP builds
+        # its own four-object stack when the assembler reports
+        # fail-closed — these entries serve that LLM write face).
+        assert "role/kube-system: name_prefix='drill-rc-'" in described
+        assert "rolebinding/kube-system: name_prefix='drill-rc-'" in described
+        # The faultdrill admission entry retired with the CR channel
+        # (openspec faultdrill-cluster-native-recovery M2 tasks 2.4/2.5):
+        # the assembler carrier stack is built programmatically inside
+        # the tool (design ND3) and never rides the LLM write-set, so a
+        # surviving entry would be dead legislation — pinned absent.
+        assert not any(e.scope == "faultdrill" for e in entries)
+
+    def test_real_case_declares_apiserver_write_recovery_channel(self):
+        # Task 3.6 (run8 inject-2a8cd99a): the FIRST routing source is the
+        # case file's own legislation — the real NXDOMAIN case declares
+        # ``recovery_channel: apiserver-write`` while its taxonomy verbs
+        # (network × dns) sit in the blade vocabulary. Pin the real-file
+        # load AND its freeze round-trip, so the gate's declaration-first
+        # branch always has a legislation source to consult for this case.
+        declared = load_case_recovery_channel(_NXDOMAIN_SKILL, _NXDOMAIN_CASE)
+        assert declared == RECOVERY_CHANNEL_APISERVER_WRITE
+        frozen = approved_from_dict(
+            freeze_approved_target_from_spec(
+                _victim_pod_spec(),
+                mechanism_entries=_real_nxdomain_entries(),
+                recovery_channel=declared,
+            )
+        )
+        assert frozen.recovery_channel == RECOVERY_CHANNEL_APISERVER_WRITE
 
     def test_full_mechanism_write_set_passes_zero_drift(self):
         approved = _frozen_real()
@@ -113,6 +144,19 @@ class TestNxDomainBackfillAcceptance:
                 f"mechanism write {scope}/{ns}/{names} must be in-contract, "
                 f"got: {decision.reason if decision else None}"
             )
+
+        # A residual FaultDrill CR apply stays REJECTED at the write-set
+        # boundary (the faultdrill admission legislation retired with the
+        # CR channel — M2 tasks 2.4/2.5; the tool_screener route gate is
+        # the second, earlier wall). Pinned so the entry cannot quietly
+        # come back.
+        decision = policy.check_identity_drift(
+            approved,
+            EffectiveTarget(scope="faultdrill", namespace="default",
+                            names=("fd-1a2b3c",)),
+        )
+        assert decision is not None
+        assert decision.verdict.value == "reject_drift"
 
     def test_recovery_delete_passes_through_prefix_entry(self):
         approved = _frozen_real()
@@ -298,20 +342,21 @@ class TestUnattendedEarlyExitFromRealManifest:
             result = await confirmation_gate(state)
 
         # The card carried the widening marker over the real manifest.
-        # Six entries: the three original mechanism writes (coredns cm,
-        # drill-nxdomain- cm prefix, deployment) plus the cross-ns
-        # carrier's role/rolebinding @ kube-system (drill-rc- prefix),
-        # plus the CR-channel body itself (faultdrill/kube-system,
-        # fd- prefix — the T3.4 pre-fix: the entry the route gate's
-        # write-set admission requires; without it the first CR apply
-        # is scope-drift-rejected before the gate is ever consulted).
+        # Five entries: the three original mechanism writes (coredns cm,
+        # drill-nxdomain- cm prefix, deployment) plus the degraded-path
+        # carrier stack's role/rolebinding @ kube-system (drill-rc-
+        # prefix — the LLM SOP's own four-object stack when the
+        # assembler reports fail-closed). The faultdrill admission entry
+        # retired with the CR channel (M2 tasks 2.4/2.5 — the assembler
+        # carrier is tool-built, design ND3, and a residual CR apply is
+        # rejected at the write-set boundary; pinned absent below).
         assert seen_payloads[0]["write_set_widened"]
-        assert len(seen_payloads[0]["write_set_widened"]["mechanism_writes"]) == 6
+        assert len(seen_payloads[0]["write_set_widened"]["mechanism_writes"]) == 5
         widened = {
             e["description"]
             for e in seen_payloads[0]["write_set_widened"]["mechanism_writes"]
         }
-        assert "faultdrill/kube-system: name_prefix='fd-'" in widened
+        assert "faultdrill/default: name_prefix='fd-'" not in widened
 
         # The runner's decision was the AUTO delegation ("approved"),
         # and the gate flowed through its approved branch: the pending

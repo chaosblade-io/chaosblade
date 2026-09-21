@@ -461,6 +461,10 @@ class TestPhaseToolUnionGuard:
         "blade_query_k8s", "kubectl", "host_inject",
         # chaosblade_python provider (EXECUTE phase)
         "blade_python_create", "blade_python_prepare", "blade_python_revoke",
+        # faultdrill provider (EXECUTE phase) — the programmatic
+        # recovery-carrier assembler (openspec
+        # faultdrill-cluster-native-recovery M1, blade_create precedent)
+        "faultdrill_assemble_carrier",
     }
     _VERIFY = {
         "read_skill_resource", "execute_skill_script", "read_knowledge_resource",
@@ -581,6 +585,10 @@ class TestPhaseSpecMatrix:
             "blade_create", "blade_destroy", "blade_help", "blade_status",
             "blade_query_k8s", "kubectl", "host_inject",
             "blade_python_create", "blade_python_prepare", "blade_python_revoke",
+            # faultdrill provider (EXECUTE phase) — programmatic
+            # recovery-carrier assembler (faultdrill-cluster-native-
+            # recovery M1)
+            "faultdrill_assemble_carrier",
         ],
         "verifier": [
             "read_skill_resource", "execute_skill_script",

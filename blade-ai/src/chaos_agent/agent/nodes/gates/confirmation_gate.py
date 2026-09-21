@@ -376,11 +376,12 @@ def _freeze_from_state(state: AgentState) -> dict | None:
     visible in the screener's WARNING log rather than silently
     constructing an empty approval).
 
-    Reuses ``owner_names``, ``resolved_names``, ``pvc_claims`` AND the
-    case-manifest ``mechanism_entries`` from the ``approved_target``
-    that safety_check already froze (avoiding a redundant cluster
-    query and re-read of the case file — the entries were legislated
-    at settlement and must survive re-freeze unchanged).
+    Reuses ``owner_names``, ``resolved_names``, ``pvc_claims``, the
+    case-manifest ``mechanism_entries`` AND the case-file
+    ``recovery_channel`` from the ``approved_target`` that safety_check
+    already froze (avoiding a redundant cluster query and re-read of
+    the case file — both were legislated at settlement and must
+    survive re-freeze unchanged).
 
     This re-freeze is the SINGLE approval point for the widened
     contract: ``widening_pending_approval`` deliberately defaults to
@@ -396,8 +397,13 @@ def _freeze_from_state(state: AgentState) -> dict | None:
     resolved_names = tuple(existing.get("resolved_names") or ())
     pvc_claims = tuple(existing.get("pvc_claims") or ())
     mechanism_entries = entries_from_list(existing.get("mechanism_entries"))
+    # The case-file recovery-route legislation survives re-freeze verbatim
+    # (same rationale as the manifest entries: legislated at settlement,
+    # orthogonal to whatever the human just approved).
+    recovery_channel = str(existing.get("recovery_channel") or "")
     return freeze_approved_target_from_spec(
         spec, owner_names=owner_names, resolved_names=resolved_names,
         pvc_claims=pvc_claims, mechanism_entries=mechanism_entries,
+        recovery_channel=recovery_channel,
         widening_pending_approval=False,
     )

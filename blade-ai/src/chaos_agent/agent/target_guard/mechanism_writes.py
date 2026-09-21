@@ -193,6 +193,93 @@ def parse_mechanism_writes(content: str) -> tuple[MechanismWriteEntry, ...]:
     return tuple(entries)
 
 
+# ---------------------------------------------------------------------------
+# ``recovery_channel`` — the case file's recovery-route legislation (D3
+# source 1, openspec faultdrill-cr-channel). Same one-directional chain as
+# the write-set manifest: case author legislates → deterministic code
+# parses (here) → approval freezes it into the snapshot → the CR-channel
+# route gate consults it BEFORE the verb-vocabulary proxy. The proxy was
+# an explicitly temporary M2 stand-in ("M3 task 3.1 才写入 case
+# recovery_channel 元数据，M2 门不得依赖" — tasks.md 2.4); now that the
+# declaration exists, it outranks the proxy: a k8s-native mechanism whose
+# taxonomy verbs happen to land in the blade vocabulary (NXDOMAIN:
+# target=network action=dns) is NOT symmetric-revert reachable, and only
+# the case legislation can say so.
+# ---------------------------------------------------------------------------
+
+# The only declared value with routing meaning today. Unknown values are
+# dropped (logged) rather than frozen — a typo must not silently widen
+# the CR channel's admission surface, and the gate falls back to the
+# verb proxy exactly as if no declaration existed (fail closed to the
+# pre-declaration behaviour, never fail open).
+RECOVERY_CHANNEL_APISERVER_WRITE = "apiserver-write"
+KNOWN_RECOVERY_CHANNELS = frozenset({RECOVERY_CHANNEL_APISERVER_WRITE})
+
+
+def parse_recovery_channel(content: str) -> str:
+    """Deterministically parse the ``recovery_channel`` frontmatter key.
+
+    Returns ``""`` for: no frontmatter, missing key, empty value, or an
+    unknown value (logged). Never raises — same failure posture as the
+    manifest parser.
+    """
+    if not content:
+        return ""
+    from chaos_agent.skills.loader import parse_frontmatter
+
+    try:
+        frontmatter = parse_frontmatter(content)
+    except Exception:  # noqa: BLE001 — parse must never raise
+        logger.warning("recovery_channel: frontmatter parse failed — no declaration")
+        return ""
+    if not frontmatter:
+        return ""
+
+    raw = str(frontmatter.get("recovery_channel") or "").strip().lower()
+    if not raw:
+        return ""
+    if raw not in KNOWN_RECOVERY_CHANNELS:
+        logger.warning(
+            "recovery_channel: unknown value %r — declaration ignored "
+            "(known: %s)", raw, sorted(KNOWN_RECOVERY_CHANNELS),
+        )
+        return ""
+    return raw
+
+
+def load_case_recovery_channel(skill_name: str, case_resource_path: str) -> str:
+    """Read the settled case file and return its ``recovery_channel``.
+
+    The AUTHORITATIVE read, same discipline as
+    :func:`load_case_mechanism_writes`: code re-reads the case file
+    through the escape-proof resolver, so neither the Agent's prose
+    reading nor any LLM-declared planning field is a routing input.
+    Any failure → ``""`` (the route gate falls back to the verb proxy).
+    """
+    skill_name = (skill_name or "").strip()
+    case_resource_path = (case_resource_path or "").strip()
+    if not skill_name or not case_resource_path:
+        return ""
+    try:
+        from chaos_agent.skills.loader import get_skills_dir, load_skill_resource
+
+        skill_dir = get_skills_dir() / skill_name
+        content = load_skill_resource(skill_dir, case_resource_path)
+    except (ValueError, FileNotFoundError, OSError) as e:
+        logger.warning(
+            "recovery_channel: resource read failed for skill=%s path=%s (%s)",
+            skill_name, case_resource_path, e,
+        )
+        return ""
+    except Exception as e:  # noqa: BLE001 — load must never raise
+        logger.warning(
+            "recovery_channel: unexpected load failure for skill=%s path=%s (%s)",
+            skill_name, case_resource_path, e,
+        )
+        return ""
+    return parse_recovery_channel(content)
+
+
 def derive_pvc_claims_from_writes(
     entries: tuple[MechanismWriteEntry, ...],
 ) -> tuple[str, ...]:
@@ -518,6 +605,8 @@ def format_mechanism_writes_for_display(payload_entries: list[dict]) -> str:
 
 __all__ = [
     "CLUSTER_SCOPED_KINDS",
+    "KNOWN_RECOVERY_CHANNELS",
+    "RECOVERY_CHANNEL_APISERVER_WRITE",
     "MechanismWriteEntry",
     "entries_beyond_victim",
     "entries_from_list",
@@ -525,8 +614,10 @@ __all__ = [
     "format_entries_for_payload",
     "format_mechanism_writes_for_display",
     "load_case_mechanism_writes",
+    "load_case_recovery_channel",
     "match_mechanism_entries",
     "names_within_entries",
     "names_within_entry",
     "parse_mechanism_writes",
+    "parse_recovery_channel",
 ]

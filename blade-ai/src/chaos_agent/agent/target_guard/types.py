@@ -240,6 +240,21 @@ class ApprovedTarget:
     # those runs keep today's freeze output and guard behaviour
     # byte-identically.
     mechanism_entries: "tuple[MechanismWriteEntry, ...]" = ()
+    # Case-file ``recovery_channel`` legislation — the FIRST source of the
+    # D3 three-source routing (openspec faultdrill-cr-channel). Parsed
+    # deterministically from the settled case frontmatter at freeze time
+    # (same one-directional chain as ``mechanism_entries``: code re-reads
+    # the file, no LLM input point) and frozen here so the CR-channel
+    # route gate consults the case's own recovery-route declaration
+    # BEFORE the blade verb-vocabulary proxy. The proxy is a temporary
+    # M2 stand-in that classifies by taxonomy verbs; a k8s-native
+    # mechanism whose verbs happen to land in the blade vocabulary
+    # (NXDOMAIN: target=network action=dns — no blade equivalent exists)
+    # is only distinguishable via this declaration. ``apiserver-write``
+    # = the case legislates CR-channel routing; ``""`` = no declaration
+    # (every legacy case — the gate falls back to the verb proxy,
+    # behaviour byte-identical to pre-declaration).
+    recovery_channel: str = ""
     # Write-set approval state — the in-graph half of the D4 invariant.
     # True means the snapshot still carries manifest entries beyond the
     # victim coverage that NO knowing human has approved yet. Set at the

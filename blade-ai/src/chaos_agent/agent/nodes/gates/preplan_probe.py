@@ -172,7 +172,7 @@ async def _probe_operator(
 
 
 async def _probe_metrics_server(kubeconfig: str) -> tuple[str, str, dict]:
-    from chaos_agent.tools.kubectl import exec_kubectl_raw
+    from chaos_agent.tools.kubectl_cli import exec_kubectl_raw
 
     result = await exec_kubectl_raw(
         "get",
@@ -215,7 +215,7 @@ async def _fetch_healthy_ds_images(
     """
     import json as _json
 
-    from chaos_agent.tools.kubectl import exec_kubectl_raw
+    from chaos_agent.tools.kubectl_cli import exec_kubectl_raw
 
     try:
         result = await exec_kubectl_raw(
@@ -397,67 +397,6 @@ async def _probe_carrier_images(kubeconfig: str) -> tuple[str, str, dict]:
     )
 
 
-async def _probe_faultdrill_crd(kubeconfig: str) -> tuple[str, str, dict]:
-    """FaultDrill CRD installability — the D3 planning-route signal.
-
-    Read-only two-step: (1) the CRD already exists → the channel needs no
-    install (schema compatibility stays with the execute-time lazy check —
-    the probe contributes a routing hint, not a verdict); (2) otherwise
-    ``kubectl auth can-i create customresourcedefinitions`` decides whether
-    the provider channel could install it. ``can-i`` reports a denial as
-    exit 0 + ``no`` (a denial is an answer, not an error) — only a nonzero
-    exit is a probe failure (``unknown``). A denied can-i at plan time
-    means the CR route is unavailable, so the planner routes an
-    ``apiserver-write`` case onto the recovery-carrier SOP form directly —
-    no CR attempt round is spent (design D3: degradation completes at the
-    plan layer).
-
-    Probed ONLY while ``faultdrill_enabled`` is on (the wiring site) —
-    dark launch keeps the observation message identical to pre-change.
-    """
-    from chaos_agent.tools.kubectl import exec_kubectl_raw
-
-    crd_name = f"faultdrills.{settings.faultdrill_crd_group}"
-    exists = await exec_kubectl_raw(
-        "get", ["crd", crd_name], kubeconfig=kubeconfig, timeout=5.0,
-    )
-    if exists.exit_code == 0:
-        return (
-            "ok",
-            f"FaultDrill CRD {crd_name} already installed — the CR channel "
-            "needs no install (schema compatibility is re-checked lazily "
-            "at apply)",
-            {},
-        )
-    can = await exec_kubectl_raw(
-        "auth", ["can-i", "create", "customresourcedefinitions"],
-        kubeconfig=kubeconfig, timeout=5.0,
-    )
-    if can.exit_code != 0:
-        return (
-            "unknown",
-            "FaultDrill CRD installability probe failed (kubectl auth "
-            "can-i errored); treat the CR channel as unverified",
-            {},
-        )
-    if can.stdout.strip().lower() == "yes":
-        return (
-            "ok",
-            "FaultDrill CRD not installed but installable (can create "
-            "customresourcedefinitions) — the CR channel installs it "
-            "lazily on first use",
-            {},
-        )
-    return (
-        "warning",
-        "FaultDrill CRD not installed and NOT installable (cannot create "
-        "customresourcedefinitions) — the CR channel is unavailable: plan "
-        "recovery_channel: apiserver-write cases onto the recovery-carrier "
-        "SOP form",
-        {},
-    )
-
-
 # ── Probe runner ─────────────────────────────────────────────────────
 
 
@@ -552,14 +491,6 @@ async def preplan_probe(state: AgentState) -> dict:
         ("metrics_server", _probe_metrics_server(kubeconfig)),
         ("carrier_images", _probe_carrier_images(kubeconfig)),
     ]
-    if settings.faultdrill_enabled:
-        # D3 planning-route signal (openspec faultdrill-cr-channel): the
-        # CRD installability line the routing guide points the planner at.
-        # Probed only while the channel is enabled — dark launch keeps the
-        # observation message identical to pre-change.
-        probe_specs.append(
-            ("faultdrill_crd", _probe_faultdrill_crd(kubeconfig)),
-        )
     try:
         results = await asyncio.wait_for(
             asyncio.gather(*(

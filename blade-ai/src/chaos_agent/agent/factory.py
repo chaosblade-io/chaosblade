@@ -833,6 +833,24 @@ def _build_skill_tools(registry: SkillRegistry):
             e.g. tainting all nodes, modifying cluster-level resources).
             The system uses this to assess safety — cluster-wide scope triggers
             elevated safety review.
+            Declare the scope of the channel the plan COMMITS to landing.
+            When the plan could take MORE THAN ONE channel (e.g. a CR
+            primary with a kubectl-native recovery-carrier fallback),
+            declare the WIDEST scope any of them could produce — an
+            over-declaration is only an audit imprecision, but an
+            UNDER-declaration starves the elevated-safety review, which
+            is the worse error. (A tool's lazy control-plane side effect,
+            e.g. a CR channel auto-installing a cluster-scoped CRD, counts
+            toward the widest branch when that channel may land.) The
+            audit-accuracy fix is NOT to pre-emptively narrow the
+            declaration to a fallback that may never run; it is to
+            re-PLAN through finish_planning once execution DEGRADES to a
+            narrower channel after confirmation, so the declared scope is
+            re-confirmed to what actually landed. Do NOT degrade inline
+            and leave a stale pre-degradation scope in the audit (run6
+            inject-3d5de7fa: cluster-wide declared for a CR that was
+            refused, never re-evaluated for the namespace-scoped
+            kubectl-native patch that actually landed).
           - blast_radius_detail: One-line description of what cluster resources
             the execution will mutate beyond the target (e.g. "Will taint 30 nodes
             cluster-wide to block scheduling").

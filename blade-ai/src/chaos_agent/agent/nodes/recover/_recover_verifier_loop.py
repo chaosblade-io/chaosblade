@@ -155,11 +155,24 @@ async def _layer1_destroy_via_provider(
 ):
     """Provider-mediated Layer-1 destroy: the dispatched carrier destroys its
     own experiment through the ``layer1_destroy`` protocol hook — the generic
-    recover flow names no carrier tool. Kept as a module seam for tests."""
+    recover flow names no carrier tool. Kept as a module seam for tests.
+
+    ``artifacts`` is read off ``state`` HERE rather than threaded through the
+    two call sites: the wrapper already owns the state, and the two evidence
+    sources have to travel together. ``messages`` is exactly what a
+    CROSS-TASK recover (``blade-ai recover --task-id``) does not inherit —
+    the recover-state builder in ``state_mgmt.recovery_state`` starts from
+    ``recover_reset_state()`` and flattens inject history into the
+    ``inject_context`` string — while ``execution_artifacts`` does cross that
+    boundary, and also survives ``memory.tool_compactor`` truncating the
+    receipt inside one task. Handing over only one of them leaves a UID-less
+    carrier's recipe hydration single-sourced. Which artifacts mean anything
+    stays the provider's business; this layer passes the neutral list."""
     provider = _provider_for_recover(state)
     return await provider.layer1_destroy(
         experiment_uid, kubeconfig,
         messages=messages, injection_method=injection_method,
+        artifacts=list((state or {}).get("execution_artifacts") or []),
     )
 
 
@@ -267,6 +280,14 @@ async def recover_verifier(state: AgentState) -> dict:
         tracker.complete(f"Recovery verification: {layer1_status} (uid={experiment_uid or 'N/A'})")
     else:
         tracker.complete(f"Recovery verification: {layer1_status}")
+    # W-56-8 F2b: the sibling loops (agent_loop, execute_loop, verifier) all
+    # publish the wall-clock cause at their exits — this domain had no
+    # publisher at all, so an expired budget ended the recover run into
+    # ``done`` with no cause on the result envelope (the router's
+    # ``should_continue_recover_verifier`` decides on its side; the node must
+    # stamp before returning, same as ``verifier``'s simple exit).
+    from chaos_agent.agent.router import mark_wall_clock_timeout
+    result_dict = mark_wall_clock_timeout(state, result_dict)
     return result_dict
 
 
@@ -294,6 +315,45 @@ def _record_layer1_to_session(hook, state, layer1):
         })
 
 
+def _publish_recover_cut_causes(state, result_update: dict, count: int) -> dict:
+    """Publish the cut causes ``should_continue_recover_verifier`` may act on.
+
+    Both markers are conditional no-ops, so this is safe on every Layer-1
+    round-trip exit — and it must run there, because those exits are exactly
+    the ones the router cuts to ``done`` -> END, bypassing every terminal
+    node. A cut delta carrying no cause was measured leaving the envelope at
+    ``success`` while the session payload recorded the aborted recovery as
+    completed (W-56-8 review round 3, probe K1-K3: ``status='in_progress'``,
+    ``finished_at=''``, ``duration_ms=0``).
+
+    The loop-cap arm carries two guards, both mirroring the router's own
+    reasoning rather than assuming who calls this. With
+    ``layer2_context_added`` set the same count routes to ``finalize`` — a
+    live hand-off to a node that will judge the run itself — and stamping a
+    cause there would mislabel a task that is still running. And a delta
+    another cause already named keeps it: the clock cut is the more specific
+    one, and the two routinely hold at once (a run that burns its budget is
+    usually near the cap too). ``layer2_context_added`` is read delta-first
+    because that is what the router sees — a first Layer-2 round sets the flag
+    IN the delta while ``state`` still carries the Layer-1 value.
+    """
+    from chaos_agent.agent.router import mark_loop_exhausted, mark_wall_clock_timeout
+
+    result_update = mark_wall_clock_timeout(state, result_update)
+    _layer2_ctx = result_update.get(
+        "layer2_context_added", state.get("layer2_context_added")
+    )
+    if not _layer2_ctx and not result_update.get("failure_detail"):
+        result_update = mark_loop_exhausted(
+            result_update,
+            count,
+            settings.max_recover_verifier_loop,
+            category=FailureCategory.RECOVERY_VERIFICATION_TIMEOUT,
+            label="recover verifier loop",
+        )
+    return result_update
+
+
 async def _run_layer1_recovery(
     state, hook, llm, tools, task_id, experiment_uid, skill_name, kubeconfig, count, tracker,
 ):
@@ -301,7 +361,15 @@ async def _run_layer1_recovery(
 
     Returns ``(layer1_result, early_return_dict | None)``.  When the second
     element is not ``None``, the caller must return it immediately.
+
+    Every round-trip exit below hands the run back to the router, whose
+    ``should_continue_recover_verifier`` cuts it to ``done`` -> END on TWO
+    conditions — an expired wall clock, and the loop cap with no Layer 2
+    context. Both cuts bypass every terminal node, so each exit publishes its
+    cause through ``_publish_layer1_cut_causes`` before persisting; see that
+    helper for the measured failure it prevents.
     """
+
     capability_context = build_capability_context(state, "recover_verify", tools or [])
     visible_tools = filter_tools_for_context(tools or [], capability_context)
     recover_phase = state.get("recover_phase", "layer1_recovery")
@@ -684,6 +752,11 @@ async def _run_layer1_recovery(
                             "raw_output": "",
                             "system_prompt": layer1_system_prompt,
                         }
+                        # W-56-8: publish whichever cut the router is about to
+                        # act on (a no-op until one of them is true).
+                        result_update = _publish_recover_cut_causes(
+                            state, result_update, count
+                        )
                         await sync_to_store(state, result_update)
                         return (None, result_update)
                     else:
@@ -752,6 +825,11 @@ async def _run_layer1_recovery(
                                     "post-undo observation (looping back)",
                                     {"layer1_success_guard": True},
                                 )
+                            # W-56-8: publish whichever cut the router is about
+                            # to act on (a no-op until one of them is true).
+                            result_update = _publish_recover_cut_causes(
+                                state, result_update, count
+                            )
                             await sync_to_store(state, result_update)
                             return (None, result_update)
 
@@ -778,6 +856,11 @@ async def _run_layer1_recovery(
                         # Layer 2 verifies actual fault state even if recovery action failed)
                         result_update["recover_phase"] = "layer2_verification"
                         result_update["recover_layer1_type"] = "llm_driven"
+                        # W-56-8: publish whichever cut the router is about to
+                        # act on (a no-op until one of them is true).
+                        result_update = _publish_recover_cut_causes(
+                            state, result_update, count
+                        )
                         await sync_to_store(state, result_update)
                         # Return and let the next iteration handle Layer 2
                         # (this iteration already consumed an LLM call for Layer 1)
@@ -932,6 +1015,11 @@ async def _run_layer1_recovery(
                         {"iteration": layer1_iteration, "tool_calls": tool_names},
                     )
 
+                # W-56-8: publish whichever cut the router is about to act on
+                # (a no-op until one of them is true).
+                result_update = _publish_recover_cut_causes(
+                    state, result_update, count
+                )
                 await sync_to_store(state, result_update)
                 return (None, result_update)
             else:
@@ -971,6 +1059,11 @@ async def _run_layer1_recovery(
                             "claim rejected — no post-undo observation (looping back)",
                             {"layer1_success_guard": True},
                         )
+                    # W-56-8: publish whichever cut the router is about to act
+                    # on (a no-op until one of them is true).
+                    result_update = _publish_recover_cut_causes(
+                        state, result_update, count
+                    )
                     await sync_to_store(state, result_update)
                     return (None, result_update)
 
@@ -995,6 +1088,11 @@ async def _run_layer1_recovery(
                 # Layer 2 verifies actual fault state even if recovery action failed)
                 result_update["recover_phase"] = "layer2_verification"
                 result_update["recover_layer1_type"] = "llm_driven"
+                # W-56-8: publish whichever cut the router is about to act on
+                # (a no-op until one of them is true).
+                result_update = _publish_recover_cut_causes(
+                    state, result_update, count
+                )
                 await sync_to_store(state, result_update)
                 return (None, result_update)
 
@@ -1700,6 +1798,13 @@ async def _run_layer2_verification(
 
     from chaos_agent.memory.hook import merge_hook_updates
     merge_hook_updates(result_update, hook_updates)
+    # W-56-8 F2b/r3: the Layer-2 round-trip exit — the seventh of this node's
+    # exits that hand the run back to ``should_continue_recover_verifier``.
+    # The wall-clock cut reaches ``done`` -> END from here; the loop cap does
+    # NOT, because Layer 2 context IS set — the router routes that count to
+    # ``finalize``, which judges the run itself. The shared publisher's cap
+    # arm mirrors that same condition and therefore stays silent here.
+    result_update = _publish_recover_cut_causes(state, result_update, count)
     await sync_to_store(state, result_update)
     return result_update
 
@@ -1757,17 +1862,31 @@ def make_recover_verifier(hook=None, llm=None, tools=None, registry=None):
         )
 
         # ---- Guard: max iterations exceeded ----
+        # Reachability (W-56-8 review round 3): the router cuts at
+        # ``count >= max`` and publishes that cut's cause
+        # (``_publish_recover_cut_causes``), so arriving HERE with a count past
+        # the cap takes a state no production path writes — every
+        # ``verifier_loop_count`` writer in this domain stores its own
+        # ``state value + 1``, and the router stops the run one round earlier.
+        # This guard is therefore the backstop BEHIND that cut, not its peer,
+        # which is also why the two words differ: the reachable cut carries no
+        # verdict and lands on the evidence fallback ("failed"), while this
+        # unreachable backstop keeps the round-32 K2 word below.
         if count > settings.max_recover_verifier_loop:
             logger.warning(f"Recover verifier loop exceeded max iterations ({settings.max_recover_verifier_loop})")
             # Round-32 K2 — the word moves to its honest slot: the loop could
-            # not CONFIRM recovery, which is honest ignorance, not partial
-            # recovery. "partial" (the previous word) fed
-            # recovery_task_state_from_level the failed terminal branch
-            # (recovered=False + level=partial → "failed"), permanently
-            # closing the recovery entrance on a fault this very warning
-            # says may still be active. "unverified" keeps the row in the
-            # recoverable set (fail-closed: ignorance ≠ absence) and lets
-            # may_carry_live_fault keep the ledger verdict authoritative.
+            # not CONFIRM recovery, which is honest ignorance, not a partial
+            # recovery, and it keeps the operator-facing word distinct from
+            # the real "partial" verdict. History: with the pre-round-32
+            # word-predicate, "partial" fed recovery_task_state_from_level the
+            # failed terminal branch (recovered=False + level=partial →
+            # "failed"), which permanently closed the recovery entrance on a
+            # fault this very warning says may still be active. That entrance
+            # is now decided by evidence, not by the word: round-32 replaced
+            # the word-based recoverable set with ``may_carry_live_fault`` →
+            # ``tasks.liability_live``, which never reads ``task_state``
+            # (measured word-blind, W-56-8 review round 2 — same verdict for
+            # "failed" and "unverified" on an identical row).
             verification = {
                 "level": "unverified",
                 "layer1": {"status": "passed", "details": "Confirmed in earlier iterations"},

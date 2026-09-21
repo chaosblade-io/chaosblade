@@ -14,7 +14,7 @@ import pytest
 
 from chaos_agent.agent.target_guard.carriers import registered_carrier_is_current
 
-_META = "chaos_agent.tools.kubectl._debug_pod_metadata"
+_META = "chaos_agent.tools.kubectl_cli._debug_pod_metadata"
 
 
 def _artifact():
@@ -120,7 +120,7 @@ class TestRealSignatureIntegration:
         # tools package re-binds the name ``kubectl`` to the StructuredTool
         # instance — so resolve the MODULE via sys.modules, not the string
         # path (monkeypatch would getattr the tool object instead).
-        kubectl_module = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_module = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(
             kubectl_module, "execute_via_transport",
             self._transport_returning(self._pod_json()),
@@ -136,7 +136,7 @@ class TestRealSignatureIntegration:
             _probe_debug_pod_with_backoff,
         )
 
-        kubectl_module = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_module = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(
             kubectl_module, "execute_via_transport",
             self._transport_returning(self._pod_json()),

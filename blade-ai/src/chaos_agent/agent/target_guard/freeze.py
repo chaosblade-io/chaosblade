@@ -25,10 +25,15 @@ from typing import Mapping, Optional
 
 from chaos_agent.agent.spec.fault_registry import is_host_scope, is_workload_scope
 from chaos_agent.agent.spec.fault_spec import FaultSpec
-from chaos_agent.tools.kubectl import query_kubectl
+from chaos_agent.tools.kubectl_cli import query_kubectl
 from .classifier import canonicalise_kind
 from .guard import CLUSTER_SCOPED_KINDS, OWNER_SCOPES
-from .mechanism_writes import MechanismWriteEntry, entries_from_list, entries_to_list
+from .mechanism_writes import (
+    KNOWN_RECOVERY_CHANNELS,
+    MechanismWriteEntry,
+    entries_from_list,
+    entries_to_list,
+)
 from .types import ApprovedTarget
 
 logger = logging.getLogger(__name__)
@@ -41,6 +46,7 @@ def freeze_approved_target_from_spec(
     resolved_names: tuple[str, ...] = (),
     pvc_claims: tuple[str, ...] = (),
     mechanism_entries: tuple[MechanismWriteEntry, ...] = (),
+    recovery_channel: str = "",
     widening_pending_approval: bool = False,
 ) -> Optional[dict]:
     """Build the ``approved_target`` snapshot from a FaultSpec.
@@ -75,6 +81,7 @@ def freeze_approved_target_from_spec(
         resolved_names=resolved_names,
         pvc_claims=pvc_claims,
         mechanism_entries=mechanism_entries,
+        recovery_channel=recovery_channel,
         widening_pending_approval=widening_pending_approval,
         duration_seconds=int(getattr(spec_obj, "duration_seconds", 0) or 0),
     )
@@ -92,6 +99,7 @@ def freeze_approved_target(
     resolved_names: tuple[str, ...] = (),
     pvc_claims: tuple[str, ...] = (),
     mechanism_entries: tuple[MechanismWriteEntry, ...] = (),
+    recovery_channel: str = "",
     widening_pending_approval: bool = False,
     duration_seconds: int = 0,
 ) -> Optional[dict]:
@@ -248,6 +256,13 @@ def freeze_approved_target(
         # checkpointer round-trip.
         **({"mechanism_entries": entries_to_list(mechanism_entries)}
            if mechanism_entries else {}),
+        # Case-file recovery-route legislation (D3 source 1). Key present
+        # ONLY when the settled case declares a known channel, so every
+        # legacy snapshot stays byte-identical (golden-locked) and the
+        # route gate's fallback semantics ("no declaration → verb proxy")
+        # read off key absence, not a sentinel value.
+        **({"recovery_channel": str(recovery_channel).strip().lower()}
+           if str(recovery_channel or "").strip() else {}),
         # Pending-approval marker — present ONLY while the widened
         # contract awaits its knowing human, so both the no-manifest and
         # the post-approval snapshots stay byte-identical. Cleared by
@@ -294,6 +309,15 @@ def approved_from_dict(d: Optional[dict]) -> Optional[ApprovedTarget]:
         secondary_namespace=str(d.get("secondary_namespace") or ""),
         host_name=str(d.get("host_name") or ""),
         mechanism_entries=entries_from_list(d.get("mechanism_entries")),
+        # Hydration re-validates against the known vocabulary: a
+        # hand-edited state or a future renamed value must not smuggle an
+        # unknown channel into the gate's declaration-first branch
+        # (fail closed to the verb proxy — the pre-declaration behaviour).
+        recovery_channel=(
+            str(d.get("recovery_channel") or "").strip().lower()
+            if str(d.get("recovery_channel") or "").strip().lower()
+            in KNOWN_RECOVERY_CHANNELS else ""
+        ),
         widening_pending_approval=bool(d.get("widening_pending_approval") or False),
         duration_seconds=int(d.get("duration_seconds") or 0),
     )
@@ -568,12 +592,12 @@ async def _run_kubectl_query(args: list, kubeconfig: str):
     """Deprecated alias kept only for in-tree tests; see :func:`query_kubectl`.
 
     B81/B82 rework: the guard's reads now go through the tri-state
-    :func:`chaos_agent.tools.kubectl.query_kubectl` (error ≠ empty ≠
+    :func:`chaos_agent.tools.kubectl_cli.query_kubectl` (error ≠ empty ≠
     value) and are rendered by :func:`_jsonpath_get_args`. This stub
     exists so any straggler caller keeps working during the migration;
     new code MUST NOT use it.
     """
-    from chaos_agent.tools.kubectl import query_kubectl
+    from chaos_agent.tools.kubectl_cli import query_kubectl
     return await query_kubectl(args, kubeconfig)
 
 

@@ -34,6 +34,7 @@ from chaos_agent.agent.target_guard.mechanism_writes import (
     derive_pvc_claims_from_writes,
     entries_beyond_victim,
     load_case_mechanism_writes,
+    load_case_recovery_channel,
 )
 from chaos_agent.agent.target_guard.freeze import approved_from_dict
 from chaos_agent.agent.result.verdict import FailureCategory
@@ -55,7 +56,7 @@ async def _get_topology_deep_signal(spec, kubeconfig: str) -> tuple[int, str]:
     if spec.scope != "deployment" or not spec.names:
         return (0, "")
     try:
-        from chaos_agent.tools.kubectl import exec_kubectl_raw
+        from chaos_agent.tools.kubectl_cli import exec_kubectl_raw
 
         result = await exec_kubectl_raw(
             "get",
@@ -578,6 +579,19 @@ async def safety_check(state: AgentState) -> dict:
     mechanism_entries = load_case_mechanism_writes(
         skill_name, getattr(spec, "case_resource_path", "") or "",
     )
+    # Case-file recovery-route legislation (D3 source 1, openspec
+    # faultdrill-cr-channel): the SAME deterministic re-read discipline as
+    # the manifest — code reads the settled case file, so neither the
+    # Agent's prose reading nor any LLM planning declaration is a routing
+    # input. Frozen into the snapshot so the CR-channel route gate consults
+    # the declaration BEFORE its blade verb-vocabulary proxy (the proxy is
+    # a temporary M2 stand-in; run8 inject-2a8cd99a proved it misroutes a
+    # k8s-native mechanism whose taxonomy verbs land in the blade
+    # vocabulary — NXDOMAIN target=network action=dns). Empty for every
+    # case without the declaration (gate behaviour unchanged).
+    recovery_channel = load_case_recovery_channel(
+        skill_name, getattr(spec, "case_resource_path", "") or "",
+    )
     # #39 time-dimension gap: live claim discovery only finds PVCs that
     # ALREADY exist; a #38-shaped case applies its PVC during execution.
     # The in-band PVC is already legislated in mechanism_writes (an
@@ -614,6 +628,7 @@ async def safety_check(state: AgentState) -> dict:
             resolved_names=resolved_names,
             pvc_claims=pvc_claims,
             mechanism_entries=mechanism_entries,
+            recovery_channel=recovery_channel,
         ) or {})
         if _probe is not None:
             _widening = entries_beyond_victim(_probe)
@@ -623,6 +638,7 @@ async def safety_check(state: AgentState) -> dict:
         resolved_names=resolved_names,
         pvc_claims=pvc_claims,
         mechanism_entries=mechanism_entries,
+        recovery_channel=recovery_channel,
         widening_pending_approval=bool(_widening),
     )
     if _widening:
