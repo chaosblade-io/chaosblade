@@ -76,7 +76,9 @@ async def build_result_payload(
     state_task_id = values.get("task_id") or ""
     real_task_id = state_task_id if isinstance(state_task_id, str) and state_task_id else task_id
 
-    data = build_inject_data_from_state(values, real_task_id, elapsed_ms=elapsed_ms)
+    data = build_inject_data_from_state(
+        values, real_task_id, elapsed_ms=elapsed_ms, snapshot=final_state,
+    )
     return {"status": "success", "data": data}
 
 

@@ -101,20 +101,36 @@ def _install_sigterm_cancel_guard() -> Optional[Callable[[], None]]:
     return lambda: loop.remove_signal_handler(signal.SIGTERM)
 
 
+def _signal_interrupted_word() -> str:
+    """The classified terminal word for a signal-interrupted CLI graph run.
+
+    Single source for the interrupt case's word on BOTH CLI surfaces:
+    the row write below and the recover session's ``default_status``
+    resolve through this one helper, i.e. through the shared
+    ``abort_row_word`` taxonomy the server's abort paths use. Round-64
+    F1: the CLI recover paths spelled their session word from a boolean
+    that could not tell an interrupt from a success, so the same abort
+    event shipped "cancelled" to the row and "completed" to the session
+    record — the word split rounds 55/56 legislated away, CLI edition.
+    """
+
+    from chaos_agent.server.routes.stream_abort import abort_row_word
+
+    return abort_row_word("user_cancel")
+
+
 async def _write_signal_interrupted_row(task_id: str) -> None:
     """Terminal row write for a signal-interrupted CLI graph run.
 
-    "user_cancel" classifies to "cancelled" through the shared
-    abort_row_word taxonomy — the same single source the server abort
-    paths use. Fail-soft by design (an interrupt path must not raise
-    past the exit that is already unwinding); write_aborted_task_row
-    logs LOUD when the write is lost.
+    "user_cancel" classifies to "cancelled" through _signal_interrupted_word
+    — the same single source the server abort paths use. Fail-soft by
+    design (an interrupt path must not raise past the exit that is
+    already unwinding); write_aborted_task_row logs LOUD when the write
+    is lost.
     """
-    from chaos_agent.server.routes.stream_abort import (
-        abort_row_word,
-        write_aborted_task_row,
-    )
-    await write_aborted_task_row(task_id, abort_row_word("user_cancel"))
+    from chaos_agent.server.routes.stream_abort import write_aborted_task_row
+
+    await write_aborted_task_row(task_id, _signal_interrupted_word())
 
 
 class AgentRunner:
@@ -326,6 +342,15 @@ class AgentRunner:
         done_event = asyncio.Event()
         printer_task = asyncio.create_task(_status_printer(status_queue, done_event))
 
+        # Round-64 F2: an interrupt is the THIRD terminal case the boolean
+        # exits cannot spell. The classified word lands here from the
+        # signal arm below and rides into the session finalize as its
+        # override — without it the row shipped "cancelled" while the
+        # session's own inference spelled the same abort event "failed"
+        # (one event, two words, two user-visible surfaces: the r55 F2
+        # split, still open on the inject-CLI side).
+        abort_word = ""
+
         # Orphan-row guard: SIGTERM's default kill disposition leaves the
         # row at its last mid-graph upsert (see _install_sigterm_cancel_guard).
         _sigterm_cleanup = _install_sigterm_cancel_guard()
@@ -484,6 +509,7 @@ class AgentRunner:
             _values = final_state.values if final_state and final_state.values else None
             result_events, should_return = _build_inject_result_events(
                 _values, task_id, turn_tokens_seen, _interaction_mode,
+                snapshot=final_state,
             )
             for evt in result_events:
                 yield evt
@@ -492,7 +518,10 @@ class AgentRunner:
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
-            # never finished, so the row must leave its mid-graph word.
+            # never finished, so the row must leave its mid-graph word —
+            # and the session must hear the SAME classified word, or one
+            # abort event ships two words (the r55 F2 split, CLI edition).
+            abort_word = _signal_interrupted_word()
             try:
                 await _write_signal_interrupted_row(task_id)
             except Exception:
@@ -541,6 +570,12 @@ class AgentRunner:
                 self._session_store, graph, config, task_id,
                 kwargs=kwargs,
                 error_log_level="warning",
+                # Round-64 F2: the interrupt path's classified word — the
+                # session surface's only other writer is this finalize, so
+                # without it the row's "cancelled" met the session's
+                # inferred "failed" (the finalizer's own verdict gate
+                # still yields to a reached verdict).
+                status_override=abort_word or None,
             )
             done_event.set()
             await printer_task
@@ -648,6 +683,12 @@ class AgentRunner:
         done_event = asyncio.Event()
         printer_task = asyncio.create_task(_status_printer(status_queue, done_event))
 
+        # Round-64 F2: an interrupt is the THIRD terminal case the boolean
+        # exits cannot spell. The classified word lands here from the
+        # signal arm below and rides into the session finalize as its
+        # override (see inject_stream for the split it closes).
+        abort_word = ""
+
         # Orphan-row guard (see _install_sigterm_cancel_guard).
         _sigterm_cleanup = _install_sigterm_cancel_guard()
 
@@ -659,6 +700,19 @@ class AgentRunner:
 
             # First invoke - will pause at confirmation_gate (or complete if chat)
             result = await self._agents["pipeline"].ainvoke(initial_state, config)
+
+            # Round-64 F3: with confirm=True this invoke returns at the gate's
+            # ``interrupt()`` — the run is PARKED, not over. Capture the fact
+            # from the engine (the authority on pause) before anything
+            # translates the values, or the fail-closed terminal projection
+            # reads "no verdict yet" as "the injection failed".
+            run_paused = False
+            if kwargs.get("confirm", False):
+                from chaos_agent.agent.state import resumable_pause
+
+                run_paused = resumable_pause(
+                    await self._agents["pipeline"].aget_state(config)
+                )
 
             # If confirmation is NOT required, auto-approve and wait for completion
             # Only resume if the graph is actually paused at confirmation_gate
@@ -706,6 +760,7 @@ class AgentRunner:
             from chaos_agent.agent.result.operation_result import build_inject_data_from_state
             inject_data = build_inject_data_from_state(
                 result if isinstance(result, dict) else {}, task_id,
+                paused=run_paused,
             )
             return build_inject_envelope(
                 inject_data, inject_data["task_state"], inject_data.get("error", ""),
@@ -713,7 +768,10 @@ class AgentRunner:
 
         except (KeyboardInterrupt, asyncio.CancelledError):
             # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
-            # never finished, so the row must leave its mid-graph word.
+            # never finished, so the row must leave its mid-graph word —
+            # and the session must hear the SAME classified word, or one
+            # abort event ships two words (the r55 F2 split, CLI edition).
+            abort_word = _signal_interrupted_word()
             try:
                 await _write_signal_interrupted_row(task_id)
             except Exception:
@@ -749,6 +807,10 @@ class AgentRunner:
                 self._session_store, self._agents["pipeline"], config, task_id,
                 kwargs=kwargs,
                 error_log_level="warning",
+                # Round-64 F2: the interrupt path's classified word (see
+                # inject_stream) — the finalizer's own verdict gate still
+                # yields to a verdict the graph already reached.
+                status_override=abort_word or None,
             )
             done_event.set()
             await printer_task
@@ -1017,6 +1079,11 @@ class AgentRunner:
         status_queue = subscribe(thread_id)
         done_event = asyncio.Event()
 
+        # Orphan-row guard (see _install_sigterm_cancel_guard): this entry
+        # point drives the pipeline too, and without the guard its thread
+        # row keeps its last mid-graph word on a SIGTERM.
+        _sigterm_cleanup = _install_sigterm_cancel_guard()
+
         try:
             async for event in graph.astream_events(None, config, version="v2"):
                 for stream_evt in parse_stream_events(event):
@@ -1064,6 +1131,19 @@ class AgentRunner:
                         task_id=thread_id,
                     )
 
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
+            # never finished, so the row must leave its mid-graph word
+            # (skip_if_terminal keeps any verdict the thread reached).
+            try:
+                await _write_signal_interrupted_row(thread_id)
+            except Exception:
+                logger.warning(
+                    "Failed to write interrupted terminal word for %s "
+                    "(zombie-row risk)", thread_id,
+                )
+            raise
+
         except Exception as e:
             logger.exception(f"lift_dry_run_and_run failed for {thread_id}")
             yield StreamEvent(
@@ -1072,6 +1152,8 @@ class AgentRunner:
                 task_id=thread_id,
             )
         finally:
+            if _sigterm_cleanup is not None:
+                _sigterm_cleanup()
             done_event.set()
             unsubscribe(thread_id, status_queue)
 
@@ -1091,18 +1173,42 @@ class AgentRunner:
         try:
             from chaos_agent.persistence.task_store import get_task_store
             store = await get_task_store()
-            active_tasks = await store.query_active()
+            # Connected defect 1 (round-64): ``query_active()`` keys off the
+            # materialised liability column (round-32) — it returns rows with
+            # a COMMITTED fault awaiting recovery. A run parked at the
+            # confirmation gate has committed nothing, so it carries no
+            # liability and was invisible here, blinding the TUI
+            # crash-recovery to exactly the tasks its docstring promises to
+            # find ("paused at interrupt points, waiting for user input").
+            # The right discovery set for a pause is the ``waiting_input``
+            # word the row itself carries (``select_tasks_by_state``), which
+            # is "find resumable pauses", NOT the round-32 liability
+            # predicate — a different question, so this does not resurrect
+            # the retired "guess recoverability from the word" rule. Union
+            # both so nothing the old query found is lost; the per-task
+            # ``state.next`` check below is still the authority on whether a
+            # candidate is really paused.
+            from chaos_agent.agent.state import TaskStateOverlay
+            candidate_tasks = await store.list_tasks(
+                task_state=TaskStateOverlay.WAITING_INPUT.value,
+            )
+            try:
+                candidate_tasks += await store.query_active()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Failed to query active tasks: {e}")
         except Exception as e:
-            logger.warning(f"Failed to query active tasks: {e}")
+            logger.warning(f"Failed to query interrupted tasks: {e}")
             return []
 
         graph = self._agents["pipeline"]
         interrupted = []
+        seen_task_ids: set[str] = set()
 
-        for task in active_tasks:
+        for task in candidate_tasks:
             task_id = task.get("task_id", "")
-            if not task_id:
+            if not task_id or task_id in seen_task_ids:
                 continue
+            seen_task_ids.add(task_id)
 
             try:
                 config = {"configurable": {"thread_id": task_id}, "recursion_limit": settings.recursion_limit}
@@ -1166,6 +1272,17 @@ class AgentRunner:
         # otherwise a failed recovery records "completed" on its session
         # (the envelope's own data.result says failed/unverified).
         recover_failed = False
+        # Round-64 F1: an interrupt is the THIRD terminal case the boolean
+        # cannot spell. The classified word lands here from the signal arm
+        # below and outranks both boolean exits — without it the same
+        # abort event shipped "cancelled" to the row and the optimistic
+        # "completed" to the session record.
+        abort_word = ""
+
+        # Orphan-row guard: SIGTERM's default kill disposition leaves the
+        # inject row AND this run's recover session at their last mid-run
+        # write (see _install_sigterm_cancel_guard).
+        _sigterm_cleanup = _install_sigterm_cancel_guard()
 
         try:
             # Try to fetch LangGraph checkpoint as supplemental live context.
@@ -1247,6 +1364,21 @@ class AgentRunner:
 
             return JSONEnvelope.ok(data=recover_data)
 
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
+            # never finished, so the row must leave its mid-graph word —
+            # and the session must hear the SAME classified word, or one
+            # abort event ships two words (the r55 F2 split, CLI edition).
+            abort_word = _signal_interrupted_word()
+            try:
+                await _write_signal_interrupted_row(record_task_id)
+            except Exception:
+                logger.warning(
+                    "Failed to write interrupted terminal word for %s "
+                    "(zombie-row risk)", record_task_id,
+                )
+            raise
+
         except Exception as e:
             recover_failed = True
             code, msg = _format_error(e)
@@ -1266,6 +1398,8 @@ class AgentRunner:
                 ),
             )
         finally:
+            if _sigterm_cleanup is not None:
+                _sigterm_cleanup()
             # Finalize session: flush remaining messages from final graph state
             if self._session_store:
                 from chaos_agent.memory.session_finalizer import (
@@ -1281,7 +1415,14 @@ class AgentRunner:
                     inject_task_id,
                     state_values,
                     result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
-                    default_status="failed" if recover_failed else "completed",
+                    # Round-64 F1: the interrupt path's classified word
+                    # outranks the boolean exits — an interrupted run is
+                    # not a failed one, and never the optimistic
+                    # "completed" this expression used to spell for every
+                    # BaseException exit (the runner's two arms above).
+                    default_status=(
+                        abort_word or ("failed" if recover_failed else "completed")
+                    ),
                 )
             done_event.set()
             await printer_task
@@ -1332,6 +1473,15 @@ class AgentRunner:
         # otherwise a failed recovery records "completed" on its session
         # (the envelope's own data.result says failed/unverified).
         recover_failed = False
+        # Round-64 F1: the streaming twin of recover()'s interrupt word —
+        # an interrupt is the THIRD terminal case the boolean cannot
+        # spell, and it outranks both boolean exits.
+        abort_word = ""
+
+        # Orphan-row guard: SIGTERM's default kill disposition leaves the
+        # inject row AND this run's recover session at their last mid-run
+        # write (see _install_sigterm_cancel_guard).
+        _sigterm_cleanup = _install_sigterm_cancel_guard()
 
         try:
             current_state = await self._agents["pipeline"].aget_state(config)
@@ -1425,6 +1575,21 @@ class AgentRunner:
                 task_id=record_task_id,
             )
 
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
+            # never finished, so the row must leave its mid-graph word —
+            # and the session must hear the SAME classified word, or one
+            # abort event ships two words (the r55 F2 split, CLI edition).
+            abort_word = _signal_interrupted_word()
+            try:
+                await _write_signal_interrupted_row(record_task_id)
+            except Exception:
+                logger.warning(
+                    "Failed to write interrupted terminal word for %s "
+                    "(zombie-row risk)", record_task_id,
+                )
+            raise
+
         except Exception as e:
             recover_failed = True
             code, msg = _format_error(e)
@@ -1453,6 +1618,8 @@ class AgentRunner:
                 task_id=record_task_id,
             )
         finally:
+            if _sigterm_cleanup is not None:
+                _sigterm_cleanup()
             if self._session_store:
                 from chaos_agent.memory.session_finalizer import (
                     RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
@@ -1467,7 +1634,14 @@ class AgentRunner:
                     inject_task_id,
                     state_values,
                     result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
-                    default_status="failed" if recover_failed else "completed",
+                    # Round-64 F1: the interrupt path's classified word
+                    # outranks the boolean exits — an interrupted run is
+                    # not a failed one, and never the optimistic
+                    # "completed" this expression used to spell for every
+                    # BaseException exit (the runner's two arms above).
+                    default_status=(
+                        abort_word or ("failed" if recover_failed else "completed")
+                    ),
                 )
             done_event.set()
             await printer_task
@@ -1625,11 +1799,34 @@ class AgentRunner:
         done_event = asyncio.Event()
         printer_task = asyncio.create_task(_status_printer(status_queue, done_event))
 
+        # Orphan-row guard (see _install_sigterm_cancel_guard): resuming a
+        # paused graph is a graph run like any other — a SIGTERM here used
+        # to kill the process with the row still at its last mid-graph word.
+        _sigterm_cleanup = _install_sigterm_cancel_guard()
+
         try:
             from langgraph.types import Command
 
             resume_value = "approved" if action == "approve" else "rejected"
-            await self._agents["pipeline"].ainvoke(Command(resume=resume_value), config)
+            final = await self._agents["pipeline"].ainvoke(Command(resume=resume_value), config)
+
+            # Connected defect 2 (round-64): the docstring promises "the
+            # returned task_state reflects the final state", but the shape
+            # only carried {task_id, action, reason, confirmed_at} — so the
+            # CLI's two-phase confirm (which replaces ``result`` with this
+            # envelope) printed a bare "approved" with no verdict, and the
+            # user could not tell an injected drill from a rejected one.
+            # Read the resumed graph through the SAME single-source
+            # projection every other terminal surface uses; the resume ran
+            # the pipeline to its own verdict, so the snapshot is terminal
+            # (next empty) and the word is real, not the paused placeholder.
+            snapshot = await self._agents["pipeline"].aget_state(config)
+            from chaos_agent.agent.result.operation_result import build_inject_data_from_state
+
+            inject_data = build_inject_data_from_state(
+                final if isinstance(final, dict) else {}, task_id, snapshot=snapshot,
+            )
+            task_state = inject_data.get("task_state")
 
             return JSONEnvelope.ok(
                 data={
@@ -1637,15 +1834,32 @@ class AgentRunner:
                     "action": action,
                     "reason": reason,
                     "confirmed_at": now_iso(),
+                    "task_state": task_state,
+                    "result": task_state,
+                    "error": inject_data.get("error", ""),
                 },
 
             )
+
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Signal-interrupted run (SIGTERM cancel / Ctrl-C): the graph
+            # never finished, so the row must leave its mid-graph word.
+            try:
+                await _write_signal_interrupted_row(task_id)
+            except Exception:
+                logger.warning(
+                    "Failed to write interrupted terminal word for %s "
+                    "(zombie-row risk)", task_id,
+                )
+            raise
 
         except Exception as e:
             code, msg = _format_error(e)
             logger.exception(f"Local confirm failed for task {task_id}")
             return JSONEnvelope.fail(code=code, message=f"Task not found or confirm failed: {msg}")
         finally:
+            if _sigterm_cleanup is not None:
+                _sigterm_cleanup()
             done_event.set()
             await printer_task
             unsubscribe(task_id, status_queue)

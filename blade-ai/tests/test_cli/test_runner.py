@@ -1,10 +1,25 @@
 """Tests for CLI AgentRunner (local execution wrapper)."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from chaos_agent.cli.runner import AgentRunner
+
+# A run the verifier confirmed: L1 passed + L2 passed → the single-source
+# projection resolves the terminal word to "injected" (state.infer_task_state).
+# Both the CLI confirm() and the server confirm route read a resumed graph
+# through build_inject_data_from_state, so this shape drives a deterministic
+# verdict without mocking the projection itself.
+_INJECTED_VALUES = {
+    "operation": "inject",
+    "verification": {
+        "level": "verified",
+        "layer1": {"status": "passed"},
+        "layer2": {"status": "passed"},
+    },
+}
 
 
 class TestAgentRunnerInit:
@@ -145,6 +160,125 @@ class TestAgentRunnerConfirm:
         result = await runner.confirm("task-123", "invalid_action")
         assert result["code"] == 1001
         assert "invalid" in result["message"].lower()
+
+    @pytest.mark.asyncio
+    async def test_confirm_returns_final_task_state(self):
+        """Connected defect 2 (round-64): confirm()'s docstring promises "the
+        returned task_state reflects the final state", but the envelope used
+        to carry only {task_id, action, reason, confirmed_at} — so the CLI's
+        two-phase confirm (which replaces ``result`` with this envelope)
+        printed a bare "approved" with no verdict, and the user could not tell
+        an injected drill from a rejected one. The resumed run must be read
+        through the SAME single-source projection every terminal surface uses
+        and its word must ride the ack.
+        """
+
+        class _ResumeGraph:
+            async def ainvoke(self, command, config):
+                # resume ran the pipeline to its own verdict.
+                return dict(_INJECTED_VALUES)
+
+            async def aget_state(self, config):
+                # Terminal: the graph is no longer parked at the gate.
+                return SimpleNamespace(
+                    values=dict(_INJECTED_VALUES), next=(), tasks=[],
+                )
+
+        runner = AgentRunner()
+        runner._initialized = True
+        runner._agents = {"pipeline": _ResumeGraph()}
+
+        result = await runner.confirm("task-approve", "approve")
+        assert result["code"] == 0
+        data = result["data"]
+        # The whole point: the verdict rides the confirm ack.
+        assert data["task_state"] == "injected"
+        assert data["result"] == "injected"
+        assert data["action"] == "approve"
+
+
+class TestListInterruptedTasks:
+    """Connected defect 1 (round-64): crash-recovery discovery must see a run
+    parked at the confirmation gate.
+
+    ``list_interrupted_tasks`` used to source candidates ONLY from
+    ``query_active()``, which keys off the materialised liability column
+    (round-32) — a COMMITTED fault awaiting recovery. A run paused at
+    ``confirmation_gate`` has committed nothing, carries no liability, and was
+    therefore invisible, blinding the TUI startup scan to exactly the tasks its
+    docstring promises ("paused at interrupt points, waiting for user input").
+    The fix unions in ``list_tasks(task_state="waiting_input")`` (a "find
+    resumable pauses" query, NOT the round-32 liability predicate) while the
+    per-task ``state.next`` check stays the authority on whether a candidate
+    is really paused.
+    """
+
+    @pytest.mark.asyncio
+    async def test_discovers_paused_row_with_no_liability(self):
+        store = MagicMock()
+        # The paused row is ONLY in the waiting_input set; query_active (the
+        # old sole source) returns nothing — reproduces the pre-fix blind spot.
+        store.list_tasks = AsyncMock(return_value=[{"task_id": "task-paused"}])
+        store.query_active = AsyncMock(return_value=[])
+
+        class _Graph:
+            async def aget_state(self, config):
+                intr = SimpleNamespace(value={"plan_summary": "kill pod X"})
+                task = SimpleNamespace(interrupts=[intr])
+                return SimpleNamespace(
+                    next=("confirmation_gate",), tasks=[task], values={},
+                )
+
+        runner = AgentRunner()
+        runner._initialized = True
+        runner._agents = {"pipeline": _Graph()}
+
+        with patch(
+            "chaos_agent.persistence.task_store.get_task_store",
+            new=AsyncMock(return_value=store),
+        ):
+            result = await runner.list_interrupted_tasks()
+
+        assert [t["task_id"] for t in result] == ["task-paused"]
+        assert result[0]["next_nodes"] == ["confirmation_gate"]
+        assert result[0]["interrupt_info"] == {"plan_summary": "kill pod X"}
+
+    @pytest.mark.asyncio
+    async def test_union_dedups_and_state_next_is_authority(self):
+        store = MagicMock()
+        store.list_tasks = AsyncMock(return_value=[{"task_id": "task-paused"}])
+        # task-paused appears in BOTH sources (dedup); task-liability is a
+        # committed-fault row the engine does NOT report as paused (next empty),
+        # so it must be filtered — the union widens discovery without letting a
+        # non-paused row through.
+        store.query_active = AsyncMock(return_value=[
+            {"task_id": "task-paused"},
+            {"task_id": "task-liability"},
+        ])
+
+        class _Graph:
+            async def aget_state(self, config):
+                tid = config["configurable"]["thread_id"]
+                if tid == "task-paused":
+                    intr = SimpleNamespace(value={"plan_summary": "kill pod X"})
+                    return SimpleNamespace(
+                        next=("confirmation_gate",),
+                        tasks=[SimpleNamespace(interrupts=[intr])],
+                        values={},
+                    )
+                return SimpleNamespace(next=(), tasks=[], values={})
+
+        runner = AgentRunner()
+        runner._initialized = True
+        runner._agents = {"pipeline": _Graph()}
+
+        with patch(
+            "chaos_agent.persistence.task_store.get_task_store",
+            new=AsyncMock(return_value=store),
+        ):
+            result = await runner.list_interrupted_tasks()
+
+        assert [t["task_id"] for t in result] == ["task-paused"]
 
 
 class TestResumeStreamCleanupContract:

@@ -36,7 +36,20 @@ async def confirm_task(task_id: str, request: ConfirmRequest, req: Request):
         from langgraph.types import Command
 
         resume_value = "approved" if request.action == "approve" else "rejected"
-        await agents["pipeline"].ainvoke(Command(resume=resume_value), config)
+        final = await agents["pipeline"].ainvoke(Command(resume=resume_value), config)
+
+        # Connected defect 2 (round-64): mirror the CLI runner — the resume
+        # ran the pipeline to its own verdict, so read it through the same
+        # single-source projection and return ``task_state`` alongside the
+        # confirm ack. Without it an HTTP caller got a bare "approved" and
+        # could not tell an injected drill from a rejected one.
+        snapshot = await agents["pipeline"].aget_state(config)
+        from chaos_agent.agent.result.operation_result import build_inject_data_from_state
+
+        inject_data = build_inject_data_from_state(
+            final if isinstance(final, dict) else {}, task_id, snapshot=snapshot,
+        )
+        task_state = inject_data.get("task_state")
 
         return JSONEnvelope.ok(
             data={
@@ -44,6 +57,9 @@ async def confirm_task(task_id: str, request: ConfirmRequest, req: Request):
                 "action": request.action,
                 "reason": request.reason,
                 "confirmed_at": now_iso(),
+                "task_state": task_state,
+                "result": task_state,
+                "error": inject_data.get("error", ""),
             },
             request_id=req_id,
         )

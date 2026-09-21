@@ -8,6 +8,7 @@ import typer
 
 from chaos_agent.cli.output import OutputFormat, format_output
 from chaos_agent.config.settings import settings
+from chaos_agent.models.schemas import ResponseCode
 from chaos_agent.preflight import INJECT_CHECKS, exit_for_envelope, run_command
 
 
@@ -216,10 +217,15 @@ def inject_command(
         else:
             result = await backend.inject(**request_data)
 
-            # Interactive confirmation flow
+            # Interactive confirmation flow. The paused run arrives as
+            # AWAITING_CONFIRMATION (1003, status SUCCESS), not code 0 —
+            # round-64 F3: the pre-fix gate ``code == 0`` could never fire
+            # against the envelope the paused run actually produced, so the
+            # two-phase confirm was dead on the non-stream path even once
+            # ``needs_confirm`` rode the projection.
             if (
                 confirm
-                and result["code"] == 0
+                and result["code"] in (ResponseCode.OK, ResponseCode.AWAITING_CONFIRMATION)
                 and (result.get("data") or {}).get("needs_confirm")
             ):
                 plan = result["data"].get("plan_summary", "No plan summary available")

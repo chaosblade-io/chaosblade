@@ -59,10 +59,19 @@ def _build_inject_result_events(
     task_id: str,
     turn_tokens_seen: bool,
     interaction_mode: str,
+    snapshot=None,
 ) -> tuple[list[StreamEvent], bool]:
     """Build result StreamEvents from final graph state values.
 
     Returns (events_to_yield, should_return_early).
+
+    ``snapshot`` is the graph snapshot the caller already holds (the engine
+    is the authority on pause — round-64 F3). Forwarded to
+    ``build_inject_data_from_state`` so a stream that ``break``s at the
+    confirmation gate (``confirm=True``, no callback) reports
+    ``waiting_input`` instead of the fail-closed ``failed`` the values-only
+    projection produced. The TUI conversation branch is untouched: its
+    pause is the intent graph's, finalized on purpose (round-60 F4''').
     """
     if not values:
         return [StreamEvent(
@@ -99,7 +108,7 @@ def _build_inject_result_events(
         return events, True
 
     from chaos_agent.agent.result.operation_result import build_inject_data_from_state
-    result_data = build_inject_data_from_state(values, task_id)
+    result_data = build_inject_data_from_state(values, task_id, snapshot=snapshot)
 
     events: list[StreamEvent] = [StreamEvent(
         type="result",

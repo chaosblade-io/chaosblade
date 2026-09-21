@@ -3,12 +3,15 @@
 from chaos_agent.agent.state import (
     AgentState,
     build_status_data,
+    graph_is_paused,
     has_active_fault,
     infer_inject_status,
     infer_phase,
     infer_recover_status,
     infer_task_state,
     materialize_fault_handle,
+    paused_task_state,
+    resumable_pause,
     terminal_task_state,
 )
 from chaos_agent.agent.state_mgmt.state_lifecycle import (
@@ -1087,3 +1090,50 @@ class TestRecoverUnverified:
     def test_infer_recover_status_recovered_unchanged(self):
         assert infer_recover_status("recovered", "recover") == "success"
         assert infer_recover_status("partial_recovered", "recover") == "success"
+
+
+class TestPausePredicates:
+    """Round-64 R4: the single-source pause vocabulary.
+
+    ``graph_is_paused`` is the ENGINE authority (``snapshot.next`` non-empty);
+    ``paused_task_state`` is the VALUES-side derivation (mid-flight word + a
+    confirmation owed + no committed fault → ``waiting_input``);
+    ``resumable_pause`` is their conjunction — the predicate that lets the
+    session finalizer tell a PIPELINE confirmation pause (keep active) from
+    an INTENT-graph dialogue pause (finalize on purpose, round-60 F4''').
+    """
+
+    @staticmethod
+    def _snap(values, next_nodes):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(values=values, next=next_nodes)
+
+    def _owed_confirmation(self):
+        return {"operation": "inject", "needs_confirmation": True}
+
+    def test_graph_is_paused_reads_next(self):
+        assert graph_is_paused(self._snap({}, ("confirmation_gate",))) is True
+        assert graph_is_paused(self._snap({}, ())) is False
+        assert graph_is_paused(None) is False
+
+    def test_paused_task_state_needs_all_three_facts(self):
+        # mid-flight + confirmation owed + nothing committed → waiting_input
+        assert paused_task_state(self._owed_confirmation()) == "waiting_input"
+        # no confirmation owed → not a pause
+        assert paused_task_state({"operation": "inject"}) is None
+        # a committed fault means the gate already ran → the pause is history
+        committed = {**self._owed_confirmation(), "experiment_uid": "uid-1"}
+        assert paused_task_state(committed) is None
+
+    def test_resumable_pause_requires_engine_and_contract(self):
+        values = self._owed_confirmation()
+        # engine paused AND confirmation owed → resumable inject pause
+        assert resumable_pause(self._snap(values, ("confirmation_gate",))) is True
+        # engine NOT paused (next empty) → not resumable, even with the values
+        assert resumable_pause(self._snap(values, ())) is False
+        # engine paused but NO owed confirmation (e.g. an intent-graph dialogue
+        # pause) → not a resumable INJECT pause; the finalizer finalizes it
+        assert resumable_pause(self._snap({"operation": "inject"}, ("intent_confirm",))) is False
+        assert resumable_pause(None) is False
+

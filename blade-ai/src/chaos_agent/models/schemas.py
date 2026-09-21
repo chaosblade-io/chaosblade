@@ -46,6 +46,14 @@ class ResponseCode(IntEnum):
     # Distinct from INVALID_ACTION which the legacy injection routes
     # already use for action-string rejection.
     INVALID_PARAMS = 1002
+    # The run is NOT finished: it is parked at an interrupt boundary
+    # (confirmation gate / ask_human) waiting for a human decision.
+    # Distinct from every failure code on purpose — the pre-round-64
+    # envelope mapped this to INJECTION_FAILED, so ``--confirm`` told the
+    # user "Injection failed" for a drill that had never been allowed to
+    # run. Status stays SUCCESS (the agent did exactly what it was asked:
+    # plan, then stop and ask); the code carries the "your turn" fact.
+    AWAITING_CONFIRMATION = 1003
 
     # Not-found (2xxx)
     TASK_NOT_FOUND = 2001
@@ -149,7 +157,27 @@ def build_inject_envelope(
     Uses JSONEnvelope.fail() when task_state indicates failure,
     JSONEnvelope.ok() otherwise. The inject_data is always included
     in the data field for diagnostic purposes.
+
+    ``waiting_input`` is neither: the run has not ended, so there is no
+    outcome to report yet. It gets SUCCESS + AWAITING_CONFIRMATION and a
+    message that names the rescue command, because the pre-round-64
+    mapping to ``fail``/INJECTION_FAILED sent every ``--confirm`` user
+    looking for a fault that did not exist.
     """
+    from chaos_agent.agent.state import TaskStateOverlay
+
+    if task_state == TaskStateOverlay.WAITING_INPUT.value:
+        task_id = str(inject_data.get("task_id") or "")
+        return JSONEnvelope.ok(
+            code=ResponseCode.AWAITING_CONFIRMATION,
+            message=(
+                "Injection is awaiting confirmation — the graph is paused at "
+                "the confirmation gate and nothing has been injected yet. "
+                f"Resume with: blade-ai confirm --task-id {task_id} "
+                "--action approve"
+            ),
+            data=inject_data,
+        )
     if task_state == "failed":
         code = ResponseCode.INJECTION_FAILED
         if failure_reason:

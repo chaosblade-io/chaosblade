@@ -315,11 +315,17 @@ async def inject_stream(request: InjectRequest, req: Request):
                     ).to_sse()
                     return
 
-                # Fault injection result
+                # Fault injection result. ``snapshot=final_state`` makes the
+                # engine the authority on pause (round-64 F3): with
+                # ``confirm=true`` this route emits the ``confirm`` event
+                # above and leaves the graph PARKED, so the projection must
+                # read ``waiting_input``, not the fail-closed ``failed`` the
+                # values-only path produced. ``needs_confirm`` /
+                # ``plan_summary`` now ride the single-source projection —
+                # the hand-patched copies this route used to add after the
+                # call are gone (they were one of the six divergent shapes).
                 from chaos_agent.agent.result.operation_result import build_inject_data_from_state
-                _data = build_inject_data_from_state(values, task_id)
-                _data["plan_summary"] = values.get("plan_summary", "")
-                _data["needs_confirm"] = request.confirm
+                _data = build_inject_data_from_state(values, task_id, snapshot=final_state)
                 _data["created_at"] = now_iso()
 
                 yield StreamEvent(

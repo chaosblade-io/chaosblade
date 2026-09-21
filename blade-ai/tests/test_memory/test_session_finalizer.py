@@ -242,6 +242,77 @@ async def test_finalize_failed_inject_persists_failed_status_and_summary():
     assert "iptables not found" in store.finalized["result_summary"]["data"]["error"]
 
 
+def _paused_inject_values() -> dict:
+    """A run parked at the confirmation gate: a plan exists, a confirmation
+    is still owed, and NOTHING has committed (no uid, no verification)."""
+    spec = FaultSpec(
+        namespace="arms-prom",
+        scope="pod",
+        names=("pod-a",),
+        fault_target="cpu",
+        fault_action="fullload",
+        params={"cpu-percent": "80"},
+    )
+    return {
+        "fault_spec": spec.to_dict(),
+        "needs_confirmation": True,
+        "plan_summary": "Inject pod-cpu fullload on pod-a",
+    }
+
+
+class _PausedGraph:
+    """A graph snapshot sitting at an interrupt boundary (``next`` non-empty)
+    — the engine's authority that the run has paused, not ended."""
+
+    def __init__(self, values: dict, next_nodes=("confirmation_gate",)):
+        self.values = values
+        self.next = next_nodes
+
+    async def aget_state(self, config):
+        return SimpleNamespace(values=self.values, next=self.next)
+
+
+@pytest.mark.asyncio
+async def test_finalize_inject_session_keeps_paused_run_active():
+    """Round-64 F3 regression: a run parked at the confirmation gate has NOT
+    ended — ``blade-ai confirm`` / ``POST /confirm/{task_id}`` continues it.
+    Finalizing must flush nothing terminal and leave the session OPEN for the
+    resume path; the pre-fix behavior archived it as a finished failure
+    (``inject_session_status`` is fail-closed on a verdict-less projection),
+    released the in-memory session, and blinded the turn route's has_active
+    defensive arm."""
+    store = _SessionStore()
+
+    await finalize_inject_session(
+        store,
+        _PausedGraph(_paused_inject_values()),
+        {"configurable": {"thread_id": "task-paused"}},
+        "task-paused",
+    )
+
+    # No terminal word written — the session stays active for the resume.
+    assert store.finalized is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_inject_session_still_finalizes_terminal_run():
+    """Guard against the pause fix over-firing: a graph that is NOT paused
+    (``next`` empty) with the same verdict-less values is a finished failure
+    and MUST still be finalized fail-closed."""
+    store = _SessionStore()
+
+    await finalize_inject_session(
+        store,
+        _Graph({**_paused_inject_values(), "error": "execution_failed: boom"}),
+        {"configurable": {"thread_id": "task-ended"}},
+        "task-ended",
+    )
+
+    assert store.finalized is not None
+    assert store.finalized["status"] == "failed"
+
+
+
 @pytest.mark.asyncio
 async def test_finalize_cancelled_inject_keeps_summary_but_marks_cancelled():
     store = _SessionStore()
@@ -508,6 +579,137 @@ async def test_finalize_recover_cli_envelope_default_lands_on_empty_values():
         _inject_values(),
         result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
         default_status="failed",
+    )
+
+    assert store.finalized["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_no_word_is_fail_closed_midflight():
+    """Round-64 F1: with NO classified word and NO verdict the floor is
+    "failed", never "completed". This is the interrupt shape — the CLI
+    recover paths used to reach this finalize with a mid-flight state and
+    the optimistic default, recording a Ctrl-C'd recovery as a completed
+    one while the same record's envelope said "recovering"."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph({"operation": "recover"}),
+        {"configurable": {"thread_id": "task-recover-noword-midflight"}},
+        "task-recover-noword-midflight",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+    )
+
+    assert store.finalized["status"] == "failed"
+    # The two faces do not contradict each other: the session word is the
+    # verdict ("no evidence → failed"), the envelope's own result is the
+    # position ("recovering"). Neither claims a success.
+    assert store.finalized["result_summary"]["data"]["result"] == "recovering"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_no_word_verdict_still_speaks():
+    """A reached verdict speaks for a caller with no word of its own —
+    the fail-closed floor must never overwrite evidence on record."""
+    cases = (
+        (_recover_values(), "completed"),
+        (
+            {
+                "operation": "recover",
+                "recover_verification": {
+                    "level": "failed",
+                    "layer1": {"status": "failed"},
+                },
+            },
+            "failed",
+        ),
+        (
+            {
+                "operation": "recover",
+                "recover_verification": {"level": "unverified"},
+            },
+            "completed",
+        ),
+    )
+    for values, expected in cases:
+        store = _SessionStore()
+        await finalize_recover_session(
+            store,
+            _Graph(values),
+            {"configurable": {"thread_id": "task-recover-noword-verdict"}},
+            "task-recover-noword-verdict",
+            "task-inject",
+            _inject_values(),
+            result_summary_mode=RESULT_SUMMARY_RECOVER_CLI_ENVELOPE,
+        )
+        assert store.finalized["status"] == expected, values
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_no_word_no_payload_no_values_is_fail_closed():
+    """The payload-mode twin: an empty state and no payload is the weakest
+    evidence a recover run can leave — the former "completed" default
+    recorded exactly that run as a success."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph({}),
+        {"configurable": {"thread_id": "task-recover-noword-empty"}},
+        "task-recover-noword-empty",
+        "task-inject",
+        _inject_values(),
+        result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+    )
+
+    assert store.finalized["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_no_word_falls_back_to_payload_word():
+    """A payload on record still speaks for a caller with no word: the
+    fail-closed floor applies only when nothing else is left."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph({"operation": "recover"}),
+        {"configurable": {"thread_id": "task-recover-noword-payload"}},
+        "task-recover-noword-payload",
+        "task-inject",
+        _inject_values(),
+        result_payload={
+            "status": "success",
+            "data": {
+                "task_id": "task-recover-noword-payload",
+                "task_state": "recovered",
+            },
+        },
+        result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
+    )
+
+    assert store.finalized["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_finalize_recover_no_word_data_less_payload_falls_through():
+    """A payload carrying no data dict is not a verdict — the state's own
+    verdict decides (the former code read any non-dict data as a
+    completion)."""
+    store = _SessionStore()
+
+    await finalize_recover_session(
+        store,
+        _Graph({"operation": "recover"}),
+        {"configurable": {"thread_id": "task-recover-noword-barepayload"}},
+        "task-recover-noword-barepayload",
+        "task-inject",
+        _inject_values(),
+        result_payload={"status": "success"},
+        result_summary_mode=RESULT_SUMMARY_RECOVER_PAYLOAD,
     )
 
     assert store.finalized["status"] == "failed"

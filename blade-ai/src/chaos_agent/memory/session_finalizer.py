@@ -23,6 +23,20 @@ spans EVERY ``result_summary_mode``: the recover CLI envelope's status
 consumes ``default_status`` directly (round-63 R63-1 — its former
 hard-coded "completed" recorded FAILED recoveries as completed,
 contradicting the envelope's own ``data.result`` on the same record).
+
+Fail-closed floor (round-64 F1): "no classified word" and "the run
+completed" are different facts, and the recover surface's default used
+to conflate them — ``default_status`` defaulted to "completed", while
+the CLI's expression could spell only two of the three terminal cases
+(success / failure; an interrupt is a BaseException, invisible to the
+boolean it keyed on). An interrupted ``blade-ai recover`` therefore
+recorded its session as "completed" while the same record's envelope
+said "recovering". The default is now None ("the caller has no word")
+and a caller with nothing to say falls through to
+``_recover_session_status``, whose floor is "failed": no evidence of
+success must never upgrade to success — the same polarity
+``inject_session_status`` and ``terminal_task_state`` already enforce
+on the inject surface.
 """
 
 from __future__ import annotations
@@ -104,18 +118,76 @@ def inject_session_status(data: dict[str, Any]) -> str:
 
 def _recover_status_from_payload(
     result_payload: dict[str, Any] | None,
-    *,
-    default_status: str = "completed",
-) -> str:
+) -> str | None:
+    """The session word the result payload itself spells, or None.
+
+    ``None`` = no payload on record (every abort path and the whole CLI
+    never build one) or a payload carrying no data dict — the caller
+    then falls through to the graph state's own verdict instead of
+    reading the absence as a completion.
+    """
+
     if not isinstance(result_payload, dict):
-        return default_status
+        return None
     envelope_status = str(result_payload.get("status") or "").lower()
     if envelope_status in {"fail", "failed", "error"}:
         return "failed"
     data = result_payload.get("data")
     if not isinstance(data, dict):
-        return default_status
+        return None
     return "failed" if data.get("task_state") == "failed" else "completed"
+
+
+def _recover_verdict_word(values_fin: dict[str, Any]) -> str | None:
+    """The word a recover graph state's OWN verdict spells, or None.
+
+    ``None`` means the state carries no verdict — still mid-flight.
+    Both mid-flight markers are excluded, not just "recovering": a
+    pre-dispatch recover state (operation not yet written) infers
+    "injecting", which is a position on the way, not a verdict. The
+    polarity is the payload path's own — only "failed" lands failed;
+    unverified and partial_recovered are session-level completions.
+    """
+
+    if not values_fin:
+        return None
+    from chaos_agent.agent.state import infer_task_state
+
+    state = infer_task_state(values_fin)
+    if state in ("recovering", "injecting"):
+        return None
+    return "failed" if state == "failed" else "completed"
+
+
+def _recover_session_status(
+    values_fin: dict[str, Any],
+    result_payload: dict[str, Any] | None,
+    override: str | None,
+) -> str:
+    """The recover session word for a run with no classified word of its own.
+
+    Priority: the caller's classified word (when it has one — the
+    payload-mode callers and the CLI's own classified arms) > the result
+    payload's envelope word > the graph state's own verdict > the
+    fail-closed floor. The floor is "failed", NEVER "completed": a run
+    that left no evidence of success must not be recorded as one. A
+    mid-flight interrupt (Ctrl-C / SIGTERM / scope cancel) arrives here
+    with no override, no payload and a "recovering" state, and the
+    former "completed" floor recorded exactly that run as a success —
+    while the same record's envelope said "recovering", the word split
+    the row surface legislated away in rounds 55/56, session edition
+    (round-64 F1).
+    """
+
+    if override:
+        return override
+    payload_word = _recover_status_from_payload(result_payload)
+    if payload_word is not None:
+        return payload_word
+    verdict_word = _recover_verdict_word(values_fin)
+    if verdict_word is not None:
+        return verdict_word
+    return "failed"
 
 
 def build_recover_session_summary(
@@ -203,17 +275,51 @@ async def finalize_inject_session(
     try:
         remaining = []
         values_fin = {}
+        snapshot = None
 
-        try:
-            if precomputed_values:
-                values_fin = precomputed_values
-            else:
-                final_graph_state = await graph_or_agent.aget_state(config)
-                if final_graph_state and final_graph_state.values:
-                    values_fin = final_graph_state.values
-            remaining = values_fin.get("messages", []) if values_fin else []
-        except Exception:
-            pass
+        # Snapshot read is best-effort and ISOLATED: a caller that already
+        # holds the values (``precomputed_values`` — the turn route's finally
+        # arm) must not lose them just because this second ``aget_state``
+        # fails or the caller passed no graph at all. The snapshot is needed
+        # only for the pause guard below; the values drive everything else.
+        if graph_or_agent is not None:
+            try:
+                snapshot = await graph_or_agent.aget_state(config)
+            except Exception:
+                snapshot = None
+
+        if precomputed_values:
+            values_fin = precomputed_values
+        elif snapshot and snapshot.values:
+            values_fin = snapshot.values
+        remaining = values_fin.get("messages", []) if values_fin else []
+
+        # Round-64 F3: a run parked at the confirmation gate has NOT ended —
+        # ``blade-ai confirm --task-id <id>`` / ``POST /confirm/{task_id}``
+        # continues it. Finalizing here archived it as a finished failure
+        # (``inject_session_status`` on a verdict-less projection is
+        # fail-closed by design), released the in-memory session so no later
+        # writer could correct the word, and blinded the turn route's
+        # defensive arm (which gates on ``has_active``). Flush the dialogue
+        # and keep the session OPEN: the resume path's own terminal point
+        # (``save_memory``) is the closer.
+        from chaos_agent.agent.state import resumable_pause
+
+        if resumable_pause(snapshot):
+            logger.info(
+                "Session %s paused at an interrupt boundary; keeping it "
+                "active for the resume path (no terminal word written)",
+                session_id,
+            )
+            if remaining and session_store.has_active(session_id):
+                try:
+                    session_store.append_messages(session_id, remaining)
+                except Exception:
+                    logger.debug(
+                        "Pre-resume message flush failed for %s",
+                        session_id, exc_info=True,
+                    )
+            return
 
         from chaos_agent.agent.result.operation_result import (
             build_inject_data_from_state,
@@ -247,7 +353,7 @@ async def finalize_inject_session(
                 status_override = None
 
         data = (
-            build_inject_data_from_state(values_fin, session_id)
+            build_inject_data_from_state(values_fin, session_id, snapshot=snapshot)
             if values_fin
             else build_unknown_inject_data(session_id)
         )
@@ -276,7 +382,7 @@ async def finalize_recover_session(
     *,
     result_payload: dict[str, Any] | None = None,
     result_summary_mode: str = RESULT_SUMMARY_RECOVER_PAYLOAD,
-    default_status: str = "completed",
+    default_status: str | None = None,
     error_log_level: str = "warning",
     precomputed_values: dict[str, Any] | None = None,
 ) -> None:
@@ -293,6 +399,16 @@ async def finalize_recover_session(
     row's verdict (the r55 F2 word split, recover edition). Empty values
     (aget_state failed) do NOT suppress the default: the interrupt itself
     is a KNOWN terminal fact (round-53 ruling).
+
+    No-word contract (round-64 F1): ``default_status`` DEFAULT is None —
+    "the caller has no classified word", never "the run completed". A
+    caller with nothing to say falls through to ``_recover_session_status``,
+    whose floor is "failed" (fail-closed): a run that left no evidence of
+    success is never recorded as one. The former "completed" default made
+    every caller that forgot to classify — the CLI recover paths on their
+    interrupt exits, and any future entry point — record a mid-flight
+    Ctrl-C/SIGTERM as a completed recovery, contradicting the same
+    record's own envelope ("recovering").
     """
 
     if not session_store:
@@ -353,15 +469,18 @@ async def finalize_recover_session(
 
         status = (
             # CLI envelope: the caller classifies ("completed" on the
-            # normal path, "failed" from the failure exits — the caller
-            # knows which one ran); the verdict gate above still holds
-            # (a verdict reached before the crash keeps its derived word).
+            # normal path, "failed"/"cancelled" from the failure and
+            # interrupt exits — the caller knows which one ran); the
+            # verdict gate above still holds (a verdict reached before
+            # the crash keeps its derived word). A caller with NO word
+            # falls through to the evidence ladder instead of this leg
+            # (round-64 F1): the interrupt exits that never classified
+            # used to land right here on the old "completed" default and
+            # recorded a mid-flight Ctrl-C/SIGTERM as a success.
             default_status
             if result_summary_mode == RESULT_SUMMARY_RECOVER_CLI_ENVELOPE
-            else _recover_status_from_payload(
-                result_payload,
-                default_status=default_status,
-            )
+            and default_status
+            else _recover_session_status(values_fin, result_payload, default_status)
         )
 
         session_store.finalize_session(

@@ -393,3 +393,94 @@ def test_future_experiment_carrier_pins_without_consumer_changes():
     finally:
         FaultProviderRegistry.clear()
         FaultProviderRegistry.register_builtins()
+
+
+# ── Round-64 F3: the paused-at-confirmation-gate projection ──────────────
+#
+# A run parked at ``confirmation_gate`` has NOT ended. The pre-fix builder
+# ran every caller through ``terminal_task_state`` (fail-closed: no verdict
+# → ``failed``), so ``blade-ai inject --confirm`` told the user "Injection
+# failed" for a drill that was only waiting for approval. The fix gives the
+# pause a single word (``waiting_input``) sourced from the engine snapshot,
+# and the envelope a distinct SUCCESS code that names the rescue command.
+
+
+def _paused_values() -> dict:
+    spec = FaultSpec(
+        namespace="arms-prom",
+        scope="pod",
+        names=("pod-a",),
+        fault_target="cpu",
+        fault_action="fullload",
+        params={"cpu-percent": "80"},
+    )
+    return {
+        "confirmed_intent": "inject",
+        "fault_spec": spec.to_dict(),
+        "needs_confirmation": True,
+        "plan_summary": "Inject pod-cpu fullload on pod-a",
+        # no experiment_uid, no verification → nothing committed yet
+    }
+
+
+def _snapshot(values: dict, next_nodes):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(values=values, next=next_nodes)
+
+
+def test_paused_snapshot_projects_waiting_input_not_failed():
+    data = build_inject_data_from_state(
+        _paused_values(), "task-paused",
+        snapshot=_snapshot(_paused_values(), ("confirmation_gate",)),
+    )
+
+    assert data["task_state"] == "waiting_input"
+    # The two-phase-confirm contract rides the projection (single source),
+    # so the CLI/SSE consumers no longer hand-patch it per surface.
+    assert data["needs_confirm"] is True
+    assert data["plan_summary"] == "Inject pod-cpu fullload on pod-a"
+
+
+def test_paused_envelope_is_success_awaiting_confirmation():
+    from chaos_agent.models.schemas import ResponseCode, build_inject_envelope
+
+    data = build_inject_data_from_state(
+        _paused_values(), "task-paused",
+        snapshot=_snapshot(_paused_values(), ("confirmation_gate",)),
+    )
+    envelope = build_inject_envelope(data, data["task_state"], data.get("error", ""))
+
+    assert envelope["status"] == "success"
+    assert envelope["code"] == ResponseCode.AWAITING_CONFIRMATION
+    assert "blade-ai confirm --task-id task-paused" in envelope["message"]
+    assert envelope["data"]["task_state"] == "waiting_input"
+
+
+def test_terminal_run_with_stale_needs_confirmation_stays_failed():
+    """Guard against over-firing: with NO snapshot and NO explicit paused
+    flag the builder is at a terminal point and must fail closed. A finished
+    failure still carries ``needs_confirmation`` from planning — the values
+    alone cannot tell "paused" from "ran and failed", so pause detection is
+    opt-in through the engine, never guessed."""
+    values = {**_paused_values(), "error": "execution_failed: iptables not found"}
+
+    data = build_inject_data_from_state(values, "task-ended")
+
+    assert data["task_state"] == "failed"
+
+
+def test_non_confirmation_interrupt_is_not_a_resumable_inject_pause():
+    """A snapshot paused at some OTHER interrupt (next non-empty) whose
+    values carry no owed confirmation is not a resumable inject pause — the
+    builder's snapshot branch requires the confirmation contract, matching
+    ``resumable_pause`` so the session finalizer and the projection agree."""
+    values = {"confirmed_intent": "inject", "fault_spec": _paused_values()["fault_spec"]}
+
+    data = build_inject_data_from_state(
+        values, "task-other-interrupt",
+        snapshot=_snapshot(values, ("some_other_gate",)),
+    )
+
+    assert data["task_state"] != "waiting_input"
+

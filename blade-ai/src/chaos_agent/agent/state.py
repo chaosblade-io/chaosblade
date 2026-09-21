@@ -408,7 +408,11 @@ def infer_task_state(values: dict) -> str:
     if not isinstance(result, dict):
         result = {}
 
-    # Safety rejection
+    # Safety rejection. The word means the SAFETY GATE rejected this attempt —
+    # not "any terminal rejection": the reject node deliberately leaves
+    # ``safety_status`` alone (W-56-6 defect d), so a planning-timeout run that
+    # died in the loop keeps whatever the gate last said ("pending" = it never
+    # ran, "retry" = it sent the plan back) and lands on "failed" below.
     if safety_status == "rejected":
         return "rejected"
 
@@ -572,6 +576,74 @@ def terminal_task_state(values: dict) -> str:
     """
     state = infer_task_state(values)
     return "failed" if state == "injecting" else state
+
+
+def graph_is_paused(snapshot) -> bool:
+    """True when a graph snapshot sits at an interrupt boundary.
+
+    The ENGINE is the authority on "has this run stopped or is it waiting
+    for someone": a static ``interrupt()`` leaves the checkpoint with a
+    non-empty ``next`` and returns the in-flight values to ``ainvoke``
+    without raising. Reading the values alone cannot answer the question
+    — the same dict describes a run that ended without a verdict and a
+    run that has not ended yet.
+
+    Single source for the pause question (round-64 R4). Before this the
+    answer was re-invented at six consumption sites in five different
+    shapes (``if final_state.next`` in turn_result, a ``paused_at_interrupt``
+    flag in turn_event_stream, ``has_active_fault`` in the CLI lift path,
+    ``result="pending"`` in the HTTP route, a hand-set ``needs_confirm`` in
+    the SSE route, ``_compute_inferred`` in the persistence layer) and
+    omitted at four more — every omission translated "waiting for a human"
+    into "the injection failed".
+    """
+    return bool(snapshot is not None and getattr(snapshot, "next", None))
+
+
+def paused_task_state(values: dict) -> str | None:
+    """``waiting_input`` when *values* describe a run parked at a gate, else None.
+
+    The VALUES-side counterpart of :func:`graph_is_paused`, for callers
+    that hold a state dict and no snapshot (the persistence row writer,
+    result builders fed by ``ainvoke``'s return). Derivation is the one
+    ``TaskStore._compute_inferred`` has shipped since round-17 D4:
+    mid-flight word + a confirmation still owed + no committed fault.
+    A fault already on the books means the gate ran and the run moved
+    past it — the pause is history, not the current situation.
+    """
+    state = infer_task_state(values)
+    if state not in ("injecting", "cancelled"):
+        return None
+    if not values.get("needs_confirmation"):
+        return None
+    if has_active_fault(values):
+        return None
+    return TaskStateOverlay.WAITING_INPUT.value
+
+
+def resumable_pause(snapshot) -> bool:
+    """True when *snapshot* is an inject pause a resume command can continue.
+
+    Stricter than :func:`graph_is_paused` on purpose, because the session
+    finalizer must tell two paused graphs apart:
+
+    * the PIPELINE parked at ``confirmation_gate`` — the run is not over,
+      ``blade-ai confirm`` / ``POST /confirm/{task_id}`` continues it, so
+      closing the session would archive a live drill as a finished failure;
+    * the INTENT / dialogue graph parked at ``intent_confirm`` — every
+      consumer of that pause finalizes on purpose (the round-60 F4'''
+      ruling: the turn route's finally reads the intent graph, whose pause
+      is not a resumable inject).
+
+    The discriminator is the confirmation contract itself: engine says
+    paused AND a confirmation is still owed AND no fault committed yet —
+    the same three facts :func:`paused_task_state` derives from values
+    alone, so the snapshot-side and values-side answers cannot drift.
+    """
+    if not graph_is_paused(snapshot):
+        return False
+    values = getattr(snapshot, "values", None) or {}
+    return paused_task_state(dict(values)) is not None
 
 
 def infer_stage(values: dict) -> Optional[str]:
@@ -909,6 +981,25 @@ def extract_ui_diagnostics(values: dict) -> dict:
     }
 
 
+def duration_ms_from_timestamps(created_at: str, finished_at: str) -> int:
+    """Derive wall-clock duration (ms) from ISO timestamps; 0 when underivable.
+
+    Single source for the created_at→finished_at derivation shared by
+    ``build_status_data`` (read path) and ``sync_to_store`` (write path,
+    W-55-11: the tasks.duration_ms column used to stay 0 for every
+    inject row because no writer ever computed it — the only fallback
+    was the read-side recompute in ``get_metric``).
+    """
+    if not created_at or not finished_at:
+        return 0
+    try:
+        ct = parse_iso_timestamp(created_at)
+        ft = parse_iso_timestamp(finished_at)
+        return int((ft - ct).total_seconds() * 1000)
+    except (ValueError, TypeError):
+        return 0
+
+
 def build_status_data(task_id: str, values: dict) -> dict:
     """Build a complete status data dict from LangGraph checkpoint values.
 
@@ -934,15 +1025,8 @@ def build_status_data(task_id: str, values: dict) -> dict:
     created_at = values.get("created_at") or ""
     finished_at = values.get("finished_at") or ""
 
-    # Calculate duration
-    duration_ms = 0
-    if created_at and finished_at:
-        try:
-            ct = parse_iso_timestamp(created_at)
-            ft = parse_iso_timestamp(finished_at)
-            duration_ms = int((ft - ct).total_seconds() * 1000)
-        except (ValueError, TypeError):
-            pass
+    # Calculate duration (single-sourced derivation, W-55-11)
+    duration_ms = duration_ms_from_timestamps(created_at, finished_at)
 
     outcome = read_operation_outcome(values)
     failure_detail = outcome.failure_detail
@@ -1041,6 +1125,21 @@ class AgentState(MessagesState):
     plan_confirmed: bool = False         # submit_plan completed; /run routes to safety_check
 
     # ── Safety ─────────────────────────────────────────────────────
+    # ``safety_status`` is the run's last-safety-verdict word and drives
+    # task_state / status payloads / operator reports. Two writer domains
+    # hold authority for the terminal value "rejected" (pinned in
+    # tests/test_agent/test_write_contracts.py):
+    #   * the safety gates (safety_check / confirmation_gate /
+    #     _write_set_boundary) — a safety verdict, always with a fresh
+    #     ``safety_reason`` beside it;
+    #   * agent_loop's transport exit — a configuration failure, written
+    #     together with ``planning_rejected`` (the node's other entry, its
+    #     count-cap branch, is unreachable: the router rejects at
+    #     ``count >= settings.max_agent_loop`` — the value ``MAX_AGENT_LOOP``
+    #     snapshots — before a larger count can reach the node).
+    # Terminal nodes only: stamping "rejected" mid-loop flips the
+    # task_state derivation (failed → rejected), so every writer above is a
+    # terminal exit by construction.
     safety_status: str = "pending"       # pending / safe / unsafe / warning / rejected / retry
     safety_reason: Optional[str] = None
     safety_checked_detail: Optional[str] = None
@@ -1101,14 +1200,6 @@ class AgentState(MessagesState):
     # "method": "kubectl_native"|"host_native"}`` for UID-less carriers.
     # None = no committed fault (or the attribution was cleared at a seam).
     fault_handle: Optional[dict] = None
-    # Readback bookkeeping (faultdrill-cr-channel task 2.1): the carrier
-    # handle value (e.g. the CR's ``ns/name``) whose landing was already
-    # integrity-verified by the post-landing readback guard. Idempotence
-    # input only — the provider's hook skips an already-verified landing;
-    # the replan seam clears it WITH the handle (a retry under a fresh
-    # epoch re-runs the check, because a re-apply may carry a different
-    # recipe under the same name). None = nothing verified yet.
-    fault_readback_verified: Optional[str] = None
     # UIDs retired by FRAMEWORK-side cleanup (verify-replan residual destroy).
     # Such destroys run in code, so they leave NO blade_destroy ToolMessage in
     # history and _collect_destroyed_uids cannot see them; without this list a

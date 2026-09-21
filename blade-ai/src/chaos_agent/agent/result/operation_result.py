@@ -22,8 +22,12 @@ from chaos_agent.agent.result.operation_outcome import (
 from chaos_agent.agent.result.verdict import RecoverVerdict
 from chaos_agent.agent.state import (
     TaskState,
+    TaskStateOverlay,
+    duration_ms_from_timestamps,
     extract_ui_diagnostics,
+    graph_is_paused,
     materialize_fault_handle,
+    paused_task_state,
     recovery_task_state_from_level,
     strip_side_effects,
     terminal_task_state,
@@ -106,15 +110,67 @@ def build_inject_data_from_state(
     task_id: str,
     *,
     elapsed_ms: int = 0,
+    paused: bool | None = None,
+    snapshot=None,
 ) -> dict[str, Any]:
-    """Build the result-card data dict for an inject graph state."""
+    """Build the result-card data dict for an inject graph state.
+
+    ``paused`` / ``snapshot`` declare whether the caller is really at a
+    terminal point. The builder's fail-closed word (``terminal_task_state``:
+    no verdict → ``failed``) is only correct for a run that has ENDED; a
+    run parked at ``confirmation_gate`` has not ended, and translating it
+    as a failure told the user "Injection failed" for a drill that was
+    waiting for their approval (round-64 F3). Callers holding the graph
+    snapshot pass it (the engine is the authority — see
+    :func:`graph_is_paused`, gated by the confirmation contract
+    :func:`paused_task_state` so a non-confirmation interrupt is not
+    misread as a resumable inject); callers holding only ``ainvoke``'s
+    returned values pass ``paused=True`` (already the resume-path
+    verdict). Callers that pass NEITHER get the fail-closed terminal word
+    — pause detection is opt-in through the engine, never guessed from
+    values, because a finished failure still carries ``needs_confirmation``
+    from planning and the values alone cannot tell the two apart.
+
+    A paused run reports ``task_state="waiting_input"`` — the SAME word the
+    persistence layer's row carries (``TaskStateOverlay``, round-17 D4), so
+    one pause reads identically on the envelope, the session record and the
+    task row. ``needs_confirm`` / ``plan_summary`` ride the projection so
+    every consumer gets the two-phase-confirm contract from one place
+    instead of hand-patching it per surface.
+    """
 
     state_values = dict(values or {})
     verification = read_inject_verification(state_values)
-    # ``terminal_task_state`` (not ``infer_task_state``): every caller of this
-    # builder is a terminal point, and without a verdict the run is failed —
-    # see that helper for why a creation handle is not evidence of effect.
-    task_state = terminal_task_state(state_values)
+    if snapshot is not None:
+        # Engine authority (``next`` non-empty) AND the confirmation contract
+        # on the values we are about to project. Requiring both keeps this
+        # builder's answer identical to ``resumable_pause`` — the predicate
+        # the session finalizer's keep-active guard uses — so a graph parked
+        # at some NON-confirmation interrupt cannot read as a resumable
+        # inject pause here while the finalizer (correctly) declines to keep
+        # the session open. One pause, one word, both surfaces.
+        is_paused = (
+            graph_is_paused(snapshot)
+            and paused_task_state(state_values) is not None
+        )
+    elif paused is not None:
+        is_paused = bool(paused)
+    else:
+        # No pause information: the caller gave neither the engine snapshot
+        # nor an explicit flag, so this is a terminal point and the word is
+        # fail-closed (``terminal_task_state``). The values alone CANNOT
+        # answer "paused vs ran-and-failed" — a failed run still carries
+        # ``needs_confirmation`` from planning, so deriving a pause from
+        # values misreported finished failures as ``waiting_input``. Pause
+        # detection is opt-in through the engine, never guessed.
+        is_paused = False
+    if is_paused:
+        task_state = TaskStateOverlay.WAITING_INPUT.value
+    else:
+        # ``terminal_task_state`` (not ``infer_task_state``): every caller of this
+        # builder is a terminal point, and without a verdict the run is failed —
+        # see that helper for why a creation handle is not evidence of effect.
+        task_state = terminal_task_state(state_values)
 
     outcome = read_operation_outcome(state_values)
 
@@ -138,6 +194,15 @@ def build_inject_data_from_state(
         inject_context = ""
 
     experiment_uid_out = state_values.get("experiment_uid") or ""
+    # W-55-11: only the TUI turn path measures elapsed_ms (monotonic);
+    # every other caller (CLI runner, SSE inject_stream, session
+    # finalize, save_memory) omitted it and the card shipped
+    # duration_ms=0. Fall back to the state-timestamp derivation — the
+    # same single source sync_to_store uses for the DB column.
+    duration_ms_out = elapsed_ms or duration_ms_from_timestamps(
+        str(state_values.get("created_at") or ""),
+        str(state_values.get("finished_at") or ""),
+    )
     return {
         "task_id": task_id,
         "task_state": task_state,
@@ -150,7 +215,7 @@ def build_inject_data_from_state(
         "injection_method": state_values.get("injection_method"),
         "fault_handle": materialize_fault_handle(state_values),
         "recovery_handle": build_recovery_handle(state_values),
-        "duration_ms": elapsed_ms,
+        "duration_ms": duration_ms_out,
         "fault_spec": _fault_spec_dict(state_values),
         "target": legacy_target_dict(state_values),
         "params": legacy_params_dict(state_values),
@@ -159,6 +224,13 @@ def build_inject_data_from_state(
         "side_effects": read_verification_side_effects(verification),
         "blast_radius_detail": str(state_values.get("blast_radius_detail") or ""),
         "inject_context": inject_context,
+        # Two-phase-confirm contract, single-sourced (round-64 F3): the CLI's
+        # interactive branch reads ``needs_confirm`` off this projection and
+        # the SSE route used to hand-patch both fields in after the call —
+        # which is why the non-stream entry shipped no ``needs_confirm`` at
+        # all and its confirm flow was unreachable.
+        "needs_confirm": bool(state_values.get("needs_confirmation")),
+        "plan_summary": str(state_values.get("plan_summary") or ""),
         "postmortem": outcome.postmortem,
         "issue_report": outcome.issue_report,
         "error": outcome.error,
