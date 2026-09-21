@@ -162,7 +162,7 @@ def _section_recovery_strategy(state: AgentState) -> str:
 def _section_safety_assessment(state: AgentState) -> str:
     safety_status = state.get("safety_status", "pending")
     safety_reason = state.get("safety_reason") or ""
-    health_report = state.get("target_health_report") or ""
+    health_report = state.get("target_health_report") or {}
     conflicts = state.get("conflict_uids") or []
     safety_score = state.get("safety_score") or {}
 
@@ -175,7 +175,10 @@ def _section_safety_assessment(state: AgentState) -> str:
     else:
         lines.append("- Conflicting experiments: none")
     if health_report:
-        lines.append(f"- Health pre-check: {health_report}")
+        lines.append(
+            f"- Health pre-check: {health_report.get('overall', '?')} "
+            f"({health_report.get('summary', '')})"
+        )
 
     # E10 — render multi-dimensional safety score when present.
     if safety_score:

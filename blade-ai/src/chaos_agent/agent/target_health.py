@@ -198,6 +198,10 @@ class NodeHealthChecker:
         self, target: dict, kubeconfig: str
     ) -> HealthReport:
         from chaos_agent.config.settings import settings
+        from chaos_agent.tools.pod_discovery import (
+            TOOL_POD_ABSENT,
+            TOOL_POD_PRESENT,
+        )
         from chaos_agent.utils.coerce import coerce_to_list
 
         names = coerce_to_list(
@@ -215,11 +219,13 @@ class NodeHealthChecker:
         report = _build_node_report(target, conditions)
 
         # chaosblade-tool existence — node scope requires DaemonSet pod on target.
-        tool_checked = False
+        # R69 three-state: only ABSENT blocks; UNKNOWN fails open (a broken
+        # probe must never block the inject), and "online" is claimed ONLY on
+        # PRESENT so the report can no longer stamp a carrier it never found.
+        tool_state = None
         if settings.blade_agent_check_enabled and kubeconfig:
-            tool_checked = True
-            tool_ok = await _query_blade_agent_on_node(names[0], kubeconfig)
-            if not tool_ok:
+            tool_state = await _query_blade_agent_on_node(names[0], kubeconfig)
+            if tool_state == TOOL_POD_ABSENT:
                 report.issues.append(
                     HealthIssue(
                         severity=HealthSeverity.BLOCK,
@@ -231,7 +237,7 @@ class NodeHealthChecker:
 
         if report.overall == HealthSeverity.OK:
             detail = "Node Ready, no DiskPressure/MemoryPressure/PIDPressure/NetworkUnavailable"
-            if tool_checked:
+            if tool_state == TOOL_POD_PRESENT:
                 detail += ", chaosblade-tool online"
             report.checked_detail = detail
 
@@ -328,8 +334,10 @@ async def assess_target_health(
     """Single entry point — agent_loop calls this once per turn.
 
     Returns a ``HealthReport`` regardless of scope; an unknown scope
-    returns an empty OK report (graceful degradation — never raise,
-    never block on a checker bug).
+    returns an empty OK report (no checker configured for that scope is
+    "no such check", not a failed check). A checker that RAISES is
+    different — see the except branch: never raise, never block, but
+    also never masquerade as healthy (R66).
     """
     checker = _REGISTRY.get(scope)
     if checker is None:
@@ -342,15 +350,32 @@ async def assess_target_health(
     try:
         return await checker.check(target, kubeconfig)
     except Exception as exc:
-        # A checker bug must NOT take down the inject pipeline. Log
-        # and degrade to OK so confirm proceeds with no info.
+        # A checker bug must NOT take down the inject pipeline (never
+        # raise, never block). R66: but it must not masquerade as a
+        # clean bill of health either — degrade to an explicit unknown
+        # WARN, the transparent fail-open, so confirm proceeds WITH the
+        # information that nothing was verified.
         logger.warning(
             "health checker for scope=%s failed: %s",
             scope,
             exc,
         )
         return HealthReport(
-            target=target, overall=HealthSeverity.OK, issues=[]
+            target=target,
+            overall=HealthSeverity.WARN,
+            issues=[
+                HealthIssue(
+                    severity=HealthSeverity.WARN,
+                    code=f"{scope}.health_check_unknown",
+                    message=(
+                        f"Target health could not be verified (checker "
+                        f"for scope '{scope}' raised {type(exc).__name__})"
+                    ),
+                )
+            ],
+            checked_detail=(
+                f"health check for scope '{scope}' FAILED — condition unknown"
+            ),
         )
 
 
@@ -367,14 +392,59 @@ _NODE_BLOCKING_CONDITIONS = {
 }
 
 
-def _build_node_report(target: dict, conditions: list[dict]) -> HealthReport:
+def _build_node_report(
+    target: dict, conditions: list[dict] | str | None
+) -> HealthReport:
     """Translate kubectl ``status.conditions`` array into a HealthReport.
 
     ``conditions`` shape::
 
         [{"type": "DiskPressure", "status": "True",
           "lastTransitionTime": "2026-02-08T12:34:56Z", ...}, ...]
+
+    ``None`` means the query FAILED — see the unknown branch below.
+    ``_NODE_NOT_FOUND`` means the node does not exist — a hard BLOCK,
+    symmetric with the pod face's ``resource_not_found``.
     """
+    if conditions == _NODE_NOT_FOUND:
+        # R69: a non-existent node is a real BLOCK, not an "unknown". The
+        # pod face already blocks on ``pod.not_found``; before R69 the node
+        # face collapsed not-found into ``None`` → WARN (blocking=False),
+        # so "node missing" and "pod missing" got opposite verdicts.
+        names = target.get("names", [])
+        name = names[0] if names else "unknown"
+        return HealthReport(
+            target=target,
+            overall=HealthSeverity.BLOCK,
+            issues=[HealthIssue(
+                severity=HealthSeverity.BLOCK,
+                code="node.not_found",
+                message=f"Node '{name}' not found in the cluster",
+            )],
+            checked_detail=f"Node '{name}' not found",
+        )
+    if conditions is None:
+        # R66: the query failed — the outcome-UNKNOWN third state, not
+        # a clean bill of health. Deliberately WARN, not BLOCK: the
+        # historical behaviour is fail-open (a broken health check must
+        # not block the inject); R66 keeps that but makes the fail-open
+        # TRANSPARENT — the confirm card / plan prompt now read
+        # "could not verify" instead of a fake "Node Ready".
+        return HealthReport(
+            target=target,
+            overall=HealthSeverity.WARN,
+            issues=[
+                HealthIssue(
+                    severity=HealthSeverity.WARN,
+                    code="node.health_check_unknown",
+                    message=(
+                        "Node health could not be verified (kubectl "
+                        "query failed) — condition unknown"
+                    ),
+                )
+            ],
+            checked_detail="Node health NOT verified (kubectl query failed)",
+        )
     issues: list[HealthIssue] = []
     for cond in conditions or []:
         ctype = cond.get("type", "")
@@ -451,6 +521,26 @@ def _build_pod_report(target: dict, status: dict) -> HealthReport:
             )],
             checked_detail=f"Pod '{name}' not found in '{ns}'",
         )
+    if _error == "query_failed":
+        # R66: the query failed — the outcome-UNKNOWN third state, not
+        # a clean bill of health. Same transparent-fail-open ruling as
+        # the node face: WARN (visible, never blocking) so the report
+        # no longer implies "pod is fine" when nothing was read.
+        return HealthReport(
+            target=target,
+            overall=HealthSeverity.WARN,
+            issues=[
+                HealthIssue(
+                    severity=HealthSeverity.WARN,
+                    code="pod.health_check_unknown",
+                    message=(
+                        "Pod health could not be verified (kubectl "
+                        "query failed) — condition unknown"
+                    ),
+                )
+            ],
+            checked_detail="Pod health NOT verified (kubectl query failed)",
+        )
 
     issues: list[HealthIssue] = []
     phase = status.get("phase", "")
@@ -518,88 +608,93 @@ def _format_condition_duration(iso_timestamp: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# R69 sentinel: ``_query_node_conditions`` returns this (a str, distinct
+# from both ``None`` = query-failed and ``[]`` = verified-no-conditions)
+# when kubectl reports the node does not exist. ``_build_node_report``
+# turns it into a BLOCK, symmetric with the pod face's ``resource_not_found``.
+_NODE_NOT_FOUND = "node_not_found"
+
+
 async def _query_node_conditions(
     node_name: str, kubeconfig: str
-) -> list[dict]:
+) -> list[dict] | str | None:
     """Real impl: ``kubectl get node {name} -o json``, return
     ``.status.conditions``.
 
-    Errors are swallowed — health-check failures must NOT crash the
-    inject pipeline. Returns empty list (= OK report) on any kubectl
-    issue. The kubectl wrapper itself emits structured error logs so
-    the swallow is observable upstream.
+    R66: a FAILED query no longer collapses into ``[]`` — an empty
+    list is a VERIFIED "queried fine, no conditions", byte-identical
+    to a healthy node, which let the report layer stamp a fake
+    "Node Ready, no DiskPressure..." even when nothing was read. Every
+    failure mode (transport, RBAC, timeout, non-JSON) returns ``None``
+    instead — the distinguishable "could not verify" marker the report
+    layer turns into an explicit unknown WARN. Never raises (a broken
+    health check must not crash the inject pipeline); the information
+    is now CARRIED, not discarded.
+
+    R69: runs through ``query_kubectl`` (the internal read entrypoint,
+    tri-state ``.ok``) instead of ``_kubectl_impl`` (the LLM-presentation
+    face that decorates output with hints), and distinguishes a genuinely
+    missing node (returns ``_NODE_NOT_FOUND`` → BLOCK) from a failed query
+    (returns ``None`` → WARN unknown).
     """
     if not node_name:
-        return []
-    from chaos_agent.tools.kubectl import _kubectl_impl
+        return None
+    from chaos_agent.tools.kubectl_cli import query_kubectl
 
-    try:
-        raw = await _kubectl_impl(
-            subcommand="get",
-            v_args=f"node {node_name} -o json",
-            kubeconfig=kubeconfig or "",
-        )
-    except Exception as exc:
-        logger.warning(
-            "_query_node_conditions: kubectl error for %s: %s",
-            node_name, exc,
-        )
-        return []
-
-    if not raw:
-        return []
-    # The kubectl wrapper returns either raw JSON / formatted output /
-    # an error string ("Error: ..."). Parse defensively.
+    outcome = await query_kubectl(
+        ["node", node_name, "-o", "json"],
+        kubeconfig or "",
+        log_name="_query_node_conditions",
+    )
+    if not outcome.ok:
+        # "not found" ⇒ the node genuinely does not exist (a real BLOCK —
+        # you cannot inject on a node that is not in the cluster). Any
+        # other failure ⇒ could not verify (fail-open WARN). The old
+        # ``_kubectl_impl`` face could only guess via ``s.startswith("Error")``
+        # on decorated text.
+        if "not found" in outcome.error.lower():
+            return _NODE_NOT_FOUND
+        return None
     import json as _json
-    s = raw.strip()
-    if s.startswith("Error"):
-        logger.debug("_query_node_conditions: kubectl reported error: %s", s[:200])
-        return []
     try:
-        data = _json.loads(s)
+        data = _json.loads(outcome.text)
     except _json.JSONDecodeError:
         logger.debug("_query_node_conditions: non-JSON output for %s", node_name)
-        return []
+        return None
     status = data.get("status") if isinstance(data, dict) else None
     if not isinstance(status, dict):
-        return []
-    conds = status.get("conditions") or []
+        return None
+    conds = status.get("conditions")
     if not isinstance(conds, list):
-        return []
+        # Missing / malformed conditions — could not verify, which is
+        # NOT the same as "verified healthy".
+        return None
     return conds
 
 
 async def _query_blade_agent_on_node(
     node_name: str, kubeconfig: str
-) -> bool:
-    """Check if ChaosBlade agent DaemonSet pod is Running on target node.
+) -> str:
+    """Three-state ChaosBlade tool-pod presence on ``node_name``.
 
-    Returns True if at least one matching pod is found, False otherwise.
-    Never raises — returns True on error (fail-open: assume agent is there).
+    Returns one of ``TOOL_POD_PRESENT`` / ``TOOL_POD_ABSENT`` /
+    ``TOOL_POD_UNKNOWN`` (see ``pod_discovery``).
+
+    R69: this used to be a hand-rolled ``kubectl get pod -n chaosblade
+    -l app=chaosblade-tool`` + ``len(raw.strip()) > 0`` check running
+    through the LLM-presentation entrypoint (``_kubectl_impl``). Two
+    defects made it lie: (1) the empty-selector hint appended to ``raw``
+    turned "no match" into non-empty text, so it ALWAYS returned True;
+    (2) it disagreed with the authoritative execution-side discovery
+    (``pod_discovery.discover_tool_pod_on_node``) in 8 of 12 scenarios —
+    the report stamped "chaosblade-tool online" while the injector could
+    find no carrier. Now it delegates to that single authority and only
+    the three-state verdict is consumed here.
     """
-    from chaos_agent.config.settings import settings
-    from chaos_agent.tools.kubectl import _kubectl_impl
+    from chaos_agent.tools.pod_discovery import discover_tool_pod_state_on_node
 
-    try:
-        raw = await _kubectl_impl(
-            subcommand="get",
-            v_args=(
-                f"pod -n {settings.blade_agent_namespace} "
-                f"--field-selector=spec.nodeName={node_name},status.phase=Running "
-                f"-l {settings.blade_agent_label} --no-headers"
-            ),
-            kubeconfig=kubeconfig or "",
-        )
-    except Exception as exc:
-        logger.warning(
-            "_query_blade_agent_on_node: kubectl error for %s: %s",
-            node_name, exc,
-        )
-        return True  # fail-open
-
-    if raw is None:
-        return True  # fail-open
-    return len(raw.strip()) > 0
+    state, _found = await discover_tool_pod_state_on_node(node_name, kubeconfig)
+    return state
 
 
 async def _resolve_pod_names(target: dict, kubeconfig: str) -> list[str]:
@@ -622,28 +717,25 @@ async def _resolve_pod_names(target: dict, kubeconfig: str) -> list[str]:
 
     if labels:
         label_selector = ",".join(f"{k}={v}" for k, v in labels.items())
-        from chaos_agent.tools.kubectl import _kubectl_impl
-        try:
-            raw = await _kubectl_impl(
-                subcommand="get",
-                v_args=(
-                    f"pod -l {label_selector} -n {namespace} "
-                    f"--field-selector=status.phase=Running "
-                    f"-o jsonpath={{.items[*].metadata.name}}"
-                ),
-                kubeconfig=kubeconfig or "",
-            )
-            # kubectl_impl appends a hint when no resources match
-            # (e.g. "💡 No resources matched..."). Detect and skip.
-            stripped = (raw or "").strip().strip("'\"")
-            if not stripped or "💡" in stripped or "No resources" in stripped:
-                pod_names = []
-            else:
-                pod_names = [n for n in stripped.split() if n]
+        from chaos_agent.tools.kubectl_cli import query_kubectl
+        outcome = await query_kubectl(
+            [
+                "pod", "-l", label_selector, "-n", namespace,
+                "--field-selector=status.phase=Running",
+                "-o", "jsonpath={.items[*].metadata.name}",
+            ],
+            kubeconfig or "",
+            log_name="_resolve_pod_names",
+        )
+        # R69: gate on ``.ok`` (tri-state) instead of sniffing the decorated
+        # ``_kubectl_impl`` string. The old path split ANY non-empty text —
+        # including an "Error from server ..." failure string — on whitespace
+        # and returned the tokens as pod names (so "Error" became a pod).
+        # ``.text`` is the undecorated payload and is empty unless ok.
+        if outcome.ok:
+            pod_names = [n for n in outcome.text.split() if n]
             if pod_names:
                 return pod_names
-        except Exception:
-            pass
 
     return list(names)
 
@@ -655,49 +747,44 @@ async def _query_pod_status(
     ``.status``.
 
     Same defensive pattern as ``_query_node_conditions`` — never
-    raises, returns ``{}`` on any failure.
+    raises. R66: a generic failure no longer collapses into ``{}``
+    (byte-identical to a healthy empty status); it returns
+    ``{"_error": "query_failed"}`` through the SAME ``_error`` channel
+    that already carries the two not-found pre-classifications — the
+    report layer turns it into an explicit unknown WARN.
     """
     if not pod_name:
-        return {}
-    from chaos_agent.tools.kubectl import _kubectl_impl
+        return {"_error": "query_failed"}
+    from chaos_agent.tools.kubectl_cli import query_kubectl
 
-    args = f"pod {pod_name}"
+    args = ["pod", pod_name]
     if namespace:
-        args += f" -n {namespace}"
-    args += " -o json"
+        args += ["-n", namespace]
+    args += ["-o", "json"]
 
-    try:
-        raw = await _kubectl_impl(
-            subcommand="get",
-            v_args=args,
-            kubeconfig=kubeconfig or "",
-        )
-    except Exception as exc:
-        logger.warning(
-            "_query_pod_status: kubectl error for %s/%s: %s",
-            namespace, pod_name, exc,
-        )
-        return {}
-
-    if not raw:
-        return {}
-    import json as _json
-    s = raw.strip()
-    if s.startswith("Error"):
-        logger.debug("_query_pod_status: kubectl reported error: %s", s[:200])
-        s_lower = s.lower()
-        if "not found" in s_lower and "namespace" in s_lower:
+    outcome = await query_kubectl(
+        args, kubeconfig or "", log_name="_query_pod_status",
+    )
+    if not outcome.ok:
+        # R69: classify from ``.error`` (the merged stdout+stderr diagnosis
+        # produced by query_kubectl) instead of sniffing decorated
+        # ``_kubectl_impl`` text with ``s.startswith("Error")``. Under the
+        # wiz relay the NotFound text can land in stdout — the dual-stream
+        # merge in query_kubectl keeps it in ``.error`` either way.
+        err = outcome.error.lower()
+        if "not found" in err and "namespace" in err:
             return {"_error": "namespace_not_found", "phase": "", "reason": ""}
-        if "not found" in s_lower:
+        if "not found" in err:
             return {"_error": "resource_not_found", "phase": "", "reason": ""}
-        return {}
+        return {"_error": "query_failed"}
+    import json as _json
     try:
-        data = _json.loads(s)
+        data = _json.loads(outcome.text)
     except _json.JSONDecodeError:
-        return {}
+        return {"_error": "query_failed"}
     status = data.get("status") if isinstance(data, dict) else None
     if not isinstance(status, dict):
-        return {}
+        return {"_error": "query_failed"}
     # Surface the top-level reason if any — used by _build_pod_report
     # to detect Evicted / CrashLoopBackOff at a glance without walking
     # the conditions array.

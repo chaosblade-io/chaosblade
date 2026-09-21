@@ -23,7 +23,7 @@ E11 — host_part regex was replaced by AST-level parsing via
        b. Regex blacklist (``PARAM_BLACKLIST_PATTERNS``).
      Data payload flag values (``-p`` ``--patch`` ``--from-literal``
      ``-l`` ``--field-selector`` …) and container_command (after
-     ``--`` for ``kubectl exec/run/attach/debug``) are excluded from
+     ``--`` for ``kubectl exec/run/debug``) are excluded from
      BOTH checks — they are not shell tokens on the host (subprocess
      uses ``shell=False``), so a stray ``|`` in those positions is at
      worst a no-op, never a host-injection.
@@ -771,7 +771,7 @@ class ToolGuard:
 
         # 4 + 5. Token-level checks (SUSPICIOUS_SOLO_TOKENS + regex blacklist)
         # on host-relevant tokens only. Excludes data_payload_values and
-        # container_command (tokens after ``--`` for exec/run/attach/debug) —
+        # container_command (tokens after ``--`` for exec/run/debug) —
         # under shell=False a stray metachar there is a literal argv, never a
         # host-side pipeline, so it is not a security issue.
         host_tokens = parsed.host_relevant_tokens()

@@ -6,9 +6,9 @@ import subprocess
 
 import pytest
 
+from chaos_agent.tools.guard import ToolGuard
 from chaos_agent.tools.guard_parser import (
     BLADE_BOOLEAN_FLAGS,
-    BLADE_SUBCOMMANDS,
     KUBECTL_BOOLEAN_FLAGS,
     KUBECTL_DATA_PAYLOAD_FLAGS,
     KUBECTL_DOUBLE_DASH_SUBCOMMANDS,
@@ -32,8 +32,15 @@ _HELP_FLAG_LINE = re.compile(
 
 # Every subcommand whose --help the drift tests walk. Hardcoded on purpose
 # (R47): the scan surface must not silently track the guard's admit set —
-# a widening there should show up as a deliberate diff here. ``options`` is
-# the global-flag page (no --help suffix).
+# a widening there should show up as a deliberate diff here. R50: the
+# coverage requirement is ONE-DIRECTIONAL — the admit set must be COVERED
+# (an admitted subcommand with nobody drift-checking its boolean
+# vocabulary is the dangerous direction), while scanning EXTRA names is
+# harmless (the flat table applies to every kubectl parse; ``attach`` is
+# scanned though not admitted). Parent commands (top/rollout/auth/config/
+# cluster-info/set) have no flag section of their own; cordon/uncordon
+# genuinely declare no boolean (their flags are NoOptDefVal/value-typed).
+# ``options`` is the global-flag page (no --help suffix).
 _HELP_SUBS = (
     "get", "describe", "delete", "replace", "exec", "logs", "top",
     "patch", "set", "scale", "debug", "wait", "cordon", "uncordon",
@@ -41,6 +48,21 @@ _HELP_SUBS = (
     "rollout", "version", "cluster-info", "api-resources", "explain",
     "auth", "config", "run", "attach", "options",
 )
+
+# R50: scan-yield FLOORS. The drift tests assert ABSENCE of uncovered
+# names — but a regex/format mismatch (kubectl changes how it prints flag
+# lines) would silently collapse the scan to nothing and turn "0
+# uncovered" into a fake green: the very false-negative class R49 hit
+# with the EOL-colon variant of ``:\s``. Both floors are measured
+# snapshots (R50): removing a boolean flag or drifting the format drops
+# the yield below the floor and fails loudly; ADDING flags stays green.
+# Re-derive and update when kubectl legitimately evolves. Both faces
+# count GENUINE boolean declarations (no-eq and false/true markers): the
+# 21 NoOptDefVal value-marker declarations (dry-run/cascade/validate)
+# sit outside both counters, hence 158 total member declarations = 137
+# + 21 on the reverse face.
+_HELP_SCAN_FLOOR = 137      # boolean declarations matched across _HELP_SUBS
+_REVERSE_SCAN_FLOOR = 137   # boolean-TABLE member declarations matched
 
 
 class TestKubectlBasic:
@@ -171,7 +193,7 @@ class TestKubectlDoubleDash:
         assert p.container_command == ("echo", "hi")
 
     def test_get_double_dash_treated_as_positional(self):
-        """Regression: `--` outside exec/run/attach/debug MUST NOT split
+        """Regression: `--` outside exec/run/debug MUST NOT split
         container_command — it's just a token. Otherwise misplaced `--`
         would silently bypass shell checks (Gap B)."""
         p = parse_command(["kubectl", "get", "--", "pod"])
@@ -208,10 +230,12 @@ class TestBlade:
         assert ("--interface", "eth0") in p.flags
 
     def test_blade_subcommand_in_known_set(self):
+        # R52: the former BLADE_SUBCOMMANDS "known set" is deleted — zero
+        # production consumers and one tautological assertion here. The
+        # subcommand EXTRACTION itself is the surviving contract.
         for sub in ("create", "destroy", "status", "prepare", "revoke"):
             p = parse_command(["blade", sub])
             assert p.subcommand == sub
-            assert sub in BLADE_SUBCOMMANDS
 
     def test_blade_boolean_h_does_not_consume_next(self):
         """Regression: -h must not eat next token (Gap A)."""
@@ -409,6 +433,7 @@ class TestKubectlBooleanVocabulary:
 
         opt = _HELP_FLAG_LINE
         missing: list[tuple[str, str]] = []
+        scanned = 0
         for sub in _HELP_SUBS:
             argv = ["kubectl", sub] + ([] if sub == "options" else ["--help"])
             text = subprocess.run(
@@ -428,9 +453,15 @@ class TestKubectlBooleanVocabulary:
                 # value declaration and stays skipped.
                 if marker is not None and marker not in ("false", "true"):
                     continue
+                scanned += 1
                 for name in (m.group(2), m.group(1)):
                     if name and name not in covered:
                         missing.append((sub, name))
+        assert scanned >= _HELP_SCAN_FLOOR, (
+            f"scan yield collapsed: {scanned} < {_HELP_SCAN_FLOOR} — format "
+            "drift (the R49 EOL-colon class) or removed flags; re-derive "
+            "the floor before trusting the coverage verdict below"
+        )
         assert not missing, f"uncovered boolean names: {missing}"
 
 
@@ -499,6 +530,7 @@ class TestNoOptDefValAndGlobalArity:
         if shutil.which("kubectl") is None:
             pytest.skip("kubectl not on PATH")
         suspects: list[tuple[str, str, str]] = []
+        scanned = 0
         for sub in _HELP_SUBS:
             argv = ["kubectl", sub] + ([] if sub == "options" else ["--help"])
             text = subprocess.run(
@@ -510,9 +542,15 @@ class TestNoOptDefValAndGlobalArity:
                     continue
                 marker = m.group(3)
                 if marker is None or marker in ("false", "true"):
+                    scanned += 1
                     continue  # genuine boolean declaration
                 if m.group(2) not in KUBECTL_NOOPT_DEFVAL_FLAGS:
                     suspects.append((sub, m.group(2), marker))
+        assert scanned >= _REVERSE_SCAN_FLOOR, (
+            f"reverse-face scan yield collapsed: {scanned} < "
+            f"{_REVERSE_SCAN_FLOOR} — the whitelist verdict below is not "
+            "backed by a live scan; re-derive the floor"
+        )
         assert not suspects, (
             "boolean-table members declared with a value marker outside "
             f"the measured NoOptDefVal whitelist: {suspects}"
@@ -563,3 +601,196 @@ class TestNoOptDefValAndGlobalArity:
             assert p.subcommand == "get", (flag, p.subcommand)
             checked += 1
         assert checked >= 25, f"options page shrank? checked={checked}"
+
+
+class TestDriftScanIntegrity:
+    """R50: the round that audited the R48/R49 fixes THEMSELVES. The drift
+    suite's remaining silent-failure channels, closed:
+
+    1. COVERAGE DIRECTION — ``_HELP_SUBS`` must cover the guard's admit
+       set; an admitted subcommand whose boolean vocabulary nobody walks
+       is the dangerous direction. Scanning extra names is harmless.
+    2. PAYLOAD LONG axis — R48's "logs is the only colliding subcommand"
+       was derived on the SHORT axis; a payload-table LONG name that is
+       boolean under some subcommand would swallow the next token AND
+       payload-skip it there (the measured ``-p`` escape chain). R50's
+       enumeration: 0 hits on the long axis; the short axis re-derives
+       exactly the handled logs pair.
+    """
+
+    def test_help_subs_cover_admit_set(self):
+        admit = set(ToolGuard().kubectl_subcommands)
+        uncovered = admit - set(_HELP_SUBS)
+        assert not uncovered, (
+            "admitted subcommands with no boolean drift scan: "
+            f"{sorted(uncovered)} — add them to _HELP_SUBS"
+        )
+        assert "options" in _HELP_SUBS  # the global-flag page stays walked
+
+    def test_payload_names_never_boolean_outside_the_handled_pair(self):
+        if shutil.which("kubectl") is None:
+            pytest.skip("kubectl not on PATH")
+        payload_longs = {
+            n for n in KUBECTL_DATA_PAYLOAD_FLAGS if n.startswith("--")
+        }
+        payload_shorts = {
+            n for n in KUBECTL_DATA_PAYLOAD_FLAGS if not n.startswith("--")
+        }
+        hits: list[tuple[str, str, str]] = []
+        for sub in _HELP_SUBS:
+            argv = ["kubectl", sub] + ([] if sub == "options" else ["--help"])
+            text = subprocess.run(
+                argv, capture_output=True, text=True, check=False
+            ).stdout
+            handled_shorts = KUBECTL_SUBCOMMAND_BOOLEAN_SHORTHANDS.get(sub, ())
+            for line in text.splitlines():
+                m = _HELP_FLAG_LINE.match(line)
+                if m is None:
+                    continue
+                marker = m.group(3)
+                if marker is not None and marker not in ("false", "true"):
+                    continue
+                if m.group(2) in KUBECTL_NOOPT_DEFVAL_FLAGS:
+                    continue  # boolean by measurement, not a collision
+                if m.group(2) in payload_longs:
+                    hits.append((sub, m.group(2), "long"))
+                if m.group(1) and m.group(1) in payload_shorts:
+                    if m.group(1) not in handled_shorts:
+                        hits.append((sub, m.group(1), "short-unhandled"))
+        assert not hits, (
+            "payload-table names boolean under some subcommand outside the "
+            f"handled shorthand pair (escape chain -p): {hits}"
+        )
+
+
+class TestDoubleDashUsageParity:
+    """R51: the last table family with no mechanical reconciliation. The
+    ``--`` split is an EXEMPTION surface (tokens after it become
+    ``container_command`` instead of host-scanned positionals), so a member
+    whose subcommand does not actually support the form lets the exemption
+    cover a shape kubectl itself refuses — the dangerous direction (a
+    missed member is merely over-deny). Membership is reconciled BOTH ways
+    against the real binary: every member's help shows a
+    ``kubectl <sub> ... -- ...`` usage/example line, and every subcommand
+    whose help shows that shape is a member. ``attach`` was REMOVED (R51):
+    no ``--`` shape in its help, and the client rejects the form before
+    connecting (measured: "expected POD... saw 3").
+    """
+
+    _USAGE_DASH = re.compile(r"^\s*kubectl\s+\S+.*\s--\s")
+    # R52: the reverse face is an ABSENCE assertion — without a scan-yield
+    # floor a regex/format drift silently collapses the scan to zero and
+    # turns "0 non-members" into a fake green (the R50 lesson recurring on
+    # the R51 tooth). Measured floor: exec/run/debug carry the shape.
+    _USAGE_SHAPE_FLOOR = 3
+
+    def _usage_dash_count(self, sub: str) -> int:
+        if shutil.which("kubectl") is None:
+            pytest.skip("kubectl not on PATH")
+        text = subprocess.run(
+            ["kubectl", sub, "--help"], capture_output=True, text=True,
+            check=False,
+        ).stdout
+        return sum(
+            1 for line in text.splitlines() if self._USAGE_DASH.match(line)
+        )
+
+    def test_every_member_shows_the_usage_shape(self):
+        shapeless = [
+            sub for sub in sorted(KUBECTL_DOUBLE_DASH_SUBCOMMANDS)
+            if self._usage_dash_count(sub) == 0
+        ]
+        assert not shapeless, (
+            f"table members with no '--' usage shape in kubectl help: "
+            f"{shapeless} — the container-command exemption would cover a "
+            "form kubectl refuses; remove them"
+        )
+
+    def test_every_usage_shape_is_a_member(self):
+        shapeful = 0
+        unlisted = []
+        for sub in _HELP_SUBS:
+            if sub == "options":
+                continue
+            if self._usage_dash_count(sub) > 0:
+                shapeful += 1
+                if sub not in KUBECTL_DOUBLE_DASH_SUBCOMMANDS:
+                    unlisted.append(sub)
+        assert shapeful >= self._USAGE_SHAPE_FLOOR, (
+            f"usage-shape scan yield collapsed: {shapeful} < "
+            f"{self._USAGE_SHAPE_FLOOR} — the _USAGE_DASH regex no longer "
+            "matches kubectl's help format; the reverse parity below would "
+            "be a fake green"
+        )
+        assert not unlisted, (
+            f"subcommands with a '--' usage shape missing from the table: "
+            f"{unlisted} — their delegated command would be host-scanned "
+            "and refused (over-deny); add them"
+        )
+
+    def test_attach_double_dash_is_no_longer_an_exemption(self):
+        # R51 regression pin: attach left the table, so the `--` (and what
+        # follows) falls back to the host-scanned positional stream —
+        # exactly the shape kubectl itself rejects with "saw 3".
+        p = parse_command(["kubectl", "attach", "pod1", "--", "echo", "hi"])
+        assert p.container_command == ()
+        assert "echo" in p.positional_args and "hi" in p.positional_args
+
+
+class TestBladePolarityReconciliation:
+    """R52: the BLADE flag tables reconciled against the installed
+    v1.9.0-alpha fork (read-only help sweep + decisive binary probes).
+
+    Measured facts pinned here (bare-form probes, R52 post-review):
+    - ``-v`` is VALUE-taking where it lives (bare ``blade -v version`` →
+      ``invalid value "version" for flag -v``) but its visibility FOLLOWS
+      cobra's command tree: on the status chain the identical bare form
+      dies with ``unknown shorthand flag: 'v' in -v``. Both real forms
+      fail at the binary; the parser mirrors the value-taking reading.
+    - every ADDED ``BLADE_VALUE_FLAGS`` member answered bare-form probes
+      with ``flag needs an argument`` (destroy 5, status 4, k8s chain 1
+      plus the create-k8s pair) — value-taking is measured, not read off
+      the usage page (whose flag family cobra may never merge).
+    - the fork's destroy page carries 5 value flags that were missing from
+      ``BLADE_VALUE_FLAGS`` — the provenance walk handed the CLUSTER uuid
+      to the UID shape gate, got it rejected → "" → the REAL experiment
+      uid was skipped → fail-closed false refusal of the task's own
+      cleanup (round-14 F3's ``--kubeconfig`` class, fork-flag instance).
+    - ghosts (``--debug``/``--version``/``--no-color``) stay boolean on
+      purpose: the binary refuses them anyway, and a boolean reading only
+      widens the host-scanned positional stream.
+    """
+
+    def test_v_absorbs_its_value_not_the_subcommand(self):
+        # Parser view under the value-reading; on the REAL binary this
+        # spelling dies at the root (unknown shorthand — the flag lives on
+        # a subcommand's persistent set), so the admitted-view direction
+        # is harmless either way.
+        p = parse_command(["blade", "-v", "3", "status"])
+        assert p.subcommand == "status"
+        assert ("-v", "3") in p.flags
+
+    def test_v_bare_form_leaves_no_subcommand(self):
+        # Real binary: ``blade -v version`` dies on the invalid int; the
+        # parser now mirrors that (version absorbed as the level).
+        p = parse_command(["blade", "-v", "version"])
+        assert p.subcommand is None
+        assert ("-v", "version") in p.flags
+
+    def test_destroy_cluster_uuid_no_longer_hijacks_the_uid(self):
+        from chaos_agent.agent.providers.chaosblade.verify import (
+            destroy_uid_from_tokens,
+        )
+
+        cluster = "c62735cce1d61445995c0f1d9e4a1bded"  # 32-hex, real shape
+        uid = "aabbccddeeff0011"                       # HEX16 UID shape
+        assert destroy_uid_from_tokens(
+            ["--cluster-uuid", cluster, uid]) == uid
+
+    def test_ghost_members_stay_boolean(self):
+        # ``--debug`` is refused by the binary; the parser keeps the
+        # boolean reading (never swallows the next token) — recorded
+        # decision, pinned so a polarity flip cannot happen silently.
+        p = parse_command(["blade", "--debug", "status"])
+        assert p.subcommand == "status"
+        assert ("--debug", None) in p.flags

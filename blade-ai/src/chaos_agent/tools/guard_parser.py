@@ -7,7 +7,7 @@ structured ``ParsedCommand`` so that ``ToolGuard`` can:
     ``-p JSON``, ``--from-literal k=v``) — these are opaque data to
     the binary, not shell commands.
   - Skip shell-pattern checks on tokens after ``--`` for kubectl
-    exec/run/attach/debug — those run inside the container.
+    exec/run/debug — those run inside the container.
   - Reject suspicious solo shell-metachar tokens (``;``, ``|``, ``&``,
     ``>``, ``<``, ``&&``, ``||``) regardless of position, as
     defense-in-depth against anomalous LLM output (exec-form would
@@ -200,8 +200,26 @@ KUBECTL_DATA_PAYLOAD_FLAGS: frozenset[str] = frozenset({
 # delegated to a container/process. Outside these subcommands, `--`
 # is treated as a plain positional token (so a misplaced `--` cannot
 # become a host-check bypass).
+# R51: membership is MECHANICALLY verified against the real binary —
+# every member's ``kubectl <sub> --help`` shows a ``kubectl <sub> ... -- ...``
+# usage/example line (exec 7, run 3, debug 2), and every subcommand whose
+# help shows that shape must be a member. ``attach`` was removed here:
+# its help carries NO ``--`` shape (Usage: ``kubectl attach (POD |
+# TYPE/NAME) -c CONTAINER [options]``), and the client rejects the form
+# before connecting — measured: ``kubectl attach pod1 -- echo hi`` →
+# "error: expected POD, TYPE/NAME, or TYPE NAME, (at most 2 arguments)
+# saw 3: [pod1 echo hi]" (``--`` swallowed by pflag, both words became
+# surplus positionals), while ``attach pod1 -i`` reaches the server.
+# Cross-checked on the wiz channel with a DIFFERENT kubectl build
+# (executor v1.30.0 vs local v1.34.1): the same nonexistent-pod probe
+# reproduces the IDENTICAL "saw 3" rejection while ``exec`` on the same
+# pod name reaches the server (NotFound) — the removal holds on the
+# production path, not just locally.
+# Keeping attach would let the container-command exemption cover tokens
+# for a form kubectl itself refuses — the dangerous direction of this
+# table (a missed member is merely over-deny).
 KUBECTL_DOUBLE_DASH_SUBCOMMANDS: frozenset[str] = frozenset({
-    "exec", "run", "attach", "debug",
+    "exec", "run", "debug",
 })
 
 # Subcommand-dependent boolean SHORTHANDS — the one place the flat tables
@@ -234,28 +252,86 @@ KUBECTL_SUBCOMMAND_BOOLEAN_SHORTHANDS: dict[str, frozenset[str]] = {
     "logs": frozenset({"-f", "-p"}),
 }
 
-# blade boolean flags — same rationale as KUBECTL_BOOLEAN_FLAGS.
+# blade boolean flags — polarity MEASURED against the installed binary
+# (v1.9.0-alpha kubewiz fork, R52; read-only help surfaces only):
+#   -h/--help: built-in — ``blade --help`` prints usage and exits, never
+#     consumes a value. Measured alive.
+#   -d/--debug, --version, --no-color: GHOSTS — "flag provided but not
+#     defined" on the real binary. Kept anyway: a boolean reading only
+#     widens the host-scanned positional stream and the command fails at
+#     the binary regardless — the safe direction. Recorded, not assumed.
+#   -v: REMOVED — measured on BOTH spellings (bare-form probes):
+#     ``blade -v version`` → ``invalid value "version" for flag -v`` (the
+#     flag is VALUE-taking int where it lives), but ``blade -v 3 status``
+#     → ``unknown shorthand flag: 'v' in -v`` — its visibility FOLLOWS
+#     cobra's command tree (a subcommand's persistent set, not root's).
+#     Both real forms fail at the binary, so either polarity is harmless;
+#     the boolean row additionally mis-keyed the subcommand slot where the
+#     flag lives (``blade -v version`` read "version" as the subcommand).
+#   USAGE-PAGE ≠ PARSE-FACE (R52 lesson): the top-level help page prints a
+#     klog flag family (-logtostderr, -v, -log_dir, ...) that cobra never
+#     merged into the parser — every spelling is refused ("unknown
+#     shorthand flag: 'l' in -logtostderr" / "unknown flag: --v"). No klog
+#     member was added to this table; the kubectl equivalence (help page =
+#     parse face) does NOT hold for the cobra family.
 BLADE_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     "-h", "--help",
     "-d", "--debug",
-    "-v", "--version",
+    "--version",
     "--no-color",
 })
 
-# blade value-taking flags (explicit list for documentation; the parser
-# would default to value-taking anyway, but listing makes audit obvious).
+# blade value-taking flags (explicit list; the parser defaults to
+# value-taking anyway — the CONSUMING face is the provenance walk in
+# verify.py ``destroy_uid_from_tokens``, where a value flag MUST be known
+# or its value is mistaken for the experiment UID). Reconciled against the
+# installed v1.9.0-alpha fork, R52 (read-only help sweep, 11 pages incl.
+# the action layer):
+#   + ``--cluster-uuid``/``--kubectl-proxy``/``--kubewiz-token``/
+#     ``--kubewiz-url``/``--token``: the fork's destroy page carries 8
+#     value flags and 5 of these were MISSING — ``blade destroy
+#     --cluster-uuid <c-uuid> <uid>`` made the walk hand the CLUSTER uuid
+#     to the UID shape gate, which rejected it → "" → the REAL uid was
+#     skipped → fail-closed FALSE REFUSAL of the task's own cleanup (the
+#     same class as round-14 F3's ``--kubeconfig``).
+#   + ``--action``/``--flag-filter``/``--limit``/``--status`` (status page)
+#     and ``--waiting-time`` (k8s chain): value-real, same walk-safety
+#     boundary, zero cost to list.
+#   KNOWN DRIFT (recorded, kept; narrowed by R53's host-chain re-sweep):
+#     ``--interface``/``--protocol``/``--local-port``/``--remote-port``/
+#     ``--exclude-port``/``--target``/``--type`` are ABSENT from the k8s
+#     pages R52 swept AND from the host ``network drop`` page — re-verified
+#     in R53 both by help grep AND by reading the page's FULL local-flag
+#     list (none of the seven appears). The other members once lumped
+#     under this drift line were MEASURED ALIVE on host-level chains in
+#     R53: bare-form "needs an argument" for ``--time`` (python/strace
+#     delay), ``--offset`` (time travel), ``--port`` (network occupy);
+#     ``=value --help`` eq-form probe for ``--percent`` (disk fill) and
+#     ``--rate`` (mem load) — the eq form parses a value flag and prints
+#     help, while a boolean dies with a ParseBool error (both outcomes
+#     stay at the parse/help layer, never reaching Run) — the R52 blanket
+#     claim "never appear on any fork help page" was TOO WIDE: that sweep only
+#     covered the k8s chain. Ghost membership is walk-cosmetic here — the
+#     consuming face is the destroy/revoke tail (``destroy_uid_from_tokens``
+#     ), whose flags were reconciled directly; a ghost member only makes
+#     the walk skip a token after a flag the binary does not define on the
+#     destroy chain — harmless direction.
 BLADE_VALUE_FLAGS: frozenset[str] = frozenset({
     "--time", "--interface", "--names", "--namespace", "--container",
     "--labels", "--percent", "--rate", "--offset", "--port", "--protocol",
     "--remote-port", "--local-port", "--exclude-port", "--target", "--type",
     "--kubeconfig", "--cri-endpoint", "--container-runtime",
     "--uid", "--ip", "--hostname", "--domain", "--device", "--mode",
+    "--cluster-uuid", "--kubectl-proxy", "--kubewiz-token",
+    "--kubewiz-url", "--token", "--action", "--flag-filter",
+    "--limit", "--status", "--waiting-time",
 })
 
-BLADE_SUBCOMMANDS: frozenset[str] = frozenset({
-    "create", "destroy", "status", "prepare", "revoke",
-    "query", "version", "help",
-})
+# R52: the former BLADE_SUBCOMMANDS frozenset is deleted — it had ZERO
+# production consumers (_parse_blade takes the first non-flag token as the
+# subcommand without any set check) and one tautological test assertion;
+# a dead table reads as a claim ("subcommands are validated") that no code
+# honors. The subcommand vocabulary now lives only in the real parser.
 
 # Solo shell-metachar tokens — independent presence of these in cmd is
 # anomalous LLM behavior (exec-form would treat them as literals; their
@@ -284,7 +360,7 @@ class ParsedCommand:
     # by host_relevant_tokens(). Stored as a tuple (not dict) because a
     # flag may legitimately appear multiple times (e.g. ``--from-literal``).
     data_payload_values: tuple[str, ...]
-    # Tokens after the `--` separator for exec/run/attach/debug. Fully
+    # Tokens after the `--` separator for exec/run/debug. Fully
     # excluded from host_relevant_tokens() (runs inside the container).
     container_command: tuple[str, ...]
 
@@ -335,14 +411,14 @@ def _parse_kubectl(cmd: list[str]) -> ParsedCommand:
         token = cmd[i]
 
         # `--` separator handling: only treated as host/container split
-        # when we're inside an exec/run/attach/debug subcommand. In
+        # when we're inside an exec/run/debug subcommand. In
         # other contexts it's a plain positional (defense-in-depth: a
         # misplaced ``--`` must not become a host-check bypass).
         if token == "--":
             if subcommand in KUBECTL_DOUBLE_DASH_SUBCOMMANDS:
                 container_cmd = list(cmd[i + 1:])
                 break
-            # Outside exec/run/attach/debug: treat `--` as a positional
+            # Outside exec/run/debug: treat `--` as a positional
             # rather than a flag (avoids consuming the next token as a
             # phantom value).
             if subcommand is None:
@@ -491,7 +567,7 @@ def _parse_wiz(cmd: list[str]) -> ParsedCommand:
     lifting the inner structure up to the wiz level:
       - inner host-relevant tokens (the ``--``-prefix segment: binary,
         subcommand, positional args, flag names/values) stay CHECKED;
-      - inner ``container_command`` (after ``--`` for exec/run/attach/debug)
+      - inner ``container_command`` (after ``--`` for exec/run/debug)
         stays EXEMPT.
     This makes kubewiz-wrapped commands behave IDENTICALLY to raw commands.
 

@@ -1064,7 +1064,7 @@ class TestToolGuardCheck:
         assert ("-h", None) in p.flags
 
     def test_kubectl_get_with_double_dash_treated_as_positional(self):
-        """E11 Gap B regression: `--` outside exec/run/attach/debug
+        """E11 Gap B regression: `--` outside exec/run/debug
         MUST NOT split container_command. Otherwise a misplaced `--`
         would become a bypass channel for shell-pattern checks on
         anything that follows."""
@@ -2652,7 +2652,7 @@ class TestToolGuardWizUnwrap:
         """
         from types import SimpleNamespace
 
-        from chaos_agent.tools.kubectl import build_kubectl_cmd
+        from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
 
         s = SimpleNamespace(
             kubectl_path="kubectl",

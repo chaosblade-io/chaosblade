@@ -8,7 +8,6 @@ from chaos_agent.agent.target_health import (
     HealthIssue,
     HealthReport,
     HealthSeverity,
-    NodeHealthChecker,
     PodHealthChecker,
     _build_node_report,
     _build_pod_report,
@@ -177,14 +176,176 @@ class TestAssessTargetHealth:
             raise RuntimeError("checker bug")
 
         monkeypatch.setattr(target_health, "_query_node_conditions", boom)
-        # Must NOT propagate exception; report comes back empty/OK.
+        # Must NOT propagate exception; and must NOT masquerade as a
+        # clean bill of health — R66: the degraded report is an
+        # explicit unknown WARN (transparent fail-open), still
+        # non-blocking.
         report = await assess_target_health("node", {"names": ["n"]}, "")
-        assert report.overall == HealthSeverity.OK
+        assert report.overall == HealthSeverity.WARN
+        assert report.is_blocking() is False
+        assert any(
+            i.code == "node.health_check_unknown" for i in report.issues
+        )
 
     @pytest.mark.asyncio
     async def test_empty_target_names_is_ok(self):
         report = await assess_target_health("node", {"names": []}, "")
         assert report.overall == HealthSeverity.OK
+
+
+# ---------------------------------------------------------------------------
+# R66 — the mirror face: a FAILED health query is UNKNOWN, never "healthy"
+# ---------------------------------------------------------------------------
+
+
+class TestHealthCheckUnknownIsNotOk:
+    """R66 pins (probe _r66_target_health_failopen.py, sections A-K):
+    every failed query mode must surface as an explicit unknown WARN —
+    never a fake "healthy" + assertion sentence. Controls assert the
+    genuine paths (verified-OK / genuine pressure / not-found) keep
+    their previous semantics."""
+
+    R57_UNKNOWN = (
+        "Error: kubectl get: Command timed out after 300s: kubectl get "
+        "node node-1 -o json\n"
+        "Outcome UNKNOWN: only the local wait was killed — the command "
+        "may STILL be running server-side."
+    )
+
+    @staticmethod
+    def _patch_kubectl(monkeypatch, raw_or_exc):
+        """Pin the REAL upstream seam: ``execute_via_transport``.
+
+        R69: the query faces moved off ``_kubectl_impl`` (the decorated
+        LLM-presentation entrypoint) onto ``query_kubectl`` → the
+        transport. Mocking ``_kubectl_impl`` here would pin a function
+        production no longer calls — a downstream pin that stays green
+        while the real path rots (the exact blind spot R69 fixes). So we
+        feed transport-shaped results and let ``query_kubectl`` + the
+        judgment functions run for real.
+
+        ``raw_or_exc`` is either an Exception (transport raises) or the
+        kubectl payload string: an ``Error…`` payload is delivered as a
+        non-zero exit with the text on stderr (kubectl's real failure
+        shape), anything else as a clean exit-0 stdout payload.
+        """
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import chaos_agent.transports as tp
+
+        mock = AsyncMock()
+        if isinstance(raw_or_exc, Exception):
+            mock.side_effect = raw_or_exc
+        else:
+            raw = raw_or_exc
+            if raw.strip().startswith("Error"):
+                result = SimpleNamespace(stdout="", stderr=raw, exit_code=1)
+            else:
+                result = SimpleNamespace(stdout=raw, stderr="", exit_code=0)
+            mock.return_value = result
+        monkeypatch.setattr(tp, "execute_via_transport", mock)
+
+    @pytest.mark.asyncio
+    async def test_node_transport_failure_is_unknown_warn(self, monkeypatch):
+        self._patch_kubectl(monkeypatch, ConnectionError("dial tcp: i/o timeout"))
+        report = await assess_target_health("node", {"names": ["n1"]}, "")
+        assert report.overall == HealthSeverity.WARN
+        assert report.is_blocking() is False  # fail-open kept, but transparent
+        assert report.issues[0].code == "node.health_check_unknown"
+        assert "NOT verified" in report.checked_detail
+
+    @pytest.mark.asyncio
+    async def test_node_rbac_error_is_unknown_warn(self, monkeypatch):
+        self._patch_kubectl(monkeypatch, 'Error: nodes "n1" is forbidden')
+        report = await assess_target_health("node", {"names": ["n1"]}, "")
+        assert report.overall == HealthSeverity.WARN
+        assert report.issues[0].code == "node.health_check_unknown"
+
+    @pytest.mark.asyncio
+    async def test_node_non_json_is_unknown_warn(self, monkeypatch):
+        self._patch_kubectl(monkeypatch, "system: warning line\nnot json")
+        report = await assess_target_health("node", {"names": ["n1"]}, "")
+        assert report.overall == HealthSeverity.WARN
+
+    @pytest.mark.asyncio
+    async def test_node_budget_expiry_unknown_shape(self, monkeypatch):
+        """The R57/R59 budget-expiry shapes — the family anchor: the
+        outcome-UNKNOWN third state must never be read as a verdict in
+        EITHER direction (not failure, and not health either)."""
+        self._patch_kubectl(monkeypatch, self.R57_UNKNOWN)
+        report = await assess_target_health("node", {"names": ["n1"]}, "")
+        assert report.overall == HealthSeverity.WARN
+        assert report.issues[0].code == "node.health_check_unknown"
+
+    @pytest.mark.asyncio
+    async def test_node_verified_ok_control(self, monkeypatch):
+        self._patch_kubectl(
+            monkeypatch,
+            '{"status": {"conditions": [{"type": "Ready", "status": "True"}]}}',
+        )
+        report = await assess_target_health("node", {"names": ["n1"]}, "")
+        assert report.overall == HealthSeverity.OK
+        assert "Node Ready" in report.checked_detail
+
+    @pytest.mark.asyncio
+    async def test_node_genuine_pressure_still_blocks(self, monkeypatch):
+        self._patch_kubectl(
+            monkeypatch,
+            '{"status": {"conditions": [{"type": "DiskPressure", "status": "True"}]}}',
+        )
+        report = await assess_target_health("node", {"names": ["n1"]}, "")
+        assert report.overall == HealthSeverity.BLOCK
+
+    @pytest.mark.asyncio
+    async def test_node_not_found_blocks_symmetric_with_pod(self, monkeypatch):
+        """R69: a non-existent node is a hard BLOCK, symmetric with the pod
+        face's ``pod.not_found``. Before R69 the node face collapsed
+        not-found into the failed-query ``None`` → WARN (blocking=False),
+        so 'node missing' and 'pod missing' got opposite verdicts."""
+        self._patch_kubectl(monkeypatch, 'Error: nodes "n1" not found')
+        report = await assess_target_health("node", {"names": ["n1"]}, "")
+        assert report.overall == HealthSeverity.BLOCK
+        assert report.is_blocking() is True
+        assert report.issues[0].code == "node.not_found"
+
+    @pytest.mark.asyncio
+    async def test_pod_transport_failure_is_unknown_warn(self, monkeypatch):
+        self._patch_kubectl(monkeypatch, ConnectionError("dial tcp: i/o timeout"))
+        report = await assess_target_health(
+            "pod", {"names": ["p1"], "namespace": "default"}, ""
+        )
+        assert report.overall == HealthSeverity.WARN
+        assert report.is_blocking() is False
+        assert report.issues[0].code == "pod.health_check_unknown"
+
+    @pytest.mark.asyncio
+    async def test_pod_rbac_error_is_unknown_warn(self, monkeypatch):
+        self._patch_kubectl(monkeypatch, 'Error: pods "p1" is forbidden')
+        report = await assess_target_health(
+            "pod", {"names": ["p1"], "namespace": "default"}, ""
+        )
+        assert report.overall == HealthSeverity.WARN
+        assert report.issues[0].code == "pod.health_check_unknown"
+
+    @pytest.mark.asyncio
+    async def test_pod_verified_ok_control(self, monkeypatch):
+        self._patch_kubectl(monkeypatch, '{"status": {"phase": "Running"}}')
+        report = await assess_target_health(
+            "pod", {"names": ["p1"], "namespace": "default"}, ""
+        )
+        assert report.overall == HealthSeverity.OK
+        assert "no Evicted" in report.checked_detail
+
+    @pytest.mark.asyncio
+    async def test_pod_not_found_still_blocks(self, monkeypatch):
+        """The pre-existing not-found special case keeps its semantics."""
+        self._patch_kubectl(monkeypatch, 'Error: pods "p1" not found')
+        report = await assess_target_health(
+            "pod", {"names": ["p1"], "namespace": "default"}, ""
+        )
+        assert report.overall == HealthSeverity.BLOCK
+        assert report.issues[0].code == "pod.not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +436,57 @@ class TestResolvePodNames:
             "",
         )
         assert report.overall == HealthSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_labels_resolve_via_transport_jsonpath(self, monkeypatch):
+        """R69 upstream pin: with labels, ``_resolve_pod_names`` reads the
+        jsonpath payload off the transport (exit 0) and returns real names."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import chaos_agent.transports as tp
+        from chaos_agent.agent import target_health
+
+        monkeypatch.setattr(tp, "execute_via_transport", AsyncMock(
+            return_value=SimpleNamespace(
+                stdout="accounting-6fb-qn2vr accounting-6fb-xqhdd",
+                stderr="", exit_code=0,
+            ),
+        ))
+        result = await target_health._resolve_pod_names(
+            {"labels": {"app": "accounting"}, "names": ["accounting"],
+             "namespace": "cms-demo"},
+            "/fake/kc",
+        )
+        assert result == ["accounting-6fb-qn2vr", "accounting-6fb-xqhdd"]
+
+    @pytest.mark.asyncio
+    async def test_labels_query_failure_does_not_leak_error_tokens(self, monkeypatch):
+        """R69 regression: a FAILED label query must NOT be split into pod
+        names. The old ``_kubectl_impl`` face returned an "Error from
+        server ..." string that ``len(strip())>0`` + ``split()`` turned into
+        pods ``["Error", "from", "server", ...]``. Now the ``.ok`` gate
+        rejects the failure and falls back to ``names``."""
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        import chaos_agent.transports as tp
+        from chaos_agent.agent import target_health
+
+        monkeypatch.setattr(tp, "execute_via_transport", AsyncMock(
+            return_value=SimpleNamespace(
+                stdout="", exit_code=1,
+                stderr='Error from server (NotFound): pods not found',
+            ),
+        ))
+        result = await target_health._resolve_pod_names(
+            {"labels": {"app": "accounting"}, "names": ["accounting"],
+             "namespace": "cms-demo"},
+            "/fake/kc",
+        )
+        # Falls back to the declared names — never the error-string tokens.
+        assert result == ["accounting"]
+        assert not any(tok.startswith("Error") for tok in result)
 
 
 # ---------------------------------------------------------------------------
@@ -554,65 +766,130 @@ class TestNodeReadyCondition:
 
 
 # ---------------------------------------------------------------------------
-# ChaosBlade agent existence (improvement 4)
+# ChaosBlade tool-pod presence — health verdict MUST agree with execution side
 # ---------------------------------------------------------------------------
 
 
 class TestBladeAgentCheck:
-    @pytest.mark.asyncio
-    async def test_agent_missing_blocks(self, monkeypatch):
+    """R69: the health pre-check's tool-pod verdict and the execution-side
+    carrier discovery (``discover_tool_pod_on_node``) now share ONE
+    authority (``discover_tool_pod_state_on_node``). Before R69 the health
+    check hand-rolled its own ``len(raw.strip()) > 0`` query through the
+    decorated ``_kubectl_impl`` face — the empty-selector hint made it
+    ALWAYS report 'online', so it disagreed with the injector in 8/12
+    scenarios (report stamped online, execution found no carrier).
+
+    These tests pin at the REAL transport seam (never mock the judgment
+    function itself — that was the downstream pin that stayed green while
+    the real path lied) and assert BOTH sides agree for each of the three
+    states: PRESENT / ABSENT / UNKNOWN.
+    """
+
+    _TARGET = {
+        "names": ["worker-01"], "namespace": "",
+        "labels": {}, "resource_type": "node",
+    }
+
+    @staticmethod
+    def _ready_node(monkeypatch):
+        """Isolate the tool-pod probe: node conditions are healthy."""
         from unittest.mock import AsyncMock
 
         monkeypatch.setattr(
             "chaos_agent.agent.target_health._query_node_conditions",
             AsyncMock(return_value=[{"type": "Ready", "status": "True"}]),
         )
-        monkeypatch.setattr(
-            "chaos_agent.agent.target_health._query_blade_agent_on_node",
-            AsyncMock(return_value=False),
+
+    @staticmethod
+    def _patch_transport(monkeypatch, result_or_exc):
+        from unittest.mock import AsyncMock
+
+        import chaos_agent.transports as tp
+
+        mock = AsyncMock()
+        if isinstance(result_or_exc, Exception):
+            mock.side_effect = result_or_exc
+        else:
+            mock.return_value = result_or_exc
+        monkeypatch.setattr(tp, "execute_via_transport", mock)
+
+    @staticmethod
+    def _row(ns, name, phase, node):
+        """Explicit-field jsonpath row (``ns|name|phase|node``) as the
+        transport stdout of a clean exit-0 tool-pod listing."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            stdout=f"{ns}|{name}|{phase}|{node}", stderr="", exit_code=0,
         )
+
+    @pytest.mark.asyncio
+    async def test_present_is_ok_and_execution_finds_same_carrier(self, monkeypatch):
+        from chaos_agent.tools.pod_discovery import discover_tool_pod_on_node
+
+        self._ready_node(monkeypatch)
+        self._patch_transport(monkeypatch, self._row(
+            "chaosblade", "chaosblade-tool-abc", "Running", "worker-01",
+        ))
         report = await assess_target_health(
-            "node",
-            {"names": ["worker-01"], "namespace": "", "labels": {}, "resource_type": "node"},
-            kubeconfig="/fake/kubeconfig",
+            "node", self._TARGET, kubeconfig="/fake/kc",
+        )
+        assert report.overall == HealthSeverity.OK
+        assert "chaosblade-tool online" in report.checked_detail
+        # AGREEMENT: the execution side resolves the SAME carrier.
+        assert await discover_tool_pod_on_node("worker-01", "/fake/kc") == (
+            "chaosblade-tool-abc", "chaosblade",
+        )
+
+    @pytest.mark.asyncio
+    async def test_absent_blocks_and_execution_finds_no_carrier(self, monkeypatch):
+        from chaos_agent.tools.pod_discovery import discover_tool_pod_on_node
+
+        self._ready_node(monkeypatch)
+        # Query SUCCEEDS (exit 0) but the only Running tool pod is on another
+        # node — the tool is genuinely absent from worker-01 (ABSENT, not
+        # UNKNOWN, so it is safe to BLOCK).
+        self._patch_transport(monkeypatch, self._row(
+            "chaosblade", "chaosblade-tool-xyz", "Running", "other-node",
+        ))
+        report = await assess_target_health(
+            "node", self._TARGET, kubeconfig="/fake/kc",
         )
         assert report.overall == HealthSeverity.BLOCK
         assert any(i.code == "node.chaosblade_tool_missing" for i in report.issues)
+        assert "chaosblade-tool online" not in report.checked_detail
+        # AGREEMENT: execution side also finds no carrier (both say 'missing').
+        assert await discover_tool_pod_on_node("worker-01", "/fake/kc") is None
 
     @pytest.mark.asyncio
-    async def test_agent_present_is_ok(self, monkeypatch):
-        from unittest.mock import AsyncMock
+    async def test_unknown_fails_open_and_never_claims_online(self, monkeypatch):
+        from chaos_agent.tools.pod_discovery import discover_tool_pod_on_node
 
-        monkeypatch.setattr(
-            "chaos_agent.agent.target_health._query_node_conditions",
-            AsyncMock(return_value=[{"type": "Ready", "status": "True"}]),
-        )
-        monkeypatch.setattr(
-            "chaos_agent.agent.target_health._query_blade_agent_on_node",
-            AsyncMock(return_value=True),
-        )
+        self._ready_node(monkeypatch)
+        # Every label query fails → UNKNOWN → fail-open (no BLOCK), but the
+        # report must NOT claim 'online' either (that was the R69 lie).
+        self._patch_transport(monkeypatch, ConnectionError("dial tcp: i/o timeout"))
         report = await assess_target_health(
-            "node",
-            {"names": ["worker-01"], "namespace": "", "labels": {}, "resource_type": "node"},
-            kubeconfig="/fake/kubeconfig",
+            "node", self._TARGET, kubeconfig="/fake/kc",
         )
         assert report.overall == HealthSeverity.OK
+        assert report.is_blocking() is False
+        assert "chaosblade-tool online" not in report.checked_detail
+        assert not any(
+            i.code == "node.chaosblade_tool_missing" for i in report.issues
+        )
+        assert await discover_tool_pod_on_node("worker-01", "/fake/kc") is None
 
     @pytest.mark.asyncio
     async def test_agent_check_disabled(self, monkeypatch):
-        from unittest.mock import AsyncMock
-
-        monkeypatch.setattr(
-            "chaos_agent.agent.target_health._query_node_conditions",
-            AsyncMock(return_value=[{"type": "Ready", "status": "True"}]),
-        )
+        self._ready_node(monkeypatch)
         monkeypatch.setattr(
             "chaos_agent.config.settings.settings.blade_agent_check_enabled", False
         )
-        # _query_blade_agent_on_node is NOT mocked — should never be called
+        # Transport NOT patched: the probe must never run when disabled —
+        # if it did, the unmocked transport would fail loudly.
         report = await assess_target_health(
-            "node",
-            {"names": ["worker-01"], "namespace": "", "labels": {}, "resource_type": "node"},
-            kubeconfig="/fake/kubeconfig",
+            "node", self._TARGET, kubeconfig="/fake/kc",
         )
         assert report.overall == HealthSeverity.OK
+        assert "chaosblade-tool online" not in report.checked_detail
