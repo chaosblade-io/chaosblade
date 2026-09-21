@@ -200,6 +200,36 @@ def _phase2_handle_tool_error(error: Exception) -> str:
     )
 
 
+async def stamp_recover_terminal(state) -> dict:
+    """The recover graph's single terminal funnel — stamps ``finished_at``.
+
+    The recover graph's cut exits (expired wall clock, exhausted loop budget)
+    route ``done`` -> END from a round-trip delta carrying no verdict, so no
+    node in such a run ever wrote ``finished_at``: the row kept
+    ``finished_at=''`` and the derived ``duration_ms=0`` (W-56-8 review round
+    3, probe K1-K3), violating the terminal-node contract ``sync_to_store``
+    documents ("Terminal nodes put finished_at into updated_fields"). The
+    inject graph has no such hole — its ``done`` funnels through
+    ``save_memory``, which stamps.
+
+    Skipping an existing stamp is deliberate, not an optimisation:
+    ``finalize_recover_verification`` already stamps its verdict time, and
+    re-stamping here would date the run's end after the judgement that ended
+    it. No ``with_phase_events`` wrapper either — the intent graph's
+    ``save_dialogue`` sets the precedent for timestamps-only end nodes, and
+    this one runs only after the run has been judged, so it has no phase of
+    its own to emit.
+    """
+    if state.get("finished_at"):
+        return {}
+    from chaos_agent.agent.nodes.store._store_sync import sync_to_store
+    from chaos_agent.utils.time import now_iso
+
+    result = {"finished_at": now_iso()}
+    await sync_to_store(state, result)
+    return result
+
+
 def build_recover_graph(
     verifier_tools: list = None,
     pre_reason_hook=None,
@@ -209,7 +239,9 @@ def build_recover_graph(
     """Build the recover graph with two-layer verification.
 
     Flow:
-        START → execute_destroy → recover_verifier_loop ⇄ verifier_tools → END
+        START → recover_verifier_loop ⇄ (recover_verifier_screener →
+        recover_verifier_tools) → finalize_recover_verification →
+        stamp_recover_terminal → END
 
     Layer 1: Execute blade_destroy + verify via blade_status (deterministic)
     Layer 2: LLM reads skill's "恢复验证" section and verifies (ReAct loop)
@@ -231,6 +263,9 @@ def build_recover_graph(
     # Nodes
     graph.add_node("recover_verifier_loop", with_phase_events("recover_verifier_loop", "recovery", recover_verifier_node))
     graph.add_node("finalize_recover_verification", with_phase_events("finalize_recover_verification", "recovery", finalize_recover_node))
+    # Single terminal funnel — mirrors the inject graph's terminal_reports
+    # contract (task-349ccf5d): every "done" below lands here before END.
+    graph.add_node("stamp_recover_terminal", stamp_recover_terminal)
     if verifier_tools:
         # Unified screener edge node — capability verdict + read-only
         # discipline between the loop and its ToolNode, mirroring
@@ -273,7 +308,7 @@ def build_recover_graph(
             {
                 "continue": "recover_verifier_screener",
                 "finalize": "finalize_recover_verification",
-                "done": END,
+                "done": "stamp_recover_terminal",
             },
         )
         graph.add_conditional_edges(
@@ -300,18 +335,23 @@ def build_recover_graph(
             {
                 "continue": "finalize_recover_verification",
                 "finalize": "finalize_recover_verification",
-                "done": END,
+                "done": "stamp_recover_terminal",
             },
         )
-    # finalize_recover_verification → END (done) or back to recover_verifier_loop (guard/retry).
+    # finalize_recover_verification → terminal funnel (done), or back to
+    # recover_verifier_loop (guard/retry).
     graph.add_conditional_edges(
         "finalize_recover_verification",
         route_after_recover_finalize,
         {
             "recover_verifier_loop": "recover_verifier_loop",
-            "done": END,
+            "done": "stamp_recover_terminal",
         },
     )
+    # The funnel's ONLY edge — the single path to END. Routing every "done"
+    # through it makes the finished_at stamp a property of the topology, so no
+    # future exit (or a missed one today) can end a recover run unstamped.
+    graph.add_edge("stamp_recover_terminal", END)
 
     return graph
 

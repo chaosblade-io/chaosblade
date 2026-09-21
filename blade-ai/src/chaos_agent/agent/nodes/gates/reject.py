@@ -74,6 +74,27 @@ async def reject(state: AgentState) -> dict:
         or "Unknown reason"
     )
 
+    # W-56-6 (defect d): this node deliberately does NOT stamp
+    # ``safety_status``. The field records the SAFETY GATE's last verdict for
+    # the attempt — "pending" (it never ran) and "retry" (it sent the plan back
+    # for skill activation) are truthful values on a finished run, and nothing
+    # routes on the field once the run is terminal (route_after_safety's
+    # "retry" branch only fires straight after safety_check). The terminal
+    # lifecycle word is derived separately (infer_task_state → task_state /
+    # status); stamping "rejected" here would flip that derivation from
+    # "failed" to "rejected" for every planning-timeout rejection.
+    #
+    # What every in-edge DOES owe this node is a FRESH ``safety_reason``, one
+    # value shared by every rendering below:
+    #   · safety_check — blacklist / no-target / health / feasibility;
+    #   · tool_screener — the hard stop (SCREENER_ROUTE_FAIL);
+    #   · confirmation_gate — force-override required, and user rejection;
+    #   · extract_planning_metadata — the LLM's planning rejection;
+    #   · agent_loop — its three reachable terminal exits, which ride the
+    #     router's error branch and used to leave an earlier gate's
+    #     "No skill activated …" note standing (pinned by
+    #     tests/test_agent/test_planning_termination_attribution.py).
+
     tracker = get_tracker(task_id)
     tracker.start(
         StatusCategory.NODE,

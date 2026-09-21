@@ -12,6 +12,7 @@ from copy import deepcopy
 from typing import Any
 
 from chaos_agent.agent.spec.fault_spec import FaultSpec
+from chaos_agent.agent.state_mgmt.state_lifecycle import stamp_pipeline_start
 from chaos_agent.utils.time import now_iso
 
 
@@ -96,7 +97,10 @@ def build_inject_initial_state(
         state["progress_ledger"] = deepcopy(progress_ledger)
     if probe_snapshot is not None:
         state["probe_snapshot"] = deepcopy(probe_snapshot)
-    return state
+    # This constructor opens a run, so it opens the run's wall-clock origin
+    # (W-56-8 F1): every CLI / TUI / HTTP / L4 inject starts here, and
+    # without the stamp the router's max_inject_seconds guard had no input.
+    return stamp_pipeline_start(state)
 
 
 __all__ = [

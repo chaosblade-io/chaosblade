@@ -350,6 +350,53 @@ def _split_args(args: str) -> list[str]:
 
 MAX_AGENT_LOOP = settings.max_agent_loop
 
+# Both text-only exits (stall-exhausted and final forced iteration) terminate
+# for the same reason; naming it once keeps their failure_detail context and
+# their safety_reason from drifting apart.
+_PLAN_TEXT_ONLY_CONCLUSION = "LLM concluded without tool use or skill activation"
+
+
+def _planning_termination(
+    category: FailureCategory,
+    message: str,
+    messages: list | None = None,
+    *,
+    context: str = "",
+    alternatives: str = "",
+    llm_analysis: str = "",
+    extra: dict | None = None,
+) -> dict:
+    """Build a terminal planning-failure delta that names its own cause.
+
+    ``reject`` renders ``safety_reason or outcome.error or "Unknown reason"``
+    and states that preference as "written by whichever gate routes here THIS
+    time" (nodes/gates/reject.py). A planning-loop termination is one of those
+    routers — its edge into ``reject`` rides the router's error branch — so it
+    has to publish ``safety_reason`` as well. That field is cleared only where
+    a run moves FORWARD: safety_check's safe branch, plan_change_confirm's
+    approval, and the replan seam's attempt-scoped reset (state_lifecycle).
+    A terminal exit inside the same attempt reaches none of them, so leaving
+    the field alone lets an earlier gate's recoverable note ("No skill
+    activated — returned to planner for activation") survive into the
+    rejection an operator reads. Measured on all three reachable exits of this
+    node (stall-exhausted, final-iteration, budget-exhausted).
+
+    ``fail_state`` keeps receiving the machine ``context`` unchanged; only the
+    human-facing ``safety_reason`` channel is added here, so every exit's
+    ``failure_detail`` stays byte-identical to what it produced before.
+    """
+    return {
+        **(extra or {}),
+        "safety_reason": message,
+        **fail_state(
+            category,
+            context or message,
+            messages if messages is not None else [],
+            alternatives=alternatives,
+            llm_analysis=llm_analysis,
+        ),
+    }
+
 
 def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", registry=None):
     """Create an agent_loop node with optional PreReasoningHook and LLM.
@@ -418,16 +465,15 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 "or the LLM could not converge on a viable plan. "
                 "Check the target resource's state and retry."
             )
-            result = {
-                "safety_status": "rejected",
-                **fail_state(
-                    category,
-                    rejection_reason or f"max_iterations={MAX_AGENT_LOOP}",
-                    state.get("messages", []),
-                    alternatives=alternatives,
-                    llm_analysis=analysis,
-                ),
-            }
+            result = _planning_termination(
+                category,
+                analysis,
+                state.get("messages", []),
+                context=rejection_reason or f"max_iterations={MAX_AGENT_LOOP}",
+                alternatives=alternatives,
+                llm_analysis=analysis,
+                extra={"safety_status": "rejected"},
+            )
             await sync_to_store(state, result)
             return result
 
@@ -436,7 +482,13 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         if llm is None and hook is None:
             tracker.complete(f"Agent loop iteration {count} done")
             from chaos_agent.agent.router import mark_wall_clock_timeout
-            return mark_wall_clock_timeout(state, {"agent_loop_count": count})
+            result = mark_wall_clock_timeout(state, {"agent_loop_count": count})
+            # W-56-8 F2, same read-back contract as the main exit below: this
+            # node's wall-clock reject renders ``safety_reason``, so the cause
+            # just stamped must ride both result fields.
+            if result.get("error"):
+                result.setdefault("safety_reason", result["error"])
+            return result
 
         # 2. Call pre_reason_hook (memory compaction)
         hook_updates = {}
@@ -523,17 +575,17 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                         "environment, or bind an environment that already has "
                         f"one. Selected domain: {selected_domain}."
                     )
-                result = {
-                    "agent_loop_count": count,
-                    "safety_status": "rejected",
-                    "planning_rejected": True,
-                    **fail_state(
-                        FailureCategory.PLANNING_REJECTED,
-                        message,
-                        state.get("messages", []),
-                        llm_analysis=message,
-                    ),
-                }
+                result = _planning_termination(
+                    FailureCategory.PLANNING_REJECTED,
+                    message,
+                    state.get("messages", []),
+                    llm_analysis=message,
+                    extra={
+                        "agent_loop_count": count,
+                        "safety_status": "rejected",
+                        "planning_rejected": True,
+                    },
+                )
                 from chaos_agent.memory.hook import merge_hook_updates
                 merge_hook_updates(result, hook_updates)
                 tracker.fail(message)
@@ -548,12 +600,6 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                 replan_history=replan_history if is_replan_entry else None,
                 profile=capability_context.profile,
                 fault_spec=state.get("fault_spec"),
-                # FaultDrill CR channel routing guide gate (openspec
-                # faultdrill-cr-channel D3 source 2): the caller-side
-                # capability fact — the builder combines it with the K8s
-                # profile so host-channel prompts never see the guide, and
-                # the dark-launch window (flag off) stays byte-identical.
-                cr_channel_enabled=settings.faultdrill_enabled,
             )
 
             # --- Inject structured fault context from FaultSpec ---
@@ -1036,9 +1082,9 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                     if count >= MAX_AGENT_LOOP:
                         # Final iteration: tools were unbound to force a text
                         # handoff — accept it as the terminal conclusion.
-                        result.update(fail_state(
+                        result.update(_planning_termination(
                             FailureCategory.PLANNING_TIMEOUT,
-                            "LLM concluded without tool use or skill activation",
+                            _PLAN_TEXT_ONLY_CONCLUSION,
                             state.get("messages", []) + result.get("messages", []),
                         ))
                     else:
@@ -1063,9 +1109,9 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
                             )
                             result["_plan_text_stall_count"] = stall_count
                         else:
-                            result.update(fail_state(
+                            result.update(_planning_termination(
                                 FailureCategory.PLANNING_TIMEOUT,
-                                "LLM concluded without tool use or skill activation",
+                                _PLAN_TEXT_ONLY_CONCLUSION,
                                 state.get("messages", []) + result.get("messages", []),
                             ))
 
@@ -1080,11 +1126,39 @@ def make_agent_loop(hook=None, llm=None, tools=None, skill_catalog: str = "", re
         # ``FailureCategory`` is imported at module level; re-importing it here
         # would make it a LOCAL name for the whole function and shadow every
         # earlier use (UnboundLocalError on the branches above).
-        from chaos_agent.agent.router import mark_loop_exhausted
-        return mark_loop_exhausted(
+        from chaos_agent.agent.router import (
+            mark_loop_exhausted,
+            mark_wall_clock_timeout,
+        )
+        mark_loop_exhausted(
             result, count, MAX_AGENT_LOOP,
             category=FailureCategory.PLANNING_TIMEOUT, label="planning loop",
         )
+        # The same contract as _planning_termination, for the exit whose cause
+        # is stamped through the router backstop instead of fail_state: publish
+        # the sentence the backstop just composed as ``safety_reason`` too, so
+        # the reject node's first-priority slot names THIS termination rather
+        # than an earlier gate's note. Reading it back — instead of composing a
+        # second sentence — keeps the two channels from drifting, and an
+        # iteration still in flight (count below the cap) carries no
+        # termination, so it is left untouched.
+        if count >= MAX_AGENT_LOOP:
+            result.setdefault("safety_reason", result.get("error", ""))
+        # W-56-8 F2 — the wall-clock sibling of the backstop above. This node's
+        # loop exit is the ONE place the router's wall-clock guard turns into a
+        # ``reject`` (``should_continue_agent_loop`` checks the budget first),
+        # but the decision lives on the router side: with no publisher here the
+        # reject rendered whatever earlier gate note happened to be on state.
+        # The sibling loops (execute_loop, verifier, recover) publish at their
+        # exits the same way; read the stamped sentence back into
+        # ``safety_reason`` so the reject's first-priority slot names THIS
+        # termination. Pre-existing causes win (``mark_wall_clock_timeout`` is
+        # write-once), and an in-flight iteration carries no error, so nothing
+        # is published early.
+        result = mark_wall_clock_timeout(state, result)
+        if result.get("error"):
+            result.setdefault("safety_reason", result["error"])
+        return result
 
     return _agent_loop_with_llm
 

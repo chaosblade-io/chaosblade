@@ -106,6 +106,22 @@ async def sync_to_store(state: dict, updated_fields: dict) -> None:
 
         merged = dict(state)
         merged.update(updated_fields)
+        # W-55-11: derive tasks.duration_ms at the write seam. The column
+        # is a task-table field, but no graph node ever computed it —
+        # every inject row persisted duration_ms=0 and only the read-side
+        # get_metric fallback reconstructed the number. Terminal nodes
+        # (save_memory / reject) put finished_at into updated_fields, so
+        # the merged snapshot is the earliest point where both timestamps
+        # coexist; derive here once and every backend row carries it.
+        if not merged.get("duration_ms"):
+            from chaos_agent.agent.state import duration_ms_from_timestamps
+
+            derived = duration_ms_from_timestamps(
+                str(merged.get("created_at") or ""),
+                str(merged.get("finished_at") or ""),
+            )
+            if derived:
+                merged["duration_ms"] = derived
         task_fields, detail_fields = _extract_db_fields(merged)
         # upsert handles the field splitting internally
         all_fields = {**task_fields, **detail_fields}

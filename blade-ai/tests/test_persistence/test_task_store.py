@@ -360,6 +360,57 @@ class TestUpsert:
         assert data["task_state"] == "cancelled"
 
     @pytest.mark.asyncio
+    async def test_terminal_word_stamps_finished_at_when_absent(self, store):
+        """W-56-8 round 4: a terminal word and its end time are one fact.
+
+        The abort exits write their word through update_task_state, whose
+        column list carries no timestamp: the row then said the run was over
+        while finished_at stayed empty and consumers derived duration_ms=0 —
+        the same event whose session record stamped its own finished_at.
+        Measured on a real row before the fix: word 'injecting' ->
+        'cancelled', finished_at None -> None.
+        """
+        await store.upsert("task-t1", skill_name="pod-kill")
+        before = await store.get("task-t1")
+        assert not before.get("finished_at")
+
+        await store.update_task_state("task-t1", "cancelled")
+
+        data = await store.get("task-t1")
+        assert data["task_state"] == "cancelled"
+        assert data["finished_at"], (
+            "a terminal word must carry the run's end time"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mid_flight_word_keeps_the_stamp_absent(self, store):
+        """The stamp is for terminal words only — this method's mid-flight
+        callers (a resume writing 'injecting', recover start writing
+        'recovering') describe a run still in motion."""
+        await store.upsert("task-t1", skill_name="pod-kill")
+
+        await store.update_task_state("task-t1", "recovering")
+
+        data = await store.get("task-t1")
+        assert data["task_state"] == "recovering"
+        assert not data.get("finished_at"), (
+            "a mid-flight word must not date the run's end"
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_word_keeps_an_existing_stamp(self, store):
+        """The run that finished keeps its own end time, the way
+        skip_if_terminal keeps its own word."""
+        await store.upsert("task-t1", skill_name="pod-kill")
+        await store.update_task_state("task-t1", "completed")
+        first = (await store.get("task-t1"))["finished_at"]
+
+        # The recover flow's later upgrade on the SAME row.
+        await store.update_task_state("task-t1", "recovered")
+
+        assert (await store.get("task-t1"))["finished_at"] == first
+
+    @pytest.mark.asyncio
     async def test_update_task_state_default_keeps_legacy_overwrite_semantics(self, store):
         """The guard is opt-in: the non-abort write paths (the recover
         flow's own verdict upgrades — failed → recovered on the SAME row)

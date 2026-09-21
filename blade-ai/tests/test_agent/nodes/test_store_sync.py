@@ -98,3 +98,114 @@ def test_no_fault_spec_means_no_synthesized_target():
 
     assert not detail_fields.get("target")
     assert not detail_fields.get("fault_spec")
+
+
+# ---------------------------------------------------------------------------
+# W-55-11: tasks.duration_ms 写库 seam 推导
+# ---------------------------------------------------------------------------
+# 缺陷：duration_ms 是 tasks 表列，但没有任何图节点计算它——每条 inject 行
+# 落库都是 duration_ms=0，只有读侧 get_metric 兜底重算。修复把推导搬到
+# sync_to_store 写库 seam（terminal 节点把 finished_at 放进 updates，
+# merged 快照是两个时间戳首次共存的时刻）。
+
+
+def test_duration_ms_from_timestamps_derives_wall_clock():
+    from chaos_agent.agent.state import duration_ms_from_timestamps
+
+    assert duration_ms_from_timestamps(
+        "2026-09-20T12:42:13.155020+08:00",
+        "2026-09-20T12:55:03.770106+08:00",
+    ) == 770615
+
+
+@pytest.mark.parametrize("created,finished", [
+    ("", "2026-09-20T12:55:03+08:00"),
+    ("2026-09-20T12:42:13+08:00", ""),
+    ("", ""),
+    ("not-a-timestamp", "also-bad"),
+])
+def test_duration_ms_from_timestamps_zero_when_underivable(created, finished):
+    from chaos_agent.agent.state import duration_ms_from_timestamps
+
+    assert duration_ms_from_timestamps(created, finished) == 0
+
+
+@pytest.mark.asyncio
+async def test_sync_to_store_derives_duration_ms(monkeypatch):
+    """写库 seam：merged 快照有 created_at + finished_at 时，upsert 收到真实 duration_ms。"""
+    from chaos_agent.agent.nodes.store import _store_sync
+
+    captured = {}
+
+    class _FakeStore:
+        async def upsert(self, task_id, **fields):
+            captured["task_id"] = task_id
+            captured["fields"] = fields
+
+    async def _fake_get_store():
+        return _FakeStore()
+
+    monkeypatch.setattr(
+        "chaos_agent.persistence.task_store.get_task_store", _fake_get_store,
+    )
+    monkeypatch.setattr(_store_sync, "is_real_task_id", lambda tid: True)
+
+    await _store_sync.sync_to_store(
+        {"task_id": "inject-abc", "created_at": "2026-09-20T12:42:13+08:00"},
+        {"finished_at": "2026-09-20T12:55:03+08:00"},
+    )
+
+    # 12'50" = 770000ms（秒级时间戳，无亚秒精度）
+    assert captured["fields"]["duration_ms"] == 770000
+
+
+@pytest.mark.asyncio
+async def test_sync_to_store_preserves_explicit_duration_ms(monkeypatch):
+    """已带真实 duration_ms（如 TUI turn 路径的 monotonic 测量）时不得被覆盖。"""
+    from chaos_agent.agent.nodes.store import _store_sync
+
+    captured = {}
+
+    class _FakeStore:
+        async def upsert(self, task_id, **fields):
+            captured["fields"] = fields
+
+    async def _fake_get_store():
+        return _FakeStore()
+
+    monkeypatch.setattr(
+        "chaos_agent.persistence.task_store.get_task_store", _fake_get_store,
+    )
+    monkeypatch.setattr(_store_sync, "is_real_task_id", lambda tid: True)
+
+    await _store_sync.sync_to_store(
+        {"task_id": "inject-abc", "created_at": "2026-09-20T12:42:13+08:00",
+         "duration_ms": 12345},
+        {"finished_at": "2026-09-20T12:55:03+08:00"},
+    )
+
+    assert captured["fields"]["duration_ms"] == 12345
+
+
+def test_build_inject_data_derives_duration_when_elapsed_absent():
+    """结果卡片：非 TUI 调用方不传 elapsed_ms 时，从 state 时间戳兜底推导。"""
+    from chaos_agent.agent.result.operation_result import build_inject_data_from_state
+
+    data = build_inject_data_from_state({
+        "created_at": "2026-09-20T12:42:13+08:00",
+        "finished_at": "2026-09-20T12:55:03+08:00",
+    }, "inject-abc")
+
+    assert data["duration_ms"] == 770000
+
+
+def test_build_inject_data_prefers_explicit_elapsed():
+    """TUI turn 路径显式传 elapsed_ms 时优先采用（monotonic 测量更精确）。"""
+    from chaos_agent.agent.result.operation_result import build_inject_data_from_state
+
+    data = build_inject_data_from_state({
+        "created_at": "2026-09-20T12:42:13+08:00",
+        "finished_at": "2026-09-20T12:55:03+08:00",
+    }, "inject-abc", elapsed_ms=999)
+
+    assert data["duration_ms"] == 999

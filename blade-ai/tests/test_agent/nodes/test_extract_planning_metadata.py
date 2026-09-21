@@ -571,6 +571,13 @@ class TestCatalogueRejectionGuard:
         """LLM browsed catalogue then rejects → accepted as real rejection."""
         state = AgentState(
             task_id="test-task",
+            # A stale gate note from earlier in the attempt: the reject node
+            # renders ``safety_reason`` first, so this edge owes it a fresh
+            # value (W-56-6 in-edge matrix).
+            safety_reason=(
+                "Cluster-wide blast radius: execution will mutate resources "
+                "beyond the target scope."
+            ),
             messages=[
                 AIMessage(content="", tool_calls=[{
                     "name": "read_skill_resource", "id": "rs1", "type": "tool_call",
@@ -599,6 +606,9 @@ class TestCatalogueRejectionGuard:
         assert result.get("error") == "No matching use case"
         assert result.get("_planning_rejection_reason") == "No matching use case"
         assert result.get("_catalogue_rejection_nudged") is not True
+        # The stale blast-radius note above must be REPLACED, not left to be
+        # rendered as this termination's cause.
+        assert result.get("safety_reason") == "No matching use case"
 
     @pytest.mark.asyncio
     async def test_nudge_only_once(self):
@@ -606,6 +616,7 @@ class TestCatalogueRejectionGuard:
         state = AgentState(
             task_id="test-task",
             _catalogue_rejection_nudged=True,
+            safety_reason="No skill activated — returned to planner for activation",
             messages=[
                 AIMessage(content="", tool_calls=[{
                     "name": "finish_planning", "id": "fp2", "type": "tool_call",
@@ -624,6 +635,9 @@ class TestCatalogueRejectionGuard:
         assert result.get("planning_rejected") is True
         assert result.get("error") == "Really not supported"
         assert result.get("_planning_rejection_reason") == "Really not supported"
+        # Same freshness duty as above: the "No skill activated" note must be
+        # replaced by this edge's own reason.
+        assert result.get("safety_reason") == "Really not supported"
 
 
 class TestSavedPlanHydration:

@@ -16,6 +16,10 @@ Blood-tear anchors mirrored here (see ``src/chaos_agent/agent/graph.py``):
   (task-349ccf5d).
 """
 
+from unittest.mock import patch
+
+import pytest
+
 from chaos_agent.agent.graph import (
     build_intent_graph,
     build_pipeline_graph,
@@ -61,6 +65,18 @@ def _branches_of(graph) -> dict[str, tuple[str, list[str]]]:
             name = getattr(getattr(fn, "func", fn), "__name__", repr(fn))
             out[node] = (name, sorted(ends_map.keys()))
     return out
+
+
+def _ends_map_of(graph, node: str) -> dict[str, str]:
+    """The routed node's key -> TARGET map.
+
+    ``_branches_of`` pins key sets only; a funnel assertion needs to know
+    WHERE a key lands, and ``branches`` is the complete source for that
+    (``get_graph().edges`` collapses keys sharing a target).
+    """
+    for _key, spec in graph.branches[node].items():
+        return dict(spec[1])
+    raise AssertionError(f"{node} is not a routed node")
 
 
 # Two-form fixtures use a real @tool singleton (design D4): graph building
@@ -115,7 +131,13 @@ _PIPELINE_NODES = frozenset(
     }
 )
 
-_RECOVER_NODES_NO_TOOLS = frozenset({"finalize_recover_verification", "recover_verifier_loop"})
+_RECOVER_NODES_NO_TOOLS = frozenset(
+    {
+        "finalize_recover_verification",
+        "recover_verifier_loop",
+        "stamp_recover_terminal",
+    }
+)
 _RECOVER_NODES_WITH_TOOLS = _RECOVER_NODES_NO_TOOLS | {
     "recover_verifier_screener",
     "recover_verifier_tools",
@@ -216,6 +238,65 @@ class TestTerminalFunnelInvariants:
         graph = _pipeline_full()
         targets = {t for (s, t) in _direct_edges_of(graph) if s == "se_detect"}
         assert targets == {"terminal_reports"}
+
+    def test_recover_done_funnels_into_the_terminal_stamp(self):
+        # W-56-8 review round 3: a recover run cut by the wall clock or by the
+        # loop cap reached END from a round-trip delta no terminal node ever
+        # saw, so ``finished_at`` stayed empty and the derived ``duration_ms``
+        # was 0 (probe K1-K3). Both forms must route every "done" through the
+        # stamp funnel — which is also the graph's ONLY edge into END, so a
+        # future cut exit cannot reintroduce the hole by wiring itself to END.
+        for graph in (
+            build_recover_graph(),
+            build_recover_graph(verifier_tools=_TOOLS),
+        ):
+            assert (
+                _ends_map_of(graph, "recover_verifier_loop")["done"]
+                == "stamp_recover_terminal"
+            )
+            assert (
+                _ends_map_of(graph, "finalize_recover_verification")["done"]
+                == "stamp_recover_terminal"
+            )
+            edges = _direct_edges_of(graph)
+            assert {t for (s, t) in edges if s == "stamp_recover_terminal"} == {"__end__"}
+            assert {s for (s, t) in edges if t == "__end__"} == {"stamp_recover_terminal"}
+
+
+class TestRecoverTerminalStamp:
+    """Requirement: recover 终局戳行为 — the funnel stamps ``finished_at`` when
+    a run arrives without one (the cut exits), and defers when a terminal node
+    already dated the run (finalize's verdict time must not move later)."""
+
+    async def _run(self, state: dict) -> tuple[dict, list[dict]]:
+        from chaos_agent.agent.graph import stamp_recover_terminal
+        from chaos_agent.agent.nodes.store import _store_sync
+
+        synced: list[dict] = []
+
+        async def _fake_sync(_state, updated_fields):
+            synced.append(updated_fields)
+
+        # The node imports ``sync_to_store`` per call, so patching the module
+        # attribute is what the node actually resolves.
+        with patch.object(_store_sync, "sync_to_store", _fake_sync):
+            result = await stamp_recover_terminal(state)
+        return result, synced
+
+    @pytest.mark.asyncio
+    async def test_stamps_and_persists_when_absent(self):
+        result, synced = await self._run({"task_id": "task-w56-8-recover"})
+        assert result.get("finished_at")
+        # Persisted, not state-only: the DB row is written from this delta.
+        assert synced == [result]
+
+    @pytest.mark.asyncio
+    async def test_defers_to_an_existing_stamp(self):
+        result, synced = await self._run(
+            {"task_id": "task-w56-8-recover", "finished_at": "2026-01-01T00:00:00Z"}
+        )
+        assert result == {}
+        assert synced == []
 
 
 class TestConditionalRegistrationForms:

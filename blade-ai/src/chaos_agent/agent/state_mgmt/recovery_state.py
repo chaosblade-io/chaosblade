@@ -20,6 +20,7 @@ from chaos_agent.agent.state import materialize_fault_handle
 from chaos_agent.agent.state_mgmt.state_lifecycle import (
     ensure_recover_runtime_defaults,
     recover_reset_state,
+    stamp_pipeline_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,7 +111,10 @@ def build_recover_initial_from_checkpoint(
             _inject_mode, _conn_mode, inject_task_id,
         )
 
-    initial = recover_reset_state()
+    # Recover opens its own run, so it opens its own wall-clock origin
+    # (W-56-8 F1) — the reset table's recover=0.0 entry gives the field its
+    # per-recover lifetime, and the writer must move with that lifetime.
+    initial = stamp_pipeline_start(recover_reset_state())
     initial.update({
         "task_id": record_task_id,
         "tui_session_id": (

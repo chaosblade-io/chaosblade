@@ -539,6 +539,12 @@ def make_finalize_recover_verification(registry=None):
                     "inject task %s as recovered", inject_task_id,
                 )
 
+        # W-56-8 F2b: the recover domain's terminal exit, mirroring the inject
+        # side's ``finalize_verification``. Covers the run that ends here right
+        # after the budget expired (stamp is a no-op otherwise), so the result
+        # envelope names the termination instead of ending with no cause.
+        from chaos_agent.agent.router import mark_wall_clock_timeout
+        result_update = mark_wall_clock_timeout(state, result_update)
         return result_update
 
     return finalize_recover_verification

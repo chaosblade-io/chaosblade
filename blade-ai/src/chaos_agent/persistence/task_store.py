@@ -533,11 +533,36 @@ class TaskStore:
         # produced a NULL-task_id ghost row on SQLite and a NOT NULL
         # violation on PostgreSQL (empty SET clause on PG additionally
         # yields a syntax error for conflict-key-only upserts).
-        await self._backend.upsert_task(
-            task_id,
-            ["task_id", "task_state", "liability_live"],
-            [task_id, task_state, liability_live],
-        )
+        # Terminal words imply an END TIME (W-56-8 review round 4). The abort
+        # paths (three stream modules' cancel / disconnect / internal-error
+        # exits, the CLI's signal handler, and the intent phase's user
+        # cancellation) write their word through THIS method — which used to
+        # write exactly ["task_id", "task_state", "liability_live"], no
+        # timestamps — so a run interrupted mid-graph kept finished_at='' and
+        # the read-side derivation rendered duration_ms=0, while the SAME
+        # event's other user-visible surface stamped its own end time
+        # (session_store.finalize_session: session["finished_at"] =
+        # now_iso()) and the row's own word already said the run was over.
+        # Measured on a real row before this: word 'injecting' ->
+        # 'cancelled' with finished_at None -> None.
+        #
+        # The word and its timestamp are one fact, so they travel in ONE
+        # write: the stamp is appended to this call's column list rather than
+        # issued as a second statement, which also means no crash window can
+        # leave a dated row still saying the run was in flight.
+        #
+        # Only terminal words stamp: this method's mid-flight callers
+        # ("injecting" at a resume, "recovering" at recover start) describe a
+        # run still in motion. ``record`` is the merged tasks+details view,
+        # so a row that already carries a stamp keeps it — the run that
+        # finished keeps its own end time, the same way skip_if_terminal
+        # keeps its own word.
+        _columns = ["task_id", "task_state", "liability_live"]
+        _values = [task_id, task_state, liability_live]
+        if task_state in _TERMINAL_TASK_STATES and not record.get("finished_at"):
+            _columns.append("finished_at")
+            _values.append(now_iso())
+        await self._backend.upsert_task(task_id, _columns, _values)
         return True
 
     async def get(self, task_id: str) -> Optional[dict]:
@@ -943,8 +968,17 @@ class TaskStore:
             # confirmation card, and the TUI crash-recovery detector must
             # still be able to find it (a cancelled verdict from the
             # previous round must not blind it).
-            if task_state in ("injecting", "cancelled") and values.get("needs_confirmation") and not has_active_fault(values):
-                task_state = TaskStateOverlay.WAITING_INPUT.value
+            #
+            # Round-64 R4: the confirmation branch delegates to the shared
+            # ``paused_task_state`` so the row and the result/session
+            # surfaces derive the SAME word from the SAME predicate — the
+            # derivation used to live only here, which is why the row said
+            # ``waiting_input`` while every envelope said ``failed``.
+            from chaos_agent.agent.state import paused_task_state
+
+            _paused_word = paused_task_state(values)
+            if _paused_word:
+                task_state = _paused_word
             elif values.get("interaction_mode") == "tui" and not values.get("confirmed_intent") and not has_active_fault(values):
                 task_state = TaskStateOverlay.WAITING_INPUT.value
 

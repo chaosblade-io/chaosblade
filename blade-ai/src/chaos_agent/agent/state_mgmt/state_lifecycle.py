@@ -9,6 +9,7 @@ state, and which are per-attempt (replan) state.
 
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
@@ -107,6 +108,13 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     _p("plan_confirmed", "planning", batch=False),
 
     # ── Safety ─────────────────────────────────────────────────────
+    # "Last verdict", not "current state": a FINISHED run may legitimately
+    # carry a transient word ("pending" = the gate never ran, "retry" = the
+    # gate sent the plan back for skill activation). No router reads the field
+    # after the terminal node, and the terminal lifecycle word is derived
+    # separately (infer_task_state). The reject node therefore does NOT "close"
+    # it — stamping "rejected" there would flip task_state for every
+    # planning-timeout rejection (W-56-6 defect d).
     _p("safety_status", "safety", batch="pending", replan="pending"),
     # W-56-5 (defect b): attempt-scoped residue. A safety_reason written by
     # the PREVIOUS attempt's safety_check (e.g. its blast-radius warning)
@@ -158,14 +166,6 @@ _STATE_FIELD_POLICY_LIST: tuple[StateFieldPolicy, ...] = (
     # batch advance), inherited by recover (no ``recover=`` → the reset
     # whitelist keeps it).
     _p("fault_handle", "execution", durable=True, batch=None),
-    # Landing readback bookkeeping (faultdrill-cr-channel task 2.1): the
-    # handle value whose landing was integrity-verified. Same lifecycle as
-    # fault_handle — cleared with it at the replan seam and on batch
-    # advance, so a re-apply under the same name always re-verifies (a
-    # retry may carry a different recipe). Losing it to nothing is
-    # fail-safe anyway: the guard re-runs one extra readback, never skips
-    # one.
-    _p("fault_readback_verified", "execution", durable=True, batch=None),
     # Liability ledger's death wing (B76 review G/H): UIDs PROVEN destroyed
     # (framework-side destroys leave no ToolMessage, so this registry is their
     # only death proof). Durable AND never reset on batch advance or recover
@@ -365,6 +365,22 @@ _RECOVER_RESET_DEFAULTS: dict[str, Any] = _build_reset_defaults("recover")
 _REPLAN_RESET_DEFAULTS: dict[str, Any] = _build_reset_defaults("replan")
 
 
+def stamp_pipeline_start(delta: dict[str, Any]) -> dict[str, Any]:
+    """Stamp the wall-clock origin for the run ``delta`` opens (W-56-8 F1).
+
+    ``pipeline_started_at`` is read by ``router._wall_clock_exceeded`` and the
+    four loop publishers; its last writer was dropped in the 2026-06
+    agent_loop refactor, silently turning the whole wall-clock guard
+    (``max_inject_seconds``, ``WALL_CLOCK_TIMEOUT``) into dead code. The stamp
+    belongs beside this module's reset table, whose ``batch=0.0`` /
+    ``recover=0.0`` entries give the field its per-run lifetime, so the writer
+    and the reset semantics cannot drift apart again: every inject run
+    (single, each batch fault, L4) and every recover opens its own clock.
+    """
+    delta["pipeline_started_at"] = time.time()
+    return delta
+
+
 def per_fault_reset_state() -> dict[str, Any]:
     """Return a fresh reset delta for one batch fault iteration."""
     return deepcopy(_PER_FAULT_RESET_DEFAULTS)
@@ -408,7 +424,7 @@ def build_batch_iteration_state(
     messages: list,
 ) -> dict[str, Any]:
     """Build the full state delta for a new batch fault iteration."""
-    result = per_fault_reset_state()
+    result = stamp_pipeline_start(per_fault_reset_state())
     result.update({
         "task_id": task_id,
         "fault_spec": spec.to_dict(),
@@ -431,6 +447,7 @@ __all__ = [
     "per_fault_reset_state",
     "recover_reset_state",
     "replan_reset_state",
+    "stamp_pipeline_start",
     "state_field_policy",
     "state_field_group",
 ]
