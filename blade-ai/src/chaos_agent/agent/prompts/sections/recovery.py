@@ -11,8 +11,12 @@ Design rationale (from first-principles audit of task-d0f0f506 recovery):
   2) treating ls /tmp as primary evidence for pod-disk-burn (cyclic write-delete)
   3) skipping /proc/diskstats check entirely
 - This module restructures the prompt using the U-shaped pattern already proven
-  in the inject verifier: Core Principles at BEGINNING (primacy) + REMEMBER at END (recency),
-  with low-priority information in the middle.
+  in the inject verifier: Core Principles at BEGINNING (primacy), low-priority
+  information in the middle, and — since the 2026-09-20 pass-5 cleanup — the
+  machine-parsed Output contract at the END. (The REMEMBER recency mirror was
+  removed there: the ReAct loop's message tail owns recency, and its seven
+  bullets were restatements of named carriers. Same ruling as the pass-4
+  verifier cleanup.)
 """
 
 from chaos_agent.agent.prompts.reminder import (
@@ -216,18 +220,6 @@ hold 'partial' items (e.g. convergence still in progress) while Overall says
 RECOVERY_VERIFICATION_CHECKLIST is mandatory — parsed programmatically."""
 
 
-def get_recover_remember_section() -> str:
-    """REMEMBER segment — recency zone anchor for recover verifier."""
-    return f"""# REMEMBER
-- Evidence from CURRENT post-recovery state only — stale data is NOT evidence
-- Baseline comparison proves recovery — SAME metric on SAME resource; degrade to healthy-state confirmation, then cross-validation when baseline unavailable
-- When a tool returns error, the TOOL is right
-- Repeated failure → suspect your METHOD; switch approach, never silently omit
-- Primary evidence = fault effect ABSENT, not generic health (pod Running ≠ recovered)
-- Attribute residuals before judging: recovery propagation cost is NOT recovery failure — partial means fault-attributable residuals
-- {PARALLELIZE_PRINCIPLE}"""
-
-
 # ---------------------------------------------------------------------------
 # Builder: compose all sections into a complete system prompt
 # ---------------------------------------------------------------------------
@@ -239,8 +231,11 @@ def build_recover_verifier_system_prompt(
     """Build the recovery verifier system prompt using U-shaped composition.
 
     Follows the same architecture pattern as build_verifier_prompt():
-    Core Principles at BEGINNING (primacy) + REMEMBER at END (recency), with
-    low-priority information in the middle.
+    Core Principles at BEGINNING (primacy); the prompt CLOSES on the
+    machine-parsed Output contract (the REMEMBER recency mirror was
+    removed in the 2026-09-20 pass-5 cleanup — the ReAct loop's message
+    tail owns recency, and every bullet was a restatement of a named
+    carrier above).
 
     Args:
         layer1_label: Label for the Layer-1 line — "deterministic destroy"
@@ -283,8 +278,14 @@ def build_recover_verifier_system_prompt(
         # _recover_verifier_loop) so this [system] head stays byte-stable across
         # rounds. ``ledger_section`` is retained as an accepted-but-ignored kwarg
         # for in-flight callers.
-        # U-shaped attention: REMEMBER at END (recency)
-        get_recover_remember_section(),
+        # REMEMBER (recency zone) removed in the 2026-09-20 pass-5 cleanup:
+        # all seven bullets were compressed restatements of named carriers
+        # (Core Principles head, Output contract, Residual-Attribution
+        # judgement, PARALLELIZE second render). The recover verifier is a
+        # ReAct loop — recency rides the message tail (tool results +
+        # conditional reminders), so the prompt now closes on the
+        # machine-parsed Output contract, same shape as the pass-4
+        # verifier.
     ]
     prompt = "\n\n".join(p for p in parts if p)
     return prompt

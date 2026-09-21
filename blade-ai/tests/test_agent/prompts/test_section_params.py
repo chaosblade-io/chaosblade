@@ -53,9 +53,13 @@ class TestSafetySectionLevel:
 
 class TestWorkflowSectionTokens:
     def test_keeps_aav_verbs(self):
+        # The Analyze step was deleted in the 2026-09-20 skeleton/weight
+        # cleanup — its teaching (FAULT INTENT is UNVERIFIED) was a verbatim
+        # duplicate of Core Principles. The surviving step verbs:
         s = get_workflow_section()
-        for verb in ("Analyze", "Activate", "Verify"):
+        for verb in ("Activate", "Verify", "Read"):
             assert verb in s, f"{verb} verb missing from workflow section"
+        assert "**Analyze**" not in s
 
     def test_keeps_phase_headers(self):
         s = get_workflow_section()

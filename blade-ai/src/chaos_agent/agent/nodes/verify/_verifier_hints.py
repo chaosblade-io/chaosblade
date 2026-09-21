@@ -35,32 +35,36 @@ def _extract_baseline_key_metrics(
     return extract_baseline_metrics(baseline, fault_target, fault_action)
 
 
+# Baseline-comparison integrity rules, injected into the Layer 2 first
+# iteration context only when a successful baseline exists (see
+# _verifier_messages). Compressed in the 2026-09-20 verifier cleanup
+# (pass-4) by per-rule carrier analysis: rules that cross with the
+# system prompt's Core Principles / Output contract keep only the
+# context-side-unique teaching here. Rule numbering changed 7→6 (the
+# former no-baseline-say-so and corroborating-evidence rules merged).
 _BASELINE_INTEGRITY_PROMPT: str = (
     "**BASELINE INTEGRITY** (applies to ALL quantitative metric verification — "
     "disk %, CPU %, memory %, latency ms, etc. Does NOT apply to qualitative status "
     "checks like 'Pod is Running' or 'Service is reachable'):\n"
-    "1. IDENTIFY the exact resource you are measuring — be specific:\n"
-    '   "imagefs /dev/vdb", "node cn-hongkong.10.0.2.69 CPU", "pod accounting memory", '
-    '"endpoint /api/health latency"\n'
-    '   "disk" or "CPU" alone is ambiguous — always include the resource identity.\n'
+    "1. IDENTIFY the exact resource you are measuring — 'imagefs /dev/vdb', "
+    "'node cn-hongkong.10.0.2.69 CPU', 'pod accounting memory'; "
+    "'disk' or 'CPU' alone is ambiguous — always include the resource identity.\n"
     "2. When no pre-injection baseline exists for a resource, your FIRST measurement of it is "
     "your baseline for later re-checks — record the resource identity AND value together.\n"
     "3. ALL comparisons MUST be against the SAME resource. NEVER compare metrics from different resources:\n"
     '   ✅ "imagefs /dev/vdb: first-check 42% → re-check 84%" (same partition, valid delta)\n'
-    '   ✅ "node X CPU: 12% → 89%" (same node, valid delta)\n'
     '   ❌ "first-check 16% → re-check 84%" (different partitions: 16% was nodefs /dev/vda3, '
     "84% was imagefs /dev/vdb — INVALID comparison)\n"
-    "4. If you lack a pre-injection baseline for the target resource, say so explicitly:\n"
-    '   "No pre-injection baseline available for imagefs /dev/vdb. Current value: 84%."\n'
-    "5. HIGH post-injection values WITHOUT baseline context are ambiguous — the value may be "
-    "pre-existing, not fault-caused. Look for corroborating evidence (e.g., DiskPressure condition, "
-    "recent events, timestamp correlation with injection time).\n"
-    "6. If your first-check value already matches the expected injection parameter "
+    "4. No pre-injection baseline for the target resource → say so explicitly; a HIGH value "
+    "without baseline context is ambiguous (may be pre-existing) — look for corroborating "
+    "evidence (e.g., DiskPressure condition, recent events, timestamp correlation with "
+    "injection time).\n"
+    "5. If your first-check value already matches the expected injection parameter "
     "(e.g., --percent 85 → first-check shows 84%), this IS evidence the fault is in effect — "
     "do NOT conclude 'no change' just because re-check shows the same value; "
     "a drift toward the target that is not yet significant is a trend, not attainment "
     "(attainment is the significant change itself — see EVIDENCE SEMANTICS).\n"
-    "7. EXPECTED NEGATIVE RESULTS: If the PRIMARY metric confirms the fault is in effect "
+    "6. EXPECTED NEGATIVE RESULTS: If the PRIMARY metric confirms the fault is in effect "
     "(e.g., disk usage rose significantly from baseline), but a THRESHOLD-DEPENDENT condition is not met "
     "(e.g., DiskPressure=False because usage is 84% vs 85% threshold), mark that step as "
     "'expected' — the negative result is anticipated and does not indicate injection failure. "

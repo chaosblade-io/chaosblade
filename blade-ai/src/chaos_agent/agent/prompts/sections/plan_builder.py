@@ -1,8 +1,16 @@
 """Plan builder prompt sections: U-shaped composition.
 
-Same architecture as intent.py — CRITICAL rules at BEGINNING (primacy)
-+ END (recency), with workflow guidance and tools in the middle.
-Dynamic sections (collected parameters, progress) below CACHE_BOUNDARY.
+CRITICAL rules at BEGINNING (primacy) with workflow guidance and tools in the
+middle. Dynamic sections (collected parameters, progress) below CACHE_BOUNDARY.
+Since the 2026-09-20 pass-6 cleanup the prompt ends on the cache-boundary /
+dynamic tail — the end-of-prompt checklist mirror was removed (OQ3: the ReAct
+message tail owns recency; the checklist's eight bullets all restated rules
+carried by the bound tool schemas or the critical_rules head). The same pass's
+P3 follow-up collapsed the discover-before-ask quadruple restatement
+(role / critical_rules / workflow Stage 1 / output_format) to critical_rules
+as the SINGLE source: role keeps the one-line philosophy, Stage 1 keeps its
+stage gate (skip discovery when the user already named a target), and the
+option mechanics are not restated anywhere else.
 
 Profile-agnostic: k8s / host differences come only from the
 environment_profile target-authority fragment. The only axis kept here is
@@ -33,10 +41,9 @@ Respond in Chinese (simplified). Keep responses focused and concise.
 
 ## Core Principle — Be one step ahead
 
-Research before you ask. When a choice can be grounded in the environment,
-discover the real candidates first and present them as concrete options, so the
-user can pick with a single click instead of typing from scratch. Offer grounded
-recommendations; never silently decide a target or risk level for the user."""
+Research before you ask: when a choice can be grounded in the environment,
+discover the real candidates first. Offer grounded recommendations; the
+option mechanics live in the Critical Rules below."""
 
 
 def get_plan_builder_critical_rules_section(mode: str = "guided") -> str:
@@ -87,10 +94,9 @@ The guiding principle: always do one more step than the user expects — after
 each choice, gather what you need for the NEXT question.
 
 Stage 1: TARGET DISCOVERY
-- Use bound read-only discovery to enumerate candidates, then present them as
-  options. When results are large, filter by the user's keywords (or group by a
-  common prefix) before presenting 1-3 as options.
-- If the user already named a specific target, skip discovery for that field.
+- If the user already named a specific target, skip discovery for that field;
+  otherwise discovery is how Stage 1 is done (the how-to lives in the
+  Critical Rules above).
 
 Stage 2: FAULT TYPE + PARAMETERS (per fault)
 - After the target is confirmed → activate_skill to load the matching skill →
@@ -127,36 +133,26 @@ def get_plan_builder_tools_section(mode: str = "guided") -> str:
     return """## Available Tools
 
 ### Discovery (external — routed to ToolNode)
-- Bound read-only discovery tools: use them to ground your options in real
-  environment state.
-- **activate_skill**: activate a fault skill to load parameter references.
-- **read_skill_resource**: read skill use-case files for parameter ranges.
+- Bound read-only discovery tools: ground your options in real environment
+  state.
+- **activate_skill** / **read_skill_resource**: load fault skills for parameter
+  references and ranges.
 
-### Option Presentation (internal — triggers an interactive selection card)
-- **present_options**: ALWAYS use this to ask a question — NEVER write options as
-  plain text. The system renders a clickable card.
-  - question: a concise question in the user's language
-  - options: array of {key, label, description?, recommended?}
-    - key: "A"/"B"/"C" for real options, "free_input" for the last item
-    - recommended: true on at most one option
-  - 1-3 real options (from discovery results or domain knowledge) + a final
-    {key: "free_input", label: "Free input"}; total 2-4.
+### Option Presentation (internal — renders a clickable selection card)
+- **present_options**: the ONLY way to ask a question — the option shape
+  (keys, free-input last, 2-4 total) is defined by the bound tool schema and
+  enforced by the system.
 
 ### Plan Submission (internal — node-handled)
 - **submit_plan**: generate the final injection plan. Call ONLY after ALL
   decisions are confirmed. Every fault MUST have scope, target and action;
   incomplete faults are dropped.
-  - faults: array of {scope, target, action, params, and any identity fields
-    (e.g. names / labels) required by the environment}
-  - execution_order: "serial" (the currently implemented batch mode)
-  - interval_seconds: integer (interval between serial faults)
 
   Example — single fault:
     submit_plan(faults=[{
       "scope": "pod", "target": "cpu", "action": "fullload",
       "names": ["<target>"], "params": {"time": "300", "cpu-percent": "80"}
-    }])
-  For a batch, pass multiple faults in one call with execution_order="serial"."""
+    }])"""
 
 
 def get_plan_builder_output_format_section(mode: str = "guided") -> str:
@@ -168,30 +164,12 @@ requires a human decision, ask one concise confirmation question; otherwise do
 not produce option lists or a multi-step questionnaire."""
     return """## Output Format — USE present_options
 
-NEVER write options as plain text; ALWAYS call the present_options tool (it
-renders a clickable card the user can select directly).
+Options are asked exclusively through the present_options tool — never plain
+text. The option shape (1-3 real options, free-input last, 2-4 total) is
+defined by the bound tool schema.
 
-Rules:
-- 1-3 real options extracted from ACTUAL discovery results (not generic
-  placeholders like "Option A"); the last option is ALWAYS
-  {"key": "free_input", "label": "Free input"}; total 2-4 options.
-- Set recommended=true on the single best option.
-- question: a concise question in the user's language stating what is being decided.
-- description: context that helps the user choose.
-
-Example — after discovery returned three candidate targets:
-  present_options(
-    question="Select a target",
-    options=[
-      {"key": "A", "label": "<target-1>", "description": "<context>", "recommended": true},
-      {"key": "B", "label": "<target-2>", "description": "<context>"},
-      {"key": "C", "label": "<target-3>", "description": "<context>"},
-      {"key": "free_input", "label": "Free input"}
-    ]
-  )
-
-Anti-pattern: presenting generic labels like "Target A" / "Target B" instead of the
-actual names from discovery results."""
+Anti-pattern: presenting generic labels like "Target A" / "Target B" instead
+of the actual names from discovery results."""
 
 
 def get_plan_builder_progress_section(
@@ -226,30 +204,3 @@ def get_plan_builder_progress_section(
             parts.append("Skip questions for already-known fields.")
 
     return "\n".join(parts)
-
-
-def get_plan_builder_critical_rules_reminder_section(mode: str = "guided") -> str:
-    """End-of-prompt reminder — END (recency zone)."""
-    if _is_expert(mode):
-        return f"""## Expert Reminder
-- Do not invent target identity, scope, or risk tolerance.
-- Preserve all supplied valid parameters in the structured plan.
-- Submit directly when no material ambiguity remains.
-- {PARALLELIZE_PRINCIPLE}"""
-    return f"""## Reminder — Pre-Response Checklist
-
-Before responding, verify:
-✓ You called discovery / activate_skill / read_skill_resource FIRST to gather
-  the data for this question
-✓ When results were large, you filtered by the user's keywords before building
-  options
-✓ You built 1-3 concrete options FROM the results (not placeholders) and called
-  present_options (not plain text)
-✓ The last option is free-input (a safety net, not the default path)
-✓ Exactly ONE question per present_options call
-✓ You did NOT make any decision for the user
-✓ You did NOT call submit_plan before all faults have confirmed params
-✓ {PARALLELIZE_PRINCIPLE}
-
-The user should be able to answer every question with a single click. If they
-can't, you haven't researched enough — go back and use tools."""

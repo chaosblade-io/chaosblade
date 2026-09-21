@@ -22,11 +22,9 @@ from chaos_agent.agent.nodes.verify._verifier_messages import (
 from chaos_agent.agent.prompts.sections.recovery import (
     get_recover_delay_section,
     get_recover_output_format_section,
-    get_recover_remember_section,
 )
 from chaos_agent.agent.prompts.sections.verification import (
     get_verifier_core_principles_section,
-    get_verifier_remember_section,
 )
 from chaos_agent.agent.prompts.sections.workflow import (
     get_verification_heuristics_compact_section,
@@ -46,7 +44,6 @@ CONCRETE_TOOLS = (
 
 JUDGEMENT_SECTIONS = {
     "verifier_core_principles": get_verifier_core_principles_section,
-    "verifier_remember": get_verifier_remember_section,
     "recover_delay": get_recover_delay_section,
     "verification_heuristics": get_verification_heuristics_compact_section,
 }
@@ -95,11 +92,13 @@ class TestVerifierConvergencePrinciple:
         text = get_verifier_core_principles_section()
         assert "unable to observe is itself a conclusion" in text
 
-    def test_remember_restates_convergence_in_the_recency_zone(self):
-        """The failure it prevents happens late, far from the primacy copy."""
-        text = get_verifier_remember_section()
-        assert "adds no proof" in text
-        assert "completeness of observation is not the goal" in text
+    # test_remember_restates_convergence_in_the_recency_zone removed in
+    # the 2026-09-20 verifier cleanup (pass-4): the REMEMBER mirror it
+    # pinned is gone (OQ3 — recency rides the message tail; a
+    # prompt-end mirror never held the position). The convergence
+    # wording it pinned stays guarded on its real carrier by
+    # ``test_convergence_is_a_core_principle_not_a_heuristic`` above
+    # ("adds no proof" in Core Principles).
 
     def test_convergence_is_a_core_principle_not_a_heuristic(self):
         """Placement matters: the existing heuristics all push to keep observing.
@@ -176,10 +175,11 @@ class TestVerifierEffectDecides:
         # fixed retry count.
         assert "predates propagation says nothing yet" in _EVIDENCE_SEMANTICS_PROMPT
 
-    def test_remember_mirrors_effect_decides(self):
-        text = get_verifier_remember_section()
-        assert "is the effect evidence" in text
-        assert "speak for the mechanism, not the outcome" in text
+    # test_remember_mirrors_effect_decides removed in the 2026-09-20
+    # verifier cleanup (pass-4): the REMEMBER mirror it pinned is gone.
+    # The mechanism-vs-outcome wording it guarded stays pinned on its
+    # real carrier by the assertion above (L166-family: "speaks for the
+    # mechanism, not the outcome" in _EVIDENCE_SEMANTICS_PROMPT).
 
     def test_effect_decides_prompt_stays_tool_agnostic(self):
         # The CONCRETE_TOOLS guard extended to the new prompt: it conveys
@@ -237,6 +237,22 @@ class TestRecoverAttributionContract:
         assert "Overall = HOLISTIC JUDGMENT" in text
         assert "converging recovery tail is NOT partial" in text
 
-    def test_remember_restates_attribution_in_the_recency_zone(self):
-        text = get_recover_remember_section()
-        assert "recovery propagation cost is NOT recovery failure" in text
+    def test_recover_prompt_closes_on_the_output_contract(self):
+        """pass-5 (2026-09-20): the recover REMEMBER recency mirror was
+        deleted — every bullet restated a named carrier, and the ReAct
+        loop's message tail owns recency. What the deletion must NOT do is
+        silently change where the prompt ends: the machine-parsed Output
+        contract is now the closing block, the shape the parser and the
+        submit tool actually consume."""
+        from chaos_agent.agent.prompts.sections.recovery import (
+            build_recover_verifier_system_prompt,
+        )
+
+        prompt = build_recover_verifier_system_prompt()
+        assert "# REMEMBER" not in prompt
+        assert prompt.rstrip().endswith("parsed programmatically.")
+        # Carrier spot-check for the two bullets whose carriers sat farthest
+        # from the head: primary evidence and attribution both remain
+        # stated in their functional sections.
+        assert "NOT generic health" in prompt
+        assert "attributed to recovery propagation" in prompt

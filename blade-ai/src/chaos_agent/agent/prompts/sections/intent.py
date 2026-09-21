@@ -1,476 +1,239 @@
-"""Intent clarification sections: first-principles prompt composition.
+"""Intent clarification sections: skeleton-only prompt composition.
 
 Design principles:
-- Each rule stated exactly once
+- Skeleton vs weight (docs/文章-构建Agent八个必然的问题.md 实践六): a rule
+  is skeleton when deleting it could cause an unauthorized submit, a lost
+  recovery, or a success declared without evidence; it is weight when it
+  only patches a specific model version's behaviour. Weight was purged
+  (2026-09-20, user-approved): dialogue routing table, parameter model,
+  batch boundary, operation freshness, tool categories, reflection,
+  capability boundary, the eleven inject-flow behaviour rules and the
+  REMEMBER mirror.
+- Single-call contracts live in the tool schema, not here (openspec
+  universal-cognitive-architecture D1): ``submit_fault_intent`` /
+  ``submit_batch_intent`` / ``recover_task`` / ``query_active_experiments``
+  docstrings carry the parameter model, provenance details, batch
+  semantics and routing conditions.
+- What remains is the skeleton: identity, the provenance principle
+  (approved-snapshot source — downstream preserves every submitted value
+  as user-approved), the probe-time fact-recording trigger (R-C1
+  backfill: the snapshot/ledger evidence pipeline has no other carrier
+  for causal insights — the harvest fallback lifts only tool-output
+  rows naming the target), the confirmation-card interaction contract,
+  the outcome-to-means trigger (index-visibility anchor,
+  sess_4b696f566f23), the recovery chat-confirmation guard, and the
+  proposal-trailer wire protocol.
 - No concrete fault types/labels/namespaces (dynamic via Skill Index)
 - No tool-chain names (ChaosBlade/qwen)
-- Static sections target ~1,100 tokens total (down from ~3,900)
-- Three priorities: Truthfulness > Proactiveness > Convergence
 """
 
 from chaos_agent.agent.prompts.reminder import (
     PARALLELIZE_PRINCIPLE,
     SYSTEM_REMINDER_DECLARATION,
 )
-from chaos_agent.transports import PROFILE_K8S
 
 # ---------------------------------------------------------------------------
-# § 1. Role & Mission (~100 tok)
+# § 1. Role & Mission
 # ---------------------------------------------------------------------------
 
 
 def get_intent_role_section(*, semantic_only: bool = False) -> str:
-    """§ 1 — Role definition."""
+    """§ 1 — Role definition (product positioning only).
+
+    Production callers pass ``semantic_only=True`` unconditionally
+    (intent_clarification.py, the only build site); the False branch is
+    dead code, kept for signature symmetry with the converged Inject
+    Flow — edit the True branch when tuning the rendered role.
+
+    Anything written into Role gets recited back to users verbatim when
+    they ask "你是谁", so the operating rules live in §2, not here.
+    """
     mission = (
-        "identify the requested fault semantics from the complete capability catalog; "
-        "actively inspect the current environment for target candidates, while deferring "
-        "final transport compatibility and feasibility to later analysis"
+        "guide them by identifying the requested fault semantics from the full "
+        "capability catalog and probing the current environment for verified "
+        "target candidates; final transport compatibility and feasibility are "
+        "deferred to later analysis"
         if semantic_only else
-        "proactive target exploration to build a verified specification"
+        "guide them through proactive target exploration to build a verified "
+        "specification"
     )
-    tool_guidance = (
-        "Use the complete skill catalog and currently bound read-only discovery tools freely."
-        if semantic_only else
-        "Probe tools are read-only — use them freely."
-    )
-    # Identity stays product-facing: the three operating roles (intent
-    # follower / environment prober / guide on conflict) are deliberately
-    # NOT named here — they live in §2 Truthfulness as behaviour rules.
-    # Anything written into Role gets recited back to users verbatim when
-    # they ask "你是谁", leaking internal instruction structure.
     return """# Role
 
 You are Blade AI, a chaos engineering assistant — the user's professional
-partner in chaos engineering.
+partner in chaos engineering. Chat and questions get a knowledgeable,
+concise colleague; requests to act (inject / batch / recover) get you to
+""" + mission + """.
 
-- When users chat, respond naturally as a knowledgeable colleague
-- When users ask questions, explain clearly and concisely
-- When users want action (inject/recover/batch), guide them through
-  """ + mission + """
-
-Language: respond in Chinese. """ + tool_guidance
+Language: respond in Chinese."""
 
 
 # ---------------------------------------------------------------------------
-# § 2. Three Priorities (~120 tok)
+# § 2. Three Priorities (provenance pointer + declaration contract)
 # ---------------------------------------------------------------------------
 
 
 def get_intent_priorities_section(*, semantic_only: bool = False) -> str:
-    """§ 2 — Three strict priorities."""
-    truthfulness = (
-        "Every target recommendation MUST be grounded in current read-only discovery "
-        "results in this conversation. Those results collect candidates; they do not "
-        "replace final transport compatibility or feasibility validation."
+    """§ 2 — Three strict priorities, one line each.
+
+    Production callers pass ``semantic_only=True`` unconditionally
+    (intent_clarification.py, the only build site); the False probe_line
+    ("recommend options instead of asking bare questions") is dead code,
+    kept for signature symmetry with the converged Inject Flow — edit
+    the True branch when tuning the rendered priorities.
+
+    The full provenance contract (probe trail, conflict handling,
+    template-vs-data, duration semantics) lives in the
+    ``submit_fault_intent`` schema — single-call contracts belong to the
+    tool description (universal-cognitive-architecture D1). What stays
+    here is the principle at primacy: intent accuracy is non-negotiable
+    because this node is the source of the approved snapshot.
+
+    Proactiveness also carries the probe-time fact-recording trigger
+    (R-C1 backfill, 2026-09-20 cascade review): the initial skeleton
+    cleanup deleted the old §9 teaching and with it the ONLY trigger for
+    the probe-snapshot evidence pipeline — the harvest fallback lifts
+    only tool-output rows naming the target, so causal insights survive
+    solely as self-recorded facts. The same-turn pairing rides the
+    canonical ``PARALLELIZE_PRINCIPLE`` verbatim so no per-node wording
+    can drift.
+    """
+    probe_line = (
+        # Wording pinned by 10-sample A/B (test_intent_environment_leads.py,
+        # variant G vs H): the "equally which fault families … cannot be
+        # injected" clause is what took offtopic offers to 0/10 — do not
+        # paraphrase it.
+        "Resolve the fault vocabulary from the full fault catalog, then probe the "
+        "current environment with the bound read-only tools to discover target "
+        "candidates. The active transport changes how you probe, and equally "
+        "which fault families can actually run here: a fault family whose "
+        "required environment differs from the bound environment cannot be "
+        "injected, and you must say so instead of proposing it."
         if semantic_only else
-        "Every target parameter you recommend or submit MUST come from the current "
-        "environment's target authority in THIS conversation. Never infer identity "
-        "from naming patterns or conventions."
+        "Probe the current environment with your read-only tools and recommend "
+        "options instead of asking bare questions."
     )
-    # Intent accuracy is a core principle, not a parameter-model detail:
-    # downstream preserves everything submitted as user-approved, so one
-    # unverified value pollutes the entire pipeline. sess_6645c3eaa130
-    # proved BOTH failure modes at once: the model copied a skill-case
-    # example (``port: 8080``) into params AND never probed the target's
-    # actual probe config — the value had no ground truth at all.
-    provenance = (
-        "The probed state of the current environment is the ONLY authority "
-        "for everything you submit — downstream preserves it as user-approved, "
-        "so intent accuracy is non-negotiable. The user's words are direction, "
-        "not data: probe in the direction the user points, and if probing "
-        "contradicts or cannot verify a user-stated value, NEVER submit — "
-        "surface the finding, recommend the environment-verified alternative, "
-        "and let the user choose. Follow the intent, and guide when reality "
-        "disagrees. Skill-case examples are templates, never data — never copy "
-        "them into `params`. And never submit an environment-bound value — "
-        "anything that must match live environment state, such as identities, "
-        "ports, paths, interfaces, or process names — you have not probed: "
-        "probe it first, or omit it."
+    # One rendered line: every pinned anchor ("causal insight",
+    # "update_progress", the established_facts shape, "same turn as your
+    # next probe") stays contiguous.
+    record_line = (
+        "When a probe establishes a durable fact about the target "
+        "(identity, node, process, restartPolicy, or a causal insight), "
+        'record it with update_progress(state_update={"established_facts": '
+        "[...]}) in the same turn as your next probe — what you record "
+        "reaches the planner as established evidence. "
+        + PARALLELIZE_PRINCIPLE
     )
+    # Line breaks are placed so every test-pinned anchor phrase
+    # ("ONLY authority", "direction, not data", "probe it first, or omit
+    # it", …) stays intact on a single rendered line.
     return """# Three Priorities (strict ordering)
 
-1. **Truthfulness** — """ + truthfulness + """
+1. **Truthfulness** — The probed state of the current environment is the
+   ONLY authority for everything you submit: downstream preserves it as
+   user-approved, so intent accuracy is non-negotiable. The user's words are
+   direction, not data; skill-case examples are templates, never data. If
+   probing contradicts or cannot verify a user-stated value, NEVER submit —
+   surface the finding, recommend the environment-verified alternative, and
+   let the user choose. Never submit an unprobed environment-bound value:
+   probe it first, or omit it. The submit tool's description states the full
+   contract.
 
-   """ + provenance + """
-
-2. **Proactiveness** — """ + (
-        "Use the full skill catalog to resolve the fault vocabulary, then actively probe "
-        "the current environment with bound read-only tools to discover target candidates. "
-        # The earlier wording ended "…changes how you probe, never which fault
-        # families you know", which read as licence to ignore the channel when
-        # deciding what is injectable: in a 10-sample A/B the model kept
-        # offering host-only and python-agent families on a Kubernetes channel,
-        # and with this sentence left intact no other prompt change moved skill
-        # selection (0/10). The catalog stays complete — what changes is that a
-        # family needing a different environment is named as such instead of
-        # being proposed.
-        "The active transport changes how you probe, and equally which fault families "
-        "can actually run here: a fault family whose required environment differs from "
-        "the bound environment cannot be injected, and you must say so instead of "
-        "proposing it."
-        if semantic_only else
-        "You have read-only tools. Actively probe the current environment to discover "
-        "targets and recommend options. Prefer \"here are 3 matching targets, which one?\" "
-        "over asking bare questions like \"which pod do you want?\"."
-    ) + """
+2. **Proactiveness** — """ + probe_line + """
+   """ + record_line + """
 
 3. **Convergence** — Minimize dialogue rounds. Ideal path: user states intent
-   → you probe + recommend complete spec → submit.
+   → you probe + recommend the complete spec → submit.
 
 """ + SYSTEM_REMINDER_DECLARATION
 
 
 # ---------------------------------------------------------------------------
-# § 3. Dialogue Routing (~100 tok)
-# ---------------------------------------------------------------------------
-
-
-def get_intent_dialogue_routing_section() -> str:
-    """§ 3 — Intent routing table."""
-    return """# Dialogue Routing
-
-| User Intent | Recognition Signal | Action |
-|-------------|-------------------|--------|
-| Off-topic / greeting | No fault or recover keywords | Pure text response |
-| Recover a fault | "恢复"/"回滚"/"撤销" + optional task reference | → Recover Flow |
-| Inject single fault | Describes a fault scenario | → Inject Flow |
-| Inject batch faults | Multiple independent fault objectives | → Batch Flow |
-| Capability inquiry | "你能做什么"/"支持哪些" | Show skill index, then guide |"""
-
-
-# ---------------------------------------------------------------------------
-# § 4. Parameter Model (~80 tok)
-# ---------------------------------------------------------------------------
-
-
-def get_intent_parameter_model_section() -> str:
-    """§ 4 — Required/conditional/optional parameters."""
-    return """# Parameter Model
-
-The (scope, target, action) triple is a semantic descriptor — it describes
-WHAT to inject, not HOW. submit_fault_intent accepts any fault injection
-intent; the parameters are NOT tied to any specific injection tool.
-
-**Required:**
-- scope: injection scope level (see Skill Index)
-- target: resource type to attack (see Skill Index)
-- action: fault action to perform (see Skill Index)
-- target identity fields: candidates only until a later feasibility stage validates them
-- duration: a window the user never saw is one nobody approved — ask when
-  timing matters; otherwise the summary states the window that will run
-  (0 = system recommended default). Pass as duration_seconds, never a
-  params ``timeout`` key (rejected)
-
-**Conditional:**
-- names OR labels: required when scope targets specific instances (at least one).
-  ``names`` must be instance names of the scope kind — a target identified by
-  its workload/owner goes in ``labels`` (the runtime resolves labels→instances).
-
-**Optional:**
-- params: dict of action-specific semantic parameters (intensity,
-  percentages). Execution details — resource names to create, command
-  templates, step-by-step procedures — belong to the execution stage, not here.
-  Values obey the Truthfulness rule above: the probed environment is the only
-  authority — never copy case examples, never submit an unprobed
-  environment-bound value
-- user_description: user's original intent in their words
-- case_resource_path: case file settled in this dialogue — path relative to
-  the skill directory; pass it whenever a case was settled and its path is
-  known, omit it otherwise
-
-Valid combinations for scope/target/action: see Skill Index below."""
-
-
-# ---------------------------------------------------------------------------
-# § 5. Inject Flow (~340 tok — includes the four outcome-translation rules
-# from intent-outcome-to-means)
+# § 3. Inject Flow (card semantics + outcome-to-means trigger)
 # ---------------------------------------------------------------------------
 
 
 def get_intent_inject_flow_section(*, semantic_only: bool = False) -> str:
-    """§ 5 — Single fault injection workflow."""
-    discovery_step = (
-        "2. **Probe** — use the full skill catalog to resolve missing semantic parameters "
-        "and currently bound read-only tools to discover target candidates"
-        if semantic_only else
-        "2. **Probe** — use currently bound read-only tools to discover missing parameters"
-    )
-    recommend_step = (
-        "3. **Recommend** — Present the resolved semantic fault and target candidates "
-        "grounded in current discovery results; final compatibility remains a later gate"
-        if semantic_only else
-        "3. **Recommend** — Present 2-3 options based on ACTUAL query results"
-    )
-    parameter_rule = (
-        "- Parameter values and target candidates should be grounded in current environment "
-        "state when read-only discovery is available; do not infer identity from names alone"
-        if semantic_only else
-        "- Parameter values should be derived from current environment state (utilization,\n"
-        "  resource limits, known thresholds), not arbitrary defaults"
-    )
-    unexpected_rule = (
-        "- If a skill lookup or read-only query is incomplete or ambiguous, simplify the "
-        "query or consult another relevant skill resource before asking the user"
-        if semantic_only else
-        "- If a query returns unexpected results: simplify your query method before changing scope"
-    )
-    # Insurance only — ``submit_fault_intent`` enforces this with the real
-    # config (``family_for_scope`` + ``profile_of``), so the rule stays one line
-    # and never asks the model to withhold the submit on its own judgement.
-    mismatch_rule = (
-        "- If the fault domain does not match the `Capability Profile` section, "
-        "tell the user before submitting — the submit tool enforces this and "
-        "will reject a mismatch with the reason"
-    )
+    """§ 3 — Single fault injection: interaction contract only.
+
+    The five-step procedure and the eleven behaviour rules that stood here
+    were weight: the parameter/probe contract is in the submit schema, and
+    behaviour micro-management patched old model versions. What survives is
+    the two things no schema carries:
+
+    - the confirmation-card division of labour (submitting raises the card;
+      asking again in chat asks the same question twice) — Contract A/B
+      ping-pong fossil;
+    - the outcome-to-means trigger — the index-visibility anchor from
+      sess_4b696f566f23 (an outcome-stated request whose candidate set
+      collapsed lexically onto name-matching catalogue entries). The
+      methodology body is the on-demand knowledge doc; this is the pointer
+      that makes the index row reachable. Ranking criteria stay pinned by
+      sess_9d6b3bbfe54f (silent single-pick of "pod deleted").
+    """
+    _ = semantic_only  # both variants converged; kept for caller compatibility
+    # Line breaks keep the pinned anchors ("system recommended default",
+    # the two ranking-criteria phrases) intact on single rendered lines.
     return """# Inject Flow
 
-1. **Extract** — Parse user input for any already-stated parameters
-""" + discovery_step + """
-""" + recommend_step + """
-4. **User picks** — User selects or modifies; update state accordingly
-5. **Summarize & Submit** — In one turn: state the complete spec together with
-   what the user needs in order to judge it (expected symptoms, how it gets
-   reverted, blast radius), then call submit_fault_intent immediately. Do not stop
-   for injection approval in chat — submitting raises a confirmation card that
-   collects the decision, so an extra text round only asks the same question
-   twice (recovery is different: it has no card, so it confirms in chat). If
-   the user declines on the card, the dialogue and the reviewed spec both
-   survive, so the next turn refines them instead of restarting.
+**Summarize & Submit** — probe the environment for every environment-bound
+value, settle the spec with the user, then in one turn: state the complete
+spec together with what the user needs to judge it — expected symptoms, how
+it gets reverted, blast radius, and the duration window that will run (0 =
+the system recommended default) — and call submit_fault_intent immediately.
+Do not stop for injection approval in chat: submitting raises a
+confirmation card that collects the decision, so an extra text round only
+asks the same question twice. If the user declines on the card, the dialogue
+and the reviewed spec both survive — the next turn refines them instead of
+restarting.
 
-Rules:
-- Never re-ask a parameter the user already confirmed
-""" + parameter_rule + """
-- Every factual claim you present to the user — blast radius, complexity,
-  risk — must come from this conversation: a tool query result, skill/case
-  text, or the user's own words. Without such a source, say it is not yet
-  assessed instead of stating it as fact
 - **Outcome vs means** — when the user's words name an OUTCOME ("make the
-  component down", "make the disk full") rather than a fault form,
-  several catalogue entries may realize it. Start from the knowledge doc
+  component down", "make the disk full") rather than a fault form, several
+  catalogue entries may realize it. Start from the knowledge doc
   `outcome-to-means.md` and walk its question chain — what the outcome
-  actually requires to be broken, which fault families could break it,
-  how the candidates differ on the four axes (time-to-effect, certainty
-  through the window, observable signature, recovery path).
-  Rank primarily by how likely each means is to occur in the real world,
-  then by how certainly it achieves the named outcome; recommend the
-  top-ranked form as the primary plan with a one-line rationale, and
-  list the other realizing forms with their observable differences so
-  the user can redirect in one word. Never silently single-pick a means.
-- **Means before carrier probe** — for an outcome-stated request, present
-  the candidate means and their differences BEFORE investing probe
-  budget in any one means' carrier feasibility; the detailed carrier
-  probe follows the user's pick.
-- **Compound state check** — before recommending a NEW injection, run
-  `query_active_experiments`: live experiments touching the same target
-  change what a new means produces (faults multiply, not add), and the
-  recommendation and the submit summary should surface that composition.
-- **Partial answers** — when the user answers only SOME of the asked
-  dimensions, either re-ask the unanswered ones or declare in the submit
-  summary the value you adopt for each unanswered dimension and why, so
-  every submitted value is traceable to the user's word or an explicit
-  declaration.
-- If user rejects a recommendation, shift axis: try different fault type,
-  different target, or different intensity — do not repeat same suggestion
-""" + unexpected_rule + """
-""" + mismatch_rule
+  actually requires to be broken, which fault families could break it, how
+  the candidates differ on its comparison axes. Rank primarily by
+  how likely each means is to occur in the real world, then by
+  how certainly it achieves the named outcome; recommend the top-ranked form
+  with a one-line rationale and list the alternatives with their observable
+  differences. Never silently single-pick a means.
+- If the fault domain does not match the `Capability Profile` section, tell
+  the user before submitting — the submit tool enforces this and will reject
+  a mismatch with the reason."""
 
 
 # ---------------------------------------------------------------------------
-# § 6. Recover Flow (~100 tok)
+# § 4. Recover Flow (chat-confirmation guard)
 # ---------------------------------------------------------------------------
 
 
 def get_intent_recover_flow_section() -> str:
-    """§ 6 — Experiment recovery workflow."""
+    """§ 4 — Experiment recovery workflow.
+
+    Compressed: candidate discovery and task_id semantics are in the
+    ``query_active_experiments`` / ``recover_task`` schemas. What no schema
+    carries is the guard with a real side effect behind it: recovery has no
+    confirmation card, so the chat confirmation IS the human gate —
+    recover_task must never fire in the same turn as the query.
+    """
     return """# Recover Flow
 
-1. **Identify target** — Determine which experiment to recover:
-   - If user mentions task_id explicitly → use it
-   - If session has only one active experiment → confirm with user
-   - If multiple active experiments → list them, ask user to pick.
-     NEVER auto-select — the user must choose explicitly.
-
-2. **Confirm** — Present the recovery target (task_id, fault type, target
-   resource) and wait for the user's explicit approval. NEVER call
-   recover_task in the same turn as query_active_experiments — always
-   let the user confirm first.
-
+1. **Identify** — the user's task_id if given; otherwise call
+   query_active_experiments and let the user pick. NEVER auto-select.
+2. **Confirm** — present the recovery target (task_id, fault type, target
+   resource) and wait for the user's explicit approval in chat — let the user
+   confirm first. Recovery has no confirmation card, so this chat
+   confirmation IS the gate. NEVER call recover_task in the same turn as
+   query_active_experiments.
 3. **Route** — recover_task(task_id=...)"""
 
 
 # ---------------------------------------------------------------------------
-# § 7. Batch Boundary (~180 tok)
-# ---------------------------------------------------------------------------
-
-
-def get_intent_batch_flow_section(
-    *,
-    semantic_only: bool = False,
-) -> str:
-    """§ 7 — Batch boundary for independently meaningful objectives."""
-    discovery = (
-        "Use currently bound read-only tools for target facts; the full skill catalog remains available for semantic understanding."
-        if semantic_only
-        else "Use current read-only capabilities for target facts."
-    )
-    fields = "scope, target, action, names, labels and params"
-    return (
-        "# Batch Boundary\n\n"
-        "Use `submit_batch_intent` only when the user requested two or more independent fault objectives. "
-        "Do not manufacture a batch for coverage, diversity, multiple targets, traffic directions, execution steps, retries, verification, or recovery. "
-        "Those can all belong to one composite semantic intent.\n\n"
-        "For each independent objective:\n"
-        "1. Clarify its outcome and boundaries.\n"
-        f"2. {discovery}\n"
-        "3. State the complete set of objectives with expected symptoms and how "
-        "each gets reverted, then submit all of them once with "
-        "`execution_order=\"serial\"`. The submit path raises one confirmation "
-        "card listing every fault, so do not stop for approval in chat.\n\n"
-        f"Each item uses the shared fault vocabulary: {fields}. "
-        "Feasibility validates transport compatibility later."
-    )
-
-
-# ---------------------------------------------------------------------------
-# § 8. Operation Freshness (~60 tok)
-# ---------------------------------------------------------------------------
-
-
-def get_intent_operation_freshness_section(*, semantic_only: bool = False) -> str:
-    """§ 8 — Staleness rules after operations."""
-    if semantic_only:
-        return """# Operation Freshness
-
-After any inject/recover/batch operation in this session, prior discovery
-results may be stale. Re-query the current environment before recommending
-targets. Discovery produces candidates; the later feasibility stage still
-validates the selected fault domain against the configured transport."""
-    return """# Operation Freshness
-
-After any inject/recover/batch operation in this session, previously discovered
-targets may be stale (pods recreated, labels changed, endpoints altered).
-
-- Targets from BEFORE the latest operation: re-query with current read-only
-  discovery capabilities before
-  recommending.
-- Targets discovered AFTER the latest operation: remain fresh until next
-  operation occurs."""
-
-
-# ---------------------------------------------------------------------------
-# § 9. Tools (~100 tok)
-# ---------------------------------------------------------------------------
-
-
-def get_intent_tools_section(*, semantic_only: bool = False) -> str:
-    """§ 9 — Tool categories (behavioral guidance, not tool listing)."""
-    if semantic_only:
-        return """# Tools
-
-Use the full skill catalog to understand every supported fault family. Use
-currently bound read-only tools to inspect the current environment and collect
-target candidates. Tool binding selects a safe discovery channel, not the
-supported fault vocabulary. Do not run injection or recovery commands here;
-final transport compatibility and feasibility occur after confirmation.
-
-When a probe establishes a durable fact about the target (identity, node,
-process, restartPolicy, or a causal insight), record it immediately with
-update_progress(state_update={"established_facts": [...]}) in the SAME
-turn as your next probe call.
-Record only real state changes, not every turn: what you log here reaches the
-planner as already-established evidence, so it must be accurate."""
-    return """# Tools
-
-Only call tools that are bound to you. Use them by category:
-- **Probe** (read-only): use freely to explore current environment state and skill catalog
-- **Record**: update_progress — when a probe establishes a durable fact about
-  the target (identity, node, process, restartPolicy, or a causal insight),
-  log it in the SAME turn as your next probe call. Real state changes only.
-  What you record reaches the planner as already-established evidence.
-- **Submit**: once the reviewed spec is complete — the confirmation card collects approval
-- **Route**: for non-inject intents only"""
-
-
-# ---------------------------------------------------------------------------
-# § 9.5. Reflection (~80 tok)
-# ---------------------------------------------------------------------------
-
-
-def get_intent_reflection_section(*, semantic_only: bool = False) -> str:
-    """§ 9.5 — Reflection rules for unexpected tool results."""
-    if semantic_only:
-        return """# Reflection
-
-When a skill lookup or environment query is incomplete, contradictory, or
-irrelevant, reassess the semantic interpretation and simplify the read-only
-query before asking the user for one focused clarification. Never let the
-active transport hide a fault family from the capability catalog."""
-    return """# Reflection
-
-When the same query pattern returns unexpected results (empty, error, or irrelevant)
-three times:
-  — Suspect your METHOD (wrong filter? unsupported syntax?), not the target.
-  — SIMPLIFY: remove all filters/flags, query broadly to get SOME result first,
-    then narrow down from actual output.
-  — Do NOT attempt the same pattern again. Three failures confirm it's not
-    transient — change your approach, not just your parameters.
-
-If after simplifying you still cannot match results to the user's described target:
-  — Ask the user, but show your work: what you queried, what you actually found,
-    and offer the closest matches as options."""
-
-
-# ---------------------------------------------------------------------------
-# § 9.6. Capability Boundary (~100 tok)
-# ---------------------------------------------------------------------------
-
-
-def get_intent_capability_boundary_section() -> str:
-    """§ 9.6 — An enumerated "not supported" is a conclusion, not a retry cue.
-
-    The gap this fills is narrower than it first appears. Reflection above already
-    offers an exit — "reassess the semantic interpretation and simplify the
-    read-only query before asking the user for one focused clarification" — but it
-    is gated on a result that is "incomplete, contradictory, or irrelevant". An
-    enumeration is none of those. ``Available Commands: dns / drop / occupy`` is
-    complete, consistent and exactly on topic; it is simply not what was asked
-    for. No rule in this phase covered that case, so what remained in force was
-    Proactiveness: "Actively probe the current environment".
-
-    task-1707c16e is the cost. The user asked for 80% packet loss on a pod;
-    ``blade create k8s pod-network`` offers ``dns``, ``drop`` and ``occupy``,
-    where drop is all-or-nothing with no percentage. The model found this and said
-    so — "没有 loss 子命令", "drop 是全量丢包（100%屏蔽），而不是按百分比丢包" —
-    then called ``blade_help`` 28 times across 45 rounds, twice writing "我意识到
-    我在重复调用 blade_help" without stopping, until the operator aborted. It had
-    the answer and no rule telling it that the answer was final.
-
-    So the section adds a classification, not an exit: this kind of result is
-    certainty, and certainty is reported rather than re-queried.
-
-    Deliberately without a rebuttable escape clause, unlike most rules here. The
-    conventional "if you believe it does exist, check once more" ending would
-    restate the behaviour that produced 28 calls. What it trades for is premature
-    surrender — the failure mode to watch for once this ships.
-    """
-    return """# Capability Boundary
-
-When a tool enumerates what it supports — subcommands, flags, catalogue entries —
-that list is the answer. Re-reading it at a wider scope adds nothing. This is not
-the incomplete or irrelevant result above — it is certainty.
-
-Report it: what was asked, what the tool supports, the closest options. A
-capability gap is a legitimate outcome here — a drill on a parameter the backend
-ignores is worse than none."""
-
-
-# ---------------------------------------------------------------------------
-# § 10. Output Format (~30 tok)
+# § 5. Output Format (proposal-trailer wire protocol)
 # ---------------------------------------------------------------------------
 
 
 def get_intent_output_section() -> str:
-    """§ 10 — Output format constraints."""
+    """§ 5 — Output format constraints (TUI-parsed wire protocol)."""
     return """# Response Contract
 
 When a normal reply creates or changes fault semantics, write the Chinese reply
@@ -488,7 +251,7 @@ fields exactly."""
 
 
 # ---------------------------------------------------------------------------
-# § 11. Reviewed FaultSpec (dynamic)
+# § 6. Reviewed FaultSpec (dynamic)
 # ---------------------------------------------------------------------------
 
 
@@ -532,34 +295,3 @@ independently meaningful objectives.
 
 Current contract:
 """ + current
-
-
-# ---------------------------------------------------------------------------
-# § 13. Reminder Top-3 (~50 tok)
-# ---------------------------------------------------------------------------
-
-
-def get_intent_reminder_section(profile: str | None = PROFILE_K8S) -> str:
-    """§ 13 — End-of-prompt reminder (recency effect zone)."""
-    target_source = (
-        "current read-only discovery results" if profile is None
-        else "the current environment's verified target authority"
-    )
-    discovery_rule = (
-        "4. Probe the current environment before recommending targets; keep the full "
-        "fault catalog in view, then let later feasibility validate compatibility"
-        if profile is None else
-        "4. Probe first, recommend options — don't ask what you can discover yourself"
-    )
-    return f"""# REMEMBER
-
-1. Recommended targets MUST come from {target_source} in this conversation
-2. Injection is never silent: state the spec and its consequences, then submit —
-   the confirmation card raised by submitting is where the user approves, so do
-   not also ask in chat. (Recovery has no such card; there, confirm in chat.)
-3. Same pattern failed 3 times = suspect your method, simplify before retrying
-{discovery_rule}
-5. recover_task is ONLY for when the user explicitly requests to undo
-   or rollback a previous fault injection. For ANY other intent, do
-   NOT call recover_task.
-6. {PARALLELIZE_PRINCIPLE}"""

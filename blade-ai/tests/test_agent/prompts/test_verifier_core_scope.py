@@ -29,9 +29,13 @@ from chaos_agent.agent.result.verdict import ChecklistItem, Layer1Result
 
 def test_verifier_layer2_section_scope():
     text = get_verifier_layer2_section()
-    # Coverage (target-set completeness) belongs to "injection took effect".
-    assert "**Coverage**" in text
-    # Impact-side observations are out of verify's scope.
+    # Coverage Awareness sub-section removed in the 2026-09-20 verifier
+    # cleanup (pass-4): target-set completeness is carried by Core
+    # Principles #4 ("coverage of the target set") and the Output
+    # contract's Overall 'verified' definition. Impact-side observations
+    # stay out of verify's scope.
+    assert "Coverage Awareness" not in text
+    assert "Were ALL target resources" not in text
     assert "Anomalies" not in text
     assert "Application Impact" not in text
     assert "downstream impact" not in text

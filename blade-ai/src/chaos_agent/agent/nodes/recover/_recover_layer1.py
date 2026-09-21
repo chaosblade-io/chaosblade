@@ -167,6 +167,14 @@ def _build_layer1_recovery_prompt(
 ) -> str:
     """Build the Layer 1 recovery execution system prompt.
 
+    The REMEMBER blocks were compressed to a single bullet in the
+    2026-09-20 pass-5 cleanup: the dropped bullets (in-cluster channel,
+    tool-pod discovery, help/usage ground truth, bound tools, target
+    boundary) each restated a constraint verbatim from the body above —
+    the kept bullet is the B2-revised one-line completion reminder
+    ("confirmed landed at the API layer"), which has no carrier in the
+    body and is test-pinned (test_landed_reminder_kept_but_no_heuristic_gate).
+
     Args:
         is_kubectl_blade: If True, this is a ChaosBlade experiment created via
             kubectl exec into a cluster pod (e.g., otel-c-tool). The recovery
@@ -243,12 +251,6 @@ EVERY cluster tool call. The default kubeconfig cannot access the target
 cluster; omitting it connects tool calls to the WRONG cluster.
 
 # REMEMBER
-- Undo through the SAME in-cluster channel that performed the injection —
-  host-side tools cannot reach cluster-created experiments.
-- Discover the tool pod and its namespace with live cluster queries; NEVER
-  assume either.
-- A tool's own help/usage output and runtime behavior are the ground truth
-  over documentation and memory.
 - Your job ends when the undo action is confirmed landed at the API layer —
   Layer 2 verifies the recovery outcome.
 
@@ -294,10 +296,6 @@ success claim rests on direct evidence the fault cause is revoked or
 visibly being removed; immediate evidence, not a wait for recovery.
 
 # REMEMBER
-- Execute ONLY through currently bound tools; inspect their help/usage and
-  trust their runtime output over documentation or memory.
-- Preserve the target boundary — do not broaden scope to compensate for an
-  error.
 - Your job ends when the recovery actions are confirmed landed at the API
   layer — Layer 2 verifies the recovery outcome.
 

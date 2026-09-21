@@ -31,19 +31,15 @@ from chaos_agent.agent.prompts.assembly import PromptSegment, assemble_prompt
 # Section functions — intent clarification
 from chaos_agent.agent.prompts.sections import (
     get_intent_role_section, get_intent_priorities_section,
-    get_intent_dialogue_routing_section, get_intent_parameter_model_section,
     get_intent_inject_flow_section, get_intent_recover_flow_section,
-    get_intent_batch_flow_section, get_intent_operation_freshness_section,
-    get_intent_tools_section, get_intent_reflection_section,
-    get_intent_capability_boundary_section, get_intent_output_section,
-    get_intent_completeness_section, get_intent_reminder_section,
+    get_intent_output_section,
+    get_intent_completeness_section,
 )
 # Section functions — recovery verifier
 from chaos_agent.agent.prompts.sections import (
     get_recover_role_section, get_recover_core_principles_section,
     get_recover_skill_priority_section,
     get_recover_output_format_section,
-    get_recover_remember_section,
     build_recover_verifier_system_prompt,
 )
 # Section functions — replan
@@ -53,7 +49,7 @@ from chaos_agent.agent.prompts.sections import (
 # Section functions — core
 from chaos_agent.agent.prompts.sections import (
     get_role_section, get_env_section,
-    get_knowledge_summary_section, get_domain_knowledge_section, get_skill_index_section,
+    get_knowledge_summary_section, get_skill_index_section,
     get_experience_section,
 )
 # Section functions — safety
@@ -70,15 +66,13 @@ from chaos_agent.agent.prompts.sections import (
     get_verifier_role_section,
     get_verifier_layer2_section,
     get_verifier_output_format_section,
-    get_verifier_core_principles_section, get_verifier_remember_section,
+    get_verifier_core_principles_section,
 )
 # Section functions — workflow & verification strategy
 from chaos_agent.agent.prompts.sections import (
     get_workflow_section,
     get_core_principles_section,
-    get_remember_section,
     get_executor_core_principles_section,
-    get_executor_remember_section,
 )
 
 __all__ = [
@@ -89,11 +83,11 @@ __all__ = [
     "PromptMode", "PromptSegment", "assemble_prompt",
     # Section functions — core
     "get_role_section", "get_env_section",
-    "get_knowledge_summary_section", "get_domain_knowledge_section", "get_skill_index_section",
+    "get_knowledge_summary_section", "get_skill_index_section",
     "get_experience_section",
     "get_workflow_section",
-    "get_core_principles_section", "get_remember_section",
-    "get_executor_core_principles_section", "get_executor_remember_section",
+    "get_core_principles_section",
+    "get_executor_core_principles_section",
     # Section functions — safety
     "get_safety_section",
     # Section functions — execution
@@ -103,23 +97,19 @@ __all__ = [
     "get_verifier_role_section",
     "get_verifier_layer2_section",
     "get_verifier_output_format_section",
-    "get_verifier_core_principles_section", "get_verifier_remember_section",
+    "get_verifier_core_principles_section",
     # Section functions — recovery verifier
     "get_recover_role_section", "get_recover_core_principles_section",
     "get_recover_skill_priority_section",
     "get_recover_output_format_section",
-    "get_recover_remember_section",
     "build_recover_verifier_system_prompt",
     # Section functions — replan
     "get_replan_section", "get_replan_directive_for_execution",
     # Section functions — intent clarification
     "get_intent_role_section", "get_intent_priorities_section",
-    "get_intent_dialogue_routing_section", "get_intent_parameter_model_section",
     "get_intent_inject_flow_section", "get_intent_recover_flow_section",
-    "get_intent_batch_flow_section", "get_intent_operation_freshness_section",
-    "get_intent_tools_section", "get_intent_reflection_section",
-    "get_intent_capability_boundary_section", "get_intent_output_section",
-    "get_intent_completeness_section", "get_intent_reminder_section",
+    "get_intent_output_section",
+    "get_intent_completeness_section",
     # Builders
     "build_inject_system_prompt", "build_execute_system_prompt",
     "build_verifier_prompt", "build_intent_clarification_prompt",

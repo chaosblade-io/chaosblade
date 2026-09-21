@@ -55,15 +55,18 @@ def get_verifier_core_principles_section() -> str:
 def get_verifier_layer2_section() -> str:
     """Core Layer 2 verification instructions.
 
-    Covers: coverage awareness, mandatory skill step execution,
-    observe-fault-effect distinction, recovery awareness, supplementary
-    checks, and fallback when no skill verification instructions exist.
+    Covers: mandatory skill step execution, observe-fault-effect distinction,
+    recovery awareness, supplementary checks, and fallback when no skill
+    verification instructions exist.
+
+    Coverage Awareness sub-section removed in the 2026-09-20 verifier
+    cleanup (pass-4): its single rule ("Were ALL target resources
+    affected?") is carried by Core Principles #4 ("coverage of the target
+    set") and the Output contract's Overall 'verified' definition ("across
+    the ENTIRE approved target set") — two stronger named carriers made
+    this mirror weight without a carrier.
     """
     return """## Fault-Specific Verification
-
-### Coverage Awareness
-Before concluding verification 'passed', verify:
-1. **Coverage**: Were ALL target resources affected?
 
 ### If Injection Verification Instructions are provided
 
@@ -148,23 +151,3 @@ Primary evidence = **significant change from baseline OR significant deviation f
 Checklist = OBSERVED FACTS. Overall = HOLISTIC JUDGMENT. A checklist CAN have 'failed' items while Overall says 'verified' — explain in Warnings.
 
 The VERIFICATION_CHECKLIST is mandatory and parsed programmatically."""
-
-
-
-def get_verifier_remember_section() -> str:
-    """REMEMBER segment — recency zone anchor for U-shaped attention.
-
-    Mirrors the 4 Core Principles + 1 tactical reminder (baseline execution).
-    The convergence line is restated here deliberately: the failure it prevents
-    (sampling a proven element over and over) happens LATE in the phase, when
-    the primacy-zone copy is furthest away.
-    """
-    return f"""# REMEMBER
-- Evidence from THIS phase only — prior phase results are NOT evidence
-- Baseline comparison proves causation — SAME metric on SAME resource; degrade to healthy-state comparison, then cross-validation when baseline unavailable
-- When a tool returns error, the TOOL is right
-- Every step uses the strongest available reference: baseline > healthy state > cross-validation
-- Submit once effect, attribution and coverage each have evidence — repeating a proven element adds no proof, and completeness of observation is not the goal
-- {PARALLELIZE_PRINCIPLE}
-- A significant change (vs baseline, or vs the expected healthy state) is the effect evidence; receipts and snapshots speak for the mechanism, not the outcome
-- Text responses = brief progress updates; tables and structured comparison go ONLY into submit_verification"""

@@ -8,7 +8,7 @@ topics:
   - decision framework
 fault_types:
   - all
-summary: "Advisory good-practice rules, the Blast Radius Assessment Framework (scope / dependencies / cross-namespace / data risk), and the Abort / Continue / Escalate decision framework. Sourced on demand when the cache-tight inject prompt's hard-only safety section is insufficient."
+summary: "Advisory good-practice rules, the Blast Radius Assessment Framework (scope / dependencies / cross-namespace / data risk), and the Abort / Continue / Escalate decision framework. Read on demand when planning a multi-target or node-scope injection, when unsure whether to abort or continue after a failure, or when the user pushes for a larger blast radius than originally specified."
 phases:
   - plan
   - execute
@@ -16,10 +16,11 @@ phases:
 
 # Safety Extended: Advisory, Blast Radius, Decision Framework
 
-> **When to read this**: The cache-tight inject prompt only carries
-> Hard Rules + Caution Rule Compliance. Read this doc when planning a
-> multi-target or node-scope injection, when you are unsure whether to
-> abort or continue after a failure, or when the user pushes for a
+> **When to read this**: The system prompts carry no safety section — hard
+> rules ride the program guards (safety_check node, phase-1 tool binding,
+> target freeze, automatic timeout, conflict detection). Read this doc when
+> planning a multi-target or node-scope injection, when you are unsure
+> whether to abort or continue after a failure, or when the user pushes for a
 > larger blast radius than they originally specified.
 
 ## Advisory Rules (Good Practice)

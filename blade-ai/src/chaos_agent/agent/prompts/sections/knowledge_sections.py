@@ -1,8 +1,6 @@
-"""Knowledge sections: summary index and legacy full-text loading."""
+"""Knowledge sections: the on-demand summary index."""
 
 import re
-import warnings
-from pathlib import Path
 
 
 def get_skill_index_section(skill_catalog: str) -> str:
@@ -164,38 +162,3 @@ def get_knowledge_summary_section(phase: str | None = None) -> str:
         result = "\n".join(new_lines)
 
     return result
-
-
-def get_domain_knowledge_section() -> str:
-    """Shared domain knowledge section — full-text loading (legacy fallback).
-
-    Loads content from the ``knowledge/`` directory adjacent to the agent package.
-    Each .md file is read and concatenated, providing the LLM with prerequisite
-    K8s, kubectl, and ChaosBlade knowledge so it can reason effectively
-    without relying solely on tool docstrings.
-
-    NOTE: Prefer get_knowledge_summary_section() + read_knowledge_resource tool
-    for new code. This function loads all files (~133KB) and is kept for
-    backward compatibility only.
-    """
-    knowledge_dir = Path(__file__).resolve().parent.parent.parent.parent / "knowledge"
-    parts: list[str] = []
-    if knowledge_dir.is_dir():
-        for md_file in sorted(knowledge_dir.glob("*.md")):
-            try:
-                content = md_file.read_text(encoding="utf-8").strip()
-                if content:
-                    parts.append(content)
-            except Exception as exc:
-                warnings.warn(
-                    f"Failed to read knowledge file {md_file}: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-    if parts:
-        return "\n\n---\n\n".join(parts)
-    # Fallback: minimal inline knowledge if files are missing
-    return """## Domain Knowledge (fallback)
-- **K8s Resource Model**: Node > Pod > Container > Process
-- **kubectl**: use `get -o json` for structured data, `describe` for events, `top` for metrics, `exec` for container-level checks
-- **ChaosBlade**: `blade_status` = CLI-side status; `kubectl` = cluster-side reality"""

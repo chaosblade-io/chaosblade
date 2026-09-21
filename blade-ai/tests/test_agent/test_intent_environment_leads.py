@@ -66,7 +66,7 @@ def test_environment_section_leads_the_prompt(profile):
     prompt = _intent_prompt(profile)
     env = prompt.index("# Bound Environment")
 
-    for later in ("# Three Priorities", "# Dialogue Routing", "# Inject Flow",
+    for later in ("# Three Priorities", "# Inject Flow",
                   "# Response Contract", "## Skill Index"):
         assert later in prompt
         assert env < prompt.index(later), (

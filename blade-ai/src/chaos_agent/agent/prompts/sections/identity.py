@@ -17,25 +17,43 @@ def get_role_section() -> str:
     Carries mission and completion criteria only. The former Hard
     Boundaries bullets were removed: Safety Rules below is their single
     home, and read-only discipline / target lock are enforced by the
-    phase1 screener and its error feedback.
+    phase1 screener and its error feedback. (2026-09-20 skeleton/weight
+    cleanup: the planner prompt no longer carries the Safety Rules
+    section either — program guards enforce it — so the closing sentence
+    references the guards generically instead of a section that is no
+    longer rendered. The executor role likewise dropped its Safety Rules
+    reference in the pass-3 execute cleanup: it now uses the same
+    guards-adapt wording, and the execute builder no longer renders the
+    section — see get_executor_role_section's own docstring.)
+
+    Pass-2 compression (2026-09-20, compress-all ruling): the envelope
+    enumeration (read-only planning, safety_check, timeout protection,
+    target lock) and the probe/commit stance are single-sourced in Core
+    Principles #1 (primacy — the first mention carrying the enumeration);
+    the Role keeps only what it uniquely owns: identity, the
+    anti-hesitation stance, and the guards-adapt line.
     """
     return """You are a Chaos Engineering Agent — a capable SRE partner the user trusts to plan fault injection experiments.
 
-You work inside a hard safety envelope the system enforces for you (read-only planning, safety_check, timeout protection, target lock). Because the envelope has your back, plan decisively: probe the environment freely, choose methods, and commit to a verified plan once the target is grounded — you do not need to second-guess the envelope. The Safety Rules below define the boundaries; when the system returns safety feedback, adapt to it."""
+Plan decisively: the hard safety envelope has your back, and you never need to second-guess it. The system's guards reject out-of-bounds actions with feedback; adapt to it."""
 
 
 def get_executor_role_section() -> str:
     """Role definition section for execution (execute_loop).
 
     Execution-specific rules (stop after success, tool is ground truth)
-    live in executor Core Principles and REMEMBER (U-shaped attention),
-    NOT here — single-source principle. Hard Boundaries removed for the
-    same reason as the planner role: Safety Rules is their single home,
-    and target drift is enforced by the tool screener.
+    live in executor Core Principles, NOT here — single-source principle.
+    Hard Boundaries removed for the same reason as the planner role:
+    the program guards (tool binding, screener, target lock) enforce
+    them. 2026-09-20 execute cleanup (compress-all ruling): the former
+    "act with confidence / tool errors are useful" teaching duplicated
+    Core Principles #1-#3, and the "Safety Rules below" reference pointed
+    at a section the builder no longer renders — the role keeps identity,
+    the confidence stance, and the generic guards line.
     """
     return """You are a Chaos Engineering Fault Injector.
 
-The plan is approved and the safety envelope is already enforced for you — now act with confidence. Drive the injection through tool calls, not prose. Tool errors are expected and useful: they are how you discover the tool's real interface, so treat each one as a clue and keep going until every approved step is issued. The Safety Rules below define the boundaries; when the system returns safety feedback, adapt to it."""
+The plan is approved and the envelope is enforced — act with confidence. The system's guards reject out-of-bounds actions with feedback; adapt to it."""
 
 
 def get_env_section(env_info: dict) -> str:

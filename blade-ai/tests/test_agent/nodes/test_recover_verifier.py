@@ -1035,8 +1035,12 @@ class TestBuildLayer1RecoveryPrompt:
         assert "NEVER assume" in prompt
         assert "ACROSS ALL NAMESPACES" in prompt
         assert "deployment-specific" in prompt
-        # Recovery must mirror the in-cluster injection channel
-        assert "in-cluster channel" in prompt
+        # Recovery must mirror the in-cluster injection channel — pinned on
+        # the CRITICAL CONSTRAINTS wording (its body carrier since pass-5
+        # removed the REMEMBER bullet that carried the shorter phrase; the
+        # phrase spans a line break, so both halves are pinned).
+        assert "MUST go through the same in-cluster" in prompt
+        assert "channel that performed the injection" in prompt
         # The recovery context message carries no persisted injection-pod
         # field, so the template must not promise one unconditionally —
         # only a conditional "when it is named" reference is honest.
@@ -3371,17 +3375,23 @@ class TestBuildRecoverVerifierSystemPrompt:
         assert "Evidence MUST come from" in prompt[:600]
 
     def test_u_shape_recency_zone(self):
-        """REMEMBER section appears at the END of the prompt (recency effect)."""
+        """pass-5 (2026-09-20): the REMEMBER recency mirror was deleted —
+        all seven bullets restated named carriers, and the recover
+        verifier's ReAct loop owns recency at the message tail (tool
+        results + conditional reminders). The prompt now closes on the
+        machine-parsed Output contract, the same shape as the pass-4
+        verifier; what must NOT come back is a prompt-end REMEMBER recap
+        pretending to hold the recency position."""
         prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
-        # REMEMBER section must appear AFTER all middle-zone sections
-        remember_pos = prompt.index("REMEMBER")
+        assert "# REMEMBER" not in prompt
+        # Output contract IS the closing block now
         output_format_pos = prompt.index("RECOVERY_VERIFICATION_RESULT")
-        assert remember_pos > output_format_pos
-        # Tail of prompt must contain the REMEMBER recap (window sized for
-        # the full recap, including the attribution line and the
-        # PARALLELIZE_PRINCIPLE turn-economy line)
-        assert "REMEMBER" in prompt[-850:]
-        assert "stale data is NOT evidence" in prompt[-750:]
+        assert prompt.rstrip().endswith("parsed programmatically.")
+        assert output_format_pos > prompt.index("Core Principles")
+        # Carrier spot-checks: the two bullets whose carriers sat farthest
+        # from the head remain stated in their functional sections.
+        assert "stale" in prompt[: prompt.index("Converging State")]
+        assert "NOT generic health" in prompt
 
     def test_chaosblade_label(self):
         """is_chaosblade=True → Layer1 label is 'blade_destroy'."""
@@ -3394,7 +3404,8 @@ class TestBuildRecoverVerifierSystemPrompt:
         assert "recovery execution" in prompt
 
     def test_all_sections_present(self):
-        """All section functions are composed in the prompt."""
+        """All section functions are composed in the prompt (REMEMBER
+        removed in pass-5 — see test_u_shape_recency_zone)."""
         prompt = build_recover_verifier_system_prompt(layer1_label="blade_destroy")
         assert "successfully recovered" in prompt
         assert "Core Principles" in prompt
@@ -3402,7 +3413,6 @@ class TestBuildRecoverVerifierSystemPrompt:
         assert "kubectl" in prompt
         assert "Skill Use-Case Priority" in prompt
         assert "RECOVERY_VERIFICATION_RESULT" in prompt
-        assert "REMEMBER" in prompt
 
     def test_baseline_integrity_compact(self):
         """Compact baseline integrity rules (4 rules + 1 example) are present."""

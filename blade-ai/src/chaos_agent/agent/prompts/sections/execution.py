@@ -15,6 +15,25 @@ def get_tools_section(phase: int = 1) -> str:
             Phase 2 omits skill-resource-reading guidance because the
             skill case content is in the conversation history from Phase 1
             (read_skill_resource ToolMessages), not in the system prompt.
+            Phase 1 was compressed in the 2026-09-20 skeleton/weight
+            cleanup to two one-line priority pointers plus the incident-
+            forged parallel-dependency rule: the verbose per-tool guidance
+            duplicated the read_skill_resource / read_knowledge_resource
+            docstrings, and "plan, don't execute" duplicated the Workflow
+            phase framing. Phase 2 keeps its full text (different runtime
+            questions: partial-failure cleanup, records-as-state).
+            Pass-2 (same date, compress-all ruling) dropped phase 1's
+            Avoid Redundancy line — planner Core Principles' "do NOT
+            re-probe a question already answered" is the single source.
+            Parallel Calls keeps both sentences: the dependency definition
+            is what the canonical PARALLELIZE_PRINCIPLE does NOT say
+            (pinned by tests), and the not-found clause guards the B53
+            over-serialization failure mode — distinct from Core
+            Principles' empty-query resilience stance. Phase 2's own Avoid
+            Redundancy was later dropped too (pass-3, execute cleanup):
+            its carrier is the _EXECUTOR_PRINCIPLES anti-loop condition
+            ("no unchanged repetition without new evidence or
+            hypothesis") in workflow.py.
     """
     if phase == 2:
         return """## Tool Usage Guidelines
@@ -23,17 +42,14 @@ def get_tools_section(phase: int = 1) -> str:
 1. **Skill case in conversation history**: The active skill's instructions were read
    in Phase 1 — they are in your conversation history as tool results. Re-read them
    as the STARTING POINT for injection commands. Do NOT call skill-reading tools (not bound here).
-2. **Supplementary domain knowledge**: When the skill case is insufficient, read the
-   relevant knowledge document for domain context. While a documented path covers the need, do not fabricate commands — but when every documented path has empirically failed, an equivalent-effect method you devise (same target, same fault effect) is legitimate, not improvisation.
+2. **Supplementary domain knowledge**: When the skill case is insufficient, call
+   `read_knowledge_resource` for domain context.
 3. **Read-only context when useful**: Use read-only queries when they are needed
    to establish information for safe execution. The system owns the post-execution
    verification and recovery lifecycle.
 4. **Injection tools**: Use the injection tool specified by the skill case. Before invoking
    any tool, inspect its own help/usage output to confirm the flags and parameters it
-   actually supports (runtime interface wins — see Core Principles). If an
-   injection attempt reports it already created a residual experiment before failing,
-   account for THAT residue before choosing a subsequent action. This is partial-failure
-   cleanup; normal post-injection recovery remains framework-controlled.
+   actually supports (runtime interface wins — see Core Principles).
 5. **Injection records are framework state, not your artifacts**: NEVER destroy or clean
    up the record of a SUCCESSFUL injection — it is the recovery handle and evidence for
    the stages after you, and an irreversible fault effect is exactly why it must survive.
@@ -42,24 +58,16 @@ def get_tools_section(phase: int = 1) -> str:
 
 ### Parallel Calls
 - "Dependent" means one call's arguments require another call's result — not that the calls are about the same thing. A probe that comes back "not found" is itself a usable answer.
-- Mutation calls stay sequenced by their receipts
-
-### Avoid Redundancy
-- Do not repeat read-only queries that were just answered in a previous tool result"""
+- Mutation calls stay sequenced by their receipts"""
 
     return """## Tool Usage Guidelines
 
 ### Tool Selection Priority
-1. **Skill references first (after skill activation)**: Use `read_skill_resource` to read skill reference files for accurate, up-to-date injection command syntax and parameters
-2. **Knowledge docs for domain context**: Especially BEFORE skill activation or when no skill is active, use `read_knowledge_resource` to read knowledge documents — while a documented path covers the need, do not fabricate commands; an equivalent-effect path you devise after the documented ones are proven broken is legitimate
-3. **Plan, don't execute**: Your output is the input to `confirmation_gate`. Capture the intended injection parameters in your plan (via `save_fault_plan`); the executor (Phase 2) will issue the actual call
+1. **Skill references first (after skill activation)**: `read_skill_resource` for command syntax and parameters
+2. **Knowledge docs for domain context**: `read_knowledge_resource` before or without an active skill
 
 ### Parallel Calls
-- "Dependent" means one call's arguments require another call's result — not that the calls are about the same thing. A probe that comes back "not found" is itself a usable answer.
-
-### Avoid Redundancy
-- Do not call `activate_skill` more than once in the same Phase 1 session
-- Do not repeat read-only queries that were just answered in a previous tool result"""
+- "Dependent" means one call's arguments require another call's result — not that the calls are about the same thing. A probe that comes back "not found" is itself a usable answer."""
 
 
 def get_guidelines_section(
@@ -67,6 +75,15 @@ def get_guidelines_section(
     phase: int = 2,
 ) -> str:
     """Important guidelines section.
+
+    Consumerless since the 2026-09-20 execute cleanup: the planner
+    builder dropped it in pass 1 (its single bullet duplicated Core
+    Principles) and the execute builder dropped it in pass 3 (the same
+    duplication on the Phase 2 side, and the Conflict Check notice
+    folded into the Execution Directives' Orchestration paragraph). The
+    function and its parameterized tests remain, per the
+    get_safety_section(level="full") precedent: dead-but-exported beats
+    deletion churn while downstream consumers might still import it.
 
     Args:
         include_method_switching: When False, omit the Conflict Check
@@ -138,13 +155,10 @@ def get_execution_directives_section(
         "### Execution Orchestration",
         "The approved plan is a contract, not a hypothesis: its commands were",
         "constructed and validated during planning — execute them as written",
-        "(see Execution Discipline below). Use only capabilities within the",
-        "approved scope — do not fabricate tool interfaces or expand the approved",
-        "target or safety boundaries. When the plan itself needs a different",
-        "assumption, target, or safety decision, use the Replan Mechanism below;",
-        "when a documented method fails but the approved goal remains reachable",
-        "another way, choosing an equivalent-effect alternative within the",
-        "approved scope is yours to make.",
+        "(see Execution Discipline below). Conflict checks already ran before",
+        "you were invoked — focus on executing. When the plan itself needs a",
+        "different assumption, target, or safety decision, use the Replan",
+        "Mechanism below.",
         "",
         "### Execution Discipline",
         "A tool error corrected by the tool's own feedback is a legitimate path,",

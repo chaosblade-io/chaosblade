@@ -32,7 +32,9 @@ def _build_recover_verifier_prompt(
 
     Delegates to section functions in recovery.py, following the same
     architecture pattern as the inject verifier (verification.py).
-    Core Principles at BEGINNING (primacy) + REMEMBER at END (recency), with
+    Core Principles at BEGINNING (primacy); the prompt CLOSES on the
+    machine-parsed Output contract (REMEMBER recency mirror removed in
+    the 2026-09-20 pass-5 cleanup — message tail owns recency), with
     low-priority information in the middle.
 
     Args:

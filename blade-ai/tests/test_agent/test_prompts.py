@@ -1,13 +1,13 @@
 """Tests for system prompt templates."""
 
+import re
+
 from chaos_agent.agent.prompts import (
     build_inject_system_prompt,
     build_intent_clarification_prompt,
     get_role_section,
     get_core_principles_section,
-    get_remember_section,
     get_executor_core_principles_section,
-    get_executor_remember_section,
     get_workflow_section,
     get_safety_section,
     get_tools_section,
@@ -19,15 +19,12 @@ from chaos_agent.agent.prompts.sections.workflow import (
 )
 from chaos_agent.agent.prompts.sections.verification import (
     get_verifier_core_principles_section,
-    get_verifier_remember_section,
 )
 from chaos_agent.agent.prompts.sections.recovery import (
     get_recover_core_principles_section,
-    get_recover_remember_section,
 )
 from chaos_agent.agent.prompts.sections.plan_builder import (
     get_plan_builder_critical_rules_section,
-    get_plan_builder_critical_rules_reminder_section,
 )
 from chaos_agent.agent.prompts.reminder import PARALLELIZE_PRINCIPLE
 from chaos_agent.agent.prompts.sections.execution import (
@@ -38,16 +35,10 @@ from chaos_agent.agent.prompts.modes import PromptMode
 from chaos_agent.agent.prompts.sections.intent import (
     get_intent_role_section,
     get_intent_priorities_section,
-    get_intent_dialogue_routing_section,
-    get_intent_parameter_model_section,
     get_intent_inject_flow_section,
     get_intent_recover_flow_section,
-    get_intent_batch_flow_section,
-    get_intent_operation_freshness_section,
-    get_intent_tools_section,
     get_intent_output_section,
     get_intent_completeness_section,
-    get_intent_reminder_section,
 )
 
 
@@ -67,10 +58,25 @@ class TestSectionFunctions:
     def test_workflow_section_grounds_target_before_planning(self):
         # Single profile-agnostic text: target grounding is enforced for every
         # environment via bound read-only tools, not a per-profile branch.
+        # Pass-2 (2026-09-20): the Ground Truth subsection's "environment's
+        # target authority" clause is carried by the Capability Profile
+        # ("Treat Kubernetes API observations as the authority…"); the
+        # workflow keeps the grounding procedure in Step 2.
         section = get_workflow_section()
-        assert "target authority" in section
         assert "read-only tools" in section
         assert "finish_planning" in section
+        assert "ground it in runtime evidence" in section
+
+    def test_workflow_ground_truth_subsection_removed(self):
+        # Pass-2 (2026-09-20, compress-all ruling): every clause of the
+        # former Ground Truth subsection is carried elsewhere — fact
+        # priority in Core Principles #2/#3 (primacy), the environment's
+        # target authority in the Capability Profile, approved-target /
+        # safety-boundary intact in Preserve-FaultSpec + the guards line
+        # in the Role. A fourth restatement in the middle zone added
+        # nothing.
+        section = get_workflow_section()
+        assert "### Ground Truth" not in section
 
     def test_workflow_plan_contract_keeps_execution_steps_mutation_only(self):
         # Postmortem (inject-3a745506): the planner copied the case's
@@ -128,6 +134,46 @@ class TestSectionFunctions:
         assert "never from the skill-case document" in section
         assert "`finish_planning` tool schema" in section
 
+    def test_workflow_reject_clarifies_enumerated_capability_is_final(self):
+        # task-1707c16e (pass-1~4 cleanup review, 2026-09-20): the intent
+        # §9.6 "Capability Boundary" section and this clause's behavioral
+        # half were deleted in separate passes without either declaring
+        # the other a carrier — the rule vanished system-wide while the
+        # executor hints kept teaching the OPPOSITE direction ("Broaden —
+        # verify at a wider scope"). The failure mode: user asked for 80%
+        # packet loss; the model found "no loss subcommand, drop is
+        # all-or-nothing", then called blade_help 28 times over 45 rounds,
+        # twice writing down that it was repeating, until the operator
+        # aborted. Backfilled as an inline clause on the 4b enumeration
+        # criterion (the judge that fires when the list is in hand), with
+        # NO rebuttable escape clause — "if you're confident it exists,
+        # check once more" would reproduce the 28-call behavior.
+        section = get_workflow_section()
+        assert "complete answer" in section
+        assert "re-reading it, or" in section
+        assert "probing at a wider scope, adds nothing" in section
+        # Position: the clause lives on the 4b enumeration criterion, not
+        # as a standalone section — a standalone section is what died
+        # orphaned in §9.6; riding the criterion inherits its context.
+        assert "is not among them" in section
+        i_criterion = section.index("is not among them")
+        i_clause = section.index("complete answer")
+        assert 0 < i_clause - i_criterion < 80, (
+            "the enumeration-is-final clause must sit on the 4b criterion"
+        )
+
+    def test_workflow_step_numbering_is_continuous(self):
+        # Pass-2 fix (2026-09-20): the Analyze deletion left stale 5/5b/6
+        # numbers, so the main sequence skipped 4. The byte-identity pins
+        # could not catch it — they were self-updated by the same edit that
+        # broke the numbering. This test pins the PROPERTY, not the
+        # numbers: the main sequence is gapless 1..N (b-suffix insertions
+        # allowed). Single-path pin since M2 task 2.4 retired the CR
+        # routing-guide splice — the numbering is static again.
+        section = get_workflow_section()
+        nums = [int(n) for n in re.findall(r"^(\d+)\. \*\*", section, re.M)]
+        assert nums == list(range(1, len(nums) + 1)), nums
+
     def test_execution_directives_skip_planned_observation_steps(self):
         # Legacy or malformed plans may still carry observation steps; the
         # executor must treat them as verification work and skip them rather
@@ -148,10 +194,11 @@ class TestSectionFunctions:
         assert "partial N/total" in section
 
     def test_verification_heuristics_encodes_method_not_target(self):
-        # Aligns the verifier with intent's `# Reflection`: after repeated
-        # identical failures, suspect your own method (not the target) and
-        # broaden-then-narrow rather than re-running the same command. Lives as
-        # a GENERAL heuristic, not a per-fault branch.
+        # After repeated identical failures, suspect your own method (not the
+        # target) and broaden-then-narrow rather than re-running the same
+        # command. Lives as a GENERAL heuristic, not a per-fault branch.
+        # (The intent-side `# Reflection` twin was removed in the 2026-09-20
+        # skeleton/weight cleanup; the verifier keeps its own copy.)
         section = get_verification_heuristics_compact_section()
         assert "Method, not target" in section
         assert "broaden" in section
@@ -180,11 +227,15 @@ class TestSectionFunctions:
         section = get_tools_section(phase=1)
         assert "Tool Selection Priority" in section
         assert "Parallel Calls" in section
-        assert "Avoid Redundancy" in section
         assert "read_skill_resource" in section
         # Timeout Protection removed: default timeout is a program guarantee
         # visible in the injection tool's own schema/docstring.
         assert "Timeout Protection" not in section
+        # Avoid Redundancy removed (2026-09-20 pass-2, compress-all ruling):
+        # planner Core Principles' "do NOT re-probe a question already
+        # answered" is the single source. Phase 2 keeps its own copy
+        # (executor scope).
+        assert "Avoid Redundancy" not in section
 
     def test_phase1_parallel_authorization_covers_all_independent_calls(self):
         # inject-aac02265 (#35): planning spent 262s on three SERIAL
@@ -224,23 +275,54 @@ class TestSectionFunctions:
         # drift per node.
         zones = {
             "planner Core Principles": get_core_principles_section(),
-            "planner REMEMBER": get_remember_section(),
             "executor Core Principles": get_executor_core_principles_section(),
-            "executor REMEMBER": get_executor_remember_section(),
             "verifier Core Principles": get_verifier_core_principles_section(),
-            "verifier REMEMBER": get_verifier_remember_section(),
             "recover Core Principles": get_recover_core_principles_section(),
-            "recover REMEMBER": get_recover_remember_section(),
-            "intent REMEMBER": get_intent_reminder_section(),
+            # recover lost its REMEMBER mirror in the 2026-09-20 pass-5
+            # cleanup (same OQ3 family as planner/executor/verifier above):
+            # the recover verifier is a ReAct loop whose message tail (tool
+            # results + conditional reminders) owns recency, and all seven
+            # bullets restated named carriers (Core Principles head, Output
+            # contract, Residual-Attribution judgement, PARALLELIZE second
+            # render). The principle stays single-sided at primacy in
+            # recover Core Principles.
+            # intent lost its REMEMBER mirror in the 2026-09-20
+            # skeleton/weight cleanup — but NOT the principle: the R-C1
+            # cascade review (same date) measured that dropping it broke
+            # the probe-fact recording trigger (fallback harvest cannot
+            # capture causal insights), so the principle was backfilled
+            # into §2 Proactiveness, pairing it with the update_progress
+            # same-turn obligation. The universal cognitive prompt that
+            # would carry it phase-independently is still an unapproved
+            # openspec proposal — this §2 line is the only carrier.
+            "intent Three Priorities": get_intent_priorities_section(),
+            "intent Three Priorities (semantic)":
+                get_intent_priorities_section(semantic_only=True),
+            # The planner lost its REMEMBER mirror in the same cleanup
+            # (OQ3: planner recency rides the message tail — tool results,
+            # progress ledger, corrective hints — so a prompt-end mirror
+            # never actually held the recency position). The principle
+            # stays single-sided at primacy in planner Core Principles;
+            # the mirror's unique rule folded there. The executor's mirror
+            # (a structural single-source render of the same
+            # _EXECUTOR_PRINCIPLES tuple) went the same way in the
+            # 2026-09-20 execute cleanup — same OQ3 reasoning, same
+            # fold-back of the mirror's unique replan-escape rule. The
+            # verifier's mirror (7 rewritten bullets, only PARALLELIZE
+            # verbatim) went the same way in the same-date verifier
+            # cleanup (pass-4) — the principle stays single-sided at
+            # primacy in verifier Core Principles.
             "plan-builder critical rules (guided)":
                 get_plan_builder_critical_rules_section(),
             "plan-builder critical rules (expert)":
                 get_plan_builder_critical_rules_section(mode="expert"),
-            "plan-builder reminder (guided)":
-                get_plan_builder_critical_rules_reminder_section(),
-            "plan-builder reminder (expert)":
-                get_plan_builder_critical_rules_reminder_section(mode="expert"),
         }
+        # The plan-builder reminder rows went with the pass-6 cleanup
+        # (2026-09-20, same OQ3 family as the planner/executor/verifier
+        # mirror removals above): its bullets restated rules carried by the
+        # bound PRESENT_OPTIONS_TOOL / SUBMIT_PLAN_TOOL schemas — a
+        # STRONGER carrier than a prompt body, riding bind_tools into every
+        # request — or by the critical_rules head.
         for zone_name, zone in zones.items():
             assert PARALLELIZE_PRINCIPLE in zone, zone_name
 
@@ -258,25 +340,11 @@ class TestSectionFunctions:
         assert "FAULT INTENT parameters are UNVERIFIED" in section
         assert "TOOL is correct" in section
         assert "finish_planning" in section
-
-    def test_remember_section_content(self):
-        section = get_remember_section()
-        assert "# REMEMBER" in section
-        assert "FAULT INTENT parameters are UNVERIFIED" in section
-        assert "TOOL is correct" in section
-        assert "finish_planning" in section
+        # The REMEMBER mirror's unique rule folded here when the mirror was
+        # removed (2026-09-20 skeleton/weight cleanup — planner recency
+        # rides the message tail, not a prompt-end restatement).
+        assert "Preserve the reviewed FaultSpec" in section
         assert "propose_plan_change" in section
-
-    def test_core_principles_and_remember_are_aligned(self):
-        """REMEMBER must reinforce the same rules as Core Principles (U-shaped attention)."""
-        core = get_core_principles_section()
-        remember = get_remember_section()
-        # Each Core Principles rule must appear verbatim in REMEMBER
-        for line in core.splitlines():
-            if line.startswith("- "):
-                assert line in remember, (
-                    f"Core Principles rule not found in REMEMBER: {line!r}"
-                )
 
     def test_feasibility_probing_covers_host_level_dependencies(self):
         """Viability probing must obligate deriving the mechanism's full
@@ -289,15 +357,17 @@ class TestSectionFunctions:
         directions go stale; the mechanism's dependency set is derived per
         task and its concrete preconditions live in the skill case.
         """
-        for section in (
-            get_core_principles_section(),
-            get_remember_section(),
-        ):
-            assert "derive the fault mechanism's dependency set" in section
+        # 2026-09-20 pass-2 (compress-all ruling): the derivation recipe is
+        # single-sourced in Workflow Step 2 — the model executes it at the
+        # point of action; Core Principles keeps only the verify
+        # commitment.
         workflow = get_workflow_section()
         assert "derive what the fault mechanism depends on to work" in workflow
         assert "only as viable as the substrate it" in workflow
         assert "kernel or operator capability the mechanism needs" in workflow
+        cp = get_core_principles_section()
+        assert "Verify before finish_planning" in cp
+        assert "ACTUALLY viable here" in cp
 
     def test_executor_core_principles_section_content(self):
         section = get_executor_core_principles_section()
@@ -307,39 +377,14 @@ class TestSectionFunctions:
         assert "adaptively" in section
         assert "do not retry or re-plan" not in section
         assert "STOP" in section
-
-    def test_executor_remember_section_content(self):
-        section = get_executor_remember_section()
-        assert "# REMEMBER" in section
-        assert "UNVERIFIED" in section
-        assert "runtime evidence" in section
-        assert "adaptively" in section
-        assert "STOP" in section
-        # request_replan must be presented as a normal tool call, never a
-        # printed JSON/text marker (the text form induced verbalized
-        # "[Tool call: request_replan]" output that matched no channel).
-        assert "request_replan" in section
-        assert "<replan_request>" not in section
-
-    def test_executor_remember_rejects_replan_text_marker(self):
-        """The recency-zone mirror must carry the same anti-text-marker
-        contract as Core Principles — alignment tests only check shared
-        bullets, so the REMEMBER-only replan escape rule needs its own
-        negative guard against regression to the printed-marker form."""
-        section = get_executor_remember_section()
+        # The replan escape rule folded here from the removed REMEMBER
+        # mirror (2026-09-20 execute cleanup) — request_replan must be
+        # presented as a normal tool call, never a printed JSON/text
+        # marker (the text form induced verbalized "[Tool call:
+        # request_replan]" output that matched no channel).
         assert "request_replan" in section
         assert "<replan_request>" not in section
         assert "never describe it in prose" in section
-
-    def test_executor_core_principles_and_remember_are_aligned(self):
-        """REMEMBER must reinforce the same rules as executor Core Principles."""
-        core = get_executor_core_principles_section()
-        remember = get_executor_remember_section()
-        for line in core.splitlines():
-            if line.startswith("- "):
-                assert line in remember, (
-                    f"Executor Core Principles rule not found in REMEMBER: {line!r}"
-                )
 
     def test_env_section_format(self):
         section = get_env_section({"blade_version": "1.7.0", "k8s_available": True})
@@ -361,11 +406,18 @@ class TestBuildInjectSystemPrompt:
         prompt = build_inject_system_prompt(skill_catalog="test-skill")
         # All major section headers should be present
         assert "Workflow" in prompt
-        assert "Safety Rules" in prompt
         assert "Tool Usage Guidelines" in prompt
-        assert "Important Guidelines" in prompt
-        # REMEMBER segment (U-shaped recency zone)
-        assert "# REMEMBER" in prompt
+        # 2026-09-20 skeleton/weight cleanup: the planner prompt dropped
+        # its Safety Rules section (program guards enforce it; role keeps
+        # one generic boundary sentence), its Important Guidelines section
+        # (single bullet duplicated Core Principles), and its REMEMBER
+        # mirror (primacy duplicate with no real recency position in the
+        # ReAct loop). The SHARED section functions are untouched —
+        # execute_loop still renders safety/guidelines and its own
+        # executor REMEMBER.
+        assert "Safety Rules" not in prompt
+        assert "Important Guidelines" not in prompt
+        assert "# REMEMBER" not in prompt
         # Removed from Phase 1 (tool-agnostic redesign):
         # Communication Style and K8s Cluster Connection are Phase 2 only
         assert "Communication Style" not in prompt
@@ -396,7 +448,15 @@ class TestBuildInjectSystemPrompt:
 
 
 class TestIntentClarificationSectionFunctions:
-    """Test intent clarification section functions — English, U-shaped."""
+    """Test intent clarification section functions — skeleton-only.
+
+    The 2026-09-20 skeleton/weight cleanup deleted the routing table,
+    parameter model, batch boundary, operation freshness, tools,
+    reflection, capability boundary and REMEMBER sections: single-call
+    contracts live in the control tools' schemas (openspec
+    universal-cognitive-architecture D1) and behaviour micro-management
+    was old-model weight. These tests pin the surviving skeleton.
+    """
 
     def test_role_section_english(self):
         section = get_intent_role_section()
@@ -435,37 +495,34 @@ class TestIntentClarificationSectionFunctions:
         assert "Proactiveness" in section
         assert "Convergence" in section
 
-    def test_dialogue_routing_section_has_routes(self):
-        section = get_intent_dialogue_routing_section()
-        assert "Dialogue Routing" in section
-        assert "Recover" in section
-        assert "Batch" in section
-        assert "Pure text response" in section
-
-    def test_parameter_model_section(self):
-        section = get_intent_parameter_model_section()
-        assert "scope" in section
-        assert "target" in section
-        assert "action" in section
-        assert "target identity fields" in section
-
-    def test_parameter_model_requires_duration(self):
-        """Duration is a mandatory presentation item of the intent summary.
-
-        Guards the duration contract: the model must surface a duration
-        (user's value or the system recommended default, stating which),
-        and must never smuggle it into ``params`` as ``timeout`` — that
-        key is rejected by the submission chain.
+    def test_proactiveness_teaches_probe_time_fact_recording(self):
+        """R-C1 (2026-09-20 cascade review): the skeleton/weight cleanup
+        deleted the old §9 Tools teaching — and with it the ONLY trigger
+        for the probe-snapshot evidence pipeline. Measured downstream
+        (``_harvest_probe_snapshot`` A/B): the fallback extractor lifts
+        only tool-output rows that name the target as a whole token, so
+        causal insights survive SOLELY as self-recorded facts; without
+        this line the planner's "already-established evidence" degrades
+        to raw command output and factory's update_progress binding goes
+        untaught. The same-turn pairing rides the canonical
+        PARALLELIZE_PRINCIPLE verbatim (single-sourced in reminder.py,
+        pinned by test_parallelize_principle_single_sourced_in_every_node)
+        — the wording here must never drift from that constant.
         """
-        section = get_intent_parameter_model_section()
-        assert "duration" in section
-        assert "system recommended default" in section
-        assert "duration_seconds" in section
-        assert "rejected" in section
-        # sess_67b835f8977c: intensity got declared in the submit summary,
-        # the window never was — the user approved a duration they never saw.
-        assert "nobody approved" in section
-        assert "states the window" in section
+        for semantic_only in (False, True):
+            section = get_intent_priorities_section(semantic_only=semantic_only)
+            # the harvest trigger: durable-fact vocabulary (fallback rows
+            # cover only names/params/RestartPolicy — everything else,
+            # causal insight especially, rides this line alone)
+            assert "update_progress" in section
+            assert '"established_facts": [...]' in section
+            assert "causal insight" in section
+            assert "restartPolicy" in section
+            # the same-turn obligation, stated via the canonical principle
+            assert "same turn as your next probe" in section
+            assert PARALLELIZE_PRINCIPLE in section
+            # the downstream consequence that makes recording matter
+            assert "established evidence" in section
 
     def test_parameter_model_states_params_provenance_rule(self):
         """Intent accuracy: the probed environment is the ONLY authority.
@@ -481,7 +538,10 @@ class TestIntentClarificationSectionFunctions:
         words are direction, not data (a user-stated value probing
         cannot verify must be deferred to the environment); case
         examples are templates; an unprobed environment-bound value is
-        never submitted. §4 keeps a pointer only.
+        never submitted. The detailed single-call contract (probe trail,
+        duration semantics, field shapes) lives in the
+        ``submit_fault_intent`` schema — §2 keeps the principle at primacy
+        plus a pointer.
         """
         for semantic_only in (False, True):
             section = get_intent_priorities_section(semantic_only=semantic_only)
@@ -501,17 +561,21 @@ class TestIntentClarificationSectionFunctions:
             assert "probe it first, or omit it" in section
             # the consequence that makes the rule matter
             assert "user-approved" in section
-        # §4 points at the rule instead of restating it
-        params_section = get_intent_parameter_model_section()
-        assert "Truthfulness rule above" in params_section
-        assert "non-negotiable" not in params_section
+            # the full contract is delegated to the tool schema, not restated
+            assert "submit tool's description" in section
 
     def test_inject_flow_section(self):
         section = get_intent_inject_flow_section()
         assert "Inject Flow" in section
         assert "submit_fault_intent" in section
-        assert "Probe" in section
-        assert "Recommend" in section
+        # the card division of labour: submitting raises the confirmation
+        # card — asking again in chat asks the same question twice
+        assert "confirmation card" in section
+        assert "Do not stop" in section
+        # the duration window must be surfaced for approval
+        # (sess_67b835f8977c: the user approved a window they never saw)
+        assert "duration window" in section
+        assert "system recommended default" in section
 
     def test_inject_flow_outcome_vs_means_teaches_criteria_not_verdicts(self):
         """sess_9d6b3bbfe54f: the user's "make the component down" (an
@@ -522,13 +586,13 @@ class TestIntentClarificationSectionFunctions:
         WHICH form wins stays the model's judgement from case facts, so the
         agent layer must never bake in a domain verdict.
 
-        intent-outcome-to-means: the rule now also routes through the
+        intent-outcome-to-means: the rule also routes through the
         knowledge doc's question chain (what must break → which families →
-        four-axis comparison) and adds the sibling behavioural rules —
-        list-before-probe, the pre-recommendation
-        query_active_experiments compound-state check, and explicit
-        handling of partial answers — all sourced from trace
-        sess_4b696f566f23's FM1/FM2/FM4/FM5.
+        axis comparison) — the index-visibility anchor from trace
+        sess_4b696f566f23. The sibling behaviour rules that stood here
+        (list-before-probe, compound-state check, partial answers) were
+        removed as weight in the 2026-09-20 skeleton/weight cleanup; the
+        methodology body lives in the on-demand knowledge doc.
         """
         for kwargs in ({}, {"semantic_only": True}):
             section = get_intent_inject_flow_section(**kwargs)
@@ -542,14 +606,6 @@ class TestIntentClarificationSectionFunctions:
             assert "how likely each means is to occur in the real world" in section
             assert "how certainly it achieves the named outcome" in section
             assert "Never silently" in section
-            # behavioural siblings (trace sess_4b696f566f23)
-            assert "Means before carrier probe" in section
-            assert "query_active_experiments" in section
-            # sess_67b835f8977c: the compound warning fired at recommendation
-            # time but vanished from the submit summary — the approval
-            # decision was made without the composition in view
-            assert "submit summary" in section
-            assert "Partial answers" in section
             # no domain winner hardcoded in the agent layer (phrase-level:
             # bare "kill" collides with "skill/case")
             assert "pod deleted" not in section.lower()
@@ -587,27 +643,11 @@ class TestIntentClarificationSectionFunctions:
         assert "Recover Flow" in section
         assert "recover_task" in section
         assert "task_id" in section
-
-    def test_batch_flow_section(self):
-        section = get_intent_batch_flow_section()
-        assert "Batch Boundary" in section
-        assert "independent" in section
-        assert 'execution_order="serial"' in section
-        assert "Do not manufacture a batch" in section
-        assert "submit_batch_intent" in section
-
-    def test_operation_freshness_section(self):
-        section = get_intent_operation_freshness_section()
-        assert "Operation Freshness" in section
-        assert "stale" in section
-        assert "re-query" in section
-
-    def test_tools_section_has_categories(self):
-        section = get_intent_tools_section()
-        assert "Probe" in section
-        assert "Submit" in section
-        assert "Route" in section
-        assert "bound to you" in section
+        # recovery has no confirmation card — the chat confirmation IS the
+        # human gate, so same-turn query→recover must stay forbidden
+        assert "NEVER call" in section
+        assert "same turn" in section
+        assert "NEVER auto-select" in section
 
     def test_output_section(self):
         section = get_intent_output_section()
@@ -645,13 +685,6 @@ class TestIntentClarificationSectionFunctions:
         section = get_intent_completeness_section(None)
         assert "No FaultSpec has been collected yet" in section
 
-    def test_reminder_section_recaps_rules(self):
-        section = get_intent_reminder_section()
-        assert "REMEMBER" in section
-        assert "target authority" in section
-        assert "submit" in section
-        assert "Probe" in section
-
 
 class TestBuildIntentClarificationPrompt:
     """Test intent clarification prompt builder — U-shaped assembly."""
@@ -660,20 +693,19 @@ class TestBuildIntentClarificationPrompt:
         prompt = build_intent_clarification_prompt()
         assert "Blade AI" in prompt
         assert "Three Priorities" in prompt
-        assert "REMEMBER" in prompt
+        # the REMEMBER mirror is gone (2026-09-20 skeleton/weight cleanup)
+        assert "# REMEMBER" not in prompt
 
-    def test_u_shaped_structure(self):
-        """Priorities at beginning + reminder at end."""
+    def test_primacy_carries_provenance(self):
+        """With the recency mirror removed, the provenance principle must
+        sit in the primacy zone — it is the source-of-approved-snapshot
+        rule and the one thing the intent head may never lose."""
         prompt = build_intent_clarification_prompt()
-        # Priorities near beginning (primacy zone)
         priorities_pos = prompt.find("Three Priorities")
-        # REMEMBER near end (recency zone)
-        reminder_pos = prompt.find("# REMEMBER")
         assert priorities_pos > 0
-        assert reminder_pos > 0
-        assert reminder_pos > priorities_pos
-        # Reminder should be in the last 20% of the prompt
-        assert reminder_pos > len(prompt) * 0.8
+        # in the first 20% of the prompt
+        assert priorities_pos < len(prompt) * 0.2
+        assert "ONLY authority" in prompt[priorities_pos:]
 
     def test_cache_boundary_present(self):
         """CACHE_BOUNDARY separates stable from dynamic sections."""
@@ -703,7 +735,10 @@ class TestBuildIntentClarificationPrompt:
         prompt = build_intent_clarification_prompt()
         assert "Inject Flow" in prompt
         assert "Recover Flow" in prompt
-        assert "Batch Flow" in prompt
+        # batch semantics live in the submit_batch_intent schema; the
+        # prompt only keeps the one-outcome definition (Reviewed FaultSpec)
+        assert "submit_batch_intent" not in prompt
+        assert "do not by themselves create a batch" in prompt
 
     def test_prompt_mode_intent(self):
         """PromptMode.INTENT routes to build_intent_clarification_prompt."""
@@ -795,11 +830,9 @@ class TestExecutorEffectObservationBoundary:
         assert "do not wait for, sample, or stabilize the fault effect" in section
         # the replan channel is named so the right-to-switch-method survives
         assert "returns to you through replan" in section
-
-    def test_receipt_completion_rule_in_remember(self):
-        # U-shaped attention: the recency anchor must carry the same rule.
-        section = get_executor_remember_section()
-        assert "A step is complete when its mutation is ISSUED" in section
+        # (The REMEMBER twin of this test is gone with the 2026-09-20
+        # execute cleanup — the executor mirror was removed; recency rides
+        # the message tail, so this primacy carrier is the rule's only one.)
 
     def test_receipt_authority_wording_not_eroded(self):
         # The old phrasing taught the model that its receipt cannot be
@@ -894,61 +927,3 @@ class TestExecutorPlanContractDiscipline:
         # re-deriving.
         assert "Do NOT re-derive command texts" not in section
         assert "in their written order" not in section
-
-
-class TestCrChannelRoutingGuide:
-    """openspec faultdrill-cr-channel D3 source 2 — the Workflow routing
-    guide that teaches the planner to read the skill case's
-    ``recovery_channel`` declaration. Gated by the builder on
-    (faultdrill_enabled ∧ K8s profile): the dark-launch window keeps the
-    section byte-identical to pre-change."""
-
-    def test_dark_launch_section_is_byte_identical(self):
-        default = get_workflow_section()
-        assert default == get_workflow_section(include_cr_channel_routing=False)
-        assert "4b." not in default
-        assert "recovery_channel" not in default
-        assert "FaultDrill" not in default
-
-    def test_guide_splices_cleanly_at_the_step_boundary(self):
-        # Enabled output minus the guide is EXACTLY the pre-change section:
-        # the guide inserts between step 4 and step 5 and disturbs nothing
-        # else — no renumbering, no rewording of neighbouring steps.
-        default = get_workflow_section()
-        on = get_workflow_section(include_cr_channel_routing=True)
-        i = on.index("4b. **Recovery-channel routing**")
-        j = on.index("5. **Assess complexity**")
-        assert on[:i] + on[j:] == default
-
-    def test_guide_teaches_the_d3_route(self):
-        on = get_workflow_section(include_cr_channel_routing=True)
-        i = on.index("4b. **Recovery-channel routing**")
-        j = on.index("5. **Assess complexity**")
-        guide = " ".join(on[i:j].split())
-        # Declaration routes: apiserver-write → the FaultDrill CR channel.
-        assert "recovery_channel: apiserver-write" in guide
-        assert "FaultDrill custom resource" in guide
-        # Recovery single-source: the channel arms its own guards — no SOP
-        # stacking (the reconciler race guard, same legislation as 2.2).
-        assert "landing readback and reconciler it arms itself" in guide
-        assert "do NOT stack a recovery-carrier SOP" in guide
-        # No declaration → documented path unchanged (M3 not landed yet:
-        # zero behavior change until cases carry the field).
-        assert "keep their documented path unchanged" in guide
-        # CRD-unavailable degradation completes at the plan layer.
-        assert "pre-task environment probes message" in guide
-        assert "recovery-carrier SOP form directly" in guide
-        assert "no CR attempt round" in guide
-
-    def test_builder_gate_combines_flag_with_profile(self):
-        # The builder gate (not the section) combines the caller's feature
-        # flag with the K8s profile: host/unknown channels never see the
-        # guide even with the flag on; the prompts layer reads no settings.
-        p_on = build_inject_system_prompt("catalog", profile="k8s", cr_channel_enabled=True)
-        assert "4b. **Recovery-channel routing**" in p_on
-        p_off = build_inject_system_prompt("catalog", profile="k8s")
-        assert "4b." not in p_off
-        p_host = build_inject_system_prompt("catalog", profile="host", cr_channel_enabled=True)
-        assert "4b." not in p_host
-        p_unknown = build_inject_system_prompt("catalog", profile="unknown", cr_channel_enabled=True)
-        assert "4b." not in p_unknown

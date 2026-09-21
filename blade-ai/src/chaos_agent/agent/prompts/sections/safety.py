@@ -1,17 +1,28 @@
-"""Safety sections: graduated safety rules, failure modes, and action caution."""
+"""Safety section: graduated rules (hard / caution / advisory) plus the
+on-demand ``safety-extended`` pointer."""
 
 
 def get_safety_section(level: str = "full") -> str:
     """Safety rules section with graduated severity — profile-agnostic.
 
+    Consumerless since the 2026-09-20 skeleton/weight cleanup: the planner
+    builder dropped its safety render (five of six Hard Rules are enforced
+    by code — safety_check node, phase-1 tool binding and screener, target
+    freeze, automatic timeout, automatic conflict detection — and the sixth
+    duplicated Core Principles), and the execute builder dropped it in the
+    pass-3 execute cleanup. ZERO render sites remain project-wide. Kept
+    dead-but-exported: execution.py's guidelines docstring cites this
+    function as that precedent, and its parameterized tests in
+    test_section_params.py remain.
+
     Args:
         level: ``"full"`` returns the complete graduated rule set (default,
             backward-compatible). ``"hard_only"`` returns only Hard Rules and
-            the Caution Rule Compliance protocol — used for cache-tight inject
-            prompts where Advisory / Blast Radius / Decision background is
-            sourced on demand from the ``safety-extended`` knowledge doc. Both
-            variants keep the ``"Safety Rules"`` header that downstream tests
-            may assert on.
+            the Caution Rule Compliance protocol — historically used by the
+            (now removed) cache-tight inject prompt renders, which sourced
+            Advisory / Blast Radius / Decision background on demand from the
+            ``safety-extended`` knowledge doc. Both variants keep the
+            ``"Safety Rules"`` header that downstream tests may assert on.
 
     k8s / host differences are NOT expressed here; they come only from the
     environment_profile target-authority fragment.

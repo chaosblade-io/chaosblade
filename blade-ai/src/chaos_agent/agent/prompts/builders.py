@@ -36,12 +36,8 @@ from chaos_agent.agent.prompts.sections import (
     get_experience_section,
     get_workflow_section,
     get_core_principles_section,
-    get_remember_section,
     get_executor_core_principles_section,
-    get_executor_remember_section,
-    get_safety_section,
     get_tools_section,
-    get_guidelines_section,
     get_skill_index_section,
     get_replan_section,
     get_replan_directive_for_execution,
@@ -50,18 +46,10 @@ from chaos_agent.agent.prompts.sections import (
 from chaos_agent.agent.prompts.sections.intent import (
     get_intent_role_section,
     get_intent_priorities_section,
-    get_intent_dialogue_routing_section,
-    get_intent_parameter_model_section,
     get_intent_inject_flow_section,
     get_intent_recover_flow_section,
-    get_intent_batch_flow_section,
-    get_intent_operation_freshness_section,
-    get_intent_tools_section,
-    get_intent_reflection_section,
-    get_intent_capability_boundary_section,
     get_intent_output_section,
     get_intent_completeness_section,
-    get_intent_reminder_section,
 )
 from chaos_agent.agent.prompts.sections.plan_builder import (
     get_plan_builder_role_section,
@@ -70,11 +58,9 @@ from chaos_agent.agent.prompts.sections.plan_builder import (
     get_plan_builder_tools_section,
     get_plan_builder_output_format_section,
     get_plan_builder_progress_section,
-    get_plan_builder_critical_rules_reminder_section,
 )
 from chaos_agent.agent.prompts.sections.verification import (
     get_verifier_role_section,
-    get_verifier_remember_section,
     get_verifier_layer2_section,
     get_verifier_output_format_section,
     get_verifier_core_principles_section,
@@ -176,14 +162,6 @@ def build_inject_system_prompt(
             env_info (dict): Runtime environment info to inject.
             replan_context (dict): Phase 2 → Phase 1 error feedback.
             replan_history (list): Prior replan attempts.
-            cr_channel_enabled (bool): The FaultDrill CR channel feature
-                flag as observed by the caller (settings.faultdrill_enabled).
-                Combined with the K8s profile here to gate the Workflow
-                recovery-channel routing guide (openspec
-                faultdrill-cr-channel, design D3 source 2) — dark launch
-                keeps the section byte-identical to pre-change. The prompts
-                layer reads no settings directly; the flag is a caller
-                capability fact, same as ``profile``.
 
     Returns:
         Assembled system prompt string.
@@ -214,19 +192,32 @@ def build_inject_system_prompt(
         ("experience", get_experience_section(), "optional"),
         ("knowledge_summary", get_knowledge_summary_section(phase="plan"), "optional"),
         ("skill_catalog", get_skill_index_section(skill_catalog), "optional"),
-        ("workflow", get_workflow_section(
-            include_cr_channel_routing=(
-                profile == PROFILE_K8S
-                and bool(kwargs.get("cr_channel_enabled"))
-            ),
-        ), "context"),
-        ("safety", get_safety_section(level="hard_only"), "invariant"),
+        ("workflow", get_workflow_section(), "context"),
         ("tools", get_tools_section(phase=1), "contract"),
-        ("guidelines", get_guidelines_section(include_method_switching=False, phase=1), "context"),
         ("environment_profile", _environment_prompt_fragment(profile, "plan"), "context"),
         ("provider_identity", _provider_prompt_fragment(profile, "identity"), "context"),
         ("cache_boundary", CACHE_BOUNDARY.strip(), "contract"),
     ]
+    # 2026-09-20 skeleton/weight cleanup (user ruling, same family as the
+    # intent node): three sections dropped from the PLANNER prompt only —
+    # the shared section FUNCTIONS the planner still consumes are
+    # untouched. ("execute_loop's prompt is byte-identical" held only at
+    # planner-pass time; pass-3 later cleaned the execute builder itself —
+    # safety/guidelines/REMEMBER dropped there — so the byte-identity
+    # invariant is gone by design; what survives is that THIS pass never
+    # edits a shared function the execute builder also renders.)
+    # - safety (get_safety_section, hard_only, 1816 chars): five of six
+    #   Hard Rules are enforced by code (safety_check node, phase-1 tool
+    #   binding + screener, target freeze, automatic timeout, automatic
+    #   conflict detection) and the sixth duplicates Core Principles; the
+    #   role section keeps one generic boundary sentence. openspec
+    #   universal-cognitive-architecture: safety rides program guards,
+    #   safety-extended.md stays the on-demand pointer.
+    # - guidelines (get_guidelines_section, phase=1): its single bullet
+    #   duplicated Core Principles' documented-path rule verbatim.
+    # - remember (get_remember_section): verbatim primacy mirror with no
+    #   actual recency position in the ReAct loop (message tail owns
+    #   recency); unique line folded into Core Principles.
     if kwargs.get("env_info"):
         sections.append(("runtime_environment", get_env_section(kwargs["env_info"]), "context"))
 
@@ -287,15 +278,16 @@ def build_inject_system_prompt(
     # ``progress_ledger_section`` kwarg is retained as accepted-but-ignored for
     # in-flight callers.
 
-    # U-shaped attention: REMEMBER last, AFTER every dynamic section. The
-    # original section list carried it above cache_boundary, so the
-    # ever-present fault contract (plus replan context / runtime env /
-    # ledger) pushed it out of the recency zone on the most common Phase 1
-    # paths — the docstring contract of the sibling builders ("REMEMBER at
-    # END") silently did not hold here. Same layout as the intent builder:
-    # stable prefix above the boundary stays cache-intact, and the recency
-    # anchor now sits adjacent to the Reviewed FaultSpec rule it reinforces.
-    sections.append(("remember", get_remember_section(), "invariant"))
+    # REMEMBER (2026-09-20 skeleton/weight cleanup): the planner's recency
+    # mirror no longer rides this prompt — in the ReAct loop the model's
+    # last read is the message tail (tool results + progress ledger +
+    # corrective hints), so a prompt-end restatement never actually held
+    # the recency position. Its unique rule folded into Core Principles
+    # (see get_core_principles_section). The dynamic sections below
+    # (fault contract / replan / runtime env) therefore now close the
+    # prompt; the fault contract itself ends with the
+    # propose_plan_change declaration, which restates the folded rule
+    # exactly where it binds.
 
     return _assemble(PromptMode.FULL, sections)
 
@@ -309,11 +301,14 @@ def build_execute_system_prompt(
     user_params_hint: str = "",
     **kwargs,
 ) -> str:
-    """Build execute_loop system prompt with U-shaped attention.
+    """Build execute_loop system prompt.
 
     Same pattern as build_inject_system_prompt, build_verifier_prompt,
     build_intent_clarification_prompt, and build_plan_builder_prompt:
-    Core Principles at BEGINNING (primacy) + REMEMBER at END (recency).
+    Core Principles at BEGINNING (primacy); the executor's former
+    REMEMBER tail mirror was removed in the 2026-09-20 execute cleanup
+    (OQ3 family ruling — recency rides the message tail: tool results,
+    ledger tail-append, system-reminder corrective hints).
 
     Args:
         skill_catalog: The available skills catalog string.
@@ -323,6 +318,26 @@ def build_execute_system_prompt(
         structured_params_hint: Pre-defined scope/target/action hint from CLI
             structured params (e.g., "scope=pod, target=cpu, action=fullload").
             When set, the LLM should use these parameters instead of inferring.
+
+    2026-09-20 execute cleanup (compress-all ruling, same carrier-analysis
+    discipline as the planner pass): three sections dropped —
+    safety (all six Hard Rules' executors are code: safety_check is an
+    UPSTREAM node the executor never sees, phase-2 tool binding, the
+    tool screener on the execute path, provider default timeout, and
+    conflict resolution before execution — the rule's own text says "If
+    you reach the execution phase, conflicts have been resolved"; the
+    Caution rules are confirmation_gate artifacts already
+    user-approved), guidelines (method-first duplicated Core
+    Principles' method-switch bullet; the conflict-check notice folded
+    into the Execution Directives), and remember (91% verbatim
+    re-render of Core Principles; its unique replan-escape rule folded
+    into the _EXECUTOR_PRINCIPLES tuple). Shared section functions are
+    untouched — the planner/verifier/recover builders keep their own
+    references. (2026-09-20 addendum: "keep their own references" is
+    this pass's transaction boundary only — the planner builder's own
+    safety/guidelines/remember renders were already dropped in pass-2,
+    so get_safety_section now has ZERO render sites project-wide; see
+    its docstring.)
     """
     profile = kwargs.get("profile", PROFILE_K8S)
     sections: list[tuple[str, str, PromptPriority]] = [
@@ -334,9 +349,7 @@ def build_execute_system_prompt(
     sections.extend([
         ("experience", get_experience_section(), "optional"),
         ("knowledge_summary", get_knowledge_summary_section(phase="execute"), "optional"),
-        ("safety", get_safety_section(level="hard_only"), "invariant"),
         ("tools", get_tools_section(phase=2), "contract"),
-        ("guidelines", get_guidelines_section(include_method_switching=True, phase=2), "context"),
         ("provider_identity", _provider_prompt_fragment(profile, "identity"), "context"),
         ("environment_profile", _environment_prompt_fragment(profile, "execute"), "context"),
     ])
@@ -361,9 +374,11 @@ def build_execute_system_prompt(
     # keeping this [system][tools] head byte-stable across rounds. The
     # ``progress_ledger_section`` kwarg is accepted-but-ignored for signature
     # compatibility with callers still mid-migration.
-    sections.append(
-        ("remember", get_executor_remember_section(), "invariant"),
-    )
+    #
+    # REMEMBER tail (2026-09-20 execute cleanup): dropped with the section
+    # row above — the prompt now closes on the replan contract, whose
+    # "an actual tool call, never prose" wording re-teaches the folded
+    # escape rule exactly where the replan decision is made.
     return _assemble(PromptMode.MINIMAL, sections)
 
 
@@ -398,7 +413,16 @@ def build_verifier_prompt(profile: str = PROFILE_K8S, **kwargs) -> str:
     # (see build_ledger_tail_content), keeping this head byte-stable across
     # verify rounds. The ``progress_ledger_section`` kwarg is accepted-but-ignored
     # for signature compatibility with callers still mid-migration.
-    sections.append(("remember", get_verifier_remember_section(), "invariant"))
+    #
+    # REMEMBER tail removed in the 2026-09-20 verifier cleanup (pass-4, same
+    # OQ3 recency ruling as the execute/agent_loop/intent passes): in a ReAct
+    # loop the model's last read is the message-flow TAIL (tool results, the
+    # ledger tail-append, <system-reminder> corrective hints) — a system-prompt
+    # REMEMBER never holds the recency position. Every bullet it carried has
+    # a stronger carrier: CP #1-#4 primacy copies, the output contract's
+    # submit-only rule, and the PARALLELIZE single-source constant in CP.
+    # The prompt now ends on the output contract (same shape as execute
+    # ending on its replan contract).
     return _assemble(PromptMode.VERIFICATION, sections)
 
 
@@ -407,15 +431,16 @@ def build_intent_clarification_prompt(
     skill_catalog: str = "",
     **kwargs,
 ) -> str:
-    """Build intent_clarification system prompt using U-shaped composition.
+    """Build intent_clarification system prompt (skeleton-only composition).
 
-    Follows the same architecture pattern as build_verifier_prompt():
-    CRITICAL rules at BEGINNING (primacy) + END (recency), with
-    dialogue modes, convergence logic, and tools in the middle.
+    Primacy carries the provenance principle (§2); the recency mirror
+    (``# REMEMBER``) was removed in the 2026-09-20 skeleton/weight cleanup
+    (openspec universal-cognitive-architecture OQ3: recency rides the
+    transition tail messages and the progress ledger, not a prompt-end
+    restatement). Single-call contracts live in the control tools' schemas.
 
-    Dynamic FaultSpec context is placed below CACHE_BOUNDARY so stable sections can be cached
-    across turns. The CRITICAL rules reminder occupies the very end
-    of the prompt (after all dynamic content) for maximum recency effect.
+    Dynamic FaultSpec context is placed below CACHE_BOUNDARY so stable
+    sections can be cached across turns.
 
     Args:
         fault_spec: Reviewed FaultSpec from previous dialogue turns. It is the
@@ -458,17 +483,8 @@ def build_intent_clarification_prompt(
         # 8/10.
         ("environment_profile", _environment_prompt_fragment(profile, "intent"), "context"),
         ("priorities", get_intent_priorities_section(semantic_only=semantic_only), "invariant"),
-        ("dialogue_routing", get_intent_dialogue_routing_section(), "context"),
-        ("parameter_model", get_intent_parameter_model_section(), "context"),
         ("inject_flow", get_intent_inject_flow_section(semantic_only=semantic_only), "context"),
         ("recover_flow", get_intent_recover_flow_section(), "context"),
-        ("batch_flow", get_intent_batch_flow_section(
-            semantic_only=semantic_only,
-        ), "context"),
-        ("operation_freshness", get_intent_operation_freshness_section(semantic_only=semantic_only), "context"),
-        ("tools", get_intent_tools_section(semantic_only=semantic_only), "context"),
-        ("reflection", get_intent_reflection_section(semantic_only=semantic_only), "context"),
-        ("capability_boundary", get_intent_capability_boundary_section(), "context"),
         ("output_contract", get_intent_output_section(), "contract"),
         # On-demand knowledge index, filtered to the plan phase. Without it
         # the intent node saw ONLY the means-named skill-package index, so an
@@ -496,7 +512,6 @@ def build_intent_clarification_prompt(
     )
     if completeness:
         sections.append(("completeness", completeness, "context"))
-    sections.append(("remember", get_intent_reminder_section(profile), "invariant"))
     return _assemble(PromptMode.INTENT, sections)
 
 
@@ -528,11 +543,13 @@ def build_plan_builder_prompt(
     )
     if progress:
         sections.append(("progress", progress, "context"))
-    sections.append((
-        "remember",
-        get_plan_builder_critical_rules_reminder_section(planning_mode),
-        "invariant",
-    ))
+    # remember tail mirror removed in the 2026-09-20 pass-6 cleanup (same
+    # OQ3 family as pass-1..5): plan_builder is a ReAct loop whose messages
+    # + accumulated tail (tool results, interrupt/resume turns) owns the
+    # recency position a prompt-end checklist never actually held, and
+    # every one of its eight checklist bullets restated a rule carried by
+    # the bound tool schemas (PRESENT_OPTIONS_TOOL / SUBMIT_PLAN_TOOL ride
+    # bind_tools into EVERY request) or by the critical_rules head.
     return _assemble(PromptMode.PLAN_BUILDER, sections)
 
 

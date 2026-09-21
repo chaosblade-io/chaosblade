@@ -79,11 +79,12 @@ def test_inject_flow_summarizes_and_submits_in_one_turn(profile):
     card cannot replace that, so summarising is folded into the submit step.
     """
     prompt = _prompt(profile)
-    assert "Summarize & Submit" in prompt
-    assert "call submit_fault_intent immediately" in prompt
-    assert "Do not stop" in prompt and "for approval in chat" in prompt
+    flat = " ".join(prompt.split())  # normalise hard-wrapping (file convention)
+    assert "Summarize & Submit" in flat
+    assert "call submit_fault_intent immediately" in flat
+    assert "Do not stop" in flat and "for injection approval in chat" in flat
     # and it explains why, so the next reader does not "restore" the round
-    assert "raises a confirmation card" in prompt
+    assert "raises a confirmation card" in flat
 
 
 @pytest.mark.parametrize("profile", ["k8s", "host"])
@@ -99,19 +100,27 @@ def test_summary_must_carry_what_the_card_omits(profile):
 
 @pytest.mark.parametrize("profile", ["k8s", "host"])
 def test_prompt_states_the_card_is_the_gate(profile):
-    """The model must know submission is not silent, or it may hesitate."""
+    """The model must know submission is not silent, or it may hesitate.
+
+    Re-anchored in the 2026-09-20 skeleton/weight cleanup: the wording
+    lived in the REMEMBER mirror ("Injection is never silent…"); the
+    mirror was removed and the Inject Flow body now carries the same
+    contract ("Do not stop for injection approval in chat: submitting
+    raises a confirmation card that collects the decision").
+    """
     flat = " ".join(_prompt(profile).split())
-    assert "Injection is never silent" in flat
-    assert "state the spec and its consequences" in flat
-    assert "is where the user approves" in flat
+    assert "Do not stop for injection approval in chat" in flat
+    assert "submitting raises a confirmation card" in flat
+    assert "collects the decision" in flat
+    assert "asks the same question twice" in flat
 
 
 @pytest.mark.parametrize("profile", ["k8s", "host"])
 def test_declining_on_the_card_is_described_as_recoverable(profile):
     """Otherwise the model may keep the chat round "just in case"."""
-    prompt = _prompt(profile)
-    assert "declines on the card" in prompt
-    assert "refines them instead of restarting" in prompt
+    flat = " ".join(_prompt(profile).split())
+    assert "declines on the card" in flat
+    assert "refines them instead of restarting" in flat
 
 
 # ---------------------------------------------------------------------------
@@ -120,32 +129,18 @@ def test_declining_on_the_card_is_described_as_recoverable(profile):
 
 @pytest.mark.parametrize("profile", ["k8s", "host"])
 def test_recovery_still_confirms_in_chat(profile):
-    """``recover_task`` has no interrupt card — chat is its only gate."""
-    prompt = _prompt(profile)
-    assert "wait for the user's explicit approval" in prompt
-    assert "let the user confirm first" in prompt
-    assert "NEVER call" in prompt and "recover_task" in prompt
+    """``recover_task`` has no interrupt card — chat is its only gate.
 
-
-def test_remember_distinguishes_injection_from_recovery():
-    prompt = _prompt("k8s")
-    start = prompt.index("Injection is never silent")
-    clause = prompt[start:start + 320]
-    assert "Recovery has no such card" in clause, (
-        "without this the model may drop recovery's chat confirmation too"
-    )
-
-
-# ---------------------------------------------------------------------------
-# batch shares the same card
-# ---------------------------------------------------------------------------
-
-def test_batch_flow_also_summarizes_then_submits():
-    """``intent_confirm`` renders batch faults on the same card."""
-    flat = " ".join(_prompt("k8s").split())
-    assert "with expected symptoms and how each gets reverted" in flat
-    assert "one confirmation card listing every fault" in flat
-    assert "do not stop for approval in chat" in flat
+    This also carries the injection/recovery asymmetry that the deleted
+    REMEMBER item used to state: the Recover Flow body says recovery has
+    no confirmation card, so its chat confirmation must not be dropped
+    along with injection's.
+    """
+    flat = " ".join(_prompt(profile).split())
+    assert "wait for the user's explicit approval" in flat
+    assert "let the user confirm first" in flat
+    assert "Recovery has no confirmation card" in flat
+    assert "NEVER call" in flat and "recover_task" in flat
 
 
 # ---------------------------------------------------------------------------

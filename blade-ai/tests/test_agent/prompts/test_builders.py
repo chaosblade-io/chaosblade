@@ -14,14 +14,10 @@ from chaos_agent.agent.prompts.builders import (
     build_verifier_prompt,
 )
 from chaos_agent.agent.prompts.constants import CACHE_BOUNDARY
+from chaos_agent.agent.prompts.reminder import PARALLELIZE_PRINCIPLE
 from chaos_agent.agent.prompts.sections import (
-    get_executor_remember_section,
-    get_intent_reminder_section,
-    get_remember_section,
-    get_verifier_remember_section,
-)
-from chaos_agent.agent.prompts.sections.plan_builder import (
-    get_plan_builder_critical_rules_reminder_section,
+    get_replan_directive_for_execution,
+    get_verifier_output_format_section,
 )
 
 
@@ -67,16 +63,20 @@ class TestInjectCacheBoundary:
 
 
 class TestInjectRememberRecency:
-    """U-shaped attention: REMEMBER must occupy the true end of the Phase 1
-    prompt — AFTER every dynamic section, not just above the cache boundary.
+    """2026-09-20 skeleton/weight cleanup: the planner prompt no longer
+    carries a REMEMBER mirror. Rationale (universal-cognitive-
+    architecture OQ3): in the ReAct loop the model's last read is the
+    message tail (tool results + progress ledger + corrective hints), so
+    a prompt-end restatement never actually held the recency position —
+    it duplicated primacy content at 2030 chars / 10.4% of the prompt.
 
-    Regression: remember used to sit in the stable section list, so the
-    ever-present fault contract (plus replan context / runtime env / ledger)
-    pushed it out of the recency zone on the most common Phase 1 paths,
-    while the sibling builders' docstrings claimed "REMEMBER at END" for it.
+    These guards pin the removal's invariants on the MAXIMAL dynamic
+    path (fault contract + replan context + runtime env): no mirror
+    anywhere, the mirror's unique rule present in Core Principles, and
+    the shared principle single-sided (one occurrence, at primacy).
     """
 
-    def test_remember_trails_all_dynamic_sections(self):
+    def test_planner_prompt_omits_remember_mirror(self):
         prompt = build_inject_system_prompt(
             skill_catalog="x",
             env_info={"blade_version": "1.7.0"},
@@ -86,26 +86,38 @@ class TestInjectRememberRecency:
             },
             replan_context={"error": "boom", "failed_node": "execute_loop"},
         )
-        remember_idx = prompt.index("# REMEMBER")
-        for dynamic_marker in (
-            CACHE_BOUNDARY.strip(),
-            "## Environment",
-            "Reviewed FaultSpec",
-            "Planning Contract Declaration",
-        ):
-            assert remember_idx > prompt.index(dynamic_marker), (
-                f"# REMEMBER must come after {dynamic_marker!r} so the "
-                "recency anchor is never displaced by dynamic content"
-            )
-        # And nothing at all may follow it.
-        assert remember_idx == prompt.rindex("# REMEMBER")
-        assert "# REMEMBER" in prompt[-4000:]
+        assert "# REMEMBER" not in prompt
 
-    def test_remember_still_last_without_dynamic_sections(self):
+    def test_mirror_unique_rule_folded_into_core_principles(self):
+        # The mirror's one non-duplicated line must survive the removal —
+        # Core Principles now carries it (planning's contract-keeper rule).
         prompt = build_inject_system_prompt(skill_catalog="x")
-        assert prompt.rstrip().endswith(
-            get_remember_section().strip()
-        ) or "# REMEMBER" in prompt[-3000:]
+        assert "Preserve the reviewed FaultSpec" in prompt
+        assert "propose_plan_change" in prompt
+
+    def test_parallelize_principle_single_sided_in_planner(self):
+        # Primacy carries the principle; with the mirror gone the planner
+        # prompt must contain it EXACTLY once (a second copy creeping back
+        # in is exactly the weight the cleanup removed).
+        prompt = build_inject_system_prompt(
+            skill_catalog="x", profile="k8s",
+        )
+        assert prompt.count(PARALLELIZE_PRINCIPLE) == 1
+
+    def test_dynamic_sections_close_the_prompt(self):
+        # Without the mirror, the dynamic tail (fault contract / replan)
+        # legitimately closes the prompt; the fault contract ends with the
+        # propose_plan_change declaration that restates the folded rule
+        # exactly where it binds.
+        prompt = build_inject_system_prompt(
+            skill_catalog="x",
+            fault_spec={
+                "scope": "pod", "fault_target": "cpu", "fault_action": "fullload",
+                "namespace": "demo", "names": ["p0"], "params": {},
+            },
+        )
+        assert "Planning Contract Declaration" in prompt
+        assert prompt.rstrip().endswith("full `proposed_fault`.")
 
 
 class TestSiblingBuildersRememberRecency:
@@ -115,14 +127,32 @@ class TestSiblingBuildersRememberRecency:
     The inject-builder regression (remember pushed out of the recency zone
     by dynamic sections appended after it) survived because this contract
     was only a docstring claim. These guards pin it down for the builders
-    that currently hold it — execute, verifier, intent, plan_builder — on
-    their MAXIMAL dynamic paths, which are the ones where a future
-    late-appended section would silently displace the anchor.
+    that currently hold it — plan_builder — on their MAXIMAL dynamic
+    paths, which are the ones where a future late-appended
+    section would silently displace the anchor.
+    (intent dropped its REMEMBER mirror in the 2026-09-20 skeleton/weight
+    cleanup; its dynamic-path guard is
+    ``test_intent_dynamic_completeness_trails_cache_boundary`` below. The
+    executor dropped its own mirror in the same-date execute cleanup —
+    OQ3 family: recency rides the message tail, so a prompt-end mirror
+    never held the position; its close is now pinned on the replan
+    contract by ``test_execute_close_is_replan_contract`` below. The
+    verifier dropped its mirror in the same-date verifier cleanup
+    (pass-4); its close is pinned on the output contract by
+    ``test_verifier_close_is_output_contract`` below.)
     """
 
     LEDGER = "## Progress Ledger\n- b-anchor: plan X\n- log: step1 done"
 
-    def test_execute_remember_trails_all_dynamic_sections(self):
+    def test_execute_close_is_replan_contract(self):
+        # 2026-09-20 execute cleanup: the executor's REMEMBER mirror is
+        # gone (91% verbatim re-render of Core Principles; its unique
+        # replan-escape rule folded into the _EXECUTOR_PRINCIPLES tuple).
+        # On the MAXIMAL dynamic path this guard pins the new close: the
+        # prompt ends on the replan contract, whose "an actual tool call,
+        # never prose" wording re-teaches the folded escape rule exactly
+        # where the replan decision is made, trailing every dynamic
+        # section that could otherwise displace it.
         prompt = build_execute_system_prompt(
             skill_catalog="x",
             skill_name="k8s-fault",
@@ -133,7 +163,9 @@ class TestSiblingBuildersRememberRecency:
             env_info={"blade_version": "1.7.0"},
             progress_ledger_section=self.LEDGER,
         )
-        remember_idx = prompt.index("# REMEMBER")
+        assert "# REMEMBER" not in prompt
+        directive = get_replan_directive_for_execution().strip()
+        replan_idx = prompt.rstrip().rindex(directive)
         for dynamic_marker in (
             "## Environment",
             "the approved plan body",
@@ -141,73 +173,154 @@ class TestSiblingBuildersRememberRecency:
             # NOTE: "## Progress Ledger" is intentionally absent here — Unit A
             # (context-cache-prefix-stability task 2.1) moved the execute ledger
             # OUT of the system prompt head onto the message tail, so it is no
-            # longer a dynamic head section that could displace REMEMBER.
+            # longer a dynamic head section that could displace the close.
         ):
-            assert remember_idx > prompt.index(dynamic_marker), (
-                f"# REMEMBER must come after {dynamic_marker!r}"
+            assert replan_idx > prompt.index(dynamic_marker), (
+                f"the replan contract must come after {dynamic_marker!r}"
             )
-        assert remember_idx == prompt.rindex("# REMEMBER")
-        assert prompt.rstrip().endswith(get_executor_remember_section().strip())
+        assert prompt.rstrip().endswith(directive)
         # The ledger must NOT ride the execute head anymore (it rides the tail).
         assert "## Progress Ledger" not in prompt
 
-    def test_verifier_head_omits_ledger_and_remember_trails(self):
-        # Unit A (context-cache-prefix-stability task 2.4): the verify ledger
-        # moved OUT of build_verifier_prompt's head onto the message tail, so the
-        # head no longer carries it (passing the kwarg is now a no-op). REMEMBER
-        # still trails every dynamic head section.
+    def test_verifier_close_is_output_contract(self):
+        # 2026-09-20 verifier cleanup (pass-4): the verifier's REMEMBER
+        # mirror is gone (OQ3 family — recency rides the message tail;
+        # every bullet had a stronger carrier: CP #1-#4 primacy copies,
+        # the output contract's submit-only rule, the PARALLELIZE
+        # constant in CP). On the MAXIMAL dynamic path this guard pins
+        # the new close: the prompt ends on the output contract, trailing
+        # every dynamic head section that could otherwise displace it
+        # (same shape as the executor's replan-contract close above).
         prompt = build_verifier_prompt(progress_ledger_section=self.LEDGER)
         assert "## Progress Ledger" not in prompt
-        remember_idx = prompt.index("# REMEMBER")
-        assert remember_idx == prompt.rindex("# REMEMBER")
-        assert prompt.rstrip().endswith(get_verifier_remember_section().strip())
+        assert "# REMEMBER" not in prompt
+        contract = get_verifier_output_format_section().strip()
+        contract_idx = prompt.rstrip().rindex(contract)
+        for dynamic_marker in (
+            "## Domain Knowledge",
+            "## Fault-Specific Verification",
+            "## Capability Profile",
+            "## Verification Heuristics",
+            # NOTE: "## Progress Ledger" is intentionally absent — Unit A
+            # (context-cache-prefix-stability task 2.4) moved the verify
+            # ledger onto the message tail, so it is not a dynamic head
+            # section that could displace the close.
+        ):
+            assert contract_idx > prompt.index(dynamic_marker), (
+                f"the output contract must come after {dynamic_marker!r}"
+            )
+        assert prompt.rstrip().endswith(contract)
 
-    def test_intent_remember_trails_dynamic_completeness(self):
+    def test_intent_dynamic_completeness_trails_cache_boundary(self):
+        # The intent REMEMBER mirror was removed (2026-09-20 skeleton/weight
+        # cleanup, universal-cognitive-architecture OQ3 — recency rides the
+        # transition tail messages). What must survive on the dynamic path:
+        # the reviewed-contract snapshot is appended AFTER the cache
+        # boundary, so the stable head stays byte-identical across turns.
         prompt = build_intent_clarification_prompt(
             fault_spec={"scope": "pod", "fault_target": "cpu"},
             skill_catalog="x",
         )
-        remember_idx = prompt.index("# REMEMBER")
-        # The reviewed-contract snapshot is the dynamic section appended
-        # after the cache boundary — the anchor must still trail it.
-        assert remember_idx > prompt.index('"scope": "pod"')
-        assert remember_idx > prompt.index(CACHE_BOUNDARY.strip())
-        assert remember_idx == prompt.rindex("# REMEMBER")
-        assert prompt.rstrip().endswith(get_intent_reminder_section().strip())
+        assert "# REMEMBER" not in prompt
+        assert prompt.index('"scope": "pod"') > prompt.index(CACHE_BOUNDARY.strip())
 
-    def test_plan_builder_reminder_trails_progress(self):
+    def test_plan_builder_dynamic_tail_trails_cache_boundary(self):
+        # The end-of-prompt checklist mirror was removed (2026-09-20 pass-6,
+        # OQ3 — the ReAct message tail owns recency, and every checklist
+        # bullet restated a rule carried by the bound tool schemas or the
+        # critical_rules head). What must survive on the dynamic path: the
+        # progress snapshot is appended AFTER the cache boundary, so the
+        # stable head stays byte-identical across turns — and with the
+        # mirror gone the prompt CLOSES on that dynamic tail.
         prompt = build_plan_builder_prompt(
             collected_faults=[
                 {"scope": "pod", "target": "cpu", "action": "fullload"},
             ],
             skill_catalog="x",
         )
-        reminder_idx = prompt.index("## Reminder")
-        assert reminder_idx > prompt.index(
-            "## Collected Parameters (confirmed by user)"
-        )
-        assert reminder_idx > prompt.index(CACHE_BOUNDARY.strip())
-        assert reminder_idx == prompt.rindex("## Reminder")
+        assert "## Reminder" not in prompt
         assert prompt.rstrip().endswith(
-            get_plan_builder_critical_rules_reminder_section().strip()
+            "Do NOT re-ask for parameters already collected above."
         )
+        assert prompt.index("Do NOT re-ask for parameters") > prompt.index(
+            CACHE_BOUNDARY.strip()
+        )
+
+    def test_plan_builder_discover_before_ask_is_single_sourced(self):
+        # P3 follow-up (2026-09-20 pass-6): the discover-before-ask teaching
+        # used to be restated four times (role Core Principle / critical
+        # rules #2 / workflow Stage 1 / output_format). It is now pinned to
+        # STRUCTURE, not wording: critical_rules #2 is the single mechanism
+        # source; role keeps only the one-line philosophy; Stage 1 keeps only
+        # its stage gate (skip discovery when the user already named a
+        # target); output_format teaches only the presentation contract. If
+        # the mechanism wording reappears anywhere else, a section has
+        # regressed to restating critical_rules.
+        prompt = build_plan_builder_prompt(planning_mode="guided", skill_catalog="x")
+        # Single mechanism carrier (critical_rules #2): the enumeration
+        # HOW-TO (filter/group/present) exists exactly once in the prompt.
+        assert prompt.count("common prefix") == 1
+        assert prompt.count("build options FROM the results") == 1
+        # Role is philosophy-only: no option mechanics, no single-click
+        # promise (that promise rode the deleted restatement).
+        role = prompt[: prompt.index("### Critical Rules")]
+        assert "Research before you ask" in role
+        assert "present them as concrete options" not in role
+        assert "single click" not in prompt
+        # Stage 1 is a stage gate, not a how-to.
+        stage1 = prompt[prompt.index("Stage 1: TARGET DISCOVERY") : prompt.index("Stage 2:")]
+        assert "skip discovery for that field" in stage1
+        assert "enumerate candidates" not in stage1
 
 
 class TestInjectSlimmedSections:
     def test_role_section_content(self):
         prompt = build_inject_system_prompt(skill_catalog="x")
-        # Role section preserves "Chaos Engineering Agent" and Safety Rules.
+        # Role section preserves "Chaos Engineering Agent"; the Safety
+        # Rules section itself is gone from the planner prompt (2026-09-20
+        # skeleton/weight cleanup — program guards enforce it), and the
+        # role's closing sentence now references the guards generically
+        # instead of a section that is no longer rendered.
         assert "What You Can Do" not in prompt
         assert "Chaos Engineering Agent" in prompt
-        assert "Safety Rules" in prompt
+        assert "Safety Rules" not in prompt
+        assert "The system's guards reject out-of-bounds actions" in prompt
 
-    def test_uses_hard_only_safety(self):
+    def test_planner_prompt_omits_safety_section(self):
         prompt = build_inject_system_prompt(skill_catalog="x")
-        # Hard Rules + Caution Compliance kept; long-tail Advisory / Decision dropped.
-        assert "### Hard Rules" in prompt
-        assert "Caution Rule Compliance" in prompt
+        # 2026-09-20 skeleton/weight cleanup (user ruling): five of six Hard
+        # rules are enforced by code (safety_check node, phase-1 tool
+        # binding + screener, target freeze, automatic timeout, automatic
+        # conflict detection) and the sixth duplicates Core Principles; the
+        # Caution rules ride confirmation_gate + finish_planning required
+        # fields. The shared get_safety_section function is untouched —
+        # the same-date execute cleanup later dropped the executor's row
+        # too (all six rules' executors are code on the execute path), so
+        # the function is now builder-consumerless, pinned only by its own
+        # direct section tests: test_section_params.py's level-parameterized
+        # class and test_prompts.py's content pin (dead-but-exported).
+        assert "### Hard Rules" not in prompt
+        assert "Caution Rule Compliance" not in prompt
         assert "### Decision Framework" not in prompt
         assert "### Advisory Rules" not in prompt
+        assert "target blacklist" not in prompt
+
+    def test_executor_prompt_omits_safety_section(self):
+        # 2026-09-20 execute cleanup (compress-all ruling): every Hard
+        # Rule's executor is code on the execute path — safety_check is an
+        # upstream node the executor never sees, phase-2 tool binding, the
+        # tool screener, provider default timeout, conflict resolution
+        # before execution — and the Caution rules are confirmation_gate
+        # artifacts already user-approved. The residual prompt-side
+        # posture is the role's guard-adaptation line. The shared function
+        # itself stays pinned by its direct section tests —
+        # test_section_params.py and test_prompts.py (dead-but-exported).
+        prompt = build_execute_system_prompt(skill_catalog="x")
+        assert "### Hard Rules" not in prompt
+        assert "target blacklist" not in prompt
+        assert "Caution Rule Compliance" not in prompt
+        assert "# REMEMBER" not in prompt
+        assert "The system's guards reject out-of-bounds actions" in prompt
 
     def test_verification_merged_into_workflow(self):
         prompt = build_inject_system_prompt(skill_catalog="x")
@@ -253,11 +366,14 @@ class TestExecuteSlimmedSections:
         assert "### Cascading Impact" not in prompt
         assert "Do NOT retry failed targets automatically" not in prompt
 
-    def test_keeps_hard_safety_rules(self):
+    def test_drops_hard_safety_rules(self):
         prompt = build_execute_system_prompt(skill_catalog="x")
-        # Executor still bound by Hard Rules + Caution Compliance.
-        assert "### Hard Rules" in prompt
-        assert "target blacklist" in prompt
+        # 2026-09-20 execute cleanup: the Hard-Rules wall moved to code —
+        # full rationale pinned next to the planner-side drop in
+        # TestInjectSlimmedSections above; the executor's residual safety
+        # posture is the role's guard-adaptation line.
+        assert "### Hard Rules" not in prompt
+        assert "target blacklist" not in prompt
 
     def test_keeps_failure_handling_block(self):
         prompt = build_execute_system_prompt(skill_catalog="x")
