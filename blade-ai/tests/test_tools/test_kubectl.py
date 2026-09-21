@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import pytest
 
 from chaos_agent.tools.guard import CommandResult
-from chaos_agent.tools.kubectl import (
+from chaos_agent.tools.kubectl_cli import (
     EMPTY_SELECTOR_HINT,
     READONLY_SUBCOMMANDS,
     _build_kubectl_global_args,
@@ -212,7 +212,7 @@ class TestEmptySelectorHint:
     """
 
     async def _run_get(self, mocker, stdout, v_args):
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
 
         async def _mock_exec(cmd, *args, **kwargs):
             return CommandResult(
@@ -345,8 +345,9 @@ class TestKubectlExec:
             "kubeconfig": "",
         })
         call_kwargs = mock_run_command.call_args[1]
-        # exec subcommand should use timeout_kubectl_exec (180s by default)
-        assert call_kwargs.get("timeout") == 180
+        # exec subcommand should use timeout_kubectl_exec (600s by default
+        # since the 2026-09-20 user ruling)
+        assert call_kwargs.get("timeout") == 600
 
     async def test_exec_with_kubeconfig(self, mock_run_command):
         await kubectl.ainvoke({
@@ -365,7 +366,7 @@ class TestKubectlExec:
         async def fake_run(cmd, *args, **kwargs):
             raise Exception("Command timed out after 10s")
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -376,6 +377,76 @@ class TestKubectlExec:
         assert result.startswith("Error:")
         assert "Command timed out after 10s" in result
         assert "kubectl exec failed:" not in result
+
+    async def test_tool_timeout_presents_unknown_outcome_reconcile_first(self, monkeypatch):
+        # R57: a caller-budget expiry is outcome-UNKNOWN. The local kill does
+        # not stop the remote command (measured live: a 70s task's marker
+        # landed at t+72s after the 60s budget kill), and the bare "timed
+        # out" text reads as SHORT_RETRY — a blind retry then double-executes
+        # a side-effecting command while the first task is still running.
+        # The ToolTimeoutError branch must keep the "Error:" contract and
+        # the raw text (the transient budget still sees it) while appending
+        # the reconcile-first guidance.
+        from chaos_agent.errors import ErrorAction, ToolTimeoutError, classify_error
+
+        async def fake_run(cmd, *args, **kwargs):
+            raise ToolTimeoutError(
+                "Command timed out after 60s: kubectl delete pod nx"
+            )
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+
+        result = await kubectl.ainvoke({
+            "subcommand": "delete",
+            "v_args": "pod nx",
+            "kubeconfig": "",
+        })
+        # The failure-marker contract and the raw timeout text survive...
+        assert result.startswith("Error: kubectl delete:")
+        assert "Command timed out after 60s" in result
+        assert "failed" not in result.split("\n")[0]
+        # ...the classification stays SHORT_RETRY (the retry budget still
+        # counts this shape — the presentation changed, not the class)...
+        assert classify_error(result).action == ErrorAction.SHORT_RETRY
+        # ...and the outcome-unknown guidance teaches reconcile-first.
+        assert "STILL be running" in result
+        assert "double-execute" in result
+
+    async def test_receipt_timeout_appends_unknown_outcome(self, monkeypatch):
+        # R59: the receipt-form sibling of the R57 branch. The caller timeout
+        # feeds both the local kill and the wiz CLI's --wait-timeout mirror;
+        # when the CLI wait expires first, the CLI exits non-zero with the
+        # platform's fixed "task timed out" receipt (measured verbatim in
+        # R56) and parse_wiz_output passes it through — no ToolTimeoutError,
+        # so the R57 exception branch never sees it. The raw receipt must
+        # survive and gain the reconcile-first guidance.
+        async def fake_run(cmd, *args, **kwargs):
+            return CommandResult(
+                1,
+                "",
+                "Error: task timed out after 30s (task_uuid: u-1)",
+                1.0,
+            )
+
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
+        monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
+
+        result = await kubectl.ainvoke({
+            "subcommand": "get",
+            "v_args": "pods",
+            "kubeconfig": "",
+        })
+        # Raw receipt verbatim, unchanged head, no "failed" verdict...
+        assert result.startswith("Error: kubectl get (exit 1):")
+        assert "task timed out after 30s" in result
+        assert "failed" not in result.split("\n")[0]
+        from chaos_agent.errors import ErrorAction, classify_error
+        assert classify_error(result).action == ErrorAction.SHORT_RETRY
+        # ...plus the outcome-unknown reconcile-first guidance.
+        assert "Outcome UNKNOWN" in result
+        assert "STILL be running" in result
+        assert "double-execute" in result
 
     async def test_exec_nonzero_exit_reports_code_and_raw_output(self, mock_run_command_fail):
         # Non-zero exit surfaces the exit code + raw stderr verbatim, without a
@@ -407,7 +478,7 @@ class TestKubectlExec:
                 1.0,
             )
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -434,7 +505,7 @@ class TestKubectlExec:
                 1.0,
             )
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -464,7 +535,7 @@ class TestKubectlExec:
         async def fake_run(cmd, *args, **kwargs):
             return CommandResult(0, help_text, "", 0.5)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -622,7 +693,7 @@ class TestKubectlDebugLifecycle:
                 })
             return CommandResult(0, stdout, "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -676,7 +747,7 @@ class TestKubectlDebugLifecycle:
                 1.0,
             )
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -726,7 +797,7 @@ class TestKubectlDebugLifecycle:
                 },
             }), "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -793,7 +864,7 @@ class TestKubectlDebugLifecycle:
                 },
             }), "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -848,7 +919,7 @@ class TestKubectlDebugLifecycle:
                 }]},
             }), "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         # Keep the not-running poll bounded to one pass: a 1s deadline plus a
         # no-op sleep so the loop exits immediately instead of busy-waiting 60s.
@@ -917,7 +988,7 @@ class TestKubectlDebugOneshot:
                 return CommandResult(0, "pod deleted", "", 1.0)
             return CommandResult(0, self._pod_json("Succeeded", exit_code=0), "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -960,7 +1031,7 @@ class TestKubectlDebugOneshot:
                 return CommandResult(0, "pod deleted", "", 1.0)
             return CommandResult(0, self._pod_json("Failed", exit_code=1), "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -1023,7 +1094,7 @@ class TestKubectlDebugOneshot:
                 return CommandResult(0, "pod deleted", "", 1.0)
             return CommandResult(0, self._evicted_pod_json(), "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -1065,7 +1136,7 @@ class TestKubectlDebugOneshot:
             # Pod never terminates — forces the budget-expiry path.
             return CommandResult(0, self._pod_json("Running"), "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         monkeypatch.setattr(kubectl_mod.settings, "timeout_kubectl_exec", 1)
 
@@ -1085,7 +1156,7 @@ class TestKubectlDebugOneshot:
     def test_sleep_placeholder_stays_interactive(self):
         """``-- sleep N`` is the documented keep-alive convention: the pod
         must go through the Ready wait, never the terminal poll."""
-        from chaos_agent.tools.kubectl import _debug_has_oneshot_command
+        from chaos_agent.tools.kubectl_cli import _debug_has_oneshot_command
         assert _debug_has_oneshot_command(
             ["node/node-a", "--image=busybox", "--", "sleep", "3600"]
         ) is False
@@ -1110,7 +1181,7 @@ class TestKubectlDebugOneshot:
                 return CommandResult(0, "test-ns", "", 1.0)
             return CommandResult(0, 'Warning: some unusual output', "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         # Discovery fallback also hits _debug_pod's own transport binding;
         # make it return non-JSON so discovery misses deterministically.
@@ -1157,7 +1228,7 @@ class TestKubectlDebugOneshot:
                 return CommandResult(0, "pod deleted", "", 1.0)
             return CommandResult(0, self._pod_json("Succeeded", exit_code=0), "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         # Discovery runs inside _debug_pod, which holds its own import of
         # execute_via_transport — patch that binding too.
@@ -1483,7 +1554,7 @@ class TestKubectlTimeouts:
             "kubeconfig": "",
         })
         call_kwargs = mock_run_command.call_args[1]
-        assert call_kwargs.get("timeout") == 180
+        assert call_kwargs.get("timeout") == 600
 
 
 class TestSplitArgs:
@@ -1916,7 +1987,7 @@ class TestReviewFindings:
         (["some-workload-pod", "-n", "default"], ""),  # pod-scoped
     ])
     def test_debug_target_node_name_with_value_flags(self, args, expected):
-        from chaos_agent.tools.kubectl import _debug_target_node_name
+        from chaos_agent.tools.kubectl_cli import _debug_target_node_name
         assert _debug_target_node_name(args) == expected
 
     # ---- Suspect 2: a Succeeded one-shot pod whose containerStatuses
@@ -1949,7 +2020,7 @@ class TestReviewFindings:
                 return CommandResult(0, "pod deleted", "", 1.0)
             return CommandResult(0, pod_json, "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         result = await kubectl.ainvoke({
@@ -1973,7 +2044,7 @@ class TestReviewFindings:
         (["node/a", "--", "chroot", "/host", "crictl", "stop"], True),
     ])
     def test_sleep_keepalive_variants_stay_interactive(self, args, expected):
-        from chaos_agent.tools.kubectl import _debug_has_oneshot_command
+        from chaos_agent.tools.kubectl_cli import _debug_has_oneshot_command
         assert _debug_has_oneshot_command(args) is expected
 
     # ---- Suspect 4 (R45): the one-shot classifier's boundary is the first
@@ -2001,7 +2072,7 @@ class TestReviewFindings:
         (["node/a", "-c", "--", "sleep", "3600"], False),
     ])
     def test_oneshot_boundary_is_the_true_separator(self, args, expected):
-        from chaos_agent.tools.kubectl import _debug_has_oneshot_command
+        from chaos_agent.tools.kubectl_cli import _debug_has_oneshot_command
         assert _debug_has_oneshot_command(args) is expected
 
     # ---- Suspect 5 (R45): the v_args hygiene boundary (embedded
@@ -2041,7 +2112,7 @@ class TestReviewFindings:
                 return CommandResult(0, "pod deleted", "", 1.0)
             return CommandResult(0, pod_json, "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         await kubectl.ainvoke({
@@ -2095,7 +2166,7 @@ class TestReviewFindings:
         async def fake_namespace(_kubeconfig):
             return "test-ns"
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         monkeypatch.setattr(
             kubectl_mod, "_resolve_effective_namespace", fake_namespace,
@@ -2144,7 +2215,7 @@ class TestReviewFindings:
         (["-it", "p0", "--", "df"], "p0"),
     ])
     def test_debug_target_pod_name_skips_global_value_flags(self, args, expected):
-        from chaos_agent.tools.kubectl import _debug_target_pod_name
+        from chaos_agent.tools.kubectl_cli import _debug_target_pod_name
         assert _debug_target_pod_name(args) == expected
 
     @pytest.mark.parametrize("args, expected", [
@@ -2155,7 +2226,7 @@ class TestReviewFindings:
         (["--as", "admin", "node/n1", "--", "sleep", "3600"], "n1"),
     ])
     def test_debug_target_node_name_skips_global_value_flags(self, args, expected):
-        from chaos_agent.tools.kubectl import _debug_target_node_name
+        from chaos_agent.tools.kubectl_cli import _debug_target_node_name
         assert _debug_target_node_name(args) == expected
 
     # ---- Suspect 8 (R46): ``_namespace_from_args`` stops at the first
@@ -2167,7 +2238,7 @@ class TestReviewFindings:
     # code: the scan returned "". A line with no TRUE separator keeps the
     # legacy boundary (pinned by the third case).
     def test_namespace_scan_uses_the_true_separator(self):
-        from chaos_agent.tools.kubectl import _namespace_from_args
+        from chaos_agent.tools.kubectl_cli import _namespace_from_args
         assert _namespace_from_args(
             ["node/n1", "--profile-output", "--", "-n", "test-ns", "--", "sleep"]
         ) == "test-ns"
@@ -2208,7 +2279,7 @@ class TestExecBladeCreateTimeoutGuard:
             captured["cmd"] = list(cmd)
             return CommandResult(0, '{"code":200,"result":"uid-1"}', "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         await kubectl.ainvoke({
             "subcommand": "exec",
@@ -2289,7 +2360,7 @@ class TestErrorOutputMergesBothStreams:
                 'error: error parsing jsonpath: unterminated "', 1.0,
             )
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         out = await kubectl.ainvoke({"subcommand": "get", "v_args": "node n1"})
         assert "exit 1" in out
@@ -2301,7 +2372,7 @@ class TestErrorOutputMergesBothStreams:
         async def fake_run(cmd, *a, **kw):
             return CommandResult(1, "", "", 1.0)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         out = await kubectl.ainvoke({"subcommand": "get", "v_args": "node n1"})
         assert "(no output)" in out
@@ -2337,7 +2408,7 @@ class TestEphemeralContainerAttribution:
     """
 
     def test_parse_prefers_spec_order_over_alphabetical_status(self):
-        from chaos_agent.tools.kubectl import _parse_ephemeral_container_name
+        from chaos_agent.tools.kubectl_cli import _parse_ephemeral_container_name
         pod = _pod_json(
             ["debugger-crzj6", "debugger-5wzdw", "debugger-j6chx"],
             {
@@ -2351,7 +2422,7 @@ class TestEphemeralContainerAttribution:
         assert _parse_ephemeral_container_name(pod) == "debugger-j6chx"
 
     def test_parse_falls_back_to_status_without_spec(self):
-        from chaos_agent.tools.kubectl import _parse_ephemeral_container_name
+        from chaos_agent.tools.kubectl_cli import _parse_ephemeral_container_name
         pod = json.dumps({
             "spec": {},
             "status": {"ephemeralContainerStatuses": [
@@ -2362,7 +2433,7 @@ class TestEphemeralContainerAttribution:
         assert _parse_ephemeral_container_name(pod) == "debugger-zzz"
 
     def test_select_created_diffs_pre_dispatch_snapshot(self):
-        from chaos_agent.tools.kubectl import _select_created_ephemeral
+        from chaos_agent.tools.kubectl_cli import _select_created_ephemeral
         pod = _pod_json(
             ["debugger-old", "debugger-new"],
             {"debugger-new": {"running": {}}, "debugger-old": {"terminated": {"exitCode": 0}}},
@@ -2372,7 +2443,7 @@ class TestEphemeralContainerAttribution:
         )
 
     def test_select_created_ignores_alphabetically_last_stale(self):
-        from chaos_agent.tools.kubectl import _select_created_ephemeral
+        from chaos_agent.tools.kubectl_cli import _select_created_ephemeral
         # stale 'z' container sorts last in status; the NEW one is mid-alphabet
         pod = _pod_json(
             ["debugger-stale", "debugger-zzz-stale", "debugger-mid"],
@@ -2388,7 +2459,7 @@ class TestEphemeralContainerAttribution:
         )
 
     def test_select_created_unconfirmed_when_no_snapshot(self):
-        from chaos_agent.tools.kubectl import _select_created_ephemeral
+        from chaos_agent.tools.kubectl_cli import _select_created_ephemeral
         pod = _pod_json(
             ["debugger-old", "debugger-last"],
             {
@@ -2410,7 +2481,7 @@ class TestEphemeralContainerAttribution:
         spec yet, and the only candidate is a stale TERMINATED one picked by
         the unconfirmed fallback. The wait must NOT return that stale exit as
         the current call's result — it polls to the deadline instead."""
-        from chaos_agent.tools.kubectl import _wait_for_ephemeral_container
+        from chaos_agent.tools.kubectl_cli import _wait_for_ephemeral_container
         pod = _pod_json(
             ["debugger-stale"],
             {"debugger-stale": {"terminated": {"exitCode": 0, "reason": "Completed"}}},
@@ -2419,7 +2490,7 @@ class TestEphemeralContainerAttribution:
         async def fake_run(cmd, *args, **kwargs):
             return CommandResult(0, pod, "", 0.1)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         monkeypatch.setattr(kubectl_mod.settings, "timeout_kubectl_exec", 1)
         state, name, _, detail = await _wait_for_ephemeral_container(
@@ -2433,7 +2504,7 @@ class TestEphemeralContainerAttribution:
 
     @pytest.mark.asyncio
     async def test_wait_returns_terminated_exit0_as_success_signal(self, monkeypatch):
-        from chaos_agent.tools.kubectl import _wait_for_ephemeral_container
+        from chaos_agent.tools.kubectl_cli import _wait_for_ephemeral_container
         pod = _pod_json(
             ["debugger-probe"],
             {"debugger-probe": {"terminated": {"exitCode": 0, "reason": "Completed"}}},
@@ -2442,7 +2513,7 @@ class TestEphemeralContainerAttribution:
         async def fake_run(cmd, *args, **kwargs):
             return CommandResult(0, pod, "", 0.1)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         state, name, meta, detail = await _wait_for_ephemeral_container(
             "tgt", "default", "", pre_existing=set(),
@@ -2454,7 +2525,7 @@ class TestEphemeralContainerAttribution:
 
     @pytest.mark.asyncio
     async def test_wait_running_attributed_over_stale_terminated(self, monkeypatch):
-        from chaos_agent.tools.kubectl import _wait_for_ephemeral_container
+        from chaos_agent.tools.kubectl_cli import _wait_for_ephemeral_container
         pod = _pod_json(
             ["debugger-zzz-stale", "debugger-fresh"],
             {
@@ -2466,7 +2537,7 @@ class TestEphemeralContainerAttribution:
         async def fake_run(cmd, *args, **kwargs):
             return CommandResult(0, pod, "", 0.1)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         state, name, _, detail = await _wait_for_ephemeral_container(
             "tgt", "default", "", pre_existing={"debugger-zzz-stale"},
@@ -2484,7 +2555,7 @@ class TestEphemeralContainerAttribution:
         completion within seconds. Timestamp attribution — startedAt at/after
         dispatch — must credit it, instead of polling 60s and returning a
         false 'did not start' alarm."""
-        from chaos_agent.tools.kubectl import _wait_for_ephemeral_container
+        from chaos_agent.tools.kubectl_cli import _wait_for_ephemeral_container
         dispatch_ts = time.time()
         started = datetime.fromtimestamp(
             dispatch_ts + 2, tz=timezone.utc,
@@ -2502,7 +2573,7 @@ class TestEphemeralContainerAttribution:
         async def fake_run(cmd, *args, **kwargs):
             return CommandResult(0, pod, "", 0.1)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         state, name, _, detail = await _wait_for_ephemeral_container(
             "tgt", "default", "",
@@ -2519,7 +2590,7 @@ class TestEphemeralContainerAttribution:
         """Symmetric positive for the running branch: snapshot failed, the
         candidate is running with startedAt after dispatch -> ours, return
         running (the exec handle)."""
-        from chaos_agent.tools.kubectl import _wait_for_ephemeral_container
+        from chaos_agent.tools.kubectl_cli import _wait_for_ephemeral_container
         dispatch_ts = time.time()
         started = datetime.fromtimestamp(
             dispatch_ts + 1, tz=timezone.utc,
@@ -2535,7 +2606,7 @@ class TestEphemeralContainerAttribution:
         async def fake_run(cmd, *args, **kwargs):
             return CommandResult(0, pod, "", 0.1)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         state, name, _, detail = await _wait_for_ephemeral_container(
             "tgt", "default", "",
@@ -2551,7 +2622,7 @@ class TestEphemeralContainerAttribution:
     ):
         """Snapshot failed AND the only candidate's startedAt is an hour
         before dispatch: it belongs to an earlier drill — keep polling."""
-        from chaos_agent.tools.kubectl import _wait_for_ephemeral_container
+        from chaos_agent.tools.kubectl_cli import _wait_for_ephemeral_container
         dispatch_ts = time.time()
         started = datetime.fromtimestamp(
             dispatch_ts - 3600, tz=timezone.utc,
@@ -2568,7 +2639,7 @@ class TestEphemeralContainerAttribution:
         async def fake_run(cmd, *args, **kwargs):
             return CommandResult(0, pod, "", 0.1)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         monkeypatch.setattr(kubectl_mod.settings, "timeout_kubectl_exec", 1)
         state, _, _, detail = await _wait_for_ephemeral_container(
@@ -2584,7 +2655,7 @@ class TestEphemeralContainerAttribution:
     ):
         """Same guard for the running branch: an unconfirmed candidate running
         since BEFORE dispatch is stale — exec must not be routed to it."""
-        from chaos_agent.tools.kubectl import _wait_for_ephemeral_container
+        from chaos_agent.tools.kubectl_cli import _wait_for_ephemeral_container
         dispatch_ts = time.time()
         started = datetime.fromtimestamp(
             dispatch_ts - 3600, tz=timezone.utc,
@@ -2597,7 +2668,7 @@ class TestEphemeralContainerAttribution:
         async def fake_run(cmd, *args, **kwargs):
             return CommandResult(0, pod, "", 0.1)
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
         monkeypatch.setattr(kubectl_mod.settings, "timeout_kubectl_exec", 1)
         state, _, _, detail = await _wait_for_ephemeral_container(
@@ -2619,7 +2690,7 @@ class TestOutputSafetyValve:
         async def fake_run(cmd, *args, **kwargs):
             return command_result
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", fake_run)
 
         async def _call():
@@ -2703,7 +2774,7 @@ class TestQueryKubectl:
 
     @pytest.mark.asyncio
     async def test_success_carries_payload(self, monkeypatch):
-        from chaos_agent.tools.kubectl import query_kubectl
+        from chaos_agent.tools.kubectl_cli import query_kubectl
         from chaos_agent.models.command_result import CommandResult
 
         async def fake_execute(cmd, target, timeout=0,
@@ -2721,7 +2792,7 @@ class TestQueryKubectl:
 
     @pytest.mark.asyncio
     async def test_exit_failure_is_not_ok_with_diagnosis(self, monkeypatch):
-        from chaos_agent.tools.kubectl import query_kubectl
+        from chaos_agent.tools.kubectl_cli import query_kubectl
         from chaos_agent.models.command_result import CommandResult
 
         async def fake_execute(cmd, target, timeout=0,
@@ -2741,7 +2812,7 @@ class TestQueryKubectl:
 
     @pytest.mark.asyncio
     async def test_exception_is_not_ok(self, monkeypatch):
-        from chaos_agent.tools.kubectl import query_kubectl
+        from chaos_agent.tools.kubectl_cli import query_kubectl
 
         async def fake_execute(cmd, target, timeout=0,
                                expect_profile=None, **kwargs):
@@ -2757,7 +2828,7 @@ class TestQueryKubectl:
 
     @pytest.mark.asyncio
     async def test_empty_success_is_ok_and_empty(self, monkeypatch):
-        from chaos_agent.tools.kubectl import query_kubectl
+        from chaos_agent.tools.kubectl_cli import query_kubectl
         from chaos_agent.models.command_result import CommandResult
 
         async def fake_execute(cmd, target, timeout=0,

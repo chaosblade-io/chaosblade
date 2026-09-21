@@ -975,7 +975,7 @@ async def check_k8s_connectivity() -> CheckResult:
         # host-scope drill: no K8s cluster — probe the HOST instead
         # (mode-scoped check).  The row renders as ``host_connectivity``.
         return await _check_host_connectivity()
-    from chaos_agent.tools.kubectl import exec_kubectl_raw
+    from chaos_agent.tools.kubectl_cli import exec_kubectl_raw
 
     timeout = _self_check_timeout()
 
@@ -1143,7 +1143,7 @@ async def check_chaosblade_operator() -> CheckResult:
             name="chaosblade_operator", severity="warning", passed=True,
             message="host mode (Operator check skipped)",
         )
-    from chaos_agent.tools.kubectl import exec_kubectl_raw
+    from chaos_agent.tools.kubectl_cli import exec_kubectl_raw
 
     if _is_kubewiz_channel():
         v_args = ["deploy", "-A", "-o", "json"]

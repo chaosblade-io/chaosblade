@@ -48,7 +48,7 @@ from chaos_agent.observability.status_tracker import (
     get_tracker,
     StatusCategory,
 )
-from chaos_agent.tools.kubectl import build_kubectl_cmd
+from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
 from chaos_agent.transports import (
     PROFILE_HOST,
     PROFILE_K8S,

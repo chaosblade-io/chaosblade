@@ -30,7 +30,7 @@ from chaos_agent.preflight import (
 # also named ``kubectl``, which shadows the submodule attribute on the
 # package — resolve the module through sys.modules so patching hits the
 # exact object preflight's lazy import reads from.
-_KUBECTL_MOD = sys.modules["chaos_agent.tools.kubectl"]
+_KUBECTL_MOD = sys.modules["chaos_agent.tools.kubectl_cli"]
 
 # ── Unit: scanners normalize missing replicas, never filter names ─────
 

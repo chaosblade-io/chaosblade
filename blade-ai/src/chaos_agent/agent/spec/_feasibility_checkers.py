@@ -61,7 +61,7 @@ async def is_metrics_server_available(kubeconfig: str) -> bool:
 
 async def _run_kubectl(args: list[str], kubeconfig: str, timeout: int = 8) -> str | None:
     """Run a kubectl command. Returns stdout on success, None on any error."""
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import TransportTarget, execute_via_transport
 
     if not args:
@@ -777,7 +777,7 @@ async def _check_interface_exists(
         (False, reason) — interface confirmed missing
         (None, reason) — indeterminate (timeout/unexpected error)
     """
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import TransportTarget, execute_via_transport
 
     cmd = build_kubectl_cmd("exec", [pod_name, "-n", namespace,
@@ -819,7 +819,7 @@ async def _check_iptables_available(
         (False, reason) — confirmed unavailable (missing binary or no permission)
         (None, reason) — indeterminate (timeout/unexpected error)
     """
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import TransportTarget, execute_via_transport
 
     # Use `iptables -L -n` to verify actual functionality.
@@ -914,7 +914,7 @@ async def _check_blade_tool_pod_ready(
     required = _required_tool_binaries(action)
     probe_cmd = "command -v " + " && command -v ".join(required)
 
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import TransportTarget, execute_via_transport
 
     cmd = build_kubectl_cmd("exec", [pod_name, "-n", namespace,
@@ -955,7 +955,7 @@ async def _check_node_iptables_available(
         (False, reason) — confirmed unavailable
         (None, reason) — indeterminate (no tool pod, timeout, etc.)
     """
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.transports import TransportTarget, execute_via_transport
 
     tool_pod = await _find_tool_pod_on_node(node_name, kubeconfig)

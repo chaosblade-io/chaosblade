@@ -5,7 +5,7 @@ This module is intentionally dependency-free (no imports from
 circular import that would otherwise arise when transports modules
 need ``CommandResult`` for type annotations:
 
-    transports.base → tools.guard → tools.__init__ → tools.kubectl → transports  ✗
+    transports.base → tools.guard → tools.__init__ → tools.kubectl_cli → transports  ✗
 
 By importing from this neutral module, transports modules avoid
 triggering ``tools.__init__`` entirely.

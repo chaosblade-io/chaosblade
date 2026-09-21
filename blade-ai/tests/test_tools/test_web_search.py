@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from chaos_agent.tools.web_search import web_search, _MAX_RESULTS
+from chaos_agent.tools.web_search_tool import web_search, _MAX_RESULTS
 
 
 class TestWebSearchTool:

@@ -22,7 +22,7 @@ from chaos_agent.agent.nodes.execute.execute_loop import (
     _target_absence_proven_in_epoch,
 )
 from chaos_agent.agent.replan import ReplanRequest
-from chaos_agent.tools.kubectl import EMPTY_SELECTOR_HINT
+from chaos_agent.tools.kubectl_cli import EMPTY_SELECTOR_HINT
 
 
 def _request(decision: str = "plan_invalid") -> ReplanRequest:

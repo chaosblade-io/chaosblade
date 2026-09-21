@@ -661,7 +661,7 @@ async def _probe_debug_pod_with_backoff(
     A run of timeouts means "channel flaky", not "pod gone", so we retry; a
     ``NotFound`` short-circuits immediately.
     """
-    from chaos_agent.tools.kubectl import _debug_pod_metadata
+    from chaos_agent.tools.kubectl_cli import _debug_pod_metadata
 
     kubeconfig = str(state.get("kubeconfig") or "")
     last: tuple[dict, str] = ({}, "")
@@ -836,7 +836,7 @@ async def registered_carrier_is_current(artifact: dict, state: dict) -> bool:
     a false "carrier unavailable" rejection. A dead pod simply fails the exec at
     runtime — it is not a scope escape — so liveness is only a degraded signal.
     """
-    from chaos_agent.tools.kubectl import _debug_pod_metadata
+    from chaos_agent.tools.kubectl_cli import _debug_pod_metadata
 
     # Exactly the 3-arg signature (W-56-2/4, #56 msg#179): the former 5-arg
     # call raised TypeError on EVERY re-read, which the fail-closed liveness

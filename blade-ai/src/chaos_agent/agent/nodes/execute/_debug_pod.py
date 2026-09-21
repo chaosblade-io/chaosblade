@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 from chaos_agent.config.settings import settings
 from chaos_agent.errors import ToolGuardError, ToolTimeoutError
-from chaos_agent.tools.kubectl import build_kubectl_cmd
+from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
 from chaos_agent.transports import (
     PROFILE_K8S,
     TransportTarget,

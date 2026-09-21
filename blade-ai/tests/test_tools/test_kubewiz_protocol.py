@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from chaos_agent.tools.guard import CommandResult
-from chaos_agent.tools.kubectl import (
+from chaos_agent.tools.kubectl_cli import (
     build_kubectl_cmd,
     exec_kubectl_raw,
 )
@@ -114,7 +114,7 @@ class TestKubewizK8sChannelWrapCommand:
         assert "--profile" in wrapped
         assert "prod" in wrapped
 
-    @patch("chaos_agent.tools.kubectl.settings")
+    @patch("chaos_agent.tools.kubectl_cli.settings")
     def test_kubeconfig_mode_no_wiz(self, mock_settings):
         """In kubeconfig mode, build_kubectl_cmd should NOT use wiz wrapper."""
         mock_settings.kube_connection_mode = "kubeconfig"
@@ -143,7 +143,7 @@ class TestExecKubectlRaw:
             return CommandResult(0, "NAME    READY   STATUS\nnginx   1/1     Running\n", "", 10.0)
 
         import sys
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", mock_execute)
 
         result = await exec_kubectl_raw("get", ["pods", "-n", "default"])
@@ -157,7 +157,7 @@ class TestExecKubectlRaw:
             return CommandResult(1, "", "command failed", 10.0)
 
         import sys
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", mock_execute)
 
         result = await exec_kubectl_raw("get", ["pods"], timeout=5.0)
@@ -171,7 +171,7 @@ class TestExecKubectlRaw:
             raise FileNotFoundError("kubectl")
 
         import sys
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", mock_execute)
 
         result = await exec_kubectl_raw("get", ["pods"])
@@ -185,7 +185,7 @@ class TestExecKubectlRaw:
             return CommandResult(0, "NAME    READY   STATUS\nnginx   1/1     Running\n", "", 10.0)
 
         import sys
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(kubectl_mod, "execute_via_transport", mock_execute)
 
         result = await exec_kubectl_raw("get", ["pods", "-n", "default"])

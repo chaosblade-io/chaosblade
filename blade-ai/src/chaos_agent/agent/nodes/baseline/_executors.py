@@ -34,7 +34,7 @@ from chaos_agent.tools.pod_discovery import (
 )
 from chaos_agent.config.settings import settings
 from chaos_agent.observability.status_tracker import elided_preview, get_tracker
-from chaos_agent.tools.kubectl import _split_args, build_kubectl_cmd, display_cmd
+from chaos_agent.tools.kubectl_cli import _split_args, build_kubectl_cmd, display_cmd
 from chaos_agent.transports import (
     PROFILE_HOST,
     PROFILE_K8S,

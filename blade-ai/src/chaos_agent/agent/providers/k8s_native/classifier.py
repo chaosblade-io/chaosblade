@@ -1399,7 +1399,7 @@ _SHELL_SLEEP_RE = re.compile(r"^(?:exec\s+)?sleep(?:\s+[1-9][0-9]*)?$")
 def _is_sleep_only_command(command: Any) -> bool:
     """Whether a manifest container ``command`` is a pure keep-alive sleep.
 
-    Modelled on ``tools.kubectl._is_keepalive_sleep`` (re-declared here
+    Modelled on ``tools.kubectl_cli._is_keepalive_sleep`` (re-declared here
     rather than imported — the guard layer does not depend on tools), but
     STRICTER: a bare ``sleep`` with no duration and ``sh -c`` wrapping a
     bare ``sleep`` are refused here, because an occupant must bound its own
@@ -3101,7 +3101,7 @@ def _has_help_flag(args: list[str]) -> bool:
 def _coerce_args_list(tool_args: Any) -> list[str]:
     """Best-effort coerce of kubectl tool_args into a list[str].
 
-    Recognises the actual production shape of ``chaos_agent.tools.kubectl``
+    Recognises the actual production shape of ``chaos_agent.tools.kubectl_cli``
     (``{subcommand: str, v_args: str, kubeconfig?: str, context?: str,
     cluster?: str, task_id?: str}``) — without this branch, every real
     kubectl tool_call would coerce to ``[]`` and classify as UNKNOWN.

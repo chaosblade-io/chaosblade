@@ -201,12 +201,12 @@ def mock_run_command(mocker):
 
     # Also patch the already-imported references in the carrier CLI
     # (providers/chaosblade/cli) and kubectl modules.
-    # NOTE: ``import chaos_agent.tools.kubectl`` resolves to the @tool-decorated
+    # NOTE: ``import chaos_agent.tools.kubectl_cli`` resolves to the @tool-decorated
     # function (same name as the module), not the module itself.  Use
     # ``sys.modules`` to get the real module object for patch.object().
     import sys
     import chaos_agent.agent.providers.chaosblade.cli as blade_mod
-    kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+    kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
 
     # Patch execute_via_transport in migrated modules — same mock object
     # so call_args tracks calls from either entry point.
@@ -237,7 +237,7 @@ def mock_run_command_fail(mocker):
 
     import sys
     import chaos_agent.agent.providers.chaosblade.cli as blade_mod
-    kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+    kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
 
     # Patch execute_via_transport in migrated modules
     mocker.patch.object(kubectl_mod, "execute_via_transport", shell_mock)

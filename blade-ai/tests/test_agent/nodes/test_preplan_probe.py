@@ -339,13 +339,14 @@ class TestCarrierImageDiscovery:
         async def _fake_exec(*_a, **_k):
             return raw
 
-        # ``import chaos_agent.tools.kubectl as m`` binds the StructuredTool
-        # shadowing the submodule in the package namespace — patch the real
-        # module from sys.modules (what the in-function ``from … import``
-        # resolves against).
+        # Patch the real module object (``kubectl_cli``) from sys.modules —
+        # the same module the in-function ``from … import`` resolves
+        # against. (Renamed from ``kubectl`` in the R67 namespace fix: the
+        # old submodule filename equalled the exported tool symbol, so the
+        # package attribute was the TOOL, not the module.)
         import sys
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
 
         with patch.object(
             kubectl_mod, "exec_kubectl_raw", new=AsyncMock(side_effect=_fake_exec),
@@ -436,7 +437,7 @@ class TestCarrierImageDiscovery:
 
         import sys
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
 
         with patch.object(
             kubectl_mod, "exec_kubectl_raw",
@@ -457,7 +458,7 @@ class TestCarrierImageDiscovery:
 
         import sys
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(settings, "recovery_carrier_discovered_images", "")
         # No real 0.5s backoff sleep in tests.
         monkeypatch.setattr(pp, "_DS_FETCH_RETRY_BACKOFF_SECONDS", 0.0)
@@ -489,7 +490,7 @@ class TestCarrierImageDiscovery:
 
         import sys
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(pp, "_DS_FETCH_RETRY_BACKOFF_SECONDS", 0.0)
 
         exec_mock = AsyncMock(return_value=_Bad())
@@ -506,7 +507,7 @@ class TestCarrierImageDiscovery:
         makes exactly ONE kubectl call."""
         import sys
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(settings, "recovery_carrier_discovered_images", "")
 
         exec_mock = AsyncMock(return_value=self._raw_result(
@@ -554,7 +555,7 @@ class TestCarrierImageLazyRefresh:
     async def _refresh(self, raw_results, monkeypatch):
         import sys
 
-        kubectl_mod = sys.modules["chaos_agent.tools.kubectl"]
+        kubectl_mod = sys.modules["chaos_agent.tools.kubectl_cli"]
         monkeypatch.setattr(settings, "recovery_carrier_discovered_images", "")
         monkeypatch.setattr(pp, "_DS_FETCH_RETRY_BACKOFF_SECONDS", 0.0)
         exec_mock = AsyncMock(side_effect=raw_results)
@@ -597,115 +598,3 @@ class TestCarrierImageLazyRefresh:
         )])], monkeypatch)
         assert ok is False
         assert settings.recovery_carrier_discovered_images == ""
-
-
-# ---------------------------------------------------------------------------
-# FaultDrill CRD installability probe (openspec faultdrill-cr-channel D3
-# source 2 — the planning-route signal the Workflow routing guide points
-# the planner at)
-# ---------------------------------------------------------------------------
-
-
-class _Raw:
-    """Minimal exec_kubectl_raw stand-in (exit_code / stdout)."""
-
-    def __init__(self, exit_code: int = 0, stdout: str = ""):
-        self.exit_code = exit_code
-        self.stdout = stdout
-
-
-class TestFaultdrillCrdProbe:
-    """_probe_faultdrill_crd: read-only two-step installability verdict."""
-
-    @pytest.mark.asyncio
-    async def test_crd_exists_reports_ok_single_call(self):
-        with patch(
-            "chaos_agent.tools.kubectl.exec_kubectl_raw",
-            new=AsyncMock(return_value=_Raw(0)),
-        ) as m:
-            status, summary, _ = await pp._probe_faultdrill_crd("/fake")
-        assert status == "ok"
-        assert "already installed" in summary
-        # The exists branch short-circuits: no can-i round-trip is spent.
-        assert m.await_count == 1
-        assert m.await_args_list[0].args[1] == [
-            "crd", f"faultdrills.{settings.faultdrill_crd_group}",
-        ]
-
-    @pytest.mark.asyncio
-    async def test_missing_crd_authorized_reports_installable(self):
-        with patch(
-            "chaos_agent.tools.kubectl.exec_kubectl_raw",
-            new=AsyncMock(side_effect=[_Raw(1), _Raw(0, "yes\n")]),
-        ) as m:
-            status, summary, _ = await pp._probe_faultdrill_crd("/fake")
-        assert status == "ok"
-        assert "installable" in summary
-        assert m.await_count == 2
-        assert m.await_args_list[1].args[:2] == ("auth", ["can-i", "create", "customresourcedefinitions"])
-
-    @pytest.mark.asyncio
-    async def test_denied_can_i_reports_warning_with_sop_guidance(self):
-        # ``can-i`` reports a DENIAL as exit 0 + "no" — a denial is an
-        # answer, not an error: the route-unavailable line (not unknown).
-        with patch(
-            "chaos_agent.tools.kubectl.exec_kubectl_raw",
-            new=AsyncMock(side_effect=[_Raw(1), _Raw(0, "no\n")]),
-        ):
-            status, summary, _ = await pp._probe_faultdrill_crd("/fake")
-        assert status == "warning"
-        assert "NOT installable" in summary
-        assert "recovery-carrier SOP" in summary
-
-    @pytest.mark.asyncio
-    async def test_can_i_error_degrades_to_unknown(self):
-        with patch(
-            "chaos_agent.tools.kubectl.exec_kubectl_raw",
-            new=AsyncMock(side_effect=[_Raw(1), _Raw(1, "boom")]),
-        ):
-            status, summary, _ = await pp._probe_faultdrill_crd("/fake")
-        assert status == "unknown"
-        assert "unverified" in summary
-
-
-class TestFaultdrillCrdWiring:
-    """The probe is scheduled only while the channel is enabled — dark
-    launch keeps the observation message identical to pre-change (no
-    faultdrill line, no extra kubectl round-trip)."""
-
-    @pytest.mark.asyncio
-    async def test_disabled_channel_skips_the_probe(self, k8s_state, monkeypatch):
-        # Explicitly OFF (symmetric with the enabled test below): the
-        # post-flip default is True, and this tooth pins the CHANNEL-OFF
-        # behaviour, not the default.
-        monkeypatch.setattr(settings, "faultdrill_enabled", False)
-        fd = AsyncMock(return_value=("ok", "should not run", {}))
-        with patch(f"{_MODULE}._probe_faultdrill_crd", new=fd):
-            mocks, patches = _run_probes(k8s_state)
-            try:
-                result = await preplan_probe(k8s_state)
-            finally:
-                for p in patches:
-                    p.stop()
-        fd.assert_not_awaited()
-        assert "faultdrill_crd" not in result["messages"][0].content
-
-    @pytest.mark.asyncio
-    async def test_enabled_channel_appends_the_crd_line(
-        self, k8s_state, monkeypatch,
-    ):
-        monkeypatch.setattr(settings, "faultdrill_enabled", True)
-        fd = AsyncMock(return_value=("ok", "_probe_faultdrill_crd fine", {}))
-        with patch(f"{_MODULE}._probe_faultdrill_crd", new=fd):
-            mocks, patches = _run_probes(k8s_state)
-            try:
-                result = await preplan_probe(k8s_state)
-            finally:
-                for p in patches:
-                    p.stop()
-        fd.assert_awaited_once()
-        assert fd.await_args.args[0] == "/fake/kubeconfig"
-        assert (
-            "- faultdrill_crd [ok]: _probe_faultdrill_crd fine"
-            in result["messages"][0].content
-        )

@@ -104,7 +104,7 @@ class KubectlExecChannel(_SampleChannelBase):
         self._task_id = task_id
 
     async def run(self, command: str) -> str:
-        from chaos_agent.tools.kubectl import build_kubectl_cmd
+        from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
 
         cmd = build_kubectl_cmd(
             "exec",
@@ -177,7 +177,7 @@ async def _node_channel_factory(req: _ChannelRequest) -> Optional[EffectSampleCh
 
 
 async def _pod_channel_factory(req: _ChannelRequest) -> Optional[EffectSampleChannel]:
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.tools.pod_discovery import discover_tool_pod_on_node
     pod_name = (req.names or "").split(",")[0].strip()
     if not pod_name:

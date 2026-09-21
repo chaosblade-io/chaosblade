@@ -507,7 +507,7 @@ async def capture_snapshot(
     node scope.
     """
     from chaos_agent.transports import TransportTarget, execute_via_transport
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.config.settings import settings
 
     _target = TransportTarget.from_state({})
@@ -599,7 +599,7 @@ async def fetch_post_inject_state(
     fetch the namespace's pods / events / endpoints plus the target pod's logs.
     """
     from chaos_agent.transports import TransportTarget, execute_via_transport
-    from chaos_agent.tools.kubectl import build_kubectl_cmd
+    from chaos_agent.tools.kubectl_cli import build_kubectl_cmd
     from chaos_agent.config.settings import settings
 
     _target = TransportTarget.from_state({})

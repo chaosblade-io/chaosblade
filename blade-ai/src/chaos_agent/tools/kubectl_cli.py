@@ -1138,7 +1138,16 @@ async def query_kubectl(
         logger.warning("%s failed (exception): %s", log_name, e)
         return QueryOutcome(ok=False, error=f"exception: {e}")
     if result.exit_code != 0:
-        detail = (result.stderr or "").strip()[:200]
+        # R69: the wiz relay folds the inner command's stderr into stdout
+        # (platform drops stderr when stdout is non-empty), so a failure
+        # can present as exit!=0 + error-in-stdout + empty stderr. Reading
+        # stderr alone loses the diagnosis. Merge both streams — but only
+        # on the failure branch, so the success path never picks up stdout
+        # noise. ``.error`` is internal-log-only (no external consumer).
+        parts = [
+            s.strip() for s in (result.stdout, result.stderr) if s and s.strip()
+        ]
+        detail = " | ".join(parts)[:200]
         logger.warning(
             "%s failed (exit=%s): %s", log_name, result.exit_code, detail,
         )
@@ -1216,7 +1225,10 @@ async def kubectl(
         `drill-rc-*` + whitelisted image + `--restart=Never
         --command -- sleep N`; `--overrides` admits
         `spec.serviceAccountName` only) — guard refuses every other
-        shape (see `references/carrier/recovery-carrier.md`).
+        shape. The bare skeleton is ONLY the timer host — it does NOT
+        self-restore; the armed-before-inject gate REFUSES the injection
+        until an `exec` arms the carrier `recovery_armed` (arming SOP:
+        knowledge `recovery-carrier-arming.md`).
       - Unknown-flag error → `--help`; do NOT guess and retry.
     """
     return await _kubectl_impl(subcommand, v_args, kubeconfig, stdin_data=stdin_data)
@@ -1417,6 +1429,27 @@ async def _kubectl_impl(
             # a shell on one machine and cannot serve cluster operations.
             expect_profile=profile_for_tool("kubectl"),
         )
+    except ToolTimeoutError as e:
+        # R57: a caller-budget expiry is outcome-UNKNOWN, not a plain
+        # failure — the local kill does NOT stop the remote command (measured
+        # live: a 70s task's marker landed at t+72s after the 60s budget
+        # kill). The generic fallthrough below would leave the bare "timed
+        # out" text, which the transient-retry census reads as SHORT_RETRY —
+        # a blind retry then double-executes a side-effecting command while
+        # the first task is still running. Keep the "Error:" contract AND
+        # the raw text (the budget still sees "timed out"; a self-severing
+        # exec that times out on success still gets no "failed" verdict) and
+        # append reconcile-first advice — the same feedback-loop license as
+        # the completed-pod note below: advice, never a gate.
+        return apply_output_safety_valve(
+            f"Error: kubectl {subcommand}: {e}\n"
+            "Outcome UNKNOWN: only the local wait was killed — the command "
+            "may STILL be running server-side. A blind retry can "
+            "double-execute a side-effecting command. Reconcile first: "
+            "re-check the target's actual state with a read command, then "
+            "retry only what is genuinely missing.",
+            kind="error",
+        )
     except Exception as e:
         # Surface the raw signal without a "failed" verdict. For a self-severing
         # injection (e.g. node network isolation) THIS exec times out ON SUCCESS;
@@ -1468,6 +1501,28 @@ async def _kubectl_impl(
                 "3600` for exactly this reason. Recreate the debug pod "
                 "(kubectl debug node/<node> --image=<image> -- sleep 3600) "
                 "to continue exec-based probing."
+            )
+        # R59: receipt-form timeout — the sibling of the R57 exception branch
+        # above. The caller timeout feeds BOTH the local kill AND the wiz
+        # CLI's --wait-timeout mirror (executor.py passes one timeout to
+        # both); when the CLI's wait expires first (explicit
+        # kubewiz_wait_timeout override below the caller budget), the CLI
+        # exits non-zero with the platform's fixed receipt — "Error: task
+        # timed out after Ns" — and parse_wiz_output passes it through: no
+        # ToolTimeoutError is raised, so the R57 branch never sees this
+        # shape. The command may STILL be running server-side; a blind
+        # retry can double-execute it. The receipt is a closed-set platform
+        # format (measured verbatim in R56), so matching it is legitimate
+        # paired-prescription feedback (B38/B40): on a wording change this
+        # silently degrades to the bare error — advice, never a gate (same
+        # boundary as the completed-pod note above).
+        if "task timed out" in error_detail:
+            error_detail += (
+                "\n\nOutcome UNKNOWN: the CLI's own wait expired — the "
+                "command may STILL be running server-side. A blind retry "
+                "can double-execute a side-effecting command. Reconcile "
+                "first: re-check the target's actual state with a read "
+                "command, then retry only what is genuinely missing."
             )
         # Report the exit code + raw output verbatim; no "failed" verdict word.
         # No routine truncation at the tool layer: governance is the

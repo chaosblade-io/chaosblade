@@ -103,7 +103,7 @@ async def _get_blade_version() -> str:
 async def _check_k8s_available() -> bool:
     """Check if kubectl can reach a cluster."""
     try:
-        from chaos_agent.tools.kubectl import exec_kubectl_raw
+        from chaos_agent.tools.kubectl_cli import exec_kubectl_raw
 
         result = await exec_kubectl_raw("cluster-info", [], timeout=10.0)
         return result.exit_code == 0

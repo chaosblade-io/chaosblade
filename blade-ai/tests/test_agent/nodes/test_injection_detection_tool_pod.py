@@ -95,7 +95,7 @@ class TestDiscoverToolPodOnNode:
         with patch(
             "chaos_agent.transports.execute_via_transport", run_command_mock,
         ), patch(
-            "chaos_agent.tools.kubectl.build_kubectl_cmd",
+            "chaos_agent.tools.kubectl_cli.build_kubectl_cmd",
             return_value=["kubectl", "get", "pods"],
         ):
             result = await discover_tool_pod_on_node(
@@ -115,7 +115,7 @@ class TestDiscoverToolPodOnNode:
         with patch(
             "chaos_agent.transports.execute_via_transport", run_command_mock,
         ), patch(
-            "chaos_agent.tools.kubectl.build_kubectl_cmd",
+            "chaos_agent.tools.kubectl_cli.build_kubectl_cmd",
             return_value=["kubectl", "get", "pods"],
         ):
             result = await discover_tool_pod_on_node(
@@ -132,7 +132,7 @@ class TestDiscoverToolPodOnNode:
         with patch(
             "chaos_agent.transports.execute_via_transport", run_command_mock,
         ), patch(
-            "chaos_agent.tools.kubectl.build_kubectl_cmd",
+            "chaos_agent.tools.kubectl_cli.build_kubectl_cmd",
             return_value=["kubectl", "get", "pods"],
         ):
             result = await discover_tool_pod_on_node(
@@ -146,7 +146,7 @@ class TestDiscoverToolPodOnNode:
         with patch(
             "chaos_agent.transports.execute_via_transport", run_command_mock,
         ), patch(
-            "chaos_agent.tools.kubectl.build_kubectl_cmd",
+            "chaos_agent.tools.kubectl_cli.build_kubectl_cmd",
             return_value=["kubectl", "get", "pods"],
         ):
             result = await discover_tool_pod_on_node(
