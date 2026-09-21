@@ -1,6 +1,6 @@
 {
   "name": "@blade-ai/web",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
   "description": "Blade-AI Web UI — conversation-first chaos engineering console.",
   "type": "module",

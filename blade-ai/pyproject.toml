@@ -12,7 +12,7 @@ name = "blade-ai"
 # Versions are coordinated across pyproject.toml, tui/package.json, and
 # src/chaos_agent/__init__.py. The M11 release.yml guards enforce
 # tag↔file equality before publishing — bump all three in one commit.
-version = "0.7.1"
+version = "0.7.2"
 description = "Chaos Engineering Agent for Kubernetes fault injection"
 
 authors = [

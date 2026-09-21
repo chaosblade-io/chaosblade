@@ -1,6 +1,6 @@
 {
   "name": "@blade-ai/core",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Shared core for Blade-AI frontends (tui/ and web/): SSE client, stream-event protocol, reducer/state store, slash-command registry, i18n. Zero Node.js-only dependencies — browser-safe.",
   "private": true,
   "type": "module",
