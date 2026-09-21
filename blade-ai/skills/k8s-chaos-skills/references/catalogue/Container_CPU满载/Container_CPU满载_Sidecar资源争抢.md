@@ -50,7 +50,7 @@
 4. 确认 CPU throttling 直接证据：`kubectl exec <pod-name> -c <sidecar-container-name> -n <namespace> -- cat /sys/fs/cgroup/cpu.stat`（cgroup v2；v1 路径为 `/sys/fs/cgroup/cpu/cpu.stat`，版本探测与字段详见「Pod_CPU_Throttling_limits.cpu过低」），确认 `nr_throttled` 高于注入前基线（单调递增计数器，高于基线即节流已发生）——throttling 是内核 cgroup 行为，kubelet 不为其产生 K8s Events，`kubectl describe pod` 的 Events 里查不到 CPU throttling 相关条目（勿以 Events 为判据）
 
 **持续性检查（必做）**——故障窗口内故障必须持续存活（负载型故障：负载进程在即故障在，throttle 持续发生）：
-以「注入生效确认」为时点锚（注入验证第 1 + 4 条通过 = 生效：top 顶格 + nr_throttled 高于基线），生效后一次 `time_wait 60`，到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
+以「注入生效确认」为时点锚（注入验证第 1 + 4 条通过 = 生效：top 顶格 + nr_throttled 高于基线），生效后一次 `time_wait 30`（间隔 = 2 × 传播上限：本案为规则/字段/进程型即时生效故障，无传播过程，30s 为最小复测窗，按 SKILL.md「持续性采样间隔 per-case 推导」），到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
 1. 白盒复查：负载进程仍在（`kubectl exec <pod> -c <sidecar> -- sh -c 'ps -o pid,args | grep "[w]hile :"'`——进程在即负载在）
 2. 行为复查：`kubectl top pod --containers` sidecar CPU 仍顶格（limit 的 100%）
 3. 计数器复查：nr_throttled 相比注入生效时**继续递增**（节流仍在周期性发生——与 nr_periods 同步前进）

@@ -73,7 +73,7 @@
 3. 确认目标节点均有 node.ops/pending-reboot taint（`kubectl get node <node> -o jsonpath='{.spec.taints}'`）
 
 **持续性检查（必做）**——故障窗口内故障必须持续存活（配置型故障：taint 在节点 spec、nodeSelector 在 Pod 模板，字段在即故障在）：
-以「注入生效确认」为时点锚（注入验证第 1-3 条通过 = 生效：重建 Pod Pending + Events 见 untolerated taint + 节点 taint 在位），生效后一次 `time_wait 60`，到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
+以「注入生效确认」为时点锚（注入验证第 1-3 条通过 = 生效：重建 Pod Pending + Events 见 untolerated taint + 节点 taint 在位），生效后一次 `time_wait 30`（间隔 = 2 × 传播上限：本案为规则/字段/进程型即时生效故障，无传播过程，30s 为最小复测窗，按 SKILL.md「持续性采样间隔 per-case 推导」），到点**同轮下发**三条探针并**具体记录命令与输出**——效果证据须在故障存活期内采集，恢复完成后无法再采集；若已恢复，取证定时器是否提前触发/人工介入后如实报告：
 1. 白盒复查：节点 taint 仍在 spec（`kubectl get node <node> -o jsonpath='{.spec.taints}'` 输出含注入项；nodeSelector 仍在 Pod 模板）
 2. 行为复查：Pending Pod 未变 Running（`kubectl get pods -n <namespace> -l <app-label>`——调度器对 Pending Pod 周期重试，taint 未摘则永不成）
 3. 事件复查：FailedScheduling 事件 LAST SEEN 相比注入时有新增（调度器仍在周期性重试；新式字段形态下看 series.lastObservedTime 前进）
